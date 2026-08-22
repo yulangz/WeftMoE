@@ -70,10 +70,12 @@ private:
   materialize_rank_metadata(const LocalHistogramHandle &,
                             const ValidatedCollectiveHandle &,
                             const ValidatedCollectiveHandle &);
+  friend class testing::NotifyCorruptionHook;
 };
 
 // Move-only framework adaptor. It retains local storage, session/execution
 // tokens, and the backend operation until wait/cancel reaches a terminal state.
+// The same object does not support concurrent wait/cancel/move calls.
 class CollectiveOperation {
 public:
   CollectiveOperation();

@@ -67,6 +67,7 @@ std::uint64_t WorkspacePlan::epoch() const {
 }
 
 WorkspacePlan make_workspace_plan(const DispatchHandle& handle) {
+    validate_dispatch_metadata(handle);
     const auto& metadata = handle.metadata();
     WorkspacePlan plan;
     plan.valid_ = true;
@@ -80,6 +81,7 @@ WorkspacePlan make_workspace_plan(const DispatchHandle& handle) {
 
 void validate_workspace_plan(const DispatchHandle& handle,
                              const WorkspacePlan& plan) {
+    validate_dispatch_metadata(handle);
     const auto& metadata = handle.metadata();
     if (!plan.valid_) invalid_plan("persistent launch rejected a default/invalid WorkspacePlan");
     const auto provenance = plan.provenance_.lock();

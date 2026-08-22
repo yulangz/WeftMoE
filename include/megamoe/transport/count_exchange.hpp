@@ -137,12 +137,23 @@ public:
   virtual ~BackendDeviceLeaseState() noexcept = default;
 };
 
+// Optional backend-owned resources on which a returned completion depends.
+// The framework retains this lease through every validated-handle copy.
+class BackendCompletionLeaseState {
+public:
+  virtual ~BackendCompletionLeaseState() noexcept = default;
+};
+
 // No native-address accessor exists in the transport-independent layer.
+// element_count is checked rows*row_width and cannot exceed size_t or the
+// backend-declared capacity_elements.
 class DeviceBufferLease {
 public:
   DeviceBufferLease() = default;
   std::uint32_t rows() const;
   std::uint64_t row_width() const;
+  std::uint64_t element_count() const;
+  std::uint64_t capacity_elements() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -151,12 +162,13 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend DeviceBufferLease
-  make_device_buffer_lease(std::uint32_t, std::uint64_t,
+  make_device_buffer_lease(std::uint32_t, std::uint64_t, std::uint64_t,
                            std::shared_ptr<const BackendDeviceLeaseState>);
 };
 
 DeviceBufferLease make_device_buffer_lease(
     std::uint32_t rows, std::uint64_t row_width,
+    std::uint64_t capacity_elements,
     std::shared_ptr<const BackendDeviceLeaseState> backend_lease);
 
 struct CountExchangeRequest {
@@ -181,20 +193,20 @@ private:
   explicit BackendCompletion(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
-  friend BackendCompletion make_host_backend_completion(RankCollectiveContext,
-                                                        ExchangeKind,
-                                                        HostCountMatrix);
-  friend BackendCompletion make_device_backend_completion(RankCollectiveContext,
-                                                          ExchangeKind,
-                                                          DeviceBufferLease);
+  friend BackendCompletion make_host_backend_completion(
+      RankCollectiveContext, ExchangeKind, HostCountMatrix,
+      std::shared_ptr<const BackendCompletionLeaseState>);
+  friend BackendCompletion make_device_backend_completion(
+      RankCollectiveContext, ExchangeKind, DeviceBufferLease,
+      std::shared_ptr<const BackendCompletionLeaseState>);
 };
 
-BackendCompletion make_host_backend_completion(RankCollectiveContext context,
-                                               ExchangeKind kind,
-                                               HostCountMatrix result);
-BackendCompletion make_device_backend_completion(RankCollectiveContext context,
-                                                 ExchangeKind kind,
-                                                 DeviceBufferLease result);
+BackendCompletion make_host_backend_completion(
+    RankCollectiveContext context, ExchangeKind kind, HostCountMatrix result,
+    std::shared_ptr<const BackendCompletionLeaseState> completion_lease = {});
+BackendCompletion make_device_backend_completion(
+    RankCollectiveContext context, ExchangeKind kind, DeviceBufferLease result,
+    std::shared_ptr<const BackendCompletionLeaseState> completion_lease = {});
 
 class BackendCountExchangeOperation {
 public:

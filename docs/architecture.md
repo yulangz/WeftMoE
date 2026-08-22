@@ -54,6 +54,18 @@ an opaque `DeviceBufferLease`; the host materializer rejects it until that
 backend produces a controlled typed host result. Generic metadata never obtains
 or dereferences a device address.
 
+A device lease records `rows`, `row_width`, checked `element_count`, and the
+backend-declared `capacity_elements`. Construction requires nonzero dimensions
+and capacity and validates:
+
+```text
+element_count = checked_uint64(rows * row_width)
+element_count <= SIZE_MAX
+element_count <= capacity_elements
+```
+
+Overflow and short capacity fail before a lease is published.
+
 The backend `start` returns a backend operation, immediately wrapped in a
 move-only framework `CollectiveOperation`. The wrapper strongly retains the
 local handle, input row, session, execution token, and backend operation until
@@ -63,6 +75,17 @@ unwaited operation performs best-effort cancellation, catches every exception,
 and is `noexcept`. Backend `NotifyDispatchError`, standard exceptions, unknown
 exceptions, null operations, host-result construction errors, wait errors, and
 cancel errors are all mapped to contextual `CountExchangeFailure`.
+
+Pending operations own a shared internal `OperationResourceLease`. Successful
+`wait()` creates an immutable `CompletionResourceLease` containing the exact
+backend completion and a shared reference to that same operation resource.
+Every `ValidatedCollectiveHandle` copy shares the completion lease. Therefore
+the local histogram, typed input, session, execution token, backend operation,
+and backend completion lease remain alive until the final validated copy is
+destroyed. After the completed operation object is also released, destruction
+of the final validated copy releases the chain exactly once through ordinary
+shared ownership; it does not call wait or cancel again. Keeping the completed
+operation object longer may conservatively extend the same resource lifetime.
 
 Two explicit rounds are used:
 
@@ -110,8 +133,15 @@ local routes ──────┴─> LocalHistogramHandle (typed rows + proven
                                   │ strong ownership
                                   v
                          CollectiveOperation
-                    (backend op + input + tokens)
-                                  │ successful wait
+                                  │ owns while pending
+                                  v
+                     OperationResourceLease
+                    (local + input + tokens + backend op)
+                                  │ successful wait; shared by
+                                  v
+                    CompletionResourceLease
+                 (backend completion + optional backend lease)
+                                  │ shared by every copy
                                   v
                     ValidatedCollectiveHandle
                      (typed matrix + provenance)
@@ -126,6 +156,19 @@ local routes ──────┴─> LocalHistogramHandle (typed rows + proven
 Handles are cheaply copyable immutable owners. Operations are move-only.
 Descriptor/reverse metadata is owned by the final `DispatchHandle`; workspace
 plans hold identity/provenance bindings rather than borrowed metadata pointers.
+Materialization copies the validated integer metadata into `DispatchHandle`;
+the dispatch handle deliberately does not retain collective resources. Callers
+may release validated handles after materialization when no later consumer needs
+their completion lifetime.
+
+## Thread-safety contract
+
+One `CollectiveOperation` does **not** support concurrent `wait()`, `cancel()`,
+move construction, or move assignment. The current state machine has no internal
+lock and must not be described as thread-safe. Different operation objects may
+run in parallel when their backend supports it; the host fake supports parallel
+waits on distinct operations. Shared immutable local/validated handles may be
+read concurrently, but mutation is unavailable through the public API.
 
 ## Descriptor baseline
 

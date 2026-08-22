@@ -48,7 +48,9 @@ The three stages are:
 `LocalHistogramHandle` and `ValidatedCollectiveHandle` are immutable opaque
 handles. `CollectiveOperation` is move-only and retains local typed storage,
 session/execution tokens, and the backend operation through a terminal state.
-Its destructor performs best-effort cancellation and never propagates cleanup
+Successful `wait()` transfers shared ownership through an immutable completion
+lease, so every validated-handle copy keeps those resources alive. Its
+destructor performs best-effort cancellation and never propagates cleanup
 exceptions.
 
 `build_notify_dispatch_for_testing` is a host reference/test wrapper that

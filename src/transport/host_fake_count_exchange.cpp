@@ -280,17 +280,55 @@ CountMatrix HostCountMatrix::copy_rows() const {
 struct DeviceBufferLease::Impl {
   std::uint32_t rows = 0;
   std::uint64_t row_width = 0;
+  std::uint64_t element_count = 0;
+  std::uint64_t capacity_elements = 0;
   std::shared_ptr<const BackendDeviceLeaseState> backend_lease;
 };
 
 DeviceBufferLease make_device_buffer_lease(
     std::uint32_t rows, std::uint64_t row_width,
+    std::uint64_t capacity_elements,
     std::shared_ptr<const BackendDeviceLeaseState> backend_lease) {
   if (!backend_lease)
-    invalid_exchange("device buffer lease owner is null");
+    invalid_exchange("phase=device-lease-validation, field=backend_lease, "
+                     "rank=n/a, expected=non-null, actual=null");
+  if (rows == 0)
+    invalid_exchange("phase=device-lease-validation, field=rows, rank=n/a, "
+                     "expected=>0, actual=0");
+  if (row_width == 0)
+    invalid_exchange("phase=device-lease-validation, field=row_width, "
+                     "rank=n/a, expected=>0, actual=0");
+  if (row_width > std::numeric_limits<std::uint64_t>::max() / rows) {
+    invalid_exchange(
+        "phase=device-lease-validation, field=element_count.uint64, rank=n/a, "
+        "expected=rows*row_width within uint64, actual=overflow(rows=" +
+        std::to_string(rows) + ", row_width=" + std::to_string(row_width) +
+        ")");
+  }
+  const auto element_count = static_cast<std::uint64_t>(rows) * row_width;
+  if (element_count > std::numeric_limits<std::size_t>::max()) {
+    invalid_exchange(
+        "phase=device-lease-validation, field=element_count.size_t, rank=n/a, "
+        "expected=rows*row_width within size_t, actual=" +
+        std::to_string(element_count));
+  }
+  if (capacity_elements == 0) {
+    invalid_exchange(
+        "phase=device-lease-validation, field=capacity_elements, rank=n/a, "
+        "expected=>0, actual=0");
+  }
+  if (element_count > capacity_elements) {
+    invalid_exchange(
+        "phase=device-lease-validation, field=capacity_elements, rank=n/a, "
+        "expected=>=" +
+        std::to_string(element_count) +
+        ", actual=" + std::to_string(capacity_elements));
+  }
   auto impl = std::make_shared<DeviceBufferLease::Impl>();
   impl->rows = rows;
   impl->row_width = row_width;
+  impl->element_count = element_count;
+  impl->capacity_elements = capacity_elements;
   impl->backend_lease = std::move(backend_lease);
   return DeviceBufferLease(std::move(impl));
 }
@@ -307,16 +345,29 @@ std::uint64_t DeviceBufferLease::row_width() const {
   return impl_->row_width;
 }
 
+std::uint64_t DeviceBufferLease::element_count() const {
+  if (!impl_)
+    invalid_exchange("attempted to access an empty device buffer lease");
+  return impl_->element_count;
+}
+
+std::uint64_t DeviceBufferLease::capacity_elements() const {
+  if (!impl_)
+    invalid_exchange("attempted to access an empty device buffer lease");
+  return impl_->capacity_elements;
+}
+
 struct BackendCompletion::Impl {
   RankCollectiveContext context;
   ExchangeKind kind = ExchangeKind::ExpertCounts;
   HostCountMatrix host;
   DeviceBufferLease device;
+  std::shared_ptr<const BackendCompletionLeaseState> completion_lease;
 };
 
-BackendCompletion make_host_backend_completion(RankCollectiveContext context,
-                                               ExchangeKind kind,
-                                               HostCountMatrix result) {
+BackendCompletion make_host_backend_completion(
+    RankCollectiveContext context, ExchangeKind kind, HostCountMatrix result,
+    std::shared_ptr<const BackendCompletionLeaseState> completion_lease) {
   if (!context)
     invalid_exchange("backend completion has empty rank context");
   if (!result)
@@ -325,12 +376,13 @@ BackendCompletion make_host_backend_completion(RankCollectiveContext context,
   impl->context = std::move(context);
   impl->kind = kind;
   impl->host = std::move(result);
+  impl->completion_lease = std::move(completion_lease);
   return BackendCompletion(std::move(impl));
 }
 
-BackendCompletion make_device_backend_completion(RankCollectiveContext context,
-                                                 ExchangeKind kind,
-                                                 DeviceBufferLease result) {
+BackendCompletion make_device_backend_completion(
+    RankCollectiveContext context, ExchangeKind kind, DeviceBufferLease result,
+    std::shared_ptr<const BackendCompletionLeaseState> completion_lease) {
   if (!context)
     invalid_exchange("backend completion has empty rank context");
   if (!result)
@@ -339,6 +391,7 @@ BackendCompletion make_device_backend_completion(RankCollectiveContext context,
   impl->context = std::move(context);
   impl->kind = kind;
   impl->device = std::move(result);
+  impl->completion_lease = std::move(completion_lease);
   return BackendCompletion(std::move(impl));
 }
 

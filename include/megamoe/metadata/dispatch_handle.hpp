@@ -11,6 +11,10 @@
 
 namespace megamoe {
 
+namespace testing {
+class NotifyCorruptionHook;
+}
+
 class WorkspacePlan;
 class DispatchHandleFactory;
 
@@ -138,6 +142,9 @@ private:
     friend class WorkspacePlan;
     friend WorkspacePlan make_workspace_plan(const DispatchHandle&);
     friend void validate_workspace_plan(const DispatchHandle&, const WorkspacePlan&);
+    friend class testing::NotifyCorruptionHook;
 };
+
+void validate_dispatch_metadata(const DispatchHandle& handle);
 
 }  // namespace megamoe

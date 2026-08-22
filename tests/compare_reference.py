@@ -9,6 +9,13 @@ from reference.notify_dispatch_reference import (
 
 
 MASK64 = (1 << 64) - 1
+RANDOM_SEEDS = [
+    0x5EED1234, 0x10203040, 0xDEADBEEF, 0xC001D00D, 0x01234567,
+    0x89ABCDEF, 0x31415926, 0x27182818, 0x0BADF00D, 0xFEEDFACE,
+    0x13579BDF, 0x2468ACE0, 0xA5A5A5A5, 0x5A5A5A5A, 0x11223344,
+    0x55667788, 0x99AABBCC, 0xDDEEFF00, 0x42424242, 0x77777777,
+    0xABCDEF01, 0x10FEDCBA, 0x600DBEEF, 0x7F4A7C15, 0xF00DCAFE,
+]
 
 
 def make_config(nodes, gpus, experts, top_k, mtile):
@@ -56,9 +63,6 @@ def expected_fixtures():
         [[2, 4, 3], [0, 2, 5]], [], [], []
     ]
 
-    random_config = make_config(2, 2, 11, 4, 3)
-    random_routes = seeded_inputs(4, 11, 4, 0x5EED1234)
-
     many_config = make_config(73, 1, 73, 2, 8)
     many_routes = [[] for _ in range(73)]
     many_routes[0] = [[0, 72]]
@@ -70,16 +74,29 @@ def expected_fixtures():
         [],
         [[0, 6]],
     ]
-    return {
+    fixtures = {
         "targeted": build_reference_all(targeted, targeted_routes,
                                           "cross-targeted", 3),
-        "seeded_random": build_reference_all(random_config, random_routes,
-                                               "cross-random", 17),
-        "many_nodes": build_reference_all(many_config, many_routes,
-                                            "cross-nodes", 23),
-        "skew_empty": build_reference_all(skew_config, skew_routes,
-                                            "cross-skew", 29),
     }
+    random_config = make_config(2, 2, 11, 4, 3)
+    for index, seed in enumerate(RANDOM_SEEDS):
+        suffix = f"{index:02d}"
+        random_routes = seeded_inputs(4, 11, 4, seed)
+        first = build_reference_all(
+            random_config, random_routes, f"cross-random-{suffix}", 100 + index)
+        second = build_reference_all(
+            random_config, random_routes, f"cross-random-{suffix}", 100 + index)
+        first_bytes = json.dumps(first, separators=(",", ":"), ensure_ascii=True)
+        second_bytes = json.dumps(second, separators=(",", ":"), ensure_ascii=True)
+        if first_bytes != second_bytes:
+            raise AssertionError(
+                f"Python byte-for-byte repeat mismatch for seed=0x{seed:08x}")
+        fixtures[f"seeded_{suffix}"] = first
+    fixtures["many_nodes"] = build_reference_all(
+        many_config, many_routes, "cross-nodes", 23)
+    fixtures["skew_empty"] = build_reference_all(
+        skew_config, skew_routes, "cross-skew", 29)
+    return fixtures
 
 
 def first_difference(actual, expected, path="$" ):

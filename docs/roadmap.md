@@ -7,6 +7,8 @@
   materialization.
 - Immutable provenance-bound phase handles, owned session/execution tokens,
   typed host storage, opaque device leases, and a move-only operation adaptor.
+- Validated completion leases retain the full operation resource chain through
+  the final validated-handle copy; device leases enforce checked shape/capacity.
 - Host control-plane corruption and hostile-backend failures are contained as
   checked exceptions under ASan/UBSan.
 - Canonical row, reverse-route, packet/fan-out, and signal descriptors.

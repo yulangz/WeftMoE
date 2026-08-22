@@ -11,11 +11,14 @@ make -j test
 
 This runs:
 
-- C++ rank-local, malicious-backend, ownership/lifetime, context-provenance,
+- C++ rank-local, resource-lease lifetime/destructor-count, operation state
+  machine, device shape/capacity, malicious-backend, context-provenance,
   corruption, descriptor, topology, overflow, and workspace tests;
 - independent Python reference tests;
 - JSON full-field C++/Python comparison over targeted, fixed-seed random,
-  73-node, skewed, empty-rank, empty-expert, and partial-M cases.
+  25 fixed random seeds plus targeted 73-node, skewed, empty-rank,
+  empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
+  repeat checking.
 - every public header as an isolated `-Werror` translation unit.
 
 ## Warning-clean build

@@ -23,14 +23,7 @@ struct LocalHistogramHandle::Impl {
   std::shared_ptr<const std::uint8_t> provenance;
 };
 
-struct ValidatedCollectiveHandle::Impl {
-  RankCollectiveContext context;
-  ExchangeKind kind = ExchangeKind::ExpertCounts;
-  HostCountMatrix matrix;
-  std::shared_ptr<const std::uint8_t> local_provenance;
-};
-
-struct CollectiveOperation::Impl {
+struct OperationResourceLease {
   LocalHistogramHandle local;
   RankCollectiveContext context;
   ExchangeKind kind = ExchangeKind::ExpertCounts;
@@ -40,6 +33,23 @@ struct CollectiveOperation::Impl {
   bool terminal = false;
   bool waited = false;
   ExchangeState terminal_state = ExchangeState::Pending;
+};
+
+struct CompletionResourceLease {
+  std::shared_ptr<OperationResourceLease> operation;
+  BackendCompletion completion;
+};
+
+struct ValidatedCollectiveHandle::Impl {
+  RankCollectiveContext context;
+  ExchangeKind kind = ExchangeKind::ExpertCounts;
+  HostCountMatrix matrix;
+  std::shared_ptr<const std::uint8_t> local_provenance;
+  std::shared_ptr<const CompletionResourceLease> resources;
+};
+
+struct CollectiveOperation::Impl {
+  std::shared_ptr<OperationResourceLease> resources;
 };
 
 namespace {
@@ -320,15 +330,15 @@ void validate_backend_completion(const BackendCompletion &completion,
   const auto &matrix = completion.host_result();
   if (matrix.rows() != expected.session().world_size()) {
     exchange_failure(phase, expected_kind, expected,
-                     "matrix rows mismatch: expected=" +
+                     "field=matrix.rows, expected=" +
                          std::to_string(expected.session().world_size()) +
                          ", actual=" + std::to_string(matrix.rows()));
   }
   if (matrix.row_width() != expected_width) {
-    exchange_failure(phase, expected_kind, expected,
-                     "matrix row_width mismatch: expected=" +
-                         std::to_string(expected_width) +
-                         ", actual=" + std::to_string(matrix.row_width()));
+    exchange_failure(
+        phase, expected_kind, expected,
+        "field=matrix.row_width, expected=" + std::to_string(expected_width) +
+            ", actual=" + std::to_string(matrix.row_width()));
   }
   (void)checked_mul(matrix.rows(), matrix.row_width(),
                     "validated collective matrix elements");
@@ -342,6 +352,17 @@ std::string exception_text(const std::exception &error) {
   return std::string("std::exception: ") + error.what();
 }
 
+[[noreturn]] void metadata_failure(NotifyErrorCode code, const char *phase,
+                                   const std::string &field, std::uint32_t rank,
+                                   const std::string &expected,
+                                   const std::string &actual,
+                                   const std::string &coordinates = {}) {
+  fail(code, std::string("phase=") + phase + ", field=" + field +
+                 ", rank=" + std::to_string(rank) + ", expected=" + expected +
+                 ", actual=" + actual +
+                 (coordinates.empty() ? "" : ", " + coordinates));
+}
+
 void validate_local_structure(const LocalHistogramHandle &local) {
   const auto &config = local.config();
   (void)validate_config(config);
@@ -350,20 +371,18 @@ void validate_local_structure(const LocalHistogramHandle &local) {
   const auto rank = local.context().calling_rank();
   const auto &outgoing = local.outgoing();
   if (outgoing.top_k != config.top_k) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local histogram top_k mismatch: rank=" + std::to_string(rank) +
-             ", expected=" + std::to_string(config.top_k) +
-             ", actual=" + std::to_string(outgoing.top_k));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "outgoing.top_k", rank, std::to_string(config.top_k),
+                     std::to_string(outgoing.top_k));
   }
   const auto routes_u64 = checked_mul(outgoing.num_tokens, outgoing.top_k,
                                       "local structural route count");
   const auto routes = checked_size(routes_u64, "local structural route count");
   const auto require_routes = [&](std::size_t actual, const char *field) {
     if (actual != routes) {
-      fail(NotifyErrorCode::InvalidRouteShape,
-           "local histogram array size mismatch: rank=" + std::to_string(rank) +
-               ", field=" + field + ", expected=" + std::to_string(routes) +
-               ", actual=" + std::to_string(actual));
+      metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                       field, rank, std::to_string(routes),
+                       std::to_string(actual));
     }
   };
   require_routes(outgoing.expert_id.size(), "expert_id");
@@ -374,42 +393,41 @@ void validate_local_structure(const LocalHistogramHandle &local) {
   require_routes(outgoing.route_dst_local_rank.size(), "route_dst_local_rank");
   require_routes(outgoing.combine_order.size(), "combine_order");
   if (!outgoing.reverse_routes.empty()) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local histogram reverse_routes mismatch: expected=empty before "
-         "materialization, actual=" +
-             std::to_string(outgoing.reverse_routes.size()));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "outgoing.reverse_routes", rank, "empty",
+                     std::to_string(outgoing.reverse_routes.size()));
   }
   const auto expected_words = static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(config.topology.num_nodes) + 63U) / 64U);
   if (outgoing.node_mask_words != expected_words) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local histogram node_mask_words mismatch: expected=" +
-             std::to_string(expected_words) +
-             ", actual=" + std::to_string(outgoing.node_mask_words));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "outgoing.node_mask_words", rank,
+                     std::to_string(expected_words),
+                     std::to_string(outgoing.node_mask_words));
   }
   const auto mask_elements =
       checked_size(checked_mul(outgoing.num_tokens, expected_words,
                                "local structural mask elements"),
                    "local structural mask elements");
   if (outgoing.destination_node_mask.size() != mask_elements) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local histogram array size mismatch: field=destination_node_mask, "
-         "expected=" +
-             std::to_string(mask_elements) + ", actual=" +
-             std::to_string(outgoing.destination_node_mask.size()));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "outgoing.destination_node_mask.size", rank,
+                     std::to_string(mask_elements),
+                     std::to_string(outgoing.destination_node_mask.size()));
   }
   if (local.local_expert_count().size() != config.num_experts) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local expert count width mismatch: expected=" +
-             std::to_string(config.num_experts) +
-             ", actual=" + std::to_string(local.local_expert_count().size()));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "local_expert_count.size", rank,
+                     std::to_string(config.num_experts),
+                     std::to_string(local.local_expert_count().size()));
   }
   if (local.packet_count_by_destination_node().size() !=
       config.topology.num_nodes) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local packet summary width mismatch: expected=" +
-             std::to_string(config.topology.num_nodes) + ", actual=" +
-             std::to_string(local.packet_count_by_destination_node().size()));
+    metadata_failure(
+        NotifyErrorCode::InvalidRouteShape, "materialize-local",
+        "packet_count_by_destination_node.size", rank,
+        std::to_string(config.topology.num_nodes),
+        std::to_string(local.packet_count_by_destination_node().size()));
   }
 
   std::vector<std::uint64_t> counts(config.num_experts, 0);
@@ -427,15 +445,19 @@ void validate_local_structure(const LocalHistogramHandle &local) {
       const auto flat = base + slot;
       const auto expert = outgoing.expert_id[flat];
       if (expert >= config.num_experts) {
-        fail(NotifyErrorCode::ExpertOutOfRange,
-             "corrupt local expert at " + route_context(rank, token, slot) +
-                 ": expected=[0," + std::to_string(config.num_experts) +
-                 "), actual=" + std::to_string(expert));
+        metadata_failure(NotifyErrorCode::ExpertOutOfRange, "materialize-local",
+                         "outgoing.expert_id", rank,
+                         "[0," + std::to_string(config.num_experts) + ")",
+                         std::to_string(expert),
+                         "token=" + std::to_string(token) +
+                             ", slot=" + std::to_string(slot));
       }
       if (selected_experts[expert]) {
-        fail(NotifyErrorCode::DuplicateExpert,
-             "corrupt duplicate expert at " + route_context(rank, token, slot) +
-                 ": expert=" + std::to_string(expert));
+        metadata_failure(NotifyErrorCode::DuplicateExpert, "materialize-local",
+                         "outgoing.expert_id", rank, "unique within token",
+                         std::to_string(expert),
+                         "token=" + std::to_string(token) +
+                             ", slot=" + std::to_string(slot));
       }
       selected_experts[expert] = true;
       const auto destination_rank = config.topology.expert_to_rank[expert];
@@ -444,20 +466,24 @@ void validate_local_structure(const LocalHistogramHandle &local) {
       const auto destination_local =
           config.topology.rank_to_local_rank[destination_rank];
       if (outgoing.local_offset[flat] != counts[expert]) {
-        fail(NotifyErrorCode::InvalidRouteShape,
-             "local offset mismatch at " + route_context(rank, token, slot) +
-                 ": expected=" + std::to_string(counts[expert]) +
-                 ", actual=" + std::to_string(outgoing.local_offset[flat]));
+        metadata_failure(NotifyErrorCode::InvalidRouteShape,
+                         "materialize-local", "outgoing.local_offset", rank,
+                         std::to_string(counts[expert]),
+                         std::to_string(outgoing.local_offset[flat]),
+                         "token=" + std::to_string(token) +
+                             ", slot=" + std::to_string(slot));
       }
       counts[expert] =
           checked_add(counts[expert], 1, "validated local expert count");
       if (outgoing.route_dst_rank[flat] != destination_rank ||
           outgoing.route_dst_node[flat] != destination_node ||
           outgoing.route_dst_local_rank[flat] != destination_local) {
-        fail(NotifyErrorCode::InvalidRouteShape,
-             "local destination coordinates mismatch at " +
-                 route_context(rank, token, slot) +
-                 ": expert=" + std::to_string(expert));
+        metadata_failure(NotifyErrorCode::InvalidRouteShape,
+                         "materialize-local", "outgoing.destination", rank,
+                         "topology-derived coordinates", "mismatch",
+                         "token=" + std::to_string(token) +
+                             ", slot=" + std::to_string(slot) +
+                             ", expert=" + std::to_string(expert));
       }
       nodes[destination_node] = true;
       const auto mask_base = checked_size(
@@ -469,18 +495,21 @@ void validate_local_structure(const LocalHistogramHandle &local) {
     for (std::uint32_t position = 0; position < outgoing.top_k; ++position) {
       const auto slot = outgoing.combine_order[base + position];
       if (slot >= outgoing.top_k || slots[slot]) {
-        fail(NotifyErrorCode::InvalidRouteShape,
-             "combine_order is not a permutation: rank=" +
-                 std::to_string(rank) + ", token=" + std::to_string(token) +
-                 ", position=" + std::to_string(position) +
-                 ", slot=" + std::to_string(slot));
+        metadata_failure(NotifyErrorCode::InvalidRouteShape,
+                         "materialize-local", "outgoing.combine_order", rank,
+                         "slot permutation [0," +
+                             std::to_string(outgoing.top_k) + ")",
+                         std::to_string(slot),
+                         "token=" + std::to_string(token) +
+                             ", position=" + std::to_string(position));
       }
       slots[slot] = true;
       const auto expert = outgoing.expert_id[base + slot];
       if (position != 0 && expert < prior_expert) {
-        fail(NotifyErrorCode::InvalidRouteShape,
-             "combine_order is not expert-sorted: rank=" +
-                 std::to_string(rank) + ", token=" + std::to_string(token));
+        metadata_failure(NotifyErrorCode::InvalidRouteShape,
+                         "materialize-local", "outgoing.combine_order", rank,
+                         "nondecreasing expert order", "decreasing order",
+                         "token=" + std::to_string(token));
       }
       prior_expert = expert;
     }
@@ -491,19 +520,19 @@ void validate_local_structure(const LocalHistogramHandle &local) {
     }
   }
   if (counts != local.local_expert_count().values()) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local expert count content mismatch for rank=" +
-             std::to_string(rank));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "local_expert_count", rank, "recomputed stable counts",
+                     "content mismatch");
   }
   if (packets != local.packet_count_by_destination_node().values()) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local packet summary content mismatch for rank=" +
-             std::to_string(rank));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "packet_count_by_destination_node", rank,
+                     "recomputed token-node counts", "content mismatch");
   }
   if (masks != outgoing.destination_node_mask) {
-    fail(NotifyErrorCode::InvalidRouteShape,
-         "local destination node mask content mismatch for rank=" +
-             std::to_string(rank));
+    metadata_failure(NotifyErrorCode::InvalidRouteShape, "materialize-local",
+                     "outgoing.destination_node_mask", rank,
+                     "recomputed node mask", "content mismatch");
   }
 }
 
@@ -614,6 +643,388 @@ std::uint64_t hash_metadata(const DispatchMetadata &metadata) {
   return hash.value();
 }
 
+void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
+                                       const char *phase) {
+  const auto derived = validate_config(metadata.config);
+  const auto &config = metadata.config;
+  const auto world = config.topology.world_size;
+  const auto experts = config.num_experts;
+  const auto rank = metadata.calling_rank;
+  if (rank >= world) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase, "calling_rank",
+                     rank, "[0," + std::to_string(world) + ")",
+                     std::to_string(rank));
+  }
+  if (metadata.source_expert_count.size() != world) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "source_expert_count.rows", rank, std::to_string(world),
+                     std::to_string(metadata.source_expert_count.size()));
+  }
+  for (std::uint32_t source = 0; source < world; ++source) {
+    if (metadata.source_expert_count[source].size() != experts) {
+      metadata_failure(
+          NotifyErrorCode::InvalidHandle, phase,
+          "source_expert_count.row_width", rank, std::to_string(experts),
+          std::to_string(metadata.source_expert_count[source].size()),
+          "source_rank=" + std::to_string(source));
+    }
+  }
+
+  const auto &out = metadata.outgoing;
+  if (out.top_k != config.top_k) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase, "outgoing.top_k",
+                     rank, std::to_string(config.top_k),
+                     std::to_string(out.top_k));
+  }
+  const auto route_count = checked_size(
+      checked_mul(out.num_tokens, out.top_k, "dispatch route count"),
+      "dispatch route count");
+  const auto require_routes = [&](std::size_t actual, const char *field) {
+    if (actual != route_count) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase, field, rank,
+                       std::to_string(route_count), std::to_string(actual));
+    }
+  };
+  require_routes(out.expert_id.size(), "outgoing.expert_id.size");
+  require_routes(out.local_offset.size(), "outgoing.local_offset.size");
+  require_routes(out.route_dst_row.size(), "outgoing.route_dst_row.size");
+  require_routes(out.route_dst_rank.size(), "outgoing.route_dst_rank.size");
+  require_routes(out.route_dst_node.size(), "outgoing.route_dst_node.size");
+  require_routes(out.route_dst_local_rank.size(),
+                 "outgoing.route_dst_local_rank.size");
+  require_routes(out.combine_order.size(), "outgoing.combine_order.size");
+  require_routes(out.reverse_routes.size(), "outgoing.reverse_routes.size");
+  const auto expected_mask_words = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(config.topology.num_nodes) + 63U) / 64U);
+  if (out.node_mask_words != expected_mask_words) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "outgoing.node_mask_words", rank,
+                     std::to_string(expected_mask_words),
+                     std::to_string(out.node_mask_words));
+  }
+  const auto mask_count =
+      checked_size(checked_mul(out.num_tokens, expected_mask_words,
+                               "dispatch destination masks"),
+                   "dispatch destination masks");
+  if (out.destination_node_mask.size() != mask_count) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "outgoing.destination_node_mask.size", rank,
+                     std::to_string(mask_count),
+                     std::to_string(out.destination_node_mask.size()));
+  }
+
+  CountMatrix source_prefix(static_cast<std::size_t>(world) + 1,
+                            std::vector<std::uint64_t>(experts, 0));
+  for (std::uint32_t source = 0; source < world; ++source) {
+    for (std::uint32_t expert = 0; expert < experts; ++expert) {
+      source_prefix[source + 1][expert] =
+          checked_add(source_prefix[source][expert],
+                      metadata.source_expert_count[source][expert],
+                      "dispatch source prefix");
+    }
+  }
+  const auto &expert_total = source_prefix.back();
+  std::vector<std::uint64_t> expert_base(experts, 0);
+  for (std::uint32_t destination = 0; destination < world; ++destination) {
+    std::uint64_t prefix = 0;
+    for (std::uint32_t expert = 0; expert < experts; ++expert) {
+      if (config.topology.expert_to_rank[expert] != destination)
+        continue;
+      expert_base[expert] = prefix;
+      prefix =
+          checked_add(prefix, expert_total[expert], "dispatch expert base");
+    }
+  }
+
+  std::vector<std::uint64_t> local_counts(experts, 0);
+  std::vector<std::uint64_t> expected_masks(mask_count, 0);
+  for (std::uint64_t token = 0; token < out.num_tokens; ++token) {
+    const auto base = checked_size(
+        checked_mul(token, out.top_k, "dispatch validation route base"),
+        "dispatch validation route base");
+    std::vector<std::uint32_t> expected_order(out.top_k);
+    std::iota(expected_order.begin(), expected_order.end(), 0U);
+    for (std::uint32_t slot = 0; slot < out.top_k; ++slot) {
+      const auto flat = base + slot;
+      const auto expert = out.expert_id[flat];
+      if (expert >= experts) {
+        metadata_failure(
+            NotifyErrorCode::ExpertOutOfRange, phase, "outgoing.expert_id",
+            rank, "[0," + std::to_string(experts) + ")", std::to_string(expert),
+            "token=" + std::to_string(token) +
+                ", slot=" + std::to_string(slot));
+      }
+      if (out.local_offset[flat] != local_counts[expert]) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "outgoing.local_offset", rank,
+                         std::to_string(local_counts[expert]),
+                         std::to_string(out.local_offset[flat]),
+                         "token=" + std::to_string(token) +
+                             ", slot=" + std::to_string(slot));
+      }
+      ++local_counts[expert];
+      const auto destination_rank = config.topology.expert_to_rank[expert];
+      const auto destination_node =
+          config.topology.rank_to_node[destination_rank];
+      const auto destination_local =
+          config.topology.rank_to_local_rank[destination_rank];
+      if (out.route_dst_rank[flat] != destination_rank ||
+          out.route_dst_node[flat] != destination_node ||
+          out.route_dst_local_rank[flat] != destination_local) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "outgoing.destination", rank,
+                         "topology-derived coordinates", "mismatch",
+                         "route=" + std::to_string(flat));
+      }
+      const auto expected_row = checked_add(
+          expert_base[expert],
+          checked_add(source_prefix[rank][expert], out.local_offset[flat],
+                      "dispatch canonical expert row"),
+          "dispatch canonical row");
+      if (out.route_dst_row[flat] != expected_row) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "outgoing.route_dst_row", rank,
+                         std::to_string(expected_row),
+                         std::to_string(out.route_dst_row[flat]),
+                         "route=" + std::to_string(flat));
+      }
+      const auto &reverse = out.reverse_routes[flat];
+      if (reverse.source_rank != rank || reverse.local_token_id != token ||
+          reverse.topk_slot != slot || reverse.expert_id != expert ||
+          reverse.destination_rank != destination_rank ||
+          reverse.dst_row != expected_row) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "outgoing.reverse_routes", rank,
+                         "canonical route identity", "mismatch",
+                         "route=" + std::to_string(flat));
+      }
+      const auto mask_base = checked_size(
+          checked_mul(token, expected_mask_words, "dispatch mask base"),
+          "dispatch mask base");
+      expected_masks[mask_base + destination_node / 64U] |=
+          std::uint64_t{1} << (destination_node % 64U);
+    }
+    std::stable_sort(
+        expected_order.begin(), expected_order.end(), [&](auto lhs, auto rhs) {
+          return out.expert_id[base + lhs] < out.expert_id[base + rhs];
+        });
+    for (std::uint32_t position = 0; position < out.top_k; ++position) {
+      if (out.combine_order[base + position] != expected_order[position]) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "outgoing.combine_order", rank,
+                         std::to_string(expected_order[position]),
+                         std::to_string(out.combine_order[base + position]),
+                         "token=" + std::to_string(token) +
+                             ", position=" + std::to_string(position));
+      }
+    }
+  }
+  if (local_counts != metadata.source_expert_count[rank]) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "source_expert_count.calling_rank_row", rank,
+                     "recomputed local counts", "content mismatch");
+  }
+  if (expected_masks != out.destination_node_mask) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "outgoing.destination_node_mask", rank,
+                     "recomputed node mask", "content mismatch");
+  }
+
+  const auto &incoming = metadata.incoming;
+  if (incoming.rank != rank) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase, "incoming.rank",
+                     rank, std::to_string(rank), std::to_string(incoming.rank));
+  }
+  std::vector<std::uint32_t> owned_experts;
+  for (std::uint32_t expert = 0; expert < experts; ++expert) {
+    if (config.topology.expert_to_rank[expert] == rank)
+      owned_experts.push_back(expert);
+  }
+  const auto owned = owned_experts.size();
+  const auto require_owned = [&](std::size_t actual, const char *field) {
+    if (actual != owned) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase, field, rank,
+                       std::to_string(owned), std::to_string(actual));
+    }
+  };
+  require_owned(incoming.expert_ids.size(), "incoming.expert_ids.size");
+  require_owned(incoming.expert_row_count.size(),
+                "incoming.expert_row_count.size");
+  require_owned(incoming.mtile_expected_rows.size(),
+                "incoming.mtile_expected_rows.size");
+  if (incoming.expert_row_prefix.size() != owned + 1) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "incoming.expert_row_prefix.size", rank,
+                     std::to_string(owned + 1),
+                     std::to_string(incoming.expert_row_prefix.size()));
+  }
+  std::uint64_t incoming_total = 0;
+  for (std::size_t index = 0; index < owned; ++index) {
+    const auto expert = owned_experts[index];
+    if (incoming.expert_ids[index] != expert) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "incoming.expert_ids", rank, std::to_string(expert),
+                       std::to_string(incoming.expert_ids[index]),
+                       "index=" + std::to_string(index));
+    }
+    if (incoming.expert_row_count[index] != expert_total[expert]) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "incoming.expert_row_count", rank,
+                       std::to_string(expert_total[expert]),
+                       std::to_string(incoming.expert_row_count[index]),
+                       "expert=" + std::to_string(expert));
+    }
+    if (incoming.expert_row_prefix[index] != incoming_total) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "incoming.expert_row_prefix", rank,
+                       std::to_string(incoming_total),
+                       std::to_string(incoming.expert_row_prefix[index]),
+                       "index=" + std::to_string(index));
+    }
+    incoming_total = checked_add(incoming_total, expert_total[expert],
+                                 "validated incoming prefix");
+    std::vector<std::uint32_t> expected_tiles;
+    for (std::uint64_t first = 0; first < expert_total[expert];) {
+      const auto remaining = expert_total[expert] - first;
+      expected_tiles.push_back(static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(remaining, config.m_tile_rows)));
+      if (remaining <= config.m_tile_rows)
+        break;
+      first = checked_add(first, config.m_tile_rows, "validated M-tile offset");
+    }
+    if (incoming.mtile_expected_rows[index] != expected_tiles) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "incoming.mtile_expected_rows", rank,
+                       "canonical tile rows", "content mismatch",
+                       "expert=" + std::to_string(expert));
+    }
+  }
+  if (incoming.expert_row_prefix.back() != incoming_total) {
+    metadata_failure(
+        NotifyErrorCode::InvalidHandle, phase, "incoming.expert_row_prefix",
+        rank, std::to_string(incoming_total),
+        std::to_string(incoming.expert_row_prefix.back()), "index=terminal");
+  }
+
+  std::vector<OutgoingPacketDescriptor> expected_packets;
+  const auto source_local = config.topology.rank_to_local_rank[rank];
+  std::vector<std::uint64_t> sequence(config.topology.num_nodes, 0);
+  for (std::uint32_t node = 0; node < config.topology.num_nodes; ++node) {
+    const auto proxy =
+        derived.rank_at[static_cast<std::size_t>(node) * derived.gpus_per_node +
+                        source_local];
+    for (std::uint64_t token = 0; token < out.num_tokens; ++token) {
+      const auto base =
+          checked_size(checked_mul(token, out.top_k, "validated packet base"),
+                       "validated packet base");
+      std::vector<FanoutTarget> fanout;
+      for (std::uint32_t slot = 0; slot < out.top_k; ++slot) {
+        const auto flat = base + slot;
+        if (out.route_dst_node[flat] == node) {
+          fanout.push_back(FanoutTarget{slot, out.route_dst_local_rank[flat],
+                                        out.expert_id[flat],
+                                        out.route_dst_row[flat]});
+        }
+      }
+      if (fanout.empty())
+        continue;
+      std::stable_sort(fanout.begin(), fanout.end(),
+                       [](const auto &lhs, const auto &rhs) {
+                         return lhs.expert_id < rhs.expert_id;
+                       });
+      expected_packets.push_back(
+          OutgoingPacketDescriptor{PacketIdentity{rank, node, sequence[node]++},
+                                   token, proxy, 0, std::move(fanout)});
+    }
+  }
+  const auto &actual_packets = metadata.transport.outgoing_packets;
+  if (actual_packets.size() != expected_packets.size()) {
+    metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                     "transport.outgoing_packets.size", rank,
+                     std::to_string(expected_packets.size()),
+                     std::to_string(actual_packets.size()));
+  }
+  for (std::size_t packet = 0; packet < expected_packets.size(); ++packet) {
+    const auto &expected = expected_packets[packet];
+    const auto &actual = actual_packets[packet];
+    const auto packet_coord = "packet=" + std::to_string(packet);
+    if (actual.identity.source_rank != expected.identity.source_rank ||
+        actual.identity.destination_node !=
+            expected.identity.destination_node ||
+        actual.identity.sequence_on_link !=
+            expected.identity.sequence_on_link) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "transport.packet.identity", rank,
+                       "canonical packet identity", "mismatch", packet_coord);
+    }
+    if (actual.local_token_id != expected.local_token_id) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "transport.packet.local_token_id", rank,
+                       std::to_string(expected.local_token_id),
+                       std::to_string(actual.local_token_id), packet_coord);
+    }
+    if (actual.proxy_rank != expected.proxy_rank) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "transport.packet.proxy_rank", rank,
+                       std::to_string(expected.proxy_rank),
+                       std::to_string(actual.proxy_rank), packet_coord);
+    }
+    if (actual.channel != expected.channel) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "transport.packet.channel", rank,
+                       std::to_string(expected.channel),
+                       std::to_string(actual.channel), packet_coord);
+    }
+    if (actual.fanout.size() != expected.fanout.size()) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "transport.packet.fanout.size", rank,
+                       std::to_string(expected.fanout.size()),
+                       std::to_string(actual.fanout.size()), packet_coord);
+    }
+    for (std::size_t target = 0; target < expected.fanout.size(); ++target) {
+      const auto &expected_target = expected.fanout[target];
+      const auto &actual_target = actual.fanout[target];
+      const auto target_coord =
+          packet_coord + ", target=" + std::to_string(target);
+      if (actual_target.topk_slot != expected_target.topk_slot) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "transport.fanout.topk_slot", rank,
+                         std::to_string(expected_target.topk_slot),
+                         std::to_string(actual_target.topk_slot), target_coord);
+      }
+      if (actual_target.destination_local_rank !=
+          expected_target.destination_local_rank) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "transport.fanout.destination_local_rank", rank,
+                         std::to_string(expected_target.destination_local_rank),
+                         std::to_string(actual_target.destination_local_rank),
+                         target_coord);
+      }
+      if (actual_target.expert_id != expected_target.expert_id) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "transport.fanout.expert_id", rank,
+                         std::to_string(expected_target.expert_id),
+                         std::to_string(actual_target.expert_id), target_coord);
+      }
+      if (actual_target.dst_row != expected_target.dst_row) {
+        metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                         "transport.fanout.dst_row", rank,
+                         std::to_string(expected_target.dst_row),
+                         std::to_string(actual_target.dst_row), target_coord);
+      }
+    }
+  }
+  if (metadata.identity.content_hash != 0) {
+    const auto expected_hash = hash_metadata(metadata);
+    if (metadata.identity.content_hash != expected_hash) {
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase,
+                       "identity.content_hash", rank,
+                       std::to_string(expected_hash),
+                       std::to_string(metadata.identity.content_hash));
+    }
+  }
+}
+
 } // namespace
 
 class DispatchHandleFactory {
@@ -635,6 +1046,10 @@ const DispatchMetadata &DispatchHandle::metadata() const {
          "attempted to access an empty/default DispatchHandle");
   }
   return *metadata_;
+}
+
+void validate_dispatch_metadata(const DispatchHandle &handle) {
+  validate_dispatch_metadata_object(handle.metadata(), "dispatch-validation");
 }
 
 const RuntimeConfig &LocalHistogramHandle::config() const {
@@ -701,6 +1116,152 @@ LocalHistogramHandle testing::NotifyCorruptionHook::with_truncated_expert_ids(
   if (!impl->outgoing.expert_id.empty())
     impl->outgoing.expert_id.pop_back();
   return LocalHistogramHandle(std::move(impl));
+}
+
+LocalHistogramHandle testing::NotifyCorruptionHook::with_local_offset(
+    const LocalHistogramHandle &source, std::size_t route_index,
+    std::uint64_t value) {
+  if (!source.impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "phase=corruption-hook, field=local, rank=unknown, expected=valid, "
+         "actual=empty");
+  auto impl = std::make_shared<LocalHistogramHandle::Impl>(*source.impl_);
+  impl->outgoing.local_offset.at(route_index) = value;
+  return LocalHistogramHandle(std::move(impl));
+}
+
+LocalHistogramHandle testing::NotifyCorruptionHook::with_combine_order(
+    const LocalHistogramHandle &source, std::size_t route_index,
+    std::uint32_t value) {
+  if (!source.impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "phase=corruption-hook, field=local, rank=unknown, expected=valid, "
+         "actual=empty");
+  auto impl = std::make_shared<LocalHistogramHandle::Impl>(*source.impl_);
+  impl->outgoing.combine_order.at(route_index) = value;
+  return LocalHistogramHandle(std::move(impl));
+}
+
+LocalHistogramHandle testing::NotifyCorruptionHook::with_node_mask(
+    const LocalHistogramHandle &source, std::size_t word_index,
+    std::uint64_t value) {
+  if (!source.impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "phase=corruption-hook, field=local, rank=unknown, expected=valid, "
+         "actual=empty");
+  auto impl = std::make_shared<LocalHistogramHandle::Impl>(*source.impl_);
+  impl->outgoing.destination_node_mask.at(word_index) = value;
+  return LocalHistogramHandle(std::move(impl));
+}
+
+LocalHistogramHandle testing::NotifyCorruptionHook::with_local_expert_count(
+    const LocalHistogramHandle &source, std::size_t expert_index,
+    std::uint64_t value) {
+  if (!source.impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "phase=corruption-hook, field=local, rank=unknown, expected=valid, "
+         "actual=empty");
+  auto impl = std::make_shared<LocalHistogramHandle::Impl>(*source.impl_);
+  auto counts = impl->local_expert_count.values();
+  counts.at(expert_index) = value;
+  impl->local_expert_count = make_host_integer_row(std::move(counts));
+  return LocalHistogramHandle(std::move(impl));
+}
+
+ValidatedCollectiveHandle testing::NotifyCorruptionHook::with_collective_matrix(
+    const ValidatedCollectiveHandle &source, const CountMatrix &matrix) {
+  if (!source.impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "phase=corruption-hook, field=completion, rank=unknown, "
+         "expected=valid, "
+         "actual=empty");
+  auto impl = std::make_shared<ValidatedCollectiveHandle::Impl>(*source.impl_);
+  impl->matrix = make_host_count_matrix(matrix);
+  return ValidatedCollectiveHandle(std::move(impl));
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_expert_row_count(
+    const DispatchHandle &source, std::size_t expert_index,
+    std::uint64_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->incoming.expert_row_count.at(expert_index) = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_expert_row_prefix(
+    const DispatchHandle &source, std::size_t prefix_index,
+    std::uint64_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->incoming.expert_row_prefix.at(prefix_index) = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle
+testing::NotifyCorruptionHook::with_packet_identity_destination_node(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .identity.destination_node = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle
+testing::NotifyCorruptionHook::with_packet_proxy(const DispatchHandle &source,
+                                                 std::size_t packet_index,
+                                                 std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index).proxy_rank = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_fanout_expert(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::size_t target_index, std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .fanout.at(target_index)
+      .expert_id = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_fanout_local_rank(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::size_t target_index, std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .fanout.at(target_index)
+      .destination_local_rank = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_fanout_row(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::size_t target_index, std::uint64_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .fanout.at(target_index)
+      .dst_row = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_fanout_slot(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::size_t target_index, std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .fanout.at(target_index)
+      .topk_slot = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
+DispatchHandle testing::NotifyCorruptionHook::with_mtile_row(
+    const DispatchHandle &source, std::size_t expert_index,
+    std::size_t tile_index, std::uint32_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->incoming.mtile_expected_rows.at(expert_index).at(tile_index) =
+      value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
 }
 
 const RankCollectiveContext &ValidatedCollectiveHandle::context() const {
@@ -856,26 +1417,28 @@ CollectiveOperation start_count_exchange(const LocalHistogramHandle &local,
   }
   const auto &context = local.context();
   auto impl = std::make_unique<CollectiveOperation::Impl>();
-  impl->local = local;
-  impl->context = context;
-  impl->kind = ExchangeKind::ExpertCounts;
-  impl->row_width = local.config().num_experts;
-  impl->input = local.local_expert_count();
+  auto resources = std::make_shared<OperationResourceLease>();
+  resources->local = local;
+  resources->context = context;
+  resources->kind = ExchangeKind::ExpertCounts;
+  resources->row_width = local.config().num_experts;
+  resources->input = local.local_expert_count();
   try {
-    impl->backend = backend.start(CountExchangeRequest{
-        context, impl->kind, impl->row_width, impl->input});
-    if (!impl->backend)
+    resources->backend = backend.start(CountExchangeRequest{
+        context, resources->kind, resources->row_width, resources->input});
+    if (!resources->backend)
       throw std::runtime_error("backend returned null operation");
   } catch (const NotifyDispatchError &error) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (const std::exception &error) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (...) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='unknown non-standard exception'");
   }
+  impl->resources = std::move(resources);
   return CollectiveOperation(std::move(impl));
 }
 
@@ -889,26 +1452,28 @@ start_notify_summary_exchange(const LocalHistogramHandle &local,
   }
   const auto &context = local.context();
   auto impl = std::make_unique<CollectiveOperation::Impl>();
-  impl->local = local;
-  impl->context = context;
-  impl->kind = ExchangeKind::NotifyPacketSummary;
-  impl->row_width = local.config().topology.num_nodes;
-  impl->input = local.packet_count_by_destination_node();
+  auto resources = std::make_shared<OperationResourceLease>();
+  resources->local = local;
+  resources->context = context;
+  resources->kind = ExchangeKind::NotifyPacketSummary;
+  resources->row_width = local.config().topology.num_nodes;
+  resources->input = local.packet_count_by_destination_node();
   try {
-    impl->backend = backend.start(CountExchangeRequest{
-        context, impl->kind, impl->row_width, impl->input});
-    if (!impl->backend)
+    resources->backend = backend.start(CountExchangeRequest{
+        context, resources->kind, resources->row_width, resources->input});
+    if (!resources->backend)
       throw std::runtime_error("backend returned null operation");
   } catch (const NotifyDispatchError &error) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (const std::exception &error) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (...) {
-    exchange_failure("start", impl->kind, context,
+    exchange_failure("start", resources->kind, context,
                      "backend_error='unknown non-standard exception'");
   }
+  impl->resources = std::move(resources);
   return CollectiveOperation(std::move(impl));
 }
 
@@ -918,16 +1483,17 @@ CollectiveOperation::CollectiveOperation(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
 CollectiveOperation::~CollectiveOperation() noexcept {
-  if (!impl_ || impl_->terminal || !impl_->backend)
+  if (!impl_ || !impl_->resources || impl_->resources->terminal ||
+      !impl_->resources->backend)
     return;
   try {
-    impl_->backend->cancel();
+    impl_->resources->backend->cancel();
   } catch (...) {
     // Destructors are a no-throw cleanup boundary. Explicit cancel() exposes
     // the same backend error as CountExchangeFailure when the caller cares.
   }
-  impl_->terminal = true;
-  impl_->terminal_state = ExchangeState::Cancelled;
+  impl_->resources->terminal = true;
+  impl_->resources->terminal_state = ExchangeState::Cancelled;
 }
 
 CollectiveOperation::CollectiveOperation(CollectiveOperation &&other) noexcept =
@@ -937,11 +1503,14 @@ CollectiveOperation &
 CollectiveOperation::operator=(CollectiveOperation &&other) noexcept {
   if (this == &other)
     return *this;
-  if (impl_ && !impl_->terminal && impl_->backend) {
+  if (impl_ && impl_->resources && !impl_->resources->terminal &&
+      impl_->resources->backend) {
     try {
-      impl_->backend->cancel();
+      impl_->resources->backend->cancel();
     } catch (...) {
     }
+    impl_->resources->terminal = true;
+    impl_->resources->terminal_state = ExchangeState::Cancelled;
   }
   impl_ = std::move(other.impl_);
   return *this;
@@ -950,11 +1519,14 @@ CollectiveOperation::operator=(CollectiveOperation &&other) noexcept {
 ExchangeState CollectiveOperation::state() const noexcept {
   if (!impl_)
     return ExchangeState::Failed;
-  if (impl_->terminal)
-    return impl_->terminal_state;
-  if (!impl_->backend)
+  const auto &resources = impl_->resources;
+  if (!resources)
     return ExchangeState::Failed;
-  return impl_->backend->state();
+  if (resources->terminal)
+    return resources->terminal_state;
+  if (!resources->backend)
+    return ExchangeState::Failed;
+  return resources->backend->state();
 }
 
 ValidatedCollectiveHandle CollectiveOperation::wait() {
@@ -963,60 +1535,70 @@ ValidatedCollectiveHandle CollectiveOperation::wait() {
         NotifyErrorCode::CountExchangeFailure,
         "phase=wait, operation mismatch: expected=valid, actual=empty/default");
   }
-  if (impl_->terminal || impl_->waited) {
+  auto resources = impl_->resources;
+  if (!resources) {
+    fail(NotifyErrorCode::CountExchangeFailure,
+         "phase=wait, field=operation.resources, rank=unknown, expected=valid, "
+         "actual=empty");
+  }
+  if (resources->terminal || resources->waited) {
     exchange_failure(
-        "wait", impl_->kind, impl_->context,
+        "wait", resources->kind, resources->context,
         "operation state mismatch: expected=pending, actual=terminal");
   }
-  impl_->waited = true;
+  resources->waited = true;
   try {
-    auto completion = impl_->backend->wait();
-    validate_backend_completion(completion, impl_->context, impl_->kind,
-                                impl_->row_width);
+    auto completion = resources->backend->wait();
+    validate_backend_completion(completion, resources->context, resources->kind,
+                                resources->row_width);
+    auto completion_resources = std::make_shared<CompletionResourceLease>();
+    completion_resources->operation = resources;
+    completion_resources->completion = std::move(completion);
     auto validated = std::make_shared<ValidatedCollectiveHandle::Impl>();
-    validated->context = impl_->context;
-    validated->kind = impl_->kind;
-    validated->matrix = completion.host_result();
-    validated->local_provenance = impl_->local.impl_->provenance;
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Complete;
+    validated->context = resources->context;
+    validated->kind = resources->kind;
+    validated->matrix = completion_resources->completion.host_result();
+    validated->local_provenance = resources->local.impl_->provenance;
+    validated->resources = std::move(completion_resources);
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Complete;
     return ValidatedCollectiveHandle(std::move(validated));
   } catch (const NotifyDispatchError &error) {
     std::string cleanup;
     try {
-      impl_->backend->cancel();
+      resources->backend->cancel();
     } catch (const std::exception &cancel_error) {
       cleanup = ", cancel_error='" + exception_text(cancel_error) + "'";
     } catch (...) {
       cleanup = ", cancel_error='unknown non-standard exception'";
     }
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("wait", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("wait", resources->kind, resources->context,
                      "backend_error='" + exception_text(error) + "'" + cleanup);
   } catch (const std::exception &error) {
     std::string cleanup;
     try {
-      impl_->backend->cancel();
+      resources->backend->cancel();
     } catch (const std::exception &cancel_error) {
       cleanup = ", cancel_error='" + exception_text(cancel_error) + "'";
     } catch (...) {
       cleanup = ", cancel_error='unknown non-standard exception'";
     }
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("wait", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("wait", resources->kind, resources->context,
                      "backend_error='" + exception_text(error) + "'" + cleanup);
   } catch (...) {
     std::string cleanup;
     try {
-      impl_->backend->cancel();
+      resources->backend->cancel();
     } catch (...) {
       cleanup = ", cancel_error='exception during cleanup'";
     }
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("wait", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("wait", resources->kind, resources->context,
                      "backend_error='unknown non-standard exception'" +
                          cleanup);
   }
@@ -1028,26 +1610,33 @@ void CollectiveOperation::cancel() {
          "phase=cancel, operation mismatch: expected=valid, "
          "actual=empty/default");
   }
-  if (impl_->terminal)
+  auto resources = impl_->resources;
+  if (!resources) {
+    fail(NotifyErrorCode::CountExchangeFailure,
+         "phase=cancel, field=operation.resources, rank=unknown, "
+         "expected=valid, "
+         "actual=empty");
+  }
+  if (resources->terminal)
     return;
   try {
-    impl_->backend->cancel();
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Cancelled;
+    resources->backend->cancel();
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Cancelled;
   } catch (const NotifyDispatchError &error) {
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("cancel", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("cancel", resources->kind, resources->context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (const std::exception &error) {
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("cancel", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("cancel", resources->kind, resources->context,
                      "backend_error='" + exception_text(error) + "'");
   } catch (...) {
-    impl_->terminal = true;
-    impl_->terminal_state = ExchangeState::Failed;
-    exchange_failure("cancel", impl_->kind, impl_->context,
+    resources->terminal = true;
+    resources->terminal_state = ExchangeState::Failed;
+    exchange_failure("cancel", resources->kind, resources->context,
                      "backend_error='unknown non-standard exception'");
   }
 }
@@ -1084,63 +1673,63 @@ materialize_rank_metadata(const LocalHistogramHandle &local,
     const auto &expected = local.impl_->context;
     if (completion.impl_->kind != expected_kind) {
       exchange_failure("materialize", expected_kind, expected,
-                       "collective kind mismatch: expected=" +
+                       "field=collective.kind, expected=" +
                            std::string(kind_name(expected_kind)) +
                            ", actual=" + kind_name(completion.impl_->kind));
     }
     if (actual.calling_rank() != expected.calling_rank()) {
       exchange_failure("materialize", expected_kind, expected,
-                       "calling_rank mismatch: expected=" +
+                       "field=calling_rank, expected=" +
                            std::to_string(expected.calling_rank()) +
                            ", actual=" + std::to_string(actual.calling_rank()));
     }
     if (actual.session().world_size() != expected.session().world_size()) {
       exchange_failure(
           "materialize", expected_kind, expected,
-          "world_size mismatch: expected=" +
+          "field=world_size, expected=" +
               std::to_string(expected.session().world_size()) +
               ", actual=" + std::to_string(actual.session().world_size()));
     }
     if (actual.session().identity() != expected.session().identity()) {
       exchange_failure("materialize", expected_kind, expected,
-                       "session identity mismatch: expected='" +
+                       "field=session.identity, expected='" +
                            expected.session().identity() + "', actual='" +
                            actual.session().identity() + "'");
     }
     if (actual.session().generation() != expected.session().generation()) {
       exchange_failure(
           "materialize", expected_kind, expected,
-          "generation mismatch: expected=" +
+          "field=session.generation, expected=" +
               std::to_string(expected.session().generation()) +
               ", actual=" + std::to_string(actual.session().generation()));
     }
     if (!actual.session().same_instance(expected.session())) {
       exchange_failure("materialize", expected_kind, expected,
-                       "session provenance mismatch: expected=same session "
+                       "field=session.provenance, expected=same session "
                        "instance, actual=different session instance");
     }
     if (!actual.execution().same_instance(expected.execution())) {
       exchange_failure("materialize", expected_kind, expected,
-                       "execution token mismatch: expected='" +
+                       "field=execution.provenance, expected='" +
                            expected.execution().identity() + "', actual='" +
                            actual.execution().identity() + "'");
     }
     if (completion.impl_->local_provenance != local.impl_->provenance) {
       exchange_failure("materialize", expected_kind, expected,
-                       "local histogram provenance mismatch: expected=same "
+                       "field=local.provenance, expected=same "
                        "local handle, actual=different local handle");
     }
     if (completion.impl_->matrix.rows() != world_size) {
       exchange_failure(
           "materialize", expected_kind, expected,
-          "matrix rows mismatch: expected=" + std::to_string(world_size) +
+          "field=matrix.rows, expected=" + std::to_string(world_size) +
               ", actual=" + std::to_string(completion.impl_->matrix.rows()));
     }
     if (completion.impl_->matrix.row_width() != expected_width) {
       exchange_failure(
           "materialize", expected_kind, expected,
-          "matrix row_width mismatch: expected=" +
-              std::to_string(expected_width) + ", actual=" +
+          "field=matrix.row_width, expected=" + std::to_string(expected_width) +
+              ", actual=" +
               std::to_string(completion.impl_->matrix.row_width()));
     }
     (void)checked_mul(world_size, expected_width,
@@ -1171,15 +1760,15 @@ materialize_rank_metadata(const LocalHistogramHandle &local,
                      "non-standard exception'");
   }
   if (counts.at(rank) != local.impl_->local_expert_count.values()) {
-    fail(NotifyErrorCode::CountExchangeFailure,
-         "count collective corrupted calling rank row: rank=" +
-             std::to_string(rank));
+    metadata_failure(NotifyErrorCode::CountExchangeFailure, "materialize",
+                     "expert_counts.calling_rank_row", rank,
+                     "local histogram count row", "content mismatch");
   }
   if (summaries.at(rank) !=
       local.impl_->packet_count_by_destination_node.values()) {
-    fail(NotifyErrorCode::CountExchangeFailure,
-         "notify summary collective corrupted calling rank row: rank=" +
-             std::to_string(rank));
+    metadata_failure(NotifyErrorCode::CountExchangeFailure, "materialize",
+                     "packet_summary.calling_rank_row", rank,
+                     "local histogram summary row", "content mismatch");
   }
 
   CountMatrix source_prefix(static_cast<std::size_t>(world_size) + 1,
@@ -1365,6 +1954,7 @@ materialize_rank_metadata(const LocalHistogramHandle &local,
                           rank, rail_local_rank, 0, expected, expected});
   }
 
+  validate_dispatch_metadata_object(*metadata, "materialize-output");
   metadata->identity.content_hash = hash_metadata(*metadata);
   return DispatchHandleFactory::make(std::move(metadata));
 }

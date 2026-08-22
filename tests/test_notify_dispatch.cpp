@@ -187,11 +187,26 @@ struct BackendBehavior {
   bool override_kind = false;
   ExchangeKind returned_kind = ExchangeKind::ExpertCounts;
   bool return_device = false;
+  std::size_t wait_calls = 0;
   std::size_t cancel_calls = 0;
+  std::size_t operation_destructs = 0;
+  std::size_t completion_lease_destructs = 0;
   std::weak_ptr<const void> input_lifetime;
 };
 
 class TestDeviceLease final : public megamoe::BackendDeviceLeaseState {};
+
+class TestCompletionLease final : public megamoe::BackendCompletionLeaseState {
+public:
+  explicit TestCompletionLease(std::shared_ptr<BackendBehavior> behavior)
+      : behavior_(std::move(behavior)) {}
+  ~TestCompletionLease() noexcept override {
+    ++behavior_->completion_lease_destructs;
+  }
+
+private:
+  std::shared_ptr<BackendBehavior> behavior_;
+};
 
 class ScriptedOperation final : public BackendCountExchangeOperation {
 public:
@@ -199,11 +214,14 @@ public:
                     CountExchangeRequest request)
       : behavior_(std::move(behavior)), request_(std::move(request)) {}
 
+  ~ScriptedOperation() noexcept override { ++behavior_->operation_destructs; }
+
   ExchangeState state() const noexcept override {
     return ExchangeState::Complete;
   }
 
   BackendCompletion wait() override {
+    ++behavior_->wait_calls;
     if (behavior_->wait != ThrowMode::None) {
       throw_mode(behavior_->wait, "wait");
     }
@@ -219,10 +237,13 @@ public:
           std::move(context), kind,
           megamoe::make_device_buffer_lease(
               static_cast<std::uint32_t>(rows.size()), request_.row_width,
-              std::make_shared<TestDeviceLease>()));
+              static_cast<std::uint64_t>(rows.size()) * request_.row_width,
+              std::make_shared<TestDeviceLease>()),
+          std::make_shared<TestCompletionLease>(behavior_));
     }
     return megamoe::make_host_backend_completion(
-        std::move(context), kind, megamoe::make_host_count_matrix(rows));
+        std::move(context), kind, megamoe::make_host_count_matrix(rows),
+        std::make_shared<TestCompletionLease>(behavior_));
   }
 
   void cancel() override {
@@ -377,6 +398,23 @@ void test_topology_route_capacity_and_overflow() {
                      sparse, make_context(sparse, 0), {});
                },
                {"local coordinate"});
+  auto duplicate = make_config(2, 2, 8, 2, 4);
+  duplicate.topology.rank_to_node[2] = 0;
+  duplicate.topology.rank_to_local_rank[2] = 0;
+  expect_error(NotifyErrorCode::InvalidTopology,
+               [&] {
+                 megamoe::build_rank_local_histogram(
+                     duplicate, make_context(duplicate, 0), {});
+               },
+               {"duplicate topology coordinate", "node=0", "local_rank=0"});
+  auto bad_node = make_config(2, 2, 8, 2, 4);
+  bad_node.topology.rank_to_node[0] = 2;
+  expect_error(NotifyErrorCode::InvalidTopology,
+               [&] {
+                 megamoe::build_rank_local_histogram(
+                     bad_node, make_context(bad_node, 0), {});
+               },
+               {"out-of-range node coordinate", "rank=0", "node=2"});
   auto topk = make_config(1, 1, 2, 3, 4);
   expect_error(NotifyErrorCode::InvalidRuntimeConfig,
                [&] {
@@ -422,6 +460,71 @@ void test_topology_route_capacity_and_overflow() {
                                                             "workspace-cap", 1);
                },
                {"destination_rank=0", "actual_rows=3", "capacity=2"});
+}
+
+void test_operation_move_and_terminal_state_machine() {
+  const auto config = make_config(1, 1, 2, 1, 4);
+  const auto local = megamoe::build_rank_local_histogram(
+      config, make_context(config, 0, "state", 1), {1, {0}});
+
+  auto success = std::make_shared<BackendBehavior>();
+  success->expert_rows = {{1, 0}};
+  ScriptedBackend success_backend(success);
+  auto original = megamoe::start_count_exchange(local, success_backend);
+  CollectiveOperation moved(std::move(original));
+  REQUIRE(!original);
+  auto *self_alias = &moved;
+  moved = std::move(*self_alias);
+  REQUIRE(static_cast<bool>(moved));
+  const auto validated = moved.wait();
+  REQUIRE(validated.rows() == 1);
+  REQUIRE(success->wait_calls == 1);
+  REQUIRE(success->cancel_calls == 0);
+  moved.cancel();
+  moved.cancel();
+  REQUIRE(success->cancel_calls == 0);
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] { (void)moved.wait(); },
+               {"phase=wait", "expected=pending", "actual=terminal"});
+  REQUIRE(success->wait_calls == 1);
+
+  auto cancelled = std::make_shared<BackendBehavior>();
+  cancelled->expert_rows = {{1, 0}};
+  ScriptedBackend cancelled_backend(cancelled);
+  {
+    auto operation = megamoe::start_count_exchange(local, cancelled_backend);
+    operation.cancel();
+    operation.cancel();
+    REQUIRE(cancelled->cancel_calls == 1);
+    expect_error(NotifyErrorCode::CountExchangeFailure,
+                 [&] { (void)operation.wait(); },
+                 {"phase=wait", "actual=terminal"});
+    REQUIRE(cancelled->wait_calls == 0);
+  }
+  REQUIRE(cancelled->cancel_calls == 1);
+  REQUIRE(cancelled->operation_destructs == 1);
+
+  auto destination = std::make_shared<BackendBehavior>();
+  destination->expert_rows = {{1, 0}};
+  ScriptedBackend destination_backend(destination);
+  auto source = std::make_shared<BackendBehavior>();
+  source->expert_rows = {{1, 0}};
+  ScriptedBackend source_backend(source);
+  {
+    auto destination_operation =
+        megamoe::start_count_exchange(local, destination_backend);
+    auto source_operation =
+        megamoe::start_count_exchange(local, source_backend);
+    destination_operation = std::move(source_operation);
+    REQUIRE(destination->cancel_calls == 1);
+    REQUIRE(!source_operation);
+    destination_operation.cancel();
+    REQUIRE(source->cancel_calls == 1);
+  }
+  REQUIRE(destination->cancel_calls == 1);
+  REQUIRE(source->cancel_calls == 1);
+  REQUIRE(destination->operation_destructs == 1);
+  REQUIRE(source->operation_destructs == 1);
 }
 
 void test_typed_storage_lifetimes_and_unwaited_destruction() {
@@ -471,6 +574,7 @@ void test_typed_storage_lifetimes_and_unwaited_destruction() {
       (void)operation;
     }
     REQUIRE(throwing->cancel_calls == 1);
+    REQUIRE(throwing->operation_destructs == 1);
   }
 
   auto retained_session_state = std::make_shared<SessionState>();
@@ -499,13 +603,25 @@ void test_typed_storage_lifetimes_and_unwaited_destruction() {
   retained_context = {};
   retained_local = {};
   retained_operation = {};
+  REQUIRE(!retained_behavior->input_lifetime.expired());
   REQUIRE(!retained_session.expired());
   REQUIRE(!retained_execution.expired());
+  REQUIRE(retained_behavior->wait_calls == 1);
+  REQUIRE(retained_behavior->cancel_calls == 0);
+  REQUIRE(retained_behavior->operation_destructs == 0);
+  REQUIRE(retained_behavior->completion_lease_destructs == 0);
   REQUIRE(validated_move.rows() == 1);
   validated = {};
+  REQUIRE(retained_behavior->operation_destructs == 0);
+  REQUIRE(retained_behavior->completion_lease_destructs == 0);
   validated_move = {};
+  REQUIRE(retained_behavior->input_lifetime.expired());
   REQUIRE(retained_session.expired());
   REQUIRE(retained_execution.expired());
+  REQUIRE(retained_behavior->wait_calls == 1);
+  REQUIRE(retained_behavior->cancel_calls == 0);
+  REQUIRE(retained_behavior->operation_destructs == 1);
+  REQUIRE(retained_behavior->completion_lease_destructs == 1);
 }
 
 void test_backend_exception_boundaries_and_device_rejection() {
@@ -539,6 +655,10 @@ void test_backend_exception_boundaries_and_device_rejection() {
     expect_error(NotifyErrorCode::CountExchangeFailure,
                  [&] { (void)operation.wait(); },
                  {"phase=wait", "backend_error"});
+    REQUIRE(behavior->wait_calls == 1);
+    REQUIRE(behavior->cancel_calls == 1);
+    operation = {};
+    REQUIRE(behavior->operation_destructs == 1);
     REQUIRE(behavior->cancel_calls == 1);
   }
   for (const auto mode :
@@ -551,6 +671,10 @@ void test_backend_exception_boundaries_and_device_rejection() {
     expect_error(NotifyErrorCode::CountExchangeFailure,
                  [&] { operation.cancel(); },
                  {"phase=cancel", "backend_error"});
+    REQUIRE(behavior->cancel_calls == 1);
+    operation = {};
+    REQUIRE(behavior->operation_destructs == 1);
+    REQUIRE(behavior->cancel_calls == 1);
   }
   auto device_behavior = std::make_shared<BackendBehavior>();
   device_behavior->expert_rows = {{1, 0}};
@@ -578,7 +702,47 @@ void test_backend_exception_boundaries_and_device_rejection() {
   auto shape_op = megamoe::start_count_exchange(local, shape_backend);
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] { (void)shape_op.wait(); },
-               {"matrix rows mismatch", "expected=1", "actual=0"});
+               {"field=matrix.rows", "expected=1", "actual=0"});
+
+  const auto valid_device = megamoe::make_device_buffer_lease(
+      2, 3, 8, std::make_shared<TestDeviceLease>());
+  REQUIRE(valid_device.rows() == 2);
+  REQUIRE(valid_device.row_width() == 3);
+  REQUIRE(valid_device.element_count() == 6);
+  REQUIRE(valid_device.capacity_elements() == 8);
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::make_device_buffer_lease(
+                     0, 3, 3, std::make_shared<TestDeviceLease>());
+               },
+               {"phase=device-lease-validation", "field=rows", "expected=>0",
+                "actual=0"});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::make_device_buffer_lease(
+                     1, 0, 1, std::make_shared<TestDeviceLease>());
+               },
+               {"field=row_width", "expected=>0", "actual=0"});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::make_device_buffer_lease(
+                     2, 4, 7, std::make_shared<TestDeviceLease>());
+               },
+               {"field=capacity_elements", "expected=>=8", "actual=7"});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::make_device_buffer_lease(
+                     1, 1, 0, std::make_shared<TestDeviceLease>());
+               },
+               {"field=capacity_elements", "expected=>0", "actual=0"});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::make_device_buffer_lease(
+                     2, std::numeric_limits<std::uint64_t>::max(),
+                     std::numeric_limits<std::uint64_t>::max(),
+                     std::make_shared<TestDeviceLease>());
+               },
+               {"field=element_count.uint64", "actual=overflow"});
 }
 
 void test_context_kind_and_provenance_mismatch_messages() {
@@ -628,7 +792,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
   expect_error(
       NotifyErrorCode::CountExchangeFailure,
       [&] { (void)megamoe::materialize_rank_metadata(local0, count0, count0); },
-      {"kind mismatch", "expected=notify_packet_summary",
+      {"field=collective.kind", "expected=notify_packet_summary",
        "actual=expert_counts"});
 
   const auto local_rank1 = megamoe::build_rank_local_histogram(
@@ -643,7 +807,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(local0, count_rank1,
                                                           summary0);
                },
-               {"calling_rank mismatch", "expected=0", "actual=1"});
+               {"field=calling_rank", "expected=0", "actual=1"});
 
   const auto other_execution = megamoe::build_rank_local_histogram(
       config,
@@ -658,7 +822,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(
                      local0, other_exec_count, summary0);
                },
-               {"execution token mismatch", "exec0", "other-exec"});
+               {"field=execution.provenance", "exec0", "other-exec"});
 
   const auto generation_context = make_context(config, 0, "base", 5, "exec0");
   const auto generation_local = megamoe::build_rank_local_histogram(
@@ -671,7 +835,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(
                      local0, generation_count, summary0);
                },
-               {"generation mismatch", "expected=4", "actual=5"});
+               {"field=session.generation", "expected=4", "actual=5"});
 
   const auto session_local = megamoe::build_rank_local_histogram(
       config, make_context(config, 0, "other-session", 4, "exec0"),
@@ -683,7 +847,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(local0, session_count,
                                                           summary0);
                },
-               {"session identity mismatch", "base", "other-session"});
+               {"field=session.identity", "base", "other-session"});
 
   const auto same_fields_local =
       megamoe::build_rank_local_histogram(config, context0, {1, {0, 1}});
@@ -695,7 +859,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(
                      local0, same_fields_count, summary0);
                },
-               {"local histogram provenance mismatch"});
+               {"field=local.provenance"});
 
   const auto same_values_session =
       megamoe::make_collective_session("base", 2, 4);
@@ -711,7 +875,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(
                      local0, other_session_instance_count, summary0);
                },
-               {"session provenance mismatch", "different session instance"});
+               {"field=session.provenance", "different session instance"});
 
   const auto world3 = make_config(1, 3, 4, 2, 4);
   const auto world3_local = megamoe::build_rank_local_histogram(
@@ -724,7 +888,7 @@ void test_context_kind_and_provenance_mismatch_messages() {
                  (void)megamoe::materialize_rank_metadata(local0, world3_count,
                                                           summary0);
                },
-               {"world_size mismatch", "expected=2", "actual=3"});
+               {"field=world_size", "expected=2", "actual=3"});
 }
 
 void test_malicious_completion_context_and_corruption_hooks() {
@@ -753,7 +917,8 @@ void test_malicious_completion_context_and_corruption_hooks() {
                  (void)megamoe::materialize_rank_metadata(bad_expert, count,
                                                           summary);
                },
-               {"actual=99"});
+               {"phase=materialize-local", "field=outgoing.expert_id", "rank=0",
+                "expected=[0,2)", "actual=99"});
   const auto truncated =
       megamoe::testing::NotifyCorruptionHook::with_truncated_expert_ids(local);
   expect_error(NotifyErrorCode::InvalidRouteShape,
@@ -761,7 +926,116 @@ void test_malicious_completion_context_and_corruption_hooks() {
                  (void)megamoe::materialize_rank_metadata(truncated, count,
                                                           summary);
                },
-               {"field=expert_id", "expected=1", "actual=0"});
+               {"phase=materialize-local", "field=expert_id", "rank=0",
+                "expected=1", "actual=0"});
+
+  const auto bad_offset =
+      megamoe::testing::NotifyCorruptionHook::with_local_offset(local, 0, 7);
+  expect_error(NotifyErrorCode::InvalidRouteShape,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(bad_offset, count,
+                                                          summary);
+               },
+               {"phase=materialize-local", "field=outgoing.local_offset",
+                "rank=0", "expected=0", "actual=7"});
+  const auto bad_combine =
+      megamoe::testing::NotifyCorruptionHook::with_combine_order(local, 0, 9);
+  expect_error(NotifyErrorCode::InvalidRouteShape,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(bad_combine, count,
+                                                          summary);
+               },
+               {"phase=materialize-local", "field=outgoing.combine_order",
+                "rank=0", "actual=9"});
+  const auto bad_mask =
+      megamoe::testing::NotifyCorruptionHook::with_node_mask(local, 0, 0);
+  expect_error(
+      NotifyErrorCode::InvalidRouteShape,
+      [&] {
+        (void)megamoe::materialize_rank_metadata(bad_mask, count, summary);
+      },
+      {"phase=materialize-local", "field=outgoing.destination_node_mask",
+       "rank=0", "expected=recomputed node mask", "actual=content mismatch"});
+  const auto bad_local_count =
+      megamoe::testing::NotifyCorruptionHook::with_local_expert_count(local, 0,
+                                                                      8);
+  expect_error(NotifyErrorCode::InvalidRouteShape,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(bad_local_count,
+                                                          count, summary);
+               },
+               {"phase=materialize-local", "field=local_expert_count", "rank=0",
+                "actual=content mismatch"});
+
+  const auto bad_matrix_shape =
+      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count, {});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(
+                     local, bad_matrix_shape, summary);
+               },
+               {"phase=materialize", "field=matrix.rows", "rank=0",
+                "expected=1", "actual=0"});
+  const auto bad_matrix_width =
+      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
+                                                                     {{1}});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(
+                     local, bad_matrix_width, summary);
+               },
+               {"phase=materialize", "field=matrix.row_width", "rank=0",
+                "expected=2", "actual=1"});
+  const auto bad_matrix_row =
+      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
+                                                                     {{0, 0}});
+  expect_error(NotifyErrorCode::CountExchangeFailure,
+               [&] {
+                 (void)megamoe::materialize_rank_metadata(local, bad_matrix_row,
+                                                          summary);
+               },
+               {"phase=materialize", "field=expert_counts.calling_rank_row",
+                "rank=0", "expected=local histogram count row",
+                "actual=content mismatch"});
+
+  const auto handle = megamoe::materialize_rank_metadata(local, count, summary);
+  const auto validate_corrupt = [&](const DispatchHandle &corrupt,
+                                    const std::string &field) {
+    expect_error(NotifyErrorCode::InvalidHandle,
+                 [&] { (void)megamoe::make_workspace_plan(corrupt); },
+                 {"phase=dispatch-validation", "field=" + field, "rank=0",
+                  "expected=", "actual="});
+  };
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_expert_row_count(handle, 0,
+                                                                    9),
+      "incoming.expert_row_count");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_expert_row_prefix(handle, 1,
+                                                                     9),
+      "incoming.expert_row_prefix");
+  validate_corrupt(megamoe::testing::NotifyCorruptionHook::
+                       with_packet_identity_destination_node(handle, 0, 9),
+                   "transport.packet.identity");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_packet_proxy(handle, 0, 9),
+      "transport.packet.proxy_rank");
+  validate_corrupt(megamoe::testing::NotifyCorruptionHook::with_fanout_expert(
+                       handle, 0, 0, 9),
+                   "transport.fanout.expert_id");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_fanout_local_rank(handle, 0,
+                                                                     0, 9),
+      "transport.fanout.destination_local_rank");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_fanout_row(handle, 0, 0, 9),
+      "transport.fanout.dst_row");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_fanout_slot(handle, 0, 0, 9),
+      "transport.fanout.topk_slot");
+  validate_corrupt(
+      megamoe::testing::NotifyCorruptionHook::with_mtile_row(handle, 0, 0, 9),
+      "incoming.mtile_expected_rows");
 }
 
 void test_handle_copy_move_workspace_and_overflow() {
@@ -774,6 +1048,23 @@ void test_handle_copy_move_workspace_and_overflow() {
   const auto plan = megamoe::make_workspace_plan(handles[0]);
   megamoe::validate_workspace_plan(handles[0], plan);
   (void)megamoe::ForwardPersistentInputs::checked(handles[0], plan);
+  (void)megamoe::BackwardPersistentInputs::checked(handles[0], plan);
+  megamoe::WorkspacePlan empty_plan;
+  expect_error(NotifyErrorCode::WorkspaceMismatch,
+               [&] { (void)empty_plan.requirements(); }, {"default/invalid"});
+  expect_error(NotifyErrorCode::WorkspaceMismatch,
+               [&] { (void)empty_plan.shape(); }, {"default/invalid"});
+  expect_error(NotifyErrorCode::WorkspaceMismatch,
+               [&] { (void)empty_plan.identity(); }, {"default/invalid"});
+  expect_error(NotifyErrorCode::WorkspaceMismatch,
+               [&] { (void)empty_plan.epoch(); }, {"default/invalid"});
+  expect_error(
+      NotifyErrorCode::WorkspaceMismatch,
+      [&] { megamoe::validate_workspace_plan(handles[0], empty_plan); },
+      {"default/invalid"});
+  expect_error(NotifyErrorCode::WorkspaceMismatch,
+               [&] { megamoe::validate_workspace_plan(handles[1], plan); },
+               {"another DispatchHandle"});
   const auto other = megamoe::build_notify_dispatch_for_testing(config, inputs,
                                                                 "workspace", 5);
   expect_error(NotifyErrorCode::WorkspaceMismatch,
@@ -805,6 +1096,8 @@ int main() {
        test_topology_route_capacity_and_overflow},
       {"typed_storage_lifetimes_and_unwaited_destruction",
        test_typed_storage_lifetimes_and_unwaited_destruction},
+      {"operation_move_and_terminal_state_machine",
+       test_operation_move_and_terminal_state_machine},
       {"backend_exception_boundaries_and_device_rejection",
        test_backend_exception_boundaries_and_device_rejection},
       {"context_kind_and_provenance_mismatch_messages",
