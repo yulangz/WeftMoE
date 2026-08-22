@@ -1,0 +1,59 @@
+# Reference implementation survey
+
+The implementation was written from the MegaMOE design contract and inspected
+the following files for design patterns. No source was mechanically copied.
+
+## DeepEP
+
+- `DeepEP/deep_ep/include/deep_ep/impls/dispatch.cuh`: notify warp roles,
+  rank/expert counting, peer count writes, count readiness, expert/rank prefix,
+  and the existing atomic sender slot allocation that MegaMOE must not use for
+  canonical expert rows.
+- `DeepEP/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh`: split scale-out /
+  scale-up notify and forwarding structure for a future same-rail transport.
+- `DeepEP/deep_ep/include/deep_ep/impls/combine.cuh` and
+  `hybrid_combine.cuh`: source metadata carried back through combine.
+- `DeepEP/deep_ep/include/deep_ep/common/layout.cuh`,
+  `DeepEP/deep_ep/include/deep_ep/common/comm.cuh`, and
+  `DeepEP/deep_ep/include/deep_ep/common/handle.cuh`: explicit workspace
+  regions, signals, barriers, and GIN handle separation.
+- `DeepEP/deep_ep/buffers/elastic.py`: reusable `EPHandle` and deterministic
+  post-sort behavior. MegaMOE instead precomputes the canonical row before data
+  movement.
+
+## DeepGEMM
+
+- `DeepGEMM/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh`: explicit
+  `BlockPhase`, persistent task production, L1 warmup/L2 interleave, and runtime
+  valid-M propagation.
+- `DeepGEMM/deep_gemm/include/deep_gemm/layout/mega_moe.cuh`: typed workspace
+  regions, hot-counter isolation, token source metadata, and ring/full counters.
+- `DeepGEMM/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh`:
+  dispatch/compute/combine roles in one persistent kernel and acquire/release
+  producer-consumer waits.
+
+## DeepGEMM-bk
+
+- `DeepGEMM-bk/deep_gemm/include/deep_gemm/scheduler/sm90_mega_moe.cuh`:
+  SM90-specific phase scheduling, logical pool versus physical ring, and
+  generation semantics preventing ABA.
+- `DeepGEMM-bk/deep_gemm/include/deep_gemm/impls/sm90_bf16_mega_moe.cuh`:
+  SM90 dispatch/math role split, M-tail handling, full/empty counters, and
+  workspace cleanup boundaries.
+
+The backup tree contains experimental/local modifications; it was treated only
+as an architecture reference, not as an upstream API or code source.
+
+## Triton-distributed
+
+- `Triton-distributed/tutorials/04-deepseek-infer-all2all.py`: expert split
+  cumsums, explicit dispatch/combine offsets, put/fence/signal ordering, and
+  stable gather-index construction.
+- `Triton-distributed/python/triton_dist/kernels/nvidia/moe_utils.py`: stable
+  gather/scatter helpers, expert histograms, padding, and a contrasting atomic
+  scatter allocator whose return order is unsuitable for MegaMOE canonical
+  destination rows.
+- `Triton-distributed/csrc/lib/moe_utils.cu`: deterministic per-thread shard
+  prefix construction and expert-aligned token layout.
+- `Triton-distributed/tutorials/01-distributed-notify-wait.py`: sequence-aware
+  notify/wait concepts for future transport work.
