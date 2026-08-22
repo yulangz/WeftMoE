@@ -1,23 +1,53 @@
-# Build and developer workflow
+# Build and verification
 
-The phase-1 library is deliberately dependency-free C++17. The checked build
-environment did not provide CMake, so the repository uses a small Makefile.
+Requirements are GNU Make, a C++17 compiler, and Python 3. Phase 1 has no CUDA
+or third-party Python dependency.
 
-```bash
-make -j                     # C++ test and benchmark binaries
-make test                   # Python reference tests, then C++ production tests
-make bench                  # 8 ranks × 8192 tokens × top-k 6 host benchmark
-```
-
-Build artifacts stay under `build/`. Override `CXX` or `CXXFLAGS` normally:
+## Normal suite
 
 ```bash
-make clean
-make CXX=clang++ CXXFLAGS='-O2 -g -std=c++17 -Wall -Wextra -Werror'
+make -j test
 ```
 
-CUDA 12 and GPUs are not needed for Notify Dispatch host-control validation.
-The available development GPUs may differ from H200. Later SM90 kernels should
-be compiled for `sm_90a` on H200 and tested separately from this portable
-metadata suite; they must compare every emitted metadata array against the
-Python reference before performance work begins.
+This runs:
+
+- C++ rank-local, transport, descriptor, topology, overflow, and workspace tests;
+- independent Python reference tests;
+- JSON full-field C++/Python comparison over targeted, fixed-seed random,
+  73-node, skewed, empty-rank, empty-expert, and partial-M cases.
+
+## Warning-clean build
+
+```bash
+make BUILD_DIR=build-werror test \
+  CXXFLAGS='-O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror'
+```
+
+## ASan/UBSan
+
+```bash
+make BUILD_DIR=build-sanitize all \
+  CXXFLAGS='-O1 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fsanitize=address,undefined -fno-omit-frame-pointer'
+
+ASAN_LIB=$(g++ -print-file-name=libasan.so)
+UBSAN_LIB=$(g++ -print-file-name=libubsan.so)
+LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/test_notify_dispatch
+LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/metadata_dump >/dev/null
+```
+
+Explicit preload is required in the current container because another injected
+runtime otherwise precedes ASan.
+
+## Clean export
+
+After committing, verify without ignored build state:
+
+```bash
+EXPORT_DIR=$(mktemp -d)
+git archive HEAD | tar -x -C "$EXPORT_DIR"
+make -C "$EXPORT_DIR" -j test
+```
+
+Run the same archive on a remote machine when its SSH endpoint is available.
+Remote execution is a separate result and must not be inferred from local
+shared storage or a successful local build.

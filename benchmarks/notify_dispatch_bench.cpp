@@ -39,14 +39,14 @@ int main() {
         }
     }
 
-    megamoe::InMemoryCountExchange transport;
     const auto start = std::chrono::steady_clock::now();
-    const auto handle = megamoe::build_notify_dispatch(config, inputs, transport);
+    const auto handles = megamoe::build_notify_dispatch_for_testing(
+        config, inputs, "host-benchmark", 1);
     const auto elapsed = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start);
     std::uint64_t total_rows = 0;
-    for (const auto& destination : handle->destinations) {
-        total_rows += destination.expert_row_prefix.back();
+    for (const auto& handle : handles) {
+        total_rows += handle->incoming.expert_row_prefix.back();
     }
     std::cout << "routes=" << total_rows << " elapsed_ms=" << elapsed.count() << '\n';
 }

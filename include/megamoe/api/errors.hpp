@@ -15,6 +15,8 @@ enum class NotifyErrorCode {
     WorkspaceCapacityExceeded,
     CountExchangeFailure,
     ArithmeticOverflow,
+    InvalidHandle,
+    WorkspaceMismatch,
 };
 
 class NotifyDispatchError final : public std::runtime_error {

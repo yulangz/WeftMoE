@@ -1,64 +1,90 @@
 # MegaMOE
 
-MegaMOE is an H200/SM90-oriented deterministic training MoE runtime. The first
-vertical slice implements deterministic Notify Dispatch metadata in production
-C++ and an independent Python reference. It does **not** claim RDMA transport,
-forward/backward persistent kernels, or full data-plane dispatch yet.
+MegaMOE targets deterministic training MoE execution on H200/SM90. The current
+vertical slice implements rank-local deterministic Notify Dispatch metadata in
+production C++ plus an independent Python oracle. It does **not** implement
+NCCL GIN/LSA, RDMA, activation movement, or persistent forward/backward kernels.
 
-## Phase 1 result
+## Supported topology contract
 
-`build_notify_dispatch` accepts runtime token counts, experts, top-k, EP world
-size, node placement, local-rank placement, expert ownership, M-tile size, and
-optional capacities. It returns an immutable, cheap-copy `DispatchHandle` with:
+The current transport model supports homogeneous nodes only:
 
-- stable per-source/per-expert `local_offset` generated in
-  `(local_token_id, topk_slot)` order;
-- source-indexed count matrix and source-rank-prefix canonical destination rows;
-- destination rank/node/local-rank metadata and per-token destination node mask;
-- local expert row counts, exclusive prefixes, and per-M-tile valid row counts;
-- destination-row-indexed reverse routes;
-- ascending-expert `combine_order`;
-- the same metadata object reusable by forward and backward launch contracts.
+- node IDs are dense `0..num_nodes-1`;
+- every node has exactly the same runtime GPU count `G`;
+- each node contains every `local_rank` exactly once in `0..G-1`;
+- same-rail proxying maps a source GPU to the destination-node GPU with the
+  same `local_rank`.
 
-Duplicate experts within a token, negative/out-of-range experts, malformed
-runtime topology, arithmetic overflow, count exchange corruption, expert
-capacity overflow, and per-rank workspace overflow fail explicitly.
+Heterogeneous nodes, empty nodes, missing rails, duplicate coordinates, sparse
+local ranks, and out-of-range node/expert ownership are rejected explicitly.
 
-Canonical mapping is:
+## Rank-local production flow
 
-```text
-local_offset(t,k) = stable occurrence index for expert e in source rank r
-rank_base(r,e)    = sum(count[q,e] for q < r)
-dst_row(t,k)      = expert_row_prefix[e] + rank_base(r,e) + local_offset(t,k)
+The production path never asks one rank to provide every rank's routes:
+
+```cpp
+auto local = build_rank_local_histogram(config, calling_rank, local_routes);
+
+auto count_op = start_count_exchange(local, backend, collective_context);
+auto summary_op = start_notify_summary_exchange(local, backend, collective_context);
+// In a real collective all ranks start each corresponding round.
+auto counts = complete_exchange(*count_op, collective_context,
+                                ExchangeKind::ExpertCounts, config.num_experts);
+auto summary = complete_exchange(*summary_op, collective_context,
+                                 ExchangeKind::NotifyPacketSummary,
+                                 config.topology.num_nodes);
+
+auto handle = materialize_rank_metadata(
+    local, CompletedCollectives{std::move(counts), std::move(summary)});
 ```
 
-The transport may deliver count messages in any order, but it must place them
-in rows keyed by source rank. Arrival-order atomics are never used to choose a
-destination row.
+The three stages are:
 
-## Layout
+1. Local stable histogram/scan over only `(local_token_id, topk_slot)`.
+2. Asynchronous integer all-gathers for expert counts and packet summaries.
+3. Pure rank-local metadata materialization with no backend calls.
+
+`build_notify_dispatch_for_testing` is a host reference/test wrapper that
+composes this path for all ranks. It is not a device entry point.
+
+## Deterministic mapping and descriptors
 
 ```text
-include/megamoe/api/          public Notify Dispatch API and errors
-include/megamoe/config/       runtime shape, topology, ownership, capacity
-include/megamoe/metadata/     immutable forward/backward dispatch handle
-include/megamoe/transport/    count-exchange abstraction
-include/megamoe/scoreboard/   shape-derived workspace planning boundary
-include/megamoe/kernels/      persistent forward/backward launch contracts
-src/metadata/                 production deterministic mapping
-src/transport/                development in-memory count transport
-src/scoreboard/               workspace plan implementation
-src/kernels/{forward,backward}/ reserved device backend modules
-reference/                    independent clarity-first Python oracle
-tests/                        C++ production and Python reference tests
-benchmarks/                   host control-plane benchmark
+local_offset(t,k) = stable occurrence index in calling rank
+rank_base(r,e)    = sum(C[q,e] for q < r)
+dst_row(t,k)      = expert_base(e) + rank_base(r,e) + local_offset(t,k)
+```
+
+The handle retains only:
+
+- this rank's outgoing routes and reverse-combine identity;
+- this rank's owned-expert incoming count/prefix/tile/row geometry;
+- the global integer count matrix needed for prefixes;
+- this rank's outgoing packets and proxy signal cardinalities.
+
+Baseline packetization is one payload per `(local_token_id, destination_node)`.
+Packets are ordered by `(destination_node, local_token_id)`; packet identity is
+`(source_rank, destination_node, sequence_on_link)`. Fan-out is sorted by expert
+ID and references the precomputed canonical row. Future aggregation may change
+packet boundaries but cannot change route destination or canonical row.
+
+## Repository layout
+
+```text
+include/megamoe/api/          rank-local Notify API and errors
+include/megamoe/config/       runtime shape/topology/capacity
+include/megamoe/metadata/     rank-local handle, descriptors, serialization
+include/megamoe/transport/    async integer collective contract and host fake
+include/megamoe/scoreboard/   identity-bound workspace plan
+include/megamoe/kernels/      checked future launch contracts
+src/                          C++ implementation; no device kernel yet
+reference/                    independent Python oracle
+tests/                        C++, Python, and full-field cross-language tests
+benchmarks/                   host metadata baseline
 docs/                         architecture, build, references, roadmap
 ```
 
 ## Build and test
-
-Requirements are a C++17 compiler, GNU Make, and Python 3. No CUDA or third-party
-Python package is required for phase 1.
 
 ```bash
 make -j
@@ -66,12 +92,6 @@ make test
 make bench
 ```
 
-For undefined-behavior and memory checks:
-
-```bash
-make clean
-make test CXXFLAGS='-O1 -g -std=c++17 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer'
-```
-
-See [docs/build.md](docs/build.md), [docs/architecture.md](docs/architecture.md),
-[docs/references.md](docs/references.md), and [docs/roadmap.md](docs/roadmap.md).
+`make test` runs C++ contract tests, Python reference tests, and a machine-readable
+full-field C++/Python comparison. See [docs/build.md](docs/build.md) for
+`-Werror`, sanitizers, and clean-export validation.

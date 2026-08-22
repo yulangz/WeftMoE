@@ -1,41 +1,39 @@
 # Staged implementation roadmap
 
-## Phase 1 — complete
+## Phase 1 — rank-local foundation complete
 
-- Runtime topology and shape contracts.
-- Deterministic Notify Dispatch metadata in C++.
-- Pluggable count exchange with delivery-order tests.
-- Immutable forward/backward dispatch handle.
-- Runtime workspace cardinality plan.
-- Independent Python oracle, unit tests, and host benchmark.
+- Strict homogeneous topology and same-local-rank rail mapping.
+- Rank-local histogram, asynchronous integer collective contract, and pure
+  materialization.
+- Canonical row, reverse-route, packet/fan-out, and signal descriptors.
+- Identity/generation/provenance-bound workspace planning.
+- Independent Python oracle and full-field machine-readable comparison.
 
-## Phase 2 — SM90 Notify backend and real count transport
+## Phase 2 — SM90 Notify backend and real integer collectives
 
-- Implement device local histogram plus deterministic segmented scan. Parallel
-  work may compute counts, but final offsets must be derived from fixed route
-  partitions/prefixes rather than atomic return order.
-- Add NCCL GIN/LSA count exchange behind `CountExchange`, including same-rail
-  inter-node exchange and node-local propagation.
-- Compare all CUDA metadata buffers byte-for-byte with the Python reference on
-  SM90, including irregular topologies and capacity failures.
-- Add epoch/generation workspace state and stream-safe handle lifetime.
+- Device histogram plus deterministic segmented scan using fixed partition
+  prefixes rather than arrival-order atomic allocation.
+- Real collective backend behind the generic opaque contract. Backend selection
+  and stream integration must not leak NCCL/GIN types into metadata headers.
+- Device output ownership and asynchronous error propagation tests.
+- Byte-for-byte comparison against the existing Python oracle on H200.
 
-## Phase 3 — forward single-node persistent MegaKernel
+## Phase 3 — single-node forward persistent MegaKernel
 
 - Canonical activation dispatch, tile scoreboard, FC1 + SwiGLU, FC2, fixed-order
   combine, and partial-M tiles.
-- Separate Comm/Relay/Comp roles with release/acquire publication.
-- H200 profiling and tile/worker autotune without changing deterministic
-  accumulation or row semantics.
+- Release/acquire scoreboard publication and generation-safe workspace reuse.
+- H200 tile/worker autotune without changing canonical mapping.
 
 ## Phase 4 — multi-node forward
 
-- Same-rail RDMA proxy, node-level payload dedup, bounded per-source ingress
-  rings, credits, sequence numbers, and local-completion-safe reuse.
-- Arrival-order stress and topology-crossing forward bitwise tests.
+- Same-rail RDMA proxy using the enforced homogeneous topology.
+- Bounded ingress rings, credits, sequence numbers, node-level payload dedup,
+  and descriptor delivery/retention.
+- Packet aggregation tuning with explicit summary counts and unchanged rows.
 
 ## Phase 5 — backward persistent MegaKernel
 
-- Reuse the forward handle for dY dispatch and dX/dGate combine.
-- Cache and no-FC1-output-cache modes, fused dU/SwiGLU backward, dX, dW1/dW2.
-- `split_k=1`, canonical-M dW traversal, fixed-order dGate/dX reductions.
+- Reuse the exact forward handle for dY dispatch and dX/dGate combine.
+- Cache/no-FC1-output-cache paths, fused SwiGLU backward, dX, dW1, and dW2.
+- `split_k=1`, canonical-M dW traversal, and fixed-order reductions.

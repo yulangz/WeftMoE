@@ -2,12 +2,22 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "megamoe/config/runtime_config.hpp"
 #include "megamoe/transport/count_exchange.hpp"
 
 namespace megamoe {
+
+class WorkspacePlan;
+class DispatchHandleFactory;
+
+struct MetadataIdentity {
+    std::uint64_t content_hash = 0;
+    std::uint64_t generation = 0;
+};
 
 struct ReverseRouteMetadata {
     std::uint32_t source_rank = 0;
@@ -23,55 +33,111 @@ struct SourceRouteMetadata {
     std::uint32_t top_k = 0;
     std::uint32_t node_mask_words = 0;
 
-    // All route arrays are row-major [num_tokens, top_k].
+    // Row-major [num_tokens, top_k], for this calling rank only.
     std::vector<std::uint32_t> expert_id;
     std::vector<std::uint64_t> local_offset;
     std::vector<std::uint64_t> route_dst_row;
     std::vector<std::uint32_t> route_dst_rank;
     std::vector<std::uint32_t> route_dst_node;
     std::vector<std::uint32_t> route_dst_local_rank;
-
-    // [num_tokens, top_k], where each value is the original top-k slot at
-    // that ascending-expert combine position.
     std::vector<std::uint32_t> combine_order;
-
-    // [num_tokens, node_mask_words].
     std::vector<std::uint64_t> destination_node_mask;
+    std::vector<ReverseRouteMetadata> reverse_routes;
+};
+
+struct IncomingRowMetadata {
+    std::uint32_t source_rank = 0;
+    std::uint32_t expert_id = 0;
+    std::uint64_t source_expert_offset = 0;
+    std::uint64_t dst_row = 0;
 };
 
 struct DestinationMetadata {
     std::uint32_t rank = 0;
-    // Owned global expert IDs in ascending order.
     std::vector<std::uint32_t> expert_ids;
     std::vector<std::uint64_t> expert_row_count;
-    // Exclusive prefix, length expert_ids.size() + 1.
     std::vector<std::uint64_t> expert_row_prefix;
-    // Per local expert, valid rows in each M tile. Empty experts have no tiles.
     std::vector<std::vector<std::uint32_t>> mtile_expected_rows;
-    // Indexed directly by destination-local dst_row.
-    std::vector<ReverseRouteMetadata> reverse_routes;
+
+    // Geometry derived only from integer counts. Remote token/slot identity is
+    // carried by packet fan-out descriptors, not copied into this handle.
+    std::vector<IncomingRowMetadata> incoming_rows;
+};
+
+struct PacketIdentity {
+    std::uint32_t source_rank = 0;
+    std::uint32_t destination_node = 0;
+    std::uint64_t sequence_on_link = 0;
+};
+
+struct FanoutTarget {
+    std::uint32_t topk_slot = 0;
+    std::uint32_t destination_local_rank = 0;
+    std::uint32_t expert_id = 0;
+    std::uint64_t dst_row = 0;
+};
+
+struct OutgoingPacketDescriptor {
+    PacketIdentity identity;
+    std::uint64_t local_token_id = 0;
+    std::uint32_t proxy_rank = 0;
+    std::uint32_t channel = 0;
+    std::vector<FanoutTarget> fanout;
+};
+
+struct SignalCardinality {
+    std::uint32_t source_node = 0;
+    std::uint32_t destination_node = 0;
+    std::uint32_t source_rank = 0;
+    std::uint32_t destination_proxy_rank = 0;
+    std::uint32_t rail_local_rank = 0;
+    std::uint32_t channel = 0;
+    std::uint64_t expected_packets = 0;
+    std::uint64_t expected_signals = 0;
+};
+
+struct TransportMetadata {
+    // Baseline order: (destination_node, local_token_id). One payload per
+    // token-node; fan-out is ascending expert ID.
+    std::vector<OutgoingPacketDescriptor> outgoing_packets;
+    std::vector<SignalCardinality> outgoing_signals;
+    std::vector<SignalCardinality> incoming_proxy_signals;
 };
 
 struct DispatchMetadata {
     RuntimeConfig config;
+    std::uint32_t calling_rank = 0;
+    std::string communicator_id;
+    MetadataIdentity identity;
+
+    // The only global payload retained: integer [source_rank, expert] counts.
     CountMatrix source_expert_count;
-    std::vector<SourceRouteMetadata> sources;
-    std::vector<DestinationMetadata> destinations;
+    SourceRouteMetadata outgoing;
+    DestinationMetadata incoming;
+    TransportMetadata transport;
 };
 
-// Cheap-copy, immutable metadata shared by forward and backward launches.
 class DispatchHandle {
 public:
     DispatchHandle() = default;
-    explicit DispatchHandle(std::shared_ptr<const DispatchMetadata> metadata)
-        : metadata_(std::move(metadata)) {}
 
-    const DispatchMetadata& metadata() const { return *metadata_; }
-    const DispatchMetadata* operator->() const { return metadata_.get(); }
+    const DispatchMetadata& metadata() const;
+    const DispatchMetadata* operator->() const { return &metadata(); }
     explicit operator bool() const noexcept { return static_cast<bool>(metadata_); }
 
 private:
+    struct ProvenanceToken {};
+    DispatchHandle(std::shared_ptr<const DispatchMetadata> metadata,
+                   std::shared_ptr<const ProvenanceToken> provenance)
+        : metadata_(std::move(metadata)), provenance_(std::move(provenance)) {}
+
     std::shared_ptr<const DispatchMetadata> metadata_;
+    std::shared_ptr<const ProvenanceToken> provenance_;
+
+    friend class DispatchHandleFactory;
+    friend class WorkspacePlan;
+    friend WorkspacePlan make_workspace_plan(const DispatchHandle&);
+    friend void validate_workspace_plan(const DispatchHandle&, const WorkspacePlan&);
 };
 
 }  // namespace megamoe
