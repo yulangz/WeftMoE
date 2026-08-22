@@ -11,10 +11,12 @@ make -j test
 
 This runs:
 
-- C++ rank-local, transport, descriptor, topology, overflow, and workspace tests;
+- C++ rank-local, malicious-backend, ownership/lifetime, context-provenance,
+  corruption, descriptor, topology, overflow, and workspace tests;
 - independent Python reference tests;
 - JSON full-field C++/Python comparison over targeted, fixed-seed random,
   73-node, skewed, empty-rank, empty-expert, and partial-M cases.
+- every public header as an isolated `-Werror` translation unit.
 
 ## Warning-clean build
 
@@ -33,6 +35,8 @@ ASAN_LIB=$(g++ -print-file-name=libasan.so)
 UBSAN_LIB=$(g++ -print-file-name=libubsan.so)
 LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/test_notify_dispatch
 LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/metadata_dump >/dev/null
+make BUILD_DIR=build-sanitize reference-test
+make BUILD_DIR=build-sanitize cross-check
 ```
 
 Explicit preload is required in the current container because another injected

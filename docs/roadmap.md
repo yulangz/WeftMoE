@@ -5,6 +5,10 @@
 - Strict homogeneous topology and same-local-rank rail mapping.
 - Rank-local histogram, asynchronous integer collective contract, and pure
   materialization.
+- Immutable provenance-bound phase handles, owned session/execution tokens,
+  typed host storage, opaque device leases, and a move-only operation adaptor.
+- Host control-plane corruption and hostile-backend failures are contained as
+  checked exceptions under ASan/UBSan.
 - Canonical row, reverse-route, packet/fan-out, and signal descriptors.
 - Identity/generation/provenance-bound workspace planning.
 - Independent Python oracle and full-field machine-readable comparison.
@@ -15,7 +19,8 @@
   prefixes rather than arrival-order atomic allocation.
 - Real collective backend behind the generic opaque contract. Backend selection
   and stream integration must not leak NCCL/GIN types into metadata headers.
-- Device output ownership and asynchronous error propagation tests.
+- Backend completion-to-host typed-result handoff and asynchronous device error
+  propagation tests; device leases remain opaque to generic metadata.
 - Byte-for-byte comparison against the existing Python oracle on H200.
 
 ## Phase 3 — single-node forward persistent MegaKernel

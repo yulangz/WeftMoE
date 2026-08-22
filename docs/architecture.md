@@ -24,9 +24,12 @@ and rejected before route validation, including zero-token calls.
 
 ### 1. Rank-local histogram
 
-`build_rank_local_histogram` accepts one calling rank and that rank's routes.
-It owns a config snapshot, local outgoing route arrays, one expert-count row,
-and one destination-node packet-count row. It never reads another rank's route.
+`build_rank_local_histogram` accepts an owned rank context and that rank's
+routes. It returns an opaque immutable `LocalHistogramHandle` owning a config
+snapshot, local outgoing route arrays, one typed expert-count row, one typed
+destination-node packet-count row, and unique local provenance. It never reads
+another rank's route. Its PIMPL cannot be constructed or mutated through the
+public API.
 
 The route scan is strictly `(local_token_id, topk_slot)`. Parallel device
 implementations may parallelize histogram work, but their final offset must come
@@ -36,19 +39,30 @@ from deterministic partition prefixes, not an atomic return order.
 
 `CountExchangeRequest` explicitly supplies:
 
-- calling rank, world size, communicator identity, and generation;
+- an immutable `CollectiveSession` containing communicator identity, world
+  size, generation, and a strongly owned backend-private state token;
+- calling rank and an immutable `ExecutionToken` strongly owning any
+  backend-private stream/context state;
 - collective kind and row width;
-- a type-erased immutable integer buffer with address, element count,
-  host/device location, and shared allocation ownership;
-- opaque execution stream and backend context handles.
+- one inseparable `HostIntegerRow` typed immutable allocation.
 
-`start` returns an operation in `Pending`, `Complete`, or `Failed` state. The
-backend retains the input owner through completion. `wait` returns a similarly
-owned type-erased output buffer plus matrix shape. Production wrappers validate
-returned rank, world, communicator, generation, execution context, kind,
-location, address, element count, and shape before host materialization.
-Every backend exception is normalized to `CountExchangeFailure` with rank,
-world, communicator, generation, and backend error text.
+There is no public integer address/owner pair and no public native communicator
+or stream integer. Backend subclasses can retrieve their own opaque state only
+through protected `CountExchange` accessors. A host backend returns a checked,
+typed `HostCountMatrix` at completion. A future device backend may return only
+an opaque `DeviceBufferLease`; the host materializer rejects it until that
+backend produces a controlled typed host result. Generic metadata never obtains
+or dereferences a device address.
+
+The backend `start` returns a backend operation, immediately wrapped in a
+move-only framework `CollectiveOperation`. The wrapper strongly retains the
+local handle, input row, session, execution token, and backend operation until
+terminal completion/cancellation. `wait()` validates every returned field and
+is single-use. Explicit `cancel()` reports cleanup failures. Destruction of an
+unwaited operation performs best-effort cancellation, catches every exception,
+and is `noexcept`. Backend `NotifyDispatchError`, standard exceptions, unknown
+exceptions, null operations, host-result construction errors, wait errors, and
+cancel errors are all mapped to contextual `CountExchangeFailure`.
 
 Two explicit rounds are used:
 
@@ -61,8 +75,19 @@ simulation of NCCL, GIN, LSA, or RDMA and accepts host buffers only.
 
 ### 3. Pure rank-local materialization
 
-`materialize_rank_metadata` performs no communication. From the local histogram
-and exchanged integer matrices it constructs:
+Only successful wrapper completion can create an opaque immutable
+`ValidatedCollectiveHandle`. The framework, not the backend, copies the local
+provenance into it. `materialize_rank_metadata` performs no communication and
+requires exactly one expert-count and one packet-summary completion matching
+the local handle's rank, world, session instance, communicator identity,
+generation, execution-token instance, and provenance.
+
+Before indexing any route or allocating from a derived size, materialization
+revalidates route-array lengths, checked shape arithmetic, expert/rank/node/
+local-rank/slot ranges, stable local offsets, combine permutations, node masks,
+typed row widths, matrix shape, and the calling-rank count/summary rows. This
+makes corruption from the dedicated internal test hook a controlled exception,
+not an OOB read. From the validated inputs it constructs:
 
 - local outgoing canonical rows and reverse-route identity;
 - local owned-expert row counts, prefixes, M-tile valid rows, and incoming row
@@ -74,6 +99,33 @@ Remote token IDs/top-k slots are not copied into the destination handle.
 Outgoing fan-out descriptors own that reverse identity and remain immutable for
 the handle lifetime. A later real data/control transport must deliver the
 descriptor with its payload or retain equivalent dispatch-context state.
+
+## Ownership and lifetime
+
+```text
+CollectiveSession ─┐
+ExecutionToken ────┼─> RankCollectiveContext
+                   │          │
+local routes ──────┴─> LocalHistogramHandle (typed rows + provenance)
+                                  │ strong ownership
+                                  v
+                         CollectiveOperation
+                    (backend op + input + tokens)
+                                  │ successful wait
+                                  v
+                    ValidatedCollectiveHandle
+                     (typed matrix + provenance)
+                                  │ exact-context checks
+                                  v
+                       rank-local materialization
+                                  │
+                                  v
+                           DispatchHandle
+```
+
+Handles are cheaply copyable immutable owners. Operations are move-only.
+Descriptor/reverse metadata is owned by the final `DispatchHandle`; workspace
+plans hold identity/provenance bindings rather than borrowed metadata pointers.
 
 ## Descriptor baseline
 

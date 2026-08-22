@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "megamoe/config/runtime_config.hpp"
@@ -9,56 +11,111 @@
 #include "megamoe/transport/count_exchange.hpp"
 
 namespace megamoe {
+namespace testing {
+class NotifyCorruptionHook;
+}
 
-struct LocalNotifyMetadata {
-    RuntimeConfig config;
-    std::uint32_t calling_rank = 0;
-    SourceRouteMetadata outgoing;
-    std::shared_ptr<const std::vector<std::uint64_t>> local_expert_count;
-    std::shared_ptr<const std::vector<std::uint64_t>> packet_count_by_destination_node;
+// Immutable phase-1 result. It owns the calling rank's routes and typed count
+// rows, and binds them to one rank/session/generation/execution provenance.
+class LocalHistogramHandle {
+public:
+  LocalHistogramHandle() = default;
+  const RuntimeConfig &config() const;
+  const RankCollectiveContext &context() const;
+  const SourceRouteMetadata &outgoing() const;
+  const HostIntegerRow &local_expert_count() const;
+  const HostIntegerRow &packet_count_by_destination_node() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit LocalHistogramHandle(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+
+  friend LocalHistogramHandle
+  build_rank_local_histogram(const RuntimeConfig &,
+                             const RankCollectiveContext &,
+                             const RankRoutingInput &);
+  friend class CollectiveOperation;
+  friend DispatchHandle
+  materialize_rank_metadata(const LocalHistogramHandle &,
+                            const class ValidatedCollectiveHandle &,
+                            const class ValidatedCollectiveHandle &);
+  friend class testing::NotifyCorruptionHook;
 };
 
-struct CompletedCollectives {
-    CountExchangeResult expert_counts;
-    CountExchangeResult packet_summary;
+LocalHistogramHandle
+build_rank_local_histogram(const RuntimeConfig &config,
+                           const RankCollectiveContext &context,
+                           const RankRoutingInput &local_routes);
+
+// Successful framework-validated phase-2 result. Backends cannot construct it.
+class ValidatedCollectiveHandle {
+public:
+  ValidatedCollectiveHandle() = default;
+  const RankCollectiveContext &context() const;
+  ExchangeKind kind() const;
+  std::uint32_t rows() const;
+  std::uint64_t row_width() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit ValidatedCollectiveHandle(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class CollectiveOperation;
+  friend DispatchHandle
+  materialize_rank_metadata(const LocalHistogramHandle &,
+                            const ValidatedCollectiveHandle &,
+                            const ValidatedCollectiveHandle &);
 };
 
-// Stage 1: reads only this calling rank's routes.
-LocalNotifyMetadata build_rank_local_histogram(
-    const RuntimeConfig& config,
-    std::uint32_t calling_rank,
-    const RankRoutingInput& local_routes);
+// Move-only framework adaptor. It retains local storage, session/execution
+// tokens, and the backend operation until wait/cancel reaches a terminal state.
+class CollectiveOperation {
+public:
+  CollectiveOperation();
+  ~CollectiveOperation() noexcept;
+  CollectiveOperation(const CollectiveOperation &) = delete;
+  CollectiveOperation &operator=(const CollectiveOperation &) = delete;
+  CollectiveOperation(CollectiveOperation &&) noexcept;
+  CollectiveOperation &operator=(CollectiveOperation &&) noexcept;
 
-// Stage 2: asynchronous integer collectives. Backend failures are normalized
-// by these wrappers to NotifyDispatchError(CountExchangeFailure) with context.
-std::unique_ptr<CountExchangeOperation> start_count_exchange(
-    const LocalNotifyMetadata& local,
-    CountExchange& backend,
-    const CollectiveContext& context);
+  ExchangeState state() const noexcept;
+  ValidatedCollectiveHandle wait();
+  void cancel();
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
-std::unique_ptr<CountExchangeOperation> start_notify_summary_exchange(
-    const LocalNotifyMetadata& local,
-    CountExchange& backend,
-    const CollectiveContext& context);
+private:
+  struct Impl;
+  explicit CollectiveOperation(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+  friend CollectiveOperation start_count_exchange(const LocalHistogramHandle &,
+                                                  CountExchange &);
+  friend CollectiveOperation
+  start_notify_summary_exchange(const LocalHistogramHandle &, CountExchange &);
+};
 
-CountExchangeResult complete_exchange(
-    CountExchangeOperation& operation,
-    const CollectiveContext& expected_context,
-    ExchangeKind expected_kind,
-    std::uint64_t expected_row_width);
+CollectiveOperation start_count_exchange(const LocalHistogramHandle &local,
+                                         CountExchange &backend);
+CollectiveOperation
+start_notify_summary_exchange(const LocalHistogramHandle &local,
+                              CountExchange &backend);
 
-// Stage 3: pure rank-local materialization from local histogram plus exchanged
-// integer summaries. No backend calls and no other rank's routes are required.
-DispatchHandle materialize_rank_metadata(
-    const LocalNotifyMetadata& local,
-    const CompletedCollectives& collectives);
+// Pure rank-local phase 3. Both completions must have been created from this
+// exact local handle and its exact rank/session/execution context.
+DispatchHandle
+materialize_rank_metadata(const LocalHistogramHandle &local,
+                          const ValidatedCollectiveHandle &expert_counts,
+                          const ValidatedCollectiveHandle &packet_summary);
 
-// Reference/test convenience only. It composes the rank-local production path
-// and must not be used as a device-side entry point.
+// Reference/test convenience only; production callers use the rank-local API.
 std::vector<DispatchHandle> build_notify_dispatch_for_testing(
-    const RuntimeConfig& config,
-    const std::vector<RankRoutingInput>& routes_by_rank,
-    const std::string& communicator_id = "host-fake",
+    const RuntimeConfig &config,
+    const std::vector<RankRoutingInput> &routes_by_rank,
+    const std::string &communicator_id = "host-fake",
     std::uint64_t generation = 1);
 
-}  // namespace megamoe
+} // namespace megamoe

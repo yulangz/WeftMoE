@@ -23,19 +23,20 @@ local ranks, and out-of-range node/expert ownership are rejected explicitly.
 The production path never asks one rank to provide every rank's routes:
 
 ```cpp
-auto local = build_rank_local_histogram(config, calling_rank, local_routes);
+auto session = make_collective_session("comm-A", world_size, generation,
+                                       backend_owned_session_state);
+auto execution = make_execution_token("stream-7",
+                                      backend_owned_execution_state);
+auto context = make_rank_collective_context(session, calling_rank, execution);
+auto local = build_rank_local_histogram(config, context, local_routes);
 
-auto count_op = start_count_exchange(local, backend, collective_context);
-auto summary_op = start_notify_summary_exchange(local, backend, collective_context);
+auto count_op = start_count_exchange(local, backend);
+auto summary_op = start_notify_summary_exchange(local, backend);
 // In a real collective all ranks start each corresponding round.
-auto counts = complete_exchange(*count_op, collective_context,
-                                ExchangeKind::ExpertCounts, config.num_experts);
-auto summary = complete_exchange(*summary_op, collective_context,
-                                 ExchangeKind::NotifyPacketSummary,
-                                 config.topology.num_nodes);
+auto counts = count_op.wait();
+auto summary = summary_op.wait();
 
-auto handle = materialize_rank_metadata(
-    local, CompletedCollectives{std::move(counts), std::move(summary)});
+auto handle = materialize_rank_metadata(local, counts, summary);
 ```
 
 The three stages are:
@@ -43,6 +44,12 @@ The three stages are:
 1. Local stable histogram/scan over only `(local_token_id, topk_slot)`.
 2. Asynchronous integer all-gathers for expert counts and packet summaries.
 3. Pure rank-local metadata materialization with no backend calls.
+
+`LocalHistogramHandle` and `ValidatedCollectiveHandle` are immutable opaque
+handles. `CollectiveOperation` is move-only and retains local typed storage,
+session/execution tokens, and the backend operation through a terminal state.
+Its destructor performs best-effort cancellation and never propagates cleanup
+exceptions.
 
 `build_notify_dispatch_for_testing` is a host reference/test wrapper that
 composes this path for all ranks. It is not a device entry point.
@@ -78,6 +85,7 @@ include/megamoe/transport/    async integer collective contract and host fake
 include/megamoe/scoreboard/   identity-bound workspace plan
 include/megamoe/kernels/      checked future launch contracts
 src/                          C++ implementation; no device kernel yet
+src/metadata/*corruption*     internal sanitizer test hook, not public API
 reference/                    independent Python oracle
 tests/                        C++, Python, and full-field cross-language tests
 benchmarks/                   host metadata baseline

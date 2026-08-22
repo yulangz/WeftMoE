@@ -4,100 +4,232 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace megamoe {
 
 using CountMatrix = std::vector<std::vector<std::uint64_t>>;
 
-enum class MemoryLocation { Host, Device };
 enum class ExchangeKind { ExpertCounts, NotifyPacketSummary };
-enum class ExchangeState { Pending, Complete, Failed };
+enum class ExchangeState { Pending, Complete, Failed, Cancelled };
 
-// Opaque handles deliberately avoid leaking CUDA, NCCL, or GIN types through
-// the transport-independent metadata layer.
-struct ExecutionContext {
-    std::uintptr_t stream = 0;
-    std::uintptr_t backend_context = 0;
+class BackendSessionState {
+public:
+  virtual ~BackendSessionState() noexcept = default;
 };
 
-struct CollectiveContext {
-    std::uint32_t calling_rank = 0;
-    std::uint32_t world_size = 0;
-    std::string communicator_id;
-    std::uint64_t generation = 0;
-    ExecutionContext execution;
+class BackendExecutionState {
+public:
+  virtual ~BackendExecutionState() noexcept = default;
 };
 
-// Type-erased integer buffer descriptor. `owner` keeps the allocation alive;
-// `address` is interpreted only by a backend supporting `location`.
-struct IntegerBuffer {
-    MemoryLocation location = MemoryLocation::Host;
-    std::uint64_t elements = 0;
-    std::uintptr_t address = 0;
-    std::shared_ptr<const void> owner;
+class CollectiveSession {
+public:
+  CollectiveSession() = default;
+  const std::string &identity() const;
+  std::uint32_t world_size() const;
+  std::uint64_t generation() const;
+  bool same_instance(const CollectiveSession &other) const noexcept;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit CollectiveSession(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend CollectiveSession
+  make_collective_session(std::string, std::uint32_t, std::uint64_t,
+                          std::shared_ptr<const BackendSessionState>);
+  friend class CountExchange;
 };
+
+CollectiveSession make_collective_session(
+    std::string identity, std::uint32_t world_size, std::uint64_t generation,
+    std::shared_ptr<const BackendSessionState> backend_state = {});
+
+class ExecutionToken {
+public:
+  ExecutionToken() = default;
+  const std::string &identity() const;
+  bool same_instance(const ExecutionToken &other) const noexcept;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit ExecutionToken(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend ExecutionToken
+      make_execution_token(std::string,
+                           std::shared_ptr<const BackendExecutionState>);
+  friend class CountExchange;
+};
+
+ExecutionToken make_execution_token(
+    std::string identity,
+    std::shared_ptr<const BackendExecutionState> backend_state = {});
+
+class RankCollectiveContext {
+public:
+  RankCollectiveContext() = default;
+  std::uint32_t calling_rank() const;
+  const CollectiveSession &session() const;
+  const ExecutionToken &execution() const;
+  bool same_instance(const RankCollectiveContext &other) const noexcept;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit RankCollectiveContext(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend RankCollectiveContext make_rank_collective_context(CollectiveSession,
+                                                            std::uint32_t,
+                                                            ExecutionToken);
+};
+
+RankCollectiveContext make_rank_collective_context(CollectiveSession session,
+                                                   std::uint32_t calling_rank,
+                                                   ExecutionToken execution);
+
+// Typed immutable host storage: allocation and ownership cannot be separated.
+class HostIntegerRow {
+public:
+  HostIntegerRow() = default;
+  std::size_t size() const;
+  std::uint64_t at(std::size_t index) const;
+  const std::vector<std::uint64_t> &values() const;
+  std::weak_ptr<const void> lifetime_for_testing() const noexcept;
+  explicit operator bool() const noexcept { return static_cast<bool>(values_); }
+
+private:
+  explicit HostIntegerRow(
+      std::shared_ptr<const std::vector<std::uint64_t>> values)
+      : values_(std::move(values)) {}
+  std::shared_ptr<const std::vector<std::uint64_t>> values_;
+  friend HostIntegerRow make_host_integer_row(std::vector<std::uint64_t>);
+};
+
+HostIntegerRow make_host_integer_row(std::vector<std::uint64_t> values);
+
+class HostCountMatrix {
+public:
+  HostCountMatrix() = default;
+  std::uint32_t rows() const;
+  std::uint64_t row_width() const;
+  std::uint64_t at(std::uint32_t row, std::uint64_t column) const;
+  CountMatrix copy_rows() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit HostCountMatrix(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend HostCountMatrix make_host_count_matrix(const CountMatrix &);
+};
+
+HostCountMatrix make_host_count_matrix(const CountMatrix &rows);
+
+class BackendDeviceLeaseState {
+public:
+  virtual ~BackendDeviceLeaseState() noexcept = default;
+};
+
+// No native-address accessor exists in the transport-independent layer.
+class DeviceBufferLease {
+public:
+  DeviceBufferLease() = default;
+  std::uint32_t rows() const;
+  std::uint64_t row_width() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceBufferLease(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend DeviceBufferLease
+  make_device_buffer_lease(std::uint32_t, std::uint64_t,
+                           std::shared_ptr<const BackendDeviceLeaseState>);
+};
+
+DeviceBufferLease make_device_buffer_lease(
+    std::uint32_t rows, std::uint64_t row_width,
+    std::shared_ptr<const BackendDeviceLeaseState> backend_lease);
 
 struct CountExchangeRequest {
-    CollectiveContext collective;
-    ExchangeKind kind = ExchangeKind::ExpertCounts;
-    std::uint64_t row_width = 0;
-    // Caller-owned immutable input. Backends retain `owner` while pending.
-    IntegerBuffer input;
+  RankCollectiveContext context;
+  ExchangeKind kind = ExchangeKind::ExpertCounts;
+  std::uint64_t row_width = 0;
+  HostIntegerRow input;
 };
 
-struct CountExchangeResult {
-    CollectiveContext collective;
-    ExchangeKind kind = ExchangeKind::ExpertCounts;
-    std::uint32_t rows = 0;
-    std::uint64_t row_width = 0;
-
-    // Operation-owned until wait(); shared result ownership afterwards.
-    IntegerBuffer output;
-
-    // Host control-plane helper. Device output fails explicitly rather than
-    // being dereferenced by the generic metadata layer.
-    CountMatrix copy_host_rows() const;
-};
-
-IntegerBuffer make_host_integer_buffer(
-    std::shared_ptr<const std::vector<std::uint64_t>> values);
-CountExchangeResult make_host_exchange_result(
-    CollectiveContext context, ExchangeKind kind, const CountMatrix& rows);
-
-class CountExchangeOperation {
+class BackendCompletion {
 public:
-    virtual ~CountExchangeOperation() = default;
-    virtual ExchangeState state() const noexcept = 0;
-    virtual std::string error_message() const = 0;
-    virtual CountExchangeResult wait() = 0;
+  BackendCompletion() = default;
+  const RankCollectiveContext &context() const;
+  ExchangeKind kind() const;
+  bool has_host_result() const noexcept;
+  bool has_device_result() const noexcept;
+  const HostCountMatrix &host_result() const;
+  const DeviceBufferLease &device_result() const;
+
+private:
+  struct Impl;
+  explicit BackendCompletion(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend BackendCompletion make_host_backend_completion(RankCollectiveContext,
+                                                        ExchangeKind,
+                                                        HostCountMatrix);
+  friend BackendCompletion make_device_backend_completion(RankCollectiveContext,
+                                                          ExchangeKind,
+                                                          DeviceBufferLease);
+};
+
+BackendCompletion make_host_backend_completion(RankCollectiveContext context,
+                                               ExchangeKind kind,
+                                               HostCountMatrix result);
+BackendCompletion make_device_backend_completion(RankCollectiveContext context,
+                                                 ExchangeKind kind,
+                                                 DeviceBufferLease result);
+
+class BackendCountExchangeOperation {
+public:
+  virtual ~BackendCountExchangeOperation() noexcept = default;
+  virtual ExchangeState state() const noexcept = 0;
+  virtual BackendCompletion wait() = 0;
+  virtual void cancel() = 0;
 };
 
 class CountExchange {
 public:
-    virtual ~CountExchange() = default;
-    virtual std::unique_ptr<CountExchangeOperation> start(
-        const CountExchangeRequest& request) = 0;
+  virtual ~CountExchange() noexcept = default;
+  virtual std::unique_ptr<BackendCountExchangeOperation>
+  start(const CountExchangeRequest &request) = 0;
+
+protected:
+  static std::shared_ptr<const BackendSessionState>
+  backend_session_state(const RankCollectiveContext &context);
+  static std::shared_ptr<const BackendExecutionState>
+  backend_execution_state(const RankCollectiveContext &context);
 };
 
-// Host-only fake collective. It is a deterministic test backend, not an NCCL,
-// GIN, LSA, or RDMA implementation. All ranks share one instance and start the
-// same (communicator, generation, kind) round before any wait.
+// Deterministic host test backend; not an NCCL/GIN/LSA/RDMA implementation.
 class HostFakeCountExchange final : public CountExchange {
 public:
-    struct SharedState;
-
-    HostFakeCountExchange(std::uint32_t world_size, std::string communicator_id);
-    ~HostFakeCountExchange() override;
-
-    std::unique_ptr<CountExchangeOperation> start(
-        const CountExchangeRequest& request) override;
-
-    void fail_next_start(std::string message);
-    void fail_next_completion(std::string message);
+  struct SharedState;
+  HostFakeCountExchange(std::uint32_t world_size, std::string session_identity);
+  ~HostFakeCountExchange() noexcept override;
+  std::unique_ptr<BackendCountExchangeOperation>
+  start(const CountExchangeRequest &request) override;
+  void fail_next_start(std::string message);
+  void fail_next_completion(std::string message);
 
 private:
-    std::shared_ptr<SharedState> state_;
+  std::shared_ptr<SharedState> state_;
 };
 
-}  // namespace megamoe
+} // namespace megamoe
