@@ -19,6 +19,14 @@ public:
 };
 
 namespace testing {
+using BootstrapReadHook = std::ptrdiff_t (*)(int, void *, std::size_t);
+using BootstrapWriteHook = std::ptrdiff_t (*)(int, const void *, std::size_t);
+
+// Process-local test seam for exercising EINTR, short I/O, and zero progress.
+// Production calls leave both hooks null and use POSIX read/write directly.
+void set_bootstrap_io_hooks(BootstrapReadHook, BootstrapWriteHook) noexcept;
+void clear_bootstrap_io_hooks() noexcept;
+
 enum class NcclFaultPoint {
   None,
   ControlStart,

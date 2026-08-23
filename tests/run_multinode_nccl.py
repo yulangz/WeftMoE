@@ -50,14 +50,20 @@ def scrub_output(value, bootstrap=None):
     # Defense in depth for the retired stdout protocol, even before enough
     # bytes are known to derive its exact representation.
     text = re.sub(
-        r"(?im)^BOOTSTRAP[ \t]+[^\r\n]*",
+        r"(?im)^BOOTSTRAP[ \t]+(?:[0-9a-f]{2})+[ \t]*$",
         "[REDACTED_SECRET]",
         text,
     )
-    if len(secret) >= 8:
+    if secret:
+        # Match the actual hexadecimal value case-insensitively per character.
+        # Escaping the value keeps secret-derived text out of regex syntax.
+        text = re.sub(
+            re.escape(secret.hex()),
+            "[REDACTED_SECRET]",
+            text,
+            flags=re.IGNORECASE,
+        )
         representations = {
-            secret.hex(),
-            secret.hex().upper(),
             base64.b64encode(secret).decode("ascii"),
             base64.urlsafe_b64encode(secret).decode("ascii"),
         }
@@ -189,17 +195,72 @@ def read_bootstrap(fd, timeout):
 
 
 def send_bootstrap(process, bootstrap):
+    stream = process.stdin
+    primary_error = None
     try:
-        process.stdin.write(bootstrap)
-        process.stdin.flush()
-    except (BrokenPipeError, OSError) as error:
-        raise RuntimeError(
-            "bootstrap secret channel write failed before runner accepted input"
-        ) from error
+        if stream is None:
+            raise RuntimeError(
+                "bootstrap secret channel has no writable stdin"
+            )
+        try:
+            frame = bytes(bootstrap)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "bootstrap secret channel requires exactly 128 bytes"
+            ) from error
+        if len(frame) != BOOTSTRAP_BYTES:
+            raise RuntimeError(
+                "bootstrap secret channel requires exactly 128 bytes; "
+                f"actual={len(frame)}"
+            )
+        try:
+            descriptor = stream.fileno()
+        except (AttributeError, OSError, ValueError) as error:
+            raise RuntimeError(
+                "bootstrap secret channel has no valid descriptor"
+            ) from error
+        offset = 0
+        while offset < BOOTSTRAP_BYTES:
+            try:
+                written = os.write(descriptor, frame[offset:])
+            except InterruptedError:
+                continue
+            except BrokenPipeError as error:
+                raise RuntimeError(
+                    "bootstrap secret channel closed before 128 bytes"
+                ) from error
+            except OSError as error:
+                raise RuntimeError(
+                    "bootstrap secret channel write failed before 128 bytes"
+                ) from error
+            if written is None or not isinstance(written, int):
+                raise RuntimeError(
+                    "bootstrap secret channel write returned no byte count"
+                )
+            if written <= 0:
+                raise RuntimeError(
+                    "bootstrap secret channel write made zero progress"
+                )
+            if written > BOOTSTRAP_BYTES - offset:
+                raise RuntimeError(
+                    "bootstrap secret channel write exceeded remaining frame"
+                )
+            offset += written
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        process.stdin.close()
-        # communicate() otherwise attempts to flush the already closed pipe.
-        process.stdin = None
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError) as error:
+                if primary_error is None:
+                    raise RuntimeError(
+                        "bootstrap secret channel close failed"
+                    ) from error
+            finally:
+                # communicate() otherwise attempts to flush a closed stream.
+                process.stdin = None
 
 
 def remote_cleanup(args, launch_id, signal):
@@ -228,19 +289,36 @@ def stop_processes(processes, args, launch_id):
         if process.poll() is None:
             process.terminate()
     deadline = time.monotonic() + 5.0
-    for _rank, process in processes:
+    drained = []
+    for rank, process in processes:
         try:
             stdout, stderr = process.communicate(
                 timeout=max(0.0, deadline - time.monotonic())
             )
-            (scrub_output(stdout), scrub_output(stderr))
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
-            (scrub_output(stdout), scrub_output(stderr))
+        drained.append(RankOutput(
+            rank,
+            process.returncode if process.returncode is not None else -1,
+            scrub_output(stdout),
+            scrub_output(stderr),
+        ))
     remote_cleanup(args, launch_id, "TERM")
     time.sleep(0.25)
     remote_cleanup(args, launch_id, "KILL")
+    return drained
+
+
+def cleanup_diagnostic(outputs):
+    details = []
+    for result in outputs:
+        tail = (result.stdout + "\n" + result.stderr)[-4000:]
+        if tail.strip():
+            details.append(
+                f"rank={result.rank}, exit={result.returncode}, tail={tail}"
+            )
+    return scrub_output("; ".join(details))
 
 
 def parse_args(argv=None):
@@ -285,6 +363,7 @@ def launch_rank_processes(args):
     outputs = []
     bootstrap_read_fd = -1
     bootstrap_write_fd = -1
+    pending_error = None
     try:
         bootstrap_read_fd, bootstrap_write_fd = os.pipe()
         rank0 = subprocess.Popen(
@@ -334,12 +413,25 @@ def launch_rank_processes(args):
                 scrub_output(stdout, bootstrap),
                 scrub_output(stderr, bootstrap),
             ))
+    except BaseException as error:
+        pending_error = error
     finally:
         if bootstrap_read_fd >= 0:
             os.close(bootstrap_read_fd)
         if bootstrap_write_fd >= 0:
             os.close(bootstrap_write_fd)
-        stop_processes(processes, args, launch_id)
+        drained = stop_processes(processes, args, launch_id)
+    if pending_error is not None:
+        diagnostic = cleanup_diagnostic(drained)
+        if isinstance(pending_error, subprocess.TimeoutExpired):
+            pending_error.output = diagnostic
+            pending_error.stderr = ""
+            raise pending_error
+        message = scrub_output(str(pending_error))
+        if diagnostic:
+            message += "; cleanup=" + diagnostic
+        # Do not retain an unsanitized exception as __cause__/debug repr.
+        raise RuntimeError(message) from None
     return outputs
 
 
@@ -438,8 +530,10 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.TimeoutExpired as error:
+        diagnostic = scrub_output(error.output or "")
         print(scrub_output(
-            f"[FAIL] rank launch timed out after {error.timeout}s"
+            f"[FAIL] rank launch timed out after {error.timeout}s; "
+            f"cleanup={diagnostic}"
         ), file=sys.stderr)
         raise SystemExit(124)
     except Exception as error:

@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -21,6 +23,7 @@
 #include "megamoe/metadata/serialize.hpp"
 #include "megamoe/scoreboard/workspace_plan.hpp"
 #include "megamoe/transport/count_exchange.hpp"
+#include "cuda/nccl_protocol_internal.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 
 namespace {
@@ -43,6 +46,83 @@ using megamoe::RankRoutingInput;
 using megamoe::RuntimeConfig;
 using megamoe::Topology;
 using megamoe::ValidatedCollectiveHandle;
+
+struct BootstrapIoScript {
+  std::vector<std::uint8_t> input;
+  std::vector<std::uint8_t> output;
+  std::size_t input_offset = 0;
+  std::size_t read_chunk = std::numeric_limits<std::size_t>::max();
+  std::size_t write_chunk = std::numeric_limits<std::size_t>::max();
+  bool read_eintr = false;
+  bool write_eintr = false;
+  bool write_zero = false;
+  bool write_broken_pipe = false;
+};
+
+BootstrapIoScript *bootstrap_io_script = nullptr;
+
+std::ptrdiff_t scripted_bootstrap_read(int, void *destination,
+                                       std::size_t capacity) {
+  if (bootstrap_io_script == nullptr)
+    throw std::runtime_error("bootstrap read hook has no script");
+  if (bootstrap_io_script->read_eintr) {
+    bootstrap_io_script->read_eintr = false;
+    errno = EINTR;
+    return -1;
+  }
+  const auto remaining = bootstrap_io_script->input.size() -
+                         bootstrap_io_script->input_offset;
+  if (remaining == 0)
+    return 0;
+  const auto count = std::min(
+      {capacity, remaining, bootstrap_io_script->read_chunk});
+  std::memcpy(destination,
+              bootstrap_io_script->input.data() +
+                  bootstrap_io_script->input_offset,
+              count);
+  bootstrap_io_script->input_offset += count;
+  return static_cast<std::ptrdiff_t>(count);
+}
+
+std::ptrdiff_t scripted_bootstrap_write(int, const void *source,
+                                        std::size_t size) {
+  if (bootstrap_io_script == nullptr)
+    throw std::runtime_error("bootstrap write hook has no script");
+  if (bootstrap_io_script->write_eintr) {
+    bootstrap_io_script->write_eintr = false;
+    errno = EINTR;
+    return -1;
+  }
+  if (bootstrap_io_script->write_broken_pipe) {
+    bootstrap_io_script->write_broken_pipe = false;
+    errno = EPIPE;
+    return -1;
+  }
+  if (bootstrap_io_script->write_zero) {
+    bootstrap_io_script->write_zero = false;
+    return 0;
+  }
+  const auto count = std::min(size, bootstrap_io_script->write_chunk);
+  const auto *bytes = static_cast<const std::uint8_t *>(source);
+  bootstrap_io_script->output.insert(bootstrap_io_script->output.end(), bytes,
+                                     bytes + count);
+  return static_cast<std::ptrdiff_t>(count);
+}
+
+class BootstrapIoHookGuard {
+public:
+  explicit BootstrapIoHookGuard(BootstrapIoScript &script) {
+    bootstrap_io_script = &script;
+    megamoe::cuda::testing::set_bootstrap_io_hooks(
+        scripted_bootstrap_read, scripted_bootstrap_write);
+  }
+  BootstrapIoHookGuard(const BootstrapIoHookGuard &) = delete;
+  BootstrapIoHookGuard &operator=(const BootstrapIoHookGuard &) = delete;
+  ~BootstrapIoHookGuard() {
+    megamoe::cuda::testing::clear_bootstrap_io_hooks();
+    bootstrap_io_script = nullptr;
+  }
+};
 
 #define REQUIRE(condition)                                                     \
   do {                                                                         \
@@ -1371,6 +1451,89 @@ void test_fixed_control_protocol_agreement() {
                {"field=generation", "origin_rank=1"});
 }
 
+void test_bootstrap_exact_frame_io() {
+  std::vector<std::uint8_t> frame(
+      megamoe::cuda::NcclBootstrapIo::kWireBytes);
+  for (std::size_t index = 0; index < frame.size(); ++index)
+    frame[index] = static_cast<std::uint8_t>((index * 37U + 11U) & 0xffU);
+
+  const auto read_valid = [&](std::size_t chunk, bool interrupted) {
+    BootstrapIoScript script;
+    script.input = frame;
+    script.read_chunk = chunk;
+    script.read_eintr = interrupted;
+    BootstrapIoHookGuard guard(script);
+    auto result = megamoe::cuda::NcclBootstrapIo::read_fd(7);
+    REQUIRE(static_cast<bool>(result));
+    REQUIRE(script.input_offset == frame.size());
+    return result;
+  };
+
+  auto bootstrap = read_valid(frame.size(), false);
+  (void)read_valid(1, false);
+  (void)read_valid(17, true);
+  (void)read_valid(127, false);
+
+  for (const auto short_size : {std::size_t{0}, std::size_t{1},
+                                std::size_t{127}}) {
+    BootstrapIoScript script;
+    script.input.assign(frame.begin(), frame.begin() + short_size);
+    script.read_chunk = 17;
+    BootstrapIoHookGuard guard(script);
+    expect_error(NotifyErrorCode::NcclFailure,
+                 [&] { (void)megamoe::cuda::NcclBootstrapIo::read_fd(7); },
+                 {"phase=bootstrap-channel-read", "field=bytes",
+                  "expected=128", "actual=" + std::to_string(short_size)});
+  }
+
+  for (const auto oversized : {std::size_t{129}, std::size_t{257}}) {
+    BootstrapIoScript script;
+    script.input.resize(oversized, 0x5aU);
+    script.read_chunk = 17;
+    BootstrapIoHookGuard guard(script);
+    expect_error(NotifyErrorCode::NcclFailure,
+                 [&] { (void)megamoe::cuda::NcclBootstrapIo::read_fd(7); },
+                 {"phase=bootstrap-channel-read", "field=frame-length",
+                  "expected=128", "actual=>128"});
+  }
+
+  for (const auto chunk : {std::size_t{1}, std::size_t{17},
+                           std::size_t{127}}) {
+    BootstrapIoScript script;
+    script.write_chunk = chunk;
+    BootstrapIoHookGuard guard(script);
+    megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap, 8);
+    REQUIRE(script.output == frame);
+  }
+
+  {
+    BootstrapIoScript script;
+    script.write_chunk = 17;
+    script.write_eintr = true;
+    BootstrapIoHookGuard guard(script);
+    megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap, 8);
+    REQUIRE(script.output == frame);
+  }
+  {
+    BootstrapIoScript script;
+    script.write_zero = true;
+    BootstrapIoHookGuard guard(script);
+    expect_error(NotifyErrorCode::NcclFailure,
+                 [&] { megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap, 8); },
+                 {"phase=bootstrap-channel-write", "field=write-progress",
+                  "expected=>0", "actual=0"});
+  }
+  {
+    BootstrapIoScript script;
+    script.write_broken_pipe = true;
+    BootstrapIoHookGuard guard(script);
+    expect_error(NotifyErrorCode::NcclFailure,
+                 [&] { megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap, 8); },
+                 {"phase=bootstrap-channel-write", "field=write",
+                  "actual=I/O failure"});
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1395,6 +1558,7 @@ int main() {
        test_handle_copy_move_workspace_and_overflow},
       {"fixed_control_protocol_agreement",
        test_fixed_control_protocol_agreement},
+      {"bootstrap_exact_frame_io", test_bootstrap_exact_frame_io},
   };
   std::size_t passed = 0;
   for (const auto &[name, test] : tests) {

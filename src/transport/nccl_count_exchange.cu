@@ -7,7 +7,6 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -16,8 +15,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
-
-#include <unistd.h>
 
 #include "cuda/cuda_internal.hpp"
 #include "cuda/device_notify_internal.hpp"
@@ -233,51 +230,14 @@ void throw_nccl(const char *phase, ncclResult_t error, std::uint32_t rank,
 } // namespace internal
 
 NcclBootstrapId make_nccl_bootstrap_id() {
+  static_assert(sizeof(ncclUniqueId) == NcclBootstrapIo::kWireBytes,
+                "bootstrap frame width must match ncclUniqueId");
   ncclUniqueId id{};
   internal::throw_nccl("bootstrap", ncclGetUniqueId(&id), 0, 1,
                        "bootstrap", 1, ExchangeKind::ExpertCounts,
                        "ncclGetUniqueId");
   std::vector<std::uint8_t> bytes(sizeof(id));
   std::memcpy(bytes.data(), &id, sizeof(id));
-  return NcclBootstrapId(std::move(bytes));
-}
-
-void NcclBootstrapIo::write_fd(const NcclBootstrapId &id, int fd) {
-  static_assert(sizeof(ncclUniqueId) == kWireBytes,
-                "launcher wire width must match ncclUniqueId");
-  if (fd < 0 || id.bytes_.size() != kWireBytes)
-    invalid("phase=bootstrap-channel-write, field=descriptor/bytes, rank=n/a, expected=valid fd and 128 bytes, actual=invalid");
-  std::size_t offset = 0;
-  while (offset < id.bytes_.size()) {
-    const auto written = ::write(fd, id.bytes_.data() + offset,
-                                 id.bytes_.size() - offset);
-    if (written < 0 && errno == EINTR)
-      continue;
-    if (written <= 0)
-      invalid("phase=bootstrap-channel-write, field=write, rank=n/a, expected=128 bytes, actual=I/O failure");
-    offset += static_cast<std::size_t>(written);
-  }
-}
-
-NcclBootstrapId NcclBootstrapIo::read_fd(int fd) {
-  static_assert(sizeof(ncclUniqueId) == kWireBytes,
-                "launcher wire width must match ncclUniqueId");
-  if (fd < 0)
-    invalid("phase=bootstrap-channel-read, field=descriptor, rank=n/a, expected=valid fd, actual=invalid");
-  std::vector<std::uint8_t> bytes(kWireBytes);
-  std::size_t offset = 0;
-  while (offset < bytes.size()) {
-    const auto received =
-        ::read(fd, bytes.data() + offset, bytes.size() - offset);
-    if (received < 0 && errno == EINTR)
-      continue;
-    if (received < 0)
-      invalid("phase=bootstrap-channel-read, field=read, rank=n/a, expected=128 bytes, actual=I/O failure");
-    if (received == 0)
-      invalid("phase=bootstrap-channel-read, field=bytes, rank=n/a, expected=128, actual=" +
-              std::to_string(offset));
-    offset += static_cast<std::size_t>(received);
-  }
   return NcclBootstrapId(std::move(bytes));
 }
 

@@ -250,9 +250,17 @@ private stdin and to each remote runner exclusively through SSH stdin. The
 secret is never serialized as text and never enters argv, environment, a
 remote command, process listings, stdout/stderr, or a temporary file. All
 captured runner output and all launcher-generated exceptions/tails pass through
-a defense-in-depth scrubber that removes the known raw bytes, lower/upper hex,
-standard/URL-safe base64 (with or without padding), and the retired text-marker
-line. Scrubbing is not the transport boundary; the dedicated pipes are.
+a defense-in-depth scrubber that removes every known nonempty raw prefix,
+case-insensitive hex derived with an escaped literal pattern, standard/URL-safe
+base64 (with or without padding), and the retired text-marker line. Scrubbing is
+not the transport boundary; the dedicated pipes are.
+
+Bootstrap transport is an exact-frame protocol. Python loops on binary
+`os.write` until all 128 bytes are accepted, retries interruption, rejects zero
+progress or short capacity, and always closes stdin. C++ symmetrically retries
+partial/EINTR reads and writes; after byte 128 the receiver requires EOF and
+rejects byte 129. The sender closes immediately after the frame, while the
+launcher's generation timeout bounds the receiver's EOF wait.
 
 ## Benchmark accounting
 

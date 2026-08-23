@@ -47,10 +47,12 @@ This runs:
 - eleven compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, and bootstrap hex encode/parse APIs.
-- eight fake-runner bootstrap-channel security paths: success, local failure,
-  remote failure, timeout, SSH start failure, short/oversize bootstrap, and
-  runner exception. They inspect argv/environment, scrubbed diagnostics,
-  process cleanup, and absence of bootstrap files.
+- thirteen fake-runner/bootstrap-channel security groups covering success,
+  local/remote failure, timeout and TERM-to-KILL escalation, SSH start failure,
+  short/oversize bootstrap, runner exception, every 1/2/7/8/17/127/128-byte
+  prefix representation, Python poison writers, top-level CLI output, and 20
+  failure/recovery cycles. They inspect argv/environment, exact frame content,
+  FD/process cleanup, scrubbed diagnostics, and absence of bootstrap files.
 
 ## Warning-clean build
 
@@ -58,6 +60,11 @@ This runs:
 make BUILD_DIR=build-werror test \
   CXXFLAGS='-O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror'
 ```
+
+The equivalent maintained shorthand is `make BUILD_DIR=build-werror
+WERROR=1 test`; `WERROR=1` appends `-Werror` to host compilation and the NVCC
+host-compiler flags. The emitted compiler commands make the effective warning
+policy directly auditable.
 
 ## ASan/UBSan
 

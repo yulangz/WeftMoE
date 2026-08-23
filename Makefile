@@ -4,17 +4,23 @@ BUILD_DIR ?= build
 CPPFLAGS := -Iinclude -Isrc -pthread
 CUDA_CPPFLAGS := -Iinclude -Isrc -Xcompiler=-pthread
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+WERROR ?= 0
 
 LIB_SOURCES := \
 	src/cuda/control_protocol.cpp \
 	src/metadata/notify_dispatch.cpp \
 	src/metadata/serialize.cpp \
+	src/transport/bootstrap_channel.cpp \
 	src/transport/host_fake_count_exchange.cpp \
 	src/scoreboard/workspace_plan.cpp
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr
+ifeq ($(WERROR),1)
+override CXXFLAGS += -Werror
+override CUDA_NVCCFLAGS += -Xcompiler=-Werror
+endif
 ENABLE_CUDA ?= 0
 NCCL_RUNTIME_LIB_DIR ?=
 CUDA_RUN_ENV := $(if $(NCCL_RUNTIME_LIB_DIR),LD_LIBRARY_PATH=$(NCCL_RUNTIME_LIB_DIR):$${LD_LIBRARY_PATH},)

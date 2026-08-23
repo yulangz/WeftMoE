@@ -105,7 +105,9 @@ binary secret: rank 0 writes to an inherited private pipe, local peers read
 dedicated stdin pipes, and remote peers read SSH stdin. Bootstrap material is
 never placed in argv, environment variables, shell commands, stdout/stderr, or
 temporary files. Aggregated diagnostics are additionally scrubbed for raw,
-hex, base64, and the retired text marker form.
+arbitrary-case hex, standard/URL-safe padded or unpadded base64, and the retired
+text marker form. The same rules apply to every nonempty prefix received before
+a malformed or truncated frame fails.
 
 Canonical config is an explicit little-endian envelope: `magic`, wire version,
 64-byte header length, payload length, two zero reserved words, payload
