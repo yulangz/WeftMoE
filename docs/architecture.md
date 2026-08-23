@@ -146,11 +146,11 @@ also preallocates count and summary slots before the measured hot path; the
 control-only constructor allocates agreed data slots after exact config.
 Its internal starts enqueue H2D, byte AllGather, D2H, and an event; waits check
 the event, NCCL async status, wire schema, configuration, and local failures.
-only enqueues the collective, D2H copy, and event. If any pre-return enqueue
-step fails, it drains partially submitted stream work before releasing the
-typed input owner. `wait` synchronizes the event, checks the NCCL async error,
-then publishes typed host storage. NCCL has no per-operation cancellation, so
-`cancel` safely drains that event without aborting the shared communicator.
+If any pre-return enqueue step fails, it drains partially submitted stream work
+before releasing the typed input owner. `wait` synchronizes the event, checks
+the NCCL async error, then publishes typed host storage. NCCL has no
+per-operation cancellation, so `cancel` safely drains that event without
+aborting the shared communicator.
 This backend is not the final same-rail/GIN implementation.
 
 The backend state machine is auditable and ordered:

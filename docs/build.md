@@ -131,11 +131,13 @@ then starts the remaining local and remote ranks. `--remote` is mandatory.
 Library directory, socket interface, and IB disabling are optional and inherit
 the process/remote environment unless explicitly supplied. The values above are
 an example for the inspected environment, not launcher defaults. Arguments are
-shell-quoted as individual remote `env` entries; timeout/error cleanup
-terminates every still-owned local SSH/process handle and the launcher creates
-no remote temporary file. It compares each valid 2/16-rank result against the
-Python oracle. Every rank also reports header version, `ncclGetVersion` runtime
-version, `dladdr`-resolved library path, and active network overrides.
+shell-quoted as individual remote `env` entries. Each invocation adds a random
+`--launch-id`; timeout/error cleanup terminates owned local handles and sends
+targeted TERM/KILL cleanup for only that ID on the remote host. The launcher
+creates no remote temporary file. It compares each valid 2/16-rank result
+against the Python oracle. Every rank also reports header version,
+`ncclGetVersion` runtime version, `dladdr`-resolved library path, and active
+network overrides.
 
 Explicit preload is required in the current container because another injected
 runtime otherwise precedes ASan.
