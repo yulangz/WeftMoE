@@ -26,24 +26,32 @@ Every rank unconditionally follows this generation sequence:
 
 ```text
 host/device local preflight
-  -> AllGather ControlRecord[32 x uint64]
-  -> deterministic all-rank agreement
+  -> AllGather ControlHeader[256 bytes]
+  -> deterministic header agreement
+  -> AllGather canonical config blob[exact agreed byte length]
+  -> exact decoded-field and byte agreement
   -> AllGather expert counts [world, num_experts]
   -> AllGather packet summaries [world, num_nodes]
   -> pure materialization
 ```
 
-The fixed record contains protocol/schema versions, stable session identity
-fingerprint, generation/rank/world, canonical topology and configuration
-fingerprints, explicit experts/top-k/M-tile/node/capacity fields, collective
+The fixed header contains protocol/schema versions, a two-word stable session
+ID, generation/rank/world, diagnostic config digest and exact blob length,
+explicit experts/top-k/M-tile/node/capacity fields, collective
 dtype/index widths and row widths, local token/route requirements, and a local
-error with original token/slot/expert coordinates. Its checksum and reserved
-words are validated before use. `num_tokens` may differ by rank; every rank must
+error with original token/slot/expert coordinates. Its little-endian checksum
+is validated before use. `num_tokens` may differ by rank; every rank must
 agree on `max_tokens_per_rank` and stay within it.
 
-Rows are examined by ascending origin rank. Within a row, fields are examined
-in fixed schema order, with explicit layout fields checked before hash
-fallbacks. Thus every rank selects the same lowest-rank/first-field error.
+Every row first proves that its declared rank equals its AllGather row. Rank 0
+then supplies the common generation/session/world/schema baseline. Remaining
+rows are examined by ascending origin rank and fields by fixed schema order.
+The validator takes only gathered bytes, never local context, so all callers
+produce byte-identical errors. The canonical config blob explicitly encodes,
+without padding, `rank_to_node`, `rank_to_local_rank`, `expert_to_rank`,
+`expert_rows`, `workspace_rows_per_rank`, topology shape, experts/top-k/M-tile,
+capacity, dtype/index widths, and descriptor schema. Digest equality never
+skips exact comparison.
 Control failure resets the framework protocol gate to control-ready; count and
 summary starts remain zero in the audit. A new session/generation view may share
 the still-healthy native communicator and starts again at control.
@@ -113,7 +121,7 @@ of the final validated copy releases the chain exactly once through ordinary
 shared ownership; it does not call wait or cancel again. Keeping the completed
 operation object longer may conservatively extend the same resource lifetime.
 
-After the fixed control round, two variable-width rounds are used:
+After fixed control and exact config rounds, two data rounds are used:
 
 - `ExpertCounts`: row width `num_experts`;
 - `NotifyPacketSummary`: row width `num_nodes`, counting this source rank's
@@ -122,14 +130,14 @@ After the fixed control round, two variable-width rounds are used:
 `HostFakeCountExchange` implements this contract for tests only. It is not a
 simulation of NCCL, GIN, LSA, or RDMA and accepts host buffers only.
 
-`NcclAllGatherCountExchange` is a correctness baseline using real
+The coordinator-private NCCL backend is a correctness baseline using real
 `ncclComm_t`, `cudaStream_t`, `ncclAllGather`, pinned D2H staging, a completion
 event, and `ncclCommGetAsyncError`; all native objects stay in CUDA translation
 units. Its fixed control slot is always allocated. The capacity constructor
 also preallocates count and summary slots before the measured hot path; the
-control-only constructor allocates agreed data slots after successful control.
-`start_control` enqueues H2D, fixed AllGather, D2H, and an event; `wait` checks
-the event, NCCL async status, schema, configuration, and local failures. `start`
+control-only constructor allocates agreed data slots after exact config.
+Its internal starts enqueue H2D, byte AllGather, D2H, and an event; waits check
+the event, NCCL async status, wire schema, configuration, and local failures.
 only enqueues the collective, D2H copy, and event. If any pre-return enqueue
 step fails, it drains partially submitted stream work before releasing the
 typed input owner. `wait` synchronizes the event, checks the NCCL async error,
@@ -138,11 +146,17 @@ then publishes typed host storage. NCCL has no per-operation cancellation, so
 This backend is not the final same-rail/GIN implementation.
 
 The backend state machine is auditable and ordered:
-`ControlReady -> ControlPending -> DataReady -> CountStarted -> CountComplete
+`ControlReady -> ControlPending -> ConfigReady -> ConfigPending -> DataReady -> CountStarted -> CountComplete
 -> SummaryStarted -> Complete`. A rejected control returns to `ControlReady`.
 Pending control operation destruction/cancel drains its event without throwing
 from destruction; a partial enqueue is drained before the slot/input can be
 released. One operation object is not safe for concurrent wait/cancel/move.
+The successful audit is `control/config/count/summary = 1/1/1/1`; local/header
+failure is `1/0/0/0`, and exact config failure is `1/1/0/0`.
+Test-only hooks in `src/` inject control start/enqueue, event record/wait, D2H,
+slot allocation, and completion failures. They are absent from public headers.
+World-one or all-rank injection validates cleanup; a single-rank fatal NCCL or
+CUDA failure is a backend failure and is not claimed recoverable by agreement.
 
 ### 3. Pure rank-local materialization
 

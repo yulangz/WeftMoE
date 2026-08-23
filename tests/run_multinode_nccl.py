@@ -171,7 +171,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--scenario",
-        choices=("valid", "out_of_range", "duplicate", "max_mismatch", "over_capacity"),
+        choices=("valid", "out_of_range", "duplicate", "max_mismatch",
+                 "over_capacity", "generation_mismatch", "session_mismatch",
+                 "mtile_mismatch", "topology_mismatch",
+                 "expert_capacity_mismatch", "workspace_capacity_mismatch"),
         default="valid",
     )
     args = parser.parse_args()
@@ -284,7 +287,7 @@ def main():
     if not any(routes[rank] for rank in range(args.gpus_per_node, world)):
         raise AssertionError("fixture did not contain any remote-node routes")
     print(
-        f"[PASS] real cross-host NCCL control/count/summary: nodes=2, "
+        f"[PASS] real cross-host NCCL control/config/count/summary: nodes=2, "
         f"gpus_per_node={args.gpus_per_node}, world={world}, full-field match"
     )
 

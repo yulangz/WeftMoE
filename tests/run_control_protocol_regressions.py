@@ -30,9 +30,15 @@ def main() -> None:
         "scenario=duplicate",
         "scenario=max_mismatch",
         "scenario=over_capacity",
-        "scenario=experts_mismatch",
-        "scenario=topk_mismatch",
-        "scenario=invalid_topk",
+        "scenario=generation_mismatch",
+        "scenario=session_mismatch",
+        "scenario=mtile_mismatch",
+        "scenario=two_failures",
+        "scenario=multi_field_mismatch",
+        "scenario=topology_mismatch",
+        "scenario=expert_capacity_mismatch",
+        "scenario=workspace_capacity_mismatch",
+        "20 invalid->valid recovery rounds",
     )
     missing = [marker for marker in required if marker not in completed.stdout]
     if missing:

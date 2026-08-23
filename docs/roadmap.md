@@ -23,9 +23,9 @@
 - Real NCCL AllGather correctness backend behind the opaque session/execution/
   lease contract, with event completion, typed D2H result, async-error checks,
   and contextual CUDA/NCCL failures.
-- Fixed 32-word control AllGather before every variable-layout collective,
-  explicit collective-wide configuration agreement, deterministic distributed
-  error selection, protocol call audit, and healthy-communicator recovery.
+- Fixed 256-byte little-endian control AllGather plus an exact canonical-config
+  byte AllGather before every data collective; rank-0-baseline error selection,
+  four-stage audit, and healthy-communicator recovery.
 - Explicit capacity-bound workspace and complete device metadata staging for
   later forward/backward consumers; no hot-path device allocation.
 - Single-GPU, local 2/8-GPU, and real two-host 2/16-rank full-field comparisons

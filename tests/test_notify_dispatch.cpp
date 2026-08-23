@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -1093,12 +1094,12 @@ void test_fixed_control_protocol_agreement() {
       config, context0, 2, 6, 10);
   const auto record1 = megamoe::cuda::make_control_record(
       config, context1, 3, 9, 10);
-  megamoe::cuda::validate_control_matrix({record0, record1}, context0);
+  megamoe::cuda::validate_control_matrix({record0, record1});
 
   const auto expect_control_error = [&](const megamoe::cuda::ControlMatrix &rows,
                                         const std::vector<std::string> &fields) {
     expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] { megamoe::cuda::validate_control_matrix(rows, context0); },
+                 [&] { megamoe::cuda::validate_control_matrix(rows); },
                  fields);
   };
 
@@ -1112,8 +1113,7 @@ void test_fixed_control_protocol_agreement() {
   const auto expert_mismatch = megamoe::cuda::make_control_record(
       expert_config, context1, 3, 9, 10);
   expect_control_error({record0, expert_mismatch},
-                       {"field=num_experts", "origin_rank=1",
-                        "expected=8", "actual=9"});
+                       {"field=config_blob_bytes", "origin_rank=1"});
 
   megamoe::cuda::LocalPreflightStatus invalid_route;
   invalid_route.error = megamoe::cuda::ControlLocalError::ExpertOutOfRange;
@@ -1135,11 +1135,99 @@ void test_fixed_control_protocol_agreement() {
                        {"field=num_tokens", "origin_rank=1",
                         "expected=10", "actual=11"});
 
-  auto corrupt = record1;
-  ++corrupt.reserved;
-  expect_control_error({record0, corrupt},
-                       {"field=reserved", "origin_rank=1",
-                        "expected=0", "actual=1"});
+  auto generation_mismatch = record1;
+  ++generation_mismatch.generation;
+  expect_control_error({record0, generation_mismatch},
+                       {"field=generation", "origin_rank=1",
+                        "expected=17", "actual=18"});
+
+  auto session_mismatch = record1;
+  ++session_mismatch.session_id_word1;
+  expect_control_error({record0, session_mismatch},
+                       {"field=session_id_word1", "origin_rank=1"});
+
+  // Validation has no calling-rank context: the same gathered matrix always
+  // produces an identical structured error.
+  std::string first_error;
+  std::string second_error;
+  try {
+    megamoe::cuda::validate_control_matrix({record0, generation_mismatch});
+  } catch (const NotifyDispatchError &error) {
+    first_error = error.what();
+  }
+  try {
+    megamoe::cuda::validate_control_matrix({record0, generation_mismatch});
+  } catch (const NotifyDispatchError &error) {
+    second_error = error.what();
+  }
+  REQUIRE(!first_error.empty() && first_error == second_error);
+
+  const auto wire0 = megamoe::cuda::encode_control_header(record0);
+  REQUIRE(megamoe::cuda::decode_control_header(wire0).generation == 17);
+  REQUIRE(static_cast<unsigned>(wire0[0]) == 0x43U &&
+          static_cast<unsigned>(wire0[7]) == 0x4dU);
+  auto corrupt_wire = wire0;
+  corrupt_wire[80] ^= std::byte{1};
+  expect_error(NotifyErrorCode::ControlProtocolFailure,
+               [&] { (void)megamoe::cuda::decode_control_header(corrupt_wire); },
+               {"field=checksum"});
+  auto byteswapped = wire0;
+  for (std::size_t word = 0; word < megamoe::cuda::kControlSchemaWords;
+       ++word)
+    std::reverse(byteswapped.begin() + static_cast<std::ptrdiff_t>(word * 8),
+                 byteswapped.begin() +
+                     static_cast<std::ptrdiff_t>((word + 1) * 8));
+  expect_error(NotifyErrorCode::ControlProtocolFailure,
+               [&] { (void)megamoe::cuda::decode_control_header(byteswapped); },
+               {"phase=control-agreement"});
+
+  const auto config0 = megamoe::cuda::encode_canonical_config(config, 10);
+  const auto decoded_config =
+      megamoe::cuda::decode_canonical_config(config0);
+  REQUIRE(decoded_config.rank_to_node == config.topology.rank_to_node);
+  REQUIRE(decoded_config.expert_to_rank == config.topology.expert_to_rank);
+  auto config_changed = config;
+  config_changed.topology.rank_to_local_rank[1] = 0;
+  const auto config1 = megamoe::cuda::encode_canonical_config(config_changed, 10);
+  auto same_digest0 = record0;
+  auto same_digest1 = record1;
+  same_digest1.config_digest = same_digest0.config_digest;
+  expect_error(NotifyErrorCode::ControlProtocolFailure,
+               [&] {
+                 megamoe::cuda::validate_config_matrix(
+                     {config0, config1}, {same_digest0, same_digest1});
+               },
+               {"phase=config-agreement", "field=rank_to_local_rank",
+                "origin_rank=1"});
+
+  const auto config3 = make_config(1, 3, 9, 3, 4);
+  const auto context30 = make_context(config3, 0, "common", 44, "e0");
+  const auto context31 = make_context(config3, 1, "common", 44, "e1");
+  const auto context32 = make_context(config3, 2, "common", 44, "e2");
+  const auto row30 = megamoe::cuda::make_control_record(
+      config3, context30, 1, 3, 10);
+  auto row31 = megamoe::cuda::make_control_record(
+      config3, context31, 1, 3, 10);
+  auto row32 = megamoe::cuda::make_control_record(
+      config3, context32, 1, 3, 10);
+  ++row31.session_id_word1;
+  ++row32.generation;
+  expect_error(NotifyErrorCode::ControlProtocolFailure,
+               [&] {
+                 megamoe::cuda::validate_control_matrix(
+                     {row30, row31, row32});
+               },
+               {"field=session_id_word1", "origin_rank=1"});
+
+  // For one rank with several differences, fixed field order selects
+  // generation before session and config fields.
+  ++row31.generation;
+  expect_error(NotifyErrorCode::ControlProtocolFailure,
+               [&] {
+                 megamoe::cuda::validate_control_matrix(
+                     {row30, row31, row32});
+               },
+               {"field=generation", "origin_rank=1"});
 }
 
 } // namespace

@@ -73,33 +73,30 @@ records into one preplanned device workspace.
 auto execution = cuda::make_cuda_execution("notify-stream", device);
 auto session = cuda::make_nccl_session("ep-comm", world, rank, generation,
                                        device, bootstrap_id);
-auto context = make_rank_collective_context(session.session(), rank,
-                                            execution.token());
-auto routes = cuda::upload_cuda_routes(local_routes, config.top_k, execution);
-auto plan = cuda::query_cuda_notify_workspace(config, rank,
-                                              local_routes.num_tokens,
-                                              max_tokens_per_rank);
-auto workspace = cuda::allocate_cuda_notify_workspace(plan, context, execution);
-auto preflight = cuda::start_cuda_rank_local_notify(
-    config, context, execution, routes, std::move(workspace)).wait_preflight();
-auto record = cuda::make_control_record(config, context, num_tokens,
-                                        route_elements,
-                                        max_tokens_per_rank,
-                                        preflight.status());
-auto control = backend.start_control(context, record).wait();
-// Only a successful control handle permits expert-count then summary rounds.
-auto local = preflight.local();
-auto device_handle = cuda::stage_cuda_dispatch_metadata(
-    std::move(host_handle), local, execution);
+cuda::CudaNotifyGenerationCoordinator coordinator(session, execution);
+auto generation_result = coordinator.run(
+    {config, local_routes, max_tokens_per_rank});
+const auto& device_handle = generation_result.dispatch();
 ```
 
-Every generation executes exactly `preflight → ControlRecord AllGather →
-agreement → expert-count AllGather → packet-summary AllGather`. The 32-word
-`uint64_t` control record is fully initialized even for invalid local input.
+This coordinator is the only public production protocol entry; device upload,
+workspace allocation, preflight wait, control start, and data-collective start
+are internal. Every generation executes exactly `dataized local preflight →
+256-byte ControlHeader AllGather → header agreement → canonical config blob
+AllGather → exact byte/field agreement → expert-count AllGather →
+packet-summary AllGather`. The header is explicitly little-endian encoded as
+32 words; no native struct or padding is copied to the wire. It is fully
+initialized even for invalid local input.
 Config mismatches and route errors select the lowest origin rank and first
 field in schema order; all ranks fail after the same fixed collective and never
 enter a variable-width collective. A healthy NCCL communicator can be reused
 through a new immutable generation view after a rejected generation.
+
+The stable session ID is a two-word digest of the explicit cross-process
+session identity string, never an address. Rank 0's gathered header is the
+common baseline; validation never consults the calling rank's local context.
+The diagnostic config digest is not an acceptance boundary: equal digest with
+different canonical config bytes is rejected by exact comparison.
 
 `max_tokens_per_rank` is an explicit capacity promise for every rank in the
 collective generation. It sizes worst-case incoming rows; actual materialized

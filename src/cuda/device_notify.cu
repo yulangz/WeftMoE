@@ -1,4 +1,4 @@
-#include "megamoe/cuda/device_notify.hpp"
+#include "cuda/device_notify_internal.hpp"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>

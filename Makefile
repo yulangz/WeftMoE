@@ -24,7 +24,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test cross-check header-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test cross-check header-test api-negative-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -44,6 +44,7 @@ $(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cud
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
+	$(CUDA_RUN_ENV) python3 tests/run_control_protocol_regressions.py --binary $(BUILD_DIR)/test_cuda_notify
 
 cuda-test-local: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
@@ -84,7 +85,10 @@ cross-check: $(BUILD_DIR)/metadata_dump
 header-test:
 	CXX='$(CXX)' python3 tests/check_headers.py
 
-test: $(BUILD_DIR)/test_notify_dispatch reference-test cross-check header-test
+api-negative-test:
+	CXX='$(CXX)' python3 tests/check_cuda_public_api.py
+
+test: $(BUILD_DIR)/test_notify_dispatch reference-test cross-check header-test api-negative-test
 	$(BUILD_DIR)/test_notify_dispatch
 
 ifeq ($(ENABLE_CUDA),1)

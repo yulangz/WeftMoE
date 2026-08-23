@@ -24,13 +24,10 @@ private:
   std::vector<std::uint8_t> bytes_;
   friend NcclBootstrapId make_nccl_bootstrap_id();
   friend NcclBootstrapId parse_nccl_bootstrap_id(const std::string &);
-  friend class NcclSession;
   friend NcclSession make_nccl_session(std::string, std::uint32_t,
                                        std::uint32_t, std::uint64_t,
                                        std::uint32_t,
                                        const NcclBootstrapId &);
-  friend NcclSession make_nccl_generation(const NcclSession &, std::string,
-                                          std::uint64_t);
 };
 
 NcclBootstrapId make_nccl_bootstrap_id();
@@ -55,6 +52,7 @@ private:
                                        const NcclBootstrapId &);
   friend NcclSession make_nccl_generation(const NcclSession &, std::string,
                                           std::uint64_t);
+  friend class CudaNotifyGenerationCoordinator;
   friend class NcclAllGatherCountExchange;
 };
 
@@ -62,52 +60,13 @@ NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
                               std::uint32_t rank, std::uint64_t generation,
                               std::uint32_t device_ordinal,
                               const NcclBootstrapId &bootstrap_id);
-
-// Creates a new immutable generation/session view over the same live NCCL
-// communicator. This allows a healthy communicator to recover after a rejected
-// control generation without re-bootstrap or native-handle exposure.
 NcclSession make_nccl_generation(const NcclSession &base,
-                                 std::string identity,
+                                 std::string stable_identity,
                                  std::uint64_t generation);
-
-class ValidatedControlHandle {
-public:
-  ValidatedControlHandle() = default;
-  const ControlMatrix &matrix() const;
-  const RankCollectiveContext &context() const;
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit ValidatedControlHandle(std::shared_ptr<const Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<const Impl> impl_;
-  friend class NcclControlOperation;
-};
-
-class NcclControlOperation {
-public:
-  NcclControlOperation();
-  ~NcclControlOperation() noexcept;
-  NcclControlOperation(const NcclControlOperation &) = delete;
-  NcclControlOperation &operator=(const NcclControlOperation &) = delete;
-  NcclControlOperation(NcclControlOperation &&) noexcept;
-  NcclControlOperation &operator=(NcclControlOperation &&) noexcept;
-  ExchangeState state() const noexcept;
-  ValidatedControlHandle wait();
-  void cancel();
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit NcclControlOperation(std::shared_ptr<Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<Impl> impl_;
-  friend class NcclAllGatherCountExchange;
-};
 
 struct CollectiveProtocolAudit {
   std::uint64_t control_starts = 0;
+  std::uint64_t config_starts = 0;
   std::uint64_t expert_count_starts = 0;
   std::uint64_t packet_summary_starts = 0;
 };
@@ -116,35 +75,72 @@ struct NcclWorkspaceUsage {
   std::uint64_t device_bytes = 0;
   std::uint64_t pinned_host_bytes = 0;
   std::uint64_t control_slot_bytes = 0;
+  std::uint64_t config_wire_bytes = 0;
+  std::uint64_t config_slot_bytes = 0;
   std::uint64_t expert_slot_bytes = 0;
   std::uint64_t summary_slot_bytes = 0;
 };
 
-class NcclAllGatherCountExchange final : public CountExchange {
-public:
-  struct Impl;
-  NcclAllGatherCountExchange(const NcclSession &session,
-                             const CudaExecution &execution);
-  NcclAllGatherCountExchange(const NcclSession &session,
-                             const CudaExecution &execution,
-                             std::uint64_t max_expert_row_width,
-                             std::uint64_t max_summary_row_width);
-  ~NcclAllGatherCountExchange() noexcept override;
-  NcclAllGatherCountExchange(const NcclAllGatherCountExchange &) = delete;
-  NcclAllGatherCountExchange &
-  operator=(const NcclAllGatherCountExchange &) = delete;
-  NcclAllGatherCountExchange(NcclAllGatherCountExchange &&) noexcept;
-  NcclAllGatherCountExchange &
-  operator=(NcclAllGatherCountExchange &&) noexcept;
+struct GenerationSetupTimings {
+  double coordinator_backend_create_us = 0;
+  double control_slot_allocation_us = 0;
+  double config_slot_allocation_us = 0;
+  double count_slot_allocation_us = 0;
+  double summary_slot_allocation_us = 0;
+  double event_allocation_us = 0;
+  double pinned_allocation_us = 0;
+  double device_allocation_us = 0;
+  double per_generation_setup_total_us = 0;
+};
 
-  std::unique_ptr<BackendCountExchangeOperation>
-  start(const CountExchangeRequest &request) override;
-  NcclControlOperation start_control(const RankCollectiveContext &context,
-                                     const ControlRecord &record);
-  CollectiveProtocolAudit audit() const;
-  NcclWorkspaceUsage workspace_usage() const;
+struct NotifyGenerationRequest {
+  RuntimeConfig config;
+  RankRoutingInput local_routes;
+  std::uint64_t max_tokens_per_rank = 0;
+};
+
+// A successful result can only be published after the exact sequence
+// control/config/count/summary has completed once each.
+class ValidatedCudaGeneration {
+public:
+  ValidatedCudaGeneration() = default;
+  const CudaDispatchHandle &dispatch() const;
+  const CollectiveProtocolAudit &audit() const;
+  const NcclWorkspaceUsage &workspace_usage() const;
+  const GenerationSetupTimings &setup_timings() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
+  struct Impl;
+  explicit ValidatedCudaGeneration(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class CudaNotifyGenerationCoordinator;
+};
+
+// The sole production entry for one distributed generation. Predictable
+// config/shape/route/capacity failures are dataized before the fixed control
+// AllGather; callers cannot separately wait preflight or start data collectives.
+class CudaNotifyGenerationCoordinator {
+public:
+  CudaNotifyGenerationCoordinator(const NcclSession &session,
+                                  const CudaExecution &execution);
+  ~CudaNotifyGenerationCoordinator() noexcept;
+  CudaNotifyGenerationCoordinator(
+      const CudaNotifyGenerationCoordinator &) = delete;
+  CudaNotifyGenerationCoordinator &operator=(
+      const CudaNotifyGenerationCoordinator &) = delete;
+  CudaNotifyGenerationCoordinator(CudaNotifyGenerationCoordinator &&) noexcept;
+  CudaNotifyGenerationCoordinator &operator=(
+      CudaNotifyGenerationCoordinator &&) noexcept;
+
+  ValidatedCudaGeneration run(NotifyGenerationRequest request);
+  CollectiveProtocolAudit audit() const;
+  NcclWorkspaceUsage workspace_usage() const;
+  GenerationSetupTimings setup_timings() const;
+
+private:
+  struct Impl;
   std::shared_ptr<Impl> impl_;
 };
 

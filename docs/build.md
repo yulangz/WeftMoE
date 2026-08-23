@@ -160,34 +160,33 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
 ```
 
 The benchmark performs 10 warmups and 50 measured iterations. It reports mean,
-P50, P95, min, and max for the slowest rank of every iteration, separating CUDA
-event mapping time, host mapping wall time, control/count/summary completion,
-materialization/staging wall time, and end-to-end wall time. `BENCH_JSON` is the
-same result in machine-readable form. Workspace categories include route input,
-device arena, pinned staging, NCCL control/data device and pinned slots, and the
-logical final metadata resident in the arena (not double-counted in unique
-peak). Mapping has no per-route copy, allocation, or synchronization; NCCL slot
-allocation occurs at generation setup or after control agreement when the
-control-only constructor is selected.
+P50, P95, min, and max using the slowest rank per iteration. Names distinguish
+one-time session setup (owned by the runner), per-generation coordinator/backend
+and control/config/count/summary slot setup, and steady-state execution.
+`BENCH_JSON` carries the same categories. Workspace reporting includes the
+256-byte control wire/slots, canonical config wire/slots, count/summary slots,
+device bytes, and pinned bytes. Setup-inclusive wall time is never labelled as
+steady-state. Mapping has no per-route copy, allocation, or synchronization.
 
-On the inspected local 8-GPU host, the slowest-rank statistics in microseconds
-were:
+On the inspected local 8-GPU L20X host, the refactored coordinator baseline
+produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 
 | stage | mean | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| mapping CUDA event | 182.900 | 154.176 | 307.744 | 135.328 | 371.072 |
-| mapping host wall | 4702.140 | 4690.630 | 4868.230 | 4553.200 | 4989.240 |
-| control completion | 10177.300 | 9419.910 | 15187.500 | 7010.460 | 20758.900 |
-| expert-count completion | 380.409 | 384.360 | 483.669 | 230.354 | 666.370 |
-| packet-summary completion | 38.005 | 35.905 | 54.462 | 29.307 | 66.489 |
-| all collectives | 10382.400 | 9669.850 | 15354.300 | 7183.200 | 20944.100 |
-| D2H/materialize/H2D wall | 68310.100 | 67653.700 | 71966.000 | 66581.300 | 72085.200 |
-| end-to-end host wall | 90229.500 | 89104.800 | 98051.200 | 86110.200 | 111809.000 |
+| one-time NCCL session setup | 383008 | 369536 | 471565 | 344709 | 524727 |
+| per-generation setup | 13396.9 | 9376.96 | 34485.8 | 8219.19 | 40336.4 |
+| setup-inclusive generation end-to-end | 210409 | 174145 | 281481 | 160704 | 874043 |
+| steady-state execution | 197012 | 162620 | 263805 | 151561 | 856049 |
+| config slot allocation | 2677.08 | 2680.96 | 2967.84 | 2299.01 | 3586.94 |
+| count slot allocation | 1262.28 | 1241.65 | 1551.27 | 989.894 | 1909.25 |
+| summary slot allocation | 1241.43 | 1160.09 | 1937.30 | 964.696 | 2233.29 |
 
-Peak unique workspace was 23,057,039 bytes: route input 196,608; device
-arena 21,361,407; pinned staging 1,445,136; NCCL device slots 26,944; NCCL
-pinned slots 26,944. Final device metadata resides in the arena and is not
-added twice.
+The corresponding peak NCCL workspace categories were: control slot 4,608
+bytes, config wire 3,352 bytes, config slot 60,336 bytes, expert slot 49,152
+bytes, summary slot 128 bytes, device total 57,112 bytes, and pinned total
+57,112 bytes. The coordinator/backend creation measurement includes control
+slot creation; component rows are diagnostic and are not summed as disjoint
+categories.
 
 ## Clean export
 
