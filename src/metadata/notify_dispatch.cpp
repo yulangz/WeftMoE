@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "megamoe/api/errors.hpp"
+#include "cuda/device_notify_bridge.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 
 namespace megamoe {
@@ -20,6 +21,8 @@ struct LocalHistogramHandle::Impl {
   SourceRouteMetadata outgoing;
   HostIntegerRow local_expert_count;
   HostIntegerRow packet_count_by_destination_node;
+  DeviceBufferLease device_expert_count;
+  DeviceBufferLease device_packet_count;
   std::shared_ptr<const std::uint8_t> provenance;
 };
 
@@ -1027,6 +1030,10 @@ void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
 
 } // namespace
 
+void validate_runtime_config(const RuntimeConfig &config) {
+  (void)validate_config(config);
+}
+
 class DispatchHandleFactory {
 public:
   static DispatchHandle make(std::shared_ptr<const DispatchMetadata> metadata) {
@@ -1086,6 +1093,20 @@ LocalHistogramHandle::packet_count_by_destination_node() const {
     fail(NotifyErrorCode::InvalidHandle,
          "attempted to access an empty local histogram handle");
   return impl_->packet_count_by_destination_node;
+}
+
+const DeviceBufferLease &LocalHistogramHandle::device_expert_count() const {
+  if (!impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "attempted to access an empty local histogram handle");
+  return impl_->device_expert_count;
+}
+
+const DeviceBufferLease &LocalHistogramHandle::device_packet_count() const {
+  if (!impl_)
+    fail(NotifyErrorCode::InvalidHandle,
+         "attempted to access an empty local histogram handle");
+  return impl_->device_packet_count;
 }
 
 LocalHistogramHandle testing::NotifyCorruptionHook::with_expert_id(
@@ -1408,6 +1429,30 @@ build_rank_local_histogram(const RuntimeConfig &config,
   return LocalHistogramHandle(std::move(local));
 }
 
+LocalHistogramHandle cuda::DeviceNotifyBridge::make_local(
+    const RuntimeConfig &config, const RankCollectiveContext &context,
+    std::uint64_t num_tokens, SourceRouteMetadata outgoing,
+    std::vector<std::uint64_t> expert_counts,
+    std::vector<std::uint64_t> packet_counts,
+    DeviceBufferLease device_expert_counts,
+    DeviceBufferLease device_packet_counts) {
+  auto local = std::make_shared<LocalHistogramHandle::Impl>();
+  local->config = config;
+  local->context = context;
+  local->outgoing = std::move(outgoing);
+  local->outgoing.num_tokens = num_tokens;
+  local->local_expert_count =
+      make_host_integer_row(std::move(expert_counts));
+  local->packet_count_by_destination_node =
+      make_host_integer_row(std::move(packet_counts));
+  local->device_expert_count = std::move(device_expert_counts);
+  local->device_packet_count = std::move(device_packet_counts);
+  local->provenance = std::make_shared<const std::uint8_t>(0);
+  LocalHistogramHandle result(std::move(local));
+  validate_local_structure(result);
+  return result;
+}
+
 CollectiveOperation start_count_exchange(const LocalHistogramHandle &local,
                                          CountExchange &backend) {
   if (!local) {
@@ -1425,7 +1470,8 @@ CollectiveOperation start_count_exchange(const LocalHistogramHandle &local,
   resources->input = local.local_expert_count();
   try {
     resources->backend = backend.start(CountExchangeRequest{
-        context, resources->kind, resources->row_width, resources->input});
+        context, resources->kind, resources->row_width, resources->input,
+        local.device_expert_count()});
     if (!resources->backend)
       throw std::runtime_error("backend returned null operation");
   } catch (const NotifyDispatchError &error) {
@@ -1460,7 +1506,8 @@ start_notify_summary_exchange(const LocalHistogramHandle &local,
   resources->input = local.packet_count_by_destination_node();
   try {
     resources->backend = backend.start(CountExchangeRequest{
-        context, resources->kind, resources->row_width, resources->input});
+        context, resources->kind, resources->row_width, resources->input,
+        local.device_packet_count()});
     if (!resources->backend)
       throw std::runtime_error("backend returned null operation");
   } catch (const NotifyDispatchError &error) {

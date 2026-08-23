@@ -164,6 +164,7 @@ private:
   friend DeviceBufferLease
   make_device_buffer_lease(std::uint32_t, std::uint64_t, std::uint64_t,
                            std::shared_ptr<const BackendDeviceLeaseState>);
+  friend class CountExchange;
 };
 
 DeviceBufferLease make_device_buffer_lease(
@@ -176,6 +177,9 @@ struct CountExchangeRequest {
   ExchangeKind kind = ExchangeKind::ExpertCounts;
   std::uint64_t row_width = 0;
   HostIntegerRow input;
+  // Optional backend-opaque device row. Generic metadata never interprets it.
+  // A backend must reject an unsupported or foreign lease before enqueue.
+  DeviceBufferLease device_input;
 };
 
 class BackendCompletion {
@@ -227,6 +231,8 @@ protected:
   backend_session_state(const RankCollectiveContext &context);
   static std::shared_ptr<const BackendExecutionState>
   backend_execution_state(const RankCollectiveContext &context);
+  static std::shared_ptr<const BackendDeviceLeaseState>
+  backend_device_state(const DeviceBufferLease &lease);
 };
 
 // Deterministic host test backend; not an NCCL/GIN/LSA/RDMA implementation.

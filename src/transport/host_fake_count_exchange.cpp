@@ -441,6 +441,13 @@ CountExchange::backend_execution_state(const RankCollectiveContext &context) {
   return context.execution().impl_->backend_state;
 }
 
+std::shared_ptr<const BackendDeviceLeaseState>
+CountExchange::backend_device_state(const DeviceBufferLease &lease) {
+  if (!lease)
+    invalid_exchange("backend requested state from empty device lease");
+  return lease.impl_->backend_lease;
+}
+
 namespace {
 
 struct RoundKey {

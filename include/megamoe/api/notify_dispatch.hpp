@@ -14,6 +14,9 @@ namespace megamoe {
 namespace testing {
 class NotifyCorruptionHook;
 }
+namespace cuda {
+class DeviceNotifyBridge;
+}
 
 // Immutable phase-1 result. It owns the calling rank's routes and typed count
 // rows, and binds them to one rank/session/generation/execution provenance.
@@ -25,6 +28,8 @@ public:
   const SourceRouteMetadata &outgoing() const;
   const HostIntegerRow &local_expert_count() const;
   const HostIntegerRow &packet_count_by_destination_node() const;
+  const DeviceBufferLease &device_expert_count() const;
+  const DeviceBufferLease &device_packet_count() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -43,6 +48,7 @@ private:
                             const class ValidatedCollectiveHandle &,
                             const class ValidatedCollectiveHandle &);
   friend class testing::NotifyCorruptionHook;
+  friend class cuda::DeviceNotifyBridge;
 };
 
 LocalHistogramHandle

@@ -44,15 +44,15 @@ from deterministic partition prefixes, not an atomic return order.
 - calling rank and an immutable `ExecutionToken` strongly owning any
   backend-private stream/context state;
 - collective kind and row width;
-- one inseparable `HostIntegerRow` typed immutable allocation.
+- one inseparable `HostIntegerRow` typed immutable allocation and, when a
+  device backend is selected, an optional backend-opaque `DeviceBufferLease`.
 
 There is no public integer address/owner pair and no public native communicator
 or stream integer. Backend subclasses can retrieve their own opaque state only
-through protected `CountExchange` accessors. A host backend returns a checked,
-typed `HostCountMatrix` at completion. A future device backend may return only
-an opaque `DeviceBufferLease`; the host materializer rejects it until that
-backend produces a controlled typed host result. Generic metadata never obtains
-or dereferences a device address.
+through protected `CountExchange` accessors. The NCCL backend consumes its own
+opaque device lease and, after its CUDA event reaches completion, returns a
+checked typed `HostCountMatrix`. Generic metadata never obtains or dereferences
+a device address.
 
 A device lease records `rows`, `row_width`, checked `element_count`, and the
 backend-declared `capacity_elements`. Construction requires nonzero dimensions
@@ -95,6 +95,17 @@ Two explicit rounds are used:
 
 `HostFakeCountExchange` implements this contract for tests only. It is not a
 simulation of NCCL, GIN, LSA, or RDMA and accepts host buffers only.
+
+`NcclAllGatherCountExchange` is a correctness baseline using real
+`ncclComm_t`, `cudaStream_t`, `ncclAllGather`, pinned D2H staging, a completion
+event, and `ncclCommGetAsyncError`; all native objects stay in CUDA translation
+units. The constructor preallocates one count slot and one summary slot. `start`
+only enqueues the collective, D2H copy, and event. If any pre-return enqueue
+step fails, it drains partially submitted stream work before releasing the
+typed input owner. `wait` synchronizes the event, checks the NCCL async error,
+then publishes typed host storage. NCCL has no per-operation cancellation, so
+`cancel` safely drains that event without aborting the shared communicator.
+This backend is not the final same-rail/GIN implementation.
 
 ### 3. Pure rank-local materialization
 
@@ -160,6 +171,43 @@ Materialization copies the validated integer metadata into `DispatchHandle`;
 the dispatch handle deliberately does not retain collective resources. Callers
 may release validated handles after materialization when no later consumer needs
 their completion lifetime.
+
+## CUDA deterministic Notify and device workspace
+
+The CUDA frontend takes only the calling rank's device route matrix. Runtime
+shape, topology, calling rank, device, session generation, execution identity,
+and a collective-wide `max_tokens_per_rank` capacity are bound into
+`CudaNotifyWorkspacePlan`. Query arithmetic checks both integer and allocation
+limits. Allocation creates one device arena, one pinned host staging arena, and
+one completion event before the hot path; sort, scan, histograms, route fields,
+count matrices, descriptors, and final metadata are aligned subregions.
+
+For flat route index `i = token * top_k + slot`, the sort key is:
+
+```text
+key(i) = expert_id(i) * route_count + i
+```
+
+The explicit `i` makes it a total order even if the radix-sort implementation
+does not promise stability. A key-group inclusive scan produces the occurrence
+number, which is scattered back as `local_offset`. Atomics are limited to
+commutative histogram/summary accumulation and deterministic minimum-invalid-
+coordinate reporting; no atomic return order chooses a canonical row.
+
+After checked host materialization, one stream-ordered staging step fills:
+
+- route destination row plus all original route arrays and node masks;
+- `[source_rank, expert]` counts, owned expert IDs/counts/prefixes, flattened
+  M-tile rows, and incoming row geometry;
+- reverse-route records, packet headers, fan-out offsets/targets, and outgoing
+  and incoming-proxy signal records.
+
+Every published `DeviceBufferLease` strongly owns the common workspace state.
+Route input, workspace, output, execution stream, event, and session therefore
+remain alive through pending work and through the final `CudaDispatchHandle`.
+The controlled `validate_cuda_dispatch_metadata` diagnostic is implemented in
+the CUDA module and downloads every device field for tests; the generic
+metadata layer still cannot inspect a native pointer.
 
 ## Thread-safety contract
 

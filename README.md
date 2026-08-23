@@ -1,9 +1,11 @@
 # MegaMOE
 
-MegaMOE targets deterministic training MoE execution on H200/SM90. The current
-vertical slice implements rank-local deterministic Notify Dispatch metadata in
-production C++ plus an independent Python oracle. It does **not** implement
-NCCL GIN/LSA, RDMA, activation movement, or persistent forward/backward kernels.
+MegaMOE targets deterministic training MoE execution on H200/SM90 and later
+devices. The current vertical slice implements rank-local deterministic Notify
+Dispatch in production C++/CUDA, a real NCCL AllGather count backend, opaque
+device metadata leases, and an independent Python oracle. It does **not**
+implement NCCL GIN/LSA, RDMA, activation movement, or persistent
+forward/backward kernels.
 
 ## Supported topology contract
 
@@ -20,7 +22,7 @@ local ranks, and out-of-range node/expert ownership are rejected explicitly.
 
 ## Rank-local production flow
 
-The production path never asks one rank to provide every rank's routes:
+The host control-plane path never asks one rank to provide every rank's routes:
 
 ```cpp
 auto session = make_collective_session("comm-A", world_size, generation,
@@ -56,6 +58,38 @@ exceptions.
 `build_notify_dispatch_for_testing` is a host reference/test wrapper that
 composes this path for all ranks. It is not a device entry point.
 
+The optional CUDA path keeps `selected_experts[num_tokens, top_k]` on the
+calling GPU. It derives an explicit total-order key
+`(expert_id, flat_route_index)`, performs radix sort plus segmented inclusive
+scan, and scatters the stable local offsets. Atomic return values are never used
+as route offsets. A CUDA/NCCL session then AllGathers the device expert-count and
+token-node summary rows, stages a checked typed host result at completion, and
+uses the same materializer as the host production path. The final stage writes
+canonical rows, count geometry, reverse routes, packet fan-out, and signal
+records into one preplanned device workspace.
+
+```cpp
+auto execution = cuda::make_cuda_execution("notify-stream", device);
+auto session = cuda::make_nccl_session("ep-comm", world, rank, generation,
+                                       device, bootstrap_id);
+auto context = make_rank_collective_context(session.session(), rank,
+                                            execution.token());
+auto routes = cuda::upload_cuda_routes(local_routes, config.top_k, execution);
+auto plan = cuda::query_cuda_notify_workspace(config, rank,
+                                              local_routes.num_tokens,
+                                              max_tokens_per_rank);
+auto workspace = cuda::allocate_cuda_notify_workspace(plan, context, execution);
+auto local = cuda::start_cuda_rank_local_notify(
+    config, context, execution, routes, std::move(workspace)).wait();
+// Start/wait the two real NCCL rounds, then call materialize_rank_metadata.
+auto device_handle = cuda::stage_cuda_dispatch_metadata(
+    std::move(host_handle), local, execution);
+```
+
+`max_tokens_per_rank` is an explicit capacity promise for every rank in the
+collective generation. It sizes worst-case incoming rows; actual materialized
+rows exceeding it fail before an H2D copy.
+
 ## Deterministic mapping and descriptors
 
 ```text
@@ -84,9 +118,11 @@ include/megamoe/api/          rank-local Notify API and errors
 include/megamoe/config/       runtime shape/topology/capacity
 include/megamoe/metadata/     rank-local handle, descriptors, serialization
 include/megamoe/transport/    async integer collective contract and host fake
+include/megamoe/cuda/         opaque CUDA Notify/NCCL APIs and device schemas
 include/megamoe/scoreboard/   identity-bound workspace plan
 include/megamoe/kernels/      checked future launch contracts
-src/                          C++ implementation; no device kernel yet
+src/cuda/                     deterministic CUDA mapping and private leases
+src/transport/                host fake plus optional real NCCL AllGather
 src/metadata/*corruption*     internal sanitizer test hook, not public API
 reference/                    independent Python oracle
 tests/                        C++, Python, and full-field cross-language tests
@@ -100,6 +136,10 @@ docs/                         architecture, build, references, roadmap
 make -j
 make test
 make bench
+
+# Optional CUDA/NCCL slice; see docs/build.md for the tested runtime library.
+make BUILD_DIR=build-cuda cuda-lib
+make BUILD_DIR=build-cuda NCCL_RUNTIME_LIB_DIR=/path/to/nccl/lib cuda-test-local
 ```
 
 `make test` runs C++ contract tests, Python reference tests, and a machine-readable

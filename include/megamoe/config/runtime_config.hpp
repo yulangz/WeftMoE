@@ -36,4 +36,7 @@ struct RankRoutingInput {
     std::vector<std::int32_t> selected_experts;
 };
 
+// Shared production validation used by host and optional device frontends.
+void validate_runtime_config(const RuntimeConfig &config);
+
 }  // namespace megamoe

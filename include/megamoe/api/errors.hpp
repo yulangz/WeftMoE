@@ -17,6 +17,8 @@ enum class NotifyErrorCode {
     ArithmeticOverflow,
     InvalidHandle,
     WorkspaceMismatch,
+    CudaFailure,
+    NcclFailure,
 };
 
 class NotifyDispatchError final : public std::runtime_error {

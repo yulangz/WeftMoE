@@ -5,6 +5,13 @@ the following files for design patterns. No source was mechanically copied.
 
 ## DeepEP
 
+- `DeepEP/csrc/kernels/backend/nccl.cu`: CUDA/NCCL compilation boundaries,
+  communicator calls, stream enqueue style, and contextual backend checks. It
+  informed the private backend boundary, not the generic public types.
+- `DeepEP/deep_ep/include/deep_ep/common/exception.cuh`: CUDA/NCCL launch and
+  runtime error checking patterns; MegaMOE maps errors into its own typed,
+  phase/rank/session-aware exceptions.
+
 - `DeepEP/deep_ep/include/deep_ep/impls/dispatch.cuh`: notify warp roles,
   rank/expert counting, peer count writes, count readiness, expert/rank prefix,
   and the existing atomic sender slot allocation that MegaMOE must not use for
@@ -23,6 +30,10 @@ the following files for design patterns. No source was mechanically copied.
 
 ## DeepGEMM
 
+- `DeepGEMM/CMakeLists.txt` and
+  `DeepGEMM/deep_gemm/include/deep_gemm/common/exception.cuh`: optional CUDA
+  target layout, architecture selection, and checked launch boundaries.
+
 - `DeepGEMM/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh`: explicit
   `BlockPhase`, persistent task production, L1 warmup/L2 interleave, and runtime
   valid-M propagation.
@@ -33,6 +44,9 @@ the following files for design patterns. No source was mechanically copied.
   producer-consumer waits.
 
 ## DeepGEMM-bk
+
+- `DeepGEMM-bk/CMakeLists.txt`: separate compile targets for experimental SM90
+  paths and the need to distinguish compile coverage from runnable hardware.
 
 - `DeepGEMM-bk/deep_gemm/include/deep_gemm/scheduler/sm90_mega_moe.cuh`:
   SM90-specific phase scheduling, logical pool versus physical ring, and
@@ -50,9 +64,10 @@ as an architecture reference, not as an upstream API or code source.
   cumsums, explicit dispatch/combine offsets, put/fence/signal ordering, and
   stable gather-index construction.
 - `Triton-distributed/python/triton_dist/kernels/nvidia/moe_utils.py`: stable
-  gather/scatter helpers, expert histograms, padding, and a contrasting atomic
-  scatter allocator whose return order is unsuitable for MegaMOE canonical
-  destination rows.
+  gather/scatter helpers, histogram/scan/sort workspace shapes, explicit
+  indices, padding, and a contrasting atomic scatter allocator whose return
+  order is unsuitable for MegaMOE canonical destination rows. The MegaMOE CUDA
+  key includes the flat route index to impose a complete order.
 - `Triton-distributed/csrc/lib/moe_utils.cu`: deterministic per-thread shard
   prefix construction and expert-aligned token layout.
 - `Triton-distributed/tutorials/01-distributed-notify-wait.py`: sequence-aware
