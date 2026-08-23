@@ -72,6 +72,29 @@ struct DeviceStatus {
   unsigned long long duplicate_packed;
 };
 
+enum class MaterializationError : unsigned long long {
+  None = 0,
+  ArithmeticOverflow = 1,
+  CountRowMismatch = 2,
+  SummaryRowMismatch = 3,
+  ExpertCapacity = 4,
+  WorkspaceCapacity = 5,
+  OutputCapacity = 6,
+  InvalidCollectiveValue = 7,
+};
+
+struct DeviceMaterializationStatus {
+  unsigned long long error;
+  unsigned long long field;
+  unsigned long long expected;
+  unsigned long long actual;
+  unsigned long long owned_experts;
+  unsigned long long incoming_rows;
+  unsigned long long mtile_count;
+  unsigned long long packet_count;
+  unsigned long long fanout_count;
+};
+
 struct Layout {
   std::size_t keys_in = 0;
   std::size_t keys_out = 0;
@@ -94,7 +117,11 @@ struct Layout {
   std::size_t rank_to_node = 0;
   std::size_t rank_to_local = 0;
   std::size_t status = 0;
-  std::size_t source_expert_count = 0;
+  std::size_t materialization_status = 0;
+  std::size_t expert_total = 0;
+  std::size_t expert_base = 0;
+  std::size_t expert_capacity = 0;
+  std::size_t workspace_capacity = 0;
   std::size_t owned_expert_ids = 0;
   std::size_t owned_expert_count = 0;
   std::size_t owned_expert_prefix = 0;
@@ -136,10 +163,19 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
   layout.rank_to_node = append_region(cursor, plan.world_size, sizeof(std::uint32_t), "rank_to_node");
   layout.rank_to_local = append_region(cursor, plan.world_size, sizeof(std::uint32_t), "rank_to_local");
   layout.status = append_region(cursor, 1, sizeof(DeviceStatus), "status");
-  layout.source_expert_count = append_region(
-      cursor, checked_mul(plan.world_size, plan.num_experts,
-                          "source_expert_count_elements"),
-      sizeof(std::uint64_t), "source_expert_count");
+  layout.materialization_status = append_region(
+      cursor, 1, sizeof(DeviceMaterializationStatus),
+      "materialization_status");
+  layout.expert_total = append_region(cursor, plan.num_experts,
+                                      sizeof(std::uint64_t), "expert_total");
+  layout.expert_base = append_region(cursor, plan.num_experts,
+                                     sizeof(std::uint64_t), "expert_base");
+  layout.expert_capacity = append_region(cursor, plan.num_experts,
+                                         sizeof(std::uint64_t),
+                                         "expert_capacity");
+  layout.workspace_capacity = append_region(cursor, plan.world_size,
+                                             sizeof(std::uint64_t),
+                                             "workspace_capacity");
   layout.owned_expert_ids = append_region(
       cursor, plan.num_experts, sizeof(std::uint32_t), "owned_expert_ids");
   layout.owned_expert_count = append_region(
@@ -179,32 +215,19 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
 }
 
 struct HostLayout {
-  std::size_t expert_count = 0;
-  std::size_t packet_count = 0;
-  std::size_t expert_id = 0;
-  std::size_t local_offset = 0;
-  std::size_t route_dst_rank = 0;
-  std::size_t route_dst_node = 0;
-  std::size_t route_dst_local_rank = 0;
-  std::size_t combine_order = 0;
-  std::size_t masks = 0;
   std::size_t status = 0;
+  std::size_t materialization_status = 0;
   std::size_t total = 0;
 };
 
 HostLayout make_host_layout(const CudaNotifyWorkspacePlan &plan) {
+  (void)plan;
   HostLayout layout;
   std::size_t cursor = 0;
-  layout.expert_count = append_region(cursor, plan.num_experts, sizeof(std::uint64_t), "host_expert_count");
-  layout.packet_count = append_region(cursor, plan.num_nodes, sizeof(std::uint64_t), "host_packet_count");
-  layout.expert_id = append_region(cursor, plan.route_count, sizeof(std::uint32_t), "host_expert_id");
-  layout.local_offset = append_region(cursor, plan.route_count, sizeof(std::uint64_t), "host_local_offset");
-  layout.route_dst_rank = append_region(cursor, plan.route_count, sizeof(std::uint32_t), "host_route_dst_rank");
-  layout.route_dst_node = append_region(cursor, plan.route_count, sizeof(std::uint32_t), "host_route_dst_node");
-  layout.route_dst_local_rank = append_region(cursor, plan.route_count, sizeof(std::uint32_t), "host_route_dst_local_rank");
-  layout.combine_order = append_region(cursor, plan.route_count, sizeof(std::uint32_t), "host_combine_order");
-  layout.masks = append_region(cursor, checked_mul(plan.num_tokens, plan.node_mask_words, "host_mask_elements"), sizeof(std::uint64_t), "host_masks");
   layout.status = append_region(cursor, 1, sizeof(DeviceStatus), "host_status");
+  layout.materialization_status = append_region(
+      cursor, 1, sizeof(DeviceMaterializationStatus),
+      "host_materialization_status");
   layout.total = cursor;
   return layout;
 }
@@ -334,6 +357,330 @@ __global__ void histogram_and_scatter_kernel(
     histogram[expert] = inclusive[index];
 }
 
+struct DeviceMaterializeArgs {
+  std::uint32_t rank;
+  std::uint32_t world;
+  std::uint32_t experts;
+  std::uint32_t nodes;
+  std::uint32_t top_k;
+  std::uint32_t mask_words;
+  std::uint32_t m_tile;
+  std::uint64_t tokens;
+  std::uint64_t routes;
+  std::uint64_t max_tokens;
+  std::uint64_t max_incoming_rows;
+  bool has_expert_capacity;
+  bool has_workspace_capacity;
+  const std::uint64_t *count_matrix;
+  const std::uint64_t *summary_matrix;
+  const std::uint64_t *local_histogram;
+  const std::uint64_t *local_summary;
+  const std::uint32_t *expert_to_rank;
+  const std::uint32_t *rank_to_node;
+  const std::uint32_t *rank_to_local;
+  const std::uint64_t *expert_capacity;
+  const std::uint64_t *workspace_capacity;
+  const std::uint32_t *expert_id;
+  const std::uint64_t *local_offset;
+  const std::uint32_t *route_dst_rank;
+  const std::uint32_t *route_dst_node;
+  const std::uint32_t *route_dst_local;
+  const std::uint32_t *combine_order;
+  const std::uint64_t *masks;
+  std::uint64_t *expert_total;
+  std::uint64_t *expert_base;
+  std::uint64_t *route_dst_row;
+  std::uint32_t *owned_expert_ids;
+  std::uint64_t *owned_expert_count;
+  std::uint64_t *owned_expert_prefix;
+  std::uint64_t *mtile_offsets;
+  std::uint32_t *mtile_rows;
+  DeviceIncomingRowRecord *incoming_rows;
+  DeviceReverseRouteRecord *reverse_routes;
+  DevicePacketHeaderRecord *packet_headers;
+  std::uint64_t *packet_fanout_offsets;
+  DeviceFanoutRecord *packet_fanout;
+  DeviceSignalRecord *outgoing_signals;
+  DeviceSignalRecord *incoming_signals;
+  DeviceMaterializationStatus *status;
+};
+
+__device__ bool device_add(std::uint64_t lhs, std::uint64_t rhs,
+                           std::uint64_t &out) {
+  if (rhs > ~std::uint64_t{0} - lhs)
+    return false;
+  out = lhs + rhs;
+  return true;
+}
+
+__device__ void materialization_fail(DeviceMaterializationStatus *status,
+                                     MaterializationError error,
+                                     std::uint64_t field,
+                                     std::uint64_t expected,
+                                     std::uint64_t actual) {
+  status->error = static_cast<unsigned long long>(error);
+  status->field = field;
+  status->expected = expected;
+  status->actual = actual;
+}
+
+__device__ std::uint32_t rank_at_coordinate(const DeviceMaterializeArgs &a,
+                                            std::uint32_t node,
+                                            std::uint32_t local_rank) {
+  for (std::uint32_t rank = 0; rank < a.world; ++rank) {
+    if (a.rank_to_node[rank] == node &&
+        a.rank_to_local[rank] == local_rank)
+      return rank;
+  }
+  return a.world;
+}
+
+// Correctness baseline. Every loop has an explicit canonical order. The
+// surrounding API deliberately permits replacing this kernel with parallel
+// scans/sorts without changing its output layout or identities.
+__global__ void materialize_metadata_kernel(DeviceMaterializeArgs a) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  *a.status = DeviceMaterializationStatus{};
+  std::uint64_t max_routes_per_rank = 0;
+  if (a.top_k != 0 && a.max_tokens > ~std::uint64_t{0} / a.top_k) {
+    materialization_fail(a.status, MaterializationError::ArithmeticOverflow, 1,
+                         ~std::uint64_t{0}, a.max_tokens);
+    return;
+  }
+  max_routes_per_rank = a.max_tokens * a.top_k;
+
+  for (std::uint32_t source = 0; source < a.world; ++source) {
+    for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+      const auto value = a.count_matrix[
+          static_cast<std::uint64_t>(source) * a.experts + expert];
+      if (value > max_routes_per_rank) {
+        materialization_fail(a.status,
+                             MaterializationError::InvalidCollectiveValue, 2,
+                             max_routes_per_rank, value);
+        return;
+      }
+      if (source == a.rank && value != a.local_histogram[expert]) {
+        materialization_fail(a.status,
+                             MaterializationError::CountRowMismatch, expert,
+                             a.local_histogram[expert], value);
+        return;
+      }
+    }
+    for (std::uint32_t node = 0; node < a.nodes; ++node) {
+      const auto value = a.summary_matrix[
+          static_cast<std::uint64_t>(source) * a.nodes + node];
+      if (value > a.max_tokens) {
+        materialization_fail(a.status,
+                             MaterializationError::InvalidCollectiveValue, 3,
+                             a.max_tokens, value);
+        return;
+      }
+      if (source == a.rank && value != a.local_summary[node]) {
+        materialization_fail(a.status,
+                             MaterializationError::SummaryRowMismatch, node,
+                             a.local_summary[node], value);
+        return;
+      }
+    }
+  }
+
+  for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+    std::uint64_t total = 0;
+    for (std::uint32_t source = 0; source < a.world; ++source) {
+      const auto value = a.count_matrix[
+          static_cast<std::uint64_t>(source) * a.experts + expert];
+      if (!device_add(total, value, total)) {
+        materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                             4, ~std::uint64_t{0}, value);
+        return;
+      }
+    }
+    a.expert_total[expert] = total;
+    if (a.has_expert_capacity && total > a.expert_capacity[expert]) {
+      materialization_fail(a.status, MaterializationError::ExpertCapacity,
+                           expert, a.expert_capacity[expert], total);
+      return;
+    }
+  }
+
+  for (std::uint32_t destination = 0; destination < a.world; ++destination) {
+    std::uint64_t prefix = 0;
+    for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+      if (a.expert_to_rank[expert] != destination)
+        continue;
+      a.expert_base[expert] = prefix;
+      if (!device_add(prefix, a.expert_total[expert], prefix)) {
+        materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                             5, ~std::uint64_t{0}, a.expert_total[expert]);
+        return;
+      }
+    }
+    if (a.has_workspace_capacity &&
+        prefix > a.workspace_capacity[destination]) {
+      materialization_fail(a.status, MaterializationError::WorkspaceCapacity,
+                           destination, a.workspace_capacity[destination],
+                           prefix);
+      return;
+    }
+    if (destination == a.rank && prefix > a.max_incoming_rows) {
+      materialization_fail(a.status, MaterializationError::OutputCapacity, 6,
+                           a.max_incoming_rows, prefix);
+      return;
+    }
+  }
+
+  std::uint64_t owned = 0;
+  std::uint64_t incoming = 0;
+  std::uint64_t tiles = 0;
+  for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+    if (a.expert_to_rank[expert] != a.rank)
+      continue;
+    ++owned;
+    if (!device_add(incoming, a.expert_total[expert], incoming)) {
+      materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                           7, ~std::uint64_t{0}, a.expert_total[expert]);
+      return;
+    }
+    const auto count = a.expert_total[expert];
+    const auto expert_tiles = count / a.m_tile + (count % a.m_tile != 0);
+    if (!device_add(tiles, expert_tiles, tiles)) {
+      materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                           8, ~std::uint64_t{0}, expert_tiles);
+      return;
+    }
+  }
+  std::uint64_t packets = 0;
+  for (std::uint32_t node = 0; node < a.nodes; ++node) {
+    if (!device_add(packets, a.local_summary[node], packets)) {
+      materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                           9, ~std::uint64_t{0}, a.local_summary[node]);
+      return;
+    }
+  }
+  if (owned > a.experts || incoming > a.max_incoming_rows ||
+      tiles > a.max_incoming_rows || packets > a.routes) {
+    materialization_fail(a.status, MaterializationError::OutputCapacity, 10,
+                         a.max_incoming_rows, incoming);
+    return;
+  }
+  a.status->owned_experts = owned;
+  a.status->incoming_rows = incoming;
+  a.status->mtile_count = tiles;
+  a.status->packet_count = packets;
+  a.status->fanout_count = a.routes;
+
+  std::uint64_t owned_index = 0;
+  std::uint64_t incoming_prefix = 0;
+  std::uint64_t tile_index = 0;
+  a.owned_expert_prefix[0] = 0;
+  a.mtile_offsets[0] = 0;
+  for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+    if (a.expert_to_rank[expert] != a.rank)
+      continue;
+    a.owned_expert_ids[owned_index] = expert;
+    a.owned_expert_count[owned_index] = a.expert_total[expert];
+    incoming_prefix += a.expert_total[expert];
+    a.owned_expert_prefix[owned_index + 1] = incoming_prefix;
+    const auto count = a.expert_total[expert];
+    for (std::uint64_t first = 0; first < count; first += a.m_tile) {
+      const auto remaining = count - first;
+      a.mtile_rows[tile_index++] = static_cast<std::uint32_t>(
+          remaining < a.m_tile ? remaining : a.m_tile);
+    }
+    a.mtile_offsets[owned_index + 1] = tile_index;
+    ++owned_index;
+  }
+
+  for (std::uint64_t route = 0; route < a.routes; ++route) {
+    const auto expert = a.expert_id[route];
+    std::uint64_t source_prefix = 0;
+    for (std::uint32_t source = 0; source < a.rank; ++source)
+      source_prefix += a.count_matrix[
+          static_cast<std::uint64_t>(source) * a.experts + expert];
+    const auto row = a.expert_base[expert] + source_prefix +
+                     a.local_offset[route];
+    a.route_dst_row[route] = row;
+    a.reverse_routes[route] = DeviceReverseRouteRecord{
+        route / a.top_k, row, a.rank,
+        static_cast<std::uint32_t>(route % a.top_k), expert,
+        a.route_dst_rank[route]};
+  }
+
+  std::uint64_t incoming_index = 0;
+  for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+    if (a.expert_to_rank[expert] != a.rank)
+      continue;
+    std::uint64_t source_prefix = 0;
+    for (std::uint32_t source = 0; source < a.world; ++source) {
+      const auto count = a.count_matrix[
+          static_cast<std::uint64_t>(source) * a.experts + expert];
+      for (std::uint64_t offset = 0; offset < count; ++offset) {
+        a.incoming_rows[incoming_index++] = DeviceIncomingRowRecord{
+            offset, a.expert_base[expert] + source_prefix + offset, source,
+            expert};
+      }
+      source_prefix += count;
+    }
+  }
+
+  const auto source_node = a.rank_to_node[a.rank];
+  const auto source_local = a.rank_to_local[a.rank];
+  std::uint64_t packet_index = 0;
+  std::uint64_t fanout_index = 0;
+  a.packet_fanout_offsets[0] = 0;
+  for (std::uint32_t node = 0; node < a.nodes; ++node) {
+    const auto proxy = rank_at_coordinate(a, node, source_local);
+    std::uint64_t sequence = 0;
+    for (std::uint64_t token = 0; token < a.tokens; ++token) {
+      const auto present =
+          (a.masks[token * a.mask_words + node / 64U] >> (node % 64U)) & 1U;
+      if (!present)
+        continue;
+      a.packet_headers[packet_index] = DevicePacketHeaderRecord{
+          sequence++, token, a.rank, node, proxy, 0};
+      const auto base = token * a.top_k;
+      for (std::uint32_t position = 0; position < a.top_k; ++position) {
+        const auto slot = a.combine_order[base + position];
+        const auto route = base + slot;
+        if (a.route_dst_node[route] != node)
+          continue;
+        a.packet_fanout[fanout_index++] = DeviceFanoutRecord{
+            a.route_dst_row[route], slot, a.route_dst_local[route],
+            a.expert_id[route], 0};
+      }
+      a.packet_fanout_offsets[++packet_index] = fanout_index;
+    }
+    a.outgoing_signals[node] = DeviceSignalRecord{
+        a.local_summary[node], a.local_summary[node], source_node, node, a.rank,
+        proxy, source_local, 0};
+  }
+
+  if (packet_index != packets) {
+    materialization_fail(a.status, MaterializationError::OutputCapacity, 11,
+                         packets, packet_index);
+    return;
+  }
+  if (fanout_index != a.routes) {
+    materialization_fail(a.status, MaterializationError::OutputCapacity, 12,
+                         a.routes, fanout_index);
+    return;
+  }
+
+  const auto destination_node = a.rank_to_node[a.rank];
+  const auto rail = a.rank_to_local[a.rank];
+  for (std::uint32_t source_node_index = 0; source_node_index < a.nodes;
+       ++source_node_index) {
+    const auto source_rank =
+        rank_at_coordinate(a, source_node_index, rail);
+    const auto expected = a.summary_matrix[
+        static_cast<std::uint64_t>(source_rank) * a.nodes + destination_node];
+    a.incoming_signals[source_node_index] = DeviceSignalRecord{
+        expected, expected, source_node_index, destination_node, source_rank,
+        a.rank, rail, 0};
+  }
+}
+
 std::string route_coordinates(std::uint64_t flat, std::uint32_t top_k) {
   return "token=" + std::to_string(flat / top_k) +
          ", slot=" + std::to_string(flat % top_k);
@@ -359,23 +706,29 @@ DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
   return make_device_buffer_lease(1, width, width, std::move(buffer));
 }
 
-DeviceBufferLease make_matrix_lease(
-    const std::shared_ptr<WorkspaceState> &state, std::size_t offset,
-    std::uint32_t rows, std::uint64_t row_width) {
-  const auto elements = checked_mul(rows, row_width, "device lease elements");
-  if (elements == 0)
-    return {};
-  auto buffer = std::make_shared<CudaBufferState>();
-  buffer->owner = state;
-  buffer->pointer = at<void>(state->allocation->device_ptr, offset);
-  buffer->device = state->execution.device_ordinal();
-  return make_device_buffer_lease(rows, row_width, elements,
-                                  std::move(buffer));
-}
-
 } // namespace
 
 namespace internal {
+
+std::unique_ptr<BackendCountExchangeOperation>
+CudaDeviceLeaseAccess::start(const CountExchangeRequest &) {
+  invalid("phase=cuda-device-lease-access, field=start, rank=n/a, "
+          "expected=never called, actual=called");
+}
+
+std::shared_ptr<const CudaBufferState>
+CudaDeviceLeaseAccess::checked(const DeviceBufferLease &lease,
+                               std::uint32_t expected_device) {
+  if (!lease)
+    invalid("phase=cuda-device-lease-access, field=lease, rank=n/a, "
+            "expected=valid, actual=empty");
+  auto state = std::dynamic_pointer_cast<const CudaBufferState>(
+      backend_device_state(lease));
+  if (!state || !state->pointer || state->device != expected_device)
+    invalid("phase=cuda-device-lease-access, field=backend, rank=n/a, "
+            "expected=CUDA lease on execution device, actual=foreign/null");
+  return state;
+}
 
 CudaExecutionState::~CudaExecutionState() noexcept {
   if (!stream)
@@ -695,15 +1048,41 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
 }
 
 struct CudaLocalNotifyHandle::Impl {
-  LocalHistogramHandle local;
+  RuntimeConfig config;
+  RankCollectiveContext context;
+  std::uint64_t num_tokens = 0;
   DeviceDispatchMetadata device;
+  DeviceBufferLease expert_count;
+  DeviceBufferLease packet_count;
   std::shared_ptr<WorkspaceState> workspace;
 };
 
-const LocalHistogramHandle &CudaLocalNotifyHandle::local() const {
+std::uint64_t CudaLocalNotifyHandle::num_tokens() const {
   if (!impl_)
     invalid("attempted to access empty CUDA local notify handle");
-  return impl_->local;
+  return impl_->num_tokens;
+}
+const RuntimeConfig &CudaLocalNotifyHandle::config() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA local notify handle");
+  return impl_->config;
+}
+const RankCollectiveContext &CudaLocalNotifyHandle::context() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA local notify handle");
+  return impl_->context;
+}
+const DeviceBufferLease &
+CudaLocalNotifyHandle::device_expert_count_for_backend() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA local expert count");
+  return impl_->expert_count;
+}
+const DeviceBufferLease &
+CudaLocalNotifyHandle::device_packet_count_for_backend() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA local packet count");
+  return impl_->packet_count;
 }
 
 struct CudaNotifyPreflight::Impl {
@@ -939,15 +1318,6 @@ CudaNotifyOperation start_cuda_rank_local_notify(
                          context.session().generation(),
                          ExchangeKind::ExpertCounts, name);
   };
-  copy(hl.expert_count, dl.expert_count, config.num_experts * sizeof(std::uint64_t), "D2H expert_count");
-  copy(hl.packet_count, dl.packet_count, config.topology.num_nodes * sizeof(std::uint64_t), "D2H packet_count");
-  copy(hl.expert_id, dl.expert_id, checked_size(route_count, "routes") * sizeof(std::uint32_t), "D2H expert_id");
-  copy(hl.local_offset, dl.local_offset, checked_size(route_count, "routes") * sizeof(std::uint64_t), "D2H local_offset");
-  copy(hl.route_dst_rank, dl.route_dst_rank, checked_size(route_count, "routes") * sizeof(std::uint32_t), "D2H dst_rank");
-  copy(hl.route_dst_node, dl.route_dst_node, checked_size(route_count, "routes") * sizeof(std::uint32_t), "D2H dst_node");
-  copy(hl.route_dst_local_rank, dl.route_dst_local_rank, checked_size(route_count, "routes") * sizeof(std::uint32_t), "D2H dst_local");
-  copy(hl.combine_order, dl.combine_order, checked_size(route_count, "routes") * sizeof(std::uint32_t), "D2H combine_order");
-  copy(hl.masks, dl.masks, checked_size(checked_mul(state->plan.num_tokens, state->plan.node_mask_words, "masks"), "masks") * sizeof(std::uint64_t), "D2H masks");
   copy(hl.status, dl.status, sizeof(DeviceStatus), "D2H status");
   internal::throw_cuda("notify-start",
                        cudaEventRecord(state->allocation->completion, exec->stream),
@@ -1041,45 +1411,10 @@ CudaNotifyPreflight CudaNotifyOperation::wait_preflight() {
                   0, 1);
     return CudaNotifyPreflight(std::move(preflight_impl));
   }
-  const auto routes = checked_size(state->plan.route_count, "routes");
-  const auto masks = checked_size(
-      checked_mul(state->plan.num_tokens, state->plan.node_mask_words, "masks"),
-      "masks");
-  const auto *host = state->allocation->host_ptr;
-  const auto vector_u32 = [&](std::size_t offset, std::size_t count) {
-    const auto *first = at<const std::uint32_t>(host, offset);
-    return std::vector<std::uint32_t>(first, first + count);
-  };
-  const auto vector_u64 = [&](std::size_t offset, std::size_t count) {
-    const auto *first = at<const std::uint64_t>(host, offset);
-    return std::vector<std::uint64_t>(first, first + count);
-  };
-  SourceRouteMetadata outgoing;
-  outgoing.num_tokens = state->plan.num_tokens;
-  outgoing.top_k = state->plan.top_k;
-  outgoing.node_mask_words = state->plan.node_mask_words;
-  outgoing.expert_id = vector_u32(state->host_layout.expert_id, routes);
-  outgoing.local_offset = vector_u64(state->host_layout.local_offset, routes);
-  outgoing.route_dst_row.assign(routes, 0);
-  outgoing.route_dst_rank = vector_u32(state->host_layout.route_dst_rank, routes);
-  outgoing.route_dst_node = vector_u32(state->host_layout.route_dst_node, routes);
-  outgoing.route_dst_local_rank = vector_u32(state->host_layout.route_dst_local_rank, routes);
-  outgoing.combine_order = vector_u32(state->host_layout.combine_order, routes);
-  outgoing.destination_node_mask = vector_u64(state->host_layout.masks, masks);
-  auto expert_counts = vector_u64(state->host_layout.expert_count,
-                                  state->plan.num_experts);
-  auto packet_counts = vector_u64(state->host_layout.packet_count,
-                                  state->plan.num_nodes);
-  auto device_expert = make_lease(state, state->device_layout.expert_count,
-                                  state->plan.num_experts);
-  auto device_packet = make_lease(state, state->device_layout.packet_count,
-                                  state->plan.num_nodes);
-  auto local = DeviceNotifyBridge::make_local(
-      impl_->config, impl_->context, state->plan.num_tokens,
-      std::move(outgoing), std::move(expert_counts), std::move(packet_counts),
-      device_expert, device_packet);
   auto result = std::make_shared<CudaLocalNotifyHandle::Impl>();
-  result->local = std::move(local);
+  result->config = impl_->config;
+  result->context = impl_->context;
+  result->num_tokens = state->plan.num_tokens;
   result->workspace = state;
   const auto route_width = state->plan.route_count;
   result->device.expert_id = make_lease(state, state->device_layout.expert_id, route_width);
@@ -1092,6 +1427,10 @@ CudaNotifyPreflight CudaNotifyOperation::wait_preflight() {
   result->device.destination_node_mask = make_lease(
       state, state->device_layout.masks,
       checked_mul(state->plan.num_tokens, state->plan.node_mask_words, "mask lease"));
+  result->expert_count = make_lease(
+      state, state->device_layout.expert_count, state->plan.num_experts);
+  result->packet_count = make_lease(
+      state, state->device_layout.packet_count, state->plan.num_nodes);
   preflight_impl->local = CudaLocalNotifyHandle(std::move(result));
   return CudaNotifyPreflight(std::move(preflight_impl));
 }
@@ -1134,558 +1473,582 @@ void CudaNotifyOperation::cancel() {
   impl_->terminal = true;
 }
 
-struct CudaDispatchHandle::Impl {
-  DispatchHandle host;
+
+struct DeviceDispatchHandle::Impl {
+  RuntimeConfig config;
+  RankCollectiveContext context;
+  CudaExecution execution;
   DeviceDispatchMetadata device;
+  DeviceDispatchIdentity identity;
+  DeviceDispatchSizes sizes;
+  DeviceMaterializationAudit audit;
   std::shared_ptr<WorkspaceState> workspace;
+  BackendCompletion expert_completion;
+  BackendCompletion summary_completion;
 };
 
-const DispatchHandle &CudaDispatchHandle::host() const {
-  if (!impl_)
-    invalid("attempted to access empty CUDA dispatch handle");
-  return impl_->host;
+namespace {
+
+void validate_device_completion(const BackendCompletion &completion,
+                                const RankCollectiveContext &context,
+                                ExchangeKind kind, std::uint64_t width) {
+  if (!completion.has_device_result() || completion.has_host_result() ||
+      completion.kind() != kind ||
+      !completion.context().same_instance(context))
+    invalid("phase=device-materialize, field=completion.provenance, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=device-only exact context/kind, actual=mismatch");
+  const auto &lease = completion.device_result();
+  if (lease.rows() != context.session().world_size() ||
+      lease.row_width() != width)
+    invalid("phase=device-materialize, field=completion.shape, rank=" +
+            std::to_string(context.calling_rank()) + ", expected=[" +
+            std::to_string(context.session().world_size()) + "," +
+            std::to_string(width) + "], actual=[" +
+            std::to_string(lease.rows()) + "," +
+            std::to_string(lease.row_width()) + "]");
 }
-const DeviceDispatchMetadata &CudaDispatchHandle::device() const {
+
+template <typename T>
+std::vector<T> download_vector(const std::shared_ptr<WorkspaceState> &state,
+                               const CudaExecutionState &exec,
+                               const void *source, std::uint64_t count,
+                               const char *field) {
+  std::vector<T> result(checked_size(count, field));
+  if (count == 0)
+    return result;
+  internal::throw_cuda(
+      "device-validation-download",
+      cudaMemcpy(result.data(), source,
+                 checked_size(checked_mul(count, sizeof(T), field), field),
+                 cudaMemcpyDeviceToHost),
+      state->context.calling_rank(), state->context.session().world_size(),
+      state->context.session().identity(),
+      state->context.session().generation(), ExchangeKind::ExpertCounts, field);
+  (void)exec;
+  return result;
+}
+
+} // namespace
+
+DeviceDispatchHandle DeviceMetadataBridge::materialize(
+    const CudaLocalNotifyHandle &local, BackendCompletion expert_counts,
+    BackendCompletion packet_summary, const CudaExecution &execution) {
+  if (!local || !execution)
+    invalid("phase=device-materialize, field=input, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto &context = local.impl_->context;
+  const auto &config = local.impl_->config;
+  if (!context.execution().same_instance(execution.token()))
+    invalid("phase=device-materialize, field=execution, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=local execution, actual=different");
+  validate_device_completion(expert_counts, context,
+                             ExchangeKind::ExpertCounts,
+                             config.num_experts);
+  validate_device_completion(packet_summary, context,
+                             ExchangeKind::NotifyPacketSummary,
+                             config.topology.num_nodes);
+  auto exec = internal::checked_execution_state(execution);
+  auto count_state = internal::CudaDeviceLeaseAccess::checked(
+      expert_counts.device_result(), exec->device);
+  auto summary_state = internal::CudaDeviceLeaseAccess::checked(
+      packet_summary.device_result(), exec->device);
+  auto state = local.impl_->workspace;
+  const auto &plan = state->plan;
+  const auto &dl = state->device_layout;
+  auto *base = state->allocation->device_ptr;
+  const auto rank = context.calling_rank();
+  internal::throw_cuda("device-materialize",
+                       cudaSetDevice(static_cast<int>(exec->device)), rank,
+                       context.session().world_size(),
+                       context.session().identity(),
+                       context.session().generation(),
+                       ExchangeKind::ExpertCounts, "cudaSetDevice");
+
+  const auto h2d = [&](std::size_t offset, const void *source,
+                       std::uint64_t count, std::size_t element_bytes,
+                       const char *field) {
+    if (count == 0)
+      return;
+    internal::throw_cuda(
+        "device-materialize",
+        cudaMemcpyAsync(at<void>(base, offset), source,
+                        checked_size(checked_mul(count, element_bytes, field),
+                                     field),
+                        cudaMemcpyHostToDevice, exec->stream),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts, field);
+  };
+  h2d(dl.expert_capacity, config.capacity.expert_rows.data(),
+      config.capacity.expert_rows.size(), sizeof(std::uint64_t),
+      "expert capacity");
+  h2d(dl.workspace_capacity,
+      config.capacity.workspace_rows_per_rank.data(),
+      config.capacity.workspace_rows_per_rank.size(), sizeof(std::uint64_t),
+      "workspace capacity");
+
+  const auto zero = [&](std::size_t offset, std::uint64_t count,
+                        std::size_t element_bytes, const char *field) {
+    if (count == 0)
+      return;
+    internal::throw_cuda(
+        "device-materialize",
+        cudaMemsetAsync(at<void>(base, offset), 0,
+                        checked_size(checked_mul(count, element_bytes, field),
+                                     field),
+                        exec->stream),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts, field);
+  };
+  zero(dl.materialization_status, 1, sizeof(DeviceMaterializationStatus),
+       "materialization status");
+  zero(dl.expert_total, plan.num_experts, sizeof(std::uint64_t),
+       "expert total");
+  zero(dl.expert_base, plan.num_experts, sizeof(std::uint64_t), "expert base");
+  zero(dl.route_dst_row, plan.route_count, sizeof(std::uint64_t),
+       "route dst row");
+  zero(dl.owned_expert_ids, plan.num_experts, sizeof(std::uint32_t),
+       "owned experts");
+  zero(dl.owned_expert_count, plan.num_experts, sizeof(std::uint64_t),
+       "owned counts");
+  zero(dl.owned_expert_prefix,
+       static_cast<std::uint64_t>(plan.num_experts) + 1,
+       sizeof(std::uint64_t), "owned prefix");
+  zero(dl.mtile_offsets, static_cast<std::uint64_t>(plan.num_experts) + 1,
+       sizeof(std::uint64_t), "mtile offsets");
+  zero(dl.mtile_rows, plan.max_incoming_rows, sizeof(std::uint32_t),
+       "mtile rows");
+  zero(dl.incoming_rows, plan.max_incoming_rows,
+       sizeof(DeviceIncomingRowRecord), "incoming rows");
+  zero(dl.reverse_routes, plan.route_count,
+       sizeof(DeviceReverseRouteRecord), "reverse routes");
+  zero(dl.packet_headers, plan.route_count,
+       sizeof(DevicePacketHeaderRecord), "packet headers");
+  zero(dl.packet_fanout_offsets, plan.route_count + 1,
+       sizeof(std::uint64_t), "fanout offsets");
+  zero(dl.packet_fanout, plan.route_count, sizeof(DeviceFanoutRecord),
+       "fanout");
+  zero(dl.outgoing_signals, plan.num_nodes, sizeof(DeviceSignalRecord),
+       "outgoing signals");
+  zero(dl.incoming_signals, plan.num_nodes, sizeof(DeviceSignalRecord),
+       "incoming signals");
+
+  DeviceMaterializeArgs args{};
+  args.rank = rank;
+  args.world = plan.world_size;
+  args.experts = plan.num_experts;
+  args.nodes = plan.num_nodes;
+  args.top_k = plan.top_k;
+  args.mask_words = plan.node_mask_words;
+  args.m_tile = config.m_tile_rows;
+  args.tokens = plan.num_tokens;
+  args.routes = plan.route_count;
+  args.max_tokens = plan.max_tokens_per_rank;
+  args.max_incoming_rows = plan.max_incoming_rows;
+  args.has_expert_capacity = !config.capacity.expert_rows.empty();
+  args.has_workspace_capacity =
+      !config.capacity.workspace_rows_per_rank.empty();
+  args.count_matrix = static_cast<const std::uint64_t *>(count_state->pointer);
+  args.summary_matrix =
+      static_cast<const std::uint64_t *>(summary_state->pointer);
+  args.local_histogram = at<const std::uint64_t>(base, dl.expert_count);
+  args.local_summary = at<const std::uint64_t>(base, dl.packet_count);
+  args.expert_to_rank = at<const std::uint32_t>(base, dl.expert_to_rank);
+  args.rank_to_node = at<const std::uint32_t>(base, dl.rank_to_node);
+  args.rank_to_local = at<const std::uint32_t>(base, dl.rank_to_local);
+  args.expert_capacity = at<const std::uint64_t>(base, dl.expert_capacity);
+  args.workspace_capacity =
+      at<const std::uint64_t>(base, dl.workspace_capacity);
+  args.expert_id = at<const std::uint32_t>(base, dl.expert_id);
+  args.local_offset = at<const std::uint64_t>(base, dl.local_offset);
+  args.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);
+  args.route_dst_node = at<const std::uint32_t>(base, dl.route_dst_node);
+  args.route_dst_local =
+      at<const std::uint32_t>(base, dl.route_dst_local_rank);
+  args.combine_order = at<const std::uint32_t>(base, dl.combine_order);
+  args.masks = at<const std::uint64_t>(base, dl.masks);
+  args.expert_total = at<std::uint64_t>(base, dl.expert_total);
+  args.expert_base = at<std::uint64_t>(base, dl.expert_base);
+  args.route_dst_row = at<std::uint64_t>(base, dl.route_dst_row);
+  args.owned_expert_ids = at<std::uint32_t>(base, dl.owned_expert_ids);
+  args.owned_expert_count = at<std::uint64_t>(base, dl.owned_expert_count);
+  args.owned_expert_prefix = at<std::uint64_t>(base, dl.owned_expert_prefix);
+  args.mtile_offsets = at<std::uint64_t>(base, dl.mtile_offsets);
+  args.mtile_rows = at<std::uint32_t>(base, dl.mtile_rows);
+  args.incoming_rows =
+      at<DeviceIncomingRowRecord>(base, dl.incoming_rows);
+  args.reverse_routes =
+      at<DeviceReverseRouteRecord>(base, dl.reverse_routes);
+  args.packet_headers =
+      at<DevicePacketHeaderRecord>(base, dl.packet_headers);
+  args.packet_fanout_offsets =
+      at<std::uint64_t>(base, dl.packet_fanout_offsets);
+  args.packet_fanout = at<DeviceFanoutRecord>(base, dl.packet_fanout);
+  args.outgoing_signals =
+      at<DeviceSignalRecord>(base, dl.outgoing_signals);
+  args.incoming_signals =
+      at<DeviceSignalRecord>(base, dl.incoming_signals);
+  args.status =
+      at<DeviceMaterializationStatus>(base, dl.materialization_status);
+
+  materialize_metadata_kernel<<<1, 1, 0, exec->stream>>>(args);
+  internal::throw_cuda("device-materialize", cudaGetLastError(), rank,
+                       context.session().world_size(),
+                       context.session().identity(),
+                       context.session().generation(),
+                       ExchangeKind::ExpertCounts,
+                       "materialize_metadata_kernel launch");
+  internal::throw_cuda(
+      "device-materialize",
+      cudaMemcpyAsync(at<void>(state->allocation->host_ptr,
+                               state->host_layout.materialization_status),
+                      args.status, sizeof(DeviceMaterializationStatus),
+                      cudaMemcpyDeviceToHost, exec->stream),
+      rank, context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "D2H bounded materialization status");
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventRecord(state->allocation->completion, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord");
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventSynchronize(state->allocation->completion), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventSynchronize");
+  const auto *status = at<const DeviceMaterializationStatus>(
+      state->allocation->host_ptr,
+      state->host_layout.materialization_status);
+  if (status->error != 0) {
+    auto code = NotifyErrorCode::CountExchangeFailure;
+    if (status->error ==
+        static_cast<unsigned long long>(MaterializationError::ExpertCapacity))
+      code = NotifyErrorCode::ExpertCapacityExceeded;
+    if (status->error == static_cast<unsigned long long>(
+                             MaterializationError::WorkspaceCapacity))
+      code = NotifyErrorCode::WorkspaceCapacityExceeded;
+    if (status->error == static_cast<unsigned long long>(
+                             MaterializationError::ArithmeticOverflow))
+      code = NotifyErrorCode::ArithmeticOverflow;
+    throw NotifyDispatchError(
+        code, "phase=device-materialize, field=" +
+                  std::to_string(status->field) + ", rank=" +
+                  std::to_string(rank) + ", expected=" +
+                  std::to_string(status->expected) + ", actual=" +
+                  std::to_string(status->actual));
+  }
+
+  auto impl = std::make_shared<DeviceDispatchHandle::Impl>();
+  impl->config = config;
+  impl->context = context;
+  impl->execution = execution;
+  impl->workspace = state;
+  impl->expert_completion = std::move(expert_counts);
+  impl->summary_completion = std::move(packet_summary);
+  impl->device = local.impl_->device;
+  impl->device.source_expert_count =
+      impl->expert_completion.device_result();
+  impl->device.packet_summary_count =
+      impl->summary_completion.device_result();
+  impl->device.owned_expert_ids =
+      make_lease(state, dl.owned_expert_ids, status->owned_experts);
+  impl->device.expert_row_count =
+      make_lease(state, dl.owned_expert_count, status->owned_experts);
+  impl->device.expert_row_prefix =
+      make_lease(state, dl.owned_expert_prefix, status->owned_experts + 1);
+  impl->device.mtile_row_offsets =
+      make_lease(state, dl.mtile_offsets, status->owned_experts + 1);
+  impl->device.mtile_expected_rows =
+      make_lease(state, dl.mtile_rows, status->mtile_count);
+  impl->device.incoming_rows =
+      make_lease(state, dl.incoming_rows, status->incoming_rows);
+  impl->device.reverse_routes =
+      make_lease(state, dl.reverse_routes, plan.route_count);
+  impl->device.packet_headers =
+      make_lease(state, dl.packet_headers, status->packet_count);
+  impl->device.packet_fanout_offsets =
+      make_lease(state, dl.packet_fanout_offsets, status->packet_count + 1);
+  impl->device.packet_fanout =
+      make_lease(state, dl.packet_fanout, status->fanout_count);
+  impl->device.outgoing_signals =
+      make_lease(state, dl.outgoing_signals, plan.num_nodes);
+  impl->device.incoming_proxy_signals =
+      make_lease(state, dl.incoming_signals, plan.num_nodes);
+  impl->identity.generation = context.session().generation();
+  impl->identity.calling_rank = rank;
+  impl->identity.world_size = plan.world_size;
+  impl->identity.num_tokens = plan.num_tokens;
+  impl->identity.top_k = plan.top_k;
+  impl->identity.num_experts = plan.num_experts;
+  impl->identity.num_nodes = plan.num_nodes;
+  const auto wire = encode_canonical_config(
+      config, plan.max_tokens_per_rank,
+      context.session().stable_identity_bytes());
+  const auto config_identity = stable_session_id(wire);
+  impl->identity.config_digest_word0 = config_identity.word0;
+  impl->identity.config_digest_word1 = config_identity.word1;
+  impl->sizes.route_count = plan.route_count;
+  impl->sizes.node_mask_words = plan.node_mask_words;
+  impl->sizes.owned_expert_count =
+      static_cast<std::uint32_t>(status->owned_experts);
+  impl->sizes.incoming_row_count = status->incoming_rows;
+  impl->sizes.mtile_count = status->mtile_count;
+  impl->sizes.packet_count = status->packet_count;
+  impl->sizes.fanout_count = status->fanout_count;
+  impl->sizes.outgoing_signal_count = plan.num_nodes;
+  impl->sizes.incoming_signal_count = plan.num_nodes;
+  return DeviceDispatchHandle(std::move(impl));
+}
+
+const DeviceDispatchMetadata &DeviceDispatchHandle::device() const {
   if (!impl_)
-    invalid("attempted to access empty CUDA dispatch handle");
+    invalid("attempted to access empty device dispatch handle");
   return impl_->device;
 }
 
-CudaDispatchHandle stage_cuda_dispatch_metadata(
-    DispatchHandle host_handle, const CudaLocalNotifyHandle &local,
-    const CudaExecution &execution) {
-  if (!host_handle || !local || !execution)
-    invalid("phase=cuda-dispatch-stage, field=input, rank=n/a, expected=valid, actual=empty");
-  validate_dispatch_metadata(host_handle);
-  const auto &local_context = local.impl_->local.context();
-  if (!local_context.execution().same_instance(execution.token()))
-    invalid("phase=cuda-dispatch-stage, field=execution, rank=" +
-            std::to_string(host_handle->calling_rank) +
-            ", expected=local execution, actual=different");
-  if (host_handle->calling_rank != local_context.calling_rank())
-    invalid("phase=cuda-dispatch-stage, field=calling_rank, rank=" +
-            std::to_string(local_context.calling_rank()) + ", expected=" +
-            std::to_string(local_context.calling_rank()) + ", actual=" +
-            std::to_string(host_handle->calling_rank));
-  if (host_handle->communicator_id != local_context.session().identity())
-    invalid("phase=cuda-dispatch-stage, field=session, rank=" +
-            std::to_string(host_handle->calling_rank) + ", expected='" +
-            local_context.session().identity() + "', actual='" +
-            host_handle->communicator_id + "'");
-  if (host_handle->identity.generation !=
-      local_context.session().generation())
-    invalid("phase=cuda-dispatch-stage, field=generation, rank=" +
-            std::to_string(host_handle->calling_rank) + ", expected=" +
-            std::to_string(local_context.session().generation()) +
-            ", actual=" + std::to_string(host_handle->identity.generation));
-  const auto &local_config = local.impl_->local.config();
-  const auto &host_config = host_handle->config;
-  if (host_config.num_experts != local_config.num_experts ||
-      host_config.top_k != local_config.top_k ||
-      host_config.m_tile_rows != local_config.m_tile_rows ||
-      host_config.topology.world_size != local_config.topology.world_size ||
-      host_config.topology.num_nodes != local_config.topology.num_nodes ||
-      host_config.topology.rank_to_node !=
-          local_config.topology.rank_to_node ||
-      host_config.topology.rank_to_local_rank !=
-          local_config.topology.rank_to_local_rank ||
-      host_config.topology.expert_to_rank !=
-          local_config.topology.expert_to_rank ||
-      host_config.capacity.expert_rows != local_config.capacity.expert_rows ||
-      host_config.capacity.workspace_rows_per_rank !=
-          local_config.capacity.workspace_rows_per_rank)
-    invalid("phase=cuda-dispatch-stage, field=config, rank=" +
-            std::to_string(host_handle->calling_rank) +
-            ", expected=exact local runtime config, actual=mismatch");
-  const auto &local_out = local.impl_->local.outgoing();
-  const auto &host_out = host_handle->outgoing;
-  if (host_out.num_tokens != local_out.num_tokens ||
-      host_out.top_k != local_out.top_k ||
-      host_out.node_mask_words != local_out.node_mask_words ||
-      host_out.expert_id != local_out.expert_id ||
-      host_out.local_offset != local_out.local_offset ||
-      host_out.route_dst_rank != local_out.route_dst_rank ||
-      host_out.route_dst_node != local_out.route_dst_node ||
-      host_out.route_dst_local_rank != local_out.route_dst_local_rank ||
-      host_out.combine_order != local_out.combine_order ||
-      host_out.destination_node_mask != local_out.destination_node_mask)
-    invalid("phase=cuda-dispatch-stage, field=local_provenance, rank=" +
-            std::to_string(host_handle->calling_rank) +
-            ", expected=metadata materialized from exact local handle, "
-            "actual=route content mismatch");
-  const auto &rows = host_handle->outgoing.route_dst_row;
-  auto state = local.impl_->workspace;
-  if (rows.size() != state->plan.route_count)
-    invalid("phase=cuda-dispatch-stage, field=route_dst_row.size, rank=" +
-            std::to_string(host_handle->calling_rank) + ", expected=" +
-            std::to_string(state->plan.route_count) + ", actual=" +
-            std::to_string(rows.size()));
-  const auto &metadata = host_handle.metadata();
-  const auto &incoming = metadata.incoming;
-  const auto &transport = metadata.transport;
-  if (incoming.incoming_rows.size() > state->plan.max_incoming_rows)
-    invalid("phase=cuda-dispatch-stage, field=incoming_rows.capacity, rank=" +
-            std::to_string(metadata.calling_rank) + ", expected<=" +
-            std::to_string(state->plan.max_incoming_rows) + ", actual=" +
-            std::to_string(incoming.incoming_rows.size()));
-  std::size_t tile_count = 0;
-  for (const auto &tiles : incoming.mtile_expected_rows) {
-    if (tiles.size() > std::numeric_limits<std::size_t>::max() - tile_count)
-      invalid("phase=cuda-dispatch-stage, field=mtile_expected_rows.size, rank=" +
-              std::to_string(metadata.calling_rank) +
-              ", expected=size_t sum, actual=overflow");
-    tile_count += tiles.size();
-  }
-  if (tile_count > state->plan.max_incoming_rows)
-    invalid("phase=cuda-dispatch-stage, field=mtile_expected_rows.capacity, rank=" +
-            std::to_string(metadata.calling_rank) + ", expected<=" +
-            std::to_string(state->plan.max_incoming_rows) + ", actual=" +
-            std::to_string(tile_count));
-  if (transport.outgoing_packets.size() > state->plan.route_count)
-    invalid("phase=cuda-dispatch-stage, field=outgoing_packets.capacity, rank=" +
-            std::to_string(metadata.calling_rank) + ", expected<=" +
-            std::to_string(state->plan.route_count) + ", actual=" +
-            std::to_string(transport.outgoing_packets.size()));
-
-  std::vector<std::uint64_t> count_matrix;
-  count_matrix.reserve(checked_size(
-      checked_mul(state->plan.world_size, state->plan.num_experts,
-                  "source count elements"),
-      "source count elements"));
-  for (const auto &count_row : metadata.source_expert_count)
-    count_matrix.insert(count_matrix.end(), count_row.begin(), count_row.end());
-
-  std::vector<std::uint64_t> mtile_offsets;
-  std::vector<std::uint32_t> mtile_rows;
-  mtile_offsets.reserve(incoming.mtile_expected_rows.size() + 1);
-  mtile_rows.reserve(tile_count);
-  mtile_offsets.push_back(0);
-  for (const auto &tiles : incoming.mtile_expected_rows) {
-    mtile_rows.insert(mtile_rows.end(), tiles.begin(), tiles.end());
-    mtile_offsets.push_back(mtile_rows.size());
-  }
-
-  std::vector<DeviceIncomingRowRecord> incoming_rows;
-  incoming_rows.reserve(incoming.incoming_rows.size());
-  for (const auto &row : incoming.incoming_rows)
-    incoming_rows.push_back(DeviceIncomingRowRecord{
-        row.source_rank, row.expert_id, row.source_expert_offset, row.dst_row});
-
-  std::vector<DeviceReverseRouteRecord> reverse_routes;
-  reverse_routes.reserve(host_out.reverse_routes.size());
-  for (const auto &route : host_out.reverse_routes)
-    reverse_routes.push_back(DeviceReverseRouteRecord{
-        route.source_rank, route.local_token_id, route.topk_slot,
-        route.expert_id, route.destination_rank, route.dst_row});
-
-  std::vector<DevicePacketHeaderRecord> packet_headers;
-  std::vector<std::uint64_t> packet_fanout_offsets;
-  std::vector<DeviceFanoutRecord> packet_fanout;
-  packet_headers.reserve(transport.outgoing_packets.size());
-  packet_fanout_offsets.reserve(transport.outgoing_packets.size() + 1);
-  packet_fanout.reserve(checked_size(state->plan.route_count, "route_count"));
-  packet_fanout_offsets.push_back(0);
-  for (const auto &packet : transport.outgoing_packets) {
-    packet_headers.push_back(DevicePacketHeaderRecord{
-        packet.identity.source_rank, packet.identity.destination_node,
-        packet.identity.sequence_on_link, packet.local_token_id,
-        packet.proxy_rank, packet.channel});
-    for (const auto &target : packet.fanout)
-      packet_fanout.push_back(DeviceFanoutRecord{
-          target.topk_slot, target.destination_local_rank, target.expert_id,
-          target.dst_row});
-    packet_fanout_offsets.push_back(packet_fanout.size());
-  }
-  if (packet_fanout.size() > state->plan.route_count)
-    invalid("phase=cuda-dispatch-stage, field=packet_fanout.capacity, rank=" +
-            std::to_string(metadata.calling_rank) + ", expected<=" +
-            std::to_string(state->plan.route_count) + ", actual=" +
-            std::to_string(packet_fanout.size()));
-
-  const auto convert_signals = [](const auto &source) {
-    std::vector<DeviceSignalRecord> result;
-    result.reserve(source.size());
-    for (const auto &signal : source)
-      result.push_back(DeviceSignalRecord{
-          signal.source_node, signal.destination_node, signal.source_rank,
-          signal.destination_proxy_rank, signal.rail_local_rank,
-          signal.channel, signal.expected_packets, signal.expected_signals});
-    return result;
-  };
-  auto outgoing_signals = convert_signals(transport.outgoing_signals);
-  auto incoming_signals = convert_signals(transport.incoming_proxy_signals);
-  if (outgoing_signals.size() > state->plan.num_nodes ||
-      incoming_signals.size() > state->plan.num_nodes)
-    invalid("phase=cuda-dispatch-stage, field=signal.capacity, rank=" +
-            std::to_string(metadata.calling_rank) + ", expected<=" +
-            std::to_string(state->plan.num_nodes) + ", actual=outgoing:" +
-            std::to_string(outgoing_signals.size()) + "/incoming:" +
-            std::to_string(incoming_signals.size()));
-
-  auto exec = internal::checked_execution_state(execution);
-  internal::throw_cuda("dispatch-stage", cudaSetDevice(static_cast<int>(exec->device)),
-                       host_handle->calling_rank, host_handle->config.topology.world_size,
-                       host_handle->communicator_id, host_handle->identity.generation,
-                       ExchangeKind::ExpertCounts, "cudaSetDevice");
-  const auto copy_to_device = [&](std::size_t offset, const void *data,
-                                  std::uint64_t count,
-                                  std::uint64_t element_bytes,
-                                  const char *field) {
-    if (count == 0)
-      return;
-    const auto bytes = checked_size(
-        checked_mul(count, element_bytes, field), field);
-    internal::throw_cuda(
-        "dispatch-stage",
-        cudaMemcpyAsync(at<void>(state->allocation->device_ptr, offset), data,
-                        bytes, cudaMemcpyHostToDevice, exec->stream),
-        metadata.calling_rank, metadata.config.topology.world_size,
-        metadata.communicator_id, metadata.identity.generation,
-        ExchangeKind::ExpertCounts, field);
-  };
-  const auto &dl = state->device_layout;
-  copy_to_device(dl.route_dst_row, rows.data(), rows.size(),
-                 sizeof(std::uint64_t), "H2D route_dst_row");
-  copy_to_device(dl.source_expert_count, count_matrix.data(),
-                 count_matrix.size(), sizeof(std::uint64_t),
-                 "H2D source_expert_count");
-  copy_to_device(dl.owned_expert_ids, incoming.expert_ids.data(),
-                 incoming.expert_ids.size(), sizeof(std::uint32_t),
-                 "H2D owned_expert_ids");
-  copy_to_device(dl.owned_expert_count, incoming.expert_row_count.data(),
-                 incoming.expert_row_count.size(), sizeof(std::uint64_t),
-                 "H2D expert_row_count");
-  copy_to_device(dl.owned_expert_prefix, incoming.expert_row_prefix.data(),
-                 incoming.expert_row_prefix.size(), sizeof(std::uint64_t),
-                 "H2D expert_row_prefix");
-  copy_to_device(dl.mtile_offsets, mtile_offsets.data(), mtile_offsets.size(),
-                 sizeof(std::uint64_t), "H2D mtile_row_offsets");
-  copy_to_device(dl.mtile_rows, mtile_rows.data(), mtile_rows.size(),
-                 sizeof(std::uint32_t), "H2D mtile_expected_rows");
-  copy_to_device(dl.incoming_rows, incoming_rows.data(), incoming_rows.size(),
-                 sizeof(DeviceIncomingRowRecord), "H2D incoming_rows");
-  copy_to_device(dl.reverse_routes, reverse_routes.data(),
-                 reverse_routes.size(), sizeof(DeviceReverseRouteRecord),
-                 "H2D reverse_routes");
-  copy_to_device(dl.packet_headers, packet_headers.data(),
-                 packet_headers.size(), sizeof(DevicePacketHeaderRecord),
-                 "H2D packet_headers");
-  copy_to_device(dl.packet_fanout_offsets, packet_fanout_offsets.data(),
-                 packet_fanout_offsets.size(), sizeof(std::uint64_t),
-                 "H2D packet_fanout_offsets");
-  copy_to_device(dl.packet_fanout, packet_fanout.data(), packet_fanout.size(),
-                 sizeof(DeviceFanoutRecord), "H2D packet_fanout");
-  copy_to_device(dl.outgoing_signals, outgoing_signals.data(),
-                 outgoing_signals.size(), sizeof(DeviceSignalRecord),
-                 "H2D outgoing_signals");
-  copy_to_device(dl.incoming_signals, incoming_signals.data(),
-                 incoming_signals.size(), sizeof(DeviceSignalRecord),
-                 "H2D incoming_proxy_signals");
-  internal::throw_cuda("dispatch-stage",
-                       cudaEventRecord(state->allocation->completion, exec->stream),
-                       host_handle->calling_rank, host_handle->config.topology.world_size,
-                       host_handle->communicator_id, host_handle->identity.generation,
-                       ExchangeKind::ExpertCounts, "cudaEventRecord");
-  internal::throw_cuda("dispatch-stage",
-                       cudaEventSynchronize(state->allocation->completion),
-                       host_handle->calling_rank, host_handle->config.topology.world_size,
-                       host_handle->communicator_id, host_handle->identity.generation,
-                       ExchangeKind::ExpertCounts, "cudaEventSynchronize");
-  auto impl = std::make_shared<CudaDispatchHandle::Impl>();
-  impl->host = std::move(host_handle);
-  impl->device = local.impl_->device;
-  impl->device.source_expert_count = make_matrix_lease(
-      state, dl.source_expert_count, state->plan.world_size,
-      state->plan.num_experts);
-  impl->device.owned_expert_ids = make_lease(
-      state, dl.owned_expert_ids, incoming.expert_ids.size());
-  impl->device.expert_row_count = make_lease(
-      state, dl.owned_expert_count, incoming.expert_row_count.size());
-  impl->device.expert_row_prefix = make_lease(
-      state, dl.owned_expert_prefix, incoming.expert_row_prefix.size());
-  impl->device.mtile_row_offsets = make_lease(
-      state, dl.mtile_offsets, mtile_offsets.size());
-  impl->device.mtile_expected_rows = make_lease(
-      state, dl.mtile_rows, mtile_rows.size());
-  impl->device.incoming_rows = make_lease(
-      state, dl.incoming_rows, incoming_rows.size());
-  impl->device.reverse_routes = make_lease(
-      state, dl.reverse_routes, reverse_routes.size());
-  impl->device.packet_headers = make_lease(
-      state, dl.packet_headers, packet_headers.size());
-  impl->device.packet_fanout_offsets = make_lease(
-      state, dl.packet_fanout_offsets, packet_fanout_offsets.size());
-  impl->device.packet_fanout = make_lease(
-      state, dl.packet_fanout, packet_fanout.size());
-  impl->device.outgoing_signals = make_lease(
-      state, dl.outgoing_signals, outgoing_signals.size());
-  impl->device.incoming_proxy_signals = make_lease(
-      state, dl.incoming_signals, incoming_signals.size());
-  impl->workspace = std::move(state);
-  return CudaDispatchHandle(std::move(impl));
+const DeviceDispatchIdentity &DeviceDispatchHandle::identity() const {
+  if (!impl_)
+    invalid("attempted to access empty device dispatch handle identity");
+  return impl_->identity;
 }
 
-void validate_cuda_dispatch_metadata(const CudaDispatchHandle &handle,
-                                     const CudaExecution &execution) {
-  if (!handle || !execution)
-    invalid("phase=cuda-device-cross-check, field=input, rank=n/a, "
-            "expected=valid handles, actual=empty");
-  const auto state = handle.impl_->workspace;
-  const auto &metadata = handle.impl_->host.metadata();
-  if (!state ||
-      !state->context.execution().same_instance(execution.token()))
-    invalid("phase=cuda-device-cross-check, field=execution, rank=" +
-            std::to_string(metadata.calling_rank) +
-            ", expected=dispatch execution instance, actual=different");
+const DeviceDispatchSizes &DeviceDispatchHandle::sizes() const {
+  if (!impl_)
+    invalid("attempted to access empty device dispatch handle sizes");
+  return impl_->sizes;
+}
+
+const DeviceMaterializationAudit &DeviceDispatchHandle::audit() const {
+  if (!impl_)
+    invalid("attempted to access empty device dispatch handle audit");
+  return impl_->audit;
+}
+
+DeviceDispatchView DeviceDispatchHandle::checked_view(
+    const CudaExecution &execution,
+    const DeviceDispatchViewExpectation &expected) const {
+  if (!impl_ || !execution)
+    invalid("phase=device-view, field=handle/execution, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto &id = impl_->identity;
+  if (!impl_->context.execution().same_instance(execution.token()) ||
+      id.generation != expected.generation ||
+      id.calling_rank != expected.calling_rank ||
+      id.world_size != expected.world_size ||
+      id.num_tokens != expected.num_tokens || id.top_k != expected.top_k)
+    invalid("phase=device-view, field=identity/shape/epoch, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=exact handle provenance, actual=mismatch");
+  if (id.config_digest_word0 != expected.config_digest_word0 ||
+      id.config_digest_word1 != expected.config_digest_word1)
+    invalid("phase=device-view, field=config_identity, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=exact handle config digest, actual=mismatch");
   auto exec = internal::checked_execution_state(execution);
-  internal::throw_cuda(
-      "device-cross-check", cudaSetDevice(static_cast<int>(exec->device)),
-      metadata.calling_rank, metadata.config.topology.world_size,
-      metadata.communicator_id, metadata.identity.generation,
-      ExchangeKind::ExpertCounts, "cudaSetDevice");
-  const auto download = [&](auto tag, std::size_t offset,
-                            std::uint64_t count, const char *field) {
-    using T = decltype(tag);
-    std::vector<T> result(checked_size(count, field));
-    if (count == 0)
-      return result;
-    const auto bytes = checked_size(checked_mul(count, sizeof(T), field), field);
-    internal::throw_cuda(
-        "device-cross-check",
-        cudaMemcpy(result.data(), at<const void>(state->allocation->device_ptr,
-                                                offset),
-                   bytes, cudaMemcpyDeviceToHost),
-        metadata.calling_rank, metadata.config.topology.world_size,
-        metadata.communicator_id, metadata.identity.generation,
-        ExchangeKind::ExpertCounts, field);
-    return result;
-  };
-  const auto mismatch = [&](const char *field) {
-    invalid("phase=cuda-device-cross-check, field=" + std::string(field) +
-            ", rank=" + std::to_string(metadata.calling_rank) +
-            ", expected=immutable host metadata, actual=device mismatch");
-  };
-  const auto &dl = state->device_layout;
-  const auto &out = metadata.outgoing;
-  const auto routes = state->plan.route_count;
-  const auto check_lease = [&](const DeviceBufferLease &lease,
-                               std::uint32_t rows, std::uint64_t width,
-                               const char *field) {
-    const auto elements = checked_mul(rows, width, field);
-    if (elements == 0) {
-      if (lease)
-        mismatch(field);
-      return;
-    }
-    if (!lease || lease.rows() != rows || lease.row_width() != width ||
-        lease.element_count() != elements ||
-        lease.capacity_elements() < elements)
-      mismatch(field);
-  };
-  const auto &leases = handle.impl_->device;
-  check_lease(leases.expert_id, 1, routes, "lease.expert_id");
-  check_lease(leases.local_offset, 1, routes, "lease.local_offset");
-  check_lease(leases.route_dst_row, 1, routes, "lease.route_dst_row");
-  check_lease(leases.route_dst_rank, 1, routes, "lease.route_dst_rank");
-  check_lease(leases.route_dst_node, 1, routes, "lease.route_dst_node");
-  check_lease(leases.route_dst_local_rank, 1, routes,
-              "lease.route_dst_local_rank");
-  check_lease(leases.combine_order, 1, routes, "lease.combine_order");
-  check_lease(leases.destination_node_mask, 1,
-              checked_mul(out.num_tokens, out.node_mask_words,
-                          "lease.destination_node_mask"),
-              "lease.destination_node_mask");
-  check_lease(leases.source_expert_count, state->plan.world_size,
-              state->plan.num_experts, "lease.source_expert_count");
-  check_lease(leases.owned_expert_ids, 1,
-              metadata.incoming.expert_ids.size(),
-              "lease.owned_expert_ids");
-  check_lease(leases.expert_row_count, 1,
-              metadata.incoming.expert_row_count.size(),
-              "lease.expert_row_count");
-  check_lease(leases.expert_row_prefix, 1,
-              metadata.incoming.expert_row_prefix.size(),
-              "lease.expert_row_prefix");
-  check_lease(leases.mtile_row_offsets, 1,
-              metadata.incoming.mtile_expected_rows.size() + 1,
-              "lease.mtile_row_offsets");
-  std::size_t lease_tile_count = 0;
-  for (const auto &tiles : metadata.incoming.mtile_expected_rows)
-    lease_tile_count += tiles.size();
-  check_lease(leases.mtile_expected_rows, 1, lease_tile_count,
-              "lease.mtile_expected_rows");
-  check_lease(leases.incoming_rows, 1,
-              metadata.incoming.incoming_rows.size(),
-              "lease.incoming_rows");
-  check_lease(leases.reverse_routes, 1, out.reverse_routes.size(),
-              "lease.reverse_routes");
-  check_lease(leases.packet_headers, 1,
-              metadata.transport.outgoing_packets.size(),
-              "lease.packet_headers");
-  check_lease(leases.packet_fanout_offsets, 1,
-              metadata.transport.outgoing_packets.size() + 1,
-              "lease.packet_fanout_offsets");
-  check_lease(leases.packet_fanout, 1, routes, "lease.packet_fanout");
-  check_lease(leases.outgoing_signals, 1,
-              metadata.transport.outgoing_signals.size(),
-              "lease.outgoing_signals");
-  check_lease(leases.incoming_proxy_signals, 1,
-              metadata.transport.incoming_proxy_signals.size(),
-              "lease.incoming_proxy_signals");
-  if (download(std::uint32_t{}, dl.expert_id, routes, "expert_id") !=
-      out.expert_id)
-    mismatch("expert_id");
-  if (download(std::uint64_t{}, dl.local_offset, routes, "local_offset") !=
-      out.local_offset)
-    mismatch("local_offset");
-  if (download(std::uint64_t{}, dl.route_dst_row, routes, "route_dst_row") !=
-      out.route_dst_row)
-    mismatch("route_dst_row");
-  if (download(std::uint32_t{}, dl.route_dst_rank, routes,
-               "route_dst_rank") != out.route_dst_rank)
-    mismatch("route_dst_rank");
-  if (download(std::uint32_t{}, dl.route_dst_node, routes,
-               "route_dst_node") != out.route_dst_node)
-    mismatch("route_dst_node");
-  if (download(std::uint32_t{}, dl.route_dst_local_rank, routes,
-               "route_dst_local_rank") != out.route_dst_local_rank)
-    mismatch("route_dst_local_rank");
-  if (download(std::uint32_t{}, dl.combine_order, routes, "combine_order") !=
-      out.combine_order)
-    mismatch("combine_order");
-  const auto mask_count = checked_mul(out.num_tokens, out.node_mask_words,
-                                      "destination_node_mask");
-  if (download(std::uint64_t{}, dl.masks, mask_count,
-               "destination_node_mask") != out.destination_node_mask)
-    mismatch("destination_node_mask");
+  auto count = internal::CudaDeviceLeaseAccess::checked(
+      impl_->device.source_expert_count, exec->device);
+  const auto &dl = impl_->workspace->device_layout;
+  auto *base = impl_->workspace->allocation->device_ptr;
+  DeviceDispatchView view{};
+  view.identity = id;
+  view.sizes = impl_->sizes;
+  view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
+  view.local_offset = at<const std::uint64_t>(base, dl.local_offset);
+  view.route_dst_row = at<const std::uint64_t>(base, dl.route_dst_row);
+  view.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);
+  view.route_dst_node = at<const std::uint32_t>(base, dl.route_dst_node);
+  view.route_dst_local_rank =
+      at<const std::uint32_t>(base, dl.route_dst_local_rank);
+  view.combine_order = at<const std::uint32_t>(base, dl.combine_order);
+  view.destination_node_mask = at<const std::uint64_t>(base, dl.masks);
+  view.source_expert_count =
+      static_cast<const std::uint64_t *>(count->pointer);
+  view.owned_expert_ids = at<const std::uint32_t>(base, dl.owned_expert_ids);
+  view.expert_row_count = at<const std::uint64_t>(base, dl.owned_expert_count);
+  view.expert_row_prefix =
+      at<const std::uint64_t>(base, dl.owned_expert_prefix);
+  view.mtile_row_offsets = at<const std::uint64_t>(base, dl.mtile_offsets);
+  view.mtile_expected_rows = at<const std::uint32_t>(base, dl.mtile_rows);
+  view.incoming_rows = at<const DeviceIncomingRowRecord>(base, dl.incoming_rows);
+  view.reverse_routes =
+      at<const DeviceReverseRouteRecord>(base, dl.reverse_routes);
+  view.packet_headers =
+      at<const DevicePacketHeaderRecord>(base, dl.packet_headers);
+  view.packet_fanout_offsets =
+      at<const std::uint64_t>(base, dl.packet_fanout_offsets);
+  view.packet_fanout = at<const DeviceFanoutRecord>(base, dl.packet_fanout);
+  view.outgoing_signals =
+      at<const DeviceSignalRecord>(base, dl.outgoing_signals);
+  view.incoming_proxy_signals =
+      at<const DeviceSignalRecord>(base, dl.incoming_signals);
+  return view;
+}
 
-  std::vector<std::uint64_t> expected_counts;
-  expected_counts.reserve(checked_size(
-      checked_mul(state->plan.world_size, state->plan.num_experts,
-                  "source_expert_count"),
-      "source_expert_count"));
-  for (const auto &row : metadata.source_expert_count)
-    expected_counts.insert(expected_counts.end(), row.begin(), row.end());
-  if (download(std::uint64_t{}, dl.source_expert_count,
-               expected_counts.size(), "source_expert_count") !=
-      expected_counts)
-    mismatch("source_expert_count");
+DispatchHandle download_device_metadata_for_validation(
+    const DeviceDispatchHandle &handle, const CudaExecution &execution) {
+  if (!handle || !execution)
+    invalid("phase=device-validation-download, field=input, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto &impl = *handle.impl_;
+  const auto expectation = DeviceDispatchViewExpectation{
+      impl.identity.generation, impl.identity.calling_rank,
+      impl.identity.world_size, impl.identity.num_tokens, impl.identity.top_k,
+      impl.identity.config_digest_word0, impl.identity.config_digest_word1};
+  const auto view = handle.checked_view(execution, expectation);
+  auto exec = internal::checked_execution_state(execution);
+  const auto state = impl.workspace;
+  auto summary_state = internal::CudaDeviceLeaseAccess::checked(
+      impl.device.packet_summary_count, exec->device);
+  const auto routes = impl.sizes.route_count;
+  SourceRouteMetadata outgoing;
+  outgoing.num_tokens = impl.identity.num_tokens;
+  outgoing.top_k = impl.identity.top_k;
+  outgoing.node_mask_words = impl.sizes.node_mask_words;
+  outgoing.expert_id = download_vector<std::uint32_t>(
+      state, *exec, view.expert_id, routes, "expert_id");
+  outgoing.local_offset = download_vector<std::uint64_t>(
+      state, *exec, view.local_offset, routes, "local_offset");
+  outgoing.route_dst_row = download_vector<std::uint64_t>(
+      state, *exec, view.route_dst_row, routes, "route_dst_row");
+  outgoing.route_dst_rank = download_vector<std::uint32_t>(
+      state, *exec, view.route_dst_rank, routes, "route_dst_rank");
+  outgoing.route_dst_node = download_vector<std::uint32_t>(
+      state, *exec, view.route_dst_node, routes, "route_dst_node");
+  outgoing.route_dst_local_rank = download_vector<std::uint32_t>(
+      state, *exec, view.route_dst_local_rank, routes,
+      "route_dst_local_rank");
+  outgoing.combine_order = download_vector<std::uint32_t>(
+      state, *exec, view.combine_order, routes, "combine_order");
+  outgoing.destination_node_mask = download_vector<std::uint64_t>(
+      state, *exec, view.destination_node_mask,
+      impl.identity.num_tokens * impl.sizes.node_mask_words,
+      "destination_node_mask");
+  const auto reverse = download_vector<DeviceReverseRouteRecord>(
+      state, *exec, view.reverse_routes, routes, "reverse_routes");
+  outgoing.reverse_routes.reserve(reverse.size());
+  for (const auto &record : reverse)
+    outgoing.reverse_routes.push_back(ReverseRouteMetadata{
+        record.source_rank, record.local_token_id, record.topk_slot,
+        record.expert_id, record.destination_rank, record.dst_row});
 
-  const auto &incoming = metadata.incoming;
-  if (download(std::uint32_t{}, dl.owned_expert_ids,
-               incoming.expert_ids.size(), "owned_expert_ids") !=
-      incoming.expert_ids)
-    mismatch("owned_expert_ids");
-  if (download(std::uint64_t{}, dl.owned_expert_count,
-               incoming.expert_row_count.size(), "expert_row_count") !=
-      incoming.expert_row_count)
-    mismatch("expert_row_count");
-  if (download(std::uint64_t{}, dl.owned_expert_prefix,
-               incoming.expert_row_prefix.size(), "expert_row_prefix") !=
-      incoming.expert_row_prefix)
-    mismatch("expert_row_prefix");
-  std::vector<std::uint64_t> expected_tile_offsets{0};
-  std::vector<std::uint32_t> expected_tiles;
-  for (const auto &tiles : incoming.mtile_expected_rows) {
-    expected_tiles.insert(expected_tiles.end(), tiles.begin(), tiles.end());
-    expected_tile_offsets.push_back(expected_tiles.size());
-  }
-  if (download(std::uint64_t{}, dl.mtile_offsets,
-               expected_tile_offsets.size(), "mtile_row_offsets") !=
-      expected_tile_offsets)
-    mismatch("mtile_row_offsets");
-  if (download(std::uint32_t{}, dl.mtile_rows, expected_tiles.size(),
-               "mtile_expected_rows") != expected_tiles)
-    mismatch("mtile_expected_rows");
-
-  const auto device_incoming = download(
-      DeviceIncomingRowRecord{}, dl.incoming_rows,
-      incoming.incoming_rows.size(), "incoming_rows");
-  for (std::size_t index = 0; index < device_incoming.size(); ++index) {
-    const auto &actual = device_incoming[index];
-    const auto &expected = incoming.incoming_rows[index];
-    if (actual.source_rank != expected.source_rank ||
-        actual.expert_id != expected.expert_id ||
-        actual.source_expert_offset != expected.source_expert_offset ||
-        actual.dst_row != expected.dst_row)
-      mismatch("incoming_rows");
-  }
-  const auto device_reverse = download(
-      DeviceReverseRouteRecord{}, dl.reverse_routes, out.reverse_routes.size(),
-      "reverse_routes");
-  for (std::size_t index = 0; index < device_reverse.size(); ++index) {
-    const auto &actual = device_reverse[index];
-    const auto &expected = out.reverse_routes[index];
-    if (actual.source_rank != expected.source_rank ||
-        actual.local_token_id != expected.local_token_id ||
-        actual.topk_slot != expected.topk_slot ||
-        actual.expert_id != expected.expert_id ||
-        actual.destination_rank != expected.destination_rank ||
-        actual.dst_row != expected.dst_row)
-      mismatch("reverse_routes");
+  const auto flat_counts = download_vector<std::uint64_t>(
+      state, *exec, view.source_expert_count,
+      static_cast<std::uint64_t>(impl.identity.world_size) *
+          impl.identity.num_experts,
+      "source_expert_count");
+  const auto flat_summary = download_vector<std::uint64_t>(
+      state, *exec, summary_state->pointer,
+      static_cast<std::uint64_t>(impl.identity.world_size) *
+          impl.identity.num_nodes,
+      "packet_summary_count");
+  CountMatrix counts(impl.identity.world_size,
+                     std::vector<std::uint64_t>(impl.identity.num_experts));
+  CountMatrix summaries(impl.identity.world_size,
+                        std::vector<std::uint64_t>(impl.identity.num_nodes));
+  for (std::uint32_t rank = 0; rank < impl.identity.world_size; ++rank) {
+    std::copy_n(flat_counts.begin() +
+                    static_cast<std::size_t>(rank) * impl.identity.num_experts,
+                impl.identity.num_experts, counts[rank].begin());
+    std::copy_n(flat_summary.begin() +
+                    static_cast<std::size_t>(rank) * impl.identity.num_nodes,
+                impl.identity.num_nodes, summaries[rank].begin());
   }
 
-  const auto &packets = metadata.transport.outgoing_packets;
-  const auto device_headers = download(
-      DevicePacketHeaderRecord{}, dl.packet_headers, packets.size(),
+  DispatchMetadata metadata;
+  metadata.config = impl.config;
+  metadata.calling_rank = impl.identity.calling_rank;
+  metadata.communicator_id = impl.context.session().identity();
+  metadata.identity.generation = impl.identity.generation;
+  metadata.source_expert_count = counts;
+  metadata.outgoing = std::move(outgoing);
+  auto &incoming = metadata.incoming;
+  incoming.rank = impl.identity.calling_rank;
+  incoming.expert_ids = download_vector<std::uint32_t>(
+      state, *exec, view.owned_expert_ids, impl.sizes.owned_expert_count,
+      "owned_expert_ids");
+  incoming.expert_row_count = download_vector<std::uint64_t>(
+      state, *exec, view.expert_row_count, impl.sizes.owned_expert_count,
+      "expert_row_count");
+  incoming.expert_row_prefix = download_vector<std::uint64_t>(
+      state, *exec, view.expert_row_prefix,
+      static_cast<std::uint64_t>(impl.sizes.owned_expert_count) + 1,
+      "expert_row_prefix");
+  const auto tile_offsets = download_vector<std::uint64_t>(
+      state, *exec, view.mtile_row_offsets,
+      static_cast<std::uint64_t>(impl.sizes.owned_expert_count) + 1,
+      "mtile_row_offsets");
+  const auto tiles = download_vector<std::uint32_t>(
+      state, *exec, view.mtile_expected_rows, impl.sizes.mtile_count,
+      "mtile_expected_rows");
+  incoming.mtile_expected_rows.resize(impl.sizes.owned_expert_count);
+  for (std::uint32_t expert = 0; expert < impl.sizes.owned_expert_count;
+       ++expert) {
+    incoming.mtile_expected_rows[expert].assign(
+        tiles.begin() + static_cast<std::ptrdiff_t>(tile_offsets[expert]),
+        tiles.begin() + static_cast<std::ptrdiff_t>(tile_offsets[expert + 1]));
+  }
+  const auto rows = download_vector<DeviceIncomingRowRecord>(
+      state, *exec, view.incoming_rows, impl.sizes.incoming_row_count,
+      "incoming_rows");
+  incoming.incoming_rows.reserve(rows.size());
+  for (const auto &row : rows)
+    incoming.incoming_rows.push_back(IncomingRowMetadata{
+        row.source_rank, row.expert_id, row.source_expert_offset, row.dst_row});
+
+  const auto headers = download_vector<DevicePacketHeaderRecord>(
+      state, *exec, view.packet_headers, impl.sizes.packet_count,
       "packet_headers");
-  std::vector<std::uint64_t> expected_fanout_offsets{0};
-  std::vector<DeviceFanoutRecord> expected_fanout;
-  for (std::size_t index = 0; index < packets.size(); ++index) {
-    const auto &actual = device_headers[index];
-    const auto &expected = packets[index];
-    if (actual.source_rank != expected.identity.source_rank ||
-        actual.destination_node != expected.identity.destination_node ||
-        actual.sequence_on_link != expected.identity.sequence_on_link ||
-        actual.local_token_id != expected.local_token_id ||
-        actual.proxy_rank != expected.proxy_rank ||
-        actual.channel != expected.channel)
-      mismatch("packet_headers");
-    for (const auto &target : expected.fanout)
-      expected_fanout.push_back(DeviceFanoutRecord{
+  const auto fanout_offsets = download_vector<std::uint64_t>(
+      state, *exec, view.packet_fanout_offsets, impl.sizes.packet_count + 1,
+      "packet_fanout_offsets");
+  const auto fanout = download_vector<DeviceFanoutRecord>(
+      state, *exec, view.packet_fanout, impl.sizes.fanout_count,
+      "packet_fanout");
+  for (std::uint64_t packet = 0; packet < impl.sizes.packet_count; ++packet) {
+    const auto &header = headers[static_cast<std::size_t>(packet)];
+    OutgoingPacketDescriptor descriptor{
+        PacketIdentity{header.source_rank, header.destination_node,
+                       header.sequence_on_link},
+        header.local_token_id, header.proxy_rank, header.channel, {}};
+    for (auto index = fanout_offsets[static_cast<std::size_t>(packet)];
+         index < fanout_offsets[static_cast<std::size_t>(packet + 1)]; ++index) {
+      const auto &target = fanout[static_cast<std::size_t>(index)];
+      descriptor.fanout.push_back(FanoutTarget{
           target.topk_slot, target.destination_local_rank, target.expert_id,
           target.dst_row});
-    expected_fanout_offsets.push_back(expected_fanout.size());
-  }
-  if (download(std::uint64_t{}, dl.packet_fanout_offsets,
-               expected_fanout_offsets.size(), "packet_fanout_offsets") !=
-      expected_fanout_offsets)
-    mismatch("packet_fanout_offsets");
-  const auto device_fanout =
-      download(DeviceFanoutRecord{}, dl.packet_fanout,
-               expected_fanout.size(), "packet_fanout");
-  for (std::size_t index = 0; index < device_fanout.size(); ++index) {
-    const auto &actual = device_fanout[index];
-    const auto &expected = expected_fanout[index];
-    if (actual.topk_slot != expected.topk_slot ||
-        actual.destination_local_rank != expected.destination_local_rank ||
-        actual.expert_id != expected.expert_id ||
-        actual.dst_row != expected.dst_row)
-      mismatch("packet_fanout");
-  }
-
-  const auto compare_signals = [&](const auto &expected, std::size_t offset,
-                                   const char *field) {
-    const auto actual = download(DeviceSignalRecord{}, offset, expected.size(),
-                                 field);
-    for (std::size_t index = 0; index < actual.size(); ++index) {
-      const auto &lhs = actual[index];
-      const auto &rhs = expected[index];
-      if (lhs.source_node != rhs.source_node ||
-          lhs.destination_node != rhs.destination_node ||
-          lhs.source_rank != rhs.source_rank ||
-          lhs.destination_proxy_rank != rhs.destination_proxy_rank ||
-          lhs.rail_local_rank != rhs.rail_local_rank ||
-          lhs.channel != rhs.channel ||
-          lhs.expected_packets != rhs.expected_packets ||
-          lhs.expected_signals != rhs.expected_signals)
-        mismatch(field);
     }
+    metadata.transport.outgoing_packets.push_back(std::move(descriptor));
+  }
+  const auto outgoing_signals = download_vector<DeviceSignalRecord>(
+      state, *exec, view.outgoing_signals, impl.sizes.outgoing_signal_count,
+      "outgoing_signals");
+  const auto incoming_signals = download_vector<DeviceSignalRecord>(
+      state, *exec, view.incoming_proxy_signals,
+      impl.sizes.incoming_signal_count, "incoming_signals");
+  const auto append_signals = [](const auto &source, auto &destination) {
+    for (const auto &signal : source)
+      destination.push_back(SignalCardinality{
+          signal.source_node, signal.destination_node, signal.source_rank,
+          signal.destination_proxy_rank, signal.rail_local_rank,
+          signal.channel, signal.expected_packets,
+          signal.expected_signals});
   };
-  compare_signals(metadata.transport.outgoing_signals, dl.outgoing_signals,
-                  "outgoing_signals");
-  compare_signals(metadata.transport.incoming_proxy_signals,
-                  dl.incoming_signals, "incoming_proxy_signals");
+  append_signals(outgoing_signals, metadata.transport.outgoing_signals);
+  append_signals(incoming_signals,
+                 metadata.transport.incoming_proxy_signals);
+  auto result = DeviceNotifyBridge::make_validation_dispatch(
+      std::move(metadata));
+  validate_dispatch_metadata(result);
+  return result;
+}
+
+void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &handle,
+                                      const CudaExecution &execution) {
+  (void)download_device_metadata_for_validation(handle, execution);
 }
 
 } // namespace megamoe::cuda

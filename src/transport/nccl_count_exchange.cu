@@ -123,8 +123,6 @@ struct Slot {
   std::uint32_t device = 0;
   std::uint64_t *device_matrix = nullptr;
   std::uint64_t *device_send = nullptr;
-  std::uint64_t *host_matrix = nullptr;
-  std::uint64_t *host_send = nullptr;
   cudaEvent_t completion = nullptr;
   bool in_use = false;
   bool tracked = false;
@@ -135,10 +133,6 @@ struct Slot {
       (void)cudaEventSynchronize(completion);
     if (completion)
       (void)cudaEventDestroy(completion);
-    if (host_matrix)
-      (void)cudaFreeHost(host_matrix);
-    if (host_send)
-      (void)cudaFreeHost(host_send);
     if (device_matrix)
       (void)cudaFree(device_matrix);
     if (device_send)
@@ -399,17 +393,7 @@ void allocate_slot(Slot &slot, std::uint64_t width,
                        session.session().generation(), kind,
                        "cudaMalloc(AllGather matrix)");
   const auto device_end = std::chrono::steady_clock::now();
-  const auto pinned_start = device_end;
-  internal::throw_cuda("nccl-workspace",
-                       cudaHostAlloc(reinterpret_cast<void **>(&slot.host_matrix),
-                                     bytes,
-                                     cudaHostAllocPortable),
-                       session.rank(), slot.world,
-                       session.session().identity(),
-                       session.session().generation(), kind,
-                       "cudaHostAlloc(AllGather staging)");
-  const auto pinned_end = std::chrono::steady_clock::now();
-  const auto event_start = pinned_end;
+  const auto event_start = device_end;
   internal::throw_cuda("nccl-workspace",
                        cudaEventCreateWithFlags(&slot.completion,
                                                 cudaEventDisableTiming),
@@ -423,9 +407,6 @@ void allocate_slot(Slot &slot, std::uint64_t width,
   if (metrics) {
     metrics->device_allocation_us +=
         std::chrono::duration<double, std::micro>(device_end - device_start)
-            .count();
-    metrics->pinned_allocation_us +=
-        std::chrono::duration<double, std::micro>(pinned_end - pinned_start)
             .count();
     metrics->event_allocation_us +=
         std::chrono::duration<double, std::micro>(event_end - event_start)
@@ -891,16 +872,6 @@ public:
     if (request_.kind == ExchangeKind::NotifyPacketSummary)
       maybe_fault(testing::NcclFaultPoint::BackendCompletion,
                   "summary-backend-completion", request_.context);
-    CountMatrix rows(session.world_size(),
-                     std::vector<std::uint64_t>(
-                         static_cast<std::size_t>(request_.row_width)));
-    for (std::uint32_t rank = 0; rank < session.world_size(); ++rank) {
-      const auto offset = static_cast<std::size_t>(rank) *
-                          static_cast<std::size_t>(request_.row_width);
-      std::copy_n(slot_->host_matrix + offset,
-                  static_cast<std::size_t>(request_.row_width),
-                  rows[rank].begin());
-    }
     terminal_ = true;
     release();
     {
@@ -913,8 +884,17 @@ public:
     }
     auto lease = std::make_shared<internal::CudaCompletionLease>();
     lease->owner = impl_;
-    return make_host_backend_completion(
-        request_.context, request_.kind, make_host_count_matrix(rows),
+    auto buffer = std::make_shared<internal::CudaBufferState>();
+    buffer->owner = impl_;
+    buffer->pointer = slot_->device_matrix;
+    buffer->device = impl_->session.device_ordinal();
+    const auto elements = checked_elements(session.world_size(),
+                                           request_.row_width,
+                                           "completion_matrix_elements");
+    return make_device_backend_completion(
+        request_.context, request_.kind,
+        make_device_buffer_lease(session.world_size(), request_.row_width,
+                                 elements, std::move(buffer)),
         std::move(lease));
   }
 
@@ -1240,13 +1220,15 @@ NcclWorkspaceUsage NcclAllGatherCountExchange::workspace_usage() const {
   const auto config_row = impl_->config ? impl_->config->width : 0;
   usage.config_wire_bytes = config_row;
   usage.config_slot_bytes = 2 * (config_matrix + config_row);
-  usage.expert_slot_bytes = 2 * slot_bytes(impl_->expert.get());
-  usage.summary_slot_bytes = 2 * slot_bytes(impl_->summary.get());
+  usage.expert_slot_bytes = slot_bytes(impl_->expert.get());
+  usage.summary_slot_bytes = slot_bytes(impl_->summary.get());
+  const auto control_side = control_matrix + control_row;
+  const auto config_side = config_matrix + config_row;
   usage.device_bytes = control_matrix + control_row + config_matrix +
                        config_row +
                        slot_bytes(impl_->expert.get()) +
                        slot_bytes(impl_->summary.get());
-  usage.pinned_host_bytes = usage.device_bytes;
+  usage.pinned_host_bytes = control_side + config_side;
   return usage;
 }
 
@@ -1340,15 +1322,6 @@ NcclAllGatherCountExchange::start(const CountExchangeRequest &request) {
       ++impl_->audit.expert_count_starts;
     else
       ++impl_->audit.packet_summary_starts;
-    const auto elements = checked_elements(
-        session.world_size(), request.row_width, "active_matrix_elements");
-    const auto bytes = checked_matrix_bytes(elements, "active_matrix_bytes");
-    internal::throw_cuda(
-        "nccl-start",
-        cudaMemcpyAsync(slot->host_matrix, slot->device_matrix, bytes,
-                        cudaMemcpyDeviceToHost, impl_->execution_state->stream),
-        rank, session.world_size(), session.identity(), session.generation(),
-        request.kind, "cudaMemcpyAsync(D2H collective matrix)");
     internal::throw_cuda(
         "nccl-start",
         cudaEventRecord(slot->completion, impl_->execution_state->stream), rank,
@@ -1564,6 +1537,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     status = config_status;
 
   CudaLocalNotifyHandle local;
+  double local_mapping_us = 0;
   std::uint64_t route_input_bytes = 0;
   std::uint64_t notify_arena_bytes = 0;
   std::uint64_t notify_pinned_bytes = 0;
@@ -1584,6 +1558,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
           request.config, impl_->context, impl_->execution, routes,
           std::move(workspace));
       auto preflight = operation.wait_preflight();
+      local_mapping_us = preflight.device_mapping_us();
       status = preflight.status();
       if (preflight.valid())
         local = preflight.local();
@@ -1606,6 +1581,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     header.session_id_word0 = identity_override->summary.word0;
     header.session_id_word1 = identity_override->summary.word1;
   }
+  const auto control_config_start = std::chrono::steady_clock::now();
   auto control = impl_->backend->start_control(impl_->context, header);
   auto control_done = control.wait();
 
@@ -1619,6 +1595,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   auto config = impl_->backend->start_config(impl_->context, config_wire,
                                              control_done);
   (void)config.wait();
+  const auto control_config_end = std::chrono::steady_clock::now();
   const auto coordinator_create = impl_->setup.coordinator_backend_create_us;
   const auto initial_total = impl_->setup.per_generation_setup_total_us;
   impl_->setup = impl_->backend->impl_->setup;
@@ -1632,14 +1609,23 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     invalid("phase=generation-coordinator, field=local_handle, rank=" +
             std::to_string(impl_->session.rank()) +
             ", expected=valid after successful agreement, actual=empty");
-  auto count = start_count_exchange(local.local(), *impl_->backend);
-  auto count_done = count.wait();
-  auto summary = start_notify_summary_exchange(local.local(), *impl_->backend);
-  auto summary_done = summary.wait();
-  auto host = materialize_rank_metadata(local.local(), count_done,
-                                        summary_done);
-  auto device = stage_cuda_dispatch_metadata(std::move(host), local,
-                                             impl_->execution);
+  const auto count_start = std::chrono::steady_clock::now();
+  auto count = impl_->backend->start(CountExchangeRequest{
+      impl_->context, ExchangeKind::ExpertCounts, request.config.num_experts,
+      {}, local.device_expert_count_for_backend()});
+  auto count_done = count->wait();
+  const auto count_end = std::chrono::steady_clock::now();
+  const auto summary_start = std::chrono::steady_clock::now();
+  auto summary = impl_->backend->start(CountExchangeRequest{
+      impl_->context, ExchangeKind::NotifyPacketSummary,
+      request.config.topology.num_nodes, {},
+      local.device_packet_count_for_backend()});
+  auto summary_done = summary->wait();
+  const auto summary_end = std::chrono::steady_clock::now();
+  const auto materialize_start = std::chrono::steady_clock::now();
+  auto device = DeviceMetadataBridge::materialize(
+      local, std::move(count_done), std::move(summary_done), impl_->execution);
+  const auto materialize_end = std::chrono::steady_clock::now();
   const auto audit_value = impl_->backend->audit();
   if (audit_value.control_starts != 1 || audit_value.config_starts != 1 ||
       audit_value.expert_count_starts != 1 ||
@@ -1674,6 +1660,20 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                              result->setup.summary_slot_allocation_us;
   result->execution.steady_execution_us =
       std::max(0.0, result->execution.coordinator_run_wall_us - dynamic_setup);
+  result->execution.local_mapping_us = local_mapping_us;
+  result->execution.control_config_us =
+      std::chrono::duration<double, std::micro>(control_config_end -
+                                                control_config_start)
+          .count();
+  result->execution.expert_count_us =
+      std::chrono::duration<double, std::micro>(count_end - count_start).count();
+  result->execution.packet_summary_us =
+      std::chrono::duration<double, std::micro>(summary_end - summary_start)
+          .count();
+  result->execution.device_materialization_us =
+      std::chrono::duration<double, std::micro>(materialize_end -
+                                                materialize_start)
+          .count();
   result->resource_lease = impl_;
   testing::g_validated_publishes.fetch_add(1);
   return ValidatedCudaGeneration(std::move(result));

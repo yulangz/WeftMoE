@@ -109,6 +109,11 @@ struct GenerationExecutionTimings {
   // this value plus that rank's GenerationSetupTimings total.
   double steady_execution_us = 0;
   double coordinator_run_wall_us = 0;
+  double local_mapping_us = 0;
+  double control_config_us = 0;
+  double expert_count_us = 0;
+  double packet_summary_us = 0;
+  double device_materialization_us = 0;
 };
 
 struct NotifyGenerationRequest {

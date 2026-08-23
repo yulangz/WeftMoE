@@ -15,7 +15,8 @@ namespace megamoe::cuda {
 
 class CudaExecution;
 class CudaLocalNotifyHandle;
-class CudaDispatchHandle;
+class DeviceDispatchHandle;
+using CudaDispatchHandle = DeviceDispatchHandle;
 class CudaRouteInput;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
@@ -55,65 +56,75 @@ CudaExecution make_cuda_execution(std::string identity,
 class CudaLocalNotifyHandle {
 public:
   CudaLocalNotifyHandle() = default;
-  const LocalHistogramHandle &local() const;
+  std::uint64_t num_tokens() const;
+  const RuntimeConfig &config() const;
+  const RankCollectiveContext &context() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
+  const DeviceBufferLease &device_expert_count_for_backend() const;
+  const DeviceBufferLease &device_packet_count_for_backend() const;
   struct Impl;
   explicit CudaLocalNotifyHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class CudaNotifyOperation;
-  friend CudaDispatchHandle stage_cuda_dispatch_metadata(
-      DispatchHandle, const CudaLocalNotifyHandle &, const CudaExecution &);
-  friend void validate_cuda_dispatch_metadata(
-      const CudaDispatchHandle &, const CudaExecution &);
+  friend class DeviceMetadataBridge;
+  friend class CudaNotifyGenerationCoordinator;
 };
 
-// Device copies of the fields directly consumed by future forward/backward
-// kernels. The host handle was produced through checked typed staging.
+// Versioned POD fields directly consumed by future forward/backward kernels.
+// 64-bit fields precede 32-bit fields so the CUDA/host ABI has no hidden
+// interior padding; fixed sizes below are part of layout version 1.
 struct DeviceReverseRouteRecord {
-  std::uint32_t source_rank;
   std::uint64_t local_token_id;
+  std::uint64_t dst_row;
+  std::uint32_t source_rank;
   std::uint32_t topk_slot;
   std::uint32_t expert_id;
   std::uint32_t destination_rank;
-  std::uint64_t dst_row;
 };
 
 struct DeviceIncomingRowRecord {
-  std::uint32_t source_rank;
-  std::uint32_t expert_id;
   std::uint64_t source_expert_offset;
   std::uint64_t dst_row;
+  std::uint32_t source_rank;
+  std::uint32_t expert_id;
 };
 
 struct DevicePacketHeaderRecord {
-  std::uint32_t source_rank;
-  std::uint32_t destination_node;
   std::uint64_t sequence_on_link;
   std::uint64_t local_token_id;
+  std::uint32_t source_rank;
+  std::uint32_t destination_node;
   std::uint32_t proxy_rank;
   std::uint32_t channel;
 };
 
 struct DeviceFanoutRecord {
+  std::uint64_t dst_row;
   std::uint32_t topk_slot;
   std::uint32_t destination_local_rank;
   std::uint32_t expert_id;
-  std::uint64_t dst_row;
+  std::uint32_t reserved = 0;
 };
 
 struct DeviceSignalRecord {
+  std::uint64_t expected_packets;
+  std::uint64_t expected_signals;
   std::uint32_t source_node;
   std::uint32_t destination_node;
   std::uint32_t source_rank;
   std::uint32_t destination_proxy_rank;
   std::uint32_t rail_local_rank;
   std::uint32_t channel;
-  std::uint64_t expected_packets;
-  std::uint64_t expected_signals;
 };
+
+static_assert(sizeof(DeviceReverseRouteRecord) == 32);
+static_assert(sizeof(DeviceIncomingRowRecord) == 24);
+static_assert(sizeof(DevicePacketHeaderRecord) == 32);
+static_assert(sizeof(DeviceFanoutRecord) == 24);
+static_assert(sizeof(DeviceSignalRecord) == 40);
 
 struct DeviceDispatchMetadata {
   DeviceBufferLease expert_id;
@@ -125,6 +136,7 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease combine_order;
   DeviceBufferLease destination_node_mask;
   DeviceBufferLease source_expert_count;
+  DeviceBufferLease packet_summary_count;
   DeviceBufferLease owned_expert_ids;
   DeviceBufferLease expert_row_count;
   DeviceBufferLease expert_row_prefix;
@@ -139,32 +151,109 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease incoming_proxy_signals;
 };
 
-class CudaDispatchHandle {
+inline constexpr std::uint32_t kDeviceDispatchLayoutVersion = 1;
+
+struct DeviceDispatchIdentity {
+  std::uint32_t layout_version = kDeviceDispatchLayoutVersion;
+  std::uint64_t generation = 0;
+  std::uint32_t calling_rank = 0;
+  std::uint32_t world_size = 0;
+  std::uint64_t num_tokens = 0;
+  std::uint32_t top_k = 0;
+  std::uint32_t num_experts = 0;
+  std::uint32_t num_nodes = 0;
+  std::uint64_t config_digest_word0 = 0;
+  std::uint64_t config_digest_word1 = 0;
+};
+
+struct DeviceDispatchSizes {
+  std::uint64_t route_count = 0;
+  std::uint32_t node_mask_words = 0;
+  std::uint32_t owned_expert_count = 0;
+  std::uint64_t incoming_row_count = 0;
+  std::uint64_t mtile_count = 0;
+  std::uint64_t packet_count = 0;
+  std::uint64_t fanout_count = 0;
+  std::uint32_t outgoing_signal_count = 0;
+  std::uint32_t incoming_signal_count = 0;
+};
+
+// Auditable production-boundary counters. A normal generation must publish
+// 0/0/0/0. Explicit validation download is a separate opt-in API.
+struct DeviceMaterializationAudit {
+  std::uint64_t bulk_route_d2h = 0;
+  std::uint64_t bulk_collective_d2h = 0;
+  std::uint64_t host_materializations = 0;
+  std::uint64_t bulk_metadata_h2d = 0;
+};
+
+struct DeviceDispatchViewExpectation {
+  std::uint64_t generation = 0;
+  std::uint32_t calling_rank = 0;
+  std::uint32_t world_size = 0;
+  std::uint64_t num_tokens = 0;
+  std::uint32_t top_k = 0;
+  std::uint64_t config_digest_word0 = 0;
+  std::uint64_t config_digest_word1 = 0;
+};
+
+// CUDA-specific typed view for forward/backward kernels. Native pointers never
+// enter the transport-independent metadata API.
+struct DeviceDispatchView {
+  DeviceDispatchIdentity identity;
+  DeviceDispatchSizes sizes;
+  const std::uint32_t *expert_id = nullptr;
+  const std::uint64_t *local_offset = nullptr;
+  const std::uint64_t *route_dst_row = nullptr;
+  const std::uint32_t *route_dst_rank = nullptr;
+  const std::uint32_t *route_dst_node = nullptr;
+  const std::uint32_t *route_dst_local_rank = nullptr;
+  const std::uint32_t *combine_order = nullptr;
+  const std::uint64_t *destination_node_mask = nullptr;
+  const std::uint64_t *source_expert_count = nullptr;
+  const std::uint32_t *owned_expert_ids = nullptr;
+  const std::uint64_t *expert_row_count = nullptr;
+  const std::uint64_t *expert_row_prefix = nullptr;
+  const std::uint64_t *mtile_row_offsets = nullptr;
+  const std::uint32_t *mtile_expected_rows = nullptr;
+  const DeviceIncomingRowRecord *incoming_rows = nullptr;
+  const DeviceReverseRouteRecord *reverse_routes = nullptr;
+  const DevicePacketHeaderRecord *packet_headers = nullptr;
+  const std::uint64_t *packet_fanout_offsets = nullptr;
+  const DeviceFanoutRecord *packet_fanout = nullptr;
+  const DeviceSignalRecord *outgoing_signals = nullptr;
+  const DeviceSignalRecord *incoming_proxy_signals = nullptr;
+};
+
+class DeviceDispatchHandle {
 public:
-  CudaDispatchHandle() = default;
-  const DispatchHandle &host() const;
+  DeviceDispatchHandle() = default;
   const DeviceDispatchMetadata &device() const;
+  const DeviceDispatchIdentity &identity() const;
+  const DeviceDispatchSizes &sizes() const;
+  const DeviceMaterializationAudit &audit() const;
+  DeviceDispatchView checked_view(
+      const CudaExecution &execution,
+      const DeviceDispatchViewExpectation &expected) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
   struct Impl;
-  explicit CudaDispatchHandle(std::shared_ptr<const Impl> impl)
+  explicit DeviceDispatchHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
-  friend CudaDispatchHandle stage_cuda_dispatch_metadata(
-      DispatchHandle, const CudaLocalNotifyHandle &, const CudaExecution &);
-  friend void validate_cuda_dispatch_metadata(
-      const CudaDispatchHandle &, const CudaExecution &);
+  friend class DeviceMetadataBridge;
+  friend class CudaNotifyGenerationCoordinator;
+  friend DispatchHandle download_device_metadata_for_validation(
+      const DeviceDispatchHandle &, const CudaExecution &);
 };
 
-CudaDispatchHandle stage_cuda_dispatch_metadata(
-    DispatchHandle host, const CudaLocalNotifyHandle &local,
-    const CudaExecution &execution);
+// Explicit diagnostic/test-only bulk download. The production coordinator
+// never calls this function.
+DispatchHandle download_device_metadata_for_validation(
+    const DeviceDispatchHandle &handle, const CudaExecution &execution);
 
-// Controlled diagnostic/test staging. The CUDA module interprets its private
-// leases, downloads every device field, and compares it to the immutable host
-// handle. Transport-independent metadata never sees a native device address.
-void validate_cuda_dispatch_metadata(const CudaDispatchHandle &handle,
-                                     const CudaExecution &execution);
+void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &handle,
+                                      const CudaExecution &execution);
 
 } // namespace megamoe::cuda

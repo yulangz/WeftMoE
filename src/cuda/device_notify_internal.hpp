@@ -4,6 +4,15 @@
 
 namespace megamoe::cuda {
 
+class DeviceMetadataBridge {
+public:
+  static DeviceDispatchHandle materialize(
+      const CudaLocalNotifyHandle &local,
+      BackendCompletion expert_counts,
+      BackendCompletion packet_summary,
+      const CudaExecution &execution);
+};
+
 class CudaRouteInput {
 public:
   CudaRouteInput() = default;

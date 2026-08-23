@@ -59,15 +59,16 @@ exceptions.
 `build_notify_dispatch_for_testing` is a host reference/test wrapper that
 composes this path for all ranks. It is not a device entry point.
 
-The optional CUDA path keeps `selected_experts[num_tokens, top_k]` on the
+The CUDA production path keeps `selected_experts[num_tokens, top_k]` on the
 calling GPU. It derives an explicit total-order key
 `(expert_id, flat_route_index)`, performs radix sort plus segmented inclusive
 scan, and scatters the stable local offsets. Atomic return values are never used
 as route offsets. A CUDA/NCCL session then AllGathers the device expert-count and
-token-node summary rows, stages a checked typed host result at completion, and
-uses the same materializer as the host production path. The final stage writes
-canonical rows, count geometry, reverse routes, packet fan-out, and signal
-records into one preplanned device workspace.
+token-node summary rows into backend-owned device completion leases. A checked
+device kernel consumes those matrices directly and writes canonical rows,
+owned-expert/tile geometry, reverse routes, packet fan-out, and signals into one
+preplanned device arena. No route/count matrix is bulk-downloaded, no host
+materializer runs, and no final metadata is bulk-uploaded on this path.
 
 ```cpp
 auto execution = cuda::make_cuda_execution("notify-stream", device);
@@ -77,7 +78,18 @@ cuda::CudaNotifyGenerationCoordinator coordinator(session, execution);
 auto generation_result = coordinator.run(
     {config, local_routes, max_tokens_per_rank});
 const auto& device_handle = generation_result.dispatch();
+auto view = device_handle.checked_view(execution,
+    {generation, rank, world, local_routes.num_tokens, config.top_k,
+     device_handle.identity().config_digest_word0,
+     device_handle.identity().config_digest_word1});
 ```
+
+`DeviceDispatchHandle` is immutable and copyable through a shared arena and
+completion lease. The checked CUDA view is bound to session generation, rank,
+world, runtime shape, config digest, execution identity, and allocation
+capacity. Default/moved-from and cross-generation views fail closed. Tests and
+debuggers may explicitly call `download_device_metadata_for_validation()`;
+the coordinator never calls it.
 
 This coordinator is the only public production protocol entry; device upload,
 workspace allocation, preflight wait, control start, and data-collective start
@@ -124,8 +136,8 @@ slot width and are reconstructed by their declarations before exact comparison.
 Digest equality never skips exact decoded-field and byte agreement.
 
 `max_tokens_per_rank` is an explicit capacity promise for every rank in the
-collective generation. It sizes worst-case incoming rows; actual materialized
-rows exceeding it fail before an H2D copy.
+collective generation. It sizes worst-case incoming rows; device-side checked
+prefix/materialization rejects a short capacity before publishing a handle.
 
 ## Deterministic mapping and descriptors
 

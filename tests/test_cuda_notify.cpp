@@ -92,6 +92,7 @@ std::vector<std::uint64_t> fixed_seeds() {
 struct RunResult {
   std::string metadata;
   megamoe::cuda::CollectiveProtocolAudit audit;
+  megamoe::cuda::DeviceMaterializationAudit device_audit;
   megamoe::cuda::NcclWorkspaceUsage workspace;
   megamoe::cuda::GenerationSetupTimings setup;
   megamoe::cuda::GenerationExecutionTimings execution;
@@ -132,8 +133,10 @@ std::vector<RunResult> run_fixture(
         auto result = coordinator.run({config, routes[rank], max_tokens});
         const auto finish = Clock::now();
         results[rank].metadata = megamoe::serialize_dispatch_metadata(
-            result.dispatch().host());
+            megamoe::cuda::download_device_metadata_for_validation(
+                result.dispatch(), execution));
         results[rank].audit = result.audit();
+        results[rank].device_audit = result.dispatch().audit();
         results[rank].workspace = result.workspace_usage();
         results[rank].setup = result.setup_timings();
         results[rank].execution = result.execution_timings();
@@ -209,8 +212,10 @@ std::vector<RunResult> run_reused_fixture(
             session, resources[rank].execution);
         auto result = coordinator.run({config, routes[rank], max_tokens});
         results[rank].metadata = megamoe::serialize_dispatch_metadata(
-            result.dispatch().host());
+            megamoe::cuda::download_device_metadata_for_validation(
+                result.dispatch(), resources[rank].execution));
         results[rank].audit = result.audit();
+        results[rank].device_audit = result.dispatch().audit();
         results[rank].workspace = result.workspace_usage();
         results[rank].setup = result.setup_timings();
         results[rank].execution = result.execution_timings();
@@ -251,6 +256,12 @@ void test_local(std::uint32_t world) {
                   audit.expert_count_starts == 1 &&
                   audit.packet_summary_starts == 1,
               "successful audit is not 1/1/1/1");
+      const auto staging = actual[rank].device_audit;
+      require(staging.bulk_route_d2h == 0 &&
+                  staging.bulk_collective_d2h == 0 &&
+                  staging.host_materializations == 0 &&
+                  staging.bulk_metadata_h2d == 0,
+              "production generation used a retired host roundtrip");
     }
   }
   const auto repeated = seeded_inputs(world, experts, top_k, 0x1234abcdULL);
@@ -416,6 +427,61 @@ void test_protocol_regressions() {
     test_failure(scenario);
 }
 
+void test_device_capacity_failure_and_recovery() {
+  constexpr std::uint32_t world = 2;
+  auto bad_config = make_config(1, world, 4, 1, 4);
+  bad_config.capacity.expert_rows.assign(4, 100);
+  bad_config.capacity.expert_rows[0] = 1;
+  auto good_config = bad_config;
+  good_config.capacity.expert_rows[0] = 2;
+  auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+  std::vector<std::exception_ptr> errors(world);
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        auto execution = megamoe::cuda::make_cuda_execution(
+            "capacity-exec-" + std::to_string(rank), rank);
+        auto base = megamoe::cuda::make_nccl_session(
+            "capacity-base", world, rank, 6200, rank, bootstrap);
+        auto bad_session = megamoe::cuda::make_nccl_generation(
+            base, "capacity-bad", 6201);
+        megamoe::cuda::CudaNotifyGenerationCoordinator bad(bad_session,
+                                                            execution);
+        bool rejected = false;
+        try {
+          (void)bad.run({bad_config, {1, {0}}, 1});
+        } catch (const megamoe::NotifyDispatchError &error) {
+          rejected = error.code() ==
+                     megamoe::NotifyErrorCode::ExpertCapacityExceeded;
+        }
+        require(rejected, "device expert capacity did not reject generation");
+        const auto bad_audit = bad.audit();
+        require(bad_audit.control_starts == 1 &&
+                    bad_audit.config_starts == 1 &&
+                    bad_audit.expert_count_starts == 1 &&
+                    bad_audit.packet_summary_starts == 1,
+                "device capacity failure occurred before complete collectives");
+        auto good_session = megamoe::cuda::make_nccl_generation(
+            base, "capacity-good", 6202);
+        megamoe::cuda::CudaNotifyGenerationCoordinator good(good_session,
+                                                             execution);
+        auto result = good.run({good_config, {1, {0}}, 1});
+        require(static_cast<bool>(result),
+                "valid exact-capacity recovery did not publish");
+      } catch (...) {
+        errors[rank] = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  for (const auto &error : errors)
+    if (error)
+      std::rethrow_exception(error);
+  std::cout << "[PASS] device capacity failure and exact-capacity recovery\n";
+}
+
 void test_twenty_failure_recovery_rounds() {
   constexpr std::uint32_t world = 2;
   const auto config = make_config(1, world, 8, 3, 4);
@@ -485,7 +551,8 @@ void test_twenty_failure_recovery_rounds() {
                         result.audit().packet_summary_starts == 1,
                     "recovery audit is not 1/1/1/1");
             require(result && !megamoe::serialize_dispatch_metadata(
-                                   result.dispatch().host()).empty(),
+                                   megamoe::cuda::download_device_metadata_for_validation(
+                                       result.dispatch(), execution)).empty(),
                     "recovery did not publish checked metadata");
           }
         }
@@ -722,7 +789,93 @@ void test_device_only_sanitizer_paths() {
   };
   run({3, {5, 1, 7, 1, 2, 3, 0, 7, 4}}, true);
   run({1, {0, 1, 8}}, false);
+  const auto wide_config = make_config(73, 1, 146, 6, 4);
+  auto wide_session =
+      megamoe::make_collective_session("device-wide-mask", 73, 5002);
+  auto wide_context = megamoe::make_rank_collective_context(
+      wide_session, 0, execution.token());
+  megamoe::RankRoutingInput wide_input{1, {0, 2, 64, 128, 144, 145}};
+  auto wide_routes = megamoe::cuda::upload_cuda_routes(
+      wide_input, wide_config.top_k, execution);
+  auto wide_plan = megamoe::cuda::query_cuda_notify_workspace(
+      wide_config, 0, wide_input.num_tokens, 4);
+  require(wide_plan.node_mask_words == 2,
+          "73-node workspace did not allocate multiword mask");
+  auto wide_workspace = megamoe::cuda::allocate_cuda_notify_workspace(
+      wide_plan, wide_context, execution);
+  auto wide_operation = megamoe::cuda::start_cuda_rank_local_notify(
+      wide_config, wide_context, execution, wide_routes,
+      std::move(wide_workspace));
+  require(wide_operation.wait_preflight().valid(),
+          "73-node device-only preflight failed");
+  auto short_plan = wide_plan;
+  --short_plan.device_bytes;
+  bool short_failed = false;
+  try {
+    (void)megamoe::cuda::allocate_cuda_notify_workspace(
+        short_plan, wide_context, execution);
+  } catch (const megamoe::NotifyDispatchError &) {
+    short_failed = true;
+  }
+  require(short_failed, "workspace capacity minus one byte did not fail");
   std::cout << "[PASS] device-only normal/error preflight sanitizer paths\n";
+}
+
+void test_device_dispatch_handle_lifetime() {
+  const auto config = make_config(1, 1, 8, 3, 4);
+  const megamoe::RankRoutingInput routes{2, {7, 1, 4, 0, 6, 2}};
+  auto execution = megamoe::cuda::make_cuda_execution("handle-exec", 0);
+  megamoe::cuda::DeviceDispatchHandle retained;
+  {
+    auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+    auto session = megamoe::cuda::make_nccl_session(
+        "handle-lifetime", 1, 0, 6100, 0, bootstrap);
+    megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                execution);
+    auto result = coordinator.run({config, routes, 10});
+    auto first_copy = result.dispatch();
+    retained = first_copy;
+    auto moved = std::move(first_copy);
+    require(!first_copy && moved, "device handle move state is unsafe");
+    const auto &identity = moved.identity();
+    const auto expectation = megamoe::cuda::DeviceDispatchViewExpectation{
+        6100, 0, 1, routes.num_tokens, config.top_k,
+        identity.config_digest_word0, identity.config_digest_word1};
+    const auto view = moved.checked_view(execution, expectation);
+    require(view.route_dst_row != nullptr &&
+                view.sizes.route_count == routes.selected_experts.size(),
+            "checked device view lost typed metadata");
+  }
+  require(static_cast<bool>(retained),
+          "device handle did not outlive coordinator/result");
+  const auto actual = megamoe::cuda::download_device_metadata_for_validation(
+      retained, execution);
+  const auto expected = megamoe::build_notify_dispatch_for_testing(
+      config, {routes}, "handle-lifetime", 6100);
+  require(megamoe::serialize_dispatch_metadata(actual) ==
+              megamoe::serialize_dispatch_metadata(expected.front()),
+          "retained device handle metadata changed after owner destruction");
+  bool mismatch_failed = false;
+  try {
+    (void)retained.checked_view(
+        execution,
+        {6101, 0, 1, routes.num_tokens, config.top_k,
+         retained.identity().config_digest_word0,
+         retained.identity().config_digest_word1});
+  } catch (const megamoe::NotifyDispatchError &) {
+    mismatch_failed = true;
+  }
+  require(mismatch_failed,
+          "cross-generation device view mismatch did not fail closed");
+  megamoe::cuda::DeviceDispatchHandle empty;
+  bool empty_failed = false;
+  try {
+    (void)empty.sizes();
+  } catch (const megamoe::NotifyDispatchError &) {
+    empty_failed = true;
+  }
+  require(empty_failed, "empty device handle accessor did not fail closed");
+  std::cout << "[PASS] immutable device handle copy/move/lifetime/view checks\n";
 }
 
 void run_rank(std::uint32_t rank, std::uint32_t nodes,
@@ -763,7 +916,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
                                                                 execution);
     auto result = coordinator.run({common_config, common_routes, 10});
-    std::cout << megamoe::serialize_dispatch_metadata(result.dispatch().host())
+    std::cout << megamoe::serialize_dispatch_metadata(
+                     megamoe::cuda::download_device_metadata_for_validation(
+                         result.dispatch(), execution))
               << '\n';
     return;
   }
@@ -812,7 +967,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 recovered.audit().packet_summary_starts == 1,
             "cross-host recovery failed");
     require(recovered && !megamoe::serialize_dispatch_metadata(
-                              recovered.dispatch().host()).empty(),
+                              megamoe::cuda::download_device_metadata_for_validation(
+                                  recovered.dispatch(), execution)).empty(),
             "cross-host recovery metadata missing");
     std::cout << "RECOVERY_OK rank=" << rank << " round=" << round
               << std::endl;
@@ -868,6 +1024,21 @@ void benchmark(std::uint32_t world) {
       {"pinned_allocation_us", &megamoe::cuda::GenerationSetupTimings::pinned_allocation_us},
       {"device_allocation_us", &megamoe::cuda::GenerationSetupTimings::device_allocation_us}};
   std::vector<std::vector<double>> setup_stage_samples(setup_stages.size());
+  using ExecutionMember =
+      double megamoe::cuda::GenerationExecutionTimings::*;
+  const std::vector<std::pair<const char *, ExecutionMember>> execution_stages{
+      {"local_mapping_us",
+       &megamoe::cuda::GenerationExecutionTimings::local_mapping_us},
+      {"control_config_us",
+       &megamoe::cuda::GenerationExecutionTimings::control_config_us},
+      {"expert_count_us",
+       &megamoe::cuda::GenerationExecutionTimings::expert_count_us},
+      {"packet_summary_us",
+       &megamoe::cuda::GenerationExecutionTimings::packet_summary_us},
+      {"device_materialization_us",
+       &megamoe::cuda::GenerationExecutionTimings::device_materialization_us}};
+  std::vector<std::vector<double>> execution_stage_samples(
+      execution_stages.size());
   megamoe::cuda::NcclWorkspaceUsage peak;
   // One communicator/session establishment per rank, once for the complete
   // 10+50 run. Samples are the ranks participating in that one establishment.
@@ -887,6 +1058,7 @@ void benchmark(std::uint32_t world) {
       double slow_setup = 0;
       double slow_steady = 0;
       std::vector<double> slow_setup_stages(setup_stages.size(), 0.0);
+      std::vector<double> slow_execution_stages(execution_stages.size(), 0.0);
       for (const auto &rank : result) {
         const auto rank_steady = rank.execution.steady_execution_us;
         const auto rank_setup = rank.setup.per_generation_setup_total_us;
@@ -898,6 +1070,10 @@ void benchmark(std::uint32_t world) {
         for (std::size_t stage = 0; stage < setup_stages.size(); ++stage)
           slow_setup_stages[stage] = std::max(
               slow_setup_stages[stage], rank.setup.*setup_stages[stage].second);
+        for (std::size_t stage = 0; stage < execution_stages.size(); ++stage)
+          slow_execution_stages[stage] = std::max(
+              slow_execution_stages[stage],
+              rank.execution.*execution_stages[stage].second);
         peak.device_bytes = std::max(peak.device_bytes,
                                      rank.workspace.device_bytes);
         peak.pinned_host_bytes = std::max(
@@ -935,6 +1111,9 @@ void benchmark(std::uint32_t world) {
       generation_end_to_end.push_back(slow_wall);
       for (std::size_t stage = 0; stage < setup_stages.size(); ++stage)
         setup_stage_samples[stage].push_back(slow_setup_stages[stage]);
+      for (std::size_t stage = 0; stage < execution_stages.size(); ++stage)
+        execution_stage_samples[stage].push_back(
+            slow_execution_stages[stage]);
     }
   }
   const auto steady_stats = summarize(steady);
@@ -943,6 +1122,9 @@ void benchmark(std::uint32_t world) {
   std::vector<Statistics> setup_stage_stats;
   for (auto &samples : setup_stage_samples)
     setup_stage_stats.push_back(summarize(std::move(samples)));
+  std::vector<Statistics> execution_stage_stats;
+  for (auto &samples : execution_stage_samples)
+    execution_stage_stats.push_back(summarize(std::move(samples)));
   std::cout << "BENCH world=" << world
             << " warmup=10 measured=50 aggregation=slowest-rank"
                " session_reused=true\n"
@@ -972,7 +1154,14 @@ void benchmark(std::uint32_t world) {
               << " min=" << stats.minimum << " max=" << stats.maximum
               << '\n';
   }
-  std::cout << "BENCH_JSON {\"schema\":3,\"warmup\":10,\"measured\":50,"
+  for (std::size_t stage = 0; stage < execution_stages.size(); ++stage) {
+    const auto &stats = execution_stage_stats[stage];
+    std::cout << "  " << execution_stages[stage].first << " mean="
+              << stats.mean << " p50=" << stats.p50 << " p95=" << stats.p95
+              << " min=" << stats.minimum << " max=" << stats.maximum
+              << '\n';
+  }
+  std::cout << "BENCH_JSON {\"schema\":4,\"warmup\":10,\"measured\":50,"
                "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
                "\"session_setup_sample\":\"one establishment; samples are ranks\","
                "\"one_time_session_setup_us\":{\"mean\":"
@@ -1004,6 +1193,16 @@ void benchmark(std::uint32_t world) {
               << stats.mean << ",\"p50\":" << stats.p50
               << ",\"p95\":" << stats.p95 << ",\"min\":"
               << stats.minimum << ",\"max\":" << stats.maximum << '}';
+  }
+  std::cout << "},\"execution_stages\":{";
+  for (std::size_t stage = 0; stage < execution_stages.size(); ++stage) {
+    if (stage != 0)
+      std::cout << ',';
+    const auto &stats = execution_stage_stats[stage];
+    std::cout << '\"' << execution_stages[stage].first
+              << "\":{\"mean\":" << stats.mean << ",\"p50\":" << stats.p50
+              << ",\"p95\":" << stats.p95 << ",\"min\":" << stats.minimum
+              << ",\"max\":" << stats.maximum << '}';
   }
   std::cout << "},\"workspace\":{\"control_slot\":"
             << peak.control_slot_bytes << ",\"config_wire\":"
@@ -1052,6 +1251,7 @@ int main(int argc, char **argv) {
       test_local(world);
       if (world == 2) {
         test_protocol_regressions();
+        test_device_capacity_failure_and_recovery();
         test_twenty_failure_recovery_rounds();
         test_config_wire_corruption(2, 0);
         test_config_wire_corruption(2, 1);
@@ -1059,6 +1259,7 @@ int main(int argc, char **argv) {
         test_exact_session_identity_agreement(true);
       }
       if (world == 1) {
+        test_device_dispatch_handle_lifetime();
         test_fault_injection();
         test_config_wire_corruption(1, 0);
       }

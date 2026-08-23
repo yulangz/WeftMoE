@@ -48,7 +48,6 @@ private:
                             const class ValidatedCollectiveHandle &,
                             const class ValidatedCollectiveHandle &);
   friend class testing::NotifyCorruptionHook;
-  friend class cuda::DeviceNotifyBridge;
 };
 
 LocalHistogramHandle

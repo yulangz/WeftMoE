@@ -5,7 +5,7 @@ available without CUDA or NCCL. The optional device slice requires NVCC, CUDA
 runtime/development files, NCCL headers, and a runtime NCCL library compatible
 with the installed driver/toolkit.
 
-## Observed stage-2 environment
+## Observed stage-3 environment
 
 Both the local host and `ssh -p 2222 root@10.10.19.233` were inspected without
 changing system configuration:
@@ -105,6 +105,8 @@ for comparison to the host handle. World 2 additionally runs five independent
 corruption from rank 0 and rank 1, and exact raw-session identity mismatches
 with equal display names/header summaries. World 1 runs the nine-point enqueue
 audit/lifecycle table and a self-corruption integrity check.
+The device-only sanitizer fixture additionally exercises a 73-node/two-word
+mask, an invalid expert, and a workspace plan shortened by exactly one byte.
 
 ## Real two-host NCCL
 
@@ -201,27 +203,37 @@ produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 
 | stage | mean | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| one-time NCCL session setup | 1717800 | 1710350 | 1757600 | 1681640 | 1757600 |
-| per-generation setup | 8664.04 | 5782.74 | 25916.2 | 5212.38 | 34520.4 |
-| setup-inclusive generation end-to-end | 105863 | 96360.8 | 167391 | 93290.3 | 204228 |
-| steady-state execution | 97963.7 | 90727.2 | 162027 | 88618.6 | 178385 |
-| config slot allocation | 1186.47 | 1184.98 | 1337.73 | 947.467 | 1453.19 |
-| count slot allocation | 605.592 | 602.807 | 632.688 | 574.326 | 653.741 |
-| summary slot allocation | 667.029 | 655.960 | 707.693 | 627.258 | 928.650 |
+| one-time NCCL session setup | 1498460 | 1493350 | 1521900 | 1480160 | 1521900 |
+| per-generation setup | 6802.10 | 5048.06 | 7650.09 | 4692.24 | 75345.9 |
+| setup-inclusive generation end-to-end | 44160.3 | 42178.3 | 47453.0 | 41608.7 | 112183 |
+| steady-state execution | 37975.4 | 37685.3 | 39134.4 | 36994.0 | 46557.1 |
+| local stable mapping | 163.953 | 157.280 | 173.920 | 145.472 | 425.344 |
+| control + exact config | 2706.39 | 2587.66 | 3128.04 | 2370.41 | 5261.28 |
+| expert-count AllGather | 169.175 | 151.201 | 237.208 | 139.624 | 688.331 |
+| packet-summary AllGather | 74.2332 | 69.633 | 84.599 | 65.502 | 181.090 |
+| device prefix/materialization | 33214.7 | 33214.9 | 33231.9 | 33189.6 | 33289.0 |
 
-The corresponding unique peak workspace was 21,617,215 device bytes and
-1,504,336 pinned bytes: route input 196,608; notify arena 21,361,407; notify
-pinned staging 1,445,136; control slot 4,608; config wire 3,584; config slot
-64,512; expert slot 49,152; summary slot 128. Final metadata is a 21,361,407-byte
+The corresponding unique peak workspace was 21,209,151 device bytes and
+34,888 pinned bytes: route input 196,608; notify arena 20,953,343; notify
+pinned status staging 328; control slot 4,608; config wire 3,584; config slot
+64,512; expert device slot 24,576; summary device slot 64. Final metadata is a 20,953,343-byte
 arena view and therefore is not added again. Seven CUDA events are reported;
 their opaque runtime allocation size is recorded as zero.
+
+The phase-2 same-accounting steady baseline was approximately 97.6 ms, of
+which roughly 69 ms was bulk D2H, host materialization, and bulk H2D. Stage 3
+reduces same-accounting steady mean to 38.0 ms and pinned workspace from about
+1.50 MiB to 34 KiB; production audit is `bulk route D2H / collective D2H /
+host materialize / metadata H2D = 0/0/0/0`. The current correctness kernel is
+single-threaded and still spends 33.2 ms in device prefix/descriptor generation;
+parallel scan/sort specialization is the next Notify optimization, not part of
+this semantic slice.
 
 The earlier approximately 197 ms number is not a comparable regression point:
 that runner rebuilt communicators every iteration and computed steady time by
 subtracting independently selected slowest-rank maxima. The corrected 98.0 ms
-mean uses one reused session and same-rank accounting, which is consistent with
-the earlier approximately 90 ms correctness baseline. No mapping or
-materialization algorithm was changed for this correction.
+mean used one reused session and same-rank accounting. The new 38.0 ms result
+uses that same corrected definition.
 
 ## Clean export
 

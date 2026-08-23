@@ -14,6 +14,9 @@ namespace megamoe {
 namespace testing {
 class NotifyCorruptionHook;
 }
+namespace cuda {
+class DeviceNotifyBridge;
+}
 
 class WorkspacePlan;
 class DispatchHandleFactory;
@@ -143,6 +146,7 @@ private:
     friend WorkspacePlan make_workspace_plan(const DispatchHandle&);
     friend void validate_workspace_plan(const DispatchHandle&, const WorkspacePlan&);
     friend class testing::NotifyCorruptionHook;
+    friend class cuda::DeviceNotifyBridge;
 };
 
 void validate_dispatch_metadata(const DispatchHandle& handle);

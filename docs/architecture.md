@@ -32,7 +32,7 @@ host/device local preflight
   -> exact decoded-field and byte agreement
   -> AllGather expert counts [world, num_experts]
   -> AllGather packet summaries [world, num_nodes]
-  -> pure materialization
+  -> device prefix/descriptor materialization
 ```
 
 The fixed header contains protocol/schema versions, a two-word diagnostic
@@ -93,8 +93,9 @@ There is no public integer address/owner pair and no public native communicator
 or stream integer. Backend subclasses can retrieve their own opaque state only
 through protected `CountExchange` accessors. The NCCL backend consumes its own
 opaque device lease and, after its CUDA event reaches completion, returns a
-checked typed `HostCountMatrix`. Generic metadata never obtains or dereferences
-a device address.
+backend-owned device completion lease. Host/fake backends return a checked
+typed `HostCountMatrix`. Generic metadata never obtains or dereferences a
+device address.
 
 A device lease records `rows`, `row_width`, checked `element_count`, and the
 backend-declared `capacity_elements`. Construction requires nonzero dimensions
@@ -139,16 +140,20 @@ After fixed control and exact config rounds, two data rounds are used:
 simulation of NCCL, GIN, LSA, or RDMA and accepts host buffers only.
 
 The coordinator-private NCCL backend is a correctness baseline using real
-`ncclComm_t`, `cudaStream_t`, `ncclAllGather`, pinned D2H staging, a completion
-event, and `ncclCommGetAsyncError`; all native objects stay in CUDA translation
-units. Its fixed control slot is always allocated. The capacity constructor
+`ncclComm_t`, `cudaStream_t`, `ncclAllGather`, a completion event, and
+`ncclCommGetAsyncError`; all native objects stay in CUDA translation units. Its
+fixed control/config slots use bounded pinned staging because those two small
+agreement rounds are host control-plane data. Expert-count and packet-summary
+slots remain device-only and successful waits publish opaque device completion
+leases rather than typed host matrices. The capacity constructor
 also preallocates count and summary slots before the measured hot path; the
 control-only constructor allocates agreed data slots after exact config.
-Its internal starts enqueue H2D, byte AllGather, D2H, and an event; waits check
-the event, NCCL async status, wire schema, configuration, and local failures.
+Control/config starts enqueue H2D, byte AllGather, bounded D2H, and an event;
+data starts enqueue device-to-device AllGather plus an event. Waits check the
+event, NCCL async status, wire schema, configuration, and local failures.
 If any pre-return enqueue step fails, it drains partially submitted stream work
 before releasing the typed input owner. `wait` synchronizes the event, checks
-the NCCL async error, then publishes typed host storage. NCCL has no
+the NCCL async error, then publishes the appropriate host or device lease. NCCL has no
 per-operation cancellation, so `cancel` safely drains that event without
 aborting the shared communicator.
 This backend is not the final same-rail/GIN implementation.
@@ -172,7 +177,7 @@ public headers.
 World-one or all-rank injection validates cleanup; a single-rank fatal NCCL or
 CUDA failure is a backend failure and is not claimed recoverable by agreement.
 
-### 3. Pure rank-local materialization
+### 3. Host oracle materialization
 
 Only successful wrapper completion can create an opaque immutable
 `ValidatedCollectiveHandle`. The framework, not the backend, copies the local
@@ -198,6 +203,9 @@ Remote token IDs/top-k slots are not copied into the destination handle.
 Outgoing fan-out descriptors own that reverse identity and remain immutable for
 the handle lifetime. A later real data/control transport must deliver the
 descriptor with its payload or retain equivalent dispatch-context state.
+
+This function remains the independent C++ host oracle and host-only production
+fallback. The CUDA generation coordinator does not call it.
 
 ## Ownership and lifetime
 
@@ -290,9 +298,10 @@ The CUDA frontend takes only the calling rank's device route matrix. Runtime
 shape, topology, calling rank, device, session generation, execution identity,
 and a collective-wide `max_tokens_per_rank` capacity are bound into
 `CudaNotifyWorkspacePlan`. Query arithmetic checks both integer and allocation
-limits. Allocation creates one device arena, one pinned host staging arena, and
+limits. Allocation creates one device arena, a bounded pinned status arena, and
 one completion event before the hot path; sort, scan, histograms, route fields,
-count matrices, descriptors, and final metadata are aligned subregions.
+descriptors, and final metadata are aligned subregions. NCCL count matrices
+remain in their own backend-owned device slots.
 
 For flat route index `i = token * top_k + slot`, the sort key is:
 
@@ -306,7 +315,9 @@ number, which is scattered back as `local_offset`. Atomics are limited to
 commutative histogram/summary accumulation and deterministic minimum-invalid-
 coordinate reporting; no atomic return order chooses a canonical row.
 
-After checked host materialization, one stream-ordered staging step fills:
+After NCCL data completion, one checked stream-ordered device kernel directly
+consumes `[source_rank, expert]` and `[source_rank, destination_node]` matrices
+and fills:
 
 - route destination row plus all original route arrays and node masks;
 - `[source_rank, expert]` counts, owned expert IDs/counts/prefixes, flattened
@@ -314,12 +325,27 @@ After checked host materialization, one stream-ordered staging step fills:
 - reverse-route records, packet headers, fan-out offsets/targets, and outgoing
   and incoming-proxy signal records.
 
-Every published `DeviceBufferLease` strongly owns the common workspace state.
+The kernel first validates collective row bounds, the calling-rank rows,
+checked 64-bit sums, expert/workspace capacities, and every output capacity.
+Only after those checks does it write variable-length records. Source ranks,
+destination ranks, experts, nodes, tokens, and top-k slots are traversed in
+fixed ascending order. Packet order is `(destination_node, local_token_id)` and
+fan-out consumes the device `combine_order`, which is expert-ID order.
+
+The POD record schema is layout version 1. It places 64-bit fields before
+32-bit fields and fixes every record size with compile-time assertions. The
+arena stores aligned offset/count/capacity subviews; count/summary matrices are
+separate backend-owned completion leases. Every published `DeviceBufferLease`
+strongly owns the common workspace state.
 Route input, workspace, output, execution stream, event, and session therefore
-remain alive through pending work and through the final `CudaDispatchHandle`.
-The controlled `validate_cuda_dispatch_metadata` diagnostic is implemented in
-the CUDA module and downloads every device field for tests; the generic
-metadata layer still cannot inspect a native pointer.
+remain alive through pending work and through the final
+`DeviceDispatchHandle`. Copies share those leases; the last copy releases the
+arena and NCCL completion resources. `checked_view` validates execution,
+generation, rank/world and shape before returning CUDA-only typed pointers.
+The explicit `download_device_metadata_for_validation` diagnostic downloads
+every field for tests and reconstructs a host `DispatchHandle`; the generic
+metadata layer still cannot inspect a native pointer and the production
+coordinator never invokes this API.
 
 ## Thread-safety contract
 

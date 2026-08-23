@@ -52,6 +52,16 @@ struct CudaCompletionLease final : BackendCompletionLeaseState {
   std::shared_ptr<const void> owner;
 };
 
+// Private CUDA-only access to an opaque generic lease. This type is not part of
+// any installed/public header.
+class CudaDeviceLeaseAccess final : public CountExchange {
+public:
+  std::unique_ptr<BackendCountExchangeOperation>
+  start(const CountExchangeRequest &) override;
+  static std::shared_ptr<const CudaBufferState>
+  checked(const DeviceBufferLease &lease, std::uint32_t expected_device);
+};
+
 void throw_cuda(const char *phase, cudaError_t error, std::uint32_t rank,
                 std::uint32_t world, const std::string &session,
                 std::uint64_t generation, ExchangeKind kind,

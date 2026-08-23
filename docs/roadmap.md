@@ -21,39 +21,50 @@
   scan, deterministic local offsets, device histograms, topology coordinates,
   multiword node masks, and token-node summary dedup.
 - Real NCCL AllGather correctness backend behind the opaque session/execution/
-  lease contract, with event completion, typed D2H result, async-error checks,
+  lease contract, with event completion, device result leases, async-error checks,
   and contextual CUDA/NCCL failures.
 - Fixed 256-byte little-endian control AllGather plus an exact canonical-config
   byte AllGather before every data collective; self-checking config envelope,
   exact original session identity, rank-0-baseline error selection,
   enqueue-point four-stage audit, and healthy-communicator recovery.
-- Explicit capacity-bound workspace and complete device metadata staging for
-  later forward/backward consumers; no hot-path device allocation.
+- Explicit capacity-bound workspace for later forward/backward consumers; no
+  hot-path device allocation.
 - Single-GPU, local 2/8-GPU, and real two-host 2/16-rank full-field comparisons
   against host production and the Python oracle, plus deterministic repeats.
 
-The correctness slice is implemented; acceptance remains focused on exhaustive
-multi-host protocol replay and performance evidence. Still open inside the
-Notify area: optimized device-only global prefix and
-descriptor materialization, hierarchical/GIN count exchange, graph capture,
-and SM90-specialized performance tuning. The current controlled D2H plus host
-materializer is the correctness boundary, not a claimed final data plane.
+The correctness and distributed agreement slice is complete.
 
-## Phase 3 — single-node forward persistent MegaKernel
+## Phase 3 — all-device metadata materialization complete
+
+- NCCL count and summary matrices remain in backend-owned device completion
+  leases; the production path performs no bulk matrix/route download.
+- Checked device-side source-rank/expert prefix, canonical rows, owned-expert
+  prefixes, M tiles, reverse routes, multiword masks, packet/fan-out descriptors,
+  and expected signals.
+- Versioned immutable `DeviceDispatchHandle`, shared arena/completion lifetime,
+  checked CUDA typed view, and explicit test-only metadata download.
+- Full-field host/Python oracle comparison, 25 fixed seeds, 20 deterministic
+  repeats, world 1/2/8 and two-host validation.
+
+Still open inside Notify: parallelized prefix/descriptor specialization,
+hierarchical/GIN count exchange, graph capture, and SM90-specific tuning. These
+may replace the baseline kernel without changing the layout semantics.
+
+## Phase 4 — single-node forward persistent MegaKernel
 
 - Canonical activation dispatch, tile scoreboard, FC1 + SwiGLU, FC2, fixed-order
   combine, and partial-M tiles.
 - Release/acquire scoreboard publication and generation-safe workspace reuse.
 - H200 tile/worker autotune without changing canonical mapping.
 
-## Phase 4 — multi-node forward
+## Phase 5 — multi-node forward
 
 - Same-rail RDMA proxy using the enforced homogeneous topology.
 - Bounded ingress rings, credits, sequence numbers, node-level payload dedup,
   and descriptor delivery/retention.
 - Packet aggregation tuning with explicit summary counts and unchanged rows.
 
-## Phase 5 — backward persistent MegaKernel
+## Phase 6 — backward persistent MegaKernel
 
 - Reuse the exact forward handle for dY dispatch and dX/dGate combine.
 - Cache/no-FC1-output-cache paths, fused SwiGLU backward, dX, dW1, and dW2.

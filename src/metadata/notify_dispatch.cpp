@@ -803,7 +803,19 @@ void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
         metadata_failure(NotifyErrorCode::InvalidHandle, phase,
                          "outgoing.reverse_routes", rank,
                          "canonical route identity", "mismatch",
-                         "route=" + std::to_string(flat));
+                         "route=" + std::to_string(flat) +
+                             ", actual_source=" +
+                             std::to_string(reverse.source_rank) +
+                             ", actual_token=" +
+                             std::to_string(reverse.local_token_id) +
+                             ", actual_slot=" +
+                             std::to_string(reverse.topk_slot) +
+                             ", actual_expert=" +
+                             std::to_string(reverse.expert_id) +
+                             ", actual_destination=" +
+                             std::to_string(reverse.destination_rank) +
+                             ", actual_row=" +
+                             std::to_string(reverse.dst_row));
       }
       const auto mask_base = checked_size(
           checked_mul(token, expected_mask_words, "dispatch mask base"),
@@ -1433,28 +1445,12 @@ build_rank_local_histogram(const RuntimeConfig &config,
   return LocalHistogramHandle(std::move(local));
 }
 
-LocalHistogramHandle cuda::DeviceNotifyBridge::make_local(
-    const RuntimeConfig &config, const RankCollectiveContext &context,
-    std::uint64_t num_tokens, SourceRouteMetadata outgoing,
-    std::vector<std::uint64_t> expert_counts,
-    std::vector<std::uint64_t> packet_counts,
-    DeviceBufferLease device_expert_counts,
-    DeviceBufferLease device_packet_counts) {
-  auto local = std::make_shared<LocalHistogramHandle::Impl>();
-  local->config = config;
-  local->context = context;
-  local->outgoing = std::move(outgoing);
-  local->outgoing.num_tokens = num_tokens;
-  local->local_expert_count =
-      make_host_integer_row(std::move(expert_counts));
-  local->packet_count_by_destination_node =
-      make_host_integer_row(std::move(packet_counts));
-  local->device_expert_count = std::move(device_expert_counts);
-  local->device_packet_count = std::move(device_packet_counts);
-  local->provenance = std::make_shared<const std::uint8_t>(0);
-  LocalHistogramHandle result(std::move(local));
-  validate_local_structure(result);
-  return result;
+DispatchHandle cuda::DeviceNotifyBridge::make_validation_dispatch(
+    DispatchMetadata metadata) {
+  auto value = std::make_shared<DispatchMetadata>(std::move(metadata));
+  value->identity.content_hash = hash_metadata(*value);
+  return DispatchHandle(std::move(value),
+                        std::make_shared<DispatchHandle::ProvenanceToken>());
 }
 
 CollectiveOperation start_count_exchange(const LocalHistogramHandle &local,
