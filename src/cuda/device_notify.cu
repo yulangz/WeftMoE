@@ -2616,8 +2616,7 @@ DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
     invalid("phase=device-view, field=handle/execution, rank=n/a, "
             "expected=valid, actual=empty");
   const auto &id = impl_->identity;
-  if (!impl_->context.execution().same_instance(execution.token()) ||
-      id.generation != expected.generation ||
+  if (id.generation != expected.generation ||
       id.calling_rank != expected.calling_rank ||
       id.world_size != expected.world_size ||
       id.num_tokens != expected.num_tokens || id.top_k != expected.top_k)
