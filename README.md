@@ -107,7 +107,11 @@ never placed in argv, environment variables, shell commands, stdout/stderr, or
 temporary files. Aggregated diagnostics are additionally scrubbed for raw,
 arbitrary-case hex, standard/URL-safe padded or unpadded base64, and the retired
 text marker form. The same rules apply to every nonempty prefix received before
-a malformed or truncated frame fails.
+a malformed or truncated frame fails. On the C++ side, ownership of each pipe
+descriptor is transferred to a move-only one-shot channel. The channel closes
+on every terminal path and cannot be read or written again; in particular, byte
+129 makes the input terminal immediately rather than leaving residual bytes for
+a second frame.
 
 Canonical config is an explicit little-endian envelope: `magic`, wire version,
 64-byte header length, payload length, two zero reserved words, payload

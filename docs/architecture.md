@@ -260,7 +260,14 @@ Bootstrap transport is an exact-frame protocol. Python loops on binary
 progress or short capacity, and always closes stdin. C++ symmetrically retries
 partial/EINTR reads and writes; after byte 128 the receiver requires EOF and
 rejects byte 129. The sender closes immediately after the frame, while the
-launcher's generation timeout bounds the receiver's EOF wait.
+launcher's generation timeout bounds the receiver's EOF wait. C++ production
+transfers the descriptor into a move-only RAII channel with explicit
+`Open/Consumed/Failed/Closed` state. Success, short/oversize input, non-EINTR
+I/O failure, cancellation, and destruction all relinquish the descriptor
+exactly once. Oversize detection closes immediately at byte 129 without
+draining; every terminal state rejects reuse, so residual bytes cannot become a
+second bootstrap frame and a recycled descriptor number cannot be touched by
+the old channel.
 
 ## Benchmark accounting
 

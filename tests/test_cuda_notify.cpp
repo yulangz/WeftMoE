@@ -741,16 +741,17 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require(bootstrap_output_fd >= 0 && bootstrap_input_fd < 0,
             "rank 0 requires only a bootstrap output descriptor");
     bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
-    megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap,
-                                              bootstrap_output_fd);
-    require(::close(bootstrap_output_fd) == 0,
-            "failed to close bootstrap output descriptor");
+    megamoe::cuda::NcclBootstrapOutputChannel channel(bootstrap_output_fd);
+    channel.write(bootstrap);
+    require(channel.state() == megamoe::cuda::BootstrapChannelState::Consumed,
+            "bootstrap output channel did not reach Consumed");
   } else {
     require(bootstrap_input_fd >= 0 && bootstrap_output_fd < 0,
             "nonzero rank requires only a bootstrap input descriptor");
-    bootstrap = megamoe::cuda::NcclBootstrapIo::read_fd(bootstrap_input_fd);
-    require(::close(bootstrap_input_fd) == 0,
-            "failed to close bootstrap input descriptor");
+    megamoe::cuda::NcclBootstrapInputChannel channel(bootstrap_input_fd);
+    bootstrap = channel.read();
+    require(channel.state() == megamoe::cuda::BootstrapChannelState::Consumed,
+            "bootstrap input channel did not reach Consumed");
   }
   auto execution = megamoe::cuda::make_cuda_execution(
       "multinode-exec-" + std::to_string(rank), local_rank);

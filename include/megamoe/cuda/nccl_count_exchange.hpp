@@ -11,7 +11,8 @@
 namespace megamoe::cuda {
 
 class NcclSession;
-class NcclBootstrapIo;
+class NcclBootstrapInputChannel;
+class NcclBootstrapOutputChannel;
 
 class NcclBootstrapId {
 public:
@@ -23,7 +24,8 @@ private:
       : bytes_(std::move(bytes)) {}
   std::vector<std::uint8_t> bytes_;
   friend NcclBootstrapId make_nccl_bootstrap_id();
-  friend class NcclBootstrapIo;
+  friend class NcclBootstrapInputChannel;
+  friend class NcclBootstrapOutputChannel;
   friend NcclSession make_nccl_session(std::string, std::uint32_t,
                                        std::uint32_t, std::uint64_t,
                                        std::uint32_t,

@@ -230,7 +230,8 @@ void throw_nccl(const char *phase, ncclResult_t error, std::uint32_t rank,
 } // namespace internal
 
 NcclBootstrapId make_nccl_bootstrap_id() {
-  static_assert(sizeof(ncclUniqueId) == NcclBootstrapIo::kWireBytes,
+  static_assert(sizeof(ncclUniqueId) ==
+                    NcclBootstrapInputChannel::kWireBytes,
                 "bootstrap frame width must match ncclUniqueId");
   ncclUniqueId id{};
   internal::throw_nccl("bootstrap", ncclGetUniqueId(&id), 0, 1,

@@ -8,23 +8,68 @@
 
 namespace megamoe::cuda {
 
-// Private launcher/test bridge. Bootstrap material is transferred only as a
-// fixed-width binary record over an already-open descriptor; no text
-// representation is exposed by the public NCCL API.
-class NcclBootstrapIo {
+enum class BootstrapChannelState { Open, Consumed, Failed, Closed };
+
+// Private launcher/test bridge. Construction transfers descriptor ownership.
+// Both directions are move-only one-shot channels and close before entering a
+// terminal state; no text representation is exposed by the public NCCL API.
+class NcclBootstrapInputChannel {
 public:
   static constexpr std::size_t kWireBytes = 128U;
-  static void write_fd(const NcclBootstrapId &, int fd);
-  static NcclBootstrapId read_fd(int fd);
+  explicit NcclBootstrapInputChannel(int owned_fd);
+  ~NcclBootstrapInputChannel() noexcept;
+  NcclBootstrapInputChannel(const NcclBootstrapInputChannel &) = delete;
+  NcclBootstrapInputChannel &
+  operator=(const NcclBootstrapInputChannel &) = delete;
+  NcclBootstrapInputChannel(NcclBootstrapInputChannel &&) noexcept;
+  NcclBootstrapInputChannel &
+  operator=(NcclBootstrapInputChannel &&) noexcept;
+
+  NcclBootstrapId read();
+  void cancel() noexcept;
+  BootstrapChannelState state() const noexcept { return state_; }
+  int native_fd_for_testing() const noexcept { return fd_; }
+
+private:
+  int finish(BootstrapChannelState) noexcept;
+  void require_open(const char *operation) const;
+  int fd_ = -1;
+  BootstrapChannelState state_ = BootstrapChannelState::Closed;
+};
+
+class NcclBootstrapOutputChannel {
+public:
+  static constexpr std::size_t kWireBytes = 128U;
+  explicit NcclBootstrapOutputChannel(int owned_fd);
+  ~NcclBootstrapOutputChannel() noexcept;
+  NcclBootstrapOutputChannel(const NcclBootstrapOutputChannel &) = delete;
+  NcclBootstrapOutputChannel &
+  operator=(const NcclBootstrapOutputChannel &) = delete;
+  NcclBootstrapOutputChannel(NcclBootstrapOutputChannel &&) noexcept;
+  NcclBootstrapOutputChannel &
+  operator=(NcclBootstrapOutputChannel &&) noexcept;
+
+  void write(const NcclBootstrapId &);
+  void cancel() noexcept;
+  BootstrapChannelState state() const noexcept { return state_; }
+  int native_fd_for_testing() const noexcept { return fd_; }
+
+private:
+  int finish(BootstrapChannelState) noexcept;
+  void require_open(const char *operation) const;
+  int fd_ = -1;
+  BootstrapChannelState state_ = BootstrapChannelState::Closed;
 };
 
 namespace testing {
 using BootstrapReadHook = std::ptrdiff_t (*)(int, void *, std::size_t);
 using BootstrapWriteHook = std::ptrdiff_t (*)(int, const void *, std::size_t);
+using BootstrapCloseHook = int (*)(int);
 
 // Process-local test seam for exercising EINTR, short I/O, and zero progress.
-// Production calls leave both hooks null and use POSIX read/write directly.
-void set_bootstrap_io_hooks(BootstrapReadHook, BootstrapWriteHook) noexcept;
+// Production calls leave all hooks null and use POSIX read/write/close.
+void set_bootstrap_io_hooks(BootstrapReadHook, BootstrapWriteHook,
+                            BootstrapCloseHook = nullptr) noexcept;
 void clear_bootstrap_io_hooks() noexcept;
 
 enum class NcclFaultPoint {
