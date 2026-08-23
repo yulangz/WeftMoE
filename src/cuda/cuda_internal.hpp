@@ -32,6 +32,8 @@ struct CudaAllocation {
   void *host_ptr = nullptr;
   std::size_t device_bytes = 0;
   std::size_t host_bytes = 0;
+  cudaEvent_t mapping_start = nullptr;
+  cudaEvent_t mapping_complete = nullptr;
   cudaEvent_t completion = nullptr;
   ~CudaAllocation() noexcept;
 };

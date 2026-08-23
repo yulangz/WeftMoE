@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Launch real NCCL ranks on this host and 10.10.19.233 and cross-check all fields."""
+"""Launch a two-host NCCL protocol test with explicit remote/network options."""
 
 import argparse
 import json
 import os
+import queue
 import shlex
 import subprocess
 import sys
+import time
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reference.notify_dispatch_reference import (
     ReferenceConfig,
@@ -16,7 +22,6 @@ from reference.notify_dispatch_reference import (
 
 
 MASK64 = (1 << 64) - 1
-NCCL_CUDA12_DIR = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib"
 
 
 def seeded_inputs(world, experts, top_k, seed, max_tokens=10):
@@ -59,7 +64,7 @@ def config_for(gpus_per_node):
     )
 
 
-def runner_args(binary, rank, gpus_per_node, seed, bootstrap):
+def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario):
     return [
         binary,
         "--rank-runner",
@@ -69,91 +74,200 @@ def runner_args(binary, rank, gpus_per_node, seed, bootstrap):
         "--local-rank", str(rank % gpus_per_node),
         "--seed", str(seed),
         "--id", bootstrap,
+        "--scenario", scenario,
     ]
+
+
+def environment_overrides(args):
+    overrides = {"NCCL_DEBUG": args.nccl_debug}
+    if args.socket_ifname:
+        overrides["NCCL_SOCKET_IFNAME"] = args.socket_ifname
+    if args.disable_ib:
+        overrides["NCCL_IB_DISABLE"] = "1"
+    return overrides
+
+
+def local_environment(args):
+    environment = os.environ.copy()
+    environment.update(environment_overrides(args))
+    if args.nccl_lib_dir:
+        prior = environment.get("LD_LIBRARY_PATH", "")
+        environment["LD_LIBRARY_PATH"] = args.nccl_lib_dir + (
+            (":" + prior) if prior else ""
+        )
+    return environment
+
+
+def remote_command(args, runner):
+    overrides = environment_overrides(args)
+    if args.nccl_lib_dir:
+        overrides["LD_LIBRARY_PATH"] = args.nccl_lib_dir
+    command = ["env", *(f"{key}={value}" for key, value in overrides.items()), *runner]
+    return [
+        "ssh", "-o", "BatchMode=yes", "-p", str(args.port), args.remote,
+        "exec " + shlex.join(command),
+    ]
+
+
+def read_bootstrap(process, timeout):
+    result = queue.Queue(maxsize=1)
+
+    def reader():
+        prefix = []
+        for line in iter(process.stdout.readline, ""):
+            prefix.append(line)
+            if line.startswith("BOOTSTRAP "):
+                result.put((line.split(" ", 1)[1].strip(), "".join(prefix)))
+                return
+        result.put((None, "".join(prefix)))
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        bootstrap, prefix = result.get(timeout=timeout)
+    except queue.Empty as error:
+        raise RuntimeError(
+            "rank 0 did not publish a bootstrap ID before timeout"
+        ) from error
+    if not bootstrap:
+        raise RuntimeError(
+            f"rank 0 exited before publishing bootstrap ID; stdout={prefix[-2000:]}"
+        )
+    return bootstrap, prefix
+
+
+def stop_processes(processes):
+    for _rank, process, _prefix in processes:
+        if process.poll() is None:
+            process.terminate()
+    deadline = time.monotonic() + 5.0
+    for _rank, process, _prefix in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                process.kill()
+    for _rank, process, _prefix in processes:
+        if process.poll() is None:
+            process.wait()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
+    parser.add_argument("--remote", required=True,
+                        help="explicit SSH destination, for example user@host")
     parser.add_argument("--remote-binary", required=True)
     parser.add_argument("--gpus-per-node", type=int, required=True)
-    parser.add_argument("--remote", default="root@10.10.19.233")
-    parser.add_argument("--port", default="2222")
+    parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--seed", type=lambda value: int(value, 0), default=0x4D554C54)
     parser.add_argument("--nccl-debug", default="WARN")
+    parser.add_argument("--nccl-lib-dir",
+                        help="optional libnccl directory on both hosts")
+    parser.add_argument("--socket-ifname",
+                        help="optional NCCL_SOCKET_IFNAME override")
+    parser.add_argument("--disable-ib", action="store_true",
+                        help="set NCCL_IB_DISABLE=1 explicitly")
+    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--scenario",
+        choices=("valid", "out_of_range", "duplicate", "max_mismatch", "over_capacity"),
+        default="valid",
+    )
     args = parser.parse_args()
     if args.gpus_per_node not in (1, 8):
         raise SystemExit("gpus-per-node must be 1 or 8 for the acceptance topology")
 
-    environment = os.environ.copy()
-    prior = environment.get("LD_LIBRARY_PATH", "")
-    environment["LD_LIBRARY_PATH"] = NCCL_CUDA12_DIR + ((":" + prior) if prior else "")
-    environment["NCCL_DEBUG"] = args.nccl_debug
-    environment["NCCL_SOCKET_IFNAME"] = "=eth0"
-    # The two hosts expose different external IB plugin availability. Force the
-    # common real socket transport so both ranks select the same backend.
-    environment["NCCL_IB_DISABLE"] = "1"
+    environment = local_environment(args)
     world = 2 * args.gpus_per_node
     processes = []
-    rank0_command = runner_args(args.binary, 0, args.gpus_per_node,
-                                args.seed, "GENERATE")
-    rank0_process = subprocess.Popen(
-        rank0_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=environment,
-    )
-    bootstrap_line = rank0_process.stdout.readline().strip()
-    if not bootstrap_line.startswith("BOOTSTRAP "):
-        stderr = rank0_process.stderr.read()
-        rank0_process.kill()
-        raise RuntimeError(
-            f"rank 0 failed to publish bootstrap ID: {bootstrap_line}; {stderr}"
+    outputs = []
+    try:
+        rank0 = subprocess.Popen(
+            runner_args(args.binary, 0, args.gpus_per_node, args.seed,
+                        "GENERATE", args.scenario),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
         )
-    bootstrap = bootstrap_line.split(" ", 1)[1]
-    processes.append((0, rank0_process))
-    for rank in range(1, world):
-        if rank < args.gpus_per_node:
-            command = runner_args(args.binary, rank, args.gpus_per_node,
-                                  args.seed, bootstrap)
-        else:
-            remote_runner = runner_args(args.remote_binary, rank,
-                                        args.gpus_per_node, args.seed, bootstrap)
-            remote_command = [
-                "env",
-                f"LD_LIBRARY_PATH={NCCL_CUDA12_DIR}",
-                f"NCCL_DEBUG={args.nccl_debug}",
-                "NCCL_SOCKET_IFNAME==eth0",
-                "NCCL_IB_DISABLE=1",
-                *remote_runner,
-            ]
-            command = [
-                "ssh", "-p", args.port, args.remote,
-                shlex.join(remote_command),
-            ]
-        processes.append((rank, subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=environment,
-        )))
+        processes.append((0, rank0, ""))
+        bootstrap, prefix = read_bootstrap(rank0, min(args.timeout, 60.0))
+        processes[0] = (0, rank0, prefix)
+
+        for rank in range(1, world):
+            runner = runner_args(
+                args.binary if rank < args.gpus_per_node else args.remote_binary,
+                rank, args.gpus_per_node, args.seed, bootstrap, args.scenario,
+            )
+            command = runner if rank < args.gpus_per_node else remote_command(args, runner)
+            processes.append((rank, subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            ), ""))
+
+        deadline = time.monotonic() + args.timeout
+        for rank, process, prefix in processes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, args.timeout)
+            stdout, stderr = process.communicate(timeout=remaining)
+            outputs.append((rank, process.returncode, prefix + stdout, stderr))
+    finally:
+        stop_processes(processes)
+
+    runtime_lines = []
+    for rank, _returncode, stdout, _stderr in outputs:
+        evidence = [line for line in stdout.splitlines()
+                    if line.startswith("NCCL_RUNTIME ")]
+        if len(evidence) != 1:
+            raise RuntimeError(f"rank={rank} missing unique NCCL runtime evidence")
+        runtime_lines.append(evidence[0])
+    print("\n".join(runtime_lines))
+
+    if args.scenario != "valid":
+        errors = []
+        failures = []
+        for rank, returncode, stdout, stderr in outputs:
+            markers = [line.removeprefix("CONTROL_ERROR ")
+                       for line in stdout.splitlines()
+                       if line.startswith("CONTROL_ERROR ")]
+            recovered = f"RECOVERY_OK rank={rank}" in stdout
+            if returncode == 0 or len(markers) != 1 or not recovered:
+                failures.append(
+                    f"rank={rank} exit={returncode}, control_errors={len(markers)}, "
+                    f"recovered={recovered}; stdout={stdout[-4000:]}; stderr={stderr[-4000:]}"
+                )
+            elif "origin_rank=1" not in markers[0]:
+                failures.append(f"rank={rank} error lacks origin_rank=1: {markers[0]}")
+            errors.append(markers[0] if markers else "")
+        if failures:
+            raise RuntimeError("invalid protocol launch failed:\n" + "\n".join(failures))
+        if len(set(errors)) != 1:
+            raise AssertionError(f"ranks selected different errors: {errors}")
+        print(
+            f"[PASS] real cross-host control rejection/recovery: scenario={args.scenario}, "
+            f"world={world}, error={errors[0]}"
+        )
+        return
 
     actual = [None] * world
     failures = []
-    for rank, process in processes:
-        try:
-            stdout, stderr = process.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            failures.append(f"rank={rank} timed out; stderr={stderr[-2000:]}")
-            continue
-        if process.returncode:
+    for rank, returncode, stdout, stderr in outputs:
+        if returncode:
             failures.append(
-                f"rank={rank} exit={process.returncode}; "
-                f"stdout={stdout[-20000:]}; stderr={stderr[-20000:]}"
+                f"rank={rank} exit={returncode}; stdout={stdout[-10000:]}; "
+                f"stderr={stderr[-10000:]}"
             )
             continue
         lines = [line for line in stdout.splitlines() if line.startswith("{")]
         if len(lines) != 1:
             failures.append(
-                f"rank={rank} expected one JSON line, got {len(lines)}: {stdout[-2000:]}"
+                f"rank={rank} expected one metadata JSON line, got {len(lines)}: "
+                f"{stdout[-4000:]}"
             )
             continue
         actual[rank] = json.loads(lines[0])
@@ -164,23 +278,23 @@ def main():
     routes = seeded_inputs(world, config.num_experts, config.top_k, args.seed)
     expected = build_reference_all(config, routes, "cuda-multinode", 701)
     if actual != expected:
-        for rank, (lhs, rhs) in enumerate(zip(actual, expected)):
-            if lhs != rhs:
-                raise AssertionError(f"multinode full-field mismatch at rank={rank}")
-        raise AssertionError("multinode full-field mismatch")
-    remote_nonempty = any(routes[rank] for rank in range(args.gpus_per_node, world))
-    if not remote_nonempty:
+        mismatch = next(rank for rank, pair in enumerate(zip(actual, expected))
+                        if pair[0] != pair[1])
+        raise AssertionError(f"multinode full-field mismatch at rank={mismatch}")
+    if not any(routes[rank] for rank in range(args.gpus_per_node, world)):
         raise AssertionError("fixture did not contain any remote-node routes")
     print(
-        f"[PASS] real cross-host NCCL AllGather: nodes=2, "
-        f"gpus_per_node={args.gpus_per_node}, world={world}, "
-        f"full-field C++/Python match"
+        f"[PASS] real cross-host NCCL control/count/summary: nodes=2, "
+        f"gpus_per_node={args.gpus_per_node}, world={world}, full-field match"
     )
 
 
 if __name__ == "__main__":
     try:
         main()
+    except subprocess.TimeoutExpired as error:
+        print(f"[FAIL] rank launch timed out after {error.timeout}s", file=sys.stderr)
+        raise SystemExit(124)
     except Exception as error:
         print(f"[FAIL] {error}", file=sys.stderr)
         raise

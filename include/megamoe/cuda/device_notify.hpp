@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "megamoe/api/notify_dispatch.hpp"
+#include "megamoe/cuda/control_protocol.hpp"
 
 namespace megamoe::cuda {
 
@@ -18,6 +19,7 @@ class CudaDispatchHandle;
 class CudaRouteInput;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
+class CudaNotifyPreflight;
 namespace internal {
 struct CudaExecutionState;
 std::shared_ptr<const CudaExecutionState>
@@ -56,6 +58,7 @@ public:
   std::uint64_t num_tokens() const;
   std::uint32_t top_k() const;
   std::uint64_t route_count() const;
+  std::uint64_t device_bytes() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -144,6 +147,25 @@ private:
       const CudaDispatchHandle &, const CudaExecution &);
 };
 
+// Completion of local CUDA validation. Predictable route/config errors are
+// represented as data so the rank can still join the fixed control collective.
+class CudaNotifyPreflight {
+public:
+  CudaNotifyPreflight() = default;
+  const LocalPreflightStatus &status() const;
+  double device_mapping_us() const;
+  bool valid() const;
+  const CudaLocalNotifyHandle &local() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit CudaNotifyPreflight(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class CudaNotifyOperation;
+};
+
 class CudaNotifyOperation {
 public:
   CudaNotifyOperation();
@@ -152,6 +174,7 @@ public:
   CudaNotifyOperation &operator=(const CudaNotifyOperation &) = delete;
   CudaNotifyOperation(CudaNotifyOperation &&) noexcept;
   CudaNotifyOperation &operator=(CudaNotifyOperation &&) noexcept;
+  CudaNotifyPreflight wait_preflight();
   CudaLocalNotifyHandle wait();
   void cancel();
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }

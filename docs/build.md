@@ -95,21 +95,40 @@ Build or copy the same clean-export binary to both hosts, then run:
 ```bash
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
+  --remote root@10.10.19.233 --port 2222 \
   --remote-binary /absolute/remote/test_cuda_notify \
-  --gpus-per-node 1
+  --gpus-per-node 1 \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --socket-ifname '=eth0' --disable-ib
 
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
+  --remote root@10.10.19.233 --port 2222 \
   --remote-binary /absolute/remote/test_cuda_notify \
-  --gpus-per-node 8
+  --gpus-per-node 8 \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --socket-ifname '=eth0' --disable-ib
+
+# Timeout-bounded distributed rejection followed by recovery on the same comm.
+PYTHONPATH=. python3 tests/run_multinode_nccl.py \
+  --binary ./build-cuda/test_cuda_notify \
+  --remote root@10.10.19.233 --port 2222 \
+  --remote-binary /absolute/remote/test_cuda_notify \
+  --gpus-per-node 1 --scenario out_of_range \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --socket-ifname '=eth0' --disable-ib
 ```
 
 The launcher starts rank 0 locally and keeps the NCCL bootstrap owner alive,
-then starts the remaining local and remote ranks. It sets `NCCL_IB_DISABLE=1`
-and selects `eth0` because the two hosts expose different external IB plugin
-availability; this is still a real cross-host NCCL Socket collective, not the
-host fake. It compares each of the 2 or 16 rank results against the independent
-Python oracle.
+then starts the remaining local and remote ranks. `--remote` is mandatory.
+Library directory, socket interface, and IB disabling are optional and inherit
+the process/remote environment unless explicitly supplied. The values above are
+an example for the inspected environment, not launcher defaults. Arguments are
+shell-quoted as individual remote `env` entries; timeout/error cleanup
+terminates every still-owned local SSH/process handle and the launcher creates
+no remote temporary file. It compares each valid 2/16-rank result against the
+Python oracle. Every rank also reports header version, `ncclGetVersion` runtime
+version, `dladdr`-resolved library path, and active network overrides.
 
 Explicit preload is required in the current container because another injected
 runtime otherwise precedes ASan.
@@ -140,13 +159,35 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
   build-cuda/test_cuda_notify --bench 8
 ```
 
-On the inspected local 8-GPU host for `tokens/rank=8192`, `experts=384`,
-`top_k=6`, one warmup plus five measured iterations reported the maximum-rank
-averages: device mapping `4573.86 us`, two AllGather rounds `14131.8 us`,
-typed D2H/host materialization/device staging `67488 us`, end-to-end
-`92960.8 us`, and device+pinned workspace peak `22806543` bytes. Host
-materialization dominates and is an explicit optimization target; there is no
-per-route allocation, synchronization, or host-device round trip.
+The benchmark performs 10 warmups and 50 measured iterations. It reports mean,
+P50, P95, min, and max for the slowest rank of every iteration, separating CUDA
+event mapping time, host mapping wall time, control/count/summary completion,
+materialization/staging wall time, and end-to-end wall time. `BENCH_JSON` is the
+same result in machine-readable form. Workspace categories include route input,
+device arena, pinned staging, NCCL control/data device and pinned slots, and the
+logical final metadata resident in the arena (not double-counted in unique
+peak). Mapping has no per-route copy, allocation, or synchronization; NCCL slot
+allocation occurs at generation setup or after control agreement when the
+control-only constructor is selected.
+
+On the inspected local 8-GPU host, the slowest-rank statistics in microseconds
+were:
+
+| stage | mean | P50 | P95 | min | max |
+|---|---:|---:|---:|---:|---:|
+| mapping CUDA event | 182.900 | 154.176 | 307.744 | 135.328 | 371.072 |
+| mapping host wall | 4702.140 | 4690.630 | 4868.230 | 4553.200 | 4989.240 |
+| control completion | 10177.300 | 9419.910 | 15187.500 | 7010.460 | 20758.900 |
+| expert-count completion | 380.409 | 384.360 | 483.669 | 230.354 | 666.370 |
+| packet-summary completion | 38.005 | 35.905 | 54.462 | 29.307 | 66.489 |
+| all collectives | 10382.400 | 9669.850 | 15354.300 | 7183.200 | 20944.100 |
+| D2H/materialize/H2D wall | 68310.100 | 67653.700 | 71966.000 | 66581.300 | 72085.200 |
+| end-to-end host wall | 90229.500 | 89104.800 | 98051.200 | 86110.200 | 111809.000 |
+
+Peak unique workspace was 23,057,039 bytes: route input 196,608; device
+arena 21,361,407; pinned staging 1,445,136; NCCL device slots 26,944; NCCL
+pinned slots 26,944. Final device metadata resides in the arena and is not
+added twice.
 
 ## Clean export
 

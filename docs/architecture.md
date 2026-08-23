@@ -20,7 +20,33 @@ proxy(destination_node, source_rank) =
 Node IDs are dense. Heterogeneous GPU counts and missing rails are unsupported
 and rejected before route validation, including zero-token calls.
 
-## Three-stage production API
+## Distributed control protocol and rank-local API
+
+Every rank unconditionally follows this generation sequence:
+
+```text
+host/device local preflight
+  -> AllGather ControlRecord[32 x uint64]
+  -> deterministic all-rank agreement
+  -> AllGather expert counts [world, num_experts]
+  -> AllGather packet summaries [world, num_nodes]
+  -> pure materialization
+```
+
+The fixed record contains protocol/schema versions, stable session identity
+fingerprint, generation/rank/world, canonical topology and configuration
+fingerprints, explicit experts/top-k/M-tile/node/capacity fields, collective
+dtype/index widths and row widths, local token/route requirements, and a local
+error with original token/slot/expert coordinates. Its checksum and reserved
+words are validated before use. `num_tokens` may differ by rank; every rank must
+agree on `max_tokens_per_rank` and stay within it.
+
+Rows are examined by ascending origin rank. Within a row, fields are examined
+in fixed schema order, with explicit layout fields checked before hash
+fallbacks. Thus every rank selects the same lowest-rank/first-field error.
+Control failure resets the framework protocol gate to control-ready; count and
+summary starts remain zero in the audit. A new session/generation view may share
+the still-healthy native communicator and starts again at control.
 
 ### 1. Rank-local histogram
 
@@ -87,7 +113,7 @@ of the final validated copy releases the chain exactly once through ordinary
 shared ownership; it does not call wait or cancel again. Keeping the completed
 operation object longer may conservatively extend the same resource lifetime.
 
-Two explicit rounds are used:
+After the fixed control round, two variable-width rounds are used:
 
 - `ExpertCounts`: row width `num_experts`;
 - `NotifyPacketSummary`: row width `num_nodes`, counting this source rank's
@@ -99,13 +125,24 @@ simulation of NCCL, GIN, LSA, or RDMA and accepts host buffers only.
 `NcclAllGatherCountExchange` is a correctness baseline using real
 `ncclComm_t`, `cudaStream_t`, `ncclAllGather`, pinned D2H staging, a completion
 event, and `ncclCommGetAsyncError`; all native objects stay in CUDA translation
-units. The constructor preallocates one count slot and one summary slot. `start`
+units. Its fixed control slot is always allocated. The capacity constructor
+also preallocates count and summary slots before the measured hot path; the
+control-only constructor allocates agreed data slots after successful control.
+`start_control` enqueues H2D, fixed AllGather, D2H, and an event; `wait` checks
+the event, NCCL async status, schema, configuration, and local failures. `start`
 only enqueues the collective, D2H copy, and event. If any pre-return enqueue
 step fails, it drains partially submitted stream work before releasing the
 typed input owner. `wait` synchronizes the event, checks the NCCL async error,
 then publishes typed host storage. NCCL has no per-operation cancellation, so
 `cancel` safely drains that event without aborting the shared communicator.
 This backend is not the final same-rail/GIN implementation.
+
+The backend state machine is auditable and ordered:
+`ControlReady -> ControlPending -> DataReady -> CountStarted -> CountComplete
+-> SummaryStarted -> Complete`. A rejected control returns to `ControlReady`.
+Pending control operation destruction/cancel drains its event without throwing
+from destruction; a partial enqueue is drained before the slot/input can be
+released. One operation object is not safe for concurrent wait/cancel/move.
 
 ### 3. Pure rank-local materialization
 

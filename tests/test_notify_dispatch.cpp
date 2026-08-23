@@ -14,6 +14,7 @@
 
 #include "megamoe/api/errors.hpp"
 #include "megamoe/api/notify_dispatch.hpp"
+#include "megamoe/cuda/control_protocol.hpp"
 #include "megamoe/kernels/persistent_contract.hpp"
 #include "megamoe/metadata/serialize.hpp"
 #include "megamoe/scoreboard/workspace_plan.hpp"
@@ -1084,6 +1085,63 @@ void test_handle_copy_move_workspace_and_overflow() {
       {"source prefix"});
 }
 
+void test_fixed_control_protocol_agreement() {
+  const auto config = make_config(1, 2, 8, 3, 4);
+  const auto context0 = make_context(config, 0, "control", 17, "control-exec-0");
+  const auto context1 = make_context(config, 1, "control", 17, "control-exec-1");
+  const auto record0 = megamoe::cuda::make_control_record(
+      config, context0, 2, 6, 10);
+  const auto record1 = megamoe::cuda::make_control_record(
+      config, context1, 3, 9, 10);
+  megamoe::cuda::validate_control_matrix({record0, record1}, context0);
+
+  const auto expect_control_error = [&](const megamoe::cuda::ControlMatrix &rows,
+                                        const std::vector<std::string> &fields) {
+    expect_error(NotifyErrorCode::ControlProtocolFailure,
+                 [&] { megamoe::cuda::validate_control_matrix(rows, context0); },
+                 fields);
+  };
+
+  const auto max_mismatch = megamoe::cuda::make_control_record(
+      config, context1, 3, 9, 11);
+  expect_control_error({record0, max_mismatch},
+                       {"phase=control-agreement", "field=max_tokens_per_rank",
+                        "origin_rank=1", "expected=10", "actual=11"});
+
+  auto expert_config = make_config(1, 2, 9, 3, 4);
+  const auto expert_mismatch = megamoe::cuda::make_control_record(
+      expert_config, context1, 3, 9, 10);
+  expect_control_error({record0, expert_mismatch},
+                       {"field=num_experts", "origin_rank=1",
+                        "expected=8", "actual=9"});
+
+  megamoe::cuda::LocalPreflightStatus invalid_route;
+  invalid_route.error = megamoe::cuda::ControlLocalError::ExpertOutOfRange;
+  invalid_route.field = megamoe::cuda::ControlField::LocalValidation;
+  invalid_route.token = 4;
+  invalid_route.slot = 2;
+  invalid_route.expert = 99;
+  invalid_route.expected = 8;
+  invalid_route.actual = 99;
+  const auto bad_route = megamoe::cuda::make_control_record(
+      config, context1, 5, 15, 10, invalid_route);
+  expect_control_error({record0, bad_route},
+                       {"field=local_validation", "origin_rank=1",
+                        "token=4", "slot=2", "expert=99"});
+
+  const auto over_capacity = megamoe::cuda::make_control_record(
+      config, context1, 11, 33, 10);
+  expect_control_error({record0, over_capacity},
+                       {"field=num_tokens", "origin_rank=1",
+                        "expected=10", "actual=11"});
+
+  auto corrupt = record1;
+  ++corrupt.reserved;
+  expect_control_error({record0, corrupt},
+                       {"field=reserved", "origin_rank=1",
+                        "expected=0", "actual=1"});
+}
+
 } // namespace
 
 int main() {
@@ -1106,6 +1164,8 @@ int main() {
        test_malicious_completion_context_and_corruption_hooks},
       {"handle_copy_move_workspace_and_overflow",
        test_handle_copy_move_workspace_and_overflow},
+      {"fixed_control_protocol_agreement",
+       test_fixed_control_protocol_agreement},
   };
   std::size_t passed = 0;
   for (const auto &[name, test] : tests) {

@@ -29,6 +29,8 @@ private:
                                        std::uint32_t, std::uint64_t,
                                        std::uint32_t,
                                        const NcclBootstrapId &);
+  friend NcclSession make_nccl_generation(const NcclSession &, std::string,
+                                          std::uint64_t);
 };
 
 NcclBootstrapId make_nccl_bootstrap_id();
@@ -51,6 +53,8 @@ private:
                                        std::uint32_t, std::uint64_t,
                                        std::uint32_t,
                                        const NcclBootstrapId &);
+  friend NcclSession make_nccl_generation(const NcclSession &, std::string,
+                                          std::uint64_t);
   friend class NcclAllGatherCountExchange;
 };
 
@@ -59,9 +63,68 @@ NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
                               std::uint32_t device_ordinal,
                               const NcclBootstrapId &bootstrap_id);
 
+// Creates a new immutable generation/session view over the same live NCCL
+// communicator. This allows a healthy communicator to recover after a rejected
+// control generation without re-bootstrap or native-handle exposure.
+NcclSession make_nccl_generation(const NcclSession &base,
+                                 std::string identity,
+                                 std::uint64_t generation);
+
+class ValidatedControlHandle {
+public:
+  ValidatedControlHandle() = default;
+  const ControlMatrix &matrix() const;
+  const RankCollectiveContext &context() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit ValidatedControlHandle(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class NcclControlOperation;
+};
+
+class NcclControlOperation {
+public:
+  NcclControlOperation();
+  ~NcclControlOperation() noexcept;
+  NcclControlOperation(const NcclControlOperation &) = delete;
+  NcclControlOperation &operator=(const NcclControlOperation &) = delete;
+  NcclControlOperation(NcclControlOperation &&) noexcept;
+  NcclControlOperation &operator=(NcclControlOperation &&) noexcept;
+  ExchangeState state() const noexcept;
+  ValidatedControlHandle wait();
+  void cancel();
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit NcclControlOperation(std::shared_ptr<Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<Impl> impl_;
+  friend class NcclAllGatherCountExchange;
+};
+
+struct CollectiveProtocolAudit {
+  std::uint64_t control_starts = 0;
+  std::uint64_t expert_count_starts = 0;
+  std::uint64_t packet_summary_starts = 0;
+};
+
+struct NcclWorkspaceUsage {
+  std::uint64_t device_bytes = 0;
+  std::uint64_t pinned_host_bytes = 0;
+  std::uint64_t control_slot_bytes = 0;
+  std::uint64_t expert_slot_bytes = 0;
+  std::uint64_t summary_slot_bytes = 0;
+};
+
 class NcclAllGatherCountExchange final : public CountExchange {
 public:
   struct Impl;
+  NcclAllGatherCountExchange(const NcclSession &session,
+                             const CudaExecution &execution);
   NcclAllGatherCountExchange(const NcclSession &session,
                              const CudaExecution &execution,
                              std::uint64_t max_expert_row_width,
@@ -76,11 +139,25 @@ public:
 
   std::unique_ptr<BackendCountExchangeOperation>
   start(const CountExchangeRequest &request) override;
+  NcclControlOperation start_control(const RankCollectiveContext &context,
+                                     const ControlRecord &record);
+  CollectiveProtocolAudit audit() const;
+  NcclWorkspaceUsage workspace_usage() const;
 
 private:
   std::shared_ptr<Impl> impl_;
 };
 
 const char *compiled_nccl_version() noexcept;
+
+struct NcclRuntimeInfo {
+  std::string compiled_version;
+  std::string runtime_version;
+  std::string loaded_library_path;
+  std::string socket_ifname;
+  std::string ib_disable;
+};
+
+NcclRuntimeInfo nccl_runtime_info();
 
 } // namespace megamoe::cuda

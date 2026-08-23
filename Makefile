@@ -6,6 +6,7 @@ CUDA_CPPFLAGS := -Iinclude -Isrc -Xcompiler=-pthread
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 
 LIB_SOURCES := \
+	src/cuda/control_protocol.cpp \
 	src/metadata/notify_dispatch.cpp \
 	src/metadata/serialize.cpp \
 	src/transport/host_fake_count_exchange.cpp \
@@ -23,7 +24,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test cross-check header-test bench cuda-lib cuda-test cuda-test-local cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test cross-check header-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -39,7 +40,7 @@ cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
 $(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cuda_notify.cpp
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $^ -lnccl -o $@
+	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $^ -lnccl -ldl -o $@
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
@@ -48,6 +49,12 @@ cuda-test-local: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 2
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 8
+
+cuda-protocol-test: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) python3 tests/run_control_protocol_regressions.py --binary $(BUILD_DIR)/test_cuda_notify
+
+cuda-bench: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --bench 1
 
 cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke

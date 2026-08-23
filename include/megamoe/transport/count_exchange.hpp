@@ -11,7 +11,7 @@ namespace megamoe {
 
 using CountMatrix = std::vector<std::vector<std::uint64_t>>;
 
-enum class ExchangeKind { ExpertCounts, NotifyPacketSummary };
+enum class ExchangeKind { Control, ExpertCounts, NotifyPacketSummary };
 enum class ExchangeState { Pending, Complete, Failed, Cancelled };
 
 class BackendSessionState {

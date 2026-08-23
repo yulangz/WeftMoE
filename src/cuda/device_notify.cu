@@ -68,8 +68,8 @@ std::size_t append_region(std::size_t &cursor, std::uint64_t elements,
 }
 
 struct DeviceStatus {
-  unsigned long long out_of_range_route;
-  unsigned long long duplicate_route;
+  unsigned long long out_of_range_packed;
+  unsigned long long duplicate_packed;
 };
 
 struct Layout {
@@ -233,8 +233,10 @@ __global__ void prepare_routes_kernel(
   indices[route] = route;
   ones[route] = 1;
   if (raw < 0 || static_cast<std::uint32_t>(raw) >= num_experts) {
-    atomicMin(&status->out_of_range_route,
-              static_cast<unsigned long long>(route));
+    const auto packed =
+        (static_cast<unsigned long long>(route) << 32U) |
+        static_cast<std::uint32_t>(raw);
+    atomicMin(&status->out_of_range_packed, packed);
     keys[route] = ~std::uint64_t{0};
     expert_id[route] = num_experts;
     dst_rank[route] = 0;
@@ -272,8 +274,11 @@ __global__ void validate_and_describe_tokens_kernel(
       continue;
     for (std::uint32_t prior = 0; prior < slot; ++prior) {
       if (selected[base + prior] == raw) {
-        atomicMin(&status->duplicate_route,
-                  static_cast<unsigned long long>(base + slot));
+        const auto flat = base + slot;
+        const auto packed =
+            (static_cast<unsigned long long>(flat) << 32U) |
+            static_cast<std::uint32_t>(raw);
+        atomicMin(&status->duplicate_packed, packed);
       }
     }
     const auto destination = expert_to_rank[static_cast<std::uint32_t>(raw)];
@@ -384,6 +389,10 @@ CudaAllocation::~CudaAllocation() noexcept {
   (void)cudaSetDevice(static_cast<int>(device));
   if (completion)
     (void)cudaEventSynchronize(completion);
+  if (mapping_start)
+    (void)cudaEventDestroy(mapping_start);
+  if (mapping_complete)
+    (void)cudaEventDestroy(mapping_complete);
   if (completion)
     (void)cudaEventDestroy(completion);
   if (host_ptr)
@@ -399,9 +408,12 @@ void throw_cuda(const char *phase, cudaError_t error, std::uint32_t rank,
   if (error == cudaSuccess)
     return;
   std::ostringstream stream;
-  stream << "phase=" << phase << ", kind="
-         << (kind == ExchangeKind::ExpertCounts ? "expert_counts"
-                                                : "notify_packet_summary")
+  const char *kind_text = kind == ExchangeKind::Control
+                              ? "control"
+                              : (kind == ExchangeKind::ExpertCounts
+                                     ? "expert_counts"
+                                     : "notify_packet_summary");
+  stream << "phase=" << phase << ", kind=" << kind_text
          << ", rank=" << rank << ", world=" << world << ", session='"
          << session << "', generation=" << generation << ", operation="
          << operation << ", cuda_error=" << static_cast<int>(error) << " ("
@@ -527,6 +539,11 @@ std::uint64_t CudaRouteInput::route_count() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return impl_->routes;
+}
+std::uint64_t CudaRouteInput::device_bytes() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA route input");
+  return static_cast<std::uint64_t>(impl_->allocation->device_bytes);
 }
 
 CudaNotifyWorkspacePlan query_cuda_notify_workspace(
@@ -657,6 +674,16 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
                        context.session().identity(), context.session().generation(),
                        ExchangeKind::ExpertCounts, "cudaHostAlloc(staging)");
   internal::throw_cuda("workspace-allocate",
+                       cudaEventCreate(&allocation.mapping_start),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(), context.session().generation(),
+                       ExchangeKind::ExpertCounts, "cudaEventCreate(mapping start)");
+  internal::throw_cuda("workspace-allocate",
+                       cudaEventCreate(&allocation.mapping_complete),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(), context.session().generation(),
+                       ExchangeKind::ExpertCounts, "cudaEventCreate(mapping complete)");
+  internal::throw_cuda("workspace-allocate",
                        cudaEventCreateWithFlags(&allocation.completion,
                                                 cudaEventDisableTiming),
                        context.calling_rank(), context.session().world_size(),
@@ -676,6 +703,35 @@ struct CudaLocalNotifyHandle::Impl {
 const LocalHistogramHandle &CudaLocalNotifyHandle::local() const {
   if (!impl_)
     invalid("attempted to access empty CUDA local notify handle");
+  return impl_->local;
+}
+
+struct CudaNotifyPreflight::Impl {
+  LocalPreflightStatus status;
+  CudaLocalNotifyHandle local;
+  double device_mapping_us = 0;
+};
+
+const LocalPreflightStatus &CudaNotifyPreflight::status() const {
+  if (!impl_)
+    invalid("phase=cuda-preflight, field=handle, rank=n/a, expected=valid, actual=empty");
+  return impl_->status;
+}
+
+double CudaNotifyPreflight::device_mapping_us() const {
+  if (!impl_)
+    invalid("phase=cuda-preflight, field=handle, rank=n/a, expected=valid, actual=empty");
+  return impl_->device_mapping_us;
+}
+
+bool CudaNotifyPreflight::valid() const {
+  return impl_ && impl_->status.error == ControlLocalError::None &&
+         static_cast<bool>(impl_->local);
+}
+
+const CudaLocalNotifyHandle &CudaNotifyPreflight::local() const {
+  if (!valid())
+    invalid("phase=cuda-preflight, field=local, rank=n/a, expected=successful preflight, actual=failed/empty");
   return impl_->local;
 }
 
@@ -778,6 +834,12 @@ CudaNotifyOperation start_cuda_rank_local_notify(
   const auto route_count = state->plan.route_count;
   internal::throw_cuda(
       "notify-start",
+      cudaEventRecord(state->allocation->mapping_start, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(mapping start)");
+  internal::throw_cuda(
+      "notify-start",
       cudaMemsetAsync(
           at<void>(base, dl.local_offset), 0,
           checked_size(checked_mul(route_count, sizeof(std::uint64_t),
@@ -856,6 +918,12 @@ CudaNotifyOperation start_cuda_rank_local_notify(
                          context.session().generation(), ExchangeKind::ExpertCounts,
                          "mapping kernels launch");
   }
+  internal::throw_cuda(
+      "notify-start",
+      cudaEventRecord(state->allocation->mapping_complete, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(mapping complete)");
   const auto &hl = state->host_layout;
   void *host = state->allocation->host_ptr;
   const auto copy = [&](std::size_t host_offset, std::size_t device_offset,
@@ -917,7 +985,7 @@ CudaNotifyOperation &CudaNotifyOperation::operator=(CudaNotifyOperation &&other)
   return *this;
 }
 
-CudaLocalNotifyHandle CudaNotifyOperation::wait() {
+CudaNotifyPreflight CudaNotifyOperation::wait_preflight() {
   if (!impl_)
     invalid("phase=cuda-notify-wait, field=operation, rank=n/a, expected=valid, actual=empty");
   if (impl_->waited || impl_->terminal)
@@ -936,22 +1004,42 @@ CudaLocalNotifyHandle CudaNotifyOperation::wait() {
   const auto &state = impl_->workspace;
   const auto *status = at<const DeviceStatus>(state->allocation->host_ptr,
                                               state->host_layout.status);
-  if (status->out_of_range_route != ~0ULL) {
-    const auto flat = static_cast<std::uint64_t>(status->out_of_range_route);
-    throw NotifyDispatchError(
-        NotifyErrorCode::ExpertOutOfRange,
-        "phase=cuda-device-validation, field=selected_experts, rank=" +
-            std::to_string(rank) + ", expected=[0," +
-            std::to_string(impl_->config.num_experts) + "), actual=out-of-range, " +
-            route_coordinates(flat, impl_->config.top_k));
+  auto preflight_impl = std::make_shared<CudaNotifyPreflight::Impl>();
+  float mapping_ms = 0;
+  internal::throw_cuda(
+      "notify-wait",
+      cudaEventElapsedTime(&mapping_ms,
+                           impl_->workspace->allocation->mapping_start,
+                           impl_->workspace->allocation->mapping_complete),
+      rank, impl_->context.session().world_size(),
+      impl_->context.session().identity(), impl_->context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaEventElapsedTime(mapping)");
+  preflight_impl->device_mapping_us =
+      static_cast<double>(mapping_ms) * 1000.0;
+  const auto unpack_status = [&](unsigned long long packed,
+                                 ControlLocalError error,
+                                 std::uint64_t expected,
+                                 std::uint64_t actual) {
+    const auto flat = static_cast<std::uint64_t>(packed >> 32U);
+    const auto expert_bits = static_cast<std::uint32_t>(packed);
+    std::int32_t raw_expert = 0;
+    std::memcpy(&raw_expert, &expert_bits, sizeof(raw_expert));
+    preflight_impl->status = LocalPreflightStatus{
+        error, ControlField::LocalValidation, flat / impl_->config.top_k,
+        flat % impl_->config.top_k, raw_expert, expected, actual};
+  };
+  if (status->out_of_range_packed != ~0ULL) {
+    const auto expert_bits =
+        static_cast<std::uint32_t>(status->out_of_range_packed);
+    unpack_status(status->out_of_range_packed,
+                  ControlLocalError::ExpertOutOfRange,
+                  impl_->config.num_experts, expert_bits);
+    return CudaNotifyPreflight(std::move(preflight_impl));
   }
-  if (status->duplicate_route != ~0ULL) {
-    const auto flat = static_cast<std::uint64_t>(status->duplicate_route);
-    throw NotifyDispatchError(
-        NotifyErrorCode::DuplicateExpert,
-        "phase=cuda-device-validation, field=selected_experts, rank=" +
-            std::to_string(rank) + ", expected=unique within token, actual=duplicate, " +
-            route_coordinates(flat, impl_->config.top_k));
+  if (status->duplicate_packed != ~0ULL) {
+    unpack_status(status->duplicate_packed, ControlLocalError::DuplicateExpert,
+                  0, 1);
+    return CudaNotifyPreflight(std::move(preflight_impl));
   }
   const auto routes = checked_size(state->plan.route_count, "routes");
   const auto masks = checked_size(
@@ -1004,7 +1092,33 @@ CudaLocalNotifyHandle CudaNotifyOperation::wait() {
   result->device.destination_node_mask = make_lease(
       state, state->device_layout.masks,
       checked_mul(state->plan.num_tokens, state->plan.node_mask_words, "mask lease"));
-  return CudaLocalNotifyHandle(std::move(result));
+  preflight_impl->local = CudaLocalNotifyHandle(std::move(result));
+  return CudaNotifyPreflight(std::move(preflight_impl));
+}
+
+CudaLocalNotifyHandle CudaNotifyOperation::wait() {
+  auto preflight = wait_preflight();
+  if (preflight.valid())
+    return preflight.local();
+  const auto &status = preflight.status();
+  const auto rank = impl_->context.calling_rank();
+  const auto flat = status.token * impl_->config.top_k + status.slot;
+  if (status.error == ControlLocalError::ExpertOutOfRange) {
+    throw NotifyDispatchError(
+        NotifyErrorCode::ExpertOutOfRange,
+        "phase=cuda-device-validation, field=selected_experts, rank=" +
+            std::to_string(rank) + ", expected=[0," +
+            std::to_string(impl_->config.num_experts) + "), actual=" +
+            std::to_string(status.expert) + ", " +
+            route_coordinates(flat, impl_->config.top_k));
+  }
+  throw NotifyDispatchError(
+      NotifyErrorCode::DuplicateExpert,
+      "phase=cuda-device-validation, field=selected_experts, rank=" +
+          std::to_string(rank) +
+          ", expected=unique within token, actual=duplicate expert=" +
+          std::to_string(status.expert) + ", " +
+          route_coordinates(flat, impl_->config.top_k));
 }
 
 void CudaNotifyOperation::cancel() {

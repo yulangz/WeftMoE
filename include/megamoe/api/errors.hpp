@@ -19,6 +19,7 @@ enum class NotifyErrorCode {
     WorkspaceMismatch,
     CudaFailure,
     NcclFailure,
+    ControlProtocolFailure,
 };
 
 class NotifyDispatchError final : public std::runtime_error {

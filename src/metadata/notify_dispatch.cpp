@@ -226,8 +226,12 @@ std::string route_context(std::uint32_t rank, std::uint64_t token,
 }
 
 const char *kind_name(ExchangeKind kind) noexcept {
-  return kind == ExchangeKind::ExpertCounts ? "expert_counts"
-                                            : "notify_packet_summary";
+  switch (kind) {
+  case ExchangeKind::Control: return "control";
+  case ExchangeKind::ExpertCounts: return "expert_counts";
+  case ExchangeKind::NotifyPacketSummary: return "notify_packet_summary";
+  }
+  return "unknown";
 }
 
 std::string exchange_context(const char *phase, ExchangeKind kind,

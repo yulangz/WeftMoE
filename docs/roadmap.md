@@ -15,7 +15,7 @@
 - Identity/generation/provenance-bound workspace planning.
 - Independent Python oracle and full-field machine-readable comparison.
 
-## Phase 2 — device Notify and real integer collectives complete (baseline)
+## Phase 2 — device Notify and real integer collectives (correctness baseline)
 
 - Runtime CUDA route validation, explicit total-order radix sort, segmented
   scan, deterministic local offsets, device histograms, topology coordinates,
@@ -23,12 +23,17 @@
 - Real NCCL AllGather correctness backend behind the opaque session/execution/
   lease contract, with event completion, typed D2H result, async-error checks,
   and contextual CUDA/NCCL failures.
+- Fixed 32-word control AllGather before every variable-layout collective,
+  explicit collective-wide configuration agreement, deterministic distributed
+  error selection, protocol call audit, and healthy-communicator recovery.
 - Explicit capacity-bound workspace and complete device metadata staging for
   later forward/backward consumers; no hot-path device allocation.
 - Single-GPU, local 2/8-GPU, and real two-host 2/16-rank full-field comparisons
   against host production and the Python oracle, plus deterministic repeats.
 
-Still open inside the Notify area: optimized device-only global prefix and
+The correctness slice is implemented; acceptance remains focused on exhaustive
+multi-host protocol replay and performance evidence. Still open inside the
+Notify area: optimized device-only global prefix and
 descriptor materialization, hierarchical/GIN count exchange, graph capture,
 and SM90-specialized performance tuning. The current controlled D2H plus host
 materializer is the correctness boundary, not a claimed final data plane.

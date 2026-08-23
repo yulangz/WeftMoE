@@ -2,8 +2,9 @@
 
 MegaMOE targets deterministic training MoE execution on H200/SM90 and later
 devices. The current vertical slice implements rank-local deterministic Notify
-Dispatch in production C++/CUDA, a real NCCL AllGather count backend, opaque
-device metadata leases, and an independent Python oracle. It does **not**
+Dispatch in production C++/CUDA, a fixed-width distributed control agreement,
+a real NCCL AllGather count backend, opaque device metadata leases, and an
+independent Python oracle. It does **not**
 implement NCCL GIN/LSA, RDMA, activation movement, or persistent
 forward/backward kernels.
 
@@ -79,12 +80,26 @@ auto plan = cuda::query_cuda_notify_workspace(config, rank,
                                               local_routes.num_tokens,
                                               max_tokens_per_rank);
 auto workspace = cuda::allocate_cuda_notify_workspace(plan, context, execution);
-auto local = cuda::start_cuda_rank_local_notify(
-    config, context, execution, routes, std::move(workspace)).wait();
-// Start/wait the two real NCCL rounds, then call materialize_rank_metadata.
+auto preflight = cuda::start_cuda_rank_local_notify(
+    config, context, execution, routes, std::move(workspace)).wait_preflight();
+auto record = cuda::make_control_record(config, context, num_tokens,
+                                        route_elements,
+                                        max_tokens_per_rank,
+                                        preflight.status());
+auto control = backend.start_control(context, record).wait();
+// Only a successful control handle permits expert-count then summary rounds.
+auto local = preflight.local();
 auto device_handle = cuda::stage_cuda_dispatch_metadata(
     std::move(host_handle), local, execution);
 ```
+
+Every generation executes exactly `preflight → ControlRecord AllGather →
+agreement → expert-count AllGather → packet-summary AllGather`. The 32-word
+`uint64_t` control record is fully initialized even for invalid local input.
+Config mismatches and route errors select the lowest origin rank and first
+field in schema order; all ranks fail after the same fixed collective and never
+enter a variable-width collective. A healthy NCCL communicator can be reused
+through a new immutable generation view after a rejected generation.
 
 `max_tokens_per_rank` is an explicit capacity promise for every rank in the
 collective generation. It sizes worst-case incoming rows; actual materialized
