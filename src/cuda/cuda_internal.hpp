@@ -51,7 +51,11 @@ struct CudaAllocation {
   std::size_t host_bytes = 0;
   cudaEvent_t mapping_start = nullptr;
   cudaEvent_t mapping_complete = nullptr;
+  cudaEvent_t planning_start = nullptr;
+  cudaEvent_t planning_complete = nullptr;
+  cudaEvent_t producer_ready = nullptr;
   cudaEvent_t completion = nullptr;
+  std::vector<cudaEvent_t> consumer_events;
   ~CudaAllocation() noexcept;
 };
 

@@ -122,6 +122,8 @@ struct GenerationExecutionTimings {
   double expert_count_us = 0;
   double packet_summary_us = 0;
   double device_materialization_us = 0;
+  double prefix_planning_us = 0;
+  double remaining_parallel_materialization_us = 0;
   double pool_acquire_release_us = 0;
 };
 
@@ -133,7 +135,7 @@ struct NotifyGenerationRequest {
 
 struct DeviceNotifyGenerationRequest {
   RuntimeConfig config;
-  DeviceRouteInput local_routes;
+  CudaRouteInput local_routes;
   std::uint64_t max_tokens_per_rank = 0;
 };
 
@@ -142,6 +144,7 @@ struct DeviceNotifyResourcePoolConfig {
   std::uint64_t max_tokens_per_rank = 0;
   std::uint64_t max_config_wire_bytes = 0;
   std::uint32_t max_inflight_generations = 2;
+  std::uint32_t max_inflight_consumers = 4;
 };
 
 struct DeviceNotifyResourcePoolUsage {

@@ -778,9 +778,11 @@ ValidatedConfigHandle NcclConfigOperation::wait() {
 
   std::unique_ptr<Slot> expert;
   std::unique_ptr<Slot> summary;
+  maybe_fault(testing::NcclFaultPoint::CountSlotAllocation,
+              "count-slot-allocation", impl_->context);
+  maybe_fault(testing::NcclFaultPoint::SummarySlotAllocation,
+              "summary-slot-allocation", impl_->context);
   if (!impl_->backend->expert || !impl_->backend->summary) {
-    maybe_fault(testing::NcclFaultPoint::CountSlotAllocation,
-                "count-slot-allocation", impl_->context);
     expert = std::make_unique<Slot>();
     const auto count_start = std::chrono::steady_clock::now();
     allocate_slot(*expert, impl_->headers.front().expert_row_width,
@@ -790,8 +792,6 @@ ValidatedConfigHandle NcclConfigOperation::wait() {
     impl_->backend->setup.count_slot_allocation_us +=
         std::chrono::duration<double, std::micro>(count_end - count_start)
             .count();
-    maybe_fault(testing::NcclFaultPoint::SummarySlotAllocation,
-                "summary-slot-allocation", impl_->context);
     summary = std::make_unique<Slot>();
     const auto summary_start = std::chrono::steady_clock::now();
     allocate_slot(*summary, impl_->headers.front().summary_row_width,
@@ -1191,9 +1191,9 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
     invalid("phase=config-start, field=protocol_state, rank=" +
             std::to_string(rank) +
             ", expected=config-ready, actual=not-ready");
+  maybe_fault(testing::NcclFaultPoint::ConfigSlotAllocation,
+              "config-slot-allocation", context);
   if (!impl_->config || impl_->config->width < collective_width) {
-    maybe_fault(testing::NcclFaultPoint::ConfigSlotAllocation,
-                "config-slot-allocation", context);
     impl_->config = std::make_unique<ByteSlot>();
     const auto allocation_start = std::chrono::steady_clock::now();
     allocate_byte_slot(*impl_->config, collective_width, impl_->session,
@@ -1542,7 +1542,8 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
     const NcclSession &base_session, const CudaExecution &execution,
     DeviceNotifyResourcePoolConfig config) {
   if (!base_session || !execution || config.max_tokens_per_rank == 0 ||
-      config.max_inflight_generations == 0)
+      config.max_inflight_generations == 0 ||
+      config.max_inflight_consumers == 0)
     invalid("phase=device-pool-create, field=input, rank=n/a, "
             "expected=valid nonzero capacity, actual=invalid");
   validate_runtime_config(config.capacity_config);
@@ -1581,7 +1582,8 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
       config.max_tokens_per_rank, config.max_tokens_per_rank);
   impl->slots.resize(config.max_inflight_generations);
   for (auto &slot : impl->slots) {
-    slot.notify = DeviceNotifyPoolBridge::allocate(impl->max_plan, execution);
+    slot.notify = DeviceNotifyPoolBridge::allocate(
+        impl->max_plan, execution, config.max_inflight_consumers);
     slot.backend = std::make_shared<NcclAllGatherCountExchange>(
         base_session, execution, config.capacity_config.num_experts,
         config.capacity_config.topology.num_nodes,
@@ -1611,7 +1613,8 @@ DeviceNotifyResourcePoolUsage DeviceNotifyResourcePool::usage() const {
     const auto backend = slot.backend->workspace_usage();
     usage.device_bytes += backend.device_bytes;
     usage.pinned_host_bytes += backend.pinned_host_bytes;
-    usage.event_count += 7;
+    usage.event_count +=
+        4U + DeviceNotifyPoolBridge::event_count(slot.notify);
   }
   return usage;
 }
@@ -1842,6 +1845,16 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                                       direct_routes);
   if (status.error == ControlLocalError::None)
     status = config_status;
+  if (status.error == ControlLocalError::None && direct_routes) {
+    try {
+      DeviceRouteProvenanceBridge::validate(
+          *direct_routes, impl_->context, impl_->execution);
+    } catch (const NotifyDispatchError &) {
+      status = {ControlLocalError::InvalidRouteShape,
+                ControlField::LocalValidation, UINT64_MAX, UINT64_MAX, 0,
+                1, 0};
+    }
+  }
   if (status.error == ControlLocalError::None && impl_->pool) {
     const auto &capacity = impl_->pool->config;
     if (request.config.num_experts > capacity.capacity_config.num_experts ||
@@ -1871,9 +1884,11 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                         : pool_allocation
                         ? DeviceNotifyPoolBridge::upload(
                               request.local_routes, request.config.top_k,
+                              impl_->context,
                               impl_->execution, pool_allocation, pool_lease)
                         : upload_cuda_routes(request.local_routes,
                                              request.config.top_k,
+                                             impl_->context,
                                              impl_->execution);
       route_input_bytes = routes.device_bytes();
       auto plan = query_cuda_notify_workspace(
@@ -1967,8 +1982,10 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   auto summary_done = summary->wait();
   const auto summary_end = std::chrono::steady_clock::now();
   const auto materialize_start = std::chrono::steady_clock::now();
+  DeviceMetadataBridge::Timings materialize_timings;
   auto device = DeviceMetadataBridge::materialize(
-      local, std::move(count_done), std::move(summary_done), impl_->execution);
+      local, std::move(count_done), std::move(summary_done), impl_->execution,
+      &materialize_timings);
   const auto materialize_end = std::chrono::steady_clock::now();
   const auto audit_value = impl_->backend->audit();
   if (audit_value.control_starts != 1 || audit_value.config_starts != 1 ||
@@ -1992,8 +2009,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       notify_arena_bytes;
   result->workspace.device_bytes += route_input_bytes + notify_arena_bytes;
   result->workspace.pinned_host_bytes += notify_pinned_bytes;
-  // Three notify events plus one event for each of four collective slots.
-  result->workspace.event_count = 7;
+  // Notify workspace/route/consumer events plus four collective events.
+  result->workspace.event_count = 14;
   result->workspace.quantified_event_bytes = 0;
   if (impl_->pool) {
     result->workspace = {};
@@ -2017,7 +2034,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       result->workspace.config_slot_bytes += backend_usage.config_slot_bytes;
       result->workspace.expert_slot_bytes += backend_usage.expert_slot_bytes;
       result->workspace.summary_slot_bytes += backend_usage.summary_slot_bytes;
-      result->workspace.event_count += 7;
+      result->workspace.event_count +=
+          4U + DeviceNotifyPoolBridge::event_count(slot.notify);
     }
     result->workspace.final_device_metadata_arena_view_capacity_bytes =
         impl_->pool->max_plan.device_bytes;
@@ -2053,6 +2071,10 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       std::chrono::duration<double, std::micro>(materialize_end -
                                                 materialize_start)
           .count();
+  result->execution.prefix_planning_us =
+      materialize_timings.prefix_planning_us;
+  result->execution.remaining_parallel_materialization_us =
+      materialize_timings.remaining_parallel_us;
   result->execution.pool_acquire_release_us = result->setup.pool_acquire_us;
   result->resource_lease = pool_lease
                                ? std::static_pointer_cast<const void>(pool_lease)

@@ -205,6 +205,12 @@ Setup-inclusive E2E is calculated per rank as `rank_setup + rank_steady` before
 choosing the slowest rank. Mapping has no per-route copy, allocation, or
 synchronization.
 
+Schema 6 additionally reports `prefix_planning_us` (the existing checked
+prefix-plan kernel) separately from
+`remaining_parallel_materialization_us`. Both are measured with precreated
+CUDA events and remain components of `device_materialization_us`; observing
+them adds no steady-state event creation.
+
 On the inspected local 8-GPU L20X host, the pooled parallel coordinator
 produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 
@@ -213,14 +219,16 @@ produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 | one-time NCCL session setup | 1325100 | 1312250 | 1351720 | 1303210 | 1351720 |
 | one-time two-slot pool setup | 13352.6 | 13341.5 | 14204.3 | 11762.3 | 14204.3 |
 | per-generation setup (pool acquire) | 2.243 | 2.051 | 2.903 | 1.496 | 4.567 |
-| setup-inclusive generation end-to-end | 6825.43 | 6814.81 | 6890.41 | 6756.31 | 7010.80 |
-| steady-state execution | 6823.66 | 6812.54 | 6888.17 | 6754.77 | 7007.86 |
-| local stable mapping | 140.480 | 139.456 | 145.184 | 135.808 | 165.952 |
-| control + exact config | 855.374 | 841.635 | 932.080 | 776.720 | 997.966 |
-| expert-count AllGather | 33.093 | 31.342 | 53.374 | 27.759 | 62.863 |
-| packet-summary AllGather | 22.174 | 21.861 | 24.325 | 20.736 | 26.246 |
-| parallel device materialization | 5682.63 | 5682.37 | 5693.01 | 5672.37 | 5698.44 |
-| pool acquire + final release/drain | 24.358 | 22.546 | 33.675 | 18.102 | 44.600 |
+| setup-inclusive generation end-to-end | 6857.58 | 6850.13 | 6920.50 | 6781.25 | 7248.20 |
+| steady-state execution | 6855.91 | 6848.03 | 6918.36 | 6779.68 | 7246.86 |
+| local stable mapping | 143.139 | 142.976 | 148.832 | 138.016 | 149.856 |
+| control + exact config | 858.642 | 864.025 | 920.505 | 794.969 | 1058.21 |
+| expert-count AllGather | 35.030 | 32.099 | 52.659 | 27.869 | 92.696 |
+| packet-summary AllGather | 22.983 | 21.874 | 27.716 | 20.680 | 58.164 |
+| parallel device materialization | 5697.89 | 5693.38 | 5722.69 | 5684.20 | 5848.47 |
+| prefix planning (component) | 5574.66 | 5573.63 | 5580.70 | 5566.88 | 5582.91 |
+| remaining parallel stages (component) | 37.296 | 37.248 | 38.016 | 36.608 | 38.112 |
+| pool acquire + final release/drain | 20.311 | 18.863 | 28.502 | 15.861 | 43.904 |
 
 For `max_inflight_generations=2`, the corresponding complete unique workspace
 was 42,624,126 device bytes and 78,992 pinned bytes: route input 589,824
@@ -228,21 +236,24 @@ was 42,624,126 device bytes and 78,992 pinned bytes: route input 589,824
 Notify arenas totaling 41,906,686, Notify pinned status staging 656, control
 slots 9,216, config wire storage 8,192, config slots 147,456, expert slots
 49,152, and summary slots 128. Final metadata is a 20,953,343-byte subview of
-one arena and is not added again. Fourteen CUDA events are reported; their
+one arena and is not added again. Twenty-eight pooled CUDA events are reported;
 opaque runtime allocation size is recorded as zero.
 
 The phase-2 same-accounting steady baseline was approximately 97.6 ms, of
 which roughly 69 ms was bulk D2H, host materialization, and bulk H2D. The first
 all-device slice reduced the same-accounting steady mean to 38.0 ms, with
 33.2 ms in its serial materializer. The pooled parallel baseline now measures
-6.82 ms steady and 5.68 ms materialization while preserving production audit
+6.856 ms steady and 5.698 ms materialization while preserving production audit
 `bulk route D2H / collective D2H / host materialize / metadata H2D = 0/0/0/0`.
 Across ten pooled steady generations, CUDA API audit measured
 `cudaMalloc/cudaFree/cudaHostAlloc/cudaFreeHost/cudaEventCreate*/`
-`cudaEventDestroy/cudaDeviceSynchronize = 0` for every category. Further
-The same interval recorded bounded H2D/D2H/D2D traffic as
-8,540/8,700/0 bytes; validation download was outside the interval.
-Further parallelization of the small checked planning scan remains an
+`cudaEventDestroy/cudaDeviceSynchronize = 0` for every category. The local
+ten-generation audit recorded bounded H2D/D2H/D2D traffic as
+8,480/8,640/0 bytes; validation download was outside the interval. The new
+events expose that prefix planning accounts for about 5.575 ms, while the
+remaining parallel stages account for about 0.037 ms. Compared with 6.824 ms,
+the 6.856 ms steady mean is a 0.5% shift, not an unexplained material
+regression. Parallelizing the checked planning scan remains the next
 optimization.
 
 The earlier approximately 197 ms number is not a comparable regression point:

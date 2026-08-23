@@ -765,6 +765,15 @@ __global__ void materialize_signals_kernel(DeviceMaterializeArgs a) {
       expected, expected, node, source_node, source_rank, a.rank, rail, 0};
 }
 
+__global__ void dispatch_consumer_probe_delay_kernel(
+    const std::uint64_t *source, std::uint64_t delay_cycles) {
+  const auto start = clock64();
+  while (clock64() - start < delay_cycles) {
+  }
+  if (source && threadIdx.x == 0 && blockIdx.x == 0)
+    asm volatile("" : : "l"(*source));
+}
+
 std::string route_coordinates(std::uint64_t flat, std::uint32_t top_k) {
   return "token=" + std::to_string(flat / top_k) +
          ", slot=" + std::to_string(flat % top_k);
@@ -778,6 +787,9 @@ struct WorkspaceState {
   CudaExecution execution;
   std::shared_ptr<CudaAllocation> allocation;
   std::shared_ptr<const void> slot_lease;
+  std::uint64_t epoch = 0;
+  std::mutex consumer_mutex;
+  std::vector<bool> consumer_in_use;
 };
 
 DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
@@ -841,6 +853,24 @@ CudaAllocation::~CudaAllocation() noexcept {
     record_cuda_api(CudaApiAuditKind::EventDestroy);
   if (mapping_complete)
     (void)cudaEventDestroy(mapping_complete);
+  if (planning_start)
+    record_cuda_api(CudaApiAuditKind::EventDestroy);
+  if (planning_start)
+    (void)cudaEventDestroy(planning_start);
+  if (planning_complete)
+    record_cuda_api(CudaApiAuditKind::EventDestroy);
+  if (planning_complete)
+    (void)cudaEventDestroy(planning_complete);
+  if (producer_ready)
+    record_cuda_api(CudaApiAuditKind::EventDestroy);
+  if (producer_ready)
+    (void)cudaEventDestroy(producer_ready);
+  for (auto event : consumer_events) {
+    if (event) {
+      record_cuda_api(CudaApiAuditKind::EventDestroy);
+      (void)cudaEventDestroy(event);
+    }
+  }
   if (completion)
     record_cuda_api(CudaApiAuditKind::EventDestroy);
   if (completion)
@@ -930,12 +960,18 @@ std::uint32_t CudaExecution::device_ordinal() const {
   return impl_->state->device;
 }
 
-struct DeviceRouteInput::Impl {
+struct SelectedExpertRouteLease<std::int32_t>::Impl {
   std::shared_ptr<CudaAllocation> allocation;
-  DeviceBufferLease external_lease;
   std::shared_ptr<const void> slot_lease;
   const void *device_ptr = nullptr;
-  ExecutionToken execution;
+  CollectiveSession producer_session;
+  ExecutionToken producer_execution;
+  ExecutionToken consumer_execution;
+  std::uint32_t layout = kSelectedExpertRouteLayoutVersion;
+  std::uint32_t device = 0;
+  std::uint64_t generation = 0;
+  bool ready_recorded = false;
+  bool test_pipeline_handoff = false;
   std::uint64_t tokens = 0;
   std::uint32_t top_k = 0;
   std::uint64_t routes = 0;
@@ -943,7 +979,12 @@ struct DeviceRouteInput::Impl {
 
 CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                                   std::uint32_t top_k,
+                                  const RankCollectiveContext &context,
                                   const CudaExecution &execution) {
+  if (!context || !execution ||
+      !context.execution().same_instance(execution.token()))
+    invalid("phase=cuda-route-upload, field=producer_context, rank=n/a, "
+            "expected=matching session/execution, actual=mismatch/empty");
   const auto state = internal::checked_execution_state(execution);
   const auto count = checked_mul(routes.num_tokens, top_k, "route_count");
   if (routes.selected_experts.size() != checked_size(count, "route_count"))
@@ -965,6 +1006,15 @@ CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                        0, 1, execution.token().identity(), 1,
                        ExchangeKind::ExpertCounts, "cudaMalloc(route input)");
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+  internal::throw_cuda("route-upload",
+                       cudaEventCreateWithFlags(&allocation->producer_ready,
+                                                cudaEventDisableTiming),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(),
+                       context.session().generation(),
+                       ExchangeKind::ExpertCounts,
+                       "cudaEventCreate(producer ready)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
   if (count != 0) {
     internal::throw_cuda(
         "route-upload",
@@ -976,72 +1026,133 @@ CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
     internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
                               route_bytes);
   }
-  auto impl = std::make_shared<DeviceRouteInput::Impl>();
+  internal::throw_cuda("route-upload",
+                       cudaEventRecord(allocation->producer_ready,
+                                       state->stream),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(),
+                       context.session().generation(),
+                       ExchangeKind::ExpertCounts,
+                       "cudaEventRecord(producer ready)");
+  auto impl = std::make_shared<CudaRouteInput::Impl>();
   impl->allocation = std::move(allocation);
   impl->device_ptr = impl->allocation->device_ptr;
-  impl->execution = execution.token();
+  impl->producer_session = context.session();
+  impl->producer_execution = execution.token();
+  impl->consumer_execution = execution.token();
+  impl->device = state->device;
+  impl->generation = context.session().generation();
+  impl->ready_recorded = true;
+  impl->test_pipeline_handoff = true;
   impl->tokens = routes.num_tokens;
   impl->top_k = top_k;
   impl->routes = count;
   return CudaRouteInput(std::move(impl));
 }
 
-DeviceRouteInput upload_device_routes_for_testing(
+CudaRouteInput upload_device_routes_for_testing(
     const RankRoutingInput &routes, std::uint32_t top_k,
+    const RankCollectiveContext &context,
     const CudaExecution &execution) {
-  return upload_cuda_routes(routes, top_k, execution);
+  return upload_cuda_routes(routes, top_k, context, execution);
 }
 
-std::uint64_t DeviceRouteInput::num_tokens() const {
+std::uint64_t CudaRouteInput::num_tokens() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return impl_->tokens;
 }
-std::uint32_t DeviceRouteInput::top_k() const {
+std::uint32_t CudaRouteInput::top_k() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return impl_->top_k;
 }
-std::uint64_t DeviceRouteInput::route_count() const {
+std::uint64_t CudaRouteInput::route_count() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return impl_->routes;
 }
-std::uint64_t DeviceRouteInput::device_bytes() const {
+std::uint64_t CudaRouteInput::device_bytes() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return checked_mul(impl_->routes, sizeof(std::int32_t),
                      "route input bytes");
 }
 
-DeviceRouteInput make_device_route_input(
-    DeviceBufferLease selected_experts, std::uint64_t num_tokens,
-    std::uint32_t top_k, const CudaExecution &execution) {
-  if (!execution || top_k == 0)
-    invalid("phase=device-route-input, field=input, rank=n/a, "
-            "expected=valid execution/lease/top_k, actual=invalid");
-  const auto routes = checked_mul(num_tokens, top_k, "route_count");
-  if ((routes != 0 && !selected_experts) ||
-      (routes != 0 && (selected_experts.rows() != 1 ||
-      selected_experts.row_width() != routes ||
-      selected_experts.element_count() != routes)))
-    invalid("phase=device-route-input, field=shape, rank=n/a, expected=[1," +
-            std::to_string(routes) + "], actual=[" +
-            std::to_string(selected_experts.rows()) + "," +
-            std::to_string(selected_experts.row_width()) + "]");
-  const auto state = internal::checked_execution_state(execution);
-  auto impl = std::make_shared<DeviceRouteInput::Impl>();
-  if (routes != 0) {
-    auto buffer = internal::CudaDeviceLeaseAccess::checked(selected_experts,
-                                                            state->device);
-    impl->external_lease = std::move(selected_experts);
-    impl->device_ptr = buffer->pointer;
-  }
-  impl->execution = execution.token();
-  impl->tokens = num_tokens;
-  impl->top_k = top_k;
-  impl->routes = routes;
-  return DeviceRouteInput(std::move(impl));
+std::uint32_t CudaRouteInput::layout_version() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA route input");
+  return impl_->layout;
+}
+std::uint32_t CudaRouteInput::device_ordinal() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA route input");
+  return impl_->device;
+}
+std::uint64_t CudaRouteInput::route_generation() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA route input");
+  return impl_->generation;
+}
+
+CudaRouteInput import_selected_expert_routes(
+    const CudaRouteInput &routes,
+    const RankCollectiveContext &consumer_context,
+    const CudaExecution &consumer_execution) {
+  if (!routes.impl_ || !consumer_context || !consumer_execution)
+    invalid("phase=route-stream-handoff, field=input, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto &source = *routes.impl_;
+  if (!consumer_context.execution().same_instance(consumer_execution.token()) ||
+      consumer_context.calling_rank() >= consumer_context.session().world_size() ||
+      source.producer_session.stable_identity_bytes() !=
+          consumer_context.session().stable_identity_bytes() ||
+      (!source.test_pipeline_handoff &&
+       source.generation != consumer_context.session().generation()))
+    invalid("phase=route-stream-handoff, field=session/generation/execution, rank=" +
+            std::to_string(consumer_context.calling_rank()) +
+            ", expected=matching immutable producer provenance, actual=mismatch");
+  const auto exec = internal::checked_execution_state(consumer_execution);
+  if (exec->device != source.device || !source.ready_recorded ||
+      !source.allocation || !source.allocation->producer_ready)
+    invalid("phase=route-stream-handoff, field=device/ready_event, rank=" +
+            std::to_string(consumer_context.calling_rank()) +
+            ", expected=recorded producer event on matching device, actual=mismatch");
+  internal::throw_cuda("route-stream-handoff",
+                       cudaStreamWaitEvent(exec->stream,
+                                           source.allocation->producer_ready),
+                       consumer_context.calling_rank(),
+                       consumer_context.session().world_size(),
+                       consumer_context.session().identity(),
+                       consumer_context.session().generation(),
+                       ExchangeKind::ExpertCounts, "cudaStreamWaitEvent");
+  auto impl = std::make_shared<CudaRouteInput::Impl>(source);
+  impl->consumer_execution = consumer_execution.token();
+  return CudaRouteInput(std::move(impl));
+}
+
+void DeviceRouteProvenanceBridge::validate(
+    const CudaRouteInput &routes, const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  if (!routes.impl_ || !context || !execution)
+    invalid("phase=device-route-provenance, field=input, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto &route = *routes.impl_;
+  const auto required_bytes = checked_mul(
+      route.routes, sizeof(std::int32_t), "route provenance bytes");
+  if (route.layout != kSelectedExpertRouteLayoutVersion ||
+      route.device != execution.device_ordinal() ||
+      !route.consumer_execution.same_instance(execution.token()) ||
+      route.producer_session.stable_identity_bytes() !=
+          context.session().stable_identity_bytes() ||
+      (!route.test_pipeline_handoff &&
+       route.generation != context.session().generation()) ||
+      !route.ready_recorded || !route.allocation ||
+      !route.allocation->producer_ready ||
+      required_bytes > route.allocation->device_bytes)
+    invalid("phase=device-route-provenance, field=dtype/layout/shape/device/session/generation/execution/ready/capacity, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=exact immutable producer provenance, actual=mismatch");
 }
 
 CudaNotifyWorkspacePlan query_cuda_notify_workspace(
@@ -1148,6 +1259,7 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
             std::to_string(context.calling_rank()) +
             ", expected=recomputed layout, actual=mismatch");
   state->context = context;
+  state->epoch = context.session().generation();
   state->execution = execution;
   state->allocation = std::make_shared<CudaAllocation>();
   auto &allocation = *state->allocation;
@@ -1192,6 +1304,33 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
                        context.session().identity(), context.session().generation(),
                        ExchangeKind::ExpertCounts, "cudaEventCreate");
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda("workspace-allocate",
+                       cudaEventCreate(&allocation.planning_start),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(), context.session().generation(),
+                       ExchangeKind::ExpertCounts,
+                       "cudaEventCreate(planning start)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda("workspace-allocate",
+                       cudaEventCreate(&allocation.planning_complete),
+                       context.calling_rank(), context.session().world_size(),
+                       context.session().identity(), context.session().generation(),
+                       ExchangeKind::ExpertCounts,
+                       "cudaEventCreate(planning complete)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  allocation.consumer_events.reserve(4);
+  for (std::uint32_t i = 0; i < 4; ++i) {
+    cudaEvent_t event = nullptr;
+    internal::throw_cuda("workspace-allocate",
+                         cudaEventCreateWithFlags(&event,
+                                                  cudaEventDisableTiming),
+                         context.calling_rank(), context.session().world_size(),
+                         context.session().identity(), context.session().generation(),
+                         ExchangeKind::ExpertCounts,
+                         "cudaEventCreate(consumer completion)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+    allocation.consumer_events.push_back(event);
+  }
   auto impl = std::make_shared<CudaNotifyWorkspace::Impl>();
   impl->state = std::move(state);
   return CudaNotifyWorkspace(std::move(impl));
@@ -1199,7 +1338,8 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
 
 std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
     const CudaNotifyWorkspacePlan &max_plan,
-    const CudaExecution &execution) {
+    const CudaExecution &execution,
+    std::uint32_t max_inflight_consumers) {
   if (!execution)
     invalid("phase=device-pool-allocate, field=execution, rank=n/a, "
             "expected=valid, actual=empty");
@@ -1270,11 +1410,46 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
       execution.token().identity(), 1, ExchangeKind::ExpertCounts,
       "cudaEventCreate(pool completion)");
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda(
+      "device-pool-allocate",
+      cudaEventCreate(&result->workspace->planning_start),
+      max_plan.calling_rank, max_plan.world_size,
+      execution.token().identity(), 1, ExchangeKind::ExpertCounts,
+      "cudaEventCreate(pool planning start)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda(
+      "device-pool-allocate",
+      cudaEventCreate(&result->workspace->planning_complete),
+      max_plan.calling_rank, max_plan.world_size,
+      execution.token().identity(), 1, ExchangeKind::ExpertCounts,
+      "cudaEventCreate(pool planning complete)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda(
+      "device-pool-allocate",
+      cudaEventCreateWithFlags(&result->route->producer_ready,
+                               cudaEventDisableTiming),
+      max_plan.calling_rank, max_plan.world_size,
+      execution.token().identity(), 1, ExchangeKind::ExpertCounts,
+      "cudaEventCreate(pool producer ready)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  result->workspace->consumer_events.reserve(max_inflight_consumers);
+  for (std::uint32_t i = 0; i < max_inflight_consumers; ++i) {
+    cudaEvent_t event = nullptr;
+    internal::throw_cuda(
+        "device-pool-allocate",
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+        max_plan.calling_rank, max_plan.world_size,
+        execution.token().identity(), 1, ExchangeKind::ExpertCounts,
+        "cudaEventCreate(pool consumer completion)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+    result->workspace->consumer_events.push_back(event);
+  }
   return result;
 }
 
 CudaRouteInput DeviceNotifyPoolBridge::upload(
     const RankRoutingInput &routes, std::uint32_t top_k,
+    const RankCollectiveContext &context,
     const CudaExecution &execution,
     const std::shared_ptr<CudaNotifyPoolAllocation> &allocation,
     std::shared_ptr<const void> slot_lease) {
@@ -1302,15 +1477,26 @@ CudaRouteInput DeviceNotifyPoolBridge::upload(
         "cudaMemcpyAsync(host convenience route upload)");
   if (bytes != 0)
     internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
-  auto impl = std::make_shared<DeviceRouteInput::Impl>();
+  internal::throw_cuda(
+      "device-pool-route-upload",
+      cudaEventRecord(allocation->route->producer_ready, exec->stream),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaEventRecord(producer ready)");
+  auto impl = std::make_shared<CudaRouteInput::Impl>();
   impl->allocation = allocation->route;
   impl->slot_lease = std::move(slot_lease);
   impl->device_ptr = allocation->route->device_ptr;
-  impl->execution = execution.token();
+  impl->producer_session = context.session();
+  impl->producer_execution = execution.token();
+  impl->consumer_execution = execution.token();
+  impl->device = exec->device;
+  impl->generation = context.session().generation();
+  impl->ready_recorded = true;
   impl->tokens = routes.num_tokens;
   impl->top_k = top_k;
   impl->routes = count;
-  return DeviceRouteInput(std::move(impl));
+  return CudaRouteInput(std::move(impl));
 }
 
 CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
@@ -1339,6 +1525,7 @@ CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
   state->device_layout = device_layout;
   state->host_layout = host_layout;
   state->context = context;
+  state->epoch = context.session().generation();
   state->execution = execution;
   state->allocation = allocation->workspace;
   state->slot_lease = std::move(slot_lease);
@@ -1387,6 +1574,13 @@ std::uint64_t DeviceNotifyPoolBridge::pinned_bytes(
   return allocation
              ? static_cast<std::uint64_t>(allocation->workspace->host_bytes)
              : 0;
+}
+
+std::uint64_t DeviceNotifyPoolBridge::event_count(
+    const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept {
+  if (!allocation)
+    return 0;
+  return 6U + allocation->workspace->consumer_events.size();
 }
 
 struct CudaLocalNotifyHandle::Impl {
@@ -1479,9 +1673,7 @@ CudaNotifyOperation start_cuda_rank_local_notify(
     invalid("phase=cuda-notify-start, field=context, rank=" +
             std::to_string(rank) +
             ", expected=config world and exact execution, actual=mismatch");
-  if (!routes.impl_->execution.same_instance(execution.token()))
-    invalid("phase=cuda-notify-start, field=route.execution, rank=" +
-            std::to_string(rank) + ", expected=exact execution, actual=different");
+  DeviceRouteProvenanceBridge::validate(routes, context, execution);
   const auto expected = query_cuda_notify_workspace(
       config, context.calling_rank(), routes.num_tokens(),
       workspace.plan().max_tokens_per_rank);
@@ -1842,6 +2034,81 @@ struct DeviceDispatchHandle::Impl {
   BackendCompletion summary_completion;
 };
 
+struct DeviceDispatchConsumerLease::Impl {
+  DeviceDispatchHandle owner;
+  std::shared_ptr<WorkspaceState> workspace;
+  DeviceDispatchMetadata device;
+  DeviceDispatchIdentity identity;
+  DeviceDispatchSizes sizes;
+  RankCollectiveContext context;
+  std::uint64_t epoch = 0;
+  CudaExecution execution;
+  std::size_t event_index = SIZE_MAX;
+  DeviceDispatchConsumerState state = DeviceDispatchConsumerState::Acquired;
+
+  DeviceDispatchKernelView kernel_view() const {
+    if (!owner || state == DeviceDispatchConsumerState::Released ||
+        !workspace || workspace->epoch != epoch ||
+        identity.generation != epoch)
+      invalid("phase=dispatch-consumer-view, field=state, rank=n/a, "
+              "expected=acquired/submitted, actual=empty/released");
+    const auto &workspace_ref = *workspace;
+    const auto &dl = workspace_ref.device_layout;
+    auto *base = workspace_ref.allocation->device_ptr;
+    auto exec = internal::checked_execution_state(execution);
+    auto count = internal::CudaDeviceLeaseAccess::checked(
+        device.source_expert_count, exec->device);
+    DeviceDispatchKernelView view{};
+    view.identity = identity;
+    view.sizes = sizes;
+    view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
+    view.local_offset = at<const std::uint64_t>(base, dl.local_offset);
+    view.route_dst_row = at<const std::uint64_t>(base, dl.route_dst_row);
+    view.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);
+    view.route_dst_node = at<const std::uint32_t>(base, dl.route_dst_node);
+    view.route_dst_local_rank =
+        at<const std::uint32_t>(base, dl.route_dst_local_rank);
+    view.combine_order = at<const std::uint32_t>(base, dl.combine_order);
+    view.destination_node_mask = at<const std::uint64_t>(base, dl.masks);
+    view.source_expert_count = static_cast<const std::uint64_t *>(count->pointer);
+    view.owned_expert_ids = at<const std::uint32_t>(base, dl.owned_expert_ids);
+    view.expert_row_count = at<const std::uint64_t>(base, dl.owned_expert_count);
+    view.expert_row_prefix = at<const std::uint64_t>(base, dl.owned_expert_prefix);
+    view.mtile_row_offsets = at<const std::uint64_t>(base, dl.mtile_offsets);
+    view.mtile_expected_rows = at<const std::uint32_t>(base, dl.mtile_rows);
+    view.incoming_rows = at<const DeviceIncomingRowRecord>(base, dl.incoming_rows);
+    view.reverse_routes = at<const DeviceReverseRouteRecord>(base, dl.reverse_routes);
+    view.packet_headers = at<const DevicePacketHeaderRecord>(base, dl.packet_headers);
+    view.packet_fanout_offsets =
+        at<const std::uint64_t>(base, dl.packet_fanout_offsets);
+    view.packet_fanout = at<const DeviceFanoutRecord>(base, dl.packet_fanout);
+    view.outgoing_signals = at<const DeviceSignalRecord>(base, dl.outgoing_signals);
+    view.incoming_proxy_signals =
+        at<const DeviceSignalRecord>(base, dl.incoming_signals);
+    return view;
+  }
+
+  void release_noexcept() noexcept {
+    if (!owner || state == DeviceDispatchConsumerState::Released)
+      return;
+    auto workspace_owner = workspace;
+    if (state == DeviceDispatchConsumerState::Submitted) {
+      (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
+      (void)cudaEventSynchronize(
+          workspace_owner->allocation->consumer_events[event_index]);
+    }
+    {
+      std::lock_guard<std::mutex> lock(workspace_owner->consumer_mutex);
+      if (event_index < workspace_owner->consumer_in_use.size())
+        workspace_owner->consumer_in_use[event_index] = false;
+    }
+    state = DeviceDispatchConsumerState::Released;
+    owner = {};
+    device = {};
+    workspace.reset();
+  }
+};
+
 namespace {
 
 void validate_device_completion(const BackendCompletion &completion,
@@ -1888,7 +2155,8 @@ std::vector<T> download_vector(const std::shared_ptr<WorkspaceState> &state,
 
 DeviceDispatchHandle DeviceMetadataBridge::materialize(
     const CudaLocalNotifyHandle &local, BackendCompletion expert_counts,
-    BackendCompletion packet_summary, const CudaExecution &execution) {
+    BackendCompletion packet_summary, const CudaExecution &execution,
+    Timings *timings) {
   if (!local || !execution)
     invalid("phase=device-materialize, field=input, rank=n/a, "
             "expected=valid, actual=empty");
@@ -2065,7 +2333,19 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
             std::to_string(rank) + ", expected<=UINT_MAX, actual=" +
             std::to_string(incoming_pairs));
 
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventRecord(state->allocation->planning_start, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(prefix planning start)");
   materialize_prefix_plan_kernel<<<1, 1, 0, exec->stream>>>(args);
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventRecord(state->allocation->planning_complete, exec->stream),
+      rank, context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(prefix planning complete)");
   materialize_routes_kernel<<<blocks_for(plan.route_count, "route_grid"),
                               threads, 0, exec->stream>>>(args);
   materialize_incoming_kernel<<<
@@ -2083,6 +2363,12 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
                        context.session().generation(),
                        ExchangeKind::ExpertCounts,
                        "parallel materialization kernel launch");
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventRecord(state->allocation->mapping_complete, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(materialization complete)");
   internal::throw_cuda(
       "device-materialize",
       cudaMemcpyAsync(at<void>(state->allocation->host_ptr,
@@ -2107,6 +2393,28 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventSynchronize");
+  if (timings) {
+    float planning_ms = 0;
+    float remaining_ms = 0;
+    internal::throw_cuda(
+        "device-materialize",
+        cudaEventElapsedTime(&planning_ms, state->allocation->planning_start,
+                             state->allocation->planning_complete),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaEventElapsedTime(prefix planning)");
+    internal::throw_cuda(
+        "device-materialize",
+        cudaEventElapsedTime(&remaining_ms,
+                             state->allocation->planning_complete,
+                             state->allocation->mapping_complete),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaEventElapsedTime(remaining materialization)");
+    timings->prefix_planning_us = static_cast<double>(planning_ms) * 1000.0;
+    timings->remaining_parallel_us =
+        static_cast<double>(remaining_ms) * 1000.0;
+  }
   const auto *status = at<const DeviceMaterializationStatus>(
       state->allocation->host_ptr,
       state->host_layout.materialization_status);
@@ -2214,7 +2522,8 @@ DeviceDispatchHandle testing::materialize_fake_device_collectives(
             std::to_string(context.calling_rank()) +
             ", expected=exact initialized matrices, actual=mismatch");
 
-  auto routes = upload_cuda_routes(local_routes, config.top_k, execution);
+  auto routes = upload_cuda_routes(local_routes, config.top_k, context,
+                                   execution);
   const auto plan = query_cuda_notify_workspace(
       config, context.calling_rank(), local_routes.num_tokens,
       max_tokens_per_rank);
@@ -2282,12 +2591,6 @@ DeviceDispatchHandle testing::materialize_fake_device_collectives(
       std::move(summary_completion), execution);
 }
 
-const DeviceDispatchMetadata &DeviceDispatchHandle::device() const {
-  if (!impl_)
-    invalid("attempted to access empty device dispatch handle");
-  return impl_->device;
-}
-
 const DeviceDispatchIdentity &DeviceDispatchHandle::identity() const {
   if (!impl_)
     invalid("attempted to access empty device dispatch handle identity");
@@ -2306,7 +2609,7 @@ const DeviceMaterializationAudit &DeviceDispatchHandle::audit() const {
   return impl_->audit;
 }
 
-DeviceDispatchView DeviceDispatchHandle::checked_view(
+DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
     const CudaExecution &execution,
     const DeviceDispatchViewExpectation &expected) const {
   if (!impl_ || !execution)
@@ -2327,44 +2630,177 @@ DeviceDispatchView DeviceDispatchHandle::checked_view(
             std::to_string(id.calling_rank) +
             ", expected=exact handle config digest, actual=mismatch");
   auto exec = internal::checked_execution_state(execution);
-  auto count = internal::CudaDeviceLeaseAccess::checked(
-      impl_->device.source_expert_count, exec->device);
-  const auto &dl = impl_->workspace->device_layout;
-  auto *base = impl_->workspace->allocation->device_ptr;
-  DeviceDispatchView view{};
-  view.identity = id;
-  view.sizes = impl_->sizes;
-  view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
-  view.local_offset = at<const std::uint64_t>(base, dl.local_offset);
-  view.route_dst_row = at<const std::uint64_t>(base, dl.route_dst_row);
-  view.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);
-  view.route_dst_node = at<const std::uint32_t>(base, dl.route_dst_node);
-  view.route_dst_local_rank =
-      at<const std::uint32_t>(base, dl.route_dst_local_rank);
-  view.combine_order = at<const std::uint32_t>(base, dl.combine_order);
-  view.destination_node_mask = at<const std::uint64_t>(base, dl.masks);
-  view.source_expert_count =
-      static_cast<const std::uint64_t *>(count->pointer);
-  view.owned_expert_ids = at<const std::uint32_t>(base, dl.owned_expert_ids);
-  view.expert_row_count = at<const std::uint64_t>(base, dl.owned_expert_count);
-  view.expert_row_prefix =
-      at<const std::uint64_t>(base, dl.owned_expert_prefix);
-  view.mtile_row_offsets = at<const std::uint64_t>(base, dl.mtile_offsets);
-  view.mtile_expected_rows = at<const std::uint32_t>(base, dl.mtile_rows);
-  view.incoming_rows = at<const DeviceIncomingRowRecord>(base, dl.incoming_rows);
-  view.reverse_routes =
-      at<const DeviceReverseRouteRecord>(base, dl.reverse_routes);
-  view.packet_headers =
-      at<const DevicePacketHeaderRecord>(base, dl.packet_headers);
-  view.packet_fanout_offsets =
-      at<const std::uint64_t>(base, dl.packet_fanout_offsets);
-  view.packet_fanout = at<const DeviceFanoutRecord>(base, dl.packet_fanout);
-  view.outgoing_signals =
-      at<const DeviceSignalRecord>(base, dl.outgoing_signals);
-  view.incoming_proxy_signals =
-      at<const DeviceSignalRecord>(base, dl.incoming_signals);
-  return view;
+  if (exec->device != impl_->execution.device_ordinal())
+    invalid("phase=dispatch-consumer-acquire, field=device, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=handle device, actual=foreign device");
+  auto workspace = impl_->workspace;
+  std::size_t event_index = SIZE_MAX;
+  {
+    std::lock_guard<std::mutex> lock(workspace->consumer_mutex);
+    if (workspace->consumer_in_use.empty())
+      workspace->consumer_in_use.assign(
+          workspace->allocation->consumer_events.size(), false);
+    for (std::size_t i = 0; i < workspace->consumer_in_use.size(); ++i) {
+      if (!workspace->consumer_in_use[i]) {
+        workspace->consumer_in_use[i] = true;
+        event_index = i;
+        break;
+      }
+    }
+  }
+  if (event_index == SIZE_MAX)
+    throw NotifyDispatchError(
+        NotifyErrorCode::ResourceExhausted,
+        "phase=dispatch-consumer-acquire, field=consumer_events, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected>=1 available pooled event, actual=0");
+  try {
+    internal::throw_cuda(
+        "dispatch-consumer-acquire",
+        cudaStreamWaitEvent(exec->stream, workspace->allocation->completion),
+        id.calling_rank, id.world_size, impl_->context.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaStreamWaitEvent(notify completion)");
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(workspace->consumer_mutex);
+    workspace->consumer_in_use[event_index] = false;
+    throw;
+  }
+  auto consumer = std::make_shared<DeviceDispatchConsumerLease::Impl>();
+  consumer->owner = *this;
+  consumer->workspace = impl_->workspace;
+  consumer->device = impl_->device;
+  consumer->identity = impl_->identity;
+  consumer->sizes = impl_->sizes;
+  consumer->context = impl_->context;
+  consumer->epoch = impl_->workspace->epoch;
+  consumer->execution = execution;
+  consumer->event_index = event_index;
+  return DeviceDispatchConsumerLease(std::move(consumer));
 }
+
+DeviceDispatchConsumerLease::~DeviceDispatchConsumerLease() noexcept {
+  if (impl_)
+    impl_->release_noexcept();
+}
+DeviceDispatchConsumerLease::DeviceDispatchConsumerLease(
+    DeviceDispatchConsumerLease &&other) noexcept = default;
+DeviceDispatchConsumerLease &DeviceDispatchConsumerLease::operator=(
+    DeviceDispatchConsumerLease &&other) noexcept {
+  if (this != &other) {
+    if (impl_)
+      impl_->release_noexcept();
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
+DeviceDispatchConsumerState DeviceDispatchConsumerLease::state() const {
+  if (!impl_)
+    invalid("phase=dispatch-consumer-state, field=lease, rank=n/a, "
+            "expected=valid, actual=empty/moved-from");
+  return impl_->state;
+}
+void DeviceDispatchConsumerLease::finish() {
+  if (!impl_ || impl_->state == DeviceDispatchConsumerState::Released)
+    invalid("phase=dispatch-consumer-finish, field=state, rank=n/a, "
+            "expected=acquired/submitted, actual=empty/released");
+  auto workspace = impl_->workspace;
+  if (impl_->state == DeviceDispatchConsumerState::Submitted) {
+    const auto &id = impl_->identity;
+    internal::throw_cuda(
+        "dispatch-consumer-finish",
+        cudaEventSynchronize(
+            workspace->allocation->consumer_events[impl_->event_index]),
+        id.calling_rank, id.world_size,
+        impl_->context.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts, "cudaEventSynchronize(consumer)");
+    impl_->state = DeviceDispatchConsumerState::Completed;
+  }
+  impl_->release_noexcept();
+}
+
+class DeviceDispatchTestBridge {
+public:
+  static void submit(DeviceDispatchConsumerLease &consumer,
+                     std::uint64_t delay_cycles) {
+    if (!consumer.impl_ ||
+        consumer.impl_->state != DeviceDispatchConsumerState::Acquired)
+      invalid("phase=dispatch-test-submit, field=consumer_state, rank=n/a, "
+              "expected=Acquired, actual=invalid");
+    auto &impl = *consumer.impl_;
+    const auto view = impl.kernel_view();
+    if (view.sizes.route_count == 0)
+      invalid("phase=dispatch-test-submit, field=route_count, rank=" +
+              std::to_string(view.identity.calling_rank) +
+              ", expected>=1, actual=0");
+    auto exec = internal::checked_execution_state(impl.execution);
+    auto workspace = impl.workspace;
+    auto *destination = at<void>(workspace->allocation->host_ptr,
+                                 workspace->host_layout.materialization_status +
+                                     impl.event_index * sizeof(std::uint64_t));
+    if (workspace->host_layout.materialization_status +
+            (impl.event_index + 1U) * sizeof(std::uint64_t) >
+        workspace->host_layout.total)
+      invalid("phase=dispatch-test-submit, field=probe_staging, rank=" +
+              std::to_string(view.identity.calling_rank) +
+              ", expected=pooled consumer staging, actual=short");
+    try {
+      dispatch_consumer_probe_delay_kernel<<<1, 1, 0, exec->stream>>>(
+          view.route_dst_row, delay_cycles);
+      internal::throw_cuda(
+          "dispatch-test-submit", cudaGetLastError(),
+          view.identity.calling_rank, view.identity.world_size,
+          impl.context.session().identity(), view.identity.generation,
+          ExchangeKind::ExpertCounts, "consumer probe kernel launch");
+      internal::throw_cuda(
+          "dispatch-test-submit",
+          cudaMemcpyAsync(destination, view.route_dst_row,
+                          sizeof(std::uint64_t), cudaMemcpyDeviceToHost,
+                          exec->stream),
+          view.identity.calling_rank, view.identity.world_size,
+          impl.context.session().identity(), view.identity.generation,
+          ExchangeKind::ExpertCounts, "D2H consumer probe");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                                sizeof(std::uint64_t));
+      internal::throw_cuda(
+          "dispatch-test-submit",
+          cudaEventRecord(
+              workspace->allocation->consumer_events[impl.event_index],
+              exec->stream),
+          view.identity.calling_rank, view.identity.world_size,
+          impl.context.session().identity(), view.identity.generation,
+          ExchangeKind::ExpertCounts, "cudaEventRecord(consumer probe)");
+      impl.state = DeviceDispatchConsumerState::Submitted;
+    } catch (...) {
+      (void)cudaStreamSynchronize(exec->stream);
+      throw;
+    }
+  }
+
+  static std::uint64_t finish(DeviceDispatchConsumerLease &consumer) {
+    if (!consumer.impl_ ||
+        consumer.impl_->state != DeviceDispatchConsumerState::Submitted)
+      invalid("phase=dispatch-test-finish, field=consumer_state, rank=n/a, "
+              "expected=Submitted, actual=invalid");
+    auto workspace = consumer.impl_->workspace;
+    consumer.finish();
+    return *at<const std::uint64_t>(
+        workspace->allocation->host_ptr,
+        workspace->host_layout.materialization_status +
+            consumer.impl_->event_index * sizeof(std::uint64_t));
+  }
+};
+
+namespace testing {
+void submit_dispatch_probe(DeviceDispatchConsumerLease &consumer,
+                           std::uint64_t delay_cycles) {
+  DeviceDispatchTestBridge::submit(consumer, delay_cycles);
+}
+std::uint64_t finish_dispatch_probe(DeviceDispatchConsumerLease &consumer) {
+  return DeviceDispatchTestBridge::finish(consumer);
+}
+} // namespace testing
 
 DispatchHandle download_device_metadata_for_validation(
     const DeviceDispatchHandle &handle, const CudaExecution &execution) {
@@ -2376,7 +2812,8 @@ DispatchHandle download_device_metadata_for_validation(
       impl.identity.generation, impl.identity.calling_rank,
       impl.identity.world_size, impl.identity.num_tokens, impl.identity.top_k,
       impl.identity.config_digest_word0, impl.identity.config_digest_word1};
-  const auto view = handle.checked_view(execution, expectation);
+  auto consumer = handle.acquire_consumer(execution, expectation);
+  const auto view = consumer.impl_->kernel_view();
   auto exec = internal::checked_execution_state(execution);
   const auto state = impl.workspace;
   auto summary_state = internal::CudaDeviceLeaseAccess::checked(
@@ -2521,6 +2958,17 @@ DispatchHandle download_device_metadata_for_validation(
   auto result = DeviceNotifyBridge::make_validation_dispatch(
       std::move(metadata));
   validate_dispatch_metadata(result);
+  internal::throw_cuda(
+      "device-validation-download",
+      cudaEventRecord(
+          consumer.impl_->workspace->allocation->consumer_events[
+              consumer.impl_->event_index],
+          exec->stream),
+      impl.identity.calling_rank, impl.identity.world_size,
+      impl.context.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(consumer completion)");
+  consumer.impl_->state = DeviceDispatchConsumerState::Submitted;
+  consumer.finish();
   return result;
 }
 

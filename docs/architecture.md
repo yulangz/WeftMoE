@@ -348,9 +348,12 @@ separate backend-owned completion leases. Every published `DeviceBufferLease`
 strongly owns the common workspace state.
 Route input, workspace, output, execution stream, event, and session therefore
 remain alive through pending work and through the final
-`DeviceDispatchHandle`. Copies share those leases; the last copy releases the
-arena and NCCL completion resources. `checked_view` validates execution,
-generation, rank/world and shape before returning CUDA-only typed pointers.
+`DeviceDispatchHandle`. Copies share those leases. Public code never receives
+a detachable pointer view: `acquire_consumer` returns a move-only
+`DeviceDispatchConsumerLease`, and only a trusted launch adapter may create the
+internal `DeviceDispatchKernelView` POD. Submitted consumers record a pooled
+event on their own stream; the slot cannot return until the last handle and
+consumer have drained. The explicit
 The explicit `download_device_metadata_for_validation` diagnostic downloads
 every field for tests and reconstructs a host `DispatchHandle`; the generic
 metadata layer still cannot inspect a native pointer and the production
@@ -360,13 +363,14 @@ coordinator never invokes this API.
 
 `DeviceNotifyResourcePool` is sized from runtime maximum tokens, experts,
 top-k, world, nodes, canonical-config bytes, and an explicit
-`max_inflight_generations`. Session setup allocates, per slot:
+`max_inflight_generations` and `max_inflight_consumers`. Session setup allocates, per slot:
 
 - one host-convenience route-input device region;
 - the maximum-shape Notify transient/final arena and CUB workspace;
 - pinned status/config staging;
 - fixed control plus bounded config/count/summary send/receive slots;
-- three Notify and four collective CUDA events.
+- mapping/planning/Notify-completion and route-ready events, the configured
+  consumer-completion events, and four collective CUDA events.
 
 Slot state is `available` or `leased(epoch)`. Acquisition is serialized,
 assigns a monotonic epoch, resets backend generation state, and never allocates.
@@ -377,12 +381,24 @@ before making the slot available. Cleanup failure does not reissue the slot.
 Errors before publication release by the same path, and pool destruction is
 deferred by outstanding leases.
 
-The production route contract is `DeviceRouteInput`: immutable device storage,
-checked element capacity, execution identity, and a strong opaque owner. The
-generic metadata layer cannot obtain its pointer; only the CUDA backend
-interprets a CUDA lease after checking the execution device. The host-input
+The production route contract is
+`SelectedExpertRouteLease<std::int32_t>`: immutable int32 dtype and layout
+version, contiguous `[tokens,top_k]` shape, checked element capacity, device,
+router/pipeline session and route generation, producer execution, allocation
+owner, and a recorded producer-ready event. It is not constructible from a
+generic `DeviceBufferLease`. Same-stream consumption uses stream order;
+cross-stream consumption requires the explicit import API, which enqueues
+`cudaStreamWaitEvent` without replacing producer provenance. The host-input
 coordinator and `upload_device_routes_for_testing` are convenience/test paths,
 not router-to-Notify training interfaces.
+
+Consumer state is `Acquired -> Submitted -> Completed/Released`. An
+unsubmitted lease releases its event token immediately. A submitted lease
+waits its precreated completion event in `finish()` or its noexcept destructor.
+If the public handle dies first, the consumer still owns the arena and epoch.
+Multiple streams may acquire distinct tokens; exhaustion is
+`ResourceExhausted`, never an event allocation fallback. A single consumer
+object does not support concurrent move/submit/finish.
 
 Production construction requires a `DeviceNotifyResourcePool`. The old
 two-argument allocating constructor is private; an explicitly named

@@ -78,25 +78,29 @@ auto base_session = cuda::make_nccl_session("ep-comm", world, rank,
 auto pool = cuda::make_device_notify_resource_pool(
     base_session, execution,
     {max_shape_config, max_tokens_per_rank, max_config_wire_bytes,
-     max_inflight_generations});
-auto routes = cuda::make_device_route_input(
-    router_selected_experts, num_tokens, config.top_k, execution);
+     max_inflight_generations, max_inflight_consumers});
+cuda::SelectedExpertRouteLease<std::int32_t> routes =
+    router_output.selected_experts();
 auto session = cuda::make_nccl_generation(base_session, "ep-comm",
                                           generation);
 cuda::CudaNotifyGenerationCoordinator coordinator(session, execution, pool);
 auto generation_result = coordinator.run_device(
     {config, routes, max_tokens_per_rank});
 const auto& device_handle = generation_result.dispatch();
-auto view = device_handle.checked_view(execution,
+auto consumer = device_handle.acquire_consumer(execution,
     {generation, rank, world, local_routes.num_tokens, config.top_k,
      device_handle.identity().config_digest_word0,
      device_handle.identity().config_digest_word1});
+forward_launch_adapter.submit(consumer); // adapter alone sees the kernel POD
+consumer.finish();
 ```
 
 `DeviceDispatchHandle` is immutable and copyable through a shared arena and
-completion lease. The checked CUDA view is bound to session generation, rank,
-world, runtime shape, config digest, execution identity, and allocation
-capacity. Default/moved-from and cross-generation views fail closed. Tests and
+completion lease. Public code acquires a move-only owning consumer lease; only
+friend launch adapters can form the short-lived pointer POD. The lease is bound
+to generation, rank/world, runtime shape, config digest, execution identity,
+slot epoch and a precreated completion event. Default/moved-from and
+cross-generation consumers fail closed. Tests and
 debuggers may explicitly call `download_device_metadata_for_validation()`;
 the coordinator never calls it.
 
@@ -110,8 +114,12 @@ completion drain, returns the slot. Pool exhaustion reports
 owns the pool implementation, so a public pool object may be destroyed before
 its handles. A failed drain leaves the slot unavailable (fail closed).
 
-`run_device` is the production route path and performs no route allocation or
-upload. `run` is an explicit host convenience path: with a pool it uploads to
+`run_device` accepts only `SelectedExpertRouteLease<std::int32_t>`, whose
+dtype/layout, contiguous `[tokens,top_k]` shape, device, owner, pipeline
+session/generation, producer execution and recorded ready event are immutable.
+Cross-stream use requires `import_selected_expert_routes`, which enqueues a
+stream wait while retaining producer provenance. Generic `DeviceBufferLease`
+cannot be rebound as routes. `run` is an explicit host convenience path: with a pool it uploads to
 the already allocated route slot. `upload_device_routes_for_testing` is a
 one-time test/tool helper, not the intended training hot path. The public
 production coordinator constructor requires a pool; the allocating constructor

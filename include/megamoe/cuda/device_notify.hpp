@@ -17,8 +17,11 @@ class CudaExecution;
 class CudaLocalNotifyHandle;
 class DeviceDispatchHandle;
 using CudaDispatchHandle = DeviceDispatchHandle;
-class DeviceRouteInput;
-using CudaRouteInput = DeviceRouteInput;
+template <class T> class SelectedExpertRouteLease;
+using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
+class DeviceDispatchConsumerLease;
+class DeviceDispatchTestBridge;
+class DeviceRouteProvenanceBridge;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
 class CudaNotifyPreflight;
@@ -43,7 +46,8 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend CudaExecution make_cuda_execution(std::string, std::uint32_t);
   friend class DeviceNotifyBridge;
-  friend class DeviceRouteInput;
+  friend class SelectedExpertRouteLease<std::int32_t>;
+  friend class DeviceDispatchConsumerLease;
   friend class CudaNotifyWorkspace;
   friend class CudaNotifyOperation;
   friend class NcclAllGatherCountExchange;
@@ -57,42 +61,52 @@ CudaExecution make_cuda_execution(std::string identity,
 // Production routing input. The selected-expert matrix stays in backend-owned
 // device storage; this handle adds immutable shape, capacity, execution and
 // owner provenance without exposing a native address.
-class DeviceRouteInput {
+template <> class SelectedExpertRouteLease<std::int32_t> {
 public:
-  DeviceRouteInput() = default;
+  SelectedExpertRouteLease() = default;
   std::uint64_t num_tokens() const;
   std::uint32_t top_k() const;
   std::uint64_t route_count() const;
   std::uint64_t device_bytes() const;
+  std::uint32_t layout_version() const;
+  std::uint32_t device_ordinal() const;
+  std::uint64_t route_generation() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
   struct Impl;
-  explicit DeviceRouteInput(std::shared_ptr<const Impl> impl)
+  explicit SelectedExpertRouteLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
-  friend DeviceRouteInput make_device_route_input(
-      DeviceBufferLease, std::uint64_t, std::uint32_t,
+  friend CudaRouteInput upload_cuda_routes(
+      const RankRoutingInput &, std::uint32_t,
+      const RankCollectiveContext &, const CudaExecution &);
+  friend CudaRouteInput import_selected_expert_routes(
+      const CudaRouteInput &, const RankCollectiveContext &,
       const CudaExecution &);
-  friend DeviceRouteInput upload_cuda_routes(
-      const RankRoutingInput &, std::uint32_t, const CudaExecution &);
   friend class DeviceNotifyPoolBridge;
+  friend class DeviceRouteProvenanceBridge;
   friend class CudaNotifyOperation;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
       const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
 };
 
-DeviceRouteInput make_device_route_input(
-    DeviceBufferLease selected_experts, std::uint64_t num_tokens,
-    std::uint32_t top_k, const CudaExecution &execution);
+inline constexpr std::uint32_t kSelectedExpertRouteLayoutVersion = 1;
 
 // Explicit host convenience for tests/tools. It allocates and uploads once;
-// production training should pass the router's existing DeviceBufferLease to
-// make_device_route_input instead.
-DeviceRouteInput upload_device_routes_for_testing(
+// production training must receive this same strong type from the router.
+CudaRouteInput upload_device_routes_for_testing(
     const RankRoutingInput &routes, std::uint32_t top_k,
-    const CudaExecution &execution);
+    const RankCollectiveContext &producer_context,
+    const CudaExecution &producer_execution);
+
+// Explicit cross-stream handoff. This enqueues cudaStreamWaitEvent on the
+// consumer stream and preserves the immutable producer provenance.
+CudaRouteInput import_selected_expert_routes(
+    const CudaRouteInput &routes,
+    const RankCollectiveContext &consumer_context,
+    const CudaExecution &consumer_execution);
 
 class CudaLocalNotifyHandle {
 public:
@@ -112,6 +126,7 @@ private:
   friend class CudaNotifyOperation;
   friend class DeviceMetadataBridge;
   friend class CudaNotifyGenerationCoordinator;
+  friend class DeviceDispatchConsumerLease;
 };
 
 // Versioned POD fields directly consumed by future forward/backward kernels.
@@ -167,31 +182,6 @@ static_assert(sizeof(DevicePacketHeaderRecord) == 32);
 static_assert(sizeof(DeviceFanoutRecord) == 24);
 static_assert(sizeof(DeviceSignalRecord) == 40);
 
-struct DeviceDispatchMetadata {
-  DeviceBufferLease expert_id;
-  DeviceBufferLease local_offset;
-  DeviceBufferLease route_dst_row;
-  DeviceBufferLease route_dst_rank;
-  DeviceBufferLease route_dst_node;
-  DeviceBufferLease route_dst_local_rank;
-  DeviceBufferLease combine_order;
-  DeviceBufferLease destination_node_mask;
-  DeviceBufferLease source_expert_count;
-  DeviceBufferLease packet_summary_count;
-  DeviceBufferLease owned_expert_ids;
-  DeviceBufferLease expert_row_count;
-  DeviceBufferLease expert_row_prefix;
-  DeviceBufferLease mtile_row_offsets;
-  DeviceBufferLease mtile_expected_rows;
-  DeviceBufferLease incoming_rows;
-  DeviceBufferLease reverse_routes;
-  DeviceBufferLease packet_headers;
-  DeviceBufferLease packet_fanout_offsets;
-  DeviceBufferLease packet_fanout;
-  DeviceBufferLease outgoing_signals;
-  DeviceBufferLease incoming_proxy_signals;
-};
-
 inline constexpr std::uint32_t kDeviceDispatchLayoutVersion = 1;
 
 struct DeviceDispatchIdentity {
@@ -238,42 +228,45 @@ struct DeviceDispatchViewExpectation {
   std::uint64_t config_digest_word1 = 0;
 };
 
-// CUDA-specific typed view for forward/backward kernels. Native pointers never
-// enter the transport-independent metadata API.
-struct DeviceDispatchView {
-  DeviceDispatchIdentity identity;
-  DeviceDispatchSizes sizes;
-  const std::uint32_t *expert_id = nullptr;
-  const std::uint64_t *local_offset = nullptr;
-  const std::uint64_t *route_dst_row = nullptr;
-  const std::uint32_t *route_dst_rank = nullptr;
-  const std::uint32_t *route_dst_node = nullptr;
-  const std::uint32_t *route_dst_local_rank = nullptr;
-  const std::uint32_t *combine_order = nullptr;
-  const std::uint64_t *destination_node_mask = nullptr;
-  const std::uint64_t *source_expert_count = nullptr;
-  const std::uint32_t *owned_expert_ids = nullptr;
-  const std::uint64_t *expert_row_count = nullptr;
-  const std::uint64_t *expert_row_prefix = nullptr;
-  const std::uint64_t *mtile_row_offsets = nullptr;
-  const std::uint32_t *mtile_expected_rows = nullptr;
-  const DeviceIncomingRowRecord *incoming_rows = nullptr;
-  const DeviceReverseRouteRecord *reverse_routes = nullptr;
-  const DevicePacketHeaderRecord *packet_headers = nullptr;
-  const std::uint64_t *packet_fanout_offsets = nullptr;
-  const DeviceFanoutRecord *packet_fanout = nullptr;
-  const DeviceSignalRecord *outgoing_signals = nullptr;
-  const DeviceSignalRecord *incoming_proxy_signals = nullptr;
+enum class DeviceDispatchConsumerState : std::uint8_t {
+  Acquired,
+  Submitted,
+  Completed,
+  Released,
+};
+
+// Owning public consumer boundary. It never exposes native pointers. A trusted
+// launch adapter submits work and records the pooled completion event.
+class DeviceDispatchConsumerLease {
+public:
+  DeviceDispatchConsumerLease() = default;
+  ~DeviceDispatchConsumerLease() noexcept;
+  DeviceDispatchConsumerLease(const DeviceDispatchConsumerLease &) = delete;
+  DeviceDispatchConsumerLease &operator=(const DeviceDispatchConsumerLease &) = delete;
+  DeviceDispatchConsumerLease(DeviceDispatchConsumerLease &&) noexcept;
+  DeviceDispatchConsumerLease &operator=(DeviceDispatchConsumerLease &&) noexcept;
+  DeviceDispatchConsumerState state() const;
+  void finish();
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceDispatchConsumerLease(std::shared_ptr<Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<Impl> impl_;
+  friend class DeviceDispatchHandle;
+  friend class DeviceDispatchTestBridge;
+  friend DispatchHandle download_device_metadata_for_validation(
+      const DeviceDispatchHandle &, const CudaExecution &);
 };
 
 class DeviceDispatchHandle {
 public:
   DeviceDispatchHandle() = default;
-  const DeviceDispatchMetadata &device() const;
   const DeviceDispatchIdentity &identity() const;
   const DeviceDispatchSizes &sizes() const;
   const DeviceMaterializationAudit &audit() const;
-  DeviceDispatchView checked_view(
+  DeviceDispatchConsumerLease acquire_consumer(
       const CudaExecution &execution,
       const DeviceDispatchViewExpectation &expected) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
@@ -319,6 +312,9 @@ DeviceDispatchHandle materialize_fake_device_collectives(
     std::uint64_t max_tokens_per_rank,
     const std::vector<std::uint64_t> &expert_count_matrix,
     const std::vector<std::uint64_t> &packet_summary_matrix);
+void submit_dispatch_probe(DeviceDispatchConsumerLease &consumer,
+                           std::uint64_t delay_cycles);
+std::uint64_t finish_dispatch_probe(DeviceDispatchConsumerLease &consumer);
 } // namespace testing
 
 } // namespace megamoe::cuda

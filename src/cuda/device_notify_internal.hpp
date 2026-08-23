@@ -4,18 +4,83 @@
 
 namespace megamoe::cuda {
 
+// Backend-private opaque slices. Generic DeviceBufferLease remains confined to
+// CUDA/NCCL implementation code and never enters the public dispatch API.
+struct DeviceDispatchMetadata {
+  DeviceBufferLease expert_id;
+  DeviceBufferLease local_offset;
+  DeviceBufferLease route_dst_row;
+  DeviceBufferLease route_dst_rank;
+  DeviceBufferLease route_dst_node;
+  DeviceBufferLease route_dst_local_rank;
+  DeviceBufferLease combine_order;
+  DeviceBufferLease destination_node_mask;
+  DeviceBufferLease source_expert_count;
+  DeviceBufferLease packet_summary_count;
+  DeviceBufferLease owned_expert_ids;
+  DeviceBufferLease expert_row_count;
+  DeviceBufferLease expert_row_prefix;
+  DeviceBufferLease mtile_row_offsets;
+  DeviceBufferLease mtile_expected_rows;
+  DeviceBufferLease incoming_rows;
+  DeviceBufferLease reverse_routes;
+  DeviceBufferLease packet_headers;
+  DeviceBufferLease packet_fanout_offsets;
+  DeviceBufferLease packet_fanout;
+  DeviceBufferLease outgoing_signals;
+  DeviceBufferLease incoming_proxy_signals;
+};
+
 class DeviceMetadataBridge {
 public:
+  struct Timings {
+    double prefix_planning_us = 0;
+    double remaining_parallel_us = 0;
+  };
   static DeviceDispatchHandle materialize(
       const CudaLocalNotifyHandle &local,
       BackendCompletion expert_counts,
       BackendCompletion packet_summary,
-      const CudaExecution &execution);
+      const CudaExecution &execution, Timings *timings = nullptr);
 };
 
 CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                                   std::uint32_t top_k,
+                                  const RankCollectiveContext &context,
                                   const CudaExecution &execution);
+
+class DeviceRouteProvenanceBridge {
+public:
+  static void validate(const CudaRouteInput &routes,
+                       const RankCollectiveContext &context,
+                       const CudaExecution &execution);
+};
+
+struct DeviceDispatchKernelView {
+  DeviceDispatchIdentity identity;
+  DeviceDispatchSizes sizes;
+  const std::uint32_t *expert_id = nullptr;
+  const std::uint64_t *local_offset = nullptr;
+  const std::uint64_t *route_dst_row = nullptr;
+  const std::uint32_t *route_dst_rank = nullptr;
+  const std::uint32_t *route_dst_node = nullptr;
+  const std::uint32_t *route_dst_local_rank = nullptr;
+  const std::uint32_t *combine_order = nullptr;
+  const std::uint64_t *destination_node_mask = nullptr;
+  const std::uint64_t *source_expert_count = nullptr;
+  const std::uint32_t *owned_expert_ids = nullptr;
+  const std::uint64_t *expert_row_count = nullptr;
+  const std::uint64_t *expert_row_prefix = nullptr;
+  const std::uint64_t *mtile_row_offsets = nullptr;
+  const std::uint32_t *mtile_expected_rows = nullptr;
+  const DeviceIncomingRowRecord *incoming_rows = nullptr;
+  const DeviceReverseRouteRecord *reverse_routes = nullptr;
+  const DevicePacketHeaderRecord *packet_headers = nullptr;
+  const std::uint64_t *packet_fanout_offsets = nullptr;
+  const DeviceFanoutRecord *packet_fanout = nullptr;
+  const DeviceSignalRecord *outgoing_signals = nullptr;
+  const DeviceSignalRecord *incoming_proxy_signals = nullptr;
+};
 
 struct CudaNotifyWorkspacePlan {
   std::uint32_t calling_rank = 0;
@@ -74,9 +139,11 @@ class DeviceNotifyPoolBridge {
 public:
   static std::shared_ptr<CudaNotifyPoolAllocation> allocate(
       const CudaNotifyWorkspacePlan &max_plan,
-      const CudaExecution &execution);
+      const CudaExecution &execution,
+      std::uint32_t max_inflight_consumers = 4);
   static CudaRouteInput upload(
       const RankRoutingInput &routes, std::uint32_t top_k,
+      const RankCollectiveContext &context,
       const CudaExecution &execution,
       const std::shared_ptr<CudaNotifyPoolAllocation> &allocation,
       std::shared_ptr<const void> slot_lease);
@@ -92,6 +159,8 @@ public:
   static std::uint64_t device_bytes(
       const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
   static std::uint64_t pinned_bytes(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
+  static std::uint64_t event_count(
       const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
 };
 

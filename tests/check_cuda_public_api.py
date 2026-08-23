@@ -61,6 +61,41 @@ int main() {
                                                                execution);
 }
 ''',
+    "generic_route_rebind": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::DeviceBufferLease generic;
+  megamoe::cuda::CudaExecution execution;
+  (void)megamoe::cuda::make_device_route_input(generic, 1, 1, execution);
+}
+''',
+    "wrong_route_dtype": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::SelectedExpertRouteLease<std::uint64_t> wrong_dtype;
+}
+''',
+    "dispatch_checked_raw_view": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::DeviceDispatchHandle handle;
+  megamoe::cuda::CudaExecution execution;
+  megamoe::cuda::DeviceDispatchViewExpectation expected;
+  auto view = handle.checked_view(execution, expected);
+  (void)view.route_dst_row;
+}
+''',
+    "public_kernel_view": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() { megamoe::cuda::DeviceDispatchKernelView view; }
+''',
+    "public_generic_dispatch_buffers": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::DeviceDispatchHandle handle;
+  (void)handle.device().route_dst_row;
+}
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)
@@ -76,4 +111,4 @@ with tempfile.TemporaryDirectory() as directory:
             raise SystemExit(f"retired API unexpectedly compiled: {name}")
         if not result.stderr.strip():
             raise SystemExit(f"{name} failed without a compiler diagnostic")
-print("[PASS] 12 retired/unpooled raw protocol APIs are compile-negative")
+print(f"[PASS] {len(cases)} retired/unpooled/raw-pointer APIs are compile-negative")
