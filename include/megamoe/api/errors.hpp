@@ -20,6 +20,7 @@ enum class NotifyErrorCode {
     CudaFailure,
     NcclFailure,
     ControlProtocolFailure,
+    ResourceExhausted,
 };
 
 class NotifyDispatchError final : public std::runtime_error {

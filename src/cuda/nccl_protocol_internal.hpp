@@ -176,6 +176,8 @@ public:
   NcclAllGatherCountExchange(const NcclSession &, const CudaExecution &);
   NcclAllGatherCountExchange(const NcclSession &, const CudaExecution &,
                              std::uint64_t, std::uint64_t);
+  NcclAllGatherCountExchange(const NcclSession &, const CudaExecution &,
+                             std::uint64_t, std::uint64_t, std::size_t);
   ~NcclAllGatherCountExchange() noexcept override;
   NcclAllGatherCountExchange(const NcclAllGatherCountExchange &) = delete;
   NcclAllGatherCountExchange &
@@ -193,6 +195,7 @@ public:
                                    const ValidatedControlHandle &);
   CollectiveProtocolAudit audit() const;
   NcclWorkspaceUsage workspace_usage() const;
+  void prepare_generation(const NcclSession &);
 
 private:
   std::shared_ptr<Impl> impl_;

@@ -72,11 +72,20 @@ materializer runs, and no final metadata is bulk-uploaded on this path.
 
 ```cpp
 auto execution = cuda::make_cuda_execution("notify-stream", device);
-auto session = cuda::make_nccl_session("ep-comm", world, rank, generation,
-                                       device, bootstrap_id);
-cuda::CudaNotifyGenerationCoordinator coordinator(session, execution);
-auto generation_result = coordinator.run(
-    {config, local_routes, max_tokens_per_rank});
+auto base_session = cuda::make_nccl_session("ep-comm", world, rank,
+                                            first_generation, device,
+                                            bootstrap_id);
+auto pool = cuda::make_device_notify_resource_pool(
+    base_session, execution,
+    {max_shape_config, max_tokens_per_rank, max_config_wire_bytes,
+     max_inflight_generations});
+auto routes = cuda::make_device_route_input(
+    router_selected_experts, num_tokens, config.top_k, execution);
+auto session = cuda::make_nccl_generation(base_session, "ep-comm",
+                                          generation);
+cuda::CudaNotifyGenerationCoordinator coordinator(session, execution, pool);
+auto generation_result = coordinator.run_device(
+    {config, routes, max_tokens_per_rank});
 const auto& device_handle = generation_result.dispatch();
 auto view = device_handle.checked_view(execution,
     {generation, rank, world, local_routes.num_tokens, config.top_k,
@@ -90,6 +99,23 @@ world, runtime shape, config digest, execution identity, and allocation
 capacity. Default/moved-from and cross-generation views fail closed. Tests and
 debuggers may explicitly call `download_device_metadata_for_validation()`;
 the coordinator never calls it.
+
+`DeviceNotifyResourcePool` preallocates every route slot, Notify arena, pinned
+status region, NCCL control/config/count/summary slot, CUB temporary region,
+and CUDA event at session setup. A generation acquires one exclusive slot and
+monotonic epoch. The slot lease is shared by the workspace and every published
+handle copy; only destruction of the last copy, followed by successful stream
+completion drain, returns the slot. Pool exhaustion reports
+`ResourceExhausted` and never falls back to an allocation. The lease strongly
+owns the pool implementation, so a public pool object may be destroyed before
+its handles. A failed drain leaves the slot unavailable (fail closed).
+
+`run_device` is the production route path and performs no route allocation or
+upload. `run` is an explicit host convenience path: with a pool it uploads to
+the already allocated route slot. `upload_device_routes_for_testing` is a
+one-time test/tool helper, not the intended training hot path. The public
+production coordinator constructor requires a pool; the allocating constructor
+is private and reachable only through an explicitly named `testing` factory.
 
 This coordinator is the only public production protocol entry; device upload,
 workspace allocation, preflight wait, control start, and data-collective start

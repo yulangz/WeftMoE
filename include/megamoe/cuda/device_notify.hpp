@@ -17,7 +17,8 @@ class CudaExecution;
 class CudaLocalNotifyHandle;
 class DeviceDispatchHandle;
 using CudaDispatchHandle = DeviceDispatchHandle;
-class CudaRouteInput;
+class DeviceRouteInput;
+using CudaRouteInput = DeviceRouteInput;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
 class CudaNotifyPreflight;
@@ -42,7 +43,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend CudaExecution make_cuda_execution(std::string, std::uint32_t);
   friend class DeviceNotifyBridge;
-  friend class CudaRouteInput;
+  friend class DeviceRouteInput;
   friend class CudaNotifyWorkspace;
   friend class CudaNotifyOperation;
   friend class NcclAllGatherCountExchange;
@@ -52,6 +53,46 @@ private:
 
 CudaExecution make_cuda_execution(std::string identity,
                                   std::uint32_t device_ordinal);
+
+// Production routing input. The selected-expert matrix stays in backend-owned
+// device storage; this handle adds immutable shape, capacity, execution and
+// owner provenance without exposing a native address.
+class DeviceRouteInput {
+public:
+  DeviceRouteInput() = default;
+  std::uint64_t num_tokens() const;
+  std::uint32_t top_k() const;
+  std::uint64_t route_count() const;
+  std::uint64_t device_bytes() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceRouteInput(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend DeviceRouteInput make_device_route_input(
+      DeviceBufferLease, std::uint64_t, std::uint32_t,
+      const CudaExecution &);
+  friend DeviceRouteInput upload_cuda_routes(
+      const RankRoutingInput &, std::uint32_t, const CudaExecution &);
+  friend class DeviceNotifyPoolBridge;
+  friend class CudaNotifyOperation;
+  friend CudaNotifyOperation start_cuda_rank_local_notify(
+      const RuntimeConfig &, const RankCollectiveContext &,
+      const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
+};
+
+DeviceRouteInput make_device_route_input(
+    DeviceBufferLease selected_experts, std::uint64_t num_tokens,
+    std::uint32_t top_k, const CudaExecution &execution);
+
+// Explicit host convenience for tests/tools. It allocates and uploads once;
+// production training should pass the router's existing DeviceBufferLease to
+// make_device_route_input instead.
+DeviceRouteInput upload_device_routes_for_testing(
+    const RankRoutingInput &routes, std::uint32_t top_k,
+    const CudaExecution &execution);
 
 class CudaLocalNotifyHandle {
 public:
@@ -255,5 +296,29 @@ DispatchHandle download_device_metadata_for_validation(
 
 void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &handle,
                                       const CudaExecution &execution);
+
+namespace testing {
+struct CudaApiAuditSnapshot {
+  std::uint64_t device_allocations = 0;
+  std::uint64_t device_frees = 0;
+  std::uint64_t pinned_allocations = 0;
+  std::uint64_t pinned_frees = 0;
+  std::uint64_t event_creates = 0;
+  std::uint64_t event_destroys = 0;
+  std::uint64_t device_synchronizes = 0;
+  std::uint64_t h2d_bytes = 0;
+  std::uint64_t d2h_bytes = 0;
+  std::uint64_t d2d_bytes = 0;
+};
+CudaApiAuditSnapshot cuda_api_audit_snapshot() noexcept;
+DeviceDispatchHandle materialize_fake_device_collectives(
+    const RuntimeConfig &config,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution,
+    const RankRoutingInput &local_routes,
+    std::uint64_t max_tokens_per_rank,
+    const std::vector<std::uint64_t> &expert_count_matrix,
+    const std::vector<std::uint64_t> &packet_summary_matrix);
+} // namespace testing
 
 } // namespace megamoe::cuda

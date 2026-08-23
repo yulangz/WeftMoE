@@ -46,9 +46,13 @@ The correctness and distributed agreement slice is complete.
 - Full-field host/Python oracle comparison, 25 fixed seeds, 20 deterministic
   repeats, world 1/2/8 and two-host validation.
 
-Still open inside Notify: parallelized prefix/descriptor specialization,
-hierarchical/GIN count exchange, graph capture, and SM90-specific tuning. These
-may replace the baseline kernel without changing the layout semantics.
+The first parallel baseline and session-level preallocation boundary are now
+present: bulk routes, incoming rows, tiles, fan-out, and signals are emitted in
+parallel from deterministic prefixes, and pooled steady generations perform no
+CUDA/pinned/event allocation. Further parallelization of the small checked
+planning scan, hierarchical/GIN count exchange, graph capture, and SM90-specific
+tuning remain open. These may replace the baseline without changing layout
+semantics.
 
 ## Phase 4 — single-node forward persistent MegaKernel
 

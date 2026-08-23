@@ -13,6 +13,21 @@
 
 namespace megamoe::cuda::internal {
 
+enum class CudaApiAuditKind {
+  DeviceAllocate,
+  DeviceFree,
+  PinnedAllocate,
+  PinnedFree,
+  EventCreate,
+  EventDestroy,
+  DeviceSynchronize,
+  HostToDevice,
+  DeviceToHost,
+  DeviceToDevice,
+};
+void record_cuda_api(CudaApiAuditKind kind,
+                     std::uint64_t bytes = 0) noexcept;
+
 struct CudaExecutionState final : BackendExecutionState {
   std::uint32_t device = 0;
   cudaStream_t stream = nullptr;

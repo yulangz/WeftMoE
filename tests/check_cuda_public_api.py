@@ -52,6 +52,15 @@ int main() { megamoe::cuda::NcclBootstrapId id; (void)id.hex(); }
 #include "megamoe/cuda/nccl_count_exchange.hpp"
 int main() { (void)megamoe::cuda::parse_nccl_bootstrap_id("00"); }
 ''',
+    "unpooled_production_coordinator": r'''
+#include "megamoe/cuda/nccl_count_exchange.hpp"
+int main() {
+  megamoe::cuda::NcclSession session;
+  megamoe::cuda::CudaExecution execution;
+  megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                               execution);
+}
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)
@@ -67,4 +76,4 @@ with tempfile.TemporaryDirectory() as directory:
             raise SystemExit(f"retired API unexpectedly compiled: {name}")
         if not result.stderr.strip():
             raise SystemExit(f"{name} failed without a compiler diagnostic")
-print("[PASS] 11 retired raw/preflight/collective/bootstrap text APIs are compile-negative")
+print("[PASS] 12 retired/unpooled raw protocol APIs are compile-negative")

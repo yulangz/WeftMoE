@@ -13,6 +13,11 @@ namespace megamoe::cuda {
 class NcclSession;
 class NcclBootstrapInputChannel;
 class NcclBootstrapOutputChannel;
+class CudaNotifyGenerationCoordinator;
+namespace testing {
+CudaNotifyGenerationCoordinator make_unpooled_coordinator_for_testing(
+    const NcclSession &, const CudaExecution &);
+}
 
 class NcclBootstrapId {
 public:
@@ -40,6 +45,7 @@ public:
   const CollectiveSession &session() const;
   std::uint32_t rank() const;
   std::uint32_t device_ordinal() const;
+  bool shares_communicator_with(const NcclSession &other) const noexcept;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -93,6 +99,8 @@ struct NcclWorkspaceUsage {
 };
 
 struct GenerationSetupTimings {
+  double one_time_pool_setup_us = 0;
+  double pool_acquire_us = 0;
   double coordinator_backend_create_us = 0;
   double control_slot_allocation_us = 0;
   double config_slot_allocation_us = 0;
@@ -114,6 +122,7 @@ struct GenerationExecutionTimings {
   double expert_count_us = 0;
   double packet_summary_us = 0;
   double device_materialization_us = 0;
+  double pool_acquire_release_us = 0;
 };
 
 struct NotifyGenerationRequest {
@@ -121,6 +130,50 @@ struct NotifyGenerationRequest {
   RankRoutingInput local_routes;
   std::uint64_t max_tokens_per_rank = 0;
 };
+
+struct DeviceNotifyGenerationRequest {
+  RuntimeConfig config;
+  DeviceRouteInput local_routes;
+  std::uint64_t max_tokens_per_rank = 0;
+};
+
+struct DeviceNotifyResourcePoolConfig {
+  RuntimeConfig capacity_config;
+  std::uint64_t max_tokens_per_rank = 0;
+  std::uint64_t max_config_wire_bytes = 0;
+  std::uint32_t max_inflight_generations = 2;
+};
+
+struct DeviceNotifyResourcePoolUsage {
+  std::uint32_t slot_count = 0;
+  std::uint32_t slots_in_use = 0;
+  std::uint64_t slot_epoch_high_watermark = 0;
+  std::uint64_t device_bytes = 0;
+  std::uint64_t pinned_host_bytes = 0;
+  std::uint64_t event_count = 0;
+  double one_time_setup_us = 0;
+};
+
+class DeviceNotifyResourcePool {
+public:
+  DeviceNotifyResourcePool() = default;
+  DeviceNotifyResourcePoolUsage usage() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceNotifyResourcePool(std::shared_ptr<Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<Impl> impl_;
+  friend DeviceNotifyResourcePool make_device_notify_resource_pool(
+      const NcclSession &, const CudaExecution &,
+      DeviceNotifyResourcePoolConfig);
+  friend class CudaNotifyGenerationCoordinator;
+};
+
+DeviceNotifyResourcePool make_device_notify_resource_pool(
+    const NcclSession &base_session, const CudaExecution &execution,
+    DeviceNotifyResourcePoolConfig config);
 
 // A successful result can only be published after the exact sequence
 // control/config/count/summary has completed once each.
@@ -148,7 +201,8 @@ private:
 class CudaNotifyGenerationCoordinator {
 public:
   CudaNotifyGenerationCoordinator(const NcclSession &session,
-                                  const CudaExecution &execution);
+                                  const CudaExecution &execution,
+                                  const DeviceNotifyResourcePool &pool);
   ~CudaNotifyGenerationCoordinator() noexcept;
   CudaNotifyGenerationCoordinator(
       const CudaNotifyGenerationCoordinator &) = delete;
@@ -159,13 +213,19 @@ public:
       CudaNotifyGenerationCoordinator &&) noexcept;
 
   ValidatedCudaGeneration run(NotifyGenerationRequest request);
+  ValidatedCudaGeneration run_device(DeviceNotifyGenerationRequest request);
   CollectiveProtocolAudit audit() const;
   NcclWorkspaceUsage workspace_usage() const;
   GenerationSetupTimings setup_timings() const;
 
 private:
+  CudaNotifyGenerationCoordinator(const NcclSession &session,
+                                  const CudaExecution &execution);
   struct Impl;
   std::shared_ptr<Impl> impl_;
+  friend CudaNotifyGenerationCoordinator
+  testing::make_unpooled_coordinator_for_testing(
+      const NcclSession &, const CudaExecution &);
 };
 
 const char *compiled_nccl_version() noexcept;

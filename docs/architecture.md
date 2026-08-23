@@ -315,9 +315,13 @@ number, which is scattered back as `local_offset`. Atomics are limited to
 commutative histogram/summary accumulation and deterministic minimum-invalid-
 coordinate reporting; no atomic return order chooses a canonical row.
 
-After NCCL data completion, one checked stream-ordered device kernel directly
-consumes `[source_rank, expert]` and `[source_rank, destination_node]` matrices
-and fills:
+After NCCL data completion, a checked stream-ordered materialization pipeline
+directly consumes `[source_rank, expert]` and
+`[source_rank, destination_node]` matrices. A small serial planning kernel
+validates collective values and establishes bounded output lengths/prefixes;
+the bulk records are then emitted by regular parallel per-route,
+per-expert/source, per-expert, per-packet, and per-node kernels. The pipeline
+fills:
 
 - route destination row plus all original route arrays and node masks;
 - `[source_rank, expert]` counts, owned expert IDs/counts/prefixes, flattened
@@ -331,6 +335,11 @@ Only after those checks does it write variable-length records. Source ranks,
 destination ranks, experts, nodes, tokens, and top-k slots are traversed in
 fixed ascending order. Packet order is `(destination_node, local_token_id)` and
 fan-out consumes the device `combine_order`, which is expert-ID order.
+
+No parallel phase uses an atomic return value to choose an output index. Every
+writer consumes checked prefixes, and every route-sort key contains the flat
+route index as an explicit tie-breaker. Block scheduling and stream enqueue
+timing therefore cannot change any byte of the published layout.
 
 The POD record schema is layout version 1. It places 64-bit fields before
 32-bit fields and fixes every record size with compile-time assertions. The
@@ -346,6 +355,48 @@ The explicit `download_device_metadata_for_validation` diagnostic downloads
 every field for tests and reconstructs a host `DispatchHandle`; the generic
 metadata layer still cannot inspect a native pointer and the production
 coordinator never invokes this API.
+
+## Session resource pool and slot lifecycle
+
+`DeviceNotifyResourcePool` is sized from runtime maximum tokens, experts,
+top-k, world, nodes, canonical-config bytes, and an explicit
+`max_inflight_generations`. Session setup allocates, per slot:
+
+- one host-convenience route-input device region;
+- the maximum-shape Notify transient/final arena and CUB workspace;
+- pinned status/config staging;
+- fixed control plus bounded config/count/summary send/receive slots;
+- three Notify and four collective CUDA events.
+
+Slot state is `available` or `leased(epoch)`. Acquisition is serialized,
+assigns a monotonic epoch, resets backend generation state, and never allocates.
+The workspace and successful result share the same lease. A handle copy keeps
+the slot alive; a moved-from/default handle cannot. When the last lease dies,
+its noexcept cleanup records and waits on the precreated completion event
+before making the slot available. Cleanup failure does not reissue the slot.
+Errors before publication release by the same path, and pool destruction is
+deferred by outstanding leases.
+
+The production route contract is `DeviceRouteInput`: immutable device storage,
+checked element capacity, execution identity, and a strong opaque owner. The
+generic metadata layer cannot obtain its pointer; only the CUDA backend
+interprets a CUDA lease after checking the execution device. The host-input
+coordinator and `upload_device_routes_for_testing` are convenience/test paths,
+not router-to-Notify training interfaces.
+
+Production construction requires a `DeviceNotifyResourcePool`. The old
+two-argument allocating constructor is private; an explicitly named
+`testing::make_unpooled_coordinator_for_testing` remains solely for allocation
+fault injection. A compile-negative probe prevents its accidental restoration
+as a production constructor.
+
+For pooled generations the forbidden steady APIs are `cudaMalloc/cudaFree`,
+`cudaHostAlloc/cudaFreeHost`, `cudaEventCreate*/cudaEventDestroy`, and
+`cudaDeviceSynchronize`. Default GPU tests snapshot backend counters across ten
+generations, exercise two live handles, exhaustion, failure recovery, slot
+reuse, and pool-owner destruction. Bounded control/config/status copies remain
+visible in the audit; validation download is explicit and excluded from the
+production audit interval.
 
 ## Thread-safety contract
 

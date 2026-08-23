@@ -50,6 +50,7 @@ $(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cud
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --device-smoke
 	$(CUDA_RUN_ENV) python3 tests/run_control_protocol_regressions.py --binary $(BUILD_DIR)/test_cuda_notify
 
 cuda-test-local: $(BUILD_DIR)/test_cuda_notify
@@ -65,6 +66,8 @@ cuda-bench: $(BUILD_DIR)/test_cuda_notify
 
 cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
+	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
+	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
 
 cuda-sm90-compile:
 	$(MAKE) BUILD_DIR=$(BUILD_DIR)-sm90 CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' cuda-lib

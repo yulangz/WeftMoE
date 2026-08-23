@@ -13,29 +13,6 @@ public:
       const CudaExecution &execution);
 };
 
-class CudaRouteInput {
-public:
-  CudaRouteInput() = default;
-  std::uint64_t num_tokens() const;
-  std::uint32_t top_k() const;
-  std::uint64_t route_count() const;
-  std::uint64_t device_bytes() const;
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit CudaRouteInput(std::shared_ptr<const Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<const Impl> impl_;
-  friend CudaRouteInput upload_cuda_routes(const RankRoutingInput &,
-                                           std::uint32_t,
-                                           const CudaExecution &);
-  friend class CudaNotifyOperation;
-  friend CudaNotifyOperation start_cuda_rank_local_notify(
-      const RuntimeConfig &, const RankCollectiveContext &,
-      const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
-};
-
 CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                                   std::uint32_t top_k,
                                   const CudaExecution &execution);
@@ -81,6 +58,7 @@ private:
                                  const RankCollectiveContext &,
                                  const CudaExecution &);
   friend class CudaNotifyOperation;
+  friend class DeviceNotifyPoolBridge;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
       const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
@@ -89,6 +67,33 @@ private:
 CudaNotifyWorkspace allocate_cuda_notify_workspace(
     const CudaNotifyWorkspacePlan &plan,
     const RankCollectiveContext &context, const CudaExecution &execution);
+
+struct CudaNotifyPoolAllocation;
+
+class DeviceNotifyPoolBridge {
+public:
+  static std::shared_ptr<CudaNotifyPoolAllocation> allocate(
+      const CudaNotifyWorkspacePlan &max_plan,
+      const CudaExecution &execution);
+  static CudaRouteInput upload(
+      const RankRoutingInput &routes, std::uint32_t top_k,
+      const CudaExecution &execution,
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation,
+      std::shared_ptr<const void> slot_lease);
+  static CudaNotifyWorkspace workspace(
+      const CudaNotifyWorkspacePlan &actual_plan,
+      const RankCollectiveContext &context,
+      const CudaExecution &execution,
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation,
+      std::shared_ptr<const void> slot_lease);
+  static bool drain(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation,
+      const CudaExecution &execution) noexcept;
+  static std::uint64_t device_bytes(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
+  static std::uint64_t pinned_bytes(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
+};
 
 class CudaNotifyPreflight {
 public:

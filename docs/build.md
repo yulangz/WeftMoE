@@ -44,9 +44,10 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking.
 - every public header as an isolated `-Werror` translation unit.
-- eleven compile-negative probes for the retired `wait`, `wait_preflight`, raw
+- twelve compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
-  operation/backend types, and bootstrap hex encode/parse APIs.
+  operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
+  production coordinator constructor.
 - thirteen fake-runner/bootstrap-channel security groups covering success,
   local/remote failure, timeout and TERM-to-KILL escalation, SSH start failure,
   short/oversize bootstrap, runner exception, every 1/2/7/8/17/127/128-byte
@@ -83,7 +84,7 @@ make BUILD_DIR=build-sanitize cross-check
 ## Optional CUDA/NCCL build and local tests
 
 ```bash
-NCCL12=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib
+NCCL12=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat
 
 make BUILD_DIR=build-cuda -j cuda-lib
 make BUILD_DIR=build-cuda -j \
@@ -105,8 +106,13 @@ for comparison to the host handle. World 2 additionally runs five independent
 corruption from rank 0 and rank 1, and exact raw-session identity mismatches
 with equal display names/header summaries. World 1 runs the nine-point enqueue
 audit/lifecycle table and a self-corruption integrity check.
-The device-only sanitizer fixture additionally exercises a 73-node/two-word
-mask, an invalid expert, and a workspace plan shortened by exactly one byte.
+The default CUDA suite also runs the closed-loop fake-collective materializer:
+explicitly initialized device count/summary matrices enter the exact production
+prefix/materialization kernels and arena layout, then every field is downloaded
+and compared to the oracle. Its 73-node/one-rank-per-node fixture exercises a
+two-word mask, token-node dedup, same-rail proxying, fan-out, both signal
+directions, 20 byte-identical repeats, an invalid expert, and a workspace plan
+shortened by exactly one byte.
 
 ## Real two-host NCCL
 
@@ -118,7 +124,7 @@ PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --remote root@10.10.19.233 --port 2222 \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 1 \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   --socket-ifname '=eth0' --disable-ib
 
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
@@ -126,7 +132,7 @@ PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --remote root@10.10.19.233 --port 2222 \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 8 \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   --socket-ifname '=eth0' --disable-ib
 
 # Timeout-bounded 20-round distributed rejection/recovery on the same comm.
@@ -135,7 +141,7 @@ PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --remote root@10.10.19.233 --port 2222 \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 1 --scenario out_of_range \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   --socket-ifname '=eth0' --disable-ib
 ```
 
@@ -157,8 +163,9 @@ remote temporary file. It compares each valid 2/16-rank result against the
 Python oracle. Every rank also reports header version, `ncclGetVersion` runtime
 version, `dladdr`-resolved library path, and active network overrides.
 
-Explicit preload is required in the current container because another injected
-runtime otherwise precedes ASan.
+The inspected hosts also require the CUDA 12.9 compatibility-driver directory
+in `LD_LIBRARY_PATH`; the colon-separated `--nccl-lib-dir` example passes both
+directories explicitly to local and remote ranks without changing the system.
 
 CUDA memory checking uses valid and invalid device mapping kernels without
 instrumenting the third-party NCCL library (this NCCL binary reports
@@ -167,14 +174,14 @@ normally):
 
 ```bash
 make BUILD_DIR=build-cuda \
-  NCCL_RUNTIME_LIB_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  NCCL_RUNTIME_LIB_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   cuda-sanitizer-smoke
 
-# When available, the same smoke command can be run with:
-compute-sanitizer --tool racecheck --error-exitcode=1 \
-  build-cuda/test_cuda_notify --device-smoke
-compute-sanitizer --tool initcheck --error-exitcode=1 \
-  build-cuda/test_cuda_notify --device-smoke
+`cuda-sanitizer-smoke` runs memcheck, racecheck, and initcheck over that same
+closed-loop 73-node path. All three tools were available locally and reported
+0 errors/0 hazards. The inspected remote image did not contain the
+`compute-sanitizer` executable; its ordinary 73-node path, world 1/8 tests, and
+host ASan/UBSan still ran from the clean export.
 ```
 
 ## Notify performance baseline
@@ -182,7 +189,7 @@ compute-sanitizer --tool initcheck --error-exitcode=1 \
 The benchmark is intentionally a correctness baseline, not a GIN/RDMA result:
 
 ```bash
-LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   build-cuda/test_cuda_notify --bench 8
 ```
 
@@ -198,42 +205,52 @@ Setup-inclusive E2E is calculated per rank as `rank_setup + rank_steady` before
 choosing the slowest rank. Mapping has no per-route copy, allocation, or
 synchronization.
 
-On the inspected local 8-GPU L20X host, the refactored coordinator baseline
+On the inspected local 8-GPU L20X host, the pooled parallel coordinator
 produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 
 | stage | mean | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| one-time NCCL session setup | 1498460 | 1493350 | 1521900 | 1480160 | 1521900 |
-| per-generation setup | 6802.10 | 5048.06 | 7650.09 | 4692.24 | 75345.9 |
-| setup-inclusive generation end-to-end | 44160.3 | 42178.3 | 47453.0 | 41608.7 | 112183 |
-| steady-state execution | 37975.4 | 37685.3 | 39134.4 | 36994.0 | 46557.1 |
-| local stable mapping | 163.953 | 157.280 | 173.920 | 145.472 | 425.344 |
-| control + exact config | 2706.39 | 2587.66 | 3128.04 | 2370.41 | 5261.28 |
-| expert-count AllGather | 169.175 | 151.201 | 237.208 | 139.624 | 688.331 |
-| packet-summary AllGather | 74.2332 | 69.633 | 84.599 | 65.502 | 181.090 |
-| device prefix/materialization | 33214.7 | 33214.9 | 33231.9 | 33189.6 | 33289.0 |
+| one-time NCCL session setup | 1325100 | 1312250 | 1351720 | 1303210 | 1351720 |
+| one-time two-slot pool setup | 13352.6 | 13341.5 | 14204.3 | 11762.3 | 14204.3 |
+| per-generation setup (pool acquire) | 2.243 | 2.051 | 2.903 | 1.496 | 4.567 |
+| setup-inclusive generation end-to-end | 6825.43 | 6814.81 | 6890.41 | 6756.31 | 7010.80 |
+| steady-state execution | 6823.66 | 6812.54 | 6888.17 | 6754.77 | 7007.86 |
+| local stable mapping | 140.480 | 139.456 | 145.184 | 135.808 | 165.952 |
+| control + exact config | 855.374 | 841.635 | 932.080 | 776.720 | 997.966 |
+| expert-count AllGather | 33.093 | 31.342 | 53.374 | 27.759 | 62.863 |
+| packet-summary AllGather | 22.174 | 21.861 | 24.325 | 20.736 | 26.246 |
+| parallel device materialization | 5682.63 | 5682.37 | 5693.01 | 5672.37 | 5698.44 |
+| pool acquire + final release/drain | 24.358 | 22.546 | 33.675 | 18.102 | 44.600 |
 
-The corresponding unique peak workspace was 21,209,151 device bytes and
-34,888 pinned bytes: route input 196,608; notify arena 20,953,343; notify
-pinned status staging 328; control slot 4,608; config wire 3,584; config slot
-64,512; expert device slot 24,576; summary device slot 64. Final metadata is a 20,953,343-byte
-arena view and therefore is not added again. Seven CUDA events are reported;
-their opaque runtime allocation size is recorded as zero.
+For `max_inflight_generations=2`, the corresponding complete unique workspace
+was 42,624,126 device bytes and 78,992 pinned bytes: route input 589,824
+(two pool convenience slots plus one router/test-owned production input), two
+Notify arenas totaling 41,906,686, Notify pinned status staging 656, control
+slots 9,216, config wire storage 8,192, config slots 147,456, expert slots
+49,152, and summary slots 128. Final metadata is a 20,953,343-byte subview of
+one arena and is not added again. Fourteen CUDA events are reported; their
+opaque runtime allocation size is recorded as zero.
 
 The phase-2 same-accounting steady baseline was approximately 97.6 ms, of
-which roughly 69 ms was bulk D2H, host materialization, and bulk H2D. Stage 3
-reduces same-accounting steady mean to 38.0 ms and pinned workspace from about
-1.50 MiB to 34 KiB; production audit is `bulk route D2H / collective D2H /
-host materialize / metadata H2D = 0/0/0/0`. The current correctness kernel is
-single-threaded and still spends 33.2 ms in device prefix/descriptor generation;
-parallel scan/sort specialization is the next Notify optimization, not part of
-this semantic slice.
+which roughly 69 ms was bulk D2H, host materialization, and bulk H2D. The first
+all-device slice reduced the same-accounting steady mean to 38.0 ms, with
+33.2 ms in its serial materializer. The pooled parallel baseline now measures
+6.82 ms steady and 5.68 ms materialization while preserving production audit
+`bulk route D2H / collective D2H / host materialize / metadata H2D = 0/0/0/0`.
+Across ten pooled steady generations, CUDA API audit measured
+`cudaMalloc/cudaFree/cudaHostAlloc/cudaFreeHost/cudaEventCreate*/`
+`cudaEventDestroy/cudaDeviceSynchronize = 0` for every category. Further
+The same interval recorded bounded H2D/D2H/D2D traffic as
+8,540/8,700/0 bytes; validation download was outside the interval.
+Further parallelization of the small checked planning scan remains an
+optimization.
 
 The earlier approximately 197 ms number is not a comparable regression point:
 that runner rebuilt communicators every iteration and computed steady time by
 subtracting independently selected slowest-rank maxima. The corrected 98.0 ms
-mean used one reused session and same-rank accounting. The new 38.0 ms result
-uses that same corrected definition.
+mean used one reused session and same-rank accounting. Both the 38.0 ms serial
+device result and the new 6.82 ms pooled-parallel result use that corrected
+same-rank definition.
 
 ## Clean export
 
