@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import queue
+import secrets
 import shlex
 import subprocess
 import sys
@@ -64,7 +65,8 @@ def config_for(gpus_per_node):
     )
 
 
-def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario):
+def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario,
+                launch_id):
     return [
         binary,
         "--rank-runner",
@@ -75,6 +77,7 @@ def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario):
         "--seed", str(seed),
         "--id", bootstrap,
         "--scenario", scenario,
+        "--launch-id", launch_id,
     ]
 
 
@@ -136,7 +139,28 @@ def read_bootstrap(process, timeout):
     return bootstrap, prefix
 
 
-def stop_processes(processes):
+def remote_cleanup(args, launch_id, signal):
+    # The unique argv marker lets cleanup target only this launcher even when
+    # terminating the local ssh client did not propagate a signal remotely.
+    pattern = f"--launch-id {launch_id}"
+    command = (
+        f"pkill -{signal} -f -- " + shlex.quote(pattern)
+    )
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-p", str(args.port),
+             args.remote, command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Cleanup is best-effort here; the primary test error is preserved.
+        pass
+
+
+def stop_processes(processes, args, launch_id):
     for _rank, process, _prefix in processes:
         if process.poll() is None:
             process.terminate()
@@ -150,6 +174,9 @@ def stop_processes(processes):
     for _rank, process, _prefix in processes:
         if process.poll() is None:
             process.wait()
+    remote_cleanup(args, launch_id, "TERM")
+    time.sleep(0.25)
+    remote_cleanup(args, launch_id, "KILL")
 
 
 def main():
@@ -183,12 +210,13 @@ def main():
 
     environment = local_environment(args)
     world = 2 * args.gpus_per_node
+    launch_id = secrets.token_hex(16)
     processes = []
     outputs = []
     try:
         rank0 = subprocess.Popen(
             runner_args(args.binary, 0, args.gpus_per_node, args.seed,
-                        "GENERATE", args.scenario),
+                        "GENERATE", args.scenario, launch_id),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -202,6 +230,7 @@ def main():
             runner = runner_args(
                 args.binary if rank < args.gpus_per_node else args.remote_binary,
                 rank, args.gpus_per_node, args.seed, bootstrap, args.scenario,
+                launch_id,
             )
             command = runner if rank < args.gpus_per_node else remote_command(args, runner)
             processes.append((rank, subprocess.Popen(
@@ -220,7 +249,7 @@ def main():
             stdout, stderr = process.communicate(timeout=remaining)
             outputs.append((rank, process.returncode, prefix + stdout, stderr))
     finally:
-        stop_processes(processes)
+        stop_processes(processes, args, launch_id)
 
     runtime_lines = []
     for rank, _returncode, stdout, _stderr in outputs:
