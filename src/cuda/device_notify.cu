@@ -790,6 +790,10 @@ struct WorkspaceState {
   std::uint64_t epoch = 0;
   std::mutex consumer_mutex;
   std::vector<bool> consumer_in_use;
+  // A terminal consumer-stream failure is fail-closed: retaining self keeps
+  // the slot lease quarantined instead of making potentially live storage
+  // reusable. Normal completion never forms this cycle.
+  std::shared_ptr<WorkspaceState> failed_consumer_hold;
 };
 
 DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
@@ -2092,10 +2096,22 @@ struct DeviceDispatchConsumerLease::Impl {
     if (!owner || state == DeviceDispatchConsumerState::Released)
       return;
     auto workspace_owner = workspace;
+    bool drained = true;
     if (state == DeviceDispatchConsumerState::Submitted) {
       (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
-      (void)cudaEventSynchronize(
-          workspace_owner->allocation->consumer_events[event_index]);
+      drained = cudaEventSynchronize(
+                    workspace_owner->allocation->consumer_events[event_index]) ==
+                cudaSuccess;
+      if (!drained) {
+        try {
+          auto exec = internal::checked_execution_state(execution);
+          drained = cudaStreamSynchronize(exec->stream) == cudaSuccess;
+        } catch (...) {
+          drained = false;
+        }
+      }
+      if (!drained)
+        workspace_owner->failed_consumer_hold = workspace_owner;
     }
     {
       std::lock_guard<std::mutex> lock(workspace_owner->consumer_mutex);
