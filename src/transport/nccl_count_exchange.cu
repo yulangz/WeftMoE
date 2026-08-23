@@ -28,9 +28,53 @@ namespace megamoe::cuda {
 namespace testing {
 namespace {
 std::atomic<int> g_next_fault{0};
+thread_local std::size_t g_config_corruption_offset = SIZE_MAX;
+struct IdentityOverride {
+  std::vector<std::byte> raw;
+  StableSessionId summary;
+};
+thread_local std::unique_ptr<IdentityOverride> g_identity_override;
+std::atomic<std::uint64_t> g_slot_allocations{0};
+std::atomic<std::uint64_t> g_slot_destructions{0};
+std::atomic<std::uint64_t> g_operation_waits{0};
+std::atomic<std::uint64_t> g_operation_cancels{0};
+std::atomic<std::uint64_t> g_destructor_drains{0};
+std::atomic<std::uint64_t> g_completion_lease_creates{0};
+std::atomic<std::uint64_t> g_completion_lease_destroys{0};
+std::atomic<std::uint64_t> g_validated_publishes{0};
 }
 void inject_next_nccl_fault(NcclFaultPoint point) noexcept {
   g_next_fault.store(static_cast<int>(point), std::memory_order_release);
+}
+void corrupt_next_config_wire(std::size_t offset) noexcept {
+  g_config_corruption_offset = offset;
+}
+void override_next_protocol_identity(
+    std::vector<std::byte> raw_identity,
+    StableSessionId diagnostic_summary) noexcept {
+  try {
+    g_identity_override = std::make_unique<IdentityOverride>();
+    g_identity_override->raw = std::move(raw_identity);
+    g_identity_override->summary = diagnostic_summary;
+  } catch (...) {
+    g_identity_override.reset();
+  }
+}
+void reset_nccl_lifecycle_counters() noexcept {
+  g_slot_allocations.store(0);
+  g_slot_destructions.store(0);
+  g_operation_waits.store(0);
+  g_operation_cancels.store(0);
+  g_destructor_drains.store(0);
+  g_completion_lease_creates.store(0);
+  g_completion_lease_destroys.store(0);
+  g_validated_publishes.store(0);
+}
+NcclLifecycleSnapshot nccl_lifecycle_snapshot() noexcept {
+  return {g_slot_allocations.load(), g_slot_destructions.load(),
+          g_operation_waits.load(), g_operation_cancels.load(),
+          g_destructor_drains.load(), g_completion_lease_creates.load(),
+          g_completion_lease_destroys.load(), g_validated_publishes.load()};
 }
 } // namespace testing
 
@@ -85,6 +129,7 @@ struct Slot {
   std::uint64_t *host_send = nullptr;
   cudaEvent_t completion = nullptr;
   bool in_use = false;
+  bool tracked = false;
 
   ~Slot() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
@@ -100,6 +145,8 @@ struct Slot {
       (void)cudaFree(device_matrix);
     if (device_send)
       (void)cudaFree(device_send);
+    if (tracked)
+      testing::g_slot_destructions.fetch_add(1);
   }
 };
 
@@ -113,6 +160,7 @@ struct ByteSlot {
   std::byte *host_send = nullptr;
   cudaEvent_t completion = nullptr;
   bool in_use = false;
+  bool tracked = false;
 
   ~ByteSlot() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
@@ -128,6 +176,8 @@ struct ByteSlot {
       (void)cudaFree(device_matrix);
     if (device_send)
       (void)cudaFree(device_send);
+    if (tracked)
+      testing::g_slot_destructions.fetch_add(1);
   }
 };
 
@@ -143,6 +193,13 @@ const char *kind_name(ExchangeKind kind) noexcept {
 } // namespace
 
 namespace internal {
+
+CudaCompletionLease::CudaCompletionLease() noexcept {
+  testing::g_completion_lease_creates.fetch_add(1);
+}
+CudaCompletionLease::~CudaCompletionLease() noexcept {
+  testing::g_completion_lease_destroys.fetch_add(1);
+}
 
 NcclSessionState::~NcclSessionState() noexcept {
   if (!comm)
@@ -222,6 +279,33 @@ struct NcclSession::Impl {
   CollectiveSession session;
 };
 
+namespace {
+std::vector<std::byte> make_nccl_stable_identity(
+    const std::vector<std::uint8_t> &bootstrap, const std::string &identity) {
+  constexpr char kDomain[] = "MegaMOE/NCCL/session/v1";
+  std::vector<std::byte> result;
+  const auto total = sizeof(kDomain) - 1U + 16U + bootstrap.size() +
+                     identity.size();
+  if (total > 4096U)
+    invalid("phase=nccl-session-create, field=stable_identity_bytes, rank=n/a, expected<=4096, actual=" +
+            std::to_string(total));
+  result.reserve(total);
+  for (std::size_t index = 0; index + 1U < sizeof(kDomain); ++index)
+    result.push_back(static_cast<std::byte>(kDomain[index]));
+  const auto append_length = [&](std::uint64_t value) {
+    for (unsigned shift = 0; shift < 64; shift += 8U)
+      result.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
+  };
+  append_length(bootstrap.size());
+  for (const auto byte : bootstrap)
+    result.push_back(static_cast<std::byte>(byte));
+  append_length(identity.size());
+  for (const auto byte : identity)
+    result.push_back(static_cast<std::byte>(byte));
+  return result;
+}
+} // namespace
+
 NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
                               std::uint32_t rank, std::uint64_t generation,
                               std::uint32_t device_ordinal,
@@ -250,6 +334,7 @@ NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
   state->device = device_ordinal;
   state->rank = rank;
   state->world = world_size;
+  state->bootstrap_identity = bootstrap_id.bytes_;
   internal::throw_nccl("session-create",
                        ncclCommInitRank(&state->comm, static_cast<int>(world_size),
                                         id, static_cast<int>(rank)),
@@ -257,8 +342,11 @@ NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
                        ExchangeKind::ExpertCounts, "ncclCommInitRank");
   auto impl = std::make_shared<NcclSession::Impl>();
   impl->state = state;
-  impl->session = make_collective_session(std::move(identity), world_size,
-                                          generation, state);
+  auto stable_identity =
+      make_nccl_stable_identity(bootstrap_id.bytes_, identity);
+  impl->session = make_collective_session(
+      std::move(identity), std::move(stable_identity), world_size, generation,
+      state);
   return NcclSession(std::move(impl));
 }
 
@@ -269,8 +357,11 @@ NcclSession make_nccl_generation(const NcclSession &base,
     invalid("phase=nccl-generation-create, field=arguments, rank=n/a, expected=valid base/identity/generation, actual=invalid");
   auto impl = std::make_shared<NcclSession::Impl>();
   impl->state = base.impl_->state;
+  auto stable_identity = make_nccl_stable_identity(
+      impl->state->bootstrap_identity, identity);
   impl->session = make_collective_session(
-      std::move(identity), impl->state->world, generation, impl->state);
+      std::move(identity), std::move(stable_identity), impl->state->world,
+      generation, impl->state);
   return NcclSession(std::move(impl));
 }
 
@@ -359,6 +450,8 @@ void allocate_slot(Slot &slot, std::uint64_t width,
                        session.session().generation(), kind,
                        "cudaEventCreate(AllGather)");
   const auto event_end = std::chrono::steady_clock::now();
+  slot.tracked = true;
+  testing::g_slot_allocations.fetch_add(1);
   if (metrics) {
     metrics->device_allocation_us +=
         std::chrono::duration<double, std::micro>(device_end - device_start)
@@ -426,6 +519,8 @@ void allocate_byte_slot(ByteSlot &slot, std::size_t width,
       session.session().generation(), ExchangeKind::Control,
       "cudaEventCreate(byte slot)");
   const auto event_end = std::chrono::steady_clock::now();
+  slot.tracked = true;
+  testing::g_slot_allocations.fetch_add(1);
   if (metrics) {
     metrics->device_allocation_us +=
         std::chrono::duration<double, std::micro>(device_end - device_start)
@@ -473,6 +568,7 @@ NcclControlOperation::NcclControlOperation() = default;
 NcclControlOperation::~NcclControlOperation() noexcept {
   if (!impl_ || impl_->terminal)
     return;
+  testing::g_destructor_drains.fetch_add(1);
   (void)cudaSetDevice(
       static_cast<int>(impl_->backend->session.device_ordinal()));
   (void)cudaEventSynchronize(impl_->slot->completion);
@@ -522,6 +618,7 @@ ExchangeState NcclControlOperation::state() const noexcept {
 ValidatedControlHandle NcclControlOperation::wait() {
   if (!impl_ || impl_->terminal)
     invalid("phase=control-wait, field=operation, rank=n/a, expected=pending, actual=empty/terminal");
+  testing::g_operation_waits.fetch_add(1);
   const auto &session = impl_->context.session();
   const auto rank = impl_->context.calling_rank();
   maybe_fault(testing::NcclFaultPoint::EventWait, "control-event-wait",
@@ -582,6 +679,7 @@ ValidatedControlHandle NcclControlOperation::wait() {
 void NcclControlOperation::cancel() {
   if (!impl_ || impl_->terminal)
     return;
+  testing::g_operation_cancels.fetch_add(1);
   const auto &session = impl_->context.session();
   const auto rank = impl_->context.calling_rank();
   internal::throw_cuda(
@@ -616,6 +714,7 @@ NcclConfigOperation::NcclConfigOperation() = default;
 NcclConfigOperation::~NcclConfigOperation() noexcept {
   if (!impl_ || impl_->terminal)
     return;
+  testing::g_destructor_drains.fetch_add(1);
   (void)cudaSetDevice(
       static_cast<int>(impl_->backend->session.device_ordinal()));
   (void)cudaEventSynchronize(impl_->slot->completion);
@@ -648,6 +747,7 @@ NcclConfigOperation::operator=(NcclConfigOperation &&other) noexcept {
 ValidatedConfigHandle NcclConfigOperation::wait() {
   if (!impl_ || impl_->terminal)
     invalid("phase=config-wait, field=operation, rank=n/a, expected=pending, actual=empty/terminal");
+  testing::g_operation_waits.fetch_add(1);
   const auto &session = impl_->context.session();
   const auto rank = impl_->context.calling_rank();
   internal::throw_cuda("config-wait",
@@ -670,11 +770,18 @@ ValidatedConfigHandle NcclConfigOperation::wait() {
   internal::throw_nccl("config-wait", async, rank, session.world_size(),
                        session.identity(), session.generation(),
                        ExchangeKind::Control, "NCCL asynchronous completion");
-  std::vector<ConfigWire> matrix(session.world_size(),
-                                 ConfigWire(impl_->slot->width));
+  std::vector<ConfigWire> matrix(session.world_size());
   for (std::uint32_t source = 0; source < session.world_size(); ++source) {
     const auto offset = static_cast<std::size_t>(source) * impl_->slot->width;
-    std::copy_n(impl_->slot->host_matrix + offset, impl_->slot->width,
+    const auto row_bytes = impl_->headers[source].config_blob_bytes;
+    if (row_bytes > impl_->slot->width || row_bytes > SIZE_MAX)
+      invalid("phase=config-wait, field=config_blob_bytes, rank=" +
+              std::to_string(rank) +
+              ", expected<=collective slot width, actual=" +
+              std::to_string(row_bytes));
+    matrix[source].resize(static_cast<std::size_t>(row_bytes));
+    std::copy_n(impl_->slot->host_matrix + offset,
+                static_cast<std::size_t>(row_bytes),
                 matrix[source].begin());
   }
   {
@@ -746,6 +853,7 @@ ValidatedConfigHandle NcclConfigOperation::wait() {
 void NcclConfigOperation::cancel() {
   if (!impl_ || impl_->terminal)
     return;
+  testing::g_operation_cancels.fetch_add(1);
   (void)cudaSetDevice(
       static_cast<int>(impl_->backend->session.device_ordinal()));
   (void)cudaEventSynchronize(impl_->slot->completion);
@@ -766,6 +874,7 @@ public:
 
   ~NcclAllGatherOperation() noexcept override {
     if (!terminal_) {
+      testing::g_destructor_drains.fetch_add(1);
       (void)cudaSetDevice(static_cast<int>(impl_->session.device_ordinal()));
       (void)cudaEventSynchronize(slot_->completion);
       release();
@@ -791,6 +900,7 @@ public:
       invalid("phase=nccl-wait, kind=" + std::string(kind_name(request_.kind)) +
               ", rank=" + std::to_string(request_.context.calling_rank()) +
               ", expected=pending, actual=terminal");
+    testing::g_operation_waits.fetch_add(1);
     const auto &session = request_.context.session();
     internal::throw_cuda("nccl-wait", cudaSetDevice(static_cast<int>(impl_->session.device_ordinal())),
                          request_.context.calling_rank(), session.world_size(),
@@ -810,8 +920,9 @@ public:
                          session.world_size(), session.identity(),
                          session.generation(), request_.kind,
                          "NCCL asynchronous completion");
-    maybe_fault(testing::NcclFaultPoint::BackendCompletion,
-                "backend-completion", request_.context);
+    if (request_.kind == ExchangeKind::NotifyPacketSummary)
+      maybe_fault(testing::NcclFaultPoint::BackendCompletion,
+                  "summary-backend-completion", request_.context);
     CountMatrix rows(session.world_size(),
                      std::vector<std::uint64_t>(
                          static_cast<std::size_t>(request_.row_width)));
@@ -842,6 +953,7 @@ public:
   void cancel() override {
     if (terminal_)
       return;
+    testing::g_operation_cancels.fetch_add(1);
     const auto &session = request_.context.session();
     internal::throw_cuda("nccl-cancel", cudaSetDevice(static_cast<int>(impl_->session.device_ordinal())),
                          request_.context.calling_rank(), session.world_size(),
@@ -984,6 +1096,9 @@ NcclControlOperation NcclAllGatherCountExchange::start_control(
                       impl_->comm, impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::Control, "ncclAllGather(ControlWire bytes)");
+    // Audit means the NCCL call returned success and the collective is now
+    // enqueued. It must not depend on later D2H/event/completion success.
+    ++impl_->audit.control_starts;
     const auto matrix_bytes =
         static_cast<std::size_t>(session.world_size()) * kControlWireBytes;
     maybe_fault(testing::NcclFaultPoint::D2HStaging,
@@ -1003,7 +1118,6 @@ NcclControlOperation NcclAllGatherCountExchange::start_control(
                         impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::Control, "cudaEventRecord");
-    ++impl_->audit.control_starts;
   } catch (...) {
     (void)cudaSetDevice(static_cast<int>(impl_->session.device_ordinal()));
     (void)cudaStreamSynchronize(impl_->execution_state->stream);
@@ -1032,26 +1146,36 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
     invalid("phase=config-start, field=provenance, rank=" +
             std::to_string(rank) +
             ", expected=exact coordinator session/execution/control, actual=mismatch");
-  if (control.matrix().empty() ||
-      wire.size() != control.matrix().front().config_blob_bytes)
+  if (control.matrix().empty() || rank >= control.matrix().size() ||
+      wire.size() != control.matrix()[rank].config_blob_bytes)
     invalid("phase=config-start, field=config_blob_bytes, rank=" +
             std::to_string(rank) + ", expected=" +
             (control.matrix().empty()
                  ? std::string("validated header")
-                 : std::to_string(
-                       control.matrix().front().config_blob_bytes)) +
+                 : std::to_string(control.matrix()[rank].config_blob_bytes)) +
             ", actual=" + std::to_string(wire.size()));
+  std::size_t collective_width = 0;
+  for (const auto &header : control.matrix()) {
+    if (header.config_blob_bytes > kMaxCanonicalConfigBytes ||
+        header.config_blob_bytes > SIZE_MAX)
+      invalid("phase=config-start, field=config_blob_bytes, rank=" +
+              std::to_string(rank) +
+              ", expected=bounded size_t, actual=" +
+              std::to_string(header.config_blob_bytes));
+    collective_width = std::max(
+        collective_width, static_cast<std::size_t>(header.config_blob_bytes));
+  }
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->protocol != Impl::ProtocolState::ConfigReady)
     invalid("phase=config-start, field=protocol_state, rank=" +
             std::to_string(rank) +
             ", expected=config-ready, actual=not-ready");
-  if (!impl_->config || impl_->config->width != wire.size()) {
+  if (!impl_->config || impl_->config->width != collective_width) {
     maybe_fault(testing::NcclFaultPoint::ConfigSlotAllocation,
                 "config-slot-allocation", context);
     impl_->config = std::make_unique<ByteSlot>();
     const auto allocation_start = std::chrono::steady_clock::now();
-    allocate_byte_slot(*impl_->config, wire.size(), impl_->session,
+    allocate_byte_slot(*impl_->config, collective_width, impl_->session,
                        "nccl-config-workspace", &impl_->setup);
     const auto allocation_end = std::chrono::steady_clock::now();
     impl_->setup.config_slot_allocation_us +=
@@ -1064,6 +1188,7 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
             ", expected=available, actual=in-use");
   impl_->config->in_use = true;
   impl_->protocol = Impl::ProtocolState::ConfigPending;
+  std::fill_n(impl_->config->host_send, collective_width, std::byte{0});
   std::copy(wire.begin(), wire.end(), impl_->config->host_send);
   try {
     internal::throw_cuda(
@@ -1074,19 +1199,20 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
     internal::throw_cuda(
         "config-start",
         cudaMemcpyAsync(impl_->config->device_send, impl_->config->host_send,
-                        wire.size(), cudaMemcpyHostToDevice,
+                        collective_width, cudaMemcpyHostToDevice,
                         impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::Control, "cudaMemcpyAsync(H2D ConfigWire)");
     internal::throw_nccl(
         "config-start",
         ncclAllGather(impl_->config->device_send, impl_->config->device_matrix,
-                      wire.size(), ncclUint8, impl_->comm,
+                      collective_width, ncclUint8, impl_->comm,
                       impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::Control, "ncclAllGather(ConfigWire bytes)");
+    ++impl_->audit.config_starts;
     const auto matrix_bytes =
-        wire.size() * static_cast<std::size_t>(session.world_size());
+        collective_width * static_cast<std::size_t>(session.world_size());
     internal::throw_cuda(
         "config-start",
         cudaMemcpyAsync(impl_->config->host_matrix,
@@ -1100,7 +1226,6 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
                         impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::Control, "cudaEventRecord");
-    ++impl_->audit.config_starts;
   } catch (...) {
     (void)cudaSetDevice(static_cast<int>(impl_->session.device_ordinal()));
     (void)cudaStreamSynchronize(impl_->execution_state->stream);
@@ -1243,6 +1368,10 @@ NcclAllGatherCountExchange::start(const CountExchangeRequest &request) {
                       impl_->comm, impl_->execution_state->stream),
         rank, session.world_size(), session.identity(), session.generation(),
         request.kind, "ncclAllGather");
+    if (is_expert)
+      ++impl_->audit.expert_count_starts;
+    else
+      ++impl_->audit.packet_summary_starts;
     const auto elements = checked_elements(
         session.world_size(), request.row_width, "active_matrix_elements");
     const auto bytes = checked_matrix_bytes(elements, "active_matrix_bytes");
@@ -1257,10 +1386,6 @@ NcclAllGatherCountExchange::start(const CountExchangeRequest &request) {
         cudaEventRecord(slot->completion, impl_->execution_state->stream), rank,
         session.world_size(), session.identity(), session.generation(),
         request.kind, "cudaEventRecord");
-    if (is_expert)
-      ++impl_->audit.expert_count_starts;
-    else
-      ++impl_->audit.packet_summary_starts;
   } catch (...) {
     // No framework operation exists yet, so start itself must retain and drain
     // any partially enqueued work before the caller's typed input may unwind.
@@ -1309,6 +1434,7 @@ struct ValidatedCudaGeneration::Impl {
   CollectiveProtocolAudit audit;
   NcclWorkspaceUsage workspace;
   GenerationSetupTimings setup;
+  GenerationExecutionTimings execution;
   std::shared_ptr<const void> resource_lease;
 };
 
@@ -1334,6 +1460,13 @@ const GenerationSetupTimings &ValidatedCudaGeneration::setup_timings() const {
   if (!impl_)
     invalid("phase=generation-result, field=handle, rank=n/a, expected=valid, actual=empty");
   return impl_->setup;
+}
+
+const GenerationExecutionTimings &
+ValidatedCudaGeneration::execution_timings() const {
+  if (!impl_)
+    invalid("phase=generation-result, field=handle, rank=n/a, expected=valid, actual=empty");
+  return impl_->execution;
 }
 
 struct CudaNotifyGenerationCoordinator::Impl {
@@ -1444,26 +1577,39 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   if (!impl_ || impl_->used)
     invalid("phase=generation-coordinator-run, field=state, rank=n/a, expected=fresh coordinator, actual=empty/already-used");
   impl_->used = true;
+  const auto run_start = std::chrono::steady_clock::now();
 
   ConfigWire config_wire;
   LocalPreflightStatus config_status;
-  (void)try_encode_canonical_config(request.config,
-                                    request.max_tokens_per_rank, config_wire,
-                                    config_status);
+  auto protocol_identity = impl_->context.session().stable_identity_bytes();
+  std::unique_ptr<testing::IdentityOverride> identity_override;
+  if (testing::g_identity_override) {
+    identity_override = std::move(testing::g_identity_override);
+    protocol_identity = identity_override->raw;
+  }
+  (void)try_encode_canonical_config(
+      request.config, request.max_tokens_per_rank, config_wire, config_status,
+      protocol_identity);
   auto status = host_preflight_status(request.config, request.local_routes,
                                       request.max_tokens_per_rank);
   if (status.error == ControlLocalError::None)
     status = config_status;
 
   CudaLocalNotifyHandle local;
+  std::uint64_t route_input_bytes = 0;
+  std::uint64_t notify_arena_bytes = 0;
+  std::uint64_t notify_pinned_bytes = 0;
   if (status.error == ControlLocalError::None) {
     try {
       auto routes = upload_cuda_routes(request.local_routes,
                                        request.config.top_k,
                                        impl_->execution);
+      route_input_bytes = routes.device_bytes();
       auto plan = query_cuda_notify_workspace(
           request.config, impl_->session.rank(),
           request.local_routes.num_tokens, request.max_tokens_per_rank);
+      notify_arena_bytes = plan.device_bytes;
+      notify_pinned_bytes = plan.host_staging_bytes;
       auto workspace = allocate_cuda_notify_workspace(
           plan, impl_->context, impl_->execution);
       auto operation = start_cuda_rank_local_notify(
@@ -1483,13 +1629,24 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     }
   }
 
-  const auto header = make_control_header(
+  auto header = make_control_header(
       request.config, impl_->context, request.local_routes.num_tokens,
       request.local_routes.selected_experts.size(),
       request.max_tokens_per_rank, config_wire.size(),
       config_wire_digest(config_wire), status);
+  if (identity_override) {
+    header.session_id_word0 = identity_override->summary.word0;
+    header.session_id_word1 = identity_override->summary.word1;
+  }
   auto control = impl_->backend->start_control(impl_->context, header);
   auto control_done = control.wait();
+
+  if (testing::g_config_corruption_offset != SIZE_MAX) {
+    const auto offset = testing::g_config_corruption_offset;
+    testing::g_config_corruption_offset = SIZE_MAX;
+    if (offset < config_wire.size())
+      config_wire[offset] ^= std::byte{1};
+  }
 
   auto config = impl_->backend->start_config(impl_->context, config_wire,
                                              control_done);
@@ -1530,8 +1687,27 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   result->dispatch = std::move(device);
   result->audit = audit_value;
   result->workspace = impl_->backend->workspace_usage();
+  result->workspace.route_input_device_bytes = route_input_bytes;
+  result->workspace.device_notify_arena_bytes = notify_arena_bytes;
+  result->workspace.device_notify_pinned_staging_bytes = notify_pinned_bytes;
+  result->workspace.final_device_metadata_arena_view_capacity_bytes =
+      notify_arena_bytes;
+  result->workspace.device_bytes += route_input_bytes + notify_arena_bytes;
+  result->workspace.pinned_host_bytes += notify_pinned_bytes;
+  // Three notify events plus one event for each of four collective slots.
+  result->workspace.event_count = 7;
+  result->workspace.quantified_event_bytes = 0;
   result->setup = impl_->setup;
+  const auto run_end = std::chrono::steady_clock::now();
+  result->execution.coordinator_run_wall_us =
+      std::chrono::duration<double, std::micro>(run_end - run_start).count();
+  const auto dynamic_setup = result->setup.config_slot_allocation_us +
+                             result->setup.count_slot_allocation_us +
+                             result->setup.summary_slot_allocation_us;
+  result->execution.steady_execution_us =
+      std::max(0.0, result->execution.coordinator_run_wall_us - dynamic_setup);
   result->resource_lease = impl_;
+  testing::g_validated_publishes.fetch_add(1);
   return ValidatedCudaGeneration(std::move(result));
 }
 

@@ -82,8 +82,8 @@ const auto& device_handle = generation_result.dispatch();
 This coordinator is the only public production protocol entry; device upload,
 workspace allocation, preflight wait, control start, and data-collective start
 are internal. Every generation executes exactly `dataized local preflight →
-256-byte ControlHeader AllGather → header agreement → canonical config blob
-AllGather → exact byte/field agreement → expert-count AllGather →
+256-byte ControlHeader AllGather → header agreement → self-checking canonical
+config wire AllGather → exact byte/field agreement → expert-count AllGather →
 packet-summary AllGather`. The header is explicitly little-endian encoded as
 32 words; no native struct or padding is copied to the wire. It is fully
 initialized even for invalid local input.
@@ -92,11 +92,23 @@ field in schema order; all ranks fail after the same fixed collective and never
 enter a variable-width collective. A healthy NCCL communicator can be reused
 through a new immutable generation view after a rejected generation.
 
-The stable session ID is a two-word digest of the explicit cross-process
-session identity string, never an address. Rank 0's gathered header is the
-common baseline; validation never consults the calling rank's local context.
-The diagnostic config digest is not an acceptance boundary: equal digest with
-different canonical config bytes is rejected by exact comparison.
+The two header session words are diagnostic summaries, never the agreement
+boundary. `CollectiveSession` owns bounded original stable-identity bytes. The
+NCCL backend derives them from the shared `ncclUniqueId` bootstrap bytes plus
+an explicit protocol namespace; neither object addresses nor `ncclComm_t`
+values participate. Those original bytes are length-prefixed into canonical
+config and compared exactly. Logs expose only display names, lengths, and safe
+summaries—not bootstrap bytes.
+
+Canonical config is an explicit little-endian envelope: `magic`, wire version,
+64-byte header length, payload length, two zero reserved words, payload
+checksum, normalized wire digest, then the canonical payload. Decoding checks
+the 64 MiB bound, every length/add/multiply, reserved words, checksum, digest,
+truncation, and trailing bytes before reading payload fields. Each gathered row
+must also match its own `ControlHeader.config_digest`, including world=1.
+Different declared row lengths use the maximum gathered length as the safe NCCL
+slot width and are reconstructed by their declarations before exact comparison.
+Digest equality never skips exact decoded-field and byte agreement.
 
 `max_tokens_per_rank` is an explicit capacity promise for every rank in the
 collective generation. It sizes worst-case incoming rows; actual materialized

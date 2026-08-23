@@ -28,15 +28,16 @@ Every rank unconditionally follows this generation sequence:
 host/device local preflight
   -> AllGather ControlHeader[256 bytes]
   -> deterministic header agreement
-  -> AllGather canonical config blob[exact agreed byte length]
+  -> AllGather canonical config wire[max declared byte length]
   -> exact decoded-field and byte agreement
   -> AllGather expert counts [world, num_experts]
   -> AllGather packet summaries [world, num_nodes]
   -> pure materialization
 ```
 
-The fixed header contains protocol/schema versions, a two-word stable session
-ID, generation/rank/world, diagnostic config digest and exact blob length,
+The fixed header contains protocol/schema versions, a two-word diagnostic
+session summary, generation/rank/world, diagnostic config digest and exact
+per-rank blob length,
 explicit experts/top-k/M-tile/node/capacity fields, collective
 dtype/index widths and row widths, local token/route requirements, and a local
 error with original token/slot/expert coordinates. Its little-endian checksum
@@ -47,11 +48,18 @@ Every row first proves that its declared rank equals its AllGather row. Rank 0
 then supplies the common generation/session/world/schema baseline. Remaining
 rows are examined by ascending origin rank and fields by fixed schema order.
 The validator takes only gathered bytes, never local context, so all callers
-produce byte-identical errors. The canonical config blob explicitly encodes,
-without padding, `rank_to_node`, `rank_to_local_rank`, `expert_to_rank`,
+produce byte-identical errors. The canonical config payload explicitly encodes,
+without native-struct padding, the original length-prefixed stable session
+identity, `rank_to_node`, `rank_to_local_rank`, `expert_to_rank`,
 `expert_rows`, `workspace_rows_per_rank`, topology shape, experts/top-k/M-tile,
-capacity, dtype/index widths, and descriptor schema. Digest equality never
-skips exact comparison.
+capacity, dtype/index widths, and descriptor schema. A 64-byte little-endian
+envelope adds magic, wire version, header/payload lengths, two zero reserved
+words, payload checksum, and normalized wire digest. Decoding rejects bad
+constants, reserved bits, overflow, truncation, trailing bytes, checksum/digest
+mismatch, and `ControlHeader.config_digest` mismatch before payload use,
+including world=1. Different row lengths use the same maximum AllGather slot
+width; each exact declared prefix is reconstructed before validation. Digest
+equality never skips exact field and byte comparison.
 Control failure resets the framework protocol gate to control-ready; count and
 summary starts remain zero in the audit. A new session/generation view may share
 the still-healthy native communicator and starts again at control.
@@ -152,9 +160,15 @@ Pending control operation destruction/cancel drains its event without throwing
 from destruction; a partial enqueue is drained before the slot/input can be
 released. One operation object is not safe for concurrent wait/cancel/move.
 The successful audit is `control/config/count/summary = 1/1/1/1`; local/header
-failure is `1/0/0/0`, and exact config failure is `1/1/0/0`.
+failure is `1/0/0/0`, and config integrity/exact-agreement failure is
+`1/1/0/0`. A counter increments immediately after its `ncclAllGather` returns
+success; later D2H, event record/wait, allocation, or completion failure cannot
+roll it back.
 Test-only hooks in `src/` inject control start/enqueue, event record/wait, D2H,
-slot allocation, and completion failures. They are absent from public headers.
+slot allocation, config corruption, identity-summary collision, and completion
+failures. Lifecycle counters verify balanced slots/completion leases, no
+validated publication, and no repeated wait/cancel/drain. They are absent from
+public headers.
 World-one or all-rank injection validates cleanup; a single-rank fatal NCCL or
 CUDA failure is a backend failure and is not claimed recoverable by agreement.
 
@@ -222,6 +236,27 @@ Materialization copies the validated integer metadata into `DispatchHandle`;
 the dispatch handle deliberately does not retain collective resources. Callers
 may release validated handles after materialization when no later consumer needs
 their completion lifetime.
+
+The NCCL stable identity source is the communicator's original shared
+`ncclUniqueId` bytes plus an explicitly supplied protocol namespace. The
+session owns this immutable bounded byte string across generation views. Only a
+two-word safe summary enters fixed control; the raw bytes enter exact config
+agreement and are never emitted in normal diagnostics.
+
+## Benchmark accounting
+
+The benchmark establishes every rank's NCCL session once before 10 warmups and
+50 measured generations and reuses that communicator. Session setup is a
+separate one-establishment sample across ranks. Per-generation setup includes
+coordinator/backend creation and control/config/count/summary slot, device,
+pinned, and event allocation. Setup-inclusive E2E is computed for each rank as
+`rank_generation_setup + rank_steady_execution` before selecting the slowest
+rank; it never subtracts maxima from different ranks.
+
+Unique workspace totals count route input, the notify arena, pinned staging,
+and collective slots once. Final device metadata is reported as a notify-arena
+subview and is not added again. Event count is reported; event bytes remain
+zero unless CUDA exposes a reliable allocation size.
 
 ## CUDA deterministic Notify and device workspace
 

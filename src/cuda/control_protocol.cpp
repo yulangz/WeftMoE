@@ -14,6 +14,10 @@ namespace megamoe::cuda {
 namespace {
 
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+constexpr std::uint64_t kConfigChecksumSeed = 1469598103934665603ULL;
+constexpr std::uint64_t kConfigDigestSeed = 7809847782465536322ULL;
+constexpr std::size_t kConfigChecksumOffset = 48U;
+constexpr std::size_t kConfigDigestOffset = 56U;
 
 std::uint64_t hash_bytes(const std::byte *bytes, std::size_t size,
                          std::uint64_t seed) noexcept {
@@ -185,6 +189,55 @@ void checked_append_u64(ConfigWire &wire, std::uint64_t value) {
   write_u64(wire.data() + old, value);
 }
 
+void checked_append_bytes(ConfigWire &wire, const std::vector<std::byte> &bytes) {
+  if (bytes.size() > kMaxCanonicalConfigBytes ||
+      wire.size() > kMaxCanonicalConfigBytes - bytes.size())
+    throw NotifyDispatchError(
+        NotifyErrorCode::ControlProtocolFailure,
+        "phase=config-encode, field=blob_bytes, origin_rank=n/a, expected<=67108864, actual=overflow");
+  wire.insert(wire.end(), bytes.begin(), bytes.end());
+}
+
+std::size_t checked_encoded_bytes(const RuntimeConfig &config,
+                                  std::size_t identity_bytes) {
+  constexpr std::size_t kPayloadScalarWords = 17U;
+  std::size_t words = kPayloadScalarWords;
+  const auto add_words = [&](std::size_t count) {
+    if (count > (kMaxCanonicalConfigBytes / 8U) - words)
+      throw NotifyDispatchError(
+          NotifyErrorCode::ControlProtocolFailure,
+          "phase=config-encode, field=blob_bytes, origin_rank=n/a, expected<=67108864, actual=overflow");
+    words += count;
+  };
+  add_words(config.topology.rank_to_node.size());
+  add_words(config.topology.rank_to_local_rank.size());
+  add_words(config.topology.expert_to_rank.size());
+  add_words(config.capacity.expert_rows.size());
+  add_words(config.capacity.workspace_rows_per_rank.size());
+  if (words > (kMaxCanonicalConfigBytes - kCanonicalConfigHeaderBytes) / 8U)
+    config_failure(ControlField::ConfigBlobBytes, 0,
+                   std::to_string(kMaxCanonicalConfigBytes), "overflow");
+  const auto word_bytes = words * 8U;
+  if (identity_bytes > kMaxCanonicalConfigBytes - kCanonicalConfigHeaderBytes -
+                           word_bytes)
+    config_failure(ControlField::ConfigBlobBytes, 0,
+                   std::to_string(kMaxCanonicalConfigBytes), "overflow");
+  return kCanonicalConfigHeaderBytes + word_bytes + identity_bytes;
+}
+
+std::uint64_t normalized_config_digest(const ConfigWire &wire) noexcept {
+  auto value = kConfigDigestSeed;
+  for (std::size_t index = 0; index < wire.size(); ++index) {
+    const auto byte = index >= kConfigDigestOffset &&
+                              index < kConfigDigestOffset + 8U
+                          ? std::byte{0}
+                          : wire[index];
+    value ^= static_cast<std::uint8_t>(byte);
+    value *= kFnvPrime;
+  }
+  return value;
+}
+
 template <typename T>
 void append_vector(ConfigWire &wire, const std::vector<T> &values) {
   checked_append_u64(wire, values.size());
@@ -194,10 +247,11 @@ void append_vector(ConfigWire &wire, const std::vector<T> &values) {
 
 class ConfigReader {
 public:
-  explicit ConfigReader(const ConfigWire &wire) : wire_(wire) {}
+  ConfigReader(const ConfigWire &wire, std::size_t offset, std::size_t end)
+      : wire_(wire), offset_(offset), end_(end) {}
 
   std::uint64_t read(const char *field) {
-    if (offset_ > wire_.size() || wire_.size() - offset_ < 8U)
+    if (offset_ > end_ || end_ - offset_ < 8U)
       throw NotifyDispatchError(
           NotifyErrorCode::ControlProtocolFailure,
           std::string("phase=config-decode, field=") + field +
@@ -210,7 +264,7 @@ public:
   template <typename T>
   std::vector<T> vector(const char *field, std::uint64_t maximum) {
     const auto count = read(field);
-    if (count > maximum || count > (wire_.size() - offset_) / 8U)
+    if (count > maximum || offset_ > end_ || count > (end_ - offset_) / 8U)
       throw NotifyDispatchError(
           NotifyErrorCode::ControlProtocolFailure,
           std::string("phase=config-decode, field=") + field +
@@ -231,11 +285,28 @@ public:
     return values;
   }
 
+  std::vector<std::byte> bytes(const char *field, std::uint64_t maximum) {
+    const auto count = read(field);
+    if (count > maximum || count > std::numeric_limits<std::size_t>::max() ||
+        offset_ > end_ || static_cast<std::size_t>(count) > end_ - offset_)
+      throw NotifyDispatchError(
+          NotifyErrorCode::ControlProtocolFailure,
+          std::string("phase=config-decode, field=") + field +
+              ", origin_rank=n/a, expected=bounded bytes within payload, actual=" +
+              std::to_string(count));
+    const auto begin = wire_.begin() + static_cast<std::ptrdiff_t>(offset_);
+    std::vector<std::byte> value(begin,
+                                 begin + static_cast<std::ptrdiff_t>(count));
+    offset_ += static_cast<std::size_t>(count);
+    return value;
+  }
+
   std::size_t offset() const noexcept { return offset_; }
 
 private:
   const ConfigWire &wire_;
   std::size_t offset_ = 0;
+  std::size_t end_ = 0;
 };
 
 template <typename T>
@@ -252,18 +323,44 @@ void compare_vector(const std::vector<T> &expected,
   }
 }
 
+std::string safe_identity_description(const std::vector<std::byte> &value) {
+  const auto digest = stable_session_id(value);
+  std::ostringstream out;
+  out << "length=" << value.size() << ",digest=" << std::hex
+      << digest.word0 << ':' << digest.word1;
+  return out.str();
+}
+
+void compare_identity(const std::vector<std::byte> &expected,
+                      const std::vector<std::byte> &actual,
+                      std::uint32_t rank) {
+  if (expected.size() != actual.size())
+    config_failure(ControlField::SessionIdentity, rank,
+                   safe_identity_description(expected),
+                   safe_identity_description(actual), "length");
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    if (expected[index] != actual[index])
+      config_failure(ControlField::SessionIdentity, rank,
+                     safe_identity_description(expected),
+                     safe_identity_description(actual),
+                     std::to_string(index));
+  }
+}
+
 } // namespace
 
-StableSessionId stable_session_id(const std::string &identity) noexcept {
-  const auto *bytes = reinterpret_cast<const std::byte *>(identity.data());
+StableSessionId
+stable_session_id(const std::vector<std::byte> &identity) noexcept {
   StableSessionId result;
-  result.word0 = hash_bytes(bytes, identity.size(), 1469598103934665603ULL);
-  result.word1 = hash_bytes(bytes, identity.size(), 7809847782465536322ULL);
+  result.word0 = hash_bytes(identity.data(), identity.size(),
+                            1469598103934665603ULL);
+  result.word1 = hash_bytes(identity.data(), identity.size(),
+                            7809847782465536322ULL);
   return result;
 }
 
 std::uint64_t config_wire_digest(const ConfigWire &wire) noexcept {
-  return hash_bytes(wire.data(), wire.size(), 1469598103934665603ULL);
+  return normalized_config_digest(wire);
 }
 
 ControlWire encode_control_header(const ControlHeader &input) {
@@ -289,16 +386,28 @@ ControlHeader decode_control_header(const ControlWire &wire) {
 }
 
 ConfigWire encode_canonical_config(const RuntimeConfig &config,
-                                   std::uint64_t max_tokens_per_rank) {
+                                   std::uint64_t max_tokens_per_rank,
+                                   const std::vector<std::byte>
+                                       &stable_session_identity) {
+  constexpr std::size_t kMaxStableIdentityBytes = 4096U;
+  if (stable_session_identity.empty() ||
+      stable_session_identity.size() > kMaxStableIdentityBytes)
+    config_failure(ControlField::ConfigBlob, 0, "stable_identity_bytes=(0,4096]",
+                   std::to_string(stable_session_identity.size()),
+                   "session_identity.length");
+  const auto total_bytes =
+      checked_encoded_bytes(config, stable_session_identity.size());
   ConfigWire wire;
-  wire.reserve(192U + 8U * (config.topology.rank_to_node.size() +
-                            config.topology.rank_to_local_rank.size() +
-                            config.topology.expert_to_rank.size() +
-                            config.capacity.expert_rows.size() +
-                            config.capacity.workspace_rows_per_rank.size()));
+  wire.reserve(total_bytes);
+  // Self-checking envelope: eight explicit little-endian words.
   checked_append_u64(wire, kCanonicalConfigMagic);
   checked_append_u64(wire, kCanonicalConfigVersion);
-  checked_append_u64(wire, 0); // replaced with exact byte length below
+  checked_append_u64(wire, kCanonicalConfigHeaderBytes);
+  checked_append_u64(wire, total_bytes - kCanonicalConfigHeaderBytes);
+  checked_append_u64(wire, 0); // reserved
+  checked_append_u64(wire, 0); // reserved
+  checked_append_u64(wire, 0); // payload checksum, filled below
+  checked_append_u64(wire, 0); // normalized wire digest, filled below
   checked_append_u64(wire, config.num_experts);
   checked_append_u64(wire, config.top_k);
   checked_append_u64(wire, config.m_tile_rows);
@@ -315,18 +424,32 @@ ConfigWire encode_canonical_config(const RuntimeConfig &config,
   append_vector(wire, config.topology.expert_to_rank);
   append_vector(wire, config.capacity.expert_rows);
   append_vector(wire, config.capacity.workspace_rows_per_rank);
-  write_u64(wire.data() + 16U, wire.size());
+  checked_append_u64(wire, stable_session_identity.size());
+  checked_append_bytes(wire, stable_session_identity);
+  if (wire.size() != total_bytes)
+    config_failure(ControlField::ConfigBlobBytes, 0,
+                   std::to_string(total_bytes), std::to_string(wire.size()),
+                   "encoder_total");
+  const auto payload_checksum = hash_bytes(
+      wire.data() + kCanonicalConfigHeaderBytes,
+      wire.size() - kCanonicalConfigHeaderBytes, kConfigChecksumSeed);
+  write_u64(wire.data() + kConfigChecksumOffset, payload_checksum);
+  write_u64(wire.data() + kConfigDigestOffset,
+            normalized_config_digest(wire));
   return wire;
 }
 
 bool try_encode_canonical_config(const RuntimeConfig &config,
                                  std::uint64_t max_tokens_per_rank,
                                  ConfigWire &wire,
-                                 LocalPreflightStatus &status) noexcept {
+                                 LocalPreflightStatus &status,
+                                 const std::vector<std::byte>
+                                     &stable_session_identity) noexcept {
   wire.clear();
   status = {};
   try {
-    wire = encode_canonical_config(config, max_tokens_per_rank);
+    wire = encode_canonical_config(config, max_tokens_per_rank,
+                                   stable_session_identity);
     return true;
   } catch (...) {
     wire.clear();
@@ -343,21 +466,58 @@ CanonicalConfig decode_canonical_config(const ConfigWire &wire) {
     config_failure(ControlField::ConfigBlobBytes, 0,
                    std::to_string(kMaxCanonicalConfigBytes),
                    std::to_string(wire.size()));
-  ConfigReader reader(wire);
-  const auto magic = reader.read("magic");
+  if (wire.size() < kCanonicalConfigHeaderBytes)
+    config_failure(ControlField::ConfigBlobBytes, 0,
+                   std::to_string(kCanonicalConfigHeaderBytes),
+                   std::to_string(wire.size()), "truncated_envelope");
+  ConfigReader envelope(wire, 0, kCanonicalConfigHeaderBytes);
+  const auto magic = envelope.read("magic");
   if (magic != kCanonicalConfigMagic)
     config_failure(ControlField::Magic, 0,
                    std::to_string(kCanonicalConfigMagic),
                    std::to_string(magic));
-  const auto version = reader.read("version");
+  const auto version = envelope.read("version");
   if (version != kCanonicalConfigVersion)
     config_failure(ControlField::ProtocolVersion, 0,
                    std::to_string(kCanonicalConfigVersion),
                    std::to_string(version));
-  const auto bytes = reader.read("blob_bytes");
-  if (bytes != wire.size())
+  const auto header_bytes = envelope.read("header_bytes");
+  if (header_bytes != kCanonicalConfigHeaderBytes)
     config_failure(ControlField::ConfigBlobBytes, 0,
-                   std::to_string(wire.size()), std::to_string(bytes));
+                   std::to_string(kCanonicalConfigHeaderBytes),
+                   std::to_string(header_bytes), "header_length");
+  const auto payload_bytes = envelope.read("payload_bytes");
+  const auto reserved0 = envelope.read("reserved0");
+  const auto reserved1 = envelope.read("reserved1");
+  if (reserved0 != 0 || reserved1 != 0)
+    config_failure(ControlField::ConfigBlob, 0, "reserved=0",
+                   std::to_string(reserved0) + "/" +
+                       std::to_string(reserved1),
+                   "reserved_words");
+  const auto checksum = envelope.read("payload_checksum");
+  const auto digest = envelope.read("wire_digest");
+  if (payload_bytes > kMaxCanonicalConfigBytes - kCanonicalConfigHeaderBytes)
+    config_failure(ControlField::ConfigBlobBytes, 0, "payload within 64 MiB",
+                   std::to_string(payload_bytes), "payload_length");
+  const auto total = kCanonicalConfigHeaderBytes +
+                     static_cast<std::size_t>(payload_bytes);
+  if (total != wire.size())
+    config_failure(ControlField::ConfigBlobBytes, 0,
+                   std::to_string(total), std::to_string(wire.size()),
+                   wire.size() < total ? "truncated" : "trailing_bytes");
+  const auto actual_checksum = hash_bytes(
+      wire.data() + kCanonicalConfigHeaderBytes,
+      static_cast<std::size_t>(payload_bytes), kConfigChecksumSeed);
+  if (checksum != actual_checksum)
+    config_failure(ControlField::Checksum, 0,
+                   std::to_string(actual_checksum), std::to_string(checksum),
+                   "payload_checksum");
+  const auto actual_digest = normalized_config_digest(wire);
+  if (digest != actual_digest)
+    config_failure(ControlField::ConfigDigest, 0,
+                   std::to_string(actual_digest), std::to_string(digest),
+                   "wire_digest");
+  ConfigReader reader(wire, kCanonicalConfigHeaderBytes, wire.size());
   CanonicalConfig result;
   result.num_experts = reader.read("num_experts");
   result.top_k = reader.read("top_k");
@@ -378,10 +538,44 @@ CanonicalConfig decode_canonical_config(const ConfigWire &wire) {
   result.expert_rows = reader.vector<std::uint64_t>("expert_rows", UINT32_MAX);
   result.workspace_rows_per_rank =
       reader.vector<std::uint64_t>("workspace_rows_per_rank", UINT32_MAX);
+  result.stable_session_identity = reader.bytes("session_identity", 4096U);
   if (reader.offset() != wire.size())
     config_failure(ControlField::ConfigBlob, 0, "canonical end",
                    std::to_string(wire.size() - reader.offset()),
                    "trailing_bytes");
+  if (result.stable_session_identity.empty())
+    config_failure(ControlField::SessionIdentity, 0, "non-empty", "0",
+                   "length");
+  if (result.control_dtype != 1 || result.count_dtype != 1 ||
+      result.route_index_bits != 64 || result.expert_index_bits != 32 ||
+      result.descriptor_schema != kControlDescriptorSchema)
+    config_failure(ControlField::ConfigBlob, 0, "supported protocol layout",
+                   "unsupported dtype/index/schema", "layout");
+  if (result.max_tokens_per_rank == 0)
+    config_failure(ControlField::MaxTokensPerRank, 0, ">0", "0");
+  if (result.num_experts > UINT32_MAX || result.top_k > UINT32_MAX ||
+      result.m_tile_rows > UINT32_MAX || result.world_size > UINT32_MAX ||
+      result.num_nodes > UINT32_MAX)
+    config_failure(ControlField::ConfigBlob, 0, "runtime fields within uint32",
+                   "overflow", "shape");
+  RuntimeConfig runtime;
+  runtime.num_experts = static_cast<std::uint32_t>(result.num_experts);
+  runtime.top_k = static_cast<std::uint32_t>(result.top_k);
+  runtime.m_tile_rows = static_cast<std::uint32_t>(result.m_tile_rows);
+  runtime.topology.world_size = static_cast<std::uint32_t>(result.world_size);
+  runtime.topology.num_nodes = static_cast<std::uint32_t>(result.num_nodes);
+  runtime.topology.rank_to_node = result.rank_to_node;
+  runtime.topology.rank_to_local_rank = result.rank_to_local_rank;
+  runtime.topology.expert_to_rank = result.expert_to_rank;
+  runtime.capacity.expert_rows = result.expert_rows;
+  runtime.capacity.workspace_rows_per_rank = result.workspace_rows_per_rank;
+  try {
+    validate_runtime_config(runtime);
+  } catch (const NotifyDispatchError &error) {
+    config_failure(ControlField::ConfigBlob, 0,
+                   "valid canonical runtime config", error.what(),
+                   "runtime_validation");
+  }
   return result;
 }
 
@@ -399,7 +593,8 @@ ControlHeader make_control_header(
     header.generation = context.session().generation();
     header.calling_rank = context.calling_rank();
     header.world_size = context.session().world_size();
-    const auto session = stable_session_id(context.session().identity());
+    const auto session =
+        stable_session_id(context.session().stable_identity_bytes());
     header.session_id_word0 = session.word0;
     header.session_id_word1 = session.word1;
   }
@@ -515,9 +710,9 @@ void validate_control_matrix(const ControlMatrix &matrix) {
             "rank-0 baseline");
       check(header, rank, ControlField::WorldSize, baseline.world_size,
             header.world_size, "rank-0 baseline");
-      check(header, rank, ControlField::ConfigBlobBytes,
-            baseline.config_blob_bytes, header.config_blob_bytes,
-            "rank-0 baseline");
+      // Blob lengths may differ because original stable session identities are
+      // length-prefixed. Config AllGather uses the deterministic maximum
+      // declared width and reconstructs every exact row length.
       check(header, rank, ControlField::NumExperts, baseline.num_experts,
             header.num_experts, "rank-0 baseline");
       check(header, rank, ControlField::TopK, baseline.top_k, header.top_k,
@@ -545,6 +740,11 @@ void validate_control_matrix(const ControlMatrix &matrix) {
       control_failure(field, rank, header.error_expected, header.error_actual,
                       header, "rank-local preflight failure");
     }
+    if (header.config_blob_bytes < kCanonicalConfigHeaderBytes ||
+        header.config_blob_bytes > kMaxCanonicalConfigBytes)
+      control_failure(ControlField::ConfigBlobBytes, rank,
+                      kMaxCanonicalConfigBytes, header.config_blob_bytes,
+                      header, "declared canonical blob outside bounds");
     if (header.num_tokens > header.max_tokens_per_rank)
       control_failure(ControlField::NumTokens, rank,
                       header.max_tokens_per_rank, header.num_tokens, header,
@@ -575,6 +775,12 @@ void validate_config_matrix(const std::vector<ConfigWire> &matrix,
       config_failure(ControlField::ConfigBlob, rank, "valid canonical blob",
                      error.what());
     }
+    const auto digest = config_wire_digest(matrix[rank]);
+    if (headers[rank].config_digest != digest)
+      config_failure(ControlField::ConfigDigest, rank,
+                     std::to_string(digest),
+                     std::to_string(headers[rank].config_digest),
+                     "control_header_vs_wire");
   }
   const auto &base = decoded.front();
   for (std::uint32_t rank = 1; rank < decoded.size(); ++rank) {
@@ -601,6 +807,8 @@ void validate_config_matrix(const std::vector<ConfigWire> &matrix,
            value.expert_index_bits);
     scalar(ControlField::DescriptorSchema, base.descriptor_schema,
            value.descriptor_schema);
+    compare_identity(base.stable_session_identity,
+                     value.stable_session_identity, rank);
     compare_vector(base.rank_to_node, value.rank_to_node,
                    ControlField::RankToNode, rank);
     compare_vector(base.rank_to_local_rank, value.rank_to_local_rank,
@@ -654,6 +862,7 @@ const char *control_field_name(ControlField field) noexcept {
   case ControlField::WorkspaceRowsPerRank: return "workspace_rows_per_rank";
   case ControlField::TopologyShape: return "topology_shape";
   case ControlField::ConfigBlob: return "config_blob";
+  case ControlField::SessionIdentity: return "session_identity";
   }
   return "unknown";
 }

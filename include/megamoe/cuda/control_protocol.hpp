@@ -18,6 +18,7 @@ inline constexpr std::size_t kControlSchemaWords = 32;
 inline constexpr std::uint64_t kControlDescriptorSchema = 1;
 inline constexpr std::uint64_t kCanonicalConfigMagic = 0x4d4d434647574952ULL;
 inline constexpr std::uint64_t kCanonicalConfigVersion = 1;
+inline constexpr std::size_t kCanonicalConfigHeaderBytes = 64;
 inline constexpr std::size_t kMaxCanonicalConfigBytes = 64U * 1024U * 1024U;
 
 using ControlWire = std::array<std::byte, kControlWireBytes>;
@@ -74,6 +75,7 @@ enum class ControlField : std::uint64_t {
   WorkspaceRowsPerRank = 31,
   TopologyShape = 32,
   ConfigBlob = 33,
+  SessionIdentity = 34,
 };
 
 struct LocalPreflightStatus {
@@ -137,6 +139,7 @@ struct CanonicalConfig {
   std::uint64_t route_index_bits = 64;
   std::uint64_t expert_index_bits = 32;
   std::uint64_t descriptor_schema = kControlDescriptorSchema;
+  std::vector<std::byte> stable_session_identity;
   std::vector<std::uint32_t> rank_to_node;
   std::vector<std::uint32_t> rank_to_local_rank;
   std::vector<std::uint32_t> expert_to_rank;
@@ -144,16 +147,21 @@ struct CanonicalConfig {
   std::vector<std::uint64_t> workspace_rows_per_rank;
 };
 
-StableSessionId stable_session_id(const std::string &identity) noexcept;
+StableSessionId
+stable_session_id(const std::vector<std::byte> &identity) noexcept;
 std::uint64_t config_wire_digest(const ConfigWire &wire) noexcept;
 ControlWire encode_control_header(const ControlHeader &header);
 ControlHeader decode_control_header(const ControlWire &wire);
 ConfigWire encode_canonical_config(const RuntimeConfig &config,
-                                   std::uint64_t max_tokens_per_rank);
+                                   std::uint64_t max_tokens_per_rank,
+                                   const std::vector<std::byte>
+                                       &stable_session_identity);
 bool try_encode_canonical_config(const RuntimeConfig &config,
                                  std::uint64_t max_tokens_per_rank,
                                  ConfigWire &wire,
-                                 LocalPreflightStatus &status) noexcept;
+                                 LocalPreflightStatus &status,
+                                 const std::vector<std::byte>
+                                     &stable_session_identity) noexcept;
 CanonicalConfig decode_canonical_config(const ConfigWire &wire);
 
 ControlHeader make_control_header(
@@ -170,8 +178,13 @@ inline ControlHeader make_control_record(
     LocalPreflightStatus device_status = {}) {
   ConfigWire wire;
   LocalPreflightStatus encoding_status;
-  (void)try_encode_canonical_config(config, max_tokens_per_rank, wire,
-                                    encoding_status);
+  const std::vector<std::byte> *identity = nullptr;
+  if (context)
+    identity = &context.session().stable_identity_bytes();
+  static const std::vector<std::byte> empty_identity;
+  (void)try_encode_canonical_config(
+      config, max_tokens_per_rank, wire, encoding_status,
+      identity ? *identity : empty_identity);
   if (device_status.error == ControlLocalError::None)
     device_status = encoding_status;
   return make_control_header(config, context, num_tokens,

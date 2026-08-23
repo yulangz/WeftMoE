@@ -72,8 +72,18 @@ struct CollectiveProtocolAudit {
 };
 
 struct NcclWorkspaceUsage {
+  // Unique underlying allocations. Subviews are reported separately and are
+  // never added twice to device_bytes/pinned_host_bytes.
   std::uint64_t device_bytes = 0;
   std::uint64_t pinned_host_bytes = 0;
+  std::uint64_t route_input_device_bytes = 0;
+  std::uint64_t device_notify_arena_bytes = 0;
+  std::uint64_t device_notify_pinned_staging_bytes = 0;
+  // Capacity of the final metadata view within device_notify_arena_bytes.
+  // It is a subview and is therefore not added to device_bytes again.
+  std::uint64_t final_device_metadata_arena_view_capacity_bytes = 0;
+  std::uint64_t event_count = 0;
+  std::uint64_t quantified_event_bytes = 0;
   std::uint64_t control_slot_bytes = 0;
   std::uint64_t config_wire_bytes = 0;
   std::uint64_t config_slot_bytes = 0;
@@ -93,6 +103,13 @@ struct GenerationSetupTimings {
   double per_generation_setup_total_us = 0;
 };
 
+struct GenerationExecutionTimings {
+  // Direct same-rank coordinator measurement. setup-inclusive is defined as
+  // this value plus that rank's GenerationSetupTimings total.
+  double steady_execution_us = 0;
+  double coordinator_run_wall_us = 0;
+};
+
 struct NotifyGenerationRequest {
   RuntimeConfig config;
   RankRoutingInput local_routes;
@@ -108,6 +125,7 @@ public:
   const CollectiveProtocolAudit &audit() const;
   const NcclWorkspaceUsage &workspace_usage() const;
   const GenerationSetupTimings &setup_timings() const;
+  const GenerationExecutionTimings &execution_timings() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:

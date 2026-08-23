@@ -92,6 +92,7 @@ struct RunResult {
   megamoe::cuda::CollectiveProtocolAudit audit;
   megamoe::cuda::NcclWorkspaceUsage workspace;
   megamoe::cuda::GenerationSetupTimings setup;
+  megamoe::cuda::GenerationExecutionTimings execution;
   double session_setup_us = 0;
   double wall_us = 0;
   std::exception_ptr error;
@@ -133,10 +134,84 @@ std::vector<RunResult> run_fixture(
         results[rank].audit = result.audit();
         results[rank].workspace = result.workspace_usage();
         results[rank].setup = result.setup_timings();
+        results[rank].execution = result.execution_timings();
         results[rank].wall_us =
             std::chrono::duration<double, std::micro>(finish - start).count();
         megamoe::cuda::validate_cuda_dispatch_metadata(result.dispatch(),
                                                        execution);
+      } catch (...) {
+        results[rank].error = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  return results;
+}
+
+struct ReusableRankResources {
+  megamoe::cuda::CudaExecution execution;
+  megamoe::cuda::NcclSession base_session;
+  double session_setup_us = 0;
+  std::exception_ptr error;
+};
+
+std::vector<ReusableRankResources>
+make_reusable_resources(const megamoe::RuntimeConfig &config,
+                        const std::string &identity,
+                        std::uint64_t generation) {
+  const auto world = config.topology.world_size;
+  auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+  std::vector<ReusableRankResources> resources(world);
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        const auto device = config.topology.rank_to_local_rank[rank];
+        resources[rank].execution = megamoe::cuda::make_cuda_execution(
+            identity + "-exec-" + std::to_string(rank), device);
+        const auto start = Clock::now();
+        resources[rank].base_session = megamoe::cuda::make_nccl_session(
+            identity, world, rank, generation, device, bootstrap);
+        resources[rank].session_setup_us =
+            std::chrono::duration<double, std::micro>(Clock::now() - start)
+                .count();
+      } catch (...) {
+        resources[rank].error = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  for (const auto &resource : resources)
+    if (resource.error)
+      std::rethrow_exception(resource.error);
+  return resources;
+}
+
+std::vector<RunResult> run_reused_fixture(
+    const megamoe::RuntimeConfig &config,
+    const std::vector<megamoe::RankRoutingInput> &routes,
+    const std::vector<ReusableRankResources> &resources,
+    const std::string &identity, std::uint64_t generation,
+    std::uint64_t max_tokens) {
+  const auto world = config.topology.world_size;
+  std::vector<RunResult> results(world);
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        auto session = megamoe::cuda::make_nccl_generation(
+            resources[rank].base_session, identity, generation);
+        megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+            session, resources[rank].execution);
+        auto result = coordinator.run({config, routes[rank], max_tokens});
+        results[rank].metadata = megamoe::serialize_dispatch_metadata(
+            result.dispatch().host());
+        results[rank].audit = result.audit();
+        results[rank].workspace = result.workspace_usage();
+        results[rank].setup = result.setup_timings();
+        results[rank].execution = result.execution_timings();
       } catch (...) {
         results[rank].error = std::current_exception();
       }
@@ -342,8 +417,15 @@ void test_protocol_regressions() {
 void test_twenty_failure_recovery_rounds() {
   constexpr std::uint32_t world = 2;
   const auto config = make_config(1, world, 8, 3, 4);
+  const std::vector<std::string> scenarios{
+      "generation_mismatch", "session_mismatch", "topology_mismatch",
+      "max_mismatch", "out_of_range"};
   auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
   std::vector<std::exception_ptr> errors(world);
+  std::vector<std::vector<std::vector<std::string>>> structured(
+      scenarios.size(),
+      std::vector<std::vector<std::string>>(
+          20, std::vector<std::string>(world)));
   std::vector<std::thread> threads;
   for (std::uint32_t rank = 0; rank < world; ++rank) {
     threads.emplace_back([&, rank] {
@@ -351,32 +433,59 @@ void test_twenty_failure_recovery_rounds() {
         auto execution = megamoe::cuda::make_cuda_execution(
             "recovery-exec-" + std::to_string(rank), rank);
         auto base = megamoe::cuda::make_nccl_session(
-            "recovery", world, rank, 2000, rank, bootstrap);
-        for (std::uint64_t round = 0; round < 20; ++round) {
-          auto bad_session = megamoe::cuda::make_nccl_generation(
-              base, "recovery", 2001 + round * 2);
-          megamoe::cuda::CudaNotifyGenerationCoordinator bad(bad_session,
-                                                              execution);
-          auto routes = megamoe::RankRoutingInput{1, {0, 1, 2}};
-          if (rank == 1)
-            routes.selected_experts[2] = 8;
-          bool rejected = false;
-          try {
-            (void)bad.run({config, routes, 10});
-          } catch (const megamoe::NotifyDispatchError &) {
-            rejected = true;
+            "recovery-base", world, rank, 2000, rank, bootstrap);
+        for (std::size_t category = 0; category < scenarios.size();
+             ++category) {
+          for (std::uint64_t round = 0; round < 20; ++round) {
+            auto bad_config = config;
+            auto routes = megamoe::RankRoutingInput{1, {0, 1, 2}};
+            auto max_tokens = std::uint64_t{10};
+            auto identity = std::string("recovery-") + scenarios[category];
+            auto generation = 3000U +
+                              static_cast<std::uint64_t>(category) * 100U +
+                              round * 2U;
+            mutate_scenario(scenarios[category], rank, bad_config, routes,
+                            max_tokens, identity, generation);
+            auto bad_session = megamoe::cuda::make_nccl_generation(
+                base, identity, generation);
+            megamoe::cuda::CudaNotifyGenerationCoordinator bad(bad_session,
+                                                                execution);
+            bool rejected = false;
+            try {
+              auto unexpected = bad.run({bad_config, routes, max_tokens});
+              require(!unexpected,
+                      "invalid generation published validated result");
+            } catch (const megamoe::NotifyDispatchError &error) {
+              rejected = true;
+              structured[category][round][rank] = error.what();
+            }
+            require(rejected, "invalid recovery round was not rejected");
+            const auto bad_audit = bad.audit();
+            const bool config_failure =
+                scenarios[category] == "topology_mismatch";
+            require(bad_audit.control_starts == 1 &&
+                        bad_audit.config_starts ==
+                            (config_failure ? 1U : 0U) &&
+                        bad_audit.expert_count_starts == 0 &&
+                        bad_audit.packet_summary_starts == 0,
+                    "invalid recovery audit crossed protocol boundary");
+
+            auto good_session = megamoe::cuda::make_nccl_generation(
+                base, "recovery-good-" + scenarios[category],
+                3001U + static_cast<std::uint64_t>(category) * 100U +
+                    round * 2U);
+            megamoe::cuda::CudaNotifyGenerationCoordinator good(good_session,
+                                                                 execution);
+            auto result = good.run({config, {1, {0, 1, 2}}, 10});
+            require(result.audit().control_starts == 1 &&
+                        result.audit().config_starts == 1 &&
+                        result.audit().expert_count_starts == 1 &&
+                        result.audit().packet_summary_starts == 1,
+                    "recovery audit is not 1/1/1/1");
+            require(result && !megamoe::serialize_dispatch_metadata(
+                                   result.dispatch().host()).empty(),
+                    "recovery did not publish checked metadata");
           }
-          require(rejected, "invalid recovery round was not rejected");
-          auto good_session = megamoe::cuda::make_nccl_generation(
-              base, "recovery", 2002 + round * 2);
-          megamoe::cuda::CudaNotifyGenerationCoordinator good(good_session,
-                                                               execution);
-          auto result = good.run({config, {1, {0, 1, 2}}, 10});
-          require(result.audit().control_starts == 1 &&
-                      result.audit().config_starts == 1 &&
-                      result.audit().expert_count_starts == 1 &&
-                      result.audit().packet_summary_starts == 1,
-                  "recovery audit is not 1/1/1/1");
         }
       } catch (...) {
         errors[rank] = std::current_exception();
@@ -388,40 +497,202 @@ void test_twenty_failure_recovery_rounds() {
   for (const auto &error : errors)
     if (error)
       std::rethrow_exception(error);
-  std::cout << "[PASS] same ncclComm_t 20 invalid->valid recovery rounds\n";
+  for (std::size_t category = 0; category < scenarios.size(); ++category)
+    for (std::size_t round = 0; round < 20; ++round)
+      require(!structured[category][round][0].empty() &&
+                  structured[category][round][0] ==
+                      structured[category][round][1],
+              "recovery ranks selected different structured errors");
+  std::cout << "[PASS] same ncclComm_t 5 categories x 20 invalid->valid recovery rounds\n";
 }
 
 void test_fault_injection() {
   using Point = megamoe::cuda::testing::NcclFaultPoint;
-  const std::vector<Point> points{
-      Point::ControlStart, Point::ControlEnqueue, Point::EventRecord,
-      Point::EventWait, Point::D2HStaging, Point::ConfigSlotAllocation,
-      Point::CountSlotAllocation, Point::SummarySlotAllocation,
-      Point::BackendCompletion};
+  struct FaultExpectation {
+    Point point;
+    megamoe::cuda::CollectiveProtocolAudit audit;
+    const char *stage;
+  };
+  const std::vector<FaultExpectation> points{
+      {Point::ControlStart, {0, 0, 0, 0}, "control-start"},
+      {Point::ControlEnqueue, {0, 0, 0, 0}, "control-enqueue"},
+      {Point::D2HStaging, {1, 0, 0, 0}, "control-d2h-staging"},
+      {Point::EventRecord, {1, 0, 0, 0}, "control-event-record"},
+      {Point::EventWait, {1, 0, 0, 0}, "control-event-wait"},
+      {Point::ConfigSlotAllocation, {1, 0, 0, 0},
+       "config-slot-allocation"},
+      {Point::CountSlotAllocation, {1, 1, 0, 0},
+       "count-slot-allocation"},
+      {Point::SummarySlotAllocation, {1, 1, 0, 0},
+       "summary-slot-allocation"},
+      {Point::BackendCompletion, {1, 1, 1, 1},
+       "summary-backend-completion"}};
   const auto config = make_config(1, 1, 8, 3, 4);
   for (std::size_t index = 0; index < points.size(); ++index) {
+    megamoe::cuda::testing::reset_nccl_lifecycle_counters();
     auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
     auto execution = megamoe::cuda::make_cuda_execution("fault-exec", 0);
     auto session = megamoe::cuda::make_nccl_session(
         "fault", 1, 0, 4000 + index, 0, bootstrap);
-    megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
-                                                                execution);
-    megamoe::cuda::testing::inject_next_nccl_fault(points[index]);
-    bool failed = false;
-    try {
-      (void)coordinator.run({config, {1, {0, 1, 2}}, 10});
-    } catch (const megamoe::NotifyDispatchError &error) {
-      failed = true;
-      require(std::string(error.what()).find("fault") != std::string::npos ||
-                  error.code() == megamoe::NotifyErrorCode::CountExchangeFailure,
-              "fault error lost backend context");
+    megamoe::cuda::CollectiveProtocolAudit audit;
+    {
+      megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                  execution);
+      megamoe::cuda::testing::inject_next_nccl_fault(points[index].point);
+      bool failed = false;
+      try {
+        auto unexpected = coordinator.run({config, {1, {0, 1, 2}}, 10});
+        require(!unexpected, "fault generation published validated result");
+      } catch (const megamoe::NotifyDispatchError &error) {
+        failed = true;
+        const std::string message = error.what();
+        require(message.find(points[index].stage) != std::string::npos,
+                "fault error lost exact stage");
+        require(message.find("controlled test fault") != std::string::npos,
+                "fault error lost original backend text");
+      }
+      require(failed, "fault injection did not fail generation");
+      audit = coordinator.audit();
     }
-    require(failed, "fault injection did not fail generation");
-    const auto audit = coordinator.audit();
-    require(audit.packet_summary_starts == 0,
-            "fault generation published later collective");
+    const auto expected = points[index].audit;
+    require(audit.control_starts == expected.control_starts &&
+                audit.config_starts == expected.config_starts &&
+                audit.expert_count_starts == expected.expert_count_starts &&
+                audit.packet_summary_starts ==
+                    expected.packet_summary_starts,
+            "fault audit does not match enqueue boundary");
+    require(audit.control_starts <= 1 && audit.config_starts <= 1 &&
+                audit.expert_count_starts <= 1 &&
+                audit.packet_summary_starts <= 1,
+            "fault audit regressed or double-incremented");
+    const auto lifecycle =
+        megamoe::cuda::testing::nccl_lifecycle_snapshot();
+    require(lifecycle.slot_allocations == lifecycle.slot_destructions,
+            "fault leaked a collective slot allocation");
+    require(lifecycle.completion_lease_creates ==
+                lifecycle.completion_lease_destroys,
+            "fault leaked a completion lease");
+    require(lifecycle.validated_publishes == 0,
+            "fault published a validated generation");
+    require(lifecycle.operation_cancels <= 1,
+            "coordinator fault double-cancelled");
+    require(lifecycle.operation_waits <= 4 &&
+                lifecycle.destructor_drains <= 1,
+            "fault lifecycle repeated wait/drain");
   }
-  std::cout << "[PASS] controlled NCCL stage fault injection lifecycle\n";
+  std::cout << "[PASS] 9-point NCCL enqueue audit/fault lifecycle table\n";
+}
+
+void test_config_wire_corruption(std::uint32_t world,
+                                 std::uint32_t corrupt_rank) {
+  const auto config = make_config(1, world, 8, 3, 4);
+  auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+  std::vector<FailureResult> results(world);
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        auto execution = megamoe::cuda::make_cuda_execution(
+            "wire-corruption-exec-" + std::to_string(rank), rank);
+        auto session = megamoe::cuda::make_nccl_session(
+            "wire-corruption", world, rank, 5100 + corrupt_rank, rank,
+            bootstrap);
+        megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                    execution);
+        if (rank == corrupt_rank)
+          megamoe::cuda::testing::corrupt_next_config_wire(64);
+        try {
+          auto unexpected = coordinator.run({config, {1, {0, 1, 2}}, 10});
+          require(!unexpected, "corrupt config published validated result");
+        } catch (const megamoe::NotifyDispatchError &error) {
+          results[rank].error = error.what();
+          results[rank].audit = coordinator.audit();
+        }
+      } catch (...) {
+        results[rank].unexpected = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  for (const auto &result : results)
+    if (result.unexpected)
+      std::rethrow_exception(result.unexpected);
+  for (const auto &result : results) {
+    require(!result.error.empty() &&
+                result.error.find("checksum") != std::string::npos,
+            "config corruption did not report integrity failure");
+    require(result.audit.control_starts == 1 &&
+                result.audit.config_starts == 1 &&
+                result.audit.expert_count_starts == 0 &&
+                result.audit.packet_summary_starts == 0,
+            "config corruption audit is not 1/1/0/0");
+  }
+  for (std::uint32_t rank = 1; rank < world; ++rank)
+    require(results[rank].error == results[0].error,
+            "config corruption errors differ by validation rank");
+  std::cout << "[PASS] config envelope corruption world=" << world
+            << " origin_rank=" << corrupt_rank << " audit=1/1/0/0\n";
+}
+
+void test_exact_session_identity_agreement(bool different_length) {
+  constexpr std::uint32_t world = 2;
+  const auto config = make_config(1, world, 8, 3, 4);
+  auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+  std::vector<FailureResult> results(world);
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        auto execution = megamoe::cuda::make_cuda_execution(
+            "exact-session-exec-" + std::to_string(rank), rank);
+        // Display name and header summary are deliberately equal. Only one raw
+        // byte differs, proving that exact identity bytes are the final gate.
+        auto session = megamoe::cuda::make_nccl_session(
+            "same-display", world, rank, different_length ? 5201 : 5200,
+            rank, bootstrap);
+        std::vector<std::byte> raw_identity{
+            std::byte{0x41}, std::byte{0x42},
+            static_cast<std::byte>(0x43U + rank)};
+        if (different_length && rank == 1)
+          raw_identity.push_back(std::byte{0x44});
+        megamoe::cuda::testing::override_next_protocol_identity(
+            std::move(raw_identity),
+            {0x1111111111111111ULL, 0x2222222222222222ULL});
+        megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                    execution);
+        try {
+          auto unexpected = coordinator.run({config, {1, {0, 1, 2}}, 10});
+          require(!unexpected,
+                  "different exact session identity published result");
+        } catch (const megamoe::NotifyDispatchError &error) {
+          results[rank].error = error.what();
+          results[rank].audit = coordinator.audit();
+        }
+      } catch (...) {
+        results[rank].unexpected = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  for (const auto &result : results)
+    if (result.unexpected)
+      std::rethrow_exception(result.unexpected);
+  require(!results[0].error.empty() && results[0].error == results[1].error &&
+              results[0].error.find("field=session_identity") !=
+                  std::string::npos &&
+              results[0].error.find("origin_rank=1") != std::string::npos,
+          "exact session identity error is not globally deterministic");
+  for (const auto &result : results)
+    require(result.audit.control_starts == 1 &&
+                result.audit.config_starts == 1 &&
+                result.audit.expert_count_starts == 0 &&
+                result.audit.packet_summary_starts == 0,
+            "exact session identity audit is not 1/1/0/0");
+  std::cout << "[PASS] equal summary/display but different raw session identity"
+            << (different_length ? " length" : " byte")
+            << " audit=1/1/0/0\n";
 }
 
 void test_device_only_sanitizer_paths() {
@@ -459,17 +730,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto world = nodes * gpus_per_node;
   const auto experts = std::max<std::uint32_t>(16, world * 2);
   const auto top_k = std::min<std::uint32_t>(6, experts);
-  auto config = make_config(nodes, gpus_per_node, experts, top_k, 7);
-  if (scenario == "expert_capacity_mismatch")
-    config.capacity.expert_rows.assign(experts, 100);
-  if (scenario == "workspace_capacity_mismatch")
-    config.capacity.workspace_rows_per_rank.assign(world, 1000);
-  auto routes = seeded_inputs(world, experts, top_k, seed)[rank];
-  std::uint64_t max_tokens = 10;
-  std::string identity = "cuda-multinode";
-  std::uint64_t generation = 701;
-  mutate_scenario(scenario, rank, config, routes, max_tokens, identity,
-                  generation);
+  const auto common_config = make_config(nodes, gpus_per_node, experts, top_k, 7);
+  const auto common_routes = seeded_inputs(world, experts, top_k, seed)[rank];
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (id_hex == "GENERATE") {
     require(rank == 0, "only rank 0 may generate bootstrap ID");
@@ -481,33 +743,67 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   auto execution = megamoe::cuda::make_cuda_execution(
       "multinode-exec-" + std::to_string(rank), local_rank);
   auto base = megamoe::cuda::make_nccl_session(
-      identity, world, rank, generation, local_rank, bootstrap);
-  megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(base, execution);
-  try {
-    auto result = coordinator.run({config, routes, max_tokens});
+      "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
+  if (scenario == "valid") {
+    auto session = megamoe::cuda::make_nccl_generation(
+        base, "cuda-multinode", 701);
+    megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                execution);
+    auto result = coordinator.run({common_config, common_routes, 10});
     std::cout << megamoe::serialize_dispatch_metadata(result.dispatch().host())
               << '\n';
     return;
-  } catch (const megamoe::NotifyDispatchError &error) {
-    const auto audit = coordinator.audit();
-    require(audit.control_starts == 1 && audit.expert_count_starts == 0 &&
-                audit.packet_summary_starts == 0,
-            "failed cross-host generation entered data collective");
-    std::cout << "CONTROL_ERROR " << error.what() << std::endl;
   }
-  auto recovery_session = megamoe::cuda::make_nccl_generation(
-      base, "cuda-multinode", 1701);
-  megamoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
-                                                           execution);
-  std::vector<std::int32_t> recovery_experts;
-  for (std::uint32_t slot = 0; slot < top_k; ++slot)
-    recovery_experts.push_back(static_cast<std::int32_t>(slot));
-  auto recovered = recovery.run({make_config(nodes, gpus_per_node, experts,
-                                               top_k, 7),
-                                 {1, std::move(recovery_experts)}, 10});
-  require(recovered.audit().config_starts == 1,
-          "cross-host recovery failed");
-  std::cout << "RECOVERY_OK rank=" << rank << std::endl;
+
+  for (std::uint64_t round = 0; round < 20; ++round) {
+    auto config = common_config;
+    if (scenario == "expert_capacity_mismatch")
+      config.capacity.expert_rows.assign(experts, 100);
+    if (scenario == "workspace_capacity_mismatch")
+      config.capacity.workspace_rows_per_rank.assign(world, 1000);
+    auto routes = common_routes;
+    std::uint64_t max_tokens = 10;
+    std::string identity = "cuda-multinode-invalid-" + scenario;
+    std::uint64_t generation = 800 + round * 2;
+    mutate_scenario(scenario, rank, config, routes, max_tokens, identity,
+                    generation);
+    auto session = megamoe::cuda::make_nccl_generation(
+        base, identity, generation);
+    megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                                execution);
+    try {
+      (void)coordinator.run({config, routes, max_tokens});
+      throw std::runtime_error("invalid cross-host generation passed");
+    } catch (const megamoe::NotifyDispatchError &error) {
+      const auto audit = coordinator.audit();
+      require(audit.control_starts == 1 &&
+                  audit.expert_count_starts == 0 &&
+                  audit.packet_summary_starts == 0,
+              "failed cross-host generation entered data collective");
+      std::cout << "CONTROL_ERROR round=" << round << " " << error.what()
+                << std::endl;
+    }
+
+    auto recovery_session = megamoe::cuda::make_nccl_generation(
+        base, "cuda-multinode-recovery-" + scenario, 801 + round * 2);
+    megamoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
+                                                             execution);
+    std::vector<std::int32_t> recovery_experts;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      recovery_experts.push_back(static_cast<std::int32_t>(slot));
+    auto recovered = recovery.run({common_config,
+                                   {1, std::move(recovery_experts)}, 10});
+    require(recovered.audit().control_starts == 1 &&
+                recovered.audit().config_starts == 1 &&
+                recovered.audit().expert_count_starts == 1 &&
+                recovered.audit().packet_summary_starts == 1,
+            "cross-host recovery failed");
+    require(recovered && !megamoe::serialize_dispatch_metadata(
+                              recovered.dispatch().host()).empty(),
+            "cross-host recovery metadata missing");
+    std::cout << "RECOVERY_OK rank=" << rank << " round=" << round
+              << std::endl;
+  }
   throw megamoe::NotifyDispatchError(
       megamoe::NotifyErrorCode::ControlProtocolFailure,
       "expected invalid cross-host generation");
@@ -547,7 +843,6 @@ void benchmark(std::uint32_t world) {
   constexpr std::size_t measured = 50;
   std::vector<double> steady;
   std::vector<double> setup;
-  std::vector<double> session_setup;
   std::vector<double> generation_end_to_end;
   using SetupMember = double megamoe::cuda::GenerationSetupTimings::*;
   const std::vector<std::pair<const char *, SetupMember>> setup_stages{
@@ -561,21 +856,32 @@ void benchmark(std::uint32_t world) {
       {"device_allocation_us", &megamoe::cuda::GenerationSetupTimings::device_allocation_us}};
   std::vector<std::vector<double>> setup_stage_samples(setup_stages.size());
   megamoe::cuda::NcclWorkspaceUsage peak;
+  // One communicator/session establishment per rank, once for the complete
+  // 10+50 run. Samples are the ranks participating in that one establishment.
+  const auto resources =
+      make_reusable_resources(config, "benchmark-session", 2999);
+  std::vector<double> session_setup;
+  for (const auto &resource : resources)
+    session_setup.push_back(resource.session_setup_us);
+  const auto session_setup_stats = summarize(session_setup);
   for (std::size_t iteration = 0; iteration < warmup + measured; ++iteration) {
-    const auto result = run_fixture(config, routes, "benchmark",
-                                    3000 + iteration, 8192, false);
+    const auto result = run_reused_fixture(
+        config, routes, resources, "benchmark-session",
+        3000 + iteration, 8192);
     rethrow_errors(result);
     if (iteration >= warmup) {
       double slow_wall = 0;
       double slow_setup = 0;
-      double slow_session_setup = 0;
+      double slow_steady = 0;
       std::vector<double> slow_setup_stages(setup_stages.size(), 0.0);
       for (const auto &rank : result) {
-        slow_wall = std::max(slow_wall, rank.wall_us);
-        slow_setup = std::max(
-            slow_setup, rank.setup.per_generation_setup_total_us);
-        slow_session_setup = std::max(slow_session_setup,
-                                      rank.session_setup_us);
+        const auto rank_steady = rank.execution.steady_execution_us;
+        const auto rank_setup = rank.setup.per_generation_setup_total_us;
+        // Compute setup-inclusive E2E per rank first; only then select the
+        // iteration's slowest rank. No cross-rank max subtraction is used.
+        slow_wall = std::max(slow_wall, rank_setup + rank_steady);
+        slow_setup = std::max(slow_setup, rank_setup);
+        slow_steady = std::max(slow_steady, rank_steady);
         for (std::size_t stage = 0; stage < setup_stages.size(); ++stage)
           slow_setup_stages[stage] = std::max(
               slow_setup_stages[stage], rank.setup.*setup_stages[stage].second);
@@ -593,10 +899,26 @@ void benchmark(std::uint32_t world) {
             peak.expert_slot_bytes, rank.workspace.expert_slot_bytes);
         peak.summary_slot_bytes = std::max(
             peak.summary_slot_bytes, rank.workspace.summary_slot_bytes);
+        peak.route_input_device_bytes = std::max(
+            peak.route_input_device_bytes,
+            rank.workspace.route_input_device_bytes);
+        peak.device_notify_arena_bytes = std::max(
+            peak.device_notify_arena_bytes,
+            rank.workspace.device_notify_arena_bytes);
+        peak.device_notify_pinned_staging_bytes = std::max(
+            peak.device_notify_pinned_staging_bytes,
+            rank.workspace.device_notify_pinned_staging_bytes);
+        peak.final_device_metadata_arena_view_capacity_bytes = std::max(
+            peak.final_device_metadata_arena_view_capacity_bytes,
+            rank.workspace.final_device_metadata_arena_view_capacity_bytes);
+        peak.event_count = std::max(peak.event_count,
+                                    rank.workspace.event_count);
+        peak.quantified_event_bytes = std::max(
+            peak.quantified_event_bytes,
+            rank.workspace.quantified_event_bytes);
       }
-      steady.push_back(slow_wall - slow_setup);
+      steady.push_back(slow_steady);
       setup.push_back(slow_setup);
-      session_setup.push_back(slow_session_setup);
       generation_end_to_end.push_back(slow_wall);
       for (std::size_t stage = 0; stage < setup_stages.size(); ++stage)
         setup_stage_samples[stage].push_back(slow_setup_stages[stage]);
@@ -604,13 +926,13 @@ void benchmark(std::uint32_t world) {
   }
   const auto steady_stats = summarize(steady);
   const auto setup_stats = summarize(setup);
-  const auto session_setup_stats = summarize(session_setup);
   const auto generation_stats = summarize(generation_end_to_end);
   std::vector<Statistics> setup_stage_stats;
   for (auto &samples : setup_stage_samples)
     setup_stage_stats.push_back(summarize(std::move(samples)));
   std::cout << "BENCH world=" << world
-            << " warmup=10 measured=50 aggregation=slowest-rank\n"
+            << " warmup=10 measured=50 aggregation=slowest-rank"
+               " session_reused=true\n"
             << "  one_time_session_setup_us mean="
             << session_setup_stats.mean << " p50=" << session_setup_stats.p50
             << " p95=" << session_setup_stats.p95
@@ -637,8 +959,10 @@ void benchmark(std::uint32_t world) {
               << " min=" << stats.minimum << " max=" << stats.maximum
               << '\n';
   }
-  std::cout << "BENCH_JSON {\"schema\":2,\"warmup\":10,\"measured\":50,"
-               "\"aggregation\":\"slowest-rank\",\"one_time_session_setup_us\":{\"mean\":"
+  std::cout << "BENCH_JSON {\"schema\":3,\"warmup\":10,\"measured\":50,"
+               "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
+               "\"session_setup_sample\":\"one establishment; samples are ranks\","
+               "\"one_time_session_setup_us\":{\"mean\":"
             << session_setup_stats.mean << ",\"p50\":"
             << session_setup_stats.p50 << ",\"p95\":"
             << session_setup_stats.p95 << ",\"min\":"
@@ -676,6 +1000,18 @@ void benchmark(std::uint32_t world) {
             << peak.summary_slot_bytes << ",\"device\":"
             << peak.device_bytes << ",\"pinned\":"
             << peak.pinned_host_bytes
+            << ",\"route_input_device\":"
+            << peak.route_input_device_bytes
+            << ",\"device_notify_arena\":"
+            << peak.device_notify_arena_bytes
+            << ",\"device_notify_pinned_staging\":"
+            << peak.device_notify_pinned_staging_bytes
+            << ",\"final_device_metadata_arena_view_capacity\":"
+            << peak.final_device_metadata_arena_view_capacity_bytes
+            << ",\"final_metadata_is_arena_subview\":true"
+            << ",\"event_count\":" << peak.event_count
+            << ",\"quantified_event_bytes\":"
+            << peak.quantified_event_bytes
             << "},\"hot_path\":{\"per_route_copy\":false,"
                "\"per_route_allocation\":false,\"per_route_sync\":false}}\n";
 }
@@ -708,14 +1044,24 @@ int main(int argc, char **argv) {
       if (world == 2) {
         test_protocol_regressions();
         test_twenty_failure_recovery_rounds();
+        test_config_wire_corruption(2, 0);
+        test_config_wire_corruption(2, 1);
+        test_exact_session_identity_agreement(false);
+        test_exact_session_identity_agreement(true);
       }
-      if (world == 1)
+      if (world == 1) {
         test_fault_injection();
+        test_config_wire_corruption(1, 0);
+      }
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--protocol-regressions") {
       test_protocol_regressions();
       test_twenty_failure_recovery_rounds();
+      test_config_wire_corruption(2, 0);
+      test_config_wire_corruption(2, 1);
+      test_exact_session_identity_agreement(false);
+      test_exact_session_identity_agreement(true);
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--smoke") {

@@ -28,6 +28,10 @@ class CollectiveSession {
 public:
   CollectiveSession() = default;
   const std::string &identity() const;
+  // Stable protocol identity shared by every process in the communicator.
+  // This is immutable bounded storage; native communicator addresses are never
+  // used as a distributed identity.
+  const std::vector<std::byte> &stable_identity_bytes() const;
   std::uint32_t world_size() const;
   std::uint64_t generation() const;
   bool same_instance(const CollectiveSession &other) const noexcept;
@@ -41,11 +45,19 @@ private:
   friend CollectiveSession
   make_collective_session(std::string, std::uint32_t, std::uint64_t,
                           std::shared_ptr<const BackendSessionState>);
+  friend CollectiveSession make_collective_session(
+      std::string, std::vector<std::byte>, std::uint32_t, std::uint64_t,
+      std::shared_ptr<const BackendSessionState>);
   friend class CountExchange;
 };
 
 CollectiveSession make_collective_session(
     std::string identity, std::uint32_t world_size, std::uint64_t generation,
+    std::shared_ptr<const BackendSessionState> backend_state = {});
+
+CollectiveSession make_collective_session(
+    std::string display_identity, std::vector<std::byte> stable_identity_bytes,
+    std::uint32_t world_size, std::uint64_t generation,
     std::shared_ptr<const BackendSessionState> backend_state = {});
 
 class ExecutionToken {

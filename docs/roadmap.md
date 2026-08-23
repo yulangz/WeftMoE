@@ -24,8 +24,9 @@
   lease contract, with event completion, typed D2H result, async-error checks,
   and contextual CUDA/NCCL failures.
 - Fixed 256-byte little-endian control AllGather plus an exact canonical-config
-  byte AllGather before every data collective; rank-0-baseline error selection,
-  four-stage audit, and healthy-communicator recovery.
+  byte AllGather before every data collective; self-checking config envelope,
+  exact original session identity, rank-0-baseline error selection,
+  enqueue-point four-stage audit, and healthy-communicator recovery.
 - Explicit capacity-bound workspace and complete device metadata staging for
   later forward/backward consumers; no hot-path device allocation.
 - Single-GPU, local 2/8-GPU, and real two-host 2/16-rank full-field comparisons

@@ -32,6 +32,7 @@ const char *kind_name(ExchangeKind kind) noexcept {
 
 struct CollectiveSession::Impl {
   std::string identity;
+  std::vector<std::byte> stable_identity_bytes;
   std::uint32_t world_size = 0;
   std::uint64_t generation = 0;
   std::shared_ptr<const BackendSessionState> backend_state;
@@ -39,6 +40,18 @@ struct CollectiveSession::Impl {
 
 CollectiveSession make_collective_session(
     std::string identity, std::uint32_t world_size, std::uint64_t generation,
+    std::shared_ptr<const BackendSessionState> backend_state) {
+  std::vector<std::byte> stable(identity.size());
+  std::transform(identity.begin(), identity.end(), stable.begin(),
+                 [](char value) { return static_cast<std::byte>(value); });
+  return make_collective_session(std::move(identity), std::move(stable),
+                                 world_size, generation,
+                                 std::move(backend_state));
+}
+
+CollectiveSession make_collective_session(
+    std::string identity, std::vector<std::byte> stable_identity_bytes,
+    std::uint32_t world_size, std::uint64_t generation,
     std::shared_ptr<const BackendSessionState> backend_state) {
   if (identity.empty()) {
     invalid_exchange("collective session identity/communicator is empty: "
@@ -52,12 +65,26 @@ CollectiveSession make_collective_session(
     invalid_exchange(
         "collective session generation is invalid: expected=>0, actual=0");
   }
+  constexpr std::size_t kMaxStableIdentityBytes = 4096;
+  if (stable_identity_bytes.empty() ||
+      stable_identity_bytes.size() > kMaxStableIdentityBytes) {
+    invalid_exchange(
+        "collective stable identity bytes are invalid: expected=(0,4096], actual=" +
+        std::to_string(stable_identity_bytes.size()));
+  }
   auto impl = std::make_shared<CollectiveSession::Impl>();
   impl->identity = std::move(identity);
+  impl->stable_identity_bytes = std::move(stable_identity_bytes);
   impl->world_size = world_size;
   impl->generation = generation;
   impl->backend_state = std::move(backend_state);
   return CollectiveSession(std::move(impl));
+}
+
+const std::vector<std::byte> &CollectiveSession::stable_identity_bytes() const {
+  if (!impl_)
+    invalid_exchange("attempted to access an empty collective session");
+  return impl_->stable_identity_bytes;
 }
 
 const std::string &CollectiveSession::identity() const {

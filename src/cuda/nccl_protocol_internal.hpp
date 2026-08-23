@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <cstddef>
+#include <vector>
 
 #include "megamoe/cuda/nccl_count_exchange.hpp"
 
@@ -20,6 +22,24 @@ enum class NcclFaultPoint {
   BackendCompletion,
 };
 void inject_next_nccl_fault(NcclFaultPoint point) noexcept;
+// Controlled wire/provenance corruption hooks. They are declared only in the
+// private test header and are consumed once by the sole coordinator.
+void corrupt_next_config_wire(std::size_t offset) noexcept;
+void override_next_protocol_identity(
+    std::vector<std::byte> raw_identity,
+    StableSessionId diagnostic_summary) noexcept;
+struct NcclLifecycleSnapshot {
+  std::uint64_t slot_allocations = 0;
+  std::uint64_t slot_destructions = 0;
+  std::uint64_t operation_waits = 0;
+  std::uint64_t operation_cancels = 0;
+  std::uint64_t destructor_drains = 0;
+  std::uint64_t completion_lease_creates = 0;
+  std::uint64_t completion_lease_destroys = 0;
+  std::uint64_t validated_publishes = 0;
+};
+void reset_nccl_lifecycle_counters() noexcept;
+NcclLifecycleSnapshot nccl_lifecycle_snapshot() noexcept;
 } // namespace testing
 
 class ValidatedControlHandle {

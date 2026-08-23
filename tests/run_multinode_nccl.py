@@ -238,22 +238,27 @@ def main():
             markers = [line.removeprefix("CONTROL_ERROR ")
                        for line in stdout.splitlines()
                        if line.startswith("CONTROL_ERROR ")]
-            recovered = f"RECOVERY_OK rank={rank}" in stdout
-            if returncode == 0 or len(markers) != 1 or not recovered:
+            recoveries = [line for line in stdout.splitlines()
+                          if line.startswith(f"RECOVERY_OK rank={rank} round=")]
+            if returncode == 0 or len(markers) != 20 or len(recoveries) != 20:
                 failures.append(
                     f"rank={rank} exit={returncode}, control_errors={len(markers)}, "
-                    f"recovered={recovered}; stdout={stdout[-4000:]}; stderr={stderr[-4000:]}"
+                    f"recoveries={len(recoveries)}; stdout={stdout[-4000:]}; stderr={stderr[-4000:]}"
                 )
-            elif "origin_rank=1" not in markers[0]:
-                failures.append(f"rank={rank} error lacks origin_rank=1: {markers[0]}")
-            errors.append(markers[0] if markers else "")
+            elif any("origin_rank=1" not in marker for marker in markers):
+                failures.append(f"rank={rank} error lacks origin_rank=1: {markers[-1]}")
+            errors.append(markers)
         if failures:
             raise RuntimeError("invalid protocol launch failed:\n" + "\n".join(failures))
-        if len(set(errors)) != 1:
-            raise AssertionError(f"ranks selected different errors: {errors}")
+        for round_index in range(20):
+            round_errors = [rank_errors[round_index] for rank_errors in errors]
+            if len(set(round_errors)) != 1:
+                raise AssertionError(
+                    f"ranks selected different errors in round={round_index}: {round_errors}"
+                )
         print(
-            f"[PASS] real cross-host control rejection/recovery: scenario={args.scenario}, "
-            f"world={world}, error={errors[0]}"
+            f"[PASS] real cross-host 20-round control rejection/recovery: "
+            f"scenario={args.scenario}, world={world}, error={errors[0][0]}"
         )
         return
 

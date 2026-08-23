@@ -44,6 +44,9 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking.
 - every public header as an isolated `-Werror` translation unit.
+- nine compile-negative probes for the retired `wait`, `wait_preflight`, raw
+  notify start, phase-specific collective starters, and internal NCCL
+  operation/backend types.
 
 ## Warning-clean build
 
@@ -86,7 +89,11 @@ make BUILD_DIR=build-cuda cuda-sm90-compile
 `cuda-test-local` runs real NCCL worlds 1, 2, and 8. Each world runs 25 fixed
 seeds, a 20-run byte-for-byte repeat fixture, staggered rank enqueue timing,
 different per-rank CUDA streams, and controlled download of every device field
-for comparison to the host handle.
+for comparison to the host handle. World 2 additionally runs five independent
+20-round invalid-to-valid recovery categories on one communicator, config-wire
+corruption from rank 0 and rank 1, and exact raw-session identity mismatches
+with equal display names/header summaries. World 1 runs the nine-point enqueue
+audit/lifecycle table and a self-corruption integrity check.
 
 ## Real two-host NCCL
 
@@ -109,7 +116,7 @@ PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
   --socket-ifname '=eth0' --disable-ib
 
-# Timeout-bounded distributed rejection followed by recovery on the same comm.
+# Timeout-bounded 20-round distributed rejection/recovery on the same comm.
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
   --remote root@10.10.19.233 --port 2222 \
@@ -159,34 +166,44 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
   build-cuda/test_cuda_notify --bench 8
 ```
 
-The benchmark performs 10 warmups and 50 measured iterations. It reports mean,
-P50, P95, min, and max using the slowest rank per iteration. Names distinguish
-one-time session setup (owned by the runner), per-generation coordinator/backend
-and control/config/count/summary slot setup, and steady-state execution.
+The benchmark creates one session per rank once, reuses it for 10 warmups and
+50 measured iterations, and reports mean, P50, P95, min, and max. Names
+distinguish one-time session setup, per-generation coordinator/backend and
+control/config/count/summary slot setup, and steady-state execution.
 `BENCH_JSON` carries the same categories. Workspace reporting includes the
-256-byte control wire/slots, canonical config wire/slots, count/summary slots,
-device bytes, and pinned bytes. Setup-inclusive wall time is never labelled as
-steady-state. Mapping has no per-route copy, allocation, or synchronization.
+route input, unique notify device arena and pinned staging, 256-byte control
+wire/slots, canonical config wire/slots, count/summary slots, final-metadata
+subview, and event count. Shared-arena subviews are not double-counted.
+Setup-inclusive E2E is calculated per rank as `rank_setup + rank_steady` before
+choosing the slowest rank. Mapping has no per-route copy, allocation, or
+synchronization.
 
 On the inspected local 8-GPU L20X host, the refactored coordinator baseline
 produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
 
 | stage | mean | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| one-time NCCL session setup | 383008 | 369536 | 471565 | 344709 | 524727 |
-| per-generation setup | 13396.9 | 9376.96 | 34485.8 | 8219.19 | 40336.4 |
-| setup-inclusive generation end-to-end | 210409 | 174145 | 281481 | 160704 | 874043 |
-| steady-state execution | 197012 | 162620 | 263805 | 151561 | 856049 |
-| config slot allocation | 2677.08 | 2680.96 | 2967.84 | 2299.01 | 3586.94 |
-| count slot allocation | 1262.28 | 1241.65 | 1551.27 | 989.894 | 1909.25 |
-| summary slot allocation | 1241.43 | 1160.09 | 1937.30 | 964.696 | 2233.29 |
+| one-time NCCL session setup | 1717800 | 1710350 | 1757600 | 1681640 | 1757600 |
+| per-generation setup | 8664.04 | 5782.74 | 25916.2 | 5212.38 | 34520.4 |
+| setup-inclusive generation end-to-end | 105863 | 96360.8 | 167391 | 93290.3 | 204228 |
+| steady-state execution | 97963.7 | 90727.2 | 162027 | 88618.6 | 178385 |
+| config slot allocation | 1186.47 | 1184.98 | 1337.73 | 947.467 | 1453.19 |
+| count slot allocation | 605.592 | 602.807 | 632.688 | 574.326 | 653.741 |
+| summary slot allocation | 667.029 | 655.960 | 707.693 | 627.258 | 928.650 |
 
-The corresponding peak NCCL workspace categories were: control slot 4,608
-bytes, config wire 3,352 bytes, config slot 60,336 bytes, expert slot 49,152
-bytes, summary slot 128 bytes, device total 57,112 bytes, and pinned total
-57,112 bytes. The coordinator/backend creation measurement includes control
-slot creation; component rows are diagnostic and are not summed as disjoint
-categories.
+The corresponding unique peak workspace was 21,617,215 device bytes and
+1,504,336 pinned bytes: route input 196,608; notify arena 21,361,407; notify
+pinned staging 1,445,136; control slot 4,608; config wire 3,584; config slot
+64,512; expert slot 49,152; summary slot 128. Final metadata is a 21,361,407-byte
+arena view and therefore is not added again. Seven CUDA events are reported;
+their opaque runtime allocation size is recorded as zero.
+
+The earlier approximately 197 ms number is not a comparable regression point:
+that runner rebuilt communicators every iteration and computed steady time by
+subtracting independently selected slowest-rank maxima. The corrected 98.0 ms
+mean uses one reused session and same-rank accounting, which is consistent with
+the earlier approximately 90 ms correctness baseline. No mapping or
+materialization algorithm was changed for this correction.
 
 ## Clean export
 

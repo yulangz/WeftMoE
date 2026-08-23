@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "megamoe/cuda/nccl_count_exchange.hpp"
 
@@ -22,6 +23,7 @@ struct NcclSessionState final : BackendSessionState {
   std::uint32_t device = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
+  std::vector<std::uint8_t> bootstrap_identity;
   ncclComm_t comm = nullptr;
   ~NcclSessionState() noexcept override;
 };
@@ -45,6 +47,8 @@ struct CudaBufferState final : BackendDeviceLeaseState {
 };
 
 struct CudaCompletionLease final : BackendCompletionLeaseState {
+  CudaCompletionLease() noexcept;
+  ~CudaCompletionLease() noexcept override;
   std::shared_ptr<const void> owner;
 };
 
