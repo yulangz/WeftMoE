@@ -8,6 +8,16 @@
 
 namespace megamoe::cuda {
 
+// Private launcher/test bridge. Bootstrap material is transferred only as a
+// fixed-width binary record over an already-open descriptor; no text
+// representation is exposed by the public NCCL API.
+class NcclBootstrapIo {
+public:
+  static constexpr std::size_t kWireBytes = 128U;
+  static void write_fd(const NcclBootstrapId &, int fd);
+  static NcclBootstrapId read_fd(int fd);
+};
+
 namespace testing {
 enum class NcclFaultPoint {
   None,

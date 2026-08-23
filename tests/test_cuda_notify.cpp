@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include <cuda_runtime_api.h>
 
 #include "megamoe/api/errors.hpp"
@@ -725,7 +727,8 @@ void test_device_only_sanitizer_paths() {
 
 void run_rank(std::uint32_t rank, std::uint32_t nodes,
               std::uint32_t gpus_per_node, std::uint32_t local_rank,
-              std::uint64_t seed, const std::string &id_hex,
+              std::uint64_t seed, int bootstrap_input_fd,
+              int bootstrap_output_fd,
               const std::string &scenario) {
   const auto world = nodes * gpus_per_node;
   const auto experts = std::max<std::uint32_t>(16, world * 2);
@@ -733,12 +736,21 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto common_config = make_config(nodes, gpus_per_node, experts, top_k, 7);
   const auto common_routes = seeded_inputs(world, experts, top_k, seed)[rank];
   megamoe::cuda::NcclBootstrapId bootstrap;
-  if (id_hex == "GENERATE") {
+  if (rank == 0) {
     require(rank == 0, "only rank 0 may generate bootstrap ID");
+    require(bootstrap_output_fd >= 0 && bootstrap_input_fd < 0,
+            "rank 0 requires only a bootstrap output descriptor");
     bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
-    std::cout << "BOOTSTRAP " << bootstrap.hex() << std::endl;
+    megamoe::cuda::NcclBootstrapIo::write_fd(bootstrap,
+                                              bootstrap_output_fd);
+    require(::close(bootstrap_output_fd) == 0,
+            "failed to close bootstrap output descriptor");
   } else {
-    bootstrap = megamoe::cuda::parse_nccl_bootstrap_id(id_hex);
+    require(bootstrap_input_fd >= 0 && bootstrap_output_fd < 0,
+            "nonzero rank requires only a bootstrap input descriptor");
+    bootstrap = megamoe::cuda::NcclBootstrapIo::read_fd(bootstrap_input_fd);
+    require(::close(bootstrap_input_fd) == 0,
+            "failed to close bootstrap input descriptor");
   }
   auto execution = megamoe::cuda::make_cuda_execution(
       "multinode-exec-" + std::to_string(rank), local_rank);
@@ -1033,10 +1045,6 @@ std::uint64_t parse_u64(const char *value) {
 
 int main(int argc, char **argv) {
   try {
-    if (argc == 2 && std::string(argv[1]) == "--emit-id") {
-      std::cout << megamoe::cuda::make_nccl_bootstrap_id().hex() << '\n';
-      return 0;
-    }
     if (argc == 3 && std::string(argv[1]) == "--local") {
       const auto world = static_cast<std::uint32_t>(parse_u64(argv[2]));
       print_nccl_runtime_info();
@@ -1079,7 +1087,8 @@ int main(int argc, char **argv) {
     if (argc >= 14 && std::string(argv[1]) == "--rank-runner") {
       std::uint32_t rank = 0, nodes = 0, gpus = 0, local = 0;
       std::uint64_t seed = 0;
-      std::string id;
+      int bootstrap_input_fd = -1;
+      int bootstrap_output_fd = -1;
       std::string scenario = "valid";
       for (int index = 2; index + 1 < argc; index += 2) {
         const std::string key = argv[index];
@@ -1088,11 +1097,13 @@ int main(int argc, char **argv) {
         else if (key == "--gpus-per-node") gpus = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
         else if (key == "--local-rank") local = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
         else if (key == "--seed") seed = parse_u64(argv[index + 1]);
-        else if (key == "--id") id = argv[index + 1];
+        else if (key == "--bootstrap-input-fd") bootstrap_input_fd = std::stoi(argv[index + 1]);
+        else if (key == "--bootstrap-output-fd") bootstrap_output_fd = std::stoi(argv[index + 1]);
         else if (key == "--scenario") scenario = argv[index + 1];
       }
       print_nccl_runtime_info();
-      run_rank(rank, nodes, gpus, local, seed, id, scenario);
+      run_rank(rank, nodes, gpus, local, seed, bootstrap_input_fd,
+               bootstrap_output_fd, scenario);
       return 0;
     }
     throw std::runtime_error("invalid arguments");

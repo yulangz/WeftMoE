@@ -44,9 +44,13 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking.
 - every public header as an isolated `-Werror` translation unit.
-- nine compile-negative probes for the retired `wait`, `wait_preflight`, raw
-  notify start, phase-specific collective starters, and internal NCCL
-  operation/backend types.
+- eleven compile-negative probes for the retired `wait`, `wait_preflight`, raw
+  notify start, phase-specific collective starters, internal NCCL
+  operation/backend types, and bootstrap hex encode/parse APIs.
+- eight fake-runner bootstrap-channel security paths: success, local failure,
+  remote failure, timeout, SSH start failure, short/oversize bootstrap, and
+  runner exception. They inspect argv/environment, scrubbed diagnostics,
+  process cleanup, and absence of bootstrap files.
 
 ## Warning-clean build
 
@@ -126,18 +130,23 @@ PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --socket-ifname '=eth0' --disable-ib
 ```
 
-The launcher starts rank 0 locally and keeps the NCCL bootstrap owner alive,
-then starts the remaining local and remote ranks. `--remote` is mandatory.
+The launcher starts rank 0 locally and receives its fixed 128-byte binary NCCL
+bootstrap through an inherited private pipe. Remaining local ranks receive the
+same bytes through dedicated stdin pipes; remote ranks receive them only over
+SSH stdin. No bootstrap text is emitted and the secret never appears in argv,
+environment variables, the remote shell command, process listings, or a
+temporary file. `--remote` is mandatory.
 Library directory, socket interface, and IB disabling are optional and inherit
 the process/remote environment unless explicitly supplied. The values above are
 an example for the inspected environment, not launcher defaults. Arguments are
-shell-quoted as individual remote `env` entries. Each invocation adds a random
-`--launch-id`; timeout/error cleanup terminates owned local handles and sends
-targeted TERM/KILL cleanup for only that ID on the remote host. The launcher
-creates no remote temporary file. It compares each valid 2/16-rank result
-against the Python oracle. Every rank also reports header version,
-`ncclGetVersion` runtime version, `dladdr`-resolved library path, and active
-network overrides.
+shell-quoted as individual remote `env` entries. Captured stdout/stderr,
+exceptions, and diagnostic tails are scrubbed for raw, hex, base64, and the
+retired bootstrap marker. Each invocation adds a random `--launch-id`;
+timeout/error cleanup terminates owned local handles and sends targeted
+TERM/KILL cleanup for only that ID on the remote host. The launcher creates no
+remote temporary file. It compares each valid 2/16-rank result against the
+Python oracle. Every rank also reports header version, `ncclGetVersion` runtime
+version, `dladdr`-resolved library path, and active network overrides.
 
 Explicit preload is required in the current container because another injected
 runtime otherwise precedes ASan.

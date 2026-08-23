@@ -11,11 +11,11 @@
 namespace megamoe::cuda {
 
 class NcclSession;
+class NcclBootstrapIo;
 
 class NcclBootstrapId {
 public:
   NcclBootstrapId() = default;
-  std::string hex() const;
   explicit operator bool() const noexcept { return !bytes_.empty(); }
 
 private:
@@ -23,7 +23,7 @@ private:
       : bytes_(std::move(bytes)) {}
   std::vector<std::uint8_t> bytes_;
   friend NcclBootstrapId make_nccl_bootstrap_id();
-  friend NcclBootstrapId parse_nccl_bootstrap_id(const std::string &);
+  friend class NcclBootstrapIo;
   friend NcclSession make_nccl_session(std::string, std::uint32_t,
                                        std::uint32_t, std::uint64_t,
                                        std::uint32_t,
@@ -31,7 +31,6 @@ private:
 };
 
 NcclBootstrapId make_nccl_bootstrap_id();
-NcclBootstrapId parse_nccl_bootstrap_id(const std::string &hex);
 
 class NcclSession {
 public:

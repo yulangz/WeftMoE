@@ -24,7 +24,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test cross-check header-test api-negative-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -78,6 +78,9 @@ $(BUILD_DIR)/metadata_dump: $(LIB_OBJECTS) tests/metadata_dump.cpp
 reference-test:
 	PYTHONPATH=. python3 -m unittest discover -v -s tests -p 'test_reference.py'
 
+launcher-security-test:
+	PYTHONPATH=. python3 tests/test_launcher_security.py
+
 cross-check: $(BUILD_DIR)/metadata_dump
 	$(BUILD_DIR)/metadata_dump > $(BUILD_DIR)/cpp_metadata.json
 	PYTHONPATH=. python3 tests/compare_reference.py $(BUILD_DIR)/cpp_metadata.json
@@ -88,7 +91,7 @@ header-test:
 api-negative-test:
 	CXX='$(CXX)' python3 tests/check_cuda_public_api.py
 
-test: $(BUILD_DIR)/test_notify_dispatch reference-test cross-check header-test api-negative-test
+test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test cross-check header-test api-negative-test
 	$(BUILD_DIR)/test_notify_dispatch
 
 ifeq ($(ENABLE_CUDA),1)

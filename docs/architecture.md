@@ -243,6 +243,17 @@ session owns this immutable bounded byte string across generation views. Only a
 two-word safe summary enters fixed control; the raw bytes enter exact config
 agreement and are never emitted in normal diagnostics.
 
+For cross-host bootstrap, rank 0 creates the ID inside the runner and writes
+exactly 128 binary bytes to an inherited, launcher-owned pipe descriptor. The
+launcher forwards the bytes to each other local runner through that process's
+private stdin and to each remote runner exclusively through SSH stdin. The
+secret is never serialized as text and never enters argv, environment, a
+remote command, process listings, stdout/stderr, or a temporary file. All
+captured runner output and all launcher-generated exceptions/tails pass through
+a defense-in-depth scrubber that removes the known raw bytes, lower/upper hex,
+standard/URL-safe base64 (with or without padding), and the retired text-marker
+line. Scrubbing is not the transport boundary; the dedicated pipes are.
+
 ## Benchmark accounting
 
 The benchmark establishes every rank's NCCL session once before 10 warmups and

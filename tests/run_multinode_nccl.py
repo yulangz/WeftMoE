@@ -2,15 +2,17 @@
 """Launch a two-host NCCL protocol test with explicit remote/network options."""
 
 import argparse
+import base64
 import json
 import os
-import queue
+import re
 import secrets
+import select
 import shlex
 import subprocess
 import sys
 import time
-import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,6 +25,47 @@ from reference.notify_dispatch_reference import (
 
 
 MASK64 = (1 << 64) - 1
+BOOTSTRAP_BYTES = 128
+_active_bootstrap = b""
+
+
+@dataclass(frozen=True)
+class RankOutput:
+    rank: int
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def scrub_output(value, bootstrap=None):
+    """Remove bootstrap binary/text encodings from any aggregated diagnostic."""
+    secret = _active_bootstrap if bootstrap is None else bytes(bootstrap)
+    if isinstance(value, bytes):
+        raw = value
+        if secret:
+            raw = raw.replace(secret, b"[REDACTED_SECRET]")
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    # Defense in depth for the retired stdout protocol, even before enough
+    # bytes are known to derive its exact representation.
+    text = re.sub(
+        r"(?im)^BOOTSTRAP[ \t]+[^\r\n]*",
+        "[REDACTED_SECRET]",
+        text,
+    )
+    if len(secret) >= 8:
+        representations = {
+            secret.hex(),
+            secret.hex().upper(),
+            base64.b64encode(secret).decode("ascii"),
+            base64.urlsafe_b64encode(secret).decode("ascii"),
+        }
+        representations.update(item.rstrip("=") for item in tuple(representations))
+        for representation in sorted(representations, key=len, reverse=True):
+            if representation:
+                text = text.replace(representation, "[REDACTED_SECRET]")
+    return text
 
 
 def seeded_inputs(world, experts, top_k, seed, max_tokens=10):
@@ -65,9 +108,9 @@ def config_for(gpus_per_node):
     )
 
 
-def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario,
-                launch_id):
-    return [
+def runner_args(binary, rank, gpus_per_node, seed, scenario, launch_id,
+                bootstrap_fd, produces_bootstrap=False):
+    result = [
         binary,
         "--rank-runner",
         "--rank", str(rank),
@@ -75,10 +118,15 @@ def runner_args(binary, rank, gpus_per_node, seed, bootstrap, scenario,
         "--gpus-per-node", str(gpus_per_node),
         "--local-rank", str(rank % gpus_per_node),
         "--seed", str(seed),
-        "--id", bootstrap,
         "--scenario", scenario,
         "--launch-id", launch_id,
     ]
+    result.extend([
+        "--bootstrap-output-fd" if produces_bootstrap
+        else "--bootstrap-input-fd",
+        str(bootstrap_fd),
+    ])
+    return result
 
 
 def environment_overrides(args):
@@ -112,31 +160,46 @@ def remote_command(args, runner):
     ]
 
 
-def read_bootstrap(process, timeout):
-    result = queue.Queue(maxsize=1)
-
-    def reader():
-        prefix = []
-        for line in iter(process.stdout.readline, ""):
-            prefix.append(line)
-            if line.startswith("BOOTSTRAP "):
-                result.put((line.split(" ", 1)[1].strip(), "".join(prefix)))
-                return
-        result.put((None, "".join(prefix)))
-
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    try:
-        bootstrap, prefix = result.get(timeout=timeout)
-    except queue.Empty as error:
+def read_bootstrap(fd, timeout):
+    global _active_bootstrap
+    deadline = time.monotonic() + timeout
+    received = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("bootstrap secret pipe", timeout)
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise subprocess.TimeoutExpired("bootstrap secret pipe", timeout)
+        chunk = os.read(fd, BOOTSTRAP_BYTES + 1 - len(received))
+        if not chunk:
+            break
+        received.extend(chunk)
+        _active_bootstrap = bytes(received[:BOOTSTRAP_BYTES])
+        if len(received) > BOOTSTRAP_BYTES:
+            raise RuntimeError(
+                "bootstrap secret channel malformed: expected=128, actual=>128"
+            )
+    if len(received) != BOOTSTRAP_BYTES:
         raise RuntimeError(
-            "rank 0 did not publish a bootstrap ID before timeout"
-        ) from error
-    if not bootstrap:
-        raise RuntimeError(
-            f"rank 0 exited before publishing bootstrap ID; stdout={prefix[-2000:]}"
+            "bootstrap secret channel short read: expected=128, "
+            f"actual={len(received)}"
         )
-    return bootstrap, prefix
+    return bytes(received)
+
+
+def send_bootstrap(process, bootstrap):
+    try:
+        process.stdin.write(bootstrap)
+        process.stdin.flush()
+    except (BrokenPipeError, OSError) as error:
+        raise RuntimeError(
+            "bootstrap secret channel write failed before runner accepted input"
+        ) from error
+    finally:
+        process.stdin.close()
+        # communicate() otherwise attempts to flush the already closed pipe.
+        process.stdin = None
 
 
 def remote_cleanup(args, launch_id, signal):
@@ -161,25 +224,26 @@ def remote_cleanup(args, launch_id, signal):
 
 
 def stop_processes(processes, args, launch_id):
-    for _rank, process, _prefix in processes:
+    for _rank, process in processes:
         if process.poll() is None:
             process.terminate()
     deadline = time.monotonic() + 5.0
-    for _rank, process, _prefix in processes:
-        if process.poll() is None:
-            try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                process.kill()
-    for _rank, process, _prefix in processes:
-        if process.poll() is None:
-            process.wait()
+    for _rank, process in processes:
+        try:
+            stdout, stderr = process.communicate(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            (scrub_output(stdout), scrub_output(stderr))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            (scrub_output(stdout), scrub_output(stderr))
     remote_cleanup(args, launch_id, "TERM")
     time.sleep(0.25)
     remote_cleanup(args, launch_id, "KILL")
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--remote", required=True,
@@ -204,78 +268,120 @@ def main():
                  "expert_capacity_mismatch", "workspace_capacity_mismatch"),
         default="valid",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.gpus_per_node not in (1, 8):
         raise SystemExit("gpus-per-node must be 1 or 8 for the acceptance topology")
+    return args
+
+
+def launch_rank_processes(args):
+    global _active_bootstrap
+    _active_bootstrap = b""
 
     environment = local_environment(args)
     world = 2 * args.gpus_per_node
     launch_id = secrets.token_hex(16)
     processes = []
     outputs = []
+    bootstrap_read_fd = -1
+    bootstrap_write_fd = -1
     try:
+        bootstrap_read_fd, bootstrap_write_fd = os.pipe()
         rank0 = subprocess.Popen(
             runner_args(args.binary, 0, args.gpus_per_node, args.seed,
-                        "GENERATE", args.scenario, launch_id),
+                        args.scenario, launch_id, bootstrap_write_fd, True),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            stdin=subprocess.DEVNULL,
             env=environment,
+            pass_fds=(bootstrap_write_fd,),
         )
-        processes.append((0, rank0, ""))
-        bootstrap, prefix = read_bootstrap(rank0, min(args.timeout, 60.0))
-        processes[0] = (0, rank0, prefix)
+        processes.append((0, rank0))
+        os.close(bootstrap_write_fd)
+        bootstrap_write_fd = -1
+        bootstrap = read_bootstrap(
+            bootstrap_read_fd, min(args.timeout, 60.0)
+        )
+        os.close(bootstrap_read_fd)
+        bootstrap_read_fd = -1
 
         for rank in range(1, world):
             runner = runner_args(
                 args.binary if rank < args.gpus_per_node else args.remote_binary,
-                rank, args.gpus_per_node, args.seed, bootstrap, args.scenario,
-                launch_id,
+                rank, args.gpus_per_node, args.seed, args.scenario, launch_id,
+                0,
             )
             command = runner if rank < args.gpus_per_node else remote_command(args, runner)
-            processes.append((rank, subprocess.Popen(
+            process = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 env=environment,
-            ), ""))
+            )
+            processes.append((rank, process))
+            send_bootstrap(process, bootstrap)
 
         deadline = time.monotonic() + args.timeout
-        for rank, process, prefix in processes:
+        for rank, process in processes:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(process.args, args.timeout)
             stdout, stderr = process.communicate(timeout=remaining)
-            outputs.append((rank, process.returncode, prefix + stdout, stderr))
+            outputs.append(RankOutput(
+                rank,
+                process.returncode,
+                scrub_output(stdout, bootstrap),
+                scrub_output(stderr, bootstrap),
+            ))
     finally:
+        if bootstrap_read_fd >= 0:
+            os.close(bootstrap_read_fd)
+        if bootstrap_write_fd >= 0:
+            os.close(bootstrap_write_fd)
         stop_processes(processes, args, launch_id)
+    return outputs
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    world = 2 * args.gpus_per_node
+    outputs = launch_rank_processes(args)
 
     runtime_lines = []
-    for rank, _returncode, stdout, _stderr in outputs:
-        evidence = [line for line in stdout.splitlines()
+    for result in outputs:
+        evidence = [line for line in result.stdout.splitlines()
                     if line.startswith("NCCL_RUNTIME ")]
         if len(evidence) != 1:
-            raise RuntimeError(f"rank={rank} missing unique NCCL runtime evidence")
+            raise RuntimeError(
+                f"rank={result.rank} missing unique NCCL runtime evidence; "
+                f"exit={result.returncode}, stdout={result.stdout[-2000:]}, "
+                f"stderr={result.stderr[-2000:]}"
+            )
         runtime_lines.append(evidence[0])
     print("\n".join(runtime_lines))
 
     if args.scenario != "valid":
         errors = []
         failures = []
-        for rank, returncode, stdout, stderr in outputs:
+        for result in outputs:
             markers = [line.removeprefix("CONTROL_ERROR ")
-                       for line in stdout.splitlines()
+                       for line in result.stdout.splitlines()
                        if line.startswith("CONTROL_ERROR ")]
-            recoveries = [line for line in stdout.splitlines()
-                          if line.startswith(f"RECOVERY_OK rank={rank} round=")]
-            if returncode == 0 or len(markers) != 20 or len(recoveries) != 20:
+            recoveries = [line for line in result.stdout.splitlines()
+                          if line.startswith(
+                              f"RECOVERY_OK rank={result.rank} round=")]
+            if (result.returncode == 0 or len(markers) != 20 or
+                    len(recoveries) != 20):
                 failures.append(
-                    f"rank={rank} exit={returncode}, control_errors={len(markers)}, "
-                    f"recoveries={len(recoveries)}; stdout={stdout[-4000:]}; stderr={stderr[-4000:]}"
+                    f"rank={result.rank} exit={result.returncode}, "
+                    f"control_errors={len(markers)}, recoveries={len(recoveries)}; "
+                    f"stdout={result.stdout[-4000:]}; stderr={result.stderr[-4000:]}"
                 )
             elif any("origin_rank=1" not in marker for marker in markers):
-                failures.append(f"rank={rank} error lacks origin_rank=1: {markers[-1]}")
+                failures.append(
+                    f"rank={result.rank} error lacks origin_rank=1: {markers[-1]}"
+                )
             errors.append(markers)
         if failures:
             raise RuntimeError("invalid protocol launch failed:\n" + "\n".join(failures))
@@ -293,21 +399,23 @@ def main():
 
     actual = [None] * world
     failures = []
-    for rank, returncode, stdout, stderr in outputs:
-        if returncode:
+    for result in outputs:
+        if result.returncode:
             failures.append(
-                f"rank={rank} exit={returncode}; stdout={stdout[-10000:]}; "
-                f"stderr={stderr[-10000:]}"
+                f"rank={result.rank} exit={result.returncode}; "
+                f"stdout={result.stdout[-10000:]}; "
+                f"stderr={result.stderr[-10000:]}"
             )
             continue
-        lines = [line for line in stdout.splitlines() if line.startswith("{")]
+        lines = [line for line in result.stdout.splitlines()
+                 if line.startswith("{")]
         if len(lines) != 1:
             failures.append(
-                f"rank={rank} expected one metadata JSON line, got {len(lines)}: "
-                f"{stdout[-4000:]}"
+                f"rank={result.rank} expected one metadata JSON line, "
+                f"got {len(lines)}: {result.stdout[-4000:]}"
             )
             continue
-        actual[rank] = json.loads(lines[0])
+        actual[result.rank] = json.loads(lines[0])
     if failures:
         raise RuntimeError("multinode NCCL launch failed:\n" + "\n".join(failures))
 
@@ -330,8 +438,12 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.TimeoutExpired as error:
-        print(f"[FAIL] rank launch timed out after {error.timeout}s", file=sys.stderr)
+        print(scrub_output(
+            f"[FAIL] rank launch timed out after {error.timeout}s"
+        ), file=sys.stderr)
         raise SystemExit(124)
     except Exception as error:
-        print(f"[FAIL] {error}", file=sys.stderr)
-        raise
+        print(scrub_output(f"[FAIL] {error}"), file=sys.stderr)
+        raise SystemExit(1)
+    finally:
+        _active_bootstrap = b""

@@ -100,6 +100,13 @@ values participate. Those original bytes are length-prefixed into canonical
 config and compared exactly. Logs expose only display names, lengths, and safe
 summaries—not bootstrap bytes.
 
+The multinode launcher transports the raw `ncclUniqueId` only as a fixed-width
+binary secret: rank 0 writes to an inherited private pipe, local peers read
+dedicated stdin pipes, and remote peers read SSH stdin. Bootstrap material is
+never placed in argv, environment variables, shell commands, stdout/stderr, or
+temporary files. Aggregated diagnostics are additionally scrubbed for raw,
+hex, base64, and the retired text marker form.
+
 Canonical config is an explicit little-endian envelope: `magic`, wire version,
 64-byte header length, payload length, two zero reserved words, payload
 checksum, normalized wire digest, then the canonical payload. Decoding checks
