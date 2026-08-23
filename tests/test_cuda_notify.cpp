@@ -77,6 +77,36 @@ seeded_inputs(std::uint32_t world, std::uint32_t experts,
   return routes;
 }
 
+megamoe::RankRoutingInput seeded_rank_input(
+    std::uint32_t world, std::uint32_t experts, std::uint32_t top_k,
+    std::uint64_t seed, std::uint32_t target_rank,
+    std::uint64_t max_tokens = 10) {
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return seed;
+  };
+  megamoe::RankRoutingInput result;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    const auto tokens = next() % (max_tokens + 1);
+    if (rank == target_rank)
+      result.num_tokens = tokens;
+    for (std::uint64_t token = 0; token < tokens; ++token) {
+      std::vector<std::uint32_t> candidates(experts);
+      for (std::uint32_t expert = 0; expert < experts; ++expert)
+        candidates[expert] = expert;
+      for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+        const auto selected =
+            slot + static_cast<std::uint32_t>(next() % (experts - slot));
+        std::swap(candidates[slot], candidates[selected]);
+        if (rank == target_rank)
+          result.selected_experts.push_back(
+              static_cast<std::int32_t>(candidates[slot]));
+      }
+    }
+  }
+  return result;
+}
+
 struct Timings {
   double mapping_us = 0;
   double collective_us = 0;
@@ -516,9 +546,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto experts = std::max<std::uint32_t>(16, world * 2);
   const auto top_k = std::min<std::uint32_t>(6, experts);
   const auto config = make_config(nodes, gpus_per_node, experts, top_k, 7);
-  auto all_routes = seeded_inputs(world, experts, top_k, seed);
-  auto local_routes = std::move(all_routes.at(rank));
-  all_routes.clear();
+  auto local_routes =
+      seeded_rank_input(world, experts, top_k, seed, rank);
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (id_hex == "GENERATE") {
     require(rank == 0, "only rank 0 may generate NCCL bootstrap ID");
