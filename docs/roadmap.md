@@ -68,9 +68,10 @@ Completed correctness components:
 - trusted release all-SM bulk route/row/token grids with direct canonical writes
   and per-peer phase completion; debug retains the ring/credit worker;
 - a checked-in Megatron-Core `MoEAlltoAllTokenDispatcher` comparison harness
-  and same-generation Notify-to-P2P integrated release benchmark. The measured
-  common-semantics single-node world-8 result is 5.012 ms versus 9.002 ms
-  (44.32% faster) over three independent 10-warmup/100-sample runs;
+  and same-generation Notify-to-P2P integrated release benchmark;
+- immutable per-route FP32 gate provenance and the frozen source-side
+  gate-after identity semantics. Dynamic gates remain local to their source
+  and unit-gate compatibility runs execute the identical reduction path;
 - an explicit GIN capability probe and fail-closed backend boundary.
 
 Still required before phase 4 closes:

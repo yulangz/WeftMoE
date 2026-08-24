@@ -1739,6 +1739,7 @@ struct CudaNotifyGenerationCoordinator::Impl {
   GenerationSetupTimings setup;
   bool used = false;
   CudaRouteInput direct_routes;
+  CudaGateInput direct_gates;
 };
 
 struct GenerationCancellationToken::State {
@@ -1930,6 +1931,9 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   const auto *direct_routes = impl_->direct_routes
                                   ? &impl_->direct_routes
                                   : static_cast<const CudaRouteInput *>(nullptr);
+  const auto *direct_gates = impl_->direct_gates
+                                 ? &impl_->direct_gates
+                                 : static_cast<const CudaGateInput *>(nullptr);
   auto status = host_preflight_status(request.config, request.local_routes,
                                       request.max_tokens_per_rank,
                                       direct_routes);
@@ -1946,6 +1950,12 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       try {
         DeviceRouteProvenanceBridge::validate(
             *direct_routes, impl_->context, impl_->execution);
+        if (!direct_gates)
+          throw NotifyDispatchError(
+              NotifyErrorCode::InvalidRuntimeConfig,
+              "phase=generation-preflight, field=gates, expected=valid, actual=empty");
+        DeviceGateProvenanceBridge::validate(
+            *direct_gates, *direct_routes, impl_->context, impl_->execution);
       } catch (const NotifyDispatchError &) {
         status = {ControlLocalError::InvalidRouteShape,
                   ControlField::LocalValidation, UINT64_MAX, UINT64_MAX, 0,
@@ -1988,6 +1998,15 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                                              request.config.top_k,
                                              impl_->context,
                                              impl_->execution);
+      CudaGateInput gates;
+      if (direct_gates) {
+        gates = *direct_gates;
+      } else {
+        std::vector<float> unit_gates(
+            static_cast<std::size_t>(routes.route_count()), 1.0F);
+        gates = testing::upload_fp32_gates_for_testing(
+            unit_gates, routes, impl_->context, impl_->execution);
+      }
       route_input_bytes = routes.device_bytes();
       auto plan = query_cuda_notify_workspace(
           request.config, impl_->session.rank(),
@@ -2002,7 +2021,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                                  plan, impl_->context, impl_->execution);
       auto operation = start_cuda_rank_local_notify(
           request.config, impl_->context, impl_->execution, routes,
-          std::move(workspace));
+          gates, std::move(workspace));
       auto preflight = operation.wait_preflight();
       local_mapping_us = preflight.device_mapping_us();
       status = preflight.status();
@@ -2218,11 +2237,12 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run_device(
   if (!impl_ || !impl_->pool)
     invalid("phase=generation-coordinator-device, field=resource_pool, "
             "rank=n/a, expected=explicit session pool, actual=missing");
-  if (!request.local_routes)
+  if (!request.local_routes || !request.local_gates)
     invalid("phase=generation-coordinator-device, field=routes, rank=" +
             std::to_string(impl_->session.rank()) +
-            ", expected=valid device lease, actual=empty");
+            ", expected=valid route+gate device leases, actual=empty");
   impl_->direct_routes = request.local_routes;
+  impl_->direct_gates = request.local_gates;
   NotifyGenerationRequest adapted;
   adapted.config = std::move(request.config);
   adapted.local_routes.num_tokens = request.local_routes.num_tokens();

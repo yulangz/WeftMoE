@@ -374,6 +374,12 @@ __device__ float bf16_bits_to_float(std::uint16_t value) {
   return __uint_as_float(static_cast<unsigned int>(value) << 16U);
 }
 
+__device__ float gate_after_accumulate(float sum, float gate,
+                                       std::uint16_t bf16_value) {
+  const float product = __fmul_rn(gate, bf16_bits_to_float(bf16_value));
+  return __fadd_rn(sum, product);
+}
+
 __device__ unsigned long long device_globaltimer_ns() {
   unsigned long long value = 0;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
@@ -395,6 +401,7 @@ __device__ transport::BFloat16 synthetic_value(
 struct TransportKernelArgs {
   DeviceDispatchKernelView dispatch;
   const transport::BFloat16 *input;
+  const float *gates;
   std::uint64_t hidden;
   std::uint64_t max_destination_rows;
   std::uint32_t channels;
@@ -411,7 +418,6 @@ struct TransportKernelArgs {
   transport::BFloat16 *combined;
   TransportDeviceStatus *status;
   bool identity_expert;
-  float combine_gate_scale;
 };
 
 __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
@@ -591,8 +597,9 @@ __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
         const auto original = a.dispatch.combine_order[
             token * a.dispatch.identity.top_k + order];
         const auto route = token * a.dispatch.identity.top_k + original;
-        sum += a.combine_gate_scale *
-               bf16_bits_to_float(a.combine_return[route * a.hidden + h].bits);
+        sum = gate_after_accumulate(
+            sum, a.gates[route],
+            a.combine_return[route * a.hidden + h].bits);
       }
       a.combined[token * a.hidden + h] =
           transport::BFloat16{float_to_bf16_bits(sum)};
@@ -699,6 +706,7 @@ __device__ T *peer_at(void *base, std::size_t offset) {
 struct LocalP2pKernelArgs {
   DeviceDispatchKernelView dispatch;
   const transport::BFloat16 *input;
+  const float *gates;
   std::uint64_t hidden;
   std::uint64_t max_destination_rows;
   std::uint32_t rank;
@@ -728,7 +736,6 @@ struct LocalP2pKernelArgs {
   std::size_t status_offset;
   const unsigned long long *cancel_epoch;
   bool identity_expert;
-  float combine_gate_scale;
 };
 
 __device__ bool local_p2p_cancelled(const LocalP2pKernelArgs &a) {
@@ -1130,10 +1137,9 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
           while (atomicAdd_system(&local_return_ready[route], 0ULL) != a.epoch &&
                  !local_p2p_cancelled(a)) {
           }
-        sum += a.combine_gate_scale * bf16_bits_to_float(
-                                           local_combine_return[
-                                               route * a.hidden + hidden]
-                                               .bits);
+        sum = gate_after_accumulate(
+            sum, a.gates[route],
+            local_combine_return[route * a.hidden + hidden].bits);
       }
       local_combined[token * a.hidden + hidden] =
           transport::BFloat16{float_to_bf16_bits(sum)};
@@ -1327,8 +1333,9 @@ __global__ void local_p2p_bulk_reduce_kernel(LocalP2pKernelArgs a) {
       const auto original = a.dispatch.combine_order[
           token * a.dispatch.identity.top_k + order];
       const auto route = token * a.dispatch.identity.top_k + original;
-      sum += a.combine_gate_scale *
-             bf16_bits_to_float(contribution[route * a.hidden + hidden].bits);
+      sum = gate_after_accumulate(
+          sum, a.gates[route],
+          contribution[route * a.hidden + hidden].bits);
     }
     combined[token * a.hidden + hidden] =
         transport::BFloat16{float_to_bf16_bits(sum)};
@@ -1976,6 +1983,11 @@ DeviceActivationTransport::run_device_simulation_synthetic(
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "transport-run", "transport config", id.calling_rank,
                     "within exact pool geometry", "mismatch/exceeded");
+  if (config.gate_placement !=
+      transport::ActivationGatePlacement::SourceAfter)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "transport-run",
+                    "gate_placement", id.calling_rank, "SourceAfter",
+                    "unsupported gate-before placement");
   const auto expectation = DeviceDispatchViewExpectation{
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
       id.config_digest_word0, id.config_digest_word1};
@@ -2050,6 +2062,8 @@ DeviceActivationTransport::run_device_simulation_synthetic(
   TransportKernelArgs args{};
   args.dispatch = view;
   args.input = activation.pointer;
+  ActivationTransportBridge::wait_for_gates(dispatch, impl_->execution);
+  args.gates = ActivationTransportBridge::gate_pointer(dispatch);
   args.hidden = config.hidden_size;
   args.max_destination_rows = state->config.max_destination_rows_per_rank;
   args.channels = config.channels;
@@ -2073,7 +2087,6 @@ DeviceActivationTransport::run_device_simulation_synthetic(
   args.identity_expert =
       config.expert_transform ==
       transport::ActivationExpertTransform::Identity;
-  args.combine_gate_scale = config.combine_gate_scale;
   activation_transport_persistent_kernel<<<std::max(sms, 1), 128, 0,
                                            exec->stream>>>(args);
   internal::throw_cuda("transport-run", cudaGetLastError(), id.calling_rank,
@@ -2192,10 +2205,11 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "local-p2p-run", "transport config", id.calling_rank,
                     "within exact pool geometry", "mismatch/exceeded");
-  if (!std::isfinite(config.combine_gate_scale))
+  if (config.gate_placement !=
+      transport::ActivationGatePlacement::SourceAfter)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "local-p2p-run",
-                    "combine_gate_scale", id.calling_rank, "finite",
-                    "non-finite");
+                    "gate_placement", id.calling_rank, "SourceAfter",
+                    "unsupported gate-before placement");
 
   const auto expectation = DeviceDispatchViewExpectation{
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
@@ -2220,18 +2234,22 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       static_cast<std::uint64_t>(config.channels);
   [[maybe_unused]] const auto node_ring_slots = checked_mul(
       node_links, config.ring_slots_per_source_channel, "P2P proxy slots");
+  std::uint64_t generation_memset_calls = 0;
+  std::uint64_t generation_memset_bytes = 0;
+  std::uint64_t kernel_launches = 0;
   const auto zero_async = [&](std::size_t offset, std::uint64_t count,
                               std::size_t width, const char *name) {
     if (count == 0)
       return;
+    const auto bytes = checked_size(checked_mul(count, width, name), name);
     internal::throw_cuda(
         "local-p2p-run",
-        cudaMemsetAsync(at<void>(slot.device, offset), 0,
-                        checked_size(checked_mul(count, width, name), name),
-                        exec->stream),
+        cudaMemsetAsync(at<void>(slot.device, offset), 0, bytes, exec->stream),
         id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, name);
+    ++generation_memset_calls;
+    generation_memset_bytes += bytes;
   };
   __atomic_store_n(slot.host_cancel_epoch,
                    options.cancellation.cancellation_requested()
@@ -2350,6 +2368,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   initialize_p2p_barrier_kernel<<<1, 1, 0, exec->stream>>>(
       at<unsigned long long>(slot.device, layout.p2p_barrier_send),
       activation.slot->index, id.generation);
+  ++kernel_launches;
   internal::throw_cuda(
       "local-p2p-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -2381,6 +2400,8 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   LocalP2pKernelArgs args{};
   args.dispatch = view;
   args.input = activation.pointer;
+  ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
+  args.gates = ActivationTransportBridge::gate_pointer(dispatch);
   args.hidden = config.hidden_size;
   args.max_destination_rows =
       state->config.max_destination_rows_per_rank;
@@ -2425,7 +2446,6 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   args.identity_expert =
       config.expert_transform ==
       transport::ActivationExpertTransform::Identity;
-  args.combine_gate_scale = config.combine_gate_scale;
   internal::throw_cuda(
       "local-p2p-run",
       cudaEventRecord(slot.dispatch_complete, exec->stream), id.calling_rank,
@@ -2434,23 +2454,32 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       "cudaEventRecord(P2P generation setup complete)");
 #if MEGAMOE_DEBUG_VALIDATE
   local_p2p_persistent_kernel<<<sms, 128, 0, exec->stream>>>(args);
+  ++kernel_launches;
 #else
   local_p2p_bulk_dispatch_kernel<<<
       static_cast<unsigned int>(std::max<std::uint64_t>(
           view.sizes.route_count, 1ULL)),
       256, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_publish_dispatch_kernel<<<1, 32, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_wait_dispatch_kernel<<<1, 32, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_bulk_return_kernel<<<
       static_cast<unsigned int>(std::max<std::uint64_t>(
           view.sizes.incoming_row_count, 1ULL)),
       256, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_publish_return_kernel<<<1, 32, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_wait_return_kernel<<<1, 32, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_bulk_reduce_kernel<<<
       static_cast<unsigned int>(std::max<std::uint64_t>(id.num_tokens, 1ULL)),
       256, 0, exec->stream>>>(args);
+  ++kernel_launches;
   local_p2p_finish_kernel<<<1, 1, 0, exec->stream>>>(args);
+  ++kernel_launches;
 #endif
   internal::throw_cuda(
       "local-p2p-run", cudaGetLastError(), id.calling_rank, id.world_size,
@@ -2595,6 +2624,17 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       slot.host_status->actual_dispatch_peer_bytes;
   result->audit.actual_return_peer_bytes =
       slot.host_status->actual_return_peer_bytes;
+  result->audit.actual_route_input_bytes =
+      view.sizes.route_count * sizeof(std::int32_t);
+  result->audit.actual_local_gate_bytes =
+      view.sizes.route_count * sizeof(float);
+  result->audit.actual_peer_gate_bytes = 0;
+  result->audit.generation_memset_calls = generation_memset_calls;
+  result->audit.generation_memset_bytes = generation_memset_bytes;
+  result->audit.kernel_launches = kernel_launches;
+  result->audit.dispatch_kernel_blocks = view.sizes.route_count;
+  result->audit.return_kernel_blocks = view.sizes.incoming_row_count;
+  result->audit.reduce_kernel_blocks = id.num_tokens;
   result->audit.hot_path_allocations = 0;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
   float setup_ms = 0.0F;

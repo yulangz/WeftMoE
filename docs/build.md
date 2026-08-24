@@ -216,13 +216,13 @@ from the same clean export.
 For the real two-process IPC test, the launcher now reads the fixed 128-byte
 bootstrap frame and uses a bounded nonblocking trailing-byte check. This avoids
 waiting forever for EOF when Compute Sanitizer's subreaper retains an inherited
-write descriptor; every wait remains under the launcher timeout. The real
-world-2 top-k=6 path completes under `racecheck` and the independent Python
-oracle passes. `memcheck` reaches and completes MegaMOE's P2P path but the NCCL
-initialization kernels still produce tool/runtime compatibility reports, so it
-exits nonzero. `initcheck` reaches the rank processes but does not finish within
-the 300-second instrumentation deadline. These are not represented as clean
-full-NCCL sanitizer passes and no suppression is installed. The NCCL-independent
+write descriptor; every wait remains under the launcher timeout. The current
+real world-2 top-k=6 instrumentation attempt fails before any MegaMOE P2P
+kernel: Compute Sanitizer reports four
+`cudaErrorNoKernelImageForDevice` errors from NCCL 2.28.3
+`ncclInitKernelsForDevice/cudaFuncGetAttributes`. This is not represented as a
+clean full-P2P sanitizer pass and no suppression is installed. Normal world-2
+execution and the independent Python oracle pass. The NCCL-independent
 closed-loop device path, including transport worker and 73-node materializer,
 is covered by memcheck/racecheck/initcheck with 0 errors/hazards for all three.
 
@@ -284,63 +284,73 @@ samples are first reduced with all-rank MAX; CUDA events provide diagnostic
 phase spans. The former `Notify mean + transport device-slice mean` estimate is
 retained only as a component baseline and is never used for a speedup claim.
 Both launchers inherit the same recorded CPU-affinity mask, expose the same
-eight GPUs, and use the same NCCL environment overrides; the runner refuses an
-NCCL runtime-version mismatch.
+eight GPUs, and use the same NCCL environment overrides. Each records both its
+reported NCCL version and loaded library path; a framework-bundled version
+difference is reported explicitly rather than silently hidden.
 
 The common configuration uses contiguous ownership (rank 0 owns experts 0--47,
 rank 1 owns 48--95, and so on), identical selected expert IDs and token/slot
-order, deterministic BF16 activation, unit FP32 gates, identity experts, fixed
-expert-ID FP32 accumulation, and one final BF16 cast. MegaMOE represents the
-common unit gate as an immutable kernel scalar, so its gate tensor/peer payload
-is zero bytes; Megatron's dispatcher transports its FP32 probability tensor and
-that traffic is counted. The common-semantics Megatron path still uses the real
-Megatron dispatcher and collectives, replacing only its final native BF16
-`index_add_` with the documented expert-major FP32 reduction.
+order, deterministic BF16 activation, non-trivial per-route FP32 gates,
+identity experts, fixed expert-ID FP32 accumulation, and one final BF16 cast.
+The fixed-random generator defines each selected softmax score as an integer in
+`[1,65521]`, derived from seed `0x4d4547414d4f4547`, rank, token and slot, then
+normalizes the selected scores in FP32. Its per-rank tensor hash is recorded.
+MegaMOE retains this tensor on the source (`8192*6*4 = 196,608` bytes/rank),
+transports zero gate bytes, and applies it after identity return. Megatron's
+native dispatcher transports FP32 probabilities and applies them at the
+expert-side identity boundary. The common-semantics Megatron path keeps its
+real dispatcher/collectives but performs an explicit source-side expert-order
+FP32 reduction; it does not claim `index_add_` has a fixed route order.
 
 The inspected single-node world-8 release result was:
 
 | comparable host-wall E2E | run means (ms) | 3-run mean (ms) | variance (ms^2) |
 |---|---|---:|---:|
-| MegaMOE integrated | 5.0060 / 5.0100 / 5.0205 | 5.0122 | 0.00003714 |
-| Megatron common semantics | 8.9844 / 9.0115 / 9.0104 | 9.0021 | 0.00015660 |
-| Megatron native combine | 6.9308 / 6.9424 / 6.9803 | 6.9512 | 0.00044713 |
+| MegaMOE integrated dynamic gate | 5.0592 / 5.1517 / 5.0836 | 5.0982 | 0.00153414 |
+| Megatron common semantics dynamic gate | 11.0240 / 11.0247 / 11.0049 | 11.0179 | 0.00008397 |
+| Megatron native dynamic gate | 9.4805 / 9.4712 / 9.4905 | 9.4807 | 0.00006181 |
 
-The formal common-semantics improvement is
-`(9.0021 - 5.0122) / 9.0021 = 44.32%`. Native results are reported but are not
-substituted for the common-semantics comparison because their BF16 accumulation
-order and cast location differ.
+The formal native improvement is
+`(9.4807 - 5.0982) / 9.4807 = 46.23%`; the reference-oriented common-semantics
+improvement is 53.73%. Megatron native remains separately labelled because it
+applies/casts gate-weighted expert output before return, while the common path
+matches MegaMOE's frozen source-side gate-after order exactly.
 
 One representative 100-sample run supplies full distribution and CUDA phase
 statistics:
 
 | MegaMOE slowest-rank span | mean (ms) | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| integrated host-wall E2E | 5.0060 | 5.0027 | 5.0546 | 4.9515 | 5.1549 |
-| Notify | 0.5204 | 0.5139 | 0.5454 | 0.4981 | 0.6388 |
-| transport total | 4.4787 | 4.4781 | 4.5013 | 4.4369 | 4.5125 |
-| transport generation setup | 0.0419 | 0.0419 | 0.0493 | 0.0335 | 0.0549 |
-| dispatch put | 1.8288 | 1.8287 | 1.8306 | 1.8267 | 1.8317 |
-| identity relay/return | 2.1073 | 2.1061 | 2.1332 | 2.0697 | 2.1418 |
-| deterministic reduce | 0.4890 | 0.4889 | 0.4899 | 0.4878 | 0.4906 |
-| terminal completion/drain | 0.0149 | 0.0150 | 0.0159 | 0.0119 | 0.0164 |
+| integrated host-wall E2E | 5.0592 | 5.0546 | 5.1087 | 4.9987 | 5.2190 |
+| Notify | 0.5096 | 0.5056 | 0.5265 | 0.4957 | 0.6668 |
+| transport total | 4.5357 | 4.5343 | 4.5633 | 4.4835 | 4.5914 |
+| transport generation setup | 0.0304 | 0.0301 | 0.0384 | 0.0230 | 0.0429 |
+| dispatch put | 1.8298 | 1.8299 | 1.8314 | 1.8276 | 1.8332 |
+| identity relay/return | 2.1072 | 2.1062 | 2.1303 | 2.0609 | 2.1593 |
+| dynamic gated reduce | 0.5566 | 0.5567 | 0.5574 | 0.5553 | 0.5580 |
+| terminal completion/drain | 0.0157 | 0.0158 | 0.0167 | 0.0128 | 0.0170 |
 
 The corresponding first Megatron run measured common-semantics E2E mean
-8.9844 ms, P50 8.9303, P95 9.1524, min 8.8860, and max 10.1270. Native E2E in
-that run was 6.9308/6.9084/7.0185/6.8670/7.5995 ms for
-mean/P50/P95/min/max. Both final outputs are checked against the same common
-reference: MegaMOE and Megatron common semantics are byte-identical; Megatron
-native BF16 accumulation has max absolute error 0.125 and max relative error
-0.0076923. A separate world-8 top-k=1 run also passes byte-identical common
-output on both implementations; MegaMOE's one measured post-warmup sample was
-1.363 ms integrated and Megatron's correctness sample was 3.132 ms common
-semantics. Those one-sample numbers are correctness evidence, not a formal
-performance comparison.
+11.0240 ms, P50 10.9912, P95 11.1962, min 10.9144, max 12.1013. Native E2E was
+9.4805/9.4569/9.6342/9.3867/10.1822 ms for mean/P50/P95/min/max. MegaMOE and
+Megatron common semantics are byte-identical to the same dynamic-gate
+reference. Megatron native reports max absolute error 0.03125 and max relative
+error 0.0136986 because its gate/cast boundary is intentionally native.
+
+The final clean archive on `10.10.19.233` repeated the MegaMOE world-8 run in
+three independent sessions. Integrated E2E means were 5.0932, 5.0835 and
+5.0795 ms; the corresponding P95 values were 5.1153, 5.1030 and 5.1083 ms.
+All eight per-rank gate hashes matched the local fixture in every session and
+the downloaded output remained byte-identical. Megatron-Core is not installed
+on that host, so no remote Megatron comparison is claimed.
 
 Actual peer payload per representative rank is 616,562,688--616,591,360 bytes
 for MegaMOE dispatch and 616,491,008--616,663,040 bytes for return. Megatron
 reports 616,562,688 BF16 bytes in each direction plus 172,032 dispatch FP32
 probability bytes, 1,233,297,408 bytes total. MegaMOE's aggregate effective peer
-rate was 2203--2208 GB/s across eight GPUs. These are physical remote-GPU bytes,
+rate was 2168--2175 GB/s across eight GPUs. MegaMOE additionally retains
+196,608 route bytes and 196,608 local gate bytes/rank; peer gate bytes are
+exactly zero. These are physical remote-GPU bytes,
 not logical node-dedup traffic.
 
 Release generation setup performs no large arena clear. It increments a slot
@@ -351,7 +361,9 @@ it caused asymmetric-capacity peers to enter P2P at different boundaries.
 Static peer mappings, layouts, and capacities are one-time setup. After all
 return signals arrive, output reduction plus its completion event is sufficient
 on the normal release path, so no redundant terminal team AllGather is issued.
-Across 100 measured generations the audit records zero `cudaMalloc/free`,
+The runtime audit observes one 200-byte generation memset, nine kernel launches,
+49,152 dispatch blocks, 49,146--49,158 return blocks, and 8,192 reduce blocks
+per rank/generation. Across 100 measured generations it records zero `cudaMalloc/free`,
 `cudaHostAlloc/free`, event create/destroy, or device synchronize calls and zero
 large-generation memsets. Bounded control/status traffic was 208,626 H2D and
 285,648 D2H bytes/rank over all 110 warmup+measurement generations; activation
@@ -372,13 +384,15 @@ NCCL_DEBUG=WARN python3 benchmarks/run_integrated_comparison.py \
 ```
 
 `benchmarks/megatron_dispatch_baseline.py` uses Megatron-Core 0.17.0's actual
-`MoEAlltoAllTokenDispatcher`. For this fairness run both implementations load
-the same PyTorch-wheel NCCL 2.27.5; the comparison runner verifies every
-MegaMOE rank's runtime version against PyTorch and records the `dladdr` library
-path. Project headers remain 2.29.7, and the separately supported project
-runtime is 2.28.3, but neither is mixed into this result. This is an integrated
-identity-expert transport comparison, not an FC1/SwiGLU/FC2 or backward result;
-`intermediate=3072` is recorded for that future work.
+`MoEAlltoAllTokenDispatcher`. For this fairness run both processes load
+`/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2`, and an
+actual `ncclGetVersion` call reports 2.28.3 on both sides. PyTorch's build-time
+NCCL version remains 2.27.5 and is recorded separately; it is not treated as
+the loaded runtime. The comparison runner verifies the actual runtime version
+and records each loaded library path. Project compile headers remain 2.29.7.
+This is an integrated identity-expert transport comparison, not an
+FC1/SwiGLU/FC2 or backward result; `intermediate=3072` is recorded for that
+future work.
 
 The same script also runs as a two-node `torchrun` job; it intentionally uses
 the distributed world rather than `LOCAL_WORLD_SIZE` when constructing the EP

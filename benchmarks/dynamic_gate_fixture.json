@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "mode": "fixed-random",
+  "shape": [
+    8192,
+    6
+  ],
+  "seed_hex": "0x4d4547414d4f4547",
+  "score_formula": "1 + ((seed + token*1315423911 + slot*2654435761 + rank*97531) % 65521)",
+  "softmax_definition": "selected_logit=log(score); gate=float32(score/sum(selected_scores))",
+  "layout": "row-major [local_token_id, topk_slot]",
+  "fnv1a64_fp32_little_endian_by_rank": [
+    "16982931231370995671",
+    "14206228671031203357",
+    "16480319015498463492",
+    "2584222152514100441",
+    "17486489915493326833",
+    "10543222734339640248",
+    "3628055528955998169",
+    "541404397481342026"
+  ]
+}

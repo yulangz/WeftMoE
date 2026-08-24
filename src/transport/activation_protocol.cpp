@@ -83,6 +83,7 @@ const char *activation_transport_backend_name(
 SyntheticTransportResult simulate_activation_transport(
     const DispatchHandle &dispatch,
     const std::vector<BFloat16> &token_activations,
+    const std::vector<float> &route_gates,
     const ActivationTransportConfig &config, std::uint64_t epoch,
     const std::vector<std::uint64_t> &arrival_order) {
   validate_dispatch_metadata(dispatch);
@@ -92,8 +93,8 @@ SyntheticTransportResult simulate_activation_transport(
     protocol_error("hidden_size", rank, "> 0", "0");
   if (config.channels == 0)
     protocol_error("channels", rank, "> 0", "0");
-  if (!std::isfinite(config.combine_gate_scale))
-    protocol_error("combine_gate_scale", rank, "finite", "non-finite");
+  if (config.gate_placement != ActivationGatePlacement::SourceAfter)
+    protocol_error("gate_placement", rank, "SourceAfter", "unsupported");
   if (config.ring_slots_per_source_channel == 0)
     protocol_error("ring_slots_per_source_channel", rank, "> 0", "0");
   if (epoch == 0)
@@ -136,6 +137,13 @@ SyntheticTransportResult simulate_activation_transport(
   const auto route_count = checked_mul(metadata.outgoing.num_tokens,
                                        metadata.outgoing.top_k,
                                        "route_count", rank);
+  if (route_gates.size() != checked_size(route_count, "route_count", rank))
+    protocol_error("route_gates.size", rank, std::to_string(route_count),
+                   std::to_string(route_gates.size()));
+  for (std::size_t route = 0; route < route_gates.size(); ++route)
+    if (!std::isfinite(route_gates[route]) || route_gates[route] < 0.0F)
+      protocol_error("route_gates.value", rank, "finite>=0",
+                     "invalid route=" + std::to_string(route));
   SyntheticTransportResult result;
   result.contribution_by_route.resize(checked_size(
       checked_mul(route_count, config.hidden_size, "contribution_count", rank),
@@ -282,9 +290,11 @@ SyntheticTransportResult simulate_activation_transport(
         const auto contribution_index = checked_size(
             checked_mul(route, config.hidden_size, "reduce index", rank) + h,
             "reduce index", rank);
-        sum += config.combine_gate_scale *
-               bfloat16_to_float(
-                   result.contribution_by_route[contribution_index]);
+        volatile float product =
+            route_gates[checked_size(route, "gate route", rank)] *
+            bfloat16_to_float(
+                result.contribution_by_route[contribution_index]);
+        sum += product;
       }
       result.combined_tokens[checked_size(
           checked_mul(token, config.hidden_size, "combined index", rank) + h,

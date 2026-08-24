@@ -141,6 +141,7 @@ struct NotifyGenerationRequest {
 struct DeviceNotifyGenerationRequest {
   RuntimeConfig config;
   CudaRouteInput local_routes;
+  CudaGateInput local_gates;
   std::uint64_t max_tokens_per_rank = 0;
 };
 

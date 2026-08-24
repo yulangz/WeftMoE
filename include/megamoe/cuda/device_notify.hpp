@@ -19,10 +19,13 @@ class DeviceDispatchHandle;
 using CudaDispatchHandle = DeviceDispatchHandle;
 template <class T> class SelectedExpertRouteLease;
 using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
+template <class T> class SelectedExpertGateLease;
+using CudaGateInput = SelectedExpertGateLease<float>;
 class DeviceDispatchConsumerLease;
 class DeviceDispatchTestBridge;
 class ActivationTransportBridge;
 class DeviceRouteProvenanceBridge;
+class DeviceGateProvenanceBridge;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
 class CudaNotifyPreflight;
@@ -87,10 +90,14 @@ private:
       const CudaExecution &);
   friend class DeviceNotifyPoolBridge;
   friend class DeviceRouteProvenanceBridge;
+  friend class DeviceGateProvenanceBridge;
+  friend class ActivationTransportBridge;
+  friend class SelectedExpertGateLease<float>;
   friend class CudaNotifyOperation;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
-      const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
+      const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
+      CudaNotifyWorkspace);
 };
 
 inline constexpr std::uint32_t kSelectedExpertRouteLayoutVersion = 1;
@@ -101,6 +108,37 @@ CudaRouteInput import_selected_expert_routes(
     const CudaRouteInput &routes,
     const RankCollectiveContext &consumer_context,
     const CudaExecution &consumer_execution);
+
+inline constexpr std::uint32_t kSelectedExpertGateLayoutVersion = 1;
+
+// Immutable FP32 router gate tensor in the exact [token, top-k] route order.
+// No public API exposes its device address or permits provenance rebinding.
+template <> class SelectedExpertGateLease<float> {
+public:
+  SelectedExpertGateLease() = default;
+  std::uint64_t num_tokens() const;
+  std::uint32_t top_k() const;
+  std::uint64_t route_count() const;
+  std::uint64_t device_bytes() const;
+  std::uint32_t layout_version() const;
+  std::uint32_t device_ordinal() const;
+  std::uint64_t gate_generation() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit SelectedExpertGateLease(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class DeviceGateProvenanceBridge;
+  friend class CudaNotifyOperation;
+  friend class DeviceMetadataBridge;
+  friend class ActivationTransportBridge;
+  friend CudaNotifyOperation start_cuda_rank_local_notify(
+      const RuntimeConfig &, const RankCollectiveContext &,
+      const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
+      CudaNotifyWorkspace);
+};
 
 class CudaLocalNotifyHandle {
 public:
@@ -273,6 +311,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class DeviceMetadataBridge;
   friend class CudaNotifyGenerationCoordinator;
+  friend class ActivationTransportBridge;
   friend DispatchHandle download_device_metadata_for_validation(
       const DeviceDispatchHandle &, const CudaExecution &);
 };
@@ -286,6 +325,10 @@ void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &handle,
                                       const CudaExecution &execution);
 
 namespace testing {
+CudaGateInput upload_fp32_gates_for_testing(
+    const std::vector<float> &host, const CudaRouteInput &routes,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution);
 struct CudaApiAuditSnapshot {
   std::uint64_t device_allocations = 0;
   std::uint64_t device_frees = 0;

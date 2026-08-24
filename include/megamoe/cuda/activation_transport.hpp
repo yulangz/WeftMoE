@@ -117,6 +117,15 @@ struct ActivationTransportDeviceAudit {
   // counters include every destination-GPU fan-out and exclude local writes.
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t actual_route_input_bytes = 0;
+  std::uint64_t actual_local_gate_bytes = 0;
+  std::uint64_t actual_peer_gate_bytes = 0;
+  std::uint64_t generation_memset_calls = 0;
+  std::uint64_t generation_memset_bytes = 0;
+  std::uint64_t kernel_launches = 0;
+  std::uint64_t dispatch_kernel_blocks = 0;
+  std::uint64_t return_kernel_blocks = 0;
+  std::uint64_t reduce_kernel_blocks = 0;
   std::uint64_t packet_count = 0;
   std::uint64_t fanout_count = 0;
   std::uint64_t credit_stalls = 0;

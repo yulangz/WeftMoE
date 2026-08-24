@@ -1,4 +1,7 @@
+import json
+import struct
 import unittest
+from pathlib import Path
 
 from reference.notify_dispatch_reference import (
     ReferenceConfig,
@@ -21,6 +24,27 @@ def config(nodes=2, gpus=2, experts=8, top_k=2, mtile=4):
 
 
 class RankLocalReferenceTest(unittest.TestCase):
+    def test_dynamic_gate_fixture_hashes(self):
+        fixture = json.loads((Path(__file__).parents[1] / "benchmarks" /
+                              "dynamic_gate_fixture.json").read_text())
+        seed = int(fixture["seed_hex"], 16)
+        tokens, top_k = fixture["shape"]
+        actual = []
+        for rank in range(8):
+            digest = 1469598103934665603
+            for token in range(tokens):
+                scores = [1 + ((seed + token * 1315423911 +
+                                slot * 2654435761 + rank * 97531) % 65521)
+                          for slot in range(top_k)]
+                total = sum(scores)
+                for score in scores:
+                    for byte in struct.pack("<f", score / total):
+                        digest = ((digest ^ byte) * 1099511628211) & (
+                            (1 << 64) - 1)
+            actual.append(str(digest))
+        self.assertEqual(actual,
+                         fixture["fnv1a64_fp32_little_endian_by_rank"])
+
     def test_rank_local_determinism_and_partial_tile(self):
         cfg = config()
         routes = [

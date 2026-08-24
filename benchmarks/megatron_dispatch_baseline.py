@@ -9,11 +9,13 @@ activation transport; ``intermediate`` is recorded for the future FC baseline.
 """
 
 import argparse
+import ctypes
 import importlib.metadata
 import json
 import math
 import os
 import statistics
+import struct
 import time
 
 import torch
@@ -69,6 +71,45 @@ def measure(function, warmups, iterations):
     return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
 
 
+def fixed_random_selected_gates(tokens, top_k, rank,
+                                seed=0x4D4547414D4F4547):
+    values = []
+    for token in range(tokens):
+        scores = [1 + ((seed + token * 1315423911 + slot * 2654435761 +
+                        rank * 97531) % 65521) for slot in range(top_k)]
+        total = sum(scores)
+        values.extend(float(score / total) for score in scores)
+    return torch.tensor(values, dtype=torch.float32).reshape(tokens, top_k)
+
+
+def fp32_hash(tensor):
+    value = 1469598103934665603
+    for gate in tensor.contiguous().view(-1).tolist():
+        for byte in struct.pack("<f", gate):
+            value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return value
+
+
+def loaded_nccl_libraries():
+    paths = set()
+    with open("/proc/self/maps", "r", encoding="utf-8") as mappings:
+        for line in mappings:
+            path = line.rsplit(" ", 1)[-1].strip()
+            if "libnccl.so" in path:
+                paths.add(path)
+    return sorted(paths)
+
+
+def nccl_runtime_version():
+    library = ctypes.CDLL(None)
+    version = ctypes.c_int()
+    result = library.ncclGetVersion(ctypes.byref(version))
+    if result != 0:
+        raise RuntimeError(f"ncclGetVersion failed: {result}")
+    value = version.value
+    return f"{value // 10000}.{(value % 10000) // 100}.{value % 100}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=8192)
@@ -81,6 +122,8 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--save-output-dir")
     parser.add_argument("--trace-dir")
+    parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
+                        default="fixed-random")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -137,10 +180,16 @@ def main():
     routing.scatter_(1, selected, True)
     probabilities = torch.zeros((args.tokens, args.experts), dtype=torch.float32,
                                 device="cuda")
-    # Megatron's dispatcher transports probabilities but does not apply them;
-    # its expert implementation normally consumes them. For an actual identity
-    # expert and byte-identical common path, every selected route has gate 1.
-    probabilities.scatter_(1, selected, 1.0)
+    selected_gates_cpu = (torch.ones((args.tokens, args.top_k),
+                                     dtype=torch.float32)
+                          if args.gate_mode == "unit" else
+                          fixed_random_selected_gates(
+                              args.tokens, args.top_k, rank))
+    gate_hash = fp32_hash(selected_gates_cpu)
+    gate_hashes = [None] * world
+    dist.all_gather_object(gate_hashes, gate_hash)
+    selected_gates = selected_gates_cpu.to(device="cuda")
+    probabilities.scatter_(1, selected, selected_gates)
 
     def prepare_dispatch():
         return dispatcher.dispatch_preprocess(hidden, routing, probabilities)
@@ -148,14 +197,17 @@ def main():
     prepared_hidden, prepared_probabilities = prepare_dispatch()
     dispatched_hidden, dispatched_probabilities = dispatcher.token_dispatch(
         prepared_hidden, prepared_probabilities)
-    expert_hidden, _, _ = dispatcher.dispatch_postprocess(
+    expert_hidden, _, expert_probabilities = dispatcher.dispatch_postprocess(
         dispatched_hidden, dispatched_probabilities)
 
     def dispatch_collective():
         return dispatcher.token_dispatch(prepared_hidden, prepared_probabilities)
 
     def combine_roundtrip():
-        local = dispatcher.combine_preprocess(expert_hidden)
+        weighted = (expert_hidden.float() *
+                    expert_probabilities.float().unsqueeze(-1)).to(
+                        torch.bfloat16)
+        local = dispatcher.combine_preprocess(weighted)
         returned = dispatcher.token_combine(local)
         return dispatcher.combine_postprocess(returned)
 
@@ -164,9 +216,11 @@ def main():
             hidden, routing, probabilities)
         remote_hidden, remote_probs = dispatcher.token_dispatch(
             local_hidden, local_probs)
-        expert_input, _, _ = dispatcher.dispatch_postprocess(
+        expert_input, _, remote_gate = dispatcher.dispatch_postprocess(
             remote_hidden, remote_probs)
-        combine_input = dispatcher.combine_preprocess(expert_input)
+        weighted = (expert_input.float() * remote_gate.float().unsqueeze(-1)).to(
+            torch.bfloat16)
+        combine_input = dispatcher.combine_preprocess(weighted)
         returned = dispatcher.token_combine(combine_input)
         return dispatcher.combine_postprocess(returned)
 
@@ -182,12 +236,24 @@ def main():
         # Megatron's native combine accumulates in BF16. This explicit common
         # boundary keeps Megatron's real dispatcher/collectives and replaces
         # only that final local reduction with fixed expert-major FP32 order.
-        common = torch.zeros(dispatcher.hidden_shape_before_permute,
-                             dtype=torch.float32, device="cuda")
-        common.index_add_(
-            0, dispatcher.reversed_local_input_permutation_mapping,
-            returned.float())
-        return common.to(torch.bfloat16).view(dispatcher.hidden_shape)
+        route_count = args.tokens * args.top_k
+        flat_expert = selected.reshape(-1)
+        route_index = torch.arange(route_count, device="cuda",
+                                   dtype=torch.long)
+        expert_order = torch.argsort(flat_expert * route_count + route_index)
+        route_output = torch.empty_like(returned)
+        route_output[expert_order] = returned
+        slot_order = torch.argsort(selected, dim=1, stable=True)
+        token_base = (torch.arange(args.tokens, device="cuda",
+                                   dtype=torch.long) * args.top_k)
+        common = torch.zeros_like(hidden, dtype=torch.float32)
+        flat_gate = selected_gates.reshape(-1)
+        for position in range(args.top_k):
+            routes = token_base + slot_order[:, position]
+            product = (route_output[routes].float() *
+                       flat_gate[routes].unsqueeze(-1))
+            common = common + product
+        return common.to(torch.bfloat16)
 
     measured_runs = []
     for run in range(args.runs):
@@ -208,9 +274,13 @@ def main():
     native_output = full_roundtrip()
     common_output = common_semantics_roundtrip()
     torch.cuda.synchronize()
+    slot_order = torch.argsort(selected, dim=1, stable=True)
     expected_fp32 = torch.zeros_like(hidden, dtype=torch.float32)
-    for _slot in range(args.top_k):
-        expected_fp32.add_(hidden.float())
+    for position in range(args.top_k):
+        gates = torch.gather(selected_gates, 1,
+                             slot_order[:, position:position + 1])
+        product = gates * hidden.float()
+        expected_fp32 = expected_fp32 + product
     expected_output = expected_fp32.to(torch.bfloat16)
     native_absolute = (native_output.float() - expected_output.float()).abs()
     native_relative = (native_absolute /
@@ -267,6 +337,8 @@ def main():
         "torch_version": torch.__version__,
         "torch_nccl_version": ".".join(
             str(part) for part in torch.cuda.nccl.version()),
+        "nccl_runtime_version": nccl_runtime_version(),
+        "loaded_nccl_libraries": loaded_nccl_libraries(),
         "world": world,
         "shape": {
             "tokens": args.tokens, "hidden": args.hidden,
@@ -277,8 +349,12 @@ def main():
         "dtype": "BF16 input/output; FP32 routing probabilities",
         "expert_ownership": "contiguous rank-major",
         "expert_body": "identity",
+        "gate_mode": args.gate_mode,
+        "gate_seed": "0x4d4547414d4f4547",
+        "per_rank_gate_hash": gate_hashes,
         "combine_reference": (
-            "unit FP32 gate; fixed expert-ID FP32 sum; final BF16 cast"),
+            "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
+            "sum; final BF16 cast"),
         "payload_bytes_per_rank": {
             "dispatch_activation_peer": activation_peer_bytes,
             "dispatch_probability_peer": probability_peer_bytes,

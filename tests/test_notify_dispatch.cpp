@@ -507,13 +507,15 @@ void test_activation_transport_protocol_oracle() {
   for (std::size_t i = 0; i < activations.size(); ++i)
     activations[i] = megamoe::transport::float_to_bfloat16(
         static_cast<float>((i * 17U) % 101U) / 32.0F);
+  const std::vector<float> gates{0.2F, 0.3F, 0.5F, 0.1F, 0.6F,
+                                 0.3F, 0.7F, 0.2F, 0.1F};
   const auto canonical = megamoe::transport::simulate_activation_transport(
-      handles[0], activations, transport_config, 1);
+      handles[0], activations, gates, transport_config, 1);
   std::vector<std::uint64_t> reversed(
       handles[0]->transport.outgoing_packets.size());
   std::iota(reversed.rbegin(), reversed.rend(), std::uint64_t{0});
   const auto reordered = megamoe::transport::simulate_activation_transport(
-      handles[0], activations, transport_config, 1, reversed);
+      handles[0], activations, gates, transport_config, 1, reversed);
   REQUIRE(canonical.combined_tokens.size() == activations.size());
   REQUIRE(canonical.contribution_by_route == reordered.contribution_by_route);
   REQUIRE(canonical.combined_tokens == reordered.combined_tokens);
@@ -528,7 +530,8 @@ void test_activation_transport_protocol_oracle() {
   expect_error(NotifyErrorCode::InvalidHandle,
                [&] {
                  (void)megamoe::transport::simulate_activation_transport(
-                     bad_sequence, activations, transport_config, 1, reversed);
+                     bad_sequence, activations, gates, transport_config, 1,
+                     reversed);
                },
                {"phase=dispatch-validation",
                 "field=transport.packet.identity"});
@@ -541,7 +544,7 @@ void test_activation_transport_protocol_oracle() {
   transport_config.hidden_size = 7;
   std::vector<megamoe::transport::BFloat16> many_activations(7);
   const auto many_result = megamoe::transport::simulate_activation_transport(
-      many_handles[0], many_activations, transport_config, 2);
+      many_handles[0], many_activations, {0.25F, 0.75F}, transport_config, 2);
   REQUIRE(many_handles[0]->outgoing.node_mask_words == 2);
   REQUIRE(many_result.audit.dispatch_packets == 2);
   REQUIRE(many_result.audit.deduplicated_cross_node_payload_bytes == 14);
@@ -552,7 +555,8 @@ void test_activation_transport_protocol_oracle() {
   expect_error(NotifyErrorCode::TransportProtocolFailure,
                [&] {
                  (void)megamoe::transport::simulate_activation_transport(
-                     many_handles[0], many_activations, invalid, 2);
+                     many_handles[0], many_activations, {0.25F, 0.75F},
+                     invalid, 2);
                },
                {"phase=activation-transport",
                 "field=ring_slots_per_source_channel"});

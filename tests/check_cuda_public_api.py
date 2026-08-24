@@ -109,6 +109,19 @@ int main() {
   megamoe::cuda::SelectedExpertRouteLease<std::uint64_t> wrong_dtype;
 }
 ''',
+    "wrong_gate_dtype": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::SelectedExpertGateLease<std::uint16_t> wrong_dtype;
+}
+''',
+    "generic_gate_rebind": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::DeviceBufferLease generic;
+  (void)megamoe::cuda::make_selected_expert_gate_input(generic);
+}
+''',
     "dispatch_checked_raw_view": r'''
 #include "megamoe/cuda/device_notify.hpp"
 int main() {

@@ -275,7 +275,7 @@ make BUILD_DIR=build-debug ENABLE_CUDA=1 MEGAMOE_DEBUG_VALIDATE=1 cuda-lib
 
 # Megatron-Core dispatcher baseline, 10 warmups + 100 samples.
 torchrun --standalone --nproc-per-node=8 \
-  benchmarks/megatron_dispatch_baseline.py
+  benchmarks/megatron_dispatch_baseline.py --gate-mode fixed-random
 
 # Fair integrated comparison: three independent 8-GPU runs on each side.
 # Each measured MegaMOE sample creates a new Notify generation and runs through

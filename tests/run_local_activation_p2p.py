@@ -205,6 +205,8 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
+    parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
+                        default="fixed-random")
     parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--no-wrap", action="store_true")
     parser.add_argument("--ring-slots", type=int, choices=(1, 2))
@@ -221,6 +223,7 @@ def main():
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
     environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
+    environment["MEGAMOE_GATE_MODE"] = args.gate_mode
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
@@ -273,9 +276,15 @@ def main():
                 stdout = stdout.decode("utf-8", "replace")
                 stderr = stderr.decode("utf-8", "replace")
             if process.returncode != 0:
+                sanitizer = "\n".join(
+                    line for line in stdout.splitlines()
+                    if ("=========" in line or "Invalid" in line or
+                        "uninitialized" in line.lower() or
+                        "hazard" in line.lower()))[-12000:]
                 raise RuntimeError(
                     f"rank={rank} exit={process.returncode} "
-                    f"stdout={stdout[-3000:]} stderr={stderr[-3000:]}"
+                    f"sanitizer={sanitizer} "
+                    f"stdout_tail={stdout[-1000:]} stderr={stderr[-3000:]}"
                 )
             if args.cancel:
                 cancelled = parse_fields(stdout, "P2P_CANCEL ")
@@ -351,7 +360,12 @@ def main():
                         float(item["setup_us"]) for item in observed),
                     "expert_ownership": "contiguous-48-per-rank",
                     "expert_body": "identity",
-                    "combine": "unit gate; expert-id FP32 order; final BF16",
+                    "gate_mode": args.gate_mode,
+                    "combine": (
+                        "source-side per-route FP32 gate-after; expert-id "
+                        "FP32 order; final BF16"),
+                    "per_rank_gate_hash": [item["gate_hash"]
+                                             for item in observed],
                     "per_rank_output_hash": [item["output_hash"]
                                              for item in observed],
                     "per_rank_device_pool_bytes": [int(item["device_bytes"])
@@ -362,6 +376,14 @@ def main():
                         int(item["route_input_bytes"]) for item in observed],
                     "per_rank_local_gate_bytes": [
                         int(item["local_gate_bytes"]) for item in observed],
+                    "per_rank_actual_route_bytes": [
+                        int(item["actual_route_bytes"]) for item in observed],
+                    "per_rank_actual_local_gate_bytes": [
+                        int(item["actual_local_gate_bytes"])
+                        for item in observed],
+                    "per_rank_actual_peer_gate_bytes": [
+                        int(item["actual_peer_gate_bytes"])
+                        for item in observed],
                     "per_rank_actual_dispatch_peer_bytes": [
                         int(item["actual_dispatch_peer_bytes"])
                         for item in observed],
@@ -376,25 +398,29 @@ def main():
                         int(item["steady_d2h_bytes"]) for item in observed],
                     "per_rank_steady_d2d_bytes": [
                         int(item["steady_d2d_bytes"]) for item in observed],
-                    "release_e2e_operation_sequence": [
-                        "Notify local mapping",
-                        "control AllGather",
-                        "expert-count AllGather",
-                        "packet-summary AllGather",
-                        "parallel device materialization",
-                        "P2P cancel-epoch H2D (8 bytes)",
-                        "P2P status memset (one status record)",
-                        "P2P setup-record kernel",
-                        "P2P setup AllGather (16 bytes/rank)",
-                        "bulk dispatch put",
-                        "dispatch release/acquire signal",
-                        "bulk identity return",
-                        "return release/acquire signal",
-                        "expert-order FP32 reduce and final BF16 cast",
-                        "status D2H (one status record)",
-                        "completion event and consumer drain",
-                    ],
-                    "large_generation_memsets": 0,
+                    "per_rank_generation_memset_calls": [
+                        int(item["generation_memset_calls"])
+                        for item in observed],
+                    "per_rank_generation_memset_bytes": [
+                        int(item["generation_memset_bytes"])
+                        for item in observed],
+                    "per_rank_kernel_launches": [
+                        int(item["kernel_launches"]) for item in observed],
+                    "per_rank_collective_enqueues": [{
+                        "control": int(item["control_enqueues"]),
+                        "config": int(item["config_enqueues"]),
+                        "count": int(item["count_enqueues"]),
+                        "summary": int(item["summary_enqueues"]),
+                    } for item in observed],
+                    "per_rank_dispatch_kernel_blocks": [
+                        int(item["dispatch_kernel_blocks"])
+                        for item in observed],
+                    "per_rank_return_kernel_blocks": [
+                        int(item["return_kernel_blocks"])
+                        for item in observed],
+                    "per_rank_reduce_kernel_blocks": [
+                        int(item["reduce_kernel_blocks"])
+                        for item in observed],
                     **summary,
                 }
                 peer_bytes = sum(

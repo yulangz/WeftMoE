@@ -491,6 +491,16 @@ Default plans, expired plans, and plans from another handle fail safely.
 
 ## Phase-4 activation ownership and worker
 
+The router-to-Notify boundary is a pair of immutable typed leases:
+`SelectedExpertRouteLease<int32_t>` and `SelectedExpertGateLease<float>`.
+Both describe the same contiguous `[tokens,top_k]` order and are inseparably
+bound to the same allocation provenance, session, exact generation, device,
+producer execution, and ready event. Notify rejects a gate from another route
+allocation even when shape and capacity happen to match. The generation
+coordinator is the only production consumer and requires both leases; the
+test upload helper allocates only during setup and reissues exact-generation
+views for measured iterations.
+
 The public router handoff is `SelectedActivationLease<BFloat16>`, not a generic
 device buffer. Its immutable provenance is dtype/layout, `[tokens,hidden]`
 shape and capacity, device, session identity, exact generation, producer
@@ -521,7 +531,13 @@ The release local worker is a fixed stream-ordered pipeline of bulk CUDA grids:
 route CTAs write peer canonical rows directly, one tiny kernel publishes a
 per-peer dispatch completion, destination-row CTAs apply the selected validation
 expert body and return contributions, a second per-peer completion closes
-return, and token CTAs reduce in fixed expert order. Identity is the integrated
+return, and token CTAs reduce in fixed expert order. The sole formal gate
+placement is source-side gate-after: each returned BF16 identity result is
+multiplied by its route's FP32 gate, route contributions are accumulated in
+expert-ID order with explicit FP32 rounding, then cast once to BF16. Gates
+remain source-local (`tokens*top_k*sizeof(float)` bytes) and never enter IPC
+payloads. `DestinationBeforeUnsupported` fails explicitly; unit gates use the
+same pointer and reduce kernel without a constant specialization. Identity is the integrated
 benchmark body; the older synthetic transform remains only for transport
 validation. The grids expose all routes/rows/tokens to all SMs and avoid
 per-route system atomics. Physical peer traffic counts every destination-GPU

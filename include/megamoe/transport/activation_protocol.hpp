@@ -32,6 +32,11 @@ enum class ActivationExpertTransform : std::uint8_t {
   Identity,
 };
 
+enum class ActivationGatePlacement : std::uint8_t {
+  SourceAfter,
+  DestinationBeforeUnsupported,
+};
+
 struct ActivationTransportConfig {
   std::uint64_t hidden_size = 0;
   std::uint32_t channels = 1;
@@ -40,7 +45,8 @@ struct ActivationTransportConfig {
   std::uint32_t max_inflight_consumers = 4;
   ActivationExpertTransform expert_transform =
       ActivationExpertTransform::SyntheticValidation;
-  float combine_gate_scale = 1.0F;
+  ActivationGatePlacement gate_placement =
+      ActivationGatePlacement::SourceAfter;
 };
 
 enum class ActivationTransportBackend : std::uint8_t {
@@ -96,6 +102,7 @@ struct SyntheticTransportResult {
 SyntheticTransportResult simulate_activation_transport(
     const DispatchHandle &dispatch,
     const std::vector<BFloat16> &token_activations,
+    const std::vector<float> &route_gates,
     const ActivationTransportConfig &config,
     std::uint64_t epoch,
     const std::vector<std::uint64_t> &arrival_order = {});

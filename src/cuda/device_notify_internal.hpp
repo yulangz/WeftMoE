@@ -80,6 +80,25 @@ public:
       const CudaExecution &consumer_execution);
 };
 
+class DeviceGateProvenanceBridge {
+public:
+  static CudaGateInput upload_for_testing(
+      const std::vector<float> &host, const CudaRouteInput &routes,
+      const RankCollectiveContext &context,
+      const CudaExecution &execution);
+  static void validate(const CudaGateInput &gates,
+                       const CudaRouteInput &routes,
+                       const RankCollectiveContext &context,
+                       const CudaExecution &execution);
+  static bool same_route_storage(const CudaGateInput &gates,
+                                 const CudaRouteInput &routes);
+  static CudaGateInput reissue_for_testing(
+      const CudaGateInput &storage, const CudaRouteInput &exact_routes,
+      const RankCollectiveContext &context,
+      const CudaExecution &execution);
+  static const float *device_pointer(const CudaGateInput &gates);
+};
+
 struct DeviceDispatchKernelView {
   DeviceDispatchIdentity identity;
   DeviceDispatchSizes sizes;
@@ -150,7 +169,8 @@ private:
   friend class DeviceNotifyPoolBridge;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
-      const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
+      const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
+      CudaNotifyWorkspace);
 };
 
 CudaNotifyWorkspace allocate_cuda_notify_workspace(
@@ -228,12 +248,13 @@ private:
   std::shared_ptr<Impl> impl_;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
-      const CudaExecution &, const CudaRouteInput &, CudaNotifyWorkspace);
+      const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
+      CudaNotifyWorkspace);
 };
 
 CudaNotifyOperation start_cuda_rank_local_notify(
     const RuntimeConfig &config, const RankCollectiveContext &context,
     const CudaExecution &execution, const CudaRouteInput &routes,
-    CudaNotifyWorkspace workspace);
+    const CudaGateInput &gates, CudaNotifyWorkspace workspace);
 
 } // namespace megamoe::cuda

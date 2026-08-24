@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1267,6 +1268,22 @@ struct SelectedExpertRouteLease<std::int32_t>::Impl {
   std::uint64_t routes = 0;
 };
 
+struct SelectedExpertGateLease<float>::Impl {
+  std::shared_ptr<CudaAllocation> allocation;
+  const float *device_ptr = nullptr;
+  CudaRouteInput bound_routes;
+  CollectiveSession producer_session;
+  ExecutionToken producer_execution;
+  ExecutionToken consumer_execution;
+  std::uint32_t layout = kSelectedExpertGateLayoutVersion;
+  std::uint32_t device = 0;
+  std::uint64_t generation = 0;
+  bool ready_recorded = false;
+  std::uint64_t tokens = 0;
+  std::uint32_t top_k = 0;
+  std::uint64_t routes = 0;
+};
+
 CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                                   std::uint32_t top_k,
                                   const RankCollectiveContext &context,
@@ -1375,6 +1392,116 @@ std::uint64_t CudaRouteInput::route_generation() const {
   if (!impl_)
     invalid("attempted to access empty CUDA route input");
   return impl_->generation;
+}
+
+std::uint64_t CudaGateInput::num_tokens() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->tokens;
+}
+std::uint32_t CudaGateInput::top_k() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->top_k;
+}
+std::uint64_t CudaGateInput::route_count() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->routes;
+}
+std::uint64_t CudaGateInput::device_bytes() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return checked_mul(impl_->routes, sizeof(float), "gate input bytes");
+}
+std::uint32_t CudaGateInput::layout_version() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->layout;
+}
+std::uint32_t CudaGateInput::device_ordinal() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->device;
+}
+std::uint64_t CudaGateInput::gate_generation() const {
+  if (!impl_)
+    invalid("attempted to access empty CUDA gate input");
+  return impl_->generation;
+}
+
+CudaGateInput DeviceGateProvenanceBridge::upload_for_testing(
+    const std::vector<float> &host, const CudaRouteInput &routes,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  DeviceRouteProvenanceBridge::validate(routes, context, execution);
+  if (host.size() != checked_size(routes.route_count(), "gate route count"))
+    invalid("phase=cuda-gate-upload, field=shape, rank=" +
+            std::to_string(context.calling_rank()) + ", expected=" +
+            std::to_string(routes.route_count()) + ", actual=" +
+            std::to_string(host.size()));
+  for (std::size_t index = 0; index < host.size(); ++index)
+    if (!std::isfinite(host[index]) || host[index] < 0.0F)
+      invalid("phase=cuda-gate-upload, field=value, rank=" +
+              std::to_string(context.calling_rank()) + ", expected=finite>=0, actual=invalid, route=" +
+              std::to_string(index));
+  const auto state = internal::checked_execution_state(execution);
+  auto allocation = std::make_shared<CudaAllocation>();
+  allocation->device = state->device;
+  const auto bytes = checked_size(
+      checked_mul(routes.route_count(), sizeof(float), "gate input bytes"),
+      "gate input bytes");
+  allocation->device_bytes = std::max<std::size_t>(bytes, 1);
+  internal::throw_cuda(
+      "gate-upload", cudaSetDevice(static_cast<int>(state->device)),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaSetDevice");
+  internal::throw_cuda(
+      "gate-upload", cudaMalloc(&allocation->device_ptr,
+                                  allocation->device_bytes),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaMalloc(gate input)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+  if (bytes != 0) {
+    internal::throw_cuda(
+        "gate-upload",
+        cudaMemcpyAsync(allocation->device_ptr, host.data(), bytes,
+                        cudaMemcpyHostToDevice, state->stream),
+        context.calling_rank(), context.session().world_size(),
+        context.session().identity(), context.session().generation(),
+        ExchangeKind::ExpertCounts, "cudaMemcpyAsync(gate input)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
+  }
+  internal::throw_cuda(
+      "gate-upload",
+      cudaEventRecord(routes.impl_->allocation->producer_ready, state->stream),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaEventRecord(gate producer ready)");
+  auto impl = std::make_shared<CudaGateInput::Impl>();
+  impl->allocation = std::move(allocation);
+  impl->device_ptr = static_cast<const float *>(impl->allocation->device_ptr);
+  impl->bound_routes = routes;
+  impl->producer_session = context.session();
+  impl->producer_execution = execution.token();
+  impl->consumer_execution = execution.token();
+  impl->device = state->device;
+  impl->generation = context.session().generation();
+  impl->ready_recorded = true;
+  impl->tokens = routes.num_tokens();
+  impl->top_k = routes.top_k();
+  impl->routes = routes.route_count();
+  return CudaGateInput(std::move(impl));
+}
+
+CudaGateInput testing::upload_fp32_gates_for_testing(
+    const std::vector<float> &host, const CudaRouteInput &routes,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  return DeviceGateProvenanceBridge::upload_for_testing(
+      host, routes, context, execution);
 }
 
 CudaRouteInput import_selected_expert_routes(
@@ -1508,6 +1635,77 @@ void DeviceRouteProvenanceBridge::validate(
     invalid("phase=device-route-provenance, field=dtype/layout/shape/device/session/generation/execution/ready/capacity, rank=" +
             std::to_string(context.calling_rank()) +
             ", expected=exact immutable producer provenance, actual=mismatch");
+}
+
+bool DeviceGateProvenanceBridge::same_route_storage(
+    const CudaGateInput &gates, const CudaRouteInput &routes) {
+  return gates.impl_ && routes.impl_ && gates.impl_->bound_routes.impl_ &&
+         gates.impl_->bound_routes.impl_->allocation == routes.impl_->allocation;
+}
+
+void DeviceGateProvenanceBridge::validate(
+    const CudaGateInput &gates, const CudaRouteInput &routes,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  DeviceRouteProvenanceBridge::validate(routes, context, execution);
+  if (!gates.impl_)
+    invalid("phase=device-gate-provenance, field=input, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=valid FP32 gate lease, actual=empty");
+  const auto &gate = *gates.impl_;
+  const auto required_bytes = checked_mul(
+      gate.routes, sizeof(float), "gate provenance bytes");
+  if (gate.layout != kSelectedExpertGateLayoutVersion ||
+      gate.device != execution.device_ordinal() ||
+      !gate.consumer_execution.same_instance(execution.token()) ||
+      gate.producer_session.stable_identity_bytes() !=
+          context.session().stable_identity_bytes() ||
+      gate.generation != context.session().generation() ||
+      gate.tokens != routes.num_tokens() || gate.top_k != routes.top_k() ||
+      gate.routes != routes.route_count() || !gate.ready_recorded ||
+      !gate.allocation || !gate.bound_routes.impl_ ||
+      !gate.bound_routes.impl_->allocation ||
+      !gate.bound_routes.impl_->allocation->producer_ready ||
+      required_bytes > gate.allocation->device_bytes ||
+      !same_route_storage(gates, routes))
+    invalid("phase=device-gate-provenance, field=dtype/layout/shape/device/session/generation/execution/ready/capacity/route_binding, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=exact immutable route+gate provenance, actual=mismatch");
+}
+
+CudaGateInput DeviceGateProvenanceBridge::reissue_for_testing(
+    const CudaGateInput &storage, const CudaRouteInput &exact_routes,
+    const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  if (!storage.impl_ || !exact_routes || !context || !execution)
+    invalid("phase=test-gate-reissue, field=input, rank=n/a, expected=valid, actual=empty");
+  const auto &source = *storage.impl_;
+  if (!context.execution().same_instance(execution.token()) ||
+      !source.producer_execution.same_instance(execution.token()) ||
+      source.producer_session.stable_identity_bytes() !=
+          context.session().stable_identity_bytes() ||
+      source.device != execution.device_ordinal() || !source.ready_recorded ||
+      !source.allocation || !source.bound_routes.impl_ ||
+      !source.bound_routes.impl_->allocation ||
+      !source.bound_routes.impl_->allocation->producer_ready ||
+      !same_route_storage(storage, exact_routes) ||
+      source.tokens != exact_routes.num_tokens() ||
+      source.top_k != exact_routes.top_k())
+    invalid("phase=test-gate-reissue, field=provenance, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=same immutable route storage/execution/device, actual=mismatch");
+  auto impl = std::make_shared<CudaGateInput::Impl>(source);
+  impl->bound_routes = exact_routes;
+  impl->producer_session = context.session();
+  impl->generation = context.session().generation();
+  return CudaGateInput(std::move(impl));
+}
+
+const float *
+DeviceGateProvenanceBridge::device_pointer(const CudaGateInput &gates) {
+  if (!gates.impl_ || !gates.impl_->device_ptr)
+    invalid("phase=device-gate-view, field=gate, rank=n/a, expected=valid, actual=empty");
+  return gates.impl_->device_ptr;
 }
 
 CudaNotifyWorkspacePlan query_cuda_notify_workspace(
@@ -1975,6 +2173,8 @@ struct CudaLocalNotifyHandle::Impl {
   DeviceDispatchMetadata device;
   DeviceBufferLease expert_count;
   DeviceBufferLease packet_count;
+  CudaRouteInput routes;
+  CudaGateInput gates;
   std::shared_ptr<WorkspaceState> workspace;
 };
 
@@ -2040,6 +2240,7 @@ struct CudaNotifyOperation::Impl {
   RankCollectiveContext context;
   CudaExecution execution;
   CudaRouteInput routes;
+  CudaGateInput gates;
   std::shared_ptr<WorkspaceState> workspace;
   bool terminal = false;
   bool waited = false;
@@ -2048,9 +2249,9 @@ struct CudaNotifyOperation::Impl {
 CudaNotifyOperation start_cuda_rank_local_notify(
     const RuntimeConfig &config, const RankCollectiveContext &context,
     const CudaExecution &execution, const CudaRouteInput &routes,
-    CudaNotifyWorkspace workspace) {
+    const CudaGateInput &gates, CudaNotifyWorkspace workspace) {
   validate_runtime_config(config);
-  if (!context || !execution || !routes || !workspace)
+  if (!context || !execution || !routes || !gates || !workspace)
     invalid("phase=cuda-notify-start, field=input, rank=n/a, expected=all handles valid, actual=empty");
   const auto rank = context.calling_rank();
   if (context.session().world_size() != config.topology.world_size ||
@@ -2059,6 +2260,7 @@ CudaNotifyOperation start_cuda_rank_local_notify(
             std::to_string(rank) +
             ", expected=config world and exact execution, actual=mismatch");
   DeviceRouteProvenanceBridge::validate(routes, context, execution);
+  DeviceGateProvenanceBridge::validate(gates, routes, context, execution);
   const auto expected = query_cuda_notify_workspace(
       config, context.calling_rank(), routes.num_tokens(),
       workspace.plan().max_tokens_per_rank);
@@ -2261,6 +2463,7 @@ CudaNotifyOperation start_cuda_rank_local_notify(
   impl->context = context;
   impl->execution = execution;
   impl->routes = routes;
+  impl->gates = gates;
   impl->workspace = std::move(state);
   return CudaNotifyOperation(std::move(impl));
 }
@@ -2347,6 +2550,8 @@ CudaNotifyPreflight CudaNotifyOperation::wait_preflight() {
   result->config = impl_->config;
   result->context = impl_->context;
   result->num_tokens = state->plan.num_tokens;
+  result->routes = impl_->routes;
+  result->gates = impl_->gates;
   result->workspace = state;
   const auto route_width = state->plan.route_count;
   result->device.expert_id = make_lease(state, state->device_layout.expert_id, route_width);
@@ -2414,6 +2619,8 @@ struct DeviceDispatchHandle::Impl {
   DeviceDispatchIdentity identity;
   DeviceDispatchSizes sizes;
   DeviceMaterializationAudit audit;
+  CudaRouteInput source_routes;
+  CudaGateInput source_gates;
   std::shared_ptr<WorkspaceState> workspace;
   BackendCompletion expert_completion;
   BackendCompletion summary_completion;
@@ -2930,6 +3137,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   impl->expert_completion = std::move(expert_counts);
   impl->summary_completion = std::move(packet_summary);
   impl->device = local.impl_->device;
+  impl->source_routes = local.impl_->routes;
+  impl->source_gates = local.impl_->gates;
   impl->device.source_expert_count =
       impl->expert_completion.device_result();
   impl->device.packet_summary_count =
@@ -3009,12 +3218,17 @@ DeviceDispatchHandle testing::materialize_fake_device_collectives(
 
   auto routes = upload_cuda_routes(local_routes, config.top_k, context,
                                    execution);
+  std::vector<float> unit_gates(
+      checked_size(routes.route_count(), "fake materializer gate count"),
+      1.0F);
+  auto gates = testing::upload_fp32_gates_for_testing(
+      unit_gates, routes, context, execution);
   const auto plan = query_cuda_notify_workspace(
       config, context.calling_rank(), local_routes.num_tokens,
       max_tokens_per_rank);
   auto workspace = allocate_cuda_notify_workspace(plan, context, execution);
   auto operation = start_cuda_rank_local_notify(
-      config, context, execution, routes, std::move(workspace));
+      config, context, execution, routes, gates, std::move(workspace));
   auto preflight = operation.wait_preflight();
   if (!preflight.valid())
     invalid("phase=fake-device-materializer, field=preflight, rank=" +
@@ -3215,6 +3429,43 @@ ActivationTransportBridge::view(DeviceDispatchConsumerLease &consumer) {
     invalid("phase=activation-transport-view, field=consumer, rank=n/a, "
             "expected=Acquired, actual=invalid");
   return consumer.impl_->kernel_view();
+}
+
+const float *ActivationTransportBridge::gate_pointer(
+    const DeviceDispatchHandle &dispatch) {
+  if (!dispatch.impl_ || !dispatch.impl_->source_gates)
+    invalid("phase=activation-gate-view, field=dispatch/gates, rank=n/a, "
+            "expected=valid owning handle, actual=empty");
+  DeviceGateProvenanceBridge::validate(
+      dispatch.impl_->source_gates, dispatch.impl_->source_routes,
+      dispatch.impl_->context, dispatch.impl_->execution);
+  return DeviceGateProvenanceBridge::device_pointer(
+      dispatch.impl_->source_gates);
+}
+
+void ActivationTransportBridge::wait_for_gates(
+    const DeviceDispatchHandle &dispatch, const CudaExecution &execution) {
+  if (!dispatch.impl_ || !dispatch.impl_->source_gates.impl_)
+    invalid("phase=activation-gate-wait, field=dispatch/gates, rank=n/a, "
+            "expected=valid owning handle, actual=empty");
+  const auto &gate = *dispatch.impl_->source_gates.impl_;
+  const auto exec = internal::checked_execution_state(execution);
+  if (gate.device != exec->device || !gate.ready_recorded ||
+      !gate.allocation || !gate.bound_routes.impl_ ||
+      !gate.bound_routes.impl_->allocation ||
+      !gate.bound_routes.impl_->allocation->producer_ready)
+    invalid("phase=activation-gate-wait, field=device/ready, rank=" +
+            std::to_string(dispatch.impl_->identity.calling_rank) +
+            ", expected=matching recorded producer event, actual=mismatch");
+  internal::throw_cuda(
+      "activation-gate-wait",
+      cudaStreamWaitEvent(exec->stream,
+                          gate.bound_routes.impl_->allocation->producer_ready),
+      dispatch.impl_->identity.calling_rank,
+      dispatch.impl_->identity.world_size,
+      dispatch.impl_->context.session().identity(),
+      dispatch.impl_->identity.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(gate producer ready)");
 }
 
 void ActivationTransportBridge::submit(

@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -30,6 +31,16 @@ using Clock = std::chrono::steady_clock;
 void require(bool condition, const std::string &message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+megamoe::cuda::CudaGateInput make_unit_gates(
+    const megamoe::cuda::CudaRouteInput &routes,
+    const megamoe::RankCollectiveContext &context,
+    const megamoe::cuda::CudaExecution &execution) {
+  return megamoe::cuda::testing::upload_fp32_gates_for_testing(
+      std::vector<float>(static_cast<std::size_t>(routes.route_count()),
+                         1.0F),
+      routes, context, execution);
 }
 
 megamoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
@@ -89,6 +100,41 @@ std::vector<std::uint64_t> fixed_seeds() {
           0x99aabbccULL, 0xddeeff00ULL, 0x42424242ULL, 0x77777777ULL,
           0xabcdef01ULL, 0x10fedcbaULL, 0x600dbeefULL, 0x7f4a7c15ULL,
           0xf00dcafeULL};
+}
+
+std::vector<float> fixed_random_selected_gates(
+    std::uint64_t tokens, std::uint32_t top_k, std::uint32_t rank,
+    std::uint64_t seed) {
+  std::vector<float> gates(
+      static_cast<std::size_t>(tokens * static_cast<std::uint64_t>(top_k)));
+  for (std::uint64_t token = 0; token < tokens; ++token) {
+    std::uint64_t total = 0;
+    std::vector<std::uint32_t> scores(top_k);
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+      const auto mixed = seed + token * 1315423911ULL +
+                         static_cast<std::uint64_t>(slot) * 2654435761ULL +
+                         static_cast<std::uint64_t>(rank) * 97531ULL;
+      scores[slot] = 1U + static_cast<std::uint32_t>(mixed % 65521ULL);
+      total += scores[slot];
+    }
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      gates[static_cast<std::size_t>(token * top_k + slot)] =
+          static_cast<float>(static_cast<double>(scores[slot]) /
+                             static_cast<double>(total));
+  }
+  return gates;
+}
+
+std::uint64_t hash_fp32(const std::vector<float> &values) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const float value : values) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (unsigned byte = 0; byte < sizeof(bits); ++byte)
+      hash = (hash ^ ((bits >> (byte * 8U)) & 0xffU)) *
+             1099511628211ULL;
+  }
+  return hash;
 }
 
 struct RunResult {
@@ -164,6 +210,7 @@ struct ReusableRankResources {
   megamoe::cuda::NcclSession base_session;
   megamoe::cuda::DeviceNotifyResourcePool pool;
   megamoe::cuda::CudaRouteInput device_routes;
+  megamoe::cuda::CudaGateInput device_gates;
   double session_setup_us = 0;
   double pool_setup_us = 0;
   std::exception_ptr error;
@@ -230,11 +277,16 @@ std::vector<RunResult> run_reused_fixture(
                                             context,
                                             resources[rank].execution)
                                       : megamoe::cuda::CudaRouteInput{};
+        const auto exact_gates = exact_routes
+            ? megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+                  resources[rank].device_gates, exact_routes, context,
+                  resources[rank].execution)
+            : megamoe::cuda::CudaGateInput{};
         megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
             session, resources[rank].execution, resources[rank].pool);
         auto result = exact_routes
                           ? coordinator.run_device(
-                                {config, exact_routes, max_tokens})
+                                {config, exact_routes, exact_gates, max_tokens})
                           : coordinator.run(
                                 {config, routes[rank], max_tokens});
         results[rank].metadata = megamoe::serialize_dispatch_metadata(
@@ -928,8 +980,9 @@ void test_device_only_sanitizer_paths() {
         config, 0, input.num_tokens, 4);
     auto workspace = megamoe::cuda::allocate_cuda_notify_workspace(
         plan, context, execution);
+    auto gates = make_unit_gates(routes, context, execution);
     auto operation = megamoe::cuda::start_cuda_rank_local_notify(
-        config, context, execution, routes, std::move(workspace));
+        config, context, execution, routes, gates, std::move(workspace));
     const auto result = operation.wait_preflight();
     require(result.valid() == valid,
             "device-only validation status mismatch");
@@ -953,9 +1006,10 @@ void test_device_only_sanitizer_paths() {
   try {
     auto workspace = megamoe::cuda::allocate_cuda_notify_workspace(
         consumer_plan, consumer_context, consumer_execution);
+    auto gates = make_unit_gates(producer_routes, context, execution);
     (void)megamoe::cuda::start_cuda_rank_local_notify(
         config, consumer_context, consumer_execution, producer_routes,
-        std::move(workspace));
+        gates, std::move(workspace));
   } catch (const megamoe::NotifyDispatchError &) {
     no_wait_failed = true;
   }
@@ -965,9 +1019,11 @@ void test_device_only_sanitizer_paths() {
       producer_routes, consumer_context, consumer_execution);
   auto imported_workspace = megamoe::cuda::allocate_cuda_notify_workspace(
       consumer_plan, consumer_context, consumer_execution);
+  auto imported_gates = make_unit_gates(
+      imported, consumer_context, consumer_execution);
   auto imported_operation = megamoe::cuda::start_cuda_rank_local_notify(
       config, consumer_context, consumer_execution, imported,
-      std::move(imported_workspace));
+      imported_gates, std::move(imported_workspace));
   require(imported_operation.wait_preflight().valid(),
           "legal cross-stream event handoff failed");
   auto foreign_session =
@@ -983,6 +1039,18 @@ void test_device_only_sanitizer_paths() {
   }
   require(foreign_failed,
           "foreign route pipeline session handoff did not fail closed");
+  auto alternate_routes = megamoe::cuda::upload_cuda_routes(
+      handoff_input, config.top_k, context, execution);
+  auto original_gates = make_unit_gates(producer_routes, context, execution);
+  bool route_gate_binding_failed = false;
+  try {
+    megamoe::cuda::DeviceGateProvenanceBridge::validate(
+        original_gates, alternate_routes, context, execution);
+  } catch (const megamoe::NotifyDispatchError &) {
+    route_gate_binding_failed = true;
+  }
+  require(route_gate_binding_failed,
+          "gate lease bound to another route allocation was accepted");
   const auto wide_config = make_config(73, 1, 146, 6, 4);
   auto wide_session =
       megamoe::make_collective_session("device-wide-mask", 73, 5002);
@@ -1066,7 +1134,9 @@ void test_device_only_sanitizer_paths() {
     activations[i] = megamoe::transport::float_to_bfloat16(
         static_cast<float>((i * 13U) % 97U) / 16.0F);
   const auto oracle = megamoe::transport::simulate_activation_transport(
-      host_dispatch[0], activations, transport_config, 1);
+      host_dispatch[0], activations,
+      std::vector<float>(transport_routes.selected_experts.size(), 1.0F),
+      transport_config, 1);
   megamoe::cuda::ActivationTransportPoolConfig transport_pool_config;
   transport_pool_config.max_tokens_per_rank = 4;
   transport_pool_config.max_hidden_size = 33;
@@ -1200,12 +1270,27 @@ void test_device_only_sanitizer_paths() {
       wide_session, execution, wide_transport_pool);
   auto wide_transport_result = wide_transport.run_device_simulation_synthetic(
       wide_handle, wide_activation, wide_transport_config);
+  auto gate_before = wide_transport_config;
+  gate_before.gate_placement =
+      megamoe::transport::ActivationGatePlacement::DestinationBeforeUnsupported;
+  bool gate_before_failed = false;
+  try {
+    (void)wide_transport.run_device_simulation_synthetic(
+        wide_handle, wide_activation, gate_before);
+  } catch (const megamoe::NotifyDispatchError &) {
+    gate_before_failed = true;
+  }
+  require(gate_before_failed,
+          "unsupported gate-before placement was silently accepted");
   const auto wide_transport_download =
       megamoe::cuda::download_activation_transport_for_validation(
           wide_transport_result, execution);
   const auto wide_transport_oracle =
       megamoe::transport::simulate_activation_transport(
-          expected_wide[0], wide_activations, wide_transport_config, 1);
+          expected_wide[0], wide_activations,
+          std::vector<float>(
+              expected_wide[0]->outgoing.expert_id.size(), 1.0F),
+          wide_transport_config, 1);
   require(wide_transport_download.contribution_by_route ==
               wide_transport_oracle.contribution_by_route &&
               wide_transport_download.combined_tokens ==
@@ -1260,7 +1345,9 @@ void test_delayed_route_producer_readiness() {
       base, consumer, {config, 2, 4096, 1, 2});
   megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
       base, consumer, pool);
-  auto result = coordinator.run_device({config, imported, 2});
+  auto imported_gates = make_unit_gates(imported, consumer_context, consumer);
+  auto result = coordinator.run_device(
+      {config, imported, imported_gates, 2});
   const auto downloaded =
       megamoe::cuda::download_device_metadata_for_validation(
           result.dispatch(), consumer);
@@ -1296,7 +1383,10 @@ void test_delayed_route_producer_readiness() {
   try {
     megamoe::cuda::CudaNotifyGenerationCoordinator unsafe_coordinator(
         next, consumer, pool);
-    (void)unsafe_coordinator.run_device({config, unsafe, 2});
+    auto unsafe_gates = make_unit_gates(unsafe, next_consumer_context,
+                                        consumer);
+    (void)unsafe_coordinator.run_device(
+        {config, unsafe, unsafe_gates, 2});
   } catch (const megamoe::NotifyDispatchError &) {
     unsafe_failed = true;
   }
@@ -1316,7 +1406,9 @@ void test_delayed_route_producer_readiness() {
       same_session, producer, {config, 2, 4096, 1, 2});
   megamoe::cuda::CudaNotifyGenerationCoordinator same_coordinator(
       same_session, producer, same_pool);
-  auto same_result = same_coordinator.run_device({config, same_delayed, 2});
+  auto same_gates = make_unit_gates(same_delayed, same_context, producer);
+  auto same_result = same_coordinator.run_device(
+      {config, same_delayed, same_gates, 2});
   const auto same_download =
       megamoe::cuda::download_device_metadata_for_validation(
           same_result.dispatch(), producer);
@@ -1424,6 +1516,11 @@ void test_resource_pool_and_cuda_api_audit() {
       megamoe::make_rank_collective_context(base.session(), 0,
                                             execution.token()),
       execution);
+  auto device_gates = make_unit_gates(
+      device_routes,
+      megamoe::make_rank_collective_context(base.session(), 0,
+                                            execution.token()),
+      execution);
   const auto exact_routes = [&](const megamoe::cuda::NcclSession &session) {
     return megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
         device_routes,
@@ -1431,6 +1528,35 @@ void test_resource_pool_and_cuda_api_audit() {
                                               execution.token()),
         execution);
   };
+  const auto exact_request = [&](const megamoe::cuda::NcclSession &session) {
+    auto routes_for_generation = exact_routes(session);
+    auto gates_for_generation =
+        megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+            device_gates, routes_for_generation,
+            megamoe::make_rank_collective_context(
+                session.session(), 0, execution.token()),
+            execution);
+    return megamoe::cuda::DeviceNotifyGenerationRequest{
+        config, std::move(routes_for_generation),
+        std::move(gates_for_generation), 10};
+  };
+  {
+    auto next = megamoe::cuda::make_nccl_generation(
+        base, "pool-base", 6201);
+    auto next_routes = exact_routes(next);
+    bool stale_gate_failed = false;
+    try {
+      megamoe::cuda::DeviceGateProvenanceBridge::validate(
+          device_gates, next_routes,
+          megamoe::make_rank_collective_context(
+              next.session(), 0, execution.token()),
+          execution);
+    } catch (const megamoe::NotifyDispatchError &) {
+      stale_gate_failed = true;
+    }
+    require(stale_gate_failed,
+            "generation-6200 gate lease was accepted at generation 6201");
+  }
   for (std::uint64_t generation = 6201; generation <= 6210; ++generation) {
     bool rejected = false;
     try {
@@ -1438,7 +1564,8 @@ void test_resource_pool_and_cuda_api_audit() {
           base, "pool-base", generation);
       megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           mismatched, execution, pool);
-      (void)coordinator.run_device({config, device_routes, 10});
+      (void)coordinator.run_device(
+          {config, device_routes, device_gates, 10});
     } catch (const megamoe::NotifyDispatchError &error) {
       const std::string message = error.what();
       rejected = message.find("field=generation") != std::string::npos &&
@@ -1461,8 +1588,7 @@ void test_resource_pool_and_cuda_api_audit() {
         base, "pool-base", 6201 + iteration);
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         session, execution, pool);
-    auto result = coordinator.run_device(
-        {config, exact_routes(session), 10});
+    auto result = coordinator.run_device(exact_request(session));
     require(result.dispatch().audit().bulk_route_d2h == 0 &&
                 result.dispatch().audit().bulk_collective_d2h == 0 &&
                 result.dispatch().audit().host_materializations == 0 &&
@@ -1491,8 +1617,7 @@ void test_resource_pool_and_cuda_api_audit() {
       base, "pool-base", 6300);
   megamoe::cuda::CudaNotifyGenerationCoordinator second_coordinator(
       second_session, execution, pool);
-  auto second = second_coordinator.run_device(
-      {config, exact_routes(second_session), 10});
+  auto second = second_coordinator.run_device(exact_request(second_session));
   require(pool.usage().slots_in_use == 2,
           "two live handles did not occupy two exclusive pool slots");
   bool exhausted = false;
@@ -1501,8 +1626,7 @@ void test_resource_pool_and_cuda_api_audit() {
         base, "pool-base", 6301);
     megamoe::cuda::CudaNotifyGenerationCoordinator third_coordinator(
         third_session, execution, pool);
-    (void)third_coordinator.run_device(
-        {config, exact_routes(third_session), 10});
+    (void)third_coordinator.run_device(exact_request(third_session));
   } catch (const megamoe::NotifyDispatchError &error) {
     exhausted = error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
   }
@@ -1518,8 +1642,7 @@ void test_resource_pool_and_cuda_api_audit() {
         base, "pool-base", 6302);
     megamoe::cuda::CudaNotifyGenerationCoordinator failed_coordinator(
         failed_session, execution, pool);
-    (void)failed_coordinator.run_device(
-        {config, exact_routes(failed_session), 10});
+    (void)failed_coordinator.run_device(exact_request(failed_session));
   } catch (const megamoe::NotifyDispatchError &) {
     injected_failed = true;
   }
@@ -1530,7 +1653,7 @@ void test_resource_pool_and_cuda_api_audit() {
   megamoe::cuda::CudaNotifyGenerationCoordinator recovery_coordinator(
       recovery_session, execution, pool);
   auto recovered = recovery_coordinator.run_device(
-      {config, exact_routes(recovery_session), 10});
+      exact_request(recovery_session));
   require(recovered && pool.usage().slots_in_use == 2,
           "released pool slot was not reusable");
 
@@ -1562,8 +1685,7 @@ void test_resource_pool_and_cuda_api_audit() {
           base, "pool-base", generation);
       megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
-      live.push_back(
-          coordinator.run_device({config, exact_routes(session), 10}));
+      live.push_back(coordinator.run_device(exact_request(session)));
     }
     require(sized_pool.usage().slots_in_use == slot_count,
             "pool size 1/N did not retain every live slot");
@@ -1574,7 +1696,7 @@ void test_resource_pool_and_cuda_api_audit() {
           6500U + slot_count);
       megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
-      (void)coordinator.run_device({config, exact_routes(session), 10});
+      (void)coordinator.run_device(exact_request(session));
     } catch (const megamoe::NotifyDispatchError &error) {
       sized_exhausted =
           error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
@@ -1590,8 +1712,7 @@ void test_resource_pool_and_cuda_api_audit() {
           6600U + slot_count);
       megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
-      auto reused = coordinator.run_device(
-          {config, exact_routes(session), 10});
+      auto reused = coordinator.run_device(exact_request(session));
       require(static_cast<bool>(reused),
               "pool size 1/N released slot was not reusable");
     }
@@ -1606,8 +1727,7 @@ void test_resource_pool_and_cuda_api_audit() {
         base, "pool-base", 6700);
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         generation, execution, stale_pool);
-    auto gen1 = coordinator.run_device(
-        {config, exact_routes(generation), 10});
+    auto gen1 = coordinator.run_device(exact_request(generation));
     auto handle = gen1.dispatch();
     const auto &id = handle.identity();
     auto consumer = handle.acquire_consumer(
@@ -1648,8 +1768,7 @@ void test_resource_pool_and_cuda_api_audit() {
           base, "pool-base", 6701);
       megamoe::cuda::CudaNotifyGenerationCoordinator blocked(
           blocked_generation, execution, stale_pool);
-      (void)blocked.run_device(
-          {config, exact_routes(blocked_generation), 10});
+      (void)blocked.run_device(exact_request(blocked_generation));
     } catch (const megamoe::NotifyDispatchError &error) {
       stale_exhausted =
           error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
@@ -1667,7 +1786,7 @@ void test_resource_pool_and_cuda_api_audit() {
     megamoe::cuda::CudaNotifyGenerationCoordinator recovered_coordinator(
         recovered_generation, execution, stale_pool);
     auto gen2 = recovered_coordinator.run_device(
-        {config, exact_routes(recovered_generation), 10});
+        exact_request(recovered_generation));
     require(gen2 && stale_pool.usage().slots_in_use == 1,
             "slot was not reusable after final consumer completion");
   }
@@ -1680,8 +1799,7 @@ void test_resource_pool_and_cuda_api_audit() {
         base, "pool-base", 6800);
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         generation, execution, quarantine_pool);
-    auto result = coordinator.run_device(
-        {config, exact_routes(generation), 10});
+    auto result = coordinator.run_device(exact_request(generation));
     auto handle = result.dispatch();
     const auto &id = handle.identity();
     auto consumer = handle.acquire_consumer(
@@ -1723,7 +1841,7 @@ void test_resource_pool_and_cuda_api_audit() {
           base, "pool-base", 6801);
       megamoe::cuda::CudaNotifyGenerationCoordinator blocked(
           next, execution, quarantine_pool);
-      (void)blocked.run_device({config, exact_routes(next), 10});
+      (void)blocked.run_device(exact_request(next));
     } catch (const megamoe::NotifyDispatchError &error) {
       next_failed = error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
     }
@@ -1743,8 +1861,7 @@ void test_resource_pool_and_cuda_api_audit() {
             : 6811);
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         generation, execution, event_pool);
-    auto result = coordinator.run_device(
-        {config, exact_routes(generation), 10});
+    auto result = coordinator.run_device(exact_request(generation));
     const auto &id = result.dispatch().identity();
     auto consumer = result.dispatch().acquire_consumer(
         execution, {id.generation, id.calling_rank, id.world_size,
@@ -1862,6 +1979,31 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         setup_generation.session(), rank, execution.token());
     auto route_storage = megamoe::cuda::upload_cuda_routes(
         common_routes, top_k, setup_context, execution);
+    const auto gate_mode_text = std::getenv("MEGAMOE_GATE_MODE");
+    const std::string gate_mode = gate_mode_text ? gate_mode_text
+                                                  : "fixed-random";
+    require(gate_mode == "fixed-random" || gate_mode == "unit",
+            "gate mode must be fixed-random or unit");
+    auto route_gates = gate_mode == "unit"
+        ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
+        : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
+                                      0x4d4547414d4f4547ULL);
+    if (gate_mode == "fixed-random")
+      for (std::uint64_t token = 0; token < common_routes.num_tokens; ++token) {
+        float sum = 0.0F;
+        for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+          const auto gate = route_gates[
+              static_cast<std::size_t>(token * top_k + slot)];
+          require(gate > 0.0F && gate <= 1.0F,
+                  "fixed-random gate is outside (0,1]");
+          sum += gate;
+        }
+        require(std::abs(sum - 1.0F) <= 2.0e-6F,
+                "fixed-random selected gates do not sum to one");
+      }
+    auto gate_storage = megamoe::cuda::testing::upload_fp32_gates_for_testing(
+        route_gates, route_storage, setup_context, execution);
+    const auto gate_hash = hash_fp32(route_gates);
     megamoe::cuda::ActivationTransportPoolConfig transport_pool_config;
     transport_pool_config.max_tokens_per_rank = max_tokens;
     transport_pool_config.max_hidden_size = hidden;
@@ -1910,7 +2052,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         transport_pool_config.ring_slots_per_source_channel;
     transport_config.expert_transform =
         megamoe::transport::ActivationExpertTransform::Identity;
-    transport_config.combine_gate_scale = 1.0F;
+    transport_config.gate_placement =
+        megamoe::transport::ActivationGatePlacement::SourceAfter;
     const auto rounds_text =
         std::getenv("MEGAMOE_INTEGRATED_BENCH_ROUNDS");
     const auto rounds = rounds_text
@@ -1932,6 +2075,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> reduce_samples;
     std::vector<double> terminal_samples;
     megamoe::cuda::ActivationTransportDeviceAudit last_audit;
+    megamoe::cuda::CollectiveProtocolAudit last_notify_audit;
     const auto api_before =
         megamoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
@@ -1943,6 +2087,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto exact_routes =
           megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
               route_storage, context, execution);
+      auto exact_gates =
+          megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              gate_storage, exact_routes, context, execution);
       auto exact_activation =
           megamoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
               activation_storage, context, execution);
@@ -1953,8 +2100,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
             generation_session, execution, pool);
         auto notify = coordinator.run_device(
-            {common_config, exact_routes, max_tokens});
+            {common_config, exact_routes, exact_gates, max_tokens});
         notify_timing = notify.execution_timings();
+        last_notify_audit = notify.audit();
         megamoe::cuda::ActivationTransportRunOptions options;
         options.deadline_after = std::chrono::seconds(120);
         auto transported = transport.run_synthetic(
@@ -2012,13 +2160,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     auto validation_routes =
         megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
             route_storage, validation_context, execution);
+    auto validation_gates =
+        megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+            gate_storage, validation_routes, validation_context, execution);
     auto validation_activation =
         megamoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
             activation_storage, validation_context, execution);
     megamoe::cuda::CudaNotifyGenerationCoordinator validation_coordinator(
         validation_session, execution, pool);
     auto validation_notify = validation_coordinator.run_device(
-        {common_config, validation_routes, max_tokens});
+        {common_config, validation_routes, validation_gates, max_tokens});
     auto validation_transport = transport.run_synthetic(
         validation_notify.dispatch(), validation_activation, transport_config,
         {});
@@ -2027,22 +2178,41 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             validation_transport, execution);
     require(output.size() == activations.size(),
             "integrated output shape mismatch");
-    std::vector<megamoe::transport::BFloat16> expected_by_bits(1U << 16U);
-    for (std::uint32_t bits = 0; bits < expected_by_bits.size(); ++bits) {
-      const auto input = megamoe::transport::BFloat16{
-          static_cast<std::uint16_t>(bits)};
-      float expected = 0.0F;
-      for (std::uint32_t slot = 0; slot < top_k; ++slot)
-        expected += transport_config.combine_gate_scale *
-                    megamoe::transport::bfloat16_to_float(input);
-      expected_by_bits[bits] =
-          megamoe::transport::float_to_bfloat16(expected);
-    }
+    std::vector<megamoe::transport::BFloat16> expected_by_token_value(
+        static_cast<std::size_t>(common_routes.num_tokens * 97U));
+    for (std::uint64_t token = 0; token < common_routes.num_tokens; ++token)
+      for (std::uint32_t value_index = 0; value_index < 97U; ++value_index) {
+        const auto input = megamoe::transport::float_to_bfloat16(
+            static_cast<float>(rank * 101U + value_index) / 32.0F);
+        float expected = 0.0F;
+        std::vector<std::uint32_t> order(top_k);
+        for (std::uint32_t slot = 0; slot < top_k; ++slot)
+          order[slot] = slot;
+        std::sort(order.begin(), order.end(), [&](std::uint32_t lhs,
+                                                  std::uint32_t rhs) {
+          return common_routes.selected_experts[
+                     static_cast<std::size_t>(token * top_k + lhs)] <
+                 common_routes.selected_experts[
+                     static_cast<std::size_t>(token * top_k + rhs)];
+        });
+        for (const auto slot : order) {
+          const auto route = static_cast<std::size_t>(token * top_k + slot);
+          volatile float product =
+              route_gates[route] *
+              megamoe::transport::bfloat16_to_float(input);
+          expected += product;
+        }
+        expected_by_token_value[
+            static_cast<std::size_t>(token * 97U + value_index)] =
+            megamoe::transport::float_to_bfloat16(expected);
+      }
     std::uint64_t output_hash = 1469598103934665603ULL;
     bool output_equal = true;
     for (std::size_t index = 0; index < output.size(); ++index) {
+      const auto token = index / static_cast<std::size_t>(hidden);
       output_equal = output_equal &&
-                     output[index] == expected_by_bits[activations[index].bits];
+                     output[index] == expected_by_token_value[
+                         token * 97U + index % 97U];
       output_hash = (output_hash ^ output[index].bits) * 1099511628211ULL;
     }
     require(output_equal,
@@ -2062,8 +2232,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " device_bytes=" << usage.device_bytes
               << " pinned_bytes=" << usage.pinned_bytes
               << " route_input_bytes=" << route_storage.device_bytes()
-              << " local_gate_bytes=0"
-              << " gate_mode=unit-source-fp32"
+              << " local_gate_bytes=" << gate_storage.device_bytes()
+              << " peer_gate_bytes=0"
+              << " gate_mode=" << gate_mode
+              << " gate_hash=" << gate_hash
               << " output_equal=1 output_hash=" << output_hash
               << " raw_bytes=" << last_audit.raw_cross_node_payload_bytes
               << " dedup_bytes="
@@ -2072,6 +2244,29 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_audit.actual_dispatch_peer_bytes
               << " actual_return_peer_bytes="
               << last_audit.actual_return_peer_bytes
+              << " actual_route_bytes="
+              << last_audit.actual_route_input_bytes
+              << " actual_local_gate_bytes="
+              << last_audit.actual_local_gate_bytes
+              << " actual_peer_gate_bytes="
+              << last_audit.actual_peer_gate_bytes
+              << " generation_memset_calls="
+              << last_audit.generation_memset_calls
+              << " generation_memset_bytes="
+              << last_audit.generation_memset_bytes
+              << " kernel_launches=" << last_audit.kernel_launches
+              << " control_enqueues=" << last_notify_audit.control_starts
+              << " config_enqueues=" << last_notify_audit.config_starts
+              << " count_enqueues="
+              << last_notify_audit.expert_count_starts
+              << " summary_enqueues="
+              << last_notify_audit.packet_summary_starts
+              << " dispatch_kernel_blocks="
+              << last_audit.dispatch_kernel_blocks
+              << " return_kernel_blocks="
+              << last_audit.return_kernel_blocks
+              << " reduce_kernel_blocks="
+              << last_audit.reduce_kernel_blocks
               << " steady_allocs="
               << api_after.device_allocations - api_before.device_allocations
               << " steady_h2d_bytes="
@@ -2602,14 +2797,23 @@ void benchmark(std::uint32_t world) {
   // 10+50 run. Samples are the ranks participating in that one establishment.
   auto resources =
       make_reusable_resources(config, "benchmark-session", 2999, 8192);
-  for (std::uint32_t rank = 0; rank < world; ++rank)
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    const auto context = megamoe::make_rank_collective_context(
+        resources[rank].base_session.session(), rank,
+        resources[rank].execution.token());
     resources[rank].device_routes =
         megamoe::cuda::upload_cuda_routes(
             routes[rank], config.top_k,
-            megamoe::make_rank_collective_context(
-                resources[rank].base_session.session(), rank,
-                resources[rank].execution.token()),
+            context,
             resources[rank].execution);
+    resources[rank].device_gates =
+        megamoe::cuda::testing::upload_fp32_gates_for_testing(
+            fixed_random_selected_gates(routes[rank].num_tokens,
+                                        config.top_k, rank,
+                                        0x4d4547414d4f4547ULL),
+            resources[rank].device_routes, context,
+            resources[rank].execution);
+  }
   std::vector<double> session_setup;
   std::vector<double> pool_setup;
   for (const auto &resource : resources)
