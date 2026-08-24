@@ -117,11 +117,15 @@ its handles. A failed drain leaves the slot unavailable (fail closed).
 `run_device` accepts only `SelectedExpertRouteLease<std::int32_t>`, whose
 dtype/layout, contiguous `[tokens,top_k]` shape, device, owner, pipeline
 session/generation, producer execution and recorded ready event are immutable.
+The generation comparison is unconditional: a lease issued for generation N
+is rejected by N+1 even when its allocation is unchanged. Reusing immutable
+test storage is implemented only by a private adapter that issues a fresh,
+exact-generation lease; no test handoff exists in installed headers.
 Cross-stream use requires `import_selected_expert_routes`, which enqueues a
 stream wait while retaining producer provenance. Generic `DeviceBufferLease`
-cannot be rebound as routes. `run` is an explicit host convenience path: with a pool it uploads to
-the already allocated route slot. `upload_device_routes_for_testing` is a
-one-time test/tool helper, not the intended training hot path. The public
+cannot be rebound as routes. `run` is an explicit host convenience path: with
+a pool it uploads to the already allocated route slot. Test upload/reissue
+utilities live only in private test headers. The public
 production coordinator constructor requires a pool; the allocating constructor
 is private and reachable only through an explicitly named `testing` factory.
 

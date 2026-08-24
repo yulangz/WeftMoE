@@ -44,10 +44,12 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking.
 - every public header as an isolated `-Werror` translation unit.
-- twelve compile-negative probes for the retired `wait`, `wait_preflight`, raw
+- twenty-one compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
-  production coordinator constructor.
+  production coordinator constructor, generic route rebinding/wrong route
+  dtype, raw dispatch views, removed generation handoff/reissue helpers, and
+  the internal no-wait producer-race seam.
 - thirteen fake-runner/bootstrap-channel security groups covering success,
   local/remote failure, timeout and TERM-to-KILL escalation, SSH start failure,
   short/oversize bootstrap, runner exception, every 1/2/7/8/17/127/128-byte

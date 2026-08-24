@@ -94,13 +94,6 @@ private:
 
 inline constexpr std::uint32_t kSelectedExpertRouteLayoutVersion = 1;
 
-// Explicit host convenience for tests/tools. It allocates and uploads once;
-// production training must receive this same strong type from the router.
-CudaRouteInput upload_device_routes_for_testing(
-    const RankRoutingInput &routes, std::uint32_t top_k,
-    const RankCollectiveContext &producer_context,
-    const CudaExecution &producer_execution);
-
 // Explicit cross-stream handoff. This enqueues cudaStreamWaitEvent on the
 // consumer stream and preserves the immutable producer provenance.
 CudaRouteInput import_selected_expert_routes(

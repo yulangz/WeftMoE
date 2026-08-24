@@ -354,7 +354,7 @@ a detachable pointer view: `acquire_consumer` returns a move-only
 internal `DeviceDispatchKernelView` POD. Submitted consumers record a pooled
 event on their own stream; the slot cannot return until the last handle and
 consumer have drained. The explicit
-The explicit `download_device_metadata_for_validation` diagnostic downloads
+`download_device_metadata_for_validation` diagnostic downloads
 every field for tests and reconstructs a host `DispatchHandle`; the generic
 metadata layer still cannot inspect a native pointer and the production
 coordinator never invokes this API.
@@ -372,12 +372,22 @@ top-k, world, nodes, canonical-config bytes, and an explicit
 - mapping/planning/Notify-completion and route-ready events, the configured
   consumer-completion events, and four collective CUDA events.
 
-Slot state is `available` or `leased(epoch)`. Acquisition is serialized,
+Generation-slot state is `Available`, `InUse(epoch)`, or `Quarantined`.
+Consumer-event state is tracked independently with the same three values.
+Acquisition is serialized,
 assigns a monotonic epoch, resets backend generation state, and never allocates.
 The workspace and successful result share the same lease. A handle copy keeps
 the slot alive; a moved-from/default handle cannot. When the last lease dies,
 its noexcept cleanup records and waits on the precreated completion event
-before making the slot available. Cleanup failure does not reissue the slot.
+before making the slot available. An event record/synchronize failure
+permanently quarantines that event. If the consumer stream can still be
+drained, the generation slot remains reclaimable; if both event and stream
+drain fail, the generation slot is also permanently quarantined. Every
+download, launch adapter, later consumer acquire, and pool acquire checks this
+state and fails closed. Cleanup failure never guesses that device work ended.
+At pool teardown a quarantined slot performs a best-effort device-wide drain;
+if even that fails, native allocations are deliberately abandoned to the
+process rather than freed underneath possibly live device work.
 Errors before publication release by the same path, and pool destruction is
 deferred by outstanding leases.
 
@@ -389,7 +399,8 @@ owner, and a recorded producer-ready event. It is not constructible from a
 generic `DeviceBufferLease`. Same-stream consumption uses stream order;
 cross-stream consumption requires the explicit import API, which enqueues
 `cudaStreamWaitEvent` without replacing producer provenance. The host-input
-coordinator and `upload_device_routes_for_testing` are convenience/test paths,
+generation comparison is exact and unconditional. The coordinator host-input
+overload and private test storage adapter are convenience/test paths,
 not router-to-Notify training interfaces.
 
 Consumer state is `Acquired -> Submitted -> Completed/Released`. An
@@ -399,6 +410,14 @@ If the public handle dies first, the consumer still owns the arena and epoch.
 Multiple streams may acquire distinct tokens; exhaustion is
 `ResourceExhausted`, never an event allocation fallback. A single consumer
 object does not support concurrent move/submit/finish.
+
+The coordinator also accepts a shared cancellation token and a relative
+deadline. After fixed control/config agreement it starts the count operation;
+an all-rank-consistent cancellation or expired deadline invokes that real
+operation's `cancel()` exactly once, publishes no handle, and releases or
+quarantines the pool slot through the normal lease path. Recovery is promised
+for world=1 or consistent all-rank cancellation, not for an isolated process or
+NCCL hard failure.
 
 Production construction requires a `DeviceNotifyResourcePool`. The old
 two-argument allocating constructor is private; an explicitly named

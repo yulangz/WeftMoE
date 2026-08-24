@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -139,6 +140,23 @@ struct DeviceNotifyGenerationRequest {
   std::uint64_t max_tokens_per_rank = 0;
 };
 
+class GenerationCancellationToken {
+public:
+  GenerationCancellationToken();
+  void request_cancel() const noexcept;
+  bool cancellation_requested() const noexcept;
+
+private:
+  struct State;
+  std::shared_ptr<State> state_;
+};
+
+struct GenerationRunOptions {
+  GenerationCancellationToken cancellation;
+  // Zero means no deadline. The deadline is measured from coordinator entry.
+  std::chrono::microseconds deadline_after{0};
+};
+
 struct DeviceNotifyResourcePoolConfig {
   RuntimeConfig capacity_config;
   std::uint64_t max_tokens_per_rank = 0;
@@ -149,7 +167,12 @@ struct DeviceNotifyResourcePoolConfig {
 
 struct DeviceNotifyResourcePoolUsage {
   std::uint32_t slot_count = 0;
+  std::uint32_t slots_available = 0;
   std::uint32_t slots_in_use = 0;
+  std::uint32_t slots_quarantined = 0;
+  std::uint32_t consumer_events_available = 0;
+  std::uint32_t consumer_events_in_use = 0;
+  std::uint32_t consumer_events_quarantined = 0;
   std::uint64_t slot_epoch_high_watermark = 0;
   std::uint64_t device_bytes = 0;
   std::uint64_t pinned_host_bytes = 0;
@@ -215,8 +238,10 @@ public:
   CudaNotifyGenerationCoordinator &operator=(
       CudaNotifyGenerationCoordinator &&) noexcept;
 
-  ValidatedCudaGeneration run(NotifyGenerationRequest request);
-  ValidatedCudaGeneration run_device(DeviceNotifyGenerationRequest request);
+  ValidatedCudaGeneration run(NotifyGenerationRequest request,
+                              GenerationRunOptions options = {});
+  ValidatedCudaGeneration run_device(DeviceNotifyGenerationRequest request,
+                                     GenerationRunOptions options = {});
   CollectiveProtocolAudit audit() const;
   NcclWorkspaceUsage workspace_usage() const;
   GenerationSetupTimings setup_timings() const;

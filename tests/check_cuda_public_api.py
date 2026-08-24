@@ -69,6 +69,40 @@ int main() {
   (void)megamoe::cuda::make_device_route_input(generic, 1, 1, execution);
 }
 ''',
+    "public_test_route_upload": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::RankRoutingInput routes;
+  megamoe::RankCollectiveContext context;
+  megamoe::cuda::CudaExecution execution;
+  (void)megamoe::cuda::upload_device_routes_for_testing(routes, 1, context,
+                                                         execution);
+}
+''',
+    "public_generation_reissue": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::CudaRouteInput routes;
+  megamoe::RankCollectiveContext context;
+  megamoe::cuda::CudaExecution execution;
+  (void)megamoe::cuda::reissue_cuda_routes_for_testing(routes, context,
+                                                        execution);
+}
+''',
+    "test_pipeline_handoff": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() { (void)megamoe::cuda::test_pipeline_handoff; }
+''',
+    "unsafe_route_import_without_wait": r'''
+#include "megamoe/cuda/device_notify.hpp"
+int main() {
+  megamoe::cuda::CudaRouteInput routes;
+  megamoe::RankCollectiveContext context;
+  megamoe::cuda::CudaExecution execution;
+  (void)megamoe::cuda::unsafe_import_cuda_routes_without_wait_for_testing(
+      routes, context, execution);
+}
+''',
     "wrong_route_dtype": r'''
 #include "megamoe/cuda/device_notify.hpp"
 int main() {

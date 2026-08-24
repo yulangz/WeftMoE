@@ -1469,7 +1469,8 @@ NcclRuntimeInfo nccl_runtime_info() {
 struct DeviceNotifyResourcePool::Impl
     : std::enable_shared_from_this<DeviceNotifyResourcePool::Impl> {
   struct SlotState {
-    bool in_use = false;
+    enum class State : std::uint8_t { Available, InUse, Quarantined };
+    State state = State::Available;
     std::uint64_t epoch = 0;
     std::shared_ptr<CudaNotifyPoolAllocation> notify;
     std::shared_ptr<NcclAllGatherCountExchange> backend;
@@ -1486,10 +1487,14 @@ struct DeviceNotifyResourcePool::Impl
       const auto drained =
           DeviceNotifyPoolBridge::drain(slot.notify, pool->execution);
       std::lock_guard<std::mutex> lock(pool->mutex);
-      if (drained && slot.in_use && slot.epoch == epoch) {
-        slot.in_use = false;
+      const bool quarantined =
+          DeviceNotifyPoolBridge::quarantined(slot.notify);
+      if (slot.state == SlotState::State::InUse && slot.epoch == epoch) {
         if (pool->in_use != 0)
           --pool->in_use;
+        slot.state = drained && !quarantined
+                         ? SlotState::State::Available
+                         : SlotState::State::Quarantined;
       }
     }
   };
@@ -1513,15 +1518,15 @@ struct DeviceNotifyResourcePool::Impl
     std::lock_guard<std::mutex> lock(mutex);
     for (std::size_t index = 0; index < slots.size(); ++index) {
       auto &slot = slots[index];
-      if (slot.in_use)
+      if (slot.state != SlotState::State::Available)
         continue;
-      slot.in_use = true;
+      slot.state = SlotState::State::InUse;
       slot.epoch = ++epoch_high;
       ++in_use;
       try {
         slot.backend->prepare_generation(generation);
       } catch (...) {
-        slot.in_use = false;
+        slot.state = SlotState::State::Available;
         --in_use;
         throw;
       }
@@ -1603,10 +1608,22 @@ DeviceNotifyResourcePoolUsage DeviceNotifyResourcePool::usage() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   DeviceNotifyResourcePoolUsage usage;
   usage.slot_count = static_cast<std::uint32_t>(impl_->slots.size());
-  usage.slots_in_use = impl_->in_use;
   usage.slot_epoch_high_watermark = impl_->epoch_high;
   usage.one_time_setup_us = impl_->setup_us;
   for (const auto &slot : impl_->slots) {
+    const bool runtime_quarantined =
+        DeviceNotifyPoolBridge::quarantined(slot.notify);
+    if (runtime_quarantined ||
+        slot.state == DeviceNotifyResourcePool::Impl::SlotState::State::Quarantined)
+      ++usage.slots_quarantined;
+    else if (slot.state == DeviceNotifyResourcePool::Impl::SlotState::State::Available)
+      ++usage.slots_available;
+    else
+      ++usage.slots_in_use;
+    const auto events = DeviceNotifyPoolBridge::consumer_event_usage(slot.notify);
+    usage.consumer_events_available += events[0];
+    usage.consumer_events_in_use += events[1];
+    usage.consumer_events_quarantined += events[2];
     usage.device_bytes += DeviceNotifyPoolBridge::device_bytes(slot.notify);
     usage.pinned_host_bytes +=
         DeviceNotifyPoolBridge::pinned_bytes(slot.notify);
@@ -1669,6 +1686,22 @@ struct CudaNotifyGenerationCoordinator::Impl {
   bool used = false;
   CudaRouteInput direct_routes;
 };
+
+struct GenerationCancellationToken::State {
+  std::atomic<bool> requested{false};
+};
+
+GenerationCancellationToken::GenerationCancellationToken()
+    : state_(std::make_shared<State>()) {}
+
+void GenerationCancellationToken::request_cancel() const noexcept {
+  if (state_)
+    state_->requested.store(true, std::memory_order_release);
+}
+
+bool GenerationCancellationToken::cancellation_requested() const noexcept {
+  return state_ && state_->requested.load(std::memory_order_acquire);
+}
 
 namespace {
 
@@ -1802,11 +1835,14 @@ CudaNotifyGenerationCoordinator make_unpooled_coordinator_for_testing(
 } // namespace testing
 
 ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
-    NotifyGenerationRequest request) {
+    NotifyGenerationRequest request, GenerationRunOptions options) {
   if (!impl_ || impl_->used)
     invalid("phase=generation-coordinator-run, field=state, rank=n/a, expected=fresh coordinator, actual=empty/already-used");
   impl_->used = true;
   const auto run_start = std::chrono::steady_clock::now();
+  const auto deadline = options.deadline_after.count() > 0
+                            ? run_start + options.deadline_after
+                            : std::chrono::steady_clock::time_point::max();
 
   std::shared_ptr<DeviceNotifyResourcePool::Impl::Lease> pool_lease;
   std::shared_ptr<CudaNotifyPoolAllocation> pool_allocation;
@@ -1846,13 +1882,21 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   if (status.error == ControlLocalError::None)
     status = config_status;
   if (status.error == ControlLocalError::None && direct_routes) {
-    try {
-      DeviceRouteProvenanceBridge::validate(
-          *direct_routes, impl_->context, impl_->execution);
-    } catch (const NotifyDispatchError &) {
+    if (direct_routes->route_generation() !=
+        impl_->context.session().generation()) {
       status = {ControlLocalError::InvalidRouteShape,
-                ControlField::LocalValidation, UINT64_MAX, UINT64_MAX, 0,
-                1, 0};
+                ControlField::Generation, UINT64_MAX, UINT64_MAX, 0,
+                impl_->context.session().generation(),
+                direct_routes->route_generation()};
+    } else {
+      try {
+        DeviceRouteProvenanceBridge::validate(
+            *direct_routes, impl_->context, impl_->execution);
+      } catch (const NotifyDispatchError &) {
+        status = {ControlLocalError::InvalidRouteShape,
+                  ControlField::LocalValidation, UINT64_MAX, UINT64_MAX, 0,
+                  1, 0};
+      }
     }
   }
   if (status.error == ControlLocalError::None && impl_->pool) {
@@ -1972,6 +2016,19 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   auto count = impl_->backend->start(CountExchangeRequest{
       impl_->context, ExchangeKind::ExpertCounts, request.config.num_experts,
       {}, local.device_expert_count_for_backend()});
+  if (options.cancellation.cancellation_requested() ||
+      std::chrono::steady_clock::now() >= deadline) {
+    count->cancel();
+    throw NotifyDispatchError(
+        NotifyErrorCode::CountExchangeFailure,
+        "phase=generation-cancel, field=cancel_or_deadline, rank=" +
+            std::to_string(impl_->session.rank()) + ", world=" +
+            std::to_string(impl_->session.session().world_size()) +
+            ", session='" + impl_->session.session().identity() +
+            "', generation=" +
+            std::to_string(impl_->session.session().generation()) +
+            ", expected=active generation, actual=cancel requested/deadline expired");
+  }
   auto count_done = count->wait();
   const auto count_end = std::chrono::steady_clock::now();
   const auto summary_start = std::chrono::steady_clock::now();
@@ -2084,7 +2141,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
 }
 
 ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run_device(
-    DeviceNotifyGenerationRequest request) {
+    DeviceNotifyGenerationRequest request, GenerationRunOptions options) {
   if (!impl_ || !impl_->pool)
     invalid("phase=generation-coordinator-device, field=resource_pool, "
             "rank=n/a, expected=explicit session pool, actual=missing");
@@ -2097,7 +2154,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run_device(
   adapted.config = std::move(request.config);
   adapted.local_routes.num_tokens = request.local_routes.num_tokens();
   adapted.max_tokens_per_rank = request.max_tokens_per_rank;
-  return run(std::move(adapted));
+  return run(std::move(adapted), std::move(options));
 }
 
 CollectiveProtocolAudit CudaNotifyGenerationCoordinator::audit() const {

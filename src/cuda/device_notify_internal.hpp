@@ -49,11 +49,35 @@ CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
                                   const RankCollectiveContext &context,
                                   const CudaExecution &execution);
 
+namespace testing {
+enum class ConsumerFaultPoint : std::uint8_t {
+  None,
+  EventRecord,
+  EventSynchronize,
+  EventAndStreamSynchronize,
+};
+void inject_next_consumer_fault(ConsumerFaultPoint point) noexcept;
+} // namespace testing
+
 class DeviceRouteProvenanceBridge {
 public:
   static void validate(const CudaRouteInput &routes,
                        const RankCollectiveContext &context,
                        const CudaExecution &execution);
+  // Private test/benchmark adapters. Immutable storage may be shared, but
+  // every lease has exact generation provenance. These declarations are not
+  // installed with the public API.
+  static CudaRouteInput reissue_for_testing(
+      const CudaRouteInput &storage, const RankCollectiveContext &context,
+      const CudaExecution &execution);
+  static CudaRouteInput schedule_delayed_for_testing(
+      const CudaRouteInput &storage, std::int32_t first_expert,
+      std::uint64_t delay_cycles, const RankCollectiveContext &context,
+      const CudaExecution &producer_execution, bool record_ready = true);
+  static CudaRouteInput unsafe_import_without_wait_for_testing(
+      const CudaRouteInput &routes,
+      const RankCollectiveContext &consumer_context,
+      const CudaExecution &consumer_execution);
 };
 
 struct DeviceDispatchKernelView {
@@ -161,6 +185,10 @@ public:
   static std::uint64_t pinned_bytes(
       const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
   static std::uint64_t event_count(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
+  static bool quarantined(
+      const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
+  static std::array<std::uint32_t, 3> consumer_event_usage(
       const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept;
 };
 

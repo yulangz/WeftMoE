@@ -30,7 +30,19 @@ std::atomic<std::uint64_t> g_cuda_device_synchronizes{0};
 std::atomic<std::uint64_t> g_cuda_h2d_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2h_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2d_bytes{0};
+std::atomic<std::uint8_t> g_consumer_fault{0};
+
+bool take_consumer_fault(testing::ConsumerFaultPoint point) noexcept {
+  auto expected = static_cast<std::uint8_t>(point);
+  return g_consumer_fault.compare_exchange_strong(
+      expected,
+      static_cast<std::uint8_t>(testing::ConsumerFaultPoint::None));
+}
 } // namespace
+
+void testing::inject_next_consumer_fault(ConsumerFaultPoint point) noexcept {
+  g_consumer_fault.store(static_cast<std::uint8_t>(point));
+}
 
 namespace internal {
 void record_cuda_api(CudaApiAuditKind kind, std::uint64_t bytes) noexcept {
@@ -774,6 +786,19 @@ __global__ void dispatch_consumer_probe_delay_kernel(
     asm volatile("" : : "l"(*source));
 }
 
+__global__ void delayed_route_fill_kernel(std::int32_t *routes,
+                                          std::uint64_t count,
+                                          std::int32_t first_expert,
+                                          std::uint64_t delay_cycles) {
+  const auto start = clock64();
+  while (clock64() - start < delay_cycles) {
+  }
+  const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+  if (index < count)
+    routes[index] = first_expert + static_cast<std::int32_t>(index);
+}
+
 std::string route_coordinates(std::uint64_t flat, std::uint32_t top_k) {
   return "token=" + std::to_string(flat / top_k) +
          ", slot=" + std::to_string(flat % top_k);
@@ -788,12 +813,6 @@ struct WorkspaceState {
   std::shared_ptr<CudaAllocation> allocation;
   std::shared_ptr<const void> slot_lease;
   std::uint64_t epoch = 0;
-  std::mutex consumer_mutex;
-  std::vector<bool> consumer_in_use;
-  // A terminal consumer-stream failure is fail-closed: retaining self keeps
-  // the slot lease quarantined instead of making potentially live storage
-  // reusable. Normal completion never forms this cycle.
-  std::shared_ptr<WorkspaceState> failed_consumer_hold;
 };
 
 DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
@@ -813,6 +832,21 @@ struct CudaNotifyPoolAllocation {
   CudaNotifyWorkspacePlan max_plan;
   std::shared_ptr<internal::CudaAllocation> route;
   std::shared_ptr<internal::CudaAllocation> workspace;
+  ~CudaNotifyPoolAllocation() noexcept {
+    if (!workspace || !workspace->dispatch_slot_quarantined.load(
+                          std::memory_order_acquire))
+      return;
+    (void)cudaSetDevice(static_cast<int>(workspace->device));
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceSynchronize);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      // A broken context cannot prove that consumer work ended. Fail closed by
+      // abandoning native resources to the process instead of freeing storage
+      // that a device may still reference.
+      if (route)
+        route->abandon_on_teardown = true;
+      workspace->abandon_on_teardown = true;
+    }
+  }
 };
 
 namespace internal {
@@ -846,6 +880,8 @@ CudaExecutionState::~CudaExecutionState() noexcept {
 }
 
 CudaAllocation::~CudaAllocation() noexcept {
+  if (abandon_on_teardown)
+    return;
   (void)cudaSetDevice(static_cast<int>(device));
   if (completion)
     (void)cudaEventSynchronize(completion);
@@ -975,7 +1011,6 @@ struct SelectedExpertRouteLease<std::int32_t>::Impl {
   std::uint32_t device = 0;
   std::uint64_t generation = 0;
   bool ready_recorded = false;
-  bool test_pipeline_handoff = false;
   std::uint64_t tokens = 0;
   std::uint32_t top_k = 0;
   std::uint64_t routes = 0;
@@ -1047,18 +1082,10 @@ CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
   impl->device = state->device;
   impl->generation = context.session().generation();
   impl->ready_recorded = true;
-  impl->test_pipeline_handoff = true;
   impl->tokens = routes.num_tokens;
   impl->top_k = top_k;
   impl->routes = count;
   return CudaRouteInput(std::move(impl));
-}
-
-CudaRouteInput upload_device_routes_for_testing(
-    const RankRoutingInput &routes, std::uint32_t top_k,
-    const RankCollectiveContext &context,
-    const CudaExecution &execution) {
-  return upload_cuda_routes(routes, top_k, context, execution);
 }
 
 std::uint64_t CudaRouteInput::num_tokens() const {
@@ -1111,8 +1138,7 @@ CudaRouteInput import_selected_expert_routes(
       consumer_context.calling_rank() >= consumer_context.session().world_size() ||
       source.producer_session.stable_identity_bytes() !=
           consumer_context.session().stable_identity_bytes() ||
-      (!source.test_pipeline_handoff &&
-       source.generation != consumer_context.session().generation()))
+      source.generation != consumer_context.session().generation())
     invalid("phase=route-stream-handoff, field=session/generation/execution, rank=" +
             std::to_string(consumer_context.calling_rank()) +
             ", expected=matching immutable producer provenance, actual=mismatch");
@@ -1135,6 +1161,81 @@ CudaRouteInput import_selected_expert_routes(
   return CudaRouteInput(std::move(impl));
 }
 
+CudaRouteInput DeviceRouteProvenanceBridge::reissue_for_testing(
+    const CudaRouteInput &storage, const RankCollectiveContext &context,
+    const CudaExecution &execution) {
+  if (!storage.impl_ || !context || !execution)
+    invalid("phase=test-route-reissue, field=input, rank=n/a, "
+            "expected=valid private storage/context/execution, actual=empty");
+  const auto &source = *storage.impl_;
+  if (!context.execution().same_instance(execution.token()) ||
+      !source.producer_execution.same_instance(execution.token()) ||
+      source.producer_session.stable_identity_bytes() !=
+          context.session().stable_identity_bytes() ||
+      source.device != execution.device_ordinal() || !source.ready_recorded ||
+      !source.allocation || !source.allocation->producer_ready)
+    invalid("phase=test-route-reissue, field=provenance, rank=" +
+            std::to_string(context.calling_rank()) +
+            ", expected=same immutable storage pipeline/execution/device, "
+            "actual=mismatch");
+  auto impl = std::make_shared<CudaRouteInput::Impl>(source);
+  impl->producer_session = context.session();
+  impl->generation = context.session().generation();
+  return CudaRouteInput(std::move(impl));
+}
+
+CudaRouteInput DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
+    const CudaRouteInput &storage, std::int32_t first_expert,
+    std::uint64_t delay_cycles, const RankCollectiveContext &context,
+    const CudaExecution &producer_execution, bool record_ready) {
+  auto exact = reissue_for_testing(storage, context, producer_execution);
+  auto impl = std::make_shared<CudaRouteInput::Impl>(*exact.impl_);
+  auto exec = internal::checked_execution_state(producer_execution);
+  const auto bytes = checked_size(
+      checked_mul(impl->routes, sizeof(std::int32_t), "test delayed routes"),
+      "test delayed routes");
+  if (bytes != 0) {
+    internal::throw_cuda(
+        "test-route-producer", cudaMemset(
+            const_cast<void *>(impl->device_ptr), 0xff, bytes),
+        context.calling_rank(), context.session().world_size(),
+        context.session().identity(), context.session().generation(),
+        ExchangeKind::ExpertCounts, "cudaMemset(route poison)");
+    const auto blocks = static_cast<unsigned int>((impl->routes + 127U) / 128U);
+    delayed_route_fill_kernel<<<blocks, 128, 0, exec->stream>>>(
+        static_cast<std::int32_t *>(const_cast<void *>(impl->device_ptr)),
+        impl->routes, first_expert, delay_cycles);
+    internal::throw_cuda(
+        "test-route-producer", cudaGetLastError(), context.calling_rank(),
+        context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts,
+        "delayed route kernel launch");
+  }
+  impl->ready_recorded = false;
+  if (record_ready) {
+    internal::throw_cuda(
+        "test-route-producer",
+        cudaEventRecord(impl->allocation->producer_ready, exec->stream),
+        context.calling_rank(), context.session().world_size(),
+        context.session().identity(), context.session().generation(),
+        ExchangeKind::ExpertCounts, "cudaEventRecord(producer ready)");
+    impl->ready_recorded = true;
+  }
+  return CudaRouteInput(std::move(impl));
+}
+
+CudaRouteInput DeviceRouteProvenanceBridge::unsafe_import_without_wait_for_testing(
+    const CudaRouteInput &routes,
+    const RankCollectiveContext &consumer_context,
+    const CudaExecution &consumer_execution) {
+  if (!routes.impl_ || !consumer_context || !consumer_execution)
+    invalid("phase=test-route-import-no-wait, field=input, rank=n/a, "
+            "expected=valid, actual=empty");
+  auto impl = std::make_shared<CudaRouteInput::Impl>(*routes.impl_);
+  impl->consumer_execution = consumer_execution.token();
+  return CudaRouteInput(std::move(impl));
+}
+
 void DeviceRouteProvenanceBridge::validate(
     const CudaRouteInput &routes, const RankCollectiveContext &context,
     const CudaExecution &execution) {
@@ -1149,8 +1250,7 @@ void DeviceRouteProvenanceBridge::validate(
       !route.consumer_execution.same_instance(execution.token()) ||
       route.producer_session.stable_identity_bytes() !=
           context.session().stable_identity_bytes() ||
-      (!route.test_pipeline_handoff &&
-       route.generation != context.session().generation()) ||
+      route.generation != context.session().generation() ||
       !route.ready_recorded || !route.allocation ||
       !route.allocation->producer_ready ||
       required_bytes > route.allocation->device_bytes)
@@ -1334,6 +1434,8 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
                          "cudaEventCreate(consumer completion)");
     internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
     allocation.consumer_events.push_back(event);
+    allocation.consumer_event_states.push_back(
+        internal::ConsumerEventSlotState::Available);
   }
   auto impl = std::make_shared<CudaNotifyWorkspace::Impl>();
   impl->state = std::move(state);
@@ -1447,6 +1549,8 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
         "cudaEventCreate(pool consumer completion)");
     internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
     result->workspace->consumer_events.push_back(event);
+    result->workspace->consumer_event_states.push_back(
+        internal::ConsumerEventSlotState::Available);
   }
   return result;
 }
@@ -1585,6 +1689,32 @@ std::uint64_t DeviceNotifyPoolBridge::event_count(
   if (!allocation)
     return 0;
   return 6U + allocation->workspace->consumer_events.size();
+}
+
+bool DeviceNotifyPoolBridge::quarantined(
+    const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept {
+  if (!allocation || !allocation->workspace)
+    return true;
+  std::lock_guard<std::mutex> lock(allocation->workspace->consumer_mutex);
+  return allocation->workspace->dispatch_slot_quarantined.load(
+      std::memory_order_acquire);
+}
+
+std::array<std::uint32_t, 3> DeviceNotifyPoolBridge::consumer_event_usage(
+    const std::shared_ptr<CudaNotifyPoolAllocation> &allocation) noexcept {
+  std::array<std::uint32_t, 3> usage{};
+  if (!allocation || !allocation->workspace)
+    return usage;
+  std::lock_guard<std::mutex> lock(allocation->workspace->consumer_mutex);
+  for (const auto state : allocation->workspace->consumer_event_states) {
+    if (state == internal::ConsumerEventSlotState::Available)
+      ++usage[0];
+    else if (state == internal::ConsumerEventSlotState::InUse)
+      ++usage[1];
+    else
+      ++usage[2];
+  }
+  return usage;
 }
 
 struct CudaLocalNotifyHandle::Impl {
@@ -2053,7 +2183,9 @@ struct DeviceDispatchConsumerLease::Impl {
   DeviceDispatchKernelView kernel_view() const {
     if (!owner || state == DeviceDispatchConsumerState::Released ||
         !workspace || workspace->epoch != epoch ||
-        identity.generation != epoch)
+        identity.generation != epoch ||
+        workspace->allocation->dispatch_slot_quarantined.load(
+            std::memory_order_acquire))
       invalid("phase=dispatch-consumer-view, field=state, rank=n/a, "
               "expected=acquired/submitted, actual=empty/released");
     const auto &workspace_ref = *workspace;
@@ -2092,36 +2224,106 @@ struct DeviceDispatchConsumerLease::Impl {
     return view;
   }
 
-  void release_noexcept() noexcept {
+  void release_owner_noexcept(bool event_usable) noexcept {
     if (!owner || state == DeviceDispatchConsumerState::Released)
       return;
     auto workspace_owner = workspace;
-    bool drained = true;
-    if (state == DeviceDispatchConsumerState::Submitted) {
-      (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
-      drained = cudaEventSynchronize(
-                    workspace_owner->allocation->consumer_events[event_index]) ==
-                cudaSuccess;
-      if (!drained) {
-        try {
-          auto exec = internal::checked_execution_state(execution);
-          drained = cudaStreamSynchronize(exec->stream) == cudaSuccess;
-        } catch (...) {
-          drained = false;
-        }
-      }
-      if (!drained)
-        workspace_owner->failed_consumer_hold = workspace_owner;
-    }
     {
-      std::lock_guard<std::mutex> lock(workspace_owner->consumer_mutex);
-      if (event_index < workspace_owner->consumer_in_use.size())
-        workspace_owner->consumer_in_use[event_index] = false;
+      std::lock_guard<std::mutex> lock(
+          workspace_owner->allocation->consumer_mutex);
+      if (event_index <
+          workspace_owner->allocation->consumer_event_states.size())
+        workspace_owner->allocation->consumer_event_states[event_index] =
+            event_usable ? internal::ConsumerEventSlotState::Available
+                         : internal::ConsumerEventSlotState::Quarantined;
     }
     state = DeviceDispatchConsumerState::Released;
     owner = {};
     device = {};
     workspace.reset();
+  }
+
+  bool drain_submitted_noexcept() noexcept {
+    auto workspace_owner = workspace;
+    (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
+    const bool injected_both = take_consumer_fault(
+        testing::ConsumerFaultPoint::EventAndStreamSynchronize);
+    const bool injected_event = injected_both || take_consumer_fault(
+        testing::ConsumerFaultPoint::EventSynchronize);
+    const bool event_ok = !injected_event &&
+        cudaEventSynchronize(
+            workspace_owner->allocation->consumer_events[event_index]) ==
+        cudaSuccess;
+    bool stream_ok = true;
+    if (!event_ok) {
+      stream_ok = false;
+      try {
+        auto exec = internal::checked_execution_state(execution);
+        stream_ok = !injected_both &&
+                    cudaStreamSynchronize(exec->stream) == cudaSuccess;
+      } catch (...) {
+        stream_ok = false;
+      }
+    }
+    if (!event_ok && !stream_ok) {
+      std::lock_guard<std::mutex> lock(
+          workspace_owner->allocation->consumer_mutex);
+      workspace_owner->allocation->dispatch_slot_quarantined.store(
+          true, std::memory_order_release);
+    }
+    state = DeviceDispatchConsumerState::Completed;
+    release_owner_noexcept(event_ok);
+    return event_ok;
+  }
+
+  void record_completion() {
+    if (state != DeviceDispatchConsumerState::Acquired)
+      invalid("phase=dispatch-consumer-submit, field=state, rank=" +
+              std::to_string(identity.calling_rank) +
+              ", expected=Acquired, actual=invalid");
+    try {
+      if (take_consumer_fault(testing::ConsumerFaultPoint::EventRecord))
+        throw NotifyDispatchError(
+            NotifyErrorCode::CudaFailure,
+            "phase=dispatch-consumer-submit, field=event_record, rank=" +
+                std::to_string(identity.calling_rank) +
+                ", expected=success, actual=injected failure");
+      internal::throw_cuda(
+          "dispatch-consumer-submit",
+          cudaEventRecord(workspace->allocation->consumer_events[event_index],
+                          internal::checked_execution_state(execution)->stream),
+          identity.calling_rank, identity.world_size,
+          context.session().identity(), identity.generation,
+          ExchangeKind::ExpertCounts, "cudaEventRecord(consumer completion)");
+      state = DeviceDispatchConsumerState::Submitted;
+    } catch (...) {
+      bool stream_ok = false;
+      try {
+        stream_ok = cudaStreamSynchronize(
+                        internal::checked_execution_state(execution)->stream) ==
+                    cudaSuccess;
+      } catch (...) {
+        stream_ok = false;
+      }
+      if (!stream_ok) {
+        std::lock_guard<std::mutex> lock(
+            workspace->allocation->consumer_mutex);
+        workspace->allocation->dispatch_slot_quarantined.store(
+            true, std::memory_order_release);
+      }
+      release_owner_noexcept(false);
+      throw;
+    }
+  }
+
+  void release_noexcept() noexcept {
+    if (!owner || state == DeviceDispatchConsumerState::Released)
+      return;
+    if (state == DeviceDispatchConsumerState::Submitted) {
+      (void)drain_submitted_noexcept();
+      return;
+    }
+    release_owner_noexcept(true);
   }
 };
 
@@ -2652,13 +2854,18 @@ DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
   auto workspace = impl_->workspace;
   std::size_t event_index = SIZE_MAX;
   {
-    std::lock_guard<std::mutex> lock(workspace->consumer_mutex);
-    if (workspace->consumer_in_use.empty())
-      workspace->consumer_in_use.assign(
-          workspace->allocation->consumer_events.size(), false);
-    for (std::size_t i = 0; i < workspace->consumer_in_use.size(); ++i) {
-      if (!workspace->consumer_in_use[i]) {
-        workspace->consumer_in_use[i] = true;
+    std::lock_guard<std::mutex> lock(workspace->allocation->consumer_mutex);
+    if (workspace->allocation->dispatch_slot_quarantined.load(
+            std::memory_order_acquire))
+      invalid("phase=dispatch-consumer-acquire, field=slot_state, rank=" +
+              std::to_string(id.calling_rank) +
+              ", expected=usable, actual=Quarantined");
+    for (std::size_t i = 0;
+         i < workspace->allocation->consumer_event_states.size(); ++i) {
+      if (workspace->allocation->consumer_event_states[i] ==
+          internal::ConsumerEventSlotState::Available) {
+        workspace->allocation->consumer_event_states[i] =
+            internal::ConsumerEventSlotState::InUse;
         event_index = i;
         break;
       }
@@ -2678,8 +2885,9 @@ DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
         id.generation, ExchangeKind::ExpertCounts,
         "cudaStreamWaitEvent(notify completion)");
   } catch (...) {
-    std::lock_guard<std::mutex> lock(workspace->consumer_mutex);
-    workspace->consumer_in_use[event_index] = false;
+    std::lock_guard<std::mutex> lock(workspace->allocation->consumer_mutex);
+    workspace->allocation->consumer_event_states[event_index] =
+        internal::ConsumerEventSlotState::Available;
     throw;
   }
   auto consumer = std::make_shared<DeviceDispatchConsumerLease::Impl>();
@@ -2720,17 +2928,15 @@ void DeviceDispatchConsumerLease::finish() {
   if (!impl_ || impl_->state == DeviceDispatchConsumerState::Released)
     invalid("phase=dispatch-consumer-finish, field=state, rank=n/a, "
             "expected=acquired/submitted, actual=empty/released");
-  auto workspace = impl_->workspace;
   if (impl_->state == DeviceDispatchConsumerState::Submitted) {
     const auto &id = impl_->identity;
-    internal::throw_cuda(
-        "dispatch-consumer-finish",
-        cudaEventSynchronize(
-            workspace->allocation->consumer_events[impl_->event_index]),
-        id.calling_rank, id.world_size,
-        impl_->context.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "cudaEventSynchronize(consumer)");
-    impl_->state = DeviceDispatchConsumerState::Completed;
+    if (!impl_->drain_submitted_noexcept())
+      throw NotifyDispatchError(
+          NotifyErrorCode::CudaFailure,
+          "phase=dispatch-consumer-finish, field=consumer_event, rank=" +
+              std::to_string(id.calling_rank) +
+              ", expected=synchronized, actual=CUDA event failure; event quarantined");
+    return;
   }
   impl_->release_noexcept();
 }
@@ -2778,17 +2984,18 @@ public:
           ExchangeKind::ExpertCounts, "D2H consumer probe");
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                                 sizeof(std::uint64_t));
-      internal::throw_cuda(
-          "dispatch-test-submit",
-          cudaEventRecord(
-              workspace->allocation->consumer_events[impl.event_index],
-              exec->stream),
-          view.identity.calling_rank, view.identity.world_size,
-          impl.context.session().identity(), view.identity.generation,
-          ExchangeKind::ExpertCounts, "cudaEventRecord(consumer probe)");
-      impl.state = DeviceDispatchConsumerState::Submitted;
+      impl.record_completion();
     } catch (...) {
-      (void)cudaStreamSynchronize(exec->stream);
+      if (impl.owner) {
+        const bool stream_ok = cudaStreamSynchronize(exec->stream) == cudaSuccess;
+        if (!stream_ok) {
+          std::lock_guard<std::mutex> lock(
+              workspace->allocation->consumer_mutex);
+          workspace->allocation->dispatch_slot_quarantined.store(
+              true, std::memory_order_release);
+        }
+        impl.release_owner_noexcept(false);
+      }
       throw;
     }
   }
@@ -2973,16 +3180,7 @@ DispatchHandle download_device_metadata_for_validation(
   auto result = DeviceNotifyBridge::make_validation_dispatch(
       std::move(metadata));
   validate_dispatch_metadata(result);
-  internal::throw_cuda(
-      "device-validation-download",
-      cudaEventRecord(
-          consumer.impl_->workspace->allocation->consumer_events[
-              consumer.impl_->event_index],
-          exec->stream),
-      impl.identity.calling_rank, impl.identity.world_size,
-      impl.context.session().identity(), impl.identity.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(consumer completion)");
-  consumer.impl_->state = DeviceDispatchConsumerState::Submitted;
+  consumer.impl_->record_completion();
   consumer.finish();
   return result;
 }

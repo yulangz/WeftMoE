@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -43,6 +44,12 @@ struct NcclSessionState final : BackendSessionState {
   ~NcclSessionState() noexcept override;
 };
 
+enum class ConsumerEventSlotState : std::uint8_t {
+  Available,
+  InUse,
+  Quarantined,
+};
+
 struct CudaAllocation {
   std::uint32_t device = 0;
   void *device_ptr = nullptr;
@@ -56,6 +63,10 @@ struct CudaAllocation {
   cudaEvent_t producer_ready = nullptr;
   cudaEvent_t completion = nullptr;
   std::vector<cudaEvent_t> consumer_events;
+  mutable std::mutex consumer_mutex;
+  std::vector<ConsumerEventSlotState> consumer_event_states;
+  std::atomic<bool> dispatch_slot_quarantined{false};
+  bool abandon_on_teardown = false;
   ~CudaAllocation() noexcept;
 };
 
