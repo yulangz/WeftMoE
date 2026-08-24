@@ -384,6 +384,9 @@ struct NcclAllGatherCountExchange::Impl {
   std::unique_ptr<Slot> summary;
   std::uint64_t agreed_expert_width = 0;
   std::uint64_t agreed_summary_width = 0;
+  ConfigWire verified_config;
+  std::uint64_t verified_expert_width = 0;
+  std::uint64_t verified_summary_width = 0;
   std::mutex mutex;
   enum class ProtocolState {
     ControlReady,
@@ -829,6 +832,11 @@ ValidatedConfigHandle NcclConfigOperation::wait() {
     impl_->backend->agreed_expert_width =
         impl_->headers.front().expert_row_width;
     impl_->backend->agreed_summary_width =
+        impl_->headers.front().summary_row_width;
+    impl_->backend->verified_config = impl_->input;
+    impl_->backend->verified_expert_width =
+        impl_->headers.front().expert_row_width;
+    impl_->backend->verified_summary_width =
         impl_->headers.front().summary_row_width;
     impl_->backend->protocol =
         NcclAllGatherCountExchange::Impl::ProtocolState::DataReady;
@@ -1284,6 +1292,42 @@ NcclConfigOperation NcclAllGatherCountExchange::start_config(
   operation->slot = impl_->config.get();
   operation->collective_width = collective_width;
   return NcclConfigOperation(std::move(operation));
+}
+
+bool NcclAllGatherCountExchange::can_reuse_verified_config(
+    const ConfigWire &wire) const {
+  if (!impl_)
+    return false;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return !impl_->verified_config.empty() && impl_->verified_config == wire;
+}
+
+void NcclAllGatherCountExchange::reuse_verified_config(
+    const RankCollectiveContext &context, const ConfigWire &wire,
+    const ValidatedControlHandle &control) {
+  if (!impl_ || !context || !control)
+    invalid("phase=config-cache, field=input, rank=n/a, expected=valid, actual=empty");
+  const auto rank = context.calling_rank();
+  if (!context.session().same_instance(impl_->session.session()) ||
+      !context.execution().same_instance(impl_->execution.token()) ||
+      !control.context().same_instance(context))
+    invalid("phase=config-cache, field=provenance, rank=" +
+            std::to_string(rank) + ", expected=exact, actual=mismatch");
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->protocol != Impl::ProtocolState::ConfigReady ||
+      impl_->verified_config.empty() || impl_->verified_config != wire ||
+      control.matrix().empty() ||
+      control.matrix().front().expert_row_width !=
+          impl_->verified_expert_width ||
+      control.matrix().front().summary_row_width !=
+          impl_->verified_summary_width)
+    invalid("phase=config-cache, field=verified_config, rank=" +
+            std::to_string(rank) +
+            ", expected=setup-verified exact bytes/widths, actual=mismatch");
+  impl_->agreed_expert_width = impl_->verified_expert_width;
+  impl_->agreed_summary_width = impl_->verified_summary_width;
+  impl_->protocol = Impl::ProtocolState::DataReady;
+  ++impl_->audit.config_cache_hits;
 }
 
 CollectiveProtocolAudit NcclAllGatherCountExchange::audit() const {
@@ -1996,9 +2040,20 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       config_wire[offset] ^= std::byte{1};
   }
 
+#if MEGAMOE_DEBUG_VALIDATE
   auto config = impl_->backend->start_config(impl_->context, config_wire,
                                              control_done);
   (void)config.wait();
+#else
+  if (impl_->backend->can_reuse_verified_config(config_wire)) {
+    impl_->backend->reuse_verified_config(impl_->context, config_wire,
+                                          control_done);
+  } else {
+    auto config = impl_->backend->start_config(impl_->context, config_wire,
+                                               control_done);
+    (void)config.wait();
+  }
+#endif
   const auto control_config_end = std::chrono::steady_clock::now();
   const auto coordinator_create = impl_->setup.coordinator_backend_create_us;
   const auto initial_total = impl_->setup.per_generation_setup_total_us;
@@ -2061,14 +2116,16 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       &materialize_timings);
   const auto materialize_end = std::chrono::steady_clock::now();
   const auto audit_value = impl_->backend->audit();
-  if (audit_value.control_starts != 1 || audit_value.config_starts != 1 ||
+  if (audit_value.control_starts != 1 ||
+      audit_value.config_starts + audit_value.config_cache_hits != 1 ||
       audit_value.expert_count_starts != 1 ||
       audit_value.packet_summary_starts != 1)
     invalid("phase=generation-publish, field=audit, rank=" +
             std::to_string(impl_->session.rank()) +
             ", expected=1/1/1/1, actual=" +
             std::to_string(audit_value.control_starts) + "/" +
-            std::to_string(audit_value.config_starts) + "/" +
+            std::to_string(audit_value.config_starts) + "+cache=" +
+            std::to_string(audit_value.config_cache_hits) + "/" +
             std::to_string(audit_value.expert_count_starts) + "/" +
             std::to_string(audit_value.packet_summary_starts));
   auto result = std::make_shared<ValidatedCudaGeneration::Impl>();

@@ -196,6 +196,10 @@ public:
   NcclConfigOperation start_config(const RankCollectiveContext &,
                                    const ConfigWire &,
                                    const ValidatedControlHandle &);
+  bool can_reuse_verified_config(const ConfigWire &) const;
+  void reuse_verified_config(const RankCollectiveContext &,
+                             const ConfigWire &,
+                             const ValidatedControlHandle &);
   CollectiveProtocolAudit audit() const;
   NcclWorkspaceUsage workspace_usage() const;
   void prepare_generation(const NcclSession &);

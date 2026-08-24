@@ -244,34 +244,63 @@ reimplements mapping and BF16 reduction.
 
 `cuda-p2p-bench` launches eight independent rank processes with real CUDA IPC
 mappings. For `tokens/rank=8192`, `hidden=7168`, `top-k=6`, it uses 10 warmups
-and 50 measured iterations. Each iteration is reduced to the slowest rank
-before statistics are computed. Worker spans overlap by design (relay and
-synthetic return progress concurrently), so stage spans do not sum to total.
+and 100 measured iterations in the release build. Each iteration is reduced to
+the slowest rank before statistics are computed. Relay and synthetic return are
+one fused destination phase.
 
 | span | mean (us) | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| dispatch put | 175406.52 | 175405 | 175605 | 175156 | 175636 |
-| relay | 224831.42 | 224787 | 224964 | 224689 | 225007 |
-| synthetic return | 417737.06 | 417773 | 418050 | 417336 | 418107 |
-| expert-order combine/reduce | 8794.23 | 8793.76 | 8796.83 | 8790.85 | 8800.13 |
-| transport steady total | 426695.44 | 426735 | 427007 | 426294 | 427066 |
+| direct dispatch put | 1842.53 | 1842.46 | 1844.51 | 1840.13 | 1846.14 |
+| fused relay + synthetic return | 2126.12 | 2125.70 | 2153.18 | 2094.18 | 2162.98 |
+| expert-order FP32 reduce | 488.59 | 488.54 | 489.47 | 487.68 | 489.98 |
+| transport steady total | 4473.00 | 4472.29 | 4499.26 | 4439.52 | 4512.38 |
 
-Slowest-rank one-time pool/backend setup was 935156 us. Each rank's single-slot
-pool owns 3,089,435,048 device bytes and 168 pinned bytes. Raw six-route traffic
-is 704,643,072 bytes/rank; node-deduplicated proxy ingress is 117,440,512
-bytes/rank (6x reduction). The measured no-wrap capacity path had zero credit
-stalls and peak observed occupancy 1 because consumers kept pace with the
-published sequence watermark. `P2P_BENCH_JSON` contains the per-rank traffic,
-workspace, stall/occupancy, and slowest-rank distributions.
+Slowest-rank one-time pool/backend setup was 1391350 us. Each rank's single-slot
+pool owns 3,092,974,032 device bytes and 208 pinned bytes. Logical six-route
+traffic is 704,643,072 bytes/rank and logical node-dedup traffic is 117,440,512
+bytes/rank, but actual remote-GPU fan-out is 616,562,688 bytes in dispatch plus
+616,562,688 bytes in return per rank. Aggregate bidirectional effective peer
+bandwidth is 2205.46 GB/s (275.68 GB/s per rank). Credit stalls are zero because
+the trusted release path uses phase-batched completion instead of the debug
+ring. `P2P_BENCH_JSON` reports all values separately.
 
-The remote clean archive reproduced the same 10+50 benchmark with steady total
-mean/P50/P95/min/max of 432377.22/432356/432570/432127/432676 us and the same
-traffic/workspace cardinalities.
+The prior one-CTA serialized baseline was 426695.44 us mean. Bulk all-SM grids,
+direct canonical writes and per-peer phase signals reduce it by 98.95% (about
+95.4x). This remains CUDA IPC/NVLink—not GIN/RDMA or Socket transport.
 
-This correctness-first result is substantially slower than the earlier device
-simulation and is not presented as final transport performance. Profiling
-points to serialized source-CTA packet relay and small-route peer stores as the
-next optimization target; it does not justify a GIN/RDMA claim.
+### Megatron-Core comparable baseline
+
+`benchmarks/megatron_dispatch_baseline.py` runs Megatron-Core 0.17.0's actual
+`MoEAlltoAllTokenDispatcher` with the same world, BF16 shape, routing pattern
+and synchronization boundary. Its expert body is identity so the comparison is
+transport-only; `intermediate=3072` is recorded for the future FC benchmark.
+The installed PyTorch backend reports NCCL 2.27.5 while MegaMOE loads NCCL
+2.28.3; both versions and commands are emitted rather than hidden.
+
+For 10 warmups and 100 samples, routing/local permutation is 0.859 ms mean,
+dispatch AlltoAll 1.940 ms, combine 4.002 ms, and the identity-expert transport
+roundtrip 6.896 ms (P50 6.890, P95 6.937). MegaMOE's 4.473 ms synthetic
+transport is 35.1% faster at this boundary, exceeding the initial 15% target.
+This is not yet a full FC1/SwiGLU/FC2 forward/backward comparison.
+
+The same script also runs as a two-node `torchrun` job; it intentionally uses
+the distributed world rather than `LOCAL_WORLD_SIZE` when constructing the EP
+group. With 8 ranks/node, `NCCL_SOCKET_IFNAME=eth0`, `NCCL_IB_DISABLE=1`, 10
+warmups and 100 samples, the measured world-16 means were 0.902 ms routing,
+463.267 ms dispatch, 464.664 ms combine, and 919.151 ms identity transport
+roundtrip (P50 926.951, P95 1073.007 ms). The corresponding estimated payload
+rate was about 1.426 GB/s/direction/rank. This is a real Megatron cross-host
+Socket-NCCL baseline; MegaMOE does not yet implement cross-host activation
+transport, so no cross-host MegaMOE speedup is claimed.
+
+Example two-node invocation (run once per node with node rank 0/1):
+
+```bash
+NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
+  --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  benchmarks/megatron_dispatch_baseline.py
+```
 
 ### Device simulation (previous comparison point)
 
@@ -303,7 +332,7 @@ LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/loc
 ```
 
 The benchmark creates one session per rank once, reuses it for 10 warmups and
-50 measured iterations, and reports mean, P50, P95, min, and max. Names
+100 measured iterations, and reports mean, P50, P95, min, and max. Names
 distinguish one-time session setup, per-generation coordinator/backend and
 control/config/count/summary slot setup, and steady-state execution.
 `BENCH_JSON` carries the same categories. Workspace reporting includes the
@@ -314,30 +343,29 @@ Setup-inclusive E2E is calculated per rank as `rank_setup + rank_steady` before
 choosing the slowest rank. Mapping has no per-route copy, allocation, or
 synchronization.
 
-Schema 6 additionally reports `prefix_planning_us` (the existing checked
-prefix-plan kernel) separately from
+Schema 7 additionally reports `prefix_planning_us` (the parallel release
+prefix/packet plan or checked debug planner) separately from
 `remaining_parallel_materialization_us`. Both are measured with precreated
 CUDA events and remain components of `device_materialization_us`; observing
 them adds no steady-state event creation.
 
-On the inspected local 8-GPU L20X host, the pooled parallel coordinator
-produced these slowest-rank statistics (microseconds, 10 warmups/50 measured):
+On the inspected local 8-GPU L20X host, the release coordinator produced these
+slowest-rank statistics (microseconds, 10 warmups/100 measured):
 
 | stage | mean | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| one-time NCCL session setup | 1325100 | 1312250 | 1351720 | 1303210 | 1351720 |
-| one-time two-slot pool setup | 13352.6 | 13341.5 | 14204.3 | 11762.3 | 14204.3 |
-| per-generation setup (pool acquire) | 2.243 | 2.051 | 2.903 | 1.496 | 4.567 |
-| setup-inclusive generation end-to-end | 6857.58 | 6850.13 | 6920.50 | 6781.25 | 7248.20 |
-| steady-state execution | 6855.91 | 6848.03 | 6918.36 | 6779.68 | 7246.86 |
-| local stable mapping | 143.139 | 142.976 | 148.832 | 138.016 | 149.856 |
-| control + exact config | 858.642 | 864.025 | 920.505 | 794.969 | 1058.21 |
-| expert-count AllGather | 35.030 | 32.099 | 52.659 | 27.869 | 92.696 |
-| packet-summary AllGather | 22.983 | 21.874 | 27.716 | 20.680 | 58.164 |
-| parallel device materialization | 5697.89 | 5693.38 | 5722.69 | 5684.20 | 5848.47 |
-| prefix planning (component) | 5574.66 | 5573.63 | 5580.70 | 5566.88 | 5582.91 |
-| remaining parallel stages (component) | 37.296 | 37.248 | 38.016 | 36.608 | 38.112 |
-| pool acquire + final release/drain | 20.311 | 18.863 | 28.502 | 15.861 | 43.904 |
+| one-time NCCL session setup | 1597360 | 1630280 | 1703040 | 1349080 | 1703040 |
+| one-time two-slot pool setup | 13017.1 | 13415.2 | 14112.8 | 10011.8 | 14112.8 |
+| per-generation setup | 2.979 | 2.778 | 4.197 | 1.909 | 7.729 |
+| setup-inclusive generation E2E | 1227.07 | 1224.86 | 1310.28 | 1121.77 | 1436.93 |
+| steady-state execution | 1224.28 | 1221.53 | 1307.60 | 1118.57 | 1434.25 |
+| local stable mapping | 145.458 | 144.320 | 155.040 | 138.848 | 168.480 |
+| control + cached config | 604.122 | 607.244 | 661.279 | 499.345 | 730.954 |
+| expert-count AllGather | 171.921 | 173.537 | 234.506 | 106.330 | 276.773 |
+| packet-summary AllGather | 24.889 | 23.259 | 29.699 | 21.309 | 65.463 |
+| device materialization | 234.756 | 229.908 | 243.745 | 218.326 | 465.049 |
+| prefix planning component | 104.506 | 102.176 | 108.192 | 99.904 | 206.336 |
+| remaining parallel stages | 37.308 | 37.248 | 37.728 | 36.864 | 40.736 |
 
 For `max_inflight_generations=2`, the corresponding complete unique workspace
 was 42,624,126 device bytes and 78,992 pinned bytes: route input 589,824
@@ -358,19 +386,48 @@ Across ten pooled steady generations, CUDA API audit measured
 `cudaMalloc/cudaFree/cudaHostAlloc/cudaFreeHost/cudaEventCreate*/`
 `cudaEventDestroy/cudaDeviceSynchronize = 0` for every category. The local
 ten-generation audit recorded bounded H2D/D2H/D2D traffic as
-8,480/8,640/0 bytes; validation download was outside the interval. The new
-events expose that prefix planning accounts for about 5.575 ms, while the
-remaining parallel stages account for about 0.037 ms. Compared with 6.824 ms,
-the 6.856 ms steady mean is a 0.5% shift, not an unexplained material
-regression. Parallelizing the checked planning scan remains the next
-optimization.
+8,480/8,640/0 bytes; validation download was outside the interval. Parallel
+one-block-per-expert reductions and deterministic node block scans reduce
+planning from 5.575 ms to 0.105 ms and complete materialization from 5.698 ms
+to 0.235 ms. The 1.224 ms Notify steady mean is 82.1% below the prior 6.856 ms
+baseline.
 
 The earlier approximately 197 ms number is not a comparable regression point:
 that runner rebuilt communicators every iteration and computed steady time by
 subtracting independently selected slowest-rank maxima. The corrected 98.0 ms
 mean used one reused session and same-rank accounting. Both the 38.0 ms serial
-device result and the new 6.82 ms pooled-parallel result use that corrected
-same-rank definition.
+device result, the 6.82 ms pooled-parallel result, and the 1.224 ms release
+result use that corrected same-rank definition.
+
+### Profiler evidence
+
+Nsight Compute 2025.2.1 is available on the inspected host; Nsight Systems is
+not installed. The exact-shape, single-rank NCU run used the release binary and
+the same materialization kernels as world 8:
+
+```bash
+ncu --target-processes all --set basic \
+  --kernel-name 'regex:materialize_.*_kernel' --launch-count 11 \
+  --csv --log-file build/ncu_notify_mainshape.csv \
+  build/test_cuda_notify --bench 1
+```
+
+NCU reported 6.176 us for the 384-block expert-prefix kernel (30.9% achieved
+occupancy), 5.952 us for parallel finalization, and 118.080 us for the
+deterministic token/node packet scan. Route, incoming-row, M-tile and fan-out
+kernels were 5.984, 4.160, 13.920 and 12.704 us respectively. The packet scan,
+not the former serial expert prefix, is now the largest materialization kernel.
+
+The real two-process IPC trace profiled the release bulk kernels. For its small
+oracle fixture, bulk dispatch and return were 114--132 us and 109--115 us;
+phase publication (system fence plus peer signal) was about 109 us, waits about
+5 us, and reduce 4.8 us under instrumentation. On the uninstrumented main
+world-8 workload the CUDA-event spans above are authoritative. There are no
+per-route system atomics or credit spins in the trusted phase-batched path;
+the measured credit-stall counter is zero. NCU's local DRAM percentage does
+not account for peer-fabric stores, so peer bytes divided by event time is used
+for explicitly labeled effective NVLink/P2P bandwidth rather than treating
+that metric as HBM bandwidth.
 
 ## Clean export
 

@@ -669,7 +669,9 @@ void test_fault_injection() {
       auto recovered = recovery.run({config, {1, {0, 1, 2}}, 10});
       require(recovered &&
                   recovery.audit().control_starts == 1 &&
-                  recovery.audit().config_starts == 1 &&
+                  recovery.audit().config_starts +
+                          recovery.audit().config_cache_hits ==
+                      1 &&
                   recovery.audit().expert_count_starts == 1 &&
                   recovery.audit().packet_summary_starts == 1,
               "pooled fault did not recover on the same communicator");
@@ -1915,11 +1917,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                             ? (benchmark_rounds_text
                                    ? static_cast<std::uint32_t>(
                                          std::stoul(benchmark_rounds_text))
-                                   : 60U)
+                                   : 110U)
                             : (rounds_text ? static_cast<std::uint32_t>(
                                                  std::stoul(rounds_text))
                                            : 1U);
     require(rounds > 0, "local P2P rounds must be positive");
+    require(!benchmark_p2p || rounds > 10,
+            "local P2P benchmark requires 10 warmups plus measurements");
     megamoe::cuda::DeviceActivationTransportHandle transported;
     megamoe::cuda::ActivationTransportValidationDownload downloaded;
     std::vector<megamoe::transport::BFloat16> baseline;
@@ -1936,7 +1940,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         run_options.deadline_after = std::chrono::seconds(120);
       transported = transport.run_synthetic(
           notify.dispatch(), activation, transport_config, run_options);
-      const auto warmup = benchmark_p2p && rounds >= 60U ? 10U : 0U;
+      const auto warmup = benchmark_p2p ? 10U : 0U;
       if (benchmark_p2p && round >= warmup) {
         total_samples.push_back(transported.timings().total_us);
         dispatch_samples.push_back(transported.timings().dispatch_put_us);
@@ -2000,6 +2004,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 << transported.audit().raw_cross_node_payload_bytes
                 << " dedup_bytes="
                 << transported.audit().deduplicated_cross_node_payload_bytes
+                << " actual_dispatch_peer_bytes="
+                << transported.audit().actual_dispatch_peer_bytes
+                << " actual_return_peer_bytes="
+                << transported.audit().actual_return_peer_bytes
                 << " stalls=" << transported.audit().credit_stalls
                 << " peak_ring=" << transported.audit().peak_ring_slots
                 << " total=";
@@ -2278,7 +2286,7 @@ void benchmark(std::uint32_t world) {
     }
   }
   constexpr std::size_t warmup = 10;
-  constexpr std::size_t measured = 50;
+  constexpr std::size_t measured = 100;
   std::vector<double> steady;
   std::vector<double> setup;
   std::vector<double> generation_end_to_end;
@@ -2414,7 +2422,8 @@ void benchmark(std::uint32_t world) {
   for (auto &samples : execution_stage_samples)
     execution_stage_stats.push_back(summarize(std::move(samples)));
   std::cout << "BENCH world=" << world
-            << " warmup=10 measured=50 aggregation=slowest-rank"
+            << " warmup=" << warmup << " measured=" << measured
+            << " aggregation=slowest-rank"
                " session_reused=true\n"
             << "  one_time_session_setup_us mean="
             << session_setup_stats.mean << " p50=" << session_setup_stats.p50
@@ -2454,8 +2463,9 @@ void benchmark(std::uint32_t world) {
               << " min=" << stats.minimum << " max=" << stats.maximum
               << '\n';
   }
-  std::cout << "BENCH_JSON {\"schema\":6,\"warmup\":10,\"measured\":50,"
-               "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
+  std::cout << "BENCH_JSON {\"schema\":7,\"warmup\":" << warmup
+            << ",\"measured\":" << measured << ','
+            << "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
                "\"session_setup_sample\":\"one establishment; samples are ranks\","
                "\"one_time_session_setup_us\":{\"mean\":"
             << session_setup_stats.mean << ",\"p50\":"

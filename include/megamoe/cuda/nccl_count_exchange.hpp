@@ -80,6 +80,7 @@ struct CollectiveProtocolAudit {
   std::uint64_t config_starts = 0;
   std::uint64_t expert_count_starts = 0;
   std::uint64_t packet_summary_starts = 0;
+  std::uint64_t config_cache_hits = 0;
 };
 
 struct NcclWorkspaceUsage {
@@ -204,8 +205,9 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
     const NcclSession &base_session, const CudaExecution &execution,
     DeviceNotifyResourcePoolConfig config);
 
-// A successful result can only be published after the exact sequence
-// control/config/count/summary has completed once each.
+// A successful result can only be published after control, an exact config
+// agreement (or a release-mode hit on the session's already-validated config),
+// count, and summary complete in that order.
 class ValidatedCudaGeneration {
 public:
   ValidatedCudaGeneration() = default;

@@ -492,7 +492,8 @@ __device__ std::uint32_t rank_at_coordinate(const DeviceMaterializeArgs &a,
 
 // Small checked planning phase. It establishes all variable output sizes and
 // canonical prefixes before any parallel writer uses them as indices.
-__global__ void materialize_prefix_plan_kernel(DeviceMaterializeArgs a) {
+[[maybe_unused]] __global__ void
+materialize_prefix_plan_kernel(DeviceMaterializeArgs a) {
   if (blockIdx.x != 0 || threadIdx.x != 0)
     return;
   *a.status = DeviceMaterializationStatus{};
@@ -642,43 +643,292 @@ __global__ void materialize_prefix_plan_kernel(DeviceMaterializeArgs a) {
     ++owned_index;
   }
 
-  const auto source_local = a.rank_to_local[a.rank];
-  std::uint64_t packet_index = 0;
-  std::uint64_t fanout_index = 0;
-  a.packet_fanout_offsets[0] = 0;
-  for (std::uint32_t node = 0; node < a.nodes; ++node) {
-    const auto proxy = rank_at_coordinate(a, node, source_local);
-    std::uint64_t sequence = 0;
-    for (std::uint64_t token = 0; token < a.tokens; ++token) {
-      const auto present =
-          (a.masks[token * a.mask_words + node / 64U] >> (node % 64U)) & 1U;
-      if (!present)
-        continue;
-      a.packet_headers[packet_index] = DevicePacketHeaderRecord{
-          sequence++, token, a.rank, node, proxy, 0};
-      const auto base = token * a.top_k;
-      for (std::uint32_t position = 0; position < a.top_k; ++position) {
-        const auto slot = a.combine_order[base + position];
-        const auto route = base + slot;
-        if (a.route_dst_node[route] != node)
-          continue;
-        ++fanout_index;
-      }
-      a.packet_fanout_offsets[++packet_index] = fanout_index;
+}
+
+// Packet order is node-major and then token-major. One block owns a complete
+// destination node, so a deterministic block scan can compact token flags and
+// fan-out counts without atomics or a serial route walk. The per-node bases are
+// derived from immutable histogram/summary rows and therefore do not depend on
+// block scheduling.
+__global__ void materialize_packet_plan_kernel(DeviceMaterializeArgs a) {
+  constexpr std::uint32_t kThreads = 256;
+  using BlockScan = cub::BlockScan<unsigned long long, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ unsigned long long packet_carry;
+  __shared__ unsigned long long fanout_carry;
+  __shared__ unsigned long long chunk_packet_base;
+  __shared__ unsigned long long chunk_fanout_base;
+  __shared__ unsigned long long packet_base;
+  __shared__ unsigned long long fanout_base;
+  __shared__ std::uint32_t proxy_rank;
+
+  const auto node = static_cast<std::uint32_t>(blockIdx.x);
+  if (node >= a.nodes || a.status->error != 0)
+    return;
+  if (threadIdx.x == 0) {
+    packet_base = 0;
+    fanout_base = 0;
+    packet_carry = 0;
+    fanout_carry = 0;
+    for (std::uint32_t prior = 0; prior < node; ++prior)
+      packet_base += a.local_summary[prior];
+    for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
+      const auto destination = a.expert_to_rank[expert];
+      if (a.rank_to_node[destination] < node)
+        fanout_base += a.local_histogram[expert];
+    }
+    proxy_rank = rank_at_coordinate(a, node, a.rank_to_local[a.rank]);
+  }
+  __syncthreads();
+
+  for (std::uint64_t chunk = 0; chunk < a.tokens; chunk += kThreads) {
+    const auto token = chunk + threadIdx.x;
+    unsigned long long present = 0;
+    unsigned long long fanouts = 0;
+    if (token < a.tokens) {
+      present = static_cast<unsigned long long>(
+          (a.masks[token * a.mask_words + node / 64U] >> (node % 64U)) & 1U);
+      const auto route_base = token * a.top_k;
+      for (std::uint32_t slot = 0; slot < a.top_k; ++slot)
+        fanouts += a.route_dst_node[route_base + slot] == node ? 1ULL : 0ULL;
+    }
+
+    unsigned long long packet_prefix = 0;
+    unsigned long long packet_aggregate = 0;
+    BlockScan(scan_storage).ExclusiveSum(present, packet_prefix,
+                                         packet_aggregate);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      chunk_packet_base = packet_carry;
+      packet_carry += packet_aggregate;
+    }
+    __syncthreads();
+
+    unsigned long long fanout_prefix = 0;
+    unsigned long long fanout_aggregate = 0;
+    BlockScan(scan_storage).ExclusiveSum(fanouts, fanout_prefix,
+                                         fanout_aggregate);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      chunk_fanout_base = fanout_carry;
+      fanout_carry += fanout_aggregate;
+    }
+    __syncthreads();
+
+    if (present != 0) {
+      const auto packet = packet_base + chunk_packet_base + packet_prefix;
+      const auto fanout = fanout_base + chunk_fanout_base + fanout_prefix;
+      a.packet_headers[packet] = DevicePacketHeaderRecord{
+          chunk_packet_base + packet_prefix, token, a.rank, node, proxy_rank,
+          0};
+      a.packet_fanout_offsets[packet] = fanout;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0 && node + 1U == a.nodes)
+    a.packet_fanout_offsets[packet_base + packet_carry] =
+        fanout_base + fanout_carry;
+}
+
+__device__ void materialization_fail_once(DeviceMaterializationStatus *status,
+                                          MaterializationError error,
+                                          std::uint64_t field,
+                                          std::uint64_t expected,
+                                          std::uint64_t actual) {
+  if (atomicCAS(&status->error, 0ULL,
+                static_cast<unsigned long long>(error)) == 0ULL) {
+    status->field = field;
+    status->expected = expected;
+    status->actual = actual;
+  }
+}
+
+[[maybe_unused]] __global__ void
+materialize_plan_init_kernel(DeviceMaterializeArgs a) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *a.status = DeviceMaterializationStatus{};
+    if (a.top_k == 0 || a.max_tokens > ~std::uint64_t{0} / a.top_k) {
+      materialization_fail_once(a.status,
+                                MaterializationError::ArithmeticOverflow, 1,
+                                ~std::uint64_t{0}, a.max_tokens);
+      return;
+    }
+    const auto max_routes = a.max_tokens * a.top_k;
+    if (a.world != 0 && max_routes > ~std::uint64_t{0} / a.world)
+      materialization_fail_once(a.status,
+                                MaterializationError::ArithmeticOverflow, 2,
+                                ~std::uint64_t{0}, max_routes);
+  }
+}
+
+[[maybe_unused]] __global__ void
+materialize_expert_totals_kernel(DeviceMaterializeArgs a) {
+  const auto expert = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (expert >= a.experts || a.status->error != 0)
+    return;
+  if (a.top_k == 0 || a.max_tokens > ~std::uint64_t{0} / a.top_k) {
+    materialization_fail_once(a.status,
+                              MaterializationError::ArithmeticOverflow, 1,
+                              ~std::uint64_t{0}, a.max_tokens);
+    return;
+  }
+  const auto max_routes = a.max_tokens * a.top_k;
+  std::uint64_t total = 0;
+  for (std::uint32_t source = 0; source < a.world; ++source) {
+    const auto value = a.count_matrix[
+        static_cast<std::uint64_t>(source) * a.experts + expert];
+    if (value > max_routes || value > ~std::uint64_t{0} - total) {
+      materialization_fail_once(
+          a.status, value > max_routes
+                        ? MaterializationError::InvalidCollectiveValue
+                        : MaterializationError::ArithmeticOverflow,
+          expert, max_routes, value);
+      return;
+    }
+    if (source == a.rank && value != a.local_histogram[expert]) {
+      materialization_fail_once(a.status,
+                                MaterializationError::CountRowMismatch,
+                                expert, a.local_histogram[expert], value);
+      return;
+    }
+    total += value;
+  }
+  if (a.has_expert_capacity && total > a.expert_capacity[expert]) {
+    materialization_fail_once(a.status, MaterializationError::ExpertCapacity,
+                              expert, a.expert_capacity[expert], total);
+    return;
+  }
+  a.expert_total[expert] = total;
+}
+
+[[maybe_unused]] __global__ void
+materialize_expert_prefix_kernel(DeviceMaterializeArgs a) {
+  constexpr std::uint32_t kThreads = 256;
+  using BlockReduce = cub::BlockReduce<unsigned long long, kThreads>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  const auto expert = static_cast<std::uint32_t>(blockIdx.x);
+  if (expert >= a.experts || a.status->error != 0)
+    return;
+  const auto owner = a.expert_to_rank[expert];
+  unsigned long long destination_partial = 0;
+  unsigned long long owned_prefix_partial = 0;
+  unsigned long long tile_prefix_partial = 0;
+  unsigned long long owned_index_partial = 0;
+  for (std::uint32_t prior = threadIdx.x; prior < expert;
+       prior += kThreads) {
+    if (a.expert_to_rank[prior] == owner)
+      destination_partial += a.expert_total[prior];
+    if (a.expert_to_rank[prior] == a.rank) {
+      ++owned_index_partial;
+      owned_prefix_partial += a.expert_total[prior];
+      const auto count = a.expert_total[prior];
+      tile_prefix_partial += count / a.m_tile + (count % a.m_tile != 0);
     }
   }
 
-  if (packet_index != packets) {
-    materialization_fail(a.status, MaterializationError::OutputCapacity, 11,
-                         packets, packet_index);
-    return;
+  const auto destination_prefix =
+      BlockReduce(reduce_storage).Sum(destination_partial);
+  __syncthreads();
+  const auto owned_prefix =
+      BlockReduce(reduce_storage).Sum(owned_prefix_partial);
+  __syncthreads();
+  const auto tile_prefix = BlockReduce(reduce_storage).Sum(tile_prefix_partial);
+  __syncthreads();
+  const auto owned_index = BlockReduce(reduce_storage).Sum(owned_index_partial);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    a.expert_base[expert] = destination_prefix;
+    if (owner == a.rank) {
+      a.owned_expert_ids[owned_index] = expert;
+      a.owned_expert_count[owned_index] = a.expert_total[expert];
+      a.owned_expert_prefix[owned_index] = owned_prefix;
+      a.mtile_offsets[owned_index] = tile_prefix;
+    }
   }
-  if (fanout_index != a.routes) {
-    materialization_fail(a.status, MaterializationError::OutputCapacity, 12,
-                         a.routes, fanout_index);
-    return;
-  }
+}
 
+[[maybe_unused]] __global__ void materialize_destination_capacity_kernel(
+    DeviceMaterializeArgs a) {
+  constexpr std::uint32_t kThreads = 256;
+  using BlockReduce = cub::BlockReduce<unsigned long long, kThreads>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  const auto destination = static_cast<std::uint32_t>(blockIdx.x);
+  if (destination >= a.world || a.status->error != 0)
+    return;
+  unsigned long long rows_partial = 0;
+  for (std::uint32_t expert = threadIdx.x; expert < a.experts;
+       expert += kThreads)
+    if (a.expert_to_rank[expert] == destination)
+      rows_partial += a.expert_total[expert];
+  const auto rows = BlockReduce(reduce_storage).Sum(rows_partial);
+  if (threadIdx.x == 0) {
+    if (a.has_workspace_capacity && rows > a.workspace_capacity[destination])
+      materialization_fail_once(
+          a.status, MaterializationError::WorkspaceCapacity, destination,
+          a.workspace_capacity[destination], rows);
+    if (destination == a.rank && rows > a.max_incoming_rows)
+      materialization_fail_once(a.status, MaterializationError::OutputCapacity,
+                                destination, a.max_incoming_rows, rows);
+  }
+}
+
+[[maybe_unused]] __global__ void
+materialize_plan_finalize_kernel(DeviceMaterializeArgs a) {
+  constexpr std::uint32_t kThreads = 256;
+  using BlockReduce = cub::BlockReduce<unsigned long long, kThreads>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  if (blockIdx.x != 0 || a.status->error != 0)
+    return;
+  unsigned long long owned_partial = 0;
+  unsigned long long incoming_partial = 0;
+  unsigned long long tiles_partial = 0;
+  for (std::uint32_t expert = threadIdx.x; expert < a.experts;
+       expert += kThreads) {
+    if (a.expert_to_rank[expert] != a.rank)
+      continue;
+    ++owned_partial;
+    incoming_partial += a.expert_total[expert];
+    const auto count = a.expert_total[expert];
+    tiles_partial += count / a.m_tile + (count % a.m_tile != 0);
+  }
+  unsigned long long packets_partial = 0;
+  for (std::uint32_t node = threadIdx.x; node < a.nodes;
+       node += kThreads) {
+    const auto value = a.summary_matrix[
+        static_cast<std::uint64_t>(a.rank) * a.nodes + node];
+    if (value != a.local_summary[node] || value > a.max_tokens) {
+      materialization_fail_once(a.status,
+                                MaterializationError::SummaryRowMismatch,
+                                node, a.local_summary[node], value);
+    } else {
+      packets_partial += value;
+    }
+  }
+  const auto owned = BlockReduce(reduce_storage).Sum(owned_partial);
+  __syncthreads();
+  const auto incoming = BlockReduce(reduce_storage).Sum(incoming_partial);
+  __syncthreads();
+  const auto tiles = BlockReduce(reduce_storage).Sum(tiles_partial);
+  __syncthreads();
+  const auto packets = BlockReduce(reduce_storage).Sum(packets_partial);
+  __syncthreads();
+  if (threadIdx.x == 0 && a.status->error == 0) {
+    if (incoming > a.max_incoming_rows || tiles > a.max_incoming_rows ||
+        packets > a.routes) {
+      materialization_fail_once(a.status, MaterializationError::OutputCapacity,
+                                10, a.max_incoming_rows, incoming);
+      return;
+    }
+    a.owned_expert_prefix[owned] = incoming;
+    a.mtile_offsets[owned] = tiles;
+    a.status->owned_experts = owned;
+    a.status->incoming_rows = incoming;
+    a.status->mtile_count = tiles;
+    a.status->packet_count = packets;
+    a.status->fanout_count = a.routes;
+  }
 }
 
 __global__ void materialize_routes_kernel(DeviceMaterializeArgs a) {
@@ -2558,7 +2808,23 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(prefix planning start)");
+#if MEGAMOE_DEBUG_VALIDATE
   materialize_prefix_plan_kernel<<<1, 1, 0, exec->stream>>>(args);
+#else
+  materialize_plan_init_kernel<<<1, 1, 0, exec->stream>>>(args);
+  materialize_expert_totals_kernel<<<
+      blocks_for(plan.num_experts, "expert_total_grid"), threads, 0,
+      exec->stream>>>(args);
+  materialize_expert_prefix_kernel<<<
+      plan.num_experts, threads, 0,
+      exec->stream>>>(args);
+  materialize_destination_capacity_kernel<<<
+      plan.world_size, threads, 0,
+      exec->stream>>>(args);
+  materialize_plan_finalize_kernel<<<1, threads, 0, exec->stream>>>(args);
+#endif
+  materialize_packet_plan_kernel<<<plan.num_nodes, threads, 0, exec->stream>>>(
+      args);
   internal::throw_cuda(
       "device-materialize",
       cudaEventRecord(state->allocation->planning_complete, exec->stream),

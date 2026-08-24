@@ -189,7 +189,7 @@ def main():
     parser.add_argument("--world", type=int, choices=(2, 8), required=True)
     parser.add_argument("--seed", type=int, default=0x5EED1234)
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--rounds", type=int)
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--no-wrap", action="store_true")
@@ -197,9 +197,14 @@ def main():
     parser.add_argument("--compute-sanitizer-tool",
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
+    if args.rounds is None:
+        args.rounds = 110 if args.benchmark else 1
+    if args.benchmark and args.rounds <= 10:
+        parser.error("--benchmark requires more than 10 total rounds")
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
-    environment["MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+    environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
+                "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
     if args.no_wrap:
         environment["MEGAMOE_P2P_NO_WRAP"] = "1"
     if args.ring_slots is not None:
@@ -265,9 +270,7 @@ def main():
                     raise AssertionError(f"rank={rank} backend={item['backend']}")
                 for key in stage_keys:
                     item[key] = [float(value) for value in item[key].split(",")]
-                    expected_samples = (int(os.environ["MEGAMOE_P2P_BENCH_ROUNDS"])
-                                        if "MEGAMOE_P2P_BENCH_ROUNDS" in os.environ
-                                        else 50)
+                    expected_samples = args.rounds - 10
                     if len(item[key]) != expected_samples:
                         raise AssertionError(
                             f"rank={rank} stage={key} samples={len(item[key])}")
@@ -306,12 +309,25 @@ def main():
                                        for item in observed],
                 "per_rank_dedup_bytes": [int(item["dedup_bytes"])
                                          for item in observed],
+                "per_rank_actual_dispatch_peer_bytes": [
+                    int(item["actual_dispatch_peer_bytes"])
+                    for item in observed],
+                "per_rank_actual_return_peer_bytes": [
+                    int(item["actual_return_peer_bytes"])
+                    for item in observed],
                 "per_rank_credit_stalls": [int(item["stalls"])
                                             for item in observed],
                 "per_rank_peak_ring": [int(item["peak_ring"])
                                        for item in observed],
                 **summary,
             }
+            total_peer = [
+                int(item["actual_dispatch_peer_bytes"]) +
+                int(item["actual_return_peer_bytes"])
+                for item in observed]
+            result["aggregate_effective_peer_GBps"] = (
+                sum(total_peer) /
+                (summary["total_slowest_rank_us"]["mean"] * 1e3))
             print("P2P_BENCH_JSON " + json.dumps(result, sort_keys=True))
             return
         oracle = expected(args.world, args.seed)

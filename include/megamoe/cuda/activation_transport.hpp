@@ -111,6 +111,10 @@ struct ActivationTransportDeviceAudit {
       transport::ActivationTransportBackend::DeviceSimulation;
   std::uint64_t raw_cross_node_payload_bytes = 0;
   std::uint64_t deduplicated_cross_node_payload_bytes = 0;
+  // Physical peer-link traffic. Unlike the logical node-dedup number, these
+  // counters include every destination-GPU fan-out and exclude local writes.
+  std::uint64_t actual_dispatch_peer_bytes = 0;
+  std::uint64_t actual_return_peer_bytes = 0;
   std::uint64_t packet_count = 0;
   std::uint64_t fanout_count = 0;
   std::uint64_t credit_stalls = 0;

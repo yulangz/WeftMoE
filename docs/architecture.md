@@ -164,9 +164,13 @@ The backend state machine is auditable and ordered:
 Pending control operation destruction/cancel drains its event without throwing
 from destruction; a partial enqueue is drained before the slot/input can be
 released. One operation object is not safe for concurrent wait/cancel/move.
-The successful audit is `control/config/count/summary = 1/1/1/1`; local/header
-failure is `1/0/0/0`, and config integrity/exact-agreement failure is
-`1/1/0/0`. A counter increments immediately after its `ncclAllGather` returns
+The first successful agreement audit is
+`control/config/cache/count/summary = 1/1/0/1/1`. In a trusted-participant
+release session, later generations use the immutable verified wire and report
+`1/0/1/1/1`; debug mode always repeats exact config agreement. Local/header
+failure remains `1/0/0/0`, and config integrity/exact-agreement failure is
+`1/1/0/0` in the original four collective fields. A counter increments
+immediately after its `ncclAllGather` returns
 success; later D2H, event record/wait, allocation, or completion failure cannot
 roll it back.
 Test-only hooks in `src/` inject control start/enqueue, event record/wait, D2H,
@@ -317,10 +321,12 @@ coordinate reporting; no atomic return order chooses a canonical row.
 
 After NCCL data completion, a checked stream-ordered materialization pipeline
 directly consumes `[source_rank, expert]` and
-`[source_rank, destination_node]` matrices. A small serial planning kernel
-validates collective values and establishes bounded output lengths/prefixes;
-the bulk records are then emitted by regular parallel per-route,
-per-expert/source, per-expert, per-packet, and per-node kernels. The pipeline
+`[source_rank, destination_node]` matrices. In release, expert/source totals,
+owner prefixes, destination capacities, and node packet compaction are separate
+parallel kernels; packet compaction uses a deterministic node-owned block scan.
+Debug retains the serial checked planner as an oracle. Bulk records are emitted
+by regular parallel per-route, per-expert/source, per-expert, per-packet, and
+per-node kernels. The pipeline
 fills:
 
 - route destination row plus all original route arrays and node masks;
@@ -511,13 +517,20 @@ opens only peer-accessible devices, and closes each owned mapping exactly once.
 Partial setup fails closed. No caller-supplied backend enum participates in an
 audit record.
 
-The local worker launches one CTA per SM. CTA 0 owns canonical outgoing packet
-order. CTA `1 + source_rank` owns that source's ingress link, so a slow source
-or relay cannot consume another link's sequence/credit state. Physical slot is
-`sequence % ring_slots`; every link has a monotonic 64-bit next sequence and
-bounded credit. Payload stores and headers precede `__threadfence_system` plus
-a system-scope signal; relay acquire-observes the signal, validates the exact
-generation/source/destination/route/row tuple, writes only the Notify-provided
+The release local worker is a fixed stream-ordered pipeline of bulk CUDA grids:
+route CTAs write peer canonical rows directly, one tiny kernel publishes a
+per-peer dispatch completion, destination-row CTAs generate and return the
+synthetic contribution, a second per-peer completion closes return, and token
+CTAs reduce in fixed expert order. The grids expose all routes/rows/tokens to
+all SMs and avoid per-route system atomics. Physical peer traffic counts every
+destination-GPU fan-out; logical node dedup is reported separately.
+
+`MEGAMOE_DEBUG_VALIDATE=1` selects the earlier persistent ring worker. There,
+physical slot is `sequence % ring_slots`; every link has a monotonic 64-bit next
+sequence and bounded credit. Payload stores and headers precede
+`__threadfence_system` plus a system-scope signal; relay acquire-observes the
+signal, validates the exact generation/source/destination/route/row tuple, and
+writes only the Notify-provided
 canonical row, and returns credit after consumption. Before launch a fixed
 device AllGather confirms that every rank selected the same pool slot and
 epoch. No activation is staged through host memory.

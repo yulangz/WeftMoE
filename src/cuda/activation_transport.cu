@@ -81,9 +81,14 @@ struct TransportDeviceStatus {
   unsigned long long synthetic_ticks;
   unsigned long long raw_cross_node_payload_bytes;
   unsigned long long deduplicated_cross_node_payload_bytes;
+  unsigned long long actual_dispatch_peer_bytes;
+  unsigned long long actual_return_peer_bytes;
   unsigned long long start_clock;
   unsigned long long dispatch_complete_clock;
   unsigned long long complete_clock;
+  unsigned long long dispatch_blocks_done;
+  unsigned long long relay_blocks_done;
+  unsigned long long reduce_blocks_done;
   unsigned int error;
   unsigned int error_packet;
   unsigned int error_field;
@@ -119,6 +124,7 @@ struct Layout {
   std::size_t ingress_published_sequence = 0;
   std::size_t ingress_credits = 0;
   std::size_t outgoing_route_sequence = 0;
+  std::size_t direct_route_headers = 0;
   std::size_t return_ready_epoch = 0;
   std::size_t peer_bases = 0;
   std::size_t p2p_barrier_send = 0;
@@ -184,6 +190,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                   "P2P ingress credits");
   layout.outgoing_route_sequence = append(
       cursor, rank_links, sizeof(std::uint64_t), "P2P outgoing sequence");
+  layout.direct_route_headers = append(
+      cursor, config.max_destination_rows_per_rank,
+      sizeof(LocalP2pRouteHeader), "P2P direct route headers");
   layout.return_ready_epoch = append(cursor, routes, sizeof(std::uint64_t),
                                      "P2P combine ready epoch");
   layout.peer_bases = append(cursor, config.max_world_size, sizeof(void *),
@@ -700,6 +709,7 @@ struct LocalP2pKernelArgs {
   std::size_t ingress_published_offset;
   std::size_t ingress_credits_offset;
   std::size_t outgoing_sequence_offset;
+  std::size_t direct_headers_offset;
   std::size_t return_ready_offset;
   std::size_t canonical_rows_offset;
   std::size_t contribution_offset;
@@ -728,7 +738,8 @@ __device__ bool acquire_system_credit(unsigned int *credit,
   return false;
 }
 
-__global__ void local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
+[[maybe_unused]] __global__ void
+local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
   const auto lane = static_cast<std::uint32_t>(threadIdx.x);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *local_ring_headers = peer_at<transport::TransportSlotHeader>(
@@ -1119,6 +1130,203 @@ __global__ void local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
   }
   if (lane == 0)
     atomicMax(&status->complete_clock, device_globaltimer_ns());
+}
+
+// Trusted-team release path. Notify has already assigned a unique canonical
+// row to every route. Separate all-SM grids bulk-copy each phase, and tiny
+// kernels publish one system-scope completion per peer rather than per route.
+__global__ void local_p2p_bulk_dispatch_kernel(LocalP2pKernelArgs a) {
+  const auto route = static_cast<std::uint64_t>(blockIdx.x);
+  if (route >= a.dispatch.sizes.route_count)
+    return;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (route == 0 && threadIdx.x == 0)
+    status->start_clock = device_globaltimer_ns();
+  const auto destination = a.dispatch.route_dst_rank[route];
+  const auto row = a.dispatch.route_dst_row[route];
+  if (destination >= a.world || row >= a.max_destination_rows) {
+    if (threadIdx.x == 0) {
+      status->error_packet = static_cast<unsigned int>(route);
+      status->error_field = 30U;
+      atomicCAS(&status->error, 0U, 1U);
+    }
+    return;
+  }
+  const auto token = route / a.dispatch.identity.top_k;
+  auto *destination_base = a.peer_bases[destination];
+  auto *destination_rows = peer_at<transport::BFloat16>(
+      destination_base, a.canonical_rows_offset);
+  const auto *source = a.input + token * a.hidden;
+  auto *target = destination_rows + row * a.hidden;
+  if ((a.hidden & 7ULL) == 0ULL) {
+    const auto *source128 = reinterpret_cast<const uint4 *>(source);
+    auto *target128 = reinterpret_cast<uint4 *>(target);
+    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
+         vector += blockDim.x)
+      target128[vector] = source128[vector];
+  } else {
+    for (std::uint64_t hidden = threadIdx.x; hidden < a.hidden;
+         hidden += blockDim.x)
+      target[hidden] = source[hidden];
+  }
+  if (threadIdx.x == 0) {
+    auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+        destination_base, a.direct_headers_offset);
+    destination_headers[row] = LocalP2pRouteHeader{
+        transport::kActivationTransportSchemaVersion,
+        a.rank,
+        destination,
+        static_cast<std::uint32_t>(route % a.channels),
+        a.dispatch.identity.generation,
+        a.epoch,
+        route,
+        route,
+        token,
+        row,
+        a.dispatch.expert_id[route],
+        static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
+    if (destination != a.rank)
+      atomicAdd(&status->actual_dispatch_peer_bytes,
+                a.hidden * sizeof(transport::BFloat16));
+  }
+  __threadfence_system();
+}
+
+__global__ void local_p2p_publish_dispatch_kernel(LocalP2pKernelArgs a) {
+  const auto destination = static_cast<std::uint32_t>(threadIdx.x);
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (destination < a.world) {
+    auto *signal = peer_at<unsigned long long>(
+        a.peer_bases[destination], a.ingress_published_offset);
+    __threadfence_system();
+    atomicExch_system(&signal[a.rank * a.channels], a.epoch);
+  }
+  if (threadIdx.x == 0) {
+    status->packets_done = a.dispatch.sizes.packet_count;
+    status->fanout_done = a.dispatch.sizes.route_count;
+    status->raw_cross_node_payload_bytes =
+        a.dispatch.sizes.route_count * a.hidden *
+        sizeof(transport::BFloat16);
+    status->deduplicated_cross_node_payload_bytes =
+        a.dispatch.sizes.packet_count * a.hidden *
+        sizeof(transport::BFloat16);
+    status->dispatch_put_ticks = device_globaltimer_ns() - status->start_clock;
+  }
+}
+
+__global__ void local_p2p_wait_dispatch_kernel(LocalP2pKernelArgs a) {
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  for (std::uint32_t source = threadIdx.x; source < a.world;
+       source += blockDim.x) {
+    auto *signals = peer_at<unsigned long long>(
+        a.local_base, a.ingress_published_offset);
+    while (atomicAdd_system(&signals[source * a.channels], 0ULL) != a.epoch &&
+           !local_p2p_cancelled(a) && atomicAdd(&status->error, 0U) == 0U) {
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (local_p2p_cancelled(a))
+      atomicCAS(&status->error, 0U, 2U);
+    __threadfence_system();
+    status->dispatch_complete_clock = device_globaltimer_ns();
+  }
+}
+
+__global__ void local_p2p_bulk_return_kernel(LocalP2pKernelArgs a) {
+  const auto row = static_cast<std::uint64_t>(blockIdx.x);
+  if (row >= a.dispatch.sizes.incoming_row_count)
+    return;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (atomicAdd(&status->error, 0U) != 0U)
+    return;
+  auto *local_headers = peer_at<LocalP2pRouteHeader>(
+      a.local_base, a.direct_headers_offset);
+  auto *local_canonical = peer_at<transport::BFloat16>(
+      a.local_base, a.canonical_rows_offset);
+  const auto header = local_headers[row];
+  auto *source_contribution = peer_at<transport::BFloat16>(
+      a.peer_bases[header.source_rank], a.contribution_offset);
+  for (std::uint64_t hidden = threadIdx.x; hidden < a.hidden;
+       hidden += blockDim.x)
+    source_contribution[header.route_index * a.hidden + hidden] =
+        synthetic_value(local_canonical[row * a.hidden + hidden],
+                        header.expert_id, hidden);
+  if (threadIdx.x == 0 && header.source_rank != a.rank)
+    atomicAdd(&status->actual_return_peer_bytes,
+              a.hidden * sizeof(transport::BFloat16));
+  __threadfence_system();
+}
+
+__global__ void local_p2p_publish_return_kernel(LocalP2pKernelArgs a) {
+  const auto source = static_cast<std::uint32_t>(threadIdx.x);
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (source < a.world) {
+    auto *signal = peer_at<unsigned long long>(
+        a.peer_bases[source], a.outgoing_sequence_offset);
+    __threadfence_system();
+    atomicExch_system(&signal[a.rank * a.channels], a.epoch);
+  }
+  if (threadIdx.x == 0)
+    status->incoming_done = a.dispatch.sizes.incoming_row_count;
+}
+
+__global__ void local_p2p_wait_return_kernel(LocalP2pKernelArgs a) {
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  for (std::uint32_t destination = threadIdx.x; destination < a.world;
+       destination += blockDim.x) {
+    auto *signals = peer_at<unsigned long long>(
+        a.local_base, a.outgoing_sequence_offset);
+    while (atomicAdd_system(&signals[destination * a.channels], 0ULL) !=
+               a.epoch &&
+           !local_p2p_cancelled(a) && atomicAdd(&status->error, 0U) == 0U) {
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (local_p2p_cancelled(a))
+      atomicCAS(&status->error, 0U, 2U);
+    __threadfence_system();
+    status->synthetic_ticks =
+        device_globaltimer_ns() - status->dispatch_complete_clock;
+    status->relay_ticks = status->synthetic_ticks;
+    status->synthetic_done = a.dispatch.sizes.route_count;
+    status->combine_done = a.dispatch.sizes.route_count;
+  }
+}
+
+__global__ void local_p2p_bulk_reduce_kernel(LocalP2pKernelArgs a) {
+  const auto token = static_cast<std::uint64_t>(blockIdx.x);
+  if (token >= a.dispatch.identity.num_tokens)
+    return;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (atomicAdd(&status->error, 0U) != 0U)
+    return;
+  auto *contribution = peer_at<transport::BFloat16>(
+      a.local_base, a.contribution_offset);
+  auto *combined = peer_at<transport::BFloat16>(
+      a.local_base, a.combined_offset);
+  for (std::uint64_t hidden = threadIdx.x; hidden < a.hidden;
+       hidden += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t order = 0; order < a.dispatch.identity.top_k; ++order) {
+      const auto original = a.dispatch.combine_order[
+          token * a.dispatch.identity.top_k + order];
+      const auto route = token * a.dispatch.identity.top_k + original;
+      sum += bf16_bits_to_float(contribution[route * a.hidden + hidden].bits);
+    }
+    combined[token * a.hidden + hidden] =
+        transport::BFloat16{float_to_bf16_bits(sum)};
+  }
+  if (threadIdx.x == 0)
+    atomicAdd(&status->reduced_tokens, 1ULL);
+}
+
+__global__ void local_p2p_finish_kernel(LocalP2pKernelArgs a) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    status->complete_clock = device_globaltimer_ns();
+  }
 }
 
 } // namespace
@@ -2018,6 +2226,9 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
              sizeof(std::uint64_t), "P2P ingress published");
   zero_async(layout.outgoing_route_sequence, rank_links,
              sizeof(std::uint64_t), "P2P outgoing sequence");
+  zero_async(layout.direct_route_headers,
+             state->config.max_destination_rows_per_rank,
+             sizeof(LocalP2pRouteHeader), "P2P direct route headers");
   zero_async(layout.return_ready_epoch, view.sizes.route_count,
              sizeof(std::uint64_t), "P2P return ready");
   zero_async(layout.canonical_rows,
@@ -2114,6 +2325,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   args.ingress_published_offset = layout.ingress_published_sequence;
   args.ingress_credits_offset = layout.ingress_credits;
   args.outgoing_sequence_offset = layout.outgoing_route_sequence;
+  args.direct_headers_offset = layout.direct_route_headers;
   args.return_ready_offset = layout.return_ready_epoch;
   args.canonical_rows_offset = layout.canonical_rows;
   args.contribution_offset = layout.contribution;
@@ -2122,7 +2334,26 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   args.status_offset = layout.status;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
+#if MEGAMOE_DEBUG_VALIDATE
   local_p2p_persistent_kernel<<<sms, 128, 0, exec->stream>>>(args);
+#else
+  local_p2p_bulk_dispatch_kernel<<<
+      static_cast<unsigned int>(std::max<std::uint64_t>(
+          view.sizes.route_count, 1ULL)),
+      256, 0, exec->stream>>>(args);
+  local_p2p_publish_dispatch_kernel<<<1, 32, 0, exec->stream>>>(args);
+  local_p2p_wait_dispatch_kernel<<<1, 32, 0, exec->stream>>>(args);
+  local_p2p_bulk_return_kernel<<<
+      static_cast<unsigned int>(std::max<std::uint64_t>(
+          view.sizes.incoming_row_count, 1ULL)),
+      256, 0, exec->stream>>>(args);
+  local_p2p_publish_return_kernel<<<1, 32, 0, exec->stream>>>(args);
+  local_p2p_wait_return_kernel<<<1, 32, 0, exec->stream>>>(args);
+  local_p2p_bulk_reduce_kernel<<<
+      static_cast<unsigned int>(std::max<std::uint64_t>(id.num_tokens, 1ULL)),
+      256, 0, exec->stream>>>(args);
+  local_p2p_finish_kernel<<<1, 1, 0, exec->stream>>>(args);
+#endif
   internal::throw_cuda(
       "local-p2p-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -2242,6 +2473,10 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       slot.host_status->raw_cross_node_payload_bytes;
   result->audit.deduplicated_cross_node_payload_bytes =
       slot.host_status->deduplicated_cross_node_payload_bytes;
+  result->audit.actual_dispatch_peer_bytes =
+      slot.host_status->actual_dispatch_peer_bytes;
+  result->audit.actual_return_peer_bytes =
+      slot.host_status->actual_return_peer_bytes;
   result->audit.hot_path_allocations = 0;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
   result->timings.dispatch_put_us =
@@ -2256,8 +2491,11 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   if (dispatch_clock >= start_clock && complete_clock >= dispatch_clock) {
     result->timings.dispatch_relay_us =
         static_cast<double>(dispatch_clock - start_clock) / 1000.0;
-    result->timings.combine_reduce_us =
-        static_cast<double>(complete_clock - dispatch_clock) / 1000.0;
+    const auto post_dispatch = complete_clock - dispatch_clock;
+    const auto relay_return = slot.host_status->synthetic_ticks;
+    result->timings.combine_reduce_us = static_cast<double>(
+        post_dispatch >= relay_return ? post_dispatch - relay_return : 0ULL) /
+        1000.0;
   }
   failure_guard.committed = true;
   return DeviceActivationTransportHandle(std::move(result));

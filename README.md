@@ -5,10 +5,10 @@ devices. The current vertical slice implements rank-local deterministic Notify
 Dispatch in production C++/CUDA, a fixed-width distributed control agreement,
 a real NCCL AllGather count backend, opaque device metadata leases, and an
 independent Python oracle. Phase 4 adds a transport-only BF16 data-plane
-baseline: typed router activation leases, a bounded sequence/credit ring,
-canonical relay, synthetic contribution return, and fixed expert-order combine
-inside a persistent CUDA worker. `LocalCudaP2pActivationTransport` now uses
-real per-rank CUDA IPC mappings and independent rank processes; the explicit
+baseline: typed router activation leases, a debug sequence/credit ring,
+canonical direct writes, batched synthetic contribution return, and fixed
+expert-order combine. `LocalCudaP2pActivationTransport` now uses real per-rank
+CUDA IPC mappings and independent rank processes; the explicit
 `DeviceActivationTransport` remains a simulation-only oracle. It does **not**
 implement FC1/FC2, backward, Socket transport, or NCCL GIN/RDMA.
 
@@ -135,12 +135,17 @@ is private and reachable only through an explicitly named `testing` factory.
 
 This coordinator is the only public production protocol entry; device upload,
 workspace allocation, preflight wait, control start, and data-collective start
-are internal. Every generation executes exactly `dataized local preflight →
+are internal. With `MEGAMOE_DEBUG_VALIDATE=1`, every generation executes
+exactly `dataized local preflight →
 256-byte ControlHeader AllGather → header agreement → self-checking canonical
 config wire AllGather → exact byte/field agreement → expert-count AllGather →
 packet-summary AllGather`. The header is explicitly little-endian encoded as
 32 words; no native struct or padding is copied to the wire. It is fully
 initialized even for invalid local input.
+The trusted-participant release build caches the first successful exact config
+agreement in each session/backend slot. Later generations still execute fixed
+control/status, expert-count, and summary collectives, while reusing the exact
+verified config bytes rather than repeating the variable config AllGather.
 Config mismatches and route errors select the lowest origin rank and first
 field in schema order; all ranks fail after the same fixed collective and never
 enter a variable-width collective. A healthy NCCL communicator can be reused
@@ -215,14 +220,13 @@ failed completion quarantines rather than reuses a slot.
 The local P2P backend exchanges checked CUDA IPC handles through a device NCCL
 setup collective, opens only the one-node peer team, and retains every mapping
 until the final output lease dies. Before each generation, ranks exchange and
-validate the chosen pool-slot index and epoch. One 128-thread CTA per available
-SM is launched. CTA 0 performs canonical packet dispatch and peer puts; one
-resident CTA per source rank consumes that source's ingress ring, validates the
-64-bit sequence/generation/header, writes the Notify-provided canonical row,
-computes the documented synthetic contribution, and returns it to the source
-peer's immutable route slot. Stores precede `__threadfence_system` and a
-system-scope release signal; consumers acquire-observe the signal before use.
-Credits return only after relay consumption. Reduction follows device
+validate the chosen pool-slot index and epoch. The release path launches
+all-SM bulk grids for direct route-to-canonical-row writes, destination-side
+synthetic contribution generation, peer return, and token reduction. It emits
+one system-scope completion per peer and phase, not one per route. The debug
+path retains the bounded ring/credit/sequence worker and full descriptor
+validation. Stores precede a system fence and release signal; consumers
+acquire-observe the signal before use. Reduction follows device
 `combine_order` (expert-ID order), accumulates in FP32, and casts once to BF16.
 The synthetic transform is only a transport oracle and is not FC1/FC2.
 
@@ -264,6 +268,20 @@ make bench
 # Optional CUDA/NCCL slice; see docs/build.md for the tested runtime library.
 make BUILD_DIR=build-cuda cuda-lib
 make BUILD_DIR=build-cuda NCCL_RUNTIME_LIB_DIR=/path/to/nccl/lib cuda-test-local
+
+# Trusted release fast path (default) and full validation build.
+make BUILD_DIR=build-release ENABLE_CUDA=1 MEGAMOE_DEBUG_VALIDATE=0 cuda-lib
+make BUILD_DIR=build-debug ENABLE_CUDA=1 MEGAMOE_DEBUG_VALIDATE=1 cuda-lib
+
+# Megatron-Core dispatcher baseline, 10 warmups + 100 samples.
+torchrun --standalone --nproc-per-node=8 \
+  benchmarks/megatron_dispatch_baseline.py
+
+# Two-node baseline: run on both nodes with NODE_RANK=0/1.
+NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
+  --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  benchmarks/megatron_dispatch_baseline.py
 ```
 
 `make test` runs C++ contract tests, Python reference tests, and a machine-readable

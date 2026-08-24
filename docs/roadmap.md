@@ -24,7 +24,8 @@
   lease contract, with event completion, device result leases, async-error checks,
   and contextual CUDA/NCCL failures.
 - Fixed 256-byte little-endian control AllGather plus an exact canonical-config
-  byte AllGather before every data collective; self-checking config envelope,
+  byte AllGather before the first data collective (and every debug generation);
+  release sessions reuse the immutable verified config; self-checking envelope,
   exact original session identity, rank-0-baseline error selection,
   enqueue-point four-stage audit, and healthy-communicator recovery.
 - Explicit capacity-bound workspace for later forward/backward consumers; no
@@ -46,13 +47,12 @@ The correctness and distributed agreement slice is complete.
 - Full-field host/Python oracle comparison, 25 fixed seeds, 20 deterministic
   repeats, world 1/2/8 and two-host validation.
 
-The first parallel baseline and session-level preallocation boundary are now
-present: bulk routes, incoming rows, tiles, fan-out, and signals are emitted in
-parallel from deterministic prefixes, and pooled steady generations perform no
-CUDA/pinned/event allocation. Further parallelization of the small checked
-planning scan, hierarchical/GIN count exchange, graph capture, and SM90-specific
-tuning remain open. These may replace the baseline without changing layout
-semantics.
+The release planner now parallelizes expert/source totals, owner prefixes,
+destination capacities and deterministic node packet scans. Session slots cache
+the first exact static-config agreement; debug repeats full agreement every
+generation. Pooled steady generations perform no CUDA/pinned/event allocation.
+Hierarchical/GIN count exchange, graph capture, and SM90-specific tuning remain
+open without changing layout semantics.
 
 ## Phase 4 — activation transport data plane (in progress)
 
@@ -65,6 +65,9 @@ Completed correctness components:
 - transport-only persistent CUDA worker, 73-node device simulation, a real
   multi-process local CUDA IPC dispatch/relay/return/combine path, deterministic
   independent Python oracle, and a last-block P2P ordering probe;
+- trusted release all-SM bulk route/row/token grids with direct canonical writes
+  and per-peer phase completion; debug retains the ring/credit worker;
+- a checked-in Megatron-Core `MoEAlltoAllTokenDispatcher` comparison harness;
 - an explicit GIN capability probe and fail-closed backend boundary.
 
 Still required before phase 4 closes:
