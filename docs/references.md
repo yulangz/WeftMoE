@@ -5,6 +5,16 @@ the following files for design patterns. No source was mechanically copied.
 
 ## DeepEP
 
+- `DeepEP/csrc/kernels/legacy/ibgda_device.cuh`: device-side WQE reservation,
+  ordered doorbell publication, local quiet/fence, and remote atomic/signal
+  mechanics. MegaMOE uses the ownership and completion distinctions, not the
+  NVSHMEM-private implementation.
+- `DeepEP/csrc/kernels/legacy/internode.cu` and `intranode.cu`: channel
+  partitioning, same-local-rank scale-out, node-local forwarding, signal
+  barriers, and bounded buffer reuse.
+- `DeepEP/deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh` and
+  `hybrid_combine.cuh`: same-rail proxy/fan-out and reverse metadata flow.
+
 - `DeepEP/csrc/kernels/backend/nccl.cu`: CUDA/NCCL compilation boundaries,
   communicator calls, stream enqueue style, and contextual backend checks. It
   informed the private backend boundary, not the generic public types.
@@ -58,7 +68,19 @@ the following files for design patterns. No source was mechanically copied.
 The backup tree contains experimental/local modifications; it was treated only
 as an architecture reference, not as an upstream API or code source.
 
+The Phase-4 survey additionally used
+`DeepGEMM-bk/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh`
+for persistent dispatch/epilogue/combine role separation, logical-pool versus
+physical-ring indexing, backpressure, and phase-tagged barriers.
+
 ## Triton-distributed
+
+- `Triton-distributed/tutorials/03-inter-node-allgather.py`: hierarchical
+  same-local-rank inter-node put followed by intra-node fan-out and signal
+  waits.
+- `Triton-distributed/tutorials/07-overlapping-allgather-gemm.py`: device
+  put-with-signal producer semantics and a separately named copy-engine
+  fallback. It reinforced the need to label backend mechanisms precisely.
 
 - `Triton-distributed/tutorials/04-deepseek-infer-all2all.py`: expert split
   cumsums, explicit dispatch/combine offsets, put/fence/signal ordering, and

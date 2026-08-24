@@ -17,6 +17,7 @@
 
 #include "megamoe/api/errors.hpp"
 #include "megamoe/cuda/nccl_count_exchange.hpp"
+#include "megamoe/cuda/activation_transport.hpp"
 #include "megamoe/metadata/serialize.hpp"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
@@ -1037,6 +1038,196 @@ void test_device_only_sanitizer_paths() {
               wide_handle.sizes().packet_count == 6 &&
               wide_handle.sizes().fanout_count == 6,
           "73-node packet dedup/fan-out shape mismatch");
+
+  // The transport-only persistent worker consumes the immutable device
+  // dispatch handle directly. No activation bulk download occurs until the
+  // explicit validation call below.
+  const megamoe::RankRoutingInput transport_routes{
+      3, {5, 1, 7, 1, 2, 3, 0, 7, 4}};
+  std::vector<std::uint64_t> transport_counts(8, 0);
+  for (const auto selected : transport_routes.selected_experts)
+    ++transport_counts[static_cast<std::size_t>(selected)];
+  const std::vector<std::uint64_t> transport_summary{3};
+  auto transport_dispatch =
+      megamoe::cuda::testing::materialize_fake_device_collectives(
+          config, context, execution, transport_routes, 4, transport_counts,
+          transport_summary);
+  const auto host_dispatch = megamoe::build_notify_dispatch_for_testing(
+      config, {transport_routes}, "device-only", 5001);
+  megamoe::transport::ActivationTransportConfig transport_config;
+  transport_config.hidden_size = 33;
+  transport_config.channels = 1;
+  transport_config.ring_slots_per_source_channel = 2;
+  std::vector<megamoe::transport::BFloat16> activations(3U * 33U);
+  for (std::size_t i = 0; i < activations.size(); ++i)
+    activations[i] = megamoe::transport::float_to_bfloat16(
+        static_cast<float>((i * 13U) % 97U) / 16.0F);
+  const auto oracle = megamoe::transport::simulate_activation_transport(
+      host_dispatch[0], activations, transport_config, 1);
+  megamoe::cuda::ActivationTransportPoolConfig transport_pool_config;
+  transport_pool_config.max_tokens_per_rank = 4;
+  transport_pool_config.max_hidden_size = 33;
+  transport_pool_config.max_top_k = 3;
+  transport_pool_config.max_world_size = 1;
+  transport_pool_config.max_nodes = 1;
+  transport_pool_config.max_destination_rows_per_rank = 12;
+  transport_pool_config.channels = 1;
+  transport_pool_config.ring_slots_per_source_channel = 2;
+  transport_pool_config.max_inflight_generations = 2;
+  auto transport_pool = megamoe::cuda::make_activation_transport_pool(
+      session, execution, transport_pool_config);
+  auto activation_lease =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          activations, 3, 33, context, execution, transport_pool);
+  megamoe::cuda::DeviceActivationTransport transport(
+      session, execution, transport_pool);
+  const auto api_before = megamoe::cuda::testing::cuda_api_audit_snapshot();
+  auto transport_result = transport.run_synthetic(
+      transport_dispatch, activation_lease, transport_config);
+  const auto api_after = megamoe::cuda::testing::cuda_api_audit_snapshot();
+  require(api_after.device_allocations == api_before.device_allocations &&
+              api_after.device_frees == api_before.device_frees &&
+              api_after.pinned_allocations == api_before.pinned_allocations &&
+              api_after.pinned_frees == api_before.pinned_frees &&
+              api_after.event_creates == api_before.event_creates &&
+              api_after.event_destroys == api_before.event_destroys,
+          "steady activation transport allocated CUDA resources");
+  const auto downloaded_transport =
+      megamoe::cuda::download_activation_transport_for_validation(
+          transport_result, execution);
+  require(downloaded_transport.contribution_by_route ==
+              oracle.contribution_by_route &&
+              downloaded_transport.combined_tokens == oracle.combined_tokens,
+          "device transport synthetic contribution/combine oracle mismatch");
+  require(std::equal(oracle.canonical_expert_rows.begin(),
+                     oracle.canonical_expert_rows.end(),
+                     downloaded_transport.canonical_expert_rows.begin()),
+          "device transport canonical expert rows mismatch");
+  require(downloaded_transport.protocol.dispatch_packets == 3 &&
+              downloaded_transport.protocol.relayed_fanout == 9 &&
+              downloaded_transport.protocol.reduced_tokens == 3,
+          "device transport phase counters mismatch");
+  const auto transport_baseline = downloaded_transport.combined_tokens;
+  transport_result = {};
+  activation_lease = {};
+  for (std::uint32_t repeat = 0; repeat < 20; ++repeat) {
+    auto repeated_activation =
+        megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+            activations, 3, 33, context, execution, transport_pool);
+    auto repeated_result = transport.run_synthetic(
+        transport_dispatch, repeated_activation, transport_config);
+    const auto repeated =
+        megamoe::cuda::download_activation_transport_for_validation(
+            repeated_result, execution);
+    require(repeated.combined_tokens == transport_baseline,
+            "ring epoch reuse changed device transport bytes");
+  }
+  require(transport_pool.usage().slots_available == 2 &&
+              transport_pool.usage().slots_in_use == 0,
+          "transport slots were not returned after final lease destruction");
+
+  auto next_transport_session =
+      megamoe::make_collective_session("device-only", 1, 5002);
+  auto next_transport_context = megamoe::make_rank_collective_context(
+      next_transport_session, 0, execution.token());
+  auto wrong_generation_activation =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          activations, 3, 33, next_transport_context, execution,
+          transport_pool);
+  bool generation_failed = false;
+  try {
+    (void)transport.run_synthetic(transport_dispatch,
+                                  wrong_generation_activation,
+                                  transport_config);
+  } catch (const megamoe::NotifyDispatchError &error) {
+    generation_failed = error.code() == megamoe::NotifyErrorCode::WorkspaceMismatch;
+  }
+  require(generation_failed,
+          "cross-generation activation lease was accepted");
+  wrong_generation_activation = {};
+
+  auto exhausted_config = transport_pool_config;
+  exhausted_config.max_inflight_generations = 1;
+  auto exhausted_pool = megamoe::cuda::make_activation_transport_pool(
+      session, execution, exhausted_config);
+  auto held_activation =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          activations, 3, 33, context, execution, exhausted_pool);
+  bool exhausted = false;
+  try {
+    (void)megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+        activations, 3, 33, context, execution, exhausted_pool);
+  } catch (const megamoe::NotifyDispatchError &error) {
+    exhausted = error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
+  }
+  require(exhausted && exhausted_pool.usage().slots_in_use == 1,
+          "transport pool exhaustion did not fail closed");
+  held_activation = {};
+  require(exhausted_pool.usage().slots_available == 1,
+          "transport pool did not recover after final input lease");
+
+  megamoe::transport::ActivationTransportConfig wide_transport_config;
+  wide_transport_config.hidden_size = 7;
+  wide_transport_config.channels = 1;
+  wide_transport_config.ring_slots_per_source_channel = 1;
+  megamoe::cuda::ActivationTransportPoolConfig wide_transport_pool_config;
+  wide_transport_pool_config.max_tokens_per_rank = 4;
+  wide_transport_pool_config.max_hidden_size = 7;
+  wide_transport_pool_config.max_top_k = 6;
+  wide_transport_pool_config.max_world_size = 73;
+  wide_transport_pool_config.max_nodes = 73;
+  wide_transport_pool_config.max_destination_rows_per_rank = 32;
+  wide_transport_pool_config.channels = 1;
+  wide_transport_pool_config.ring_slots_per_source_channel = 1;
+  wide_transport_pool_config.max_inflight_generations = 1;
+  auto wide_transport_pool = megamoe::cuda::make_activation_transport_pool(
+      wide_session, execution, wide_transport_pool_config);
+  std::vector<megamoe::transport::BFloat16> wide_activations(7);
+  for (std::size_t i = 0; i < wide_activations.size(); ++i)
+    wide_activations[i] = megamoe::transport::float_to_bfloat16(
+        static_cast<float>(i + 1U) / 8.0F);
+  auto wide_activation =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          wide_activations, 1, 7, wide_context, execution,
+          wide_transport_pool);
+  megamoe::cuda::DeviceActivationTransport wide_transport(
+      wide_session, execution, wide_transport_pool);
+  auto wide_transport_result = wide_transport.run_synthetic(
+      wide_handle, wide_activation, wide_transport_config);
+  const auto wide_transport_download =
+      megamoe::cuda::download_activation_transport_for_validation(
+          wide_transport_result, execution);
+  const auto wide_transport_oracle =
+      megamoe::transport::simulate_activation_transport(
+          expected_wide[0], wide_activations, wide_transport_config, 1);
+  require(wide_transport_download.contribution_by_route ==
+              wide_transport_oracle.contribution_by_route &&
+              wide_transport_download.combined_tokens ==
+                  wide_transport_oracle.combined_tokens &&
+              wide_transport_download.protocol.dispatch_packets == 6,
+          "73-node full device transport/oracle mismatch");
+  const auto capability =
+      megamoe::cuda::probe_activation_transport_capability(2);
+  require(capability.nccl_device_headers && capability.gin_header_api &&
+              !capability.gin_runtime_symbols && !capability.gin_usable,
+          "GIN header/runtime capability boundary was not detected");
+  require(megamoe::cuda::testing::run_local_p2p_put_signal_probe(0, 1, 4096),
+          "real CUDA P2P put+system-signal probe failed");
+  auto gin_activation =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          activations, 3, 33, context, execution, transport_pool);
+  bool gin_failed = false;
+  try {
+    (void)transport.run_synthetic(
+        transport_dispatch, gin_activation, transport_config,
+        megamoe::transport::ActivationTransportBackend::NcclGinDevice);
+  } catch (const megamoe::NotifyDispatchError &error) {
+    gin_failed = error.code() == megamoe::NotifyErrorCode::BackendUnavailable;
+  }
+  require(gin_failed, "unavailable GIN backend did not fail closed");
+  std::cout << "[PASS] transport-only persistent device worker, deterministic "
+               "synthetic combine, pooled steady path, P2P put/signal, GIN "
+               "fail-closed\n";
   auto short_plan = wide_plan;
   --short_plan.device_bytes;
   bool short_failed = false;
@@ -1713,6 +1904,134 @@ Statistics summarize(std::vector<double> values) {
           values.front(), values.back()};
 }
 
+void transport_benchmark() {
+  constexpr std::uint32_t world = 8;
+  constexpr std::uint64_t tokens = 8192;
+  constexpr std::uint64_t hidden = 7168;
+  constexpr std::uint32_t experts = 384;
+  constexpr std::uint32_t top_k = 6;
+  const auto config = make_config(8, 1, experts, top_k, 64);
+  // Use the exact requested shape and deterministic, duplicate-free tuples.
+  std::vector<megamoe::RankRoutingInput> exact(world);
+  std::vector<std::uint64_t> counts(
+      static_cast<std::size_t>(world) * experts, 0);
+  std::vector<std::uint64_t> summaries(
+      static_cast<std::size_t>(world) * world, 0);
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    exact[rank].num_tokens = tokens;
+    for (std::uint64_t token = 0; token < tokens; ++token) {
+      bool seen_node[world]{};
+      const auto base = static_cast<std::uint32_t>(
+          (token * 17U + rank * 31U) % experts);
+      for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+        // Distinct experts on one destination node make the node-level
+        // payload-dedup traffic reduction directly measurable.
+        const auto expert = (base + slot * 8U) % experts;
+        exact[rank].selected_experts.push_back(
+            static_cast<std::int32_t>(expert));
+        ++counts[static_cast<std::size_t>(rank) * experts + expert];
+        seen_node[config.topology.expert_to_rank[expert]] = true;
+      }
+      for (std::uint32_t node = 0; node < world; ++node)
+        summaries[static_cast<std::size_t>(rank) * world + node] +=
+            seen_node[node] ? 1U : 0U;
+    }
+  }
+  auto execution = megamoe::cuda::make_cuda_execution("transport-bench", 0);
+  auto session = megamoe::make_collective_session("transport-bench", world,
+                                                   9100);
+  auto context = megamoe::make_rank_collective_context(
+      session, 0, execution.token());
+  auto dispatch = megamoe::cuda::testing::materialize_fake_device_collectives(
+      config, context, execution, exact[0], tokens, counts, summaries);
+  megamoe::cuda::ActivationTransportPoolConfig pool_config;
+  pool_config.max_tokens_per_rank = tokens;
+  pool_config.max_hidden_size = hidden;
+  pool_config.max_top_k = top_k;
+  pool_config.max_world_size = world;
+  pool_config.max_nodes = world;
+  pool_config.max_destination_rows_per_rank = tokens * top_k;
+  pool_config.channels = 1;
+  pool_config.ring_slots_per_source_channel = 8;
+  pool_config.max_inflight_generations = 1;
+  const auto setup_start = Clock::now();
+  auto pool = megamoe::cuda::make_activation_transport_pool(
+      session, execution, pool_config);
+  const auto setup_us = std::chrono::duration<double, std::micro>(
+                            Clock::now() - setup_start)
+                            .count();
+  std::vector<megamoe::transport::BFloat16> host(
+      static_cast<std::size_t>(tokens * hidden));
+  for (std::size_t i = 0; i < host.size(); ++i)
+    host[i].bits = static_cast<std::uint16_t>(0x3f00U + (i % 127U));
+  auto activation =
+      megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          host, tokens, hidden, context, execution, pool);
+  megamoe::transport::ActivationTransportConfig transport_config;
+  transport_config.hidden_size = hidden;
+  transport_config.channels = 1;
+  transport_config.ring_slots_per_source_channel = 8;
+  megamoe::cuda::DeviceActivationTransport transport(session, execution, pool);
+  std::vector<double> total;
+  std::vector<double> dispatch_relay;
+  std::vector<double> combine_reduce;
+  megamoe::cuda::ActivationTransportDeviceAudit last_audit;
+  for (std::uint32_t iteration = 0; iteration < 60; ++iteration) {
+    auto result = transport.run_synthetic(dispatch, activation, transport_config);
+    if (iteration >= 10) {
+      total.push_back(result.timings().total_us);
+      dispatch_relay.push_back(result.timings().dispatch_relay_us);
+      combine_reduce.push_back(result.timings().combine_reduce_us);
+    }
+    last_audit = result.audit();
+  }
+  const auto total_stats = summarize(total);
+  const auto dispatch_stats = summarize(dispatch_relay);
+  const auto reduce_stats = summarize(combine_reduce);
+  const auto usage = pool.usage();
+  const auto print_stats = [](const char *name, const Statistics &stats) {
+    std::cout << "  " << name << " mean=" << stats.mean
+              << " p50=" << stats.p50 << " p95=" << stats.p95
+              << " min=" << stats.minimum << " max=" << stats.maximum
+              << '\n';
+  };
+  std::cout << "Activation transport benchmark: tokens/rank=" << tokens
+            << " hidden=" << hidden << " top_k=" << top_k
+            << " logical_world=" << world
+            << " backend=device-simulation (no GIN/RDMA)\n"
+            << "  one_time_pool_setup_us=" << setup_us << '\n'
+            << "  raw_cross_node_payload_bytes="
+            << last_audit.raw_cross_node_payload_bytes << '\n'
+            << "  deduplicated_cross_node_payload_bytes="
+            << last_audit.deduplicated_cross_node_payload_bytes << '\n'
+            << "  device_workspace_bytes=" << usage.device_bytes << '\n'
+            << "  pinned_workspace_bytes=" << usage.pinned_bytes << '\n';
+  print_stats("dispatch_relay_us", dispatch_stats);
+  print_stats("combine_reduce_us", reduce_stats);
+  print_stats("transport_steady_total_us", total_stats);
+  std::cout
+      << "TRANSPORT_BENCH_JSON {\"schema\":1,\"warmup\":10,\"measured\":50,"
+         "\"backend\":\"device-simulation\",\"one_time_pool_setup_us\":"
+      << setup_us << ",\"raw_cross_node_payload_bytes\":"
+      << last_audit.raw_cross_node_payload_bytes
+      << ",\"deduplicated_cross_node_payload_bytes\":"
+      << last_audit.deduplicated_cross_node_payload_bytes
+      << ",\"device_workspace_bytes\":" << usage.device_bytes
+      << ",\"pinned_workspace_bytes\":" << usage.pinned_bytes
+      << ",\"dispatch_relay_us\":{\"mean\":" << dispatch_stats.mean
+      << ",\"p50\":" << dispatch_stats.p50 << ",\"p95\":"
+      << dispatch_stats.p95 << ",\"min\":" << dispatch_stats.minimum
+      << ",\"max\":" << dispatch_stats.maximum
+      << "},\"combine_reduce_us\":{\"mean\":" << reduce_stats.mean
+      << ",\"p50\":" << reduce_stats.p50 << ",\"p95\":"
+      << reduce_stats.p95 << ",\"min\":" << reduce_stats.minimum
+      << ",\"max\":" << reduce_stats.maximum
+      << "},\"steady_total_us\":{\"mean\":" << total_stats.mean
+      << ",\"p50\":" << total_stats.p50 << ",\"p95\":"
+      << total_stats.p95 << ",\"min\":" << total_stats.minimum
+      << ",\"max\":" << total_stats.maximum << "}}\n";
+}
+
 void benchmark(std::uint32_t world) {
   const auto config = make_config(1, world, 384, 6, 64);
   std::vector<megamoe::RankRoutingInput> routes(world);
@@ -2033,6 +2352,34 @@ int main(int argc, char **argv) {
     }
     if (argc == 3 && std::string(argv[1]) == "--bench") {
       benchmark(static_cast<std::uint32_t>(parse_u64(argv[2])));
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--transport-bench") {
+      transport_benchmark();
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--transport-capability") {
+      const auto capability =
+          megamoe::cuda::probe_activation_transport_capability(8);
+      std::cout << "TRANSPORT_CAPABILITY compiled_nccl="
+                << capability.compiled_nccl_version
+                << " runtime_nccl=" << capability.runtime_nccl_version
+                << " device_headers=" << capability.nccl_device_headers
+                << " gin_headers=" << capability.gin_header_api
+                << " gin_runtime_symbols=" << capability.gin_runtime_symbols
+                << " gin_usable=" << capability.gin_usable
+                << " system_scope_atomics="
+                << capability.system_scope_atomics
+                << " reason='" << capability.gin_unavailable_reason << "'\n";
+      for (std::size_t i = 0; i < capability.peer_access_matrix.size(); ++i)
+        std::cout << static_cast<unsigned int>(
+            capability.peer_access_matrix[i]);
+      std::cout << '\n';
+      std::cout << "LOCAL_P2P_DEVICE_PUT_GBPS gpu0_to_gpu1="
+                << megamoe::cuda::testing::measure_local_p2p_put_bandwidth_gbps(
+                       0, 1, 64U * 1024U * 1024U, 5, 20)
+                << " bytes_per_sample=" << (64U * 1024U * 1024U)
+                << " warmup=5 measured=20\n";
       return 0;
     }
     if (argc >= 14 && std::string(argv[1]) == "--rank-runner") {

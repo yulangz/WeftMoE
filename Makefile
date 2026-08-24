@@ -11,6 +11,7 @@ LIB_SOURCES := \
 	src/metadata/notify_dispatch.cpp \
 	src/metadata/serialize.cpp \
 	src/transport/bootstrap_channel.cpp \
+	src/transport/activation_protocol.cpp \
 	src/transport/host_fake_count_exchange.cpp \
 	src/scoreboard/workspace_plan.cpp
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
@@ -27,10 +28,11 @@ CUDA_RUN_ENV := $(if $(NCCL_RUNTIME_LIB_DIR),LD_LIBRARY_PATH=$(NCCL_RUNTIME_LIB_
 COMPUTE_SANITIZER ?= compute-sanitizer
 CUDA_LIB_SOURCES := \
 	src/cuda/device_notify.cu \
+	src/cuda/activation_transport.cu \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -63,6 +65,13 @@ cuda-protocol-test: $(BUILD_DIR)/test_cuda_notify
 
 cuda-bench: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --bench 1
+
+cuda-transport-test: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --transport-capability
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --device-smoke
+
+cuda-transport-bench: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --transport-bench
 
 cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke

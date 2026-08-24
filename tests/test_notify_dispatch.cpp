@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,7 @@
 #include "megamoe/metadata/serialize.hpp"
 #include "megamoe/scoreboard/workspace_plan.hpp"
 #include "megamoe/transport/count_exchange.hpp"
+#include "megamoe/transport/activation_protocol.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 
@@ -488,6 +490,62 @@ void test_existing_shapes_descriptors_and_repeatability() {
   REQUIRE(many_handles[0]->outgoing.destination_node_mask ==
           std::vector<std::uint64_t>({1, std::uint64_t{1} << 8U}));
   REQUIRE(many_handles[0]->transport.outgoing_signals.size() == 73);
+}
+
+void test_activation_transport_protocol_oracle() {
+  auto config = make_config(2, 2, 8, 3, 4);
+  config.topology.expert_to_rank = {0, 1, 2, 3, 2, 3, 0, 1};
+  std::vector<RankRoutingInput> inputs(4);
+  inputs[0] = {3, {4, 1, 5, 0, 3, 6, 2, 7, 4}};
+  const auto handles = megamoe::build_notify_dispatch_for_testing(
+      config, inputs, "transport-oracle", 77);
+  megamoe::transport::ActivationTransportConfig transport_config;
+  transport_config.hidden_size = 33;
+  transport_config.channels = 1;
+  transport_config.ring_slots_per_source_channel = 2;
+  std::vector<megamoe::transport::BFloat16> activations(3U * 33U);
+  for (std::size_t i = 0; i < activations.size(); ++i)
+    activations[i] = megamoe::transport::float_to_bfloat16(
+        static_cast<float>((i * 17U) % 101U) / 32.0F);
+  const auto canonical = megamoe::transport::simulate_activation_transport(
+      handles[0], activations, transport_config, 1);
+  std::vector<std::uint64_t> reversed(
+      handles[0]->transport.outgoing_packets.size());
+  std::iota(reversed.rbegin(), reversed.rend(), std::uint64_t{0});
+  const auto reordered = megamoe::transport::simulate_activation_transport(
+      handles[0], activations, transport_config, 1, reversed);
+  REQUIRE(canonical.combined_tokens.size() == activations.size());
+  REQUIRE(canonical.contribution_by_route == reordered.contribution_by_route);
+  REQUIRE(canonical.combined_tokens == reordered.combined_tokens);
+  REQUIRE(canonical.canonical_expert_rows == reordered.canonical_expert_rows);
+  REQUIRE(canonical.audit.dispatch_packets ==
+          handles[0]->transport.outgoing_packets.size());
+  REQUIRE(canonical.audit.relayed_fanout == 9);
+  REQUIRE(canonical.audit.synthetic_contributions == 9);
+
+  auto many = make_config(73, 1, 73, 2, 8);
+  std::vector<RankRoutingInput> many_inputs(73);
+  many_inputs[0] = {1, {0, 72}};
+  const auto many_handles = megamoe::build_notify_dispatch_for_testing(
+      many, many_inputs, "transport-73", 78);
+  transport_config.hidden_size = 7;
+  std::vector<megamoe::transport::BFloat16> many_activations(7);
+  const auto many_result = megamoe::transport::simulate_activation_transport(
+      many_handles[0], many_activations, transport_config, 2);
+  REQUIRE(many_handles[0]->outgoing.node_mask_words == 2);
+  REQUIRE(many_result.audit.dispatch_packets == 2);
+  REQUIRE(many_result.audit.deduplicated_cross_node_payload_bytes == 14);
+  REQUIRE(many_result.audit.raw_cross_node_payload_bytes == 14);
+
+  auto invalid = transport_config;
+  invalid.ring_slots_per_source_channel = 0;
+  expect_error(NotifyErrorCode::TransportProtocolFailure,
+               [&] {
+                 (void)megamoe::transport::simulate_activation_transport(
+                     many_handles[0], many_activations, invalid, 2);
+               },
+               {"phase=activation-transport",
+                "field=ring_slots_per_source_channel"});
 }
 
 void test_topology_route_capacity_and_overflow() {
@@ -1821,6 +1879,8 @@ int main() {
        test_rank_local_async_and_deterministic_mapping},
       {"existing_shapes_descriptors_and_repeatability",
        test_existing_shapes_descriptors_and_repeatability},
+      {"activation_transport_protocol_oracle",
+       test_activation_transport_protocol_oracle},
       {"topology_route_capacity_and_overflow",
        test_topology_route_capacity_and_overflow},
       {"typed_storage_lifetimes_and_unwaited_destruction",

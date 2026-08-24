@@ -5,7 +5,7 @@ available without CUDA or NCCL. The optional device slice requires NVCC, CUDA
 runtime/development files, NCCL headers, and a runtime NCCL library compatible
 with the installed driver/toolkit.
 
-## Observed stage-3 environment
+## Observed stage-4 environment and transport capability
 
 Both the local host and `ssh -p 2222 root@10.10.19.233` were inspected without
 changing system configuration:
@@ -22,6 +22,20 @@ changing system configuration:
 - `/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2`
   reports `2.28.3+cuda12.9` and is the compatible runtime used by tests. The
   code is compiled against the system 2.29.7 headers and uses stable APIs only.
+- `/usr/include/nccl_device/gin.h` (2.29.7) exposes GIN put, remote indexed/VA
+  signals, local counters, flush/wait, and `ncclTeamRail`. The selected 2.28.3
+  runtime does not export `ncclGinOutboxCreateRequirement` or
+  `ncclGinInboxA2ACreateRequirement`; the project reports `gin_usable=0` and
+  never launches that backend.
+- all 64 entries of the local 8x8 CUDA peer-access matrix are enabled; a
+  GPU0-to-GPU1 device-kernel store plus system-scope signal completed
+  correctly. The 64 MiB, 5-warmup/20-measure device-put probe reported
+  367.094 GB/s from GPU0 to GPU1. `nvidia-smi topo -m` reports NV18 between
+  every pair.
+- eight active `mlx5_bond_0..7` RoCE devices exist on each host. Observed ports
+  use Ethernet/RoCE, active MTU 4096, and expose link-local plus IPv4-mapped
+  RoCE v1/v2 GIDs. `ibv_devinfo` reports HCA atomics and ODP read/write/atomic.
+  An HCA alone does not make the NCCL 2.28 runtime GIN-capable.
 
 An isolated `sm_90a` compile check is supported, but architecture-accelerated
 `sm_90a` paths are not selected or claimed runtime-validated on this ambiguous
@@ -98,6 +112,11 @@ make BUILD_DIR=build-cuda ENABLE_CUDA=1 \
 
 # Compile-only architecture check; do not infer runtime coverage.
 make BUILD_DIR=build-cuda cuda-sm90-compile
+
+# Auditable transport capability, correctness/sanitizer path and benchmark.
+LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --transport-capability
+LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --device-smoke
+LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --transport-bench
 ```
 
 `cuda-test-local` runs real NCCL worlds 1, 2, and 8. Each world runs 25 fixed
@@ -186,6 +205,33 @@ closed-loop 73-node path. All three tools were available locally and reported
 `compute-sanitizer` executable; its ordinary 73-node path, world 1/8 tests, and
 host ASan/UBSan still ran from the clean export.
 ```
+
+The transport portion of `--device-smoke` executes the production persistent
+worker for world=1 and a full 73-node descriptor fixture, compares contribution
+and combine bytes with the C++ oracle, repeats ring epoch reuse 20 times, checks
+pool exhaustion/recovery and cross-generation rejection, and executes a true
+GPU0-to-GPU1 P2P put plus system-scope signal. Validation download is explicit;
+the measured steady interval creates no device/pinned/event resource.
+
+## Activation transport performance baseline
+
+`--transport-bench` uses `tokens/rank=8192`, `hidden=7168`, `top-k=6`, a
+logical eight-node descriptor topology, 10 warmups and 50 samples. It measures
+the transport-only device-simulation worker, not GIN/RDMA/network bandwidth.
+
+| stage | mean (us) | P50 | P95 | min | max |
+|---|---:|---:|---:|---:|---:|
+| dispatch + relay + synthetic return | 74034.2 | 74022.9 | 74124.4 | 73951.7 | 74156.0 |
+| deterministic combine reduce | 4540.49 | 4804.38 | 4809.60 | 4023.58 | 4810.72 |
+| steady transport total | 78589.1 | 78801.9 | 78844.4 | 78193.6 | 78853.6 |
+
+One-time transport-pool setup was 5297.55 us. The single-slot pool owns
+2,349,929,848 device bytes and 120 pinned bytes. The fixture deliberately puts
+six selected experts on one destination node: raw traffic is 616,562,688 bytes
+and node-deduplicated payload traffic is 102,760,448 bytes (6x reduction).
+`TRANSPORT_BENCH_JSON` emits the same fields. These numbers contain no network
+transfer and must not be compared to a future GIN/Socket result without keeping
+the backend label.
 
 ## Notify performance baseline
 

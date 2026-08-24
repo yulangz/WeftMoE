@@ -21,6 +21,9 @@ enum class NotifyErrorCode {
     NcclFailure,
     ControlProtocolFailure,
     ResourceExhausted,
+    BackendUnavailable,
+    TransportProtocolFailure,
+    TransportTimeout,
 };
 
 class NotifyDispatchError final : public std::runtime_error {

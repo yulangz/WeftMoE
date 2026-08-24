@@ -4,9 +4,11 @@ MegaMOE targets deterministic training MoE execution on H200/SM90 and later
 devices. The current vertical slice implements rank-local deterministic Notify
 Dispatch in production C++/CUDA, a fixed-width distributed control agreement,
 a real NCCL AllGather count backend, opaque device metadata leases, and an
-independent Python oracle. It does **not**
-implement NCCL GIN/LSA, RDMA, activation movement, or persistent
-forward/backward kernels.
+independent Python oracle. Phase 4 adds a transport-only BF16 data-plane
+baseline: typed router activation leases, a bounded sequence/credit ring,
+canonical relay, synthetic contribution return, and fixed expert-order combine
+inside a persistent CUDA worker. It does **not** implement FC1/FC2, backward,
+or claim NCCL GIN/RDMA support on the currently selected NCCL 2.28.3 runtime.
 
 ## Supported topology contract
 
@@ -197,6 +199,35 @@ Packets are ordered by `(destination_node, local_token_id)`; packet identity is
 `(source_rank, destination_node, sequence_on_link)`. Fan-out is sorted by expert
 ID and references the precomputed canonical row. Future aggregation may change
 packet boundaries but cannot change route destination or canonical row.
+
+## Activation transport boundary
+
+`SelectedActivationLease<BFloat16>` is the router-to-transport boundary. It
+binds contiguous `[tokens,hidden]` BF16 storage to the producer session,
+generation, execution, device, owner, and ready event without exposing a
+native address. `ActivationTransportResourcePool` preallocates every input,
+ring, canonical-row, contribution, combine, status, and CUDA-event slot. A
+generation has one epoch lease; exhaustion is `ResourceExhausted`, and a
+failed completion quarantines rather than reuses a slot.
+
+The correctness worker launches one 128-thread CTA per available SM. Links are
+assigned by `link % gridDim.x`; each link walks its canonical packet range in
+monotonic sequence order, writes `sequence % ring_slots`, publishes payload
+with a system-scope release signal, relays fan-out to the precomputed row, and
+returns the credit. There is no dynamic ready queue and neither packet arrival
+nor an atomic return value selects a row. After dispatch/relay counters reach
+their exact expected values, all CTAs transition to synthetic contribution and
+TopKReduce. Contributions have one slot per original route; reduction follows
+device `combine_order` (expert-ID order), accumulates in FP32, and casts once to
+BF16. The synthetic transform is only a transport oracle and is not FC1/FC2.
+
+The 2.29.7 headers contain `ncclGin` device put, remote signal, local counter,
+and rail-team APIs, but the compatible 2.28.3 runtime selected for these hosts
+does not export the required GIN requirement symbols. `NcclGinDevice` therefore
+returns `BackendUnavailable`. The checked-in device-simulation backend and the
+P2P put/signal probe must not be described as GIN, RDMA, or a cross-host
+persistent backend. A host-enqueued NCCL fallback enum is reserved but also
+fails closed until its rank-local packet coordinator is attached.
 
 ## Repository layout
 

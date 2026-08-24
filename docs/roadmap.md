@@ -54,19 +54,35 @@ planning scan, hierarchical/GIN count exchange, graph capture, and SM90-specific
 tuning remain open. These may replace the baseline without changing layout
 semantics.
 
-## Phase 4 — single-node forward persistent MegaKernel
+## Phase 4 — activation transport data plane (in progress)
 
-- Canonical activation dispatch, tile scoreboard, FC1 + SwiGLU, FC2, fixed-order
-  combine, and partial-M tiles.
-- Release/acquire scoreboard publication and generation-safe workspace reuse.
-- H200 tile/worker autotune without changing canonical mapping.
+Completed correctness components:
 
-## Phase 5 — multi-node forward
+- typed BF16 activation provenance and a session-level transport pool;
+- bounded per-link ring slots, monotonic sequences, credits, node-level packet
+  descriptors, canonical relay, independent contribution slots, and
+  expert-order FP32/BF16 combine;
+- transport-only persistent CUDA worker, 73-node device simulation, a real
+  local CUDA peer put/system-signal probe, deterministic oracle, and sanitizer
+  coverage;
+- an explicit GIN capability probe and fail-closed backend boundary.
 
-- Same-rail RDMA proxy using the enforced homogeneous topology.
-- Bounded ingress rings, credits, sequence numbers, node-level payload dedup,
-  and descriptor delivery/retention.
-- Packet aggregation tuning with explicit summary counts and unchanged rows.
+Still required before phase 4 closes:
+
+- attach CUDA IPC/P2P mappings to the complete rank-local packet/relay worker,
+  rather than only the current isolated peer-put probe;
+- implement and validate the host-enqueued NCCL Send/Recv correctness fallback
+  across two hosts, including combine return;
+- enable and validate true NCCL GIN put/signal/local-completion after a
+  compatible runtime/plugin/device-comm setup is available;
+- distributed timeout/quarantine and two-live-generation stress on those real
+  backends.
+
+## Phase 5 — forward compute integration
+
+- Add FC1, SwiGLU, FC2 and partial-M scoreboards to the frozen transport worker
+  roles without changing transport identities or canonical rows.
+- H200 tile/worker autotune and SM90a runtime validation.
 
 ## Phase 6 — backward persistent MegaKernel
 

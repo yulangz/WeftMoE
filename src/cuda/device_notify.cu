@@ -1,4 +1,5 @@
 #include "cuda/device_notify_internal.hpp"
+#include "cuda/activation_transport_internal.hpp"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -2939,6 +2940,31 @@ void DeviceDispatchConsumerLease::finish() {
     return;
   }
   impl_->release_noexcept();
+}
+
+DeviceDispatchKernelView
+ActivationTransportBridge::view(DeviceDispatchConsumerLease &consumer) {
+  if (!consumer.impl_ ||
+      consumer.impl_->state != DeviceDispatchConsumerState::Acquired)
+    invalid("phase=activation-transport-view, field=consumer, rank=n/a, "
+            "expected=Acquired, actual=invalid");
+  return consumer.impl_->kernel_view();
+}
+
+void ActivationTransportBridge::submit(
+    DeviceDispatchConsumerLease &consumer) {
+  if (!consumer.impl_)
+    invalid("phase=activation-transport-submit, field=consumer, rank=n/a, "
+            "expected=valid, actual=empty");
+  consumer.impl_->record_completion();
+}
+
+const RankCollectiveContext &ActivationTransportBridge::context(
+    const DeviceDispatchConsumerLease &consumer) {
+  if (!consumer.impl_)
+    invalid("phase=activation-transport-context, field=consumer, rank=n/a, "
+            "expected=valid, actual=empty");
+  return consumer.impl_->context;
 }
 
 class DeviceDispatchTestBridge {

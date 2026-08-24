@@ -481,5 +481,47 @@ Before any future persistent launch can read metadata or workspace buffers,
 - calling rank, world size, experts, top-k, and M tile;
 - canonical-row, M-tile, outgoing-route, and packet capacities.
 
-Default plans, expired plans, and plans from another handle fail safely. No
-persistent launch implementation exists in this phase.
+Default plans, expired plans, and plans from another handle fail safely.
+
+## Phase-4 activation ownership and worker
+
+The public router handoff is `SelectedActivationLease<BFloat16>`, not a generic
+device buffer. Its immutable provenance is dtype/layout, `[tokens,hidden]`
+shape and capacity, device, session identity, exact generation, producer
+execution, allocation owner, and precreated ready event. Only the private
+launch bridge sees its address. The host upload function is explicitly in the
+`testing` namespace and acquires a preallocated input slot.
+
+`ActivationTransportResourcePool` is session-level and capacity-planned from
+maximum tokens, hidden width, top-k, world, nodes, destination rows, channels,
+ring slots, and in-flight generations. Each slot contains input, bounded
+ingress ring/header/sequence, canonical owned rows, route contribution/return,
+combined output, device status, pinned status, and all events. Slot state is
+`Available -> InUse(epoch) -> Available|Quarantined`; the shared slot lease is
+retained by input and output handles, so destroying either public wrapper
+cannot permit premature reuse. There is no steady CUDA allocation or event
+creation fallback.
+
+The transport-only persistent worker launches one CTA per SM. Runtime link
+`L` belongs to CTA `L % gridDim.x`. A CTA scans immutable packet descriptors in
+canonical order and handles every assigned link in monotonic sequence order.
+Physical slot is `sequence % ring_slots`; payload stores precede a
+system-scope release signal, relay reads the signaled payload, writes only the
+Notify-provided canonical row, and returns the credit after fan-out. This
+regular link scan is not a dynamic ready queue. Packet/row identity never uses
+atomic-return ordering.
+
+Once exact dispatch and fan-out counters complete, CTAs transition to the
+synthetic-return/TopKReduce phase. Each route has its own contribution slot.
+Reduction traverses `combine_order`, which is global expert-ID order, performs
+FP32 additions, and casts once to BF16. Synthetic contribution is a documented
+transport-validation transform; no FC1, SwiGLU, or FC2 is present.
+
+The local device P2P capability path performs an actual peer store followed by
+a system-scope signal. It currently proves hardware/memory-ordering capability
+but is not yet attached to the full multi-rank relay worker. Likewise, 2.29.7
+GIN headers are compile-visible while the selected 2.28.3 runtime lacks GIN
+requirement symbols; the GIN backend fails with `BackendUnavailable`. The
+device-simulation result is never labeled GIN/RDMA, and the reserved
+host-enqueued NCCL fallback also fails closed until its packet coordinator and
+combine return are implemented.

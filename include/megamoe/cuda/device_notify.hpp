@@ -21,6 +21,7 @@ template <class T> class SelectedExpertRouteLease;
 using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
 class DeviceDispatchConsumerLease;
 class DeviceDispatchTestBridge;
+class ActivationTransportBridge;
 class DeviceRouteProvenanceBridge;
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
@@ -249,6 +250,7 @@ private:
   std::shared_ptr<Impl> impl_;
   friend class DeviceDispatchHandle;
   friend class DeviceDispatchTestBridge;
+  friend class ActivationTransportBridge;
   friend DispatchHandle download_device_metadata_for_validation(
       const DeviceDispatchHandle &, const CudaExecution &);
 };
