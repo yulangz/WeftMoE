@@ -64,14 +64,14 @@ BFloat16 float_to_bfloat16(float value) noexcept {
 const char *activation_transport_backend_name(
     ActivationTransportBackend backend) noexcept {
   switch (backend) {
-  case ActivationTransportBackend::LocalCudaP2p:
-    return "cuda-device-p2p";
-  case ActivationTransportBackend::NcclGinDevice:
-    return "nccl-gin-device";
-  case ActivationTransportBackend::NcclSendRecvHostEnqueuedFallback:
-    return "nccl-sendrecv-host-enqueued-fallback";
   case ActivationTransportBackend::DeviceSimulation:
     return "device-simulation";
+  case ActivationTransportBackend::LocalCudaP2p:
+    return "local-cuda-p2p";
+  case ActivationTransportBackend::NcclSocketFallback:
+    return "nccl-socket-host-enqueued-fallback";
+  case ActivationTransportBackend::Gin:
+    return "nccl-gin-device";
   }
   return "unknown";
 }
@@ -149,8 +149,30 @@ SyntheticTransportResult simulate_activation_transport(
                                config.channels, "link_count", rank),
                    "link_count", rank),
       config.ring_slots_per_source_channel);
-  std::vector<std::uint64_t> last_sequence(link_credits.size(),
-                                           std::numeric_limits<std::uint64_t>::max());
+  // Validate the descriptor protocol independently of simulated arrival.
+  // Every link must contain exactly the monotonic sequence 0..N-1. An
+  // arrival permutation may delay a sequence, but cannot redefine or skip it.
+  std::vector<std::vector<std::uint64_t>> sequence_by_link(link_credits.size());
+  for (const auto &packet : packets) {
+    if (packet.identity.destination_node >= metadata.config.topology.num_nodes ||
+        packet.channel >= config.channels)
+      protocol_error("packet_descriptor", rank, "valid node/channel",
+                     "out of range");
+    const auto link = checked_size(
+        checked_mul(packet.identity.destination_node, config.channels,
+                    "sequence link", rank) + packet.channel,
+        "sequence link", rank);
+    sequence_by_link[link].push_back(packet.identity.sequence_on_link);
+  }
+  for (std::size_t link = 0; link < sequence_by_link.size(); ++link) {
+    auto sequences = sequence_by_link[link];
+    std::sort(sequences.begin(), sequences.end());
+    for (std::size_t index = 0; index < sequences.size(); ++index) {
+      if (sequences[index] != index)
+        protocol_error("packet.sequence", rank, std::to_string(index),
+                       std::to_string(sequences[index]));
+    }
+  }
   std::vector<std::uint8_t> route_ready(
       checked_size(route_count, "route_count", rank), 0);
 
@@ -175,16 +197,6 @@ SyntheticTransportResult simulate_activation_transport(
       link_credits[link] = 1;
     }
     --link_credits[link];
-    const auto expected_sequence =
-        last_sequence[link] == std::numeric_limits<std::uint64_t>::max()
-            ? packet.identity.sequence_on_link
-            : last_sequence[link] + 1U;
-    if (packet.identity.sequence_on_link != expected_sequence &&
-        arrival_order.empty())
-      protocol_error("packet.sequence", rank,
-                     std::to_string(expected_sequence),
-                     std::to_string(packet.identity.sequence_on_link));
-    last_sequence[link] = packet.identity.sequence_on_link;
     ++result.audit.dispatch_packets;
     result.audit.peak_ring_slots = std::max<std::uint64_t>(
         result.audit.peak_ring_slots,

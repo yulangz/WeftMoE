@@ -1,12 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "megamoe/cuda/device_notify.hpp"
+#include "megamoe/cuda/nccl_count_exchange.hpp"
 #include "megamoe/transport/activation_protocol.hpp"
 
 namespace megamoe::cuda {
@@ -39,6 +41,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
+  friend class LocalCudaP2pActivationTransport;
 };
 
 struct ActivationTransportPoolConfig {
@@ -79,6 +82,7 @@ private:
       ActivationTransportPoolConfig);
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
+  friend class LocalCudaP2pActivationTransport;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -94,6 +98,9 @@ struct ActivationTransportExpectation {
 };
 
 struct ActivationTransportTimings {
+  double dispatch_put_us = 0;
+  double relay_us = 0;
+  double synthetic_return_us = 0;
   double dispatch_relay_us = 0;
   double combine_reduce_us = 0;
   double total_us = 0;
@@ -107,6 +114,7 @@ struct ActivationTransportDeviceAudit {
   std::uint64_t packet_count = 0;
   std::uint64_t fanout_count = 0;
   std::uint64_t credit_stalls = 0;
+  std::uint64_t peak_ring_slots = 0;
   std::uint64_t activation_d2h_bytes = 0;
   std::uint64_t activation_h2d_bytes = 0;
   std::uint64_t hot_path_allocations = 0;
@@ -126,6 +134,7 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class DeviceActivationTransport;
+  friend class LocalCudaP2pActivationTransport;
   friend class ActivationTransportBridge;
   friend struct ActivationTransportValidationDownload;
 };
@@ -136,12 +145,39 @@ public:
                             const CudaExecution &execution,
                             const ActivationTransportResourcePool &pool);
 
+  // Explicit correctness simulation. It can only publish a
+  // DeviceSimulation audit and never selects a production backend by enum.
+  DeviceActivationTransportHandle run_device_simulation_synthetic(
+      const DeviceDispatchHandle &dispatch,
+      const BFloat16ActivationLease &activations,
+      const transport::ActivationTransportConfig &config);
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+struct ActivationTransportRunOptions {
+  GenerationCancellationToken cancellation;
+  // Zero means no deadline. Multi-rank cancellation/deadline must be requested
+  // consistently by every healthy rank in the local P2P team.
+  std::chrono::microseconds deadline_after{0};
+};
+
+// A real, node-local, multi-process CUDA IPC backend. Construction exchanges
+// and validates pool IPC handles over the existing node-local NCCL session.
+// It fails closed unless every local peer mapping is established.
+class LocalCudaP2pActivationTransport {
+public:
+  LocalCudaP2pActivationTransport(
+      const NcclSession &session, const CudaExecution &execution,
+      const ActivationTransportResourcePool &pool);
+
   DeviceActivationTransportHandle run_synthetic(
       const DeviceDispatchHandle &dispatch,
       const BFloat16ActivationLease &activations,
       const transport::ActivationTransportConfig &config,
-      transport::ActivationTransportBackend backend =
-          transport::ActivationTransportBackend::DeviceSimulation);
+      const ActivationTransportRunOptions &options = {});
 
 private:
   struct Impl;
@@ -163,8 +199,10 @@ struct ActivationTransportCapability {
   std::uint32_t compiled_nccl_version = 0;
   std::uint32_t runtime_nccl_version = 0;
   bool nccl_device_headers = false;
-  bool gin_header_api = false;
-  bool gin_runtime_symbols = false;
+  bool gin_headers_available = false;
+  bool gin_symbols_present = false;
+  bool gin_runtime_initializable = false;
+  bool gin_backend_implemented = false;
   bool gin_usable = false;
   bool system_scope_atomics = false;
   std::vector<std::uint8_t> peer_access_matrix;

@@ -44,6 +44,11 @@ struct NcclSessionState final : BackendSessionState {
   ~NcclSessionState() noexcept override;
 };
 
+class NcclSessionAccess {
+public:
+  static std::shared_ptr<NcclSessionState> checked(const NcclSession &session);
+};
+
 enum class ConsumerEventSlotState : std::uint8_t {
   Available,
   InUse,

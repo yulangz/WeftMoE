@@ -502,14 +502,35 @@ retained by input and output handles, so destroying either public wrapper
 cannot permit premature reuse. There is no steady CUDA allocation or event
 creation fallback.
 
-The transport-only persistent worker launches one CTA per SM. Runtime link
-`L` belongs to CTA `L % gridDim.x`. A CTA scans immutable packet descriptors in
-canonical order and handles every assigned link in monotonic sequence order.
-Physical slot is `sequence % ring_slots`; payload stores precede a
-system-scope release signal, relay reads the signaled payload, writes only the
-Notify-provided canonical row, and returns the credit after fan-out. This
-regular link scan is not a dynamic ready queue. Packet/row identity never uses
-atomic-return ordering.
+The simulation worker and local P2P worker are separate concrete types. The
+former can only publish `DeviceSimulation`; the latter is constructible only
+after all local rank processes exchange and validate versioned CUDA IPC arena
+handles using the existing secret NCCL bootstrap/session. It validates rank,
+world, device ordinal, session digest, generation, slot count, and arena bytes,
+opens only peer-accessible devices, and closes each owned mapping exactly once.
+Partial setup fails closed. No caller-supplied backend enum participates in an
+audit record.
+
+The local worker launches one CTA per SM. CTA 0 owns canonical outgoing packet
+order. CTA `1 + source_rank` owns that source's ingress link, so a slow source
+or relay cannot consume another link's sequence/credit state. Physical slot is
+`sequence % ring_slots`; every link has a monotonic 64-bit next sequence and
+bounded credit. Payload stores and headers precede `__threadfence_system` plus
+a system-scope signal; relay acquire-observes the signal, validates the exact
+generation/source/destination/route/row tuple, writes only the Notify-provided
+canonical row, and returns credit after consumption. Before launch a fixed
+device AllGather confirms that every rank selected the same pool slot and
+epoch. No activation is staged through host memory.
+
+Two sequence modes share the same header invariant. Small bounded rings use a
+per-slot system-scope release signal and return one credit only after consume;
+this is the wrap/slow-relay correctness path. If the planned ring can hold the
+entire checked per-link capacity, the producer cannot wrap or overwrite, so it
+publishes the same contiguous slot sequences with a monotonically increasing
+release watermark (every 64 entries and at tail). Consumers may read only
+sequences below that acquire-observed watermark. Completion return is likewise
+batched after the source-specific relay CTA has fenced all independent route
+slots. Packet identity, canonical row and reduction order are unchanged.
 
 Once exact dispatch and fan-out counters complete, CTAs transition to the
 synthetic-return/TopKReduce phase. Each route has its own contribution slot.
@@ -517,11 +538,14 @@ Reduction traverses `combine_order`, which is global expert-ID order, performs
 FP32 additions, and casts once to BF16. Synthetic contribution is a documented
 transport-validation transform; no FC1, SwiGLU, or FC2 is present.
 
-The local device P2P capability path performs an actual peer store followed by
-a system-scope signal. It currently proves hardware/memory-ordering capability
-but is not yet attached to the full multi-rank relay worker. Likewise, 2.29.7
-GIN headers are compile-visible while the selected 2.28.3 runtime lacks GIN
-requirement symbols; the GIN backend fails with `BackendUnavailable`. The
-device-simulation result is never labeled GIN/RDMA, and the reserved
-host-enqueued NCCL fallback also fails closed until its packet coordinator and
-combine return are implemented.
+The ordering probe copies 64 MiB with multiple producer blocks. Each block
+publishes its range before incrementing a completion counter; only the last
+block fences and signals. A destination kernel on an independent stream waits
+only on that signal and validates the whole payload before the source stream is
+synchronized. Its early-signal negative seam must observe corruption.
+
+GIN capability has five independent booleans: headers, full symbols, minimal
+runtime initialization, project backend implementation, and usable. Usable is
+their conjunction. The selected 2.28.3 runtime fails the symbol gate and this
+phase intentionally has no GIN implementation. Socket fallback is also absent.
+Neither can be confused with the real one-node CUDA IPC backend.

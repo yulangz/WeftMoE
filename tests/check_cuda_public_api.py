@@ -130,6 +130,42 @@ int main() {
   (void)handle.device().route_dst_row;
 }
 ''',
+    "activation_wrong_dtype": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  megamoe::cuda::SelectedActivationLease<std::uint16_t> wrong;
+}
+''',
+    "generic_activation_rebind": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  megamoe::DeviceBufferLease generic;
+  (void)megamoe::cuda::make_activation_input(generic);
+}
+''',
+    "raw_peer_pointer": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  megamoe::cuda::LocalCudaP2pActivationTransport backend;
+  (void)backend.peer_pointer(1);
+}
+''',
+    "private_ipc_factory": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() { (void)megamoe::cuda::make_local_p2p_ipc_mapping; }
+''',
+    "activation_backend_enum_spoof": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  megamoe::cuda::DeviceActivationTransport transport;
+  megamoe::cuda::DeviceDispatchHandle dispatch;
+  megamoe::cuda::BFloat16ActivationLease input;
+  megamoe::transport::ActivationTransportConfig config;
+  (void)transport.run_synthetic(
+      dispatch, input, config,
+      megamoe::transport::ActivationTransportBackend::LocalCudaP2p);
+}
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)

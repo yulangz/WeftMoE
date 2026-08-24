@@ -1252,6 +1252,15 @@ testing::NotifyCorruptionHook::with_packet_proxy(const DispatchHandle &source,
   return DispatchHandle(std::move(metadata), source.provenance_);
 }
 
+DispatchHandle testing::NotifyCorruptionHook::with_packet_sequence(
+    const DispatchHandle &source, std::size_t packet_index,
+    std::uint64_t value) {
+  auto metadata = std::make_shared<DispatchMetadata>(source.metadata());
+  metadata->transport.outgoing_packets.at(packet_index)
+      .identity.sequence_on_link = value;
+  return DispatchHandle(std::move(metadata), source.provenance_);
+}
+
 DispatchHandle testing::NotifyCorruptionHook::with_fanout_expert(
     const DispatchHandle &source, std::size_t packet_index,
     std::size_t target_index, std::uint32_t value) {

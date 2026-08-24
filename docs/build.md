@@ -27,11 +27,12 @@ changing system configuration:
   runtime does not export `ncclGinOutboxCreateRequirement` or
   `ncclGinInboxA2ACreateRequirement`; the project reports `gin_usable=0` and
   never launches that backend.
-- all 64 entries of the local 8x8 CUDA peer-access matrix are enabled; a
-  GPU0-to-GPU1 device-kernel store plus system-scope signal completed
-  correctly. The 64 MiB, 5-warmup/20-measure device-put probe reported
-  367.094 GB/s from GPU0 to GPU1. `nvidia-smi topo -m` reports NV18 between
-  every pair.
+- all 64 entries of the local 8x8 CUDA peer-access matrix are enabled. The
+  corrected 64 MiB probe uses multi-block completion, last-block signaling and
+  independent destination-stream validation; its early-signal negative seam is
+  required to fail. With 5 warmups/20 measurements it reported 299.852 GB/s
+  locally and 299.834 GB/s remotely for GPU0-to-GPU1. `nvidia-smi topo -m`
+  reports NV18 between every pair.
 - eight active `mlx5_bond_0..7` RoCE devices exist on each host. Observed ports
   use Ethernet/RoCE, active MTU 4096, and expose link-local plus IPv4-mapped
   RoCE v1/v2 GIDs. `ibv_devinfo` reports HCA atomics and ODP read/write/atomic.
@@ -58,12 +59,16 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking.
 - every public header as an isolated `-Werror` translation unit.
-- twenty-one compile-negative probes for the retired `wait`, `wait_preflight`, raw
+- twenty-six compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
   production coordinator constructor, generic route rebinding/wrong route
   dtype, raw dispatch views, removed generation handoff/reissue helpers, and
   the internal no-wait producer-race seam.
+
+The activation-specific additions reject wrong activation dtype, generic
+buffer rebinding, raw peer-pointer extraction, access to the private IPC
+factory, and the retired caller-selected backend-enum entry.
 - thirteen fake-runner/bootstrap-channel security groups covering success,
   local/remote failure, timeout and TERM-to-KILL escalation, SSH start failure,
   short/oversize bootstrap, runner exception, every 1/2/7/8/17/127/128-byte
@@ -208,14 +213,67 @@ the default `PATH`; explicit invocation from a clean export also reported
 0 errors/0 hazards for all three tools. Host ASan/UBSan and world 1/2/8 ran
 from the same clean export.
 
-The transport portion of `--device-smoke` executes the production persistent
-worker for world=1 and a full 73-node descriptor fixture, compares contribution
-and combine bytes with the C++ oracle, repeats ring epoch reuse 20 times, checks
-pool exhaustion/recovery and cross-generation rejection, and executes a true
-GPU0-to-GPU1 P2P put plus system-scope signal. Validation download is explicit;
-the measured steady interval creates no device/pinned/event resource.
+For the real two-process IPC test, `compute-sanitizer --target-processes all`
+preserves the one-shot bootstrap FD and the full Python oracle still passes,
+but NCCL 2.28.3 itself emits eight `cudaErrorNoKernelImageForDevice` reports
+from `ncclInitKernelsForDevice`; therefore that invocation exits nonzero and is
+not represented as a clean MegaMOE sanitizer result. Wrapping each rank
+separately is also invalid because the wrapper retains the inherited bootstrap
+write FD and prevents exact-frame EOF. The checked single-process two-GPU
+ordering path plus all MegaMOE device simulation/materialization kernels are
+covered by memcheck/racecheck/initcheck with zero reports; no NCCL suppression
+is installed.
+
+The transport portion of `--device-smoke` covers the device simulation oracle
+and ordering probe. Real independent-process local P2P is separate and cannot
+be silently replaced by simulation:
+
+```bash
+make BUILD_DIR=build-cuda NCCL_RUNTIME_LIB_DIR="$NCCL12" cuda-p2p-test
+make BUILD_DIR=build-cuda NCCL_RUNTIME_LIB_DIR="$NCCL12" cuda-p2p-bench
+```
+
+`cuda-p2p-test` runs real world 2 and 8 processes, 20 byte-identical rounds,
+and compares combined output, every route contribution, and every canonical
+expert row to `tests/run_local_activation_p2p.py`, which independently
+reimplements mapping and BF16 reduction.
 
 ## Activation transport performance baseline
+
+### Real local CUDA P2P (current)
+
+`cuda-p2p-bench` launches eight independent rank processes with real CUDA IPC
+mappings. For `tokens/rank=8192`, `hidden=7168`, `top-k=6`, it uses 10 warmups
+and 50 measured iterations. Each iteration is reduced to the slowest rank
+before statistics are computed. Worker spans overlap by design (relay and
+synthetic return progress concurrently), so stage spans do not sum to total.
+
+| span | mean (us) | P50 | P95 | min | max |
+|---|---:|---:|---:|---:|---:|
+| dispatch put | 175406.52 | 175405 | 175605 | 175156 | 175636 |
+| relay | 224831.42 | 224787 | 224964 | 224689 | 225007 |
+| synthetic return | 417737.06 | 417773 | 418050 | 417336 | 418107 |
+| expert-order combine/reduce | 8794.23 | 8793.76 | 8796.83 | 8790.85 | 8800.13 |
+| transport steady total | 426695.44 | 426735 | 427007 | 426294 | 427066 |
+
+Slowest-rank one-time pool/backend setup was 935156 us. Each rank's single-slot
+pool owns 3,089,435,048 device bytes and 168 pinned bytes. Raw six-route traffic
+is 704,643,072 bytes/rank; node-deduplicated proxy ingress is 117,440,512
+bytes/rank (6x reduction). The measured no-wrap capacity path had zero credit
+stalls and peak observed occupancy 1 because consumers kept pace with the
+published sequence watermark. `P2P_BENCH_JSON` contains the per-rank traffic,
+workspace, stall/occupancy, and slowest-rank distributions.
+
+The remote clean archive reproduced the same 10+50 benchmark with steady total
+mean/P50/P95/min/max of 432377.22/432356/432570/432127/432676 us and the same
+traffic/workspace cardinalities.
+
+This correctness-first result is substantially slower than the earlier device
+simulation and is not presented as final transport performance. Profiling
+points to serialized source-CTA packet relay and small-route peer stores as the
+next optimization target; it does not justify a GIN/RDMA claim.
+
+### Device simulation (previous comparison point)
 
 `--transport-bench` uses `tokens/rank=8192`, `hidden=7168`, `top-k=6`, a
 logical eight-node descriptor topology, 10 warmups and 50 samples. It measures

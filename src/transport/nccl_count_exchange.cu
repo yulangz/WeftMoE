@@ -257,6 +257,16 @@ struct NcclSession::Impl {
   CollectiveSession session;
 };
 
+std::shared_ptr<internal::NcclSessionState>
+internal::NcclSessionAccess::checked(const NcclSession &session) {
+  if (!session.impl_ || !session.impl_->state || !session.impl_->state->comm)
+    throw NotifyDispatchError(
+        NotifyErrorCode::NcclFailure,
+        "phase=nccl-session-access, field=session, rank=n/a, "
+        "expected=live NCCL session, actual=empty");
+  return session.impl_->state;
+}
+
 namespace {
 std::vector<std::byte> make_nccl_stable_identity(
     const std::vector<std::uint8_t> &bootstrap, const std::string &identity) {

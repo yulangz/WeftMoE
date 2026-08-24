@@ -7,8 +7,10 @@ a real NCCL AllGather count backend, opaque device metadata leases, and an
 independent Python oracle. Phase 4 adds a transport-only BF16 data-plane
 baseline: typed router activation leases, a bounded sequence/credit ring,
 canonical relay, synthetic contribution return, and fixed expert-order combine
-inside a persistent CUDA worker. It does **not** implement FC1/FC2, backward,
-or claim NCCL GIN/RDMA support on the currently selected NCCL 2.28.3 runtime.
+inside a persistent CUDA worker. `LocalCudaP2pActivationTransport` now uses
+real per-rank CUDA IPC mappings and independent rank processes; the explicit
+`DeviceActivationTransport` remains a simulation-only oracle. It does **not**
+implement FC1/FC2, backward, Socket transport, or NCCL GIN/RDMA.
 
 ## Supported topology contract
 
@@ -210,24 +212,28 @@ ring, canonical-row, contribution, combine, status, and CUDA-event slot. A
 generation has one epoch lease; exhaustion is `ResourceExhausted`, and a
 failed completion quarantines rather than reuses a slot.
 
-The correctness worker launches one 128-thread CTA per available SM. Links are
-assigned by `link % gridDim.x`; each link walks its canonical packet range in
-monotonic sequence order, writes `sequence % ring_slots`, publishes payload
-with a system-scope release signal, relays fan-out to the precomputed row, and
-returns the credit. There is no dynamic ready queue and neither packet arrival
-nor an atomic return value selects a row. After dispatch/relay counters reach
-their exact expected values, all CTAs transition to synthetic contribution and
-TopKReduce. Contributions have one slot per original route; reduction follows
-device `combine_order` (expert-ID order), accumulates in FP32, and casts once to
-BF16. The synthetic transform is only a transport oracle and is not FC1/FC2.
+The local P2P backend exchanges checked CUDA IPC handles through a device NCCL
+setup collective, opens only the one-node peer team, and retains every mapping
+until the final output lease dies. Before each generation, ranks exchange and
+validate the chosen pool-slot index and epoch. One 128-thread CTA per available
+SM is launched. CTA 0 performs canonical packet dispatch and peer puts; one
+resident CTA per source rank consumes that source's ingress ring, validates the
+64-bit sequence/generation/header, writes the Notify-provided canonical row,
+computes the documented synthetic contribution, and returns it to the source
+peer's immutable route slot. Stores precede `__threadfence_system` and a
+system-scope release signal; consumers acquire-observe the signal before use.
+Credits return only after relay consumption. Reduction follows device
+`combine_order` (expert-ID order), accumulates in FP32, and casts once to BF16.
+The synthetic transform is only a transport oracle and is not FC1/FC2.
 
-The 2.29.7 headers contain `ncclGin` device put, remote signal, local counter,
-and rail-team APIs, but the compatible 2.28.3 runtime selected for these hosts
-does not export the required GIN requirement symbols. `NcclGinDevice` therefore
-returns `BackendUnavailable`. The checked-in device-simulation backend and the
-P2P put/signal probe must not be described as GIN, RDMA, or a cross-host
-persistent backend. A host-enqueued NCCL fallback enum is reserved but also
-fails closed until its rank-local packet coordinator is attached.
+The GIN probe reports headers, the full required symbol set, runtime minimal
+initialization, backend implementation, and usability independently. The
+2.29.7 headers contain `ncclGin` APIs, but the compatible 2.28.3 runtime lacks
+the first required symbol (`ncclCommQueryProperties` in the observed load), and
+the backend is deliberately not implemented; consequently `gin_usable=0`.
+`NcclSocketFallback` and `Gin` have no production constructor and cannot be
+selected by passing an enum. Simulation, local P2P, Socket, and GIN audit labels
+therefore cannot be forged by the caller.
 
 ## Repository layout
 

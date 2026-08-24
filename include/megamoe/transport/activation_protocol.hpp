@@ -36,10 +36,10 @@ struct ActivationTransportConfig {
 };
 
 enum class ActivationTransportBackend : std::uint8_t {
-  LocalCudaP2p,
-  NcclGinDevice,
-  NcclSendRecvHostEnqueuedFallback,
   DeviceSimulation,
+  LocalCudaP2p,
+  NcclSocketFallback,
+  Gin,
 };
 
 const char *activation_transport_backend_name(

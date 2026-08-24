@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Launch independent local CUDA ranks and check the synthetic P2P result.
+
+This oracle intentionally reimplements routing offsets, canonical rows, BF16
+rounding and expert-order reduction. It never imports or invokes MegaMOE's C++
+reference/materialization code.
+"""
+
+import argparse
+import json
+import os
+import select
+import statistics
+import struct
+import subprocess
+import sys
+import time
+
+BOOTSTRAP_BYTES = 128
+
+
+def read_exact_frame(fd, timeout):
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while len(output) < BOOTSTRAP_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise TimeoutError("local P2P bootstrap timed out")
+        chunk = os.read(fd, BOOTSTRAP_BYTES - len(output))
+        if not chunk:
+            raise RuntimeError("local P2P bootstrap was short")
+        output.extend(chunk)
+    if os.read(fd, 1):
+        raise RuntimeError("local P2P bootstrap was oversized")
+    return bytes(output)
+
+
+def send_exact(process, frame):
+    view = memoryview(frame)
+    offset = 0
+    try:
+        while offset < len(view):
+            try:
+                written = os.write(process.stdin.fileno(), view[offset:])
+            except InterruptedError:
+                continue
+            if written is None or written <= 0:
+                raise RuntimeError("local P2P bootstrap write made no progress")
+            offset += written
+    finally:
+        process.stdin.close()
+        process.stdin = None
+
+
+def bf16(value):
+    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFFFFFF
+    return (bits >> 16) & 0xFFFF
+
+
+def bf16_float(bits):
+    return struct.unpack("<f", struct.pack("<I", bits << 16))[0]
+
+
+def seeded_routes(world, experts, top_k, seed, max_tokens=10):
+    mask = (1 << 64) - 1
+
+    def random():
+        nonlocal seed
+        seed = (seed * 6364136223846793005 + 1442695040888963407) & mask
+        return seed
+
+    result = []
+    for _rank in range(world):
+        tokens = random() % (max_tokens + 1)
+        selected = []
+        for _token in range(tokens):
+            choices = list(range(experts))
+            for slot in range(top_k):
+                chosen = slot + random() % (experts - slot)
+                choices[slot], choices[chosen] = choices[chosen], choices[slot]
+                selected.append(choices[slot])
+        result.append((tokens, selected))
+    return result
+
+
+def expected(world, seed, hidden=17):
+    experts = max(16, world * 2)
+    top_k = min(6, experts)
+    routes = seeded_routes(world, experts, top_k, seed)
+    counts = [[0] * experts for _ in range(world)]
+    offsets = []
+    for rank, (_tokens, selected) in enumerate(routes):
+        local = [0] * experts
+        rank_offsets = []
+        for expert in selected:
+            rank_offsets.append(local[expert])
+            local[expert] += 1
+            counts[rank][expert] += 1
+        offsets.append(rank_offsets)
+
+    expert_base = [0] * experts
+    rank_rows = [0] * world
+    for owner in range(world):
+        prefix = 0
+        for expert in range(experts):
+            if expert % world == owner:
+                expert_base[expert] = prefix
+                prefix += sum(counts[source][expert] for source in range(world))
+        rank_rows[owner] = prefix
+
+    capacity_rows = world * 10 * top_k
+    canonical = [[0] * (capacity_rows * hidden) for _ in range(world)]
+    output = []
+    for rank, (tokens, selected) in enumerate(routes):
+        activations = [
+            bf16((rank * 101 + index % 97) / 32.0)
+            for index in range(tokens * hidden)
+        ]
+        contributions = [0] * (tokens * top_k * hidden)
+        for route, expert in enumerate(selected):
+            token = route // top_k
+            source_prefix = sum(counts[source][expert] for source in range(rank))
+            row = expert_base[expert] + source_prefix + offsets[rank][route]
+            owner = expert % world
+            for column in range(hidden):
+                value = activations[token * hidden + column]
+                canonical[owner][row * hidden + column] = value
+                transformed = bf16(
+                    bf16_float(value)
+                    + ((expert % 251) + 1) / 128.0
+                    + (column % 17) / 1024.0
+                )
+                contributions[route * hidden + column] = transformed
+        combined = [0] * (tokens * hidden)
+        for token in range(tokens):
+            order = sorted(range(top_k), key=lambda slot: selected[token * top_k + slot])
+            for column in range(hidden):
+                total = 0.0
+                for slot in order:
+                    route = token * top_k + slot
+                    total += bf16_float(contributions[route * hidden + column])
+                combined[token * hidden + column] = bf16(total)
+        output.append({
+            "tokens": tokens,
+            "top_k": top_k,
+            "combined": combined,
+            "contribution": contributions,
+        })
+    for rank in range(world):
+        output[rank]["canonical"] = canonical[rank]
+    return output
+
+
+def parse_vector(value):
+    return [] if value == "" else [int(item) for item in value.split(",")]
+
+
+def parse_fields(stdout, marker):
+    line = next((line for line in stdout.splitlines() if line.startswith(marker)), None)
+    if line is None:
+        raise RuntimeError(f"rank output has no {marker.strip()}")
+    fields = {}
+    for item in line[len(marker):].split(" "):
+        key, value = item.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def parse_result(stdout):
+    fields = parse_fields(stdout, "P2P_RESULT ")
+    for key in ("combined", "contribution", "canonical"):
+        fields[key] = parse_vector(fields[key])
+    return fields
+
+
+def runner(binary, rank, world, seed, fd, output, scenario, prefix=()):
+    return list(prefix) + [
+        binary, "--rank-runner", "--rank", str(rank), "--nodes", "1",
+        "--gpus-per-node", str(world), "--local-rank", str(rank),
+        "--seed", str(seed), "--scenario", scenario,
+        "--bootstrap-output-fd" if output else "--bootstrap-input-fd", str(fd),
+    ]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", required=True)
+    parser.add_argument("--world", type=int, choices=(2, 8), required=True)
+    parser.add_argument("--seed", type=int, default=0x5EED1234)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--cancel", action="store_true")
+    parser.add_argument("--no-wrap", action="store_true")
+    parser.add_argument("--ring-slots", type=int, choices=(1, 2))
+    parser.add_argument("--compute-sanitizer-tool",
+                        choices=("memcheck", "racecheck", "initcheck"))
+    args = parser.parse_args()
+    environment = os.environ.copy()
+    environment.setdefault("NCCL_DEBUG", "WARN")
+    environment["MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+    if args.no_wrap:
+        environment["MEGAMOE_P2P_NO_WRAP"] = "1"
+    if args.ring_slots is not None:
+        environment["MEGAMOE_P2P_RING_SLOTS"] = str(args.ring_slots)
+    prefix = (() if args.compute_sanitizer_tool is None else
+              ("compute-sanitizer", "--tool", args.compute_sanitizer_tool,
+               "--error-exitcode=1"))
+    read_fd, write_fd = os.pipe()
+    processes = []
+    try:
+        rank0 = subprocess.Popen(
+            runner(args.binary, 0, args.world, args.seed, write_fd, True,
+                   "activation_p2p_bench" if args.benchmark else
+                   ("activation_p2p_cancel" if args.cancel else "activation_p2p"),
+                   prefix),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            pass_fds=(write_fd,), env=environment,
+        )
+        processes.append(rank0)
+        os.close(write_fd)
+        write_fd = -1
+        frame = read_exact_frame(read_fd, min(args.timeout, 60.0))
+        os.close(read_fd)
+        read_fd = -1
+        for rank in range(1, args.world):
+            process = subprocess.Popen(
+                runner(args.binary, rank, args.world, args.seed, 0, False,
+                       "activation_p2p_bench" if args.benchmark else
+                       ("activation_p2p_cancel" if args.cancel else "activation_p2p"),
+                       prefix),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=False, env=environment,
+            )
+            send_exact(process, frame)
+            processes.append(process)
+        deadline = time.monotonic() + args.timeout
+        observed = []
+        for rank, process in enumerate(processes):
+            timeout = max(0.1, deadline - time.monotonic())
+            stdout, stderr = process.communicate(timeout=timeout)
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", "replace")
+                stderr = stderr.decode("utf-8", "replace")
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"rank={rank} exit={process.returncode} stderr={stderr[-2000:]}"
+                )
+            if args.cancel:
+                cancelled = parse_fields(stdout, "P2P_CANCEL ")
+                if cancelled.get("cancelled") != "1" or \
+                        cancelled.get("quarantined") != "1":
+                    raise AssertionError(f"rank={rank} bad cancellation audit")
+            else:
+                observed.append(parse_fields(stdout, "P2P_BENCH ")
+                                if args.benchmark else parse_result(stdout))
+        if args.cancel:
+            print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
+            return
+        if args.benchmark:
+            stage_keys = ("total", "dispatch", "relay", "synthetic", "reduce")
+            for rank, item in enumerate(observed):
+                if item["backend"] != "local-cuda-p2p":
+                    raise AssertionError(f"rank={rank} backend={item['backend']}")
+                for key in stage_keys:
+                    item[key] = [float(value) for value in item[key].split(",")]
+                    expected_samples = (int(os.environ["MEGAMOE_P2P_BENCH_ROUNDS"])
+                                        if "MEGAMOE_P2P_BENCH_ROUNDS" in os.environ
+                                        else 50)
+                    if len(item[key]) != expected_samples:
+                        raise AssertionError(
+                            f"rank={rank} stage={key} samples={len(item[key])}")
+            def stats(values):
+                ordered = sorted(values)
+                def percentile(fraction):
+                    ordinal = max(1, int(len(ordered) * fraction + 0.999999))
+                    return ordered[ordinal - 1]
+                return {
+                    "mean": statistics.fmean(values),
+                    "p50": percentile(0.50),
+                    "p95": percentile(0.95),
+                    "min": ordered[0],
+                    "max": ordered[-1],
+                }
+            summary = {}
+            for key in stage_keys:
+                # Each iteration is represented by its slowest rank; values
+                # always come from the same per-rank device timing sample.
+                slowest = [max(item[key][iteration] for item in observed)
+                           for iteration in range(len(observed[0][key]))]
+                summary[key + "_slowest_rank_us"] = stats(slowest)
+            setup = [float(item["setup_us"]) for item in observed]
+            result = {
+                "schema": 1,
+                "backend": "local-cuda-p2p",
+                "world": args.world,
+                "warmup": 10,
+                "measured": len(observed[0]["total"]),
+                "one_time_setup_slowest_rank_us": max(setup),
+                "per_rank_device_pool_bytes": [int(item["device_bytes"])
+                                                for item in observed],
+                "per_rank_pinned_pool_bytes": [int(item["pinned_bytes"])
+                                                for item in observed],
+                "per_rank_raw_bytes": [int(item["raw_bytes"])
+                                       for item in observed],
+                "per_rank_dedup_bytes": [int(item["dedup_bytes"])
+                                         for item in observed],
+                "per_rank_credit_stalls": [int(item["stalls"])
+                                            for item in observed],
+                "per_rank_peak_ring": [int(item["peak_ring"])
+                                       for item in observed],
+                **summary,
+            }
+            print("P2P_BENCH_JSON " + json.dumps(result, sort_keys=True))
+            return
+        oracle = expected(args.world, args.seed)
+        for rank, (actual, wanted) in enumerate(zip(observed, oracle)):
+            if actual["backend"] != "local-cuda-p2p":
+                raise AssertionError(f"rank={rank} backend={actual['backend']}")
+            for field in ("combined", "contribution", "canonical"):
+                if actual[field] != wanted[field]:
+                    raise AssertionError(
+                        f"rank={rank} field={field} differs at length "
+                        f"{len(actual[field])}/{len(wanted[field])}"
+                    )
+        print(
+            f"[PASS] independent-process LocalCudaP2p world={args.world} "
+            f"rounds={args.rounds} Python synthetic oracle full-field match"
+        )
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"[FAIL] {error}", file=sys.stderr)
+        raise

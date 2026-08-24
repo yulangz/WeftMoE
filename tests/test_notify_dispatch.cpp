@@ -522,6 +522,16 @@ void test_activation_transport_protocol_oracle() {
           handles[0]->transport.outgoing_packets.size());
   REQUIRE(canonical.audit.relayed_fanout == 9);
   REQUIRE(canonical.audit.synthetic_contributions == 9);
+  const auto bad_sequence =
+      megamoe::testing::NotifyCorruptionHook::with_packet_sequence(
+          handles[0], 0, 7);
+  expect_error(NotifyErrorCode::InvalidHandle,
+               [&] {
+                 (void)megamoe::transport::simulate_activation_transport(
+                     bad_sequence, activations, transport_config, 1, reversed);
+               },
+               {"phase=dispatch-validation",
+                "field=transport.packet.identity"});
 
   auto many = make_config(73, 1, 73, 2, 8);
   std::vector<RankRoutingInput> many_inputs(73);

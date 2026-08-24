@@ -46,6 +46,9 @@ public:
   static DispatchHandle with_packet_proxy(const DispatchHandle &source,
                                           std::size_t packet_index,
                                           std::uint32_t value);
+  static DispatchHandle with_packet_sequence(const DispatchHandle &source,
+                                             std::size_t packet_index,
+                                             std::uint64_t value);
   static DispatchHandle with_fanout_expert(const DispatchHandle &source,
                                            std::size_t packet_index,
                                            std::size_t target_index,

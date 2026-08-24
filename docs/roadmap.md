@@ -63,20 +63,18 @@ Completed correctness components:
   descriptors, canonical relay, independent contribution slots, and
   expert-order FP32/BF16 combine;
 - transport-only persistent CUDA worker, 73-node device simulation, a real
-  local CUDA peer put/system-signal probe, deterministic oracle, and sanitizer
-  coverage;
+  multi-process local CUDA IPC dispatch/relay/return/combine path, deterministic
+  independent Python oracle, and a last-block P2P ordering probe;
 - an explicit GIN capability probe and fail-closed backend boundary.
 
 Still required before phase 4 closes:
 
-- attach CUDA IPC/P2P mappings to the complete rank-local packet/relay worker,
-  rather than only the current isolated peer-put probe;
 - implement and validate the host-enqueued NCCL Send/Recv correctness fallback
   across two hosts, including combine return;
 - enable and validate true NCCL GIN put/signal/local-completion after a
   compatible runtime/plugin/device-comm setup is available;
-- distributed timeout/quarantine and two-live-generation stress on those real
-  backends.
+- extend local P2P cancellation/quarantine fault injection and two-live-
+  generation stress beyond the current all-rank cancellation boundary.
 
 ## Phase 5 — forward compute integration
 

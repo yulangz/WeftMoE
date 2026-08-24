@@ -11,6 +11,8 @@
 
 namespace megamoe::cuda {
 
+namespace internal { class NcclSessionAccess; }
+
 class NcclSession;
 class NcclBootstrapInputChannel;
 class NcclBootstrapOutputChannel;
@@ -62,6 +64,7 @@ private:
                                           std::uint64_t);
   friend class CudaNotifyGenerationCoordinator;
   friend class NcclAllGatherCountExchange;
+  friend class internal::NcclSessionAccess;
 };
 
 NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
