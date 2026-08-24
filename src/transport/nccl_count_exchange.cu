@@ -2030,6 +2030,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
             ", expected=active generation, actual=cancel requested/deadline expired");
   }
   auto count_done = count->wait();
+  maybe_fault(testing::NcclFaultPoint::CountKernelCompletion,
+              "count-kernel-completion", impl_->context);
   const auto count_end = std::chrono::steady_clock::now();
   const auto summary_start = std::chrono::steady_clock::now();
   auto summary = impl_->backend->start(CountExchangeRequest{
@@ -2037,9 +2039,13 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       request.config.topology.num_nodes, {},
       local.device_packet_count_for_backend()});
   auto summary_done = summary->wait();
+  maybe_fault(testing::NcclFaultPoint::SummaryKernelCompletion,
+              "summary-kernel-completion", impl_->context);
   const auto summary_end = std::chrono::steady_clock::now();
   const auto materialize_start = std::chrono::steady_clock::now();
   DeviceMetadataBridge::Timings materialize_timings;
+  maybe_fault(testing::NcclFaultPoint::MaterializationKernel,
+              "materialization-kernel", impl_->context);
   auto device = DeviceMetadataBridge::materialize(
       local, std::move(count_done), std::move(summary_done), impl_->execution,
       &materialize_timings);

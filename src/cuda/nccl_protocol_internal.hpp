@@ -83,6 +83,9 @@ enum class NcclFaultPoint {
   CountSlotAllocation,
   SummarySlotAllocation,
   BackendCompletion,
+  CountKernelCompletion,
+  SummaryKernelCompletion,
+  MaterializationKernel,
 };
 void inject_next_nccl_fault(NcclFaultPoint point) noexcept;
 // Controlled wire/provenance corruption hooks. They are declared only in the

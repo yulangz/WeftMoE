@@ -107,7 +107,8 @@ for comparison to the host handle. World 2 additionally runs five independent
 20-round invalid-to-valid recovery categories on one communicator, config-wire
 corruption from rank 0 and rank 1, and exact raw-session identity mismatches
 with equal display names/header summaries. World 1 runs the nine-point enqueue
-audit/lifecycle table and a self-corruption integrity check.
+audit/lifecycle table, three pooled count/summary/materialization completion
+faults, real cancel/deadline recovery, and a self-corruption integrity check.
 The default CUDA suite also runs the closed-loop fake-collective materializer:
 explicitly initialized device count/summary matrices enter the exact production
 prefix/materialization kernels and arena layout, then every field is downloaded

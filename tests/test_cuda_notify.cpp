@@ -699,6 +699,56 @@ void test_fault_injection() {
                 lifecycle.destructor_drains <= 2,
             "fault lifecycle repeated wait/drain");
   }
+  const std::vector<FaultExpectation> device_stage_points{
+      {Point::CountKernelCompletion, {1, 1, 1, 0},
+       "count-kernel-completion"},
+      {Point::SummaryKernelCompletion, {1, 1, 1, 1},
+       "summary-kernel-completion"},
+      {Point::MaterializationKernel, {1, 1, 1, 1},
+       "materialization-kernel"}};
+  for (std::size_t index = 0; index < device_stage_points.size(); ++index) {
+    megamoe::cuda::testing::reset_nccl_lifecycle_counters();
+    auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+    auto execution = megamoe::cuda::make_cuda_execution(
+        "device-stage-fault-exec", 0);
+    auto session = megamoe::cuda::make_nccl_session(
+        "device-stage-fault", 1, 0, 4050 + index, 0, bootstrap);
+    auto pool = megamoe::cuda::make_device_notify_resource_pool(
+        session, execution, {config, 10, 4096, 1, 2});
+    megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+        session, execution, pool);
+    megamoe::cuda::testing::inject_next_nccl_fault(
+        device_stage_points[index].point);
+    bool failed = false;
+    try {
+      (void)coordinator.run({config, {1, {0, 1, 2}}, 10});
+    } catch (const megamoe::NotifyDispatchError &error) {
+      failed = std::string(error.what()).find(
+                   device_stage_points[index].stage) != std::string::npos;
+    }
+    require(failed && pool.usage().slots_in_use == 0,
+            "pooled device-stage fault leaked/published its slot");
+    const auto actual = coordinator.audit();
+    const auto expected = device_stage_points[index].audit;
+    require(actual.control_starts == expected.control_starts &&
+                actual.config_starts == expected.config_starts &&
+                actual.expert_count_starts == expected.expert_count_starts &&
+                actual.packet_summary_starts ==
+                    expected.packet_summary_starts,
+            "device-stage fault audit crossed the wrong boundary");
+    auto recovery_session = megamoe::cuda::make_nccl_generation(
+        session, "device-stage-fault", 4150 + index);
+    megamoe::cuda::CudaNotifyGenerationCoordinator recovery(
+        recovery_session, execution, pool);
+    auto recovered = recovery.run({config, {1, {0, 1, 2}}, 10});
+    require(recovered && recovery.audit().packet_summary_starts == 1,
+            "device-stage fault did not recover on the same communicator");
+    const auto lifecycle =
+        megamoe::cuda::testing::nccl_lifecycle_snapshot();
+    require(lifecycle.validated_publishes == 1 &&
+                lifecycle.operation_cancels == 0,
+            "device-stage fault published/cancelled an invalid generation");
+  }
   for (const bool deadline : {false, true}) {
     megamoe::cuda::testing::reset_nccl_lifecycle_counters();
     auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
@@ -743,7 +793,7 @@ void test_fault_injection() {
     require(recovered && recovery.audit().packet_summary_starts == 1,
             "communicator did not recover after cancellation/deadline");
   }
-  std::cout << "[PASS] 9-point NCCL enqueue audit/fault lifecycle table + "
+  std::cout << "[PASS] 9-point NCCL + 3 device-stage pooled fault matrix + "
                "production cancel/deadline exact cancel=1\n";
 }
 
