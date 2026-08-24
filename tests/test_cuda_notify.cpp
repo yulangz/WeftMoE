@@ -2057,6 +2057,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> fc2_samples;
     std::vector<double> return_samples;
     std::vector<double> reduce_samples;
+    std::vector<double> fc1_fc2_overlap_samples;
+    std::vector<double> fc2_return_overlap_samples;
+    std::vector<double> return_reduce_overlap_samples;
     megamoe::cuda::ForwardMegaKernelAudit last_audit;
     megamoe::cuda::DeviceForwardHandle last_output;
     for (std::uint32_t round = 0; round < rounds; ++round) {
@@ -2107,6 +2110,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         fc2_samples.push_back(output.timings().fc2_us);
         return_samples.push_back(output.timings().combine_return_us);
         reduce_samples.push_back(output.timings().reduce_us);
+        fc1_fc2_overlap_samples.push_back(
+            output.timings().fc1_fc2_overlap_us);
+        fc2_return_overlap_samples.push_back(
+            output.timings().fc2_return_overlap_us);
+        return_reduce_overlap_samples.push_back(
+            output.timings().return_reduce_overlap_us);
       }
     }
     const auto emit_values = [](const std::vector<double> &values) {
@@ -2169,6 +2178,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     emit_values(return_samples);
     std::cout << " reduce=";
     emit_values(reduce_samples);
+    std::cout << " fc1_fc2_overlap=";
+    emit_values(fc1_fc2_overlap_samples);
+    std::cout << " fc2_return_overlap=";
+    emit_values(fc2_return_overlap_samples);
+    std::cout << " return_reduce_overlap=";
+    emit_values(return_reduce_overlap_samples);
     std::cout << std::endl;
     return;
   }

@@ -97,11 +97,15 @@ Still required before phase 4 closes:
   benchmark are available. Other H/I shapes, cross-node Forward, backward,
   TMA multicast, and final worker/tile autotuning remain open.
 
-The current main-shape release baseline is faster than the Megatron
-common-semantics source-gate-after path, but the measured native Megatron
-gate-before run remains too close for the phase's formal 15% performance gate.
-Phase 5 therefore remains open; the next performance work is clustered weight
-multicast/weight reuse and removal of WGMMA accumulator serialization.
+The current main-shape release specialization passes the phase performance
+gate on the inspected eight-GPU host: three independent 10-warmup/100-sample
+runs measured 14.9033, 14.8794, and 14.8924 ms versus Megatron native
+17.9283, 17.9522, and 18.0105 ms, or 16.87%, 17.12%, and 17.31% improvement.
+The implementation is bitwise stable across EP1/EP2/EP8, cache modes, build
+modes, and repeats, and meets the documented BF16/WGMMA reference tolerance.
+Phase 5 is ready for verification; clustered weight multicast/weight reuse and
+further WGMMA dependency reduction remain performance follow-ups rather than
+correctness blockers.
 
 ## Phase 6 — backward persistent MegaKernel
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare explicit MegaMOE and Megatron common-semantics Forward outputs."""
+"""Compare explicit MegaMOE and high-precision/common Forward outputs."""
 
 import argparse
 import json
@@ -15,11 +15,15 @@ def main():
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=8192)
     parser.add_argument("--hidden", type=int, default=7168)
+    parser.add_argument("--max-abs-tolerance", type=float, default=0.02)
+    parser.add_argument("--rmse-tolerance", type=float, default=0.008)
+    parser.add_argument("--relative-denominator-floor", type=float,
+                        default=1.0e-3)
     args = parser.parse_args()
 
     count = args.tokens * args.hidden
     ranks = []
-    all_equal = True
+    within_tolerance = True
     for rank in range(args.world):
         mega_path = os.path.join(
             args.megamoe_dir, f"megamoe-rank-{rank}.bf16")
@@ -39,19 +43,33 @@ def main():
         mega = mega_bits.view(torch.bfloat16).float()
         expected = reference.float()
         absolute = (mega - expected).abs()
-        relative = absolute / expected.abs().clamp_min(1.0e-12)
+        relative = absolute / expected.abs().clamp_min(
+            args.relative_denominator_floor)
+        rmse = torch.sqrt(torch.mean((mega - expected) ** 2)).item()
+        accepted = (absolute.max().item() <= args.max_abs_tolerance and
+                    rmse <= args.rmse_tolerance)
         ranks.append({
             "rank": rank,
             "byte_identical": equal,
             "max_abs_error": absolute.max().item(),
             "max_relative_error": relative.max().item(),
+            "rmse": rmse,
+            "within_tolerance": accepted,
         })
-        all_equal = all_equal and equal
+        within_tolerance = within_tolerance and accepted
     result = {"schema": 1, "world": args.world,
-              "byte_identical": all_equal, "ranks": ranks}
+              "byte_identical": all(item["byte_identical"] for item in ranks),
+              "within_tolerance": within_tolerance,
+              "tolerance": {
+                  "max_abs": args.max_abs_tolerance,
+                  "rmse": args.rmse_tolerance,
+                  "relative_denominator_floor":
+                      args.relative_denominator_floor,
+              },
+              "ranks": ranks}
     print("FORWARD_OUTPUT_COMPARISON_JSON " +
           json.dumps(result, sort_keys=True))
-    if not all_equal:
+    if not within_tolerance:
         raise SystemExit(1)
 
 

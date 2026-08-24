@@ -244,8 +244,10 @@ DispatchPut, three-stage TMA/WGMMA FC1 for both projections, BF16 SwiGLU
 materialization, four-stage N=256 TMA/WGMMA FC2, vectorized peer return, and
 fixed expert-ID source reduction. FC1 and FC2 have no intervening kernel or
 host scheduling boundary. The output lease owns the transport slot until the
-last copy dies; a tagged system-scope terminal epoch prevents reuse while any
-peer can still publish return data.
+last copy dies. Slot reuse is safe because every source acquire-observes every
+expected peer return signal before reduction, and local grid completion proves
+that all outgoing peer writes and local reads have finished; release mode does
+not pay for a second terminal team barrier.
 
 The two forward modes share the same arithmetic path. `NO_FC1_OUTPUT_CACHE`
 retains canonical dispatch X and transient S only for the live generation;

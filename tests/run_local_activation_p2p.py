@@ -405,7 +405,8 @@ def main():
             if len(hashes) != args.world:
                 raise AssertionError("missing forward ranks")
             print(f"[PASS] LocalCudaP2p Forward MegaKernel world={args.world} "
-                  "single-launch WGMMA/TMA cache/no-cache smoke")
+                  "single-launch WGMMA/TMA cache/no-cache smoke "
+                  f"rank0_output_hash={hashes[0]}")
             return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
@@ -413,7 +414,9 @@ def main():
         if benchmark_mode:
             if args.forward_benchmark:
                 stage_keys = ("wall", "notify", "forward", "dispatch",
-                              "fc1", "fc2", "return", "reduce")
+                              "fc1", "fc2", "return", "reduce",
+                              "fc1_fc2_overlap", "fc2_return_overlap",
+                              "return_reduce_overlap")
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=
                             "sm90-wgmma-tma-7168x3072" or

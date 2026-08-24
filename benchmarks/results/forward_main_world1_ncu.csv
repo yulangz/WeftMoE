@@ -1,5 +1,12 @@
 kernel,metric_name,metric_unit,metric_value
-forward_persistent_kernel,Duration,msecond,25.349
-forward_persistent_kernel,SM Throughput,percent,42.37
-forward_persistent_kernel,DRAM Throughput,percent,48.87
+forward_persistent_kernel,Duration,msecond,19.431776
+forward_persistent_kernel,SM Throughput,percent,55.97
+forward_persistent_kernel,DRAM Throughput,percent,66.55
+forward_persistent_kernel,Tensor Pipe Active,percent,56.29
 forward_persistent_kernel,Achieved Occupancy,percent,18.75
+forward_persistent_kernel,Barrier Stall,warps_per_issue_active,9.78
+forward_persistent_kernel,Long Scoreboard Stall,warps_per_issue_active,3.27
+forward_persistent_kernel,Wait Stall,warps_per_issue_active,1.44
+forward_persistent_kernel,Math Pipe Throttle,warps_per_issue_active,0.14
+forward_persistent_kernel,Membar Stall,warps_per_issue_active,0.13
+forward_persistent_kernel,Short Scoreboard Stall,warps_per_issue_active,0.11

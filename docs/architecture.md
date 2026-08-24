@@ -5,22 +5,39 @@
 After Notify publishes `DeviceDispatchHandle`, the Forward adapter acquires an
 owning dispatch consumer and passes its private kernel view directly to
 `LocalCudaP2pForwardMegaKernel`; metadata is neither downloaded nor rebuilt.
-The main-shape kernel uses one resident CTA per SM and a cooperative grid:
+The main-shape kernel uses one resident CTA per SM and a cooperative grid.
+Dispatch is currently an initial bulk phase; after its peer release/acquire
+boundary, compute/return/reduce are M-block pipelined rather than globally
+phase-serialized:
 
 ```text
 DispatchPut -> FC1(WGMMA/TMA) -> SwiGLU -> FC2(WGMMA/TMA)
-            -> vectorized peer return -> gate-after TopKReduce
-            -> peer terminal epoch
+                                      \-> batched peer return
+                                                \-> gate-after TopKReduce
 ```
 
 FC1 evaluates both `[A,B]` projections from each staged X tile, casts
 `SiLU(A)*B` to BF16 once, and releases the M-block scoreboard only after every
 lane's store is ordered. FC2 acquires that scoreboard, accumulates WGMMA in
-FP32, casts the expert output to BF16, and writes canonical local rows. Return
-copies whole BF16 rows to immutable source route slots. Source workers wait on
-system-scope route readiness, multiply by the local FP32 gate, add routes in
-expert-ID order, and perform one final BF16 cast. A tagged exact epoch barrier
-inside the kernel prevents the next generation from reusing a peer slot early.
+FP32, casts the expert output to BF16, and writes canonical local rows. The CTA
+that completes an M-block's last FC2 N tile immediately returns that block
+while other CTAs continue FC2. Return completion is aggregated once per source
+rank instead of signalled per route. Source warps reduce independent tokens,
+wait on the destination-rank release signal, multiply by the local FP32 gate,
+add routes in expert-ID order, and perform one final BF16 cast. The final local
+grid completion is sufficient for reuse: every incoming peer has already
+published all rows acquired by Reduce, and every outgoing store has completed
+before its release signal.
+
+The benchmark reads first-start and last-complete device timestamps from the
+same status lease. On the main world-8 fixture FC1/FC2 overlap by about
+0.367 ms, FC2/Return by about 5.025 ms, and Return/Reduce by about 0.429 ms.
+These full stage spans intentionally overlap and are not additive.
+
+Release mode precomputes an immutable M-block-to-expert lookup in the
+debug-only claim arena and acquires FC tasks in deterministic chunks of four.
+Debug mode keeps per-task CAS claims and full validation. Both execute the same
+WGMMA K order and produce identical output bits.
 
 The cache policy affects lifetime, not arithmetic: the cache mode retains BF16
 A/B checkpoints in the session pool; no-cache omits those stores. Both retain

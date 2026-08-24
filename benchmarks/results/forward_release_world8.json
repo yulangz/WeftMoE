@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "date_utc": "2026-08-24",
   "shape": {
     "tokens_per_rank": 8192,
@@ -15,26 +15,73 @@
     "independent_sessions": 3,
     "aggregation": "slowest-rank host wall"
   },
-  "megamoe_e2e_mean_ms": [17.898882, 17.909524, 17.935251],
-  "megatron_native_e2e_mean_ms": [17.99770669, 17.96164435, 17.94810635],
-  "megatron_common_gate_after_e2e_mean_ms": [21.95390196, 21.96503082, 21.96282784],
-  "speedup_vs_megatron_native_percent": [0.549091, 0.290172, 0.071626],
-  "formal_every_run_at_least_15_percent": false,
-  "megamoe_stage_mean_ms_range": {
-    "notify": [0.521, 0.551],
-    "dispatch": [2.018, 2.018],
-    "fc1_swiglu": [7.089, 7.093],
-    "fc2": [4.296, 4.298],
-    "combine_return": [2.261, 2.271],
-    "deterministic_reduce": [2.297, 2.313]
+  "megamoe_e2e_mean_ms": [14.903284, 14.879358, 14.892394],
+  "megatron_native_e2e_mean_ms": [17.92832474, 17.95219937, 18.01047872],
+  "megatron_common_gate_after_e2e_mean_ms": [21.96683932, 21.94236504, 21.97260625],
+  "speedup_vs_megatron_native_percent": [16.872969, 17.116796, 17.312614],
+  "formal_every_run_at_least_15_percent": true,
+  "megamoe_stage_mean_ms_per_run": {
+    "notify": [0.599188, 0.581077, 0.586561],
+    "dispatch": [1.976295, 1.975317, 1.978428],
+    "fc1_swiglu_full_span": [6.904886, 6.904366, 6.903483],
+    "fc2_full_span": [5.203186, 5.198555, 5.202047],
+    "return_full_span": [5.271978, 5.263944, 5.267675],
+    "deterministic_reduce_full_span": [1.167575, 1.163651, 1.231292],
+    "fc1_fc2_overlap": [0.366428, 0.366841, 0.366700],
+    "fc2_return_overlap": [5.028361, 5.022651, 5.025506],
+    "return_reduce_overlap": [0.429988, 0.428170, 0.428994]
+  },
+  "representative_wall_ms": {
+    "mean": 14.903284,
+    "p50": 14.890200,
+    "p95": 14.951600,
+    "min": 14.833300,
+    "max": 15.271000
   },
   "workspace_device_bytes_per_rank": 2847625496,
   "weight_device_bytes_per_rank": 6341787648,
+  "kernel_resources_sm90a": {
+    "registers_per_thread": 168,
+    "stack_bytes_per_thread": 16,
+    "static_shared_bytes_per_cta": 2048,
+    "dynamic_shared_bytes_per_cta_world8": 196704
+  },
+  "cross_ep_rank0_hash": {
+    "ep1": "10269764484660630403",
+    "ep2": "10269764484660630403",
+    "ep8": "10269764484660630403"
+  },
   "cross_implementation_output": {
     "byte_identical": false,
     "max_abs_error": 0.0185546875,
-    "note": "MegaMOE WGMMA and TransformerEngine do not share an exact K-accumulation/SwiGLU instruction order"
+    "max_rmse": 0.007263725157827139,
+    "accepted_max_abs": 0.02,
+    "accepted_rmse": 0.008,
+    "note": "MegaMOE is bitwise stable across EP/cache/build/repeat; TransformerEngine is checked by BF16/WGMMA tolerance, not instruction-order identity"
   },
-  "remote_megamoe_e2e_mean_ms": 17.82727,
-  "remote_megatron_available": false
+  "ncu_world1": {
+    "kernel_duration_ms": 19.431776,
+    "sm_throughput_percent": 55.97,
+    "dram_throughput_percent": 66.55,
+    "tensor_pipe_active_percent": 56.29,
+    "achieved_occupancy_percent": 18.75,
+    "prior_kernel_duration_ms": 25.349,
+    "prior_sm_throughput_percent": 42.37,
+    "prior_dram_throughput_percent": 48.87
+  },
+  "runtime": {
+    "megamoe_nccl": "2.28.3",
+    "megatron_loaded_nccl": "2.28.3",
+    "megatron_torch_build_nccl": "2.27.5",
+    "megamoe_nccl_library": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+  },
+  "remote_clean_archive": {
+    "host": "10.10.19.233",
+    "megamoe_e2e_mean_ms": [14.870526, 14.875508, 14.824276],
+    "megamoe_e2e_p50_ms": [14.8574, 14.8452, 14.8161],
+    "megamoe_e2e_p95_ms": [14.9456, 15.0422, 14.9222],
+    "cross_ep_rank0_hash": "10269764484660630403",
+    "megatron_available": false,
+    "note": "clean tracked-file export; world 1/2/8 top-k 1/6 smoke and three world-8 10-warmup/100-sample sessions passed"
+  }
 }

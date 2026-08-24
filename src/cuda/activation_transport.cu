@@ -1268,9 +1268,14 @@ __global__ void local_p2p_bulk_dispatch_kernel(LocalP2pKernelArgs a) {
   if ((a.hidden & 7ULL) == 0ULL) {
     const auto *source128 = reinterpret_cast<const uint4 *>(source);
     auto *target128 = reinterpret_cast<uint4 *>(target);
-    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
-         vector += blockDim.x)
+    const auto vector_count = a.hidden / 8ULL;
+    for (std::uint64_t vector = threadIdx.x; vector < vector_count;
+         vector += blockDim.x * 2ULL) {
       target128[vector] = source128[vector];
+      const auto second = vector + blockDim.x;
+      if (second < vector_count)
+        target128[second] = source128[second];
+    }
   } else {
     for (std::uint64_t hidden = threadIdx.x; hidden < a.hidden;
          hidden += blockDim.x)
@@ -1512,10 +1517,9 @@ using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 
 // FC1 consumes the same activation tile twice (the A and B projections of
 // SwiGLU).  Keep both projection accumulators live and issue the two WGMMA
-// groups from one TMA-loaded activation tile.  Three pipeline stages fill the
+// groups from one TMA-loaded activation tile. Three pipeline stages fill the
 // Hopper shared-memory union and hide the long 7168-element reduction loads;
-// FC2 reinitializes
-// its independent four-stage pipeline below.
+// FC2 reinitializes its independent four-stage pipeline below.
 __device__ void forward_wgmma_swiglu_tile(
     const CUtensorMap &activation_map, const CUtensorMap &weight_map,
     std::uint32_t activation_row, std::uint32_t weight_a_row,
@@ -1555,7 +1559,7 @@ __device__ void forward_wgmma_swiglu_tile(
           activation_row);
       deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b1, k_base, weight_a_row);
-      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+      deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b2, k_base, weight_b_row);
       full_barriers[stage].arrive_and_expect_tx(
           3U * kStageElements * sizeof(transport::BFloat16));
@@ -1591,6 +1595,11 @@ __device__ void forward_wgmma_swiglu_tile(
         ForwardMma::wgmma(desc_a, desc_b2, accum_b, 1);
       }
       deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+      for (int index = 0; index < ForwardMma::kNumAccum; ++index) {
+        deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+        deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+      }
       deep_gemm::ptx::warpgroup_wait<0>();
       if ((threadIdx.x & 31U) == 0U)
         empty_barriers[stage].arrive();
@@ -1628,10 +1637,10 @@ __device__ void forward_wgmma_wide_tile(
           smem_a_public + stage * kAStageElements);
       auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b_public + stage * kBStageElements);
-      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+      deep_gemm::tma::copy<64, 256, 128, cutlass::bfloat16_t>(
           &activation_map, &full_barriers[stage], smem_a, k_base,
           activation_row);
-      deep_gemm::tma::copy<64, 256, 128, cutlass::bfloat16_t>(
+      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b, k_base, weight_row);
       full_barriers[stage].arrive_and_expect_tx(
           (kAStageElements + kBStageElements) *
@@ -1661,6 +1670,9 @@ __device__ void forward_wgmma_wide_tile(
         ForwardMmaWide::wgmma(desc_a, desc_b, accum, 1);
       }
       deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+      for (int index = 0; index < ForwardMmaWide::kNumAccum; ++index)
+        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
       deep_gemm::ptx::warpgroup_wait<0>();
       if ((threadIdx.x & 31U) == 0U)
         empty_barriers[stage].arrive();
@@ -1737,6 +1749,7 @@ __device__ void visit_forward_accumulator_wide(float *accum,
              accum[index * 4U + 3U]);
   }
 }
+
 #endif
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -1755,6 +1768,7 @@ __device__ std::uint32_t forward_mblock_expert(const ForwardKernelArgs &a,
   local_mblock = 0;
   return a.dispatch.sizes.owned_expert_count;
 }
+
 #endif
 
 __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
@@ -1778,9 +1792,6 @@ local_p2p_forward_megakernel(
   auto *smem_b = reinterpret_cast<transport::BFloat16 *>(
       storage + 4U * 128U * 64U * sizeof(transport::BFloat16));
 #endif
-  // GEMM staging is dead before TopKReduce, so the reduction scratch aliases
-  // the same shared-memory union rather than extending the CTA footprint.
-  auto *smem_accum_a = reinterpret_cast<float *>(storage);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *full_barriers = reinterpret_cast<ForwardBarrier *>(
       storage + (4U * 128U * 64U + 4U * 256U * 64U) *
@@ -1794,6 +1805,12 @@ local_p2p_forward_megakernel(
       a.local_base, a.direct_headers_offset);
   auto *scheduler = peer_at<unsigned long long>(
       a.local_base, a.forward_scheduler_offset);
+  constexpr std::size_t kForwardGemmSmemBytes =
+      (4U * 128U * 64U + 4U * 256U * 64U) *
+          sizeof(transport::BFloat16) +
+      8U * sizeof(std::uint64_t);
+  [[maybe_unused]] auto *return_rows_by_source = reinterpret_cast<unsigned int *>(
+      storage + kForwardGemmSmemBytes);
   auto *claims = peer_at<unsigned long long>(
       a.local_base, a.forward_task_claim_offset);
   auto *fc1_done = peer_at<unsigned long long>(
@@ -1805,11 +1822,32 @@ local_p2p_forward_megakernel(
                              a.local_base, a.forward_ab_cache_offset);
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->start_clock = device_globaltimer_ns();
+    // Transport-only counters are unused by Forward and serve as first-start
+    // clocks without growing the pooled status allocation.
+    status->dispatch_blocks_done = ~0ULL; // first FC2 tile
+    status->relay_blocks_done = ~0ULL;    // first returned M-block
+    status->reduced_tokens = ~0ULL;       // first reduced token
     scheduler[0] = scheduler[1] = scheduler[2] = scheduler[3] = 0ULL;
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert)
       scheduler[3] +=
           (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+    scheduler[4U + a.world] = 0ULL;
+  }
+  // One completion word per destination->source rank replaces a system-scope
+  // signal for every route.  The high word is immutable expected rows; return
+  // CTAs add to the low word after their peer stores have been fenced.
+  if (blockIdx.x == 0 && threadIdx.x < a.world) {
+    unsigned long long expected = 0;
+    for (std::uint32_t local_expert = 0;
+         local_expert < a.dispatch.sizes.owned_expert_count; ++local_expert) {
+      const auto expert = a.dispatch.owned_expert_ids[local_expert];
+      expected += a.dispatch.source_expert_count[
+          static_cast<std::uint64_t>(threadIdx.x) *
+              a.dispatch.identity.num_experts +
+          expert];
+    }
+    scheduler[4U + threadIdx.x] = expected << 32U;
   }
   for (std::uint64_t mtile =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1817,8 +1855,24 @@ local_p2p_forward_megakernel(
        mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
     fc1_done[mtile] = a.epoch << 32U;
   grid.sync();
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && !MEGAMOE_DEBUG_VALIDATE
+  // Release reuses the otherwise debug-only claim arena as an immutable
+  // mblock lookup.  This removes the repeated expert-prefix scan from every
+  // FC1/FC2 N tile and enables chunked task acquisition below.
+  for (std::uint64_t mblock =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       mblock < scheduler[3];
+       mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    std::uint64_t local_mblock = 0;
+    const auto expert = forward_mblock_expert(a, mblock, local_mblock);
+    claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
+                     static_cast<std::uint32_t>(local_mblock);
+  }
+  grid.sync();
+#endif
 
   // DispatchPut: all resident CTAs copy independent canonical rows.
+  unsigned long long dispatch_peer_rows = 0ULL;
   for (std::uint64_t route = blockIdx.x; route < a.dispatch.sizes.route_count;
        route += gridDim.x) {
     const auto destination = a.dispatch.route_dst_rank[route];
@@ -1843,10 +1897,12 @@ local_p2p_forward_megakernel(
           route, route, token, row, a.dispatch.expert_id[route],
           static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
       if (destination != a.rank)
-        atomicAdd(&status->actual_dispatch_peer_bytes,
-                  a.hidden * sizeof(transport::BFloat16));
+        ++dispatch_peer_rows;
     }
   }
+  if (threadIdx.x == 0 && dispatch_peer_rows != 0ULL)
+    atomicAdd(&status->actual_dispatch_peer_bytes,
+              dispatch_peer_rows * a.hidden * sizeof(transport::BFloat16));
   // Every participating lane orders its peer payload stores before the team
   // rendezvous. A fence issued only by the signal lane would not cover stores
   // performed by the other lanes in the CTA.
@@ -1897,33 +1953,53 @@ local_p2p_forward_megakernel(
       static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
   const auto forward_mblocks = scheduler[3];
   const auto fc1_tasks = forward_mblocks * fc1_ntiles;
+  constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
+  __shared__ unsigned long long task_shared;
+#if MEGAMOE_DEBUG_VALIDATE
+  __shared__ std::uint32_t expert_shared;
+  __shared__ std::uint64_t local_mblock_shared;
+  __shared__ unsigned int claim_shared;
+#endif
+  unsigned int task_in_chunk = kTaskChunk;
   while (!forward_cancelled(a)) {
-    __shared__ unsigned long long task_shared;
-    __shared__ unsigned int claim_shared;
-    if (threadIdx.x == 0)
-      task_shared = atomicAdd(&scheduler[0], 1ULL);
-    __syncthreads();
-    const auto task = task_shared;
+    if (task_in_chunk == kTaskChunk) {
+      if (threadIdx.x == 0)
+        task_shared = atomicAdd(&scheduler[0],
+                                static_cast<unsigned long long>(kTaskChunk));
+      __syncthreads();
+      task_in_chunk = 0U;
+    }
+    const auto task = task_shared + task_in_chunk++;
     if (task >= fc1_tasks)
       break;
-    if (threadIdx.x == 0) {
 #if MEGAMOE_DEBUG_VALIDATE
+    if (threadIdx.x == 0) {
       const auto old = atomicAdd(&claims[task], 0ULL);
       claim_shared = old != a.epoch &&
                              atomicCAS(&claims[task], old, a.epoch) == old
                          ? 1U
                          : 0U;
-#else
-      claim_shared = 1U;
-#endif
     }
     __syncthreads();
     if (claim_shared == 0U)
       continue;
+#else
+    (void)claims;
+#endif
     const auto mblock = task / fc1_ntiles;
     const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
-    std::uint64_t local_mblock = 0;
-    const auto expert = forward_mblock_expert(a, mblock, local_mblock);
+#if MEGAMOE_DEBUG_VALIDATE
+    if (threadIdx.x == 0)
+      expert_shared = forward_mblock_expert(
+          a, mblock, local_mblock_shared);
+    __syncthreads();
+    const auto expert = expert_shared;
+    const auto local_mblock = local_mblock_shared;
+#else
+    const auto mapping = claims[mblock];
+    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+    const auto local_mblock = static_cast<std::uint32_t>(mapping);
+#endif
     if (expert >= a.dispatch.sizes.owned_expert_count)
       break;
     const auto row =
@@ -1977,7 +2053,6 @@ local_p2p_forward_megakernel(
             }
           });
     }
-    __syncthreads();
     // FC2 may be claimed by another CTA as soon as this tile increments the
     // m-block counter. Order every lane's S/checkpoint stores first; a fence
     // from only the counter lane would not publish the other lanes' writes.
@@ -1989,12 +2064,13 @@ local_p2p_forward_megakernel(
       ready.fetch_add(1ULL, ::cuda::memory_order_release);
     }
   }
-  grid.sync();
   if (threadIdx.x == 0)
     atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
 
-  // FC1 uses a three-stage A/B1/B2 pipeline. Its transactions are complete,
-  // allowing this CTA to reset the shared barriers for FC2's four stages.
+  // FC1 transactions issued by this CTA are complete, so this CTA can reset
+  // its private shared barriers and consume any M-block whose release counter
+  // is ready.  There is deliberately no grid-wide FC1/FC2 barrier: late FC1
+  // tiles and ready FC2 tiles overlap across CTAs.
   if (threadIdx.x == 256U) {
     for (std::uint32_t stage = 0; stage < 4U; ++stage) {
       full_barriers[stage].init(1);
@@ -2008,31 +2084,33 @@ local_p2p_forward_megakernel(
   const auto fc2_ntiles =
       static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
   const auto fc2_tasks = forward_mblocks * fc2_ntiles;
+  task_in_chunk = kTaskChunk;
   while (!forward_cancelled(a)) {
-    __shared__ unsigned long long task_shared;
-    __shared__ unsigned int claim_shared;
-    if (threadIdx.x == 0)
-      task_shared = atomicAdd(&scheduler[1], 1ULL);
-    __syncthreads();
-    const auto task = task_shared;
+    if (task_in_chunk == kTaskChunk) {
+      if (threadIdx.x == 0)
+        task_shared = atomicAdd(&scheduler[1],
+                                static_cast<unsigned long long>(kTaskChunk));
+      __syncthreads();
+      task_in_chunk = 0U;
+    }
+    const auto task = task_shared + task_in_chunk++;
     if (task >= fc2_tasks)
       break;
     const auto claim_index = fc1_tasks + task;
-    if (threadIdx.x == 0) {
 #if MEGAMOE_DEBUG_VALIDATE
+    if (threadIdx.x == 0) {
       const auto old = atomicAdd(&claims[claim_index], 0ULL);
       claim_shared = old != a.epoch &&
                              atomicCAS(&claims[claim_index], old, a.epoch) == old
                          ? 1U
                          : 0U;
-#else
-      (void)claim_index;
-      claim_shared = 1U;
-#endif
     }
     __syncthreads();
     if (claim_shared == 0U)
       continue;
+#else
+    (void)claim_index;
+#endif
     const auto mblock = task / fc2_ntiles;
     const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -2040,8 +2118,20 @@ local_p2p_forward_megakernel(
     while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
            fc1_ntiles) {
     }
-    std::uint64_t local_mblock = 0;
-    const auto expert = forward_mblock_expert(a, mblock, local_mblock);
+    if (threadIdx.x == 0)
+      atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
+#if MEGAMOE_DEBUG_VALIDATE
+    if (threadIdx.x == 0)
+      expert_shared = forward_mblock_expert(
+          a, mblock, local_mblock_shared);
+    __syncthreads();
+    const auto expert = expert_shared;
+    const auto local_mblock = local_mblock_shared;
+#else
+    const auto mapping = claims[mblock];
+    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+    const auto local_mblock = static_cast<std::uint32_t>(mapping);
+#endif
     const auto row =
         a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
     const auto remaining_rows =
@@ -2058,8 +2148,7 @@ local_p2p_forward_megakernel(
     visit_forward_accumulator_wide(
         accum, [&](std::uint32_t warpgroup, std::uint32_t m,
                    std::uint32_t column, float v0, float v1) {
-      const auto output_column = static_cast<std::uint64_t>(n) +
-                                 column;
+      const auto output_column = static_cast<std::uint64_t>(n) + column;
       const auto block_m = warpgroup * 64U + m;
       if (block_m < valid_rows && output_column < a.hidden)
         canonical[(row + block_m) * a.hidden + output_column] =
@@ -2068,11 +2157,85 @@ local_p2p_forward_megakernel(
         canonical[(row + block_m) * a.hidden + output_column + 1U] =
             transport::BFloat16{float_to_bf16_bits(v1)};
     });
+    // Publish this N tile's canonical stores before exposing completion.  The
+    // CTA that observes the final N tile owns the M-block return; other CTAs
+    // can continue FC2 for unrelated blocks in parallel.
+    __threadfence();
     __syncthreads();
+    __shared__ unsigned int return_mblock_shared;
     if (threadIdx.x == 0) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           complete(fc1_done[mblock]);
-      complete.fetch_add(1ULL << 16U, ::cuda::memory_order_release);
+      const auto old = complete.fetch_add(1ULL << 16U,
+                                           ::cuda::memory_order_acq_rel);
+      return_mblock_shared =
+          (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
+      if (return_mblock_shared != 0U) {
+        const auto finished = atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
+        if (finished == forward_mblocks)
+          status->fc2_complete_clock = device_globaltimer_ns();
+      }
+    }
+    __syncthreads();
+    if (return_mblock_shared != 0U) {
+      __shared__ unsigned int return_peer_rows_shared;
+      if (threadIdx.x == 0)
+        atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+      for (std::uint32_t source = threadIdx.x; source < a.world;
+           source += blockDim.x)
+        return_rows_by_source[source] = 0U;
+      if (threadIdx.x == 0)
+        return_peer_rows_shared = 0U;
+      __syncthreads();
+      for (std::uint32_t local_row = 0; local_row < valid_rows; ++local_row) {
+        const auto return_row = row + local_row;
+        const auto header = headers[return_row];
+        auto *source_contribution = peer_at<transport::BFloat16>(
+            a.peer_bases[header.source_rank], a.contribution_offset);
+        const auto *source128 = reinterpret_cast<const uint4 *>(
+            canonical + return_row * a.hidden);
+        auto *target128 = reinterpret_cast<uint4 *>(
+            source_contribution + header.route_index * a.hidden);
+        const auto vector_count = a.hidden / 8ULL;
+        for (std::uint64_t vector = threadIdx.x;
+             vector < vector_count; vector += blockDim.x * 2ULL) {
+          target128[vector] = source128[vector];
+          const auto second = vector + blockDim.x;
+          if (second < vector_count)
+            target128[second] = source128[second];
+        }
+        if (threadIdx.x == 0) {
+          ++return_rows_by_source[header.source_rank];
+          if (header.source_rank != a.rank)
+            ++return_peer_rows_shared;
+        }
+      }
+      if (threadIdx.x == 0 && return_peer_rows_shared != 0U)
+        atomicAdd(&status->actual_return_peer_bytes,
+                  static_cast<unsigned long long>(return_peer_rows_shared) *
+                      a.hidden * sizeof(transport::BFloat16));
+      __threadfence_system();
+      __syncthreads();
+      for (std::uint32_t source_rank = threadIdx.x; source_rank < a.world;
+           source_rank += blockDim.x) {
+        const auto rows = return_rows_by_source[source_rank];
+        if (rows == 0U)
+          continue;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed(scheduler[4U + source_rank]);
+        const auto old = completed.fetch_add(rows,
+                                              ::cuda::memory_order_acq_rel);
+        const auto expected = old >> 32U;
+        const auto actual = (old & 0xffffffffULL) + rows;
+        if (actual == expected) {
+          auto *source_signal = peer_at<unsigned long long>(
+              a.peer_bases[source_rank], a.outgoing_sequence_offset);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              ready(source_signal[a.rank * a.channels]);
+          ready.store(a.epoch, ::cuda::memory_order_release);
+        }
+      }
+      __syncthreads();
     }
   }
 #else
@@ -2081,133 +2244,90 @@ local_p2p_forward_megakernel(
     status->error_field = 90U;
   }
 #endif
-  grid.sync();
-  if (threadIdx.x == 0)
-    atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
-
-  // FC2 writes contiguous canonical rows locally.  A second vectorized pass
-  // transfers whole rows to their source route slots; scattered peer stores
-  // in the WGMMA epilogue are substantially slower on the measured NVLink
-  // topology.
-  for (std::uint64_t row = blockIdx.x;
-       row < a.dispatch.sizes.incoming_row_count; row += gridDim.x) {
-    const auto header = headers[row];
-    auto *source_contribution = peer_at<transport::BFloat16>(
-        a.peer_bases[header.source_rank], a.contribution_offset);
-    const auto *source128 = reinterpret_cast<const uint4 *>(
-        canonical + row * a.hidden);
-    auto *target128 = reinterpret_cast<uint4 *>(
-        source_contribution + header.route_index * a.hidden);
-    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
-         vector += blockDim.x)
-      target128[vector] = source128[vector];
-    if (threadIdx.x == 0 && header.source_rank != a.rank)
-      atomicAdd(&status->actual_return_peer_bytes,
-                a.hidden * sizeof(transport::BFloat16));
-  }
-  __syncthreads();
-  __threadfence_system();
-  __syncthreads();
-  for (std::uint64_t sequence = threadIdx.x;; sequence += blockDim.x) {
-    const auto row = static_cast<std::uint64_t>(blockIdx.x) +
-                     sequence * static_cast<std::uint64_t>(gridDim.x);
-    if (row >= a.dispatch.sizes.incoming_row_count)
-      break;
-    const auto header = headers[row];
-    auto *source_ready = peer_at<unsigned long long>(
-        a.peer_bases[header.source_rank], a.return_ready_epoch_offset);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-        source_ready[header.route_index]);
-    ready.store(a.epoch, ::cuda::memory_order_release);
-  }
-  __syncthreads();
   if (threadIdx.x == 0)
     atomicMax(&status->return_complete_clock, device_globaltimer_ns());
 
+  // A CTA may begin reducing tokens whose destination-rank bulk signals are
+  // already visible while other CTAs finish returning later M-blocks.  The
+  // per-destination acquire below is the dependency; a grid barrier here only
+  // serialized independent return and reduce work.
   auto *contribution = peer_at<transport::BFloat16>(
       a.local_base, a.contribution_offset);
-  auto *return_ready = peer_at<unsigned long long>(
-      a.local_base, a.return_ready_epoch_offset);
+  auto *source_ready = peer_at<unsigned long long>(
+      a.local_base, a.outgoing_sequence_offset);
   auto *combined = peer_at<transport::BFloat16>(
       a.local_base, a.combined_offset);
-  auto *reduce_routes = reinterpret_cast<unsigned long long *>(smem_accum_a);
-  auto *reduce_gates = reinterpret_cast<float *>(
-      reduce_routes + a.dispatch.identity.top_k);
-  while (!forward_cancelled(a)) {
-    constexpr std::uint64_t kReduceTokenChunk = 8;
-    __shared__ unsigned long long token_base_shared;
-    if (threadIdx.x == 0)
-      token_base_shared = atomicAdd(&scheduler[2], kReduceTokenChunk);
-    __syncthreads();
-    const auto chunk_end = token_base_shared + kReduceTokenChunk;
-    const auto token_end =
-        chunk_end < a.dispatch.identity.num_tokens
-            ? static_cast<std::uint64_t>(chunk_end)
-            : a.dispatch.identity.num_tokens;
-    if (token_base_shared >= token_end)
-      break;
-    for (std::uint64_t token = token_base_shared; token < token_end; ++token) {
-      if (threadIdx.x < a.dispatch.identity.top_k) {
-        const auto route = token * a.dispatch.identity.top_k + threadIdx.x;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-            return_ready[route]);
-        while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
-               !forward_cancelled(a)) {
-        }
-      }
-      __syncthreads();
-      for (std::uint32_t order = threadIdx.x;
-           order < a.dispatch.identity.top_k; order += blockDim.x) {
-        const auto slot = a.dispatch.combine_order[
-            token * a.dispatch.identity.top_k + order];
-        const auto route = token * a.dispatch.identity.top_k + slot;
-        reduce_routes[order] = route;
-        reduce_gates[order] = a.gates[route];
-      }
-      __syncthreads();
-      for (std::uint64_t hidden = threadIdx.x; hidden < a.hidden;
-           hidden += blockDim.x) {
-        float sum = 0.0F;
-        for (std::uint32_t order = 0; order < a.dispatch.identity.top_k;
-             ++order) {
-          sum = gate_after_accumulate(
-              sum, reduce_gates[order],
-              contribution[reduce_routes[order] * a.hidden + hidden].bits);
-        }
-        combined[token * a.hidden + hidden] =
-            transport::BFloat16{float_to_bf16_bits(sum)};
-      }
-      __syncthreads();
-    }
-  }
-  grid.sync();
-  // Final peer-visible generation barrier. Output completion alone is not
-  // enough to recycle a slot because a peer may still be publishing return
-  // rows from this epoch. The exact tagged epoch cannot alias the setup
-  // AllGather contents that occupied this storage before launch.
-  if (blockIdx.x == 0) {
-    constexpr unsigned long long kTerminalTag = 1ULL << 63U;
-    const auto terminal_value = kTerminalTag | a.epoch;
-    if (threadIdx.x < a.world) {
-      auto *peer_terminal = peer_at<unsigned long long>(
-          a.peer_bases[threadIdx.x], a.terminal_epoch_offset);
+  constexpr std::uint32_t kWarpsPerCta = 12U;
+  constexpr std::uint32_t kWarpsPerToken = 1U;
+  constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  const auto token_warp = warp % kWarpsPerToken;
+  for (std::uint64_t token =
+           static_cast<std::uint64_t>(blockIdx.x) * kTokensPerCta +
+           warp / kWarpsPerToken;
+       token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
+       token += static_cast<std::uint64_t>(gridDim.x) * kTokensPerCta) {
+    if (lane == 0U && status->reduced_tokens == ~0ULL)
+      atomicMin(&status->reduced_tokens, device_globaltimer_ns());
+    unsigned long long lane_route = 0ULL;
+    float lane_gate = 0.0F;
+    if (lane < a.dispatch.identity.top_k) {
+      const auto slot = a.dispatch.combine_order[
+          token * a.dispatch.identity.top_k + lane];
+      lane_route = token * a.dispatch.identity.top_k + slot;
+      lane_gate = a.gates[lane_route];
+      const auto destination = a.dispatch.route_dst_rank[lane_route];
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          published(peer_terminal[a.rank]);
-      published.store(terminal_value, ::cuda::memory_order_release);
-    }
-    __syncthreads();
-    auto *local_terminal = peer_at<unsigned long long>(
-        a.local_base, a.terminal_epoch_offset);
-    for (std::uint32_t source = threadIdx.x; source < a.world;
-         source += blockDim.x) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          published(local_terminal[source]);
-      while (published.load(::cuda::memory_order_acquire) != terminal_value &&
+          ready(source_ready[destination * a.channels]);
+      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
              !forward_cancelled(a)) {
       }
     }
+    __syncwarp();
+    auto *output8 = reinterpret_cast<uint4 *>(combined + token * a.hidden);
+    for (std::uint64_t vector = lane + token_warp * 32U;
+         vector < a.hidden / 8ULL; vector += kWarpsPerToken * 32ULL) {
+      float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F,
+                       0.0F, 0.0F, 0.0F, 0.0F};
+      for (std::uint32_t order = 0;
+           order < a.dispatch.identity.top_k; ++order) {
+        const auto route = __shfl_sync(0xffffffffU, lane_route, order);
+        const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
+        const auto packed = reinterpret_cast<const uint4 *>(
+            contribution + route * a.hidden)[vector];
+        const unsigned int words[4] = {
+            packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+        for (std::uint32_t word = 0; word < 4U; ++word) {
+          sums[word * 2U] = gate_after_accumulate(
+              sums[word * 2U], gate,
+              static_cast<std::uint16_t>(words[word]));
+          sums[word * 2U + 1U] = gate_after_accumulate(
+              sums[word * 2U + 1U], gate,
+              static_cast<std::uint16_t>(words[word] >> 16U));
+        }
+      }
+      unsigned int words[4];
+#pragma unroll
+      for (std::uint32_t word = 0; word < 4U; ++word)
+        words[word] =
+            static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
+            (static_cast<unsigned int>(
+                 float_to_bf16_bits(sums[word * 2U + 1U]))
+             << 16U);
+      output8[vector] = make_uint4(words[0], words[1], words[2], words[3]);
+    }
   }
+  if (lane == 0U)
+    atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
+  __syncthreads();
   grid.sync();
+  // Every local return CTA has fenced before publishing its destination
+  // signal, and every local Reduce warp acquired all of its destination
+  // signals before reaching this grid completion.  Consequently no peer can
+  // still write this slot and no local worker can still read it; a second
+  // all-rank terminal rendezvous would only duplicate those dependencies.
   if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     status->fc1_tasks_done = fc1_tasks;
@@ -3871,24 +3991,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "clear forward status");
 
-  // This is the only per-generation team rendezvous before the single data
-  // plane launch. It carries no activation or metadata and prevents an early
-  // rank from publishing into a peer slot that has not entered this epoch.
-  initialize_p2p_barrier_kernel<<<1, 1, 0, exec->stream>>>(
-      at<unsigned long long>(slot.device, layout.p2p_barrier_send),
-      activation.slot->index, id.generation);
-  internal::throw_cuda(
-      "forward-run", cudaGetLastError(), id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "initialize forward rendezvous");
-  internal::throw_nccl(
-      "forward-run",
-      ncclAllGather(at<void>(slot.device, layout.p2p_barrier_send),
-                    at<void>(slot.device, layout.p2p_barrier_receive), 2,
-                    ncclUint64, backend->nccl->comm, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "ncclAllGather(forward rendezvous)");
+  // Notify has already completed the rank-wide generation agreement on this
+  // communicator.  The IPC team and per-slot peer mappings are session-static,
+  // while payload visibility is ordered by the device release/acquire signals
+  // below, so a second host-enqueued AllGather here only serialized E2E.
 
   if (slot.transport_epoch >= (1ULL << 63U) - 1ULL)
     transport_error(NotifyErrorCode::ArithmeticOverflow, "forward-run",
@@ -3944,10 +4050,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                                   std::to_string(id.calling_rank) +
                                   ", expected>=2, actual=" +
                                   std::to_string(sms));
-  constexpr std::size_t forward_smem =
+  const std::size_t forward_smem =
       (4U * 128U * 64U + 4U * 256U * 64U) *
           sizeof(transport::BFloat16) +
-      8U * sizeof(std::uint64_t);
+      8U * sizeof(std::uint64_t) +
+      static_cast<std::size_t>(id.world_size) * sizeof(std::uint32_t);
   internal::throw_cuda(
       "forward-run",
       cudaFuncSetAttribute(local_p2p_forward_megakernel,
@@ -4086,11 +4193,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   result->timings.fc1_swiglu_us =
       elapsed(status.fc1_start_clock, status.fc1_complete_clock);
   result->timings.fc2_us =
-      elapsed(status.fc1_complete_clock, status.fc2_complete_clock);
+      elapsed(status.dispatch_blocks_done, status.fc2_complete_clock);
   result->timings.combine_return_us =
-      elapsed(status.fc2_complete_clock, status.return_complete_clock);
+      elapsed(status.relay_blocks_done, status.return_complete_clock);
   result->timings.reduce_us =
-      elapsed(status.return_complete_clock, status.complete_clock);
+      elapsed(status.reduced_tokens, status.reduce_blocks_done);
+  result->timings.fc1_fc2_overlap_us =
+      elapsed(status.dispatch_blocks_done, status.fc1_complete_clock);
+  result->timings.fc2_return_overlap_us =
+      elapsed(status.relay_blocks_done, status.fc2_complete_clock);
+  result->timings.return_reduce_overlap_us =
+      elapsed(status.reduced_tokens, status.return_complete_clock);
   failure_guard.committed = true;
   return DeviceForwardHandle(std::move(result));
 }

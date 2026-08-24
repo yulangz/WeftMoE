@@ -261,6 +261,9 @@ struct ForwardMegaKernelTimings {
   double fc2_us = 0;
   double combine_return_us = 0;
   double reduce_us = 0;
+  double fc1_fc2_overlap_us = 0;
+  double fc2_return_overlap_us = 0;
+  double return_reduce_overlap_us = 0;
   double total_us = 0;
 };
 

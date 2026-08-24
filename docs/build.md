@@ -156,24 +156,59 @@ the timed workload.
 
 On the inspected local 8-GPU host, three independent release sessions (each
 10 warmups + 100 measurements) produced slowest-rank Forward E2E means of
-17.899, 17.910, and 17.935 ms. The same-route/same-gate/same-weight
-Megatron-Core 0.17.0 native means were 17.998, 17.962, and 17.948 ms; per-run
-speedups are therefore only 0.55%, 0.29%, and 0.07%, not the required 15%.
-Megatron's explicit source-gate-after common-semantics means were 21.954,
-21.965, and 21.963 ms, against which MegaMOE is 18.5% faster. These two results
-are reported separately because Megatron native applies routing probability at
-a different point.
+14.9033, 14.8794, and 14.8924 ms. The same-route/same-gate/same-weight
+Megatron-Core 0.17.0 native means were 17.9283, 17.9522, and 18.0105 ms. The
+paired speedups are 16.87%, 17.12%, and 17.31%; every independent session
+passes the 15% gate. Megatron's explicit source-gate-after common-semantics
+means were 21.9668, 21.9424, and 21.9726 ms. These two Megatron results remain
+separate because its native path applies routing probability at a different
+point.
 
-The final MegaMOE stage means are approximately Notify 0.52--0.55 ms,
-Dispatch 2.02 ms, FC1 7.09 ms, FC2 4.30 ms, vectorized return 2.27 ms, and
-overlapped deterministic reduce 2.30 ms. The measured pool is
+The three MegaMOE stage means span Notify 0.581--0.599 ms, Dispatch
+1.975--1.978 ms, full FC1 6.903--6.905 ms, full FC2 5.199--5.203 ms,
+full M-block Return 5.264--5.272 ms, and full deterministic Reduce
+1.164--1.231 ms. These spans overlap and therefore must not be summed:
+device timestamps measure FC1/FC2 overlap at 0.366--0.367 ms, FC2/Return at
+5.023--5.028 ms, and Return/Reduce at 0.428--0.430 ms. Dispatch remains an
+initial bulk phase and is not claimed as hidden. The measured pool is
 2,847,625,496 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
 Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
-FP32 gates remain local. Nsight Compute on the main-shape world-1 compute slice
-reported 42.37% SM throughput, 48.87% DRAM throughput, and 18.75% active-warps
-occupancy. `ptxas` also reports serialized WGMMA accumulator dependencies;
-those results identify clustered weight reuse and WGMMA pipeline scheduling as
-the next optimization target.
+FP32 gates remain local. Rank-0 output hashes are identical under EP1/EP2/EP8,
+cache/no-cache, release/debug, and 20 repeats. Against the common high-precision
+Forward reference, max absolute error is 0.0185547 and max RMSE is 0.00726373;
+the checked tolerances are 0.02 and 0.008 respectively. Byte identity with
+TransformerEngine's internal instruction order is intentionally not required.
+
+A clean tracked-file export on `10.10.19.233` reproduced world 1/2/8,
+top-k 1/6, cache/no-cache, and 20-repeat correctness with the same rank-0 hash.
+Its three world-8 Forward means were 14.8705, 14.8755, and 14.8243 ms; P95 was
+14.9456, 15.0422, and 14.9222 ms. Megatron-Core is not installed on that host,
+so the formal paired speedup is the local same-host comparison above rather
+than a cross-machine estimate.
+
+Nsight Compute on the main-shape world-1 compute slice reports 19.432 ms kernel
+duration, 55.97% SM throughput, 66.55% DRAM throughput, 56.29% Tensor-pipe
+active, and 18.75% occupancy. The prior capture was 25.349 ms, 42.37% SM and
+48.87% DRAM. Current barrier and long-scoreboard stalls are 9.78 and 3.27
+warps/issue-active; WGMMA/TMA wait reduction is therefore the next largest
+optimization point. Nsight Systems is not installed on this host.
+
+The frozen main-shape specialization is M=128, FC1 N=128/K=64 with three TMA
+stages, FC2 N=256/K=64 with four TMA stages, 384 threads/CTA, one resident CTA
+per SM, 2-CTA launch clusters, release task chunks of four, and one warp per
+Reduce token. TMA multicast remains disabled: the tested multicast cluster
+schedule was slower and did not satisfy long-run progress. Four-stage FC1,
+BN=64/128 alternatives, direct-peer FC2 epilogues, dedicated Return CTAs,
+two-warps/token Reduce, and per-route signalling were likewise rejected.
+The selected worker policy uses all 132 CTAs for initial Dispatch, then a
+shared FC1/FC2 counter; CTAs return the M-block whose final FC2 tile they
+complete and enter Reduce as they leave compute. A fixed dedicated-CTA role
+split lost to this dynamic phase conversion on the measured main shape.
+The current `sm_90a` cubin reports 168 registers/thread, 16 bytes stack,
+2,048 bytes static shared memory, and 196,704 bytes dynamic shared memory at
+world 8. `ptxas` still reports WGMMA accumulator dependency serialization and
+an ignored `setmaxnreg`; these match the remaining barrier/scoreboard profile
+and are not hidden from the performance evidence.
 
 `cuda-test-local` runs real NCCL worlds 1, 2, and 8. Each world runs 25 fixed
 seeds, a 20-run byte-for-byte repeat fixture, staggered rank enqueue timing,
