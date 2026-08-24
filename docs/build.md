@@ -198,13 +198,15 @@ normally):
 make BUILD_DIR=build-cuda \
   NCCL_RUNTIME_LIB_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
   cuda-sanitizer-smoke
+```
 
 `cuda-sanitizer-smoke` runs memcheck, racecheck, and initcheck over that same
 closed-loop 73-node path. All three tools were available locally and reported
-0 errors/0 hazards. The inspected remote image did not contain the
-`compute-sanitizer` executable; its ordinary 73-node path, world 1/8 tests, and
-host ASan/UBSan still ran from the clean export.
-```
+0 errors/0 hazards. The remote image provides the executable at
+`/usr/local/cuda/bin/compute-sanitizer` but does not include that directory in
+the default `PATH`; explicit invocation from a clean export also reported
+0 errors/0 hazards for all three tools. Host ASan/UBSan and world 1/2/8 ran
+from the same clean export.
 
 The transport portion of `--device-smoke` executes the production persistent
 worker for world=1 and a full 73-node descriptor fixture, compares contribution
@@ -221,12 +223,12 @@ the transport-only device-simulation worker, not GIN/RDMA/network bandwidth.
 
 | stage | mean (us) | P50 | P95 | min | max |
 |---|---:|---:|---:|---:|---:|
-| dispatch + relay + synthetic return | 74034.2 | 74022.9 | 74124.4 | 73951.7 | 74156.0 |
-| deterministic combine reduce | 4540.49 | 4804.38 | 4809.60 | 4023.58 | 4810.72 |
-| steady transport total | 78589.1 | 78801.9 | 78844.4 | 78193.6 | 78853.6 |
+| dispatch + relay + synthetic return | 75719.0 | 75717.8 | 75779.6 | 75642.5 | 75789.8 |
+| deterministic combine reduce | 4387.79 | 4207.33 | 4841.02 | 4032.13 | 4841.18 |
+| steady transport total | 80121.6 | 79941.7 | 80547.2 | 79838.2 | 80555.8 |
 
-One-time transport-pool setup was 5297.55 us. The single-slot pool owns
-2,349,929,848 device bytes and 120 pinned bytes. The fixture deliberately puts
+One-time transport-pool setup was 234.361 us. The single-slot pool owns
+2,349,930,104 device bytes and 120 pinned bytes. The fixture deliberately puts
 six selected experts on one destination node: raw traffic is 616,562,688 bytes
 and node-deduplicated payload traffic is 102,760,448 bytes (6x reduction).
 `TRANSPORT_BENCH_JSON` emits the same fields. These numbers contain no network
