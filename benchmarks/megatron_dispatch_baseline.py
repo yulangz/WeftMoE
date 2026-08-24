@@ -14,6 +14,7 @@ import json
 import math
 import os
 import statistics
+import time
 
 import torch
 import torch.distributed as dist
@@ -40,25 +41,32 @@ def stats(values):
 
 
 def measure(function, warmups, iterations):
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     for _ in range(warmups):
         dist.barrier()
         function()
         torch.cuda.synchronize()
-    samples = []
+    cuda_samples = []
+    wall_samples = []
     for _ in range(iterations):
         dist.barrier()
         torch.cuda.synchronize()
-        begin = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        wall_begin = time.perf_counter_ns()
         begin.record()
         function()
         end.record()
         end.synchronize()
-        elapsed = torch.tensor(begin.elapsed_time(end), dtype=torch.float64,
-                               device="cuda")
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        samples.append(elapsed.item())
-    return samples
+        wall_ms = (time.perf_counter_ns() - wall_begin) / 1.0e6
+        cuda_elapsed = torch.tensor(begin.elapsed_time(end),
+                                    dtype=torch.float64, device="cuda")
+        wall_elapsed = torch.tensor(wall_ms, dtype=torch.float64,
+                                    device="cuda")
+        dist.all_reduce(cuda_elapsed, op=dist.ReduceOp.MAX)
+        dist.all_reduce(wall_elapsed, op=dist.ReduceOp.MAX)
+        cuda_samples.append(cuda_elapsed.item())
+        wall_samples.append(wall_elapsed.item())
+    return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
 
 
 def main():
@@ -70,6 +78,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--save-output-dir")
+    parser.add_argument("--trace-dir")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -99,6 +110,7 @@ def main():
         bf16=True,
         params_dtype=torch.bfloat16,
         moe_router_dtype="fp32",
+        moe_router_pre_softmax=args.top_k == 1,
         moe_permute_fusion=False,
         deterministic_mode=True,
     )
@@ -110,10 +122,13 @@ def main():
         get_default_pg_collection(),
     )
 
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(20260824 + rank)
-    hidden = torch.randn((args.tokens, args.hidden), dtype=torch.bfloat16,
-                         device="cuda", generator=generator)
+    # Bit-for-bit the same deterministic BF16 input used by MegaMOE's C++
+    # integrated runner: flattened element i is (rank*101 + i%97)/32.
+    flat = torch.arange(args.tokens * args.hidden, dtype=torch.int32,
+                        device="cuda")
+    hidden = ((rank * 101 + torch.remainder(flat, 97)).to(torch.float32) /
+              32.0).to(torch.bfloat16).reshape(args.tokens, args.hidden)
+    del flat
     token = torch.arange(args.tokens, device="cuda", dtype=torch.long)[:, None]
     slot = torch.arange(args.top_k, device="cuda", dtype=torch.long)[None, :]
     selected = (token * 17 + rank * 31 + slot * 53) % args.experts
@@ -122,7 +137,10 @@ def main():
     routing.scatter_(1, selected, True)
     probabilities = torch.zeros((args.tokens, args.experts), dtype=torch.float32,
                                 device="cuda")
-    probabilities.scatter_(1, selected, 1.0 / args.top_k)
+    # Megatron's dispatcher transports probabilities but does not apply them;
+    # its expert implementation normally consumes them. For an actual identity
+    # expert and byte-identical common path, every selected route has gate 1.
+    probabilities.scatter_(1, selected, 1.0)
 
     def prepare_dispatch():
         return dispatcher.dispatch_preprocess(hidden, routing, probabilities)
@@ -152,35 +170,134 @@ def main():
         returned = dispatcher.token_combine(combine_input)
         return dispatcher.combine_postprocess(returned)
 
-    results = {
-        "routing_metadata_and_local_permute": stats(
-            measure(prepare_dispatch, args.warmups, args.iterations)),
-        "dispatch_alltoall": stats(
-            measure(dispatch_collective, args.warmups, args.iterations)),
-        "combine": stats(
-            measure(combine_roundtrip, args.warmups, args.iterations)),
-        "identity_expert_transport_roundtrip": stats(
-            measure(full_roundtrip, args.warmups, args.iterations)),
+    def common_semantics_roundtrip():
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            hidden, routing, probabilities)
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        expert_input, _, _ = dispatcher.dispatch_postprocess(
+            remote_hidden, remote_probs)
+        combine_input = dispatcher.combine_preprocess(expert_input)
+        returned = dispatcher.token_combine(combine_input)
+        # Megatron's native combine accumulates in BF16. This explicit common
+        # boundary keeps Megatron's real dispatcher/collectives and replaces
+        # only that final local reduction with fixed expert-major FP32 order.
+        common = torch.zeros(dispatcher.hidden_shape_before_permute,
+                             dtype=torch.float32, device="cuda")
+        common.index_add_(
+            0, dispatcher.reversed_local_input_permutation_mapping,
+            returned.float())
+        return common.to(torch.bfloat16).view(dispatcher.hidden_shape)
+
+    measured_runs = []
+    for run in range(args.runs):
+        measured_runs.append({
+            "run": run,
+            "routing_metadata_and_local_permute": measure(
+                prepare_dispatch, args.warmups, args.iterations),
+            "dispatch_alltoall": measure(
+                dispatch_collective, args.warmups, args.iterations),
+            "combine": measure(
+                combine_roundtrip, args.warmups, args.iterations),
+            "native_identity_e2e": measure(
+                full_roundtrip, args.warmups, args.iterations),
+            "common_semantics_identity_e2e": measure(
+                common_semantics_roundtrip, args.warmups, args.iterations),
+        })
+
+    native_output = full_roundtrip()
+    common_output = common_semantics_roundtrip()
+    torch.cuda.synchronize()
+    expected_fp32 = torch.zeros_like(hidden, dtype=torch.float32)
+    for _slot in range(args.top_k):
+        expected_fp32.add_(hidden.float())
+    expected_output = expected_fp32.to(torch.bfloat16)
+    native_absolute = (native_output.float() - expected_output.float()).abs()
+    native_relative = (native_absolute /
+                       expected_output.float().abs().clamp_min(1.0e-12))
+    common_absolute = (common_output.float() - expected_output.float()).abs()
+    common_relative = (common_absolute /
+                       expected_output.float().abs().clamp_min(1.0e-12))
+    output_validation = {
+        "native": {
+            "byte_identical_to_common_reference": bool(
+                torch.equal(native_output, expected_output)),
+            "max_abs_error": native_absolute.max().item(),
+            "max_relative_error": native_relative.max().item(),
+        },
+        "common_semantics": {
+            "byte_identical_to_common_reference": bool(
+                torch.equal(common_output, expected_output)),
+            "max_abs_error": common_absolute.max().item(),
+            "max_relative_error": common_relative.max().item(),
+        },
     }
-    peer_payload_bytes = (args.tokens * args.top_k * args.hidden * 2 *
-                          (world - 1) / world)
-    results["dispatch_alltoall"]["effective_peer_GBps"] = (
-        peer_payload_bytes / (results["dispatch_alltoall"]["mean_ms"] * 1e6))
-    results["combine"]["effective_peer_GBps"] = (
-        peer_payload_bytes / (results["combine"]["mean_ms"] * 1e6))
+    if args.save_output_dir:
+        os.makedirs(args.save_output_dir, mode=0o700, exist_ok=True)
+        torch.save({"native": native_output.cpu(),
+                    "common": common_output.cpu()}, os.path.join(
+                        args.save_output_dir, f"megatron-rank-{rank}.pt"))
+
+    if args.trace_dir:
+        os.makedirs(args.trace_dir, mode=0o700, exist_ok=True)
+        activities = [torch.profiler.ProfilerActivity.CPU,
+                      torch.profiler.ProfilerActivity.CUDA]
+        with torch.profiler.profile(activities=activities) as profile:
+            dist.barrier()
+            full_roundtrip()
+            torch.cuda.synchronize()
+        profile.export_chrome_trace(os.path.join(
+            args.trace_dir, f"megatron-rank-{rank}.json"))
+
+    activation_peer_bytes = int(args.tokens * args.top_k * args.hidden * 2 *
+                                (world - 1) / world)
+    probability_peer_bytes = int(args.tokens * args.top_k * 4 *
+                                 (world - 1) / world)
+    return_peer_bytes = activation_peer_bytes
+    native_wall_means = [
+        run["native_identity_e2e"]["host_wall"]["mean_ms"]
+        for run in measured_runs]
+    common_wall_means = [
+        run["common_semantics_identity_e2e"]["host_wall"]["mean_ms"]
+        for run in measured_runs]
     output = {
-        "schema": 1,
+        "schema": 2,
         "implementation": "Megatron-Core MoEAlltoAllTokenDispatcher",
         "megatron_core_version": importlib.metadata.version("megatron-core"),
         "torch_version": torch.__version__,
         "torch_nccl_version": ".".join(
             str(part) for part in torch.cuda.nccl.version()),
         "world": world,
-        "shape": vars(args),
+        "shape": {
+            "tokens": args.tokens, "hidden": args.hidden,
+            "intermediate": args.intermediate, "experts": args.experts,
+            "top_k": args.top_k, "warmups": args.warmups,
+            "iterations": args.iterations, "runs": args.runs,
+        },
         "dtype": "BF16 input/output; FP32 routing probabilities",
-        "expert_body": "identity (transport-isolation baseline)",
-        "estimated_peer_payload_bytes_per_direction_per_rank": int(peer_payload_bytes),
-        "results": results,
+        "expert_ownership": "contiguous rank-major",
+        "expert_body": "identity",
+        "combine_reference": (
+            "unit FP32 gate; fixed expert-ID FP32 sum; final BF16 cast"),
+        "payload_bytes_per_rank": {
+            "dispatch_activation_peer": activation_peer_bytes,
+            "dispatch_probability_peer": probability_peer_bytes,
+            "combine_activation_peer": return_peer_bytes,
+            "total_peer": (activation_peer_bytes + probability_peer_bytes +
+                           return_peer_bytes),
+        },
+        "output_validation": output_validation,
+        "runs": measured_runs,
+        "native_identity_e2e_host_wall_cross_run": {
+            "mean_ms": statistics.fmean(native_wall_means),
+            "variance_ms2": statistics.pvariance(native_wall_means),
+            "per_run_mean_ms": native_wall_means,
+        },
+        "common_identity_e2e_host_wall_cross_run": {
+            "mean_ms": statistics.fmean(common_wall_means),
+            "variance_ms2": statistics.pvariance(common_wall_means),
+            "per_run_mean_ms": common_wall_means,
+        },
     }
     if rank == 0:
         print("MEGATRON_BASELINE_JSON " + json.dumps(output, sort_keys=True),

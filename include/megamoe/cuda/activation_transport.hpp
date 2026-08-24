@@ -98,11 +98,13 @@ struct ActivationTransportExpectation {
 };
 
 struct ActivationTransportTimings {
+  double generation_setup_us = 0;
   double dispatch_put_us = 0;
   double relay_us = 0;
   double synthetic_return_us = 0;
   double dispatch_relay_us = 0;
   double combine_reduce_us = 0;
+  double terminal_completion_us = 0;
   double total_us = 0;
 };
 
@@ -141,6 +143,9 @@ private:
   friend class LocalCudaP2pActivationTransport;
   friend class ActivationTransportBridge;
   friend struct ActivationTransportValidationDownload;
+  friend std::vector<transport::BFloat16>
+  download_activation_output_for_validation(
+      const DeviceActivationTransportHandle &, const CudaExecution &);
 };
 
 class DeviceActivationTransport {
@@ -196,6 +201,10 @@ struct ActivationTransportValidationDownload {
 };
 
 ActivationTransportValidationDownload download_activation_transport_for_validation(
+    const DeviceActivationTransportHandle &handle,
+    const CudaExecution &execution);
+
+std::vector<transport::BFloat16> download_activation_output_for_validation(
     const DeviceActivationTransportHandle &handle,
     const CudaExecution &execution);
 

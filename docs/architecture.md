@@ -519,11 +519,23 @@ audit record.
 
 The release local worker is a fixed stream-ordered pipeline of bulk CUDA grids:
 route CTAs write peer canonical rows directly, one tiny kernel publishes a
-per-peer dispatch completion, destination-row CTAs generate and return the
-synthetic contribution, a second per-peer completion closes return, and token
-CTAs reduce in fixed expert order. The grids expose all routes/rows/tokens to
-all SMs and avoid per-route system atomics. Physical peer traffic counts every
-destination-GPU fan-out; logical node dedup is reported separately.
+per-peer dispatch completion, destination-row CTAs apply the selected validation
+expert body and return contributions, a second per-peer completion closes
+return, and token CTAs reduce in fixed expert order. Identity is the integrated
+benchmark body; the older synthetic transform remains only for transport
+validation. The grids expose all routes/rows/tokens to all SMs and avoid
+per-route system atomics. Physical peer traffic counts every destination-GPU
+fan-out; logical node dedup is reported separately.
+
+Static IPC mappings, arena layout, and capacities are session setup. A release
+generation does not clear the multi-gigabyte arena: its monotonically increasing
+slot epoch makes prior signals stale, and only the used status record is reset.
+After Notify, a 16-byte/rank device AllGather verifies that every process has
+acquired the same transport slot and epoch before peer writes can start. This
+small agreement is necessary because Notify completion alone does not prove the
+transport slot/capacity boundary. The source waits for all return signals before
+reducing, then records output completion; the normal release path does not add a
+second terminal team barrier. Debug/cancel paths retain explicit draining.
 
 `MEGAMOE_DEBUG_VALIDATE=1` selects the earlier persistent ring worker. There,
 physical slot is `sequence % ring_slots`; every link has a monotonic 64-bit next

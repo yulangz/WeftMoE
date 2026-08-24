@@ -17,6 +17,9 @@ public:
       std::uint64_t num_tokens, std::uint64_t hidden,
       const RankCollectiveContext &context, const CudaExecution &execution,
       const ActivationTransportResourcePool &pool);
+  static BFloat16ActivationLease reissue_for_benchmark(
+      const BFloat16ActivationLease &storage,
+      const RankCollectiveContext &context, const CudaExecution &execution);
   static ActivationTransportValidationDownload download_for_validation(
       const DeviceActivationTransportHandle &handle,
       const CudaExecution &execution);

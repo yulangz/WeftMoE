@@ -67,7 +67,10 @@ Completed correctness components:
   independent Python oracle, and a last-block P2P ordering probe;
 - trusted release all-SM bulk route/row/token grids with direct canonical writes
   and per-peer phase completion; debug retains the ring/credit worker;
-- a checked-in Megatron-Core `MoEAlltoAllTokenDispatcher` comparison harness;
+- a checked-in Megatron-Core `MoEAlltoAllTokenDispatcher` comparison harness
+  and same-generation Notify-to-P2P integrated release benchmark. The measured
+  common-semantics single-node world-8 result is 5.012 ms versus 9.002 ms
+  (44.32% faster) over three independent 10-warmup/100-sample runs;
 - an explicit GIN capability probe and fail-closed backend boundary.
 
 Still required before phase 4 closes:

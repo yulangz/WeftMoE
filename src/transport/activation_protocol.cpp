@@ -1,6 +1,7 @@
 #include "megamoe/transport/activation_protocol.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -38,7 +39,10 @@ std::size_t checked_size(std::uint64_t value, const char *field,
 }
 
 BFloat16 synthetic_value(BFloat16 input, std::uint32_t expert,
-                          std::uint64_t hidden_index) noexcept {
+                          std::uint64_t hidden_index,
+                          ActivationExpertTransform transform) noexcept {
+  if (transform == ActivationExpertTransform::Identity)
+    return input;
   const auto expert_term = static_cast<float>((expert % 251U) + 1U) / 128.0F;
   const auto lane_term = static_cast<float>(hidden_index % 17U) / 1024.0F;
   return float_to_bfloat16(bfloat16_to_float(input) + expert_term + lane_term);
@@ -88,6 +92,8 @@ SyntheticTransportResult simulate_activation_transport(
     protocol_error("hidden_size", rank, "> 0", "0");
   if (config.channels == 0)
     protocol_error("channels", rank, "> 0", "0");
+  if (!std::isfinite(config.combine_gate_scale))
+    protocol_error("combine_gate_scale", rank, "finite", "non-finite");
   if (config.ring_slots_per_source_channel == 0)
     protocol_error("ring_slots_per_source_channel", rank, "> 0", "0");
   if (epoch == 0)
@@ -248,7 +254,8 @@ SyntheticTransportResult simulate_activation_transport(
             checked_mul(route, config.hidden_size, "contribution index", rank) +
                 h,
             "contribution index", rank)] =
-            synthetic_value(token_activations[input_index], target.expert_id, h);
+            synthetic_value(token_activations[input_index], target.expert_id, h,
+                            config.expert_transform);
       }
       ++result.audit.relayed_fanout;
       ++result.audit.synthetic_contributions;
@@ -275,7 +282,9 @@ SyntheticTransportResult simulate_activation_transport(
         const auto contribution_index = checked_size(
             checked_mul(route, config.hidden_size, "reduce index", rank) + h,
             "reduce index", rank);
-        sum += bfloat16_to_float(result.contribution_by_route[contribution_index]);
+        sum += config.combine_gate_scale *
+               bfloat16_to_float(
+                   result.contribution_by_route[contribution_index]);
       }
       result.combined_tokens[checked_size(
           checked_mul(token, config.hidden_size, "combined index", rank) + h,

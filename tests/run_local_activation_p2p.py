@@ -7,6 +7,7 @@ reference/materialization code.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import select
@@ -30,8 +31,19 @@ def read_exact_frame(fd, timeout):
         if not chunk:
             raise RuntimeError("local P2P bootstrap was short")
         output.extend(chunk)
-    if os.read(fd, 1):
-        raise RuntimeError("local P2P bootstrap was oversized")
+    # A sanitizer launcher can retain the inherited write descriptor in its
+    # subreaper even after the rank target has written the fixed frame. Never
+    # wait indefinitely for EOF: perform a short, nonblocking trailing-byte
+    # check under the launcher's outer timeout. A byte is still an oversize
+    # error; EAGAIN means the complete fixed frame is available to peers.
+    prior_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETFL, prior_flags | os.O_NONBLOCK)
+        readable = select.select([fd], [], [], min(0.05, max(0.0, deadline - time.monotonic())))[0]
+        if readable and os.read(fd, 1):
+            raise RuntimeError("local P2P bootstrap was oversized")
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, prior_flags)
     return bytes(output)
 
 
@@ -84,9 +96,9 @@ def seeded_routes(world, experts, top_k, seed, max_tokens=10):
     return result
 
 
-def expected(world, seed, hidden=17):
+def expected(world, seed, hidden=17, requested_top_k=6):
     experts = max(16, world * 2)
-    top_k = min(6, experts)
+    top_k = min(requested_top_k, experts)
     routes = seeded_routes(world, experts, top_k, seed)
     counts = [[0] * experts for _ in range(world)]
     offsets = []
@@ -191,20 +203,30 @@ def main():
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--integrated-benchmark", action="store_true")
+    parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--no-wrap", action="store_true")
     parser.add_argument("--ring-slots", type=int, choices=(1, 2))
     parser.add_argument("--compute-sanitizer-tool",
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
+    if args.benchmark and args.integrated_benchmark:
+        parser.error("choose only one benchmark mode")
+    benchmark_mode = args.benchmark or args.integrated_benchmark
     if args.rounds is None:
-        args.rounds = 110 if args.benchmark else 1
-    if args.benchmark and args.rounds <= 10:
+        args.rounds = 110 if benchmark_mode else 1
+    if benchmark_mode and args.rounds <= 10:
         parser.error("--benchmark requires more than 10 total rounds")
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
-    environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
-                "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+    environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
+    if args.integrated_benchmark:
+        environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
+        environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
+    else:
+        environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
+                    "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
     if args.no_wrap:
         environment["MEGAMOE_P2P_NO_WRAP"] = "1"
     if args.ring_slots is not None:
@@ -214,11 +236,14 @@ def main():
                "--error-exitcode=1"))
     read_fd, write_fd = os.pipe()
     processes = []
+    scenario = ("activation_integrated_bench" if args.integrated_benchmark else
+                ("activation_p2p_bench" if args.benchmark else
+                 ("activation_p2p_cancel" if args.cancel else
+                  "activation_p2p")))
     try:
         rank0 = subprocess.Popen(
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
-                   "activation_p2p_bench" if args.benchmark else
-                   ("activation_p2p_cancel" if args.cancel else "activation_p2p"),
+                   scenario,
                    prefix),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             pass_fds=(write_fd,), env=environment,
@@ -232,8 +257,7 @@ def main():
         for rank in range(1, args.world):
             process = subprocess.Popen(
                 runner(args.binary, rank, args.world, args.seed, 0, False,
-                       "activation_p2p_bench" if args.benchmark else
-                       ("activation_p2p_cancel" if args.cancel else "activation_p2p"),
+                       scenario,
                        prefix),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=False, env=environment,
@@ -250,7 +274,8 @@ def main():
                 stderr = stderr.decode("utf-8", "replace")
             if process.returncode != 0:
                 raise RuntimeError(
-                    f"rank={rank} exit={process.returncode} stderr={stderr[-2000:]}"
+                    f"rank={rank} exit={process.returncode} "
+                    f"stdout={stdout[-3000:]} stderr={stderr[-3000:]}"
                 )
             if args.cancel:
                 cancelled = parse_fields(stdout, "P2P_CANCEL ")
@@ -258,12 +283,130 @@ def main():
                         cancelled.get("quarantined") != "1":
                     raise AssertionError(f"rank={rank} bad cancellation audit")
             else:
-                observed.append(parse_fields(stdout, "P2P_BENCH ")
-                                if args.benchmark else parse_result(stdout))
+                marker = ("INTEGRATED_BENCH " if args.integrated_benchmark else
+                          "P2P_BENCH ")
+                item = (parse_fields(stdout, marker)
+                        if benchmark_mode else parse_result(stdout))
+                if benchmark_mode:
+                    runtime = parse_fields(stdout, "NCCL_RUNTIME ")
+                    item["_nccl_runtime"] = runtime["runtime"]
+                    item["_nccl_library"] = runtime["library"]
+                observed.append(item)
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
             return
-        if args.benchmark:
+        if benchmark_mode:
+            if args.integrated_benchmark:
+                stage_keys = (
+                    "wall", "notify", "mapping", "control",
+                    "count_summary", "materialize", "transport",
+                    "transport_setup", "dispatch", "relay_return",
+                    "reduce", "terminal")
+                for rank, item in enumerate(observed):
+                    if item["backend"] != "local-cuda-p2p":
+                        raise AssertionError(
+                            f"rank={rank} backend={item['backend']}")
+                    if item["output_equal"] != "1":
+                        raise AssertionError(
+                            f"rank={rank} integrated output mismatch")
+                    for key in stage_keys:
+                        item[key] = [float(value)
+                                     for value in item[key].split(",")]
+                        if len(item[key]) != args.rounds - 10:
+                            raise AssertionError(
+                                f"rank={rank} stage={key} "
+                                f"samples={len(item[key])}")
+
+                def stats(values):
+                    ordered = sorted(values)
+                    def percentile(fraction):
+                        ordinal = max(
+                            1, int(len(ordered) * fraction + 0.999999))
+                        return ordered[ordinal - 1]
+                    return {
+                        "mean": statistics.fmean(values),
+                        "p50": percentile(0.50),
+                        "p95": percentile(0.95),
+                        "min": ordered[0],
+                        "max": ordered[-1],
+                    }
+
+                summary = {}
+                for key in stage_keys:
+                    slowest = [max(item[key][iteration] for item in observed)
+                               for iteration in range(args.rounds - 10)]
+                    summary[key + "_slowest_rank_us"] = stats(slowest)
+                result = {
+                    "schema": 1,
+                    "benchmark": "notify-local-p2p-identity-integrated",
+                    "backend": "local-cuda-p2p",
+                    "world": args.world,
+                    "per_rank_nccl_runtime": [
+                        item["_nccl_runtime"] for item in observed],
+                    "per_rank_nccl_library": [
+                        item["_nccl_library"] for item in observed],
+                    "warmup": 10,
+                    "measured": args.rounds - 10,
+                    "one_time_setup_slowest_rank_us": max(
+                        float(item["setup_us"]) for item in observed),
+                    "expert_ownership": "contiguous-48-per-rank",
+                    "expert_body": "identity",
+                    "combine": "unit gate; expert-id FP32 order; final BF16",
+                    "per_rank_output_hash": [item["output_hash"]
+                                             for item in observed],
+                    "per_rank_device_pool_bytes": [int(item["device_bytes"])
+                                                    for item in observed],
+                    "per_rank_pinned_pool_bytes": [int(item["pinned_bytes"])
+                                                    for item in observed],
+                    "per_rank_route_input_bytes": [
+                        int(item["route_input_bytes"]) for item in observed],
+                    "per_rank_local_gate_bytes": [
+                        int(item["local_gate_bytes"]) for item in observed],
+                    "per_rank_actual_dispatch_peer_bytes": [
+                        int(item["actual_dispatch_peer_bytes"])
+                        for item in observed],
+                    "per_rank_actual_return_peer_bytes": [
+                        int(item["actual_return_peer_bytes"])
+                        for item in observed],
+                    "steady_dynamic_allocations": [
+                        int(item["steady_allocs"]) for item in observed],
+                    "per_rank_steady_h2d_bytes": [
+                        int(item["steady_h2d_bytes"]) for item in observed],
+                    "per_rank_steady_d2h_bytes": [
+                        int(item["steady_d2h_bytes"]) for item in observed],
+                    "per_rank_steady_d2d_bytes": [
+                        int(item["steady_d2d_bytes"]) for item in observed],
+                    "release_e2e_operation_sequence": [
+                        "Notify local mapping",
+                        "control AllGather",
+                        "expert-count AllGather",
+                        "packet-summary AllGather",
+                        "parallel device materialization",
+                        "P2P cancel-epoch H2D (8 bytes)",
+                        "P2P status memset (one status record)",
+                        "P2P setup-record kernel",
+                        "P2P setup AllGather (16 bytes/rank)",
+                        "bulk dispatch put",
+                        "dispatch release/acquire signal",
+                        "bulk identity return",
+                        "return release/acquire signal",
+                        "expert-order FP32 reduce and final BF16 cast",
+                        "status D2H (one status record)",
+                        "completion event and consumer drain",
+                    ],
+                    "large_generation_memsets": 0,
+                    **summary,
+                }
+                peer_bytes = sum(
+                    int(item["actual_dispatch_peer_bytes"]) +
+                    int(item["actual_return_peer_bytes"])
+                    for item in observed)
+                result["aggregate_effective_peer_GBps"] = (
+                    peer_bytes /
+                    (summary["transport_slowest_rank_us"]["mean"] * 1e3))
+                print("INTEGRATED_BENCH_JSON " +
+                      json.dumps(result, sort_keys=True))
+                return
             stage_keys = ("total", "dispatch", "relay", "synthetic", "reduce")
             for rank, item in enumerate(observed):
                 if item["backend"] != "local-cuda-p2p":
@@ -330,7 +473,7 @@ def main():
                 (summary["total_slowest_rank_us"]["mean"] * 1e3))
             print("P2P_BENCH_JSON " + json.dumps(result, sort_keys=True))
             return
-        oracle = expected(args.world, args.seed)
+        oracle = expected(args.world, args.seed, requested_top_k=args.top_k)
         for rank, (actual, wanted) in enumerate(zip(observed, oracle)):
             if actual["backend"] != "local-cuda-p2p":
                 raise AssertionError(f"rank={rank} backend={actual['backend']}")

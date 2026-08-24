@@ -27,12 +27,20 @@ BFloat16 float_to_bfloat16(float value) noexcept;
 
 inline constexpr std::uint32_t kActivationTransportSchemaVersion = 1;
 
+enum class ActivationExpertTransform : std::uint8_t {
+  SyntheticValidation,
+  Identity,
+};
+
 struct ActivationTransportConfig {
   std::uint64_t hidden_size = 0;
   std::uint32_t channels = 1;
   std::uint32_t ring_slots_per_source_channel = 0;
   std::uint32_t max_inflight_generations = 2;
   std::uint32_t max_inflight_consumers = 4;
+  ActivationExpertTransform expert_transform =
+      ActivationExpertTransform::SyntheticValidation;
+  float combine_gate_scale = 1.0F;
 };
 
 enum class ActivationTransportBackend : std::uint8_t {

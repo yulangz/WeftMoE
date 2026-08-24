@@ -277,6 +277,12 @@ make BUILD_DIR=build-debug ENABLE_CUDA=1 MEGAMOE_DEBUG_VALIDATE=1 cuda-lib
 torchrun --standalone --nproc-per-node=8 \
   benchmarks/megatron_dispatch_baseline.py
 
+# Fair integrated comparison: three independent 8-GPU runs on each side.
+# Each measured MegaMOE sample creates a new Notify generation and runs through
+# output-ready LocalCudaP2p completion; component means are not added together.
+make BUILD_DIR=build \
+  NCCL_RUNTIME_LIB_DIR=/path/to/common/nccl/lib fair-integrated-bench
+
 # Two-node baseline: run on both nodes with NODE_RANK=0/1.
 NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
   --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \

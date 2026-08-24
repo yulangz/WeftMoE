@@ -213,16 +213,18 @@ the default `PATH`; explicit invocation from a clean export also reported
 0 errors/0 hazards for all three tools. Host ASan/UBSan and world 1/2/8 ran
 from the same clean export.
 
-For the real two-process IPC test, `compute-sanitizer --target-processes all`
-preserves the one-shot bootstrap FD and the full Python oracle still passes,
-but NCCL 2.28.3 itself emits eight `cudaErrorNoKernelImageForDevice` reports
-from `ncclInitKernelsForDevice`; therefore that invocation exits nonzero and is
-not represented as a clean MegaMOE sanitizer result. Wrapping each rank
-separately is also invalid because the wrapper retains the inherited bootstrap
-write FD and prevents exact-frame EOF. The checked single-process two-GPU
-ordering path plus all MegaMOE device simulation/materialization kernels are
-covered by memcheck/racecheck/initcheck with zero reports; no NCCL suppression
-is installed.
+For the real two-process IPC test, the launcher now reads the fixed 128-byte
+bootstrap frame and uses a bounded nonblocking trailing-byte check. This avoids
+waiting forever for EOF when Compute Sanitizer's subreaper retains an inherited
+write descriptor; every wait remains under the launcher timeout. The real
+world-2 top-k=6 path completes under `racecheck` and the independent Python
+oracle passes. `memcheck` reaches and completes MegaMOE's P2P path but the NCCL
+initialization kernels still produce tool/runtime compatibility reports, so it
+exits nonzero. `initcheck` reaches the rank processes but does not finish within
+the 300-second instrumentation deadline. These are not represented as clean
+full-NCCL sanitizer passes and no suppression is installed. The NCCL-independent
+closed-loop device path, including transport worker and 73-node materializer,
+is covered by memcheck/racecheck/initcheck with 0 errors/hazards for all three.
 
 The transport portion of `--device-smoke` covers the device simulation oracle
 and ordering probe. Real independent-process local P2P is separate and cannot
@@ -268,20 +270,115 @@ The prior one-CTA serialized baseline was 426695.44 us mean. Bulk all-SM grids,
 direct canonical writes and per-peer phase signals reduce it by 98.95% (about
 95.4x). This remains CUDA IPC/NVLink—not GIN/RDMA or Socket transport.
 
-### Megatron-Core comparable baseline
+### Same-generation integrated Megatron-Core comparison
 
-`benchmarks/megatron_dispatch_baseline.py` runs Megatron-Core 0.17.0's actual
-`MoEAlltoAllTokenDispatcher` with the same world, BF16 shape, routing pattern
-and synchronization boundary. Its expert body is identity so the comparison is
-transport-only; `intermediate=3072` is recorded for the future FC benchmark.
-The installed PyTorch backend reports NCCL 2.27.5 while MegaMOE loads NCCL
-2.28.3; both versions and commands are emitted rather than hidden.
+`benchmarks/run_integrated_comparison.py` is the comparison gate. It launches
+three independent process worlds for each implementation, with 10 warmups and
+100 measured generations per run. MegaMOE's timed sample starts with a ready
+device route/activation lease, creates a new Notify generation, passes that
+exact `DeviceDispatchHandle` directly to the real `LocalCudaP2p` backend, runs
+identity expert return and deterministic combine, and stops only after output
+completion and the consumer drain required for safe pool reuse. Session, pool,
+and IPC-team construction are the only excluded one-time costs. Host-wall
+samples are first reduced with all-rank MAX; CUDA events provide diagnostic
+phase spans. The former `Notify mean + transport device-slice mean` estimate is
+retained only as a component baseline and is never used for a speedup claim.
+Both launchers inherit the same recorded CPU-affinity mask, expose the same
+eight GPUs, and use the same NCCL environment overrides; the runner refuses an
+NCCL runtime-version mismatch.
 
-For 10 warmups and 100 samples, routing/local permutation is 0.859 ms mean,
-dispatch AlltoAll 1.940 ms, combine 4.002 ms, and the identity-expert transport
-roundtrip 6.896 ms (P50 6.890, P95 6.937). MegaMOE's 4.473 ms synthetic
-transport is 35.1% faster at this boundary, exceeding the initial 15% target.
-This is not yet a full FC1/SwiGLU/FC2 forward/backward comparison.
+The common configuration uses contiguous ownership (rank 0 owns experts 0--47,
+rank 1 owns 48--95, and so on), identical selected expert IDs and token/slot
+order, deterministic BF16 activation, unit FP32 gates, identity experts, fixed
+expert-ID FP32 accumulation, and one final BF16 cast. MegaMOE represents the
+common unit gate as an immutable kernel scalar, so its gate tensor/peer payload
+is zero bytes; Megatron's dispatcher transports its FP32 probability tensor and
+that traffic is counted. The common-semantics Megatron path still uses the real
+Megatron dispatcher and collectives, replacing only its final native BF16
+`index_add_` with the documented expert-major FP32 reduction.
+
+The inspected single-node world-8 release result was:
+
+| comparable host-wall E2E | run means (ms) | 3-run mean (ms) | variance (ms^2) |
+|---|---|---:|---:|
+| MegaMOE integrated | 5.0060 / 5.0100 / 5.0205 | 5.0122 | 0.00003714 |
+| Megatron common semantics | 8.9844 / 9.0115 / 9.0104 | 9.0021 | 0.00015660 |
+| Megatron native combine | 6.9308 / 6.9424 / 6.9803 | 6.9512 | 0.00044713 |
+
+The formal common-semantics improvement is
+`(9.0021 - 5.0122) / 9.0021 = 44.32%`. Native results are reported but are not
+substituted for the common-semantics comparison because their BF16 accumulation
+order and cast location differ.
+
+One representative 100-sample run supplies full distribution and CUDA phase
+statistics:
+
+| MegaMOE slowest-rank span | mean (ms) | P50 | P95 | min | max |
+|---|---:|---:|---:|---:|---:|
+| integrated host-wall E2E | 5.0060 | 5.0027 | 5.0546 | 4.9515 | 5.1549 |
+| Notify | 0.5204 | 0.5139 | 0.5454 | 0.4981 | 0.6388 |
+| transport total | 4.4787 | 4.4781 | 4.5013 | 4.4369 | 4.5125 |
+| transport generation setup | 0.0419 | 0.0419 | 0.0493 | 0.0335 | 0.0549 |
+| dispatch put | 1.8288 | 1.8287 | 1.8306 | 1.8267 | 1.8317 |
+| identity relay/return | 2.1073 | 2.1061 | 2.1332 | 2.0697 | 2.1418 |
+| deterministic reduce | 0.4890 | 0.4889 | 0.4899 | 0.4878 | 0.4906 |
+| terminal completion/drain | 0.0149 | 0.0150 | 0.0159 | 0.0119 | 0.0164 |
+
+The corresponding first Megatron run measured common-semantics E2E mean
+8.9844 ms, P50 8.9303, P95 9.1524, min 8.8860, and max 10.1270. Native E2E in
+that run was 6.9308/6.9084/7.0185/6.8670/7.5995 ms for
+mean/P50/P95/min/max. Both final outputs are checked against the same common
+reference: MegaMOE and Megatron common semantics are byte-identical; Megatron
+native BF16 accumulation has max absolute error 0.125 and max relative error
+0.0076923. A separate world-8 top-k=1 run also passes byte-identical common
+output on both implementations; MegaMOE's one measured post-warmup sample was
+1.363 ms integrated and Megatron's correctness sample was 3.132 ms common
+semantics. Those one-sample numbers are correctness evidence, not a formal
+performance comparison.
+
+Actual peer payload per representative rank is 616,562,688--616,591,360 bytes
+for MegaMOE dispatch and 616,491,008--616,663,040 bytes for return. Megatron
+reports 616,562,688 BF16 bytes in each direction plus 172,032 dispatch FP32
+probability bytes, 1,233,297,408 bytes total. MegaMOE's aggregate effective peer
+rate was 2203--2208 GB/s across eight GPUs. These are physical remote-GPU bytes,
+not logical node-dedup traffic.
+
+Release generation setup performs no large arena clear. It increments a slot
+epoch, copies the 8-byte cancel epoch, clears one status record, creates a
+16-byte setup record, and executes a 16-byte/rank setup AllGather. The latter is
+retained because it proves common transport slot/capacity readiness; removing
+it caused asymmetric-capacity peers to enter P2P at different boundaries.
+Static peer mappings, layouts, and capacities are one-time setup. After all
+return signals arrive, output reduction plus its completion event is sufficient
+on the normal release path, so no redundant terminal team AllGather is issued.
+Across 100 measured generations the audit records zero `cudaMalloc/free`,
+`cudaHostAlloc/free`, event create/destroy, or device synchronize calls and zero
+large-generation memsets. Bounded control/status traffic was 208,626 H2D and
+285,648 D2H bytes/rank over all 110 warmup+measurement generations; activation
+bulk D2H/H2D remained zero.
+
+The standard round-robin benchmark pool owns the measured 3,092,974,032 device
+bytes/rank and 208 pinned bytes/rank. Exact continuous ownership needs six more
+worst-case destination rows, so the integrated comparison reports
+3,093,060,560 device bytes/rank; this is a checked capacity difference of
+86,528 bytes rather than an unreported allocation. The machine-readable record
+is emitted as `FAIR_BASELINE_JSON` and can be reproduced with:
+
+```bash
+NCCL_DEBUG=WARN python3 benchmarks/run_integrated_comparison.py \
+  --binary build/test_cuda_notify \
+  --nccl-lib-dir /path/to/nccl/lib \
+  --output build/fair_baseline.json
+```
+
+`benchmarks/megatron_dispatch_baseline.py` uses Megatron-Core 0.17.0's actual
+`MoEAlltoAllTokenDispatcher`. For this fairness run both implementations load
+the same PyTorch-wheel NCCL 2.27.5; the comparison runner verifies every
+MegaMOE rank's runtime version against PyTorch and records the `dladdr` library
+path. Project headers remain 2.29.7, and the separately supported project
+runtime is 2.28.3, but neither is mixed into this result. This is an integrated
+identity-expert transport comparison, not an FC1/SwiGLU/FC2 or backward result;
+`intermediate=3072` is recorded for that future work.
 
 The same script also runs as a two-node `torchrun` job; it intentionally uses
 the distributed world rather than `LOCAL_WORLD_SIZE` when constructing the EP
@@ -418,16 +515,30 @@ deterministic token/node packet scan. Route, incoming-row, M-tile and fan-out
 kernels were 5.984, 4.160, 13.920 and 12.704 us respectively. The packet scan,
 not the former serial expert prefix, is now the largest materialization kernel.
 
-The real two-process IPC trace profiled the release bulk kernels. For its small
-oracle fixture, bulk dispatch and return were 114--132 us and 109--115 us;
-phase publication (system fence plus peer signal) was about 109 us, waits about
-5 us, and reduce 4.8 us under instrumentation. On the uninstrumented main
-world-8 workload the CUDA-event spans above are authoritative. There are no
-per-route system atomics or credit spins in the trusted phase-batched path;
-the measured credit-stall counter is zero. NCU's local DRAM percentage does
-not account for peer-fabric stores, so peer bytes divided by event time is used
-for explicitly labeled effective NVLink/P2P bandwidth rather than treating
-that metric as HBM bandwidth.
+The real two-process IPC trace profiled the release bulk kernels with:
+
+```bash
+ncu --target-processes all --set basic \
+  --kernel-name 'regex:local_p2p_(bulk|publish|wait|finish).*' \
+  python3 tests/run_local_activation_p2p.py \
+    --binary build/test_cuda_notify --world 2 --rounds 1 --top-k 6
+```
+
+For this small oracle fixture, bulk dispatch and return were 114--132 us and
+109--115 us; phase publication (system fence plus peer signal) was about 109 us,
+waits about 5 us, reduce 4.8 us, and finish 2.1 us under instrumentation. The
+return fixture has only eight row blocks, so NCU reports 10.8% achieved
+occupancy there; the main shape launches one block per route/row and its
+uninstrumented world-8 CUDA-event spans above are authoritative. There are no
+per-route system atomics or credit spins in the trusted phase-batched path; the
+measured credit-stall counter is zero. NCU's local DRAM percentage does not
+account for peer-fabric stores, so peer bytes divided by event time is used for
+explicitly labeled effective NVLink/P2P bandwidth rather than treating that
+metric as HBM bandwidth. Nsight Systems is not installed on this host. The
+integrated JSON therefore also carries the audited ordered list of every
+memcpy, memset, kernel, collective, signal wait, and terminal completion in the
+timed interval; `large_generation_memsets=0` and the CUDA allocation counters
+make the setup exclusion machine-checkable.
 
 ## Clean export
 

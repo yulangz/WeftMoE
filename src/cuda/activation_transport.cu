@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <dlfcn.h>
 #include <limits>
@@ -238,6 +239,7 @@ struct PoolSlot {
   cudaEvent_t complete = nullptr;
   SlotState state = SlotState::Available;
   std::uint64_t epoch = 0;
+  std::uint64_t transport_epoch = 0;
   bool completion_recorded = false;
 };
 
@@ -380,7 +382,9 @@ __device__ unsigned long long device_globaltimer_ns() {
 
 __device__ transport::BFloat16 synthetic_value(
     transport::BFloat16 input, std::uint32_t expert,
-    std::uint64_t hidden_index) {
+    std::uint64_t hidden_index, bool identity) {
+  if (identity)
+    return input;
   const auto expert_term = static_cast<float>((expert % 251U) + 1U) / 128.0F;
   const auto lane_term = static_cast<float>(hidden_index % 17U) / 1024.0F;
   return transport::BFloat16{
@@ -406,6 +410,8 @@ struct TransportKernelArgs {
   transport::BFloat16 *combine_return;
   transport::BFloat16 *combined;
   TransportDeviceStatus *status;
+  bool identity_expert;
+  float combine_gate_scale;
 };
 
 __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
@@ -541,7 +547,8 @@ __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
                 a.dispatch.identity.calling_rank &&
             target.dst_row < a.max_destination_rows)
           a.canonical_rows[target.dst_row * a.hidden + h] = payload;
-        const auto contribution = synthetic_value(payload, target.expert_id, h);
+        const auto contribution = synthetic_value(
+            payload, target.expert_id, h, a.identity_expert);
         a.contribution[route * a.hidden + h] = contribution;
         a.combine_return[route * a.hidden + h] = contribution;
       }
@@ -584,7 +591,8 @@ __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
         const auto original = a.dispatch.combine_order[
             token * a.dispatch.identity.top_k + order];
         const auto route = token * a.dispatch.identity.top_k + original;
-        sum += bf16_bits_to_float(a.combine_return[route * a.hidden + h].bits);
+        sum += a.combine_gate_scale *
+               bf16_bits_to_float(a.combine_return[route * a.hidden + h].bits);
       }
       a.combined[token * a.hidden + h] =
           transport::BFloat16{float_to_bf16_bits(sum)};
@@ -665,6 +673,7 @@ __global__ void initialize_p2p_barrier_kernel(unsigned long long *record,
   }
 }
 
+#if MEGAMOE_DEBUG_VALIDATE
 __global__ void validate_p2p_barrier_kernel(
     const unsigned long long *records, std::uint32_t world,
     unsigned long long expected_slot, unsigned long long expected_epoch,
@@ -680,6 +689,7 @@ __global__ void validate_p2p_barrier_kernel(
     atomicCAS(&status->error, 0U, 1U);
   }
 }
+#endif
 
 template <typename T>
 __device__ T *peer_at(void *base, std::size_t offset) {
@@ -717,6 +727,8 @@ struct LocalP2pKernelArgs {
   std::size_t combined_offset;
   std::size_t status_offset;
   const unsigned long long *cancel_epoch;
+  bool identity_expert;
+  float combine_gate_scale;
 };
 
 __device__ bool local_p2p_cancelled(const LocalP2pKernelArgs &a) {
@@ -1046,7 +1058,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
            hidden += blockDim.x) {
         const auto contribution = synthetic_value(
             local_canonical[header.dst_row * a.hidden + hidden],
-            header.expert_id, hidden);
+            header.expert_id, hidden, a.identity_expert);
         source_contribution[header.route_index * a.hidden + hidden] =
             contribution;
         source_combine[header.route_index * a.hidden + hidden] = contribution;
@@ -1118,8 +1130,10 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
           while (atomicAdd_system(&local_return_ready[route], 0ULL) != a.epoch &&
                  !local_p2p_cancelled(a)) {
           }
-        sum += bf16_bits_to_float(
-            local_combine_return[route * a.hidden + hidden].bits);
+        sum += a.combine_gate_scale * bf16_bits_to_float(
+                                           local_combine_return[
+                                               route * a.hidden + hidden]
+                                               .bits);
       }
       local_combined[token * a.hidden + hidden] =
           transport::BFloat16{float_to_bf16_bits(sum)};
@@ -1251,7 +1265,7 @@ __global__ void local_p2p_bulk_return_kernel(LocalP2pKernelArgs a) {
        hidden += blockDim.x)
     source_contribution[header.route_index * a.hidden + hidden] =
         synthetic_value(local_canonical[row * a.hidden + hidden],
-                        header.expert_id, hidden);
+                        header.expert_id, hidden, a.identity_expert);
   if (threadIdx.x == 0 && header.source_rank != a.rank)
     atomicAdd(&status->actual_return_peer_bytes,
               a.hidden * sizeof(transport::BFloat16));
@@ -1313,7 +1327,8 @@ __global__ void local_p2p_bulk_reduce_kernel(LocalP2pKernelArgs a) {
       const auto original = a.dispatch.combine_order[
           token * a.dispatch.identity.top_k + order];
       const auto route = token * a.dispatch.identity.top_k + original;
-      sum += bf16_bits_to_float(contribution[route * a.hidden + hidden].bits);
+      sum += a.combine_gate_scale *
+             bf16_bits_to_float(contribution[route * a.hidden + hidden].bits);
     }
     combined[token * a.hidden + hidden] =
         transport::BFloat16{float_to_bf16_bits(sum)};
@@ -1869,6 +1884,29 @@ BFloat16ActivationLease ActivationTransportBridge::upload_for_testing(
   return BFloat16ActivationLease(std::move(impl));
 }
 
+BFloat16ActivationLease ActivationTransportBridge::reissue_for_benchmark(
+    const BFloat16ActivationLease &storage,
+    const RankCollectiveContext &context, const CudaExecution &execution) {
+  if (!storage.impl_ || !context || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "activation-benchmark-reissue", "input", 0, "valid",
+                    "empty");
+  const auto &source = *storage.impl_;
+  if (!context.execution().same_instance(execution.token()) ||
+      !source.producer_execution.same_instance(execution.token()) ||
+      source.session_identity != context.session().stable_identity_bytes() ||
+      source.device != execution.device_ordinal() || !source.ready_recorded ||
+      !source.slot || !source.pool)
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "activation-benchmark-reissue", "provenance",
+                    context.calling_rank(),
+                    "same immutable storage/session/execution/device/ready",
+                    "mismatch");
+  auto impl = std::make_shared<BFloat16ActivationLease::Impl>(source);
+  impl->generation = context.session().generation();
+  return BFloat16ActivationLease(std::move(impl));
+}
+
 BFloat16ActivationLease testing::upload_bfloat16_activations_for_testing(
     const std::vector<transport::BFloat16> &host, std::uint64_t num_tokens,
     std::uint64_t hidden, const RankCollectiveContext &context,
@@ -2032,6 +2070,10 @@ DeviceActivationTransport::run_device_simulation_synthetic(
                                                  layout.combine_return);
   args.combined = at<transport::BFloat16>(slot.device, layout.combined);
   args.status = at<TransportDeviceStatus>(slot.device, layout.status);
+  args.identity_expert =
+      config.expert_transform ==
+      transport::ActivationExpertTransform::Identity;
+  args.combine_gate_scale = config.combine_gate_scale;
   activation_transport_persistent_kernel<<<std::max(sms, 1), 128, 0,
                                            exec->stream>>>(args);
   internal::throw_cuda("transport-run", cudaGetLastError(), id.calling_rank,
@@ -2150,6 +2192,10 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "local-p2p-run", "transport config", id.calling_rank,
                     "within exact pool geometry", "mismatch/exceeded");
+  if (!std::isfinite(config.combine_gate_scale))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "local-p2p-run",
+                    "combine_gate_scale", id.calling_rank, "finite",
+                    "non-finite");
 
   const auto expectation = DeviceDispatchViewExpectation{
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
@@ -2160,18 +2206,19 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[activation.slot->index];
   const auto &layout = state->layout;
-  const auto route_elements =
+  [[maybe_unused]] const auto route_elements =
       checked_mul(view.sizes.route_count, config.hidden_size,
                   "P2P route elements");
-  const auto combined_elements =
+  [[maybe_unused]] const auto combined_elements =
       checked_mul(id.num_tokens, config.hidden_size,
                   "P2P combined elements");
-  const auto rank_links = checked_mul(id.world_size, config.channels,
-                                      "P2P rank links");
-  const auto ingress_slots = checked_mul(
+  [[maybe_unused]] const auto rank_links =
+      checked_mul(id.world_size, config.channels, "P2P rank links");
+  [[maybe_unused]] const auto ingress_slots = checked_mul(
       rank_links, config.ring_slots_per_source_channel, "P2P ingress slots");
-  const auto node_links = static_cast<std::uint64_t>(config.channels);
-  const auto node_ring_slots = checked_mul(
+  [[maybe_unused]] const auto node_links =
+      static_cast<std::uint64_t>(config.channels);
+  [[maybe_unused]] const auto node_ring_slots = checked_mul(
       node_links, config.ring_slots_per_source_channel, "P2P proxy slots");
   const auto zero_async = [&](std::size_t offset, std::uint64_t count,
                               std::size_t width, const char *name) {
@@ -2206,6 +2253,14 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(producer-ready)");
+  // The integrated timing starts after the router-owned input is ready and
+  // includes every generation-specific transport initialization below.
+  internal::throw_cuda(
+      "local-p2p-run", cudaEventRecord(slot.start, exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(P2P start)");
+#if MEGAMOE_DEBUG_VALIDATE
   zero_async(layout.ring_headers, node_ring_slots,
              sizeof(transport::TransportSlotHeader), "P2P proxy headers");
   zero_async(layout.ring_payload,
@@ -2241,7 +2296,14 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
              sizeof(transport::BFloat16), "P2P combine return");
   zero_async(layout.combined, combined_elements,
              sizeof(transport::BFloat16), "P2P combined");
+#else
+  // The trusted single-node bulk path overwrites every canonical row,
+  // contribution and output element that it later reads. Epoch-valued peer
+  // signals make all arena and signal clears unnecessary. Clearing a peer
+  // signal here would race a faster rank's release store.
+#endif
   zero_async(layout.status, 1, sizeof(TransportDeviceStatus), "P2P status");
+#if MEGAMOE_DEBUG_VALIDATE
   initialize_transport_credits_kernel<<<
       static_cast<unsigned int>((node_links + 255U) / 256U), 256, 0,
       exec->stream>>>(at<unsigned int>(slot.device, layout.link_credits),
@@ -2281,11 +2343,26 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       "local-p2p-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "validate P2P setup barrier");
+#else
+  // This small collective is a real per-generation dependency: peer writes
+  // must not begin until every process has reached the transport phase. It
+  // carries only 16 bytes/rank and replaces the old multi-gigabyte clears.
+  initialize_p2p_barrier_kernel<<<1, 1, 0, exec->stream>>>(
+      at<unsigned long long>(slot.device, layout.p2p_barrier_send),
+      activation.slot->index, id.generation);
   internal::throw_cuda(
-      "local-p2p-run", cudaEventRecord(slot.start, exec->stream),
+      "local-p2p-run", cudaGetLastError(), id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "initialize P2P setup barrier");
+  internal::throw_nccl(
+      "local-p2p-run",
+      ncclAllGather(at<void>(slot.device, layout.p2p_barrier_send),
+                    at<void>(slot.device, layout.p2p_barrier_receive), 2,
+                    ncclUint64, backend->nccl->comm, exec->stream),
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(P2P start)");
+      ExchangeKind::ExpertCounts, "ncclAllGather(P2P setup barrier)");
+#endif
   int sms = 0;
   internal::throw_cuda(
       "local-p2p-run",
@@ -2311,7 +2388,18 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   args.world = id.world_size;
   args.channels = config.channels;
   args.ring_slots = config.ring_slots_per_source_channel;
+#if MEGAMOE_DEBUG_VALIDATE
   args.epoch = activation.slot->epoch;
+#else
+  // Every rank invokes the trusted team in the same generation order. A
+  // monotonically increasing per-slot epoch supports both new generations and
+  // repeated same-generation correctness runs without clearing peer signals.
+  if (slot.transport_epoch == std::numeric_limits<std::uint64_t>::max())
+    transport_error(NotifyErrorCode::ArithmeticOverflow, "local-p2p-run",
+                    "transport_epoch", id.calling_rank, "<UINT64_MAX",
+                    "UINT64_MAX");
+  args.epoch = ++slot.transport_epoch;
+#endif
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.local_base = slot.device;
   args.ring_headers_offset = layout.ring_headers;
@@ -2334,6 +2422,16 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   args.status_offset = layout.status;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
+  args.identity_expert =
+      config.expert_transform ==
+      transport::ActivationExpertTransform::Identity;
+  args.combine_gate_scale = config.combine_gate_scale;
+  internal::throw_cuda(
+      "local-p2p-run",
+      cudaEventRecord(slot.dispatch_complete, exec->stream), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts,
+      "cudaEventRecord(P2P generation setup complete)");
 #if MEGAMOE_DEBUG_VALIDATE
   local_p2p_persistent_kernel<<<sms, 128, 0, exec->stream>>>(args);
 #else
@@ -2414,10 +2512,11 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
     }
     std::this_thread::yield();
   }
-  // Keep every process's IPC exports and mappings alive until every peer has
-  // observed its persistent worker terminal event. This is especially
-  // important on cancellation: a faster peer must not close an IPC mapping
-  // while another worker is still polling that peer's credit/signal words.
+  // Debug/cancellation paths retain the explicit team drain. In the trusted
+  // release path every source waits for a generation-valued return signal
+  // from every destination before producing output. The next Notify control
+  // collective is the natural inter-generation barrier.
+#if MEGAMOE_DEBUG_VALIDATE
   internal::throw_nccl(
       "local-p2p-drain",
       ncclAllGather(at<void>(slot.device, layout.p2p_barrier_send),
@@ -2430,6 +2529,25 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       "local-p2p-drain", cudaStreamSynchronize(exec->stream), id.calling_rank,
       id.world_size, backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaStreamSynchronize(P2P terminal drain)");
+#else
+  if (cancelled) {
+    internal::throw_nccl(
+        "local-p2p-drain",
+        ncclAllGather(at<void>(slot.device, layout.p2p_barrier_send),
+                      at<void>(slot.device, layout.p2p_barrier_receive), 2,
+                      ncclUint64, backend->nccl->comm, exec->stream),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts,
+        "ncclAllGather(P2P cancellation drain)");
+    internal::throw_cuda(
+        "local-p2p-drain", cudaStreamSynchronize(exec->stream),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts,
+        "cudaStreamSynchronize(P2P cancellation drain)");
+  }
+#endif
   consumer.finish();
   if (cancelled || slot.host_status->error == 2U)
     throw NotifyDispatchError(
@@ -2479,6 +2597,16 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
       slot.host_status->actual_return_peer_bytes;
   result->audit.hot_path_allocations = 0;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+  float setup_ms = 0.0F;
+  internal::throw_cuda(
+      "local-p2p-timing",
+      cudaEventElapsedTime(&setup_ms, slot.start, slot.dispatch_complete),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts,
+      "cudaEventElapsedTime(P2P generation setup)");
+  result->timings.generation_setup_us =
+      static_cast<double>(setup_ms) * 1000.0;
   result->timings.dispatch_put_us =
       static_cast<double>(slot.host_status->dispatch_put_ticks) / 1000.0;
   result->timings.relay_us =
@@ -2497,6 +2625,13 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
         post_dispatch >= relay_return ? post_dispatch - relay_return : 0ULL) /
         1000.0;
   }
+  const auto kernel_us = complete_clock >= start_clock
+                             ? static_cast<double>(complete_clock - start_clock) /
+                                   1000.0
+                             : 0.0;
+  const auto accounted = result->timings.generation_setup_us + kernel_us;
+  result->timings.terminal_completion_us =
+      std::max(0.0, result->timings.total_us - accounted);
   failure_guard.committed = true;
   return DeviceActivationTransportHandle(std::move(result));
 }
@@ -2585,6 +2720,43 @@ ActivationTransportValidationDownload download_activation_transport_for_validati
     const DeviceActivationTransportHandle &handle,
     const CudaExecution &execution) {
   return ActivationTransportBridge::download_for_validation(handle, execution);
+}
+
+std::vector<transport::BFloat16> download_activation_output_for_validation(
+    const DeviceActivationTransportHandle &handle,
+    const CudaExecution &execution) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "transport-output-download", "handle/execution", 0,
+                    "valid", "empty");
+  const auto &impl = *handle.impl_;
+  if (execution.device_ordinal() != impl.pool->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "transport-output-download", "device",
+                    impl.identity.rank, "handle device", "foreign");
+  const auto elements = checked_mul(impl.identity.tokens,
+                                    impl.identity.hidden,
+                                    "output download elements");
+  std::vector<transport::BFloat16> output(
+      checked_size(elements, "output download elements"));
+  if (!output.empty()) {
+    const auto bytes = checked_mul(elements,
+                                   sizeof(transport::BFloat16),
+                                   "output download bytes");
+    internal::throw_cuda(
+        "transport-output-download",
+        cudaMemcpy(output.data(),
+                   at<const void>(
+                       impl.pool->slots[impl.slot->index].device,
+                       impl.pool->layout.combined),
+                   checked_size(bytes, "output download bytes"),
+                   cudaMemcpyDeviceToHost),
+        impl.identity.rank, impl.identity.world, "transport-validation",
+        impl.identity.generation, ExchangeKind::ExpertCounts,
+        "cudaMemcpy(final output)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
+  }
+  return output;
 }
 
 ActivationTransportCapability probe_activation_transport_capability(
