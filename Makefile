@@ -3,6 +3,11 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 BUILD_DIR ?= build
 CPPFLAGS := -Iinclude -Isrc -pthread
 CUDA_CPPFLAGS := -Iinclude -Isrc -Xcompiler=-pthread
+DEEPGEMM_INCLUDE_DIR ?= ../DeepGEMM/deep_gemm/include
+# Prefer CUTLASS/CUTE bundled with an installed DeepGEMM package. A source-only
+# build can override this with an initialized CUTLASS checkout.
+CUTLASS_INCLUDE_DIR ?= $(shell python3 -c 'import importlib.util,os;s=importlib.util.find_spec("deep_gemm");print(os.path.join(os.path.dirname(s.origin),"include") if s else "../DeepGEMM/third-party/cutlass/include")')
+CUDA_CPPFLAGS += -isystem $(DEEPGEMM_INCLUDE_DIR) -isystem $(CUTLASS_INCLUDE_DIR)
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
@@ -20,7 +25,7 @@ LIB_SOURCES := \
 	src/scoreboard/workspace_plan.cpp
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
-CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90
+CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr
 ifeq ($(WERROR),1)
 override CXXFLAGS += -Werror
@@ -52,7 +57,7 @@ cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
 $(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cuda_notify.cpp
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) $^ -lnccl -ldl -o $@
+	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) $^ -lnccl -lcuda -ldl -o $@
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1

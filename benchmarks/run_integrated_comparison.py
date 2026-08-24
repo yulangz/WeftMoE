@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run independent MegaMOE/Megatron identity-EP baselines and compare E2E.
+"""Run independent MegaMOE/Megatron full Forward baselines and compare E2E.
 
 Only comparable host-wall, slowest-rank integrated measurements enter the
 reported speedup. Component means are retained for diagnosis, never summed to
@@ -53,19 +53,21 @@ def main():
         current = environment.get("LD_LIBRARY_PATH", "")
         environment["LD_LIBRARY_PATH"] = (
             args.nccl_lib_dir + (":" + current if current else ""))
+        environment["MEGAMOE_NCCL_LIBRARY"] = os.path.join(
+            args.nccl_lib_dir, "libnccl.so.2")
 
     mega_runs = []
     for _run_index in range(args.runs):
         command = [
             sys.executable, "tests/run_local_activation_p2p.py",
             "--binary", args.binary, "--world", "8",
-            "--integrated-benchmark", "--top-k", "6",
+            "--forward-benchmark", "--top-k", "6",
             "--rounds", str(args.warmups + args.measurements),
             "--gate-mode", args.gate_mode,
             "--timeout", str(args.timeout),
         ]
         mega_runs.append(extract(run(command, environment, args.timeout),
-                                 "INTEGRATED_BENCH_JSON "))
+                                 "FORWARD_BENCH_JSON "))
 
     megatron_launches = []
     for _run_index in range(args.runs):
@@ -76,6 +78,7 @@ def main():
             "--iterations", str(args.measurements),
             "--runs", "1",
             "--gate-mode", args.gate_mode,
+            "--expert-body", "te-grouped-mlp",
         ]
         megatron_launches.append(extract(
             run(megatron_command, environment, args.timeout),
@@ -91,22 +94,22 @@ def main():
         item["wall_slowest_rank_us"]["mean"] / 1000.0
         for item in mega_runs]
     megatron_common_means = [
-        launch["common_identity_e2e_host_wall_cross_run"]["mean_ms"]
+        launch["common_forward_e2e_host_wall_cross_run"]["mean_ms"]
         for launch in megatron_launches]
     megatron_native_means = [
-        launch["native_identity_e2e_host_wall_cross_run"]["mean_ms"]
+        launch["native_forward_e2e_host_wall_cross_run"]["mean_ms"]
         for launch in megatron_launches]
     megatron_nccl = megatron_launches[0]["nccl_runtime_version"]
     mega_nccl = {
         version for item in mega_runs
         for version in item["per_rank_nccl_runtime"]}
     megatron["independent_process_launches"] = args.runs
-    megatron["common_identity_e2e_host_wall_cross_run"] = {
+    megatron["common_forward_e2e_host_wall_cross_run"] = {
         "mean_ms": statistics.fmean(megatron_common_means),
         "variance_ms2": statistics.pvariance(megatron_common_means),
         "per_run_mean_ms": megatron_common_means,
     }
-    megatron["native_identity_e2e_host_wall_cross_run"] = {
+    megatron["native_forward_e2e_host_wall_cross_run"] = {
         "mean_ms": statistics.fmean(megatron_native_means),
         "variance_ms2": statistics.pvariance(megatron_native_means),
         "per_run_mean_ms": megatron_native_means,
@@ -116,9 +119,12 @@ def main():
     speedup = (common_mean - mega_mean) / common_mean * 100.0
     native_mean = statistics.fmean(megatron_native_means)
     native_speedup = (native_mean - mega_mean) / native_mean * 100.0
+    per_run_native_speedup = [
+        (native - mega) / native * 100.0
+        for native, mega in zip(megatron_native_means, mega_means_ms)]
     result = {
         "schema": 1,
-        "comparison": "single-node-8-rank-identity-EP-integrated-host-wall",
+        "comparison": "single-node-8-rank-full-forward-integrated-host-wall",
         "gate_mode": args.gate_mode,
         "shape": {
             "tokens_per_rank": 8192, "hidden": 7168,
@@ -149,13 +155,14 @@ def main():
         },
         "speedup_vs_megatron_common_percent": speedup,
         "speedup_vs_megatron_native_percent": native_speedup,
-        "formal_target_at_least_15_percent": native_speedup >= 15.0,
+        "per_run_speedup_vs_megatron_native_percent":
+            per_run_native_speedup,
+        "formal_target_at_least_15_percent":
+            all(value >= 15.0 for value in per_run_native_speedup),
         "cross_implementation_output_equivalence": {
-            "method": "both outputs compared elementwise to one shared reference",
-            "byte_identical": all(
-                launch["output_validation"]["common_semantics"]
-                      ["byte_identical_to_common_reference"]
-                for launch in megatron_launches),
+            "method": "explicit output artifacts; see --save-output-dir runs",
+            "byte_identical": False,
+            "status": "not asserted by timing-only invocation",
         },
         "megamoe_runs": mega_runs,
         "megatron": megatron,
@@ -183,9 +190,10 @@ def main():
     if args.output:
         with open(args.output, "w", encoding="utf-8") as destination:
             destination.write(encoded + "\n")
-    if native_speedup < 15.0:
+    if any(value < 15.0 for value in per_run_native_speedup):
         raise RuntimeError(
-            f"integrated native speedup {native_speedup:.3f}% is below 15%")
+            "at least one independent integrated native speedup is below "
+            f"15%: {per_run_native_speedup}")
 
 
 if __name__ == "__main__":

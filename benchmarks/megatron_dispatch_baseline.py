@@ -18,13 +18,25 @@ import statistics
 import struct
 import time
 
+# Load the requested NCCL runtime before importing PyTorch. This makes the
+# executable baseline independent of LD_PRELOAD and lets the reported version
+# come from the exact handle that established the process runtime.
+_NCCL_LIBRARY_REQUEST = os.environ.get("MEGAMOE_NCCL_LIBRARY",
+                                       "libnccl.so.2")
+_NCCL_RUNTIME = ctypes.CDLL(_NCCL_LIBRARY_REQUEST,
+                           mode=ctypes.RTLD_GLOBAL)
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+)
 
 
 def percentile(values, fraction):
@@ -90,6 +102,42 @@ def fp32_hash(tensor):
     return value
 
 
+@torch.no_grad()
+def initialize_megamoe_forward_weights(module, global_expert_begin,
+                                        hidden, intermediate):
+    """Load the exact BF16 fixture used by MegaMOE's device initializer."""
+    chunk = 4 * 1024 * 1024
+    for name, parameter in module.named_parameters():
+        if "bias" in name:
+            parameter.zero_()
+            continue
+        suffix = name.rsplit("weight", 1)[-1]
+        local_expert = int(suffix)
+        global_expert = global_expert_begin + local_expert
+        is_fc1 = "linear_fc1" in name
+        if is_fc1:
+            expected = 2 * intermediate * hidden
+            global_base = global_expert * expected
+            multiplier, addend = 7, 3
+        elif "linear_fc2" in name:
+            expected = hidden * intermediate
+            global_base = global_expert * expected
+            multiplier, addend = 5, 1
+        else:
+            raise RuntimeError(f"unexpected expert parameter: {name}")
+        if parameter.numel() != expected:
+            raise RuntimeError(
+                f"parameter {name} shape mismatch: expected {expected}, "
+                f"actual {parameter.numel()}")
+        flat = parameter.view(-1)
+        for offset in range(0, expected, chunk):
+            end = min(expected, offset + chunk)
+            index = torch.arange(global_base + offset, global_base + end,
+                                 dtype=torch.int64, device=parameter.device)
+            value = (((index * multiplier + addend) & 15).to(torch.int32) - 8)
+            flat[offset:end].copy_((value.float() / 512.0).to(torch.bfloat16))
+
+
 def loaded_nccl_libraries():
     paths = set()
     with open("/proc/self/maps", "r", encoding="utf-8") as mappings:
@@ -101,9 +149,8 @@ def loaded_nccl_libraries():
 
 
 def nccl_runtime_version():
-    library = ctypes.CDLL(None)
     version = ctypes.c_int()
-    result = library.ncclGetVersion(ctypes.byref(version))
+    result = _NCCL_RUNTIME.ncclGetVersion(ctypes.byref(version))
     if result != 0:
         raise RuntimeError(f"ncclGetVersion failed: {result}")
     value = version.value
@@ -124,6 +171,8 @@ def main():
     parser.add_argument("--trace-dir")
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
+    parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
+                        default="identity")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -156,6 +205,10 @@ def main():
         moe_router_pre_softmax=args.top_k == 1,
         moe_permute_fusion=False,
         deterministic_mode=True,
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        moe_grouped_gemm=args.expert_body == "te-grouped-mlp",
     )
     local_experts = args.experts // world
     dispatcher = MoEAlltoAllTokenDispatcher(
@@ -164,6 +217,17 @@ def main():
         config,
         get_default_pg_collection(),
     )
+    experts_module = None
+    if args.expert_body == "te-grouped-mlp":
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.experts, moe_grouped_gemm=True,
+            use_te_activation_func=True)
+        experts_builder = layer_spec.submodules.mlp.submodules.experts
+        experts_module = experts_builder(
+            local_experts, config, pg_collection=get_default_pg_collection())
+        initialize_megamoe_forward_weights(
+            experts_module, rank * local_experts, args.hidden,
+            args.intermediate)
 
     # Bit-for-bit the same deterministic BF16 input used by MegaMOE's C++
     # integrated runner: flattened element i is (rank*101 + i%97)/32.
@@ -197,7 +261,7 @@ def main():
     prepared_hidden, prepared_probabilities = prepare_dispatch()
     dispatched_hidden, dispatched_probabilities = dispatcher.token_dispatch(
         prepared_hidden, prepared_probabilities)
-    expert_hidden, _, expert_probabilities = dispatcher.dispatch_postprocess(
+    expert_hidden, tokens_per_expert, expert_probabilities = dispatcher.dispatch_postprocess(
         dispatched_hidden, dispatched_probabilities)
 
     def dispatch_collective():
@@ -223,6 +287,53 @@ def main():
         combine_input = dispatcher.combine_preprocess(weighted)
         returned = dispatcher.token_combine(combine_input)
         return dispatcher.combine_postprocess(returned)
+
+    def full_forward_roundtrip():
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            hidden, routing, probabilities)
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        expert_input, local_counts, remote_gate = dispatcher.dispatch_postprocess(
+            remote_hidden, remote_probs)
+        expert_output, _ = experts_module(
+            expert_input, local_counts, remote_gate)
+        combine_input = dispatcher.combine_preprocess(expert_output)
+        returned = dispatcher.token_combine(combine_input)
+        return dispatcher.combine_postprocess(returned)
+
+    def common_forward_roundtrip():
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            hidden, routing, probabilities)
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        expert_input, local_counts, _ = dispatcher.dispatch_postprocess(
+            remote_hidden, remote_probs)
+        # Disable Megatron's expert-side gate-before for this reference-oriented
+        # path. The returned per-route BF16 expert output is reduced at source
+        # with the same fixed expert-ID FP32 gate-after semantics as MegaMOE.
+        unit_remote_gate = torch.ones(
+            expert_input.shape[0], dtype=torch.float32, device="cuda")
+        expert_output, _ = experts_module(
+            expert_input, local_counts, unit_remote_gate)
+        combine_input = dispatcher.combine_preprocess(expert_output)
+        returned = dispatcher.token_combine(combine_input)
+        route_count = args.tokens * args.top_k
+        flat_expert = selected.reshape(-1)
+        route_index = torch.arange(route_count, device="cuda",
+                                   dtype=torch.long)
+        expert_order = torch.argsort(flat_expert * route_count + route_index)
+        route_output = torch.empty_like(returned)
+        route_output[expert_order] = returned
+        slot_order = torch.argsort(selected, dim=1, stable=True)
+        token_base = (torch.arange(args.tokens, device="cuda",
+                                   dtype=torch.long) * args.top_k)
+        common = torch.zeros_like(hidden, dtype=torch.float32)
+        flat_gate = selected_gates.reshape(-1)
+        for position in range(args.top_k):
+            routes = token_base + slot_order[:, position]
+            common = common + (route_output[routes].float() *
+                               flat_gate[routes].unsqueeze(-1))
+        return common.to(torch.bfloat16)
 
     def common_semantics_roundtrip():
         local_hidden, local_probs = dispatcher.dispatch_preprocess(
@@ -257,7 +368,7 @@ def main():
 
     measured_runs = []
     for run in range(args.runs):
-        measured_runs.append({
+        run_result = {
             "run": run,
             "routing_metadata_and_local_permute": measure(
                 prepare_dispatch, args.warmups, args.iterations),
@@ -269,10 +380,20 @@ def main():
                 full_roundtrip, args.warmups, args.iterations),
             "common_semantics_identity_e2e": measure(
                 common_semantics_roundtrip, args.warmups, args.iterations),
-        })
+        }
+        if experts_module is not None:
+            run_result["native_forward_e2e"] = measure(
+                full_forward_roundtrip, args.warmups, args.iterations)
+            run_result["common_forward_e2e"] = measure(
+                common_forward_roundtrip, args.warmups, args.iterations)
+        measured_runs.append(run_result)
 
     native_output = full_roundtrip()
     common_output = common_semantics_roundtrip()
+    native_forward_output = (full_forward_roundtrip()
+                             if experts_module is not None else None)
+    common_forward_output = (common_forward_roundtrip()
+                             if experts_module is not None else None)
     torch.cuda.synchronize()
     slot_order = torch.argsort(selected, dim=1, stable=True)
     expected_fp32 = torch.zeros_like(hidden, dtype=torch.float32)
@@ -305,7 +426,13 @@ def main():
     if args.save_output_dir:
         os.makedirs(args.save_output_dir, mode=0o700, exist_ok=True)
         torch.save({"native": native_output.cpu(),
-                    "common": common_output.cpu()}, os.path.join(
+                    "common": common_output.cpu(),
+                    "native_forward": (native_forward_output.cpu()
+                                       if native_forward_output is not None
+                                       else None),
+                    "common_forward": (common_forward_output.cpu()
+                                       if common_forward_output is not None
+                                       else None)}, os.path.join(
                         args.save_output_dir, f"megatron-rank-{rank}.pt"))
 
     if args.trace_dir:
@@ -330,6 +457,9 @@ def main():
     common_wall_means = [
         run["common_semantics_identity_e2e"]["host_wall"]["mean_ms"]
         for run in measured_runs]
+    forward_wall_means = ([
+        run["native_forward_e2e"]["host_wall"]["mean_ms"]
+        for run in measured_runs] if experts_module is not None else [])
     output = {
         "schema": 2,
         "implementation": "Megatron-Core MoEAlltoAllTokenDispatcher",
@@ -338,6 +468,7 @@ def main():
         "torch_nccl_version": ".".join(
             str(part) for part in torch.cuda.nccl.version()),
         "nccl_runtime_version": nccl_runtime_version(),
+        "explicit_nccl_library_request": _NCCL_LIBRARY_REQUEST,
         "loaded_nccl_libraries": loaded_nccl_libraries(),
         "world": world,
         "shape": {
@@ -348,7 +479,11 @@ def main():
         },
         "dtype": "BF16 input/output; FP32 routing probabilities",
         "expert_ownership": "contiguous rank-major",
-        "expert_body": "identity",
+        "expert_body": args.expert_body,
+        "gemm_backend": ("TransformerEngine TEGroupedMLP"
+                         if experts_module is not None else "none"),
+        "weight_fixture": ("MegaMOE deterministic BF16 global-index v1"
+                           if experts_module is not None else "none"),
         "gate_mode": args.gate_mode,
         "gate_seed": "0x4d4547414d4f4547",
         "per_rank_gate_hash": gate_hashes,
@@ -375,6 +510,23 @@ def main():
             "per_run_mean_ms": common_wall_means,
         },
     }
+    if forward_wall_means:
+        output["native_forward_e2e_host_wall_cross_run"] = {
+            "mean_ms": statistics.fmean(forward_wall_means),
+            "variance_ms2": statistics.pvariance(forward_wall_means),
+            "per_run_mean_ms": forward_wall_means,
+        }
+        output["common_forward_e2e_host_wall_cross_run"] = {
+            "mean_ms": statistics.fmean([
+                run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                for run in measured_runs]),
+            "variance_ms2": statistics.pvariance([
+                run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                for run in measured_runs]),
+            "per_run_mean_ms": [
+                run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                for run in measured_runs],
+        }
     if rank == 0:
         print("MEGATRON_BASELINE_JSON " + json.dumps(output, sort_keys=True),
               flush=True)

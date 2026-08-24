@@ -83,11 +83,25 @@ Still required before phase 4 closes:
 - extend local P2P cancellation/quarantine fault injection and two-live-
   generation stress beyond the current all-rank cancellation boundary.
 
-## Phase 5 — forward compute integration
+## Phase 5 — single-node forward compute integration (baseline implemented)
 
-- Add FC1, SwiGLU, FC2 and partial-M scoreboards to the frozen transport worker
-  roles without changing transport identities or canonical rows.
-- H200 tile/worker autotune and SM90a runtime validation.
+- One cooperative persistent data-plane launch now contains DispatchPut,
+  three-stage dual-projection TMA/WGMMA FC1, SwiGLU, four-stage N=256
+  TMA/WGMMA FC2, vectorized CombinePut and fixed-order TopKReduce.
+- Runtime expert rows and partial M blocks use device task counters; FC1/FC2
+  tasks retain the phase scoreboards and CAS claim validation in debug builds.
+- `CACHE_FC1_INPUT_OUTPUT` and `NO_FC1_OUTPUT_CACHE` share identical Forward
+  arithmetic. The former checkpoints BF16 A/B; neither mode retains transient
+  S or FC2 outputs for backward.
+- Main-shape single-node world 1/2/8 correctness and the real LocalCudaP2p
+  benchmark are available. Other H/I shapes, cross-node Forward, backward,
+  TMA multicast, and final worker/tile autotuning remain open.
+
+The current main-shape release baseline is faster than the Megatron
+common-semantics source-gate-after path, but the measured native Megatron
+gate-before run remains too close for the phase's formal 15% performance gate.
+Phase 5 therefore remains open; the next performance work is clustered weight
+multicast/weight reuse and removal of WGMMA accumulator serialization.
 
 ## Phase 6 — backward persistent MegaKernel
 

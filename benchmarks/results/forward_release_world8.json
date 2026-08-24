@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "date_utc": "2026-08-24",
+  "shape": {
+    "tokens_per_rank": 8192,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "experts": 384,
+    "top_k": 6,
+    "world": 8
+  },
+  "measurement": {
+    "warmups_per_run": 10,
+    "measurements_per_run": 100,
+    "independent_sessions": 3,
+    "aggregation": "slowest-rank host wall"
+  },
+  "megamoe_e2e_mean_ms": [17.898882, 17.909524, 17.935251],
+  "megatron_native_e2e_mean_ms": [17.99770669, 17.96164435, 17.94810635],
+  "megatron_common_gate_after_e2e_mean_ms": [21.95390196, 21.96503082, 21.96282784],
+  "speedup_vs_megatron_native_percent": [0.549091, 0.290172, 0.071626],
+  "formal_every_run_at_least_15_percent": false,
+  "megamoe_stage_mean_ms_range": {
+    "notify": [0.521, 0.551],
+    "dispatch": [2.018, 2.018],
+    "fc1_swiglu": [7.089, 7.093],
+    "fc2": [4.296, 4.298],
+    "combine_return": [2.261, 2.271],
+    "deterministic_reduce": [2.297, 2.313]
+  },
+  "workspace_device_bytes_per_rank": 2847625496,
+  "weight_device_bytes_per_rank": 6341787648,
+  "cross_implementation_output": {
+    "byte_identical": false,
+    "max_abs_error": 0.0185546875,
+    "note": "MegaMOE WGMMA and TransformerEngine do not share an exact K-accumulation/SwiGLU instruction order"
+  },
+  "remote_megamoe_e2e_mean_ms": 17.82727,
+  "remote_megatron_available": false
+}

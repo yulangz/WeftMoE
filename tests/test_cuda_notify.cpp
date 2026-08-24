@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -1904,7 +1905,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto benchmark_p2p = scenario == "activation_p2p_bench";
   const auto benchmark_integrated =
       scenario == "activation_integrated_bench";
-  const auto benchmark_shape = benchmark_p2p || benchmark_integrated;
+  const auto forward_smoke = scenario == "forward_smoke";
+  const auto benchmark_forward = scenario == "forward_bench";
+  const auto benchmark_shape =
+      benchmark_p2p || benchmark_integrated || benchmark_forward;
   auto experts = std::max<std::uint32_t>(16, world * 2);
   auto top_k = std::min<std::uint32_t>(6, experts);
   if (const auto *p2p_top_k = std::getenv("MEGAMOE_P2P_TOP_K"))
@@ -1916,6 +1920,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   if (benchmark_shape) {
     require(nodes == 1 &&
                 ((benchmark_p2p && world == 8) ||
+                 (benchmark_forward && (world == 1 || world == 8)) ||
                  (benchmark_integrated && (world == 2 || world == 8))),
             "local CUDA benchmark requires one supported 2/8-GPU node");
     experts = 384;
@@ -1944,6 +1949,23 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             (base + slot * 53U) % experts));
     }
   }
+  if (forward_smoke) {
+    require(nodes == 1 && (world == 1 || world == 2 || world == 8),
+            "forward smoke requires one local 1/2/8-GPU node");
+    // top-k=6 needs at least six distinct experts. Round expert count up to a
+    // whole contiguous ownership block per rank.
+    experts = ((std::max(world, top_k) + world - 1U) / world) * world;
+    max_tokens = 1;
+    common_config = make_config(1, world, experts, top_k, 64);
+    for (std::uint32_t expert = 0; expert < experts; ++expert)
+      common_config.topology.expert_to_rank[expert] =
+          expert / (experts / world);
+    common_routes.num_tokens = 1;
+    common_routes.selected_experts.clear();
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      common_routes.selected_experts.push_back(static_cast<std::int32_t>(
+          (rank * 3U + slot * 5U + 1U) % experts));
+  }
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (rank == 0) {
     require(rank == 0, "only rank 0 may generate bootstrap ID");
@@ -1968,6 +1990,320 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution, {common_config, max_tokens, 4096, 2});
+  if (benchmark_forward) {
+    constexpr std::uint64_t hidden = 7168;
+    constexpr std::uint64_t intermediate = 3072;
+    auto setup_generation = megamoe::cuda::make_nccl_generation(
+        base, "cuda-forward-bench", 701);
+    auto setup_context = megamoe::make_rank_collective_context(
+        setup_generation.session(), rank, execution.token());
+    auto route_storage = megamoe::cuda::upload_cuda_routes(
+        common_routes, top_k, setup_context, execution);
+    const auto route_gates = fixed_random_selected_gates(
+        common_routes.num_tokens, top_k, rank, 0x4d4547414d4f4547ULL);
+    auto gate_storage =
+        megamoe::cuda::testing::upload_fp32_gates_for_testing(
+            route_gates, route_storage, setup_context, execution);
+    megamoe::cuda::ActivationTransportPoolConfig transport_config;
+    transport_config.max_tokens_per_rank = max_tokens;
+    transport_config.max_hidden_size = hidden;
+    transport_config.max_top_k = top_k;
+    transport_config.max_world_size = world;
+    transport_config.max_nodes = 1;
+    // The deterministic fixture is close to uniform but integer ownership
+    // boundaries can put slightly more than route_count/world rows on a rank.
+    transport_config.max_destination_rows_per_rank =
+        max_tokens * (top_k + 1U);
+    transport_config.channels = 1;
+    transport_config.ring_slots_per_source_channel = 1;
+    transport_config.max_inflight_generations = 1;
+    transport_config.max_intermediate_size = intermediate;
+    transport_config.enable_forward_cache = false;
+    const auto setup_start = Clock::now();
+    auto transport_pool = megamoe::cuda::make_activation_transport_pool(
+        setup_generation.session(), execution, transport_config);
+    std::vector<megamoe::transport::BFloat16> activation_host(
+        static_cast<std::size_t>(max_tokens * hidden));
+    for (std::size_t index = 0; index < activation_host.size(); ++index)
+      activation_host[index] = megamoe::transport::float_to_bfloat16(
+          static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) -
+                             63) /
+          64.0F);
+    auto activation_storage =
+        megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+            activation_host, max_tokens, hidden, setup_context, execution,
+            transport_pool);
+    const auto experts_per_rank = experts / world;
+    auto weights =
+        megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+            experts_per_rank, rank * experts_per_rank, hidden, intermediate,
+            setup_generation.session(), execution);
+    megamoe::cuda::LocalCudaP2pForwardMegaKernel forward(
+        setup_generation, execution, transport_pool);
+    const auto one_time_setup_us =
+        std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
+            .count();
+    const auto rounds_text = std::getenv("MEGAMOE_FORWARD_BENCH_ROUNDS");
+    const auto rounds = rounds_text
+                            ? static_cast<std::uint32_t>(
+                                  std::stoul(rounds_text))
+                            : 110U;
+    require(rounds > 10, "forward benchmark requires >10 rounds");
+    std::vector<double> wall_samples;
+    std::vector<double> notify_samples;
+    std::vector<double> forward_samples;
+    std::vector<double> dispatch_samples;
+    std::vector<double> fc1_samples;
+    std::vector<double> fc2_samples;
+    std::vector<double> return_samples;
+    std::vector<double> reduce_samples;
+    megamoe::cuda::ForwardMegaKernelAudit last_audit;
+    megamoe::cuda::DeviceForwardHandle last_output;
+    for (std::uint32_t round = 0; round < rounds; ++round) {
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
+        std::cerr << "FORWARD_PROGRESS rank=" << rank << " round=" << round
+                  << std::endl;
+      auto generation = megamoe::cuda::make_nccl_generation(
+          base, "cuda-forward-bench", 1000U + round);
+      auto context = megamoe::make_rank_collective_context(
+          generation.session(), rank, execution.token());
+      auto routes =
+          megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+              route_storage, context, execution);
+      auto gates =
+          megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              gate_storage, routes, context, execution);
+      auto activations =
+          megamoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
+              activation_storage, context, execution);
+      const auto wall_start = Clock::now();
+      megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, routes, gates, max_tokens});
+      const auto notify_end = Clock::now();
+      megamoe::cuda::ActivationTransportRunOptions run_options;
+      run_options.deadline_after = std::getenv("MEGAMOE_FORWARD_PROGRESS")
+                                       ? std::chrono::seconds(5)
+                                       : std::chrono::seconds(300);
+      auto output = forward.run(
+          notify.dispatch(), activations, weights,
+          {hidden, intermediate,
+           megamoe::cuda::ForwardCacheMode::NoFc1OutputCache},
+          run_options);
+      const auto wall_end = Clock::now();
+      last_audit = output.audit();
+      last_output = output;
+      if (round >= 10U) {
+        wall_samples.push_back(
+            std::chrono::duration<double, std::micro>(wall_end - wall_start)
+                .count());
+        notify_samples.push_back(
+            std::chrono::duration<double, std::micro>(notify_end - wall_start)
+                .count());
+        forward_samples.push_back(output.timings().total_us);
+        dispatch_samples.push_back(output.timings().dispatch_us);
+        fc1_samples.push_back(output.timings().fc1_swiglu_us);
+        fc2_samples.push_back(output.timings().fc2_us);
+        return_samples.push_back(output.timings().combine_return_us);
+        reduce_samples.push_back(output.timings().reduce_us);
+      }
+    }
+    const auto emit_values = [](const std::vector<double> &values) {
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0)
+          std::cout << ',';
+        std::cout << values[index];
+      }
+    };
+    const auto downloaded_output =
+        megamoe::cuda::download_forward_output_for_validation(last_output,
+                                                               execution);
+    std::uint64_t output_hash = 1469598103934665603ULL;
+    for (const auto value : downloaded_output) {
+      output_hash = (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
+                    1099511628211ULL;
+      output_hash =
+          (output_hash ^ static_cast<std::uint8_t>(value.bits >> 8U)) *
+          1099511628211ULL;
+    }
+    if (const auto *output_dir = std::getenv("MEGAMOE_FORWARD_OUTPUT_DIR")) {
+      const auto path = std::string(output_dir) + "/megamoe-rank-" +
+                        std::to_string(rank) + ".bf16";
+      std::ofstream destination(path, std::ios::binary | std::ios::trunc);
+      require(destination.good(), "failed to open forward output artifact");
+      destination.write(
+          reinterpret_cast<const char *>(downloaded_output.data()),
+          static_cast<std::streamsize>(downloaded_output.size() *
+                                       sizeof(downloaded_output.front())));
+      require(destination.good(), "failed to write forward output artifact");
+    }
+    const auto usage = transport_pool.usage();
+    std::cout << "FORWARD_BENCH rank=" << rank
+              << " specialization=sm90-wgmma-tma-7168x3072"
+              << " setup_us=" << one_time_setup_us
+              << " device_pool_bytes=" << usage.device_bytes
+              << " weight_bytes=" << weights.device_bytes()
+              << " persistent_launches="
+              << last_audit.persistent_kernel_launches
+              << " wgmma=" << last_audit.wgmma_instructions
+              << " tma=" << last_audit.tma_loads
+              << " multicast=" << last_audit.tma_multicast_loads
+              << " dispatch_peer_bytes="
+              << last_audit.actual_dispatch_peer_bytes
+              << " return_peer_bytes="
+              << last_audit.actual_return_peer_bytes
+              << " output_hash=" << output_hash << " wall=";
+    emit_values(wall_samples);
+    std::cout << " notify=";
+    emit_values(notify_samples);
+    std::cout << " forward=";
+    emit_values(forward_samples);
+    std::cout << " dispatch=";
+    emit_values(dispatch_samples);
+    std::cout << " fc1=";
+    emit_values(fc1_samples);
+    std::cout << " fc2=";
+    emit_values(fc2_samples);
+    std::cout << " return=";
+    emit_values(return_samples);
+    std::cout << " reduce=";
+    emit_values(reduce_samples);
+    std::cout << std::endl;
+    return;
+  }
+  if (forward_smoke) {
+    constexpr std::uint64_t hidden = 7168;
+    constexpr std::uint64_t intermediate = 3072;
+    auto generation = megamoe::cuda::make_nccl_generation(
+        base, "cuda-forward-smoke", 701);
+    auto context = megamoe::make_rank_collective_context(
+        generation.session(), rank, execution.token());
+    auto routes = megamoe::cuda::upload_cuda_routes(
+        common_routes, top_k, context, execution);
+    const auto gate_mode = std::getenv("MEGAMOE_GATE_MODE")
+                               ? std::getenv("MEGAMOE_GATE_MODE")
+                               : "fixed-random";
+    const auto gates = std::string(gate_mode) == "unit"
+                           ? std::vector<float>(top_k, 1.0F)
+                           : fixed_random_selected_gates(
+                                 1, top_k, rank, 0x4d4547414d4f4547ULL);
+    auto device_gates =
+        megamoe::cuda::testing::upload_fp32_gates_for_testing(
+            gates, routes, context, execution);
+    megamoe::cuda::ActivationTransportPoolConfig transport_config;
+    transport_config.max_tokens_per_rank = max_tokens;
+    transport_config.max_hidden_size = hidden;
+    transport_config.max_top_k = top_k;
+    transport_config.max_world_size = world;
+    transport_config.max_nodes = 1;
+    transport_config.max_destination_rows_per_rank = world * top_k;
+    transport_config.channels = 1;
+    transport_config.ring_slots_per_source_channel = 1;
+    transport_config.max_inflight_generations = 1;
+    transport_config.max_intermediate_size = intermediate;
+    transport_config.enable_forward_cache = true;
+    auto transport_pool = megamoe::cuda::make_activation_transport_pool(
+        generation.session(), execution, transport_config);
+    std::vector<megamoe::transport::BFloat16> input(hidden);
+    for (std::uint64_t index = 0; index < hidden; ++index)
+      input[static_cast<std::size_t>(index)] =
+          megamoe::transport::float_to_bfloat16(
+              static_cast<float>(static_cast<int>(index % 31U) - 15) /
+              32.0F);
+    auto activations =
+        megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+            input, 1, hidden, context, execution, transport_pool);
+    auto weights =
+        megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+            experts / world, rank * (experts / world), hidden, intermediate,
+            generation.session(), execution);
+    megamoe::cuda::LocalCudaP2pForwardMegaKernel forward(
+        generation, execution, transport_pool);
+    megamoe::cuda::ActivationTransportRunOptions run_options;
+    run_options.deadline_after = std::chrono::seconds(120);
+    std::vector<megamoe::transport::BFloat16> no_cache_output;
+    megamoe::cuda::DeviceForwardHandle no_cache;
+    for (std::uint32_t repeat = 0; repeat < 20U; ++repeat) {
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
+        std::cerr << "FORWARD_SMOKE_PROGRESS rank=" << rank
+                  << " repeat=" << repeat << std::endl;
+      const auto mode = std::getenv("MEGAMOE_FORWARD_NO_CACHE_ONLY")
+                            ? megamoe::cuda::ForwardCacheMode::NoFc1OutputCache
+                            : (repeat % 2U == 0U
+                                   ? megamoe::cuda::ForwardCacheMode::NoFc1OutputCache
+                                   : megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput);
+      auto repeat_generation = megamoe::cuda::make_nccl_generation(
+          base, "cuda-forward-smoke", 800U + repeat);
+      auto repeat_context = megamoe::make_rank_collective_context(
+          repeat_generation.session(), rank, execution.token());
+      auto repeat_routes =
+          megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+              routes, repeat_context, execution);
+      auto repeat_gates =
+          megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              device_gates, repeat_routes, repeat_context, execution);
+      auto repeat_activations =
+          megamoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
+              activations, repeat_context, execution);
+      megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          repeat_generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, repeat_routes, repeat_gates, max_tokens});
+      auto current = forward.run(notify.dispatch(), repeat_activations, weights,
+                                 {hidden, intermediate, mode}, run_options);
+      const auto current_output =
+          megamoe::cuda::download_forward_output_for_validation(current,
+                                                                 execution);
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS")) {
+        std::uint64_t repeat_hash = 1469598103934665603ULL;
+        for (const auto value : current_output)
+          repeat_hash = (repeat_hash ^ value.bits) * 1099511628211ULL;
+        std::cerr << "FORWARD_SMOKE_HASH rank=" << rank
+                  << " repeat=" << repeat << " hash=" << repeat_hash
+                  << std::endl;
+      }
+      if (repeat == 0U) {
+        no_cache_output = current_output;
+        no_cache = current;
+      } else {
+        if (current_output != no_cache_output &&
+            std::getenv("MEGAMOE_FORWARD_PROGRESS")) {
+          const auto mismatch = std::mismatch(no_cache_output.begin(),
+                                              no_cache_output.end(),
+                                              current_output.begin());
+          const auto index = static_cast<std::size_t>(
+              mismatch.first - no_cache_output.begin());
+          std::cerr << "FORWARD_SMOKE_MISMATCH rank=" << rank
+                    << " repeat=" << repeat << " index=" << index
+                    << " expected_bits=" << mismatch.first->bits
+                    << " actual_bits=" << mismatch.second->bits << std::endl;
+        }
+        require(current_output == no_cache_output,
+                "forward cache/no-cache or repeat output mismatch");
+      }
+    }
+    require(no_cache.audit().persistent_kernel_launches == 1 &&
+                no_cache.audit().wgmma_instructions != 0 &&
+                no_cache.audit().tma_loads != 0,
+            "forward smoke did not execute one WGMMA/TMA persistent kernel");
+    std::uint64_t output_hash = 1469598103934665603ULL;
+    for (const auto value : no_cache_output)
+      output_hash = (output_hash ^ value.bits) * 1099511628211ULL;
+    std::cout << "FORWARD_SMOKE rank=" << rank
+              << " specialization=sm90-wgmma-tma-7168x3072"
+              << " persistent_launches="
+              << no_cache.audit().persistent_kernel_launches
+              << " wgmma=" << no_cache.audit().wgmma_instructions
+              << " tma=" << no_cache.audit().tma_loads
+              << " fc1_tasks=" << no_cache.audit().fc1_tasks
+              << " fc2_tasks=" << no_cache.audit().fc2_tasks
+              << " cache_equal=1 repeat_equal=1 repeats=20 gate_mode="
+              << gate_mode << " top_k=" << top_k
+              << " output_hash=" << output_hash
+              << " total_us=" << no_cache.timings().total_us << std::endl;
+    return;
+  }
   if (benchmark_integrated) {
     require(nodes == 1 && (world == 2 || world == 8),
             "integrated benchmark requires one 2/8-GPU node");
@@ -2244,12 +2580,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_audit.actual_dispatch_peer_bytes
               << " actual_return_peer_bytes="
               << last_audit.actual_return_peer_bytes
-              << " actual_route_bytes="
-              << last_audit.actual_route_input_bytes
-              << " actual_local_gate_bytes="
-              << last_audit.actual_local_gate_bytes
-              << " actual_peer_gate_bytes="
-              << last_audit.actual_peer_gate_bytes
+              << " derived_route_bytes="
+              << last_audit.derived_route_input_bytes
+              << " derived_local_gate_bytes="
+              << last_audit.derived_local_gate_bytes
+              << " derived_peer_gate_bytes="
+              << last_audit.derived_peer_gate_bytes
               << " generation_memset_calls="
               << last_audit.generation_memset_calls
               << " generation_memset_bytes="
@@ -2307,9 +2643,27 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require(nodes == 1, "local CUDA P2P scenario requires exactly one node");
     auto session = megamoe::cuda::make_nccl_generation(
         base, "cuda-local-p2p", 701);
+    auto context = megamoe::make_rank_collective_context(
+        session.session(), rank, execution.token());
+    auto device_routes = megamoe::cuda::upload_cuda_routes(
+        common_routes, top_k, context, execution);
+    const auto gate_mode_text = std::getenv("MEGAMOE_GATE_MODE");
+    const std::string gate_mode = gate_mode_text ? gate_mode_text
+                                                  : "fixed-random";
+    require(gate_mode == "fixed-random" || gate_mode == "unit",
+            "gate mode must be fixed-random or unit");
+    auto route_gates = gate_mode == "unit"
+        ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
+        : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
+                                      0x4d4547414d4f4547ULL);
+    auto device_gates =
+        megamoe::cuda::testing::upload_fp32_gates_for_testing(
+            route_gates, device_routes, context, execution);
+    const auto gate_hash = hash_fp32(route_gates);
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         session, execution, pool);
-    auto notify = coordinator.run({common_config, common_routes, max_tokens});
+    auto notify = coordinator.run_device(
+        {common_config, device_routes, device_gates, max_tokens});
     const std::uint64_t hidden = benchmark_p2p ? 7168U : 17U;
     megamoe::cuda::ActivationTransportPoolConfig transport_pool_config;
     transport_pool_config.max_tokens_per_rank = max_tokens;
@@ -2343,8 +2697,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto value = static_cast<float>(rank * 101U + index % 97U) / 32.0F;
       activations[index] = megamoe::transport::float_to_bfloat16(value);
     }
-    auto context = megamoe::make_rank_collective_context(
-        session.session(), rank, execution.token());
     auto activation =
         megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
             activations, common_routes.num_tokens, hidden, context, execution,
@@ -2359,6 +2711,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.channels = 1;
     transport_config.ring_slots_per_source_channel =
         transport_pool_config.ring_slots_per_source_channel;
+    transport_config.expert_transform =
+        megamoe::transport::ActivationExpertTransform::SyntheticValidation;
+    transport_config.gate_placement =
+        megamoe::transport::ActivationGatePlacement::SourceAfter;
     if (scenario == "activation_p2p_cancel") {
       megamoe::cuda::ActivationTransportRunOptions cancel_options;
       cancel_options.cancellation.request_cancel();
@@ -2513,6 +2869,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << transported.audit().raw_cross_node_payload_bytes
               << " dedup_bytes="
               << transported.audit().deduplicated_cross_node_payload_bytes
+              << " gate_mode=" << gate_mode
+              << " gate_hash=" << gate_hash
               << " rounds=" << rounds
               << " total_us=" << transported.timings().total_us
               << " combined=";

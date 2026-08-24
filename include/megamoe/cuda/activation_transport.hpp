@@ -17,6 +17,14 @@ template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;
 class ActivationTransportBridge;
+class ForwardMegaKernelBridge;
+class ForwardWeightLease;
+namespace testing {
+ForwardWeightLease make_deterministic_forward_weights_for_testing(
+    std::uint32_t owned_experts, std::uint32_t global_expert_begin,
+    std::uint64_t hidden_size, std::uint64_t intermediate_size,
+    const CollectiveSession &session, const CudaExecution &execution);
+} // namespace testing
 
 inline constexpr std::uint32_t kSelectedActivationLayoutVersion = 1;
 
@@ -42,6 +50,7 @@ private:
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
+  friend class LocalCudaP2pForwardMegaKernel;
 };
 
 struct ActivationTransportPoolConfig {
@@ -54,6 +63,8 @@ struct ActivationTransportPoolConfig {
   std::uint32_t channels = 1;
   std::uint32_t ring_slots_per_source_channel = 0;
   std::uint32_t max_inflight_generations = 2;
+  std::uint64_t max_intermediate_size = 0;
+  bool enable_forward_cache = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -83,6 +94,7 @@ private:
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
+  friend class LocalCudaP2pForwardMegaKernel;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -117,9 +129,11 @@ struct ActivationTransportDeviceAudit {
   // counters include every destination-GPU fan-out and exclude local writes.
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
-  std::uint64_t actual_route_input_bytes = 0;
-  std::uint64_t actual_local_gate_bytes = 0;
-  std::uint64_t actual_peer_gate_bytes = 0;
+  // Shape-derived retained-storage/semantic traffic sizes. Unlike the peer
+  // counters above, these are not incremented by the device data plane.
+  std::uint64_t derived_route_input_bytes = 0;
+  std::uint64_t derived_local_gate_bytes = 0;
+  std::uint64_t derived_peer_gate_bytes = 0;
   std::uint64_t generation_memset_calls = 0;
   std::uint64_t generation_memset_bytes = 0;
   std::uint64_t kernel_launches = 0;
@@ -202,6 +216,113 @@ private:
   std::shared_ptr<Impl> impl_;
 };
 
+enum class ForwardCacheMode : std::uint8_t {
+  CacheFc1InputOutput,
+  NoFc1OutputCache,
+};
+
+enum class ForwardKernelSpecialization : std::uint8_t {
+  Sm90WgmmaTma7168x3072,
+  CudaCoreCorrectnessFallback,
+};
+
+struct ForwardMegaKernelConfig {
+  std::uint64_t hidden_size = 0;
+  std::uint64_t intermediate_size = 0;
+  ForwardCacheMode cache_mode = ForwardCacheMode::NoFc1OutputCache;
+};
+
+class ForwardWeightLease {
+public:
+  ForwardWeightLease() = default;
+  std::uint32_t owned_experts() const;
+  std::uint64_t hidden_size() const;
+  std::uint64_t intermediate_size() const;
+  std::uint64_t device_bytes() const;
+  std::uint32_t device_ordinal() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit ForwardWeightLease(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class ForwardMegaKernelBridge;
+  friend class LocalCudaP2pForwardMegaKernel;
+  friend ForwardWeightLease
+  testing::make_deterministic_forward_weights_for_testing(
+      std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t,
+      const CollectiveSession &, const CudaExecution &);
+};
+
+struct ForwardMegaKernelTimings {
+  double dispatch_us = 0;
+  double fc1_swiglu_us = 0;
+  double fc2_us = 0;
+  double combine_return_us = 0;
+  double reduce_us = 0;
+  double total_us = 0;
+};
+
+struct ForwardMegaKernelAudit {
+  ForwardKernelSpecialization specialization =
+      ForwardKernelSpecialization::CudaCoreCorrectnessFallback;
+  std::uint64_t persistent_kernel_launches = 0;
+  std::uint64_t wgmma_instructions = 0;
+  std::uint64_t tma_loads = 0;
+  std::uint64_t tma_multicast_loads = 0;
+  std::uint64_t fc1_tasks = 0;
+  std::uint64_t fc2_tasks = 0;
+  std::uint64_t actual_dispatch_peer_bytes = 0;
+  std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t hot_path_allocations = 0;
+  std::uint64_t activation_d2h_bytes = 0;
+  std::uint64_t activation_h2d_bytes = 0;
+  std::uint64_t workspace_bytes = 0;
+};
+
+class DeviceForwardHandle {
+public:
+  DeviceForwardHandle() = default;
+  const ActivationTransportExpectation &identity() const;
+  const ForwardMegaKernelAudit &audit() const;
+  const ForwardMegaKernelTimings &timings() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceForwardHandle(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class LocalCudaP2pForwardMegaKernel;
+  friend class ForwardMegaKernelBridge;
+  friend std::vector<transport::BFloat16>
+  download_forward_output_for_validation(const DeviceForwardHandle &,
+                                         const CudaExecution &);
+};
+
+class LocalCudaP2pForwardMegaKernel {
+public:
+  LocalCudaP2pForwardMegaKernel(
+      const NcclSession &session, const CudaExecution &execution,
+      const ActivationTransportResourcePool &pool);
+
+  DeviceForwardHandle run(
+      const DeviceDispatchHandle &dispatch,
+      const BFloat16ActivationLease &activations,
+      const ForwardWeightLease &weights,
+      const ForwardMegaKernelConfig &config,
+      const ActivationTransportRunOptions &options = {});
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+std::vector<transport::BFloat16>
+download_forward_output_for_validation(const DeviceForwardHandle &handle,
+                                       const CudaExecution &execution);
+
 struct ActivationTransportValidationDownload {
   std::vector<transport::BFloat16> contribution_by_route;
   std::vector<transport::BFloat16> combined_tokens;
@@ -240,6 +361,11 @@ BFloat16ActivationLease upload_bfloat16_activations_for_testing(
     std::uint64_t num_tokens, std::uint64_t hidden,
     const RankCollectiveContext &context, const CudaExecution &execution,
     const ActivationTransportResourcePool &pool);
+
+ForwardWeightLease make_deterministic_forward_weights_for_testing(
+    std::uint32_t owned_experts, std::uint32_t global_expert_begin,
+    std::uint64_t hidden_size, std::uint64_t intermediate_size,
+    const CollectiveSession &session, const CudaExecution &execution);
 
 // Executes a true device-issued store through a peer mapping and observes a
 // system-scope release/acquire signal. It is a capability/correctness probe,

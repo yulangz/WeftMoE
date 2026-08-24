@@ -1,0 +1,5 @@
+kernel,metric_name,metric_unit,metric_value
+forward_persistent_kernel,Duration,msecond,25.349
+forward_persistent_kernel,SM Throughput,percent,42.37
+forward_persistent_kernel,DRAM Throughput,percent,48.87
+forward_persistent_kernel,Achieved Occupancy,percent,18.75

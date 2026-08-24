@@ -96,7 +96,29 @@ def seeded_routes(world, experts, top_k, seed, max_tokens=10):
     return result
 
 
-def expected(world, seed, hidden=17, requested_top_k=6):
+def fixed_random_selected_gates(tokens, top_k, rank,
+                                seed=0x4D4547414D4F4547):
+    result = []
+    for token in range(tokens):
+        scores = [1 + ((seed + token * 1315423911 + slot * 2654435761 +
+                        rank * 97531) % 65521) for slot in range(top_k)]
+        total = sum(scores)
+        result.extend(float(score / total) for score in scores)
+    # Force the exact FP32 values consumed by the C++/CUDA path.
+    return [struct.unpack("<f", struct.pack("<f", value))[0]
+            for value in result]
+
+
+def fp32_hash(values):
+    result = 1469598103934665603
+    for value in values:
+        for byte in struct.pack("<f", value):
+            result = ((result ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return result
+
+
+def expected(world, seed, hidden=17, requested_top_k=6,
+             gate_mode="fixed-random"):
     experts = max(16, world * 2)
     top_k = min(requested_top_k, experts)
     routes = seeded_routes(world, experts, top_k, seed)
@@ -125,6 +147,8 @@ def expected(world, seed, hidden=17, requested_top_k=6):
     canonical = [[0] * (capacity_rows * hidden) for _ in range(world)]
     output = []
     for rank, (tokens, selected) in enumerate(routes):
+        gates = ([1.0] * (tokens * top_k) if gate_mode == "unit" else
+                 fixed_random_selected_gates(tokens, top_k, rank))
         activations = [
             bf16((rank * 101 + index % 97) / 32.0)
             for index in range(tokens * hidden)
@@ -151,11 +175,17 @@ def expected(world, seed, hidden=17, requested_top_k=6):
                 total = 0.0
                 for slot in order:
                     route = token * top_k + slot
-                    total += bf16_float(contributions[route * hidden + column])
+                    product = struct.unpack(
+                        "<f", struct.pack(
+                            "<f", gates[route] * bf16_float(
+                                contributions[route * hidden + column])))[0]
+                    total = struct.unpack(
+                        "<f", struct.pack("<f", total + product))[0]
                 combined[token * hidden + column] = bf16(total)
         output.append({
             "tokens": tokens,
             "top_k": top_k,
+            "gate_hash": str(fp32_hash(gates)),
             "combined": combined,
             "contribution": contributions,
         })
@@ -198,24 +228,29 @@ def runner(binary, rank, world, seed, fd, output, scenario, prefix=()):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--world", type=int, choices=(2, 8), required=True)
+    parser.add_argument("--world", type=int, choices=(1, 2, 8), required=True)
     parser.add_argument("--seed", type=int, default=0x5EED1234)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
+    parser.add_argument("--forward-smoke", action="store_true")
+    parser.add_argument("--forward-benchmark", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
+    parser.add_argument("--forward-output-dir")
     parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--no-wrap", action="store_true")
     parser.add_argument("--ring-slots", type=int, choices=(1, 2))
     parser.add_argument("--compute-sanitizer-tool",
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
-    if args.benchmark and args.integrated_benchmark:
-        parser.error("choose only one benchmark mode")
-    benchmark_mode = args.benchmark or args.integrated_benchmark
+    if sum((args.benchmark, args.integrated_benchmark,
+            args.forward_smoke, args.forward_benchmark)) > 1:
+        parser.error("choose only one benchmark/smoke mode")
+    benchmark_mode = (args.benchmark or args.integrated_benchmark or
+                      args.forward_benchmark)
     if args.rounds is None:
         args.rounds = 110 if benchmark_mode else 1
     if benchmark_mode and args.rounds <= 10:
@@ -227,6 +262,12 @@ def main():
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
+    elif args.forward_benchmark:
+        environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
+        if args.forward_output_dir:
+            os.makedirs(args.forward_output_dir, mode=0o700, exist_ok=True)
+            environment["MEGAMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
+                args.forward_output_dir)
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
@@ -236,13 +277,15 @@ def main():
         environment["MEGAMOE_P2P_RING_SLOTS"] = str(args.ring_slots)
     prefix = (() if args.compute_sanitizer_tool is None else
               ("compute-sanitizer", "--tool", args.compute_sanitizer_tool,
-               "--error-exitcode=1"))
+               "--print-limit=10", "--error-exitcode=1"))
     read_fd, write_fd = os.pipe()
     processes = []
-    scenario = ("activation_integrated_bench" if args.integrated_benchmark else
+    scenario = ("forward_bench" if args.forward_benchmark else
+                ("forward_smoke" if args.forward_smoke else
+                ("activation_integrated_bench" if args.integrated_benchmark else
                 ("activation_p2p_bench" if args.benchmark else
                  ("activation_p2p_cancel" if args.cancel else
-                  "activation_p2p")))
+                  "activation_p2p")))))
     try:
         rank0 = subprocess.Popen(
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
@@ -268,10 +311,51 @@ def main():
             send_exact(process, frame)
             processes.append(process)
         deadline = time.monotonic() + args.timeout
+        # Fail fast if any peer exits while another rank is still blocked in a
+        # collective or peer signal wait; waiting rank 0 first hides the true
+        # origin and turns deterministic setup failures into launcher hangs.
+        while time.monotonic() < deadline:
+            failed = next((index for index, process in enumerate(processes)
+                           if process.poll() not in (None, 0)), None)
+            if failed is not None:
+                process = processes[failed]
+                stdout, stderr = process.communicate()
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", "replace")
+                    stderr = stderr.decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"rank={failed} exited early code={process.returncode} "
+                    f"stdout_tail={stdout[-1000:]} stderr_tail={stderr[-3000:]}")
+            if all(process.poll() is not None for process in processes):
+                break
+            time.sleep(0.02)
         observed = []
         for rank, process in enumerate(processes):
             timeout = max(0.1, deadline - time.monotonic())
-            stdout, stderr = process.communicate(timeout=timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", "replace")
+                    stderr = stderr.decode("utf-8", "replace")
+                peer_tails = []
+                for peer_rank, peer in enumerate(processes):
+                    if peer is process:
+                        continue
+                    if peer.poll() is None:
+                        peer.kill()
+                    peer_stdout, peer_stderr = peer.communicate()
+                    if isinstance(peer_stdout, bytes):
+                        peer_stdout = peer_stdout.decode("utf-8", "replace")
+                        peer_stderr = peer_stderr.decode("utf-8", "replace")
+                    peer_tails.append(
+                        f"peer_rank={peer_rank} stdout_tail={peer_stdout[-500:]} "
+                        f"stderr_tail={peer_stderr[-1500:]}")
+                raise RuntimeError(
+                    f"rank={rank} timed out stdout_tail={stdout[-1000:]} "
+                    f"stderr_tail={stderr[-3000:]} " + " ".join(peer_tails))
             if isinstance(stdout, bytes):
                 stdout = stdout.decode("utf-8", "replace")
                 stderr = stderr.decode("utf-8", "replace")
@@ -286,14 +370,29 @@ def main():
                     f"sanitizer={sanitizer} "
                     f"stdout_tail={stdout[-1000:]} stderr={stderr[-3000:]}"
                 )
+            if args.forward_smoke:
+                item = parse_fields(stdout, "FORWARD_SMOKE ")
+                if (item.get("specialization") !=
+                        "sm90-wgmma-tma-7168x3072" or
+                        item.get("persistent_launches") != "1" or
+                        item.get("cache_equal") != "1" or
+                        item.get("repeat_equal") != "1" or
+                        item.get("repeats") != "20" or
+                        item.get("gate_mode") != args.gate_mode or
+                        item.get("top_k") != str(args.top_k)):
+                    raise AssertionError(
+                        f"rank={rank} invalid forward smoke audit: {item}")
+                observed.append(item)
+                continue
             if args.cancel:
                 cancelled = parse_fields(stdout, "P2P_CANCEL ")
                 if cancelled.get("cancelled") != "1" or \
                         cancelled.get("quarantined") != "1":
                     raise AssertionError(f"rank={rank} bad cancellation audit")
             else:
-                marker = ("INTEGRATED_BENCH " if args.integrated_benchmark else
-                          "P2P_BENCH ")
+                marker = ("FORWARD_BENCH " if args.forward_benchmark else
+                          ("INTEGRATED_BENCH "
+                           if args.integrated_benchmark else "P2P_BENCH "))
                 item = (parse_fields(stdout, marker)
                         if benchmark_mode else parse_result(stdout))
                 if benchmark_mode:
@@ -301,10 +400,84 @@ def main():
                     item["_nccl_runtime"] = runtime["runtime"]
                     item["_nccl_library"] = runtime["library"]
                 observed.append(item)
+        if args.forward_smoke:
+            hashes = [item["output_hash"] for item in observed]
+            if len(hashes) != args.world:
+                raise AssertionError("missing forward ranks")
+            print(f"[PASS] LocalCudaP2p Forward MegaKernel world={args.world} "
+                  "single-launch WGMMA/TMA cache/no-cache smoke")
+            return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
             return
         if benchmark_mode:
+            if args.forward_benchmark:
+                stage_keys = ("wall", "notify", "forward", "dispatch",
+                              "fc1", "fc2", "return", "reduce")
+                for rank, item in enumerate(observed):
+                    if (item["specialization"] !=
+                            "sm90-wgmma-tma-7168x3072" or
+                            item["persistent_launches"] != "1"):
+                        raise AssertionError(
+                            f"rank={rank} invalid forward audit: {item}")
+                    for key in stage_keys:
+                        item[key] = [float(value)
+                                     for value in item[key].split(",")]
+                        if len(item[key]) != args.rounds - 10:
+                            raise AssertionError(
+                                f"rank={rank} stage={key} bad sample count")
+
+                def stats(values):
+                    ordered = sorted(values)
+                    def percentile(fraction):
+                        ordinal = max(
+                            1, int(len(ordered) * fraction + 0.999999))
+                        return ordered[ordinal - 1]
+                    return {"mean": statistics.fmean(values),
+                            "p50": percentile(0.50),
+                            "p95": percentile(0.95),
+                            "min": ordered[0], "max": ordered[-1]}
+
+                summary = {}
+                for key in stage_keys:
+                    slowest = [max(item[key][iteration]
+                                   for item in observed)
+                               for iteration in range(args.rounds - 10)]
+                    summary[key + "_slowest_rank_us"] = stats(slowest)
+                result = {
+                    "schema": 1,
+                    "benchmark": "single-persistent-forward-main-shape",
+                    "world": args.world,
+                    "warmup": 10,
+                    "measured": args.rounds - 10,
+                    "shape": {"tokens_per_rank": 8192, "hidden": 7168,
+                              "intermediate": 3072, "experts": 384,
+                              "top_k": 6},
+                    "per_rank_device_pool_bytes": [
+                        int(item["device_pool_bytes"]) for item in observed],
+                    "per_rank_weight_bytes": [
+                        int(item["weight_bytes"]) for item in observed],
+                    "per_rank_dispatch_peer_bytes": [
+                        int(item["dispatch_peer_bytes"]) for item in observed],
+                    "per_rank_return_peer_bytes": [
+                        int(item["return_peer_bytes"]) for item in observed],
+                    "per_rank_output_hash": [
+                        item["output_hash"] for item in observed],
+                    "per_rank_wgmma_instructions": [
+                        int(item["wgmma"]) for item in observed],
+                    "per_rank_tma_loads": [int(item["tma"])
+                                           for item in observed],
+                    "per_rank_tma_multicast_loads": [
+                        int(item["multicast"]) for item in observed],
+                    "per_rank_nccl_runtime": [
+                        item["_nccl_runtime"] for item in observed],
+                    "per_rank_nccl_library": [
+                        item["_nccl_library"] for item in observed],
+                    **summary,
+                }
+                print("FORWARD_BENCH_JSON " +
+                      json.dumps(result, sort_keys=True))
+                return
             if args.integrated_benchmark:
                 stage_keys = (
                     "wall", "notify", "mapping", "control",
@@ -376,13 +549,13 @@ def main():
                         int(item["route_input_bytes"]) for item in observed],
                     "per_rank_local_gate_bytes": [
                         int(item["local_gate_bytes"]) for item in observed],
-                    "per_rank_actual_route_bytes": [
-                        int(item["actual_route_bytes"]) for item in observed],
-                    "per_rank_actual_local_gate_bytes": [
-                        int(item["actual_local_gate_bytes"])
+                    "per_rank_derived_route_bytes": [
+                        int(item["derived_route_bytes"]) for item in observed],
+                    "per_rank_derived_local_gate_bytes": [
+                        int(item["derived_local_gate_bytes"])
                         for item in observed],
-                    "per_rank_actual_peer_gate_bytes": [
-                        int(item["actual_peer_gate_bytes"])
+                    "per_rank_derived_peer_gate_bytes": [
+                        int(item["derived_peer_gate_bytes"])
                         for item in observed],
                     "per_rank_actual_dispatch_peer_bytes": [
                         int(item["actual_dispatch_peer_bytes"])
@@ -499,10 +672,17 @@ def main():
                 (summary["total_slowest_rank_us"]["mean"] * 1e3))
             print("P2P_BENCH_JSON " + json.dumps(result, sort_keys=True))
             return
-        oracle = expected(args.world, args.seed, requested_top_k=args.top_k)
+        oracle = expected(args.world, args.seed, requested_top_k=args.top_k,
+                          gate_mode=args.gate_mode)
         for rank, (actual, wanted) in enumerate(zip(observed, oracle)):
             if actual["backend"] != "local-cuda-p2p":
                 raise AssertionError(f"rank={rank} backend={actual['backend']}")
+            if actual.get("gate_mode") != args.gate_mode:
+                raise AssertionError(
+                    f"rank={rank} gate mode was not propagated")
+            if actual.get("gate_hash") != wanted["gate_hash"]:
+                raise AssertionError(
+                    f"rank={rank} dynamic gate lease/hash mismatch")
             for field in ("combined", "contribution", "canonical"):
                 if actual[field] != wanted[field]:
                     raise AssertionError(

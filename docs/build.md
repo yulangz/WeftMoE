@@ -57,9 +57,9 @@ This runs:
 - JSON full-field C++/Python comparison over targeted, fixed-seed random,
   25 fixed random seeds plus targeted 73-node, skewed, empty-rank,
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
-  repeat checking.
-- every public header as an isolated `-Werror` translation unit.
-- twenty-six compile-negative probes for the retired `wait`, `wait_preflight`, raw
+  repeat checking;
+- every public header as an isolated `-Werror` translation unit;
+- twenty-eight compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
   production coordinator constructor, generic route rebinding/wrong route
@@ -122,7 +122,58 @@ make BUILD_DIR=build-cuda cuda-sm90-compile
 LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --transport-capability
 LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --device-smoke
 LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --transport-bench
+
+# Single-launch Forward correctness (cache/no-cache, 20 deterministic repeats).
+NCCL_DEBUG=WARN LD_LIBRARY_PATH="$NCCL12" \
+  python3 tests/run_local_activation_p2p.py \
+    --binary build-cuda/test_cuda_notify --world 8 --forward-smoke \
+    --top-k 6 --gate-mode fixed-random --rounds 20
+
+# Main-shape Forward: 10 warmup + 100 measured generations.
+NCCL_DEBUG=WARN LD_LIBRARY_PATH="$NCCL12" \
+  python3 tests/run_local_activation_p2p.py \
+    --binary build-cuda/test_cuda_notify --world 8 --forward-benchmark \
+    --top-k 6 --gate-mode fixed-random --rounds 110
+
+# Same routes/gates/BF16 weights under Megatron-Core 0.17.0.
+MEGAMOE_NCCL_LIBRARY="$NCCL12/libnccl.so.2" \
+NCCL_DEBUG=WARN LD_LIBRARY_PATH="$NCCL12" \
+  torchrun --standalone --nproc-per-node=8 \
+    benchmarks/megatron_dispatch_baseline.py \
+    --expert-body te-grouped-mlp --gate-mode fixed-random \
+    --warmups 10 --iterations 100 --runs 3
 ```
+
+The CUDA build reads DeepGEMM headers from `DEEPGEMM_INCLUDE_DIR` (defaulting
+to the adjacent reference checkout) and discovers the installed DeepGEMM
+package's CUTLASS/CUTE headers without embedding its wheel path. Source-only
+exports must pass `CUTLASS_INCLUDE_DIR=/path/to/cutlass/include` when the
+DeepGEMM CUTLASS submodule is not initialized.
+
+Keep `NCCL_DEBUG=WARN` for long launcher runs: rank logs are captured for
+structured failure diagnostics, and per-collective `INFO` output is not part of
+the timed workload.
+
+On the inspected local 8-GPU host, three independent release sessions (each
+10 warmups + 100 measurements) produced slowest-rank Forward E2E means of
+17.899, 17.910, and 17.935 ms. The same-route/same-gate/same-weight
+Megatron-Core 0.17.0 native means were 17.998, 17.962, and 17.948 ms; per-run
+speedups are therefore only 0.55%, 0.29%, and 0.07%, not the required 15%.
+Megatron's explicit source-gate-after common-semantics means were 21.954,
+21.965, and 21.963 ms, against which MegaMOE is 18.5% faster. These two results
+are reported separately because Megatron native applies routing probability at
+a different point.
+
+The final MegaMOE stage means are approximately Notify 0.52--0.55 ms,
+Dispatch 2.02 ms, FC1 7.09 ms, FC2 4.30 ms, vectorized return 2.27 ms, and
+overlapped deterministic reduce 2.30 ms. The measured pool is
+2,847,625,496 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
+Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
+FP32 gates remain local. Nsight Compute on the main-shape world-1 compute slice
+reported 42.37% SM throughput, 48.87% DRAM throughput, and 18.75% active-warps
+occupancy. `ptxas` also reports serialized WGMMA accumulator dependencies;
+those results identify clustered weight reuse and WGMMA pipeline scheduling as
+the next optimization target.
 
 `cuda-test-local` runs real NCCL worlds 1, 2, and 8. Each world runs 25 fixed
 seeds, a 20-run byte-for-byte repeat fixture, staggered rank enqueue timing,
@@ -270,10 +321,17 @@ The prior one-CTA serialized baseline was 426695.44 us mean. Bulk all-SM grids,
 direct canonical writes and per-peer phase signals reduce it by 98.95% (about
 95.4x). This remains CUDA IPC/NVLink—not GIN/RDMA or Socket transport.
 
-### Same-generation integrated Megatron-Core comparison
+### Phase-4 identity-transport Megatron-Core comparison
 
-`benchmarks/run_integrated_comparison.py` is the comparison gate. It launches
-three independent process worlds for each implementation, with 10 warmups and
+The measurements in this subsection are the frozen identity-expert transport
+baseline from phase 4. They are retained for regression analysis and are not
+the phase-5 full-Forward performance claim. The current
+`benchmarks/run_integrated_comparison.py` instead runs the full WGMMA/TMA
+Forward comparison described above and fails unless every independent run is
+at least 15% faster than Megatron native.
+
+The phase-4 comparison launcher used three independent process worlds for each
+implementation, with 10 warmups and
 100 measured generations per run. MegaMOE's timed sample starts with a ready
 device route/activation lease, creates a new Notify generation, passes that
 exact `DeviceDispatchHandle` directly to the real `LocalCudaP2p` backend, runs

@@ -1,5 +1,32 @@
 # Rank-local Notify architecture
 
+## Single-node Forward data plane
+
+After Notify publishes `DeviceDispatchHandle`, the Forward adapter acquires an
+owning dispatch consumer and passes its private kernel view directly to
+`LocalCudaP2pForwardMegaKernel`; metadata is neither downloaded nor rebuilt.
+The main-shape kernel uses one resident CTA per SM and a cooperative grid:
+
+```text
+DispatchPut -> FC1(WGMMA/TMA) -> SwiGLU -> FC2(WGMMA/TMA)
+            -> vectorized peer return -> gate-after TopKReduce
+            -> peer terminal epoch
+```
+
+FC1 evaluates both `[A,B]` projections from each staged X tile, casts
+`SiLU(A)*B` to BF16 once, and releases the M-block scoreboard only after every
+lane's store is ordered. FC2 acquires that scoreboard, accumulates WGMMA in
+FP32, casts the expert output to BF16, and writes canonical local rows. Return
+copies whole BF16 rows to immutable source route slots. Source workers wait on
+system-scope route readiness, multiply by the local FP32 gate, add routes in
+expert-ID order, and perform one final BF16 cast. A tagged exact epoch barrier
+inside the kernel prevents the next generation from reusing a peer slot early.
+
+The cache policy affects lifetime, not arithmetic: the cache mode retains BF16
+A/B checkpoints in the session pool; no-cache omits those stores. Both retain
+canonical dispatch X through the Forward handle. Transient S and expert output
+are generation-local. Cross-node Forward and backward are not implemented.
+
 ## Runtime topology
 
 All shape and topology values remain runtime data. The baseline requires

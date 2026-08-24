@@ -4,13 +4,17 @@ MegaMOE targets deterministic training MoE execution on H200/SM90 and later
 devices. The current vertical slice implements rank-local deterministic Notify
 Dispatch in production C++/CUDA, a fixed-width distributed control agreement,
 a real NCCL AllGather count backend, opaque device metadata leases, and an
-independent Python oracle. Phase 4 adds a transport-only BF16 data-plane
+independent Python oracle. Phase 4 adds a BF16 activation data plane
 baseline: typed router activation leases, a debug sequence/credit ring,
 canonical direct writes, batched synthetic contribution return, and fixed
 expert-order combine. `LocalCudaP2pActivationTransport` now uses real per-rank
 CUDA IPC mappings and independent rank processes; the explicit
-`DeviceActivationTransport` remains a simulation-only oracle. It does **not**
-implement FC1/FC2, backward, Socket transport, or NCCL GIN/RDMA.
+`DeviceActivationTransport` remains a simulation-only oracle. Phase 5 now has
+a single-launch, single-node Forward baseline for the main 7168x3072 shape:
+TMA/WGMMA FC1, an in-kernel SwiGLU epilogue, TMA/WGMMA FC2, peer return, and
+source-side dynamic-gate deterministic reduce all execute in one cooperative
+persistent kernel. It does **not** implement backward, cross-node Forward,
+Socket transport, or NCCL GIN/RDMA.
 
 ## Supported topology contract
 
@@ -229,6 +233,34 @@ validation. Stores precede a system fence and release signal; consumers
 acquire-observe the signal before use. Reduction follows device
 `combine_order` (expert-ID order), accumulates in FP32, and casts once to BF16.
 The synthetic transform is only a transport oracle and is not FC1/FC2.
+
+## Single-node Forward baseline
+
+`LocalCudaP2pForwardMegaKernel` accepts the immutable dispatch handle, typed
+BF16 activation/weight leases, and the dispatch-owned FP32 gate lease. For the
+main `hidden=7168, intermediate=3072` specialization it launches one
+384-thread CTA per SM as 2-CTA clusters. The single cooperative launch performs
+DispatchPut, three-stage TMA/WGMMA FC1 for both projections, BF16 SwiGLU
+materialization, four-stage N=256 TMA/WGMMA FC2, vectorized peer return, and
+fixed expert-ID source reduction. FC1 and FC2 have no intervening kernel or
+host scheduling boundary. The output lease owns the transport slot until the
+last copy dies; a tagged system-scope terminal epoch prevents reuse while any
+peer can still publish return data.
+
+The two forward modes share the same arithmetic path. `NO_FC1_OUTPUT_CACHE`
+retains canonical dispatch X and transient S only for the live generation;
+`CACHE_FC1_INPUT_OUTPUT` additionally checkpoints the BF16 A/B projections for
+a future backward implementation. Both cast SwiGLU output to BF16 before FC2,
+apply the per-route FP32 gate at the source after return, accumulate top-k in
+device `combine_order`, and cast the final sum once to BF16. No S, ungated FC2
+output, or peer contribution is retained beyond the Forward lease.
+
+The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
+CUDA runtime on the inspected L20X host; the fat binary also contains the
+ordinary `sm_89` target, which rejects this specialization at runtime. There is
+currently no correctness fallback for other H/I shapes. TMA multicast remains
+disabled (`audit=0`) because the attempted persistent cluster schedule did not
+meet the long-run progress contract; that optimization remains open.
 
 The GIN probe reports headers, the full required symbol set, runtime minimal
 initialization, backend implementation, and usability independently. The
