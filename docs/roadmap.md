@@ -120,14 +120,27 @@ correctness blockers.
 - A NCCL-free production-kernel harness covers memcheck, racecheck and
   initcheck. Single-node world 1/8 cache/no-cache correctness and steady
   allocation auditing are available.
-- Performance closure remains open. Independent FP64 checks found that the
-  earlier direct MN-major dW path produced incorrect nonzero-column gradients,
-  so its 31.9 ms measurements are invalid. The corrected K-major path is exact
-  on the selected BF16 dW samples and reports max absolute oracle error
-  `3.51e-8` (from FP32 dGate). After fusing U/dAB transpose and using a
-  coalesced 256x256 dY/X transpose, one 10-warmup/100-sample local 8-GPU run
-  measured 41.538 ms Backward and 58.089 ms integrated Forward+Backward. This
-  does not beat the matching 33.700--33.851 ms Megatron Backward baseline;
-  dW (13.870 ms), dV (7.917 ms), dX (7.642 ms), and the remaining transpose
-  (7.754 ms) are the next profiling targets. No Phase-6 completion claim or
-  release commit is made until every independent run clears the 15% gates.
+- Performance closure remains open, but the current cache-mode candidate has
+  crossed the local performance gates. The global dY/X transpose is gone;
+  dW1 now uses an outer producer/two-consumer WGMMA pipeline, an STSM BF16
+  epilogue, and four 128x64 TMA stores. Deterministic grid-stride ownership for
+  the uniform main-shape dW1 and dX tiles removes their global claim atomics.
+  Three independent 10-warmup/100-sample local 8-GPU runs measured Backward
+  means of `28.578`, `28.553`, and `28.587` ms. Matching Megatron native means
+  were `33.700`, `33.851`, and `33.806` ms, giving `15.20%`, `15.65%`, and
+  `15.44%` improvements. dW1 averaged about `6.73` ms and dX about `7.92` ms.
+  Cache-mode Forward+Backward was `45.240`, `45.214`, and `45.260` ms versus
+  Megatron's `54.149`, `54.205`, and `54.191` ms (`16.45%`--`16.59%` faster).
+  No-cache remains slower because FC1 recomputation raises Backward to
+  `37.168` ms despite avoiding the Forward checkpoint write.
+
+  The isolated DeepGEMM grouped-GEMM comparison reaches `5.519` ms outside
+  profiler replay and uses M128xN256xK64, three stages, 128 TMA plus 256 math
+  threads, and a 2-CTA multicast cluster. The production path deliberately
+  does not adopt the previously unstable multicast candidate. NCU reports the
+  isolated DeepGEMM kernel at 85.61% SM throughput and 14.06% achieved
+  occupancy; production world=8 NCU replay cannot currently progress through
+  the peer-synchronized persistent kernel, while world=1 profiling exhausts
+  memory because that rank owns all 384 experts. Correctness, sanitizer, and
+  ordinary timing evidence therefore remain separate from this profiler
+  limitation. No Phase-6 completion claim is made until external test handoff.
