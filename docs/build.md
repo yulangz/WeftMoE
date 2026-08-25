@@ -156,32 +156,42 @@ the timed workload.
 
 On the inspected local 8-GPU host, three independent release sessions (each
 10 warmups + 100 measurements) produced slowest-rank Forward E2E means of
-14.9338, 14.9344, and 14.9387 ms. The exact same activation, route, gate, and
-expert-aware weight fixture on Megatron-Core 0.17.0 produced native means of
-18.2190, 18.3069, and 18.1783 ms. The paired speedups are 18.03%, 18.42%, and
-17.82%; every independent session passes the 15% gate. Megatron's explicit
-source-gate-after common-semantics means were 22.1246, 22.1949, and 22.0780 ms.
+15.2538, 15.2652, and 15.2611 ms. The exact same activation, route, gate, and
+actual device weight bytes on Megatron-Core 0.17.0 produced native means of
+18.4617, 18.6098, and 18.4789 ms. The paired speedups are 17.38%, 17.97%, and
+17.41%; every independent session passes the 15% gate. Megatron's explicit
+source-gate-after common-semantics mean across the three sessions is
+22.3574 ms.
 These two Megatron results remain
 separate because its native path applies routing probability at a different
 point.
 
-The three MegaMOE stage means span Notify 0.596--0.605 ms, Dispatch
-1.960--1.962 ms, full FC1 6.920 ms, full FC2 5.204--5.209 ms,
-full M-block Return 5.256--5.259 ms, and full deterministic Reduce
-1.145--1.153 ms. These spans overlap and therefore must not be summed:
-device timestamps measure FC1/FC2 overlap at 0.366 ms, FC2/Return at
-5.015--5.020 ms, and Return/Reduce at 0.428--0.431 ms. Dispatch remains an
+The three MegaMOE stage means and complete distributions are stored in
+`benchmarks/results/forward_actual_weight_hash_world8.json`. These device
+intervals overlap and therefore must not be
+summed. Dispatch remains an
 initial bulk phase and is not claimed as hidden. The measured pool is
 2,847,625,512 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
 Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
-FP32 gates remain local. Cache mode uses 3,552,268,584 bytes/rank and measures
-16.1698 ms mean, 16.1625 ms P50, and 16.2435 ms P95: 1.2342 ms over the
-no-cache mean. Rank-0 output hashes are identical under EP1/EP2/EP8,
+FP32 gates remain local. The explicit main-shape cache lifecycle test uses two
+simultaneously live slots and measures 7,104,537,168 device bytes/rank. It
+checks disjoint A/B device intervals, stable gen1 bytes after gen2, exact
+pool exhaustion, and selective reuse after one handle is released. Rank-0
+output hashes are identical under EP1/EP2/EP8,
 cache/no-cache, release/debug, and 20 repeats. The independent NumPy FP64
 oracle checks selected main-shape output columns plus every cached A/B element;
-output error is zero and the cache max absolute/RMSE are 0.0008545/0.0003249
+output error is zero and the cache max absolute/RMSE are 0.0019531/0.0003182
 against fixed 0.02/0.008 limits. Byte identity with TransformerEngine's
 internal instruction order is intentionally not required.
+
+Fixture v3 computes every BF16 weight from a non-periodic 32-bit mix of
+`(global_expert_id, tensor_kind, output_row, input_col)` and maps the final bit
+to a stable random `{-1,+1}/256` value. The complete W1 and W2 device storage is
+hashed outside timing with fixed 4-Mi-element chunks and two independent
+64-bit modular reductions. MegaMOE and Megatron apply the same definition to
+the bytes their Forward kernels actually consume. The fair launcher rejects
+any per-rank W1 or W2 mismatch before timing; the formula-derived sample hash
+is retained only as generator/layout diagnostics.
 
 The production launch requests cluster dimension `2x1x1`; both inspected L20X
 hosts report cluster capability, `cudaOccupancyMaxActiveClusters=66`, and a
@@ -291,8 +301,12 @@ Python oracle. Every rank also reports header version, `ncclGetVersion` runtime
 version, `dladdr`-resolved library path, and active network overrides.
 
 The inspected hosts also require the CUDA 12.9 compatibility-driver directory
-in `LD_LIBRARY_PATH`; the colon-separated `--nccl-lib-dir` example passes both
-directories explicitly to local and remote ranks without changing the system.
+in `LD_LIBRARY_PATH`. `--nccl-lib-dir` parses a platform path-list: every entry
+is added to the loader search path, while the first entry that actually owns
+`libnccl.so.2` becomes `MEGAMOE_NCCL_LIBRARY`. Thus a CUDA compatibility-only
+directory is never incorrectly suffixed with `/libnccl.so.2`. Megatron loads
+that resolved file before importing PyTorch and reports both its path and
+`ncclGetVersion`; no `LD_PRELOAD` is needed.
 
 CUDA memory checking uses valid and invalid device mapping kernels without
 instrumenting the third-party NCCL library (this NCCL binary reports
@@ -319,13 +333,13 @@ export.
 For the real two-process IPC test, the launcher now reads the fixed 128-byte
 bootstrap frame and uses a bounded nonblocking trailing-byte check. This avoids
 waiting forever for EOF when Compute Sanitizer's subreaper retains an inherited
-write descriptor; every wait remains under the launcher timeout. The current
-real world-2 top-k=6 instrumentation attempt fails before any MegaMOE P2P
-kernel: Compute Sanitizer reports four
-`cudaErrorNoKernelImageForDevice` errors from NCCL 2.28.3
-`ncclInitKernelsForDevice/cudaFuncGetAttributes`. This is not represented as a
-clean full-P2P sanitizer pass and no suppression is installed. Normal world-2
-execution and the independent Python oracle pass. The NCCL-independent
+write descriptor; every wait remains under the launcher timeout. With the
+current tool/runtime pair, real world-2 top-k=6 racecheck reaches the production
+Forward kernel but reports peer-write/peer-read hazards across the two
+independently instrumented IPC processes. The accesses are ordered by a
+system-scope release/acquire epoch, but the report is not suppressed or
+represented as a clean racecheck pass. Normal world-2 execution, twenty-repeat
+bitwise checks, and the independent Python oracle pass. The NCCL-independent
 closed-loop device path, including transport worker and 73-node materializer,
 is covered by memcheck/racecheck/initcheck with 0 errors/hazards for all three.
 

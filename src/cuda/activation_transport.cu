@@ -1519,17 +1519,82 @@ __device__ std::uint32_t forward_fixture_mix32(std::uint32_t value) {
 __device__ std::uint16_t forward_fixture_weight_bits(
     std::uint32_t expert, std::uint32_t tensor_kind, std::uint64_t row,
     std::uint64_t column) {
-  auto key = expert * 0x9e3779b1U;
-  key ^= tensor_kind * 0x85ebca77U;
-  key ^= static_cast<std::uint32_t>(row / 1024ULL) * 0xc2b2ae3dU;
-  const auto row_salt = forward_fixture_mix32(key);
-  const auto signed_value = static_cast<int>(
-                                (row_salt +
-                                 static_cast<std::uint32_t>(column)) &
-                                15U) -
-                            8;
+  auto key = forward_fixture_mix32(expert ^ 0x9e3779b9U);
+  key ^= forward_fixture_mix32(tensor_kind ^ 0x85ebca6bU);
+  key ^= forward_fixture_mix32(static_cast<std::uint32_t>(row) ^
+                               0xc2b2ae35U);
+  key ^= forward_fixture_mix32(static_cast<std::uint32_t>(column) ^
+                               0x27d4eb2fU);
+  const auto signed_value =
+      static_cast<int>(forward_fixture_mix32(key) & 1U) * 2 - 1;
   return float_to_bf16_bits(static_cast<float>(signed_value) *
-                            (1.0F / 512.0F));
+                            (1.0F / 256.0F));
+}
+
+constexpr std::uint64_t kWeightHashChunkElements = 1ULL << 22U;
+constexpr std::uint64_t kWeightHashSeedLow = 0x243f6a8885a308d3ULL;
+constexpr std::uint64_t kWeightHashSeedHigh = 0x13198a2e03707344ULL;
+constexpr std::uint64_t kWeightHashMultiplierLow = 0x9e3779b185ebca87ULL;
+constexpr std::uint64_t kWeightHashMultiplierHigh = 0xc2b2ae3d27d4eb4fULL;
+
+struct WeightHashPair {
+  std::uint64_t low;
+  std::uint64_t high;
+};
+
+__device__ std::uint32_t weight_hash_mix(std::uint32_t value) {
+  return forward_fixture_mix32(value);
+}
+
+__global__ void hash_forward_weight_chunks_kernel(
+    const transport::BFloat16 *values, std::uint64_t elements,
+    WeightHashPair *chunks) {
+  __shared__ std::uint64_t low[256];
+  __shared__ std::uint64_t high[256];
+  const auto begin = static_cast<std::uint64_t>(blockIdx.x) *
+                     kWeightHashChunkElements;
+  const auto end = min(elements, begin + kWeightHashChunkElements);
+  std::uint64_t local_low = 0;
+  std::uint64_t local_high = 0;
+  for (auto index = begin + threadIdx.x; index < end; index += blockDim.x) {
+    const auto bits = static_cast<std::uint32_t>(values[index].bits);
+    const auto logical_index = static_cast<std::uint32_t>(index);
+    const auto mixed_low = weight_hash_mix(
+        bits ^ (logical_index * 0x9e3779b1U) ^ 0xa5a5f00dU);
+    const auto mixed_high = weight_hash_mix(
+        (bits << 16U) ^ (logical_index * 0x85ebca77U) ^ 0x5a5a0ff1U);
+    local_low += static_cast<std::uint64_t>(mixed_low) *
+                 kWeightHashMultiplierLow;
+    local_high += static_cast<std::uint64_t>(mixed_high) *
+                  kWeightHashMultiplierHigh;
+  }
+  low[threadIdx.x] = local_low;
+  high[threadIdx.x] = local_high;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset != 0U; offset /= 2U) {
+    if (threadIdx.x < offset) {
+      low[threadIdx.x] += low[threadIdx.x + offset];
+      high[threadIdx.x] += high[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    chunks[blockIdx.x] = {low[0], high[0]};
+}
+
+__global__ void finalize_forward_weight_hash_kernel(
+    const WeightHashPair *chunks, std::uint64_t chunk_count,
+    std::uint64_t elements, WeightHashPair *result) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  WeightHashPair value{
+      kWeightHashSeedLow ^ (elements * 0x100000001b3ULL),
+      kWeightHashSeedHigh ^ (elements * 0x9e3779b97f4a7c15ULL)};
+  for (std::uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
+    value.low += chunks[chunk].low;
+    value.high += chunks[chunk].high;
+  }
+  *result = value;
 }
 
 __global__ void initialize_forward_weights_kernel(
@@ -2545,6 +2610,13 @@ struct ForwardWeightLease::Impl {
   CUtensorMap w2_map{};
 };
 
+struct ForwardWeightStorageHashAccess {
+  static const ForwardWeightLease::Impl &get(
+      const ForwardWeightLease &weights) {
+    return *weights.impl_;
+  }
+};
+
 struct DeviceForwardHandle::Impl {
   std::shared_ptr<SlotLease> slot;
   std::shared_ptr<ActivationPoolState> pool;
@@ -2680,6 +2752,132 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
       impl->allocation->w2, intermediate_size,
       static_cast<std::uint64_t>(owned_experts) * hidden_size, 256, "W2");
   return ForwardWeightLease(std::move(impl));
+}
+
+ForwardWeightStorageHashes
+testing::hash_forward_weight_storage_for_validation(
+    const ForwardWeightLease &weights, const CudaExecution &execution) {
+  if (!weights || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle, "forward-weight-hash",
+                    "weights/execution", 0, "valid", "empty");
+  const auto &impl = ForwardWeightStorageHashAccess::get(weights);
+  const auto state = internal::checked_execution_state(execution);
+  if (state->device != impl.device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "forward-weight-hash", "device", 0,
+                    std::to_string(impl.device),
+                    std::to_string(state->device));
+  internal::throw_cuda(
+      "forward-weight-hash",
+      cudaStreamWaitEvent(state->stream, impl.allocation->ready, 0), 0, 1,
+      "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(weight ready)");
+
+  const auto hash_one = [&](const transport::BFloat16 *values,
+                            std::uint64_t elements,
+                            const char *field) -> DeviceStorageHash128 {
+    const auto chunk_count =
+        (elements + kWeightHashChunkElements - 1ULL) /
+        kWeightHashChunkElements;
+    const auto chunk_bytes = checked_size(
+        checked_mul(chunk_count, sizeof(WeightHashPair),
+                    "weight hash chunk bytes"),
+        "weight hash chunk bytes");
+    WeightHashPair *device_chunks = nullptr;
+    WeightHashPair *device_result = nullptr;
+    try {
+      internal::throw_cuda(
+          "forward-weight-hash", cudaMalloc(&device_chunks, chunk_bytes), 0,
+          1, "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+          "cudaMalloc(hash chunks)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+      internal::throw_cuda(
+          "forward-weight-hash",
+          cudaMalloc(&device_result, sizeof(WeightHashPair)), 0, 1,
+          "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+          "cudaMalloc(hash result)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+      hash_forward_weight_chunks_kernel<<<
+          static_cast<unsigned>(chunk_count), 256, 0, state->stream>>>(
+          values, elements, device_chunks);
+      internal::throw_cuda(
+          "forward-weight-hash", cudaGetLastError(), 0, 1,
+          "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+          field);
+      finalize_forward_weight_hash_kernel<<<1, 1, 0, state->stream>>>(
+          device_chunks, chunk_count, elements, device_result);
+      internal::throw_cuda(
+          "forward-weight-hash", cudaGetLastError(), 0, 1,
+          "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+          "finalize_forward_weight_hash_kernel");
+      WeightHashPair host{};
+      internal::throw_cuda(
+          "forward-weight-hash",
+          cudaMemcpyAsync(&host, device_result, sizeof(host),
+                          cudaMemcpyDeviceToHost, state->stream),
+          0, 1, "forward-weight-validation", 1,
+          ExchangeKind::ExpertCounts, "cudaMemcpyAsync(hash result)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                                sizeof(host));
+      internal::throw_cuda(
+          "forward-weight-hash", cudaStreamSynchronize(state->stream), 0, 1,
+          "forward-weight-validation", 1, ExchangeKind::ExpertCounts,
+          "cudaStreamSynchronize(hash result)");
+      (void)cudaFree(device_result);
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      (void)cudaFree(device_chunks);
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      return {host.low, host.high, elements};
+    } catch (...) {
+      if (device_result) {
+        (void)cudaFree(device_result);
+        internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      }
+      if (device_chunks) {
+        (void)cudaFree(device_chunks);
+        internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      }
+      throw;
+    }
+  };
+
+  const auto w1_elements = checked_mul(
+      checked_mul(impl.owned_experts, 2ULL, "W1 hash expert rows"),
+      checked_mul(impl.intermediate, impl.hidden, "W1 hash expert elements"),
+      "W1 hash elements");
+  const auto w2_elements = checked_mul(
+      impl.owned_experts,
+      checked_mul(impl.hidden, impl.intermediate,
+                  "W2 hash expert elements"),
+      "W2 hash elements");
+  ForwardWeightStorageHashes hashes;
+  hashes.w1 = hash_one(impl.w1, w1_elements,
+                       "hash_forward_weight_chunks_kernel(W1)");
+  hashes.w2 = hash_one(impl.w2, w2_elements,
+                       "hash_forward_weight_chunks_kernel(W2)");
+  const auto w1_expert_elements = checked_mul(
+      2ULL, checked_mul(impl.intermediate, impl.hidden,
+                        "sample W1 expert elements"),
+      "sample W1 expert elements");
+  const auto w2_expert_elements = checked_mul(
+      impl.hidden, impl.intermediate, "sample W2 expert elements");
+  std::array<std::uint32_t, 3> sampled_experts{
+      0U, impl.owned_experts / 2U, impl.owned_experts - 1U};
+  for (const auto local_expert : sampled_experts) {
+    hashes.sampled_w1_experts.push_back(hash_one(
+        impl.w1 + local_expert * w1_expert_elements, w1_expert_elements,
+        "hash_forward_weight_chunks_kernel(W1 expert)"));
+    hashes.sampled_w2_experts.push_back(hash_one(
+        impl.w2 + local_expert * w2_expert_elements, w2_expert_elements,
+        "hash_forward_weight_chunks_kernel(W2 expert)"));
+  }
+  std::array<std::uint64_t, 4> sampled_rows{
+      0ULL, 1ULL, impl.hidden / 2ULL, impl.hidden - 1ULL};
+  for (const auto row : sampled_rows)
+    hashes.sampled_w2_output_rows.push_back(hash_one(
+        impl.w2 + row * impl.intermediate, impl.intermediate,
+        "hash_forward_weight_chunks_kernel(W2 output row)"));
+  return hashes;
 }
 
 constexpr std::uint64_t kLocalP2pBootstrapMagic = 0x31504350454f4d4dULL;
@@ -4474,6 +4672,44 @@ std::vector<transport::BFloat16> download_forward_cache_for_validation(
                               plane_bytes * 2ULL);
   }
   return output;
+}
+
+bool testing_forward_cache_ranges_disjoint(
+    const DeviceForwardHandle &left, const DeviceForwardHandle &right) {
+  if (!left || !right)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "forward-cache-isolation", "handle", 0,
+                    "two valid handles", "empty");
+  const auto &a = *left.impl_;
+  const auto &b = *right.impl_;
+  if (a.cache_mode != ForwardCacheMode::CacheFc1InputOutput ||
+      b.cache_mode != ForwardCacheMode::CacheFc1InputOutput)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "forward-cache-isolation", "cache_mode", 0,
+                    "CacheFc1InputOutput", "disabled");
+  const auto bytes_for = [](const DeviceForwardHandle::Impl &impl) {
+    return checked_size(
+        checked_mul(
+            checked_mul(impl.pool->config.max_destination_rows_per_rank,
+                        impl.intermediate, "cache isolation plane elements"),
+            2ULL * sizeof(transport::BFloat16),
+            "cache isolation bytes"),
+        "cache isolation bytes");
+  };
+  const auto a_begin = reinterpret_cast<std::uintptr_t>(
+      at<void>(a.pool->slots[a.slot->index].device,
+               a.pool->layout.forward_ab_cache));
+  const auto b_begin = reinterpret_cast<std::uintptr_t>(
+      at<void>(b.pool->slots[b.slot->index].device,
+               b.pool->layout.forward_ab_cache));
+  const auto a_bytes = bytes_for(a);
+  const auto b_bytes = bytes_for(b);
+  if (a_begin > std::numeric_limits<std::uintptr_t>::max() - a_bytes ||
+      b_begin > std::numeric_limits<std::uintptr_t>::max() - b_bytes)
+    transport_error(NotifyErrorCode::ArithmeticOverflow,
+                    "forward-cache-isolation", "address range", 0,
+                    "checked native interval", "overflow");
+  return a_begin + a_bytes <= b_begin || b_begin + b_bytes <= a_begin;
 }
 
 const ActivationTransportExpectation &

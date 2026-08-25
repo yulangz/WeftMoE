@@ -39,13 +39,14 @@ def mix32(value):
 
 
 def weight(expert, kind, rows, columns):
-    base = np.uint32(((expert * 0x9E3779B1) ^
-                      (kind * 0x85EBCA77)) & 0xffffffff)
-    row_group = np.asarray(rows, dtype=np.uint32) // np.uint32(1024)
-    key = base ^ row_group * np.uint32(0xC2B2AE3D)
-    row_salt = mix32(key)
-    return (((row_salt + np.asarray(columns, dtype=np.uint32)) &
-             np.uint32(15)).astype(np.int32) - 8).astype(np.float64) / 512.0
+    rows = np.asarray(rows, dtype=np.uint32)
+    columns = np.asarray(columns, dtype=np.uint32)
+    key = (mix32(np.uint32(expert) ^ np.uint32(0x9E3779B9)) ^
+           mix32(np.uint32(kind) ^ np.uint32(0x85EBCA6B)) ^
+           mix32(rows ^ np.uint32(0xC2B2AE35)) ^
+           mix32(columns ^ np.uint32(0x27D4EB2F)))
+    return ((mix32(key) & np.uint32(1)).astype(np.int32) * 2 - 1).astype(
+        np.float64) / 256.0
 
 
 def float32_to_bf16_bits(values):
@@ -76,11 +77,13 @@ def selected_gates(token):
 def sampled_weight_hash(expert, kind):
     """FNV-1a over public, canonical coordinates for fixture evidence."""
     if kind == 1:
-        coordinates = ((0, 0), (1, 17), (INTERMEDIATE, HIDDEN - 1),
-                       (2 * INTERMEDIATE - 1, HIDDEN // 2))
+        coordinates = (((sample * 7919 + 5) % (2 * INTERMEDIATE),
+                        (sample * 104729 + 17) % HIDDEN)
+                       for sample in range(32))
     else:
-        coordinates = ((0, 0), (17, 1), (HIDDEN // 2, INTERMEDIATE - 1),
-                       (HIDDEN - 1, INTERMEDIATE // 2))
+        coordinates = (((sample * 65537 + 11) % HIDDEN,
+                        (sample * 8191 + 3) % INTERMEDIATE)
+                       for sample in range(32))
     result = 1469598103934665603
     for row, column in coordinates:
         bits = int(float32_to_bf16_bits(weight(
@@ -160,6 +163,15 @@ def main():
     output_bits = output_bits.reshape(len(ROUTES), HIDDEN)
     actual_output = bf16_bits_to_float64(
         output_bits[:, np.asarray(OUTPUT_COLUMNS)])
+    selected_unique_values = np.unique(
+        output_bits[:, np.asarray(OUTPUT_COLUMNS)]).size
+    first_token_full_unique_values = np.unique(output_bits[0]).size
+    if selected_unique_values < len(OUTPUT_COLUMNS):
+        raise RuntimeError(
+            "selected oracle outputs are insufficiently diverse: "
+            f"unique={selected_unique_values}")
+    if first_token_full_unique_values <= 1:
+        raise RuntimeError("7168-column output collapsed to one value")
     output_metrics = metrics(
         actual_output.reshape(-1), combined_reference.reshape(-1),
         [f"output[{token},{column}]" for token in range(len(ROUTES))
@@ -213,6 +225,14 @@ def main():
             "relative_floor": RELATIVE_FLOOR,
             "max_relative": MAX_RELATIVE},
         "output": output_metrics,
+        "output_diversity": {
+            "selected_coordinate_unique_bf16_values":
+                int(selected_unique_values),
+            "first_token_7168_column_unique_bf16_values":
+                int(first_token_full_unique_values),
+            "selected_tokens": len(ROUTES),
+            "selected_expert_routes": sum(len(routes) for routes in ROUTES),
+        },
         "fc1_cache": cache_metrics,
         "expert_weight_sample_hashes": sample_hashes,
         "passed": passed,

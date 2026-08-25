@@ -269,6 +269,7 @@ def main():
     parser.add_argument("--forward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
     parser.add_argument("--forward-cache", action="store_true")
+    parser.add_argument("--forward-cache-pool2-validation", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
@@ -295,6 +296,12 @@ def main():
     if args.forward_cache:
         if not (args.forward_benchmark or args.forward_smoke):
             parser.error("--forward-cache requires a Forward mode")
+        environment["MEGAMOE_FORWARD_CACHE"] = "1"
+    if args.forward_cache_pool2_validation:
+        if not args.forward_benchmark:
+            parser.error("--forward-cache-pool2-validation requires "
+                         "--forward-benchmark")
+        environment["MEGAMOE_FORWARD_CACHE_POOL2_VALIDATE"] = "1"
         environment["MEGAMOE_FORWARD_CACHE"] = "1"
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
@@ -368,9 +375,15 @@ def main():
                         process.kill()
                         process.wait()
                 stdout, stderr = captured_text(captures[failed])
+                sanitizer = ""
+                if args.compute_sanitizer_tool:
+                    sanitizer = "\n".join(
+                        line for line in stdout.splitlines()
+                        if line.startswith("========="))[-12000:]
                 raise RuntimeError(
                     f"rank={failed} exited early "
                     f"code={processes[failed].returncode} "
+                    f"sanitizer={sanitizer} "
                     f"stdout_tail={stdout[-1000:]} stderr_tail={stderr[-3000:]}")
             if all(process.poll() is not None for process in processes):
                 break
@@ -394,7 +407,8 @@ def main():
             if process.returncode != 0:
                 sanitizer = "\n".join(
                     line for line in stdout.splitlines()
-                    if ("=========" in line or "Invalid" in line or
+                    if (line.startswith("=========") or "Invalid" in line or
+                        "Error:" in line or
                         "uninitialized" in line.lower() or
                         "hazard" in line.lower()))[-12000:]
                 raise RuntimeError(
@@ -431,6 +445,9 @@ def main():
                     runtime = parse_fields(stdout, "NCCL_RUNTIME ")
                     item["_nccl_runtime"] = runtime["runtime"]
                     item["_nccl_library"] = runtime["library"]
+                    if args.forward_cache_pool2_validation:
+                        item["_cache_pool2"] = parse_fields(
+                            stdout, "FORWARD_CACHE_POOL2 ")
                 observed.append(item)
         if args.forward_smoke:
             hashes = [item["output_hash"] for item in observed]
@@ -484,7 +501,9 @@ def main():
                     "benchmark": "single-persistent-forward-main-shape",
                     "world": args.world,
                     "cache_mode": ("cache-fc1-input-output"
-                                   if args.forward_cache else "no-cache"),
+                                   if (args.forward_cache or
+                                       args.forward_cache_pool2_validation)
+                                   else "no-cache"),
                     "warmup": 10,
                     "measured": args.rounds - 10,
                     "shape": {"tokens_per_rank": 8192, "hidden": 7168,
@@ -500,6 +519,9 @@ def main():
                         int(item["return_peer_bytes"]) for item in observed],
                     "per_rank_output_hash": [
                         item["output_hash"] for item in observed],
+                    "per_rank_first_token_output_unique_at_least": [
+                        int(item["first_token_output_unique_at_least"])
+                        for item in observed],
                     "per_rank_activation_hash": [
                         int(item["activation_hash"]) for item in observed],
                     "per_rank_route_hash": [
@@ -508,6 +530,16 @@ def main():
                         int(item["gate_hash"]) for item in observed],
                     "per_rank_weight_sample_hash": [
                         int(item["weight_hash"]) for item in observed],
+                    "weight_generator_version": int(
+                        observed[0]["weight_generator_version"]),
+                    "per_rank_actual_w1_device_hash": [
+                        [int(item["actual_w1_hash_low"]),
+                         int(item["actual_w1_hash_high"])]
+                        for item in observed],
+                    "per_rank_actual_w2_device_hash": [
+                        [int(item["actual_w2_hash_low"]),
+                         int(item["actual_w2_hash_high"])]
+                        for item in observed],
                     "per_rank_cluster_supported": [
                         int(item["cluster_supported"]) for item in observed],
                     "per_rank_cluster_requested": [
@@ -527,6 +559,8 @@ def main():
                                            for item in observed],
                     "per_rank_tma_multicast_loads": [
                         int(item["multicast"]) for item in observed],
+                    "per_rank_cache_pool2_validation": [
+                        item.get("_cache_pool2") for item in observed],
                     "per_rank_nccl_runtime": [
                         item["_nccl_runtime"] for item in observed],
                     "per_rank_nccl_library": [

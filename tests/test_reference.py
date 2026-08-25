@@ -1,7 +1,12 @@
 import json
+import os
 import struct
+import tempfile
 import unittest
 from pathlib import Path
+
+from benchmarks.nccl_library import configure_nccl_library
+from benchmarks.run_integrated_comparison import verify_fixture_agreement
 
 from reference.notify_dispatch_reference import (
     ReferenceConfig,
@@ -24,6 +29,36 @@ def config(nodes=2, gpus=2, experts=8, top_k=2, mtile=4):
 
 
 class RankLocalReferenceTest(unittest.TestCase):
+    def test_nccl_library_path_list_resolution(self):
+        with tempfile.TemporaryDirectory() as nccl_dir, \
+             tempfile.TemporaryDirectory() as compat_dir:
+            library = Path(nccl_dir) / "libnccl.so.2"
+            library.touch()
+            environment = {"LD_LIBRARY_PATH": "/existing"}
+            resolved = configure_nccl_library(
+                environment, os.pathsep.join((compat_dir, nccl_dir)))
+            self.assertEqual(resolved, str(library))
+            self.assertEqual(environment["MEGAMOE_NCCL_LIBRARY"],
+                             str(library))
+            self.assertEqual(environment["LD_LIBRARY_PATH"].split(
+                os.pathsep), [compat_dir, nccl_dir, "/existing"])
+
+    def test_actual_device_weight_hash_mismatch_is_fatal(self):
+        base = {
+            "weight_generator_version": 3,
+            "per_rank_activation_hash": [1],
+            "per_rank_route_hash": [2],
+            "per_rank_gate_hash": [3],
+            "per_rank_weight_sample_hash": [4],
+            "per_rank_actual_w1_device_hash": [[5, 6]],
+            "per_rank_actual_w2_device_hash": [[7, 8]],
+        }
+        foreign = dict(base)
+        foreign["per_rank_actual_w1_device_hash"] = [[5, 9]]
+        with self.assertRaisesRegex(RuntimeError,
+                                    "actual_w1_device_hash"):
+            verify_fixture_agreement([base], [foreign])
+
     def test_dynamic_gate_fixture_hashes(self):
         fixture = json.loads((Path(__file__).parents[1] / "benchmarks" /
                               "dynamic_gate_fixture.json").read_text())

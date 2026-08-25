@@ -99,9 +99,9 @@ Still required before phase 4 closes:
 
 The current main-shape release specialization passes the phase performance
 gate on the inspected eight-GPU host: three independent 10-warmup/100-sample
-runs with the shared expert-aware fixture measured 14.9338, 14.9344, and
-14.9387 ms versus Megatron native 18.2190, 18.3069, and 18.1783 ms, or 18.03%,
-18.42%, and 17.82% improvement. The implementation is bitwise stable across
+runs with the shared actual-device-byte fixture measured 15.2538, 15.2652,
+and 15.2611 ms versus Megatron native 18.4617, 18.6098, and 18.4789 ms, or
+17.38%, 17.97%, and 17.41% improvement. The implementation is bitwise stable across
 EP1/EP2/EP8, cache modes, build modes, and repeats, and the independent NumPy
 FP64 oracle meets the fixed BF16/WGMMA tolerance.
 Phase 5 is ready for verification; clustered weight multicast/weight reuse and

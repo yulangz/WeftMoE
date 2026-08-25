@@ -135,28 +135,76 @@ def fixture_mix32(value):
                              0xffffffff)
 
 
+WEIGHT_HASH_CHUNK_ELEMENTS = 1 << 22
+WEIGHT_HASH_SEED_LOW = 0x243F6A8885A308D3
+WEIGHT_HASH_SEED_HIGH = 0x13198A2E03707344
+WEIGHT_HASH_MULTIPLIER_LOW = 0x9E3779B185EBCA87
+WEIGHT_HASH_MULTIPLIER_HIGH = 0xC2B2AE3D27D4EB4F
+
+
+def _signed_u64(value):
+    value &= (1 << 64) - 1
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+@torch.no_grad()
+def actual_device_bf16_hash(tensors):
+    """Hash complete device BF16 storage with MegaMOE's fixed definition."""
+    tensors = [tensor.detach().contiguous().view(torch.uint16).view(-1)
+               for tensor in tensors]
+    elements = sum(tensor.numel() for tensor in tensors)
+    low = (WEIGHT_HASH_SEED_LOW ^
+           (elements * 0x100000001B3)) & ((1 << 64) - 1)
+    high = (WEIGHT_HASH_SEED_HIGH ^
+            (elements * 0x9E3779B97F4A7C15)) & ((1 << 64) - 1)
+    logical_offset = 0
+    for bits in tensors:
+        for offset in range(0, bits.numel(), WEIGHT_HASH_CHUNK_ELEMENTS):
+            end = min(bits.numel(), offset + WEIGHT_HASH_CHUNK_ELEMENTS)
+            index = torch.arange(logical_offset + offset,
+                                 logical_offset + end,
+                                 dtype=torch.int64, device=bits.device)
+            values = bits[offset:end].to(torch.int64)
+            low_key = (values ^ torch.bitwise_and(
+                index * 0x9E3779B1, 0xffffffff) ^ 0xA5A5F00D)
+            high_key = ((values << 16) ^ torch.bitwise_and(
+                index * 0x85EBCA77, 0xffffffff) ^ 0x5A5A0FF1)
+            low_term = fixture_mix32(low_key) * _signed_u64(
+                WEIGHT_HASH_MULTIPLIER_LOW)
+            high_term = fixture_mix32(high_key) * _signed_u64(
+                WEIGHT_HASH_MULTIPLIER_HIGH)
+            low = (low + int(low_term.sum(dtype=torch.int64).item())) & (
+                (1 << 64) - 1)
+            high = (high + int(high_term.sum(dtype=torch.int64).item())) & (
+                (1 << 64) - 1)
+        logical_offset += bits.numel()
+    return [low, high]
+
+
 def forward_fixture_values(global_expert, tensor_kind, row, column):
-    scalar_key = ((global_expert * 0x9e3779b1) ^
-                  (tensor_kind * 0x85ebca77)) & 0xffffffff
-    key = torch.full_like(row, scalar_key, dtype=torch.int64)
-    key = key ^ torch.bitwise_and(torch.div(
-        row, 1024, rounding_mode="floor") * 0xc2b2ae3d, 0xffffffff)
-    row_salt = fixture_mix32(key)
-    signed = torch.bitwise_and(row_salt + column, 15).to(torch.int32) - 8
-    return (signed.float() / 512.0).to(torch.bfloat16)
+    key = fixture_mix32(torch.full_like(
+        row, global_expert ^ 0x9e3779b9, dtype=torch.int64))
+    key = key ^ fixture_mix32(torch.full_like(
+        row, tensor_kind ^ 0x85ebca6b, dtype=torch.int64))
+    key = key ^ fixture_mix32(torch.bitwise_xor(row, 0xc2b2ae35))
+    key = key ^ fixture_mix32(torch.bitwise_xor(column, 0x27d4eb2f))
+    signed = (torch.bitwise_and(fixture_mix32(key), 1).to(torch.int32) * 2 - 1)
+    return (signed.float() / 256.0).to(torch.bfloat16)
 
 
 def forward_weight_sample_hash(expert_begin, expert_count, hidden,
                                intermediate):
     value = 1469598103934665603
-    samples = (
-        (1, ((0, 0), (1, 17), (intermediate, hidden - 1),
-             (2 * intermediate - 1, hidden // 2))),
-        (2, ((0, 0), (17, 1), (hidden // 2, intermediate - 1),
-             (hidden - 1, intermediate // 2))),
-    )
     for expert in range(expert_begin, expert_begin + expert_count):
-        for tensor_kind, coordinates in samples:
+        coordinates_by_tensor = (
+            (1, (((sample * 7919 + 5) % (2 * intermediate),
+                  (sample * 104729 + 17) % hidden)
+                 for sample in range(32))),
+            (2, (((sample * 65537 + 11) % hidden,
+                  (sample * 8191 + 3) % intermediate)
+                 for sample in range(32))),
+        )
+        for tensor_kind, coordinates in coordinates_by_tensor:
             for row, column in coordinates:
                 bits = int(forward_fixture_values(
                     expert, tensor_kind, torch.tensor([row], dtype=torch.int64),
@@ -172,6 +220,7 @@ def initialize_megamoe_forward_weights(module, global_expert_begin,
                                         hidden, intermediate):
     """Load the exact BF16 fixture used by MegaMOE's device initializer."""
     chunk = 4 * 1024 * 1024
+    actual_parameters = {"w1": [], "w2": []}
     for name, parameter in module.named_parameters():
         if "bias" in name:
             parameter.zero_()
@@ -184,10 +233,12 @@ def initialize_megamoe_forward_weights(module, global_expert_begin,
             expected = 2 * intermediate * hidden
             tensor_kind = 1
             row_width = hidden
+            tensor_name = "w1"
         elif "linear_fc2" in name:
             expected = hidden * intermediate
             tensor_kind = 2
             row_width = intermediate
+            tensor_name = "w2"
         else:
             raise RuntimeError(f"unexpected expert parameter: {name}")
         if parameter.numel() != expected:
@@ -203,6 +254,10 @@ def initialize_megamoe_forward_weights(module, global_expert_begin,
                 global_expert, tensor_kind,
                 torch.div(index, row_width, rounding_mode="floor"),
                 torch.remainder(index, row_width)))
+        actual_parameters[tensor_name].append((local_expert, parameter))
+    for tensor_name in actual_parameters:
+        actual_parameters[tensor_name].sort(key=lambda item: item[0])
+    return actual_parameters
 
 
 def loaded_nccl_libraries():
@@ -285,6 +340,7 @@ def main():
         get_default_pg_collection(),
     )
     experts_module = None
+    actual_weight_parameters = None
     if args.expert_body == "te-grouped-mlp":
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=args.experts, moe_grouped_gemm=True,
@@ -292,11 +348,11 @@ def main():
         experts_builder = layer_spec.submodules.mlp.submodules.experts
         experts_module = experts_builder(
             local_experts, config, pg_collection=get_default_pg_collection())
-        initialize_megamoe_forward_weights(
+        actual_weight_parameters = initialize_megamoe_forward_weights(
             experts_module, rank * local_experts, args.hidden,
             args.intermediate)
 
-    # Shared MegaMOE/Megatron BF16 fixture v2. Rank and flat index enter the
+    # Shared MegaMOE/Megatron BF16 fixture v3. Rank and flat index enter the
     # same expression on both implementations before the BF16 cast.
     flat = torch.arange(args.tokens * args.hidden, dtype=torch.int32,
                         device="cuda")
@@ -321,14 +377,44 @@ def main():
     route_hash = i32_hash(selected.to(torch.int32))
     weight_hash = forward_weight_sample_hash(
         rank * local_experts, local_experts, args.hidden, args.intermediate)
+    actual_w1_hash = None
+    actual_w2_hash = None
+    if actual_weight_parameters is not None:
+        w1_parameters = [item[1]
+                         for item in actual_weight_parameters["w1"]]
+        w2_parameters = [item[1]
+                         for item in actual_weight_parameters["w2"]]
+        actual_w1_hash = actual_device_bf16_hash(w1_parameters)
+        actual_w2_hash = actual_device_bf16_hash(w2_parameters)
+        sampled_indices = (0, len(w1_parameters) // 2,
+                           len(w1_parameters) - 1)
+        sampled_w1 = [actual_device_bf16_hash([w1_parameters[index]])
+                      for index in sampled_indices]
+        sampled_w2 = [actual_device_bf16_hash([w2_parameters[index]])
+                      for index in sampled_indices]
+        if len({tuple(value) for value in sampled_w1}) != len(sampled_w1):
+            raise RuntimeError("actual W1 device storage is not expert-distinct")
+        if len({tuple(value) for value in sampled_w2}) != len(sampled_w2):
+            raise RuntimeError("actual W2 device storage is not expert-distinct")
+        first_w2 = w2_parameters[0].view(-1)
+        sampled_rows = (0, 1, args.hidden // 2, args.hidden - 1)
+        row_hashes = [actual_device_bf16_hash([
+            first_w2[row * args.intermediate:(row + 1) * args.intermediate]])
+            for row in sampled_rows]
+        if len({tuple(value) for value in row_hashes}) != len(row_hashes):
+            raise RuntimeError("actual W2 output rows are not distinct")
     activation_hashes = [None] * world
     route_hashes = [None] * world
     gate_hashes = [None] * world
     weight_hashes = [None] * world
+    actual_w1_hashes = [None] * world
+    actual_w2_hashes = [None] * world
     dist.all_gather_object(activation_hashes, activation_hash)
     dist.all_gather_object(route_hashes, route_hash)
     dist.all_gather_object(gate_hashes, gate_hash)
     dist.all_gather_object(weight_hashes, weight_hash)
+    dist.all_gather_object(actual_w1_hashes, actual_w1_hash)
+    dist.all_gather_object(actual_w2_hashes, actual_w2_hash)
     selected_gates = selected_gates_cpu.to(device="cuda")
     probabilities.scatter_(1, selected, selected_gates)
 
@@ -559,8 +645,9 @@ def main():
         "expert_body": args.expert_body,
         "gemm_backend": ("TransformerEngine TEGroupedMLP"
                          if experts_module is not None else "none"),
-        "weight_fixture": ("MegaMOE expert-aware hash BF16 v2"
+        "weight_fixture": ("MegaMOE four-coordinate PRNG BF16 v3"
                            if experts_module is not None else "none"),
+        "weight_generator_version": 3 if experts_module is not None else None,
         "activation_fixture": "MegaMOE rank-flat BF16 v2",
         "per_rank_activation_hash": activation_hashes,
         "per_rank_route_hash": route_hashes,
@@ -568,6 +655,8 @@ def main():
         "gate_seed": "0x4d4547414d4f4547",
         "per_rank_gate_hash": gate_hashes,
         "per_rank_weight_sample_hash": weight_hashes,
+        "per_rank_actual_w1_device_hash": actual_w1_hashes,
+        "per_rank_actual_w2_device_hash": actual_w2_hashes,
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
             "sum; final BF16 cast"),

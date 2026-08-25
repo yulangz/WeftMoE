@@ -253,6 +253,21 @@ private:
   testing::make_deterministic_forward_weights_for_testing(
       std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t,
       const CollectiveSession &, const CudaExecution &);
+  friend struct ForwardWeightStorageHashAccess;
+};
+
+struct DeviceStorageHash128 {
+  std::uint64_t low = 0;
+  std::uint64_t high = 0;
+  std::uint64_t element_count = 0;
+};
+
+struct ForwardWeightStorageHashes {
+  DeviceStorageHash128 w1;
+  DeviceStorageHash128 w2;
+  std::vector<DeviceStorageHash128> sampled_w1_experts;
+  std::vector<DeviceStorageHash128> sampled_w2_experts;
+  std::vector<DeviceStorageHash128> sampled_w2_output_rows;
 };
 
 struct ForwardMegaKernelTimings {
@@ -310,6 +325,8 @@ private:
   friend std::vector<transport::BFloat16>
   download_forward_cache_for_validation(const DeviceForwardHandle &,
                                         const CudaExecution &);
+  friend bool testing_forward_cache_ranges_disjoint(
+      const DeviceForwardHandle &, const DeviceForwardHandle &);
 };
 
 class LocalCudaP2pForwardMegaKernel {
@@ -337,6 +354,11 @@ download_forward_output_for_validation(const DeviceForwardHandle &handle,
 std::vector<transport::BFloat16>
 download_forward_cache_for_validation(const DeviceForwardHandle &handle,
                                       const CudaExecution &execution);
+
+// Test-only predicate. It validates real device address intervals internally
+// without exposing either native pointer to the caller.
+bool testing_forward_cache_ranges_disjoint(const DeviceForwardHandle &left,
+                                           const DeviceForwardHandle &right);
 
 struct ActivationTransportValidationDownload {
   std::vector<transport::BFloat16> contribution_by_route;
@@ -381,6 +403,12 @@ ForwardWeightLease make_deterministic_forward_weights_for_testing(
     std::uint32_t owned_experts, std::uint32_t global_expert_begin,
     std::uint64_t hidden_size, std::uint64_t intermediate_size,
     const CollectiveSession &session, const CudaExecution &execution);
+
+// Validation-only hash of the complete BF16 storage which the Forward kernel
+// will consume. The device performs a fixed-size chunk reduction over actual
+// bytes; only the two 64-bit results per tensor are copied to the host.
+ForwardWeightStorageHashes hash_forward_weight_storage_for_validation(
+    const ForwardWeightLease &weights, const CudaExecution &execution);
 
 // Executes a true device-issued store through a peer mapping and observes a
 // system-scope release/acquire signal. It is a capability/correctness probe,

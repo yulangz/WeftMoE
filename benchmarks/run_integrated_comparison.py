@@ -13,6 +13,36 @@ import statistics
 import subprocess
 import sys
 
+try:
+    from .nccl_library import configure_nccl_library
+except ImportError:
+    from nccl_library import configure_nccl_library
+
+
+FIXTURE_FIELDS = (
+    "weight_generator_version",
+    "per_rank_activation_hash", "per_rank_route_hash",
+    "per_rank_gate_hash", "per_rank_weight_sample_hash",
+    "per_rank_actual_w1_device_hash", "per_rank_actual_w2_device_hash")
+
+
+def verify_fixture_agreement(mega_runs, megatron_launches):
+    agreement = {}
+    for field in FIXTURE_FIELDS:
+        mega_values = mega_runs[0].get(field)
+        for run_index, run_record in enumerate(mega_runs):
+            if run_record.get(field) != mega_values:
+                raise RuntimeError(
+                    f"MegaMOE fixture changed field={field} run={run_index}")
+        for run_index, launch in enumerate(megatron_launches):
+            actual = launch.get(field)
+            if actual != mega_values:
+                raise RuntimeError(
+                    f"fixture mismatch field={field} run={run_index} "
+                    f"MegaMOE={mega_values} Megatron={actual}")
+        agreement[field] = mega_values
+    return agreement
+
 
 def extract(output, marker):
     lines = [line for line in output.splitlines() if line.startswith(marker)]
@@ -50,11 +80,7 @@ def main():
     environment = os.environ.copy()
     environment["NCCL_DEBUG"] = "WARN"
     if args.nccl_lib_dir:
-        current = environment.get("LD_LIBRARY_PATH", "")
-        environment["LD_LIBRARY_PATH"] = (
-            args.nccl_lib_dir + (":" + current if current else ""))
-        environment["MEGAMOE_NCCL_LIBRARY"] = os.path.join(
-            args.nccl_lib_dir, "libnccl.so.2")
+        configure_nccl_library(environment, args.nccl_lib_dir)
 
     mega_runs = []
     for _run_index in range(args.runs):
@@ -122,23 +148,8 @@ def main():
     per_run_native_speedup = [
         (native - mega) / native * 100.0
         for native, mega in zip(megatron_native_means, mega_means_ms)]
-    fixture_fields = (
-        "per_rank_activation_hash", "per_rank_route_hash",
-        "per_rank_gate_hash", "per_rank_weight_sample_hash")
-    fixture_agreement = {}
-    for field in fixture_fields:
-        mega_values = mega_runs[0].get(field)
-        for run_index, run_record in enumerate(mega_runs):
-            if run_record.get(field) != mega_values:
-                raise RuntimeError(
-                    f"MegaMOE fixture changed field={field} run={run_index}")
-        for run_index, launch in enumerate(megatron_launches):
-            actual = launch.get(field)
-            if actual != mega_values:
-                raise RuntimeError(
-                    f"fixture mismatch field={field} run={run_index} "
-                    f"MegaMOE={mega_values} Megatron={actual}")
-        fixture_agreement[field] = mega_values
+    fixture_agreement = verify_fixture_agreement(
+        mega_runs, megatron_launches)
     result = {
         "schema": 1,
         "comparison": "single-node-8-rank-full-forward-integrated-host-wall",

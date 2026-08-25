@@ -171,17 +171,15 @@ std::uint16_t fixture_weight_bits(std::uint32_t expert,
                                   std::uint32_t tensor_kind,
                                   std::uint64_t row,
                                   std::uint64_t column) {
-  auto key = expert * 0x9e3779b1U;
-  key ^= tensor_kind * 0x85ebca77U;
-  key ^= static_cast<std::uint32_t>(row / 1024ULL) * 0xc2b2ae3dU;
-  const auto row_salt = fixture_mix32_host(key);
-  const auto signed_value = static_cast<int>(
-                                (row_salt +
-                                 static_cast<std::uint32_t>(column)) &
-                                15U) -
-                            8;
+  auto key = fixture_mix32_host(expert ^ 0x9e3779b9U);
+  key ^= fixture_mix32_host(tensor_kind ^ 0x85ebca6bU);
+  key ^= fixture_mix32_host(static_cast<std::uint32_t>(row) ^ 0xc2b2ae35U);
+  key ^=
+      fixture_mix32_host(static_cast<std::uint32_t>(column) ^ 0x27d4eb2fU);
+  const auto signed_value =
+      static_cast<int>(fixture_mix32_host(key) & 1U) * 2 - 1;
   return megamoe::transport::float_to_bfloat16(
-             static_cast<float>(signed_value) / 512.0F)
+             static_cast<float>(signed_value) / 256.0F)
       .bits;
 }
 
@@ -190,21 +188,19 @@ std::uint64_t forward_weight_sample_hash(std::uint32_t expert_begin,
                                          std::uint64_t hidden,
                                          std::uint64_t intermediate) {
   std::uint64_t hash = 1469598103934665603ULL;
-  const std::array<std::pair<std::uint64_t, std::uint64_t>, 4> w1_samples{{
-      {0, 0}, {1, 17}, {intermediate, hidden - 1},
-      {2 * intermediate - 1, hidden / 2}}};
-  const std::array<std::pair<std::uint64_t, std::uint64_t>, 4> w2_samples{{
-      {0, 0}, {17, 1}, {hidden / 2, intermediate - 1},
-      {hidden - 1, intermediate / 2}}};
   for (std::uint32_t local = 0; local < expert_count; ++local) {
     const auto expert = expert_begin + local;
-    for (const auto [row, column] : w1_samples) {
+    for (std::uint64_t sample = 0; sample < 32ULL; ++sample) {
+      const auto row = (sample * 7919ULL + 5ULL) % (2ULL * intermediate);
+      const auto column = (sample * 104729ULL + 17ULL) % hidden;
       const auto bits = fixture_weight_bits(expert, 1U, row, column);
       hash = (hash ^ static_cast<std::uint8_t>(bits)) * 1099511628211ULL;
       hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) *
              1099511628211ULL;
     }
-    for (const auto [row, column] : w2_samples) {
+    for (std::uint64_t sample = 0; sample < 32ULL; ++sample) {
+      const auto row = (sample * 65537ULL + 11ULL) % hidden;
+      const auto column = (sample * 8191ULL + 3ULL) % intermediate;
       const auto bits = fixture_weight_bits(expert, 2U, row, column);
       hash = (hash ^ static_cast<std::uint8_t>(bits)) * 1099511628211ULL;
       hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) *
@@ -1983,6 +1979,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       scenario == "activation_integrated_bench";
   const auto forward_smoke = scenario == "forward_smoke";
   const auto benchmark_forward = scenario == "forward_bench";
+  const auto validate_main_cache_pool2 =
+      benchmark_forward &&
+      std::getenv("MEGAMOE_FORWARD_CACHE_POOL2_VALIDATE") != nullptr;
   const auto benchmark_shape =
       benchmark_p2p || benchmark_integrated || benchmark_forward;
   auto experts = std::max<std::uint32_t>(16, world * 2);
@@ -2071,7 +2070,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution,
-      {common_config, max_tokens, 4096, forward_smoke ? 3U : 2U});
+      {common_config, max_tokens, 4096,
+       forward_smoke || validate_main_cache_pool2 ? 3U : 2U});
   if (benchmark_forward) {
     constexpr std::uint64_t hidden = 7168;
     constexpr std::uint64_t intermediate = 3072;
@@ -2098,7 +2098,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         max_tokens * (top_k + 1U);
     transport_config.channels = 1;
     transport_config.ring_slots_per_source_channel = 1;
-    transport_config.max_inflight_generations = 1;
+    transport_config.max_inflight_generations =
+        validate_main_cache_pool2 ? 2U : 1U;
     transport_config.max_intermediate_size = intermediate;
     const auto benchmark_cache = std::getenv("MEGAMOE_FORWARD_CACHE") != nullptr;
     transport_config.enable_forward_cache = benchmark_cache;
@@ -2126,11 +2127,119 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
             experts_per_rank, rank * experts_per_rank, hidden, intermediate,
             setup_generation.session(), execution);
+    const auto actual_weight_hashes =
+        megamoe::cuda::testing::hash_forward_weight_storage_for_validation(
+            weights, execution);
+    const auto all_distinct = [](const auto &hashes) {
+      for (std::size_t left = 0; left < hashes.size(); ++left)
+        for (std::size_t right = left + 1; right < hashes.size(); ++right)
+          if (hashes[left].low == hashes[right].low &&
+              hashes[left].high == hashes[right].high)
+            return false;
+      return true;
+    };
+    require(all_distinct(actual_weight_hashes.sampled_w1_experts),
+            "actual W1 device storage is not expert-distinct");
+    require(all_distinct(actual_weight_hashes.sampled_w2_experts),
+            "actual W2 device storage is not expert-distinct");
+    require(all_distinct(actual_weight_hashes.sampled_w2_output_rows),
+            "actual W2 device output rows are not distinct");
     megamoe::cuda::LocalCudaP2pForwardMegaKernel forward(
         setup_generation, execution, transport_pool);
     const auto one_time_setup_us =
         std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
             .count();
+    if (validate_main_cache_pool2) {
+      activation_storage = {};
+      const auto run_cached = [&](std::uint64_t exact_generation) {
+        auto generation = megamoe::cuda::make_nccl_generation(
+            base, "cuda-forward-bench", exact_generation);
+        auto context = megamoe::make_rank_collective_context(
+            generation.session(), rank, execution.token());
+        auto routes =
+            megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+                route_storage, context, execution);
+        auto gates =
+            megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+                gate_storage, routes, context, execution);
+        // The host wrapper is explicit test-only setup. It acquires the exact
+        // generation's deterministic physical slot so two live handles never
+        // reissue an old slot-backed activation lease.
+        auto activations =
+            megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+                activation_host, max_tokens, hidden, context, execution,
+                transport_pool);
+        megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+            generation, execution, pool);
+        auto notify = coordinator.run_device(
+            {common_config, routes, gates, max_tokens});
+        megamoe::cuda::ActivationTransportRunOptions options;
+        options.deadline_after = std::chrono::seconds(300);
+        return forward.run(
+            notify.dispatch(), activations, weights,
+            {hidden, intermediate,
+             megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput},
+            options);
+      };
+      const auto cache_hash = [&](const auto &handle) {
+        return hash_bf16_indexed(
+            megamoe::cuda::download_forward_cache_for_validation(
+                handle, execution));
+      };
+      const auto output_hash_for = [&](const auto &handle) {
+        return hash_bf16_indexed(
+            megamoe::cuda::download_forward_output_for_validation(
+                handle, execution));
+      };
+      auto first = run_cached(900U);
+      const auto first_cache_before = cache_hash(first);
+      const auto first_output = output_hash_for(first);
+      auto second = run_cached(901U);
+      require(megamoe::cuda::testing_forward_cache_ranges_disjoint(first,
+                                                                   second),
+              "main-shape Forward cache address intervals overlap");
+      const auto second_cache_before = cache_hash(second);
+      const auto second_output = output_hash_for(second);
+      require(first_cache_before == cache_hash(first),
+              "gen2 overwrote live gen1 A/B checkpoint");
+      require(first_output == second_output,
+              "identical main-shape generations produced different output");
+      auto live_usage = transport_pool.usage();
+      require(live_usage.slots_in_use == 2U &&
+                  live_usage.slots_available == 0U,
+              "main-shape cache pool did not retain two live slots");
+      bool exhausted = false;
+      try {
+        (void)run_cached(902U);
+      } catch (const megamoe::NotifyDispatchError &error) {
+        exhausted =
+            error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
+      }
+      require(exhausted,
+              "main-shape cache pool=2 accepted a third live generation");
+      first = {};
+      auto third = run_cached(904U);
+      require(second_cache_before == cache_hash(second),
+              "reusing released gen1 slot overwrote live gen2 checkpoint");
+      require(second_output == output_hash_for(third),
+              "reused main-shape cache slot changed Forward output");
+      second = {};
+      third = {};
+      live_usage = transport_pool.usage();
+      require(live_usage.slots_available == 2U &&
+                  live_usage.slots_in_use == 0U,
+              "main-shape cache slots were not returned exactly once");
+      activation_storage =
+          megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+              activation_host, max_tokens, hidden, setup_context, execution,
+              transport_pool);
+      std::cout << "FORWARD_CACHE_POOL2 rank=" << rank
+                << " disjoint=1 first_stable=1 second_stable=1"
+                << " third_exhausted=1 selective_reuse=1"
+                << " first_cache_hash=" << first_cache_before
+                << " second_cache_hash=" << second_cache_before
+                << " output_hash=" << first_output << std::endl;
+    }
     const auto rounds_text = std::getenv("MEGAMOE_FORWARD_BENCH_ROUNDS");
     const auto rounds = rounds_text
                             ? static_cast<std::uint32_t>(
@@ -2238,6 +2347,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         megamoe::cuda::download_forward_output_for_validation(last_output,
                                                                execution);
     std::uint64_t output_hash = 1469598103934665603ULL;
+    std::vector<std::uint16_t> first_token_unique;
     for (const auto value : downloaded_output) {
       output_hash = (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
                     1099511628211ULL;
@@ -2245,6 +2355,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           (output_hash ^ static_cast<std::uint8_t>(value.bits >> 8U)) *
           1099511628211ULL;
     }
+    for (std::uint64_t column = 0;
+         column < hidden && first_token_unique.size() < 32U; ++column) {
+      const auto bits = downloaded_output[static_cast<std::size_t>(column)].bits;
+      if (std::find(first_token_unique.begin(), first_token_unique.end(), bits) ==
+          first_token_unique.end())
+        first_token_unique.push_back(bits);
+    }
+    require(first_token_unique.size() > 1U,
+            "Forward output fixture collapsed to one repeated value");
     if (const auto *output_dir = std::getenv("MEGAMOE_FORWARD_OUTPUT_DIR")) {
       const auto path = std::string(output_dir) + "/megamoe-rank-" +
                         std::to_string(rank) + ".bf16";
@@ -2275,7 +2394,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " activation_hash=" << activation_hash
               << " route_hash=" << route_hash
               << " gate_hash=" << gate_hash
+              << " weight_generator_version=3"
               << " weight_hash=" << weight_hash
+              << " actual_w1_hash_low=" << actual_weight_hashes.w1.low
+              << " actual_w1_hash_high=" << actual_weight_hashes.w1.high
+              << " actual_w2_hash_low=" << actual_weight_hashes.w2.low
+              << " actual_w2_hash_high=" << actual_weight_hashes.w2.high
+              << " first_token_output_unique_at_least="
+              << first_token_unique.size()
               << " cluster_supported="
               << static_cast<unsigned int>(
                      last_audit.runtime_cluster_supported)
