@@ -267,7 +267,10 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
+    parser.add_argument("--backward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
+    parser.add_argument("--backward-benchmark", action="store_true")
+    parser.add_argument("--backward-cache", action="store_true")
     parser.add_argument("--forward-cache", action="store_true")
     parser.add_argument("--forward-cache-pool2-validation", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
@@ -281,10 +284,11 @@ def main():
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
     if sum((args.benchmark, args.integrated_benchmark,
-            args.forward_smoke, args.forward_benchmark)) > 1:
+            args.forward_smoke, args.backward_smoke,
+            args.forward_benchmark, args.backward_benchmark)) > 1:
         parser.error("choose only one benchmark/smoke mode")
     benchmark_mode = (args.benchmark or args.integrated_benchmark or
-                      args.forward_benchmark)
+                      args.forward_benchmark or args.backward_benchmark)
     if args.rounds is None:
         args.rounds = 110 if benchmark_mode else 1
     if benchmark_mode and args.rounds <= 10:
@@ -308,6 +312,10 @@ def main():
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
     elif args.forward_benchmark:
         environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
+    elif args.backward_benchmark:
+        environment["MEGAMOE_BACKWARD_BENCH_ROUNDS"] = str(args.rounds)
+        if args.backward_cache:
+            environment["MEGAMOE_BACKWARD_CACHE"] = "1"
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
@@ -327,11 +335,13 @@ def main():
     read_fd, write_fd = os.pipe()
     processes = []
     scenario = ("forward_bench" if args.forward_benchmark else
+                ("backward_bench" if args.backward_benchmark else
                 ("forward_smoke" if args.forward_smoke else
+                ("backward_smoke" if args.backward_smoke else
                 ("activation_integrated_bench" if args.integrated_benchmark else
                 ("activation_p2p_bench" if args.benchmark else
                  ("activation_p2p_cancel" if args.cancel else
-                  "activation_p2p")))))
+                  "activation_p2p")))))))
     try:
         rank0 = subprocess.Popen(
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
@@ -430,6 +440,15 @@ def main():
                         f"rank={rank} invalid forward smoke audit: {item}")
                 observed.append(item)
                 continue
+            if args.backward_smoke:
+                item = parse_fields(stdout, "BACKWARD_SMOKE ")
+                if (item.get("cache_no_cache_equal") != "1" or
+                        item.get("persistent_launches") != "1" or
+                        item.get("top_k") != str(args.top_k)):
+                    raise AssertionError(
+                        f"rank={rank} invalid backward smoke audit: {item}")
+                observed.append(item)
+                continue
             if args.cancel:
                 cancelled = parse_fields(stdout, "P2P_CANCEL ")
                 if cancelled.get("cancelled") != "1" or \
@@ -437,8 +456,10 @@ def main():
                     raise AssertionError(f"rank={rank} bad cancellation audit")
             else:
                 marker = ("FORWARD_BENCH " if args.forward_benchmark else
+                          ("BACKWARD_BENCH " if args.backward_benchmark else
                           ("INTEGRATED_BENCH "
                            if args.integrated_benchmark else "P2P_BENCH "))
+                          )
                 item = (parse_fields(stdout, marker)
                         if benchmark_mode else parse_result(stdout))
                 if benchmark_mode:
@@ -457,10 +478,109 @@ def main():
                   "single-launch WGMMA/TMA cache/no-cache smoke "
                   f"rank0_output_hash={hashes[0]}")
             return
+        if args.backward_smoke:
+            if len(observed) != args.world:
+                raise AssertionError("missing backward ranks")
+            if args.world == 1 and args.top_k == 1:
+                oracle_keys = (
+                    "oracle_dx_bits", "oracle_dgate", "oracle_dw1_bits",
+                    "oracle_dw2_bits", "oracle_ab_bits", "oracle_dab_bits",
+                    "oracle_dw1_row0_bits")
+                if not all(key in observed[0] for key in oracle_keys):
+                    raise AssertionError("missing Backward oracle samples")
+                print("BACKWARD_ORACLE_JSON " + json.dumps(
+                    {key: observed[0][key] for key in oracle_keys},
+                    sort_keys=True))
+            print(f"[PASS] LocalCudaP2p Backward MegaKernel world={args.world} "
+                  "single-launch WGMMA/TMA cache/no-cache smoke "
+                  f"rank0_dx_hash={observed[0]['dx_hash']}")
+            return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
             return
         if benchmark_mode:
+            if args.backward_benchmark:
+                stage_keys = ("wall", "notify", "forward", "backward",
+                              "dy_dispatch", "dv", "dgate", "transpose",
+                              "dx", "dw1", "dw2",
+                              "reduce")
+                for rank, item in enumerate(observed):
+                    if (item["specialization"] !=
+                            "sm90-wgmma-tma-7168x3072" or
+                            item["persistent_launches"] != "1" or
+                            item["steady_forbidden_cuda_api_calls"] != "0"):
+                        raise AssertionError(
+                            f"rank={rank} invalid backward audit: {item}")
+                    for key in stage_keys:
+                        item[key] = [float(value)
+                                     for value in item[key].split(",")]
+                        if len(item[key]) != args.rounds - 10:
+                            raise AssertionError(
+                                f"rank={rank} stage={key} bad sample count")
+
+                def stats(values):
+                    ordered = sorted(values)
+                    def percentile(fraction):
+                        ordinal = max(
+                            1, int(len(ordered) * fraction + 0.999999))
+                        return ordered[ordinal - 1]
+                    return {"mean": statistics.fmean(values),
+                            "p50": percentile(0.50),
+                            "p95": percentile(0.95),
+                            "min": ordered[0], "max": ordered[-1]}
+
+                summary = {}
+                for key in stage_keys:
+                    slowest = [max(item[key][iteration]
+                                   for item in observed)
+                               for iteration in range(args.rounds - 10)]
+                    summary[key + "_slowest_rank_us"] = stats(slowest)
+                result = {
+                    "schema": 1,
+                    "benchmark": "single-persistent-backward-main-shape",
+                    "world": args.world,
+                    "cache_mode": ("cache-fc1-input-output"
+                                   if args.backward_cache else "no-cache"),
+                    "warmup": 10,
+                    "measured": args.rounds - 10,
+                    "shape": {"tokens_per_rank": 8192, "hidden": 7168,
+                              "intermediate": 3072, "experts": 384,
+                              "top_k": args.top_k},
+                    "per_rank_workspace_bytes": [
+                        int(item["workspace"]) for item in observed],
+                    "per_rank_wgmma_instructions": [
+                        int(item["wgmma"]) for item in observed],
+                    "per_rank_tma_loads": [int(item["tma"])
+                                           for item in observed],
+                    "per_rank_one_time_setup_us": [
+                        float(item["one_time_setup"]) for item in observed],
+                    "per_rank_activation_hash": [
+                        int(item["activation_hash"]) for item in observed],
+                    "per_rank_output_gradient_hash": [
+                        int(item["output_gradient_hash"])
+                        for item in observed],
+                    "per_rank_route_hash": [
+                        int(item["route_hash"]) for item in observed],
+                    "per_rank_gate_hash": [
+                        int(item["gate_hash"]) for item in observed],
+                    "per_rank_actual_w1_device_hash": [
+                        [int(item["actual_w1_hash_low"]),
+                         int(item["actual_w1_hash_high"])]
+                        for item in observed],
+                    "per_rank_actual_w2_device_hash": [
+                        [int(item["actual_w2_hash_low"]),
+                         int(item["actual_w2_hash_high"])]
+                        for item in observed],
+                    "weight_gradient_dtype": observed[0]["dw_dtype"],
+                    "per_rank_nccl_runtime": [
+                        item["_nccl_runtime"] for item in observed],
+                    "per_rank_nccl_library": [
+                        item["_nccl_library"] for item in observed],
+                    **summary,
+                }
+                print("BACKWARD_BENCH_JSON " +
+                      json.dumps(result, sort_keys=True))
+                return
             if args.forward_benchmark:
                 stage_keys = ("wall", "notify", "forward", "dispatch",
                               "fc1", "fc2", "return", "reduce",

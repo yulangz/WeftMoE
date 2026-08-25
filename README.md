@@ -13,8 +13,11 @@ CUDA IPC mappings and independent rank processes; the explicit
 a single-launch, single-node Forward baseline for the main 7168x3072 shape:
 TMA/WGMMA FC1, an in-kernel SwiGLU epilogue, TMA/WGMMA FC2, peer return, and
 source-side dynamic-gate deterministic reduce all execute in one cooperative
-persistent kernel. It does **not** implement backward, cross-node Forward,
-Socket transport, or NCCL GIN/RDMA.
+persistent kernel. Phase 6 adds a single-launch, single-node Backward baseline
+for the same main shape, including cache/recompute paths, dY dispatch,
+WGMMA/TMA dV/dX/dW1/dW2, deterministic dGate, and fixed-order dX combine. It
+does **not** implement cross-node Forward/Backward, Socket transport, or NCCL
+GIN/RDMA.
 
 ## Supported topology contract
 
@@ -278,6 +281,28 @@ launch is a real 2-CTA runtime cluster (`cluster_size=2`, observed rank mask
 `0b11`, 66 active clusters/device). TMA multicast remains disabled (`audit=0`)
 and is not implied by cluster formation. There is currently no correctness
 fallback for other H/I shapes.
+
+## Single-node Backward baseline
+
+`LocalCudaP2pBackwardMegaKernel` consumes the owning Forward handle and a typed
+BF16 `[tokens, hidden]` output-gradient lease. One cooperative persistent
+launch performs dY peer dispatch, dV, source-side gate multiplication,
+SwiGLU backward, dX, split-K=1 dW1/dW2, peer dX/dGate return, and deterministic
+top-k dX reduction. Main-shape GEMMs use TMA/WGMMA with FP32 accumulators;
+dX/dW are stored as BF16 and dGate as FP32. dW tiles have one owner and traverse
+each expert's canonical padded-M segment in increasing order, so no floating
+atomic participates in a result.
+
+`CACHE_FC1_INPUT_OUTPUT` reuses Forward's BF16 A/B checkpoint.
+`NO_FC1_OUTPUT_CACHE` recomputes A/B from canonical X inside the same Backward
+kernel; it does not redispatch X. U, dAB, dGate partials, returned dX, and dW
+are generation-slot storage owned through the Backward handle. The resource
+pool must be created with `enable_backward=true`; the steady path performs no
+CUDA/pinned/event allocation or device-wide synchronization.
+
+The NCCL-free `--backward-sanitizer` harness executes the exact production
+Forward and Backward kernels with an initialized world-1 fixture. It is part of
+`make cuda-sanitizer-smoke` for memcheck, racecheck, and initcheck.
 
 The GIN probe reports headers, the full required symbol set, runtime minimal
 initialization, backend implementation, and usability independently. The

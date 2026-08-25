@@ -19,6 +19,8 @@ using BFloat16ActivationLease =
 class ActivationTransportBridge;
 class ForwardMegaKernelBridge;
 class ForwardWeightLease;
+class SelectedOutputGradientLease;
+struct BackwardValidationDownload;
 namespace testing {
 ForwardWeightLease make_deterministic_forward_weights_for_testing(
     std::uint32_t owned_experts, std::uint32_t global_expert_begin,
@@ -51,6 +53,7 @@ private:
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class LocalCudaP2pBackwardMegaKernel;
 };
 
 struct ActivationTransportPoolConfig {
@@ -64,7 +67,11 @@ struct ActivationTransportPoolConfig {
   std::uint32_t ring_slots_per_source_channel = 0;
   std::uint32_t max_inflight_generations = 2;
   std::uint64_t max_intermediate_size = 0;
+  std::uint32_t max_owned_experts = 0;
   bool enable_forward_cache = false;
+  // Reserves the generation-local Backward arena.  It is deliberately opt-in
+  // so the frozen Forward-only pool footprint is unchanged.
+  bool enable_backward = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -95,6 +102,7 @@ private:
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class LocalCudaP2pBackwardMegaKernel;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -249,11 +257,13 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class ForwardMegaKernelBridge;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class LocalCudaP2pBackwardMegaKernel;
   friend ForwardWeightLease
   testing::make_deterministic_forward_weights_for_testing(
       std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t,
       const CollectiveSession &, const CudaExecution &);
   friend struct ForwardWeightStorageHashAccess;
+  friend struct ForwardBackwardWeightAccess;
 };
 
 struct DeviceStorageHash128 {
@@ -327,6 +337,17 @@ private:
                                         const CudaExecution &);
   friend bool testing_forward_cache_ranges_disjoint(
       const DeviceForwardHandle &, const DeviceForwardHandle &);
+  friend class SelectedOutputGradientLease;
+  friend class LocalCudaP2pBackwardMegaKernel;
+  friend struct BackwardMegaKernelBridge;
+  friend SelectedOutputGradientLease
+  testing_upload_output_gradient_for_backward(
+      const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
+      const CudaExecution &);
+  friend SelectedOutputGradientLease
+  testing_reissue_output_gradient_for_benchmark(
+      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
+      const CudaExecution &);
 };
 
 class LocalCudaP2pForwardMegaKernel {
@@ -359,6 +380,140 @@ download_forward_cache_for_validation(const DeviceForwardHandle &handle,
 // without exposing either native pointer to the caller.
 bool testing_forward_cache_ranges_disjoint(const DeviceForwardHandle &left,
                                            const DeviceForwardHandle &right);
+
+// Immutable autograd -> Backward handoff.  dY is BF16 [tokens, hidden] and is
+// bound to the exact Forward generation/slot.  No native pointer is exposed.
+class SelectedOutputGradientLease {
+public:
+  SelectedOutputGradientLease() = default;
+  std::uint64_t num_tokens() const;
+  std::uint64_t hidden_size() const;
+  std::uint64_t generation() const;
+  std::uint32_t device_ordinal() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit SelectedOutputGradientLease(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class LocalCudaP2pBackwardMegaKernel;
+  friend struct BackwardMegaKernelBridge;
+  friend SelectedOutputGradientLease
+  testing_upload_output_gradient_for_backward(
+      const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
+      const CudaExecution &);
+  friend SelectedOutputGradientLease
+  testing_reissue_output_gradient_for_benchmark(
+      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
+      const CudaExecution &);
+};
+
+enum class BackwardWeightGradientDType : std::uint8_t { BFloat16 };
+
+struct BackwardMegaKernelConfig {
+  std::uint64_t hidden_size = 0;
+  std::uint64_t intermediate_size = 0;
+  BackwardWeightGradientDType weight_gradient_dtype =
+      BackwardWeightGradientDType::BFloat16;
+};
+
+enum class BackwardKernelSpecialization : std::uint8_t {
+  Sm90WgmmaTma7168x3072,
+  CudaCoreCorrectnessFallback,
+};
+
+struct BackwardMegaKernelTimings {
+  double dy_dispatch_us = 0;
+  double dv_swiglu_backward_us = 0;
+  double dgate_reduce_us = 0;
+  double transpose_us = 0;
+  double dx_us = 0;
+  double dw1_us = 0;
+  double dw2_us = 0;
+  double dx_combine_reduce_us = 0;
+  double total_us = 0;
+};
+
+struct BackwardMegaKernelAudit {
+  BackwardKernelSpecialization specialization =
+      BackwardKernelSpecialization::CudaCoreCorrectnessFallback;
+  std::uint64_t persistent_kernel_launches = 0;
+  std::uint64_t wgmma_instructions = 0;
+  std::uint64_t tma_loads = 0;
+  std::uint64_t dv_tasks = 0;
+  std::uint64_t dx_tasks = 0;
+  std::uint64_t dw1_tasks = 0;
+  std::uint64_t dw2_tasks = 0;
+  std::uint64_t actual_dy_peer_bytes = 0;
+  std::uint64_t actual_dx_peer_bytes = 0;
+  std::uint64_t hot_path_allocations = 0;
+  std::uint64_t workspace_bytes = 0;
+  bool recomputed_fc1 = false;
+  BackwardWeightGradientDType weight_gradient_dtype =
+      BackwardWeightGradientDType::BFloat16;
+};
+
+class DeviceBackwardHandle {
+public:
+  DeviceBackwardHandle() = default;
+  const ActivationTransportExpectation &identity() const;
+  const BackwardMegaKernelAudit &audit() const;
+  const BackwardMegaKernelTimings &timings() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
+
+private:
+  struct Impl;
+  explicit DeviceBackwardHandle(std::shared_ptr<const Impl> impl)
+      : impl_(std::move(impl)) {}
+  std::shared_ptr<const Impl> impl_;
+  friend class LocalCudaP2pBackwardMegaKernel;
+  friend struct BackwardValidationDownload;
+  friend BackwardValidationDownload download_backward_for_validation(
+      const DeviceBackwardHandle &, const CudaExecution &);
+};
+
+struct BackwardValidationDownload {
+  std::vector<transport::BFloat16> dx;
+  std::vector<float> dgate;
+  std::vector<transport::BFloat16> dw1;
+  std::vector<transport::BFloat16> dw2;
+  std::vector<transport::BFloat16> sampled_ab;
+  std::vector<transport::BFloat16> sampled_dab;
+};
+
+class LocalCudaP2pBackwardMegaKernel {
+public:
+  LocalCudaP2pBackwardMegaKernel(
+      const NcclSession &session, const CudaExecution &execution,
+      const ActivationTransportResourcePool &pool);
+
+  DeviceBackwardHandle run(
+      const DeviceForwardHandle &forward,
+      const SelectedOutputGradientLease &output_gradient,
+      const BackwardMegaKernelConfig &config,
+      const ActivationTransportRunOptions &options = {});
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+BackwardValidationDownload download_backward_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+// Explicit test/convenience upload into the Forward generation's preallocated
+// dY slot.  Production autograd/router integration will issue the same typed
+// lease without a host roundtrip.
+SelectedOutputGradientLease testing_upload_output_gradient_for_backward(
+    const DeviceForwardHandle &forward,
+    const std::vector<transport::BFloat16> &host,
+    const CudaExecution &execution);
+
+SelectedOutputGradientLease testing_reissue_output_gradient_for_benchmark(
+    const DeviceForwardHandle &forward,
+    const SelectedOutputGradientLease &storage,
+    const CudaExecution &execution);
 
 struct ActivationTransportValidationDownload {
   std::vector<transport::BFloat16> contribution_by_route;
@@ -410,6 +565,11 @@ ForwardWeightLease make_deterministic_forward_weights_for_testing(
 ForwardWeightStorageHashes hash_forward_weight_storage_for_validation(
     const ForwardWeightLease &weights, const CudaExecution &execution);
 
+// One-time Backward session setup. It builds device-resident W1^T/W2^T and
+// their TMA descriptors; Forward-only callers pay neither memory nor setup.
+void prepare_forward_weights_for_backward(
+    const ForwardWeightLease &weights, const CudaExecution &execution);
+
 // Executes a true device-issued store through a peer mapping and observes a
 // system-scope release/acquire signal. It is a capability/correctness probe,
 // not the cross-node backend.
@@ -425,6 +585,7 @@ double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
 // Forward persistent kernel, replacing only Notify/bootstrap with an explicit
 // initialized world-1 dispatch fixture.
 bool run_forward_world1_sanitizer_harness();
+bool run_backward_world1_sanitizer_harness();
 } // namespace testing
 
 } // namespace megamoe::cuda

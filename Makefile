@@ -41,7 +41,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench megatron-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench megatron-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -92,6 +92,14 @@ cuda-p2p-bench: $(BUILD_DIR)/test_cuda_notify
 cuda-integrated-bench: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(BUILD_DIR)/test_cuda_notify --world 8 --integrated-benchmark --timeout 900
 
+cuda-backward-test: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 1 --backward-smoke --timeout 300
+	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 2 --backward-smoke --timeout 600
+	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 8 --backward-smoke --timeout 900
+
+cuda-backward-bench: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 8 --backward-benchmark --backward-cache --rounds 110 --timeout 1800
+
 megatron-bench:
 	torchrun --standalone --nproc-per-node=8 benchmarks/megatron_dispatch_baseline.py
 
@@ -109,6 +117,9 @@ cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
+	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
+	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
+	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
 
 cuda-sm90-compile:
 	$(MAKE) BUILD_DIR=$(BUILD_DIR)-sm90 CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' cuda-lib

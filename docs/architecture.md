@@ -650,3 +650,29 @@ runtime initialization, project backend implementation, and usable. Usable is
 their conjunction. The selected 2.28.3 runtime fails the symbol gate and this
 phase intentionally has no GIN implementation. Socket fallback is also absent.
 Neither can be confused with the real one-node CUDA IPC backend.
+
+### Backward ownership and dataflow
+
+The Backward public boundary is owning on both sides. A
+`SelectedOutputGradientLease` binds BF16 `[tokens, hidden]` dY to the same
+session, generation, device, execution and Forward slot; a
+`DeviceBackwardHandle` retains the Forward handle, dY lease, pool slot and
+backend team. Consequently A/B checkpoints, canonical X, transient gradients
+and returned dX cannot be recycled while any Backward result remains live.
+
+For the 7168x3072 specialization one cooperative kernel executes dY peer put,
+dV, source gate multiplication, SwiGLU backward, dX, dW2/dW1, peer dX/dGate
+return, and top-k reduction. Cache mode consumes the Forward BF16 A/B planes;
+no-cache mode recomputes those planes in-kernel from canonical X. dAB lives
+until both dX and dW1 finish, and the BF16 U plane lives until dW2 finishes.
+dW uses one owner per output tile and increasing canonical padded-M traversal;
+dGate uses fixed intermediate-tile partials, and dX reduction follows the
+Forward handle's immutable expert-ID `combine_order`.
+
+The pool's `enable_backward` layout reserves dY, dAB/U, dX return/combined,
+dGate partial/final, padded K-major transposed dW operands, dW1/dW2, scheduler
+and status storage per in-flight generation. U/dAB transposes are fused into
+the dV epilogue; dY/X use a coalesced 256x256 shared-memory transpose. Weight
+transposes and TMA descriptors are one-time weight/session setup. The steady
+Backward launch initializes only its small status/signal words and performs no
+CUDA/pinned/event allocation or device-wide synchronization.

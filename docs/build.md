@@ -681,6 +681,38 @@ memcpy, memset, kernel, collective, signal wait, and terminal completion in the
 timed interval; `large_generation_memsets=0` and the CUDA allocation counters
 make the setup exclusion machine-checkable.
 
+## Backward MegaKernel validation
+
+Build the release CUDA binary and run the single-node cache/no-cache smoke:
+
+```bash
+make ENABLE_CUDA=1 WERROR=1 \
+  NCCL_RUNTIME_LIB_DIR=/path/to/nccl/lib build/test_cuda_notify
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  python3 tests/run_local_activation_p2p.py \
+    --binary "$PWD/build/test_cuda_notify" --world 8 --backward-smoke
+```
+
+The Backward sanitizer path bypasses NCCL bootstrap but launches the exact
+production world-1 Forward and Backward WGMMA/TMA kernels:
+
+```bash
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  compute-sanitizer --tool memcheck --error-exitcode=1 \
+    build/test_cuda_notify --backward-sanitizer
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  compute-sanitizer --tool racecheck --error-exitcode=1 \
+    build/test_cuda_notify --backward-sanitizer
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  compute-sanitizer --tool initcheck --error-exitcode=1 \
+    build/test_cuda_notify --backward-sanitizer
+```
+
+`make ENABLE_CUDA=1 cuda-sanitizer-smoke` includes all three commands. The
+main-shape benchmark uses `--backward-benchmark --backward-cache`; its JSON
+reports the single persistent launch, BF16 dW dtype, per-stage device clocks,
+actual dY/dX peer bytes and complete per-rank pool bytes.
+
 ## Clean export
 
 After committing, verify without ignored build state:

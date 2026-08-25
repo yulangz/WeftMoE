@@ -1978,12 +1978,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto benchmark_integrated =
       scenario == "activation_integrated_bench";
   const auto forward_smoke = scenario == "forward_smoke";
+  const auto backward_smoke = scenario == "backward_smoke";
   const auto benchmark_forward = scenario == "forward_bench";
+  const auto benchmark_backward = scenario == "backward_bench";
   const auto validate_main_cache_pool2 =
       benchmark_forward &&
       std::getenv("MEGAMOE_FORWARD_CACHE_POOL2_VALIDATE") != nullptr;
   const auto benchmark_shape =
-      benchmark_p2p || benchmark_integrated || benchmark_forward;
+      benchmark_p2p || benchmark_integrated || benchmark_forward ||
+      benchmark_backward;
   auto experts = std::max<std::uint32_t>(16, world * 2);
   auto top_k = std::min<std::uint32_t>(6, experts);
   if (const auto *p2p_top_k = std::getenv("MEGAMOE_P2P_TOP_K"))
@@ -1995,7 +1998,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   if (benchmark_shape) {
     require(nodes == 1 &&
                 ((benchmark_p2p && world == 8) ||
-                 (benchmark_forward && (world == 1 || world == 8)) ||
+                 ((benchmark_forward || benchmark_backward) &&
+                  (world == 1 || world == 8)) ||
                  (benchmark_integrated && (world == 2 || world == 8))),
             "local CUDA benchmark requires one supported 2/8-GPU node");
     experts = 384;
@@ -2024,13 +2028,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             (base + slot * 53U) % experts));
     }
   }
-  if (forward_smoke) {
+  if (forward_smoke || backward_smoke) {
     require(nodes == 1 && (world == 1 || world == 2 || world == 8),
             "forward smoke requires one local 1/2/8-GPU node");
     // Cross-topology fixture: all EP sizes retain the same 384 global experts,
     // source activation, selected IDs and gates. Only contiguous ownership
     // changes. The selected experts span the complete ownership range.
-    experts = 384;
+    experts = backward_smoke ? std::max<std::uint32_t>(8U, world * 2U) : 384U;
     max_tokens = 2;
     common_config = make_config(1, world, experts, top_k, 64);
     for (std::uint32_t expert = 0; expert < experts; ++expert)
@@ -2044,7 +2048,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     for (std::uint64_t token = 0; token < max_tokens; ++token)
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
         common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            cross_ep_experts[token * 6U + slot]));
+            backward_smoke
+                ? ((token * 3U + slot * 5U + rank) % experts)
+                : cross_ep_experts[token * 6U + slot]));
   }
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (rank == 0) {
@@ -2071,7 +2077,200 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution,
       {common_config, max_tokens, 4096,
-       forward_smoke || validate_main_cache_pool2 ? 3U : 2U});
+       forward_smoke || backward_smoke || validate_main_cache_pool2 ? 3U : 2U});
+  if (benchmark_backward) {
+    constexpr std::uint64_t hidden = 7168;
+    constexpr std::uint64_t intermediate = 3072;
+    auto setup_generation = megamoe::cuda::make_nccl_generation(
+        base, "cuda-backward-bench", 701);
+    auto setup_context = megamoe::make_rank_collective_context(
+        setup_generation.session(), rank, execution.token());
+    auto route_storage = megamoe::cuda::upload_cuda_routes(
+        common_routes, top_k, setup_context, execution);
+    const auto route_gates = fixed_random_selected_gates(
+        common_routes.num_tokens, top_k, rank, 0x4d4547414d4f4547ULL);
+    auto gate_storage = megamoe::cuda::testing::upload_fp32_gates_for_testing(
+        route_gates, route_storage, setup_context, execution);
+    megamoe::cuda::ActivationTransportPoolConfig transport_config;
+    transport_config.max_tokens_per_rank = max_tokens;
+    transport_config.max_hidden_size = hidden;
+    transport_config.max_top_k = top_k;
+    transport_config.max_world_size = world;
+    transport_config.max_nodes = 1;
+    transport_config.max_destination_rows_per_rank = max_tokens * (top_k + 1U);
+    transport_config.channels = 1;
+    transport_config.ring_slots_per_source_channel = 1;
+    transport_config.max_inflight_generations = 1;
+    transport_config.max_intermediate_size = intermediate;
+    transport_config.max_owned_experts = experts / world;
+    const auto cache_mode = std::getenv("MEGAMOE_BACKWARD_CACHE") != nullptr;
+    transport_config.enable_forward_cache = cache_mode;
+    transport_config.enable_backward = true;
+    const auto setup_start = Clock::now();
+    auto transport_pool = megamoe::cuda::make_activation_transport_pool(
+        setup_generation.session(), execution, transport_config);
+    std::vector<megamoe::transport::BFloat16> activation_host(
+        static_cast<std::size_t>(max_tokens * hidden));
+    std::vector<megamoe::transport::BFloat16> dy_host(
+        static_cast<std::size_t>(max_tokens * hidden));
+    for (std::size_t index = 0; index < activation_host.size(); ++index) {
+      activation_host[index] = megamoe::transport::float_to_bfloat16(
+          static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) -
+                             63) /
+          64.0F);
+      dy_host[index] = megamoe::transport::float_to_bfloat16(
+          static_cast<float>(static_cast<int>((index * 7U + rank * 19U) %
+                                               113U) -
+                             56) /
+          128.0F);
+    }
+    auto activation_storage =
+        megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+            activation_host, max_tokens, hidden, setup_context, execution,
+            transport_pool);
+    auto weights =
+        megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+            experts / world, rank * (experts / world), hidden, intermediate,
+            setup_generation.session(), execution);
+    megamoe::cuda::testing::prepare_forward_weights_for_backward(weights,
+                                                                  execution);
+    const auto actual_weight_hashes =
+        megamoe::cuda::testing::hash_forward_weight_storage_for_validation(
+            weights, execution);
+    const auto activation_hash = hash_bf16_indexed(activation_host);
+    const auto output_gradient_hash = hash_bf16_indexed(dy_host);
+    const auto route_hash = hash_i32(common_routes.selected_experts);
+    const auto gate_hash = hash_fp32(route_gates);
+    megamoe::cuda::LocalCudaP2pForwardMegaKernel forward(
+        setup_generation, execution, transport_pool);
+    megamoe::cuda::LocalCudaP2pBackwardMegaKernel backward(
+        setup_generation, execution, transport_pool);
+    const auto one_time_setup_us =
+        std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
+            .count();
+    const auto rounds = std::getenv("MEGAMOE_BACKWARD_BENCH_ROUNDS")
+                            ? static_cast<std::uint32_t>(std::stoul(
+                                  std::getenv("MEGAMOE_BACKWARD_BENCH_ROUNDS")))
+                            : 110U;
+    std::vector<double> wall, notify_samples, forward_samples,
+        backward_samples, dy_dispatch_samples, dv_samples, dx_samples,
+        dw1_samples, dw2_samples, reduce_samples, dgate_samples,
+        transpose_samples;
+    megamoe::cuda::BackwardMegaKernelAudit last_audit;
+    megamoe::cuda::SelectedOutputGradientLease dy_storage;
+    const auto api_before = megamoe::cuda::testing::cuda_api_audit_snapshot();
+    for (std::uint32_t repeat = 0; repeat < rounds; ++repeat) {
+      auto generation = megamoe::cuda::make_nccl_generation(
+          base, "cuda-backward-bench", 800U + repeat);
+      auto context = megamoe::make_rank_collective_context(
+          generation.session(), rank, execution.token());
+      auto routes =
+          megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+              route_storage, context, execution);
+      auto gates =
+          megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              gate_storage, routes, context, execution);
+      auto activations =
+          megamoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
+              activation_storage, context, execution);
+      const auto begin = Clock::now();
+      megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, routes, gates, max_tokens});
+      const auto notify_end = Clock::now();
+      megamoe::cuda::ActivationTransportRunOptions options;
+      options.deadline_after = std::chrono::seconds(300);
+      auto forward_handle = forward.run(
+          notify.dispatch(), activations, weights,
+          {hidden, intermediate,
+           cache_mode
+               ? megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput
+               : megamoe::cuda::ForwardCacheMode::NoFc1OutputCache},
+          options);
+      auto dy = dy_storage
+                    ? megamoe::cuda::testing_reissue_output_gradient_for_benchmark(
+                          forward_handle, dy_storage, execution)
+                    : megamoe::cuda::testing_upload_output_gradient_for_backward(
+                          forward_handle, dy_host, execution);
+      if (!dy_storage)
+        dy_storage = dy;
+      auto backward_handle = backward.run(
+          forward_handle, dy,
+          {hidden, intermediate,
+           megamoe::cuda::BackwardWeightGradientDType::BFloat16},
+          options);
+      const auto end = Clock::now();
+      last_audit = backward_handle.audit();
+      if (repeat >= 10U) {
+        wall.push_back(
+            std::chrono::duration<double, std::micro>(end - begin).count());
+        notify_samples.push_back(std::chrono::duration<double, std::micro>(
+                                     notify_end - begin).count());
+        forward_samples.push_back(forward_handle.timings().total_us);
+        backward_samples.push_back(backward_handle.timings().total_us);
+        dy_dispatch_samples.push_back(
+            backward_handle.timings().dy_dispatch_us);
+        dv_samples.push_back(
+            backward_handle.timings().dv_swiglu_backward_us);
+        dgate_samples.push_back(backward_handle.timings().dgate_reduce_us);
+        transpose_samples.push_back(backward_handle.timings().transpose_us);
+        dx_samples.push_back(backward_handle.timings().dx_us);
+        dw1_samples.push_back(backward_handle.timings().dw1_us);
+        dw2_samples.push_back(backward_handle.timings().dw2_us);
+        reduce_samples.push_back(
+            backward_handle.timings().dx_combine_reduce_us);
+      }
+    }
+    const auto api_after = megamoe::cuda::testing::cuda_api_audit_snapshot();
+    require(api_after.device_allocations == api_before.device_allocations &&
+                api_after.device_frees == api_before.device_frees &&
+                api_after.pinned_allocations == api_before.pinned_allocations &&
+                api_after.pinned_frees == api_before.pinned_frees &&
+                api_after.event_creates == api_before.event_creates &&
+                api_after.event_destroys == api_before.event_destroys &&
+                api_after.device_synchronizes == api_before.device_synchronizes,
+            "Backward steady path used a forbidden CUDA allocation/sync API");
+    const auto emit = [](const auto &values) {
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << values[index];
+      }
+    };
+    std::cout << "BACKWARD_BENCH rank=" << rank << " world=" << world
+              << " warmup=10 measured=" << wall.size()
+              << " cache=" << (cache_mode ? 1 : 0)
+              << " specialization=sm90-wgmma-tma-7168x3072"
+              << " persistent_launches="
+              << last_audit.persistent_kernel_launches
+              << " wgmma=" << last_audit.wgmma_instructions
+              << " tma=" << last_audit.tma_loads
+              << " workspace=" << last_audit.workspace_bytes
+              << " one_time_setup=" << one_time_setup_us
+              << " activation_hash=" << activation_hash
+              << " output_gradient_hash=" << output_gradient_hash
+              << " route_hash=" << route_hash
+              << " gate_hash=" << gate_hash
+              << " actual_w1_hash_low=" << actual_weight_hashes.w1.low
+              << " actual_w1_hash_high=" << actual_weight_hashes.w1.high
+              << " actual_w2_hash_low=" << actual_weight_hashes.w2.low
+              << " actual_w2_hash_high=" << actual_weight_hashes.w2.high
+              << " dw_dtype=bf16"
+              << " steady_forbidden_cuda_api_calls=0 wall=";
+    emit(wall); std::cout << " notify="; emit(notify_samples);
+    std::cout << " forward="; emit(forward_samples);
+    std::cout << " backward="; emit(backward_samples);
+    std::cout << " dy_dispatch="; emit(dy_dispatch_samples);
+    std::cout << " dv="; emit(dv_samples);
+    std::cout << " dgate="; emit(dgate_samples);
+    std::cout << " transpose="; emit(transpose_samples);
+    std::cout << " dx="; emit(dx_samples);
+    std::cout << " dw1="; emit(dw1_samples);
+    std::cout << " dw2="; emit(dw2_samples);
+    std::cout << " reduce="; emit(reduce_samples);
+    std::cout << std::endl;
+    return;
+  }
   if (benchmark_forward) {
     constexpr std::uint64_t hidden = 7168;
     constexpr std::uint64_t intermediate = 3072;
@@ -2507,6 +2706,162 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::cout << " return_reduce_overlap=";
     emit_values(return_reduce_overlap_samples);
     std::cout << std::endl;
+    return;
+  }
+  if (backward_smoke) {
+    constexpr std::uint64_t hidden = 7168;
+    constexpr std::uint64_t intermediate = 3072;
+    auto setup_generation = megamoe::cuda::make_nccl_generation(
+        base, "cuda-backward-smoke", 701);
+    auto setup_context = megamoe::make_rank_collective_context(
+        setup_generation.session(), rank, execution.token());
+    auto route_storage = megamoe::cuda::upload_cuda_routes(
+        common_routes, top_k, setup_context, execution);
+    const auto gates = fixed_random_selected_gates(
+        max_tokens, top_k, rank, 0x4241434b57415244ULL);
+    auto gate_storage = megamoe::cuda::testing::upload_fp32_gates_for_testing(
+        gates, route_storage, setup_context, execution);
+    megamoe::cuda::ActivationTransportPoolConfig transport_config;
+    transport_config.max_tokens_per_rank = max_tokens;
+    transport_config.max_hidden_size = hidden;
+    transport_config.max_top_k = top_k;
+    transport_config.max_world_size = world;
+    transport_config.max_nodes = 1;
+    transport_config.max_destination_rows_per_rank = world * max_tokens * top_k;
+    transport_config.channels = 1;
+    transport_config.ring_slots_per_source_channel = 1;
+    transport_config.max_inflight_generations = 1;
+    transport_config.max_intermediate_size = intermediate;
+    transport_config.max_owned_experts = experts / world;
+    transport_config.enable_forward_cache = true;
+    transport_config.enable_backward = true;
+    auto transport_pool = megamoe::cuda::make_activation_transport_pool(
+        setup_generation.session(), execution, transport_config);
+    std::vector<megamoe::transport::BFloat16> input(max_tokens * hidden);
+    std::vector<megamoe::transport::BFloat16> dy(max_tokens * hidden);
+    for (std::uint64_t index = 0; index < max_tokens * hidden; ++index) {
+      input[static_cast<std::size_t>(index)] =
+          megamoe::transport::float_to_bfloat16(
+              static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) -
+                                 63) /
+              64.0F);
+      dy[static_cast<std::size_t>(index)] =
+          megamoe::transport::float_to_bfloat16(
+              static_cast<float>(static_cast<int>((index * 7U + rank * 19U) %
+                                                   113U) -
+                                 56) /
+              128.0F);
+    }
+    auto weights =
+        megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+            experts / world, rank * (experts / world), hidden, intermediate,
+            setup_generation.session(), execution);
+    megamoe::cuda::testing::prepare_forward_weights_for_backward(weights,
+                                                                  execution);
+    megamoe::cuda::LocalCudaP2pForwardMegaKernel forward(
+        setup_generation, execution, transport_pool);
+    megamoe::cuda::LocalCudaP2pBackwardMegaKernel backward(
+        setup_generation, execution, transport_pool);
+    megamoe::cuda::ActivationTransportRunOptions options;
+    options.deadline_after = std::chrono::seconds(300);
+    const auto run_mode = [&](megamoe::cuda::ForwardCacheMode mode,
+                              std::uint64_t exact_generation) {
+      auto generation = megamoe::cuda::make_nccl_generation(
+          base, "cuda-backward-smoke", exact_generation);
+      auto context = megamoe::make_rank_collective_context(
+          generation.session(), rank, execution.token());
+      auto routes =
+          megamoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+              route_storage, context, execution);
+      auto device_gates =
+          megamoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              gate_storage, routes, context, execution);
+      auto activations =
+          megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
+              input, max_tokens, hidden, context, execution, transport_pool);
+      megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, routes, device_gates, max_tokens});
+      auto host_metadata =
+          megamoe::cuda::download_device_metadata_for_validation(
+              notify.dispatch(), execution);
+      auto forward_handle = forward.run(
+          notify.dispatch(), activations, weights,
+          {hidden, intermediate, mode}, options);
+      auto dy_lease = megamoe::cuda::testing_upload_output_gradient_for_backward(
+          forward_handle, dy, execution);
+      auto backward_handle = backward.run(
+          forward_handle, dy_lease,
+          {hidden, intermediate,
+           megamoe::cuda::BackwardWeightGradientDType::BFloat16},
+          options);
+      require(backward_handle.audit().persistent_kernel_launches == 1U &&
+                  backward_handle.audit().wgmma_instructions != 0U &&
+                  backward_handle.audit().tma_loads != 0U,
+              "Backward did not execute one WGMMA/TMA persistent kernel");
+      return std::make_pair(
+          megamoe::cuda::download_backward_for_validation(backward_handle,
+                                                           execution),
+          std::move(host_metadata));
+    };
+    const auto no_cache = run_mode(
+        megamoe::cuda::ForwardCacheMode::NoFc1OutputCache, 900U);
+    const auto cache = run_mode(
+        megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput, 901U);
+    require(no_cache.first.dx == cache.first.dx &&
+                no_cache.first.dgate == cache.first.dgate &&
+                no_cache.first.dw1 == cache.first.dw1 &&
+                no_cache.first.dw2 == cache.first.dw2 &&
+                no_cache.first.sampled_ab == cache.first.sampled_ab &&
+                no_cache.first.sampled_dab == cache.first.sampled_dab,
+            "Backward cache/no-cache results differ");
+    require(std::any_of(cache.first.dx.begin(), cache.first.dx.end(), [](const auto value) {
+              return value.bits != 0U;
+            }) &&
+                std::any_of(cache.first.dgate.begin(), cache.first.dgate.end(),
+                            [](float value) { return value != 0.0F; }),
+            "Backward outputs are unexpectedly all zero");
+    std::cout << "BACKWARD_SMOKE rank=" << rank << " world=" << world
+              << " top_k=" << top_k
+              << " dx_hash=" << hash_bf16_indexed(cache.first.dx)
+              << " dw1_hash=" << hash_bf16_indexed(cache.first.dw1)
+              << " dw2_hash=" << hash_bf16_indexed(cache.first.dw2)
+              << " dgate_hash=" << hash_fp32(cache.first.dgate)
+              << " cache_no_cache_equal=1 persistent_launches=1";
+    if (world == 1U && top_k == 1U) {
+      constexpr std::array<std::uint64_t, 4> hidden_samples{
+          0ULL, 17ULL, 1024ULL, hidden - 1ULL};
+      std::cout << " oracle_dx_bits=";
+      for (std::size_t i = 0; i < hidden_samples.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << cache.first.dx[hidden_samples[i]].bits;
+      }
+      std::cout << " oracle_dgate=" << cache.first.dgate[0]
+                << " oracle_dw1_bits="
+                << cache.first.dw1[0].bits << ','
+                << cache.first.dw1[intermediate * hidden + 17ULL].bits
+                << " oracle_dw2_bits="
+                << cache.first.dw2[0].bits << ','
+                << cache.first.dw2[17ULL * intermediate + 17ULL].bits
+                << " oracle_ab_bits="
+                << cache.first.sampled_ab[0].bits << ','
+                << cache.first.sampled_ab[17].bits << ','
+                << cache.first.sampled_ab[2048].bits << ','
+                << cache.first.sampled_ab[2048 + 17].bits
+                << " oracle_dab_bits="
+                << cache.first.sampled_dab[0].bits << ','
+                << cache.first.sampled_dab[17].bits << ','
+                << cache.first.sampled_dab[2048].bits << ','
+                << cache.first.sampled_dab[2048 + 17].bits
+                << " oracle_dw1_row0_bits=";
+      for (std::uint64_t column = 0; column < 32ULL; ++column) {
+        if (column != 0) std::cout << ',';
+        std::cout << cache.first.dw1[column].bits;
+      }
+    }
+    std::cout
+              << std::endl;
     return;
   }
   if (forward_smoke) {
@@ -3899,6 +4254,13 @@ int main(int argc, char **argv) {
               "NCCL-free production Forward sanitizer harness failed");
       std::cout << "[PASS] NCCL-free production world=1 Forward WGMMA/TMA "
                    "sanitizer harness\n";
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--backward-sanitizer") {
+      require(megamoe::cuda::testing::run_backward_world1_sanitizer_harness(),
+              "NCCL-free production Backward sanitizer harness failed");
+      std::cout << "[PASS] NCCL-free production world=1 Forward+Backward "
+                   "WGMMA/TMA sanitizer harness\n";
       return 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--bench") {

@@ -108,8 +108,26 @@ Phase 5 is ready for verification; clustered weight multicast/weight reuse and
 further WGMMA dependency reduction remain performance follow-ups rather than
 correctness blockers.
 
-## Phase 6 — backward persistent MegaKernel
+## Phase 6 — backward persistent MegaKernel (correctness baseline implemented)
 
-- Reuse the exact forward handle for dY dispatch and dX/dGate combine.
-- Cache/no-FC1-output-cache paths, fused SwiGLU backward, dX, dW1, and dW2.
-- `split_k=1`, canonical-M dW traversal, and fixed-order reductions.
+- The exact owning Forward handle now drives typed dY dispatch and dX/dGate
+  return/combine in one cooperative persistent launch.
+- Cache and no-cache paths share fused dV/gate/SwiGLU backward, dX, dW1 and
+  dW2. No-cache recomputes A/B from canonical X without redispatching X.
+- Main-shape GEMMs use TMA/WGMMA. dW is `split_k=1`, one CTA owns each output
+  tile, canonical padded-M order is fixed, and dGate/dX reductions avoid
+  floating atomics.
+- A NCCL-free production-kernel harness covers memcheck, racecheck and
+  initcheck. Single-node world 1/8 cache/no-cache correctness and steady
+  allocation auditing are available.
+- Performance closure remains open. Independent FP64 checks found that the
+  earlier direct MN-major dW path produced incorrect nonzero-column gradients,
+  so its 31.9 ms measurements are invalid. The corrected K-major path is exact
+  on the selected BF16 dW samples and reports max absolute oracle error
+  `3.51e-8` (from FP32 dGate). After fusing U/dAB transpose and using a
+  coalesced 256x256 dY/X transpose, one 10-warmup/100-sample local 8-GPU run
+  measured 41.538 ms Backward and 58.089 ms integrated Forward+Backward. This
+  does not beat the matching 33.700--33.851 ms Megatron Backward baseline;
+  dW (13.870 ms), dV (7.917 ms), dX (7.642 ms), and the remaining transpose
+  (7.754 ms) are the next profiling targets. No Phase-6 completion claim or
+  release commit is made until every independent run clears the 15% gates.

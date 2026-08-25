@@ -83,6 +83,39 @@ def measure(function, warmups, iterations):
     return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
 
 
+def measure_backward(setup, backward, warmups, iterations):
+    """Time native backward only; graph construction is outside the boundary."""
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(warmups):
+        output, gradient = setup()
+        torch.cuda.synchronize()
+        dist.barrier()
+        backward(output, gradient)
+        torch.cuda.synchronize()
+    cuda_samples = []
+    wall_samples = []
+    for _ in range(iterations):
+        output, gradient = setup()
+        torch.cuda.synchronize()
+        dist.barrier()
+        wall_begin = time.perf_counter_ns()
+        begin.record()
+        backward(output, gradient)
+        end.record()
+        end.synchronize()
+        wall_ms = (time.perf_counter_ns() - wall_begin) / 1.0e6
+        cuda_elapsed = torch.tensor(begin.elapsed_time(end),
+                                    dtype=torch.float64, device="cuda")
+        wall_elapsed = torch.tensor(wall_ms, dtype=torch.float64,
+                                    device="cuda")
+        dist.all_reduce(cuda_elapsed, op=dist.ReduceOp.MAX)
+        dist.all_reduce(wall_elapsed, op=dist.ReduceOp.MAX)
+        cuda_samples.append(cuda_elapsed.item())
+        wall_samples.append(wall_elapsed.item())
+    return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
+
+
 def fixed_random_selected_gates(tokens, top_k, rank,
                                 seed=0x4D4547414D4F4547):
     values = []
@@ -295,6 +328,7 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="identity")
+    parser.add_argument("--benchmark-backward", action="store_true")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -498,6 +532,42 @@ def main():
                                flat_gate[routes].unsqueeze(-1))
         return common.to(torch.bfloat16)
 
+    gradient_flat = torch.arange(args.tokens * args.hidden,
+                                 dtype=torch.int32, device="cuda")
+    output_gradient = ((torch.remainder(gradient_flat * 7 + rank * 19, 113) -
+                        56).to(torch.float32) / 128.0).to(
+                            torch.bfloat16).reshape(args.tokens, args.hidden)
+    del gradient_flat
+    output_gradient_hash = bf16_indexed_hash(output_gradient)
+    output_gradient_hashes = [None] * world
+    dist.all_gather_object(output_gradient_hashes, output_gradient_hash)
+
+    def native_training_graph():
+        if experts_module is None:
+            raise RuntimeError("Backward baseline requires te-grouped-mlp")
+        experts_module.zero_grad(set_to_none=False)
+        input_with_grad = hidden.detach().requires_grad_(True)
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            input_with_grad, routing, probabilities)
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        expert_input, local_counts, remote_gate = dispatcher.dispatch_postprocess(
+            remote_hidden, remote_probs)
+        expert_output, _ = experts_module(
+            expert_input, local_counts, remote_gate)
+        combine_input = dispatcher.combine_preprocess(expert_output)
+        returned = dispatcher.token_combine(combine_input)
+        output = dispatcher.combine_postprocess(returned)
+        return output, output_gradient
+
+    def native_backward(output, gradient):
+        output.backward(gradient)
+
+    def native_training_step():
+        output, gradient = native_training_graph()
+        native_backward(output, gradient)
+        return output
+
     def common_semantics_roundtrip():
         local_hidden, local_probs = dispatcher.dispatch_preprocess(
             hidden, routing, probabilities)
@@ -549,6 +619,12 @@ def main():
                 full_forward_roundtrip, args.warmups, args.iterations)
             run_result["common_forward_e2e"] = measure(
                 common_forward_roundtrip, args.warmups, args.iterations)
+            if args.benchmark_backward:
+                run_result["native_backward_only"] = measure_backward(
+                    native_training_graph, native_backward,
+                    args.warmups, args.iterations)
+                run_result["native_forward_backward_e2e"] = measure(
+                    native_training_step, args.warmups, args.iterations)
         measured_runs.append(run_result)
 
     native_output = full_roundtrip()
@@ -623,6 +699,14 @@ def main():
     forward_wall_means = ([
         run["native_forward_e2e"]["host_wall"]["mean_ms"]
         for run in measured_runs] if experts_module is not None else [])
+    weight_gradient_dtypes = []
+    if actual_weight_parameters is not None:
+        weight_gradient_dtypes = sorted({
+            str(parameter.grad.dtype)
+            for kind in ("w1", "w2")
+            for _, parameter in actual_weight_parameters[kind]
+            if parameter.grad is not None
+        })
     output = {
         "schema": 2,
         "implementation": "Megatron-Core MoEAlltoAllTokenDispatcher",
@@ -650,6 +734,7 @@ def main():
         "weight_generator_version": 3 if experts_module is not None else None,
         "activation_fixture": "MegaMOE rank-flat BF16 v2",
         "per_rank_activation_hash": activation_hashes,
+        "per_rank_output_gradient_hash": output_gradient_hashes,
         "per_rank_route_hash": route_hashes,
         "gate_mode": args.gate_mode,
         "gate_seed": "0x4d4547414d4f4547",
@@ -657,6 +742,7 @@ def main():
         "per_rank_weight_sample_hash": weight_hashes,
         "per_rank_actual_w1_device_hash": actual_w1_hashes,
         "per_rank_actual_w2_device_hash": actual_w2_hashes,
+        "weight_gradient_dtypes": weight_gradient_dtypes,
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
             "sum; final BF16 cast"),
@@ -697,6 +783,23 @@ def main():
                 run["common_forward_e2e"]["host_wall"]["mean_ms"]
                 for run in measured_runs],
         }
+        if args.benchmark_backward:
+            backward_means = [
+                run["native_backward_only"]["host_wall"]["mean_ms"]
+                for run in measured_runs]
+            training_means = [
+                run["native_forward_backward_e2e"]["host_wall"]["mean_ms"]
+                for run in measured_runs]
+            output["native_backward_host_wall_cross_run"] = {
+                "mean_ms": statistics.fmean(backward_means),
+                "variance_ms2": statistics.pvariance(backward_means),
+                "per_run_mean_ms": backward_means,
+            }
+            output["native_forward_backward_host_wall_cross_run"] = {
+                "mean_ms": statistics.fmean(training_means),
+                "variance_ms2": statistics.pvariance(training_means),
+                "per_run_mean_ms": training_means,
+            }
     if rank == 0:
         print("MEGATRON_BASELINE_JSON " + json.dumps(output, sort_keys=True),
               flush=True)
