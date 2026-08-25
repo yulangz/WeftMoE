@@ -173,8 +173,10 @@ correctness blockers.
 
 - A repository-external NCCL 2.29.7 CUDA-12.9 runtime passes real two-host
   world-2/world-16 device-communicator and registered-window lifecycle probes.
-  MegaMOE still reports `gin_backend_implemented=0, gin_usable=0` until actual
-  put/signal/local-completion kernels exist.
+  A dedicated world-2/world-16 probe also passes real same-rail device put,
+  remote indexed signal, local completion, and full payload hash validation.
+  MegaMOE still reports `gin_backend_implemented=0, gin_usable=0` until this
+  primitive is integrated with the activation ring and persistent kernels.
 - The first concrete `NcclSocketFallback` slice passes real world-2 and
   world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
   gate-after combine, and independent host-oracle comparison. It has no

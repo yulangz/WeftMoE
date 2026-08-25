@@ -186,6 +186,25 @@ deregisters a strict-ordering NCCL window, and destroys the device comm. It
 does not claim data-plane usability: until MegaMOE put/signal kernels exist,
 `gin_backend_implemented=0` and `gin_usable=0`.
 
+The same compatible runtime also executes a real 1 KiB payload on every rail:
+
+```bash
+env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
+  python3 tests/run_multinode_nccl.py \
+    --binary "$PWD/build-gin-put/test_cuda_notify" \
+    --remote root@10.10.19.233 --port 2222 \
+    --remote-binary "$PWD/build-gin-put/test_cuda_notify" \
+    --gpus-per-node 8 --scenario gin_put_probe \
+    --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
+```
+
+This probe uses `ncclTeamRail`, a registered NCCL allocation, a device-issued
+`ncclGin::put`, an indexed remote signal ordered after payload settlement, and
+a local completion counter before source reuse. The observed world-16 rail
+shape is two nodes by eight local ranks, and all 16 received hashes match the
+expected same-local-rank peer. It proves the runtime/plugin/NIC data-movement
+path, but is deliberately not counted as the complete MegaMOE GIN backend.
+
 The explicit Socket correctness backend uses the default CUDA-12.9 NCCL
 runtime and requires the network choice at communicator creation. A two-rank
 run is:

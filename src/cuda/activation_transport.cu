@@ -17,6 +17,9 @@
 #include <nccl_device/core.h>
 #include <nccl_device/impl/comm__types.h>
 #endif
+#if __has_include(<nccl_device.h>)
+#include <nccl_device.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1186,6 +1189,38 @@ __global__ void socket_finalize_status_kernel(TransportDeviceStatus *status,
   status->reduced_tokens = tokens;
   status->complete_clock = device_globaltimer_ns();
 }
+
+#if __has_include(<nccl_device.h>)
+__global__ void gin_probe_reset_kernel(ncclDevComm_t dev_comm) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const ncclGin gin(dev_comm, 0);
+    gin.resetSignal(0);
+    gin.resetCounter(0);
+  }
+}
+
+__global__ void gin_probe_put_signal_kernel(
+    ncclDevComm_t dev_comm, ncclWindow_t window, std::size_t payload_bytes,
+    std::size_t receive_offset, unsigned int *device_error) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  const ncclGin gin(dev_comm, 0);
+  const auto rail = ncclTeamRail(dev_comm);
+  if (rail.nRanks < 2) {
+    *device_error = 1U;
+    return;
+  }
+  const auto destination = (rail.rank + 1) % rail.nRanks;
+  gin.put(rail, destination, window, receive_offset, window, 0,
+          payload_bytes, ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+          ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_thread,
+          ::cuda::thread_scope_device);
+  // Counter completion proves the local source region can be reused. The
+  // remote indexed signal is ordered after the payload has settled.
+  gin.waitCounter(ncclCoopThread{}, 0, 1);
+  gin.waitSignal(ncclCoopThread{}, 0, 1);
+}
+#endif
 
 __global__ void peer_put_signal_kernel(const std::uint64_t *source,
                                        std::uint64_t *destination,
@@ -9037,6 +9072,239 @@ std::vector<transport::BFloat16> download_activation_output_for_validation(
     internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
   }
   return output;
+}
+
+testing::GinPutSignalProbeResult
+testing::run_distributed_gin_put_signal_probe(
+    const NcclSession &session, const CudaExecution &execution,
+    std::uint64_t payload_bytes) {
+#if !__has_include(<nccl_device.h>)
+  (void)session;
+  (void)execution;
+  (void)payload_bytes;
+  throw NotifyDispatchError(
+      NotifyErrorCode::BackendUnavailable,
+      "phase=gin-put-probe, field=headers, rank=0, expected=nccl_device.h, "
+      "actual=unavailable");
+#else
+  const auto nccl = internal::NcclSessionAccess::checked(session);
+  const auto exec = internal::checked_execution_state(execution);
+  if (nccl->device != exec->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "gin-put-probe",
+                    "device", nccl->rank, std::to_string(nccl->device),
+                    std::to_string(exec->device));
+  constexpr std::size_t kAllocationBytes = 4096;
+  constexpr std::size_t kReceiveOffset = 2048;
+  constexpr std::size_t kBarrierOffset = 3072;
+  constexpr std::size_t kErrorOffset = 4088;
+  if (payload_bytes == 0 || payload_bytes > kReceiveOffset)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "gin-put-probe",
+                    "payload_bytes", nccl->rank, "1..2048",
+                    std::to_string(payload_bytes));
+
+  using QueryPropertiesFn = ncclResult_t (*)(ncclComm_t,
+                                              ncclCommProperties_t *);
+  using DevCommCreateFn = ncclResult_t (*)(
+      ncclComm_t, const ncclDevCommRequirements_t *, ncclDevComm_t *);
+  using DevCommDestroyFn = ncclResult_t (*)(ncclComm_t,
+                                             const ncclDevComm_t *);
+  using WindowRegisterFn = ncclResult_t (*)(ncclComm_t, void *, std::size_t,
+                                             ncclWindow_t *, int);
+  using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+  using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
+  using MemFreeFn = ncclResult_t (*)(void *);
+  using TeamFn = ncclTeam_t (*)(ncclComm_t);
+  const auto load = [](const char *name) {
+    auto *symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol == nullptr)
+      throw NotifyDispatchError(
+          NotifyErrorCode::BackendUnavailable,
+          std::string("phase=gin-put-probe, field=symbol, rank=0, expected=") +
+              name + ", actual=missing from loaded runtime");
+    return symbol;
+  };
+  const auto query_properties = reinterpret_cast<QueryPropertiesFn>(
+      load("ncclCommQueryProperties"));
+  const auto dev_comm_create = reinterpret_cast<DevCommCreateFn>(
+      load("ncclDevCommCreate"));
+  const auto dev_comm_destroy = reinterpret_cast<DevCommDestroyFn>(
+      load("ncclDevCommDestroy"));
+  const auto window_register = reinterpret_cast<WindowRegisterFn>(
+      load("ncclCommWindowRegister"));
+  const auto window_deregister = reinterpret_cast<WindowDeregisterFn>(
+      load("ncclCommWindowDeregister"));
+  const auto mem_alloc =
+      reinterpret_cast<MemAllocFn>(load("ncclMemAlloc"));
+  const auto mem_free = reinterpret_cast<MemFreeFn>(load("ncclMemFree"));
+  const auto team_rail = reinterpret_cast<TeamFn>(load("ncclTeamRail"));
+  const auto team_lsa = reinterpret_cast<TeamFn>(load("ncclTeamLsa"));
+
+  ncclCommProperties_t properties{};
+  properties.size = sizeof(properties);
+  properties.magic = NCCL_API_MAGIC;
+  properties.version = NCCL_VERSION_CODE;
+  auto result = query_properties(nccl->comm, &properties);
+  if (result != ncclSuccess || properties.railedGinType == NCCL_GIN_TYPE_NONE)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-put-probe, field=railed_gin, rank=" +
+            std::to_string(nccl->rank) +
+            ", expected=available, actual=" +
+            (result == ncclSuccess
+                 ? std::string("NCCL_GIN_TYPE_NONE")
+                 : std::string(ncclGetErrorString(result))));
+  const auto rail = team_rail(nccl->comm);
+  const auto lsa = team_lsa(nccl->comm);
+  if (rail.nRanks < 2 || lsa.nRanks <= 0)
+    transport_error(NotifyErrorCode::BackendUnavailable, "gin-put-probe",
+                    "rail topology", nccl->rank, "rail.nRanks>=2, lsa>0",
+                    "rail=" + std::to_string(rail.nRanks) + ", lsa=" +
+                        std::to_string(lsa.nRanks));
+
+  ncclDevCommRequirements_t requirements =
+      NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  requirements.ginContextCount = 1;
+  requirements.ginExclusiveContexts = true;
+  requirements.ginQueueDepth = 32;
+  requirements.ginSignalCount = 1;
+  requirements.ginCounterCount = 1;
+  requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+  ncclDevComm_t dev_comm{};
+  ncclWindow_t window = nullptr;
+  void *allocation = nullptr;
+  bool dev_comm_created = false;
+  const auto cleanup = [&]() noexcept {
+    if (window != nullptr)
+      (void)window_deregister(nccl->comm, window);
+    if (allocation != nullptr)
+      (void)mem_free(allocation);
+    if (dev_comm_created)
+      (void)dev_comm_destroy(nccl->comm, &dev_comm);
+  };
+  try {
+    internal::throw_nccl(
+        "gin-put-probe",
+        dev_comm_create(nccl->comm, &requirements, &dev_comm), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclDevCommCreate(rail GIN)");
+    dev_comm_created = true;
+    internal::throw_nccl(
+        "gin-put-probe", mem_alloc(&allocation, kAllocationBytes), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclMemAlloc(GIN probe window)");
+    internal::throw_cuda(
+        "gin-put-probe",
+        cudaMemsetAsync(allocation, 0, kAllocationBytes, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemsetAsync(GIN probe window)");
+    std::vector<std::uint8_t> send(
+        checked_size(payload_bytes, "GIN probe payload"));
+    for (std::size_t index = 0; index < send.size(); ++index)
+      send[index] = static_cast<std::uint8_t>(
+          (static_cast<std::uint64_t>(nccl->rank) * 17ULL +
+           static_cast<std::uint64_t>(index) * 13ULL) %
+          251ULL);
+    internal::throw_cuda(
+        "gin-put-probe",
+        cudaMemcpyAsync(allocation, send.data(), send.size(),
+                        cudaMemcpyHostToDevice, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemcpyAsync(GIN probe source)");
+    internal::throw_cuda(
+        "gin-put-probe", cudaStreamSynchronize(exec->stream), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaStreamSynchronize(before GIN window register)");
+    internal::throw_nccl(
+        "gin-put-probe",
+        window_register(nccl->comm, allocation, kAllocationBytes, &window,
+                        NCCL_WIN_STRICT_ORDERING),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclCommWindowRegister(GIN probe)");
+    gin_probe_reset_kernel<<<1, 1, 0, exec->stream>>>(dev_comm);
+    auto *barrier = static_cast<std::uint64_t *>(allocation) +
+                    kBarrierOffset / sizeof(std::uint64_t);
+    internal::throw_nccl(
+        "gin-put-probe",
+        ncclAllReduce(barrier, barrier, 1, ncclUint64, ncclSum, nccl->comm,
+                      exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclAllReduce(after GIN reset)");
+    gin_probe_put_signal_kernel<<<1, 1, 0, exec->stream>>>(
+        dev_comm, window, checked_size(payload_bytes, "GIN probe payload"),
+        kReceiveOffset,
+        reinterpret_cast<unsigned int *>(
+            static_cast<std::byte *>(allocation) + kErrorOffset));
+    internal::throw_cuda(
+        "gin-put-probe", cudaGetLastError(), nccl->rank, nccl->world,
+        session.session().identity(), session.session().generation(),
+        ExchangeKind::ExpertCounts, "GIN put/signal kernel launch");
+    internal::throw_cuda(
+        "gin-put-probe", cudaStreamSynchronize(exec->stream), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaStreamSynchronize(GIN put/signal)");
+    unsigned int device_error = 0;
+    std::vector<std::uint8_t> received(send.size());
+    internal::throw_cuda(
+        "gin-put-probe",
+        cudaMemcpy(received.data(),
+                   static_cast<std::byte *>(allocation) + kReceiveOffset,
+                   received.size(), cudaMemcpyDeviceToHost),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemcpy(GIN received payload)");
+    internal::throw_cuda(
+        "gin-put-probe",
+        cudaMemcpy(&device_error,
+                   static_cast<std::byte *>(allocation) + kErrorOffset,
+                   sizeof(device_error), cudaMemcpyDeviceToHost),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemcpy(GIN device error)");
+    if (device_error != 0)
+      transport_error(NotifyErrorCode::NcclFailure, "gin-put-probe",
+                      "device_error", nccl->rank, "0",
+                      std::to_string(device_error));
+    const auto source_rail = (rail.rank + rail.nRanks - 1) % rail.nRanks;
+    const auto source_rank = source_rail * lsa.nRanks + lsa.rank;
+    std::vector<std::uint8_t> expected(received.size());
+    for (std::size_t index = 0; index < expected.size(); ++index)
+      expected[index] = static_cast<std::uint8_t>(
+          (static_cast<std::uint64_t>(source_rank) * 17ULL +
+           static_cast<std::uint64_t>(index) * 13ULL) %
+          251ULL);
+    const auto hash = [](const std::vector<std::uint8_t> &bytes) {
+      std::uint64_t value = 1469598103934665603ULL;
+      for (const auto byte : bytes)
+        value = (value ^ byte) * 1099511628211ULL;
+      return value;
+    };
+    testing::GinPutSignalProbeResult probe;
+    probe.payload_bytes = payload_bytes;
+    probe.rail_rank = static_cast<std::uint32_t>(rail.rank);
+    probe.rail_world = static_cast<std::uint32_t>(rail.nRanks);
+    probe.local_rank = static_cast<std::uint32_t>(lsa.rank);
+    probe.received_hash = hash(received);
+    probe.expected_hash = hash(expected);
+    if (received != expected)
+      transport_error(NotifyErrorCode::NcclFailure, "gin-put-probe",
+                      "received payload hash", nccl->rank,
+                      std::to_string(probe.expected_hash),
+                      std::to_string(probe.received_hash));
+    cleanup();
+    return probe;
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+#endif
 }
 
 ActivationTransportCapability probe_activation_transport_capability(

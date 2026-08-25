@@ -621,6 +621,22 @@ ActivationTransportCapability probe_activation_transport_capability(
     const NcclSession &session, const CudaExecution &execution);
 
 namespace testing {
+struct GinPutSignalProbeResult {
+  std::uint64_t payload_bytes = 0;
+  std::uint32_t rail_rank = 0;
+  std::uint32_t rail_world = 0;
+  std::uint32_t local_rank = 0;
+  std::uint64_t received_hash = 0;
+  std::uint64_t expected_hash = 0;
+};
+
+// Real device-issued GIN rail put with remote indexed signal and local
+// completion counter. This is a lifecycle/data-movement probe, not the full
+// activation backend.
+GinPutSignalProbeResult run_distributed_gin_put_signal_probe(
+    const NcclSession &session, const CudaExecution &execution,
+    std::uint64_t payload_bytes = 1024);
+
 BFloat16ActivationLease upload_bfloat16_activations_for_testing(
     const std::vector<transport::BFloat16> &host,
     std::uint64_t num_tokens, std::uint64_t hidden,

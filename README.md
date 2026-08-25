@@ -340,8 +340,11 @@ runtime initialization, backend implementation, and usability independently.
 The default NCCL 2.28.3 runtime lacks the required lifecycle symbols. An
 official NCCL 2.29.7 CUDA 12.9 package, explicitly loaded from a repository-
 external cache, has passed real two-host world-2 and world-16 device-comm plus
-collective registered-window lifecycle probes. The data-plane backend is not
-implemented yet; consequently `gin_backend_implemented=0, gin_usable=0`.
+collective registered-window lifecycle probes. A separate validation probe
+also passes real same-rail device-issued put, remote indexed signal, and local
+completion counter on world 2 and 16. The full activation data-plane backend
+is not implemented yet; consequently
+`gin_backend_implemented=0, gin_usable=0`.
 `NcclSocketFallback` has a distinct production constructor and refuses to run
 unless the communicator was explicitly configured for NCCL Socket
 (`NCCL_IB_DISABLE=1`). `Gin` still has no production constructor. Simulation,

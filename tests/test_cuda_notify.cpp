@@ -2411,6 +2411,21 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << std::endl;
     return;
   }
+  if (scenario == "gin_put_probe") {
+    const auto probe =
+        megamoe::cuda::testing::run_distributed_gin_put_signal_probe(
+            base, execution, 1024);
+    std::cout << "GIN_PUT_SIGNAL rank=" << rank << " world=" << world
+              << " rail_rank=" << probe.rail_rank
+              << " rail_world=" << probe.rail_world
+              << " local_rank=" << probe.local_rank
+              << " bytes=" << probe.payload_bytes
+              << " received_hash=" << probe.received_hash
+              << " expected_hash=" << probe.expected_hash
+              << " match=" << (probe.received_hash == probe.expected_hash)
+              << std::endl;
+    return;
+  }
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution,
       {common_config, max_tokens, 4096,

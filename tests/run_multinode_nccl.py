@@ -344,7 +344,7 @@ def parse_args(argv=None):
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
-                 "gin_probe", "activation_socket"),
+                 "gin_probe", "gin_put_probe", "activation_socket"),
         default="valid",
     )
     args = parser.parse_args(argv)
@@ -476,6 +476,28 @@ def main(argv=None):
                             for line in evidence)
         print(f"[PASS] distributed GIN lifecycle probe world={world} "
               f"runtime_initializable={int(initializable)}")
+        return
+
+    if args.scenario == "gin_put_probe":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("GIN_PUT_SIGNAL ")]
+            if (result.returncode != 0 or len(lines) != 1 or
+                    "match=1" not in (lines[0] if lines else "")):
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}, "
+                    f"evidence={len(lines)}; stdout={result.stdout[-4000:]}; "
+                    f"stderr={result.stderr[-4000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN put/signal failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] real GIN rail put/signal/local-completion world={world}")
         return
 
     if args.scenario == "activation_socket":
