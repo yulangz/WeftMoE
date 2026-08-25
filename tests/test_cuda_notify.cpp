@@ -2173,18 +2173,87 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             generation, execution, pool);
         auto notify = coordinator.run_device(
             {common_config, routes, gates, max_tokens});
+        auto host_metadata =
+            megamoe::cuda::download_device_metadata_for_validation(
+                notify.dispatch(), execution);
         megamoe::cuda::ActivationTransportRunOptions options;
         options.deadline_after = std::chrono::seconds(300);
-        return forward.run(
+        auto output = forward.run(
             notify.dispatch(), activations, weights,
             {hidden, intermediate,
              megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput},
             options);
+        return std::make_pair(std::move(output), std::move(host_metadata));
       };
-      const auto cache_hash = [&](const auto &handle) {
-        return hash_bf16_indexed(
+      const auto cache_evidence = [&](const auto &run) {
+        const auto cache =
             megamoe::cuda::download_forward_cache_for_validation(
-                handle, execution));
+                run.first, execution);
+        const auto &incoming = run.second->incoming.incoming_rows;
+        const auto plane_elements = incoming.size() * intermediate;
+        require(cache.size() == plane_elements * 2ULL,
+                "main-shape cache validation shape mismatch");
+        std::vector<std::uint32_t> sampled_experts;
+        std::uint32_t samples = 0;
+        constexpr std::array<std::uint64_t, 4> columns{
+            0ULL, 17ULL, 1024ULL, intermediate - 1ULL};
+        for (const auto &row : incoming) {
+          if (std::find(sampled_experts.begin(), sampled_experts.end(),
+                        row.expert_id) != sampled_experts.end())
+            continue;
+          std::uint64_t matching_offset = 0;
+          std::uint64_t source_token = max_tokens;
+          for (std::uint64_t token = 0; token < max_tokens; ++token) {
+            for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+              const auto expert = static_cast<std::uint32_t>(
+                  (token * 17U + row.source_rank * 31U + slot * 53U) %
+                  experts);
+              if (expert != row.expert_id)
+                continue;
+              if (matching_offset++ == row.source_expert_offset) {
+                source_token = token;
+                break;
+              }
+            }
+            if (source_token != max_tokens)
+              break;
+          }
+          require(source_token != max_tokens,
+                  "main-shape FC1 oracle could not recover source token");
+          for (const auto column : columns) {
+            for (std::uint32_t plane = 0; plane < 2U; ++plane) {
+              const auto weight_row = plane * intermediate + column;
+              double expected = 0.0;
+              for (std::uint64_t k = 0; k < hidden; ++k) {
+                const auto input = megamoe::transport::float_to_bfloat16(
+                    static_cast<float>(static_cast<int>(
+                        (source_token * hidden + k + row.source_rank * 13U) %
+                        127U) - 63) /
+                    64.0F);
+                const megamoe::transport::BFloat16 weight{
+                    fixture_weight_bits(row.expert_id, 1U, weight_row, k)};
+                expected +=
+                    static_cast<double>(
+                        megamoe::transport::bfloat16_to_float(input)) *
+                    static_cast<double>(
+                        megamoe::transport::bfloat16_to_float(weight));
+              }
+              const auto index =
+                  plane * plane_elements + row.dst_row * intermediate + column;
+              const auto actual = static_cast<double>(
+                  megamoe::transport::bfloat16_to_float(cache[index]));
+              require(std::abs(actual - expected) <= 0.02,
+                      "main-shape cached FC1 sample exceeds FP64 tolerance");
+              ++samples;
+            }
+          }
+          sampled_experts.push_back(row.expert_id);
+          if (sampled_experts.size() == 3U)
+            break;
+        }
+        require(sampled_experts.size() == 3U && samples == 24U,
+                "main-shape FC1 oracle did not cover three experts");
+        return std::make_pair(hash_bf16_indexed(cache), samples);
       };
       const auto output_hash_for = [&](const auto &handle) {
         return hash_bf16_indexed(
@@ -2192,15 +2261,17 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 handle, execution));
       };
       auto first = run_cached(900U);
-      const auto first_cache_before = cache_hash(first);
-      const auto first_output = output_hash_for(first);
+      const auto first_cache_evidence = cache_evidence(first);
+      const auto first_cache_before = first_cache_evidence.first;
+      const auto first_output = output_hash_for(first.first);
       auto second = run_cached(901U);
-      require(megamoe::cuda::testing_forward_cache_ranges_disjoint(first,
-                                                                   second),
+      require(megamoe::cuda::testing_forward_cache_ranges_disjoint(
+                  first.first, second.first),
               "main-shape Forward cache address intervals overlap");
-      const auto second_cache_before = cache_hash(second);
-      const auto second_output = output_hash_for(second);
-      require(first_cache_before == cache_hash(first),
+      const auto second_cache_evidence = cache_evidence(second);
+      const auto second_cache_before = second_cache_evidence.first;
+      const auto second_output = output_hash_for(second.first);
+      require(first_cache_before == cache_evidence(first).first,
               "gen2 overwrote live gen1 A/B checkpoint");
       require(first_output == second_output,
               "identical main-shape generations produced different output");
@@ -2217,14 +2288,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       }
       require(exhausted,
               "main-shape cache pool=2 accepted a third live generation");
-      first = {};
+      first.first = {};
       auto third = run_cached(904U);
-      require(second_cache_before == cache_hash(second),
+      require(second_cache_before == cache_evidence(second).first,
               "reusing released gen1 slot overwrote live gen2 checkpoint");
-      require(second_output == output_hash_for(third),
+      require(second_output == output_hash_for(third.first),
               "reused main-shape cache slot changed Forward output");
-      second = {};
-      third = {};
+      second.first = {};
+      third.first = {};
       live_usage = transport_pool.usage();
       require(live_usage.slots_available == 2U &&
                   live_usage.slots_in_use == 0U,
@@ -2236,6 +2307,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       std::cout << "FORWARD_CACHE_POOL2 rank=" << rank
                 << " disjoint=1 first_stable=1 second_stable=1"
                 << " third_exhausted=1 selective_reuse=1"
+                << " fc1_oracle_samples="
+                << first_cache_evidence.second + second_cache_evidence.second
                 << " first_cache_hash=" << first_cache_before
                 << " second_cache_hash=" << second_cache_before
                 << " output_hash=" << first_output << std::endl;

@@ -176,7 +176,9 @@ Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
 FP32 gates remain local. The explicit main-shape cache lifecycle test uses two
 simultaneously live slots and measures 7,104,537,168 device bytes/rank. It
 checks disjoint A/B device intervals, stable gen1 bytes after gen2, exact
-pool exhaustion, and selective reuse after one handle is released. Rank-0
+pool exhaustion, and selective reuse after one handle is released. Each rank
+also rebuilds 24 cached FC1 values per generation in FP64, spanning three
+experts, both A/B planes, and four non-adjacent intermediate columns. Rank-0
 output hashes are identical under EP1/EP2/EP8,
 cache/no-cache, release/debug, and 20 repeats. The independent NumPy FP64
 oracle checks selected main-shape output columns plus every cached A/B element;
