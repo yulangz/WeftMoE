@@ -257,12 +257,27 @@ apply the per-route FP32 gate at the source after return, accumulate top-k in
 device `combine_order`, and cast the final sum once to BF16. No S, ungated FC2
 output, or peer contribution is retained beyond the Forward lease.
 
+The correctness fixture is shared byte-for-byte with the Megatron baseline.
+Activation, selected-route, FP32 gate, and sampled weight hashes are exchanged
+and checked per rank before timing. Weights are rebuilt from an expert-aware
+hash of `(global_expert, tensor_kind, row_group, column)`; W1 and W2 differ,
+expert strides no longer collide, and the small BF16 range avoids SwiGLU
+saturation. The EP1/EP2/EP8 fixture keeps all 384 global experts and changes
+only contiguous ownership.
+
+Forward completion signals have explicit lifetime semantics: pool setup clears
+the backing allocation once, while each generation initializes only its
+owner-local signal words to the new epoch and completes a device peer
+ready/ack handshake before DispatchPut. No generation depends on `cudaMalloc`
+contents or a prior generation's signal value.
+
 The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
 CUDA runtime on the inspected L20X host; the fat binary also contains the
-ordinary `sm_89` target, which rejects this specialization at runtime. There is
-currently no correctness fallback for other H/I shapes. TMA multicast remains
-disabled (`audit=0`) because the attempted persistent cluster schedule did not
-meet the long-run progress contract; that optimization remains open.
+ordinary `sm_89` target, which rejects this specialization at runtime. The
+launch is a real 2-CTA runtime cluster (`cluster_size=2`, observed rank mask
+`0b11`, 66 active clusters/device). TMA multicast remains disabled (`audit=0`)
+and is not implied by cluster formation. There is currently no correctness
+fallback for other H/I shapes.
 
 The GIN probe reports headers, the full required symbol set, runtime minimal
 initialization, backend implementation, and usability independently. The

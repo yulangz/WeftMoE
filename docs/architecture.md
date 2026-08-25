@@ -29,9 +29,19 @@ grid completion is sufficient for reuse: every incoming peer has already
 published all rows acquired by Reduce, and every outgoing store has completed
 before its release signal.
 
+Completion storage is initialized, not assumed. Pool creation clears each
+physical slot once. Every Forward generation then launches a small owner-only
+setup kernel that writes `ingress_published` and
+`outgoing_sequence/source_ready` to `epoch-1`, system-fences those stores, and
+performs a peer-visible ready/ack handshake before any put can publish. The
+second acknowledgement prevents a fast rank from reinitializing a reused slot
+before a slow peer observed the preceding epoch. Two live generations select
+different deterministic physical slots; a slot is reusable only after the
+last Forward handle releases it.
+
 The benchmark reads first-start and last-complete device timestamps from the
 same status lease. On the main world-8 fixture FC1/FC2 overlap by about
-0.367 ms, FC2/Return by about 5.025 ms, and Return/Reduce by about 0.429 ms.
+0.366 ms, FC2/Return by about 5.018 ms, and Return/Reduce by about 0.429 ms.
 These full stage spans intentionally overlap and are not additive.
 
 Release mode precomputes an immutable M-block-to-expert lookup in the
@@ -43,6 +53,12 @@ The cache policy affects lifetime, not arithmetic: the cache mode retains BF16
 A/B checkpoints in the session pool; no-cache omits those stores. Both retain
 canonical dispatch X through the Forward handle. Transient S and expert output
 are generation-local. Cross-node Forward and backward are not implemented.
+
+The tested launch requests a `2x1x1` cluster with `cudaLaunchKernelEx`, checks
+`cudaDevAttrClusterLaunch` and `cudaOccupancyMaxActiveClusters`, and records
+the observed device cluster rank mask. On both inspected L20X hosts the runtime
+audit is `cluster_size=2`, rank mask `0b11`, with 66 active clusters possible.
+TMA multicast remains disabled; a runtime cluster is not reported as multicast.
 
 ## Runtime topology
 

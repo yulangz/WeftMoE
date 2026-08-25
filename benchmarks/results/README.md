@@ -6,7 +6,9 @@ expectations.
 
 - `forward_release_world8.json` records the three independent MegaMOE and
   Megatron-Core 0.17.0 Forward sessions and the formal per-run comparison,
-  plus the independent remote clean-export MegaMOE reproduction.
+  exact cross-implementation fixture hashes, cache/no-cache workspace and
+  timing, the independent NumPy FP64 oracle, runtime cluster audit, and the
+  remote clean-export reproduction.
 - `forward_main_world1_ncu.csv` records the available Nsight Compute metrics
   for the same main-shape kernel in world 1. Multi-process replay was not used
   because pausing one process independently invalidates the live peer data-plane

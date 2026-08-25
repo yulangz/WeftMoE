@@ -1,6 +1,6 @@
 {
-  "schema": 2,
-  "date_utc": "2026-08-24",
+  "schema": 3,
+  "date_utc": "2026-08-25",
   "shape": {
     "tokens_per_rank": 8192,
     "hidden": 7168,
@@ -15,30 +15,39 @@
     "independent_sessions": 3,
     "aggregation": "slowest-rank host wall"
   },
-  "megamoe_e2e_mean_ms": [14.903284, 14.879358, 14.892394],
-  "megatron_native_e2e_mean_ms": [17.92832474, 17.95219937, 18.01047872],
-  "megatron_common_gate_after_e2e_mean_ms": [21.96683932, 21.94236504, 21.97260625],
-  "speedup_vs_megatron_native_percent": [16.872969, 17.116796, 17.312614],
+  "megamoe_e2e_mean_ms": [14.933806, 14.934402, 14.938689],
+  "megatron_native_e2e_mean_ms": [18.21899256, 18.30685738, 18.17831938],
+  "megatron_common_gate_after_e2e_mean_ms": [22.12463053, 22.19485895, 22.07802596],
+  "speedup_vs_megatron_native_percent": [18.031659, 18.421815, 17.821397],
   "formal_every_run_at_least_15_percent": true,
   "megamoe_stage_mean_ms_per_run": {
-    "notify": [0.599188, 0.581077, 0.586561],
-    "dispatch": [1.976295, 1.975317, 1.978428],
-    "fc1_swiglu_full_span": [6.904886, 6.904366, 6.903483],
-    "fc2_full_span": [5.203186, 5.198555, 5.202047],
-    "return_full_span": [5.271978, 5.263944, 5.267675],
-    "deterministic_reduce_full_span": [1.167575, 1.163651, 1.231292],
-    "fc1_fc2_overlap": [0.366428, 0.366841, 0.366700],
-    "fc2_return_overlap": [5.028361, 5.022651, 5.025506],
-    "return_reduce_overlap": [0.429988, 0.428170, 0.428994]
+    "notify": [0.596652, 0.604633, 0.596208],
+    "dispatch": [1.962000, 1.959979, 1.960943],
+    "fc1_swiglu_full_span": [6.920321, 6.919576, 6.919800],
+    "fc2_full_span": [5.206178, 5.204197, 5.209155],
+    "return_full_span": [5.259155, 5.255669, 5.257883],
+    "deterministic_reduce_full_span": [1.153250, 1.147246, 1.145377],
+    "fc1_fc2_overlap": [0.366385, 0.366252, 0.366336],
+    "fc2_return_overlap": [5.018772, 5.014949, 5.020034],
+    "return_reduce_overlap": [0.428488, 0.431024, 0.427866]
   },
   "representative_wall_ms": {
-    "mean": 14.903284,
-    "p50": 14.890200,
-    "p95": 14.951600,
-    "min": 14.833300,
-    "max": 15.271000
+    "mean": 14.933806,
+    "p50": 14.921800,
+    "p95": 15.018700,
+    "min": 14.857900,
+    "max": 15.574200
   },
-  "workspace_device_bytes_per_rank": 2847625496,
+  "workspace_device_bytes_per_rank": 2847625512,
+  "cache_workspace_device_bytes_per_rank": 3552268584,
+  "cache_e2e_ms": {
+    "mean": 16.169839,
+    "p50": 16.162500,
+    "p95": 16.243500,
+    "min": 16.062000,
+    "max": 16.444300,
+    "mean_overhead_vs_no_cache_ms": 1.234207
+  },
   "weight_device_bytes_per_rank": 6341787648,
   "kernel_resources_sm90a": {
     "registers_per_thread": 168,
@@ -47,17 +56,36 @@
     "dynamic_shared_bytes_per_cta_world8": 196704
   },
   "cross_ep_rank0_hash": {
-    "ep1": "10269764484660630403",
-    "ep2": "10269764484660630403",
-    "ep8": "10269764484660630403"
+    "ep1": "17050206622106222467",
+    "ep2": "17050206622106222467",
+    "ep8": "17050206622106222467"
   },
-  "cross_implementation_output": {
-    "byte_identical": false,
-    "max_abs_error": 0.0185546875,
-    "max_rmse": 0.007263725157827139,
+  "independent_fp64_reference": {
+    "selected_output_max_abs": 0.0,
+    "selected_output_rmse": 0.0,
+    "fc1_cache_max_abs": 0.0008544921875,
+    "fc1_cache_rmse": 0.0003248844283583844,
     "accepted_max_abs": 0.02,
     "accepted_rmse": 0.008,
-    "note": "MegaMOE is bitwise stable across EP/cache/build/repeat; TransformerEngine is checked by BF16/WGMMA tolerance, not instruction-order identity"
+    "note": "Independent NumPy FP64 reconstruction; BF16 inputs and documented phase casts"
+  },
+  "fixture": {
+    "activation_hash_rank0": 171170217191544600,
+    "weight_sample_hash_rank0": 11295211195109083342,
+    "formula": "expert-aware hash(global_expert,tensor_kind,row_group,column), row_group=row/1024"
+  },
+  "runtime_cluster": {
+    "requested_size": 2,
+    "observed_size": 2,
+    "observed_rank_mask": 3,
+    "max_active_clusters": 66,
+    "tma_multicast": false
+  },
+  "steady_cuda_api_audit": {
+    "device_allocate_free": 0,
+    "pinned_allocate_free": 0,
+    "event_create_destroy": 0,
+    "device_synchronize": 0
   },
   "ncu_world1": {
     "kernel_duration_ms": 19.431776,
@@ -77,11 +105,9 @@
   },
   "remote_clean_archive": {
     "host": "10.10.19.233",
-    "megamoe_e2e_mean_ms": [14.870526, 14.875508, 14.824276],
-    "megamoe_e2e_p50_ms": [14.8574, 14.8452, 14.8161],
-    "megamoe_e2e_p95_ms": [14.9456, 15.0422, 14.9222],
-    "cross_ep_rank0_hash": "10269764484660630403",
-    "megatron_available": false,
-    "note": "clean tracked-file export; world 1/2/8 top-k 1/6 smoke and three world-8 10-warmup/100-sample sessions passed"
+    "world8_rank0_hash": "17050206622106222467",
+    "forward_initcheck_errors": 0,
+    "cross_host_notify_worlds": [2, 16],
+    "note": "clean tracked+new-file export; world8 20-repeat cache/no-cache and cross-host Notify passed"
   }
 }

@@ -15,6 +15,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 BOOTSTRAP_BYTES = 128
@@ -225,6 +226,37 @@ def runner(binary, rank, world, seed, fd, output, scenario, prefix=()):
     ]
 
 
+def start_process_capture(process):
+    """Continuously drain both pipes so a verbose rank cannot block peers."""
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def drain(stream, destination):
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", "replace")
+            destination.extend(chunk)
+
+    threads = []
+    for name in ("stdout", "stderr"):
+        thread = threading.Thread(
+            target=drain, args=(getattr(process, name), buffers[name]),
+            daemon=True)
+        thread.start()
+        threads.append(thread)
+    return buffers, threads
+
+
+def captured_text(capture):
+    buffers, threads = capture
+    for thread in threads:
+        thread.join(timeout=2.0)
+    return (bytes(buffers["stdout"]).decode("utf-8", "replace"),
+            bytes(buffers["stderr"]).decode("utf-8", "replace"))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
@@ -236,6 +268,7 @@ def main():
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
+    parser.add_argument("--forward-cache", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
@@ -259,18 +292,24 @@ def main():
     environment.setdefault("NCCL_DEBUG", "WARN")
     environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
     environment["MEGAMOE_GATE_MODE"] = args.gate_mode
+    if args.forward_cache:
+        if not (args.forward_benchmark or args.forward_smoke):
+            parser.error("--forward-cache requires a Forward mode")
+        environment["MEGAMOE_FORWARD_CACHE"] = "1"
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
     elif args.forward_benchmark:
         environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
-        if args.forward_output_dir:
-            os.makedirs(args.forward_output_dir, mode=0o700, exist_ok=True)
-            environment["MEGAMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
-                args.forward_output_dir)
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+    if args.forward_output_dir:
+        if not (args.forward_benchmark or args.forward_smoke):
+            parser.error("--forward-output-dir requires a Forward mode")
+        os.makedirs(args.forward_output_dir, mode=0o700, exist_ok=True)
+        environment["MEGAMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
+            args.forward_output_dir)
     if args.no_wrap:
         environment["MEGAMOE_P2P_NO_WRAP"] = "1"
     if args.ring_slots is not None:
@@ -291,7 +330,7 @@ def main():
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
                    scenario,
                    prefix),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
             pass_fds=(write_fd,), env=environment,
         )
         processes.append(rank0)
@@ -310,6 +349,7 @@ def main():
             )
             send_exact(process, frame)
             processes.append(process)
+        captures = [start_process_capture(process) for process in processes]
         deadline = time.monotonic() + args.timeout
         # Fail fast if any peer exits while another rank is still blocked in a
         # collective or peer signal wait; waiting rank 0 first hides the true
@@ -318,47 +358,39 @@ def main():
             failed = next((index for index, process in enumerate(processes)
                            if process.poll() not in (None, 0)), None)
             if failed is not None:
-                process = processes[failed]
-                stdout, stderr = process.communicate()
-                if isinstance(stdout, bytes):
-                    stdout = stdout.decode("utf-8", "replace")
-                    stderr = stderr.decode("utf-8", "replace")
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                for process in processes:
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                stdout, stderr = captured_text(captures[failed])
                 raise RuntimeError(
-                    f"rank={failed} exited early code={process.returncode} "
+                    f"rank={failed} exited early "
+                    f"code={processes[failed].returncode} "
                     f"stdout_tail={stdout[-1000:]} stderr_tail={stderr[-3000:]}")
             if all(process.poll() is not None for process in processes):
                 break
             time.sleep(0.02)
+        if any(process.poll() is None for process in processes):
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+            for process in processes:
+                process.wait()
+            tails = []
+            for rank, capture in enumerate(captures):
+                stdout, stderr = captured_text(capture)
+                tails.append(
+                    f"rank={rank} stdout_tail={stdout[-500:]} "
+                    f"stderr_tail={stderr[-1500:]}")
+            raise RuntimeError("rank launcher timed out " + " ".join(tails))
         observed = []
         for rank, process in enumerate(processes):
-            timeout = max(0.1, deadline - time.monotonic())
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-                if isinstance(stdout, bytes):
-                    stdout = stdout.decode("utf-8", "replace")
-                    stderr = stderr.decode("utf-8", "replace")
-                peer_tails = []
-                for peer_rank, peer in enumerate(processes):
-                    if peer is process:
-                        continue
-                    if peer.poll() is None:
-                        peer.kill()
-                    peer_stdout, peer_stderr = peer.communicate()
-                    if isinstance(peer_stdout, bytes):
-                        peer_stdout = peer_stdout.decode("utf-8", "replace")
-                        peer_stderr = peer_stderr.decode("utf-8", "replace")
-                    peer_tails.append(
-                        f"peer_rank={peer_rank} stdout_tail={peer_stdout[-500:]} "
-                        f"stderr_tail={peer_stderr[-1500:]}")
-                raise RuntimeError(
-                    f"rank={rank} timed out stdout_tail={stdout[-1000:]} "
-                    f"stderr_tail={stderr[-3000:]} " + " ".join(peer_tails))
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode("utf-8", "replace")
-                stderr = stderr.decode("utf-8", "replace")
+            stdout, stderr = captured_text(captures[rank])
             if process.returncode != 0:
                 sanitizer = "\n".join(
                     line for line in stdout.splitlines()
@@ -451,6 +483,8 @@ def main():
                     "schema": 1,
                     "benchmark": "single-persistent-forward-main-shape",
                     "world": args.world,
+                    "cache_mode": ("cache-fc1-input-output"
+                                   if args.forward_cache else "no-cache"),
                     "warmup": 10,
                     "measured": args.rounds - 10,
                     "shape": {"tokens_per_rank": 8192, "hidden": 7168,
@@ -466,6 +500,27 @@ def main():
                         int(item["return_peer_bytes"]) for item in observed],
                     "per_rank_output_hash": [
                         item["output_hash"] for item in observed],
+                    "per_rank_activation_hash": [
+                        int(item["activation_hash"]) for item in observed],
+                    "per_rank_route_hash": [
+                        int(item["route_hash"]) for item in observed],
+                    "per_rank_gate_hash": [
+                        int(item["gate_hash"]) for item in observed],
+                    "per_rank_weight_sample_hash": [
+                        int(item["weight_hash"]) for item in observed],
+                    "per_rank_cluster_supported": [
+                        int(item["cluster_supported"]) for item in observed],
+                    "per_rank_cluster_requested": [
+                        int(item["cluster_requested"]) for item in observed],
+                    "per_rank_cluster_actual": [
+                        int(item["cluster_actual"]) for item in observed],
+                    "per_rank_cluster_rank_mask": [
+                        int(item["cluster_rank_mask"]) for item in observed],
+                    "per_rank_max_active_clusters": [
+                        int(item["max_active_clusters"]) for item in observed],
+                    "per_rank_steady_forbidden_cuda_api_calls": [
+                        int(item["steady_forbidden_cuda_api_calls"])
+                        for item in observed],
                     "per_rank_wgmma_instructions": [
                         int(item["wgmma"]) for item in observed],
                     "per_rank_tma_loads": [int(item["tma"])

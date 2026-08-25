@@ -274,6 +274,11 @@ struct ForwardMegaKernelAudit {
   std::uint64_t wgmma_instructions = 0;
   std::uint64_t tma_loads = 0;
   std::uint64_t tma_multicast_loads = 0;
+  bool runtime_cluster_supported = false;
+  std::uint32_t requested_cluster_size = 1;
+  std::uint32_t runtime_cluster_size = 1;
+  std::uint64_t observed_cluster_rank_mask = 1;
+  std::uint32_t max_active_clusters = 0;
   std::uint64_t fc1_tasks = 0;
   std::uint64_t fc2_tasks = 0;
   std::uint64_t actual_dispatch_peer_bytes = 0;
@@ -302,6 +307,9 @@ private:
   friend std::vector<transport::BFloat16>
   download_forward_output_for_validation(const DeviceForwardHandle &,
                                          const CudaExecution &);
+  friend std::vector<transport::BFloat16>
+  download_forward_cache_for_validation(const DeviceForwardHandle &,
+                                        const CudaExecution &);
 };
 
 class LocalCudaP2pForwardMegaKernel {
@@ -325,6 +333,10 @@ private:
 std::vector<transport::BFloat16>
 download_forward_output_for_validation(const DeviceForwardHandle &handle,
                                        const CudaExecution &execution);
+
+std::vector<transport::BFloat16>
+download_forward_cache_for_validation(const DeviceForwardHandle &handle,
+                                      const CudaExecution &execution);
 
 struct ActivationTransportValidationDownload {
   std::vector<transport::BFloat16> contribution_by_route;
@@ -381,6 +393,10 @@ double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
                                             std::uint64_t bytes,
                                             std::uint32_t warmup,
                                             std::uint32_t measured);
+// NCCL-free sanitizer harness. It launches the exact production main-shape
+// Forward persistent kernel, replacing only Notify/bootstrap with an explicit
+// initialized world-1 dispatch fixture.
+bool run_forward_world1_sanitizer_harness();
 } // namespace testing
 
 } // namespace megamoe::cuda

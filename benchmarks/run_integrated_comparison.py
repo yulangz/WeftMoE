@@ -122,6 +122,23 @@ def main():
     per_run_native_speedup = [
         (native - mega) / native * 100.0
         for native, mega in zip(megatron_native_means, mega_means_ms)]
+    fixture_fields = (
+        "per_rank_activation_hash", "per_rank_route_hash",
+        "per_rank_gate_hash", "per_rank_weight_sample_hash")
+    fixture_agreement = {}
+    for field in fixture_fields:
+        mega_values = mega_runs[0].get(field)
+        for run_index, run_record in enumerate(mega_runs):
+            if run_record.get(field) != mega_values:
+                raise RuntimeError(
+                    f"MegaMOE fixture changed field={field} run={run_index}")
+        for run_index, launch in enumerate(megatron_launches):
+            actual = launch.get(field)
+            if actual != mega_values:
+                raise RuntimeError(
+                    f"fixture mismatch field={field} run={run_index} "
+                    f"MegaMOE={mega_values} Megatron={actual}")
+        fixture_agreement[field] = mega_values
     result = {
         "schema": 1,
         "comparison": "single-node-8-rank-full-forward-integrated-host-wall",
@@ -159,6 +176,7 @@ def main():
             per_run_native_speedup,
         "formal_target_at_least_15_percent":
             all(value >= 15.0 for value in per_run_native_speedup),
+        "fixture_hash_agreement": fixture_agreement,
         "cross_implementation_output_equivalence": {
             "method": "explicit output artifacts; see --save-output-dir runs",
             "byte_identical": False,

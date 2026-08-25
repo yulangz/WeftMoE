@@ -156,35 +156,49 @@ the timed workload.
 
 On the inspected local 8-GPU host, three independent release sessions (each
 10 warmups + 100 measurements) produced slowest-rank Forward E2E means of
-14.9033, 14.8794, and 14.8924 ms. The same-route/same-gate/same-weight
-Megatron-Core 0.17.0 native means were 17.9283, 17.9522, and 18.0105 ms. The
-paired speedups are 16.87%, 17.12%, and 17.31%; every independent session
-passes the 15% gate. Megatron's explicit source-gate-after common-semantics
-means were 21.9668, 21.9424, and 21.9726 ms. These two Megatron results remain
+14.9338, 14.9344, and 14.9387 ms. The exact same activation, route, gate, and
+expert-aware weight fixture on Megatron-Core 0.17.0 produced native means of
+18.2190, 18.3069, and 18.1783 ms. The paired speedups are 18.03%, 18.42%, and
+17.82%; every independent session passes the 15% gate. Megatron's explicit
+source-gate-after common-semantics means were 22.1246, 22.1949, and 22.0780 ms.
+These two Megatron results remain
 separate because its native path applies routing probability at a different
 point.
 
-The three MegaMOE stage means span Notify 0.581--0.599 ms, Dispatch
-1.975--1.978 ms, full FC1 6.903--6.905 ms, full FC2 5.199--5.203 ms,
-full M-block Return 5.264--5.272 ms, and full deterministic Reduce
-1.164--1.231 ms. These spans overlap and therefore must not be summed:
-device timestamps measure FC1/FC2 overlap at 0.366--0.367 ms, FC2/Return at
-5.023--5.028 ms, and Return/Reduce at 0.428--0.430 ms. Dispatch remains an
+The three MegaMOE stage means span Notify 0.596--0.605 ms, Dispatch
+1.960--1.962 ms, full FC1 6.920 ms, full FC2 5.204--5.209 ms,
+full M-block Return 5.256--5.259 ms, and full deterministic Reduce
+1.145--1.153 ms. These spans overlap and therefore must not be summed:
+device timestamps measure FC1/FC2 overlap at 0.366 ms, FC2/Return at
+5.015--5.020 ms, and Return/Reduce at 0.428--0.431 ms. Dispatch remains an
 initial bulk phase and is not claimed as hidden. The measured pool is
-2,847,625,496 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
+2,847,625,512 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
 Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
-FP32 gates remain local. Rank-0 output hashes are identical under EP1/EP2/EP8,
-cache/no-cache, release/debug, and 20 repeats. Against the common high-precision
-Forward reference, max absolute error is 0.0185547 and max RMSE is 0.00726373;
-the checked tolerances are 0.02 and 0.008 respectively. Byte identity with
-TransformerEngine's internal instruction order is intentionally not required.
+FP32 gates remain local. Cache mode uses 3,552,268,584 bytes/rank and measures
+16.1698 ms mean, 16.1625 ms P50, and 16.2435 ms P95: 1.2342 ms over the
+no-cache mean. Rank-0 output hashes are identical under EP1/EP2/EP8,
+cache/no-cache, release/debug, and 20 repeats. The independent NumPy FP64
+oracle checks selected main-shape output columns plus every cached A/B element;
+output error is zero and the cache max absolute/RMSE are 0.0008545/0.0003249
+against fixed 0.02/0.008 limits. Byte identity with TransformerEngine's
+internal instruction order is intentionally not required.
 
-A clean tracked-file export on `10.10.19.233` reproduced world 1/2/8,
-top-k 1/6, cache/no-cache, and 20-repeat correctness with the same rank-0 hash.
-Its three world-8 Forward means were 14.8705, 14.8755, and 14.8243 ms; P95 was
-14.9456, 15.0422, and 14.9222 ms. Megatron-Core is not installed on that host,
-so the formal paired speedup is the local same-host comparison above rather
-than a cross-machine estimate.
+The production launch requests cluster dimension `2x1x1`; both inspected L20X
+hosts report cluster capability, `cudaOccupancyMaxActiveClusters=66`, and a
+device-observed cluster size/rank mask of `2/0b11`. TMA multicast is still off,
+so reports distinguish actual cluster formation from multicast capability.
+Pool construction clears each slot once. A generation writes only
+`2 * world * channels` completion words plus `2 * world` ready/ack words in a
+small setup kernel; it performs no arena-wide memset. The Forward benchmark's
+runtime API snapshot reports zero device/pinned allocation or free, event
+create/destroy, and `cudaDeviceSynchronize` calls across every steady sample.
+
+A clean tracked-file export on `10.10.19.233` reproduced world-8 top-k=6,
+cache/no-cache, and 20-repeat correctness with rank-0 hash
+`17050206622106222467`; Forward initcheck reported zero errors. The same export
+also passed real cross-host Notify world 2 and 16. Megatron-Core is not
+installed on that host, so the formal paired speedup remains the local
+same-host comparison above rather than a cross-machine estimate.
 
 Nsight Compute on the main-shape world-1 compute slice reports 19.432 ms kernel
 duration, 55.97% SM throughput, 66.55% DRAM throughput, 56.29% Tensor-pipe
@@ -292,12 +306,15 @@ make BUILD_DIR=build-cuda \
 ```
 
 `cuda-sanitizer-smoke` runs memcheck, racecheck, and initcheck over that same
-closed-loop 73-node path. All three tools were available locally and reported
-0 errors/0 hazards. The remote image provides the executable at
+closed-loop 73-node path and over an NCCL-free harness that launches the exact
+production world-1 Forward WGMMA/TMA persistent kernel. All six invocations
+reported 0 errors/0 hazards. The harness replaces only bootstrap/Notify with
+an explicitly initialized world-1 dispatch view; it is not the device-smoke
+kernel. The remote image provides the executable at
 `/usr/local/cuda/bin/compute-sanitizer` but does not include that directory in
-the default `PATH`; explicit invocation from a clean export also reported
-0 errors/0 hazards for all three tools. Host ASan/UBSan and world 1/2/8 ran
-from the same clean export.
+the default `PATH`; explicit Forward initcheck from a clean export also
+reported 0 errors. Host ASan/UBSan and world 1/2/8 ran from the same clean
+export.
 
 For the real two-process IPC test, the launcher now reads the fixed 128-byte
 bootstrap frame and uses a bounded nonblocking trailing-byte check. This avoids
@@ -362,8 +379,9 @@ The measurements in this subsection are the frozen identity-expert transport
 baseline from phase 4. They are retained for regression analysis and are not
 the phase-5 full-Forward performance claim. The current
 `benchmarks/run_integrated_comparison.py` instead runs the full WGMMA/TMA
-Forward comparison described above and fails unless every independent run is
-at least 15% faster than Megatron native.
+Forward comparison described above, verifies per-rank hashes for activation,
+routes, gates, and sampled weights before accepting timing, and fails unless
+every independent run is at least 15% faster than Megatron native.
 
 The phase-4 comparison launcher used three independent process worlds for each
 implementation, with 10 warmups and

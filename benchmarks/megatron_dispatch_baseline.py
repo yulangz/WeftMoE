@@ -102,6 +102,71 @@ def fp32_hash(tensor):
     return value
 
 
+def i32_hash(tensor):
+    value = 1469598103934665603
+    for item in tensor.contiguous().view(-1).cpu().tolist():
+        bits = int(item) & 0xffffffff
+        for byte in struct.pack("<I", bits):
+            value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return value
+
+
+def bf16_indexed_hash(tensor):
+    bits = tensor.contiguous().view(torch.uint16).view(-1)
+    result = 0
+    chunk = 1_000_000
+    for offset in range(0, bits.numel(), chunk):
+        end = min(bits.numel(), offset + chunk)
+        indices = torch.arange(offset + 1, end + 1, dtype=torch.int64,
+                               device=bits.device)
+        subtotal = (bits[offset:end].to(torch.int64) * indices).sum().item()
+        result = (result + int(subtotal)) & ((1 << 64) - 1)
+    return result
+
+
+def fixture_mix32(value):
+    value = torch.bitwise_and(value ^ torch.bitwise_right_shift(value, 16),
+                              0xffffffff)
+    value = torch.bitwise_and(value * 0x7feb352d, 0xffffffff)
+    value = torch.bitwise_and(value ^ torch.bitwise_right_shift(value, 15),
+                              0xffffffff)
+    value = torch.bitwise_and(value * 0x846ca68b, 0xffffffff)
+    return torch.bitwise_and(value ^ torch.bitwise_right_shift(value, 16),
+                             0xffffffff)
+
+
+def forward_fixture_values(global_expert, tensor_kind, row, column):
+    scalar_key = ((global_expert * 0x9e3779b1) ^
+                  (tensor_kind * 0x85ebca77)) & 0xffffffff
+    key = torch.full_like(row, scalar_key, dtype=torch.int64)
+    key = key ^ torch.bitwise_and(torch.div(
+        row, 1024, rounding_mode="floor") * 0xc2b2ae3d, 0xffffffff)
+    row_salt = fixture_mix32(key)
+    signed = torch.bitwise_and(row_salt + column, 15).to(torch.int32) - 8
+    return (signed.float() / 512.0).to(torch.bfloat16)
+
+
+def forward_weight_sample_hash(expert_begin, expert_count, hidden,
+                               intermediate):
+    value = 1469598103934665603
+    samples = (
+        (1, ((0, 0), (1, 17), (intermediate, hidden - 1),
+             (2 * intermediate - 1, hidden // 2))),
+        (2, ((0, 0), (17, 1), (hidden // 2, intermediate - 1),
+             (hidden - 1, intermediate // 2))),
+    )
+    for expert in range(expert_begin, expert_begin + expert_count):
+        for tensor_kind, coordinates in samples:
+            for row, column in coordinates:
+                bits = int(forward_fixture_values(
+                    expert, tensor_kind, torch.tensor([row], dtype=torch.int64),
+                    torch.tensor([column], dtype=torch.int64)).view(
+                        torch.uint16).item())
+                for byte in struct.pack("<H", bits):
+                    value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return value
+
+
 @torch.no_grad()
 def initialize_megamoe_forward_weights(module, global_expert_begin,
                                         hidden, intermediate):
@@ -117,12 +182,12 @@ def initialize_megamoe_forward_weights(module, global_expert_begin,
         is_fc1 = "linear_fc1" in name
         if is_fc1:
             expected = 2 * intermediate * hidden
-            global_base = global_expert * expected
-            multiplier, addend = 7, 3
+            tensor_kind = 1
+            row_width = hidden
         elif "linear_fc2" in name:
             expected = hidden * intermediate
-            global_base = global_expert * expected
-            multiplier, addend = 5, 1
+            tensor_kind = 2
+            row_width = intermediate
         else:
             raise RuntimeError(f"unexpected expert parameter: {name}")
         if parameter.numel() != expected:
@@ -132,10 +197,12 @@ def initialize_megamoe_forward_weights(module, global_expert_begin,
         flat = parameter.view(-1)
         for offset in range(0, expected, chunk):
             end = min(expected, offset + chunk)
-            index = torch.arange(global_base + offset, global_base + end,
+            index = torch.arange(offset, end,
                                  dtype=torch.int64, device=parameter.device)
-            value = (((index * multiplier + addend) & 15).to(torch.int32) - 8)
-            flat[offset:end].copy_((value.float() / 512.0).to(torch.bfloat16))
+            flat[offset:end].copy_(forward_fixture_values(
+                global_expert, tensor_kind,
+                torch.div(index, row_width, rounding_mode="floor"),
+                torch.remainder(index, row_width)))
 
 
 def loaded_nccl_libraries():
@@ -229,13 +296,14 @@ def main():
             experts_module, rank * local_experts, args.hidden,
             args.intermediate)
 
-    # Bit-for-bit the same deterministic BF16 input used by MegaMOE's C++
-    # integrated runner: flattened element i is (rank*101 + i%97)/32.
+    # Shared MegaMOE/Megatron BF16 fixture v2. Rank and flat index enter the
+    # same expression on both implementations before the BF16 cast.
     flat = torch.arange(args.tokens * args.hidden, dtype=torch.int32,
                         device="cuda")
-    hidden = ((rank * 101 + torch.remainder(flat, 97)).to(torch.float32) /
-              32.0).to(torch.bfloat16).reshape(args.tokens, args.hidden)
+    hidden = ((torch.remainder(flat + rank * 13, 127) - 63).to(torch.float32) /
+              64.0).to(torch.bfloat16).reshape(args.tokens, args.hidden)
     del flat
+    activation_hash = bf16_indexed_hash(hidden)
     token = torch.arange(args.tokens, device="cuda", dtype=torch.long)[:, None]
     slot = torch.arange(args.top_k, device="cuda", dtype=torch.long)[None, :]
     selected = (token * 17 + rank * 31 + slot * 53) % args.experts
@@ -250,8 +318,17 @@ def main():
                           fixed_random_selected_gates(
                               args.tokens, args.top_k, rank))
     gate_hash = fp32_hash(selected_gates_cpu)
+    route_hash = i32_hash(selected.to(torch.int32))
+    weight_hash = forward_weight_sample_hash(
+        rank * local_experts, local_experts, args.hidden, args.intermediate)
+    activation_hashes = [None] * world
+    route_hashes = [None] * world
     gate_hashes = [None] * world
+    weight_hashes = [None] * world
+    dist.all_gather_object(activation_hashes, activation_hash)
+    dist.all_gather_object(route_hashes, route_hash)
     dist.all_gather_object(gate_hashes, gate_hash)
+    dist.all_gather_object(weight_hashes, weight_hash)
     selected_gates = selected_gates_cpu.to(device="cuda")
     probabilities.scatter_(1, selected, selected_gates)
 
@@ -482,11 +559,15 @@ def main():
         "expert_body": args.expert_body,
         "gemm_backend": ("TransformerEngine TEGroupedMLP"
                          if experts_module is not None else "none"),
-        "weight_fixture": ("MegaMOE deterministic BF16 global-index v1"
+        "weight_fixture": ("MegaMOE expert-aware hash BF16 v2"
                            if experts_module is not None else "none"),
+        "activation_fixture": "MegaMOE rank-flat BF16 v2",
+        "per_rank_activation_hash": activation_hashes,
+        "per_rank_route_hash": route_hashes,
         "gate_mode": args.gate_mode,
         "gate_seed": "0x4d4547414d4f4547",
         "per_rank_gate_hash": gate_hashes,
+        "per_rank_weight_sample_hash": weight_hashes,
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
             "sum; final BF16 cast"),
