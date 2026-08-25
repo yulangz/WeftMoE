@@ -174,7 +174,7 @@ initial bulk phase and is not claimed as hidden. The measured pool is
 2,847,625,512 bytes/rank and immutable weights are 6,341,787,648 bytes/rank.
 Each rank moves about 616.6 MB peer dispatch and 616.5 MB peer return payload;
 FP32 gates remain local. The explicit main-shape cache lifecycle test uses two
-simultaneously live slots and measures 7,104,537,168 device bytes/rank. It
+simultaneously live slots and measures 7,104,537,680 device bytes/rank. It
 checks disjoint A/B device intervals, stable gen1 bytes after gen2, exact
 pool exhaustion, and selective reuse after one handle is released. Each rank
 also rebuilds 24 cached FC1 values per generation in FP64, spanning three

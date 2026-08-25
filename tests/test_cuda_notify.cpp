@@ -642,6 +642,133 @@ void test_device_capacity_failure_and_recovery() {
   std::cout << "[PASS] device capacity failure and exact-capacity recovery\n";
 }
 
+#if !MEGAMOE_DEBUG_VALIDATE
+void test_release_fused_status_and_config_fallback() {
+  constexpr std::uint32_t world = 2;
+  const auto config = make_config(1, world, 8, 3, 4);
+  const std::vector<megamoe::RankRoutingInput> good_routes(
+      world, megamoe::RankRoutingInput{1, {0, 1, 2}});
+  auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
+  std::vector<std::exception_ptr> unexpected(world);
+  std::array<std::array<std::string, world>, 2> failures;
+  std::vector<std::thread> threads;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    threads.emplace_back([&, rank] {
+      try {
+        auto execution = megamoe::cuda::make_cuda_execution(
+            "release-contract-exec-" + std::to_string(rank), rank);
+        auto base = megamoe::cuda::make_nccl_session(
+            "release-contract", world, rank, 6600, rank, bootstrap);
+        auto pool = megamoe::cuda::make_device_notify_resource_pool(
+            base, execution, {config, 10, 4096, 1, 2});
+
+        const auto run_good = [&](std::uint64_t generation) {
+          auto session = megamoe::cuda::make_nccl_generation(
+              base, "release-contract", generation);
+          megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+              session, execution, pool);
+          auto result = coordinator.run({config, good_routes[rank], 10});
+          const auto audit = coordinator.audit();
+          require(result && audit.fused_notify_starts == 1U &&
+                      audit.control_starts == 0U &&
+                      audit.config_starts == 0U &&
+                      audit.expert_count_starts == 0U &&
+                      audit.packet_summary_starts == 0U,
+                  "release recovery did not use one fused collective");
+          const auto actual = megamoe::serialize_dispatch_metadata(
+              megamoe::cuda::download_device_metadata_for_validation(
+                  result.dispatch(), execution));
+          const auto expected = megamoe::build_notify_dispatch_for_testing(
+              config, good_routes, "release-contract", generation);
+          require(actual ==
+                      megamoe::serialize_dispatch_metadata(expected[rank]),
+                  "release recovery metadata/hash differs from oracle");
+        };
+
+        // Establish the immutable session config. The prime itself uses the
+        // complete protocol; every following base-config generation is fused.
+        {
+          auto session = megamoe::cuda::make_nccl_generation(
+              base, "release-contract", 6601);
+          megamoe::cuda::CudaNotifyGenerationCoordinator prime(
+              session, execution, pool);
+          auto result = prime.run({config, good_routes[rank], 10});
+          const auto audit = prime.audit();
+          require(result && audit.fused_notify_starts == 0U &&
+                      audit.control_starts == 1U &&
+                      audit.config_starts == 1U &&
+                      audit.expert_count_starts == 1U &&
+                      audit.packet_summary_starts == 1U,
+                  "release config prime did not use the complete protocol");
+        }
+
+        auto invalid_routes = good_routes[rank];
+        if (rank == 1U)
+          invalid_routes.selected_experts.back() =
+              static_cast<std::int32_t>(config.num_experts);
+        {
+          auto session = megamoe::cuda::make_nccl_generation(
+              base, "release-contract", 6602);
+          megamoe::cuda::CudaNotifyGenerationCoordinator invalid(
+              session, execution, pool);
+          try {
+            (void)invalid.run({config, invalid_routes, 10});
+            throw std::runtime_error(
+                "fused invalid-route generation unexpectedly passed");
+          } catch (const megamoe::NotifyDispatchError &error) {
+            failures[0][rank] = error.what();
+          }
+          const auto audit = invalid.audit();
+          require(audit.fused_notify_starts == 1U &&
+                      audit.control_starts == 0U &&
+                      audit.config_starts == 0U &&
+                      audit.expert_count_starts == 0U &&
+                      audit.packet_summary_starts == 0U,
+                  "same-config invalid route crossed the fused boundary");
+        }
+        run_good(6603);
+
+        auto changed_config = config;
+        changed_config.top_k = changed_config.num_experts + 1U;
+        {
+          auto session = megamoe::cuda::make_nccl_generation(
+              base, "release-contract", 6604);
+          megamoe::cuda::CudaNotifyGenerationCoordinator changed(
+              session, execution, pool);
+          try {
+            (void)changed.run({changed_config, good_routes[rank], 10});
+            throw std::runtime_error(
+                "layout-changing invalid generation unexpectedly passed");
+          } catch (const megamoe::NotifyDispatchError &error) {
+            failures[1][rank] = error.what();
+          }
+          const auto audit = changed.audit();
+          require(audit.fused_notify_starts == 0U &&
+                      audit.control_starts == 1U &&
+                      audit.config_starts == 0U &&
+                      audit.expert_count_starts == 0U &&
+                      audit.packet_summary_starts == 0U,
+                  "layout-changing config entered the cached fused path");
+        }
+        run_good(6605);
+      } catch (...) {
+        unexpected[rank] = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+  for (const auto &error : unexpected)
+    if (error)
+      std::rethrow_exception(error);
+  for (const auto &failure : failures)
+    require(!failure[0].empty() && failure[0] == failure[1],
+            "release protocol failure was not identical on every rank");
+  std::cout << "[PASS] release fused invalid-status + full config fallback + "
+               "same-communicator oracle recoveries\n";
+}
+#endif
+
 void test_twenty_failure_recovery_rounds() {
   constexpr std::uint32_t world = 2;
   const auto config = make_config(1, world, 8, 3, 4);
@@ -1774,20 +1901,41 @@ void test_resource_pool_and_cuda_api_audit() {
           "retained handle did not keep exactly one pool slot leased");
 
 #if !MEGAMOE_DEBUG_VALIDATE
-  // The already-verified second slot must dataize a predictable local error
-  // into the same fixed-width record instead of returning before the fused
-  // collective.  World>1 exercises the identical wire path in the rank
-  // launcher; this world=1 check also proves that invalid status is validated
-  // rather than silently accepted when there is no peer row to compare.
+  const auto require_base_recovery = [&](std::uint64_t generation,
+                                         const char *failure) {
+    auto recovery_session = megamoe::cuda::make_nccl_generation(
+        base, "pool-base", generation);
+    megamoe::cuda::CudaNotifyGenerationCoordinator recovery(
+        recovery_session, execution, pool);
+    auto recovered = recovery.run_device(exact_request(recovery_session));
+    const auto audit = recovery.audit();
+    require(recovered && audit.fused_notify_starts == 1U &&
+                audit.control_starts == 0U && audit.config_starts == 0U &&
+                audit.expert_count_starts == 0U &&
+                audit.packet_summary_starts == 0U,
+            failure);
+    const auto actual = megamoe::serialize_dispatch_metadata(
+        megamoe::cuda::download_device_metadata_for_validation(
+            recovered.dispatch(), execution));
+    const auto expected = megamoe::build_notify_dispatch_for_testing(
+        config, {routes}, "pool-base", generation);
+    require(actual == megamoe::serialize_dispatch_metadata(expected.front()),
+            "release protocol recovery metadata/hash mismatch");
+  };
+
+  // A predictable route error does not change the cached static layout.  It
+  // must therefore be dataized in the fixed-width fused record instead of
+  // returning locally before the collective.
   auto invalid_session = megamoe::cuda::make_nccl_generation(
       base, "pool-base", 6299);
   megamoe::cuda::CudaNotifyGenerationCoordinator invalid_coordinator(
       invalid_session, execution, pool);
-  auto invalid_request = exact_request(invalid_session);
-  invalid_request.config.top_k = invalid_request.config.num_experts + 1U;
+  auto invalid_routes = routes;
+  invalid_routes.selected_experts.front() =
+      static_cast<std::int32_t>(config.num_experts);
   bool fused_status_failed = false;
   try {
-    (void)invalid_coordinator.run_device(std::move(invalid_request));
+    (void)invalid_coordinator.run({config, invalid_routes, 10});
   } catch (const megamoe::NotifyDispatchError &error) {
     fused_status_failed =
         error.code() == megamoe::NotifyErrorCode::ControlProtocolFailure;
@@ -1802,10 +1950,45 @@ void test_resource_pool_and_cuda_api_audit() {
           "collective");
   require(pool.usage().slots_in_use == 1,
           "failed fused Notify generation did not return its pool slot");
+  require_base_recovery(
+      6300, "same-communicator recovery after fused route failure did not "
+            "use the cached release protocol");
+
+  // A request that changes a layout-relevant field cannot use a record laid
+  // out from the cached config.  It must enter the complete protocol and fail
+  // at control validation; forcing it through fused would interpret the old
+  // layout.  Returning to the cached config on the same communicator must
+  // recover through fused and reproduce the oracle bytes.
+  auto changed_session = megamoe::cuda::make_nccl_generation(
+      base, "pool-base", 6301);
+  megamoe::cuda::CudaNotifyGenerationCoordinator changed_coordinator(
+      changed_session, execution, pool);
+  auto changed_config = config;
+  changed_config.top_k = changed_config.num_experts + 1U;
+  bool changed_config_failed = false;
+  try {
+    (void)changed_coordinator.run({changed_config, routes, 10});
+  } catch (const megamoe::NotifyDispatchError &error) {
+    changed_config_failed =
+        error.code() == megamoe::NotifyErrorCode::ControlProtocolFailure;
+  }
+  const auto changed_audit = changed_coordinator.audit();
+  require(changed_config_failed && changed_audit.fused_notify_starts == 0U &&
+              changed_audit.control_starts == 1U &&
+              changed_audit.config_starts == 0U &&
+              changed_audit.expert_count_starts == 0U &&
+              changed_audit.packet_summary_starts == 0U,
+          "layout-changing invalid config did not fail at the complete "
+          "protocol control boundary");
+  require(pool.usage().slots_in_use == 1,
+          "failed full-protocol config generation did not return its slot");
+  require_base_recovery(
+      6302, "same-communicator recovery after config fallback did not return "
+            "to the cached release protocol");
 #endif
 
   auto second_session = megamoe::cuda::make_nccl_generation(
-      base, "pool-base", 6300);
+      base, "pool-base", 6310);
   megamoe::cuda::CudaNotifyGenerationCoordinator second_coordinator(
       second_session, execution, pool);
   auto second = second_coordinator.run_device(exact_request(second_session));
@@ -1814,7 +1997,7 @@ void test_resource_pool_and_cuda_api_audit() {
   bool exhausted = false;
   try {
     auto third_session = megamoe::cuda::make_nccl_generation(
-        base, "pool-base", 6301);
+        base, "pool-base", 6311);
     megamoe::cuda::CudaNotifyGenerationCoordinator third_coordinator(
         third_session, execution, pool);
     (void)third_coordinator.run_device(exact_request(third_session));
@@ -1830,7 +2013,7 @@ void test_resource_pool_and_cuda_api_audit() {
   bool injected_failed = false;
   try {
     auto failed_session = megamoe::cuda::make_nccl_generation(
-        base, "pool-base", 6302);
+        base, "pool-base", 6312);
     megamoe::cuda::CudaNotifyGenerationCoordinator failed_coordinator(
         failed_session, execution, pool);
     (void)failed_coordinator.run_device(exact_request(failed_session));
@@ -1840,7 +2023,7 @@ void test_resource_pool_and_cuda_api_audit() {
   require(injected_failed && pool.usage().slots_in_use == 1,
           "failed generation leaked or published a pool slot");
   auto recovery_session = megamoe::cuda::make_nccl_generation(
-      base, "pool-base", 6303);
+      base, "pool-base", 6313);
   megamoe::cuda::CudaNotifyGenerationCoordinator recovery_coordinator(
       recovery_session, execution, pool);
   auto recovered = recovery_coordinator.run_device(
@@ -1851,7 +2034,7 @@ void test_resource_pool_and_cuda_api_audit() {
   const auto actual = megamoe::cuda::download_device_metadata_for_validation(
       recovered.dispatch(), execution);
   const auto expected = megamoe::build_notify_dispatch_for_testing(
-      config, {routes}, "pool-base", 6303);
+      config, {routes}, "pool-base", 6313);
   require(megamoe::serialize_dispatch_metadata(actual) ==
               megamoe::serialize_dispatch_metadata(expected.front()),
           "pooled device input metadata mismatch");
@@ -4869,6 +5052,9 @@ int main(int argc, char **argv) {
       if (world == 2) {
         test_protocol_regressions();
         test_device_capacity_failure_and_recovery();
+#if !MEGAMOE_DEBUG_VALIDATE
+        test_release_fused_status_and_config_fallback();
+#endif
         test_twenty_failure_recovery_rounds();
         test_config_wire_corruption(2, 0);
         test_config_wire_corruption(2, 1);
