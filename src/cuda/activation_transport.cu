@@ -12,6 +12,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
 #if __has_include(<nccl_device/core.h>)
 #include <nccl_device/core.h>
 #include <nccl_device/impl/comm__types.h>
@@ -133,6 +134,35 @@ CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
     (void)cuGetErrorString(result, &text);
     transport_error(NotifyErrorCode::CudaFailure, "backward-tma-map", field,
                     0, "cuTensorMapEncodeTiled success",
+                    text ? text : "unknown CUDA driver error");
+  }
+  return map;
+}
+
+CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
+                                    std::uint64_t outer,
+                                    const char *field) {
+  if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
+      outer > UINT32_MAX)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "backward-tma-store-map", field, 0,
+                    "nonzero uint32 dimensions and valid base", "invalid");
+  CUtensorMap map{};
+  const cuuint64_t dims[2] = {inner, outer};
+  const cuuint64_t strides[1] = {
+      checked_mul(inner, sizeof(transport::BFloat16), field)};
+  const cuuint32_t box[2] = {64U, 128U};
+  const cuuint32_t element_strides[2] = {1U, 1U};
+  const auto result = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    const char *text = nullptr;
+    (void)cuGetErrorString(result, &text);
+    transport_error(NotifyErrorCode::CudaFailure, "backward-tma-store-map",
+                    field, 0, "cuTensorMapEncodeTiled success",
                     text ? text : "unknown CUDA driver error");
   }
   return map;
@@ -515,6 +545,7 @@ struct PoolSlot {
   CUtensorMap backward_x_mn_map{};
   CUtensorMap backward_u_transpose_map{};
   CUtensorMap backward_dab_transpose_map{};
+  CUtensorMap backward_dw1_store_map{};
   bool forward_maps_valid = false;
   bool backward_maps_valid = false;
 };
@@ -3231,7 +3262,8 @@ local_p2p_backward_megakernel(
     const __grid_constant__ CUtensorMap dy_mn_map,
     const __grid_constant__ CUtensorMap x_mn_map,
     const __grid_constant__ CUtensorMap u_transpose_map,
-    const __grid_constant__ CUtensorMap dab_transpose_map) {
+    const __grid_constant__ CUtensorMap dab_transpose_map,
+    const __grid_constant__ CUtensorMap dw1_store_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
   extern __shared__ __align__(1024) unsigned char storage[];
@@ -3744,12 +3776,15 @@ local_p2p_backward_megakernel(
       a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
   const auto dw1_tasks = static_cast<unsigned long long>(
       a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
-  const auto dw_tasks = dw2_tasks + dw1_tasks;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_start_clock = device_globaltimer_ns();
+  // Main-shape dX tasks have uniform K and a unique output tile owner. A
+  // deterministic grid-stride assignment removes the global claim atomic
+  // while retaining enough cross-expert parallelism to fill every SM.
+  if (threadIdx.x == 0U)
+    task_shared = blockIdx.x;
+  __syncthreads();
   while (true) {
-    if (threadIdx.x == 0)
-      task_shared = atomicAdd(&scheduler[2], 1ULL);
     __syncthreads();
     if (task_shared >= dx_tasks)
       break;
@@ -3807,6 +3842,8 @@ local_p2p_backward_megakernel(
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0U)
+      task_shared += gridDim.x;
   }
   __threadfence_system();
   grid.sync();
@@ -3832,12 +3869,12 @@ local_p2p_backward_megakernel(
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
-    if (task_shared >= dw_tasks)
+    if (task_shared >= dw2_tasks)
       break;
-    const bool is_dw1 = task_shared >= dw2_tasks;
-    auto task = is_dw1 ? task_shared - dw2_tasks : task_shared;
-    const auto ntiles = is_dw1 ? dw1_ntiles : dw2_ntiles;
-    const auto mtiles = is_dw1 ? dw1_mtiles : dw2_mtiles;
+    constexpr bool is_dw1 = false;
+    auto task = task_shared;
+    const auto ntiles = dw2_ntiles;
+    const auto mtiles = dw2_mtiles;
     const auto per_expert = mtiles * ntiles;
     const auto expert = static_cast<std::uint32_t>(task / per_expert);
     task %= per_expert;
@@ -3914,6 +3951,7 @@ local_p2p_backward_megakernel(
     }
     __syncthreads();
     __syncthreads();
+#if MEGAMOE_DEBUG_VALIDATE
     if (threadIdx.x == 0) {
       const auto complete = is_dw1
           ? atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL
@@ -3929,11 +3967,214 @@ local_p2p_backward_megakernel(
         }
       }
     }
+#endif
     __syncthreads();
+  }
+#if !MEGAMOE_DEBUG_VALIDATE
+  // Release timing needs only the true global completion boundary. One
+  // timestamp per CTA replaces the per-tile audit atomics retained in debug.
+  if (threadIdx.x == 0U)
+    atomicMax(&status->dw2_last_complete_clock, device_globaltimer_ns());
+#endif
+
+  // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
+  // preceding general dW2 loop, the accumulator is lexically confined to the
+  // math branch and the producer WG executes only the TMA path.
+  // Four input stages minimize canonical-M stalls. The accumulator epilogue
+  // reuses the input storage only after all stages have been consumed.
+  constexpr std::uint32_t kDw1Stages = 4U;
+  constexpr std::uint32_t kDw1AStageElements = 128U * 64U;
+  constexpr std::uint32_t kDw1BStageElements = 256U * 64U;
+  auto *dw1_smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+  auto *dw1_smem_b = dw1_smem_a + kDw1Stages * kDw1AStageElements;
+  auto *dw1_output_tile = dw1_smem_a;
+  auto *dw1_full_barriers = reinterpret_cast<ForwardBarrier *>(
+      dw1_smem_b + kDw1Stages * kDw1BStageElements);
+  auto *dw1_empty_barriers = dw1_full_barriers + kDw1Stages;
+  if (threadIdx.x == 256U) {
+    for (std::uint32_t stage = 0; stage < kDw1Stages; ++stage) {
+      dw1_full_barriers[stage].init(1);
+      dw1_empty_barriers[stage].init(8);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  __syncthreads();
+  constexpr std::uint32_t kDwTaskReadyBarrier = 0U;
+  constexpr std::uint32_t kDwTaskDoneBarrier = 1U;
+  constexpr std::uint32_t kDwMathOutputReadyBarrier = 2U;
+  constexpr std::uint32_t kDwMathOutputDoneBarrier = 3U;
+  const auto dw_warpgroup = threadIdx.x / 128U;
+  // Every task still has exactly one owner; grid-stride assignment avoids a
+  // 64K-operation global claim stream and preserves parallel expert coverage.
+  if (threadIdx.x == 0U)
+    task_shared = blockIdx.x;
+  __syncthreads();
+  if (dw_warpgroup >= 2U) {
+    cutlass::arch::warpgroup_reg_dealloc<48>();
+    std::uint32_t dw_pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction_start = claims[expert];
+      const auto reduction =
+          (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+      if (threadIdx.x == 256U) {
+        const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+        for (std::uint32_t iteration = 0; iteration < iterations;
+             ++iteration) {
+          const auto pipeline = dw_pipeline + iteration;
+          const auto stage = pipeline % kDw1Stages;
+          const auto phase = (pipeline / kDw1Stages) & 1U;
+          dw1_empty_barriers[stage].wait(phase ^ 1U);
+          auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+              dw1_smem_a + stage * kDw1AStageElements);
+          auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+              dw1_smem_b + stage * kDw1BStageElements);
+          const auto a_k = static_cast<std::uint32_t>(
+              reduction_start + iteration * 64ULL);
+          const auto b_k = static_cast<std::uint32_t>(
+              a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
+          deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+              &dab_transpose_map, &dw1_full_barriers[stage], stage_a, a_k,
+              static_cast<std::uint32_t>(mtile * 128ULL));
+          for (std::uint32_t atom = 0; atom < 4U; ++atom)
+            deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                &x_mn_map, &dw1_full_barriers[stage],
+                stage_b + atom * 64U * 64U,
+                static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
+                b_k);
+          dw1_full_barriers[stage].arrive_and_expect_tx(
+              (kDw1AStageElements + kDw1BStageElements) *
+              sizeof(transport::BFloat16));
+        }
+        dw_pipeline += iterations;
+      }
+      cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
+    }
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<224>();
+    std::uint32_t dw_pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction =
+          (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+      if (threadIdx.x == 0) {
+        const auto now = device_globaltimer_ns();
+        if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL, now) ==
+            0ULL)
+          atomicMin(&status->dw1_first_start_clock, now);
+      }
+      float accum[BackwardDwMixedMma::kNumAccum];
+#pragma unroll
+      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+        accum[index] = 0.0F;
+      const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+      for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        const auto pipeline = dw_pipeline + iteration;
+        const auto stage = pipeline % kDw1Stages;
+        const auto phase = (pipeline / kDw1Stages) & 1U;
+        auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+            dw1_smem_a + stage * kDw1AStageElements);
+        auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+            dw1_smem_b + stage * kDw1BStageElements);
+        dw1_full_barriers[stage].wait(phase);
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+        for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
+              stage_a, dw_warpgroup * 64U, k * BackwardDwMixedMma::K);
+          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
+              stage_b, 0U, k * BackwardDwMixedMma::K);
+          BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+        }
+        deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_wait<0>();
+        if ((threadIdx.x & 31U) == 0U)
+          dw1_empty_barriers[stage].arrive();
+      }
+      dw_pipeline += iterations;
+      const auto warp = threadIdx.x / 32U;
+      const auto lane = threadIdx.x & 31U;
+#pragma unroll
+      for (std::uint32_t index = 0;
+           index < BackwardDwMixedMma::kNumAccum / 4U; ++index) {
+        constexpr std::uint32_t kBankGroupBytes = 16U;
+        const auto atom = index / (64U / 8U);
+        const auto in_atom = index % (64U / 8U);
+        const auto row = lane;
+        auto column = in_atom;
+        column ^= row % (128U / kBankGroupBytes);
+        auto *smem_pointer =
+            reinterpret_cast<std::uint8_t *>(dw1_output_tile) +
+            warp * 16U * 128U + atom * 128U * 128U + row * 128U +
+            column * kBankGroupBytes;
+        deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+            __float22bfloat162_rn(
+                make_float2(accum[index * 4U], accum[index * 4U + 1U])),
+            __float22bfloat162_rn(make_float2(accum[index * 4U + 2U],
+                                               accum[index * 4U + 3U])),
+            smem_pointer);
+      }
+      cute::tma_store_fence();
+      cutlass::arch::NamedBarrier::sync(256U,
+                                        kDwMathOutputReadyBarrier);
+      if (threadIdx.x < 4U) {
+        const auto atom = threadIdx.x;
+        cute::SM90_TMA_STORE_2D::copy(
+            &dw1_store_map, dw1_output_tile + atom * 128U * 64U,
+            static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
+            static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
+                                       mtile * 128ULL));
+        cute::tma_store_arrive();
+        cute::tma_store_wait<0>();
+      }
+      cutlass::arch::NamedBarrier::sync(256U,
+                                        kDwMathOutputDoneBarrier);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0) {
+        const auto complete =
+            atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL;
+        if (complete == per_expert) {
+          const auto now = device_globaltimer_ns();
+          dw_timeline[expert].dw1_complete_clock = now;
+          atomicMax(&status->dw1_last_complete_clock, now);
+        }
+      }
+#endif
+      cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
+      if (threadIdx.x == 0U)
+        task_shared += gridDim.x;
+    }
   }
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
+#if !MEGAMOE_DEBUG_VALIDATE
+    status->dw1_last_complete_clock = device_globaltimer_ns();
+#endif
     status->dw1_complete_clock = status->dw1_last_complete_clock;
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert) {
@@ -4917,6 +5158,12 @@ ActivationTransportResourcePool make_activation_transport_pool(
               at<void>(slot.device, state->layout.backward_dab_transpose),
               reduction_rows, 2ULL * config.max_intermediate_size, 128,
               "backward dAB transpose");
+          slot.backward_dw1_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_dw1),
+              config.max_hidden_size,
+              static_cast<std::uint64_t>(config.max_owned_experts) * 2ULL *
+                  config.max_intermediate_size,
+              "backward dW1 output");
           slot.backward_maps_valid = true;
         }
       }
@@ -6621,7 +6868,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
           f.weights.impl_->w2_transpose_map,
           f.weights.impl_->w1_transpose_map,
           slot.backward_dy_mn_map, slot.backward_x_mn_map,
-          slot.backward_u_transpose_map, slot.backward_dab_transpose_map),
+          slot.backward_u_transpose_map, slot.backward_dab_transpose_map,
+          slot.backward_dw1_store_map),
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA Backward launch");
@@ -7871,6 +8119,9 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
       const auto dab_mn_map = make_bf16_tma_map(
           at<void>(arena, layout.backward_dab_transpose), 64,
           2 * intermediate, 128, "sanitizer padded dAB");
+      const auto dw1_store_map = make_bf16_tma_store_map(
+          at<void>(arena, layout.backward_dw1), hidden, 2 * intermediate,
+          "sanitizer dW1 output");
       const std::size_t backward_smem =
           (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(*input) +
           8U * sizeof(std::uint64_t);
@@ -7889,7 +8140,7 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
               &launch, local_p2p_backward_megakernel, backward, x_map, dy_map,
               dab_map, w1_map, w2_transpose_map, w1_transpose_map,
               canonical_dy_mn_map, canonical_x_mn_map, u_mn_map,
-              dab_mn_map),
+              dab_mn_map, dw1_store_map),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "production Backward persistent kernel");
       BackwardDeviceStatus backward_status{};
