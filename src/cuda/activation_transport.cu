@@ -334,6 +334,10 @@ struct Layout {
   std::size_t contribution = 0;
   std::size_t combine_return = 0;
   std::size_t combined = 0;
+  std::size_t socket_count_matrix = 0;
+  std::size_t socket_header_send = 0;
+  std::size_t socket_header_receive = 0;
+  std::size_t socket_payload_receive = 0;
   std::size_t forward_s = 0;
   std::size_t forward_ab_cache = 0;
   std::size_t forward_task_claim = 0;
@@ -446,6 +450,22 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
                           "combined elements"),
       sizeof(transport::BFloat16), "combined");
+  if (config.enable_socket_fallback) {
+    layout.socket_count_matrix = append(
+        cursor, checked_mul(config.max_world_size, config.max_world_size,
+                            "Socket count matrix"),
+        sizeof(std::uint64_t), "Socket count matrix");
+    layout.socket_header_send = append(
+        cursor, routes, sizeof(LocalP2pRouteHeader), "Socket send headers");
+    layout.socket_header_receive = append(
+        cursor, config.max_destination_rows_per_rank,
+        sizeof(LocalP2pRouteHeader), "Socket receive headers");
+    layout.socket_payload_receive = append(
+        cursor, checked_mul(config.max_destination_rows_per_rank,
+                            config.max_hidden_size,
+                            "Socket receive payload elements"),
+        sizeof(transport::BFloat16), "Socket receive payload");
+  }
   if (config.max_intermediate_size != 0) {
     const auto forward_elements = checked_mul(
         config.max_destination_rows_per_rank,
@@ -576,6 +596,7 @@ struct PoolSlot {
   std::uint64_t *device_backward_progress = nullptr;
   std::size_t backward_progress_words = 0;
   std::uint64_t *host_cancel_epoch = nullptr;
+  std::uint64_t *host_socket_counts = nullptr;
   std::uint64_t *device_cancel_epoch = nullptr;
   cudaEvent_t producer_ready = nullptr;
   cudaEvent_t start = nullptr;
@@ -677,6 +698,10 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
       if (slot.host_cancel_epoch)
         (void)cudaFreeHost(slot.host_cancel_epoch);
+      if (slot.host_socket_counts)
+        internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
+      if (slot.host_socket_counts)
+        (void)cudaFreeHost(slot.host_socket_counts);
       if (slot.device_cancel_epoch)
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       if (slot.device_cancel_epoch)
@@ -996,6 +1021,170 @@ __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
   if (lane == 0)
     atomicMax(&a.status->complete_clock,
               device_globaltimer_ns());
+}
+
+__global__ void socket_route_count_kernel(DeviceDispatchKernelView dispatch,
+                                          unsigned long long *counts) {
+  for (std::uint64_t route =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       route < dispatch.sizes.route_count;
+       route += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    const auto destination = dispatch.route_dst_rank[route];
+    if (destination < dispatch.identity.world_size)
+      atomicAdd(&counts[destination], 1ULL);
+  }
+}
+
+__global__ void socket_route_prefix_kernel(const unsigned long long *counts,
+                                           unsigned long long *prefix,
+                                           std::uint32_t world) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  unsigned long long total = 0;
+  for (std::uint32_t rank = 0; rank < world; ++rank) {
+    prefix[rank] = total;
+    total += counts[rank];
+  }
+  prefix[world] = total;
+}
+
+__global__ void socket_stable_route_ids_kernel(
+    DeviceDispatchKernelView dispatch, const unsigned long long *prefix,
+    unsigned int *route_ids) {
+  const auto destination = static_cast<std::uint32_t>(blockIdx.x);
+  if (destination >= dispatch.identity.world_size)
+    return;
+  __shared__ unsigned int scan[256];
+  __shared__ unsigned long long carry;
+  if (threadIdx.x == 0)
+    carry = 0;
+  __syncthreads();
+  for (std::uint64_t base = 0; base < dispatch.sizes.route_count;
+       base += blockDim.x) {
+    const auto route = base + threadIdx.x;
+    scan[threadIdx.x] =
+        route < dispatch.sizes.route_count &&
+                dispatch.route_dst_rank[route] == destination
+            ? 1U
+            : 0U;
+    __syncthreads();
+    for (unsigned int offset = 1; offset < blockDim.x; offset <<= 1U) {
+      const auto add = threadIdx.x >= offset ? scan[threadIdx.x - offset] : 0U;
+      __syncthreads();
+      scan[threadIdx.x] += add;
+      __syncthreads();
+    }
+    if (route < dispatch.sizes.route_count &&
+        dispatch.route_dst_rank[route] == destination) {
+      const auto position = prefix[destination] + carry +
+                            static_cast<unsigned long long>(scan[threadIdx.x] - 1U);
+      route_ids[position] = static_cast<unsigned int>(route);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+      carry += scan[blockDim.x - 1U];
+    __syncthreads();
+  }
+}
+
+__global__ void socket_pack_routes_kernel(
+    DeviceDispatchKernelView dispatch, const transport::BFloat16 *input,
+    std::uint64_t hidden, std::uint64_t epoch,
+    const unsigned int *route_ids, LocalP2pRouteHeader *headers,
+    transport::BFloat16 *payload) {
+  const auto packed = static_cast<std::uint64_t>(blockIdx.x);
+  if (packed >= dispatch.sizes.route_count)
+    return;
+  const auto route = static_cast<std::uint64_t>(route_ids[packed]);
+  const auto token = route / dispatch.identity.top_k;
+  const auto slot = static_cast<std::uint32_t>(route % dispatch.identity.top_k);
+  if (threadIdx.x == 0) {
+    headers[packed] = LocalP2pRouteHeader{
+        transport::kActivationTransportSchemaVersion,
+        dispatch.identity.calling_rank,
+        dispatch.route_dst_rank[route], 0U, dispatch.identity.generation,
+        epoch, packed, route, token, dispatch.route_dst_row[route],
+        dispatch.expert_id[route], slot};
+  }
+  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
+    payload[packed * hidden + h] = input[token * hidden + h];
+}
+
+__global__ void socket_relay_synthetic_kernel(
+    LocalP2pRouteHeader *headers, transport::BFloat16 *compact_payload,
+    transport::BFloat16 *canonical_rows, std::uint64_t incoming,
+    std::uint64_t hidden, std::uint64_t generation,
+    std::uint32_t destination_rank, std::uint64_t max_rows,
+    bool identity_expert, unsigned int *error) {
+  const auto incoming_index = static_cast<std::uint64_t>(blockIdx.x);
+  if (incoming_index >= incoming)
+    return;
+  const auto header = headers[incoming_index];
+  const bool valid =
+      header.schema_version == transport::kActivationTransportSchemaVersion &&
+      header.generation == generation &&
+      header.destination_rank == destination_rank &&
+      header.dst_row < max_rows;
+  if (!valid) {
+    if (threadIdx.x == 0)
+      atomicExch(error, 1U);
+    return;
+  }
+  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+    const auto value = compact_payload[incoming_index * hidden + h];
+    canonical_rows[header.dst_row * hidden + h] = value;
+    compact_payload[incoming_index * hidden + h] =
+        synthetic_value(value, header.expert_id, h, identity_expert);
+  }
+}
+
+__global__ void socket_scatter_returns_kernel(
+    const LocalP2pRouteHeader *headers,
+    const transport::BFloat16 *compact,
+    transport::BFloat16 *by_route, std::uint64_t routes,
+    std::uint64_t hidden) {
+  const auto packed = static_cast<std::uint64_t>(blockIdx.x);
+  if (packed >= routes)
+    return;
+  const auto route = headers[packed].route_index;
+  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
+    by_route[route * hidden + h] = compact[packed * hidden + h];
+}
+
+__global__ void socket_gate_reduce_kernel(
+    DeviceDispatchKernelView dispatch, const float *gates,
+    const transport::BFloat16 *by_route, transport::BFloat16 *combined,
+    std::uint64_t hidden) {
+  const auto token = static_cast<std::uint64_t>(blockIdx.x);
+  if (token >= dispatch.identity.num_tokens)
+    return;
+  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t order = 0; order < dispatch.identity.top_k; ++order) {
+      const auto original = dispatch.combine_order[
+          token * dispatch.identity.top_k + order];
+      const auto route = token * dispatch.identity.top_k + original;
+      sum = gate_after_accumulate(sum, gates[route],
+                                  by_route[route * hidden + h].bits);
+    }
+    combined[token * hidden + h] =
+        transport::BFloat16{float_to_bf16_bits(sum)};
+  }
+}
+
+__global__ void socket_finalize_status_kernel(TransportDeviceStatus *status,
+                                              std::uint64_t routes,
+                                              std::uint64_t incoming,
+                                              std::uint64_t tokens) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  status->packets_done = routes;
+  status->fanout_done = incoming;
+  status->synthetic_done = incoming;
+  status->combine_done = routes;
+  status->incoming_done = incoming;
+  status->reduced_tokens = tokens;
+  status->complete_clock = device_globaltimer_ns();
 }
 
 __global__ void peer_put_signal_kernel(const std::uint64_t *source,
@@ -4507,6 +4696,7 @@ struct SelectedActivationLease<transport::BFloat16>::Impl {
 };
 
 struct LocalP2pBackendState;
+struct SocketBackendState;
 
 struct DeviceActivationTransportHandle::Impl {
   std::shared_ptr<SlotLease> slot;
@@ -4517,6 +4707,7 @@ struct DeviceActivationTransportHandle::Impl {
   std::uint64_t route_count = 0;
   std::uint64_t destination_rows = 0;
   std::shared_ptr<LocalP2pBackendState> local_p2p_backend;
+  std::shared_ptr<SocketBackendState> socket_backend;
 };
 
 struct DeviceActivationTransport::Impl {
@@ -4546,6 +4737,17 @@ struct LocalP2pBackendState {
 
 struct LocalCudaP2pActivationTransport::Impl {
   std::shared_ptr<LocalP2pBackendState> backend;
+};
+
+struct SocketBackendState {
+  std::shared_ptr<ActivationPoolState> pool;
+  std::shared_ptr<internal::NcclSessionState> nccl;
+  NcclSession session;
+  CudaExecution execution;
+};
+
+struct NcclSocketFallbackActivationTransport::Impl {
+  std::shared_ptr<SocketBackendState> backend;
 };
 
 struct ForwardAllocation {
@@ -5759,6 +5961,24 @@ ActivationTransportResourcePool make_activation_transport_pool(
           ExchangeKind::ExpertCounts, "cudaHostAlloc(cancel epoch)");
       internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
       *slot.host_cancel_epoch = 0;
+      if (config.enable_socket_fallback) {
+        const auto socket_count_bytes = checked_size(
+            checked_mul(checked_mul(config.max_world_size,
+                                    config.max_world_size,
+                                    "Socket host count matrix"),
+                        sizeof(std::uint64_t),
+                        "Socket host count matrix bytes"),
+            "Socket host count matrix bytes");
+        internal::throw_cuda(
+            "transport-pool-create",
+            cudaHostAlloc(reinterpret_cast<void **>(&slot.host_socket_counts),
+                          socket_count_bytes, cudaHostAllocPortable),
+            0, session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts,
+            "cudaHostAlloc(Socket count matrix)");
+        internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+        std::memset(slot.host_socket_counts, 0, socket_count_bytes);
+      }
       internal::throw_cuda(
           "transport-pool-create",
           cudaMalloc(reinterpret_cast<void **>(&slot.device_cancel_epoch),
@@ -5850,7 +6070,17 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
       checked_add(2ULL * sizeof(TransportDeviceStatus),
                   sizeof(std::uint64_t), "pool pinned status/cancel bytes"),
       progress_bytes, "pool pinned bytes per slot");
-  result.pinned_bytes = checked_mul(pinned_per_slot, state->slots.size(),
+  const auto socket_count_bytes = state->config.enable_socket_fallback
+      ? checked_mul(checked_mul(state->config.max_world_size,
+                                state->config.max_world_size,
+                                "Socket host count matrix"),
+                    sizeof(std::uint64_t),
+                    "Socket host count matrix bytes")
+      : 0ULL;
+  result.pinned_bytes = checked_mul(
+      checked_add(pinned_per_slot, socket_count_bytes,
+                  "pool pinned plus Socket bytes"),
+      state->slots.size(),
                                     "pool pinned bytes");
   result.event_count = checked_mul(8, state->slots.size(), "pool events");
   result.epoch_high_watermark = state->epoch_high;
@@ -6014,6 +6244,43 @@ LocalCudaP2pActivationTransport::LocalCudaP2pActivationTransport(
   impl_ = std::make_shared<Impl>();
   impl_->backend =
       create_local_p2p_backend(session, execution, pool.impl_->state);
+}
+
+NcclSocketFallbackActivationTransport::
+    NcclSocketFallbackActivationTransport(
+        const NcclSession &session, const CudaExecution &execution,
+        const ActivationTransportResourcePool &pool) {
+  if (!session || !execution || !pool.impl_ || !pool.impl_->state)
+    transport_error(NotifyErrorCode::InvalidHandle, "socket-create",
+                    "session/execution/pool", 0, "valid", "empty");
+  auto state = pool.impl_->state;
+  const auto nccl = internal::NcclSessionAccess::checked(session);
+  if (!state->config.enable_socket_fallback)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "socket-create",
+                    "pool.enable_socket_fallback", session.rank(), "true",
+                    "false");
+  const auto *ib_disabled = std::getenv("NCCL_IB_DISABLE");
+  if (ib_disabled == nullptr || std::string(ib_disabled) != "1")
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=socket-create, field=NCCL_IB_DISABLE, rank=" +
+            std::to_string(session.rank()) +
+            ", expected=1 before communicator creation, actual=" +
+            (ib_disabled ? std::string(ib_disabled) : "unset") +
+            "; NcclSocketFallback refuses an unaudited network selection");
+  if (session.session().stable_identity_bytes() != state->session_identity ||
+      session.session().world_size() != state->world ||
+      session.device_ordinal() != state->device ||
+      execution.device_ordinal() != state->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "socket-create",
+                    "provenance", session.rank(),
+                    "same session/world/device", "mismatch");
+  impl_ = std::make_shared<Impl>();
+  impl_->backend = std::make_shared<SocketBackendState>();
+  impl_->backend->pool = std::move(state);
+  impl_->backend->nccl = nccl;
+  impl_->backend->session = session;
+  impl_->backend->execution = execution;
 }
 
 LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
@@ -6761,6 +7028,438 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
   const auto accounted = result->timings.generation_setup_us + kernel_us;
   result->timings.terminal_completion_us =
       std::max(0.0, result->timings.total_us - accounted);
+  failure_guard.committed = true;
+  return DeviceActivationTransportHandle(std::move(result));
+}
+
+DeviceActivationTransportHandle
+NcclSocketFallbackActivationTransport::run_synthetic(
+    const DeviceDispatchHandle &dispatch,
+    const BFloat16ActivationLease &activations,
+    const transport::ActivationTransportConfig &config,
+    const ActivationTransportRunOptions &options) {
+  if (!impl_ || !impl_->backend || !dispatch || !activations)
+    transport_error(NotifyErrorCode::InvalidHandle, "socket-run",
+                    "backend/dispatch/activation", 0, "valid", "empty");
+  const auto backend = impl_->backend;
+  const auto &id = dispatch.identity();
+  auto state = backend->pool;
+  const auto &activation = *activations.impl_;
+  if (id.num_nodes < 2 || id.world_size != backend->nccl->world ||
+      id.calling_rank != backend->nccl->rank)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "socket-run",
+                    "topology", id.calling_rank,
+                    "multi-node exact NCCL world/rank", "mismatch");
+  if (activation.pool.get() != state.get() ||
+      activation.generation != id.generation ||
+      activation.tokens != id.num_tokens ||
+      activation.hidden != config.hidden_size ||
+      activation.device != backend->execution.device_ordinal() ||
+      activation.session_identity !=
+          backend->session.session().stable_identity_bytes() ||
+      !activation.producer_execution.same_instance(
+          backend->execution.token()) ||
+      !activation.ready_recorded)
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "socket-run",
+                    "activation provenance", id.calling_rank,
+                    "exact pool/session/generation/execution/shape/ready",
+                    "mismatch");
+  if (!state->config.enable_socket_fallback ||
+      config.hidden_size > state->config.max_hidden_size ||
+      id.world_size > state->config.max_world_size ||
+      id.top_k > state->config.max_top_k)
+    transport_error(NotifyErrorCode::WorkspaceCapacityExceeded, "socket-run",
+                    "pool geometry", id.calling_rank, "within capacity",
+                    "exceeded/disabled");
+  if (config.gate_placement !=
+      transport::ActivationGatePlacement::SourceAfter)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "socket-run",
+                    "gate_placement", id.calling_rank, "SourceAfter",
+                    "unsupported");
+  if (options.cancellation.cancellation_requested())
+    throw NotifyDispatchError(
+        NotifyErrorCode::TransportTimeout,
+        "phase=socket-run, field=cancellation, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=not requested, actual=requested");
+
+  const auto expectation = DeviceDispatchViewExpectation{
+      id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+      id.config_digest_word0, id.config_digest_word1};
+  auto consumer = dispatch.acquire_consumer(backend->execution, expectation);
+  const auto view = ActivationTransportBridge::view(consumer);
+  SlotFailureGuard failure_guard{activation.slot, false};
+  auto exec = internal::checked_execution_state(backend->execution);
+  auto &slot = state->slots[activation.slot->index];
+  const auto &layout = state->layout;
+  auto *local_counts = at<unsigned long long>(slot.device,
+                                               layout.terminal_epoch);
+  auto *count_matrix = at<unsigned long long>(slot.device,
+                                               layout.socket_count_matrix);
+  auto *prefix = at<unsigned long long>(slot.device,
+                                        layout.p2p_barrier_receive);
+  auto *route_ids = at<unsigned int>(slot.device, layout.packet_claim);
+  auto *send_headers = at<LocalP2pRouteHeader>(
+      slot.device, layout.socket_header_send);
+  auto *receive_headers = at<LocalP2pRouteHeader>(
+      slot.device, layout.socket_header_receive);
+  auto *send_payload = at<transport::BFloat16>(slot.device,
+                                                layout.contribution);
+  auto *receive_payload = at<transport::BFloat16>(
+      slot.device, layout.socket_payload_receive);
+  auto *canonical = at<transport::BFloat16>(slot.device,
+                                             layout.canonical_rows);
+  auto *by_route = at<transport::BFloat16>(slot.device,
+                                            layout.combine_return);
+  auto *combined = at<transport::BFloat16>(slot.device, layout.combined);
+  auto *status = at<TransportDeviceStatus>(slot.device, layout.status);
+  const auto world = id.world_size;
+  const auto route_count = view.sizes.route_count;
+
+  internal::throw_cuda(
+      "socket-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(producer-ready)");
+  ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
+  internal::throw_cuda(
+      "socket-run", cudaEventRecord(slot.start, exec->stream), id.calling_rank,
+      world, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(Socket start)");
+  internal::throw_cuda(
+      "socket-run", cudaMemsetAsync(local_counts, 0,
+                                     world * sizeof(std::uint64_t),
+                                     exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaMemsetAsync(Socket counts)");
+  internal::throw_cuda(
+      "socket-run", cudaMemsetAsync(status, 0, sizeof(*status), exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaMemsetAsync(Socket status)");
+  if (route_count != 0) {
+    socket_route_count_kernel<<<
+        static_cast<unsigned int>((route_count + 255ULL) / 256ULL), 256, 0,
+        exec->stream>>>(view, local_counts);
+  }
+  socket_route_prefix_kernel<<<1, 1, 0, exec->stream>>>(local_counts, prefix,
+                                                        world);
+  if (route_count != 0) {
+    socket_stable_route_ids_kernel<<<world, 256, 0, exec->stream>>>(
+        view, prefix, route_ids);
+    socket_pack_routes_kernel<<<static_cast<unsigned int>(route_count), 256, 0,
+                                exec->stream>>>(
+        view, activation.pointer, config.hidden_size, activation.slot->epoch,
+        route_ids, send_headers, send_payload);
+  }
+  internal::throw_cuda(
+      "socket-run", cudaGetLastError(), id.calling_rank, world,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "Socket pack kernels");
+  internal::throw_nccl(
+      "socket-run",
+      ncclAllGather(local_counts, count_matrix, world, ncclUint64,
+                    backend->nccl->comm, exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "ncclAllGather(Socket route counts)");
+  const auto count_bytes = checked_size(
+      checked_mul(checked_mul(world, world, "Socket actual count matrix"),
+                  sizeof(std::uint64_t), "Socket actual count bytes"),
+      "Socket actual count bytes");
+  internal::throw_cuda(
+      "socket-run",
+      cudaMemcpyAsync(slot.host_socket_counts, count_matrix, count_bytes,
+                      cudaMemcpyDeviceToHost, exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "D2H Socket route counts");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                            count_bytes);
+  internal::throw_cuda(
+      "socket-run", cudaStreamSynchronize(exec->stream), id.calling_rank,
+      world, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaStreamSynchronize(Socket counts)");
+
+  std::vector<std::uint64_t> send_prefix(static_cast<std::size_t>(world) + 1U,
+                                         0);
+  std::vector<std::uint64_t> receive_prefix(
+      static_cast<std::size_t>(world) + 1U, 0);
+  for (std::uint32_t peer = 0; peer < world; ++peer) {
+    send_prefix[peer + 1U] =
+        send_prefix[peer] +
+        slot.host_socket_counts[static_cast<std::size_t>(id.calling_rank) *
+                                    world +
+                                peer];
+    receive_prefix[peer + 1U] =
+        receive_prefix[peer] +
+        slot.host_socket_counts[static_cast<std::size_t>(peer) * world +
+                                id.calling_rank];
+  }
+  const auto incoming = receive_prefix[world];
+  if (send_prefix[world] != route_count ||
+      incoming > state->config.max_destination_rows_per_rank)
+    transport_error(NotifyErrorCode::WorkspaceCapacityExceeded, "socket-run",
+                    "route totals", id.calling_rank,
+                    "send=route_count and incoming<=capacity",
+                    "send=" + std::to_string(send_prefix[world]) +
+                        ", incoming=" + std::to_string(incoming));
+
+  const auto enqueue_dispatch = [&] {
+    internal::throw_nccl("socket-dispatch", ncclGroupStart(), id.calling_rank,
+                         world, backend->session.session().identity(),
+                         id.generation, ExchangeKind::ExpertCounts,
+                         "ncclGroupStart(Socket dispatch)");
+    for (std::uint32_t peer = 0; peer < world; ++peer) {
+      const auto send_rows = send_prefix[peer + 1U] - send_prefix[peer];
+      const auto receive_rows =
+          receive_prefix[peer + 1U] - receive_prefix[peer];
+      if (peer == id.calling_rank) {
+        if (send_rows != receive_rows)
+          transport_error(NotifyErrorCode::TransportProtocolFailure,
+                          "socket-dispatch", "self rows", id.calling_rank,
+                          std::to_string(send_rows),
+                          std::to_string(receive_rows));
+        if (send_rows != 0) {
+          internal::throw_cuda(
+              "socket-dispatch",
+              cudaMemcpyAsync(receive_headers + receive_prefix[peer],
+                              send_headers + send_prefix[peer],
+                              checked_size(send_rows * sizeof(*send_headers),
+                                           "Socket self header bytes"),
+                              cudaMemcpyDeviceToDevice, exec->stream),
+              id.calling_rank, world,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts, "D2D Socket self headers");
+          internal::throw_cuda(
+              "socket-dispatch",
+              cudaMemcpyAsync(
+                  receive_payload + receive_prefix[peer] * config.hidden_size,
+                  send_payload + send_prefix[peer] * config.hidden_size,
+                  checked_size(send_rows * config.hidden_size *
+                                   sizeof(transport::BFloat16),
+                               "Socket self payload bytes"),
+                  cudaMemcpyDeviceToDevice, exec->stream),
+              id.calling_rank, world,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts, "D2D Socket self payload");
+        }
+        continue;
+      }
+      if (send_rows != 0) {
+        internal::throw_nccl(
+            "socket-dispatch",
+            ncclSend(send_headers + send_prefix[peer],
+                     send_rows * sizeof(*send_headers), ncclUint8,
+                     static_cast<int>(peer), backend->nccl->comm,
+                     exec->stream),
+            id.calling_rank, world,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "ncclSend(Socket headers)");
+        internal::throw_nccl(
+            "socket-dispatch",
+            ncclSend(send_payload + send_prefix[peer] * config.hidden_size,
+                     send_rows * config.hidden_size *
+                         sizeof(transport::BFloat16),
+                     ncclUint8, static_cast<int>(peer), backend->nccl->comm,
+                     exec->stream),
+            id.calling_rank, world,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "ncclSend(Socket payload)");
+      }
+      if (receive_rows != 0) {
+        internal::throw_nccl(
+            "socket-dispatch",
+            ncclRecv(receive_headers + receive_prefix[peer],
+                     receive_rows * sizeof(*receive_headers), ncclUint8,
+                     static_cast<int>(peer), backend->nccl->comm,
+                     exec->stream),
+            id.calling_rank, world,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "ncclRecv(Socket headers)");
+        internal::throw_nccl(
+            "socket-dispatch",
+            ncclRecv(receive_payload +
+                         receive_prefix[peer] * config.hidden_size,
+                     receive_rows * config.hidden_size *
+                         sizeof(transport::BFloat16),
+                     ncclUint8, static_cast<int>(peer), backend->nccl->comm,
+                     exec->stream),
+            id.calling_rank, world,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "ncclRecv(Socket payload)");
+      }
+    }
+    internal::throw_nccl("socket-dispatch", ncclGroupEnd(), id.calling_rank,
+                         world, backend->session.session().identity(),
+                         id.generation, ExchangeKind::ExpertCounts,
+                         "ncclGroupEnd(Socket dispatch)");
+  };
+  enqueue_dispatch();
+  internal::throw_cuda(
+      "socket-run", cudaEventRecord(slot.dispatch_complete, exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(Socket dispatch complete)");
+  if (incoming != 0)
+    socket_relay_synthetic_kernel<<<static_cast<unsigned int>(incoming), 256,
+                                     0, exec->stream>>>(
+        receive_headers, receive_payload, canonical, incoming,
+        config.hidden_size, id.generation, id.calling_rank,
+        state->config.max_destination_rows_per_rank,
+        config.expert_transform ==
+            transport::ActivationExpertTransform::Identity,
+        &status->error);
+
+  internal::throw_nccl("socket-return", ncclGroupStart(), id.calling_rank,
+                       world, backend->session.session().identity(),
+                       id.generation, ExchangeKind::ExpertCounts,
+                       "ncclGroupStart(Socket return)");
+  for (std::uint32_t peer = 0; peer < world; ++peer) {
+    const auto send_rows = receive_prefix[peer + 1U] - receive_prefix[peer];
+    const auto receive_rows = send_prefix[peer + 1U] - send_prefix[peer];
+    if (peer == id.calling_rank) {
+      if (send_rows != 0)
+        internal::throw_cuda(
+            "socket-return",
+            cudaMemcpyAsync(
+                send_payload + send_prefix[peer] * config.hidden_size,
+                receive_payload + receive_prefix[peer] * config.hidden_size,
+                checked_size(send_rows * config.hidden_size *
+                                 sizeof(transport::BFloat16),
+                             "Socket self return bytes"),
+                cudaMemcpyDeviceToDevice, exec->stream),
+            id.calling_rank, world, backend->session.session().identity(),
+            id.generation, ExchangeKind::ExpertCounts,
+            "D2D Socket self return");
+      continue;
+    }
+    if (send_rows != 0)
+      internal::throw_nccl(
+          "socket-return",
+          ncclSend(receive_payload +
+                       receive_prefix[peer] * config.hidden_size,
+                   send_rows * config.hidden_size *
+                       sizeof(transport::BFloat16),
+                   ncclUint8, static_cast<int>(peer), backend->nccl->comm,
+                   exec->stream),
+          id.calling_rank, world, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "ncclSend(Socket return)");
+    if (receive_rows != 0)
+      internal::throw_nccl(
+          "socket-return",
+          ncclRecv(send_payload + send_prefix[peer] * config.hidden_size,
+                   receive_rows * config.hidden_size *
+                       sizeof(transport::BFloat16),
+                   ncclUint8, static_cast<int>(peer), backend->nccl->comm,
+                   exec->stream),
+          id.calling_rank, world, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "ncclRecv(Socket return)");
+  }
+  internal::throw_nccl("socket-return", ncclGroupEnd(), id.calling_rank,
+                       world, backend->session.session().identity(),
+                       id.generation, ExchangeKind::ExpertCounts,
+                       "ncclGroupEnd(Socket return)");
+  if (route_count != 0)
+    socket_scatter_returns_kernel<<<static_cast<unsigned int>(route_count),
+                                    256, 0, exec->stream>>>(
+        send_headers, send_payload, by_route, route_count,
+        config.hidden_size);
+  if (id.num_tokens != 0)
+    socket_gate_reduce_kernel<<<static_cast<unsigned int>(id.num_tokens), 256,
+                                0, exec->stream>>>(
+        view, ActivationTransportBridge::gate_pointer(dispatch), by_route,
+        combined, config.hidden_size);
+  socket_finalize_status_kernel<<<1, 1, 0, exec->stream>>>(
+      status, route_count, incoming, id.num_tokens);
+  internal::throw_cuda(
+      "socket-run", cudaGetLastError(), id.calling_rank, world,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "Socket relay/return/reduce kernels");
+  internal::throw_cuda(
+      "socket-run",
+      cudaMemcpyAsync(slot.host_status, status, sizeof(*status),
+                      cudaMemcpyDeviceToHost, exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts, "D2H Socket status");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                            sizeof(*status));
+  internal::throw_cuda(
+      "socket-run", cudaEventRecord(slot.complete, exec->stream),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(Socket complete)");
+  slot.completion_recorded = true;
+  ActivationTransportBridge::submit(consumer);
+  internal::throw_cuda(
+      "socket-run", cudaEventSynchronize(slot.complete), id.calling_rank,
+      world, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventSynchronize(Socket complete)");
+  consumer.finish();
+  if (slot.host_status->error != 0)
+    transport_error(NotifyErrorCode::TransportProtocolFailure, "socket-run",
+                    "received descriptor", id.calling_rank, "valid",
+                    "device validation failure");
+
+  float total_ms = 0.0F;
+  float dispatch_ms = 0.0F;
+  internal::throw_cuda(
+      "socket-timing",
+      cudaEventElapsedTime(&total_ms, slot.start, slot.complete),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventElapsedTime(Socket total)");
+  internal::throw_cuda(
+      "socket-timing",
+      cudaEventElapsedTime(&dispatch_ms, slot.start, slot.dispatch_complete),
+      id.calling_rank, world, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventElapsedTime(Socket dispatch)");
+  const auto gpus_per_node = world / id.num_nodes;
+  const auto source_node = id.calling_rank / gpus_per_node;
+  std::uint64_t remote_rows = 0;
+  for (std::uint32_t peer = 0; peer < world; ++peer)
+    if (peer / gpus_per_node != source_node)
+      remote_rows += send_prefix[peer + 1U] - send_prefix[peer];
+  const auto remote_bytes = checked_mul(
+      checked_mul(remote_rows, config.hidden_size, "Socket remote elements"),
+      sizeof(transport::BFloat16), "Socket remote bytes");
+  auto result = std::make_shared<DeviceActivationTransportHandle::Impl>();
+  result->slot = activation.slot;
+  result->pool = state;
+  result->socket_backend = backend;
+  result->identity = {id.generation, id.calling_rank, id.world_size,
+                      id.num_tokens, config.hidden_size};
+  result->route_count = route_count;
+  result->destination_rows = state->config.max_destination_rows_per_rank;
+  result->audit.backend =
+      transport::ActivationTransportBackend::NcclSocketFallback;
+  result->audit.packet_count = route_count;
+  result->audit.fanout_count = incoming;
+  result->audit.raw_cross_node_payload_bytes = remote_bytes;
+  result->audit.deduplicated_cross_node_payload_bytes = remote_bytes;
+  result->audit.actual_dispatch_peer_bytes = remote_bytes;
+  result->audit.actual_return_peer_bytes = remote_bytes;
+  result->audit.derived_route_input_bytes =
+      route_count * sizeof(std::int32_t);
+  result->audit.derived_local_gate_bytes = route_count * sizeof(float);
+  result->audit.derived_peer_gate_bytes = 0;
+  result->audit.kernel_launches = 7;
+  result->audit.dispatch_kernel_blocks = route_count;
+  result->audit.return_kernel_blocks = incoming;
+  result->audit.reduce_kernel_blocks = id.num_tokens;
+  // Only fixed-width control/count/status metadata is staged. No activation
+  // payload crosses the host boundary.
+  result->audit.activation_d2h_bytes = 0;
+  result->audit.hot_path_allocations = 0;
+  result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+  result->timings.dispatch_relay_us =
+      static_cast<double>(dispatch_ms) * 1000.0;
+  result->timings.combine_reduce_us =
+      result->timings.total_us - result->timings.dispatch_relay_us;
   failure_guard.committed = true;
   return DeviceActivationTransportHandle(std::move(result));
 }
@@ -8273,7 +8972,12 @@ ActivationTransportValidationDownload ActivationTransportBridge::download_for_va
         impl.identity.rank, impl.identity.world, "transport-validation",
         impl.identity.generation, ExchangeKind::ExpertCounts, name);
   };
-  copy(result.contribution_by_route.data(), impl.pool->layout.contribution,
+  const auto contribution_offset =
+      impl.audit.backend ==
+              transport::ActivationTransportBackend::NcclSocketFallback
+          ? impl.pool->layout.combine_return
+          : impl.pool->layout.contribution;
+  copy(result.contribution_by_route.data(), contribution_offset,
        route_elements, "download contributions");
   copy(result.combined_tokens.data(), impl.pool->layout.combined,
        combined_elements, "download combined");

@@ -4308,8 +4308,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     return;
   }
   if (scenario == "activation_p2p" || scenario == "activation_p2p_cancel" ||
-      benchmark_p2p) {
-    require(nodes == 1, "local CUDA P2P scenario requires exactly one node");
+      scenario == "activation_socket" || benchmark_p2p) {
+    const bool socket_fallback = scenario == "activation_socket";
+    require(socket_fallback ? nodes == 2 : nodes == 1,
+            socket_fallback
+                ? "NCCL Socket scenario requires exactly two nodes"
+                : "local CUDA P2P scenario requires exactly one node");
     auto session = megamoe::cuda::make_nccl_generation(
         base, "cuda-local-p2p", 701);
     auto context = megamoe::make_rank_collective_context(
@@ -4339,7 +4343,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_pool_config.max_hidden_size = hidden;
     transport_pool_config.max_top_k = top_k;
     transport_pool_config.max_world_size = world;
-    transport_pool_config.max_nodes = 1;
+    transport_pool_config.max_nodes = nodes;
     transport_pool_config.max_destination_rows_per_rank = benchmark_p2p
         ? max_tokens * top_k
         : static_cast<std::uint64_t>(world) * max_tokens * top_k;
@@ -4357,6 +4361,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                 std::stoul(ring_slots_text))
                           : 2U));
     transport_pool_config.max_inflight_generations = 1;
+    transport_pool_config.enable_socket_fallback = socket_fallback;
     const auto setup_start = Clock::now();
     auto transport_pool = megamoe::cuda::make_activation_transport_pool(
         session.session(), execution, transport_pool_config);
@@ -4370,8 +4375,18 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         megamoe::cuda::testing::upload_bfloat16_activations_for_testing(
             activations, common_routes.num_tokens, hidden, context, execution,
             transport_pool);
-    megamoe::cuda::LocalCudaP2pActivationTransport transport(
-        session, execution, transport_pool);
+    std::unique_ptr<megamoe::cuda::LocalCudaP2pActivationTransport>
+        local_transport;
+    std::unique_ptr<megamoe::cuda::NcclSocketFallbackActivationTransport>
+        socket_transport;
+    if (socket_fallback)
+      socket_transport = std::make_unique<
+          megamoe::cuda::NcclSocketFallbackActivationTransport>(
+          session, execution, transport_pool);
+    else
+      local_transport = std::make_unique<
+          megamoe::cuda::LocalCudaP2pActivationTransport>(
+          session, execution, transport_pool);
     const auto setup_us = std::chrono::duration<double, std::micro>(
                               Clock::now() - setup_start)
                               .count();
@@ -4389,8 +4404,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       cancel_options.cancellation.request_cancel();
       bool cancelled = false;
       try {
-        (void)transport.run_synthetic(notify.dispatch(), activation,
-                                      transport_config, cancel_options);
+        (void)local_transport->run_synthetic(
+            notify.dispatch(), activation, transport_config, cancel_options);
       } catch (const megamoe::NotifyDispatchError &error) {
         cancelled = error.code() == megamoe::NotifyErrorCode::TransportTimeout;
       }
@@ -4414,7 +4429,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                    : 110U)
                             : (rounds_text ? static_cast<std::uint32_t>(
                                                  std::stoul(rounds_text))
-                                           : 1U);
+                                           : (socket_fallback ? 20U : 1U));
     require(rounds > 0, "local P2P rounds must be positive");
     require(!benchmark_p2p || rounds > 10,
             "local P2P benchmark requires 10 warmups plus measurements");
@@ -4432,8 +4447,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       megamoe::cuda::ActivationTransportRunOptions run_options;
       if (benchmark_p2p)
         run_options.deadline_after = std::chrono::seconds(120);
-      transported = transport.run_synthetic(
-          notify.dispatch(), activation, transport_config, run_options);
+      transported = socket_fallback
+          ? socket_transport->run_synthetic(
+                notify.dispatch(), activation, transport_config, run_options)
+          : local_transport->run_synthetic(
+                notify.dispatch(), activation, transport_config, run_options);
       const auto warmup = benchmark_p2p ? 10U : 0U;
       if (benchmark_p2p && round >= warmup) {
         total_samples.push_back(transported.timings().total_us);
@@ -4461,12 +4479,38 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       }
     }
     require(transported.audit().backend ==
-                megamoe::transport::ActivationTransportBackend::LocalCudaP2p,
-            "real local P2P backend audit mismatch");
+                (socket_fallback
+                     ? megamoe::transport::ActivationTransportBackend::
+                           NcclSocketFallback
+                     : megamoe::transport::ActivationTransportBackend::
+                           LocalCudaP2p),
+            "concrete activation backend audit mismatch");
     require(transported.audit().activation_d2h_bytes == 0 &&
                 transported.audit().activation_h2d_bytes == 0 &&
                 transported.audit().hot_path_allocations == 0,
             "real local P2P path staged activation or allocated hot resources");
+    if (socket_fallback) {
+      const auto host_dispatch =
+          megamoe::cuda::download_device_metadata_for_validation(
+              notify.dispatch(), execution);
+      const auto oracle = megamoe::transport::simulate_activation_transport(
+          host_dispatch, activations, route_gates, transport_config, 1);
+      if (downloaded.contribution_by_route != oracle.contribution_by_route) {
+        const auto mismatch = std::mismatch(
+            downloaded.contribution_by_route.begin(),
+            downloaded.contribution_by_route.end(),
+            oracle.contribution_by_route.begin());
+        const auto index = static_cast<std::size_t>(
+            mismatch.first - downloaded.contribution_by_route.begin());
+        throw std::runtime_error(
+            "NCCL Socket route contributions differ from host oracle: "
+            "index=" + std::to_string(index) + ", actual=" +
+            std::to_string(mismatch.first->bits) + ", expected=" +
+            std::to_string(mismatch.second->bits));
+      }
+      require(downloaded.combined_tokens == oracle.combined_tokens,
+              "NCCL Socket combined output differs from host oracle");
+    }
     const auto steady_api_after =
         megamoe::cuda::testing::cuda_api_audit_snapshot();
     require(steady_api_after.device_allocations ==
@@ -4515,6 +4559,30 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       std::cout << " reduce=";
       emit_values(reduce_samples);
       std::cout << std::endl;
+      return;
+    }
+    if (socket_fallback) {
+      std::cout << "SOCKET_RESULT rank=" << rank
+                << " backend="
+                << megamoe::transport::activation_transport_backend_name(
+                       transported.audit().backend)
+                << " tokens=" << common_routes.num_tokens
+                << " top_k=" << top_k << " hidden=" << hidden
+                << " packets=" << transported.audit().packet_count
+                << " fanout=" << transported.audit().fanout_count
+                << " raw_bytes="
+                << transported.audit().raw_cross_node_payload_bytes
+                << " dedup_bytes="
+                << transported.audit().deduplicated_cross_node_payload_bytes
+                << " gate_mode=" << gate_mode
+                << " gate_hash=" << gate_hash
+                << " output_hash="
+                << hash_bf16_indexed(downloaded.combined_tokens)
+                << " contribution_hash="
+                << hash_bf16_indexed(downloaded.contribution_by_route)
+                << " rounds=" << rounds
+                << " oracle=1 total_us=" << transported.timings().total_us
+                << std::endl;
       return;
     }
     const auto emit_bits = [](const auto &values) {

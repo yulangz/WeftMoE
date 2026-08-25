@@ -16,8 +16,13 @@ source-side dynamic-gate deterministic reduce all execute in one cooperative
 persistent kernel. Phase 6 adds a single-launch, single-node Backward baseline
 for the same main shape, including cache/recompute paths, dY dispatch,
 WGMMA/TMA dV/dX/dW1/dW2, deterministic dGate, and fixed-order dX combine. It
-does **not** implement cross-node Forward/Backward, Socket transport, or NCCL
-GIN/RDMA.
+Phase 7 has started with a concrete, opt-in
+`NcclSocketFallbackActivationTransport`: it performs host-enqueued NCCL
+Send/Recv of GPU-resident BF16 payloads across two hosts, device relay,
+synthetic return, and source-side dynamic-gate reduction without activation
+D2H/H2D. This is a correctness/lower-bound backend, not a persistent GIN
+data plane. Cross-node FC Forward/Backward, node-deduplicated same-rail proxy
+fan-out, and NCCL GIN/RDMA remain incomplete.
 
 ## Supported topology contract
 
@@ -337,9 +342,11 @@ official NCCL 2.29.7 CUDA 12.9 package, explicitly loaded from a repository-
 external cache, has passed real two-host world-2 and world-16 device-comm plus
 collective registered-window lifecycle probes. The data-plane backend is not
 implemented yet; consequently `gin_backend_implemented=0, gin_usable=0`.
-`NcclSocketFallback` and `Gin` have no production constructor and cannot be
-selected by passing an enum. Simulation, local P2P, Socket, and GIN audit labels
-therefore cannot be forged by the caller.
+`NcclSocketFallback` has a distinct production constructor and refuses to run
+unless the communicator was explicitly configured for NCCL Socket
+(`NCCL_IB_DISABLE=1`). `Gin` still has no production constructor. Simulation,
+local P2P, Socket, and GIN audit labels are emitted by their concrete backend
+objects rather than selected by a caller enum.
 
 ## Repository layout
 

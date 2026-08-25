@@ -52,6 +52,7 @@ private:
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
+  friend class NcclSocketFallbackActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
 };
@@ -72,6 +73,9 @@ struct ActivationTransportPoolConfig {
   // Reserves the generation-local Backward arena.  It is deliberately opt-in
   // so the frozen Forward-only pool footprint is unchanged.
   bool enable_backward = false;
+  // Reserves compact route/payload staging for the explicitly host-enqueued
+  // NCCL Socket correctness backend. Disabled for the frozen local P2P path.
+  bool enable_socket_fallback = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -101,6 +105,7 @@ private:
   friend class ActivationTransportBridge;
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
+  friend class NcclSocketFallbackActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
 };
@@ -172,6 +177,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
+  friend class NcclSocketFallbackActivationTransport;
   friend class ActivationTransportBridge;
   friend struct ActivationTransportValidationDownload;
   friend std::vector<transport::BFloat16>
@@ -214,6 +220,26 @@ struct ActivationTransportRunOptions {
 class LocalCudaP2pActivationTransport {
 public:
   LocalCudaP2pActivationTransport(
+      const NcclSession &session, const CudaExecution &execution,
+      const ActivationTransportResourcePool &pool);
+
+  DeviceActivationTransportHandle run_synthetic(
+      const DeviceDispatchHandle &dispatch,
+      const BFloat16ActivationLease &activations,
+      const transport::ActivationTransportConfig &config,
+      const ActivationTransportRunOptions &options = {});
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+// Cross-host correctness/lower-bound backend. Payload movement is explicitly
+// host-enqueued NCCL Send/Recv; this class is not a device-side GIN backend and
+// never publishes a Gin audit label.
+class NcclSocketFallbackActivationTransport {
+public:
+  NcclSocketFallbackActivationTransport(
       const NcclSession &session, const CudaExecution &execution,
       const ActivationTransportResourcePool &pool);
 

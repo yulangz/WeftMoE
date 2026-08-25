@@ -186,6 +186,30 @@ deregisters a strict-ordering NCCL window, and destroys the device comm. It
 does not claim data-plane usability: until MegaMOE put/signal kernels exist,
 `gin_backend_implemented=0` and `gin_usable=0`.
 
+The explicit Socket correctness backend uses the default CUDA-12.9 NCCL
+runtime and requires the network choice at communicator creation. A two-rank
+run is:
+
+```bash
+python3 tests/run_multinode_nccl.py \
+  --binary "$PWD/build-cuda/test_cuda_notify" \
+  --remote root@10.10.19.233 --port 2222 \
+  --remote-binary "$PWD/build-cuda/test_cuda_notify" \
+  --gpus-per-node 1 --scenario activation_socket \
+  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+  --socket-ifname eth0 --disable-ib
+
+# Use --gpus-per-node 8 for the real two-host world-16 run.
+```
+
+The launcher prints the actual loaded `libnccl.so.2`, runtime version, network
+overrides, concrete `nccl-socket-host-enqueued-fallback` audit label, and
+per-rank output/contribution hashes. Each rank compares the downloaded test
+result with the independent host transport oracle before printing
+`oracle=1`. This initial Socket slice sends route aggregates directly between
+ranks; node-deduplicated same-rail proxy fan-out and cross-node FC
+Forward/Backward are still Phase-7 work.
+
 The CUDA build reads DeepGEMM headers from `DEEPGEMM_INCLUDE_DIR` (defaulting
 to the adjacent reference checkout) and discovers the installed DeepGEMM
 package's CUTLASS/CUTE headers without embedding its wheel path. Source-only

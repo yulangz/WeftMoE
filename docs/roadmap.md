@@ -168,3 +168,20 @@ correctness blockers.
   memory because that rank owns all 384 experts. Correctness, sanitizer, and
   ordinary timing evidence therefore remain separate from this profiler
   limitation. No Phase-6 completion claim is made until external test handoff.
+
+## Phase 7 — cross-node activation and complete training step (in progress)
+
+- A repository-external NCCL 2.29.7 CUDA-12.9 runtime passes real two-host
+  world-2/world-16 device-communicator and registered-window lifecycle probes.
+  MegaMOE still reports `gin_backend_implemented=0, gin_usable=0` until actual
+  put/signal/local-completion kernels exist.
+- The first concrete `NcclSocketFallback` slice passes real world-2 and
+  world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
+  gate-after combine, and independent host-oracle comparison. It has no
+  activation D2H/H2D and its backend label cannot be selected by enum.
+- This baseline still uses direct rank-to-rank route aggregation. Required
+  follow-up is node-level payload dedup, same-rail destination proxies and
+  local P2P fan-out, followed by cache Forward/Backward/dGate integration and
+  the two-host Megatron performance comparison.
+- GIN/RDMA and the single-persistent cross-node data plane are not implemented
+  or claimed by the Socket fallback.

@@ -652,8 +652,16 @@ symbol gate. The explicitly loaded NCCL 2.29.7 CUDA 12.9 runtime passes
 world-2/world-16 device-communicator and registered-window initialization, but
 the data-plane backend is not implemented yet; therefore `gin_usable` remains
 false. The session probe is collective and returns no native NCCL/CUDA handle.
-Socket fallback is also absent at this checkpoint.
-Neither can be confused with the real one-node CUDA IPC backend.
+The opt-in Socket correctness backend is now concrete and separately typed. It
+packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
+NCCL Send/Recv, performs destination device relay plus the validation expert
+transform, returns aggregate contributions, and reduces with source-resident
+dynamic gates. Only the small runtime count matrix and terminal status are
+staged to host; activation bytes remain on device. Its current first slice is
+direct rank-to-rank and therefore does not yet implement node dedup,
+same-rail proxy plus local CUDA-P2P fan-out, or full FC Forward/Backward. It is
+never described as persistent, GIN, or RDMA and cannot be confused with the
+real one-node CUDA IPC backend.
 
 ### Backward ownership and dataflow
 
