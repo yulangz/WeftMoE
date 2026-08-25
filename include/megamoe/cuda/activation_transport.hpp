@@ -55,7 +55,9 @@ private:
   friend class NcclSocketFallbackActivationTransport;
   friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class GinRdmaForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
+  friend class GinRdmaBackwardMegaKernel;
 };
 
 struct ActivationTransportPoolConfig {
@@ -115,7 +117,9 @@ private:
   friend class NcclSocketFallbackActivationTransport;
   friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class GinRdmaForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
+  friend class GinRdmaBackwardMegaKernel;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -400,6 +404,7 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pForwardMegaKernel;
+  friend class GinRdmaForwardMegaKernel;
   friend class ForwardMegaKernelBridge;
   friend std::vector<transport::BFloat16>
   download_forward_output_for_validation(const DeviceForwardHandle &,
@@ -411,6 +416,7 @@ private:
       const DeviceForwardHandle &, const DeviceForwardHandle &);
   friend class SelectedOutputGradientLease;
   friend class LocalCudaP2pBackwardMegaKernel;
+  friend class GinRdmaBackwardMegaKernel;
   friend struct BackwardMegaKernelBridge;
   friend SelectedOutputGradientLease
   testing_upload_output_gradient_for_backward(
@@ -436,8 +442,28 @@ public:
       const ActivationTransportRunOptions &options = {});
 
 private:
+  LocalCudaP2pForwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &, bool use_gin);
   struct Impl;
   std::shared_ptr<Impl> impl_;
+  friend class GinRdmaForwardMegaKernel;
+};
+
+// Cross-node same-rail GIN Forward. It shares the frozen WGMMA/TMA compute
+// specialization with LocalCudaP2pForwardMegaKernel, but has a distinct
+// construction path and never falls back to local simulation or Socket.
+class GinRdmaForwardMegaKernel {
+public:
+  GinRdmaForwardMegaKernel(const NcclSession &, const CudaExecution &,
+                           const ActivationTransportResourcePool &);
+  DeviceForwardHandle run(
+      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
+      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
+      const ActivationTransportRunOptions & = {});
+
+private:
+  std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
 };
 
 std::vector<transport::BFloat16>
@@ -470,6 +496,7 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
+  friend class GinRdmaBackwardMegaKernel;
   friend struct BackwardMegaKernelBridge;
   friend SelectedOutputGradientLease
   testing_upload_output_gradient_for_backward(
@@ -554,6 +581,7 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
+  friend class GinRdmaBackwardMegaKernel;
   friend struct BackwardValidationDownload;
   friend struct BackwardStorageHashAccess;
   friend BackwardValidationDownload download_backward_for_validation(
@@ -586,8 +614,25 @@ public:
       const ActivationTransportRunOptions &options = {});
 
 private:
+  LocalCudaP2pBackwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &, bool use_gin);
   struct Impl;
   std::shared_ptr<Impl> impl_;
+  friend class GinRdmaBackwardMegaKernel;
+};
+
+class GinRdmaBackwardMegaKernel {
+public:
+  GinRdmaBackwardMegaKernel(const NcclSession &, const CudaExecution &,
+                            const ActivationTransportResourcePool &);
+  DeviceBackwardHandle run(
+      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
+      const BackwardMegaKernelConfig &,
+      const ActivationTransportRunOptions & = {});
+
+private:
+  std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
 };
 
 BackwardValidationDownload download_backward_for_validation(

@@ -359,6 +359,8 @@ def parse_args(argv=None):
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
                  "gin_probe", "gin_put_probe", "gin_team_pool",
+                 "gin_forward_smoke",
+                 "gin_backward_smoke",
                  "activation_socket",
                  "activation_gin"),
         default="valid",
@@ -535,6 +537,30 @@ def main(argv=None):
                                "\n".join(failures))
         print("\n".join(evidence))
         print(f"[PASS] runtime GIN rail/local-team/pool world={world}")
+        return
+
+    if args.scenario in ("gin_forward_smoke", "gin_backward_smoke"):
+        failures = []
+        evidence = []
+        for result in outputs:
+            marker = ("FORWARD_SMOKE " if args.scenario == "gin_forward_smoke"
+                      else "BACKWARD_SMOKE ")
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith(marker)]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN MegaKernel failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        stage = "Forward" if args.scenario == "gin_forward_smoke" else "Backward"
+        print(f"[PASS] same-rail GIN {stage} persistent kernel world={world}")
         return
 
     if args.scenario == "activation_socket":
