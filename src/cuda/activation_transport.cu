@@ -392,26 +392,42 @@ GinWindowLayout make_gin_window_layout(
   std::size_t cursor = 0;
   const auto routes = checked_mul(config.max_tokens_per_rank,
                                   config.max_top_k, "GIN max routes");
-  const auto packet_payload = checked_mul(routes, config.max_hidden_size,
-                                          "GIN packet payload elements");
+  const auto outgoing_packets = checked_mul(
+      config.max_nodes, config.max_tokens_per_rank,
+      "GIN outgoing packet capacity");
+  const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
+  const auto incoming_packets = checked_mul(
+      remote_nodes, config.max_tokens_per_rank,
+      "GIN incoming packet capacity");
+  const auto packet_payload = checked_mul(outgoing_packets,
+                                          config.max_hidden_size,
+                                          "GIN send payload elements");
+  const auto incoming_payload = checked_mul(incoming_packets,
+                                            config.max_hidden_size,
+                                            "GIN receive payload elements");
   const auto return_payload = checked_mul(routes, config.max_hidden_size,
                                           "GIN return payload elements");
   layout.send_packet_headers = append(
-      cursor, routes, sizeof(LocalP2pRouteHeader), "GIN send packet headers");
+      cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
+      "GIN send packet headers");
   layout.receive_packet_headers = append(
-      cursor, routes, sizeof(LocalP2pRouteHeader),
+      cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
       "GIN receive packet headers");
   layout.send_fanout = append(cursor, routes, sizeof(DeviceFanoutRecord),
                               "GIN send fanout");
-  layout.receive_fanout = append(cursor, routes, sizeof(DeviceFanoutRecord),
-                                 "GIN receive fanout");
+  layout.receive_fanout = append(
+      cursor, checked_mul(incoming_packets, config.max_top_k,
+                          "GIN receive fanout capacity"),
+      sizeof(DeviceFanoutRecord), "GIN receive fanout");
   layout.send_payload = append(cursor, packet_payload,
                                sizeof(transport::BFloat16),
                                "GIN send payload");
-  layout.receive_payload = append(cursor, packet_payload,
+  layout.receive_payload = append(cursor, incoming_payload,
                                   sizeof(transport::BFloat16),
                                   "GIN receive payload");
-  layout.return_staging = append(cursor, return_payload,
+  layout.return_staging = append(
+      cursor, checked_mul(remote_nodes, return_payload,
+                          "GIN return staging elements"),
                                  sizeof(transport::BFloat16),
                                  "GIN return staging");
   layout.return_receive = append(cursor, return_payload,
@@ -1296,6 +1312,8 @@ struct GinSyntheticArgs {
   void *window_base;
   std::size_t send_header_offset;
   std::size_t receive_header_offset;
+  std::size_t send_fanout_offset;
+  std::size_t receive_fanout_offset;
   std::size_t send_payload_offset;
   std::size_t receive_payload_offset;
   std::size_t canonical_offset;
@@ -1304,6 +1322,10 @@ struct GinSyntheticArgs {
   std::size_t combine_compute_offset;
   std::size_t combined_offset;
   std::size_t status_offset;
+  std::size_t peer_bases_offset;
+  std::uint32_t local_world_size;
+  std::uint32_t node;
+  std::uint64_t max_tokens_per_rank;
   bool identity_expert;
 };
 
@@ -1319,7 +1341,6 @@ __global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm) {
 __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
   const auto lane = static_cast<std::uint32_t>(threadIdx.x);
   const auto rank = a.dispatch.identity.calling_rank;
-  const auto world = a.dispatch.identity.world_size;
   const ncclGin gin(a.dev_comm, 0);
   const auto rail = ncclTeamRail(a.dev_comm);
   auto *bytes = static_cast<std::byte *>(a.window_base);
@@ -1328,15 +1349,17 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
       bytes + a.send_header_offset);
   auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.receive_header_offset);
+  auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+      bytes + a.send_fanout_offset);
+  auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+      bytes + a.receive_fanout_offset);
   auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.send_payload_offset);
   auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.receive_payload_offset);
-  auto *canonical = reinterpret_cast<transport::BFloat16 *>(
-      compute_bytes + a.canonical_offset);
   auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.return_staging_offset);
-  auto *combine = reinterpret_cast<transport::BFloat16 *>(
+  auto *return_receive = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.return_receive_offset);
   auto *combine_compute = reinterpret_cast<transport::BFloat16 *>(
       compute_bytes + a.combine_compute_offset);
@@ -1344,6 +1367,8 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
       compute_bytes + a.combined_offset);
   auto *status = reinterpret_cast<TransportDeviceStatus *>(
       compute_bytes + a.status_offset);
+  auto **peer_bases = reinterpret_cast<void **>(
+      compute_bytes + a.peer_bases_offset);
   __shared__ unsigned long long remote_packets;
   __shared__ unsigned long long remote_routes;
   __shared__ unsigned long long remote_incoming;
@@ -1362,18 +1387,17 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
     const auto descriptor = a.dispatch.packet_headers[packet];
     const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
     const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-    const bool local = descriptor.destination_node == rank;
+    const bool local = descriptor.destination_node == a.node;
     if (!local) {
       for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x)
         send_payload[packet * a.hidden + h] =
             a.input[descriptor.local_token_id * a.hidden + h];
       for (auto fanout = fanout_begin + lane; fanout < fanout_end;
            fanout += blockDim.x) {
-        const auto target = a.dispatch.packet_fanout[fanout];
-        const auto route = descriptor.local_token_id *
-                               a.dispatch.identity.top_k +
-                           target.topk_slot;
-        send_headers[fanout] = LocalP2pRouteHeader{
+        send_fanout[fanout] = a.dispatch.packet_fanout[fanout];
+      }
+      if (lane == 0)
+        send_headers[packet] = LocalP2pRouteHeader{
             transport::kActivationTransportSchemaVersion,
             rank,
             descriptor.proxy_rank,
@@ -1381,29 +1405,37 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
             a.dispatch.identity.generation,
             a.epoch,
             descriptor.sequence_on_link,
-            route,
+            fanout_end - fanout_begin,
             descriptor.local_token_id,
-            target.dst_row,
-            target.expert_id,
-            target.topk_slot};
-      }
+            fanout_begin,
+            0,
+            0};
       __syncthreads();
       if (lane == 0) {
         const auto destination =
             static_cast<int>(descriptor.destination_node);
-        for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
-          const auto target = a.dispatch.packet_fanout[fanout];
-          gin.put(rail, destination, a.window,
-                  a.receive_header_offset +
-                      target.dst_row * sizeof(LocalP2pRouteHeader),
-                  a.window,
-                  a.send_header_offset +
-                      fanout * sizeof(LocalP2pRouteHeader),
-                  sizeof(LocalP2pRouteHeader));
-        }
+        const auto source_partition =
+            a.node < descriptor.destination_node ? a.node : a.node - 1U;
+        const auto receive_packet =
+            source_partition * a.max_tokens_per_rank +
+            descriptor.sequence_on_link;
+        gin.put(rail, destination, a.window,
+                a.receive_header_offset + receive_packet *
+                                              sizeof(LocalP2pRouteHeader),
+                a.window,
+                a.send_header_offset + packet * sizeof(LocalP2pRouteHeader),
+                sizeof(LocalP2pRouteHeader));
+        gin.put(rail, destination, a.window,
+                a.receive_fanout_offset +
+                    receive_packet *
+                        a.dispatch.identity.top_k * sizeof(DeviceFanoutRecord),
+                a.window,
+                a.send_fanout_offset +
+                    fanout_begin * sizeof(DeviceFanoutRecord),
+                (fanout_end - fanout_begin) * sizeof(DeviceFanoutRecord));
         gin.put(rail, destination, a.window,
                 a.receive_payload_offset +
-                    descriptor.sequence_on_link * a.hidden *
+                    receive_packet * a.hidden *
                         sizeof(transport::BFloat16),
                 a.window,
                 a.send_payload_offset + packet * a.hidden *
@@ -1423,8 +1455,14 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
                            target.topk_slot;
         for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
           const auto value = a.input[descriptor.local_token_id * a.hidden + h];
-          canonical[target.dst_row * a.hidden + h] = value;
-          combine[route * a.hidden + h] = synthetic_value(
+          const auto destination_rank =
+              a.node * a.local_world_size + target.destination_local_rank;
+          auto *destination_canonical =
+              reinterpret_cast<transport::BFloat16 *>(
+                  static_cast<std::byte *>(peer_bases[destination_rank]) +
+                  a.canonical_offset);
+          destination_canonical[target.dst_row * a.hidden + h] = value;
+          combine_compute[route * a.hidden + h] = synthetic_value(
               value, target.expert_id, h, a.identity_expert);
         }
         __syncthreads();
@@ -1437,52 +1475,96 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
   __syncthreads();
 
   if (lane == 0) {
-    for (std::uint32_t node = 0; node < world; ++node)
-      if (node != rank)
-        remote_incoming +=
-            a.dispatch.incoming_proxy_signals[node].expected_packets;
+    for (std::uint32_t index = 0;
+         index < a.dispatch.sizes.incoming_signal_count; ++index) {
+      const auto signal = a.dispatch.incoming_proxy_signals[index];
+      if (signal.source_node != a.node)
+        remote_incoming += signal.expected_packets;
+    }
     if (remote_incoming != 0)
       gin.waitSignal(ncclCoopThread{}, 0, remote_incoming);
   }
   __syncthreads();
 
   unsigned long long return_count = 0;
-  for (std::uint64_t row = 0;
-       row < a.dispatch.sizes.incoming_row_count; ++row) {
-    const auto incoming = a.dispatch.incoming_rows[row];
-    if (incoming.source_rank == rank)
+  for (std::uint32_t signal_index = 0;
+       signal_index < a.dispatch.sizes.incoming_signal_count;
+       ++signal_index) {
+    const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+    if (signal.source_node == a.node)
       continue;
-    const auto header = receive_headers[row];
-    for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
-      const auto value =
-          receive_payload[header.sequence * a.hidden + h];
-      canonical[row * a.hidden + h] = value;
-      return_staging[row * a.hidden + h] = synthetic_value(
-          value, header.expert_id, h, a.identity_expert);
+    const auto source_partition =
+        signal.source_node < a.node ? signal.source_node
+                                    : signal.source_node - 1U;
+    for (std::uint64_t sequence = 0;
+         sequence < signal.expected_packets; ++sequence) {
+      const auto packet = source_partition * a.max_tokens_per_rank + sequence;
+      const auto header = receive_headers[packet];
+      const auto fanout_count = header.route_index;
+      for (std::uint64_t fanout = 0; fanout < fanout_count; ++fanout) {
+        const auto target = receive_fanout[
+            packet * a.dispatch.identity.top_k + fanout];
+        const auto destination_rank =
+            a.node * a.local_world_size + target.destination_local_rank;
+        auto *destination_canonical =
+            reinterpret_cast<transport::BFloat16 *>(
+                static_cast<std::byte *>(peer_bases[destination_rank]) +
+                a.canonical_offset);
+        const auto staging =
+            (packet * a.dispatch.identity.top_k + fanout) * a.hidden;
+        for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
+          const auto value = receive_payload[packet * a.hidden + h];
+          destination_canonical[target.dst_row * a.hidden + h] = value;
+          return_staging[staging + h] = synthetic_value(
+              value, target.expert_id, h, a.identity_expert);
+        }
+        __syncthreads();
+      }
+      if (lane == 0 && fanout_count != 0) {
+        gin.put(rail, static_cast<int>(signal.source_node), a.window,
+                a.return_receive_offset +
+                    header.dst_row * a.hidden *
+                        sizeof(transport::BFloat16),
+                a.window,
+                a.return_staging_offset +
+                    packet * a.dispatch.identity.top_k * a.hidden *
+                        sizeof(transport::BFloat16),
+                fanout_count * a.hidden * sizeof(transport::BFloat16),
+                ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
+                ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        ++return_count;
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    if (lane == 0) {
-      const auto destination = static_cast<int>(header.source_rank);
-      gin.put(rail, destination, a.window,
-              a.return_receive_offset + header.route_index * a.hidden *
-                                            sizeof(transport::BFloat16),
-              a.window,
-              a.return_staging_offset + row * a.hidden *
-                                            sizeof(transport::BFloat16),
-              a.hidden * sizeof(transport::BFloat16),
-              ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
-              ncclCoopThread{}, ncclGin_None{},
-              ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-      ++return_count;
-    }
-    __syncthreads();
   }
   if (lane == 0 && return_count != 0)
     gin.waitCounter(ncclCoopThread{}, 0, remote_packets + return_count);
   __syncthreads();
-  if (lane == 0 && remote_routes != 0)
-    gin.waitSignal(ncclCoopThread{}, 1, remote_routes);
+  if (lane == 0 && remote_packets != 0)
+    gin.waitSignal(ncclCoopThread{}, 1, remote_packets);
   __syncthreads();
+
+  // Map the packed return payload back to the original route slots using the
+  // same deterministic outgoing packet/fan-out order which formed the put.
+  for (std::uint64_t packet = 0;
+       packet < a.dispatch.sizes.packet_count; ++packet) {
+    const auto descriptor = a.dispatch.packet_headers[packet];
+    if (descriptor.destination_node == a.node)
+      continue;
+    const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+    const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+    for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
+      const auto target = a.dispatch.packet_fanout[fanout];
+      const auto route = descriptor.local_token_id *
+                             a.dispatch.identity.top_k +
+                         target.topk_slot;
+      for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x)
+        combine_compute[route * a.hidden + h] =
+            return_receive[fanout * a.hidden + h];
+      __syncthreads();
+    }
+  }
 
   for (std::uint64_t token = 0; token < a.dispatch.identity.num_tokens;
        ++token) {
@@ -1493,10 +1575,8 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
         const auto slot = a.dispatch.combine_order[
             token * a.dispatch.identity.top_k + order];
         const auto route = token * a.dispatch.identity.top_k + slot;
-        combine_compute[route * a.hidden + h] =
-            combine[route * a.hidden + h];
         sum = gate_after_accumulate(
-            sum, a.gates[route], combine[route * a.hidden + h].bits);
+            sum, a.gates[route], combine_compute[route * a.hidden + h].bits);
       }
       combined[token * a.hidden + h] =
           transport::BFloat16{float_to_bf16_bits(sum)};
@@ -8175,14 +8255,14 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
   const auto state = backend->pool;
   const auto &id = dispatch.identity();
   const auto &activation = *activations.impl_;
-  if (id.num_nodes != 2 || id.world_size != 2 ||
+  if (id.num_nodes != backend->num_nodes ||
       id.world_size != backend->nccl->world ||
       id.calling_rank != backend->nccl->rank)
     throw NotifyDispatchError(
         NotifyErrorCode::BackendUnavailable,
         "phase=gin-run, field=topology, rank=" +
             std::to_string(id.calling_rank) +
-            ", expected=two nodes with one GPU each and exact rank, actual=" +
+            ", expected=runtime GIN team topology and exact rank, actual=" +
             std::to_string(id.num_nodes) + " nodes, world=" +
             std::to_string(id.world_size));
   if (activation.pool.get() != state.get() ||
@@ -8288,6 +8368,8 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
   args.window_base = slot.gin_window;
   args.send_header_offset = state->gin_layout.send_packet_headers;
   args.receive_header_offset = state->gin_layout.receive_packet_headers;
+  args.send_fanout_offset = state->gin_layout.send_fanout;
+  args.receive_fanout_offset = state->gin_layout.receive_fanout;
   args.send_payload_offset = state->gin_layout.send_payload;
   args.receive_payload_offset = state->gin_layout.receive_payload;
   args.canonical_offset = layout.canonical_rows;
@@ -8296,6 +8378,10 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
   args.combine_compute_offset = layout.combine_return;
   args.combined_offset = layout.combined;
   args.status_offset = layout.status;
+  args.peer_bases_offset = layout.peer_bases;
+  args.local_world_size = backend->local_world_size;
+  args.node = backend->node;
+  args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   args.identity_expert =
       config.expert_transform ==
       transport::ActivationExpertTransform::Identity;

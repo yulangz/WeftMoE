@@ -205,7 +205,7 @@ shape is two nodes by eight local ranks, and all 16 received hashes match the
 expected same-local-rank peer. It proves the runtime/plugin/NIC data-movement
 path, but is deliberately not counted as the complete MegaMOE GIN backend.
 
-The initial real activation slice (one GPU per node) is exercised with:
+The real activation transport slice is exercised at world 2 with:
 
 ```bash
 env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
@@ -220,12 +220,17 @@ env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
 Both ranks use ten tokens, top-k six, dynamic source-resident gates, and the
 independent host oracle. Twenty generations complete with
 `backend=nccl-gin-device` and `oracle=1`; no activation payload crosses the
-host. This is a genuine device-issued GIN dispatch/return slice, but it is not
-the world-16 backend and does not yet execute FC Forward/Backward.
+host. The same test runs the complete two-node, eight-GPU-per-node same-rail
+and local CUDA-IPC fan-out path by changing `--gpus-per-node 1` to
+`--gpus-per-node 8`. All 16 ranks pass 20 deterministic generations with
+`backend=nccl-gin-device` and `oracle=1`. Return contributions are aggregated
+per deduplicated token packet (one put and signal), rather than per route.
+This is a genuine device-issued GIN dispatch/relay/return slice, but it still
+does not execute cross-node FC Forward/Backward.
 
 The runtime team/pool setup is separately checked on all 16 ranks with
 `--gpus-per-node 8 --scenario gin_team_pool`. The observed two-slot small-shape
-pool reports `54,848` ordinary compute bytes and `5,136` GIN-registered bytes
+pool reports `54,848` ordinary compute bytes and `4,624` GIN-registered bytes
 per rank. All ranks validate rail size two, local team size eight, their
 runtime local rank, registered windows, and seven node-local IPC mappings.
 

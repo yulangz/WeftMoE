@@ -263,9 +263,11 @@ private:
   std::shared_ptr<Impl> impl_;
 };
 
-// True device-issued NCCL GIN data plane. The initial implementation supports
-// exactly two nodes with one GPU per node; other teams fail BackendUnavailable
-// until source-indexed ingress and local proxy fan-out are connected.
+// True device-issued NCCL GIN data plane. The transport slice derives the
+// homogeneous rail/local team at runtime, partitions ingress by source node,
+// and performs same-rail ingress plus node-local CUDA-IPC fan-out. The current
+// public operation remains the synthetic validation transform; cross-node
+// Forward/Backward FC integration is not implied by this type.
 class GinRdmaActivationTransport {
 public:
   GinRdmaActivationTransport(

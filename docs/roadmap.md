@@ -175,21 +175,21 @@ correctness blockers.
   world-2/world-16 device-communicator and registered-window lifecycle probes.
   A dedicated world-2/world-16 probe also passes real same-rail device put,
   remote indexed signal, local completion, and full payload hash validation.
-  The primitive is now integrated into a separately typed two-node,
-  one-GPU-per-node activation backend: real world-2 device dispatch, remote
-  signal, synthetic
-  contribution return and gate-after reduce pass 20 deterministic oracle
+  The primitive is now integrated into a separately typed homogeneous runtime
+  backend. Real world-2 and two-node world-16 device dispatch, remote signal,
+  same-rail proxy ingress, local CUDA-IPC fan-out, packet-batched synthetic
+  contribution return, and gate-after reduce pass 20 deterministic oracle
   checks. The general capability still reports
-  `gin_backend_implemented=0, gin_usable=0` because the required world-16
-  same-rail proxy/local-P2P fan-out is not implemented.
+  `gin_backend_implemented=0, gin_usable=0` because cross-node FC
+  Forward/Backward is not implemented.
 - The first concrete `NcclSocketFallback` slice passes real world-2 and
   world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
   gate-after combine, and independent host-oracle comparison. It has no
   activation D2H/H2D and its backend label cannot be selected by enum.
-- This baseline still uses direct rank-to-rank route aggregation. Required
-  follow-up is node-level payload dedup, same-rail destination proxies and
-  local P2P fan-out, followed by cache Forward/Backward/dGate integration and
-  the two-host Megatron performance comparison.
+- GIN now uses node-level payload dedup, same-rail destination proxies, and
+  local P2P fan-out. Required follow-up is cache Forward/Backward/dGate
+  integration and the two-host Megatron performance comparison. The Socket
+  baseline remains direct rank-to-rank aggregation.
 - The Socket fallback never claims GIN/RDMA. The partial GIN backend is a real
-  single-persistent cross-node data plane for world 2 only; world-16 and full
-  Forward/Backward remain open.
+  single-persistent synthetic cross-node data plane for world 2 and 16; full
+  Forward/Backward remains open.

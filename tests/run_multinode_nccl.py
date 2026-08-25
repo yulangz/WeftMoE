@@ -141,6 +141,20 @@ def environment_overrides(args):
         overrides["NCCL_SOCKET_IFNAME"] = args.socket_ifname
     if args.disable_ib:
         overrides["NCCL_IB_DISABLE"] = "1"
+    # These test/benchmark controls are ordinary non-secret configuration.
+    # Forward them explicitly so local and remote ranks cannot silently run a
+    # different generation count, shape, or gate mode.
+    for key in (
+        "MEGAMOE_P2P_ROUNDS",
+        "MEGAMOE_P2P_BENCH_ROUNDS",
+        "MEGAMOE_P2P_BENCH_TOKENS",
+        "MEGAMOE_P2P_TOP_K",
+        "MEGAMOE_P2P_RING_SLOTS",
+        "MEGAMOE_P2P_NO_WRAP",
+        "MEGAMOE_GATE_MODE",
+    ):
+        if key in os.environ:
+            overrides[key] = os.environ[key]
     return overrides
 
 

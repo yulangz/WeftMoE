@@ -23,9 +23,11 @@ synthetic return, and source-side dynamic-gate reduction without activation
 D2H/H2D. This is a correctness/lower-bound backend. A separately typed
 `GinRdmaActivationTransport` now runs the synthetic activation chain with
 device-issued NCCL GIN put/signal/local-completion in one persistent kernel
-for the initial two-node, one-GPU-per-node world-2 slice. Cross-node FC
-Forward/Backward and the world-16 same-rail local-P2P fan-out remain
-incomplete.
+on homogeneous runtime rail/local teams. Real two-node world-16 execution uses
+eight same-rail proxies, source-node-partitioned ingress, CUDA-IPC local
+fan-out to canonical rows, packet-batched return, and dynamic gate-after
+reduce. Cross-node FC Forward/Backward remains incomplete; this synthetic
+slice is not reported as a complete training data plane.
 
 ## Supported topology contract
 
@@ -345,11 +347,12 @@ official NCCL 2.29.7 CUDA 12.9 package, explicitly loaded from a repository-
 external cache, has passed real two-host world-2 and world-16 device-comm plus
 collective registered-window lifecycle probes. A separate validation probe
 also passes real same-rail device-issued put, remote indexed signal, and local
-completion counter on world 2 and 16. The initial activation backend registers
-session-pool slots allocated by `ncclMemAlloc` and passes 20 deterministic
-world-2 generations with both ranks sending. It intentionally rejects every
-other team shape; consequently the general capability flag remains
-`gin_backend_implemented=0, gin_usable=0` until world-16 proxy fan-out exists.
+completion counter on world 2 and 16. The activation backend registers only
+its network windows with `ncclMemAlloc` and passes 20 deterministic world-2
+and world-16 generations with every rank sending. World-16 uses eight rail
+peers plus seven node-local IPC mappings per rank. The general capability flag
+remains `gin_backend_implemented=0, gin_usable=0` because full cross-node
+Forward/Backward is not yet implemented.
 `NcclSocketFallback` has a distinct production constructor and refuses to run
 unless the communicator was explicitly configured for NCCL Socket
 (`NCCL_IB_DISABLE=1`). Simulation, local P2P, Socket, and GIN audit labels are

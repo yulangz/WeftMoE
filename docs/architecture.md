@@ -650,17 +650,19 @@ distributed runtime initialization, project backend implementation, and
 usable. Usable is their conjunction. The default 2.28.3 runtime fails the
 symbol gate. The explicitly loaded NCCL 2.29.7 CUDA 12.9 runtime passes
 world-2/world-16 device-communicator and registered-window initialization.
-The first concrete GIN activation slice is separately typed and supports
-exactly two nodes with one GPU each: each session-pool slot is allocated once
-with `ncclMemAlloc`,
-registered as a strict-ordering window, and retained by the result handle.
-One device kernel consumes deterministic Notify packets, issues remote header
-and node-deduplicated token puts, waits for local completion and remote signal,
-returns transformed route contributions, and performs source gate-after
-reduction. It rejects every other team shape until source-indexed ingress and
-same-rail proxy plus local-P2P fan-out are connected, so the general
-`gin_usable` capability remains
-false. The session probe is collective and returns no native NCCL/CUDA handle.
+The concrete GIN activation slice is separately typed. Each session-pool slot
+owns a strict-ordering `ncclMemAlloc` window retained by the result handle;
+ordinary compute/canonical storage remains a CUDA allocation. Runtime
+`num_nodes` and homogeneous `local_world_size` derive the rail and LSA teams.
+Ingress slots are partitioned by source node, so identical per-link sequence
+numbers never alias. One device kernel consumes deterministic Notify packets,
+issues one node-deduplicated token payload per destination node, waits for
+local completion and remote signal, relays fan-out through the global-rank IPC
+pointer table, returns all contributions of a token packet with one contiguous
+put/signal, and performs source gate-after reduction. The world-2 and
+two-node world-16 paths pass the independent oracle for 20 generations. The
+general `gin_usable` capability remains false until FC Forward/Backward is
+integrated. The session probe is collective and returns no native handle.
 
 The world-16 setup path now derives `local_world_size = world / num_nodes`,
 checks the runtime rail/LSA teams, and exchanges compute-arena IPC handles
@@ -668,7 +670,8 @@ collectively. Each rank opens only its seven node-local peers; the global-rank
 pointer table remains the stable fan-out index. GIN-registered storage is a
 separate `ncclMemAlloc` window containing only ingress, payload, return, and
 control slots. Canonical rows, compute transients, and weights remain ordinary
-CUDA allocations. Payload execution on this world-16 team is the next slice.
+CUDA allocations. The synthetic payload execution now runs on this world-16
+team; FC1/FC2 and Backward still use only the frozen single-node backend.
 The opt-in Socket correctness backend is now concrete and separately typed. It
 packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
 NCCL Send/Recv, performs destination device relay plus the validation expert

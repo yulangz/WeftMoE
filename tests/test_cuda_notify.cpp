@@ -4376,8 +4376,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             socket_fallback || gin_rdma
                 ? "cross-host activation scenario requires exactly two nodes"
                 : "local CUDA P2P scenario requires exactly one node");
-    require(!gin_rdma || gpus_per_node == 1,
-            "initial GIN activation slice requires one GPU per node");
     auto session = megamoe::cuda::make_nccl_generation(
         base, "cuda-local-p2p", 701);
     auto context = megamoe::make_rank_collective_context(
@@ -4401,6 +4399,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         session, execution, pool);
     auto notify = coordinator.run_device(
         {common_config, device_routes, device_gates, max_tokens});
+    megamoe::DispatchHandle cross_host_oracle_dispatch;
+    if (socket_fallback || gin_rdma)
+      cross_host_oracle_dispatch =
+          megamoe::cuda::download_device_metadata_for_validation(
+              notify.dispatch(), execution);
     const std::uint64_t hidden = benchmark_p2p ? 7168U : 17U;
     megamoe::cuda::ActivationTransportPoolConfig transport_pool_config;
     transport_pool_config.max_tokens_per_rank = max_tokens;
@@ -4507,7 +4510,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             "local P2P benchmark requires 10 warmups plus measurements");
     megamoe::cuda::DeviceActivationTransportHandle transported;
     megamoe::cuda::ActivationTransportValidationDownload downloaded;
-    std::vector<megamoe::transport::BFloat16> baseline;
+    std::vector<megamoe::transport::BFloat16> baseline(
+        static_cast<std::size_t>(common_routes.num_tokens * hidden));
     std::vector<double> total_samples;
     std::vector<double> dispatch_samples;
     std::vector<double> relay_samples;
@@ -4545,7 +4549,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       downloaded = megamoe::cuda::download_activation_transport_for_validation(
           transported, execution);
       if (round == 0)
-        baseline = downloaded.combined_tokens;
+        std::copy(downloaded.combined_tokens.begin(),
+                  downloaded.combined_tokens.end(), baseline.begin());
       else
         require(downloaded.combined_tokens == baseline,
                 "local P2P repeated generation changed output bytes");
@@ -4568,11 +4573,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 transported.audit().hot_path_allocations == 0,
             "real local P2P path staged activation or allocated hot resources");
     if (socket_fallback || gin_rdma) {
-      const auto host_dispatch =
-          megamoe::cuda::download_device_metadata_for_validation(
-              notify.dispatch(), execution);
       const auto oracle = megamoe::transport::simulate_activation_transport(
-          host_dispatch, activations, route_gates, transport_config, 1);
+          cross_host_oracle_dispatch, activations, route_gates,
+          transport_config, 1);
       if (downloaded.contribution_by_route != oracle.contribution_by_route) {
         const auto mismatch = std::mismatch(
             downloaded.contribution_by_route.begin(),
