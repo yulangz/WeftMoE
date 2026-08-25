@@ -59,6 +59,10 @@ struct CudaAllocation {
   std::uint32_t device = 0;
   void *device_ptr = nullptr;
   void *host_ptr = nullptr;
+  // Device alias for the small mapped status page. Generic/public metadata
+  // never exposes this address; release Notify uses it only to avoid a host
+  // scheduler wake between device materialization and Forward launch.
+  void *host_device_ptr = nullptr;
   std::size_t device_bytes = 0;
   std::size_t host_bytes = 0;
   cudaEvent_t mapping_start = nullptr;

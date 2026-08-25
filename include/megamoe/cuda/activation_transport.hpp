@@ -334,6 +334,10 @@ public:
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
+  // Owning one-shot handoff used by Backward. It transfers the already
+  // acquired Forward dispatch consumer; it never exposes a kernel view or
+  // acquires a second consumer event/slot lease.
+  DeviceDispatchConsumerLease transfer_consumer_to_backward() const;
   struct Impl;
   explicit DeviceForwardHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
@@ -473,6 +477,8 @@ struct BackwardMegaKernelAudit {
   std::uint64_t hot_path_allocations = 0;
   std::uint64_t workspace_bytes = 0;
   bool recomputed_fc1 = false;
+  std::uint64_t dispatch_consumer_acquires = 0;
+  std::uint64_t dispatch_consumer_releases = 0;
   BackwardWeightGradientDType weight_gradient_dtype =
       BackwardWeightGradientDType::BFloat16;
 };

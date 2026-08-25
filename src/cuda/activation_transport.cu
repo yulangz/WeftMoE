@@ -328,6 +328,7 @@ struct Layout {
   std::size_t peer_bases = 0;
   std::size_t p2p_barrier_send = 0;
   std::size_t p2p_barrier_receive = 0;
+  std::size_t terminal_epoch = 0;
   std::size_t packet_claim = 0;
   std::size_t canonical_rows = 0;
   std::size_t contribution = 0;
@@ -426,6 +427,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                                   "P2P barrier words"),
                                       sizeof(std::uint64_t),
                                       "P2P barrier receive");
+  layout.terminal_epoch = append(cursor, config.max_world_size,
+                                 sizeof(std::uint64_t),
+                                 "P2P terminal generation epoch");
   layout.packet_claim = append(cursor, routes, sizeof(std::uint32_t),
                                "packet claim bitmap");
   layout.canonical_rows = append(
@@ -1596,6 +1600,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
 // Trusted-team release path. Notify has already assigned a unique canonical
 // row to every route. Separate all-SM grids bulk-copy each phase, and tiny
 // kernels publish one system-scope completion per peer rather than per route.
+#if !MEGAMOE_DEBUG_VALIDATE
 __global__ void local_p2p_bulk_dispatch_kernel(LocalP2pKernelArgs a) {
   const auto route = static_cast<std::uint64_t>(blockIdx.x);
   if (route >= a.dispatch.sizes.route_count)
@@ -1796,6 +1801,7 @@ __global__ void local_p2p_finish_kernel(LocalP2pKernelArgs a) {
     status->complete_clock = device_globaltimer_ns();
   }
 }
+#endif
 
 __device__ std::uint32_t forward_fixture_mix32(std::uint32_t value) {
   value ^= value >> 16U;
@@ -2002,7 +2008,7 @@ struct ForwardKernelArgs {
   bool cache_fc1;
 };
 
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
 using ForwardMma =
     typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
 using ForwardMmaWide =
@@ -2977,6 +2983,7 @@ struct BackwardKernelArgs {
   std::size_t claim_offset;
   std::size_t incoming_signal_offset;
   std::size_t outgoing_signal_offset;
+  std::size_t terminal_epoch_offset;
   std::size_t status_offset;
   const unsigned long long *cancel_epoch;
   unsigned long long *progress;
@@ -2985,6 +2992,40 @@ struct BackwardKernelArgs {
 };
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
+
+// Final generation drain for the trusted single-node team.  All local work
+// (including peer dX return and source reduction) is complete before this is
+// called.  Publish one monotonic epoch per rank into each peer allocation and
+// wait for the corresponding owner-local vector.  This closes the formal
+// route-ready -> final-gradient-ready boundary on device and prevents a fast
+// rank's next Notify from absorbing the previous generation's rank skew.
+// No host collective, reset, or allocation is involved.
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+__device__ void backward_terminal_rendezvous(const BackwardKernelArgs &a) {
+  if (blockIdx.x != 0U)
+    return;
+  for (std::uint32_t peer = static_cast<std::uint32_t>(threadIdx.x);
+       peer < a.world; peer += static_cast<std::uint32_t>(blockDim.x)) {
+    auto *terminal = peer_at<unsigned long long>(
+        a.peer_bases[peer], a.terminal_epoch_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        published(terminal[a.rank]);
+    published.store(a.epoch, ::cuda::memory_order_release);
+  }
+  __syncthreads();
+  auto *local_terminal = peer_at<unsigned long long>(
+      a.local_base, a.terminal_epoch_offset);
+  for (std::uint32_t peer = static_cast<std::uint32_t>(threadIdx.x);
+       peer < a.world; peer += static_cast<std::uint32_t>(blockDim.x)) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        observed(local_terminal[peer]);
+    while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
+           !backward_cancelled(a)) {
+    }
+  }
+  __syncthreads();
+}
+#endif
 
 __device__ void backward_publish_progress(const BackwardKernelArgs &a,
                                           std::uint32_t word,
@@ -3487,12 +3528,14 @@ local_p2p_backward_megakernel(
            static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        expert < a.dispatch.sizes.owned_expert_count;
        expert += static_cast<std::uint32_t>(gridDim.x) * blockDim.x) {
+#if MEGAMOE_DEBUG_VALIDATE
     dw_timeline[expert] = BackwardExpertDwTimeline{};
     if (a.dispatch.expert_row_count[expert] == 0ULL) {
       dw_timeline[expert].ready_clock = status->start_clock;
       atomicMin(&status->dw1_first_ready_clock, status->start_clock);
       atomicMin(&status->dw2_first_ready_clock, status->start_clock);
     }
+#endif
     if (a.progress != nullptr && expert < a.progress_experts) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> rows(
           a.progress[kBackwardProgressExpertBase + expert * 8U]);
@@ -3876,6 +3919,7 @@ local_p2p_backward_megakernel(
 }
 
     __syncthreads();
+#if MEGAMOE_DEBUG_VALIDATE
     if (threadIdx.x == 0) {
       const auto expected =
           ((a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL) *
@@ -3889,6 +3933,7 @@ local_p2p_backward_megakernel(
         atomicMin(&status->dw2_first_ready_clock, now);
       }
     }
+#endif
     __syncthreads();
   }
   grid.sync();
@@ -4053,9 +4098,14 @@ local_p2p_backward_megakernel(
         (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
     if (threadIdx.x == 0U) {
       const auto now = device_globaltimer_ns();
+#if MEGAMOE_DEBUG_VALIDATE
       if (atomicCAS(&dw_timeline[expert].dw2_first_start_clock, 0ULL, now) ==
           0ULL)
         atomicMin(&status->dw2_first_start_clock, now);
+#else
+      if (task_shared < gridDim.x)
+        atomicMin(&status->dw2_first_start_clock, now);
+#endif
     }
     float accum[BackwardDwDirectMma::kNumAccum];
     backward_wgmma_dw_mn_k_tile(
@@ -4216,9 +4266,14 @@ local_p2p_backward_megakernel(
           (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
       if (threadIdx.x == 0) {
         const auto now = device_globaltimer_ns();
+#if MEGAMOE_DEBUG_VALIDATE
         if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL, now) ==
             0ULL)
           atomicMin(&status->dw1_first_start_clock, now);
+#else
+        if (task_shared < gridDim.x)
+          atomicMin(&status->dw1_first_start_clock, now);
+#endif
       }
       float accum[BackwardDwMixedMma::kNumAccum];
 #pragma unroll
@@ -4318,6 +4373,7 @@ local_p2p_backward_megakernel(
     status->dw1_last_complete_clock = device_globaltimer_ns();
 #endif
     status->dw1_complete_clock = status->dw1_last_complete_clock;
+#if MEGAMOE_DEBUG_VALIDATE
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert) {
       const auto ready = dw_timeline[expert].ready_clock;
@@ -4330,6 +4386,7 @@ local_p2p_backward_megakernel(
         status->dw2_max_ready_wait =
             max(status->dw2_max_ready_wait, dw2_start - ready);
     }
+#endif
   }
   backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
                               gridDim.x);
@@ -4338,6 +4395,8 @@ local_p2p_backward_megakernel(
     status->dx_reduce_complete_clock = device_globaltimer_ns();
   backward_publish_progress(a, kBackwardReduceComplete,
                             a.dispatch.identity.num_tokens);
+  backward_terminal_rendezvous(a);
+  grid.sync();
 
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -4561,6 +4620,27 @@ struct SelectedOutputGradientLease::Impl {
   std::uint32_t device = 0;
   bool ready_recorded = false;
 };
+
+DeviceDispatchConsumerLease
+DeviceForwardHandle::transfer_consumer_to_backward() const {
+  if (!impl_)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "forward-backward-handoff", "forward handle", 0,
+                    "valid", "empty");
+  auto &mutable_result = const_cast<DeviceForwardHandle::Impl &>(*impl_);
+  if (!mutable_result.completion_pending ||
+      !mutable_result.pending_consumer ||
+      mutable_result.pending_consumer->state() !=
+          DeviceDispatchConsumerState::Acquired)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "forward-backward-handoff", "dispatch consumer",
+                    mutable_result.identity.rank,
+                    "one acquired transferable consumer",
+                    "missing/already transferred/invalid");
+  auto consumer = std::move(*mutable_result.pending_consumer);
+  mutable_result.pending_consumer.reset();
+  return consumer;
+}
 
 struct DeviceBackwardHandle::Impl {
   std::shared_ptr<SlotLease> slot;
@@ -6837,7 +6917,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
   args.forward_scheduler_offset = layout.forward_scheduler;
-  args.terminal_epoch_offset = layout.p2p_barrier_receive;
+  args.terminal_epoch_offset = layout.terminal_epoch;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
 #if MEGAMOE_DEBUG_VALIDATE
@@ -6944,7 +7024,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaEventRecord(forward complete)");
   slot.completion_recorded = true;
-  ActivationTransportBridge::submit(consumer);
 
   if (options.defer_forward_completion_to_backward) {
     if (!state->config.enable_backward ||
@@ -6978,6 +7057,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     failure_guard.committed = true;
     return DeviceForwardHandle(std::move(result));
   }
+
+  ActivationTransportBridge::submit(consumer);
 
   const auto wait_start = std::chrono::steady_clock::now();
   bool cancelled = false;
@@ -7274,13 +7355,18 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   const auto expectation = DeviceDispatchViewExpectation{
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
       id.config_digest_word0, id.config_digest_word1};
-  auto consumer = f.dispatch.acquire_consumer(backend->execution, expectation);
+  const bool had_deferred_forward = f.completion_pending;
+  DeviceDispatchConsumerLease consumer;
+  if (had_deferred_forward) {
+    consumer = forward.transfer_consumer_to_backward();
+  } else {
+    consumer = f.dispatch.acquire_consumer(backend->execution, expectation);
+  }
   const auto view = ActivationTransportBridge::view(consumer);
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[f.slot->index];
   const auto &layout = state->layout;
   SlotFailureGuard failure_guard{f.slot, false};
-  const bool had_deferred_forward = f.completion_pending;
   if (had_deferred_forward) {
     internal::throw_cuda(
         "backward-run",
@@ -7380,6 +7466,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.claim_offset = layout.forward_task_claim;
   args.incoming_signal_offset = layout.ingress_published_sequence;
   args.outgoing_signal_offset = layout.outgoing_route_sequence;
+  args.terminal_epoch_offset = layout.terminal_epoch;
   args.status_offset = layout.backward_status;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
@@ -7649,18 +7736,6 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   if (had_deferred_forward) {
     auto &forward_result =
         const_cast<DeviceForwardHandle::Impl &>(*forward.impl_);
-    const auto drain_begin = std::chrono::steady_clock::now();
-    if (!forward_result.pending_consumer)
-      transport_error(NotifyErrorCode::InvalidHandle, "backward-run",
-                      "deferred Forward consumer", id.calling_rank,
-                      "owning pending consumer", "missing");
-    forward_result.pending_consumer->finish();
-    forward_result.pending_consumer.reset();
-    const auto drain_end = std::chrono::steady_clock::now();
-    forward_consumer_drain_host_us =
-        std::chrono::duration<double, std::micro>(drain_end - drain_begin)
-            .count();
-
     const auto &forward_status = *slot.host_forward_status;
     if (forward_status.error != 0U)
       transport_error(
@@ -7782,6 +7857,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->audit.workspace_bytes = state->layout.total;
   result->audit.recomputed_fc1 = !args.use_forward_cache;
   result->audit.weight_gradient_dtype = config.weight_gradient_dtype;
+  result->audit.dispatch_consumer_acquires = had_deferred_forward ? 1U : 0U;
+  result->audit.dispatch_consumer_releases = had_deferred_forward ? 1U : 0U;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
   result->timings.dy_dispatch_us =
       elapsed(status.start_clock, status.dy_dispatch_complete_clock);

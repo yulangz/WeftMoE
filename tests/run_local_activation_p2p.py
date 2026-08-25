@@ -572,8 +572,10 @@ def main():
             return
         if benchmark_mode:
             if args.backward_benchmark:
-                stage_keys = ("wall", "forward_backward_wall", "notify",
-                              "forward", "backward",
+                stage_keys = (
+                              "notify_inclusive_training_step_wall",
+                              "post_notify_training_step_wall", "notify_wall",
+                              "forward_wall", "backward_wall",
                               "dy_dispatch", "dv", "dgate", "transpose",
                               "dx", "dw1", "dw2",
                               "dw1_ready_wait", "dw2_ready_wait",
@@ -582,16 +584,29 @@ def main():
                               "dw1_overlap_dv_dx", "dw2_overlap_dv_dx",
                               "reduce", "forward_call_host", "dy_ready_host",
                               "backward_call_host", "integration_overhead",
-                              "forward_backward_handoff",
+                              "handoff",
                               "backward_setup_host",
                               "forward_consumer_drain",
-                              "final_consumer_drain")
+                              "final_drain", "notify_pool_acquire",
+                              "notify_local_histogram_wall",
+                              "notify_local_mapping_device",
+                              "notify_collective_enqueue",
+                              "notify_collective_wait",
+                              "notify_materialization", "notify_publish")
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=
                             "sm90-wgmma-tma-7168x3072" or
                             item["persistent_launches"] != "1" or
                             item["steady_forbidden_cuda_api_calls"] != "0" or
-                            item.get("gradient_hash_repeats") != "20"):
+                            item.get("gradient_hash_repeats") != "20" or
+                            item.get("notify_fused_enqueues") != "1" or
+                            any(item.get(field) != "0" for field in
+                                ("notify_control_enqueues",
+                                 "notify_config_enqueues",
+                                 "notify_count_enqueues",
+                                 "notify_summary_enqueues")) or
+                            item.get("consumer_acquires") != "1" or
+                            item.get("consumer_releases") != "1"):
                         raise AssertionError(
                             f"rank={rank} invalid backward audit: {item}")
                     for key in stage_keys:
@@ -618,6 +633,38 @@ def main():
                                    for item in observed)
                                for iteration in range(args.rounds - 10)]
                     summary[key + "_slowest_rank_us"] = stats(slowest)
+
+                # Keep the formal critical path in one rank/time domain.  A
+                # table assembled from the independently slowest rank of each
+                # stage cannot explain full-wall latency because those maxima
+                # frequently come from different ranks.  Select the rank with
+                # the largest formal route-ready -> final-drain sample, then
+                # report every component from that same rank and iteration.
+                formal_key = "notify_inclusive_training_step_wall"
+                critical_ranks = [
+                    max(range(args.world),
+                        key=lambda rank: observed[rank][formal_key][iteration])
+                    for iteration in range(args.rounds - 10)
+                ]
+                for key in stage_keys:
+                    same_rank = [
+                        observed[critical_ranks[iteration]][key][iteration]
+                        for iteration in range(args.rounds - 10)
+                    ]
+                    summary["critical_path_" + key + "_us"] = stats(
+                        same_rank)
+                notify_components = (
+                    "notify_pool_acquire", "notify_local_histogram_wall",
+                    "notify_collective_enqueue", "notify_collective_wait",
+                    "notify_materialization", "notify_publish")
+                notify_residual = []
+                for iteration, rank in enumerate(critical_ranks):
+                    notify_residual.append(
+                        observed[rank]["notify_wall"][iteration] - sum(
+                            observed[rank][key][iteration]
+                            for key in notify_components))
+                summary["critical_path_notify_unattributed_us"] = stats(
+                    notify_residual)
                 result = {
                     "schema": 1,
                     "benchmark": "single-persistent-backward-main-shape",
@@ -674,6 +721,24 @@ def main():
                         for item in observed],
                     "gradient_hash_repeats": 20,
                     "weight_gradient_dtype": observed[0]["dw_dtype"],
+                    "per_rank_notify_collective_audit": [{
+                        "fused": int(item["notify_fused_enqueues"]),
+                        "control": int(item["notify_control_enqueues"]),
+                        "config": int(item["notify_config_enqueues"]),
+                        "count": int(item["notify_count_enqueues"]),
+                        "summary": int(item["notify_summary_enqueues"]),
+                    } for item in observed],
+                    "formal_critical_path_rank_by_iteration": critical_ranks,
+                    "per_rank_dispatch_consumer_acquires": [
+                        int(item["consumer_acquires"]) for item in observed],
+                    "per_rank_dispatch_consumer_releases": [
+                        int(item["consumer_releases"]) for item in observed],
+                    "per_rank_forward_cluster_requested": [
+                        int(item["forward_cluster_requested"])
+                        for item in observed],
+                    "per_rank_forward_cluster_actual": [
+                        int(item["forward_cluster_actual"])
+                        for item in observed],
                     "per_rank_nccl_runtime": [
                         item["_nccl_runtime"] for item in observed],
                     "per_rank_nccl_library": [

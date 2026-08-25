@@ -54,11 +54,10 @@ A/B checkpoints in the session pool; no-cache omits those stores. Both retain
 canonical dispatch X through the Forward handle. Transient S and expert output
 are generation-local. Cross-node Forward and backward are not implemented.
 
-The tested launch requests a `2x1x1` cluster with `cudaLaunchKernelEx`, checks
-`cudaDevAttrClusterLaunch` and `cudaOccupancyMaxActiveClusters`, and records
-the observed device cluster rank mask. On both inspected L20X hosts the runtime
-audit is `cluster_size=2`, rank mask `0b11`, with 66 active clusters possible.
-TMA multicast remains disabled; a runtime cluster is not reported as multicast.
+The launch requests a `2x1x1` cluster where supported and records requested and
+actual sizes independently. On the current L20X performance path the runtime
+audit is `requested=2, actual=1`; TMA multicast is disabled. Documentation and
+benchmark JSON therefore make no 2-CTA formation or multicast claim.
 
 ## Runtime topology
 
@@ -436,7 +435,8 @@ top-k, world, nodes, canonical-config bytes, and an explicit
 - pinned status/config staging;
 - fixed control plus bounded config/count/summary send/receive slots;
 - mapping/planning/Notify-completion and route-ready events, the configured
-  consumer-completion events, and four collective CUDA events.
+  consumer-completion events, and five collective CUDA events (the fifth is
+  the preallocated fused-Notify completion event).
 
 Generation-slot state is `Available`, `InUse(epoch)`, or `Quarantined`.
 Consumer-event state is tracked independently with the same three values.
@@ -662,11 +662,23 @@ and returned dX cannot be recycled while any Backward result remains live.
 
 The integrated cache path keeps that ownership chain asynchronous. Forward
 records pooled `output_ready` and `complete` events and returns an owning,
-pending handle; Backward waits on `output_ready` in its CUDA stream and retains
-the Forward consumer until the final Backward completion drain. There is no
-intermediate host stream synchronization, cache release/reacquire, repeated
-Notify, or route/metadata rebuild. Public Forward audit access remains checked
-and rejects a pending handle until this handoff reaches its terminal state.
+pending handle. `transfer_consumer_to_backward()` moves the already acquired
+dispatch consumer into Backward; Backward waits on `output_ready` in its CUDA
+stream and finishes that same consumer only after its kernel completes. The
+slot therefore observes one acquire and one release for the complete training
+step. There is no intermediate host stream synchronization, cache
+release/reacquire, repeated Notify, or route/metadata rebuild. Public Forward
+audit access remains checked and rejects a pending handle until this handoff
+reaches its terminal state.
+
+After Backward has completed dX return and fixed-order source reduction, the
+production kernel publishes its monotonic generation epoch into a dedicated
+peer-visible terminal vector and acquire-waits for every rank. This final
+device drain uses no host collective or allocation. Keeping it distinct from
+the Forward/Backward setup ready/ack vector prevents an already-published
+setup epoch from falsely satisfying terminal completion. It also closes each
+formal benchmark generation before the next fused Notify, rather than charging
+the previous generation's rank skew to the next AllGather.
 
 For the 7168x3072 specialization one cooperative kernel executes dY peer put,
 dV, source gate multiplication, SwiGLU backward, dX, dW2/dW1, peer dX/dGate

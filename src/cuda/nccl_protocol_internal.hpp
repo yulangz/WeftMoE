@@ -205,6 +205,23 @@ public:
   void prepare_generation(const NcclSession &);
 
 private:
+  struct FastNotifyResult {
+    BackendCompletion expert_counts;
+    BackendCompletion packet_summary;
+    double enqueue_us = 0;
+    double wait_us = 0;
+  };
+  bool fast_path_ready() const;
+  bool fast_config_matches(const ConfigWire &) const;
+  FastNotifyResult run_fast_notify(
+      const RankCollectiveContext &, const ControlHeader &,
+      const DeviceBufferLease *expert_counts,
+      const DeviceBufferLease *packet_summary);
+  // Completes the fixed-record agreement after downstream device work on the
+  // same execution stream has reached its own completion event. This folds
+  // the fast collective and materialization into one host wait while keeping
+  // control validation before a generation is published.
+  double finish_fast_notify();
   std::shared_ptr<Impl> impl_;
   friend class CudaNotifyGenerationCoordinator;
 };

@@ -1581,7 +1581,7 @@ void test_resource_pool_and_cuda_api_audit() {
   require(initial_usage.slot_count == 2 && initial_usage.slots_in_use == 0 &&
               initial_usage.device_bytes != 0 &&
               initial_usage.pinned_host_bytes != 0 &&
-              initial_usage.event_count == 28,
+              initial_usage.event_count == 30,
           "session resource pool capacity/accounting mismatch");
 
   auto device_routes = megamoe::cuda::upload_cuda_routes(
@@ -1667,6 +1667,23 @@ void test_resource_pool_and_cuda_api_audit() {
                 result.dispatch().audit().host_materializations == 0 &&
                 result.dispatch().audit().bulk_metadata_h2d == 0,
             "pooled device generation used bulk host staging");
+    if (iteration >= 2U) {
+      const auto audit = result.audit();
+#if MEGAMOE_DEBUG_VALIDATE
+      require(audit.fused_notify_starts == 0U &&
+                  audit.control_starts == 1U && audit.config_starts == 1U &&
+                  audit.expert_count_starts == 1U &&
+                  audit.packet_summary_starts == 1U,
+              "debug generation did not retain the full Notify protocol");
+#else
+      require(audit.fused_notify_starts == 1U &&
+                  audit.control_starts == 0U && audit.config_starts == 0U &&
+                  audit.expert_count_starts == 0U &&
+                  audit.packet_summary_starts == 0U,
+              "steady single-node release generation did not use one fused "
+              "Notify collective");
+#endif
+    }
     if (iteration == 0)
       retained = result.dispatch();
   }
@@ -1681,10 +1698,41 @@ void test_resource_pool_and_cuda_api_audit() {
           "steady generation performed forbidden CUDA resource API call");
   require(after.h2d_bytes - before.h2d_bytes < 1024U * 1024U &&
               after.d2h_bytes - before.d2h_bytes < 1024U * 1024U &&
-              after.d2d_bytes == before.d2d_bytes,
+              after.d2d_bytes - before.d2d_bytes < 1024U * 1024U,
           "steady generation performed an unexpected bulk memcpy");
   require(pool.usage().slots_in_use == 1,
           "retained handle did not keep exactly one pool slot leased");
+
+#if !MEGAMOE_DEBUG_VALIDATE
+  // The already-verified second slot must dataize a predictable local error
+  // into the same fixed-width record instead of returning before the fused
+  // collective.  World>1 exercises the identical wire path in the rank
+  // launcher; this world=1 check also proves that invalid status is validated
+  // rather than silently accepted when there is no peer row to compare.
+  auto invalid_session = megamoe::cuda::make_nccl_generation(
+      base, "pool-base", 6299);
+  megamoe::cuda::CudaNotifyGenerationCoordinator invalid_coordinator(
+      invalid_session, execution, pool);
+  auto invalid_request = exact_request(invalid_session);
+  invalid_request.config.top_k = invalid_request.config.num_experts + 1U;
+  bool fused_status_failed = false;
+  try {
+    (void)invalid_coordinator.run_device(std::move(invalid_request));
+  } catch (const megamoe::NotifyDispatchError &error) {
+    fused_status_failed =
+        error.code() == megamoe::NotifyErrorCode::ControlProtocolFailure;
+  }
+  const auto invalid_audit = invalid_coordinator.audit();
+  require(fused_status_failed && invalid_audit.fused_notify_starts == 1U &&
+              invalid_audit.control_starts == 0U &&
+              invalid_audit.config_starts == 0U &&
+              invalid_audit.expert_count_starts == 0U &&
+              invalid_audit.packet_summary_starts == 0U,
+          "invalid local status did not fail after exactly one fused Notify "
+          "collective");
+  require(pool.usage().slots_in_use == 1,
+          "failed fused Notify generation did not return its pool slot");
+#endif
 
   auto second_session = megamoe::cuda::make_nccl_generation(
       base, "pool-base", 6300);
@@ -2201,8 +2249,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         forward_call_host_samples, dy_ready_host_samples,
         backward_call_host_samples, integration_overhead_samples,
         handoff_samples, backward_setup_host_samples,
-        forward_drain_host_samples, final_drain_host_samples;
+        forward_drain_host_samples, final_drain_host_samples,
+        notify_pool_acquire_samples, notify_local_histogram_wall_samples,
+        notify_local_mapping_device_samples,
+        notify_collective_enqueue_samples,
+        notify_collective_wait_samples,
+        notify_materialization_samples, notify_publish_samples;
     megamoe::cuda::BackwardMegaKernelAudit last_audit;
+    megamoe::cuda::ForwardMegaKernelAudit last_forward_audit;
+    megamoe::cuda::CollectiveProtocolAudit last_notify_audit;
     megamoe::cuda::SelectedOutputGradientLease dy_storage;
     megamoe::cuda::BackwardStorageHashes gradient_hashes;
     bool have_gradient_hashes = false;
@@ -2371,6 +2426,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           generation, execution, pool);
       auto notify = coordinator.run_device(
           {common_config, routes, gates, max_tokens});
+      const auto notify_timing = notify.execution_timings();
+      last_notify_audit = notify.audit();
       const auto notify_end = Clock::now();
       megamoe::cuda::ActivationTransportRunOptions options;
       options.deadline_after = std::chrono::seconds(300);
@@ -2418,6 +2475,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       }
       const auto end = Clock::now();
       last_audit = backward_handle.audit();
+      last_forward_audit = forward_handle.audit();
       if (!validation_repeat && repeat >= 10U) {
         wall.push_back(
             std::chrono::duration<double, std::micro>(end - begin).count());
@@ -2476,6 +2534,27 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             backward_handle.timings().forward_consumer_drain_host_us);
         final_drain_host_samples.push_back(
             backward_handle.timings().final_consumer_drain_host_us);
+        notify_pool_acquire_samples.push_back(
+            notify_timing.pool_acquire_end_offset_us -
+            notify_timing.pool_acquire_begin_offset_us);
+        notify_local_histogram_wall_samples.push_back(
+            notify_timing.local_histogram_end_offset_us -
+            notify_timing.local_histogram_begin_offset_us);
+        notify_local_mapping_device_samples.push_back(
+            notify_timing.local_mapping_us);
+        notify_collective_enqueue_samples.push_back(
+            notify_timing.collective_enqueue_end_offset_us -
+            notify_timing.collective_enqueue_begin_offset_us);
+        notify_collective_wait_samples.push_back(
+            last_notify_audit.fused_notify_starts == 1U
+                ? notify_timing.fused_collective_wait_us
+                : notify_timing.collective_complete_offset_us -
+                      notify_timing.collective_enqueue_end_offset_us);
+        notify_materialization_samples.push_back(
+            notify_timing.device_materialization_us);
+        notify_publish_samples.push_back(
+            notify_timing.notify_handle_ready_offset_us -
+            notify_timing.device_materialization_end_offset_us);
       }
     }
     (void)unsetenv("MEGAMOE_BACKWARD_CAPTURE_HASH");
@@ -2524,13 +2603,32 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " actual_dgate_hash_low=" << gradient_hashes.dgate.low
               << " actual_dgate_hash_high=" << gradient_hashes.dgate.high
               << " gradient_hash_repeats=" << gradient_hash_repeats
+              << " notify_control_enqueues="
+              << last_notify_audit.control_starts
+              << " notify_config_enqueues="
+              << last_notify_audit.config_starts
+              << " notify_count_enqueues="
+              << last_notify_audit.expert_count_starts
+              << " notify_summary_enqueues="
+              << last_notify_audit.packet_summary_starts
+              << " notify_fused_enqueues="
+              << last_notify_audit.fused_notify_starts
+              << " consumer_acquires="
+              << last_audit.dispatch_consumer_acquires
+              << " consumer_releases="
+              << last_audit.dispatch_consumer_releases
+              << " forward_cluster_requested="
+              << last_forward_audit.requested_cluster_size
+              << " forward_cluster_actual="
+              << last_forward_audit.runtime_cluster_size
               << " dw_dtype=bf16"
-              << " steady_forbidden_cuda_api_calls=0 wall=";
-    emit(wall); std::cout << " notify="; emit(notify_samples);
-    std::cout << " forward_backward_wall=";
+              << " steady_forbidden_cuda_api_calls=0"
+              << " notify_inclusive_training_step_wall=";
+    emit(wall); std::cout << " notify_wall="; emit(notify_samples);
+    std::cout << " post_notify_training_step_wall=";
     emit(forward_backward_wall_samples);
-    std::cout << " forward="; emit(forward_samples);
-    std::cout << " backward="; emit(backward_samples);
+    std::cout << " forward_wall="; emit(forward_samples);
+    std::cout << " backward_wall="; emit(backward_samples);
     std::cout << " dy_dispatch="; emit(dy_dispatch_samples);
     std::cout << " dv="; emit(dv_samples);
     std::cout << " dgate="; emit(dgate_samples);
@@ -2551,10 +2649,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::cout << " dy_ready_host="; emit(dy_ready_host_samples);
     std::cout << " backward_call_host="; emit(backward_call_host_samples);
     std::cout << " integration_overhead="; emit(integration_overhead_samples);
-    std::cout << " forward_backward_handoff="; emit(handoff_samples);
+    std::cout << " handoff="; emit(handoff_samples);
     std::cout << " backward_setup_host="; emit(backward_setup_host_samples);
     std::cout << " forward_consumer_drain="; emit(forward_drain_host_samples);
-    std::cout << " final_consumer_drain="; emit(final_drain_host_samples);
+    std::cout << " final_drain="; emit(final_drain_host_samples);
+    std::cout << " notify_pool_acquire="; emit(notify_pool_acquire_samples);
+    std::cout << " notify_local_histogram_wall=";
+    emit(notify_local_histogram_wall_samples);
+    std::cout << " notify_local_mapping_device=";
+    emit(notify_local_mapping_device_samples);
+    std::cout << " notify_collective_enqueue=";
+    emit(notify_collective_enqueue_samples);
+    std::cout << " notify_collective_wait=";
+    emit(notify_collective_wait_samples);
+    std::cout << " notify_materialization=";
+    emit(notify_materialization_samples);
+    std::cout << " notify_publish="; emit(notify_publish_samples);
     std::cout << std::endl;
     return;
   }
@@ -4719,6 +4829,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--device-smoke") {
       test_device_only_sanitizer_paths();
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--resource-pool-test") {
+      print_nccl_runtime_info();
+      test_resource_pool_and_cuda_api_audit();
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--forward-sanitizer") {

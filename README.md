@@ -150,13 +150,17 @@ packet-summary AllGather`. The header is explicitly little-endian encoded as
 32 words; no native struct or padding is copied to the wire. It is fully
 initialized even for invalid local input.
 The trusted-participant release build caches the first successful exact config
-agreement in each session/backend slot. Later generations still execute fixed
-control/status, expert-count, and summary collectives, while reusing the exact
-verified config bytes rather than repeating the variable config AllGather.
-Config mismatches and route errors select the lowest origin rank and first
-field in schema order; all ranks fail after the same fixed collective and never
-enter a variable-width collective. A healthy NCCL communicator can be reused
-through a new immutable generation view after a rejected generation.
+agreement in each session/backend slot. On a homogeneous single node, later
+generations pack status/control, generation, the expert-count row, and the
+packet-summary row into one preallocated fixed-layout `NotifyFastRecord` and
+execute exactly one NCCL AllGather. The gathered count/summary payload stays on
+device; only bounded control headers are staged for agreement. The collective,
+unpack, and device materialization are ordered on one stream and share the
+materialization completion wait. Cross-node release and every debug generation
+retain the full control/config/count/summary protocol. Config mismatches and
+route errors select the lowest origin rank and first field in schema order; all
+ranks fail after the same fixed collective. A healthy communicator can be
+reused through a new immutable generation view after a rejected generation.
 
 The two header session words are diagnostic summaries, never the agreement
 boundary. `CollectiveSession` owns bounded original stable-identity bytes. The
@@ -242,7 +246,9 @@ The synthetic transform is only a transport oracle and is not FC1/FC2.
 `LocalCudaP2pForwardMegaKernel` accepts the immutable dispatch handle, typed
 BF16 activation/weight leases, and the dispatch-owned FP32 gate lease. For the
 main `hidden=7168, intermediate=3072` specialization it launches one
-384-thread CTA per SM as 2-CTA clusters. The single cooperative launch performs
+384-thread CTA per SM. A 2-CTA cluster is requested where supported, but the
+runtime audit on the current performance path reports an actual cluster size
+of one. The single cooperative launch performs
 DispatchPut, three-stage TMA/WGMMA FC1 for both projections, BF16 SwiGLU
 materialization, four-stage N=256 TMA/WGMMA FC2, vectorized peer return, and
 fixed expert-ID source reduction. FC1 and FC2 have no intervening kernel or
@@ -277,10 +283,11 @@ contents or a prior generation's signal value.
 The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
 CUDA runtime on the inspected L20X host; the fat binary also contains the
 ordinary `sm_89` target, which rejects this specialization at runtime. The
-launch is a real 2-CTA runtime cluster (`cluster_size=2`, observed rank mask
-`0b11`, 66 active clusters/device). TMA multicast remains disabled (`audit=0`)
-and is not implied by cluster formation. There is currently no correctness
-fallback for other H/I shapes.
+launch audit records requested and actual cluster sizes separately. On the
+current L20X performance path it requests two CTAs but observes
+`cluster_size=1`; TMA multicast remains disabled (`audit=0`). No 2-CTA
+formation or multicast performance claim is made. There is currently no
+correctness fallback for other H/I shapes.
 
 ## Single-node Backward baseline
 
@@ -307,6 +314,11 @@ all-empty owner rank participates in terminal completion and exposes real zero
 gradient storage instead of an implicit epoch convention. A timeout-only
 mapped progress page can report per-rank/per-expert terminal state when
 `MEGAMOE_BACKWARD_PROGRESS_DUMP=1`; it is absent from the normal release path.
+After the final dX reduction, each rank release-publishes the generation epoch
+to a dedicated peer terminal vector and acquire-waits for the complete local
+vector. This device-only final drain neither launches a host collective nor
+reuses the setup ready/ack words; the next generation therefore starts from a
+closed all-rank boundary.
 
 Validation can hash the complete device dX/dW1/dW2/dGate allocations in a
 fixed order without bulk downloads. The benchmark repeats those hashes 20

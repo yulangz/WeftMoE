@@ -195,10 +195,9 @@ the bytes their Forward kernels actually consume. The fair launcher rejects
 any per-rank W1 or W2 mismatch before timing; the formula-derived sample hash
 is retained only as generator/layout diagnostics.
 
-The production launch requests cluster dimension `2x1x1`; both inspected L20X
-hosts report cluster capability, `cudaOccupancyMaxActiveClusters=66`, and a
-device-observed cluster size/rank mask of `2/0b11`. TMA multicast is still off,
-so reports distinguish actual cluster formation from multicast capability.
+The production launch requests cluster dimension `2x1x1`, but the current L20X
+performance audit observes `actual=1`. JSON reports requested and actual sizes
+separately. TMA multicast is off; no 2-CTA formation claim is made.
 Pool construction clears each slot once. A generation writes only
 `2 * world * channels` completion words plus `2 * world` ready/ack words in a
 small setup kernel; it performs no arena-wide memset. The Forward benchmark's
@@ -221,7 +220,7 @@ optimization point. Nsight Systems is not installed on this host.
 
 The frozen main-shape specialization is M=128, FC1 N=128/K=64 with three TMA
 stages, FC2 N=256/K=64 with four TMA stages, 384 threads/CTA, one resident CTA
-per SM, 2-CTA launch clusters, release task chunks of four, and one warp per
+per SM, actual cluster size one, release task chunks of four, and one warp per
 Reduce token. TMA multicast remains disabled: the tested multicast cluster
 schedule was slower and did not satisfy long-run progress. Four-stage FC1,
 BN=64/128 alternatives, direct-peer FC2 epilogues, dedicated Return CTAs,
@@ -728,14 +727,28 @@ actual dY/dX peer bytes, complete per-rank pool bytes, and fixed-order hashes
 of the complete device dX/dW1/dW2/dGate storage. `gradient_hash_repeats=20`
 means all four hashes were byte-stable for twenty independent generations.
 
-The same benchmark now reports `forward_backward_wall_ms` from the completed
-Notify boundary through the final Backward drain, plus
-`forward_to_backward_handoff_ms`, `backward_setup_host_ms`,
-`forward_consumer_drain_ms`, and `integration_overhead_ms`. Do not infer the
-integrated result by adding independent stage means: the old outer host wall
-also included Notify and therefore made about 2.3 ms look like handoff cost.
-The measured event handoff is about 0.11--0.12 ms and the complete boundary
-overhead is about 0.14--0.15 ms.
+The formal training-step field is
+`notify_inclusive_training_step_wall_slowest_rank_us`, measured from
+route/gate readiness through Notify, Forward, Backward, and the final drain.
+`post_notify_training_step_wall_slowest_rank_us` is diagnostic only and must
+not be used for a speedup claim. The same JSON separately reports
+`notify_wall`, `forward_wall`, `backward_wall`, `handoff`, and `final_drain`;
+release runs also require fused/control/config/count/summary audit
+`1/0/0/0/0` and dispatch-consumer acquire/release counts `1/1` on every rank.
+
+To enforce the per-run comparison against a Megatron JSON log:
+
+```bash
+python3 benchmarks/compare_backward_training.py \
+  --megamoe run1.log run2.log run3.log \
+  --megatron megatron.log --minimum-percent 15
+```
+
+The launcher also emits `critical_path_*` statistics. For each iteration it
+first selects the rank with the largest formal Notify-inclusive wall sample,
+then takes every Notify component from that same rank and clock domain. This
+prevents independently selected per-stage maxima from being misread as one
+additive critical path.
 
 The full world-2 production Forward+Backward racecheck command is:
 

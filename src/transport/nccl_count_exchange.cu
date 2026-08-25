@@ -324,8 +324,9 @@ NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,
   state->world = world_size;
   state->bootstrap_identity = bootstrap_id.bytes_;
   internal::throw_nccl("session-create",
-                       ncclCommInitRank(&state->comm, static_cast<int>(world_size),
-                                        id, static_cast<int>(rank)),
+                       ncclCommInitRank(&state->comm,
+                                        static_cast<int>(world_size), id,
+                                        static_cast<int>(rank)),
                        rank, world_size, identity, generation,
                        ExchangeKind::ExpertCounts, "ncclCommInitRank");
   auto impl = std::make_shared<NcclSession::Impl>();
@@ -382,6 +383,7 @@ struct NcclAllGatherCountExchange::Impl {
   std::unique_ptr<ByteSlot> config;
   std::unique_ptr<Slot> expert;
   std::unique_ptr<Slot> summary;
+  std::unique_ptr<ByteSlot> fast_notify;
   std::uint64_t agreed_expert_width = 0;
   std::uint64_t agreed_summary_width = 0;
   ConfigWire verified_config;
@@ -397,6 +399,7 @@ struct NcclAllGatherCountExchange::Impl {
     CountStarted,
     CountComplete,
     SummaryStarted,
+    FastNotifyStarted,
     Complete,
   } protocol = ProtocolState::ControlReady;
   CollectiveProtocolAudit audit;
@@ -1047,6 +1050,25 @@ NcclAllGatherCountExchange::NcclAllGatherCountExchange(
   impl_->config = std::make_unique<ByteSlot>();
   allocate_byte_slot(*impl_->config, max_config_wire_bytes, session,
                      "nccl-config-pool", &impl_->setup);
+  constexpr std::size_t kFastHeaderBytes = kControlWireBytes;
+  if (max_expert_row_width >
+          (std::numeric_limits<std::size_t>::max() - kFastHeaderBytes) /
+              sizeof(std::uint64_t) ||
+      max_summary_row_width >
+          (std::numeric_limits<std::size_t>::max() - kFastHeaderBytes -
+           static_cast<std::size_t>(max_expert_row_width) *
+               sizeof(std::uint64_t)) /
+              sizeof(std::uint64_t))
+    invalid("phase=nccl-fast-notify-pool, field=record_bytes, rank=" +
+            std::to_string(session.rank()) +
+            ", expected=size_t sum, actual=overflow");
+  const auto fast_bytes =
+      kFastHeaderBytes +
+      static_cast<std::size_t>(max_expert_row_width) * sizeof(std::uint64_t) +
+      static_cast<std::size_t>(max_summary_row_width) * sizeof(std::uint64_t);
+  impl_->fast_notify = std::make_unique<ByteSlot>();
+  allocate_byte_slot(*impl_->fast_notify, fast_bytes, session,
+                     "nccl-fast-notify-pool", &impl_->setup);
 }
 
 void NcclAllGatherCountExchange::prepare_generation(
@@ -1059,7 +1081,8 @@ void NcclAllGatherCountExchange::prepare_generation(
   const auto busy = impl_->control->in_use ||
                     (impl_->config && impl_->config->in_use) ||
                     (impl_->expert && impl_->expert->in_use) ||
-                    (impl_->summary && impl_->summary->in_use);
+                    (impl_->summary && impl_->summary->in_use) ||
+                    (impl_->fast_notify && impl_->fast_notify->in_use);
   if (busy)
     invalid("phase=nccl-pool-prepare, field=slot, rank=" +
             std::to_string(session.rank()) +
@@ -1302,6 +1325,328 @@ bool NcclAllGatherCountExchange::can_reuse_verified_config(
   return !impl_->verified_config.empty() && impl_->verified_config == wire;
 }
 
+bool NcclAllGatherCountExchange::fast_path_ready() const {
+  if (!impl_)
+    return false;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return !impl_->verified_config.empty() && impl_->fast_notify &&
+         impl_->expert && impl_->summary;
+}
+
+bool NcclAllGatherCountExchange::fast_config_matches(
+    const ConfigWire &wire) const {
+  if (!impl_)
+    return false;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return !impl_->verified_config.empty() && impl_->verified_config == wire;
+}
+
+NcclAllGatherCountExchange::FastNotifyResult
+NcclAllGatherCountExchange::run_fast_notify(
+    const RankCollectiveContext &context, const ControlHeader &header,
+    const DeviceBufferLease *expert_input,
+    const DeviceBufferLease *summary_input) {
+  if (!impl_ || !context)
+    invalid("phase=fast-notify, field=context/backend, rank=n/a, "
+            "expected=valid, actual=empty");
+  const auto rank = context.calling_rank();
+  const auto &session = context.session();
+  if (!session.same_instance(impl_->session.session()) ||
+      !context.execution().same_instance(impl_->execution.token()))
+    invalid("phase=fast-notify, field=context, rank=" +
+            std::to_string(rank) +
+            ", expected=backend session/execution, actual=mismatch");
+
+  std::shared_ptr<const internal::CudaBufferState> expert_state;
+  std::shared_ptr<const internal::CudaBufferState> summary_state;
+  if ((expert_input == nullptr) != (summary_input == nullptr))
+    invalid("phase=fast-notify, field=device_inputs, rank=" +
+            std::to_string(rank) +
+            ", expected=both present or both absent, actual=partial");
+  if (expert_input) {
+    if (!*expert_input || !*summary_input || expert_input->rows() != 1 ||
+        summary_input->rows() != 1 ||
+        expert_input->row_width() != header.expert_row_width ||
+        summary_input->row_width() != header.summary_row_width)
+      invalid("phase=fast-notify, field=device_input.shape, rank=" +
+              std::to_string(rank) +
+              ", expected=agreed local rows, actual=mismatch");
+    expert_state =
+        std::dynamic_pointer_cast<const internal::CudaBufferState>(
+            backend_device_state(*expert_input));
+    summary_state =
+        std::dynamic_pointer_cast<const internal::CudaBufferState>(
+            backend_device_state(*summary_input));
+    if (!expert_state || !summary_state || !expert_state->pointer ||
+        !summary_state->pointer ||
+        expert_state->device != impl_->session.device_ordinal() ||
+        summary_state->device != impl_->session.device_ordinal())
+      invalid("phase=fast-notify, field=device_input.backend, rank=" +
+              std::to_string(rank) +
+              ", expected=CUDA leases on backend device, actual=foreign/null");
+  }
+  ByteSlot *fast = nullptr;
+  Slot *expert = nullptr;
+  Slot *summary = nullptr;
+  std::uint64_t expert_width = 0;
+  std::uint64_t summary_width = 0;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->protocol != Impl::ProtocolState::ControlReady ||
+        impl_->verified_config.empty() || !impl_->fast_notify ||
+        !impl_->expert || !impl_->summary || impl_->fast_notify->in_use ||
+        impl_->expert->in_use || impl_->summary->in_use)
+      invalid("phase=fast-notify, field=protocol_state, rank=" +
+              std::to_string(rank) +
+              ", expected=verified/idle, actual=not-ready/busy");
+    expert_width = impl_->verified_expert_width;
+    summary_width = impl_->verified_summary_width;
+    fast = impl_->fast_notify.get();
+    expert = impl_->expert.get();
+    summary = impl_->summary.get();
+    fast->in_use = true;
+    expert->in_use = true;
+    summary->in_use = true;
+    impl_->protocol = Impl::ProtocolState::FastNotifyStarted;
+  }
+  const auto release = [&]() noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    fast->in_use = false;
+    expert->in_use = false;
+    summary->in_use = false;
+  };
+  if (expert_width > SIZE_MAX / sizeof(std::uint64_t) ||
+      summary_width > SIZE_MAX / sizeof(std::uint64_t)) {
+    release();
+    invalid("phase=fast-notify, field=record_width, rank=" +
+            std::to_string(rank) +
+            ", expected=size_t widths, actual=overflow");
+  }
+  const auto expert_bytes =
+      static_cast<std::size_t>(expert_width) * sizeof(std::uint64_t);
+  const auto summary_bytes =
+      static_cast<std::size_t>(summary_width) * sizeof(std::uint64_t);
+  if (expert_bytes > SIZE_MAX - kControlWireBytes ||
+      summary_bytes > SIZE_MAX - kControlWireBytes - expert_bytes) {
+    release();
+    invalid("phase=fast-notify, field=record_bytes, rank=" +
+            std::to_string(rank) +
+            ", expected=size_t sum, actual=overflow");
+  }
+  const auto record_bytes = kControlWireBytes + expert_bytes + summary_bytes;
+  if (record_bytes > fast->width || expert_width > expert->width ||
+      summary_width > summary->width) {
+    release();
+    invalid("phase=fast-notify, field=slot_capacity, rank=" +
+            std::to_string(rank) + ", expected=preallocated record, actual=short");
+  }
+
+  const auto wire = encode_control_header(header);
+  const auto enqueue_begin = std::chrono::steady_clock::now();
+  try {
+    internal::throw_cuda(
+        "fast-notify", cudaSetDevice(static_cast<int>(impl_->session.device_ordinal())),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaSetDevice");
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemsetAsync(fast->device_send, 0, record_bytes,
+                        impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaMemsetAsync(fast send)");
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemsetAsync(fast->device_matrix, 0,
+                        record_bytes * static_cast<std::size_t>(session.world_size()),
+                        impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaMemsetAsync(fast receive)");
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemcpyAsync(fast->device_send, wire.data(), kControlWireBytes,
+                        cudaMemcpyHostToDevice, impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaMemcpyAsync(H2D fast header)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
+                              kControlWireBytes);
+    if (expert_state) {
+      internal::throw_cuda(
+          "fast-notify",
+          cudaMemcpyAsync(fast->device_send + kControlWireBytes,
+                          expert_state->pointer, expert_bytes,
+                          cudaMemcpyDeviceToDevice,
+                          impl_->execution_state->stream),
+          rank, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts, "cudaMemcpyAsync(D2D expert row)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToDevice,
+                                expert_bytes);
+      internal::throw_cuda(
+          "fast-notify",
+          cudaMemcpyAsync(fast->device_send + kControlWireBytes + expert_bytes,
+                          summary_state->pointer, summary_bytes,
+                          cudaMemcpyDeviceToDevice,
+                          impl_->execution_state->stream),
+          rank, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::NotifyPacketSummary,
+          "cudaMemcpyAsync(D2D summary row)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToDevice,
+                                summary_bytes);
+    }
+    internal::throw_nccl(
+        "fast-notify",
+        ncclAllGather(fast->device_send, fast->device_matrix, record_bytes,
+                      ncclUint8, impl_->comm, impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "ncclAllGather(NotifyFastRecord)");
+    ++impl_->audit.fused_notify_starts;
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemcpy2DAsync(expert->device_matrix, expert_bytes,
+                          fast->device_matrix + kControlWireBytes, record_bytes,
+                          expert_bytes, session.world_size(),
+                          cudaMemcpyDeviceToDevice,
+                          impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::ExpertCounts,
+        "cudaMemcpy2DAsync(unpack expert matrix)");
+    internal::record_cuda_api(
+        internal::CudaApiAuditKind::DeviceToDevice,
+        expert_bytes * static_cast<std::size_t>(session.world_size()));
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemcpy2DAsync(summary->device_matrix, summary_bytes,
+                          fast->device_matrix + kControlWireBytes + expert_bytes,
+                          record_bytes, summary_bytes, session.world_size(),
+                          cudaMemcpyDeviceToDevice,
+                          impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::NotifyPacketSummary,
+        "cudaMemcpy2DAsync(unpack summary matrix)");
+    internal::record_cuda_api(
+        internal::CudaApiAuditKind::DeviceToDevice,
+        summary_bytes * static_cast<std::size_t>(session.world_size()));
+    internal::throw_cuda(
+        "fast-notify",
+        cudaMemcpy2DAsync(fast->host_matrix, kControlWireBytes,
+                          fast->device_matrix, record_bytes, kControlWireBytes,
+                          session.world_size(), cudaMemcpyDeviceToHost,
+                          impl_->execution_state->stream),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaMemcpy2DAsync(D2H fast headers)");
+    internal::record_cuda_api(
+        internal::CudaApiAuditKind::DeviceToHost,
+        kControlWireBytes * static_cast<std::size_t>(session.world_size()));
+    internal::throw_cuda(
+        "fast-notify",
+        cudaEventRecord(fast->completion, impl_->execution_state->stream), rank,
+        session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaEventRecord(fast notify)");
+  } catch (...) {
+    (void)cudaSetDevice(static_cast<int>(impl_->session.device_ordinal()));
+    (void)cudaStreamSynchronize(impl_->execution_state->stream);
+    release();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->protocol = Impl::ProtocolState::ControlReady;
+    throw;
+  }
+  const auto enqueue_end = std::chrono::steady_clock::now();
+
+  auto make_completion = [&](Slot *slot, ExchangeKind kind,
+                             std::uint64_t width) {
+    auto lease = std::make_shared<internal::CudaCompletionLease>();
+    lease->owner = impl_;
+    auto buffer = std::make_shared<internal::CudaBufferState>();
+    buffer->owner = impl_;
+    buffer->pointer = slot->device_matrix;
+    buffer->device = impl_->session.device_ordinal();
+    const auto elements = checked_elements(session.world_size(), width,
+                                           "fast completion matrix");
+    return make_device_backend_completion(
+        context, kind,
+        make_device_buffer_lease(session.world_size(), width, elements,
+                                 std::move(buffer)),
+        std::move(lease));
+  };
+  FastNotifyResult result;
+  result.expert_counts =
+      make_completion(expert, ExchangeKind::ExpertCounts, expert_width);
+  result.packet_summary = make_completion(
+      summary, ExchangeKind::NotifyPacketSummary, summary_width);
+  result.enqueue_us =
+      std::chrono::duration<double, std::micro>(enqueue_end - enqueue_begin)
+          .count();
+  // The coordinator deliberately defers the only host wait until device
+  // materialization has also been enqueued on this stream.
+  result.wait_us = 0.0;
+  return result;
+}
+
+double NcclAllGatherCountExchange::finish_fast_notify() {
+  if (!impl_)
+    invalid("phase=fast-notify-finish, field=backend, rank=n/a, "
+            "expected=valid, actual=empty");
+  ByteSlot *fast = nullptr;
+  Slot *expert = nullptr;
+  Slot *summary = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->protocol != Impl::ProtocolState::FastNotifyStarted ||
+        !impl_->fast_notify || !impl_->expert || !impl_->summary ||
+        !impl_->fast_notify->in_use || !impl_->expert->in_use ||
+        !impl_->summary->in_use)
+      invalid("phase=fast-notify-finish, field=state, rank=" +
+              std::to_string(impl_->session.rank()) +
+              ", expected=pending fast notify, actual=not-pending");
+    fast = impl_->fast_notify.get();
+    expert = impl_->expert.get();
+    summary = impl_->summary.get();
+  }
+  const auto release = [&]() noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    fast->in_use = false;
+    expert->in_use = false;
+    summary->in_use = false;
+  };
+  const auto rank = impl_->session.rank();
+  const auto &session = impl_->session.session();
+  try {
+    // Device materialization is ordered after this event on the same stream,
+    // so in the normal path its completion wait has already completed the
+    // collective. Keep this checked wait for standalone/failure paths.
+    internal::throw_cuda(
+        "fast-notify-finish", cudaEventSynchronize(fast->completion), rank,
+        session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "cudaEventSynchronize(fast notify)");
+    ncclResult_t async = ncclSuccess;
+    internal::throw_nccl(
+        "fast-notify-finish", ncclCommGetAsyncError(impl_->comm, &async),
+        rank, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::Control, "ncclCommGetAsyncError");
+    internal::throw_nccl(
+        "fast-notify-finish", async, rank, session.world_size(),
+        session.identity(), session.generation(), ExchangeKind::Control,
+        "NCCL asynchronous completion");
+    ControlWireMatrix wires(session.world_size());
+    for (std::uint32_t source = 0; source < session.world_size(); ++source)
+      std::copy_n(fast->host_matrix +
+                      static_cast<std::size_t>(source) * kControlWireBytes,
+                  kControlWireBytes, wires[source].begin());
+    (void)validate_control_wires(wires);
+    release();
+    {
+      std::lock_guard<std::mutex> lock(impl_->mutex);
+      impl_->protocol = Impl::ProtocolState::Complete;
+      ++impl_->audit.config_cache_hits;
+    }
+    return 0.0;
+  } catch (...) {
+    release();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->protocol = Impl::ProtocolState::ControlReady;
+    throw;
+  }
+}
+
 void NcclAllGatherCountExchange::reuse_verified_config(
     const RankCollectiveContext &context, const ConfigWire &wire,
     const ValidatedControlHandle &control) {
@@ -1362,13 +1707,17 @@ NcclWorkspaceUsage NcclAllGatherCountExchange::workspace_usage() const {
   usage.config_slot_bytes = 2 * (config_matrix + config_row);
   usage.expert_slot_bytes = slot_bytes(impl_->expert.get());
   usage.summary_slot_bytes = slot_bytes(impl_->summary.get());
+  const auto fast_matrix = byte_slot_matrix(impl_->fast_notify.get());
+  const auto fast_row = impl_->fast_notify ? impl_->fast_notify->width : 0;
+  usage.fused_notify_slot_bytes = 2 * (fast_matrix + fast_row);
   const auto control_side = control_matrix + control_row;
   const auto config_side = config_matrix + config_row;
+  const auto fast_side = fast_matrix + fast_row;
   usage.device_bytes = control_matrix + control_row + config_matrix +
                        config_row +
                        slot_bytes(impl_->expert.get()) +
-                       slot_bytes(impl_->summary.get());
-  usage.pinned_host_bytes = control_side + config_side;
+                       slot_bytes(impl_->summary.get()) + fast_side;
+  usage.pinned_host_bytes = control_side + config_side + fast_side;
   return usage;
 }
 
@@ -1685,7 +2034,7 @@ DeviceNotifyResourcePoolUsage DeviceNotifyResourcePool::usage() const {
     usage.device_bytes += backend.device_bytes;
     usage.pinned_host_bytes += backend.pinned_host_bytes;
     usage.event_count +=
-        4U + DeviceNotifyPoolBridge::event_count(slot.notify);
+        5U + DeviceNotifyPoolBridge::event_count(slot.notify);
   }
   return usage;
 }
@@ -1895,6 +2244,11 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     invalid("phase=generation-coordinator-run, field=state, rank=n/a, expected=fresh coordinator, actual=empty/already-used");
   impl_->used = true;
   const auto run_start = std::chrono::steady_clock::now();
+  const auto offset_us = [&](std::chrono::steady_clock::time_point point) {
+    return std::chrono::duration<double, std::micro>(point - run_start)
+        .count();
+  };
+  const auto pool_acquire_begin = std::chrono::steady_clock::now();
   const auto deadline = options.deadline_after.count() > 0
                             ? run_start + options.deadline_after
                             : std::chrono::steady_clock::time_point::max();
@@ -1912,6 +2266,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
             std::chrono::steady_clock::now() - acquire_start)
             .count();
   }
+  const auto pool_acquire_end = std::chrono::steady_clock::now();
   if (!impl_->backend)
     invalid("phase=generation-coordinator-run, field=backend, rank=" +
             std::to_string(impl_->session.rank()) +
@@ -1980,11 +2335,25 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     }
   }
 
+  bool use_fast_notify = false;
+#if !MEGAMOE_DEBUG_VALIDATE
+  use_fast_notify = request.config.topology.num_nodes == 1 && impl_->pool &&
+                    impl_->backend->fast_path_ready() && !identity_override &&
+                    testing::g_config_corruption_offset == SIZE_MAX &&
+                    testing::g_next_fault.load(std::memory_order_acquire) == 0;
+  if (use_fast_notify &&
+      !impl_->backend->fast_config_matches(config_wire) &&
+      status.error == ControlLocalError::None)
+    status = {ControlLocalError::InvalidRuntimeConfig,
+              ControlField::ConfigBlob, UINT64_MAX, UINT64_MAX, 0, 1, 0};
+#endif
+
   CudaLocalNotifyHandle local;
   double local_mapping_us = 0;
   std::uint64_t route_input_bytes = 0;
   std::uint64_t notify_arena_bytes = 0;
   std::uint64_t notify_pinned_bytes = 0;
+  const auto local_histogram_begin = std::chrono::steady_clock::now();
   if (status.error == ControlLocalError::None) {
     try {
       auto routes = direct_routes
@@ -2037,6 +2406,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
         throw;
     }
   }
+  const auto local_histogram_end = std::chrono::steady_clock::now();
 
   auto header = make_control_header(
       request.config, impl_->context, request.local_routes.num_tokens,
@@ -2048,32 +2418,37 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     header.session_id_word0 = identity_override->summary.word0;
     header.session_id_word1 = identity_override->summary.word1;
   }
-  const auto control_config_start = std::chrono::steady_clock::now();
-  auto control = impl_->backend->start_control(impl_->context, header);
-  auto control_done = control.wait();
+  const auto collective_enqueue_begin = std::chrono::steady_clock::now();
+  auto control_config_start = collective_enqueue_begin;
+  auto control_config_end = collective_enqueue_begin;
+  if (!use_fast_notify) {
+    control_config_start = std::chrono::steady_clock::now();
+    auto control = impl_->backend->start_control(impl_->context, header);
+    auto control_done = control.wait();
 
-  if (testing::g_config_corruption_offset != SIZE_MAX) {
-    const auto offset = testing::g_config_corruption_offset;
-    testing::g_config_corruption_offset = SIZE_MAX;
-    if (offset < config_wire.size())
-      config_wire[offset] ^= std::byte{1};
-  }
+    if (testing::g_config_corruption_offset != SIZE_MAX) {
+      const auto offset = testing::g_config_corruption_offset;
+      testing::g_config_corruption_offset = SIZE_MAX;
+      if (offset < config_wire.size())
+        config_wire[offset] ^= std::byte{1};
+    }
 
 #if MEGAMOE_DEBUG_VALIDATE
-  auto config = impl_->backend->start_config(impl_->context, config_wire,
-                                             control_done);
-  (void)config.wait();
-#else
-  if (impl_->backend->can_reuse_verified_config(config_wire)) {
-    impl_->backend->reuse_verified_config(impl_->context, config_wire,
-                                          control_done);
-  } else {
     auto config = impl_->backend->start_config(impl_->context, config_wire,
                                                control_done);
     (void)config.wait();
-  }
+#else
+    if (impl_->backend->can_reuse_verified_config(config_wire)) {
+      impl_->backend->reuse_verified_config(impl_->context, config_wire,
+                                            control_done);
+    } else {
+      auto config = impl_->backend->start_config(impl_->context, config_wire,
+                                                 control_done);
+      (void)config.wait();
+    }
 #endif
-  const auto control_config_end = std::chrono::steady_clock::now();
+    control_config_end = std::chrono::steady_clock::now();
+  }
   const auto coordinator_create = impl_->setup.coordinator_backend_create_us;
   const auto initial_total = impl_->setup.per_generation_setup_total_us;
   const auto pool_setup = impl_->setup.one_time_pool_setup_us;
@@ -2092,61 +2467,146 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
         impl_->setup.summary_slot_allocation_us;
   }
 
+  BackendCompletion count_done;
+  BackendCompletion summary_done;
+  auto count_start = std::chrono::steady_clock::now();
+  auto count_end = count_start;
+  auto summary_start = count_start;
+  auto summary_end = count_start;
+  auto collective_enqueue_end = count_start;
+  auto collective_complete = count_start;
+  double fused_enqueue_us = 0.0;
+  double fused_wait_us = 0.0;
+  if (use_fast_notify) {
+    const DeviceBufferLease *count_input = nullptr;
+    const DeviceBufferLease *summary_input = nullptr;
+    DeviceBufferLease count_lease;
+    DeviceBufferLease summary_lease;
+    // A failed preflight still participates in the fixed-width fused control
+    // collective, but its variable rows are deliberately represented by the
+    // already-zeroed record payload.  In particular, a config mismatch may
+    // have produced a local row whose width differs from the session-verified
+    // layout; never copy that row using the canonical record width.
+    if (local && status.error == ControlLocalError::None) {
+      count_lease = local.device_expert_count_for_backend();
+      summary_lease = local.device_packet_count_for_backend();
+      count_input = &count_lease;
+      summary_input = &summary_lease;
+    }
+    auto fused = impl_->backend->run_fast_notify(
+        impl_->context, header, count_input, summary_input);
+    count_done = std::move(fused.expert_counts);
+    summary_done = std::move(fused.packet_summary);
+    fused_enqueue_us = fused.enqueue_us;
+    fused_wait_us = fused.wait_us;
+    collective_enqueue_end =
+        collective_enqueue_begin + std::chrono::duration_cast<
+                                       std::chrono::steady_clock::duration>(
+                                       std::chrono::duration<double, std::micro>(
+                                           fused_enqueue_us));
+  } else {
+    if (!local)
+      invalid("phase=generation-coordinator, field=local_handle, rank=" +
+              std::to_string(impl_->session.rank()) +
+              ", expected=valid after successful agreement, actual=empty");
+    count_start = std::chrono::steady_clock::now();
+    auto count = impl_->backend->start(CountExchangeRequest{
+        impl_->context, ExchangeKind::ExpertCounts, request.config.num_experts,
+        {}, local.device_expert_count_for_backend()});
+    if (options.cancellation.cancellation_requested() ||
+        std::chrono::steady_clock::now() >= deadline) {
+      count->cancel();
+      throw NotifyDispatchError(
+          NotifyErrorCode::CountExchangeFailure,
+          "phase=generation-cancel, field=cancel_or_deadline, rank=" +
+              std::to_string(impl_->session.rank()) + ", world=" +
+              std::to_string(impl_->session.session().world_size()) +
+              ", session='" + impl_->session.session().identity() +
+              "', generation=" +
+              std::to_string(impl_->session.session().generation()) +
+              ", expected=active generation, actual=cancel requested/deadline expired");
+    }
+    count_done = count->wait();
+    maybe_fault(testing::NcclFaultPoint::CountKernelCompletion,
+                "count-kernel-completion", impl_->context);
+    count_end = std::chrono::steady_clock::now();
+    summary_start = std::chrono::steady_clock::now();
+    auto summary = impl_->backend->start(CountExchangeRequest{
+        impl_->context, ExchangeKind::NotifyPacketSummary,
+        request.config.topology.num_nodes, {},
+        local.device_packet_count_for_backend()});
+    summary_done = summary->wait();
+    maybe_fault(testing::NcclFaultPoint::SummaryKernelCompletion,
+                "summary-kernel-completion", impl_->context);
+    summary_end = std::chrono::steady_clock::now();
+    collective_enqueue_end = summary_start;
+    collective_complete = summary_end;
+  }
+  if (!local && use_fast_notify) {
+    // Predictable invalid input has no local device metadata to materialize,
+    // but every rank has already joined the fixed collective. Complete and
+    // validate that collective so all ranks select the same structured error.
+    (void)impl_->backend->finish_fast_notify();
+    collective_complete = std::chrono::steady_clock::now();
+  }
   if (!local)
     invalid("phase=generation-coordinator, field=local_handle, rank=" +
             std::to_string(impl_->session.rank()) +
             ", expected=valid after successful agreement, actual=empty");
-  const auto count_start = std::chrono::steady_clock::now();
-  auto count = impl_->backend->start(CountExchangeRequest{
-      impl_->context, ExchangeKind::ExpertCounts, request.config.num_experts,
-      {}, local.device_expert_count_for_backend()});
-  if (options.cancellation.cancellation_requested() ||
-      std::chrono::steady_clock::now() >= deadline) {
-    count->cancel();
-    throw NotifyDispatchError(
-        NotifyErrorCode::CountExchangeFailure,
-        "phase=generation-cancel, field=cancel_or_deadline, rank=" +
-            std::to_string(impl_->session.rank()) + ", world=" +
-            std::to_string(impl_->session.session().world_size()) +
-            ", session='" + impl_->session.session().identity() +
-            "', generation=" +
-            std::to_string(impl_->session.session().generation()) +
-            ", expected=active generation, actual=cancel requested/deadline expired");
-  }
-  auto count_done = count->wait();
-  maybe_fault(testing::NcclFaultPoint::CountKernelCompletion,
-              "count-kernel-completion", impl_->context);
-  const auto count_end = std::chrono::steady_clock::now();
-  const auto summary_start = std::chrono::steady_clock::now();
-  auto summary = impl_->backend->start(CountExchangeRequest{
-      impl_->context, ExchangeKind::NotifyPacketSummary,
-      request.config.topology.num_nodes, {},
-      local.device_packet_count_for_backend()});
-  auto summary_done = summary->wait();
-  maybe_fault(testing::NcclFaultPoint::SummaryKernelCompletion,
-              "summary-kernel-completion", impl_->context);
-  const auto summary_end = std::chrono::steady_clock::now();
   const auto materialize_start = std::chrono::steady_clock::now();
   DeviceMetadataBridge::Timings materialize_timings;
+  auto materialize_end = materialize_start;
   maybe_fault(testing::NcclFaultPoint::MaterializationKernel,
               "materialization-kernel", impl_->context);
-  auto device = DeviceMetadataBridge::materialize(
-      local, std::move(count_done), std::move(summary_done), impl_->execution,
-      &materialize_timings);
-  const auto materialize_end = std::chrono::steady_clock::now();
+  DeviceDispatchHandle device;
+  try {
+    device = DeviceMetadataBridge::materialize(
+        local, std::move(count_done), std::move(summary_done), impl_->execution,
+        &materialize_timings);
+    materialize_end = std::chrono::steady_clock::now();
+  } catch (...) {
+    if (use_fast_notify) {
+      try {
+        (void)impl_->backend->finish_fast_notify();
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  if (use_fast_notify) {
+    (void)impl_->backend->finish_fast_notify();
+    const auto combined_wait_us =
+        std::chrono::duration<double, std::micro>(materialize_end -
+                                                  materialize_start)
+            .count();
+    fused_wait_us = std::max(
+        0.0, combined_wait_us - materialize_timings.prefix_planning_us -
+                 materialize_timings.remaining_parallel_us);
+    collective_complete = std::chrono::steady_clock::now();
+  }
   const auto audit_value = impl_->backend->audit();
-  if (audit_value.control_starts != 1 ||
-      audit_value.config_starts + audit_value.config_cache_hits != 1 ||
-      audit_value.expert_count_starts != 1 ||
-      audit_value.packet_summary_starts != 1)
+  const bool valid_fused_audit =
+      use_fast_notify && audit_value.fused_notify_starts == 1 &&
+      audit_value.control_starts == 0 && audit_value.config_starts == 0 &&
+      audit_value.expert_count_starts == 0 &&
+      audit_value.packet_summary_starts == 0 &&
+      audit_value.config_cache_hits == 1;
+  const bool valid_full_audit =
+      !use_fast_notify && audit_value.fused_notify_starts == 0 &&
+      audit_value.control_starts == 1 &&
+      audit_value.config_starts + audit_value.config_cache_hits == 1 &&
+      audit_value.expert_count_starts == 1 &&
+      audit_value.packet_summary_starts == 1;
+  if (!valid_fused_audit && !valid_full_audit)
     invalid("phase=generation-publish, field=audit, rank=" +
             std::to_string(impl_->session.rank()) +
-            ", expected=1/1/1/1, actual=" +
+            ", expected=full 1/1/1/1 or fused 1, actual=" +
             std::to_string(audit_value.control_starts) + "/" +
             std::to_string(audit_value.config_starts) + "+cache=" +
             std::to_string(audit_value.config_cache_hits) + "/" +
             std::to_string(audit_value.expert_count_starts) + "/" +
-            std::to_string(audit_value.packet_summary_starts));
+            std::to_string(audit_value.packet_summary_starts) + "/fused=" +
+            std::to_string(audit_value.fused_notify_starts));
   auto result = std::make_shared<ValidatedCudaGeneration::Impl>();
   result->dispatch = std::move(device);
   result->audit = audit_value;
@@ -2158,8 +2618,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       notify_arena_bytes;
   result->workspace.device_bytes += route_input_bytes + notify_arena_bytes;
   result->workspace.pinned_host_bytes += notify_pinned_bytes;
-  // Notify workspace/route/consumer events plus four collective events.
-  result->workspace.event_count = 14;
+  // Notify workspace/route/consumer events plus preallocated collective events.
+  result->workspace.event_count = 15;
   result->workspace.quantified_event_bytes = 0;
   if (impl_->pool) {
     result->workspace = {};
@@ -2183,8 +2643,10 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       result->workspace.config_slot_bytes += backend_usage.config_slot_bytes;
       result->workspace.expert_slot_bytes += backend_usage.expert_slot_bytes;
       result->workspace.summary_slot_bytes += backend_usage.summary_slot_bytes;
+      result->workspace.fused_notify_slot_bytes +=
+          backend_usage.fused_notify_slot_bytes;
       result->workspace.event_count +=
-          4U + DeviceNotifyPoolBridge::event_count(slot.notify);
+          5U + DeviceNotifyPoolBridge::event_count(slot.notify);
     }
     result->workspace.final_device_metadata_arena_view_capacity_bytes =
         impl_->pool->max_plan.device_bytes;
@@ -2217,14 +2679,36 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       std::chrono::duration<double, std::micro>(summary_end - summary_start)
           .count();
   result->execution.device_materialization_us =
-      std::chrono::duration<double, std::micro>(materialize_end -
-                                                materialize_start)
-          .count();
+      use_fast_notify
+          ? materialize_timings.prefix_planning_us +
+                materialize_timings.remaining_parallel_us
+          : std::chrono::duration<double, std::micro>(materialize_end -
+                                                      materialize_start)
+                .count();
   result->execution.prefix_planning_us =
       materialize_timings.prefix_planning_us;
   result->execution.remaining_parallel_materialization_us =
       materialize_timings.remaining_parallel_us;
   result->execution.pool_acquire_release_us = result->setup.pool_acquire_us;
+  result->execution.route_gate_ready_offset_us = 0.0;
+  result->execution.pool_acquire_begin_offset_us =
+      offset_us(pool_acquire_begin);
+  result->execution.pool_acquire_end_offset_us = offset_us(pool_acquire_end);
+  result->execution.local_histogram_begin_offset_us =
+      offset_us(local_histogram_begin);
+  result->execution.local_histogram_end_offset_us =
+      offset_us(local_histogram_end);
+  result->execution.collective_enqueue_begin_offset_us =
+      offset_us(collective_enqueue_begin);
+  result->execution.collective_enqueue_end_offset_us =
+      offset_us(collective_enqueue_end);
+  result->execution.collective_complete_offset_us =
+      offset_us(collective_complete);
+  result->execution.device_materialization_end_offset_us =
+      offset_us(materialize_end);
+  result->execution.notify_handle_ready_offset_us = offset_us(run_end);
+  result->execution.fused_collective_enqueue_us = fused_enqueue_us;
+  result->execution.fused_collective_wait_us = fused_wait_us;
   result->resource_lease = pool_lease
                                ? std::static_pointer_cast<const void>(pool_lease)
                                : std::static_pointer_cast<const void>(impl_);

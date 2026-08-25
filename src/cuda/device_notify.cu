@@ -273,6 +273,7 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
 struct HostLayout {
   std::size_t status = 0;
   std::size_t materialization_status = 0;
+  std::size_t materialization_ready = 0;
   std::size_t total = 0;
 };
 
@@ -284,6 +285,8 @@ HostLayout make_host_layout(const CudaNotifyWorkspacePlan &plan) {
   layout.materialization_status = append_region(
       cursor, 1, sizeof(DeviceMaterializationStatus),
       "host_materialization_status");
+  layout.materialization_ready = append_region(
+      cursor, 1, sizeof(std::uint32_t), "host_materialization_ready");
   layout.total = cursor;
   return layout;
 }
@@ -1028,6 +1031,21 @@ __global__ void materialize_signals_kernel(DeviceMaterializeArgs a) {
   a.incoming_signals[node] = DeviceSignalRecord{
       expected, expected, node, source_node, source_rank, a.rank, rail, 0};
 }
+
+#if !MEGAMOE_DEBUG_VALIDATE
+__global__ void publish_materialization_status_kernel(
+    const DeviceMaterializationStatus *source,
+    DeviceMaterializationStatus *mapped_status,
+    std::uint32_t *mapped_ready) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  *mapped_status = *source;
+  __threadfence_system();
+  ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_system> ready(
+      *mapped_ready);
+  ready.store(1U, ::cuda::memory_order_release);
+}
+#endif
 
 __global__ void dispatch_consumer_probe_delay_kernel(
     const std::uint64_t *source, std::uint64_t delay_cycles) {
@@ -1833,11 +1851,19 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
   internal::throw_cuda("workspace-allocate",
                        cudaHostAlloc(&allocation.host_ptr,
                                      std::max<std::size_t>(allocation.host_bytes, 1),
-                                     cudaHostAllocPortable),
+                                     cudaHostAllocPortable |
+                                         cudaHostAllocMapped),
                        context.calling_rank(), context.session().world_size(),
                        context.session().identity(), context.session().generation(),
                        ExchangeKind::ExpertCounts, "cudaHostAlloc(staging)");
   internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+  internal::throw_cuda(
+      "workspace-allocate",
+      cudaHostGetDevicePointer(&allocation.host_device_ptr,
+                               allocation.host_ptr, 0),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaHostGetDevicePointer(staging)");
   internal::throw_cuda("workspace-allocate",
                        cudaEventCreate(&allocation.mapping_start),
                        context.calling_rank(), context.session().world_size(),
@@ -1938,11 +1964,18 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
       "device-pool-allocate",
       cudaHostAlloc(&result->workspace->host_ptr,
                     std::max<std::size_t>(result->workspace->host_bytes, 1),
-                    cudaHostAllocPortable),
+                    cudaHostAllocPortable | cudaHostAllocMapped),
       max_plan.calling_rank, max_plan.world_size,
       execution.token().identity(), 1, ExchangeKind::ExpertCounts,
       "cudaHostAlloc(pool status staging)");
   internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+  internal::throw_cuda(
+      "device-pool-allocate",
+      cudaHostGetDevicePointer(&result->workspace->host_device_ptr,
+                               result->workspace->host_ptr, 0),
+      max_plan.calling_rank, max_plan.world_size,
+      execution.token().identity(), 1, ExchangeKind::ExpertCounts,
+      "cudaHostGetDevicePointer(pool status staging)");
   internal::throw_cuda(
       "device-pool-allocate",
       cudaEventCreate(&result->workspace->mapping_start),
@@ -2858,6 +2891,12 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   const auto &dl = state->device_layout;
   auto *base = state->allocation->device_ptr;
   const auto rank = context.calling_rank();
+#if !MEGAMOE_DEBUG_VALIDATE
+  auto *host_ready = at<std::uint32_t>(
+      state->allocation->host_ptr,
+      state->host_layout.materialization_ready);
+  __atomic_store_n(host_ready, 0U, __ATOMIC_RELEASE);
+#endif
   internal::throw_cuda("device-materialize",
                        cudaSetDevice(static_cast<int>(exec->device)), rank,
                        context.session().world_size(),
@@ -3061,6 +3100,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(materialization complete)");
+#if MEGAMOE_DEBUG_VALIDATE
   internal::throw_cuda(
       "device-materialize",
       cudaMemcpyAsync(at<void>(state->allocation->host_ptr,
@@ -3085,6 +3125,44 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventSynchronize");
+#else
+  auto *mapped_status = at<DeviceMaterializationStatus>(
+      state->allocation->host_device_ptr,
+      state->host_layout.materialization_status);
+  auto *mapped_ready = at<std::uint32_t>(
+      state->allocation->host_device_ptr,
+      state->host_layout.materialization_ready);
+  publish_materialization_status_kernel<<<1, 1, 0, exec->stream>>>(
+      args.status, mapped_status, mapped_ready);
+  internal::throw_cuda(
+      "device-materialize", cudaGetLastError(), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "publish_materialization_status_kernel");
+  internal::throw_cuda(
+      "device-materialize",
+      cudaEventRecord(state->allocation->completion, exec->stream), rank,
+      context.session().world_size(), context.session().identity(),
+      context.session().generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(mapped materialization status)");
+  std::uint64_t polls = 0;
+  while (__atomic_load_n(host_ready, __ATOMIC_ACQUIRE) != 1U) {
+    if ((++polls & 0x3ffU) == 0U) {
+      const auto event = cudaEventQuery(state->allocation->completion);
+      if (event != cudaSuccess && event != cudaErrorNotReady)
+        internal::throw_cuda(
+            "device-materialize", event, rank,
+            context.session().world_size(), context.session().identity(),
+            context.session().generation(), ExchangeKind::ExpertCounts,
+            "cudaEventQuery(mapped materialization status)");
+      if (event == cudaSuccess &&
+          __atomic_load_n(host_ready, __ATOMIC_ACQUIRE) != 1U)
+        invalid("phase=device-materialize, field=mapped_status_ready, rank=" +
+                std::to_string(rank) +
+                ", expected=1 before completion, actual=0");
+    }
+  }
+#endif
   if (timings) {
     float planning_ms = 0;
     float remaining_ms = 0;

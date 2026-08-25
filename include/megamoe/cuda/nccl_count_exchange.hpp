@@ -81,6 +81,9 @@ struct CollectiveProtocolAudit {
   std::uint64_t expert_count_starts = 0;
   std::uint64_t packet_summary_starts = 0;
   std::uint64_t config_cache_hits = 0;
+  // Single-node trusted release path: one record carries control/status,
+  // expert counts and packet summary in one AllGather.
+  std::uint64_t fused_notify_starts = 0;
 };
 
 struct NcclWorkspaceUsage {
@@ -101,6 +104,7 @@ struct NcclWorkspaceUsage {
   std::uint64_t config_slot_bytes = 0;
   std::uint64_t expert_slot_bytes = 0;
   std::uint64_t summary_slot_bytes = 0;
+  std::uint64_t fused_notify_slot_bytes = 0;
 };
 
 struct GenerationSetupTimings {
@@ -130,6 +134,21 @@ struct GenerationExecutionTimings {
   double prefix_planning_us = 0;
   double remaining_parallel_materialization_us = 0;
   double pool_acquire_release_us = 0;
+  // Same-clock-domain offsets from coordinator entry. Route/gate readiness is
+  // the entry boundary for run_device(); all remaining values are monotonic
+  // host timestamps around the asynchronous device/NCCL work.
+  double route_gate_ready_offset_us = 0;
+  double pool_acquire_begin_offset_us = 0;
+  double pool_acquire_end_offset_us = 0;
+  double local_histogram_begin_offset_us = 0;
+  double local_histogram_end_offset_us = 0;
+  double collective_enqueue_begin_offset_us = 0;
+  double collective_enqueue_end_offset_us = 0;
+  double collective_complete_offset_us = 0;
+  double device_materialization_end_offset_us = 0;
+  double notify_handle_ready_offset_us = 0;
+  double fused_collective_enqueue_us = 0;
+  double fused_collective_wait_us = 0;
 };
 
 struct NotifyGenerationRequest {

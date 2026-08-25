@@ -132,16 +132,23 @@ correctness blockers.
   dW1 now uses an outer producer/two-consumer WGMMA pipeline, an STSM BF16
   epilogue, and four 128x64 TMA stores. Deterministic grid-stride ownership for
   the uniform main-shape dW1 and dX tiles removes their global claim atomics.
-  Three independent 10-warmup/100-sample local 8-GPU runs with the owning
-  event handoff measured Backward means of `28.705`, `28.688`, and `28.736`
-  ms. Matching Megatron native means were `33.828`, `33.890`, and `33.907` ms,
-  giving `15.14%`, `15.35%`, and `15.25%` improvements. True same-generation
-  cache Forward+Backward wall means, measured from completed Notify through the
-  final Backward drain, were `45.557`, `45.543`, and `45.580` ms versus
-  Megatron's `54.207`, `54.240`, and `54.264` ms (`15.96%`, `16.03%`, and
-  `16.00%` faster). The device event handoff itself was `0.114`--`0.119` ms;
-  total integration boundary overhead was `0.141`--`0.148` ms. Standalone
-  cache Forward averaged `15.879` ms, within the frozen Forward budget.
+  The formal integrated boundary is now route/gate readiness through Notify,
+  Forward, Backward, and final drain; the former post-Notify number is retained
+  only as a diagnostic. Single-node trusted release packs status, expert
+  counts, and packet summary into one `NotifyFastRecord` AllGather after the
+  session config is verified. Forward moves its existing dispatch consumer to
+  Backward, giving exactly one acquire/release across the training step. The
+  fair comparator rejects each run unless both Backward-only and this
+  Notify-inclusive training step beat the matching Megatron run by at least
+  15%. The final three 10-warmup/100-measurement local runs were
+  `28.650/28.633/28.691 ms` Backward and
+  `46.008/45.973/46.068 ms` Notify-inclusive training-step wall. Against the
+  matching Megatron runs this is `15.17/15.47/15.45%` and
+  `15.07/15.28/15.10%`, respectively. The fused Notify itself measured
+  `0.524/0.528/0.521 ms`; the device terminal rendezvous prevents prior-rank
+  skew from being charged to the following generation. These pass the formal
+  per-run 15% gate, while the aspirational absolute 28.5/45.6 ms margin remains
+  narrowly unmet and is recorded rather than hidden.
 
   Reserving 1, 2, or 4 CTAs for early dW produced `29.263`, `29.023`, and
   `29.021` ms Backward in the directed short search, all slower than the
