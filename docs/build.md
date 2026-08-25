@@ -20,13 +20,20 @@ changing system configuration:
 - system NCCL headers/library report `2.29.7+cuda13.2`, whose
   `ncclCommInitRank` fails here because that runtime requires a newer driver;
 - `/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2`
-  reports `2.28.3+cuda12.9` and is the compatible runtime used by tests. The
-  code is compiled against the system 2.29.7 headers and uses stable APIs only.
+  reports `2.28.3+cuda12.9` and remains the default runtime used by frozen
+  single-node tests;
+- the official `libnccl2_2.29.7-1+cuda12.9_amd64.deb` works without a system
+  install when extracted into a repository-external cache. Its SHA-256 is
+  `be1e9f1246394cb5a33df2b9f1d687b558b83fe2eec18caf9f82a11aeab3fc5f`.
+  The code is compiled against the system 2.29.7 headers.
 - `/usr/include/nccl_device/gin.h` (2.29.7) exposes GIN put, remote indexed/VA
   signals, local counters, flush/wait, and `ncclTeamRail`. The selected 2.28.3
   runtime does not export `ncclGinOutboxCreateRequirement` or
-  `ncclGinInboxA2ACreateRequirement`; the project reports `gin_usable=0` and
-  never launches that backend.
+  `ncclGinInboxA2ACreateRequirement`. The explicitly loaded CUDA 12.9 NCCL
+  2.29.7 exports the complete required set and passes real two-host
+  device-communicator/window initialization. Since the data-plane backend is
+  not implemented yet, the project reports
+  `gin_backend_implemented=0, gin_usable=0`.
 - all 64 entries of the local 8x8 CUDA peer-access matrix are enabled. The
   corrected 64 MiB probe uses multi-block completion, last-block signaling and
   independent destination-stream validation; its early-signal negative seam is
@@ -143,6 +150,41 @@ NCCL_DEBUG=WARN LD_LIBRARY_PATH="$NCCL12" \
     --expert-body te-grouped-mlp --gate-mode fixed-random \
     --warmups 10 --iterations 100 --runs 3
 ```
+
+### Repository-external NCCL 2.29.7 CUDA 12.9 GIN runtime
+
+The compatible runtime is downloaded and extracted, never installed globally
+and never committed:
+
+```bash
+NCCL_GIN_CACHE=/absolute/path/outside/MegaMOE/nccl-2.29.7-cuda12.9
+mkdir -p "$NCCL_GIN_CACHE/packages" "$NCCL_GIN_CACHE/root"
+(cd "$NCCL_GIN_CACHE/packages" && \
+  apt-get download 'libnccl2=2.29.7-1+cuda12.9')
+sha256sum "$NCCL_GIN_CACHE/packages/libnccl2_2.29.7-1+cuda12.9_amd64.deb"
+dpkg-deb -x \
+  "$NCCL_GIN_CACHE/packages/libnccl2_2.29.7-1+cuda12.9_amd64.deb" \
+  "$NCCL_GIN_CACHE/root"
+
+NCCL_GIN_LIB="$NCCL_GIN_CACHE/root/usr/lib/x86_64-linux-gnu"
+env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
+  python3 tests/run_multinode_nccl.py \
+    --binary "$PWD/build/test_cuda_notify" \
+    --remote root@10.10.19.233 --port 2222 \
+    --remote-binary "$PWD/build/test_cuda_notify" \
+    --gpus-per-node 1 --scenario gin_probe \
+    --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
+
+# Repeat with --gpus-per-node 8 for the complete 16-rank rail team.
+```
+
+The observed world-2 and world-16 result on both hosts is
+`compiled=22907, runtime=22907, headers=1, symbols=1,
+runtime_initializable=1`. The probe collectively creates a GIN-requiring
+`ncclDevComm`, allocates symmetric storage with `ncclMemAlloc`, registers and
+deregisters a strict-ordering NCCL window, and destroys the device comm. It
+does not claim data-plane usability: until MegaMOE put/signal kernels exist,
+`gin_backend_implemented=0` and `gin_usable=0`.
 
 The CUDA build reads DeepGEMM headers from `DEEPGEMM_INCLUDE_DIR` (defaulting
 to the adjacent reference checkout) and discovers the installed DeepGEMM

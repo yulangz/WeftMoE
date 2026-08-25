@@ -1571,8 +1571,6 @@ void test_device_only_sanitizer_paths() {
       megamoe::cuda::probe_activation_transport_capability(2);
   require(capability.nccl_device_headers &&
               capability.gin_headers_available &&
-              !capability.gin_symbols_present &&
-              !capability.gin_runtime_initializable &&
               !capability.gin_backend_implemented && !capability.gin_usable,
           "GIN header/runtime capability boundary was not detected");
   require(megamoe::cuda::testing::run_local_p2p_put_signal_probe(0, 1, 4096),
@@ -2397,6 +2395,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "multinode-exec-" + std::to_string(rank), local_rank);
   auto base = megamoe::cuda::make_nccl_session(
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
+  if (scenario == "gin_probe") {
+    const auto capability =
+        megamoe::cuda::probe_activation_transport_capability(base, execution);
+    std::cout << "GIN_DISTRIBUTED_PROBE rank=" << rank
+              << " world=" << world
+              << " headers=" << capability.gin_headers_available
+              << " symbols=" << capability.gin_symbols_present
+              << " runtime_initializable="
+              << capability.gin_runtime_initializable
+              << " backend_implemented="
+              << capability.gin_backend_implemented
+              << " usable=" << capability.gin_usable
+              << " reason=" << capability.gin_unavailable_reason
+              << std::endl;
+    return;
+  }
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution,
       {common_config, max_tokens, 4096,

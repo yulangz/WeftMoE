@@ -343,7 +343,8 @@ def parse_args(argv=None):
         choices=("valid", "out_of_range", "duplicate", "max_mismatch",
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
-                 "expert_capacity_mismatch", "workspace_capacity_mismatch"),
+                 "expert_capacity_mismatch", "workspace_capacity_mismatch",
+                 "gin_probe"),
         default="valid",
     )
     args = parser.parse_args(argv)
@@ -452,6 +453,30 @@ def main(argv=None):
             )
         runtime_lines.append(evidence[0])
     print("\n".join(runtime_lines))
+
+    if args.scenario == "gin_probe":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("GIN_DISTRIBUTED_PROBE ")]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}, "
+                    f"evidence={len(lines)}; stdout={result.stdout[-4000:]}; "
+                    f"stderr={result.stderr[-4000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN probe failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        initializable = all("runtime_initializable=1" in line
+                            for line in evidence)
+        print(f"[PASS] distributed GIN lifecycle probe world={world} "
+              f"runtime_initializable={int(initializable)}")
+        return
 
     if args.scenario != "valid":
         errors = []

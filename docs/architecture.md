@@ -645,10 +645,14 @@ block fences and signals. A destination kernel on an independent stream waits
 only on that signal and validates the whole payload before the source stream is
 synchronized. Its early-signal negative seam must observe corruption.
 
-GIN capability has five independent booleans: headers, full symbols, minimal
-runtime initialization, project backend implementation, and usable. Usable is
-their conjunction. The selected 2.28.3 runtime fails the symbol gate and this
-phase intentionally has no GIN implementation. Socket fallback is also absent.
+GIN capability has five independent booleans: headers, full symbols,
+distributed runtime initialization, project backend implementation, and
+usable. Usable is their conjunction. The default 2.28.3 runtime fails the
+symbol gate. The explicitly loaded NCCL 2.29.7 CUDA 12.9 runtime passes
+world-2/world-16 device-communicator and registered-window initialization, but
+the data-plane backend is not implemented yet; therefore `gin_usable` remains
+false. The session probe is collective and returns no native NCCL/CUDA handle.
+Socket fallback is also absent at this checkpoint.
 Neither can be confused with the real one-node CUDA IPC backend.
 
 ### Backward ownership and dataflow

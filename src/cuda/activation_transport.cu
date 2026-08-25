@@ -8354,8 +8354,11 @@ ActivationTransportCapability probe_activation_transport_capability(
       "ncclCommQueryProperties",
       "ncclDevCommCreate",
       "ncclDevCommDestroy",
+      "ncclMemAlloc",
+      "ncclMemFree",
       "ncclCommWindowRegister",
       "ncclCommWindowDeregister",
+      "ncclGetPeerDevicePointer",
       "ncclTeamRail",
       "ncclGinOutboxCreateRequirement",
       "ncclGinInboxA2ACreateRequirement",
@@ -8383,6 +8386,8 @@ ActivationTransportCapability probe_activation_transport_capability(
     using WindowRegisterFn = ncclResult_t (*)(ncclComm_t, void *, std::size_t,
                                                ncclWindow_t *, int);
     using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+    using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
+    using MemFreeFn = ncclResult_t (*)(void *);
     const auto query_properties = reinterpret_cast<QueryPropertiesFn>(
         dlsym(RTLD_DEFAULT, "ncclCommQueryProperties"));
     const auto dev_comm_create = reinterpret_cast<DevCommCreateFn>(
@@ -8393,6 +8398,10 @@ ActivationTransportCapability probe_activation_transport_capability(
         dlsym(RTLD_DEFAULT, "ncclCommWindowRegister"));
     const auto window_deregister = reinterpret_cast<WindowDeregisterFn>(
         dlsym(RTLD_DEFAULT, "ncclCommWindowDeregister"));
+    const auto mem_alloc = reinterpret_cast<MemAllocFn>(
+        dlsym(RTLD_DEFAULT, "ncclMemAlloc"));
+    const auto mem_free = reinterpret_cast<MemFreeFn>(
+        dlsym(RTLD_DEFAULT, "ncclMemFree"));
     ncclComm_t probe_comm = nullptr;
     ncclDevComm_t dev_comm{};
     ncclWindow_t window = nullptr;
@@ -8437,10 +8446,10 @@ ActivationTransportCapability probe_activation_transport_capability(
                        ncclGetErrorString(nccl_result);
         } else {
           dev_comm_created = true;
-          const auto cuda_result = cudaMalloc(&allocation, 4096);
-          if (cuda_result != cudaSuccess) {
-            init_error = std::string("cudaMalloc(window): ") +
-                         cudaGetErrorString(cuda_result);
+          nccl_result = mem_alloc(&allocation, 4096);
+          if (nccl_result != ncclSuccess) {
+            init_error = std::string("ncclMemAlloc(window): ") +
+                         ncclGetErrorString(nccl_result);
           } else {
             nccl_result = window_register(
                 probe_comm, allocation, 4096, &window,
@@ -8457,7 +8466,7 @@ ActivationTransportCapability probe_activation_transport_capability(
     if (window)
       (void)window_deregister(probe_comm, window);
     if (allocation)
-      (void)cudaFree(allocation);
+      (void)mem_free(allocation);
     if (dev_comm_created)
       (void)dev_comm_destroy(probe_comm, &dev_comm);
     if (probe_comm)
@@ -8510,6 +8519,130 @@ ActivationTransportCapability probe_activation_transport_capability(
     if (cudaGetDeviceProperties(&properties, 0) == cudaSuccess)
       result.system_scope_atomics = properties.major >= 6;
   }
+  return result;
+}
+
+ActivationTransportCapability probe_activation_transport_capability(
+    const NcclSession &session, const CudaExecution &execution) {
+  const auto nccl = internal::NcclSessionAccess::checked(session);
+  const auto cuda = internal::checked_execution_state(execution);
+  if (nccl->device != cuda->device)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "gin-distributed-probe",
+                    "device", nccl->rank, std::to_string(nccl->device),
+                    std::to_string(cuda->device));
+
+  auto result = probe_activation_transport_capability(nccl->world);
+  // The world=1 probe above is useful for loader diagnostics but cannot prove
+  // that a rail GIN team can be formed.  Replace only its initialization
+  // result with the collective probe below.
+  result.gin_runtime_initializable = false;
+  result.gin_backend_implemented = false;
+  result.gin_usable = false;
+  result.gin_unavailable_reason.clear();
+
+#if __has_include(<nccl_device/core.h>)
+  if (result.gin_headers_available && result.gin_symbols_present) {
+    using QueryPropertiesFn = ncclResult_t (*)(ncclComm_t,
+                                                ncclCommProperties_t *);
+    using DevCommCreateFn = ncclResult_t (*)(
+        ncclComm_t, const ncclDevCommRequirements_t *, ncclDevComm_t *);
+    using DevCommDestroyFn = ncclResult_t (*)(ncclComm_t,
+                                               const ncclDevComm_t *);
+    using WindowRegisterFn = ncclResult_t (*)(ncclComm_t, void *, std::size_t,
+                                               ncclWindow_t *, int);
+    using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+    using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
+    using MemFreeFn = ncclResult_t (*)(void *);
+    const auto query_properties = reinterpret_cast<QueryPropertiesFn>(
+        dlsym(RTLD_DEFAULT, "ncclCommQueryProperties"));
+    const auto dev_comm_create = reinterpret_cast<DevCommCreateFn>(
+        dlsym(RTLD_DEFAULT, "ncclDevCommCreate"));
+    const auto dev_comm_destroy = reinterpret_cast<DevCommDestroyFn>(
+        dlsym(RTLD_DEFAULT, "ncclDevCommDestroy"));
+    const auto window_register = reinterpret_cast<WindowRegisterFn>(
+        dlsym(RTLD_DEFAULT, "ncclCommWindowRegister"));
+    const auto window_deregister = reinterpret_cast<WindowDeregisterFn>(
+        dlsym(RTLD_DEFAULT, "ncclCommWindowDeregister"));
+    const auto mem_alloc = reinterpret_cast<MemAllocFn>(
+        dlsym(RTLD_DEFAULT, "ncclMemAlloc"));
+    const auto mem_free = reinterpret_cast<MemFreeFn>(
+        dlsym(RTLD_DEFAULT, "ncclMemFree"));
+
+    ncclCommProperties_t properties{};
+    properties.size = sizeof(properties);
+    properties.magic = NCCL_API_MAGIC;
+    properties.version = NCCL_VERSION_CODE;
+    ncclDevCommRequirements_t requirements{};
+    requirements.size = sizeof(requirements);
+    requirements.magic = NCCL_API_MAGIC;
+    requirements.version = NCCL_VERSION_CODE;
+    ncclDevComm_t dev_comm{};
+    ncclWindow_t window = nullptr;
+    void *allocation = nullptr;
+    bool dev_comm_created = false;
+    std::string error;
+
+    auto nccl_result = query_properties(nccl->comm, &properties);
+    if (nccl_result != ncclSuccess) {
+      error = std::string("ncclCommQueryProperties: ") +
+              ncclGetErrorString(nccl_result);
+    } else if (properties.ginType == NCCL_GIN_TYPE_NONE &&
+               properties.railedGinType == NCCL_GIN_TYPE_NONE) {
+      error = "ncclCommQueryProperties: no GIN context type";
+    } else {
+      requirements.ginContextCount = 1;
+      requirements.ginExclusiveContexts = true;
+      requirements.ginQueueDepth = 32;
+      requirements.ginSignalCount = 4;
+      requirements.ginConnectionType =
+          properties.railedGinType != NCCL_GIN_TYPE_NONE
+              ? NCCL_GIN_CONNECTION_RAIL
+              : NCCL_GIN_CONNECTION_FULL;
+      nccl_result = dev_comm_create(nccl->comm, &requirements, &dev_comm);
+      if (nccl_result != ncclSuccess) {
+        error = std::string("ncclDevCommCreate(GIN): ") +
+                ncclGetErrorString(nccl_result);
+      } else {
+        dev_comm_created = true;
+        nccl_result = mem_alloc(&allocation, 4096);
+        if (nccl_result != ncclSuccess) {
+          error = std::string("ncclMemAlloc(window): ") +
+                  ncclGetErrorString(nccl_result);
+        } else {
+          nccl_result = window_register(nccl->comm, allocation, 4096, &window,
+                                        NCCL_WIN_STRICT_ORDERING);
+          if (nccl_result != ncclSuccess)
+            error = std::string("ncclCommWindowRegister: ") +
+                    ncclGetErrorString(nccl_result);
+          else
+            result.gin_runtime_initializable = true;
+        }
+      }
+    }
+    if (window != nullptr)
+      (void)window_deregister(nccl->comm, window);
+    if (allocation != nullptr)
+      (void)mem_free(allocation);
+    if (dev_comm_created)
+      (void)dev_comm_destroy(nccl->comm, &dev_comm);
+    if (!result.gin_runtime_initializable)
+      result.gin_unavailable_reason = std::move(error);
+  }
+#endif
+
+  std::ostringstream message;
+  message << "GIN distributed probe: headers="
+          << result.gin_headers_available << ", symbols="
+          << result.gin_symbols_present << ", runtime_initializable="
+          << result.gin_runtime_initializable << ", backend_implemented="
+          << result.gin_backend_implemented << ", rank=" << nccl->rank
+          << ", world=" << nccl->world << ", compiled_nccl="
+          << result.compiled_nccl_version << ", runtime_nccl="
+          << result.runtime_nccl_version;
+  if (!result.gin_unavailable_reason.empty())
+    message << ", initialization_error=" << result.gin_unavailable_reason;
+  result.gin_unavailable_reason = message.str();
   return result;
 }
 

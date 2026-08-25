@@ -587,6 +587,13 @@ struct ActivationTransportCapability {
 ActivationTransportCapability probe_activation_transport_capability(
     std::uint32_t world_size);
 
+// Run the device-communicator/window portion of the GIN capability probe on
+// an already established communicator.  Window registration is collective,
+// so every rank in `session` must call this overload in the same order.  The
+// returned value contains no native NCCL/CUDA handles.
+ActivationTransportCapability probe_activation_transport_capability(
+    const NcclSession &session, const CudaExecution &execution);
+
 namespace testing {
 BFloat16ActivationLease upload_bfloat16_activations_for_testing(
     const std::vector<transport::BFloat16> &host,

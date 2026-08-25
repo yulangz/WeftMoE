@@ -330,11 +330,13 @@ The NCCL-free `--backward-sanitizer` harness executes the exact production
 Forward and Backward kernels with an initialized world-1 fixture. It is part of
 `make cuda-sanitizer-smoke` for memcheck, racecheck, and initcheck.
 
-The GIN probe reports headers, the full required symbol set, runtime minimal
-initialization, backend implementation, and usability independently. The
-2.29.7 headers contain `ncclGin` APIs, but the compatible 2.28.3 runtime lacks
-the first required symbol (`ncclCommQueryProperties` in the observed load), and
-the backend is deliberately not implemented; consequently `gin_usable=0`.
+The GIN probe reports headers, the full required symbol set, distributed
+runtime initialization, backend implementation, and usability independently.
+The default NCCL 2.28.3 runtime lacks the required lifecycle symbols. An
+official NCCL 2.29.7 CUDA 12.9 package, explicitly loaded from a repository-
+external cache, has passed real two-host world-2 and world-16 device-comm plus
+collective registered-window lifecycle probes. The data-plane backend is not
+implemented yet; consequently `gin_backend_implemented=0, gin_usable=0`.
 `NcclSocketFallback` and `Gin` have no production constructor and cannot be
 selected by passing an enum. Simulation, local P2P, Socket, and GIN audit labels
 therefore cannot be forged by the caller.
