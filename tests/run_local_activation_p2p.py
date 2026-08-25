@@ -470,6 +470,13 @@ def main():
                         item.get("route_case") != args.backward_route_case):
                     raise AssertionError(
                         f"rank={rank} invalid backward smoke audit: {item}")
+                if args.world == 1 and any(
+                        item.get(field) != "1" for field in
+                        ("mutation_dx", "mutation_dw1", "mutation_dw2",
+                         "mutation_dgate")):
+                    raise AssertionError(
+                        f"rank={rank} incomplete gradient mutation audit: "
+                        f"{item}")
                 observed.append(item)
                 continue
             if args.backward_cache_pool2_validation:
@@ -516,6 +523,19 @@ def main():
                        int(item["dw2_tasks"]) == 0 for item in observed):
                     raise AssertionError(
                         "empty-expert zero-store tasks were not completed")
+                if args.backward_route_case == "concentrated":
+                    for rank, item in enumerate(observed[1:], start=1):
+                        if (item.get("empty_zero_nonzero_dw1") != "0" or
+                                item.get("empty_zero_nonzero_dw2") != "0" or
+                                item.get("empty_zero_dw1_expected") !=
+                                item.get("empty_zero_dw1_completed") or
+                                item.get("empty_zero_dw2_expected") !=
+                                item.get("empty_zero_dw2_completed") or
+                                int(item.get("empty_zero_check_repeats", "0"))
+                                < min(args.backward_smoke_repeats, 2)):
+                            raise AssertionError(
+                                f"rank={rank} incomplete empty-expert full "
+                                f"zero audit: {item}")
             if args.backward_route_case == "zero-rank":
                 if observed[-1]["local_tokens"] != "0":
                     raise AssertionError("zero-token rank was not exercised")
@@ -531,7 +551,10 @@ def main():
                     sort_keys=True))
             print(f"[PASS] LocalCudaP2p Backward MegaKernel world={args.world} "
                   "single-launch WGMMA/TMA cache/no-cache smoke "
-                  f"rank0_dx_hash={observed[0]['dx_hash']}")
+                  f"rank0_dx_hash={observed[0]['dx_hash']} "
+                  f"rank0_dw1_hash={observed[0]['dw1_hash']} "
+                  f"rank0_dw2_hash={observed[0]['dw2_hash']} "
+                  f"rank0_dgate_hash={observed[0]['dgate_hash']}")
             return
         if args.backward_cache_pool2_validation:
             required = ("disjoint", "first_stable", "second_stable",
@@ -549,14 +572,20 @@ def main():
             return
         if benchmark_mode:
             if args.backward_benchmark:
-                stage_keys = ("wall", "notify", "forward", "backward",
+                stage_keys = ("wall", "forward_backward_wall", "notify",
+                              "forward", "backward",
                               "dy_dispatch", "dv", "dgate", "transpose",
                               "dx", "dw1", "dw2",
                               "dw1_ready_wait", "dw2_ready_wait",
                               "dw1_max_expert_wait", "dw2_max_expert_wait",
                               "dw1_tail", "dw2_tail",
                               "dw1_overlap_dv_dx", "dw2_overlap_dv_dx",
-                              "reduce")
+                              "reduce", "forward_call_host", "dy_ready_host",
+                              "backward_call_host", "integration_overhead",
+                              "forward_backward_handoff",
+                              "backward_setup_host",
+                              "forward_consumer_drain",
+                              "final_consumer_drain")
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=
                             "sm90-wgmma-tma-7168x3072" or

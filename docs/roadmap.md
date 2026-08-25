@@ -132,15 +132,16 @@ correctness blockers.
   dW1 now uses an outer producer/two-consumer WGMMA pipeline, an STSM BF16
   epilogue, and four 128x64 TMA stores. Deterministic grid-stride ownership for
   the uniform main-shape dW1 and dX tiles removes their global claim atomics.
-  Three independent 10-warmup/100-sample local 8-GPU runs after the
-  empty-expert fix measured Backward means of `28.640`, `28.636`, and `28.718`
-  ms. Matching Megatron native means were `33.772`, `33.873`, and `33.935` ms,
-  giving `15.20%`, `15.46%`, and `15.38%` improvements. dW1 averaged
-  `6.764`--`6.789` ms and dX `7.901`--`7.959` ms. Cache-mode
-  Forward+Backward was `45.327`, `45.367`, and `45.461` ms versus Megatron's
-  `54.175`, `54.263`, and `54.263` ms (`16.22%`--`16.39%` faster). Standalone
-  cache-Forward means were `15.911`, `15.892`, and `15.894` ms, within the
-  frozen Forward budget.
+  Three independent 10-warmup/100-sample local 8-GPU runs with the owning
+  event handoff measured Backward means of `28.705`, `28.688`, and `28.736`
+  ms. Matching Megatron native means were `33.828`, `33.890`, and `33.907` ms,
+  giving `15.14%`, `15.35%`, and `15.25%` improvements. True same-generation
+  cache Forward+Backward wall means, measured from completed Notify through the
+  final Backward drain, were `45.557`, `45.543`, and `45.580` ms versus
+  Megatron's `54.207`, `54.240`, and `54.264` ms (`15.96%`, `16.03%`, and
+  `16.00%` faster). The device event handoff itself was `0.114`--`0.119` ms;
+  total integration boundary overhead was `0.141`--`0.148` ms. Standalone
+  cache Forward averaged `15.879` ms, within the frozen Forward budget.
 
   Reserving 1, 2, or 4 CTAs for early dW produced `29.263`, `29.023`, and
   `29.021` ms Backward in the directed short search, all slower than the

@@ -2191,12 +2191,17 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                             ? static_cast<std::uint32_t>(std::stoul(
                                   std::getenv("MEGAMOE_BACKWARD_BENCH_ROUNDS")))
                             : 110U;
-    std::vector<double> wall, notify_samples, forward_samples,
+    std::vector<double> wall, forward_backward_wall_samples, notify_samples,
+        forward_samples,
         backward_samples, dy_dispatch_samples, dv_samples, dx_samples,
         dw1_samples, dw2_samples, reduce_samples, dgate_samples,
         transpose_samples, dw1_wait_samples, dw2_wait_samples,
         dw1_max_wait_samples, dw2_max_wait_samples, dw1_tail_samples,
-        dw2_tail_samples, dw1_overlap_samples, dw2_overlap_samples;
+        dw2_tail_samples, dw1_overlap_samples, dw2_overlap_samples,
+        forward_call_host_samples, dy_ready_host_samples,
+        backward_call_host_samples, integration_overhead_samples,
+        handoff_samples, backward_setup_host_samples,
+        forward_drain_host_samples, final_drain_host_samples;
     megamoe::cuda::BackwardMegaKernelAudit last_audit;
     megamoe::cuda::SelectedOutputGradientLease dy_storage;
     megamoe::cuda::BackwardStorageHashes gradient_hashes;
@@ -2369,6 +2374,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto notify_end = Clock::now();
       megamoe::cuda::ActivationTransportRunOptions options;
       options.deadline_after = std::chrono::seconds(300);
+      options.defer_forward_completion_to_backward = cache_mode;
+      const auto forward_call_begin = Clock::now();
       auto forward_handle = forward.run(
           notify.dispatch(), activations, weights,
           {hidden, intermediate,
@@ -2376,6 +2383,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                ? megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput
                : megamoe::cuda::ForwardCacheMode::NoFc1OutputCache},
           options);
+      const auto forward_call_end = Clock::now();
+      const auto dy_ready_begin = Clock::now();
       auto dy = dy_storage
                     ? megamoe::cuda::testing_reissue_output_gradient_for_benchmark(
                           forward_handle, dy_storage, execution)
@@ -2383,11 +2392,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                           forward_handle, dy_host, execution);
       if (!dy_storage)
         dy_storage = dy;
+      const auto dy_ready_end = Clock::now();
+      const auto backward_call_begin = Clock::now();
       auto backward_handle = backward.run(
           forward_handle, dy,
           {hidden, intermediate,
            megamoe::cuda::BackwardWeightGradientDType::BFloat16},
           options);
+      const auto backward_call_end = Clock::now();
       if (validation_repeat) {
         const auto hashes =
             megamoe::cuda::testing::hash_backward_storage_for_validation(
@@ -2409,6 +2421,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       if (!validation_repeat && repeat >= 10U) {
         wall.push_back(
             std::chrono::duration<double, std::micro>(end - begin).count());
+        forward_backward_wall_samples.push_back(
+            std::chrono::duration<double, std::micro>(end - notify_end)
+                .count());
         notify_samples.push_back(std::chrono::duration<double, std::micro>(
                                      notify_end - begin).count());
         forward_samples.push_back(forward_handle.timings().total_us);
@@ -2438,6 +2453,29 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             backward_handle.timings().dw2_overlap_dv_dx_us);
         reduce_samples.push_back(
             backward_handle.timings().dx_combine_reduce_us);
+        forward_call_host_samples.push_back(
+            std::chrono::duration<double, std::micro>(forward_call_end -
+                                                       forward_call_begin)
+                .count());
+        dy_ready_host_samples.push_back(
+            std::chrono::duration<double, std::micro>(dy_ready_end -
+                                                       dy_ready_begin)
+                .count());
+        backward_call_host_samples.push_back(
+            std::chrono::duration<double, std::micro>(backward_call_end -
+                                                       backward_call_begin)
+                .count());
+        integration_overhead_samples.push_back(std::max(
+            0.0, wall.back() - notify_samples.back() -
+                     forward_samples.back() - backward_samples.back()));
+        handoff_samples.push_back(
+            backward_handle.timings().forward_to_backward_handoff_us);
+        backward_setup_host_samples.push_back(
+            backward_handle.timings().backward_setup_to_launch_host_us);
+        forward_drain_host_samples.push_back(
+            backward_handle.timings().forward_consumer_drain_host_us);
+        final_drain_host_samples.push_back(
+            backward_handle.timings().final_consumer_drain_host_us);
       }
     }
     (void)unsetenv("MEGAMOE_BACKWARD_CAPTURE_HASH");
@@ -2489,6 +2527,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " dw_dtype=bf16"
               << " steady_forbidden_cuda_api_calls=0 wall=";
     emit(wall); std::cout << " notify="; emit(notify_samples);
+    std::cout << " forward_backward_wall=";
+    emit(forward_backward_wall_samples);
     std::cout << " forward="; emit(forward_samples);
     std::cout << " backward="; emit(backward_samples);
     std::cout << " dy_dispatch="; emit(dy_dispatch_samples);
@@ -2507,6 +2547,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::cout << " dw1_overlap_dv_dx="; emit(dw1_overlap_samples);
     std::cout << " dw2_overlap_dv_dx="; emit(dw2_overlap_samples);
     std::cout << " reduce="; emit(reduce_samples);
+    std::cout << " forward_call_host="; emit(forward_call_host_samples);
+    std::cout << " dy_ready_host="; emit(dy_ready_host_samples);
+    std::cout << " backward_call_host="; emit(backward_call_host_samples);
+    std::cout << " integration_overhead="; emit(integration_overhead_samples);
+    std::cout << " forward_backward_handoff="; emit(handoff_samples);
+    std::cout << " backward_setup_host="; emit(backward_setup_host_samples);
+    std::cout << " forward_consumer_drain="; emit(forward_drain_host_samples);
+    std::cout << " final_consumer_drain="; emit(final_drain_host_samples);
     std::cout << std::endl;
     return;
   }
@@ -3005,6 +3053,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     megamoe::cuda::ActivationTransportRunOptions options;
     options.deadline_after = std::chrono::seconds(300);
     megamoe::cuda::BackwardMegaKernelAudit last_smoke_audit;
+    std::array<bool, 4> mutation_validated{};
+    megamoe::cuda::testing::EmptyExpertGradientZeroCheck empty_zero_check{};
+    std::uint32_t empty_zero_check_repeats = 0;
     const auto run_mode = [&](megamoe::cuda::ForwardCacheMode mode,
                               std::uint64_t exact_generation) {
       const auto smoke_trace =
@@ -3066,23 +3117,70 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto hashes =
           megamoe::cuda::testing::hash_backward_storage_for_validation(
               backward_handle, execution);
+      const auto smoke_route_case =
+          std::getenv("MEGAMOE_BACKWARD_ROUTE_CASE")
+              ? std::getenv("MEGAMOE_BACKWARD_ROUTE_CASE")
+              : "regular";
+      if (std::string(smoke_route_case) == "concentrated" && rank != 0U &&
+          (exact_generation == 901U || exact_generation == 902U)) {
+        empty_zero_check =
+            megamoe::cuda::testing::check_empty_expert_gradients_for_validation(
+                backward_handle, 0U, execution);
+        require(empty_zero_check.dw1_nonzero_elements == 0U &&
+                    empty_zero_check.dw2_nonzero_elements == 0U &&
+                    empty_zero_check.dw1_zero_store_tasks_completed ==
+                        empty_zero_check.dw1_zero_store_tasks_expected &&
+                    empty_zero_check.dw2_zero_store_tasks_completed ==
+                        empty_zero_check.dw2_zero_store_tasks_expected,
+                "empty local expert full dW interval is not actual zero");
+        ++empty_zero_check_repeats;
+      }
       if (world == 1U && exact_generation == 901U) {
         const auto original = hashes;
-        megamoe::cuda::testing::flip_backward_dx_byte_for_validation(
-            backward_handle, 17U, execution);
-        const auto mutated =
-            megamoe::cuda::testing::hash_backward_storage_for_validation(
-                backward_handle, execution);
-        require(original.dx.low != mutated.dx.low ||
-                    original.dx.high != mutated.dx.high,
-                "actual gradient byte flip did not change dX hash");
-        megamoe::cuda::testing::flip_backward_dx_byte_for_validation(
-            backward_handle, 17U, execution);
-        hashes = megamoe::cuda::testing::hash_backward_storage_for_validation(
-            backward_handle, execution);
-        require(original.dx.low == hashes.dx.low &&
-                    original.dx.high == hashes.dx.high,
-                "restoring actual gradient byte did not restore dX hash");
+        using Field = megamoe::cuda::testing::BackwardStorageField;
+        constexpr std::array<Field, 4> fields{
+            Field::Dx, Field::Dw1, Field::Dw2, Field::DGate};
+        const auto select_hash = [](const auto &all, Field field)
+            -> const megamoe::cuda::DeviceStorageHash128 & {
+          switch (field) {
+          case Field::Dx: return all.dx;
+          case Field::Dw1: return all.dw1;
+          case Field::Dw2: return all.dw2;
+          case Field::DGate: return all.dgate;
+          }
+          return all.dx;
+        };
+        for (std::size_t field_index = 0; field_index < fields.size();
+             ++field_index) {
+          megamoe::cuda::testing::flip_backward_storage_byte_for_validation(
+              backward_handle, fields[field_index], 1U, execution);
+          const auto mutated =
+              megamoe::cuda::testing::hash_backward_storage_for_validation(
+                  backward_handle, execution);
+          for (const auto candidate : fields) {
+            const auto &before = select_hash(original, candidate);
+            const auto &after = select_hash(mutated, candidate);
+            const bool changed = before.low != after.low ||
+                                 before.high != after.high;
+            require(changed == (candidate == fields[field_index]),
+                    "gradient mutation changed the wrong storage hash");
+          }
+          megamoe::cuda::testing::flip_backward_storage_byte_for_validation(
+              backward_handle, fields[field_index], 1U, execution);
+          hashes =
+              megamoe::cuda::testing::hash_backward_storage_for_validation(
+                  backward_handle, execution);
+          const auto restored = [](const auto &left, const auto &right) {
+            return left.low == right.low && left.high == right.high &&
+                   left.element_count == right.element_count;
+          };
+          require(restored(original.dx, hashes.dx) &&
+                      restored(original.dw1, hashes.dw1) &&
+                      restored(original.dw2, hashes.dw2) &&
+                      restored(original.dgate, hashes.dgate),
+                  "restoring gradient byte did not restore all hashes");
+          mutation_validated[field_index] = true;
+        }
       }
       megamoe::cuda::BackwardValidationDownload downloaded;
       if (world == 1U)
@@ -3185,6 +3283,23 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " dw1_hash=" << cache.second.dw1.low
               << " dw2_hash=" << cache.second.dw2.low
               << " dgate_hash=" << cache.second.dgate.low
+              << " mutation_dx=" << mutation_validated[0]
+              << " mutation_dw1=" << mutation_validated[1]
+              << " mutation_dw2=" << mutation_validated[2]
+              << " mutation_dgate=" << mutation_validated[3]
+              << " empty_zero_nonzero_dw1="
+              << empty_zero_check.dw1_nonzero_elements
+              << " empty_zero_nonzero_dw2="
+              << empty_zero_check.dw2_nonzero_elements
+              << " empty_zero_dw1_expected="
+              << empty_zero_check.dw1_zero_store_tasks_expected
+              << " empty_zero_dw1_completed="
+              << empty_zero_check.dw1_zero_store_tasks_completed
+              << " empty_zero_dw2_expected="
+              << empty_zero_check.dw2_zero_store_tasks_expected
+              << " empty_zero_dw2_completed="
+              << empty_zero_check.dw2_zero_store_tasks_completed
+              << " empty_zero_check_repeats=" << empty_zero_check_repeats
               << " cache_no_cache_equal=1 persistent_launches=1";
     if (world == 1U && top_k == 1U) {
       constexpr std::array<std::uint64_t, 4> hidden_samples{

@@ -728,6 +728,29 @@ actual dY/dX peer bytes, complete per-rank pool bytes, and fixed-order hashes
 of the complete device dX/dW1/dW2/dGate storage. `gradient_hash_repeats=20`
 means all four hashes were byte-stable for twenty independent generations.
 
+The same benchmark now reports `forward_backward_wall_ms` from the completed
+Notify boundary through the final Backward drain, plus
+`forward_to_backward_handoff_ms`, `backward_setup_host_ms`,
+`forward_consumer_drain_ms`, and `integration_overhead_ms`. Do not infer the
+integrated result by adding independent stage means: the old outer host wall
+also included Notify and therefore made about 2.3 ms look like handoff cost.
+The measured event handoff is about 0.11--0.12 ms and the complete boundary
+overhead is about 0.14--0.15 ms.
+
+The full world-2 production Forward+Backward racecheck command is:
+
+```bash
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  python3 tests/run_local_activation_p2p.py \
+    --binary build/test_cuda_notify --world 2 --backward-smoke \
+    --backward-cache --top-k 6 --backward-smoke-repeats 1 \
+    --compute-sanitizer-tool racecheck --timeout 600
+```
+
+The former hazard mapped to Forward SASS offsets `+0x1c6b0/+0x1c730`: a
+thread-0-only return-row scalar had been placed in cluster shared memory. It is
+now a thread-local scalar; the command must report zero errors and hazards.
+
 ## Clean export
 
 After committing, verify without ignored build state:

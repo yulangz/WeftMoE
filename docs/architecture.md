@@ -660,6 +660,14 @@ session, generation, device, execution and Forward slot; a
 backend team. Consequently A/B checkpoints, canonical X, transient gradients
 and returned dX cannot be recycled while any Backward result remains live.
 
+The integrated cache path keeps that ownership chain asynchronous. Forward
+records pooled `output_ready` and `complete` events and returns an owning,
+pending handle; Backward waits on `output_ready` in its CUDA stream and retains
+the Forward consumer until the final Backward completion drain. There is no
+intermediate host stream synchronization, cache release/reacquire, repeated
+Notify, or route/metadata rebuild. Public Forward audit access remains checked
+and rejects a pending handle until this handoff reaches its terminal state.
+
 For the 7168x3072 specialization one cooperative kernel executes dY peer put,
 dV, source gate multiplication, SwiGLU backward, dX, dW2/dW1, peer dX/dGate
 return, and top-k reduction. Cache mode consumes the Forward BF16 A/B planes;
@@ -688,6 +696,11 @@ Each slot also owns a small mapped progress page. The kernel writes it only
 when timeout diagnostics are explicitly enabled; after 30 seconds the host may
 dump Forward terminal epoch, Backward phase counters and per-expert row state.
 This is observation only and never participates in the completion predicate.
+In debug-validation builds, Forward also clears the exact FC1/FC2 claim domain
+at generation setup. Backward legitimately reuses that arena as prefix scratch;
+without the generation-local clear, a scratch offset equal to the next epoch
+could be mistaken for an already-claimed task and prevent terminal progress.
+The clear is grid-stride parallel and is compiled out of the release path.
 Complete-gradient validation hashes are computed on device with fixed chunk
 and reduction order. Hash results are staged, not gradient tensors. A
 `DeviceBackwardHandle` retains its slot, so two live handles have disjoint

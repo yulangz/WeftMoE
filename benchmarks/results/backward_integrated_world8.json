@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "shape": {"world": 8, "tokens_per_rank": 8192, "experts": 384, "top_k": 6, "hidden": 7168, "intermediate": 3072, "dtype": "bf16", "gate": "source-side-fp32-gate-after"},
+  "measurement": {"independent_sessions": 3, "warmup_per_session": 10, "samples_per_session": 100, "rank_aggregation": "per-iteration-slowest-rank", "forward_backward_boundary": "notify-complete-to-final-backward-consumer-drain"},
+  "megamoe": {
+    "backward_mean_ms": [28.705043, 28.688460, 28.736182],
+    "forward_backward_wall_mean_ms": [45.557494, 45.543490, 45.580136],
+    "forward_backward_handoff_mean_ms": [0.119389, 0.114425, 0.113614],
+    "integration_overhead_mean_ms": [0.147940, 0.141121, 0.143162],
+    "standalone_cache_forward_mean_ms": 15.878864,
+    "steady_forbidden_cuda_api_calls": 0
+  },
+  "megatron_core_0_17_0": {
+    "backward_mean_ms": [33.828213, 33.890388, 33.906982],
+    "forward_backward_mean_ms": [54.207190, 54.239570, 54.264234],
+    "nccl_runtime": "2.28.3",
+    "gemm_backend": "TransformerEngine TEGroupedMLP"
+  },
+  "improvement_percent": {
+    "backward": [15.144668, 15.349273, 15.249956],
+    "forward_backward": [15.956731, 16.032723, 16.003355]
+  },
+  "integration_diagnosis": {"old_apparent_extra_ms": 2.3, "cause": "old outer wall included generation Notify while independent Forward and Backward device intervals did not", "notify_is_reported_separately": true}
+}

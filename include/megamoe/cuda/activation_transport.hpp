@@ -202,6 +202,10 @@ struct ActivationTransportRunOptions {
   // Zero means no deadline. Multi-rank cancellation/deadline must be requested
   // consistently by every healthy rank in the local P2P team.
   std::chrono::microseconds deadline_after{0};
+  // Training-step fast path: enqueue Forward and transfer its completion/cache
+  // lease directly to Backward. The Forward handle remains owning, but audit
+  // and timing access is valid only after Backward completes the handoff.
+  bool defer_forward_completion_to_backward = false;
 };
 
 // A real, node-local, multi-process CUDA IPC backend. Construction exchanges
@@ -431,6 +435,10 @@ enum class BackwardKernelSpecialization : std::uint8_t {
 };
 
 struct BackwardMegaKernelTimings {
+  double forward_to_backward_handoff_us = 0;
+  double backward_setup_to_launch_host_us = 0;
+  double forward_consumer_drain_host_us = 0;
+  double final_consumer_drain_host_us = 0;
   double dy_dispatch_us = 0;
   double dv_swiglu_backward_us = 0;
   double dgate_reduce_us = 0;
@@ -603,10 +611,31 @@ BackwardStorageHashes hash_backward_storage_for_validation(
 BackwardStorageHashes rehash_backward_storage_for_validation(
     const DeviceBackwardHandle &handle, const CudaExecution &execution);
 
-// Corruption sensitivity check for the actual device dX storage. Validation
+enum class BackwardStorageField : std::uint8_t { Dx, Dw1, Dw2, DGate };
+
+// Corruption sensitivity check for actual device gradient storage. Validation
 // only; the offset is measured in bytes and the caller must restore mutations.
+void flip_backward_storage_byte_for_validation(
+    const DeviceBackwardHandle &handle, BackwardStorageField field,
+    std::uint64_t byte_offset, const CudaExecution &execution);
+
+// Compatibility wrapper retained inside the validation namespace.
 void flip_backward_dx_byte_for_validation(
     const DeviceBackwardHandle &handle, std::uint64_t byte_offset,
+    const CudaExecution &execution);
+
+struct EmptyExpertGradientZeroCheck {
+  std::uint64_t dw1_nonzero_elements = 0;
+  std::uint64_t dw2_nonzero_elements = 0;
+  std::uint64_t dw1_zero_store_tasks_expected = 0;
+  std::uint64_t dw1_zero_store_tasks_completed = 0;
+  std::uint64_t dw2_zero_store_tasks_expected = 0;
+  std::uint64_t dw2_zero_store_tasks_completed = 0;
+};
+
+// Scans the complete dW intervals of one known-empty local expert on device.
+EmptyExpertGradientZeroCheck check_empty_expert_gradients_for_validation(
+    const DeviceBackwardHandle &handle, std::uint32_t local_expert,
     const CudaExecution &execution);
 
 // One-time Backward session setup. It builds device-resident W1^T/W2^T and
