@@ -106,12 +106,11 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   return map;
 }
 
-[[maybe_unused]] CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
+CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
                                  std::uint64_t outer,
-                                 std::uint32_t box_inner,
                                  const char *field) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
-      outer > UINT32_MAX || box_inner == 0)
+      outer > UINT32_MAX)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "backward-tma-map", field, 0,
                     "nonzero uint32 dimensions and valid base", "invalid");
@@ -119,12 +118,15 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   const cuuint64_t dims[2] = {inner, outer};
   const cuuint64_t strides[1] = {
       checked_mul(inner, sizeof(transport::BFloat16), field)};
-  const cuuint32_t box[2] = {box_inner, 64U};
+  // MN-major BF16 WGMMA uses 128-byte swizzle atoms: 64 contiguous MN
+  // elements by one 64-row K slice.  A 128-column dW tile is assembled from
+  // two adjacent atoms by the TMA producer below.
+  const cuuint32_t box[2] = {64U, 64U};
   const cuuint32_t element_strides[2] = {1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
       &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,
       element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   if (result != CUDA_SUCCESS) {
     const char *text = nullptr;
@@ -248,20 +250,15 @@ struct Layout {
   std::size_t backward_forward_output = 0;
   std::size_t backward_dy_canonical = 0;
   std::size_t backward_canonical_gate = 0;
-  std::size_t backward_dv = 0;
   std::size_t backward_dab = 0;
   std::size_t backward_recompute_ab = 0;
-  std::size_t backward_u = 0;
-  std::size_t backward_dx_canonical = 0;
   std::size_t backward_dx_return = 0;
   std::size_t backward_dx_combined = 0;
   std::size_t backward_dgate_partial = 0;
   std::size_t backward_dgate_canonical = 0;
   std::size_t backward_dgate = 0;
-  std::size_t backward_dy_transpose = 0;
   std::size_t backward_u_transpose = 0;
   std::size_t backward_dab_transpose = 0;
-  std::size_t backward_x_transpose = 0;
   std::size_t backward_dw1 = 0;
   std::size_t backward_dw2 = 0;
   std::size_t backward_scheduler = 0;
@@ -403,8 +400,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           "backward canonical dY");
       layout.backward_canonical_gate = append(
           cursor, rows, sizeof(float), "backward canonical gate");
-      layout.backward_dv = append(cursor, row_intermediate,
-                                  sizeof(transport::BFloat16), "backward dV");
       layout.backward_dab = append(
           cursor, checked_mul(row_intermediate, 2ULL, "backward dAB"),
           sizeof(transport::BFloat16), "backward dAB");
@@ -412,11 +407,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           cursor, checked_mul(row_intermediate, 2ULL,
                               "backward recompute A/B"),
           sizeof(transport::BFloat16), "backward recompute A/B");
-      layout.backward_u = append(cursor, row_intermediate,
-                                 sizeof(transport::BFloat16), "backward U");
-      layout.backward_dx_canonical = append(
-          cursor, row_hidden, sizeof(transport::BFloat16),
-          "backward canonical dX");
       layout.backward_dx_return = append(
           cursor, route_elements, sizeof(transport::BFloat16),
           "backward dX return");
@@ -443,11 +433,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                               "backward padded reduction rows") +
            63ULL) &
           ~63ULL;
-      layout.backward_dy_transpose = append(
-          cursor, checked_mul(reduction_rows, hidden,
-                              "backward padded dY transpose"),
-          sizeof(transport::BFloat16),
-          "backward dY transpose");
       layout.backward_u_transpose = append(
           cursor, checked_mul(reduction_rows, intermediate,
                               "backward padded U transpose"),
@@ -457,11 +442,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           cursor, checked_mul(reduction_rows, 2ULL * intermediate,
                               "backward padded dAB transpose"),
           sizeof(transport::BFloat16), "backward dAB transpose");
-      layout.backward_x_transpose = append(
-          cursor, checked_mul(reduction_rows, hidden,
-                              "backward padded X transpose"),
-          sizeof(transport::BFloat16),
-          "backward X transpose");
       layout.backward_dw1 = append(
           cursor,
           checked_mul(checked_mul(max_owned_experts, 2ULL * intermediate,
@@ -505,13 +485,11 @@ struct PoolSlot {
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};
   CUtensorMap backward_dy_map{};
-  CUtensorMap backward_dv_map{};
   CUtensorMap backward_dab_map{};
-  CUtensorMap backward_dx_map{};
-  CUtensorMap backward_dy_transpose_map{};
+  CUtensorMap backward_dy_mn_map{};
+  CUtensorMap backward_x_mn_map{};
   CUtensorMap backward_u_transpose_map{};
   CUtensorMap backward_dab_transpose_map{};
-  CUtensorMap backward_x_transpose_map{};
   bool forward_maps_valid = false;
   bool backward_maps_valid = false;
 };
@@ -1885,6 +1863,8 @@ using ForwardMmaWide =
     typename deep_gemm::mma::sm90::BF16MMASelector<256>::type;
 using BackwardDwMma = typename deep_gemm::mma::sm90::BF16MMASelector<
     256, cute::UMMA::Major::MN, cute::UMMA::Major::MN>::type;
+using BackwardDwMixedMma = typename deep_gemm::mma::sm90::BF16MMASelector<
+    256, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
 using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 
 // FC1 consumes the same activation tile twice (the A and B projections of
@@ -2046,9 +2026,18 @@ __device__ void forward_wgmma_wide_tile(
 #pragma unroll
       for (int index = 0; index < ForwardMmaWide::kNumAccum; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      if (iteration != 0U) {
+        deep_gemm::ptx::warpgroup_wait<1>();
+        const auto completed_pipeline = pipeline_iteration + iteration - 1U;
+        if ((threadIdx.x & 31U) == 0U)
+          empty_barriers[completed_pipeline % kStages].arrive();
+      }
+    }
+    if (iterations != 0U) {
       deep_gemm::ptx::warpgroup_wait<0>();
+      const auto final_pipeline = pipeline_iteration + iterations - 1U;
       if ((threadIdx.x & 31U) == 0U)
-        empty_barriers[stage].arrive();
+        empty_barriers[final_pipeline % kStages].arrive();
     }
   }
   __syncthreads();
@@ -2115,6 +2104,28 @@ __device__ void visit_forward_accumulator_wide(float *accum,
 #pragma unroll
   for (std::uint32_t index = 0; index < ForwardMmaWide::kNumAccum / 4U;
        ++index) {
+    const auto column = (lane % 4U) * 2U + index * 8U;
+    callback(warpgroup, row0, column, accum[index * 4U],
+             accum[index * 4U + 1U]);
+    callback(warpgroup, row1, column, accum[index * 4U + 2U],
+             accum[index * 4U + 3U]);
+  }
+}
+
+template <class Callback>
+__device__ void visit_backward_accumulator_tall(float *accum,
+                                                Callback callback) {
+  if (threadIdx.x >= 256U)
+    return;
+  const auto warpgroup = threadIdx.x / 128U;
+  const auto warpgroup_thread = threadIdx.x % 128U;
+  const auto warp = warpgroup_thread / 32U;
+  const auto lane = warpgroup_thread % 32U;
+  const auto row0 = warp * 16U + lane / 4U;
+  const auto row1 = row0 + 8U;
+#pragma unroll
+  for (std::uint32_t index = 0;
+       index < BackwardDwMixedMma::kNumAccum / 4U; ++index) {
     const auto column = (lane % 4U) * 2U + index * 8U;
     callback(warpgroup, row0, column, accum[index * 4U],
              accum[index * 4U + 1U]);
@@ -2754,22 +2765,17 @@ struct BackwardKernelArgs {
   std::size_t direct_headers_offset;
   std::size_t dy_canonical_offset;
   std::size_t canonical_gate_offset;
-  std::size_t dv_offset;
   std::size_t dab_offset;
   std::size_t recompute_ab_offset;
   std::size_t backward_s_offset;
   std::size_t forward_ab_cache_offset;
-  std::size_t u_offset;
-  std::size_t dx_canonical_offset;
   std::size_t dx_return_offset;
   std::size_t dx_combined_offset;
   std::size_t dgate_partial_offset;
   std::size_t dgate_canonical_offset;
   std::size_t dgate_offset;
-  std::size_t dy_transpose_offset;
   std::size_t u_transpose_offset;
   std::size_t dab_transpose_offset;
-  std::size_t x_transpose_offset;
   std::size_t dw1_offset;
   std::size_t dw2_offset;
   std::size_t scheduler_offset;
@@ -2905,6 +2911,103 @@ __device__ __attribute__((unused)) void backward_wgmma_tile(
   pipeline_iteration += iterations;
 }
 
+// dW mixed-major path.  The left operand is emitted by the dV epilogue as a
+// padded [output, canonical-M] K-major matrix.  The right operand stays in its
+// canonical row-major [canonical-M, output] storage and is consumed as
+// MN-major.  Four 64-column TMA atoms form one 256-column B tile; consequently
+// no full dY/X transpose or staging pass is required.
+__device__ void backward_wgmma_dw_k_mn_tile(
+    const CUtensorMap &a_map, const CUtensorMap &b_mn_map,
+    std::uint32_t a_reduction_start, std::uint32_t b_reduction_start,
+    std::uint32_t output_row, std::uint32_t output_column,
+    std::uint32_t reduction, transport::BFloat16 *smem_a_public,
+    transport::BFloat16 *smem_b_public, ForwardBarrier *full_barriers,
+    ForwardBarrier *empty_barriers, float *accum,
+    std::uint32_t &pipeline_iteration) {
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::uint32_t kMathWarpGroups = 2U;
+  constexpr std::uint32_t kAStageElements = 128U * 64U;
+  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  const auto warpgroup = __shfl_sync(0xffffffffU, threadIdx.x / 128U, 0);
+  if (warpgroup < kMathWarpGroups) {
+#pragma unroll
+    for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+      accum[index] = 0.0F;
+  }
+  const auto iterations = reduction / 64U;
+  if (threadIdx.x == kMathWarpGroups * 128U) {
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+      const auto pipeline = pipeline_iteration + iteration;
+      const auto stage = pipeline % kStages;
+      const auto phase = (pipeline / kStages) & 1U;
+      empty_barriers[stage].wait(phase ^ 1U);
+      auto *smem_a = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_a_public + stage * kAStageElements);
+      auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_b_public + stage * kBStageElements);
+      const auto a_k = a_reduction_start + iteration * 64U;
+      const auto b_k = b_reduction_start + iteration * 64U;
+      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+          &a_map, &full_barriers[stage], smem_a, a_k, output_row);
+      for (std::uint32_t atom = 0; atom < 4U; ++atom)
+        deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+            &b_mn_map, &full_barriers[stage],
+            smem_b + atom * 64U * 64U, output_column + atom * 64U, b_k);
+      full_barriers[stage].arrive_and_expect_tx(
+          (kAStageElements + kBStageElements) *
+          sizeof(transport::BFloat16));
+    }
+  } else if (warpgroup < kMathWarpGroups) {
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+      const auto pipeline = pipeline_iteration + iteration;
+      const auto stage = pipeline % kStages;
+      const auto phase = (pipeline / kStages) & 1U;
+      auto *smem_a = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_a_public + stage * kAStageElements);
+      auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_b_public + stage * kBStageElements);
+      full_barriers[stage].wait(phase);
+#pragma unroll
+      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+#pragma unroll
+      for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
+        const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+            cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
+            smem_a, warpgroup * 64U, k * BackwardDwMixedMma::K);
+        const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+            cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
+            smem_b, 0U, k * BackwardDwMixedMma::K);
+        BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+      }
+      deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      // Keep two canonical-M WGMMA groups in flight.  The instruction stream
+      // still updates one accumulator in strict K order, while wait_group<1>
+      // releases only the oldest shared stage and hides the next TMA/WGMMA
+      // issue latency.
+      if (iteration != 0U) {
+        deep_gemm::ptx::warpgroup_wait<1>();
+        const auto completed_pipeline = pipeline_iteration + iteration - 1U;
+        if ((threadIdx.x & 31U) == 0U)
+          empty_barriers[completed_pipeline % kStages].arrive();
+      }
+    }
+    if (iterations != 0U) {
+      deep_gemm::ptx::warpgroup_wait<0>();
+      const auto final_pipeline = pipeline_iteration + iterations - 1U;
+      if ((threadIdx.x & 31U) == 0U)
+        empty_barriers[final_pipeline % kStages].arrive();
+    }
+  }
+  __syncthreads();
+  pipeline_iteration += iterations;
+}
+
 // dW consumes padded row-major [K,M] and [K,N] operands directly.  Hopper's
 // MN-major WGMMA descriptors express this transpose in the MMA contract, so
 // no bulk global-memory transpose is required.
@@ -3007,64 +3110,6 @@ __device__ bool backward_cancelled(const BackwardKernelArgs &a) {
              a.epoch;
 }
 
-// Pack canonical rows into expert-local padded canonical-M order transposed as
-// [feature, padded-M]. A 256x256 shared tile makes both the source read and
-// destination write coalesced while amortizing the persistent task claim.
-__device__ __attribute__((unused)) void backward_pack_padded_matrix(
-    const transport::BFloat16 *source, transport::BFloat16 *target,
-    std::uint64_t source_width, std::uint64_t source_column,
-    std::uint64_t outer, std::uint64_t padded_rows,
-    std::uint64_t target_row_stride,
-    const unsigned long long *padded_to_canonical,
-    unsigned long long *task_counter, unsigned long long &task_shared,
-    transport::BFloat16 *tile) {
-  constexpr std::uint64_t kTile = 256ULL;
-  constexpr std::uint64_t kTileStride = 257ULL;
-  const auto row_tiles = (padded_rows + kTile - 1ULL) / kTile;
-  const auto column_tiles = (outer + kTile - 1ULL) / kTile;
-  const auto tasks = row_tiles * column_tiles;
-  while (true) {
-    if (threadIdx.x == 0)
-      task_shared = atomicAdd(task_counter, 1ULL);
-    __syncthreads();
-    if (task_shared >= tasks)
-      break;
-    const auto row_base = (task_shared / column_tiles) * kTile;
-    const auto column_base = (task_shared % column_tiles) * kTile;
-    for (std::uint32_t index = threadIdx.x; index < kTile * kTile;
-         index += blockDim.x) {
-      const auto row = static_cast<std::uint64_t>(index) / kTile;
-      const auto column = static_cast<std::uint64_t>(index) % kTile;
-      const auto padded_row = row_base + row;
-      const auto source_column_index = column_base + column;
-      transport::BFloat16 value{0};
-      if (padded_row < padded_rows && source_column_index < outer) {
-        const auto canonical = padded_to_canonical[padded_row];
-        if (canonical != ~0ULL)
-          value = source[canonical * source_width + source_column +
-                         source_column_index];
-      }
-      tile[row * kTileStride + column] = value;
-    }
-    __syncthreads();
-    for (std::uint32_t index = threadIdx.x; index < kTile * kTile;
-         index += blockDim.x) {
-      const auto output_feature =
-          column_base + static_cast<std::uint64_t>(index) / kTile;
-      const auto output_padded_row =
-          row_base + static_cast<std::uint64_t>(index) % kTile;
-      if (output_feature < outer && output_padded_row < padded_rows) {
-        const auto input_row = static_cast<std::uint64_t>(index) % kTile;
-        const auto input_column =
-            static_cast<std::uint64_t>(index) / kTile;
-        target[output_feature * target_row_stride + output_padded_row] =
-            tile[input_row * kTileStride + input_column];
-      }
-    }
-    __syncthreads();
-  }
-}
-
 __global__ __launch_bounds__(384, 1) void
 local_p2p_backward_megakernel(
     BackwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
@@ -3073,10 +3118,10 @@ local_p2p_backward_megakernel(
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_transpose_map,
     const __grid_constant__ CUtensorMap w1_transpose_map,
-    const __grid_constant__ CUtensorMap dy_transpose_map,
+    const __grid_constant__ CUtensorMap dy_mn_map,
+    const __grid_constant__ CUtensorMap x_mn_map,
     const __grid_constant__ CUtensorMap u_transpose_map,
-    const __grid_constant__ CUtensorMap dab_transpose_map,
-    const __grid_constant__ CUtensorMap x_transpose_map) {
+    const __grid_constant__ CUtensorMap dab_transpose_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
   extern __shared__ __align__(1024) unsigned char storage[];
@@ -3093,9 +3138,6 @@ local_p2p_backward_megakernel(
   auto *canonical_gate = peer_at<float>(a.local_base,
                                         a.canonical_gate_offset);
   auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
-  auto *u = peer_at<transport::BFloat16>(a.local_base, a.u_offset);
-  auto *dx = peer_at<transport::BFloat16>(a.local_base,
-                                          a.dx_canonical_offset);
   auto *dx_return = peer_at<transport::BFloat16>(a.local_base,
                                                   a.dx_return_offset);
   auto *dx_combined = peer_at<transport::BFloat16>(a.local_base,
@@ -3105,14 +3147,10 @@ local_p2p_backward_megakernel(
   auto *dgate_canonical = peer_at<float>(a.local_base,
                                          a.dgate_canonical_offset);
   auto *dgate = peer_at<float>(a.local_base, a.dgate_offset);
-  auto *dy_t = peer_at<transport::BFloat16>(a.local_base,
-                                            a.dy_transpose_offset);
   auto *u_t = peer_at<transport::BFloat16>(a.local_base,
                                            a.u_transpose_offset);
   auto *dab_t = peer_at<transport::BFloat16>(a.local_base,
                                              a.dab_transpose_offset);
-  auto *x_t = peer_at<transport::BFloat16>(a.local_base,
-                                           a.x_transpose_offset);
   auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset);
   auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
   auto *ab = a.use_forward_cache
@@ -3245,7 +3283,6 @@ local_p2p_backward_megakernel(
   std::uint32_t pipeline_iteration = 0;
   __shared__ unsigned long long task_shared;
   const auto mblocks = scheduler[8];
-  const auto padded_rows = scheduler[9];
   const auto fc1_ntiles =
       static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
   const auto dv_ntiles =
@@ -3365,7 +3402,6 @@ local_p2p_backward_megakernel(
     const auto padded_block_rows = static_cast<std::uint32_t>(min(
         128ULL, expert_padded_rows -
                     static_cast<std::uint64_t>(local_mblock) * 128ULL));
-    float row_partial = 0.0F;
 #pragma unroll
     for (std::uint32_t half = 0; half < 2U; ++half) {
       auto *half_accum = half == 0U ? accum_a : accum_b;
@@ -3407,15 +3443,36 @@ local_p2p_backward_megakernel(
       }
       });
       __syncthreads();
-      if (threadIdx.x < valid_rows) {
-        for (std::uint32_t column = 0; column < 128U; ++column) {
-          const auto index = threadIdx.x * 128U + column;
-          row_partial = __fadd_rn(
-              row_partial,
+      const auto epilogue_warp = threadIdx.x / 32U;
+      const auto epilogue_lane = threadIdx.x & 31U;
+      for (std::uint32_t local_row = epilogue_warp;
+           local_row < valid_rows; local_row += blockDim.x / 32U) {
+        float partial = 0.0F;
+#pragma unroll
+        for (std::uint32_t column = epilogue_lane; column < 128U;
+             column += 32U) {
+          const auto index = local_row * 128U + column;
+          partial = __fadd_rn(
+              partial,
               __fmul_rn(bf16_bits_to_float(epilogue_dv[index].bits),
                         bf16_bits_to_float(epilogue_s[index].bits)));
         }
+        partial = __fadd_rn(partial,
+                            __shfl_down_sync(0xffffffffU, partial, 16));
+        partial = __fadd_rn(partial,
+                            __shfl_down_sync(0xffffffffU, partial, 8));
+        partial = __fadd_rn(partial,
+                            __shfl_down_sync(0xffffffffU, partial, 4));
+        partial = __fadd_rn(partial,
+                            __shfl_down_sync(0xffffffffU, partial, 2));
+        partial = __fadd_rn(partial,
+                            __shfl_down_sync(0xffffffffU, partial, 1));
+        if (epilogue_lane == 0U) {
+          auto &target = dgate_partial[(row + local_row) * dv_ntiles + ntile];
+          target = half == 0U ? partial : __fadd_rn(target, partial);
+        }
       }
+      __syncthreads();
       constexpr std::uint32_t kVectorsPerEpilogueRow = 128U / 8U;
       constexpr std::uint32_t kEpilogueVectors =
           128U * kVectorsPerEpilogueRow;
@@ -3428,18 +3485,13 @@ local_p2p_backward_megakernel(
                             local_column;
         if (column + 7ULL < a.intermediate &&
             local_row < padded_block_rows) {
-          uint4 value_u{};
           uint4 value_da{};
           uint4 value_db{};
           if (local_row < valid_rows) {
-            value_u = reinterpret_cast<const uint4 *>(
-                epilogue_u + local_row * 128U)[local_vector];
             value_da = reinterpret_cast<const uint4 *>(
                 epilogue_da + local_row * 128U)[local_vector];
             value_db = reinterpret_cast<const uint4 *>(
                 epilogue_db + local_row * 128U)[local_vector];
-            reinterpret_cast<uint4 *>(
-                u + (row + local_row) * a.intermediate + column)[0] = value_u;
             reinterpret_cast<uint4 *>(
                 dab + (row + local_row) * (2ULL * a.intermediate) +
                 column)[0] = value_da;
@@ -3454,36 +3506,52 @@ local_p2p_backward_megakernel(
       // epilogue tile.  Threads adjacent in the linear loop write adjacent
       // padded-M locations, avoiding a later multi-gigabyte global transpose
       // for U and dAB.
-      for (std::uint32_t index = threadIdx.x; index < 128U * 128U;
+      constexpr std::uint32_t kPaddedRowVectors = 128U / 8U;
+      for (std::uint32_t index = threadIdx.x;
+           index < 128U * kPaddedRowVectors;
            index += blockDim.x) {
-        const auto feature = index / 128U;
-        const auto local_row = index % 128U;
+        const auto feature = index / kPaddedRowVectors;
+        const auto local_row = (index % kPaddedRowVectors) * 8U;
         const auto output_feature =
             static_cast<std::uint64_t>(n) + half * 128ULL + feature;
-        if (local_row < padded_block_rows &&
+        if (local_row + 7U < padded_block_rows &&
             output_feature < a.intermediate) {
           const auto padded_row = padded_row_base + local_row;
-          const auto value_u = local_row < valid_rows
-                                   ? epilogue_u[local_row * 128U + feature]
-                                   : transport::BFloat16{0};
-          const auto value_da = local_row < valid_rows
-                                    ? epilogue_da[local_row * 128U + feature]
-                                    : transport::BFloat16{0};
-          const auto value_db = local_row < valid_rows
-                                    ? epilogue_db[local_row * 128U + feature]
-                                    : transport::BFloat16{0};
-          u_t[output_feature * a.reduction_rows + padded_row] =
-              value_u;
-          dab_t[output_feature * a.reduction_rows + padded_row] =
-              value_da;
-          dab_t[(a.intermediate + output_feature) * a.reduction_rows +
-                padded_row] = value_db;
+          unsigned int words_u[4];
+          unsigned int words_da[4];
+          unsigned int words_db[4];
+#pragma unroll
+          for (std::uint32_t word = 0; word < 4U; ++word) {
+            const auto row0 = local_row + word * 2U;
+            const auto row1 = row0 + 1U;
+            const auto read = [&](const transport::BFloat16 *tile,
+                                  std::uint32_t row) {
+              return row < valid_rows ? tile[row * 128U + feature].bits
+                                      : std::uint16_t{0};
+            };
+            words_u[word] = static_cast<unsigned int>(read(epilogue_u, row0)) |
+                            (static_cast<unsigned int>(
+                                 read(epilogue_u, row1)) << 16U);
+            words_da[word] =
+                static_cast<unsigned int>(read(epilogue_da, row0)) |
+                (static_cast<unsigned int>(read(epilogue_da, row1)) << 16U);
+            words_db[word] =
+                static_cast<unsigned int>(read(epilogue_db, row0)) |
+                (static_cast<unsigned int>(read(epilogue_db, row1)) << 16U);
+          }
+          reinterpret_cast<uint4 *>(
+              u_t + output_feature * a.reduction_rows + padded_row)[0] =
+              make_uint4(words_u[0], words_u[1], words_u[2], words_u[3]);
+          reinterpret_cast<uint4 *>(
+              dab_t + output_feature * a.reduction_rows + padded_row)[0] =
+              make_uint4(words_da[0], words_da[1], words_da[2], words_da[3]);
+          reinterpret_cast<uint4 *>(
+              dab_t + (a.intermediate + output_feature) * a.reduction_rows +
+              padded_row)[0] =
+              make_uint4(words_db[0], words_db[1], words_db[2], words_db[3]);
         }
       }
       __syncthreads();
-    }
-    if (threadIdx.x < valid_rows) {
-      dgate_partial[(row + threadIdx.x) * dv_ntiles + ntile] = row_partial;
     }
     __syncthreads();
   }
@@ -3507,15 +3575,9 @@ local_p2p_backward_megakernel(
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dgate_complete_clock = device_globaltimer_ns();
 
-  backward_pack_padded_matrix(
-      dy, dy_t, a.hidden, 0ULL, a.hidden, padded_rows, a.reduction_rows,
-      scheduler + 64ULL, scheduler + 4ULL, task_shared, smem_a);
-  grid.sync();
-  backward_pack_padded_matrix(
-      canonical_x, x_t, a.hidden, 0ULL, a.hidden, padded_rows,
-      a.reduction_rows, scheduler + 64ULL, scheduler + 5ULL, task_shared,
-      smem_a);
-  grid.sync();
+  // dY and X remain in canonical row-major storage.  The dW WGMMA path below
+  // consumes them directly as MN-major operands, so this point is now only a
+  // timestamp and contains no bulk transpose/staging work.
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->transpose_complete_clock = device_globaltimer_ns();
 
@@ -3578,27 +3640,76 @@ local_p2p_backward_megakernel(
       if (local_row < valid_rows && output_column + 7ULL < a.hidden) {
         const auto packed = reinterpret_cast<const uint4 *>(
             output_tile + local_row * 256ULL)[local_vector];
+        const auto header = headers[row + local_row];
+        auto *source_dx = peer_at<transport::BFloat16>(
+            a.peer_bases[header.source_rank], a.dx_return_offset);
         reinterpret_cast<uint4 *>(
-            dx + (row + local_row) * a.hidden + output_column)[0] = packed;
+            source_dx + header.route_index * a.hidden + output_column)[0] =
+            packed;
+        if (ntile == 0U && local_vector == 0U) {
+          auto *source_dgate = peer_at<float>(
+              a.peer_bases[header.source_rank], a.dgate_offset);
+          source_dgate[header.route_index] = dgate_canonical[row + local_row];
+        }
       }
     }
     __syncthreads();
   }
+  __threadfence_system();
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_complete_clock = device_globaltimer_ns();
 
+  // Every dX contribution and dGate scalar is now globally visible. Publish
+  // the per-source completion before dW so peer acquire latency is hidden by
+  // the independent weight-gradient work instead of extending the tail.
+  if (blockIdx.x == 0 && threadIdx.x < a.world) {
+    auto *signal = peer_at<unsigned long long>(
+        a.peer_bases[threadIdx.x], a.outgoing_signal_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+        signal[a.rank * a.channels]);
+    ready.store(a.epoch, ::cuda::memory_order_release);
+  }
+
+  // A small set of CTAs consumes the already-published source contributions
+  // while the remaining SMs execute tensor-core dW.  This hides the
+  // bandwidth-bound deterministic top-k reduction without changing either
+  // reduction order or any dW tile ownership.
+  constexpr std::uint32_t kConcurrentReduceCtas = 8U;
+  const auto reduce_ctas = min(kConcurrentReduceCtas,
+                               static_cast<std::uint32_t>(gridDim.x / 4U));
+  const auto dw_ctas = static_cast<std::uint32_t>(gridDim.x) - reduce_ctas;
+  const bool reduce_worker = blockIdx.x >= dw_ctas;
+  if (reduce_worker) {
+    auto *signal = peer_at<unsigned long long>(a.local_base,
+                                                a.outgoing_signal_offset);
+    for (std::uint32_t destination = threadIdx.x; destination < a.world;
+         destination += blockDim.x) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          ready(signal[destination * a.channels]);
+      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+             !backward_cancelled(a)) {
+      }
+    }
+    __syncthreads();
+    backward_reduce_token_slice(a, dx_return, dx_combined,
+                                blockIdx.x - dw_ctas, reduce_ctas);
+  }
+
   // dW2 and dW1 use split_k=1. Each task owns one output tile and traverses
   // that expert's padded canonical-M segment in ascending order.
-  const auto dw2_mtiles = (a.hidden + 127ULL) / 128ULL;
-  const auto dw2_ntiles = (a.intermediate + 127ULL) / 128ULL;
+  // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
+  // 128x128 accumulator tile directly into the parameter layout [H,I].
+  const auto dw2_mtiles = (a.intermediate + 127ULL) / 128ULL;
+  constexpr std::uint64_t kDwN = 256ULL;
+  const auto dw2_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
   const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
-  const auto dw1_ntiles = (a.hidden + 127ULL) / 128ULL;
+  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
   const auto dw2_tasks = static_cast<unsigned long long>(
       a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
   const auto dw1_tasks = static_cast<unsigned long long>(
       a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
-  while (true) {
+  while (!reduce_worker) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
@@ -3611,49 +3722,86 @@ local_p2p_backward_megakernel(
     const auto per_expert = mtiles * ntiles;
     const auto expert = static_cast<std::uint32_t>(task / per_expert);
     task %= per_expert;
-    const auto mtile = task / ntiles;
-    const auto ntile = task % ntiles;
+    // Consecutive claims share the larger canonical-MN B tile (X or dY)
+    // across output-row tiles.  This gives L2 one 32-KiB operand to reuse,
+    // instead of reusing the smaller 16-KiB transposed A tile.
+    const auto ntile = task / mtiles;
+    const auto mtile = task % mtiles;
     const auto reduction_start = claims[expert];
     const auto reduction =
         (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
-    float accum[ForwardMma::kNumAccum];
-    backward_wgmma_tile(
-        is_dw1 ? dab_transpose_map : dy_transpose_map,
-        is_dw1 ? x_transpose_map : u_transpose_map,
+    float accum[BackwardDwMixedMma::kNumAccum];
+    backward_wgmma_dw_k_mn_tile(
+        is_dw1 ? dab_transpose_map : u_transpose_map,
+        is_dw1 ? x_mn_map : dy_mn_map,
         static_cast<std::uint32_t>(reduction_start),
+        static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
         static_cast<std::uint32_t>(mtile * 128ULL),
-        static_cast<std::uint32_t>(ntile * 128ULL),
+        static_cast<std::uint32_t>(ntile * kDwN),
         static_cast<std::uint32_t>(reduction), smem_a, smem_b,
         full_barriers, empty_barriers, accum, pipeline_iteration);
-    const auto output_rows = is_dw1 ? 2ULL * a.intermediate : a.hidden;
-    const auto output_columns = is_dw1 ? a.hidden : a.intermediate;
+    const auto mma_rows = is_dw1 ? 2ULL * a.intermediate : a.intermediate;
+    const auto mma_columns = a.hidden;
+    const auto output_rows = is_dw1 ? mma_rows : a.hidden;
+    const auto output_columns = is_dw1 ? mma_columns : a.intermediate;
     auto *output = is_dw1 ? dw1 : dw2;
     const auto expert_stride = output_rows * output_columns;
     auto *output_tile = smem_a;
-    visit_forward_accumulator(
+    visit_forward_accumulator_wide(
         accum, [&](std::uint32_t wg, std::uint32_t m,
                    std::uint32_t column, float v0, float v1) {
-      const auto local_row = wg * 64U + m;
-      output_tile[local_row * 128U + column] =
-          transport::BFloat16{float_to_bf16_bits(v0)};
-      output_tile[local_row * 128U + column + 1U] =
-          transport::BFloat16{float_to_bf16_bits(v1)};
-    });
+        const auto local_row = wg * 64U + m;
+        output_tile[local_row * kDwN + column] =
+            transport::BFloat16{float_to_bf16_bits(v0)};
+        output_tile[local_row * kDwN + column + 1U] =
+            transport::BFloat16{float_to_bf16_bits(v1)};
+      });
     __syncthreads();
-    constexpr std::uint32_t kVectorsPerRow = 128U / 8U;
+    constexpr std::uint32_t kVectorsPerRow = kDwN / 8U;
     constexpr std::uint32_t kOutputVectors = 128U * kVectorsPerRow;
     for (std::uint32_t vector = threadIdx.x; vector < kOutputVectors;
          vector += blockDim.x) {
       const auto local_row = vector / kVectorsPerRow;
       const auto local_vector = vector % kVectorsPerRow;
-      const auto output_row = mtile * 128ULL + local_row;
-      const auto output_column = ntile * 128ULL + local_vector * 8ULL;
-      if (output_row < output_rows && output_column + 7ULL < output_columns) {
-        const auto packed = reinterpret_cast<const uint4 *>(
-            output_tile + local_row * 128ULL)[local_vector];
+      const auto mma_row = mtile * 128ULL + local_row;
+      const auto mma_column = ntile * kDwN + local_vector * 8ULL;
+      if (is_dw1 && mma_row < output_rows &&
+          mma_column + 7ULL < output_columns) {
         reinterpret_cast<uint4 *>(
-            output + expert * expert_stride + output_row * output_columns +
-            output_column)[0] = packed;
+            output + expert * expert_stride + mma_row * output_columns +
+            mma_column)[0] = reinterpret_cast<const uint4 *>(
+                output_tile + local_row * kDwN)[local_vector];
+      }
+    }
+    __syncthreads();
+    // dW2's MMA tile is [I,H].  Gather eight adjacent I rows from shared
+    // memory and issue one coalesced 16-byte store into parameter layout
+    // [H,I], rather than 8 strided global scalar stores.
+    if (!is_dw1) {
+      constexpr std::uint32_t kTransposeVectors = kDwN * (128U / 8U);
+      for (std::uint32_t vector = threadIdx.x; vector < kTransposeVectors;
+           vector += blockDim.x) {
+        const auto local_hidden = vector / (128U / 8U);
+        const auto local_i_vector = vector % (128U / 8U);
+        const auto hidden_row = ntile * kDwN + local_hidden;
+        const auto i_column = mtile * 128ULL + local_i_vector * 8ULL;
+        if (hidden_row < output_rows && i_column + 7ULL < output_columns) {
+          unsigned int words[4];
+#pragma unroll
+          for (std::uint32_t word = 0; word < 4U; ++word) {
+            const auto first = output_tile[
+                (local_i_vector * 8U + word * 2U) * kDwN + local_hidden];
+            const auto second = output_tile[
+                (local_i_vector * 8U + word * 2U + 1U) * kDwN +
+                local_hidden];
+            words[word] = static_cast<unsigned int>(first.bits) |
+                          (static_cast<unsigned int>(second.bits) << 16U);
+          }
+          reinterpret_cast<uint4 *>(
+              output + expert * expert_stride + hidden_row * output_columns +
+              i_column)[0] = make_uint4(words[0], words[1], words[2],
+                                        words[3]);
+        }
       }
     }
     __syncthreads();
@@ -3662,59 +3810,11 @@ local_p2p_backward_megakernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = device_globaltimer_ns();
     status->dw1_complete_clock = status->dw2_complete_clock;
+    // The rendezvous above covers both dW workers and the concurrent Reduce
+    // workers; a second empty cooperative-grid barrier costs ~1.5 ms on the
+    // eight-GPU production topology and establishes no additional ordering.
+    status->dx_reduce_complete_clock = status->dw1_complete_clock;
   }
-
-  unsigned long long dx_peer_rows = 0ULL;
-  for (std::uint64_t row = blockIdx.x;
-       row < a.dispatch.sizes.incoming_row_count; row += gridDim.x) {
-    const auto header = headers[row];
-    auto *source_base = a.peer_bases[header.source_rank];
-    auto *source_dx = peer_at<transport::BFloat16>(source_base,
-                                                    a.dx_return_offset);
-    auto *source_dgate = peer_at<float>(source_base, a.dgate_offset);
-    const auto *source128 = reinterpret_cast<const uint4 *>(
-        dx + row * a.hidden);
-    auto *target128 = reinterpret_cast<uint4 *>(
-        source_dx + header.route_index * a.hidden);
-    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
-         vector += blockDim.x)
-      target128[vector] = source128[vector];
-    if (threadIdx.x == 0) {
-      source_dgate[header.route_index] = dgate_canonical[row];
-      if (header.source_rank != a.rank)
-        ++dx_peer_rows;
-    }
-  }
-  if (threadIdx.x == 0 && dx_peer_rows != 0ULL)
-    atomicAdd(&status->actual_dx_peer_bytes,
-              dx_peer_rows * a.hidden * sizeof(transport::BFloat16));
-  __threadfence_system();
-  grid.sync();
-  if (blockIdx.x == 0) {
-    if (threadIdx.x < a.world) {
-      auto *signal = peer_at<unsigned long long>(
-          a.peer_bases[threadIdx.x], a.outgoing_signal_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(signal[a.rank * a.channels]);
-      ready.store(a.epoch, ::cuda::memory_order_release);
-    }
-    auto *signal = peer_at<unsigned long long>(a.local_base,
-                                                a.outgoing_signal_offset);
-    for (std::uint32_t destination = threadIdx.x; destination < a.world;
-         destination += blockDim.x) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(signal[destination * a.channels]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
-             !backward_cancelled(a)) {
-      }
-    }
-  }
-  grid.sync();
-  backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
-                              gridDim.x);
-  grid.sync();
-  if (blockIdx.x == 0 && threadIdx.x == 0)
-    status->dx_reduce_complete_clock = device_globaltimer_ns();
 
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -3726,26 +3826,30 @@ local_p2p_backward_megakernel(
 
   if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+    // Remote dY dispatch and dX return have an exact one-to-one route/byte
+    // correspondence for this source rank; reuse the measured dispatch count
+    // instead of adding per-route atomics to the dX epilogue.
+    status->actual_dx_peer_bytes = status->actual_dy_peer_bytes;
     status->dv_tasks = scheduler[8] *
                        ((a.intermediate + 255ULL) / 256ULL);
     status->dx_tasks = scheduler[8] * ((a.hidden + 255ULL) / 256ULL);
     status->dw1_tasks = static_cast<unsigned long long>(
         a.dispatch.sizes.owned_expert_count) *
         ((2ULL * a.intermediate + 127ULL) / 128ULL) *
-        ((a.hidden + 127ULL) / 128ULL);
+        ((a.hidden + 255ULL) / 256ULL);
     status->dw2_tasks = static_cast<unsigned long long>(
         a.dispatch.sizes.owned_expert_count) *
-        ((a.hidden + 127ULL) / 128ULL) *
-        ((a.intermediate + 127ULL) / 128ULL);
+        ((a.intermediate + 127ULL) / 128ULL) *
+        ((a.hidden + 255ULL) / 256ULL);
     const auto kdv = a.hidden / 64ULL;
     const auto kdx = (2ULL * a.intermediate) / 64ULL;
     unsigned long long dw_reduction_iterations = 0ULL;
     const auto dw1_tiles_per_expert =
         ((2ULL * a.intermediate + 127ULL) / 128ULL) *
-        ((a.hidden + 127ULL) / 128ULL);
+        ((a.hidden + 255ULL) / 256ULL);
     const auto dw2_tiles_per_expert =
-        ((a.hidden + 127ULL) / 128ULL) *
-        ((a.intermediate + 127ULL) / 128ULL);
+        ((a.intermediate + 127ULL) / 128ULL) *
+        ((a.hidden + 255ULL) / 256ULL);
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert)
       dw_reduction_iterations +=
@@ -3757,7 +3861,7 @@ local_p2p_backward_megakernel(
         dw_reduction_iterations * 2ULL * (64ULL / ForwardMma::K);
     status->tma_loads = (status->dv_tasks * kdv +
                          status->dx_tasks * kdx) * 2ULL +
-                        dw_reduction_iterations * 2ULL;
+                        dw_reduction_iterations * 5ULL;
 #endif
     status->complete_clock = device_globaltimer_ns();
   }
@@ -4649,20 +4753,16 @@ ActivationTransportResourcePool make_activation_transport_pool(
           slot.backward_dy_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dy_canonical),
               config.max_hidden_size, rows, 128, "backward canonical dY");
-          slot.backward_dv_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_dv),
-              config.max_intermediate_size, rows, 128, "backward dV");
           slot.backward_dab_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dab),
               2ULL * config.max_intermediate_size, rows, 128,
               "backward dAB");
-          slot.backward_dx_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_dx_canonical),
-              config.max_hidden_size, rows, 128, "backward canonical dX");
-          slot.backward_dy_transpose_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_dy_transpose),
-              reduction_rows, config.max_hidden_size, 128,
-              "backward dY transpose");
+          slot.backward_dy_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_dy_canonical),
+              config.max_hidden_size, rows, "backward canonical dY MN");
+          slot.backward_x_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.canonical_rows),
+              config.max_hidden_size, rows, "canonical X MN");
           slot.backward_u_transpose_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_u_transpose),
               reduction_rows, config.max_intermediate_size, 128,
@@ -4671,10 +4771,6 @@ ActivationTransportResourcePool make_activation_transport_pool(
               at<void>(slot.device, state->layout.backward_dab_transpose),
               reduction_rows, 2ULL * config.max_intermediate_size, 128,
               "backward dAB transpose");
-          slot.backward_x_transpose_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_x_transpose),
-              reduction_rows, config.max_hidden_size, 128,
-              "backward X transpose");
           slot.backward_maps_valid = true;
         }
       }
@@ -5870,7 +5966,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaDeviceGetAttribute(SM count)");
-  const auto grid_blocks = static_cast<unsigned int>(sms & ~1);
+  const auto grid_blocks = static_cast<unsigned int>(sms);
   if (grid_blocks == 0)
     throw NotifyDispatchError(NotifyErrorCode::BackendUnavailable,
                               "phase=forward-run, field=SM count, rank=" +
@@ -5890,18 +5986,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaFuncSetAttribute(dynamic smem)");
-  cudaLaunchAttribute attributes[2]{};
+  cudaLaunchAttribute attributes[1]{};
   attributes[0].id = cudaLaunchAttributeCooperative;
   attributes[0].val.cooperative = 1;
-  attributes[1].id = cudaLaunchAttributeClusterDimension;
-  attributes[1].val.clusterDim = {2U, 1U, 1U};
   cudaLaunchConfig_t launch{};
   launch.gridDim = dim3(grid_blocks, 1, 1);
   launch.blockDim = dim3(384, 1, 1);
   launch.dynamicSmemBytes = forward_smem;
   launch.stream = exec->stream;
   launch.attrs = attributes;
-  launch.numAttrs = 2;
+  launch.numAttrs = 1;
   int cluster_supported = 0;
   internal::throw_cuda(
       "forward-run",
@@ -6311,22 +6405,17 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.direct_headers_offset = layout.direct_route_headers;
   args.dy_canonical_offset = layout.backward_dy_canonical;
   args.canonical_gate_offset = layout.backward_canonical_gate;
-  args.dv_offset = layout.backward_dv;
   args.dab_offset = layout.backward_dab;
   args.recompute_ab_offset = layout.backward_recompute_ab;
   args.backward_s_offset = layout.forward_s;
   args.forward_ab_cache_offset = layout.forward_ab_cache;
-  args.u_offset = layout.backward_u;
-  args.dx_canonical_offset = layout.backward_dx_canonical;
   args.dx_return_offset = layout.backward_dx_return;
   args.dx_combined_offset = layout.backward_dx_combined;
   args.dgate_partial_offset = layout.backward_dgate_partial;
   args.dgate_canonical_offset = layout.backward_dgate_canonical;
   args.dgate_offset = layout.backward_dgate;
-  args.dy_transpose_offset = layout.backward_dy_transpose;
   args.u_transpose_offset = layout.backward_u_transpose;
   args.dab_transpose_offset = layout.backward_dab_transpose;
-  args.x_transpose_offset = layout.backward_x_transpose;
   args.dw1_offset = layout.backward_dw1;
   args.dw2_offset = layout.backward_dw2;
   args.scheduler_offset = layout.backward_scheduler;
@@ -6384,8 +6473,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
           slot.backward_dy_map, slot.backward_dab_map, f.weights.impl_->w1_map,
           f.weights.impl_->w2_transpose_map,
           f.weights.impl_->w1_transpose_map,
-          slot.backward_dy_transpose_map, slot.backward_u_transpose_map,
-          slot.backward_dab_transpose_map, slot.backward_x_transpose_map),
+          slot.backward_dy_mn_map, slot.backward_x_mn_map,
+          slot.backward_u_transpose_map, slot.backward_dab_transpose_map),
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA Backward launch");
@@ -7562,22 +7651,17 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
       backward.direct_headers_offset = layout.direct_route_headers;
       backward.dy_canonical_offset = layout.backward_dy_canonical;
       backward.canonical_gate_offset = layout.backward_canonical_gate;
-      backward.dv_offset = layout.backward_dv;
       backward.dab_offset = layout.backward_dab;
       backward.recompute_ab_offset = layout.backward_recompute_ab;
       backward.backward_s_offset = layout.forward_s;
       backward.forward_ab_cache_offset = layout.forward_ab_cache;
-      backward.u_offset = layout.backward_u;
-      backward.dx_canonical_offset = layout.backward_dx_canonical;
       backward.dx_return_offset = layout.backward_dx_return;
       backward.dx_combined_offset = layout.backward_dx_combined;
       backward.dgate_partial_offset = layout.backward_dgate_partial;
       backward.dgate_canonical_offset = layout.backward_dgate_canonical;
       backward.dgate_offset = layout.backward_dgate;
-      backward.dy_transpose_offset = layout.backward_dy_transpose;
       backward.u_transpose_offset = layout.backward_u_transpose;
       backward.dab_transpose_offset = layout.backward_dab_transpose;
-      backward.x_transpose_offset = layout.backward_x_transpose;
       backward.dw1_offset = layout.backward_dw1;
       backward.dw2_offset = layout.backward_dw2;
       backward.scheduler_offset = layout.backward_scheduler;
@@ -7600,18 +7684,18 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
       const auto w1_transpose_map = make_bf16_tma_map(
           w1_transpose, 2 * intermediate, hidden, 256,
           "sanitizer W1 transpose");
-      const auto dy_mn_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_dy_transpose), 64, hidden, 128,
-          "sanitizer padded dY");
+      const auto canonical_dy_mn_map = make_bf16_tma_map_mn(
+          at<void>(arena, layout.backward_dy_canonical), hidden, 1,
+          "sanitizer canonical dY MN");
+      const auto canonical_x_mn_map = make_bf16_tma_map_mn(
+          at<void>(arena, layout.canonical_rows), hidden, 1,
+          "sanitizer canonical X MN");
       const auto u_mn_map = make_bf16_tma_map(
           at<void>(arena, layout.backward_u_transpose), 64, intermediate, 128,
           "sanitizer padded U");
       const auto dab_mn_map = make_bf16_tma_map(
           at<void>(arena, layout.backward_dab_transpose), 64,
           2 * intermediate, 128, "sanitizer padded dAB");
-      const auto x_mn_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_x_transpose), 64, hidden, 128,
-          "sanitizer padded X");
       const std::size_t backward_smem =
           (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(*input) +
           8U * sizeof(std::uint64_t);
@@ -7622,13 +7706,15 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
                                static_cast<int>(backward_smem)),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "set Backward dynamic shared memory");
+      launch.blockDim = dim3(384, 1, 1);
       launch.dynamicSmemBytes = backward_smem;
       internal::throw_cuda(
           "backward-sanitizer",
           cudaLaunchKernelEx(
               &launch, local_p2p_backward_megakernel, backward, x_map, dy_map,
-              dab_map, w1_map, w2_transpose_map, w1_transpose_map, dy_mn_map,
-              u_mn_map, dab_mn_map, x_mn_map),
+              dab_map, w1_map, w2_transpose_map, w1_transpose_map,
+              canonical_dy_mn_map, canonical_x_mn_map, u_mn_map,
+              dab_mn_map),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "production Backward persistent kernel");
       BackwardDeviceStatus backward_status{};
