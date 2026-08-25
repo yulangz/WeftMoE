@@ -120,17 +120,33 @@ correctness blockers.
 - A NCCL-free production-kernel harness covers memcheck, racecheck and
   initcheck. Single-node world 1/8 cache/no-cache correctness and steady
   allocation auditing are available.
+- Zero-row experts are ready at setup and receive real persistent-kernel dW
+  zero stores. World=8/top-k=1, concentrated routing, an entirely empty owner
+  rank, and a zero-token source rank therefore share the ordinary terminal
+  predicate. Timeout-only phase dumps replace multi-minute hang diagnosis.
+- Complete device dX/dW1/dW2/dGate hashes are checked across 20 generations.
+  The main-shape pool=2 test retains both handles, rejects a third generation,
+  and proves hash-preserving selective reuse after one handle is released.
 - Performance closure remains open, but the current cache-mode candidate has
   crossed the local performance gates. The global dY/X transpose is gone;
   dW1 now uses an outer producer/two-consumer WGMMA pipeline, an STSM BF16
   epilogue, and four 128x64 TMA stores. Deterministic grid-stride ownership for
   the uniform main-shape dW1 and dX tiles removes their global claim atomics.
-  Three independent 10-warmup/100-sample local 8-GPU runs measured Backward
-  means of `28.578`, `28.553`, and `28.587` ms. Matching Megatron native means
-  were `33.700`, `33.851`, and `33.806` ms, giving `15.20%`, `15.65%`, and
-  `15.44%` improvements. dW1 averaged about `6.73` ms and dX about `7.92` ms.
-  Cache-mode Forward+Backward was `45.240`, `45.214`, and `45.260` ms versus
-  Megatron's `54.149`, `54.205`, and `54.191` ms (`16.45%`--`16.59%` faster).
+  Three independent 10-warmup/100-sample local 8-GPU runs after the
+  empty-expert fix measured Backward means of `28.640`, `28.636`, and `28.718`
+  ms. Matching Megatron native means were `33.772`, `33.873`, and `33.935` ms,
+  giving `15.20%`, `15.46%`, and `15.38%` improvements. dW1 averaged
+  `6.764`--`6.789` ms and dX `7.901`--`7.959` ms. Cache-mode
+  Forward+Backward was `45.327`, `45.367`, and `45.461` ms versus Megatron's
+  `54.175`, `54.263`, and `54.263` ms (`16.22%`--`16.39%` faster). Standalone
+  cache-Forward means were `15.911`, `15.892`, and `15.894` ms, within the
+  frozen Forward budget.
+
+  Reserving 1, 2, or 4 CTAs for early dW produced `29.263`, `29.023`, and
+  `29.021` ms Backward in the directed short search, all slower than the
+  unreserved candidate; those branches and their runtime knob were removed.
+  The retained release path only eliminates redundant dW2 CTA barriers and
+  keeps the stable all-worker dV/dX then dW schedule.
   No-cache remains slower because FC1 recomputation raises Backward to
   `37.168` ms despite avoiding the Forward checkpoint write.
 

@@ -280,6 +280,13 @@ struct ForwardWeightStorageHashes {
   std::vector<DeviceStorageHash128> sampled_w2_output_rows;
 };
 
+struct BackwardStorageHashes {
+  DeviceStorageHash128 dx;
+  DeviceStorageHash128 dw1;
+  DeviceStorageHash128 dw2;
+  DeviceStorageHash128 dgate;
+};
+
 struct ForwardMegaKernelTimings {
   double dispatch_us = 0;
   double fc1_swiglu_us = 0;
@@ -477,8 +484,13 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend struct BackwardValidationDownload;
+  friend struct BackwardStorageHashAccess;
   friend BackwardValidationDownload download_backward_for_validation(
       const DeviceBackwardHandle &, const CudaExecution &);
+  friend bool testing_backward_storage_ranges_disjoint(
+      const DeviceBackwardHandle &, const DeviceBackwardHandle &);
+  friend std::size_t
+  testing_backward_slot_index(const DeviceBackwardHandle &);
 };
 
 struct BackwardValidationDownload {
@@ -509,6 +521,12 @@ private:
 
 BackwardValidationDownload download_backward_for_validation(
     const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+// Test-only predicates expose slot identity/isolation without exposing native
+// device addresses or an owner-free kernel view.
+bool testing_backward_storage_ranges_disjoint(
+    const DeviceBackwardHandle &left, const DeviceBackwardHandle &right);
+std::size_t testing_backward_slot_index(const DeviceBackwardHandle &handle);
 
 // Explicit test/convenience upload into the Forward generation's preallocated
 // dY slot.  Production autograd/router integration will issue the same typed
@@ -572,6 +590,24 @@ ForwardWeightLease make_deterministic_forward_weights_for_testing(
 // bytes; only the two 64-bit results per tensor are copied to the host.
 ForwardWeightStorageHashes hash_forward_weight_storage_for_validation(
     const ForwardWeightLease &weights, const CudaExecution &execution);
+
+// Validation-only fixed-order hashes over the complete device gradient
+// buffers produced by the persistent Backward kernel. No bulk gradient
+// download is performed.
+BackwardStorageHashes hash_backward_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+// Recomputes the hash from the live device allocation even when the handle
+// carries a completion-time hash. This is intentionally validation-only and
+// is used to prove that a later live generation did not overwrite the slot.
+BackwardStorageHashes rehash_backward_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+// Corruption sensitivity check for the actual device dX storage. Validation
+// only; the offset is measured in bytes and the caller must restore mutations.
+void flip_backward_dx_byte_for_validation(
+    const DeviceBackwardHandle &handle, std::uint64_t byte_offset,
+    const CudaExecution &execution);
 
 // One-time Backward session setup. It builds device-resident W1^T/W2^T and
 // their TMA descriptors; Forward-only callers pay neither memory nor setup.

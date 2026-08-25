@@ -271,6 +271,12 @@ def main():
     parser.add_argument("--forward-benchmark", action="store_true")
     parser.add_argument("--backward-benchmark", action="store_true")
     parser.add_argument("--backward-cache", action="store_true")
+    parser.add_argument("--backward-cache-pool2-validation",
+                        action="store_true")
+    parser.add_argument("--backward-smoke-repeats", type=int, default=1)
+    parser.add_argument("--backward-route-case",
+                        choices=("regular", "concentrated", "zero-rank"),
+                        default="regular")
     parser.add_argument("--forward-cache", action="store_true")
     parser.add_argument("--forward-cache-pool2-validation", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
@@ -307,6 +313,9 @@ def main():
                          "--forward-benchmark")
         environment["MEGAMOE_FORWARD_CACHE_POOL2_VALIDATE"] = "1"
         environment["MEGAMOE_FORWARD_CACHE"] = "1"
+    if args.backward_cache_pool2_validation and not args.backward_benchmark:
+        parser.error("--backward-cache-pool2-validation requires "
+                     "--backward-benchmark")
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
@@ -316,9 +325,20 @@ def main():
         environment["MEGAMOE_BACKWARD_BENCH_ROUNDS"] = str(args.rounds)
         if args.backward_cache:
             environment["MEGAMOE_BACKWARD_CACHE"] = "1"
+        if args.backward_cache_pool2_validation:
+            environment["MEGAMOE_BACKWARD_POOL2_VALIDATE"] = "1"
+            environment["MEGAMOE_BACKWARD_CACHE"] = "1"
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+    if args.backward_smoke:
+        if args.backward_smoke_repeats < 1:
+            parser.error("--backward-smoke-repeats must be positive")
+        environment["MEGAMOE_BACKWARD_CAPTURE_HASH"] = "1"
+        environment["MEGAMOE_BACKWARD_PROGRESS_DUMP"] = "1"
+        environment["MEGAMOE_BACKWARD_SMOKE_REPEATS"] = str(
+            args.backward_smoke_repeats)
+        environment["MEGAMOE_BACKWARD_ROUTE_CASE"] = args.backward_route_case
     if args.forward_output_dir:
         if not (args.forward_benchmark or args.forward_smoke):
             parser.error("--forward-output-dir requires a Forward mode")
@@ -444,9 +464,16 @@ def main():
                 item = parse_fields(stdout, "BACKWARD_SMOKE ")
                 if (item.get("cache_no_cache_equal") != "1" or
                         item.get("persistent_launches") != "1" or
-                        item.get("top_k") != str(args.top_k)):
+                        item.get("top_k") != str(args.top_k) or
+                        item.get("repeats") !=
+                        str(args.backward_smoke_repeats) or
+                        item.get("route_case") != args.backward_route_case):
                     raise AssertionError(
                         f"rank={rank} invalid backward smoke audit: {item}")
+                observed.append(item)
+                continue
+            if args.backward_cache_pool2_validation:
+                item = parse_fields(stdout, "BACKWARD_POOL2 ")
                 observed.append(item)
                 continue
             if args.cancel:
@@ -481,6 +508,17 @@ def main():
         if args.backward_smoke:
             if len(observed) != args.world:
                 raise AssertionError("missing backward ranks")
+            if args.world == 8 and args.top_k == 1:
+                if not any(int(item["dv_tasks"]) == 0 for item in observed):
+                    raise AssertionError(
+                        "world=8/top-k=1 did not exercise an all-empty owner")
+                if any(int(item["dw1_tasks"]) == 0 or
+                       int(item["dw2_tasks"]) == 0 for item in observed):
+                    raise AssertionError(
+                        "empty-expert zero-store tasks were not completed")
+            if args.backward_route_case == "zero-rank":
+                if observed[-1]["local_tokens"] != "0":
+                    raise AssertionError("zero-token rank was not exercised")
             if args.world == 1 and args.top_k == 1:
                 oracle_keys = (
                     "oracle_dx_bits", "oracle_dgate", "oracle_dw1_bits",
@@ -494,6 +532,17 @@ def main():
             print(f"[PASS] LocalCudaP2p Backward MegaKernel world={args.world} "
                   "single-launch WGMMA/TMA cache/no-cache smoke "
                   f"rank0_dx_hash={observed[0]['dx_hash']}")
+            return
+        if args.backward_cache_pool2_validation:
+            required = ("disjoint", "first_stable", "second_stable",
+                        "third_exhausted", "selective_reuse")
+            if len(observed) != args.world or any(
+                    item.get(field) != "1"
+                    for item in observed for field in required):
+                raise AssertionError(
+                    f"invalid Backward pool=2 lifecycle audit: {observed}")
+            print(f"[PASS] Backward main-shape pool=2 lifecycle world="
+                  f"{args.world} disjoint/exhaustion/selective-reuse")
             return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
@@ -512,7 +561,8 @@ def main():
                     if (item["specialization"] !=
                             "sm90-wgmma-tma-7168x3072" or
                             item["persistent_launches"] != "1" or
-                            item["steady_forbidden_cuda_api_calls"] != "0"):
+                            item["steady_forbidden_cuda_api_calls"] != "0" or
+                            item.get("gradient_hash_repeats") != "20"):
                         raise AssertionError(
                             f"rank={rank} invalid backward audit: {item}")
                     for key in stage_keys:
@@ -544,7 +594,9 @@ def main():
                     "benchmark": "single-persistent-backward-main-shape",
                     "world": args.world,
                     "cache_mode": ("cache-fc1-input-output"
-                                   if args.backward_cache else "no-cache"),
+                                   if (args.backward_cache or
+                                       args.backward_cache_pool2_validation)
+                                   else "no-cache"),
                     "warmup": 10,
                     "measured": args.rounds - 10,
                     "shape": {"tokens_per_rank": 8192, "hidden": 7168,
@@ -575,6 +627,23 @@ def main():
                         [int(item["actual_w2_hash_low"]),
                          int(item["actual_w2_hash_high"])]
                         for item in observed],
+                    "per_rank_actual_dx_device_hash": [
+                        [int(item["actual_dx_hash_low"]),
+                         int(item["actual_dx_hash_high"])]
+                        for item in observed],
+                    "per_rank_actual_dw1_device_hash": [
+                        [int(item["actual_dw1_hash_low"]),
+                         int(item["actual_dw1_hash_high"])]
+                        for item in observed],
+                    "per_rank_actual_dw2_device_hash": [
+                        [int(item["actual_dw2_hash_low"]),
+                         int(item["actual_dw2_hash_high"])]
+                        for item in observed],
+                    "per_rank_actual_dgate_device_hash": [
+                        [int(item["actual_dgate_hash_low"]),
+                         int(item["actual_dgate_hash_high"])]
+                        for item in observed],
+                    "gradient_hash_repeats": 20,
                     "weight_gradient_dtype": observed[0]["dw_dtype"],
                     "per_rank_nccl_runtime": [
                         item["_nccl_runtime"] for item in observed],

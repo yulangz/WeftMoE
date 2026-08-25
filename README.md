@@ -300,6 +300,20 @@ are generation-slot storage owned through the Backward handle. The resource
 pool must be created with `enable_backward=true`; the steady path performs no
 CUDA/pinned/event allocation or device-wide synchronization.
 
+Zero-row owned experts are first-class Backward inputs. Generation setup marks
+their dY/U/dAB readiness without waiting for a producer, and the persistent
+kernel still owns deterministic vectorized dW1/dW2 zero-store tasks. Thus an
+all-empty owner rank participates in terminal completion and exposes real zero
+gradient storage instead of an implicit epoch convention. A timeout-only
+mapped progress page can report per-rank/per-expert terminal state when
+`MEGAMOE_BACKWARD_PROGRESS_DUMP=1`; it is absent from the normal release path.
+
+Validation can hash the complete device dX/dW1/dW2/dGate allocations in a
+fixed order without bulk downloads. The benchmark repeats those hashes 20
+times, and the pool=2 lifecycle test retains both Backward handles, proves
+their arenas disjoint, observes `ResourceExhausted` for a third generation,
+then verifies selective slot reuse without changing the still-live hash.
+
 The NCCL-free `--backward-sanitizer` harness executes the exact production
 Forward and Backward kernels with an initialized world-1 fixture. It is part of
 `make cuda-sanitizer-smoke` for memcheck, racecheck, and initcheck.

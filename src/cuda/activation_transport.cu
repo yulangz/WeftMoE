@@ -269,6 +269,25 @@ struct BackwardExpertDwTimeline {
   unsigned long long dw2_complete_clock;
 };
 
+enum BackwardProgressWord : std::uint32_t {
+  kBackwardEntered = 0,
+  kBackwardSetupComplete = 1,
+  kBackwardDyComplete = 2,
+  kBackwardDvStarted = 3,
+  kBackwardDvComplete = 4,
+  kBackwardDgateComplete = 5,
+  kBackwardDxStarted = 6,
+  kBackwardDxComplete = 7,
+  kBackwardDw2Started = 8,
+  kBackwardDw2Complete = 9,
+  kBackwardDw1Started = 10,
+  kBackwardDw1Complete = 11,
+  kBackwardReduceComplete = 12,
+  kBackwardTerminal = 13,
+  kBackwardHashBase = 16,
+  kBackwardProgressExpertBase = 32,
+};
+
 struct Layout {
   std::size_t input = 0;
   std::size_t ring_headers = 0;
@@ -526,6 +545,9 @@ enum class SlotState : std::uint8_t { Available, InUse, Quarantined };
 struct PoolSlot {
   void *device = nullptr;
   TransportDeviceStatus *host_status = nullptr;
+  std::uint64_t *host_backward_progress = nullptr;
+  std::uint64_t *device_backward_progress = nullptr;
+  std::size_t backward_progress_words = 0;
   std::uint64_t *host_cancel_epoch = nullptr;
   std::uint64_t *device_cancel_epoch = nullptr;
   cudaEvent_t producer_ready = nullptr;
@@ -601,6 +623,10 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
       if (slot.host_status)
         (void)cudaFreeHost(slot.host_status);
+      if (slot.host_backward_progress)
+        internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
+      if (slot.host_backward_progress)
+        (void)cudaFreeHost(slot.host_backward_progress);
       if (slot.host_cancel_epoch)
         internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
       if (slot.host_cancel_epoch)
@@ -1819,6 +1845,12 @@ __global__ void finalize_forward_weight_hash_kernel(
   *result = value;
 }
 
+__global__ void flip_validation_byte_kernel(unsigned char *storage,
+                                            std::uint64_t byte_offset) {
+  if (blockIdx.x == 0U && threadIdx.x == 0U)
+    storage[byte_offset] ^= 1U;
+}
+
 __global__ void initialize_forward_weights_kernel(
     transport::BFloat16 *w1, std::uint64_t w1_elements,
     transport::BFloat16 *w2, std::uint64_t w2_elements,
@@ -2843,10 +2875,22 @@ struct BackwardKernelArgs {
   std::size_t outgoing_signal_offset;
   std::size_t status_offset;
   const unsigned long long *cancel_epoch;
+  unsigned long long *progress;
+  std::uint32_t progress_experts;
   bool use_forward_cache;
 };
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
+
+__device__ void backward_publish_progress(const BackwardKernelArgs &a,
+                                          std::uint32_t word,
+                                          unsigned long long value) {
+  if (a.progress == nullptr || blockIdx.x != 0U || threadIdx.x != 0U)
+    return;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> target(
+      a.progress[word]);
+  target.store(value, ::cuda::memory_order_release);
+}
 
 __device__ __attribute__((unused)) void backward_reduce_token_slice(
     const BackwardKernelArgs &a, const transport::BFloat16 *dx_return,
@@ -2986,7 +3030,7 @@ __device__ __attribute__((unused)) void backward_wgmma_tile(
 // canonical row-major [canonical-M, output] storage and is consumed as
 // MN-major.  Four 64-column TMA atoms form one 256-column B tile; consequently
 // no full dY/X transpose or staging pass is required.
-__device__ void backward_wgmma_dw_k_mn_tile(
+__device__ __attribute__((unused)) void backward_wgmma_dw_k_mn_tile(
     const CUtensorMap &a_map, const CUtensorMap &b_mn_map,
     std::uint32_t a_reduction_start, std::uint32_t b_reduction_start,
     std::uint32_t output_row, std::uint32_t output_column,
@@ -3242,6 +3286,7 @@ __device__ std::uint32_t backward_mblock_expert(
   local_mblock = 0;
   return a.dispatch.sizes.owned_expert_count;
 }
+
 #endif
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a) {
@@ -3300,8 +3345,9 @@ local_p2p_backward_megakernel(
   auto *ab = a.use_forward_cache
                  ? peer_at<transport::BFloat16>(a.local_base,
                                                  a.forward_ab_cache_offset)
-                 : peer_at<transport::BFloat16>(a.local_base,
+                       : peer_at<transport::BFloat16>(a.local_base,
                                                  a.recompute_ab_offset);
+  backward_publish_progress(a, kBackwardEntered, a.epoch);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *smem_b = reinterpret_cast<transport::BFloat16 *>(
@@ -3332,12 +3378,26 @@ local_p2p_backward_megakernel(
     scheduler[8] = mblocks;
     scheduler[9] = padded;
   }
+  grid.sync();
   for (std::uint32_t expert =
            static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        expert < a.dispatch.sizes.owned_expert_count;
-       expert += static_cast<std::uint32_t>(gridDim.x) * blockDim.x)
+       expert += static_cast<std::uint32_t>(gridDim.x) * blockDim.x) {
     dw_timeline[expert] = BackwardExpertDwTimeline{};
+    if (a.dispatch.expert_row_count[expert] == 0ULL) {
+      dw_timeline[expert].ready_clock = status->start_clock;
+      atomicMin(&status->dw1_first_ready_clock, status->start_clock);
+      atomicMin(&status->dw2_first_ready_clock, status->start_clock);
+    }
+    if (a.progress != nullptr && expert < a.progress_experts) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> rows(
+          a.progress[kBackwardProgressExpertBase + expert * 8U]);
+      rows.store(a.dispatch.expert_row_count[expert],
+                 ::cuda::memory_order_release);
+    }
+  }
   grid.sync();
+  backward_publish_progress(a, kBackwardSetupComplete, scheduler[8]);
 
   // Build an immutable padded-canonical lookup. dW reductions use this to
   // preserve canonical M order while giving every TMA reduction a 64-row tail.
@@ -3418,6 +3478,7 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dy_dispatch_complete_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDyComplete, a.epoch);
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   if (threadIdx.x == 256U) {
@@ -3517,6 +3578,7 @@ local_p2p_backward_megakernel(
   const auto dv_tasks = mblocks * dv_ntiles;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dv_start_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDvStarted, dv_tasks);
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[1], 1ULL);
@@ -3728,6 +3790,7 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dv_complete_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDvComplete, dv_tasks);
 
   // The owner dV CTA wrote each fixed I-tile partial above. An ordered tile
   // reduction now produces one dGate per canonical route.
@@ -3744,6 +3807,7 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dgate_complete_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDgateComplete, incoming_rows);
 
   // dY and X remain in canonical row-major storage.  The dW WGMMA path below
   // consumes them directly as MN-major operands, so this point is now only a
@@ -3778,6 +3842,7 @@ local_p2p_backward_megakernel(
       a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_start_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDxStarted, dx_tasks);
   // Main-shape dX tasks have uniform K and a unique output tile owner. A
   // deterministic grid-stride assignment removes the global claim atomic
   // while retaining enough cross-expert parallelism to fill every SM.
@@ -3849,6 +3914,7 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_complete_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardDxComplete, dx_tasks);
 
   // Every dX contribution and dGate scalar is now globally visible. Publish
   // the per-source completion before dW so peer acquire latency is hidden by
@@ -3865,74 +3931,50 @@ local_p2p_backward_megakernel(
   // that expert's padded canonical-M segment in ascending order.
   // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
   // 128x128 accumulator tile directly into the parameter layout [H,I].
+  backward_publish_progress(a, kBackwardDw2Started, dw2_tasks);
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
     if (task_shared >= dw2_tasks)
       break;
-    constexpr bool is_dw1 = false;
     auto task = task_shared;
-    const auto ntiles = dw2_ntiles;
-    const auto mtiles = dw2_mtiles;
-    const auto per_expert = mtiles * ntiles;
+    const auto per_expert = dw2_mtiles * dw2_ntiles;
     const auto expert = static_cast<std::uint32_t>(task / per_expert);
     task %= per_expert;
-    // Consecutive claims share the larger canonical-MN B tile (X or dY)
-    // across output-row tiles.  This gives L2 one 32-KiB operand to reuse,
-    // instead of reusing the smaller 16-KiB transposed A tile.
-    const auto ntile = task / mtiles;
-    const auto mtile = task % mtiles;
+    const auto ntile = task / dw2_mtiles;
+    const auto mtile = task % dw2_mtiles;
     const auto reduction_start = claims[expert];
     const auto reduction =
         (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0U) {
       const auto now = device_globaltimer_ns();
-      auto *first_start = is_dw1
-                              ? &dw_timeline[expert].dw1_first_start_clock
-                              : &dw_timeline[expert].dw2_first_start_clock;
-      if (atomicCAS(first_start, 0ULL, now) == 0ULL)
-        atomicMin(is_dw1 ? &status->dw1_first_start_clock
-                         : &status->dw2_first_start_clock,
-                  now);
+      if (atomicCAS(&dw_timeline[expert].dw2_first_start_clock, 0ULL, now) ==
+          0ULL)
+        atomicMin(&status->dw2_first_start_clock, now);
     }
-    __syncthreads();
-    float accum[BackwardDwMixedMma::kNumAccum];
-    if (is_dw1) {
-      backward_wgmma_dw_k_mn_tile(
-          dab_transpose_map, x_mn_map,
-          static_cast<std::uint32_t>(reduction_start),
-          static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
-          static_cast<std::uint32_t>(mtile * 128ULL),
-          static_cast<std::uint32_t>(ntile * kDwN),
-          static_cast<std::uint32_t>(reduction), smem_a, smem_b,
-          full_barriers, empty_barriers, accum, pipeline_iteration);
-    } else {
-      backward_wgmma_dw_mn_k_tile(
-          dy_mn_map, u_transpose_map,
-          static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
-          static_cast<std::uint32_t>(reduction_start),
-          static_cast<std::uint32_t>(mtile * 128ULL),
-          static_cast<std::uint32_t>(ntile * kDwN),
-          static_cast<std::uint32_t>(reduction), smem_a, smem_b,
-          full_barriers, empty_barriers, accum, pipeline_iteration);
-    }
-    const auto mma_rows = is_dw1 ? 2ULL * a.intermediate : a.hidden;
-    const auto mma_columns = is_dw1 ? a.hidden : a.intermediate;
-    const auto output_rows = mma_rows;
-    const auto output_columns = mma_columns;
-    auto *output = is_dw1 ? dw1 : dw2;
+    float accum[BackwardDwDirectMma::kNumAccum];
+    backward_wgmma_dw_mn_k_tile(
+        dy_mn_map, u_transpose_map,
+        static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
+        static_cast<std::uint32_t>(reduction_start),
+        static_cast<std::uint32_t>(mtile * 128ULL),
+        static_cast<std::uint32_t>(ntile * kDwN),
+        static_cast<std::uint32_t>(reduction), smem_a, smem_b,
+        full_barriers, empty_barriers, accum, pipeline_iteration);
+    const auto output_rows = a.hidden;
+    const auto output_columns = a.intermediate;
     const auto expert_stride = output_rows * output_columns;
     auto *output_tile = smem_a;
     visit_forward_accumulator_wide(
         accum, [&](std::uint32_t wg, std::uint32_t m,
                    std::uint32_t column, float v0, float v1) {
-        const auto local_row = wg * 64U + m;
-        output_tile[local_row * kDwN + column] =
-            transport::BFloat16{float_to_bf16_bits(v0)};
-        output_tile[local_row * kDwN + column + 1U] =
-            transport::BFloat16{float_to_bf16_bits(v1)};
-      });
+          const auto local_row = wg * 64U + m;
+          output_tile[local_row * kDwN + column] =
+              transport::BFloat16{float_to_bf16_bits(v0)};
+          output_tile[local_row * kDwN + column + 1U] =
+              transport::BFloat16{float_to_bf16_bits(v1)};
+        });
     __syncthreads();
     constexpr std::uint32_t kVectorsPerRow = kDwN / 8U;
     constexpr std::uint32_t kOutputVectors = 128U * kVectorsPerRow;
@@ -3944,31 +3986,24 @@ local_p2p_backward_megakernel(
       const auto mma_column = ntile * kDwN + local_vector * 8ULL;
       if (mma_row < output_rows && mma_column + 7ULL < output_columns) {
         reinterpret_cast<uint4 *>(
-            output + expert * expert_stride + mma_row * output_columns +
+            dw2 + expert * expert_stride + mma_row * output_columns +
             mma_column)[0] = reinterpret_cast<const uint4 *>(
                 output_tile + local_row * kDwN)[local_vector];
       }
     }
     __syncthreads();
-    __syncthreads();
 #if MEGAMOE_DEBUG_VALIDATE
-    if (threadIdx.x == 0) {
-      const auto complete = is_dw1
-          ? atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL
-          : atomicAdd(&dw_timeline[expert].dw2_tasks_complete, 1ULL) + 1ULL;
+    if (threadIdx.x == 0U) {
+      const auto complete =
+          atomicAdd(&dw_timeline[expert].dw2_tasks_complete, 1ULL) + 1ULL;
       if (complete == per_expert) {
         const auto now = device_globaltimer_ns();
-        if (is_dw1) {
-          dw_timeline[expert].dw1_complete_clock = now;
-          atomicMax(&status->dw1_last_complete_clock, now);
-        } else {
-          dw_timeline[expert].dw2_complete_clock = now;
-          atomicMax(&status->dw2_last_complete_clock, now);
-        }
+        dw_timeline[expert].dw2_complete_clock = now;
+        atomicMax(&status->dw2_last_complete_clock, now);
       }
     }
-#endif
     __syncthreads();
+#endif
   }
 #if !MEGAMOE_DEBUG_VALIDATE
   // Release timing needs only the true global completion boundary. One
@@ -3976,6 +4011,7 @@ local_p2p_backward_megakernel(
   if (threadIdx.x == 0U)
     atomicMax(&status->dw2_last_complete_clock, device_globaltimer_ns());
 #endif
+  backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
 
   // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
   // preceding general dW2 loop, the accumulator is lexically confined to the
@@ -4009,6 +4045,7 @@ local_p2p_backward_megakernel(
   if (threadIdx.x == 0U)
     task_shared = blockIdx.x;
   __syncthreads();
+  backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
   if (dw_warpgroup >= 2U) {
     cutlass::arch::warpgroup_reg_dealloc<48>();
     std::uint32_t dw_pipeline = 0U;
@@ -4169,6 +4206,7 @@ local_p2p_backward_megakernel(
         task_shared += gridDim.x;
     }
   }
+  backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
@@ -4194,6 +4232,8 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_reduce_complete_clock = device_globaltimer_ns();
+  backward_publish_progress(a, kBackwardReduceComplete,
+                            a.dispatch.identity.num_tokens);
 
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -4251,6 +4291,7 @@ local_p2p_backward_megakernel(
                         dw2_reduction_iterations * 4ULL;
 #endif
     status->complete_clock = device_globaltimer_ns();
+    backward_publish_progress(a, kBackwardTerminal, a.epoch);
   }
 }
 
@@ -4430,6 +4471,19 @@ struct DeviceBackwardHandle::Impl {
   std::uint64_t hidden = 0;
   std::uint64_t intermediate = 0;
   bool used_forward_cache = false;
+  bool hashes_captured = false;
+  BackwardStorageHashes hashes;
+};
+
+struct BackwardStorageHashAccess {
+  static const DeviceBackwardHandle::Impl &get(
+      const DeviceBackwardHandle &handle) {
+    return *handle.impl_;
+  }
+  static DeviceBackwardHandle::Impl &get_mutable(
+      const DeviceBackwardHandle &handle) {
+    return const_cast<DeviceBackwardHandle::Impl &>(*handle.impl_);
+  }
 };
 
 struct LocalCudaP2pBackwardMegaKernel::Impl {
@@ -4815,6 +4869,153 @@ testing::hash_forward_weight_storage_for_validation(
   return hashes;
 }
 
+static BackwardStorageHashes hash_backward_storage_impl(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution,
+    bool allow_completion_hash) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle, "backward-storage-hash",
+                    "handle/execution", 0, "valid", "empty");
+  const auto &impl = BackwardStorageHashAccess::get(handle);
+  if (allow_completion_hash && impl.hashes_captured)
+    return impl.hashes;
+  const auto state = internal::checked_execution_state(execution);
+  if (state->device != impl.pool->device ||
+      !execution.token().same_instance(impl.backend->execution.token()))
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "backward-storage-hash", "execution/device",
+                    impl.identity.rank, "exact Backward execution", "foreign");
+  const auto &slot = impl.pool->slots[impl.slot->index];
+  const auto &layout = impl.pool->layout;
+  const auto hash_one = [&](const transport::BFloat16 *values,
+                            std::uint64_t elements,
+                            const char *field) -> DeviceStorageHash128 {
+    if (elements == 0)
+      return {kWeightHashSeedLow, kWeightHashSeedHigh, 0};
+    const auto chunk_count =
+        (elements + kWeightHashChunkElements - 1ULL) /
+        kWeightHashChunkElements;
+    const auto chunk_bytes = checked_size(
+        checked_mul(chunk_count, sizeof(WeightHashPair),
+                    "backward hash chunk bytes"),
+        "backward hash chunk bytes");
+    const auto scratch_bytes =
+        layout.backward_dw_timeline - layout.backward_scheduler;
+    if (chunk_bytes > scratch_bytes)
+      transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                      "backward-storage-hash", "pooled hash scratch",
+                      impl.identity.rank, std::to_string(chunk_bytes),
+                      std::to_string(scratch_bytes));
+    auto *device_chunks = reinterpret_cast<WeightHashPair *>(
+        at<void>(slot.device, layout.backward_scheduler));
+    auto *device_result = reinterpret_cast<WeightHashPair *>(
+        at<void>(slot.device, layout.backward_status));
+    hash_forward_weight_chunks_kernel<<<
+        static_cast<unsigned>(chunk_count), 256, 0, state->stream>>>(
+        values, elements, device_chunks);
+    internal::throw_cuda(
+        "backward-storage-hash", cudaGetLastError(), impl.identity.rank,
+        impl.identity.world, "backward-validation", impl.identity.generation,
+        ExchangeKind::ExpertCounts, field);
+    finalize_forward_weight_hash_kernel<<<1, 1, 0, state->stream>>>(
+        device_chunks, chunk_count, elements, device_result);
+    internal::throw_cuda(
+        "backward-storage-hash", cudaGetLastError(), impl.identity.rank,
+        impl.identity.world, "backward-validation", impl.identity.generation,
+        ExchangeKind::ExpertCounts, "finalize backward storage hash");
+    WeightHashPair host{};
+    internal::throw_cuda(
+        "backward-storage-hash",
+        cudaMemcpyAsync(&host, device_result, sizeof(host),
+                        cudaMemcpyDeviceToHost, state->stream),
+        impl.identity.rank, impl.identity.world, "backward-validation",
+        impl.identity.generation, ExchangeKind::ExpertCounts,
+        "cudaMemcpyAsync(backward hash result)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                              sizeof(host));
+    internal::throw_cuda(
+        "backward-storage-hash", cudaStreamSynchronize(state->stream),
+        impl.identity.rank, impl.identity.world, "backward-validation",
+        impl.identity.generation, ExchangeKind::ExpertCounts,
+        "cudaStreamSynchronize(backward hash)");
+    return {host.low, host.high, elements};
+  };
+  const auto dx_elements = checked_mul(impl.identity.tokens, impl.hidden,
+                                       "backward hash dX");
+  const auto dw1_elements = checked_mul(
+      checked_mul(impl.owned_experts, 2ULL * impl.intermediate,
+                  "backward hash dW1 rows"),
+      impl.hidden, "backward hash dW1");
+  const auto dw2_elements = checked_mul(
+      checked_mul(impl.owned_experts, impl.hidden,
+                  "backward hash dW2 rows"),
+      impl.intermediate, "backward hash dW2");
+  BackwardStorageHashes hashes;
+  hashes.dx = hash_one(
+      at<const transport::BFloat16>(slot.device, layout.backward_dx_combined),
+      dx_elements, "hash backward dX");
+  hashes.dw1 = hash_one(
+      at<const transport::BFloat16>(slot.device, layout.backward_dw1),
+      dw1_elements, "hash backward dW1");
+  hashes.dw2 = hash_one(
+      at<const transport::BFloat16>(slot.device, layout.backward_dw2),
+      dw2_elements, "hash backward dW2");
+  hashes.dgate = hash_one(
+      reinterpret_cast<const transport::BFloat16 *>(
+          at<const float>(slot.device, layout.backward_dgate)),
+      checked_mul(impl.route_count, 2ULL, "backward hash dGate BF16 words"),
+      "hash backward dGate");
+  return hashes;
+}
+
+BackwardStorageHashes testing::hash_backward_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution) {
+  return hash_backward_storage_impl(handle, execution, true);
+}
+
+BackwardStorageHashes testing::rehash_backward_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution) {
+  return hash_backward_storage_impl(handle, execution, false);
+}
+
+void testing::flip_backward_dx_byte_for_validation(
+    const DeviceBackwardHandle &handle, std::uint64_t byte_offset,
+    const CudaExecution &execution) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle, "backward-byte-flip",
+                    "handle/execution", 0, "valid", "empty");
+  auto &impl = BackwardStorageHashAccess::get_mutable(handle);
+  const auto state = internal::checked_execution_state(execution);
+  if (state->device != impl.pool->device ||
+      !execution.token().same_instance(impl.backend->execution.token()))
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "backward-byte-flip", "execution/device",
+                    impl.identity.rank, "exact Backward execution", "foreign");
+  const auto dx_bytes = checked_mul(
+      checked_mul(impl.identity.tokens, impl.hidden,
+                  "backward byte flip dX elements"),
+      sizeof(transport::BFloat16), "backward byte flip dX bytes");
+  if (byte_offset >= dx_bytes)
+    transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                    "backward-byte-flip", "byte_offset", impl.identity.rank,
+                    "<" + std::to_string(dx_bytes),
+                    std::to_string(byte_offset));
+  auto &slot = impl.pool->slots[impl.slot->index];
+  flip_validation_byte_kernel<<<1, 1, 0, state->stream>>>(
+      at<unsigned char>(slot.device,
+                        impl.pool->layout.backward_dx_combined),
+      byte_offset);
+  internal::throw_cuda(
+      "backward-byte-flip", cudaGetLastError(), impl.identity.rank,
+      impl.identity.world, "backward-validation", impl.identity.generation,
+      ExchangeKind::ExpertCounts, "flip actual dX byte");
+  internal::throw_cuda(
+      "backward-byte-flip", cudaStreamSynchronize(state->stream),
+      impl.identity.rank, impl.identity.world, "backward-validation",
+      impl.identity.generation, ExchangeKind::ExpertCounts,
+      "wait actual dX byte flip");
+  impl.hashes_captured = false;
+}
+
 constexpr std::uint64_t kLocalP2pBootstrapMagic = 0x31504350454f4d4dULL;
 constexpr std::uint64_t kLocalP2pBootstrapSchema = 1;
 constexpr std::size_t kLocalP2pBootstrapHeaderBytes = 96;
@@ -5174,6 +5375,28 @@ ActivationTransportResourcePool make_activation_transport_pool(
           0, session.world_size(), session.identity(), session.generation(),
           ExchangeKind::ExpertCounts, "cudaHostAlloc(transport status)");
       internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+      slot.backward_progress_words =
+          32ULL + static_cast<std::size_t>(config.max_owned_experts) * 8ULL;
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaHostAlloc(
+              reinterpret_cast<void **>(&slot.host_backward_progress),
+              slot.backward_progress_words * sizeof(std::uint64_t),
+              cudaHostAllocPortable | cudaHostAllocMapped),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaHostAlloc(mapped Backward progress)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaHostGetDevicePointer(
+              reinterpret_cast<void **>(&slot.device_backward_progress),
+              slot.host_backward_progress, 0),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaHostGetDevicePointer(Backward progress)");
+      std::fill_n(slot.host_backward_progress, slot.backward_progress_words,
+                  0ULL);
       internal::throw_cuda(
           "transport-pool-create",
           cudaHostAlloc(reinterpret_cast<void **>(&slot.host_cancel_epoch),
@@ -6819,6 +7042,13 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.status_offset = layout.backward_status;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
+  std::fill_n(slot.host_backward_progress, slot.backward_progress_words,
+              0ULL);
+  args.progress = std::getenv("MEGAMOE_BACKWARD_PROGRESS_DUMP") != nullptr
+                      ? reinterpret_cast<unsigned long long *>(
+                            slot.device_backward_progress)
+                      : nullptr;
+  args.progress_experts = state->config.max_owned_experts;
   args.use_forward_cache =
       f.cache_mode == ForwardCacheMode::CacheFc1InputOutput;
 
@@ -6873,6 +7103,81 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA Backward launch");
+  const bool capture_hashes =
+      std::getenv("MEGAMOE_BACKWARD_CAPTURE_HASH") != nullptr;
+  if (capture_hashes) {
+    const auto scratch_bytes =
+        layout.backward_dw_timeline - layout.backward_scheduler;
+    auto *device_chunks = reinterpret_cast<WeightHashPair *>(
+        at<void>(slot.device, layout.backward_scheduler));
+    const auto enqueue_hash = [&](const transport::BFloat16 *values,
+                                  std::uint64_t elements,
+                                  std::uint32_t hash_index,
+                                  const char *field) {
+      auto *device_result = reinterpret_cast<WeightHashPair *>(
+          slot.device_backward_progress + kBackwardHashBase) + hash_index;
+      if (elements == 0) {
+        finalize_forward_weight_hash_kernel<<<1, 1, 0, exec->stream>>>(
+            device_chunks, 0, 0, device_result);
+        internal::throw_cuda(
+            "backward-run", cudaGetLastError(),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, field);
+        return;
+      }
+      const auto chunk_count =
+          (elements + kWeightHashChunkElements - 1ULL) /
+          kWeightHashChunkElements;
+      const auto chunk_bytes = checked_size(
+          checked_mul(chunk_count, sizeof(WeightHashPair),
+                      "captured Backward hash chunks"),
+          "captured Backward hash chunks");
+      if (chunk_bytes > scratch_bytes)
+        transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                        "backward-run", "captured hash scratch",
+                        id.calling_rank, std::to_string(chunk_bytes),
+                        std::to_string(scratch_bytes));
+      hash_forward_weight_chunks_kernel<<<
+          static_cast<unsigned>(chunk_count), 256, 0, exec->stream>>>(
+          values, elements, device_chunks);
+      internal::throw_cuda(
+          "backward-run", cudaGetLastError(), id.calling_rank,
+          id.world_size, backend->session.session().identity(), id.generation,
+          ExchangeKind::ExpertCounts, field);
+      finalize_forward_weight_hash_kernel<<<1, 1, 0, exec->stream>>>(
+          device_chunks, chunk_count, elements, device_result);
+      internal::throw_cuda(
+          "backward-run", cudaGetLastError(), id.calling_rank,
+          id.world_size, backend->session.session().identity(), id.generation,
+          ExchangeKind::ExpertCounts, field);
+    };
+    const auto dx_elements = checked_mul(id.num_tokens, config.hidden_size,
+                                         "captured Backward dX hash");
+    const auto dw1_elements = checked_mul(
+        checked_mul(view.sizes.owned_expert_count,
+                    2ULL * config.intermediate_size,
+                    "captured Backward dW1 rows"),
+        config.hidden_size, "captured Backward dW1 hash");
+    const auto dw2_elements = checked_mul(
+        checked_mul(view.sizes.owned_expert_count, config.hidden_size,
+                    "captured Backward dW2 rows"),
+        config.intermediate_size, "captured Backward dW2 hash");
+    enqueue_hash(at<const transport::BFloat16>(
+                     slot.device, layout.backward_dx_combined),
+                 dx_elements, 0U, "capture Backward dX hash");
+    enqueue_hash(at<const transport::BFloat16>(slot.device,
+                                                layout.backward_dw1),
+                 dw1_elements, 1U, "capture Backward dW1 hash");
+    enqueue_hash(at<const transport::BFloat16>(slot.device,
+                                                layout.backward_dw2),
+                 dw2_elements, 2U, "capture Backward dW2 hash");
+    enqueue_hash(reinterpret_cast<const transport::BFloat16 *>(
+                     at<const float>(slot.device, layout.backward_dgate)),
+                 checked_mul(view.sizes.route_count, 2ULL,
+                             "captured Backward dGate words"),
+                 3U, "capture Backward dGate hash");
+  }
   static_assert(sizeof(BackwardDeviceStatus) <= sizeof(TransportDeviceStatus));
   internal::throw_cuda(
       "backward-run",
@@ -6895,6 +7200,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
 
   const auto wait_start = std::chrono::steady_clock::now();
   bool cancelled = false;
+  bool progress_dumped = false;
   while (true) {
     const auto query = cudaEventQuery(slot.complete);
     if (query == cudaSuccess)
@@ -6907,6 +7213,35 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     const auto expired = options.deadline_after.count() > 0 &&
                          std::chrono::steady_clock::now() - wait_start >=
                              options.deadline_after;
+    const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
+    if (!progress_dumped && stalled_for >= std::chrono::seconds(30)) {
+      const auto progress = [&](std::uint32_t word) {
+        return __atomic_load_n(slot.host_backward_progress + word,
+                               __ATOMIC_ACQUIRE);
+      };
+      std::cerr << "BACKWARD_PROGRESS rank=" << id.calling_rank
+                << " generation=" << id.generation
+                << " entered=" << progress(kBackwardEntered)
+                << " setup_mblocks=" << progress(kBackwardSetupComplete)
+                << " dy_done=" << progress(kBackwardDyComplete)
+                << " dv_tasks=" << progress(kBackwardDvStarted)
+                << " dv_done=" << progress(kBackwardDvComplete)
+                << " dgate_rows=" << progress(kBackwardDgateComplete)
+                << " dx_tasks=" << progress(kBackwardDxStarted)
+                << " dx_done=" << progress(kBackwardDxComplete)
+                << " dw2_tasks=" << progress(kBackwardDw2Started)
+                << " dw2_done=" << progress(kBackwardDw2Complete)
+                << " dw1_tasks=" << progress(kBackwardDw1Started)
+                << " dw1_done=" << progress(kBackwardDw1Complete)
+                << " reduced_tokens=" << progress(kBackwardReduceComplete)
+                << " terminal=" << progress(kBackwardTerminal);
+      for (std::uint32_t expert = 0;
+           expert < view.sizes.owned_expert_count; ++expert)
+        std::cerr << " expert[" << expert << "].rows="
+                  << progress(kBackwardProgressExpertBase + expert * 8U);
+      std::cerr << std::endl;
+      progress_dumped = true;
+    }
     if (!cancelled &&
         (expired || options.cancellation.cancellation_requested())) {
       __atomic_store_n(slot.host_cancel_epoch, args.epoch, __ATOMIC_RELEASE);
@@ -6965,6 +7300,29 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->hidden = config.hidden_size;
   result->intermediate = config.intermediate_size;
   result->used_forward_cache = args.use_forward_cache;
+  result->hashes_captured = capture_hashes;
+  if (capture_hashes) {
+    const auto *captured = reinterpret_cast<const WeightHashPair *>(
+        slot.host_backward_progress + kBackwardHashBase);
+    const auto dx_elements = checked_mul(id.num_tokens, config.hidden_size,
+                                         "captured dX hash elements");
+    const auto dw1_elements = checked_mul(
+        checked_mul(view.sizes.owned_expert_count,
+                    2ULL * config.intermediate_size,
+                    "captured dW1 hash rows"),
+        config.hidden_size, "captured dW1 hash elements");
+    const auto dw2_elements = checked_mul(
+        checked_mul(view.sizes.owned_expert_count, config.hidden_size,
+                    "captured dW2 hash rows"),
+        config.intermediate_size, "captured dW2 hash elements");
+    result->hashes.dx = {captured[0].low, captured[0].high, dx_elements};
+    result->hashes.dw1 = {captured[1].low, captured[1].high, dw1_elements};
+    result->hashes.dw2 = {captured[2].low, captured[2].high, dw2_elements};
+    result->hashes.dgate = {
+        captured[3].low, captured[3].high,
+        checked_mul(view.sizes.route_count, 2ULL,
+                    "captured dGate hash BF16 words")};
+  }
   result->audit.specialization =
       BackwardKernelSpecialization::Sm90WgmmaTma7168x3072;
   result->audit.persistent_kernel_launches = 1;
@@ -7153,6 +7511,39 @@ bool testing_forward_cache_ranges_disjoint(
                     "forward-cache-isolation", "address range", 0,
                     "checked native interval", "overflow");
   return a_begin + a_bytes <= b_begin || b_begin + b_bytes <= a_begin;
+}
+
+bool testing_backward_storage_ranges_disjoint(
+    const DeviceBackwardHandle &left, const DeviceBackwardHandle &right) {
+  if (!left || !right)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "backward-storage-isolation", "handle", 0,
+                    "two valid handles", "empty");
+  const auto &a = *left.impl_;
+  const auto &b = *right.impl_;
+  if (a.pool.get() != b.pool.get())
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "backward-storage-isolation", "pool", 0,
+                    "same activation pool", "foreign");
+  const auto a_begin = reinterpret_cast<std::uintptr_t>(
+      a.pool->slots[a.slot->index].device);
+  const auto b_begin = reinterpret_cast<std::uintptr_t>(
+      b.pool->slots[b.slot->index].device);
+  const auto bytes = a.pool->layout.total;
+  if (a_begin > std::numeric_limits<std::uintptr_t>::max() - bytes ||
+      b_begin > std::numeric_limits<std::uintptr_t>::max() - bytes)
+    transport_error(NotifyErrorCode::ArithmeticOverflow,
+                    "backward-storage-isolation", "arena interval", 0,
+                    "checked native interval", "overflow");
+  return a_begin + bytes <= b_begin || b_begin + bytes <= a_begin;
+}
+
+std::size_t testing_backward_slot_index(const DeviceBackwardHandle &handle) {
+  if (!handle)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "backward-slot-validation", "handle", 0,
+                    "valid", "empty");
+  return handle.impl_->slot->index;
 }
 
 BackwardValidationDownload download_backward_for_validation(

@@ -691,6 +691,19 @@ make ENABLE_CUDA=1 WERROR=1 \
 LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
   python3 tests/run_local_activation_p2p.py \
     --binary "$PWD/build/test_cuda_notify" --world 8 --backward-smoke
+
+# Empty-expert termination: 100 consecutive world=8/top-k=1 generations.
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  python3 tests/run_local_activation_p2p.py \
+    --binary "$PWD/build/test_cuda_notify" --world 8 --backward-smoke \
+    --backward-cache --top-k 1 --backward-smoke-repeats 100 --timeout 90
+
+# Two simultaneous main-shape Backward handles and selective slot reuse.
+LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
+  python3 tests/run_local_activation_p2p.py \
+    --binary "$PWD/build/test_cuda_notify" --world 8 \
+    --backward-benchmark --backward-cache \
+    --backward-cache-pool2-validation --rounds 11 --timeout 90
 ```
 
 The Backward sanitizer path bypasses NCCL bootstrap but launches the exact
@@ -711,7 +724,9 @@ LD_LIBRARY_PATH=/path/to/nccl/lib:$LD_LIBRARY_PATH \
 `make ENABLE_CUDA=1 cuda-sanitizer-smoke` includes all three commands. The
 main-shape benchmark uses `--backward-benchmark --backward-cache`; its JSON
 reports the single persistent launch, BF16 dW dtype, per-stage device clocks,
-actual dY/dX peer bytes and complete per-rank pool bytes.
+actual dY/dX peer bytes, complete per-rank pool bytes, and fixed-order hashes
+of the complete device dX/dW1/dW2/dGate storage. `gradient_hash_repeats=20`
+means all four hashes were byte-stable for twenty independent generations.
 
 ## Clean export
 

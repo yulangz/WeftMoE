@@ -676,3 +676,20 @@ the dV epilogue; dY/X use a coalesced 256x256 shared-memory transpose. Weight
 transposes and TMA descriptors are one-time weight/session setup. The steady
 Backward launch initializes only its small status/signal words and performs no
 CUDA/pinned/event allocation or device-wide synchronization.
+
+An owned expert with zero canonical rows is made ready during generation
+setup. It has no dY/dV/dX producer task, but its dW1 and dW2 output tiles remain
+real persistent-kernel tasks that vector-store BF16 zero and contribute to the
+same expected/completed terminal accounting. This closes the case where a rank
+owns only empty experts (common for world=8/top-k=1) without inventing a host
+phase or a second kernel.
+
+Each slot also owns a small mapped progress page. The kernel writes it only
+when timeout diagnostics are explicitly enabled; after 30 seconds the host may
+dump Forward terminal epoch, Backward phase counters and per-expert row state.
+This is observation only and never participates in the completion predicate.
+Complete-gradient validation hashes are computed on device with fixed chunk
+and reduction order. Hash results are staged, not gradient tensors. A
+`DeviceBackwardHandle` retains its slot, so two live handles have disjoint
+gradient/checkpoint ranges and the slot cannot be reused until the last handle
+lease is released.
