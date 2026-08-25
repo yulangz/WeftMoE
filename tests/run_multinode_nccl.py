@@ -344,7 +344,8 @@ def parse_args(argv=None):
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
-                 "gin_probe", "gin_put_probe", "activation_socket",
+                 "gin_probe", "gin_put_probe", "gin_team_pool",
+                 "activation_socket",
                  "activation_gin"),
         default="valid",
     )
@@ -499,6 +500,27 @@ def main(argv=None):
                                "\n".join(failures))
         print("\n".join(evidence))
         print(f"[PASS] real GIN rail put/signal/local-completion world={world}")
+        return
+
+    if args.scenario == "gin_team_pool":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("GIN_TEAM_POOL ")]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN team/pool failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] runtime GIN rail/local-team/pool world={world}")
         return
 
     if args.scenario == "activation_socket":

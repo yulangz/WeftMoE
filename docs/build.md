@@ -223,6 +223,12 @@ independent host oracle. Twenty generations complete with
 host. This is a genuine device-issued GIN dispatch/return slice, but it is not
 the world-16 backend and does not yet execute FC Forward/Backward.
 
+The runtime team/pool setup is separately checked on all 16 ranks with
+`--gpus-per-node 8 --scenario gin_team_pool`. The observed two-slot small-shape
+pool reports `54,848` ordinary compute bytes and `5,136` GIN-registered bytes
+per rank. All ranks validate rail size two, local team size eight, their
+runtime local rank, registered windows, and seven node-local IPC mappings.
+
 The explicit Socket correctness backend uses the default CUDA-12.9 NCCL
 runtime and requires the network choice at communicator creation. A two-rank
 run is:

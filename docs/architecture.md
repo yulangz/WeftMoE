@@ -661,6 +661,14 @@ reduction. It rejects every other team shape until source-indexed ingress and
 same-rail proxy plus local-P2P fan-out are connected, so the general
 `gin_usable` capability remains
 false. The session probe is collective and returns no native NCCL/CUDA handle.
+
+The world-16 setup path now derives `local_world_size = world / num_nodes`,
+checks the runtime rail/LSA teams, and exchanges compute-arena IPC handles
+collectively. Each rank opens only its seven node-local peers; the global-rank
+pointer table remains the stable fan-out index. GIN-registered storage is a
+separate `ncclMemAlloc` window containing only ingress, payload, return, and
+control slots. Canonical rows, compute transients, and weights remain ordinary
+CUDA allocations. Payload execution on this world-16 team is the next slice.
 The opt-in Socket correctness backend is now concrete and separately typed. It
 packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
 NCCL Send/Recv, performs destination device relay plus the validation expert

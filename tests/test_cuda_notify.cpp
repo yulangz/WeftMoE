@@ -2439,6 +2439,38 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << std::endl;
     return;
   }
+  if (scenario == "gin_team_pool") {
+    auto generation = megamoe::cuda::make_nccl_generation(
+        base, "cuda-gin-team-pool", 701);
+    megamoe::cuda::ActivationTransportPoolConfig config;
+    config.max_tokens_per_rank = 2;
+    config.max_hidden_size = 17;
+    config.max_top_k = 2;
+    config.max_world_size = world;
+    config.max_nodes = nodes;
+    config.max_destination_rows_per_rank = world * 4ULL;
+    config.channels = 2;
+    config.ring_slots_per_source_channel = 2;
+    config.max_inflight_generations = 2;
+    config.enable_gin_rdma = true;
+    auto activation_pool = megamoe::cuda::make_activation_transport_pool(
+        generation.session(), execution, config);
+    megamoe::cuda::GinRdmaActivationTransport transport(
+        generation, execution, activation_pool);
+    const auto usage = activation_pool.usage();
+    require(usage.compute_device_bytes != 0 &&
+                usage.gin_registered_bytes != 0 &&
+                usage.device_bytes > usage.compute_device_bytes,
+            "GIN pool did not separate compute and registered storage");
+    std::cout << "GIN_TEAM_POOL rank=" << rank << " world=" << world
+              << " nodes=" << nodes
+              << " local_world=" << gpus_per_node
+              << " local_rank=" << local_rank
+              << " compute_bytes=" << usage.compute_device_bytes
+              << " registered_bytes=" << usage.gin_registered_bytes
+              << " slots=" << config.max_inflight_generations << std::endl;
+    return;
+  }
   auto pool = megamoe::cuda::make_device_notify_resource_pool(
       base, execution,
       {common_config, max_tokens, 4096,

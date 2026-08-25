@@ -88,6 +88,8 @@ struct ActivationTransportPoolUsage {
   std::uint32_t slots_in_use = 0;
   std::uint32_t slots_quarantined = 0;
   std::uint64_t device_bytes = 0;
+  std::uint64_t compute_device_bytes = 0;
+  std::uint64_t gin_registered_bytes = 0;
   std::uint64_t pinned_bytes = 0;
   std::uint64_t event_count = 0;
   std::uint64_t epoch_high_watermark = 0;

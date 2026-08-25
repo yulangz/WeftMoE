@@ -341,7 +341,6 @@ struct Layout {
   std::size_t socket_header_send = 0;
   std::size_t socket_header_receive = 0;
   std::size_t socket_payload_receive = 0;
-  std::size_t gin_return_staging = 0;
   std::size_t forward_s = 0;
   std::size_t forward_ab_cache = 0;
   std::size_t forward_task_claim = 0;
@@ -368,6 +367,60 @@ struct Layout {
   std::size_t status = 0;
   std::size_t total = 0;
 };
+
+// Only these bytes participate in remote GIN registration. Compute arenas,
+// weights, canonical rows, and local-P2P storage stay in ordinary CUDA
+// allocations so enabling the network backend does not change their allocator.
+struct GinWindowLayout {
+  std::size_t send_packet_headers = 0;
+  std::size_t receive_packet_headers = 0;
+  std::size_t send_fanout = 0;
+  std::size_t receive_fanout = 0;
+  std::size_t send_payload = 0;
+  std::size_t receive_payload = 0;
+  std::size_t return_staging = 0;
+  std::size_t return_receive = 0;
+  std::size_t barrier = 0;
+  std::size_t total = 0;
+};
+
+GinWindowLayout make_gin_window_layout(
+    const ActivationTransportPoolConfig &config) {
+  GinWindowLayout layout;
+  if (!config.enable_gin_rdma)
+    return layout;
+  std::size_t cursor = 0;
+  const auto routes = checked_mul(config.max_tokens_per_rank,
+                                  config.max_top_k, "GIN max routes");
+  const auto packet_payload = checked_mul(routes, config.max_hidden_size,
+                                          "GIN packet payload elements");
+  const auto return_payload = checked_mul(routes, config.max_hidden_size,
+                                          "GIN return payload elements");
+  layout.send_packet_headers = append(
+      cursor, routes, sizeof(LocalP2pRouteHeader), "GIN send packet headers");
+  layout.receive_packet_headers = append(
+      cursor, routes, sizeof(LocalP2pRouteHeader),
+      "GIN receive packet headers");
+  layout.send_fanout = append(cursor, routes, sizeof(DeviceFanoutRecord),
+                              "GIN send fanout");
+  layout.receive_fanout = append(cursor, routes, sizeof(DeviceFanoutRecord),
+                                 "GIN receive fanout");
+  layout.send_payload = append(cursor, packet_payload,
+                               sizeof(transport::BFloat16),
+                               "GIN send payload");
+  layout.receive_payload = append(cursor, packet_payload,
+                                  sizeof(transport::BFloat16),
+                                  "GIN receive payload");
+  layout.return_staging = append(cursor, return_payload,
+                                 sizeof(transport::BFloat16),
+                                 "GIN return staging");
+  layout.return_receive = append(cursor, return_payload,
+                                 sizeof(transport::BFloat16),
+                                 "GIN return receive");
+  layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
+  layout.total = cursor;
+  return layout;
+}
 
 Layout make_layout(const ActivationTransportPoolConfig &config) {
   if (config.max_tokens_per_rank == 0 || config.max_hidden_size == 0 ||
@@ -469,12 +522,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                             config.max_hidden_size,
                             "Socket receive payload elements"),
         sizeof(transport::BFloat16), "Socket receive payload");
-    if (config.enable_gin_rdma)
-      layout.gin_return_staging = append(
-          cursor, checked_mul(config.max_destination_rows_per_rank,
-                              config.max_hidden_size,
-                              "GIN return staging elements"),
-          sizeof(transport::BFloat16), "GIN return staging");
   }
   if (config.max_intermediate_size != 0) {
     const auto forward_elements = checked_mul(
@@ -600,6 +647,7 @@ enum class SlotState : std::uint8_t { Available, InUse, Quarantined };
 
 struct PoolSlot {
   void *device = nullptr;
+  void *gin_window = nullptr;
   TransportDeviceStatus *host_status = nullptr;
   TransportDeviceStatus *host_forward_status = nullptr;
   std::uint64_t *host_backward_progress = nullptr;
@@ -646,6 +694,7 @@ const T *at(const void *base, std::size_t offset) {
 struct ActivationPoolState {
   ActivationTransportPoolConfig config;
   Layout layout;
+  GinWindowLayout gin_layout;
   std::vector<std::byte> session_identity;
   std::uint32_t world = 0;
   CudaExecution execution;
@@ -654,7 +703,6 @@ struct ActivationPoolState {
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
-  bool slot_storage_uses_nccl_allocator = false;
 
   ~ActivationPoolState() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
@@ -719,16 +767,14 @@ struct ActivationPoolState {
         (void)cudaFree(slot.device_cancel_epoch);
       if (slot.device)
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
-      if (slot.device) {
-        if (slot_storage_uses_nccl_allocator) {
-          using MemFreeFn = ncclResult_t (*)(void *);
-          const auto mem_free = reinterpret_cast<MemFreeFn>(
-              dlsym(RTLD_DEFAULT, "ncclMemFree"));
-          if (mem_free != nullptr)
-            (void)mem_free(slot.device);
-        } else {
-          (void)cudaFree(slot.device);
-        }
+      if (slot.device)
+        (void)cudaFree(slot.device);
+      if (slot.gin_window) {
+        using MemFreeFn = ncclResult_t (*)(void *);
+        const auto mem_free = reinterpret_cast<MemFreeFn>(
+            dlsym(RTLD_DEFAULT, "ncclMemFree"));
+        if (mem_free != nullptr)
+          (void)mem_free(slot.gin_window);
       }
     }
     if (cancel_stream)
@@ -1246,14 +1292,16 @@ struct GinSyntheticArgs {
   std::uint64_t epoch;
   ncclDevComm_t dev_comm;
   ncclWindow_t window;
-  void *base;
+  void *compute_base;
+  void *window_base;
   std::size_t send_header_offset;
   std::size_t receive_header_offset;
   std::size_t send_payload_offset;
   std::size_t receive_payload_offset;
   std::size_t canonical_offset;
   std::size_t return_staging_offset;
-  std::size_t combine_offset;
+  std::size_t return_receive_offset;
+  std::size_t combine_compute_offset;
   std::size_t combined_offset;
   std::size_t status_offset;
   bool identity_expert;
@@ -1274,7 +1322,8 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
   const auto world = a.dispatch.identity.world_size;
   const ncclGin gin(a.dev_comm, 0);
   const auto rail = ncclTeamRail(a.dev_comm);
-  auto *bytes = static_cast<std::byte *>(a.base);
+  auto *bytes = static_cast<std::byte *>(a.window_base);
+  auto *compute_bytes = static_cast<std::byte *>(a.compute_base);
   auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.send_header_offset);
   auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -1284,15 +1333,17 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
   auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.receive_payload_offset);
   auto *canonical = reinterpret_cast<transport::BFloat16 *>(
-      bytes + a.canonical_offset);
+      compute_bytes + a.canonical_offset);
   auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.return_staging_offset);
   auto *combine = reinterpret_cast<transport::BFloat16 *>(
-      bytes + a.combine_offset);
+      bytes + a.return_receive_offset);
+  auto *combine_compute = reinterpret_cast<transport::BFloat16 *>(
+      compute_bytes + a.combine_compute_offset);
   auto *combined = reinterpret_cast<transport::BFloat16 *>(
-      bytes + a.combined_offset);
+      compute_bytes + a.combined_offset);
   auto *status = reinterpret_cast<TransportDeviceStatus *>(
-      bytes + a.status_offset);
+      compute_bytes + a.status_offset);
   __shared__ unsigned long long remote_packets;
   __shared__ unsigned long long remote_routes;
   __shared__ unsigned long long remote_incoming;
@@ -1413,8 +1464,8 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
     if (lane == 0) {
       const auto destination = static_cast<int>(header.source_rank);
       gin.put(rail, destination, a.window,
-              a.combine_offset + header.route_index * a.hidden *
-                                     sizeof(transport::BFloat16),
+              a.return_receive_offset + header.route_index * a.hidden *
+                                            sizeof(transport::BFloat16),
               a.window,
               a.return_staging_offset + row * a.hidden *
                                             sizeof(transport::BFloat16),
@@ -1442,6 +1493,8 @@ __global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
         const auto slot = a.dispatch.combine_order[
             token * a.dispatch.identity.top_k + order];
         const auto route = token * a.dispatch.identity.top_k + slot;
+        combine_compute[route * a.hidden + h] =
+            combine[route * a.hidden + h];
         sum = gate_after_accumulate(
             sum, a.gates[route], combine[route * a.hidden + h].bits);
       }
@@ -5042,11 +5095,21 @@ struct GinBackendState {
   CudaExecution execution;
   ncclDevComm_t dev_comm{};
   std::vector<ncclWindow_t> windows;
+  std::vector<void *> peer_slot_bases;
+  std::vector<std::uint8_t> owns_mapping;
+  std::uint32_t num_nodes = 0;
+  std::uint32_t local_world_size = 0;
+  std::uint32_t node = 0;
+  std::uint32_t local_rank = 0;
   bool dev_comm_created = false;
 
   ~GinBackendState() noexcept {
     if (!nccl)
       return;
+    (void)cudaSetDevice(static_cast<int>(pool->device));
+    for (std::size_t index = 0; index < peer_slot_bases.size(); ++index)
+      if (owns_mapping[index] != 0 && peer_slot_bases[index] != nullptr)
+        (void)cudaIpcCloseMemHandle(peer_slot_bases[index]);
     using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
     using DevCommDestroyFn = ncclResult_t (*)(ncclComm_t,
                                                const ncclDevComm_t *);
@@ -6211,21 +6274,158 @@ std::shared_ptr<GinBackendState> create_gin_backend(
             ", expected=available, actual=NCCL_GIN_TYPE_NONE");
   const auto rail = team_rail(nccl->comm);
   const auto lsa = team_lsa(nccl->comm);
-  if (nccl->world != 2 || rail.nRanks != 2 || lsa.nRanks != 1)
+  if (pool->config.max_nodes == 0 ||
+      nccl->world % pool->config.max_nodes != 0)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "gin-create",
+                    "homogeneous topology", nccl->rank,
+                    "world divisible by runtime nodes", "mismatch");
+  const auto num_nodes = pool->config.max_nodes;
+  const auto local_world = nccl->world / num_nodes;
+  const auto node = nccl->rank / local_world;
+  const auto local_rank = nccl->rank % local_world;
+  if (rail.nRanks != static_cast<int>(num_nodes) ||
+      lsa.nRanks != static_cast<int>(local_world) ||
+      pool->device != local_rank)
     throw NotifyDispatchError(
         NotifyErrorCode::BackendUnavailable,
         "phase=gin-create, field=topology, rank=" +
             std::to_string(session.rank()) +
-            ", expected=world=2, rail=2, lsa=1, actual=world=" +
-            std::to_string(nccl->world) + ", rail=" +
+            ", expected=rail=nodes, lsa=local_world, device=local_rank, "
+            "actual=world=" + std::to_string(nccl->world) + ", rail=" +
             std::to_string(rail.nRanks) + ", lsa=" +
-            std::to_string(lsa.nRanks));
+            std::to_string(lsa.nRanks) + ", device=" +
+            std::to_string(pool->device) + ", local_rank=" +
+            std::to_string(local_rank));
 
   auto backend = std::make_shared<GinBackendState>();
   backend->pool = pool;
   backend->nccl = nccl;
   backend->session = session;
   backend->execution = execution;
+  backend->num_nodes = num_nodes;
+  backend->local_world_size = local_world;
+  backend->node = node;
+  backend->local_rank = local_rank;
+
+  // Exchange every compute-arena IPC handle collectively, but open only the
+  // ranks in this node. The full-world pointer table keeps global rank as the
+  // stable index consumed by Notify fan-out descriptors.
+  const auto slot_count = pool->slots.size();
+  const auto handles_per_rank_bytes = checked_size(
+      checked_mul(slot_count, sizeof(cudaIpcMemHandle_t),
+                  "GIN IPC handles per rank"),
+      "GIN IPC handles per rank");
+  const auto matrix_bytes = checked_size(
+      checked_mul(handles_per_rank_bytes, nccl->world,
+                  "GIN IPC handle matrix"),
+      "GIN IPC handle matrix");
+  std::vector<cudaIpcMemHandle_t> local_handles(slot_count);
+  std::vector<cudaIpcMemHandle_t> handle_matrix(slot_count * nccl->world);
+  for (std::size_t slot_index = 0; slot_index < slot_count; ++slot_index)
+    internal::throw_cuda(
+        "gin-create",
+        cudaIpcGetMemHandle(&local_handles[slot_index],
+                            pool->slots[slot_index].device),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaIpcGetMemHandle(GIN local compute arena)");
+  void *device_handles = nullptr;
+  void *device_matrix = nullptr;
+  try {
+    internal::throw_cuda(
+        "gin-create", cudaMalloc(&device_handles, handles_per_rank_bytes),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMalloc(GIN IPC handles)");
+    internal::throw_cuda(
+        "gin-create", cudaMalloc(&device_matrix, matrix_bytes), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMalloc(GIN IPC matrix)");
+    const auto exec = internal::checked_execution_state(execution);
+    internal::throw_cuda(
+        "gin-create",
+        cudaMemcpyAsync(device_handles, local_handles.data(),
+                        handles_per_rank_bytes, cudaMemcpyHostToDevice,
+                        exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "H2D GIN IPC handles");
+    internal::throw_nccl(
+        "gin-create",
+        ncclAllGather(device_handles, device_matrix, handles_per_rank_bytes,
+                      ncclUint8, nccl->comm, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclAllGather(GIN IPC handles)");
+    internal::throw_cuda(
+        "gin-create",
+        cudaMemcpyAsync(handle_matrix.data(), device_matrix, matrix_bytes,
+                        cudaMemcpyDeviceToHost, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "D2H GIN IPC matrix");
+    internal::throw_cuda(
+        "gin-create", cudaStreamSynchronize(exec->stream), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "wait GIN IPC bootstrap");
+  } catch (...) {
+    if (device_matrix != nullptr)
+      (void)cudaFree(device_matrix);
+    if (device_handles != nullptr)
+      (void)cudaFree(device_handles);
+    throw;
+  }
+  (void)cudaFree(device_matrix);
+  (void)cudaFree(device_handles);
+  backend->peer_slot_bases.assign(slot_count * nccl->world, nullptr);
+  backend->owns_mapping.assign(slot_count * nccl->world, 0);
+  try {
+    for (std::size_t slot_index = 0; slot_index < slot_count; ++slot_index) {
+      for (std::uint32_t peer = node * local_world;
+           peer < (node + 1U) * local_world; ++peer) {
+        const auto index = slot_index * nccl->world + peer;
+        if (peer == nccl->rank) {
+          backend->peer_slot_bases[index] = pool->slots[slot_index].device;
+        } else {
+          internal::throw_cuda(
+              "gin-create",
+              cudaIpcOpenMemHandle(
+                  &backend->peer_slot_bases[index],
+                  handle_matrix[static_cast<std::size_t>(peer) * slot_count +
+                                slot_index],
+                  cudaIpcMemLazyEnablePeerAccess),
+              nccl->rank, nccl->world, session.session().identity(),
+              session.session().generation(), ExchangeKind::ExpertCounts,
+              "cudaIpcOpenMemHandle(GIN local peer arena)");
+          backend->owns_mapping[index] = 1;
+        }
+      }
+      const auto exec = internal::checked_execution_state(execution);
+      internal::throw_cuda(
+          "gin-create",
+          cudaMemcpyAsync(
+              at<void *>(pool->slots[slot_index].device,
+                         pool->layout.peer_bases),
+              backend->peer_slot_bases.data() + slot_index * nccl->world,
+              nccl->world * sizeof(void *), cudaMemcpyHostToDevice,
+              exec->stream),
+          nccl->rank, nccl->world, session.session().identity(),
+          session.session().generation(), ExchangeKind::ExpertCounts,
+          "H2D GIN local peer table");
+    }
+    internal::throw_cuda(
+        "gin-create",
+        cudaStreamSynchronize(
+            internal::checked_execution_state(execution)->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "wait GIN local peer table");
+  } catch (...) {
+    backend.reset();
+    throw;
+  }
   ncclDevCommRequirements_t requirements =
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   requirements.ginContextCount = 1;
@@ -6245,9 +6445,14 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     backend->windows.reserve(pool->slots.size());
     for (auto &slot : pool->slots) {
       ncclWindow_t window = nullptr;
+      if (slot.gin_window == nullptr || pool->gin_layout.total == 0)
+        transport_error(NotifyErrorCode::InvalidHandle, "gin-create",
+                        "registered window storage", nccl->rank,
+                        "preallocated ncclMemAlloc window", "empty");
       internal::throw_nccl(
           "gin-create",
-          window_register(nccl->comm, slot.device, pool->layout.total, &window,
+          window_register(nccl->comm, slot.gin_window,
+                          pool->gin_layout.total, &window,
                           NCCL_WIN_STRICT_ORDERING),
           nccl->rank, nccl->world, session.session().identity(),
           session.session().generation(), ExchangeKind::ExpertCounts,
@@ -6275,11 +6480,11 @@ ActivationTransportResourcePool make_activation_transport_pool(
   auto state = std::make_shared<ActivationPoolState>();
   state->config = config;
   state->layout = make_layout(config);
+  state->gin_layout = make_gin_window_layout(config);
   state->session_identity = session.stable_identity_bytes();
   state->world = session.world_size();
   state->execution = execution;
   state->device = execution.device_ordinal();
-  state->slot_storage_uses_nccl_allocator = config.enable_gin_rdma;
   internal::throw_cuda("transport-pool-create",
                        cudaSetDevice(static_cast<int>(state->device)), 0,
                        session.world_size(), session.identity(),
@@ -6293,6 +6498,11 @@ ActivationTransportResourcePool make_activation_transport_pool(
         0, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::ExpertCounts, "cudaStreamCreate(cancel)");
     for (auto &slot : state->slots) {
+      internal::throw_cuda(
+          "transport-pool-create", cudaMalloc(&slot.device,
+                                                state->layout.total),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts, "cudaMalloc(transport slot)");
       if (config.enable_gin_rdma) {
         using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
         const auto mem_alloc = reinterpret_cast<MemAllocFn>(
@@ -6304,15 +6514,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
               "expected=runtime symbol, actual=missing");
         internal::throw_nccl(
             "transport-pool-create",
-            mem_alloc(&slot.device, state->layout.total), 0,
+            mem_alloc(&slot.gin_window, state->gin_layout.total), 0,
             session.world_size(), session.identity(), session.generation(),
-            ExchangeKind::ExpertCounts, "ncclMemAlloc(GIN transport slot)");
-      } else {
-        internal::throw_cuda(
-            "transport-pool-create", cudaMalloc(&slot.device,
-                                                  state->layout.total),
-            0, session.world_size(), session.identity(), session.generation(),
-            ExchangeKind::ExpertCounts, "cudaMalloc(transport slot)");
+            ExchangeKind::ExpertCounts, "ncclMemAlloc(GIN window slot)");
       }
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
       internal::throw_cuda(
@@ -6322,6 +6526,14 @@ ActivationTransportResourcePool make_activation_transport_pool(
           0, session.world_size(), session.identity(), session.generation(),
           ExchangeKind::ExpertCounts,
           "one-time initialize complete transport slot storage");
+      if (slot.gin_window)
+        internal::throw_cuda(
+            "transport-pool-create",
+            cudaMemsetAsync(slot.gin_window, 0, state->gin_layout.total,
+                            internal::checked_execution_state(execution)->stream),
+            0, session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts,
+            "one-time initialize GIN window slot storage");
       if (config.max_intermediate_size != 0) {
         slot.forward_x_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
@@ -6515,8 +6727,16 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
       ++result.slots_quarantined;
   }
   result.device_bytes = checked_mul(
-      state->layout.total + sizeof(std::uint64_t), state->slots.size(),
-      "pool device bytes");
+      checked_add(
+          checked_add(state->layout.total, state->gin_layout.total,
+                      "pool compute plus GIN bytes"),
+          sizeof(std::uint64_t), "pool slot device bytes"),
+      state->slots.size(), "pool device bytes");
+  result.compute_device_bytes = checked_mul(
+      state->layout.total, state->slots.size(), "pool compute device bytes");
+  result.gin_registered_bytes = checked_mul(
+      state->gin_layout.total, state->slots.size(),
+      "pool GIN registered bytes");
   const auto progress_bytes = checked_mul(
       state->slots.empty() ? 0ULL
                            : state->slots.front().backward_progress_words,
@@ -8035,7 +8255,8 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN status)");
   internal::throw_cuda(
       "gin-run",
-      cudaMemsetAsync(at<void>(slot.device, layout.p2p_barrier_send), 0,
+      cudaMemsetAsync(at<void>(slot.gin_window,
+                               state->gin_layout.barrier), 0,
                       sizeof(std::uint64_t), exec->stream),
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -8045,7 +8266,8 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "GIN reset kernel launch");
-  auto *barrier = at<std::uint64_t>(slot.device, layout.p2p_barrier_send);
+  auto *barrier = at<std::uint64_t>(slot.gin_window,
+                                    state->gin_layout.barrier);
   internal::throw_nccl(
       "gin-run",
       ncclAllReduce(barrier, barrier, 1, ncclUint64, ncclSum,
@@ -8062,14 +8284,16 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
   args.epoch = activation.slot->epoch;
   args.dev_comm = backend->dev_comm;
   args.window = backend->windows[activation.slot->index];
-  args.base = slot.device;
-  args.send_header_offset = layout.socket_header_send;
-  args.receive_header_offset = layout.socket_header_receive;
-  args.send_payload_offset = layout.contribution;
-  args.receive_payload_offset = layout.socket_payload_receive;
+  args.compute_base = slot.device;
+  args.window_base = slot.gin_window;
+  args.send_header_offset = state->gin_layout.send_packet_headers;
+  args.receive_header_offset = state->gin_layout.receive_packet_headers;
+  args.send_payload_offset = state->gin_layout.send_payload;
+  args.receive_payload_offset = state->gin_layout.receive_payload;
   args.canonical_offset = layout.canonical_rows;
-  args.return_staging_offset = layout.gin_return_staging;
-  args.combine_offset = layout.combine_return;
+  args.return_staging_offset = state->gin_layout.return_staging;
+  args.return_receive_offset = state->gin_layout.return_receive;
+  args.combine_compute_offset = layout.combine_return;
   args.combined_offset = layout.combined;
   args.status_offset = layout.status;
   args.identity_expert =
@@ -8102,6 +8326,21 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       "gin-run", cudaEventSynchronize(slot.complete), id.calling_rank,
       id.world_size, backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaEventSynchronize(GIN complete)");
+  // A rank may destroy its registered window immediately after its result and
+  // transport object leave scope. Rendezvous only after every device worker
+  // has completed all remote puts so no peer can deregister early.
+  internal::throw_nccl(
+      "gin-run",
+      ncclAllReduce(barrier, barrier, 1, ncclUint64, ncclSum,
+                    backend->nccl->comm, exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "ncclAllReduce(GIN terminal window lease)");
+  internal::throw_cuda(
+      "gin-run", cudaStreamSynchronize(exec->stream), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts,
+      "cudaStreamSynchronize(GIN terminal window lease)");
   consumer.finish();
   if (slot.host_status->error != 0)
     transport_error(NotifyErrorCode::TransportProtocolFailure, "gin-run",
