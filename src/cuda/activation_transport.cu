@@ -2787,12 +2787,16 @@ struct BackwardKernelArgs {
   bool use_forward_cache;
 };
 
+__device__ bool backward_cancelled(const BackwardKernelArgs &a);
+
 __device__ __attribute__((unused)) void backward_reduce_token_slice(
     const BackwardKernelArgs &a, const transport::BFloat16 *dx_return,
     transport::BFloat16 *dx_combined, std::uint32_t worker,
     std::uint32_t workers) {
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
+  auto *source_ready = peer_at<unsigned long long>(
+      a.local_base, a.outgoing_signal_offset);
   constexpr std::uint32_t kWarpsPerCta = 12U;
   for (std::uint64_t token =
            static_cast<std::uint64_t>(worker) * kWarpsPerCta + warp;
@@ -2803,7 +2807,14 @@ __device__ __attribute__((unused)) void backward_reduce_token_slice(
       const auto slot = a.dispatch.combine_order[
           token * a.dispatch.identity.top_k + lane];
       lane_route = token * a.dispatch.identity.top_k + slot;
+      const auto destination = a.dispatch.route_dst_rank[lane_route];
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          ready(source_ready[destination * a.channels]);
+      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+             !backward_cancelled(a)) {
+      }
     }
+    __syncwarp();
     auto *output8 = reinterpret_cast<uint4 *>(dx_combined + token * a.hidden);
     for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
          vector += 32ULL) {
@@ -3671,31 +3682,6 @@ local_p2p_backward_megakernel(
     ready.store(a.epoch, ::cuda::memory_order_release);
   }
 
-  // A small set of CTAs consumes the already-published source contributions
-  // while the remaining SMs execute tensor-core dW.  This hides the
-  // bandwidth-bound deterministic top-k reduction without changing either
-  // reduction order or any dW tile ownership.
-  constexpr std::uint32_t kConcurrentReduceCtas = 8U;
-  const auto reduce_ctas = min(kConcurrentReduceCtas,
-                               static_cast<std::uint32_t>(gridDim.x / 4U));
-  const auto dw_ctas = static_cast<std::uint32_t>(gridDim.x) - reduce_ctas;
-  const bool reduce_worker = blockIdx.x >= dw_ctas;
-  if (reduce_worker) {
-    auto *signal = peer_at<unsigned long long>(a.local_base,
-                                                a.outgoing_signal_offset);
-    for (std::uint32_t destination = threadIdx.x; destination < a.world;
-         destination += blockDim.x) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(signal[destination * a.channels]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
-             !backward_cancelled(a)) {
-      }
-    }
-    __syncthreads();
-    backward_reduce_token_slice(a, dx_return, dx_combined,
-                                blockIdx.x - dw_ctas, reduce_ctas);
-  }
-
   // dW2 and dW1 use split_k=1. Each task owns one output tile and traverses
   // that expert's padded canonical-M segment in ascending order.
   // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
@@ -3709,7 +3695,7 @@ local_p2p_backward_megakernel(
       a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
   const auto dw1_tasks = static_cast<unsigned long long>(
       a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
-  while (!reduce_worker) {
+  while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
@@ -3810,11 +3796,12 @@ local_p2p_backward_megakernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = device_globaltimer_ns();
     status->dw1_complete_clock = status->dw2_complete_clock;
-    // The rendezvous above covers both dW workers and the concurrent Reduce
-    // workers; a second empty cooperative-grid barrier costs ~1.5 ms on the
-    // eight-GPU production topology and establishes no additional ordering.
-    status->dx_reduce_complete_clock = status->dw1_complete_clock;
   }
+  backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
+                              gridDim.x);
+  grid.sync();
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    status->dx_reduce_complete_clock = device_globaltimer_ns();
 
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
