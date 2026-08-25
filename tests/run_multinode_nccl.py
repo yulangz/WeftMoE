@@ -344,7 +344,8 @@ def parse_args(argv=None):
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
-                 "gin_probe", "gin_put_probe", "activation_socket"),
+                 "gin_probe", "gin_put_probe", "activation_socket",
+                 "activation_gin"),
         default="valid",
     )
     args = parser.parse_args(argv)
@@ -528,6 +529,36 @@ def main(argv=None):
                                "\n".join(failures))
         print("\n".join(evidence))
         print(f"[PASS] real cross-host NCCL Socket activation world={world}")
+        return
+
+    if args.scenario == "activation_gin":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("GIN_RESULT ")]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}, "
+                    f"results={len(lines)}; stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+                if "backend=nccl-gin-device" not in lines[0]:
+                    failures.append(
+                        f"rank={result.rank} wrong backend audit: {lines[0]}"
+                    )
+                if "oracle=1" not in lines[0]:
+                    failures.append(
+                        f"rank={result.rank} missing GIN oracle proof: "
+                        f"{lines[0]}"
+                    )
+        if failures:
+            raise RuntimeError("NCCL GIN activation failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] real device-issued GIN activation world={world}")
         return
 
     if args.scenario != "valid":

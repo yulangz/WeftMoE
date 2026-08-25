@@ -175,8 +175,13 @@ correctness blockers.
   world-2/world-16 device-communicator and registered-window lifecycle probes.
   A dedicated world-2/world-16 probe also passes real same-rail device put,
   remote indexed signal, local completion, and full payload hash validation.
-  MegaMOE still reports `gin_backend_implemented=0, gin_usable=0` until this
-  primitive is integrated with the activation ring and persistent kernels.
+  The primitive is now integrated into a separately typed two-node,
+  one-GPU-per-node activation backend: real world-2 device dispatch, remote
+  signal, synthetic
+  contribution return and gate-after reduce pass 20 deterministic oracle
+  checks. The general capability still reports
+  `gin_backend_implemented=0, gin_usable=0` because the required world-16
+  same-rail proxy/local-P2P fan-out is not implemented.
 - The first concrete `NcclSocketFallback` slice passes real world-2 and
   world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
   gate-after combine, and independent host-oracle comparison. It has no
@@ -185,5 +190,6 @@ correctness blockers.
   follow-up is node-level payload dedup, same-rail destination proxies and
   local P2P fan-out, followed by cache Forward/Backward/dGate integration and
   the two-host Megatron performance comparison.
-- GIN/RDMA and the single-persistent cross-node data plane are not implemented
-  or claimed by the Socket fallback.
+- The Socket fallback never claims GIN/RDMA. The partial GIN backend is a real
+  single-persistent cross-node data plane for world 2 only; world-16 and full
+  Forward/Backward remain open.

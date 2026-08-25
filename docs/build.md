@@ -205,6 +205,24 @@ shape is two nodes by eight local ranks, and all 16 received hashes match the
 expected same-local-rank peer. It proves the runtime/plugin/NIC data-movement
 path, but is deliberately not counted as the complete MegaMOE GIN backend.
 
+The initial real activation slice (one GPU per node) is exercised with:
+
+```bash
+env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
+  python3 tests/run_multinode_nccl.py \
+    --binary "$PWD/build-cuda/test_cuda_notify" \
+    --remote root@10.10.19.233 --port 2222 \
+    --remote-binary "$PWD/build-cuda/test_cuda_notify" \
+    --gpus-per-node 1 --scenario activation_gin \
+    --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
+```
+
+Both ranks use ten tokens, top-k six, dynamic source-resident gates, and the
+independent host oracle. Twenty generations complete with
+`backend=nccl-gin-device` and `oracle=1`; no activation payload crosses the
+host. This is a genuine device-issued GIN dispatch/return slice, but it is not
+the world-16 backend and does not yet execute FC Forward/Backward.
+
 The explicit Socket correctness backend uses the default CUDA-12.9 NCCL
 runtime and requires the network choice at communicator creation. A two-rank
 run is:

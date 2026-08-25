@@ -53,6 +53,7 @@ private:
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class NcclSocketFallbackActivationTransport;
+  friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
 };
@@ -76,6 +77,10 @@ struct ActivationTransportPoolConfig {
   // Reserves compact route/payload staging for the explicitly host-enqueued
   // NCCL Socket correctness backend. Disabled for the frozen local P2P path.
   bool enable_socket_fallback = false;
+  // Registers each preallocated slot as an NCCL window for the explicitly
+  // constructed GinRdma backend. It never enables or selects that backend by
+  // itself.
+  bool enable_gin_rdma = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -106,6 +111,7 @@ private:
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class NcclSocketFallbackActivationTransport;
+  friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
 };
@@ -178,6 +184,7 @@ private:
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class NcclSocketFallbackActivationTransport;
+  friend class GinRdmaActivationTransport;
   friend class ActivationTransportBridge;
   friend struct ActivationTransportValidationDownload;
   friend std::vector<transport::BFloat16>
@@ -240,6 +247,26 @@ private:
 class NcclSocketFallbackActivationTransport {
 public:
   NcclSocketFallbackActivationTransport(
+      const NcclSession &session, const CudaExecution &execution,
+      const ActivationTransportResourcePool &pool);
+
+  DeviceActivationTransportHandle run_synthetic(
+      const DeviceDispatchHandle &dispatch,
+      const BFloat16ActivationLease &activations,
+      const transport::ActivationTransportConfig &config,
+      const ActivationTransportRunOptions &options = {});
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
+
+// True device-issued NCCL GIN data plane. The initial implementation supports
+// exactly two nodes with one GPU per node; other teams fail BackendUnavailable
+// until source-indexed ingress and local proxy fan-out are connected.
+class GinRdmaActivationTransport {
+public:
+  GinRdmaActivationTransport(
       const NcclSession &session, const CudaExecution &execution,
       const ActivationTransportResourcePool &pool);
 

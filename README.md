@@ -15,14 +15,17 @@ TMA/WGMMA FC1, an in-kernel SwiGLU epilogue, TMA/WGMMA FC2, peer return, and
 source-side dynamic-gate deterministic reduce all execute in one cooperative
 persistent kernel. Phase 6 adds a single-launch, single-node Backward baseline
 for the same main shape, including cache/recompute paths, dY dispatch,
-WGMMA/TMA dV/dX/dW1/dW2, deterministic dGate, and fixed-order dX combine. It
+WGMMA/TMA dV/dX/dW1/dW2, deterministic dGate, and fixed-order dX combine.
 Phase 7 has started with a concrete, opt-in
 `NcclSocketFallbackActivationTransport`: it performs host-enqueued NCCL
 Send/Recv of GPU-resident BF16 payloads across two hosts, device relay,
 synthetic return, and source-side dynamic-gate reduction without activation
-D2H/H2D. This is a correctness/lower-bound backend, not a persistent GIN
-data plane. Cross-node FC Forward/Backward, node-deduplicated same-rail proxy
-fan-out, and NCCL GIN/RDMA remain incomplete.
+D2H/H2D. This is a correctness/lower-bound backend. A separately typed
+`GinRdmaActivationTransport` now runs the synthetic activation chain with
+device-issued NCCL GIN put/signal/local-completion in one persistent kernel
+for the initial two-node, one-GPU-per-node world-2 slice. Cross-node FC
+Forward/Backward and the world-16 same-rail local-P2P fan-out remain
+incomplete.
 
 ## Supported topology contract
 
@@ -342,13 +345,15 @@ official NCCL 2.29.7 CUDA 12.9 package, explicitly loaded from a repository-
 external cache, has passed real two-host world-2 and world-16 device-comm plus
 collective registered-window lifecycle probes. A separate validation probe
 also passes real same-rail device-issued put, remote indexed signal, and local
-completion counter on world 2 and 16. The full activation data-plane backend
-is not implemented yet; consequently
-`gin_backend_implemented=0, gin_usable=0`.
+completion counter on world 2 and 16. The initial activation backend registers
+session-pool slots allocated by `ncclMemAlloc` and passes 20 deterministic
+world-2 generations with both ranks sending. It intentionally rejects every
+other team shape; consequently the general capability flag remains
+`gin_backend_implemented=0, gin_usable=0` until world-16 proxy fan-out exists.
 `NcclSocketFallback` has a distinct production constructor and refuses to run
 unless the communicator was explicitly configured for NCCL Socket
-(`NCCL_IB_DISABLE=1`). `Gin` still has no production constructor. Simulation,
-local P2P, Socket, and GIN audit labels are emitted by their concrete backend
+(`NCCL_IB_DISABLE=1`). Simulation, local P2P, Socket, and GIN audit labels are
+emitted by their concrete backend
 objects rather than selected by a caller enum.
 
 ## Repository layout

@@ -341,6 +341,7 @@ struct Layout {
   std::size_t socket_header_send = 0;
   std::size_t socket_header_receive = 0;
   std::size_t socket_payload_receive = 0;
+  std::size_t gin_return_staging = 0;
   std::size_t forward_s = 0;
   std::size_t forward_ab_cache = 0;
   std::size_t forward_task_claim = 0;
@@ -453,7 +454,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
                           "combined elements"),
       sizeof(transport::BFloat16), "combined");
-  if (config.enable_socket_fallback) {
+  if (config.enable_socket_fallback || config.enable_gin_rdma) {
     layout.socket_count_matrix = append(
         cursor, checked_mul(config.max_world_size, config.max_world_size,
                             "Socket count matrix"),
@@ -468,6 +469,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                             config.max_hidden_size,
                             "Socket receive payload elements"),
         sizeof(transport::BFloat16), "Socket receive payload");
+    if (config.enable_gin_rdma)
+      layout.gin_return_staging = append(
+          cursor, checked_mul(config.max_destination_rows_per_rank,
+                              config.max_hidden_size,
+                              "GIN return staging elements"),
+          sizeof(transport::BFloat16), "GIN return staging");
   }
   if (config.max_intermediate_size != 0) {
     const auto forward_elements = checked_mul(
@@ -647,6 +654,7 @@ struct ActivationPoolState {
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
+  bool slot_storage_uses_nccl_allocator = false;
 
   ~ActivationPoolState() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
@@ -711,8 +719,17 @@ struct ActivationPoolState {
         (void)cudaFree(slot.device_cancel_epoch);
       if (slot.device)
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
-      if (slot.device)
-        (void)cudaFree(slot.device);
+      if (slot.device) {
+        if (slot_storage_uses_nccl_allocator) {
+          using MemFreeFn = ncclResult_t (*)(void *);
+          const auto mem_free = reinterpret_cast<MemFreeFn>(
+              dlsym(RTLD_DEFAULT, "ncclMemFree"));
+          if (mem_free != nullptr)
+            (void)mem_free(slot.device);
+        } else {
+          (void)cudaFree(slot.device);
+        }
+      }
     }
     if (cancel_stream)
       (void)cudaStreamDestroy(cancel_stream);
@@ -1219,6 +1236,237 @@ __global__ void gin_probe_put_signal_kernel(
   // remote indexed signal is ordered after the payload has settled.
   gin.waitCounter(ncclCoopThread{}, 0, 1);
   gin.waitSignal(ncclCoopThread{}, 0, 1);
+}
+
+struct GinSyntheticArgs {
+  DeviceDispatchKernelView dispatch;
+  const transport::BFloat16 *input;
+  const float *gates;
+  std::uint64_t hidden;
+  std::uint64_t epoch;
+  ncclDevComm_t dev_comm;
+  ncclWindow_t window;
+  void *base;
+  std::size_t send_header_offset;
+  std::size_t receive_header_offset;
+  std::size_t send_payload_offset;
+  std::size_t receive_payload_offset;
+  std::size_t canonical_offset;
+  std::size_t return_staging_offset;
+  std::size_t combine_offset;
+  std::size_t combined_offset;
+  std::size_t status_offset;
+  bool identity_expert;
+};
+
+__global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const ncclGin gin(dev_comm, 0);
+    gin.resetSignal(0);
+    gin.resetSignal(1);
+    gin.resetCounter(0);
+  }
+}
+
+__global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
+  const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+  const auto rank = a.dispatch.identity.calling_rank;
+  const auto world = a.dispatch.identity.world_size;
+  const ncclGin gin(a.dev_comm, 0);
+  const auto rail = ncclTeamRail(a.dev_comm);
+  auto *bytes = static_cast<std::byte *>(a.base);
+  auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+      bytes + a.send_header_offset);
+  auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+      bytes + a.receive_header_offset);
+  auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.send_payload_offset);
+  auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.receive_payload_offset);
+  auto *canonical = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.canonical_offset);
+  auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.return_staging_offset);
+  auto *combine = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.combine_offset);
+  auto *combined = reinterpret_cast<transport::BFloat16 *>(
+      bytes + a.combined_offset);
+  auto *status = reinterpret_cast<TransportDeviceStatus *>(
+      bytes + a.status_offset);
+  __shared__ unsigned long long remote_packets;
+  __shared__ unsigned long long remote_routes;
+  __shared__ unsigned long long remote_incoming;
+  if (lane == 0) {
+    remote_packets = 0;
+    remote_routes = 0;
+    remote_incoming = 0;
+    status->start_clock = device_globaltimer_ns();
+  }
+  __syncthreads();
+
+  // Notify packets are already in deterministic (destination node, token)
+  // order. One packet carries one token payload and all expert fan-out rows.
+  for (std::uint64_t packet = 0;
+       packet < a.dispatch.sizes.packet_count; ++packet) {
+    const auto descriptor = a.dispatch.packet_headers[packet];
+    const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+    const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+    const bool local = descriptor.destination_node == rank;
+    if (!local) {
+      for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x)
+        send_payload[packet * a.hidden + h] =
+            a.input[descriptor.local_token_id * a.hidden + h];
+      for (auto fanout = fanout_begin + lane; fanout < fanout_end;
+           fanout += blockDim.x) {
+        const auto target = a.dispatch.packet_fanout[fanout];
+        const auto route = descriptor.local_token_id *
+                               a.dispatch.identity.top_k +
+                           target.topk_slot;
+        send_headers[fanout] = LocalP2pRouteHeader{
+            transport::kActivationTransportSchemaVersion,
+            rank,
+            descriptor.proxy_rank,
+            descriptor.channel,
+            a.dispatch.identity.generation,
+            a.epoch,
+            descriptor.sequence_on_link,
+            route,
+            descriptor.local_token_id,
+            target.dst_row,
+            target.expert_id,
+            target.topk_slot};
+      }
+      __syncthreads();
+      if (lane == 0) {
+        const auto destination =
+            static_cast<int>(descriptor.destination_node);
+        for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
+          const auto target = a.dispatch.packet_fanout[fanout];
+          gin.put(rail, destination, a.window,
+                  a.receive_header_offset +
+                      target.dst_row * sizeof(LocalP2pRouteHeader),
+                  a.window,
+                  a.send_header_offset +
+                      fanout * sizeof(LocalP2pRouteHeader),
+                  sizeof(LocalP2pRouteHeader));
+        }
+        gin.put(rail, destination, a.window,
+                a.receive_payload_offset +
+                    descriptor.sequence_on_link * a.hidden *
+                        sizeof(transport::BFloat16),
+                a.window,
+                a.send_payload_offset + packet * a.hidden *
+                                            sizeof(transport::BFloat16),
+                a.hidden * sizeof(transport::BFloat16),
+                ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+                ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        ++remote_packets;
+        remote_routes += fanout_end - fanout_begin;
+      }
+    } else {
+      for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
+        const auto target = a.dispatch.packet_fanout[fanout];
+        const auto route = descriptor.local_token_id *
+                               a.dispatch.identity.top_k +
+                           target.topk_slot;
+        for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
+          const auto value = a.input[descriptor.local_token_id * a.hidden + h];
+          canonical[target.dst_row * a.hidden + h] = value;
+          combine[route * a.hidden + h] = synthetic_value(
+              value, target.expert_id, h, a.identity_expert);
+        }
+        __syncthreads();
+      }
+    }
+    __syncthreads();
+  }
+  if (lane == 0 && remote_packets != 0)
+    gin.waitCounter(ncclCoopThread{}, 0, remote_packets);
+  __syncthreads();
+
+  if (lane == 0) {
+    for (std::uint32_t node = 0; node < world; ++node)
+      if (node != rank)
+        remote_incoming +=
+            a.dispatch.incoming_proxy_signals[node].expected_packets;
+    if (remote_incoming != 0)
+      gin.waitSignal(ncclCoopThread{}, 0, remote_incoming);
+  }
+  __syncthreads();
+
+  unsigned long long return_count = 0;
+  for (std::uint64_t row = 0;
+       row < a.dispatch.sizes.incoming_row_count; ++row) {
+    const auto incoming = a.dispatch.incoming_rows[row];
+    if (incoming.source_rank == rank)
+      continue;
+    const auto header = receive_headers[row];
+    for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
+      const auto value =
+          receive_payload[header.sequence * a.hidden + h];
+      canonical[row * a.hidden + h] = value;
+      return_staging[row * a.hidden + h] = synthetic_value(
+          value, header.expert_id, h, a.identity_expert);
+    }
+    __syncthreads();
+    if (lane == 0) {
+      const auto destination = static_cast<int>(header.source_rank);
+      gin.put(rail, destination, a.window,
+              a.combine_offset + header.route_index * a.hidden *
+                                     sizeof(transport::BFloat16),
+              a.window,
+              a.return_staging_offset + row * a.hidden *
+                                            sizeof(transport::BFloat16),
+              a.hidden * sizeof(transport::BFloat16),
+              ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
+              ncclCoopThread{}, ncclGin_None{},
+              ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+      ++return_count;
+    }
+    __syncthreads();
+  }
+  if (lane == 0 && return_count != 0)
+    gin.waitCounter(ncclCoopThread{}, 0, remote_packets + return_count);
+  __syncthreads();
+  if (lane == 0 && remote_routes != 0)
+    gin.waitSignal(ncclCoopThread{}, 1, remote_routes);
+  __syncthreads();
+
+  for (std::uint64_t token = 0; token < a.dispatch.identity.num_tokens;
+       ++token) {
+    for (std::uint64_t h = lane; h < a.hidden; h += blockDim.x) {
+      float sum = 0.0F;
+      for (std::uint32_t order = 0; order < a.dispatch.identity.top_k;
+           ++order) {
+        const auto slot = a.dispatch.combine_order[
+            token * a.dispatch.identity.top_k + order];
+        const auto route = token * a.dispatch.identity.top_k + slot;
+        sum = gate_after_accumulate(
+            sum, a.gates[route], combine[route * a.hidden + h].bits);
+      }
+      combined[token * a.hidden + h] =
+          transport::BFloat16{float_to_bf16_bits(sum)};
+    }
+  }
+  __syncthreads();
+  if (lane == 0) {
+    status->packets_done = a.dispatch.sizes.packet_count;
+    status->fanout_done = a.dispatch.sizes.fanout_count;
+    status->synthetic_done = a.dispatch.sizes.incoming_row_count;
+    status->combine_done = a.dispatch.sizes.route_count;
+    status->incoming_done = a.dispatch.sizes.incoming_row_count;
+    status->reduced_tokens = a.dispatch.identity.num_tokens;
+    status->raw_cross_node_payload_bytes =
+        remote_routes * a.hidden * sizeof(transport::BFloat16);
+    status->deduplicated_cross_node_payload_bytes =
+        remote_packets * a.hidden * sizeof(transport::BFloat16);
+    status->actual_dispatch_peer_bytes =
+        status->deduplicated_cross_node_payload_bytes;
+    status->actual_return_peer_bytes =
+        remote_routes * a.hidden * sizeof(transport::BFloat16);
+    status->complete_clock = device_globaltimer_ns();
+  }
 }
 #endif
 
@@ -4732,6 +4980,7 @@ struct SelectedActivationLease<transport::BFloat16>::Impl {
 
 struct LocalP2pBackendState;
 struct SocketBackendState;
+struct GinBackendState;
 
 struct DeviceActivationTransportHandle::Impl {
   std::shared_ptr<SlotLease> slot;
@@ -4743,6 +4992,7 @@ struct DeviceActivationTransportHandle::Impl {
   std::uint64_t destination_rows = 0;
   std::shared_ptr<LocalP2pBackendState> local_p2p_backend;
   std::shared_ptr<SocketBackendState> socket_backend;
+  std::shared_ptr<GinBackendState> gin_backend;
 };
 
 struct DeviceActivationTransport::Impl {
@@ -4783,6 +5033,38 @@ struct SocketBackendState {
 
 struct NcclSocketFallbackActivationTransport::Impl {
   std::shared_ptr<SocketBackendState> backend;
+};
+
+struct GinBackendState {
+  std::shared_ptr<ActivationPoolState> pool;
+  std::shared_ptr<internal::NcclSessionState> nccl;
+  NcclSession session;
+  CudaExecution execution;
+  ncclDevComm_t dev_comm{};
+  std::vector<ncclWindow_t> windows;
+  bool dev_comm_created = false;
+
+  ~GinBackendState() noexcept {
+    if (!nccl)
+      return;
+    using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+    using DevCommDestroyFn = ncclResult_t (*)(ncclComm_t,
+                                               const ncclDevComm_t *);
+    const auto window_deregister = reinterpret_cast<WindowDeregisterFn>(
+        dlsym(RTLD_DEFAULT, "ncclCommWindowDeregister"));
+    const auto dev_comm_destroy = reinterpret_cast<DevCommDestroyFn>(
+        dlsym(RTLD_DEFAULT, "ncclDevCommDestroy"));
+    if (window_deregister != nullptr)
+      for (const auto window : windows)
+        if (window != nullptr)
+          (void)window_deregister(nccl->comm, window);
+    if (dev_comm_created && dev_comm_destroy != nullptr)
+      (void)dev_comm_destroy(nccl->comm, &dev_comm);
+  }
+};
+
+struct GinRdmaActivationTransport::Impl {
+  std::shared_ptr<GinBackendState> backend;
 };
 
 struct ForwardAllocation {
@@ -5859,6 +6141,127 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
   return backend;
 }
 
+std::shared_ptr<GinBackendState> create_gin_backend(
+    const NcclSession &session, const CudaExecution &execution,
+    const std::shared_ptr<ActivationPoolState> &pool) {
+#if !__has_include(<nccl_device.h>)
+  (void)session;
+  (void)execution;
+  (void)pool;
+  throw NotifyDispatchError(
+      NotifyErrorCode::BackendUnavailable,
+      "phase=gin-create, field=headers, rank=0, expected=nccl_device.h, "
+      "actual=unavailable");
+#else
+  if (!session || !execution || !pool)
+    transport_error(NotifyErrorCode::InvalidHandle, "gin-create",
+                    "session/execution/pool", 0, "valid", "empty");
+  const auto nccl = internal::NcclSessionAccess::checked(session);
+  if (!pool->config.enable_gin_rdma)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "gin-create",
+                    "pool.enable_gin_rdma", session.rank(), "true", "false");
+  if (session.session().stable_identity_bytes() != pool->session_identity ||
+      session.session().world_size() != pool->world ||
+      session.device_ordinal() != pool->device ||
+      execution.device_ordinal() != pool->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "gin-create",
+                    "provenance", session.rank(),
+                    "same session/world/device", "mismatch");
+
+  using QueryPropertiesFn = ncclResult_t (*)(ncclComm_t,
+                                              ncclCommProperties_t *);
+  using DevCommCreateFn = ncclResult_t (*)(
+      ncclComm_t, const ncclDevCommRequirements_t *, ncclDevComm_t *);
+  using WindowRegisterFn = ncclResult_t (*)(ncclComm_t, void *, std::size_t,
+                                             ncclWindow_t *, int);
+  using TeamFn = ncclTeam_t (*)(ncclComm_t);
+  const auto load = [&](const char *name) {
+    auto *symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol == nullptr)
+      throw NotifyDispatchError(
+          NotifyErrorCode::BackendUnavailable,
+          std::string("phase=gin-create, field=symbol, rank=") +
+              std::to_string(session.rank()) + ", expected=" + name +
+              ", actual=missing from loaded runtime");
+    return symbol;
+  };
+  const auto query_properties = reinterpret_cast<QueryPropertiesFn>(
+      load("ncclCommQueryProperties"));
+  const auto dev_comm_create = reinterpret_cast<DevCommCreateFn>(
+      load("ncclDevCommCreate"));
+  const auto window_register = reinterpret_cast<WindowRegisterFn>(
+      load("ncclCommWindowRegister"));
+  const auto team_rail = reinterpret_cast<TeamFn>(load("ncclTeamRail"));
+  const auto team_lsa = reinterpret_cast<TeamFn>(load("ncclTeamLsa"));
+
+  ncclCommProperties_t properties{};
+  properties.size = sizeof(properties);
+  properties.magic = NCCL_API_MAGIC;
+  properties.version = NCCL_VERSION_CODE;
+  internal::throw_nccl(
+      "gin-create", query_properties(nccl->comm, &properties), nccl->rank,
+      nccl->world, session.session().identity(),
+      session.session().generation(), ExchangeKind::ExpertCounts,
+      "ncclCommQueryProperties");
+  if (properties.railedGinType == NCCL_GIN_TYPE_NONE)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-create, field=railed_gin, rank=" +
+            std::to_string(session.rank()) +
+            ", expected=available, actual=NCCL_GIN_TYPE_NONE");
+  const auto rail = team_rail(nccl->comm);
+  const auto lsa = team_lsa(nccl->comm);
+  if (nccl->world != 2 || rail.nRanks != 2 || lsa.nRanks != 1)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-create, field=topology, rank=" +
+            std::to_string(session.rank()) +
+            ", expected=world=2, rail=2, lsa=1, actual=world=" +
+            std::to_string(nccl->world) + ", rail=" +
+            std::to_string(rail.nRanks) + ", lsa=" +
+            std::to_string(lsa.nRanks));
+
+  auto backend = std::make_shared<GinBackendState>();
+  backend->pool = pool;
+  backend->nccl = nccl;
+  backend->session = session;
+  backend->execution = execution;
+  ncclDevCommRequirements_t requirements =
+      NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  requirements.ginContextCount = 1;
+  requirements.ginExclusiveContexts = true;
+  requirements.ginQueueDepth = 32;
+  requirements.ginSignalCount = 2;
+  requirements.ginCounterCount = 1;
+  requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+  internal::throw_nccl(
+      "gin-create",
+      dev_comm_create(nccl->comm, &requirements, &backend->dev_comm),
+      nccl->rank, nccl->world, session.session().identity(),
+      session.session().generation(), ExchangeKind::ExpertCounts,
+      "ncclDevCommCreate(activation GIN)");
+  backend->dev_comm_created = true;
+  try {
+    backend->windows.reserve(pool->slots.size());
+    for (auto &slot : pool->slots) {
+      ncclWindow_t window = nullptr;
+      internal::throw_nccl(
+          "gin-create",
+          window_register(nccl->comm, slot.device, pool->layout.total, &window,
+                          NCCL_WIN_STRICT_ORDERING),
+          nccl->rank, nccl->world, session.session().identity(),
+          session.session().generation(), ExchangeKind::ExpertCounts,
+          "ncclCommWindowRegister(activation pool slot)");
+      backend->windows.push_back(window);
+    }
+  } catch (...) {
+    backend.reset();
+    throw;
+  }
+  return backend;
+#endif
+}
+
 ActivationTransportResourcePool make_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config) {
@@ -5876,6 +6279,7 @@ ActivationTransportResourcePool make_activation_transport_pool(
   state->world = session.world_size();
   state->execution = execution;
   state->device = execution.device_ordinal();
+  state->slot_storage_uses_nccl_allocator = config.enable_gin_rdma;
   internal::throw_cuda("transport-pool-create",
                        cudaSetDevice(static_cast<int>(state->device)), 0,
                        session.world_size(), session.identity(),
@@ -5889,11 +6293,27 @@ ActivationTransportResourcePool make_activation_transport_pool(
         0, session.world_size(), session.identity(), session.generation(),
         ExchangeKind::ExpertCounts, "cudaStreamCreate(cancel)");
     for (auto &slot : state->slots) {
-      internal::throw_cuda("transport-pool-create",
-                           cudaMalloc(&slot.device, state->layout.total), 0,
-                           session.world_size(), session.identity(),
-                           session.generation(), ExchangeKind::ExpertCounts,
-                           "cudaMalloc(transport slot)");
+      if (config.enable_gin_rdma) {
+        using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
+        const auto mem_alloc = reinterpret_cast<MemAllocFn>(
+            dlsym(RTLD_DEFAULT, "ncclMemAlloc"));
+        if (mem_alloc == nullptr)
+          throw NotifyDispatchError(
+              NotifyErrorCode::BackendUnavailable,
+              "phase=transport-pool-create, field=ncclMemAlloc, rank=0, "
+              "expected=runtime symbol, actual=missing");
+        internal::throw_nccl(
+            "transport-pool-create",
+            mem_alloc(&slot.device, state->layout.total), 0,
+            session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts, "ncclMemAlloc(GIN transport slot)");
+      } else {
+        internal::throw_cuda(
+            "transport-pool-create", cudaMalloc(&slot.device,
+                                                  state->layout.total),
+            0, session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts, "cudaMalloc(transport slot)");
+      }
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
       internal::throw_cuda(
           "transport-pool-create",
@@ -6318,6 +6738,16 @@ NcclSocketFallbackActivationTransport::
   impl_->backend->execution = execution;
 }
 
+GinRdmaActivationTransport::GinRdmaActivationTransport(
+    const NcclSession &session, const CudaExecution &execution,
+    const ActivationTransportResourcePool &pool) {
+  if (!pool.impl_ || !pool.impl_->state)
+    transport_error(NotifyErrorCode::InvalidHandle, "gin-create", "pool", 0,
+                    "valid", "empty");
+  impl_ = std::make_shared<Impl>();
+  impl_->backend = create_gin_backend(session, execution, pool.impl_->state);
+}
+
 LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
     const NcclSession &session, const CudaExecution &execution,
     const ActivationTransportResourcePool &pool) {
@@ -6533,11 +6963,15 @@ DeviceActivationTransport::run_device_simulation_synthetic(
       transport::ActivationTransportBackend::DeviceSimulation;
   result->audit.packet_count = slot.host_status->packets_done;
   result->audit.fanout_count = slot.host_status->fanout_done;
-  result->audit.credit_stalls = slot.host_status->credit_stalls;
   result->audit.raw_cross_node_payload_bytes =
       slot.host_status->raw_cross_node_payload_bytes;
   result->audit.deduplicated_cross_node_payload_bytes =
       slot.host_status->deduplicated_cross_node_payload_bytes;
+  result->audit.actual_dispatch_peer_bytes =
+      slot.host_status->actual_dispatch_peer_bytes;
+  result->audit.actual_return_peer_bytes =
+      slot.host_status->actual_return_peer_bytes;
+  result->audit.credit_stalls = slot.host_status->credit_stalls;
   result->audit.hot_path_allocations = 0;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
   const auto start_clock = slot.host_status->start_clock;
@@ -7497,6 +7931,228 @@ NcclSocketFallbackActivationTransport::run_synthetic(
       result->timings.total_us - result->timings.dispatch_relay_us;
   failure_guard.committed = true;
   return DeviceActivationTransportHandle(std::move(result));
+}
+
+DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
+    const DeviceDispatchHandle &dispatch,
+    const BFloat16ActivationLease &activations,
+    const transport::ActivationTransportConfig &config,
+    const ActivationTransportRunOptions &options) {
+#if !__has_include(<nccl_device.h>)
+  (void)dispatch;
+  (void)activations;
+  (void)config;
+  (void)options;
+  throw NotifyDispatchError(
+      NotifyErrorCode::BackendUnavailable,
+      "phase=gin-run, field=headers, rank=0, expected=nccl_device.h, "
+      "actual=unavailable");
+#else
+  if (!impl_ || !impl_->backend || !dispatch || !activations)
+    transport_error(NotifyErrorCode::InvalidHandle, "gin-run",
+                    "backend/dispatch/activation", 0, "valid", "empty");
+  const auto backend = impl_->backend;
+  const auto state = backend->pool;
+  const auto &id = dispatch.identity();
+  const auto &activation = *activations.impl_;
+  if (id.num_nodes != 2 || id.world_size != 2 ||
+      id.world_size != backend->nccl->world ||
+      id.calling_rank != backend->nccl->rank)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-run, field=topology, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=two nodes with one GPU each and exact rank, actual=" +
+            std::to_string(id.num_nodes) + " nodes, world=" +
+            std::to_string(id.world_size));
+  if (activation.pool.get() != state.get() ||
+      activation.generation != id.generation ||
+      activation.tokens != id.num_tokens ||
+      activation.hidden != config.hidden_size ||
+      activation.device != backend->execution.device_ordinal() ||
+      activation.session_identity !=
+          backend->session.session().stable_identity_bytes() ||
+      !activation.producer_execution.same_instance(
+          backend->execution.token()) ||
+      !activation.ready_recorded)
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "gin-run",
+                    "activation provenance", id.calling_rank,
+                    "exact pool/session/generation/execution/shape/ready",
+                    "mismatch");
+  if (!state->config.enable_gin_rdma ||
+      config.hidden_size > state->config.max_hidden_size ||
+      id.world_size > state->config.max_world_size ||
+      id.top_k > state->config.max_top_k ||
+      activation.slot->index >= backend->windows.size())
+    transport_error(NotifyErrorCode::WorkspaceCapacityExceeded, "gin-run",
+                    "pool geometry/window", id.calling_rank,
+                    "within registered GIN pool capacity",
+                    "exceeded/disabled");
+  if (config.gate_placement !=
+      transport::ActivationGatePlacement::SourceAfter)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "gin-run",
+                    "gate_placement", id.calling_rank, "SourceAfter",
+                    "unsupported");
+  if (options.cancellation.cancellation_requested())
+    throw NotifyDispatchError(
+        NotifyErrorCode::TransportTimeout,
+        "phase=gin-run, field=cancellation, rank=" +
+            std::to_string(id.calling_rank) +
+            ", expected=not requested, actual=requested");
+
+  const auto expectation = DeviceDispatchViewExpectation{
+      id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+      id.config_digest_word0, id.config_digest_word1};
+  auto consumer = dispatch.acquire_consumer(backend->execution, expectation);
+  const auto view = ActivationTransportBridge::view(consumer);
+  if (view.sizes.incoming_row_count >
+          state->config.max_destination_rows_per_rank ||
+      view.sizes.route_count >
+          checked_mul(state->config.max_tokens_per_rank,
+                      state->config.max_top_k, "GIN route capacity"))
+    transport_error(NotifyErrorCode::WorkspaceCapacityExceeded, "gin-run",
+                    "rows/routes", id.calling_rank, "within pool capacity",
+                    "exceeded");
+  SlotFailureGuard failure_guard{activation.slot, false};
+  const auto exec = internal::checked_execution_state(backend->execution);
+  auto &slot = state->slots[activation.slot->index];
+  const auto &layout = state->layout;
+  internal::throw_cuda(
+      "gin-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(producer-ready)");
+  ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
+  internal::throw_cuda(
+      "gin-run", cudaEventRecord(slot.start, exec->stream), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(GIN start)");
+  internal::throw_cuda(
+      "gin-run", cudaMemsetAsync(at<void>(slot.device, layout.status), 0,
+                                  sizeof(TransportDeviceStatus), exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN status)");
+  internal::throw_cuda(
+      "gin-run",
+      cudaMemsetAsync(at<void>(slot.device, layout.p2p_barrier_send), 0,
+                      sizeof(std::uint64_t), exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN reset barrier)");
+  gin_synthetic_reset_kernel<<<1, 1, 0, exec->stream>>>(backend->dev_comm);
+  internal::throw_cuda(
+      "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "GIN reset kernel launch");
+  auto *barrier = at<std::uint64_t>(slot.device, layout.p2p_barrier_send);
+  internal::throw_nccl(
+      "gin-run",
+      ncclAllReduce(barrier, barrier, 1, ncclUint64, ncclSum,
+                    backend->nccl->comm, exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "ncclAllReduce(after GIN reset)");
+
+  GinSyntheticArgs args{};
+  args.dispatch = view;
+  args.input = activation.pointer;
+  args.gates = ActivationTransportBridge::gate_pointer(dispatch);
+  args.hidden = config.hidden_size;
+  args.epoch = activation.slot->epoch;
+  args.dev_comm = backend->dev_comm;
+  args.window = backend->windows[activation.slot->index];
+  args.base = slot.device;
+  args.send_header_offset = layout.socket_header_send;
+  args.receive_header_offset = layout.socket_header_receive;
+  args.send_payload_offset = layout.contribution;
+  args.receive_payload_offset = layout.socket_payload_receive;
+  args.canonical_offset = layout.canonical_rows;
+  args.return_staging_offset = layout.gin_return_staging;
+  args.combine_offset = layout.combine_return;
+  args.combined_offset = layout.combined;
+  args.status_offset = layout.status;
+  args.identity_expert =
+      config.expert_transform ==
+      transport::ActivationExpertTransform::Identity;
+  gin_synthetic_persistent_kernel<<<1, 256, 0, exec->stream>>>(args);
+  internal::throw_cuda(
+      "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts,
+      "GIN activation persistent kernel launch");
+  internal::throw_cuda(
+      "gin-run",
+      cudaMemcpyAsync(slot.host_status, at<void>(slot.device, layout.status),
+                      sizeof(TransportDeviceStatus), cudaMemcpyDeviceToHost,
+                      exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "D2H GIN status");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                            sizeof(TransportDeviceStatus));
+  internal::throw_cuda(
+      "gin-run", cudaEventRecord(slot.complete, exec->stream),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(GIN complete)");
+  slot.completion_recorded = true;
+  ActivationTransportBridge::submit(consumer);
+  internal::throw_cuda(
+      "gin-run", cudaEventSynchronize(slot.complete), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventSynchronize(GIN complete)");
+  consumer.finish();
+  if (slot.host_status->error != 0)
+    transport_error(NotifyErrorCode::TransportProtocolFailure, "gin-run",
+                    "device data plane", id.calling_rank, "valid",
+                    "device error field=" +
+                        std::to_string(slot.host_status->error_field));
+
+  float total_ms = 0.0F;
+  internal::throw_cuda(
+      "gin-timing", cudaEventElapsedTime(&total_ms, slot.start, slot.complete),
+      id.calling_rank, id.world_size,
+      backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventElapsedTime(GIN total)");
+  auto result = std::make_shared<DeviceActivationTransportHandle::Impl>();
+  result->slot = activation.slot;
+  result->pool = state;
+  result->gin_backend = backend;
+  result->identity = {id.generation, id.calling_rank, id.world_size,
+                      id.num_tokens, config.hidden_size};
+  result->route_count = view.sizes.route_count;
+  result->destination_rows = state->config.max_destination_rows_per_rank;
+  result->audit.backend = transport::ActivationTransportBackend::Gin;
+  result->audit.packet_count = slot.host_status->packets_done;
+  result->audit.fanout_count = slot.host_status->fanout_done;
+  result->audit.raw_cross_node_payload_bytes =
+      slot.host_status->raw_cross_node_payload_bytes;
+  result->audit.deduplicated_cross_node_payload_bytes =
+      slot.host_status->deduplicated_cross_node_payload_bytes;
+  result->audit.actual_dispatch_peer_bytes =
+      slot.host_status->actual_dispatch_peer_bytes;
+  result->audit.actual_return_peer_bytes =
+      slot.host_status->actual_return_peer_bytes;
+  result->audit.derived_route_input_bytes =
+      view.sizes.route_count * sizeof(std::int32_t);
+  result->audit.derived_local_gate_bytes =
+      view.sizes.route_count * sizeof(float);
+  result->audit.derived_peer_gate_bytes = 0;
+  result->audit.generation_memset_calls = 2;
+  result->audit.generation_memset_bytes =
+      sizeof(TransportDeviceStatus) + sizeof(std::uint64_t);
+  result->audit.kernel_launches = 2;
+  result->audit.dispatch_kernel_blocks = 1;
+  result->audit.return_kernel_blocks = 1;
+  result->audit.reduce_kernel_blocks = 1;
+  result->audit.activation_d2h_bytes = 0;
+  result->audit.activation_h2d_bytes = 0;
+  result->audit.hot_path_allocations = 0;
+  result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+  failure_guard.committed = true;
+  return DeviceActivationTransportHandle(std::move(result));
+#endif
 }
 
 DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
@@ -9009,7 +9665,9 @@ ActivationTransportValidationDownload ActivationTransportBridge::download_for_va
   };
   const auto contribution_offset =
       impl.audit.backend ==
-              transport::ActivationTransportBackend::NcclSocketFallback
+                  transport::ActivationTransportBackend::NcclSocketFallback ||
+              impl.audit.backend ==
+                  transport::ActivationTransportBackend::Gin
           ? impl.pool->layout.combine_return
           : impl.pool->layout.contribution;
   copy(result.contribution_by_route.data(), contribution_offset,

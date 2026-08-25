@@ -649,8 +649,17 @@ GIN capability has five independent booleans: headers, full symbols,
 distributed runtime initialization, project backend implementation, and
 usable. Usable is their conjunction. The default 2.28.3 runtime fails the
 symbol gate. The explicitly loaded NCCL 2.29.7 CUDA 12.9 runtime passes
-world-2/world-16 device-communicator and registered-window initialization, but
-the data-plane backend is not implemented yet; therefore `gin_usable` remains
+world-2/world-16 device-communicator and registered-window initialization.
+The first concrete GIN activation slice is separately typed and supports
+exactly two nodes with one GPU each: each session-pool slot is allocated once
+with `ncclMemAlloc`,
+registered as a strict-ordering window, and retained by the result handle.
+One device kernel consumes deterministic Notify packets, issues remote header
+and node-deduplicated token puts, waits for local completion and remote signal,
+returns transformed route contributions, and performs source gate-after
+reduction. It rejects every other team shape until source-indexed ingress and
+same-rail proxy plus local-P2P fan-out are connected, so the general
+`gin_usable` capability remains
 false. The session probe is collective and returns no native NCCL/CUDA handle.
 The opt-in Socket correctness backend is now concrete and separately typed. It
 packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
