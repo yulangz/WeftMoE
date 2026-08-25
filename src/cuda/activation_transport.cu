@@ -2619,28 +2619,56 @@ local_p2p_forward_megakernel(
               std::uint32_t column, float av0, float av1, float bv0,
               float bv1) {
             const auto block_m = warpgroup * 64U + m;
-            const float av[2] = {av0, av1};
-            const float bv[2] = {bv0, bv1};
+            const auto output_column =
+                static_cast<std::uint64_t>(n) + column;
+            if (block_m < valid_rows &&
+                output_column + 1ULL < a.intermediate &&
+                (a.intermediate & 1ULL) == 0ULL) {
+              const auto output_index =
+                  (row + block_m) * a.intermediate + output_column;
+              // Each WGMMA lane owns two adjacent BF16 outputs.  Publish the
+              // pair as one naturally aligned store for S and for each cache
+              // plane; scalar struct stores previously doubled the FC1
+              // epilogue store instruction count on the cache fast path.
+              const auto sigmoid0 = 1.0F / (1.0F + __expf(-av0));
+              const auto sigmoid1 = 1.0F / (1.0F + __expf(-av1));
+              const auto pack = [](std::uint16_t low,
+                                   std::uint16_t high) {
+                return static_cast<std::uint32_t>(low) |
+                       (static_cast<std::uint32_t>(high) << 16U);
+              };
+              reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
+                  pack(float_to_bf16_bits((av0 * sigmoid0) * bv0),
+                       float_to_bf16_bits((av1 * sigmoid1) * bv1));
+              if (a.cache_fc1 && ab_cache) {
+                reinterpret_cast<std::uint32_t *>(ab_cache)
+                    [output_index / 2ULL] =
+                    pack(float_to_bf16_bits(av0), float_to_bf16_bits(av1));
+                const auto b_index =
+                    a.max_destination_rows * a.intermediate + output_index;
+                reinterpret_cast<std::uint32_t *>(ab_cache)[b_index / 2ULL] =
+                    pack(float_to_bf16_bits(bv0), float_to_bf16_bits(bv1));
+              }
+            } else if (block_m < valid_rows) {
+              // Retain checked scalar stores for non-main odd-N fixtures.
+              const float av[2] = {av0, av1};
+              const float bv[2] = {bv0, bv1};
 #pragma unroll
-            for (std::uint32_t value = 0; value < 2U; ++value) {
-              const auto output_column =
-                  static_cast<std::uint64_t>(n) + column + value;
-              if (block_m < valid_rows && output_column < a.intermediate) {
-                const auto output_index =
-                    (row + block_m) * a.intermediate + output_column;
-                // Hopper's native exponential is the forward specialization's
-                // documented SiLU approximation.  Keeping it at this fixed
-                // point makes both cache modes deterministic while avoiding a
-                // scalar libdevice call for every FC1 output element.
-                const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
-                s[output_index] = transport::BFloat16{
-                    float_to_bf16_bits((av[value] * sigmoid) * bv[value])};
-                if (a.cache_fc1 && ab_cache) {
-                  ab_cache[output_index] = transport::BFloat16{
-                      float_to_bf16_bits(av[value])};
-                  ab_cache[a.max_destination_rows * a.intermediate +
-                           output_index] = transport::BFloat16{
-                      float_to_bf16_bits(bv[value])};
+              for (std::uint32_t value = 0; value < 2U; ++value) {
+                const auto tail_column = output_column + value;
+                if (tail_column < a.intermediate) {
+                  const auto output_index =
+                      (row + block_m) * a.intermediate + tail_column;
+                  const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
+                  s[output_index] = transport::BFloat16{float_to_bf16_bits(
+                      (av[value] * sigmoid) * bv[value])};
+                  if (a.cache_fc1 && ab_cache) {
+                    ab_cache[output_index] =
+                        transport::BFloat16{float_to_bf16_bits(av[value])};
+                    ab_cache[a.max_destination_rows * a.intermediate +
+                             output_index] = transport::BFloat16{
+                        float_to_bf16_bits(bv[value])};
+                  }
                 }
               }
             }

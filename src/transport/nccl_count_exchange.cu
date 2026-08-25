@@ -2341,11 +2341,12 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                     impl_->backend->fast_path_ready() && !identity_override &&
                     testing::g_config_corruption_offset == SIZE_MAX &&
                     testing::g_next_fault.load(std::memory_order_acquire) == 0;
-  if (use_fast_notify &&
-      !impl_->backend->fast_config_matches(config_wire) &&
-      status.error == ControlLocalError::None)
-    status = {ControlLocalError::InvalidRuntimeConfig,
-              ControlField::ConfigBlob, UINT64_MAX, UINT64_MAX, 0, 1, 0};
+  // A changed config cannot use the cached fixed-layout record. Fall back to
+  // the complete agreement protocol so a uniformly changed, valid generation
+  // can recover on the same communicator, while mismatched ranks still fail
+  // at the exact config boundary.
+  if (use_fast_notify && !impl_->backend->fast_config_matches(config_wire))
+    use_fast_notify = false;
 #endif
 
   CudaLocalNotifyHandle local;
@@ -2433,20 +2434,9 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
         config_wire[offset] ^= std::byte{1};
     }
 
-#if MEGAMOE_DEBUG_VALIDATE
     auto config = impl_->backend->start_config(impl_->context, config_wire,
                                                control_done);
     (void)config.wait();
-#else
-    if (impl_->backend->can_reuse_verified_config(config_wire)) {
-      impl_->backend->reuse_verified_config(impl_->context, config_wire,
-                                            control_done);
-    } else {
-      auto config = impl_->backend->start_config(impl_->context, config_wire,
-                                                 control_done);
-      (void)config.wait();
-    }
-#endif
     control_config_end = std::chrono::steady_clock::now();
   }
   const auto coordinator_create = impl_->setup.coordinator_backend_create_us;
@@ -2594,7 +2584,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   const bool valid_full_audit =
       !use_fast_notify && audit_value.fused_notify_starts == 0 &&
       audit_value.control_starts == 1 &&
-      audit_value.config_starts + audit_value.config_cache_hits == 1 &&
+      audit_value.config_starts == 1 && audit_value.config_cache_hits == 0 &&
       audit_value.expert_count_starts == 1 &&
       audit_value.packet_summary_starts == 1;
   if (!valid_fused_audit && !valid_full_audit)

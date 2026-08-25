@@ -739,6 +739,32 @@ void test_twenty_failure_recovery_rounds() {
 
 void test_fault_injection() {
   using Point = megamoe::cuda::testing::NcclFaultPoint;
+  const auto require_recovery = [](const auto &recovered, const auto &audit,
+                                   const auto &config, const auto &routes,
+                                   const auto &execution,
+                                   const std::string &identity,
+                                   std::uint64_t generation,
+                                   const char *failure) {
+#if MEGAMOE_DEBUG_VALIDATE
+    const bool protocol_ok =
+        audit.fused_notify_starts == 0 && audit.control_starts == 1 &&
+        audit.config_starts == 1 && audit.expert_count_starts == 1 &&
+        audit.packet_summary_starts == 1;
+#else
+    const bool protocol_ok =
+        audit.fused_notify_starts == 1 && audit.control_starts == 0 &&
+        audit.config_starts == 0 && audit.expert_count_starts == 0 &&
+        audit.packet_summary_starts == 0;
+#endif
+    require(recovered && protocol_ok, failure);
+    const auto actual = megamoe::serialize_dispatch_metadata(
+        megamoe::cuda::download_device_metadata_for_validation(
+            recovered.dispatch(), execution));
+    const auto expected = megamoe::build_notify_dispatch_for_testing(
+        config, {routes}, identity, generation);
+    require(actual == megamoe::serialize_dispatch_metadata(expected.front()),
+            "fault recovery produced incorrect dispatch metadata/hash");
+  };
   struct FaultExpectation {
     Point point;
     megamoe::cuda::CollectiveProtocolAudit audit;
@@ -769,6 +795,21 @@ void test_fault_injection() {
     {
       auto pool = megamoe::cuda::make_device_notify_resource_pool(
           session, execution, {config, 10, 4096, 1, 2});
+      // Establish the session-static config on this exact pooled backend.
+      // Release must then recover through the fused protocol; debug must
+      // continue to execute the complete protocol without this release-only
+      // setup prime. Lifecycle assertions below distinguish both modes.
+#if !MEGAMOE_DEBUG_VALIDATE
+      {
+        auto prime_session = megamoe::cuda::make_nccl_generation(
+            session, "fault", 3900 + index);
+        megamoe::cuda::CudaNotifyGenerationCoordinator prime(
+            prime_session, execution, pool);
+        require(static_cast<bool>(
+                    prime.run({config, {1, {0, 1, 2}}, 10})),
+                "failed to prime fault-recovery static config");
+      }
+#endif
       megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, pool);
       megamoe::cuda::testing::inject_next_nccl_fault(points[index].point);
@@ -784,7 +825,8 @@ void test_fault_injection() {
         require(message.find("controlled test fault") != std::string::npos,
                 "fault error lost original backend text");
       }
-      require(failed, "fault injection did not fail generation");
+      require(failed, std::string("fault generation published validated result at ") +
+                          points[index].stage);
       audit = coordinator.audit();
       require(pool.usage().slots_in_use == 0,
               "pooled fault did not return failed generation slot");
@@ -792,15 +834,12 @@ void test_fault_injection() {
           session, "fault", 5000 + index);
       megamoe::cuda::CudaNotifyGenerationCoordinator recovery(
           recovery_session, execution, pool);
-      auto recovered = recovery.run({config, {1, {0, 1, 2}}, 10});
-      require(recovered &&
-                  recovery.audit().control_starts == 1 &&
-                  recovery.audit().config_starts +
-                          recovery.audit().config_cache_hits ==
-                      1 &&
-                  recovery.audit().expert_count_starts == 1 &&
-                  recovery.audit().packet_summary_starts == 1,
-              "pooled fault did not recover on the same communicator");
+      const megamoe::RankRoutingInput routes{1, {0, 1, 2}};
+      auto recovered = recovery.run({config, routes, 10});
+      require_recovery(recovered, recovery.audit(), config, routes, execution,
+                       "fault", 5000 + index,
+                       "pooled fault did not recover with the exact protocol "
+                       "on the same communicator");
     }
     const auto expected = points[index].audit;
     require(audit.control_starts == expected.control_starts &&
@@ -820,8 +859,13 @@ void test_fault_injection() {
     require(lifecycle.completion_lease_creates ==
                 lifecycle.completion_lease_destroys,
             "fault leaked a completion lease");
+#if MEGAMOE_DEBUG_VALIDATE
     require(lifecycle.validated_publishes == 1,
-            "fault/recovery published other than the one valid generation");
+            "debug fault/recovery published other than recovery");
+#else
+    require(lifecycle.validated_publishes == 2,
+            "release fault/recovery published other than prime + recovery");
+#endif
     require(lifecycle.operation_cancels <= 1,
             "coordinator fault double-cancelled");
     require(lifecycle.operation_waits <= 8 &&
@@ -844,6 +888,17 @@ void test_fault_injection() {
         "device-stage-fault", 1, 0, 4050 + index, 0, bootstrap);
     auto pool = megamoe::cuda::make_device_notify_resource_pool(
         session, execution, {config, 10, 4096, 1, 2});
+#if !MEGAMOE_DEBUG_VALIDATE
+    {
+      auto prime_session = megamoe::cuda::make_nccl_generation(
+          session, "device-stage-fault", 3950 + index);
+      megamoe::cuda::CudaNotifyGenerationCoordinator prime(
+          prime_session, execution, pool);
+      require(static_cast<bool>(
+                  prime.run({config, {1, {0, 1, 2}}, 10})),
+              "failed to prime device-stage recovery static config");
+    }
+#endif
     megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         session, execution, pool);
     megamoe::cuda::testing::inject_next_nccl_fault(
@@ -869,14 +924,25 @@ void test_fault_injection() {
         session, "device-stage-fault", 4150 + index);
     megamoe::cuda::CudaNotifyGenerationCoordinator recovery(
         recovery_session, execution, pool);
-    auto recovered = recovery.run({config, {1, {0, 1, 2}}, 10});
-    require(recovered && recovery.audit().packet_summary_starts == 1,
-            "device-stage fault did not recover on the same communicator");
+    const megamoe::RankRoutingInput routes{1, {0, 1, 2}};
+    auto recovered = recovery.run({config, routes, 10});
+    require_recovery(recovered, recovery.audit(), config, routes, execution,
+                     "device-stage-fault", 4150 + index,
+                     "device-stage fault did not recover with the exact "
+                     "protocol on the same communicator");
     const auto lifecycle =
         megamoe::cuda::testing::nccl_lifecycle_snapshot();
+#if MEGAMOE_DEBUG_VALIDATE
     require(lifecycle.validated_publishes == 1 &&
                 lifecycle.operation_cancels == 0,
-            "device-stage fault published/cancelled an invalid generation");
+            "debug device-stage fault published/cancelled an invalid "
+            "generation");
+#else
+    require(lifecycle.validated_publishes == 2 &&
+                lifecycle.operation_cancels == 0,
+            "release device-stage fault published other than prime + "
+            "recovery or cancelled an invalid generation");
+#endif
   }
   for (const bool deadline : {false, true}) {
     megamoe::cuda::testing::reset_nccl_lifecycle_counters();
@@ -918,9 +984,13 @@ void test_fault_injection() {
         deadline ? 4191 : 4190);
     megamoe::cuda::CudaNotifyGenerationCoordinator recovery(
         recovery_session, execution, pool);
-    auto recovered = recovery.run({config, {1, {0, 1, 2}}, 10});
-    require(recovered && recovery.audit().packet_summary_starts == 1,
-            "communicator did not recover after cancellation/deadline");
+    const megamoe::RankRoutingInput routes{1, {0, 1, 2}};
+    auto recovered = recovery.run({config, routes, 10});
+    require_recovery(recovered, recovery.audit(), config, routes, execution,
+                     deadline ? "deadline" : "cancel",
+                     deadline ? 4191 : 4190,
+                     "communicator did not recover with the exact protocol "
+                     "after cancellation/deadline");
   }
   std::cout << "[PASS] 9-point NCCL + 3 device-stage pooled fault matrix + "
                "production cancel/deadline exact cancel=1\n";
