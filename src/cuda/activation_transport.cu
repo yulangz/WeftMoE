@@ -206,6 +206,16 @@ struct BackwardDeviceStatus {
   unsigned long long dw2_complete_clock;
   unsigned long long dx_reduce_complete_clock;
   unsigned long long complete_clock;
+  unsigned long long dv_start_clock;
+  unsigned long long dx_start_clock;
+  unsigned long long dw1_first_ready_clock;
+  unsigned long long dw1_first_start_clock;
+  unsigned long long dw1_last_complete_clock;
+  unsigned long long dw2_first_ready_clock;
+  unsigned long long dw2_first_start_clock;
+  unsigned long long dw2_last_complete_clock;
+  unsigned long long dw1_max_ready_wait;
+  unsigned long long dw2_max_ready_wait;
   unsigned long long dv_tasks;
   unsigned long long dx_tasks;
   unsigned long long dw1_tasks;
@@ -216,6 +226,17 @@ struct BackwardDeviceStatus {
   unsigned long long actual_dx_peer_bytes;
   unsigned int error;
   unsigned int error_field;
+};
+
+struct BackwardExpertDwTimeline {
+  unsigned long long dv_tasks_complete;
+  unsigned long long ready_clock;
+  unsigned long long dw1_first_start_clock;
+  unsigned long long dw1_tasks_complete;
+  unsigned long long dw1_complete_clock;
+  unsigned long long dw2_first_start_clock;
+  unsigned long long dw2_tasks_complete;
+  unsigned long long dw2_complete_clock;
 };
 
 struct Layout {
@@ -262,6 +283,7 @@ struct Layout {
   std::size_t backward_dw1 = 0;
   std::size_t backward_dw2 = 0;
   std::size_t backward_scheduler = 0;
+  std::size_t backward_dw_timeline = 0;
   std::size_t backward_status = 0;
   std::size_t status = 0;
   std::size_t total = 0;
@@ -457,6 +479,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       layout.backward_scheduler = append(
           cursor, 64ULL + reduction_rows, sizeof(std::uint64_t),
           "backward scheduler/readiness");
+      layout.backward_dw_timeline = append(
+          cursor, max_owned_experts, sizeof(BackwardExpertDwTimeline),
+          "backward per-expert dW timeline");
       layout.backward_status = append(cursor, 1, sizeof(BackwardDeviceStatus),
                                       "backward status");
     }
@@ -1865,6 +1890,8 @@ using BackwardDwMma = typename deep_gemm::mma::sm90::BF16MMASelector<
     256, cute::UMMA::Major::MN, cute::UMMA::Major::MN>::type;
 using BackwardDwMixedMma = typename deep_gemm::mma::sm90::BF16MMASelector<
     256, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
+using BackwardDwDirectMma = typename deep_gemm::mma::sm90::BF16MMASelector<
+    256, cute::UMMA::Major::MN, cute::UMMA::Major::K>::type;
 using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 
 // FC1 consumes the same activation tile twice (the A and B projections of
@@ -2779,6 +2806,7 @@ struct BackwardKernelArgs {
   std::size_t dw1_offset;
   std::size_t dw2_offset;
   std::size_t scheduler_offset;
+  std::size_t dw_timeline_offset;
   std::size_t claim_offset;
   std::size_t incoming_signal_offset;
   std::size_t outgoing_signal_offset;
@@ -2997,22 +3025,93 @@ __device__ void backward_wgmma_dw_k_mn_tile(
 #pragma unroll
       for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-      // Keep two canonical-M WGMMA groups in flight.  The instruction stream
-      // still updates one accumulator in strict K order, while wait_group<1>
-      // releases only the oldest shared stage and hides the next TMA/WGMMA
-      // issue latency.
-      if (iteration != 0U) {
-        deep_gemm::ptx::warpgroup_wait<1>();
-        const auto completed_pipeline = pipeline_iteration + iteration - 1U;
-        if ((threadIdx.x & 31U) == 0U)
-          empty_barriers[completed_pipeline % kStages].arrive();
-      }
-    }
-    if (iterations != 0U) {
       deep_gemm::ptx::warpgroup_wait<0>();
-      const auto final_pipeline = pipeline_iteration + iterations - 1U;
       if ((threadIdx.x & 31U) == 0U)
-        empty_barriers[final_pipeline % kStages].arrive();
+        empty_barriers[stage].arrive();
+    }
+  }
+  __syncthreads();
+  pipeline_iteration += iterations;
+}
+
+// Direct dW2 parameter-layout path: dW2 = dY^T @ U. dY remains canonical
+// row-major and is consumed as MN-major A; U^T is consumed as K-major B.
+// Two 64-row A atoms and two 128-column B atoms form one [128,256] tile.
+__device__ void backward_wgmma_dw_mn_k_tile(
+    const CUtensorMap &a_mn_map, const CUtensorMap &b_k_map,
+    std::uint32_t a_reduction_start, std::uint32_t b_reduction_start,
+    std::uint32_t output_row, std::uint32_t output_column,
+    std::uint32_t reduction, transport::BFloat16 *smem_a_public,
+    transport::BFloat16 *smem_b_public, ForwardBarrier *full_barriers,
+    ForwardBarrier *empty_barriers, float *accum,
+    std::uint32_t &pipeline_iteration) {
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::uint32_t kMathWarpGroups = 2U;
+  constexpr std::uint32_t kAStageElements = 128U * 64U;
+  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  const auto warpgroup = __shfl_sync(0xffffffffU, threadIdx.x / 128U, 0);
+  if (warpgroup < kMathWarpGroups) {
+#pragma unroll
+    for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+      accum[index] = 0.0F;
+  }
+  const auto iterations = reduction / 64U;
+  if (threadIdx.x == kMathWarpGroups * 128U) {
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+      const auto pipeline = pipeline_iteration + iteration;
+      const auto stage = pipeline % kStages;
+      const auto phase = (pipeline / kStages) & 1U;
+      empty_barriers[stage].wait(phase ^ 1U);
+      auto *smem_a = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_a_public + stage * kAStageElements);
+      auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_b_public + stage * kBStageElements);
+      const auto a_k = a_reduction_start + iteration * 64U;
+      const auto b_k = b_reduction_start + iteration * 64U;
+      for (std::uint32_t atom = 0; atom < 2U; ++atom)
+        deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+            &a_mn_map, &full_barriers[stage],
+            smem_a + atom * 64U * 64U, output_row + atom * 64U, a_k);
+      for (std::uint32_t atom = 0; atom < 2U; ++atom)
+        deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+            &b_k_map, &full_barriers[stage],
+            smem_b + atom * 128U * 64U, b_k,
+            output_column + atom * 128U);
+      full_barriers[stage].arrive_and_expect_tx(
+          (kAStageElements + kBStageElements) *
+          sizeof(transport::BFloat16));
+    }
+  } else if (warpgroup < kMathWarpGroups) {
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+      const auto pipeline = pipeline_iteration + iteration;
+      const auto stage = pipeline % kStages;
+      const auto phase = (pipeline / kStages) & 1U;
+      auto *smem_a = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_a_public + stage * kAStageElements);
+      auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
+          smem_b_public + stage * kBStageElements);
+      full_barriers[stage].wait(phase);
+#pragma unroll
+      for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+      for (std::uint32_t k = 0; k < 64U / BackwardDwDirectMma::K; ++k) {
+        const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+            cute::UMMA::Major::MN, 128, 64, 128, cutlass::bfloat16_t>(
+            smem_a, warpgroup * 64U, k * BackwardDwDirectMma::K);
+        const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+            cute::UMMA::Major::K, 256, 64, 128, cutlass::bfloat16_t>(
+            smem_b, 0U, k * BackwardDwDirectMma::K);
+        BackwardDwDirectMma::wgmma(desc_a, desc_b, accum, 1);
+      }
+      deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+      for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      deep_gemm::ptx::warpgroup_wait<0>();
+      if ((threadIdx.x & 31U) == 0U)
+        empty_barriers[stage].arrive();
     }
   }
   __syncthreads();
@@ -3139,6 +3238,8 @@ local_p2p_backward_megakernel(
   auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler = peer_at<unsigned long long>(a.local_base,
                                                 a.scheduler_offset);
+  auto *dw_timeline = peer_at<BackwardExpertDwTimeline>(
+      a.local_base, a.dw_timeline_offset);
   auto *claims = peer_at<unsigned long long>(a.local_base, a.claim_offset);
   auto *headers = peer_at<LocalP2pRouteHeader>(a.local_base,
                                                a.direct_headers_offset);
@@ -3181,6 +3282,10 @@ local_p2p_backward_megakernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     *status = BackwardDeviceStatus{};
     status->start_clock = device_globaltimer_ns();
+    status->dw1_first_ready_clock = ~0ULL;
+    status->dw1_first_start_clock = ~0ULL;
+    status->dw2_first_ready_clock = ~0ULL;
+    status->dw2_first_start_clock = ~0ULL;
     for (std::uint32_t word = 0; word < 32U; ++word)
       scheduler[word] = 0ULL;
     unsigned long long mblocks = 0ULL;
@@ -3195,6 +3300,11 @@ local_p2p_backward_megakernel(
     scheduler[8] = mblocks;
     scheduler[9] = padded;
   }
+  for (std::uint32_t expert =
+           static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       expert < a.dispatch.sizes.owned_expert_count;
+       expert += static_cast<std::uint32_t>(gridDim.x) * blockDim.x)
+    dw_timeline[expert] = BackwardExpertDwTimeline{};
   grid.sync();
 
   // Build an immutable padded-canonical lookup. dW reductions use this to
@@ -3373,6 +3483,8 @@ local_p2p_backward_megakernel(
   __syncthreads();
   pipeline_iteration = 0;
   const auto dv_tasks = mblocks * dv_ntiles;
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    status->dv_start_clock = device_globaltimer_ns();
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[1], 1ULL);
@@ -3562,7 +3674,22 @@ local_p2p_backward_megakernel(
               make_uint4(words_db[0], words_db[1], words_db[2], words_db[3]);
         }
       }
-      __syncthreads();
+  __syncthreads();
+}
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const auto expected =
+          ((a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL) *
+          dv_ntiles;
+      const auto complete =
+          atomicAdd(&dw_timeline[expert].dv_tasks_complete, 1ULL) + 1ULL;
+      if (complete == expected) {
+        const auto now = device_globaltimer_ns();
+        dw_timeline[expert].ready_clock = now;
+        atomicMin(&status->dw1_first_ready_clock, now);
+        atomicMin(&status->dw2_first_ready_clock, now);
+      }
     }
     __syncthreads();
   }
@@ -3605,6 +3732,21 @@ local_p2p_backward_megakernel(
   const auto dx_ntiles =
       static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
   const auto dx_tasks = mblocks * dx_ntiles;
+  // dW2 and dW1 retain their L2-friendly contiguous task domains. Scheduler
+  // candidates may overlap a prefix with dX, but do not interleave operand
+  // families because that destroys canonical-MN B reuse.
+  const auto dw2_mtiles = (a.hidden + 127ULL) / 128ULL;
+  constexpr std::uint64_t kDwN = 256ULL;
+  const auto dw2_ntiles = (a.intermediate + kDwN - 1ULL) / kDwN;
+  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
+  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
+  const auto dw2_tasks = static_cast<unsigned long long>(
+      a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
+  const auto dw1_tasks = static_cast<unsigned long long>(
+      a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
+  const auto dw_tasks = dw2_tasks + dw1_tasks;
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    status->dx_start_clock = device_globaltimer_ns();
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[2], 1ULL);
@@ -3686,20 +3828,11 @@ local_p2p_backward_megakernel(
   // that expert's padded canonical-M segment in ascending order.
   // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
   // 128x128 accumulator tile directly into the parameter layout [H,I].
-  const auto dw2_mtiles = (a.intermediate + 127ULL) / 128ULL;
-  constexpr std::uint64_t kDwN = 256ULL;
-  const auto dw2_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
-  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
-  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
-  const auto dw2_tasks = static_cast<unsigned long long>(
-      a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
-  const auto dw1_tasks = static_cast<unsigned long long>(
-      a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
-    if (task_shared >= dw2_tasks + dw1_tasks)
+    if (task_shared >= dw_tasks)
       break;
     const bool is_dw1 = task_shared >= dw2_tasks;
     auto task = is_dw1 ? task_shared - dw2_tasks : task_shared;
@@ -3716,20 +3849,41 @@ local_p2p_backward_megakernel(
     const auto reduction_start = claims[expert];
     const auto reduction =
         (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+    if (threadIdx.x == 0) {
+      const auto now = device_globaltimer_ns();
+      auto *first_start = is_dw1
+                              ? &dw_timeline[expert].dw1_first_start_clock
+                              : &dw_timeline[expert].dw2_first_start_clock;
+      if (atomicCAS(first_start, 0ULL, now) == 0ULL)
+        atomicMin(is_dw1 ? &status->dw1_first_start_clock
+                         : &status->dw2_first_start_clock,
+                  now);
+    }
+    __syncthreads();
     float accum[BackwardDwMixedMma::kNumAccum];
-    backward_wgmma_dw_k_mn_tile(
-        is_dw1 ? dab_transpose_map : u_transpose_map,
-        is_dw1 ? x_mn_map : dy_mn_map,
-        static_cast<std::uint32_t>(reduction_start),
-        static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
-        static_cast<std::uint32_t>(mtile * 128ULL),
-        static_cast<std::uint32_t>(ntile * kDwN),
-        static_cast<std::uint32_t>(reduction), smem_a, smem_b,
-        full_barriers, empty_barriers, accum, pipeline_iteration);
-    const auto mma_rows = is_dw1 ? 2ULL * a.intermediate : a.intermediate;
-    const auto mma_columns = a.hidden;
-    const auto output_rows = is_dw1 ? mma_rows : a.hidden;
-    const auto output_columns = is_dw1 ? mma_columns : a.intermediate;
+    if (is_dw1) {
+      backward_wgmma_dw_k_mn_tile(
+          dab_transpose_map, x_mn_map,
+          static_cast<std::uint32_t>(reduction_start),
+          static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
+          static_cast<std::uint32_t>(mtile * 128ULL),
+          static_cast<std::uint32_t>(ntile * kDwN),
+          static_cast<std::uint32_t>(reduction), smem_a, smem_b,
+          full_barriers, empty_barriers, accum, pipeline_iteration);
+    } else {
+      backward_wgmma_dw_mn_k_tile(
+          dy_mn_map, u_transpose_map,
+          static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert]),
+          static_cast<std::uint32_t>(reduction_start),
+          static_cast<std::uint32_t>(mtile * 128ULL),
+          static_cast<std::uint32_t>(ntile * kDwN),
+          static_cast<std::uint32_t>(reduction), smem_a, smem_b,
+          full_barriers, empty_barriers, accum, pipeline_iteration);
+    }
+    const auto mma_rows = is_dw1 ? 2ULL * a.intermediate : a.hidden;
+    const auto mma_columns = is_dw1 ? a.hidden : a.intermediate;
+    const auto output_rows = mma_rows;
+    const auto output_columns = mma_columns;
     auto *output = is_dw1 ? dw1 : dw2;
     const auto expert_stride = output_rows * output_columns;
     auto *output_tile = smem_a;
@@ -3751,8 +3905,7 @@ local_p2p_backward_megakernel(
       const auto local_vector = vector % kVectorsPerRow;
       const auto mma_row = mtile * 128ULL + local_row;
       const auto mma_column = ntile * kDwN + local_vector * 8ULL;
-      if (is_dw1 && mma_row < output_rows &&
-          mma_column + 7ULL < output_columns) {
+      if (mma_row < output_rows && mma_column + 7ULL < output_columns) {
         reinterpret_cast<uint4 *>(
             output + expert * expert_stride + mma_row * output_columns +
             mma_column)[0] = reinterpret_cast<const uint4 *>(
@@ -3760,33 +3913,19 @@ local_p2p_backward_megakernel(
       }
     }
     __syncthreads();
-    // dW2's MMA tile is [I,H].  Gather eight adjacent I rows from shared
-    // memory and issue one coalesced 16-byte store into parameter layout
-    // [H,I], rather than 8 strided global scalar stores.
-    if (!is_dw1) {
-      constexpr std::uint32_t kTransposeVectors = kDwN * (128U / 8U);
-      for (std::uint32_t vector = threadIdx.x; vector < kTransposeVectors;
-           vector += blockDim.x) {
-        const auto local_hidden = vector / (128U / 8U);
-        const auto local_i_vector = vector % (128U / 8U);
-        const auto hidden_row = ntile * kDwN + local_hidden;
-        const auto i_column = mtile * 128ULL + local_i_vector * 8ULL;
-        if (hidden_row < output_rows && i_column + 7ULL < output_columns) {
-          unsigned int words[4];
-#pragma unroll
-          for (std::uint32_t word = 0; word < 4U; ++word) {
-            const auto first = output_tile[
-                (local_i_vector * 8U + word * 2U) * kDwN + local_hidden];
-            const auto second = output_tile[
-                (local_i_vector * 8U + word * 2U + 1U) * kDwN +
-                local_hidden];
-            words[word] = static_cast<unsigned int>(first.bits) |
-                          (static_cast<unsigned int>(second.bits) << 16U);
-          }
-          reinterpret_cast<uint4 *>(
-              output + expert * expert_stride + hidden_row * output_columns +
-              i_column)[0] = make_uint4(words[0], words[1], words[2],
-                                        words[3]);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const auto complete = is_dw1
+          ? atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL
+          : atomicAdd(&dw_timeline[expert].dw2_tasks_complete, 1ULL) + 1ULL;
+      if (complete == per_expert) {
+        const auto now = device_globaltimer_ns();
+        if (is_dw1) {
+          dw_timeline[expert].dw1_complete_clock = now;
+          atomicMax(&status->dw1_last_complete_clock, now);
+        } else {
+          dw_timeline[expert].dw2_complete_clock = now;
+          atomicMax(&status->dw2_last_complete_clock, now);
         }
       }
     }
@@ -3794,8 +3933,20 @@ local_p2p_backward_megakernel(
   }
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status->dw2_complete_clock = device_globaltimer_ns();
-    status->dw1_complete_clock = status->dw2_complete_clock;
+    status->dw2_complete_clock = status->dw2_last_complete_clock;
+    status->dw1_complete_clock = status->dw1_last_complete_clock;
+    for (std::uint32_t expert = 0;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      const auto ready = dw_timeline[expert].ready_clock;
+      const auto dw1_start = dw_timeline[expert].dw1_first_start_clock;
+      const auto dw2_start = dw_timeline[expert].dw2_first_start_clock;
+      if (ready != 0ULL && dw1_start >= ready)
+        status->dw1_max_ready_wait =
+            max(status->dw1_max_ready_wait, dw1_start - ready);
+      if (ready != 0ULL && dw2_start >= ready)
+        status->dw2_max_ready_wait =
+            max(status->dw2_max_ready_wait, dw2_start - ready);
+    }
   }
   backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
                               gridDim.x);
@@ -3826,29 +3977,37 @@ local_p2p_backward_megakernel(
         ((a.hidden + 255ULL) / 256ULL);
     status->dw2_tasks = static_cast<unsigned long long>(
         a.dispatch.sizes.owned_expert_count) *
-        ((a.intermediate + 127ULL) / 128ULL) *
-        ((a.hidden + 255ULL) / 256ULL);
+        ((a.hidden + 127ULL) / 128ULL) *
+        ((a.intermediate + 255ULL) / 256ULL);
     const auto kdv = a.hidden / 64ULL;
     const auto kdx = (2ULL * a.intermediate) / 64ULL;
-    unsigned long long dw_reduction_iterations = 0ULL;
+    unsigned long long dw1_reduction_iterations = 0ULL;
+    unsigned long long dw2_reduction_iterations = 0ULL;
     const auto dw1_tiles_per_expert =
         ((2ULL * a.intermediate + 127ULL) / 128ULL) *
         ((a.hidden + 255ULL) / 256ULL);
     const auto dw2_tiles_per_expert =
-        ((a.intermediate + 127ULL) / 128ULL) *
-        ((a.hidden + 255ULL) / 256ULL);
+        ((a.hidden + 127ULL) / 128ULL) *
+        ((a.intermediate + 255ULL) / 256ULL);
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert)
-      dw_reduction_iterations +=
-          ((a.dispatch.expert_row_count[expert] + 63ULL) / 64ULL) *
-          (dw1_tiles_per_expert + dw2_tiles_per_expert);
+      {
+        const auto reduction_iterations =
+            (a.dispatch.expert_row_count[expert] + 63ULL) / 64ULL;
+        dw1_reduction_iterations +=
+            reduction_iterations * dw1_tiles_per_expert;
+        dw2_reduction_iterations +=
+            reduction_iterations * dw2_tiles_per_expert;
+      }
     status->wgmma_instructions =
         (status->dv_tasks * kdv + status->dx_tasks * kdx) *
             2ULL * (64ULL / ForwardMma::K) +
-        dw_reduction_iterations * 2ULL * (64ULL / ForwardMma::K);
+        (dw1_reduction_iterations + dw2_reduction_iterations) *
+            2ULL * (64ULL / ForwardMma::K);
     status->tma_loads = (status->dv_tasks * kdv +
                          status->dx_tasks * kdx) * 2ULL +
-                        dw_reduction_iterations * 5ULL;
+                        dw1_reduction_iterations * 5ULL +
+                        dw2_reduction_iterations * 4ULL;
 #endif
     status->complete_clock = device_globaltimer_ns();
   }
@@ -6406,6 +6565,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.dw1_offset = layout.backward_dw1;
   args.dw2_offset = layout.backward_dw2;
   args.scheduler_offset = layout.backward_scheduler;
+  args.dw_timeline_offset = layout.backward_dw_timeline;
   args.claim_offset = layout.forward_task_claim;
   args.incoming_signal_offset = layout.ingress_published_sequence;
   args.outgoing_signal_offset = layout.outgoing_route_sequence;
@@ -6582,12 +6742,40 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       elapsed(status.dgate_complete_clock, status.transpose_complete_clock);
   result->timings.dx_us = elapsed(status.transpose_complete_clock,
                                   status.dx_complete_clock);
-  result->timings.dw1_us =
-      elapsed(status.dx_complete_clock, status.dw1_complete_clock);
-  result->timings.dw2_us =
-      elapsed(status.dx_complete_clock, status.dw2_complete_clock);
+  result->timings.dw1_us = elapsed(status.dw1_first_start_clock,
+                                  status.dw1_last_complete_clock);
+  result->timings.dw2_us = elapsed(status.dw2_first_start_clock,
+                                  status.dw2_last_complete_clock);
+  result->timings.dw1_ready_to_start_us = elapsed(
+      status.dw1_first_ready_clock, status.dw1_first_start_clock);
+  result->timings.dw2_ready_to_start_us = elapsed(
+      status.dw2_first_ready_clock, status.dw2_first_start_clock);
+  result->timings.dw1_max_expert_ready_to_start_us =
+      static_cast<double>(status.dw1_max_ready_wait) / 1000.0;
+  result->timings.dw2_max_expert_ready_to_start_us =
+      static_cast<double>(status.dw2_max_ready_wait) / 1000.0;
+  result->timings.dw1_tail_us = elapsed(
+      max(status.dx_complete_clock, status.dw1_first_start_clock),
+      status.dw1_last_complete_clock);
+  result->timings.dw2_tail_us = elapsed(
+      max(status.dx_complete_clock, status.dw2_first_start_clock),
+      status.dw2_last_complete_clock);
+  const auto overlap = [](std::uint64_t begin, std::uint64_t end,
+                          std::uint64_t window_begin,
+                          std::uint64_t window_end) {
+    const auto first = max(begin, window_begin);
+    const auto last = min(end, window_end);
+    return last >= first ? static_cast<double>(last - first) / 1000.0 : 0.0;
+  };
+  result->timings.dw1_overlap_dv_dx_us = overlap(
+      status.dw1_first_start_clock, status.dw1_last_complete_clock,
+      status.dv_start_clock, status.dx_complete_clock);
+  result->timings.dw2_overlap_dv_dx_us = overlap(
+      status.dw2_first_start_clock, status.dw2_last_complete_clock,
+      status.dv_start_clock, status.dx_complete_clock);
   result->timings.dx_combine_reduce_us = elapsed(
-      status.dw2_complete_clock, status.dx_reduce_complete_clock);
+      max(status.dw1_complete_clock, status.dw2_complete_clock),
+      status.dx_reduce_complete_clock);
   failure_guard.committed = true;
   return DeviceBackwardHandle(std::move(result));
 }

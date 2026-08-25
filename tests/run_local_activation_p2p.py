@@ -503,6 +503,10 @@ def main():
                 stage_keys = ("wall", "notify", "forward", "backward",
                               "dy_dispatch", "dv", "dgate", "transpose",
                               "dx", "dw1", "dw2",
+                              "dw1_ready_wait", "dw2_ready_wait",
+                              "dw1_max_expert_wait", "dw2_max_expert_wait",
+                              "dw1_tail", "dw2_tail",
+                              "dw1_overlap_dv_dx", "dw2_overlap_dv_dx",
                               "reduce")
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=

@@ -431,6 +431,14 @@ struct BackwardMegaKernelTimings {
   double dx_us = 0;
   double dw1_us = 0;
   double dw2_us = 0;
+  double dw1_ready_to_start_us = 0;
+  double dw2_ready_to_start_us = 0;
+  double dw1_max_expert_ready_to_start_us = 0;
+  double dw2_max_expert_ready_to_start_us = 0;
+  double dw1_tail_us = 0;
+  double dw2_tail_us = 0;
+  double dw1_overlap_dv_dx_us = 0;
+  double dw2_overlap_dv_dx_us = 0;
   double dx_combine_reduce_us = 0;
   double total_us = 0;
 };

@@ -2155,7 +2155,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> wall, notify_samples, forward_samples,
         backward_samples, dy_dispatch_samples, dv_samples, dx_samples,
         dw1_samples, dw2_samples, reduce_samples, dgate_samples,
-        transpose_samples;
+        transpose_samples, dw1_wait_samples, dw2_wait_samples,
+        dw1_max_wait_samples, dw2_max_wait_samples, dw1_tail_samples,
+        dw2_tail_samples, dw1_overlap_samples, dw2_overlap_samples;
     megamoe::cuda::BackwardMegaKernelAudit last_audit;
     megamoe::cuda::SelectedOutputGradientLease dy_storage;
     const auto api_before = megamoe::cuda::testing::cuda_api_audit_snapshot();
@@ -2218,6 +2220,20 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         dx_samples.push_back(backward_handle.timings().dx_us);
         dw1_samples.push_back(backward_handle.timings().dw1_us);
         dw2_samples.push_back(backward_handle.timings().dw2_us);
+        dw1_wait_samples.push_back(
+            backward_handle.timings().dw1_ready_to_start_us);
+        dw2_wait_samples.push_back(
+            backward_handle.timings().dw2_ready_to_start_us);
+        dw1_max_wait_samples.push_back(
+            backward_handle.timings().dw1_max_expert_ready_to_start_us);
+        dw2_max_wait_samples.push_back(
+            backward_handle.timings().dw2_max_expert_ready_to_start_us);
+        dw1_tail_samples.push_back(backward_handle.timings().dw1_tail_us);
+        dw2_tail_samples.push_back(backward_handle.timings().dw2_tail_us);
+        dw1_overlap_samples.push_back(
+            backward_handle.timings().dw1_overlap_dv_dx_us);
+        dw2_overlap_samples.push_back(
+            backward_handle.timings().dw2_overlap_dv_dx_us);
         reduce_samples.push_back(
             backward_handle.timings().dx_combine_reduce_us);
       }
@@ -2267,6 +2283,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::cout << " dx="; emit(dx_samples);
     std::cout << " dw1="; emit(dw1_samples);
     std::cout << " dw2="; emit(dw2_samples);
+    std::cout << " dw1_ready_wait="; emit(dw1_wait_samples);
+    std::cout << " dw2_ready_wait="; emit(dw2_wait_samples);
+    std::cout << " dw1_max_expert_wait="; emit(dw1_max_wait_samples);
+    std::cout << " dw2_max_expert_wait="; emit(dw2_max_wait_samples);
+    std::cout << " dw1_tail="; emit(dw1_tail_samples);
+    std::cout << " dw2_tail="; emit(dw2_tail_samples);
+    std::cout << " dw1_overlap_dv_dx="; emit(dw1_overlap_samples);
+    std::cout << " dw2_overlap_dv_dx="; emit(dw2_overlap_samples);
     std::cout << " reduce="; emit(reduce_samples);
     std::cout << std::endl;
     return;
