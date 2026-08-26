@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: MegaMOE
+Description: Deterministic persistent MoE runtime
+Version: @VERSION@
+Libs: -L${libdir} -lmegamoe
+Libs.private: -lnccl -lcudart -lcuda -ldl
+Cflags: -I${includedir}

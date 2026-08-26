@@ -9,10 +9,18 @@ DEEPGEMM_INCLUDE_DIR ?= ../DeepGEMM/deep_gemm/include
 CUTLASS_INCLUDE_DIR ?= $(shell python3 -c 'import importlib.util,os;s=importlib.util.find_spec("deep_gemm");print(os.path.join(os.path.dirname(s.origin),"include") if s else "../DeepGEMM/third-party/cutlass/include")')
 CUDA_CPPFLAGS += -isystem $(DEEPGEMM_INCLUDE_DIR) -isystem $(CUTLASS_INCLUDE_DIR)
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+override CXXFLAGS += -fPIC
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
 PREFIX ?= /usr/local
 DESTDIR ?=
+LIBDIR ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
+DATADIR ?= $(PREFIX)/share/megamoe
+LIBMEGAMOE_VERSION := 2.0.0
+LIBMEGAMOE_SONAME := libmegamoe.so.2
+LIBMEGAMOE_REALNAME := libmegamoe.so.$(LIBMEGAMOE_VERSION)
 
 PUBLIC_HEADERS := \
 	include/megamoe/version.hpp \
@@ -43,6 +51,7 @@ LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr
+override CUDA_NVCCFLAGS += -Xcompiler=-fPIC
 ifeq ($(WERROR),1)
 override CXXFLAGS += -Werror
 override CUDA_NVCCFLAGS += -Xcompiler=-Werror
@@ -59,7 +68,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test install install-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib install uninstall-manifest install-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -77,6 +86,13 @@ $(BUILD_DIR)/src/cuda/activation_transport.o: \
 	src/cuda/backward/kernel_contract.cuh
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
+
+$(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
+	@mkdir -p $(@D)
+	$(NVCC) -shared -Xlinker=-soname -Xlinker=$(LIBMEGAMOE_SONAME) \
+		$(LDFLAGS) $^ -lnccl -lcudart -lcuda -ldl -o $@
+
+shared-lib: $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME)
 
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp \
@@ -199,11 +215,33 @@ header-test:
 api-negative-test:
 	CXX='$(CXX)' python3 tests/check_cuda_public_api.py
 
-install:
+install: shared-lib
 	@for header in $(PUBLIC_HEADERS); do \
-		destination='$(DESTDIR)$(PREFIX)/include/'$${header#include/}; \
+		destination='$(DESTDIR)$(INCLUDEDIR)/'$${header#include/}; \
 		install -D -m 0644 $$header $$destination; \
 	done
+	install -D -m 0755 $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME) \
+		$(DESTDIR)$(LIBDIR)/$(LIBMEGAMOE_REALNAME)
+	ln -sfn $(LIBMEGAMOE_REALNAME) $(DESTDIR)$(LIBDIR)/$(LIBMEGAMOE_SONAME)
+	ln -sfn $(LIBMEGAMOE_SONAME) $(DESTDIR)$(LIBDIR)/libmegamoe.so
+	@mkdir -p $(DESTDIR)$(PKGCONFIGDIR)
+	sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@VERSION@|$(LIBMEGAMOE_VERSION)|g' \
+		packaging/megamoe.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/megamoe.pc
+	install -D -m 0644 examples/minimal_training.cpp \
+		$(DESTDIR)$(DATADIR)/examples/minimal_training.cpp
+	@{ \
+		for header in $(PUBLIC_HEADERS); do echo '$(INCLUDEDIR)/'$${header#include/}; done; \
+		echo '$(LIBDIR)/$(LIBMEGAMOE_REALNAME)'; \
+		echo '$(LIBDIR)/$(LIBMEGAMOE_SONAME)'; \
+		echo '$(LIBDIR)/libmegamoe.so'; \
+		echo '$(PKGCONFIGDIR)/megamoe.pc'; \
+		echo '$(DATADIR)/examples/minimal_training.cpp'; \
+		echo '$(DATADIR)/install_manifest.txt'; \
+	} > $(DESTDIR)$(DATADIR)/install_manifest.txt
+
+uninstall-manifest:
+	@printf '%s\n' 'Installed files are listed in $(DATADIR)/install_manifest.txt.' \
+		'This target is intentionally non-destructive; remove exactly that manifest.'
 
 install-test:
 	CXX='$(CXX)' python3 tests/check_install.py

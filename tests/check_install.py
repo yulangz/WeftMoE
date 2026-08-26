@@ -41,7 +41,11 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         extra = sorted(installed - EXPECTED)
         raise SystemExit(f"installed header mismatch: missing={missing}, extra={extra}")
 
-    output = root / "minimal_training.o"
+    output = root / "minimal_training"
+    # The installed .pc file is link metadata for package-aware clients.  The
+    # acceptance test deliberately has no pkg-config runtime dependency.
+    flags = ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
+             "-lmegamoe"]
     command = [
         os.environ.get("CXX", "c++"),
         "-std=c++17",
@@ -50,13 +54,25 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         "-Werror",
         "-I",
         str(prefix / "include"),
-        "-c",
         str(ROOT / "examples/minimal_training.cpp"),
         "-o",
         str(output),
-    ]
+    ] + flags
     subprocess.run(command, cwd=root, check=True)
     if not output.is_file():
-        raise SystemExit("minimal installed-prefix program produced no object")
+        raise SystemExit("minimal installed-prefix program produced no executable")
+    subprocess.run(
+        [str(output)], cwd=root, check=True,
+        env={**os.environ,
+             "LD_LIBRARY_PATH": str(prefix / "lib") + os.pathsep +
+             os.environ.get("LD_LIBRARY_PATH", "")},
+    )
 
-print("[PASS] installed v2 headers and minimal training program")
+    library = prefix / "lib/libmegamoe.so.2.0.0"
+    dynamic = subprocess.check_output(["readelf", "-d", str(library)], text=True)
+    if "SONAME" not in dynamic or "libmegamoe.so.2" not in dynamic:
+        raise SystemExit("installed library has the wrong SONAME")
+    if "RPATH" in dynamic or "RUNPATH" in dynamic:
+        raise SystemExit("installed library unexpectedly contains an rpath")
+
+print("[PASS] installed v2 headers, libmegamoe SONAME, link and run")
