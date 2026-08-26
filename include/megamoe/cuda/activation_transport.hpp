@@ -12,6 +12,8 @@
 #include "megamoe/transport/activation_protocol.hpp"
 #include "megamoe/version.hpp"
 
+struct CUstream_st;
+
 namespace megamoe::cuda {
 
 template <class T> class SelectedActivationLease;
@@ -23,6 +25,7 @@ class ForwardMegaKernelBridge;
 #endif
 class ForwardWeightLease;
 class SelectedOutputGradientLease;
+class ExternalCudaProducer;
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
 struct BackwardValidationDownload;
 namespace testing {
@@ -69,6 +72,7 @@ private:
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
   friend class NcclSocketFallbackBackwardMegaKernel;
+  friend class ExternalCudaProducer;
 };
 
 struct ActivationTransportPoolConfig {
@@ -137,6 +141,7 @@ private:
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
   friend class NcclSocketFallbackBackwardMegaKernel;
+  friend class ExternalCudaProducer;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -361,6 +366,7 @@ private:
   friend struct ForwardWeightStorageHashAccess;
 #endif
   friend struct ForwardBackwardWeightAccess;
+  friend class ExternalCudaProducer;
 };
 
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
@@ -497,6 +503,7 @@ private:
   friend class SelectedOutputGradientLease;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+  friend class ExternalCudaProducer;
   friend class NcclSocketFallbackBackwardMegaKernel;
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend struct BackwardMegaKernelBridge;
@@ -511,6 +518,57 @@ private:
       const CudaExecution &);
 #endif
 };
+
+// CUDA-specific zero-copy producer boundary. It records readiness on the
+// caller-owned producer stream, checks the typed allocation range/device, and
+// retains both allocation and stream owners through consumer completion.
+class ExternalCudaProducer {
+public:
+  ExternalCudaProducer() = default;
+  const RankCollectiveContext &context() const;
+  std::uint32_t device_ordinal() const;
+  explicit operator bool() const noexcept { return static_cast<bool>(state_); }
+
+  CudaRouteInput publish_selected_experts(
+      const std::int32_t *device_data, std::uint64_t capacity_elements,
+      std::uint64_t num_tokens, std::uint32_t top_k,
+      std::shared_ptr<const void> allocation_owner) const;
+  CudaGateInput publish_gates(
+      const float *device_data, std::uint64_t capacity_elements,
+      const CudaRouteInput &exact_routes,
+      std::shared_ptr<const void> allocation_owner) const;
+  BFloat16ActivationLease publish_activations(
+      const transport::BFloat16 *device_data,
+      std::uint64_t capacity_elements, std::uint64_t num_tokens,
+      std::uint64_t hidden_size, const ActivationTransportResourcePool &pool,
+      std::shared_ptr<const void> allocation_owner) const;
+  ForwardWeightLease publish_weights(
+      const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
+      std::shared_ptr<const void> w1_owner,
+      const transport::BFloat16 *w2, std::uint64_t w2_capacity_elements,
+      std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
+      std::uint32_t global_expert_begin, std::uint64_t hidden_size,
+      std::uint64_t intermediate_size) const;
+  SelectedOutputGradientLease publish_output_gradient(
+      const DeviceForwardHandle &forward,
+      const transport::BFloat16 *device_data,
+      std::uint64_t capacity_elements,
+      std::shared_ptr<const void> allocation_owner) const;
+
+private:
+  explicit ExternalCudaProducer(
+      std::shared_ptr<const internal::ExternalCudaProducerState> state)
+      : state_(std::move(state)) {}
+  std::shared_ptr<const internal::ExternalCudaProducerState> state_;
+  friend ExternalCudaProducer make_external_cuda_producer(
+      RankCollectiveContext, std::uint32_t, CUstream_st *,
+      std::shared_ptr<const void>, std::string);
+};
+
+ExternalCudaProducer make_external_cuda_producer(
+    RankCollectiveContext context, std::uint32_t device_ordinal,
+    CUstream_st *producer_stream, std::shared_ptr<const void> stream_owner,
+    std::string identity);
 
 class LocalCudaP2pForwardMegaKernel {
 public:
@@ -606,6 +664,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+  friend class ExternalCudaProducer;
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend struct BackwardMegaKernelBridge;
 #endif

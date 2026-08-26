@@ -47,11 +47,8 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
     flags = ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
              "-lmegamoe"]
     command = [
-        os.environ.get("CXX", "c++"),
+        os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc"),
         "-std=c++17",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
         "-I",
         str(prefix / "include"),
         str(ROOT / "examples/minimal_training.cpp"),
@@ -65,6 +62,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         [str(output)], cwd=root, check=True,
         env={**os.environ,
              "LD_LIBRARY_PATH": str(prefix / "lib") + os.pathsep +
+             os.environ.get("NCCL_RUNTIME_LIB_DIR", "") + os.pathsep +
              os.environ.get("LD_LIBRARY_PATH", "")},
     )
 

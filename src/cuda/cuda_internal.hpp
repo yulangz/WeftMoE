@@ -35,6 +35,14 @@ struct CudaExecutionState final : BackendExecutionState {
   ~CudaExecutionState() noexcept override;
 };
 
+struct ExternalCudaProducerState final : BackendExecutionState {
+  RankCollectiveContext context;
+  ExecutionToken execution;
+  std::shared_ptr<const void> stream_owner;
+  cudaStream_t stream = nullptr;
+  std::uint32_t device = 0;
+};
+
 struct NcclSessionState final : BackendSessionState {
   std::uint32_t device = 0;
   std::uint32_t rank = 0;
@@ -76,6 +84,9 @@ struct CudaAllocation {
   std::vector<ConsumerEventSlotState> consumer_event_states;
   std::atomic<bool> dispatch_slot_quarantined{false};
   bool abandon_on_teardown = false;
+  bool owns_device_memory = true;
+  bool owns_producer_event = true;
+  std::shared_ptr<const void> external_owner;
   ~CudaAllocation() noexcept;
 };
 

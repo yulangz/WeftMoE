@@ -14,6 +14,7 @@
 namespace megamoe::cuda {
 
 class CudaExecution;
+class ExternalCudaProducer;
 class CudaLocalNotifyHandle;
 class DeviceDispatchHandle;
 using CudaDispatchHandle = DeviceDispatchHandle;
@@ -39,6 +40,7 @@ class CudaNotifyPreflight;
 #endif
 namespace internal {
 struct CudaExecutionState;
+struct ExternalCudaProducerState;
 std::shared_ptr<const CudaExecutionState>
 checked_execution_state(const CudaExecution &execution);
 }
@@ -100,12 +102,16 @@ private:
   friend CudaRouteInput import_selected_expert_routes(
       const CudaRouteInput &, const RankCollectiveContext &,
       const CudaExecution &);
+  friend CudaGateInput import_selected_expert_gates(
+      const CudaGateInput &, const CudaRouteInput &,
+      const RankCollectiveContext &, const CudaExecution &);
   friend class DeviceNotifyPoolBridge;
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceRouteProvenanceBridge;
   friend class DeviceGateProvenanceBridge;
 #endif
   friend class SelectedExpertGateLease<float>;
+  friend class ExternalCudaProducer;
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ActivationTransportBridge;
   friend class CudaNotifyOperation;
@@ -122,6 +128,11 @@ inline constexpr std::uint32_t kSelectedExpertRouteLayoutVersion = 1;
 // consumer stream and preserves the immutable producer provenance.
 CudaRouteInput import_selected_expert_routes(
     const CudaRouteInput &routes,
+    const RankCollectiveContext &consumer_context,
+    const CudaExecution &consumer_execution);
+
+CudaGateInput import_selected_expert_gates(
+    const CudaGateInput &gates, const CudaRouteInput &routes,
     const RankCollectiveContext &consumer_context,
     const CudaExecution &consumer_execution);
 
@@ -146,6 +157,10 @@ private:
   explicit SelectedExpertGateLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+  friend class ExternalCudaProducer;
+  friend CudaGateInput import_selected_expert_gates(
+      const CudaGateInput &, const CudaRouteInput &,
+      const RankCollectiveContext &, const CudaExecution &);
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceGateProvenanceBridge;
 #endif
