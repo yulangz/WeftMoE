@@ -329,6 +329,9 @@ def main():
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="identity")
     parser.add_argument("--benchmark-backward", action="store_true")
+    parser.add_argument(
+        "--training-only", action="store_true",
+        help="measure only native Forward/Backward/training-step boundaries")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -601,24 +604,26 @@ def main():
 
     measured_runs = []
     for run in range(args.runs):
-        run_result = {
-            "run": run,
-            "routing_metadata_and_local_permute": measure(
-                prepare_dispatch, args.warmups, args.iterations),
-            "dispatch_alltoall": measure(
-                dispatch_collective, args.warmups, args.iterations),
-            "combine": measure(
-                combine_roundtrip, args.warmups, args.iterations),
-            "native_identity_e2e": measure(
-                full_roundtrip, args.warmups, args.iterations),
-            "common_semantics_identity_e2e": measure(
-                common_semantics_roundtrip, args.warmups, args.iterations),
-        }
+        run_result = {"run": run}
+        if not args.training_only:
+            run_result.update({
+                "routing_metadata_and_local_permute": measure(
+                    prepare_dispatch, args.warmups, args.iterations),
+                "dispatch_alltoall": measure(
+                    dispatch_collective, args.warmups, args.iterations),
+                "combine": measure(
+                    combine_roundtrip, args.warmups, args.iterations),
+                "native_identity_e2e": measure(
+                    full_roundtrip, args.warmups, args.iterations),
+                "common_semantics_identity_e2e": measure(
+                    common_semantics_roundtrip, args.warmups, args.iterations),
+            })
         if experts_module is not None:
             run_result["native_forward_e2e"] = measure(
                 full_forward_roundtrip, args.warmups, args.iterations)
-            run_result["common_forward_e2e"] = measure(
-                common_forward_roundtrip, args.warmups, args.iterations)
+            if not args.training_only:
+                run_result["common_forward_e2e"] = measure(
+                    common_forward_roundtrip, args.warmups, args.iterations)
             if args.benchmark_backward:
                 run_result["native_backward_only"] = measure_backward(
                     native_training_graph, native_backward,
@@ -692,10 +697,10 @@ def main():
     return_peer_bytes = activation_peer_bytes
     native_wall_means = [
         run["native_identity_e2e"]["host_wall"]["mean_ms"]
-        for run in measured_runs]
+        for run in measured_runs if "native_identity_e2e" in run]
     common_wall_means = [
         run["common_semantics_identity_e2e"]["host_wall"]["mean_ms"]
-        for run in measured_runs]
+        for run in measured_runs if "common_semantics_identity_e2e" in run]
     forward_wall_means = ([
         run["native_forward_e2e"]["host_wall"]["mean_ms"]
         for run in measured_runs] if experts_module is not None else [])
@@ -755,34 +760,38 @@ def main():
         },
         "output_validation": output_validation,
         "runs": measured_runs,
-        "native_identity_e2e_host_wall_cross_run": {
+        "measurement_scope": ("native-training-only" if args.training_only
+                              else "full-routing-and-training"),
+    }
+    if native_wall_means:
+        output["native_identity_e2e_host_wall_cross_run"] = {
             "mean_ms": statistics.fmean(native_wall_means),
             "variance_ms2": statistics.pvariance(native_wall_means),
             "per_run_mean_ms": native_wall_means,
-        },
-        "common_identity_e2e_host_wall_cross_run": {
+        }
+        output["common_identity_e2e_host_wall_cross_run"] = {
             "mean_ms": statistics.fmean(common_wall_means),
             "variance_ms2": statistics.pvariance(common_wall_means),
             "per_run_mean_ms": common_wall_means,
-        },
-    }
+        }
     if forward_wall_means:
         output["native_forward_e2e_host_wall_cross_run"] = {
             "mean_ms": statistics.fmean(forward_wall_means),
             "variance_ms2": statistics.pvariance(forward_wall_means),
             "per_run_mean_ms": forward_wall_means,
         }
-        output["common_forward_e2e_host_wall_cross_run"] = {
-            "mean_ms": statistics.fmean([
-                run["common_forward_e2e"]["host_wall"]["mean_ms"]
-                for run in measured_runs]),
-            "variance_ms2": statistics.pvariance([
-                run["common_forward_e2e"]["host_wall"]["mean_ms"]
-                for run in measured_runs]),
-            "per_run_mean_ms": [
-                run["common_forward_e2e"]["host_wall"]["mean_ms"]
-                for run in measured_runs],
-        }
+        if not args.training_only:
+            output["common_forward_e2e_host_wall_cross_run"] = {
+                "mean_ms": statistics.fmean([
+                    run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                    for run in measured_runs]),
+                "variance_ms2": statistics.pvariance([
+                    run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                    for run in measured_runs]),
+                "per_run_mean_ms": [
+                    run["common_forward_e2e"]["host_wall"]["mean_ms"]
+                    for run in measured_runs],
+            }
         if args.benchmark_backward:
             backward_means = [
                 run["native_backward_only"]["host_wall"]["mean_ms"]
