@@ -5,7 +5,9 @@ licensed projects are build dependencies or documented design references.
 Their upstream copyright and license terms remain applicable.
 
 - DeepGEMM (DeepSeek, MIT): selected header-only TMA, SM90 WGMMA, load/store,
-  and math utilities are included at build time. DeepGEMM is not vendored.
+  and math utilities are vendored under `src/cuda/vendor/deep_gemm`; the
+  upstream MIT license is retained alongside those files. No DeepGEMM binary
+  is redistributed.
 - CUTLASS/CuTe (NVIDIA, BSD-3-Clause): CUDA tensor-map, barrier, layout, and
   device primitives are included through the external DeepGEMM/CUTLASS
   installation. CUTLASS is not vendored.

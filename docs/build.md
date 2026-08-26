@@ -381,11 +381,12 @@ those actual byte counters and the slowest-rank device spans, payload rates are
 4,382,039,368 ordinary compute bytes from 1,766,522,888 GIN-registered bytes
 per rank; weights add 3,170,893,824 ordinary bytes per rank.
 
-The CUDA build reads DeepGEMM headers from `DEEPGEMM_INCLUDE_DIR` (defaulting
-to the adjacent reference checkout) and discovers the installed DeepGEMM
-package's CUTLASS/CUTE headers without embedding its wheel path. Source-only
-exports must pass `CUTLASS_INCLUDE_DIR=/path/to/cutlass/include` when the
-DeepGEMM CUTLASS submodule is not initialized.
+The CUDA build uses the exact MIT-licensed DeepGEMM helper headers retained
+under `src/cuda/vendor` for the frozen SM90 kernels. This keeps a `git archive`
+self-contained without depending on an adjacent reference checkout. CUTLASS/
+CuTe remains external and is discovered from the installed DeepGEMM package
+without embedding its wheel path. Environments without that package must pass
+`CUTLASS_INCLUDE_DIR=/path/to/cutlass/include`.
 
 Keep `NCCL_DEBUG=WARN` for long launcher runs: rank logs are captured for
 structured failure diagnostics, and per-collective `INFO` output is not part of
