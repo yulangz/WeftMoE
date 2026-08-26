@@ -4198,6 +4198,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                 : "regular";
     std::cout << "BACKWARD_SMOKE rank=" << rank << " world=" << world
               << " top_k=" << top_k
+              << " experts=" << experts
               << " route_case=" << route_case
               << " local_tokens=" << local_tokens
               << " repeats=" << smoke_repeats

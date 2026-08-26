@@ -14609,9 +14609,14 @@ bool run_world1_forward_backward_sanitizer_harness(
           "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "wait production Backward kernel");
       passed = backward_status.error == 0U &&
-               (!main_shape ||
-                (backward_status.wgmma_instructions != 0ULL &&
-                 backward_status.tma_loads != 0ULL));
+               (main_shape
+                    ? (backward_status.wgmma_instructions != 0ULL &&
+                       backward_status.tma_loads != 0ULL)
+                    : (backward_status.dv_tasks == intermediate &&
+                       backward_status.dx_tasks == hidden &&
+                       backward_status.dw1_tasks ==
+                           2ULL * intermediate * hidden &&
+                       backward_status.dw2_tasks == hidden * intermediate));
       if (!main_shape && passed) {
         std::vector<transport::BFloat16> actual_forward(hidden);
         std::vector<transport::BFloat16> actual_dx(hidden);

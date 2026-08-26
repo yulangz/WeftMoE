@@ -1283,6 +1283,8 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
 
   const auto incoming = a.dispatch.sizes.incoming_row_count;
   const auto fc1_elements = incoming * a.intermediate;
+  if (threadIdx.x == 0U)
+    status->dv_tasks = fc1_elements;
   runtime_shape_backward_progress(a, kBackwardDvStarted, fc1_elements);
   if (!a.use_forward_cache) {
     for (std::uint64_t item = threadIdx.x; item < fc1_elements;
@@ -1370,6 +1372,8 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
   runtime_shape_backward_progress(a, kBackwardDvComplete, fc1_elements);
 
   const auto dx_elements = incoming * a.hidden;
+  if (threadIdx.x == 0U)
+    status->dx_tasks = dx_elements;
   runtime_shape_backward_progress(a, kBackwardDxStarted, dx_elements);
   for (std::uint64_t item = threadIdx.x; item < dx_elements;
        item += blockDim.x) {
@@ -1396,6 +1400,8 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
   const auto dw1_per_expert = 2ULL * a.intermediate * a.hidden;
   const auto dw1_elements =
       a.dispatch.sizes.owned_expert_count * dw1_per_expert;
+  if (threadIdx.x == 0U)
+    status->dw1_tasks = dw1_elements;
   runtime_shape_backward_progress(a, kBackwardDw1Started, dw1_elements);
   for (std::uint64_t item = threadIdx.x; item < dw1_elements;
        item += blockDim.x) {
@@ -1420,6 +1426,8 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
   const auto dw2_per_expert = a.hidden * a.intermediate;
   const auto dw2_elements =
       a.dispatch.sizes.owned_expert_count * dw2_per_expert;
+  if (threadIdx.x == 0U)
+    status->dw2_tasks = dw2_elements;
   runtime_shape_backward_progress(a, kBackwardDw2Started, dw2_elements);
   for (std::uint64_t item = threadIdx.x; item < dw2_elements;
        item += blockDim.x) {

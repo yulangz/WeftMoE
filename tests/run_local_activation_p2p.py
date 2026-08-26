@@ -542,6 +542,29 @@ def main():
         if args.backward_smoke:
             if len(observed) != args.world:
                 raise AssertionError("missing backward ranks")
+            if args.runtime_hidden is not None:
+                hidden = args.runtime_hidden
+                intermediate = args.runtime_intermediate
+                expected_dv = sum(int(item["local_tokens"])
+                                  for item in observed) * args.top_k * intermediate
+                actual_dv = sum(int(item["dv_tasks"]) for item in observed)
+                if actual_dv != expected_dv:
+                    raise AssertionError(
+                        f"generic dV task audit mismatch: expected="
+                        f"{expected_dv}, actual={actual_dv}")
+                experts = int(observed[0]["experts"])
+                if experts % args.world != 0:
+                    raise AssertionError("generic fixture ownership is uneven")
+                owned = experts // args.world
+                expected_dw1 = owned * 2 * intermediate * hidden
+                expected_dw2 = owned * hidden * intermediate
+                if any(int(item["dw1_tasks"]) != expected_dw1 or
+                       int(item["dw2_tasks"]) != expected_dw2
+                       for item in observed):
+                    raise AssertionError(
+                        "generic dW task audit mismatch: "
+                        f"expected dw1/dw2={expected_dw1}/{expected_dw2}, "
+                        f"actual={[(item['dw1_tasks'], item['dw2_tasks']) for item in observed]}")
             status_fault_phase = os.environ.get(
                 "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
             if status_fault_phase:
