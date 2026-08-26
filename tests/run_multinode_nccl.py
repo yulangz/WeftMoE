@@ -159,6 +159,12 @@ def aggregate_gin_benchmark(outputs, scenario):
                 int(item["return_peer_bytes"]) for item in records],
             "per_rank_gin_dispatch_puts": [int(item["gin_dispatch_puts"])
                                            for item in records],
+            "per_rank_raw_remote_route_bytes": [
+                int(item["raw_remote_route_bytes"]) for item in records],
+            "per_rank_gin_dispatch_payload_bytes": [
+                int(item["gin_dispatch_payload_bytes"]) for item in records],
+            "per_rank_gin_return_payload_bytes": [
+                int(item["gin_return_payload_bytes"]) for item in records],
             "per_rank_gin_return_puts": [int(item["gin_return_puts"])
                                          for item in records],
             "per_rank_gin_signals": [int(item["gin_signals"])
@@ -187,6 +193,15 @@ def aggregate_gin_benchmark(outputs, scenario):
                 int(item["forward_return_peer_bytes"]) for item in records],
             "per_rank_forward_gin_dispatch_puts": [
                 int(item["forward_gin_dispatch_puts"]) for item in records],
+            "per_rank_forward_raw_remote_route_bytes": [
+                int(item["forward_raw_remote_route_bytes"])
+                for item in records],
+            "per_rank_forward_gin_dispatch_payload_bytes": [
+                int(item["forward_gin_dispatch_payload_bytes"])
+                for item in records],
+            "per_rank_forward_gin_return_payload_bytes": [
+                int(item["forward_gin_return_payload_bytes"])
+                for item in records],
             "per_rank_forward_gin_return_puts": [
                 int(item["forward_gin_return_puts"]) for item in records],
             "per_rank_forward_gin_signals": [
@@ -199,6 +214,15 @@ def aggregate_gin_benchmark(outputs, scenario):
                 int(item["backward_dx_peer_bytes"]) for item in records],
             "per_rank_backward_gin_dispatch_puts": [
                 int(item["backward_gin_dispatch_puts"])
+                for item in records],
+            "per_rank_backward_raw_remote_dy_bytes": [
+                int(item["backward_raw_remote_dy_bytes"])
+                for item in records],
+            "per_rank_backward_gin_dy_payload_bytes": [
+                int(item["backward_gin_dy_payload_bytes"])
+                for item in records],
+            "per_rank_backward_gin_dx_payload_bytes": [
+                int(item["backward_gin_dx_payload_bytes"])
                 for item in records],
             "per_rank_backward_gin_return_puts": [
                 int(item["backward_gin_return_puts"]) for item in records],

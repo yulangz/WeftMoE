@@ -16,18 +16,19 @@ source-side dynamic-gate deterministic reduce all execute in one cooperative
 persistent kernel. Phase 6 adds a single-launch, single-node Backward baseline
 for the same main shape, including cache/recompute paths, dY dispatch,
 WGMMA/TMA dV/dX/dW1/dW2, deterministic dGate, and fixed-order dX combine.
-Phase 7 has started with a concrete, opt-in
+Phase 7 adds a concrete, opt-in
 `NcclSocketFallbackActivationTransport`: it performs host-enqueued NCCL
 Send/Recv of GPU-resident BF16 payloads across two hosts, device relay,
 synthetic return, and source-side dynamic-gate reduction without activation
 D2H/H2D. This is a correctness/lower-bound backend. A separately typed
-`GinRdmaActivationTransport` now runs the synthetic activation chain with
-device-issued NCCL GIN put/signal/local-completion in one persistent kernel
-on homogeneous runtime rail/local teams. Real two-node world-16 execution uses
-eight same-rail proxies, source-node-partitioned ingress, CUDA-IPC local
-fan-out to canonical rows, packet-batched return, and dynamic gate-after
-reduce. Cross-node FC Forward/Backward remains incomplete; this synthetic
-slice is not reported as a complete training data plane.
+`GinRdmaActivationTransport` now runs full cache Forward and Backward with
+device-issued NCCL GIN put/signal/local-completion inside the existing
+persistent data-plane kernels. Real two-node world-16 execution uses eight
+same-rail proxies, node-deduplicated ingress, CUDA-IPC local fan-out to
+canonical rows, WGMMA/TMA FC/dW, packet-batched return, dGate, and deterministic
+source reduction. The direct-rank Socket slice remains synthetic and is not
+yet a full FC correctness fallback; arbitrary node counts beyond the tested
+two-node homogeneous topology remain open validation work.
 
 ## Supported topology contract
 
@@ -350,9 +351,10 @@ also passes real same-rail device-issued put, remote indexed signal, and local
 completion counter on world 2 and 16. The activation backend registers only
 its network windows with `ncclMemAlloc` and passes 20 deterministic world-2
 and world-16 generations with every rank sending. World-16 uses eight rail
-peers plus seven node-local IPC mappings per rank. The general capability flag
-remains `gin_backend_implemented=0, gin_usable=0` because full cross-node
-Forward/Backward is not yet implemented.
+peers plus seven node-local IPC mappings per rank. The project backend flag is
+now true; with the explicit compatible 2.29.7 runtime the distributed probe
+also reports `gin_runtime_initializable=1, gin_usable=1`. The default 2.28.3
+runtime remains fail-closed because it lacks the required symbols.
 `NcclSocketFallback` has a distinct production constructor and refuses to run
 unless the communicator was explicitly configured for NCCL Socket
 (`NCCL_IB_DISABLE=1`). Simulation, local P2P, Socket, and GIN audit labels are

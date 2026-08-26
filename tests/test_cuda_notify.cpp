@@ -1571,7 +1571,7 @@ void test_device_only_sanitizer_paths() {
       megamoe::cuda::probe_activation_transport_capability(2);
   require(capability.nccl_device_headers &&
               capability.gin_headers_available &&
-              !capability.gin_backend_implemented && !capability.gin_usable,
+              capability.gin_backend_implemented && !capability.gin_usable,
           "GIN header/runtime capability boundary was not detected");
   require(megamoe::cuda::testing::run_local_p2p_put_signal_probe(0, 1, 4096),
           "real CUDA P2P put+system-signal probe failed");
@@ -2990,6 +2990,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_forward_audit.actual_return_peer_bytes
               << " forward_gin_dispatch_puts="
               << last_forward_audit.gin_dispatch_put_count
+              << " forward_raw_remote_route_bytes="
+              << last_forward_audit.raw_cross_node_route_bytes
+              << " forward_gin_dispatch_payload_bytes="
+              << last_forward_audit.gin_dispatch_payload_bytes
+              << " forward_gin_return_payload_bytes="
+              << last_forward_audit.gin_return_payload_bytes
               << " forward_gin_return_puts="
               << last_forward_audit.gin_return_put_count
               << " forward_gin_signals="
@@ -3002,6 +3008,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_audit.actual_dx_peer_bytes
               << " backward_gin_dispatch_puts="
               << last_audit.gin_dispatch_put_count
+              << " backward_raw_remote_dy_bytes="
+              << last_audit.raw_cross_node_dy_bytes
+              << " backward_gin_dy_payload_bytes="
+              << last_audit.gin_dy_payload_bytes
+              << " backward_gin_dx_payload_bytes="
+              << last_audit.gin_dx_payload_bytes
               << " backward_gin_return_puts="
               << last_audit.gin_return_put_count
               << " backward_gin_signals="
@@ -3520,6 +3532,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_audit.actual_return_peer_bytes
               << " gin_dispatch_puts="
               << last_audit.gin_dispatch_put_count
+              << " raw_remote_route_bytes="
+              << last_audit.raw_cross_node_route_bytes
+              << " gin_dispatch_payload_bytes="
+              << last_audit.gin_dispatch_payload_bytes
+              << " gin_return_payload_bytes="
+              << last_audit.gin_return_payload_bytes
               << " gin_return_puts=" << last_audit.gin_return_put_count
               << " gin_signals=" << last_audit.gin_signal_count
               << " gin_metadata_bytes=" << last_audit.gin_metadata_bytes

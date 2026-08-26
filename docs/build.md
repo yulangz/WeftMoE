@@ -31,9 +31,10 @@ changing system configuration:
   runtime does not export `ncclGinOutboxCreateRequirement` or
   `ncclGinInboxA2ACreateRequirement`. The explicitly loaded CUDA 12.9 NCCL
   2.29.7 exports the complete required set and passes real two-host
-  device-communicator/window initialization. Since the data-plane backend is
-  not implemented yet, the project reports
-  `gin_backend_implemented=0, gin_usable=0`.
+  device-communicator/window initialization. The project data-plane backend is
+  implemented; the explicit compatible runtime reports
+  `gin_backend_implemented=1, gin_usable=1`, while the default 2.28.3 runtime
+  remains unusable because the symbol gate fails.
 - all 64 entries of the local 8x8 CUDA peer-access matrix are enabled. The
   corrected 64 MiB probe uses multi-block completion, last-block signaling and
   independent destination-stream validation; its early-signal negative seam is
@@ -183,8 +184,8 @@ The observed world-2 and world-16 result on both hosts is
 runtime_initializable=1`. The probe collectively creates a GIN-requiring
 `ncclDevComm`, allocates symmetric storage with `ncclMemAlloc`, registers and
 deregisters a strict-ordering NCCL window, and destroys the device comm. It
-does not claim data-plane usability: until MegaMOE put/signal kernels exist,
-`gin_backend_implemented=0` and `gin_usable=0`.
+does not by itself claim data-plane usability. The separately typed full
+Forward/Backward benchmark below proves project put/signal/local-completion.
 
 The same compatible runtime also executes a real 1 KiB payload on every rail:
 
@@ -225,8 +226,8 @@ and local CUDA-IPC fan-out path by changing `--gpus-per-node 1` to
 `--gpus-per-node 8`. All 16 ranks pass 20 deterministic generations with
 `backend=nccl-gin-device` and `oracle=1`. Return contributions are aggregated
 per deduplicated token packet (one put and signal), rather than per route.
-This is a genuine device-issued GIN dispatch/relay/return slice, but it still
-does not execute cross-node FC Forward/Backward.
+This remains the transport-only oracle slice. Full FC execution uses the
+Forward/Backward benchmark scenarios below and is reported separately.
 
 The runtime team/pool setup is separately checked on all 16 ranks with
 `--gpus-per-node 8 --scenario gin_team_pool`. The observed two-slot small-shape
@@ -257,6 +258,56 @@ result with the independent host transport oracle before printing
 `oracle=1`. This initial Socket slice sends route aggregates directly between
 ranks; node-deduplicated same-rail proxy fan-out and cross-node FC
 Forward/Backward are still Phase-7 work.
+
+### World-16 full GIN Forward/Backward and Megatron Socket baseline
+
+The production main-shape GIN benchmark runs without a host payload phase:
+
+```bash
+NCCL_GIN_LIB=/storage/openpsi/codes/wanghaitao.wht/deps/\
+nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu
+
+env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
+  MEGAMOE_P2P_BENCH_TOKENS=8192 \
+  MEGAMOE_FORWARD_BENCH_ROUNDS=110 MEGAMOE_FORWARD_CACHE=1 \
+  python3 tests/run_multinode_nccl.py \
+    --binary "$PWD/build/test_cuda_notify" \
+    --remote root@10.10.19.233 --port 2222 \
+    --remote-binary "$PWD/build/test_cuda_notify" \
+    --gpus-per-node 8 --scenario gin_forward_bench \
+    --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
+
+# Use MEGAMOE_BACKWARD_BENCH_ROUNDS=110, MEGAMOE_BACKWARD_CACHE=1 and
+# --scenario gin_backward_bench for the integrated Forward+Backward path.
+```
+
+The matching Megatron-Core 0.17.0 native Socket baseline is launched without
+`LD_PRELOAD`; the wrapper resolves and loads `libnccl.so.2` explicitly:
+
+```bash
+python3 benchmarks/run_multinode_megatron_socket.py \
+  --remote root@10.10.19.233 --port 2222 --gpus-per-node 8 \
+  --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat" \
+  --socket-ifname eth0 --tokens 8192 --warmups 10 --iterations 100 \
+  --expert-body te-grouped-mlp --benchmark-backward --training-only
+```
+
+Run each command in three independent sessions, then enforce fixture agreement
+and every per-run 15% gate with `benchmarks/compare_multinode_training.py`.
+The checked result is
+`benchmarks/results/gin_world16_training_20260826.json`. Cross-run means are
+41.264 ms GIN Forward, 52.345 ms GIN Backward, and 93.607 ms
+Notify-inclusive GIN F+B, versus 816.308/720.933/1465.224 ms for Megatron
+NCCL Socket. Every individual run clears all three gates.
+
+Runtime device counters report, per rail/rank/generation, 352.25--352.39 MB
+raw remote Forward route payload, 117.44 MB after node dedup, and
+352.25--352.39 MB return payload. Forward uses 24 dispatch puts, eight return
+puts, and 16 signals; Backward uses 32/16 puts and 16 signals. Derived from
+those actual byte counters and the slowest-rank device spans, payload rates are
+13.25 GB/s dispatch and 14.87 GB/s return. The Forward pool separates
+4,382,039,368 ordinary compute bytes from 1,766,522,888 GIN-registered bytes
+per rank; weights add 3,170,893,824 ordinary bytes per rank.
 
 The CUDA build reads DeepGEMM headers from `DEEPGEMM_INCLUDE_DIR` (defaulting
 to the adjacent reference checkout) and discovers the installed DeepGEMM
@@ -640,9 +691,10 @@ group. With 8 ranks/node, `NCCL_SOCKET_IFNAME=eth0`, `NCCL_IB_DISABLE=1`, 10
 warmups and 100 samples, the measured world-16 means were 0.902 ms routing,
 463.267 ms dispatch, 464.664 ms combine, and 919.151 ms identity transport
 roundtrip (P50 926.951, P95 1073.007 ms). The corresponding estimated payload
-rate was about 1.426 GB/s/direction/rank. This is a real Megatron cross-host
-Socket-NCCL baseline; MegaMOE does not yet implement cross-host activation
-transport, so no cross-host MegaMOE speedup is claimed.
+rate was about 1.426 GB/s/direction/rank. This remains a real Megatron
+cross-host Socket-NCCL identity-transport baseline. The newer full-FC
+world-16 comparison and GIN speedup are reported in the Phase-7 section above;
+the two benchmark semantics must not be mixed.
 
 Example two-node invocation (run once per node with node rank 0/1):
 

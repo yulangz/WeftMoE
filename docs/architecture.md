@@ -660,9 +660,11 @@ issues one node-deduplicated token payload per destination node, waits for
 local completion and remote signal, relays fan-out through the global-rank IPC
 pointer table, returns all contributions of a token packet with one contiguous
 put/signal, and performs source gate-after reduction. The world-2 and
-two-node world-16 paths pass the independent oracle for 20 generations. The
-general `gin_usable` capability remains false until FC Forward/Backward is
-integrated. The session probe is collective and returns no native handle.
+two-node world-16 transport paths pass the independent oracle for 20
+generations. The same backend now feeds the cache Forward and Backward
+persistent kernels: FC1/FC2, dV/dX/dW, dGate, return and fixed-order source
+reduction remain device-resident. The session probe is collective and returns
+no native handle.
 
 The world-16 setup path now derives `local_world_size = world / num_nodes`,
 checks the runtime rail/LSA teams, and exchanges compute-arena IPC handles
@@ -670,8 +672,11 @@ collectively. Each rank opens only its seven node-local peers; the global-rank
 pointer table remains the stable fan-out index. GIN-registered storage is a
 separate `ncclMemAlloc` window containing only ingress, payload, return, and
 control slots. Canonical rows, compute transients, and weights remain ordinary
-CUDA allocations. The synthetic payload execution now runs on this world-16
-team; FC1/FC2 and Backward still use only the frozen single-node backend.
+CUDA allocations. The complete main-shape Forward and Backward execution now
+runs on this world-16 team without a host-enqueued payload phase. The measured
+pool separates 4.382 GB/rank ordinary Forward compute storage from a 1.767
+GB/rank GIN-registered rail window; Backward-enabled ordinary storage is
+13.457 GB/rank.
 The opt-in Socket correctness backend is now concrete and separately typed. It
 packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
 NCCL Send/Recv, performs destination device relay plus the validation expert

@@ -203,6 +203,7 @@ struct TransportDeviceStatus {
   unsigned long long gin_return_put_count;
   unsigned long long gin_signal_count;
   unsigned long long gin_metadata_bytes;
+  unsigned long long gin_return_payload_bytes;
   unsigned long long start_clock;
   unsigned long long dispatch_complete_clock;
   unsigned long long complete_clock;
@@ -275,6 +276,9 @@ struct BackwardDeviceStatus {
   unsigned long long gin_return_put_count;
   unsigned long long gin_signal_count;
   unsigned long long gin_metadata_bytes;
+  unsigned long long raw_cross_node_dy_bytes;
+  unsigned long long gin_dispatch_payload_bytes;
+  unsigned long long gin_return_payload_bytes;
   unsigned int error;
   unsigned int error_field;
 };
@@ -3282,6 +3286,9 @@ local_p2p_forward_megakernel(
                 packet_count * sizeof(LocalP2pRouteHeader) +
                     (last_fanout - first_fanout) *
                         sizeof(DeviceFanoutRecord));
+      atomicAdd(&status->raw_cross_node_payload_bytes,
+                (last_fanout - first_fanout) * a.hidden *
+                    sizeof(transport::BFloat16));
       gin.waitCounter(ncclCoopThread{}, 0, 1);
     }
     if (threadIdx.x == 0U)
@@ -3938,6 +3945,9 @@ local_p2p_forward_megakernel(
                   ::cuda::thread_scope_block, ::cuda::thread_scope_device);
           atomicAdd(&status->gin_return_put_count, 1ULL);
           atomicAdd(&status->gin_signal_count, 1ULL);
+          atomicAdd(&status->gin_return_payload_bytes,
+                    (last_return - first_return) * a.hidden *
+                        sizeof(transport::BFloat16));
           ++return_puts;
         }
         __syncthreads();
@@ -4986,6 +4996,12 @@ local_p2p_backward_megakernel(
                   packet_count * sizeof(LocalP2pRouteHeader) +
                       (last_fanout - first_fanout) *
                           (sizeof(DeviceFanoutRecord) + sizeof(float)));
+        atomicAdd(&status->raw_cross_node_dy_bytes,
+                  (last_fanout - first_fanout) * a.hidden *
+                      sizeof(transport::BFloat16));
+        atomicAdd(&status->gin_dispatch_payload_bytes,
+                  packet_count * a.hidden *
+                      sizeof(transport::BFloat16));
         gin.waitCounter(ncclCoopThread{}, 0, 1);
     }
     if (threadIdx.x == 0U)
@@ -5748,6 +5764,9 @@ local_p2p_backward_megakernel(
           atomicAdd(&status->gin_signal_count, 1ULL);
           atomicAdd(&status->gin_metadata_bytes,
                     (last_return - first_return) * sizeof(float));
+          atomicAdd(&status->gin_return_payload_bytes,
+                    (last_return - first_return) * a.hidden *
+                        sizeof(transport::BFloat16));
           ++return_packets;
       }
       __syncthreads();
@@ -10166,6 +10185,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       slot.host_forward_status->actual_return_peer_bytes;
   result->audit.gin_dispatch_put_count =
       slot.host_forward_status->gin_dispatch_put_count;
+  result->audit.raw_cross_node_route_bytes =
+      slot.host_forward_status->raw_cross_node_payload_bytes;
+  result->audit.gin_dispatch_payload_bytes =
+      slot.host_forward_status->deduplicated_cross_node_payload_bytes;
+  result->audit.gin_return_payload_bytes =
+      slot.host_forward_status->gin_return_payload_bytes;
   result->audit.gin_return_put_count =
       slot.host_forward_status->gin_return_put_count;
   result->audit.gin_signal_count =
@@ -10854,6 +10879,12 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         forward_status.actual_return_peer_bytes;
     forward_result.audit.gin_dispatch_put_count =
         forward_status.gin_dispatch_put_count;
+    forward_result.audit.raw_cross_node_route_bytes =
+        forward_status.raw_cross_node_payload_bytes;
+    forward_result.audit.gin_dispatch_payload_bytes =
+        forward_status.deduplicated_cross_node_payload_bytes;
+    forward_result.audit.gin_return_payload_bytes =
+        forward_status.gin_return_payload_bytes;
     forward_result.audit.gin_return_put_count =
         forward_status.gin_return_put_count;
     forward_result.audit.gin_signal_count = forward_status.gin_signal_count;
@@ -10947,6 +10978,9 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->audit.actual_dy_peer_bytes = status.actual_dy_peer_bytes;
   result->audit.actual_dx_peer_bytes = status.actual_dx_peer_bytes;
   result->audit.gin_dispatch_put_count = status.gin_dispatch_put_count;
+  result->audit.raw_cross_node_dy_bytes = status.raw_cross_node_dy_bytes;
+  result->audit.gin_dy_payload_bytes = status.gin_dispatch_payload_bytes;
+  result->audit.gin_dx_payload_bytes = status.gin_return_payload_bytes;
   result->audit.gin_return_put_count = status.gin_return_put_count;
   result->audit.gin_signal_count = status.gin_signal_count;
   result->audit.gin_metadata_bytes = status.gin_metadata_bytes;
@@ -11681,7 +11715,7 @@ ActivationTransportCapability probe_activation_transport_capability(
         first_missing = symbol;
     }
   }
-  result.gin_backend_implemented = false;
+  result.gin_backend_implemented = true;
 
 #if __has_include(<nccl_device/core.h>)
   if (result.gin_headers_available && result.gin_symbols_present) {
@@ -11845,7 +11879,7 @@ ActivationTransportCapability probe_activation_transport_capability(
   // that a rail GIN team can be formed.  Replace only its initialization
   // result with the collective probe below.
   result.gin_runtime_initializable = false;
-  result.gin_backend_implemented = false;
+  result.gin_backend_implemented = true;
   result.gin_usable = false;
   result.gin_unavailable_reason.clear();
 
@@ -11938,6 +11972,11 @@ ActivationTransportCapability probe_activation_transport_capability(
       result.gin_unavailable_reason = std::move(error);
   }
 #endif
+
+  result.gin_usable = result.gin_headers_available &&
+                      result.gin_symbols_present &&
+                      result.gin_runtime_initializable &&
+                      result.gin_backend_implemented;
 
   std::ostringstream message;
   message << "GIN distributed probe: headers="

@@ -154,6 +154,9 @@ struct ActivationTransportDeviceAudit {
   // counters include every destination-GPU fan-out and exclude local writes.
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t raw_cross_node_route_bytes = 0;
+  std::uint64_t gin_dispatch_payload_bytes = 0;
+  std::uint64_t gin_return_payload_bytes = 0;
   std::uint64_t gin_dispatch_put_count = 0;
   std::uint64_t gin_return_put_count = 0;
   std::uint64_t gin_signal_count = 0;
@@ -385,6 +388,9 @@ struct ForwardMegaKernelAudit {
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
   std::uint64_t gin_dispatch_put_count = 0;
+  std::uint64_t raw_cross_node_route_bytes = 0;
+  std::uint64_t gin_dispatch_payload_bytes = 0;
+  std::uint64_t gin_return_payload_bytes = 0;
   std::uint64_t gin_return_put_count = 0;
   std::uint64_t gin_signal_count = 0;
   std::uint64_t gin_metadata_bytes = 0;
@@ -566,6 +572,9 @@ struct BackwardMegaKernelAudit {
   std::uint64_t dw2_tasks = 0;
   std::uint64_t actual_dy_peer_bytes = 0;
   std::uint64_t actual_dx_peer_bytes = 0;
+  std::uint64_t raw_cross_node_dy_bytes = 0;
+  std::uint64_t gin_dy_payload_bytes = 0;
+  std::uint64_t gin_dx_payload_bytes = 0;
   std::uint64_t gin_dispatch_put_count = 0;
   std::uint64_t gin_return_put_count = 0;
   std::uint64_t gin_signal_count = 0;

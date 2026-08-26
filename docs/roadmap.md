@@ -179,17 +179,19 @@ correctness blockers.
   backend. Real world-2 and two-node world-16 device dispatch, remote signal,
   same-rail proxy ingress, local CUDA-IPC fan-out, packet-batched synthetic
   contribution return, and gate-after reduce pass 20 deterministic oracle
-  checks. The general capability still reports
-  `gin_backend_implemented=0, gin_usable=0` because cross-node FC
-  Forward/Backward is not implemented.
+  checks. Cache Forward and Backward now execute their complete main-shape
+  persistent kernels on the same world-16 GIN team, including FC1/FC2,
+  dV/dX/dW, dGate and return/reduce.
 - The first concrete `NcclSocketFallback` slice passes real world-2 and
   world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
   gate-after combine, and independent host-oracle comparison. It has no
   activation D2H/H2D and its backend label cannot be selected by enum.
-- GIN now uses node-level payload dedup, same-rail destination proxies, and
-  local P2P fan-out. Required follow-up is cache Forward/Backward/dGate
-  integration and the two-host Megatron performance comparison. The Socket
-  baseline remains direct rank-to-rank aggregation.
-- The Socket fallback never claims GIN/RDMA. The partial GIN backend is a real
-  single-persistent synthetic cross-node data plane for world 2 and 16; full
-  Forward/Backward remains open.
+- GIN uses node-level payload dedup, same-rail destination proxies, local P2P
+  fan-out and batched reverse traffic. Three independent world-16 10+100 runs
+  pass the 15% Forward, Backward and Notify-inclusive F+B gates against the
+  real Megatron NCCL Socket baseline; the checked machine-readable result is
+  `benchmarks/results/gin_world16_training_20260826.json`.
+- The Socket fallback never claims GIN/RDMA. It remains a synthetic
+  correctness/lower-bound backend; connecting its packet coordinator to full
+  FC Forward/Backward is still open. Runtime node counts other than the tested
+  homogeneous two-node world-2/world-16 configurations also remain to validate.
