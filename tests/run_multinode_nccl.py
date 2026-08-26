@@ -148,6 +148,10 @@ def environment_overrides(args):
         "MEGAMOE_P2P_ROUNDS",
         "MEGAMOE_P2P_BENCH_ROUNDS",
         "MEGAMOE_P2P_BENCH_TOKENS",
+        "MEGAMOE_FORWARD_BENCH_ROUNDS",
+        "MEGAMOE_BACKWARD_BENCH_ROUNDS",
+        "MEGAMOE_FORWARD_CACHE",
+        "MEGAMOE_BACKWARD_CACHE",
         "MEGAMOE_P2P_TOP_K",
         "MEGAMOE_P2P_RING_SLOTS",
         "MEGAMOE_P2P_NO_WRAP",
@@ -361,6 +365,8 @@ def parse_args(argv=None):
                  "gin_probe", "gin_put_probe", "gin_team_pool",
                  "gin_forward_smoke",
                  "gin_backward_smoke",
+                 "gin_forward_bench",
+                 "gin_backward_bench",
                  "activation_socket",
                  "activation_gin"),
         default="valid",
@@ -561,6 +567,34 @@ def main(argv=None):
         print("\n".join(evidence))
         stage = "Forward" if args.scenario == "gin_forward_smoke" else "Backward"
         print(f"[PASS] same-rail GIN {stage} persistent kernel world={world}")
+        return
+
+    if args.scenario in ("gin_forward_bench", "gin_backward_bench"):
+        failures = []
+        evidence = []
+        marker = ("FORWARD_BENCH " if args.scenario == "gin_forward_bench"
+                  else "BACKWARD_BENCH ")
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith(marker)]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+                if "backend=gin-rdma" not in lines[0]:
+                    failures.append(
+                        f"rank={result.rank} wrong benchmark backend: "
+                        f"{lines[0]}"
+                    )
+        if failures:
+            raise RuntimeError("distributed GIN benchmark failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] same-rail GIN benchmark world={world}")
         return
 
     if args.scenario == "activation_socket":
