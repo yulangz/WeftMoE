@@ -4689,7 +4689,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         last_notify_audit = notify.audit();
         megamoe::cuda::ActivationTransportRunOptions options;
         options.deadline_after = std::chrono::seconds(120);
-        auto transported = transport.run_synthetic(
+        auto transported = transport.run_transport_slice(
             notify.dispatch(), exact_activation, transport_config, options);
         transport_timing = transported.timings();
         last_audit = transported.audit();
@@ -4754,7 +4754,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         validation_session, execution, pool);
     auto validation_notify = validation_coordinator.run_device(
         {common_config, validation_routes, validation_gates, max_tokens});
-    auto validation_transport = transport.run_synthetic(
+    auto validation_transport = transport.run_transport_slice(
         validation_notify.dispatch(), validation_activation, transport_config,
         {});
     const auto output =
@@ -4996,7 +4996,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       cancel_options.cancellation.request_cancel();
       bool cancelled = false;
       try {
-        (void)local_transport->run_synthetic(
+        (void)local_transport->run_transport_slice(
             notify.dispatch(), activation, transport_config, cancel_options);
       } catch (const megamoe::NotifyDispatchError &error) {
         cancelled = error.code() == megamoe::NotifyErrorCode::TransportTimeout;
@@ -5043,13 +5043,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       if (benchmark_p2p)
         run_options.deadline_after = std::chrono::seconds(120);
       if (socket_fallback)
-        transported = socket_transport->run_synthetic(
+        transported = socket_transport->run_transport_slice(
             notify.dispatch(), activation, transport_config, run_options);
       else if (gin_rdma)
-        transported = gin_transport->run_synthetic(
+        transported = gin_transport->run_transport_slice(
             notify.dispatch(), activation, transport_config, run_options);
       else
-        transported = local_transport->run_synthetic(
+        transported = local_transport->run_transport_slice(
             notify.dispatch(), activation, transport_config, run_options);
       const auto warmup = benchmark_p2p ? 10U : 0U;
       if (benchmark_p2p && round >= warmup) {

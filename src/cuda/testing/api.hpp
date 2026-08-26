@@ -1,12 +1,7 @@
 #pragma once
 
-// Repository-internal declarations for validation downloads, synthetic
-// transports, fault seams and fixture factories.  Installed clients never add
-// src/ to their include path and therefore cannot enable this API surface.
-#ifndef MEGAMOE_INTERNAL_TESTING_API
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#endif
-
-#include "megamoe/cuda/activation_transport.hpp"
-#include "megamoe/cuda/device_notify.hpp"
-#include "megamoe/cuda/nccl_count_exchange.hpp"
+// Repository-internal diagnostics and fixture factories. This file is never
+// installed and production headers never include it.
+#include "cuda/activation_transport_internal.hpp"
+#include "cuda/nccl_protocol_internal.hpp"
+#include "metadata/testing_api.hpp"

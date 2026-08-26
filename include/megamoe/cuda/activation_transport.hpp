@@ -12,6 +12,8 @@
 #include "megamoe/transport/activation_protocol.hpp"
 #include "megamoe/version.hpp"
 
+MEGAMOE_PUBLIC_API_BEGIN
+
 struct CUstream_st;
 
 namespace megamoe::cuda {
@@ -19,22 +21,9 @@ namespace megamoe::cuda {
 template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-class ActivationTransportBridge;
-class ForwardMegaKernelBridge;
-#endif
 class ForwardWeightLease;
 class SelectedOutputGradientLease;
 class ExternalCudaProducer;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-struct BackwardValidationDownload;
-namespace testing {
-ForwardWeightLease make_deterministic_forward_weights_for_testing(
-    std::uint32_t owned_experts, std::uint32_t global_expert_begin,
-    std::uint64_t hidden_size, std::uint64_t intermediate_size,
-    const CollectiveSession &session, const CudaExecution &execution);
-} // namespace testing
-#endif
 
 inline constexpr std::uint32_t kSelectedActivationLayoutVersion = 1;
 
@@ -57,15 +46,6 @@ private:
   explicit SelectedActivationLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class ActivationTransportBridge;
-#endif
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class DeviceActivationTransport;
-  friend class LocalCudaP2pActivationTransport;
-  friend class NcclSocketFallbackActivationTransport;
-  friend class GinRdmaActivationTransport;
-#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
@@ -126,15 +106,6 @@ private:
   friend ActivationTransportResourcePool make_activation_transport_pool(
       const CollectiveSession &, const CudaExecution &,
       ActivationTransportPoolConfig);
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class ActivationTransportBridge;
-#endif
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class DeviceActivationTransport;
-  friend class LocalCudaP2pActivationTransport;
-  friend class NcclSocketFallbackActivationTransport;
-  friend class GinRdmaActivationTransport;
-#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
@@ -156,96 +127,6 @@ struct ActivationTransportExpectation {
   std::uint64_t hidden = 0;
 };
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-struct ActivationTransportTimings {
-  double generation_setup_us = 0;
-  double dispatch_put_us = 0;
-  double relay_us = 0;
-  double synthetic_return_us = 0;
-  double dispatch_relay_us = 0;
-  double combine_reduce_us = 0;
-  double terminal_completion_us = 0;
-  double total_us = 0;
-};
-
-struct ActivationTransportDeviceAudit {
-  transport::ActivationTransportBackend backend =
-      transport::ActivationTransportBackend::DeviceSimulation;
-  std::uint64_t raw_cross_node_payload_bytes = 0;
-  std::uint64_t deduplicated_cross_node_payload_bytes = 0;
-  // Physical peer-link traffic. Unlike the logical node-dedup number, these
-  // counters include every destination-GPU fan-out and exclude local writes.
-  std::uint64_t actual_dispatch_peer_bytes = 0;
-  std::uint64_t actual_return_peer_bytes = 0;
-  std::uint64_t raw_cross_node_route_bytes = 0;
-  std::uint64_t gin_dispatch_payload_bytes = 0;
-  std::uint64_t gin_return_payload_bytes = 0;
-  std::uint64_t gin_dispatch_put_count = 0;
-  std::uint64_t gin_return_put_count = 0;
-  std::uint64_t gin_signal_count = 0;
-  std::uint64_t gin_metadata_bytes = 0;
-  // Shape-derived retained-storage/semantic traffic sizes. Unlike the peer
-  // counters above, these are not incremented by the device data plane.
-  std::uint64_t derived_route_input_bytes = 0;
-  std::uint64_t derived_local_gate_bytes = 0;
-  std::uint64_t derived_peer_gate_bytes = 0;
-  std::uint64_t generation_memset_calls = 0;
-  std::uint64_t generation_memset_bytes = 0;
-  std::uint64_t kernel_launches = 0;
-  std::uint64_t dispatch_kernel_blocks = 0;
-  std::uint64_t return_kernel_blocks = 0;
-  std::uint64_t reduce_kernel_blocks = 0;
-  std::uint64_t packet_count = 0;
-  std::uint64_t fanout_count = 0;
-  std::uint64_t credit_stalls = 0;
-  std::uint64_t peak_ring_slots = 0;
-  std::uint64_t activation_d2h_bytes = 0;
-  std::uint64_t activation_h2d_bytes = 0;
-  std::uint64_t hot_path_allocations = 0;
-};
-
-class DeviceActivationTransportHandle {
-public:
-  DeviceActivationTransportHandle() = default;
-  const ActivationTransportExpectation &identity() const;
-  const ActivationTransportDeviceAudit &audit() const;
-  const ActivationTransportTimings &timings() const;
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit DeviceActivationTransportHandle(std::shared_ptr<const Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<const Impl> impl_;
-  friend class DeviceActivationTransport;
-  friend class LocalCudaP2pActivationTransport;
-  friend class NcclSocketFallbackActivationTransport;
-  friend class GinRdmaActivationTransport;
-  friend class ActivationTransportBridge;
-  friend struct ActivationTransportValidationDownload;
-  friend std::vector<transport::BFloat16>
-  download_activation_output_for_validation(
-      const DeviceActivationTransportHandle &, const CudaExecution &);
-};
-
-class DeviceActivationTransport {
-public:
-  DeviceActivationTransport(const CollectiveSession &session,
-                            const CudaExecution &execution,
-                            const ActivationTransportResourcePool &pool);
-
-  // Explicit correctness simulation. It can only publish a
-  // DeviceSimulation audit and never selects a production backend by enum.
-  DeviceActivationTransportHandle run_device_simulation_synthetic(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const transport::ActivationTransportConfig &config);
-
-private:
-  struct Impl;
-  std::shared_ptr<Impl> impl_;
-};
-#endif
 
 struct ActivationTransportRunOptions {
   GenerationCancellationToken cancellation;
@@ -261,66 +142,6 @@ struct ActivationTransportRunOptions {
 // A real, node-local, multi-process CUDA IPC backend. Construction exchanges
 // and validates pool IPC handles over the existing node-local NCCL session.
 // It fails closed unless every local peer mapping is established.
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-class LocalCudaP2pActivationTransport {
-public:
-  LocalCudaP2pActivationTransport(
-      const NcclSession &session, const CudaExecution &execution,
-      const ActivationTransportResourcePool &pool);
-
-  DeviceActivationTransportHandle run_synthetic(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const transport::ActivationTransportConfig &config,
-      const ActivationTransportRunOptions &options = {});
-
-private:
-  struct Impl;
-  std::shared_ptr<Impl> impl_;
-};
-
-// Cross-host correctness/lower-bound backend. Payload movement is explicitly
-// host-enqueued NCCL Send/Recv; this class is not a device-side GIN backend and
-// never publishes a Gin audit label.
-class NcclSocketFallbackActivationTransport {
-public:
-  NcclSocketFallbackActivationTransport(
-      const NcclSession &session, const CudaExecution &execution,
-      const ActivationTransportResourcePool &pool);
-
-  DeviceActivationTransportHandle run_synthetic(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const transport::ActivationTransportConfig &config,
-      const ActivationTransportRunOptions &options = {});
-
-private:
-  struct Impl;
-  std::shared_ptr<Impl> impl_;
-};
-
-// True device-issued NCCL GIN data plane. The transport slice derives the
-// homogeneous rail/local team at runtime, partitions ingress by source node,
-// and performs same-rail ingress plus node-local CUDA-IPC fan-out. The current
-// public operation remains the synthetic validation transform; cross-node
-// Forward/Backward FC integration is not implied by this type.
-class GinRdmaActivationTransport {
-public:
-  GinRdmaActivationTransport(
-      const NcclSession &session, const CudaExecution &execution,
-      const ActivationTransportResourcePool &pool);
-
-  DeviceActivationTransportHandle run_synthetic(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const transport::ActivationTransportConfig &config,
-      const ActivationTransportRunOptions &options = {});
-
-private:
-  struct Impl;
-  std::shared_ptr<Impl> impl_;
-};
-#endif
 
 enum class ForwardCacheMode : std::uint8_t {
   CacheFc1InputOutput,
@@ -353,78 +174,12 @@ private:
   explicit ForwardWeightLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class ForwardMegaKernelBridge;
-#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend ForwardWeightLease
-  testing::make_deterministic_forward_weights_for_testing(
-      std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t,
-      const CollectiveSession &, const CudaExecution &);
-  friend struct ForwardWeightStorageHashAccess;
-#endif
   friend struct ForwardBackwardWeightAccess;
   friend class ExternalCudaProducer;
 };
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-struct DeviceStorageHash128 {
-  std::uint64_t low = 0;
-  std::uint64_t high = 0;
-  std::uint64_t element_count = 0;
-};
-
-struct ForwardWeightStorageHashes {
-  DeviceStorageHash128 w1;
-  DeviceStorageHash128 w2;
-  std::vector<DeviceStorageHash128> sampled_w1_experts;
-  std::vector<DeviceStorageHash128> sampled_w2_experts;
-  std::vector<DeviceStorageHash128> sampled_w2_output_rows;
-};
-
-struct BackwardStorageHashes {
-  DeviceStorageHash128 dx;
-  DeviceStorageHash128 dw1;
-  DeviceStorageHash128 dw2;
-  DeviceStorageHash128 dgate;
-};
-
-// Timing-excluded validation hashes over the actual device buffers feeding
-// each Backward stage.  A zero element_count means that the production kernel
-// intentionally does not materialize that intermediate (for example dV in a
-// release build).  This is a diagnostic contract, not a data-plane API.
-struct BackwardStageStorageHashes {
-  DeviceStorageHash128 canonical_x;
-  DeviceStorageHash128 canonical_dy;
-  DeviceStorageHash128 dy_dw2_reduction_extent;
-  DeviceStorageHash128 active_ab;
-  DeviceStorageHash128 s;
-  DeviceStorageHash128 dv;
-  DeviceStorageHash128 u_transpose;
-  DeviceStorageHash128 dab;
-  DeviceStorageHash128 dab_transpose;
-  DeviceStorageHash128 dgate_partial;
-  DeviceStorageHash128 dgate_canonical;
-  DeviceStorageHash128 dgate_final;
-  DeviceStorageHash128 dw2;
-  DeviceStorageHash128 dw1;
-  DeviceStorageHash128 return_signal_epoch;
-  DeviceStorageHash128 route_return_coverage;
-  std::uint64_t incoming_rows = 0;
-  std::uint64_t padded_reduction_rows = 0;
-  std::uint64_t route_return_coverage_count = 0;
-};
-
-struct BackwardHashAgreement {
-  bool matches = false;
-  std::uint32_t origin_rank = 0;
-  std::uint32_t field = 0;
-  DeviceStorageHash128 expected;
-  DeviceStorageHash128 actual;
-};
-#endif
 
 struct ForwardMegaKernelTimings {
   double dispatch_us = 0;
@@ -488,35 +243,11 @@ private:
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class ForwardMegaKernelBridge;
-#endif
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend std::vector<transport::BFloat16>
-  download_forward_output_for_validation(const DeviceForwardHandle &,
-                                         const CudaExecution &);
-  friend std::vector<transport::BFloat16>
-  download_forward_cache_for_validation(const DeviceForwardHandle &,
-                                        const CudaExecution &);
-  friend bool testing_forward_cache_ranges_disjoint(
-      const DeviceForwardHandle &, const DeviceForwardHandle &);
   friend class SelectedOutputGradientLease;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
   friend class ExternalCudaProducer;
   friend class NcclSocketFallbackBackwardMegaKernel;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend struct BackwardMegaKernelBridge;
-#endif
-  friend SelectedOutputGradientLease
-  testing_upload_output_gradient_for_backward(
-      const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
-      const CudaExecution &);
-  friend SelectedOutputGradientLease
-  testing_reissue_output_gradient_for_benchmark(
-      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
-      const CudaExecution &);
-#endif
 };
 
 // CUDA-specific zero-copy producer boundary. It records readiness on the
@@ -631,20 +362,6 @@ private:
   std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
 };
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-std::vector<transport::BFloat16>
-download_forward_output_for_validation(const DeviceForwardHandle &handle,
-                                       const CudaExecution &execution);
-
-std::vector<transport::BFloat16>
-download_forward_cache_for_validation(const DeviceForwardHandle &handle,
-                                      const CudaExecution &execution);
-
-// Test-only predicate. It validates real device address intervals internally
-// without exposing either native pointer to the caller.
-bool testing_forward_cache_ranges_disjoint(const DeviceForwardHandle &left,
-                                           const DeviceForwardHandle &right);
-#endif
 
 // Immutable autograd -> Backward handoff.  dY is BF16 [tokens, hidden] and is
 // bound to the exact Forward generation/slot.  No native pointer is exposed.
@@ -665,19 +382,6 @@ private:
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
   friend class ExternalCudaProducer;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend struct BackwardMegaKernelBridge;
-#endif
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend SelectedOutputGradientLease
-  testing_upload_output_gradient_for_backward(
-      const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
-      const CudaExecution &);
-  friend SelectedOutputGradientLease
-  testing_reissue_output_gradient_for_benchmark(
-      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
-      const CudaExecution &);
-#endif
 };
 
 enum class BackwardWeightGradientDType : std::uint8_t { BFloat16 };
@@ -762,28 +466,8 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend struct BackwardValidationDownload;
-  friend struct BackwardStorageHashAccess;
-  friend BackwardValidationDownload download_backward_for_validation(
-      const DeviceBackwardHandle &, const CudaExecution &);
-  friend bool testing_backward_storage_ranges_disjoint(
-      const DeviceBackwardHandle &, const DeviceBackwardHandle &);
-  friend std::size_t
-  testing_backward_slot_index(const DeviceBackwardHandle &);
-#endif
 };
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-struct BackwardValidationDownload {
-  std::vector<transport::BFloat16> dx;
-  std::vector<float> dgate;
-  std::vector<transport::BFloat16> dw1;
-  std::vector<transport::BFloat16> dw2;
-  std::vector<transport::BFloat16> sampled_ab;
-  std::vector<transport::BFloat16> sampled_dab;
-};
-#endif
 
 class LocalCudaP2pBackwardMegaKernel {
 public:
@@ -841,44 +525,6 @@ private:
   std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
 };
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-BackwardValidationDownload download_backward_for_validation(
-    const DeviceBackwardHandle &handle, const CudaExecution &execution);
-
-// Test-only predicates expose slot identity/isolation without exposing native
-// device addresses or an owner-free kernel view.
-bool testing_backward_storage_ranges_disjoint(
-    const DeviceBackwardHandle &left, const DeviceBackwardHandle &right);
-std::size_t testing_backward_slot_index(const DeviceBackwardHandle &handle);
-
-// Explicit test/convenience upload into the Forward generation's preallocated
-// dY slot.  Production autograd/router integration will issue the same typed
-// lease without a host roundtrip.
-SelectedOutputGradientLease testing_upload_output_gradient_for_backward(
-    const DeviceForwardHandle &forward,
-    const std::vector<transport::BFloat16> &host,
-    const CudaExecution &execution);
-
-SelectedOutputGradientLease testing_reissue_output_gradient_for_benchmark(
-    const DeviceForwardHandle &forward,
-    const SelectedOutputGradientLease &storage,
-    const CudaExecution &execution);
-
-struct ActivationTransportValidationDownload {
-  std::vector<transport::BFloat16> contribution_by_route;
-  std::vector<transport::BFloat16> combined_tokens;
-  std::vector<transport::BFloat16> canonical_expert_rows;
-  transport::TransportProtocolAudit protocol;
-};
-
-ActivationTransportValidationDownload download_activation_transport_for_validation(
-    const DeviceActivationTransportHandle &handle,
-    const CudaExecution &execution);
-
-std::vector<transport::BFloat16> download_activation_output_for_validation(
-    const DeviceActivationTransportHandle &handle,
-    const CudaExecution &execution);
-#endif
 
 struct ActivationTransportCapability {
   std::uint32_t compiled_nccl_version = 0;
@@ -909,104 +555,7 @@ ActivationTransportCapability probe_activation_transport_capability(
 void prepare_forward_weights_for_backward(
     const ForwardWeightLease &weights, const CudaExecution &execution);
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-namespace testing {
-struct GinPutSignalProbeResult {
-  std::uint64_t payload_bytes = 0;
-  std::uint32_t rail_rank = 0;
-  std::uint32_t rail_world = 0;
-  std::uint32_t local_rank = 0;
-  std::uint64_t received_hash = 0;
-  std::uint64_t expected_hash = 0;
-};
-
-// Real device-issued GIN rail put with remote indexed signal and local
-// completion counter. This is a lifecycle/data-movement probe, not the full
-// activation backend.
-GinPutSignalProbeResult run_distributed_gin_put_signal_probe(
-    const NcclSession &session, const CudaExecution &execution,
-    std::uint64_t payload_bytes = 1024);
-
-BFloat16ActivationLease upload_bfloat16_activations_for_testing(
-    const std::vector<transport::BFloat16> &host,
-    std::uint64_t num_tokens, std::uint64_t hidden,
-    const RankCollectiveContext &context, const CudaExecution &execution,
-    const ActivationTransportResourcePool &pool);
-
-ForwardWeightLease make_deterministic_forward_weights_for_testing(
-    std::uint32_t owned_experts, std::uint32_t global_expert_begin,
-    std::uint64_t hidden_size, std::uint64_t intermediate_size,
-    const CollectiveSession &session, const CudaExecution &execution);
-
-// Validation-only hash of the complete BF16 storage which the Forward kernel
-// will consume. The device performs a fixed-size chunk reduction over actual
-// bytes; only the two 64-bit results per tensor are copied to the host.
-ForwardWeightStorageHashes hash_forward_weight_storage_for_validation(
-    const ForwardWeightLease &weights, const CudaExecution &execution);
-
-// Validation-only fixed-order hashes over the complete device gradient
-// buffers produced by the persistent Backward kernel. No bulk gradient
-// download is performed.
-BackwardStorageHashes hash_backward_storage_for_validation(
-    const DeviceBackwardHandle &handle, const CudaExecution &execution);
-
-// Recomputes the hash from the live device allocation even when the handle
-// carries a completion-time hash. This is intentionally validation-only and
-// is used to prove that a later live generation did not overwrite the slot.
-BackwardStorageHashes rehash_backward_storage_for_validation(
-    const DeviceBackwardHandle &handle, const CudaExecution &execution);
-
-BackwardStageStorageHashes hash_backward_stage_storage_for_validation(
-    const DeviceBackwardHandle &handle, const CudaExecution &execution);
-
-// Fixed-width terminal validation used by distributed tests. Every rank calls
-// this before acting on a local hash mismatch, so one rank cannot exit while
-// peers enter a terminal collective. Field order is dx,dW1,dW2,dGate.
-BackwardHashAgreement agree_backward_hashes_for_validation(
-    const DeviceBackwardHandle &handle,
-    const BackwardStorageHashes &expected,
-    const BackwardStorageHashes &actual,
-    const CudaExecution &execution);
-
-enum class BackwardStorageField : std::uint8_t { Dx, Dw1, Dw2, DGate };
-
-// Corruption sensitivity check for actual device gradient storage. Validation
-// only; the offset is measured in bytes and the caller must restore mutations.
-void flip_backward_storage_byte_for_validation(
-    const DeviceBackwardHandle &handle, BackwardStorageField field,
-    std::uint64_t byte_offset, const CudaExecution &execution);
-
-// Compatibility wrapper retained inside the validation namespace.
-void flip_backward_dx_byte_for_validation(
-    const DeviceBackwardHandle &handle, std::uint64_t byte_offset,
-    const CudaExecution &execution);
-
-struct EmptyExpertGradientZeroCheck {
-  std::uint64_t dw1_nonzero_elements = 0;
-  std::uint64_t dw2_nonzero_elements = 0;
-  std::uint64_t dw1_zero_store_tasks_expected = 0;
-  std::uint64_t dw1_zero_store_tasks_completed = 0;
-  std::uint64_t dw2_zero_store_tasks_expected = 0;
-  std::uint64_t dw2_zero_store_tasks_completed = 0;
-};
-
-// Scans the complete dW intervals of one known-empty local expert on device.
-EmptyExpertGradientZeroCheck check_empty_expert_gradients_for_validation(
-    const DeviceBackwardHandle &handle, std::uint32_t local_expert,
-    const CudaExecution &execution);
-
-// Executes a true device-issued store through a peer mapping and observes a
-// system-scope release/acquire signal. It is a capability/correctness probe,
-// not the cross-node backend.
-bool run_local_p2p_put_signal_probe(std::uint32_t source_device,
-                                    std::uint32_t destination_device,
-                                    std::uint64_t elements);
-double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
-                                            std::uint32_t destination_device,
-                                            std::uint64_t bytes,
-                                            std::uint32_t warmup,
-                                            std::uint32_t measured);
-} // namespace testing
-#endif
 
 } // namespace megamoe::cuda
+
+MEGAMOE_PUBLIC_API_END

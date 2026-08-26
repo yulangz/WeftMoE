@@ -7,11 +7,11 @@
 #include <utility>
 #include <vector>
 
-namespace megamoe {
+#include "megamoe/version.hpp"
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-namespace testing { class HostIntegerRowTestAccess; }
-#endif
+MEGAMOE_PUBLIC_API_BEGIN
+
+namespace megamoe {
 
 using CountMatrix = std::vector<std::vector<std::uint64_t>>;
 
@@ -124,9 +124,6 @@ private:
       : values_(std::move(values)) {}
   std::shared_ptr<const std::vector<std::uint64_t>> values_;
   friend HostIntegerRow make_host_integer_row(std::vector<std::uint64_t>);
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend class testing::HostIntegerRowTestAccess;
-#endif
 };
 
 HostIntegerRow make_host_integer_row(std::vector<std::uint64_t> values);
@@ -269,3 +266,5 @@ private:
 };
 
 } // namespace megamoe
+
+MEGAMOE_PUBLIC_API_END

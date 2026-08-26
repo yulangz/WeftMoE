@@ -1,5 +1,4 @@
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#include "megamoe/transport/activation_protocol.hpp"
+#include "transport/activation_protocol_testing.hpp"
 
 #include <algorithm>
 #include <cmath>

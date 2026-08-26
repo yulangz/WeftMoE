@@ -1,12 +1,15 @@
 #pragma once
 
-// Host oracle and corruption declarations are repository-internal.  This
-// header is intentionally outside include/megamoe and is never installed.
-#ifndef MEGAMOE_INTERNAL_TESTING_API
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#endif
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
+#define private public
 #include "megamoe/api/notify_dispatch.hpp"
+#undef private
 
 namespace megamoe::testing {
 
@@ -17,3 +20,10 @@ public:
 };
 
 } // namespace megamoe::testing
+
+namespace megamoe {
+std::vector<DispatchHandle> build_notify_dispatch_for_testing(
+    const RuntimeConfig &, const std::vector<RankRoutingInput> &,
+    const std::string &communicator_id = "host-fake",
+    std::uint64_t generation = 1);
+} // namespace megamoe

@@ -9,18 +9,9 @@
 #include "megamoe/config/runtime_config.hpp"
 #include "megamoe/transport/count_exchange.hpp"
 
-namespace megamoe {
+MEGAMOE_PUBLIC_API_BEGIN
 
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-namespace testing {
-class NotifyCorruptionHook;
-}
-#endif
-namespace cuda {
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-class DeviceNotifyBridge;
-#endif
-}
+namespace megamoe {
 
 class WorkspacePlan;
 class DispatchHandleFactory;
@@ -149,14 +140,10 @@ private:
     friend class WorkspacePlan;
     friend WorkspacePlan make_workspace_plan(const DispatchHandle&);
     friend void validate_workspace_plan(const DispatchHandle&, const WorkspacePlan&);
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-    friend class testing::NotifyCorruptionHook;
-#endif
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-    friend class cuda::DeviceNotifyBridge;
-#endif
 };
 
 void validate_dispatch_metadata(const DispatchHandle& handle);
 
 }  // namespace megamoe
+
+MEGAMOE_PUBLIC_API_END

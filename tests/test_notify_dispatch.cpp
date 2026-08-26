@@ -30,7 +30,7 @@
 #include "megamoe/metadata/serialize.hpp"
 #include "megamoe/scoreboard/workspace_plan.hpp"
 #include "megamoe/transport/count_exchange.hpp"
-#include "megamoe/transport/activation_protocol.hpp"
+#include "transport/activation_protocol_testing.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 

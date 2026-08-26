@@ -1,5 +1,4 @@
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#include "megamoe/cuda/nccl_count_exchange.hpp"
+#include "cuda/nccl_protocol_internal.hpp"
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -23,6 +22,18 @@
 #include "megamoe/api/errors.hpp"
 
 namespace megamoe::cuda {
+
+#if !MEGAMOE_BUILD_TESTING
+// The release object graph keeps only the counters needed by the production
+// coordinator. Repository fault-control entry points are section-collected;
+// using a distinct namespace also makes accidental retention auditable.
+namespace release_instrumentation {
+using NcclFaultPoint = ::megamoe::cuda::testing::NcclFaultPoint;
+using NcclLifecycleSnapshot =
+    ::megamoe::cuda::testing::NcclLifecycleSnapshot;
+} // namespace release_instrumentation
+#define testing release_instrumentation
+#endif
 
 namespace testing {
 namespace {
@@ -83,6 +94,7 @@ namespace {
   throw NotifyDispatchError(NotifyErrorCode::NcclFailure, message);
 }
 
+#if MEGAMOE_BUILD_TESTING
 void maybe_fault(testing::NcclFaultPoint point, const char *stage,
                  const RankCollectiveContext &context) {
   auto expected = static_cast<int>(point);
@@ -98,6 +110,11 @@ void maybe_fault(testing::NcclFaultPoint point, const char *stage,
           << ", backend_error=controlled test fault";
   throw NotifyDispatchError(NotifyErrorCode::NcclFailure, message.str());
 }
+#else
+template <typename Point>
+constexpr void maybe_fault(Point, const char *,
+                           const RankCollectiveContext &) noexcept {}
+#endif
 
 std::size_t checked_elements(std::uint32_t world, std::uint64_t width,
                              const char *field) {
@@ -2276,11 +2293,13 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   ConfigWire config_wire;
   LocalPreflightStatus config_status;
   auto protocol_identity = impl_->context.session().stable_identity_bytes();
+#if MEGAMOE_BUILD_TESTING
   std::unique_ptr<testing::IdentityOverride> identity_override;
   if (testing::g_identity_override) {
     identity_override = std::move(testing::g_identity_override);
     protocol_identity = identity_override->raw;
   }
+#endif
   (void)try_encode_canonical_config(
       request.config, request.max_tokens_per_rank, config_wire, config_status,
       protocol_identity);
@@ -2339,9 +2358,13 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   bool use_fast_notify = false;
 #if !MEGAMOE_DEBUG_VALIDATE
   use_fast_notify = request.config.topology.num_nodes == 1 && impl_->pool &&
-                    impl_->backend->fast_path_ready() && !identity_override &&
+                    impl_->backend->fast_path_ready()
+#if MEGAMOE_BUILD_TESTING
+                    && !identity_override &&
                     testing::g_config_corruption_offset == SIZE_MAX &&
-                    testing::g_next_fault.load(std::memory_order_acquire) == 0;
+                    testing::g_next_fault.load(std::memory_order_acquire) == 0
+#endif
+                    ;
   // A changed config cannot use the cached fixed-layout record. Fall back to
   // the complete agreement protocol so a uniformly changed, valid generation
   // can recover on the same communicator, while mismatched ranks still fail
@@ -2375,7 +2398,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       } else {
         std::vector<float> unit_gates(
             static_cast<std::size_t>(routes.route_count()), 1.0F);
-        gates = testing::upload_fp32_gates_for_testing(
+        gates = DeviceGateProvenanceBridge::upload_internal(
             unit_gates, routes, impl_->context, impl_->execution);
       }
       route_input_bytes = routes.device_bytes();
@@ -2416,10 +2439,12 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                     : request.local_routes.selected_experts.size(),
       request.max_tokens_per_rank, config_wire.size(),
       config_wire_digest(config_wire), status);
+#if MEGAMOE_BUILD_TESTING
   if (identity_override) {
     header.session_id_word0 = identity_override->summary.word0;
     header.session_id_word1 = identity_override->summary.word1;
   }
+#endif
   const auto collective_enqueue_begin = std::chrono::steady_clock::now();
   auto control_config_start = collective_enqueue_begin;
   auto control_config_end = collective_enqueue_begin;
@@ -2428,12 +2453,14 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     auto control = impl_->backend->start_control(impl_->context, header);
     auto control_done = control.wait();
 
+#if MEGAMOE_BUILD_TESTING
     if (testing::g_config_corruption_offset != SIZE_MAX) {
       const auto offset = testing::g_config_corruption_offset;
       testing::g_config_corruption_offset = SIZE_MAX;
       if (offset < config_wire.size())
         config_wire[offset] ^= std::byte{1};
     }
+#endif
 
     auto config = impl_->backend->start_config(impl_->context, config_wire,
                                                control_done);

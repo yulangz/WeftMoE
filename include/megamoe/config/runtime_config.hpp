@@ -4,6 +4,10 @@
 #include <limits>
 #include <vector>
 
+#include "megamoe/version.hpp"
+
+MEGAMOE_PUBLIC_API_BEGIN
+
 namespace megamoe {
 
 // All topology values are runtime data.  Expert ownership may be non-contiguous.
@@ -40,3 +44,5 @@ struct RankRoutingInput {
 void validate_runtime_config(const RuntimeConfig &config);
 
 }  // namespace megamoe
+
+MEGAMOE_PUBLIC_API_END

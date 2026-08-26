@@ -1,5 +1,4 @@
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#include "megamoe/api/notify_dispatch.hpp"
+#include "metadata/testing_api.hpp"
 
 #include <algorithm>
 #include <limits>

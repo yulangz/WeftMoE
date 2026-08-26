@@ -1,16 +1,20 @@
 #pragma once
 
-#ifndef MEGAMOE_INTERNAL_TESTING_API
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#endif
-
 #include <memory>
 #include <cstddef>
 #include <vector>
 
+#include "cuda/device_notify_internal.hpp"
+#define private public
 #include "megamoe/cuda/nccl_count_exchange.hpp"
+#undef private
 
 namespace megamoe::cuda {
+
+namespace testing {
+CudaNotifyGenerationCoordinator make_unpooled_coordinator_for_testing(
+    const NcclSession &, const CudaExecution &);
+}
 
 enum class BootstrapChannelState { Open, Consumed, Failed, Closed };
 

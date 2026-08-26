@@ -3,6 +3,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "megamoe/version.hpp"
+
+MEGAMOE_PUBLIC_API_BEGIN
+
 namespace megamoe {
 
 enum class NotifyErrorCode {
@@ -38,3 +42,5 @@ private:
 };
 
 }  // namespace megamoe
+
+MEGAMOE_PUBLIC_API_END

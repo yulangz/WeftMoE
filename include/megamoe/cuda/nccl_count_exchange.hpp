@@ -9,6 +9,8 @@
 
 #include "megamoe/cuda/device_notify.hpp"
 
+MEGAMOE_PUBLIC_API_BEGIN
+
 namespace megamoe::cuda {
 
 namespace internal { class NcclSessionAccess; }
@@ -17,12 +19,6 @@ class NcclSession;
 class NcclBootstrapInputChannel;
 class NcclBootstrapOutputChannel;
 class CudaNotifyGenerationCoordinator;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-namespace testing {
-CudaNotifyGenerationCoordinator make_unpooled_coordinator_for_testing(
-    const NcclSession &, const CudaExecution &);
-}
-#endif
 
 class NcclBootstrapId {
 public:
@@ -278,11 +274,6 @@ private:
                                   const CudaExecution &execution);
   struct Impl;
   std::shared_ptr<Impl> impl_;
-#if defined(MEGAMOE_INTERNAL_TESTING_API)
-  friend CudaNotifyGenerationCoordinator
-  testing::make_unpooled_coordinator_for_testing(
-      const NcclSession &, const CudaExecution &);
-#endif
 };
 
 const char *compiled_nccl_version() noexcept;
@@ -298,3 +289,5 @@ struct NcclRuntimeInfo {
 NcclRuntimeInfo nccl_runtime_info();
 
 } // namespace megamoe::cuda
+
+MEGAMOE_PUBLIC_API_END

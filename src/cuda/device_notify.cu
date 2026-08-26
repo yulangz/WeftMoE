@@ -33,6 +33,7 @@ std::atomic<std::uint64_t> g_cuda_device_synchronizes{0};
 std::atomic<std::uint64_t> g_cuda_h2d_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2h_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2d_bytes{0};
+#if MEGAMOE_BUILD_TESTING
 std::atomic<std::uint8_t> g_consumer_fault{0};
 
 bool take_consumer_fault(testing::ConsumerFaultPoint point) noexcept {
@@ -41,11 +42,19 @@ bool take_consumer_fault(testing::ConsumerFaultPoint point) noexcept {
       expected,
       static_cast<std::uint8_t>(testing::ConsumerFaultPoint::None));
 }
+#else
+template <typename Point>
+constexpr bool take_consumer_fault(Point) noexcept {
+  return false;
+}
+#endif
 } // namespace
 
+#if MEGAMOE_BUILD_TESTING
 void testing::inject_next_consumer_fault(ConsumerFaultPoint point) noexcept {
   g_consumer_fault.store(static_cast<std::uint8_t>(point));
 }
+#endif
 
 namespace internal {
 void record_cuda_api(CudaApiAuditKind kind, std::uint64_t bytes) noexcept {
@@ -66,6 +75,7 @@ void record_cuda_api(CudaApiAuditKind kind, std::uint64_t bytes) noexcept {
 }
 } // namespace internal
 
+#if MEGAMOE_BUILD_TESTING
 testing::CudaApiAuditSnapshot testing::cuda_api_audit_snapshot() noexcept {
   return {g_cuda_device_allocations.load(), g_cuda_device_frees.load(),
           g_cuda_pinned_allocations.load(), g_cuda_pinned_frees.load(),
@@ -73,6 +83,7 @@ testing::CudaApiAuditSnapshot testing::cuda_api_audit_snapshot() noexcept {
           g_cuda_device_synchronizes.load(), g_cuda_h2d_bytes.load(),
           g_cuda_d2h_bytes.load(), g_cuda_d2d_bytes.load()};
 }
+#endif
 
 namespace {
 
@@ -1641,7 +1652,7 @@ std::uint64_t CudaGateInput::gate_generation() const {
   return impl_->generation;
 }
 
-CudaGateInput DeviceGateProvenanceBridge::upload_for_testing(
+CudaGateInput DeviceGateProvenanceBridge::upload_internal(
     const std::vector<float> &host, const CudaRouteInput &routes,
     const RankCollectiveContext &context,
     const CudaExecution &execution) {
@@ -1711,7 +1722,7 @@ CudaGateInput testing::upload_fp32_gates_for_testing(
     const std::vector<float> &host, const CudaRouteInput &routes,
     const RankCollectiveContext &context,
     const CudaExecution &execution) {
-  return DeviceGateProvenanceBridge::upload_for_testing(
+  return DeviceGateProvenanceBridge::upload_internal(
       host, routes, context, execution);
 }
 

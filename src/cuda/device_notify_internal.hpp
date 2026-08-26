@@ -1,12 +1,53 @@
 #pragma once
 
-#ifndef MEGAMOE_INTERNAL_TESTING_API
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#endif
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#define private public
 #include "megamoe/cuda/device_notify.hpp"
+#undef private
 
 namespace megamoe::cuda {
+
+class CudaNotifyWorkspace;
+class CudaNotifyOperation;
+class CudaNotifyPreflight;
+
+namespace testing {
+struct CudaApiAuditSnapshot {
+  std::uint64_t device_allocations = 0;
+  std::uint64_t device_frees = 0;
+  std::uint64_t pinned_allocations = 0;
+  std::uint64_t pinned_frees = 0;
+  std::uint64_t event_creates = 0;
+  std::uint64_t event_destroys = 0;
+  std::uint64_t device_synchronizes = 0;
+  std::uint64_t h2d_bytes = 0;
+  std::uint64_t d2h_bytes = 0;
+  std::uint64_t d2d_bytes = 0;
+};
+CudaApiAuditSnapshot cuda_api_audit_snapshot() noexcept;
+CudaGateInput upload_fp32_gates_for_testing(
+    const std::vector<float> &, const CudaRouteInput &,
+    const RankCollectiveContext &, const CudaExecution &);
+DeviceDispatchHandle materialize_fake_device_collectives(
+    const RuntimeConfig &, const RankCollectiveContext &,
+    const CudaExecution &, const RankRoutingInput &, std::uint64_t,
+    const std::vector<std::uint64_t> &,
+    const std::vector<std::uint64_t> &);
+void submit_dispatch_probe(DeviceDispatchConsumerLease &, std::uint64_t);
+std::uint64_t finish_dispatch_probe(DeviceDispatchConsumerLease &);
+} // namespace testing
+
+DispatchHandle download_device_metadata_for_validation(
+    const DeviceDispatchHandle &, const CudaExecution &);
+void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &,
+                                     const CudaExecution &);
 
 // Backend-private opaque slices. Generic DeviceBufferLease remains confined to
 // CUDA/NCCL implementation code and never enters the public dispatch API.
@@ -86,7 +127,7 @@ public:
 
 class DeviceGateProvenanceBridge {
 public:
-  static CudaGateInput upload_for_testing(
+  static CudaGateInput upload_internal(
       const std::vector<float> &host, const CudaRouteInput &routes,
       const RankCollectiveContext &context,
       const CudaExecution &execution);

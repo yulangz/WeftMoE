@@ -5,6 +5,8 @@
 
 #include "megamoe/metadata/dispatch_handle.hpp"
 
+MEGAMOE_PUBLIC_API_BEGIN
+
 namespace megamoe {
 
 struct WorkspaceRequirements {
@@ -49,3 +51,5 @@ void validate_workspace_plan(const DispatchHandle& handle,
                              const WorkspacePlan& plan);
 
 }  // namespace megamoe
+
+MEGAMOE_PUBLIC_API_END

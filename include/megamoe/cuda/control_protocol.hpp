@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+#include "megamoe/version.hpp"
+
+MEGAMOE_PUBLIC_API_BEGIN
+
 #include "megamoe/config/runtime_config.hpp"
 #include "megamoe/transport/count_exchange.hpp"
 
@@ -202,3 +206,5 @@ const char *control_field_name(ControlField field) noexcept;
 const char *control_error_name(ControlLocalError error) noexcept;
 
 } // namespace megamoe::cuda
+
+MEGAMOE_PUBLIC_API_END
