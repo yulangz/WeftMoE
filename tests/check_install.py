@@ -58,6 +58,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
              "-lmegamoe"]
     command = [
         os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc"),
+        "-Wno-deprecated-gpu-targets",
         "-std=c++17",
         "-I",
         str(prefix / "include"),

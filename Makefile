@@ -50,7 +50,7 @@ LIB_SOURCES := \
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
-CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr
+CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets
 override CUDA_NVCCFLAGS += -Xcompiler=-fPIC
 ifeq ($(WERROR),1)
 override CXXFLAGS += -Werror
@@ -89,7 +89,8 @@ cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
 $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 	@mkdir -p $(@D)
-	$(NVCC) -shared -Xlinker=-soname -Xlinker=$(LIBMEGAMOE_SONAME) \
+	$(NVCC) -Wno-deprecated-gpu-targets -shared \
+		-Xlinker=-soname -Xlinker=$(LIBMEGAMOE_SONAME) \
 		$(LDFLAGS) $^ -lnccl -lcudart -lcuda -ldl -o $@
 
 shared-lib: $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME)

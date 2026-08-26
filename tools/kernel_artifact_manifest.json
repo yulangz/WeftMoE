@@ -8,18 +8,18 @@
     "backward_local_main": {
       "sm_90": {
         "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 1648,
+        "instruction_count": 1584,
         "local_bytes": 0,
-        "normalized_sass_sha256": "fdbb45ca1ade9df08a435d30ebdc8f17f3f388296fb846d24187b089564ee8a9",
+        "normalized_sass_sha256": "b3ee5f55ba4e68c3bb51464ea62d4cfd4f8b87e7470d706f5fcfd487650550a3",
         "registers": 64,
         "stack_bytes": 0,
         "static_shared_bytes": 0
       },
       "sm_90a": {
         "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 22656,
+        "instruction_count": 22456,
         "local_bytes": 0,
-        "normalized_sass_sha256": "91fd5367d1c3a755d8dc36d7b9e3c0c4052ffce9731d96ea5802bad1c676d2d2",
+        "normalized_sass_sha256": "4556f549855fc253d3bdfb0ce974942610ad7894834f8ea61dd17da48c536538",
         "registers": 168,
         "stack_bytes": 120,
         "static_shared_bytes": 2048

@@ -3353,14 +3353,19 @@ __device__ void forward_publish_progress(const ForwardKernelArgs &a,
 }
 
 template <bool StaticLocal>
+__device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
+  if constexpr (StaticLocal)
+    return false;
+  return enabled;
+}
+
+template <bool StaticLocal>
 __global__ __launch_bounds__(384, 1) void
 local_p2p_forward_megakernel(
     ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map) {
-  const bool use_gin = !StaticLocal && a.use_gin;
-  const bool use_socket = !StaticLocal && a.use_socket;
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
   extern __shared__ __align__(1024) unsigned char storage[];
@@ -3471,14 +3476,15 @@ local_p2p_forward_megakernel(
   // Socket correctness mode has already placed every incoming activation and
   // canonical header through host-enqueued NCCL Send/Recv. It deliberately
   // bypasses the peer/G​IN dispatch phase while retaining the exact FC core.
-  if (!use_socket) {
+  if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
     // Local rows use the frozen CUDA-IPC fast path. Cross-node rows are packed
     // once per (token,node) by the same-rail proxy path below.
     unsigned long long dispatch_peer_rows = 0ULL;
     for (std::uint64_t route = blockIdx.x;
          route < a.dispatch.sizes.route_count; route += gridDim.x) {
     const auto destination = a.dispatch.route_dst_rank[route];
-    if (use_gin && destination / a.local_world_size != a.node)
+    if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+        destination / a.local_world_size != a.node)
       continue;
     const auto row = a.dispatch.route_dst_row[route];
     const auto token = route / a.dispatch.identity.top_k;
@@ -3505,7 +3511,7 @@ local_p2p_forward_megakernel(
     }
     }
 #if __has_include(<nccl_device.h>)
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -3564,7 +3570,8 @@ local_p2p_forward_megakernel(
     __threadfence_system();
     grid.sync();
   }
-  if (use_gin && blockIdx.x < a.gin_context_count) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x < a.gin_context_count) {
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
@@ -3677,7 +3684,7 @@ local_p2p_forward_megakernel(
       atomicAdd(&status->actual_dispatch_peer_bytes, bytes);
     }
   }
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     if (threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -3785,8 +3792,12 @@ local_p2p_forward_megakernel(
                            a.dispatch.sizes.route_count);
   grid.sync();
   if (blockIdx.x == 0) {
-    const auto first_local = use_gin ? a.node * a.local_world_size : 0U;
-    const auto local_count = use_gin ? a.local_world_size : a.world;
+    const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                 ? a.node * a.local_world_size
+                                 : 0U;
+    const auto local_count = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                 ? a.local_world_size
+                                 : a.world;
     if (threadIdx.x < local_count) {
       const auto peer = first_local + threadIdx.x;
       auto *signal = peer_at<unsigned long long>(
@@ -3810,7 +3821,9 @@ local_p2p_forward_megakernel(
   }
   grid.sync();
   forward_publish_progress(a, kForwardDispatchObserved,
-                           use_gin ? a.local_world_size : a.world);
+                           remote_backend_enabled<StaticLocal>(a.use_gin)
+                               ? a.local_world_size
+                               : a.world);
   } else {
     grid.sync();
     forward_publish_progress(a, kForwardDispatchStored,
@@ -4114,7 +4127,8 @@ local_p2p_forward_megakernel(
       }
     }
     __syncthreads();
-    if (return_mblock_shared != 0U && !use_socket) {
+    if (return_mblock_shared != 0U &&
+        !remote_backend_enabled<StaticLocal>(a.use_socket)) {
       // Only lane 0 produces and consumes the peer-row audit count. Keeping
       // it in CTA shared storage made independent CTAs alias through the
       // cluster-shared address space under racecheck. A thread-local scalar
@@ -4129,7 +4143,7 @@ local_p2p_forward_megakernel(
       for (std::uint32_t local_row = 0; local_row < valid_rows; ++local_row) {
         const auto return_row = row + local_row;
         const auto header = headers[return_row];
-        if (use_gin &&
+        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
             header.source_rank / a.local_world_size != a.node)
           continue;
         auto *source_contribution = peer_at<transport::BFloat16>(
@@ -4160,7 +4174,8 @@ local_p2p_forward_megakernel(
       __syncthreads();
       for (std::uint32_t source_rank = threadIdx.x; source_rank < a.world;
            source_rank += blockDim.x) {
-        if (use_gin && source_rank / a.local_world_size != a.node)
+        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+            source_rank / a.local_world_size != a.node)
           continue;
         const auto rows = return_rows_by_source[source_rank];
         if (rows == 0U)
@@ -4183,7 +4198,7 @@ local_p2p_forward_megakernel(
     }
   }
 #if __has_include(<nccl_device.h>)
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     // All FC2 rows are now available. Each same-rail proxy gathers its remote
     // packet's local fan-out directly from node-local expert arenas.  The full
     // persistent grid performs the NVLink gather/scatter; only the bounded GIN
@@ -4423,7 +4438,7 @@ local_p2p_forward_megakernel(
     publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
   }
 #endif
-  if (use_socket) {
+  if (remote_backend_enabled<StaticLocal>(a.use_socket)) {
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0 &&
         a.injected_status_error_rank == static_cast<int>(a.rank))
@@ -5056,8 +5071,6 @@ local_p2p_backward_megakernel(
     const __grid_constant__ CUtensorMap u_transpose_map,
     const __grid_constant__ CUtensorMap dab_transpose_map,
     const __grid_constant__ CUtensorMap dw1_store_map) {
-  const bool use_gin = !StaticLocal && a.use_gin;
-  const bool use_socket = !StaticLocal && a.use_socket;
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
   extern __shared__ __align__(1024) unsigned char storage[];
@@ -5104,7 +5117,8 @@ local_p2p_backward_megakernel(
                                                  a.forward_ab_cache_offset)
                        : peer_at<transport::BFloat16>(a.local_base,
                                                  a.recompute_ab_offset);
-  backward_publish_progress(a, kBackwardEntered, a.epoch);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardEntered, a.epoch);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *smem_b = reinterpret_cast<transport::BFloat16 *>(
@@ -5166,7 +5180,8 @@ local_p2p_backward_megakernel(
     }
   }
   grid.sync();
-  backward_publish_progress(a, kBackwardSetupComplete, scheduler[8]);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardSetupComplete, scheduler[8]);
 
   // Build an immutable padded-canonical lookup. dW reductions use this to
   // preserve canonical M order while giving every TMA reduction a 64-row tail.
@@ -5195,7 +5210,7 @@ local_p2p_backward_megakernel(
   }
   grid.sync();
 
-  if (!use_socket) {
+  if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
     // DYDispatchPut: dY and its route-local source gate share the exact
     // Forward canonical row mapping. Socket mode preloads both through its
     // host-enqueued aggregate phase before this compute-only launch.
@@ -5203,7 +5218,8 @@ local_p2p_backward_megakernel(
     for (std::uint64_t route = blockIdx.x;
          route < a.dispatch.sizes.route_count; route += gridDim.x) {
     const auto destination = a.dispatch.route_dst_rank[route];
-    if (use_gin && destination / a.local_world_size != a.node)
+    if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+        destination / a.local_world_size != a.node)
       continue;
     const auto row = a.dispatch.route_dst_row[route];
     const auto token = route / a.dispatch.identity.top_k;
@@ -5228,7 +5244,7 @@ local_p2p_backward_megakernel(
       atomicAdd(&status->actual_dy_peer_bytes,
                 dy_peer_rows * a.hidden * sizeof(transport::BFloat16));
 #if __has_include(<nccl_device.h>)
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     const auto first_local = a.node * a.local_world_size;
     if (blockIdx.x == 0U) {
@@ -5309,7 +5325,8 @@ local_p2p_backward_megakernel(
     __threadfence_system();
     grid.sync();
   }
-  if (use_gin && blockIdx.x < a.gin_context_count) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x < a.gin_context_count) {
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
@@ -5424,7 +5441,7 @@ local_p2p_backward_megakernel(
     }
     __syncthreads();
   }
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     if (threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -5514,8 +5531,12 @@ local_p2p_backward_megakernel(
   __threadfence_system();
   grid.sync();
   if (blockIdx.x == 0) {
-    const auto first_local = use_gin ? a.node * a.local_world_size : 0U;
-    const auto local_count = use_gin ? a.local_world_size : a.world;
+    const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                 ? a.node * a.local_world_size
+                                 : 0U;
+    const auto local_count = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                 ? a.local_world_size
+                                 : a.world;
     if (threadIdx.x < local_count) {
       const auto peer = first_local + threadIdx.x;
       auto *signal = peer_at<unsigned long long>(
@@ -5542,7 +5563,8 @@ local_p2p_backward_megakernel(
   }
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dy_dispatch_complete_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDyComplete, a.epoch);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDyComplete, a.epoch);
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   if (threadIdx.x == 256U) {
@@ -5642,7 +5664,8 @@ local_p2p_backward_megakernel(
   const auto dv_tasks = mblocks * dv_ntiles;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dv_start_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDvStarted, dv_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDvStarted, dv_tasks);
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[1], 1ULL);
@@ -5861,7 +5884,8 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dv_complete_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDvComplete, dv_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDvComplete, dv_tasks);
 
   // The owner dV CTA wrote each fixed I-tile partial above. An ordered tile
   // reduction now produces one dGate per canonical route.
@@ -5878,7 +5902,8 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dgate_complete_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDgateComplete, incoming_rows);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDgateComplete, incoming_rows);
 
   // dY and X remain in canonical row-major storage.  The dW WGMMA path below
   // consumes them directly as MN-major operands, so this point is now only a
@@ -5913,7 +5938,8 @@ local_p2p_backward_megakernel(
       a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_start_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDxStarted, dx_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDxStarted, dx_tasks);
   // Main-shape dX tasks have uniform K and a unique output tile owner. A
   // deterministic grid-stride assignment removes the global claim atomic
   // while retaining enough cross-expert parallelism to fill every SM.
@@ -5968,9 +5994,9 @@ local_p2p_backward_megakernel(
         reinterpret_cast<uint4 *>(
             dx_canonical + (row + local_row) * a.hidden +
             output_column)[0] = packed;
-        if (use_socket)
+        if (remote_backend_enabled<StaticLocal>(a.use_socket))
           continue;
-        if (use_gin &&
+        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
             header.source_rank / a.local_world_size != a.node)
           continue;
         auto *source_dx = peer_at<transport::BFloat16>(
@@ -6000,16 +6026,21 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_complete_clock = device_globaltimer_ns();
-  backward_publish_progress(a, kBackwardDxComplete, dx_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDxComplete, dx_tasks);
 
   // Every dX contribution and dGate scalar is now globally visible. Publish
   // the per-source completion before dW so peer acquire latency is hidden by
   // the independent weight-gradient work instead of extending the tail.
   const auto backward_first_local =
-      use_gin ? a.node * a.local_world_size : 0U;
+      remote_backend_enabled<StaticLocal>(a.use_gin)
+          ? a.node * a.local_world_size
+          : 0U;
   const auto backward_local_count =
-      use_gin ? a.local_world_size : a.world;
-  if (!use_socket && blockIdx.x == 0 &&
+      remote_backend_enabled<StaticLocal>(a.use_gin) ? a.local_world_size
+                                                      : a.world;
+  if (!remote_backend_enabled<StaticLocal>(a.use_socket) &&
+      blockIdx.x == 0 &&
       threadIdx.x < backward_local_count) {
     const auto peer = backward_first_local + threadIdx.x;
     auto *signal = peer_at<unsigned long long>(
@@ -6020,7 +6051,7 @@ local_p2p_backward_megakernel(
   }
 
 #if __has_include(<nccl_device.h>)
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     const auto first_local = a.node * a.local_world_size;
     const auto compute_epoch = a.epoch | (1ULL << 63U);
@@ -6130,7 +6161,8 @@ local_p2p_backward_megakernel(
     __threadfence_system();
     grid.sync();
   }
-  if (use_gin && blockIdx.x < a.gin_context_count) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x < a.gin_context_count) {
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
@@ -6276,7 +6308,7 @@ local_p2p_backward_megakernel(
     }
     __syncthreads();
   }
-  if (use_gin) {
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
     if (threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -6361,7 +6393,8 @@ local_p2p_backward_megakernel(
   // that expert's padded canonical-M segment in ascending order.
   // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
   // 128x128 accumulator tile directly into the parameter layout [H,I].
-  backward_publish_progress(a, kBackwardDw2Started, dw2_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw2Started, dw2_tasks);
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
@@ -6377,17 +6410,19 @@ local_p2p_backward_megakernel(
     const auto reduction_start = claims[expert];
     const auto reduction =
         (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+#if MEGAMOE_DEBUG_VALIDATE
     if (threadIdx.x == 0U) {
       const auto now = device_globaltimer_ns();
-#if MEGAMOE_DEBUG_VALIDATE
       if (atomicCAS(&dw_timeline[expert].dw2_first_start_clock, 0ULL, now) ==
           0ULL)
         atomicMin(&status->dw2_first_start_clock, now);
-#else
-      if (task_shared < gridDim.x)
-        atomicMin(&status->dw2_first_start_clock, now);
-#endif
     }
+#else
+    if constexpr (!StaticLocal) {
+      if (threadIdx.x == 0U && task_shared < gridDim.x)
+        atomicMin(&status->dw2_first_start_clock, device_globaltimer_ns());
+    }
+#endif
     float accum[BackwardDwDirectMma::kNumAccum];
     backward_wgmma_dw_mn_k_tile(
         dy_mn_map, u_transpose_map,
@@ -6441,12 +6476,13 @@ local_p2p_backward_megakernel(
 #endif
   }
 #if !MEGAMOE_DEBUG_VALIDATE
-  // Release timing needs only the true global completion boundary. One
-  // timestamp per CTA replaces the per-tile audit atomics retained in debug.
-  if (threadIdx.x == 0U)
-    atomicMax(&status->dw2_last_complete_clock, device_globaltimer_ns());
+  if constexpr (!StaticLocal) {
+    if (threadIdx.x == 0U)
+      atomicMax(&status->dw2_last_complete_clock, device_globaltimer_ns());
+  }
 #endif
-  backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
 
   // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
   // preceding general dW2 loop, the accumulator is lexically confined to the
@@ -6480,7 +6516,8 @@ local_p2p_backward_megakernel(
   if (threadIdx.x == 0U)
     task_shared = blockIdx.x;
   __syncthreads();
-  backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
   if (dw_warpgroup >= 2U) {
     cutlass::arch::warpgroup_reg_dealloc<48>();
     std::uint32_t dw_pipeline = 0U;
@@ -6545,17 +6582,19 @@ local_p2p_backward_megakernel(
       const auto ntile = task % dw1_ntiles;
       const auto reduction =
           (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+#if MEGAMOE_DEBUG_VALIDATE
       if (threadIdx.x == 0) {
         const auto now = device_globaltimer_ns();
-#if MEGAMOE_DEBUG_VALIDATE
         if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL, now) ==
             0ULL)
           atomicMin(&status->dw1_first_start_clock, now);
-#else
-        if (task_shared < gridDim.x)
-          atomicMin(&status->dw1_first_start_clock, now);
-#endif
       }
+#else
+      if constexpr (!StaticLocal) {
+        if (threadIdx.x == 0U && task_shared < gridDim.x)
+          atomicMin(&status->dw1_first_start_clock, device_globaltimer_ns());
+      }
+#endif
       float accum[BackwardDwMixedMma::kNumAccum];
 #pragma unroll
       for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
@@ -6646,7 +6685,8 @@ local_p2p_backward_megakernel(
         task_shared += gridDim.x;
     }
   }
-  backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
@@ -6669,14 +6709,15 @@ local_p2p_backward_megakernel(
     }
 #endif
   }
-  if (!use_socket) {
+  if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
     backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
                                 gridDim.x);
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0)
       status->dx_reduce_complete_clock = device_globaltimer_ns();
-    backward_publish_progress(a, kBackwardReduceComplete,
-                              a.dispatch.identity.num_tokens);
+    if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+      backward_publish_progress(a, kBackwardReduceComplete,
+                                a.dispatch.identity.num_tokens);
     backward_terminal_rendezvous<StaticLocal>(a);
   }
   grid.sync();
@@ -6746,7 +6787,8 @@ local_p2p_backward_megakernel(
                         dw2_reduction_iterations * 4ULL;
 #endif
     status->complete_clock = device_globaltimer_ns();
-    backward_publish_progress(a, kBackwardTerminal, a.epoch);
+    if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+      backward_publish_progress(a, kBackwardTerminal, a.epoch);
   }
 }
 
