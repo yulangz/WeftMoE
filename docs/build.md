@@ -67,12 +67,13 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking;
 - every public header as an isolated `-Werror` translation unit;
-- twenty-eight compile-negative probes for the retired `wait`, `wait_preflight`, raw
+- twenty-nine compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
   production coordinator constructor, generic route rebinding/wrong route
   dtype, raw dispatch views, removed generation handoff/reissue helpers, and
-  the internal no-wait producer-race seam.
+  the internal no-wait producer-race seam, and the non-installed runtime-shape
+  harness.
 
 The activation-specific additions reject wrong activation dtype, generic
 buffer rebinding, raw peer-pointer extraction, access to the private IPC

@@ -179,6 +179,13 @@ int main() {
       megamoe::transport::ActivationTransportBackend::LocalCudaP2p);
 }
 ''',
+    "internal_runtime_shape_harness": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  return megamoe::cuda::testing::run_runtime_shape_world1_harness(64, 32,
+                                                                   true);
+}
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)
