@@ -2959,6 +2959,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 api_after.event_destroys == api_before.event_destroys &&
                 api_after.device_synchronizes == api_before.device_synchronizes,
             "Backward steady path used a forbidden CUDA allocation/sync API");
+    const auto usage = transport_pool.usage();
     const auto emit = [](const auto &values) {
       for (std::size_t index = 0; index < values.size(); ++index) {
         if (index != 0) std::cout << ',';
@@ -2966,6 +2967,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       }
     };
     std::cout << "BACKWARD_BENCH rank=" << rank << " world=" << world
+              << " tokens=" << common_routes.num_tokens
+              << " experts=" << experts << " top_k=" << top_k
+              << " hidden=" << hidden << " intermediate=" << intermediate
               << " backend="
               << (gin_backward_benchmark ? "gin-rdma" : "local-cuda-p2p")
               << " warmup=10 measured=" << wall.size()
@@ -2976,6 +2980,34 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " wgmma=" << last_audit.wgmma_instructions
               << " tma=" << last_audit.tma_loads
               << " workspace=" << last_audit.workspace_bytes
+              << " compute_pool_bytes=" << usage.compute_device_bytes
+              << " gin_registered_bytes=" << usage.gin_registered_bytes
+              << " pinned_pool_bytes=" << usage.pinned_bytes
+              << " pool_events=" << usage.event_count
+              << " forward_dispatch_peer_bytes="
+              << last_forward_audit.actual_dispatch_peer_bytes
+              << " forward_return_peer_bytes="
+              << last_forward_audit.actual_return_peer_bytes
+              << " forward_gin_dispatch_puts="
+              << last_forward_audit.gin_dispatch_put_count
+              << " forward_gin_return_puts="
+              << last_forward_audit.gin_return_put_count
+              << " forward_gin_signals="
+              << last_forward_audit.gin_signal_count
+              << " forward_gin_metadata_bytes="
+              << last_forward_audit.gin_metadata_bytes
+              << " backward_dy_peer_bytes="
+              << last_audit.actual_dy_peer_bytes
+              << " backward_dx_peer_bytes="
+              << last_audit.actual_dx_peer_bytes
+              << " backward_gin_dispatch_puts="
+              << last_audit.gin_dispatch_put_count
+              << " backward_gin_return_puts="
+              << last_audit.gin_return_put_count
+              << " backward_gin_signals="
+              << last_audit.gin_signal_count
+              << " backward_gin_metadata_bytes="
+              << last_audit.gin_metadata_bytes
               << " one_time_setup=" << one_time_setup_us
               << " activation_hash=" << activation_hash
               << " output_gradient_hash=" << output_gradient_hash
@@ -3462,12 +3494,20 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     }
     const auto usage = transport_pool.usage();
     std::cout << "FORWARD_BENCH rank=" << rank
+              << " world=" << world
+              << " tokens=" << common_routes.num_tokens
+              << " experts=" << experts << " top_k=" << top_k
+              << " hidden=" << hidden << " intermediate=" << intermediate
               << " backend="
               << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
               << " specialization=sm90-wgmma-tma-7168x3072"
               << " cache_mode=" << (benchmark_cache ? "cache" : "no-cache")
               << " setup_us=" << one_time_setup_us
               << " device_pool_bytes=" << usage.device_bytes
+              << " compute_pool_bytes=" << usage.compute_device_bytes
+              << " gin_registered_bytes=" << usage.gin_registered_bytes
+              << " pinned_pool_bytes=" << usage.pinned_bytes
+              << " pool_events=" << usage.event_count
               << " weight_bytes=" << weights.device_bytes()
               << " persistent_launches="
               << last_audit.persistent_kernel_launches
@@ -3478,6 +3518,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << last_audit.actual_dispatch_peer_bytes
               << " return_peer_bytes="
               << last_audit.actual_return_peer_bytes
+              << " gin_dispatch_puts="
+              << last_audit.gin_dispatch_put_count
+              << " gin_return_puts=" << last_audit.gin_return_put_count
+              << " gin_signals=" << last_audit.gin_signal_count
+              << " gin_metadata_bytes=" << last_audit.gin_metadata_bytes
               << " activation_hash=" << activation_hash
               << " route_hash=" << route_hash
               << " gate_hash=" << gate_hash

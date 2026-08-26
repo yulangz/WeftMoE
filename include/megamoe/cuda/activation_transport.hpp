@@ -154,6 +154,10 @@ struct ActivationTransportDeviceAudit {
   // counters include every destination-GPU fan-out and exclude local writes.
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t gin_dispatch_put_count = 0;
+  std::uint64_t gin_return_put_count = 0;
+  std::uint64_t gin_signal_count = 0;
+  std::uint64_t gin_metadata_bytes = 0;
   // Shape-derived retained-storage/semantic traffic sizes. Unlike the peer
   // counters above, these are not incremented by the device data plane.
   std::uint64_t derived_route_input_bytes = 0;
@@ -380,6 +384,10 @@ struct ForwardMegaKernelAudit {
   std::uint64_t fc2_tasks = 0;
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t gin_dispatch_put_count = 0;
+  std::uint64_t gin_return_put_count = 0;
+  std::uint64_t gin_signal_count = 0;
+  std::uint64_t gin_metadata_bytes = 0;
   std::uint64_t hot_path_allocations = 0;
   std::uint64_t activation_d2h_bytes = 0;
   std::uint64_t activation_h2d_bytes = 0;
@@ -558,6 +566,10 @@ struct BackwardMegaKernelAudit {
   std::uint64_t dw2_tasks = 0;
   std::uint64_t actual_dy_peer_bytes = 0;
   std::uint64_t actual_dx_peer_bytes = 0;
+  std::uint64_t gin_dispatch_put_count = 0;
+  std::uint64_t gin_return_put_count = 0;
+  std::uint64_t gin_signal_count = 0;
+  std::uint64_t gin_metadata_bytes = 0;
   std::uint64_t hot_path_allocations = 0;
   std::uint64_t workspace_bytes = 0;
   bool recomputed_fc1 = false;

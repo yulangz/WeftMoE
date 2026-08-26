@@ -199,6 +199,10 @@ struct TransportDeviceStatus {
   unsigned long long deduplicated_cross_node_payload_bytes;
   unsigned long long actual_dispatch_peer_bytes;
   unsigned long long actual_return_peer_bytes;
+  unsigned long long gin_dispatch_put_count;
+  unsigned long long gin_return_put_count;
+  unsigned long long gin_signal_count;
+  unsigned long long gin_metadata_bytes;
   unsigned long long start_clock;
   unsigned long long dispatch_complete_clock;
   unsigned long long complete_clock;
@@ -267,6 +271,10 @@ struct BackwardDeviceStatus {
   unsigned long long tma_loads;
   unsigned long long actual_dy_peer_bytes;
   unsigned long long actual_dx_peer_bytes;
+  unsigned long long gin_dispatch_put_count;
+  unsigned long long gin_return_put_count;
+  unsigned long long gin_signal_count;
+  unsigned long long gin_metadata_bytes;
   unsigned int error;
   unsigned int error_field;
 };
@@ -3268,6 +3276,12 @@ local_p2p_forward_megakernel(
               ncclGin_SignalInc{0}, ncclGin_CounterInc{0}, ncclCoopThread{},
               ncclGin_None{}, ::cuda::thread_scope_block,
               ::cuda::thread_scope_device);
+      atomicAdd(&status->gin_dispatch_put_count, 3ULL);
+      atomicAdd(&status->gin_signal_count, 1ULL);
+      atomicAdd(&status->gin_metadata_bytes,
+                packet_count * sizeof(LocalP2pRouteHeader) +
+                    (last_fanout - first_fanout) *
+                        sizeof(DeviceFanoutRecord));
       gin.waitCounter(ncclCoopThread{}, 0, 1);
     }
     if (threadIdx.x == 0U)
@@ -3922,6 +3936,8 @@ local_p2p_forward_megakernel(
                   ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
                   ncclCoopThread{}, ncclGin_None{},
                   ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+          atomicAdd(&status->gin_return_put_count, 1ULL);
+          atomicAdd(&status->gin_signal_count, 1ULL);
           ++return_puts;
         }
         __syncthreads();
@@ -4964,6 +4980,12 @@ local_p2p_backward_megakernel(
                 ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
                 ncclCoopThread{}, ncclGin_None{},
                 ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        atomicAdd(&status->gin_dispatch_put_count, 4ULL);
+        atomicAdd(&status->gin_signal_count, 1ULL);
+        atomicAdd(&status->gin_metadata_bytes,
+                  packet_count * sizeof(LocalP2pRouteHeader) +
+                      (last_fanout - first_fanout) *
+                          (sizeof(DeviceFanoutRecord) + sizeof(float)));
         gin.waitCounter(ncclCoopThread{}, 0, 1);
     }
     if (threadIdx.x == 0U)
@@ -5722,6 +5744,10 @@ local_p2p_backward_megakernel(
                   ncclGin_SignalInc{1},
                   ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
                   ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+          atomicAdd(&status->gin_return_put_count, 2ULL);
+          atomicAdd(&status->gin_signal_count, 1ULL);
+          atomicAdd(&status->gin_metadata_bytes,
+                    (last_return - first_return) * sizeof(float));
           ++return_packets;
       }
       __syncthreads();
@@ -10138,6 +10164,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       slot.host_forward_status->actual_dispatch_peer_bytes;
   result->audit.actual_return_peer_bytes =
       slot.host_forward_status->actual_return_peer_bytes;
+  result->audit.gin_dispatch_put_count =
+      slot.host_forward_status->gin_dispatch_put_count;
+  result->audit.gin_return_put_count =
+      slot.host_forward_status->gin_return_put_count;
+  result->audit.gin_signal_count =
+      slot.host_forward_status->gin_signal_count;
+  result->audit.gin_metadata_bytes =
+      slot.host_forward_status->gin_metadata_bytes;
   result->audit.workspace_bytes = state->layout.total;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
   const auto &status = *slot.host_forward_status;
@@ -10818,6 +10852,13 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         forward_status.actual_dispatch_peer_bytes;
     forward_result.audit.actual_return_peer_bytes =
         forward_status.actual_return_peer_bytes;
+    forward_result.audit.gin_dispatch_put_count =
+        forward_status.gin_dispatch_put_count;
+    forward_result.audit.gin_return_put_count =
+        forward_status.gin_return_put_count;
+    forward_result.audit.gin_signal_count = forward_status.gin_signal_count;
+    forward_result.audit.gin_metadata_bytes =
+        forward_status.gin_metadata_bytes;
     forward_result.timings.total_us =
         static_cast<double>(forward_total_ms) * 1000.0;
     const auto forward_elapsed = [](std::uint64_t begin,
@@ -10905,6 +10946,10 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->audit.dw2_tasks = status.dw2_tasks;
   result->audit.actual_dy_peer_bytes = status.actual_dy_peer_bytes;
   result->audit.actual_dx_peer_bytes = status.actual_dx_peer_bytes;
+  result->audit.gin_dispatch_put_count = status.gin_dispatch_put_count;
+  result->audit.gin_return_put_count = status.gin_return_put_count;
+  result->audit.gin_signal_count = status.gin_signal_count;
+  result->audit.gin_metadata_bytes = status.gin_metadata_bytes;
   result->audit.workspace_bytes = state->layout.total;
   result->audit.recomputed_fc1 = !args.use_forward_cache;
   result->audit.weight_gradient_dtype = config.weight_gradient_dtype;

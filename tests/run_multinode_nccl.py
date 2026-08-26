@@ -9,6 +9,7 @@ import re
 import secrets
 import select
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -35,6 +36,200 @@ class RankOutput:
     returncode: int
     stdout: str
     stderr: str
+
+
+def parse_fields(stdout, marker):
+    line = next((line for line in stdout.splitlines()
+                 if line.startswith(marker)), None)
+    if line is None:
+        raise RuntimeError(f"rank output has no {marker.strip()}")
+    fields = {}
+    for item in line[len(marker):].split(" "):
+        key, value = item.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def sample_stats(values):
+    if not values:
+        raise RuntimeError("benchmark contains no measured samples")
+    ordered = sorted(values)
+
+    def percentile(fraction):
+        ordinal = max(1, int(len(ordered) * fraction + 0.999999))
+        return ordered[ordinal - 1]
+
+    return {
+        "mean": statistics.fmean(values),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "min": ordered[0],
+        "max": ordered[-1],
+    }
+
+
+def aggregate_gin_benchmark(outputs, scenario):
+    forward = scenario == "gin_forward_bench"
+    marker = "FORWARD_BENCH " if forward else "BACKWARD_BENCH "
+    records = [parse_fields(item.stdout, marker) for item in outputs]
+    stage_keys = (("wall", "notify", "forward", "dispatch", "fc1", "fc2",
+                   "return", "reduce", "fc1_fc2_overlap",
+                   "fc2_return_overlap", "return_reduce_overlap") if forward
+                  else
+                  ("notify_inclusive_training_step_wall",
+                   "post_notify_training_step_wall", "notify_wall",
+                   "forward_wall", "backward_wall", "dy_dispatch", "dv",
+                   "dgate", "transpose", "dx", "dw1", "dw2",
+                   "dw1_ready_wait", "dw2_ready_wait",
+                   "dw1_max_expert_wait", "dw2_max_expert_wait",
+                   "dw1_tail", "dw2_tail", "dw1_overlap_dv_dx",
+                   "dw2_overlap_dv_dx", "reduce", "forward_call_host",
+                   "dy_ready_host", "backward_call_host",
+                   "integration_overhead", "handoff", "backward_setup_host",
+                   "forward_consumer_drain", "final_drain",
+                   "notify_pool_acquire", "notify_local_histogram_wall",
+                   "notify_local_mapping_device",
+                   "notify_collective_enqueue", "notify_collective_wait",
+                   "notify_materialization", "notify_publish"))
+    measured = None
+    for rank, record in enumerate(records):
+        if record.get("backend") != "gin-rdma":
+            raise RuntimeError(
+                f"rank={rank} benchmark did not run GinRdma backend")
+        for key in stage_keys:
+            samples = [float(value) for value in record[key].split(",")]
+            record[key] = samples
+            if measured is None:
+                measured = len(samples)
+            elif len(samples) != measured:
+                raise RuntimeError(
+                    f"rank={rank} stage={key} sample count={len(samples)} "
+                    f"expected={measured}")
+    summary = {}
+    for key in stage_keys:
+        slowest = [max(record[key][iteration] for record in records)
+                   for iteration in range(measured)]
+        summary[key + "_slowest_rank_us"] = sample_stats(slowest)
+    result = {
+        "schema": 1,
+        "benchmark": ("multinode-gin-forward-main-shape" if forward else
+                      "multinode-gin-forward-backward-main-shape"),
+        "backend": "gin-rdma-device-persistent",
+        "world": len(records),
+        "warmup": int(records[0].get("warmup", "10")),
+        "measured": measured,
+        "shape": {
+            "tokens_per_rank": int(records[0]["tokens"]),
+            "hidden": int(records[0]["hidden"]),
+            "intermediate": int(records[0]["intermediate"]),
+            "experts": int(records[0]["experts"]),
+            "top_k": int(records[0]["top_k"]),
+        },
+        "per_rank_activation_hash": [int(item["activation_hash"])
+                                     for item in records],
+        "per_rank_route_hash": [int(item["route_hash"])
+                                for item in records],
+        "per_rank_gate_hash": [int(item["gate_hash"])
+                               for item in records],
+        "per_rank_actual_w1_device_hash": [
+            [int(item["actual_w1_hash_low"]),
+             int(item["actual_w1_hash_high"])] for item in records],
+        "per_rank_actual_w2_device_hash": [
+            [int(item["actual_w2_hash_low"]),
+             int(item["actual_w2_hash_high"])] for item in records],
+        **summary,
+    }
+    if forward:
+        result.update({
+            "per_rank_device_pool_bytes": [int(item["device_pool_bytes"])
+                                           for item in records],
+            "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
+                                            for item in records],
+            "per_rank_gin_registered_bytes": [
+                int(item["gin_registered_bytes"]) for item in records],
+            "per_rank_pinned_pool_bytes": [int(item["pinned_pool_bytes"])
+                                           for item in records],
+            "per_rank_pool_events": [int(item["pool_events"])
+                                     for item in records],
+            "per_rank_weight_bytes": [int(item["weight_bytes"])
+                                      for item in records],
+            "per_rank_dispatch_peer_bytes": [
+                int(item["dispatch_peer_bytes"]) for item in records],
+            "per_rank_return_peer_bytes": [
+                int(item["return_peer_bytes"]) for item in records],
+            "per_rank_gin_dispatch_puts": [int(item["gin_dispatch_puts"])
+                                           for item in records],
+            "per_rank_gin_return_puts": [int(item["gin_return_puts"])
+                                         for item in records],
+            "per_rank_gin_signals": [int(item["gin_signals"])
+                                     for item in records],
+            "per_rank_gin_metadata_bytes": [
+                int(item["gin_metadata_bytes"]) for item in records],
+            "per_rank_output_hash": [int(item["output_hash"])
+                                     for item in records],
+        })
+    else:
+        result.update({
+            "per_rank_workspace_bytes": [int(item["workspace"])
+                                         for item in records],
+            "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
+                                            for item in records],
+            "per_rank_gin_registered_bytes": [
+                int(item["gin_registered_bytes"]) for item in records],
+            "per_rank_pinned_pool_bytes": [int(item["pinned_pool_bytes"])
+                                           for item in records],
+            "per_rank_pool_events": [int(item["pool_events"])
+                                     for item in records],
+            "per_rank_forward_dispatch_peer_bytes": [
+                int(item["forward_dispatch_peer_bytes"])
+                for item in records],
+            "per_rank_forward_return_peer_bytes": [
+                int(item["forward_return_peer_bytes"]) for item in records],
+            "per_rank_forward_gin_dispatch_puts": [
+                int(item["forward_gin_dispatch_puts"]) for item in records],
+            "per_rank_forward_gin_return_puts": [
+                int(item["forward_gin_return_puts"]) for item in records],
+            "per_rank_forward_gin_signals": [
+                int(item["forward_gin_signals"]) for item in records],
+            "per_rank_forward_gin_metadata_bytes": [
+                int(item["forward_gin_metadata_bytes"]) for item in records],
+            "per_rank_backward_dy_peer_bytes": [
+                int(item["backward_dy_peer_bytes"]) for item in records],
+            "per_rank_backward_dx_peer_bytes": [
+                int(item["backward_dx_peer_bytes"]) for item in records],
+            "per_rank_backward_gin_dispatch_puts": [
+                int(item["backward_gin_dispatch_puts"])
+                for item in records],
+            "per_rank_backward_gin_return_puts": [
+                int(item["backward_gin_return_puts"]) for item in records],
+            "per_rank_backward_gin_signals": [
+                int(item["backward_gin_signals"]) for item in records],
+            "per_rank_backward_gin_metadata_bytes": [
+                int(item["backward_gin_metadata_bytes"])
+                for item in records],
+            "per_rank_output_gradient_hash": [
+                int(item["output_gradient_hash"]) for item in records],
+            "per_rank_actual_dx_device_hash": [
+                [int(item["actual_dx_hash_low"]),
+                 int(item["actual_dx_hash_high"])] for item in records],
+            "per_rank_actual_dw1_device_hash": [
+                [int(item["actual_dw1_hash_low"]),
+                 int(item["actual_dw1_hash_high"])] for item in records],
+            "per_rank_actual_dw2_device_hash": [
+                [int(item["actual_dw2_hash_low"]),
+                 int(item["actual_dw2_hash_high"])] for item in records],
+            "per_rank_actual_dgate_device_hash": [
+                [int(item["actual_dgate_hash_low"]),
+                 int(item["actual_dgate_hash_high"])] for item in records],
+            "per_rank_notify_collective_audit": [{
+                "fused": int(item["notify_fused_enqueues"]),
+                "control": int(item["notify_control_enqueues"]),
+                "config": int(item["notify_config_enqueues"]),
+                "count": int(item["notify_count_enqueues"]),
+                "summary": int(item["notify_summary_enqueues"]),
+            } for item in records],
+        })
+    return result
 
 
 def scrub_output(value, bootstrap=None):
@@ -594,6 +789,9 @@ def main(argv=None):
             raise RuntimeError("distributed GIN benchmark failed:\n" +
                                "\n".join(failures))
         print("\n".join(evidence))
+        print("GIN_BENCH_JSON " + json.dumps(
+            aggregate_gin_benchmark(outputs, args.scenario),
+            sort_keys=True))
         print(f"[PASS] same-rail GIN benchmark world={world}")
         return
 
