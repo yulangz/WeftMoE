@@ -224,7 +224,31 @@ struct TransportDeviceStatus {
   unsigned int error;
   unsigned int error_packet;
   unsigned int error_field;
-  unsigned int reserved;
+  unsigned int error_origin_rank;
+  unsigned int error_code;
+  unsigned long long error_expected;
+  unsigned long long error_actual;
+};
+
+// Fixed, pointer-free record shared by the Forward and Backward production
+// terminal protocol.  `epoch` is published last with system release ordering.
+// The host wire exchange serializes these eight uint64 words verbatim through
+// NCCL's typed uint64 AllGather; no native struct bytes cross the wire.
+struct ProductionStatusRecord {
+  unsigned long long generation;
+  unsigned long long phase;
+  unsigned long long origin_rank;
+  unsigned long long error_code;
+  unsigned long long field;
+  unsigned long long expected;
+  unsigned long long actual;
+  unsigned long long epoch;
+};
+static_assert(sizeof(ProductionStatusRecord) == 8U * sizeof(std::uint64_t));
+
+enum class ProductionStatusPhase : std::uint64_t {
+  Forward = 1,
+  Backward = 2,
 };
 
 struct LocalP2pRouteHeader {
@@ -282,6 +306,10 @@ struct BackwardDeviceStatus {
   unsigned long long padded_reduction_rows;
   unsigned int error;
   unsigned int error_field;
+  unsigned int error_origin_rank;
+  unsigned int error_code;
+  unsigned long long error_expected;
+  unsigned long long error_actual;
 };
 
 struct BackwardExpertDwTimeline {
@@ -347,6 +375,8 @@ struct Layout {
   std::size_t p2p_barrier_receive = 0;
   std::size_t gin_local_compute_ready = 0;
   std::size_t terminal_epoch = 0;
+  std::size_t production_error_records = 0;
+  std::size_t production_status_matrix = 0;
   std::size_t packet_claim = 0;
   std::size_t canonical_rows = 0;
   std::size_t contribution = 0;
@@ -402,6 +432,7 @@ struct GinWindowLayout {
   std::size_t return_gate_staging = 0;
   std::size_t return_gate_receive = 0;
   std::size_t barrier = 0;
+  std::size_t production_error_records = 0;
   std::size_t total = 0;
 };
 
@@ -467,6 +498,9 @@ GinWindowLayout make_gin_window_layout(
   layout.return_gate_receive = append(cursor, routes, sizeof(float),
                                       "GIN return gate receive");
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
+  layout.production_error_records = append(
+      cursor, config.max_world_size, sizeof(ProductionStatusRecord),
+      "GIN production error records");
   layout.total = cursor;
   return layout;
 }
@@ -543,6 +577,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   layout.terminal_epoch = append(cursor, config.max_world_size,
                                  sizeof(std::uint64_t),
                                  "P2P terminal generation epoch");
+  layout.production_error_records = append(
+      cursor, config.max_world_size, sizeof(ProductionStatusRecord),
+      "peer-visible production error records");
+  layout.production_status_matrix = append(
+      cursor, checked_mul(config.max_world_size, 8ULL,
+                          "production terminal status words"),
+      sizeof(std::uint64_t), "production terminal status matrix");
   layout.packet_claim = append(cursor, routes, sizeof(std::uint32_t),
                                "packet claim bitmap");
   layout.canonical_rows = append(
@@ -709,6 +750,7 @@ struct PoolSlot {
   void *gin_window = nullptr;
   TransportDeviceStatus *host_status = nullptr;
   TransportDeviceStatus *host_forward_status = nullptr;
+  ProductionStatusRecord *host_production_status = nullptr;
   std::uint64_t *host_backward_progress = nullptr;
   std::uint64_t *device_backward_progress = nullptr;
   std::size_t backward_progress_words = 0;
@@ -809,6 +851,10 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
       if (slot.host_forward_status)
         (void)cudaFreeHost(slot.host_forward_status);
+      if (slot.host_production_status)
+        internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
+      if (slot.host_production_status)
+        (void)cudaFreeHost(slot.host_production_status);
       if (slot.host_backward_progress)
         internal::record_cuda_api(internal::CudaApiAuditKind::PinnedFree);
       if (slot.host_backward_progress)
@@ -920,6 +966,21 @@ __device__ unsigned long long device_globaltimer_ns() {
   unsigned long long value = 0;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
   return value;
+}
+
+template <typename Status>
+__device__ void publish_local_structured_error(
+    Status *status, std::uint32_t rank, std::uint32_t field,
+    std::uint32_t code, unsigned long long expected,
+    unsigned long long actual) {
+  if (atomicCAS(&status->error, 0U, 1U) != 0U)
+    return;
+  status->error_origin_rank = rank;
+  status->error_field = field;
+  status->error_code = code;
+  status->error_expected = expected;
+  status->error_actual = actual;
+  __threadfence_system();
 }
 
 __device__ transport::BFloat16 synthetic_value(
@@ -1241,7 +1302,7 @@ __global__ void socket_relay_synthetic_kernel(
     transport::BFloat16 *canonical_rows, std::uint64_t incoming,
     std::uint64_t hidden, std::uint64_t generation,
     std::uint32_t destination_rank, std::uint64_t max_rows,
-    bool identity_expert, unsigned int *error) {
+    bool identity_expert, TransportDeviceStatus *status) {
   const auto incoming_index = static_cast<std::uint64_t>(blockIdx.x);
   if (incoming_index >= incoming)
     return;
@@ -1253,7 +1314,8 @@ __global__ void socket_relay_synthetic_kernel(
       header.dst_row < max_rows;
   if (!valid) {
     if (threadIdx.x == 0)
-      atomicExch(error, 1U);
+      publish_local_structured_error(status, destination_rank, 40U, 1U,
+                                     max_rows, header.dst_row);
     return;
   }
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
@@ -1269,7 +1331,7 @@ __global__ void socket_install_forward_headers_kernel(
     LocalP2pRouteHeader *canonical_headers, std::uint64_t incoming,
     std::uint64_t generation, std::uint64_t epoch,
     std::uint32_t destination_rank, std::uint64_t max_rows,
-    unsigned int *error) {
+    TransportDeviceStatus *status) {
   const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                      threadIdx.x;
   if (index >= incoming)
@@ -1279,7 +1341,8 @@ __global__ void socket_install_forward_headers_kernel(
       header.generation != generation ||
       header.destination_rank != destination_rank ||
       header.dst_row >= max_rows) {
-    atomicExch(error, 1U);
+    publish_local_structured_error(status, destination_rank, 41U, 1U,
+                                   max_rows, header.dst_row);
     return;
   }
   header.source_epoch = epoch;
@@ -1315,7 +1378,7 @@ __global__ void socket_relay_backward_inputs_kernel(
     LocalP2pRouteHeader *canonical_headers, std::uint64_t incoming,
     std::uint64_t hidden, std::uint64_t generation, std::uint64_t epoch,
     std::uint32_t destination_rank, std::uint64_t max_rows,
-    unsigned int *error) {
+    BackwardDeviceStatus *status) {
   const auto packed = static_cast<std::uint64_t>(blockIdx.x);
   if (packed >= incoming)
     return;
@@ -1325,7 +1388,8 @@ __global__ void socket_relay_backward_inputs_kernel(
       header.destination_rank != destination_rank ||
       header.dst_row >= max_rows) {
     if (threadIdx.x == 0)
-      atomicExch(error, 1U);
+      publish_local_structured_error(status, destination_rank, 241U, 1U,
+                                     max_rows, header.dst_row);
     return;
   }
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
@@ -1507,6 +1571,7 @@ __global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm,
     const ncclGin gin(dev_comm, blockIdx.x);
     gin.resetSignal(0);
     gin.resetSignal(1);
+    gin.resetSignal(2);
     gin.resetCounter(0);
   }
 }
@@ -1864,6 +1929,152 @@ __global__ void validate_p2p_barrier_kernel(
 template <typename T>
 __device__ T *peer_at(void *base, std::size_t offset) {
   return reinterpret_cast<T *>(static_cast<unsigned char *>(base) + offset);
+}
+
+template <typename Args, typename Status>
+__device__ void publish_production_terminal_status(
+    const Args &a, Status *status, ProductionStatusPhase phase,
+    std::size_t ordinary_record_offset,
+    std::size_t gin_record_offset) {
+  if (blockIdx.x != 0U)
+    return;
+  const auto local_world = a.local_world_size == 0U ? a.world
+                                                     : a.local_world_size;
+  const auto node = a.local_world_size == 0U ? 0U : a.node;
+  const auto first_local = node * local_world;
+  // Legacy cancellation and debug checks may have claimed the status word
+  // before structured fields were written. Normalize that already-owned local
+  // failure at the single production boundary so it cannot be mistaken for a
+  // successful record by the host agreement.
+  if (threadIdx.x == 0U && status->error != 0U && status->error_code == 0U) {
+    status->error_origin_rank = a.rank;
+    status->error_code = status->error;
+    status->error_expected = 0ULL;
+    status->error_actual = status->error;
+    __threadfence_system();
+  }
+  __syncthreads();
+  const ProductionStatusRecord local{
+      a.dispatch.identity.generation,
+      static_cast<unsigned long long>(phase),
+      a.rank,
+      status->error == 0U ? 0ULL
+                          : static_cast<unsigned long long>(status->error_code),
+      status->error == 0U ? 0ULL
+                          : static_cast<unsigned long long>(status->error_field),
+      status->error_expected,
+      status->error_actual,
+      a.epoch};
+
+  // The Socket fallback deliberately has no CUDA-IPC/Gin peer window. Publish
+  // into owner-local storage and let the mandatory production NCCL status
+  // agreement carry the same record after the host-enqueued payload drain.
+  if (a.use_socket) {
+    if (threadIdx.x == 0U) {
+      auto *records = peer_at<ProductionStatusRecord>(
+          a.local_base, ordinary_record_offset);
+      auto record = local;
+      record.epoch = 0ULL;
+      records[a.rank] = record;
+      __threadfence_system();
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          published(records[a.rank].epoch);
+      published.store(a.epoch, ::cuda::memory_order_release);
+    }
+    return;
+  }
+
+  // Publish this rail's local record to every node-local peer. No record is
+  // consumed until its epoch is observed with acquire ordering.
+  for (std::uint32_t local_peer = threadIdx.x; local_peer < local_world;
+       local_peer += blockDim.x) {
+    const auto peer = first_local + local_peer;
+    auto *records = peer_at<ProductionStatusRecord>(
+        a.peer_bases[peer], ordinary_record_offset);
+    auto record = local;
+    record.epoch = 0ULL;
+    records[a.rank] = record;
+    __threadfence_system();
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        published(records[a.rank].epoch);
+    published.store(a.epoch, ::cuda::memory_order_release);
+  }
+  __syncthreads();
+
+#if __has_include(<nccl_device.h>)
+  if (a.use_gin) {
+    auto *gin_records = reinterpret_cast<ProductionStatusRecord *>(
+        static_cast<std::byte *>(a.gin_window_base) + gin_record_offset);
+    if (threadIdx.x == 0U) {
+      auto record = local;
+      record.epoch = 0ULL;
+      gin_records[a.rank] = record;
+      __threadfence_system();
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          published(gin_records[a.rank].epoch);
+      published.store(a.epoch, ::cuda::memory_order_release);
+      const ncclGin gin(a.gin_dev_comm, 0);
+      const auto rail = ncclTeamRail(a.gin_dev_comm);
+      for (std::uint32_t remote_node = 0;
+           remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+        if (remote_node == node)
+          continue;
+        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                gin_record_offset +
+                    static_cast<std::size_t>(a.rank) * sizeof(local),
+                a.gin_window,
+                gin_record_offset +
+                    static_cast<std::size_t>(a.rank) * sizeof(local),
+                sizeof(local), ncclGin_SignalInc{2}, ncclGin_CounterInc{0},
+                ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+      }
+      gin.waitSignal(ncclCoopThread{}, 2,
+                     a.dispatch.identity.num_nodes - 1U);
+    }
+    __syncthreads();
+    // Each same-rail proxy receives the record for its corresponding remote
+    // rank, then fans it out through already-owned node-local IPC mappings.
+    const auto local_rank = a.rank - first_local;
+    for (std::uint32_t remote_node = 0;
+         remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+      if (remote_node == node)
+        continue;
+      const auto source = remote_node * local_world + local_rank;
+      const auto remote = gin_records[source];
+      for (std::uint32_t local_peer = threadIdx.x; local_peer < local_world;
+           local_peer += blockDim.x) {
+        const auto peer = first_local + local_peer;
+        auto *records = peer_at<ProductionStatusRecord>(
+            a.peer_bases[peer], ordinary_record_offset);
+        auto record = remote;
+        record.epoch = 0ULL;
+        records[source] = record;
+        __threadfence_system();
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            published(records[source].epoch);
+        published.store(a.epoch, ::cuda::memory_order_release);
+      }
+    }
+    __syncthreads();
+  }
+#else
+  (void)gin_record_offset;
+#endif
+
+  auto *observed_records = peer_at<ProductionStatusRecord>(
+      a.local_base, ordinary_record_offset);
+  const auto observed_world = a.world;
+  const auto observed_first = 0U;
+  for (std::uint32_t offset = threadIdx.x; offset < observed_world;
+       offset += blockDim.x) {
+    const auto source = observed_first + offset;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        observed(observed_records[source].epoch);
+    while (observed.load(::cuda::memory_order_acquire) < a.epoch) {
+    }
+  }
+  __syncthreads();
 }
 
 // The storage is owned by the local rank: ingress_published is written by
@@ -2790,6 +3001,7 @@ struct ForwardKernelArgs {
   std::size_t gin_receive_payload_offset = 0;
   std::size_t gin_return_staging_offset = 0;
   std::size_t gin_return_receive_offset = 0;
+  std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
   std::uint32_t gin_context_count = 1;
@@ -2812,7 +3024,9 @@ struct ForwardKernelArgs {
   std::size_t forward_scheduler_offset;
   std::size_t gin_local_compute_ready_offset;
   std::size_t terminal_epoch_offset;
+  std::size_t production_error_records_offset;
   const unsigned long long *cancel_epoch;
+  int injected_status_error_rank = -1;
 #if MEGAMOE_DEBUG_VALIDATE
   unsigned long long *progress;
 #endif
@@ -4208,11 +4422,19 @@ local_p2p_forward_megakernel(
 #endif
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status->error = 1U;
-    status->error_field = 90U;
+    publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
   }
 #endif
   if (a.use_socket) {
+    grid.sync();
+    if (blockIdx.x == 0 && threadIdx.x == 0 &&
+        a.injected_status_error_rank == static_cast<int>(a.rank))
+      publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
+    grid.sync();
+    publish_production_terminal_status(
+        a, status, ProductionStatusPhase::Forward,
+        a.production_error_records_offset,
+        a.gin_production_error_records_offset);
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -4315,6 +4537,15 @@ local_p2p_forward_megakernel(
   grid.sync();
   forward_publish_progress(a, kForwardReduceComplete,
                            a.dispatch.identity.num_tokens);
+  if (blockIdx.x == 0 && threadIdx.x == 0 &&
+      a.injected_status_error_rank == static_cast<int>(a.rank))
+    publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
+  grid.sync();
+  publish_production_terminal_status(
+      a, status, ProductionStatusPhase::Forward,
+      a.production_error_records_offset,
+      a.gin_production_error_records_offset);
+  grid.sync();
   // Every local return CTA has fenced before publishing its destination
   // signal, and every local Reduce warp acquired all of its destination
   // signals before reaching this grid completion.  Consequently no peer can
@@ -4369,6 +4600,7 @@ struct BackwardKernelArgs {
   std::size_t gin_return_receive_offset = 0;
   std::size_t gin_return_gate_staging_offset = 0;
   std::size_t gin_return_gate_receive_offset = 0;
+  std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
   std::uint32_t gin_context_count = 1;
@@ -4400,11 +4632,13 @@ struct BackwardKernelArgs {
   std::size_t outgoing_signal_offset;
   std::size_t gin_local_compute_ready_offset;
   std::size_t terminal_epoch_offset;
+  std::size_t production_error_records_offset;
   std::size_t status_offset;
   const unsigned long long *cancel_epoch;
   unsigned long long *progress;
   std::uint32_t progress_experts;
   bool use_forward_cache;
+  int injected_status_error_rank = -1;
 #if MEGAMOE_DEBUG_VALIDATE
   std::size_t debug_dv_offset;
   std::size_t debug_coverage_offset;
@@ -6517,11 +6751,20 @@ local_p2p_backward_megakernel(
 
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status->error = 1U;
-    status->error_field = 90U;
+    publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
   }
   grid.sync();
 #endif
+
+  if (blockIdx.x == 0 && threadIdx.x == 0 &&
+      a.injected_status_error_rank == static_cast<int>(a.rank))
+    publish_local_structured_error(status, a.rank, 220U, 1U, 0ULL, 1ULL);
+  grid.sync();
+  publish_production_terminal_status(
+      a, status, ProductionStatusPhase::Backward,
+      a.production_error_records_offset,
+      a.gin_production_error_records_offset);
+  grid.sync();
 
   if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -6689,6 +6932,146 @@ struct GinBackendState : ActivationMegaKernelBackendState {
 struct GinRdmaActivationTransport::Impl {
   std::shared_ptr<GinBackendState> backend;
 };
+
+namespace {
+
+struct ProductionStatusAgreementResult {
+  bool has_error = false;
+  ProductionStatusRecord error{};
+  double elapsed_us = 0.0;
+};
+
+template <typename Status>
+ProductionStatusAgreementResult agree_production_terminal_status(
+    const std::shared_ptr<ActivationMegaKernelBackendState> &backend,
+    PoolSlot &slot, ProductionStatusPhase phase, std::uint64_t generation,
+    std::uint64_t epoch, std::uint32_t rank, std::uint32_t world,
+    const Status &status, cudaEvent_t completion_event) {
+  const auto begin = std::chrono::steady_clock::now();
+  auto &layout = backend->pool->layout;
+  const auto exec = internal::checked_execution_state(backend->execution);
+  auto *host_records = slot.host_production_status;
+  const auto error = status.error != 0U;
+  host_records[rank] = ProductionStatusRecord{
+      generation,
+      static_cast<unsigned long long>(phase),
+      error ? static_cast<unsigned long long>(status.error_origin_rank)
+            : static_cast<unsigned long long>(rank),
+      error ? static_cast<unsigned long long>(status.error_code) : 0ULL,
+      error ? static_cast<unsigned long long>(status.error_field) : 0ULL,
+      error ? status.error_expected : 0ULL,
+      error ? status.error_actual : 0ULL,
+      epoch};
+  auto *send = at<ProductionStatusRecord>(
+      slot.device, layout.production_error_records) + rank;
+  auto *receive = at<unsigned long long>(
+      slot.device, layout.production_status_matrix);
+  internal::throw_cuda(
+      "production-terminal-status",
+      cudaMemcpyAsync(send, host_records + rank,
+                      sizeof(ProductionStatusRecord), cudaMemcpyHostToDevice,
+                      exec->stream),
+      rank, world, backend->session.session().identity(), generation,
+      ExchangeKind::ExpertCounts, "H2D local production status record");
+  internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
+                            sizeof(ProductionStatusRecord));
+  internal::throw_nccl(
+      "production-terminal-status",
+      ncclAllGather(send, receive, 8, ncclUint64, backend->nccl->comm,
+                    exec->stream),
+      rank, world, backend->session.session().identity(), generation,
+      ExchangeKind::ExpertCounts,
+      "ncclAllGather(ProductionStatusRecord)");
+  const auto matrix_bytes = checked_size(
+      checked_mul(world, sizeof(ProductionStatusRecord),
+                  "production terminal status matrix"),
+      "production terminal status matrix");
+  internal::throw_cuda(
+      "production-terminal-status",
+      cudaMemcpyAsync(host_records, receive, matrix_bytes,
+                      cudaMemcpyDeviceToHost, exec->stream),
+      rank, world, backend->session.session().identity(), generation,
+      ExchangeKind::ExpertCounts, "D2H production status matrix");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                            matrix_bytes);
+  internal::throw_cuda(
+      "production-terminal-status",
+      cudaEventRecord(completion_event, exec->stream), rank, world,
+      backend->session.session().identity(), generation,
+      ExchangeKind::ExpertCounts,
+      "cudaEventRecord(production terminal status)");
+  internal::throw_cuda(
+      "production-terminal-status", cudaEventSynchronize(completion_event),
+      rank, world, backend->session.session().identity(), generation,
+      ExchangeKind::ExpertCounts,
+      "cudaEventSynchronize(production terminal status)");
+
+  ProductionStatusAgreementResult result;
+  const auto expected_phase = static_cast<unsigned long long>(phase);
+  const auto malformed = [&](std::uint32_t origin, std::uint64_t field,
+                             std::uint64_t expected,
+                             std::uint64_t actual) {
+    result.has_error = true;
+    result.error = ProductionStatusRecord{
+        generation, expected_phase, origin, 2ULL, field, expected, actual,
+        epoch};
+  };
+  for (std::uint32_t source = 0; source < world && !result.has_error;
+       ++source) {
+    const auto &record = host_records[source];
+    if (record.generation != generation)
+      malformed(source, 1ULL, generation, record.generation);
+    else if (record.phase != expected_phase)
+      malformed(source, 2ULL, expected_phase, record.phase);
+    else if (record.origin_rank != source && record.error_code == 0ULL)
+      malformed(source, 3ULL, source, record.origin_rank);
+    else if (record.epoch != epoch)
+      malformed(source, 4ULL, epoch, record.epoch);
+  }
+  if (!result.has_error) {
+    for (std::uint32_t source = 0; source < world; ++source) {
+      const auto &record = host_records[source];
+      if (record.error_code == 0ULL)
+        continue;
+      if (record.origin_rank >= world) {
+        malformed(source, 5ULL, world - 1ULL, record.origin_rank);
+        break;
+      }
+      if (!result.has_error || record.origin_rank < result.error.origin_rank ||
+          (record.origin_rank == result.error.origin_rank &&
+           record.field < result.error.field)) {
+        result.has_error = true;
+        result.error = record;
+      }
+    }
+  }
+  result.elapsed_us = std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - begin)
+                          .count();
+  return result;
+}
+
+void throw_production_status_error(
+    const ProductionStatusAgreementResult &agreement) {
+  if (!agreement.has_error)
+    return;
+  const auto &error = agreement.error;
+  const auto phase = error.phase == static_cast<unsigned long long>(
+                                      ProductionStatusPhase::Forward)
+                         ? "Forward"
+                         : "Backward";
+  throw NotifyDispatchError(
+      NotifyErrorCode::TransportProtocolFailure,
+      "phase=production-terminal-agreement, kind=" + std::string(phase) +
+          ", origin_rank=" + std::to_string(error.origin_rank) +
+          ", field=" + std::to_string(error.field) +
+          ", code=" + std::to_string(error.error_code) +
+          ", expected=" + std::to_string(error.expected) +
+          ", actual=" + std::to_string(error.actual) +
+          ", generation=" + std::to_string(error.generation));
+}
+
+} // namespace
 
 struct ForwardAllocation {
   void *w1 = nullptr;
@@ -8300,7 +8683,10 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   requirements.ginExclusiveContexts = true;
   requirements.ginQueueDepth = 64;
   // 0=dispatch arrival, 1=return arrival.
-  requirements.ginSignalCount = 2;
+  // Signal 0/1 are the data-plane dispatch/return epochs. Signal 2 is the
+  // fixed terminal production-status epoch and is touched only once per
+  // generation, never on the per-task success path.
+  requirements.ginSignalCount = 3;
   requirements.ginCounterCount = 1;
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
   internal::throw_nccl(
@@ -8470,6 +8856,21 @@ ActivationTransportResourcePool make_activation_transport_pool(
           ExchangeKind::ExpertCounts,
           "cudaHostAlloc(forward status)");
       internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaHostAlloc(
+              reinterpret_cast<void **>(&slot.host_production_status),
+              checked_size(checked_mul(config.max_world_size,
+                                       sizeof(ProductionStatusRecord),
+                                       "production status host matrix"),
+                           "production status host matrix"),
+              cudaHostAllocPortable),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaHostAlloc(production terminal status matrix)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+      std::fill_n(slot.host_production_status, config.max_world_size,
+                  ProductionStatusRecord{});
       slot.backward_progress_words =
           32ULL + static_cast<std::size_t>(config.max_owned_experts) * 8ULL +
           kForwardProgressWords;
@@ -10004,7 +10405,7 @@ NcclSocketFallbackActivationTransport::run_synthetic(
         state->config.max_destination_rows_per_rank,
         config.expert_transform ==
             transport::ActivationExpertTransform::Identity,
-        &status->error);
+        status);
 
   internal::throw_nccl("socket-return", ncclGroupStart(), id.calling_rank,
                        world, backend->session.session().identity(),
@@ -10093,10 +10494,14 @@ NcclSocketFallbackActivationTransport::run_synthetic(
       world, backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaEventSynchronize(Socket complete)");
   consumer.finish();
-  if (slot.host_status->error != 0)
-    transport_error(NotifyErrorCode::TransportProtocolFailure, "socket-run",
-                    "received descriptor", id.calling_rank, "valid",
-                    "device validation failure");
+  const auto production_agreement = agree_production_terminal_status(
+      backend, slot, ProductionStatusPhase::Forward, id.generation,
+      id.generation, id.calling_rank, id.world_size, *slot.host_status,
+      slot.complete);
+  if (production_agreement.has_error) {
+    failure_guard.committed = true;
+    throw_production_status_error(production_agreement);
+  }
 
   float total_ms = 0.0F;
   float dispatch_ms = 0.0F;
@@ -10488,7 +10893,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
       id.config_digest_word0, id.config_digest_word1};
   auto consumer = dispatch.acquire_consumer(backend->execution, expectation);
-  const auto view = ActivationTransportBridge::view(consumer);
+  auto view = ActivationTransportBridge::view(consumer);
   if (weight.owned_experts != view.sizes.owned_expert_count)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                     "owned_experts", id.calling_rank,
@@ -10545,6 +10950,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   std::uint64_t socket_return_peer_bytes = 0;
   std::uint64_t socket_raw_cross_node_route_bytes = 0;
   if (use_socket) {
+    // The fallback transport and the fused Forward are sequential consumers
+    // of the same immutable Dispatch handle. Release the first token while
+    // the host-enqueued Socket slice owns it, then reacquire before launching
+    // the production Forward kernel; retaining both would exhaust the bounded
+    // consumer-event pool and stall before the first payload collective.
+    consumer = {};
     transport::ActivationTransportConfig socket_config{};
     socket_config.hidden_size = config.hidden_size;
     socket_config.channels = state->config.channels;
@@ -10595,6 +11006,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             socket_raw_cross_node_route_bytes, outgoing_bytes,
             "Socket Forward cross-node route bytes");
     }
+    consumer = dispatch.acquire_consumer(backend->execution, expectation);
+    view = ActivationTransportBridge::view(consumer);
   }
   internal::throw_cuda(
       "forward-run", cudaEventRecord(slot.forward_start, exec->stream),
@@ -10658,7 +11071,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         at<LocalP2pRouteHeader>(slot.device, layout.direct_route_headers),
         socket_incoming, id.generation, generation_epoch, id.calling_rank,
         state->config.max_destination_rows_per_rank,
-        &at<TransportDeviceStatus>(slot.device, layout.status)->error);
+        at<TransportDeviceStatus>(slot.device, layout.status));
   }
   internal::throw_cuda(
       "forward-run", cudaGetLastError(), id.calling_rank, id.world_size,
@@ -10683,6 +11096,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
   args.use_socket = use_socket;
+  args.local_world_size = id.world_size / id.num_nodes;
+  args.node = id.calling_rank / args.local_world_size;
+  if (const auto *fault_rank =
+          std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK")) {
+    const auto *fault_generation =
+        std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_GENERATION");
+    if (fault_generation == nullptr ||
+        std::stoull(fault_generation) == id.generation)
+      args.injected_status_error_rank = std::stoi(fault_rank);
+  }
   if (use_gin) {
 #if __has_include(<nccl_device.h>)
     args.gin_dev_comm = gin_backend->dev_comm;
@@ -10697,6 +11120,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     args.gin_receive_payload_offset = state->gin_layout.receive_payload;
     args.gin_return_staging_offset = state->gin_layout.return_staging;
     args.gin_return_receive_offset = state->gin_layout.return_receive;
+    args.gin_production_error_records_offset =
+        state->gin_layout.production_error_records;
     args.node = gin_backend->node;
     args.local_world_size = gin_backend->local_world_size;
     args.gin_context_count = gin_backend->gin_context_count;
@@ -10720,6 +11145,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_scheduler_offset = layout.forward_scheduler;
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
+  args.production_error_records_offset = layout.production_error_records;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
 #if MEGAMOE_DEBUG_VALIDATE
@@ -11033,19 +11459,23 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     std::this_thread::yield();
   }
   consumer.finish();
+  const auto production_agreement = agree_production_terminal_status(
+      backend, slot, ProductionStatusPhase::Forward, id.generation,
+      id.generation, id.calling_rank, id.world_size,
+      *slot.host_forward_status, slot.forward_complete);
   if (cancelled || slot.host_forward_status->error == 2U)
     throw NotifyDispatchError(
         NotifyErrorCode::TransportTimeout,
         "phase=forward-run, field=cancel/deadline, rank=" +
             std::to_string(id.calling_rank) +
             ", expected=completed forward, actual=cancelled");
-  if (slot.host_forward_status->error != 0)
-    transport_error(NotifyErrorCode::TransportProtocolFailure,
-                    "forward-kernel", "device status", id.calling_rank,
-                    "error=0", "error=" +
-                                     std::to_string(slot.host_forward_status->error) +
-                                     ", field=" +
-                                     std::to_string(slot.host_forward_status->error_field));
+  if (production_agreement.has_error) {
+    // A logical device-status failure reached the fixed terminal agreement;
+    // all peer work is drained and this slot is recoverable. Backend/CUDA
+    // failures still leave the guard uncommitted and therefore quarantine.
+    failure_guard.committed = true;
+    throw_production_status_error(production_agreement);
+  }
 
   float total_ms = 0.0F;
   internal::throw_cuda(
@@ -11108,6 +11538,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       slot.host_forward_status->gin_metadata_bytes;
   result->audit.workspace_bytes = state->layout.total;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+  result->timings.terminal_status_agreement_us =
+      production_agreement.elapsed_us;
   const auto &status = *slot.host_forward_status;
   const auto elapsed = [](std::uint64_t begin, std::uint64_t end) {
     return end >= begin ? static_cast<double>(end - begin) / 1000.0 : 0.0;
@@ -11598,8 +12030,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
           socket_incoming, config.hidden_size, id.generation,
           generation_epoch, id.calling_rank,
           state->config.max_destination_rows_per_rank,
-          &at<BackwardDeviceStatus>(slot.device, layout.backward_status)
-               ->error);
+          at<BackwardDeviceStatus>(slot.device, layout.backward_status));
     internal::throw_cuda(
         "socket-backward-dispatch", cudaGetLastError(), id.calling_rank,
         id.world_size, backend->session.session().identity(), id.generation,
@@ -11667,6 +12098,16 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
   args.use_socket = use_socket;
+  args.local_world_size = id.world_size / id.num_nodes;
+  args.node = id.calling_rank / args.local_world_size;
+  if (const auto *fault_rank =
+          std::getenv("MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_RANK")) {
+    const auto *fault_generation =
+        std::getenv("MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_GENERATION");
+    if (fault_generation == nullptr ||
+        std::stoull(fault_generation) == id.generation)
+      args.injected_status_error_rank = std::stoi(fault_rank);
+  }
   if (use_gin) {
 #if __has_include(<nccl_device.h>)
     args.gin_dev_comm = gin_backend->dev_comm;
@@ -11687,6 +12128,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         state->gin_layout.return_gate_staging;
     args.gin_return_gate_receive_offset =
         state->gin_layout.return_gate_receive;
+    args.gin_production_error_records_offset =
+        state->gin_layout.production_error_records;
     args.node = gin_backend->node;
     args.local_world_size = gin_backend->local_world_size;
     args.gin_context_count = gin_backend->gin_context_count;
@@ -11717,6 +12160,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.outgoing_signal_offset = layout.outgoing_route_sequence;
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
+  args.production_error_records_offset = layout.production_error_records;
   args.status_offset = layout.backward_status;
   args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
       slot.device_cancel_epoch);
@@ -12125,29 +12569,32 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   const auto backward_consumer_drained = std::chrono::steady_clock::now();
   const auto &status = *reinterpret_cast<const BackwardDeviceStatus *>(
       slot.host_status);
+  ProductionStatusAgreementResult forward_agreement;
+  if (had_deferred_forward)
+    forward_agreement = agree_production_terminal_status(
+        backend, slot, ProductionStatusPhase::Forward, id.generation,
+        id.generation, id.calling_rank, id.world_size,
+        *slot.host_forward_status, slot.complete);
+  const auto backward_agreement = agree_production_terminal_status(
+      backend, slot, ProductionStatusPhase::Backward, id.generation,
+      id.generation, id.calling_rank, id.world_size, status,
+      slot.complete);
   if (cancelled || status.error == 2U)
     throw NotifyDispatchError(
         NotifyErrorCode::TransportTimeout,
         "phase=backward-run, field=cancel/deadline, rank=" +
             std::to_string(id.calling_rank) +
             ", expected=completed Backward, actual=cancelled");
-  if (status.error != 0U)
-    transport_error(NotifyErrorCode::TransportProtocolFailure,
-                    "backward-kernel", "device status", id.calling_rank,
-                    "error=0", "error=" + std::to_string(status.error) +
-                                     ", field=" +
-                                     std::to_string(status.error_field));
+  if (forward_agreement.has_error || backward_agreement.has_error) {
+    failure_guard.committed = true;
+    throw_production_status_error(forward_agreement);
+    throw_production_status_error(backward_agreement);
+  }
   double forward_consumer_drain_host_us = 0.0;
   if (had_deferred_forward) {
     auto &forward_result =
         const_cast<DeviceForwardHandle::Impl &>(*forward.impl_);
     const auto &forward_status = *slot.host_forward_status;
-    if (forward_status.error != 0U)
-      transport_error(
-          NotifyErrorCode::TransportProtocolFailure, "forward-kernel",
-          "device status", id.calling_rank, "error=0",
-          "error=" + std::to_string(forward_status.error) + ", field=" +
-              std::to_string(forward_status.error_field));
     float forward_total_ms = 0.0F;
     internal::throw_cuda(
         "forward-timing",
@@ -12190,6 +12637,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         forward_status.gin_metadata_bytes;
     forward_result.timings.total_us =
         static_cast<double>(forward_total_ms) * 1000.0;
+    forward_result.timings.terminal_status_agreement_us =
+        forward_agreement.elapsed_us;
     const auto forward_elapsed = [](std::uint64_t begin,
                                     std::uint64_t end) {
       return end >= begin ? static_cast<double>(end - begin) / 1000.0 : 0.0;
@@ -12296,6 +12745,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->audit.dispatch_consumer_acquires = had_deferred_forward ? 1U : 0U;
   result->audit.dispatch_consumer_releases = had_deferred_forward ? 1U : 0U;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+  result->timings.terminal_status_agreement_us =
+      backward_agreement.elapsed_us;
   result->timings.dy_dispatch_us =
       elapsed(status.start_clock, status.dy_dispatch_complete_clock);
   result->timings.dv_swiglu_backward_us = elapsed(

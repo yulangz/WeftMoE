@@ -2670,6 +2670,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         backward_call_host_samples, integration_overhead_samples,
         handoff_samples, backward_setup_host_samples,
         forward_drain_host_samples, final_drain_host_samples,
+        forward_terminal_status_samples, backward_terminal_status_samples,
         notify_pool_acquire_samples, notify_local_histogram_wall_samples,
         notify_local_mapping_device_samples,
         notify_collective_enqueue_samples,
@@ -2961,6 +2962,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             backward_handle.timings().forward_consumer_drain_host_us);
         final_drain_host_samples.push_back(
             backward_handle.timings().final_consumer_drain_host_us);
+        forward_terminal_status_samples.push_back(
+            forward_handle.timings().terminal_status_agreement_us);
+        backward_terminal_status_samples.push_back(
+            backward_handle.timings().terminal_status_agreement_us);
         notify_pool_acquire_samples.push_back(
             notify_timing.pool_acquire_end_offset_us -
             notify_timing.pool_acquire_begin_offset_us);
@@ -3129,6 +3134,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::cout << " backward_setup_host="; emit(backward_setup_host_samples);
     std::cout << " forward_consumer_drain="; emit(forward_drain_host_samples);
     std::cout << " final_drain="; emit(final_drain_host_samples);
+    std::cout << " forward_terminal_status_agreement=";
+    emit(forward_terminal_status_samples);
+    std::cout << " backward_terminal_status_agreement=";
+    emit(backward_terminal_status_samples);
     std::cout << " notify_pool_acquire="; emit(notify_pool_acquire_samples);
     std::cout << " notify_local_histogram_wall=";
     emit(notify_local_histogram_wall_samples);
@@ -3437,6 +3446,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> fc1_fc2_overlap_samples;
     std::vector<double> fc2_return_overlap_samples;
     std::vector<double> return_reduce_overlap_samples;
+    std::vector<double> terminal_status_samples;
     megamoe::cuda::ForwardMegaKernelAudit last_audit;
     megamoe::cuda::DeviceForwardHandle last_output;
     const auto forward_api_before =
@@ -3497,6 +3507,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             output.timings().fc2_return_overlap_us);
         return_reduce_overlap_samples.push_back(
             output.timings().return_reduce_overlap_us);
+        terminal_status_samples.push_back(
+            output.timings().terminal_status_agreement_us);
       }
     }
     const auto forward_api_after =
@@ -3637,6 +3649,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     emit_values(fc2_return_overlap_samples);
     std::cout << " return_reduce_overlap=";
     emit_values(return_reduce_overlap_samples);
+    std::cout << " terminal_status_agreement=";
+    emit_values(terminal_status_samples);
     std::cout << std::endl;
     return;
   }
@@ -3939,6 +3953,67 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << " phase=lambda_return" << std::endl;
       return result;
     };
+    if (const auto *fault_phase =
+            std::getenv("MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")) {
+      const auto phase = std::string(fault_phase);
+      require(phase == "forward" || phase == "backward",
+              "production status fault phase must be forward/backward");
+      const auto rank_variable = phase == "forward"
+                                     ? "MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK"
+                                     : "MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_RANK";
+      const auto generation_variable =
+          phase == "forward"
+              ? "MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_GENERATION"
+              : "MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_GENERATION";
+      require(setenv(rank_variable, "1", 1) == 0 &&
+                  setenv(generation_variable, "990", 1) == 0,
+              "failed to configure internal production status fault seam");
+      std::string agreed_error;
+      try {
+        (void)run_mode(
+            megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput, 990U);
+      } catch (const megamoe::NotifyDispatchError &error) {
+        agreed_error = error.what();
+      }
+      const auto expected_field = phase == "forward" ? "field=120"
+                                                       : "field=220";
+      require(!agreed_error.empty() &&
+                  agreed_error.find("phase=production-terminal-agreement") !=
+                      std::string::npos &&
+                  agreed_error.find("origin_rank=1") != std::string::npos &&
+                  agreed_error.find(expected_field) != std::string::npos,
+              "production status fault did not surface the agreed structured "
+              "rank1 error");
+      std::uint64_t error_hash = 1469598103934665603ULL;
+      for (const auto byte : agreed_error)
+        error_hash = (error_hash ^ static_cast<unsigned char>(byte)) *
+                     1099511628211ULL;
+      const auto recovered = run_mode(
+          megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput, 991U);
+      (void)unsetenv(rank_variable);
+      (void)unsetenv(generation_variable);
+      require(recovered.second.dx.low != 0U &&
+                  recovered.second.dw1.low != 0U &&
+                  recovered.second.dw2.low != 0U &&
+                  recovered.second.dgate.low != 0U,
+              "production status fault recovery did not publish valid "
+              "Backward outputs");
+      const auto usage = transport_pool.usage();
+      require(usage.slots_quarantined == 0U,
+              "recoverable production status fault quarantined its slot");
+      std::cout << "PRODUCTION_STATUS_FAULT rank=" << rank
+                << " backend="
+                << (gin_backward_smoke ? "gin" : "socket")
+                << " phase=" << phase << " origin_rank=1 "
+                << expected_field << " error_hash=" << error_hash
+                << " recovery_generation=991"
+                << " dx_hash=" << recovered.second.dx.low
+                << " dw1_hash=" << recovered.second.dw1.low
+                << " dw2_hash=" << recovered.second.dw2.low
+                << " dgate_hash=" << recovered.second.dgate.low
+                << " recovered=1" << std::endl;
+      return;
+    }
     const bool cache_first =
         std::getenv("MEGAMOE_BACKWARD_CACHE_FIRST") != nullptr;
     const auto first = run_mode(

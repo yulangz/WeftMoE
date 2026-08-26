@@ -688,6 +688,25 @@ fallback is direct rank-to-rank and does not implement the GIN node-dedup,
 same-rail proxy plus local CUDA-P2P fan-out data plane. Its host phase
 boundaries are explicit, so it is never described as persistent, GIN, or RDMA.
 
+### Production Forward/Backward terminal status
+
+Forward and Backward no longer act on a rank-local device error in isolation.
+The production kernels publish a fixed structured record containing generation,
+phase, origin rank, error code, field and expected/actual values. The GIN path
+uses a dedicated peer-visible release epoch and same-rail fan-out after draining
+already-issued put/return work; the local-P2P path uses its existing IPC peer
+mappings. The host-enqueued Socket correctness fallback has no device peer
+window, so it publishes the same owner-local record after its payload drain.
+
+Every rank then unconditionally performs the same fixed-width 64-byte-per-rank
+NCCL AllGather. The matrix is validated and errors are selected by origin-rank
+order and then field order, so every rank either publishes its handle or throws
+the same structured production exception. A drained logical protocol error
+leaves the communicator and slot reusable by the next generation. CUDA-context
+or process failure remains a deadline/teardown boundary and is not claimed to be
+recoverable. The validation-only hash agreement remains separate and is not on
+this production error path.
+
 GIN signal acquire is transferred from each device context leader to all
 reader CTAs through a device-scope release/acquire phase counter; a cooperative
 grid barrier alone is not the memory-ordering contract. The small FP32 dGate

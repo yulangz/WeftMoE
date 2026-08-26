@@ -461,6 +461,20 @@ def main():
                 observed.append(item)
                 continue
             if args.backward_smoke:
+                status_fault_phase = os.environ.get(
+                    "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
+                if status_fault_phase:
+                    item = parse_fields(stdout, "PRODUCTION_STATUS_FAULT ")
+                    expected_field = "120" if status_fault_phase == "forward" \
+                        else "220"
+                    if (item.get("origin_rank") != "1" or
+                            item.get("field") != expected_field or
+                            item.get("recovered") != "1"):
+                        raise AssertionError(
+                            f"rank={rank} invalid production status fault: "
+                            f"{item}")
+                    observed.append(item)
+                    continue
                 item = parse_fields(stdout, "BACKWARD_SMOKE ")
                 if (item.get("cache_no_cache_equal") != "1" or
                         item.get("persistent_launches") != "1" or
@@ -515,6 +529,18 @@ def main():
         if args.backward_smoke:
             if len(observed) != args.world:
                 raise AssertionError("missing backward ranks")
+            status_fault_phase = os.environ.get(
+                "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
+            if status_fault_phase:
+                hashes = {item["error_hash"] for item in observed}
+                if len(hashes) != 1:
+                    raise AssertionError(
+                        "production status error was not byte-identical: " +
+                        repr(observed))
+                print(f"[PASS] production {status_fault_phase} status "
+                      f"agreement and same-communicator recovery "
+                      f"world={args.world}")
+                return
             if args.world == 8 and args.top_k == 1:
                 if not any(int(item["dv_tasks"]) == 0 for item in observed):
                     raise AssertionError(

@@ -406,6 +406,7 @@ struct ForwardMegaKernelTimings {
   double fc1_fc2_overlap_us = 0;
   double fc2_return_overlap_us = 0;
   double return_reduce_overlap_us = 0;
+  double terminal_status_agreement_us = 0;
   double total_us = 0;
 };
 
@@ -620,6 +621,7 @@ struct BackwardMegaKernelTimings {
   double dw1_overlap_dv_dx_us = 0;
   double dw2_overlap_dv_dx_us = 0;
   double dx_combine_reduce_us = 0;
+  double terminal_status_agreement_us = 0;
   double total_us = 0;
 };
 

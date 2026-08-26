@@ -74,7 +74,8 @@ def aggregate_gin_benchmark(outputs, scenario):
     records = [parse_fields(item.stdout, marker) for item in outputs]
     stage_keys = (("wall", "notify", "forward", "dispatch", "fc1", "fc2",
                    "return", "reduce", "fc1_fc2_overlap",
-                   "fc2_return_overlap", "return_reduce_overlap") if forward
+                   "fc2_return_overlap", "return_reduce_overlap",
+                   "terminal_status_agreement") if forward
                   else
                   ("notify_inclusive_training_step_wall",
                    "post_notify_training_step_wall", "notify_wall",
@@ -87,6 +88,8 @@ def aggregate_gin_benchmark(outputs, scenario):
                    "dy_ready_host", "backward_call_host",
                    "integration_overhead", "handoff", "backward_setup_host",
                    "forward_consumer_drain", "final_drain",
+                   "forward_terminal_status_agreement",
+                   "backward_terminal_status_agreement",
                    "notify_pool_acquire", "notify_local_histogram_wall",
                    "notify_local_mapping_device",
                    "notify_collective_enqueue", "notify_collective_wait",
@@ -374,11 +377,13 @@ def environment_overrides(args):
         "MEGAMOE_BACKWARD_HASH_REPEATS",
         "MEGAMOE_BACKWARD_ROUTE_CASE",
         "MEGAMOE_BACKWARD_SMOKE_REPEATS",
+        "MEGAMOE_BACKWARD_SMOKE_TRACE",
         "MEGAMOE_BACKWARD_POOL2_VALIDATE",
         "MEGAMOE_BACKWARD_CAPTURE_HASH",
         "MEGAMOE_BACKWARD_STAGE_HASHES",
         "MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH",
         "MEGAMOE_BACKWARD_CACHE_FIRST",
+        "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE",
         "MEGAMOE_FORWARD_CACHE",
         "MEGAMOE_BACKWARD_CACHE",
         "MEGAMOE_P2P_TOP_K",
@@ -791,6 +796,45 @@ def main(argv=None):
 
     if args.scenario in ("gin_forward_smoke", "gin_backward_smoke",
                          "socket_backward_smoke"):
+        status_fault_phase = os.environ.get(
+            "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
+        if status_fault_phase:
+            failures = []
+            evidence = []
+            error_hashes = set()
+            expected_field = "field=120" if status_fault_phase == "forward" \
+                else "field=220"
+            for result in outputs:
+                lines = [line for line in result.stdout.splitlines()
+                         if line.startswith("PRODUCTION_STATUS_FAULT ")]
+                if result.returncode != 0 or len(lines) != 1:
+                    failures.append(
+                        f"rank={result.rank} exit={result.returncode}; "
+                        f"stdout={result.stdout[-5000:]}; "
+                        f"stderr={result.stderr[-5000:]}"
+                    )
+                    continue
+                line = lines[0]
+                fields = dict(item.split("=", 1) for item in line.split()[1:])
+                if (fields.get("origin_rank") != "1" or
+                        expected_field not in line or
+                        fields.get("recovered") != "1"):
+                    failures.append(f"rank={result.rank} malformed={line}")
+                    continue
+                error_hashes.add(fields.get("error_hash"))
+                evidence.append(line)
+            if len(error_hashes) != 1:
+                failures.append(
+                    "production status errors were not byte-identical: " +
+                    repr(sorted(error_hashes)))
+            if failures:
+                raise RuntimeError(
+                    "production terminal status agreement failed:\n" +
+                    "\n".join(failures))
+            print("\n".join(evidence))
+            print(f"[PASS] production {status_fault_phase} status agreement "
+                  f"and same-communicator recovery world={world}")
+            return
         failures = []
         evidence = []
         for result in outputs:
