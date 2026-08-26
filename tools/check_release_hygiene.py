@@ -46,11 +46,14 @@ EXCLUDED_DIRECTORY_NAMES = {
     ".idea",
     ".mypy_cache",
     ".pytest_cache",
+    ".release-build",
+    ".release-install",
     ".ruff_cache",
     ".vscode",
     "__pycache__",
-    "install",
-    "install-stage",
+    "build",
+    "build-release",
+    "build-release-werror",
 }
 EXCLUDED_SUFFIXES = {
     ".a",
@@ -95,14 +98,24 @@ def git_release_files(
     return files, excluded
 
 
-def excluded_directory(name: str) -> str | None:
-    if name in EXCLUDED_DIRECTORY_NAMES:
-        return "generated/cache directory"
-    if name.startswith("build"):
-        return "build directory"
-    if name.startswith("install-") or name.startswith("install_stage"):
-        return "install staging directory"
-    return None
+def checked_explicit_excludes(
+        root: pathlib.Path, values: list[str]) -> tuple[set[pathlib.Path], list[str]]:
+    excludes: set[pathlib.Path] = set()
+    failures: list[str] = []
+    for value in values:
+        relative = pathlib.Path(value)
+        if (not value or relative.is_absolute() or value in (".", "..") or
+                ".." in relative.parts or re.search(r"[*?\[\]{}]", value)):
+            failures.append(
+                f"explicit exclude must be an exact relative path: {value!r}")
+            continue
+        candidate = (root / relative).resolve(strict=False)
+        if not candidate.is_relative_to(root):
+            failures.append(
+                f"explicit exclude escapes archive root: {value!r}")
+            continue
+        excludes.add(relative)
+    return excludes, failures
 
 
 def excluded_file(name: str) -> str | None:
@@ -116,10 +129,13 @@ def excluded_file(name: str) -> str | None:
 
 
 def archive_release_files(
-        root: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
+        root: pathlib.Path,
+        explicit_excludes: set[pathlib.Path] | None = None,
+        ) -> tuple[list[pathlib.Path], list[str]]:
     """Walk every archive entry without following directory symlinks."""
     files: list[pathlib.Path] = []
     excluded: list[str] = []
+    exact_excludes = explicit_excludes or set()
 
     def walk(directory: pathlib.Path) -> None:
         with os.scandir(directory) as iterator:
@@ -131,9 +147,13 @@ def archive_release_files(
                 excluded.append(f"{relative} (symlink not followed)")
                 continue
             if entry.is_dir(follow_symlinks=False):
-                reason = excluded_directory(entry.name)
-                if reason is not None:
-                    excluded.append(f"{relative}/ ({reason})")
+                relative_path = path.relative_to(root)
+                if relative_path in exact_excludes:
+                    excluded.append(
+                        f"{relative}/ (source=explicit, exact path)")
+                elif entry.name in EXCLUDED_DIRECTORY_NAMES:
+                    excluded.append(
+                        f"{relative}/ (source=builtin, exact basename)")
                 else:
                     walk(path)
                 continue
@@ -151,11 +171,13 @@ def archive_release_files(
 
 
 def release_files(
-        root: pathlib.Path) -> tuple[list[pathlib.Path], list[str], str]:
+        root: pathlib.Path,
+        explicit_excludes: set[pathlib.Path] | None = None,
+        ) -> tuple[list[pathlib.Path], list[str], str]:
     if has_git_metadata(root):
         files, excluded = git_release_files(root)
         return files, excluded, "git"
-    files, excluded = archive_release_files(root)
+    files, excluded = archive_release_files(root, explicit_excludes)
     return files, excluded, "archive"
 
 
@@ -209,7 +231,7 @@ def scan_headers(paths: list[pathlib.Path]) -> list[str]:
     return failures
 
 
-def self_test() -> tuple[list[str], list[str]]:
+def self_test() -> tuple[list[str], list[str], list[str]]:
     failures: list[str] = []
     fixtures = (
         (
@@ -236,6 +258,30 @@ def self_test() -> tuple[list[str], list[str]]:
             "owner=" + "wang" + "haitao\n",
             "known developer identity",
         ),
+        (
+            "buildspec-source-private-ip",
+            pathlib.Path("buildspec-source/new-source.txt"),
+            "endpoint=" + "10" + ".23.45.67\n",
+            "private IPv4",
+        ),
+        (
+            "install-tools-absolute-path",
+            pathlib.Path("install-tools/new-source.txt"),
+            "path=/" + "storage" + "/release/input\n",
+            "machine storage path",
+        ),
+        (
+            "build-release-notes-trailing-whitespace",
+            pathlib.Path("build-release-notes/file.txt"),
+            "release note \n",
+            "trailing whitespace",
+        ),
+        (
+            "cache-algorithm-identity",
+            pathlib.Path("cache-algorithm/source.txt"),
+            "owner=" + "gpu" + "lingjun\n",
+            "known developer identity",
+        ),
     )
     passed: list[str] = []
     for label, relative, content, expected in fixtures:
@@ -259,27 +305,70 @@ def self_test() -> tuple[list[str], list[str]]:
                     f"{expected}; output={result.stdout.strip()!r}")
             else:
                 passed.append(label)
-    return failures, passed
+    exclude_fixtures = (
+        ("builtin-build-release", pathlib.Path("build-release"), []),
+        ("builtin-release-install", pathlib.Path(".release-install"), []),
+        ("builtin-pycache", pathlib.Path("__pycache__"), []),
+        (
+            "explicit-release-output",
+            pathlib.Path("release-output"),
+            ["--exclude-dir", "release-output"],
+        ),
+    )
+    excluded_passed: list[str] = []
+    for label, relative, extra_arguments in exclude_fixtures:
+        with tempfile.TemporaryDirectory(
+                prefix="megamoe-hygiene-") as directory:
+            root = pathlib.Path(directory)
+            path = root / relative / "must-not-scan.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "endpoint=" + "192" + ".168.44.55\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()),
+                 "--root", str(root), *extra_arguments],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            expected_source = "source=explicit" if extra_arguments else \
+                "source=builtin"
+            if result.returncode != 0 or expected_source not in result.stdout:
+                failures.append(
+                    f"exclude fixture {relative}: expected exact exclusion; "
+                    f"output={result.stdout.strip()!r}")
+            else:
+                excluded_passed.append(label)
+    return failures, passed, excluded_passed
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path("."))
     parser.add_argument("--headers", nargs="*", type=pathlib.Path, default=[])
+    parser.add_argument(
+        "--exclude-dir", action="append", default=[],
+        help="exact archive-root-relative generated directory to exclude",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve()
-    files, excluded, mode = release_files(root)
+    explicit_excludes, failures = checked_explicit_excludes(
+        root, args.exclude_dir)
+    files, excluded, mode = release_files(root, explicit_excludes)
     headers = args.headers or sorted((root / "include" / "megamoe").rglob("*.hpp"))
-    failures, text_count, binary = scan_release_text(files)
+    text_failures, text_count, binary = scan_release_text(files)
+    failures += text_failures
     excluded.extend(
         f"{path.relative_to(root).as_posix()} (binary/non-UTF8, not text-scanned)"
         for path in binary
     )
     failures += scan_headers(headers)
     fixture_labels: list[str] = []
+    exclude_fixture_labels: list[str] = []
     if args.self_test:
-        fixture_failures, fixture_labels = self_test()
+        fixture_failures, fixture_labels, exclude_fixture_labels = self_test()
         failures += fixture_failures
     if failures:
         print("\n".join(failures))
@@ -289,7 +378,9 @@ def main() -> int:
         f"release hygiene: mode={mode}, regular_files={len(files)}, "
         f"text_files={text_count}, excluded={excluded_text}, "
         f"installed_headers={len(headers)}, negative_fixtures="
-        f"{','.join(fixture_labels) if args.self_test else 'not-requested'}"
+        f"{','.join(fixture_labels) if args.self_test else 'not-requested'}, "
+        f"exclude_fixtures="
+        f"{','.join(exclude_fixture_labels) if args.self_test else 'not-requested'}"
     )
     return 0
 
