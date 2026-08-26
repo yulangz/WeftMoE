@@ -239,6 +239,10 @@ install: shared-lib
 		packaging/megamoe.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/megamoe.pc
 	install -D -m 0644 examples/minimal_training.cpp \
 		$(DESTDIR)$(DATADIR)/examples/minimal_training.cpp
+	install -D -m 0644 LICENSE $(DESTDIR)$(DATADIR)/LICENSE
+	install -D -m 0644 NOTICE $(DESTDIR)$(DATADIR)/NOTICE
+	install -D -m 0644 THIRD_PARTY_NOTICES.md \
+		$(DESTDIR)$(DATADIR)/THIRD_PARTY_NOTICES.md
 	@{ \
 		for header in $(PUBLIC_HEADERS); do echo '$(INCLUDEDIR)/'$${header#include/}; done; \
 		echo '$(LIBDIR)/$(LIBMEGAMOE_REALNAME)'; \
@@ -246,6 +250,9 @@ install: shared-lib
 		echo '$(LIBDIR)/libmegamoe.so'; \
 		echo '$(PKGCONFIGDIR)/megamoe.pc'; \
 		echo '$(DATADIR)/examples/minimal_training.cpp'; \
+		echo '$(DATADIR)/LICENSE'; \
+		echo '$(DATADIR)/NOTICE'; \
+		echo '$(DATADIR)/THIRD_PARTY_NOTICES.md'; \
 		echo '$(DATADIR)/install_manifest.txt'; \
 	} > $(DESTDIR)$(DATADIR)/install_manifest.txt
 

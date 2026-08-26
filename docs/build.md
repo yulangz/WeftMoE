@@ -7,7 +7,7 @@ with the installed driver/toolkit.
 
 ## Observed stage-4 environment and transport capability
 
-Both the local host and `ssh -p 2222 root@10.10.19.233` were inspected without
+Both test hosts were inspected without
 changing system configuration:
 
 - 8 NVIDIA L20X GPUs per host, 143771 MiB each; `nvidia-smi topo -m` reports
@@ -19,7 +19,7 @@ changing system configuration:
   contains both ordinary `sm_89` and `sm_90` cubins;
 - system NCCL headers/library report `2.29.7+cuda13.2`, whose
   `ncclCommInitRank` fails here because that runtime requires a newer driver;
-- `/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2`
+- the explicitly selected `$NCCL_RUNTIME_DIR/libnccl.so.2`
   reports `2.28.3+cuda12.9` and remains the default runtime used by frozen
   single-node tests;
 - the official `libnccl2_2.29.7-1+cuda12.9_amd64.deb` works without a system
@@ -92,9 +92,10 @@ make install DESTDIR=/tmp/megamoe-package PREFIX=/usr/local
 make install-test
 ```
 
-`install-test` checks the exact 12-header manifest, then compiles
-`examples/minimal_training.cpp` using only the temporary installed prefix and
-`-Werror`; it never adds the repository `src/` include path. Validation
+`install-test` performs a clean temporary install, checks the exact 12-header
+manifest, then compiles, links with `-lmegamoe`, and runs the world-1 minimal
+Forward+Backward example using only the installed prefix and `-Werror`; it
+never adds the repository `src/` include path. Validation
 downloads, synthetic transports, fixture/hash mutation, fault injection and
 runtime-shape harnesses are exposed only by repository-internal testing headers.
 See `docs/api_v2_migration.md`.
@@ -129,7 +130,7 @@ make BUILD_DIR=build-sanitize \
 ## Optional CUDA/NCCL build and local tests
 
 ```bash
-NCCL12=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat
+NCCL12="$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR"
 
 make BUILD_DIR=build-cuda -j cuda-lib
 make BUILD_DIR=build-cuda -j \
@@ -195,7 +196,7 @@ NCCL_GIN_LIB="$NCCL_GIN_CACHE/root/usr/lib/x86_64-linux-gnu"
 env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
   python3 tests/run_multinode_nccl.py \
     --binary "$PWD/build/test_cuda_notify" \
-    --remote root@10.10.19.233 --port 2222 \
+    --remote REMOTE_HOST --port REMOTE_PORT \
     --remote-binary "$PWD/build/test_cuda_notify" \
     --gpus-per-node 1 --scenario gin_probe \
     --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
@@ -217,7 +218,7 @@ The same compatible runtime also executes a real 1 KiB payload on every rail:
 env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
   python3 tests/run_multinode_nccl.py \
     --binary "$PWD/build-gin-put/test_cuda_notify" \
-    --remote root@10.10.19.233 --port 2222 \
+    --remote REMOTE_HOST --port REMOTE_PORT \
     --remote-binary "$PWD/build-gin-put/test_cuda_notify" \
     --gpus-per-node 8 --scenario gin_put_probe \
     --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
@@ -236,7 +237,7 @@ The real activation transport slice is exercised at world 2 with:
 env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
   python3 tests/run_multinode_nccl.py \
     --binary "$PWD/build-cuda/test_cuda_notify" \
-    --remote root@10.10.19.233 --port 2222 \
+    --remote REMOTE_HOST --port REMOTE_PORT \
     --remote-binary "$PWD/build-cuda/test_cuda_notify" \
     --gpus-per-node 1 --scenario activation_gin \
     --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
@@ -276,11 +277,11 @@ run is:
 ```bash
 python3 tests/run_multinode_nccl.py \
   --binary "$PWD/build-cuda/test_cuda_notify" \
-  --remote root@10.10.19.233 --port 2222 \
+  --remote REMOTE_HOST --port REMOTE_PORT \
   --remote-binary "$PWD/build-cuda/test_cuda_notify" \
   --gpus-per-node 1 --scenario activation_socket \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
-  --socket-ifname eth0 --disable-ib
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --disable-ib
 
 # Use --gpus-per-node 8 for the real two-host world-16 run.
 ```
@@ -302,15 +303,14 @@ GIN execution or a single cross-node persistent payload kernel.
 The production main-shape GIN benchmark runs without a host payload phase:
 
 ```bash
-NCCL_GIN_LIB=/storage/openpsi/codes/wanghaitao.wht/deps/\
-nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu
+NCCL_GIN_LIB="$NCCL_RUNTIME_DIR"
 
 env -u NCCL_IB_DISABLE -u NCCL_SOCKET_IFNAME \
   MEGAMOE_P2P_BENCH_TOKENS=8192 \
   MEGAMOE_FORWARD_BENCH_ROUNDS=110 MEGAMOE_FORWARD_CACHE=1 \
   python3 tests/run_multinode_nccl.py \
     --binary "$PWD/build/test_cuda_notify" \
-    --remote root@10.10.19.233 --port 2222 \
+    --remote REMOTE_HOST --port REMOTE_PORT \
     --remote-binary "$PWD/build/test_cuda_notify" \
     --gpus-per-node 8 --scenario gin_forward_bench \
     --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat"
@@ -324,9 +324,9 @@ The matching Megatron-Core 0.17.0 native Socket baseline is launched without
 
 ```bash
 python3 benchmarks/run_multinode_megatron_socket.py \
-  --remote root@10.10.19.233 --port 2222 --gpus-per-node 8 \
+  --remote REMOTE_HOST --port REMOTE_PORT --gpus-per-node 8 \
   --nccl-lib-dir "$NCCL_GIN_LIB:/usr/local/cuda-12.9/compat" \
-  --socket-ifname eth0 --tokens 8192 --warmups 10 --iterations 100 \
+  --socket-ifname SOCKET_IFNAME --tokens 8192 --warmups 10 --iterations 100 \
   --expert-body te-grouped-mlp --benchmark-backward --training-only
 ```
 
@@ -437,7 +437,7 @@ small setup kernel; it performs no arena-wide memset. The Forward benchmark's
 runtime API snapshot reports zero device/pinned allocation or free, event
 create/destroy, and `cudaDeviceSynchronize` calls across every steady sample.
 
-A clean tracked-file export on `10.10.19.233` reproduced world-8 top-k=6,
+A clean tracked-file export on the second test host reproduced world-8 top-k=6,
 cache/no-cache, and 20-repeat correctness with rank-0 hash
 `17050206622106222467`; Forward initcheck reported zero errors. The same export
 also passed real cross-host Notify world 2 and 16. Megatron-Core is not
@@ -462,9 +462,12 @@ The selected worker policy uses all 132 CTAs for initial Dispatch, then a
 shared FC1/FC2 counter; CTAs return the M-block whose final FC2 tile they
 complete and enter Reduce as they leave compute. A fixed dedicated-CTA role
 split lost to this dynamic phase conversion on the measured main shape.
-The current `sm_90a` cubin reports 168 registers/thread, 16 bytes stack,
-2,048 bytes static shared memory, and 196,704 bytes dynamic shared memory at
-world 8. `ptxas` still reports WGMMA accumulator dependency serialization and
+The versioned artifact manifest reports the actually selected `sm_90` Forward
+kernel at 64 registers/thread, zero stack/static shared and 196,704 bytes
+configured dynamic shared at world 8; Backward is 64 registers, zero stack and
+196,672 bytes configured dynamic shared. Compile-only `sm_90a` is recorded
+separately at 168 registers and 16/120 bytes Forward/Backward stack.
+`ptxas` still reports WGMMA accumulator dependency serialization and
 an ignored `setmaxnreg`; these match the remaining barrier/scoreboard profile
 and are not hidden from the performance evidence.
 
@@ -492,28 +495,28 @@ Build or copy the same clean-export binary to both hosts, then run:
 ```bash
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
-  --remote root@10.10.19.233 --port 2222 \
+  --remote REMOTE_HOST --port REMOTE_PORT \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 1 \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
-  --socket-ifname '=eth0' --disable-ib
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --disable-ib
 
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
-  --remote root@10.10.19.233 --port 2222 \
+  --remote REMOTE_HOST --port REMOTE_PORT \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 8 \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
-  --socket-ifname '=eth0' --disable-ib
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --disable-ib
 
 # Timeout-bounded 20-round distributed rejection/recovery on the same comm.
 PYTHONPATH=. python3 tests/run_multinode_nccl.py \
   --binary ./build-cuda/test_cuda_notify \
-  --remote root@10.10.19.233 --port 2222 \
+  --remote REMOTE_HOST --port REMOTE_PORT \
   --remote-binary /absolute/remote/test_cuda_notify \
   --gpus-per-node 1 --scenario out_of_range \
-  --nccl-lib-dir /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
-  --socket-ifname '=eth0' --disable-ib
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --disable-ib
 ```
 
 The launcher starts rank 0 locally and receives its fixed 128-byte binary NCCL
@@ -549,7 +552,7 @@ normally):
 
 ```bash
 make BUILD_DIR=build-cuda \
-  NCCL_RUNTIME_LIB_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
+  NCCL_RUNTIME_LIB_DIR="$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
   cuda-sanitizer-smoke
 ```
 
@@ -695,7 +698,7 @@ Megatron common semantics are byte-identical to the same dynamic-gate
 reference. Megatron native reports max absolute error 0.03125 and max relative
 error 0.0136986 because its gate/cast boundary is intentionally native.
 
-The final clean archive on `10.10.19.233` repeated the MegaMOE world-8 run in
+The final clean archive on the second test host repeated the MegaMOE world-8 run in
 three independent sessions. Integrated E2E means were 5.0932, 5.0835 and
 5.0795 ms; the corresponding P95 values were 5.1153, 5.1030 and 5.1083 ms.
 All eight per-rank gate hashes matched the local fixture in every session and
@@ -743,7 +746,7 @@ NCCL_DEBUG=WARN python3 benchmarks/run_integrated_comparison.py \
 
 `benchmarks/megatron_dispatch_baseline.py` uses Megatron-Core 0.17.0's actual
 `MoEAlltoAllTokenDispatcher`. For this fairness run both processes load
-`/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2`, and an
+`$NCCL_RUNTIME_DIR/libnccl.so.2`, and an
 actual `ncclGetVersion` call reports 2.28.3 on both sides. PyTorch's build-time
 NCCL version remains 2.27.5 and is recorded separately; it is not treated as
 the loaded runtime. The comparison runner verifies the actual runtime version
@@ -754,7 +757,7 @@ future work.
 
 The same script also runs as a two-node `torchrun` job; it intentionally uses
 the distributed world rather than `LOCAL_WORLD_SIZE` when constructing the EP
-group. With 8 ranks/node, `NCCL_SOCKET_IFNAME=eth0`, `NCCL_IB_DISABLE=1`, 10
+group. With 8 ranks/node, `NCCL_SOCKET_IFNAME=SOCKET_IFNAME`, `NCCL_IB_DISABLE=1`, 10
 warmups and 100 samples, the measured world-16 means were 0.902 ms routing,
 463.267 ms dispatch, 464.664 ms combine, and 919.151 ms identity transport
 roundtrip (P50 926.951, P95 1073.007 ms). The corresponding estimated payload
@@ -766,7 +769,7 @@ the two benchmark semantics must not be mixed.
 Example two-node invocation (run once per node with node rank 0/1):
 
 ```bash
-NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
+NCCL_SOCKET_IFNAME=SOCKET_IFNAME NCCL_IB_DISABLE=1 torchrun \
   --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   benchmarks/megatron_dispatch_baseline.py
@@ -797,7 +800,7 @@ the backend label.
 The benchmark is intentionally a correctness baseline, not a GIN/RDMA result:
 
 ```bash
-LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda-12.9/compat \
+LD_LIBRARY_PATH="$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
   build-cuda/test_cuda_notify --bench 8
 ```
 

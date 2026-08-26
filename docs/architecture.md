@@ -98,9 +98,9 @@ src/transport/nccl_count_exchange.cu         NCCL session/control backend
 
 The launch PODs contain native pointers and are deliberately not reachable
 from public headers. The public surface exposes typed leases and owning result
-handles only. A normalized pre/post-refactor cubin comparison gives identical
-SASS and identical kernel resource records; anonymous-namespace hash changes
-are the only symbol-name difference.
+handles only. `tools/kernel_artifact_manifest.py` normalizes instruction
+addresses and anonymous-namespace symbol churn, then gates the `sm_90` runtime
+and `sm_90a` compile-only Forward/Backward SASS plus resource records.
 
 ## Runtime topology
 

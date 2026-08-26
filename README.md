@@ -306,9 +306,9 @@ owner-local signal words to the new epoch and completes a device peer
 ready/ack handshake before DispatchPut. No generation depends on `cudaMalloc`
 contents or a prior generation's signal value.
 
-The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
-CUDA runtime on the inspected L20X host; the fat binary also contains the
-ordinary `sm_89` target, which rejects this specialization at runtime. The
+The release benchmark uses the `sm_90` WGMMA/TMA cubin selected by the CUDA
+runtime on the inspected L20X host; `sm_90a` is compile-only on this hardware,
+and the fat binary also contains an ordinary `sm_89` target. The
 launch audit records requested and actual cluster sizes separately. The
 standalone frozen Forward result records `cluster_size=2`/rank mask `3`; the
 current deferred Forward-to-Backward integrated path records actual size one.
@@ -400,9 +400,14 @@ docs/                         architecture, compliance, performance, limits
 ```
 
 The installed API is version 2. `make install DESTDIR=... PREFIX=...` installs
-only the production manifest; test/oracle/synthetic/fault declarations remain
-under `src/` and are unavailable to installed clients. See
+`libmegamoe.so.2`, 12 production headers, pkg-config metadata, the minimal
+Forward+Backward example, and license notices. Test/oracle/synthetic/fault
+declarations remain under `src/` and are unavailable to installed clients. See
 `docs/api_v2_migration.md` and `examples/minimal_training.cpp`.
+
+MegaMOE-owned source is Apache-2.0 licensed. Build dependencies and inspected
+reference repositories are listed in `THIRD_PARTY_NOTICES.md`; CUDA/NCCL and
+third-party repository binaries are not redistributed.
 
 ## Build and test
 
@@ -431,7 +436,7 @@ make BUILD_DIR=build \
   NCCL_RUNTIME_LIB_DIR=/path/to/common/nccl/lib fair-integrated-bench
 
 # Two-node baseline: run on both nodes with NODE_RANK=0/1.
-NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
+NCCL_SOCKET_IFNAME=SOCKET_IFNAME NCCL_IB_DISABLE=1 torchrun \
   --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   benchmarks/megatron_dispatch_baseline.py

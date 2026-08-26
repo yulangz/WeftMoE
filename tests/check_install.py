@@ -24,6 +24,16 @@ EXPECTED = {
 }
 
 
+def absolute_library_path(value):
+    entries = []
+    for entry in value.split(os.pathsep):
+        if not entry:
+            continue
+        path = Path(entry)
+        entries.append(str(path if path.is_absolute() else (ROOT / path).resolve()))
+    return os.pathsep.join(entries)
+
+
 with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
     root = Path(temporary)
     subprocess.run(
@@ -62,8 +72,9 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         [str(output)], cwd=root, check=True,
         env={**os.environ,
              "LD_LIBRARY_PATH": str(prefix / "lib") + os.pathsep +
-             os.environ.get("NCCL_RUNTIME_LIB_DIR", "") + os.pathsep +
-             os.environ.get("LD_LIBRARY_PATH", "")},
+             absolute_library_path(
+                 os.environ.get("NCCL_RUNTIME_LIB_DIR", "")) + os.pathsep +
+             absolute_library_path(os.environ.get("LD_LIBRARY_PATH", ""))},
     )
 
     library = prefix / "lib/libmegamoe.so.2.0.0"

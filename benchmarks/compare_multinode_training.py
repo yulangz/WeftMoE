@@ -203,7 +203,9 @@ def main():
         "network": {
             "megamoe": "NCCL GIN/RDMA same-rail device put/signal",
             "megatron": "NCCL Socket host-enqueued all-to-all",
-            "megatron_socket_ifname": "eth0",
+            "megatron_socket_ifname": sorted({
+                item.get("socket_ifname", "inherited") for item in megatron
+            }),
             "nccl_runtime": "2.29.7",
         },
         "gin_forward_runtime_audit": forward_audit,
