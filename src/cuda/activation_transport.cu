@@ -37,6 +37,7 @@
 #include "megamoe/api/errors.hpp"
 
 namespace megamoe::cuda {
+struct ActivationMegaKernelBackendState;
 namespace {
 
 constexpr std::size_t kAlign = 256;
@@ -740,6 +741,7 @@ struct ActivationPoolState {
   CudaExecution execution;
   std::uint32_t device = 0;
   std::mutex mutex;
+  std::weak_ptr<ActivationMegaKernelBackendState> gin_backend;
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
@@ -1353,9 +1355,10 @@ struct GinSyntheticArgs {
   bool identity_expert;
 };
 
-__global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const ncclGin gin(dev_comm, 0);
+__global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm,
+                                           std::uint32_t context_count) {
+  if (blockIdx.x < context_count && threadIdx.x == 0) {
+    const ncclGin gin(dev_comm, blockIdx.x);
     gin.resetSignal(0);
     gin.resetSignal(1);
     gin.resetCounter(0);
@@ -2643,6 +2646,7 @@ struct ForwardKernelArgs {
   std::size_t gin_return_receive_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
+  std::uint32_t gin_context_count = 1;
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
   std::size_t canonical_rows_offset;
@@ -3138,8 +3142,9 @@ local_p2p_forward_megakernel(
     }
   }
 #if __has_include(<nccl_device.h>)
-  if (a.use_gin && blockIdx.x == 0U) {
-    const ncclGin gin(a.gin_dev_comm, 0);
+  if (a.use_gin && blockIdx.x < a.gin_context_count) {
+    const auto context = static_cast<std::uint32_t>(blockIdx.x);
+    const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
     auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -3158,7 +3163,8 @@ local_p2p_forward_megakernel(
     for (std::uint64_t packet = 0;
          packet < a.dispatch.sizes.packet_count; ++packet) {
       const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
+      if (descriptor.destination_node == a.node ||
+          descriptor.sequence_on_link % a.gin_context_count != context)
         continue;
       const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
@@ -3229,8 +3235,11 @@ local_p2p_forward_megakernel(
       for (std::uint32_t index = 0;
            index < a.dispatch.sizes.incoming_signal_count; ++index) {
         const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node)
-          incoming_packets += signal.expected_packets;
+        if (signal.source_node != a.node) {
+          const auto full = signal.expected_packets / a.gin_context_count;
+          const auto tail = signal.expected_packets % a.gin_context_count;
+          incoming_packets += full + (context < tail ? 1ULL : 0ULL);
+        }
       }
       if (incoming_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
@@ -3247,6 +3256,8 @@ local_p2p_forward_megakernel(
                                       : signal.source_node - 1U;
       for (std::uint64_t sequence = 0;
            sequence < signal.expected_packets; ++sequence) {
+        if (sequence % a.gin_context_count != context)
+          continue;
         const auto packet =
             source_partition * a.max_tokens_per_rank + sequence;
         const auto header = receive_headers[packet];
@@ -3286,10 +3297,10 @@ local_p2p_forward_megakernel(
       }
     }
     if (threadIdx.x == 0U) {
-      status->deduplicated_cross_node_payload_bytes =
+      const auto bytes =
           sent_packets * a.hidden * sizeof(transport::BFloat16);
-      status->actual_dispatch_peer_bytes +=
-          sent_packets * a.hidden * sizeof(transport::BFloat16);
+      atomicAdd(&status->deduplicated_cross_node_payload_bytes, bytes);
+      atomicAdd(&status->actual_dispatch_peer_bytes, bytes);
     }
   }
 #endif
@@ -3700,18 +3711,21 @@ local_p2p_forward_megakernel(
     // packet's local fan-out directly from node-local expert arenas and emits
     // one contiguous return put/signal per token packet.
     grid.sync();
-    if (blockIdx.x == 0U) {
+    if (blockIdx.x < a.gin_context_count) {
+      const auto context = static_cast<std::uint32_t>(blockIdx.x);
       const auto first_local = a.node * a.local_world_size;
-      for (std::uint32_t local = threadIdx.x;
-           local < a.local_world_size; local += blockDim.x) {
-        const auto peer = first_local + local;
-        auto *ready = peer_at<unsigned long long>(
-            a.peer_bases[peer], a.gin_local_compute_ready_offset);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            published(ready[a.rank]);
-        published.store(a.epoch, ::cuda::memory_order_release);
+      if (context == 0U) {
+        for (std::uint32_t local = threadIdx.x;
+             local < a.local_world_size; local += blockDim.x) {
+          const auto peer = first_local + local;
+          auto *ready = peer_at<unsigned long long>(
+              a.peer_bases[peer], a.gin_local_compute_ready_offset);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              published(ready[a.rank]);
+          published.store(a.epoch, ::cuda::memory_order_release);
+        }
+        __syncthreads();
       }
-      __syncthreads();
       auto *local_ready = peer_at<unsigned long long>(
           a.local_base, a.gin_local_compute_ready_offset);
       for (std::uint32_t local = threadIdx.x;
@@ -3724,7 +3738,7 @@ local_p2p_forward_megakernel(
         }
       }
       __syncthreads();
-      const ncclGin gin(a.gin_dev_comm, 0);
+      const ncclGin gin(a.gin_dev_comm, context);
       const auto rail = ncclTeamRail(a.gin_dev_comm);
       auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
       auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -3747,6 +3761,8 @@ local_p2p_forward_megakernel(
                                         : signal.source_node - 1U;
         for (std::uint64_t sequence = 0;
              sequence < signal.expected_packets; ++sequence) {
+          if (sequence % a.gin_context_count != context)
+            continue;
           const auto packet =
               source_partition * a.max_tokens_per_rank + sequence;
           const auto header = receive_headers[packet];
@@ -3791,7 +3807,10 @@ local_p2p_forward_megakernel(
       if (threadIdx.x == 0U) {
         for (std::uint64_t packet = 0;
              packet < a.dispatch.sizes.packet_count; ++packet)
-          if (a.dispatch.packet_headers[packet].destination_node != a.node)
+          if (a.dispatch.packet_headers[packet].destination_node != a.node &&
+              a.dispatch.packet_headers[packet].sequence_on_link %
+                      a.gin_context_count ==
+                  context)
             ++outgoing_remote_packets;
         if (outgoing_remote_packets != 0ULL)
           gin.waitSignal(ncclCoopThread{}, 1, outgoing_remote_packets);
@@ -3802,7 +3821,8 @@ local_p2p_forward_megakernel(
       for (std::uint64_t packet = 0;
            packet < a.dispatch.sizes.packet_count; ++packet) {
         const auto descriptor = a.dispatch.packet_headers[packet];
-        if (descriptor.destination_node == a.node)
+        if (descriptor.destination_node == a.node ||
+            descriptor.sequence_on_link % a.gin_context_count != context)
           continue;
         const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
         const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
@@ -3819,6 +3839,13 @@ local_p2p_forward_megakernel(
       }
       __threadfence_system();
       __syncthreads();
+      if (threadIdx.x == 0U)
+        atomicAdd(&status->actual_return_peer_bytes,
+                  outgoing_remote_packets * a.dispatch.identity.top_k *
+                      a.hidden * sizeof(transport::BFloat16));
+    }
+    grid.sync();
+    if (blockIdx.x == 0U) {
       for (std::uint32_t destination = threadIdx.x;
            destination < a.world; destination += blockDim.x) {
         if (destination / a.local_world_size == a.node)
@@ -3829,10 +3856,6 @@ local_p2p_forward_megakernel(
                       [destination * a.channels]);
         ready.store(a.epoch, ::cuda::memory_order_release);
       }
-      if (threadIdx.x == 0U)
-        atomicAdd(&status->actual_return_peer_bytes,
-                  outgoing_remote_packets * a.dispatch.identity.top_k *
-                      a.hidden * sizeof(transport::BFloat16));
     }
     grid.sync();
   }
@@ -3981,6 +4004,7 @@ struct BackwardKernelArgs {
   std::size_t gin_return_gate_receive_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
+  std::uint32_t gin_context_count = 1;
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
   std::size_t canonical_x_offset;
@@ -4636,18 +4660,21 @@ local_p2p_backward_megakernel(
     atomicAdd(&status->actual_dy_peer_bytes,
               dy_peer_rows * a.hidden * sizeof(transport::BFloat16));
 #if __has_include(<nccl_device.h>)
-  if (a.use_gin && blockIdx.x == 0U) {
+  if (a.use_gin && blockIdx.x < a.gin_context_count) {
+    const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const auto first_local = a.node * a.local_world_size;
-    for (std::uint32_t local = threadIdx.x;
-         local < a.local_world_size; local += blockDim.x) {
-      const auto peer = first_local + local;
-      auto *ready = peer_at<unsigned long long>(
-          a.peer_bases[peer], a.gin_local_compute_ready_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          published(ready[a.rank]);
-      published.store(a.epoch, ::cuda::memory_order_release);
+    if (context == 0U) {
+      for (std::uint32_t local = threadIdx.x;
+           local < a.local_world_size; local += blockDim.x) {
+        const auto peer = first_local + local;
+        auto *ready = peer_at<unsigned long long>(
+            a.peer_bases[peer], a.gin_local_compute_ready_offset);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            published(ready[a.rank]);
+        published.store(a.epoch, ::cuda::memory_order_release);
+      }
+      __syncthreads();
     }
-    __syncthreads();
     auto *local_ready = peer_at<unsigned long long>(
         a.local_base, a.gin_local_compute_ready_offset);
     for (std::uint32_t local = threadIdx.x;
@@ -4660,7 +4687,7 @@ local_p2p_backward_megakernel(
       }
     }
     __syncthreads();
-    const ncclGin gin(a.gin_dev_comm, 0);
+    const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
     auto *bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -4682,7 +4709,8 @@ local_p2p_backward_megakernel(
     for (std::uint64_t packet = 0;
          packet < a.dispatch.sizes.packet_count; ++packet) {
       const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
+      if (descriptor.destination_node == a.node ||
+          descriptor.sequence_on_link % a.gin_context_count != context)
         continue;
       const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
@@ -4758,8 +4786,11 @@ local_p2p_backward_megakernel(
       for (std::uint32_t index = 0;
            index < a.dispatch.sizes.incoming_signal_count; ++index) {
         const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node)
-          incoming_packets += signal.expected_packets;
+        if (signal.source_node != a.node) {
+          const auto full = signal.expected_packets / a.gin_context_count;
+          const auto tail = signal.expected_packets % a.gin_context_count;
+          incoming_packets += full + (context < tail ? 1ULL : 0ULL);
+        }
       }
       if (incoming_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
@@ -4776,6 +4807,8 @@ local_p2p_backward_megakernel(
                                       : signal.source_node - 1U;
       for (std::uint64_t sequence = 0;
            sequence < signal.expected_packets; ++sequence) {
+        if (sequence % a.gin_context_count != context)
+          continue;
         const auto packet =
             source_partition * a.max_tokens_per_rank + sequence;
         const auto header = receive_headers[packet];
@@ -5292,8 +5325,35 @@ local_p2p_backward_megakernel(
   }
 
 #if __has_include(<nccl_device.h>)
-  if (a.use_gin && blockIdx.x == 0U) {
-    const ncclGin gin(a.gin_dev_comm, 0);
+  if (a.use_gin && blockIdx.x < a.gin_context_count) {
+    const auto context = static_cast<std::uint32_t>(blockIdx.x);
+    const auto first_local = a.node * a.local_world_size;
+    const auto compute_epoch = a.epoch | (1ULL << 63U);
+    if (context == 0U) {
+      for (std::uint32_t local = threadIdx.x;
+           local < a.local_world_size; local += blockDim.x) {
+        const auto peer = first_local + local;
+        auto *ready = peer_at<unsigned long long>(
+            a.peer_bases[peer], a.gin_local_compute_ready_offset);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            published(ready[a.rank]);
+        published.store(compute_epoch, ::cuda::memory_order_release);
+      }
+      __syncthreads();
+    }
+    auto *local_ready = peer_at<unsigned long long>(
+        a.local_base, a.gin_local_compute_ready_offset);
+    for (std::uint32_t local = threadIdx.x;
+         local < a.local_world_size; local += blockDim.x) {
+      const auto peer = first_local + local;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          observed(local_ready[peer]);
+      while (observed.load(::cuda::memory_order_acquire) < compute_epoch &&
+             !backward_cancelled(a)) {
+      }
+    }
+    __syncthreads();
+    const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
     auto *bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
@@ -5320,6 +5380,8 @@ local_p2p_backward_megakernel(
                                       : signal.source_node - 1U;
       for (std::uint64_t sequence = 0;
            sequence < signal.expected_packets; ++sequence) {
+        if (sequence % a.gin_context_count != context)
+          continue;
         const auto packet =
             source_partition * a.max_tokens_per_rank + sequence;
         const auto header = receive_headers[packet];
@@ -5374,7 +5436,10 @@ local_p2p_backward_megakernel(
     if (threadIdx.x == 0U) {
       for (std::uint64_t packet = 0;
            packet < a.dispatch.sizes.packet_count; ++packet)
-        if (a.dispatch.packet_headers[packet].destination_node != a.node)
+        if (a.dispatch.packet_headers[packet].destination_node != a.node &&
+            a.dispatch.packet_headers[packet].sequence_on_link %
+                    a.gin_context_count ==
+                context)
           ++outgoing_remote_packets;
       if (outgoing_remote_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 1, outgoing_remote_packets);
@@ -5383,7 +5448,8 @@ local_p2p_backward_megakernel(
     for (std::uint64_t packet = 0;
          packet < a.dispatch.sizes.packet_count; ++packet) {
       const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
+      if (descriptor.destination_node == a.node ||
+          descriptor.sequence_on_link % a.gin_context_count != context)
         continue;
       const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
@@ -5402,15 +5468,22 @@ local_p2p_backward_megakernel(
     }
     __threadfence_system();
     __syncthreads();
-    for (std::uint32_t destination = threadIdx.x;
-         destination < a.world; destination += blockDim.x) {
-      if (destination / a.local_world_size == a.node)
-        continue;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(peer_at<unsigned long long>(
-              a.local_base, a.outgoing_signal_offset)
-                    [destination * a.channels]);
-      ready.store(a.epoch, ::cuda::memory_order_release);
+    if (threadIdx.x == 0U) {
+      const auto completed = atomicAdd(&scheduler[31], 1ULL) + 1ULL;
+      if (completed == a.gin_context_count) {
+        __threadfence_system();
+        for (std::uint32_t destination = 0; destination < a.world;
+             ++destination) {
+          if (destination / a.local_world_size == a.node)
+            continue;
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              ready(peer_at<unsigned long long>(
+                  a.local_base, a.outgoing_signal_offset)
+                        [destination * a.channels]);
+          ready.store(a.epoch, ::cuda::memory_order_release);
+        }
+      }
     }
   }
 #endif
@@ -5887,6 +5960,7 @@ struct GinBackendState : ActivationMegaKernelBackendState {
   std::uint32_t local_world_size = 0;
   std::uint32_t node = 0;
   std::uint32_t local_rank = 0;
+  std::uint32_t gin_context_count = 1;
   bool dev_comm_created = false;
 
   ~GinBackendState() noexcept {
@@ -7016,6 +7090,18 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     transport_error(NotifyErrorCode::WorkspaceMismatch, "gin-create",
                     "provenance", session.rank(),
                     "same session/world/device", "mismatch");
+  {
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    if (auto cached_base = pool->gin_backend.lock()) {
+      auto cached = std::dynamic_pointer_cast<GinBackendState>(cached_base);
+      if (!cached || cached->nccl.get() != nccl.get() ||
+          !cached->execution.token().same_instance(execution.token()))
+        transport_error(NotifyErrorCode::WorkspaceMismatch, "gin-create",
+                        "cached backend provenance", session.rank(),
+                        "same communicator/execution", "mismatch");
+      return cached;
+    }
+  }
 
   using QueryPropertiesFn = ncclResult_t (*)(ncclComm_t,
                                               ncclCommProperties_t *);
@@ -7214,9 +7300,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   }
   ncclDevCommRequirements_t requirements =
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  requirements.ginContextCount = 1;
+  constexpr std::uint32_t kGinContextCount = 8;
+  requirements.ginContextCount = kGinContextCount;
   requirements.ginExclusiveContexts = true;
-  requirements.ginQueueDepth = 32;
+  requirements.ginQueueDepth = 64;
+  // 0=dispatch arrival, 1=return arrival.
   requirements.ginSignalCount = 2;
   requirements.ginCounterCount = 1;
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
@@ -7227,6 +7315,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
       session.session().generation(), ExchangeKind::ExpertCounts,
       "ncclDevCommCreate(activation GIN)");
   backend->dev_comm_created = true;
+  backend->gin_context_count = kGinContextCount;
   try {
     backend->windows.reserve(pool->slots.size());
     for (auto &slot : pool->slots) {
@@ -7248,6 +7337,10 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   } catch (...) {
     backend.reset();
     throw;
+  }
+  {
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    pool->gin_backend = backend;
   }
   return backend;
 #endif
@@ -9107,7 +9200,9 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN reset barrier)");
-  gin_synthetic_reset_kernel<<<1, 1, 0, exec->stream>>>(backend->dev_comm);
+  gin_synthetic_reset_kernel<<<backend->gin_context_count, 1, 0,
+                               exec->stream>>>(backend->dev_comm,
+                                               backend->gin_context_count);
   internal::throw_cuda(
       "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -9401,8 +9496,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "reset Forward GIN barrier");
-    gin_synthetic_reset_kernel<<<1, 1, 0, exec->stream>>>(
-        gin_backend->dev_comm);
+    gin_synthetic_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
+                                 exec->stream>>>(
+        gin_backend->dev_comm, gin_backend->gin_context_count);
     internal::throw_cuda(
         "forward-run", cudaGetLastError(), id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
@@ -9462,6 +9558,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     args.gin_return_receive_offset = state->gin_layout.return_receive;
     args.node = gin_backend->node;
     args.local_world_size = gin_backend->local_world_size;
+    args.gin_context_count = gin_backend->gin_context_count;
     args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   }
   args.canonical_rows_offset = layout.canonical_rows;
@@ -9562,23 +9659,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA forward launch");
-  if (use_gin) {
-#if __has_include(<nccl_device.h>)
-    // The device terminal epoch is node-local. Keep the registered GIN
-    // window leased until every rail peer has stopped consuming it. This is
-    // one control word; no activation payload crosses the host path.
-    auto *gin_barrier = at<std::uint64_t>(slot.gin_window,
-                                          state->gin_layout.barrier);
-    internal::throw_nccl(
-        "forward-run",
-        ncclAllReduce(gin_barrier, gin_barrier, 1, ncclUint64, ncclSum,
-                      backend->nccl->comm, exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
-        "ncclAllReduce(Forward GIN terminal lease rendezvous)");
-#endif
-  }
   internal::throw_cuda(
       "forward-run",
       cudaEventRecord(slot.forward_output_ready, exec->stream),
@@ -9586,8 +9666,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "cudaEventRecord(Forward output/cache ready)");
-  // Local P2P relies on the peer-visible terminal epoch. The GIN path has
-  // already enqueued its all-rank window-lease rendezvous above.
+  // Local P2P relies on the peer-visible terminal epoch. GIN payload and
+  // return consumers have already acquired their per-generation signals;
+  // the next Notify/reset agreement is the registered-window reuse boundary.
   internal::throw_cuda(
       "forward-run",
       cudaMemcpyAsync(slot.host_forward_status,
@@ -10012,8 +10093,9 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "reset Backward GIN barrier");
-    gin_synthetic_reset_kernel<<<1, 1, 0, exec->stream>>>(
-        gin_backend->dev_comm);
+    gin_synthetic_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
+                                 exec->stream>>>(
+        gin_backend->dev_comm, gin_backend->gin_context_count);
     internal::throw_cuda(
         "backward-run", cudaGetLastError(), id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
@@ -10083,6 +10165,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         state->gin_layout.return_gate_receive;
     args.node = gin_backend->node;
     args.local_world_size = gin_backend->local_world_size;
+    args.gin_context_count = gin_backend->gin_context_count;
     args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   }
   args.canonical_x_offset = layout.canonical_rows;
@@ -10175,22 +10258,6 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA Backward launch");
-  if (use_gin) {
-#if __has_include(<nccl_device.h>)
-    // Stream ordering places this rendezvous after all device puts and remote
-    // window reads performed by the persistent Backward kernel.
-    auto *gin_barrier = at<std::uint64_t>(slot.gin_window,
-                                          state->gin_layout.barrier);
-    internal::throw_nccl(
-        "backward-run",
-        ncclAllReduce(gin_barrier, gin_barrier, 1, ncclUint64, ncclSum,
-                      backend->nccl->comm, exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
-        "ncclAllReduce(Backward GIN terminal lease rendezvous)");
-#endif
-  }
   const auto backward_launch_enqueued = std::chrono::steady_clock::now();
   const bool capture_hashes =
       std::getenv("MEGAMOE_BACKWARD_CAPTURE_HASH") != nullptr;

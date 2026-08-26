@@ -4099,7 +4099,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " cache_hash=" << cache_hash
               << " cache_elements=" << cached_ab.size()
               << " pool2_isolated=1"
-              << " total_us=" << no_cache_timings.total_us << std::endl;
+              << " total_us=" << no_cache_timings.total_us
+              << " dispatch_us=" << no_cache_timings.dispatch_us
+              << " fc1_us=" << no_cache_timings.fc1_swiglu_us
+              << " fc2_us=" << no_cache_timings.fc2_us
+              << " return_us=" << no_cache_timings.combine_return_us
+              << " reduce_us=" << no_cache_timings.reduce_us << std::endl;
     return;
   }
   if (benchmark_integrated) {
