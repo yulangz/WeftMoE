@@ -360,6 +360,8 @@ def environment_overrides(args):
         overrides["NCCL_SOCKET_IFNAME"] = args.socket_ifname
     if args.disable_ib:
         overrides["NCCL_IB_DISABLE"] = "1"
+    elif args.enable_ib:
+        overrides["NCCL_IB_DISABLE"] = "0"
     # These test/benchmark controls are ordinary non-secret configuration.
     # Forward them explicitly so local and remote ranks cannot silently run a
     # different generation count, shape, or gate mode.
@@ -370,6 +372,13 @@ def environment_overrides(args):
         "MEGAMOE_FORWARD_BENCH_ROUNDS",
         "MEGAMOE_BACKWARD_BENCH_ROUNDS",
         "MEGAMOE_BACKWARD_HASH_REPEATS",
+        "MEGAMOE_BACKWARD_ROUTE_CASE",
+        "MEGAMOE_BACKWARD_SMOKE_REPEATS",
+        "MEGAMOE_BACKWARD_POOL2_VALIDATE",
+        "MEGAMOE_BACKWARD_CAPTURE_HASH",
+        "MEGAMOE_BACKWARD_STAGE_HASHES",
+        "MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH",
+        "MEGAMOE_BACKWARD_CACHE_FIRST",
         "MEGAMOE_FORWARD_CACHE",
         "MEGAMOE_BACKWARD_CACHE",
         "MEGAMOE_P2P_TOP_K",
@@ -573,8 +582,11 @@ def parse_args(argv=None):
                         help="optional libnccl directory on both hosts")
     parser.add_argument("--socket-ifname",
                         help="optional NCCL_SOCKET_IFNAME override")
-    parser.add_argument("--disable-ib", action="store_true",
-                        help="set NCCL_IB_DISABLE=1 explicitly")
+    ib_group = parser.add_mutually_exclusive_group()
+    ib_group.add_argument("--disable-ib", action="store_true",
+                          help="set NCCL_IB_DISABLE=1 explicitly")
+    ib_group.add_argument("--enable-ib", action="store_true",
+                          help="set NCCL_IB_DISABLE=0 explicitly")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--scenario",
@@ -585,6 +597,7 @@ def parse_args(argv=None):
                  "gin_probe", "gin_put_probe", "gin_team_pool",
                  "gin_forward_smoke",
                  "gin_backward_smoke",
+                 "socket_backward_smoke",
                  "gin_forward_bench",
                  "gin_backward_bench",
                  "socket_forward_bench",
@@ -594,8 +607,8 @@ def parse_args(argv=None):
         default="valid",
     )
     args = parser.parse_args(argv)
-    if args.gpus_per_node not in (1, 8):
-        raise SystemExit("gpus-per-node must be 1 or 8 for the acceptance topology")
+    if args.gpus_per_node <= 0:
+        raise SystemExit("gpus-per-node must be positive")
     return args
 
 
@@ -685,6 +698,15 @@ def launch_rank_processes(args):
 def main(argv=None):
     args = parse_args(argv)
     world = 2 * args.gpus_per_node
+    launch_environment = environment_overrides(args)
+    print(
+        "LAUNCH_CONFIG "
+        f"route_case={launch_environment.get('MEGAMOE_BACKWARD_ROUTE_CASE', 'regular')} "
+        f"repeats={launch_environment.get('MEGAMOE_BACKWARD_SMOKE_REPEATS', '1')} "
+        f"pool2={int(launch_environment.get('MEGAMOE_BACKWARD_POOL2_VALIDATE') == '1')} "
+        f"cache_first={int('MEGAMOE_BACKWARD_CACHE_FIRST' in launch_environment)} "
+        f"NCCL_IB_DISABLE={launch_environment.get('NCCL_IB_DISABLE', 'inherit')}"
+    )
     outputs = launch_rank_processes(args)
 
     runtime_lines = []
@@ -767,7 +789,8 @@ def main(argv=None):
         print(f"[PASS] runtime GIN rail/local-team/pool world={world}")
         return
 
-    if args.scenario in ("gin_forward_smoke", "gin_backward_smoke"):
+    if args.scenario in ("gin_forward_smoke", "gin_backward_smoke",
+                         "socket_backward_smoke"):
         failures = []
         evidence = []
         for result in outputs:
@@ -787,15 +810,34 @@ def main(argv=None):
             raise RuntimeError("distributed GIN MegaKernel failed:\n" +
                                "\n".join(failures))
         print("\n".join(evidence))
+        if args.scenario in ("gin_backward_smoke", "socket_backward_smoke"):
+            stage_evidence = []
+            for result in outputs:
+                stage_evidence.extend(
+                    line for line in result.stdout.splitlines()
+                    if line.startswith("BACKWARD_HASH_RECOVERY ")
+                )
+                stage_evidence.extend(
+                    line for line in result.stderr.splitlines()
+                    if line.startswith("BACKWARD_STAGE_HASH ") or
+                    line.startswith("BACKWARD_STAGE_FIRST_MISMATCH ")
+                )
+            if stage_evidence:
+                print("\n".join(stage_evidence))
         stage = "Forward" if args.scenario == "gin_forward_smoke" else "Backward"
-        print(f"[PASS] same-rail GIN {stage} persistent kernel world={world}")
+        backend = ("host-enqueued Socket fallback"
+                   if args.scenario == "socket_backward_smoke"
+                   else "same-rail GIN")
+        print(f"[PASS] {backend} {stage} persistent kernel world={world}")
         return
 
     if args.scenario in ("gin_forward_bench", "gin_backward_bench"):
         failures = []
         evidence = []
+        pool2 = (args.scenario == "gin_backward_bench" and
+                 os.environ.get("MEGAMOE_BACKWARD_POOL2_VALIDATE") == "1")
         marker = ("FORWARD_BENCH " if args.scenario == "gin_forward_bench"
-                  else "BACKWARD_BENCH ")
+                  else ("BACKWARD_POOL2 " if pool2 else "BACKWARD_BENCH "))
         for result in outputs:
             lines = [line for line in result.stdout.splitlines()
                      if line.startswith(marker)]
@@ -807,7 +849,7 @@ def main(argv=None):
                 )
             else:
                 evidence.append(lines[0])
-                if "backend=gin-rdma" not in lines[0]:
+                if not pool2 and "backend=gin-rdma" not in lines[0]:
                     failures.append(
                         f"rank={result.rank} wrong benchmark backend: "
                         f"{lines[0]}"
@@ -816,10 +858,13 @@ def main(argv=None):
             raise RuntimeError("distributed GIN benchmark failed:\n" +
                                "\n".join(failures))
         print("\n".join(evidence))
-        print("GIN_BENCH_JSON " + json.dumps(
-            aggregate_gin_benchmark(outputs, args.scenario),
-            sort_keys=True))
-        print(f"[PASS] same-rail GIN benchmark world={world}")
+        if pool2:
+            print(f"[PASS] same-rail GIN Backward pool=2 lifecycle world={world}")
+        else:
+            print("GIN_BENCH_JSON " + json.dumps(
+                aggregate_gin_benchmark(outputs, args.scenario),
+                sort_keys=True))
+            print(f"[PASS] same-rail GIN benchmark world={world}")
         return
 
     if args.scenario == "socket_forward_bench":
@@ -851,9 +896,11 @@ def main(argv=None):
     if args.scenario == "socket_backward_bench":
         failures = []
         evidence = []
+        pool2 = os.environ.get("MEGAMOE_BACKWARD_POOL2_VALIDATE") == "1"
+        marker = "BACKWARD_POOL2 " if pool2 else "BACKWARD_BENCH "
         for result in outputs:
             lines = [line for line in result.stdout.splitlines()
-                     if line.startswith("BACKWARD_BENCH ")]
+                     if line.startswith(marker)]
             if result.returncode != 0 or len(lines) != 1:
                 failures.append(
                     f"rank={result.rank} exit={result.returncode}; "
@@ -862,7 +909,7 @@ def main(argv=None):
                 )
             else:
                 evidence.append(lines[0])
-                if "backend=nccl-socket-fallback" not in lines[0]:
+                if not pool2 and "backend=nccl-socket-fallback" not in lines[0]:
                     failures.append(
                         f"rank={result.rank} wrong Socket Backward backend: "
                         f"{lines[0]}"
@@ -871,7 +918,8 @@ def main(argv=None):
             raise RuntimeError("distributed Socket Backward failed:\n" +
                                "\n".join(failures))
         print("\n".join(evidence))
-        print(f"[PASS] host-enqueued Socket full Backward world={world}")
+        suffix = "pool=2 lifecycle" if pool2 else "full Backward"
+        print(f"[PASS] host-enqueued Socket {suffix} world={world}")
         return
 
     if args.scenario == "activation_socket":

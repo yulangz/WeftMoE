@@ -279,6 +279,7 @@ struct BackwardDeviceStatus {
   unsigned long long raw_cross_node_dy_bytes;
   unsigned long long gin_dispatch_payload_bytes;
   unsigned long long gin_return_payload_bytes;
+  unsigned long long padded_reduction_rows;
   unsigned int error;
   unsigned int error_field;
 };
@@ -378,6 +379,7 @@ struct Layout {
   std::size_t backward_dw2 = 0;
   std::size_t backward_scheduler = 0;
   std::size_t backward_dw_timeline = 0;
+  std::size_t backward_validation_status = 0;
   std::size_t backward_status = 0;
   std::size_t status = 0;
   std::size_t total = 0;
@@ -643,7 +645,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           sizeof(transport::BFloat16), "backward combined dX");
       const auto intermediate_tiles = (intermediate + 255ULL) / 256ULL;
       layout.backward_dgate_partial = append(
-          cursor, checked_mul(routes, intermediate_tiles,
+          cursor, checked_mul(rows, intermediate_tiles,
                               "backward dGate partials"),
           sizeof(float), "backward dGate partials");
       layout.backward_dgate_canonical = append(
@@ -687,6 +689,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       layout.backward_dw_timeline = append(
           cursor, max_owned_experts, sizeof(BackwardExpertDwTimeline),
           "backward per-expert dW timeline");
+      layout.backward_validation_status = append(
+          cursor, checked_mul(config.max_world_size, 8ULL,
+                              "backward terminal validation words"),
+          sizeof(std::uint64_t), "backward terminal validation status");
       layout.backward_status = append(cursor, 1, sizeof(BackwardDeviceStatus),
                                       "backward status");
     }
@@ -1351,15 +1357,18 @@ __global__ void socket_scatter_backward_returns_kernel(
     const LocalP2pRouteHeader *headers,
     const transport::BFloat16 *compact_dx, const float *compact_dgate,
     transport::BFloat16 *dx_by_route, float *dgate_by_route,
-    std::uint64_t routes, std::uint64_t hidden) {
+    std::uint32_t *coverage, std::uint64_t routes, std::uint64_t hidden) {
   const auto packed = static_cast<std::uint64_t>(blockIdx.x);
   if (packed >= routes)
     return;
   const auto route = headers[packed].route_index;
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
     dx_by_route[route * hidden + h] = compact_dx[packed * hidden + h];
-  if (threadIdx.x == 0)
+  if (threadIdx.x == 0) {
     dgate_by_route[route] = compact_dgate[packed];
+    if (coverage != nullptr)
+      coverage[route] = 1U;
+  }
 }
 
 __global__ void socket_backward_reduce_kernel(
@@ -4396,6 +4405,11 @@ struct BackwardKernelArgs {
   unsigned long long *progress;
   std::uint32_t progress_experts;
   bool use_forward_cache;
+#if MEGAMOE_DEBUG_VALIDATE
+  std::size_t debug_dv_offset;
+  std::size_t debug_coverage_offset;
+  bool capture_stage_storage;
+#endif
 };
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
@@ -4913,6 +4927,12 @@ local_p2p_backward_megakernel(
                                              a.dab_transpose_offset);
   auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset);
   auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+  auto *debug_dv = peer_at<transport::BFloat16>(a.local_base,
+                                                a.debug_dv_offset);
+  auto *debug_coverage = peer_at<std::uint32_t>(a.local_base,
+                                                a.debug_coverage_offset);
+#endif
   auto *ab = a.use_forward_cache
                  ? peer_at<transport::BFloat16>(a.local_base,
                                                  a.forward_ab_cache_offset)
@@ -4948,8 +4968,18 @@ local_p2p_backward_megakernel(
     }
     scheduler[8] = mblocks;
     scheduler[9] = padded;
+    status->padded_reduction_rows = padded;
   }
   grid.sync();
+#if MEGAMOE_DEBUG_VALIDATE
+  if (a.capture_stage_storage)
+    for (std::uint64_t route =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         route < a.dispatch.sizes.route_count;
+         route += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+      debug_coverage[route] = 0U;
+  grid.sync();
+#endif
   for (std::uint32_t expert =
            static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        expert < a.dispatch.sizes.owned_expert_count;
@@ -5524,6 +5554,11 @@ local_p2p_backward_megakernel(
               transport::BFloat16{float_to_bf16_bits(db)};
           epilogue_dv[epilogue_index] = transport::BFloat16{dv_bf16};
           epilogue_s[epilogue_index] = transport::BFloat16{s_bf16};
+#if MEGAMOE_DEBUG_VALIDATE
+          if (a.capture_stage_storage)
+            debug_dv[(row + block_m) * a.intermediate + output_column] =
+                transport::BFloat16{dv_bf16};
+#endif
         }
       }
       });
@@ -5781,6 +5816,13 @@ local_p2p_backward_megakernel(
           auto *source_dgate = peer_at<float>(
               a.peer_bases[header.source_rank], a.dgate_offset);
           source_dgate[header.route_index] = dgate_canonical[row + local_row];
+#if MEGAMOE_DEBUG_VALIDATE
+          if (a.capture_stage_storage) {
+            auto *source_coverage = peer_at<std::uint32_t>(
+                a.peer_bases[header.source_rank], a.debug_coverage_offset);
+            source_coverage[header.route_index] = 1U;
+          }
+#endif
         }
       }
     }
@@ -6125,6 +6167,10 @@ local_p2p_backward_megakernel(
                                a.dispatch.identity.top_k +
                            target.topk_slot;
         dgate[route] = return_gate_receive[fanout];
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.capture_stage_storage)
+          debug_coverage[route] = 1U;
+#endif
       }
     }
     __threadfence_system();
@@ -6789,6 +6835,8 @@ struct DeviceBackwardHandle::Impl {
   std::uint64_t intermediate = 0;
   bool used_forward_cache = false;
   bool hashes_captured = false;
+  bool stage_storage_captured = false;
+  std::uint64_t padded_reduction_rows = 0;
   BackwardStorageHashes hashes;
 };
 
@@ -7292,6 +7340,292 @@ BackwardStorageHashes testing::hash_backward_storage_for_validation(
 BackwardStorageHashes testing::rehash_backward_storage_for_validation(
     const DeviceBackwardHandle &handle, const CudaExecution &execution) {
   return hash_backward_storage_impl(handle, execution, false);
+}
+
+BackwardStageStorageHashes
+testing::hash_backward_stage_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle, "backward-stage-hash",
+                    "handle/execution", 0, "valid", "empty");
+  const auto &impl = BackwardStorageHashAccess::get(handle);
+  const auto state = internal::checked_execution_state(execution);
+  if (state->device != impl.pool->device ||
+      !execution.token().same_instance(impl.backend->execution.token()))
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "backward-stage-hash", "execution/device",
+                    impl.identity.rank, "exact Backward execution", "foreign");
+  const auto &slot = impl.pool->slots[impl.slot->index];
+  const auto &layout = impl.pool->layout;
+  const auto padded_rows = impl.padded_reduction_rows;
+  const auto hash_one = [&](const transport::BFloat16 *values,
+                            std::uint64_t elements,
+                            const char *field) -> DeviceStorageHash128 {
+    if (elements == 0)
+      return {kWeightHashSeedLow, kWeightHashSeedHigh, 0};
+    const auto chunk_count =
+        (elements + kWeightHashChunkElements - 1ULL) /
+        kWeightHashChunkElements;
+    const auto chunk_bytes = checked_size(
+        checked_mul(chunk_count, sizeof(WeightHashPair),
+                    "stage hash chunk bytes"),
+        "stage hash chunk bytes");
+    const auto scratch_bytes =
+        layout.backward_dw_timeline - layout.backward_scheduler;
+    if (chunk_bytes > scratch_bytes)
+      transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                      "backward-stage-hash", "pooled hash scratch",
+                      impl.identity.rank, std::to_string(chunk_bytes),
+                      std::to_string(scratch_bytes));
+    auto *chunks = reinterpret_cast<WeightHashPair *>(
+        at<void>(slot.device, layout.backward_scheduler));
+    auto *result = reinterpret_cast<WeightHashPair *>(
+        at<void>(slot.device, layout.backward_status));
+    hash_forward_weight_chunks_kernel<<<
+        static_cast<unsigned>(chunk_count), 256, 0, state->stream>>>(
+        values, elements, chunks);
+    internal::throw_cuda(
+        "backward-stage-hash", cudaGetLastError(), impl.identity.rank,
+        impl.identity.world, "backward-validation", impl.identity.generation,
+        ExchangeKind::ExpertCounts, field);
+    finalize_forward_weight_hash_kernel<<<1, 1, 0, state->stream>>>(
+        chunks, chunk_count, elements, result);
+    internal::throw_cuda(
+        "backward-stage-hash", cudaGetLastError(), impl.identity.rank,
+        impl.identity.world, "backward-validation", impl.identity.generation,
+        ExchangeKind::ExpertCounts, field);
+    WeightHashPair host{};
+    internal::throw_cuda(
+        "backward-stage-hash",
+        cudaMemcpyAsync(&host, result, sizeof(host), cudaMemcpyDeviceToHost,
+                        state->stream),
+        impl.identity.rank, impl.identity.world, "backward-validation",
+        impl.identity.generation, ExchangeKind::ExpertCounts, field);
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                              sizeof(host));
+    internal::throw_cuda(
+        "backward-stage-hash", cudaStreamSynchronize(state->stream),
+        impl.identity.rank, impl.identity.world, "backward-validation",
+        impl.identity.generation, ExchangeKind::ExpertCounts, field);
+    return {host.low, host.high, elements};
+  };
+  const auto bf16 = [&](std::size_t offset) {
+    return at<const transport::BFloat16>(slot.device, offset);
+  };
+  const auto float_words = [&](std::size_t offset) {
+    return reinterpret_cast<const transport::BFloat16 *>(
+        at<const float>(slot.device, offset));
+  };
+  const auto rows_hidden = checked_mul(impl.incoming_rows, impl.hidden,
+                                       "stage hash rows hidden");
+  const auto rows_intermediate = checked_mul(
+      impl.incoming_rows, impl.intermediate,
+      "stage hash rows intermediate");
+  const auto padded_intermediate = checked_mul(
+      padded_rows, impl.intermediate, "stage hash padded intermediate");
+  const auto tiles = (impl.intermediate + 255ULL) / 256ULL;
+  BackwardStageStorageHashes hashes;
+  hashes.incoming_rows = impl.incoming_rows;
+  hashes.padded_reduction_rows = padded_rows;
+  hashes.canonical_x = hash_one(bf16(layout.canonical_rows), rows_hidden,
+                                "canonical X");
+  hashes.canonical_dy = hash_one(bf16(layout.backward_dy_canonical),
+                                 rows_hidden, "canonical dY");
+  // TMA supplies zero for the rounded tail beyond the canonical tensor-map
+  // extent, so the actual nonzero dW2 input extent is exactly canonical dY.
+  hashes.dy_dw2_reduction_extent = hashes.canonical_dy;
+  const auto ab_offset = impl.used_forward_cache
+                             ? layout.forward_ab_cache
+                             : layout.backward_recompute_ab;
+  hashes.active_ab = hash_one(
+      bf16(ab_offset), checked_mul(rows_intermediate, 2ULL, "stage hash A/B"),
+      "active A/B");
+  hashes.s = hash_one(bf16(layout.forward_s), rows_intermediate, "S");
+  hashes.dv = impl.stage_storage_captured
+                  ? hash_one(bf16(layout.backward_forward_output),
+                             rows_intermediate, "dV")
+                  : DeviceStorageHash128{kWeightHashSeedLow,
+                                         kWeightHashSeedHigh, 0};
+  hashes.u_transpose = hash_one(bf16(layout.backward_u_transpose),
+                                padded_intermediate, "U transpose");
+  hashes.dab = hash_one(
+      bf16(layout.backward_dab),
+      checked_mul(rows_intermediate, 2ULL, "stage hash dAB"), "dAB");
+  hashes.dab_transpose = hash_one(
+      bf16(layout.backward_dab_transpose),
+      checked_mul(padded_intermediate, 2ULL, "stage hash dAB transpose"),
+      "dAB transpose");
+  hashes.dgate_partial = hash_one(
+      float_words(layout.backward_dgate_partial),
+      checked_mul(checked_mul(impl.incoming_rows, tiles,
+                              "stage hash dGate partials"),
+                  2ULL, "stage hash dGate partial words"),
+      "dGate partial");
+  hashes.dgate_canonical = hash_one(
+      float_words(layout.backward_dgate_canonical),
+      checked_mul(impl.incoming_rows, 2ULL,
+                  "stage hash canonical dGate words"),
+      "canonical dGate");
+  hashes.dgate_final = hash_one(
+      float_words(layout.backward_dgate),
+      checked_mul(impl.route_count, 2ULL, "stage hash final dGate words"),
+      "final dGate");
+  const auto dw1_elements = checked_mul(
+      checked_mul(impl.owned_experts, 2ULL * impl.intermediate,
+                  "stage hash dW1 rows"),
+      impl.hidden, "stage hash dW1");
+  const auto dw2_elements = checked_mul(
+      checked_mul(impl.owned_experts, impl.hidden, "stage hash dW2 rows"),
+      impl.intermediate, "stage hash dW2");
+  hashes.dw2 = hash_one(bf16(layout.backward_dw2), dw2_elements, "dW2");
+  hashes.dw1 = hash_one(bf16(layout.backward_dw1), dw1_elements, "dW1");
+  hashes.return_signal_epoch = hash_one(
+      reinterpret_cast<const transport::BFloat16 *>(at<const std::uint64_t>(
+          slot.device, layout.outgoing_route_sequence)),
+      checked_mul(checked_mul(impl.identity.world,
+                              impl.pool->config.channels,
+                              "stage hash return signals"),
+                  4ULL, "stage hash return signal BF16 words"),
+      "return signal/epoch");
+  if (impl.stage_storage_captured) {
+    hashes.route_return_coverage = hash_one(
+        reinterpret_cast<const transport::BFloat16 *>(
+            at<const std::uint32_t>(slot.device, layout.packet_claim)),
+        checked_mul(impl.route_count, 2ULL,
+                    "stage hash return coverage BF16 words"),
+        "route return coverage");
+    std::vector<std::uint32_t> coverage(
+        checked_size(impl.route_count, "route return coverage elements"));
+    if (!coverage.empty()) {
+      internal::throw_cuda(
+          "backward-stage-hash",
+          cudaMemcpyAsync(coverage.data(),
+                          at<const std::uint32_t>(slot.device,
+                                                  layout.packet_claim),
+                          coverage.size() * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost, state->stream),
+          impl.identity.rank, impl.identity.world, "backward-validation",
+          impl.identity.generation, ExchangeKind::ExpertCounts,
+          "copy route return coverage");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                                coverage.size() * sizeof(std::uint32_t));
+      internal::throw_cuda(
+          "backward-stage-hash", cudaStreamSynchronize(state->stream),
+          impl.identity.rank, impl.identity.world, "backward-validation",
+          impl.identity.generation, ExchangeKind::ExpertCounts,
+          "synchronize route return coverage");
+    }
+    hashes.route_return_coverage_count = static_cast<std::uint64_t>(
+        std::count(coverage.begin(), coverage.end(), 1U));
+  }
+  return hashes;
+}
+
+BackwardHashAgreement testing::agree_backward_hashes_for_validation(
+    const DeviceBackwardHandle &handle,
+    const BackwardStorageHashes &expected,
+    const BackwardStorageHashes &actual,
+    const CudaExecution &execution) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "backward-hash-agreement", "handle/execution", 0,
+                    "valid", "empty");
+  const auto &impl = BackwardStorageHashAccess::get(handle);
+  const auto state = internal::checked_execution_state(execution);
+  if (state->device != impl.pool->device ||
+      !execution.token().same_instance(impl.backend->execution.token()))
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "backward-hash-agreement", "execution/device",
+                    impl.identity.rank, "exact Backward execution", "foreign");
+  const auto equal = [](const DeviceStorageHash128 &left,
+                        const DeviceStorageHash128 &right) {
+    return left.low == right.low && left.high == right.high &&
+           left.element_count == right.element_count;
+  };
+  std::uint32_t field = 0;
+  DeviceStorageHash128 expected_field{};
+  DeviceStorageHash128 actual_field{};
+  const std::array<std::pair<const DeviceStorageHash128 *,
+                             const DeviceStorageHash128 *>, 4>
+      fields{{{&expected.dx, &actual.dx},
+              {&expected.dw1, &actual.dw1},
+              {&expected.dw2, &actual.dw2},
+              {&expected.dgate, &actual.dgate}}};
+  for (std::size_t index = 0; index < fields.size(); ++index) {
+    if (!equal(*fields[index].first, *fields[index].second)) {
+      field = static_cast<std::uint32_t>(index + 1U);
+      expected_field = *fields[index].first;
+      actual_field = *fields[index].second;
+      break;
+    }
+  }
+  std::array<std::uint64_t, 8> local{
+      impl.identity.rank, field, expected_field.low, expected_field.high,
+      expected_field.element_count, actual_field.low, actual_field.high,
+      actual_field.element_count};
+  std::vector<std::uint64_t> gathered(
+      checked_size(checked_mul(impl.identity.world, local.size(),
+                               "terminal hash agreement words"),
+                   "terminal hash agreement words"));
+  auto *device_records = at<std::uint64_t>(
+      impl.pool->slots[impl.slot->index].device,
+      impl.pool->layout.backward_validation_status);
+  internal::throw_cuda(
+      "backward-hash-agreement",
+      cudaMemcpyAsync(device_records + impl.identity.rank * local.size(),
+                      local.data(), sizeof(local), cudaMemcpyHostToDevice,
+                      state->stream),
+      impl.identity.rank, impl.identity.world,
+      impl.backend->session.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts,
+      "copy local terminal Backward validation status");
+  internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
+                            sizeof(local));
+  internal::throw_nccl(
+      "backward-hash-agreement",
+      ncclAllGather(device_records + impl.identity.rank * local.size(),
+                    device_records, local.size(), ncclUint64,
+                    impl.backend->nccl->comm, state->stream),
+      impl.identity.rank, impl.identity.world,
+      impl.backend->session.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts,
+      "ncclAllGather(terminal Backward validation status)");
+  internal::throw_cuda(
+      "backward-hash-agreement",
+      cudaMemcpyAsync(gathered.data(), device_records,
+                      gathered.size() * sizeof(std::uint64_t),
+                      cudaMemcpyDeviceToHost, state->stream),
+      impl.identity.rank, impl.identity.world,
+      impl.backend->session.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts,
+      "copy terminal Backward validation matrix");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
+                            gathered.size() * sizeof(std::uint64_t));
+  internal::throw_cuda(
+      "backward-hash-agreement", cudaStreamSynchronize(state->stream),
+      impl.identity.rank, impl.identity.world,
+      impl.backend->session.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts,
+      "cudaStreamSynchronize(terminal Backward validation status)");
+  BackwardHashAgreement agreement;
+  agreement.matches = true;
+  for (std::uint32_t rank = 0; rank < impl.identity.world; ++rank) {
+    const auto *record = gathered.data() + rank * local.size();
+    if (record[0] != rank)
+      transport_error(NotifyErrorCode::ControlProtocolFailure,
+                      "backward-hash-agreement", "rank row",
+                      impl.identity.rank, std::to_string(rank),
+                      std::to_string(record[0]));
+    if (record[1] == 0)
+      continue;
+    agreement.matches = false;
+    agreement.origin_rank = rank;
+    agreement.field = static_cast<std::uint32_t>(record[1]);
+    agreement.expected = {record[2], record[3], record[4]};
+    agreement.actual = {record[5], record[6], record[7]};
+    break;
+  }
+  return agreement;
 }
 
 void testing::flip_backward_storage_byte_for_validation(
@@ -11396,6 +11730,12 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.progress_experts = state->config.max_owned_experts;
   args.use_forward_cache =
       f.cache_mode == ForwardCacheMode::CacheFc1InputOutput;
+#if MEGAMOE_DEBUG_VALIDATE
+  args.debug_dv_offset = layout.backward_forward_output;
+  args.debug_coverage_offset = layout.packet_claim;
+  args.capture_stage_storage =
+      std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr;
+#endif
 
   int sms = 0;
   internal::throw_cuda(
@@ -11576,6 +11916,13 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
           send_headers, send_payload, return_gate_receive,
           at<transport::BFloat16>(slot.device, layout.backward_dx_return),
           at<float>(slot.device, layout.backward_dgate),
+#if MEGAMOE_DEBUG_VALIDATE
+          args.capture_stage_storage
+              ? at<std::uint32_t>(slot.device, layout.packet_claim)
+              : nullptr,
+#else
+          nullptr,
+#endif
           view.sizes.route_count, config.hidden_size);
     if (id.num_tokens != 0)
       socket_backward_reduce_kernel<<<static_cast<unsigned int>(id.num_tokens),
@@ -11894,6 +12241,10 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->hidden = config.hidden_size;
   result->intermediate = config.intermediate_size;
   result->used_forward_cache = args.use_forward_cache;
+#if MEGAMOE_DEBUG_VALIDATE
+  result->stage_storage_captured = args.capture_stage_storage;
+#endif
+  result->padded_reduction_rows = status.padded_reduction_rows;
   result->hashes_captured = capture_hashes;
   if (capture_hashes) {
     const auto *captured = reinterpret_cast<const WeightHashPair *>(

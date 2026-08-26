@@ -735,6 +735,18 @@ dW uses one owner per output tile and increasing canonical padded-M traversal;
 dGate uses fixed intermediate-tile partials, and dX reduction follows the
 Forward handle's immutable expert-ID `combine_order`.
 
+The dGate partial plane is destination-owned: its first dimension is the
+maximum incoming canonical-row capacity, not the calling rank's outgoing route
+capacity. A concentrated route can therefore give one destination many more
+rows than it originated. Backward consumers use the exact incoming row count
+and the recorded padded reduction extent; rounded TMA tails are zero-filled and
+never extend a canonical dW reduction. Timing-excluded debug validation hashes
+the actual stage buffers and records one coverage word for every returned
+`(source token, top-k slot)`. Cache/no-cache comparison uses a fixed-width
+terminal AllGather before any rank acts on a local mismatch, choosing the
+lowest rank and fixed field order (`dX`, `dW1`, `dW2`, `dGate`). A subsequent
+healthy generation may reuse the same communicator.
+
 The pool's `enable_backward` layout reserves dY, dAB/U, dX return/combined,
 dGate partial/final, padded K-major transposed dW operands, dW1/dW2, scheduler
 and status storage per in-flight generation. U/dAB transposes are fused into

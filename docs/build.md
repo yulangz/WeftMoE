@@ -107,7 +107,8 @@ UBSAN_LIB=$(g++ -print-file-name=libubsan.so)
 LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/test_notify_dispatch
 LD_PRELOAD="$ASAN_LIB:$UBSAN_LIB" build-sanitize/metadata_dump >/dev/null
 make BUILD_DIR=build-sanitize reference-test
-make BUILD_DIR=build-sanitize cross-check
+make BUILD_DIR=build-sanitize \
+  SANITIZER_PRELOAD="$ASAN_LIB:$UBSAN_LIB" cross-check
 ```
 
 ## Optional CUDA/NCCL build and local tests
@@ -231,9 +232,19 @@ Forward/Backward benchmark scenarios below and is reported separately.
 
 The runtime team/pool setup is separately checked on all 16 ranks with
 `--gpus-per-node 8 --scenario gin_team_pool`. The observed two-slot small-shape
-pool reports `54,848` ordinary compute bytes and `4,624` GIN-registered bytes
+pool reports `55,440` ordinary compute bytes and `6,672` GIN-registered bytes
 per rank. All ranks validate rail size two, local team size eight, their
 runtime local rank, registered windows, and seven node-local IPC mappings.
+
+Backward smoke controls are forwarded identically to every local and remote
+rank. For example, the concentrated-route reproduction uses
+`MEGAMOE_BACKWARD_ROUTE_CASE=concentrated`,
+`MEGAMOE_BACKWARD_SMOKE_REPEATS=20`, and optional
+`MEGAMOE_BACKWARD_POOL2_VALIDATE=1`. `MEGAMOE_BACKWARD_CACHE_FIRST=1`
+reverses the generation-900/901 cache order in a fresh launcher session. The
+launcher prints the effective route case, repeat count, pool2 flag, cache
+order, and `NCCL_IB_DISABLE` value before starting ranks. Use `--enable-ib` or
+`--disable-ib` to set the latter explicitly; otherwise it is inherited.
 
 The explicit Socket correctness backend uses the default CUDA-12.9 NCCL
 runtime and requires the network choice at communicator creation. A two-rank

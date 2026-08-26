@@ -550,6 +550,59 @@ void test_activation_transport_protocol_oracle() {
   REQUIRE(many_result.audit.deduplicated_cross_node_payload_bytes == 14);
   REQUIRE(many_result.audit.raw_cross_node_payload_bytes == 14);
 
+  // Descriptor/team logic is runtime-shaped and is not restricted to the
+  // physically available two-node, 1/8-GPU acceptance topology.
+  const auto verify_runtime_topology = [&](std::uint32_t nodes,
+                                            std::uint32_t gpus) {
+    const auto world = nodes * gpus;
+    const auto top_k = std::min<std::uint32_t>(6U, world);
+    auto runtime = make_config(nodes, gpus, world, top_k, 4);
+    const auto source_rank = std::min<std::uint32_t>(2U, gpus - 1U);
+    std::vector<RankRoutingInput> runtime_inputs(world);
+    runtime_inputs[source_rank].num_tokens = 2;
+    for (std::uint64_t token = 0; token < 2; ++token)
+      for (std::uint32_t slot = 0; slot < top_k; ++slot)
+        runtime_inputs[source_rank].selected_experts.push_back(
+            static_cast<std::int32_t>((token * top_k + slot) % world));
+    const auto runtime_handles = megamoe::build_notify_dispatch_for_testing(
+        runtime, runtime_inputs,
+        "runtime-topology-" + std::to_string(nodes) + "x" +
+            std::to_string(gpus),
+        79 + nodes * 10U + gpus);
+    const auto &descriptor = runtime_handles[source_rank]->transport;
+    REQUIRE(descriptor.outgoing_signals.size() == nodes);
+    REQUIRE(descriptor.outgoing_packets.size() <= 2ULL * nodes);
+    const auto source_local = source_rank % gpus;
+    for (const auto &packet : descriptor.outgoing_packets) {
+      REQUIRE(packet.proxy_rank ==
+              packet.identity.destination_node * gpus + source_local);
+      REQUIRE(packet.channel == 0U);
+      for (const auto &fanout : packet.fanout) {
+        const auto owner = runtime.topology.expert_to_rank[fanout.expert_id];
+        REQUIRE(fanout.destination_local_rank == owner % gpus);
+      }
+    }
+    megamoe::transport::ActivationTransportConfig runtime_transport;
+    runtime_transport.hidden_size = 7;
+    runtime_transport.channels = 4;
+    runtime_transport.ring_slots_per_source_channel = 2;
+    std::vector<megamoe::transport::BFloat16> runtime_activations(14);
+    std::vector<float> runtime_gates(2ULL * top_k,
+                                     1.0F / static_cast<float>(top_k));
+    const auto result = megamoe::transport::simulate_activation_transport(
+        runtime_handles[source_rank], runtime_activations, runtime_gates,
+        runtime_transport, 3);
+    REQUIRE(result.audit.dispatch_packets ==
+            descriptor.outgoing_packets.size());
+    REQUIRE(result.audit.relayed_fanout == 2ULL * top_k);
+    REQUIRE(result.audit.peak_ring_slots <=
+            runtime_transport.ring_slots_per_source_channel);
+    verify_mapping(runtime_handles);
+  };
+  verify_runtime_topology(3, 1);
+  verify_runtime_topology(3, 4);
+  verify_runtime_topology(4, 2);
+
   auto invalid = transport_config;
   invalid.ring_slots_per_source_channel = 0;
   expect_error(NotifyErrorCode::TransportProtocolFailure,

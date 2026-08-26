@@ -363,6 +363,40 @@ struct BackwardStorageHashes {
   DeviceStorageHash128 dgate;
 };
 
+// Timing-excluded validation hashes over the actual device buffers feeding
+// each Backward stage.  A zero element_count means that the production kernel
+// intentionally does not materialize that intermediate (for example dV in a
+// release build).  This is a diagnostic contract, not a data-plane API.
+struct BackwardStageStorageHashes {
+  DeviceStorageHash128 canonical_x;
+  DeviceStorageHash128 canonical_dy;
+  DeviceStorageHash128 dy_dw2_reduction_extent;
+  DeviceStorageHash128 active_ab;
+  DeviceStorageHash128 s;
+  DeviceStorageHash128 dv;
+  DeviceStorageHash128 u_transpose;
+  DeviceStorageHash128 dab;
+  DeviceStorageHash128 dab_transpose;
+  DeviceStorageHash128 dgate_partial;
+  DeviceStorageHash128 dgate_canonical;
+  DeviceStorageHash128 dgate_final;
+  DeviceStorageHash128 dw2;
+  DeviceStorageHash128 dw1;
+  DeviceStorageHash128 return_signal_epoch;
+  DeviceStorageHash128 route_return_coverage;
+  std::uint64_t incoming_rows = 0;
+  std::uint64_t padded_reduction_rows = 0;
+  std::uint64_t route_return_coverage_count = 0;
+};
+
+struct BackwardHashAgreement {
+  bool matches = false;
+  std::uint32_t origin_rank = 0;
+  std::uint32_t field = 0;
+  DeviceStorageHash128 expected;
+  DeviceStorageHash128 actual;
+};
+
 struct ForwardMegaKernelTimings {
   double dispatch_us = 0;
   double fc1_swiglu_us = 0;
@@ -813,6 +847,18 @@ BackwardStorageHashes hash_backward_storage_for_validation(
 // is used to prove that a later live generation did not overwrite the slot.
 BackwardStorageHashes rehash_backward_storage_for_validation(
     const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+BackwardStageStorageHashes hash_backward_stage_storage_for_validation(
+    const DeviceBackwardHandle &handle, const CudaExecution &execution);
+
+// Fixed-width terminal validation used by distributed tests. Every rank calls
+// this before acting on a local hash mismatch, so one rank cannot exit while
+// peers enter a terminal collective. Field order is dx,dW1,dW2,dGate.
+BackwardHashAgreement agree_backward_hashes_for_validation(
+    const DeviceBackwardHandle &handle,
+    const BackwardStorageHashes &expected,
+    const BackwardStorageHashes &actual,
+    const CudaExecution &execution);
 
 enum class BackwardStorageField : std::uint8_t { Dx, Dw1, Dw2, DGate };
 

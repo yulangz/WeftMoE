@@ -194,5 +194,7 @@ correctness blockers.
   real Megatron NCCL Socket baseline; the checked machine-readable result is
   `benchmarks/results/gin_world16_training_20260826.json`.
 - The Socket fallback never claims GIN/RDMA or a single persistent cross-node
-  data plane. Runtime node counts other than the tested
-  homogeneous two-node world-2/world-16 configurations also remain to validate.
+  data plane. Descriptor/team construction is host-tested with homogeneous
+  runtime shapes 3x1, 3x4 and 4x2, including same-rail proxies, node dedup,
+  channels/rings and forward/reverse ownership. Physical GIN execution remains
+  validated only on the available homogeneous 2x1 and 2x8 systems.

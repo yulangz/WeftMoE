@@ -35,6 +35,8 @@ ENABLE_CUDA ?= 0
 NCCL_RUNTIME_LIB_DIR ?=
 CUDA_RUN_ENV := $(if $(NCCL_RUNTIME_LIB_DIR),LD_LIBRARY_PATH=$(NCCL_RUNTIME_LIB_DIR):$${LD_LIBRARY_PATH},)
 COMPUTE_SANITIZER ?= compute-sanitizer
+SANITIZER_PRELOAD ?=
+CROSS_CHECK_ENV := $(if $(SANITIZER_PRELOAD),LD_PRELOAD=$(SANITIZER_PRELOAD),)
 CUDA_LIB_SOURCES := \
 	src/cuda/device_notify.cu \
 	src/cuda/activation_transport.cu \
@@ -152,7 +154,7 @@ launcher-security-test:
 	PYTHONPATH=. python3 tests/test_launcher_security.py
 
 cross-check: $(BUILD_DIR)/metadata_dump
-	$(BUILD_DIR)/metadata_dump > $(BUILD_DIR)/cpp_metadata.json
+	$(CROSS_CHECK_ENV) $(BUILD_DIR)/metadata_dump > $(BUILD_DIR)/cpp_metadata.json
 	PYTHONPATH=. python3 tests/compare_reference.py $(BUILD_DIR)/cpp_metadata.json
 
 header-test:

@@ -7,6 +7,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2278,6 +2279,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       scenario == "activation_integrated_bench";
   const auto gin_forward_smoke = scenario == "gin_forward_smoke";
   const auto gin_backward_smoke = scenario == "gin_backward_smoke";
+  const auto socket_backward_smoke = scenario == "socket_backward_smoke";
   const auto gin_forward_benchmark = scenario == "gin_forward_bench";
   const auto gin_backward_benchmark = scenario == "gin_backward_bench";
   const auto socket_forward_benchmark =
@@ -2285,8 +2287,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto socket_backward_benchmark =
       scenario == "socket_backward_bench";
   const auto forward_smoke = scenario == "forward_smoke" || gin_forward_smoke;
-  const auto backward_smoke =
-      scenario == "backward_smoke" || gin_backward_smoke;
+  const auto backward_smoke = scenario == "backward_smoke" ||
+                              gin_backward_smoke || socket_backward_smoke;
   const auto benchmark_forward =
       scenario == "forward_bench" || gin_forward_benchmark ||
       socket_forward_benchmark;
@@ -2352,13 +2354,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     }
   }
   if (forward_smoke || backward_smoke) {
-    const auto gin_megakernel_smoke =
-        gin_forward_smoke || gin_backward_smoke;
-    require((!gin_megakernel_smoke && nodes == 1 &&
+    const auto cross_host_megakernel_smoke =
+        gin_forward_smoke || gin_backward_smoke || socket_backward_smoke;
+    require((!cross_host_megakernel_smoke && nodes == 1 &&
              (world == 1 || world == 2 || world == 8)) ||
-                (gin_megakernel_smoke && nodes == 2 &&
+                (cross_host_megakernel_smoke && nodes == 2 &&
                  (world == 2 || world == 16)),
-            "forward smoke requires local 1/2/8 GPUs or GIN 2x1/2x8 GPUs");
+            "forward smoke requires local 1/2/8 GPUs or cross-host "
+            "2x1/2x8 GPUs");
     // Cross-topology fixture: all EP sizes retain the same 384 global experts,
     // source activation, selected IDs and gates. Only contiguous ownership
     // changes. The selected experts span the complete ownership range.
@@ -3665,6 +3668,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.max_owned_experts = experts / world;
     transport_config.enable_forward_cache = true;
     transport_config.enable_gin_rdma = gin_backward_smoke;
+    transport_config.enable_socket_fallback = socket_backward_smoke;
     transport_config.enable_backward = true;
     auto transport_pool = megamoe::cuda::make_activation_transport_pool(
         setup_generation.session(), execution, transport_config);
@@ -3695,12 +3699,23 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         local_backward;
     std::unique_ptr<megamoe::cuda::GinRdmaForwardMegaKernel> gin_forward;
     std::unique_ptr<megamoe::cuda::GinRdmaBackwardMegaKernel> gin_backward;
+    std::unique_ptr<megamoe::cuda::NcclSocketFallbackForwardMegaKernel>
+        socket_forward;
+    std::unique_ptr<megamoe::cuda::NcclSocketFallbackBackwardMegaKernel>
+        socket_backward;
     if (gin_backward_smoke) {
       gin_forward = std::make_unique<megamoe::cuda::GinRdmaForwardMegaKernel>(
           setup_generation, execution, transport_pool);
       gin_backward =
           std::make_unique<megamoe::cuda::GinRdmaBackwardMegaKernel>(
               setup_generation, execution, transport_pool);
+    } else if (socket_backward_smoke) {
+      socket_forward = std::make_unique<
+          megamoe::cuda::NcclSocketFallbackForwardMegaKernel>(
+          setup_generation, execution, transport_pool);
+      socket_backward = std::make_unique<
+          megamoe::cuda::NcclSocketFallbackBackwardMegaKernel>(
+          setup_generation, execution, transport_pool);
     } else {
       local_forward =
           std::make_unique<megamoe::cuda::LocalCudaP2pForwardMegaKernel>(
@@ -3713,6 +3728,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     options.deadline_after = std::chrono::seconds(300);
     megamoe::cuda::BackwardMegaKernelAudit last_smoke_audit;
     std::array<bool, 4> mutation_validated{};
+    std::array<megamoe::cuda::BackwardStageStorageHashes, 2>
+        stage_storage_hashes{};
+    std::array<bool, 2> stage_storage_hashes_valid{};
+    std::optional<megamoe::cuda::BackwardStorageHashes>
+        first_generation_hashes_for_agreement;
+    megamoe::cuda::BackwardHashAgreement cache_hash_agreement;
+    cache_hash_agreement.matches = true;
     megamoe::cuda::testing::EmptyExpertGradientZeroCheck empty_zero_check{};
     std::uint32_t empty_zero_check_repeats = 0;
     const auto run_mode = [&](megamoe::cuda::ForwardCacheMode mode,
@@ -3749,8 +3771,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto forward_handle = gin_backward_smoke
           ? gin_forward->run(notify.dispatch(), activations, weights,
                              forward_config, options)
-          : local_forward->run(notify.dispatch(), activations, weights,
-                               forward_config, options);
+          : socket_backward_smoke
+                ? socket_forward->run(notify.dispatch(), activations, weights,
+                                      forward_config, options)
+                : local_forward->run(notify.dispatch(), activations, weights,
+                                     forward_config, options);
       if (smoke_trace)
         std::cerr << "BACKWARD_SMOKE_PROGRESS rank=" << rank
                   << " generation=" << exact_generation
@@ -3767,8 +3792,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto backward_handle = gin_backward_smoke
           ? gin_backward->run(forward_handle, dy_lease, backward_config,
                               options)
-          : local_backward->run(forward_handle, dy_lease, backward_config,
-                                options);
+          : socket_backward_smoke
+                ? socket_backward->run(forward_handle, dy_lease,
+                                       backward_config, options)
+                : local_backward->run(forward_handle, dy_lease,
+                                      backward_config, options);
       if (smoke_trace)
         std::cerr << "BACKWARD_SMOKE_PROGRESS rank=" << rank
                   << " generation=" << exact_generation
@@ -3783,6 +3811,54 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto hashes =
           megamoe::cuda::testing::hash_backward_storage_for_validation(
               backward_handle, execution);
+      if (exact_generation == 900U)
+        first_generation_hashes_for_agreement = hashes;
+      else if (exact_generation == 901U &&
+               first_generation_hashes_for_agreement.has_value()) {
+        auto expected = *first_generation_hashes_for_agreement;
+        if (std::getenv("MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH") != nullptr &&
+            rank == 1U)
+          expected.dgate.low ^= 1ULL;
+        cache_hash_agreement =
+            megamoe::cuda::testing::agree_backward_hashes_for_validation(
+                backward_handle, expected, hashes, execution);
+      }
+      if (std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr &&
+          (exact_generation == 900U || exact_generation == 901U)) {
+        const auto index = static_cast<std::size_t>(exact_generation - 900U);
+        stage_storage_hashes[index] =
+            megamoe::cuda::testing::
+                hash_backward_stage_storage_for_validation(backward_handle,
+                                                            execution);
+        stage_storage_hashes_valid[index] = true;
+        const auto &stage = stage_storage_hashes[index];
+        std::cerr << "BACKWARD_STAGE_HASH rank=" << rank
+                  << " generation=" << exact_generation
+                  << " incoming_rows=" << stage.incoming_rows
+                  << " padded_rows=" << stage.padded_reduction_rows
+                  << " x=" << stage.canonical_x.low
+                  << " dy=" << stage.canonical_dy.low
+                  << " ab=" << stage.active_ab.low
+                  << " s=" << stage.s.low
+                  << " dv=" << stage.dv.low
+                  << " u_t=" << stage.u_transpose.low
+                  << " dab=" << stage.dab.low
+                  << " dab_t=" << stage.dab_transpose.low
+                  << " dgate_partial=" << stage.dgate_partial.low
+                  << " dgate_canonical=" << stage.dgate_canonical.low
+                  << " dgate_final=" << stage.dgate_final.low
+                  << " dw2=" << stage.dw2.low
+                  << " dw1=" << stage.dw1.low
+                  << " return_epoch=" << stage.return_signal_epoch.low
+                  << " return_coverage="
+                  << stage.route_return_coverage_count << '/'
+                  << hashes.dgate.element_count / 2ULL
+                  << std::endl;
+        if (stage.route_return_coverage.element_count != 0)
+          require(stage.route_return_coverage_count ==
+                      hashes.dgate.element_count / 2ULL,
+                  "Backward route return coverage is incomplete");
+      }
       const auto smoke_route_case =
           std::getenv("MEGAMOE_BACKWARD_ROUTE_CASE")
               ? std::getenv("MEGAMOE_BACKWARD_ROUTE_CASE")
@@ -3863,14 +3939,58 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << " phase=lambda_return" << std::endl;
       return result;
     };
-    const auto no_cache = run_mode(
-        megamoe::cuda::ForwardCacheMode::NoFc1OutputCache, 900U);
-    const auto cache = run_mode(
-        megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput, 901U);
+    const bool cache_first =
+        std::getenv("MEGAMOE_BACKWARD_CACHE_FIRST") != nullptr;
+    const auto first = run_mode(
+        cache_first ? megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput
+                    : megamoe::cuda::ForwardCacheMode::NoFc1OutputCache,
+        900U);
+    const auto second = run_mode(
+        cache_first ? megamoe::cuda::ForwardCacheMode::NoFc1OutputCache
+                    : megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput,
+        901U);
+    const auto &no_cache = cache_first ? second : first;
+    const auto &cache = cache_first ? first : second;
     const auto hash_equal = [](const auto &left, const auto &right) {
       return left.low == right.low && left.high == right.high &&
              left.element_count == right.element_count;
     };
+    if (stage_storage_hashes_valid[0] && stage_storage_hashes_valid[1]) {
+      const auto &left = stage_storage_hashes[0];
+      const auto &right = stage_storage_hashes[1];
+      const std::array<std::pair<const char *, std::pair<
+                                         megamoe::cuda::DeviceStorageHash128,
+                                         megamoe::cuda::DeviceStorageHash128>>,
+                       13>
+          fields{{
+              {"canonical_x", {left.canonical_x, right.canonical_x}},
+              {"canonical_dy", {left.canonical_dy, right.canonical_dy}},
+              {"active_ab", {left.active_ab, right.active_ab}},
+              {"s", {left.s, right.s}},
+              {"dv", {left.dv, right.dv}},
+              {"u_transpose", {left.u_transpose, right.u_transpose}},
+              {"dab", {left.dab, right.dab}},
+              {"dab_transpose", {left.dab_transpose, right.dab_transpose}},
+              {"dgate_partial", {left.dgate_partial, right.dgate_partial}},
+              {"dgate_canonical",
+               {left.dgate_canonical, right.dgate_canonical}},
+              {"dgate_final", {left.dgate_final, right.dgate_final}},
+              {"dw2", {left.dw2, right.dw2}},
+              {"dw1", {left.dw1, right.dw1}},
+          }};
+      const char *first = "none";
+      for (const auto &field : fields)
+        if (!hash_equal(field.second.first, field.second.second)) {
+          first = field.first;
+          break;
+        }
+      std::cerr << "BACKWARD_STAGE_FIRST_MISMATCH rank=" << rank
+                << " field=" << first
+                << " return_epoch_changed="
+                << !hash_equal(left.return_signal_epoch,
+                               right.return_signal_epoch)
+                << std::endl;
+    }
     if (!(hash_equal(no_cache.second.dx, cache.second.dx) &&
           hash_equal(no_cache.second.dgate, cache.second.dgate) &&
           hash_equal(no_cache.second.dw1, cache.second.dw1) &&
@@ -3884,7 +4004,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 << " cache_dw1=" << cache.second.dw1.low
                 << " no_cache_dw2=" << no_cache.second.dw2.low
                 << " cache_dw2=" << cache.second.dw2.low << std::endl;
-    require(hash_equal(no_cache.second.dx, cache.second.dx) &&
+    const bool injected_hash_mismatch =
+        std::getenv("MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH") != nullptr;
+    require((injected_hash_mismatch
+                 ? (!cache_hash_agreement.matches &&
+                    cache_hash_agreement.origin_rank == 1U &&
+                    cache_hash_agreement.field == 4U)
+                 : cache_hash_agreement.matches) &&
+                hash_equal(no_cache.second.dx, cache.second.dx) &&
                 hash_equal(no_cache.second.dgate, cache.second.dgate) &&
                 hash_equal(no_cache.second.dw1, cache.second.dw1) &&
                 hash_equal(no_cache.second.dw2, cache.second.dw2) &&
@@ -3895,7 +4022,28 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   no_cache.first.dw2 == cache.first.dw2 &&
                   no_cache.first.sampled_ab == cache.first.sampled_ab &&
                   no_cache.first.sampled_dab == cache.first.sampled_dab)),
-            "Backward cache/no-cache results differ");
+            "Backward cache/no-cache results differ after all-rank terminal "
+            "validation; origin_rank=" +
+                std::to_string(cache_hash_agreement.origin_rank) +
+                ", field=" + std::to_string(cache_hash_agreement.field) +
+                ", expected=" +
+                std::to_string(cache_hash_agreement.expected.low) +
+                ", actual=" +
+                std::to_string(cache_hash_agreement.actual.low));
+    if (injected_hash_mismatch) {
+      const auto recovered = run_mode(
+          megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput, 902U);
+      require(hash_equal(cache.second.dx, recovered.second.dx) &&
+                  hash_equal(cache.second.dgate, recovered.second.dgate) &&
+                  hash_equal(cache.second.dw1, recovered.second.dw1) &&
+                  hash_equal(cache.second.dw2, recovered.second.dw2),
+              "healthy generation after terminal hash mismatch did not "
+              "recover on the same communicator");
+      std::cout << "BACKWARD_HASH_RECOVERY rank=" << rank
+                << " origin_rank=" << cache_hash_agreement.origin_rank
+                << " field=" << cache_hash_agreement.field
+                << " recovered=1" << std::endl;
+    }
     if (world == 1U) {
       std::vector<bool> routed(experts, false);
       for (const auto expert : common_routes.selected_experts)
