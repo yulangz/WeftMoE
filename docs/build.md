@@ -549,13 +549,12 @@ bootstrap frame and uses a bounded nonblocking trailing-byte check. This avoids
 waiting forever for EOF when Compute Sanitizer's subreaper retains an inherited
 write descriptor; every wait remains under the launcher timeout. With the
 current tool/runtime pair, real world-2 top-k=6 racecheck reaches the production
-Forward kernel but reports peer-write/peer-read hazards across the two
-independently instrumented IPC processes. The accesses are ordered by a
-system-scope release/acquire epoch, but the report is not suppressed or
-represented as a clean racecheck pass. Normal world-2 execution, twenty-repeat
-bitwise checks, and the independent Python oracle pass. The NCCL-independent
-closed-loop device path, including transport worker and 73-node materializer,
-is covered by memcheck/racecheck/initcheck with 0 errors/hazards for all three.
+Forward+Backward kernels and reports zero errors/hazards. The prior shared-
+memory alias was replaced by a thread-local scalar; no suppression is used.
+Normal world-2 execution, twenty-repeat bitwise checks, and the independent
+Python oracle also pass. The NCCL-independent closed-loop device path,
+including transport worker and 73-node materializer, is covered by
+memcheck/racecheck/initcheck with zero errors/hazards for all three.
 
 The transport portion of `--device-smoke` covers the device simulation oracle
 and ordering probe. Real independent-process local P2P is separate and cannot
