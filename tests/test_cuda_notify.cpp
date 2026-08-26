@@ -3029,7 +3029,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                                   : "local-cuda-p2p")
               << " warmup=10 measured=" << wall.size()
               << " cache=" << (cache_mode ? 1 : 0)
-              << " specialization=sm90-wgmma-tma-7168x3072"
+              << " specialization="
+              << (last_audit.specialization ==
+                          megamoe::cuda::BackwardKernelSpecialization::
+                              Sm90WgmmaTma7168x3072
+                      ? "sm90-wgmma-tma-7168x3072"
+                      : "runtime-shape-correctness-fallback")
               << " persistent_launches="
               << last_audit.persistent_kernel_launches
               << " wgmma=" << last_audit.wgmma_instructions

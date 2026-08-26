@@ -40,9 +40,10 @@ a correctness-only CUDA-core fallback that still executes Forward in one
 persistent kernel and Backward in one persistent kernel. World-1 oracle tests
 cover `64/32`, `96/48`, `127/65`, and `256/192`, including M/N/K tails, and
 `127/65` is also exercised through the real two-process LocalCudaP2p path. The
-fallback carries no performance claim. Non-main-shape GIN is not yet wired:
-that combination fails closed with a structured device error, while the
-frozen `7168/3072` GIN path remains supported.
+same kernels run through real GIN at world 2 for 64/32, 96/48, 127/65 and
+256/192 and at world 16 for 96/48 and 127/65, including cache/no-cache,
+top-k 1/6 and deterministic gradients. The fallback carries no performance
+claim; `7168/3072` still selects the frozen WGMMA/TMA path.
 
 ## Supported topology contract
 
@@ -136,9 +137,9 @@ completion lease. Public code acquires a move-only owning consumer lease; only
 friend launch adapters can form the short-lived pointer POD. The lease is bound
 to generation, rank/world, runtime shape, config digest, execution identity,
 slot epoch and a precreated completion event. Default/moved-from and
-cross-generation consumers fail closed. Tests and
-debuggers may explicitly call `download_device_metadata_for_validation()`;
-the coordinator never calls it.
+cross-generation consumers fail closed. Repository tests may explicitly use
+the non-installed validation download declared by `src/cuda/testing/api.hpp`;
+the coordinator and installed API cannot call it.
 
 `DeviceNotifyResourcePool` preallocates every route slot, Notify arena, pinned
 status region, NCCL control/config/count/summary slot, CUB temporary region,
@@ -398,12 +399,18 @@ benchmarks/                   host metadata baseline
 docs/                         architecture, compliance, performance, limits
 ```
 
+The installed API is version 2. `make install DESTDIR=... PREFIX=...` installs
+only the production manifest; test/oracle/synthetic/fault declarations remain
+under `src/` and are unavailable to installed clients. See
+`docs/api_v2_migration.md` and `examples/minimal_training.cpp`.
+
 ## Build and test
 
 ```bash
 make -j
 make test
 make bench
+make install-test
 
 # Optional CUDA/NCCL slice; see docs/build.md for the tested runtime library.
 make BUILD_DIR=build-cuda cuda-lib

@@ -67,7 +67,7 @@ This runs:
   empty-expert, and partial-M cases; every fixture is rebuilt for byte-identical
   repeat checking;
 - every public header as an isolated `-Werror` translation unit;
-- twenty-nine compile-negative probes for the retired `wait`, `wait_preflight`, raw
+- thirty-four compile-negative probes for the retired `wait`, `wait_preflight`, raw
   notify start, phase-specific collective starters, internal NCCL
   operation/backend types, bootstrap hex encode/parse APIs, and the unpooled
   production coordinator constructor, generic route rebinding/wrong route
@@ -84,6 +84,20 @@ factory, and the retired caller-selected backend-enum entry.
   prefix representation, Python poison writers, top-level CLI output, and 20
   failure/recovery cycles. They inspect argv/environment, exact frame content,
   FD/process cleanup, scrubbed diagnostics, and absence of bootstrap files.
+
+## Installed API v2
+
+```bash
+make install DESTDIR=/tmp/megamoe-package PREFIX=/usr/local
+make install-test
+```
+
+`install-test` checks the exact 12-header manifest, then compiles
+`examples/minimal_training.cpp` using only the temporary installed prefix and
+`-Werror`; it never adds the repository `src/` include path. Validation
+downloads, synthetic transports, fixture/hash mutation, fault injection and
+runtime-shape harnesses are exposed only by repository-internal testing headers.
+See `docs/api_v2_migration.md`.
 
 ## Warning-clean build
 
@@ -124,6 +138,10 @@ make BUILD_DIR=build-cuda -j \
 # Correctness-only runtime H/I matrix (world 1 and real local world 2).
 make BUILD_DIR=build-cuda \
   NCCL_RUNTIME_LIB_DIR="$NCCL12" cuda-runtime-shape-test
+
+# Generic-shape GIN uses tests/run_multinode_nccl.py with the compatible
+# repository-external NCCL 2.29.7 CUDA-12.9 runtime and explicit
+# MEGAMOE_RUNTIME_HIDDEN / MEGAMOE_RUNTIME_INTERMEDIATE values.
 
 # Include the one-GPU CUDA slice in the default host suite.
 make BUILD_DIR=build-cuda ENABLE_CUDA=1 \

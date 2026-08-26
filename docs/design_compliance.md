@@ -11,7 +11,7 @@ completed production feature.
 |---|---|---|---|---|
 | Runtime tokens, experts, top-k, rank/world and homogeneous topology | `RuntimeConfig`, `Topology`, device Notify configuration | host topology rejection tests; CUDA world 1/2/8; real world 2/16 | Notify benchmark JSON and fused/full protocol audits | Complete |
 | Runtime hidden/intermediate, including tails | `runtime_shape_forward_megakernel` and `runtime_shape_backward_megakernel`; the frozen `7168/3072` branch remains the WGMMA/TMA specialization | world-1 oracle at 64/32, 96/48, 127/65 and 256/192; real world-2 LocalCudaP2p at 127/65 | correctness-only; not a performance claim | Complete |
-| Non-main hidden/intermediate over GIN | The generic kernels currently reject `use_gin` with a structured device error; the frozen `7168/3072` GIN path is unaffected | no physical non-main-shape GIN execution | none | **Missing** |
+| Non-main hidden/intermediate over GIN | The generic kernels consume the same registered GIN windows, same-rail proxy/fan-out, put/signal/completion and deterministic return layouts as the main specialization | physical world 2 at 64/32, 96/48, 127/65, 256/192; physical world 16 at 96/48 and 127/65; top-k 1/6, cache/no-cache, zero rank, empty owner, 20 hashes and pool=2 | correctness-only; 127/65 world-2 diagnostic is recorded separately from main-shape claims | Complete |
 | Deterministic Notify local offsets and canonical rows | `device_notify.cu`, host metadata materializer and Python reference | 28 full-field fixtures, 25 fixed CUDA seeds, 20 byte-identical repeats | device Notify stage timings | Complete |
 | Source-rank prefix, owned-expert prefix/M-tile metadata, reverse routes and combine order | device materializer and immutable `DeviceDispatchHandle` | C++/Python full-field comparison; row uniqueness/continuity properties | materialization benchmark split | Complete |
 | Forward is one persistent data-plane kernel after Notify | `local_p2p_forward_megakernel`; Local, GIN and Socket full-FC adapters | world 1/2/8 and GIN world 2/16; launch audit equals one | single-node and world-16 Forward results | Complete |
@@ -29,7 +29,7 @@ completed production feature.
 | Host-enqueued Socket correctness fallback | aggregate NCCL Send/Recv plus device relay/compute | real world 2/16 Forward/Backward and GIN byte comparison | separately labelled Socket lower bound | Complete |
 | Workspace query, epoch, completion and two live generations | session pool, slot lease, consumer lease and completion events | exact/short capacity, pool exhaustion/reuse/quarantine, pool=2 | allocation audit: no steady allocation/event creation | Complete |
 | Autotune cannot change canonical/reduction invariants | frozen main-shape specialization and recorded tuning parameters | output/gradient hashes are checked for every accepted candidate | recorded top candidates and final main-shape configuration | Complete |
-| Installed public API excludes test/oracle/synthetic hooks | New runtime-shape harnesses are internal, but legacy `testing`, synthetic transport and `*_for_validation` declarations remain in installed CUDA headers | compile-negative coverage protects the newly internalized harness only | not applicable | **Missing** |
+| Installed public API excludes test/oracle/synthetic hooks | API v2 installs a fixed production-header manifest; internal declarations require `src/cuda/testing/api.hpp` or `src/metadata/testing_api.hpp`, neither of which is installed | temporary-DESTDIR manifest check, installed-prefix-only minimal training compile, 34 compile-negative retired/internal entries | not applicable | Complete |
 | H200 / SM90a runtime validation | SM90/SM90a targets compile; actual machines report L20X / CC 8.9 virtualization | SM90a compile and L20X runtime tests | no H200 measurement | **Environment-limited** |
 
 ## Audit findings and disposition
@@ -37,30 +37,31 @@ completed production feature.
 1. The runtime H/I gap is closed by a correctness-only, one-kernel Forward and
    Backward fallback. The frozen `7168/3072` WGMMA/TMA branch is selected by an
    explicit shape predicate and its normalized SASS/resource report is
-   unchanged by the refactor.
+   unchanged by the refactor. Across sm89/sm90/sm90a, normalized main Forward
+   SASS hashes to `93e252103a677eaa8e88f9c23774673d3dd399eb6dd4a0121521d19db8276161`
+   and Backward to
+   `aecdfb35af22d2f69a4da9aaeac25140726512ead198276d80de6a02370d6593`
+   both before and after this final work.
 2. Pointer-bearing Forward and Backward launch contracts and the generic
    fallback are internal `.cuh` modules. The large aggregation translation
    unit remains intentional: splitting the device definitions across separate
    translation units changed compiler visibility and would risk the frozen
    kernel. Public API, runtime pool, and backend ownership stay separate.
-3. Runtime-shape test entry points and NCCL-free harness declarations moved to
-   `tests/cuda` and `src/cuda/testing`; they are absent from the installed
-   production header. The legacy all-mode driver remains for launcher
-   compatibility, with new cases added in focused modules.
-4. Native CUDA, IPC and GIN handles are confined to internal headers and
-   backend state. However, older simulation, fault/oracle and validation
-   download declarations still occupy installed CUDA headers. Their names are
-   explicit, but naming is not API hiding; completing this cleanup requires a
-   compatibility-breaking public-header split and remains a recorded gap.
+3. Runtime-shape harnesses, simulation, validation downloads, hash/mutation
+   helpers and fault seams require a repository-internal testing header. API
+   v2 installs only production declarations; an installed-prefix-only build
+   cannot name the hidden symbols or add `src/` to its include path.
+4. Native CUDA, IPC and GIN handles remain confined to internal headers and
+   backend state. The public boundary consists of typed leases, owning handles,
+   session/pool configuration, backend capability/selection and production
+   status/error records.
 5. Physical GIN coverage is two homogeneous eight-GPU nodes. Runtime 3+ node
    construction is tested, but physical 3+ node behavior and H200/SM90a
    execution remain environment-limited rather than complete claims.
 
-The generic CUDA-core fallback is fully exercised on world 1 and local P2P
-world 2. Its arithmetic is transport-neutral, but the current implementation
-explicitly rejects the GIN branch for non-main H/I. Consequently generic
-cross-host GIN is an implementation gap, not merely an unavailable-hardware or
-test-coverage limitation. The optimized main-shape GIN path remains complete.
+The generic CUDA-core fallback is exercised on world 1, LocalCudaP2p world 2,
+and real GIN world 2/16. It remains correctness-only; the optimized main-shape
+GIN specialization and its performance evidence are unchanged.
 
 ## Frozen invariants
 

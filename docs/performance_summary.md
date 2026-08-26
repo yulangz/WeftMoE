@@ -62,6 +62,13 @@ gradient hashes remain unchanged and Forward, Backward and F+B regress by no
 more than 3%. The generic runtime-shape path is correctness-only and excluded
 from the main-shape performance claim.
 
+The correctness-only generic GIN benchmark at world 2, H/I=127/65, two
+tokens/rank and top-k 6 used 10 warmups plus 10 measurements. Slowest-rank
+means were 0.442 ms Notify, 0.368 ms Forward device span, 5.904 ms Backward
+device span and 6.776 ms Notify-inclusive F+B wall. These small-shape numbers
+only demonstrate that the real GIN path executes without a host payload phase;
+they are not compared with Megatron and are not a tuning claim.
+
 For the final module review, commit `5af8828` (before launch-contract/test
 splitting) and the reviewed head were rebuilt and measured back-to-back on the
 same host. With 10 warmups and 100 samples, the pre-refactor/current means were
@@ -77,3 +84,11 @@ Backward and 95.4062 ms Notify-inclusive F+B. Relative to the checked
 41.0693/52.7385/94.0076 ms cross-run means, the changes are -0.25%, +0.91% and
 +1.49%, all inside the 3% guard. The corresponding P95 values were
 41.0542/53.4385/95.6547 ms.
+
+After the final generic-GIN/API-v2 commits, short 10-warmup/10-measurement
+guards rechecked the untouched main specialization. Single-node world 8 means
+were 15.543 ms Forward, 28.962 ms Backward and 45.039 ms Notify-inclusive F+B.
+Two-node world 16 GIN means were 40.946/53.149/95.297 ms respectively (P95
+40.984/53.321/95.543 ms). These short guards are not substituted for the
+10+100 records above; together with the byte-identical normalized main-kernel
+SASS they show that the final correctness/API work stayed within the 3% guard.

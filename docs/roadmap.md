@@ -71,9 +71,9 @@ Complete: non-main positive H/I values now select one-kernel Forward and
 Backward correctness fallbacks with BF16 inputs/outputs, FP32 accumulation,
 cache/no-cache behavior and M/N/K tails. Recorded cases are 64/32, 96/48,
 127/65 and 256/192 on world 1 plus 127/65 through real world-2 LocalCudaP2p.
-The main shape continues to select the unchanged WGMMA/TMA cubin. Non-main
-GIN is not yet wired and fails closed; it is not included in this completion
-claim.
+The main shape continues to select the unchanged WGMMA/TMA cubin. Generic GIN
+uses the real same-rail device data plane and is correctness-tested on the
+available physical world-2/world-16 topology.
 
 Internal Forward/Backward pointer contracts and test harnesses are separated
 from installed headers while CUDA remains a single aggregation translation
@@ -90,9 +90,5 @@ focused `tests/cuda` entry points; legacy launcher modes remain compatible.
   3x4 and 4x2 homogeneous descriptor/team construction is simulated.
 - Performance specializations/autotuning for H/I shapes other than 7168/3072.
   The generic path is deliberately correctness-only.
-- Wire the generic H/I kernels into the GIN data plane. The current generic
-  branch supports world 1 and LocalCudaP2p and explicitly rejects GIN.
-- Complete the compatibility-breaking public-header split needed to remove
-  legacy test/oracle/synthetic declarations from installed CUDA headers.
 - Optional graph-capture and further GIN/weight-multicast tuning, provided the
   frozen canonical, cast and accumulation invariants remain unchanged.

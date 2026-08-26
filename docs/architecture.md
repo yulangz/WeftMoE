@@ -77,9 +77,9 @@ tail bounds. They intentionally use scalar CUDA-core FP32 accumulation and are
 correctness fallbacks, not performance substitutes for the main specialization.
 TMA maps are neither created nor interpreted on this branch, which keeps odd
 dimensions such as `127/65` within checked ordinary device storage.
-The generic path is currently integrated with world 1 and LocalCudaP2p only.
-Selecting GIN with a non-main shape publishes a structured device error and
-fails closed; generic GIN transport integration remains outstanding.
+The generic path uses the same typed GIN window, same-rail proxy/local fan-out,
+epoch/completion and deterministic return contracts as the optimized path.
+Physical world-2 and world-16 tests cover odd and tile-aligned runtime shapes.
 
 ## CUDA internal module boundary
 
@@ -462,8 +462,8 @@ a detachable pointer view: `acquire_consumer` returns a move-only
 internal `DeviceDispatchKernelView` POD. Submitted consumers record a pooled
 event on their own stream; the slot cannot return until the last handle and
 consumer have drained. The explicit
-`download_device_metadata_for_validation` diagnostic downloads
-every field for tests and reconstructs a host `DispatchHandle`; the generic
+The non-installed `download_device_metadata_for_validation` diagnostic downloads
+every field for repository tests and reconstructs a host `DispatchHandle`; the generic
 metadata layer still cannot inspect a native pointer and the production
 coordinator never invokes this API.
 
@@ -529,10 +529,9 @@ for world=1 or consistent all-rank cancellation, not for an isolated process or
 NCCL hard failure.
 
 Production construction requires a `DeviceNotifyResourcePool`. The old
-two-argument allocating constructor is private; an explicitly named
-`testing::make_unpooled_coordinator_for_testing` remains solely for allocation
-fault injection. A compile-negative probe prevents its accidental restoration
-as a production constructor.
+two-argument allocating constructor is private; its allocation fault seam is
+declared only by the non-installed internal testing header. A compile-negative
+probe prevents its accidental restoration as a production constructor.
 
 For pooled generations the forbidden steady APIs are `cudaMalloc/cudaFree`,
 `cudaHostAlloc/cudaFreeHost`, `cudaEventCreate*/cudaEventDestroy`, and
