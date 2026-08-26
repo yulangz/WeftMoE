@@ -7,6 +7,7 @@ The same checks run in a Git worktree and in a ``git archive`` extraction.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -39,27 +40,14 @@ RELEASE_PATTERNS = {
     ),
     "merge conflict marker": re.compile(r"^(?:<<<<<<<|=======|>>>>>>>)"),
 }
-RELEASE_ROOTS = (
-    "include",
-    "src",
-    "tests",
-    "benchmarks",
-    "examples",
-    "docs",
-    "tools",
-    "abi",
-)
-TOP_LEVEL_RELEASE_FILES = {
-    "Makefile",
-    "README.md",
-    "LICENSE",
-    "NOTICE",
-    "THIRD_PARTY_NOTICES.md",
-}
 EXCLUDED_DIRECTORY_NAMES = {
     ".git",
     ".cache",
+    ".idea",
+    ".mypy_cache",
     ".pytest_cache",
+    ".ruff_cache",
+    ".vscode",
     "__pycache__",
     "install",
     "install-stage",
@@ -71,10 +59,8 @@ EXCLUDED_SUFFIXES = {
     ".fatbin",
     ".o",
     ".pyc",
-    ".so",
-    ".tar",
-    ".tgz",
-    ".zip",
+    ".swo",
+    ".swp",
 }
 
 
@@ -90,43 +76,87 @@ def has_git_metadata(root: pathlib.Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def git_release_files(root: pathlib.Path) -> list[pathlib.Path]:
+def git_release_files(
+        root: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
     output = subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
     relative = sorted(
         pathlib.Path(item.decode("utf-8"))
         for item in output.split(b"\0")
         if item
     )
-    return [root / path for path in relative if (root / path).is_file()]
+    files: list[pathlib.Path] = []
+    excluded: list[str] = []
+    for path in relative:
+        absolute = root / path
+        if absolute.is_symlink():
+            excluded.append(f"{path.as_posix()} (symlink not followed)")
+        elif absolute.is_file():
+            files.append(absolute)
+    return files, excluded
 
 
-def excluded_path(relative: pathlib.Path) -> bool:
-    if any(part in EXCLUDED_DIRECTORY_NAMES or part.startswith("build-")
-           for part in relative.parts[:-1]):
-        return True
-    return relative.suffix.lower() in EXCLUDED_SUFFIXES
+def excluded_directory(name: str) -> str | None:
+    if name in EXCLUDED_DIRECTORY_NAMES:
+        return "generated/cache directory"
+    if name.startswith("build"):
+        return "build directory"
+    if name.startswith("install-") or name.startswith("install_stage"):
+        return "install staging directory"
+    return None
 
 
-def archive_release_files(root: pathlib.Path) -> list[pathlib.Path]:
-    paths: set[pathlib.Path] = set()
-    for root_name in RELEASE_ROOTS:
-        base = root / root_name
-        if not base.is_dir():
-            continue
-        for path in base.rglob("*"):
-            if path.is_file() and not excluded_path(path.relative_to(root)):
-                paths.add(path)
-    for name in TOP_LEVEL_RELEASE_FILES:
-        path = root / name
-        if path.is_file():
-            paths.add(path)
-    return sorted(paths, key=lambda path: path.relative_to(root).as_posix())
+def excluded_file(name: str) -> str | None:
+    if name.endswith("~"):
+        return "editor backup"
+    if pathlib.Path(name).suffix.lower() in EXCLUDED_SUFFIXES:
+        return "generated/binary artifact"
+    if re.search(r"\.so(?:\.[0-9]+)*$", name):
+        return "compiled shared library"
+    return None
 
 
-def release_files(root: pathlib.Path) -> tuple[list[pathlib.Path], str]:
+def archive_release_files(
+        root: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
+    """Walk every archive entry without following directory symlinks."""
+    files: list[pathlib.Path] = []
+    excluded: list[str] = []
+
+    def walk(directory: pathlib.Path) -> None:
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            path = pathlib.Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            if entry.is_symlink():
+                excluded.append(f"{relative} (symlink not followed)")
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                reason = excluded_directory(entry.name)
+                if reason is not None:
+                    excluded.append(f"{relative}/ ({reason})")
+                else:
+                    walk(path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                excluded.append(f"{relative} (non-regular entry)")
+                continue
+            reason = excluded_file(entry.name)
+            if reason is not None:
+                excluded.append(f"{relative} ({reason})")
+            else:
+                files.append(path)
+
+    walk(root)
+    return files, excluded
+
+
+def release_files(
+        root: pathlib.Path) -> tuple[list[pathlib.Path], list[str], str]:
     if has_git_metadata(root):
-        return git_release_files(root), "git"
-    return archive_release_files(root), "archive"
+        files, excluded = git_release_files(root)
+        return files, excluded, "git"
+    files, excluded = archive_release_files(root)
+    return files, excluded, "archive"
 
 
 def text_content(path: pathlib.Path) -> str | None:
@@ -139,12 +169,15 @@ def text_content(path: pathlib.Path) -> str | None:
         return None
 
 
-def scan_release_text(paths: list[pathlib.Path]) -> tuple[list[str], int]:
+def scan_release_text(
+        paths: list[pathlib.Path]) -> tuple[list[str], int, list[pathlib.Path]]:
     failures: list[str] = []
     scanned = 0
+    binary: list[pathlib.Path] = []
     for path in paths:
         text = text_content(path)
         if text is None:
+            binary.append(path)
             continue
         scanned += 1
         for line_number, line_with_ending in enumerate(
@@ -158,7 +191,7 @@ def scan_release_text(paths: list[pathlib.Path]) -> tuple[list[str], int]:
                         f"{path}:{line_number}: {label}: {line.strip()}")
         if text and not text.endswith("\n"):
             failures.append(f"{path}: missing final newline")
-    return failures, scanned
+    return failures, scanned, binary
 
 
 def scan_headers(paths: list[pathlib.Path]) -> list[str]:
@@ -176,23 +209,57 @@ def scan_headers(paths: list[pathlib.Path]) -> list[str]:
     return failures
 
 
-def self_test() -> list[str]:
+def self_test() -> tuple[list[str], list[str]]:
     failures: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="megamoe-hygiene-") as directory:
-        root = pathlib.Path(directory)
-        trailing = root / "trailing.txt"
-        trailing.write_text("bad trailing space \n", encoding="utf-8")
-        private = root / "private.txt"
-        private.write_text(
-            "endpoint=" + "192" + ".168.23.41\n", encoding="utf-8"
-        )
-        trailing_failures, _ = scan_release_text([trailing])
-        private_failures, _ = scan_release_text([private])
-        if not any("trailing whitespace" in item for item in trailing_failures):
-            failures.append("negative fixture: trailing whitespace was accepted")
-        if not any("private IPv4" in item for item in private_failures):
-            failures.append("negative fixture: private IPv4 was accepted")
-    return failures
+    fixtures = (
+        (
+            "packaging-private-ip",
+            pathlib.Path("packaging/megamoe.pc.in"),
+            "endpoint=" + "192" + ".168.23.41\n",
+            "private IPv4",
+        ),
+        (
+            "reference-absolute-path",
+            pathlib.Path("reference/notify_dispatch_reference.py"),
+            "path=/" + "storage" + "/machine/input\n",
+            "machine storage path",
+        ),
+        (
+            "dotfile-trailing-whitespace",
+            pathlib.Path(".gitignore"),
+            "generated/ \n",
+            "trailing whitespace",
+        ),
+        (
+            "unknown-directory-identity",
+            pathlib.Path("future-module/new-file.txt"),
+            "owner=" + "wang" + "haitao\n",
+            "known developer identity",
+        ),
+    )
+    passed: list[str] = []
+    for label, relative, content, expected in fixtures:
+        with tempfile.TemporaryDirectory(
+                prefix="megamoe-hygiene-") as directory:
+            root = pathlib.Path(directory)
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()),
+                 "--root", str(root)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            if result.returncode == 0 or expected not in result.stdout:
+                failures.append(
+                    f"negative fixture {relative}: expected nonzero "
+                    f"{expected}; output={result.stdout.strip()!r}")
+            else:
+                passed.append(label)
+    return failures, passed
 
 
 def main() -> int:
@@ -202,19 +269,27 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve()
-    files, mode = release_files(root)
+    files, excluded, mode = release_files(root)
     headers = args.headers or sorted((root / "include" / "megamoe").rglob("*.hpp"))
-    failures, text_count = scan_release_text(files)
+    failures, text_count, binary = scan_release_text(files)
+    excluded.extend(
+        f"{path.relative_to(root).as_posix()} (binary/non-UTF8, not text-scanned)"
+        for path in binary
+    )
     failures += scan_headers(headers)
+    fixture_labels: list[str] = []
     if args.self_test:
-        failures += self_test()
+        fixture_failures, fixture_labels = self_test()
+        failures += fixture_failures
     if failures:
         print("\n".join(failures))
         return 1
+    excluded_text = "[]" if not excluded else "[" + ", ".join(excluded) + "]"
     print(
-        f"release hygiene: mode={mode}, text_files={text_count}, "
+        f"release hygiene: mode={mode}, regular_files={len(files)}, "
+        f"text_files={text_count}, excluded={excluded_text}, "
         f"installed_headers={len(headers)}, negative_fixtures="
-        f"{'pass' if args.self_test else 'not-requested'}"
+        f"{','.join(fixture_labels) if args.self_test else 'not-requested'}"
     )
     return 0
 
