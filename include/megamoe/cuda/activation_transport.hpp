@@ -845,6 +845,11 @@ ActivationTransportCapability probe_activation_transport_capability(
 ActivationTransportCapability probe_activation_transport_capability(
     const NcclSession &session, const CudaExecution &execution);
 
+// One-time training-session preparation. It builds device-resident W1^T/W2^T
+// and their TMA descriptors; Forward-only users do not call it.
+void prepare_forward_weights_for_backward(
+    const ForwardWeightLease &weights, const CudaExecution &execution);
+
 #if defined(MEGAMOE_INTERNAL_TESTING_API)
 namespace testing {
 struct GinPutSignalProbeResult {
@@ -930,11 +935,6 @@ struct EmptyExpertGradientZeroCheck {
 EmptyExpertGradientZeroCheck check_empty_expert_gradients_for_validation(
     const DeviceBackwardHandle &handle, std::uint32_t local_expert,
     const CudaExecution &execution);
-
-// One-time Backward session setup. It builds device-resident W1^T/W2^T and
-// their TMA descriptors; Forward-only callers pay neither memory nor setup.
-void prepare_forward_weights_for_backward(
-    const ForwardWeightLease &weights, const CudaExecution &execution);
 
 // Executes a true device-issued store through a peer mapping and observes a
 // system-scope release/acquire signal. It is a capability/correctness probe,

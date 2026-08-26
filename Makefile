@@ -11,6 +11,22 @@ CUDA_CPPFLAGS += -isystem $(DEEPGEMM_INCLUDE_DIR) -isystem $(CUTLASS_INCLUDE_DIR
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
+PREFIX ?= /usr/local
+DESTDIR ?=
+
+PUBLIC_HEADERS := \
+	include/megamoe/version.hpp \
+	include/megamoe/api/errors.hpp \
+	include/megamoe/api/notify_dispatch.hpp \
+	include/megamoe/config/runtime_config.hpp \
+	include/megamoe/cuda/activation_transport.hpp \
+	include/megamoe/cuda/control_protocol.hpp \
+	include/megamoe/cuda/device_notify.hpp \
+	include/megamoe/cuda/nccl_count_exchange.hpp \
+	include/megamoe/metadata/dispatch_handle.hpp \
+	include/megamoe/scoreboard/workspace_plan.hpp \
+	include/megamoe/transport/activation_protocol.hpp \
+	include/megamoe/transport/count_exchange.hpp
 
 CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE)
 CUDA_CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE)
@@ -43,7 +59,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test install install-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -182,6 +198,15 @@ header-test:
 
 api-negative-test:
 	CXX='$(CXX)' python3 tests/check_cuda_public_api.py
+
+install:
+	@for header in $(PUBLIC_HEADERS); do \
+		destination='$(DESTDIR)$(PREFIX)/include/'$${header#include/}; \
+		install -D -m 0644 $$header $$destination; \
+	done
+
+install-test:
+	CXX='$(CXX)' python3 tests/check_install.py
 
 test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test cross-check header-test api-negative-test
 	$(BUILD_DIR)/test_notify_dispatch

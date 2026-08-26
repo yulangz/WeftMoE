@@ -2586,8 +2586,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             experts / world, rank * (experts / world), hidden, intermediate,
             setup_generation.session(), execution);
     trace_backward_bench("weights_initialized");
-    megamoe::cuda::testing::prepare_forward_weights_for_backward(weights,
-                                                                  execution);
+    megamoe::cuda::prepare_forward_weights_for_backward(weights, execution);
     trace_backward_bench("weights_prepacked");
     const auto actual_weight_hashes =
         megamoe::cuda::testing::hash_forward_weight_storage_for_validation(
@@ -3723,8 +3722,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         megamoe::cuda::testing::make_deterministic_forward_weights_for_testing(
             experts / world, rank * (experts / world), hidden, intermediate,
             setup_generation.session(), execution);
-    megamoe::cuda::testing::prepare_forward_weights_for_backward(weights,
-                                                                  execution);
+    megamoe::cuda::prepare_forward_weights_for_backward(weights, execution);
     std::unique_ptr<megamoe::cuda::LocalCudaP2pForwardMegaKernel>
         local_forward;
     std::unique_ptr<megamoe::cuda::LocalCudaP2pBackwardMegaKernel>

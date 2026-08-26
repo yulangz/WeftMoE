@@ -7271,7 +7271,7 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
   return ForwardWeightLease(std::move(impl));
 }
 
-void testing::prepare_forward_weights_for_backward(
+void prepare_forward_weights_for_backward(
     const ForwardWeightLease &weights, const CudaExecution &execution) {
   if (!weights || !execution)
     transport_error(NotifyErrorCode::InvalidHandle,
