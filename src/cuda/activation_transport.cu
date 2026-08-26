@@ -34,6 +34,7 @@
 #include <thread>
 
 #include "cuda/cuda_internal.hpp"
+#include "cuda/testing/harnesses.hpp"
 #include "megamoe/api/errors.hpp"
 
 namespace megamoe::cuda {

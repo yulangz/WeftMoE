@@ -1,8 +1,8 @@
 CXX ?= c++
 NVCC ?= /usr/local/cuda/bin/nvcc
 BUILD_DIR ?= build
-CPPFLAGS := -Iinclude -Isrc -pthread
-CUDA_CPPFLAGS := -Iinclude -Isrc -Xcompiler=-pthread
+CPPFLAGS := -Iinclude -Isrc -Itests -pthread
+CUDA_CPPFLAGS := -Iinclude -Isrc -Itests -Xcompiler=-pthread
 DEEPGEMM_INCLUDE_DIR ?= ../DeepGEMM/deep_gemm/include
 # Prefer CUTLASS/CUTE bundled with an installed DeepGEMM package. A source-only
 # build can override this with an initialized CUTLASS checkout.
@@ -57,7 +57,11 @@ $(BUILD_DIR)/%.o: %.cu
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
-$(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cuda_notify.cpp
+CUDA_TEST_SOURCES := \
+	tests/test_cuda_notify.cpp \
+	tests/cuda/runtime_shape_tests.cpp
+
+$(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) $(CUDA_TEST_SOURCES)
 	@mkdir -p $(@D)
 	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) $^ -lnccl -lcuda -ldl -o $@
 

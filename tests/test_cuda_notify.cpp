@@ -25,6 +25,8 @@
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
+#include "cuda/testing/harnesses.hpp"
+#include "cuda/test_entrypoints.hpp"
 
 namespace {
 
@@ -5802,12 +5804,7 @@ int main(int argc, char **argv) {
       const auto hidden = parse_u64(argv[2]);
       const auto intermediate = parse_u64(argv[3]);
       const auto backward = parse_u64(argv[4]) != 0;
-      require(megamoe::cuda::testing::run_runtime_shape_world1_harness(
-                  hidden, intermediate, backward),
-              "runtime-shape persistent Forward/Backward harness failed");
-      std::cout << "[PASS] runtime-shape persistent kernel hidden=" << hidden
-                << " intermediate=" << intermediate
-                << " backward=" << backward << '\n';
+      megamoe::tests::run_runtime_shape_test(hidden, intermediate, backward);
       return 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--bench") {

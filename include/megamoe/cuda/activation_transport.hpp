@@ -905,14 +905,6 @@ double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
                                             std::uint64_t bytes,
                                             std::uint32_t warmup,
                                             std::uint32_t measured);
-// NCCL-free sanitizer harness. It launches the exact production main-shape
-// Forward persistent kernel, replacing only Notify/bootstrap with an explicit
-// initialized world-1 dispatch fixture.
-bool run_forward_world1_sanitizer_harness();
-bool run_backward_world1_sanitizer_harness();
-bool run_runtime_shape_world1_harness(std::uint64_t hidden,
-                                      std::uint64_t intermediate,
-                                      bool run_backward);
 } // namespace testing
 
 } // namespace megamoe::cuda
