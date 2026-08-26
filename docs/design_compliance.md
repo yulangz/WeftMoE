@@ -10,7 +10,7 @@ completed production feature.
 | Design requirement | Implementation | Test / evidence | Performance evidence | Status |
 |---|---|---|---|---|
 | Runtime tokens, experts, top-k, rank/world and homogeneous topology | `RuntimeConfig`, `Topology`, device Notify configuration | host topology rejection tests; CUDA world 1/2/8; real world 2/16 | Notify benchmark JSON and fused/full protocol audits | Complete |
-| Runtime hidden/intermediate, including tails | Forward/Backward public entry currently accepts only the `7168/3072` specialization | rejection is covered, but no production fallback exists at this audit point | none | **Missing** |
+| Runtime hidden/intermediate, including tails | `runtime_shape_forward_megakernel` and `runtime_shape_backward_megakernel`; the frozen `7168/3072` branch remains the WGMMA/TMA specialization | world-1 oracle at 64/32, 96/48, 127/65 and 256/192; real world-2 LocalCudaP2p at 127/65 | correctness-only; not a performance claim | Complete |
 | Deterministic Notify local offsets and canonical rows | `device_notify.cu`, host metadata materializer and Python reference | 28 full-field fixtures, 25 fixed CUDA seeds, 20 byte-identical repeats | device Notify stage timings | Complete |
 | Source-rank prefix, owned-expert prefix/M-tile metadata, reverse routes and combine order | device materializer and immutable `DeviceDispatchHandle` | C++/Python full-field comparison; row uniqueness/continuity properties | materialization benchmark split | Complete |
 | Forward is one persistent data-plane kernel after Notify | `local_p2p_forward_megakernel`; Local, GIN and Socket full-FC adapters | world 1/2/8 and GIN world 2/16; launch audit equals one | single-node and world-16 Forward results | Complete |
@@ -30,24 +30,32 @@ completed production feature.
 | Autotune cannot change canonical/reduction invariants | frozen main-shape specialization and recorded tuning parameters | output/gradient hashes are checked for every accepted candidate | recorded top candidates and final main-shape configuration | Complete |
 | H200 / SM90a runtime validation | SM90/SM90a targets compile; actual machines report L20X / CC 8.9 virtualization | SM90a compile and L20X runtime tests | no H200 measurement | **Environment-limited** |
 
-## Audit findings and required work
+## Audit findings and disposition
 
-1. Add a correctness-only, single-kernel Forward and Backward fallback for
-   runtime hidden/intermediate dimensions and tail tiles. The frozen
-   `7168/3072` WGMMA/TMA path must remain byte-for-byte and performance stable.
-2. `src/cuda/activation_transport.cu` combines protocol types, pool ownership,
-   three transports, two schedulers, validation and benchmark hooks in one
-   translation unit. Split internal responsibilities without changing public
-   ABI or compiler visibility of the main kernels.
-3. `tests/test_cuda_notify.cpp` combines protocol, pool, transport, Forward,
-   Backward and performance cases. Extract shared fixtures/hash/statistics and
-   separate test entry points while keeping launcher behavior stable.
-4. Public production types remain owning and typed, but simulation/synthetic
-   helpers and validation downloads must stay visibly test-only or be hidden
-   from the installed API during the final API pass.
+1. The runtime H/I gap is closed by a correctness-only, one-kernel Forward and
+   Backward fallback. The frozen `7168/3072` WGMMA/TMA branch is selected by an
+   explicit shape predicate and its normalized SASS/resource report is
+   unchanged by the refactor.
+2. Pointer-bearing Forward and Backward launch contracts and the generic
+   fallback are internal `.cuh` modules. The large aggregation translation
+   unit remains intentional: splitting the device definitions across separate
+   translation units changed compiler visibility and would risk the frozen
+   kernel. Public API, runtime pool, and backend ownership stay separate.
+3. Runtime-shape test entry points and NCCL-free harness declarations moved to
+   `tests/cuda` and `src/cuda/testing`; they are absent from the installed
+   production header. The legacy all-mode driver remains for launcher
+   compatibility, with new cases added in focused modules.
+4. Simulation, corruption, mutation and oracle helpers remain under
+   `testing` or explicit `*_for_validation` names. Native CUDA, IPC and GIN
+   handles are confined to internal headers and backend state.
 5. Physical GIN coverage is two homogeneous eight-GPU nodes. Runtime 3+ node
    construction is tested, but physical 3+ node behavior and H200/SM90a
    execution remain environment-limited rather than complete claims.
+
+The generic CUDA-core fallback is fully exercised on world 1 and local P2P
+world 2. Its arithmetic is transport-neutral, but physical cross-host testing
+for non-main H/I shapes is not part of the recorded two-host matrix; this is a
+test-coverage limitation rather than a compile-time H/I restriction.
 
 ## Frozen invariants
 

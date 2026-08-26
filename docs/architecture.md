@@ -52,12 +52,50 @@ WGMMA K order and produce identical output bits.
 The cache policy affects lifetime, not arithmetic: the cache mode retains BF16
 A/B checkpoints in the session pool; no-cache omits those stores. Both retain
 canonical dispatch X through the Forward handle. Transient S and expert output
-are generation-local. Cross-node Forward and backward are not implemented.
+are generation-local. Cross-node Forward and Backward use the separately typed
+GIN/RDMA backend; the Socket backend retains explicit host-enqueued payload
+phase boundaries and is a correctness fallback rather than a persistent-data-
+plane performance result.
 
 The launch requests a `2x1x1` cluster where supported and records requested and
-actual sizes independently. On the current L20X performance path the runtime
-audit is `requested=2, actual=1`; TMA multicast is disabled. Documentation and
-benchmark JSON therefore make no 2-CTA formation or multicast claim.
+actual sizes independently. The checked main-shape world-8 fixtures report
+`requested=2, actual=2`, rank mask `3`, and no TMA multicast. Cluster formation
+is therefore real for that measured path, while operand multicast remains
+disabled; the generic runtime-shape fallback reports cluster size one.
+
+## Runtime compute shapes
+
+`hidden` and `intermediate` are runtime values. The exact `7168/3072` predicate
+selects the frozen WGMMA/TMA kernels and their prebuilt TMA maps. Other positive
+sizes select `runtime_shape_forward_megakernel` and
+`runtime_shape_backward_megakernel`. Those kernels preserve one persistent
+launch per direction, canonical route rows, source-side FP32 gate-after,
+expert-ID combine order, canonical-M dW traversal, cache/no-cache behavior and
+tail bounds. They intentionally use scalar CUDA-core FP32 accumulation and are
+correctness fallbacks, not performance substitutes for the main specialization.
+TMA maps are neither created nor interpreted on this branch, which keeps odd
+dimensions such as `127/65` within checked ordinary device storage.
+
+## CUDA internal module boundary
+
+CUDA remains an aggregation translation unit so device helpers stay visible to
+NVCC and the frozen WGMMA/TMA SASS remains stable. Responsibilities within it
+are separated by internal headers:
+
+```text
+src/cuda/device_notify.cu                    deterministic Notify
+src/cuda/forward/kernel_contract.cuh         private Forward launch POD
+src/cuda/forward/runtime_shape_fallback.cuh  generic Forward/Backward kernels
+src/cuda/backward/kernel_contract.cuh        private Backward launch POD
+src/cuda/testing/harnesses.hpp               non-installed test entry points
+src/transport/nccl_count_exchange.cu         NCCL session/control backend
+```
+
+The launch PODs contain native pointers and are deliberately not reachable
+from public headers. The public surface exposes typed leases and owning result
+handles only. A normalized pre/post-refactor cubin comparison gives identical
+SASS and identical kernel resource records; anonymous-namespace hash changes
+are the only symbol-name difference.
 
 ## Runtime topology
 

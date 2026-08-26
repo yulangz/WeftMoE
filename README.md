@@ -34,6 +34,14 @@ source reduction. Socket and GIN full Forward/Backward actual device hashes
 match on real world-2 and world-16 runs for top-k 1/6. Arbitrary node counts
 beyond the tested two-node homogeneous topology remain open validation work.
 
+Hidden and intermediate sizes are runtime values. `7168/3072` selects the
+frozen SM90 WGMMA/TMA performance specialization; all other positive sizes use
+a correctness-only CUDA-core fallback that still executes Forward in one
+persistent kernel and Backward in one persistent kernel. World-1 oracle tests
+cover `64/32`, `96/48`, `127/65`, and `256/192`, including M/N/K tails, and
+`127/65` is also exercised through the real two-process LocalCudaP2p path. The
+fallback carries no performance claim.
+
 ## Supported topology contract
 
 The current transport model supports homogeneous nodes only:
@@ -276,7 +284,7 @@ not pay for a second terminal team barrier.
 The two forward modes share the same arithmetic path. `NO_FC1_OUTPUT_CACHE`
 retains canonical dispatch X and transient S only for the live generation;
 `CACHE_FC1_INPUT_OUTPUT` additionally checkpoints the BF16 A/B projections for
-a future backward implementation. Both cast SwiGLU output to BF16 before FC2,
+the persistent Backward kernel. Both cast SwiGLU output to BF16 before FC2,
 apply the per-route FP32 gate at the source after return, accumulate top-k in
 device `combine_order`, and cast the final sum once to BF16. No S, ungated FC2
 output, or peer contribution is retained beyond the Forward lease.
@@ -298,11 +306,10 @@ contents or a prior generation's signal value.
 The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
 CUDA runtime on the inspected L20X host; the fat binary also contains the
 ordinary `sm_89` target, which rejects this specialization at runtime. The
-launch audit records requested and actual cluster sizes separately. On the
-current L20X performance path it requests two CTAs but observes
-`cluster_size=1`; TMA multicast remains disabled (`audit=0`). No 2-CTA
-formation or multicast performance claim is made. There is currently no
-correctness fallback for other H/I shapes.
+launch audit records requested and actual cluster sizes separately. The
+checked world-8 main-shape runs request and observe `cluster_size=2` with rank
+mask `3`; TMA multicast remains disabled (`audit=0`). Other positive H/I
+shapes select the single-CTA correctness fallback described above.
 
 ## Single-node Backward baseline
 
@@ -375,13 +382,17 @@ include/megamoe/transport/    async integer collective contract and host fake
 include/megamoe/cuda/         opaque CUDA Notify/NCCL APIs and device schemas
 include/megamoe/scoreboard/   identity-bound workspace plan
 include/megamoe/kernels/      checked future launch contracts
-src/cuda/                     deterministic CUDA mapping and private leases
+src/cuda/device_notify.cu     Notify implementation boundary
+src/cuda/forward/             private Forward contracts and fallback kernels
+src/cuda/backward/            private Backward launch contract
+src/cuda/testing/             non-installed CUDA harness declarations
+src/cuda/*.cu                 aggregation TUs preserving device inlining
 src/transport/                host fake plus optional real NCCL AllGather
 src/metadata/*corruption*     internal sanitizer test hook, not public API
 reference/                    independent Python oracle
 tests/                        C++, Python, and full-field cross-language tests
 benchmarks/                   host metadata baseline
-docs/                         architecture, build, references, roadmap
+docs/                         architecture, compliance, performance, limits
 ```
 
 ## Build and test
@@ -418,4 +429,7 @@ NCCL_SOCKET_IFNAME=eth0 NCCL_IB_DISABLE=1 torchrun \
 
 `make test` runs C++ contract tests, Python reference tests, and a machine-readable
 full-field C++/Python comparison. See [docs/build.md](docs/build.md) for
-`-Werror`, sanitizers, and clean-export validation.
+`-Werror`, sanitizers, and clean-export validation; see
+[design compliance](docs/design_compliance.md),
+[performance](docs/performance_summary.md), and
+[known limitations](docs/known_limitations.md) for the final audit.

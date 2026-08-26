@@ -120,6 +120,10 @@ make BUILD_DIR=build-cuda -j cuda-lib
 make BUILD_DIR=build-cuda -j \
   NCCL_RUNTIME_LIB_DIR="$NCCL12" cuda-test-local
 
+# Correctness-only runtime H/I matrix (world 1 and real local world 2).
+make BUILD_DIR=build-cuda \
+  NCCL_RUNTIME_LIB_DIR="$NCCL12" cuda-runtime-shape-test
+
 # Include the one-GPU CUDA slice in the default host suite.
 make BUILD_DIR=build-cuda ENABLE_CUDA=1 \
   NCCL_RUNTIME_LIB_DIR="$NCCL12" test
@@ -403,9 +407,10 @@ the bytes their Forward kernels actually consume. The fair launcher rejects
 any per-rank W1 or W2 mismatch before timing; the formula-derived sample hash
 is retained only as generator/layout diagnostics.
 
-The production launch requests cluster dimension `2x1x1`, but the current L20X
-performance audit observes `actual=1`. JSON reports requested and actual sizes
-separately. TMA multicast is off; no 2-CTA formation claim is made.
+The production launch requests cluster dimension `2x1x1`; the checked world-8
+main-shape audit observes `actual=2` and rank mask `3`. JSON reports requested
+and actual sizes separately. TMA multicast is off, so no operand-multicast
+performance claim is made. The generic runtime-shape fallback uses one CTA.
 Pool construction clears each slot once. A generation writes only
 `2 * world * channels` completion words plus `2 * world` ready/ack words in a
 small setup kernel; it performs no arena-wide memset. The Forward benchmark's
