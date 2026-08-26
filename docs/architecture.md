@@ -679,14 +679,23 @@ GB/rank GIN-registered rail window; Backward-enabled ordinary storage is
 13.457 GB/rank.
 The opt-in Socket correctness backend is now concrete and separately typed. It
 packs GPU route payloads, exchanges one aggregate per peer with host-enqueued
-NCCL Send/Recv, performs destination device relay plus the validation expert
-transform, returns aggregate contributions, and reduces with source-resident
-dynamic gates. Only the small runtime count matrix and terminal status are
-staged to host; activation bytes remain on device. Its current first slice is
-direct rank-to-rank and therefore does not yet implement node dedup,
-same-rail proxy plus local CUDA-P2P fan-out, or full FC Forward/Backward. It is
-never described as persistent, GIN, or RDMA and cannot be confused with the
-real one-node CUDA IPC backend.
+NCCL Send/Recv, and performs destination device relay. Its full-FC wrappers
+then execute the same frozen WGMMA/TMA Forward/Backward core as the GIN path,
+exchange aggregate contribution or dX/dGate buffers, and use fixed-order
+source reduction. Only the small runtime count matrix and terminal status are
+staged to host; activation and gradient payload bytes remain on device. This
+fallback is direct rank-to-rank and does not implement the GIN node-dedup,
+same-rail proxy plus local CUDA-P2P fan-out data plane. Its host phase
+boundaries are explicit, so it is never described as persistent, GIN, or RDMA.
+
+GIN signal acquire is transferred from each device context leader to all
+reader CTAs through a device-scope release/acquire phase counter; a cooperative
+grid barrier alone is not the memory-ordering contract. The small FP32 dGate
+return receives a distinct terminal signal after local completion of the dX
+batch. Source reduce also refreshes node-local route dGate directly from the
+canonical owner row after its peer completion acquire. These rules make the
+four Backward storage hashes stable across generations and byte-identical to
+the Socket fallback.
 
 ### Backward ownership and dataflow
 

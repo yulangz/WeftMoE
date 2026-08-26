@@ -12,6 +12,12 @@ expectations.
 - `backward_integrated_world8.json` records three true same-generation
   Forward-to-Backward event-handoff sessions and the native Megatron
   Backward/F+B comparison.
+- `gin_world16_training_20260826.json` records three two-node world-16 GIN
+  Forward and F+B sessions, exact fixture agreement, runtime put/signal/byte
+  counters, and the per-run Megatron Socket comparison gate.
+- `socket_world16_fallback_20260826.json` records the corresponding three-run
+  full-FC NCCL Socket correctness/performance lower bound. Its explicit host
+  payload phases are included and every GIN audit field is zero.
 - `forward_main_world1_ncu.csv` records the available Nsight Compute metrics
   for the same main-shape kernel in world 1. Multi-process replay was not used
   because pausing one process independently invalidates the live peer data-plane

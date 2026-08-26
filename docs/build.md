@@ -255,9 +255,13 @@ The launcher prints the actual loaded `libnccl.so.2`, runtime version, network
 overrides, concrete `nccl-socket-host-enqueued-fallback` audit label, and
 per-rank output/contribution hashes. Each rank compares the downloaded test
 result with the independent host transport oracle before printing
-`oracle=1`. This initial Socket slice sends route aggregates directly between
-ranks; node-deduplicated same-rail proxy fan-out and cross-node FC
-Forward/Backward are still Phase-7 work.
+`oracle=1`. The complete host-enqueued correctness fallback uses the same
+launcher with `--scenario socket_forward_bench` or
+`--scenario socket_backward_bench`; set the corresponding
+`MEGAMOE_FORWARD_BENCH_ROUNDS`/`MEGAMOE_BACKWARD_BENCH_ROUNDS` and cache
+environment variables. It sends aggregates directly between ranks and runs
+the frozen WGMMA/TMA FC core, but does not claim node-deduplicated same-rail
+GIN execution or a single cross-node persistent payload kernel.
 
 ### World-16 full GIN Forward/Backward and Megatron Socket baseline
 
@@ -296,16 +300,44 @@ Run each command in three independent sessions, then enforce fixture agreement
 and every per-run 15% gate with `benchmarks/compare_multinode_training.py`.
 The checked result is
 `benchmarks/results/gin_world16_training_20260826.json`. Cross-run means are
-41.264 ms GIN Forward, 52.345 ms GIN Backward, and 93.607 ms
+41.069 ms GIN Forward, 52.738 ms GIN Backward, and 94.008 ms
 Notify-inclusive GIN F+B, versus 816.308/720.933/1465.224 ms for Megatron
 NCCL Socket. Every individual run clears all three gates.
+
+For a small exact correctness cross-check, run both GIN and Socket scenarios
+with identical `MEGAMOE_P2P_BENCH_TOKENS` and then compare the actual per-rank
+device-storage hashes:
+
+```bash
+python3 benchmarks/compare_socket_gin_correctness.py \
+  --gin-forward /tmp/gin-forward.log \
+  --socket-forward /tmp/socket-forward.log \
+  --gin-backward /tmp/gin-backward.log \
+  --socket-backward /tmp/socket-backward.log
+```
+
+Real world-16 top-k 1/6 checks cover 224 Forward and 352 Backward rank-fields;
+the top-k=1 Backward run additionally uses 20 validation generations. World-2
+full Backward uses the same 384-expert, 7168x3072 fixture and matches all actual
+dX/dW1/dW2/dGate hashes.
+
+The full Socket fallback was also measured in three independent world-16
+sessions with the same 10+100 boundary. Its cross-run slowest-rank means are
+428.075 ms Forward, 424.088 ms Backward, and 1874.219 ms for the
+Notify-inclusive F+B path. The large step wall includes every explicit Socket
+payload phase and terminal boundary. The fallback's current correctness
+preload completes an identity return before the FC body; its real bytes are
+included in the audit rather than hidden. The machine-readable result is
+`benchmarks/results/socket_world16_fallback_20260826.json`; every `gin_*`
+counter is zero.
 
 Runtime device counters report, per rail/rank/generation, 352.25--352.39 MB
 raw remote Forward route payload, 117.44 MB after node dedup, and
 352.25--352.39 MB return payload. Forward uses 24 dispatch puts, eight return
-puts, and 16 signals; Backward uses 32/16 puts and 16 signals. Derived from
+puts, and 16 signals; Backward uses 32/24 puts and 24 signals after the
+distinct terminal FP32 dGate publication. Derived from
 those actual byte counters and the slowest-rank device spans, payload rates are
-13.25 GB/s dispatch and 14.87 GB/s return. The Forward pool separates
+13.26 GB/s dispatch and 14.89 GB/s return. The Forward pool separates
 4,382,039,368 ordinary compute bytes from 1,766,522,888 GIN-registered bytes
 per rank; weights add 3,170,893,824 ordinary bytes per rank.
 

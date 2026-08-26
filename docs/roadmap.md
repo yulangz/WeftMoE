@@ -182,16 +182,17 @@ correctness blockers.
   checks. Cache Forward and Backward now execute their complete main-shape
   persistent kernels on the same world-16 GIN team, including FC1/FC2,
   dV/dX/dW, dGate and return/reduce.
-- The first concrete `NcclSocketFallback` slice passes real world-2 and
-  world-16 NCCL Socket Send/Recv, device synthetic relay/return, dynamic
-  gate-after combine, and independent host-oracle comparison. It has no
-  activation D2H/H2D and its backend label cannot be selected by enum.
+- The concrete `NcclSocketFallback` passes real world-2 and world-16 NCCL
+  Socket Send/Recv for complete cache Forward and Backward, including the
+  frozen WGMMA/TMA expert body, aggregate contribution/dX/dGate return, and
+  deterministic source reduce. It has no activation/gradient payload D2H/H2D,
+  retains explicit host-enqueued phase boundaries, and its backend label cannot
+  be selected by enum.
 - GIN uses node-level payload dedup, same-rail destination proxies, local P2P
   fan-out and batched reverse traffic. Three independent world-16 10+100 runs
   pass the 15% Forward, Backward and Notify-inclusive F+B gates against the
   real Megatron NCCL Socket baseline; the checked machine-readable result is
   `benchmarks/results/gin_world16_training_20260826.json`.
-- The Socket fallback never claims GIN/RDMA. It remains a synthetic
-  correctness/lower-bound backend; connecting its packet coordinator to full
-  FC Forward/Backward is still open. Runtime node counts other than the tested
+- The Socket fallback never claims GIN/RDMA or a single persistent cross-node
+  data plane. Runtime node counts other than the tested
   homogeneous two-node world-2/world-16 configurations also remain to validate.

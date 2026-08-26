@@ -20,15 +20,19 @@ Phase 7 adds a concrete, opt-in
 `NcclSocketFallbackActivationTransport`: it performs host-enqueued NCCL
 Send/Recv of GPU-resident BF16 payloads across two hosts, device relay,
 synthetic return, and source-side dynamic-gate reduction without activation
-D2H/H2D. This is a correctness/lower-bound backend. A separately typed
+D2H/H2D. The separately typed `NcclSocketFallbackForwardMegaKernel` and
+`NcclSocketFallbackBackwardMegaKernel` extend that backend through the frozen
+WGMMA/TMA FC1/FC2 and dV/dX/dW cores, aggregate dX/dGate return, and fixed-order
+source reduce. They retain explicit host-enqueued payload phase boundaries and
+remain a correctness/lower-bound backend. A separately typed
 `GinRdmaActivationTransport` now runs full cache Forward and Backward with
 device-issued NCCL GIN put/signal/local-completion inside the existing
 persistent data-plane kernels. Real two-node world-16 execution uses eight
 same-rail proxies, node-deduplicated ingress, CUDA-IPC local fan-out to
 canonical rows, WGMMA/TMA FC/dW, packet-batched return, dGate, and deterministic
-source reduction. The direct-rank Socket slice remains synthetic and is not
-yet a full FC correctness fallback; arbitrary node counts beyond the tested
-two-node homogeneous topology remain open validation work.
+source reduction. Socket and GIN full Forward/Backward actual device hashes
+match on real world-2 and world-16 runs for top-k 1/6. Arbitrary node counts
+beyond the tested two-node homogeneous topology remain open validation work.
 
 ## Supported topology contract
 

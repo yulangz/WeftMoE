@@ -369,6 +369,7 @@ def environment_overrides(args):
         "MEGAMOE_P2P_BENCH_TOKENS",
         "MEGAMOE_FORWARD_BENCH_ROUNDS",
         "MEGAMOE_BACKWARD_BENCH_ROUNDS",
+        "MEGAMOE_BACKWARD_HASH_REPEATS",
         "MEGAMOE_FORWARD_CACHE",
         "MEGAMOE_BACKWARD_CACHE",
         "MEGAMOE_P2P_TOP_K",
@@ -586,6 +587,8 @@ def parse_args(argv=None):
                  "gin_backward_smoke",
                  "gin_forward_bench",
                  "gin_backward_bench",
+                 "socket_forward_bench",
+                 "socket_backward_bench",
                  "activation_socket",
                  "activation_gin"),
         default="valid",
@@ -817,6 +820,58 @@ def main(argv=None):
             aggregate_gin_benchmark(outputs, args.scenario),
             sort_keys=True))
         print(f"[PASS] same-rail GIN benchmark world={world}")
+        return
+
+    if args.scenario == "socket_forward_bench":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("FORWARD_BENCH ")]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+                if "backend=nccl-socket-fallback" not in lines[0]:
+                    failures.append(
+                        f"rank={result.rank} wrong Socket Forward backend: "
+                        f"{lines[0]}"
+                    )
+        if failures:
+            raise RuntimeError("distributed Socket Forward failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] host-enqueued Socket full Forward world={world}")
+        return
+
+    if args.scenario == "socket_backward_bench":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("BACKWARD_BENCH ")]
+            if result.returncode != 0 or len(lines) != 1:
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}"
+                )
+            else:
+                evidence.append(lines[0])
+                if "backend=nccl-socket-fallback" not in lines[0]:
+                    failures.append(
+                        f"rank={result.rank} wrong Socket Backward backend: "
+                        f"{lines[0]}"
+                    )
+        if failures:
+            raise RuntimeError("distributed Socket Backward failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] host-enqueued Socket full Backward world={world}")
         return
 
     if args.scenario == "activation_socket":

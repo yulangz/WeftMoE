@@ -56,8 +56,10 @@ private:
   friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
+  friend class NcclSocketFallbackForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+  friend class NcclSocketFallbackBackwardMegaKernel;
 };
 
 struct ActivationTransportPoolConfig {
@@ -118,8 +120,10 @@ private:
   friend class GinRdmaActivationTransport;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
+  friend class NcclSocketFallbackForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+  friend class NcclSocketFallbackBackwardMegaKernel;
 };
 
 ActivationTransportResourcePool make_activation_transport_pool(
@@ -419,6 +423,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
+  friend class NcclSocketFallbackForwardMegaKernel;
   friend class ForwardMegaKernelBridge;
   friend std::vector<transport::BFloat16>
   download_forward_output_for_validation(const DeviceForwardHandle &,
@@ -431,6 +436,7 @@ private:
   friend class SelectedOutputGradientLease;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+  friend class NcclSocketFallbackBackwardMegaKernel;
   friend struct BackwardMegaKernelBridge;
   friend SelectedOutputGradientLease
   testing_upload_output_gradient_for_backward(
@@ -459,9 +465,14 @@ private:
   LocalCudaP2pForwardMegaKernel(
       const NcclSession &, const CudaExecution &,
       const ActivationTransportResourcePool &, bool use_gin);
+  LocalCudaP2pForwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &, bool use_gin,
+      bool use_socket);
   struct Impl;
   std::shared_ptr<Impl> impl_;
   friend class GinRdmaForwardMegaKernel;
+  friend class NcclSocketFallbackForwardMegaKernel;
 };
 
 // Cross-node same-rail GIN Forward. It shares the frozen WGMMA/TMA compute
@@ -471,6 +482,24 @@ class GinRdmaForwardMegaKernel {
 public:
   GinRdmaForwardMegaKernel(const NcclSession &, const CudaExecution &,
                            const ActivationTransportResourcePool &);
+  DeviceForwardHandle run(
+      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
+      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
+      const ActivationTransportRunOptions & = {});
+
+private:
+  std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
+};
+
+// Host-enqueued NCCL Socket correctness fallback for the complete Forward
+// semantics. Dispatch and return have explicit host phase boundaries; the FC
+// body reuses the frozen WGMMA/TMA compute core and deterministic gate-after
+// reduce. This type never reports a GIN or single-persistent audit label.
+class NcclSocketFallbackForwardMegaKernel {
+public:
+  NcclSocketFallbackForwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &);
   DeviceForwardHandle run(
       const DeviceDispatchHandle &, const BFloat16ActivationLease &,
       const ForwardWeightLease &, const ForwardMegaKernelConfig &,
@@ -638,15 +667,37 @@ private:
   LocalCudaP2pBackwardMegaKernel(
       const NcclSession &, const CudaExecution &,
       const ActivationTransportResourcePool &, bool use_gin);
+  LocalCudaP2pBackwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &, bool use_gin,
+      bool use_socket);
   struct Impl;
   std::shared_ptr<Impl> impl_;
   friend class GinRdmaBackwardMegaKernel;
+  friend class NcclSocketFallbackBackwardMegaKernel;
 };
 
 class GinRdmaBackwardMegaKernel {
 public:
   GinRdmaBackwardMegaKernel(const NcclSession &, const CudaExecution &,
                             const ActivationTransportResourcePool &);
+  DeviceBackwardHandle run(
+      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
+      const BackwardMegaKernelConfig &,
+      const ActivationTransportRunOptions & = {});
+
+private:
+  std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
+};
+
+// Host-enqueued NCCL Socket correctness fallback for complete Backward
+// semantics. dY/dX/dGate cross explicit aggregate Socket phase boundaries;
+// dV/dX/dW reuse the frozen WGMMA/TMA core and deterministic dX reduce.
+class NcclSocketFallbackBackwardMegaKernel {
+public:
+  NcclSocketFallbackBackwardMegaKernel(
+      const NcclSession &, const CudaExecution &,
+      const ActivationTransportResourcePool &);
   DeviceBackwardHandle run(
       const DeviceForwardHandle &, const SelectedOutputGradientLease &,
       const BackwardMegaKernelConfig &,

@@ -1,9 +1,9 @@
 {
   "comparison": "world16-gin-vs-megatron-nccl-socket-training",
   "cross_run_mean_ms": {
-    "megamoe_gin_backward": 52.344876666666664,
-    "megamoe_gin_forward": 41.264075,
-    "megamoe_gin_forward_backward": 93.60687033333333,
+    "megamoe_gin_backward": 52.73848933333334,
+    "megamoe_gin_forward": 41.06928800000001,
+    "megamoe_gin_forward_backward": 94.00755033333333,
     "megatron_socket_backward": 720.9330925566666,
     "megatron_socket_forward": 816.3075086033333,
     "megatron_socket_forward_backward": 1465.2236620466665
@@ -75,58 +75,58 @@
       117440512
     ],
     "per_rank_backward_gin_metadata_bytes": [
-      1376360,
-      1376384,
-      1376396,
-      1376336,
-      1376264,
-      1376208,
-      1376100,
-      1376100,
-      1376408,
-      1376384,
-      1376276,
-      1376240,
-      1376120,
-      1376112,
-      1376124,
-      1376124
+      1474684,
+      1474704,
+      1474700,
+      1474636,
+      1474548,
+      1474492,
+      1474388,
+      1474388,
+      1474724,
+      1474704,
+      1474600,
+      1474556,
+      1474428,
+      1474412,
+      1474408,
+      1474408
     ],
     "per_rank_backward_gin_return_puts": [
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24
     ],
     "per_rank_backward_gin_signals": [
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16,
-      16
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24
     ],
     "per_rank_backward_raw_remote_dy_bytes": [
       352364544,
@@ -149,12 +149,12 @@
   },
   "gin_forward_runtime_audit": {
     "derived_per_rail_dispatch_payload_gbytes_per_second_range": [
-      13.25179762077709,
-      13.25179762077709
+      13.255837738146765,
+      13.255837738146765
     ],
     "derived_per_rail_return_payload_gbytes_per_second_range": [
-      14.868733239691116,
-      14.874784573881701
+      14.882996194894812,
+      14.889053333877715
     ],
     "derived_per_rank_local_dispatch_fanout_bytes": [
       308238336,
@@ -443,18 +443,18 @@
   "runs": [
     {
       "improvement_percent": {
-        "backward": 92.58797115595821,
-        "forward": 94.68072437252412,
-        "forward_backward": 93.49333172244316
+        "backward": 92.53286902635297,
+        "forward": 94.71164559277597,
+        "forward_backward": 93.46290471986656
       },
-      "megamoe_backward_p95_ms": 52.547,
-      "megamoe_forward_p95_ms": 41.6821,
+      "megamoe_backward_p95_ms": 52.8838,
+      "megamoe_forward_p95_ms": 41.2895,
       "megamoe_gin_ms": {
-        "backward": 52.348289,
-        "forward": 41.291914,
-        "notify_inclusive_forward_backward": 93.61736300000001
+        "backward": 52.73745400000001,
+        "forward": 41.051882000000006,
+        "notify_inclusive_forward_backward": 94.055144
       },
-      "megamoe_step_p95_ms": 93.9838,
+      "megamoe_step_p95_ms": 95.2969,
       "megatron_backward_p95_ms": 839.828676,
       "megatron_forward_p95_ms": 963.009124,
       "megatron_socket_ms": {
@@ -467,18 +467,18 @@
     },
     {
       "improvement_percent": {
-        "backward": 91.83566972388874,
-        "forward": 94.19941377599153,
-        "forward_backward": 92.86095783098051
+        "backward": 91.77265839701361,
+        "forward": 94.24068962495376,
+        "forward_backward": 92.83382198323584
       },
-      "megamoe_backward_p95_ms": 52.4991,
-      "megamoe_forward_p95_ms": 42.5359,
+      "megamoe_backward_p95_ms": 52.857800000000005,
+      "megamoe_forward_p95_ms": 41.3254,
       "megamoe_gin_ms": {
-        "backward": 52.337684,
-        "forward": 41.347527,
-        "notify_inclusive_forward_backward": 93.61653
+        "backward": 52.741620000000005,
+        "forward": 41.053306000000006,
+        "notify_inclusive_forward_backward": 93.972371
       },
-      "megamoe_step_p95_ms": 94.0572,
+      "megamoe_step_p95_ms": 94.298,
       "megatron_backward_p95_ms": 767.380965,
       "megatron_forward_p95_ms": 866.357236,
       "megatron_socket_ms": {
@@ -491,18 +491,18 @@
     },
     {
       "improvement_percent": {
-        "backward": 93.5806720739774,
-        "forward": 95.71252226746711,
-        "forward_backward": 94.3127327788751
+        "backward": 93.53312527727444,
+        "forward": 95.71774273892348,
+        "forward_backward": 94.28791320667985
       },
-      "megamoe_backward_p95_ms": 52.551300000000005,
-      "megamoe_forward_p95_ms": 41.4775,
+      "megamoe_backward_p95_ms": 52.891400000000004,
+      "megamoe_forward_p95_ms": 41.3512,
       "megamoe_gin_ms": {
-        "backward": 52.348656999999996,
-        "forward": 41.152784,
-        "notify_inclusive_forward_backward": 93.586718
+        "backward": 52.736394,
+        "forward": 41.102676,
+        "notify_inclusive_forward_backward": 93.995136
       },
-      "megamoe_step_p95_ms": 93.9559,
+      "megamoe_step_p95_ms": 94.25710000000001,
       "megatron_backward_p95_ms": 956.954974,
       "megatron_forward_p95_ms": 1127.721489,
       "megatron_socket_ms": {
