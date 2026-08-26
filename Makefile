@@ -9,7 +9,7 @@ DEEPGEMM_INCLUDE_DIR ?= ../DeepGEMM/deep_gemm/include
 CUTLASS_INCLUDE_DIR ?= $(shell python3 -c 'import importlib.util,os;s=importlib.util.find_spec("deep_gemm");print(os.path.join(os.path.dirname(s.origin),"include") if s else "../DeepGEMM/third-party/cutlass/include")')
 CUDA_CPPFLAGS += -isystem $(DEEPGEMM_INCLUDE_DIR) -isystem $(CUTLASS_INCLUDE_DIR)
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-override CXXFLAGS += -fPIC
+override CXXFLAGS += -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
 PREFIX ?= /usr/local
@@ -36,8 +36,8 @@ PUBLIC_HEADERS := \
 	include/megamoe/transport/activation_protocol.hpp \
 	include/megamoe/transport/count_exchange.hpp
 
-CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE)
-CUDA_CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE)
+CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_SHARED=1
+CUDA_CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_SHARED=1
 
 LIB_SOURCES := \
 	src/cuda/control_protocol.cpp \
@@ -48,10 +48,11 @@ LIB_SOURCES := \
 	src/transport/host_fake_count_exchange.cpp \
 	src/scoreboard/workspace_plan.cpp
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
+PROD_LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/production/%.o)
 
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets
-override CUDA_NVCCFLAGS += -Xcompiler=-fPIC
+override CUDA_NVCCFLAGS += -Xcompiler=-fPIC,-fvisibility=hidden,-ffunction-sections,-fdata-sections
 ifeq ($(WERROR),1)
 override CXXFLAGS += -Werror
 override CUDA_NVCCFLAGS += -Xcompiler=-Werror
@@ -67,51 +68,105 @@ CUDA_LIB_SOURCES := \
 	src/cuda/activation_transport.cu \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
+PROD_CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib install uninstall-manifest install-test kernel-artifact-check kernel-artifact-update release-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cu
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_CPPFLAGS) $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
 
-$(BUILD_DIR)/src/cuda/activation_transport.o: \
+$(BUILD_DIR)/production/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/production/%.o: %.cu
+	@mkdir -p $(@D)
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
+
+$(BUILD_DIR)/src/cuda/activation_transport.o \
+$(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
 	src/cuda/forward/runtime_shape_fallback.cuh \
 	src/cuda/backward/kernel_contract.cuh
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
-$(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
+$(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(PROD_LIB_OBJECTS) $(PROD_CUDA_LIB_OBJECTS) abi/libmegamoe.map
 	@mkdir -p $(@D)
 	$(NVCC) -Wno-deprecated-gpu-targets -shared \
 		-Xlinker=-soname -Xlinker=$(LIBMEGAMOE_SONAME) \
-		$(LDFLAGS) $^ -lnccl -lcudart -lcuda -ldl -o $@
+		-Xlinker=--version-script=$(CURDIR)/abi/libmegamoe.map \
+		-Xlinker=--gc-sections \
+		$(LDFLAGS) $(filter %.o,$^) -lnccl -lcudart -lcuda -ldl -o $@
 
 shared-lib: $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME)
 
-kernel-artifact-check: $(BUILD_DIR)/src/cuda/activation_transport.o
+$(BUILD_DIR)/libmegamoe_testing.a: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
+	@mkdir -p $(@D)
+	ar rcs $@ $^
+
+# Repository tests may link this non-installed archive. Production packages
+# only build the MEGAMOE_BUILD_TESTING=0 object graph above.
+testing-lib: $(BUILD_DIR)/libmegamoe_testing.a
+
+kernel-artifact-check: $(BUILD_DIR)/production/src/cuda/activation_transport.o
 	python3 tools/kernel_artifact_manifest.py \
 		--binary $< --manifest tools/kernel_artifact_manifest.json
 
-kernel-artifact-update: $(BUILD_DIR)/src/cuda/activation_transport.o
+kernel-artifact-update: $(BUILD_DIR)/production/src/cuda/activation_transport.o
 	python3 tools/kernel_artifact_manifest.py \
 		--binary $< --manifest tools/kernel_artifact_manifest.json --update
 
+installed-header-scan:
+	python3 tools/check_release_hygiene.py --root .
+
+public-symbol-check: shared-lib
+	python3 tools/check_public_symbols.py --binary $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME) \
+		--whitelist abi/public_symbols_v2.txt
+
+retired-symbol-link-negative: shared-lib
+	ln -sfn $(LIBMEGAMOE_REALNAME) $(BUILD_DIR)/libmegamoe.so
+	python3 tools/check_retired_symbol_link.py --library-dir $(abspath $(BUILD_DIR))
+
+license-check:
+	test -s LICENSE
+	test -s NOTICE
+	test -s THIRD_PARTY_NOTICES.md
+
 release-test: shared-lib kernel-artifact-check install-test
+
+release-check:
+	$(MAKE) BUILD_DIR=$(BUILD_DIR)-release clean
+	$(MAKE) BUILD_DIR=$(BUILD_DIR)-release ENABLE_CUDA=1 \
+		NCCL_RUNTIME_LIB_DIR='$(NCCL_RUNTIME_LIB_DIR)' release-check-inner
+
+release-check-inner:
+	+$(MAKE) BUILD_DIR=$(BUILD_DIR) ENABLE_CUDA=1 shared-lib
+	+$(MAKE) BUILD_DIR=$(BUILD_DIR) installed-header-scan public-symbol-check \
+		retired-symbol-link-negative kernel-artifact-check header-test \
+		api-negative-test license-check
+	+$(MAKE) BUILD_DIR=$(BUILD_DIR) ENABLE_CUDA=1 \
+		NCCL_RUNTIME_LIB_DIR='$(NCCL_RUNTIME_LIB_DIR)' install-test
+	+$(MAKE) BUILD_DIR=$(BUILD_DIR)-werror ENABLE_CUDA=1 WERROR=1 shared-lib
+	git diff --check
 
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp \
 	tests/cuda/runtime_shape_tests.cpp
 
-$(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) $(CUDA_TEST_SOURCES)
+$(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES)
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) $^ -lnccl -lcuda -ldl -o $@
+	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) \
+		$(CUDA_TEST_SOURCES) -Xlinker=--whole-archive \
+		$(BUILD_DIR)/libmegamoe_testing.a -Xlinker=--no-whole-archive \
+		-lnccl -lcuda -ldl -o $@
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
