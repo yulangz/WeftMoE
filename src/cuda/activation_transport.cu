@@ -1350,7 +1350,7 @@ __global__ void socket_pack_routes_kernel(
     payload[packed * hidden + h] = input[token * hidden + h];
 }
 
-__global__ void socket_relay_synthetic_kernel(
+__global__ void socket_relay_transport_kernel(
     LocalP2pRouteHeader *headers, transport::BFloat16 *compact_payload,
     transport::BFloat16 *canonical_rows, std::uint64_t incoming,
     std::uint64_t hidden, std::uint64_t generation,
@@ -1589,7 +1589,7 @@ __global__ void gin_probe_put_signal_kernel(
   gin.waitSignal(ncclCoopThread{}, 0, 1);
 }
 
-struct GinSyntheticArgs {
+struct GinTransportSliceArgs {
   DeviceDispatchKernelView dispatch;
   const transport::BFloat16 *input;
   const float *gates;
@@ -1618,7 +1618,7 @@ struct GinSyntheticArgs {
   bool identity_expert;
 };
 
-__global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm,
+__global__ void gin_signal_reset_kernel(ncclDevComm_t dev_comm,
                                            std::uint32_t context_count) {
   if (blockIdx.x < context_count && threadIdx.x == 0) {
     const ncclGin gin(dev_comm, blockIdx.x);
@@ -1629,7 +1629,7 @@ __global__ void gin_synthetic_reset_kernel(ncclDevComm_t dev_comm,
   }
 }
 
-__global__ void gin_synthetic_persistent_kernel(GinSyntheticArgs a) {
+__global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
   const auto lane = static_cast<std::uint32_t>(threadIdx.x);
   const auto rank = a.dispatch.identity.calling_rank;
   const ncclGin gin(a.dev_comm, 0);
@@ -2128,6 +2128,54 @@ __device__ __forceinline__ void publish_production_terminal_status(
     }
   }
   __syncthreads();
+
+  // The trusted single-node release path completes the fixed status agreement
+  // on device. Every rank sees the same peer-owned record matrix and applies
+  // the same rank/field ordering before the host observes its local status.
+  if constexpr (StaticLocal) {
+    if (threadIdx.x == 0U) {
+      ProductionStatusRecord selected{};
+      bool has_error = false;
+      const auto expected_phase = static_cast<unsigned long long>(phase);
+      for (std::uint32_t source = 0; source < observed_world; ++source) {
+        auto record = observed_records[source];
+        if (record.generation != a.dispatch.identity.generation) {
+          record = ProductionStatusRecord{a.dispatch.identity.generation,
+                                          expected_phase, source, 2ULL, 1ULL,
+                                          a.dispatch.identity.generation,
+                                          record.generation, a.epoch};
+        } else if (record.phase != expected_phase) {
+          record = ProductionStatusRecord{a.dispatch.identity.generation,
+                                          expected_phase, source, 2ULL, 2ULL,
+                                          expected_phase, record.phase,
+                                          a.epoch};
+        } else if (record.epoch != a.epoch) {
+          record = ProductionStatusRecord{a.dispatch.identity.generation,
+                                          expected_phase, source, 2ULL, 4ULL,
+                                          a.epoch, record.epoch, a.epoch};
+        }
+        if (record.error_code == 0ULL)
+          continue;
+        if (!has_error || record.origin_rank < selected.origin_rank ||
+            (record.origin_rank == selected.origin_rank &&
+             record.field < selected.field)) {
+          selected = record;
+          has_error = true;
+        }
+      }
+      if (has_error) {
+        status->error = 1U;
+        status->error_origin_rank =
+            static_cast<std::uint32_t>(selected.origin_rank);
+        status->error_code = static_cast<std::uint32_t>(selected.error_code);
+        status->error_field = static_cast<std::uint32_t>(selected.field);
+        status->error_expected = selected.expected;
+        status->error_actual = selected.actual;
+      }
+      __threadfence_system();
+    }
+    __syncthreads();
+  }
 }
 
 // The storage is owned by the local rank: ingress_published is written by
@@ -6823,6 +6871,7 @@ struct ActivationMegaKernelBackendState {
   std::shared_ptr<internal::NcclSessionState> nccl;
   NcclSession session;
   CudaExecution execution;
+  virtual bool requires_collective_terminal_status() const noexcept = 0;
   virtual ~ActivationMegaKernelBackendState() noexcept = default;
 };
 
@@ -6849,6 +6898,10 @@ struct LocalP2pBackendState : ActivationMegaKernelBackendState {
   std::vector<void *> peer_slot_bases;
   std::vector<std::uint8_t> owns_mapping;
 
+  bool requires_collective_terminal_status() const noexcept override {
+    return false;
+  }
+
   ~LocalP2pBackendState() noexcept {
     if (!pool)
       return;
@@ -6864,7 +6917,11 @@ struct LocalCudaP2pActivationTransport::Impl {
   std::shared_ptr<LocalP2pBackendState> backend;
 };
 
-struct SocketBackendState : ActivationMegaKernelBackendState {};
+struct SocketBackendState : ActivationMegaKernelBackendState {
+  bool requires_collective_terminal_status() const noexcept override {
+    return true;
+  }
+};
 
 struct NcclSocketFallbackActivationTransport::Impl {
   std::shared_ptr<SocketBackendState> backend;
@@ -6881,6 +6938,10 @@ struct GinBackendState : ActivationMegaKernelBackendState {
   std::uint32_t local_rank = 0;
   std::uint32_t gin_context_count = 1;
   bool dev_comm_created = false;
+
+  bool requires_collective_terminal_status() const noexcept override {
+    return true;
+  }
 
   ~GinBackendState() noexcept {
     if (!nccl)
@@ -6924,6 +6985,26 @@ ProductionStatusAgreementResult agree_production_terminal_status(
     std::uint64_t epoch, std::uint32_t rank, std::uint32_t world,
     const Status &status, cudaEvent_t completion_event) {
   const auto begin = std::chrono::steady_clock::now();
+  if (!MEGAMOE_DEBUG_VALIDATE &&
+      !backend->requires_collective_terminal_status()) {
+    ProductionStatusAgreementResult result;
+    if (status.error != 0U) {
+      result.has_error = true;
+      result.error = ProductionStatusRecord{
+          generation,
+          static_cast<unsigned long long>(phase),
+          static_cast<unsigned long long>(status.error_origin_rank),
+          static_cast<unsigned long long>(status.error_code),
+          static_cast<unsigned long long>(status.error_field),
+          status.error_expected,
+          status.error_actual,
+          epoch};
+    }
+    result.elapsed_us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+    return result;
+  }
   auto &layout = backend->pool->layout;
   const auto exec = internal::checked_execution_state(backend->execution);
   auto *host_records = slot.host_production_status;
@@ -9734,7 +9815,7 @@ DeviceActivationTransport::run_device_simulation_synthetic(
   return DeviceActivationTransportHandle(std::move(result));
 }
 
-DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
+DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_slice(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
     const transport::ActivationTransportConfig &config,
@@ -10249,7 +10330,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_synthetic(
 }
 
 DeviceActivationTransportHandle
-NcclSocketFallbackActivationTransport::run_synthetic(
+NcclSocketFallbackActivationTransport::run_transport_slice(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
     const transport::ActivationTransportConfig &config,
@@ -10519,7 +10600,7 @@ NcclSocketFallbackActivationTransport::run_synthetic(
       id.generation, ExchangeKind::ExpertCounts,
       "cudaEventRecord(Socket dispatch complete)");
   if (incoming != 0)
-    socket_relay_synthetic_kernel<<<static_cast<unsigned int>(incoming), 256,
+    socket_relay_transport_kernel<<<static_cast<unsigned int>(incoming), 256,
                                      0, exec->stream>>>(
         receive_headers, receive_payload, canonical, incoming,
         config.hidden_size, id.generation, id.calling_rank,
@@ -10684,7 +10765,7 @@ NcclSocketFallbackActivationTransport::run_synthetic(
   return DeviceActivationTransportHandle(std::move(result));
 }
 
-DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
+DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
     const transport::ActivationTransportConfig &config,
@@ -10792,7 +10873,7 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN reset barrier)");
-  gin_synthetic_reset_kernel<<<backend->gin_context_count, 1, 0,
+  gin_signal_reset_kernel<<<backend->gin_context_count, 1, 0,
                                exec->stream>>>(backend->dev_comm,
                                                backend->gin_context_count);
   internal::throw_cuda(
@@ -10809,7 +10890,7 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "ncclAllReduce(after GIN reset)");
 
-  GinSyntheticArgs args{};
+  GinTransportSliceArgs args{};
   args.dispatch = view;
   args.input = activation.pointer;
   args.gates = ActivationTransportBridge::gate_pointer(dispatch);
@@ -10838,7 +10919,7 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_synthetic(
   args.identity_expert =
       config.expert_transform ==
       transport::ActivationExpertTransform::Identity;
-  gin_synthetic_persistent_kernel<<<1, 256, 0, exec->stream>>>(args);
+  gin_transport_slice_kernel<<<1, 256, 0, exec->stream>>>(args);
   internal::throw_cuda(
       "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -11081,7 +11162,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         transport::ActivationExpertTransform::Identity;
     socket_config.gate_placement =
         transport::ActivationGatePlacement::SourceAfter;
-    const auto socket_preload = impl_->socket_transport->run_synthetic(
+    const auto socket_preload = impl_->socket_transport->run_transport_slice(
         dispatch, activations, socket_config, options);
     socket_incoming = socket_preload.audit().fanout_count;
     // Count the actual rank-to-rank NCCL payloads. The transport-only audit is
@@ -11151,7 +11232,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "reset Forward GIN barrier");
-    gin_synthetic_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
+    gin_signal_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
                                  exec->stream>>>(
         gin_backend->dev_comm, gin_backend->gin_context_count);
     internal::throw_cuda(
@@ -11212,6 +11293,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
+#if MEGAMOE_BUILD_TESTING
   if (const auto *fault_rank =
           std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK")) {
     const auto *fault_generation =
@@ -11220,6 +11302,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         std::stoull(fault_generation) == id.generation)
       args.injected_status_error_rank = std::stoi(fault_rank);
   }
+#endif
   if (use_gin) {
 #if __has_include(<nccl_device.h>)
     args.gin_dev_comm = gin_backend->dev_comm;
@@ -12247,7 +12330,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         id.calling_rank, id.world_size,
         backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "reset Backward GIN barrier");
-    gin_synthetic_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
+    gin_signal_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
                                  exec->stream>>>(
         gin_backend->dev_comm, gin_backend->gin_context_count);
     internal::throw_cuda(
@@ -12302,6 +12385,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
+#if MEGAMOE_BUILD_TESTING
   if (const auto *fault_rank =
           std::getenv("MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_RANK")) {
     const auto *fault_generation =
@@ -12310,6 +12394,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         std::stoull(fault_generation) == id.generation)
       args.injected_status_error_rank = std::stoi(fault_rank);
   }
+#endif
   if (use_gin) {
 #if __has_include(<nccl_device.h>)
     args.gin_dev_comm = gin_backend->dev_comm;
