@@ -2,7 +2,9 @@
 
 - The optimized WGMMA/TMA specialization is only for hidden 7168 and
   intermediate 3072. Other positive sizes use a correct one-kernel CUDA-core
-  fallback and are not performance tuned.
+  fallback and are not performance tuned. That fallback is currently wired for
+  world 1 and LocalCudaP2p; non-main-shape GIN execution is rejected rather
+  than silently selecting an incorrect transport path.
 - Nodes must be homogeneous, node IDs dense, and every node must contain the
   complete local-rank set. Missing rails and heterogeneous node sizes are
   rejected.
@@ -22,6 +24,11 @@
   in the measured runtime. NCCL-free production-kernel harnesses validate the
   MegaMOE Forward/Backward kernels; backend lifecycle and real GIN are tested
   separately.
+- Installed CUDA headers still contain legacy explicitly named `testing`,
+  synthetic transport and `*_for_validation` entry points. Newly added
+  runtime-shape harnesses are internal, and native backend handles remain
+  hidden, but fully removing the older test/oracle surface is a pending public
+  API compatibility cleanup.
 - Heterogeneous dtype, FP8, alternative gate placement, cross-node topology
   heterogeneity, graph capture and automatic tuning of arbitrary H/I shapes are
   outside the frozen semantic contract.

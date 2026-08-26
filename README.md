@@ -40,7 +40,9 @@ a correctness-only CUDA-core fallback that still executes Forward in one
 persistent kernel and Backward in one persistent kernel. World-1 oracle tests
 cover `64/32`, `96/48`, `127/65`, and `256/192`, including M/N/K tails, and
 `127/65` is also exercised through the real two-process LocalCudaP2p path. The
-fallback carries no performance claim.
+fallback carries no performance claim. Non-main-shape GIN is not yet wired:
+that combination fails closed with a structured device error, while the
+frozen `7168/3072` GIN path remains supported.
 
 ## Supported topology contract
 

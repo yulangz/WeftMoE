@@ -77,6 +77,9 @@ tail bounds. They intentionally use scalar CUDA-core FP32 accumulation and are
 correctness fallbacks, not performance substitutes for the main specialization.
 TMA maps are neither created nor interpreted on this branch, which keeps odd
 dimensions such as `127/65` within checked ordinary device storage.
+The generic path is currently integrated with world 1 and LocalCudaP2p only.
+Selecting GIN with a non-main shape publishes a structured device error and
+fails closed; generic GIN transport integration remains outstanding.
 
 ## CUDA internal module boundary
 
