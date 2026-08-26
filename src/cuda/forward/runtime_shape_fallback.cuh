@@ -1176,7 +1176,7 @@ __global__ void runtime_shape_forward_megakernel(ForwardKernelArgs a) {
       threadIdx.x == 0U)
     publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
   __syncthreads();
-  publish_production_terminal_status(
+    publish_production_terminal_status<false>(
       a, status, ProductionStatusPhase::Forward,
       a.production_error_records_offset,
       a.gin_production_error_records_offset);
@@ -1533,7 +1533,7 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
       threadIdx.x == 0U)
     publish_local_structured_error(status, a.rank, 320U, 1U, 0ULL, 1ULL);
   __syncthreads();
-  publish_production_terminal_status(
+    publish_production_terminal_status<false>(
       a, status, ProductionStatusPhase::Backward,
       a.production_error_records_offset,
       a.gin_production_error_records_offset);
