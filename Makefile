@@ -55,6 +55,11 @@ $(BUILD_DIR)/%.o: %.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(CUDA_CPPFLAGS) $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
 
+$(BUILD_DIR)/src/cuda/activation_transport.o: \
+	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/runtime_shape_fallback.cuh \
+	src/cuda/backward/kernel_contract.cuh
+
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
 CUDA_TEST_SOURCES := \

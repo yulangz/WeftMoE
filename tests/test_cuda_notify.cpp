@@ -2518,8 +2518,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         std::cerr << "BACKWARD_BENCH_PROGRESS rank=" << rank
                   << " phase=" << phase << " value=" << value << std::endl;
     };
-    constexpr std::uint64_t hidden = 7168;
-    constexpr std::uint64_t intermediate = 3072;
+    const std::uint64_t hidden =
+        std::getenv("MEGAMOE_RUNTIME_HIDDEN")
+            ? std::stoull(std::getenv("MEGAMOE_RUNTIME_HIDDEN"))
+            : 7168ULL;
+    const std::uint64_t intermediate =
+        std::getenv("MEGAMOE_RUNTIME_INTERMEDIATE")
+            ? std::stoull(std::getenv("MEGAMOE_RUNTIME_INTERMEDIATE"))
+            : 3072ULL;
+    require(hidden != 0U && intermediate != 0U,
+            "Backward benchmark runtime H/I must be nonzero");
     auto setup_generation = megamoe::cuda::make_nccl_generation(
         base, "cuda-backward-bench", 701);
     auto setup_context = megamoe::make_rank_collective_context(
@@ -2698,7 +2706,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     };
     if (validate_main_backward_pool2) {
       require(cache_mode,
-              "main-shape Backward pool=2 validation requires cache mode");
+              "Backward pool=2 validation requires cache mode");
       activation_storage = {};
       const auto pool2_api_before =
           megamoe::cuda::testing::cuda_api_audit_snapshot();
@@ -2753,7 +2761,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       require(first_slot != second_slot &&
                   megamoe::cuda::testing_backward_storage_ranges_disjoint(
                       first, second),
-              "main-shape Backward result address intervals overlap");
+              "Backward result address intervals overlap");
       require(same_backward_hashes(
                   first_hash,
                   megamoe::cuda::testing::
@@ -2764,7 +2772,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               "identical live Backward generations produced different hashes");
       auto usage = transport_pool.usage();
       require(usage.slots_in_use == 2U && usage.slots_available == 0U,
-              "main-shape Backward pool did not retain two live slots");
+              "Backward pool did not retain two live slots");
       bool exhausted = false;
       try {
         (void)run_cached_backward(902U);
@@ -2773,7 +2781,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             error.code() == megamoe::NotifyErrorCode::ResourceExhausted;
       }
       require(exhausted,
-              "main-shape Backward pool=2 accepted a third live generation");
+              "Backward pool=2 accepted a third live generation");
       first = {};
       auto third = run_cached_backward(904U);
       require(megamoe::cuda::testing_backward_slot_index(third) == first_slot,
@@ -2793,7 +2801,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       third = {};
       usage = transport_pool.usage();
       require(usage.slots_available == 2U && usage.slots_in_use == 0U,
-              "main-shape Backward slots were not returned exactly once");
+              "Backward slots were not returned exactly once");
       const auto pool2_api_after =
           megamoe::cuda::testing::cuda_api_audit_snapshot();
       require(pool2_api_after.device_allocations ==
@@ -2809,7 +2817,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                       pool2_api_before.event_destroys &&
                   pool2_api_after.device_synchronizes ==
                       pool2_api_before.device_synchronizes,
-              "main-shape Backward pool=2 used forbidden steady CUDA APIs");
+              "Backward pool=2 used forbidden steady CUDA APIs");
       (void)unsetenv("MEGAMOE_BACKWARD_CAPTURE_HASH");
       std::cout << "BACKWARD_POOL2 rank=" << rank
                 << " disjoint=1 first_stable=1 second_stable=1"
@@ -3827,11 +3835,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << " phase=backward_complete" << std::endl;
       const auto &backward_audit = backward_handle.audit();
       last_smoke_audit = backward_audit;
+      const bool main_shape = hidden == 7168U && intermediate == 3072U;
       require(backward_audit.persistent_kernel_launches == 1U &&
-                  (backward_audit.dv_tasks == 0U ||
+                  (!main_shape || backward_audit.dv_tasks == 0U ||
                    (backward_audit.wgmma_instructions != 0U &&
                     backward_audit.tma_loads != 0U)),
-              "Backward did not execute one WGMMA/TMA persistent kernel");
+              "Backward did not execute the expected single persistent "
+              "kernel specialization");
       auto hashes =
           megamoe::cuda::testing::hash_backward_storage_for_validation(
               backward_handle, execution);

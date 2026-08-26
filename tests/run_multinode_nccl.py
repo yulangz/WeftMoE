@@ -390,6 +390,8 @@ def environment_overrides(args):
         "MEGAMOE_P2P_RING_SLOTS",
         "MEGAMOE_P2P_NO_WRAP",
         "MEGAMOE_GATE_MODE",
+        "MEGAMOE_RUNTIME_HIDDEN",
+        "MEGAMOE_RUNTIME_INTERMEDIATE",
     ):
         if key in os.environ:
             overrides[key] = os.environ[key]
