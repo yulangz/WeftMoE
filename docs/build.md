@@ -151,6 +151,12 @@ make BUILD_DIR=build-cuda ENABLE_CUDA=1 \
 # Compile-only architecture check; do not infer runtime coverage.
 make BUILD_DIR=build-cuda cuda-sm90-compile
 
+# Clean release gate: installed-header raw scan, exact dynamic ABI, retired
+# symbol link failure, installed-prefix compile/link/run, kernel artifact
+# manifest, public headers, compile-negative API suite, WERROR and hygiene.
+make BUILD_DIR=build-release ENABLE_CUDA=1 \
+  NCCL_RUNTIME_LIB_DIR="$NCCL_RUNTIME_DIR" release-check
+
 # Auditable transport capability, correctness/sanitizer path and benchmark.
 LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --transport-capability
 LD_LIBRARY_PATH="$NCCL12" build-cuda/test_cuda_notify --device-smoke
@@ -463,7 +469,7 @@ shared FC1/FC2 counter; CTAs return the M-block whose final FC2 tile they
 complete and enter Reduce as they leave compute. A fixed dedicated-CTA role
 split lost to this dynamic phase conversion on the measured main shape.
 The versioned artifact manifest reports the actually selected `sm_90` Forward
-kernel at 64 registers/thread, zero stack/static shared and 196,704 bytes
+kernel at 61 registers/thread, zero stack/static shared and 196,704 bytes
 configured dynamic shared at world 8; Backward is 64 registers, zero stack and
 196,672 bytes configured dynamic shared. Compile-only `sm_90a` is recorded
 separately at 168 registers and 16/120 bytes Forward/Backward stack.

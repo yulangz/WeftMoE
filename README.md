@@ -402,7 +402,10 @@ docs/                         architecture, compliance, performance, limits
 The installed API is version 2. `make install DESTDIR=... PREFIX=...` installs
 `libmegamoe.so.2`, 12 production headers, pkg-config metadata, the minimal
 Forward+Backward example, and license notices. Test/oracle/synthetic/fault
-declarations remain under `src/` and are unavailable to installed clients. See
+declarations remain under `src/`, are compiled only into the non-installed
+`libmegamoe_testing.a`, and are unavailable to installed clients. Production
+objects use hidden-by-default visibility; `abi/public_symbols_v2.txt` and the
+`MEGAMOE_2` linker version script define the exact ABI. See
 `docs/api_v2_migration.md` and `examples/minimal_training.cpp`.
 
 MegaMOE-owned source is Apache-2.0 licensed. Build dependencies and inspected
@@ -416,6 +419,8 @@ make -j
 make test
 make bench
 make install-test
+make BUILD_DIR=build-release ENABLE_CUDA=1 \
+  NCCL_RUNTIME_LIB_DIR=NCCL_RUNTIME_DIR release-check
 
 # Optional CUDA/NCCL slice; see docs/build.md for the tested runtime library.
 make BUILD_DIR=build-cuda cuda-lib

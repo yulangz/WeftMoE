@@ -104,7 +104,7 @@
     "megamoe_nccl_library": "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
   },
   "remote_clean_archive": {
-    "host": "10.10.19.233",
+      "host": "REMOTE_HOST",
     "world8_rank0_hash": "17050206622106222467",
     "forward_initcheck_errors": 0,
     "cross_host_notify_worlds": [2, 16],

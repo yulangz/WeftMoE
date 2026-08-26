@@ -32,18 +32,19 @@ The formal training-step boundary is route/gate ready through fused Notify,
 Forward, Backward and final gradient drain. Post-Notify timing is diagnostic
 only. Steady forbidden allocation/event/device-sync calls are zero.
 
-The API-v2 release build was freshly remeasured after separating the local
-main specialization from generic/runtime transport code and removing
-debug-only progress/timeline atomics from the release kernel. With the same
-actual fixture and explicitly loaded NCCL 2.28.9 CUDA 12.9 runtime, the three
-MegaMOE Backward means were 28.5963/28.6011/28.5876 ms and the formal
-Notify-inclusive F+B means were 44.9213/44.8906/44.9142 ms. Fresh Megatron-Core
-0.17.0 means were 33.7057/33.8497/33.8405 ms Backward and
-54.1241/54.2496/54.3071 ms F+B. The per-run improvements are therefore
-15.16%/15.51%/15.52% and 17.00%/17.25%/17.30%; the fail-closed comparison gate
-passes every run. Release results intentionally omit the optional per-CTA dW
-timeline (available in `MEGAMOE_DEBUG_VALIDATE=1`); the CUDA-event Backward
-boundary and the Notify-inclusive host-wall boundary remain unchanged.
+The API-v2 release candidate was freshly remeasured after replacing the local
+success-path terminal NCCL AllGather with the existing peer-visible status
+matrix and terminal epoch. With the same actual fixture and explicitly loaded
+NCCL 2.28.3 runtime, the three MegaMOE Backward means were
+28.5997/28.5978/28.6096 ms and the formal Notify-inclusive F+B means were
+45.0336/45.0559/45.1161 ms. Fresh Megatron-Core 0.17.0 means were
+33.7057/33.8497/33.8405 ms Backward and 54.1241/54.2496/54.3071 ms F+B. The
+per-run improvements are 15.15%/15.52%/15.46% and
+16.80%/16.95%/16.92%; the fail-closed comparison gate passes every run.
+Release local-rank success and structured-error agreement performs no NCCL
+status collective; Debug, Socket and GIN retain their fixed-width terminal
+AllGather. The CUDA-event Backward boundary and Notify-inclusive host-wall
+boundary remain unchanged.
 
 ## Two hosts, sixteen GPUs
 

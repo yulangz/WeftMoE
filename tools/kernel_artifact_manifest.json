@@ -8,18 +8,18 @@
     "backward_local_main": {
       "sm_90": {
         "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 1584,
+        "instruction_count": 2080,
         "local_bytes": 0,
-        "normalized_sass_sha256": "b3ee5f55ba4e68c3bb51464ea62d4cfd4f8b87e7470d706f5fcfd487650550a3",
+        "normalized_sass_sha256": "0de7b814fa516c3e99a8bd56a569bd772b111c2c9d7c8f23227bb10c90fe134d",
         "registers": 64,
         "stack_bytes": 0,
         "static_shared_bytes": 0
       },
       "sm_90a": {
         "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 22456,
+        "instruction_count": 22888,
         "local_bytes": 0,
-        "normalized_sass_sha256": "4556f549855fc253d3bdfb0ce974942610ad7894834f8ea61dd17da48c536538",
+        "normalized_sass_sha256": "206a5366d2e21ef703afd7bd83056963f8ccb7ac37eb9d0f5f95be741bab2bfa",
         "registers": 168,
         "stack_bytes": 120,
         "static_shared_bytes": 2048
@@ -28,18 +28,18 @@
     "forward_local_main": {
       "sm_90": {
         "configured_dynamic_shared_bytes": 196704,
-        "instruction_count": 2312,
+        "instruction_count": 2744,
         "local_bytes": 0,
-        "normalized_sass_sha256": "05d9f47c2607bd826732294d7c4356b559ec1510c10f7a839f9e35ec3ffb5236",
-        "registers": 64,
+        "normalized_sass_sha256": "ffa5bd918c5d84bc90adc726b5ac3fe7cb92ebd9f5ad3c22089f54ea03dbd3c0",
+        "registers": 61,
         "stack_bytes": 0,
         "static_shared_bytes": 0
       },
       "sm_90a": {
         "configured_dynamic_shared_bytes": 196704,
-        "instruction_count": 13632,
+        "instruction_count": 14056,
         "local_bytes": 0,
-        "normalized_sass_sha256": "4deee0a3ff2bc18100ed956ff0e279e63aa91f959afd5c770c5d5dbe90c29acc",
+        "normalized_sass_sha256": "47f6f6ccade6ba27fbddd8719ef5fb4aa9af28a34307e911a8e6d9d8ae24559a",
         "registers": 168,
         "stack_bytes": 16,
         "static_shared_bytes": 2048

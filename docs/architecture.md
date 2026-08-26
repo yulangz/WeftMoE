@@ -740,14 +740,16 @@ already-issued put/return work; the local-P2P path uses its existing IPC peer
 mappings. The host-enqueued Socket correctness fallback has no device peer
 window, so it publishes the same owner-local record after its payload drain.
 
-Every rank then unconditionally performs the same fixed-width 64-byte-per-rank
-NCCL AllGather. The matrix is validated and errors are selected by origin-rank
-order and then field order, so every rank either publishes its handle or throws
-the same structured production exception. A drained logical protocol error
-leaves the communicator and slot reusable by the next generation. CUDA-context
-or process failure remains a deadline/teardown boundary and is not claimed to be
-recoverable. The validation-only hash agreement remains separate and is not on
-this production error path.
+For local release, the peer-visible fixed records and terminal epochs are the
+agreement matrix: every rank performs the same rank/field-ordered device scan,
+so the normal path issues no NCCL status collective. Debug and cross-host GIN
+or Socket use the equivalent fixed-width 64-byte-per-rank NCCL AllGather. Both
+paths therefore either publish their handle or throw the same structured
+production exception. A drained logical protocol error leaves the communicator
+and slot reusable by the next generation. CUDA-context or process failure
+remains a deadline/teardown boundary and is not claimed to be recoverable. The
+validation-only hash agreement remains separate and is not on this production
+error path.
 
 GIN signal acquire is transferred from each device context leader to all
 reader CTAs through a device-scope release/acquire phase counter; a cooperative
