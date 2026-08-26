@@ -277,6 +277,8 @@ def main():
     parser.add_argument("--backward-route-case",
                         choices=("regular", "concentrated", "zero-rank"),
                         default="regular")
+    parser.add_argument("--runtime-hidden", type=int)
+    parser.add_argument("--runtime-intermediate", type=int)
     parser.add_argument("--forward-cache", action="store_true")
     parser.add_argument("--forward-cache-pool2-validation", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
@@ -339,6 +341,14 @@ def main():
         environment["MEGAMOE_BACKWARD_SMOKE_REPEATS"] = str(
             args.backward_smoke_repeats)
         environment["MEGAMOE_BACKWARD_ROUTE_CASE"] = args.backward_route_case
+        if (args.runtime_hidden is None) != (args.runtime_intermediate is None):
+            parser.error("runtime hidden/intermediate must be provided together")
+        if args.runtime_hidden is not None:
+            if args.runtime_hidden <= 0 or args.runtime_intermediate <= 0:
+                parser.error("runtime hidden/intermediate must be positive")
+            environment["MEGAMOE_RUNTIME_HIDDEN"] = str(args.runtime_hidden)
+            environment["MEGAMOE_RUNTIME_INTERMEDIATE"] = str(
+                args.runtime_intermediate)
     if args.forward_output_dir:
         if not (args.forward_benchmark or args.forward_smoke):
             parser.error("--forward-output-dir requires a Forward mode")
@@ -522,8 +532,11 @@ def main():
             hashes = [item["output_hash"] for item in observed]
             if len(hashes) != args.world:
                 raise AssertionError("missing forward ranks")
+            specialization = ("runtime-shape-correctness-fallback"
+                              if args.runtime_hidden is not None
+                              else "WGMMA/TMA-7168x3072")
             print(f"[PASS] LocalCudaP2p Forward MegaKernel world={args.world} "
-                  "single-launch WGMMA/TMA cache/no-cache smoke "
+                  f"single-launch {specialization} cache/no-cache smoke "
                   f"rank0_output_hash={hashes[0]}")
             return
         if args.backward_smoke:
@@ -575,8 +588,11 @@ def main():
                 print("BACKWARD_ORACLE_JSON " + json.dumps(
                     {key: observed[0][key] for key in oracle_keys},
                     sort_keys=True))
+            specialization = ("runtime-shape-correctness-fallback"
+                              if args.runtime_hidden is not None
+                              else "WGMMA/TMA-7168x3072")
             print(f"[PASS] LocalCudaP2p Backward MegaKernel world={args.world} "
-                  "single-launch WGMMA/TMA cache/no-cache smoke "
+                  f"single-launch {specialization} cache/no-cache smoke "
                   f"rank0_dx_hash={observed[0]['dx_hash']} "
                   f"rank0_dw1_hash={observed[0]['dw1_hash']} "
                   f"rank0_dw2_hash={observed[0]['dw2_hash']} "

@@ -307,7 +307,7 @@ enum class ForwardCacheMode : std::uint8_t {
 
 enum class ForwardKernelSpecialization : std::uint8_t {
   Sm90WgmmaTma7168x3072,
-  CudaCoreCorrectnessFallback,
+  RuntimeShapeCorrectnessFallback,
 };
 
 struct ForwardMegaKernelConfig {
@@ -412,7 +412,7 @@ struct ForwardMegaKernelTimings {
 
 struct ForwardMegaKernelAudit {
   ForwardKernelSpecialization specialization =
-      ForwardKernelSpecialization::CudaCoreCorrectnessFallback;
+      ForwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
   std::uint64_t persistent_kernel_launches = 0;
   std::uint64_t wgmma_instructions = 0;
   std::uint64_t tma_loads = 0;
@@ -597,7 +597,7 @@ struct BackwardMegaKernelConfig {
 
 enum class BackwardKernelSpecialization : std::uint8_t {
   Sm90WgmmaTma7168x3072,
-  CudaCoreCorrectnessFallback,
+  RuntimeShapeCorrectnessFallback,
 };
 
 struct BackwardMegaKernelTimings {
@@ -627,7 +627,7 @@ struct BackwardMegaKernelTimings {
 
 struct BackwardMegaKernelAudit {
   BackwardKernelSpecialization specialization =
-      BackwardKernelSpecialization::CudaCoreCorrectnessFallback;
+      BackwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
   std::uint64_t persistent_kernel_launches = 0;
   std::uint64_t wgmma_instructions = 0;
   std::uint64_t tma_loads = 0;
@@ -910,6 +910,9 @@ double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
 // initialized world-1 dispatch fixture.
 bool run_forward_world1_sanitizer_harness();
 bool run_backward_world1_sanitizer_harness();
+bool run_runtime_shape_world1_harness(std::uint64_t hidden,
+                                      std::uint64_t intermediate,
+                                      bool run_backward);
 } // namespace testing
 
 } // namespace megamoe::cuda

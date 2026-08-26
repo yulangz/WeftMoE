@@ -3655,8 +3655,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     return;
   }
   if (backward_smoke) {
-    constexpr std::uint64_t hidden = 7168;
-    constexpr std::uint64_t intermediate = 3072;
+    const std::uint64_t hidden =
+        std::getenv("MEGAMOE_RUNTIME_HIDDEN")
+            ? std::stoull(std::getenv("MEGAMOE_RUNTIME_HIDDEN"))
+            : 7168ULL;
+    const std::uint64_t intermediate =
+        std::getenv("MEGAMOE_RUNTIME_INTERMEDIATE")
+            ? std::stoull(std::getenv("MEGAMOE_RUNTIME_INTERMEDIATE"))
+            : 3072ULL;
+    require(hidden != 0 && intermediate != 0,
+            "Backward smoke runtime H/I must be nonzero");
     auto setup_generation = megamoe::cuda::make_nccl_generation(
         base, "cuda-backward-smoke", 701);
     auto setup_context = megamoe::make_rank_collective_context(
@@ -4204,8 +4212,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " empty_zero_check_repeats=" << empty_zero_check_repeats
               << " cache_no_cache_equal=1 persistent_launches=1";
     if (world == 1U && top_k == 1U) {
-      constexpr std::array<std::uint64_t, 4> hidden_samples{
-          0ULL, 17ULL, 1024ULL, hidden - 1ULL};
+      const std::array<std::uint64_t, 4> hidden_samples{
+          0ULL, std::min<std::uint64_t>(17ULL, hidden - 1ULL),
+          std::min<std::uint64_t>(1024ULL, hidden - 1ULL), hidden - 1ULL};
       std::cout << " oracle_dx_bits=";
       for (std::size_t i = 0; i < hidden_samples.size(); ++i) {
         if (i != 0) std::cout << ',';
@@ -5787,6 +5796,18 @@ int main(int argc, char **argv) {
               "NCCL-free production Backward sanitizer harness failed");
       std::cout << "[PASS] NCCL-free production world=1 Forward+Backward "
                    "WGMMA/TMA sanitizer harness\n";
+      return 0;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--runtime-shape") {
+      const auto hidden = parse_u64(argv[2]);
+      const auto intermediate = parse_u64(argv[3]);
+      const auto backward = parse_u64(argv[4]) != 0;
+      require(megamoe::cuda::testing::run_runtime_shape_world1_harness(
+                  hidden, intermediate, backward),
+              "runtime-shape persistent Forward/Backward harness failed");
+      std::cout << "[PASS] runtime-shape persistent kernel hidden=" << hidden
+                << " intermediate=" << intermediate
+                << " backward=" << backward << '\n';
       return 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--bench") {

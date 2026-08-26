@@ -4573,6 +4573,7 @@ struct BackwardKernelArgs {
   const transport::BFloat16 *dy_input;
   const float *gates;
   const transport::BFloat16 *w1;
+  const transport::BFloat16 *w2;
   std::uint64_t hidden;
   std::uint64_t intermediate;
   std::uint64_t max_destination_rows;
@@ -4647,6 +4648,8 @@ struct BackwardKernelArgs {
 };
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
+
+#include "cuda/forward/runtime_shape_fallback.cuh"
 
 // Final generation drain for the trusted single-node team.  All local work
 // (including peer dX return and source reduction) is complete before this is
@@ -7390,13 +7393,15 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
   impl->hidden = hidden_size;
   impl->intermediate = intermediate_size;
   impl->device = state->device;
-  impl->w1_map = make_bf16_tma_map(
-      impl->allocation->w1, hidden_size,
-      static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-      128, "W1");
-  impl->w2_map = make_bf16_tma_map(
-      impl->allocation->w2, intermediate_size,
-      static_cast<std::uint64_t>(owned_experts) * hidden_size, 256, "W2");
+  if (hidden_size == 7168 && intermediate_size == 3072) {
+    impl->w1_map = make_bf16_tma_map(
+        impl->allocation->w1, hidden_size,
+        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
+        128, "W1");
+    impl->w2_map = make_bf16_tma_map(
+        impl->allocation->w2, intermediate_size,
+        static_cast<std::uint64_t>(owned_experts) * hidden_size, 256, "W2");
+  }
   return ForwardWeightLease(std::move(impl));
 }
 
@@ -7464,14 +7469,16 @@ void testing::prepare_forward_weights_for_backward(
         impl.allocation->w1_transpose);
     impl.w2_transpose = static_cast<const transport::BFloat16 *>(
         impl.allocation->w2_transpose);
-    impl.w1_transpose_map = make_bf16_tma_map(
-        impl.allocation->w1_transpose, 2ULL * impl.intermediate,
-        static_cast<std::uint64_t>(impl.owned_experts) * impl.hidden, 256,
-        "W1 transpose for dX");
-    impl.w2_transpose_map = make_bf16_tma_map(
-        impl.allocation->w2_transpose, impl.hidden,
-        static_cast<std::uint64_t>(impl.owned_experts) * impl.intermediate,
-        128, "W2 transpose for dV");
+    if (impl.hidden == 7168 && impl.intermediate == 3072) {
+      impl.w1_transpose_map = make_bf16_tma_map(
+          impl.allocation->w1_transpose, 2ULL * impl.intermediate,
+          static_cast<std::uint64_t>(impl.owned_experts) * impl.hidden, 256,
+          "W1 transpose for dX");
+      impl.w2_transpose_map = make_bf16_tma_map(
+          impl.allocation->w2_transpose, impl.hidden,
+          static_cast<std::uint64_t>(impl.owned_experts) * impl.intermediate,
+          128, "W2 transpose for dV");
+    }
     internal::throw_cuda(
         "backward-weight-prepare",
         cudaEventRecord(impl.allocation->ready, state->stream), 0, 1,
@@ -8794,7 +8801,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
             0, session.world_size(), session.identity(), session.generation(),
             ExchangeKind::ExpertCounts,
             "one-time initialize GIN window slot storage");
-      if (config.max_intermediate_size != 0) {
+      if (config.max_intermediate_size != 0 &&
+          config.max_hidden_size == 7168 &&
+          config.max_intermediate_size == 3072) {
         slot.forward_x_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank, 128,
@@ -8840,6 +8849,12 @@ ActivationTransportResourcePool make_activation_transport_pool(
               "backward dW1 output");
           slot.backward_maps_valid = true;
         }
+      } else if (config.max_intermediate_size != 0) {
+        // The runtime-shape correctness kernels consume typed pointers and
+        // checked dimensions directly.  Native TMA descriptors are neither
+        // created nor interpreted for shapes that do not use the specialization.
+        slot.forward_maps_valid = true;
+        slot.backward_maps_valid = config.enable_backward;
       }
       internal::throw_cuda(
           "transport-pool-create",
@@ -10871,14 +10886,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     transport_error(NotifyErrorCode::WorkspaceMismatch, "forward-run",
                     "weight provenance", id.calling_rank,
                     "exact session/execution/device/shape/ready", "mismatch");
-  if (config.hidden_size != 7168 || config.intermediate_size != 3072)
-    throw NotifyDispatchError(
-        NotifyErrorCode::BackendUnavailable,
-        "phase=forward-run, field=specialization, rank=" +
-            std::to_string(id.calling_rank) +
-            ", expected=sm90 WGMMA/TMA hidden=7168 intermediate=3072, actual=" +
-            std::to_string(config.hidden_size) + "x" +
-            std::to_string(config.intermediate_size));
   if (state->config.max_hidden_size != config.hidden_size ||
       state->config.max_intermediate_size != config.intermediate_size ||
       !state->slots[activation.slot->index].forward_maps_valid ||
@@ -10886,8 +10893,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
        !state->config.enable_forward_cache))
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded, "forward-run",
                     "forward pool geometry/cache", id.calling_rank,
-                    "exact main-shape TMA maps and requested cache storage",
+                    "exact runtime-shape TMA maps and requested cache storage",
                     "mismatch/missing");
+
+  const bool main_shape =
+      config.hidden_size == 7168 && config.intermediate_size == 3072;
 
   const auto expectation = DeviceDispatchViewExpectation{
       id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
@@ -11161,6 +11171,27 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.cache_fc1 =
       config.cache_mode == ForwardCacheMode::CacheFc1InputOutput;
 
+  int cluster_supported = 0;
+  int max_active_clusters = 0;
+  if (!main_shape) {
+    cudaLaunchAttribute fallback_attribute{};
+    fallback_attribute.id = cudaLaunchAttributeCooperative;
+    fallback_attribute.val.cooperative = 1;
+    cudaLaunchConfig_t fallback_launch{};
+    fallback_launch.gridDim = dim3(1, 1, 1);
+    fallback_launch.blockDim = dim3(256, 1, 1);
+    fallback_launch.stream = exec->stream;
+    fallback_launch.attrs = &fallback_attribute;
+    fallback_launch.numAttrs = 1;
+    internal::throw_cuda(
+        "forward-run",
+        cudaLaunchKernelEx(&fallback_launch,
+                           runtime_shape_forward_megakernel, args),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts,
+        "single persistent runtime-shape Forward launch");
+  } else {
   int sms = 0;
   internal::throw_cuda(
       "forward-run",
@@ -11199,7 +11230,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   launch.stream = exec->stream;
   launch.attrs = attributes;
   launch.numAttrs = 1;
-  int cluster_supported = 0;
   internal::throw_cuda(
       "forward-run",
       cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
@@ -11207,7 +11237,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaDevAttrClusterLaunch");
-  int max_active_clusters = 0;
   internal::throw_cuda(
       "forward-run",
       cudaOccupancyMaxActiveClusters(
@@ -11226,6 +11255,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA forward launch");
+  }
   if (use_socket) {
     std::vector<std::uint64_t> send_prefix(
         static_cast<std::size_t>(id.world_size) + 1U, 0);
@@ -11397,7 +11427,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     result->incoming_rows = view.sizes.incoming_row_count;
     result->intermediate = config.intermediate_size;
     result->audit.specialization =
-        ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
+        main_shape ? ForwardKernelSpecialization::Sm90WgmmaTma7168x3072
+                   : ForwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
     result->audit.persistent_kernel_launches = 1;
     result->audit.runtime_cluster_supported = cluster_supported != 0;
     result->audit.requested_cluster_size = 2;
@@ -11498,7 +11529,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
   result->audit.specialization =
-      ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
+      main_shape ? ForwardKernelSpecialization::Sm90WgmmaTma7168x3072
+                 : ForwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
   result->audit.persistent_kernel_launches = 1;
   result->audit.wgmma_instructions =
       slot.host_forward_status->wgmma_instructions;
@@ -11735,8 +11767,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
             ", actual=nodes=" +
             std::to_string(id.num_nodes) + ", world=" +
             std::to_string(id.world_size));
-  if (config.hidden_size != 7168 || config.intermediate_size != 3072 ||
-      f.weights.hidden_size() != config.hidden_size ||
+  if (f.weights.hidden_size() != config.hidden_size ||
       f.weights.intermediate_size() != config.intermediate_size ||
       !f.weights.impl_->allocation->backward_prepared ||
       !f.weights.impl_->w1_transpose || !f.weights.impl_->w2_transpose ||
@@ -11745,8 +11776,10 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "backward-run", "specialization/pool/weights",
                     id.calling_rank,
-                    "sm90 7168x3072 and sufficient Backward pool",
+                    "runtime-shape WGMMA/TMA maps and sufficient Backward pool",
                     "mismatch");
+  const bool main_shape =
+      config.hidden_size == 7168 && config.intermediate_size == 3072;
   if (config.weight_gradient_dtype != BackwardWeightGradientDType::BFloat16)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
                     "dW dtype", id.calling_rank, "BF16", "unsupported");
@@ -12082,6 +12115,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.dy_input = dy_lease.pointer;
   args.gates = ActivationTransportBridge::gate_pointer(f.dispatch);
   args.w1 = f.weights.impl_->w1;
+  args.w2 = f.weights.impl_->w2;
   args.hidden = config.hidden_size;
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = state->config.max_destination_rows_per_rank;
@@ -12181,6 +12215,30 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr;
 #endif
 
+  if (!main_shape) {
+    cudaLaunchAttribute fallback_attribute{};
+    fallback_attribute.id = cudaLaunchAttributeCooperative;
+    fallback_attribute.val.cooperative = 1;
+    cudaLaunchConfig_t fallback_launch{};
+    fallback_launch.gridDim = dim3(1, 1, 1);
+    fallback_launch.blockDim = dim3(256, 1, 1);
+    fallback_launch.stream = exec->stream;
+    fallback_launch.attrs = &fallback_attribute;
+    fallback_launch.numAttrs = 1;
+    internal::throw_cuda(
+        "backward-run", cudaEventRecord(slot.start, exec->stream),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts, "cudaEventRecord(Backward start)");
+    internal::throw_cuda(
+        "backward-run",
+        cudaLaunchKernelEx(&fallback_launch,
+                           runtime_shape_backward_megakernel, args),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts,
+        "single persistent runtime-shape Backward launch");
+  } else {
   int sms = 0;
   internal::throw_cuda(
       "backward-run",
@@ -12232,6 +12290,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "single persistent WGMMA/TMA Backward launch");
+  }
   const auto backward_launch_enqueued = std::chrono::steady_clock::now();
   if (use_socket) {
     auto *send_headers = at<LocalP2pRouteHeader>(
@@ -12718,7 +12777,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
                     "captured dGate hash BF16 words")};
   }
   result->audit.specialization =
-      BackwardKernelSpecialization::Sm90WgmmaTma7168x3072;
+      main_shape ? BackwardKernelSpecialization::Sm90WgmmaTma7168x3072
+                 : BackwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
   result->audit.persistent_kernel_launches = 1;
   result->audit.wgmma_instructions = status.wgmma_instructions;
   result->audit.tma_loads = status.tma_loads;
@@ -13982,9 +14042,13 @@ cleanup:
 }
 
 namespace {
-bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
-  constexpr std::uint64_t hidden = 7168;
-  constexpr std::uint64_t intermediate = 3072;
+bool run_world1_forward_backward_sanitizer_harness(
+    bool run_backward, std::uint64_t hidden = 7168,
+    std::uint64_t intermediate = 3072) {
+  if (hidden == 0 || intermediate == 0)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "runtime-shape-harness", "hidden/intermediate", 0,
+                    "nonzero", "zero");
   struct HarnessMetadata {
     std::uint32_t expert_id = 0;
     std::uint32_t route_dst_rank = 0;
@@ -14192,19 +14256,27 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
     args.forward_scheduler_offset = layout.forward_scheduler;
     args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
     args.terminal_epoch_offset = layout.p2p_barrier_receive;
+    args.production_error_records_offset = layout.production_error_records;
     args.cancel_epoch =
         reinterpret_cast<const unsigned long long *>(cancel_epoch);
     args.cache_fc1 = true;
-    const auto x_map = make_bf16_tma_map(
-        at<void>(arena, layout.canonical_rows), hidden, 1, 128,
-        "sanitizer canonical X");
-    const auto s_map = make_bf16_tma_map(
-        at<void>(arena, layout.forward_s), intermediate, 1, 128,
-        "sanitizer S");
-    const auto w1_map = make_bf16_tma_map(w1, hidden, 2 * intermediate, 128,
-                                          "sanitizer W1");
-    const auto w2_map = make_bf16_tma_map(w2, intermediate, hidden, 256,
-                                          "sanitizer W2");
+    const bool main_shape = hidden == 7168 && intermediate == 3072;
+    CUtensorMap x_map{};
+    CUtensorMap s_map{};
+    CUtensorMap w1_map{};
+    CUtensorMap w2_map{};
+    if (main_shape) {
+      x_map = make_bf16_tma_map(
+          at<void>(arena, layout.canonical_rows), hidden, 1, 128,
+          "sanitizer canonical X");
+      s_map = make_bf16_tma_map(
+          at<void>(arena, layout.forward_s), intermediate, 1, 128,
+          "sanitizer S");
+      w1_map = make_bf16_tma_map(w1, hidden, 2 * intermediate, 128,
+                                 "sanitizer W1");
+      w2_map = make_bf16_tma_map(w2, intermediate, hidden, 256,
+                                 "sanitizer W2");
+    }
     const std::size_t smem =
         (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(*input) +
         8U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
@@ -14227,10 +14299,19 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
     launch.stream = stream;
     launch.attrs = attributes;
     launch.numAttrs = 2;
+    if (!main_shape) {
+      launch.gridDim = dim3(1, 1, 1);
+      launch.blockDim = dim3(256, 1, 1);
+      launch.dynamicSmemBytes = 0;
+      launch.numAttrs = 1;
+    }
     internal::throw_cuda(
         "forward-sanitizer",
-        cudaLaunchKernelEx(&launch, local_p2p_forward_megakernel, args, x_map,
-                           s_map, w1_map, w2_map),
+        main_shape
+            ? cudaLaunchKernelEx(&launch, local_p2p_forward_megakernel, args,
+                                 x_map, s_map, w1_map, w2_map)
+            : cudaLaunchKernelEx(&launch,
+                                 runtime_shape_forward_megakernel, args),
         0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
         "production Forward persistent kernel");
     TransportDeviceStatus status{};
@@ -14244,8 +14325,10 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
         "forward-sanitizer", cudaStreamSynchronize(stream), 0, 1,
         "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
         "wait production Forward kernel");
-    passed = status.error == 0U && status.wgmma_instructions != 0ULL &&
-             status.tma_loads != 0ULL && status.runtime_cluster_size == 2U;
+    passed = status.error == 0U &&
+             (!main_shape || (status.wgmma_instructions != 0ULL &&
+                              status.tma_loads != 0ULL &&
+                              status.runtime_cluster_size == 2U));
     if (run_backward && passed) {
       auto *dy_input = at<transport::BFloat16>(
           arena, layout.backward_dy_input);
@@ -14264,6 +14347,7 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
       backward.dy_input = dy_input;
       backward.gates = gates;
       backward.w1 = w1;
+      backward.w2 = w2;
       backward.hidden = hidden;
       backward.intermediate = intermediate;
       backward.max_destination_rows = 1;
@@ -14298,37 +14382,50 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
       backward.outgoing_signal_offset = layout.outgoing_route_sequence;
       backward.gin_local_compute_ready_offset =
           layout.gin_local_compute_ready;
+      backward.production_error_records_offset =
+          layout.production_error_records;
       backward.status_offset = layout.backward_status;
       backward.cancel_epoch =
           reinterpret_cast<const unsigned long long *>(cancel_epoch);
       backward.use_forward_cache = true;
-      const auto dy_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_dy_canonical), hidden, 1, 128,
-          "sanitizer backward dY");
-      const auto dab_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_dab), 2 * intermediate, 1, 128,
-          "sanitizer backward dAB");
-      const auto w2_transpose_map = make_bf16_tma_map(
-          w2_transpose, hidden, intermediate, 128,
-          "sanitizer W2 transpose");
-      const auto w1_transpose_map = make_bf16_tma_map(
-          w1_transpose, 2 * intermediate, hidden, 256,
-          "sanitizer W1 transpose");
-      const auto canonical_dy_mn_map = make_bf16_tma_map_mn(
-          at<void>(arena, layout.backward_dy_canonical), hidden, 1,
-          "sanitizer canonical dY MN");
-      const auto canonical_x_mn_map = make_bf16_tma_map_mn(
-          at<void>(arena, layout.canonical_rows), hidden, 1,
-          "sanitizer canonical X MN");
-      const auto u_mn_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_u_transpose), 64, intermediate, 128,
-          "sanitizer padded U");
-      const auto dab_mn_map = make_bf16_tma_map(
-          at<void>(arena, layout.backward_dab_transpose), 64,
-          2 * intermediate, 128, "sanitizer padded dAB");
-      const auto dw1_store_map = make_bf16_tma_store_map(
-          at<void>(arena, layout.backward_dw1), hidden, 2 * intermediate,
-          "sanitizer dW1 output");
+      CUtensorMap dy_map{};
+      CUtensorMap dab_map{};
+      CUtensorMap w2_transpose_map{};
+      CUtensorMap w1_transpose_map{};
+      CUtensorMap canonical_dy_mn_map{};
+      CUtensorMap canonical_x_mn_map{};
+      CUtensorMap u_mn_map{};
+      CUtensorMap dab_mn_map{};
+      CUtensorMap dw1_store_map{};
+      if (main_shape) {
+        dy_map = make_bf16_tma_map(
+            at<void>(arena, layout.backward_dy_canonical), hidden, 1, 128,
+            "sanitizer backward dY");
+        dab_map = make_bf16_tma_map(
+            at<void>(arena, layout.backward_dab), 2 * intermediate, 1, 128,
+            "sanitizer backward dAB");
+        w2_transpose_map = make_bf16_tma_map(
+            w2_transpose, hidden, intermediate, 128,
+            "sanitizer W2 transpose");
+        w1_transpose_map = make_bf16_tma_map(
+            w1_transpose, 2 * intermediate, hidden, 256,
+            "sanitizer W1 transpose");
+        canonical_dy_mn_map = make_bf16_tma_map_mn(
+            at<void>(arena, layout.backward_dy_canonical), hidden, 1,
+            "sanitizer canonical dY MN");
+        canonical_x_mn_map = make_bf16_tma_map_mn(
+            at<void>(arena, layout.canonical_rows), hidden, 1,
+            "sanitizer canonical X MN");
+        u_mn_map = make_bf16_tma_map(
+            at<void>(arena, layout.backward_u_transpose), 64, intermediate,
+            128, "sanitizer padded U");
+        dab_mn_map = make_bf16_tma_map(
+            at<void>(arena, layout.backward_dab_transpose), 64,
+            2 * intermediate, 128, "sanitizer padded dAB");
+        dw1_store_map = make_bf16_tma_store_map(
+            at<void>(arena, layout.backward_dw1), hidden, 2 * intermediate,
+            "sanitizer dW1 output");
+      }
       const std::size_t backward_smem =
           (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(*input) +
           8U * sizeof(std::uint64_t);
@@ -14341,13 +14438,23 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
           "set Backward dynamic shared memory");
       launch.blockDim = dim3(384, 1, 1);
       launch.dynamicSmemBytes = backward_smem;
+      if (!main_shape) {
+        launch.gridDim = dim3(1, 1, 1);
+        launch.blockDim = dim3(256, 1, 1);
+        launch.dynamicSmemBytes = 0;
+        launch.numAttrs = 1;
+      }
       internal::throw_cuda(
           "backward-sanitizer",
-          cudaLaunchKernelEx(
-              &launch, local_p2p_backward_megakernel, backward, x_map, dy_map,
-              dab_map, w1_map, w2_transpose_map, w1_transpose_map,
-              canonical_dy_mn_map, canonical_x_mn_map, u_mn_map,
-              dab_mn_map, dw1_store_map),
+          main_shape
+              ? cudaLaunchKernelEx(
+                    &launch, local_p2p_backward_megakernel, backward, x_map,
+                    dy_map, dab_map, w1_map, w2_transpose_map,
+                    w1_transpose_map, canonical_dy_mn_map,
+                    canonical_x_mn_map, u_mn_map, dab_mn_map, dw1_store_map)
+              : cudaLaunchKernelEx(&launch,
+                                   runtime_shape_backward_megakernel,
+                                   backward),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "production Backward persistent kernel");
       BackwardDeviceStatus backward_status{};
@@ -14364,8 +14471,128 @@ bool run_world1_forward_backward_sanitizer_harness(bool run_backward) {
           "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "wait production Backward kernel");
       passed = backward_status.error == 0U &&
-               backward_status.wgmma_instructions != 0ULL &&
-               backward_status.tma_loads != 0ULL;
+               (!main_shape ||
+                (backward_status.wgmma_instructions != 0ULL &&
+                 backward_status.tma_loads != 0ULL));
+      if (!main_shape && passed) {
+        std::vector<transport::BFloat16> actual_forward(hidden);
+        std::vector<transport::BFloat16> actual_dx(hidden);
+        std::vector<float> actual_dgate(1);
+        std::vector<transport::BFloat16> actual_dw1(2ULL * intermediate *
+                                                    hidden);
+        std::vector<transport::BFloat16> actual_dw2(hidden * intermediate);
+        const auto copy_to_host = [&](void *host, std::size_t offset,
+                                      std::size_t bytes,
+                                      const char *field) {
+          internal::throw_cuda(
+              "runtime-shape-oracle",
+              cudaMemcpy(host, at<const void>(arena, offset), bytes,
+                         cudaMemcpyDeviceToHost),
+              0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts, field);
+        };
+        copy_to_host(actual_forward.data(), layout.combined,
+                     actual_forward.size() * sizeof(actual_forward[0]),
+                     "download Forward output");
+        copy_to_host(actual_dx.data(), layout.backward_dx_combined,
+                     actual_dx.size() * sizeof(actual_dx[0]),
+                     "download dX");
+        copy_to_host(actual_dgate.data(), layout.backward_dgate,
+                     sizeof(float), "download dGate");
+        copy_to_host(actual_dw1.data(), layout.backward_dw1,
+                     actual_dw1.size() * sizeof(actual_dw1[0]),
+                     "download dW1");
+        copy_to_host(actual_dw2.data(), layout.backward_dw2,
+                     actual_dw2.size() * sizeof(actual_dw2[0]),
+                     "download dW2");
+
+        const auto mix = [](std::uint32_t value) {
+          value ^= value >> 16U;
+          value *= 0x7feb352dU;
+          value ^= value >> 15U;
+          value *= 0x846ca68bU;
+          value ^= value >> 16U;
+          return value;
+        };
+        const auto weight = [&](std::uint32_t kind, std::uint64_t row,
+                                std::uint64_t column) {
+          auto key = mix(0x9e3779b9U);
+          key ^= mix(kind ^ 0x85ebca6bU);
+          key ^= mix(static_cast<std::uint32_t>(row) ^ 0xc2b2ae35U);
+          key ^= mix(static_cast<std::uint32_t>(column) ^ 0x27d4eb2fU);
+          const auto sign = static_cast<int>(mix(key) & 1U) * 2 - 1;
+          return static_cast<float>(sign) * (1.0F / 256.0F);
+        };
+        const auto quantize = [](float value) {
+          return transport::bfloat16_to_float(
+              transport::float_to_bfloat16(value));
+        };
+        const auto x = transport::bfloat16_to_float(
+            transport::BFloat16{0x3f3fU});
+        const auto dy_value = transport::bfloat16_to_float(
+            transport::BFloat16{0x3e3eU});
+        std::vector<float> av(intermediate), bv(intermediate),
+            ref_s(intermediate), dv(intermediate), da(intermediate),
+            db(intermediate);
+        for (std::uint64_t i = 0; i < intermediate; ++i) {
+          float a_sum = 0.0F;
+          float b_sum = 0.0F;
+          for (std::uint64_t k = 0; k < hidden; ++k) {
+            a_sum += x * weight(1U, i, k);
+            b_sum += x * weight(1U, intermediate + i, k);
+          }
+          av[i] = quantize(a_sum);
+          bv[i] = quantize(b_sum);
+          const auto sigmoid = 1.0F / (1.0F + std::exp(-av[i]));
+          ref_s[i] = quantize((av[i] * sigmoid) * bv[i]);
+          float dv_sum = 0.0F;
+          for (std::uint64_t h = 0; h < hidden; ++h)
+            dv_sum += dy_value * weight(2U, h, i);
+          dv[i] = quantize(dv_sum);
+          const auto ds = dv[i]; // unit gate in this harness
+          da[i] = quantize(ds * bv[i] * sigmoid *
+                           (1.0F + av[i] * (1.0F - sigmoid)));
+          db[i] = quantize(ds * (av[i] * sigmoid));
+        }
+        const auto close = [](float actual, float expected,
+                              float tolerance) {
+          return std::isfinite(actual) &&
+                 std::abs(actual - expected) <= tolerance;
+        };
+        for (std::uint64_t h = 0; h < hidden && passed; ++h) {
+          float forward_sum = 0.0F;
+          float dx_sum = 0.0F;
+          for (std::uint64_t i = 0; i < intermediate; ++i) {
+            forward_sum += ref_s[i] * weight(2U, h, i);
+            dx_sum += da[i] * weight(1U, i, h);
+            dx_sum += db[i] * weight(1U, intermediate + i, h);
+            const auto expected_dw2 = quantize(dy_value * ref_s[i]);
+            passed = passed && close(
+                transport::bfloat16_to_float(
+                    actual_dw2[h * intermediate + i]),
+                expected_dw2, 0.02F);
+          }
+          passed = passed && close(
+              transport::bfloat16_to_float(actual_forward[h]),
+              quantize(forward_sum), 0.02F);
+          passed = passed && close(
+              transport::bfloat16_to_float(actual_dx[h]), quantize(dx_sum),
+              0.02F);
+        }
+        float dgate_sum = 0.0F;
+        for (std::uint64_t i = 0; i < intermediate; ++i)
+          dgate_sum += dv[i] * ref_s[i];
+        passed = passed && close(actual_dgate[0], dgate_sum, 0.02F);
+        for (std::uint64_t row = 0; row < 2ULL * intermediate && passed;
+             ++row) {
+          const auto gradient = row < intermediate ? da[row]
+                                                   : db[row - intermediate];
+          for (std::uint64_t h = 0; h < hidden; ++h)
+            passed = passed && close(
+                transport::bfloat16_to_float(
+                    actual_dw1[row * hidden + h]),
+                quantize(gradient * x), 0.02F);
+        }
+      }
     }
   } catch (...) {
     cleanup();
@@ -14382,6 +14609,13 @@ bool testing::run_forward_world1_sanitizer_harness() {
 
 bool testing::run_backward_world1_sanitizer_harness() {
   return run_world1_forward_backward_sanitizer_harness(true);
+}
+
+bool testing::run_runtime_shape_world1_harness(std::uint64_t hidden,
+                                               std::uint64_t intermediate,
+                                               bool run_backward) {
+  return run_world1_forward_backward_sanitizer_harness(
+      run_backward, hidden, intermediate);
 }
 
 } // namespace megamoe::cuda

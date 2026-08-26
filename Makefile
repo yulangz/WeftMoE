@@ -43,7 +43,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -64,7 +64,18 @@ $(BUILD_DIR)/test_cuda_notify: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS) tests/test_cud
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --device-smoke
+	$(MAKE) BUILD_DIR=$(BUILD_DIR) cuda-runtime-shape-test
 	$(CUDA_RUN_ENV) python3 tests/run_control_protocol_regressions.py --binary $(BUILD_DIR)/test_cuda_notify
+
+cuda-runtime-shape-test: $(BUILD_DIR)/test_cuda_notify
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 64 32 1
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 96 48 1
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 127 65 1
+	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 256 192 1
+	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py \
+		--binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 2 \
+		--backward-smoke --runtime-hidden 127 --runtime-intermediate 65 \
+		--backward-smoke-repeats 1 --timeout 180
 
 cuda-test-local: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
