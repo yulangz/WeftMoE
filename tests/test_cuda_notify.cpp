@@ -1,3 +1,5 @@
+#include "cuda/testing/api.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -19,8 +21,6 @@
 #include <cuda_runtime_api.h>
 
 #include "megamoe/api/errors.hpp"
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-#include "megamoe/cuda/activation_transport.hpp"
 #include "megamoe/metadata/serialize.hpp"
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/device_notify_internal.hpp"

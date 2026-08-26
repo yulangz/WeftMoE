@@ -1,3 +1,5 @@
+#include "metadata/testing_api.hpp"
+
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -6,7 +8,6 @@
 #include <utility>
 #include <vector>
 
-#include "megamoe/api/notify_dispatch.hpp"
 #include "megamoe/metadata/serialize.hpp"
 
 namespace {

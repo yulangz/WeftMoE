@@ -9,13 +9,18 @@
 #include "megamoe/config/runtime_config.hpp"
 #include "megamoe/metadata/dispatch_handle.hpp"
 #include "megamoe/transport/count_exchange.hpp"
+#include "megamoe/version.hpp"
 
 namespace megamoe {
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 namespace testing {
 class NotifyCorruptionHook;
 }
+#endif
 namespace cuda {
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class DeviceNotifyBridge;
+#endif
 }
 
 // Immutable phase-1 result. It owns the calling rank's routes and typed count
@@ -47,7 +52,9 @@ private:
   materialize_rank_metadata(const LocalHistogramHandle &,
                             const class ValidatedCollectiveHandle &,
                             const class ValidatedCollectiveHandle &);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class testing::NotifyCorruptionHook;
+#endif
 };
 
 LocalHistogramHandle
@@ -75,7 +82,9 @@ private:
   materialize_rank_metadata(const LocalHistogramHandle &,
                             const ValidatedCollectiveHandle &,
                             const ValidatedCollectiveHandle &);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class testing::NotifyCorruptionHook;
+#endif
 };
 
 // Move-only framework adaptor. It retains local storage, session/execution
@@ -118,11 +127,13 @@ materialize_rank_metadata(const LocalHistogramHandle &local,
                           const ValidatedCollectiveHandle &expert_counts,
                           const ValidatedCollectiveHandle &packet_summary);
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 // Reference/test convenience only; production callers use the rank-local API.
 std::vector<DispatchHandle> build_notify_dispatch_for_testing(
     const RuntimeConfig &config,
     const std::vector<RankRoutingInput> &routes_by_rank,
     const std::string &communicator_id = "host-fake",
     std::uint64_t generation = 1);
+#endif
 
 } // namespace megamoe

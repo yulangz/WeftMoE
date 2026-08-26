@@ -10,16 +10,20 @@
 #include "megamoe/cuda/device_notify.hpp"
 #include "megamoe/cuda/nccl_count_exchange.hpp"
 #include "megamoe/transport/activation_protocol.hpp"
+#include "megamoe/version.hpp"
 
 namespace megamoe::cuda {
 
 template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class ActivationTransportBridge;
 class ForwardMegaKernelBridge;
+#endif
 class ForwardWeightLease;
 class SelectedOutputGradientLease;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 struct BackwardValidationDownload;
 namespace testing {
 ForwardWeightLease make_deterministic_forward_weights_for_testing(
@@ -27,6 +31,7 @@ ForwardWeightLease make_deterministic_forward_weights_for_testing(
     std::uint64_t hidden_size, std::uint64_t intermediate_size,
     const CollectiveSession &session, const CudaExecution &execution);
 } // namespace testing
+#endif
 
 inline constexpr std::uint32_t kSelectedActivationLayoutVersion = 1;
 
@@ -49,11 +54,15 @@ private:
   explicit SelectedActivationLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ActivationTransportBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class NcclSocketFallbackActivationTransport;
   friend class GinRdmaActivationTransport;
+#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
@@ -113,11 +122,15 @@ private:
   friend ActivationTransportResourcePool make_activation_transport_pool(
       const CollectiveSession &, const CudaExecution &,
       ActivationTransportPoolConfig);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ActivationTransportBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceActivationTransport;
   friend class LocalCudaP2pActivationTransport;
   friend class NcclSocketFallbackActivationTransport;
   friend class GinRdmaActivationTransport;
+#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
@@ -138,6 +151,7 @@ struct ActivationTransportExpectation {
   std::uint64_t hidden = 0;
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 struct ActivationTransportTimings {
   double generation_setup_us = 0;
   double dispatch_put_us = 0;
@@ -226,6 +240,7 @@ private:
   struct Impl;
   std::shared_ptr<Impl> impl_;
 };
+#endif
 
 struct ActivationTransportRunOptions {
   GenerationCancellationToken cancellation;
@@ -241,6 +256,7 @@ struct ActivationTransportRunOptions {
 // A real, node-local, multi-process CUDA IPC backend. Construction exchanges
 // and validates pool IPC handles over the existing node-local NCCL session.
 // It fails closed unless every local peer mapping is established.
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class LocalCudaP2pActivationTransport {
 public:
   LocalCudaP2pActivationTransport(
@@ -299,6 +315,7 @@ private:
   struct Impl;
   std::shared_ptr<Impl> impl_;
 };
+#endif
 
 enum class ForwardCacheMode : std::uint8_t {
   CacheFc1InputOutput,
@@ -331,17 +348,22 @@ private:
   explicit ForwardWeightLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ForwardMegaKernelBridge;
+#endif
   friend class LocalCudaP2pForwardMegaKernel;
   friend class LocalCudaP2pBackwardMegaKernel;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend ForwardWeightLease
   testing::make_deterministic_forward_weights_for_testing(
       std::uint32_t, std::uint32_t, std::uint64_t, std::uint64_t,
       const CollectiveSession &, const CudaExecution &);
   friend struct ForwardWeightStorageHashAccess;
+#endif
   friend struct ForwardBackwardWeightAccess;
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 struct DeviceStorageHash128 {
   std::uint64_t low = 0;
   std::uint64_t high = 0;
@@ -396,6 +418,7 @@ struct BackwardHashAgreement {
   DeviceStorageHash128 expected;
   DeviceStorageHash128 actual;
 };
+#endif
 
 struct ForwardMegaKernelTimings {
   double dispatch_us = 0;
@@ -459,7 +482,10 @@ private:
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ForwardMegaKernelBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend std::vector<transport::BFloat16>
   download_forward_output_for_validation(const DeviceForwardHandle &,
                                          const CudaExecution &);
@@ -472,7 +498,9 @@ private:
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
   friend class NcclSocketFallbackBackwardMegaKernel;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend struct BackwardMegaKernelBridge;
+#endif
   friend SelectedOutputGradientLease
   testing_upload_output_gradient_for_backward(
       const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
@@ -481,6 +509,7 @@ private:
   testing_reissue_output_gradient_for_benchmark(
       const DeviceForwardHandle &, const SelectedOutputGradientLease &,
       const CudaExecution &);
+#endif
 };
 
 class LocalCudaP2pForwardMegaKernel {
@@ -544,6 +573,7 @@ private:
   std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 std::vector<transport::BFloat16>
 download_forward_output_for_validation(const DeviceForwardHandle &handle,
                                        const CudaExecution &execution);
@@ -556,6 +586,7 @@ download_forward_cache_for_validation(const DeviceForwardHandle &handle,
 // without exposing either native pointer to the caller.
 bool testing_forward_cache_ranges_disjoint(const DeviceForwardHandle &left,
                                            const DeviceForwardHandle &right);
+#endif
 
 // Immutable autograd -> Backward handoff.  dY is BF16 [tokens, hidden] and is
 // bound to the exact Forward generation/slot.  No native pointer is exposed.
@@ -575,7 +606,10 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend struct BackwardMegaKernelBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend SelectedOutputGradientLease
   testing_upload_output_gradient_for_backward(
       const DeviceForwardHandle &, const std::vector<transport::BFloat16> &,
@@ -584,6 +618,7 @@ private:
   testing_reissue_output_gradient_for_benchmark(
       const DeviceForwardHandle &, const SelectedOutputGradientLease &,
       const CudaExecution &);
+#endif
 };
 
 enum class BackwardWeightGradientDType : std::uint8_t { BFloat16 };
@@ -668,6 +703,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pBackwardMegaKernel;
   friend class GinRdmaBackwardMegaKernel;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend struct BackwardValidationDownload;
   friend struct BackwardStorageHashAccess;
   friend BackwardValidationDownload download_backward_for_validation(
@@ -676,8 +712,10 @@ private:
       const DeviceBackwardHandle &, const DeviceBackwardHandle &);
   friend std::size_t
   testing_backward_slot_index(const DeviceBackwardHandle &);
+#endif
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 struct BackwardValidationDownload {
   std::vector<transport::BFloat16> dx;
   std::vector<float> dgate;
@@ -686,6 +724,7 @@ struct BackwardValidationDownload {
   std::vector<transport::BFloat16> sampled_ab;
   std::vector<transport::BFloat16> sampled_dab;
 };
+#endif
 
 class LocalCudaP2pBackwardMegaKernel {
 public:
@@ -743,6 +782,7 @@ private:
   std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 BackwardValidationDownload download_backward_for_validation(
     const DeviceBackwardHandle &handle, const CudaExecution &execution);
 
@@ -779,6 +819,7 @@ ActivationTransportValidationDownload download_activation_transport_for_validati
 std::vector<transport::BFloat16> download_activation_output_for_validation(
     const DeviceActivationTransportHandle &handle,
     const CudaExecution &execution);
+#endif
 
 struct ActivationTransportCapability {
   std::uint32_t compiled_nccl_version = 0;
@@ -804,6 +845,7 @@ ActivationTransportCapability probe_activation_transport_capability(
 ActivationTransportCapability probe_activation_transport_capability(
     const NcclSession &session, const CudaExecution &execution);
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 namespace testing {
 struct GinPutSignalProbeResult {
   std::uint64_t payload_bytes = 0;
@@ -906,5 +948,6 @@ double measure_local_p2p_put_bandwidth_gbps(std::uint32_t source_device,
                                             std::uint32_t warmup,
                                             std::uint32_t measured);
 } // namespace testing
+#endif
 
 } // namespace megamoe::cuda

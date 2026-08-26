@@ -1,3 +1,4 @@
+#define MEGAMOE_INTERNAL_TESTING_API 1
 #include "megamoe/cuda/nccl_count_exchange.hpp"
 
 #include <cuda_runtime.h>

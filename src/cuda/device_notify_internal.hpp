@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef MEGAMOE_INTERNAL_TESTING_API
+#define MEGAMOE_INTERNAL_TESTING_API 1
+#endif
+
 #include "megamoe/cuda/device_notify.hpp"
 
 namespace megamoe::cuda {

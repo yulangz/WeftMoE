@@ -186,6 +186,31 @@ int main() {
                                                                    true);
 }
 ''',
+    "installed_testing_namespace": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
+''',
+    "installed_synthetic_transport": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() { megamoe::cuda::DeviceActivationTransport transport; }
+''',
+    "installed_validation_download": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() {
+  megamoe::cuda::DeviceForwardHandle handle;
+  megamoe::cuda::CudaExecution execution;
+  (void)megamoe::cuda::download_forward_output_for_validation(handle,
+                                                               execution);
+}
+''',
+    "installed_backward_mutation": r'''
+#include "megamoe/cuda/activation_transport.hpp"
+int main() { (void)megamoe::cuda::testing::flip_backward_storage_byte_for_validation; }
+''',
+    "installed_host_oracle_wrapper": r'''
+#include "megamoe/api/notify_dispatch.hpp"
+int main() { (void)megamoe::build_notify_dispatch_for_testing; }
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)

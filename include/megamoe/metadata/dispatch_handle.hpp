@@ -11,11 +11,15 @@
 
 namespace megamoe {
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 namespace testing {
 class NotifyCorruptionHook;
 }
+#endif
 namespace cuda {
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class DeviceNotifyBridge;
+#endif
 }
 
 class WorkspacePlan;
@@ -145,8 +149,12 @@ private:
     friend class WorkspacePlan;
     friend WorkspacePlan make_workspace_plan(const DispatchHandle&);
     friend void validate_workspace_plan(const DispatchHandle&, const WorkspacePlan&);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
     friend class testing::NotifyCorruptionHook;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
     friend class cuda::DeviceNotifyBridge;
+#endif
 };
 
 void validate_dispatch_metadata(const DispatchHandle& handle);

@@ -22,13 +22,21 @@ using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
 template <class T> class SelectedExpertGateLease;
 using CudaGateInput = SelectedExpertGateLease<float>;
 class DeviceDispatchConsumerLease;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class DeviceDispatchTestBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class ActivationTransportBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class DeviceRouteProvenanceBridge;
 class DeviceGateProvenanceBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
 class CudaNotifyPreflight;
+#endif
 namespace internal {
 struct CudaExecutionState;
 std::shared_ptr<const CudaExecutionState>
@@ -49,11 +57,15 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend CudaExecution make_cuda_execution(std::string, std::uint32_t);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceNotifyBridge;
+#endif
   friend class SelectedExpertRouteLease<std::int32_t>;
   friend class DeviceDispatchConsumerLease;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class CudaNotifyWorkspace;
   friend class CudaNotifyOperation;
+#endif
   friend class NcclAllGatherCountExchange;
   friend std::shared_ptr<const internal::CudaExecutionState>
   internal::checked_execution_state(const CudaExecution &);
@@ -89,15 +101,19 @@ private:
       const CudaRouteInput &, const RankCollectiveContext &,
       const CudaExecution &);
   friend class DeviceNotifyPoolBridge;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceRouteProvenanceBridge;
   friend class DeviceGateProvenanceBridge;
-  friend class ActivationTransportBridge;
+#endif
   friend class SelectedExpertGateLease<float>;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
+  friend class ActivationTransportBridge;
   friend class CudaNotifyOperation;
   friend CudaNotifyOperation start_cuda_rank_local_notify(
       const RuntimeConfig &, const RankCollectiveContext &,
       const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
       CudaNotifyWorkspace);
+#endif
 };
 
 inline constexpr std::uint32_t kSelectedExpertRouteLayoutVersion = 1;
@@ -130,7 +146,10 @@ private:
   explicit SelectedExpertGateLease(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceGateProvenanceBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class CudaNotifyOperation;
   friend class DeviceMetadataBridge;
   friend class ActivationTransportBridge;
@@ -138,6 +157,7 @@ private:
       const RuntimeConfig &, const RankCollectiveContext &,
       const CudaExecution &, const CudaRouteInput &, const CudaGateInput &,
       CudaNotifyWorkspace);
+#endif
 };
 
 class CudaLocalNotifyHandle {
@@ -155,8 +175,10 @@ private:
   explicit CudaLocalNotifyHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class CudaNotifyOperation;
   friend class DeviceMetadataBridge;
+#endif
   friend class CudaNotifyGenerationCoordinator;
   friend class DeviceDispatchConsumerLease;
 };
@@ -287,10 +309,16 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<Impl> impl_;
   friend class DeviceDispatchHandle;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceDispatchTestBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ActivationTransportBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend DispatchHandle download_device_metadata_for_validation(
       const DeviceDispatchHandle &, const CudaExecution &);
+#endif
 };
 
 class DeviceDispatchHandle {
@@ -309,13 +337,20 @@ private:
   explicit DeviceDispatchHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class DeviceMetadataBridge;
+#endif
   friend class CudaNotifyGenerationCoordinator;
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend class ActivationTransportBridge;
+#endif
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
   friend DispatchHandle download_device_metadata_for_validation(
       const DeviceDispatchHandle &, const CudaExecution &);
+#endif
 };
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 // Explicit diagnostic/test-only bulk download. The production coordinator
 // never calls this function.
 DispatchHandle download_device_metadata_for_validation(
@@ -354,5 +389,6 @@ void submit_dispatch_probe(DeviceDispatchConsumerLease &consumer,
                            std::uint64_t delay_cycles);
 std::uint64_t finish_dispatch_probe(DeviceDispatchConsumerLease &consumer);
 } // namespace testing
+#endif
 
 } // namespace megamoe::cuda

@@ -25,6 +25,7 @@ inline bool operator!=(BFloat16 lhs, BFloat16 rhs) noexcept {
 float bfloat16_to_float(BFloat16 value) noexcept;
 BFloat16 float_to_bfloat16(float value) noexcept;
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
 inline constexpr std::uint32_t kActivationTransportSchemaVersion = 1;
 
 enum class ActivationExpertTransform : std::uint8_t {
@@ -106,5 +107,6 @@ SyntheticTransportResult simulate_activation_transport(
     const ActivationTransportConfig &config,
     std::uint64_t epoch,
     const std::vector<std::uint64_t> &arrival_order = {});
+#endif
 
 } // namespace megamoe::transport

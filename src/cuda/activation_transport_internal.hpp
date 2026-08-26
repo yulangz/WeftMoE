@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef MEGAMOE_INTERNAL_TESTING_API
+#define MEGAMOE_INTERNAL_TESTING_API 1
+#endif
+
 #include "cuda/device_notify_internal.hpp"
 #include "megamoe/cuda/activation_transport.hpp"
 

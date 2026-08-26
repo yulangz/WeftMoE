@@ -1,3 +1,5 @@
+#include "metadata/testing_api.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,7 +25,6 @@
 #include <unistd.h>
 
 #include "megamoe/api/errors.hpp"
-#include "megamoe/api/notify_dispatch.hpp"
 #include "megamoe/cuda/control_protocol.hpp"
 #include "megamoe/kernels/persistent_contract.hpp"
 #include "megamoe/metadata/serialize.hpp"

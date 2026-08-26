@@ -1,9 +1,10 @@
+#include "metadata/testing_api.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
-#include "megamoe/api/notify_dispatch.hpp"
 #include "megamoe/transport/count_exchange.hpp"
 
 int main() {
