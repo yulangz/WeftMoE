@@ -1,0 +1,51 @@
+{
+  "artifact": "src/cuda/activation_transport.o",
+  "compile_only_arches": [
+    "sm_90a"
+  ],
+  "dynamic_shared_shape": "main-shape world=8",
+  "kernels": {
+    "backward_local_main": {
+      "sm_90": {
+        "configured_dynamic_shared_bytes": 196672,
+        "instruction_count": 1648,
+        "local_bytes": 0,
+        "normalized_sass_sha256": "fdbb45ca1ade9df08a435d30ebdc8f17f3f388296fb846d24187b089564ee8a9",
+        "registers": 64,
+        "stack_bytes": 0,
+        "static_shared_bytes": 0
+      },
+      "sm_90a": {
+        "configured_dynamic_shared_bytes": 196672,
+        "instruction_count": 22656,
+        "local_bytes": 0,
+        "normalized_sass_sha256": "91fd5367d1c3a755d8dc36d7b9e3c0c4052ffce9731d96ea5802bad1c676d2d2",
+        "registers": 168,
+        "stack_bytes": 120,
+        "static_shared_bytes": 2048
+      }
+    },
+    "forward_local_main": {
+      "sm_90": {
+        "configured_dynamic_shared_bytes": 196704,
+        "instruction_count": 2312,
+        "local_bytes": 0,
+        "normalized_sass_sha256": "05d9f47c2607bd826732294d7c4356b559ec1510c10f7a839f9e35ec3ffb5236",
+        "registers": 64,
+        "stack_bytes": 0,
+        "static_shared_bytes": 0
+      },
+      "sm_90a": {
+        "configured_dynamic_shared_bytes": 196704,
+        "instruction_count": 13632,
+        "local_bytes": 0,
+        "normalized_sass_sha256": "4deee0a3ff2bc18100ed956ff0e279e63aa91f959afd5c770c5d5dbe90c29acc",
+        "registers": 168,
+        "stack_bytes": 16,
+        "static_shared_bytes": 2048
+      }
+    }
+  },
+  "runtime_arch": "sm_90",
+  "schema": 1
+}

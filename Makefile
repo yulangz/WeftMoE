@@ -68,7 +68,7 @@ CUDA_LIB_SOURCES := \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib install uninstall-manifest install-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib install uninstall-manifest install-test kernel-artifact-check kernel-artifact-update release-test bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -93,6 +93,16 @@ $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 		$(LDFLAGS) $^ -lnccl -lcudart -lcuda -ldl -o $@
 
 shared-lib: $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME)
+
+kernel-artifact-check: $(BUILD_DIR)/src/cuda/activation_transport.o
+	python3 tools/kernel_artifact_manifest.py \
+		--binary $< --manifest tools/kernel_artifact_manifest.json
+
+kernel-artifact-update: $(BUILD_DIR)/src/cuda/activation_transport.o
+	python3 tools/kernel_artifact_manifest.py \
+		--binary $< --manifest tools/kernel_artifact_manifest.json --update
+
+release-test: shared-lib kernel-artifact-check install-test
 
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp \
