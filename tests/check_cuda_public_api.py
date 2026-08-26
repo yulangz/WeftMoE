@@ -190,6 +190,11 @@ int main() {
 #include "megamoe/cuda/activation_transport.hpp"
 int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
 ''',
+    "retired_testing_macro_cannot_restore_api": r'''
+#define MEGAMOE_INTERNAL_TESTING_API 1
+#include "megamoe/cuda/activation_transport.hpp"
+int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
+''',
     "installed_synthetic_transport": r'''
 #include "megamoe/cuda/activation_transport.hpp"
 int main() { megamoe::cuda::DeviceActivationTransport transport; }

@@ -70,7 +70,7 @@ CUDA_LIB_SOURCES := \
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 PROD_CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -125,7 +125,16 @@ kernel-artifact-update: $(BUILD_DIR)/production/src/cuda/activation_transport.o
 		--binary $< --manifest tools/kernel_artifact_manifest.json --update
 
 installed-header-scan:
-	python3 tools/check_release_hygiene.py --root .
+	python3 tools/check_release_hygiene.py --root . --self-test
+
+release-text-check:
+	@if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		echo "release text check: mode=git"; \
+		git diff --check; \
+	else \
+		echo "release text check: mode=archive"; \
+		python3 tools/check_release_hygiene.py --root . --self-test; \
+	fi
 
 public-symbol-check: shared-lib
 	python3 tools/check_public_symbols.py --binary $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME) \
@@ -151,11 +160,10 @@ release-check-inner:
 	+$(MAKE) BUILD_DIR=$(BUILD_DIR) ENABLE_CUDA=1 shared-lib
 	+$(MAKE) BUILD_DIR=$(BUILD_DIR) installed-header-scan public-symbol-check \
 		retired-symbol-link-negative kernel-artifact-check header-test \
-		api-negative-test license-check
+		api-negative-test license-check release-text-check
 	+$(MAKE) BUILD_DIR=$(BUILD_DIR) ENABLE_CUDA=1 \
 		NCCL_RUNTIME_LIB_DIR='$(NCCL_RUNTIME_LIB_DIR)' install-test
 	+$(MAKE) BUILD_DIR=$(BUILD_DIR)-werror ENABLE_CUDA=1 WERROR=1 shared-lib
-	git diff --check
 
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp \
