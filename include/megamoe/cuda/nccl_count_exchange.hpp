@@ -13,8 +13,6 @@ MEGAMOE_PUBLIC_API_BEGIN
 
 namespace megamoe::cuda {
 
-namespace internal { class NcclSessionAccess; }
-
 class NcclSession;
 class NcclBootstrapInputChannel;
 class NcclBootstrapOutputChannel;
@@ -43,6 +41,11 @@ NcclBootstrapId make_nccl_bootstrap_id();
 class NcclSession {
 public:
   NcclSession() = default;
+  NcclSession(const NcclSession &);
+  NcclSession(NcclSession &&) noexcept;
+  NcclSession &operator=(const NcclSession &);
+  NcclSession &operator=(NcclSession &&) noexcept;
+  ~NcclSession();
   const CollectiveSession &session() const;
   std::uint32_t rank() const;
   std::uint32_t device_ordinal() const;
@@ -62,7 +65,6 @@ private:
                                           std::uint64_t);
   friend class CudaNotifyGenerationCoordinator;
   friend class NcclAllGatherCountExchange;
-  friend class internal::NcclSessionAccess;
 };
 
 NcclSession make_nccl_session(std::string identity, std::uint32_t world_size,

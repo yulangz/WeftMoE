@@ -8,6 +8,14 @@
 
 namespace megamoe::cuda {
 
+namespace internal {
+struct ExternalCudaProducerState;
+}
+
+struct ExternalCudaProducer::State {
+  std::shared_ptr<const internal::ExternalCudaProducerState> backend;
+};
+
 struct ActivationTransportTimings {
   double generation_setup_us = 0;
   double dispatch_put_us = 0;

@@ -1287,13 +1287,36 @@ struct CudaExecution::Impl {
 };
 
 namespace internal {
+std::unique_ptr<BackendCountExchangeOperation>
+CudaExecutionStateAccess::start(const CountExchangeRequest &) {
+  invalid("phase=cuda-execution-state-access, field=start, rank=n/a, "
+          "expected=never called, actual=called");
+}
+
+std::shared_ptr<const CudaExecutionState>
+CudaExecutionStateAccess::checked(const CudaExecution &execution) {
+  if (!execution)
+    invalid("phase=cuda-context, field=execution, rank=n/a, "
+            "expected=valid, actual=empty");
+  auto state = std::dynamic_pointer_cast<const CudaExecutionState>(
+      backend_execution_state(execution.token()));
+  if (!state || !state->stream)
+    invalid("phase=cuda-context, field=execution_backend, rank=n/a, "
+            "expected=live CUDA execution, actual=foreign/null");
+  return state;
+}
+
 std::shared_ptr<const CudaExecutionState>
 checked_execution_state(const CudaExecution &execution) {
-  if (!execution)
-    invalid("phase=cuda-context, field=execution, rank=n/a, expected=valid, actual=empty");
-  return execution.impl_->state;
+  return CudaExecutionStateAccess::checked(execution);
 }
 } // namespace internal
+
+CudaExecution::CudaExecution(const CudaExecution &) = default;
+CudaExecution::CudaExecution(CudaExecution &&) noexcept = default;
+CudaExecution &CudaExecution::operator=(const CudaExecution &) = default;
+CudaExecution &CudaExecution::operator=(CudaExecution &&) noexcept = default;
+CudaExecution::~CudaExecution() = default;
 
 CudaExecution make_cuda_execution(std::string identity,
                                   std::uint32_t device_ordinal) {
@@ -1383,25 +1406,37 @@ ExternalCudaProducer make_external_cuda_producer(
             std::to_string(context.calling_rank()) + ", expected=[0," +
             std::to_string(device_count) + "), actual=" +
             std::to_string(device_ordinal));
-  auto state = std::make_shared<internal::ExternalCudaProducerState>();
-  state->context = std::move(context);
-  state->device = device_ordinal;
-  state->stream = reinterpret_cast<cudaStream_t>(producer_stream);
-  state->stream_owner = std::move(stream_owner);
-  state->execution = make_execution_token(std::move(identity), state);
+  auto backend = std::make_shared<internal::ExternalCudaProducerState>();
+  backend->context = std::move(context);
+  backend->device = device_ordinal;
+  backend->stream = reinterpret_cast<cudaStream_t>(producer_stream);
+  backend->stream_owner = std::move(stream_owner);
+  backend->execution = make_execution_token(std::move(identity), backend);
+  auto state = std::make_shared<ExternalCudaProducer::State>();
+  state->backend = std::move(backend);
   return ExternalCudaProducer(std::move(state));
 }
+
+ExternalCudaProducer::ExternalCudaProducer(const ExternalCudaProducer &) =
+    default;
+ExternalCudaProducer::ExternalCudaProducer(ExternalCudaProducer &&) noexcept =
+    default;
+ExternalCudaProducer &ExternalCudaProducer::operator=(
+    const ExternalCudaProducer &) = default;
+ExternalCudaProducer &ExternalCudaProducer::operator=(
+    ExternalCudaProducer &&) noexcept = default;
+ExternalCudaProducer::~ExternalCudaProducer() = default;
 
 const RankCollectiveContext &ExternalCudaProducer::context() const {
   if (!state_)
     invalid("phase=external-cuda-producer, field=handle, rank=n/a, expected=valid, actual=empty");
-  return state_->context;
+  return state_->backend->context;
 }
 
 std::uint32_t ExternalCudaProducer::device_ordinal() const {
   if (!state_)
     invalid("phase=external-cuda-producer, field=handle, rank=n/a, expected=valid, actual=empty");
-  return state_->device;
+  return state_->backend->device;
 }
 
 CudaRouteInput ExternalCudaProducer::publish_selected_experts(
@@ -1412,10 +1447,10 @@ CudaRouteInput ExternalCudaProducer::publish_selected_experts(
     invalid("phase=external-route-publish, field=producer/owner/top_k, rank=n/a, expected=valid/nonzero, actual=invalid");
   const auto routes = checked_mul(num_tokens, top_k, "external route count");
   validate_external_cuda_range(device_data, routes, capacity_elements,
-                               sizeof(std::int32_t), state_->device,
+                               sizeof(std::int32_t), state_->backend->device,
                                "selected_experts");
   auto allocation = std::make_shared<CudaAllocation>();
-  allocation->device = state_->device;
+  allocation->device = state_->backend->device;
   allocation->device_ptr = const_cast<std::int32_t *>(device_data);
   allocation->device_bytes = checked_size(
       checked_mul(capacity_elements, sizeof(std::int32_t),
@@ -1423,31 +1458,31 @@ CudaRouteInput ExternalCudaProducer::publish_selected_experts(
       "external route capacity");
   allocation->owns_device_memory = false;
   allocation->external_owner = std::make_shared<ExternalTensorOwners>(
-      ExternalTensorOwners{std::move(allocation_owner), state_});
+      ExternalTensorOwners{std::move(allocation_owner), state_->backend});
   internal::throw_cuda(
       "external-route-publish",
       cudaEventCreateWithFlags(&allocation->producer_ready,
                                cudaEventDisableTiming),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventCreate(producer ready)");
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
   internal::throw_cuda(
       "external-route-publish",
-      cudaEventRecord(allocation->producer_ready, state_->stream),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      cudaEventRecord(allocation->producer_ready, state_->backend->stream),
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(producer ready)");
   auto impl = std::make_shared<CudaRouteInput::Impl>();
   impl->allocation = std::move(allocation);
   impl->device_ptr = device_data;
-  impl->producer_session = state_->context.session();
-  impl->producer_execution = state_->execution;
-  impl->consumer_execution = state_->execution;
-  impl->device = state_->device;
-  impl->generation = state_->context.session().generation();
+  impl->producer_session = state_->backend->context.session();
+  impl->producer_execution = state_->backend->execution;
+  impl->consumer_execution = state_->backend->execution;
+  impl->device = state_->backend->device;
+  impl->generation = state_->backend->context.session().generation();
   impl->ready_recorded = true;
   impl->tokens = num_tokens;
   impl->top_k = top_k;
@@ -1463,42 +1498,42 @@ CudaGateInput ExternalCudaProducer::publish_gates(
     invalid("phase=external-gate-publish, field=producer/owner/routes, rank=n/a, expected=valid, actual=empty");
   const auto &route = *exact_routes.impl_;
   if (route.producer_session.stable_identity_bytes() !=
-          state_->context.session().stable_identity_bytes() ||
-      route.generation != state_->context.session().generation() ||
-      route.device != state_->device ||
-      !route.producer_execution.same_instance(state_->execution))
+          state_->backend->context.session().stable_identity_bytes() ||
+      route.generation != state_->backend->context.session().generation() ||
+      route.device != state_->backend->device ||
+      !route.producer_execution.same_instance(state_->backend->execution))
     invalid("phase=external-gate-publish, field=route_provenance, rank=" +
-            std::to_string(state_->context.calling_rank()) +
+            std::to_string(state_->backend->context.calling_rank()) +
             ", expected=exact producer route lease, actual=mismatch");
   validate_external_cuda_range(device_data, route.routes, capacity_elements,
-                               sizeof(float), state_->device, "gates");
+                               sizeof(float), state_->backend->device, "gates");
   auto allocation = std::make_shared<CudaAllocation>();
-  allocation->device = state_->device;
+  allocation->device = state_->backend->device;
   allocation->device_ptr = const_cast<float *>(device_data);
   allocation->device_bytes = checked_size(
       checked_mul(capacity_elements, sizeof(float), "external gate capacity"),
       "external gate capacity");
   allocation->owns_device_memory = false;
   allocation->external_owner = std::make_shared<ExternalTensorOwners>(
-      ExternalTensorOwners{std::move(allocation_owner), state_});
+      ExternalTensorOwners{std::move(allocation_owner), state_->backend});
   // Gate and route readiness share the immutable route provenance event. A
   // second record extends it to cover all producer work enqueued so far.
   internal::throw_cuda(
       "external-gate-publish",
-      cudaEventRecord(route.allocation->producer_ready, state_->stream),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      cudaEventRecord(route.allocation->producer_ready, state_->backend->stream),
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(route+gate ready)");
   auto impl = std::make_shared<CudaGateInput::Impl>();
   impl->allocation = std::move(allocation);
   impl->device_ptr = device_data;
   impl->bound_routes = exact_routes;
-  impl->producer_session = state_->context.session();
-  impl->producer_execution = state_->execution;
-  impl->consumer_execution = state_->execution;
-  impl->device = state_->device;
-  impl->generation = state_->context.session().generation();
+  impl->producer_session = state_->backend->context.session();
+  impl->producer_execution = state_->backend->execution;
+  impl->consumer_execution = state_->backend->execution;
+  impl->device = state_->backend->device;
+  impl->generation = state_->backend->context.session().generation();
   impl->ready_recorded = true;
   impl->tokens = route.tokens;
   impl->top_k = route.top_k;

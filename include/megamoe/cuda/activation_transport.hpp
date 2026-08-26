@@ -256,6 +256,11 @@ private:
 class ExternalCudaProducer {
 public:
   ExternalCudaProducer() = default;
+  ExternalCudaProducer(const ExternalCudaProducer &);
+  ExternalCudaProducer(ExternalCudaProducer &&) noexcept;
+  ExternalCudaProducer &operator=(const ExternalCudaProducer &);
+  ExternalCudaProducer &operator=(ExternalCudaProducer &&) noexcept;
+  ~ExternalCudaProducer();
   const RankCollectiveContext &context() const;
   std::uint32_t device_ordinal() const;
   explicit operator bool() const noexcept { return static_cast<bool>(state_); }
@@ -287,10 +292,10 @@ public:
       std::shared_ptr<const void> allocation_owner) const;
 
 private:
-  explicit ExternalCudaProducer(
-      std::shared_ptr<const internal::ExternalCudaProducerState> state)
+  struct State;
+  explicit ExternalCudaProducer(std::shared_ptr<const State> state)
       : state_(std::move(state)) {}
-  std::shared_ptr<const internal::ExternalCudaProducerState> state_;
+  std::shared_ptr<const State> state_;
   friend ExternalCudaProducer make_external_cuda_producer(
       RankCollectiveContext, std::uint32_t, CUstream_st *,
       std::shared_ptr<const void>, std::string);

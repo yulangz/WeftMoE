@@ -459,17 +459,31 @@ const DeviceBufferLease &BackendCompletion::device_result() const {
 }
 
 std::shared_ptr<const BackendSessionState>
+CountExchange::backend_session_state(const CollectiveSession &session) {
+  if (!session)
+    invalid_exchange("backend requested state from empty collective session");
+  return session.impl_->backend_state;
+}
+
+std::shared_ptr<const BackendSessionState>
 CountExchange::backend_session_state(const RankCollectiveContext &context) {
   if (!context)
     invalid_exchange("backend requested state from empty rank context");
-  return context.session().impl_->backend_state;
+  return backend_session_state(context.session());
+}
+
+std::shared_ptr<const BackendExecutionState>
+CountExchange::backend_execution_state(const ExecutionToken &execution) {
+  if (!execution)
+    invalid_exchange("backend requested state from empty execution token");
+  return execution.impl_->backend_state;
 }
 
 std::shared_ptr<const BackendExecutionState>
 CountExchange::backend_execution_state(const RankCollectiveContext &context) {
   if (!context)
     invalid_exchange("backend requested state from empty rank context");
-  return context.execution().impl_->backend_state;
+  return backend_execution_state(context.execution());
 }
 
 std::shared_ptr<const BackendDeviceLeaseState>

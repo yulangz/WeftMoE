@@ -7486,20 +7486,20 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
       checked_mul(owned_experts, hidden_size, "external W2 rows"),
       intermediate_size, "external W2 elements");
   validate_external_cuda_range(w1, w1_elements, w1_capacity_elements,
-                               sizeof(transport::BFloat16), state_->device,
+                               sizeof(transport::BFloat16), state_->backend->device,
                                "W1");
   validate_external_cuda_range(w2, w2_elements, w2_capacity_elements,
-                               sizeof(transport::BFloat16), state_->device,
+                               sizeof(transport::BFloat16), state_->backend->device,
                                "W2");
   auto allocation = std::make_shared<ForwardAllocation>();
-  allocation->device = state_->device;
+  allocation->device = state_->backend->device;
   allocation->w1 = const_cast<transport::BFloat16 *>(w1);
   allocation->w2 = const_cast<transport::BFloat16 *>(w2);
   allocation->owns_w1 = false;
   allocation->owns_w2 = false;
   allocation->w1_owner = std::move(w1_owner);
   allocation->w2_owner = std::move(w2_owner);
-  allocation->external_producer = state_;
+  allocation->external_producer = state_->backend;
   allocation->bytes = checked_add(
       checked_mul(w1_elements, sizeof(transport::BFloat16), "W1 bytes"),
       checked_mul(w2_elements, sizeof(transport::BFloat16), "W2 bytes"),
@@ -7507,29 +7507,29 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   internal::throw_cuda(
       "external-weight-publish",
       cudaEventCreateWithFlags(&allocation->ready, cudaEventDisableTiming),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventCreate(weight ready)");
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
   internal::throw_cuda(
       "external-weight-publish",
-      cudaEventRecord(allocation->ready, state_->stream),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      cudaEventRecord(allocation->ready, state_->backend->stream),
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(weight ready)");
   auto impl = std::make_shared<ForwardWeightLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->w1 = w1;
   impl->w2 = w2;
-  impl->session_identity = state_->context.session().stable_identity_bytes();
-  impl->execution = state_->execution;
+  impl->session_identity = state_->backend->context.session().stable_identity_bytes();
+  impl->execution = state_->backend->execution;
   impl->owned_experts = owned_experts;
   impl->global_expert_begin = global_expert_begin;
   impl->hidden = hidden_size;
   impl->intermediate = intermediate_size;
-  impl->device = state_->device;
+  impl->device = state_->backend->device;
   if (hidden_size == 7168 && intermediate_size == 3072) {
     impl->w1_map = make_bf16_tma_map(
         impl->allocation->w1, hidden_size,
@@ -9328,9 +9328,9 @@ BFloat16ActivationLease ExternalCudaProducer::publish_activations(
                     "external-activation-publish", "producer/pool/owner", 0,
                     "valid", "empty");
   auto pool_state = pool.impl_->state;
-  if (state_->context.session().stable_identity_bytes() !=
+  if (state_->backend->context.session().stable_identity_bytes() !=
           pool_state->session_identity ||
-      state_->device != pool_state->device || hidden_size == 0 ||
+      state_->backend->device != pool_state->device || hidden_size == 0 ||
       hidden_size > pool_state->config.max_hidden_size ||
       num_tokens > pool_state->config.max_tokens_per_rank)
     transport_error(NotifyErrorCode::WorkspaceMismatch,
@@ -9340,32 +9340,32 @@ BFloat16ActivationLease ExternalCudaProducer::publish_activations(
   const auto elements = checked_mul(num_tokens, hidden_size,
                                     "external activation elements");
   validate_external_cuda_range(device_data, elements, capacity_elements,
-                               sizeof(transport::BFloat16), state_->device,
+                               sizeof(transport::BFloat16), state_->backend->device,
                                "activations");
   auto lease = acquire_slot(pool_state,
-                            state_->context.session().generation(),
-                            state_->context.calling_rank());
+                            state_->backend->context.session().generation(),
+                            state_->backend->context.calling_rank());
   auto &slot = pool_state->slots[lease->index];
   internal::throw_cuda(
       "external-activation-publish",
-      cudaEventRecord(slot.producer_ready, state_->stream),
-      state_->context.calling_rank(), state_->context.session().world_size(),
-      state_->context.session().identity(),
-      state_->context.session().generation(), ExchangeKind::ExpertCounts,
+      cudaEventRecord(slot.producer_ready, state_->backend->stream),
+      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(activation ready)");
   auto impl = std::make_shared<BFloat16ActivationLease::Impl>();
   impl->slot = std::move(lease);
   impl->pool = std::move(pool_state);
   impl->pointer = device_data;
-  impl->session_identity = state_->context.session().stable_identity_bytes();
-  impl->producer_execution = state_->execution;
-  impl->generation = state_->context.session().generation();
+  impl->session_identity = state_->backend->context.session().stable_identity_bytes();
+  impl->producer_execution = state_->backend->execution;
+  impl->generation = state_->backend->context.session().generation();
   impl->tokens = num_tokens;
   impl->hidden = hidden_size;
-  impl->device = state_->device;
+  impl->device = state_->backend->device;
   impl->ready_recorded = true;
   impl->external_owner = std::move(allocation_owner);
-  impl->external_producer = state_;
+  impl->external_producer = state_->backend;
   return BFloat16ActivationLease(std::move(impl));
 }
 
@@ -11934,11 +11934,11 @@ SelectedOutputGradientLease ExternalCudaProducer::publish_output_gradient(
                     "external-dy-publish", "producer/forward/owner", 0,
                     "valid", "empty");
   const auto &f = *forward.impl_;
-  if (state_->context.session().stable_identity_bytes() !=
+  if (state_->backend->context.session().stable_identity_bytes() !=
           f.pool->session_identity ||
-      state_->context.session().generation() != f.identity.generation ||
-      state_->context.calling_rank() != f.identity.rank ||
-      state_->device != f.pool->device || !f.pool->config.enable_backward)
+      state_->backend->context.session().generation() != f.identity.generation ||
+      state_->backend->context.calling_rank() != f.identity.rank ||
+      state_->backend->device != f.pool->device || !f.pool->config.enable_backward)
     transport_error(NotifyErrorCode::WorkspaceMismatch,
                     "external-dy-publish", "provenance", f.identity.rank,
                     "exact Forward session/generation/rank/device",
@@ -11946,13 +11946,13 @@ SelectedOutputGradientLease ExternalCudaProducer::publish_output_gradient(
   const auto elements = checked_mul(f.identity.tokens, f.identity.hidden,
                                     "external dY elements");
   validate_external_cuda_range(device_data, elements, capacity_elements,
-                               sizeof(transport::BFloat16), state_->device,
+                               sizeof(transport::BFloat16), state_->backend->device,
                                "dY");
   auto &slot = f.pool->slots[f.slot->index];
   internal::throw_cuda(
       "external-dy-publish",
-      cudaEventRecord(slot.backward_ready, state_->stream), f.identity.rank,
-      f.identity.world, state_->context.session().identity(),
+      cudaEventRecord(slot.backward_ready, state_->backend->stream), f.identity.rank,
+      f.identity.world, state_->backend->context.session().identity(),
       f.identity.generation, ExchangeKind::ExpertCounts,
       "cudaEventRecord(dY ready)");
   auto impl = std::make_shared<SelectedOutputGradientLease::Impl>();
@@ -11960,14 +11960,14 @@ SelectedOutputGradientLease ExternalCudaProducer::publish_output_gradient(
   impl->pool = f.pool;
   impl->pointer = device_data;
   impl->session_identity = f.pool->session_identity;
-  impl->producer_execution = state_->execution;
+  impl->producer_execution = state_->backend->execution;
   impl->generation = f.identity.generation;
   impl->tokens = f.identity.tokens;
   impl->hidden = f.identity.hidden;
-  impl->device = state_->device;
+  impl->device = state_->backend->device;
   impl->ready_recorded = true;
   impl->external_owner = std::move(allocation_owner);
-  impl->external_producer = state_;
+  impl->external_producer = state_->backend;
   return SelectedOutputGradientLease(std::move(impl));
 }
 

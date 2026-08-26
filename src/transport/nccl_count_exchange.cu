@@ -275,15 +275,34 @@ struct NcclSession::Impl {
   CollectiveSession session;
 };
 
+std::unique_ptr<BackendCountExchangeOperation>
+internal::NcclSessionAccess::start(const CountExchangeRequest &) {
+  invalid("phase=nccl-session-access, field=start, rank=n/a, "
+          "expected=never called, actual=called");
+}
+
 std::shared_ptr<internal::NcclSessionState>
 internal::NcclSessionAccess::checked(const NcclSession &session) {
-  if (!session.impl_ || !session.impl_->state || !session.impl_->state->comm)
+  if (!session)
     throw NotifyDispatchError(
         NotifyErrorCode::NcclFailure,
         "phase=nccl-session-access, field=session, rank=n/a, "
         "expected=live NCCL session, actual=empty");
-  return session.impl_->state;
+  auto state = std::dynamic_pointer_cast<const internal::NcclSessionState>(
+      backend_session_state(session.session()));
+  if (!state || !state->comm)
+    throw NotifyDispatchError(
+        NotifyErrorCode::NcclFailure,
+        "phase=nccl-session-access, field=session_backend, rank=n/a, "
+        "expected=live NCCL session, actual=foreign/null");
+  return std::const_pointer_cast<internal::NcclSessionState>(state);
 }
+
+NcclSession::NcclSession(const NcclSession &) = default;
+NcclSession::NcclSession(NcclSession &&) noexcept = default;
+NcclSession &NcclSession::operator=(const NcclSession &) = default;
+NcclSession &NcclSession::operator=(NcclSession &&) noexcept = default;
+NcclSession::~NcclSession() = default;
 
 namespace {
 std::vector<std::byte> make_nccl_stable_identity(

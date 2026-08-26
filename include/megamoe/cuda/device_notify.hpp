@@ -25,17 +25,16 @@ using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
 template <class T> class SelectedExpertGateLease;
 using CudaGateInput = SelectedExpertGateLease<float>;
 class DeviceDispatchConsumerLease;
-namespace internal {
-struct CudaExecutionState;
-struct ExternalCudaProducerState;
-std::shared_ptr<const CudaExecutionState>
-checked_execution_state(const CudaExecution &execution);
-}
 
 // CUDA/NCCL native handles remain private to the implementation.
 class CudaExecution {
 public:
   CudaExecution() = default;
+  CudaExecution(const CudaExecution &);
+  CudaExecution(CudaExecution &&) noexcept;
+  CudaExecution &operator=(const CudaExecution &);
+  CudaExecution &operator=(CudaExecution &&) noexcept;
+  ~CudaExecution();
   const ExecutionToken &token() const;
   std::uint32_t device_ordinal() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
@@ -49,8 +48,6 @@ private:
   friend class SelectedExpertRouteLease<std::int32_t>;
   friend class DeviceDispatchConsumerLease;
   friend class NcclAllGatherCountExchange;
-  friend std::shared_ptr<const internal::CudaExecutionState>
-  internal::checked_execution_state(const CudaExecution &);
 };
 
 CudaExecution make_cuda_execution(std::string identity,

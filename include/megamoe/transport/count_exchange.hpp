@@ -243,7 +243,11 @@ public:
 
 protected:
   static std::shared_ptr<const BackendSessionState>
+  backend_session_state(const CollectiveSession &session);
+  static std::shared_ptr<const BackendSessionState>
   backend_session_state(const RankCollectiveContext &context);
+  static std::shared_ptr<const BackendExecutionState>
+  backend_execution_state(const ExecutionToken &execution);
   static std::shared_ptr<const BackendExecutionState>
   backend_execution_state(const RankCollectiveContext &context);
   static std::shared_ptr<const BackendDeviceLeaseState>

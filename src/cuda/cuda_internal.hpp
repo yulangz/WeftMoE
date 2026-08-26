@@ -52,9 +52,23 @@ struct NcclSessionState final : BackendSessionState {
   ~NcclSessionState() noexcept override;
 };
 
-class NcclSessionAccess {
+class NcclSessionAccess final : public CountExchange {
 public:
   static std::shared_ptr<NcclSessionState> checked(const NcclSession &session);
+
+private:
+  std::unique_ptr<BackendCountExchangeOperation>
+  start(const CountExchangeRequest &) override;
+};
+
+class CudaExecutionStateAccess final : public CountExchange {
+public:
+  static std::shared_ptr<const CudaExecutionState>
+  checked(const CudaExecution &execution);
+
+private:
+  std::unique_ptr<BackendCountExchangeOperation>
+  start(const CountExchangeRequest &) override;
 };
 
 enum class ConsumerEventSlotState : std::uint8_t {
