@@ -377,7 +377,8 @@ public:
 
   std::unique_ptr<BackendCountExchangeOperation>
   start(const CountExchangeRequest &request) override {
-    behavior_->input_lifetime = request.input.lifetime_for_testing();
+    behavior_->input_lifetime =
+        megamoe::testing::HostIntegerRowTestAccess::lifetime(request.input);
     if (behavior_->start != ThrowMode::None) {
       throw_mode(behavior_->start, "start");
     }

@@ -1,4 +1,4 @@
-#include "megamoe/transport/count_exchange.hpp"
+#include "metadata/testing_api.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -214,9 +214,9 @@ const std::vector<std::uint64_t> &HostIntegerRow::values() const {
   return *values_;
 }
 
-std::weak_ptr<const void>
-HostIntegerRow::lifetime_for_testing() const noexcept {
-  return std::weak_ptr<const void>(values_);
+std::weak_ptr<const void> testing::HostIntegerRowTestAccess::lifetime(
+    const HostIntegerRow &row) noexcept {
+  return std::weak_ptr<const void>(row.values_);
 }
 
 struct HostCountMatrix::Impl {

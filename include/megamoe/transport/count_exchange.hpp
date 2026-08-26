@@ -9,6 +9,10 @@
 
 namespace megamoe {
 
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
+namespace testing { class HostIntegerRowTestAccess; }
+#endif
+
 using CountMatrix = std::vector<std::vector<std::uint64_t>>;
 
 enum class ExchangeKind { Control, ExpertCounts, NotifyPacketSummary };
@@ -112,7 +116,6 @@ public:
   std::size_t size() const;
   std::uint64_t at(std::size_t index) const;
   const std::vector<std::uint64_t> &values() const;
-  std::weak_ptr<const void> lifetime_for_testing() const noexcept;
   explicit operator bool() const noexcept { return static_cast<bool>(values_); }
 
 private:
@@ -121,6 +124,9 @@ private:
       : values_(std::move(values)) {}
   std::shared_ptr<const std::vector<std::uint64_t>> values_;
   friend HostIntegerRow make_host_integer_row(std::vector<std::uint64_t>);
+#if defined(MEGAMOE_INTERNAL_TESTING_API)
+  friend class testing::HostIntegerRowTestAccess;
+#endif
 };
 
 HostIntegerRow make_host_integer_row(std::vector<std::uint64_t> values);

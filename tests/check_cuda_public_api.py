@@ -211,6 +211,13 @@ int main() { (void)megamoe::cuda::testing::flip_backward_storage_byte_for_valida
 #include "megamoe/api/notify_dispatch.hpp"
 int main() { (void)megamoe::build_notify_dispatch_for_testing; }
 ''',
+    "host_integer_row_lifetime_hook": r'''
+#include "megamoe/transport/count_exchange.hpp"
+int main() {
+  megamoe::HostIntegerRow row;
+  (void)row.lifetime_for_testing();
+}
+''',
 }
 with tempfile.TemporaryDirectory() as directory:
     temporary = Path(directory)

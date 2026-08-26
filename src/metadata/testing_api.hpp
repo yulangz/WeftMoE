@@ -7,3 +7,13 @@
 #endif
 
 #include "megamoe/api/notify_dispatch.hpp"
+
+namespace megamoe::testing {
+
+class HostIntegerRowTestAccess {
+public:
+  static std::weak_ptr<const void> lifetime(
+      const HostIntegerRow &row) noexcept;
+};
+
+} // namespace megamoe::testing
