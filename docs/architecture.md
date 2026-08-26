@@ -58,10 +58,12 @@ phase boundaries and is a correctness fallback rather than a persistent-data-
 plane performance result.
 
 The launch requests a `2x1x1` cluster where supported and records requested and
-actual sizes independently. The checked main-shape world-8 fixtures report
-`requested=2, actual=2`, rank mask `3`, and no TMA multicast. Cluster formation
-is therefore real for that measured path, while operand multicast remains
-disabled; the generic runtime-shape fallback reports cluster size one.
+actual sizes independently. The standalone frozen Forward fixture reports
+`requested=2, actual=2`, rank mask `3`; the deferred Forward-to-Backward
+integrated fixture currently reports `requested=2, actual=1`. Neither path uses
+TMA multicast. Results therefore report the audit belonging to that exact
+measurement rather than treating requested size as formation proof. The
+generic runtime-shape fallback reports cluster size one.
 
 ## Runtime compute shapes
 

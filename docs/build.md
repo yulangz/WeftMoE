@@ -407,10 +407,11 @@ the bytes their Forward kernels actually consume. The fair launcher rejects
 any per-rank W1 or W2 mismatch before timing; the formula-derived sample hash
 is retained only as generator/layout diagnostics.
 
-The production launch requests cluster dimension `2x1x1`; the checked world-8
-main-shape audit observes `actual=2` and rank mask `3`. JSON reports requested
-and actual sizes separately. TMA multicast is off, so no operand-multicast
-performance claim is made. The generic runtime-shape fallback uses one CTA.
+The production launch requests cluster dimension `2x1x1`. The checked
+standalone Forward JSON observes `actual=2` and rank mask `3`; the current
+deferred Forward-to-Backward integrated audit observes `actual=1`. JSON reports
+requested and actual sizes per measurement. TMA multicast is off, so no
+operand-multicast performance claim is made. The generic fallback uses one CTA.
 Pool construction clears each slot once. A generation writes only
 `2 * world * channels` completion words plus `2 * world` ready/ack words in a
 small setup kernel; it performs no arena-wide memset. The Forward benchmark's

@@ -43,8 +43,9 @@ Complete: one cooperative data-plane kernel contains dispatch, TMA/WGMMA FC1,
 SwiGLU, TMA/WGMMA FC2, return and deterministic reduce for the frozen
 `hidden=7168, intermediate=3072` specialization. Cache/no-cache lifetimes,
 actual-device weight hashes, cross-EP bitwise fixtures and independent FP64
-checks are closed. The observed main-shape cluster is two CTAs; TMA multicast
-is disabled.
+checks are closed. Standalone Forward has observed a two-CTA cluster, while the
+current deferred F+B path observes one CTA; both audits are recorded with their
+measurement and TMA multicast is disabled.
 
 ## Phase 6 — persistent Backward
 

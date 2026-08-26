@@ -307,9 +307,10 @@ The release benchmark uses the actual `sm_90a` WGMMA/TMA cubin selected by the
 CUDA runtime on the inspected L20X host; the fat binary also contains the
 ordinary `sm_89` target, which rejects this specialization at runtime. The
 launch audit records requested and actual cluster sizes separately. The
-checked world-8 main-shape runs request and observe `cluster_size=2` with rank
-mask `3`; TMA multicast remains disabled (`audit=0`). Other positive H/I
-shapes select the single-CTA correctness fallback described above.
+standalone frozen Forward result records `cluster_size=2`/rank mask `3`; the
+current deferred Forward-to-Backward integrated path records actual size one.
+TMA multicast remains disabled (`audit=0`) in both. Other positive H/I shapes
+select the single-CTA correctness fallback described above.
 
 ## Single-node Backward baseline
 

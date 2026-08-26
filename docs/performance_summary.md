@@ -17,8 +17,9 @@ From `benchmarks/results/forward_release_world8.json`:
 
 The representative Forward P50/P95 are 14.9218/15.0187 ms. Cache Forward is
 16.1698 ms mean and adds 1.2342 ms while retaining A/B for Backward. The actual
-main-shape launch reports cluster size two, 168 registers/thread, 16 bytes
-stack/thread and no TMA multicast.
+standalone launch in that result reports cluster size two, 168 registers/thread,
+16 bytes stack/thread and no TMA multicast. The deferred F+B benchmark records
+actual cluster size one; cluster audit is therefore reported per harness.
 
 From `benchmarks/results/backward_integrated_world8.json`:
 
@@ -60,3 +61,19 @@ The main-shape hash is frozen. Refactoring is accepted only when output and
 gradient hashes remain unchanged and Forward, Backward and F+B regress by no
 more than 3%. The generic runtime-shape path is correctness-only and excluded
 from the main-shape performance claim.
+
+For the final module review, commit `5af8828` (before launch-contract/test
+splitting) and the reviewed head were rebuilt and measured back-to-back on the
+same host. With 10 warmups and 100 samples, the pre-refactor/current means were
+29.5487/29.5287 ms Backward, 15.8548/15.8519 ms Forward, and
+45.9335/45.9039 ms Notify-inclusive F+B. The reviewed build is respectively
+0.068%, 0.018%, and 0.064% faster in that paired run. Normalized complete SASS
+SHA-256 and all kernel resource records are identical; this is the performance
+protection evidence for the source/module refactor, independent of older-run
+machine variance.
+
+A fresh two-host GIN 10+100 run measured 40.9664 ms Forward, 53.2206 ms
+Backward and 95.4062 ms Notify-inclusive F+B. Relative to the checked
+41.0693/52.7385/94.0076 ms cross-run means, the changes are -0.25%, +0.91% and
++1.49%, all inside the 3% guard. The corresponding P95 values were
+41.0542/53.4385/95.6547 ms.
