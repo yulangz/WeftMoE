@@ -60,6 +60,7 @@ struct ForwardKernelArgs {
 #endif
 #if MEGAMOE_DEBUG_VALIDATE
   unsigned long long *progress;
+  std::uint32_t progress_contexts;
 #endif
   bool cache_fc1;
   DispatchWaveKernelView dispatch_waves;

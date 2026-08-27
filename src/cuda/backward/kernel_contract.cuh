@@ -71,6 +71,9 @@ struct BackwardKernelArgs {
   const unsigned long long *cancel_epoch;
   unsigned long long *progress;
   std::uint32_t progress_experts;
+#if MEGAMOE_DEBUG_VALIDATE
+  std::uint32_t progress_contexts;
+#endif
   bool use_forward_cache;
   int injected_status_error_rank = -1;
 #if MEGAMOE_DEVICE_TIMELINE

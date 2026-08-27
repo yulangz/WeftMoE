@@ -422,6 +422,53 @@ enum ForwardProgressWord : std::uint32_t {
   kForwardProgressWords = 16,
 };
 
+#if MEGAMOE_DEBUG_VALIDATE
+void dump_generation_completion(std::ostream &output,
+                                const std::uint64_t *mapped,
+                                std::uint32_t contexts,
+                                const char *prefix) {
+  const auto word = [&](std::size_t index) {
+    return __atomic_load_n(mapped + index, __ATOMIC_ACQUIRE);
+  };
+  output << ' ' << prefix << ".generation=" << word(0) << ' ' << prefix
+         << ".epoch=" << word(1);
+  static constexpr const char *kTaskNames[] = {
+      "dispatch", "relay",  "fc1_or_dv", "fc2_or_dx", "return",
+      "arrival",  "reduce", "dw1",       "dw2"};
+  for (std::size_t task = 0; task < transport_state::kTaskClassCount; ++task) {
+    const auto base = 2ULL + task * 4ULL;
+    output << ' ' << prefix << '.' << kTaskNames[task] << "={expected="
+           << word(base) << ",claimed=" << word(base + 1ULL)
+           << ",completed=" << word(base + 2ULL)
+           << ",inflight=" << word(base + 3ULL) << '}';
+  }
+  constexpr auto kTail = 2ULL + transport_state::kTaskClassCount * 4ULL;
+  output << ' ' << prefix << ".dispatch_local={expected=" << word(kTail)
+         << ",completed=" << word(kTail + 1ULL) << "} " << prefix
+         << ".return_local={expected=" << word(kTail + 2ULL)
+         << ",completed=" << word(kTail + 3ULL) << "} " << prefix
+         << ".credit={expected=" << word(kTail + 4ULL)
+         << ",restored=" << word(kTail + 5ULL) << "} " << prefix
+         << ".directory={expected=" << word(kTail + 6ULL)
+         << ",ready=" << word(kTail + 7ULL) << "} " << prefix
+         << ".kernel_complete_epoch=" << word(kTail + 8ULL) << ' ' << prefix
+         << ".terminal_publish_count=" << word(kTail + 9ULL);
+  for (std::uint32_t context = 0; context < contexts; ++context) {
+    const auto base = transport_state::kGenerationCompletionWords +
+                      context * transport_state::kContextCompletionWords;
+    output << ' ' << prefix << ".context[" << context << "]={directory="
+           << word(base + 2ULL) << ",dispatch=" << word(base + 3ULL) << '/'
+           << word(base + 5ULL) << ",relay=" << word(base + 6ULL) << '/'
+           << word(base + 8ULL) << ",return=" << word(base + 9ULL) << '/'
+           << word(base + 11ULL) << ",inflight=" << word(base + 12ULL)
+           << ",local_completion=" << word(base + 13ULL)
+           << ",credit=" << word(base + 14ULL)
+           << ",cursor=" << word(base + 15ULL)
+           << ",last_progress=" << word(base + 16ULL) << '}';
+  }
+}
+#endif
+
 struct Layout {
   std::size_t input = 0;
   std::size_t ring_headers = 0;
@@ -893,6 +940,8 @@ struct PoolSlot {
   std::uint64_t *host_backward_progress = nullptr;
   std::uint64_t *device_backward_progress = nullptr;
   std::size_t backward_progress_words = 0;
+  std::size_t generation_debug_words = 0;
+  std::uint32_t generation_debug_contexts = 0;
   std::uint64_t *host_cancel_epoch = nullptr;
   std::uint64_t *host_socket_counts = nullptr;
   std::uint64_t *device_cancel_epoch = nullptr;
@@ -3695,6 +3744,19 @@ local_p2p_forward_megakernel(
       context_completion =
           static_cast<transport_state::ContextCompletionRecord *>(
               a.peer_bases[a.world + 1U]);
+#if MEGAMOE_DEBUG_VALIDATE
+      // Timeout diagnostics use mapped, session-owned storage.  Debug kernels
+      // update it in place so the host can identify a stalled expected task
+      // without waiting for a D2H copy behind the persistent kernel.
+      if (a.progress != nullptr) {
+        auto *debug_words = a.progress + kForwardProgressWords;
+        completion = reinterpret_cast<
+            transport_state::GenerationCompletionVector *>(debug_words);
+        context_completion = reinterpret_cast<
+            transport_state::ContextCompletionRecord *>(
+            debug_words + transport_state::kGenerationCompletionWords);
+      }
+#endif
     }
   }
   constexpr std::size_t kForwardGemmSmemBytes =
@@ -3727,6 +3789,8 @@ local_p2p_forward_megakernel(
     scheduler[4U + a.world] = 0ULL;
     if constexpr (!StaticLocal) {
       if (a.use_gin) {
+        completion->generation = a.dispatch.identity.generation;
+        completion->epoch = a.epoch;
         unsigned long long dispatch_waves = 0ULL;
         for (std::uint64_t wave = 0; wave < a.dispatch_waves.wave_count;
              ++wave)
@@ -5700,6 +5764,21 @@ local_p2p_backward_megakernel(
       context_completion =
           static_cast<transport_state::ContextCompletionRecord *>(
               a.peer_bases[a.world + 3U]);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (a.progress != nullptr) {
+        const auto backward_legacy_words =
+            32ULL + static_cast<unsigned long long>(a.progress_experts) * 8ULL;
+        const auto debug_words = transport_state::completion_debug_words(
+            a.progress_contexts);
+        auto *backward_debug = a.progress + backward_legacy_words +
+                               kForwardProgressWords + debug_words;
+        completion = reinterpret_cast<
+            transport_state::GenerationCompletionVector *>(backward_debug);
+        context_completion = reinterpret_cast<
+            transport_state::ContextCompletionRecord *>(
+            backward_debug + transport_state::kGenerationCompletionWords);
+      }
+#endif
     }
   }
   auto *dw_timeline = peer_at<BackwardExpertDwTimeline>(
@@ -5776,6 +5855,8 @@ local_p2p_backward_megakernel(
     status->padded_reduction_rows = padded;
     if constexpr (!StaticLocal) {
       if (a.use_gin) {
+        completion->generation = a.dispatch.identity.generation;
+        completion->epoch = a.epoch;
         unsigned long long dispatch_waves = 0ULL;
         for (std::uint64_t wave = 0; wave < a.dispatch_waves.wave_count;
              ++wave)
@@ -10083,9 +10164,15 @@ ActivationTransportResourcePool make_activation_transport_pool(
       internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
       std::fill_n(slot.host_production_status, config.max_world_size,
                   ProductionStatusRecord{});
+      const auto backward_legacy_words =
+          32ULL + static_cast<std::size_t>(config.max_owned_experts) * 8ULL;
+      slot.generation_debug_contexts = static_cast<std::uint32_t>(
+          (config.max_nodes > 0 ? config.max_nodes - 1ULL : 0ULL) * 8ULL);
+      slot.generation_debug_words = transport_state::completion_debug_words(
+          slot.generation_debug_contexts);
       slot.backward_progress_words =
-          32ULL + static_cast<std::size_t>(config.max_owned_experts) * 8ULL +
-          kForwardProgressWords;
+          backward_legacy_words + kForwardProgressWords +
+          2ULL * slot.generation_debug_words;
       internal::throw_cuda(
           "transport-pool-create",
           cudaHostAlloc(
@@ -12447,9 +12534,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       32ULL + static_cast<std::size_t>(state->config.max_owned_experts) * 8ULL;
   if (std::getenv("MEGAMOE_BACKWARD_PROGRESS_DUMP") != nullptr) {
     std::fill_n(slot.host_backward_progress + forward_progress_base,
-                kForwardProgressWords, 0ULL);
+                kForwardProgressWords + 2ULL * slot.generation_debug_words,
+                0ULL);
     args.progress = reinterpret_cast<unsigned long long *>(
         slot.device_backward_progress + forward_progress_base);
+    args.progress_contexts = slot.generation_debug_contexts;
   }
 #endif
   args.cache_fc1 =
@@ -12759,6 +12848,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 
   const auto wait_start = std::chrono::steady_clock::now();
   bool cancelled = false;
+#if MEGAMOE_DEBUG_VALIDATE
+  bool progress_dumped = false;
+#endif
   while (true) {
     const auto query = cudaEventQuery(slot.forward_complete);
     if (query == cudaSuccess)
@@ -12771,6 +12863,39 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     const auto expired = options.deadline_after.count() > 0 &&
                          std::chrono::steady_clock::now() - wait_start >=
                              options.deadline_after;
+#if MEGAMOE_DEBUG_VALIDATE
+    const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
+    if (!progress_dumped && use_gin && args.progress != nullptr &&
+        stalled_for >= std::chrono::seconds(30)) {
+      const auto forward_progress_base =
+          32ULL + static_cast<std::size_t>(state->config.max_owned_experts) *
+                      8ULL;
+      const auto progress = [&](std::uint32_t word) {
+        return __atomic_load_n(slot.host_backward_progress +
+                                   forward_progress_base + word,
+                               __ATOMIC_ACQUIRE);
+      };
+      std::cerr << "FORWARD_PROGRESS rank=" << id.calling_rank
+                << " generation=" << id.generation
+                << " entered=" << progress(kForwardEntered)
+                << " setup=" << progress(kForwardSetupComplete)
+                << " dispatch_stored=" << progress(kForwardDispatchStored)
+                << " dispatch_observed="
+                << progress(kForwardDispatchObserved)
+                << " fc1=" << progress(kForwardFc1Complete)
+                << " fc2=" << progress(kForwardFc2Complete)
+                << " return=" << progress(kForwardReturnObserved)
+                << " reduce=" << progress(kForwardReduceComplete)
+                << " terminal=" << progress(kForwardTerminal);
+      dump_generation_completion(
+          std::cerr,
+          slot.host_backward_progress + forward_progress_base +
+              kForwardProgressWords,
+          slot.generation_debug_contexts, "forward_completion");
+      std::cerr << std::endl;
+      progress_dumped = true;
+    }
+#endif
     if (!cancelled &&
         (expired || options.cancellation.cancellation_requested())) {
       __atomic_store_n(slot.host_cancel_epoch, args.epoch, __ATOMIC_RELEASE);
@@ -13584,6 +13709,16 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
                             slot.device_backward_progress)
                       : nullptr;
   args.progress_experts = state->config.max_owned_experts;
+#if MEGAMOE_DEBUG_VALIDATE
+  args.progress_contexts = slot.generation_debug_contexts;
+  if (args.progress != nullptr) {
+    const auto backward_debug_base = backward_progress_words +
+                                     kForwardProgressWords +
+                                     slot.generation_debug_words;
+    std::fill_n(slot.host_backward_progress + backward_debug_base,
+                slot.generation_debug_words, 0ULL);
+  }
+#endif
   args.use_forward_cache =
       f.cache_mode == ForwardCacheMode::CacheFc1InputOutput;
 #if MEGAMOE_DEBUG_VALIDATE
@@ -13990,6 +14125,17 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
            expert < view.sizes.owned_expert_count; ++expert)
         std::cerr << " expert[" << expert << "].rows="
                   << progress(kBackwardProgressExpertBase + expert * 8U);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (use_gin) {
+        const auto debug_words = slot.generation_debug_words;
+        const auto backward_debug_base = backward_progress_words +
+                                         kForwardProgressWords + debug_words;
+        dump_generation_completion(
+            std::cerr,
+            slot.host_backward_progress + backward_debug_base,
+            slot.generation_debug_contexts, "backward_completion");
+      }
+#endif
       std::cerr << std::endl;
       progress_dumped = true;
     }

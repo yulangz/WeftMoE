@@ -73,5 +73,15 @@ struct ContextCompletionRecord {
 
 static_assert(sizeof(TaskCompletionRecord) == 4U * sizeof(std::uint64_t));
 static_assert(sizeof(ContextCompletionRecord) == 17U * sizeof(std::uint64_t));
+static_assert(sizeof(GenerationCompletionVector) % sizeof(std::uint64_t) == 0U);
+
+constexpr std::size_t kGenerationCompletionWords =
+    sizeof(GenerationCompletionVector) / sizeof(std::uint64_t);
+constexpr std::size_t kContextCompletionWords =
+    sizeof(ContextCompletionRecord) / sizeof(std::uint64_t);
+
+constexpr std::size_t completion_debug_words(std::size_t contexts) {
+  return kGenerationCompletionWords + contexts * kContextCompletionWords;
+}
 
 } // namespace megamoe::cuda::transport_state
