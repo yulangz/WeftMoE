@@ -1,0 +1,1131 @@
+{
+  "aggregate_duration_ms": {
+    "dispatch_issue_to_completion": {
+      "count": 16,
+      "max": 4.973952,
+      "min": 4.931584,
+      "p50": 4.961888,
+      "p95": 4.973952
+    },
+    "dispatch_signal_to_relay": {
+      "count": 2,
+      "max": 0.033536,
+      "min": 0.015264,
+      "p50": 0.015264,
+      "p95": 0.033536
+    },
+    "dv": {
+      "count": 264,
+      "max": 9.51664,
+      "min": 9.46272,
+      "p50": 9.463648,
+      "p95": 9.516544
+    },
+    "dw1": {
+      "count": 264,
+      "max": 14.784384,
+      "min": 14.201824,
+      "p50": 14.39792,
+      "p95": 14.761952
+    },
+    "dw1_ready_to_start": {
+      "count": 264,
+      "max": 0.000544,
+      "min": 0.000128,
+      "p50": 0.000128,
+      "p95": 0.00016
+    },
+    "dw2": {
+      "count": 264,
+      "max": 11.936576,
+      "min": 11.864864,
+      "p50": 11.8784,
+      "p95": 11.935104
+    },
+    "dw2_ready_to_start": {
+      "count": 264,
+      "max": 0.001888,
+      "min": 0.001088,
+      "p50": 0.001376,
+      "p95": 0.001632
+    },
+    "dx_return_issue_to_completion": {
+      "count": 16,
+      "max": 14.7904,
+      "min": 14.708352,
+      "p50": 14.774656,
+      "p95": 14.7904
+    },
+    "dy_issue_to_completion": {
+      "count": 16,
+      "max": 4.977504,
+      "min": 4.945952,
+      "p50": 4.967648,
+      "p95": 4.977504
+    },
+    "dy_relay": {
+      "count": 264,
+      "max": 0.769344,
+      "min": 0.768352,
+      "p50": 0.768608,
+      "p95": 0.76928
+    },
+    "fc1": {
+      "count": 264,
+      "max": 10.640736,
+      "min": 9.962336,
+      "p50": 10.098272,
+      "p95": 10.569792
+    },
+    "kernel": {
+      "count": 528,
+      "max": 75.66192,
+      "min": 46.143808,
+      "p50": 46.160672,
+      "p95": 75.650112
+    },
+    "proxy_relay": {
+      "count": 264,
+      "max": 0.706912,
+      "min": 0.706208,
+      "p50": 0.706592,
+      "p95": 0.706816
+    },
+    "reduce": {
+      "count": 528,
+      "max": 0.436096,
+      "min": 0.357344,
+      "p50": 0.367424,
+      "p95": 0.431232
+    },
+    "return_issue_to_completion": {
+      "count": 16,
+      "max": 14.799808,
+      "min": 14.784704,
+      "p50": 14.794176,
+      "p95": 14.799808
+    },
+    "return_pack": {
+      "count": 264,
+      "max": 0.86208,
+      "min": 0.854496,
+      "p50": 0.854784,
+      "p95": 0.862048
+    },
+    "source_relay": {
+      "count": 264,
+      "max": 1.38256,
+      "min": 1.33184,
+      "p50": 1.332384,
+      "p95": 1.382496
+    }
+  },
+  "clock_contract": "durations within one GPU only",
+  "ranks": [
+    {
+      "durations_ms": {
+        "dispatch_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dispatch_signal_to_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dv": {
+          "count": 132,
+          "max": 9.51664,
+          "min": 9.515552,
+          "p50": 9.516416,
+          "p95": 9.516576
+        },
+        "dw1": {
+          "count": 132,
+          "max": 14.784384,
+          "min": 14.510624,
+          "p50": 14.597728,
+          "p95": 14.768608
+        },
+        "dw1_ready_to_start": {
+          "count": 132,
+          "max": 0.000544,
+          "min": 0.000128,
+          "p50": 0.000128,
+          "p95": 0.00016
+        },
+        "dw2": {
+          "count": 132,
+          "max": 11.8784,
+          "min": 11.864864,
+          "p50": 11.86896,
+          "p95": 11.876736
+        },
+        "dw2_ready_to_start": {
+          "count": 132,
+          "max": 0.001888,
+          "min": 0.00112,
+          "p50": 0.001376,
+          "p95": 0.001632
+        },
+        "dx_return_issue_to_completion": {
+          "count": 8,
+          "max": 14.7904,
+          "min": 14.708352,
+          "p50": 14.778624,
+          "p95": 14.7904
+        },
+        "dy_issue_to_completion": {
+          "count": 8,
+          "max": 4.971616,
+          "min": 4.945952,
+          "p50": 4.966016,
+          "p95": 4.971616
+        },
+        "dy_relay": {
+          "count": 132,
+          "max": 0.769344,
+          "min": 0.76912,
+          "p50": 0.769184,
+          "p95": 0.769312
+        },
+        "fc1": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "kernel": {
+          "count": 132,
+          "max": 75.66192,
+          "min": 75.6496,
+          "p50": 75.649984,
+          "p95": 75.650112
+        },
+        "proxy_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "reduce": {
+          "count": 132,
+          "max": 0.436096,
+          "min": 0.362592,
+          "p50": 0.368672,
+          "p95": 0.432576
+        },
+        "return_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "return_pack": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "source_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        }
+      },
+      "event_count": 2688,
+      "events": {
+        "dgate_return": {
+          "count": 132,
+          "first_ns": 1787815291124815264,
+          "last_ns": 1787815291124878176
+        },
+        "dv_first": {
+          "count": 132,
+          "first_ns": 1787815291085166240,
+          "last_ns": 1787815291085167296
+        },
+        "dv_last": {
+          "count": 132,
+          "first_ns": 1787815291094682784,
+          "last_ns": 1787815291094682912
+        },
+        "dw1_end": {
+          "count": 132,
+          "first_ns": 1787815291151273568,
+          "last_ns": 1787815291151545472
+        },
+        "dw1_ready": {
+          "count": 132,
+          "first_ns": 1787815291136750176,
+          "last_ns": 1787815291136763680
+        },
+        "dw1_start": {
+          "count": 132,
+          "first_ns": 1787815291136750720,
+          "last_ns": 1787815291136763840
+        },
+        "dw2_end": {
+          "count": 132,
+          "first_ns": 1787815291136749856,
+          "last_ns": 1787815291136763360
+        },
+        "dw2_ready": {
+          "count": 132,
+          "first_ns": 1787815291124883392,
+          "last_ns": 1787815291124884128
+        },
+        "dw2_start": {
+          "count": 132,
+          "first_ns": 1787815291124884736,
+          "last_ns": 1787815291124885536
+        },
+        "dx_return_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815291105967040,
+          "last_ns": 1787815291105988096
+        },
+        "dx_return_local_completion": {
+          "count": 8,
+          "first_ns": 1787815291120675392,
+          "last_ns": 1787815291120771136
+        },
+        "dx_return_pack_start": {
+          "count": 132,
+          "first_ns": 1787815291104914176,
+          "last_ns": 1787815291104914368
+        },
+        "dx_source_relay": {
+          "count": 132,
+          "first_ns": 1787815291123551744,
+          "last_ns": 1787815291123552032
+        },
+        "dx_tile_ready": {
+          "count": 132,
+          "first_ns": 1787815291104908640,
+          "last_ns": 1787815291104908992
+        },
+        "dy_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815291079380384,
+          "last_ns": 1787815291079416864
+        },
+        "dy_local_completion": {
+          "count": 8,
+          "first_ns": 1787815291084327104,
+          "last_ns": 1787815291084382752
+        },
+        "dy_packet_ready": {
+          "count": 132,
+          "first_ns": 1787815291077321536,
+          "last_ns": 1787815291077329792
+        },
+        "dy_relay_end": {
+          "count": 132,
+          "first_ns": 1787815291085156128,
+          "last_ns": 1787815291085156224
+        },
+        "dy_relay_start": {
+          "count": 132,
+          "first_ns": 1787815291084386848,
+          "last_ns": 1787815291084387040
+        },
+        "kernel_enter": {
+          "count": 132,
+          "first_ns": 1787815291076579456,
+          "last_ns": 1787815291076579872
+        },
+        "reduce_end": {
+          "count": 132,
+          "first_ns": 1787815291151909824,
+          "last_ns": 1787815291151983872
+        },
+        "reduce_ready": {
+          "count": 132,
+          "first_ns": 1787815291151547072,
+          "last_ns": 1787815291151547584
+        },
+        "reduce_start": {
+          "count": 132,
+          "first_ns": 1787815291151547200,
+          "last_ns": 1787815291151547776
+        },
+        "remote_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815291084358016,
+          "last_ns": 1787815291084384480
+        },
+        "source_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815291123548960,
+          "last_ns": 1787815291123548992
+        },
+        "terminal": {
+          "count": 132,
+          "first_ns": 1787815291152229440,
+          "last_ns": 1787815291152241760
+        }
+      },
+      "generation": 811,
+      "overflow_events": 0,
+      "path": "world2.rank0.backward.json",
+      "phase": "backward",
+      "rank": 0
+    },
+    {
+      "durations_ms": {
+        "dispatch_issue_to_completion": {
+          "count": 8,
+          "max": 4.96432,
+          "min": 4.931584,
+          "p50": 4.945184,
+          "p95": 4.96432
+        },
+        "dispatch_signal_to_relay": {
+          "count": 1,
+          "max": 0.015264,
+          "min": 0.015264,
+          "p50": 0.015264,
+          "p95": 0.015264
+        },
+        "dv": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw1": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw1_ready_to_start": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw2": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw2_ready_to_start": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dx_return_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dy_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dy_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "fc1": {
+          "count": 132,
+          "max": 10.514688,
+          "min": 9.962336,
+          "p50": 10.071424,
+          "p95": 10.514048
+        },
+        "kernel": {
+          "count": 132,
+          "max": 46.160672,
+          "min": 46.160224,
+          "p50": 46.160448,
+          "p95": 46.16064
+        },
+        "proxy_relay": {
+          "count": 132,
+          "max": 0.706912,
+          "min": 0.706528,
+          "p50": 0.70672,
+          "p95": 0.706816
+        },
+        "reduce": {
+          "count": 132,
+          "max": 0.434752,
+          "min": 0.359104,
+          "p50": 0.365536,
+          "p95": 0.42928
+        },
+        "return_issue_to_completion": {
+          "count": 8,
+          "max": 14.799616,
+          "min": 14.791776,
+          "p50": 14.794816,
+          "p95": 14.799616
+        },
+        "return_pack": {
+          "count": 132,
+          "max": 0.86208,
+          "min": 0.86176,
+          "p50": 0.861952,
+          "p95": 0.862048
+        },
+        "source_relay": {
+          "count": 132,
+          "max": 1.332384,
+          "min": 1.33184,
+          "p50": 1.332,
+          "p95": 1.332352
+        }
+      },
+      "event_count": 14656,
+      "events": {
+        "dispatch_local_completion": {
+          "count": 8,
+          "first_ns": 1787815291038025120,
+          "last_ns": 1787815291038093216
+        },
+        "dispatch_packet_ready": {
+          "count": 132,
+          "first_ns": 1787815291031126304,
+          "last_ns": 1787815291031131104
+        },
+        "fc1_first": {
+          "count": 132,
+          "first_ns": 1787815291038825152,
+          "last_ns": 1787815291038826080
+        },
+        "fc1_last": {
+          "count": 132,
+          "first_ns": 1787815291048787680,
+          "last_ns": 1787815291049339936
+        },
+        "fc2_tile_ready": {
+          "count": 12628,
+          "first_ns": 1787815291048856416,
+          "last_ns": 1787815291055664608
+        },
+        "gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815291033092640,
+          "last_ns": 1787815291033150656
+        },
+        "kernel_enter": {
+          "count": 132,
+          "first_ns": 1787815291030360800,
+          "last_ns": 1787815291030361216
+        },
+        "proxy_relay_end": {
+          "count": 132,
+          "first_ns": 1787815291038816800,
+          "last_ns": 1787815291038817120
+        },
+        "proxy_relay_start": {
+          "count": 132,
+          "first_ns": 1787815291038110176,
+          "last_ns": 1787815291038110368
+        },
+        "reduce_end": {
+          "count": 132,
+          "first_ns": 1787815291076339232,
+          "last_ns": 1787815291076414912
+        },
+        "reduce_ready": {
+          "count": 132,
+          "first_ns": 1787815291075979904,
+          "last_ns": 1787815291075980064
+        },
+        "reduce_start": {
+          "count": 132,
+          "first_ns": 1787815291075980032,
+          "last_ns": 1787815291075980192
+        },
+        "remote_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815291038082560,
+          "last_ns": 1787815291038107840
+        },
+        "return_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815291056786912,
+          "last_ns": 1787815291056792512
+        },
+        "return_local_completion": {
+          "count": 8,
+          "first_ns": 1787815291071582368,
+          "last_ns": 1787815291071591200
+        },
+        "return_pack_end": {
+          "count": 132,
+          "first_ns": 1787815291056737184,
+          "last_ns": 1787815291056737440
+        },
+        "return_pack_start": {
+          "count": 132,
+          "first_ns": 1787815291055875264,
+          "last_ns": 1787815291055875520
+        },
+        "source_relay_end": {
+          "count": 132,
+          "first_ns": 1787815291075977344,
+          "last_ns": 1787815291075977760
+        },
+        "source_relay_start": {
+          "count": 132,
+          "first_ns": 1787815291074645376,
+          "last_ns": 1787815291074645568
+        },
+        "source_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815291074538240,
+          "last_ns": 1787815291074642976
+        },
+        "terminal": {
+          "count": 132,
+          "first_ns": 1787815291076521408,
+          "last_ns": 1787815291076521536
+        },
+        "x_mtile_ready": {
+          "count": 132,
+          "first_ns": 1787815291038822720,
+          "last_ns": 1787815291038822976
+        }
+      },
+      "generation": 811,
+      "overflow_events": 0,
+      "path": "world2.rank0.forward.json",
+      "phase": "forward",
+      "rank": 0
+    },
+    {
+      "durations_ms": {
+        "dispatch_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dispatch_signal_to_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dv": {
+          "count": 132,
+          "max": 9.463648,
+          "min": 9.46272,
+          "p50": 9.46336,
+          "p95": 9.463552
+        },
+        "dw1": {
+          "count": 132,
+          "max": 14.39792,
+          "min": 14.201824,
+          "p50": 14.24816,
+          "p95": 14.3736
+        },
+        "dw1_ready_to_start": {
+          "count": 132,
+          "max": 0.000288,
+          "min": 0.000128,
+          "p50": 0.000128,
+          "p95": 0.00016
+        },
+        "dw2": {
+          "count": 132,
+          "max": 11.936576,
+          "min": 11.924032,
+          "p50": 11.929696,
+          "p95": 11.935968
+        },
+        "dw2_ready_to_start": {
+          "count": 132,
+          "max": 0.001856,
+          "min": 0.001088,
+          "p50": 0.001408,
+          "p95": 0.001632
+        },
+        "dx_return_issue_to_completion": {
+          "count": 8,
+          "max": 14.787392,
+          "min": 14.735712,
+          "p50": 14.771616,
+          "p95": 14.787392
+        },
+        "dy_issue_to_completion": {
+          "count": 8,
+          "max": 4.977504,
+          "min": 4.960128,
+          "p50": 4.97056,
+          "p95": 4.977504
+        },
+        "dy_relay": {
+          "count": 132,
+          "max": 0.768608,
+          "min": 0.768352,
+          "p50": 0.768512,
+          "p95": 0.768576
+        },
+        "fc1": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "kernel": {
+          "count": 132,
+          "max": 75.642176,
+          "min": 75.630208,
+          "p50": 75.630464,
+          "p95": 75.630752
+        },
+        "proxy_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "reduce": {
+          "count": 132,
+          "max": 0.434752,
+          "min": 0.362016,
+          "p50": 0.36848,
+          "p95": 0.432
+        },
+        "return_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "return_pack": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "source_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        }
+      },
+      "event_count": 2688,
+      "events": {
+        "dgate_return": {
+          "count": 132,
+          "first_ns": 1787815470525683040,
+          "last_ns": 1787815470525687520
+        },
+        "dv_first": {
+          "count": 132,
+          "first_ns": 1787815470485436384,
+          "last_ns": 1787815470485437344
+        },
+        "dv_last": {
+          "count": 132,
+          "first_ns": 1787815470494900032,
+          "last_ns": 1787815470494900096
+        },
+        "dw1_end": {
+          "count": 132,
+          "first_ns": 1787815470551833056,
+          "last_ns": 1787815470552029088
+        },
+        "dw1_ready": {
+          "count": 132,
+          "first_ns": 1787815470537619392,
+          "last_ns": 1787815470537631520
+        },
+        "dw1_start": {
+          "count": 132,
+          "first_ns": 1787815470537619680,
+          "last_ns": 1787815470537631648
+        },
+        "dw2_end": {
+          "count": 132,
+          "first_ns": 1787815470537618944,
+          "last_ns": 1787815470537631168
+        },
+        "dw2_ready": {
+          "count": 132,
+          "first_ns": 1787815470525692896,
+          "last_ns": 1787815470525693344
+        },
+        "dw2_start": {
+          "count": 132,
+          "first_ns": 1787815470525694176,
+          "last_ns": 1787815470525695168
+        },
+        "dx_return_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815470506405312,
+          "last_ns": 1787815470506428000
+        },
+        "dx_return_local_completion": {
+          "count": 8,
+          "first_ns": 1787815470521141024,
+          "last_ns": 1787815470521204704
+        },
+        "dx_return_pack_start": {
+          "count": 132,
+          "first_ns": 1787815470505357440,
+          "last_ns": 1787815470505357632
+        },
+        "dx_source_relay": {
+          "count": 132,
+          "first_ns": 1787815470524324384,
+          "last_ns": 1787815470524324800
+        },
+        "dx_tile_ready": {
+          "count": 132,
+          "first_ns": 1787815470505352032,
+          "last_ns": 1787815470505352224
+        },
+        "dy_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815470479652800,
+          "last_ns": 1787815470479683328
+        },
+        "dy_local_completion": {
+          "count": 8,
+          "first_ns": 1787815470484612928,
+          "last_ns": 1787815470484653568
+        },
+        "dy_packet_ready": {
+          "count": 132,
+          "first_ns": 1787815470477602912,
+          "last_ns": 1787815470477610208
+        },
+        "dy_relay_end": {
+          "count": 132,
+          "first_ns": 1787815470485426464,
+          "last_ns": 1787815470485426656
+        },
+        "dy_relay_start": {
+          "count": 132,
+          "first_ns": 1787815470484657888,
+          "last_ns": 1787815470484658240
+        },
+        "kernel_enter": {
+          "count": 132,
+          "first_ns": 1787815470476863712,
+          "last_ns": 1787815470476864128
+        },
+        "reduce_end": {
+          "count": 132,
+          "first_ns": 1787815470552392704,
+          "last_ns": 1787815470552465408
+        },
+        "reduce_ready": {
+          "count": 132,
+          "first_ns": 1787815470552030400,
+          "last_ns": 1787815470552031104
+        },
+        "reduce_start": {
+          "count": 132,
+          "first_ns": 1787815470552030624,
+          "last_ns": 1787815470552031232
+        },
+        "remote_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815470484636512,
+          "last_ns": 1787815470484655584
+        },
+        "source_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815470524321856,
+          "last_ns": 1787815470524321856
+        },
+        "terminal": {
+          "count": 132,
+          "first_ns": 1787815470552494304,
+          "last_ns": 1787815470552506208
+        }
+      },
+      "generation": 811,
+      "overflow_events": 0,
+      "path": "world2.rank1.backward.json",
+      "phase": "backward",
+      "rank": 1
+    },
+    {
+      "durations_ms": {
+        "dispatch_issue_to_completion": {
+          "count": 8,
+          "max": 4.973952,
+          "min": 4.957184,
+          "p50": 4.968,
+          "p95": 4.973952
+        },
+        "dispatch_signal_to_relay": {
+          "count": 1,
+          "max": 0.033536,
+          "min": 0.033536,
+          "p50": 0.033536,
+          "p95": 0.033536
+        },
+        "dv": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw1": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw1_ready_to_start": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw2": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dw2_ready_to_start": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dx_return_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dy_issue_to_completion": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "dy_relay": {
+          "count": 0,
+          "max": 0.0,
+          "min": 0.0,
+          "p50": 0.0,
+          "p95": 0.0
+        },
+        "fc1": {
+          "count": 132,
+          "max": 10.640736,
+          "min": 10.055264,
+          "p50": 10.098272,
+          "p95": 10.570016
+        },
+        "kernel": {
+          "count": 132,
+          "max": 46.144224,
+          "min": 46.143808,
+          "p50": 46.144,
+          "p95": 46.144192
+        },
+        "proxy_relay": {
+          "count": 132,
+          "max": 0.706592,
+          "min": 0.706208,
+          "p50": 0.706432,
+          "p95": 0.706592
+        },
+        "reduce": {
+          "count": 132,
+          "max": 0.431232,
+          "min": 0.357344,
+          "p50": 0.365216,
+          "p95": 0.429472
+        },
+        "return_issue_to_completion": {
+          "count": 8,
+          "max": 14.799808,
+          "min": 14.784704,
+          "p50": 14.792512,
+          "p95": 14.799808
+        },
+        "return_pack": {
+          "count": 132,
+          "max": 0.854784,
+          "min": 0.854496,
+          "p50": 0.854688,
+          "p95": 0.854752
+        },
+        "source_relay": {
+          "count": 132,
+          "max": 1.38256,
+          "min": 1.382208,
+          "p50": 1.3824,
+          "p95": 1.382528
+        }
+      },
+      "event_count": 14488,
+      "events": {
+        "dispatch_local_completion": {
+          "count": 8,
+          "first_ns": 1787815470438343072,
+          "last_ns": 1787815470438381920
+        },
+        "dispatch_packet_ready": {
+          "count": 132,
+          "first_ns": 1787815470431410656,
+          "last_ns": 1787815470431415168
+        },
+        "fc1_first": {
+          "count": 132,
+          "first_ns": 1787815470439100448,
+          "last_ns": 1787815470439101312
+        },
+        "fc1_last": {
+          "count": 132,
+          "first_ns": 1787815470449156384,
+          "last_ns": 1787815470449741792
+        },
+        "fc2_tile_ready": {
+          "count": 12460,
+          "first_ns": 1787815470449225056,
+          "last_ns": 1787815470455925120
+        },
+        "gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815470433385888,
+          "last_ns": 1787815470433417152
+        },
+        "kernel_enter": {
+          "count": 132,
+          "first_ns": 1787815470430641152,
+          "last_ns": 1787815470430641536
+        },
+        "proxy_relay_end": {
+          "count": 132,
+          "first_ns": 1787815470439092256,
+          "last_ns": 1787815470439092480
+        },
+        "proxy_relay_start": {
+          "count": 132,
+          "first_ns": 1787815470438385856,
+          "last_ns": 1787815470438386080
+        },
+        "reduce_end": {
+          "count": 132,
+          "first_ns": 1787815470476682528,
+          "last_ns": 1787815470476756448
+        },
+        "reduce_ready": {
+          "count": 132,
+          "first_ns": 1787815470476324992,
+          "last_ns": 1787815470476325152
+        },
+        "reduce_start": {
+          "count": 132,
+          "first_ns": 1787815470476325120,
+          "last_ns": 1787815470476325280
+        },
+        "remote_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815470438347872,
+          "last_ns": 1787815470438383552
+        },
+        "return_gin_put_issue": {
+          "count": 8,
+          "first_ns": 1787815470457058208,
+          "last_ns": 1787815470457064384
+        },
+        "return_local_completion": {
+          "count": 8,
+          "first_ns": 1787815470471845984,
+          "last_ns": 1787815470471859040
+        },
+        "return_pack_end": {
+          "count": 132,
+          "first_ns": 1787815470457009920,
+          "last_ns": 1787815470457010144
+        },
+        "return_pack_start": {
+          "count": 132,
+          "first_ns": 1787815470456155264,
+          "last_ns": 1787815470456155552
+        },
+        "source_relay_end": {
+          "count": 132,
+          "first_ns": 1787815470476322336,
+          "last_ns": 1787815470476322560
+        },
+        "source_relay_start": {
+          "count": 132,
+          "first_ns": 1787815470474939968,
+          "last_ns": 1787815470474940160
+        },
+        "source_signal_observed": {
+          "count": 8,
+          "first_ns": 1787815470474858272,
+          "last_ns": 1787815470474937600
+        },
+        "terminal": {
+          "count": 132,
+          "first_ns": 1787815470476785312,
+          "last_ns": 1787815470476785440
+        },
+        "x_mtile_ready": {
+          "count": 132,
+          "first_ns": 1787815470439098304,
+          "last_ns": 1787815470439098528
+        }
+      },
+      "generation": 811,
+      "overflow_events": 0,
+      "path": "world2.rank1.forward.json",
+      "phase": "forward",
+      "rank": 1
+    }
+  ],
+  "schema": 1
+}

@@ -34,6 +34,7 @@
 #include <thread>
 
 #include "cuda/cuda_internal.hpp"
+#include "cuda/profiling/device_timeline.cuh"
 #include "cuda/testing/harnesses.hpp"
 #include "megamoe/api/errors.hpp"
 
@@ -489,6 +490,32 @@ struct GinWindowLayout {
   std::size_t total = 0;
 };
 
+#if MEGAMOE_DEVICE_TIMELINE
+struct TimelineAllocationLayout {
+  std::size_t counts = 0;
+  std::size_t overflow = 0;
+  std::size_t records = 0;
+  std::size_t total = 0;
+};
+
+TimelineAllocationLayout make_timeline_allocation_layout(
+    std::uint32_t max_ctas) {
+  TimelineAllocationLayout layout;
+  std::size_t cursor = 0;
+  layout.counts = append(cursor, max_ctas, sizeof(std::uint32_t),
+                         "timeline CTA counts");
+  layout.overflow = append(cursor, max_ctas, sizeof(std::uint32_t),
+                           "timeline CTA overflow");
+  layout.records = append(
+      cursor,
+      checked_mul(max_ctas, profiling::kEventsPerCta,
+                  "timeline records"),
+      sizeof(profiling::DeviceTimelineRecord), "timeline records");
+  layout.total = cursor;
+  return layout;
+}
+#endif
+
 GinWindowLayout make_gin_window_layout(
     const ActivationTransportPoolConfig &config) {
   GinWindowLayout layout;
@@ -801,6 +828,10 @@ enum class SlotState : std::uint8_t { Available, InUse, Quarantined };
 struct PoolSlot {
   void *device = nullptr;
   void *gin_window = nullptr;
+#if MEGAMOE_DEVICE_TIMELINE
+  void *forward_timeline = nullptr;
+  void *backward_timeline = nullptr;
+#endif
   TransportDeviceStatus *host_status = nullptr;
   TransportDeviceStatus *host_forward_status = nullptr;
   ProductionStatusRecord *host_production_status = nullptr;
@@ -845,10 +876,56 @@ const T *at(const void *base, std::size_t offset) {
       static_cast<const unsigned char *>(base) + offset);
 }
 
+#if MEGAMOE_DEVICE_TIMELINE
+profiling::DeviceTimelineContext make_timeline_context(
+    void *allocation, const TimelineAllocationLayout &layout,
+    std::uint32_t max_ctas, std::uint32_t rank,
+    profiling::TimelinePhase phase, std::uint64_t generation) {
+  profiling::DeviceTimelineContext context;
+  context.records =
+      at<profiling::DeviceTimelineRecord>(allocation, layout.records);
+  context.counts = at<std::uint32_t>(allocation, layout.counts);
+  context.overflow = at<std::uint32_t>(allocation, layout.overflow);
+  context.max_ctas = max_ctas;
+  context.capacity_per_cta = profiling::kEventsPerCta;
+  context.rank = rank;
+  context.phase = static_cast<std::uint32_t>(phase);
+  context.generation = generation;
+  return context;
+}
+
+void reset_timeline(const char *phase, void *allocation,
+                    const TimelineAllocationLayout &layout,
+                    std::uint32_t max_ctas, cudaStream_t stream,
+                    std::uint32_t rank, std::uint32_t world,
+                    std::uint64_t generation,
+                    const NcclSession &session) {
+  const auto reset_bytes = checked_size(
+      checked_mul(max_ctas, sizeof(std::uint32_t), "timeline count reset"),
+      "timeline count reset");
+  internal::throw_cuda(
+      phase,
+      cudaMemsetAsync(at<void>(allocation, layout.counts), 0, reset_bytes,
+                      stream),
+      rank, world, session.session().identity(), generation,
+      ExchangeKind::ExpertCounts, "reset device timeline counts");
+  internal::throw_cuda(
+      phase,
+      cudaMemsetAsync(at<void>(allocation, layout.overflow), 0, reset_bytes,
+                      stream),
+      rank, world, session.session().identity(), generation,
+      ExchangeKind::ExpertCounts, "reset device timeline overflow");
+}
+#endif
+
 struct ActivationPoolState {
   ActivationTransportPoolConfig config;
   Layout layout;
   GinWindowLayout gin_layout;
+#if MEGAMOE_DEVICE_TIMELINE
+  TimelineAllocationLayout timeline_layout;
+  std::uint32_t timeline_max_ctas = 0;
+#endif
   std::vector<std::byte> session_identity;
   std::uint32_t world = 0;
   CudaExecution execution;
@@ -928,6 +1005,16 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       if (slot.device)
         (void)cudaFree(slot.device);
+#if MEGAMOE_DEVICE_TIMELINE
+      if (slot.forward_timeline)
+        internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      if (slot.forward_timeline)
+        (void)cudaFree(slot.forward_timeline);
+      if (slot.backward_timeline)
+        internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      if (slot.backward_timeline)
+        (void)cudaFree(slot.backward_timeline);
+#endif
       if (slot.gin_window) {
         using MemFreeFn = ncclResult_t (*)(void *);
         const auto mem_free = reinterpret_cast<MemFreeFn>(
@@ -3416,6 +3503,8 @@ local_p2p_forward_megakernel(
     const __grid_constant__ CUtensorMap w2_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
+                          a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
@@ -3615,6 +3704,9 @@ local_p2p_forward_megakernel(
     // GIN's device DMA reads this window after the grid-wide producers have
     // populated it. A cooperative grid barrier orders CUDA threads but does
     // not by itself publish their stores to a system-scope device backend.
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPacketReady, GinDispatch,
+                            blockIdx.x < a.gin_context_count ? blockIdx.x : 0U,
+                            a.dispatch.sizes.packet_count, a.epoch);
     __threadfence_system();
     grid.sync();
   }
@@ -3662,6 +3754,10 @@ local_p2p_forward_megakernel(
           source_partition * a.max_tokens_per_rank + sequence_begin;
       const auto packet_count = last_packet - first_packet;
       const auto destination = static_cast<int>(remote_node);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, GinPutIssue, GinDispatch, context,
+                              packet_count * a.hidden *
+                                  sizeof(transport::BFloat16),
+                              a.epoch);
       gin.put(rail, destination, a.gin_window,
               a.gin_receive_header_offset +
                   receive_packet * sizeof(LocalP2pRouteHeader),
@@ -3700,6 +3796,8 @@ local_p2p_forward_megakernel(
                 (last_fanout - first_fanout) * a.hidden *
                     sizeof(transport::BFloat16));
       gin.waitCounter(ncclCoopThread{}, 0, 1);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
+                              GinDispatch, context, packet_count, a.epoch);
     }
     if (threadIdx.x == 0U)
       gin.resetCounter(0);
@@ -3719,6 +3817,8 @@ local_p2p_forward_megakernel(
       }
       if (incoming_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
+                              context, incoming_packets, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -3749,6 +3849,8 @@ local_p2p_forward_megakernel(
         window_bytes + a.gin_receive_fanout_offset);
     auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
         window_bytes + a.gin_receive_payload_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_signal_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
     const auto global_thread =
         static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -3827,6 +3929,8 @@ local_p2p_forward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
   }
 #endif
     if (threadIdx.x == 0 && dispatch_peer_rows != 0ULL)
@@ -3883,6 +3987,8 @@ local_p2p_forward_megakernel(
     status->dispatch_complete_clock = device_globaltimer_ns();
     status->fc1_start_clock = status->dispatch_complete_clock;
   }
+  MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
+                          a.dispatch.sizes.mtile_count, a.epoch);
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   if (threadIdx.x == 256U) {
@@ -3928,6 +4034,9 @@ local_p2p_forward_megakernel(
   __shared__ unsigned int claim_shared;
 #endif
   unsigned int task_in_chunk = kTaskChunk;
+#if MEGAMOE_DEVICE_TIMELINE
+  bool timeline_fc1_started = false;
+#endif
   while (!forward_cancelled(a)) {
     if (task_in_chunk == kTaskChunk) {
       if (threadIdx.x == 0)
@@ -3969,6 +4078,13 @@ local_p2p_forward_megakernel(
 #endif
     if (expert >= a.dispatch.sizes.owned_expert_count)
       break;
+#if MEGAMOE_DEVICE_TIMELINE
+    if (!timeline_fc1_started) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
+                              a.epoch);
+      timeline_fc1_started = true;
+    }
+#endif
     const auto row =
         a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
     const auto remaining_rows =
@@ -4061,6 +4177,8 @@ local_p2p_forward_megakernel(
   }
   if (threadIdx.x == 0)
     atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
+                          a.epoch);
   forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
 
   // FC1 transactions issued by this CTA are complete, so this CTA can reset
@@ -4175,6 +4293,8 @@ local_p2p_forward_megakernel(
       }
     }
     __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
+                            a.epoch);
     if (return_mblock_shared != 0U &&
         !remote_backend_enabled<StaticLocal>(a.use_socket)) {
       // Only lane 0 produces and consumes the peer-row audit count. Keeping
@@ -4252,6 +4372,8 @@ local_p2p_forward_megakernel(
     // persistent grid performs the NVLink gather/scatter; only the bounded GIN
     // context CTAs enqueue the batched rail puts.
     grid.sync();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackStart, GinReturn, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
     const auto first_local = a.node * a.local_world_size;
     if (blockIdx.x == 0U) {
       for (std::uint32_t local = threadIdx.x;
@@ -4330,6 +4452,8 @@ local_p2p_forward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackEnd, GinReturn, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
     if (blockIdx.x < a.gin_context_count) {
       const auto context = static_cast<std::uint32_t>(blockIdx.x);
       const ncclGin gin(a.gin_dev_comm, context);
@@ -4365,6 +4489,11 @@ local_p2p_forward_megakernel(
         }
         __syncthreads();
         if (threadIdx.x == 0U && last_return != first_return) {
+          MEGAMOE_TIMELINE_RECORD(
+              a.timeline, ReturnGinPutIssue, GinReturn, context,
+              (last_return - first_return) * a.hidden *
+                  sizeof(transport::BFloat16),
+              a.epoch);
           gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
                   a.gin_return_receive_offset +
                       first_return * a.hidden *
@@ -4391,6 +4520,8 @@ local_p2p_forward_megakernel(
       }
       if (threadIdx.x == 0U && return_puts != 0ULL)
         gin.waitCounter(ncclCoopThread{}, 0, return_puts);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
+                              context, return_puts, a.epoch);
       __syncthreads();
       unsigned long long outgoing_remote_packets = 0ULL;
       unsigned long long outgoing_remote_fanout = 0ULL;
@@ -4416,6 +4547,8 @@ local_p2p_forward_megakernel(
         }
         if (outgoing_remote_packets != 0ULL)
           gin.waitSignal(ncclCoopThread{}, 1, 1);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
+                                context, outgoing_remote_packets, a.epoch);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             phase(scheduler[2]);
         phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -4439,6 +4572,8 @@ local_p2p_forward_megakernel(
         gin_window_bytes + a.gin_return_receive_offset);
     auto *local_contribution = peer_at<transport::BFloat16>(
         a.local_base, a.contribution_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayStart, SourceRelay, 0U,
+                            a.dispatch.sizes.packet_count, a.epoch);
     const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
     for (std::uint64_t item = global_thread;
          item < a.dispatch.sizes.packet_count * packet_vectors;
@@ -4466,6 +4601,8 @@ local_p2p_forward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay, 0U,
+                            a.dispatch.sizes.route_count, a.epoch);
     if (blockIdx.x == 0U) {
       for (std::uint32_t destination = threadIdx.x;
            destination < a.world; destination += blockDim.x) {
@@ -4535,6 +4672,10 @@ local_p2p_forward_megakernel(
   constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
   const auto token_warp = warp % kWarpsPerToken;
   for (std::uint64_t token =
            static_cast<std::uint64_t>(blockIdx.x) * kTokensPerCta +
@@ -4594,6 +4735,8 @@ local_p2p_forward_megakernel(
   }
   if (lane == 0U)
     atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
   __syncthreads();
   grid.sync();
   forward_publish_progress(a, kForwardReduceComplete,
@@ -4627,6 +4770,7 @@ local_p2p_forward_megakernel(
     status->complete_clock = device_globaltimer_ns();
   }
   forward_publish_progress(a, kForwardTerminal, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 
 #include "cuda/backward/kernel_contract.cuh"
@@ -5121,6 +5265,8 @@ local_p2p_backward_megakernel(
     const __grid_constant__ CUtensorMap dw1_store_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
+                          a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
   auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler = peer_at<unsigned long long>(a.local_base,
@@ -5370,6 +5516,8 @@ local_p2p_backward_megakernel(
           descriptor.sequence_on_link, fanout_end - fanout_begin,
           descriptor.local_token_id, fanout_begin, 0, 0};
     }
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DyPacketReady, GinDispatch, 0U,
+                            a.dispatch.sizes.packet_count, a.epoch);
     __threadfence_system();
     grid.sync();
   }
@@ -5415,6 +5563,9 @@ local_p2p_backward_megakernel(
         const auto receive_packet = source_partition * a.max_tokens_per_rank +
                                     sequence_begin;
         const auto packet_count = last_packet - first_packet;
+        MEGAMOE_TIMELINE_RECORD(
+            a.timeline, DyGinPutIssue, GinDispatch, context,
+            packet_count * a.hidden * sizeof(transport::BFloat16), a.epoch);
         gin.put(rail, destination, a.gin_window,
                 a.gin_receive_header_offset +
                     receive_packet * sizeof(LocalP2pRouteHeader),
@@ -5464,6 +5615,8 @@ local_p2p_backward_megakernel(
                   packet_count * a.hidden *
                       sizeof(transport::BFloat16));
         gin.waitCounter(ncclCoopThread{}, 0, 1);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DyLocalCompletion, GinDispatch,
+                                context, packet_count, a.epoch);
     }
     if (threadIdx.x == 0U)
       gin.resetCounter(0);
@@ -5483,6 +5636,8 @@ local_p2p_backward_megakernel(
       }
       if (incoming_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
+                              context, incoming_packets, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -5508,6 +5663,8 @@ local_p2p_backward_megakernel(
         bytes + a.gin_receive_gate_offset);
     auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
         bytes + a.gin_receive_payload_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayStart, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_signal_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
     const auto global_thread =
         static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -5574,6 +5731,8 @@ local_p2p_backward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayEnd, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
   }
 #endif
   __threadfence_system();
@@ -5714,12 +5873,22 @@ local_p2p_backward_megakernel(
     status->dv_start_clock = device_globaltimer_ns();
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDvStarted, dv_tasks);
+#if MEGAMOE_DEVICE_TIMELINE
+  bool timeline_dv_started = false;
+#endif
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[1], 1ULL);
     __syncthreads();
     if (task_shared >= dv_tasks)
       break;
+#if MEGAMOE_DEVICE_TIMELINE
+    if (!timeline_dv_started) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DvFirst, Compute, 0U, task_shared,
+                              a.epoch);
+      timeline_dv_started = true;
+    }
+#endif
     const auto mblock = task_shared / dv_ntiles;
     const auto ntile = static_cast<std::uint32_t>(task_shared % dv_ntiles);
     const auto mapping =
@@ -5932,6 +6101,8 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dv_complete_clock = device_globaltimer_ns();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, DvLast, Compute, 0U, dv_tasks,
+                          a.epoch);
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDvComplete, dv_tasks);
 
@@ -6074,6 +6245,8 @@ local_p2p_backward_megakernel(
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_complete_clock = device_globaltimer_ns();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, DxTileReady, Compute, 0U, dx_tasks,
+                          a.epoch);
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDxComplete, dx_tasks);
 
@@ -6136,6 +6309,8 @@ local_p2p_backward_megakernel(
         bytes + a.gin_return_staging_offset);
     auto *return_gate_staging = reinterpret_cast<float *>(
         bytes + a.gin_return_gate_staging_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DxReturnPackStart, GinReturn, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
     const auto global_thread =
         static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -6245,6 +6420,11 @@ local_p2p_backward_megakernel(
       }
       __syncthreads();
       if (threadIdx.x == 0U && last_return != first_return) {
+          MEGAMOE_TIMELINE_RECORD(
+              a.timeline, DxReturnGinPutIssue, GinReturn, context,
+              (last_return - first_return) * a.hidden *
+                  sizeof(transport::BFloat16),
+              a.epoch);
           gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
                   a.gin_return_receive_offset +
                       first_return * a.hidden *
@@ -6282,6 +6462,8 @@ local_p2p_backward_megakernel(
     }
     if (threadIdx.x == 0U && return_packets != 0ULL)
       gin.waitCounter(ncclCoopThread{}, 0, return_packets);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DxReturnLocalCompletion, GinReturn,
+                            context, return_packets, a.epoch);
     __syncthreads();
     // The FP32 scalar return is deliberately re-issued after local completion
     // of the payload batch. This gives the remote acquire a distinct terminal
@@ -6350,6 +6532,8 @@ local_p2p_backward_megakernel(
       outgoing_remote_packets = end - begin;
       if (outgoing_remote_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 1, 2);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
+                              context, outgoing_remote_packets, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -6371,6 +6555,8 @@ local_p2p_backward_megakernel(
         bytes + a.gin_return_receive_offset);
     auto *return_gate_receive = reinterpret_cast<float *>(
         bytes + a.gin_return_gate_receive_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DxSourceRelay, SourceRelay, 0U,
+                            a.dispatch.sizes.packet_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
     const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
     const auto global_thread =
@@ -6419,6 +6605,8 @@ local_p2p_backward_megakernel(
 #endif
       }
     }
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DGateReturn, SourceRelay, 0U,
+                            a.dispatch.sizes.route_count, a.epoch);
     __threadfence_system();
     grid.sync();
     if (blockIdx.x == 0U && threadIdx.x == 0U) {
@@ -6443,12 +6631,24 @@ local_p2p_backward_megakernel(
   // 128x128 accumulator tile directly into the parameter layout [H,I].
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw2Started, dw2_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2Ready, Compute, 0U, dw2_tasks,
+                          a.epoch);
+#if MEGAMOE_DEVICE_TIMELINE
+  bool timeline_dw2_started = false;
+#endif
   while (true) {
     if (threadIdx.x == 0)
       task_shared = atomicAdd(&scheduler[3], 1ULL);
     __syncthreads();
     if (task_shared >= dw2_tasks)
       break;
+#if MEGAMOE_DEVICE_TIMELINE
+    if (!timeline_dw2_started) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2Start, Compute, 0U, task_shared,
+                              a.epoch);
+      timeline_dw2_started = true;
+    }
+#endif
     auto task = task_shared;
     const auto per_expert = dw2_mtiles * dw2_ntiles;
     const auto expert = static_cast<std::uint32_t>(task / per_expert);
@@ -6531,6 +6731,8 @@ local_p2p_backward_megakernel(
 #endif
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2End, Compute, 0U, dw2_tasks,
+                          a.epoch);
 
   // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
   // preceding general dW2 loop, the accumulator is lexically confined to the
@@ -6566,6 +6768,9 @@ local_p2p_backward_megakernel(
   __syncthreads();
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Ready, Compute, 0U, dw1_tasks,
+                          a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Start, Compute, 0U, 0ULL, a.epoch);
   if (dw_warpgroup >= 2U) {
     cutlass::arch::warpgroup_reg_dealloc<48>();
     std::uint32_t dw_pipeline = 0U;
@@ -6735,6 +6940,8 @@ local_p2p_backward_megakernel(
   }
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks,
+                          a.epoch);
   grid.sync();
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
@@ -6758,8 +6965,14 @@ local_p2p_backward_megakernel(
 #endif
   }
   if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
     backward_reduce_token_slice(a, dx_return, dx_combined, blockIdx.x,
                                 gridDim.x);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0)
       status->dx_reduce_complete_clock = device_globaltimer_ns();
@@ -6838,6 +7051,7 @@ local_p2p_backward_megakernel(
     if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
       backward_publish_progress(a, kBackwardTerminal, a.epoch);
   }
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 
 } // namespace
@@ -7301,6 +7515,106 @@ struct BackwardStorageHashAccess {
 struct LocalCudaP2pBackwardMegaKernel::Impl {
   std::shared_ptr<ActivationMegaKernelBackendState> backend;
 };
+
+#if MEGAMOE_DEVICE_TIMELINE
+namespace {
+profiling::DeviceTimelineSnapshot download_device_timeline(
+    const std::shared_ptr<ActivationPoolState> &pool,
+    const std::shared_ptr<SlotLease> &lease, void *allocation,
+    cudaEvent_t completion, const ActivationTransportExpectation &identity,
+    profiling::TimelinePhase phase) {
+  if (!pool || !lease || lease->index >= pool->slots.size() || !allocation)
+    transport_error(NotifyErrorCode::InvalidHandle, "device-timeline",
+                    "handle/storage", identity.rank, "valid", "empty");
+  internal::throw_cuda(
+      "device-timeline", cudaEventSynchronize(completion), identity.rank,
+      identity.world, "timeline", identity.generation,
+      ExchangeKind::ExpertCounts, "wait timeline producer completion");
+  const auto max_ctas = pool->timeline_max_ctas;
+  std::vector<std::uint32_t> counts(max_ctas);
+  std::vector<std::uint32_t> overflow(max_ctas);
+  const auto count_bytes = checked_size(
+      checked_mul(max_ctas, sizeof(std::uint32_t), "timeline count download"),
+      "timeline count download");
+  internal::throw_cuda(
+      "device-timeline",
+      cudaMemcpy(counts.data(),
+                 at<const void>(allocation, pool->timeline_layout.counts),
+                 count_bytes, cudaMemcpyDeviceToHost),
+      identity.rank, identity.world, "timeline", identity.generation,
+      ExchangeKind::ExpertCounts, "download timeline counts");
+  internal::throw_cuda(
+      "device-timeline",
+      cudaMemcpy(overflow.data(),
+                 at<const void>(allocation, pool->timeline_layout.overflow),
+                 count_bytes, cudaMemcpyDeviceToHost),
+      identity.rank, identity.world, "timeline", identity.generation,
+      ExchangeKind::ExpertCounts, "download timeline overflow");
+  const auto record_count = checked_mul(max_ctas, profiling::kEventsPerCta,
+                                        "timeline record download");
+  std::vector<profiling::DeviceTimelineRecord> raw(
+      checked_size(record_count, "timeline record vector"));
+  const auto record_bytes = checked_size(
+      checked_mul(record_count, sizeof(profiling::DeviceTimelineRecord),
+                  "timeline record bytes"),
+      "timeline record bytes");
+  internal::throw_cuda(
+      "device-timeline",
+      cudaMemcpy(raw.data(),
+                 at<const void>(allocation, pool->timeline_layout.records),
+                 record_bytes, cudaMemcpyDeviceToHost),
+      identity.rank, identity.world, "timeline", identity.generation,
+      ExchangeKind::ExpertCounts, "download timeline records");
+  profiling::DeviceTimelineSnapshot result;
+  result.rank = identity.rank;
+  result.generation = identity.generation;
+  result.phase = phase;
+  result.max_ctas = max_ctas;
+  result.capacity_per_cta = profiling::kEventsPerCta;
+  for (std::uint32_t cta = 0; cta < max_ctas; ++cta) {
+    result.overflow_events += overflow[cta];
+    const auto stored = std::min(counts[cta], profiling::kEventsPerCta);
+    const auto begin = raw.begin() +
+                       static_cast<std::ptrdiff_t>(cta) *
+                           profiling::kEventsPerCta;
+    result.records.insert(result.records.end(), begin, begin + stored);
+  }
+  std::stable_sort(result.records.begin(), result.records.end(),
+                   [](const auto &left, const auto &right) {
+                     if (left.timestamp_ns != right.timestamp_ns)
+                       return left.timestamp_ns < right.timestamp_ns;
+                     if (left.cta != right.cta)
+                       return left.cta < right.cta;
+                     return left.metadata < right.metadata;
+                   });
+  return result;
+}
+} // namespace
+
+profiling::DeviceTimelineSnapshot testing::download_forward_device_timeline(
+    const DeviceForwardHandle &handle) {
+  if (!handle.impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "device-timeline",
+                    "Forward handle", 0, "valid", "empty");
+  const auto &impl = *handle.impl_;
+  const auto &slot = impl.pool->slots[impl.slot->index];
+  return download_device_timeline(
+      impl.pool, impl.slot, slot.forward_timeline, slot.forward_complete,
+      impl.identity, profiling::TimelinePhase::Forward);
+}
+
+profiling::DeviceTimelineSnapshot testing::download_backward_device_timeline(
+    const DeviceBackwardHandle &handle) {
+  if (!handle.impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "device-timeline",
+                    "Backward handle", 0, "valid", "empty");
+  const auto &impl = *handle.impl_;
+  const auto &slot = impl.pool->slots[impl.slot->index];
+  return download_device_timeline(
+      impl.pool, impl.slot, slot.backward_timeline, slot.complete,
+      impl.identity, profiling::TimelinePhase::Backward);
+}
+#endif
 
 std::uint32_t ForwardWeightLease::owned_experts() const {
   if (!impl_)
@@ -8893,6 +9207,25 @@ ActivationTransportResourcePool make_activation_transport_pool(
                        session.world_size(), session.identity(),
                        session.generation(), ExchangeKind::ExpertCounts,
                        "cudaSetDevice");
+#if MEGAMOE_DEVICE_TIMELINE
+  cudaDeviceProp timeline_device_properties{};
+  internal::throw_cuda(
+      "transport-pool-create",
+      cudaGetDeviceProperties(&timeline_device_properties,
+                              static_cast<int>(state->device)),
+      0, session.world_size(), session.identity(), session.generation(),
+      ExchangeKind::ExpertCounts,
+      "cudaGetDeviceProperties(device timeline)");
+  if (timeline_device_properties.multiProcessorCount <= 0)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "transport-pool-create", "timeline CTA capacity", 0,
+                    "positive SM count",
+                    std::to_string(timeline_device_properties.multiProcessorCount));
+  state->timeline_max_ctas =
+      static_cast<std::uint32_t>(timeline_device_properties.multiProcessorCount);
+  state->timeline_layout =
+      make_timeline_allocation_layout(state->timeline_max_ctas);
+#endif
   state->slots.resize(config.max_inflight_generations);
   try {
     internal::throw_cuda(
@@ -8922,6 +9255,39 @@ ActivationTransportResourcePool make_activation_transport_pool(
             ExchangeKind::ExpertCounts, "ncclMemAlloc(GIN window slot)");
       }
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+#if MEGAMOE_DEVICE_TIMELINE
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaMalloc(&slot.forward_timeline, state->timeline_layout.total),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts, "cudaMalloc(Forward timeline)");
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+      if (config.enable_backward) {
+        internal::throw_cuda(
+            "transport-pool-create",
+            cudaMalloc(&slot.backward_timeline, state->timeline_layout.total),
+            0, session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts, "cudaMalloc(Backward timeline)");
+        internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+      }
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaMemsetAsync(slot.forward_timeline, 0,
+                          state->timeline_layout.total,
+                          internal::checked_execution_state(execution)->stream),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "one-time initialize Forward timeline");
+      if (slot.backward_timeline)
+        internal::throw_cuda(
+            "transport-pool-create",
+            cudaMemsetAsync(slot.backward_timeline, 0,
+                            state->timeline_layout.total,
+                            internal::checked_execution_state(execution)->stream),
+            0, session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts,
+            "one-time initialize Backward timeline");
+#endif
       internal::throw_cuda(
           "transport-pool-create",
           cudaMemsetAsync(slot.device, 0, state->layout.total,
@@ -9158,6 +9524,15 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
                       "pool compute plus GIN bytes"),
           sizeof(std::uint64_t), "pool slot device bytes"),
       state->slots.size(), "pool device bytes");
+#if MEGAMOE_DEVICE_TIMELINE
+  const auto timeline_phases = state->config.enable_backward ? 2ULL : 1ULL;
+  result.device_bytes = checked_add(
+      result.device_bytes,
+      checked_mul(checked_mul(state->timeline_layout.total, timeline_phases,
+                              "pool timeline phase bytes"),
+                  state->slots.size(), "pool timeline bytes"),
+      "pool device plus timeline bytes");
+#endif
   result.compute_device_bytes = checked_mul(
       state->layout.total, state->slots.size(), "pool compute device bytes");
   result.gin_registered_bytes = checked_mul(
@@ -11216,6 +11591,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "clear forward status");
+#if MEGAMOE_DEVICE_TIMELINE
+  reset_timeline("forward-run", slot.forward_timeline,
+                 state->timeline_layout, state->timeline_max_ctas,
+                 exec->stream, id.calling_rank, id.world_size,
+                 id.generation, backend->session);
+#endif
 
   // Notify has already completed the rank-wide generation agreement on this
   // communicator.  The IPC team and per-slot peer mappings are session-static,
@@ -11293,6 +11674,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
+#if MEGAMOE_DEVICE_TIMELINE
+  args.timeline = make_timeline_context(
+      slot.forward_timeline, state->timeline_layout,
+      state->timeline_max_ctas, id.calling_rank,
+      profiling::TimelinePhase::Forward, id.generation);
+#endif
 #if MEGAMOE_BUILD_TESTING
   if (const auto *fault_rank =
           std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK")) {
@@ -12361,6 +12748,13 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       ExchangeKind::ExpertCounts,
       "initialize Backward owner signals and peer setup epoch");
 
+#if MEGAMOE_DEVICE_TIMELINE
+  reset_timeline("backward-run", slot.backward_timeline,
+                 state->timeline_layout, state->timeline_max_ctas,
+                 exec->stream, id.calling_rank, id.world_size,
+                 id.generation, backend->session);
+#endif
+
   BackwardKernelArgs args{};
   args.dispatch = view;
   args.dy_input = dy_lease.pointer;
@@ -12385,6 +12779,12 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
+#if MEGAMOE_DEVICE_TIMELINE
+  args.timeline = make_timeline_context(
+      slot.backward_timeline, state->timeline_layout,
+      state->timeline_max_ctas, id.calling_rank,
+      profiling::TimelinePhase::Backward, id.generation);
+#endif
 #if MEGAMOE_BUILD_TESTING
   if (const auto *fault_rank =
           std::getenv("MEGAMOE_INTERNAL_BACKWARD_STATUS_FAULT_RANK")) {

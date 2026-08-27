@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda/device_notify_internal.hpp"
+#include "cuda/profiling/device_timeline_types.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #define private public
 #include "megamoe/cuda/activation_transport.hpp"
@@ -244,6 +245,12 @@ download_activation_output_for_validation(
     const DeviceActivationTransportHandle &, const CudaExecution &);
 
 namespace testing {
+#if MEGAMOE_DEVICE_TIMELINE
+profiling::DeviceTimelineSnapshot
+download_forward_device_timeline(const DeviceForwardHandle &);
+profiling::DeviceTimelineSnapshot
+download_backward_device_timeline(const DeviceBackwardHandle &);
+#endif
 struct GinPutSignalProbeResult {
   std::uint64_t payload_bytes = 0;
   std::uint32_t rail_rank = 0;

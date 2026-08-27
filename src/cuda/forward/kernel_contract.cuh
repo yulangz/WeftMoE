@@ -55,6 +55,9 @@ struct ForwardKernelArgs {
   std::size_t production_error_records_offset;
   const unsigned long long *cancel_epoch;
   int injected_status_error_rank = -1;
+#if MEGAMOE_DEVICE_TIMELINE
+  profiling::DeviceTimelineContext timeline;
+#endif
 #if MEGAMOE_DEBUG_VALIDATE
   unsigned long long *progress;
 #endif

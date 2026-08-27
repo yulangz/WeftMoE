@@ -73,6 +73,9 @@ struct BackwardKernelArgs {
   std::uint32_t progress_experts;
   bool use_forward_cache;
   int injected_status_error_rank = -1;
+#if MEGAMOE_DEVICE_TIMELINE
+  profiling::DeviceTimelineContext timeline;
+#endif
 #if MEGAMOE_DEBUG_VALIDATE
   std::size_t debug_dv_offset;
   std::size_t debug_coverage_offset;

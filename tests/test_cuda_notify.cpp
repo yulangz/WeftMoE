@@ -32,6 +32,51 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#if MEGAMOE_DEVICE_TIMELINE
+void write_device_timeline(
+    const megamoe::cuda::profiling::DeviceTimelineSnapshot &snapshot,
+    const std::string &prefix) {
+  const auto phase =
+      snapshot.phase == megamoe::cuda::profiling::TimelinePhase::Forward
+          ? "forward"
+          : "backward";
+  const auto path = prefix + ".rank" + std::to_string(snapshot.rank) + "." +
+                    phase + ".json";
+  std::ofstream output(path, std::ios::trunc);
+  if (!output)
+    throw std::runtime_error("cannot create device timeline: " + path);
+  output << "{\"schema\":" << snapshot.schema_version
+         << ",\"rank\":" << snapshot.rank
+         << ",\"generation\":" << snapshot.generation
+         << ",\"phase\":\"" << phase << "\""
+         << ",\"max_ctas\":" << snapshot.max_ctas
+         << ",\"capacity_per_cta\":" << snapshot.capacity_per_cta
+         << ",\"overflow_events\":" << snapshot.overflow_events
+         << ",\"events\":[";
+  for (std::size_t index = 0; index < snapshot.records.size(); ++index) {
+    const auto &event = snapshot.records[index];
+    if (index != 0)
+      output << ',';
+    output << "{\"timestamp_ns\":" << event.timestamp_ns
+           << ",\"generation\":" << event.generation
+           << ",\"rank\":" << event.rank << ",\"cta\":" << event.cta
+           << ",\"channel\":" << event.channel
+           << ",\"phase\":" << ((event.metadata >> 24U) & 0xffU)
+           << ",\"role\":" << ((event.metadata >> 16U) & 0xffU)
+           << ",\"event\":" << (event.metadata & 0xffffU)
+           << ",\"arg0\":" << event.arg0 << ",\"arg1\":" << event.arg1
+           << '}';
+  }
+  output << "]}\n";
+  if (!output)
+    throw std::runtime_error("failed writing device timeline: " + path);
+  std::cout << "DEVICE_TIMELINE rank=" << snapshot.rank
+            << " phase=" << phase << " events=" << snapshot.records.size()
+            << " overflow=" << snapshot.overflow_events
+            << " path=" << path << std::endl;
+}
+#endif
+
 void require(bool condition, const std::string &message) {
   if (!condition)
     throw std::runtime_error(message);
@@ -2894,6 +2939,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
            megamoe::cuda::BackwardWeightGradientDType::BFloat16},
           options);
       const auto backward_call_end = Clock::now();
+#if MEGAMOE_DEVICE_TIMELINE
+      if (validation_repeat &&
+          std::getenv("MEGAMOE_DEVICE_TIMELINE_PREFIX") != nullptr &&
+          repeat == rounds) {
+        const std::string prefix =
+            std::getenv("MEGAMOE_DEVICE_TIMELINE_PREFIX");
+        write_device_timeline(
+            megamoe::cuda::testing::download_forward_device_timeline(
+                forward_handle),
+            prefix);
+        write_device_timeline(
+            megamoe::cuda::testing::download_backward_device_timeline(
+                backward_handle),
+            prefix);
+      }
+#endif
       if (validation_repeat) {
         const auto hashes =
             megamoe::cuda::testing::hash_backward_storage_for_validation(

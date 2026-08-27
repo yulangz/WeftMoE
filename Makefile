@@ -14,6 +14,7 @@ CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 override CXXFLAGS += -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
+MEGAMOE_DEVICE_TIMELINE ?= 0
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
@@ -40,6 +41,8 @@ PUBLIC_HEADERS := \
 
 CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_SHARED=1
 CUDA_CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_SHARED=1
+CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
+CUDA_CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
 
 LIB_SOURCES := \
 	src/cuda/control_protocol.cpp \
@@ -96,7 +99,9 @@ $(BUILD_DIR)/src/cuda/activation_transport.o \
 $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
 	src/cuda/forward/runtime_shape_fallback.cuh \
-	src/cuda/backward/kernel_contract.cuh
+	src/cuda/backward/kernel_contract.cuh \
+	src/cuda/profiling/device_timeline.cuh \
+	src/cuda/profiling/device_timeline_types.hpp
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 

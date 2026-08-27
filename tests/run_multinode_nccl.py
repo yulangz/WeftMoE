@@ -392,6 +392,16 @@ def environment_overrides(args):
         "MEGAMOE_GATE_MODE",
         "MEGAMOE_RUNTIME_HIDDEN",
         "MEGAMOE_RUNTIME_INTERMEDIATE",
+        "MEGAMOE_DEVICE_TIMELINE_PREFIX",
+        "NCCL_IB_HCA",
+        "NCCL_IB_GID_INDEX",
+        "NCCL_IB_TC",
+        "NCCL_IB_QPS_PER_CONNECTION",
+        "NCCL_IB_SPLIT_DATA_ON_QPS",
+        "NCCL_IB_PCI_RELAXED_ORDERING",
+        "NCCL_NET_GDR_LEVEL",
+        "NCCL_CROSS_NIC",
+        "NCCL_SOCKET_FAMILY",
     ):
         if key in os.environ:
             overrides[key] = os.environ[key]

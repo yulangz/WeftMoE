@@ -30,6 +30,11 @@ expectations.
   for the same main-shape kernel in world 1. Multi-process replay was not used
   because pausing one process independently invalidates the live peer data-plane
   timing and progress assumptions.
+- `gin_device_timeline_world2_20260827.json` and
+  `gin_device_timeline_world16_20260827.json` are `%globaltimer` summaries for
+  the pre-streaming GIN Forward/Backward baseline. Timestamps are only
+  subtracted within one GPU; the world-16 data proves that the roughly 352 MB
+  Forward and dX returns start after compute and each occupy about 14.8 ms.
 
 The optimized capture improves kernel duration from 25.349 to 19.432 ms, SM
 throughput from 42.37% to 55.97%, and DRAM throughput from 48.87% to 66.55%.
