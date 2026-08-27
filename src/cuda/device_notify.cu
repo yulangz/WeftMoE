@@ -228,6 +228,7 @@ struct Layout {
   std::size_t expert_id = 0;
   std::size_t local_offset = 0;
   std::size_t route_dst_row = 0;
+  std::size_t route_dst_mtile = 0;
   std::size_t route_dst_rank = 0;
   std::size_t route_dst_node = 0;
   std::size_t route_dst_local_rank = 0;
@@ -240,6 +241,7 @@ struct Layout {
   std::size_t materialization_status = 0;
   std::size_t expert_total = 0;
   std::size_t expert_base = 0;
+  std::size_t expert_tile_base = 0;
   std::size_t expert_capacity = 0;
   std::size_t workspace_capacity = 0;
   std::size_t owned_expert_ids = 0;
@@ -284,6 +286,8 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
   layout.expert_id = append_region(cursor, routes, sizeof(std::uint32_t), "expert_id");
   layout.local_offset = append_region(cursor, routes, sizeof(std::uint64_t), "local_offset");
   layout.route_dst_row = append_region(cursor, routes, sizeof(std::uint64_t), "route_dst_row");
+  layout.route_dst_mtile = append_region(cursor, routes, sizeof(std::uint32_t),
+                                         "route_dst_mtile");
   layout.route_dst_rank = append_region(cursor, routes, sizeof(std::uint32_t), "route_dst_rank");
   layout.route_dst_node = append_region(cursor, routes, sizeof(std::uint32_t), "route_dst_node");
   layout.route_dst_local_rank = append_region(cursor, routes, sizeof(std::uint32_t), "route_dst_local_rank");
@@ -300,6 +304,8 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
                                       sizeof(std::uint64_t), "expert_total");
   layout.expert_base = append_region(cursor, plan.num_experts,
                                      sizeof(std::uint64_t), "expert_base");
+  layout.expert_tile_base = append_region(
+      cursor, plan.num_experts, sizeof(std::uint64_t), "expert_tile_base");
   layout.expert_capacity = append_region(cursor, plan.num_experts,
                                          sizeof(std::uint64_t),
                                          "expert_capacity");
@@ -549,7 +555,9 @@ struct DeviceMaterializeArgs {
   const std::uint64_t *masks;
   std::uint64_t *expert_total;
   std::uint64_t *expert_base;
+  std::uint64_t *expert_tile_base;
   std::uint64_t *route_dst_row;
+  std::uint32_t *route_dst_mtile;
   std::uint32_t *owned_expert_ids;
   std::uint64_t *owned_expert_count;
   std::uint64_t *owned_expert_prefix;
@@ -934,13 +942,18 @@ materialize_expert_prefix_kernel(DeviceMaterializeArgs a) {
     return;
   const auto owner = a.expert_to_rank[expert];
   unsigned long long destination_partial = 0;
+  unsigned long long destination_tile_partial = 0;
   unsigned long long owned_prefix_partial = 0;
   unsigned long long tile_prefix_partial = 0;
   unsigned long long owned_index_partial = 0;
   for (std::uint32_t prior = threadIdx.x; prior < expert;
        prior += kThreads) {
-    if (a.expert_to_rank[prior] == owner)
+    if (a.expert_to_rank[prior] == owner) {
       destination_partial += a.expert_total[prior];
+      const auto count = a.expert_total[prior];
+      destination_tile_partial +=
+          count / a.m_tile + (count % a.m_tile != 0);
+    }
     if (a.expert_to_rank[prior] == a.rank) {
       ++owned_index_partial;
       owned_prefix_partial += a.expert_total[prior];
@@ -952,6 +965,9 @@ materialize_expert_prefix_kernel(DeviceMaterializeArgs a) {
   const auto destination_prefix =
       BlockReduce(reduce_storage).Sum(destination_partial);
   __syncthreads();
+  const auto destination_tile_prefix =
+      BlockReduce(reduce_storage).Sum(destination_tile_partial);
+  __syncthreads();
   const auto owned_prefix =
       BlockReduce(reduce_storage).Sum(owned_prefix_partial);
   __syncthreads();
@@ -961,6 +977,7 @@ materialize_expert_prefix_kernel(DeviceMaterializeArgs a) {
   __syncthreads();
   if (threadIdx.x == 0) {
     a.expert_base[expert] = destination_prefix;
+    a.expert_tile_base[expert] = destination_tile_prefix;
     if (owner == a.rank) {
       a.owned_expert_ids[owned_index] = expert;
       a.owned_expert_count[owned_index] = a.expert_total[expert];
@@ -1065,6 +1082,15 @@ __global__ void materialize_routes_kernel(DeviceMaterializeArgs a) {
   const auto row =
       a.expert_base[expert] + source_prefix + a.local_offset[route];
   a.route_dst_row[route] = row;
+  const auto destination_tile =
+      a.expert_tile_base[expert] +
+      (row - a.expert_base[expert]) / a.m_tile;
+  if (destination_tile > UINT32_MAX) {
+    materialization_fail_once(a.status, MaterializationError::OutputCapacity,
+                              43, UINT32_MAX, destination_tile);
+    return;
+  }
+  a.route_dst_mtile[route] = static_cast<std::uint32_t>(destination_tile);
   a.reverse_routes[route] = DeviceReverseRouteRecord{
       route / a.top_k, row, a.rank,
       static_cast<std::uint32_t>(route % a.top_k), expert,
@@ -1127,7 +1153,7 @@ __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
       continue;
     a.packet_fanout[output++] = DeviceFanoutRecord{
         a.route_dst_row[route], slot, a.route_dst_local[route],
-        a.expert_id[route], 0};
+        a.expert_id[route], a.route_dst_mtile[route]};
   }
 }
 
@@ -3070,6 +3096,8 @@ CudaNotifyPreflight CudaNotifyOperation::wait_preflight() {
   result->device.expert_id = make_lease(state, state->device_layout.expert_id, route_width);
   result->device.local_offset = make_lease(state, state->device_layout.local_offset, route_width);
   result->device.route_dst_row = make_lease(state, state->device_layout.route_dst_row, route_width);
+  result->device.route_dst_mtile =
+      make_lease(state, state->device_layout.route_dst_mtile, route_width);
   result->device.route_dst_rank = make_lease(state, state->device_layout.route_dst_rank, route_width);
   result->device.route_dst_node = make_lease(state, state->device_layout.route_dst_node, route_width);
   result->device.route_dst_local_rank = make_lease(state, state->device_layout.route_dst_local_rank, route_width);
@@ -3427,8 +3455,12 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   zero(dl.expert_total, plan.num_experts, sizeof(std::uint64_t),
        "expert total");
   zero(dl.expert_base, plan.num_experts, sizeof(std::uint64_t), "expert base");
+  zero(dl.expert_tile_base, plan.num_experts, sizeof(std::uint64_t),
+       "expert tile base");
   zero(dl.route_dst_row, plan.route_count, sizeof(std::uint64_t),
        "route dst row");
+  zero(dl.route_dst_mtile, plan.route_count, sizeof(std::uint32_t),
+       "route dst mtile");
   zero(dl.owned_expert_ids, plan.num_experts, sizeof(std::uint32_t),
        "owned experts");
   zero(dl.owned_expert_count, plan.num_experts, sizeof(std::uint64_t),
@@ -3511,7 +3543,9 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   args.masks = at<const std::uint64_t>(base, dl.masks);
   args.expert_total = at<std::uint64_t>(base, dl.expert_total);
   args.expert_base = at<std::uint64_t>(base, dl.expert_base);
+  args.expert_tile_base = at<std::uint64_t>(base, dl.expert_tile_base);
   args.route_dst_row = at<std::uint64_t>(base, dl.route_dst_row);
+  args.route_dst_mtile = at<std::uint32_t>(base, dl.route_dst_mtile);
   args.owned_expert_ids = at<std::uint32_t>(base, dl.owned_expert_ids);
   args.owned_expert_count = at<std::uint64_t>(base, dl.owned_expert_count);
   args.owned_expert_prefix = at<std::uint64_t>(base, dl.owned_expert_prefix);
@@ -4119,6 +4153,53 @@ ActivationTransportBridge::view(DeviceDispatchConsumerLease &consumer) {
     invalid("phase=activation-transport-view, field=consumer, rank=n/a, "
             "expected=Acquired, actual=invalid");
   return consumer.impl_->kernel_view();
+}
+
+DispatchWaveKernelView
+ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
+  if (!consumer.impl_ ||
+      consumer.impl_->state != DeviceDispatchConsumerState::Acquired)
+    invalid("phase=activation-wave-view, field=consumer, rank=n/a, "
+            "expected=Acquired, actual=invalid");
+  const auto &owner = consumer.impl_->owner;
+  if (!owner.impl_ || !consumer.impl_->workspace ||
+      consumer.impl_->workspace->epoch != consumer.impl_->epoch)
+    invalid("phase=activation-wave-view, field=owner/epoch, rank=n/a, "
+            "expected=live matching dispatch owner, actual=invalid");
+  auto exec = internal::checked_execution_state(consumer.impl_->execution);
+  const auto checked = [&](const DeviceBufferLease &lease,
+                           const char *field) -> const void * {
+    const auto storage = internal::CudaDeviceLeaseAccess::checked(
+        lease, exec->device);
+    if (!storage || !storage->pointer)
+      invalid(std::string("phase=activation-wave-view, field=") + field +
+              ", rank=" +
+              std::to_string(consumer.impl_->identity.calling_rank) +
+              ", expected=live device storage, actual=empty");
+    return storage->pointer;
+  };
+  const auto &device = owner.impl_->device;
+  DispatchWaveKernelView view{};
+  view.wave_count = owner.impl_->dispatch_wave_count;
+  view.packet_order = static_cast<const std::uint64_t *>(
+      checked(device.dispatch_wave_packet_order, "packet_order"));
+  view.offsets = static_cast<const std::uint64_t *>(
+      checked(device.dispatch_wave_offsets, "offsets"));
+  view.destination_node = static_cast<const std::uint32_t *>(
+      checked(device.dispatch_wave_destination_node, "destination_node"));
+  view.channel = static_cast<const std::uint32_t *>(
+      checked(device.dispatch_wave_channel, "channel"));
+  view.first_primary_tile = static_cast<const std::uint64_t *>(checked(
+      device.dispatch_wave_first_primary_tile, "first_primary_tile"));
+  view.last_primary_tile = static_cast<const std::uint64_t *>(checked(
+      device.dispatch_wave_last_primary_tile, "last_primary_tile"));
+  view.packet_count = static_cast<const std::uint64_t *>(
+      checked(device.dispatch_wave_packet_count, "packet_count"));
+  view.descriptor_bytes = static_cast<const std::uint64_t *>(
+      checked(device.dispatch_wave_payload_bytes, "descriptor_bytes"));
+  view.route_dst_mtile = static_cast<const std::uint32_t *>(
+      checked(device.route_dst_mtile, "route_dst_mtile"));
+  return view;
 }
 
 const float *ActivationTransportBridge::gate_pointer(

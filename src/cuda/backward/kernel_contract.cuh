@@ -81,4 +81,8 @@ struct BackwardKernelArgs {
   std::size_t debug_coverage_offset;
   bool capture_stage_storage;
 #endif
+  DispatchWaveKernelView dispatch_waves;
+  std::size_t gin_send_dispatch_directory_offset = 0;
+  std::size_t gin_receive_dispatch_directory_offset = 0;
+  std::size_t dy_arrived_rows_offset = 0;
 };

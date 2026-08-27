@@ -55,6 +55,7 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease expert_id;
   DeviceBufferLease local_offset;
   DeviceBufferLease route_dst_row;
+  DeviceBufferLease route_dst_mtile;
   DeviceBufferLease route_dst_rank;
   DeviceBufferLease route_dst_node;
   DeviceBufferLease route_dst_local_rank;
@@ -176,6 +177,23 @@ struct DeviceDispatchKernelView {
   const DeviceFanoutRecord *packet_fanout = nullptr;
   const DeviceSignalRecord *outgoing_signals = nullptr;
   const DeviceSignalRecord *incoming_proxy_signals = nullptr;
+};
+
+// GIN-only scheduling view.  Keeping the wavefront permutation outside
+// DeviceDispatchKernelView means the frozen LocalCudaP2p Forward/Backward
+// launch contract and its generated SASS do not grow when the remote backend
+// learns a new packet scheduling policy.
+struct DispatchWaveKernelView {
+  std::uint64_t wave_count = 0;
+  const std::uint64_t *packet_order = nullptr;
+  const std::uint64_t *offsets = nullptr;
+  const std::uint32_t *destination_node = nullptr;
+  const std::uint32_t *channel = nullptr;
+  const std::uint64_t *first_primary_tile = nullptr;
+  const std::uint64_t *last_primary_tile = nullptr;
+  const std::uint64_t *packet_count = nullptr;
+  const std::uint64_t *descriptor_bytes = nullptr;
+  const std::uint32_t *route_dst_mtile = nullptr;
 };
 
 struct CudaNotifyWorkspacePlan {

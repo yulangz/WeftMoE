@@ -62,4 +62,8 @@ struct ForwardKernelArgs {
   unsigned long long *progress;
 #endif
   bool cache_fc1;
+  DispatchWaveKernelView dispatch_waves;
+  std::size_t gin_send_dispatch_directory_offset = 0;
+  std::size_t gin_receive_dispatch_directory_offset = 0;
+  std::size_t x_arrived_rows_offset = 0;
 };

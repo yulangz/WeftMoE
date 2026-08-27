@@ -321,6 +321,18 @@ struct LocalP2pRouteHeader {
 };
 static_assert(sizeof(LocalP2pRouteHeader) == 72);
 
+// One directory entry is exchanged before a context starts publishing its
+// M-tile waves.  It lets the peer consume context-local wire ranges without
+// assuming that independently progressing GIN contexts complete in lockstep.
+struct GinDispatchContextRecord {
+  std::uint64_t generation;
+  std::uint64_t epoch;
+  std::uint64_t packet_begin;
+  std::uint32_t packet_count;
+  std::uint32_t wave_count;
+};
+static_assert(sizeof(GinDispatchContextRecord) == 32);
+
 struct BackwardDeviceStatus {
   unsigned long long start_clock;
   unsigned long long dy_dispatch_complete_clock;
@@ -444,6 +456,7 @@ struct Layout {
   std::size_t forward_ab_cache = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
+  std::size_t forward_x_arrived_rows = 0;
   std::size_t forward_scheduler = 0;
   std::size_t backward_dy_input = 0;
   std::size_t backward_forward_output = 0;
@@ -462,6 +475,7 @@ struct Layout {
   std::size_t backward_dw1 = 0;
   std::size_t backward_dw2 = 0;
   std::size_t backward_scheduler = 0;
+  std::size_t backward_dy_arrived_rows = 0;
   std::size_t backward_dw_timeline = 0;
   std::size_t backward_validation_status = 0;
   std::size_t backward_status = 0;
@@ -473,6 +487,8 @@ struct Layout {
 // weights, canonical rows, and local-P2P storage stay in ordinary CUDA
 // allocations so enabling the network backend does not change their allocator.
 struct GinWindowLayout {
+  std::size_t send_dispatch_directory = 0;
+  std::size_t receive_dispatch_directory = 0;
   std::size_t send_packet_headers = 0;
   std::size_t receive_packet_headers = 0;
   std::size_t send_fanout = 0;
@@ -528,6 +544,9 @@ GinWindowLayout make_gin_window_layout(
       config.max_nodes, config.max_tokens_per_rank,
       "GIN outgoing packet capacity");
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
+  constexpr std::uint32_t kGinContextsPerRail = 8;
+  const auto directory_records = checked_mul(
+      remote_nodes, kGinContextsPerRail, "GIN dispatch directory records");
   const auto incoming_packets = checked_mul(
       remote_nodes, config.max_tokens_per_rank,
       "GIN incoming packet capacity");
@@ -539,6 +558,12 @@ GinWindowLayout make_gin_window_layout(
                                             "GIN receive payload elements");
   const auto return_payload = checked_mul(routes, config.max_hidden_size,
                                           "GIN return payload elements");
+  layout.send_dispatch_directory = append(
+      cursor, directory_records, sizeof(GinDispatchContextRecord),
+      "GIN send dispatch directory");
+  layout.receive_dispatch_directory = append(
+      cursor, directory_records, sizeof(GinDispatchContextRecord),
+      "GIN receive dispatch directory");
   layout.send_packet_headers = append(
       cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
       "GIN send packet headers");
@@ -722,6 +747,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_fc1_done = append(cursor, max_mblocks,
                                      sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
+    layout.forward_x_arrived_rows = append(
+        cursor, max_mblocks, sizeof(std::uint64_t),
+        "forward exact X M-tile arrived rows");
     layout.forward_scheduler = append(
         cursor, 4 + config.max_world_size * 32ULL,
         sizeof(std::uint64_t), "forward scheduler");
@@ -807,6 +835,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       layout.backward_scheduler = append(
           cursor, 64ULL + reduction_rows, sizeof(std::uint64_t),
           "backward scheduler/readiness");
+      layout.backward_dy_arrived_rows = append(
+          cursor, max_mblocks, sizeof(std::uint64_t),
+          "backward exact dY M-tile arrived rows");
       layout.backward_dw_timeline = append(
           cursor, max_owned_experts, sizeof(BackwardExpertDwTimeline),
           "backward per-expert dW timeline");
@@ -2273,7 +2304,10 @@ __device__ __forceinline__ void publish_production_terminal_status(
 __global__ void initialize_forward_generation_signals_kernel(
     void *local_base, void **peer_bases, std::size_t ingress_published_offset,
     std::size_t outgoing_sequence_offset, std::size_t setup_epoch_offset,
-    std::size_t gin_local_compute_ready_offset, std::uint32_t rank,
+    std::size_t gin_local_compute_ready_offset,
+    std::size_t forward_x_arrived_rows_offset,
+    std::size_t backward_dy_arrived_rows_offset, std::uint64_t mtile_count,
+    std::uint32_t rank,
     std::uint32_t world, std::uint32_t channels, unsigned long long epoch,
     std::uint32_t first_peer, std::uint32_t peer_count) {
   const auto index = static_cast<std::uint32_t>(threadIdx.x);
@@ -2283,6 +2317,12 @@ __global__ void initialize_forward_generation_signals_kernel(
                                                 outgoing_sequence_offset);
   auto *compute_ready = peer_at<unsigned long long>(
       local_base, gin_local_compute_ready_offset);
+  auto *x_arrived = peer_at<unsigned long long>(
+      local_base, forward_x_arrived_rows_offset);
+  auto *dy_arrived = backward_dy_arrived_rows_offset == 0
+                         ? nullptr
+                         : peer_at<unsigned long long>(
+                               local_base, backward_dy_arrived_rows_offset);
   const auto initial = epoch - 1ULL;
   for (std::uint32_t link = index; link < world * channels;
        link += blockDim.x) {
@@ -2291,6 +2331,12 @@ __global__ void initialize_forward_generation_signals_kernel(
   }
   for (std::uint32_t peer = index; peer < world; peer += blockDim.x)
     compute_ready[peer] = initial;
+  for (std::uint64_t tile = index; tile < mtile_count;
+       tile += blockDim.x) {
+    x_arrived[tile] = 0ULL;
+    if (dy_arrived)
+      dy_arrived[tile] = 0ULL;
+  }
   __syncthreads();
   __threadfence_system();
   for (std::uint32_t local_peer = index; local_peer < peer_count;
@@ -3638,6 +3684,22 @@ local_p2p_forward_megakernel(
     for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
          vector += blockDim.x)
       target128[vector] = source128[vector];
+    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+      // Every lane's row stores precede the exact destination M-tile row
+      // increment.  The destination compute worker acquires this counter; no
+      // packet/wave signal is itself interpreted as tile readiness.
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        auto *arrived = peer_at<unsigned long long>(
+            destination_base, a.x_arrived_rows_offset);
+        ::cuda::atomic_ref<unsigned long long,
+                           ::cuda::thread_scope_system>
+            counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
+        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+      }
+      __syncthreads();
+    }
 #if MEGAMOE_DEVICE_TIMELINE
     __syncthreads();
     if (!timeline_x_local_recorded) {
@@ -3676,39 +3738,49 @@ local_p2p_forward_megakernel(
     for (std::uint64_t item = global_thread;
          item < a.dispatch.sizes.packet_count * vector_count;
          item += global_threads) {
-      const auto packet = item / vector_count;
+      const auto wave_position = item / vector_count;
       const auto vector = item % vector_count;
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
       const auto descriptor = a.dispatch.packet_headers[packet];
       if (descriptor.destination_node == a.node)
         continue;
-      reinterpret_cast<uint4 *>(send_payload)[packet * vector_count +
+      reinterpret_cast<uint4 *>(send_payload)[wave_position * vector_count +
                                                vector] =
           reinterpret_cast<const uint4 *>(a.input)[
               descriptor.local_token_id * vector_count + vector];
     }
-    const auto fanout_count = a.dispatch.packet_fanout_offsets[
-        a.dispatch.sizes.packet_count];
-    for (std::uint64_t fanout = global_thread; fanout < fanout_count;
-         fanout += global_threads)
-      send_fanout[fanout] = a.dispatch.packet_fanout[fanout];
-    for (std::uint64_t packet = global_thread;
-         packet < a.dispatch.sizes.packet_count; packet += global_threads) {
+    for (std::uint64_t packed = global_thread;
+         packed < a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
+         packed += global_threads) {
+      const auto wave_position = packed / a.dispatch.identity.top_k;
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
+      const auto fanout_slot = packed % a.dispatch.identity.top_k;
+      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+      if (fanout_begin + fanout_slot < fanout_end)
+        send_fanout[packed] =
+            a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+    }
+    for (std::uint64_t wave_position = global_thread;
+         wave_position < a.dispatch.sizes.packet_count;
+         wave_position += global_threads) {
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
       const auto descriptor = a.dispatch.packet_headers[packet];
       if (descriptor.destination_node == a.node)
         continue;
       const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      send_headers[packet] = LocalP2pRouteHeader{
+      send_headers[wave_position] = LocalP2pRouteHeader{
           transport::kActivationTransportSchemaVersion,
           a.rank,
           descriptor.proxy_rank,
           descriptor.channel,
           a.dispatch.identity.generation,
           a.epoch,
-          descriptor.sequence_on_link,
+          wave_position,
           fanout_end - fanout_begin,
           descriptor.local_token_id,
-          fanout_begin,
+          wave_position * a.dispatch.identity.top_k,
           0,
           0};
     }
@@ -3726,126 +3798,185 @@ local_p2p_forward_megakernel(
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
-    std::uint64_t remote_packets = 0;
-    for (std::uint64_t packet = 0;
-         packet < a.dispatch.sizes.packet_count; ++packet)
-      if (a.dispatch.packet_headers[packet].destination_node != a.node)
-        ++remote_packets;
-    const auto sequence_begin =
-        remote_packets * context / a.gin_context_count;
-    const auto sequence_end =
-        remote_packets * (context + 1U) / a.gin_context_count;
-    std::uint64_t first_packet = a.dispatch.sizes.packet_count;
-    std::uint64_t last_packet = 0;
-    std::uint64_t first_fanout = 0;
-    std::uint64_t last_fanout = 0;
-    std::uint32_t remote_node = a.node;
-    for (std::uint64_t packet = 0;
-         packet < a.dispatch.sizes.packet_count; ++packet) {
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node ||
-          descriptor.sequence_on_link < sequence_begin ||
-          descriptor.sequence_on_link >= sequence_end)
+    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+    auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
+        window_bytes + a.gin_send_dispatch_directory_offset);
+    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+        window_bytes + a.gin_send_header_offset);
+    unsigned long long issued_completions = 0ULL;
+    unsigned long long issued_packets = 0ULL;
+    for (std::uint32_t remote_node = 0;
+         remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+      if (remote_node == a.node)
         continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (first_packet == a.dispatch.sizes.packet_count) {
-        first_packet = packet;
-        first_fanout = fanout_begin;
-        remote_node = descriptor.destination_node;
-      }
-      last_packet = packet + 1U;
-      last_fanout = fanout_end;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0U && first_packet != a.dispatch.sizes.packet_count) {
+      std::uint64_t node_wave_begin = 0;
+      while (node_wave_begin < a.dispatch_waves.wave_count &&
+             a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
+        ++node_wave_begin;
+      auto node_wave_end = node_wave_begin;
+      while (node_wave_end < a.dispatch_waves.wave_count &&
+             a.dispatch_waves.destination_node[node_wave_end] == remote_node)
+        ++node_wave_end;
+      const auto node_waves = node_wave_end - node_wave_begin;
+      const auto context_wave_begin =
+          node_wave_begin + node_waves * context / a.gin_context_count;
+      const auto context_wave_end =
+          node_wave_begin + node_waves * (context + 1U) /
+                                a.gin_context_count;
+      const auto node_packet_begin =
+          a.dispatch_waves.offsets[node_wave_begin];
+      const auto packet_begin =
+          a.dispatch_waves.offsets[context_wave_begin] - node_packet_begin;
+      const auto packet_end =
+          a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
+      const auto remote_partition =
+          remote_node < a.node ? remote_node : remote_node - 1U;
       const auto source_partition =
           a.node < remote_node ? a.node : a.node - 1U;
-      const auto receive_packet =
-          source_partition * a.max_tokens_per_rank + sequence_begin;
-      const auto packet_count = last_packet - first_packet;
-      const auto destination = static_cast<int>(remote_node);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, GinPutIssue, GinDispatch, context,
-                              packet_count * a.hidden *
-                                  sizeof(transport::BFloat16),
-                              a.epoch);
-      gin.put(rail, destination, a.gin_window,
-              a.gin_receive_header_offset +
-                  receive_packet * sizeof(LocalP2pRouteHeader),
-              a.gin_window,
-              a.gin_send_header_offset +
-                  first_packet * sizeof(LocalP2pRouteHeader),
-              packet_count * sizeof(LocalP2pRouteHeader));
-      gin.put(rail, destination, a.gin_window,
-              a.gin_receive_fanout_offset +
-                  (source_partition * a.max_tokens_per_rank *
-                       a.dispatch.identity.top_k +
-                   first_fanout) *
-                      sizeof(DeviceFanoutRecord),
-              a.gin_window,
-              a.gin_send_fanout_offset +
-                  first_fanout * sizeof(DeviceFanoutRecord),
-              (last_fanout - first_fanout) * sizeof(DeviceFanoutRecord));
-      gin.put(rail, destination, a.gin_window,
-              a.gin_receive_payload_offset +
-                  receive_packet * a.hidden *
-                      sizeof(transport::BFloat16),
-              a.gin_window,
-              a.gin_send_payload_offset +
-                  first_packet * a.hidden * sizeof(transport::BFloat16),
-              packet_count * a.hidden * sizeof(transport::BFloat16),
-              ncclGin_SignalInc{0}, ncclGin_CounterInc{0}, ncclCoopThread{},
-              ncclGin_None{}, ::cuda::thread_scope_block,
-              ::cuda::thread_scope_device);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, XLastDispatchPut, GinDispatch,
-                              context, packet_count, a.epoch);
-      atomicAdd(&status->gin_dispatch_put_count, 3ULL);
-      atomicAdd(&status->gin_signal_count, 1ULL);
-      atomicAdd(&status->gin_metadata_bytes,
-                packet_count * sizeof(LocalP2pRouteHeader) +
-                    (last_fanout - first_fanout) *
-                        sizeof(DeviceFanoutRecord));
-      atomicAdd(&status->raw_cross_node_payload_bytes,
-                (last_fanout - first_fanout) * a.hidden *
-                    sizeof(transport::BFloat16));
-      gin.waitCounter(ncclCoopThread{}, 0, 1);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
-                              GinDispatch, context, packet_count, a.epoch);
+      const auto directory_index =
+          remote_partition * a.gin_context_count + context;
+      if (threadIdx.x == 0U) {
+        send_directory[directory_index] = GinDispatchContextRecord{
+            a.dispatch.identity.generation, a.epoch, packet_begin,
+            static_cast<std::uint32_t>(packet_end - packet_begin),
+            static_cast<std::uint32_t>(context_wave_end -
+                                       context_wave_begin)};
+        __threadfence_system();
+        const auto remote_directory_index =
+            source_partition * a.gin_context_count + context;
+        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                a.gin_receive_dispatch_directory_offset +
+                    remote_directory_index *
+                        sizeof(GinDispatchContextRecord),
+                a.gin_window, a.gin_send_dispatch_directory_offset +
+                                  directory_index *
+                                      sizeof(GinDispatchContextRecord),
+                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        ++issued_completions;
+      }
+      __syncthreads();
+      // Every context publishes exactly one fixed-width directory record for
+      // every remote node that participates in this generation, including an
+      // empty record.  Receivers therefore never have to infer which sender
+      // contexts own waves before waiting for the directory phase.
+      for (auto wave = context_wave_begin; wave < context_wave_end; ++wave) {
+        const auto wave_begin = a.dispatch_waves.offsets[wave];
+        const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
+        const auto wire_begin = wave_begin - node_packet_begin;
+        const auto wave_packets = wave_end - wave_begin;
+        for (auto position = wave_begin + threadIdx.x; position < wave_end;
+             position += blockDim.x) {
+          send_headers[position].sequence = position - node_packet_begin;
+          send_headers[position].dst_row =
+              (position - node_packet_begin) * a.dispatch.identity.top_k;
+          send_headers[position].topk_slot = 0U;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+          send_headers[wave_begin].topk_slot =
+              static_cast<std::uint32_t>(wave_packets);
+          __threadfence_system();
+          const auto receive_packet =
+              source_partition * a.max_tokens_per_rank + wire_begin;
+          MEGAMOE_TIMELINE_RECORD(
+              a.timeline, GinPutIssue, GinDispatch, context,
+              wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_header_offset +
+                      receive_packet * sizeof(LocalP2pRouteHeader),
+                  a.gin_window,
+                  a.gin_send_header_offset +
+                      wave_begin * sizeof(LocalP2pRouteHeader),
+                  wave_packets * sizeof(LocalP2pRouteHeader));
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_fanout_offset +
+                      (source_partition * a.max_tokens_per_rank + wire_begin) *
+                          a.dispatch.identity.top_k *
+                          sizeof(DeviceFanoutRecord),
+                  a.gin_window,
+                  a.gin_send_fanout_offset +
+                      wave_begin * a.dispatch.identity.top_k *
+                          sizeof(DeviceFanoutRecord),
+                  wave_packets * a.dispatch.identity.top_k *
+                      sizeof(DeviceFanoutRecord));
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_payload_offset +
+                      receive_packet * a.hidden *
+                          sizeof(transport::BFloat16),
+                  a.gin_window,
+                  a.gin_send_payload_offset +
+                      wave_begin * a.hidden * sizeof(transport::BFloat16),
+                  wave_packets * a.hidden * sizeof(transport::BFloat16),
+                  ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+                  ncclCoopThread{}, ncclGin_None{},
+                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+          ++issued_completions;
+          issued_packets += wave_packets;
+          atomicAdd(&status->gin_dispatch_put_count, 3ULL);
+          atomicAdd(&status->gin_signal_count, 1ULL);
+          atomicAdd(&status->gin_metadata_bytes,
+                    wave_packets *
+                        (sizeof(LocalP2pRouteHeader) +
+                         a.dispatch.identity.top_k *
+                             sizeof(DeviceFanoutRecord)));
+        }
+        __syncthreads();
+      }
     }
-    if (threadIdx.x == 0U)
+    if (threadIdx.x == 0U && issued_completions != 0ULL) {
+      gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
+                              GinDispatch, context, issued_packets, a.epoch);
+      atomicAdd(&status->deduplicated_cross_node_payload_bytes,
+                issued_packets * a.hidden * sizeof(transport::BFloat16));
+      atomicAdd(&status->actual_dispatch_peer_bytes,
+                issued_packets * a.hidden * sizeof(transport::BFloat16));
       gin.resetCounter(0);
+    }
     __syncthreads();
-    unsigned long long incoming_packets = 0ULL;
+    unsigned long long incoming_sources = 0ULL;
     if (threadIdx.x == 0U) {
       for (std::uint32_t index = 0;
            index < a.dispatch.sizes.incoming_signal_count; ++index) {
         const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node) {
-          const auto begin =
-              signal.expected_packets * context / a.gin_context_count;
-          const auto end = signal.expected_packets * (context + 1U) /
-                           a.gin_context_count;
-          incoming_packets += begin != end ? 1ULL : 0ULL;
-        }
+        if (signal.source_node != a.node && signal.expected_packets != 0ULL)
+          ++incoming_sources;
       }
-      if (incoming_packets != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
+      if (incoming_sources != 0ULL)
+        gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
+      auto *receive_directory =
+          reinterpret_cast<GinDispatchContextRecord *>(
+              static_cast<std::byte *>(a.gin_window_base) +
+              a.gin_receive_dispatch_directory_offset);
+      unsigned long long incoming_waves = 0ULL;
+      for (std::uint32_t index = 0;
+           index < a.dispatch.sizes.incoming_signal_count; ++index) {
+        const auto signal = a.dispatch.incoming_proxy_signals[index];
+        if (signal.source_node == a.node || signal.expected_packets == 0ULL)
+          continue;
+        const auto source_partition =
+            signal.source_node < a.node ? signal.source_node
+                                        : signal.source_node - 1U;
+        const auto directory = receive_directory[
+            source_partition * a.gin_context_count + context];
+        if (directory.generation == a.dispatch.identity.generation &&
+            directory.epoch == a.epoch)
+          incoming_waves += directory.wave_count;
+      }
+      if (incoming_waves != 0ULL)
+        gin.waitSignal(ncclCoopThread{}, 0,
+                       incoming_sources + incoming_waves);
       MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
-                              context, incoming_packets, a.epoch);
+                              context, incoming_sources, a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
-                              context, incoming_packets, a.epoch);
+                              context, incoming_sources, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
     }
     __syncthreads();
-    if (threadIdx.x == 0U) {
-      const auto bytes =
-          (sequence_end - sequence_begin) * a.hidden *
-          sizeof(transport::BFloat16);
-      atomicAdd(&status->deduplicated_cross_node_payload_bytes, bytes);
-      atomicAdd(&status->actual_dispatch_peer_bytes, bytes);
-    }
   }
   if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     grid.sync();
@@ -3945,6 +4076,44 @@ local_p2p_forward_megakernel(
       }
     }
     __threadfence_system();
+    grid.sync();
+    // The packet signal only makes the registered ingress visible.  Exact
+    // readiness is published after every destination row and reverse header
+    // store has completed.  Multi-fanout packets increment each destination
+    // tile independently.
+    for (std::uint32_t signal_index = 0;
+         signal_index < a.dispatch.sizes.incoming_signal_count;
+         ++signal_index) {
+      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+      if (signal.source_node == a.node)
+        continue;
+      const auto source_partition =
+          signal.source_node < a.node ? signal.source_node
+                                      : signal.source_node - 1U;
+      for (std::uint64_t slot = global_thread;
+           slot < signal.expected_packets * a.dispatch.identity.top_k;
+           slot += global_threads) {
+        const auto sequence = slot / a.dispatch.identity.top_k;
+        const auto fanout = slot % a.dispatch.identity.top_k;
+        const auto packet =
+            source_partition * a.max_tokens_per_rank + sequence;
+        const auto header = receive_headers[packet];
+        if (fanout >= header.route_index)
+          continue;
+        const auto target = receive_fanout[
+            source_partition * a.max_tokens_per_rank *
+                    a.dispatch.identity.top_k +
+                header.dst_row + fanout];
+        const auto destination =
+            a.node * a.local_world_size + target.destination_local_rank;
+        auto *arrived = peer_at<unsigned long long>(
+            a.peer_bases[destination], a.x_arrived_rows_offset);
+        ::cuda::atomic_ref<unsigned long long,
+                           ::cuda::thread_scope_system>
+            counter(arrived[target.reserved]);
+        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+      }
+    }
     grid.sync();
     MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
@@ -5456,6 +5625,19 @@ local_p2p_backward_megakernel(
     for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
          vector += blockDim.x)
       target128[vector] = source128[vector];
+    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        auto *arrived = peer_at<unsigned long long>(
+            destination_base, a.dy_arrived_rows_offset);
+        ::cuda::atomic_ref<unsigned long long,
+                           ::cuda::thread_scope_system>
+            counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
+        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+      }
+      __syncthreads();
+    }
 #if MEGAMOE_DEVICE_TIMELINE
     __syncthreads();
     if (!timeline_dy_local_recorded) {
@@ -5517,40 +5699,53 @@ local_p2p_backward_megakernel(
     for (std::uint64_t item = global_thread;
          item < a.dispatch.sizes.packet_count * vector_count;
          item += global_threads) {
-      const auto packet = item / vector_count;
+      const auto wave_position = item / vector_count;
       const auto vector = item % vector_count;
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
       const auto descriptor = a.dispatch.packet_headers[packet];
       if (descriptor.destination_node == a.node)
         continue;
-      reinterpret_cast<uint4 *>(send_payload)[packet * vector_count +
+      reinterpret_cast<uint4 *>(send_payload)[wave_position * vector_count +
                                                vector] =
           reinterpret_cast<const uint4 *>(a.dy_input)[
               descriptor.local_token_id * vector_count + vector];
     }
-    const auto fanout_count = a.dispatch.packet_fanout_offsets[
-        a.dispatch.sizes.packet_count];
-    for (std::uint64_t fanout = global_thread; fanout < fanout_count;
-         fanout += global_threads)
-      send_fanout[fanout] = a.dispatch.packet_fanout[fanout];
-    for (std::uint64_t packet = global_thread;
-         packet < a.dispatch.sizes.packet_count; packet += global_threads) {
+    const auto fanout_slots =
+        a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
+    for (std::uint64_t packed = global_thread; packed < fanout_slots;
+         packed += global_threads) {
+      const auto wave_position = packed / a.dispatch.identity.top_k;
+      const auto fanout_slot = packed % a.dispatch.identity.top_k;
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
       const auto descriptor = a.dispatch.packet_headers[packet];
       if (descriptor.destination_node == a.node)
         continue;
       const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
-        const auto target = a.dispatch.packet_fanout[fanout];
-        send_gate[fanout] = a.gates[descriptor.local_token_id *
+      if (fanout_begin + fanout_slot < fanout_end) {
+        const auto target = a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+        send_fanout[packed] = target;
+        send_gate[packed] = a.gates[descriptor.local_token_id *
                                         a.dispatch.identity.top_k +
                                     target.topk_slot];
       }
-      send_headers[packet] = LocalP2pRouteHeader{
+    }
+    for (std::uint64_t wave_position = global_thread;
+         wave_position < a.dispatch.sizes.packet_count;
+         wave_position += global_threads) {
+      const auto packet = a.dispatch_waves.packet_order[wave_position];
+      const auto descriptor = a.dispatch.packet_headers[packet];
+      if (descriptor.destination_node == a.node)
+        continue;
+      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+      send_headers[wave_position] = LocalP2pRouteHeader{
           transport::kActivationTransportSchemaVersion, a.rank,
           descriptor.proxy_rank, descriptor.channel,
           a.dispatch.identity.generation, a.epoch,
-          descriptor.sequence_on_link, fanout_end - fanout_begin,
-          descriptor.local_token_id, fanout_begin, 0, 0};
+          wave_position, fanout_end - fanout_begin,
+          descriptor.local_token_id,
+          wave_position * a.dispatch.identity.top_k, 0, 0};
     }
     MEGAMOE_TIMELINE_RECORD(a.timeline, DyPacketReady, GinDispatch, 0U,
                             a.dispatch.sizes.packet_count, a.epoch);
@@ -5562,122 +5757,181 @@ local_p2p_backward_megakernel(
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
-    std::uint64_t remote_packets = 0;
-    for (std::uint64_t packet = 0;
-         packet < a.dispatch.sizes.packet_count; ++packet)
-      if (a.dispatch.packet_headers[packet].destination_node != a.node)
-        ++remote_packets;
-    const auto sequence_begin =
-        remote_packets * context / a.gin_context_count;
-    const auto sequence_end =
-        remote_packets * (context + 1U) / a.gin_context_count;
-    std::uint64_t first_packet = a.dispatch.sizes.packet_count;
-    std::uint64_t last_packet = 0;
-    std::uint64_t first_fanout = 0;
-    std::uint64_t last_fanout = 0;
-    std::uint32_t remote_node = a.node;
-    for (std::uint64_t packet = 0;
-         packet < a.dispatch.sizes.packet_count; ++packet) {
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node ||
-          descriptor.sequence_on_link < sequence_begin ||
-          descriptor.sequence_on_link >= sequence_end)
+    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+    auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
+        window_bytes + a.gin_send_dispatch_directory_offset);
+    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+        window_bytes + a.gin_send_header_offset);
+    unsigned long long issued_completions = 0ULL;
+    unsigned long long issued_packets = 0ULL;
+    for (std::uint32_t remote_node = 0;
+         remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+      if (remote_node == a.node)
         continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (first_packet == a.dispatch.sizes.packet_count) {
-        first_packet = packet;
-        first_fanout = fanout_begin;
-        remote_node = descriptor.destination_node;
-      }
-      last_packet = packet + 1U;
-      last_fanout = fanout_end;
-    }
-    if (threadIdx.x == 0U && first_packet != a.dispatch.sizes.packet_count) {
-        const auto destination = static_cast<int>(remote_node);
-        const auto source_partition = a.node < remote_node ? a.node : a.node - 1U;
-        const auto receive_packet = source_partition * a.max_tokens_per_rank +
-                                    sequence_begin;
-        const auto packet_count = last_packet - first_packet;
-        MEGAMOE_TIMELINE_RECORD(
-            a.timeline, DyGinPutIssue, GinDispatch, context,
-            packet_count * a.hidden * sizeof(transport::BFloat16), a.epoch);
-        gin.put(rail, destination, a.gin_window,
-                a.gin_receive_header_offset +
-                    receive_packet * sizeof(LocalP2pRouteHeader),
-                a.gin_window,
-                a.gin_send_header_offset +
-                    first_packet * sizeof(LocalP2pRouteHeader),
-                packet_count * sizeof(LocalP2pRouteHeader));
-        gin.put(rail, destination, a.gin_window,
-                a.gin_receive_fanout_offset +
-                    (source_partition * a.max_tokens_per_rank *
-                         a.dispatch.identity.top_k +
-                     first_fanout) *
-                        sizeof(DeviceFanoutRecord),
-                a.gin_window,
-                a.gin_send_fanout_offset +
-                    first_fanout * sizeof(DeviceFanoutRecord),
-                (last_fanout - first_fanout) * sizeof(DeviceFanoutRecord));
-        gin.put(rail, destination, a.gin_window,
-                a.gin_receive_gate_offset +
-                    (source_partition * a.max_tokens_per_rank *
-                         a.dispatch.identity.top_k +
-                     first_fanout) * sizeof(float),
-                a.gin_window, a.gin_send_gate_offset +
-                                  first_fanout * sizeof(float),
-                (last_fanout - first_fanout) * sizeof(float));
-        gin.put(rail, destination, a.gin_window,
-                a.gin_receive_payload_offset +
-                    receive_packet * a.hidden *
-                        sizeof(transport::BFloat16),
-                a.gin_window,
-                a.gin_send_payload_offset +
-                    first_packet * a.hidden * sizeof(transport::BFloat16),
-                packet_count * a.hidden * sizeof(transport::BFloat16),
-                ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
-                ncclCoopThread{}, ncclGin_None{},
+      std::uint64_t node_wave_begin = 0;
+      while (node_wave_begin < a.dispatch_waves.wave_count &&
+             a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
+        ++node_wave_begin;
+      auto node_wave_end = node_wave_begin;
+      while (node_wave_end < a.dispatch_waves.wave_count &&
+             a.dispatch_waves.destination_node[node_wave_end] == remote_node)
+        ++node_wave_end;
+      const auto node_waves = node_wave_end - node_wave_begin;
+      const auto context_wave_begin =
+          node_wave_begin + node_waves * context / a.gin_context_count;
+      const auto context_wave_end =
+          node_wave_begin + node_waves * (context + 1U) /
+                                a.gin_context_count;
+      const auto node_packet_begin =
+          a.dispatch_waves.offsets[node_wave_begin];
+      const auto packet_begin =
+          a.dispatch_waves.offsets[context_wave_begin] - node_packet_begin;
+      const auto packet_end =
+          a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
+      const auto remote_partition =
+          remote_node < a.node ? remote_node : remote_node - 1U;
+      const auto source_partition =
+          a.node < remote_node ? a.node : a.node - 1U;
+      const auto directory_index =
+          remote_partition * a.gin_context_count + context;
+      if (threadIdx.x == 0U) {
+        send_directory[directory_index] = GinDispatchContextRecord{
+            a.dispatch.identity.generation, a.epoch, packet_begin,
+            static_cast<std::uint32_t>(packet_end - packet_begin),
+            static_cast<std::uint32_t>(context_wave_end - context_wave_begin)};
+        __threadfence_system();
+        const auto remote_directory_index =
+            source_partition * a.gin_context_count + context;
+        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                a.gin_receive_dispatch_directory_offset +
+                    remote_directory_index * sizeof(GinDispatchContextRecord),
+                a.gin_window, a.gin_send_dispatch_directory_offset +
+                                  directory_index *
+                                      sizeof(GinDispatchContextRecord),
+                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
                 ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, DyLastDispatchPut, GinDispatch,
-                                context, packet_count, a.epoch);
-        atomicAdd(&status->gin_dispatch_put_count, 4ULL);
-        atomicAdd(&status->gin_signal_count, 1ULL);
-        atomicAdd(&status->gin_metadata_bytes,
-                  packet_count * sizeof(LocalP2pRouteHeader) +
-                      (last_fanout - first_fanout) *
-                          (sizeof(DeviceFanoutRecord) + sizeof(float)));
-        atomicAdd(&status->raw_cross_node_dy_bytes,
-                  (last_fanout - first_fanout) * a.hidden *
-                      sizeof(transport::BFloat16));
-        atomicAdd(&status->gin_dispatch_payload_bytes,
-                  packet_count * a.hidden *
-                      sizeof(transport::BFloat16));
-        gin.waitCounter(ncclCoopThread{}, 0, 1);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, DyLocalCompletion, GinDispatch,
-                                context, packet_count, a.epoch);
+        ++issued_completions;
+      }
+      __syncthreads();
+      for (auto wave = context_wave_begin; wave < context_wave_end; ++wave) {
+        const auto wave_begin = a.dispatch_waves.offsets[wave];
+        const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
+        const auto wire_begin = wave_begin - node_packet_begin;
+        const auto wave_packets = wave_end - wave_begin;
+        for (auto position = wave_begin + threadIdx.x; position < wave_end;
+             position += blockDim.x) {
+          send_headers[position].sequence = position - node_packet_begin;
+          send_headers[position].dst_row =
+              (position - node_packet_begin) * a.dispatch.identity.top_k;
+          send_headers[position].topk_slot = 0U;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+          send_headers[wave_begin].topk_slot =
+              static_cast<std::uint32_t>(wave_packets);
+          __threadfence_system();
+          const auto receive_packet =
+              source_partition * a.max_tokens_per_rank + wire_begin;
+          MEGAMOE_TIMELINE_RECORD(
+              a.timeline, DyGinPutIssue, GinDispatch, context,
+              wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_header_offset +
+                      receive_packet * sizeof(LocalP2pRouteHeader),
+                  a.gin_window, a.gin_send_header_offset +
+                                    wave_begin * sizeof(LocalP2pRouteHeader),
+                  wave_packets * sizeof(LocalP2pRouteHeader));
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_fanout_offset +
+                      (source_partition * a.max_tokens_per_rank + wire_begin) *
+                          a.dispatch.identity.top_k *
+                          sizeof(DeviceFanoutRecord),
+                  a.gin_window, a.gin_send_fanout_offset +
+                                    wave_begin * a.dispatch.identity.top_k *
+                                        sizeof(DeviceFanoutRecord),
+                  wave_packets * a.dispatch.identity.top_k *
+                      sizeof(DeviceFanoutRecord));
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_gate_offset +
+                      (source_partition * a.max_tokens_per_rank + wire_begin) *
+                          a.dispatch.identity.top_k * sizeof(float),
+                  a.gin_window, a.gin_send_gate_offset +
+                                    wave_begin * a.dispatch.identity.top_k *
+                                        sizeof(float),
+                  wave_packets * a.dispatch.identity.top_k * sizeof(float));
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_payload_offset +
+                      receive_packet * a.hidden *
+                          sizeof(transport::BFloat16),
+                  a.gin_window, a.gin_send_payload_offset +
+                                    wave_begin * a.hidden *
+                                        sizeof(transport::BFloat16),
+                  wave_packets * a.hidden * sizeof(transport::BFloat16),
+                  ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+                  ncclCoopThread{}, ncclGin_None{},
+                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+          ++issued_completions;
+          issued_packets += wave_packets;
+          atomicAdd(&status->gin_dispatch_put_count, 4ULL);
+          atomicAdd(&status->gin_signal_count, 1ULL);
+          atomicAdd(&status->gin_metadata_bytes,
+                    wave_packets *
+                        (sizeof(LocalP2pRouteHeader) +
+                         a.dispatch.identity.top_k *
+                             (sizeof(DeviceFanoutRecord) + sizeof(float))));
+        }
+        __syncthreads();
+      }
     }
-    if (threadIdx.x == 0U)
+    if (threadIdx.x == 0U && issued_completions != 0ULL) {
+      gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyLocalCompletion, GinDispatch,
+                              context, issued_packets, a.epoch);
+      atomicAdd(&status->raw_cross_node_dy_bytes,
+                issued_packets * a.dispatch.identity.top_k * a.hidden *
+                    sizeof(transport::BFloat16));
+      atomicAdd(&status->gin_dispatch_payload_bytes,
+                issued_packets * a.hidden * sizeof(transport::BFloat16));
       gin.resetCounter(0);
+    }
     __syncthreads();
-    unsigned long long incoming_packets = 0ULL;
+    unsigned long long incoming_sources = 0ULL;
     if (threadIdx.x == 0U) {
       for (std::uint32_t index = 0;
            index < a.dispatch.sizes.incoming_signal_count; ++index) {
         const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node) {
-          const auto begin =
-              signal.expected_packets * context / a.gin_context_count;
-          const auto end = signal.expected_packets * (context + 1U) /
-                           a.gin_context_count;
-          incoming_packets += begin != end ? 1ULL : 0ULL;
-        }
+        if (signal.source_node != a.node && signal.expected_packets != 0ULL)
+          ++incoming_sources;
       }
-      if (incoming_packets != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
+      if (incoming_sources != 0ULL)
+        gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
+      auto *receive_directory =
+          reinterpret_cast<GinDispatchContextRecord *>(
+              static_cast<std::byte *>(a.gin_window_base) +
+              a.gin_receive_dispatch_directory_offset);
+      unsigned long long incoming_waves = 0ULL;
+      for (std::uint32_t index = 0;
+           index < a.dispatch.sizes.incoming_signal_count; ++index) {
+        const auto signal = a.dispatch.incoming_proxy_signals[index];
+        if (signal.source_node == a.node || signal.expected_packets == 0ULL)
+          continue;
+        const auto source_partition =
+            signal.source_node < a.node ? signal.source_node
+                                        : signal.source_node - 1U;
+        const auto directory = receive_directory[
+            source_partition * a.gin_context_count + context];
+        if (directory.generation == a.dispatch.identity.generation &&
+            directory.epoch == a.epoch)
+          incoming_waves += directory.wave_count;
+      }
+      if (incoming_waves != 0ULL)
+        gin.waitSignal(ncclCoopThread{}, 0,
+                       incoming_sources + incoming_waves);
       MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
-                              context, incoming_packets, a.epoch);
+                              context, incoming_sources, a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstRemoteSignal, GinDispatch,
-                              context, incoming_packets, a.epoch);
+                              context, incoming_sources, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -5770,6 +6024,40 @@ local_p2p_backward_megakernel(
       }
     }
     __threadfence_system();
+    grid.sync();
+    for (std::uint32_t signal_index = 0;
+         signal_index < a.dispatch.sizes.incoming_signal_count;
+         ++signal_index) {
+      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+      if (signal.source_node == a.node)
+        continue;
+      const auto source_partition =
+          signal.source_node < a.node ? signal.source_node
+                                      : signal.source_node - 1U;
+      for (std::uint64_t slot = global_thread;
+           slot < signal.expected_packets * a.dispatch.identity.top_k;
+           slot += global_threads) {
+        const auto sequence = slot / a.dispatch.identity.top_k;
+        const auto fanout = slot % a.dispatch.identity.top_k;
+        const auto packet =
+            source_partition * a.max_tokens_per_rank + sequence;
+        const auto header = receive_headers[packet];
+        if (fanout >= header.route_index)
+          continue;
+        const auto target = receive_fanout[
+            source_partition * a.max_tokens_per_rank *
+                    a.dispatch.identity.top_k +
+                header.dst_row + fanout];
+        const auto destination =
+            a.node * a.local_world_size + target.destination_local_rank;
+        auto *arrived = peer_at<unsigned long long>(
+            a.peer_bases[destination], a.dy_arrived_rows_offset);
+        ::cuda::atomic_ref<unsigned long long,
+                           ::cuda::thread_scope_system>
+            counter(arrived[target.reserved]);
+        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+      }
+    }
     grid.sync();
     MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayEnd, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
@@ -11521,6 +11809,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.config_digest_word0, id.config_digest_word1};
   auto consumer = dispatch.acquire_consumer(backend->execution, expectation);
   auto view = ActivationTransportBridge::view(consumer);
+  const auto dispatch_waves = use_gin
+                                  ? ActivationTransportBridge::wave_view(consumer)
+                                  : DispatchWaveKernelView{};
   if (weight.owned_experts != view.sizes.owned_expert_count)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                     "owned_experts", id.calling_rank,
@@ -11692,6 +11983,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         slot.device, at<void *>(slot.device, layout.peer_bases),
         layout.ingress_published_sequence, layout.outgoing_route_sequence,
         layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+        layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
+        view.sizes.mtile_count,
         id.calling_rank, id.world_size, state->config.channels,
         generation_epoch,
         use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
@@ -11713,6 +12006,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       "initialize owner completion signals and wait peer setup epoch");
   ForwardKernelArgs args{};
   args.dispatch = view;
+  args.dispatch_waves = dispatch_waves;
   args.input = activation.pointer;
   args.gates = ActivationTransportBridge::gate_pointer(dispatch);
   args.w1 = weight.w1;
@@ -11755,6 +12049,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     args.gin_window_base = slot.gin_window;
     args.gin_send_header_offset = state->gin_layout.send_packet_headers;
     args.gin_receive_header_offset = state->gin_layout.receive_packet_headers;
+    args.gin_send_dispatch_directory_offset =
+        state->gin_layout.send_dispatch_directory;
+    args.gin_receive_dispatch_directory_offset =
+        state->gin_layout.receive_dispatch_directory;
     args.gin_send_fanout_offset = state->gin_layout.send_fanout;
     args.gin_receive_fanout_offset = state->gin_layout.receive_fanout;
     args.gin_send_payload_offset = state->gin_layout.send_payload;
@@ -11783,6 +12081,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_ab_cache_offset = layout.forward_ab_cache;
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
+  args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
   args.forward_scheduler_offset = layout.forward_scheduler;
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
@@ -12490,6 +12789,9 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     consumer = f.dispatch.acquire_consumer(backend->execution, expectation);
   }
   const auto view = ActivationTransportBridge::view(consumer);
+  const auto dispatch_waves = use_gin
+                                  ? ActivationTransportBridge::wave_view(consumer)
+                                  : DispatchWaveKernelView{};
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[f.slot->index];
   const auto &layout = state->layout;
@@ -12796,6 +13098,8 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
       slot.device, at<void *>(slot.device, layout.peer_bases),
       layout.ingress_published_sequence, layout.outgoing_route_sequence,
       layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+      layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
+      view.sizes.mtile_count,
       id.calling_rank, id.world_size, state->config.channels, generation_epoch,
       use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
       use_gin ? gin_backend->local_world_size : id.world_size);
@@ -12814,6 +13118,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
 
   BackwardKernelArgs args{};
   args.dispatch = view;
+  args.dispatch_waves = dispatch_waves;
   args.dy_input = dy_lease.pointer;
   args.gates = ActivationTransportBridge::gate_pointer(f.dispatch);
   args.w1 = f.weights.impl_->w1;
@@ -12860,6 +13165,10 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     args.gin_window_base = slot.gin_window;
     args.gin_send_header_offset = state->gin_layout.send_packet_headers;
     args.gin_receive_header_offset = state->gin_layout.receive_packet_headers;
+    args.gin_send_dispatch_directory_offset =
+        state->gin_layout.send_dispatch_directory;
+    args.gin_receive_dispatch_directory_offset =
+        state->gin_layout.receive_dispatch_directory;
     args.gin_send_fanout_offset = state->gin_layout.send_fanout;
     args.gin_receive_fanout_offset = state->gin_layout.receive_fanout;
     args.gin_send_gate_offset = state->gin_layout.send_gate;
@@ -12898,6 +13207,7 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.dw1_offset = layout.backward_dw1;
   args.dw2_offset = layout.backward_dw2;
   args.scheduler_offset = layout.backward_scheduler;
+  args.dy_arrived_rows_offset = layout.backward_dy_arrived_rows;
   args.dw_timeline_offset = layout.backward_dw_timeline;
   args.claim_offset = layout.forward_task_claim;
   args.incoming_signal_offset = layout.ingress_published_sequence;
@@ -14945,8 +15255,9 @@ bool run_world1_forward_backward_sanitizer_harness(
     initialize_forward_generation_signals_kernel<<<1, 256, 0, stream>>>(
         arena, at<void *>(arena, layout.peer_bases),
         layout.ingress_published_sequence, layout.outgoing_route_sequence,
-        layout.p2p_barrier_receive, layout.gin_local_compute_ready, 0, 1, 1,
-        1, 0, 1);
+        layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+        layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
+        view.sizes.mtile_count, 0, 1, 1, 1, 0, 1);
     ForwardKernelArgs args{};
     args.dispatch = view;
     args.input = input;
@@ -15062,8 +15373,9 @@ bool run_world1_forward_backward_sanitizer_harness(
       initialize_forward_generation_signals_kernel<<<1, 256, 0, stream>>>(
           arena, at<void *>(arena, layout.peer_bases),
           layout.ingress_published_sequence, layout.outgoing_route_sequence,
-          layout.p2p_barrier_receive, layout.gin_local_compute_ready, 0, 1, 1,
-          2, 0, 1);
+          layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+          layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
+          view.sizes.mtile_count, 0, 1, 1, 2, 0, 1);
       BackwardKernelArgs backward{};
       backward.dispatch = view;
       backward.dy_input = dy_input;

@@ -201,6 +201,8 @@ class ActivationTransportBridge {
 public:
   static DeviceDispatchKernelView
   view(DeviceDispatchConsumerLease &consumer);
+  static DispatchWaveKernelView
+  wave_view(DeviceDispatchConsumerLease &consumer);
   static const float *gate_pointer(const DeviceDispatchHandle &dispatch);
   static void wait_for_gates(const DeviceDispatchHandle &dispatch,
                              const CudaExecution &execution);
