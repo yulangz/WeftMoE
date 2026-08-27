@@ -3617,6 +3617,9 @@ local_p2p_forward_megakernel(
     // Local rows use the frozen CUDA-IPC fast path. Cross-node rows are packed
     // once per (token,node) by the same-rail proxy path below.
     unsigned long long dispatch_peer_rows = 0ULL;
+#if MEGAMOE_DEVICE_TIMELINE
+    bool timeline_x_local_recorded = false;
+#endif
     for (std::uint64_t route = blockIdx.x;
          route < a.dispatch.sizes.route_count; route += gridDim.x) {
     const auto destination = a.dispatch.route_dst_rank[route];
@@ -3635,6 +3638,14 @@ local_p2p_forward_megakernel(
     for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
          vector += blockDim.x)
       target128[vector] = source128[vector];
+#if MEGAMOE_DEVICE_TIMELINE
+    __syncthreads();
+    if (!timeline_x_local_recorded) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible, GinDispatch,
+                              0U, route, a.epoch);
+      timeline_x_local_recorded = true;
+    }
+#endif
     if (threadIdx.x == 0) {
       auto *destination_headers = peer_at<LocalP2pRouteHeader>(
           destination_base, a.direct_headers_offset);
@@ -3786,6 +3797,8 @@ local_p2p_forward_megakernel(
               ncclGin_SignalInc{0}, ncclGin_CounterInc{0}, ncclCoopThread{},
               ncclGin_None{}, ::cuda::thread_scope_block,
               ::cuda::thread_scope_device);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, XLastDispatchPut, GinDispatch,
+                              context, packet_count, a.epoch);
       atomicAdd(&status->gin_dispatch_put_count, 3ULL);
       atomicAdd(&status->gin_signal_count, 1ULL);
       atomicAdd(&status->gin_metadata_bytes,
@@ -3819,6 +3832,8 @@ local_p2p_forward_megakernel(
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
       MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
                               context, incoming_packets, a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
+                              context, incoming_packets, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
@@ -3850,6 +3865,8 @@ local_p2p_forward_megakernel(
     auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
         window_bytes + a.gin_receive_payload_offset);
     MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_signal_count, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_signal_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
     const auto global_thread =
@@ -3931,6 +3948,8 @@ local_p2p_forward_megakernel(
     grid.sync();
     MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
   }
 #endif
     if (threadIdx.x == 0 && dispatch_peer_rows != 0ULL)
@@ -3988,6 +4007,10 @@ local_p2p_forward_megakernel(
     status->fc1_start_clock = status->dispatch_complete_clock;
   }
   MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
+                          a.dispatch.sizes.mtile_count, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U,
+                          a.dispatch.sizes.mtile_count, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
                           a.dispatch.sizes.mtile_count, a.epoch);
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -4081,6 +4104,8 @@ local_p2p_forward_megakernel(
 #if MEGAMOE_DEVICE_TIMELINE
     if (!timeline_fc1_started) {
       MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
+                              a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
                               a.epoch);
       timeline_fc1_started = true;
     }
@@ -5409,6 +5434,9 @@ local_p2p_backward_megakernel(
     // Forward canonical row mapping. Socket mode preloads both through its
     // host-enqueued aggregate phase before this compute-only launch.
     unsigned long long dy_peer_rows = 0ULL;
+#if MEGAMOE_DEVICE_TIMELINE
+    bool timeline_dy_local_recorded = false;
+#endif
     for (std::uint64_t route = blockIdx.x;
          route < a.dispatch.sizes.route_count; route += gridDim.x) {
     const auto destination = a.dispatch.route_dst_rank[route];
@@ -5428,6 +5456,14 @@ local_p2p_backward_megakernel(
     for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
          vector += blockDim.x)
       target128[vector] = source128[vector];
+#if MEGAMOE_DEVICE_TIMELINE
+    __syncthreads();
+    if (!timeline_dy_local_recorded) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstLocalRowVisible, GinDispatch,
+                              0U, route, a.epoch);
+      timeline_dy_local_recorded = true;
+    }
+#endif
     if (threadIdx.x == 0) {
       destination_gate[row] = a.gates[route];
       if (destination != a.rank)
@@ -5602,6 +5638,8 @@ local_p2p_backward_megakernel(
                 ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
                 ncclCoopThread{}, ncclGin_None{},
                 ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DyLastDispatchPut, GinDispatch,
+                                context, packet_count, a.epoch);
         atomicAdd(&status->gin_dispatch_put_count, 4ULL);
         atomicAdd(&status->gin_signal_count, 1ULL);
         atomicAdd(&status->gin_metadata_bytes,
@@ -5637,6 +5675,8 @@ local_p2p_backward_megakernel(
       if (incoming_packets != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0, incoming_packets);
       MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
+                              context, incoming_packets, a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstRemoteSignal, GinDispatch,
                               context, incoming_packets, a.epoch);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
@@ -5733,6 +5773,8 @@ local_p2p_backward_megakernel(
     grid.sync();
     MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayEnd, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DyLastRelay, ProxyRelay, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
   }
 #endif
   __threadfence_system();
@@ -5770,6 +5812,10 @@ local_p2p_backward_megakernel(
   }
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dy_dispatch_complete_clock = device_globaltimer_ns();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstMtileReady, Compute, 0U,
+                          a.dispatch.sizes.mtile_count, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, DyDispatchComplete, Compute, 0U,
+                          a.dispatch.sizes.mtile_count, a.epoch);
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDyComplete, a.epoch);
 
@@ -5886,6 +5932,8 @@ local_p2p_backward_megakernel(
     if (!timeline_dv_started) {
       MEGAMOE_TIMELINE_RECORD(a.timeline, DvFirst, Compute, 0U, task_shared,
                               a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DvClaimStart, Compute, 0U,
+                              task_shared, a.epoch);
       timeline_dv_started = true;
     }
 #endif

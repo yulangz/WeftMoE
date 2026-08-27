@@ -120,6 +120,39 @@ and dedicated Dispatch/Relay/Compute roles.  Transfer chunk, channel and
 credit values are compile-time policy candidates selected by full F+B
 autotuning; isolated chunk latency is not the optimization objective.
 
+### Dispatch-to-compute barrier localization
+
+Timeline schema 2 separates the first physically visible local row, the
+first remote signal and relay, the first M-tile readiness publication, the
+first compute claim, and the last global dispatch events. A real world-16
+cache-mode generation produced the following representative rank-local
+offsets (ranks 0 and 8 agreed within 0.02 ms):
+
+| event | Forward X | Backward dY |
+|---|---:|---:|
+| first local row visible | 0.014 ms | 0.014 ms |
+| last dispatch put issued | 3.40 ms | 3.43 ms |
+| first remote signal observed | 8.35 ms | 8.40 ms |
+| last proxy relay complete | 9.31 ms | 9.34 ms |
+| first M-tile declared ready | 9.31 ms | 9.35 ms |
+| first FC1/dV claim | 9.32 ms | 9.35 ms |
+
+Across all ranks, first-M-tile-to-first-claim P50/P95 was only
+0.0033/0.0038 ms for FC1 and 0.0046/0.0051 ms for dV. In contrast, the
+first-local-row-to-first-M-tile P50/P95 was 9.285/9.300 ms and
+9.320/9.336 ms respectively. The first remote signal still preceded the
+global M-tile publication by roughly 1.35--1.53 ms. This rules out the task
+scanner and claim bitmap as the primary cause: the current kernel explicitly
+publishes every M tile only after all puts, all relay work, the node ingress
+rendezvous, and cooperative-grid barriers complete.
+
+The optimization boundary is consequently the dataflow, not an arbitrary
+byte chunk. The implementation will publish store-complete row counts into
+canonical M-tile readiness words, retain dedicated GIN progress CTAs, and
+let compute workers consume ready tiles while later waves are still in
+flight. Packet wave size remains a compile-time policy restricted to one,
+two, or four M tiles and is selected by complete F+B autotuning.
+
 ## Nsight Compute boundary
 
 The existing NCCL-free main Forward profile reports 55.97% SM throughput,

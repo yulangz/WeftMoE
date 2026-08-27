@@ -56,6 +56,21 @@ EVENTS = {
     39: "dx_return_local_completion",
     40: "dx_source_relay",
     41: "dgate_return",
+    42: "x_first_local_row_visible",
+    43: "x_first_remote_signal",
+    44: "x_first_proxy_relay",
+    45: "x_first_mtile_ready",
+    46: "fc1_claim_start",
+    47: "x_last_dispatch_put",
+    48: "x_last_relay",
+    49: "x_dispatch_complete",
+    50: "dy_first_local_row_visible",
+    51: "dy_first_remote_signal",
+    52: "dy_first_mtile_ready",
+    53: "dv_claim_start",
+    54: "dy_last_dispatch_put",
+    55: "dy_last_relay",
+    56: "dy_dispatch_complete",
 }
 
 PAIRS = {
@@ -76,6 +91,16 @@ PAIRS = {
     "dw2_ready_to_start": (34, 35),
     "dw2": (35, 36),
     "dx_return_issue_to_completion": (38, 39),
+    "x_first_local_to_first_mtile": (42, 45),
+    "x_first_signal_to_first_mtile": (43, 45),
+    "x_first_mtile_to_fc1_claim": (45, 46),
+    "x_last_put_to_dispatch_complete": (47, 49),
+    "x_last_relay_to_dispatch_complete": (48, 49),
+    "dy_first_local_to_first_mtile": (50, 52),
+    "dy_first_signal_to_first_mtile": (51, 52),
+    "dy_first_mtile_to_dv_claim": (52, 53),
+    "dy_last_put_to_dispatch_complete": (54, 56),
+    "dy_last_relay_to_dispatch_complete": (55, 56),
 }
 
 
@@ -155,7 +180,7 @@ def main() -> int:
         for name, values in durations.items():
             aggregate.setdefault(name, []).extend(values)
     result = {
-        "schema": 1,
+        "schema": 2,
         "clock_contract": "durations within one GPU only",
         "ranks": rank_summaries,
         "aggregate_duration_ms": {
