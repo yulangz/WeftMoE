@@ -1,0 +1,1330 @@
+{
+  "comparison": "world16-megamoe-gin-vs-megatron-nccl-rdma-training",
+  "conclusion": {
+    "fifteen_percent_lead_achieved": false,
+    "socket_baseline_is_not_used_for_speedup": true
+  },
+  "cross_session": {
+    "megamoe_gin": {
+      "backward": {
+        "mean_ms": 53.257412666666674,
+        "per_session_mean_ms": [
+          53.227121,
+          53.273398,
+          53.271719000000004
+        ],
+        "standard_deviation_ms": 0.021430407716350127
+      },
+      "forward": {
+        "mean_ms": 42.28852933333333,
+        "per_session_mean_ms": [
+          42.337379999999996,
+          42.24309099999999,
+          42.285117
+        ],
+        "standard_deviation_ms": 0.038568872547115635
+      },
+      "notify_inclusive_forward_backward": {
+        "mean_ms": 95.50490866666667,
+        "per_session_mean_ms": [
+          95.497767,
+          95.48018199999999,
+          95.53677699999999
+        ],
+        "standard_deviation_ms": 0.02365024394988069
+      }
+    },
+    "megatron_rdma": {
+      "backward": {
+        "mean_ms": 44.49588937000001,
+        "per_session_mean_ms": [
+          44.58831602,
+          44.390515670000006,
+          44.508836419999994
+        ],
+        "standard_deviation_ms": 0.08126895345213045
+      },
+      "forward": {
+        "mean_ms": 31.33387815333333,
+        "per_session_mean_ms": [
+          31.25181722,
+          31.27899524,
+          31.470822
+        ],
+        "standard_deviation_ms": 0.09746751269928361
+      },
+      "notify_inclusive_forward_backward": {
+        "mean_ms": 77.19554039666667,
+        "per_session_mean_ms": [
+          77.24068927,
+          77.02416506,
+          77.32176686
+        ],
+        "standard_deviation_ms": 0.12561985886862947
+      }
+    },
+    "speedup_percent": {
+      "backward": {
+        "overall_from_cross_session_means": -19.69063529399607,
+        "per_session": [
+          -19.374593505897547,
+          -20.010766254745768,
+          -19.687961503442985
+        ],
+        "worst_session": -20.010766254745768
+      },
+      "forward": {
+        "overall_from_cross_session_means": -34.96104480394372,
+        "per_session": [
+          -35.471738177534355,
+          -35.05258297420934,
+          -34.362925124739355
+        ],
+        "worst_session": -35.471738177534355
+      },
+      "notify_inclusive_forward_backward": {
+        "overall_from_cross_session_means": -23.71816840185058,
+        "per_session": [
+          -23.636606434441767,
+          -23.9613333369121,
+          -23.557415821834972
+        ],
+        "worst_session": -23.9613333369121
+      }
+    }
+  },
+  "fixture_agreement": {
+    "all_ranks_all_sessions": true,
+    "fields": [
+      "per_rank_activation_hash",
+      "per_rank_route_hash",
+      "per_rank_gate_hash",
+      "per_rank_actual_w1_device_hash",
+      "per_rank_actual_w2_device_hash",
+      "per_rank_output_gradient_hash"
+    ],
+    "per_rank_activation_hash": [
+      171170217191544600,
+      171182943675543952,
+      171195582314065660,
+      171199388956613312,
+      171186940897052000,
+      171174618269435808,
+      171162362115059996,
+      171150146360183744,
+      171147585154567776,
+      171160392444862900,
+      171173160034830192,
+      171185869607400848,
+      171198477711397136,
+      171196495946543992,
+      171184090166848352,
+      171171785860874816
+    ],
+    "per_rank_actual_w1_device_hash": [
+      [
+        16928820429334670760,
+        11311687179131231856
+      ],
+      [
+        4016535015394025161,
+        3580938942983064310
+      ],
+      [
+        14976620708742839557,
+        8475967032973053903
+      ],
+      [
+        17772264709437089310,
+        7237355670343385421
+      ],
+      [
+        15000697718298631769,
+        5612083078625358510
+      ],
+      [
+        14672938540729649510,
+        8097573749253290397
+      ],
+      [
+        11004386657345555435,
+        11194317663959665854
+      ],
+      [
+        11278081069976602308,
+        4011105220726655095
+      ],
+      [
+        5042865990406204296,
+        3584059800358286617
+      ],
+      [
+        8733955545503437149,
+        3698468507427958434
+      ],
+      [
+        17631527866483194989,
+        6577527134594082114
+      ],
+      [
+        16712224276922025862,
+        8784737569087503322
+      ],
+      [
+        12580390798030887331,
+        6424608681326366345
+      ],
+      [
+        17324661362094421416,
+        17282895477344164072
+      ],
+      [
+        12894242257246741592,
+        18442269339919078237
+      ],
+      [
+        12429313591963634502,
+        8521007119468060686
+      ]
+    ],
+    "per_rank_actual_w2_device_hash": [
+      [
+        2153887418537559926,
+        6364654117250746183
+      ],
+      [
+        14862460664302823283,
+        16316752934770280061
+      ],
+      [
+        223751546341146457,
+        3831501490704224689
+      ],
+      [
+        15206672015332738493,
+        7074110121386248444
+      ],
+      [
+        1826354000942452981,
+        5837931446652297574
+      ],
+      [
+        12060011421755506532,
+        1311582304639632054
+      ],
+      [
+        10280870055855822719,
+        6204828651527283379
+      ],
+      [
+        3945823235289959980,
+        5942312969343757770
+      ],
+      [
+        14621602254457052938,
+        15028118195000666680
+      ],
+      [
+        8005321429682538661,
+        12921486994773038712
+      ],
+      [
+        17238992965503458444,
+        6530168634001831232
+      ],
+      [
+        17048682037489524232,
+        13881366494373668751
+      ],
+      [
+        15672185219692168117,
+        3877091339170309263
+      ],
+      [
+        3830953059585562156,
+        5632741324824072619
+      ],
+      [
+        1671471239981060488,
+        4487357138298425792
+      ],
+      [
+        14197986410393105859,
+        14392626198694436997
+      ]
+    ],
+    "per_rank_gate_hash": [
+      16982931231370995671,
+      14206228671031203357,
+      16480319015498463492,
+      2584222152514100441,
+      17486489915493326833,
+      10543222734339640248,
+      3628055528955998169,
+      541404397481342026,
+      15768522442401229232,
+      10073578652152128975,
+      16204961559445341160,
+      1261013586833055393,
+      9056837617023296751,
+      16580058255639657992,
+      8480634238111579082,
+      17378075445738318862
+    ],
+    "per_rank_output_gradient_hash": [
+      18308315629318780224,
+      18308317200433879312,
+      18308320683245227104,
+      18308321298629500248,
+      18308320869028194168,
+      18308318569773374080,
+      18308315370924344380,
+      18308316933349356544,
+      18308320417335110496,
+      18308323861860853908,
+      18308320600534384104,
+      18308318304567900836,
+      18308316014473442004,
+      18308316668378472192,
+      18308320149311064996,
+      18308323599004188276
+    ],
+    "per_rank_route_hash": [
+      14589262328670976444,
+      12187438025875985392,
+      17343939564522866128,
+      15160388894563610204,
+      12980344467368557683,
+      10273345834807270975,
+      2648909205294236883,
+      16977122404426347579,
+      16972899583252878652,
+      2621614568147205471,
+      673599563064448656,
+      15788788295361383656,
+      12113872089463536891,
+      11059000026647170880,
+      14322241447956076763,
+      15487770836575184340
+    ]
+  },
+  "measurement": {
+    "backward_scope": "device dY ready through final gradient drain",
+    "cpu_affinity_both_hosts": "0-191",
+    "forward_scope": "route/gate ready through final Forward drain",
+    "gpu_set_both_hosts": "0-7",
+    "independent_process_and_nccl_sessions": 3,
+    "measurements_per_session": 100,
+    "one_time_session_pool_weight_setup_included": false,
+    "rank_aggregation": "slowest-rank/MAX",
+    "training_scope": "route/gate ready through Notify, Forward, Backward and final gradient drain",
+    "warmups_per_session": 10
+  },
+  "network_audit": {
+    "megamoe_gin": {
+      "credit_stalls": 0,
+      "credit_stalls_source": "phase-batched production audit; unchanged frozen path",
+      "overlap_slowest_rank_us": {
+        "backward_dw1_dv_dx": [
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          },
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          },
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          }
+        ],
+        "backward_dw2_dv_dx": [
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          },
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          },
+          {
+            "max": 0.0,
+            "mean": 0.0,
+            "min": 0.0,
+            "p50": 0.0,
+            "p95": 0.0
+          }
+        ],
+        "forward_fc1_fc2": [
+          {
+            "max": 477.824,
+            "mean": 450.94112,
+            "min": 430.08,
+            "p50": 450.24,
+            "p95": 470.176
+          },
+          {
+            "max": 476.352,
+            "mean": 451.79616000000004,
+            "min": 431.264,
+            "p50": 450.432,
+            "p95": 470.24
+          },
+          {
+            "max": 476.896,
+            "mean": 451.61663999999996,
+            "min": 430.88,
+            "p50": 449.216,
+            "p95": 470.24
+          }
+        ],
+        "forward_fc2_return": [
+          {
+            "max": 4801.63,
+            "mean": 4776.9233,
+            "min": 4750.21,
+            "p50": 4776.38,
+            "p95": 4796.06
+          },
+          {
+            "max": 4807.36,
+            "mean": 4775.9462,
+            "min": 4753.12,
+            "p50": 4774.82,
+            "p95": 4791.84
+          },
+          {
+            "max": 4804.83,
+            "mean": 4776.1637,
+            "min": 4748.38,
+            "p50": 4776.26,
+            "p95": 4795.17
+          }
+        ]
+      },
+      "per_rank_backward_dispatch_puts": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "per_rank_backward_dx_payload_bytes": [
+        352393216,
+        352378880,
+        352321536,
+        352307200,
+        352249856,
+        352249856,
+        352264192,
+        352264192,
+        352364544,
+        352378880,
+        352393216,
+        352364544,
+        352335872,
+        352307200,
+        352249856,
+        352249856
+      ],
+      "per_rank_backward_dy_payload_bytes": [
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512
+      ],
+      "per_rank_backward_metadata_bytes": [
+        1474684,
+        1474704,
+        1474700,
+        1474636,
+        1474548,
+        1474492,
+        1474388,
+        1474388,
+        1474724,
+        1474704,
+        1474600,
+        1474556,
+        1474428,
+        1474412,
+        1474408,
+        1474408
+      ],
+      "per_rank_backward_return_puts": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "per_rank_backward_signals": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "per_rank_forward_dispatch_payload_bytes": [
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512,
+        117440512
+      ],
+      "per_rank_forward_dispatch_puts": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "per_rank_forward_metadata_bytes": [
+        1179720,
+        1179744,
+        1179768,
+        1179720,
+        1179672,
+        1179624,
+        1179528,
+        1179528,
+        1179768,
+        1179744,
+        1179648,
+        1179624,
+        1179528,
+        1179528,
+        1179552,
+        1179552
+      ],
+      "per_rank_forward_return_payload_bytes": [
+        352393216,
+        352378880,
+        352321536,
+        352307200,
+        352249856,
+        352249856,
+        352264192,
+        352264192,
+        352364544,
+        352378880,
+        352393216,
+        352364544,
+        352335872,
+        352307200,
+        352249856,
+        352249856
+      ],
+      "per_rank_forward_return_puts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "per_rank_forward_signals": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ]
+    },
+    "megatron_rdma": {
+      "collective_breakdown_present_all_sessions": true,
+      "derived_payload_bytes_per_rank": {
+        "combine_activation_peer": 660602880,
+        "dispatch_activation_peer": 660602880,
+        "dispatch_probability_peer": 184320,
+        "total_peer": 1321390080
+      }
+    }
+  },
+  "rdma_proof": {
+    "gid_index": 3,
+    "gid_type": "RoCE v2",
+    "hca_counter_throughput_by_session_gbytes_per_second": {
+      "local_rx": [
+        74.76887288620611,
+        76.43051095038948,
+        79.11223807558854
+      ],
+      "local_tx": [
+        74.7688814679312,
+        76.43062623683988,
+        79.11225530964353
+      ],
+      "remote_rx": [
+        74.76888146292838,
+        76.4306262437115,
+        79.11225529955348
+      ],
+      "remote_tx": [
+        74.76887288339204,
+        76.43051094647426,
+        79.1122380502807
+      ]
+    },
+    "hcas": [
+      "mlx5_bond_0",
+      "mlx5_bond_1",
+      "mlx5_bond_2",
+      "mlx5_bond_3",
+      "mlx5_bond_4",
+      "mlx5_bond_5",
+      "mlx5_bond_6",
+      "mlx5_bond_7"
+    ],
+    "key_log_lines": [
+      "HOST:PID:TID [0] NCCL INFO NCCL version 2.29.7+cuda12.9",
+      "HOST:PID:TID [6] NCCL INFO NCCL version 2.29.7+cuda12.9",
+      "HOST:PID:TID [0] NCCL INFO NET/IB : Using [0]mlx5_bond_0:1/RoCE [1]mlx5_bond_1:1/RoCE [2]mlx5_bond_2:1/RoCE [3]mlx5_bond_3:1/RoCE [4]mlx5_bond_4:1/RoCE [5]mlx5_bond_5:1/RoCE [6]mlx5_bond_6:1/RoCE [7]mlx5_bond_7:1/RoCE [RO]; OOB eth0:PRIVATE_IPV4<0>",
+      "HOST:PID:TID [0] NCCL INFO Using network IB",
+      "HOST:PID:TID [6] NCCL INFO NET/IB : Using [0]mlx5_bond_0:1/RoCE [1]mlx5_bond_1:1/RoCE [2]mlx5_bond_2:1/RoCE [3]mlx5_bond_3:1/RoCE [4]mlx5_bond_4:1/RoCE [5]mlx5_bond_5:1/RoCE [6]mlx5_bond_6:1/RoCE [7]mlx5_bond_7:1/RoCE [RO]; OOB eth0:PRIVATE_IPV4<0>",
+      "HOST:PID:TID [6] NCCL INFO Using network IB",
+      "HOST:PID:TID [0] NCCL INFO Channel 00/0 : 9[1] -> 0[0] [receive] via NET/IB/0/GDRDMA",
+      "HOST:PID:TID [0] NCCL INFO Channel 08/0 : 9[1] -> 0[0] [receive] via NET/IB/0/GDRDMA",
+      "HOST:PID:TID [2] NCCL INFO Channel 02/0 : 11[3] -> 2[2] [receive] via NET/IB/2/GDRDMA",
+      "HOST:PID:TID [2] NCCL INFO Channel 10/0 : 11[3] -> 2[2] [receive] via NET/IB/2/GDRDMA",
+      "HOST:PID:TID [1] NCCL INFO Channel 01/0 : 10[2] -> 1[1] [receive] via NET/IB/1/GDRDMA",
+      "HOST:PID:TID [3] NCCL INFO Channel 03/0 : 12[4] -> 3[3] [receive] via NET/IB/3/GDRDMA",
+      "HOST:PID:TID [6] NCCL INFO Channel 06/0 : 15[7] -> 6[6] [receive] via NET/IB/6/GDRDMA",
+      "HOST:PID:TID [2] NCCL INFO Channel 01/0 : 2[2] -> 9[1] [send] via NET/IB/1(1)/GDRDMA",
+      "HOST:PID:TID [3] NCCL INFO Channel 11/0 : 12[4] -> 3[3] [receive] via NET/IB/3/GDRDMA",
+      "HOST:PID:TID [1] NCCL INFO Channel 09/0 : 10[2] -> 1[1] [receive] via NET/IB/1/GDRDMA",
+      "HOST:PID:TID [2] NCCL INFO Channel 09/0 : 2[2] -> 9[1] [send] via NET/IB/1(1)/GDRDMA",
+      "HOST:PID:TID [6] NCCL INFO Channel 14/0 : 15[7] -> 6[6] [receive] via NET/IB/6/GDRDMA",
+      "HOST:PID:TID [7] NCCL INFO Channel 06/0 : 7[7] -> 14[6] [send] via NET/IB/6(6)/GDRDMA",
+      "HOST:PID:TID [1] NCCL INFO Channel 00/0 : 1[1] -> 8[0] [send] via NET/IB/0(0)/GDRDMA",
+      "HOST:PID:TID [7] NCCL INFO Channel 14/0 : 7[7] -> 14[6] [send] via NET/IB/6(6)/GDRDMA",
+      "HOST:PID:TID [3] NCCL INFO Channel 02/0 : 3[3] -> 10[2] [send] via NET/IB/2(2)/GDRDMA"
+    ],
+    "nccl_runtime": "2.29.7+cuda12.9",
+    "nccl_runtime_library": "NCCL_RUNTIME_DIR/libnccl.so.2.29.7",
+    "nccl_runtime_sha256": "19d9851b65feef08fb78280ffc0d3e9067d23bc1c637e4c93e3a6dd6e20b06e6",
+    "network_backend": "NCCL NET/IB over RoCE v2 with GDRDMA",
+    "rail_rate": "200 Gb/sec (2X NDR)",
+    "socket_payload_fallback_observed": false
+  },
+  "runs": [
+    {
+      "megamoe_gin_slowest_rank_ms": {
+        "backward": {
+          "max": 55.649699999999996,
+          "mean": 53.227121,
+          "min": 52.909699999999994,
+          "p50": 53.2004,
+          "p95": 53.469
+        },
+        "forward": {
+          "max": 43.8335,
+          "mean": 42.337379999999996,
+          "min": 42.0652,
+          "p50": 42.2674,
+          "p95": 42.850300000000004
+        },
+        "notify_inclusive_forward_backward": {
+          "max": 97.7748,
+          "mean": 95.497767,
+          "min": 95.0115,
+          "p50": 95.3938,
+          "p95": 96.2862
+        }
+      },
+      "megatron_collective_slowest_rank_ms": {
+        "combine": {
+          "max_ms": 15.044152,
+          "mean_ms": 13.62952584,
+          "min_ms": 13.413883,
+          "p50_ms": 13.491429,
+          "p95_ms": 14.514432
+        },
+        "dispatch_alltoall": {
+          "max_ms": 11.216238,
+          "mean_ms": 9.41757676,
+          "min_ms": 9.274977,
+          "p50_ms": 9.352495,
+          "p95_ms": 9.920828
+        }
+      },
+      "megatron_derived_effective_payload_gbytes_per_second": {
+        "combine": 48.46851517469958,
+        "dispatch": 70.16531076302053
+      },
+      "megatron_hca_counter_delta": {
+        "local": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 477999474148,
+            "tx_bytes": 478010600336
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478288913988,
+            "tx_bytes": 478336675188
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478334108928,
+            "tx_bytes": 478294958708
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478277041420,
+            "tx_bytes": 478286706316
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478309328872,
+            "tx_bytes": 478270275620
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478280043068,
+            "tx_bytes": 478250737612
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478259278136,
+            "tx_bytes": 478288130468
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478254563576,
+            "tx_bytes": 478265107024
+          }
+        },
+        "remote": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478010603168,
+            "tx_bytes": 477999477092
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478336675340,
+            "tx_bytes": 478288914036
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478294959256,
+            "tx_bytes": 478334109368
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478286707332,
+            "tx_bytes": 478277042544
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478270275776,
+            "tx_bytes": 478309328916
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478250735604,
+            "tx_bytes": 478280041060
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478288128436,
+            "tx_bytes": 478259276528
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478265106104,
+            "tx_bytes": 478254562448
+          }
+        }
+      },
+      "megatron_hca_counter_throughput_gbytes_per_second": {
+        "local_rx": 74.76887288620611,
+        "local_tx": 74.7688814679312,
+        "remote_rx": 74.76888146292838,
+        "remote_tx": 74.76887288339204
+      },
+      "megatron_rdma_slowest_rank_ms": {
+        "backward": {
+          "max_ms": 46.067596,
+          "mean_ms": 44.58831602,
+          "min_ms": 43.85202,
+          "p50_ms": 44.478574,
+          "p95_ms": 45.689965
+        },
+        "forward": {
+          "max_ms": 32.279984,
+          "mean_ms": 31.25181722,
+          "min_ms": 31.034961,
+          "p50_ms": 31.20466,
+          "p95_ms": 31.527707
+        },
+        "notify_inclusive_forward_backward": {
+          "max_ms": 80.46411,
+          "mean_ms": 77.24068927,
+          "min_ms": 75.821066,
+          "p50_ms": 77.187525,
+          "p95_ms": 78.421454
+        }
+      },
+      "rdma_log_sha256": {
+        "local": "0167e657add1753bc6d9d1d5f5ba51d9279e417c677a9f523169d9d8cd2bcb95",
+        "remote": "de9dca41ea87c62c61fc01b565df37aba2f85bd596cf9a075aa52b0e619ffbe4"
+      },
+      "session": 1,
+      "speedup_percent": {
+        "backward": -19.374593505897547,
+        "forward": -35.471738177534355,
+        "notify_inclusive_forward_backward": -23.636606434441767
+      }
+    },
+    {
+      "megamoe_gin_slowest_rank_ms": {
+        "backward": {
+          "max": 55.3812,
+          "mean": 53.273398,
+          "min": 52.9249,
+          "p50": 53.2565,
+          "p95": 53.465199999999996
+        },
+        "forward": {
+          "max": 42.7914,
+          "mean": 42.24309099999999,
+          "min": 42.0574,
+          "p50": 42.2139,
+          "p95": 42.5048
+        },
+        "notify_inclusive_forward_backward": {
+          "max": 97.6075,
+          "mean": 95.48018199999999,
+          "min": 95.08789999999999,
+          "p50": 95.42580000000001,
+          "p95": 95.86739999999999
+        }
+      },
+      "megatron_collective_slowest_rank_ms": {
+        "combine": {
+          "max_ms": 14.570585,
+          "mean_ms": 13.52293029,
+          "min_ms": 13.396798,
+          "p50_ms": 13.457331,
+          "p95_ms": 13.786107
+        },
+        "dispatch_alltoall": {
+          "max_ms": 10.903555,
+          "mean_ms": 9.60077011,
+          "min_ms": 9.28332,
+          "p50_ms": 9.442629,
+          "p95_ms": 10.506556
+        }
+      },
+      "megatron_derived_effective_payload_gbytes_per_second": {
+        "combine": 48.85057201607449,
+        "dispatch": 68.8264787542132
+      },
+      "megatron_hca_counter_delta": {
+        "local": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478206684196,
+            "tx_bytes": 478216977272
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478278159432,
+            "tx_bytes": 478327865172
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478322051204,
+            "tx_bytes": 478282525976
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478276591272,
+            "tx_bytes": 478287363412
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478308680184,
+            "tx_bytes": 478269055344
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478270397564,
+            "tx_bytes": 478243335220
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478263162180,
+            "tx_bytes": 478294182792
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478260097884,
+            "tx_bytes": 478270290080
+          }
+        },
+        "remote": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478216978960,
+            "tx_bytes": 478206685888
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478327864216,
+            "tx_bytes": 478278158368
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478282527768,
+            "tx_bytes": 478322052996
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478287364784,
+            "tx_bytes": 478276592212
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478269054460,
+            "tx_bytes": 478308679508
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478243333788,
+            "tx_bytes": 478270396136
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478294181280,
+            "tx_bytes": 478263160772
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478270290356,
+            "tx_bytes": 478260097840
+          }
+        }
+      },
+      "megatron_hca_counter_throughput_gbytes_per_second": {
+        "local_rx": 76.43051095038948,
+        "local_tx": 76.43062623683988,
+        "remote_rx": 76.4306262437115,
+        "remote_tx": 76.43051094647426
+      },
+      "megatron_rdma_slowest_rank_ms": {
+        "backward": {
+          "max_ms": 45.294685,
+          "mean_ms": 44.390515670000006,
+          "min_ms": 43.771954,
+          "p50_ms": 44.407417,
+          "p95_ms": 44.881456
+        },
+        "forward": {
+          "max_ms": 33.217563,
+          "mean_ms": 31.27899524,
+          "min_ms": 31.002859,
+          "p50_ms": 31.180368,
+          "p95_ms": 31.690229
+        },
+        "notify_inclusive_forward_backward": {
+          "max_ms": 78.916814,
+          "mean_ms": 77.02416506,
+          "min_ms": 75.910683,
+          "p50_ms": 77.039846,
+          "p95_ms": 77.879745
+        }
+      },
+      "rdma_log_sha256": {
+        "local": "0f66bbd6a72ffa0998199e9760089dc0df0af6113766ba9c73aa909f100bcbf3",
+        "remote": "5aa4b54b8f17e15e252888e22241acd984d5a7a97d1bf3b6561033d7c5c7bd41"
+      },
+      "session": 2,
+      "speedup_percent": {
+        "backward": -20.010766254745768,
+        "forward": -35.05258297420934,
+        "notify_inclusive_forward_backward": -23.9613333369121
+      }
+    },
+    {
+      "megamoe_gin_slowest_rank_ms": {
+        "backward": {
+          "max": 55.494,
+          "mean": 53.271719000000004,
+          "min": 52.973,
+          "p50": 53.2228,
+          "p95": 53.6304
+        },
+        "forward": {
+          "max": 43.295,
+          "mean": 42.285117,
+          "min": 42.093900000000005,
+          "p50": 42.238,
+          "p95": 42.6024
+        },
+        "notify_inclusive_forward_backward": {
+          "max": 100.517,
+          "mean": 95.53677699999999,
+          "min": 95.0829,
+          "p50": 95.4428,
+          "p95": 96.0804
+        }
+      },
+      "megatron_collective_slowest_rank_ms": {
+        "combine": {
+          "max_ms": 14.758377,
+          "mean_ms": 13.677751249999998,
+          "min_ms": 13.419557,
+          "p50_ms": 13.546288,
+          "p95_ms": 14.439811
+        },
+        "dispatch_alltoall": {
+          "max_ms": 10.856713,
+          "mean_ms": 9.49287052,
+          "min_ms": 9.277897,
+          "p50_ms": 9.390614,
+          "p95_ms": 9.781426
+        }
+      },
+      "megatron_derived_effective_payload_gbytes_per_second": {
+        "combine": 48.297623485439544,
+        "dispatch": 69.60878678454786
+      },
+      "megatron_hca_counter_delta": {
+        "local": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478202023732,
+            "tx_bytes": 478214570420
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478286113520,
+            "tx_bytes": 478333435712
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478324150820,
+            "tx_bytes": 478285226408
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478279833972,
+            "tx_bytes": 478290440064
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478316122700,
+            "tx_bytes": 478277555744
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478280839704,
+            "tx_bytes": 478251596620
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478274971856,
+            "tx_bytes": 478302301320
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478257703408,
+            "tx_bytes": 478267466940
+          }
+        },
+        "remote": {
+          "mlx5_bond_0": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond0",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478214572392,
+            "tx_bytes": 478202025284
+          },
+          "mlx5_bond_1": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond1",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478333434152,
+            "tx_bytes": 478286111956
+          },
+          "mlx5_bond_2": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond2",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478285226016,
+            "tx_bytes": 478324150112
+          },
+          "mlx5_bond_3": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond3",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478290439708,
+            "tx_bytes": 478279833088
+          },
+          "mlx5_bond_4": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond4",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478277555296,
+            "tx_bytes": 478316122252
+          },
+          "mlx5_bond_5": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond5",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478251595960,
+            "tx_bytes": 478280839468
+          },
+          "mlx5_bond_6": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond6",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478302301472,
+            "tx_bytes": 478274972224
+          },
+          "mlx5_bond_7": {
+            "gid_type": "RoCE v2",
+            "netdev": "bond7",
+            "rate": "200 Gb/sec (2X NDR)",
+            "rx_bytes": 478267467744,
+            "tx_bytes": 478257704104
+          }
+        }
+      },
+      "megatron_hca_counter_throughput_gbytes_per_second": {
+        "local_rx": 79.11223807558854,
+        "local_tx": 79.11225530964353,
+        "remote_rx": 79.11225529955348,
+        "remote_tx": 79.1122380502807
+      },
+      "megatron_rdma_slowest_rank_ms": {
+        "backward": {
+          "max_ms": 47.973713,
+          "mean_ms": 44.508836419999994,
+          "min_ms": 43.812429,
+          "p50_ms": 44.492669,
+          "p95_ms": 44.909855
+        },
+        "forward": {
+          "max_ms": 35.21895,
+          "mean_ms": 31.470822,
+          "min_ms": 31.06091,
+          "p50_ms": 31.293731,
+          "p95_ms": 32.29629
+        },
+        "notify_inclusive_forward_backward": {
+          "max_ms": 79.961459,
+          "mean_ms": 77.32176686,
+          "min_ms": 76.041643,
+          "p50_ms": 77.272723,
+          "p95_ms": 78.348141
+        }
+      },
+      "rdma_log_sha256": {
+        "local": "e3b56e078545b00fc12ecd9e468b486ff914370218c4ed5b88f179f71ab20a07",
+        "remote": "99512569c6ede0b1ae0753423795fee694e433984377683996a453652466abd6"
+      },
+      "session": 3,
+      "speedup_percent": {
+        "backward": -19.687961503442985,
+        "forward": -34.362925124739355,
+        "notify_inclusive_forward_backward": -23.557415821834972
+      }
+    }
+  ],
+  "schema": 1,
+  "shape": {
+    "experts": 384,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "tokens_per_rank": 8192,
+    "top_k": 6
+  }
+}

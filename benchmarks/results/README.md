@@ -14,7 +14,15 @@ expectations.
   Backward/F+B comparison.
 - `gin_world16_training_20260826.json` records three two-node world-16 GIN
   Forward and F+B sessions, exact fixture agreement, runtime put/signal/byte
-  counters, and the per-run Megatron Socket comparison gate.
+  counters, and the historical per-run Megatron Socket comparison. Socket is a
+  lower-bound result and is not a fair RDMA acceleration claim.
+- `gin_vs_megatron_rdma_world16_20260827.json` is the formal transport-fair
+  result: three independent MegaMOE GIN and Megatron NCCL RDMA/RoCE sessions,
+  10 warmups plus 100 samples each. It contains exact input/device-weight/dY
+  hash agreement, slowest-rank mean/P50/P95/min/max, per-session and aggregate
+  speedups, NCCL `NET/IB`/GDRDMA evidence, all-rail HCA counter deltas,
+  collective timings and GIN put/signal/byte audits. It records that MegaMOE
+  does not beat Megatron on this RDMA baseline.
 - `socket_world16_fallback_20260826.json` records the corresponding three-run
   full-FC NCCL Socket correctness/performance lower bound. Its explicit host
   payload phases are included and every GIN audit field is zero.

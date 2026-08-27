@@ -72,7 +72,7 @@ CUDA_LIB_SOURCES := \
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 PROD_CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
 
-.PHONY: all test reference-test launcher-security-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test rdma-launcher-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -281,6 +281,9 @@ reference-test:
 launcher-security-test:
 	PYTHONPATH=. python3 tests/test_launcher_security.py
 
+rdma-launcher-test:
+	PYTHONPATH=. python3 tests/test_megatron_rdma_launcher.py
+
 cross-check: $(BUILD_DIR)/metadata_dump
 	$(CROSS_CHECK_ENV) $(BUILD_DIR)/metadata_dump > $(BUILD_DIR)/cpp_metadata.json
 	PYTHONPATH=. python3 tests/compare_reference.py $(BUILD_DIR)/cpp_metadata.json
@@ -329,7 +332,7 @@ uninstall-manifest:
 install-test:
 	CXX='$(CXX)' python3 tests/check_install.py
 
-test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test cross-check header-test api-negative-test
+test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test rdma-launcher-test cross-check header-test api-negative-test
 	$(BUILD_DIR)/test_notify_dispatch
 
 ifeq ($(ENABLE_CUDA),1)

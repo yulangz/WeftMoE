@@ -440,12 +440,25 @@ torchrun --standalone --nproc-per-node=8 \
 make BUILD_DIR=build \
   NCCL_RUNTIME_LIB_DIR=/path/to/common/nccl/lib fair-integrated-bench
 
-# Two-node baseline: run on both nodes with NODE_RANK=0/1.
+# Historical two-node Socket lower bound: run on both nodes with NODE_RANK=0/1.
 NCCL_SOCKET_IFNAME=SOCKET_IFNAME NCCL_IB_DISABLE=1 torchrun \
   --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
   benchmarks/megatron_dispatch_baseline.py
+
+# Formal two-node RDMA baseline; the launcher rejects Socket fallback.
+python3 benchmarks/run_multinode_megatron_rdma.py \
+  --remote REMOTE_HOST --port REMOTE_PORT --gpus-per-node 8 \
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --ib-hca "$NCCL_HCAS" \
+  --ib-gid-index ROCE_V2_GID_INDEX --expert-body te-grouped-mlp \
+  --benchmark-backward --training-only --collective-breakdown
 ```
+
+The checked world-16 RDMA result does not meet the 15% target: MegaMOE GIN is
+34.96% slower in Forward, 19.69% slower in Backward and 23.72% slower in the
+Notify-inclusive F+B cross-session means. See
+`docs/performance_summary.md`; Socket numbers are not used for this claim.
 
 `make test` runs C++ contract tests, Python reference tests, and a machine-readable
 full-field C++/Python comparison. See [docs/build.md](docs/build.md) for

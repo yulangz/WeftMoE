@@ -48,6 +48,46 @@ boundary remain unchanged.
 
 ## Two hosts, sixteen GPUs
 
+The fair RDMA comparison is
+`benchmarks/results/gin_vs_megatron_rdma_world16_20260827.json`. Both sides use
+the same two L20X hosts, 16 GPUs, BF16 fixture, contiguous expert ownership,
+NCCL 2.29.7 CUDA 12.9 runtime, CPU/GPU placement, 10 warmups, 100 measurements
+and slowest-rank/MAX boundary. Activation, route, dynamic gate, full device W1,
+full device W2 and dY hashes match for every rank and session.
+
+| Metric | MegaMOE GIN means (ms) | Megatron NCCL RDMA means (ms) | MegaMOE speedup per session |
+|---|---:|---:|---:|
+| Forward | 42.337 / 42.243 / 42.285 | 31.252 / 31.279 / 31.471 | -35.47% / -35.05% / -34.36% |
+| Backward | 53.227 / 53.273 / 53.272 | 44.588 / 44.391 / 44.509 | -19.37% / -20.01% / -19.69% |
+| Notify-inclusive F+B | 95.498 / 95.480 / 95.537 | 77.241 / 77.024 / 77.322 | -23.64% / -23.96% / -23.56% |
+
+Negative speedup means MegaMOE is slower. Cross-session MegaMOE/Megatron
+means are 42.289/31.334 ms Forward, 53.257/44.496 ms Backward and
+95.505/77.196 ms F+B. Therefore the world-16 15% claim is **not met** against
+the real Megatron RDMA baseline; the earlier Socket comparison must not be used
+as evidence for such a claim.
+
+The RDMA result is fail-closed. Every process reports `Using network IB`, the
+selected payload channels report `NET/IB/.../GDRDMA`, and no `NET/Socket`
+payload line appears. All eight configured `mlx5_bond_0..7` rails are active at
+200 Gb/s with RoCE v2 GID index 3. Independent HCA counters advance on both
+hosts and report aggregate one-direction throughput of 74.77, 76.43 and
+79.11 GB/s across the three complete launcher sessions. Megatron's isolated
+dispatch All-to-All means are 9.418/9.601/9.493 ms and combine means are
+13.630/13.523/13.678 ms; derived payload rates are 68.83–70.17 GB/s dispatch
+and 48.30–48.85 GB/s combine.
+
+MegaMOE's runtime counters report exactly 117,440,512 dispatch bytes/rank,
+352,249,856–352,393,216 return bytes/rank, 24 dispatch puts, 8 return puts and
+16 signals for Forward. Backward reports 117,440,512 dY bytes/rank,
+352,249,856–352,393,216 dX bytes/rank, 32 dispatch puts, 24 return puts and 24
+signals. The frozen phase-batched path reports zero credit stalls. FC1/FC2 and
+FC2/return overlap distributions, per-rail HCA deltas, all P50/P95/min/max
+values and log SHA-256 values are retained in the machine-readable result.
+
+The older Socket comparison remains useful only as a correctness/lower-bound
+record:
+
 From `benchmarks/results/gin_world16_training_20260826.json`:
 
 | Metric | MegaMOE GIN cross-run mean (ms) | Megatron NCCL Socket mean (ms) | Improvement range |
@@ -56,10 +96,10 @@ From `benchmarks/results/gin_world16_training_20260826.json`:
 | Backward | 52.7385 | 720.9331 | 92.52–92.55% |
 | Notify-inclusive F+B | 94.0076 | 1465.2237 | 93.46–93.47% |
 
-This comparison records the actual network distinction: MegaMOE uses NCCL
+This historical comparison records the actual network distinction: MegaMOE uses NCCL
 2.29.7 GIN/RDMA same-rail device put/signal, while the measured Megatron
 baseline uses NCCL Socket. It is therefore a real end-to-end environment result,
-not an assertion that GIN and Socket have equal transport semantics. The
+not a fair transport comparison or an acceleration claim. The
 separately measured MegaMOE Socket backend remains a correctness/lower-bound
 result in `socket_world16_fallback_20260826.json`.
 

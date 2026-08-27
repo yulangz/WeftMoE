@@ -71,6 +71,8 @@ def benchmark_arguments(args):
         result.append("--benchmark-backward")
     if args.training_only:
         result.append("--training-only")
+    if getattr(args, "collective_breakdown", False):
+        result.append("--collective-breakdown")
     return result
 
 
@@ -111,6 +113,7 @@ def main():
                         default="te-grouped-mlp")
     parser.add_argument("--benchmark-backward", action="store_true")
     parser.add_argument("--training-only", action="store_true")
+    parser.add_argument("--collective-breakdown", action="store_true")
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")

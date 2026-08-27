@@ -304,7 +304,7 @@ environment variables. It sends aggregates directly between ranks and runs
 the frozen WGMMA/TMA FC core, but does not claim node-deduplicated same-rail
 GIN execution or a single cross-node persistent payload kernel.
 
-### World-16 full GIN Forward/Backward and Megatron Socket baseline
+### World-16 full GIN Forward/Backward and Megatron network baselines
 
 The production main-shape GIN benchmark runs without a host payload phase:
 
@@ -343,6 +343,46 @@ The checked result is
 41.069 ms GIN Forward, 52.738 ms GIN Backward, and 94.008 ms
 Notify-inclusive GIN F+B, versus 816.308/720.933/1465.224 ms for Megatron
 NCCL Socket. Every individual run clears all three gates.
+
+The formal RDMA baseline uses the same Megatron benchmark body but fails unless
+NCCL selects real IB/RoCE with GPUDirect RDMA. `NCCL_HCAS` is the explicit
+comma-separated HCA:port allowlist for the target hosts; `SOCKET_IFNAME` is
+only the bootstrap/OOB interface:
+
+```bash
+python3 benchmarks/run_multinode_megatron_rdma.py \
+  --remote REMOTE_HOST --port REMOTE_PORT --gpus-per-node 8 \
+  --nccl-lib-dir "$NCCL_RUNTIME_DIR:$CUDA_COMPAT_DIR" \
+  --socket-ifname SOCKET_IFNAME --ib-hca "$NCCL_HCAS" \
+  --ib-gid-index ROCE_V2_GID_INDEX \
+  --tokens 8192 --hidden 7168 --intermediate 3072 \
+  --experts 384 --top-k 6 --warmups 10 --iterations 100 \
+  --expert-body te-grouped-mlp --benchmark-backward --training-only \
+  --collective-breakdown --evidence-dir EVIDENCE_DIR
+```
+
+The launcher explicitly sets `NCCL_IB_DISABLE=0`, `NCCL_NET=IB`, the HCA/GID,
+RoCE version, address family, GDR level and OOB interface. It rejects missing
+`NET/IB`, missing `GDRDMA`, any `NET/Socket` payload selection, any configured
+rail whose counters do not advance on both hosts, or a runtime other than
+2.29.7. Full redacted INFO logs and a compact evidence JSON are written to the
+requested evidence directory. Run three independent GIN Forward, GIN Backward
+and Megatron RDMA sessions, then generate the checked result with:
+
+```bash
+python3 benchmarks/compare_multinode_rdma_training.py \
+  --gin-forward GIN_FORWARD_1 GIN_FORWARD_2 GIN_FORWARD_3 \
+  --gin-backward GIN_BACKWARD_1 GIN_BACKWARD_2 GIN_BACKWARD_3 \
+  --megatron-rdma MEGATRON_RDMA_1 MEGATRON_RDMA_2 MEGATRON_RDMA_3 \
+  --cpu-affinity CPUSET --gpu-set GPUSET \
+  --nccl-runtime-sha256 NCCL_RUNTIME_SHA256 \
+  --output benchmarks/results/gin_vs_megatron_rdma_world16_20260827.json
+```
+
+That result is the formal world-16 comparison. MegaMOE is slower by
+34.36–35.47% Forward, 19.37–20.01% Backward and 23.56–23.96% F+B; consequently
+the 15% cross-node target remains open. The Socket result above remains a
+correctness/lower-bound record only.
 
 For a small exact correctness cross-check, run both GIN and Socket scenarios
 with identical `MEGAMOE_P2P_BENCH_TOKENS` and then compare the actual per-rank
@@ -770,7 +810,8 @@ warmups and 100 samples, the measured world-16 means were 0.902 ms routing,
 roundtrip (P50 926.951, P95 1073.007 ms). The corresponding estimated payload
 rate was about 1.426 GB/s/direction/rank. This remains a real Megatron
 cross-host Socket-NCCL identity-transport baseline. The newer full-FC
-world-16 comparison and GIN speedup are reported in the Phase-7 section above;
+world-16 fair RDMA comparison (which records a GIN slowdown, not a speedup) is
+reported in the Phase-7 section above;
 the two benchmark semantics must not be mixed.
 
 Example two-node invocation (run once per node with node rank 0/1):

@@ -332,6 +332,9 @@ def main():
     parser.add_argument(
         "--training-only", action="store_true",
         help="measure only native Forward/Backward/training-step boundaries")
+    parser.add_argument(
+        "--collective-breakdown", action="store_true",
+        help="also time routing metadata, dispatch and combine collectives")
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -605,7 +608,7 @@ def main():
     measured_runs = []
     for run in range(args.runs):
         run_result = {"run": run}
-        if not args.training_only:
+        if not args.training_only or args.collective_breakdown:
             run_result.update({
                 "routing_metadata_and_local_permute": measure(
                     prepare_dispatch, args.warmups, args.iterations),
@@ -613,6 +616,9 @@ def main():
                     dispatch_collective, args.warmups, args.iterations),
                 "combine": measure(
                     combine_roundtrip, args.warmups, args.iterations),
+            })
+        if not args.training_only:
+            run_result.update({
                 "native_identity_e2e": measure(
                     full_roundtrip, args.warmups, args.iterations),
                 "common_semantics_identity_e2e": measure(
@@ -751,7 +757,7 @@ def main():
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
             "sum; final BF16 cast"),
-        "payload_bytes_per_rank": {
+        "derived_payload_bytes_per_rank": {
             "dispatch_activation_peer": activation_peer_bytes,
             "dispatch_probability_peer": probability_peer_bytes,
             "combine_activation_peer": return_peer_bytes,
