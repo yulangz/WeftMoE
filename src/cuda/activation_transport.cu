@@ -3648,6 +3648,22 @@ __device__ void mark_task_space_complete(
   task.inflight = 0ULL;
 }
 
+__device__ void claim_completion_tasks(
+    transport_state::GenerationCompletionVector *completion,
+    transport_state::TaskClass kind, unsigned long long count = 1ULL) {
+  auto &task = completion_task(completion, kind);
+  atomicAdd(&task.claimed, count);
+  atomicAdd(&task.inflight, count);
+}
+
+__device__ void complete_completion_tasks(
+    transport_state::GenerationCompletionVector *completion,
+    transport_state::TaskClass kind, unsigned long long count = 1ULL) {
+  auto &task = completion_task(completion, kind);
+  atomicAdd(&task.completed, count);
+  atomicAdd(&task.inflight, 0ULL - count);
+}
+
 __device__ bool completion_vector_ready(
     const transport_state::GenerationCompletionVector &completion) {
   for (std::size_t index = 0; index < transport_state::kTaskClassCount;
@@ -3822,12 +3838,20 @@ local_p2p_forward_megakernel(
                 signal.expected_packets * context / a.gin_context_count;
             const auto end = signal.expected_packets * (context + 1U) /
                              a.gin_context_count;
-            if (end != begin)
+            if (end != begin) {
               ++return_tasks;
+              const auto source_partition =
+                  signal.source_node < a.node ? signal.source_node
+                                              : signal.source_node - 1U;
+              context_completion[source_partition * a.gin_context_count +
+                                 context]
+                  .return_expected += 1ULL;
+            }
           }
         }
         completion_task(completion, transport_state::TaskClass::Return)
             .expected = return_tasks;
+        completion->return_local_completion_expected = return_tasks;
         completion->directory_expected =
             static_cast<unsigned long long>(
                 a.dispatch.identity.num_nodes - 1U) *
@@ -4187,6 +4211,14 @@ local_p2p_forward_megakernel(
         atomicAdd(&completion->directory_ready, 1ULL);
         atomicAdd(&completion->dispatch_local_completion_completed,
                   1ULL + directory.wave_count);
+        if (directory.wave_count != 0ULL) {
+          claim_completion_tasks(completion,
+                                 transport_state::TaskClass::DispatchWave,
+                                 directory.wave_count);
+          complete_completion_tasks(completion,
+                                    transport_state::TaskClass::DispatchWave,
+                                    directory.wave_count);
+        }
       }
     }
     __syncthreads();
@@ -4388,6 +4420,25 @@ local_p2p_forward_megakernel(
       }
     }
     grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+      unsigned long long relayed = 0ULL;
+      const auto contexts =
+          (a.dispatch.identity.num_nodes - 1U) * a.gin_context_count;
+      for (std::uint32_t index = 0; index < contexts; ++index) {
+        auto &record = context_completion[index];
+        record.relay_claimed = record.relay_expected;
+        record.relay_completed = record.relay_expected;
+        record.last_progress_globaltimer = device_globaltimer_ns();
+        relayed += record.relay_expected;
+      }
+      if (relayed != 0ULL) {
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::RelayWave, relayed);
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::RelayWave,
+                                  relayed);
+      }
+    }
     MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
     MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
@@ -4543,6 +4594,10 @@ local_p2p_forward_megakernel(
 #endif
     if (expert >= a.dispatch.sizes.owned_expert_count)
       break;
+    if constexpr (!StaticLocal)
+      if (a.use_gin)
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::Fc1OrDv);
 #if MEGAMOE_DEVICE_TIMELINE
     if (!timeline_fc1_started) {
       MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
@@ -4641,6 +4696,10 @@ local_p2p_forward_megakernel(
           fc1_done[mblock]);
       ready.fetch_add(1ULL, ::cuda::memory_order_release);
     }
+    if constexpr (!StaticLocal)
+      if (a.use_gin)
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::Fc1OrDv);
   }
   if (threadIdx.x == 0)
     atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
@@ -4699,6 +4758,10 @@ local_p2p_forward_megakernel(
     while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
            fc1_ntiles) {
     }
+    if constexpr (!StaticLocal)
+      if (a.use_gin)
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::Fc2OrDx);
     if (threadIdx.x == 0)
       atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
 #if MEGAMOE_DEBUG_VALIDATE
@@ -4831,6 +4894,10 @@ local_p2p_forward_megakernel(
       }
       __syncthreads();
     }
+    if constexpr (!StaticLocal)
+      if (a.use_gin)
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::Fc2OrDx);
   }
 #if __has_include(<nccl_device.h>)
   if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
@@ -4956,6 +5023,12 @@ local_p2p_forward_megakernel(
         }
         __syncthreads();
         if (threadIdx.x == 0U && last_return != first_return) {
+          claim_completion_tasks(completion,
+                                 transport_state::TaskClass::Return);
+          const auto record_index =
+              source_partition * a.gin_context_count + context;
+          context_completion[record_index].return_claimed += 1ULL;
+          context_completion[record_index].inflight += 1ULL;
           MEGAMOE_TIMELINE_RECORD(
               a.timeline, ReturnGinPutIssue, GinReturn, context,
               (last_return - first_return) * a.hidden *
@@ -4987,6 +5060,35 @@ local_p2p_forward_megakernel(
       }
       if (threadIdx.x == 0U && return_puts != 0ULL)
         gin.waitCounter(ncclCoopThread{}, 0, return_puts);
+      if (threadIdx.x == 0U && return_puts != 0ULL) {
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::Return,
+                                  return_puts);
+        atomicAdd(&completion->return_local_completion_completed,
+                  return_puts);
+        for (std::uint32_t signal_index = 0;
+             signal_index < a.dispatch.sizes.incoming_signal_count;
+             ++signal_index) {
+          const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+          if (signal.source_node == a.node)
+            continue;
+          const auto begin =
+              signal.expected_packets * context / a.gin_context_count;
+          const auto end = signal.expected_packets * (context + 1U) /
+                           a.gin_context_count;
+          if (begin == end)
+            continue;
+          const auto source_partition =
+              signal.source_node < a.node ? signal.source_node
+                                          : signal.source_node - 1U;
+          auto &record = context_completion[
+              source_partition * a.gin_context_count + context];
+          record.return_completed += 1ULL;
+          record.inflight -= 1ULL;
+          record.local_completion += 1ULL;
+          record.last_progress_globaltimer = device_globaltimer_ns();
+        }
+      }
       MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
                               context, return_puts, a.epoch);
       __syncthreads();
@@ -5068,6 +5170,18 @@ local_p2p_forward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+      const auto arrivals = completion_task(
+          completion, transport_state::TaskClass::SourceArrival).expected;
+      if (arrivals != 0ULL) {
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::SourceArrival,
+                               arrivals);
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::SourceArrival,
+                                  arrivals);
+      }
+    }
     MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay, 0U,
                             a.dispatch.sizes.route_count, a.epoch);
     if (blockIdx.x == 0U) {
@@ -5149,6 +5263,10 @@ local_p2p_forward_megakernel(
            warp / kWarpsPerToken;
        token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
        token += static_cast<std::uint64_t>(gridDim.x) * kTokensPerCta) {
+    if constexpr (!StaticLocal)
+      if (a.use_gin && lane == 0U)
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::Reduce);
     if (lane == 0U && status->reduced_tokens == ~0ULL)
       atomicMin(&status->reduced_tokens, device_globaltimer_ns());
     unsigned long long lane_route = 0ULL;
@@ -5199,6 +5317,11 @@ local_p2p_forward_megakernel(
              << 16U);
       output8[vector] = make_uint4(words[0], words[1], words[2], words[3]);
     }
+    __syncwarp();
+    if constexpr (!StaticLocal)
+      if (a.use_gin && lane == 0U)
+        complete_completion_tasks(completion,
+                                  transport_state::TaskClass::Reduce);
   }
   if (lane == 0U)
     atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
@@ -5215,14 +5338,6 @@ local_p2p_forward_megakernel(
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
       if (blockIdx.x == 0U && threadIdx.x == 0U) {
-        for (std::size_t index = 0;
-             index < transport_state::kTaskClassCount; ++index)
-          mark_task_space_complete(completion->tasks[index]);
-        completion->return_local_completion_expected =
-            completion_task(completion, transport_state::TaskClass::Return)
-                .expected;
-        completion->return_local_completion_completed =
-            completion->return_local_completion_expected;
         completion->ring_credit_restored = completion->ring_credit_expected;
         publish_elected_terminal(completion, a.epoch, status->error != 0U);
       }
