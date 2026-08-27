@@ -67,4 +67,11 @@ struct ForwardKernelArgs {
   std::size_t gin_send_dispatch_directory_offset = 0;
   std::size_t gin_receive_dispatch_directory_offset = 0;
   std::size_t x_arrived_rows_offset = 0;
+  std::size_t forward_output_ready_epoch_offset = 0;
+  std::size_t forward_return_chunk_directory_offset = 0;
+  std::size_t forward_return_chunk_state_offset = 0;
+  std::size_t forward_return_chunk_ready_count_offset = 0;
+  std::size_t forward_return_fragment_index_offset = 0;
+  std::size_t forward_return_source_compact_index_offset = 0;
+  std::uint64_t forward_return_chunk_capacity = 0;
 };

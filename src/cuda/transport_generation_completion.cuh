@@ -59,6 +59,9 @@ struct GenerationCompletionVector {
   unsigned long long first_wait_expected;
   unsigned long long first_wait_arrived;
   unsigned long long tile_waiter_count;
+#if MEGAMOE_DEBUG_VALIDATE
+  std::array<unsigned long long, 8> first_wait_arrived_by_rail;
+#endif
   unsigned long long kernel_complete_epoch;
   unsigned long long terminal_publish_count;
 };

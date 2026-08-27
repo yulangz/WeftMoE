@@ -334,6 +334,23 @@ struct GinDispatchContextRecord {
 };
 static_assert(sizeof(GinDispatchContextRecord) == 32);
 
+// Forward Return uses immutable, generation-local compact chunks. A chunk owns a
+// contiguous range in both the registered staging window and the source
+// rank's return receive window.  Its rows are selected from the canonical
+// reverse descriptors; FC2 completion order never changes this identity.
+struct ForwardReturnChunkRecord {
+  std::uint64_t row_begin;
+  std::uint32_t row_count;
+  std::uint32_t source_node;
+  std::uint32_t context;
+  std::uint32_t expected_fragments;
+  std::uint64_t payload_bytes;
+};
+static_assert(sizeof(ForwardReturnChunkRecord) == 32);
+
+constexpr std::uint64_t kForwardReturnChunkRows = 64ULL;
+[[maybe_unused]] constexpr std::uint32_t kForwardReturnCompletionBatch = 8U;
+
 struct BackwardDeviceStatus {
   unsigned long long start_clock;
   unsigned long long dy_dispatch_complete_clock;
@@ -465,9 +482,22 @@ void dump_generation_completion(std::ostream &output,
          << ".tile_wait={tile=" << word(kTail + 19ULL)
          << ",expected=" << word(kTail + 20ULL)
          << ",arrived=" << word(kTail + 21ULL)
-         << ",waiters=" << word(kTail + 22ULL) << "} " << prefix
+         << ",waiters=" << word(kTail + 22ULL) << '}';
+#if MEGAMOE_DEBUG_VALIDATE
+  output << ' ' << prefix << ".tile_wait_rails={";
+  for (std::uint32_t rail = 0; rail < 8U; ++rail) {
+    if (rail != 0U)
+      output << ',';
+    output << word(kTail + 23ULL + rail);
+  }
+  output << "} " << prefix
+         << ".kernel_complete_epoch=" << word(kTail + 31ULL) << ' ' << prefix
+         << ".terminal_publish_count=" << word(kTail + 32ULL);
+#else
+  output << ' ' << prefix
          << ".kernel_complete_epoch=" << word(kTail + 23ULL) << ' ' << prefix
          << ".terminal_publish_count=" << word(kTail + 24ULL);
+#endif
   for (std::uint32_t context = 0; context < contexts; ++context) {
     const auto base = transport_state::kGenerationCompletionWords +
                       context * transport_state::kContextCompletionWords;
@@ -524,6 +554,13 @@ struct Layout {
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_x_arrived_rows = 0;
+  std::size_t forward_output_ready_epoch = 0;
+  std::size_t forward_return_chunk_directory = 0;
+  std::size_t forward_return_chunk_state = 0;
+  std::size_t forward_return_chunk_ready_count = 0;
+  std::size_t forward_return_fragment_index = 0;
+  std::size_t forward_return_source_compact_index = 0;
+  std::uint64_t forward_return_chunk_capacity = 0;
   std::size_t forward_scheduler = 0;
   std::size_t forward_completion = 0;
   std::size_t forward_context_completion = 0;
@@ -828,9 +865,45 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_fc1_done = append(cursor, max_mblocks,
                                      sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
+    // A destination tile is produced concurrently by every node-local rail.
+    // Keep one row counter per local-rank/rail instead of issuing contended
+    // system-scope atomics from several GPUs into one peer word. The consumer
+    // sums the fixed rail vector with acquire loads. This is both deterministic
+    // and avoids relying on peer-atomic combining behavior of a particular
+    // NVLink/virtualization topology.
     layout.forward_x_arrived_rows = append(
-        cursor, max_mblocks, sizeof(std::uint64_t),
-        "forward exact X M-tile arrived rows");
+        cursor,
+        checked_mul(max_mblocks, config.max_world_size,
+                    "forward exact X M-tile rail counters"),
+        sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
+    layout.forward_output_ready_epoch = append(
+        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
+        "forward output row ready epochs");
+    // A discontinuity in the canonical reverse-row space may terminate a
+    // chunk.  The safe O(routes) bound is therefore one directory record per
+    // destination row rather than ceil(rows/chunk_rows).
+    layout.forward_return_chunk_capacity =
+        config.max_destination_rows_per_rank;
+    layout.forward_return_chunk_directory = append(
+        cursor, layout.forward_return_chunk_capacity,
+        sizeof(ForwardReturnChunkRecord),
+        "forward return chunk directory");
+    layout.forward_return_chunk_state = append(
+        cursor, layout.forward_return_chunk_capacity, sizeof(std::uint64_t),
+        "forward return chunk state");
+    layout.forward_return_chunk_ready_count = append(
+        cursor,
+        checked_mul(layout.forward_return_chunk_capacity,
+                    config.max_world_size,
+                    "forward return chunk producer rail counters"),
+        sizeof(std::uint64_t),
+        "forward return chunk ready count");
+    layout.forward_return_fragment_index = append(
+        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
+        "forward return compact fragment index");
+    layout.forward_return_source_compact_index = append(
+        cursor, routes, sizeof(std::uint64_t),
+        "forward source compact return index");
     layout.forward_scheduler = append(
         cursor, 4 + config.max_world_size * 32ULL,
         sizeof(std::uint64_t), "forward scheduler");
@@ -2455,9 +2528,13 @@ __global__ void initialize_forward_generation_signals_kernel(
   }
   for (std::uint32_t peer = index; peer < world; peer += blockDim.x)
     compute_ready[peer] = initial;
+  const auto x_arrived_count = mtile_count * peer_count;
+  for (std::uint64_t slot = index; slot < x_arrived_count;
+       slot += blockDim.x) {
+    x_arrived[slot] = 0ULL;
+  }
   for (std::uint64_t tile = index; tile < mtile_count;
        tile += blockDim.x) {
-    x_arrived[tile] = 0ULL;
     if (dy_arrived)
       dy_arrived[tile] = 0ULL;
   }
@@ -3691,6 +3768,12 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
     return;
   if (!a.use_gin || valid_rows == 0U)
     return;
+  // One elected lane polls the peer-visible rail counters; the CTA-level
+  // synchronization at the call site releases the remaining lanes. Polling
+  // from all 384 threads only multiplies L2/system traffic while conveying no
+  // additional readiness information.
+  if (threadIdx.x != 0U)
+    return;
   const auto end_row = local_row + valid_rows;
   const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
   const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
@@ -3706,9 +3789,16 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
     }
     if (tile_row >= end_row)
       break;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        ready(arrived[tile]);
-    auto current = ready.load(::cuda::memory_order_acquire);
+    auto load_arrived = [&]() {
+      unsigned long long total = 0ULL;
+      for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            ready(arrived[tile * a.local_world_size + rail]);
+        total += ready.load(::cuda::memory_order_acquire);
+      }
+      return total;
+    };
+    auto current = load_arrived();
 #if MEGAMOE_DEBUG_VALIDATE
     if (current < expected && threadIdx.x == 0U) {
       atomicAdd(&completion->tile_waiter_count, 1ULL);
@@ -3716,6 +3806,13 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
       if (completion->first_waiting_tile == tile) {
         completion->first_wait_expected = expected;
         completion->first_wait_arrived = current;
+        for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              ready(arrived[tile * a.local_world_size + rail]);
+          completion->first_wait_arrived_by_rail[rail] =
+              ready.load(::cuda::memory_order_acquire);
+        }
       }
     }
 #endif
@@ -3723,8 +3820,16 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
 #if MEGAMOE_DEBUG_VALIDATE
       if (threadIdx.x == 0U && completion->first_waiting_tile == tile)
         completion->first_wait_arrived = current;
+      if (threadIdx.x == 0U && completion->first_waiting_tile == tile)
+        for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              ready(arrived[tile * a.local_world_size + rail]);
+          completion->first_wait_arrived_by_rail[rail] =
+              ready.load(::cuda::memory_order_acquire);
+        }
 #endif
-      current = ready.load(::cuda::memory_order_acquire);
+      current = load_arrived();
     }
     tile_row = tile_row_end;
   }
@@ -3880,6 +3985,18 @@ local_p2p_forward_megakernel(
       a.local_base, a.forward_task_claim_offset);
   auto *fc1_done = peer_at<unsigned long long>(
       a.local_base, a.forward_fc1_done_offset);
+  auto *forward_output_ready_epoch = peer_at<unsigned long long>(
+      a.local_base, a.forward_output_ready_epoch_offset);
+  auto *forward_return_chunks = peer_at<ForwardReturnChunkRecord>(
+      a.local_base, a.forward_return_chunk_directory_offset);
+  auto *forward_return_chunk_state = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_chunk_state_offset);
+  auto *forward_return_chunk_ready_count = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_chunk_ready_count_offset);
+  auto *forward_return_fragment_index = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_fragment_index_offset);
+  auto *forward_return_source_compact_index = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_source_compact_index_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
   auto *ab_cache = a.forward_ab_cache_offset == 0
                        ? static_cast<transport::BFloat16 *>(nullptr)
@@ -3898,6 +4015,8 @@ local_p2p_forward_megakernel(
       scheduler[3] +=
           (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
     scheduler[4U + a.world] = 0ULL;
+    scheduler[5U + 2ULL * a.world] = 0ULL; // GIN headers ready contexts
+    scheduler[6U + 2ULL * a.world] = 0ULL; // Return directory ready epoch
     if constexpr (!StaticLocal) {
       if (a.use_gin) {
         completion->generation = a.dispatch.identity.generation;
@@ -3933,32 +4052,9 @@ local_p2p_forward_megakernel(
             .expected = a.dispatch.sizes.route_count;
         completion_task(completion, transport_state::TaskClass::Reduce)
             .expected = a.dispatch.identity.num_tokens;
-        unsigned long long return_tasks = 0ULL;
-        for (std::uint32_t index = 0;
-             index < a.dispatch.sizes.incoming_signal_count; ++index) {
-          const auto signal = a.dispatch.incoming_proxy_signals[index];
-          if (signal.source_node == a.node)
-            continue;
-          for (std::uint32_t context = 0; context < a.gin_context_count;
-               ++context) {
-            const auto begin =
-                signal.expected_packets * context / a.gin_context_count;
-            const auto end = signal.expected_packets * (context + 1U) /
-                             a.gin_context_count;
-            if (end != begin) {
-              ++return_tasks;
-              const auto source_partition =
-                  signal.source_node < a.node ? signal.source_node
-                                              : signal.source_node - 1U;
-              context_completion[source_partition * a.gin_context_count +
-                                 context]
-                  .return_expected += 1ULL;
-            }
-          }
-        }
         completion_task(completion, transport_state::TaskClass::Return)
-            .expected = return_tasks;
-        completion->return_local_completion_expected = return_tasks;
+            .expected = 0ULL;
+        completion->return_local_completion_expected = 0ULL;
         completion->directory_expected =
             static_cast<unsigned long long>(
                 a.dispatch.identity.num_nodes - 1U) *
@@ -4001,6 +4097,14 @@ local_p2p_forward_megakernel(
        mtile < a.dispatch.sizes.mtile_count;
        mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
     fc1_done[mtile] = a.epoch << 32U;
+  // The same allocation is a generation-local row->(proxy,chunk) map for
+  // remote Return. Clear only the actual canonical rows; peer proxies fill
+  // remote-route entries after consuming the immutable Dispatch directory.
+  for (std::uint64_t row =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       row < a.dispatch.sizes.incoming_row_count;
+       row += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+    forward_output_ready_epoch[row] = 0ULL;
   grid.sync();
   forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -4070,9 +4174,12 @@ local_p2p_forward_megakernel(
       if (threadIdx.x == 0) {
         auto *arrived = peer_at<unsigned long long>(
             destination_base, a.x_arrived_rows_offset);
+        const auto rail = a.rank % a.local_world_size;
         ::cuda::atomic_ref<unsigned long long,
                            ::cuda::thread_scope_system>
-            counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
+            counter(arrived[a.dispatch_waves.route_dst_mtile[route] *
+                                a.local_world_size +
+                            rail]);
         counter.fetch_add(1ULL, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
         atomicAdd(&completion->local_rows_published, 1ULL);
@@ -4190,6 +4297,53 @@ local_p2p_forward_megakernel(
     auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
         window_bytes + a.gin_send_fanout_offset);
 #endif
+    // The owner-side initialization kernel only rendezvous with CUDA-IPC
+    // peers on this node.  A remote same-rail producer can otherwise enter
+    // this kernel first, publish an exact M-tile row increment, and have that
+    // increment erased when the slower destination initializes its local
+    // x_arrived_rows storage.  Signal 2 is reserved for a fixed-width,
+    // per-context generation-ready handshake.  It runs once before any
+    // Dispatch payload put and therefore adds no per-wave or per-task work.
+    //
+    // Reuse each context's immutable directory slot as the eight-byte DMA
+    // source/destination: the real directory record is written only after the
+    // handshake completes, and Dispatch signal 0 orders that later record.
+    if (threadIdx.x == 0U) {
+      unsigned long long setup_peers = 0ULL;
+      for (std::uint32_t remote_node = 0;
+           remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+        if (remote_node == a.node)
+          continue;
+        const auto remote_partition =
+            remote_node < a.node ? remote_node : remote_node - 1U;
+        const auto source_partition =
+            a.node < remote_node ? a.node : a.node - 1U;
+        const auto directory_index =
+            remote_partition * a.gin_context_count + context;
+        const auto remote_directory_index =
+            source_partition * a.gin_context_count + context;
+        send_directory[directory_index] = GinDispatchContextRecord{
+            a.dispatch.identity.generation, a.epoch, 0ULL, 0U, 0U};
+        __threadfence_system();
+        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                a.gin_receive_dispatch_directory_offset +
+                    remote_directory_index *
+                        sizeof(GinDispatchContextRecord),
+                a.gin_window, a.gin_send_dispatch_directory_offset +
+                                  directory_index *
+                                      sizeof(GinDispatchContextRecord),
+                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{2},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        ++setup_peers;
+      }
+      if (setup_peers != 0ULL) {
+        gin.waitCounter(ncclCoopThread{}, 0, setup_peers);
+        gin.resetCounter(0);
+        gin.waitSignal(ncclCoopThread{}, 2, setup_peers);
+      }
+    }
+    __syncthreads();
     unsigned long long issued_completions = 0ULL;
     unsigned long long issued_packets = 0ULL;
     for (std::uint32_t remote_node = 0;
@@ -4416,6 +4570,26 @@ local_p2p_forward_megakernel(
                               context, incoming_sources, a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
                               context, incoming_sources, a.epoch);
+      atomicAdd(&scheduler[5U + 2ULL * a.world], 1ULL);
+    }
+    __syncthreads();
+
+    // All GIN contexts publish an immutable receive directory before Relay.
+    // Packet waves are divided between contexts by wave count, which can be
+    // very uneven in bytes/fan-out.  Relaying only the directory owned by the
+    // matching context left one CTA copying nearly the entire remote payload
+    // while the other progress CTAs were idle.  Wait for the fixed directory
+    // set, then stripe every directory across the fixed context CTA team.  No
+    // task space is extended here and the exact destination-row counters stay
+    // the sole FC readiness condition.
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          directories_ready(scheduler[5U + 2ULL * a.world]);
+      while (directories_ready.load(::cuda::memory_order_acquire) <
+                 a.gin_context_count &&
+             !forward_cancelled(a)) {
+        __nanosleep(256U);
+      }
     }
     __syncthreads();
   }
@@ -4438,6 +4612,11 @@ local_p2p_forward_megakernel(
     const auto vector_count = a.hidden / 8ULL;
     const auto context_thread = static_cast<std::uint64_t>(threadIdx.x);
     const auto context_threads = static_cast<std::uint64_t>(blockDim.x);
+    const auto relay_thread =
+        static_cast<std::uint64_t>(context) * context_threads +
+        context_thread;
+    const auto relay_threads =
+        static_cast<std::uint64_t>(a.gin_context_count) * context_threads;
     for (std::uint32_t signal_index = 0;
          signal_index < a.dispatch.sizes.incoming_signal_count;
          ++signal_index) {
@@ -4447,79 +4626,79 @@ local_p2p_forward_megakernel(
       const auto source_partition =
           signal.source_node < a.node ? signal.source_node
                                       : signal.source_node - 1U;
-      const auto directory = receive_directory[
-          source_partition * a.gin_context_count + context];
       const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint64_t item = context_thread;
-           item < static_cast<std::uint64_t>(directory.packet_count) *
-                      packet_vectors;
-           item += context_threads) {
-        const auto sequence = directory.packet_begin + item / packet_vectors;
-        const auto within_packet = item % packet_vectors;
-        const auto fanout = within_packet / vector_count;
-        const auto vector = within_packet % vector_count;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *destination_rows = peer_at<transport::BFloat16>(
-            a.peer_bases[destination], a.canonical_rows_offset);
-        reinterpret_cast<uint4 *>(destination_rows)[
-            target.dst_row * vector_count + vector] =
-            reinterpret_cast<const uint4 *>(receive_payload)[
-                packet * vector_count + vector];
-      }
-      for (std::uint64_t slot = context_thread;
-           slot < static_cast<std::uint64_t>(directory.packet_count) *
-                      a.dispatch.identity.top_k;
-           slot += context_threads) {
-        const auto sequence = directory.packet_begin +
-                              slot / a.dispatch.identity.top_k;
-        const auto fanout = slot % a.dispatch.identity.top_k;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-            a.peer_bases[destination], a.direct_headers_offset);
-        const auto route = header.local_token_id *
-                               a.dispatch.identity.top_k +
-                           target.topk_slot;
-        destination_headers[target.dst_row] = LocalP2pRouteHeader{
-            transport::kActivationTransportSchemaVersion,
-            header.source_rank,
-            destination,
-            header.channel,
-            header.generation,
-            header.source_epoch,
-            header.sequence,
-            route,
-            header.local_token_id,
-            target.dst_row,
-            target.expert_id,
-            target.topk_slot};
+      for (std::uint32_t directory_context = 0;
+           directory_context < a.gin_context_count; ++directory_context) {
+        const auto directory = receive_directory[
+            source_partition * a.gin_context_count + directory_context];
+        for (std::uint64_t item = relay_thread;
+             item < static_cast<std::uint64_t>(directory.packet_count) *
+                        packet_vectors;
+             item += relay_threads) {
+          const auto sequence =
+              directory.packet_begin + item / packet_vectors;
+          const auto within_packet = item % packet_vectors;
+          const auto fanout = within_packet / vector_count;
+          const auto vector = within_packet % vector_count;
+          const auto packet =
+              source_partition * a.max_tokens_per_rank + sequence;
+          const auto header = receive_headers[packet];
+          if (fanout >= header.route_index)
+            continue;
+          const auto target = receive_fanout[
+              source_partition * a.max_tokens_per_rank *
+                      a.dispatch.identity.top_k +
+                  header.dst_row + fanout];
+          const auto destination =
+              a.node * a.local_world_size + target.destination_local_rank;
+          auto *destination_rows = peer_at<transport::BFloat16>(
+              a.peer_bases[destination], a.canonical_rows_offset);
+          reinterpret_cast<uint4 *>(destination_rows)[
+              target.dst_row * vector_count + vector] =
+              reinterpret_cast<const uint4 *>(receive_payload)[
+                  packet * vector_count + vector];
+        }
+        for (std::uint64_t slot = relay_thread;
+             slot < static_cast<std::uint64_t>(directory.packet_count) *
+                        a.dispatch.identity.top_k;
+             slot += relay_threads) {
+          const auto sequence = directory.packet_begin +
+                                slot / a.dispatch.identity.top_k;
+          const auto fanout = slot % a.dispatch.identity.top_k;
+          const auto packet =
+              source_partition * a.max_tokens_per_rank + sequence;
+          const auto header = receive_headers[packet];
+          if (fanout >= header.route_index)
+            continue;
+          const auto target = receive_fanout[
+              source_partition * a.max_tokens_per_rank *
+                      a.dispatch.identity.top_k +
+                  header.dst_row + fanout];
+          const auto destination =
+              a.node * a.local_world_size + target.destination_local_rank;
+          auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+              a.peer_bases[destination], a.direct_headers_offset);
+          const auto route = header.local_token_id *
+                                 a.dispatch.identity.top_k +
+                             target.topk_slot;
+          destination_headers[target.dst_row] = LocalP2pRouteHeader{
+              transport::kActivationTransportSchemaVersion,
+              header.source_rank,
+              destination,
+              header.channel,
+              header.generation,
+              header.source_epoch,
+              header.sequence,
+              route,
+              header.local_token_id,
+              target.dst_row,
+              target.expert_id,
+              target.topk_slot};
+        }
       }
     }
     __threadfence_system();
     __syncthreads();
-    // The packet signal only makes the registered ingress visible.  Exact
-    // readiness is published after every destination row and reverse header
-    // store has completed.  Multi-fanout packets increment each destination
-    // tile independently.
     for (std::uint32_t signal_index = 0;
          signal_index < a.dispatch.sizes.incoming_signal_count;
          ++signal_index) {
@@ -4529,46 +4708,173 @@ local_p2p_forward_megakernel(
       const auto source_partition =
           signal.source_node < a.node ? signal.source_node
                                       : signal.source_node - 1U;
-      const auto directory = receive_directory[
-          source_partition * a.gin_context_count + context];
-      for (std::uint64_t slot = context_thread;
-           slot < static_cast<std::uint64_t>(directory.packet_count) *
-                      a.dispatch.identity.top_k;
-           slot += context_threads) {
-        const auto sequence = directory.packet_begin +
-                              slot / a.dispatch.identity.top_k;
-        const auto fanout = slot % a.dispatch.identity.top_k;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *arrived = peer_at<unsigned long long>(
-            a.peer_bases[destination], a.x_arrived_rows_offset);
-        ::cuda::atomic_ref<unsigned long long,
-                           ::cuda::thread_scope_system>
-            counter(arrived[target.reserved]);
-        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+      for (std::uint32_t directory_context = 0;
+           directory_context < a.gin_context_count; ++directory_context) {
+        const auto directory = receive_directory[
+            source_partition * a.gin_context_count + directory_context];
+        for (std::uint64_t slot = relay_thread;
+             slot < static_cast<std::uint64_t>(directory.packet_count) *
+                        a.dispatch.identity.top_k;
+             slot += relay_threads) {
+          const auto sequence = directory.packet_begin +
+                                slot / a.dispatch.identity.top_k;
+          const auto fanout = slot % a.dispatch.identity.top_k;
+          const auto packet =
+              source_partition * a.max_tokens_per_rank + sequence;
+          const auto header = receive_headers[packet];
+          if (fanout >= header.route_index)
+            continue;
+          const auto target = receive_fanout[
+              source_partition * a.max_tokens_per_rank *
+                      a.dispatch.identity.top_k +
+                  header.dst_row + fanout];
+          const auto destination =
+              a.node * a.local_world_size + target.destination_local_rank;
+          auto *arrived = peer_at<unsigned long long>(
+              a.peer_bases[destination], a.x_arrived_rows_offset);
+          const auto rail = a.rank % a.local_world_size;
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              counter(arrived[target.reserved * a.local_world_size + rail]);
+          counter.fetch_add(1ULL, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
-        const auto record_index =
-            source_partition * a.gin_context_count + context;
-        atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
-        if (target.reserved == 0U)
-          atomicAdd(&context_completion[record_index].relay_tile0_rows, 1ULL);
-        atomicAdd(&completion->remote_rows_published, 1ULL);
-        if (target.reserved < 64U)
-          atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
+          const auto record_index =
+              source_partition * a.gin_context_count + directory_context;
+          atomicAdd(&context_completion[record_index].relay_fanout_rows,
+                    1ULL);
+          if (target.reserved == 0U)
+            atomicAdd(&context_completion[record_index].relay_tile0_rows,
+                      1ULL);
+          atomicAdd(&completion->remote_rows_published, 1ULL);
+          if (target.reserved < 64U)
+            atomicOr(&completion->published_tile_mask,
+                     1ULL << target.reserved);
 #endif
+        }
       }
     }
+    #if 0
+    const auto relay_index = static_cast<std::uint64_t>(blockIdx.x);
+    const auto forward_relay_ctas = a.gin_context_count;
+    for (std::uint32_t signal_index = 0;
+         signal_index < a.dispatch.sizes.incoming_signal_count;
+         ++signal_index) {
+      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+      if (signal.source_node == a.node)
+        continue;
+      const auto source_partition =
+          signal.source_node < a.node ? signal.source_node
+                                      : signal.source_node - 1U;
+      for (std::uint32_t directory_context = 0;
+           directory_context < a.gin_context_count; ++directory_context) {
+        const auto directory = receive_directory[
+            source_partition * a.gin_context_count + directory_context];
+        constexpr std::uint64_t kRelayRowsPerRelease = 8ULL;
+        const auto directory_slots =
+            static_cast<std::uint64_t>(directory.packet_count) *
+            a.dispatch.identity.top_k;
+        for (std::uint64_t batch_begin =
+                 relay_index * kRelayRowsPerRelease;
+             batch_begin < directory_slots;
+             batch_begin += forward_relay_ctas * kRelayRowsPerRelease) {
+          for (std::uint64_t lane = 0; lane < kRelayRowsPerRelease; ++lane) {
+            const auto slot = batch_begin + lane;
+            if (slot >= directory_slots)
+              break;
+            const auto sequence = directory.packet_begin +
+                                  slot / a.dispatch.identity.top_k;
+            const auto fanout = slot % a.dispatch.identity.top_k;
+            const auto packet =
+                source_partition * a.max_tokens_per_rank + sequence;
+            const auto header = receive_headers[packet];
+            if (fanout >= header.route_index)
+              continue;
+            const auto target = receive_fanout[
+                source_partition * a.max_tokens_per_rank *
+                        a.dispatch.identity.top_k +
+                    header.dst_row + fanout];
+            const auto destination =
+                a.node * a.local_world_size + target.destination_local_rank;
+            auto *destination_rows = peer_at<transport::BFloat16>(
+                a.peer_bases[destination], a.canonical_rows_offset);
+            for (std::uint64_t vector = threadIdx.x; vector < vector_count;
+                 vector += blockDim.x)
+              reinterpret_cast<uint4 *>(destination_rows)[
+                  target.dst_row * vector_count + vector] =
+                  reinterpret_cast<const uint4 *>(receive_payload)[
+                      packet * vector_count + vector];
+            if (threadIdx.x == 0U) {
+              auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+                  a.peer_bases[destination], a.direct_headers_offset);
+              const auto route = header.local_token_id *
+                                     a.dispatch.identity.top_k +
+                                 target.topk_slot;
+              destination_headers[target.dst_row] = LocalP2pRouteHeader{
+                  transport::kActivationTransportSchemaVersion,
+                  header.source_rank,
+                  destination,
+                  header.channel,
+                  header.generation,
+                  header.source_epoch,
+                  header.sequence,
+                  route,
+                  header.local_token_id,
+                  target.dst_row,
+                  target.expert_id,
+                  target.topk_slot};
+            }
+          }
+          __syncthreads();
+          if (threadIdx.x == 0U)
+            __threadfence_system();
+          __syncthreads();
+          for (std::uint64_t lane = threadIdx.x;
+               lane < kRelayRowsPerRelease; lane += blockDim.x) {
+            const auto slot = batch_begin + lane;
+            if (slot >= directory_slots)
+              continue;
+            const auto sequence = directory.packet_begin +
+                                  slot / a.dispatch.identity.top_k;
+            const auto fanout = slot % a.dispatch.identity.top_k;
+            const auto packet =
+                source_partition * a.max_tokens_per_rank + sequence;
+            const auto header = receive_headers[packet];
+            if (fanout >= header.route_index)
+              continue;
+            const auto target = receive_fanout[
+                source_partition * a.max_tokens_per_rank *
+                        a.dispatch.identity.top_k +
+                    header.dst_row + fanout];
+            const auto destination =
+                a.node * a.local_world_size + target.destination_local_rank;
+            auto *arrived = peer_at<unsigned long long>(
+                a.peer_bases[destination], a.x_arrived_rows_offset);
+            const auto rail = a.rank % a.local_world_size;
+            ::cuda::atomic_ref<unsigned long long,
+                               ::cuda::thread_scope_system>
+                counter(arrived[target.reserved * a.local_world_size + rail]);
+            counter.fetch_add(1ULL, ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+            const auto record_index =
+                source_partition * a.gin_context_count + directory_context;
+            atomicAdd(&context_completion[record_index].relay_fanout_rows,
+                      1ULL);
+            if (target.reserved == 0U)
+              atomicAdd(&context_completion[record_index].relay_tile0_rows,
+                        1ULL);
+            atomicAdd(&completion->remote_rows_published, 1ULL);
+            if (target.reserved < 64U)
+              atomicOr(&completion->published_tile_mask,
+                       1ULL << target.reserved);
+#endif
+          }
+          __syncthreads();
+        }
+      }
+    }
+    #endif
     __syncthreads();
-    if (threadIdx.x == 0U) {
+    if (blockIdx.x < a.gin_context_count && threadIdx.x == 0U) {
       unsigned long long relayed = 0ULL;
       for (std::uint32_t remote = 0;
            remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
@@ -4653,6 +4959,180 @@ local_p2p_forward_megakernel(
                           a.dispatch.sizes.mtile_count, a.epoch);
   MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
                           a.dispatch.sizes.mtile_count, a.epoch);
+
+#if __has_include(<nccl_device.h>)
+  // Build a fixed ReturnChunk catalog once the immutable remote Dispatch
+  // directory is visible.  Chunk identity depends only on the packed reverse
+  // row range; FC2 completion order can only change when a chunk becomes
+  // ready, never where it is sent or stored.
+  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x == a.gin_context_count) {
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnDirectoryStart, GinReturn, 0U,
+                            a.dispatch.sizes.incoming_row_count, a.epoch);
+    const auto chunk_count_word = 4ULL + 2ULL * a.world;
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          headers_ready(scheduler[chunk_count_word + 1ULL]);
+      while (headers_ready.load(::cuda::memory_order_acquire) <
+                 a.gin_context_count &&
+             !forward_cancelled(a)) {
+        __nanosleep(256U);
+      }
+      auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+      auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+          window_bytes + a.gin_receive_header_offset);
+      std::uint64_t chunk_count = 0ULL;
+      auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
+          window_bytes + a.gin_receive_dispatch_directory_offset);
+      for (std::uint32_t source_partition = 0;
+           source_partition + 1U < a.dispatch.identity.num_nodes;
+           ++source_partition) {
+        const auto source_node =
+            source_partition < a.node ? source_partition
+                                      : source_partition + 1U;
+        std::uint64_t received_packets = 0ULL;
+        for (std::uint32_t context = 0; context < a.gin_context_count;
+             ++context) {
+          const auto directory = receive_directory[
+              source_partition * a.gin_context_count + context];
+          if (directory.generation != a.dispatch.identity.generation ||
+              directory.epoch != a.epoch)
+            continue;
+          const auto end = directory.packet_begin + directory.packet_count;
+          received_packets = end > received_packets ? end : received_packets;
+        }
+        std::uint64_t compact_rows = 0ULL;
+        for (std::uint64_t sequence = 0; sequence < received_packets;
+             ++sequence) {
+          const auto header = receive_headers[
+              source_partition * a.max_tokens_per_rank + sequence];
+          for (std::uint64_t row = header.dst_row;
+               row < header.dst_row + header.route_index; ++row)
+            forward_return_fragment_index[
+                source_partition * a.max_tokens_per_rank *
+                    a.dispatch.identity.top_k +
+                compact_rows++] = row;
+        }
+        for (std::uint64_t compact_begin = 0ULL;
+             compact_begin < compact_rows;
+             compact_begin += kForwardReturnChunkRows) {
+          if (chunk_count >= a.forward_return_chunk_capacity) {
+            publish_local_structured_error(
+                status, a.rank, 131U, 1U,
+                a.forward_return_chunk_capacity, chunk_count + 1ULL);
+            break;
+          }
+          const auto remaining = compact_rows - compact_begin;
+          const auto chunk_rows = static_cast<std::uint32_t>(
+              remaining < kForwardReturnChunkRows
+                  ? remaining
+                  : kForwardReturnChunkRows);
+          const auto context = static_cast<std::uint32_t>(
+              chunk_count % a.gin_context_count);
+          const auto bytes = static_cast<std::uint64_t>(chunk_rows) *
+                             a.hidden * sizeof(transport::BFloat16);
+          forward_return_chunks[chunk_count] = ForwardReturnChunkRecord{
+              compact_begin, chunk_rows, source_node, context,
+              chunk_rows, bytes};
+          forward_return_chunk_state[chunk_count] = 0ULL;
+          for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail)
+            forward_return_chunk_ready_count[
+                chunk_count * a.local_world_size + rail] = 0ULL;
+          context_completion[source_partition * a.gin_context_count +
+                             context]
+              .return_expected += 1ULL;
+          ++chunk_count;
+        }
+      }
+      std::uint64_t source_compact = 0ULL;
+      for (std::uint64_t wave_position = 0;
+           wave_position < a.dispatch.sizes.packet_count; ++wave_position) {
+        const auto packet = a.dispatch_waves.packet_order[wave_position];
+        if (a.dispatch.packet_headers[packet].destination_node == a.node)
+          continue;
+        const auto begin = a.dispatch.packet_fanout_offsets[packet];
+        const auto end = a.dispatch.packet_fanout_offsets[packet + 1ULL];
+        for (std::uint64_t fanout = begin; fanout < end; ++fanout)
+          forward_return_source_compact_index[fanout] = source_compact++;
+      }
+      scheduler[chunk_count_word] = chunk_count;
+      completion_task(completion, transport_state::TaskClass::Return)
+          .expected = chunk_count;
+      completion->return_local_completion_expected = chunk_count;
+    }
+    __syncthreads();
+    // Install the immutable row-to-proxy/chunk map before publishing the
+    // directory. FC1 may progress concurrently on other CTAs; FC2 acquires
+    // directory_ready before it can expose a ReturnChunk producer count.
+    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+        static_cast<std::byte *>(a.gin_window_base) +
+        a.gin_receive_fanout_offset);
+    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
+    for (std::uint64_t chunk_index = 0; chunk_index < chunk_count;
+         ++chunk_index) {
+      const auto chunk = forward_return_chunks[chunk_index];
+      const auto source_partition =
+          chunk.source_node < a.node ? chunk.source_node
+                                     : chunk.source_node - 1U;
+      const auto partition_base =
+          source_partition * a.max_tokens_per_rank *
+          a.dispatch.identity.top_k;
+      for (std::uint64_t row_index = threadIdx.x; row_index < chunk.row_count;
+           row_index += blockDim.x) {
+        const auto fragment = forward_return_fragment_index[
+            partition_base + chunk.row_begin + row_index];
+        const auto target = receive_fanout[partition_base + fragment];
+        const auto destination =
+            a.node * a.local_world_size + target.destination_local_rank;
+        auto *peer_chunk_map = peer_at<unsigned long long>(
+            a.peer_bases[destination], a.forward_output_ready_epoch_offset);
+        ::cuda::atomic_ref<unsigned long long,
+                           ::cuda::thread_scope_system>
+            published_mapping(peer_chunk_map[target.dst_row]);
+        published_mapping.store(
+            (static_cast<unsigned long long>(a.rank + 1U) << 48U) |
+                (chunk_index + 1ULL),
+            ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+        atomicAdd(&completion->bulk_pack_complete, 1ULL);
+#endif
+      }
+    }
+    __threadfence_system();
+    __syncthreads();
+    const auto first_local = a.node * a.local_world_size;
+    for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
+         local += blockDim.x) {
+      const auto peer = first_local + local;
+      auto *ready = peer_at<unsigned long long>(
+          a.peer_bases[peer], a.gin_local_compute_ready_offset);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          published(ready[a.rank]);
+      published.store(a.epoch, ::cuda::memory_order_release);
+    }
+    __syncthreads();
+    auto *local_ready = peer_at<unsigned long long>(
+        a.local_base, a.gin_local_compute_ready_offset);
+    for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
+         local += blockDim.x) {
+      const auto peer = first_local + local;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          observed(local_ready[peer]);
+      while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
+             !forward_cancelled(a)) {
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          directory_ready(scheduler[6ULL + 2ULL * a.world]);
+      directory_ready.store(a.epoch, ::cuda::memory_order_release);
+    }
+    __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnDirectoryEnd, GinReturn, 0U,
+                            chunk_count, a.epoch);
+  }
+#endif
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   const auto fc1_ntiles =
@@ -4874,6 +5354,16 @@ local_p2p_forward_megakernel(
   pipeline_iteration = 0;
 
   task_in_chunk = kTaskChunk;
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        directory_ready(scheduler[6ULL + 2ULL * a.world]);
+    while (directory_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+           !forward_cancelled(a)) {
+      if (threadIdx.x == 0U)
+        __nanosleep(256U);
+      __syncthreads();
+    }
+  }
   while (!forward_cancelled(a)) {
     if (task_in_chunk == kTaskChunk) {
       if (threadIdx.x == 0U)
@@ -4949,15 +5439,49 @@ local_p2p_forward_megakernel(
                                            ::cuda::memory_order_acq_rel);
       return_mblock_shared =
           (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
-      if (return_mblock_shared != 0U) {
-        const auto finished = atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
+    }
+    __syncthreads();
+    if (return_mblock_shared != 0U) {
+      // Publish one exact producer fragment per completed canonical row only
+      // after every FC2 N tile for this M-block has stored its output. The row
+      // map selects its immutable same-rail proxy and ReturnChunk; local rows
+      // have mapping zero and never enter the registered GIN staging path.
+      __threadfence_system();
+      for (std::uint32_t ready_row = threadIdx.x;
+           ready_row < valid_rows; ready_row += blockDim.x) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            published_mapping(forward_output_ready_epoch[row + ready_row]);
+        const auto mapping =
+            published_mapping.load(::cuda::memory_order_acquire);
+        if (mapping != 0ULL) {
+          const auto proxy_rank =
+              static_cast<std::uint32_t>((mapping >> 48U) - 1ULL);
+          const auto chunk = (mapping & ((1ULL << 48U) - 1ULL)) - 1ULL;
+          auto *peer_ready_count = peer_at<unsigned long long>(
+              a.peer_bases[proxy_rank],
+              a.forward_return_chunk_ready_count_offset);
+          const auto producer_rail = a.rank % a.local_world_size;
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              ready(peer_ready_count[chunk * a.local_world_size +
+                                     producer_rail]);
+          ready.fetch_add(1ULL, ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+          atomicAdd(&completion->bulk_contexts_issuing, 1ULL);
+#endif
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0U) {
+        const auto finished =
+            atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
         if (finished == forward_mblocks) {
           status->fc2_complete_clock = device_globaltimer_ns();
           forward_publish_progress(a, kForwardFc2Complete, fc2_tasks);
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
     MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
                             a.epoch);
     if (return_mblock_shared != 0U &&
@@ -5038,6 +5562,199 @@ local_p2p_forward_megakernel(
     }
     __syncthreads();
   }
+  } else {
+#if __has_include(<nccl_device.h>)
+    // Dedicated context CTAs overlap FC2 with Return.  Every context owns a
+    // disjoint static subset of chunks and keeps up to one completion batch
+    // outstanding; a not-yet-ready chunk never blocks another context.
+    const auto context = static_cast<std::uint32_t>(blockIdx.x);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        directory_ready(scheduler[6ULL + 2ULL * a.world]);
+    while (directory_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+           !forward_cancelled(a)) {
+      if (threadIdx.x == 0U)
+        __nanosleep(256U);
+      __syncthreads();
+    }
+    // chunk_count is part of the immutable directory publication. Reading it
+    // before the acquire wait allowed a fast context to cache the setup-time
+    // zero, conclude that its task space was empty, and leave while the peer
+    // still expected a ReturnChunk signal.
+    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
+    const ncclGin gin(a.gin_dev_comm, context);
+    const auto rail = ncclTeamRail(a.gin_dev_comm);
+    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+        window_bytes + a.gin_receive_fanout_offset);
+    auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
+        window_bytes + a.gin_return_staging_offset);
+    __shared__ unsigned long long selected_chunk;
+    __shared__ unsigned int chunk_ready;
+    __shared__ unsigned int batch_count;
+    __shared__ unsigned long long batch_chunks[kForwardReturnCompletionBatch];
+    __shared__ unsigned long long context_expected;
+    __shared__ unsigned long long context_completed;
+    __shared__ unsigned long long issued_total;
+    if (threadIdx.x == 0U) {
+      context_expected = 0ULL;
+      context_completed = 0ULL;
+      issued_total = 0ULL;
+      batch_count = 0U;
+      for (std::uint64_t chunk = context; chunk < chunk_count;
+           chunk += a.gin_context_count)
+        ++context_expected;
+    }
+    __syncthreads();
+
+    while (context_completed < context_expected && !forward_cancelled(a)) {
+      selected_chunk = ~0ULL;
+      __syncthreads();
+      for (std::uint64_t candidate = context;
+           candidate < chunk_count && selected_chunk == ~0ULL;
+           candidate += a.gin_context_count) {
+        if (threadIdx.x == 0U) {
+          const auto chunk = forward_return_chunks[candidate];
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_device>
+              state(forward_return_chunk_state[candidate]);
+          unsigned long long producer_count = 0ULL;
+#if MEGAMOE_DEBUG_VALIDATE
+          unsigned long long producer_rails = 0ULL;
+#endif
+          for (std::uint32_t producer_rail = 0;
+               producer_rail < a.local_world_size; ++producer_rail) {
+            ::cuda::atomic_ref<unsigned long long,
+                               ::cuda::thread_scope_system>
+                producers(forward_return_chunk_ready_count[
+                    candidate * a.local_world_size + producer_rail]);
+            const auto rail_count =
+                producers.load(::cuda::memory_order_acquire);
+            producer_count += rail_count;
+#if MEGAMOE_DEBUG_VALIDATE
+            producer_rails |=
+                (rail_count & 0xffULL) << (producer_rail * 8U);
+#endif
+          }
+#if MEGAMOE_DEBUG_VALIDATE
+          const auto source_partition =
+              chunk.source_node < a.node ? chunk.source_node
+                                         : chunk.source_node - 1U;
+          auto &debug_record = context_completion[
+              source_partition * a.gin_context_count + context];
+          debug_record.last_cursor = producer_count;
+          debug_record.dispatch_fanout_rows = producer_rails;
+#endif
+          chunk_ready =
+              state.load(::cuda::memory_order_relaxed) == 0ULL &&
+                      producer_count == chunk.expected_fragments
+                  ? 1U
+                  : 0U;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0U && chunk_ready != 0U &&
+            atomicCAS(&forward_return_chunk_state[candidate], 0ULL, 1ULL) ==
+                0ULL)
+          selected_chunk = candidate;
+        __syncthreads();
+      }
+      if (selected_chunk == ~0ULL) {
+        // Before the first FC2 tile becomes ready there can be tens of
+        // milliseconds of GEMM work. Tight polling from every GIN context
+        // needlessly saturates L2/atomic fabric and throttles WGMMA CTAs. A
+        // bounded device backoff preserves microsecond-scale first-chunk
+        // while allowing the compute pipeline to use the machine.
+        if (threadIdx.x == 0U)
+          __nanosleep(2048U);
+        __syncthreads();
+        continue;
+      }
+
+      const auto chunk = forward_return_chunks[selected_chunk];
+      const auto source_partition =
+          chunk.source_node < a.node ? chunk.source_node
+                                     : chunk.source_node - 1U;
+      const auto partition_base = source_partition * a.max_tokens_per_rank *
+                                  a.dispatch.identity.top_k;
+      const auto packed_base = partition_base + chunk.row_begin;
+      const auto vector_count = a.hidden / 8ULL;
+      for (std::uint64_t item = threadIdx.x;
+           item < static_cast<std::uint64_t>(chunk.row_count) * vector_count;
+           item += blockDim.x) {
+        const auto row_index = item / vector_count;
+        const auto vector = item % vector_count;
+        const auto fragment = forward_return_fragment_index[
+            partition_base + chunk.row_begin + row_index];
+        const auto target = receive_fanout[partition_base + fragment];
+        const auto destination =
+            a.node * a.local_world_size + target.destination_local_rank;
+        const auto *destination_output = peer_at<transport::BFloat16>(
+            a.peer_bases[destination], a.forward_output_rows_offset);
+        reinterpret_cast<uint4 *>(return_staging)[
+            (packed_base + row_index) * vector_count + vector] =
+            reinterpret_cast<const uint4 *>(destination_output)[
+                target.dst_row * vector_count + vector];
+      }
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0U) {
+        claim_completion_tasks(completion,
+                               transport_state::TaskClass::Return);
+        const auto record_index =
+            source_partition * a.gin_context_count + context;
+        context_completion[record_index].return_claimed += 1ULL;
+        context_completion[record_index].inflight += 1ULL;
+        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn,
+                                context, chunk.payload_bytes, a.epoch);
+        gin.put(rail, static_cast<int>(chunk.source_node), a.gin_window,
+                a.gin_return_receive_offset +
+                    chunk.row_begin * a.hidden *
+                        sizeof(transport::BFloat16),
+                a.gin_window,
+                a.gin_return_staging_offset +
+                    packed_base * a.hidden * sizeof(transport::BFloat16),
+                chunk.payload_bytes, ncclGin_SignalInc{1},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        atomicAdd(&status->gin_return_put_count, 1ULL);
+        atomicAdd(&status->gin_signal_count, 1ULL);
+        atomicAdd(&status->gin_return_payload_bytes, chunk.payload_bytes);
+        batch_chunks[batch_count++] = selected_chunk;
+        ++issued_total;
+      }
+      __syncthreads();
+
+      if (batch_count == kForwardReturnCompletionBatch ||
+          issued_total == context_expected) {
+        if (threadIdx.x == 0U) {
+          gin.waitCounter(ncclCoopThread{}, 0, issued_total);
+          for (std::uint32_t batch = 0; batch < batch_count; ++batch) {
+            atomicExch(&forward_return_chunk_state[batch_chunks[batch]], 2ULL);
+            complete_completion_tasks(completion,
+                                      transport_state::TaskClass::Return);
+            const auto completed_chunk =
+                forward_return_chunks[batch_chunks[batch]];
+            const auto completed_partition =
+                completed_chunk.source_node < a.node
+                    ? completed_chunk.source_node
+                    : completed_chunk.source_node - 1U;
+            auto &record = context_completion[
+                completed_partition * a.gin_context_count + context];
+            record.return_completed += 1ULL;
+            record.inflight -= 1ULL;
+            record.local_completion += 1ULL;
+            record.last_progress_globaltimer = device_globaltimer_ns();
+            ++context_completed;
+          }
+          atomicAdd(&completion->return_local_completion_completed,
+                    batch_count);
+          batch_count = 0U;
+        }
+        __syncthreads();
+      }
+    }
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
+                            context, context_completed, a.epoch);
+#endif
   }
 #if __has_include(<nccl_device.h>)
   if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
@@ -5053,6 +5770,13 @@ local_p2p_forward_megakernel(
       completion->grid_ctas_expected = gridDim.x;
     }
     grid.sync();
+    auto *gin_window_bytes = static_cast<std::byte *>(a.gin_window_base);
+    const auto vector_count = a.hidden / 8ULL;
+    const auto global_thread =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto global_threads =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    if (a.forward_return_chunk_capacity == 0ULL) {
     MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackStart, GinReturn, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
     const auto first_local = a.node * a.local_world_size;
@@ -5082,18 +5806,19 @@ local_p2p_forward_megakernel(
     grid.sync();
     if (blockIdx.x == 0U && threadIdx.x == 0U)
       completion->bulk_local_ready = 1ULL;
-    auto *gin_window_bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *gin_receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
         gin_window_bytes + a.gin_receive_header_offset);
     auto *gin_receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
         gin_window_bytes + a.gin_receive_fanout_offset);
     auto *gin_return_staging = reinterpret_cast<transport::BFloat16 *>(
         gin_window_bytes + a.gin_return_staging_offset);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+#if MEGAMOE_DEVICE_TIMELINE
+    __shared__ unsigned long long return_pack_cta_bytes;
+    if (threadIdx.x == 0U)
+      return_pack_cta_bytes = 0ULL;
+    __syncthreads();
+    unsigned long long return_pack_thread_bytes = 0ULL;
+#endif
     for (std::uint32_t signal_index = 0;
          signal_index < a.dispatch.sizes.incoming_signal_count;
          ++signal_index) {
@@ -5131,8 +5856,17 @@ local_p2p_forward_megakernel(
                  vector_count) +
             vector] = reinterpret_cast<const uint4 *>(destination_output)[
             target.dst_row * vector_count + vector];
+#if MEGAMOE_DEVICE_TIMELINE
+        return_pack_thread_bytes += sizeof(uint4);
+#endif
       }
     }
+#if MEGAMOE_DEVICE_TIMELINE
+    atomicAdd(&return_pack_cta_bytes, return_pack_thread_bytes);
+    __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackCtaBytes, GinReturn, 0U,
+                            return_pack_cta_bytes, a.epoch);
+#endif
     __threadfence_system();
     grid.sync();
     if (blockIdx.x == 0U && threadIdx.x == 0U)
@@ -5281,6 +6015,45 @@ local_p2p_forward_megakernel(
                   outgoing_remote_fanout *
                       a.hidden * sizeof(transport::BFloat16));
     }
+    } else if (blockIdx.x < a.gin_context_count) {
+      // The destination issued one signal per immutable ReturnChunk.  The
+      // source derives the same chunk cardinality from its frozen outgoing
+      // fan-out descriptors, so no dynamic producer can extend the terminal
+      // condition after the kernel starts.
+      const auto context = static_cast<std::uint32_t>(blockIdx.x);
+      const ncclGin gin(a.gin_dev_comm, context);
+      unsigned long long outgoing_remote_fanout = 0ULL;
+      if (threadIdx.x == 0U) {
+        for (std::uint64_t packet = 0;
+             packet < a.dispatch.sizes.packet_count; ++packet) {
+          const auto descriptor = a.dispatch.packet_headers[packet];
+          if (descriptor.destination_node == a.node)
+            continue;
+          const auto begin = a.dispatch.packet_fanout_offsets[packet];
+          const auto end = a.dispatch.packet_fanout_offsets[packet + 1ULL];
+          outgoing_remote_fanout += end - begin;
+        }
+        const auto chunks =
+            (outgoing_remote_fanout + kForwardReturnChunkRows - 1ULL) /
+            kForwardReturnChunkRows;
+        const auto context_chunks =
+            chunks > context
+                ? 1ULL + (chunks - 1ULL - context) / a.gin_context_count
+                : 0ULL;
+        if (context_chunks != 0ULL)
+          gin.waitSignal(ncclCoopThread{}, 1, context_chunks);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
+                                context, context_chunks, a.epoch);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            phase(scheduler[2]);
+        phase.fetch_add(1ULL, ::cuda::memory_order_release);
+        if (context == 0U)
+          atomicAdd(&status->actual_return_peer_bytes,
+                    outgoing_remote_fanout * a.hidden *
+                        sizeof(transport::BFloat16));
+      }
+      __syncthreads();
+    }
     grid.sync();
     if (threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -5319,7 +6092,8 @@ local_p2p_forward_megakernel(
       reinterpret_cast<uint4 *>(local_contribution)[
           route * vector_count + vector] =
           reinterpret_cast<const uint4 *>(gin_return_receive)[
-              fanout * vector_count + vector];
+              forward_return_source_compact_index[fanout] * vector_count +
+              vector];
     }
     __threadfence_system();
     grid.sync();
@@ -12910,6 +13684,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
   args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
+  args.forward_output_ready_epoch_offset =
+      layout.forward_output_ready_epoch;
+  args.forward_return_chunk_directory_offset =
+      layout.forward_return_chunk_directory;
+  args.forward_return_chunk_state_offset =
+      layout.forward_return_chunk_state;
+  args.forward_return_chunk_ready_count_offset =
+      layout.forward_return_chunk_ready_count;
+  args.forward_return_fragment_index_offset =
+      layout.forward_return_fragment_index;
+  args.forward_return_source_compact_index_offset =
+      layout.forward_return_source_compact_index;
+  args.forward_return_chunk_capacity =
+      layout.forward_return_chunk_capacity;
   args.forward_scheduler_offset = layout.forward_scheduler;
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;

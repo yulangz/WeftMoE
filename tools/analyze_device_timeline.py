@@ -71,6 +71,9 @@ EVENTS = {
     54: "dy_last_dispatch_put",
     55: "dy_last_relay",
     56: "dy_dispatch_complete",
+    57: "return_pack_cta_bytes",
+    58: "return_directory_start",
+    59: "return_directory_end",
 }
 
 PAIRS = {
@@ -101,6 +104,7 @@ PAIRS = {
     "dy_first_mtile_to_dv_claim": (52, 53),
     "dy_last_put_to_dispatch_complete": (54, 56),
     "dy_last_relay_to_dispatch_complete": (55, 56),
+    "return_directory": (58, 59),
 }
 
 
@@ -147,6 +151,10 @@ def summarize(path: Path) -> tuple[dict[str, object], dict[str, list[float]]]:
                 "count": len(values),
             }
             for event, values in sorted(event_extents.items())
+        },
+        "return_pack_cta_bytes": {
+            str(int(item["cta"])): int(item["arg0"])
+            for item in events if int(item["event"]) == 57
         },
         "durations_ms": {
             name: {
