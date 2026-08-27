@@ -86,6 +86,40 @@ Backward additionally serializes `dW2 -> dW1` after the return path. The next
 optimization must stream bounded ready chunks and allow dW to consume ready
 experts while dX return is in flight.
 
+## First pipeline fold: Return with dW
+
+The first accepted pipeline change deliberately did not tune the GIN transfer
+chunk.  The eight GIN context CTAs remain responsible for return progress;
+after dX, every other CTA converts directly to split-K=1 dW work.  Both
+branches join before source relay and deterministic token reduction.  Remote
+GIN dW tasks use a shared claim counter because context CTAs join the work at
+different times.  The local and Socket paths retain their static grid-stride
+task ownership.
+
+With the same NCCL 2.29.7 runtime and cache-mode fixture, a 10-warmup/20-sample
+screen changed the rank-0 means as follows:
+
+| release world-16 metric | phase-serial | Return/dW pipeline |
+|---|---:|---:|
+| Forward | 45.44 ms | 45.49 ms |
+| Backward | 59.30 ms | 47.99 ms |
+| Notify-inclusive F+B | 106.0 ms | 94.77 ms |
+
+All actual dX/dW1/dW2/dGate hashes remained unchanged.  An instrumented
+world-16 generation then located dX GIN issue/completion at 27.56/42.56 ms,
+dW2 first/last activity at 27.18/45.86 ms, and dW1 first/last activity at
+31.01/45.86 ms.  This is real compute/communication overlap rather than a
+change in timing boundaries.  The overlap makes the dW spans longer because
+TMA/HBM traffic competes with the registered return window, but removes about
+11.3 ms from the Backward critical path.
+
+The new critical path is the front of both kernels: dY dispatch/relay still
+occupies about 9.3 ms before the first dV task, and Forward dispatch/relay
+similarly precedes FC1.  Further work therefore targets per-M-tile readiness
+and dedicated Dispatch/Relay/Compute roles.  Transfer chunk, channel and
+credit values are compile-time policy candidates selected by full F+B
+autotuning; isolated chunk latency is not the optimization objective.
+
 ## Nsight Compute boundary
 
 The existing NCCL-free main Forward profile reports 55.97% SM throughput,

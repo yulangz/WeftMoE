@@ -6540,89 +6540,10 @@ local_p2p_backward_megakernel(
     }
     __syncthreads();
   }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    grid.sync();
-    if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
-      while (phase.load(::cuda::memory_order_acquire) <
-             2ULL * a.gin_context_count) {
-      }
-    }
-    __syncthreads();
-    auto *bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *return_receive = reinterpret_cast<transport::BFloat16 *>(
-        bytes + a.gin_return_receive_offset);
-    auto *return_gate_receive = reinterpret_cast<float *>(
-        bytes + a.gin_return_gate_receive_offset);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DxSourceRelay, SourceRelay, 0U,
-                            a.dispatch.sizes.packet_count, a.epoch);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t item = global_thread;
-         item < a.dispatch.sizes.packet_count * packet_vectors;
-         item += global_threads) {
-      const auto packet = item / packet_vectors;
-      const auto within_packet = item % packet_vectors;
-      const auto fanout_slot = within_packet / vector_count;
-      const auto vector = within_packet % vector_count;
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (fanout_slot >= fanout_end - fanout_begin)
-        continue;
-      const auto fanout = fanout_begin + fanout_slot;
-      const auto target = a.dispatch.packet_fanout[fanout];
-      const auto route = descriptor.local_token_id *
-                             a.dispatch.identity.top_k +
-                         target.topk_slot;
-      reinterpret_cast<uint4 *>(dx_return)[route * vector_count + vector] =
-          reinterpret_cast<const uint4 *>(return_receive)[
-              fanout * vector_count + vector];
-    }
-    for (std::uint64_t packet = global_thread;
-         packet < a.dispatch.sizes.packet_count; packet += global_threads) {
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
-        const auto target = a.dispatch.packet_fanout[fanout];
-        const auto route = descriptor.local_token_id *
-                               a.dispatch.identity.top_k +
-                           target.topk_slot;
-        dgate[route] = return_gate_receive[fanout];
-#if MEGAMOE_DEBUG_VALIDATE
-        if (a.capture_stage_storage)
-          debug_coverage[route] = 1U;
-#endif
-      }
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DGateReturn, SourceRelay, 0U,
-                            a.dispatch.sizes.route_count, a.epoch);
-    __threadfence_system();
-    grid.sync();
-    if (blockIdx.x == 0U && threadIdx.x == 0U) {
-      for (std::uint32_t destination = 0; destination < a.world;
-           ++destination) {
-        if (destination / a.local_world_size == a.node)
-          continue;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            ready(peer_at<unsigned long long>(
-                a.local_base, a.outgoing_signal_offset)
-                      [destination * a.channels]);
-        ready.store(a.epoch, ::cuda::memory_order_release);
-      }
-    }
-    grid.sync();
-  }
+  // The GIN context CTAs remain dedicated to return progress. Other CTAs
+  // immediately convert from dX workers to dW workers below, so rail DMA and
+  // the split-K=1 gradient GEMMs occupy independent portions of the machine.
+  // The two branches rejoin before source relay/reduce.
 #endif
 
   // dW2 and dW1 use split_k=1. Each task owns one output tile and traverses
@@ -6764,7 +6685,9 @@ local_p2p_backward_megakernel(
   // Every task still has exactly one owner; grid-stride assignment avoids a
   // 64K-operation global claim stream and preserves parallel expert coverage.
   if (threadIdx.x == 0U)
-    task_shared = blockIdx.x;
+    task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                      ? atomicAdd(&scheduler[4], 1ULL)
+                      : blockIdx.x;
   __syncthreads();
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
@@ -6935,7 +6858,9 @@ local_p2p_backward_megakernel(
 #endif
       cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
       if (threadIdx.x == 0U)
-        task_shared += gridDim.x;
+        task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                          ? atomicAdd(&scheduler[4], 1ULL)
+                          : task_shared + gridDim.x;
     }
   }
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
@@ -6943,6 +6868,90 @@ local_p2p_backward_megakernel(
   MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks,
                           a.epoch);
   grid.sync();
+#if __has_include(<nccl_device.h>)
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          phase(scheduler[2]);
+      while (phase.load(::cuda::memory_order_acquire) <
+             2ULL * a.gin_context_count) {
+      }
+    }
+    __syncthreads();
+    auto *bytes = static_cast<std::byte *>(a.gin_window_base);
+    auto *return_receive = reinterpret_cast<transport::BFloat16 *>(
+        bytes + a.gin_return_receive_offset);
+    auto *return_gate_receive = reinterpret_cast<float *>(
+        bytes + a.gin_return_gate_receive_offset);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DxSourceRelay, SourceRelay, 0U,
+                            a.dispatch.sizes.packet_count, a.epoch);
+    const auto vector_count = a.hidden / 8ULL;
+    const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
+    const auto global_thread =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto global_threads =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t item = global_thread;
+         item < a.dispatch.sizes.packet_count * packet_vectors;
+         item += global_threads) {
+      const auto packet = item / packet_vectors;
+      const auto within_packet = item % packet_vectors;
+      const auto fanout_slot = within_packet / vector_count;
+      const auto vector = within_packet % vector_count;
+      const auto descriptor = a.dispatch.packet_headers[packet];
+      if (descriptor.destination_node == a.node)
+        continue;
+      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+      if (fanout_slot >= fanout_end - fanout_begin)
+        continue;
+      const auto fanout = fanout_begin + fanout_slot;
+      const auto target = a.dispatch.packet_fanout[fanout];
+      const auto route = descriptor.local_token_id *
+                             a.dispatch.identity.top_k +
+                         target.topk_slot;
+      reinterpret_cast<uint4 *>(dx_return)[route * vector_count + vector] =
+          reinterpret_cast<const uint4 *>(return_receive)[
+              fanout * vector_count + vector];
+    }
+    for (std::uint64_t packet = global_thread;
+         packet < a.dispatch.sizes.packet_count; packet += global_threads) {
+      const auto descriptor = a.dispatch.packet_headers[packet];
+      if (descriptor.destination_node == a.node)
+        continue;
+      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+      for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
+        const auto target = a.dispatch.packet_fanout[fanout];
+        const auto route = descriptor.local_token_id *
+                               a.dispatch.identity.top_k +
+                           target.topk_slot;
+        dgate[route] = return_gate_receive[fanout];
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.capture_stage_storage)
+          debug_coverage[route] = 1U;
+#endif
+      }
+    }
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DGateReturn, SourceRelay, 0U,
+                            a.dispatch.sizes.route_count, a.epoch);
+    __threadfence_system();
+    grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+      for (std::uint32_t destination = 0; destination < a.world;
+           ++destination) {
+        if (destination / a.local_world_size == a.node)
+          continue;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            ready(peer_at<unsigned long long>(
+                a.local_base, a.outgoing_signal_offset)
+                      [destination * a.channels]);
+        ready.store(a.epoch, ::cuda::memory_order_release);
+      }
+    }
+    grid.sync();
+  }
+#endif
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
 #if !MEGAMOE_DEBUG_VALIDATE
