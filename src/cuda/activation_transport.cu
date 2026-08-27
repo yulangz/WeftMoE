@@ -454,11 +454,20 @@ void dump_generation_completion(std::ostream &output,
          << ".bulk_return_barrier={progress=" << word(kTail + 8ULL)
          << ",compute=" << word(kTail + 9ULL)
          << ",grid=" << word(kTail + 10ULL) << "} " << prefix
-         << ".published_rows={local=" << word(kTail + 11ULL)
-         << ",remote=" << word(kTail + 12ULL)
-         << ",tile_mask=" << word(kTail + 13ULL) << "} " << prefix
-         << ".kernel_complete_epoch=" << word(kTail + 14ULL) << ' ' << prefix
-         << ".terminal_publish_count=" << word(kTail + 15ULL);
+         << ".bulk_return_stage={local_ready=" << word(kTail + 11ULL)
+         << ",pack_complete=" << word(kTail + 12ULL)
+         << ",contexts_issuing=" << word(kTail + 13ULL) << "} " << prefix
+         << ".fc_scheduler={fc1=" << word(kTail + 14ULL)
+         << ",fc2=" << word(kTail + 15ULL) << "} " << prefix
+         << ".published_rows={local=" << word(kTail + 16ULL)
+         << ",remote=" << word(kTail + 17ULL)
+         << ",tile_mask=" << word(kTail + 18ULL) << "} " << prefix
+         << ".tile_wait={tile=" << word(kTail + 19ULL)
+         << ",expected=" << word(kTail + 20ULL)
+         << ",arrived=" << word(kTail + 21ULL)
+         << ",waiters=" << word(kTail + 22ULL) << "} " << prefix
+         << ".kernel_complete_epoch=" << word(kTail + 23ULL) << ' ' << prefix
+         << ".terminal_publish_count=" << word(kTail + 24ULL);
   for (std::uint32_t context = 0; context < contexts; ++context) {
     const auto base = transport_state::kGenerationCompletionWords +
                       context * transport_state::kContextCompletionWords;
@@ -470,7 +479,11 @@ void dump_generation_completion(std::ostream &output,
            << ",local_completion=" << word(base + 13ULL)
            << ",credit=" << word(base + 14ULL)
            << ",cursor=" << word(base + 15ULL)
-           << ",last_progress=" << word(base + 16ULL) << '}';
+           << ",last_progress=" << word(base + 16ULL)
+           << ",dispatch_rows=" << word(base + 17ULL)
+           << ",dispatch_tile0=" << word(base + 18ULL)
+           << ",relay_rows=" << word(base + 19ULL)
+           << ",relay_tile0=" << word(base + 20ULL) << '}';
   }
 }
 #endif
@@ -601,6 +614,9 @@ GinWindowLayout make_gin_window_layout(
   const auto outgoing_packets = checked_mul(
       config.max_nodes, config.max_tokens_per_rank,
       "GIN outgoing packet capacity");
+  const auto outgoing_fanout = checked_mul(
+      outgoing_packets, config.max_top_k,
+      "GIN outgoing packet fanout capacity");
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
   constexpr std::uint32_t kGinContextsPerRail = 8;
   const auto directory_records = checked_mul(
@@ -628,13 +644,18 @@ GinWindowLayout make_gin_window_layout(
   layout.receive_packet_headers = append(
       cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
       "GIN receive packet headers");
-  layout.send_fanout = append(cursor, routes, sizeof(DeviceFanoutRecord),
-                              "GIN send fanout");
+  // Packet descriptors are materialized in transport order. A token can
+  // contribute one node-deduplicated packet to every node, so packet-position
+  // indexing requires nodes*tokens*top-k capacity even though the number of
+  // logical routes remains tokens*top-k. The previous route-sized allocation
+  // made the first remote-node packet range alias send_gate/send_payload.
+  layout.send_fanout = append(cursor, outgoing_fanout,
+                              sizeof(DeviceFanoutRecord), "GIN send fanout");
   layout.receive_fanout = append(
       cursor, checked_mul(incoming_packets, config.max_top_k,
                           "GIN receive fanout capacity"),
       sizeof(DeviceFanoutRecord), "GIN receive fanout");
-  layout.send_gate = append(cursor, routes, sizeof(float),
+  layout.send_gate = append(cursor, outgoing_fanout, sizeof(float),
                             "GIN send route gates");
   layout.receive_gate = append(
       cursor, checked_mul(incoming_packets, config.max_top_k,
@@ -801,7 +822,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         (config.max_hidden_size + 255ULL) / 256ULL;
     layout.forward_task_claim = append(
         cursor,
-        checked_mul(max_mblocks, fc1_ntiles + fc2_ntiles,
+        checked_mul(max_mblocks, 1ULL + fc1_ntiles + fc2_ntiles,
                     "forward task claims"),
         sizeof(std::uint64_t), "forward task claims");
     layout.forward_fc1_done = append(cursor, max_mblocks,
@@ -2444,10 +2465,12 @@ __global__ void initialize_forward_generation_signals_kernel(
     *forward_completion = transport_state::GenerationCompletionVector{};
     forward_completion->generation = generation;
     forward_completion->epoch = epoch;
+    forward_completion->first_waiting_tile = ~0ULL;
     if (backward_completion != nullptr) {
       *backward_completion = transport_state::GenerationCompletionVector{};
       backward_completion->generation = generation;
       backward_completion->epoch = epoch;
+      backward_completion->first_waiting_tile = ~0ULL;
     }
   }
   for (std::uint32_t context = index; context < context_completion_capacity;
@@ -3616,19 +3639,35 @@ __device__ void visit_backward_accumulator_tall(float *accum,
 #endif
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-__device__ std::uint32_t forward_mblock_expert(const ForwardKernelArgs &a,
-                                               std::uint64_t mblock,
-                                               std::uint64_t &local_mblock) {
+// Map the immutable M-block task space in the same wavefront order used by
+// Notify packet priorities: local M tile first, then expert.  This lets the
+// bounded compute scheduler consume the earliest completed tiles without a
+// global Dispatch barrier or an O(N-task) atomic scan.
+__device__ std::uint32_t forward_wavefront_mblock_expert(
+    const ForwardKernelArgs &a, std::uint64_t ordinal,
+    std::uint64_t &local_mblock) {
+  std::uint64_t max_blocks = 0ULL;
   for (std::uint32_t expert = 0;
        expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-    const auto blocks = (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
-    if (mblock < blocks) {
-      local_mblock = mblock;
-      return expert;
-    }
-    mblock -= blocks;
+    const std::uint64_t blocks =
+        (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+    max_blocks = blocks > max_blocks ? blocks : max_blocks;
   }
-  local_mblock = 0;
+  for (std::uint64_t tile = 0; tile < max_blocks; ++tile) {
+    for (std::uint32_t expert = 0;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      const auto blocks =
+          (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+      if (tile >= blocks)
+        continue;
+      if (ordinal == 0ULL) {
+        local_mblock = tile;
+        return expert;
+      }
+      --ordinal;
+    }
+  }
+  local_mblock = 0ULL;
   return a.dispatch.sizes.owned_expert_count;
 }
 
@@ -3645,7 +3684,9 @@ template <bool StaticLocal>
 __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
                                          std::uint32_t expert,
                                          std::uint64_t local_row,
-                                         std::uint32_t valid_rows) {
+                                         std::uint32_t valid_rows,
+                                         transport_state::GenerationCompletionVector
+                                             *completion) {
   if constexpr (StaticLocal)
     return;
   if (!a.use_gin || valid_rows == 0U)
@@ -3667,8 +3708,23 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
       break;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         ready(arrived[tile]);
-    while (ready.load(::cuda::memory_order_acquire) < expected &&
-           !forward_cancelled(a)) {
+    auto current = ready.load(::cuda::memory_order_acquire);
+#if MEGAMOE_DEBUG_VALIDATE
+    if (current < expected && threadIdx.x == 0U) {
+      atomicAdd(&completion->tile_waiter_count, 1ULL);
+      (void)atomicCAS(&completion->first_waiting_tile, ~0ULL, tile);
+      if (completion->first_waiting_tile == tile) {
+        completion->first_wait_expected = expected;
+        completion->first_wait_arrived = current;
+      }
+    }
+#endif
+    while (current < expected && !forward_cancelled(a)) {
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0U && completion->first_waiting_tile == tile)
+        completion->first_wait_arrived = current;
+#endif
+      current = ready.load(::cuda::memory_order_acquire);
     }
     tile_row = tile_row_end;
   }
@@ -3846,6 +3902,9 @@ local_p2p_forward_megakernel(
       if (a.use_gin) {
         completion->generation = a.dispatch.identity.generation;
         completion->epoch = a.epoch;
+#if MEGAMOE_DEBUG_VALIDATE
+        completion->first_waiting_tile = ~0ULL;
+#endif
         unsigned long long dispatch_waves = 0ULL;
         for (std::uint64_t wave = 0; wave < a.dispatch_waves.wave_count;
              ++wave)
@@ -3856,6 +3915,15 @@ local_p2p_forward_megakernel(
         completion_task(completion,
                         transport_state::TaskClass::DispatchWave)
             .expected = dispatch_waves;
+        unsigned long long relay_packets = 0ULL;
+        for (std::uint32_t index = 0;
+             index < a.dispatch.sizes.incoming_signal_count; ++index) {
+          const auto signal = a.dispatch.incoming_proxy_signals[index];
+          if (signal.source_node != a.node)
+            relay_packets += signal.expected_packets;
+        }
+        completion_task(completion, transport_state::TaskClass::RelayWave)
+            .expected = relay_packets;
         completion_task(completion, transport_state::TaskClass::Fc1OrDv)
             .expected = scheduler[3] * fc1_ntiles;
         completion_task(completion, transport_state::TaskClass::Fc2OrDx)
@@ -3935,19 +4003,33 @@ local_p2p_forward_megakernel(
     fc1_done[mtile] = a.epoch << 32U;
   grid.sync();
   forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && !MEGAMOE_DEBUG_VALIDATE
-  // Release reuses the otherwise debug-only claim arena as an immutable
-  // mblock lookup.  This removes the repeated expert-prefix scan from every
-  // FC1/FC2 N tile and enables chunked task acquisition below.
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  const auto setup_fc1_ntiles =
+      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+  const auto setup_fc2_ntiles =
+      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+  const auto setup_mblocks = scheduler[3];
+  // The first words are an immutable expert/local-M lookup in Notify's M-tile
+  // wavefront order. Task-state words follow it and every individual task has
+  // the only legal transitions
+  // WAITING(0) -> CLAIMED(1) -> COMPLETED(2).
   for (std::uint64_t mblock =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       mblock < scheduler[3];
+       mblock < setup_mblocks;
        mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
     std::uint64_t local_mblock = 0;
-    const auto expert = forward_mblock_expert(a, mblock, local_mblock);
+    const auto expert =
+        forward_wavefront_mblock_expert(a, mblock, local_mblock);
     claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
                      static_cast<std::uint32_t>(local_mblock);
   }
+  const auto setup_task_count =
+      setup_mblocks * (setup_fc1_ntiles + setup_fc2_ntiles);
+  for (std::uint64_t task =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < setup_task_count;
+       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+    claims[setup_mblocks + task] = 0ULL;
   grid.sync();
 #endif
 
@@ -4104,6 +4186,10 @@ local_p2p_forward_megakernel(
         window_bytes + a.gin_send_dispatch_directory_offset);
     auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
         window_bytes + a.gin_send_header_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+    auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+        window_bytes + a.gin_send_fanout_offset);
+#endif
     unsigned long long issued_completions = 0ULL;
     unsigned long long issued_packets = 0ULL;
     for (std::uint32_t remote_node = 0;
@@ -4253,6 +4339,28 @@ local_p2p_forward_megakernel(
         record.credit = 1ULL;
         record.last_cursor = directory.packet_begin + directory.packet_count;
         record.last_progress_globaltimer = device_globaltimer_ns();
+#if MEGAMOE_DEBUG_VALIDATE
+        std::uint64_t first_node_wave = 0;
+        while (first_node_wave < a.dispatch_waves.wave_count &&
+               a.dispatch_waves.destination_node[first_node_wave] <
+                   remote_node)
+          ++first_node_wave;
+        const auto node_packet_begin =
+            a.dispatch_waves.offsets[first_node_wave];
+        for (std::uint64_t position = directory.packet_begin;
+             position < directory.packet_begin + directory.packet_count;
+             ++position) {
+          const auto header = send_headers[node_packet_begin + position];
+          record.dispatch_fanout_rows += header.route_index;
+          for (std::uint64_t fanout = 0; fanout < header.route_index;
+               ++fanout)
+            record.dispatch_tile0_rows +=
+                send_fanout[(node_packet_begin + position) *
+                                a.dispatch.identity.top_k +
+                            fanout]
+                    .reserved == 0U;
+        }
+#endif
         atomicAdd(&completion->directory_ready, 1ULL);
         atomicAdd(&completion->dispatch_local_completion_completed,
                   1ULL + directory.wave_count);
@@ -4298,14 +4406,9 @@ local_p2p_forward_megakernel(
           const auto record_index =
               source_partition * a.gin_context_count + context;
           context_completion[record_index].relay_expected =
-              directory.wave_count;
+              directory.packet_count;
         }
       }
-      if (incoming_waves != 0ULL)
-        atomicAdd(&completion_task(completion,
-                                   transport_state::TaskClass::RelayWave)
-                       .expected,
-                  incoming_waves);
       if (incoming_waves != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0,
                        incoming_sources + incoming_waves);
@@ -4453,6 +4556,11 @@ local_p2p_forward_megakernel(
             counter(arrived[target.reserved]);
         counter.fetch_add(1ULL, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
+        const auto record_index =
+            source_partition * a.gin_context_count + context;
+        atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
+        if (target.reserved == 0U)
+          atomicAdd(&context_completion[record_index].relay_tile0_rows, 1ULL);
         atomicAdd(&completion->remote_rows_published, 1ULL);
         if (target.reserved < 64U)
           atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
@@ -4543,8 +4651,6 @@ local_p2p_forward_megakernel(
   }
   MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
                           a.dispatch.sizes.mtile_count, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U,
-                          a.dispatch.sizes.mtile_count, a.epoch);
   MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
                           a.dispatch.sizes.mtile_count, a.epoch);
 
@@ -4566,26 +4672,6 @@ local_p2p_forward_megakernel(
   // both roles rejoin only at the already-proven Bulk Return grid barrier.
   // This makes role ownership static and keeps the Return state machine
   // unchanged while Dispatch is made asynchronous.
-#if MEGAMOE_DEBUG_VALIDATE
-  // Backward reuses the claim arena as canonical-prefix scratch.  A scratch
-  // value can numerically equal the next Forward epoch, so treating the old
-  // contents as an epoch-tagged claim would skip a real FC1/FC2 task and make
-  // Reduce wait forever.  Initialize only the actual task domain in parallel.
-  const auto debug_fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
-  const auto debug_claims =
-      forward_mblocks * (fc1_ntiles + debug_fc2_ntiles);
-  for (std::uint64_t task =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       task < debug_claims;
-       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    claims[task] = 0ULL;
-  // Cooperative-grid barriers must remain role-uniform.  Fixed GIN progress
-  // CTAs do not execute FC work, but they still participate in this debug-only
-  // claim-arena initialization boundary so it cannot be confused with the
-  // later Bulk Return rendezvous.
-  grid.sync();
-#endif
   if (!gin_progress_cta) {
   if (threadIdx.x == 256U) {
     for (std::uint32_t stage = 0; stage < 4U; ++stage) {
@@ -4602,64 +4688,72 @@ local_p2p_forward_megakernel(
   else
     cutlass::arch::warpgroup_reg_dealloc<48>();
   std::uint32_t pipeline_iteration = 0;
-  constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
   __shared__ unsigned long long task_shared;
-#if MEGAMOE_DEBUG_VALIDATE
-  __shared__ std::uint32_t expert_shared;
-  __shared__ std::uint64_t local_mblock_shared;
   __shared__ unsigned int claim_shared;
-#endif
+  auto *fc1_claims = claims + forward_mblocks;
+  auto *fc2_claims = fc1_claims + fc1_tasks;
+  constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
   unsigned int task_in_chunk = kTaskChunk;
 #if MEGAMOE_DEVICE_TIMELINE
   bool timeline_fc1_started = false;
 #endif
+#if MEGAMOE_DEBUG_VALIDATE
+  if (threadIdx.x == 0U) {
+    completion->fc1_scheduler_value =
+        a.cancel_epoch
+            ? atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
+                               0ULL)
+            : ~0ULL;
+    completion->bulk_local_ready = 10ULL;
+  }
+  __syncthreads();
+#endif
   while (!forward_cancelled(a)) {
     if (task_in_chunk == kTaskChunk) {
-      if (threadIdx.x == 0)
-        task_shared = atomicAdd(&scheduler[0],
-                                static_cast<unsigned long long>(kTaskChunk));
+      if (threadIdx.x == 0U)
+        task_shared =
+            atomicAdd(&scheduler[0], static_cast<unsigned long long>(kTaskChunk));
       __syncthreads();
       task_in_chunk = 0U;
     }
     const auto task = task_shared + task_in_chunk++;
     if (task >= fc1_tasks)
       break;
+    const auto mblock = task / fc1_ntiles;
+    const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
+    const auto mapping = claims[mblock];
+    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+    const auto local_mblock = static_cast<std::uint32_t>(mapping);
+    if (threadIdx.x == 0U) {
+      claim_shared = atomicCAS(&fc1_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
 #if MEGAMOE_DEBUG_VALIDATE
-    if (threadIdx.x == 0) {
-      const auto old = atomicAdd(&claims[task], 0ULL);
-      claim_shared = old != a.epoch &&
-                             atomicCAS(&claims[task], old, a.epoch) == old
-                         ? 1U
-                         : 0U;
+      completion->fc1_scheduler_value = task;
+      completion->bulk_local_ready = 11ULL;
+#endif
     }
     __syncthreads();
     if (claim_shared == 0U)
       continue;
-#else
-    (void)claims;
-#endif
-    const auto mblock = task / fc1_ntiles;
-    const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
-#if MEGAMOE_DEBUG_VALIDATE
-    if (threadIdx.x == 0)
-      expert_shared = forward_mblock_expert(
-          a, mblock, local_mblock_shared);
-    __syncthreads();
-    const auto expert = expert_shared;
-    const auto local_mblock = local_mblock_shared;
-#else
-    const auto mapping = claims[mblock];
-    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-    const auto local_mblock = static_cast<std::uint32_t>(mapping);
-#endif
     if (expert >= a.dispatch.sizes.owned_expert_count)
       break;
     if constexpr (!StaticLocal)
       if (a.use_gin && threadIdx.x == 0U)
         claim_completion_tasks(completion,
                                transport_state::TaskClass::Fc1OrDv);
+    const auto row =
+        a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
+    const auto remaining_rows =
+        a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
+    const auto valid_rows = static_cast<std::uint32_t>(
+        remaining_rows < 128ULL ? remaining_rows : 128ULL);
+    wait_forward_mblock_rows<StaticLocal>(
+        a, expert, static_cast<std::uint64_t>(local_mblock) * 128ULL,
+        valid_rows, completion);
+    __syncthreads();
 #if MEGAMOE_DEVICE_TIMELINE
     if (!timeline_fc1_started) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
+                              a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
                               a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
@@ -4667,14 +4761,6 @@ local_p2p_forward_megakernel(
       timeline_fc1_started = true;
     }
 #endif
-    const auto row =
-        a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
-    const auto remaining_rows =
-        a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
-    const auto valid_rows = static_cast<std::uint32_t>(
-        remaining_rows < 128ULL ? remaining_rows : 128ULL);
-    wait_forward_mblock_rows<StaticLocal>(a, expert, local_mblock * 128ULL,
-                                          valid_rows);
     const auto n = n_tile * 128U;
     {
       float accum_a[ForwardMma::kNumAccum];
@@ -4762,6 +4848,10 @@ local_p2p_forward_megakernel(
       if (a.use_gin && threadIdx.x == 0U)
         complete_completion_tasks(completion,
                                   transport_state::TaskClass::Fc1OrDv);
+    if (threadIdx.x == 0U) {
+      atomicExch(&fc1_claims[task], 2ULL);
+    }
+    __syncthreads();
   }
   if (threadIdx.x == 0)
     atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
@@ -4786,55 +4876,41 @@ local_p2p_forward_megakernel(
   task_in_chunk = kTaskChunk;
   while (!forward_cancelled(a)) {
     if (task_in_chunk == kTaskChunk) {
-      if (threadIdx.x == 0)
-        task_shared = atomicAdd(&scheduler[1],
-                                static_cast<unsigned long long>(kTaskChunk));
+      if (threadIdx.x == 0U)
+        task_shared =
+            atomicAdd(&scheduler[1], static_cast<unsigned long long>(kTaskChunk));
       __syncthreads();
       task_in_chunk = 0U;
     }
     const auto task = task_shared + task_in_chunk++;
     if (task >= fc2_tasks)
       break;
-    const auto claim_index = fc1_tasks + task;
+    const auto mblock = task / fc2_ntiles;
+    const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
+    if (threadIdx.x == 0U) {
+      claim_shared = atomicCAS(&fc2_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
 #if MEGAMOE_DEBUG_VALIDATE
-    if (threadIdx.x == 0) {
-      const auto old = atomicAdd(&claims[claim_index], 0ULL);
-      claim_shared = old != a.epoch &&
-                             atomicCAS(&claims[claim_index], old, a.epoch) == old
-                         ? 1U
-                         : 0U;
+      completion->fc2_scheduler_value = task;
+#endif
     }
     __syncthreads();
     if (claim_shared == 0U)
       continue;
-#else
-    (void)claim_index;
-#endif
-    const auto mblock = task / fc2_ntiles;
-    const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        fc1_ready(fc1_done[mblock]);
-    while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
-           fc1_ntiles) {
-    }
     if constexpr (!StaticLocal)
       if (a.use_gin && threadIdx.x == 0U)
         claim_completion_tasks(completion,
                                transport_state::TaskClass::Fc2OrDx);
     if (threadIdx.x == 0)
       atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
-#if MEGAMOE_DEBUG_VALIDATE
-    if (threadIdx.x == 0)
-      expert_shared = forward_mblock_expert(
-          a, mblock, local_mblock_shared);
-    __syncthreads();
-    const auto expert = expert_shared;
-    const auto local_mblock = local_mblock_shared;
-#else
     const auto mapping = claims[mblock];
     const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
     const auto local_mblock = static_cast<std::uint32_t>(mapping);
-#endif
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        fc1_ready(fc1_done[mblock]);
+    while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
+           fc1_ntiles) {
+    }
+    __syncthreads();
     const auto row =
         a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
     const auto remaining_rows =
@@ -4957,6 +5033,10 @@ local_p2p_forward_megakernel(
       if (a.use_gin && threadIdx.x == 0U)
         complete_completion_tasks(completion,
                                   transport_state::TaskClass::Fc2OrDx);
+    if (threadIdx.x == 0U) {
+      atomicExch(&fc2_claims[task], 2ULL);
+    }
+    __syncthreads();
   }
   }
 #if __has_include(<nccl_device.h>)
@@ -5000,6 +5080,8 @@ local_p2p_forward_megakernel(
       }
     }
     grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U)
+      completion->bulk_local_ready = 1ULL;
     auto *gin_window_bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *gin_receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
         gin_window_bytes + a.gin_receive_header_offset);
@@ -5053,10 +5135,14 @@ local_p2p_forward_megakernel(
     }
     __threadfence_system();
     grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U)
+      completion->bulk_pack_complete = 1ULL;
     MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackEnd, GinReturn, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
     if (blockIdx.x < a.gin_context_count) {
       const auto context = static_cast<std::uint32_t>(blockIdx.x);
+      if (threadIdx.x == 0U)
+        atomicAdd(&completion->bulk_contexts_issuing, 1ULL);
       const ncclGin gin(a.gin_dev_comm, context);
       const auto rail = ncclTeamRail(a.gin_dev_comm);
       auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
@@ -5949,19 +6035,31 @@ __device__ __attribute__((unused)) void backward_wgmma_dw_mn_tile(
   pipeline_iteration += iterations;
 }
 
-__device__ std::uint32_t backward_mblock_expert(
-    const BackwardKernelArgs &a, std::uint64_t mblock,
+__device__ std::uint32_t backward_wavefront_mblock_expert(
+    const BackwardKernelArgs &a, std::uint64_t ordinal,
     std::uint64_t &local_mblock) {
+  std::uint64_t max_blocks = 0ULL;
   for (std::uint32_t expert = 0;
        expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-    const auto blocks = (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
-    if (mblock < blocks) {
-      local_mblock = mblock;
-      return expert;
-    }
-    mblock -= blocks;
+    const std::uint64_t blocks =
+        (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+    max_blocks = blocks > max_blocks ? blocks : max_blocks;
   }
-  local_mblock = 0;
+  for (std::uint64_t tile = 0; tile < max_blocks; ++tile) {
+    for (std::uint32_t expert = 0;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      const auto blocks =
+          (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+      if (tile >= blocks)
+        continue;
+      if (ordinal == 0ULL) {
+        local_mblock = tile;
+        return expert;
+      }
+      --ordinal;
+    }
+  }
+  local_mblock = 0ULL;
   return a.dispatch.sizes.owned_expert_count;
 }
 
@@ -6106,6 +6204,15 @@ local_p2p_backward_megakernel(
         completion_task(completion,
                         transport_state::TaskClass::DispatchWave)
             .expected = dispatch_waves;
+        unsigned long long relay_packets = 0ULL;
+        for (std::uint32_t index = 0;
+             index < a.dispatch.sizes.incoming_signal_count; ++index) {
+          const auto signal = a.dispatch.incoming_proxy_signals[index];
+          if (signal.source_node != a.node)
+            relay_packets += signal.expected_packets;
+        }
+        completion_task(completion, transport_state::TaskClass::RelayWave)
+            .expected = relay_packets;
         completion_task(completion, transport_state::TaskClass::Fc1OrDv)
             .expected = mblocks * ((a.intermediate + 255ULL) / 256ULL);
         completion_task(completion, transport_state::TaskClass::Fc2OrDx)
@@ -6143,6 +6250,7 @@ local_p2p_backward_megakernel(
         }
         completion_task(completion, transport_state::TaskClass::Return)
             .expected = return_tasks;
+        completion->return_local_completion_expected = return_tasks;
         completion->directory_expected =
             static_cast<unsigned long long>(
                 a.dispatch.identity.num_nodes - 1U) *
@@ -6204,7 +6312,8 @@ local_p2p_backward_megakernel(
        mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     std::uint64_t local = 0;
-    const auto expert = backward_mblock_expert(a, mblock, local);
+    const auto expert =
+        backward_wavefront_mblock_expert(a, mblock, local);
     claims[a.dispatch.sizes.owned_expert_count + mblock] =
         (static_cast<unsigned long long>(expert) << 32U) |
         static_cast<std::uint32_t>(local);
@@ -6529,6 +6638,14 @@ local_p2p_backward_megakernel(
         atomicAdd(&completion->directory_ready, 1ULL);
         atomicAdd(&completion->dispatch_local_completion_completed,
                   1ULL + directory.wave_count);
+        if (directory.wave_count != 0ULL) {
+          claim_completion_tasks(completion,
+                                 transport_state::TaskClass::DispatchWave,
+                                 directory.wave_count);
+          complete_completion_tasks(completion,
+                                    transport_state::TaskClass::DispatchWave,
+                                    directory.wave_count);
+        }
       }
     }
     __syncthreads();
@@ -6563,14 +6680,9 @@ local_p2p_backward_megakernel(
           const auto record_index =
               source_partition * a.gin_context_count + context;
           context_completion[record_index].relay_expected =
-              directory.wave_count;
+              directory.packet_count;
         }
       }
-      if (incoming_waves != 0ULL)
-        atomicAdd(&completion_task(completion,
-                                   transport_state::TaskClass::RelayWave)
-                       .expected,
-                  incoming_waves);
       if (incoming_waves != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0,
                        incoming_sources + incoming_waves);
@@ -6768,8 +6880,6 @@ local_p2p_backward_megakernel(
   }
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dy_dispatch_complete_clock = device_globaltimer_ns();
-  MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstMtileReady, Compute, 0U,
-                          a.dispatch.sizes.mtile_count, a.epoch);
   MEGAMOE_TIMELINE_RECORD(a.timeline, DyDispatchComplete, Compute, 0U,
                           a.dispatch.sizes.mtile_count, a.epoch);
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
@@ -6884,15 +6994,6 @@ local_p2p_backward_megakernel(
     __syncthreads();
     if (task_shared >= dv_tasks)
       break;
-#if MEGAMOE_DEVICE_TIMELINE
-    if (!timeline_dv_started) {
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DvFirst, Compute, 0U, task_shared,
-                              a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DvClaimStart, Compute, 0U,
-                              task_shared, a.epoch);
-      timeline_dv_started = true;
-    }
-#endif
     const auto mblock = task_shared / dv_ntiles;
     const auto ntile = static_cast<std::uint32_t>(task_shared % dv_ntiles);
     const auto mapping =
@@ -6908,6 +7009,17 @@ local_p2p_backward_megakernel(
         a, expert, static_cast<std::uint64_t>(local_mblock) * 128ULL,
         valid_rows);
     __syncthreads();
+#if MEGAMOE_DEVICE_TIMELINE
+    if (!timeline_dv_started) {
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstMtileReady, Compute, 0U,
+                              task_shared, a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DvFirst, Compute, 0U, task_shared,
+                              a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DvClaimStart, Compute, 0U,
+                              task_shared, a.epoch);
+      timeline_dv_started = true;
+    }
+#endif
     const auto n = ntile * 256U;
     float accum_a[ForwardMma::kNumAccum];
     float accum_b[ForwardMma::kNumAccum];
@@ -8014,25 +8126,42 @@ local_p2p_backward_megakernel(
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
       if (blockIdx.x == 0U && threadIdx.x == 0U) {
+        // This point is reachable only after the fixed Dispatch, Relay,
+        // dV/dAB/dX/dW, bulk Return, source-arrival, and Reduce barriers above.
+        // Convert those already-proven static task spaces into the immutable
+        // completion vector; no producer may change expected after this point.
         for (std::size_t index = 0;
              index < transport_state::kTaskClassCount; ++index)
           mark_task_space_complete(completion->tasks[index]);
-        completion->return_local_completion_expected =
-            completion_task(completion, transport_state::TaskClass::Return)
-                .expected;
         completion->return_local_completion_completed =
             completion->return_local_completion_expected;
         completion->ring_credit_restored = completion->ring_credit_expected;
         publish_elected_terminal(completion, a.epoch, status->error != 0U);
       }
-      grid.sync();
+      __syncthreads();
+      if (blockIdx.x != 0U) {
+        if (threadIdx.x == 0U) {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              terminal(completion->kernel_complete_epoch);
+          while (terminal.load(::cuda::memory_order_acquire) < a.epoch) {
+          }
+        }
+        __syncthreads();
+        return;
+      }
     }
   }
   publish_production_terminal_status<StaticLocal>(
       a, status, ProductionStatusPhase::Backward,
       a.production_error_records_offset,
       a.gin_production_error_records_offset);
-  grid.sync();
+  if constexpr (StaticLocal) {
+    grid.sync();
+  } else if (!a.use_gin) {
+    grid.sync();
+  } else {
+    __syncthreads();
+  }
 
   if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)

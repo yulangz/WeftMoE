@@ -47,9 +47,18 @@ struct GenerationCompletionVector {
   unsigned long long progress_ctas_at_bulk_return;
   unsigned long long compute_ctas_at_bulk_return;
   unsigned long long grid_ctas_expected;
+  unsigned long long bulk_local_ready;
+  unsigned long long bulk_pack_complete;
+  unsigned long long bulk_contexts_issuing;
+  unsigned long long fc1_scheduler_value;
+  unsigned long long fc2_scheduler_value;
   unsigned long long local_rows_published;
   unsigned long long remote_rows_published;
   unsigned long long published_tile_mask;
+  unsigned long long first_waiting_tile;
+  unsigned long long first_wait_expected;
+  unsigned long long first_wait_arrived;
+  unsigned long long tile_waiter_count;
   unsigned long long kernel_complete_epoch;
   unsigned long long terminal_publish_count;
 };
@@ -75,10 +84,14 @@ struct ContextCompletionRecord {
   unsigned long long credit;
   unsigned long long last_cursor;
   unsigned long long last_progress_globaltimer;
+  unsigned long long dispatch_fanout_rows;
+  unsigned long long dispatch_tile0_rows;
+  unsigned long long relay_fanout_rows;
+  unsigned long long relay_tile0_rows;
 };
 
 static_assert(sizeof(TaskCompletionRecord) == 4U * sizeof(std::uint64_t));
-static_assert(sizeof(ContextCompletionRecord) == 17U * sizeof(std::uint64_t));
+static_assert(sizeof(ContextCompletionRecord) == 21U * sizeof(std::uint64_t));
 static_assert(sizeof(GenerationCompletionVector) % sizeof(std::uint64_t) == 0U);
 
 constexpr std::size_t kGenerationCompletionWords =
