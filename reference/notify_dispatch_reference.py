@@ -222,6 +222,13 @@ def _content_hash(metadata: dict) -> int:
         for target in packet["fanout"]:
             for key in ("topk_slot", "destination_local_rank", "expert_id", "dst_row"):
                 h.add(target[key])
+    for key in ("dispatch_wave_packet_order", "dispatch_wave_offsets",
+                "dispatch_wave_destination_node", "dispatch_wave_channel",
+                "dispatch_wave_first_primary_tile",
+                "dispatch_wave_last_primary_tile",
+                "dispatch_wave_packet_count",
+                "dispatch_wave_payload_bytes"):
+        h.vector(transport[key])
     for group in ("outgoing_signals", "incoming_proxy_signals"):
         for signal in transport[group]:
             for key in ("source_node", "destination_node", "source_rank",
@@ -370,6 +377,44 @@ def materialize_rank_metadata(local: LocalHistogram, count_matrix: Sequence[Sequ
                                         remote_source_rank, source_rank,
                                         rail_local_rank, expected))
 
+    priorities = []
+    for packet_index, packet in enumerate(packets):
+        primary = min(
+            ((target["dst_row"] - expert_base[target["expert_id"]]) //
+             config.m_tile_rows,
+             target["expert_id"],
+             config.topology.expert_to_rank[target["expert_id"]])
+            for target in packet["fanout"])
+        priorities.append((packet["identity"]["destination_node"], *primary,
+                           packet["local_token_id"], packet_index))
+    priorities.sort()
+    wave_order = [entry[-1] for entry in priorities]
+    wave_offsets = [0]
+    wave_nodes = []
+    wave_channels = []
+    wave_first_tiles = []
+    wave_last_tiles = []
+    wave_packet_counts = []
+    wave_payload_bytes = []
+    previous = None
+    for position, entry in enumerate(priorities):
+        node, tile, _expert, _rank, _token, packet_index = entry
+        key = (node, tile)
+        if key != previous:
+            if position:
+                wave_offsets.append(position)
+            wave_nodes.append(node)
+            wave_channels.append(packets[packet_index]["channel"])
+            wave_first_tiles.append(tile)
+            wave_last_tiles.append(tile)
+            wave_packet_counts.append(0)
+            wave_payload_bytes.append(0)
+            previous = key
+        wave_packet_counts[-1] += 1
+        wave_payload_bytes[-1] += 32 + 24 * len(packets[packet_index]["fanout"])
+    if priorities:
+        wave_offsets.append(len(priorities))
+
     metadata = {
         "schema": 1,
         "config": {
@@ -392,6 +437,14 @@ def materialize_rank_metadata(local: LocalHistogram, count_matrix: Sequence[Sequ
         "incoming": incoming,
         "transport": {
             "outgoing_packets": packets,
+            "dispatch_wave_packet_order": wave_order,
+            "dispatch_wave_offsets": wave_offsets,
+            "dispatch_wave_destination_node": wave_nodes,
+            "dispatch_wave_channel": wave_channels,
+            "dispatch_wave_first_primary_tile": wave_first_tiles,
+            "dispatch_wave_last_primary_tile": wave_last_tiles,
+            "dispatch_wave_packet_count": wave_packet_counts,
+            "dispatch_wave_payload_bytes": wave_payload_bytes,
             "outgoing_signals": outgoing_signals,
             "incoming_proxy_signals": incoming_signals,
         },

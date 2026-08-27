@@ -72,6 +72,14 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease packet_headers;
   DeviceBufferLease packet_fanout_offsets;
   DeviceBufferLease packet_fanout;
+  DeviceBufferLease dispatch_wave_packet_order;
+  DeviceBufferLease dispatch_wave_offsets;
+  DeviceBufferLease dispatch_wave_destination_node;
+  DeviceBufferLease dispatch_wave_channel;
+  DeviceBufferLease dispatch_wave_first_primary_tile;
+  DeviceBufferLease dispatch_wave_last_primary_tile;
+  DeviceBufferLease dispatch_wave_packet_count;
+  DeviceBufferLease dispatch_wave_payload_bytes;
   DeviceBufferLease outgoing_signals;
   DeviceBufferLease incoming_proxy_signals;
 };

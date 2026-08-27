@@ -553,8 +553,9 @@ read concurrently, but mutation is unavailable through the public API.
 ## Descriptor baseline
 
 For each local token, routes are grouped by destination node. One packet is
-created per non-empty token-node group. Deterministic order is destination node
-first, then local token ID. Each fan-out is sorted by global expert ID and stores:
+created per non-empty token-node group. Packet identity/storage order remains
+destination node first, then local token ID. Each fan-out is sorted by global
+expert ID and stores:
 
 ```text
 topk_slot, destination_local_rank, expert_id, canonical dst_row
@@ -568,6 +569,31 @@ at `(destination_node, rail_local_rank)`, the expected count from source node
 ```text
 summary[rank_at(s, rail_local_rank)][destination_node]
 ```
+
+Notify additionally materializes a device-only consumption permutation for
+the GIN pipeline. For each fan-out it computes the expert-local canonical
+M-tile and the key `(m_tile, global_expert_id, destination_rank)`. A packet's
+primary key is the minimum of its fan-out keys, and packet consumption order is
+the explicit total order:
+
+```text
+(destination_node, primary_m_tile, primary_expert,
+ destination_rank, local_token_id)
+```
+
+Runtime-width fields are sorted with stable radix passes; token ID is an
+explicit key component, so correctness does not depend on an unspecified tie
+order. Waves group equal primary M-tile keys (the future autotune may group 1,
+2, or 4 consecutive tile keys). Because every fan-out key is greater than or
+equal to its packet primary key, after consuming all packet priorities through
+tile `T`, this source has sent every row it owns for `T`. A packet appears once
+in the permutation, preserving node dedup and canonical rows. Wave signals are
+only ingress hints: final compute readiness still requires exact per-tile row
+counters after destination stores complete.
+
+`dispatch_wave_payload_bytes` counts packet/fan-out descriptor bytes because
+Notify intentionally has no hidden dimension. The transport layer adds the
+actual BF16 activation bytes after binding runtime `hidden_size`.
 
 Packet aggregation/channel autotuning may replace this baseline only if it
 also supplies a new explicit summary collective and leaves canonical mapping

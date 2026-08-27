@@ -172,6 +172,22 @@ std::string serialize_dispatch_metadata(const DispatchHandle& handle) {
         });
         out << '}';
     });
+    out << ",\"dispatch_wave_packet_order\":";
+    write_vector(out, metadata.transport.dispatch_wave_packet_order);
+    out << ",\"dispatch_wave_offsets\":";
+    write_vector(out, metadata.transport.dispatch_wave_offsets);
+    out << ",\"dispatch_wave_destination_node\":";
+    write_vector(out, metadata.transport.dispatch_wave_destination_node);
+    out << ",\"dispatch_wave_channel\":";
+    write_vector(out, metadata.transport.dispatch_wave_channel);
+    out << ",\"dispatch_wave_first_primary_tile\":";
+    write_vector(out, metadata.transport.dispatch_wave_first_primary_tile);
+    out << ",\"dispatch_wave_last_primary_tile\":";
+    write_vector(out, metadata.transport.dispatch_wave_last_primary_tile);
+    out << ",\"dispatch_wave_packet_count\":";
+    write_vector(out, metadata.transport.dispatch_wave_packet_count);
+    out << ",\"dispatch_wave_payload_bytes\":";
+    write_vector(out, metadata.transport.dispatch_wave_payload_bytes);
     out << ",\"outgoing_signals\":";
     write_objects(out, metadata.transport.outgoing_signals.size(),
                   [&](std::size_t i) {

@@ -103,6 +103,36 @@ class RankLocalReferenceTest(unittest.TestCase):
         self.assertEqual(result["outgoing"]["destination_node_mask"], [1, 1 << 8])
         self.assertEqual(len(result["transport"]["outgoing_packets"]), 2)
 
+    def test_dispatch_wave_is_mtile_priority_total_order(self):
+        cfg = config(nodes=1, gpus=1, experts=3, top_k=1, mtile=2)
+        routes = [[0], [0], [0], [1], [1], [0], [1]]
+        result = build_reference_all(cfg, [routes], "wave", 9)[0]
+        transport = result["transport"]
+        order = transport["dispatch_wave_packet_order"]
+        self.assertEqual(sorted(order), list(range(len(routes))))
+        self.assertNotEqual(order, list(range(len(routes))))
+
+        expert_base = [0, 4, 7]
+        priorities = []
+        for packet in transport["outgoing_packets"]:
+            fanout_keys = []
+            for target in packet["fanout"]:
+                tile = ((target["dst_row"] - expert_base[target["expert_id"]]) //
+                        cfg.m_tile_rows)
+                fanout_keys.append((tile, target["expert_id"], 0))
+            primary = min(fanout_keys)
+            # Every fan-out tile is at or after its packet's primary key.
+            self.assertTrue(all(primary <= key for key in fanout_keys))
+            priorities.append((packet["identity"]["destination_node"],
+                               *primary, packet["local_token_id"]))
+        self.assertEqual([priorities[index] for index in order],
+                         sorted(priorities))
+        offsets = transport["dispatch_wave_offsets"]
+        self.assertEqual(offsets[0], 0)
+        self.assertEqual(offsets[-1], len(order))
+        self.assertEqual(sum(transport["dispatch_wave_packet_count"]),
+                         len(order))
+
     def test_topology_and_topk_rejections(self):
         cfg = config()
         sparse = ReferenceConfig(

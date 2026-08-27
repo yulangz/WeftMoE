@@ -212,6 +212,7 @@ struct DeviceMaterializationStatus {
   unsigned long long mtile_count;
   unsigned long long packet_count;
   unsigned long long fanout_count;
+  unsigned long long wave_count;
 };
 
 struct Layout {
@@ -251,6 +252,16 @@ struct Layout {
   std::size_t packet_headers = 0;
   std::size_t packet_fanout_offsets = 0;
   std::size_t packet_fanout = 0;
+  std::size_t packet_primary_tile = 0;
+  std::size_t packet_primary_expert = 0;
+  std::size_t packet_primary_rank = 0;
+  std::size_t dispatch_wave_offsets = 0;
+  std::size_t dispatch_wave_destination_node = 0;
+  std::size_t dispatch_wave_channel = 0;
+  std::size_t dispatch_wave_first_primary_tile = 0;
+  std::size_t dispatch_wave_last_primary_tile = 0;
+  std::size_t dispatch_wave_packet_count = 0;
+  std::size_t dispatch_wave_payload_bytes = 0;
   std::size_t outgoing_signals = 0;
   std::size_t incoming_signals = 0;
   std::size_t temp = 0;
@@ -322,6 +333,33 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
   layout.packet_fanout = append_region(cursor, plan.route_count,
                                        sizeof(DeviceFanoutRecord),
                                        "packet_fanout");
+  layout.packet_primary_tile = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t), "packet_primary_tile");
+  layout.packet_primary_expert = append_region(
+      cursor, plan.route_count, sizeof(std::uint32_t), "packet_primary_expert");
+  layout.packet_primary_rank = append_region(
+      cursor, plan.route_count, sizeof(std::uint32_t), "packet_primary_rank");
+  layout.dispatch_wave_offsets = append_region(
+      cursor, plan.route_count + 1, sizeof(std::uint64_t),
+      "dispatch_wave_offsets");
+  layout.dispatch_wave_destination_node = append_region(
+      cursor, plan.route_count, sizeof(std::uint32_t),
+      "dispatch_wave_destination_node");
+  layout.dispatch_wave_channel = append_region(
+      cursor, plan.route_count, sizeof(std::uint32_t),
+      "dispatch_wave_channel");
+  layout.dispatch_wave_first_primary_tile = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t),
+      "dispatch_wave_first_primary_tile");
+  layout.dispatch_wave_last_primary_tile = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t),
+      "dispatch_wave_last_primary_tile");
+  layout.dispatch_wave_packet_count = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t),
+      "dispatch_wave_packet_count");
+  layout.dispatch_wave_payload_bytes = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t),
+      "dispatch_wave_payload_bytes");
   layout.outgoing_signals = append_region(cursor, plan.num_nodes,
                                           sizeof(DeviceSignalRecord),
                                           "outgoing_signals");
@@ -522,6 +560,22 @@ struct DeviceMaterializeArgs {
   DevicePacketHeaderRecord *packet_headers;
   std::uint64_t *packet_fanout_offsets;
   DeviceFanoutRecord *packet_fanout;
+  std::uint64_t *packet_primary_tile;
+  std::uint32_t *packet_primary_expert;
+  std::uint32_t *packet_primary_rank;
+  std::uint64_t *sort_keys_in;
+  std::uint64_t *sort_keys_out;
+  std::uint64_t *sort_indices_in;
+  std::uint64_t *sort_indices_out;
+  std::uint64_t *wave_flags;
+  std::uint64_t *wave_ids;
+  std::uint64_t *dispatch_wave_offsets;
+  std::uint32_t *dispatch_wave_destination_node;
+  std::uint32_t *dispatch_wave_channel;
+  std::uint64_t *dispatch_wave_first_primary_tile;
+  std::uint64_t *dispatch_wave_last_primary_tile;
+  std::uint64_t *dispatch_wave_packet_count;
+  std::uint64_t *dispatch_wave_payload_bytes;
   DeviceSignalRecord *outgoing_signals;
   DeviceSignalRecord *incoming_signals;
   DeviceMaterializationStatus *status;
@@ -1074,6 +1128,153 @@ __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
     a.packet_fanout[output++] = DeviceFanoutRecord{
         a.route_dst_row[route], slot, a.route_dst_local[route],
         a.expert_id[route], 0};
+  }
+}
+
+// Packet storage/identity is intentionally left untouched.  These kernels
+// build a transport consumption permutation whose explicit lexicographic key
+// is (destination node, primary M tile, expert, destination rank, token).
+// Five stable radix passes implement that full runtime-width key without
+// packing unrelated runtime dimensions into a fixed-width integer.
+__global__ void materialize_packet_primary_kernel(DeviceMaterializeArgs a) {
+  const auto packet = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (a.status->error != 0 || packet >= a.routes)
+    return;
+  a.sort_indices_in[packet] = packet;
+  if (packet >= a.status->packet_count) {
+    a.packet_primary_tile[packet] = ~std::uint64_t{0};
+    a.packet_primary_expert[packet] = ~std::uint32_t{0};
+    a.packet_primary_rank[packet] = ~std::uint32_t{0};
+    return;
+  }
+  const auto begin = a.packet_fanout_offsets[packet];
+  const auto end = a.packet_fanout_offsets[packet + 1];
+  if (begin >= end) {
+    materialization_fail_once(a.status, MaterializationError::OutputCapacity,
+                              40, 1, 0);
+    return;
+  }
+  std::uint64_t primary_tile = ~std::uint64_t{0};
+  std::uint32_t primary_expert = ~std::uint32_t{0};
+  std::uint32_t primary_rank = ~std::uint32_t{0};
+  for (auto index = begin; index < end; ++index) {
+    const auto target = a.packet_fanout[index];
+    if (target.expert_id >= a.experts) {
+      materialization_fail_once(a.status,
+                                MaterializationError::InvalidCollectiveValue,
+                                41, a.experts, target.expert_id);
+      return;
+    }
+    const auto base = a.expert_base[target.expert_id];
+    if (target.dst_row < base) {
+      materialization_fail_once(a.status,
+                                MaterializationError::InvalidCollectiveValue,
+                                42, base, target.dst_row);
+      return;
+    }
+    const auto tile = (target.dst_row - base) / a.m_tile;
+    const auto destination_rank = a.expert_to_rank[target.expert_id];
+    if (tile < primary_tile ||
+        (tile == primary_tile && target.expert_id < primary_expert) ||
+        (tile == primary_tile && target.expert_id == primary_expert &&
+         destination_rank < primary_rank)) {
+      primary_tile = tile;
+      primary_expert = target.expert_id;
+      primary_rank = destination_rank;
+    }
+  }
+  a.packet_primary_tile[packet] = primary_tile;
+  a.packet_primary_expert[packet] = primary_expert;
+  a.packet_primary_rank[packet] = primary_rank;
+}
+
+enum class WaveSortField : std::uint32_t {
+  Token,
+  DestinationRank,
+  Expert,
+  MTile,
+  DestinationNode,
+};
+
+template <WaveSortField Field>
+__global__ void materialize_wave_sort_keys_kernel(
+    DeviceMaterializeArgs a, const std::uint64_t *packet_indices) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.status->packet_count) {
+    if (position < a.routes)
+      a.sort_keys_in[position] = ~std::uint64_t{0};
+    return;
+  }
+  const auto packet = packet_indices[position];
+  std::uint64_t key = 0;
+  if constexpr (Field == WaveSortField::Token)
+    key = a.packet_headers[packet].local_token_id;
+  else if constexpr (Field == WaveSortField::DestinationRank)
+    key = a.packet_primary_rank[packet];
+  else if constexpr (Field == WaveSortField::Expert)
+    key = a.packet_primary_expert[packet];
+  else if constexpr (Field == WaveSortField::MTile)
+    key = a.packet_primary_tile[packet];
+  else
+    key = a.packet_headers[packet].destination_node;
+  a.sort_keys_in[position] = key;
+}
+
+inline constexpr std::uint64_t kDispatchPrimaryTilesPerWave = 1;
+
+__global__ void materialize_wave_flags_kernel(DeviceMaterializeArgs a) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.status->packet_count)
+    return;
+  const auto packet = a.sort_indices_out[position];
+  bool begins = position == 0;
+  if (!begins) {
+    const auto previous = a.sort_indices_out[position - 1];
+    begins = a.packet_headers[packet].destination_node !=
+                 a.packet_headers[previous].destination_node ||
+             a.packet_primary_tile[packet] /
+                     kDispatchPrimaryTilesPerWave !=
+                 a.packet_primary_tile[previous] /
+                     kDispatchPrimaryTilesPerWave;
+  }
+  a.wave_flags[position] = begins ? 1 : 0;
+}
+
+__global__ void materialize_waves_kernel(DeviceMaterializeArgs a) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.status->packet_count)
+    return;
+  const auto packet = a.sort_indices_out[position];
+  const auto wave = a.wave_ids[position] - 1;
+  const auto tile = a.packet_primary_tile[packet];
+  if (a.wave_flags[position] != 0) {
+    a.dispatch_wave_offsets[wave] = position;
+    a.dispatch_wave_destination_node[wave] =
+        a.packet_headers[packet].destination_node;
+    a.dispatch_wave_channel[wave] = a.packet_headers[packet].channel;
+    a.dispatch_wave_first_primary_tile[wave] = tile;
+  }
+  atomicMax(reinterpret_cast<unsigned long long *>(
+                &a.dispatch_wave_last_primary_tile[wave]),
+            static_cast<unsigned long long>(tile));
+  atomicAdd(reinterpret_cast<unsigned long long *>(
+                &a.dispatch_wave_packet_count[wave]),
+            1ULL);
+  const auto fanout_count = a.packet_fanout_offsets[packet + 1] -
+                            a.packet_fanout_offsets[packet];
+  const auto descriptor_bytes = sizeof(DevicePacketHeaderRecord) +
+                                fanout_count * sizeof(DeviceFanoutRecord);
+  atomicAdd(reinterpret_cast<unsigned long long *>(
+                &a.dispatch_wave_payload_bytes[wave]),
+            static_cast<unsigned long long>(descriptor_bytes));
+  if (position + 1 == a.status->packet_count) {
+    const auto waves = a.wave_ids[position];
+    a.dispatch_wave_offsets[waves] = a.status->packet_count;
+    a.status->wave_count = waves;
   }
 }
 
@@ -2048,6 +2249,11 @@ CudaNotifyWorkspacePlan query_cuda_notify_workspace(
       nullptr, scan_bytes, static_cast<std::uint32_t *>(nullptr),
       static_cast<std::uint64_t *>(nullptr),
       static_cast<std::uint64_t *>(nullptr), cub_items);
+  std::size_t plain_scan_bytes = 0;
+  (void)cub::DeviceScan::InclusiveSum(
+      nullptr, plain_scan_bytes, static_cast<std::uint64_t *>(nullptr),
+      static_cast<std::uint64_t *>(nullptr), cub_items);
+  scan_bytes = std::max(scan_bytes, plain_scan_bytes);
   plan.sort_temp_bytes = sort_bytes;
   plan.scan_temp_bytes = scan_bytes;
   const auto device = make_device_layout(plan);
@@ -2925,6 +3131,7 @@ struct DeviceDispatchHandle::Impl {
   DeviceDispatchMetadata device;
   DeviceDispatchIdentity identity;
   DeviceDispatchSizes sizes;
+  std::uint64_t dispatch_wave_count = 0;
   DeviceMaterializationAudit audit;
   CudaRouteInput source_routes;
   CudaGateInput source_gates;
@@ -3243,6 +3450,26 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
        sizeof(std::uint64_t), "fanout offsets");
   zero(dl.packet_fanout, plan.route_count, sizeof(DeviceFanoutRecord),
        "fanout");
+  zero(dl.packet_primary_tile, plan.route_count, sizeof(std::uint64_t),
+       "packet primary tile");
+  zero(dl.packet_primary_expert, plan.route_count, sizeof(std::uint32_t),
+       "packet primary expert");
+  zero(dl.packet_primary_rank, plan.route_count, sizeof(std::uint32_t),
+       "packet primary rank");
+  zero(dl.dispatch_wave_offsets, plan.route_count + 1,
+       sizeof(std::uint64_t), "dispatch wave offsets");
+  zero(dl.dispatch_wave_destination_node, plan.route_count,
+       sizeof(std::uint32_t), "dispatch wave destination node");
+  zero(dl.dispatch_wave_channel, plan.route_count, sizeof(std::uint32_t),
+       "dispatch wave channel");
+  zero(dl.dispatch_wave_first_primary_tile, plan.route_count,
+       sizeof(std::uint64_t), "dispatch wave first primary tile");
+  zero(dl.dispatch_wave_last_primary_tile, plan.route_count,
+       sizeof(std::uint64_t), "dispatch wave last primary tile");
+  zero(dl.dispatch_wave_packet_count, plan.route_count, sizeof(std::uint64_t),
+       "dispatch wave packet count");
+  zero(dl.dispatch_wave_payload_bytes, plan.route_count,
+       sizeof(std::uint64_t), "dispatch wave payload bytes");
   zero(dl.outgoing_signals, plan.num_nodes, sizeof(DeviceSignalRecord),
        "outgoing signals");
   zero(dl.incoming_signals, plan.num_nodes, sizeof(DeviceSignalRecord),
@@ -3299,6 +3526,32 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   args.packet_fanout_offsets =
       at<std::uint64_t>(base, dl.packet_fanout_offsets);
   args.packet_fanout = at<DeviceFanoutRecord>(base, dl.packet_fanout);
+  args.packet_primary_tile =
+      at<std::uint64_t>(base, dl.packet_primary_tile);
+  args.packet_primary_expert =
+      at<std::uint32_t>(base, dl.packet_primary_expert);
+  args.packet_primary_rank =
+      at<std::uint32_t>(base, dl.packet_primary_rank);
+  args.sort_keys_in = at<std::uint64_t>(base, dl.keys_in);
+  args.sort_keys_out = at<std::uint64_t>(base, dl.keys_out);
+  args.sort_indices_in = at<std::uint64_t>(base, dl.indices_in);
+  args.sort_indices_out = at<std::uint64_t>(base, dl.indices_out);
+  args.wave_flags = at<std::uint64_t>(base, dl.ones);
+  args.wave_ids = at<std::uint64_t>(base, dl.inclusive);
+  args.dispatch_wave_offsets =
+      at<std::uint64_t>(base, dl.dispatch_wave_offsets);
+  args.dispatch_wave_destination_node =
+      at<std::uint32_t>(base, dl.dispatch_wave_destination_node);
+  args.dispatch_wave_channel =
+      at<std::uint32_t>(base, dl.dispatch_wave_channel);
+  args.dispatch_wave_first_primary_tile =
+      at<std::uint64_t>(base, dl.dispatch_wave_first_primary_tile);
+  args.dispatch_wave_last_primary_tile =
+      at<std::uint64_t>(base, dl.dispatch_wave_last_primary_tile);
+  args.dispatch_wave_packet_count =
+      at<std::uint64_t>(base, dl.dispatch_wave_packet_count);
+  args.dispatch_wave_payload_bytes =
+      at<std::uint64_t>(base, dl.dispatch_wave_payload_bytes);
   args.outgoing_signals =
       at<DeviceSignalRecord>(base, dl.outgoing_signals);
   args.incoming_signals =
@@ -3360,6 +3613,74 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       args);
   materialize_fanout_kernel<<<blocks_for(plan.route_count, "packet_grid"),
                               threads, 0, exec->stream>>>(args);
+  if (plan.route_count != 0) {
+    materialize_packet_primary_kernel<<<
+        blocks_for(plan.route_count, "wave_primary_grid"), threads, 0,
+        exec->stream>>>(args);
+    const auto sort_pass = [&](WaveSortField field,
+                               const std::uint64_t *indices_input,
+                               std::uint64_t *indices_output) {
+      const auto blocks = blocks_for(plan.route_count, "wave_sort_grid");
+      switch (field) {
+      case WaveSortField::Token:
+        materialize_wave_sort_keys_kernel<WaveSortField::Token>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case WaveSortField::DestinationRank:
+        materialize_wave_sort_keys_kernel<WaveSortField::DestinationRank>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case WaveSortField::Expert:
+        materialize_wave_sort_keys_kernel<WaveSortField::Expert>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case WaveSortField::MTile:
+        materialize_wave_sort_keys_kernel<WaveSortField::MTile>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case WaveSortField::DestinationNode:
+        materialize_wave_sort_keys_kernel<WaveSortField::DestinationNode>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      }
+      auto sort_bytes = checked_size(state->plan.sort_temp_bytes,
+                                     "wave_sort_temp_bytes");
+      internal::throw_cuda(
+          "device-materialize",
+          cub::DeviceRadixSort::SortPairs(
+              at<void>(base, dl.temp), sort_bytes, args.sort_keys_in,
+              args.sort_keys_out, indices_input, indices_output,
+              static_cast<int>(plan.route_count), 0, 64, exec->stream),
+          rank, context.session().world_size(), context.session().identity(),
+          context.session().generation(), ExchangeKind::ExpertCounts,
+          "wave cub::DeviceRadixSort::SortPairs");
+    };
+    sort_pass(WaveSortField::Token, args.sort_indices_in,
+              args.sort_indices_out);
+    sort_pass(WaveSortField::DestinationRank, args.sort_indices_out,
+              args.sort_indices_in);
+    sort_pass(WaveSortField::Expert, args.sort_indices_in,
+              args.sort_indices_out);
+    sort_pass(WaveSortField::MTile, args.sort_indices_out,
+              args.sort_indices_in);
+    sort_pass(WaveSortField::DestinationNode, args.sort_indices_in,
+              args.sort_indices_out);
+    materialize_wave_flags_kernel<<<
+        blocks_for(plan.route_count, "wave_flag_grid"), threads, 0,
+        exec->stream>>>(args);
+    auto wave_scan_bytes = checked_size(state->plan.scan_temp_bytes,
+                                        "wave_scan_temp_bytes");
+    internal::throw_cuda(
+        "device-materialize",
+        cub::DeviceScan::InclusiveSum(
+            at<void>(base, dl.temp), wave_scan_bytes, args.wave_flags,
+            args.wave_ids, static_cast<int>(plan.route_count), exec->stream),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts,
+        "wave cub::DeviceScan::InclusiveSum");
+    materialize_waves_kernel<<<blocks_for(plan.route_count, "wave_grid"),
+                               threads, 0, exec->stream>>>(args);
+  }
   materialize_signals_kernel<<<blocks_for(plan.num_nodes, "signal_grid"),
                                threads, 0, exec->stream>>>(args);
   internal::throw_cuda("device-materialize", cudaGetLastError(), rank,
@@ -3515,6 +3836,22 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       make_lease(state, dl.packet_fanout_offsets, status->packet_count + 1);
   impl->device.packet_fanout =
       make_lease(state, dl.packet_fanout, status->fanout_count);
+  impl->device.dispatch_wave_packet_order =
+      make_lease(state, dl.indices_out, status->packet_count);
+  impl->device.dispatch_wave_offsets =
+      make_lease(state, dl.dispatch_wave_offsets, status->wave_count + 1);
+  impl->device.dispatch_wave_destination_node = make_lease(
+      state, dl.dispatch_wave_destination_node, status->wave_count);
+  impl->device.dispatch_wave_channel =
+      make_lease(state, dl.dispatch_wave_channel, status->wave_count);
+  impl->device.dispatch_wave_first_primary_tile = make_lease(
+      state, dl.dispatch_wave_first_primary_tile, status->wave_count);
+  impl->device.dispatch_wave_last_primary_tile = make_lease(
+      state, dl.dispatch_wave_last_primary_tile, status->wave_count);
+  impl->device.dispatch_wave_packet_count =
+      make_lease(state, dl.dispatch_wave_packet_count, status->wave_count);
+  impl->device.dispatch_wave_payload_bytes =
+      make_lease(state, dl.dispatch_wave_payload_bytes, status->wave_count);
   impl->device.outgoing_signals =
       make_lease(state, dl.outgoing_signals, plan.num_nodes);
   impl->device.incoming_proxy_signals =
@@ -3540,6 +3877,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   impl->sizes.mtile_count = status->mtile_count;
   impl->sizes.packet_count = status->packet_count;
   impl->sizes.fanout_count = status->fanout_count;
+  impl->dispatch_wave_count = status->wave_count;
   impl->sizes.outgoing_signal_count = plan.num_nodes;
   impl->sizes.incoming_signal_count = plan.num_nodes;
   return DeviceDispatchHandle(std::move(impl));
@@ -4055,6 +4393,61 @@ DispatchHandle download_device_metadata_for_validation(
     }
     metadata.transport.outgoing_packets.push_back(std::move(descriptor));
   }
+  metadata.transport.dispatch_wave_packet_order =
+      download_vector<std::uint64_t>(
+          state, *exec,
+          at<const std::uint64_t>(state->allocation->device_ptr,
+                                  state->device_layout.indices_out),
+          impl.sizes.packet_count, "dispatch_wave_packet_order");
+  metadata.transport.dispatch_wave_offsets = download_vector<std::uint64_t>(
+      state, *exec,
+      at<const std::uint64_t>(state->allocation->device_ptr,
+                              state->device_layout.dispatch_wave_offsets),
+      impl.dispatch_wave_count + 1, "dispatch_wave_offsets");
+  metadata.transport.dispatch_wave_destination_node =
+      download_vector<std::uint32_t>(
+          state, *exec,
+          at<const std::uint32_t>(
+              state->allocation->device_ptr,
+              state->device_layout.dispatch_wave_destination_node),
+          impl.dispatch_wave_count,
+          "dispatch_wave_destination_node");
+  metadata.transport.dispatch_wave_channel = download_vector<std::uint32_t>(
+      state, *exec,
+      at<const std::uint32_t>(state->allocation->device_ptr,
+                              state->device_layout.dispatch_wave_channel),
+      impl.dispatch_wave_count, "dispatch_wave_channel");
+  metadata.transport.dispatch_wave_first_primary_tile =
+      download_vector<std::uint64_t>(
+          state, *exec,
+          at<const std::uint64_t>(
+              state->allocation->device_ptr,
+              state->device_layout.dispatch_wave_first_primary_tile),
+          impl.dispatch_wave_count,
+          "dispatch_wave_first_primary_tile");
+  metadata.transport.dispatch_wave_last_primary_tile =
+      download_vector<std::uint64_t>(
+          state, *exec,
+          at<const std::uint64_t>(
+              state->allocation->device_ptr,
+              state->device_layout.dispatch_wave_last_primary_tile),
+          impl.dispatch_wave_count,
+          "dispatch_wave_last_primary_tile");
+  metadata.transport.dispatch_wave_packet_count =
+      download_vector<std::uint64_t>(
+          state, *exec,
+          at<const std::uint64_t>(
+              state->allocation->device_ptr,
+              state->device_layout.dispatch_wave_packet_count),
+          impl.dispatch_wave_count, "dispatch_wave_packet_count");
+  metadata.transport.dispatch_wave_payload_bytes =
+      download_vector<std::uint64_t>(
+          state, *exec,
+          at<const std::uint64_t>(
+              state->allocation->device_ptr,
+              state->device_layout.dispatch_wave_payload_bytes),
+          impl.dispatch_wave_count,
+          "dispatch_wave_payload_bytes");
   const auto outgoing_signals = download_vector<DeviceSignalRecord>(
       state, *exec, view.outgoing_signals, impl.sizes.outgoing_signal_count,
       "outgoing_signals");

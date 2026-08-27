@@ -6,6 +6,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -633,6 +634,14 @@ std::uint64_t hash_metadata(const DispatchMetadata &metadata) {
       hash.add(target.dst_row);
     }
   }
+  hash.add_vector(metadata.transport.dispatch_wave_packet_order);
+  hash.add_vector(metadata.transport.dispatch_wave_offsets);
+  hash.add_vector(metadata.transport.dispatch_wave_destination_node);
+  hash.add_vector(metadata.transport.dispatch_wave_channel);
+  hash.add_vector(metadata.transport.dispatch_wave_first_primary_tile);
+  hash.add_vector(metadata.transport.dispatch_wave_last_primary_tile);
+  hash.add_vector(metadata.transport.dispatch_wave_packet_count);
+  hash.add_vector(metadata.transport.dispatch_wave_payload_bytes);
   const auto add_signals = [&hash](const auto &signals) {
     for (const auto &signal : signals) {
       hash.add(signal.source_node);
@@ -648,6 +657,90 @@ std::uint64_t hash_metadata(const DispatchMetadata &metadata) {
   add_signals(metadata.transport.outgoing_signals);
   add_signals(metadata.transport.incoming_proxy_signals);
   return hash.value();
+}
+
+void materialize_dispatch_waves(TransportMetadata &transport,
+                                const RuntimeConfig &config,
+                                const std::vector<std::uint64_t> &expert_base) {
+  struct PacketPriority {
+    std::uint64_t packet = 0;
+    std::uint64_t tile = 0;
+    std::uint32_t expert = 0;
+    std::uint32_t destination_rank = 0;
+  };
+  std::vector<PacketPriority> priorities;
+  priorities.reserve(transport.outgoing_packets.size());
+  for (std::size_t packet = 0; packet < transport.outgoing_packets.size();
+       ++packet) {
+    const auto &descriptor = transport.outgoing_packets[packet];
+    if (descriptor.fanout.empty())
+      fail(NotifyErrorCode::InvalidHandle,
+           "wave packet has no fan-out: packet=" + std::to_string(packet));
+    PacketPriority primary{static_cast<std::uint64_t>(packet),
+                           std::numeric_limits<std::uint64_t>::max(),
+                           std::numeric_limits<std::uint32_t>::max(),
+                           std::numeric_limits<std::uint32_t>::max()};
+    for (const auto &target : descriptor.fanout) {
+      if (target.expert_id >= config.num_experts ||
+          target.dst_row < expert_base[target.expert_id])
+        fail(NotifyErrorCode::InvalidHandle,
+             "wave fan-out has invalid canonical row: packet=" +
+                 std::to_string(packet));
+      const auto tile =
+          (target.dst_row - expert_base[target.expert_id]) /
+          config.m_tile_rows;
+      const auto destination_rank =
+          config.topology.expert_to_rank[target.expert_id];
+      if (std::tie(tile, target.expert_id, destination_rank) <
+          std::tie(primary.tile, primary.expert, primary.destination_rank)) {
+        primary.tile = tile;
+        primary.expert = target.expert_id;
+        primary.destination_rank = destination_rank;
+      }
+    }
+    priorities.push_back(primary);
+  }
+  std::sort(priorities.begin(), priorities.end(),
+            [&](const auto &lhs, const auto &rhs) {
+              const auto &left = transport.outgoing_packets[lhs.packet];
+              const auto &right = transport.outgoing_packets[rhs.packet];
+              return std::tie(left.identity.destination_node, lhs.tile,
+                              lhs.expert, lhs.destination_rank,
+                              left.local_token_id) <
+                     std::tie(right.identity.destination_node, rhs.tile,
+                              rhs.expert, rhs.destination_rank,
+                              right.local_token_id);
+            });
+  auto &order = transport.dispatch_wave_packet_order;
+  auto &offsets = transport.dispatch_wave_offsets;
+  order.reserve(priorities.size());
+  offsets.push_back(0);
+  std::uint32_t previous_node = std::numeric_limits<std::uint32_t>::max();
+  std::uint64_t previous_tile = std::numeric_limits<std::uint64_t>::max();
+  for (const auto &priority : priorities) {
+    const auto &packet = transport.outgoing_packets[priority.packet];
+    if (packet.identity.destination_node != previous_node ||
+        priority.tile != previous_tile) {
+      if (!order.empty())
+        offsets.push_back(order.size());
+      transport.dispatch_wave_destination_node.push_back(
+          packet.identity.destination_node);
+      transport.dispatch_wave_channel.push_back(packet.channel);
+      transport.dispatch_wave_first_primary_tile.push_back(priority.tile);
+      transport.dispatch_wave_last_primary_tile.push_back(priority.tile);
+      transport.dispatch_wave_packet_count.push_back(0);
+      transport.dispatch_wave_payload_bytes.push_back(0);
+      previous_node = packet.identity.destination_node;
+      previous_tile = priority.tile;
+    }
+    order.push_back(priority.packet);
+    transport.dispatch_wave_packet_count.back() += 1;
+    transport.dispatch_wave_payload_bytes.back() +=
+        kDispatchPacketHeaderDescriptorBytes +
+        packet.fanout.size() * kDispatchFanoutDescriptorBytes;
+  }
+  if (!priorities.empty())
+    offsets.push_back(order.size());
 }
 
 void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
@@ -1033,6 +1126,40 @@ void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
       }
     }
   }
+  TransportMetadata expected_transport;
+  expected_transport.outgoing_packets = expected_packets;
+  materialize_dispatch_waves(expected_transport, config, expert_base);
+  const auto require_wave_field = [&](const auto &actual,
+                                      const auto &expected,
+                                      const char *field) {
+    if (actual != expected)
+      metadata_failure(NotifyErrorCode::InvalidHandle, phase, field, rank,
+                       "canonical tile-priority descriptor", "mismatch");
+  };
+  require_wave_field(metadata.transport.dispatch_wave_packet_order,
+                     expected_transport.dispatch_wave_packet_order,
+                     "transport.dispatch_wave_packet_order");
+  require_wave_field(metadata.transport.dispatch_wave_offsets,
+                     expected_transport.dispatch_wave_offsets,
+                     "transport.dispatch_wave_offsets");
+  require_wave_field(metadata.transport.dispatch_wave_destination_node,
+                     expected_transport.dispatch_wave_destination_node,
+                     "transport.dispatch_wave_destination_node");
+  require_wave_field(metadata.transport.dispatch_wave_channel,
+                     expected_transport.dispatch_wave_channel,
+                     "transport.dispatch_wave_channel");
+  require_wave_field(metadata.transport.dispatch_wave_first_primary_tile,
+                     expected_transport.dispatch_wave_first_primary_tile,
+                     "transport.dispatch_wave_first_primary_tile");
+  require_wave_field(metadata.transport.dispatch_wave_last_primary_tile,
+                     expected_transport.dispatch_wave_last_primary_tile,
+                     "transport.dispatch_wave_last_primary_tile");
+  require_wave_field(metadata.transport.dispatch_wave_packet_count,
+                     expected_transport.dispatch_wave_packet_count,
+                     "transport.dispatch_wave_packet_count");
+  require_wave_field(metadata.transport.dispatch_wave_payload_bytes,
+                     expected_transport.dispatch_wave_payload_bytes,
+                     "transport.dispatch_wave_payload_bytes");
   if (metadata.identity.content_hash != 0) {
     const auto expected_hash = hash_metadata(metadata);
     if (metadata.identity.content_hash != expected_hash) {
@@ -1995,6 +2122,8 @@ materialize_rank_metadata(const LocalHistogramHandle &local,
         SignalCardinality{source_node, destination_node, rank, proxy_rank,
                           source_local_rank, 0, expected, expected});
   }
+
+  materialize_dispatch_waves(metadata->transport, config, expert_base);
 
   const auto destination_node = config.topology.rank_to_node[rank];
   const auto rail_local_rank = config.topology.rank_to_local_rank[rank];

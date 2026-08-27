@@ -87,6 +87,9 @@ struct OutgoingPacketDescriptor {
     std::vector<FanoutTarget> fanout;
 };
 
+inline constexpr std::uint64_t kDispatchPacketHeaderDescriptorBytes = 32;
+inline constexpr std::uint64_t kDispatchFanoutDescriptorBytes = 24;
+
 struct SignalCardinality {
     std::uint32_t source_node = 0;
     std::uint32_t destination_node = 0;
@@ -99,9 +102,23 @@ struct SignalCardinality {
 };
 
 struct TransportMetadata {
-    // Baseline order: (destination_node, local_token_id). One payload per
-    // token-node; fan-out is ascending expert ID.
+    // Packet identity/storage order remains (destination_node,
+    // local_token_id).  dispatch_wave_packet_order is a permutation over that
+    // immutable storage, ordered by
+    // (destination_node, primary_mtile, expert_id, destination_rank,
+    // local_token_id).  This lets a transport advance canonical M tiles while
+    // preserving one payload per token-node.
     std::vector<OutgoingPacketDescriptor> outgoing_packets;
+    std::vector<std::uint64_t> dispatch_wave_packet_order;
+    std::vector<std::uint64_t> dispatch_wave_offsets;
+    std::vector<std::uint32_t> dispatch_wave_destination_node;
+    std::vector<std::uint32_t> dispatch_wave_channel;
+    std::vector<std::uint64_t> dispatch_wave_first_primary_tile;
+    std::vector<std::uint64_t> dispatch_wave_last_primary_tile;
+    std::vector<std::uint64_t> dispatch_wave_packet_count;
+    // Descriptor bytes only. Activation bytes are derived after transport
+    // binds the runtime hidden size and dtype.
+    std::vector<std::uint64_t> dispatch_wave_payload_bytes;
     std::vector<SignalCardinality> outgoing_signals;
     std::vector<SignalCardinality> incoming_proxy_signals;
 };
