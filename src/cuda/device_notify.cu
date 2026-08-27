@@ -690,13 +690,22 @@ materialize_prefix_plan_kernel(DeviceMaterializeArgs a) {
 
   for (std::uint32_t destination = 0; destination < a.world; ++destination) {
     std::uint64_t prefix = 0;
+    std::uint64_t tile_prefix = 0;
     for (std::uint32_t expert = 0; expert < a.experts; ++expert) {
       if (a.expert_to_rank[expert] != destination)
         continue;
       a.expert_base[expert] = prefix;
+      a.expert_tile_base[expert] = tile_prefix;
       if (!device_add(prefix, a.expert_total[expert], prefix)) {
         materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
                              5, ~std::uint64_t{0}, a.expert_total[expert]);
+        return;
+      }
+      const auto count = a.expert_total[expert];
+      const auto expert_tiles = count / a.m_tile + (count % a.m_tile != 0);
+      if (!device_add(tile_prefix, expert_tiles, tile_prefix)) {
+        materialization_fail(a.status, MaterializationError::ArithmeticOverflow,
+                             44, ~std::uint64_t{0}, expert_tiles);
         return;
       }
     }

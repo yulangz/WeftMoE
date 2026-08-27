@@ -44,6 +44,12 @@ struct GenerationCompletionVector {
   unsigned long long ring_credit_restored;
   unsigned long long directory_expected;
   unsigned long long directory_ready;
+  unsigned long long progress_ctas_at_bulk_return;
+  unsigned long long compute_ctas_at_bulk_return;
+  unsigned long long grid_ctas_expected;
+  unsigned long long local_rows_published;
+  unsigned long long remote_rows_published;
+  unsigned long long published_tile_mask;
   unsigned long long kernel_complete_epoch;
   unsigned long long terminal_publish_count;
 };

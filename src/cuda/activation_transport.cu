@@ -451,8 +451,14 @@ void dump_generation_completion(std::ostream &output,
          << ",restored=" << word(kTail + 5ULL) << "} " << prefix
          << ".directory={expected=" << word(kTail + 6ULL)
          << ",ready=" << word(kTail + 7ULL) << "} " << prefix
-         << ".kernel_complete_epoch=" << word(kTail + 8ULL) << ' ' << prefix
-         << ".terminal_publish_count=" << word(kTail + 9ULL);
+         << ".bulk_return_barrier={progress=" << word(kTail + 8ULL)
+         << ",compute=" << word(kTail + 9ULL)
+         << ",grid=" << word(kTail + 10ULL) << "} " << prefix
+         << ".published_rows={local=" << word(kTail + 11ULL)
+         << ",remote=" << word(kTail + 12ULL)
+         << ",tile_mask=" << word(kTail + 13ULL) << "} " << prefix
+         << ".kernel_complete_epoch=" << word(kTail + 14ULL) << ' ' << prefix
+         << ".terminal_publish_count=" << word(kTail + 15ULL);
   for (std::uint32_t context = 0; context < contexts; ++context) {
     const auto base = transport_state::kGenerationCompletionWords +
                       context * transport_state::kContextCompletionWords;
@@ -3635,6 +3641,39 @@ __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
              a.epoch;
 }
 
+template <bool StaticLocal>
+__device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
+                                         std::uint32_t expert,
+                                         std::uint64_t local_row,
+                                         std::uint32_t valid_rows) {
+  if constexpr (StaticLocal)
+    return;
+  if (!a.use_gin || valid_rows == 0U)
+    return;
+  const auto end_row = local_row + valid_rows;
+  const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
+  const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
+  auto *arrived = peer_at<unsigned long long>(a.local_base,
+                                               a.x_arrived_rows_offset);
+  std::uint64_t tile_row = 0ULL;
+  for (auto tile = tile_begin; tile < tile_end; ++tile) {
+    const auto expected = a.dispatch.mtile_expected_rows[tile];
+    const auto tile_row_end = tile_row + expected;
+    if (tile_row_end <= local_row) {
+      tile_row = tile_row_end;
+      continue;
+    }
+    if (tile_row >= end_row)
+      break;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        ready(arrived[tile]);
+    while (ready.load(::cuda::memory_order_acquire) < expected &&
+           !forward_cancelled(a)) {
+    }
+    tile_row = tile_row_end;
+  }
+}
+
 __device__ transport_state::TaskCompletionRecord &completion_task(
     transport_state::GenerationCompletionVector *completion,
     transport_state::TaskClass kind) {
@@ -3953,6 +3992,12 @@ local_p2p_forward_megakernel(
                            ::cuda::thread_scope_system>
             counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
         counter.fetch_add(1ULL, ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+        atomicAdd(&completion->local_rows_published, 1ULL);
+        const auto tile = a.dispatch_waves.route_dst_mtile[route];
+        if (tile < 64U)
+          atomicOr(&completion->published_tile_mask, 1ULL << tile);
+#endif
       }
       __syncthreads();
     }
@@ -4248,9 +4293,19 @@ local_p2p_forward_megakernel(
         const auto directory = receive_directory[
             source_partition * a.gin_context_count + context];
         if (directory.generation == a.dispatch.identity.generation &&
-            directory.epoch == a.epoch)
+            directory.epoch == a.epoch) {
           incoming_waves += directory.wave_count;
+          const auto record_index =
+              source_partition * a.gin_context_count + context;
+          context_completion[record_index].relay_expected =
+              directory.wave_count;
+        }
       }
+      if (incoming_waves != 0ULL)
+        atomicAdd(&completion_task(completion,
+                                   transport_state::TaskClass::RelayWave)
+                       .expected,
+                  incoming_waves);
       if (incoming_waves != 0ULL)
         gin.waitSignal(ncclCoopThread{}, 0,
                        incoming_sources + incoming_waves);
@@ -4258,41 +4313,12 @@ local_p2p_forward_megakernel(
                               context, incoming_sources, a.epoch);
       MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
                               context, incoming_sources, a.epoch);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
-      phase.fetch_add(1ULL, ::cuda::memory_order_release);
     }
     __syncthreads();
   }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    grid.sync();
-    if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
-      while (phase.load(::cuda::memory_order_acquire) <
-             a.gin_context_count) {
-      }
-      if (blockIdx.x == 0U) {
-        unsigned long long relay_waves = 0ULL;
-        auto *receive_directory =
-            reinterpret_cast<GinDispatchContextRecord *>(
-                static_cast<std::byte *>(a.gin_window_base) +
-                a.gin_receive_dispatch_directory_offset);
-        for (std::uint32_t remote = 0;
-             remote < a.dispatch.identity.num_nodes - 1U; ++remote)
-          for (std::uint32_t context = 0; context < a.gin_context_count;
-               ++context) {
-            const auto record_index =
-                remote * a.gin_context_count + context;
-            const auto waves = receive_directory[record_index].wave_count;
-            relay_waves += waves;
-            context_completion[record_index].relay_expected = waves;
-          }
-        completion_task(completion, transport_state::TaskClass::RelayWave)
-            .expected = relay_waves;
-      }
-    }
-    __syncthreads();
+  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x < a.gin_context_count) {
+    const auto context = static_cast<std::uint32_t>(blockIdx.x);
     auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
         window_bytes + a.gin_receive_header_offset);
@@ -4300,15 +4326,15 @@ local_p2p_forward_megakernel(
         window_bytes + a.gin_receive_fanout_offset);
     auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
         window_bytes + a.gin_receive_payload_offset);
+    auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
+        window_bytes + a.gin_receive_dispatch_directory_offset);
     MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_signal_count, a.epoch);
     MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
                             a.dispatch.sizes.incoming_signal_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    const auto context_thread = static_cast<std::uint64_t>(threadIdx.x);
+    const auto context_threads = static_cast<std::uint64_t>(blockDim.x);
     for (std::uint32_t signal_index = 0;
          signal_index < a.dispatch.sizes.incoming_signal_count;
          ++signal_index) {
@@ -4318,11 +4344,14 @@ local_p2p_forward_megakernel(
       const auto source_partition =
           signal.source_node < a.node ? signal.source_node
                                       : signal.source_node - 1U;
+      const auto directory = receive_directory[
+          source_partition * a.gin_context_count + context];
       const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint64_t item = global_thread;
-           item < signal.expected_packets * packet_vectors;
-           item += global_threads) {
-        const auto sequence = item / packet_vectors;
+      for (std::uint64_t item = context_thread;
+           item < static_cast<std::uint64_t>(directory.packet_count) *
+                      packet_vectors;
+           item += context_threads) {
+        const auto sequence = directory.packet_begin + item / packet_vectors;
         const auto within_packet = item % packet_vectors;
         const auto fanout = within_packet / vector_count;
         const auto vector = within_packet % vector_count;
@@ -4344,10 +4373,12 @@ local_p2p_forward_megakernel(
             reinterpret_cast<const uint4 *>(receive_payload)[
                 packet * vector_count + vector];
       }
-      for (std::uint64_t slot = global_thread;
-           slot < signal.expected_packets * a.dispatch.identity.top_k;
-           slot += global_threads) {
-        const auto sequence = slot / a.dispatch.identity.top_k;
+      for (std::uint64_t slot = context_thread;
+           slot < static_cast<std::uint64_t>(directory.packet_count) *
+                      a.dispatch.identity.top_k;
+           slot += context_threads) {
+        const auto sequence = directory.packet_begin +
+                              slot / a.dispatch.identity.top_k;
         const auto fanout = slot % a.dispatch.identity.top_k;
         const auto packet =
             source_partition * a.max_tokens_per_rank + sequence;
@@ -4381,7 +4412,7 @@ local_p2p_forward_megakernel(
       }
     }
     __threadfence_system();
-    grid.sync();
+    __syncthreads();
     // The packet signal only makes the registered ingress visible.  Exact
     // readiness is published after every destination row and reverse header
     // store has completed.  Multi-fanout packets increment each destination
@@ -4395,10 +4426,14 @@ local_p2p_forward_megakernel(
       const auto source_partition =
           signal.source_node < a.node ? signal.source_node
                                       : signal.source_node - 1U;
-      for (std::uint64_t slot = global_thread;
-           slot < signal.expected_packets * a.dispatch.identity.top_k;
-           slot += global_threads) {
-        const auto sequence = slot / a.dispatch.identity.top_k;
+      const auto directory = receive_directory[
+          source_partition * a.gin_context_count + context];
+      for (std::uint64_t slot = context_thread;
+           slot < static_cast<std::uint64_t>(directory.packet_count) *
+                      a.dispatch.identity.top_k;
+           slot += context_threads) {
+        const auto sequence = directory.packet_begin +
+                              slot / a.dispatch.identity.top_k;
         const auto fanout = slot % a.dispatch.identity.top_k;
         const auto packet =
             source_partition * a.max_tokens_per_rank + sequence;
@@ -4417,14 +4452,19 @@ local_p2p_forward_megakernel(
                            ::cuda::thread_scope_system>
             counter(arrived[target.reserved]);
         counter.fetch_add(1ULL, ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+        atomicAdd(&completion->remote_rows_published, 1ULL);
+        if (target.reserved < 64U)
+          atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
+#endif
       }
     }
-    grid.sync();
-    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    __syncthreads();
+    if (threadIdx.x == 0U) {
       unsigned long long relayed = 0ULL;
-      const auto contexts =
-          (a.dispatch.identity.num_nodes - 1U) * a.gin_context_count;
-      for (std::uint32_t index = 0; index < contexts; ++index) {
+      for (std::uint32_t remote = 0;
+           remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
+        const auto index = remote * a.gin_context_count + context;
         auto &record = context_completion[index];
         record.relay_claimed = record.relay_expected;
         record.relay_completed = record.relay_expected;
@@ -4454,8 +4494,9 @@ local_p2p_forward_megakernel(
   __threadfence_system();
   forward_publish_progress(a, kForwardDispatchStored,
                            a.dispatch.sizes.route_count);
-  grid.sync();
-  if (blockIdx.x == 0) {
+  if (!remote_backend_enabled<StaticLocal>(a.use_gin)) {
+    grid.sync();
+    if (blockIdx.x == 0) {
     const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
                                  ? a.node * a.local_world_size
                                  : 0U;
@@ -4482,8 +4523,9 @@ local_p2p_forward_megakernel(
              !forward_cancelled(a)) {
       }
     }
+    }
+    grid.sync();
   }
-  grid.sync();
   forward_publish_progress(a, kForwardDispatchObserved,
                            remote_backend_enabled<StaticLocal>(a.use_gin)
                                ? a.local_world_size
@@ -4507,6 +4549,44 @@ local_p2p_forward_megakernel(
                           a.dispatch.sizes.mtile_count, a.epoch);
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  const auto fc1_ntiles =
+      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+  const auto forward_mblocks = scheduler[3];
+  const auto fc1_tasks = forward_mblocks * fc1_ntiles;
+  const auto fc2_ntiles =
+      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+  const auto fc2_tasks = forward_mblocks * fc2_ntiles;
+  const bool gin_progress_cta =
+      remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      blockIdx.x < a.gin_context_count;
+
+  // GIN context CTAs remain transport progress workers for the lifetime of
+  // the Dispatch-to-compute interval.  Compute CTAs can consume an exact
+  // M-tile as soon as its row counter reaches the immutable expected value;
+  // both roles rejoin only at the already-proven Bulk Return grid barrier.
+  // This makes role ownership static and keeps the Return state machine
+  // unchanged while Dispatch is made asynchronous.
+#if MEGAMOE_DEBUG_VALIDATE
+  // Backward reuses the claim arena as canonical-prefix scratch.  A scratch
+  // value can numerically equal the next Forward epoch, so treating the old
+  // contents as an epoch-tagged claim would skip a real FC1/FC2 task and make
+  // Reduce wait forever.  Initialize only the actual task domain in parallel.
+  const auto debug_fc2_ntiles =
+      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+  const auto debug_claims =
+      forward_mblocks * (fc1_ntiles + debug_fc2_ntiles);
+  for (std::uint64_t task =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < debug_claims;
+       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+    claims[task] = 0ULL;
+  // Cooperative-grid barriers must remain role-uniform.  Fixed GIN progress
+  // CTAs do not execute FC work, but they still participate in this debug-only
+  // claim-arena initialization boundary so it cannot be confused with the
+  // later Bulk Return rendezvous.
+  grid.sync();
+#endif
+  if (!gin_progress_cta) {
   if (threadIdx.x == 256U) {
     for (std::uint32_t stage = 0; stage < 4U; ++stage) {
       full_barriers[stage].init(1);
@@ -4522,26 +4602,6 @@ local_p2p_forward_megakernel(
   else
     cutlass::arch::warpgroup_reg_dealloc<48>();
   std::uint32_t pipeline_iteration = 0;
-  const auto fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
-  const auto forward_mblocks = scheduler[3];
-  const auto fc1_tasks = forward_mblocks * fc1_ntiles;
-#if MEGAMOE_DEBUG_VALIDATE
-  // Backward reuses the claim arena as canonical-prefix scratch.  A scratch
-  // value can numerically equal the next Forward epoch, so treating the old
-  // contents as an epoch-tagged claim would skip a real FC1/FC2 task and make
-  // Reduce wait forever.  Initialize only the actual task domain in parallel.
-  const auto debug_fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
-  const auto debug_claims =
-      forward_mblocks * (fc1_ntiles + debug_fc2_ntiles);
-  for (std::uint64_t task =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       task < debug_claims;
-       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    claims[task] = 0ULL;
-  grid.sync();
-#endif
   constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
   __shared__ unsigned long long task_shared;
 #if MEGAMOE_DEBUG_VALIDATE
@@ -4595,7 +4655,7 @@ local_p2p_forward_megakernel(
     if (expert >= a.dispatch.sizes.owned_expert_count)
       break;
     if constexpr (!StaticLocal)
-      if (a.use_gin)
+      if (a.use_gin && threadIdx.x == 0U)
         claim_completion_tasks(completion,
                                transport_state::TaskClass::Fc1OrDv);
 #if MEGAMOE_DEVICE_TIMELINE
@@ -4613,6 +4673,8 @@ local_p2p_forward_megakernel(
         a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
     const auto valid_rows = static_cast<std::uint32_t>(
         remaining_rows < 128ULL ? remaining_rows : 128ULL);
+    wait_forward_mblock_rows<StaticLocal>(a, expert, local_mblock * 128ULL,
+                                          valid_rows);
     const auto n = n_tile * 128U;
     {
       float accum_a[ForwardMma::kNumAccum];
@@ -4697,7 +4759,7 @@ local_p2p_forward_megakernel(
       ready.fetch_add(1ULL, ::cuda::memory_order_release);
     }
     if constexpr (!StaticLocal)
-      if (a.use_gin)
+      if (a.use_gin && threadIdx.x == 0U)
         complete_completion_tasks(completion,
                                   transport_state::TaskClass::Fc1OrDv);
   }
@@ -4721,9 +4783,6 @@ local_p2p_forward_megakernel(
   __syncthreads();
   pipeline_iteration = 0;
 
-  const auto fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
-  const auto fc2_tasks = forward_mblocks * fc2_ntiles;
   task_in_chunk = kTaskChunk;
   while (!forward_cancelled(a)) {
     if (task_in_chunk == kTaskChunk) {
@@ -4759,7 +4818,7 @@ local_p2p_forward_megakernel(
            fc1_ntiles) {
     }
     if constexpr (!StaticLocal)
-      if (a.use_gin)
+      if (a.use_gin && threadIdx.x == 0U)
         claim_completion_tasks(completion,
                                transport_state::TaskClass::Fc2OrDx);
     if (threadIdx.x == 0)
@@ -4895,9 +4954,10 @@ local_p2p_forward_megakernel(
       __syncthreads();
     }
     if constexpr (!StaticLocal)
-      if (a.use_gin)
+      if (a.use_gin && threadIdx.x == 0U)
         complete_completion_tasks(completion,
                                   transport_state::TaskClass::Fc2OrDx);
+  }
   }
 #if __has_include(<nccl_device.h>)
   if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
@@ -4905,6 +4965,13 @@ local_p2p_forward_megakernel(
     // packet's local fan-out directly from node-local expert arenas.  The full
     // persistent grid performs the NVLink gather/scatter; only the bounded GIN
     // context CTAs enqueue the batched rail puts.
+    if (threadIdx.x == 0U) {
+      atomicAdd(gin_progress_cta
+                    ? &completion->progress_ctas_at_bulk_return
+                    : &completion->compute_ctas_at_bulk_return,
+                1ULL);
+      completion->grid_ctas_expected = gridDim.x;
+    }
     grid.sync();
     MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackStart, GinReturn, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
@@ -5133,7 +5200,7 @@ local_p2p_forward_megakernel(
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           phase(scheduler[2]);
       while (phase.load(::cuda::memory_order_acquire) <
-             2ULL * a.gin_context_count) {
+             a.gin_context_count) {
       }
     }
     __syncthreads();
@@ -5341,14 +5408,40 @@ local_p2p_forward_megakernel(
         completion->ring_credit_restored = completion->ring_credit_expected;
         publish_elected_terminal(completion, a.epoch, status->error != 0U);
       }
-      grid.sync();
+      __syncthreads();
+      if (blockIdx.x != 0U) {
+        // Elect one lane to poll.  forward_cancelled() contains warp-level
+        // collectives used by the normal worker loops, so evaluating it from
+        // independently reconverging lanes at terminal can strand the rest of
+        // warp 0 in WARPSYNC even after the completion epoch is visible.
+        if (threadIdx.x == 0U) {
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_system>
+              terminal(completion->kernel_complete_epoch);
+          while (terminal.load(::cuda::memory_order_acquire) < a.epoch) {
+          }
+        }
+        __syncthreads();
+        return;
+      }
     }
   }
+  // Only the elected terminal CTA performs the production status agreement.
+  // GIN progress CTAs and compute CTAs have already proved their static task
+  // spaces complete and now leave after observing kernel_complete_epoch.  In
+  // particular, they never participate in a second grid-wide rendezvous whose
+  // progress would otherwise depend on CTA-local control-flow state.
   publish_production_terminal_status<StaticLocal>(
       a, status, ProductionStatusPhase::Forward,
       a.production_error_records_offset,
       a.gin_production_error_records_offset);
-  grid.sync();
+  if constexpr (StaticLocal) {
+    grid.sync();
+  } else if (!a.use_gin) {
+    grid.sync();
+  } else {
+    __syncthreads();
+  }
   // Every local return CTA has fenced before publishing its destination
   // signal, and every local Reduce warp acquired all of its destination
   // signals before reaching this grid completion.  Consequently no peer can

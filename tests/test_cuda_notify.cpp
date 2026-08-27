@@ -4484,7 +4484,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<megamoe::transport::BFloat16> cached_ab;
     megamoe::cuda::ForwardMegaKernelAudit no_cache_audit;
     megamoe::cuda::ForwardMegaKernelTimings no_cache_timings;
-    for (std::uint32_t repeat = 0; repeat < 20U; ++repeat) {
+    const auto forward_smoke_repeats =
+        std::getenv("MEGAMOE_FORWARD_SMOKE_REPEATS")
+            ? static_cast<std::uint32_t>(std::stoul(
+                  std::getenv("MEGAMOE_FORWARD_SMOKE_REPEATS")))
+            : 20U;
+    require(forward_smoke_repeats >= 1U,
+            "Forward smoke repeat count must be nonzero");
+    for (std::uint32_t repeat = 0; repeat < forward_smoke_repeats; ++repeat) {
       if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_SMOKE_PROGRESS rank=" << rank
                   << " repeat=" << repeat << std::endl;
@@ -4600,7 +4607,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " tma=" << no_cache_audit.tma_loads
               << " fc1_tasks=" << no_cache_audit.fc1_tasks
               << " fc2_tasks=" << no_cache_audit.fc2_tasks
-              << " cache_equal=1 repeat_equal=1 repeats=20 gate_mode="
+              << " cache_equal=1 repeat_equal=1 repeats="
+              << forward_smoke_repeats << " gate_mode="
               << gate_mode << " top_k=" << top_k
               << " output_hash=" << output_hash
               << " cache_hash=" << cache_hash
