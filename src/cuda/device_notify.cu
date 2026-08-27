@@ -4187,27 +4187,42 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
               ", expected=live device storage, actual=empty");
     return storage->pointer;
   };
+  const auto checked_optional = [&](const DeviceBufferLease &lease,
+                                    std::uint64_t count,
+                                    const char *field) -> const void * {
+    return count == 0U ? nullptr : checked(lease, field);
+  };
   const auto &device = owner.impl_->device;
+  const auto packet_count = owner.impl_->sizes.packet_count;
+  const auto route_count = owner.impl_->sizes.route_count;
+  const auto wave_count = owner.impl_->dispatch_wave_count;
   DispatchWaveKernelView view{};
-  view.wave_count = owner.impl_->dispatch_wave_count;
+  view.wave_count = wave_count;
   view.packet_order = static_cast<const std::uint64_t *>(
-      checked(device.dispatch_wave_packet_order, "packet_order"));
+      checked_optional(device.dispatch_wave_packet_order, packet_count,
+                       "packet_order"));
   view.offsets = static_cast<const std::uint64_t *>(
       checked(device.dispatch_wave_offsets, "offsets"));
   view.destination_node = static_cast<const std::uint32_t *>(
-      checked(device.dispatch_wave_destination_node, "destination_node"));
+      checked_optional(device.dispatch_wave_destination_node, wave_count,
+                       "destination_node"));
   view.channel = static_cast<const std::uint32_t *>(
-      checked(device.dispatch_wave_channel, "channel"));
-  view.first_primary_tile = static_cast<const std::uint64_t *>(checked(
-      device.dispatch_wave_first_primary_tile, "first_primary_tile"));
-  view.last_primary_tile = static_cast<const std::uint64_t *>(checked(
-      device.dispatch_wave_last_primary_tile, "last_primary_tile"));
+      checked_optional(device.dispatch_wave_channel, wave_count, "channel"));
+  view.first_primary_tile = static_cast<const std::uint64_t *>(
+      checked_optional(device.dispatch_wave_first_primary_tile, wave_count,
+                       "first_primary_tile"));
+  view.last_primary_tile = static_cast<const std::uint64_t *>(
+      checked_optional(device.dispatch_wave_last_primary_tile, wave_count,
+                       "last_primary_tile"));
   view.packet_count = static_cast<const std::uint64_t *>(
-      checked(device.dispatch_wave_packet_count, "packet_count"));
+      checked_optional(device.dispatch_wave_packet_count, wave_count,
+                       "packet_count"));
   view.descriptor_bytes = static_cast<const std::uint64_t *>(
-      checked(device.dispatch_wave_payload_bytes, "descriptor_bytes"));
+      checked_optional(device.dispatch_wave_payload_bytes, wave_count,
+                       "descriptor_bytes"));
   view.route_dst_mtile = static_cast<const std::uint32_t *>(
-      checked(device.route_dst_mtile, "route_dst_mtile"));
+      checked_optional(device.route_dst_mtile, route_count,
+                       "route_dst_mtile"));
   return view;
 }
 
