@@ -350,6 +350,11 @@ static_assert(sizeof(ForwardReturnChunkRecord) == 32);
 
 constexpr std::uint64_t kForwardReturnChunkRows = 64ULL;
 [[maybe_unused]] constexpr std::uint32_t kForwardReturnCompletionBatch = 8U;
+[[maybe_unused]] constexpr unsigned long long kReturnChunkWaiting = 0ULL;
+[[maybe_unused]] constexpr unsigned long long kReturnChunkPacking = 1ULL;
+[[maybe_unused]] constexpr unsigned long long kReturnChunkReady = 2ULL;
+[[maybe_unused]] constexpr unsigned long long kReturnChunkInflight = 3ULL;
+[[maybe_unused]] constexpr unsigned long long kReturnChunkComplete = 4ULL;
 
 struct BackwardDeviceStatus {
   unsigned long long start_clock;
@@ -3915,6 +3920,44 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
   return enabled;
 }
 
+#if __has_include(<nccl_device.h>)
+[[maybe_unused]] __device__ __forceinline__ void
+pack_forward_return_chunk(
+    const ForwardKernelArgs &a, const ForwardReturnChunkRecord &chunk,
+    const unsigned long long *forward_return_fragment_index) {
+  auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+  auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+      window_bytes + a.gin_receive_fanout_offset);
+  auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
+      window_bytes + a.gin_return_staging_offset);
+  const auto source_partition =
+      chunk.source_node < a.node ? chunk.source_node : chunk.source_node - 1U;
+  const auto partition_base = source_partition * a.max_tokens_per_rank *
+                              a.dispatch.identity.top_k;
+  const auto packed_base = partition_base + chunk.row_begin;
+  const auto vector_count = a.hidden / 8ULL;
+  for (std::uint64_t item = threadIdx.x;
+       item < static_cast<std::uint64_t>(chunk.row_count) * vector_count;
+       item += blockDim.x) {
+    const auto row_index = item / vector_count;
+    const auto vector = item % vector_count;
+    const auto fragment = forward_return_fragment_index[
+        partition_base + chunk.row_begin + row_index];
+    const auto target = receive_fanout[partition_base + fragment];
+    const auto destination =
+        a.node * a.local_world_size + target.destination_local_rank;
+    const auto *destination_output = peer_at<transport::BFloat16>(
+        a.peer_bases[destination], a.forward_output_rows_offset);
+    reinterpret_cast<uint4 *>(return_staging)
+        [(packed_base + row_index) * vector_count + vector] =
+            reinterpret_cast<const uint4 *>(destination_output)
+                [target.dst_row * vector_count + vector];
+  }
+  __threadfence_system();
+  __syncthreads();
+}
+#endif
+
 template <bool StaticLocal>
 __global__ __launch_bounds__(384, 1) void
 local_p2p_forward_megakernel(
@@ -5562,6 +5605,67 @@ local_p2p_forward_megakernel(
     }
     __syncthreads();
   }
+#if __has_include(<nccl_device.h>)
+  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
+    const auto helper = static_cast<std::uint32_t>(blockIdx.x) -
+                        a.gin_context_count;
+    const auto helper_count = gridDim.x - a.gin_context_count;
+    __shared__ unsigned int helper_claimed;
+    for (std::uint64_t candidate = helper; candidate < chunk_count;
+         candidate += helper_count) {
+      if (threadIdx.x == 0U)
+        helper_claimed = 0U;
+      __syncthreads();
+      while (!forward_cancelled(a)) {
+        if (threadIdx.x == 0U) {
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_device>
+              state(forward_return_chunk_state[candidate]);
+          if (state.load(::cuda::memory_order_acquire) !=
+              kReturnChunkWaiting) {
+            helper_claimed = 0U;
+          } else {
+            const auto chunk = forward_return_chunks[candidate];
+            unsigned long long producer_count = 0ULL;
+            for (std::uint32_t producer_rail = 0;
+                 producer_rail < a.local_world_size; ++producer_rail) {
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_system>
+                  producers(forward_return_chunk_ready_count[
+                      candidate * a.local_world_size + producer_rail]);
+              producer_count +=
+                  producers.load(::cuda::memory_order_acquire);
+            }
+            if (producer_count == chunk.expected_fragments &&
+                atomicCAS(&forward_return_chunk_state[candidate],
+                          kReturnChunkWaiting, kReturnChunkPacking) ==
+                    kReturnChunkWaiting)
+              helper_claimed = 1U;
+            else
+              helper_claimed = 2U;
+          }
+        }
+        __syncthreads();
+        if (helper_claimed == 1U) {
+          const auto chunk = forward_return_chunks[candidate];
+          pack_forward_return_chunk(a, chunk,
+                                    forward_return_fragment_index);
+          if (threadIdx.x == 0U)
+            atomicExch(&forward_return_chunk_state[candidate],
+                       kReturnChunkReady);
+          __syncthreads();
+          break;
+        }
+        if (helper_claimed == 0U)
+          break;
+        if (threadIdx.x == 0U)
+          __nanosleep(256U);
+        __syncthreads();
+      }
+    }
+  }
+#endif
   } else {
 #if __has_include(<nccl_device.h>)
     // Dedicated context CTAs overlap FC2 with Return.  Every context owns a
@@ -5583,11 +5687,6 @@ local_p2p_forward_megakernel(
     const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
-    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        window_bytes + a.gin_receive_fanout_offset);
-    auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
-        window_bytes + a.gin_return_staging_offset);
     __shared__ unsigned long long selected_chunk;
     __shared__ unsigned int chunk_ready;
     __shared__ unsigned int batch_count;
@@ -5644,17 +5743,28 @@ local_p2p_forward_megakernel(
           debug_record.last_cursor = producer_count;
           debug_record.dispatch_fanout_rows = producer_rails;
 #endif
-          chunk_ready =
-              state.load(::cuda::memory_order_relaxed) == 0ULL &&
-                      producer_count == chunk.expected_fragments
-                  ? 1U
-                  : 0U;
+          const auto current = state.load(::cuda::memory_order_acquire);
+          chunk_ready = current == kReturnChunkReady
+                            ? 1U
+                            : (current == kReturnChunkWaiting &&
+                                       producer_count ==
+                                           chunk.expected_fragments
+                                   ? 2U
+                                   : 0U);
         }
         __syncthreads();
-        if (threadIdx.x == 0U && chunk_ready != 0U &&
-            atomicCAS(&forward_return_chunk_state[candidate], 0ULL, 1ULL) ==
-                0ULL)
-          selected_chunk = candidate;
+        if (threadIdx.x == 0U) {
+          if (chunk_ready == 1U &&
+              atomicCAS(&forward_return_chunk_state[candidate],
+                        kReturnChunkReady, kReturnChunkInflight) ==
+                  kReturnChunkReady)
+            selected_chunk = candidate;
+          else if (chunk_ready == 2U &&
+                   atomicCAS(&forward_return_chunk_state[candidate],
+                             kReturnChunkWaiting, kReturnChunkPacking) ==
+                       kReturnChunkWaiting)
+            selected_chunk = candidate;
+        }
         __syncthreads();
       }
       if (selected_chunk == ~0ULL) {
@@ -5676,26 +5786,14 @@ local_p2p_forward_megakernel(
       const auto partition_base = source_partition * a.max_tokens_per_rank *
                                   a.dispatch.identity.top_k;
       const auto packed_base = partition_base + chunk.row_begin;
-      const auto vector_count = a.hidden / 8ULL;
-      for (std::uint64_t item = threadIdx.x;
-           item < static_cast<std::uint64_t>(chunk.row_count) * vector_count;
-           item += blockDim.x) {
-        const auto row_index = item / vector_count;
-        const auto vector = item % vector_count;
-        const auto fragment = forward_return_fragment_index[
-            partition_base + chunk.row_begin + row_index];
-        const auto target = receive_fanout[partition_base + fragment];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        const auto *destination_output = peer_at<transport::BFloat16>(
-            a.peer_bases[destination], a.forward_output_rows_offset);
-        reinterpret_cast<uint4 *>(return_staging)[
-            (packed_base + row_index) * vector_count + vector] =
-            reinterpret_cast<const uint4 *>(destination_output)[
-                target.dst_row * vector_count + vector];
+      if (chunk_ready == 2U) {
+        pack_forward_return_chunk(a, chunk,
+                                  forward_return_fragment_index);
+        if (threadIdx.x == 0U)
+          atomicExch(&forward_return_chunk_state[selected_chunk],
+                     kReturnChunkInflight);
+        __syncthreads();
       }
-      __threadfence_system();
-      __syncthreads();
       if (threadIdx.x == 0U) {
         claim_completion_tasks(completion,
                                transport_state::TaskClass::Return);
@@ -5728,7 +5826,8 @@ local_p2p_forward_megakernel(
         if (threadIdx.x == 0U) {
           gin.waitCounter(ncclCoopThread{}, 0, issued_total);
           for (std::uint32_t batch = 0; batch < batch_count; ++batch) {
-            atomicExch(&forward_return_chunk_state[batch_chunks[batch]], 2ULL);
+            atomicExch(&forward_return_chunk_state[batch_chunks[batch]],
+                       kReturnChunkComplete);
             complete_completion_tasks(completion,
                                       transport_state::TaskClass::Return);
             const auto completed_chunk =
