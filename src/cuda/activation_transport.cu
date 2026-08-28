@@ -4268,6 +4268,15 @@ local_p2p_forward_megakernel(
         static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const auto global_threads =
         static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+#if MEGAMOE_DEVICE_TIMELINE
+    unsigned long long dispatch_pack_thread_bytes = 0ULL;
+    __shared__ unsigned long long dispatch_pack_cta_bytes;
+    if (threadIdx.x == 0U)
+      dispatch_pack_cta_bytes = 0ULL;
+    __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch, 0U,
+                            0ULL, a.epoch);
+#endif
     for (std::uint64_t item = global_thread;
          item < a.dispatch.sizes.packet_count * vector_count;
          item += global_threads) {
@@ -4281,6 +4290,9 @@ local_p2p_forward_megakernel(
                                                vector] =
           reinterpret_cast<const uint4 *>(a.input)[
               descriptor.local_token_id * vector_count + vector];
+#if MEGAMOE_DEVICE_TIMELINE
+      dispatch_pack_thread_bytes += sizeof(uint4);
+#endif
     }
     for (std::uint64_t packed = global_thread;
          packed < a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
@@ -4293,6 +4305,10 @@ local_p2p_forward_megakernel(
       if (fanout_begin + fanout_slot < fanout_end)
         send_fanout[packed] =
             a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+#if MEGAMOE_DEVICE_TIMELINE
+      if (fanout_begin + fanout_slot < fanout_end)
+        dispatch_pack_thread_bytes += sizeof(DeviceFanoutRecord);
+#endif
     }
     for (std::uint64_t wave_position = global_thread;
          wave_position < a.dispatch.sizes.packet_count;
@@ -4316,7 +4332,18 @@ local_p2p_forward_megakernel(
           wave_position * a.dispatch.identity.top_k,
           0,
           0};
+#if MEGAMOE_DEVICE_TIMELINE
+      dispatch_pack_thread_bytes += sizeof(LocalP2pRouteHeader);
+#endif
     }
+#if MEGAMOE_DEVICE_TIMELINE
+    atomicAdd(&dispatch_pack_cta_bytes, dispatch_pack_thread_bytes);
+    __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackCtaBytes, GinDispatch, 0U,
+                            dispatch_pack_cta_bytes, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch, 0U,
+                            dispatch_pack_cta_bytes, a.epoch);
+#endif
     // GIN's device DMA reads this window after the grid-wide producers have
     // populated it. A cooperative grid barrier orders CUDA threads but does
     // not by itself publish their stores to a system-scope device backend.
@@ -5649,8 +5676,15 @@ local_p2p_forward_megakernel(
         __syncthreads();
         if (helper_claimed == 1U) {
           const auto chunk = forward_return_chunks[candidate];
+          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherStart, GinReturn,
+                                  helper, chunk.payload_bytes, a.epoch);
           pack_forward_return_chunk(a, chunk,
                                     forward_return_fragment_index);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherEnd, GinReturn,
+                                  helper, chunk.payload_bytes, a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherCtaBytes,
+                                  GinReturn, helper, chunk.payload_bytes,
+                                  a.epoch);
           if (threadIdx.x == 0U)
             atomicExch(&forward_return_chunk_state[candidate],
                        kReturnChunkReady);
@@ -5787,8 +5821,14 @@ local_p2p_forward_megakernel(
                                   a.dispatch.identity.top_k;
       const auto packed_base = partition_base + chunk.row_begin;
       if (chunk_ready == 2U) {
+        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherStart, GinReturn,
+                                context, chunk.payload_bytes, a.epoch);
         pack_forward_return_chunk(a, chunk,
                                   forward_return_fragment_index);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherEnd, GinReturn,
+                                context, chunk.payload_bytes, a.epoch);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherCtaBytes, GinReturn,
+                                context, chunk.payload_bytes, a.epoch);
         if (threadIdx.x == 0U)
           atomicExch(&forward_return_chunk_state[selected_chunk],
                      kReturnChunkInflight);

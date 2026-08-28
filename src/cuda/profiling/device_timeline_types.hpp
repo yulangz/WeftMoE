@@ -9,7 +9,7 @@
 
 namespace megamoe::cuda::profiling {
 
-inline constexpr std::uint32_t kTimelineSchemaVersion = 3;
+inline constexpr std::uint32_t kTimelineSchemaVersion = 4;
 inline constexpr std::uint32_t kEventsPerCta = 256;
 
 enum class TimelinePhase : std::uint16_t { Forward = 1, Backward = 2 };
@@ -84,6 +84,12 @@ enum class TimelineEvent : std::uint16_t {
   ReturnPackCtaBytes = 57,
   ReturnDirectoryStart = 58,
   ReturnDirectoryEnd = 59,
+  DispatchPackStart = 60,
+  DispatchPackEnd = 61,
+  DispatchPackCtaBytes = 62,
+  ReturnGatherStart = 63,
+  ReturnGatherEnd = 64,
+  ReturnGatherCtaBytes = 65,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

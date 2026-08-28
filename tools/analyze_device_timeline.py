@@ -74,6 +74,12 @@ EVENTS = {
     57: "return_pack_cta_bytes",
     58: "return_directory_start",
     59: "return_directory_end",
+    60: "dispatch_pack_start",
+    61: "dispatch_pack_end",
+    62: "dispatch_pack_cta_bytes",
+    63: "return_gather_start",
+    64: "return_gather_end",
+    65: "return_gather_cta_bytes",
 }
 
 PAIRS = {
@@ -105,6 +111,8 @@ PAIRS = {
     "dy_last_put_to_dispatch_complete": (54, 56),
     "dy_last_relay_to_dispatch_complete": (55, 56),
     "return_directory": (58, 59),
+    "dispatch_pack": (60, 61),
+    "return_gather": (63, 64),
 }
 
 
