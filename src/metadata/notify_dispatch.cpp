@@ -720,7 +720,10 @@ void materialize_dispatch_waves(TransportMetadata &transport,
   for (const auto &priority : priorities) {
     const auto &packet = transport.outgoing_packets[priority.packet];
     if (packet.identity.destination_node != previous_node ||
-        priority.tile != previous_tile) {
+        priority.tile != previous_tile ||
+        (!transport.dispatch_wave_packet_count.empty() &&
+         transport.dispatch_wave_packet_count.back() >=
+             kDispatchMaxPacketsPerWave)) {
       if (!order.empty())
         offsets.push_back(order.size());
       transport.dispatch_wave_destination_node.push_back(

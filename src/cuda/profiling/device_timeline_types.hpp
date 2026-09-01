@@ -9,8 +9,12 @@
 
 namespace megamoe::cuda::profiling {
 
-inline constexpr std::uint32_t kTimelineSchemaVersion = 4;
-inline constexpr std::uint32_t kEventsPerCta = 256;
+inline constexpr std::uint32_t kTimelineSchemaVersion = 6;
+// Main-shape compute CTAs can retire more than 256 FC tiles.  A truncated
+// suffix makes the apparent FC2/Return tail shorter than the real one, so the
+// profiling build deliberately spends a few extra MiB per GPU for a complete
+// trace.  This allocation is compiled out of production builds.
+inline constexpr std::uint32_t kEventsPerCta = 1024;
 
 enum class TimelinePhase : std::uint16_t { Forward = 1, Backward = 2 };
 
@@ -90,6 +94,13 @@ enum class TimelineEvent : std::uint16_t {
   ReturnGatherStart = 63,
   ReturnGatherEnd = 64,
   ReturnGatherCtaBytes = 65,
+  DvMathEnd = 66,
+  DvTileEnd = 67,
+  DxFirst = 68,
+  DxMathEnd = 69,
+  DxTileEnd = 70,
+  Fc2First = 71,
+  Fc2Last = 72,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only
@@ -115,6 +126,9 @@ struct DeviceTimelineContext {
   std::uint32_t capacity_per_cta = 0;
   std::uint32_t rank = 0;
   std::uint32_t phase = 0;
+  // Split kernels share one allocation.  Give each grid a disjoint logical
+  // CTA range so their lock-free per-CTA writers cannot alias.
+  std::uint32_t cta_base = 0;
   std::uint64_t generation = 0;
 };
 

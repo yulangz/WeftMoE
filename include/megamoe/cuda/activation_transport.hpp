@@ -408,6 +408,16 @@ struct BackwardMegaKernelTimings {
   double backward_setup_to_launch_host_us = 0;
   double forward_consumer_drain_host_us = 0;
   double final_consumer_drain_host_us = 0;
+  double v3_local_delivery_complete_us = 0;
+  double v3_outbound_pack_complete_us = 0;
+  double v3_rdma_complete_us = 0;
+  double v3_inbound_relay_complete_us = 0;
+  double v3_dv_first_start_us = 0;
+  double v3_dv_complete_us = 0;
+  double v3_dw2_first_ready_us = 0;
+  double v3_dw2_first_start_us = 0;
+  double v3_dw2_last_complete_us = 0;
+  double v3_terminal_complete_us = 0;
   double dy_dispatch_us = 0;
   double dv_swiglu_backward_us = 0;
   double dgate_reduce_us = 0;

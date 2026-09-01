@@ -2,6 +2,7 @@
 #include "cuda/activation_transport_internal.hpp"
 
 #include <cub/cub.cuh>
+#include <cuda/atomic>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -257,6 +258,7 @@ struct Layout {
   std::size_t packet_primary_tile = 0;
   std::size_t packet_primary_expert = 0;
   std::size_t packet_primary_rank = 0;
+  std::size_t local_route_order = 0;
   std::size_t dispatch_wave_offsets = 0;
   std::size_t dispatch_wave_destination_node = 0;
   std::size_t dispatch_wave_channel = 0;
@@ -345,6 +347,8 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
       cursor, plan.route_count, sizeof(std::uint32_t), "packet_primary_expert");
   layout.packet_primary_rank = append_region(
       cursor, plan.route_count, sizeof(std::uint32_t), "packet_primary_rank");
+  layout.local_route_order = append_region(
+      cursor, plan.route_count, sizeof(std::uint64_t), "local_route_order");
   layout.dispatch_wave_offsets = append_region(
       cursor, plan.route_count + 1, sizeof(std::uint64_t),
       "dispatch_wave_offsets");
@@ -571,6 +575,7 @@ struct DeviceMaterializeArgs {
   std::uint64_t *packet_primary_tile;
   std::uint32_t *packet_primary_expert;
   std::uint32_t *packet_primary_rank;
+  std::uint64_t *local_route_order;
   std::uint64_t *sort_keys_in;
   std::uint64_t *sort_keys_out;
   std::uint64_t *sort_indices_in;
@@ -1147,6 +1152,7 @@ __global__ void materialize_mtiles_kernel(DeviceMaterializeArgs a) {
   }
 }
 
+template <bool IncludeReturnOrder = false>
 __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
   const auto packet = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                       threadIdx.x;
@@ -1161,8 +1167,10 @@ __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
     if (a.route_dst_node[route] != header.destination_node)
       continue;
     a.packet_fanout[output++] = DeviceFanoutRecord{
-        a.route_dst_row[route], slot, a.route_dst_local[route],
-        a.expert_id[route], a.route_dst_mtile[route]};
+        a.route_dst_row[route],
+        IncludeReturnOrder ? a.sort_keys_in[route] : 0ULL, slot,
+        a.route_dst_local[route], a.expert_id[route],
+        a.route_dst_mtile[route]};
   }
 }
 
@@ -1257,15 +1265,106 @@ __global__ void materialize_wave_sort_keys_kernel(
   a.sort_keys_in[position] = key;
 }
 
-inline constexpr std::uint64_t kDispatchPrimaryTilesPerWave = 1;
+enum class LocalRouteSortField : std::uint32_t {
+  Expert,
+  MTile,
+  Locality,
+};
 
+__global__ void materialize_local_route_order_init_kernel(
+    DeviceMaterializeArgs a) {
+  const auto route = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+  if (a.status->error == 0 && route < a.routes)
+    a.sort_indices_in[route] = route;
+}
+
+// Return payloads are independent of the packet order used to amortize the
+// Forward dispatch of one token.  Build a second, route-level permutation so
+// every source/proxy pair lays Return rows out by destination GPU and canonical
+// row.  The key is unique because every route owns one canonical destination
+// row.  Keeping the dense ordinal in DeviceFanoutRecord lets the receiving
+// proxy reconstruct the same compact directory without another sort or any
+// control-plane exchange.
+__global__ void materialize_return_order_init_kernel(DeviceMaterializeArgs a) {
+  const auto route = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+  if (a.status->error != 0 || route >= a.routes)
+    return;
+  a.sort_indices_in[route] = route;
+  const auto coordinate =
+      static_cast<std::uint64_t>(a.route_dst_node[route]) * a.world +
+      a.route_dst_local[route];
+  a.sort_keys_in[route] =
+      coordinate * a.max_incoming_rows + a.route_dst_row[route];
+}
+
+__global__ void materialize_return_node_offsets_kernel(
+    DeviceMaterializeArgs a) {
+  const auto node = static_cast<std::uint32_t>(threadIdx.x);
+  std::uint64_t lower = 0ULL;
+  if (a.status->error == 0 && node < a.nodes) {
+    const auto key_begin =
+        static_cast<std::uint64_t>(node) * a.world * a.max_incoming_rows;
+    std::uint64_t upper = a.routes;
+    while (lower < upper) {
+      const auto middle = lower + (upper - lower) / 2ULL;
+      if (a.sort_keys_out[middle] < key_begin)
+        lower = middle + 1ULL;
+      else
+        upper = middle;
+    }
+  }
+  // Do not let a fast lane overwrite an input key while another lane is still
+  // searching it.
+  __syncthreads();
+  // The sorted keys are dead after this point.  Reuse their first words for
+  // the tiny per-node prefix table consumed by the ordinal kernel.
+  if (a.status->error == 0 && node < a.nodes)
+    a.sort_keys_out[node] = lower;
+}
+
+__global__ void materialize_return_compact_rows_kernel(
+    DeviceMaterializeArgs a) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.routes)
+    return;
+  const auto route = a.wave_flags[position];
+  const auto node = a.route_dst_node[route];
+  a.sort_keys_in[route] = position - a.sort_keys_out[node];
+}
+
+template <LocalRouteSortField Field>
+__global__ void materialize_local_route_sort_keys_kernel(
+    DeviceMaterializeArgs a, const std::uint64_t *route_indices) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.routes)
+    return;
+  const auto route = route_indices[position];
+  std::uint64_t key = 0ULL;
+  if constexpr (Field == LocalRouteSortField::Expert) {
+    key = a.expert_id[route];
+  } else if constexpr (Field == LocalRouteSortField::MTile) {
+    const auto expert = a.expert_id[route];
+    key = (a.route_dst_row[route] - a.expert_base[expert]) / a.m_tile;
+  } else {
+    const auto local_node = a.rank_to_node[a.rank];
+    key = a.route_dst_node[route] == local_node ? 0ULL : 1ULL;
+  }
+  a.sort_keys_in[position] = key;
+}
+
+inline constexpr std::uint64_t kDispatchPrimaryTilesPerWave = 1;
 __global__ void materialize_wave_flags_kernel(DeviceMaterializeArgs a) {
   const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                         threadIdx.x;
   if (a.status->error != 0 || position >= a.status->packet_count)
     return;
   const auto packet = a.sort_indices_out[position];
-  bool begins = position == 0;
+  bool begins = position == 0 ||
+                position % kDispatchMaxPacketsPerWave == 0;
   if (!begins) {
     const auto previous = a.sort_indices_out[position - 1];
     begins = a.packet_headers[packet].destination_node !=
@@ -3575,6 +3674,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       at<std::uint32_t>(base, dl.packet_primary_expert);
   args.packet_primary_rank =
       at<std::uint32_t>(base, dl.packet_primary_rank);
+  args.local_route_order =
+      at<std::uint64_t>(base, dl.local_route_order);
   args.sort_keys_in = at<std::uint64_t>(base, dl.keys_in);
   args.sort_keys_out = at<std::uint64_t>(base, dl.keys_out);
   args.sort_indices_in = at<std::uint64_t>(base, dl.indices_in);
@@ -3654,8 +3755,9 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       threads, 0, exec->stream>>>(args);
   materialize_mtiles_kernel<<<plan.num_experts, threads, 0, exec->stream>>>(
       args);
-  materialize_fanout_kernel<<<blocks_for(plan.route_count, "packet_grid"),
-                              threads, 0, exec->stream>>>(args);
+  materialize_fanout_kernel<false>
+      <<<blocks_for(plan.route_count, "packet_grid"), threads, 0,
+         exec->stream>>>(args);
   if (plan.route_count != 0) {
     materialize_packet_primary_kernel<<<
         blocks_for(plan.route_count, "wave_primary_grid"), threads, 0,
@@ -3723,6 +3825,79 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
         "wave cub::DeviceScan::InclusiveSum");
     materialize_waves_kernel<<<blocks_for(plan.route_count, "wave_grid"),
                                threads, 0, exec->stream>>>(args);
+
+    // Build a separate local delivery permutation after the packet wave
+    // catalog is final.  Three stable passes yield
+    // (locality, local M tile, expert, original route).  Keeping the packet
+    // permutation in indices_out and using a dedicated final buffer avoids
+    // coupling GIN wire identity to local NVLink scheduling.
+    materialize_local_route_order_init_kernel<<<
+        blocks_for(plan.route_count, "local_route_init_grid"), threads, 0,
+        exec->stream>>>(args);
+    const auto local_route_sort_pass = [&] (
+        LocalRouteSortField field, const std::uint64_t *indices_input,
+        std::uint64_t *indices_output) {
+      const auto blocks =
+          blocks_for(plan.route_count, "local_route_sort_grid");
+      switch (field) {
+      case LocalRouteSortField::Expert:
+        materialize_local_route_sort_keys_kernel<LocalRouteSortField::Expert>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case LocalRouteSortField::MTile:
+        materialize_local_route_sort_keys_kernel<LocalRouteSortField::MTile>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      case LocalRouteSortField::Locality:
+        materialize_local_route_sort_keys_kernel<LocalRouteSortField::Locality>
+            <<<blocks, threads, 0, exec->stream>>>(args, indices_input);
+        break;
+      }
+      auto sort_bytes = checked_size(state->plan.sort_temp_bytes,
+                                     "local_route_sort_temp_bytes");
+      internal::throw_cuda(
+          "device-materialize",
+          cub::DeviceRadixSort::SortPairs(
+              at<void>(base, dl.temp), sort_bytes, args.sort_keys_in,
+              args.sort_keys_out, indices_input, indices_output,
+              static_cast<int>(plan.route_count), 0, 64, exec->stream),
+          rank, context.session().world_size(), context.session().identity(),
+          context.session().generation(), ExchangeKind::ExpertCounts,
+          "local route cub::DeviceRadixSort::SortPairs");
+    };
+    local_route_sort_pass(LocalRouteSortField::Expert,
+                          args.sort_indices_in, args.local_route_order);
+    local_route_sort_pass(LocalRouteSortField::MTile,
+                          args.local_route_order, args.sort_indices_in);
+    local_route_sort_pass(LocalRouteSortField::Locality,
+                          args.sort_indices_in, args.local_route_order);
+
+    // Build the immutable Return wire order only after the Dispatch and local
+    // delivery permutations have been materialized into their final buffers.
+    // One packed, unique key needs a single radix pass and is outside the
+    // steady Forward/Backward path.
+    materialize_return_order_init_kernel<<<
+        blocks_for(plan.route_count, "return_order_init_grid"), threads, 0,
+        exec->stream>>>(args);
+    auto return_sort_bytes = checked_size(state->plan.sort_temp_bytes,
+                                          "return_order_sort_temp_bytes");
+    internal::throw_cuda(
+        "device-materialize",
+        cub::DeviceRadixSort::SortPairs(
+            at<void>(base, dl.temp), return_sort_bytes, args.sort_keys_in,
+            args.sort_keys_out, args.sort_indices_in, args.wave_flags,
+            static_cast<int>(plan.route_count), 0, 64, exec->stream),
+        rank, context.session().world_size(), context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts,
+        "return order cub::DeviceRadixSort::SortPairs");
+    materialize_return_node_offsets_kernel<<<1, threads, 0, exec->stream>>>(
+        args);
+    materialize_return_compact_rows_kernel<<<
+        blocks_for(plan.route_count, "return_compact_grid"), threads, 0,
+        exec->stream>>>(args);
+    materialize_fanout_kernel<true>
+        <<<blocks_for(plan.route_count, "return_fanout_grid"), threads, 0,
+           exec->stream>>>(args);
   }
   materialize_signals_kernel<<<blocks_for(plan.num_nodes, "signal_grid"),
                                threads, 0, exec->stream>>>(args);
@@ -3879,6 +4054,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       make_lease(state, dl.packet_fanout_offsets, status->packet_count + 1);
   impl->device.packet_fanout =
       make_lease(state, dl.packet_fanout, status->fanout_count);
+  impl->device.local_route_order =
+      make_lease(state, dl.local_route_order, plan.route_count);
   impl->device.dispatch_wave_packet_order =
       make_lease(state, dl.indices_out, status->packet_count);
   impl->device.dispatch_wave_offsets =
@@ -4198,6 +4375,9 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
   const auto wave_count = owner.impl_->dispatch_wave_count;
   DispatchWaveKernelView view{};
   view.wave_count = wave_count;
+  view.local_route_order = static_cast<const std::uint64_t *>(
+      checked_optional(device.local_route_order, route_count,
+                       "local_route_order"));
   view.packet_order = static_cast<const std::uint64_t *>(
       checked_optional(device.dispatch_wave_packet_order, packet_count,
                        "packet_order"));

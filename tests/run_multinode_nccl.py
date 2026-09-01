@@ -12,6 +12,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,12 @@ def aggregate_gin_benchmark(outputs, scenario):
     forward = scenario == "gin_forward_bench"
     marker = "FORWARD_BENCH " if forward else "BACKWARD_BENCH "
     records = [parse_fields(item.stdout, marker) for item in outputs]
+    if forward:
+        schedulers = {item.get("reduce_scheduler") for item in records}
+        if len(schedulers) != 1 or None in schedulers:
+            raise RuntimeError(
+                "Forward ranks disagree on reduce scheduler: " +
+                ",".join(sorted(str(item) for item in schedulers)))
     stage_keys = (("wall", "notify", "forward", "dispatch", "fc1", "fc2",
                    "return", "reduce", "fc1_fc2_overlap",
                    "fc2_return_overlap", "return_reduce_overlap",
@@ -81,6 +88,12 @@ def aggregate_gin_benchmark(outputs, scenario):
                    "post_notify_training_step_wall", "notify_wall",
                    "forward_wall", "backward_wall", "dy_dispatch", "dv",
                    "dgate", "transpose", "dx", "dw1", "dw2",
+                   "v3_local_delivery_complete",
+                   "v3_outbound_pack_complete", "v3_rdma_complete",
+                   "v3_inbound_relay_complete", "v3_dv_first_start",
+                   "v3_dv_complete", "v3_dw2_first_ready",
+                   "v3_dw2_first_start", "v3_dw2_last_complete",
+                   "v3_terminal_complete",
                    "dw1_ready_wait", "dw2_ready_wait",
                    "dw1_max_expert_wait", "dw2_max_expert_wait",
                    "dw1_tail", "dw2_tail", "dw1_overlap_dv_dx",
@@ -144,6 +157,7 @@ def aggregate_gin_benchmark(outputs, scenario):
     }
     if forward:
         result.update({
+            "reduce_scheduler": records[0]["reduce_scheduler"],
             "per_rank_device_pool_bytes": [int(item["device_pool_bytes"])
                                            for item in records],
             "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
@@ -373,6 +387,9 @@ def environment_overrides(args):
         "MEGAMOE_P2P_BENCH_ROUNDS",
         "MEGAMOE_P2P_BENCH_TOKENS",
         "MEGAMOE_FORWARD_BENCH_ROUNDS",
+        "MEGAMOE_FORWARD_BENCH_GENERATION_BASE",
+        "MEGAMOE_FORWARD_PROGRESS",
+        "MEGAMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
         "MEGAMOE_BACKWARD_BENCH_ROUNDS",
         "MEGAMOE_BACKWARD_BENCH_TRACE",
         "MEGAMOE_BACKWARD_HASH_REPEATS",
@@ -384,6 +401,58 @@ def environment_overrides(args):
         "MEGAMOE_BACKWARD_CAPTURE_HASH",
         "MEGAMOE_BACKWARD_STAGE_HASHES",
         "MEGAMOE_BACKWARD_PROGRESS_DUMP",
+        "MEGAMOE_BACKWARD_SPLIT_DW1",
+        "MEGAMOE_BACKWARD_DIAG_DW2",
+        "MEGAMOE_BACKWARD_DIAG_DW2_128",
+        "MEGAMOE_BACKWARD_DW2_128_STAGES",
+        "MEGAMOE_BACKWARD_DIAG_V3_DV_DW2",
+        "MEGAMOE_BACKWARD_DIAG_V3_VERIFY_ORACLE",
+        "MEGAMOE_BACKWARD_PERSISTENT_V3",
+        "MEGAMOE_BACKWARD_V3_RETURN_GROUP_ROWS",
+        "MEGAMOE_BACKWARD_V3_WEIGHT_CTA_DIVISOR",
+        "MEGAMOE_BACKWARD_V3_DV_PHASE_SLOTS",
+        "MEGAMOE_BACKWARD_V3_DX_PHASE_SLOTS",
+        "MEGAMOE_BACKWARD_V3_ACTIVATION_CTAS",
+        "MEGAMOE_BACKWARD_V3_DW1_CTAS",
+        "MEGAMOE_BACKWARD_V3_DW_TILE_N",
+        "MEGAMOE_BACKWARD_V3_WEIGHT_CLUSTER2",
+        "MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE",
+        "MEGAMOE_BACKWARD_V3_ELASTIC",
+        "MEGAMOE_BACKWARD_V3_CLUSTER_COMPUTE",
+        "MEGAMOE_BACKWARD_V3_ACTIVATION_MULTICAST",
+        "MEGAMOE_BACKWARD_V3_CLUSTER_REDUCE_CTAS",
+        "MEGAMOE_BACKWARD_V3_DIRECT_DY_INPUT",
+        "MEGAMOE_BACKWARD_V3_REDUCE_CTAS",
+        "MEGAMOE_BACKWARD_V3_DIRECT_RETURN_STAGING",
+        "MEGAMOE_BACKWARD_V3_DIRECT_RETURN_CONSUME",
+        "MEGAMOE_BACKWARD_V3_GENERIC_DY_COPY",
+        "MEGAMOE_BACKWARD_V3_WAIT_FULL_DY_DISPATCH",
+        "MEGAMOE_BACKWARD_V3_CLEAR_CANONICAL_DY",
+        "MEGAMOE_BACKWARD_V3_SNAPSHOT_DY",
+        "MEGAMOE_BACKWARD_V3_LOCALIZE_DY",
+        "MEGAMOE_FORWARD_RETURN_CHUNK_ROWS",
+        "MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE",
+        "MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN",
+        "MEGAMOE_FORWARD_LEGACY_REDUCE",
+        "MEGAMOE_FORWARD_FC1_CTAS",
+        "MEGAMOE_FORWARD_M64",
+        "MEGAMOE_FORWARD_M64_HEAD",
+        "MEGAMOE_FORWARD_M64_HEAD_CTAS",
+        "MEGAMOE_FORWARD_M64_HEAD_EXPERTS",
+        "MEGAMOE_FORWARD_SPECIALIZE_STAGES",
+        "MEGAMOE_FORWARD_FC2_TMA_STORE",
+        "MEGAMOE_FORWARD_COMPUTE_LOCAL_RETURN",
+        "MEGAMOE_FORWARD_RELAY_CTAS",
+        "MEGAMOE_FORWARD_RELAY_TMA_WARPS",
+        "MEGAMOE_FORWARD_REGISTERED_OUTPUT",
+        "MEGAMOE_FORWARD_FC1_STAGES",
+        "MEGAMOE_FORWARD_FC2_STAGES",
+        "MEGAMOE_GIN_BENCH_MODE",
+        "MEGAMOE_GIN_BENCH_SHIFT",
+        "MEGAMOE_GIN_BENCH_FANOUT",
+        "MEGAMOE_GIN_BENCH_WARMUP",
+        "MEGAMOE_GIN_BENCH_MEASURED",
+        "MEGAMOE_GIN_BENCH_BATCH",
         "MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH",
         "MEGAMOE_BACKWARD_CACHE_FIRST",
         "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE",
@@ -551,7 +620,25 @@ def remote_cleanup(args, launch_id, signal):
         pass
 
 
-def stop_processes(processes, args, launch_id):
+def read_rank_output(rank, process, captures, bootstrap=None):
+    stdout_capture, stderr_capture = captures[rank]
+    stdout_capture.seek(0)
+    stderr_capture.seek(0)
+    return RankOutput(
+        rank,
+        process.returncode if process.returncode is not None else -1,
+        scrub_output(stdout_capture.read(), bootstrap),
+        scrub_output(stderr_capture.read(), bootstrap),
+    )
+
+
+def close_captures(captures):
+    for stdout_capture, stderr_capture in captures.values():
+        stdout_capture.close()
+        stderr_capture.close()
+
+
+def stop_processes(processes, captures, args, launch_id):
     for _rank, process in processes:
         if process.poll() is None:
             process.terminate()
@@ -559,18 +646,11 @@ def stop_processes(processes, args, launch_id):
     drained = []
     for rank, process in processes:
         try:
-            stdout, stderr = process.communicate(
-                timeout=max(0.0, deadline - time.monotonic())
-            )
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             process.kill()
-            stdout, stderr = process.communicate()
-        drained.append(RankOutput(
-            rank,
-            process.returncode if process.returncode is not None else -1,
-            scrub_output(stdout),
-            scrub_output(stderr),
-        ))
+            process.wait()
+        drained.append(read_rank_output(rank, process, captures))
     remote_cleanup(args, launch_id, "TERM")
     time.sleep(0.25)
     remote_cleanup(args, launch_id, "KILL")
@@ -580,10 +660,72 @@ def stop_processes(processes, args, launch_id):
 def cleanup_diagnostic(outputs):
     details = []
     for result in outputs:
-        tail = (result.stdout + "\n" + result.stderr)[-4000:]
-        if tail.strip():
+        combined = result.stdout + "\n" + result.stderr
+        lines = [line for line in combined.splitlines() if line.strip()]
+        # Persistent-kernel debug dumps can be tens of kilobytes per rank.
+        # Keep the last milestone from each useful class so a 16-rank timeout
+        # remains readable and still identifies the causal protocol phase.
+        markers = (
+            "FORWARD_PROGRESS_COARSE",
+            "FORWARD_HOST_PROGRESS",
+            "FORWARD_RUN_HOST",
+            "BACKWARD_PROGRESS rank=",
+            "[FAIL]",
+            "terminate called",
+            "what():",
+        )
+        selected = []
+        for marker in markers:
+            match = next((line for line in reversed(lines) if marker in line),
+                         None)
+            if match is not None:
+                # The detailed generation-completion record is useful, but
+                # cap a malformed/expanded record without dropping the coarse
+                # milestone that precedes it.
+                selected.append(match[-10000:] if
+                                "BACKWARD_PROGRESS rank=" in match else
+                                match[-2000:])
+        detailed = next(
+            (line for line in reversed(lines)
+             if "FORWARD_PROGRESS rank=" in line),
+            None,
+        )
+        if detailed is not None:
+            prefix = detailed.split(" forward_completion.", 1)[0]
+            fields = [prefix]
+            for name in (
+                "dispatch", "relay", "fc1_or_dv", "fc2_or_dx", "return",
+                "arrival", "reduce", "directory",
+                "bulk_return_barrier", "bulk_return_stage", "fc_scheduler",
+                "tile_wait", "fc2_stalled_ctas",
+            ):
+                match = re.search(
+                    rf"forward_completion\.{name}=(\{{[^}}]*\}}|[^ ]+)",
+                    detailed,
+                )
+                if match is not None:
+                    fields.append(f"{name}={match.group(1)}")
+            for context in range(8):
+                match = re.search(
+                    rf"forward_completion\.context\[{context}\]="
+                    rf"(\{{[^}}]*\}})",
+                    detailed,
+                )
+                if match is not None:
+                    fields.append(f"context[{context}]={match.group(1)}")
+            for name in ("kernel_complete_epoch", "terminal_publish_count"):
+                match = re.search(
+                    rf"forward_completion\.{name}=([^ ]+)", detailed
+                )
+                if match is not None:
+                    fields.append(f"{name}={match.group(1)}")
+            selected.append(" ".join(fields))
+        if not selected and lines:
+            selected.append("\n".join(lines[-8:])[-2000:])
+        if selected:
             details.append(
-                f"rank={result.rank}, exit={result.returncode}, tail={tail}"
+                f"rank={result.rank}, exit={result.returncode}, "
+                + " | ".join(selected)
             )
     return scrub_output("; ".join(details))
 
@@ -614,7 +756,8 @@ def parse_args(argv=None):
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
-                 "gin_probe", "gin_put_probe", "gin_team_pool",
+                 "gin_probe", "gin_put_probe", "gin_link_bench",
+                 "gin_team_pool",
                  "gin_forward_smoke",
                  "gin_backward_smoke",
                  "socket_backward_smoke",
@@ -640,17 +783,19 @@ def launch_rank_processes(args):
     world = 2 * args.gpus_per_node
     launch_id = secrets.token_hex(16)
     processes = []
+    captures = {}
     outputs = []
     bootstrap_read_fd = -1
     bootstrap_write_fd = -1
     pending_error = None
     try:
         bootstrap_read_fd, bootstrap_write_fd = os.pipe()
+        captures[0] = (tempfile.TemporaryFile(), tempfile.TemporaryFile())
         rank0 = subprocess.Popen(
             runner_args(args.binary, 0, args.gpus_per_node, args.seed,
                         args.scenario, launch_id, bootstrap_write_fd, True),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=captures[0][0],
+            stderr=captures[0][1],
             stdin=subprocess.DEVNULL,
             env=environment,
             pass_fds=(bootstrap_write_fd,),
@@ -671,11 +816,13 @@ def launch_rank_processes(args):
                 0,
             )
             command = runner if rank < args.gpus_per_node else remote_command(args, runner)
+            captures[rank] = (tempfile.TemporaryFile(),
+                              tempfile.TemporaryFile())
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=captures[rank][0],
+                stderr=captures[rank][1],
                 env=environment,
             )
             processes.append((rank, process))
@@ -686,13 +833,11 @@ def launch_rank_processes(args):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(process.args, args.timeout)
-            stdout, stderr = process.communicate(timeout=remaining)
-            outputs.append(RankOutput(
-                rank,
-                process.returncode,
-                scrub_output(stdout, bootstrap),
-                scrub_output(stderr, bootstrap),
-            ))
+            process.wait(timeout=remaining)
+        outputs = [
+            read_rank_output(rank, process, captures, bootstrap)
+            for rank, process in processes
+        ]
     except BaseException as error:
         pending_error = error
     finally:
@@ -700,18 +845,25 @@ def launch_rank_processes(args):
             os.close(bootstrap_read_fd)
         if bootstrap_write_fd >= 0:
             os.close(bootstrap_write_fd)
-        drained = stop_processes(processes, args, launch_id)
+        drained = stop_processes(processes, captures, args, launch_id)
     if pending_error is not None:
-        diagnostic = cleanup_diagnostic(drained)
+        # Preserve any output captured before cleanup together with the final
+        # snapshots; the first failing rank usually explains why a peer waited.
+        diagnostic = cleanup_diagnostic(outputs + drained)
         if isinstance(pending_error, subprocess.TimeoutExpired):
+            # `drained` already contains every process.  Attaching only the
+            # compact summary avoids duplicating an unbounded rank dump.
             pending_error.output = diagnostic
             pending_error.stderr = ""
+            close_captures(captures)
             raise pending_error
         message = scrub_output(str(pending_error))
         if diagnostic:
             message += "; cleanup=" + diagnostic
         # Do not retain an unsanitized exception as __cause__/debug repr.
+        close_captures(captures)
         raise RuntimeError(message) from None
+    close_captures(captures)
     return outputs
 
 
@@ -786,6 +938,72 @@ def main(argv=None):
                                "\n".join(failures))
         print("\n".join(evidence))
         print(f"[PASS] real GIN rail put/signal/local-completion world={world}")
+        return
+
+    if args.scenario == "gin_link_bench":
+        failures = []
+        evidence = []
+        samples = {}
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("GIN_LINK_BENCH ")]
+            if (result.returncode != 0 or not lines or
+                    any("match=1" not in line for line in lines)):
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}, "
+                    f"evidence={len(lines)}; stdout={result.stdout[-6000:]}; "
+                    f"stderr={result.stderr[-6000:]}"
+                )
+            else:
+                evidence.extend(lines)
+                for line in lines:
+                    fields = {
+                        key: value
+                        for key, value in (
+                            item.split("=", 1)
+                            for item in line[len("GIN_LINK_BENCH "):].split()
+                        )
+                    }
+                    key = (fields["mode"], int(fields["shift"]),
+                           int(fields["payload"]), int(fields["puts"]))
+                    durations = [int(value) for value in
+                                 fields["durations_ns"].split(",")]
+                    samples.setdefault(key, {})[result.rank] = durations
+        if failures:
+            raise RuntimeError("distributed GIN link benchmark failed:\n" +
+                               "\n".join(failures))
+        if os.environ.get("MEGAMOE_GIN_BENCH_VERBOSE") == "1":
+            print("\n".join(evidence))
+        for (mode, shift, payload, puts), rank_samples in sorted(
+                samples.items()):
+            if len(rank_samples) != world:
+                raise RuntimeError(
+                    f"GIN link benchmark is missing ranks: mode={mode} "
+                    f"shift={shift} payload={payload} puts={puts} "
+                    f"observed={len(rank_samples)} expected={world}")
+            sample_counts = {len(values)
+                             for values in rank_samples.values()}
+            if len(sample_counts) != 1:
+                raise RuntimeError(
+                    f"GIN link benchmark sample count mismatch: "
+                    f"mode={mode} shift={shift} payload={payload} puts={puts}")
+            # Every rank runs concurrently, so the slowest rank for each
+            # iteration determines the distributed critical path.
+            critical_ns = [
+                max(values[index] for values in rank_samples.values())
+                for index in range(next(iter(sample_counts)))
+            ]
+            stats = sample_stats(critical_ns)
+            gbps = payload * puts / stats["mean"]
+            print(
+                f"GIN_LINK_SUMMARY mode={mode} shift={shift} "
+                f"payload={payload} puts={puts} "
+                f"mean_us={stats['mean'] / 1.0e3:.3f} "
+                f"p50_us={stats['p50'] / 1.0e3:.3f} "
+                f"p95_us={stats['p95'] / 1.0e3:.3f} "
+                f"critical_gbps={gbps:.3f} "
+                f"aggregate_gbps={gbps * args.gpus_per_node:.3f}")
+        print(f"[PASS] GIN link benchmark world={world}")
         return
 
     if args.scenario == "gin_team_pool":
@@ -916,6 +1134,13 @@ def main(argv=None):
         if failures:
             raise RuntimeError("distributed GIN benchmark failed:\n" +
                                "\n".join(failures))
+        if (args.scenario == "gin_backward_bench" and
+                os.environ.get("MEGAMOE_BACKWARD_STAGE_HASHES")):
+            for result in outputs:
+                evidence.extend(
+                    line for line in result.stdout.splitlines()
+                    if line.startswith("BACKWARD_V3_DX_HASH ")
+                )
         print("\n".join(evidence))
         if pool2:
             print(f"[PASS] same-rail GIN Backward pool=2 lifecycle world={world}")

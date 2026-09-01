@@ -2516,6 +2516,63 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << std::endl;
     return;
   }
+  if (scenario == "gin_link_bench") {
+    const auto *mode_text = std::getenv("MEGAMOE_GIN_BENCH_MODE");
+    const auto full = mode_text != nullptr && std::string(mode_text) == "full";
+    const auto *shift_text = std::getenv("MEGAMOE_GIN_BENCH_SHIFT");
+    const auto shift = shift_text == nullptr
+                           ? 0U
+                           : static_cast<std::uint32_t>(std::stoul(shift_text));
+    const auto *warmup_text = std::getenv("MEGAMOE_GIN_BENCH_WARMUP");
+    const auto warmup = warmup_text == nullptr
+                            ? 4U
+                            : static_cast<std::uint32_t>(std::stoul(warmup_text));
+    const auto *measured_text = std::getenv("MEGAMOE_GIN_BENCH_MEASURED");
+    const auto measured =
+        measured_text == nullptr
+            ? 20U
+            : static_cast<std::uint32_t>(std::stoul(measured_text));
+    const auto *batch_text = std::getenv("MEGAMOE_GIN_BENCH_BATCH");
+    const auto batch = batch_text == nullptr
+                           ? 32U
+                           : static_cast<std::uint32_t>(std::stoul(batch_text));
+    const std::vector<std::uint64_t> payloads{
+        1ULL * 7168ULL * sizeof(megamoe::transport::BFloat16),
+        2ULL * 7168ULL * sizeof(megamoe::transport::BFloat16),
+        64ULL * 1024ULL,
+        64ULL * 7168ULL * sizeof(megamoe::transport::BFloat16),
+        128ULL * 7168ULL * sizeof(megamoe::transport::BFloat16),
+        4ULL * 1024ULL * 1024ULL};
+    const auto benchmark =
+        megamoe::cuda::testing::run_distributed_gin_link_benchmark(
+            base, execution,
+            full ? megamoe::cuda::testing::GinConnectionMode::Full
+                 : megamoe::cuda::testing::GinConnectionMode::Rail,
+            shift, payloads, warmup, measured, batch);
+    for (const auto &sample : benchmark.cases) {
+      std::cout << "GIN_LINK_BENCH rank=" << rank
+                << " mode=" << (full ? "full" : "rail")
+                << " shift=" << benchmark.target_shift
+                << " local_rank=" << benchmark.local_rank
+                << " local_world=" << benchmark.local_world
+                << " gin_type=" << benchmark.gin_type
+                << " railed_gin_type=" << benchmark.railed_gin_type
+                << " payload=" << sample.payload_bytes
+                << " puts=" << sample.puts_per_sample
+                << " durations_ns=";
+      for (std::size_t index = 0; index < sample.duration_ns.size(); ++index) {
+        if (index != 0)
+          std::cout << ',';
+        std::cout << sample.duration_ns[index];
+      }
+      std::cout << " received_hash=" << benchmark.received_hash
+                << " expected_hash=" << benchmark.expected_hash
+                << " match="
+                << (benchmark.received_hash == benchmark.expected_hash)
+                << std::endl;
+    }
+    return;
+  }
   if (scenario == "gin_team_pool") {
     auto generation = megamoe::cuda::make_nccl_generation(
         base, "cuda-gin-team-pool", 701);
@@ -2719,6 +2776,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         backward_samples, dy_dispatch_samples, dv_samples, dx_samples,
         dw1_samples, dw2_samples, reduce_samples, dgate_samples,
         transpose_samples, dw1_wait_samples, dw2_wait_samples,
+        v3_local_delivery_samples, v3_outbound_pack_samples,
+        v3_rdma_samples, v3_inbound_relay_samples,
+        v3_dv_first_start_samples, v3_dv_complete_samples,
+        v3_dw2_first_ready_samples, v3_dw2_first_start_samples,
+        v3_dw2_last_complete_samples, v3_terminal_samples,
         dw1_max_wait_samples, dw2_max_wait_samples, dw1_tail_samples,
         dw2_tail_samples, dw1_overlap_samples, dw2_overlap_samples,
         forward_call_host_samples, dy_ready_host_samples,
@@ -2738,6 +2800,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     megamoe::cuda::BackwardStorageHashes gradient_hashes;
     bool have_gradient_hashes = false;
     std::uint32_t gradient_hash_repeats = 0;
+    std::string gradient_hash_mismatch;
     const auto same_storage_hash = [](const auto &left, const auto &right) {
       return left.low == right.low && left.high == right.high &&
              left.element_count == right.element_count;
@@ -2909,6 +2972,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           generation, execution, pool);
       auto notify = coordinator.run_device(
           {common_config, routes, gates, max_tokens});
+      trace_backward_bench("notify_complete", repeat);
       const auto notify_timing = notify.execution_timings();
       last_notify_audit = notify.audit();
       const auto notify_end = Clock::now();
@@ -2923,6 +2987,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                ? megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput
                : megamoe::cuda::ForwardCacheMode::NoFc1OutputCache},
           options);
+      trace_backward_bench("forward_submitted", repeat);
       const auto forward_call_end = Clock::now();
       const auto dy_ready_begin = Clock::now();
       auto dy = dy_storage
@@ -2932,6 +2997,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                           forward_handle, dy_host, execution);
       if (!dy_storage)
         dy_storage = dy;
+      trace_backward_bench("dy_ready", repeat);
       const auto dy_ready_end = Clock::now();
       const auto backward_call_begin = Clock::now();
       auto backward_handle = run_backward(
@@ -2939,6 +3005,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           {hidden, intermediate,
            megamoe::cuda::BackwardWeightGradientDType::BFloat16},
           options);
+      trace_backward_bench("backward_complete", repeat);
       const auto backward_call_end = Clock::now();
 #if MEGAMOE_DEVICE_TIMELINE
       if (validation_repeat &&
@@ -2960,15 +3027,68 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         const auto hashes =
             megamoe::cuda::testing::hash_backward_storage_for_validation(
                 backward_handle, execution);
+        if (std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr) {
+          const auto stage = megamoe::cuda::testing::
+              hash_backward_stage_storage_for_validation(backward_handle,
+                                                          execution);
+          std::cerr << "BACKWARD_BENCH_STAGE_HASH rank=" << rank
+                    << " repeat=" << repeat
+                    << " x=" << stage.canonical_x.low << ':'
+                    << stage.canonical_x.high
+                    << " dy=" << stage.canonical_dy.low << ':'
+                    << stage.canonical_dy.high
+                    << " gate=" << stage.canonical_gate.low << ':'
+                    << stage.canonical_gate.high
+                    << " a=" << stage.active_a.low << ':'
+                    << stage.active_a.high
+                    << " b=" << stage.active_b.low << ':'
+                    << stage.active_b.high
+                    << " ab=" << stage.active_ab.low << ':'
+                    << stage.active_ab.high
+                    << " dv=" << stage.dv.low << ':' << stage.dv.high
+                    << " dy_local=" << stage.dy_local_snapshot.low << ':'
+                    << stage.dy_local_snapshot.high
+                    << " u_t=" << stage.u_transpose.low << ':'
+                    << stage.u_transpose.high
+                    << " dab=" << stage.dab.low << ':' << stage.dab.high
+                    << " dab_t=" << stage.dab_transpose.low << ':'
+                    << stage.dab_transpose.high
+                    << " dw1=" << stage.dw1.low << ':' << stage.dw1.high
+                    << " dw2=" << stage.dw2.low << ':' << stage.dw2.high
+                    << std::endl;
+        }
         if (!have_gradient_hashes) {
           gradient_hashes = hashes;
           have_gradient_hashes = true;
         } else {
-          require(same_storage_hash(gradient_hashes.dx, hashes.dx) &&
-                      same_storage_hash(gradient_hashes.dw1, hashes.dw1) &&
-                      same_storage_hash(gradient_hashes.dw2, hashes.dw2) &&
-                      same_storage_hash(gradient_hashes.dgate, hashes.dgate),
-                  "main-shape Backward gradient hash changed across repeats");
+          const auto append_mismatch = [&](std::string &message,
+                                           const char *name,
+                                           const auto &expected,
+                                           const auto &actual) {
+            if (same_storage_hash(expected, actual))
+              return;
+            message += " ";
+            message += name;
+            message += "=" + std::to_string(expected.low) + ":" +
+                       std::to_string(expected.high) + "->" +
+                       std::to_string(actual.low) + ":" +
+                       std::to_string(actual.high);
+          };
+          std::string mismatch =
+              "main-shape Backward gradient hash changed at repeat=" +
+              std::to_string(repeat);
+          append_mismatch(mismatch, "dx", gradient_hashes.dx, hashes.dx);
+          append_mismatch(mismatch, "dw1", gradient_hashes.dw1, hashes.dw1);
+          append_mismatch(mismatch, "dw2", gradient_hashes.dw2, hashes.dw2);
+          append_mismatch(mismatch, "dgate", gradient_hashes.dgate,
+                          hashes.dgate);
+          // Do not let one rank tear down the communicator while peers are
+          // entering the next generation.  Preserve the first mismatch and
+          // report it only after every rank has executed the same collective
+          // sequence.
+          if (!same_backward_hashes(gradient_hashes, hashes) &&
+              gradient_hash_mismatch.empty())
+            gradient_hash_mismatch = std::move(mismatch);
         }
         ++gradient_hash_repeats;
       }
@@ -2985,6 +3105,26 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                      notify_end - begin).count());
         forward_samples.push_back(forward_handle.timings().total_us);
         backward_samples.push_back(backward_handle.timings().total_us);
+        v3_local_delivery_samples.push_back(
+            backward_handle.timings().v3_local_delivery_complete_us);
+        v3_outbound_pack_samples.push_back(
+            backward_handle.timings().v3_outbound_pack_complete_us);
+        v3_rdma_samples.push_back(
+            backward_handle.timings().v3_rdma_complete_us);
+        v3_inbound_relay_samples.push_back(
+            backward_handle.timings().v3_inbound_relay_complete_us);
+        v3_dv_first_start_samples.push_back(
+            backward_handle.timings().v3_dv_first_start_us);
+        v3_dv_complete_samples.push_back(
+            backward_handle.timings().v3_dv_complete_us);
+        v3_dw2_first_ready_samples.push_back(
+            backward_handle.timings().v3_dw2_first_ready_us);
+        v3_dw2_first_start_samples.push_back(
+            backward_handle.timings().v3_dw2_first_start_us);
+        v3_dw2_last_complete_samples.push_back(
+            backward_handle.timings().v3_dw2_last_complete_us);
+        v3_terminal_samples.push_back(
+            backward_handle.timings().v3_terminal_complete_us);
         dy_dispatch_samples.push_back(
             backward_handle.timings().dy_dispatch_us);
         dv_samples.push_back(
@@ -3064,6 +3204,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require(have_gradient_hashes &&
                 gradient_hash_repeats == kGradientHashValidationRepeats,
             "main-shape Backward gradient hash validation count mismatch");
+    require(gradient_hash_mismatch.empty(), gradient_hash_mismatch);
     const auto api_after = megamoe::cuda::testing::cuda_api_audit_snapshot();
     require(api_after.device_allocations == api_before.device_allocations &&
                 api_after.device_frees == api_before.device_frees &&
@@ -3186,6 +3327,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     emit(forward_backward_wall_samples);
     std::cout << " forward_wall="; emit(forward_samples);
     std::cout << " backward_wall="; emit(backward_samples);
+    std::cout << " v3_local_delivery_complete=";
+    emit(v3_local_delivery_samples);
+    std::cout << " v3_outbound_pack_complete=";
+    emit(v3_outbound_pack_samples);
+    std::cout << " v3_rdma_complete="; emit(v3_rdma_samples);
+    std::cout << " v3_inbound_relay_complete=";
+    emit(v3_inbound_relay_samples);
+    std::cout << " v3_dv_first_start="; emit(v3_dv_first_start_samples);
+    std::cout << " v3_dv_complete="; emit(v3_dv_complete_samples);
+    std::cout << " v3_dw2_first_ready=";
+    emit(v3_dw2_first_ready_samples);
+    std::cout << " v3_dw2_first_start=";
+    emit(v3_dw2_first_start_samples);
+    std::cout << " v3_dw2_last_complete=";
+    emit(v3_dw2_last_complete_samples);
+    std::cout << " v3_terminal_complete="; emit(v3_terminal_samples);
     std::cout << " dy_dispatch="; emit(dy_dispatch_samples);
     std::cout << " dv="; emit(dv_samples);
     std::cout << " dgate="; emit(dgate_samples);
@@ -3511,6 +3668,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                   std::stoul(rounds_text))
                             : 110U;
     require(rounds > 10, "forward benchmark requires >10 rounds");
+    const auto generation_base_text =
+        std::getenv("MEGAMOE_FORWARD_BENCH_GENERATION_BASE");
+    const auto generation_base =
+        generation_base_text
+            ? static_cast<std::uint64_t>(std::stoull(generation_base_text))
+            : 1000ULL;
+    require(generation_base <=
+                std::numeric_limits<std::uint64_t>::max() - rounds,
+            "forward benchmark generation range overflows");
     std::vector<double> wall_samples;
     std::vector<double> notify_samples;
     std::vector<double> forward_samples;
@@ -3532,7 +3698,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         std::cerr << "FORWARD_PROGRESS rank=" << rank << " round=" << round
                   << std::endl;
       auto generation = megamoe::cuda::make_nccl_generation(
-          base, "cuda-forward-bench", 1000U + round);
+          base, "cuda-forward-bench", generation_base + round);
       auto context = megamoe::make_rank_collective_context(
           generation.session(), rank, execution.token());
       auto routes =
@@ -3550,10 +3716,26 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto notify = coordinator.run_device(
           {common_config, routes, gates, max_tokens});
       const auto notify_end = Clock::now();
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
+                  << " round=" << round << " phase=notify_done"
+                  << std::endl;
       megamoe::cuda::ActivationTransportRunOptions run_options;
-      run_options.deadline_after = std::getenv("MEGAMOE_FORWARD_PROGRESS")
-                                       ? std::chrono::seconds(5)
-                                       : std::chrono::seconds(300);
+      auto progress_deadline_seconds = 5U;
+      if (const auto *deadline =
+              std::getenv("MEGAMOE_FORWARD_PROGRESS_DEADLINE_SECONDS"))
+        progress_deadline_seconds =
+            static_cast<std::uint32_t>(std::stoul(deadline));
+      require(progress_deadline_seconds != 0U,
+              "Forward progress deadline must be positive");
+      run_options.deadline_after =
+          std::getenv("MEGAMOE_FORWARD_PROGRESS")
+              ? std::chrono::seconds(progress_deadline_seconds)
+              : std::chrono::seconds(300);
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
+                  << " round=" << round << " phase=forward_enter"
+                  << std::endl;
       auto output = run_forward(
           notify.dispatch(), activations, weights,
           {hidden, intermediate,
@@ -3561,6 +3743,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                ? megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput
                : megamoe::cuda::ForwardCacheMode::NoFc1OutputCache},
           run_options);
+      if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
+                  << " round=" << round << " phase=forward_done"
+                  << std::endl;
       const auto wall_end = Clock::now();
       last_audit = output.audit();
       last_output = output;
@@ -3589,6 +3775,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     }
     const auto forward_api_after =
         megamoe::cuda::testing::cuda_api_audit_snapshot();
+#if MEGAMOE_DEVICE_TIMELINE
+    if (std::getenv("MEGAMOE_DEVICE_TIMELINE_PREFIX") != nullptr) {
+      const std::string prefix =
+          std::getenv("MEGAMOE_DEVICE_TIMELINE_PREFIX");
+      write_device_timeline(
+          megamoe::cuda::testing::download_forward_device_timeline(
+              last_output),
+          prefix);
+    }
+#endif
     require(forward_api_after.device_allocations ==
                     forward_api_before.device_allocations &&
                 forward_api_after.device_frees ==
@@ -3644,6 +3840,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       require(destination.good(), "failed to write forward output artifact");
     }
     const auto usage = transport_pool.usage();
+    const char *reduce_scheduler =
+        std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN") != nullptr
+            ? "scan"
+            : (std::getenv("MEGAMOE_FORWARD_LEGACY_REDUCE") != nullptr
+                   ? "legacy"
+                   : "queue");
     std::cout << "FORWARD_BENCH rank=" << rank
               << " world=" << world
               << " tokens=" << common_routes.num_tokens
@@ -3655,6 +3857,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                       : socket_forward_benchmark ? "nccl-socket-fallback"
                                                  : "local-cuda-p2p")
               << " specialization=sm90-wgmma-tma-7168x3072"
+              << " reduce_scheduler=" << reduce_scheduler
               << " cache_mode=" << (benchmark_cache ? "cache" : "no-cache")
               << " setup_us=" << one_time_setup_us
               << " device_pool_bytes=" << usage.device_bytes
@@ -3901,11 +4104,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto &backward_audit = backward_handle.audit();
       last_smoke_audit = backward_audit;
       const bool main_shape = hidden == 7168U && intermediate == 3072U;
-      require(backward_audit.persistent_kernel_launches == 1U &&
+      const std::uint64_t expected_persistent_launches =
+          main_shape && gin_backward_smoke &&
+                  (std::getenv("MEGAMOE_BACKWARD_SPLIT_DW1") != nullptr ||
+                   std::getenv("MEGAMOE_BACKWARD_PERSISTENT_V3") != nullptr)
+              ? (std::getenv("MEGAMOE_BACKWARD_PERSISTENT_V3") != nullptr
+                     ? (std::getenv("MEGAMOE_BACKWARD_V3_ELASTIC") != nullptr
+                            ? 2U
+                            : 5U)
+                     : 2U)
+              : 1U;
+      require(backward_audit.persistent_kernel_launches ==
+                      expected_persistent_launches &&
                   (!main_shape || backward_audit.dv_tasks == 0U ||
                    (backward_audit.wgmma_instructions != 0U &&
                     backward_audit.tma_loads != 0U)),
-              "Backward did not execute the expected single persistent "
+              "Backward did not execute the expected persistent "
               "kernel specialization");
       auto hashes =
           megamoe::cuda::testing::hash_backward_storage_for_validation(
@@ -3940,6 +4154,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << " ab=" << stage.active_ab.low
                   << " s=" << stage.s.low
                   << " dv=" << stage.dv.low
+                  << " dy_local=" << stage.dy_local_snapshot.low
                   << " u_t=" << stage.u_transpose.low
                   << " dab=" << stage.dab.low
                   << " dab_t=" << stage.dab_transpose.low
@@ -4288,7 +4503,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " empty_zero_dw2_completed="
               << empty_zero_check.dw2_zero_store_tasks_completed
               << " empty_zero_check_repeats=" << empty_zero_check_repeats
-              << " cache_no_cache_equal=1 persistent_launches=1";
+              << " cache_no_cache_equal=1 persistent_launches="
+              << last_smoke_audit.persistent_kernel_launches;
     if (world == 1U && top_k == 1U) {
       const std::array<std::uint64_t, 4> hidden_samples{
           0ULL, std::min<std::uint64_t>(17ULL, hidden - 1ULL),
@@ -5924,6 +6140,27 @@ int main(int argc, char **argv) {
       test_device_only_sanitizer_paths();
       return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--v3-protocol-smoke") {
+      const auto probe =
+          megamoe::cuda::testing::run_persistent_v3_protocol_probe();
+      require(probe.rdma_ctas == 8U && probe.relay_ctas == 8U &&
+                  probe.compute_ctas + probe.rdma_ctas + probe.relay_ctas ==
+                      probe.sm_count,
+              "V3 fixed CTA role partition mismatch");
+      require(probe.tasks_completed == 8ULL * probe.tasks_per_context &&
+                  probe.observed_checksum == probe.expected_checksum &&
+                  probe.terminal_epoch != 0ULL &&
+                  probe.terminal_publish_count == 1ULL &&
+                  probe.error_code == 0ULL,
+              "V3 ticket/scoreboard protocol probe failed");
+      std::cout << "[PASS] V3 fixed roles rdma=" << probe.rdma_ctas
+                << " relay=" << probe.relay_ctas
+                << " compute=" << probe.compute_ctas
+                << " tasks=" << probe.tasks_completed
+                << " terminal_publish_count="
+                << probe.terminal_publish_count << '\n';
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--resource-pool-test") {
       print_nccl_runtime_info();
       test_resource_pool_and_cuda_api_audit();
@@ -5945,6 +6182,51 @@ int main(int argc, char **argv) {
               "NCCL-free production Backward sanitizer harness failed");
       std::cout << "[PASS] NCCL-free production world=1 Forward+Backward "
                    "WGMMA/TMA sanitizer harness\n";
+      return 0;
+    }
+    if (argc == 7 && std::string(argv[1]) == "--dw1-core-profile") {
+      const auto warmup = static_cast<std::uint32_t>(parse_u64(argv[2]));
+      const auto measured =
+          static_cast<std::uint32_t>(parse_u64(argv[3]));
+      const auto k_major_x = parse_u64(argv[4]) != 0ULL;
+      const auto cluster2 = parse_u64(argv[5]) != 0ULL;
+      const auto independent_tasks = parse_u64(argv[6]) != 0ULL;
+      const auto profile =
+          megamoe::cuda::testing::profile_backward_v3_dw1_core(
+              warmup, measured, k_major_x, cluster2, independent_tasks);
+      std::cout << "DW1_CORE_PROFILE sm_count=" << profile.sm_count
+                << " experts=" << profile.experts
+                << " rows_per_expert=" << profile.rows_per_expert
+                << " tile=128x256x64 stages=3 layout="
+                << (k_major_x ? "KxK" : "KxMN")
+                << " cluster=" << (cluster2 ? 2 : 1)
+                << " independent_tasks=" << independent_tasks
+                << " mean_ms=" << profile.mean_ms
+                << " min_ms=" << profile.min_ms
+                << " max_ms=" << profile.max_ms
+                << " tflops=" << profile.tflops << '\n';
+      return 0;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--dv-core-profile") {
+      const auto warmup = static_cast<std::uint32_t>(parse_u64(argv[2]));
+      const auto measured =
+          static_cast<std::uint32_t>(parse_u64(argv[3]));
+      const auto tasks_per_cta =
+          static_cast<std::uint32_t>(parse_u64(argv[4]));
+      const auto profile =
+          megamoe::cuda::testing::profile_backward_v3_dv_core(
+              warmup, measured, tasks_per_cta);
+      std::cout << "DV_CORE_PROFILE sm_count=" << profile.sm_count
+                << " tasks=" << profile.tasks
+                << " tasks_per_cta=" << profile.tasks_per_cta
+                << " tile=128x256x64 stages=4"
+                << " mean_ms=" << profile.mean_ms
+                << " min_ms=" << profile.min_ms
+                << " max_ms=" << profile.max_ms
+                << " tflops=" << profile.tflops
+                << " mismatches=" << profile.mismatches << '\n';
+      require(profile.mismatches == 0ULL,
+              "dV core profile produced incorrect output");
       return 0;
     }
     if (argc == 5 && std::string(argv[1]) == "--runtime-shape") {

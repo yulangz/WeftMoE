@@ -21,6 +21,9 @@ enum class TaskClass : std::uint32_t {
 
 constexpr std::size_t kTaskClassCount =
     static_cast<std::size_t>(TaskClass::Count);
+#if MEGAMOE_DEBUG_VALIDATE
+constexpr std::size_t kForwardDebugCtas = 160;
+#endif
 
 struct TaskCompletionRecord {
   unsigned long long expected;
@@ -61,6 +64,25 @@ struct GenerationCompletionVector {
   unsigned long long tile_waiter_count;
 #if MEGAMOE_DEBUG_VALIDATE
   std::array<unsigned long long, 8> first_wait_arrived_by_rail;
+  // Aggregate CTA checkpoints isolate a Forward FC2 stall without adding any
+  // instrumentation to release kernels. A count drop between adjacent phases
+  // identifies the exact task interval that did not retire.
+  std::array<unsigned long long, 8> forward_fc2_phase_counts;
+  std::array<unsigned long long, 8> forward_fc2_phase_last_task;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_tiles_started;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_tiles_completed;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_last_task;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_pipeline_iteration;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_producer_checkpoint;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_math0_checkpoint;
+  std::array<unsigned long long, kForwardDebugCtas>
+      forward_fc2_cta_math1_checkpoint;
 #endif
   unsigned long long kernel_complete_epoch;
   unsigned long long terminal_publish_count;

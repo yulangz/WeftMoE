@@ -155,10 +155,14 @@ struct BackwardStorageHashes {
 struct BackwardStageStorageHashes {
   DeviceStorageHash128 canonical_x;
   DeviceStorageHash128 canonical_dy;
+  DeviceStorageHash128 canonical_gate;
+  DeviceStorageHash128 active_a;
+  DeviceStorageHash128 active_b;
   DeviceStorageHash128 dy_dw2_reduction_extent;
   DeviceStorageHash128 active_ab;
   DeviceStorageHash128 s;
   DeviceStorageHash128 dv;
+  DeviceStorageHash128 dy_local_snapshot;
   DeviceStorageHash128 u_transpose;
   DeviceStorageHash128 dab;
   DeviceStorageHash128 dab_transpose;
@@ -263,6 +267,37 @@ struct GinPutSignalProbeResult {
 };
 GinPutSignalProbeResult run_distributed_gin_put_signal_probe(
     const NcclSession &, const CudaExecution &, std::uint64_t = 1024);
+
+enum class GinConnectionMode : std::uint8_t {
+  Rail = 0,
+  Full = 1,
+};
+
+struct GinLinkBenchmarkCaseResult {
+  std::uint64_t payload_bytes = 0;
+  std::uint32_t puts_per_sample = 0;
+  std::vector<std::uint64_t> duration_ns;
+};
+
+struct GinLinkBenchmarkResult {
+  GinConnectionMode mode = GinConnectionMode::Rail;
+  std::uint32_t target_shift = 0;
+  std::uint32_t rank = 0;
+  std::uint32_t world = 0;
+  std::uint32_t local_rank = 0;
+  std::uint32_t local_world = 0;
+  std::uint32_t gin_type = 0;
+  std::uint32_t railed_gin_type = 0;
+  std::uint64_t received_hash = 0;
+  std::uint64_t expected_hash = 0;
+  std::vector<GinLinkBenchmarkCaseResult> cases;
+};
+
+GinLinkBenchmarkResult run_distributed_gin_link_benchmark(
+    const NcclSession &, const CudaExecution &, GinConnectionMode,
+    std::uint32_t target_shift, const std::vector<std::uint64_t> &payload_bytes,
+    std::uint32_t warmup = 4, std::uint32_t measured = 20,
+    std::uint32_t throughput_puts_per_sample = 32);
 BFloat16ActivationLease upload_bfloat16_activations_for_testing(
     const std::vector<transport::BFloat16> &, std::uint64_t, std::uint64_t,
     const RankCollectiveContext &, const CudaExecution &,

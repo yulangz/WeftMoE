@@ -177,6 +177,11 @@ struct DevicePacketHeaderRecord {
 
 struct DeviceFanoutRecord {
   std::uint64_t dst_row;
+  // Dense within one (source rank, destination node) pair and ordered by
+  // destination local rank then canonical row.  Forward and Backward reuse
+  // this immutable identity so Return wire groups follow compute M blocks
+  // instead of the token/packet dispatch order.
+  std::uint64_t return_compact_row;
   std::uint32_t topk_slot;
   std::uint32_t destination_local_rank;
   std::uint32_t expert_id;
@@ -197,10 +202,10 @@ struct DeviceSignalRecord {
 static_assert(sizeof(DeviceReverseRouteRecord) == 32);
 static_assert(sizeof(DeviceIncomingRowRecord) == 24);
 static_assert(sizeof(DevicePacketHeaderRecord) == 32);
-static_assert(sizeof(DeviceFanoutRecord) == 24);
+static_assert(sizeof(DeviceFanoutRecord) == 32);
 static_assert(sizeof(DeviceSignalRecord) == 40);
 
-inline constexpr std::uint32_t kDeviceDispatchLayoutVersion = 1;
+inline constexpr std::uint32_t kDeviceDispatchLayoutVersion = 2;
 
 struct DeviceDispatchIdentity {
   std::uint32_t layout_version = kDeviceDispatchLayoutVersion;

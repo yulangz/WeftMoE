@@ -73,6 +73,7 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease packet_headers;
   DeviceBufferLease packet_fanout_offsets;
   DeviceBufferLease packet_fanout;
+  DeviceBufferLease local_route_order;
   DeviceBufferLease dispatch_wave_packet_order;
   DeviceBufferLease dispatch_wave_offsets;
   DeviceBufferLease dispatch_wave_destination_node;
@@ -185,6 +186,10 @@ struct DeviceDispatchKernelView {
 // learns a new packet scheduling policy.
 struct DispatchWaveKernelView {
   std::uint64_t wave_count = 0;
+  // Source routes sorted by (local-node first, destination local M tile,
+  // expert, original route).  Relay CTAs use the local prefix to complete
+  // destination M-blocks in the same wavefront order as remote packets.
+  const std::uint64_t *local_route_order = nullptr;
   const std::uint64_t *packet_order = nullptr;
   const std::uint64_t *offsets = nullptr;
   const std::uint32_t *destination_node = nullptr;

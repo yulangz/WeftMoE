@@ -89,6 +89,11 @@ struct OutgoingPacketDescriptor {
 
 inline constexpr std::uint64_t kDispatchPacketHeaderDescriptorBytes = 32;
 inline constexpr std::uint64_t kDispatchFanoutDescriptorBytes = 24;
+// One packet is one deduplicated activation row for a destination node.  A
+// 128-packet cap exposes each primary-tile band in small enough pieces to start
+// FC1 and the reverse Return pipeline early; larger batches reduce WQEs but
+// increase the measured communication tail on Hopper.
+inline constexpr std::uint64_t kDispatchMaxPacketsPerWave = 128;
 
 struct SignalCardinality {
     std::uint32_t source_node = 0;

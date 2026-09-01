@@ -15,6 +15,7 @@ override CXXFLAGS += -fPIC -fvisibility=hidden -ffunction-sections -fdata-sectio
 WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
 MEGAMOE_DEVICE_TIMELINE ?= 0
+MEGAMOE_FORWARD_LIGHT_PROGRESS ?= 0
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
@@ -43,6 +44,8 @@ CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_S
 CUDA_CPPFLAGS += -DMEGAMOE_DEBUG_VALIDATE=$(MEGAMOE_DEBUG_VALIDATE) -DMEGAMOE_BUILD_SHARED=1
 CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
 CUDA_CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
+CPPFLAGS += -DMEGAMOE_FORWARD_LIGHT_PROGRESS=$(MEGAMOE_FORWARD_LIGHT_PROGRESS)
+CUDA_CPPFLAGS += -DMEGAMOE_FORWARD_LIGHT_PROGRESS=$(MEGAMOE_FORWARD_LIGHT_PROGRESS)
 
 LIB_SOURCES := \
 	src/cuda/control_protocol.cpp \
@@ -71,6 +74,7 @@ CROSS_CHECK_ENV := $(if $(SANITIZER_PRELOAD),LD_PRELOAD=$(SANITIZER_PRELOAD),)
 CUDA_LIB_SOURCES := \
 	src/cuda/device_notify.cu \
 	src/cuda/activation_transport.cu \
+	src/cuda/persistent_v3/kernel_entry.cu \
 	src/transport/nccl_count_exchange.cu
 CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 PROD_CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
@@ -100,8 +104,37 @@ $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
 	src/cuda/forward/runtime_shape_fallback.cuh \
 	src/cuda/backward/kernel_contract.cuh \
+	src/cuda/persistent_v3/contracts.hpp \
+	src/cuda/persistent_v3/queues.cuh \
+	src/cuda/persistent_v3/roles/common.cuh \
+	src/cuda/persistent_v3/backward/pipeline_state.cuh \
+	src/cuda/persistent_v3/forward/pipeline_state.cuh \
+	src/cuda/persistent_v3/forward/dispatch_pipeline.cuh \
+	src/cuda/persistent_v3/forward/return_pipeline.cuh \
+	src/cuda/persistent_v3/forward/finalize_pipeline.cuh \
+	src/cuda/persistent_v3/forward/compute_kernel.cuh \
+	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
+	src/cuda/persistent_v3/backward/dy_transport.cuh \
+	src/cuda/persistent_v3/backward/dv_dw2_pipeline_probe.cuh \
+	src/cuda/persistent_v3/backward/weight_compute.cuh \
+	src/cuda/persistent_v3/gemm/wgmma_wait_accumulator.cuh \
+	src/cuda/persistent_v3/gemm/dw_128x128_task.cuh \
+	src/cuda/persistent_v3/gemm/dw2_128x128_kernel.cuh \
 	src/cuda/profiling/device_timeline.cuh \
 	src/cuda/profiling/device_timeline_types.hpp
+
+$(BUILD_DIR)/src/cuda/persistent_v3/kernel_entry.o \
+$(BUILD_DIR)/production/src/cuda/persistent_v3/kernel_entry.o: \
+	src/cuda/persistent_v3/contracts.hpp \
+	src/cuda/persistent_v3/epoch_state.cuh \
+	src/cuda/persistent_v3/queues.cuh \
+	src/cuda/persistent_v3/shared_storage.cuh \
+	src/cuda/persistent_v3/pipelines/task_scoreboard.cuh \
+	src/cuda/persistent_v3/roles/common.cuh \
+	src/cuda/persistent_v3/roles/rdma_role.cuh \
+	src/cuda/persistent_v3/roles/relay_role.cuh \
+	src/cuda/persistent_v3/roles/compute_role.cuh \
+	src/cuda/persistent_v3/testing.hpp
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 

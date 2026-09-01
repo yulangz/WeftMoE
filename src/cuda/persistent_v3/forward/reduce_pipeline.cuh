@@ -1,0 +1,337 @@
+#pragma once
+
+// Token combine runs after the CTA's final FC2 tile. WGMMA/TMA live ranges have
+// ended at this point, so the caller redistributes their fixed register budget
+// uniformly across all three warpgroups. The former TMA producer contributes
+// four warps instead of leaving one third of the SM idle during the tail.
+
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+
+namespace forward_compute_detail {
+
+template <bool StaticLocal>
+__device__ __forceinline__ void reduce_one_token(
+    const ForwardKernelArgs &a, std::uint64_t token,
+    TransportDeviceStatus *status, transport::BFloat16 *contribution,
+    unsigned long long *source_ready, unsigned long long *route_ready,
+    const unsigned long long *direct_source_compact_index,
+    const transport::BFloat16 *direct_return_receive,
+    transport::BFloat16 *combined,
+    transport_state::GenerationCompletionVector *completion) {
+  const auto lane = threadIdx.x & 31U;
+#if MEGAMOE_DEBUG_VALIDATE
+  if constexpr (!StaticLocal) {
+    if (a.use_gin && lane == 0U)
+      claim_completion_tasks(completion, transport_state::TaskClass::Reduce);
+  }
+#endif
+  if (lane == 0U && status->reduced_tokens == ~0ULL)
+    atomicMin(&status->reduced_tokens, device_globaltimer_ns());
+
+  unsigned long long lane_route = 0ULL;
+  unsigned long long lane_row = 0ULL;
+  unsigned int lane_direct = 0U;
+  float lane_gate = 0.0F;
+  if (lane < a.dispatch.identity.top_k) {
+    const auto slot =
+        a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
+    lane_route = token * a.dispatch.identity.top_k + slot;
+    lane_row = lane_route;
+    lane_gate = a.gates[lane_route];
+    if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
+      // The queue-slot acquire already covers the release sequence of all
+      // top-k publishers, including payload and direct-map stores.
+      if (a.use_gin &&
+          a.dispatch.route_dst_node[lane_route] != a.node) {
+        lane_row = direct_source_compact_index[lane_route];
+        lane_direct = 1U;
+      }
+    } else if (a.use_gin) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+          route_ready[lane_route]);
+      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+             !forward_cancelled(a))
+        __nanosleep(64U);
+      if (a.dispatch.route_dst_node[lane_route] != a.node) {
+        lane_row = direct_source_compact_index[lane_route];
+        lane_direct = 1U;
+      }
+    } else {
+      const auto destination = a.dispatch.route_dst_rank[lane_route];
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+          source_ready[destination * a.channels]);
+      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+             !forward_cancelled(a))
+        __nanosleep(64U);
+    }
+  }
+  __syncwarp();
+
+  auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
+  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
+       vector += 32ULL) {
+    float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (std::uint32_t order = 0; order < a.dispatch.identity.top_k; ++order) {
+      const auto row = __shfl_sync(0xffffffffU, lane_row, order);
+      const auto direct =
+          __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
+      const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
+      const auto *source = direct ? direct_return_receive : contribution;
+      const auto packed =
+          reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];
+      const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+      for (std::uint32_t word = 0; word < 4U; ++word) {
+        sums[word * 2U] = gate_after_accumulate(
+            sums[word * 2U], gate, static_cast<std::uint16_t>(words[word]));
+        sums[word * 2U + 1U] = gate_after_accumulate(
+            sums[word * 2U + 1U], gate,
+            static_cast<std::uint16_t>(words[word] >> 16U));
+      }
+    }
+    unsigned int words[4];
+#pragma unroll
+    for (std::uint32_t word = 0; word < 4U; ++word)
+      words[word] =
+          static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
+          (static_cast<unsigned int>(
+               float_to_bf16_bits(sums[word * 2U + 1U]))
+           << 16U);
+    output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
+  }
+  __syncwarp();
+#if MEGAMOE_DEBUG_VALIDATE
+  if constexpr (!StaticLocal) {
+    if (a.use_gin && lane == 0U)
+      complete_completion_tasks(completion, transport_state::TaskClass::Reduce);
+  }
+#endif
+}
+
+template <bool StaticLocal>
+__device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
+                                         std::uint32_t role_index,
+                                         std::uint32_t role_count) {
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  auto *contribution =
+      peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
+  auto *source_ready =
+      peer_at<unsigned long long>(a.local_base, a.outgoing_sequence_offset);
+  auto *route_ready = peer_at<unsigned long long>(
+      a.local_base, a.return_ready_epoch_offset);
+  const auto *direct_source_compact_index =
+      peer_at<const unsigned long long>(
+          a.local_base, a.forward_direct_source_compact_index_offset);
+  const auto *direct_return_receive =
+      a.use_gin
+          ? reinterpret_cast<const transport::BFloat16 *>(
+                static_cast<const std::byte *>(a.gin_window_base) +
+                a.gin_return_receive_offset)
+          : nullptr;
+  auto *combined =
+      peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
+  transport_state::GenerationCompletionVector *completion = nullptr;
+  if constexpr (!StaticLocal) {
+    if (a.use_gin)
+      completion = static_cast<transport_state::GenerationCompletionVector *>(
+          a.peer_bases[a.world]);
+  }
+
+  constexpr std::uint32_t kWarpsPerCta = kThreads / 32U;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
+
+  if (a.forward_dynamic_reduce_queue) {
+    __shared__ unsigned long long batch_begin;
+    __shared__ unsigned int batch_count;
+    __shared__ unsigned int queue_done;
+    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+        a.local_base, a.forward_v3_control_offset);
+    auto *ready_token = peer_at<unsigned long long>(
+        a.local_base, a.forward_reduce_ready_token_offset);
+
+    while (true) {
+      if (threadIdx.x == 0U) {
+        batch_count = 0U;
+        queue_done = 0U;
+        if (forward_cancelled(a)) {
+          queue_done = 1U;
+        } else {
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_device>
+              head(control->reduce_ready_head.value);
+          auto candidate = head.load(::cuda::memory_order_relaxed);
+          const auto token_count = static_cast<unsigned long long>(
+              a.dispatch.identity.num_tokens);
+          if (candidate >= token_count) {
+            // Every queue entry has an owner. Each CTA finishes its claimed
+            // batch before returning, and Transport finalization waits for all
+            // reduce roles, so no per-token completion atomic is required.
+            queue_done = 1U;
+          } else {
+            ::cuda::atomic_ref<unsigned long long,
+                               ::cuda::thread_scope_system>
+                tail(control->reduce_ready_tail.value);
+            const auto published = tail.load(::cuda::memory_order_acquire);
+            const auto available =
+                published < token_count ? published : token_count;
+            if (candidate < available) {
+              const auto count = static_cast<unsigned int>(
+                  min(static_cast<unsigned long long>(kWarpsPerCta),
+                      available - candidate));
+              if (head.compare_exchange_strong(
+                      candidate, candidate + count,
+                      ::cuda::memory_order_acq_rel,
+                      ::cuda::memory_order_relaxed)) {
+                batch_begin = candidate;
+                batch_count = count;
+              }
+            } else {
+              __nanosleep(128U);
+            }
+          }
+        }
+      }
+      __syncthreads();
+      if (queue_done != 0U)
+        break;
+
+      if (warp < batch_count) {
+        const auto slot = batch_begin + warp;
+        unsigned long long token = 0ULL;
+        unsigned int token_ready = 0U;
+        if (lane == 0U) {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              published(ready_token[slot]);
+          auto encoded = published.load(::cuda::memory_order_acquire);
+          while (encoded == 0ULL && !forward_cancelled(a)) {
+            __nanosleep(64U);
+            encoded = published.load(::cuda::memory_order_acquire);
+          }
+          if (encoded != 0ULL) {
+            token = encoded - 1ULL;
+            token_ready = 1U;
+          }
+        }
+        token = __shfl_sync(0xffffffffU, token, 0U);
+        token_ready = __shfl_sync(0xffffffffU, token_ready, 0U);
+        if (token_ready != 0U)
+          reduce_one_token<StaticLocal>(
+              a, token, status, contribution, source_ready, route_ready,
+              direct_source_compact_index, direct_return_receive, combined,
+              completion);
+      }
+      __syncthreads();
+    }
+  } else if (a.forward_dynamic_reduce_scan) {
+    __shared__ unsigned long long batch_begin;
+    __shared__ unsigned int scan_done;
+    __shared__ unsigned int batch_progress;
+    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+        a.local_base, a.forward_v3_control_offset);
+    auto *token_state = peer_at<unsigned int>(
+        a.local_base, a.forward_reduce_route_count_offset);
+
+    while (true) {
+      if (threadIdx.x == 0U) {
+        scan_done = 0U;
+        batch_progress = 0U;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed(control->reduce_tokens_complete.value);
+        if (forward_cancelled(a) ||
+            completed.load(::cuda::memory_order_acquire) >=
+                a.dispatch.identity.num_tokens) {
+          scan_done = 1U;
+        } else {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              cursor(control->reduce_ready_head.value);
+          batch_begin = cursor.fetch_add(kWarpsPerCta,
+                                         ::cuda::memory_order_relaxed);
+        }
+      }
+      __syncthreads();
+      if (scan_done != 0U)
+        break;
+
+      const auto token =
+          (batch_begin + warp) % a.dispatch.identity.num_tokens;
+      unsigned int open = 0U;
+      if (lane == 0U) {
+        ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device> state(
+            token_state[token]);
+        open = state.load(::cuda::memory_order_relaxed) == 0U ? 1U : 0U;
+      }
+      open = __shfl_sync(0xffffffffU, open, 0U);
+
+      bool route_is_ready = open != 0U;
+      if (route_is_ready && lane < a.dispatch.identity.top_k) {
+        const auto route = token * a.dispatch.identity.top_k + lane;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            published(route_ready[route]);
+        route_is_ready =
+            published.load(::cuda::memory_order_acquire) >= a.epoch;
+      }
+      const auto ready_lanes = __ballot_sync(0xffffffffU, route_is_ready);
+      const auto route_mask =
+          (1U << a.dispatch.identity.top_k) - 1U;
+      unsigned int owner = 0U;
+      if (lane == 0U && open != 0U &&
+          (ready_lanes & route_mask) == route_mask) {
+        owner = atomicCAS(&token_state[token], 0U, 1U) == 0U ? 1U : 0U;
+        if (owner != 0U)
+          atomicAdd(&batch_progress, 1U);
+      }
+      owner = __shfl_sync(0xffffffffU, owner, 0U);
+      if (owner != 0U) {
+        reduce_one_token<StaticLocal>(
+            a, token, status, contribution, source_ready, route_ready,
+            direct_source_compact_index, direct_return_receive, combined,
+            completion);
+        if (lane == 0U) {
+          ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device> state(
+              token_state[token]);
+          state.store(2U, ::cuda::memory_order_release);
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_device>
+              completed(control->reduce_tokens_complete.value);
+          completed.fetch_add(1ULL, ::cuda::memory_order_release);
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0U && batch_progress == 0U)
+        __nanosleep(256U);
+      __syncthreads();
+    }
+  } else {
+    for (std::uint64_t token =
+             static_cast<std::uint64_t>(role_index) * kWarpsPerCta + warp;
+         token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
+         token += static_cast<std::uint64_t>(role_count) * kWarpsPerCta) {
+      reduce_one_token<StaticLocal>(
+          a, token, status, contribution, source_ready, route_ready,
+          direct_source_compact_index, direct_return_receive, combined,
+          completion);
+    }
+  }
+
+  if (lane == 0U)
+    atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+                          a.dispatch.identity.num_tokens, a.epoch);
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0U) {
+    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+        a.local_base, a.forward_v3_control_offset);
+    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+        control->compute_reduce_roles_complete.value, 1ULL);
+  }
+}
+
+} // namespace forward_compute_detail
+
+#endif // CUTE_ARCH_MMA_SM90A_ENABLED

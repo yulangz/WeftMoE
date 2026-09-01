@@ -80,6 +80,13 @@ EVENTS = {
     63: "return_gather_start",
     64: "return_gather_end",
     65: "return_gather_cta_bytes",
+    66: "dv_math_end",
+    67: "dv_tile_end",
+    68: "dx_first",
+    69: "dx_math_end",
+    70: "dx_tile_end",
+    71: "fc2_first",
+    72: "fc2_last",
 }
 
 PAIRS = {
@@ -113,6 +120,14 @@ PAIRS = {
     "return_directory": (58, 59),
     "dispatch_pack": (60, 61),
     "return_gather": (63, 64),
+    "dv_math": (28, 66),
+    "dv_tile": (28, 67),
+    "dv_epilogue": (66, 67),
+    "dx_math": (68, 69),
+    "dx_tile": (68, 70),
+    "dx_epilogue": (69, 70),
+    "fc2": (71, 72),
+    "fc1_end_to_fc2_start": (10, 71),
 }
 
 

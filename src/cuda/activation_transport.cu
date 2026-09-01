@@ -2,6 +2,8 @@
 
 #include <cuda.h>
 #include <cuda/atomic>
+#include <cuda/barrier>
+#include <cuda/ptx>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <nccl.h>
@@ -31,19 +33,35 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include "cuda/cuda_internal.hpp"
+#include "cuda/persistent_v3/backward/pipeline_state.cuh"
+#include "cuda/persistent_v3/contracts.hpp"
+#include "cuda/persistent_v3/forward/pipeline_state.cuh"
+#include "cuda/persistent_v3/queues.cuh"
+#include "cuda/persistent_v3/roles/common.cuh"
 #include "cuda/profiling/device_timeline.cuh"
 #include "cuda/testing/harnesses.hpp"
 #include "cuda/transport_generation_completion.cuh"
 #include "megamoe/api/errors.hpp"
+
+#ifndef MEGAMOE_FORWARD_LIGHT_PROGRESS
+#define MEGAMOE_FORWARD_LIGHT_PROGRESS 0
+#endif
 
 namespace megamoe::cuda {
 struct ActivationMegaKernelBackendState;
 namespace {
 
 constexpr std::size_t kAlign = 256;
+constexpr std::uint64_t kBackwardV3SigmoidLutEntries = 1ULL << 16U;
+
+void CUDART_CB publish_stream_completion(void *opaque) {
+  static_cast<std::atomic<bool> *>(opaque)->store(true,
+                                                  std::memory_order_release);
+}
 
 [[noreturn]] void transport_error(NotifyErrorCode code, const char *phase,
                                   const char *field, std::uint32_t rank,
@@ -331,8 +349,12 @@ struct GinDispatchContextRecord {
   std::uint64_t packet_begin;
   std::uint32_t packet_count;
   std::uint32_t wave_count;
+  // Total route-level fanout rows for this source rank and destination node.
+  // Every context carries the same total, allowing its permanent RDMA owner
+  // to consume FULL Return descriptors independently during Dispatch.
+  std::uint64_t return_row_count;
 };
-static_assert(sizeof(GinDispatchContextRecord) == 32);
+static_assert(sizeof(GinDispatchContextRecord) == 40);
 
 // Forward Return uses immutable, generation-local compact chunks. A chunk owns a
 // contiguous range in both the registered staging window and the source
@@ -348,7 +370,54 @@ struct ForwardReturnChunkRecord {
 };
 static_assert(sizeof(ForwardReturnChunkRecord) == 32);
 
-constexpr std::uint64_t kForwardReturnChunkRows = 64ULL;
+// Compute publishes only immutable byte ranges.  The fixed RDMA team scans
+// this generation-local catalog and the context named by each record is its
+// sole GIN issuer.  `epoch` is stored last with device-release ordering.
+struct alignas(16) ForwardDirectReturnFragment {
+  std::uint64_t canonical_row;
+  std::uint64_t compact_row;
+  std::uint32_t source_rank;
+  std::uint32_t row_count;
+  std::uint32_t context;
+  std::uint32_t reserved;
+  std::uint64_t epoch;
+};
+static_assert(sizeof(ForwardDirectReturnFragment) == 48);
+
+// One immutable word lets an FC2/dX producer address both the proxy's chunk
+// scoreboard and the exact compact row in its registered Return window.  Main
+// shapes need only hundreds of chunks and tens of thousands of compact rows;
+// 24 bits for each preserves ample headroom while retaining a 16-bit rank.
+constexpr std::uint32_t kReturnMappingFieldBits = 24U;
+constexpr std::uint32_t kReturnMappingChunkShift = 24U;
+constexpr std::uint32_t kReturnMappingProxyShift = 48U;
+constexpr unsigned long long kReturnMappingFieldMask =
+    (1ULL << kReturnMappingFieldBits) - 1ULL;
+
+__device__ __forceinline__ std::uint64_t
+encode_return_row_mapping(std::uint32_t proxy_rank, std::uint64_t chunk,
+                          std::uint64_t compact_row) {
+  return (static_cast<std::uint64_t>(proxy_rank + 1U)
+          << kReturnMappingProxyShift) |
+         ((chunk + 1ULL) << kReturnMappingChunkShift) | (compact_row + 1ULL);
+}
+
+__device__ __forceinline__ std::uint32_t
+return_mapping_proxy(std::uint64_t mapping) {
+  return static_cast<std::uint32_t>(mapping >> kReturnMappingProxyShift) - 1U;
+}
+
+__device__ __forceinline__ std::uint64_t
+return_mapping_chunk(std::uint64_t mapping) {
+  return ((mapping >> kReturnMappingChunkShift) & kReturnMappingFieldMask) -
+         1ULL;
+}
+
+__device__ __forceinline__ std::uint64_t
+return_mapping_compact_row(std::uint64_t mapping) {
+  return (mapping & kReturnMappingFieldMask) - 1ULL;
+}
+
 [[maybe_unused]] constexpr std::uint32_t kForwardReturnCompletionBatch = 8U;
 [[maybe_unused]] constexpr unsigned long long kReturnChunkWaiting = 0ULL;
 [[maybe_unused]] constexpr unsigned long long kReturnChunkPacking = 1ULL;
@@ -393,6 +462,13 @@ struct BackwardDeviceStatus {
   unsigned long long gin_dispatch_payload_bytes;
   unsigned long long gin_return_payload_bytes;
   unsigned long long padded_reduction_rows;
+  // Persistent-v3 diagnostic milestones.  These are absolute device clocks;
+  // keeping them separate from the production phase clocks makes overlap
+  // visible instead of forcing concurrently progressing stages into a
+  // misleading serial timeline.
+  unsigned long long v3_local_delivery_complete_clock;
+  unsigned long long v3_outbound_pack_complete_clock;
+  unsigned long long v3_rdma_complete_clock;
   unsigned int error;
   unsigned int error_field;
   unsigned int error_origin_rank;
@@ -444,7 +520,7 @@ enum ForwardProgressWord : std::uint32_t {
   kForwardProgressWords = 16,
 };
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
 void dump_generation_completion(std::ostream &output,
                                 const std::uint64_t *mapped,
                                 std::uint32_t contexts,
@@ -495,22 +571,63 @@ void dump_generation_completion(std::ostream &output,
       output << ',';
     output << word(kTail + 23ULL + rail);
   }
-  output << "} " << prefix
-         << ".kernel_complete_epoch=" << word(kTail + 31ULL) << ' ' << prefix
-         << ".terminal_publish_count=" << word(kTail + 32ULL);
+  output << "} " << prefix << ".fc2_phase_counts={";
+  for (std::uint32_t phase = 0; phase < 8U; ++phase) {
+    if (phase != 0U)
+      output << ',';
+    output << word(kTail + 31ULL + phase);
+  }
+  output << "} " << prefix << ".fc2_phase_last_task={";
+  for (std::uint32_t phase = 0; phase < 8U; ++phase) {
+    if (phase != 0U)
+      output << ',';
+    output << word(kTail + 39ULL + phase);
+  }
+  output << "} " << prefix << ".fc2_stalled_ctas={";
+  constexpr auto kCtaStarted = kTail + 47ULL;
+  constexpr auto kCtaCompleted =
+      kCtaStarted + transport_state::kForwardDebugCtas;
+  constexpr auto kCtaLastTask =
+      kCtaCompleted + transport_state::kForwardDebugCtas;
+  constexpr auto kCtaPipeline =
+      kCtaLastTask + transport_state::kForwardDebugCtas;
+  constexpr auto kCtaProducer =
+      kCtaPipeline + transport_state::kForwardDebugCtas;
+  constexpr auto kCtaMath0 = kCtaProducer + transport_state::kForwardDebugCtas;
+  constexpr auto kCtaMath1 = kCtaMath0 + transport_state::kForwardDebugCtas;
+  bool first_stalled_cta = true;
+  for (std::size_t cta = 0; cta < transport_state::kForwardDebugCtas; ++cta) {
+    const auto started = word(kCtaStarted + cta);
+    const auto completed = word(kCtaCompleted + cta);
+    if (started == completed)
+      continue;
+    if (!first_stalled_cta)
+      output << ',';
+    first_stalled_cta = false;
+    output << cta << ":" << started << '/' << completed << "@task"
+           << word(kCtaLastTask + cta) << ":pipeline"
+           << word(kCtaPipeline + cta) << ":producer"
+           << word(kCtaProducer + cta) << ":math0" << word(kCtaMath0 + cta)
+           << ":math1" << word(kCtaMath1 + cta);
+  }
+  constexpr auto kKernelComplete =
+      kCtaMath1 + transport_state::kForwardDebugCtas;
+  output << "} " << prefix << ".kernel_complete_epoch=" << word(kKernelComplete)
+         << ' ' << prefix
+         << ".terminal_publish_count=" << word(kKernelComplete + 1ULL);
 #else
-  output << ' ' << prefix
-         << ".kernel_complete_epoch=" << word(kTail + 23ULL) << ' ' << prefix
-         << ".terminal_publish_count=" << word(kTail + 24ULL);
+  output << ' ' << prefix << ".kernel_complete_epoch=" << word(kTail + 23ULL)
+         << ' ' << prefix << ".terminal_publish_count=" << word(kTail + 24ULL);
 #endif
   for (std::uint32_t context = 0; context < contexts; ++context) {
     const auto base = transport_state::kGenerationCompletionWords +
                       context * transport_state::kContextCompletionWords;
-    output << ' ' << prefix << ".context[" << context << "]={directory="
-           << word(base + 2ULL) << ",dispatch=" << word(base + 3ULL) << '/'
-           << word(base + 5ULL) << ",relay=" << word(base + 6ULL) << '/'
-           << word(base + 8ULL) << ",return=" << word(base + 9ULL) << '/'
-           << word(base + 11ULL) << ",inflight=" << word(base + 12ULL)
+    output << ' ' << prefix << ".context[" << context
+           << "]={directory=" << word(base + 2ULL)
+           << ",dispatch=" << word(base + 3ULL) << '/' << word(base + 5ULL)
+           << ",relay=" << word(base + 6ULL) << '/' << word(base + 8ULL)
+           << ",return=" << word(base + 9ULL) << '/' << word(base + 11ULL)
+           << ",inflight=" << word(base + 12ULL)
            << ",local_completion=" << word(base + 13ULL)
            << ",credit=" << word(base + 14ULL)
            << ",cursor=" << word(base + 15ULL)
@@ -558,6 +675,7 @@ struct Layout {
   std::size_t forward_ab_cache = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
+  std::size_t forward_fc1_published = 0;
   std::size_t forward_x_arrived_rows = 0;
   std::size_t forward_output_ready_epoch = 0;
   std::size_t forward_return_chunk_directory = 0;
@@ -565,8 +683,15 @@ struct Layout {
   std::size_t forward_return_chunk_ready_count = 0;
   std::size_t forward_return_fragment_index = 0;
   std::size_t forward_return_source_compact_index = 0;
+  std::size_t forward_return_source_route_index = 0;
+  std::size_t forward_direct_source_compact_index = 0;
+  std::size_t forward_reduce_route_count = 0;
+  std::size_t forward_reduce_ready_token = 0;
+  std::size_t forward_direct_return_fragment = 0;
   std::uint64_t forward_return_chunk_capacity = 0;
+  std::uint64_t forward_direct_return_fragment_capacity = 0;
   std::size_t forward_scheduler = 0;
+  std::size_t forward_v3_control = 0;
   std::size_t forward_completion = 0;
   std::size_t forward_context_completion = 0;
   std::size_t backward_dy_input = 0;
@@ -585,10 +710,24 @@ struct Layout {
   std::size_t backward_dab_transpose = 0;
   std::size_t backward_dw1 = 0;
   std::size_t backward_dw2 = 0;
+  std::size_t backward_sigmoid_lut = 0;
   std::size_t backward_scheduler = 0;
   std::size_t backward_completion = 0;
   std::size_t backward_context_completion = 0;
   std::size_t backward_dy_arrived_rows = 0;
+  std::size_t backward_v3_control = 0;
+  std::size_t backward_v3_activation_pair_mailboxes = 0;
+  std::size_t backward_v3_mblock_mapping = 0;
+  std::size_t backward_v3_mblock_dv_cursor = 0;
+  std::size_t backward_v3_mblock_dv_complete = 0;
+  std::size_t backward_v3_mblock_ready = 0;
+  std::size_t backward_v3_mblock_dx_cursor = 0;
+  std::size_t backward_v3_mblock_dx_complete = 0;
+  std::size_t backward_v3_token_state = 0;
+  std::size_t backward_v3_expert_padded_prefix = 0;
+  std::size_t backward_v3_expert_dv_complete = 0;
+  std::size_t backward_v3_expert_dw1_cursor = 0;
+  std::size_t backward_v3_expert_dw2_cursor = 0;
   std::size_t backward_dw_timeline = 0;
   std::size_t backward_validation_status = 0;
   std::size_t backward_status = 0;
@@ -610,8 +749,10 @@ struct GinWindowLayout {
   std::size_t receive_gate = 0;
   std::size_t send_payload = 0;
   std::size_t receive_payload = 0;
+  std::size_t backward_dy_input = 0;
   std::size_t return_staging = 0;
   std::size_t return_receive = 0;
+  std::size_t return_fragment_ready = 0;
   std::size_t return_gate_staging = 0;
   std::size_t return_gate_receive = 0;
   std::size_t barrier = 0;
@@ -627,65 +768,71 @@ struct TimelineAllocationLayout {
   std::size_t total = 0;
 };
 
-TimelineAllocationLayout make_timeline_allocation_layout(
-    std::uint32_t max_ctas) {
+TimelineAllocationLayout
+make_timeline_allocation_layout(std::uint32_t max_ctas) {
   TimelineAllocationLayout layout;
   std::size_t cursor = 0;
-  layout.counts = append(cursor, max_ctas, sizeof(std::uint32_t),
-                         "timeline CTA counts");
-  layout.overflow = append(cursor, max_ctas, sizeof(std::uint32_t),
-                           "timeline CTA overflow");
+  layout.counts =
+      append(cursor, max_ctas, sizeof(std::uint32_t), "timeline CTA counts");
+  layout.overflow =
+      append(cursor, max_ctas, sizeof(std::uint32_t), "timeline CTA overflow");
   layout.records = append(
       cursor,
-      checked_mul(max_ctas, profiling::kEventsPerCta,
-                  "timeline records"),
+      checked_mul(max_ctas, profiling::kEventsPerCta, "timeline records"),
       sizeof(profiling::DeviceTimelineRecord), "timeline records");
   layout.total = cursor;
   return layout;
 }
 #endif
 
-GinWindowLayout make_gin_window_layout(
-    const ActivationTransportPoolConfig &config) {
+GinWindowLayout
+make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   GinWindowLayout layout;
   if (!config.enable_gin_rdma)
     return layout;
   std::size_t cursor = 0;
-  const auto routes = checked_mul(config.max_tokens_per_rank,
-                                  config.max_top_k, "GIN max routes");
-  const auto outgoing_packets = checked_mul(
-      config.max_nodes, config.max_tokens_per_rank,
-      "GIN outgoing packet capacity");
-  const auto outgoing_fanout = checked_mul(
-      outgoing_packets, config.max_top_k,
-      "GIN outgoing packet fanout capacity");
+  const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                                  "GIN max routes");
+  const auto outgoing_packets =
+      checked_mul(config.max_nodes, config.max_tokens_per_rank,
+                  "GIN outgoing packet capacity");
+  const auto outgoing_fanout =
+      checked_mul(outgoing_packets, config.max_top_k,
+                  "GIN outgoing packet fanout capacity");
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
   constexpr std::uint32_t kGinContextsPerRail = 8;
-  const auto directory_records = checked_mul(
-      remote_nodes, kGinContextsPerRail, "GIN dispatch directory records");
+  const auto directory_records = checked_mul(remote_nodes, kGinContextsPerRail,
+                                             "GIN dispatch directory records");
   const auto incoming_packets = checked_mul(
-      remote_nodes, config.max_tokens_per_rank,
-      "GIN incoming packet capacity");
-  const auto packet_payload = checked_mul(outgoing_packets,
-                                          config.max_hidden_size,
-                                          "GIN send payload elements");
-  const auto incoming_payload = checked_mul(incoming_packets,
-                                            config.max_hidden_size,
-                                            "GIN receive payload elements");
+      remote_nodes, config.max_tokens_per_rank, "GIN incoming packet capacity");
+  const auto packet_payload = checked_mul(
+      outgoing_packets, config.max_hidden_size, "GIN send payload elements");
+  const auto incoming_payload = checked_mul(
+      incoming_packets, config.max_hidden_size, "GIN receive payload elements");
+  const auto backward_dy_input =
+      checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
+                  "GIN backward dY input elements");
   const auto return_payload = checked_mul(routes, config.max_hidden_size,
                                           "GIN return payload elements");
-  layout.send_dispatch_directory = append(
-      cursor, directory_records, sizeof(GinDispatchContextRecord),
-      "GIN send dispatch directory");
-  layout.receive_dispatch_directory = append(
-      cursor, directory_records, sizeof(GinDispatchContextRecord),
-      "GIN receive dispatch directory");
-  layout.send_packet_headers = append(
-      cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
-      "GIN send packet headers");
-  layout.receive_packet_headers = append(
-      cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
-      "GIN receive packet headers");
+  // FULL's send plane is indexed by canonical producer row and its receive
+  // plane by compact source row. Reserve the larger bound so both planes share
+  // one registered-window layout without a pre-put pack.
+  const auto direct_return_rows =
+      std::max<std::uint64_t>(
+          checked_mul(remote_nodes, routes, "GIN compact return rows"),
+          config.max_destination_rows_per_rank);
+  layout.send_dispatch_directory =
+      append(cursor, directory_records, sizeof(GinDispatchContextRecord),
+             "GIN send dispatch directory");
+  layout.receive_dispatch_directory =
+      append(cursor, directory_records, sizeof(GinDispatchContextRecord),
+             "GIN receive dispatch directory");
+  layout.send_packet_headers =
+      append(cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
+             "GIN send packet headers");
+  layout.receive_packet_headers =
+      append(cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
+             "GIN receive packet headers");
   // Packet descriptors are materialized in transport order. A token can
   // contribute one node-deduplicated packet to every node, so packet-position
   // indexing requires nodes*tokens*top-k capacity even though the number of
@@ -693,40 +840,51 @@ GinWindowLayout make_gin_window_layout(
   // made the first remote-node packet range alias send_gate/send_payload.
   layout.send_fanout = append(cursor, outgoing_fanout,
                               sizeof(DeviceFanoutRecord), "GIN send fanout");
-  layout.receive_fanout = append(
-      cursor, checked_mul(incoming_packets, config.max_top_k,
-                          "GIN receive fanout capacity"),
-      sizeof(DeviceFanoutRecord), "GIN receive fanout");
-  layout.send_gate = append(cursor, outgoing_fanout, sizeof(float),
-                            "GIN send route gates");
-  layout.receive_gate = append(
-      cursor, checked_mul(incoming_packets, config.max_top_k,
-                          "GIN receive gate capacity"),
-      sizeof(float), "GIN receive route gates");
+  layout.receive_fanout =
+      append(cursor,
+             checked_mul(incoming_packets, config.max_top_k,
+                         "GIN receive fanout capacity"),
+             sizeof(DeviceFanoutRecord), "GIN receive fanout");
+  layout.send_gate =
+      append(cursor, outgoing_fanout, sizeof(float), "GIN send route gates");
+  layout.receive_gate = append(cursor,
+                               checked_mul(incoming_packets, config.max_top_k,
+                                           "GIN receive gate capacity"),
+                               sizeof(float), "GIN receive route gates");
   layout.send_payload = append(cursor, packet_payload,
-                               sizeof(transport::BFloat16),
-                               "GIN send payload");
-  layout.receive_payload = append(cursor, incoming_payload,
-                                  sizeof(transport::BFloat16),
-                                  "GIN receive payload");
+                               sizeof(transport::BFloat16), "GIN send payload");
+  layout.receive_payload =
+      append(cursor, incoming_payload, sizeof(transport::BFloat16),
+             "GIN receive payload");
+  // A Backward producer can publish its native token-major dY here.  The
+  // fixed RDMA CTAs put disjoint token slices directly; Relay metadata keeps
+  // the route/expert permutation separate from the 117 MiB payload plane.
+  layout.backward_dy_input =
+      append(cursor, backward_dy_input, sizeof(transport::BFloat16),
+             "GIN backward token-major dY input");
   layout.return_staging = append(
-      cursor, checked_mul(remote_nodes, return_payload,
-                          "GIN return staging elements"),
-                                 sizeof(transport::BFloat16),
-                                 "GIN return staging");
-  layout.return_receive = append(cursor, return_payload,
-                                 sizeof(transport::BFloat16),
-                                 "GIN return receive");
+      cursor, checked_mul(direct_return_rows, config.max_hidden_size,
+                          "GIN direct return staging elements"),
+      sizeof(transport::BFloat16), "GIN return staging");
+  layout.return_receive =
+      append(cursor, return_payload, sizeof(transport::BFloat16),
+             "GIN return receive");
+  // The worst legal fragmentation begins at every row, hence routes marker
+  // words are sufficient for every compact Return layout.  The main path
+  // normally emits one marker per M128 producer block.
+  layout.return_fragment_ready =
+      append(cursor, routes, sizeof(std::uint64_t),
+             "GIN return fragment ready counters");
   layout.return_gate_staging = append(
-      cursor, checked_mul(remote_nodes, routes,
-                          "GIN return gate staging elements"),
+      cursor,
+      checked_mul(remote_nodes, routes, "GIN return gate staging elements"),
       sizeof(float), "GIN return gate staging");
-  layout.return_gate_receive = append(cursor, routes, sizeof(float),
-                                      "GIN return gate receive");
+  layout.return_gate_receive =
+      append(cursor, routes, sizeof(float), "GIN return gate receive");
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
-  layout.production_error_records = append(
-      cursor, config.max_world_size, sizeof(ProductionStatusRecord),
-      "GIN production error records");
+  layout.production_error_records =
+      append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
+             "GIN production error records");
   layout.total = cursor;
   return layout;
 }
@@ -864,165 +1022,232 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         (config.max_hidden_size + 255ULL) / 256ULL;
     layout.forward_task_claim = append(
         cursor,
-        checked_mul(max_mblocks, 1ULL + fc1_ntiles + fc2_ntiles,
+        checked_mul(max_mblocks, 2ULL + fc1_ntiles + fc2_ntiles,
                     "forward task claims"),
         sizeof(std::uint64_t), "forward task claims");
     layout.forward_fc1_done = append(cursor, max_mblocks,
                                      sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
+    layout.forward_fc1_published = append(
+        cursor, max_mblocks, sizeof(std::uint64_t),
+        "forward FC1 readiness publication bitmap");
     // A destination tile is produced concurrently by every node-local rail.
     // Keep one row counter per local-rank/rail instead of issuing contended
     // system-scope atomics from several GPUs into one peer word. The consumer
     // sums the fixed rail vector with acquire loads. This is both deterministic
     // and avoids relying on peer-atomic combining behavior of a particular
     // NVLink/virtualization topology.
-    layout.forward_x_arrived_rows = append(
-        cursor,
-        checked_mul(max_mblocks, config.max_world_size,
-                    "forward exact X M-tile rail counters"),
-        sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
-    layout.forward_output_ready_epoch = append(
-        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
-        "forward output row ready epochs");
+    layout.forward_x_arrived_rows =
+        append(cursor,
+               checked_mul(max_mblocks, config.max_world_size,
+                           "forward exact X M-tile rail counters"),
+               sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
+    layout.forward_output_ready_epoch =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(std::uint64_t), "forward output row ready epochs");
     // A discontinuity in the canonical reverse-row space may terminate a
     // chunk.  The safe O(routes) bound is therefore one directory record per
     // destination row rather than ceil(rows/chunk_rows).
-    layout.forward_return_chunk_capacity =
-        config.max_destination_rows_per_rank;
+    layout.forward_return_chunk_capacity = config.max_destination_rows_per_rank;
     layout.forward_return_chunk_directory = append(
         cursor, layout.forward_return_chunk_capacity,
-        sizeof(ForwardReturnChunkRecord),
-        "forward return chunk directory");
-    layout.forward_return_chunk_state = append(
-        cursor, layout.forward_return_chunk_capacity, sizeof(std::uint64_t),
-        "forward return chunk state");
+        sizeof(ForwardReturnChunkRecord), "forward return chunk directory");
+    layout.forward_return_chunk_state =
+        append(cursor, layout.forward_return_chunk_capacity,
+               sizeof(std::uint64_t), "forward return chunk state");
     layout.forward_return_chunk_ready_count = append(
         cursor,
-        checked_mul(layout.forward_return_chunk_capacity,
-                    config.max_world_size,
+        checked_mul(layout.forward_return_chunk_capacity, config.max_world_size,
                     "forward return chunk producer rail counters"),
-        sizeof(std::uint64_t),
-        "forward return chunk ready count");
-    layout.forward_return_fragment_index = append(
-        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
-        "forward return compact fragment index");
-    layout.forward_return_source_compact_index = append(
-        cursor, routes, sizeof(std::uint64_t),
-        "forward source compact return index");
-    layout.forward_scheduler = append(
-        cursor, 4 + config.max_world_size * 32ULL,
-        sizeof(std::uint64_t), "forward scheduler");
-    layout.forward_completion = append(
-        cursor, 1, sizeof(transport_state::GenerationCompletionVector),
-        "forward generation completion vector");
-    const auto max_context_records = checked_mul(
-        config.max_nodes > 0 ? config.max_nodes - 1ULL : 0ULL, 8ULL,
-        "forward GIN context completion records");
-    layout.forward_context_completion = append(
-        cursor, max_context_records,
-        sizeof(transport_state::ContextCompletionRecord),
-        "forward GIN context completion records");
+        sizeof(std::uint64_t), "forward return chunk ready count");
+    layout.forward_return_fragment_index =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(std::uint64_t), "forward return compact fragment index");
+    layout.forward_return_source_compact_index =
+        append(cursor, routes, sizeof(std::uint64_t),
+               "forward source compact return index");
+    layout.forward_return_source_route_index =
+        append(cursor, routes, sizeof(std::uint64_t),
+               "forward compact return source route index");
+    layout.forward_direct_source_compact_index =
+        append(cursor, routes, sizeof(std::uint64_t),
+               "forward FULL source route compact index");
+    layout.forward_reduce_route_count = append(
+        cursor, config.max_tokens_per_rank, sizeof(std::uint32_t),
+        "forward reduce ready route counts");
+    layout.forward_reduce_ready_token = append(
+        cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
+        "forward reduce ready token queue");
+    layout.forward_direct_return_fragment_capacity =
+        config.max_destination_rows_per_rank;
+    layout.forward_direct_return_fragment = append(
+        cursor, layout.forward_direct_return_fragment_capacity,
+        sizeof(ForwardDirectReturnFragment),
+        "forward direct return fragment directory");
+    layout.forward_scheduler =
+        append(cursor, 4 + config.max_world_size * 32ULL, sizeof(std::uint64_t),
+               "forward scheduler");
+    layout.forward_v3_control =
+        append(cursor, 1, sizeof(persistent_v3::ForwardPipelineControl),
+               "forward V3 persistent control plane");
+    layout.forward_completion =
+        append(cursor, 1, sizeof(transport_state::GenerationCompletionVector),
+               "forward generation completion vector");
+    const auto max_context_records =
+        checked_mul(config.max_nodes > 0 ? config.max_nodes - 1ULL : 0ULL, 8ULL,
+                    "forward GIN context completion records");
+    layout.forward_context_completion =
+        append(cursor, max_context_records,
+               sizeof(transport_state::ContextCompletionRecord),
+               "forward GIN context completion records");
     if (config.enable_backward) {
       const auto rows = config.max_destination_rows_per_rank;
       const auto hidden = config.max_hidden_size;
       const auto intermediate = config.max_intermediate_size;
-      const auto route_elements = checked_mul(routes, hidden,
-                                              "backward route elements");
-      const auto row_hidden = checked_mul(rows, hidden,
-                                          "backward row hidden elements");
-      const auto row_intermediate = checked_mul(
-          rows, intermediate, "backward row intermediate elements");
-      layout.backward_dy_input = append(
-          cursor, checked_mul(config.max_tokens_per_rank, hidden,
-                              "backward dY input elements"),
-          sizeof(transport::BFloat16), "backward dY input");
-      layout.backward_forward_output = append(
-          cursor, row_hidden, sizeof(transport::BFloat16),
-          "Backward-enabled Forward FC2 output rows");
-      layout.backward_dy_canonical = append(
-          cursor, row_hidden, sizeof(transport::BFloat16),
-          "backward canonical dY");
-      layout.backward_canonical_gate = append(
-          cursor, rows, sizeof(float), "backward canonical gate");
-      layout.backward_dab = append(
-          cursor, checked_mul(row_intermediate, 2ULL, "backward dAB"),
-          sizeof(transport::BFloat16), "backward dAB");
+      const auto route_elements =
+          checked_mul(routes, hidden, "backward route elements");
+      const auto row_hidden =
+          checked_mul(rows, hidden, "backward row hidden elements");
+      const auto row_intermediate =
+          checked_mul(rows, intermediate, "backward row intermediate elements");
+      layout.backward_dy_input =
+          append(cursor,
+                 checked_mul(config.max_tokens_per_rank, hidden,
+                             "backward dY input elements"),
+                 sizeof(transport::BFloat16), "backward dY input");
+      layout.backward_forward_output =
+          append(cursor, row_hidden, sizeof(transport::BFloat16),
+                 "Backward-enabled Forward FC2 output rows");
+      layout.backward_dy_canonical =
+          append(cursor, row_hidden, sizeof(transport::BFloat16),
+                 "backward canonical dY");
+      layout.backward_canonical_gate =
+          append(cursor, rows, sizeof(float), "backward canonical gate");
+      layout.backward_dab =
+          append(cursor, checked_mul(row_intermediate, 2ULL, "backward dAB"),
+                 sizeof(transport::BFloat16), "backward dAB");
       layout.backward_recompute_ab = append(
-          cursor, checked_mul(row_intermediate, 2ULL,
-                              "backward recompute A/B"),
+          cursor, checked_mul(row_intermediate, 2ULL, "backward recompute A/B"),
           sizeof(transport::BFloat16), "backward recompute A/B");
-      layout.backward_dx_canonical = append(
-          cursor, row_hidden, sizeof(transport::BFloat16),
-          "backward canonical dX");
-      layout.backward_dx_return = append(
-          cursor, route_elements, sizeof(transport::BFloat16),
-          "backward dX return");
-      layout.backward_dx_combined = append(
-          cursor, checked_mul(config.max_tokens_per_rank, hidden,
-                              "backward combined dX"),
-          sizeof(transport::BFloat16), "backward combined dX");
+      layout.backward_dx_canonical =
+          append(cursor, row_hidden, sizeof(transport::BFloat16),
+                 "backward canonical dX");
+      layout.backward_dx_return =
+          append(cursor, route_elements, sizeof(transport::BFloat16),
+                 "backward dX return");
+      layout.backward_dx_combined =
+          append(cursor,
+                 checked_mul(config.max_tokens_per_rank, hidden,
+                             "backward combined dX"),
+                 sizeof(transport::BFloat16), "backward combined dX");
       const auto intermediate_tiles = (intermediate + 255ULL) / 256ULL;
       layout.backward_dgate_partial = append(
-          cursor, checked_mul(rows, intermediate_tiles,
-                              "backward dGate partials"),
+          cursor,
+          checked_mul(rows, intermediate_tiles, "backward dGate partials"),
           sizeof(float), "backward dGate partials");
-      layout.backward_dgate_canonical = append(
-          cursor, rows, sizeof(float), "backward canonical dGate");
-      layout.backward_dgate = append(cursor, routes, sizeof(float),
-                                     "backward dGate");
+      layout.backward_dgate_canonical =
+          append(cursor, rows, sizeof(float), "backward canonical dGate");
+      layout.backward_dgate =
+          append(cursor, routes, sizeof(float), "backward dGate");
       if (config.max_owned_experts == 0)
         transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                         "transport-pool-query", "max_owned_experts", 0,
                         "> 0 when enable_backward", "0");
       const auto max_owned_experts = config.max_owned_experts;
-      const auto reduction_rows =
-          (rows + checked_mul(max_owned_experts, 63ULL,
-                              "backward padded reduction rows") +
-           63ULL) &
-          ~63ULL;
-      layout.backward_u_transpose = append(
-          cursor, checked_mul(reduction_rows, intermediate,
-                              "backward padded U transpose"),
-          sizeof(transport::BFloat16),
-          "backward U transpose");
-      layout.backward_dab_transpose = append(
-          cursor, checked_mul(reduction_rows, 2ULL * intermediate,
-                              "backward padded dAB transpose"),
-          sizeof(transport::BFloat16), "backward dAB transpose");
-      layout.backward_dw1 = append(
-          cursor,
-          checked_mul(checked_mul(max_owned_experts, 2ULL * intermediate,
-                                  "backward dW1 rows"),
-                      hidden, "backward dW1 elements"),
-          sizeof(transport::BFloat16), "backward dW1");
-      layout.backward_dw2 = append(
-          cursor,
-          checked_mul(checked_mul(max_owned_experts, hidden,
-                                  "backward dW2 rows"),
-                      intermediate, "backward dW2 elements"),
-          sizeof(transport::BFloat16), "backward dW2");
-      layout.backward_scheduler = append(
-          cursor, 64ULL + reduction_rows, sizeof(std::uint64_t),
-          "backward scheduler/readiness");
-      layout.backward_completion = append(
-          cursor, 1, sizeof(transport_state::GenerationCompletionVector),
-          "backward generation completion vector");
-      layout.backward_context_completion = append(
-          cursor, max_context_records,
-          sizeof(transport_state::ContextCompletionRecord),
-          "backward GIN context completion records");
-      layout.backward_dy_arrived_rows = append(
-          cursor, max_mblocks, sizeof(std::uint64_t),
-          "backward exact dY M-tile arrived rows");
-      layout.backward_dw_timeline = append(
-          cursor, max_owned_experts, sizeof(BackwardExpertDwTimeline),
-          "backward per-expert dW timeline");
-      layout.backward_validation_status = append(
-          cursor, checked_mul(config.max_world_size, 8ULL,
-                              "backward terminal validation words"),
-          sizeof(std::uint64_t), "backward terminal validation status");
-      layout.backward_status = append(cursor, 1, sizeof(BackwardDeviceStatus),
-                                      "backward status");
+      const auto reduction_rows = persistent_v3::align_up<std::uint64_t>(
+          checked_add(rows,
+                      checked_mul(max_owned_experts, 127ULL,
+                                  "backward padded reduction rows"),
+                      "backward padded reduction rows"),
+          128U);
+      layout.backward_u_transpose =
+          append(cursor,
+                 checked_mul(reduction_rows, intermediate,
+                             "backward padded U transpose"),
+                 sizeof(transport::BFloat16), "backward U transpose");
+      layout.backward_dab_transpose =
+          append(cursor,
+                 checked_mul(reduction_rows, 2ULL * intermediate,
+                             "backward padded dAB transpose"),
+                 sizeof(transport::BFloat16), "backward dAB transpose");
+      layout.backward_dw1 =
+          append(cursor,
+                 checked_mul(checked_mul(max_owned_experts, 2ULL * intermediate,
+                                         "backward dW1 rows"),
+                             hidden, "backward dW1 elements"),
+                 sizeof(transport::BFloat16), "backward dW1");
+      layout.backward_dw2 =
+          append(cursor,
+                 checked_mul(checked_mul(max_owned_experts, hidden,
+                                         "backward dW2 rows"),
+                             intermediate, "backward dW2 elements"),
+                 sizeof(transport::BFloat16), "backward dW2");
+      layout.backward_sigmoid_lut =
+          append(cursor, kBackwardV3SigmoidLutEntries, sizeof(float),
+                 "backward BF16 sigmoid lookup table");
+      layout.backward_scheduler =
+          append(cursor, 64ULL + reduction_rows, sizeof(std::uint64_t),
+                 "backward scheduler/readiness");
+      layout.backward_completion =
+          append(cursor, 1, sizeof(transport_state::GenerationCompletionVector),
+                 "backward generation completion vector");
+      layout.backward_context_completion =
+          append(cursor, max_context_records,
+                 sizeof(transport_state::ContextCompletionRecord),
+                 "backward GIN context completion records");
+      layout.backward_dy_arrived_rows =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward exact dY row-ready epochs");
+      layout.backward_v3_control =
+          append(cursor, 1, sizeof(persistent_v3::BackwardPipelineControl),
+                 "backward V3 persistent control plane");
+      layout.backward_v3_activation_pair_mailboxes =
+          append(cursor, persistent_v3::kBackwardActivationPairCapacity,
+                 sizeof(persistent_v3::BackwardActivationPairMailbox),
+                 "backward V3 activation pair mailboxes");
+      layout.backward_v3_mblock_mapping =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 M-block mapping");
+      layout.backward_v3_mblock_dv_cursor =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 per-M-block dV cursor");
+      layout.backward_v3_mblock_dv_complete =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 per-M-block dV completion");
+      layout.backward_v3_mblock_ready =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 per-M-block activation-ready epoch");
+      layout.backward_v3_mblock_dx_cursor =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 per-M-block dX cursor");
+      layout.backward_v3_mblock_dx_complete =
+          append(cursor, max_mblocks, sizeof(std::uint64_t),
+                 "backward V3 per-M-block dX completion");
+      layout.backward_v3_token_state =
+          append(cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
+                 "backward V3 per-token return/reduce state");
+      layout.backward_v3_expert_padded_prefix =
+          append(cursor, max_owned_experts + 1ULL, sizeof(std::uint64_t),
+                 "backward V3 expert padded prefixes");
+      layout.backward_v3_expert_dv_complete =
+          append(cursor, max_owned_experts, sizeof(std::uint64_t),
+                 "backward V3 expert dV completion");
+      layout.backward_v3_expert_dw1_cursor =
+          append(cursor, max_owned_experts, sizeof(std::uint64_t),
+                 "backward V3 expert dW1 cursor");
+      layout.backward_v3_expert_dw2_cursor =
+          append(cursor, max_owned_experts, sizeof(std::uint64_t),
+                 "backward V3 expert dW2 cursor");
+      layout.backward_dw_timeline =
+          append(cursor, max_owned_experts, sizeof(BackwardExpertDwTimeline),
+                 "backward per-expert dW timeline");
+      layout.backward_validation_status =
+          append(cursor,
+                 checked_mul(config.max_world_size, 8ULL,
+                             "backward terminal validation words"),
+                 sizeof(std::uint64_t), "backward terminal validation status");
+      layout.backward_status =
+          append(cursor, 1, sizeof(BackwardDeviceStatus), "backward status");
     }
   }
   layout.status = append(cursor, 1, sizeof(TransportDeviceStatus), "status");
@@ -1055,6 +1280,18 @@ struct PoolSlot {
   cudaEvent_t forward_start = nullptr;
   cudaEvent_t forward_output_ready = nullptr;
   cudaEvent_t forward_complete = nullptr;
+  // GIN Forward uses compile-time-isolated transport and compute kernels.
+  // Per-slot non-blocking streams allow both persistent grids to remain
+  // resident without serializing independent generations in the pool.
+  cudaStream_t forward_transport_stream = nullptr;
+  cudaStream_t forward_m64_head_stream = nullptr;
+  cudaStream_t forward_compute_stream = nullptr;
+  cudaStream_t backward_dw2_stream = nullptr;
+  cudaEvent_t forward_roles_ready = nullptr;
+  cudaEvent_t forward_transport_done = nullptr;
+  cudaEvent_t forward_m64_head_done = nullptr;
+  cudaEvent_t forward_compute_done = nullptr;
+  cudaEvent_t backward_dw2_done = nullptr;
   cudaEvent_t dispatch_complete = nullptr;
   cudaEvent_t complete = nullptr;
   cudaEvent_t backward_ready = nullptr;
@@ -1064,13 +1301,19 @@ struct PoolSlot {
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};
+  CUtensorMap forward_x_m64_map{};
+  CUtensorMap forward_s_m64_map{};
+  CUtensorMap forward_output_store_map{};
+  CUtensorMap forward_staging_store_map{};
   CUtensorMap backward_dy_map{};
   CUtensorMap backward_dab_map{};
   CUtensorMap backward_dy_mn_map{};
   CUtensorMap backward_x_mn_map{};
   CUtensorMap backward_u_transpose_map{};
   CUtensorMap backward_dab_transpose_map{};
+  CUtensorMap backward_dab_dx_map{};
   CUtensorMap backward_dw1_store_map{};
+  CUtensorMap backward_dw2_store_map{};
   bool forward_maps_valid = false;
   bool backward_maps_valid = false;
 };
@@ -1170,6 +1413,34 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.forward_complete)
         (void)cudaEventDestroy(slot.forward_complete);
+      if (slot.forward_roles_ready)
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      if (slot.forward_roles_ready)
+        (void)cudaEventDestroy(slot.forward_roles_ready);
+      if (slot.forward_transport_done)
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      if (slot.forward_transport_done)
+        (void)cudaEventDestroy(slot.forward_transport_done);
+      if (slot.forward_m64_head_done)
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      if (slot.forward_m64_head_done)
+        (void)cudaEventDestroy(slot.forward_m64_head_done);
+      if (slot.forward_compute_done)
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      if (slot.forward_compute_done)
+        (void)cudaEventDestroy(slot.forward_compute_done);
+      if (slot.backward_dw2_done)
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      if (slot.backward_dw2_done)
+        (void)cudaEventDestroy(slot.backward_dw2_done);
+      if (slot.forward_transport_stream)
+        (void)cudaStreamDestroy(slot.forward_transport_stream);
+      if (slot.forward_m64_head_stream)
+        (void)cudaStreamDestroy(slot.forward_m64_head_stream);
+      if (slot.forward_compute_stream)
+        (void)cudaStreamDestroy(slot.forward_compute_stream);
+      if (slot.backward_dw2_stream)
+        (void)cudaStreamDestroy(slot.backward_dw2_stream);
       if (slot.dispatch_complete)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.dispatch_complete)
@@ -1299,6 +1570,14 @@ __device__ std::uint16_t float_to_bf16_bits(float value) {
   auto bits = __float_as_uint(value);
   bits += 0x7fffU + ((bits >> 16U) & 1U);
   return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+__device__ __forceinline__ std::uint32_t float2_to_bf16x2_bits(float low,
+                                                               float high) {
+  const auto pair = static_cast<__nv_bfloat162_raw>(
+      __float22bfloat162_rn(make_float2(low, high)));
+  return static_cast<std::uint32_t>(pair.x) |
+         (static_cast<std::uint32_t>(pair.y) << 16U);
 }
 
 __device__ float bf16_bits_to_float(std::uint16_t value) {
@@ -1885,6 +2164,55 @@ __global__ void gin_probe_put_signal_kernel(
   gin.waitSignal(ncclCoopThread{}, 0, 1);
 }
 
+__global__ void gin_link_benchmark_kernel(
+    ncclDevComm_t dev_comm, ncclWindow_t window, bool full_connection,
+    bool fanout_full, int destination, int local_world,
+    std::size_t payload_bytes, std::size_t receive_offset,
+    std::uint32_t warmup, std::uint32_t measured,
+    std::uint32_t puts_per_sample, unsigned long long *duration_ns,
+    unsigned int *device_error) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  const ncclGin gin(dev_comm, 0);
+  const ncclTeam team = full_connection ? ncclTeamWorld(dev_comm)
+                                        : ncclTeamRail(dev_comm);
+  if (destination < 0 || destination >= team.nRanks || measured == 0U ||
+      puts_per_sample == 0U) {
+    *device_error = 1U;
+    return;
+  }
+
+  unsigned long long expected = 0ULL;
+  const auto samples = static_cast<unsigned long long>(warmup) + measured;
+  for (unsigned long long sample = 0ULL; sample < samples; ++sample) {
+    const auto begin = device_globaltimer_ns();
+    for (std::uint32_t put = 0; put < puts_per_sample; ++put) {
+      auto put_destination = destination;
+      if (fanout_full) {
+        const auto node = destination / local_world;
+        const auto local = destination % local_world;
+        put_destination =
+            node * local_world + (local + static_cast<int>(put)) % local_world;
+      }
+      gin.put(team, put_destination, window, receive_offset, window, 0,
+              payload_bytes, ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+              ncclCoopThread{}, ncclGin_None{},
+              ::cuda::thread_scope_system, ::cuda::thread_scope_system);
+    }
+    expected += puts_per_sample;
+    gin.waitCounter(ncclCoopThread{}, 0, expected, 64,
+                    ::cuda::memory_order_acquire);
+    const auto end = device_globaltimer_ns();
+    if (sample >= warmup)
+      duration_ns[sample - warmup] = end - begin;
+  }
+  // Every rank has exactly one inverse sender.  Waiting for the matching
+  // remote signal makes the final payload validation independent of whether
+  // local completion happens a little earlier than the receive-side action.
+  gin.waitSignal(ncclCoopThread{}, 0, expected, 64,
+                 ::cuda::memory_order_acquire);
+}
+
 struct GinTransportSliceArgs {
   DeviceDispatchKernelView dispatch;
   const transport::BFloat16 *input;
@@ -1922,6 +2250,7 @@ __global__ void gin_signal_reset_kernel(ncclDevComm_t dev_comm,
     gin.resetSignal(1);
     gin.resetSignal(2);
     gin.resetCounter(0);
+    gin.resetCounter(1);
   }
 }
 
@@ -2275,20 +2604,39 @@ __global__ void validate_p2p_barrier_kernel(
 }
 #endif
 
-template <typename T>
-__device__ T *peer_at(void *base, std::size_t offset) {
+template <typename T> __device__ T *peer_at(void *base, std::size_t offset) {
   return reinterpret_cast<T *>(static_cast<unsigned char *>(base) + offset);
 }
+
+#if MEGAMOE_DEBUG_VALIDATE
+template <typename Args>
+__device__ __forceinline__ void
+production_terminal_debug_progress(const Args &a, ProductionStatusPhase phase,
+                                   unsigned long long value) {
+  if (phase == ProductionStatusPhase::Forward && a.progress != nullptr &&
+      blockIdx.x == 0U && threadIdx.x == 0U) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        progress(a.progress[kForwardTerminal]);
+    progress.store(value, ::cuda::memory_order_release);
+  }
+}
+#else
+template <typename Args>
+__device__ __forceinline__ void
+production_terminal_debug_progress(const Args &, ProductionStatusPhase,
+                                   unsigned long long) {}
+#endif
 
 template <bool StaticLocal, typename Args, typename Status>
 __device__ __forceinline__ void publish_production_terminal_status(
     const Args &a, Status *status, ProductionStatusPhase phase,
-    std::size_t ordinary_record_offset,
-    std::size_t gin_record_offset) {
+    std::size_t ordinary_record_offset, std::size_t gin_record_offset,
+    unsigned long long prior_gin_signal_count) {
   if (blockIdx.x != 0U)
     return;
-  const auto local_world = a.local_world_size == 0U ? a.world
-                                                     : a.local_world_size;
+  production_terminal_debug_progress(a, phase, 10ULL);
+  const auto local_world =
+      a.local_world_size == 0U ? a.world : a.local_world_size;
   const auto node = a.local_world_size == 0U ? 0U : a.node;
   const auto first_local = node * local_world;
   // Legacy cancellation and debug checks may have claimed the status word
@@ -2349,6 +2697,7 @@ __device__ __forceinline__ void publish_production_terminal_status(
     published.store(a.epoch, ::cuda::memory_order_release);
   }
   __syncthreads();
+  production_terminal_debug_progress(a, phase, 20ULL);
 
 #if __has_include(<nccl_device.h>)
   if (!StaticLocal && a.use_gin) {
@@ -2364,24 +2713,65 @@ __device__ __forceinline__ void publish_production_terminal_status(
       published.store(a.epoch, ::cuda::memory_order_release);
       const ncclGin gin(a.gin_dev_comm, 0);
       const auto rail = ncclTeamRail(a.gin_dev_comm);
+      production_terminal_debug_progress(a, phase, 30ULL);
+      // Indexed signals are context-scoped, not operation-scoped.  In the
+      // specialized Forward path signal 2 already contains the fixed-width
+      // generation-ready handshake.  Its terminal threshold must therefore
+      // include that protocol-known prefix.  It cannot be derived by reading
+      // the live signal here: a faster peer may already have delivered this
+      // terminal wave, which would make a sampled-base-plus-delta wait for an
+      // increment that will never exist.
+      //
+      unsigned long long status_peers = 0ULL;
+      const unsigned long long words[8] = {
+          local.generation, local.phase,    local.origin_rank, local.error_code,
+          local.field,      local.expected, local.actual,      local.epoch};
       for (std::uint32_t remote_node = 0;
            remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
         if (remote_node == node)
           continue;
-        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                gin_record_offset +
-                    static_cast<std::size_t>(a.rank) * sizeof(local),
-                a.gin_window,
-                gin_record_offset +
-                    static_cast<std::size_t>(a.rank) * sizeof(local),
-                sizeof(local), ncclGin_SignalInc{2}, ncclGin_CounterInc{0},
-                ncclCoopThread{}, ncclGin_None{},
-                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        const auto destination =
+            gin_record_offset +
+            static_cast<std::size_t>(a.rank) * sizeof(local);
+        // Inline values remove the generic-store -> async-proxy source
+        // dependency entirely.  The final epoch write carries the signal;
+        // GIN orders it after all preceding puts to this context/peer, so the
+        // receiver cannot observe completion before all eight words settle.
+#pragma unroll
+        for (std::uint32_t word = 0; word < 7U; ++word) {
+          gin.putValue<unsigned long long>(
+              rail, static_cast<int>(remote_node), a.gin_window,
+              destination + word * sizeof(unsigned long long), words[word],
+              ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+              ::cuda::thread_scope_thread, ::cuda::thread_scope_device);
+          production_terminal_debug_progress(a, phase, 40ULL + word);
+        }
+        gin.putValue<unsigned long long>(
+            rail, static_cast<int>(remote_node), a.gin_window,
+            destination + 7U * sizeof(unsigned long long), words[7],
+            ncclGin_SignalInc{2}, ncclCoopThread{}, ncclGin_None{},
+            ::cuda::thread_scope_thread, ::cuda::thread_scope_device);
+        production_terminal_debug_progress(a, phase, 47ULL);
+        ++status_peers;
       }
-      gin.waitSignal(ncclCoopThread{}, 2,
-                     a.dispatch.identity.num_nodes - 1U);
+      if (status_peers != 0ULL) {
+        const auto expected = prior_gin_signal_count + status_peers;
+        production_terminal_debug_progress(
+            a, phase,
+            0x5000000000000000ULL | (expected << 32U) | gin.readSignal(2));
+        gin.waitSignal(ncclCoopThread{}, 2, expected);
+      }
+      production_terminal_debug_progress(a, phase, 60ULL);
     }
     __syncthreads();
+    // GIN writes arrive through Hopper's async proxy. Signal observation
+    // orders the remote operation, but generic CTA loads of the received
+    // record require an explicit proxy-domain fence. Without it the synthetic
+    // epoch publication below could expose a current epoch with a stale
+    // generation-zero payload.
+    asm volatile("fence.proxy.async.global;" : : : "memory");
+    __syncthreads();
+    production_terminal_debug_progress(a, phase, 70ULL);
     // Each same-rail proxy receives the record for its corresponding remote
     // rank, then fans it out through already-owned node-local IPC mappings.
     const auto local_rank = a.rank - first_local;
@@ -2406,6 +2796,7 @@ __device__ __forceinline__ void publish_production_terminal_status(
       }
     }
     __syncthreads();
+    production_terminal_debug_progress(a, phase, 80ULL);
   }
 #else
   (void)gin_record_offset;
@@ -2424,11 +2815,15 @@ __device__ __forceinline__ void publish_production_terminal_status(
     }
   }
   __syncthreads();
+  production_terminal_debug_progress(a, phase, 90ULL);
 
-  // The trusted single-node release path completes the fixed status agreement
-  // on device. Every rank sees the same peer-owned record matrix and applies
-  // the same rank/field ordering before the host observes its local status.
-  if constexpr (StaticLocal) {
+  // Local P2P and GIN both complete the fixed status agreement on device.
+  // For GIN, every rail has already put its record cross-node and fanned the
+  // corresponding remote record through node-local IPC, so the matrix below
+  // is the same full-world matrix a redundant host NCCL AllGather would
+  // produce. Validate and select the deterministic error here before the
+  // status D2H; Socket returned above and retains its host collective.
+  if (StaticLocal || a.use_gin) {
     if (threadIdx.x == 0U) {
       ProductionStatusRecord selected{};
       bool has_error = false;
@@ -2437,18 +2832,40 @@ __device__ __forceinline__ void publish_production_terminal_status(
         auto record = observed_records[source];
         if (record.generation != a.dispatch.identity.generation) {
           record = ProductionStatusRecord{a.dispatch.identity.generation,
-                                          expected_phase, source, 2ULL, 1ULL,
+                                          expected_phase,
+                                          source,
+                                          2ULL,
+                                          1ULL,
                                           a.dispatch.identity.generation,
-                                          record.generation, a.epoch};
+                                          record.generation,
+                                          a.epoch};
         } else if (record.phase != expected_phase) {
           record = ProductionStatusRecord{a.dispatch.identity.generation,
-                                          expected_phase, source, 2ULL, 2ULL,
-                                          expected_phase, record.phase,
+                                          expected_phase,
+                                          source,
+                                          2ULL,
+                                          2ULL,
+                                          expected_phase,
+                                          record.phase,
+                                          a.epoch};
+        } else if (record.origin_rank != source && record.error_code == 0ULL) {
+          record = ProductionStatusRecord{a.dispatch.identity.generation,
+                                          expected_phase,
+                                          source,
+                                          2ULL,
+                                          3ULL,
+                                          source,
+                                          record.origin_rank,
                                           a.epoch};
         } else if (record.epoch != a.epoch) {
           record = ProductionStatusRecord{a.dispatch.identity.generation,
-                                          expected_phase, source, 2ULL, 4ULL,
-                                          a.epoch, record.epoch, a.epoch};
+                                          expected_phase,
+                                          source,
+                                          2ULL,
+                                          4ULL,
+                                          a.epoch,
+                                          record.epoch,
+                                          a.epoch};
         }
         if (record.error_code == 0ULL)
           continue;
@@ -2472,6 +2889,7 @@ __device__ __forceinline__ void publish_production_terminal_status(
     }
     __syncthreads();
   }
+  production_terminal_debug_progress(a, phase, 100ULL);
 }
 
 // The storage is owned by the local rank: ingress_published is written by
@@ -2485,7 +2903,7 @@ __global__ void initialize_forward_generation_signals_kernel(
     std::size_t gin_local_compute_ready_offset,
     std::size_t forward_x_arrived_rows_offset,
     std::size_t backward_dy_arrived_rows_offset, std::uint64_t mtile_count,
-    std::size_t forward_completion_offset,
+    std::uint64_t dy_row_count, std::size_t forward_completion_offset,
     std::size_t backward_completion_offset,
     std::size_t forward_context_completion_offset,
     std::size_t backward_context_completion_offset,
@@ -2534,12 +2952,14 @@ __global__ void initialize_forward_generation_signals_kernel(
   for (std::uint32_t peer = index; peer < world; peer += blockDim.x)
     compute_ready[peer] = initial;
   const auto x_arrived_count = mtile_count * peer_count;
-  for (std::uint64_t slot = index; slot < x_arrived_count;
-       slot += blockDim.x) {
+  for (std::uint64_t slot = index; slot < x_arrived_count; slot += blockDim.x) {
     x_arrived[slot] = 0ULL;
   }
-  for (std::uint64_t tile = index; tile < mtile_count;
-       tile += blockDim.x) {
+  // V3 publishes one word per real canonical row.  Transport M tiles may be
+  // finer than the independent 128-row compute blocks, so their count is not
+  // a valid bound for this identity plane.  Legacy aggregate counters use a
+  // smaller prefix and remain covered by the same row-capacity allocation.
+  for (std::uint64_t tile = index; tile < dy_row_count; tile += blockDim.x) {
     if (dy_arrived)
       dy_arrived[tile] = 0ULL;
   }
@@ -3364,9 +3784,135 @@ __global__ void flip_validation_byte_kernel(unsigned char *storage,
     storage[byte_offset] ^= 1U;
 }
 
-__global__ void count_nonzero_bf16_kernel(
-    const transport::BFloat16 *values, std::uint64_t elements,
-    unsigned long long *nonzero_count) {
+// The production V3 path keeps dAB only in its padded reduction-major form.
+// Validation APIs historically expose a canonical row-major sample, so build
+// that redundant view after the persistent kernel and only when diagnostics
+// explicitly request it.  This kernel is never part of the steady hot path.
+__global__ void materialize_v3_canonical_dab_kernel(
+    const transport::BFloat16 *dab_transpose,
+    transport::BFloat16 *canonical_dab, const std::uint64_t *expert_row_prefix,
+    const unsigned long long *expert_padded_prefix, std::uint32_t owned_experts,
+    std::uint64_t rows, std::uint64_t intermediate,
+    std::uint64_t reduction_rows) {
+  const auto columns = 2ULL * intermediate;
+  const auto elements = rows * columns;
+  const auto stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  for (std::uint64_t index =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += stride) {
+    const auto row = index / columns;
+    const auto column = index % columns;
+    std::uint32_t begin = 0U;
+    std::uint32_t end = owned_experts + 1U;
+    while (begin < end) {
+      const auto middle = begin + (end - begin) / 2U;
+      if (expert_row_prefix[middle] <= row)
+        begin = middle + 1U;
+      else
+        end = middle;
+    }
+    const auto expert = min(begin - 1U, owned_experts - 1U);
+    const auto padded_row =
+        expert_padded_prefix[expert] + row - expert_row_prefix[expert];
+    canonical_dab[index] = dab_transpose[column * reduction_rows + padded_row];
+  }
+}
+
+// Low-perturbation dV diagnostic.  The fused epilogue already materializes
+// reduction-major dAB for dX/dW1. Canonical dAB is reconstructed by the
+// diagnostic kernel above before this comparison, outside the hot path.
+__global__ void compare_v3_dab_oracle_kernel(
+    const transport::BFloat16 *dab, const transport::BFloat16 *dab_transpose,
+    const transport::BFloat16 *oracle_dab, const transport::BFloat16 *dy,
+    const transport::BFloat16 *w2_transpose, const transport::BFloat16 *ab,
+    const float *canonical_gate, const std::uint64_t *expert_row_prefix,
+    const unsigned long long *expert_padded_prefix, std::uint32_t owned_experts,
+    std::uint64_t rows, std::uint64_t hidden, std::uint64_t intermediate,
+    std::uint64_t max_destination_rows, std::uint64_t reduction_rows,
+    BackwardDeviceStatus *status, std::uint32_t rank) {
+  const auto elements = rows * (2ULL * intermediate);
+  const auto stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  for (std::uint64_t index =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += stride) {
+    const auto row = index / (2ULL * intermediate);
+    const auto column = index % (2ULL * intermediate);
+
+    // upper_bound(expert_row_prefix, row) - 1, including zero-row experts.
+    std::uint32_t begin = 0U;
+    std::uint32_t end = owned_experts + 1U;
+    while (begin < end) {
+      const auto middle = begin + (end - begin) / 2U;
+      if (expert_row_prefix[middle] <= row)
+        begin = middle + 1U;
+      else
+        end = middle;
+    }
+    const auto expert = min(begin - 1U, owned_experts - 1U);
+    const auto padded_row =
+        expert_padded_prefix[expert] + row - expert_row_prefix[expert];
+    const auto expected = oracle_dab[index].bits;
+    const auto row_major = dab[index].bits;
+    const auto transposed =
+        dab_transpose[column * reduction_rows + padded_row].bits;
+
+    std::uint32_t field = 0U;
+    if (row_major != expected) {
+      if (transposed == expected)
+        field = 212U; // correct epilogue value; row-major overwritten later
+      else if (transposed == row_major)
+        field = 211U; // both V3 materializations agree and differ from legacy
+      else
+        field = 213U; // the two V3 materializations diverged
+    } else if (transposed != expected) {
+      field = 214U; // row-major correct, transpose path diverged
+    }
+    if (field != 0U && atomicCAS(&status->error, 0U, 1U) == 0U) {
+      // A CUDA-core scalar dot is not bitwise equivalent to tensor-core
+      // reduction, but it is an independent numerical reference for the
+      // large outliers produced by an invalid WGMMA dependency chain. Pack
+      // {scalar, transpose, row-major} into error_actual for offline decode.
+      const auto feature = column % intermediate;
+      float dv = 0.0F;
+      const auto dy_base = row * hidden;
+      const auto weight_base =
+          (static_cast<std::uint64_t>(expert) * intermediate + feature) *
+          hidden;
+      for (std::uint64_t k = 0; k < hidden; ++k)
+        dv = __fmaf_rn(bf16_bits_to_float(dy[dy_base + k].bits),
+                       bf16_bits_to_float(w2_transpose[weight_base + k].bits),
+                       dv);
+      const auto activation_index = row * intermediate + feature;
+      const auto av = bf16_bits_to_float(ab[activation_index].bits);
+      const auto bv = bf16_bits_to_float(
+          ab[max_destination_rows * intermediate + activation_index].bits);
+      const auto sigmoid = 1.0F / (1.0F + __expf(-av));
+      const auto silu = av * sigmoid;
+      const auto dv_bf16 = float_to_bf16_bits(dv);
+      const auto ds =
+          __fmul_rn(canonical_gate[row], bf16_bits_to_float(dv_bf16));
+      const auto scalar_value =
+          column < intermediate
+              ? __fmul_rn(
+                    ds, __fmul_rn(bv, sigmoid * (1.0F + av * (1.0F - sigmoid))))
+              : __fmul_rn(ds, silu);
+      const auto scalar = float_to_bf16_bits(scalar_value);
+      status->error_origin_rank = rank;
+      status->error_field = field;
+      status->error_code = static_cast<std::uint32_t>(index + 1ULL);
+      status->error_expected = expected;
+      status->error_actual =
+          static_cast<unsigned long long>(row_major) |
+          (static_cast<unsigned long long>(transposed) << 16U) |
+          (static_cast<unsigned long long>(scalar) << 32U);
+      __threadfence_system();
+    }
+  }
+}
+
+__global__ void count_nonzero_bf16_kernel(const transport::BFloat16 *values,
+                                          std::uint64_t elements,
+                                          unsigned long long *nonzero_count) {
   unsigned long long local = 0ULL;
   for (std::uint64_t index =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -3439,17 +3985,23 @@ __global__ void transpose_forward_weights_for_backward_kernel(
 #include "cuda/forward/kernel_contract.cuh"
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
-using ForwardMma =
-    typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
+using ForwardMmaNarrow =
+    typename deep_gemm::mma::sm90::BF16MMASelector<64>::type;
+using ForwardMma = typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
 using ForwardMmaWide =
     typename deep_gemm::mma::sm90::BF16MMASelector<256>::type;
-using BackwardDwMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-    256, cute::UMMA::Major::MN, cute::UMMA::Major::MN>::type;
-using BackwardDwMixedMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-    256, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
-using BackwardDwDirectMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-    256, cute::UMMA::Major::MN, cute::UMMA::Major::K>::type;
+using BackwardDwMma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<256, cute::UMMA::Major::MN,
+                                                   cute::UMMA::Major::MN>::type;
+using BackwardDwMixedMma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<256, cute::UMMA::Major::K,
+                                                   cute::UMMA::Major::MN>::type;
+using BackwardDwDirectMma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<256, cute::UMMA::Major::MN,
+                                                   cute::UMMA::Major::K>::type;
 using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
+
+#include "cuda/persistent_v3/gemm/dw_128x128_task.cuh"
 
 // FC1 consumes the same activation tile twice (the A and B projections of
 // SwiGLU).  Keep both projection accumulators live and issue the two WGMMA
@@ -3545,46 +4097,82 @@ __device__ void forward_wgmma_swiglu_tile(
   pipeline_iteration += iterations;
 }
 
-__device__ void forward_wgmma_wide_tile(
+template <class TileMma, std::uint32_t TileColumns>
+__device__ void forward_wgmma_tile(
     const CUtensorMap &activation_map, const CUtensorMap &weight_map,
     std::uint32_t activation_row, std::uint32_t weight_row,
     std::uint32_t reduction, transport::BFloat16 *smem_a_public,
     transport::BFloat16 *smem_b_public, ForwardBarrier *full_barriers,
     ForwardBarrier *empty_barriers, float *accum,
-    std::uint32_t &pipeline_iteration,
-    std::uint32_t reduction_start = 0U) {
+    std::uint32_t &pipeline_iteration, std::uint32_t reduction_start = 0U
+#if MEGAMOE_DEBUG_VALIDATE
+    ,
+    unsigned long long *debug_producer = nullptr,
+    unsigned long long *debug_math0 = nullptr,
+    unsigned long long *debug_math1 = nullptr
+#endif
+) {
   constexpr std::uint32_t kStages = 4;
   constexpr std::uint32_t kMathWarpGroups = 2;
   constexpr std::uint32_t kAStageElements = 128U * 64U;
-  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  constexpr std::uint32_t kBStageElements = TileColumns * 64U;
   const auto warpgroup = __shfl_sync(0xffffffffU, threadIdx.x / 128U, 0);
   if (warpgroup < kMathWarpGroups)
 #pragma unroll
-    for (int index = 0; index < ForwardMmaWide::kNumAccum; ++index)
+    for (int index = 0; index < TileMma::kNumAccum; ++index)
       accum[index] = 0.0F;
   const auto iterations = (reduction + 63U) / 64U;
+#if MEGAMOE_DEBUG_VALIDATE
+  const bool debug_first_tile = pipeline_iteration == 0U;
+#endif
   if (threadIdx.x == kMathWarpGroups * 128U) {
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && debug_producer)
+        *debug_producer =
+            (static_cast<unsigned long long>(iteration) << 8U) | 1ULL;
+#endif
       const auto pipeline = pipeline_iteration + iteration;
       const auto stage = pipeline % kStages;
       const auto phase = (pipeline / kStages) & 1U;
       empty_barriers[stage].wait(phase ^ 1U);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && debug_producer)
+        *debug_producer =
+            (static_cast<unsigned long long>(iteration) << 8U) | 2ULL;
+#endif
       const auto k_base = reduction_start + iteration * 64U;
       auto *smem_a = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_a_public + stage * kAStageElements);
       auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b_public + stage * kBStageElements);
-      deep_gemm::tma::copy<64, 256, 128, cutlass::bfloat16_t>(
+      deep_gemm::tma::copy<64, TileColumns, 128, cutlass::bfloat16_t>(
           &activation_map, &full_barriers[stage], smem_a, k_base,
           activation_row);
       deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b, k_base, weight_row);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && debug_producer)
+        *debug_producer =
+            (static_cast<unsigned long long>(iteration) << 8U) | 3ULL;
+#endif
       full_barriers[stage].arrive_and_expect_tx(
-          (kAStageElements + kBStageElements) *
-          sizeof(transport::BFloat16));
+          (kAStageElements + kBStageElements) * sizeof(transport::BFloat16));
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && debug_producer)
+        *debug_producer =
+            (static_cast<unsigned long long>(iteration) << 8U) | 4ULL;
+#endif
     }
   } else if (warpgroup < kMathWarpGroups) {
+#if MEGAMOE_DEBUG_VALIDATE
+    auto *debug_math = warpgroup == 0U ? debug_math0 : debug_math1;
+#endif
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
+        *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 1ULL;
+#endif
       const auto pipeline = pipeline_iteration + iteration;
       const auto stage = pipeline % kStages;
       const auto phase = (pipeline / kStages) & 1U;
@@ -3594,24 +4182,37 @@ __device__ void forward_wgmma_wide_tile(
       auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b_public + stage * kBStageElements);
       full_barriers[stage].wait(phase);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
+        *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 2ULL;
+#endif
 #pragma unroll
-      for (int index = 0; index < ForwardMmaWide::kNumAccum; ++index)
+      for (int index = 0; index < TileMma::kNumAccum; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
       deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
-      for (std::uint32_t k = 0; k < 64U / ForwardMmaWide::K; ++k) {
-        const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
-            smem_a + k * ForwardMmaWide::K, 1);
-        const auto desc_b = deep_gemm::mma::sm90::make_smem_desc(
-            smem_b + k * ForwardMmaWide::K, 1);
-        ForwardMmaWide::wgmma(desc_a, desc_b, accum, 1);
+      for (std::uint32_t k = 0; k < 64U / TileMma::K; ++k) {
+        const auto desc_a =
+            deep_gemm::mma::sm90::make_smem_desc(smem_a + k * TileMma::K, 1);
+        const auto desc_b =
+            deep_gemm::mma::sm90::make_smem_desc(smem_b + k * TileMma::K, 1);
+        TileMma::wgmma(desc_a, desc_b, accum, 1);
       }
       deep_gemm::ptx::warpgroup_commit_batch();
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
+        *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 3ULL;
+#endif
 #pragma unroll
-      for (int index = 0; index < ForwardMmaWide::kNumAccum; ++index)
+      for (int index = 0; index < TileMma::kNumAccum; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
       if (iteration != 0U) {
         deep_gemm::ptx::warpgroup_wait<1>();
+#if MEGAMOE_DEBUG_VALIDATE
+        if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
+          *debug_math =
+              (static_cast<unsigned long long>(iteration) << 8U) | 4ULL;
+#endif
         const auto completed_pipeline = pipeline_iteration + iteration - 1U;
         if ((threadIdx.x & 31U) == 0U)
           empty_barriers[completed_pipeline % kStages].arrive();
@@ -3619,6 +4220,11 @@ __device__ void forward_wgmma_wide_tile(
     }
     if (iterations != 0U) {
       deep_gemm::ptx::warpgroup_wait<0>();
+#if MEGAMOE_DEBUG_VALIDATE
+      if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
+        *debug_math =
+            (static_cast<unsigned long long>(iterations) << 8U) | 5ULL;
+#endif
       const auto final_pipeline = pipeline_iteration + iterations - 1U;
       if ((threadIdx.x & 31U) == 0U)
         empty_barriers[final_pipeline % kStages].arrive();
@@ -3720,6 +4326,93 @@ __device__ void visit_backward_accumulator_tall(float *accum,
 
 #endif
 
+// Forward normally uses uniform M128 blocks.  The latency-wavefront variant
+// preserves the same 128-row physical expert padding but exposes the first
+// physical block as two M64 compute tasks: [0,64), [64,128), followed by
+// aligned M128 tasks.  Keeping this address calculation in one helper prevents
+// Dispatch, compute, and Return from silently disagreeing about block identity.
+__device__ __forceinline__ std::uint64_t forward_expert_mblock_count(
+    const ForwardKernelArgs &a, std::uint32_t expert) {
+  const auto rows = a.dispatch.expert_row_count[expert];
+  const bool split_head = a.forward_m64_head_wavefront &&
+                          expert < a.forward_m64_head_expert_count;
+  if (!split_head)
+    return (rows + a.forward_mblock_rows - 1ULL) / a.forward_mblock_rows;
+  if (rows == 0ULL)
+    return 0ULL;
+  const auto head_blocks = rows <= 64ULL ? 1ULL : 2ULL;
+  const auto body_rows = rows > 128ULL ? rows - 128ULL : 0ULL;
+  return head_blocks + (body_rows + 127ULL) / 128ULL;
+}
+
+__device__ __forceinline__ std::uint64_t forward_expert_head_mblock_count(
+    const ForwardKernelArgs &a, std::uint32_t expert) {
+  if (!a.forward_m64_head_wavefront ||
+      expert >= a.forward_m64_head_expert_count)
+    return 0ULL;
+  const auto rows = a.dispatch.expert_row_count[expert];
+  return rows == 0ULL ? 0ULL : (rows <= 64ULL ? 1ULL : 2ULL);
+}
+
+__device__ __forceinline__ std::uint64_t forward_mblock_local_row(
+    const ForwardKernelArgs &a, std::uint32_t expert,
+    std::uint32_t local_mblock) {
+  const bool split_head = a.forward_m64_head_wavefront &&
+                          expert < a.forward_m64_head_expert_count;
+  if (!split_head)
+    return static_cast<std::uint64_t>(local_mblock) * a.forward_mblock_rows;
+  if (local_mblock < 2U)
+    return static_cast<std::uint64_t>(local_mblock) * 64ULL;
+  return 128ULL + static_cast<std::uint64_t>(local_mblock - 2U) * 128ULL;
+}
+
+__device__ __forceinline__ std::uint32_t forward_mblock_extent(
+    const ForwardKernelArgs &a, std::uint32_t expert,
+    std::uint32_t local_mblock) {
+  return a.forward_m64_head_wavefront &&
+                 expert < a.forward_m64_head_expert_count &&
+                 local_mblock < 2U
+             ? 64U
+             : a.forward_mblock_rows;
+}
+
+__device__ __forceinline__ std::uint32_t forward_mblock_valid_rows(
+    const ForwardKernelArgs &a, std::uint32_t expert,
+    std::uint32_t local_mblock) {
+  const auto local_row = forward_mblock_local_row(a, expert, local_mblock);
+  const auto remaining = a.dispatch.expert_row_count[expert] - local_row;
+  const auto extent = forward_mblock_extent(a, expert, local_mblock);
+  return static_cast<std::uint32_t>(remaining < extent ? remaining : extent);
+}
+
+enum ForwardMixedSchedulerWord : std::uint32_t {
+  kForwardHeadMblocks = 0U,
+  kForwardBodyFc1Publish = 1U,
+  kForwardBodyFc1Claim = 2U,
+  kForwardBodyFc2Publish = 3U,
+  kForwardBodyFc2Claim = 4U,
+};
+
+enum class ForwardTaskPartition : std::uint32_t {
+  All = 0U,
+  Head = 1U,
+  Body = 2U,
+};
+
+__device__ __forceinline__ unsigned long long *forward_mixed_scheduler_word(
+    const ForwardKernelArgs &a, unsigned long long *scheduler,
+    ForwardMixedSchedulerWord word) {
+  // Return-directory construction owns two arrays of one word per
+  // (remote-node, GIN-context), beginning at 16 + 2*world.  Mixed scheduling
+  // state must live after both arrays; placing it in the apparent gap before
+  // that base aliases the arrays for world=2/16 once directory scans begin.
+  const auto partitions = a.dispatch.identity.num_nodes - 1ULL;
+  const auto mixed_base = 16ULL + 2ULL * a.world +
+                          2ULL * partitions * a.gin_context_count;
+  return scheduler + mixed_base +
+         static_cast<std::uint32_t>(word);
+}
+
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
 // Map the immutable M-block task space in the same wavefront order used by
 // Notify packet priorities: local M tile first, then expert.  This lets the
@@ -3728,18 +4421,67 @@ __device__ void visit_backward_accumulator_tall(float *accum,
 __device__ std::uint32_t forward_wavefront_mblock_expert(
     const ForwardKernelArgs &a, std::uint64_t ordinal,
     std::uint64_t &local_mblock) {
+  if (a.forward_m64_head_wavefront) {
+    const auto head_experts =
+        min(a.forward_m64_head_expert_count,
+            a.dispatch.sizes.owned_expert_count);
+    // Keep every M64 task contiguous at the head of the immutable mapping so
+    // the head and body kernels can use independent monotonic queue cursors.
+    for (std::uint32_t expert = 0; expert < head_experts; ++expert) {
+      const auto blocks = forward_expert_head_mblock_count(a, expert);
+      for (std::uint64_t tile = 0; tile < blocks; ++tile) {
+        if (ordinal == 0ULL) {
+          local_mblock = tile;
+          return expert;
+        }
+        --ordinal;
+      }
+    }
+
+    // The body returns to M128 wavefront order. Split experts start at logical
+    // block 2 (physical row 128); unsplit experts start at block 0.
+    std::uint64_t max_body_blocks = 0ULL;
+    for (std::uint32_t expert = 0;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      const auto blocks = forward_expert_mblock_count(a, expert);
+      const auto skipped = expert < head_experts
+                               ? forward_expert_head_mblock_count(a, expert)
+                               : 0ULL;
+      const auto body_blocks = blocks - skipped;
+      max_body_blocks = body_blocks > max_body_blocks ? body_blocks
+                                                       : max_body_blocks;
+    }
+    for (std::uint64_t body_tile = 0; body_tile < max_body_blocks;
+         ++body_tile) {
+      for (std::uint32_t expert = 0;
+           expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+        const auto blocks = forward_expert_mblock_count(a, expert);
+        const auto skipped = expert < head_experts
+                                 ? forward_expert_head_mblock_count(a, expert)
+                                 : 0ULL;
+        if (body_tile >= blocks - skipped)
+          continue;
+        if (ordinal == 0ULL) {
+          local_mblock = body_tile + skipped;
+          return expert;
+        }
+        --ordinal;
+      }
+    }
+    local_mblock = 0ULL;
+    return a.dispatch.sizes.owned_expert_count;
+  }
+
   std::uint64_t max_blocks = 0ULL;
   for (std::uint32_t expert = 0;
        expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-    const std::uint64_t blocks =
-        (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+    const auto blocks = forward_expert_mblock_count(a, expert);
     max_blocks = blocks > max_blocks ? blocks : max_blocks;
   }
   for (std::uint64_t tile = 0; tile < max_blocks; ++tile) {
     for (std::uint32_t expert = 0;
          expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-      const auto blocks =
-          (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
+      const auto blocks = forward_expert_mblock_count(a, expert);
       if (tile >= blocks)
         continue;
       if (ordinal == 0ULL) {
@@ -3757,18 +4499,51 @@ __device__ std::uint32_t forward_wavefront_mblock_expert(
 
 __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
   return a.cancel_epoch &&
-         atomicAdd_system(
-             const_cast<unsigned long long *>(a.cancel_epoch), 0ULL) ==
-             a.epoch;
+         atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
+                          0ULL) == a.epoch;
 }
 
 template <bool StaticLocal>
-__device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
-                                         std::uint32_t expert,
-                                         std::uint64_t local_row,
-                                         std::uint32_t valid_rows,
-                                         transport_state::GenerationCompletionVector
-                                             *completion) {
+__device__ __forceinline__ bool
+forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
+                          std::uint64_t local_row, std::uint32_t valid_rows) {
+  if constexpr (StaticLocal)
+    return true;
+  if (!a.use_gin || valid_rows == 0U)
+    return true;
+  const auto end_row = local_row + valid_rows;
+  const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
+  const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
+  auto *arrived = peer_at<unsigned long long>(a.local_base,
+                                               a.x_arrived_rows_offset);
+  std::uint64_t tile_row = 0ULL;
+  for (auto tile = tile_begin; tile < tile_end; ++tile) {
+    const auto expected = a.dispatch.mtile_expected_rows[tile];
+    const auto tile_row_end = tile_row + expected;
+    if (tile_row_end <= local_row) {
+      tile_row = tile_row_end;
+      continue;
+    }
+    if (tile_row >= end_row)
+      break;
+    unsigned long long total = 0ULL;
+    for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+          arrived[tile * a.local_world_size + rail]);
+      total += ready.load(::cuda::memory_order_acquire);
+    }
+    if (total < expected)
+      return false;
+    tile_row = tile_row_end;
+  }
+  return true;
+}
+
+template <bool StaticLocal>
+__device__ void wait_forward_mblock_rows(
+    const ForwardKernelArgs &a, std::uint32_t expert, std::uint64_t local_row,
+    std::uint32_t valid_rows,
+    transport_state::GenerationCompletionVector *completion) {
   if constexpr (StaticLocal)
     return;
   if (!a.use_gin || valid_rows == 0U)
@@ -3782,8 +4557,8 @@ __device__ void wait_forward_mblock_rows(const ForwardKernelArgs &a,
   const auto end_row = local_row + valid_rows;
   const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
   const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
-  auto *arrived = peer_at<unsigned long long>(a.local_base,
-                                               a.x_arrived_rows_offset);
+  auto *arrived =
+      peer_at<unsigned long long>(a.local_base, a.x_arrived_rows_offset);
   std::uint64_t tile_row = 0ULL;
   for (auto tile = tile_begin; tile < tile_end; ++tile) {
     const auto expected = a.dispatch.mtile_expected_rows[tile];
@@ -3900,7 +4675,7 @@ __device__ void publish_elected_terminal(
 __device__ void forward_publish_progress(const ForwardKernelArgs &a,
                                          std::uint32_t word,
                                          unsigned long long value) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
   if (a.progress != nullptr && blockIdx.x == 0U && threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> field(
         a.progress[word]);
@@ -3920,55 +4695,29 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
   return enabled;
 }
 
-#if __has_include(<nccl_device.h>)
-[[maybe_unused]] __device__ __forceinline__ void
-pack_forward_return_chunk(
-    const ForwardKernelArgs &a, const ForwardReturnChunkRecord &chunk,
-    const unsigned long long *forward_return_fragment_index) {
-  auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-  auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-      window_bytes + a.gin_receive_fanout_offset);
-  auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
-      window_bytes + a.gin_return_staging_offset);
-  const auto source_partition =
-      chunk.source_node < a.node ? chunk.source_node : chunk.source_node - 1U;
-  const auto partition_base = source_partition * a.max_tokens_per_rank *
-                              a.dispatch.identity.top_k;
-  const auto packed_base = partition_base + chunk.row_begin;
-  const auto vector_count = a.hidden / 8ULL;
-  for (std::uint64_t item = threadIdx.x;
-       item < static_cast<std::uint64_t>(chunk.row_count) * vector_count;
-       item += blockDim.x) {
-    const auto row_index = item / vector_count;
-    const auto vector = item % vector_count;
-    const auto fragment = forward_return_fragment_index[
-        partition_base + chunk.row_begin + row_index];
-    const auto target = receive_fanout[partition_base + fragment];
-    const auto destination =
-        a.node * a.local_world_size + target.destination_local_rank;
-    const auto *destination_output = peer_at<transport::BFloat16>(
-        a.peer_bases[destination], a.forward_output_rows_offset);
-    reinterpret_cast<uint4 *>(return_staging)
-        [(packed_base + row_index) * vector_count + vector] =
-            reinterpret_cast<const uint4 *>(destination_output)
-                [target.dst_row * vector_count + vector];
-  }
-  __threadfence_system();
-  __syncthreads();
-}
-#endif
+#include "cuda/persistent_v3/forward/reduce_queue.cuh"
+#include "cuda/persistent_v3/forward/return_pipeline.cuh"
+#include "cuda/persistent_v3/forward/dispatch_pipeline.cuh"
+#include "cuda/persistent_v3/forward/finalize_pipeline.cuh"
 
-template <bool StaticLocal>
-__global__ __launch_bounds__(384, 1) void
-local_p2p_forward_megakernel(
+enum class ForwardKernelRole : std::uint8_t {
+  Combined,
+  TransportOnly,
+  ComputeOnly,
+};
+
+#include "cuda/persistent_v3/forward/compute_kernel.cuh"
+
+template <bool StaticLocal,
+          ForwardKernelRole KernelRole = ForwardKernelRole::Combined>
+__global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
-  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
-                          a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
@@ -3976,24 +4725,52 @@ local_p2p_forward_megakernel(
       storage + 4U * 128U * 64U * sizeof(transport::BFloat16));
 #endif
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-  auto *full_barriers = reinterpret_cast<ForwardBarrier *>(
-      storage + (4U * 128U * 64U + 4U * 256U * 64U) *
-                    sizeof(transport::BFloat16));
-  auto *empty_barriers = full_barriers + 4;
+  // FC1 and FC2 reuse the large tile storage, but they must not reuse an
+  // mbarrier object. Reinitializing a transaction barrier after a long TMA /
+  // WGMMA phase is not a valid lifetime transition while an async-proxy
+  // completion may still reference its address. Keep the tiny control objects
+  // disjoint and initialize both sets once.
+  auto *fc1_full_barriers = reinterpret_cast<ForwardBarrier *>(
+      storage +
+      (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16));
+  auto *fc1_empty_barriers = fc1_full_barriers + 3;
+  auto *fc2_full_barriers = fc1_empty_barriers + 3;
+  auto *fc2_empty_barriers = fc2_full_barriers + 4;
 #endif
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   forward_publish_progress(a, kForwardEntered, a.epoch);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   const auto cluster = cg::this_cluster();
 #endif
-  auto *canonical = peer_at<transport::BFloat16>(
-      a.local_base, a.canonical_rows_offset);
-  auto *forward_output = peer_at<transport::BFloat16>(
-      a.local_base, a.forward_output_rows_offset);
-  auto *headers = peer_at<LocalP2pRouteHeader>(
-      a.local_base, a.direct_headers_offset);
-  auto *scheduler = peer_at<unsigned long long>(
-      a.local_base, a.forward_scheduler_offset);
+  auto *canonical =
+      peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
+  auto *forward_output =
+      peer_at<transport::BFloat16>(a.local_base, a.forward_output_rows_offset);
+  auto *headers =
+      peer_at<LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
+  auto *scheduler =
+      peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
+  const auto forward_rdma_ctas =
+      a.gin_context_count < gridDim.x ? a.gin_context_count : gridDim.x;
+  const auto configured_relay_ctas = a.forward_relay_cta_count;
+  const auto relay_cta_capacity = gridDim.x - forward_rdma_ctas;
+  const auto forward_relay_ctas = configured_relay_ctas < relay_cta_capacity
+                                      ? configured_relay_ctas
+                                      : relay_cta_capacity;
+  const auto forward_relay_cta_begin = forward_rdma_ctas;
+  const auto forward_compute_cta_begin =
+      forward_relay_cta_begin + forward_relay_ctas;
+  const bool stream_remote_dispatch =
+      KernelRole == ForwardKernelRole::TransportOnly &&
+      remote_backend_enabled<StaticLocal>(a.use_gin) &&
+      a.dispatch.identity.num_nodes == 2U &&
+      forward_rdma_ctas == persistent_v3::kRdmaCtaCount &&
+      forward_relay_ctas == configured_relay_ctas &&
+      forward_relay_ctas >= persistent_v3::kRdmaCtaCount &&
+      forward_relay_ctas % persistent_v3::kRdmaCtaCount == 0U;
+  const bool stream_remote_return_pipeline = stream_remote_dispatch;
+  auto *forward_v3_control = peer_at<persistent_v3::ForwardPipelineControl>(
+      a.local_base, a.forward_v3_control_offset);
   transport_state::GenerationCompletionVector *completion = nullptr;
   transport_state::ContextCompletionRecord *context_completion = nullptr;
   if constexpr (!StaticLocal) {
@@ -4003,31 +4780,23 @@ local_p2p_forward_megakernel(
       context_completion =
           static_cast<transport_state::ContextCompletionRecord *>(
               a.peer_bases[a.world + 1U]);
-#if MEGAMOE_DEBUG_VALIDATE
-      // Timeout diagnostics use mapped, session-owned storage.  Debug kernels
-      // update it in place so the host can identify a stalled expected task
-      // without waiting for a D2H copy behind the persistent kernel.
-      if (a.progress != nullptr) {
-        auto *debug_words = a.progress + kForwardProgressWords;
-        completion = reinterpret_cast<
-            transport_state::GenerationCompletionVector *>(debug_words);
-        context_completion = reinterpret_cast<
-            transport_state::ContextCompletionRecord *>(
-            debug_words + transport_state::kGenerationCompletionWords);
-      }
-#endif
     }
   }
   constexpr std::size_t kForwardGemmSmemBytes =
-      (4U * 128U * 64U + 4U * 256U * 64U) *
-          sizeof(transport::BFloat16) +
-      8U * sizeof(std::uint64_t);
-  [[maybe_unused]] auto *return_rows_by_source = reinterpret_cast<unsigned int *>(
-      storage + kForwardGemmSmemBytes);
-  auto *claims = peer_at<unsigned long long>(
-      a.local_base, a.forward_task_claim_offset);
-  auto *fc1_done = peer_at<unsigned long long>(
-      a.local_base, a.forward_fc1_done_offset);
+      (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16) +
+      16U * sizeof(std::uint64_t);
+  [[maybe_unused]] auto *return_rows_by_source =
+      reinterpret_cast<unsigned int *>(storage + kForwardGemmSmemBytes);
+  auto *claims =
+      peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
+  auto *fc1_done =
+      peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
+  auto *fc1_published = peer_at<unsigned long long>(
+      a.local_base, a.forward_fc1_published_offset);
+  auto *forward_reduce_route_count = peer_at<unsigned int>(
+      a.local_base, a.forward_reduce_route_count_offset);
+  auto *forward_reduce_ready_token = peer_at<unsigned long long>(
+      a.local_base, a.forward_reduce_ready_token_offset);
   auto *forward_output_ready_epoch = peer_at<unsigned long long>(
       a.local_base, a.forward_output_ready_epoch_offset);
   auto *forward_return_chunks = peer_at<ForwardReturnChunkRecord>(
@@ -4040,1169 +4809,1070 @@ local_p2p_forward_megakernel(
       a.local_base, a.forward_return_fragment_index_offset);
   auto *forward_return_source_compact_index = peer_at<unsigned long long>(
       a.local_base, a.forward_return_source_compact_index_offset);
+  auto *forward_return_source_route_index = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_source_route_index_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
   auto *ab_cache = a.forward_ab_cache_offset == 0
                        ? static_cast<transport::BFloat16 *>(nullptr)
                        : peer_at<transport::BFloat16>(
                              a.local_base, a.forward_ab_cache_offset);
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status->start_clock = device_globaltimer_ns();
-    // Transport-only counters are unused by Forward and serve as first-start
-    // clocks without growing the pooled status allocation.
-    status->dispatch_blocks_done = ~0ULL; // first FC2 tile
-    status->relay_blocks_done = ~0ULL;    // first returned M-block
-    status->reduced_tokens = ~0ULL;       // first reduced token
-    scheduler[0] = scheduler[1] = scheduler[2] = scheduler[3] = 0ULL;
-    for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert)
-      scheduler[3] +=
-          (a.dispatch.expert_row_count[expert] + 127ULL) / 128ULL;
-    scheduler[4U + a.world] = 0ULL;
-    scheduler[5U + 2ULL * a.world] = 0ULL; // GIN headers ready contexts
-    scheduler[6U + 2ULL * a.world] = 0ULL; // Return directory ready epoch
-    if constexpr (!StaticLocal) {
-      if (a.use_gin) {
-        completion->generation = a.dispatch.identity.generation;
-        completion->epoch = a.epoch;
+  if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      status->start_clock = device_globaltimer_ns();
+      // Transport-only counters are unused by Forward and serve as first-start
+      // clocks without growing the pooled status allocation.
+      status->dispatch_blocks_done = ~0ULL; // first FC2 tile
+      status->relay_blocks_done = ~0ULL;    // first returned M-block
+      status->reduced_tokens = ~0ULL;       // first reduced token
+      status->fc1_start_clock = ~0ULL;
+      scheduler[0] = scheduler[1] = scheduler[2] = scheduler[3] = 0ULL;
+      auto *head_mblocks = forward_mixed_scheduler_word(
+          a, scheduler, kForwardHeadMblocks);
+      *head_mblocks = 0ULL;
+      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Publish) =
+          0ULL;
+      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Claim) = 0ULL;
+      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Publish) =
+          0ULL;
+      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Claim) = 0ULL;
+      for (std::uint32_t expert = 0;
+           expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+        scheduler[3] += forward_expert_mblock_count(a, expert);
+        *head_mblocks += forward_expert_head_mblock_count(a, expert);
+      }
+      scheduler[4U + a.world] = 0ULL;
+      scheduler[5U + 2ULL * a.world] = 0ULL;  // GIN headers ready contexts
+      scheduler[6U + 2ULL * a.world] = 0ULL;  // Return directory ready epoch
+      scheduler[7U + 2ULL * a.world] = 0ULL;  // Relay copy barrier arrivals
+      scheduler[8U + 2ULL * a.world] = 0ULL;  // Compute setup ready epoch
+      scheduler[9U + 2ULL * a.world] = 0ULL;  // Return-directory totals barrier
+      scheduler[10U + 2ULL * a.world] = 0ULL; // Return-directory map barrier
+      scheduler[11U + 2ULL * a.world] = 0ULL; // FC1-complete M-block count
+      scheduler[12U + 2ULL * a.world] = 0ULL; // Published FC1 queue tail
+      scheduler[13U + 2ULL * a.world] = 0ULL; // Completed M-block queue head
+      scheduler[14U + 2ULL * a.world] = 0ULL; // Directory fragments barrier
+      scheduler[15U + 2ULL * a.world] = 0ULL; // Reserved directory scratch
+      auto *direct_issued =
+          forward_return_detail::direct_issued_counts(a, scheduler);
+      for (std::uint32_t context = 0; context < a.gin_context_count;
+           ++context)
+        direct_issued[context] = 0ULL;
+      forward_return_detail::direct_fragment_tail(a, scheduler) = 0ULL;
+      forward_return_detail::direct_mblocks_complete(a, scheduler) = 0ULL;
+      if constexpr (!StaticLocal) {
+        if (a.use_gin) {
+          completion->generation = a.dispatch.identity.generation;
+          completion->epoch = a.epoch;
 #if MEGAMOE_DEBUG_VALIDATE
-        completion->first_waiting_tile = ~0ULL;
+          completion->first_waiting_tile = ~0ULL;
 #endif
-        unsigned long long dispatch_waves = 0ULL;
-        for (std::uint64_t wave = 0; wave < a.dispatch_waves.wave_count;
-             ++wave)
-          if (a.dispatch_waves.destination_node[wave] != a.node)
-            ++dispatch_waves;
-        const auto fc1_ntiles = (a.intermediate + 127ULL) / 128ULL;
-        const auto fc2_ntiles = (a.hidden + 255ULL) / 256ULL;
-        completion_task(completion,
-                        transport_state::TaskClass::DispatchWave)
-            .expected = dispatch_waves;
-        unsigned long long relay_packets = 0ULL;
-        for (std::uint32_t index = 0;
-             index < a.dispatch.sizes.incoming_signal_count; ++index) {
-          const auto signal = a.dispatch.incoming_proxy_signals[index];
-          if (signal.source_node != a.node)
-            relay_packets += signal.expected_packets;
+          unsigned long long dispatch_waves = 0ULL;
+          for (std::uint64_t wave = 0; wave < a.dispatch_waves.wave_count;
+               ++wave)
+            if (a.dispatch_waves.destination_node[wave] != a.node)
+              ++dispatch_waves;
+          const auto fc1_ntiles = (a.intermediate + 127ULL) / 128ULL;
+          const auto fc2_ntiles = (a.hidden + 255ULL) / 256ULL;
+          completion_task(completion, transport_state::TaskClass::DispatchWave)
+              .expected = dispatch_waves;
+          unsigned long long relay_packets = 0ULL;
+          for (std::uint32_t index = 0;
+               index < a.dispatch.sizes.incoming_signal_count; ++index) {
+            const auto signal = a.dispatch.incoming_proxy_signals[index];
+            if (signal.source_node != a.node)
+              relay_packets += signal.expected_packets;
+          }
+          completion_task(completion, transport_state::TaskClass::RelayWave)
+              .expected = relay_packets;
+          completion_task(completion, transport_state::TaskClass::Fc1OrDv)
+              .expected = scheduler[3] * fc1_ntiles;
+          completion_task(completion, transport_state::TaskClass::Fc2OrDx)
+              .expected = scheduler[3] * fc2_ntiles;
+          completion_task(completion, transport_state::TaskClass::SourceArrival)
+              .expected = a.dispatch.sizes.route_count;
+          completion_task(completion, transport_state::TaskClass::Reduce)
+              .expected = a.dispatch.identity.num_tokens;
+          completion_task(completion, transport_state::TaskClass::Return)
+              .expected = 0ULL;
+          completion->return_local_completion_expected = 0ULL;
+          completion->directory_expected =
+              static_cast<unsigned long long>(a.dispatch.identity.num_nodes -
+                                              1U) *
+              a.gin_context_count;
+          completion->dispatch_local_completion_expected =
+              completion->directory_expected + dispatch_waves;
         }
-        completion_task(completion, transport_state::TaskClass::RelayWave)
-            .expected = relay_packets;
-        completion_task(completion, transport_state::TaskClass::Fc1OrDv)
-            .expected = scheduler[3] * fc1_ntiles;
-        completion_task(completion, transport_state::TaskClass::Fc2OrDx)
-            .expected = scheduler[3] * fc2_ntiles;
-        completion_task(completion,
-                        transport_state::TaskClass::SourceArrival)
-            .expected = a.dispatch.sizes.route_count;
-        completion_task(completion, transport_state::TaskClass::Reduce)
-            .expected = a.dispatch.identity.num_tokens;
-        completion_task(completion, transport_state::TaskClass::Return)
-            .expected = 0ULL;
-        completion->return_local_completion_expected = 0ULL;
-        completion->directory_expected =
-            static_cast<unsigned long long>(
-                a.dispatch.identity.num_nodes - 1U) *
-            a.gin_context_count;
-        completion->dispatch_local_completion_expected =
-            completion->directory_expected + dispatch_waves;
       }
     }
-  }
-  if (threadIdx.x == 0) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    const auto cluster_size = cluster.dim_blocks().x * cluster.dim_blocks().y *
-                              cluster.dim_blocks().z;
-    atomicMax(&status->runtime_cluster_size, cluster_size);
-    const auto cluster_rank = cluster.block_rank();
-    if (cluster_rank < 64U)
-      atomicOr(&status->cluster_rank_mask, 1ULL << cluster_rank);
-#else
-    atomicMax(&status->runtime_cluster_size, 1U);
-    atomicOr(&status->cluster_rank_mask, 1ULL);
-#endif
-  }
-  // One completion word per destination->source rank replaces a system-scope
-  // signal for every route.  The high word is immutable expected rows; return
-  // CTAs add to the low word after their peer stores have been fenced.
-  if (blockIdx.x == 0 && threadIdx.x < a.world) {
-    unsigned long long expected = 0;
-    for (std::uint32_t local_expert = 0;
-         local_expert < a.dispatch.sizes.owned_expert_count; ++local_expert) {
-      const auto expert = a.dispatch.owned_expert_ids[local_expert];
-      expected += a.dispatch.source_expert_count[
-          static_cast<std::uint64_t>(threadIdx.x) *
-              a.dispatch.identity.num_experts +
-          expert];
-    }
-    scheduler[4U + threadIdx.x] = expected << 32U;
-  }
-  for (std::uint64_t mtile =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       mtile < a.dispatch.sizes.mtile_count;
-       mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    fc1_done[mtile] = a.epoch << 32U;
-  // The same allocation is a generation-local row->(proxy,chunk) map for
-  // remote Return. Clear only the actual canonical rows; peer proxies fill
-  // remote-route entries after consuming the immutable Dispatch directory.
-  for (std::uint64_t row =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       row < a.dispatch.sizes.incoming_row_count;
-       row += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    forward_output_ready_epoch[row] = 0ULL;
-  grid.sync();
-  forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-  const auto setup_fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
-  const auto setup_fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
-  const auto setup_mblocks = scheduler[3];
-  // The first words are an immutable expert/local-M lookup in Notify's M-tile
-  // wavefront order. Task-state words follow it and every individual task has
-  // the only legal transitions
-  // WAITING(0) -> CLAIMED(1) -> COMPLETED(2).
-  for (std::uint64_t mblock =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       mblock < setup_mblocks;
-       mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
-    std::uint64_t local_mblock = 0;
-    const auto expert =
-        forward_wavefront_mblock_expert(a, mblock, local_mblock);
-    claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
-                     static_cast<std::uint32_t>(local_mblock);
-  }
-  const auto setup_task_count =
-      setup_mblocks * (setup_fc1_ntiles + setup_fc2_ntiles);
-  for (std::uint64_t task =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       task < setup_task_count;
-       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    claims[setup_mblocks + task] = 0ULL;
-  grid.sync();
-#endif
-
-  // Socket correctness mode has already placed every incoming activation and
-  // canonical header through host-enqueued NCCL Send/Recv. It deliberately
-  // bypasses the peer/G​IN dispatch phase while retaining the exact FC core.
-  if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
-    // Local rows use the frozen CUDA-IPC fast path. Cross-node rows are packed
-    // once per (token,node) by the same-rail proxy path below.
-    unsigned long long dispatch_peer_rows = 0ULL;
-#if MEGAMOE_DEVICE_TIMELINE
-    bool timeline_x_local_recorded = false;
-#endif
-    for (std::uint64_t route = blockIdx.x;
-         route < a.dispatch.sizes.route_count; route += gridDim.x) {
-    const auto destination = a.dispatch.route_dst_rank[route];
-    if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-        destination / a.local_world_size != a.node)
-      continue;
-    const auto row = a.dispatch.route_dst_row[route];
-    const auto token = route / a.dispatch.identity.top_k;
-    auto *destination_base = a.peer_bases[destination];
-    auto *destination_rows = peer_at<transport::BFloat16>(
-        destination_base, a.canonical_rows_offset);
-    const auto *source = a.input + token * a.hidden;
-    auto *target = destination_rows + row * a.hidden;
-    const auto *source128 = reinterpret_cast<const uint4 *>(source);
-    auto *target128 = reinterpret_cast<uint4 *>(target);
-    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
-         vector += blockDim.x)
-      target128[vector] = source128[vector];
-    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-      // Every lane's row stores precede the exact destination M-tile row
-      // increment.  The destination compute worker acquires this counter; no
-      // packet/wave signal is itself interpreted as tile readiness.
-      __threadfence_system();
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        auto *arrived = peer_at<unsigned long long>(
-            destination_base, a.x_arrived_rows_offset);
-        const auto rail = a.rank % a.local_world_size;
-        ::cuda::atomic_ref<unsigned long long,
-                           ::cuda::thread_scope_system>
-            counter(arrived[a.dispatch_waves.route_dst_mtile[route] *
-                                a.local_world_size +
-                            rail]);
-        counter.fetch_add(1ULL, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
-        atomicAdd(&completion->local_rows_published, 1ULL);
-        const auto tile = a.dispatch_waves.route_dst_mtile[route];
-        if (tile < 64U)
-          atomicOr(&completion->published_tile_mask, 1ULL << tile);
-#endif
-      }
-      __syncthreads();
-    }
-#if MEGAMOE_DEVICE_TIMELINE
-    __syncthreads();
-    if (!timeline_x_local_recorded) {
-      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible, GinDispatch,
-                              0U, route, a.epoch);
-      timeline_x_local_recorded = true;
-    }
-#endif
     if (threadIdx.x == 0) {
-      auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-          destination_base, a.direct_headers_offset);
-      destination_headers[row] = LocalP2pRouteHeader{
-          transport::kActivationTransportSchemaVersion,
-          a.rank, destination, 0U, a.dispatch.identity.generation, a.epoch,
-          route, route, token, row, a.dispatch.expert_id[route],
-          static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
-      if (destination != a.rank)
-        ++dispatch_peer_rows;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      const auto cluster_size = cluster.dim_blocks().x *
+                                cluster.dim_blocks().y * cluster.dim_blocks().z;
+      atomicMax(&status->runtime_cluster_size, cluster_size);
+      const auto cluster_rank = cluster.block_rank();
+      if (cluster_rank < 64U)
+        atomicOr(&status->cluster_rank_mask, 1ULL << cluster_rank);
+#else
+      atomicMax(&status->runtime_cluster_size, 1U);
+      atomicOr(&status->cluster_rank_mask, 1ULL);
+#endif
     }
-    }
-#if __has_include(<nccl_device.h>)
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+    // Block 0 publishes the generation-local scheduler bounds and resets all
+    // queue cursors above.  Every transport CTA must observe those values
+    // before using scheduler[3] as the extent of the parallel initialization
+    // below; otherwise a recycled generation can leave stale ready-queue
+    // entries when the forward M-block shape changes (notably M128 -> M64).
+    // This rendezvous is confined to the fixed transport grid and precedes
+    // compute setup publication, so it is not an FC1/FC2 pipeline barrier.
     grid.sync();
-    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        window_bytes + a.gin_send_header_offset);
-    auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        window_bytes + a.gin_send_fanout_offset);
-    auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
-        window_bytes + a.gin_send_payload_offset);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-#if MEGAMOE_DEVICE_TIMELINE
-    unsigned long long dispatch_pack_thread_bytes = 0ULL;
-    __shared__ unsigned long long dispatch_pack_cta_bytes;
-    if (threadIdx.x == 0U)
-      dispatch_pack_cta_bytes = 0ULL;
-    __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch, 0U,
-                            0ULL, a.epoch);
-#endif
-    for (std::uint64_t item = global_thread;
-         item < a.dispatch.sizes.packet_count * vector_count;
-         item += global_threads) {
-      const auto wave_position = item / vector_count;
-      const auto vector = item % vector_count;
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      reinterpret_cast<uint4 *>(send_payload)[wave_position * vector_count +
-                                               vector] =
-          reinterpret_cast<const uint4 *>(a.input)[
-              descriptor.local_token_id * vector_count + vector];
-#if MEGAMOE_DEVICE_TIMELINE
-      dispatch_pack_thread_bytes += sizeof(uint4);
-#endif
+    // One completion word per destination->source rank replaces a system-scope
+    // signal for every route.  The high word is immutable expected rows; return
+    // CTAs add to the low word after their peer stores have been fenced.
+    if (blockIdx.x == 0 && threadIdx.x < a.world) {
+      unsigned long long expected = 0;
+      for (std::uint32_t local_expert = 0;
+           local_expert < a.dispatch.sizes.owned_expert_count; ++local_expert) {
+        const auto expert = a.dispatch.owned_expert_ids[local_expert];
+        expected +=
+            a.dispatch
+                .source_expert_count[static_cast<std::uint64_t>(threadIdx.x) *
+                                         a.dispatch.identity.num_experts +
+                                     expert];
+      }
+      scheduler[4U + threadIdx.x] = expected << 32U;
     }
-    for (std::uint64_t packed = global_thread;
-         packed < a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
-         packed += global_threads) {
-      const auto wave_position = packed / a.dispatch.identity.top_k;
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto fanout_slot = packed % a.dispatch.identity.top_k;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (fanout_begin + fanout_slot < fanout_end)
-        send_fanout[packed] =
-            a.dispatch.packet_fanout[fanout_begin + fanout_slot];
-#if MEGAMOE_DEVICE_TIMELINE
-      if (fanout_begin + fanout_slot < fanout_end)
-        dispatch_pack_thread_bytes += sizeof(DeviceFanoutRecord);
-#endif
+    for (std::uint64_t mtile =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         mtile < scheduler[3];
+         mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+      fc1_done[mtile] = a.epoch << 32U;
+      fc1_published[mtile] = 0ULL;
     }
-    for (std::uint64_t wave_position = global_thread;
-         wave_position < a.dispatch.sizes.packet_count;
-         wave_position += global_threads) {
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      send_headers[wave_position] = LocalP2pRouteHeader{
-          transport::kActivationTransportSchemaVersion,
-          a.rank,
-          descriptor.proxy_rank,
-          descriptor.channel,
-          a.dispatch.identity.generation,
-          a.epoch,
-          wave_position,
-          fanout_end - fanout_begin,
-          descriptor.local_token_id,
-          wave_position * a.dispatch.identity.top_k,
-          0,
-          0};
-#if MEGAMOE_DEVICE_TIMELINE
-      dispatch_pack_thread_bytes += sizeof(LocalP2pRouteHeader);
-#endif
+    // The same allocation is a generation-local row->(proxy,chunk) map for
+    // remote Return. Clear only the actual canonical rows; peer proxies fill
+    // remote-route entries after consuming the immutable Dispatch directory.
+    for (std::uint64_t row =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < a.dispatch.sizes.incoming_row_count;
+         row += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+      forward_output_ready_epoch[row] = 0ULL;
+    if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
+      for (std::uint64_t token =
+               static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+               threadIdx.x;
+           token < a.dispatch.identity.num_tokens;
+           token += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        forward_reduce_route_count[token] = 0U;
+        if (a.forward_dynamic_reduce_queue)
+          forward_reduce_ready_token[token] = 0ULL;
+      }
     }
-#if MEGAMOE_DEVICE_TIMELINE
-    atomicAdd(&dispatch_pack_cta_bytes, dispatch_pack_thread_bytes);
-    __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackCtaBytes, GinDispatch, 0U,
-                            dispatch_pack_cta_bytes, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch, 0U,
-                            dispatch_pack_cta_bytes, a.epoch);
-#endif
-    // GIN's device DMA reads this window after the grid-wide producers have
-    // populated it. A cooperative grid barrier orders CUDA threads but does
-    // not by itself publish their stores to a system-scope device backend.
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPacketReady, GinDispatch,
-                            blockIdx.x < a.gin_context_count ? blockIdx.x : 0U,
-                            a.dispatch.sizes.packet_count, a.epoch);
-    __threadfence_system();
+    if (stream_remote_dispatch) {
+      auto *control_words =
+          reinterpret_cast<unsigned long long *>(forward_v3_control);
+      constexpr auto control_words_count =
+          sizeof(persistent_v3::ForwardPipelineControl) /
+          sizeof(unsigned long long);
+      for (std::uint64_t word =
+               static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+               threadIdx.x;
+           word < control_words_count;
+           word += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        control_words[word] = 0ULL;
+    }
     grid.sync();
-  }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x < a.gin_context_count) {
-    const auto context = static_cast<std::uint32_t>(blockIdx.x);
-    const ncclGin gin(a.gin_dev_comm, context);
-    const auto rail = ncclTeamRail(a.gin_dev_comm);
-    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
-        window_bytes + a.gin_send_dispatch_directory_offset);
-    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        window_bytes + a.gin_send_header_offset);
-#if MEGAMOE_DEBUG_VALIDATE
-    auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        window_bytes + a.gin_send_fanout_offset);
-#endif
-    // The owner-side initialization kernel only rendezvous with CUDA-IPC
-    // peers on this node.  A remote same-rail producer can otherwise enter
-    // this kernel first, publish an exact M-tile row increment, and have that
-    // increment erased when the slower destination initializes its local
-    // x_arrived_rows storage.  Signal 2 is reserved for a fixed-width,
-    // per-context generation-ready handshake.  It runs once before any
-    // Dispatch payload put and therefore adds no per-wave or per-task work.
-    //
-    // Reuse each context's immutable directory slot as the eight-byte DMA
-    // source/destination: the real directory record is written only after the
-    // handshake completes, and Dispatch signal 0 orders that later record.
-    if (threadIdx.x == 0U) {
-      unsigned long long setup_peers = 0ULL;
-      for (std::uint32_t remote_node = 0;
-           remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
-        if (remote_node == a.node)
-          continue;
-        const auto remote_partition =
-            remote_node < a.node ? remote_node : remote_node - 1U;
-        const auto source_partition =
-            a.node < remote_node ? a.node : a.node - 1U;
-        const auto directory_index =
-            remote_partition * a.gin_context_count + context;
-        const auto remote_directory_index =
-            source_partition * a.gin_context_count + context;
-        send_directory[directory_index] = GinDispatchContextRecord{
-            a.dispatch.identity.generation, a.epoch, 0ULL, 0U, 0U};
-        __threadfence_system();
-        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                a.gin_receive_dispatch_directory_offset +
-                    remote_directory_index *
-                        sizeof(GinDispatchContextRecord),
-                a.gin_window, a.gin_send_dispatch_directory_offset +
-                                  directory_index *
-                                      sizeof(GinDispatchContextRecord),
-                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{2},
-                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
-                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-        ++setup_peers;
-      }
-      if (setup_peers != 0ULL) {
-        gin.waitCounter(ncclCoopThread{}, 0, setup_peers);
-        gin.resetCounter(0);
-        gin.waitSignal(ncclCoopThread{}, 2, setup_peers);
-      }
+    forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+    const auto setup_fc1_ntiles =
+        static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+    const auto setup_fc2_ntiles =
+        static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+    const auto setup_mblocks = scheduler[3];
+    // The first words are an immutable expert/local-M lookup in Notify's M-tile
+    // wavefront order.  The following regions are generation-local,
+    // readiness-ordered FC1 and FC2 task queues.
+    for (std::uint64_t mblock =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         mblock < setup_mblocks;
+         mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+      std::uint64_t local_mblock = 0;
+      const auto expert =
+          forward_wavefront_mblock_expert(a, mblock, local_mblock);
+      claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
+                       static_cast<std::uint32_t>(local_mblock);
     }
-    __syncthreads();
-    unsigned long long issued_completions = 0ULL;
-    unsigned long long issued_packets = 0ULL;
-    for (std::uint32_t remote_node = 0;
-         remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
-      if (remote_node == a.node)
-        continue;
-      std::uint64_t node_wave_begin = 0;
-      while (node_wave_begin < a.dispatch_waves.wave_count &&
-             a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
-        ++node_wave_begin;
-      auto node_wave_end = node_wave_begin;
-      while (node_wave_end < a.dispatch_waves.wave_count &&
-             a.dispatch_waves.destination_node[node_wave_end] == remote_node)
-        ++node_wave_end;
-      const auto node_waves = node_wave_end - node_wave_begin;
-      const auto context_wave_begin =
-          node_wave_begin + node_waves * context / a.gin_context_count;
-      const auto context_wave_end =
-          node_wave_begin + node_waves * (context + 1U) /
-                                a.gin_context_count;
-      const auto node_packet_begin =
-          a.dispatch_waves.offsets[node_wave_begin];
-      const auto packet_begin =
-          a.dispatch_waves.offsets[context_wave_begin] - node_packet_begin;
-      const auto packet_end =
-          a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
-      const auto remote_partition =
-          remote_node < a.node ? remote_node : remote_node - 1U;
-      const auto source_partition =
-          a.node < remote_node ? a.node : a.node - 1U;
-      const auto directory_index =
-          remote_partition * a.gin_context_count + context;
-      if (threadIdx.x == 0U) {
-        send_directory[directory_index] = GinDispatchContextRecord{
-            a.dispatch.identity.generation, a.epoch, packet_begin,
-            static_cast<std::uint32_t>(packet_end - packet_begin),
-            static_cast<std::uint32_t>(context_wave_end -
-                                       context_wave_begin)};
-        __threadfence_system();
-        const auto remote_directory_index =
-            source_partition * a.gin_context_count + context;
-        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                a.gin_receive_dispatch_directory_offset +
-                    remote_directory_index *
-                        sizeof(GinDispatchContextRecord),
-                a.gin_window, a.gin_send_dispatch_directory_offset +
-                                  directory_index *
-                                      sizeof(GinDispatchContextRecord),
-                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
-                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
-                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-        ++issued_completions;
-      }
-      __syncthreads();
-      // Every context publishes exactly one fixed-width directory record for
-      // every remote node that participates in this generation, including an
-      // empty record.  Receivers therefore never have to infer which sender
-      // contexts own waves before waiting for the directory phase.
-      for (auto wave = context_wave_begin; wave < context_wave_end; ++wave) {
-        const auto wave_begin = a.dispatch_waves.offsets[wave];
-        const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
-        const auto wire_begin = wave_begin - node_packet_begin;
-        const auto wave_packets = wave_end - wave_begin;
-        for (auto position = wave_begin + threadIdx.x; position < wave_end;
-             position += blockDim.x) {
-          send_headers[position].sequence = position - node_packet_begin;
-          send_headers[position].dst_row =
-              (position - node_packet_begin) * a.dispatch.identity.top_k;
-          send_headers[position].topk_slot = 0U;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0U) {
-          send_headers[wave_begin].topk_slot =
-              static_cast<std::uint32_t>(wave_packets);
-          __threadfence_system();
-          const auto receive_packet =
-              source_partition * a.max_tokens_per_rank + wire_begin;
-          MEGAMOE_TIMELINE_RECORD(
-              a.timeline, GinPutIssue, GinDispatch, context,
-              wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_header_offset +
-                      receive_packet * sizeof(LocalP2pRouteHeader),
-                  a.gin_window,
-                  a.gin_send_header_offset +
-                      wave_begin * sizeof(LocalP2pRouteHeader),
-                  wave_packets * sizeof(LocalP2pRouteHeader));
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_fanout_offset +
-                      (source_partition * a.max_tokens_per_rank + wire_begin) *
-                          a.dispatch.identity.top_k *
-                          sizeof(DeviceFanoutRecord),
-                  a.gin_window,
-                  a.gin_send_fanout_offset +
-                      wave_begin * a.dispatch.identity.top_k *
-                          sizeof(DeviceFanoutRecord),
-                  wave_packets * a.dispatch.identity.top_k *
-                      sizeof(DeviceFanoutRecord));
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_payload_offset +
-                      receive_packet * a.hidden *
-                          sizeof(transport::BFloat16),
-                  a.gin_window,
-                  a.gin_send_payload_offset +
-                      wave_begin * a.hidden * sizeof(transport::BFloat16),
-                  wave_packets * a.hidden * sizeof(transport::BFloat16),
-                  ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
-                  ncclCoopThread{}, ncclGin_None{},
-                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-          ++issued_completions;
-          issued_packets += wave_packets;
-          atomicAdd(&status->gin_dispatch_put_count, 3ULL);
-          atomicAdd(&status->gin_signal_count, 1ULL);
-          atomicAdd(&status->gin_metadata_bytes,
-                    wave_packets *
-                        (sizeof(LocalP2pRouteHeader) +
-                         a.dispatch.identity.top_k *
-                             sizeof(DeviceFanoutRecord)));
-        }
-        __syncthreads();
-      }
-    }
-    if (threadIdx.x == 0U && issued_completions != 0ULL) {
-      gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
-                              GinDispatch, context, issued_packets, a.epoch);
-      atomicAdd(&status->deduplicated_cross_node_payload_bytes,
-                issued_packets * a.hidden * sizeof(transport::BFloat16));
-      atomicAdd(&status->actual_dispatch_peer_bytes,
-                issued_packets * a.hidden * sizeof(transport::BFloat16));
-      gin.resetCounter(0);
-      for (std::uint32_t remote_node = 0;
-           remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
-        if (remote_node == a.node)
-          continue;
-        const auto remote_partition =
-            remote_node < a.node ? remote_node : remote_node - 1U;
-        const auto record_index =
-            remote_partition * a.gin_context_count + context;
-        const auto directory = send_directory[record_index];
-        auto &record = context_completion[record_index];
-        record.directory_ready = 1ULL;
-        record.dispatch_expected = directory.wave_count;
-        record.dispatch_claimed = directory.wave_count;
-        record.dispatch_completed = directory.wave_count;
-        record.local_completion = 1ULL + directory.wave_count;
-        record.credit = 1ULL;
-        record.last_cursor = directory.packet_begin + directory.packet_count;
-        record.last_progress_globaltimer = device_globaltimer_ns();
-#if MEGAMOE_DEBUG_VALIDATE
-        std::uint64_t first_node_wave = 0;
-        while (first_node_wave < a.dispatch_waves.wave_count &&
-               a.dispatch_waves.destination_node[first_node_wave] <
-                   remote_node)
-          ++first_node_wave;
-        const auto node_packet_begin =
-            a.dispatch_waves.offsets[first_node_wave];
-        for (std::uint64_t position = directory.packet_begin;
-             position < directory.packet_begin + directory.packet_count;
-             ++position) {
-          const auto header = send_headers[node_packet_begin + position];
-          record.dispatch_fanout_rows += header.route_index;
-          for (std::uint64_t fanout = 0; fanout < header.route_index;
-               ++fanout)
-            record.dispatch_tile0_rows +=
-                send_fanout[(node_packet_begin + position) *
-                                a.dispatch.identity.top_k +
-                            fanout]
-                    .reserved == 0U;
-        }
-#endif
-        atomicAdd(&completion->directory_ready, 1ULL);
-        atomicAdd(&completion->dispatch_local_completion_completed,
-                  1ULL + directory.wave_count);
-        if (directory.wave_count != 0ULL) {
-          claim_completion_tasks(completion,
-                                 transport_state::TaskClass::DispatchWave,
-                                 directory.wave_count);
-          complete_completion_tasks(completion,
-                                    transport_state::TaskClass::DispatchWave,
-                                    directory.wave_count);
-        }
-      }
-    }
-    __syncthreads();
-    unsigned long long incoming_sources = 0ULL;
-    if (threadIdx.x == 0U) {
-      for (std::uint32_t index = 0;
-           index < a.dispatch.sizes.incoming_signal_count; ++index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node && signal.expected_packets != 0ULL)
-          ++incoming_sources;
-      }
-      if (incoming_sources != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
-      auto *receive_directory =
-          reinterpret_cast<GinDispatchContextRecord *>(
-              static_cast<std::byte *>(a.gin_window_base) +
-              a.gin_receive_dispatch_directory_offset);
-      unsigned long long incoming_waves = 0ULL;
-      for (std::uint32_t index = 0;
-           index < a.dispatch.sizes.incoming_signal_count; ++index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node == a.node || signal.expected_packets == 0ULL)
-          continue;
-        const auto source_partition =
-            signal.source_node < a.node ? signal.source_node
-                                        : signal.source_node - 1U;
-        const auto directory = receive_directory[
-            source_partition * a.gin_context_count + context];
-        if (directory.generation == a.dispatch.identity.generation &&
-            directory.epoch == a.epoch) {
-          incoming_waves += directory.wave_count;
-          const auto record_index =
-              source_partition * a.gin_context_count + context;
-          context_completion[record_index].relay_expected =
-              directory.packet_count;
-        }
-      }
-      if (incoming_waves != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0,
-                       incoming_sources + incoming_waves);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
-                              context, incoming_sources, a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
-                              context, incoming_sources, a.epoch);
-      atomicAdd(&scheduler[5U + 2ULL * a.world], 1ULL);
-    }
-    __syncthreads();
-
-    // All GIN contexts publish an immutable receive directory before Relay.
-    // Packet waves are divided between contexts by wave count, which can be
-    // very uneven in bytes/fan-out.  Relaying only the directory owned by the
-    // matching context left one CTA copying nearly the entire remote payload
-    // while the other progress CTAs were idle.  Wait for the fixed directory
-    // set, then stripe every directory across the fixed context CTA team.  No
-    // task space is extended here and the exact destination-row counters stay
-    // the sole FC readiness condition.
-    if (threadIdx.x == 0U) {
+    // FC1-ready tasks, then FC2 M-block descriptors and their private N-tile
+    // ticket counters, live after the immutable M-block mapping.  The FC2
+    // region retains fc2_ntiles words per M-block, so the two M-block-sized
+    // arrays fit without changing the pooled ABI. FULL Return has a separate
+    // append-only descriptor array.
+    const auto setup_task_count =
+        setup_mblocks * (setup_fc1_ntiles + setup_fc2_ntiles);
+    for (std::uint64_t task =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         task < setup_task_count;
+         task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+      claims[setup_mblocks + task] = 0ULL;
+    grid.sync();
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          directories_ready(scheduler[5U + 2ULL * a.world]);
-      while (directories_ready.load(::cuda::memory_order_acquire) <
-                 a.gin_context_count &&
-             !forward_cancelled(a)) {
-        __nanosleep(256U);
-      }
+          setup_ready(scheduler[8ULL + 2ULL * a.world]);
+      setup_ready.store(a.epoch, ::cuda::memory_order_release);
     }
-    __syncthreads();
-  }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x < a.gin_context_count) {
-    const auto context = static_cast<std::uint32_t>(blockIdx.x);
-    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        window_bytes + a.gin_receive_header_offset);
-    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        window_bytes + a.gin_receive_fanout_offset);
-    auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
-        window_bytes + a.gin_receive_payload_offset);
-    auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
-        window_bytes + a.gin_receive_dispatch_directory_offset);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_signal_count, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_signal_count, a.epoch);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto context_thread = static_cast<std::uint64_t>(threadIdx.x);
-    const auto context_threads = static_cast<std::uint64_t>(blockDim.x);
-    const auto relay_thread =
-        static_cast<std::uint64_t>(context) * context_threads +
-        context_thread;
-    const auto relay_threads =
-        static_cast<std::uint64_t>(a.gin_context_count) * context_threads;
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint32_t directory_context = 0;
-           directory_context < a.gin_context_count; ++directory_context) {
-        const auto directory = receive_directory[
-            source_partition * a.gin_context_count + directory_context];
-        for (std::uint64_t item = relay_thread;
-             item < static_cast<std::uint64_t>(directory.packet_count) *
-                        packet_vectors;
-             item += relay_threads) {
-          const auto sequence =
-              directory.packet_begin + item / packet_vectors;
-          const auto within_packet = item % packet_vectors;
-          const auto fanout = within_packet / vector_count;
-          const auto vector = within_packet % vector_count;
-          const auto packet =
-              source_partition * a.max_tokens_per_rank + sequence;
-          const auto header = receive_headers[packet];
-          if (fanout >= header.route_index)
-            continue;
-          const auto target = receive_fanout[
-              source_partition * a.max_tokens_per_rank *
-                      a.dispatch.identity.top_k +
-                  header.dst_row + fanout];
-          const auto destination =
-              a.node * a.local_world_size + target.destination_local_rank;
-          auto *destination_rows = peer_at<transport::BFloat16>(
-              a.peer_bases[destination], a.canonical_rows_offset);
-          reinterpret_cast<uint4 *>(destination_rows)[
-              target.dst_row * vector_count + vector] =
-              reinterpret_cast<const uint4 *>(receive_payload)[
-                  packet * vector_count + vector];
-        }
-        for (std::uint64_t slot = relay_thread;
-             slot < static_cast<std::uint64_t>(directory.packet_count) *
-                        a.dispatch.identity.top_k;
-             slot += relay_threads) {
-          const auto sequence = directory.packet_begin +
-                                slot / a.dispatch.identity.top_k;
-          const auto fanout = slot % a.dispatch.identity.top_k;
-          const auto packet =
-              source_partition * a.max_tokens_per_rank + sequence;
-          const auto header = receive_headers[packet];
-          if (fanout >= header.route_index)
-            continue;
-          const auto target = receive_fanout[
-              source_partition * a.max_tokens_per_rank *
-                      a.dispatch.identity.top_k +
-                  header.dst_row + fanout];
-          const auto destination =
-              a.node * a.local_world_size + target.destination_local_rank;
-          auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-              a.peer_bases[destination], a.direct_headers_offset);
-          const auto route = header.local_token_id *
-                                 a.dispatch.identity.top_k +
-                             target.topk_slot;
-          destination_headers[target.dst_row] = LocalP2pRouteHeader{
-              transport::kActivationTransportSchemaVersion,
-              header.source_rank,
-              destination,
-              header.channel,
-              header.generation,
-              header.source_epoch,
-              header.sequence,
-              route,
-              header.local_token_id,
-              target.dst_row,
-              target.expert_id,
-              target.topk_slot};
-        }
-      }
-    }
-    __threadfence_system();
-    __syncthreads();
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      for (std::uint32_t directory_context = 0;
-           directory_context < a.gin_context_count; ++directory_context) {
-        const auto directory = receive_directory[
-            source_partition * a.gin_context_count + directory_context];
-        for (std::uint64_t slot = relay_thread;
-             slot < static_cast<std::uint64_t>(directory.packet_count) *
-                        a.dispatch.identity.top_k;
-             slot += relay_threads) {
-          const auto sequence = directory.packet_begin +
-                                slot / a.dispatch.identity.top_k;
-          const auto fanout = slot % a.dispatch.identity.top_k;
-          const auto packet =
-              source_partition * a.max_tokens_per_rank + sequence;
-          const auto header = receive_headers[packet];
-          if (fanout >= header.route_index)
-            continue;
-          const auto target = receive_fanout[
-              source_partition * a.max_tokens_per_rank *
-                      a.dispatch.identity.top_k +
-                  header.dst_row + fanout];
-          const auto destination =
-              a.node * a.local_world_size + target.destination_local_rank;
-          auto *arrived = peer_at<unsigned long long>(
-              a.peer_bases[destination], a.x_arrived_rows_offset);
-          const auto rail = a.rank % a.local_world_size;
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_system>
-              counter(arrived[target.reserved * a.local_world_size + rail]);
-          counter.fetch_add(1ULL, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
-          const auto record_index =
-              source_partition * a.gin_context_count + directory_context;
-          atomicAdd(&context_completion[record_index].relay_fanout_rows,
-                    1ULL);
-          if (target.reserved == 0U)
-            atomicAdd(&context_completion[record_index].relay_tile0_rows,
-                      1ULL);
-          atomicAdd(&completion->remote_rows_published, 1ULL);
-          if (target.reserved < 64U)
-            atomicOr(&completion->published_tile_mask,
-                     1ULL << target.reserved);
 #endif
+
+    // Socket correctness mode has already placed every incoming activation and
+    // canonical header through host-enqueued NCCL Send/Recv. It deliberately
+    // bypasses the peer/G​IN dispatch phase while retaining the exact FC
+    // core.
+    if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
+#if __has_include(<nccl_device.h>)
+      if (stream_remote_dispatch) {
+        forward_dispatch_detail::dispatch_role(
+            a, *forward_v3_control, forward_relay_cta_begin, completion,
+            context_completion, scheduler, storage);
+        forward_publish_progress(a, kForwardDispatchStored,
+                                 a.dispatch.sizes.route_count);
+        forward_publish_progress(a, kForwardDispatchObserved,
+                                 a.dispatch.sizes.incoming_row_count);
+      } else
+#endif
+      {
+        // Local rows use the frozen CUDA-IPC fast path. Cross-node rows are
+        // packed once per (token,node) by the same-rail proxy path below.
+        unsigned long long dispatch_peer_rows = 0ULL;
+#if MEGAMOE_DEVICE_TIMELINE
+        bool timeline_x_local_recorded = false;
+#endif
+        for (std::uint64_t route = blockIdx.x;
+             route < a.dispatch.sizes.route_count; route += gridDim.x) {
+          const auto destination = a.dispatch.route_dst_rank[route];
+          if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+              destination / a.local_world_size != a.node)
+            continue;
+          const auto row = a.dispatch.route_dst_row[route];
+          const auto token = route / a.dispatch.identity.top_k;
+          auto *destination_base = a.peer_bases[destination];
+          auto *destination_rows = peer_at<transport::BFloat16>(
+              destination_base, a.canonical_rows_offset);
+          const auto *source = a.input + token * a.hidden;
+          auto *target = destination_rows + row * a.hidden;
+          const auto *source128 = reinterpret_cast<const uint4 *>(source);
+          auto *target128 = reinterpret_cast<uint4 *>(target);
+          for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
+               vector += blockDim.x)
+            target128[vector] = source128[vector];
+          if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+            // Every lane's row stores precede the exact destination M-tile row
+            // increment.  The destination compute worker acquires this counter;
+            // no packet/wave signal is itself interpreted as tile readiness.
+            __threadfence_system();
+            __syncthreads();
+            if (threadIdx.x == 0) {
+              auto *arrived = peer_at<unsigned long long>(
+                  destination_base, a.x_arrived_rows_offset);
+              const auto rail = a.rank % a.local_world_size;
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_system>
+                  counter(arrived[a.dispatch_waves.route_dst_mtile[route] *
+                                      a.local_world_size +
+                                  rail]);
+              counter.fetch_add(1ULL, ::cuda::memory_order_release);
+#if MEGAMOE_DEBUG_VALIDATE
+              atomicAdd(&completion->local_rows_published, 1ULL);
+              const auto tile = a.dispatch_waves.route_dst_mtile[route];
+              if (tile < 64U)
+                atomicOr(&completion->published_tile_mask, 1ULL << tile);
+#endif
+            }
+            __syncthreads();
+          }
+#if MEGAMOE_DEVICE_TIMELINE
+          __syncthreads();
+          if (!timeline_x_local_recorded) {
+            MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+                                    GinDispatch, 0U, route, a.epoch);
+            timeline_x_local_recorded = true;
+          }
+#endif
+          if (threadIdx.x == 0) {
+            auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+                destination_base, a.direct_headers_offset);
+            destination_headers[row] = LocalP2pRouteHeader{
+                transport::kActivationTransportSchemaVersion,
+                a.rank,
+                destination,
+                0U,
+                a.dispatch.identity.generation,
+                a.epoch,
+                route,
+                route,
+                token,
+                row,
+                a.dispatch.expert_id[route],
+                static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
+            if (destination != a.rank)
+              ++dispatch_peer_rows;
+          }
         }
-      }
-    }
-    #if 0
-    const auto relay_index = static_cast<std::uint64_t>(blockIdx.x);
-    const auto forward_relay_ctas = a.gin_context_count;
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      for (std::uint32_t directory_context = 0;
-           directory_context < a.gin_context_count; ++directory_context) {
-        const auto directory = receive_directory[
-            source_partition * a.gin_context_count + directory_context];
-        constexpr std::uint64_t kRelayRowsPerRelease = 8ULL;
-        const auto directory_slots =
-            static_cast<std::uint64_t>(directory.packet_count) *
-            a.dispatch.identity.top_k;
-        for (std::uint64_t batch_begin =
-                 relay_index * kRelayRowsPerRelease;
-             batch_begin < directory_slots;
-             batch_begin += forward_relay_ctas * kRelayRowsPerRelease) {
-          for (std::uint64_t lane = 0; lane < kRelayRowsPerRelease; ++lane) {
-            const auto slot = batch_begin + lane;
-            if (slot >= directory_slots)
-              break;
-            const auto sequence = directory.packet_begin +
-                                  slot / a.dispatch.identity.top_k;
-            const auto fanout = slot % a.dispatch.identity.top_k;
-            const auto packet =
-                source_partition * a.max_tokens_per_rank + sequence;
-            const auto header = receive_headers[packet];
-            if (fanout >= header.route_index)
+#if __has_include(<nccl_device.h>)
+        if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+          grid.sync();
+          auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+          auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+              window_bytes + a.gin_send_header_offset);
+          auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+              window_bytes + a.gin_send_fanout_offset);
+          auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
+              window_bytes + a.gin_send_payload_offset);
+          const auto vector_count = a.hidden / 8ULL;
+          const auto global_thread =
+              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+          const auto global_threads =
+              static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+#if MEGAMOE_DEVICE_TIMELINE
+          unsigned long long dispatch_pack_thread_bytes = 0ULL;
+          __shared__ unsigned long long dispatch_pack_cta_bytes;
+          if (threadIdx.x == 0U)
+            dispatch_pack_cta_bytes = 0ULL;
+          __syncthreads();
+          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch,
+                                  0U, 0ULL, a.epoch);
+#endif
+          for (std::uint64_t item = global_thread;
+               item < a.dispatch.sizes.packet_count * vector_count;
+               item += global_threads) {
+            const auto wave_position = item / vector_count;
+            const auto vector = item % vector_count;
+            const auto packet = a.dispatch_waves.packet_order[wave_position];
+            const auto descriptor = a.dispatch.packet_headers[packet];
+            if (descriptor.destination_node == a.node)
               continue;
-            const auto target = receive_fanout[
-                source_partition * a.max_tokens_per_rank *
-                        a.dispatch.identity.top_k +
-                    header.dst_row + fanout];
-            const auto destination =
-                a.node * a.local_world_size + target.destination_local_rank;
-            auto *destination_rows = peer_at<transport::BFloat16>(
-                a.peer_bases[destination], a.canonical_rows_offset);
-            for (std::uint64_t vector = threadIdx.x; vector < vector_count;
-                 vector += blockDim.x)
-              reinterpret_cast<uint4 *>(destination_rows)[
-                  target.dst_row * vector_count + vector] =
-                  reinterpret_cast<const uint4 *>(receive_payload)[
-                      packet * vector_count + vector];
-            if (threadIdx.x == 0U) {
-              auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-                  a.peer_bases[destination], a.direct_headers_offset);
-              const auto route = header.local_token_id *
-                                     a.dispatch.identity.top_k +
-                                 target.topk_slot;
-              destination_headers[target.dst_row] = LocalP2pRouteHeader{
-                  transport::kActivationTransportSchemaVersion,
-                  header.source_rank,
-                  destination,
-                  header.channel,
-                  header.generation,
-                  header.source_epoch,
-                  header.sequence,
-                  route,
-                  header.local_token_id,
-                  target.dst_row,
-                  target.expert_id,
-                  target.topk_slot};
+            reinterpret_cast<uint4 *>(
+                send_payload)[wave_position * vector_count + vector] =
+                reinterpret_cast<const uint4 *>(
+                    a.input)[descriptor.local_token_id * vector_count + vector];
+#if MEGAMOE_DEVICE_TIMELINE
+            dispatch_pack_thread_bytes += sizeof(uint4);
+#endif
+          }
+          for (std::uint64_t packed = global_thread;
+               packed <
+               a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
+               packed += global_threads) {
+            const auto wave_position = packed / a.dispatch.identity.top_k;
+            const auto packet = a.dispatch_waves.packet_order[wave_position];
+            const auto fanout_slot = packed % a.dispatch.identity.top_k;
+            const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+            const auto fanout_end =
+                a.dispatch.packet_fanout_offsets[packet + 1U];
+            if (fanout_begin + fanout_slot < fanout_end)
+              send_fanout[packed] =
+                  a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+#if MEGAMOE_DEVICE_TIMELINE
+            if (fanout_begin + fanout_slot < fanout_end)
+              dispatch_pack_thread_bytes += sizeof(DeviceFanoutRecord);
+#endif
+          }
+          for (std::uint64_t wave_position = global_thread;
+               wave_position < a.dispatch.sizes.packet_count;
+               wave_position += global_threads) {
+            const auto packet = a.dispatch_waves.packet_order[wave_position];
+            const auto descriptor = a.dispatch.packet_headers[packet];
+            if (descriptor.destination_node == a.node)
+              continue;
+            const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+            const auto fanout_end =
+                a.dispatch.packet_fanout_offsets[packet + 1U];
+            send_headers[wave_position] = LocalP2pRouteHeader{
+                transport::kActivationTransportSchemaVersion,
+                a.rank,
+                descriptor.proxy_rank,
+                descriptor.channel,
+                a.dispatch.identity.generation,
+                a.epoch,
+                wave_position,
+                fanout_end - fanout_begin,
+                descriptor.local_token_id,
+                wave_position * a.dispatch.identity.top_k,
+                0,
+                0};
+#if MEGAMOE_DEVICE_TIMELINE
+            dispatch_pack_thread_bytes += sizeof(LocalP2pRouteHeader);
+#endif
+          }
+#if MEGAMOE_DEVICE_TIMELINE
+          atomicAdd(&dispatch_pack_cta_bytes, dispatch_pack_thread_bytes);
+          __syncthreads();
+          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackCtaBytes, GinDispatch,
+                                  0U, dispatch_pack_cta_bytes, a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch, 0U,
+                                  dispatch_pack_cta_bytes, a.epoch);
+#endif
+          // GIN's device DMA reads this window after the grid-wide producers
+          // have populated it. A cooperative grid barrier orders CUDA threads
+          // but does not by itself publish their stores to a system-scope
+          // device backend.
+          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPacketReady, GinDispatch,
+                                  blockIdx.x < a.gin_context_count ? blockIdx.x
+                                                                   : 0U,
+                                  a.dispatch.sizes.packet_count, a.epoch);
+          __threadfence_system();
+          grid.sync();
+        }
+        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+            blockIdx.x < a.gin_context_count) {
+          const auto context = static_cast<std::uint32_t>(blockIdx.x);
+          const ncclGin gin(a.gin_dev_comm, context);
+          const auto rail = ncclTeamRail(a.gin_dev_comm);
+          auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+          auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
+              window_bytes + a.gin_send_dispatch_directory_offset);
+          auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+              window_bytes + a.gin_send_header_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+          auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+              window_bytes + a.gin_send_fanout_offset);
+#endif
+          // The owner-side initialization kernel only rendezvous with CUDA-IPC
+          // peers on this node.  A remote same-rail producer can otherwise
+          // enter this kernel first, publish an exact M-tile row increment, and
+          // have that increment erased when the slower destination initializes
+          // its local x_arrived_rows storage.  Signal 2 is reserved for a
+          // fixed-width, per-context generation-ready handshake.  It runs once
+          // before any Dispatch payload put and therefore adds no per-wave or
+          // per-task work.
+          //
+          // Reuse each context's immutable directory slot as the eight-byte DMA
+          // source/destination: the real directory record is written only after
+          // the handshake completes, and Dispatch signal 0 orders that later
+          // record.
+          if (threadIdx.x == 0U) {
+            unsigned long long setup_peers = 0ULL;
+            for (std::uint32_t remote_node = 0;
+                 remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+              if (remote_node == a.node)
+                continue;
+              const auto remote_partition =
+                  remote_node < a.node ? remote_node : remote_node - 1U;
+              const auto source_partition =
+                  a.node < remote_node ? a.node : a.node - 1U;
+              const auto directory_index =
+                  remote_partition * a.gin_context_count + context;
+              const auto remote_directory_index =
+                  source_partition * a.gin_context_count + context;
+              send_directory[directory_index] = GinDispatchContextRecord{
+                  a.dispatch.identity.generation, a.epoch, 0ULL, 0U, 0U};
+              __threadfence_system();
+              gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                      a.gin_receive_dispatch_directory_offset +
+                          remote_directory_index *
+                              sizeof(GinDispatchContextRecord),
+                      a.gin_window,
+                      a.gin_send_dispatch_directory_offset +
+                          directory_index * sizeof(GinDispatchContextRecord),
+                      sizeof(GinDispatchContextRecord), ncclGin_SignalInc{2},
+                      ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                      ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+              ++setup_peers;
+            }
+            if (setup_peers != 0ULL) {
+              gin.waitCounter(ncclCoopThread{}, 0, setup_peers);
+              gin.resetCounter(0);
+              gin.waitSignal(ncclCoopThread{}, 2, setup_peers);
             }
           }
           __syncthreads();
-          if (threadIdx.x == 0U)
-            __threadfence_system();
-          __syncthreads();
-          for (std::uint64_t lane = threadIdx.x;
-               lane < kRelayRowsPerRelease; lane += blockDim.x) {
-            const auto slot = batch_begin + lane;
-            if (slot >= directory_slots)
+          unsigned long long issued_completions = 0ULL;
+          unsigned long long issued_packets = 0ULL;
+          for (std::uint32_t remote_node = 0;
+               remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+            if (remote_node == a.node)
               continue;
-            const auto sequence = directory.packet_begin +
-                                  slot / a.dispatch.identity.top_k;
-            const auto fanout = slot % a.dispatch.identity.top_k;
-            const auto packet =
-                source_partition * a.max_tokens_per_rank + sequence;
-            const auto header = receive_headers[packet];
-            if (fanout >= header.route_index)
-              continue;
-            const auto target = receive_fanout[
-                source_partition * a.max_tokens_per_rank *
-                        a.dispatch.identity.top_k +
-                    header.dst_row + fanout];
-            const auto destination =
-                a.node * a.local_world_size + target.destination_local_rank;
-            auto *arrived = peer_at<unsigned long long>(
-                a.peer_bases[destination], a.x_arrived_rows_offset);
-            const auto rail = a.rank % a.local_world_size;
-            ::cuda::atomic_ref<unsigned long long,
-                               ::cuda::thread_scope_system>
-                counter(arrived[target.reserved * a.local_world_size + rail]);
-            counter.fetch_add(1ULL, ::cuda::memory_order_release);
+            std::uint64_t node_wave_begin = 0;
+            while (node_wave_begin < a.dispatch_waves.wave_count &&
+                   a.dispatch_waves.destination_node[node_wave_begin] <
+                       remote_node)
+              ++node_wave_begin;
+            auto node_wave_end = node_wave_begin;
+            while (node_wave_end < a.dispatch_waves.wave_count &&
+                   a.dispatch_waves.destination_node[node_wave_end] ==
+                       remote_node)
+              ++node_wave_end;
+            const auto node_waves = node_wave_end - node_wave_begin;
+            const auto context_wave_begin =
+                node_wave_begin + node_waves * context / a.gin_context_count;
+            const auto context_wave_end =
+                node_wave_begin +
+                node_waves * (context + 1U) / a.gin_context_count;
+            const auto node_packet_begin =
+                a.dispatch_waves.offsets[node_wave_begin];
+            const auto packet_begin =
+                a.dispatch_waves.offsets[context_wave_begin] -
+                node_packet_begin;
+            const auto packet_end =
+                a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
+            const auto remote_partition =
+                remote_node < a.node ? remote_node : remote_node - 1U;
+            const auto source_partition =
+                a.node < remote_node ? a.node : a.node - 1U;
+            const auto directory_index =
+                remote_partition * a.gin_context_count + context;
+            if (threadIdx.x == 0U) {
+              send_directory[directory_index] = GinDispatchContextRecord{
+                  a.dispatch.identity.generation, a.epoch, packet_begin,
+                  static_cast<std::uint32_t>(packet_end - packet_begin),
+                  static_cast<std::uint32_t>(context_wave_end -
+                                             context_wave_begin)};
+              __threadfence_system();
+              const auto remote_directory_index =
+                  source_partition * a.gin_context_count + context;
+              gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                      a.gin_receive_dispatch_directory_offset +
+                          remote_directory_index *
+                              sizeof(GinDispatchContextRecord),
+                      a.gin_window,
+                      a.gin_send_dispatch_directory_offset +
+                          directory_index * sizeof(GinDispatchContextRecord),
+                      sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
+                      ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                      ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+              ++issued_completions;
+            }
+            __syncthreads();
+            // Every context publishes exactly one fixed-width directory record
+            // for every remote node that participates in this generation,
+            // including an empty record.  Receivers therefore never have to
+            // infer which sender contexts own waves before waiting for the
+            // directory phase.
+            for (auto wave = context_wave_begin; wave < context_wave_end;
+                 ++wave) {
+              const auto wave_begin = a.dispatch_waves.offsets[wave];
+              const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
+              const auto wire_begin = wave_begin - node_packet_begin;
+              const auto wave_packets = wave_end - wave_begin;
+              for (auto position = wave_begin + threadIdx.x;
+                   position < wave_end; position += blockDim.x) {
+                send_headers[position].sequence = position - node_packet_begin;
+                send_headers[position].dst_row =
+                    (position - node_packet_begin) * a.dispatch.identity.top_k;
+                send_headers[position].topk_slot = 0U;
+              }
+              __syncthreads();
+              if (threadIdx.x == 0U) {
+                send_headers[wave_begin].topk_slot =
+                    static_cast<std::uint32_t>(wave_packets);
+                __threadfence_system();
+                const auto receive_packet =
+                    source_partition * a.max_tokens_per_rank + wire_begin;
+                MEGAMOE_TIMELINE_RECORD(
+                    a.timeline, GinPutIssue, GinDispatch, context,
+                    wave_packets * a.hidden * sizeof(transport::BFloat16),
+                    a.epoch);
+                gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                        a.gin_receive_header_offset +
+                            receive_packet * sizeof(LocalP2pRouteHeader),
+                        a.gin_window,
+                        a.gin_send_header_offset +
+                            wave_begin * sizeof(LocalP2pRouteHeader),
+                        wave_packets * sizeof(LocalP2pRouteHeader));
+                gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                        a.gin_receive_fanout_offset +
+                            (source_partition * a.max_tokens_per_rank +
+                             wire_begin) *
+                                a.dispatch.identity.top_k *
+                                sizeof(DeviceFanoutRecord),
+                        a.gin_window,
+                        a.gin_send_fanout_offset +
+                            wave_begin * a.dispatch.identity.top_k *
+                                sizeof(DeviceFanoutRecord),
+                        wave_packets * a.dispatch.identity.top_k *
+                            sizeof(DeviceFanoutRecord));
+                gin.put(
+                    rail, static_cast<int>(remote_node), a.gin_window,
+                    a.gin_receive_payload_offset +
+                        receive_packet * a.hidden * sizeof(transport::BFloat16),
+                    a.gin_window,
+                    a.gin_send_payload_offset +
+                        wave_begin * a.hidden * sizeof(transport::BFloat16),
+                    wave_packets * a.hidden * sizeof(transport::BFloat16),
+                    ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+                    ncclCoopThread{}, ncclGin_None{},
+                    ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+                ++issued_completions;
+                issued_packets += wave_packets;
+                atomicAdd(&status->gin_dispatch_put_count, 3ULL);
+                atomicAdd(&status->gin_signal_count, 1ULL);
+                atomicAdd(&status->gin_metadata_bytes,
+                          wave_packets * (sizeof(LocalP2pRouteHeader) +
+                                          a.dispatch.identity.top_k *
+                                              sizeof(DeviceFanoutRecord)));
+              }
+              __syncthreads();
+            }
+          }
+          if (threadIdx.x == 0U && issued_completions != 0ULL) {
+            gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
+            MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
+                                    GinDispatch, context, issued_packets,
+                                    a.epoch);
+            atomicAdd(&status->deduplicated_cross_node_payload_bytes,
+                      issued_packets * a.hidden * sizeof(transport::BFloat16));
+            atomicAdd(&status->actual_dispatch_peer_bytes,
+                      issued_packets * a.hidden * sizeof(transport::BFloat16));
+            gin.resetCounter(0);
+            for (std::uint32_t remote_node = 0;
+                 remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+              if (remote_node == a.node)
+                continue;
+              const auto remote_partition =
+                  remote_node < a.node ? remote_node : remote_node - 1U;
+              const auto record_index =
+                  remote_partition * a.gin_context_count + context;
+              const auto directory = send_directory[record_index];
+              auto &record = context_completion[record_index];
+              record.directory_ready = 1ULL;
+              record.dispatch_expected = directory.wave_count;
+              record.dispatch_claimed = directory.wave_count;
+              record.dispatch_completed = directory.wave_count;
+              record.local_completion = 1ULL + directory.wave_count;
+              record.credit = 1ULL;
+              record.last_cursor =
+                  directory.packet_begin + directory.packet_count;
+              record.last_progress_globaltimer = device_globaltimer_ns();
 #if MEGAMOE_DEBUG_VALIDATE
-            const auto record_index =
-                source_partition * a.gin_context_count + directory_context;
-            atomicAdd(&context_completion[record_index].relay_fanout_rows,
-                      1ULL);
-            if (target.reserved == 0U)
-              atomicAdd(&context_completion[record_index].relay_tile0_rows,
-                        1ULL);
-            atomicAdd(&completion->remote_rows_published, 1ULL);
-            if (target.reserved < 64U)
-              atomicOr(&completion->published_tile_mask,
-                       1ULL << target.reserved);
+              std::uint64_t first_node_wave = 0;
+              while (first_node_wave < a.dispatch_waves.wave_count &&
+                     a.dispatch_waves.destination_node[first_node_wave] <
+                         remote_node)
+                ++first_node_wave;
+              const auto node_packet_begin =
+                  a.dispatch_waves.offsets[first_node_wave];
+              for (std::uint64_t position = directory.packet_begin;
+                   position < directory.packet_begin + directory.packet_count;
+                   ++position) {
+                const auto header = send_headers[node_packet_begin + position];
+                record.dispatch_fanout_rows += header.route_index;
+                for (std::uint64_t fanout = 0; fanout < header.route_index;
+                     ++fanout)
+                  record.dispatch_tile0_rows +=
+                      send_fanout[(node_packet_begin + position) *
+                                      a.dispatch.identity.top_k +
+                                  fanout]
+                          .reserved == 0U;
+              }
 #endif
+              atomicAdd(&completion->directory_ready, 1ULL);
+              atomicAdd(&completion->dispatch_local_completion_completed,
+                        1ULL + directory.wave_count);
+              if (directory.wave_count != 0ULL) {
+                claim_completion_tasks(completion,
+                                       transport_state::TaskClass::DispatchWave,
+                                       directory.wave_count);
+                complete_completion_tasks(
+                    completion, transport_state::TaskClass::DispatchWave,
+                    directory.wave_count);
+              }
+            }
           }
           __syncthreads();
-        }
-      }
-    }
-    #endif
-    __syncthreads();
-    if (blockIdx.x < a.gin_context_count && threadIdx.x == 0U) {
-      unsigned long long relayed = 0ULL;
-      for (std::uint32_t remote = 0;
-           remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
-        const auto index = remote * a.gin_context_count + context;
-        auto &record = context_completion[index];
-        record.relay_claimed = record.relay_expected;
-        record.relay_completed = record.relay_expected;
-        record.last_progress_globaltimer = device_globaltimer_ns();
-        relayed += record.relay_expected;
-      }
-      if (relayed != 0ULL) {
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::RelayWave, relayed);
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::RelayWave,
-                                  relayed);
-      }
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-  }
-#endif
-    if (threadIdx.x == 0 && dispatch_peer_rows != 0ULL)
-      atomicAdd(&status->actual_dispatch_peer_bytes,
-                dispatch_peer_rows * a.hidden * sizeof(transport::BFloat16));
-  // Every participating lane orders its peer payload stores before the team
-  // rendezvous. A fence issued only by the signal lane would not cover stores
-  // performed by the other lanes in the CTA.
-  __threadfence_system();
-  forward_publish_progress(a, kForwardDispatchStored,
-                           a.dispatch.sizes.route_count);
-  if (!remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    grid.sync();
-    if (blockIdx.x == 0) {
-    const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
-                                 ? a.node * a.local_world_size
-                                 : 0U;
-    const auto local_count = remote_backend_enabled<StaticLocal>(a.use_gin)
-                                 ? a.local_world_size
-                                 : a.world;
-    if (threadIdx.x < local_count) {
-      const auto peer = first_local + threadIdx.x;
-      auto *signal = peer_at<unsigned long long>(
-          a.peer_bases[peer], a.ingress_published_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> published(
-          signal[a.rank * a.channels]);
-      published.store(a.epoch, ::cuda::memory_order_release);
-    }
-    for (std::uint32_t local_source = threadIdx.x;
-         local_source < local_count;
-         local_source += blockDim.x) {
-      const auto source = first_local + local_source;
-      auto *signals = peer_at<unsigned long long>(
-          a.local_base, a.ingress_published_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> published(
-          signals[source * a.channels]);
-      while (published.load(::cuda::memory_order_acquire) < a.epoch &&
-             !forward_cancelled(a)) {
-      }
-    }
-    }
-    grid.sync();
-  }
-  forward_publish_progress(a, kForwardDispatchObserved,
-                           remote_backend_enabled<StaticLocal>(a.use_gin)
-                               ? a.local_world_size
-                               : a.world);
-  } else {
-    grid.sync();
-    forward_publish_progress(a, kForwardDispatchStored,
-                             a.dispatch.sizes.route_count);
-    forward_publish_progress(a, kForwardDispatchObserved,
-                             a.dispatch.sizes.incoming_row_count);
-  }
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    status->dispatch_complete_clock = device_globaltimer_ns();
-    status->fc1_start_clock = status->dispatch_complete_clock;
-  }
-  MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
-                          a.dispatch.sizes.mtile_count, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
-                          a.dispatch.sizes.mtile_count, a.epoch);
+          unsigned long long incoming_sources = 0ULL;
+          if (threadIdx.x == 0U) {
+            for (std::uint32_t index = 0;
+                 index < a.dispatch.sizes.incoming_signal_count; ++index) {
+              const auto signal = a.dispatch.incoming_proxy_signals[index];
+              if (signal.source_node != a.node &&
+                  signal.expected_packets != 0ULL)
+                ++incoming_sources;
+            }
+            if (incoming_sources != 0ULL)
+              gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
+            auto *receive_directory =
+                reinterpret_cast<GinDispatchContextRecord *>(
+                    static_cast<std::byte *>(a.gin_window_base) +
+                    a.gin_receive_dispatch_directory_offset);
+            unsigned long long incoming_waves = 0ULL;
+            for (std::uint32_t index = 0;
+                 index < a.dispatch.sizes.incoming_signal_count; ++index) {
+              const auto signal = a.dispatch.incoming_proxy_signals[index];
+              if (signal.source_node == a.node ||
+                  signal.expected_packets == 0ULL)
+                continue;
+              const auto source_partition = signal.source_node < a.node
+                                                ? signal.source_node
+                                                : signal.source_node - 1U;
+              const auto directory =
+                  receive_directory[source_partition * a.gin_context_count +
+                                    context];
+              if (directory.generation == a.dispatch.identity.generation &&
+                  directory.epoch == a.epoch) {
+                incoming_waves += directory.wave_count;
+                const auto record_index =
+                    source_partition * a.gin_context_count + context;
+                context_completion[record_index].relay_expected =
+                    directory.packet_count;
+              }
+            }
+            if (incoming_waves != 0ULL)
+              gin.waitSignal(ncclCoopThread{}, 0,
+                             incoming_sources + incoming_waves);
+            MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved,
+                                    GinDispatch, context, incoming_sources,
+                                    a.epoch);
+            MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
+                                    context, incoming_sources, a.epoch);
+            // The GIN signal orders the network operation, but the next
+            // consumer is now a different CTA/SM.  Bridge async-proxy writes
+            // into the generic memory domain before publishing the CUDA atomic
+            // hand-off.
+            asm volatile("fence.proxy.async.global;" : : : "memory");
+            __threadfence();
+            atomicAdd(&scheduler[5U + 2ULL * a.world], 1ULL);
+          }
+          __syncthreads();
 
-#if __has_include(<nccl_device.h>)
-  // Build a fixed ReturnChunk catalog once the immutable remote Dispatch
-  // directory is visible.  Chunk identity depends only on the packed reverse
-  // row range; FC2 completion order can only change when a chunk becomes
-  // ready, never where it is sent or stored.
-  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x == a.gin_context_count) {
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnDirectoryStart, GinReturn, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-    const auto chunk_count_word = 4ULL + 2ULL * a.world;
-    if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          headers_ready(scheduler[chunk_count_word + 1ULL]);
-      while (headers_ready.load(::cuda::memory_order_acquire) <
-                 a.gin_context_count &&
-             !forward_cancelled(a)) {
-        __nanosleep(256U);
-      }
-      auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-      auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-          window_bytes + a.gin_receive_header_offset);
-      std::uint64_t chunk_count = 0ULL;
-      auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
-          window_bytes + a.gin_receive_dispatch_directory_offset);
-      for (std::uint32_t source_partition = 0;
-           source_partition + 1U < a.dispatch.identity.num_nodes;
-           ++source_partition) {
-        const auto source_node =
-            source_partition < a.node ? source_partition
-                                      : source_partition + 1U;
-        std::uint64_t received_packets = 0ULL;
-        for (std::uint32_t context = 0; context < a.gin_context_count;
-             ++context) {
-          const auto directory = receive_directory[
-              source_partition * a.gin_context_count + context];
-          if (directory.generation != a.dispatch.identity.generation ||
-              directory.epoch != a.epoch)
-            continue;
-          const auto end = directory.packet_begin + directory.packet_count;
-          received_packets = end > received_packets ? end : received_packets;
-        }
-        std::uint64_t compact_rows = 0ULL;
-        for (std::uint64_t sequence = 0; sequence < received_packets;
-             ++sequence) {
-          const auto header = receive_headers[
-              source_partition * a.max_tokens_per_rank + sequence];
-          for (std::uint64_t row = header.dst_row;
-               row < header.dst_row + header.route_index; ++row)
-            forward_return_fragment_index[
-                source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                compact_rows++] = row;
-        }
-        for (std::uint64_t compact_begin = 0ULL;
-             compact_begin < compact_rows;
-             compact_begin += kForwardReturnChunkRows) {
-          if (chunk_count >= a.forward_return_chunk_capacity) {
-            publish_local_structured_error(
-                status, a.rank, 131U, 1U,
-                a.forward_return_chunk_capacity, chunk_count + 1ULL);
-            break;
+          // All GIN contexts publish an immutable receive directory before
+          // Relay. Packet waves are divided between contexts by wave count,
+          // which can be very uneven in bytes/fan-out.  Relaying only the
+          // directory owned by the matching context left one CTA copying nearly
+          // the entire remote payload while the other progress CTAs were idle.
+          // Wait for the fixed directory set, then stripe every directory
+          // across the fixed context CTA team.  No task space is extended here
+          // and the exact destination-row counters stay the sole FC readiness
+          // condition.
+          if (threadIdx.x == 0U) {
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                directories_ready(scheduler[5U + 2ULL * a.world]);
+            while (directories_ready.load(::cuda::memory_order_acquire) <
+                       a.gin_context_count &&
+                   !forward_cancelled(a)) {
+              __nanosleep(256U);
+            }
           }
-          const auto remaining = compact_rows - compact_begin;
-          const auto chunk_rows = static_cast<std::uint32_t>(
-              remaining < kForwardReturnChunkRows
-                  ? remaining
-                  : kForwardReturnChunkRows);
-          const auto context = static_cast<std::uint32_t>(
-              chunk_count % a.gin_context_count);
-          const auto bytes = static_cast<std::uint64_t>(chunk_rows) *
-                             a.hidden * sizeof(transport::BFloat16);
-          forward_return_chunks[chunk_count] = ForwardReturnChunkRecord{
-              compact_begin, chunk_rows, source_node, context,
-              chunk_rows, bytes};
-          forward_return_chunk_state[chunk_count] = 0ULL;
-          for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail)
-            forward_return_chunk_ready_count[
-                chunk_count * a.local_world_size + rail] = 0ULL;
-          context_completion[source_partition * a.gin_context_count +
-                             context]
-              .return_expected += 1ULL;
-          ++chunk_count;
+          __syncthreads();
         }
-      }
-      std::uint64_t source_compact = 0ULL;
-      for (std::uint64_t wave_position = 0;
-           wave_position < a.dispatch.sizes.packet_count; ++wave_position) {
-        const auto packet = a.dispatch_waves.packet_order[wave_position];
-        if (a.dispatch.packet_headers[packet].destination_node == a.node)
-          continue;
-        const auto begin = a.dispatch.packet_fanout_offsets[packet];
-        const auto end = a.dispatch.packet_fanout_offsets[packet + 1ULL];
-        for (std::uint64_t fanout = begin; fanout < end; ++fanout)
-          forward_return_source_compact_index[fanout] = source_compact++;
-      }
-      scheduler[chunk_count_word] = chunk_count;
-      completion_task(completion, transport_state::TaskClass::Return)
-          .expected = chunk_count;
-      completion->return_local_completion_expected = chunk_count;
-    }
-    __syncthreads();
-    // Install the immutable row-to-proxy/chunk map before publishing the
-    // directory. FC1 may progress concurrently on other CTAs; FC2 acquires
-    // directory_ready before it can expose a ReturnChunk producer count.
-    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        static_cast<std::byte *>(a.gin_window_base) +
-        a.gin_receive_fanout_offset);
-    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
-    for (std::uint64_t chunk_index = 0; chunk_index < chunk_count;
-         ++chunk_index) {
-      const auto chunk = forward_return_chunks[chunk_index];
-      const auto source_partition =
-          chunk.source_node < a.node ? chunk.source_node
-                                     : chunk.source_node - 1U;
-      const auto partition_base =
-          source_partition * a.max_tokens_per_rank *
-          a.dispatch.identity.top_k;
-      for (std::uint64_t row_index = threadIdx.x; row_index < chunk.row_count;
-           row_index += blockDim.x) {
-        const auto fragment = forward_return_fragment_index[
-            partition_base + chunk.row_begin + row_index];
-        const auto target = receive_fanout[partition_base + fragment];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *peer_chunk_map = peer_at<unsigned long long>(
-            a.peer_bases[destination], a.forward_output_ready_epoch_offset);
-        ::cuda::atomic_ref<unsigned long long,
-                           ::cuda::thread_scope_system>
-            published_mapping(peer_chunk_map[target.dst_row]);
-        published_mapping.store(
-            (static_cast<unsigned long long>(a.rank + 1U) << 48U) |
-                (chunk_index + 1ULL),
-            ::cuda::memory_order_release);
+        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+            blockIdx.x >= forward_relay_cta_begin &&
+            blockIdx.x < forward_compute_cta_begin) {
+          // Relay work is row-owned by a static transport team. Wait until the
+          // fixed context CTAs have observed every immutable directory before
+          // dereference.
+          if (threadIdx.x == 0U) {
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                directories_ready(scheduler[5U + 2ULL * a.world]);
+            while (directories_ready.load(::cuda::memory_order_acquire) <
+                       a.gin_context_count &&
+                   !forward_cancelled(a)) {
+              __nanosleep(256U);
+            }
+          }
+          __syncthreads();
+          // Acquire the cross-CTA hand-off before this Relay team dereferences
+          // the registered receive window.  Keeping this fence at the consumer
+          // as well makes the proxy-domain transition explicit for every Relay
+          // SM.
+          asm volatile("fence.proxy.async.global;" : : : "memory");
+          __syncthreads();
+          auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+          auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+              window_bytes + a.gin_receive_header_offset);
+          auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+              window_bytes + a.gin_receive_fanout_offset);
+          auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
+              window_bytes + a.gin_receive_payload_offset);
+          auto *receive_directory =
+              reinterpret_cast<GinDispatchContextRecord *>(
+                  window_bytes + a.gin_receive_dispatch_directory_offset);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
+                                  a.dispatch.sizes.incoming_signal_count,
+                                  a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
+                                  a.dispatch.sizes.incoming_signal_count,
+                                  a.epoch);
+          const auto vector_count = a.hidden / 8ULL;
+          const auto relay_cta =
+              static_cast<std::uint64_t>(blockIdx.x - forward_relay_cta_begin);
+          const auto relay_thread = relay_cta * blockDim.x + threadIdx.x;
+          const auto relay_threads =
+              static_cast<std::uint64_t>(forward_relay_ctas) * blockDim.x;
+          // Stable control path: stripe the complete immutable receive set
+          // across the fixed Relay team, join the team once, then publish row
+          // readiness. This deliberately gives up chunk-level FC1 overlap while
+          // the dedicated Relay queue protocol is being rebuilt, but it
+          // preserves broad vector transactions and makes
+          // payload-before-counter ordering exact.
+          for (std::uint32_t signal_index = 0;
+               signal_index < a.dispatch.sizes.incoming_signal_count;
+               ++signal_index) {
+            const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+            if (signal.source_node == a.node)
+              continue;
+            const auto source_partition = signal.source_node < a.node
+                                              ? signal.source_node
+                                              : signal.source_node - 1U;
+            const auto packet_vectors =
+                a.dispatch.identity.top_k * vector_count;
+            for (std::uint32_t directory_context = 0;
+                 directory_context < a.gin_context_count; ++directory_context) {
+              const auto directory =
+                  receive_directory[source_partition * a.gin_context_count +
+                                    directory_context];
+              for (std::uint64_t item = relay_thread;
+                   item < static_cast<std::uint64_t>(directory.packet_count) *
+                              packet_vectors;
+                   item += relay_threads) {
+                const auto sequence =
+                    directory.packet_begin + item / packet_vectors;
+                const auto within_packet = item % packet_vectors;
+                const auto fanout = within_packet / vector_count;
+                const auto vector = within_packet % vector_count;
+                const auto packet =
+                    source_partition * a.max_tokens_per_rank + sequence;
+                const auto header = receive_headers[packet];
+                if (fanout >= header.route_index)
+                  continue;
+                const auto target =
+                    receive_fanout[source_partition * a.max_tokens_per_rank *
+                                       a.dispatch.identity.top_k +
+                                   header.dst_row + fanout];
+                const auto destination =
+                    a.node * a.local_world_size + target.destination_local_rank;
+                auto *destination_rows = peer_at<transport::BFloat16>(
+                    a.peer_bases[destination], a.canonical_rows_offset);
+                reinterpret_cast<uint4 *>(
+                    destination_rows)[target.dst_row * vector_count + vector] =
+                    reinterpret_cast<const uint4 *>(
+                        receive_payload)[packet * vector_count + vector];
+              }
+              for (std::uint64_t slot = relay_thread;
+                   slot < static_cast<std::uint64_t>(directory.packet_count) *
+                              a.dispatch.identity.top_k;
+                   slot += relay_threads) {
+                const auto sequence =
+                    directory.packet_begin + slot / a.dispatch.identity.top_k;
+                const auto fanout = slot % a.dispatch.identity.top_k;
+                const auto packet =
+                    source_partition * a.max_tokens_per_rank + sequence;
+                const auto header = receive_headers[packet];
+                if (fanout >= header.route_index)
+                  continue;
+                const auto target =
+                    receive_fanout[source_partition * a.max_tokens_per_rank *
+                                       a.dispatch.identity.top_k +
+                                   header.dst_row + fanout];
+                const auto destination =
+                    a.node * a.local_world_size + target.destination_local_rank;
+                auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+                    a.peer_bases[destination], a.direct_headers_offset);
+                const auto route =
+                    header.local_token_id * a.dispatch.identity.top_k +
+                    target.topk_slot;
+                destination_headers[target.dst_row] = LocalP2pRouteHeader{
+                    transport::kActivationTransportSchemaVersion,
+                    header.source_rank,
+                    destination,
+                    header.channel,
+                    header.generation,
+                    header.source_epoch,
+                    header.sequence,
+                    route,
+                    header.local_token_id,
+                    target.dst_row,
+                    target.expert_id,
+                    target.topk_slot};
+              }
+            }
+          }
+          // This is the only inter-CTA rendezvous in the temporary stable
+          // relay. Every Relay CTA has finished all of its vector/header
+          // stripes before any CTA is allowed to release a destination-row
+          // counter.
+          __threadfence_system();
+          asm volatile("fence.proxy.async.global;" : : : "memory");
+          __syncthreads();
+          if (threadIdx.x == 0U) {
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                copy_complete(scheduler[7ULL + 2ULL * a.world]);
+            copy_complete.fetch_add(1ULL, ::cuda::memory_order_release);
+            while (copy_complete.load(::cuda::memory_order_acquire) <
+                       forward_relay_ctas &&
+                   !forward_cancelled(a))
+              __nanosleep(256U);
+          }
+          __syncthreads();
+          for (std::uint32_t signal_index = 0;
+               signal_index < a.dispatch.sizes.incoming_signal_count;
+               ++signal_index) {
+            const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+            if (signal.source_node == a.node)
+              continue;
+            const auto source_partition = signal.source_node < a.node
+                                              ? signal.source_node
+                                              : signal.source_node - 1U;
+            for (std::uint32_t directory_context = 0;
+                 directory_context < a.gin_context_count; ++directory_context) {
+              const auto directory =
+                  receive_directory[source_partition * a.gin_context_count +
+                                    directory_context];
+              for (std::uint64_t slot = relay_thread;
+                   slot < static_cast<std::uint64_t>(directory.packet_count) *
+                              a.dispatch.identity.top_k;
+                   slot += relay_threads) {
+                const auto sequence =
+                    directory.packet_begin + slot / a.dispatch.identity.top_k;
+                const auto fanout = slot % a.dispatch.identity.top_k;
+                const auto packet =
+                    source_partition * a.max_tokens_per_rank + sequence;
+                const auto header = receive_headers[packet];
+                if (fanout >= header.route_index)
+                  continue;
+                const auto target =
+                    receive_fanout[source_partition * a.max_tokens_per_rank *
+                                       a.dispatch.identity.top_k +
+                                   header.dst_row + fanout];
+                const auto destination =
+                    a.node * a.local_world_size + target.destination_local_rank;
+                auto *arrived = peer_at<unsigned long long>(
+                    a.peer_bases[destination], a.x_arrived_rows_offset);
+                const auto rail = a.rank % a.local_world_size;
+                ::cuda::atomic_ref<unsigned long long,
+                                   ::cuda::thread_scope_system>
+                    counter(
+                        arrived[target.reserved * a.local_world_size + rail]);
+                counter.fetch_add(1ULL, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
-        atomicAdd(&completion->bulk_pack_complete, 1ULL);
+                const auto record_index =
+                    source_partition * a.gin_context_count + directory_context;
+                atomicAdd(&context_completion[record_index].relay_fanout_rows,
+                          1ULL);
+                if (target.reserved == 0U)
+                  atomicAdd(&context_completion[record_index].relay_tile0_rows,
+                            1ULL);
+                atomicAdd(&completion->remote_rows_published, 1ULL);
+                if (target.reserved < 64U)
+                  atomicOr(&completion->published_tile_mask,
+                           1ULL << target.reserved);
 #endif
+              }
+            }
+          }
+          __syncthreads();
+          if (relay_cta < a.gin_context_count && threadIdx.x == 0U) {
+            const auto context = static_cast<std::uint32_t>(relay_cta);
+            unsigned long long relayed = 0ULL;
+            for (std::uint32_t remote = 0;
+                 remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
+              const auto index = remote * a.gin_context_count + context;
+              auto &record = context_completion[index];
+              record.relay_claimed = record.relay_expected;
+              record.relay_completed = record.relay_expected;
+              record.last_progress_globaltimer = device_globaltimer_ns();
+              relayed += record.relay_expected;
+            }
+            if (relayed != 0ULL) {
+              claim_completion_tasks(
+                  completion, transport_state::TaskClass::RelayWave, relayed);
+              complete_completion_tasks(
+                  completion, transport_state::TaskClass::RelayWave, relayed);
+            }
+          }
+          MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
+                                  a.dispatch.sizes.incoming_row_count, a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
+                                  a.dispatch.sizes.incoming_row_count, a.epoch);
+        }
+#endif
+        if (threadIdx.x == 0 && dispatch_peer_rows != 0ULL)
+          atomicAdd(&status->actual_dispatch_peer_bytes,
+                    dispatch_peer_rows * a.hidden *
+                        sizeof(transport::BFloat16));
+        // Every participating lane orders its peer payload stores before the
+        // team rendezvous. A fence issued only by the signal lane would not
+        // cover stores performed by the other lanes in the CTA.
+        __threadfence_system();
+        forward_publish_progress(a, kForwardDispatchStored,
+                                 a.dispatch.sizes.route_count);
+        if (!remote_backend_enabled<StaticLocal>(a.use_gin)) {
+          grid.sync();
+          if (blockIdx.x == 0) {
+            const auto first_local =
+                remote_backend_enabled<StaticLocal>(a.use_gin)
+                    ? a.node * a.local_world_size
+                    : 0U;
+            const auto local_count =
+                remote_backend_enabled<StaticLocal>(a.use_gin)
+                    ? a.local_world_size
+                    : a.world;
+            if (threadIdx.x < local_count) {
+              const auto peer = first_local + threadIdx.x;
+              auto *signal = peer_at<unsigned long long>(
+                  a.peer_bases[peer], a.ingress_published_offset);
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_system>
+                  published(signal[a.rank * a.channels]);
+              published.store(a.epoch, ::cuda::memory_order_release);
+            }
+            for (std::uint32_t local_source = threadIdx.x;
+                 local_source < local_count; local_source += blockDim.x) {
+              const auto source = first_local + local_source;
+              auto *signals = peer_at<unsigned long long>(
+                  a.local_base, a.ingress_published_offset);
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_system>
+                  published(signals[source * a.channels]);
+              while (published.load(::cuda::memory_order_acquire) < a.epoch &&
+                     !forward_cancelled(a)) {
+              }
+            }
+          }
+          grid.sync();
+        }
+        forward_publish_progress(a, kForwardDispatchObserved,
+                                 remote_backend_enabled<StaticLocal>(a.use_gin)
+                                     ? a.local_world_size
+                                     : a.world);
       }
+    } else {
+      grid.sync();
+      forward_publish_progress(a, kForwardDispatchStored,
+                               a.dispatch.sizes.route_count);
+      forward_publish_progress(a, kForwardDispatchObserved,
+                               a.dispatch.sizes.incoming_row_count);
     }
-    __threadfence_system();
-    __syncthreads();
-    const auto first_local = a.node * a.local_world_size;
-    for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
-         local += blockDim.x) {
-      const auto peer = first_local + local;
-      auto *ready = peer_at<unsigned long long>(
-          a.peer_bases[peer], a.gin_local_compute_ready_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          published(ready[a.rank]);
-      published.store(a.epoch, ::cuda::memory_order_release);
+    if (!stream_remote_dispatch && blockIdx.x == 0 && threadIdx.x == 0) {
+      status->dispatch_complete_clock = device_globaltimer_ns();
+      status->fc1_start_clock = status->dispatch_complete_clock;
     }
-    __syncthreads();
-    auto *local_ready = peer_at<unsigned long long>(
-        a.local_base, a.gin_local_compute_ready_offset);
-    for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
-         local += blockDim.x) {
-      const auto peer = first_local + local;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          observed(local_ready[peer]);
-      while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
-             !forward_cancelled(a)) {
+    MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
+                            a.dispatch.sizes.mtile_count, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
+                            a.dispatch.sizes.mtile_count, a.epoch);
+
+    if constexpr (KernelRole == ForwardKernelRole::TransportOnly) {
+      if (!stream_remote_return_pipeline) {
+        if (blockIdx.x == 0U && threadIdx.x == 0U)
+          publish_local_structured_error(status, a.rank, 133U, 1U, 1ULL, 0ULL);
+        return;
       }
+      forward_finalize_detail::split_transport_finalize<StaticLocal>(
+          a, *forward_v3_control, completion, scheduler, status);
+      return;
     }
-    __syncthreads();
+
+  } else {
+    // The transport grid owns all generation initialization.  Compute can be
+    // launched immediately on its independent stream and waits only for this
+    // release publication; Dispatch and FC1 then overlap through exact
+    // per-M-block row counters.
     if (threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          directory_ready(scheduler[6ULL + 2ULL * a.world]);
-      directory_ready.store(a.epoch, ::cuda::memory_order_release);
+          setup_ready(scheduler[8ULL + 2ULL * a.world]);
+      while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+             !forward_cancelled(a))
+        __nanosleep(256U);
     }
     __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnDirectoryEnd, GinReturn, 0U,
-                            chunk_count, a.epoch);
   }
-#endif
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   const auto fc1_ntiles =
@@ -5212,1075 +5882,672 @@ local_p2p_forward_megakernel(
   const auto fc2_ntiles =
       static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
   const auto fc2_tasks = forward_mblocks * fc2_ntiles;
-  const bool gin_progress_cta =
+  const bool rdma_worker_cta = KernelRole != ForwardKernelRole::ComputeOnly &&
+                               remote_backend_enabled<StaticLocal>(a.use_gin) &&
+                               blockIdx.x < forward_rdma_ctas;
+  [[maybe_unused]] const bool relay_worker_cta =
+      KernelRole != ForwardKernelRole::ComputeOnly &&
       remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x < a.gin_context_count;
+      blockIdx.x >= forward_relay_cta_begin &&
+      blockIdx.x < forward_compute_cta_begin;
+  // Keep transport and WGMMA roles disjoint for the complete persistent
+  // interval.  In particular, a Relay CTA must not execute generic/proxy
+  // traffic and then enter the dynamic WGMMA register-allocation protocol.
+  const bool transport_worker_cta = rdma_worker_cta || relay_worker_cta;
 
-  // GIN context CTAs remain transport progress workers for the lifetime of
-  // the Dispatch-to-compute interval.  Compute CTAs can consume an exact
-  // M-tile as soon as its row counter reaches the immutable expected value;
-  // both roles rejoin only at the already-proven Bulk Return grid barrier.
-  // This makes role ownership static and keeps the Return state machine
-  // unchanged while Dispatch is made asynchronous.
-  if (!gin_progress_cta) {
-  if (threadIdx.x == 256U) {
-    for (std::uint32_t stage = 0; stage < 4U; ++stage) {
-      full_barriers[stage].init(1);
-      empty_barriers[stage].init(8);
-    }
-    cutlass::arch::fence_barrier_init();
-  }
-  __syncthreads();
-  const auto forward_warpgroup =
-      __shfl_sync(0xffffffffU, threadIdx.x / 128U, 0);
-  if (forward_warpgroup < 2U)
-    cutlass::arch::warpgroup_reg_alloc<224>();
-  else
-    cutlass::arch::warpgroup_reg_dealloc<48>();
-  std::uint32_t pipeline_iteration = 0;
-  __shared__ unsigned long long task_shared;
-  __shared__ unsigned int claim_shared;
-  auto *fc1_claims = claims + forward_mblocks;
-  auto *fc2_claims = fc1_claims + fc1_tasks;
-  constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
-  unsigned int task_in_chunk = kTaskChunk;
-#if MEGAMOE_DEVICE_TIMELINE
-  bool timeline_fc1_started = false;
-#endif
-#if MEGAMOE_DEBUG_VALIDATE
-  if (threadIdx.x == 0U) {
-    completion->fc1_scheduler_value =
-        a.cancel_epoch
-            ? atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
-                               0ULL)
-            : ~0ULL;
-    completion->bulk_local_ready = 10ULL;
-  }
-  __syncthreads();
-#endif
-  while (!forward_cancelled(a)) {
-    if (task_in_chunk == kTaskChunk) {
-      if (threadIdx.x == 0U)
-        task_shared =
-            atomicAdd(&scheduler[0], static_cast<unsigned long long>(kTaskChunk));
+  // Roles are immutable for the Dispatch/FC/streaming-Return interval:
+  // [0,8) owns GIN contexts, [8,16) owns NVLink Relay/directory work, and the
+  // remaining CTAs own WGMMA.  In particular no Relay CTA enters the GEMM
+  // path and no RDMA CTA copies the Dispatch payload into expert arenas.
+  if constexpr (KernelRole != ForwardKernelRole::TransportOnly) {
+    if (!transport_worker_cta) {
+      if (threadIdx.x == 256U) {
+        for (std::uint32_t stage = 0; stage < 3U; ++stage) {
+          fc1_full_barriers[stage].init(1);
+          fc1_empty_barriers[stage].init(8);
+        }
+        for (std::uint32_t stage = 0; stage < 4U; ++stage) {
+          fc2_full_barriers[stage].init(1);
+          fc2_empty_barriers[stage].init(8);
+        }
+        cutlass::arch::fence_barrier_init();
+      }
       __syncthreads();
-      task_in_chunk = 0U;
-    }
-    const auto task = task_shared + task_in_chunk++;
-    if (task >= fc1_tasks)
-      break;
-    const auto mblock = task / fc1_ntiles;
-    const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
-    const auto mapping = claims[mblock];
-    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-    const auto local_mblock = static_cast<std::uint32_t>(mapping);
-    if (threadIdx.x == 0U) {
-      claim_shared = atomicCAS(&fc1_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
-#if MEGAMOE_DEBUG_VALIDATE
-      completion->fc1_scheduler_value = task;
-      completion->bulk_local_ready = 11ULL;
-#endif
-    }
-    __syncthreads();
-    if (claim_shared == 0U)
-      continue;
-    if (expert >= a.dispatch.sizes.owned_expert_count)
-      break;
-    if constexpr (!StaticLocal)
-      if (a.use_gin && threadIdx.x == 0U)
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::Fc1OrDv);
-    const auto row =
-        a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
-    const auto remaining_rows =
-        a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
-    const auto valid_rows = static_cast<std::uint32_t>(
-        remaining_rows < 128ULL ? remaining_rows : 128ULL);
-    wait_forward_mblock_rows<StaticLocal>(
-        a, expert, static_cast<std::uint64_t>(local_mblock) * 128ULL,
-        valid_rows, completion);
-    __syncthreads();
+      // Do not emit SETMAXNREG in the monolithic compatibility kernel. Its
+      // static allocation is already 168 registers/thread (64,512
+      // registers/CTA), and ptxas cannot lower the transport-capable producer
+      // warpgroup to 48. Keeping the ignored alloc/dealloc pair still
+      // introduces warpgroup dependency edges and can strand the TMA producer
+      // behind math warpgroups waiting on its barrier. The split compute kernel
+      // restores the intended 224/48 redistribution once its producer path has
+      // a genuinely small live set.
+      std::uint32_t pipeline_iteration = 0;
+      __shared__ unsigned long long task_shared;
+      __shared__ unsigned int claim_shared;
+      auto *fc1_claims = claims + forward_mblocks;
+      auto *fc2_claims = fc1_claims + fc1_tasks;
+      constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
+      unsigned int task_in_chunk = kTaskChunk;
 #if MEGAMOE_DEVICE_TIMELINE
-    if (!timeline_fc1_started) {
-      MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
-                              a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
-                              a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
-                              a.epoch);
-      timeline_fc1_started = true;
-    }
+      bool timeline_fc1_started = false;
 #endif
-    const auto n = n_tile * 128U;
-    {
-      float accum_a[ForwardMma::kNumAccum];
-      float accum_b[ForwardMma::kNumAccum];
-      forward_wgmma_swiglu_tile(
-          x_map, w1_map, static_cast<std::uint32_t>(row),
-          static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n),
-          static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
-                                     a.intermediate + n),
-          static_cast<std::uint32_t>(a.hidden), smem_a, smem_b,
-          full_barriers, empty_barriers, accum_a, accum_b,
-          pipeline_iteration);
-      visit_forward_accumulator_pair(
-          accum_a, accum_b,
-          [&](std::uint32_t warpgroup, std::uint32_t m,
-              std::uint32_t column, float av0, float av1, float bv0,
-              float bv1) {
-            const auto block_m = warpgroup * 64U + m;
-            const auto output_column =
-                static_cast<std::uint64_t>(n) + column;
-            if (block_m < valid_rows &&
-                output_column + 1ULL < a.intermediate &&
-                (a.intermediate & 1ULL) == 0ULL) {
-              const auto output_index =
-                  (row + block_m) * a.intermediate + output_column;
-              // Each WGMMA lane owns two adjacent BF16 outputs.  Publish the
-              // pair as one naturally aligned store for S and for each cache
-              // plane; scalar struct stores previously doubled the FC1
-              // epilogue store instruction count on the cache fast path.
-              const auto sigmoid0 = 1.0F / (1.0F + __expf(-av0));
-              const auto sigmoid1 = 1.0F / (1.0F + __expf(-av1));
-              const auto pack = [](std::uint16_t low,
-                                   std::uint16_t high) {
-                return static_cast<std::uint32_t>(low) |
-                       (static_cast<std::uint32_t>(high) << 16U);
-              };
-              reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
-                  pack(float_to_bf16_bits((av0 * sigmoid0) * bv0),
-                       float_to_bf16_bits((av1 * sigmoid1) * bv1));
-              if (a.cache_fc1 && ab_cache) {
-                reinterpret_cast<std::uint32_t *>(ab_cache)
-                    [output_index / 2ULL] =
-                    pack(float_to_bf16_bits(av0), float_to_bf16_bits(av1));
-                const auto b_index =
-                    a.max_destination_rows * a.intermediate + output_index;
-                reinterpret_cast<std::uint32_t *>(ab_cache)[b_index / 2ULL] =
-                    pack(float_to_bf16_bits(bv0), float_to_bf16_bits(bv1));
-              }
-            } else if (block_m < valid_rows) {
-              // Retain checked scalar stores for non-main odd-N fixtures.
-              const float av[2] = {av0, av1};
-              const float bv[2] = {bv0, bv1};
-#pragma unroll
-              for (std::uint32_t value = 0; value < 2U; ++value) {
-                const auto tail_column = output_column + value;
-                if (tail_column < a.intermediate) {
+#if MEGAMOE_DEBUG_VALIDATE
+      if (completion != nullptr && threadIdx.x == 0U) {
+        completion->fc1_scheduler_value =
+            a.cancel_epoch
+                ? atomicAdd_system(
+                      const_cast<unsigned long long *>(a.cancel_epoch), 0ULL)
+                : ~0ULL;
+        completion->bulk_local_ready = 10ULL;
+      }
+      __syncthreads();
+#endif
+      while (!forward_cancelled(a)) {
+        if (task_in_chunk == kTaskChunk) {
+          if (threadIdx.x == 0U)
+            task_shared = atomicAdd(
+                &scheduler[0], static_cast<unsigned long long>(kTaskChunk));
+          __syncthreads();
+          task_in_chunk = 0U;
+        }
+        const auto task = task_shared + task_in_chunk++;
+        if (task >= fc1_tasks)
+          break;
+        const auto mblock = task / fc1_ntiles;
+        const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
+        const auto mapping = claims[mblock];
+        const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+        const auto local_mblock = static_cast<std::uint32_t>(mapping);
+        if (threadIdx.x == 0U) {
+          claim_shared =
+              atomicCAS(&fc1_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
+#if MEGAMOE_DEBUG_VALIDATE
+          if (completion != nullptr) {
+            completion->fc1_scheduler_value = task;
+            completion->bulk_local_ready = 11ULL;
+          }
+#endif
+        }
+        __syncthreads();
+        if (claim_shared == 0U)
+          continue;
+        if (expert >= a.dispatch.sizes.owned_expert_count)
+          break;
+        if constexpr (!StaticLocal)
+          if (a.use_gin && threadIdx.x == 0U)
+            claim_completion_tasks(completion,
+                                   transport_state::TaskClass::Fc1OrDv);
+        const auto row =
+            a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
+        const auto remaining_rows =
+            a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
+        const auto valid_rows = static_cast<std::uint32_t>(
+            remaining_rows < 128ULL ? remaining_rows : 128ULL);
+        wait_forward_mblock_rows<StaticLocal>(
+            a, expert, static_cast<std::uint64_t>(local_mblock) * 128ULL,
+            valid_rows, completion);
+        __syncthreads();
+#if MEGAMOE_DEVICE_TIMELINE
+        if (!timeline_fc1_started) {
+          MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U,
+                                  task, a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
+                                  a.epoch);
+          MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
+                                  a.epoch);
+          timeline_fc1_started = true;
+        }
+#endif
+        const auto n = n_tile * 128U;
+        {
+          float accum_a[ForwardMma::kNumAccum];
+          float accum_b[ForwardMma::kNumAccum];
+          forward_wgmma_swiglu_tile(
+              x_map, w1_map, static_cast<std::uint32_t>(row),
+              static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n),
+              static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
+                                         a.intermediate + n),
+              static_cast<std::uint32_t>(a.hidden), smem_a, smem_b,
+              fc1_full_barriers, fc1_empty_barriers, accum_a, accum_b,
+              pipeline_iteration);
+          visit_forward_accumulator_pair(
+              accum_a, accum_b,
+              [&](std::uint32_t warpgroup, std::uint32_t m,
+                  std::uint32_t column, float av0, float av1, float bv0,
+                  float bv1) {
+                const auto block_m = warpgroup * 64U + m;
+                const auto output_column =
+                    static_cast<std::uint64_t>(n) + column;
+                if (block_m < valid_rows &&
+                    output_column + 1ULL < a.intermediate &&
+                    (a.intermediate & 1ULL) == 0ULL) {
                   const auto output_index =
-                      (row + block_m) * a.intermediate + tail_column;
-                  const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
-                  s[output_index] = transport::BFloat16{float_to_bf16_bits(
-                      (av[value] * sigmoid) * bv[value])};
+                      (row + block_m) * a.intermediate + output_column;
+                  // Each WGMMA lane owns two adjacent BF16 outputs.  Publish
+                  // the pair as one naturally aligned store for S and for each
+                  // cache plane; scalar struct stores previously doubled the
+                  // FC1 epilogue store instruction count on the cache fast
+                  // path.
+                  const auto sigmoid0 = 1.0F / (1.0F + __expf(-av0));
+                  const auto sigmoid1 = 1.0F / (1.0F + __expf(-av1));
+                  const auto pack = [](std::uint16_t low, std::uint16_t high) {
+                    return static_cast<std::uint32_t>(low) |
+                           (static_cast<std::uint32_t>(high) << 16U);
+                  };
+                  reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
+                      pack(float_to_bf16_bits((av0 * sigmoid0) * bv0),
+                           float_to_bf16_bits((av1 * sigmoid1) * bv1));
                   if (a.cache_fc1 && ab_cache) {
-                    ab_cache[output_index] =
-                        transport::BFloat16{float_to_bf16_bits(av[value])};
-                    ab_cache[a.max_destination_rows * a.intermediate +
-                             output_index] = transport::BFloat16{
-                        float_to_bf16_bits(bv[value])};
+                    reinterpret_cast<std::uint32_t *>(
+                        ab_cache)[output_index / 2ULL] =
+                        pack(float_to_bf16_bits(av0), float_to_bf16_bits(av1));
+                    const auto b_index =
+                        a.max_destination_rows * a.intermediate + output_index;
+                    reinterpret_cast<std::uint32_t *>(
+                        ab_cache)[b_index / 2ULL] =
+                        pack(float_to_bf16_bits(bv0), float_to_bf16_bits(bv1));
+                  }
+                } else if (block_m < valid_rows) {
+                  // Retain checked scalar stores for non-main odd-N fixtures.
+                  const float av[2] = {av0, av1};
+                  const float bv[2] = {bv0, bv1};
+#pragma unroll
+                  for (std::uint32_t value = 0; value < 2U; ++value) {
+                    const auto tail_column = output_column + value;
+                    if (tail_column < a.intermediate) {
+                      const auto output_index =
+                          (row + block_m) * a.intermediate + tail_column;
+                      const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
+                      s[output_index] = transport::BFloat16{float_to_bf16_bits(
+                          (av[value] * sigmoid) * bv[value])};
+                      if (a.cache_fc1 && ab_cache) {
+                        ab_cache[output_index] =
+                            transport::BFloat16{float_to_bf16_bits(av[value])};
+                        ab_cache[a.max_destination_rows * a.intermediate +
+                                 output_index] =
+                            transport::BFloat16{float_to_bf16_bits(bv[value])};
+                      }
+                    }
                   }
                 }
-              }
-            }
-          });
-    }
-    // FC2 may be claimed by another CTA as soon as this tile increments the
-    // m-block counter. Order every lane's S/checkpoint stores first; a fence
-    // from only the counter lane would not publish the other lanes' writes.
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
-          fc1_done[mblock]);
-      ready.fetch_add(1ULL, ::cuda::memory_order_release);
-    }
-    if constexpr (!StaticLocal)
-      if (a.use_gin && threadIdx.x == 0U)
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::Fc1OrDv);
-    if (threadIdx.x == 0U) {
-      atomicExch(&fc1_claims[task], 2ULL);
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0)
-    atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
-                          a.epoch);
-  forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
-
-  // FC1 transactions issued by this CTA are complete, so this CTA can reset
-  // its private shared barriers and consume any M-block whose release counter
-  // is ready.  There is deliberately no grid-wide FC1/FC2 barrier: late FC1
-  // tiles and ready FC2 tiles overlap across CTAs.
-  if (threadIdx.x == 256U) {
-    for (std::uint32_t stage = 0; stage < 4U; ++stage) {
-      full_barriers[stage].init(1);
-      empty_barriers[stage].init(8);
-    }
-    cutlass::arch::fence_barrier_init();
-  }
-  __syncthreads();
-  pipeline_iteration = 0;
-
-  task_in_chunk = kTaskChunk;
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        directory_ready(scheduler[6ULL + 2ULL * a.world]);
-    while (directory_ready.load(::cuda::memory_order_acquire) < a.epoch &&
-           !forward_cancelled(a)) {
-      if (threadIdx.x == 0U)
-        __nanosleep(256U);
-      __syncthreads();
-    }
-  }
-  while (!forward_cancelled(a)) {
-    if (task_in_chunk == kTaskChunk) {
-      if (threadIdx.x == 0U)
-        task_shared =
-            atomicAdd(&scheduler[1], static_cast<unsigned long long>(kTaskChunk));
-      __syncthreads();
-      task_in_chunk = 0U;
-    }
-    const auto task = task_shared + task_in_chunk++;
-    if (task >= fc2_tasks)
-      break;
-    const auto mblock = task / fc2_ntiles;
-    const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
-    if (threadIdx.x == 0U) {
-      claim_shared = atomicCAS(&fc2_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
-#if MEGAMOE_DEBUG_VALIDATE
-      completion->fc2_scheduler_value = task;
-#endif
-    }
-    __syncthreads();
-    if (claim_shared == 0U)
-      continue;
-    if constexpr (!StaticLocal)
-      if (a.use_gin && threadIdx.x == 0U)
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::Fc2OrDx);
-    if (threadIdx.x == 0)
-      atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
-    const auto mapping = claims[mblock];
-    const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-    const auto local_mblock = static_cast<std::uint32_t>(mapping);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        fc1_ready(fc1_done[mblock]);
-    while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
-           fc1_ntiles) {
-    }
-    __syncthreads();
-    const auto row =
-        a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
-    const auto remaining_rows =
-        a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
-    const auto valid_rows = static_cast<std::uint32_t>(
-        remaining_rows < 128ULL ? remaining_rows : 128ULL);
-    const auto n = n_tile * 256U;
-    float accum[ForwardMmaWide::kNumAccum];
-    forward_wgmma_wide_tile(
-        s_map, w2_map, static_cast<std::uint32_t>(row),
-        static_cast<std::uint32_t>(expert * a.hidden + n),
-        static_cast<std::uint32_t>(a.intermediate), smem_a, smem_b,
-        full_barriers, empty_barriers, accum, pipeline_iteration);
-    visit_forward_accumulator_wide(
-        accum, [&](std::uint32_t warpgroup, std::uint32_t m,
-                   std::uint32_t column, float v0, float v1) {
-      const auto output_column = static_cast<std::uint64_t>(n) + column;
-      const auto block_m = warpgroup * 64U + m;
-      if (block_m < valid_rows && output_column < a.hidden)
-        forward_output[(row + block_m) * a.hidden + output_column] =
-            transport::BFloat16{float_to_bf16_bits(v0)};
-      if (block_m < valid_rows && output_column + 1U < a.hidden)
-        forward_output[(row + block_m) * a.hidden + output_column + 1U] =
-            transport::BFloat16{float_to_bf16_bits(v1)};
-    });
-    // Publish this N tile's canonical stores before exposing completion.  The
-    // CTA that observes the final N tile owns the M-block return; other CTAs
-    // can continue FC2 for unrelated blocks in parallel.
-    __threadfence();
-    __syncthreads();
-    __shared__ unsigned int return_mblock_shared;
-    if (threadIdx.x == 0) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          complete(fc1_done[mblock]);
-      const auto old = complete.fetch_add(1ULL << 16U,
-                                           ::cuda::memory_order_acq_rel);
-      return_mblock_shared =
-          (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
-    }
-    __syncthreads();
-    if (return_mblock_shared != 0U) {
-      // Publish one exact producer fragment per completed canonical row only
-      // after every FC2 N tile for this M-block has stored its output. The row
-      // map selects its immutable same-rail proxy and ReturnChunk; local rows
-      // have mapping zero and never enter the registered GIN staging path.
-      __threadfence_system();
-      for (std::uint32_t ready_row = threadIdx.x;
-           ready_row < valid_rows; ready_row += blockDim.x) {
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            published_mapping(forward_output_ready_epoch[row + ready_row]);
-        const auto mapping =
-            published_mapping.load(::cuda::memory_order_acquire);
-        if (mapping != 0ULL) {
-          const auto proxy_rank =
-              static_cast<std::uint32_t>((mapping >> 48U) - 1ULL);
-          const auto chunk = (mapping & ((1ULL << 48U) - 1ULL)) - 1ULL;
-          auto *peer_ready_count = peer_at<unsigned long long>(
-              a.peer_bases[proxy_rank],
-              a.forward_return_chunk_ready_count_offset);
-          const auto producer_rail = a.rank % a.local_world_size;
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_system>
-              ready(peer_ready_count[chunk * a.local_world_size +
-                                     producer_rail]);
-          ready.fetch_add(1ULL, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
-          atomicAdd(&completion->bulk_contexts_issuing, 1ULL);
-#endif
+              });
         }
-      }
-      __syncthreads();
-      if (threadIdx.x == 0U) {
-        const auto finished =
-            atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
-        if (finished == forward_mblocks) {
-          status->fc2_complete_clock = device_globaltimer_ns();
-          forward_publish_progress(a, kForwardFc2Complete, fc2_tasks);
-        }
-      }
-      __syncthreads();
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
-                            a.epoch);
-    if (return_mblock_shared != 0U &&
-        !remote_backend_enabled<StaticLocal>(a.use_socket)) {
-      // Only lane 0 produces and consumes the peer-row audit count. Keeping
-      // it in CTA shared storage made independent CTAs alias through the
-      // cluster-shared address space under racecheck. A thread-local scalar
-      // has the same audit semantics and no cross-thread lifetime.
-      std::uint32_t return_peer_rows = 0U;
-      if (threadIdx.x == 0)
-        atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-      for (std::uint32_t source = threadIdx.x; source < a.world;
-           source += blockDim.x)
-        return_rows_by_source[source] = 0U;
-      __syncthreads();
-      for (std::uint32_t local_row = 0; local_row < valid_rows; ++local_row) {
-        const auto return_row = row + local_row;
-        const auto header = headers[return_row];
-        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-            header.source_rank / a.local_world_size != a.node)
-          continue;
-        auto *source_contribution = peer_at<transport::BFloat16>(
-            a.peer_bases[header.source_rank], a.contribution_offset);
-        const auto *source128 = reinterpret_cast<const uint4 *>(
-            forward_output + return_row * a.hidden);
-        auto *target128 = reinterpret_cast<uint4 *>(
-            source_contribution + header.route_index * a.hidden);
-        const auto vector_count = a.hidden / 8ULL;
-        for (std::uint64_t vector = threadIdx.x;
-             vector < vector_count; vector += blockDim.x * 2ULL) {
-          target128[vector] = source128[vector];
-          const auto second = vector + blockDim.x;
-          if (second < vector_count)
-            target128[second] = source128[second];
-        }
+        // FC2 may be claimed by another CTA as soon as this tile increments the
+        // m-block counter. Order every lane's S/checkpoint stores first; a
+        // fence from only the counter lane would not publish the other lanes'
+        // writes.
+        __threadfence();
+        __syncthreads();
         if (threadIdx.x == 0) {
-          ++return_rows_by_source[header.source_rank];
-          if (header.source_rank != a.rank)
-            ++return_peer_rows;
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              ready(fc1_done[mblock]);
+          ready.fetch_add(1ULL, ::cuda::memory_order_release);
         }
-      }
-      if (threadIdx.x == 0 && return_peer_rows != 0U)
-        atomicAdd(&status->actual_return_peer_bytes,
-                  static_cast<unsigned long long>(return_peer_rows) *
-                      a.hidden * sizeof(transport::BFloat16));
-      __threadfence_system();
-      __syncthreads();
-      for (std::uint32_t source_rank = threadIdx.x; source_rank < a.world;
-           source_rank += blockDim.x) {
-        if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-            source_rank / a.local_world_size != a.node)
-          continue;
-        const auto rows = return_rows_by_source[source_rank];
-        if (rows == 0U)
-          continue;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed(scheduler[4U + source_rank]);
-        const auto old = completed.fetch_add(rows,
-                                              ::cuda::memory_order_acq_rel);
-        const auto expected = old >> 32U;
-        const auto actual = (old & 0xffffffffULL) + rows;
-        if (actual == expected) {
-          auto *source_signal = peer_at<unsigned long long>(
-              a.peer_bases[source_rank], a.outgoing_sequence_offset);
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-              ready(source_signal[a.rank * a.channels]);
-          ready.store(a.epoch, ::cuda::memory_order_release);
-        }
-      }
-      __syncthreads();
-    }
-    if constexpr (!StaticLocal)
-      if (a.use_gin && threadIdx.x == 0U)
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::Fc2OrDx);
-    if (threadIdx.x == 0U) {
-      atomicExch(&fc2_claims[task], 2ULL);
-    }
-    __syncthreads();
-  }
-#if __has_include(<nccl_device.h>)
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
-    const auto helper = static_cast<std::uint32_t>(blockIdx.x) -
-                        a.gin_context_count;
-    const auto helper_count = gridDim.x - a.gin_context_count;
-    __shared__ unsigned int helper_claimed;
-    for (std::uint64_t candidate = helper; candidate < chunk_count;
-         candidate += helper_count) {
-      if (threadIdx.x == 0U)
-        helper_claimed = 0U;
-      __syncthreads();
-      while (!forward_cancelled(a)) {
+        if constexpr (!StaticLocal)
+          if (a.use_gin && threadIdx.x == 0U)
+            complete_completion_tasks(completion,
+                                      transport_state::TaskClass::Fc1OrDv);
         if (threadIdx.x == 0U) {
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_device>
-              state(forward_return_chunk_state[candidate]);
-          if (state.load(::cuda::memory_order_acquire) !=
-              kReturnChunkWaiting) {
-            helper_claimed = 0U;
-          } else {
-            const auto chunk = forward_return_chunks[candidate];
-            unsigned long long producer_count = 0ULL;
-            for (std::uint32_t producer_rail = 0;
-                 producer_rail < a.local_world_size; ++producer_rail) {
+          atomicExch(&fc1_claims[task], 2ULL);
+        }
+        __syncthreads();
+      }
+      if (threadIdx.x == 0)
+        atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
+      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
+                              a.epoch);
+      forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
+
+      // FC1 transactions issued by this CTA are complete. FC2 consumes its
+      // separately initialized barrier set, so no transaction-barrier object is
+      // reinitialized in place. There is deliberately no grid-wide FC1/FC2
+      // barrier: late FC1 tiles and ready FC2 tiles overlap across CTAs.
+      __syncthreads();
+      pipeline_iteration = 0;
+
+      task_in_chunk = kTaskChunk;
+      if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            directory_ready(scheduler[6ULL + 2ULL * a.world]);
+        while (directory_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+               !forward_cancelled(a)) {
+          if (threadIdx.x == 0U)
+            __nanosleep(256U);
+          __syncthreads();
+        }
+      }
+      while (!forward_cancelled(a)) {
+        if (task_in_chunk == kTaskChunk) {
+          if (threadIdx.x == 0U)
+            task_shared = atomicAdd(
+                &scheduler[1], static_cast<unsigned long long>(kTaskChunk));
+          __syncthreads();
+          task_in_chunk = 0U;
+        }
+        const auto task = task_shared + task_in_chunk++;
+        if (task >= fc2_tasks)
+          break;
+        const auto mblock = task / fc2_ntiles;
+        const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
+        if (threadIdx.x == 0U) {
+          claim_shared =
+              atomicCAS(&fc2_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
+#if MEGAMOE_DEBUG_VALIDATE
+          if (completion != nullptr)
+            completion->fc2_scheduler_value = task;
+#endif
+        }
+        __syncthreads();
+        if (claim_shared == 0U)
+          continue;
+        if constexpr (!StaticLocal)
+          if (a.use_gin && threadIdx.x == 0U)
+            claim_completion_tasks(completion,
+                                   transport_state::TaskClass::Fc2OrDx);
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.use_gin && threadIdx.x == 0U &&
+            blockIdx.x < transport_state::kForwardDebugCtas) {
+          completion->forward_fc2_cta_tiles_started[blockIdx.x] = task + 1ULL;
+          completion->forward_fc2_cta_last_task[blockIdx.x] = task;
+          completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
+              (1ULL << 32U) | pipeline_iteration;
+        }
+#endif
+        if (threadIdx.x == 0)
+          atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
+        const auto mapping = claims[mblock];
+        const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+        const auto local_mblock = static_cast<std::uint32_t>(mapping);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            fc1_ready(fc1_done[mblock]);
+        while ((fc1_ready.load(::cuda::memory_order_acquire) & 0xffffffffULL) <
+               fc1_ntiles) {
+        }
+        __syncthreads();
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.use_gin && threadIdx.x == 0U &&
+            blockIdx.x < transport_state::kForwardDebugCtas)
+          completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
+              (2ULL << 32U) | pipeline_iteration;
+#endif
+        const auto row =
+            a.dispatch.expert_row_prefix[expert] + local_mblock * 128ULL;
+        const auto remaining_rows =
+            a.dispatch.expert_row_count[expert] - local_mblock * 128ULL;
+        const auto valid_rows = static_cast<std::uint32_t>(
+            remaining_rows < 128ULL ? remaining_rows : 128ULL);
+        const auto n = n_tile * 256U;
+        float accum[ForwardMmaWide::kNumAccum];
+        forward_wgmma_tile<ForwardMmaWide, 256U>(
+            s_map, w2_map, static_cast<std::uint32_t>(row),
+            static_cast<std::uint32_t>(expert * a.hidden + n),
+            static_cast<std::uint32_t>(a.intermediate), smem_a, smem_b,
+            fc2_full_barriers, fc2_empty_barriers, accum, pipeline_iteration, 0U
+#if MEGAMOE_DEBUG_VALIDATE
+            ,
+            a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas
+                ? &completion->forward_fc2_cta_producer_checkpoint[blockIdx.x]
+                : nullptr,
+            a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas
+                ? &completion->forward_fc2_cta_math0_checkpoint[blockIdx.x]
+                : nullptr,
+            a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas
+                ? &completion->forward_fc2_cta_math1_checkpoint[blockIdx.x]
+                : nullptr
+#endif
+        );
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.use_gin && threadIdx.x == 0U &&
+            blockIdx.x < transport_state::kForwardDebugCtas)
+          completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
+              (3ULL << 32U) | pipeline_iteration;
+#endif
+        visit_forward_accumulator_wide(accum, [&](std::uint32_t warpgroup,
+                                                  std::uint32_t m,
+                                                  std::uint32_t column,
+                                                  float v0, float v1) {
+          const auto output_column = static_cast<std::uint64_t>(n) + column;
+          const auto block_m = warpgroup * 64U + m;
+          if (block_m < valid_rows && output_column < a.hidden)
+            forward_output[(row + block_m) * a.hidden + output_column] =
+                transport::BFloat16{float_to_bf16_bits(v0)};
+          if (block_m < valid_rows && output_column + 1U < a.hidden)
+            forward_output[(row + block_m) * a.hidden + output_column + 1U] =
+                transport::BFloat16{float_to_bf16_bits(v1)};
+        });
+        // Publish this N tile's canonical stores before exposing completion.
+        // The CTA that observes the final N tile owns the M-block return; other
+        // CTAs can continue FC2 for unrelated blocks in parallel.
+        __threadfence();
+        __syncthreads();
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.use_gin && threadIdx.x == 0U &&
+            blockIdx.x < transport_state::kForwardDebugCtas)
+          completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
+              (4ULL << 32U) | pipeline_iteration;
+#endif
+        __shared__ unsigned int return_mblock_shared;
+        if (threadIdx.x == 0) {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              complete(fc1_done[mblock]);
+          const auto old =
+              complete.fetch_add(1ULL << 16U, ::cuda::memory_order_acq_rel);
+          return_mblock_shared =
+              (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
+        }
+        __syncthreads();
+        if (return_mblock_shared != 0U) {
+          // Preserve the monolithic local/socket completion accounting. The
+          // cross-node build always uses the split FULL descriptor path.
+          __threadfence_system();
+          __syncthreads();
+          if (threadIdx.x == 0U) {
+            const auto finished =
+                atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
+            if (finished == forward_mblocks) {
+              status->fc2_complete_clock = device_globaltimer_ns();
+              forward_publish_progress(a, kForwardFc2Complete, fc2_tasks);
+            }
+          }
+          __syncthreads();
+        }
+        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
+                                a.epoch);
+        if (return_mblock_shared != 0U &&
+            !remote_backend_enabled<StaticLocal>(a.use_socket)) {
+          // Only lane 0 produces and consumes the peer-row audit count. Keeping
+          // it in CTA shared storage made independent CTAs alias through the
+          // cluster-shared address space under racecheck. A thread-local scalar
+          // has the same audit semantics and no cross-thread lifetime.
+          std::uint32_t return_peer_rows = 0U;
+          if (threadIdx.x == 0)
+            atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+          for (std::uint32_t source = threadIdx.x; source < a.world;
+               source += blockDim.x)
+            return_rows_by_source[source] = 0U;
+          __syncthreads();
+          for (std::uint32_t local_row = 0; local_row < valid_rows;
+               ++local_row) {
+            const auto return_row = row + local_row;
+            const auto header = headers[return_row];
+            if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+                header.source_rank / a.local_world_size != a.node)
+              continue;
+            auto *source_contribution = peer_at<transport::BFloat16>(
+                a.peer_bases[header.source_rank], a.contribution_offset);
+            const auto *source128 = reinterpret_cast<const uint4 *>(
+                forward_output + return_row * a.hidden);
+            auto *target128 = reinterpret_cast<uint4 *>(
+                source_contribution + header.route_index * a.hidden);
+            const auto vector_count = a.hidden / 8ULL;
+            for (std::uint64_t vector = threadIdx.x; vector < vector_count;
+                 vector += blockDim.x * 2ULL) {
+              target128[vector] = source128[vector];
+              const auto second = vector + blockDim.x;
+              if (second < vector_count)
+                target128[second] = source128[second];
+            }
+            if (threadIdx.x == 0) {
+              ++return_rows_by_source[header.source_rank];
+              if (header.source_rank != a.rank)
+                ++return_peer_rows;
+            }
+          }
+          if (threadIdx.x == 0 && return_peer_rows != 0U)
+            atomicAdd(&status->actual_return_peer_bytes,
+                      static_cast<unsigned long long>(return_peer_rows) *
+                          a.hidden * sizeof(transport::BFloat16));
+          __threadfence_system();
+          __syncthreads();
+          for (std::uint32_t source_rank = threadIdx.x; source_rank < a.world;
+               source_rank += blockDim.x) {
+            if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+                source_rank / a.local_world_size != a.node)
+              continue;
+            const auto rows = return_rows_by_source[source_rank];
+            if (rows == 0U)
+              continue;
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                completed(scheduler[4U + source_rank]);
+            const auto old =
+                completed.fetch_add(rows, ::cuda::memory_order_acq_rel);
+            const auto expected = old >> 32U;
+            const auto actual = (old & 0xffffffffULL) + rows;
+            if (actual == expected) {
+              auto *source_signal = peer_at<unsigned long long>(
+                  a.peer_bases[source_rank], a.outgoing_sequence_offset);
               ::cuda::atomic_ref<unsigned long long,
                                  ::cuda::thread_scope_system>
-                  producers(forward_return_chunk_ready_count[
-                      candidate * a.local_world_size + producer_rail]);
-              producer_count +=
-                  producers.load(::cuda::memory_order_acquire);
+                  ready(source_signal[a.rank * a.channels]);
+              ready.store(a.epoch, ::cuda::memory_order_release);
             }
-            if (producer_count == chunk.expected_fragments &&
-                atomicCAS(&forward_return_chunk_state[candidate],
-                          kReturnChunkWaiting, kReturnChunkPacking) ==
-                    kReturnChunkWaiting)
-              helper_claimed = 1U;
-            else
-              helper_claimed = 2U;
           }
-        }
-        __syncthreads();
-        if (helper_claimed == 1U) {
-          const auto chunk = forward_return_chunks[candidate];
-          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherStart, GinReturn,
-                                  helper, chunk.payload_bytes, a.epoch);
-          pack_forward_return_chunk(a, chunk,
-                                    forward_return_fragment_index);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherEnd, GinReturn,
-                                  helper, chunk.payload_bytes, a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherCtaBytes,
-                                  GinReturn, helper, chunk.payload_bytes,
-                                  a.epoch);
-          if (threadIdx.x == 0U)
-            atomicExch(&forward_return_chunk_state[candidate],
-                       kReturnChunkReady);
           __syncthreads();
-          break;
         }
-        if (helper_claimed == 0U)
-          break;
-        if (threadIdx.x == 0U)
-          __nanosleep(256U);
-        __syncthreads();
-      }
-    }
-  }
-#endif
-  } else {
-#if __has_include(<nccl_device.h>)
-    // Dedicated context CTAs overlap FC2 with Return.  Every context owns a
-    // disjoint static subset of chunks and keeps up to one completion batch
-    // outstanding; a not-yet-ready chunk never blocks another context.
-    const auto context = static_cast<std::uint32_t>(blockIdx.x);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        directory_ready(scheduler[6ULL + 2ULL * a.world]);
-    while (directory_ready.load(::cuda::memory_order_acquire) < a.epoch &&
-           !forward_cancelled(a)) {
-      if (threadIdx.x == 0U)
-        __nanosleep(256U);
-      __syncthreads();
-    }
-    // chunk_count is part of the immutable directory publication. Reading it
-    // before the acquire wait allowed a fast context to cache the setup-time
-    // zero, conclude that its task space was empty, and leave while the peer
-    // still expected a ReturnChunk signal.
-    const auto chunk_count = scheduler[4ULL + 2ULL * a.world];
-    const ncclGin gin(a.gin_dev_comm, context);
-    const auto rail = ncclTeamRail(a.gin_dev_comm);
-    __shared__ unsigned long long selected_chunk;
-    __shared__ unsigned int chunk_ready;
-    __shared__ unsigned int batch_count;
-    __shared__ unsigned long long batch_chunks[kForwardReturnCompletionBatch];
-    __shared__ unsigned long long context_expected;
-    __shared__ unsigned long long context_completed;
-    __shared__ unsigned long long issued_total;
-    if (threadIdx.x == 0U) {
-      context_expected = 0ULL;
-      context_completed = 0ULL;
-      issued_total = 0ULL;
-      batch_count = 0U;
-      for (std::uint64_t chunk = context; chunk < chunk_count;
-           chunk += a.gin_context_count)
-        ++context_expected;
-    }
-    __syncthreads();
-
-    while (context_completed < context_expected && !forward_cancelled(a)) {
-      selected_chunk = ~0ULL;
-      __syncthreads();
-      for (std::uint64_t candidate = context;
-           candidate < chunk_count && selected_chunk == ~0ULL;
-           candidate += a.gin_context_count) {
-        if (threadIdx.x == 0U) {
-          const auto chunk = forward_return_chunks[candidate];
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_device>
-              state(forward_return_chunk_state[candidate]);
-          unsigned long long producer_count = 0ULL;
-#if MEGAMOE_DEBUG_VALIDATE
-          unsigned long long producer_rails = 0ULL;
-#endif
-          for (std::uint32_t producer_rail = 0;
-               producer_rail < a.local_world_size; ++producer_rail) {
-            ::cuda::atomic_ref<unsigned long long,
-                               ::cuda::thread_scope_system>
-                producers(forward_return_chunk_ready_count[
-                    candidate * a.local_world_size + producer_rail]);
-            const auto rail_count =
-                producers.load(::cuda::memory_order_acquire);
-            producer_count += rail_count;
-#if MEGAMOE_DEBUG_VALIDATE
-            producer_rails |=
-                (rail_count & 0xffULL) << (producer_rail * 8U);
-#endif
-          }
-#if MEGAMOE_DEBUG_VALIDATE
-          const auto source_partition =
-              chunk.source_node < a.node ? chunk.source_node
-                                         : chunk.source_node - 1U;
-          auto &debug_record = context_completion[
-              source_partition * a.gin_context_count + context];
-          debug_record.last_cursor = producer_count;
-          debug_record.dispatch_fanout_rows = producer_rails;
-#endif
-          const auto current = state.load(::cuda::memory_order_acquire);
-          chunk_ready = current == kReturnChunkReady
-                            ? 1U
-                            : (current == kReturnChunkWaiting &&
-                                       producer_count ==
-                                           chunk.expected_fragments
-                                   ? 2U
-                                   : 0U);
-        }
-        __syncthreads();
-        if (threadIdx.x == 0U) {
-          if (chunk_ready == 1U &&
-              atomicCAS(&forward_return_chunk_state[candidate],
-                        kReturnChunkReady, kReturnChunkInflight) ==
-                  kReturnChunkReady)
-            selected_chunk = candidate;
-          else if (chunk_ready == 2U &&
-                   atomicCAS(&forward_return_chunk_state[candidate],
-                             kReturnChunkWaiting, kReturnChunkPacking) ==
-                       kReturnChunkWaiting)
-            selected_chunk = candidate;
-        }
-        __syncthreads();
-      }
-      if (selected_chunk == ~0ULL) {
-        // Before the first FC2 tile becomes ready there can be tens of
-        // milliseconds of GEMM work. Tight polling from every GIN context
-        // needlessly saturates L2/atomic fabric and throttles WGMMA CTAs. A
-        // bounded device backoff preserves microsecond-scale first-chunk
-        // while allowing the compute pipeline to use the machine.
-        if (threadIdx.x == 0U)
-          __nanosleep(2048U);
-        __syncthreads();
-        continue;
-      }
-
-      const auto chunk = forward_return_chunks[selected_chunk];
-      const auto source_partition =
-          chunk.source_node < a.node ? chunk.source_node
-                                     : chunk.source_node - 1U;
-      const auto partition_base = source_partition * a.max_tokens_per_rank *
-                                  a.dispatch.identity.top_k;
-      const auto packed_base = partition_base + chunk.row_begin;
-      if (chunk_ready == 2U) {
-        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherStart, GinReturn,
-                                context, chunk.payload_bytes, a.epoch);
-        pack_forward_return_chunk(a, chunk,
-                                  forward_return_fragment_index);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherEnd, GinReturn,
-                                context, chunk.payload_bytes, a.epoch);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGatherCtaBytes, GinReturn,
-                                context, chunk.payload_bytes, a.epoch);
-        if (threadIdx.x == 0U)
-          atomicExch(&forward_return_chunk_state[selected_chunk],
-                     kReturnChunkInflight);
-        __syncthreads();
-      }
-      if (threadIdx.x == 0U) {
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::Return);
-        const auto record_index =
-            source_partition * a.gin_context_count + context;
-        context_completion[record_index].return_claimed += 1ULL;
-        context_completion[record_index].inflight += 1ULL;
-        MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn,
-                                context, chunk.payload_bytes, a.epoch);
-        gin.put(rail, static_cast<int>(chunk.source_node), a.gin_window,
-                a.gin_return_receive_offset +
-                    chunk.row_begin * a.hidden *
-                        sizeof(transport::BFloat16),
-                a.gin_window,
-                a.gin_return_staging_offset +
-                    packed_base * a.hidden * sizeof(transport::BFloat16),
-                chunk.payload_bytes, ncclGin_SignalInc{1},
-                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
-                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-        atomicAdd(&status->gin_return_put_count, 1ULL);
-        atomicAdd(&status->gin_signal_count, 1ULL);
-        atomicAdd(&status->gin_return_payload_bytes, chunk.payload_bytes);
-        batch_chunks[batch_count++] = selected_chunk;
-        ++issued_total;
-      }
-      __syncthreads();
-
-      if (batch_count == kForwardReturnCompletionBatch ||
-          issued_total == context_expected) {
-        if (threadIdx.x == 0U) {
-          gin.waitCounter(ncclCoopThread{}, 0, issued_total);
-          for (std::uint32_t batch = 0; batch < batch_count; ++batch) {
-            atomicExch(&forward_return_chunk_state[batch_chunks[batch]],
-                       kReturnChunkComplete);
+        if constexpr (!StaticLocal)
+          if (a.use_gin && threadIdx.x == 0U)
             complete_completion_tasks(completion,
-                                      transport_state::TaskClass::Return);
-            const auto completed_chunk =
-                forward_return_chunks[batch_chunks[batch]];
-            const auto completed_partition =
-                completed_chunk.source_node < a.node
-                    ? completed_chunk.source_node
-                    : completed_chunk.source_node - 1U;
-            auto &record = context_completion[
-                completed_partition * a.gin_context_count + context];
-            record.return_completed += 1ULL;
-            record.inflight -= 1ULL;
-            record.local_completion += 1ULL;
-            record.last_progress_globaltimer = device_globaltimer_ns();
-            ++context_completed;
-          }
-          atomicAdd(&completion->return_local_completion_completed,
-                    batch_count);
-          batch_count = 0U;
+                                      transport_state::TaskClass::Fc2OrDx);
+#if MEGAMOE_DEBUG_VALIDATE
+        if (a.use_gin && threadIdx.x == 0U &&
+            blockIdx.x < transport_state::kForwardDebugCtas) {
+          completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
+              (5ULL << 32U) | pipeline_iteration;
+          completion->forward_fc2_cta_tiles_completed[blockIdx.x] = task + 1ULL;
+        }
+#endif
+        if (threadIdx.x == 0U) {
+          atomicExch(&fc2_claims[task], 2ULL);
         }
         __syncthreads();
       }
+      // Return chunks have a single owner: their GIN context CTA. Allowing
+      // completed compute CTAs to race those owners for WAITING -> PACKING made
+      // the release kernel timing-dependent and could strand a context in its
+      // terminal wait. The fixed progress team is sufficient to gather while
+      // FC2 continues and keeps pack, issue, and completion ordered in one CTA.
     }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
-                            context, context_completed, a.epoch);
-#endif
   }
-#if __has_include(<nccl_device.h>)
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    // All FC2 rows are now available. Each same-rail proxy gathers its remote
-    // packet's local fan-out directly from node-local expert arenas.  The full
-    // persistent grid performs the NVLink gather/scatter; only the bounded GIN
-    // context CTAs enqueue the batched rail puts.
-    if (threadIdx.x == 0U) {
-      atomicAdd(gin_progress_cta
-                    ? &completion->progress_ctas_at_bulk_return
-                    : &completion->compute_ctas_at_bulk_return,
-                1ULL);
-      completion->grid_ctas_expected = gridDim.x;
-    }
-    grid.sync();
-    auto *gin_window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    if (a.forward_return_chunk_capacity == 0ULL) {
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackStart, GinReturn, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-    const auto first_local = a.node * a.local_world_size;
-    if (blockIdx.x == 0U) {
-      for (std::uint32_t local = threadIdx.x;
-           local < a.local_world_size; local += blockDim.x) {
-        const auto peer = first_local + local;
-        auto *ready = peer_at<unsigned long long>(
-            a.peer_bases[peer], a.gin_local_compute_ready_offset);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            published(ready[a.rank]);
-        published.store(a.epoch, ::cuda::memory_order_release);
-      }
-      __syncthreads();
-      auto *local_ready = peer_at<unsigned long long>(
-          a.local_base, a.gin_local_compute_ready_offset);
-      for (std::uint32_t local = threadIdx.x;
-           local < a.local_world_size; local += blockDim.x) {
-        const auto peer = first_local + local;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            observed(local_ready[peer]);
-        while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
-               !forward_cancelled(a)) {
-        }
-      }
-    }
-    grid.sync();
-    if (blockIdx.x == 0U && threadIdx.x == 0U)
-      completion->bulk_local_ready = 1ULL;
-    auto *gin_receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        gin_window_bytes + a.gin_receive_header_offset);
-    auto *gin_receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        gin_window_bytes + a.gin_receive_fanout_offset);
-    auto *gin_return_staging = reinterpret_cast<transport::BFloat16 *>(
-        gin_window_bytes + a.gin_return_staging_offset);
-#if MEGAMOE_DEVICE_TIMELINE
-    __shared__ unsigned long long return_pack_cta_bytes;
-    if (threadIdx.x == 0U)
-      return_pack_cta_bytes = 0ULL;
-    __syncthreads();
-    unsigned long long return_pack_thread_bytes = 0ULL;
-#endif
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint64_t item = global_thread;
-           item < signal.expected_packets * packet_vectors;
-           item += global_threads) {
-        const auto sequence = item / packet_vectors;
-        const auto within_packet = item % packet_vectors;
-        const auto fanout = within_packet / vector_count;
-        const auto vector = within_packet % vector_count;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = gin_receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = gin_receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        const auto *destination_output = peer_at<transport::BFloat16>(
-            a.peer_bases[destination], a.forward_output_rows_offset);
-        reinterpret_cast<uint4 *>(gin_return_staging)[
-            ((source_partition * a.max_tokens_per_rank *
-                  a.dispatch.identity.top_k +
-              header.dst_row + fanout) *
-                 vector_count) +
-            vector] = reinterpret_cast<const uint4 *>(destination_output)[
-            target.dst_row * vector_count + vector];
-#if MEGAMOE_DEVICE_TIMELINE
-        return_pack_thread_bytes += sizeof(uint4);
-#endif
-      }
-    }
-#if MEGAMOE_DEVICE_TIMELINE
-    atomicAdd(&return_pack_cta_bytes, return_pack_thread_bytes);
-    __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackCtaBytes, GinReturn, 0U,
-                            return_pack_cta_bytes, a.epoch);
-#endif
-    __threadfence_system();
-    grid.sync();
-    if (blockIdx.x == 0U && threadIdx.x == 0U)
-      completion->bulk_pack_complete = 1ULL;
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnPackEnd, GinReturn, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-    if (blockIdx.x < a.gin_context_count) {
-      const auto context = static_cast<std::uint32_t>(blockIdx.x);
-      if (threadIdx.x == 0U)
-        atomicAdd(&completion->bulk_contexts_issuing, 1ULL);
-      const ncclGin gin(a.gin_dev_comm, context);
-      const auto rail = ncclTeamRail(a.gin_dev_comm);
-      auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-      auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-          window_bytes + a.gin_receive_header_offset);
-      unsigned long long return_puts = 0ULL;
-      for (std::uint32_t signal_index = 0;
-           signal_index < a.dispatch.sizes.incoming_signal_count;
-           ++signal_index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-        if (signal.source_node == a.node)
-          continue;
-        const auto source_partition =
-            signal.source_node < a.node ? signal.source_node
-                                        : signal.source_node - 1U;
-        const auto sequence_begin =
-            signal.expected_packets * context / a.gin_context_count;
-        const auto sequence_end = signal.expected_packets * (context + 1U) /
-                                  a.gin_context_count;
-        std::uint64_t first_return = 0;
-        std::uint64_t last_return = 0;
-        for (std::uint64_t sequence = sequence_begin;
-             sequence < sequence_end; ++sequence) {
-          const auto packet =
-              source_partition * a.max_tokens_per_rank + sequence;
-          const auto header = receive_headers[packet];
-          const auto fanout_count = header.route_index;
-          if (sequence == sequence_begin)
-            first_return = header.dst_row;
-          last_return = header.dst_row + fanout_count;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0U && last_return != first_return) {
-          claim_completion_tasks(completion,
-                                 transport_state::TaskClass::Return);
-          const auto record_index =
-              source_partition * a.gin_context_count + context;
-          context_completion[record_index].return_claimed += 1ULL;
-          context_completion[record_index].inflight += 1ULL;
-          MEGAMOE_TIMELINE_RECORD(
-              a.timeline, ReturnGinPutIssue, GinReturn, context,
-              (last_return - first_return) * a.hidden *
-                  sizeof(transport::BFloat16),
-              a.epoch);
-          gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
-                  a.gin_return_receive_offset +
-                      first_return * a.hidden *
-                          sizeof(transport::BFloat16),
-                  a.gin_window,
-                  a.gin_return_staging_offset +
-                      (source_partition * a.max_tokens_per_rank *
-                               a.dispatch.identity.top_k +
-                       first_return) *
-                          a.hidden * sizeof(transport::BFloat16),
-                  (last_return - first_return) * a.hidden *
-                      sizeof(transport::BFloat16),
-                  ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
-                  ncclCoopThread{}, ncclGin_None{},
-                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-          atomicAdd(&status->gin_return_put_count, 1ULL);
-          atomicAdd(&status->gin_signal_count, 1ULL);
-          atomicAdd(&status->gin_return_payload_bytes,
-                    (last_return - first_return) * a.hidden *
-                        sizeof(transport::BFloat16));
-          ++return_puts;
-        }
-        __syncthreads();
-      }
-      if (threadIdx.x == 0U && return_puts != 0ULL)
-        gin.waitCounter(ncclCoopThread{}, 0, return_puts);
-      if (threadIdx.x == 0U && return_puts != 0ULL) {
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::Return,
-                                  return_puts);
-        atomicAdd(&completion->return_local_completion_completed,
-                  return_puts);
-        for (std::uint32_t signal_index = 0;
-             signal_index < a.dispatch.sizes.incoming_signal_count;
-             ++signal_index) {
-          const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-          if (signal.source_node == a.node)
-            continue;
-          const auto begin =
-              signal.expected_packets * context / a.gin_context_count;
-          const auto end = signal.expected_packets * (context + 1U) /
-                           a.gin_context_count;
-          if (begin == end)
-            continue;
-          const auto source_partition =
-              signal.source_node < a.node ? signal.source_node
-                                          : signal.source_node - 1U;
-          auto &record = context_completion[
-              source_partition * a.gin_context_count + context];
-          record.return_completed += 1ULL;
-          record.inflight -= 1ULL;
-          record.local_completion += 1ULL;
-          record.last_progress_globaltimer = device_globaltimer_ns();
-        }
-      }
-      MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
-                              context, return_puts, a.epoch);
-      __syncthreads();
-      unsigned long long outgoing_remote_packets = 0ULL;
-      unsigned long long outgoing_remote_fanout = 0ULL;
-      if (threadIdx.x == 0U) {
-        std::uint64_t total = 0;
-        for (std::uint64_t packet = 0;
-             packet < a.dispatch.sizes.packet_count; ++packet)
-          if (a.dispatch.packet_headers[packet].destination_node != a.node)
-            ++total;
-        const auto begin = total * context / a.gin_context_count;
-        const auto end = total * (context + 1U) / a.gin_context_count;
-        outgoing_remote_packets = end - begin;
-        for (std::uint64_t packet = 0;
-             packet < a.dispatch.sizes.packet_count; ++packet) {
-          const auto descriptor = a.dispatch.packet_headers[packet];
-          if (descriptor.destination_node == a.node ||
-              descriptor.sequence_on_link < begin ||
-              descriptor.sequence_on_link >= end)
-            continue;
-          outgoing_remote_fanout +=
-              a.dispatch.packet_fanout_offsets[packet + 1U] -
-              a.dispatch.packet_fanout_offsets[packet];
-        }
-        if (outgoing_remote_packets != 0ULL)
-          gin.waitSignal(ncclCoopThread{}, 1, 1);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
-                                context, outgoing_remote_packets, a.epoch);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            phase(scheduler[2]);
-        phase.fetch_add(1ULL, ::cuda::memory_order_release);
-      }
-      __syncthreads();
-      if (threadIdx.x == 0U)
-        atomicAdd(&status->actual_return_peer_bytes,
-                  outgoing_remote_fanout *
-                      a.hidden * sizeof(transport::BFloat16));
-    }
-    } else if (blockIdx.x < a.gin_context_count) {
-      // The destination issued one signal per immutable ReturnChunk.  The
-      // source derives the same chunk cardinality from its frozen outgoing
-      // fan-out descriptors, so no dynamic producer can extend the terminal
-      // condition after the kernel starts.
-      const auto context = static_cast<std::uint32_t>(blockIdx.x);
-      const ncclGin gin(a.gin_dev_comm, context);
-      unsigned long long outgoing_remote_fanout = 0ULL;
-      if (threadIdx.x == 0U) {
-        for (std::uint64_t packet = 0;
-             packet < a.dispatch.sizes.packet_count; ++packet) {
-          const auto descriptor = a.dispatch.packet_headers[packet];
-          if (descriptor.destination_node == a.node)
-            continue;
-          const auto begin = a.dispatch.packet_fanout_offsets[packet];
-          const auto end = a.dispatch.packet_fanout_offsets[packet + 1ULL];
-          outgoing_remote_fanout += end - begin;
-        }
-        const auto chunks =
-            (outgoing_remote_fanout + kForwardReturnChunkRows - 1ULL) /
-            kForwardReturnChunkRows;
-        const auto context_chunks =
-            chunks > context
-                ? 1ULL + (chunks - 1ULL - context) / a.gin_context_count
-                : 0ULL;
-        if (context_chunks != 0ULL)
-          gin.waitSignal(ncclCoopThread{}, 1, context_chunks);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
-                                context, context_chunks, a.epoch);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            phase(scheduler[2]);
-        phase.fetch_add(1ULL, ::cuda::memory_order_release);
-        if (context == 0U)
-          atomicAdd(&status->actual_return_peer_bytes,
-                    outgoing_remote_fanout * a.hidden *
-                        sizeof(transport::BFloat16));
-      }
-      __syncthreads();
-    }
-    grid.sync();
-    if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
-      while (phase.load(::cuda::memory_order_acquire) <
-             a.gin_context_count) {
-      }
-    }
-    __syncthreads();
-    auto *gin_return_receive = reinterpret_cast<transport::BFloat16 *>(
-        gin_window_bytes + a.gin_return_receive_offset);
-    auto *local_contribution = peer_at<transport::BFloat16>(
-        a.local_base, a.contribution_offset);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayStart, SourceRelay, 0U,
-                            a.dispatch.sizes.packet_count, a.epoch);
-    const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-    for (std::uint64_t item = global_thread;
-         item < a.dispatch.sizes.packet_count * packet_vectors;
-         item += global_threads) {
-      const auto packet = item / packet_vectors;
-      const auto within_packet = item % packet_vectors;
-      const auto fanout_slot = within_packet / vector_count;
-      const auto vector = within_packet % vector_count;
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (fanout_slot >= fanout_end - fanout_begin)
-        continue;
-      const auto fanout = fanout_begin + fanout_slot;
-      const auto target = a.dispatch.packet_fanout[fanout];
-      const auto route = descriptor.local_token_id *
-                             a.dispatch.identity.top_k +
-                         target.topk_slot;
-      reinterpret_cast<uint4 *>(local_contribution)[
-          route * vector_count + vector] =
-          reinterpret_cast<const uint4 *>(gin_return_receive)[
-              forward_return_source_compact_index[fanout] * vector_count +
-              vector];
-    }
-    __threadfence_system();
-    grid.sync();
-    if (blockIdx.x == 0U && threadIdx.x == 0U) {
-      const auto arrivals = completion_task(
-          completion, transport_state::TaskClass::SourceArrival).expected;
-      if (arrivals != 0ULL) {
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::SourceArrival,
-                               arrivals);
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::SourceArrival,
-                                  arrivals);
-      }
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay, 0U,
-                            a.dispatch.sizes.route_count, a.epoch);
-    if (blockIdx.x == 0U) {
-      for (std::uint32_t destination = threadIdx.x;
-           destination < a.world; destination += blockDim.x) {
-        if (destination / a.local_world_size == a.node)
-          continue;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            ready(peer_at<unsigned long long>(
-                a.local_base, a.outgoing_sequence_offset)
-                      [destination * a.channels]);
-        ready.store(a.epoch, ::cuda::memory_order_release);
-      }
-    }
-    grid.sync();
-  }
-#endif
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
   }
 #endif
-  if (remote_backend_enabled<StaticLocal>(a.use_socket)) {
+  if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
+    if (remote_backend_enabled<StaticLocal>(a.use_socket)) {
+      grid.sync();
+      if (blockIdx.x == 0 && threadIdx.x == 0 &&
+          a.injected_status_error_rank == static_cast<int>(a.rank))
+        publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
+      grid.sync();
+      publish_production_terminal_status<StaticLocal>(
+          a, status, ProductionStatusPhase::Forward,
+          a.production_error_records_offset,
+          a.gin_production_error_records_offset, 0ULL);
+      grid.sync();
+      if (blockIdx.x == 0 && threadIdx.x == 0) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+        status->fc1_tasks_done = fc1_tasks;
+        status->fc2_tasks_done = fc2_tasks;
+        const auto fc1_k_blocks = (a.hidden + 63ULL) / 64ULL;
+        const auto fc2_k_blocks = (a.intermediate + 63ULL) / 64ULL;
+        status->tma_loads = fc1_tasks * 2ULL * fc1_k_blocks * 2ULL +
+                            fc2_tasks * fc2_k_blocks * 2ULL;
+        status->wgmma_instructions =
+            (fc1_tasks * 2ULL * fc1_k_blocks + fc2_tasks * fc2_k_blocks) *
+            2ULL * (64ULL / ForwardMma::K);
+#endif
+        status->return_complete_clock = device_globaltimer_ns();
+        status->complete_clock = status->return_complete_clock;
+      }
+      forward_publish_progress(a, kForwardFc2Complete, scheduler[3]);
+      forward_publish_progress(a, kForwardTerminal, a.epoch);
+      return;
+    }
+    if (threadIdx.x == 0)
+      atomicMax(&status->return_complete_clock, device_globaltimer_ns());
+    forward_publish_progress(a, kForwardReturnObserved, scheduler[3]);
+
+    // A CTA may begin reducing tokens whose destination-rank bulk signals are
+    // already visible while other CTAs finish returning later M-blocks.  The
+    // per-destination acquire below is the dependency; a grid barrier here only
+    // serialized independent return and reduce work.
+    auto *contribution =
+        peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
+    auto *source_ready =
+        peer_at<unsigned long long>(a.local_base, a.outgoing_sequence_offset);
+    const auto *direct_source_compact_index =
+        peer_at<const unsigned long long>(
+            a.local_base, a.forward_direct_source_compact_index_offset);
+    const auto *direct_return_receive =
+        a.use_gin
+            ? reinterpret_cast<const transport::BFloat16 *>(
+                  static_cast<const std::byte *>(a.gin_window_base) +
+                  a.gin_return_receive_offset)
+            : nullptr;
+    auto *combined =
+        peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
+    constexpr std::uint32_t kWarpsPerCta = 12U;
+    constexpr std::uint32_t kWarpsPerToken = 1U;
+    constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
+    const auto warp = threadIdx.x / 32U;
+    const auto lane = threadIdx.x & 31U;
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
+    const auto token_warp = warp % kWarpsPerToken;
+    for (std::uint64_t token =
+             static_cast<std::uint64_t>(blockIdx.x) * kTokensPerCta +
+             warp / kWarpsPerToken;
+         token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
+         token += static_cast<std::uint64_t>(gridDim.x) * kTokensPerCta) {
+      if constexpr (!StaticLocal)
+        if (a.use_gin && lane == 0U)
+          claim_completion_tasks(completion,
+                                 transport_state::TaskClass::Reduce);
+      if (lane == 0U && status->reduced_tokens == ~0ULL)
+        atomicMin(&status->reduced_tokens, device_globaltimer_ns());
+      unsigned long long lane_route = 0ULL;
+      unsigned long long lane_row = 0ULL;
+      unsigned int lane_direct = 0U;
+      float lane_gate = 0.0F;
+      if (lane < a.dispatch.identity.top_k) {
+        const auto slot =
+            a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
+        lane_route = token * a.dispatch.identity.top_k + slot;
+        lane_row = lane_route;
+        lane_gate = a.gates[lane_route];
+        const auto destination = a.dispatch.route_dst_rank[lane_route];
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            ready(source_ready[destination * a.channels]);
+        while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+               !forward_cancelled(a)) {
+        }
+        if (a.use_gin &&
+            a.dispatch.route_dst_node[lane_route] != a.node) {
+          lane_row = direct_source_compact_index[lane_route];
+          lane_direct = 1U;
+        }
+      }
+      __syncwarp();
+      auto *output8 = reinterpret_cast<uint4 *>(combined + token * a.hidden);
+      for (std::uint64_t vector = lane + token_warp * 32U;
+           vector < a.hidden / 8ULL; vector += kWarpsPerToken * 32ULL) {
+        float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+        for (std::uint32_t order = 0; order < a.dispatch.identity.top_k;
+             ++order) {
+          const auto row = __shfl_sync(0xffffffffU, lane_row, order);
+          const auto direct =
+              __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
+          const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
+          const auto *source = direct ? direct_return_receive : contribution;
+          const auto packed = reinterpret_cast<const uint4 *>(
+              source + row * a.hidden)[vector];
+          const unsigned int words[4] = {packed.x, packed.y, packed.z,
+                                         packed.w};
+#pragma unroll
+          for (std::uint32_t word = 0; word < 4U; ++word) {
+            sums[word * 2U] = gate_after_accumulate(
+                sums[word * 2U], gate, static_cast<std::uint16_t>(words[word]));
+            sums[word * 2U + 1U] = gate_after_accumulate(
+                sums[word * 2U + 1U], gate,
+                static_cast<std::uint16_t>(words[word] >> 16U));
+          }
+        }
+        unsigned int words[4];
+#pragma unroll
+        for (std::uint32_t word = 0; word < 4U; ++word)
+          words[word] =
+              static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
+              (static_cast<unsigned int>(
+                   float_to_bf16_bits(sums[word * 2U + 1U]))
+               << 16U);
+        output8[vector] = make_uint4(words[0], words[1], words[2], words[3]);
+      }
+      __syncwarp();
+      if constexpr (!StaticLocal)
+        if (a.use_gin && lane == 0U)
+          complete_completion_tasks(completion,
+                                    transport_state::TaskClass::Reduce);
+    }
+    if (lane == 0U)
+      atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
+    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+                            a.dispatch.identity.num_tokens, a.epoch);
+    __syncthreads();
     grid.sync();
+    forward_publish_progress(a, kForwardReduceComplete,
+                             a.dispatch.identity.num_tokens);
     if (blockIdx.x == 0 && threadIdx.x == 0 &&
         a.injected_status_error_rank == static_cast<int>(a.rank))
       publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
     grid.sync();
+    if constexpr (!StaticLocal) {
+      if (a.use_gin) {
+        if (blockIdx.x == 0U && threadIdx.x == 0U) {
+          completion->ring_credit_restored = completion->ring_credit_expected;
+          publish_elected_terminal(completion, a.epoch, status->error != 0U);
+        }
+        __syncthreads();
+        if (blockIdx.x != 0U) {
+          // Elect one lane to poll.  forward_cancelled() contains warp-level
+          // collectives used by the normal worker loops, so evaluating it from
+          // independently reconverging lanes at terminal can strand the rest of
+          // warp 0 in WARPSYNC even after the completion epoch is visible.
+          if (threadIdx.x == 0U) {
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+                terminal(completion->kernel_complete_epoch);
+            while (terminal.load(::cuda::memory_order_acquire) < a.epoch) {
+            }
+          }
+          __syncthreads();
+          return;
+        }
+      }
+    }
+    // Only the elected terminal CTA performs the production status agreement.
+    // GIN progress CTAs and compute CTAs have already proved their static task
+    // spaces complete and now leave after observing kernel_complete_epoch.  In
+    // particular, they never participate in a second grid-wide rendezvous whose
+    // progress would otherwise depend on CTA-local control-flow state.
     publish_production_terminal_status<StaticLocal>(
         a, status, ProductionStatusPhase::Forward,
         a.production_error_records_offset,
-        a.gin_production_error_records_offset);
-    grid.sync();
+        a.gin_production_error_records_offset,
+        a.use_gin ? a.dispatch.identity.num_nodes - 1ULL : 0ULL);
+    if constexpr (StaticLocal) {
+      grid.sync();
+    } else if (!a.use_gin) {
+      grid.sync();
+    } else {
+      __syncthreads();
+    }
+    // Every local return CTA has fenced before publishing its destination
+    // signal, and every local Reduce warp acquired all of its destination
+    // signals before reaching this grid completion.  Consequently no peer can
+    // still write this slot and no local worker can still read it; a second
+    // all-rank terminal rendezvous would only duplicate those dependencies.
     if (blockIdx.x == 0 && threadIdx.x == 0) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
       status->fc1_tasks_done = fc1_tasks;
@@ -6290,178 +6557,14 @@ local_p2p_forward_megakernel(
       status->tma_loads = fc1_tasks * 2ULL * fc1_k_blocks * 2ULL +
                           fc2_tasks * fc2_k_blocks * 2ULL;
       status->wgmma_instructions =
-          (fc1_tasks * 2ULL * fc1_k_blocks + fc2_tasks * fc2_k_blocks) *
-          2ULL * (64ULL / ForwardMma::K);
+          (fc1_tasks * 2ULL * fc1_k_blocks + fc2_tasks * fc2_k_blocks) * 2ULL *
+          (64ULL / ForwardMma::K);
 #endif
-      status->return_complete_clock = device_globaltimer_ns();
-      status->complete_clock = status->return_complete_clock;
+      status->complete_clock = device_globaltimer_ns();
     }
-    forward_publish_progress(a, kForwardFc2Complete, scheduler[3]);
     forward_publish_progress(a, kForwardTerminal, a.epoch);
-    return;
+    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
   }
-  if (threadIdx.x == 0)
-    atomicMax(&status->return_complete_clock, device_globaltimer_ns());
-  forward_publish_progress(a, kForwardReturnObserved, scheduler[3]);
-
-  // A CTA may begin reducing tokens whose destination-rank bulk signals are
-  // already visible while other CTAs finish returning later M-blocks.  The
-  // per-destination acquire below is the dependency; a grid barrier here only
-  // serialized independent return and reduce work.
-  auto *contribution = peer_at<transport::BFloat16>(
-      a.local_base, a.contribution_offset);
-  auto *source_ready = peer_at<unsigned long long>(
-      a.local_base, a.outgoing_sequence_offset);
-  auto *combined = peer_at<transport::BFloat16>(
-      a.local_base, a.combined_offset);
-  constexpr std::uint32_t kWarpsPerCta = 12U;
-  constexpr std::uint32_t kWarpsPerToken = 1U;
-  constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
-  const auto warp = threadIdx.x / 32U;
-  const auto lane = threadIdx.x & 31U;
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
-  const auto token_warp = warp % kWarpsPerToken;
-  for (std::uint64_t token =
-           static_cast<std::uint64_t>(blockIdx.x) * kTokensPerCta +
-           warp / kWarpsPerToken;
-       token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
-       token += static_cast<std::uint64_t>(gridDim.x) * kTokensPerCta) {
-    if constexpr (!StaticLocal)
-      if (a.use_gin && lane == 0U)
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::Reduce);
-    if (lane == 0U && status->reduced_tokens == ~0ULL)
-      atomicMin(&status->reduced_tokens, device_globaltimer_ns());
-    unsigned long long lane_route = 0ULL;
-    float lane_gate = 0.0F;
-    if (lane < a.dispatch.identity.top_k) {
-      const auto slot = a.dispatch.combine_order[
-          token * a.dispatch.identity.top_k + lane];
-      lane_route = token * a.dispatch.identity.top_k + slot;
-      lane_gate = a.gates[lane_route];
-      const auto destination = a.dispatch.route_dst_rank[lane_route];
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(source_ready[destination * a.channels]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
-             !forward_cancelled(a)) {
-      }
-    }
-    __syncwarp();
-    auto *output8 = reinterpret_cast<uint4 *>(combined + token * a.hidden);
-    for (std::uint64_t vector = lane + token_warp * 32U;
-         vector < a.hidden / 8ULL; vector += kWarpsPerToken * 32ULL) {
-      float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F,
-                       0.0F, 0.0F, 0.0F, 0.0F};
-      for (std::uint32_t order = 0;
-           order < a.dispatch.identity.top_k; ++order) {
-        const auto route = __shfl_sync(0xffffffffU, lane_route, order);
-        const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
-        const auto packed = reinterpret_cast<const uint4 *>(
-            contribution + route * a.hidden)[vector];
-        const unsigned int words[4] = {
-            packed.x, packed.y, packed.z, packed.w};
-#pragma unroll
-        for (std::uint32_t word = 0; word < 4U; ++word) {
-          sums[word * 2U] = gate_after_accumulate(
-              sums[word * 2U], gate,
-              static_cast<std::uint16_t>(words[word]));
-          sums[word * 2U + 1U] = gate_after_accumulate(
-              sums[word * 2U + 1U], gate,
-              static_cast<std::uint16_t>(words[word] >> 16U));
-        }
-      }
-      unsigned int words[4];
-#pragma unroll
-      for (std::uint32_t word = 0; word < 4U; ++word)
-        words[word] =
-            static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
-            (static_cast<unsigned int>(
-                 float_to_bf16_bits(sums[word * 2U + 1U]))
-             << 16U);
-      output8[vector] = make_uint4(words[0], words[1], words[2], words[3]);
-    }
-    __syncwarp();
-    if constexpr (!StaticLocal)
-      if (a.use_gin && lane == 0U)
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::Reduce);
-  }
-  if (lane == 0U)
-    atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
-  __syncthreads();
-  grid.sync();
-  forward_publish_progress(a, kForwardReduceComplete,
-                           a.dispatch.identity.num_tokens);
-  if (blockIdx.x == 0 && threadIdx.x == 0 &&
-      a.injected_status_error_rank == static_cast<int>(a.rank))
-    publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
-  grid.sync();
-  if constexpr (!StaticLocal) {
-    if (a.use_gin) {
-      if (blockIdx.x == 0U && threadIdx.x == 0U) {
-        completion->ring_credit_restored = completion->ring_credit_expected;
-        publish_elected_terminal(completion, a.epoch, status->error != 0U);
-      }
-      __syncthreads();
-      if (blockIdx.x != 0U) {
-        // Elect one lane to poll.  forward_cancelled() contains warp-level
-        // collectives used by the normal worker loops, so evaluating it from
-        // independently reconverging lanes at terminal can strand the rest of
-        // warp 0 in WARPSYNC even after the completion epoch is visible.
-        if (threadIdx.x == 0U) {
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_system>
-              terminal(completion->kernel_complete_epoch);
-          while (terminal.load(::cuda::memory_order_acquire) < a.epoch) {
-          }
-        }
-        __syncthreads();
-        return;
-      }
-    }
-  }
-  // Only the elected terminal CTA performs the production status agreement.
-  // GIN progress CTAs and compute CTAs have already proved their static task
-  // spaces complete and now leave after observing kernel_complete_epoch.  In
-  // particular, they never participate in a second grid-wide rendezvous whose
-  // progress would otherwise depend on CTA-local control-flow state.
-  publish_production_terminal_status<StaticLocal>(
-      a, status, ProductionStatusPhase::Forward,
-      a.production_error_records_offset,
-      a.gin_production_error_records_offset);
-  if constexpr (StaticLocal) {
-    grid.sync();
-  } else if (!a.use_gin) {
-    grid.sync();
-  } else {
-    __syncthreads();
-  }
-  // Every local return CTA has fenced before publishing its destination
-  // signal, and every local Reduce warp acquired all of its destination
-  // signals before reaching this grid completion.  Consequently no peer can
-  // still write this slot and no local worker can still read it; a second
-  // all-rank terminal rendezvous would only duplicate those dependencies.
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-    status->fc1_tasks_done = fc1_tasks;
-    status->fc2_tasks_done = fc2_tasks;
-    const auto fc1_k_blocks = (a.hidden + 63ULL) / 64ULL;
-    const auto fc2_k_blocks = (a.intermediate + 63ULL) / 64ULL;
-    status->tma_loads = fc1_tasks * 2ULL * fc1_k_blocks * 2ULL +
-                        fc2_tasks * fc2_k_blocks * 2ULL;
-    status->wgmma_instructions =
-        (fc1_tasks * 2ULL * fc1_k_blocks + fc2_tasks * fc2_k_blocks) *
-        2ULL * (64ULL / ForwardMma::K);
-#endif
-    status->complete_clock = device_globaltimer_ns();
-  }
-  forward_publish_progress(a, kForwardTerminal, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 
 #include "cuda/backward/kernel_contract.cuh"
@@ -6469,10 +6572,9 @@ local_p2p_forward_megakernel(
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
 
 template <bool StaticLocal>
-__device__ void wait_backward_mblock_rows(const BackwardKernelArgs &a,
-                                          std::uint32_t expert,
-                                          std::uint64_t local_row,
-                                          std::uint32_t valid_rows) {
+__device__ void
+wait_backward_mblock_rows(const BackwardKernelArgs &a, std::uint32_t expert,
+                          std::uint64_t local_row, std::uint32_t valid_rows) {
   if constexpr (StaticLocal)
     return;
   if (!a.use_gin || valid_rows == 0U)
@@ -6480,8 +6582,8 @@ __device__ void wait_backward_mblock_rows(const BackwardKernelArgs &a,
   const auto end_row = local_row + valid_rows;
   const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
   const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
-  auto *arrived = peer_at<unsigned long long>(a.local_base,
-                                               a.dy_arrived_rows_offset);
+  auto *arrived =
+      peer_at<unsigned long long>(a.local_base, a.dy_arrived_rows_offset);
   std::uint64_t tile_row = 0ULL;
   for (auto tile = tile_begin; tile < tile_end; ++tile) {
     const auto expected = a.dispatch.mtile_expected_rows[tile];
@@ -6492,8 +6594,8 @@ __device__ void wait_backward_mblock_rows(const BackwardKernelArgs &a,
     }
     if (tile_row >= end_row)
       break;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        ready(arrived[tile]);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+        arrived[tile]);
     while (ready.load(::cuda::memory_order_acquire) < expected &&
            !backward_cancelled(a)) {
     }
@@ -6515,25 +6617,23 @@ template <bool StaticLocal>
 __device__ void backward_terminal_rendezvous(const BackwardKernelArgs &a) {
   if (blockIdx.x != 0U)
     return;
-  const auto first_peer = !StaticLocal && a.use_gin
-                              ? a.node * a.local_world_size
-                              : 0U;
-  const auto peer_count = !StaticLocal && a.use_gin
-                              ? a.local_world_size
-                              : a.world;
+  const auto first_peer =
+      !StaticLocal && a.use_gin ? a.node * a.local_world_size : 0U;
+  const auto peer_count =
+      !StaticLocal && a.use_gin ? a.local_world_size : a.world;
   for (std::uint32_t local_peer = static_cast<std::uint32_t>(threadIdx.x);
        local_peer < peer_count;
        local_peer += static_cast<std::uint32_t>(blockDim.x)) {
     const auto peer = first_peer + local_peer;
-    auto *terminal = peer_at<unsigned long long>(
-        a.peer_bases[peer], a.terminal_epoch_offset);
+    auto *terminal = peer_at<unsigned long long>(a.peer_bases[peer],
+                                                 a.terminal_epoch_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(terminal[a.rank]);
     published.store(a.epoch, ::cuda::memory_order_release);
   }
   __syncthreads();
-  auto *local_terminal = peer_at<unsigned long long>(
-      a.local_base, a.terminal_epoch_offset);
+  auto *local_terminal =
+      peer_at<unsigned long long>(a.local_base, a.terminal_epoch_offset);
   for (std::uint32_t local_peer = static_cast<std::uint32_t>(threadIdx.x);
        local_peer < peer_count;
        local_peer += static_cast<std::uint32_t>(blockDim.x)) {
@@ -6558,14 +6658,15 @@ __device__ void backward_publish_progress(const BackwardKernelArgs &a,
   target.store(value, ::cuda::memory_order_release);
 }
 
-__device__ __attribute__((unused)) void backward_reduce_token_slice(
-    const BackwardKernelArgs &a, const transport::BFloat16 *dx_return,
-    transport::BFloat16 *dx_combined, std::uint32_t worker,
-    std::uint32_t workers) {
+__device__ __attribute__((unused)) void
+backward_reduce_token_slice(const BackwardKernelArgs &a,
+                            const transport::BFloat16 *dx_return,
+                            transport::BFloat16 *dx_combined,
+                            std::uint32_t worker, std::uint32_t workers) {
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
-  auto *source_ready = peer_at<unsigned long long>(
-      a.local_base, a.outgoing_signal_offset);
+  auto *source_ready =
+      peer_at<unsigned long long>(a.local_base, a.outgoing_signal_offset);
   constexpr std::uint32_t kWarpsPerCta = 12U;
   for (std::uint64_t token =
            static_cast<std::uint64_t>(worker) * kWarpsPerCta + warp;
@@ -6573,12 +6674,12 @@ __device__ __attribute__((unused)) void backward_reduce_token_slice(
        token += static_cast<std::uint64_t>(workers) * kWarpsPerCta) {
     unsigned long long lane_route = 0ULL;
     if (lane < a.dispatch.identity.top_k) {
-      const auto slot = a.dispatch.combine_order[
-          token * a.dispatch.identity.top_k + lane];
+      const auto slot =
+          a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
       lane_route = token * a.dispatch.identity.top_k + slot;
       const auto destination = a.dispatch.route_dst_rank[lane_route];
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          ready(source_ready[destination * a.channels]);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+          source_ready[destination * a.channels]);
       while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
              !backward_cancelled(a)) {
       }
@@ -6589,8 +6690,7 @@ __device__ __attribute__((unused)) void backward_reduce_token_slice(
         const auto row = a.dispatch.route_dst_row[lane_route];
         const auto *destination_dgate = peer_at<const float>(
             a.peer_bases[destination], a.dgate_canonical_offset);
-        auto *local_dgate =
-            peer_at<float>(a.local_base, a.dgate_offset);
+        auto *local_dgate = peer_at<float>(a.local_base, a.dgate_offset);
         local_dgate[lane_route] = destination_dgate[row];
       }
     }
@@ -6598,33 +6698,32 @@ __device__ __attribute__((unused)) void backward_reduce_token_slice(
     auto *output8 = reinterpret_cast<uint4 *>(dx_combined + token * a.hidden);
     for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
          vector += 32ULL) {
-      float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F,
-                       0.0F, 0.0F, 0.0F, 0.0F};
+      float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
       for (std::uint32_t order = 0; order < a.dispatch.identity.top_k;
            ++order) {
         const auto route = __shfl_sync(0xffffffffU, lane_route, order);
         const auto packed = reinterpret_cast<const uint4 *>(
             dx_return + route * a.hidden)[vector];
-        const unsigned int words[4] = {packed.x, packed.y, packed.z,
-                                       packed.w};
+        const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
         for (std::uint32_t word = 0; word < 4U; ++word) {
           sums[word * 2U] = __fadd_rn(
-              sums[word * 2U], bf16_bits_to_float(
-                                     static_cast<std::uint16_t>(words[word])));
-          sums[word * 2U + 1U] = __fadd_rn(
-              sums[word * 2U + 1U],
-              bf16_bits_to_float(
-                  static_cast<std::uint16_t>(words[word] >> 16U)));
+              sums[word * 2U],
+              bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
+          sums[word * 2U + 1U] =
+              __fadd_rn(sums[word * 2U + 1U],
+                        bf16_bits_to_float(
+                            static_cast<std::uint16_t>(words[word] >> 16U)));
         }
       }
       unsigned int words[4];
 #pragma unroll
       for (std::uint32_t word = 0; word < 4U; ++word)
-        words[word] = static_cast<unsigned int>(
-                          float_to_bf16_bits(sums[word * 2U])) |
-                      (static_cast<unsigned int>(float_to_bf16_bits(
-                           sums[word * 2U + 1U])) << 16U);
+        words[word] =
+            static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
+            (static_cast<unsigned int>(
+                 float_to_bf16_bits(sums[word * 2U + 1U]))
+             << 16U);
       output8[vector] = make_uint4(words[0], words[1], words[2], words[3]);
     }
   }
@@ -6980,14 +7079,318 @@ __device__ std::uint32_t backward_wavefront_mblock_expert(
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a) {
   return a.cancel_epoch &&
-         atomicAdd_system(
-             const_cast<unsigned long long *>(a.cancel_epoch), 0ULL) ==
-             a.epoch;
+         atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
+                          0ULL) == a.epoch;
 }
 
+#if __has_include(<nccl_device.h>)
+// Backward Return has exactly the same reverse-route identity as Forward
+// Return.  Pack through the immutable compact catalog built by Forward rather
+// than copying the sparse sequence*top_k wire envelope.  Besides halving the
+// main-shape payload, this keeps the receive layout independent of wave order.
+__device__ __forceinline__ void pack_backward_return_chunk(
+    const BackwardKernelArgs &a, const ForwardReturnChunkRecord &chunk,
+    const unsigned long long *forward_return_fragment_index) {
+  auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+  auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+      window_bytes + a.gin_receive_fanout_offset);
+  auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
+      window_bytes + a.gin_return_staging_offset);
+  auto *return_gate_staging = reinterpret_cast<float *>(
+      window_bytes + a.gin_return_gate_staging_offset);
+  const auto source_partition =
+      chunk.source_node < a.node ? chunk.source_node : chunk.source_node - 1U;
+  const auto partition_base =
+      source_partition * a.max_tokens_per_rank * a.dispatch.identity.top_k;
+  const auto packed_base = partition_base + chunk.row_begin;
+  const auto vector_count = a.hidden / 8ULL;
+  for (std::uint64_t item = threadIdx.x;
+       item < static_cast<std::uint64_t>(chunk.row_count) * vector_count;
+       item += blockDim.x) {
+    const auto row_index = item / vector_count;
+    const auto vector = item % vector_count;
+    const auto fragment =
+        forward_return_fragment_index[partition_base + chunk.row_begin +
+                                      row_index];
+    const auto target = receive_fanout[partition_base + fragment];
+    const auto destination =
+        a.node * a.local_world_size + target.destination_local_rank;
+    const auto *destination_dx = peer_at<const transport::BFloat16>(
+        a.peer_bases[destination], a.dx_canonical_offset);
+    reinterpret_cast<uint4 *>(
+        return_staging)[(packed_base + row_index) * vector_count + vector] =
+        reinterpret_cast<const uint4 *>(
+            destination_dx)[target.dst_row * vector_count + vector];
+  }
+  for (std::uint64_t row_index = threadIdx.x; row_index < chunk.row_count;
+       row_index += blockDim.x) {
+    const auto fragment =
+        forward_return_fragment_index[partition_base + chunk.row_begin +
+                                      row_index];
+    const auto target = receive_fanout[partition_base + fragment];
+    const auto destination =
+        a.node * a.local_world_size + target.destination_local_rank;
+    const auto *destination_dgate = peer_at<const float>(
+        a.peer_bases[destination], a.dgate_canonical_offset);
+    return_gate_staging[packed_base + row_index] =
+        destination_dgate[target.dst_row];
+  }
+  __threadfence_system();
+  __syncthreads();
+}
+#endif
+
+// Keep the dW1 warp-specialized pipeline behind an out-of-line device-call
+// boundary.  This is the register-allocation analogue of reusing a fixed
+// storage union: the producer and math warpgroup live ranges are confined to
+// this function, and their dynamic quotas are restored before returning to
+// the transport megakernel.
 template <bool StaticLocal>
-__global__ __launch_bounds__(384, 1) void
-local_p2p_backward_megakernel(
+__device__ __noinline__ void backward_dw1_outlined_role(
+    const BackwardKernelArgs &a, const CUtensorMap &x_mn_map,
+    const CUtensorMap &dab_transpose_map, const CUtensorMap &dw1_store_map,
+    unsigned char *storage, unsigned long long *task_shared) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
+  auto *scheduler =
+      peer_at<unsigned long long>(a.local_base, a.scheduler_offset);
+  auto *claims = peer_at<unsigned long long>(a.local_base, a.claim_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+  auto *dw_timeline =
+      peer_at<BackwardExpertDwTimeline>(a.local_base, a.dw_timeline_offset);
+#endif
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::uint32_t kAStageElements = 128U * 64U;
+  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  constexpr std::uint64_t kDwN = 256ULL;
+  constexpr std::uint32_t kTaskReadyBarrier = 0U;
+  constexpr std::uint32_t kTaskDoneBarrier = 1U;
+  constexpr std::uint32_t kMathOutputReadyBarrier = 2U;
+  constexpr std::uint32_t kMathOutputDoneBarrier = 3U;
+  constexpr std::uint32_t kRestoreReleaseBarrier = 4U;
+  constexpr std::uint32_t kRestoreAcquireBarrier = 5U;
+
+  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
+  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
+  const auto dw1_tasks =
+      static_cast<unsigned long long>(a.dispatch.sizes.owned_expert_count) *
+      dw1_mtiles * dw1_ntiles;
+  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+  auto *smem_b = smem_a + kStages * kAStageElements;
+  auto *output_tile = smem_a;
+  auto *full_barriers =
+      reinterpret_cast<ForwardBarrier *>(smem_b + kStages * kBStageElements);
+  auto *empty_barriers = full_barriers + kStages;
+
+  if (threadIdx.x == 256U) {
+    for (std::uint32_t stage = 0; stage < kStages; ++stage) {
+      full_barriers[stage].init(1);
+      empty_barriers[stage].init(8);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0U)
+    *task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                       ? atomicAdd(&scheduler[4], 1ULL)
+                       : blockIdx.x;
+  __syncthreads();
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Ready, Compute, 0U, dw1_tasks,
+                          a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Start, Compute, 0U, 0ULL, a.epoch);
+
+  const auto warpgroup = threadIdx.x / 128U;
+  if (warpgroup >= 2U) {
+    cutlass::arch::warpgroup_reg_dealloc<48>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = *task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction_start = claims[expert];
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+      if (threadIdx.x == 256U) {
+        const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+          const auto current = pipeline + iteration;
+          const auto stage = current % kStages;
+          const auto phase = (current / kStages) & 1U;
+          empty_barriers[stage].wait(phase ^ 1U);
+          auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_a + stage * kAStageElements);
+          auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_b + stage * kBStageElements);
+          const auto a_k =
+              static_cast<std::uint32_t>(reduction_start + iteration * 64ULL);
+          const auto b_k = static_cast<std::uint32_t>(
+              a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
+          deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+              &dab_transpose_map, &full_barriers[stage], stage_a, a_k,
+              static_cast<std::uint32_t>(mtile * 128ULL));
+          for (std::uint32_t atom = 0; atom < 4U; ++atom)
+            deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                &x_mn_map, &full_barriers[stage], stage_b + atom * 64U * 64U,
+                static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL), b_k);
+          full_barriers[stage].arrive_and_expect_tx(
+              (kAStageElements + kBStageElements) *
+              sizeof(transport::BFloat16));
+        }
+        pipeline += iterations;
+      }
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+    }
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<224>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = *task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0U) {
+        const auto now = device_globaltimer_ns();
+        if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL, now) ==
+            0ULL)
+          atomicMin(&status->dw1_first_start_clock, now);
+      }
+#else
+      if constexpr (!StaticLocal) {
+        if (threadIdx.x == 0U && *task_shared < gridDim.x)
+          atomicMin(&status->dw1_first_start_clock, device_globaltimer_ns());
+      }
+#endif
+      float accum[BackwardDwMixedMma::kNumAccum];
+#pragma unroll
+      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+        accum[index] = 0.0F;
+      const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+      for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        const auto current = pipeline + iteration;
+        const auto stage = current % kStages;
+        const auto phase = (current / kStages) & 1U;
+        auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_a + stage * kAStageElements);
+        auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_b + stage * kBStageElements);
+        full_barriers[stage].wait(phase);
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+        for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
+              stage_a, warpgroup * 64U, k * BackwardDwMixedMma::K);
+          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
+              stage_b, 0U, k * BackwardDwMixedMma::K);
+          BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+        }
+        deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_wait<0>();
+        if ((threadIdx.x & 31U) == 0U)
+          empty_barriers[stage].arrive();
+      }
+      pipeline += iterations;
+
+      const auto warp = threadIdx.x / 32U;
+      const auto lane = threadIdx.x & 31U;
+#pragma unroll
+      for (std::uint32_t index = 0; index < BackwardDwMixedMma::kNumAccum / 4U;
+           ++index) {
+        constexpr std::uint32_t kBankGroupBytes = 16U;
+        const auto atom = index / (64U / 8U);
+        const auto in_atom = index % (64U / 8U);
+        const auto row = lane;
+        auto column = in_atom;
+        column ^= row % (128U / kBankGroupBytes);
+        auto *smem_pointer = reinterpret_cast<std::uint8_t *>(output_tile) +
+                             warp * 16U * 128U + atom * 128U * 128U +
+                             row * 128U + column * kBankGroupBytes;
+        deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+            __float22bfloat162_rn(
+                make_float2(accum[index * 4U], accum[index * 4U + 1U])),
+            __float22bfloat162_rn(
+                make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])),
+            smem_pointer);
+      }
+      cute::tma_store_fence();
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputReadyBarrier);
+      if (threadIdx.x < 4U) {
+        const auto atom = threadIdx.x;
+        cute::SM90_TMA_STORE_2D::copy(
+            &dw1_store_map, output_tile + atom * 128U * 64U,
+            static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
+            static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
+                                       mtile * 128ULL));
+        cute::tma_store_arrive();
+        cute::tma_store_wait<0>();
+      }
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputDoneBarrier);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0U) {
+        const auto complete =
+            atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL;
+        if (complete == per_expert) {
+          const auto now = device_globaltimer_ns();
+          dw_timeline[expert].dw1_complete_clock = now;
+          atomicMax(&status->dw1_last_complete_clock, now);
+        }
+      }
+#endif
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+      if (threadIdx.x == 0U)
+        *task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                           ? atomicAdd(&scheduler[4], 1ULL)
+                           : *task_shared + gridDim.x;
+    }
+  }
+
+  // The caller continues with source relay/reduce, so return the dynamic
+  // register pool to the uniform per-warpgroup quota expected by that code.
+  if (warpgroup < 2U)
+    cutlass::arch::warpgroup_reg_dealloc<168>();
+  cutlass::arch::NamedBarrier::sync(384U, kRestoreReleaseBarrier);
+  if (warpgroup >= 2U)
+    cutlass::arch::warpgroup_reg_alloc<168>();
+  cutlass::arch::NamedBarrier::sync(384U, kRestoreAcquireBarrier);
+
+  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+    backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks, a.epoch);
+#else
+  (void)a;
+  (void)x_mn_map;
+  (void)dab_transpose_map;
+  (void)dw1_store_map;
+  (void)storage;
+  (void)task_shared;
+#endif
+}
+
+template <bool StaticLocal, bool SplitDw1 = false>
+__global__ __launch_bounds__(384, 1) void local_p2p_backward_megakernel(
     BackwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap dy_map,
     const __grid_constant__ CUtensorMap dab_map,
@@ -7001,12 +7404,13 @@ local_p2p_backward_megakernel(
     const __grid_constant__ CUtensorMap dw1_store_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
-  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
-                          a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
+  __shared__ unsigned long long task_shared;
+  std::uint32_t pipeline_iteration = 0U;
   auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
-  auto *scheduler = peer_at<unsigned long long>(a.local_base,
-                                                a.scheduler_offset);
+  auto *scheduler =
+      peer_at<unsigned long long>(a.local_base, a.scheduler_offset);
   transport_state::GenerationCompletionVector *completion = nullptr;
   transport_state::ContextCompletionRecord *context_completion = nullptr;
   if constexpr (!StaticLocal) {
@@ -7095,11 +7499,11 @@ local_p2p_backward_megakernel(
       scheduler[word] = 0ULL;
     unsigned long long mblocks = 0ULL;
     unsigned long long padded = 0ULL;
-    for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+    for (std::uint32_t expert = 0; expert < a.dispatch.sizes.owned_expert_count;
+         ++expert) {
       claims[expert] = padded;
       const auto rows = a.dispatch.expert_row_count[expert];
-      padded += (rows + 63ULL) & ~63ULL;
+      padded += persistent_v3::padded_expert_rows(rows);
       mblocks += (rows + 127ULL) / 128ULL;
     }
     scheduler[8] = mblocks;
@@ -7213,9 +7617,8 @@ local_p2p_backward_megakernel(
     const auto padded_prefix = claims[expert];
     const auto row_prefix = a.dispatch.expert_row_prefix[expert];
     const auto rows = a.dispatch.expert_row_count[expert];
-    const auto padded_rows = (rows + 63ULL) & ~63ULL;
-    for (std::uint64_t row = threadIdx.x; row < padded_rows;
-         row += blockDim.x)
+    const auto padded_rows = persistent_v3::padded_expert_rows(rows);
+    for (std::uint64_t row = threadIdx.x; row < padded_rows; row += blockDim.x)
       scheduler[64ULL + padded_prefix + row] =
           row < rows ? row_prefix + row : ~0ULL;
   }
@@ -7242,552 +7645,584 @@ local_p2p_backward_megakernel(
 #if MEGAMOE_DEVICE_TIMELINE
     bool timeline_dy_local_recorded = false;
 #endif
-    for (std::uint64_t route = blockIdx.x;
-         route < a.dispatch.sizes.route_count; route += gridDim.x) {
-    const auto destination = a.dispatch.route_dst_rank[route];
-    if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-        destination / a.local_world_size != a.node)
-      continue;
-    const auto row = a.dispatch.route_dst_row[route];
-    const auto token = route / a.dispatch.identity.top_k;
-    auto *destination_base = a.peer_bases[destination];
-    auto *destination_dy = peer_at<transport::BFloat16>(
-        destination_base, a.dy_canonical_offset);
-    auto *destination_gate = peer_at<float>(destination_base,
-                                             a.canonical_gate_offset);
-    const auto *source128 = reinterpret_cast<const uint4 *>(
-        a.dy_input + token * a.hidden);
-    auto *target128 = reinterpret_cast<uint4 *>(destination_dy + row * a.hidden);
-    for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
-         vector += blockDim.x)
-      target128[vector] = source128[vector];
-    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-      __threadfence_system();
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        auto *arrived = peer_at<unsigned long long>(
-            destination_base, a.dy_arrived_rows_offset);
-        ::cuda::atomic_ref<unsigned long long,
-                           ::cuda::thread_scope_system>
-            counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
-        counter.fetch_add(1ULL, ::cuda::memory_order_release);
+    for (std::uint64_t route = blockIdx.x; route < a.dispatch.sizes.route_count;
+         route += gridDim.x) {
+      const auto destination = a.dispatch.route_dst_rank[route];
+      if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+          destination / a.local_world_size != a.node)
+        continue;
+      const auto row = a.dispatch.route_dst_row[route];
+      const auto token = route / a.dispatch.identity.top_k;
+      auto *destination_base = a.peer_bases[destination];
+      auto *destination_dy =
+          peer_at<transport::BFloat16>(destination_base, a.dy_canonical_offset);
+      auto *destination_gate =
+          peer_at<float>(destination_base, a.canonical_gate_offset);
+      const auto *source128 =
+          reinterpret_cast<const uint4 *>(a.dy_input + token * a.hidden);
+      auto *target128 =
+          reinterpret_cast<uint4 *>(destination_dy + row * a.hidden);
+      for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
+           vector += blockDim.x)
+        target128[vector] = source128[vector];
+      if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          auto *arrived = peer_at<unsigned long long>(destination_base,
+                                                      a.dy_arrived_rows_offset);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              counter(arrived[a.dispatch_waves.route_dst_mtile[route]]);
+          counter.fetch_add(1ULL, ::cuda::memory_order_release);
+        }
+        __syncthreads();
       }
-      __syncthreads();
-    }
 #if MEGAMOE_DEVICE_TIMELINE
-    __syncthreads();
-    if (!timeline_dy_local_recorded) {
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstLocalRowVisible, GinDispatch,
-                              0U, route, a.epoch);
-      timeline_dy_local_recorded = true;
-    }
+      __syncthreads();
+      if (!timeline_dy_local_recorded) {
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstLocalRowVisible, GinDispatch,
+                                0U, route, a.epoch);
+        timeline_dy_local_recorded = true;
+      }
 #endif
-    if (threadIdx.x == 0) {
-      destination_gate[row] = a.gates[route];
-      if (destination != a.rank)
-        ++dy_peer_rows;
-    }
+      if (threadIdx.x == 0) {
+        destination_gate[row] = a.gates[route];
+        if (destination != a.rank)
+          ++dy_peer_rows;
+      }
     }
     if (threadIdx.x == 0 && dy_peer_rows != 0ULL)
       atomicAdd(&status->actual_dy_peer_bytes,
                 dy_peer_rows * a.hidden * sizeof(transport::BFloat16));
 #if __has_include(<nccl_device.h>)
-  if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    grid.sync();
-    const auto first_local = a.node * a.local_world_size;
-    if (blockIdx.x == 0U) {
-      for (std::uint32_t local = threadIdx.x;
-           local < a.local_world_size; local += blockDim.x) {
-        const auto peer = first_local + local;
-        auto *ready = peer_at<unsigned long long>(
-            a.peer_bases[peer], a.gin_local_compute_ready_offset);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            published(ready[a.rank]);
-        published.store(a.epoch, ::cuda::memory_order_release);
-      }
-      __syncthreads();
-      auto *local_ready = peer_at<unsigned long long>(
-          a.local_base, a.gin_local_compute_ready_offset);
-      for (std::uint32_t local = threadIdx.x;
-           local < a.local_world_size; local += blockDim.x) {
-        const auto peer = first_local + local;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            observed(local_ready[peer]);
-        while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
-               !backward_cancelled(a)) {
-        }
-      }
-    }
-    grid.sync();
-    auto *bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        bytes + a.gin_send_header_offset);
-    auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        bytes + a.gin_send_fanout_offset);
-    auto *send_gate = reinterpret_cast<float *>(bytes + a.gin_send_gate_offset);
-    auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
-        bytes + a.gin_send_payload_offset);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint64_t item = global_thread;
-         item < a.dispatch.sizes.packet_count * vector_count;
-         item += global_threads) {
-      const auto wave_position = item / vector_count;
-      const auto vector = item % vector_count;
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      reinterpret_cast<uint4 *>(send_payload)[wave_position * vector_count +
-                                               vector] =
-          reinterpret_cast<const uint4 *>(a.dy_input)[
-              descriptor.local_token_id * vector_count + vector];
-    }
-    const auto fanout_slots =
-        a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
-    for (std::uint64_t packed = global_thread; packed < fanout_slots;
-         packed += global_threads) {
-      const auto wave_position = packed / a.dispatch.identity.top_k;
-      const auto fanout_slot = packed % a.dispatch.identity.top_k;
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      if (fanout_begin + fanout_slot < fanout_end) {
-        const auto target = a.dispatch.packet_fanout[fanout_begin + fanout_slot];
-        send_fanout[packed] = target;
-        send_gate[packed] = a.gates[descriptor.local_token_id *
-                                        a.dispatch.identity.top_k +
-                                    target.topk_slot];
-      }
-    }
-    for (std::uint64_t wave_position = global_thread;
-         wave_position < a.dispatch.sizes.packet_count;
-         wave_position += global_threads) {
-      const auto packet = a.dispatch_waves.packet_order[wave_position];
-      const auto descriptor = a.dispatch.packet_headers[packet];
-      if (descriptor.destination_node == a.node)
-        continue;
-      const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
-      const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
-      send_headers[wave_position] = LocalP2pRouteHeader{
-          transport::kActivationTransportSchemaVersion, a.rank,
-          descriptor.proxy_rank, descriptor.channel,
-          a.dispatch.identity.generation, a.epoch,
-          wave_position, fanout_end - fanout_begin,
-          descriptor.local_token_id,
-          wave_position * a.dispatch.identity.top_k, 0, 0};
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DyPacketReady, GinDispatch, 0U,
-                            a.dispatch.sizes.packet_count, a.epoch);
-    __threadfence_system();
-    grid.sync();
-  }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x < a.gin_context_count) {
-    const auto context = static_cast<std::uint32_t>(blockIdx.x);
-    const ncclGin gin(a.gin_dev_comm, context);
-    const auto rail = ncclTeamRail(a.gin_dev_comm);
-    auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
-        window_bytes + a.gin_send_dispatch_directory_offset);
-    auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        window_bytes + a.gin_send_header_offset);
-    unsigned long long issued_completions = 0ULL;
-    unsigned long long issued_packets = 0ULL;
-    for (std::uint32_t remote_node = 0;
-         remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
-      if (remote_node == a.node)
-        continue;
-      std::uint64_t node_wave_begin = 0;
-      while (node_wave_begin < a.dispatch_waves.wave_count &&
-             a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
-        ++node_wave_begin;
-      auto node_wave_end = node_wave_begin;
-      while (node_wave_end < a.dispatch_waves.wave_count &&
-             a.dispatch_waves.destination_node[node_wave_end] == remote_node)
-        ++node_wave_end;
-      const auto node_waves = node_wave_end - node_wave_begin;
-      const auto context_wave_begin =
-          node_wave_begin + node_waves * context / a.gin_context_count;
-      const auto context_wave_end =
-          node_wave_begin + node_waves * (context + 1U) /
-                                a.gin_context_count;
-      const auto node_packet_begin =
-          a.dispatch_waves.offsets[node_wave_begin];
-      const auto packet_begin =
-          a.dispatch_waves.offsets[context_wave_begin] - node_packet_begin;
-      const auto packet_end =
-          a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
-      const auto remote_partition =
-          remote_node < a.node ? remote_node : remote_node - 1U;
-      const auto source_partition =
-          a.node < remote_node ? a.node : a.node - 1U;
-      const auto directory_index =
-          remote_partition * a.gin_context_count + context;
-      if (threadIdx.x == 0U) {
-        send_directory[directory_index] = GinDispatchContextRecord{
-            a.dispatch.identity.generation, a.epoch, packet_begin,
-            static_cast<std::uint32_t>(packet_end - packet_begin),
-            static_cast<std::uint32_t>(context_wave_end - context_wave_begin)};
-        __threadfence_system();
-        const auto remote_directory_index =
-            source_partition * a.gin_context_count + context;
-        gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                a.gin_receive_dispatch_directory_offset +
-                    remote_directory_index * sizeof(GinDispatchContextRecord),
-                a.gin_window, a.gin_send_dispatch_directory_offset +
-                                  directory_index *
-                                      sizeof(GinDispatchContextRecord),
-                sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
-                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
-                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-        ++issued_completions;
-      }
-      __syncthreads();
-      for (auto wave = context_wave_begin; wave < context_wave_end; ++wave) {
-        const auto wave_begin = a.dispatch_waves.offsets[wave];
-        const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
-        const auto wire_begin = wave_begin - node_packet_begin;
-        const auto wave_packets = wave_end - wave_begin;
-        for (auto position = wave_begin + threadIdx.x; position < wave_end;
-             position += blockDim.x) {
-          send_headers[position].sequence = position - node_packet_begin;
-          send_headers[position].dst_row =
-              (position - node_packet_begin) * a.dispatch.identity.top_k;
-          send_headers[position].topk_slot = 0U;
+    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+      grid.sync();
+      const auto first_local = a.node * a.local_world_size;
+      if (blockIdx.x == 0U) {
+        for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
+             local += blockDim.x) {
+          const auto peer = first_local + local;
+          auto *ready = peer_at<unsigned long long>(
+              a.peer_bases[peer], a.gin_local_compute_ready_offset);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              published(ready[a.rank]);
+          published.store(a.epoch, ::cuda::memory_order_release);
         }
         __syncthreads();
-        if (threadIdx.x == 0U) {
-          send_headers[wave_begin].topk_slot =
-              static_cast<std::uint32_t>(wave_packets);
-          __threadfence_system();
-          const auto receive_packet =
-              source_partition * a.max_tokens_per_rank + wire_begin;
-          MEGAMOE_TIMELINE_RECORD(
-              a.timeline, DyGinPutIssue, GinDispatch, context,
-              wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_header_offset +
-                      receive_packet * sizeof(LocalP2pRouteHeader),
-                  a.gin_window, a.gin_send_header_offset +
-                                    wave_begin * sizeof(LocalP2pRouteHeader),
-                  wave_packets * sizeof(LocalP2pRouteHeader));
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_fanout_offset +
-                      (source_partition * a.max_tokens_per_rank + wire_begin) *
-                          a.dispatch.identity.top_k *
-                          sizeof(DeviceFanoutRecord),
-                  a.gin_window, a.gin_send_fanout_offset +
-                                    wave_begin * a.dispatch.identity.top_k *
-                                        sizeof(DeviceFanoutRecord),
-                  wave_packets * a.dispatch.identity.top_k *
-                      sizeof(DeviceFanoutRecord));
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_gate_offset +
-                      (source_partition * a.max_tokens_per_rank + wire_begin) *
-                          a.dispatch.identity.top_k * sizeof(float),
-                  a.gin_window, a.gin_send_gate_offset +
-                                    wave_begin * a.dispatch.identity.top_k *
-                                        sizeof(float),
-                  wave_packets * a.dispatch.identity.top_k * sizeof(float));
-          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
-                  a.gin_receive_payload_offset +
-                      receive_packet * a.hidden *
-                          sizeof(transport::BFloat16),
-                  a.gin_window, a.gin_send_payload_offset +
-                                    wave_begin * a.hidden *
-                                        sizeof(transport::BFloat16),
-                  wave_packets * a.hidden * sizeof(transport::BFloat16),
-                  ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
-                  ncclCoopThread{}, ncclGin_None{},
-                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-          ++issued_completions;
-          issued_packets += wave_packets;
-          atomicAdd(&status->gin_dispatch_put_count, 4ULL);
-          atomicAdd(&status->gin_signal_count, 1ULL);
-          atomicAdd(&status->gin_metadata_bytes,
-                    wave_packets *
-                        (sizeof(LocalP2pRouteHeader) +
-                         a.dispatch.identity.top_k *
-                             (sizeof(DeviceFanoutRecord) + sizeof(float))));
+        auto *local_ready = peer_at<unsigned long long>(
+            a.local_base, a.gin_local_compute_ready_offset);
+        for (std::uint32_t local = threadIdx.x; local < a.local_world_size;
+             local += blockDim.x) {
+          const auto peer = first_local + local;
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              observed(local_ready[peer]);
+          while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
+                 !backward_cancelled(a)) {
+          }
         }
-        __syncthreads();
       }
+      grid.sync();
+      auto *bytes = static_cast<std::byte *>(a.gin_window_base);
+      auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+          bytes + a.gin_send_header_offset);
+      auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+          bytes + a.gin_send_fanout_offset);
+      auto *send_gate =
+          reinterpret_cast<float *>(bytes + a.gin_send_gate_offset);
+      auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
+          bytes + a.gin_send_payload_offset);
+      const auto vector_count = a.hidden / 8ULL;
+      const auto global_thread =
+          static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      const auto global_threads =
+          static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+      for (std::uint64_t item = global_thread;
+           item < a.dispatch.sizes.packet_count * vector_count;
+           item += global_threads) {
+        const auto wave_position = item / vector_count;
+        const auto vector = item % vector_count;
+        const auto packet = a.dispatch_waves.packet_order[wave_position];
+        const auto descriptor = a.dispatch.packet_headers[packet];
+        if (descriptor.destination_node == a.node)
+          continue;
+        reinterpret_cast<uint4 *>(
+            send_payload)[wave_position * vector_count + vector] =
+            reinterpret_cast<const uint4 *>(
+                a.dy_input)[descriptor.local_token_id * vector_count + vector];
+      }
+      const auto fanout_slots =
+          a.dispatch.sizes.packet_count * a.dispatch.identity.top_k;
+      for (std::uint64_t packed = global_thread; packed < fanout_slots;
+           packed += global_threads) {
+        const auto wave_position = packed / a.dispatch.identity.top_k;
+        const auto fanout_slot = packed % a.dispatch.identity.top_k;
+        const auto packet = a.dispatch_waves.packet_order[wave_position];
+        const auto descriptor = a.dispatch.packet_headers[packet];
+        if (descriptor.destination_node == a.node)
+          continue;
+        const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+        const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+        if (fanout_begin + fanout_slot < fanout_end) {
+          const auto target =
+              a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+          send_fanout[packed] = target;
+          send_gate[packed] =
+              a.gates[descriptor.local_token_id * a.dispatch.identity.top_k +
+                      target.topk_slot];
+        }
+      }
+      for (std::uint64_t wave_position = global_thread;
+           wave_position < a.dispatch.sizes.packet_count;
+           wave_position += global_threads) {
+        const auto packet = a.dispatch_waves.packet_order[wave_position];
+        const auto descriptor = a.dispatch.packet_headers[packet];
+        if (descriptor.destination_node == a.node)
+          continue;
+        const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
+        const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
+        send_headers[wave_position] =
+            LocalP2pRouteHeader{transport::kActivationTransportSchemaVersion,
+                                a.rank,
+                                descriptor.proxy_rank,
+                                descriptor.channel,
+                                a.dispatch.identity.generation,
+                                a.epoch,
+                                wave_position,
+                                fanout_end - fanout_begin,
+                                descriptor.local_token_id,
+                                wave_position * a.dispatch.identity.top_k,
+                                0,
+                                0};
+      }
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyPacketReady, GinDispatch, 0U,
+                              a.dispatch.sizes.packet_count, a.epoch);
+      __threadfence_system();
+      grid.sync();
     }
-    if (threadIdx.x == 0U && issued_completions != 0ULL) {
-      gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DyLocalCompletion, GinDispatch,
-                              context, issued_packets, a.epoch);
-      atomicAdd(&status->raw_cross_node_dy_bytes,
-                issued_packets * a.dispatch.identity.top_k * a.hidden *
-                    sizeof(transport::BFloat16));
-      atomicAdd(&status->gin_dispatch_payload_bytes,
-                issued_packets * a.hidden * sizeof(transport::BFloat16));
-      gin.resetCounter(0);
+    if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
+        blockIdx.x < a.gin_context_count) {
+      const auto context = static_cast<std::uint32_t>(blockIdx.x);
+      const ncclGin gin(a.gin_dev_comm, context);
+      const auto rail = ncclTeamRail(a.gin_dev_comm);
+      auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
+      auto *send_directory = reinterpret_cast<GinDispatchContextRecord *>(
+          window_bytes + a.gin_send_dispatch_directory_offset);
+      auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+          window_bytes + a.gin_send_header_offset);
+      unsigned long long issued_completions = 0ULL;
+      unsigned long long issued_packets = 0ULL;
       for (std::uint32_t remote_node = 0;
            remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
         if (remote_node == a.node)
           continue;
+        std::uint64_t node_wave_begin = 0;
+        while (node_wave_begin < a.dispatch_waves.wave_count &&
+               a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
+          ++node_wave_begin;
+        auto node_wave_end = node_wave_begin;
+        while (node_wave_end < a.dispatch_waves.wave_count &&
+               a.dispatch_waves.destination_node[node_wave_end] == remote_node)
+          ++node_wave_end;
+        const auto node_waves = node_wave_end - node_wave_begin;
+        const auto context_wave_begin =
+            node_wave_begin + node_waves * context / a.gin_context_count;
+        const auto context_wave_end =
+            node_wave_begin + node_waves * (context + 1U) / a.gin_context_count;
+        const auto node_packet_begin =
+            a.dispatch_waves.offsets[node_wave_begin];
+        const auto packet_begin =
+            a.dispatch_waves.offsets[context_wave_begin] - node_packet_begin;
+        const auto packet_end =
+            a.dispatch_waves.offsets[context_wave_end] - node_packet_begin;
         const auto remote_partition =
             remote_node < a.node ? remote_node : remote_node - 1U;
-        const auto record_index =
-            remote_partition * a.gin_context_count + context;
-        const auto directory = send_directory[record_index];
-        auto &record = context_completion[record_index];
-        record.directory_ready = 1ULL;
-        record.dispatch_expected = directory.wave_count;
-        record.dispatch_claimed = directory.wave_count;
-        record.dispatch_completed = directory.wave_count;
-        record.local_completion = 1ULL + directory.wave_count;
-        record.credit = 1ULL;
-        record.last_cursor = directory.packet_begin + directory.packet_count;
-        record.last_progress_globaltimer = device_globaltimer_ns();
-        atomicAdd(&completion->directory_ready, 1ULL);
-        atomicAdd(&completion->dispatch_local_completion_completed,
-                  1ULL + directory.wave_count);
-        if (directory.wave_count != 0ULL) {
-          claim_completion_tasks(completion,
-                                 transport_state::TaskClass::DispatchWave,
-                                 directory.wave_count);
-          complete_completion_tasks(completion,
-                                    transport_state::TaskClass::DispatchWave,
-                                    directory.wave_count);
-        }
-      }
-    }
-    __syncthreads();
-    unsigned long long incoming_sources = 0ULL;
-    if (threadIdx.x == 0U) {
-      for (std::uint32_t index = 0;
-           index < a.dispatch.sizes.incoming_signal_count; ++index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node != a.node && signal.expected_packets != 0ULL)
-          ++incoming_sources;
-      }
-      if (incoming_sources != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
-      auto *receive_directory =
-          reinterpret_cast<GinDispatchContextRecord *>(
-              static_cast<std::byte *>(a.gin_window_base) +
-              a.gin_receive_dispatch_directory_offset);
-      unsigned long long incoming_waves = 0ULL;
-      for (std::uint32_t index = 0;
-           index < a.dispatch.sizes.incoming_signal_count; ++index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[index];
-        if (signal.source_node == a.node || signal.expected_packets == 0ULL)
-          continue;
         const auto source_partition =
-            signal.source_node < a.node ? signal.source_node
-                                        : signal.source_node - 1U;
-        const auto directory = receive_directory[
-            source_partition * a.gin_context_count + context];
-        if (directory.generation == a.dispatch.identity.generation &&
-            directory.epoch == a.epoch) {
-          incoming_waves += directory.wave_count;
-          const auto record_index =
+            a.node < remote_node ? a.node : a.node - 1U;
+        const auto directory_index =
+            remote_partition * a.gin_context_count + context;
+        if (threadIdx.x == 0U) {
+          send_directory[directory_index] = GinDispatchContextRecord{
+              a.dispatch.identity.generation, a.epoch, packet_begin,
+              static_cast<std::uint32_t>(packet_end - packet_begin),
+              static_cast<std::uint32_t>(context_wave_end -
+                                         context_wave_begin)};
+          __threadfence_system();
+          const auto remote_directory_index =
               source_partition * a.gin_context_count + context;
-          context_completion[record_index].relay_expected =
-              directory.packet_count;
+          gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                  a.gin_receive_dispatch_directory_offset +
+                      remote_directory_index * sizeof(GinDispatchContextRecord),
+                  a.gin_window,
+                  a.gin_send_dispatch_directory_offset +
+                      directory_index * sizeof(GinDispatchContextRecord),
+                  sizeof(GinDispatchContextRecord), ncclGin_SignalInc{0},
+                  ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+          ++issued_completions;
+        }
+        __syncthreads();
+        for (auto wave = context_wave_begin; wave < context_wave_end; ++wave) {
+          const auto wave_begin = a.dispatch_waves.offsets[wave];
+          const auto wave_end = a.dispatch_waves.offsets[wave + 1U];
+          const auto wire_begin = wave_begin - node_packet_begin;
+          const auto wave_packets = wave_end - wave_begin;
+          for (auto position = wave_begin + threadIdx.x; position < wave_end;
+               position += blockDim.x) {
+            send_headers[position].sequence = position - node_packet_begin;
+            send_headers[position].dst_row =
+                (position - node_packet_begin) * a.dispatch.identity.top_k;
+            send_headers[position].topk_slot = 0U;
+          }
+          __syncthreads();
+          if (threadIdx.x == 0U) {
+            send_headers[wave_begin].topk_slot =
+                static_cast<std::uint32_t>(wave_packets);
+            __threadfence_system();
+            const auto receive_packet =
+                source_partition * a.max_tokens_per_rank + wire_begin;
+            MEGAMOE_TIMELINE_RECORD(
+                a.timeline, DyGinPutIssue, GinDispatch, context,
+                wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
+            gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                    a.gin_receive_header_offset +
+                        receive_packet * sizeof(LocalP2pRouteHeader),
+                    a.gin_window,
+                    a.gin_send_header_offset +
+                        wave_begin * sizeof(LocalP2pRouteHeader),
+                    wave_packets * sizeof(LocalP2pRouteHeader));
+            gin.put(
+                rail, static_cast<int>(remote_node), a.gin_window,
+                a.gin_receive_fanout_offset +
+                    (source_partition * a.max_tokens_per_rank + wire_begin) *
+                        a.dispatch.identity.top_k * sizeof(DeviceFanoutRecord),
+                a.gin_window,
+                a.gin_send_fanout_offset + wave_begin *
+                                               a.dispatch.identity.top_k *
+                                               sizeof(DeviceFanoutRecord),
+                wave_packets * a.dispatch.identity.top_k *
+                    sizeof(DeviceFanoutRecord));
+            gin.put(
+                rail, static_cast<int>(remote_node), a.gin_window,
+                a.gin_receive_gate_offset +
+                    (source_partition * a.max_tokens_per_rank + wire_begin) *
+                        a.dispatch.identity.top_k * sizeof(float),
+                a.gin_window,
+                a.gin_send_gate_offset +
+                    wave_begin * a.dispatch.identity.top_k * sizeof(float),
+                wave_packets * a.dispatch.identity.top_k * sizeof(float));
+            gin.put(rail, static_cast<int>(remote_node), a.gin_window,
+                    a.gin_receive_payload_offset +
+                        receive_packet * a.hidden * sizeof(transport::BFloat16),
+                    a.gin_window,
+                    a.gin_send_payload_offset +
+                        wave_begin * a.hidden * sizeof(transport::BFloat16),
+                    wave_packets * a.hidden * sizeof(transport::BFloat16),
+                    ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+                    ncclCoopThread{}, ncclGin_None{},
+                    ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+            ++issued_completions;
+            issued_packets += wave_packets;
+            atomicAdd(&status->gin_dispatch_put_count, 4ULL);
+            atomicAdd(&status->gin_signal_count, 1ULL);
+            atomicAdd(&status->gin_metadata_bytes,
+                      wave_packets *
+                          (sizeof(LocalP2pRouteHeader) +
+                           a.dispatch.identity.top_k *
+                               (sizeof(DeviceFanoutRecord) + sizeof(float))));
+          }
+          __syncthreads();
         }
       }
-      if (incoming_waves != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 0,
-                       incoming_sources + incoming_waves);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
-                              context, incoming_sources, a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstRemoteSignal, GinDispatch,
-                              context, incoming_sources, a.epoch);
+      if (threadIdx.x == 0U && issued_completions != 0ULL) {
+        gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DyLocalCompletion, GinDispatch,
+                                context, issued_packets, a.epoch);
+        atomicAdd(&status->raw_cross_node_dy_bytes,
+                  issued_packets * a.dispatch.identity.top_k * a.hidden *
+                      sizeof(transport::BFloat16));
+        atomicAdd(&status->gin_dispatch_payload_bytes,
+                  issued_packets * a.hidden * sizeof(transport::BFloat16));
+        gin.resetCounter(0);
+        for (std::uint32_t remote_node = 0;
+             remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+          if (remote_node == a.node)
+            continue;
+          const auto remote_partition =
+              remote_node < a.node ? remote_node : remote_node - 1U;
+          const auto record_index =
+              remote_partition * a.gin_context_count + context;
+          const auto directory = send_directory[record_index];
+          auto &record = context_completion[record_index];
+          record.directory_ready = 1ULL;
+          record.dispatch_expected = directory.wave_count;
+          record.dispatch_claimed = directory.wave_count;
+          record.dispatch_completed = directory.wave_count;
+          record.local_completion = 1ULL + directory.wave_count;
+          record.credit = 1ULL;
+          record.last_cursor = directory.packet_begin + directory.packet_count;
+          record.last_progress_globaltimer = device_globaltimer_ns();
+          atomicAdd(&completion->directory_ready, 1ULL);
+          atomicAdd(&completion->dispatch_local_completion_completed,
+                    1ULL + directory.wave_count);
+          if (directory.wave_count != 0ULL) {
+            claim_completion_tasks(completion,
+                                   transport_state::TaskClass::DispatchWave,
+                                   directory.wave_count);
+            complete_completion_tasks(completion,
+                                      transport_state::TaskClass::DispatchWave,
+                                      directory.wave_count);
+          }
+        }
+      }
+      __syncthreads();
+      unsigned long long incoming_sources = 0ULL;
+      if (threadIdx.x == 0U) {
+        for (std::uint32_t index = 0;
+             index < a.dispatch.sizes.incoming_signal_count; ++index) {
+          const auto signal = a.dispatch.incoming_proxy_signals[index];
+          if (signal.source_node != a.node && signal.expected_packets != 0ULL)
+            ++incoming_sources;
+        }
+        if (incoming_sources != 0ULL)
+          gin.waitSignal(ncclCoopThread{}, 0, incoming_sources);
+        auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
+            static_cast<std::byte *>(a.gin_window_base) +
+            a.gin_receive_dispatch_directory_offset);
+        unsigned long long incoming_waves = 0ULL;
+        for (std::uint32_t index = 0;
+             index < a.dispatch.sizes.incoming_signal_count; ++index) {
+          const auto signal = a.dispatch.incoming_proxy_signals[index];
+          if (signal.source_node == a.node || signal.expected_packets == 0ULL)
+            continue;
+          const auto source_partition = signal.source_node < a.node
+                                            ? signal.source_node
+                                            : signal.source_node - 1U;
+          const auto directory =
+              receive_directory[source_partition * a.gin_context_count +
+                                context];
+          if (directory.generation == a.dispatch.identity.generation &&
+              directory.epoch == a.epoch) {
+            incoming_waves += directory.wave_count;
+            const auto record_index =
+                source_partition * a.gin_context_count + context;
+            context_completion[record_index].relay_expected =
+                directory.packet_count;
+          }
+        }
+        if (incoming_waves != 0ULL)
+          gin.waitSignal(ncclCoopThread{}, 0,
+                         incoming_sources + incoming_waves);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
+                                context, incoming_sources, a.epoch);
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DyFirstRemoteSignal, GinDispatch,
+                                context, incoming_sources, a.epoch);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            directories_ready(scheduler[10]);
+        directories_ready.fetch_add(1ULL, ::cuda::memory_order_release);
+      }
+      __syncthreads();
     }
-    __syncthreads();
-  }
-  if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      blockIdx.x < a.gin_context_count) {
-    const auto context = static_cast<std::uint32_t>(blockIdx.x);
-    auto *bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        bytes + a.gin_receive_header_offset);
-    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        bytes + a.gin_receive_fanout_offset);
-    auto *receive_gate = reinterpret_cast<float *>(
-        bytes + a.gin_receive_gate_offset);
-    auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
-        bytes + a.gin_receive_payload_offset);
-    auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
-        bytes + a.gin_receive_dispatch_directory_offset);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayStart, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_signal_count, a.epoch);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto context_thread = static_cast<std::uint64_t>(threadIdx.x);
-    const auto context_threads = static_cast<std::uint64_t>(blockDim.x);
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto directory = receive_directory[
-          source_partition * a.gin_context_count + context];
-      const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint64_t item = context_thread;
-           item < static_cast<std::uint64_t>(directory.packet_count) *
-                      packet_vectors;
-           item += context_threads) {
-        const auto sequence =
-            directory.packet_begin + item / packet_vectors;
-        const auto within_packet = item % packet_vectors;
-        const auto fanout = within_packet / vector_count;
-        const auto vector = within_packet % vector_count;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
+    if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
+      if (threadIdx.x == 0U) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            directories_ready(scheduler[10]);
+        while (directories_ready.load(::cuda::memory_order_acquire) <
+                   a.gin_context_count &&
+               !backward_cancelled(a)) {
+          __nanosleep(256U);
+        }
+      }
+      __syncthreads();
+      auto *bytes = static_cast<std::byte *>(a.gin_window_base);
+      auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
+          bytes + a.gin_receive_header_offset);
+      auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+          bytes + a.gin_receive_fanout_offset);
+      auto *receive_gate =
+          reinterpret_cast<float *>(bytes + a.gin_receive_gate_offset);
+      auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
+          bytes + a.gin_receive_payload_offset);
+      auto *receive_directory = reinterpret_cast<GinDispatchContextRecord *>(
+          bytes + a.gin_receive_dispatch_directory_offset);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayStart, ProxyRelay, 0U,
+                              a.dispatch.sizes.incoming_signal_count, a.epoch);
+      const auto vector_count = a.hidden / 8ULL;
+      const auto relay_thread =
+          static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+      const auto relay_threads =
+          static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+      for (std::uint32_t signal_index = 0;
+           signal_index < a.dispatch.sizes.incoming_signal_count;
+           ++signal_index) {
+        const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+        if (signal.source_node == a.node)
           continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *destination_dy = peer_at<transport::BFloat16>(
-            a.peer_bases[destination], a.dy_canonical_offset);
-        reinterpret_cast<uint4 *>(destination_dy)[
-            target.dst_row * vector_count + vector] =
-            reinterpret_cast<const uint4 *>(receive_payload)[
-                packet * vector_count + vector];
+        const auto source_partition = signal.source_node < a.node
+                                          ? signal.source_node
+                                          : signal.source_node - 1U;
+        const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
+        for (std::uint32_t directory_context = 0;
+             directory_context < a.gin_context_count; ++directory_context) {
+          const auto directory =
+              receive_directory[source_partition * a.gin_context_count +
+                                directory_context];
+          for (std::uint64_t item = relay_thread;
+               item < static_cast<std::uint64_t>(directory.packet_count) *
+                          packet_vectors;
+               item += relay_threads) {
+            const auto sequence =
+                directory.packet_begin + item / packet_vectors;
+            const auto within_packet = item % packet_vectors;
+            const auto fanout = within_packet / vector_count;
+            const auto vector = within_packet % vector_count;
+            const auto packet =
+                source_partition * a.max_tokens_per_rank + sequence;
+            const auto header = receive_headers[packet];
+            if (fanout >= header.route_index)
+              continue;
+            const auto target =
+                receive_fanout[source_partition * a.max_tokens_per_rank *
+                                   a.dispatch.identity.top_k +
+                               header.dst_row + fanout];
+            const auto destination =
+                a.node * a.local_world_size + target.destination_local_rank;
+            auto *destination_dy = peer_at<transport::BFloat16>(
+                a.peer_bases[destination], a.dy_canonical_offset);
+            reinterpret_cast<uint4 *>(
+                destination_dy)[target.dst_row * vector_count + vector] =
+                reinterpret_cast<const uint4 *>(
+                    receive_payload)[packet * vector_count + vector];
+          }
+          for (std::uint64_t slot = relay_thread;
+               slot < static_cast<std::uint64_t>(directory.packet_count) *
+                          a.dispatch.identity.top_k;
+               slot += relay_threads) {
+            const auto sequence =
+                directory.packet_begin + slot / a.dispatch.identity.top_k;
+            const auto fanout = slot % a.dispatch.identity.top_k;
+            const auto packet =
+                source_partition * a.max_tokens_per_rank + sequence;
+            const auto header = receive_headers[packet];
+            if (fanout >= header.route_index)
+              continue;
+            const auto target =
+                receive_fanout[source_partition * a.max_tokens_per_rank *
+                                   a.dispatch.identity.top_k +
+                               header.dst_row + fanout];
+            const auto destination =
+                a.node * a.local_world_size + target.destination_local_rank;
+            auto *destination_gate = peer_at<float>(a.peer_bases[destination],
+                                                    a.canonical_gate_offset);
+            destination_gate[target.dst_row] =
+                receive_gate[source_partition * a.max_tokens_per_rank *
+                                 a.dispatch.identity.top_k +
+                             header.dst_row + fanout];
+          }
+        }
       }
-      for (std::uint64_t slot = context_thread;
-           slot < static_cast<std::uint64_t>(directory.packet_count) *
-                      a.dispatch.identity.top_k;
-           slot += context_threads) {
-        const auto sequence =
-            directory.packet_begin + slot / a.dispatch.identity.top_k;
-        const auto fanout = slot % a.dispatch.identity.top_k;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
+      __threadfence_system();
+      // Every row is striped across the full cooperative grid.  Publish tile
+      // readiness only after every CTA has made its payload and gate stores
+      // visible; a CTA-local fence is insufficient for this ownership pattern.
+      grid.sync();
+      for (std::uint32_t signal_index = 0;
+           signal_index < a.dispatch.sizes.incoming_signal_count;
+           ++signal_index) {
+        const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
+        if (signal.source_node == a.node)
           continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *destination_gate = peer_at<float>(
-            a.peer_bases[destination], a.canonical_gate_offset);
-        destination_gate[target.dst_row] = receive_gate[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
+        const auto source_partition = signal.source_node < a.node
+                                          ? signal.source_node
+                                          : signal.source_node - 1U;
+        for (std::uint32_t directory_context = 0;
+             directory_context < a.gin_context_count; ++directory_context) {
+          const auto directory =
+              receive_directory[source_partition * a.gin_context_count +
+                                directory_context];
+          for (std::uint64_t slot = relay_thread;
+               slot < static_cast<std::uint64_t>(directory.packet_count) *
+                          a.dispatch.identity.top_k;
+               slot += relay_threads) {
+            const auto sequence =
+                directory.packet_begin + slot / a.dispatch.identity.top_k;
+            const auto fanout = slot % a.dispatch.identity.top_k;
+            const auto packet =
+                source_partition * a.max_tokens_per_rank + sequence;
+            const auto header = receive_headers[packet];
+            if (fanout >= header.route_index)
+              continue;
+            const auto target =
+                receive_fanout[source_partition * a.max_tokens_per_rank *
+                                   a.dispatch.identity.top_k +
+                               header.dst_row + fanout];
+            const auto destination =
+                a.node * a.local_world_size + target.destination_local_rank;
+            auto *arrived = peer_at<unsigned long long>(
+                a.peer_bases[destination], a.dy_arrived_rows_offset);
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+                counter(arrived[target.reserved]);
+            counter.fetch_add(1ULL, ::cuda::memory_order_release);
+          }
+        }
       }
+      __syncthreads();
+      if (blockIdx.x < a.gin_context_count && threadIdx.x == 0U) {
+        const auto context = static_cast<std::uint32_t>(blockIdx.x);
+        unsigned long long relayed = 0ULL;
+        for (std::uint32_t remote = 0;
+             remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
+          const auto index = remote * a.gin_context_count + context;
+          auto &record = context_completion[index];
+          record.relay_claimed = record.relay_expected;
+          record.relay_completed = record.relay_expected;
+          record.last_progress_globaltimer = device_globaltimer_ns();
+          relayed += record.relay_expected;
+        }
+        if (relayed != 0ULL) {
+          claim_completion_tasks(
+              completion, transport_state::TaskClass::RelayWave, relayed);
+          complete_completion_tasks(
+              completion, transport_state::TaskClass::RelayWave, relayed);
+        }
+      }
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayEnd, ProxyRelay, 0U,
+                              a.dispatch.sizes.incoming_row_count, a.epoch);
+      MEGAMOE_TIMELINE_RECORD(a.timeline, DyLastRelay, ProxyRelay, 0U,
+                              a.dispatch.sizes.incoming_row_count, a.epoch);
     }
-    __threadfence_system();
-    __syncthreads();
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto directory = receive_directory[
-          source_partition * a.gin_context_count + context];
-      for (std::uint64_t slot = context_thread;
-           slot < static_cast<std::uint64_t>(directory.packet_count) *
-                      a.dispatch.identity.top_k;
-           slot += context_threads) {
-        const auto sequence =
-            directory.packet_begin + slot / a.dispatch.identity.top_k;
-        const auto fanout = slot % a.dispatch.identity.top_k;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        auto *arrived = peer_at<unsigned long long>(
-            a.peer_bases[destination], a.dy_arrived_rows_offset);
-        ::cuda::atomic_ref<unsigned long long,
-                           ::cuda::thread_scope_system>
-            counter(arrived[target.reserved]);
-        counter.fetch_add(1ULL, ::cuda::memory_order_release);
-      }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0U) {
-      unsigned long long relayed = 0ULL;
-      for (std::uint32_t remote = 0;
-           remote < a.dispatch.identity.num_nodes - 1U; ++remote) {
-        const auto index = remote * a.gin_context_count + context;
-        auto &record = context_completion[index];
-        record.relay_claimed = record.relay_expected;
-        record.relay_completed = record.relay_expected;
-        record.last_progress_globaltimer = device_globaltimer_ns();
-        relayed += record.relay_expected;
-      }
-      if (relayed != 0ULL) {
-        claim_completion_tasks(completion,
-                               transport_state::TaskClass::RelayWave,
-                               relayed);
-        complete_completion_tasks(completion,
-                                  transport_state::TaskClass::RelayWave,
-                                  relayed);
-      }
-    }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DyRelayEnd, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DyLastRelay, ProxyRelay, 0U,
-                            a.dispatch.sizes.incoming_row_count, a.epoch);
-  }
 #endif
-  __threadfence_system();
-  if (!remote_backend_enabled<StaticLocal>(a.use_gin)) {
-    grid.sync();
-    if (blockIdx.x == 0) {
-    const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
-                                 ? a.node * a.local_world_size
-                                 : 0U;
-    const auto local_count = remote_backend_enabled<StaticLocal>(a.use_gin)
-                                 ? a.local_world_size
-                                 : a.world;
-    if (threadIdx.x < local_count) {
-      const auto peer = first_local + threadIdx.x;
-      auto *signal = peer_at<unsigned long long>(
-          a.peer_bases[peer], a.incoming_signal_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          signal[a.rank * a.channels]);
-      ready.store(a.epoch, ::cuda::memory_order_release);
-    }
-    auto *signal = peer_at<unsigned long long>(a.local_base,
-                                                a.incoming_signal_offset);
-    for (std::uint32_t local_source = threadIdx.x;
-         local_source < local_count; local_source += blockDim.x) {
-      const auto source = first_local + local_source;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          signal[source * a.channels]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
-             !backward_cancelled(a)) {
+    __threadfence_system();
+    if (!remote_backend_enabled<StaticLocal>(a.use_gin)) {
+      grid.sync();
+      if (blockIdx.x == 0) {
+        const auto first_local = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                     ? a.node * a.local_world_size
+                                     : 0U;
+        const auto local_count = remote_backend_enabled<StaticLocal>(a.use_gin)
+                                     ? a.local_world_size
+                                     : a.world;
+        if (threadIdx.x < local_count) {
+          const auto peer = first_local + threadIdx.x;
+          auto *signal = peer_at<unsigned long long>(a.peer_bases[peer],
+                                                     a.incoming_signal_offset);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              ready(signal[a.rank * a.channels]);
+          ready.store(a.epoch, ::cuda::memory_order_release);
+        }
+        auto *signal =
+            peer_at<unsigned long long>(a.local_base, a.incoming_signal_offset);
+        for (std::uint32_t local_source = threadIdx.x;
+             local_source < local_count; local_source += blockDim.x) {
+          const auto source = first_local + local_source;
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              ready(signal[source * a.channels]);
+          while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+                 !backward_cancelled(a)) {
+          }
+        }
       }
+      grid.sync();
     }
-    }
-    grid.sync();
-  }
   } else {
     grid.sync();
   }
@@ -7812,8 +8247,6 @@ local_p2p_backward_megakernel(
     cutlass::arch::warpgroup_reg_alloc<224>();
   else
     cutlass::arch::warpgroup_reg_dealloc<48>();
-  std::uint32_t pipeline_iteration = 0;
-  __shared__ unsigned long long task_shared;
   const auto mblocks = scheduler[8];
   const auto fc1_ntiles =
       static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
@@ -7952,80 +8385,76 @@ local_p2p_backward_megakernel(
     auto *epilogue_dv = epilogue_db + kEpilogueTileElements;
     auto *epilogue_s = epilogue_dv + kEpilogueTileElements;
     const auto expert_padded_rows =
-        (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
-    const auto padded_block_rows = static_cast<std::uint32_t>(min(
-        128ULL, expert_padded_rows -
-                    static_cast<std::uint64_t>(local_mblock) * 128ULL));
+        persistent_v3::padded_expert_rows(a.dispatch.expert_row_count[expert]);
+    const auto padded_block_rows = static_cast<std::uint32_t>(
+        min(128ULL, expert_padded_rows -
+                        static_cast<std::uint64_t>(local_mblock) * 128ULL));
 #pragma unroll
     for (std::uint32_t half = 0; half < 2U; ++half) {
       auto *half_accum = half == 0U ? accum_a : accum_b;
-      visit_forward_accumulator(
-        half_accum, [&](std::uint32_t wg, std::uint32_t m,
-                   std::uint32_t column, float value0, float value1) {
-      const auto block_m = wg * 64U + m;
-      const float values[2] = {value0, value1};
+      visit_forward_accumulator(half_accum, [&](std::uint32_t wg,
+                                                std::uint32_t m,
+                                                std::uint32_t column,
+                                                float value0, float value1) {
+        const auto block_m = wg * 64U + m;
+        const float values[2] = {value0, value1};
 #pragma unroll
-      for (std::uint32_t value = 0; value < 2U; ++value) {
-        const auto output_column = static_cast<std::uint64_t>(n) +
-                                   half * 128ULL + column + value;
-        if (block_m < valid_rows && output_column < a.intermediate) {
-          const auto index = (row + block_m) * a.intermediate + output_column;
-          const auto dv_bf16 = float_to_bf16_bits(values[value]);
-          const auto av = bf16_bits_to_float(ab[index].bits);
-          const auto bv = bf16_bits_to_float(
-              ab[a.max_destination_rows * a.intermediate + index].bits);
-          const auto sigmoid = 1.0F / (1.0F + __expf(-av));
-          const auto silu = av * sigmoid;
-          const auto s_value = silu * bv;
-          const auto s_bf16 = float_to_bf16_bits(s_value);
-          const auto gate = canonical_gate[row + block_m];
-          const auto u_bf16 = float_to_bf16_bits(
-              __fmul_rn(gate, bf16_bits_to_float(s_bf16)));
-          const auto ds = __fmul_rn(gate, bf16_bits_to_float(dv_bf16));
-          const auto da = __fmul_rn(
-              ds, __fmul_rn(bv, sigmoid * (1.0F + av * (1.0F - sigmoid))));
-          const auto db = __fmul_rn(ds, silu);
-          const auto epilogue_index = block_m * 128ULL + column + value;
-          epilogue_u[epilogue_index] = transport::BFloat16{u_bf16};
-          epilogue_da[epilogue_index] =
-              transport::BFloat16{float_to_bf16_bits(da)};
-          epilogue_db[epilogue_index] =
-              transport::BFloat16{float_to_bf16_bits(db)};
-          epilogue_dv[epilogue_index] = transport::BFloat16{dv_bf16};
-          epilogue_s[epilogue_index] = transport::BFloat16{s_bf16};
+        for (std::uint32_t value = 0; value < 2U; ++value) {
+          const auto output_column =
+              static_cast<std::uint64_t>(n) + half * 128ULL + column + value;
+          if (block_m < valid_rows && output_column < a.intermediate) {
+            const auto index = (row + block_m) * a.intermediate + output_column;
+            const auto dv_bf16 = float_to_bf16_bits(values[value]);
+            const auto av = bf16_bits_to_float(ab[index].bits);
+            const auto bv = bf16_bits_to_float(
+                ab[a.max_destination_rows * a.intermediate + index].bits);
+            const auto sigmoid = 1.0F / (1.0F + __expf(-av));
+            const auto silu = av * sigmoid;
+            const auto s_value = silu * bv;
+            const auto s_bf16 = float_to_bf16_bits(s_value);
+            const auto gate = canonical_gate[row + block_m];
+            const auto u_bf16 =
+                float_to_bf16_bits(__fmul_rn(gate, bf16_bits_to_float(s_bf16)));
+            const auto ds = __fmul_rn(gate, bf16_bits_to_float(dv_bf16));
+            const auto da = __fmul_rn(
+                ds, __fmul_rn(bv, sigmoid * (1.0F + av * (1.0F - sigmoid))));
+            const auto db = __fmul_rn(ds, silu);
+            const auto epilogue_index = block_m * 128ULL + column + value;
+            epilogue_u[epilogue_index] = transport::BFloat16{u_bf16};
+            epilogue_da[epilogue_index] =
+                transport::BFloat16{float_to_bf16_bits(da)};
+            epilogue_db[epilogue_index] =
+                transport::BFloat16{float_to_bf16_bits(db)};
+            epilogue_dv[epilogue_index] = transport::BFloat16{dv_bf16};
+            epilogue_s[epilogue_index] = transport::BFloat16{s_bf16};
 #if MEGAMOE_DEBUG_VALIDATE
-          if (a.capture_stage_storage)
-            debug_dv[(row + block_m) * a.intermediate + output_column] =
-                transport::BFloat16{dv_bf16};
+            if (a.capture_stage_storage)
+              debug_dv[(row + block_m) * a.intermediate + output_column] =
+                  transport::BFloat16{dv_bf16};
 #endif
+          }
         }
-      }
       });
       __syncthreads();
       const auto epilogue_warp = threadIdx.x / 32U;
       const auto epilogue_lane = threadIdx.x & 31U;
-      for (std::uint32_t local_row = epilogue_warp;
-           local_row < valid_rows; local_row += blockDim.x / 32U) {
+      for (std::uint32_t local_row = epilogue_warp; local_row < valid_rows;
+           local_row += blockDim.x / 32U) {
         float partial = 0.0F;
 #pragma unroll
         for (std::uint32_t column = epilogue_lane; column < 128U;
              column += 32U) {
           const auto index = local_row * 128U + column;
           partial = __fadd_rn(
-              partial,
-              __fmul_rn(bf16_bits_to_float(epilogue_dv[index].bits),
-                        bf16_bits_to_float(epilogue_s[index].bits)));
+              partial, __fmul_rn(bf16_bits_to_float(epilogue_dv[index].bits),
+                                 bf16_bits_to_float(epilogue_s[index].bits)));
         }
-        partial = __fadd_rn(partial,
-                            __shfl_down_sync(0xffffffffU, partial, 16));
-        partial = __fadd_rn(partial,
-                            __shfl_down_sync(0xffffffffU, partial, 8));
-        partial = __fadd_rn(partial,
-                            __shfl_down_sync(0xffffffffU, partial, 4));
-        partial = __fadd_rn(partial,
-                            __shfl_down_sync(0xffffffffU, partial, 2));
-        partial = __fadd_rn(partial,
-                            __shfl_down_sync(0xffffffffU, partial, 1));
+        partial =
+            __fadd_rn(partial, __shfl_down_sync(0xffffffffU, partial, 16));
+        partial = __fadd_rn(partial, __shfl_down_sync(0xffffffffU, partial, 8));
+        partial = __fadd_rn(partial, __shfl_down_sync(0xffffffffU, partial, 4));
+        partial = __fadd_rn(partial, __shfl_down_sync(0xffffffffU, partial, 2));
+        partial = __fadd_rn(partial, __shfl_down_sync(0xffffffffU, partial, 1));
         if (epilogue_lane == 0U) {
           auto &target = dgate_partial[(row + local_row) * dv_ntiles + ntile];
           target = half == 0U ? partial : __fadd_rn(target, partial);
@@ -8176,18 +8605,6 @@ local_p2p_backward_megakernel(
   const auto dx_ntiles =
       static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
   const auto dx_tasks = mblocks * dx_ntiles;
-  // dW2 and dW1 retain their L2-friendly contiguous task domains. Scheduler
-  // candidates may overlap a prefix with dX, but do not interleave operand
-  // families because that destroys canonical-MN B reuse.
-  const auto dw2_mtiles = (a.hidden + 127ULL) / 128ULL;
-  constexpr std::uint64_t kDwN = 256ULL;
-  const auto dw2_ntiles = (a.intermediate + kDwN - 1ULL) / kDwN;
-  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
-  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
-  const auto dw2_tasks = static_cast<unsigned long long>(
-      a.dispatch.sizes.owned_expert_count) * dw2_mtiles * dw2_ntiles;
-  const auto dw1_tasks = static_cast<unsigned long long>(
-      a.dispatch.sizes.owned_expert_count) * dw1_mtiles * dw1_ntiles;
   if (blockIdx.x == 0 && threadIdx.x == 0)
     status->dx_start_clock = device_globaltimer_ns();
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
@@ -8204,18 +8621,17 @@ local_p2p_backward_megakernel(
       break;
     const auto mblock = task_shared / dx_ntiles;
     const auto ntile = static_cast<std::uint32_t>(task_shared % dx_ntiles);
-    const auto mapping =
-        claims[a.dispatch.sizes.owned_expert_count + mblock];
+    const auto mapping = claims[a.dispatch.sizes.owned_expert_count + mblock];
     const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
     const auto local_mblock = static_cast<std::uint32_t>(mapping);
     const auto row = a.dispatch.expert_row_prefix[expert] +
                      static_cast<std::uint64_t>(local_mblock) * 128ULL;
-    const auto valid_rows = static_cast<std::uint32_t>(min(
-        128ULL, a.dispatch.expert_row_count[expert] -
-                    static_cast<std::uint64_t>(local_mblock) * 128ULL));
+    const auto valid_rows = static_cast<std::uint32_t>(
+        min(128ULL, a.dispatch.expert_row_count[expert] -
+                        static_cast<std::uint64_t>(local_mblock) * 128ULL));
     const auto n = ntile * 256U;
     float accum[ForwardMmaWide::kNumAccum];
-    forward_wgmma_wide_tile(
+    forward_wgmma_tile<ForwardMmaWide, 256U>(
         dab_map, w1_transpose_map, static_cast<std::uint32_t>(row),
         static_cast<std::uint32_t>(expert * a.hidden + n),
         static_cast<std::uint32_t>(2ULL * a.intermediate), smem_a, smem_b,
@@ -8336,85 +8752,20 @@ local_p2p_backward_megakernel(
     auto *bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
         bytes + a.gin_receive_header_offset);
-    auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
-        bytes + a.gin_receive_fanout_offset);
-    auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
-        bytes + a.gin_return_staging_offset);
-    auto *return_gate_staging = reinterpret_cast<float *>(
-        bytes + a.gin_return_gate_staging_offset);
+    (void)receive_headers;
+    auto *forward_return_chunks = peer_at<ForwardReturnChunkRecord>(
+        a.local_base, a.forward_return_chunk_directory_offset);
+    auto *forward_return_fragment_index = peer_at<unsigned long long>(
+        a.local_base, a.forward_return_fragment_index_offset);
+    auto *forward_scheduler =
+        peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
+    const auto chunk_count = forward_scheduler[4ULL + 2ULL * a.world];
     MEGAMOE_TIMELINE_RECORD(a.timeline, DxReturnPackStart, GinReturn, 0U,
                             a.dispatch.sizes.incoming_row_count, a.epoch);
-    const auto vector_count = a.hidden / 8ULL;
-    const auto global_thread =
-        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto global_threads =
-        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto packet_vectors = a.dispatch.identity.top_k * vector_count;
-      for (std::uint64_t item = global_thread;
-           item < signal.expected_packets * packet_vectors;
-           item += global_threads) {
-        const auto sequence = item / packet_vectors;
-        const auto within_packet = item % packet_vectors;
-        const auto fanout = within_packet / vector_count;
-        const auto vector = within_packet % vector_count;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        const auto *destination_dx = peer_at<transport::BFloat16>(
-            a.peer_bases[destination], a.dx_canonical_offset);
-        reinterpret_cast<uint4 *>(return_staging)[
-            ((source_partition * a.max_tokens_per_rank *
-                  a.dispatch.identity.top_k +
-              header.dst_row + fanout) *
-                 vector_count) +
-            vector] = reinterpret_cast<const uint4 *>(destination_dx)[
-            target.dst_row * vector_count + vector];
-      }
-      for (std::uint64_t slot = global_thread;
-           slot < signal.expected_packets * a.dispatch.identity.top_k;
-           slot += global_threads) {
-        const auto sequence = slot / a.dispatch.identity.top_k;
-        const auto fanout = slot % a.dispatch.identity.top_k;
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        if (fanout >= header.route_index)
-          continue;
-        const auto target = receive_fanout[
-            source_partition * a.max_tokens_per_rank *
-                    a.dispatch.identity.top_k +
-                header.dst_row + fanout];
-        const auto destination =
-            a.node * a.local_world_size + target.destination_local_rank;
-        const auto *destination_dgate = peer_at<float>(
-            a.peer_bases[destination], a.dgate_canonical_offset);
-        return_gate_staging[source_partition * a.max_tokens_per_rank *
-                                a.dispatch.identity.top_k +
-                            header.dst_row + fanout] =
-            destination_dgate[target.dst_row];
-      }
-    }
-    // dGate is only four bytes per route and exposed the missing publication
-    // fence as intermittent stale values even when the much larger dX DMA had
-    // enough latency to appear correct.
-    __threadfence_system();
+    for (std::uint64_t chunk_index = blockIdx.x; chunk_index < chunk_count;
+         chunk_index += gridDim.x)
+      pack_backward_return_chunk(a, forward_return_chunks[chunk_index],
+                                 forward_return_fragment_index);
     grid.sync();
   }
   if (remote_backend_enabled<StaticLocal>(a.use_gin) &&
@@ -8422,74 +8773,64 @@ local_p2p_backward_megakernel(
     const auto context = static_cast<std::uint32_t>(blockIdx.x);
     const ncclGin gin(a.gin_dev_comm, context);
     const auto rail = ncclTeamRail(a.gin_dev_comm);
-    auto *bytes = static_cast<std::byte *>(a.gin_window_base);
-    auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
-        bytes + a.gin_receive_header_offset);
+    auto *forward_return_chunks = peer_at<ForwardReturnChunkRecord>(
+        a.local_base, a.forward_return_chunk_directory_offset);
+    auto *forward_scheduler =
+        peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
+    const auto chunk_count = forward_scheduler[4ULL + 2ULL * a.world];
+    // dX is globally complete before this phase, so the 64-row Forward
+    // readiness chunks no longer need to define the Backward wire protocol.
+    // Partition each source's compact contiguous range across GIN contexts
+    // and issue one large payload/scalar pair per non-empty slice. This keeps
+    // fine-grained Forward overlap while reducing main-shape Backward from
+    // roughly 1,152 tiny puts to 24 large puts per remote node.
     unsigned long long return_packets = 0ULL;
-    for (std::uint32_t signal_index = 0;
-         signal_index < a.dispatch.sizes.incoming_signal_count;
-         ++signal_index) {
-      const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-      if (signal.source_node == a.node)
-        continue;
-      const auto source_partition =
-          signal.source_node < a.node ? signal.source_node
-                                      : signal.source_node - 1U;
-      const auto sequence_begin =
-          signal.expected_packets * context / a.gin_context_count;
-      const auto sequence_end = signal.expected_packets * (context + 1U) /
-                                a.gin_context_count;
-      std::uint64_t first_return = 0;
-      std::uint64_t last_return = 0;
-      for (std::uint64_t sequence = sequence_begin;
-           sequence < sequence_end; ++sequence) {
-        const auto packet =
-            source_partition * a.max_tokens_per_rank + sequence;
-        const auto header = receive_headers[packet];
-        const auto fanout_count = header.route_index;
-        if (sequence == sequence_begin)
-          first_return = header.dst_row;
-        last_return = header.dst_row + fanout_count;
+    for (std::uint32_t source_partition = 0;
+         source_partition + 1U < a.dispatch.identity.num_nodes;
+         ++source_partition) {
+      const auto source_node =
+          source_partition < a.node ? source_partition : source_partition + 1U;
+      std::uint64_t compact_rows = 0ULL;
+      for (std::uint64_t chunk_index = 0; chunk_index < chunk_count;
+           ++chunk_index) {
+        const auto chunk = forward_return_chunks[chunk_index];
+        if (chunk.source_node == source_node)
+          compact_rows = max(compact_rows, chunk.row_begin + chunk.row_count);
       }
-      __syncthreads();
-      if (threadIdx.x == 0U && last_return != first_return) {
-          MEGAMOE_TIMELINE_RECORD(
-              a.timeline, DxReturnGinPutIssue, GinReturn, context,
-              (last_return - first_return) * a.hidden *
-                  sizeof(transport::BFloat16),
-              a.epoch);
-          gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
-                  a.gin_return_receive_offset +
-                      first_return * a.hidden *
-                          sizeof(transport::BFloat16),
-                  a.gin_window,
-                  a.gin_return_staging_offset +
-                      (source_partition * a.max_tokens_per_rank *
-                               a.dispatch.identity.top_k +
-                       first_return) *
-                          a.hidden * sizeof(transport::BFloat16),
-                  (last_return - first_return) * a.hidden *
-                      sizeof(transport::BFloat16));
-          gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
-                  a.gin_return_gate_receive_offset +
-                      first_return * sizeof(float),
-                  a.gin_window,
-                  a.gin_return_gate_staging_offset +
-                      (source_partition * a.max_tokens_per_rank *
-                               a.dispatch.identity.top_k +
-                       first_return) * sizeof(float),
-                  (last_return - first_return) * sizeof(float),
-                  ncclGin_SignalInc{1},
-                  ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
-                  ::cuda::thread_scope_block, ::cuda::thread_scope_device);
-          atomicAdd(&status->gin_return_put_count, 2ULL);
-          atomicAdd(&status->gin_signal_count, 1ULL);
-          atomicAdd(&status->gin_metadata_bytes,
-                    (last_return - first_return) * sizeof(float));
-          atomicAdd(&status->gin_return_payload_bytes,
-                    (last_return - first_return) * a.hidden *
-                        sizeof(transport::BFloat16));
-          ++return_packets;
+      const auto row_begin = compact_rows * context / a.gin_context_count;
+      const auto row_end =
+          compact_rows * (context + 1ULL) / a.gin_context_count;
+      if (row_begin == row_end)
+        continue;
+      const auto row_count = row_end - row_begin;
+      const auto partition_base = static_cast<std::uint64_t>(source_partition) *
+                                  a.max_tokens_per_rank *
+                                  a.dispatch.identity.top_k;
+      const auto packed_base = partition_base + row_begin;
+      const auto payload_bytes =
+          row_count * a.hidden * sizeof(transport::BFloat16);
+      if (threadIdx.x == 0U) {
+        MEGAMOE_TIMELINE_RECORD(a.timeline, DxReturnGinPutIssue, GinReturn,
+                                context, payload_bytes, a.epoch);
+        gin.put(rail, static_cast<int>(source_node), a.gin_window,
+                a.gin_return_receive_offset +
+                    row_begin * a.hidden * sizeof(transport::BFloat16),
+                a.gin_window,
+                a.gin_return_staging_offset +
+                    packed_base * a.hidden * sizeof(transport::BFloat16),
+                payload_bytes);
+        gin.put(rail, static_cast<int>(source_node), a.gin_window,
+                a.gin_return_gate_receive_offset + row_begin * sizeof(float),
+                a.gin_window,
+                a.gin_return_gate_staging_offset + packed_base * sizeof(float),
+                row_count * sizeof(float), ncclGin_SignalInc{1},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+        atomicAdd(&status->gin_return_put_count, 2ULL);
+        atomicAdd(&status->gin_signal_count, 1ULL);
+        atomicAdd(&status->gin_metadata_bytes, row_count * sizeof(float));
+        atomicAdd(&status->gin_return_payload_bytes, payload_bytes);
+        ++return_packets;
       }
       __syncthreads();
     }
@@ -8504,71 +8845,73 @@ local_p2p_backward_megakernel(
     // the much larger dX operation on the same context.
     if (threadIdx.x == 0U) {
       unsigned long long scalar_returns = 0ULL;
-      for (std::uint32_t signal_index = 0;
-           signal_index < a.dispatch.sizes.incoming_signal_count;
-           ++signal_index) {
-        const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
-        if (signal.source_node == a.node)
-          continue;
-        const auto source_partition =
-            signal.source_node < a.node ? signal.source_node
-                                        : signal.source_node - 1U;
-        const auto sequence_begin =
-            signal.expected_packets * context / a.gin_context_count;
-        const auto sequence_end =
-            signal.expected_packets * (context + 1U) / a.gin_context_count;
-        std::uint64_t first_return = 0;
-        std::uint64_t last_return = 0;
-        for (std::uint64_t sequence = sequence_begin;
-             sequence < sequence_end; ++sequence) {
-          const auto packet =
-              source_partition * a.max_tokens_per_rank + sequence;
-          const auto header = receive_headers[packet];
-          if (sequence == sequence_begin)
-            first_return = header.dst_row;
-          last_return = header.dst_row + header.route_index;
+      for (std::uint32_t source_partition = 0;
+           source_partition + 1U < a.dispatch.identity.num_nodes;
+           ++source_partition) {
+        const auto source_node = source_partition < a.node
+                                     ? source_partition
+                                     : source_partition + 1U;
+        std::uint64_t compact_rows = 0ULL;
+        for (std::uint64_t chunk_index = 0; chunk_index < chunk_count;
+             ++chunk_index) {
+          const auto chunk = forward_return_chunks[chunk_index];
+          if (chunk.source_node == source_node)
+            compact_rows = max(compact_rows, chunk.row_begin + chunk.row_count);
         }
-        if (last_return == first_return)
+        const auto row_begin = compact_rows * context / a.gin_context_count;
+        const auto row_end =
+            compact_rows * (context + 1ULL) / a.gin_context_count;
+        if (row_begin == row_end)
           continue;
-        gin.put(rail, static_cast<int>(signal.source_node), a.gin_window,
-                a.gin_return_gate_receive_offset +
-                    first_return * sizeof(float),
+        const auto row_count = row_end - row_begin;
+        const auto partition_base =
+            static_cast<std::uint64_t>(source_partition) *
+            a.max_tokens_per_rank * a.dispatch.identity.top_k;
+        const auto packed_base = partition_base + row_begin;
+        gin.put(rail, static_cast<int>(source_node), a.gin_window,
+                a.gin_return_gate_receive_offset + row_begin * sizeof(float),
                 a.gin_window,
-                a.gin_return_gate_staging_offset +
-                    (source_partition * a.max_tokens_per_rank *
-                         a.dispatch.identity.top_k +
-                     first_return) * sizeof(float),
-                (last_return - first_return) * sizeof(float),
-                ncclGin_SignalInc{1}, ncclGin_CounterInc{0},
-                ncclCoopThread{}, ncclGin_None{},
+                a.gin_return_gate_staging_offset + packed_base * sizeof(float),
+                row_count * sizeof(float), ncclGin_SignalInc{1},
+                ncclGin_CounterInc{0}, ncclCoopThread{}, ncclGin_None{},
                 ::cuda::thread_scope_block, ::cuda::thread_scope_device);
         atomicAdd(&status->gin_return_put_count, 1ULL);
         atomicAdd(&status->gin_signal_count, 1ULL);
-        atomicAdd(&status->gin_metadata_bytes,
-                  (last_return - first_return) * sizeof(float));
+        atomicAdd(&status->gin_metadata_bytes, row_count * sizeof(float));
         ++scalar_returns;
       }
       if (scalar_returns != 0ULL)
-        gin.waitCounter(ncclCoopThread{}, 0,
-                        return_packets + scalar_returns);
+        gin.waitCounter(ncclCoopThread{}, 0, return_packets + scalar_returns);
     }
     __syncthreads();
-    unsigned long long outgoing_remote_packets = 0ULL;
+    unsigned long long outgoing_remote_chunks = 0ULL;
     if (threadIdx.x == 0U) {
-      std::uint64_t total = 0;
-      for (std::uint64_t packet = 0;
-           packet < a.dispatch.sizes.packet_count; ++packet)
-        if (a.dispatch.packet_headers[packet].destination_node != a.node)
-          ++total;
-      const auto begin = total * context / a.gin_context_count;
-      const auto end = total * (context + 1U) / a.gin_context_count;
-      outgoing_remote_packets = end - begin;
-      if (outgoing_remote_packets != 0ULL)
-        gin.waitSignal(ncclCoopThread{}, 1, 2);
+      for (std::uint32_t remote_node = 0;
+           remote_node < a.dispatch.identity.num_nodes; ++remote_node) {
+        if (remote_node == a.node)
+          continue;
+        std::uint64_t remote_fanout = 0ULL;
+        for (std::uint64_t packet = 0; packet < a.dispatch.sizes.packet_count;
+             ++packet) {
+          const auto descriptor = a.dispatch.packet_headers[packet];
+          if (descriptor.destination_node != remote_node)
+            continue;
+          remote_fanout += a.dispatch.packet_fanout_offsets[packet + 1ULL] -
+                           a.dispatch.packet_fanout_offsets[packet];
+        }
+        const auto context_begin =
+            remote_fanout * context / a.gin_context_count;
+        const auto context_end =
+            remote_fanout * (context + 1ULL) / a.gin_context_count;
+        if (context_begin != context_end)
+          ++outgoing_remote_chunks;
+      }
+      if (outgoing_remote_chunks != 0ULL)
+        gin.waitSignal(ncclCoopThread{}, 1, 2ULL * outgoing_remote_chunks);
       MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay,
-                              context, outgoing_remote_packets, a.epoch);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
+                              context, outgoing_remote_chunks, a.epoch);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> phase(
+          scheduler[2]);
       phase.fetch_add(1ULL, ::cuda::memory_order_release);
     }
     __syncthreads();
@@ -8579,6 +8922,17 @@ local_p2p_backward_megakernel(
   // The two branches rejoin before source relay/reduce.
 #endif
 
+  const auto dw2_mtiles = (a.hidden + 127ULL) / 128ULL;
+  constexpr std::uint64_t kDwN = 256ULL;
+  const auto dw2_ntiles = (a.intermediate + kDwN - 1ULL) / kDwN;
+  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
+  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
+  const auto dw2_tasks =
+      static_cast<unsigned long long>(a.dispatch.sizes.owned_expert_count) *
+      dw2_mtiles * dw2_ntiles;
+  const auto dw1_tasks =
+      static_cast<unsigned long long>(a.dispatch.sizes.owned_expert_count) *
+      dw1_mtiles * dw1_ntiles;
   // dW2 and dW1 use split_k=1. Each task owns one output tile and traverses
   // that expert's padded canonical-M segment in ascending order.
   // dW2 is evaluated as dW2^T = U^T @ dY.  Its epilogue transposes each
@@ -8611,7 +8965,7 @@ local_p2p_backward_megakernel(
     const auto mtile = task % dw2_mtiles;
     const auto reduction_start = claims[expert];
     const auto reduction =
-        (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
+        persistent_v3::padded_expert_rows(a.dispatch.expert_row_count[expert]);
 #if MEGAMOE_DEBUG_VALIDATE
     if (threadIdx.x == 0U) {
       const auto now = device_globaltimer_ns();
@@ -8685,237 +9039,236 @@ local_p2p_backward_megakernel(
 #endif
   if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
     backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2End, Compute, 0U, dw2_tasks,
-                          a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2End, Compute, 0U, dw2_tasks, a.epoch);
 
-  // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
-  // preceding general dW2 loop, the accumulator is lexically confined to the
-  // math branch and the producer WG executes only the TMA path.
-  // Four input stages minimize canonical-M stalls. The accumulator epilogue
-  // reuses the input storage only after all stages have been consumed.
-  constexpr std::uint32_t kDw1Stages = 4U;
-  constexpr std::uint32_t kDw1AStageElements = 128U * 64U;
-  constexpr std::uint32_t kDw1BStageElements = 256U * 64U;
-  auto *dw1_smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
-  auto *dw1_smem_b = dw1_smem_a + kDw1Stages * kDw1AStageElements;
-  auto *dw1_output_tile = dw1_smem_a;
-  auto *dw1_full_barriers = reinterpret_cast<ForwardBarrier *>(
-      dw1_smem_b + kDw1Stages * kDw1BStageElements);
-  auto *dw1_empty_barriers = dw1_full_barriers + kDw1Stages;
-  if (threadIdx.x == 256U) {
-    for (std::uint32_t stage = 0; stage < kDw1Stages; ++stage) {
-      dw1_full_barriers[stage].init(1);
-      dw1_empty_barriers[stage].init(8);
+  if constexpr (!SplitDw1) {
+    // dW1 alone uses a persistent outer warp-specialized loop.  Unlike the
+    // preceding general dW2 loop, the accumulator is lexically confined to the
+    // math branch and the producer WG executes only the TMA path.
+    // Four input stages minimize canonical-M stalls. The accumulator epilogue
+    // reuses the input storage only after all stages have been consumed.
+    constexpr std::uint32_t kDw1Stages = 4U;
+    constexpr std::uint32_t kDw1AStageElements = 128U * 64U;
+    constexpr std::uint32_t kDw1BStageElements = 256U * 64U;
+    auto *dw1_smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+    auto *dw1_smem_b = dw1_smem_a + kDw1Stages * kDw1AStageElements;
+    auto *dw1_output_tile = dw1_smem_a;
+    auto *dw1_full_barriers = reinterpret_cast<ForwardBarrier *>(
+        dw1_smem_b + kDw1Stages * kDw1BStageElements);
+    auto *dw1_empty_barriers = dw1_full_barriers + kDw1Stages;
+    if (threadIdx.x == 256U) {
+      for (std::uint32_t stage = 0; stage < kDw1Stages; ++stage) {
+        dw1_full_barriers[stage].init(1);
+        dw1_empty_barriers[stage].init(8);
+      }
+      cutlass::arch::fence_barrier_init();
     }
-    cutlass::arch::fence_barrier_init();
-  }
-  __syncthreads();
-  constexpr std::uint32_t kDwTaskReadyBarrier = 0U;
-  constexpr std::uint32_t kDwTaskDoneBarrier = 1U;
-  constexpr std::uint32_t kDwMathOutputReadyBarrier = 2U;
-  constexpr std::uint32_t kDwMathOutputDoneBarrier = 3U;
-  const auto dw_warpgroup = threadIdx.x / 128U;
-  // Every task still has exactly one owner; grid-stride assignment avoids a
-  // 64K-operation global claim stream and preserves parallel expert coverage.
-  if (threadIdx.x == 0U)
-    task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
-                      ? atomicAdd(&scheduler[4], 1ULL)
-                      : blockIdx.x;
-  __syncthreads();
-  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
-    backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Ready, Compute, 0U, dw1_tasks,
-                          a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Start, Compute, 0U, 0ULL, a.epoch);
-  if (dw_warpgroup >= 2U) {
-    cutlass::arch::warpgroup_reg_dealloc<48>();
-    std::uint32_t dw_pipeline = 0U;
-    while (true) {
-      cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
-      auto task = task_shared;
-      if (task >= dw1_tasks)
-        break;
-      const auto per_expert = dw1_mtiles * dw1_ntiles;
-      const auto expert = static_cast<std::uint32_t>(task / per_expert);
-      task %= per_expert;
-      const auto mtile = task / dw1_ntiles;
-      const auto ntile = task % dw1_ntiles;
-      const auto reduction_start = claims[expert];
-      const auto reduction =
-          (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
-      if (threadIdx.x == 256U) {
+    __syncthreads();
+    constexpr std::uint32_t kDwTaskReadyBarrier = 0U;
+    constexpr std::uint32_t kDwTaskDoneBarrier = 1U;
+    constexpr std::uint32_t kDwMathOutputReadyBarrier = 2U;
+    constexpr std::uint32_t kDwMathOutputDoneBarrier = 3U;
+    const auto dw_warpgroup = threadIdx.x / 128U;
+    // Every task still has exactly one owner; grid-stride assignment avoids a
+    // 64K-operation global claim stream and preserves parallel expert coverage.
+    if (threadIdx.x == 0U)
+      task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                        ? atomicAdd(&scheduler[4], 1ULL)
+                        : blockIdx.x;
+    __syncthreads();
+    if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+      backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Ready, Compute, 0U, dw1_tasks,
+                            a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1Start, Compute, 0U, 0ULL, a.epoch);
+    if (dw_warpgroup >= 2U) {
+      cutlass::arch::warpgroup_reg_dealloc<48>();
+      std::uint32_t dw_pipeline = 0U;
+      while (true) {
+        cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
+        auto task = task_shared;
+        if (task >= dw1_tasks)
+          break;
+        const auto per_expert = dw1_mtiles * dw1_ntiles;
+        const auto expert = static_cast<std::uint32_t>(task / per_expert);
+        task %= per_expert;
+        const auto mtile = task / dw1_ntiles;
+        const auto ntile = task % dw1_ntiles;
+        const auto reduction_start = claims[expert];
+        const auto reduction = persistent_v3::padded_expert_rows(
+            a.dispatch.expert_row_count[expert]);
+        if (threadIdx.x == 256U) {
+          const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+          for (std::uint32_t iteration = 0; iteration < iterations;
+               ++iteration) {
+            const auto pipeline = dw_pipeline + iteration;
+            const auto stage = pipeline % kDw1Stages;
+            const auto phase = (pipeline / kDw1Stages) & 1U;
+            dw1_empty_barriers[stage].wait(phase ^ 1U);
+            auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+                dw1_smem_a + stage * kDw1AStageElements);
+            auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+                dw1_smem_b + stage * kDw1BStageElements);
+            const auto a_k =
+                static_cast<std::uint32_t>(reduction_start + iteration * 64ULL);
+            const auto b_k = static_cast<std::uint32_t>(
+                a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
+            deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+                &dab_transpose_map, &dw1_full_barriers[stage], stage_a, a_k,
+                static_cast<std::uint32_t>(mtile * 128ULL));
+            for (std::uint32_t atom = 0; atom < 4U; ++atom)
+              deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                  &x_mn_map, &dw1_full_barriers[stage],
+                  stage_b + atom * 64U * 64U,
+                  static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL), b_k);
+            dw1_full_barriers[stage].arrive_and_expect_tx(
+                (kDw1AStageElements + kDw1BStageElements) *
+                sizeof(transport::BFloat16));
+          }
+          dw_pipeline += iterations;
+        }
+        cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
+      }
+    } else {
+      cutlass::arch::warpgroup_reg_alloc<224>();
+      std::uint32_t dw_pipeline = 0U;
+      while (true) {
+        cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
+        auto task = task_shared;
+        if (task >= dw1_tasks)
+          break;
+        const auto per_expert = dw1_mtiles * dw1_ntiles;
+        const auto expert = static_cast<std::uint32_t>(task / per_expert);
+        task %= per_expert;
+        const auto mtile = task / dw1_ntiles;
+        const auto ntile = task % dw1_ntiles;
+        const auto reduction = persistent_v3::padded_expert_rows(
+            a.dispatch.expert_row_count[expert]);
+#if MEGAMOE_DEBUG_VALIDATE
+        if (threadIdx.x == 0) {
+          const auto now = device_globaltimer_ns();
+          if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL,
+                        now) == 0ULL)
+            atomicMin(&status->dw1_first_start_clock, now);
+        }
+#else
+        if constexpr (!StaticLocal) {
+          if (threadIdx.x == 0U && task_shared < gridDim.x)
+            atomicMin(&status->dw1_first_start_clock, device_globaltimer_ns());
+        }
+#endif
+        float accum[BackwardDwMixedMma::kNumAccum];
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          accum[index] = 0.0F;
         const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
-        for (std::uint32_t iteration = 0; iteration < iterations;
-             ++iteration) {
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
           const auto pipeline = dw_pipeline + iteration;
           const auto stage = pipeline % kDw1Stages;
           const auto phase = (pipeline / kDw1Stages) & 1U;
-          dw1_empty_barriers[stage].wait(phase ^ 1U);
           auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
               dw1_smem_a + stage * kDw1AStageElements);
           auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
               dw1_smem_b + stage * kDw1BStageElements);
-          const auto a_k = static_cast<std::uint32_t>(
-              reduction_start + iteration * 64ULL);
-          const auto b_k = static_cast<std::uint32_t>(
-              a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
-          deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
-              &dab_transpose_map, &dw1_full_barriers[stage], stage_a, a_k,
-              static_cast<std::uint32_t>(mtile * 128ULL));
-          for (std::uint32_t atom = 0; atom < 4U; ++atom)
-            deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
-                &x_mn_map, &dw1_full_barriers[stage],
-                stage_b + atom * 64U * 64U,
-                static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
-                b_k);
-          dw1_full_barriers[stage].arrive_and_expect_tx(
-              (kDw1AStageElements + kDw1BStageElements) *
-              sizeof(transport::BFloat16));
+          dw1_full_barriers[stage].wait(phase);
+#pragma unroll
+          for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+            deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+          deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+          for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
+            const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+                cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
+                stage_a, dw_warpgroup * 64U, k * BackwardDwMixedMma::K);
+            const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+                cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
+                stage_b, 0U, k * BackwardDwMixedMma::K);
+            BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+          }
+          deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+          for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+            deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+          deep_gemm::ptx::warpgroup_wait<0>();
+          if ((threadIdx.x & 31U) == 0U)
+            dw1_empty_barriers[stage].arrive();
         }
         dw_pipeline += iterations;
-      }
-      cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
-    }
-  } else {
-    cutlass::arch::warpgroup_reg_alloc<224>();
-    std::uint32_t dw_pipeline = 0U;
-    while (true) {
-      cutlass::arch::NamedBarrier::sync(384U, kDwTaskReadyBarrier);
-      auto task = task_shared;
-      if (task >= dw1_tasks)
-        break;
-      const auto per_expert = dw1_mtiles * dw1_ntiles;
-      const auto expert = static_cast<std::uint32_t>(task / per_expert);
-      task %= per_expert;
-      const auto mtile = task / dw1_ntiles;
-      const auto ntile = task % dw1_ntiles;
-      const auto reduction =
-          (a.dispatch.expert_row_count[expert] + 63ULL) & ~63ULL;
-#if MEGAMOE_DEBUG_VALIDATE
-      if (threadIdx.x == 0) {
-        const auto now = device_globaltimer_ns();
-        if (atomicCAS(&dw_timeline[expert].dw1_first_start_clock, 0ULL, now) ==
-            0ULL)
-          atomicMin(&status->dw1_first_start_clock, now);
-      }
-#else
-      if constexpr (!StaticLocal) {
-        if (threadIdx.x == 0U && task_shared < gridDim.x)
-          atomicMin(&status->dw1_first_start_clock, device_globaltimer_ns());
-      }
-#endif
-      float accum[BackwardDwMixedMma::kNumAccum];
+        const auto warp = threadIdx.x / 32U;
+        const auto lane = threadIdx.x & 31U;
 #pragma unroll
-      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
-        accum[index] = 0.0F;
-      const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
-      for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
-        const auto pipeline = dw_pipeline + iteration;
-        const auto stage = pipeline % kDw1Stages;
-        const auto phase = (pipeline / kDw1Stages) & 1U;
-        auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
-            dw1_smem_a + stage * kDw1AStageElements);
-        auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
-            dw1_smem_b + stage * kDw1BStageElements);
-        dw1_full_barriers[stage].wait(phase);
-#pragma unroll
-        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-        deep_gemm::ptx::warpgroup_arrive();
-#pragma unroll
-        for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
-          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
-              cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
-              stage_a, dw_warpgroup * 64U, k * BackwardDwMixedMma::K);
-          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
-              cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
-              stage_b, 0U, k * BackwardDwMixedMma::K);
-          BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+        for (std::uint32_t index = 0;
+             index < BackwardDwMixedMma::kNumAccum / 4U; ++index) {
+          constexpr std::uint32_t kBankGroupBytes = 16U;
+          const auto atom = index / (64U / 8U);
+          const auto in_atom = index % (64U / 8U);
+          const auto row = lane;
+          auto column = in_atom;
+          column ^= row % (128U / kBankGroupBytes);
+          auto *smem_pointer =
+              reinterpret_cast<std::uint8_t *>(dw1_output_tile) +
+              warp * 16U * 128U + atom * 128U * 128U + row * 128U +
+              column * kBankGroupBytes;
+          deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+              __float22bfloat162_rn(
+                  make_float2(accum[index * 4U], accum[index * 4U + 1U])),
+              __float22bfloat162_rn(
+                  make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])),
+              smem_pointer);
         }
-        deep_gemm::ptx::warpgroup_commit_batch();
-#pragma unroll
-        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-        deep_gemm::ptx::warpgroup_wait<0>();
-        if ((threadIdx.x & 31U) == 0U)
-          dw1_empty_barriers[stage].arrive();
-      }
-      dw_pipeline += iterations;
-      const auto warp = threadIdx.x / 32U;
-      const auto lane = threadIdx.x & 31U;
-#pragma unroll
-      for (std::uint32_t index = 0;
-           index < BackwardDwMixedMma::kNumAccum / 4U; ++index) {
-        constexpr std::uint32_t kBankGroupBytes = 16U;
-        const auto atom = index / (64U / 8U);
-        const auto in_atom = index % (64U / 8U);
-        const auto row = lane;
-        auto column = in_atom;
-        column ^= row % (128U / kBankGroupBytes);
-        auto *smem_pointer =
-            reinterpret_cast<std::uint8_t *>(dw1_output_tile) +
-            warp * 16U * 128U + atom * 128U * 128U + row * 128U +
-            column * kBankGroupBytes;
-        deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
-            __float22bfloat162_rn(
-                make_float2(accum[index * 4U], accum[index * 4U + 1U])),
-            __float22bfloat162_rn(make_float2(accum[index * 4U + 2U],
-                                               accum[index * 4U + 3U])),
-            smem_pointer);
-      }
-      cute::tma_store_fence();
-      cutlass::arch::NamedBarrier::sync(256U,
-                                        kDwMathOutputReadyBarrier);
-      if (threadIdx.x < 4U) {
-        const auto atom = threadIdx.x;
-        cute::SM90_TMA_STORE_2D::copy(
-            &dw1_store_map, dw1_output_tile + atom * 128U * 64U,
-            static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
-            static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
-                                       mtile * 128ULL));
-        cute::tma_store_arrive();
-        cute::tma_store_wait<0>();
-      }
-      cutlass::arch::NamedBarrier::sync(256U,
-                                        kDwMathOutputDoneBarrier);
-#if MEGAMOE_DEBUG_VALIDATE
-      if (threadIdx.x == 0) {
-        const auto complete =
-            atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL;
-        if (complete == per_expert) {
-          const auto now = device_globaltimer_ns();
-          dw_timeline[expert].dw1_complete_clock = now;
-          atomicMax(&status->dw1_last_complete_clock, now);
+        cute::tma_store_fence();
+        cutlass::arch::NamedBarrier::sync(256U, kDwMathOutputReadyBarrier);
+        if (threadIdx.x < 4U) {
+          const auto atom = threadIdx.x;
+          cute::SM90_TMA_STORE_2D::copy(
+              &dw1_store_map, dw1_output_tile + atom * 128U * 64U,
+              static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
+              static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
+                                         mtile * 128ULL));
+          cute::tma_store_arrive();
+          cute::tma_store_wait<0>();
         }
-      }
+        cutlass::arch::NamedBarrier::sync(256U, kDwMathOutputDoneBarrier);
+#if MEGAMOE_DEBUG_VALIDATE
+        if (threadIdx.x == 0) {
+          const auto complete =
+              atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL;
+          if (complete == per_expert) {
+            const auto now = device_globaltimer_ns();
+            dw_timeline[expert].dw1_complete_clock = now;
+            atomicMax(&status->dw1_last_complete_clock, now);
+          }
+        }
 #endif
-      cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
-      if (threadIdx.x == 0U)
-        task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
-                          ? atomicAdd(&scheduler[4], 1ULL)
-                          : task_shared + gridDim.x;
+        cutlass::arch::NamedBarrier::sync(384U, kDwTaskDoneBarrier);
+        if (threadIdx.x == 0U)
+          task_shared = remote_backend_enabled<StaticLocal>(a.use_gin)
+                            ? atomicAdd(&scheduler[4], 1ULL)
+                            : task_shared + gridDim.x;
+      }
     }
+    if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
+      backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks,
+                            a.epoch);
   }
-  if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
-    backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks,
-                          a.epoch);
   grid.sync();
 #if __has_include(<nccl_device.h>)
   if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
     if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          phase(scheduler[2]);
-      while (phase.load(::cuda::memory_order_acquire) <
-             a.gin_context_count) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> phase(
+          scheduler[2]);
+      while (phase.load(::cuda::memory_order_acquire) < a.gin_context_count) {
       }
     }
     __syncthreads();
     auto *bytes = static_cast<std::byte *>(a.gin_window_base);
     auto *return_receive = reinterpret_cast<transport::BFloat16 *>(
         bytes + a.gin_return_receive_offset);
-    auto *return_gate_receive = reinterpret_cast<float *>(
-        bytes + a.gin_return_gate_receive_offset);
+    auto *return_gate_receive =
+        reinterpret_cast<float *>(bytes + a.gin_return_gate_receive_offset);
+    auto *forward_return_source_compact_index = peer_at<unsigned long long>(
+        a.local_base, a.forward_return_source_compact_index_offset);
     MEGAMOE_TIMELINE_RECORD(a.timeline, DxSourceRelay, SourceRelay, 0U,
                             a.dispatch.sizes.packet_count, a.epoch);
     const auto vector_count = a.hidden / 8ULL;
@@ -8940,12 +9293,13 @@ local_p2p_backward_megakernel(
         continue;
       const auto fanout = fanout_begin + fanout_slot;
       const auto target = a.dispatch.packet_fanout[fanout];
-      const auto route = descriptor.local_token_id *
-                             a.dispatch.identity.top_k +
+      const auto route = descriptor.local_token_id * a.dispatch.identity.top_k +
                          target.topk_slot;
       reinterpret_cast<uint4 *>(dx_return)[route * vector_count + vector] =
-          reinterpret_cast<const uint4 *>(return_receive)[
-              fanout * vector_count + vector];
+          reinterpret_cast<const uint4 *>(
+              return_receive)[forward_return_source_compact_index[fanout] *
+                                  vector_count +
+                              vector];
     }
     for (std::uint64_t packet = global_thread;
          packet < a.dispatch.sizes.packet_count; packet += global_threads) {
@@ -8956,10 +9310,11 @@ local_p2p_backward_megakernel(
       const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
       for (auto fanout = fanout_begin; fanout < fanout_end; ++fanout) {
         const auto target = a.dispatch.packet_fanout[fanout];
-        const auto route = descriptor.local_token_id *
-                               a.dispatch.identity.top_k +
-                           target.topk_slot;
-        dgate[route] = return_gate_receive[fanout];
+        const auto route =
+            descriptor.local_token_id * a.dispatch.identity.top_k +
+            target.topk_slot;
+        dgate[route] =
+            return_gate_receive[forward_return_source_compact_index[fanout]];
 #if MEGAMOE_DEBUG_VALIDATE
         if (a.capture_stage_storage)
           debug_coverage[route] = 1U;
@@ -8987,13 +9342,15 @@ local_p2p_backward_megakernel(
 #endif
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     status->dw2_complete_clock = status->dw2_last_complete_clock;
+    if constexpr (!SplitDw1) {
 #if !MEGAMOE_DEBUG_VALIDATE
-    status->dw1_last_complete_clock = device_globaltimer_ns();
+      status->dw1_last_complete_clock = device_globaltimer_ns();
 #endif
-    status->dw1_complete_clock = status->dw1_last_complete_clock;
+      status->dw1_complete_clock = status->dw1_last_complete_clock;
+    }
 #if MEGAMOE_DEBUG_VALIDATE
-    for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+    for (std::uint32_t expert = 0; expert < a.dispatch.sizes.owned_expert_count;
+         ++expert) {
       const auto ready = dw_timeline[expert].ready_clock;
       const auto dw1_start = dw_timeline[expert].dw1_first_start_clock;
       const auto dw2_start = dw_timeline[expert].dw2_first_start_clock;
@@ -9066,8 +9423,8 @@ local_p2p_backward_megakernel(
   }
   publish_production_terminal_status<StaticLocal>(
       a, status, ProductionStatusPhase::Backward,
-      a.production_error_records_offset,
-      a.gin_production_error_records_offset);
+      a.production_error_records_offset, a.gin_production_error_records_offset,
+      0ULL);
   if constexpr (StaticLocal) {
     grid.sync();
   } else if (!a.use_gin) {
@@ -9101,33 +9458,505 @@ local_p2p_backward_megakernel(
         ((2ULL * a.intermediate + 127ULL) / 128ULL) *
         ((a.hidden + 255ULL) / 256ULL);
     const auto dw2_tiles_per_expert =
-        ((a.hidden + 127ULL) / 128ULL) *
-        ((a.intermediate + 255ULL) / 256ULL);
-    for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert)
-      {
-        const auto reduction_iterations =
-            (a.dispatch.expert_row_count[expert] + 63ULL) / 64ULL;
-        dw1_reduction_iterations +=
-            reduction_iterations * dw1_tiles_per_expert;
-        dw2_reduction_iterations +=
-            reduction_iterations * dw2_tiles_per_expert;
-      }
+        ((a.hidden + 127ULL) / 128ULL) * ((a.intermediate + 255ULL) / 256ULL);
+    for (std::uint32_t expert = 0; expert < a.dispatch.sizes.owned_expert_count;
+         ++expert) {
+      const auto reduction_iterations =
+          persistent_v3::padded_expert_rows(
+              a.dispatch.expert_row_count[expert]) /
+          64ULL;
+      dw1_reduction_iterations += reduction_iterations * dw1_tiles_per_expert;
+      dw2_reduction_iterations += reduction_iterations * dw2_tiles_per_expert;
+    }
     status->wgmma_instructions =
-        (status->dv_tasks * kdv + status->dx_tasks * kdx) *
-            2ULL * (64ULL / ForwardMma::K) +
-        (dw1_reduction_iterations + dw2_reduction_iterations) *
-            2ULL * (64ULL / ForwardMma::K);
-    status->tma_loads = (status->dv_tasks * kdv +
-                         status->dx_tasks * kdx) * 2ULL +
-                        dw1_reduction_iterations * 5ULL +
-                        dw2_reduction_iterations * 4ULL;
+        (status->dv_tasks * kdv + status->dx_tasks * kdx) * 2ULL *
+            (64ULL / ForwardMma::K) +
+        (dw1_reduction_iterations + dw2_reduction_iterations) * 2ULL *
+            (64ULL / ForwardMma::K);
+    status->tma_loads =
+        (status->dv_tasks * kdv + status->dx_tasks * kdx) * 2ULL +
+        dw1_reduction_iterations * 5ULL + dw2_reduction_iterations * 4ULL;
 #endif
     status->complete_clock = device_globaltimer_ns();
     if constexpr (!StaticLocal || MEGAMOE_DEBUG_VALIDATE)
       backward_publish_progress(a, kBackwardTerminal, a.epoch);
   }
   MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+}
+
+// CUTE's tma_store_wait<0>() intentionally emits
+// `cp.async.bulk.wait_group.read 0`: it only protects reuse of the shared
+// source buffer.  V3 also needs a stronger boundary before publishing a
+// global payload to another CTA/GPU.  The unqualified wait observes the
+// destination writes as complete and performs the instruction-defined
+// async-to-generic proxy transition for the issuing thread.
+__device__ __forceinline__ void backward_v3_tma_store_wait_complete() {
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+  asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+#endif
+}
+
+#include "cuda/persistent_v3/gemm/dw2_128x128_kernel.cuh"
+#include "cuda/persistent_v3/backward/dy_transport.cuh"
+#include "cuda/persistent_v3/gemm/wgmma_wait_accumulator.cuh"
+#include "cuda/persistent_v3/backward/dv_dw2_pipeline_probe.cuh" // V3 roles
+#include "cuda/persistent_v3/backward/activation_core_profile.cuh" // core fixture
+#include "cuda/persistent_v3/backward/weight_compute.cuh"
+
+// Diagnostic role-isolated dW1 kernel.  The production megakernel can compile
+// dW1 out entirely and enqueue this kernel after its transport/activation
+// phases.  Keeping this as a distinct global function gives ptxas an actual
+// register-allocation boundary; a C++ union inside the megakernel cannot do
+// that because registers are assigned from the whole function's live ranges.
+__global__ __launch_bounds__(384, 1) void backward_dw1_specialized_kernel(
+    BackwardKernelArgs a, const __grid_constant__ CUtensorMap x_mn_map,
+    const __grid_constant__ CUtensorMap dab_transpose_map,
+    const __grid_constant__ CUtensorMap dw1_store_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  namespace cg = cooperative_groups;
+  auto grid = cg::this_grid();
+  extern __shared__ __align__(1024) unsigned char storage[];
+  __shared__ unsigned long long task_shared;
+  auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
+  auto *claims = peer_at<unsigned long long>(a.local_base, a.claim_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+  auto *dw_timeline =
+      peer_at<BackwardExpertDwTimeline>(a.local_base, a.dw_timeline_offset);
+#endif
+
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::uint32_t kAStageElements = 128U * 64U;
+  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  constexpr std::uint64_t kDwN = 256ULL;
+  constexpr std::uint32_t kTaskReadyBarrier = 0U;
+  constexpr std::uint32_t kTaskDoneBarrier = 1U;
+  constexpr std::uint32_t kMathOutputReadyBarrier = 2U;
+  constexpr std::uint32_t kMathOutputDoneBarrier = 3U;
+
+  const auto dw1_mtiles = (2ULL * a.intermediate + 127ULL) / 128ULL;
+  const auto dw1_ntiles = (a.hidden + kDwN - 1ULL) / kDwN;
+  const auto dw1_tasks =
+      static_cast<unsigned long long>(a.dispatch.sizes.owned_expert_count) *
+      dw1_mtiles * dw1_ntiles;
+  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+  auto *smem_b = smem_a + kStages * kAStageElements;
+  auto *output_tile = smem_a;
+  auto *full_barriers =
+      reinterpret_cast<ForwardBarrier *>(smem_b + kStages * kBStageElements);
+  auto *empty_barriers = full_barriers + kStages;
+
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    status->dw1_first_start_clock = ~0ULL;
+    status->dw1_last_complete_clock = 0ULL;
+    status->dw1_complete_clock = 0ULL;
+  }
+  if (threadIdx.x == 256U) {
+    for (std::uint32_t stage = 0; stage < kStages; ++stage) {
+      full_barriers[stage].init(1);
+      empty_barriers[stage].init(8);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (threadIdx.x == 0U)
+    task_shared = blockIdx.x;
+  grid.sync();
+  backward_publish_progress(a, kBackwardDw1Started, dw1_tasks);
+
+  const auto warpgroup = threadIdx.x / 128U;
+  if (warpgroup >= 2U) {
+    cutlass::arch::warpgroup_reg_dealloc<48>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction_start = claims[expert];
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+      if (threadIdx.x == 256U) {
+        const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+          const auto current = pipeline + iteration;
+          const auto stage = current % kStages;
+          const auto phase = (current / kStages) & 1U;
+          empty_barriers[stage].wait(phase ^ 1U);
+          auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_a + stage * kAStageElements);
+          auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_b + stage * kBStageElements);
+          const auto a_k =
+              static_cast<std::uint32_t>(reduction_start + iteration * 64ULL);
+          const auto b_k = static_cast<std::uint32_t>(
+              a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
+          deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+              &dab_transpose_map, &full_barriers[stage], stage_a, a_k,
+              static_cast<std::uint32_t>(mtile * 128ULL));
+          for (std::uint32_t atom = 0; atom < 4U; ++atom)
+            deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                &x_mn_map, &full_barriers[stage], stage_b + atom * 64U * 64U,
+                static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL), b_k);
+          full_barriers[stage].arrive_and_expect_tx(
+              (kAStageElements + kBStageElements) *
+              sizeof(transport::BFloat16));
+        }
+        pipeline += iterations;
+      }
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+    }
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<224>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw1_tasks)
+        break;
+      const auto per_expert = dw1_mtiles * dw1_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto mtile = task / dw1_ntiles;
+      const auto ntile = task % dw1_ntiles;
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+      if (threadIdx.x == 0U)
+        atomicMin(&status->dw1_first_start_clock, device_globaltimer_ns());
+
+      float accum[BackwardDwMixedMma::kNumAccum];
+#pragma unroll
+      for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+        accum[index] = 0.0F;
+      const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+      for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        const auto current = pipeline + iteration;
+        const auto stage = current % kStages;
+        const auto phase = (current / kStages) & 1U;
+        auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_a + stage * kAStageElements);
+        auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_b + stage * kBStageElements);
+        full_barriers[stage].wait(phase);
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+        for (std::uint32_t k = 0; k < 64U / BackwardDwMixedMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::K, 128, 64, 128, cutlass::bfloat16_t>(
+              stage_a, warpgroup * 64U, k * BackwardDwMixedMma::K);
+          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::MN, 256, 64, 128, cutlass::bfloat16_t>(
+              stage_b, 0U, k * BackwardDwMixedMma::K);
+          BackwardDwMixedMma::wgmma(desc_a, desc_b, accum, 1);
+        }
+        deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+        for (int index = 0; index < BackwardDwMixedMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_wait<0>();
+        if ((threadIdx.x & 31U) == 0U)
+          empty_barriers[stage].arrive();
+      }
+      pipeline += iterations;
+
+      const auto warp = threadIdx.x / 32U;
+      const auto lane = threadIdx.x & 31U;
+#pragma unroll
+      for (std::uint32_t index = 0; index < BackwardDwMixedMma::kNumAccum / 4U;
+           ++index) {
+        constexpr std::uint32_t kBankGroupBytes = 16U;
+        const auto atom = index / (64U / 8U);
+        const auto in_atom = index % (64U / 8U);
+        const auto row = lane;
+        auto column = in_atom;
+        column ^= row % (128U / kBankGroupBytes);
+        auto *smem_pointer = reinterpret_cast<std::uint8_t *>(output_tile) +
+                             warp * 16U * 128U + atom * 128U * 128U +
+                             row * 128U + column * kBankGroupBytes;
+        deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+            __float22bfloat162_rn(
+                make_float2(accum[index * 4U], accum[index * 4U + 1U])),
+            __float22bfloat162_rn(
+                make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])),
+            smem_pointer);
+      }
+      cute::tma_store_fence();
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputReadyBarrier);
+      if (threadIdx.x < 4U) {
+        const auto atom = threadIdx.x;
+        cute::SM90_TMA_STORE_2D::copy(
+            &dw1_store_map, output_tile + atom * 128U * 64U,
+            static_cast<std::uint32_t>(ntile * kDwN + atom * 64ULL),
+            static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
+                                       mtile * 128ULL));
+        cute::tma_store_arrive();
+        cute::tma_store_wait<0>();
+      }
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputDoneBarrier);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0U) {
+        const auto complete =
+            atomicAdd(&dw_timeline[expert].dw1_tasks_complete, 1ULL) + 1ULL;
+        if (complete == per_expert)
+          dw_timeline[expert].dw1_complete_clock = device_globaltimer_ns();
+      }
+#endif
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+      if (threadIdx.x == 0U)
+        task_shared += gridDim.x;
+    }
+  }
+
+  grid.sync();
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    status->dw1_last_complete_clock = device_globaltimer_ns();
+    status->dw1_complete_clock = status->dw1_last_complete_clock;
+    auto *scheduler =
+        peer_at<unsigned long long>(a.local_base, a.scheduler_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        complete(scheduler[10]);
+    complete.store(a.epoch, ::cuda::memory_order_release);
+  }
+  backward_publish_progress(a, kBackwardDw1Complete, dw1_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw1End, Compute, 0U, dw1_tasks, a.epoch);
+#else
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
+    publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
+  }
+#endif
+}
+
+// Diagnostic dW2 role kernel.  It mirrors the production arithmetic and
+// output order, but confines the producer and WGMMA accumulator live ranges
+// to this global function so Hopper can honor the warpgroup register split.
+__global__ __launch_bounds__(384, 1) void backward_dw2_specialized_kernel(
+    BackwardKernelArgs a, const __grid_constant__ CUtensorMap dy_mn_map,
+    const __grid_constant__ CUtensorMap u_transpose_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  namespace cg = cooperative_groups;
+  auto grid = cg::this_grid();
+  extern __shared__ __align__(1024) unsigned char storage[];
+  __shared__ unsigned long long task_shared;
+  auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
+  auto *claims = peer_at<unsigned long long>(a.local_base, a.claim_offset);
+  auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+  auto *dw_timeline =
+      peer_at<BackwardExpertDwTimeline>(a.local_base, a.dw_timeline_offset);
+#endif
+
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::uint32_t kAStageElements = 128U * 64U;
+  constexpr std::uint32_t kBStageElements = 256U * 64U;
+  constexpr std::uint64_t kDwN = 256ULL;
+  constexpr std::uint32_t kTaskReadyBarrier = 0U;
+  constexpr std::uint32_t kTaskDoneBarrier = 1U;
+  constexpr std::uint32_t kMathOutputReadyBarrier = 2U;
+  constexpr std::uint32_t kMathOutputDoneBarrier = 3U;
+
+  const auto dw2_mtiles = (a.hidden + 127ULL) / 128ULL;
+  const auto dw2_ntiles = (a.intermediate + kDwN - 1ULL) / kDwN;
+  const auto dw2_tasks =
+      static_cast<unsigned long long>(a.dispatch.sizes.owned_expert_count) *
+      dw2_mtiles * dw2_ntiles;
+  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+  auto *smem_b = smem_a + kStages * kAStageElements;
+  auto *output_tile = smem_a;
+  auto *full_barriers =
+      reinterpret_cast<ForwardBarrier *>(smem_b + kStages * kBStageElements);
+  auto *empty_barriers = full_barriers + kStages;
+
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    status->dw2_first_start_clock = ~0ULL;
+    status->dw2_last_complete_clock = 0ULL;
+    status->dw2_complete_clock = 0ULL;
+  }
+  if (threadIdx.x == 256U) {
+    for (std::uint32_t stage = 0; stage < kStages; ++stage) {
+      full_barriers[stage].init(1);
+      empty_barriers[stage].init(8);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  if (threadIdx.x == 0U)
+    task_shared = blockIdx.x;
+  __syncthreads();
+  grid.sync();
+  backward_publish_progress(a, kBackwardDw2Started, dw2_tasks);
+
+  const auto warpgroup = threadIdx.x / 128U;
+  if (warpgroup >= 2U) {
+    cutlass::arch::warpgroup_reg_dealloc<48>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw2_tasks)
+        break;
+      const auto per_expert = dw2_mtiles * dw2_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto ntile = task / dw2_mtiles;
+      const auto mtile = task % dw2_mtiles;
+      const auto reduction_start = claims[expert];
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+      if (threadIdx.x == 256U) {
+        const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+          const auto current = pipeline + iteration;
+          const auto stage = current % kStages;
+          const auto phase = (current / kStages) & 1U;
+          empty_barriers[stage].wait(phase ^ 1U);
+          auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_a + stage * kAStageElements);
+          auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+              smem_b + stage * kBStageElements);
+          const auto a_k = static_cast<std::uint32_t>(
+              a.dispatch.expert_row_prefix[expert] + iteration * 64ULL);
+          const auto b_k =
+              static_cast<std::uint32_t>(reduction_start + iteration * 64ULL);
+          for (std::uint32_t atom = 0; atom < 2U; ++atom)
+            deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                &dy_mn_map, &full_barriers[stage], stage_a + atom * 64U * 64U,
+                static_cast<std::uint32_t>(mtile * 128ULL + atom * 64ULL), a_k);
+          for (std::uint32_t atom = 0; atom < 2U; ++atom)
+            deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+                &u_transpose_map, &full_barriers[stage],
+                stage_b + atom * 128U * 64U, b_k,
+                static_cast<std::uint32_t>(ntile * kDwN + atom * 128ULL));
+          full_barriers[stage].arrive_and_expect_tx(
+              (kAStageElements + kBStageElements) *
+              sizeof(transport::BFloat16));
+        }
+        pipeline += iterations;
+      }
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+    }
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<224>();
+    std::uint32_t pipeline = 0U;
+    while (true) {
+      cutlass::arch::NamedBarrier::sync(384U, kTaskReadyBarrier);
+      auto task = task_shared;
+      if (task >= dw2_tasks)
+        break;
+      const auto per_expert = dw2_mtiles * dw2_ntiles;
+      const auto expert = static_cast<std::uint32_t>(task / per_expert);
+      task %= per_expert;
+      const auto ntile = task / dw2_mtiles;
+      const auto mtile = task % dw2_mtiles;
+      const auto reduction = persistent_v3::padded_expert_rows(
+          a.dispatch.expert_row_count[expert]);
+      if (threadIdx.x == 0U)
+        atomicMin(&status->dw2_first_start_clock, device_globaltimer_ns());
+
+      float accum[BackwardDwDirectMma::kNumAccum];
+#pragma unroll
+      for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+        accum[index] = 0.0F;
+      const auto iterations = static_cast<std::uint32_t>(reduction / 64ULL);
+      for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        const auto current = pipeline + iteration;
+        const auto stage = current % kStages;
+        const auto phase = (current / kStages) & 1U;
+        auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_a + stage * kAStageElements);
+        auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
+            smem_b + stage * kBStageElements);
+        full_barriers[stage].wait(phase);
+#pragma unroll
+        for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+        for (std::uint32_t k = 0; k < 64U / BackwardDwDirectMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::MN, 128, 64, 128, cutlass::bfloat16_t>(
+              stage_a, warpgroup * 64U, k * BackwardDwDirectMma::K);
+          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+              cute::UMMA::Major::K, 256, 64, 128, cutlass::bfloat16_t>(
+              stage_b, 0U, k * BackwardDwDirectMma::K);
+          BackwardDwDirectMma::wgmma(desc_a, desc_b, accum, 1);
+        }
+        deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+        for (int index = 0; index < BackwardDwDirectMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        deep_gemm::ptx::warpgroup_wait<0>();
+        if ((threadIdx.x & 31U) == 0U)
+          empty_barriers[stage].arrive();
+      }
+      pipeline += iterations;
+
+      visit_forward_accumulator_wide(
+          accum, [&](std::uint32_t wg, std::uint32_t m, std::uint32_t column,
+                     float v0, float v1) {
+            const auto local_row = wg * 64U + m;
+            output_tile[local_row * kDwN + column] =
+                transport::BFloat16{float_to_bf16_bits(v0)};
+            output_tile[local_row * kDwN + column + 1U] =
+                transport::BFloat16{float_to_bf16_bits(v1)};
+          });
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputReadyBarrier);
+      constexpr std::uint32_t kVectorsPerRow = kDwN / 8U;
+      constexpr std::uint32_t kOutputVectors = 128U * kVectorsPerRow;
+      const auto output_rows = a.hidden;
+      const auto output_columns = a.intermediate;
+      const auto expert_stride = output_rows * output_columns;
+      for (std::uint32_t vector = threadIdx.x; vector < kOutputVectors;
+           vector += 256U) {
+        const auto local_row = vector / kVectorsPerRow;
+        const auto local_vector = vector % kVectorsPerRow;
+        const auto mma_row = mtile * 128ULL + local_row;
+        const auto mma_column = ntile * kDwN + local_vector * 8ULL;
+        if (mma_row < output_rows && mma_column + 7ULL < output_columns) {
+          reinterpret_cast<uint4 *>(dw2 + expert * expert_stride +
+                                    mma_row * output_columns + mma_column)[0] =
+              reinterpret_cast<const uint4 *>(output_tile +
+                                              local_row * kDwN)[local_vector];
+        }
+      }
+      cutlass::arch::NamedBarrier::sync(256U, kMathOutputDoneBarrier);
+#if MEGAMOE_DEBUG_VALIDATE
+      if (threadIdx.x == 0U) {
+        const auto complete =
+            atomicAdd(&dw_timeline[expert].dw2_tasks_complete, 1ULL) + 1ULL;
+        if (complete == per_expert)
+          dw_timeline[expert].dw2_complete_clock = device_globaltimer_ns();
+      }
+#endif
+      cutlass::arch::NamedBarrier::sync(384U, kTaskDoneBarrier);
+      if (threadIdx.x == 0U)
+        task_shared += gridDim.x;
+    }
+  }
+
+  grid.sync();
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    status->dw2_last_complete_clock = device_globaltimer_ns();
+    status->dw2_complete_clock = status->dw2_last_complete_clock;
+    auto *scheduler =
+        peer_at<unsigned long long>(a.local_base, a.scheduler_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        complete(scheduler[11]);
+    complete.store(a.epoch, ::cuda::memory_order_release);
+  }
+  backward_publish_progress(a, kBackwardDw2Complete, dw2_tasks);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Dw2End, Compute, 0U, dw2_tasks, a.epoch);
+#else
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    auto *status = peer_at<BackwardDeviceStatus>(a.local_base, a.status_offset);
+    publish_local_structured_error(status, a.rank, 90U, 1U, 1ULL, 0ULL);
+  }
+#endif
 }
 
 } // namespace
@@ -9227,10 +10056,12 @@ struct GinBackendState : ActivationMegaKernelBackendState {
   std::uint32_t node = 0;
   std::uint32_t local_rank = 0;
   std::uint32_t gin_context_count = 1;
+  std::uint32_t gin_allocated_context_count = 1;
+  bool full_connections = false;
   bool dev_comm_created = false;
 
   bool requires_collective_terminal_status() const noexcept override {
-    return true;
+    return false;
   }
 
   ~GinBackendState() noexcept {
@@ -9275,8 +10106,7 @@ ProductionStatusAgreementResult agree_production_terminal_status(
     std::uint64_t epoch, std::uint32_t rank, std::uint32_t world,
     const Status &status, cudaEvent_t completion_event) {
   const auto begin = std::chrono::steady_clock::now();
-  if (!MEGAMOE_DEBUG_VALIDATE &&
-      !backend->requires_collective_terminal_status()) {
+  if (!backend->requires_collective_terminal_status()) {
     ProductionStatusAgreementResult result;
     if (status.error != 0U) {
       result.has_error = true;
@@ -9573,6 +10403,7 @@ struct DeviceBackwardHandle::Impl {
   bool used_forward_cache = false;
   bool hashes_captured = false;
   bool stage_storage_captured = false;
+  bool localized_dy_snapshot = false;
   std::uint64_t padded_reduction_rows = 0;
   BackwardStorageHashes hashes;
 };
@@ -9614,16 +10445,17 @@ profiling::DeviceTimelineSnapshot download_device_timeline(
       "timeline count download");
   internal::throw_cuda(
       "device-timeline",
-      cudaMemcpy(counts.data(),
-                 at<const void>(allocation, pool->timeline_layout.counts),
-                 count_bytes, cudaMemcpyDeviceToHost),
+      cudaMemcpyAsync(counts.data(),
+                      at<const void>(allocation, pool->timeline_layout.counts),
+                      count_bytes, cudaMemcpyDeviceToHost, pool->cancel_stream),
       identity.rank, identity.world, "timeline", identity.generation,
       ExchangeKind::ExpertCounts, "download timeline counts");
   internal::throw_cuda(
       "device-timeline",
-      cudaMemcpy(overflow.data(),
-                 at<const void>(allocation, pool->timeline_layout.overflow),
-                 count_bytes, cudaMemcpyDeviceToHost),
+      cudaMemcpyAsync(
+          overflow.data(),
+          at<const void>(allocation, pool->timeline_layout.overflow),
+          count_bytes, cudaMemcpyDeviceToHost, pool->cancel_stream),
       identity.rank, identity.world, "timeline", identity.generation,
       ExchangeKind::ExpertCounts, "download timeline overflow");
   const auto record_count = checked_mul(max_ctas, profiling::kEventsPerCta,
@@ -9636,11 +10468,19 @@ profiling::DeviceTimelineSnapshot download_device_timeline(
       "timeline record bytes");
   internal::throw_cuda(
       "device-timeline",
-      cudaMemcpy(raw.data(),
-                 at<const void>(allocation, pool->timeline_layout.records),
-                 record_bytes, cudaMemcpyDeviceToHost),
+      cudaMemcpyAsync(
+          raw.data(), at<const void>(allocation, pool->timeline_layout.records),
+          record_bytes, cudaMemcpyDeviceToHost, pool->cancel_stream),
       identity.rank, identity.world, "timeline", identity.generation,
       ExchangeKind::ExpertCounts, "download timeline records");
+  // All producer streams are ordered before the completion event above.
+  // Download on the pool's non-blocking diagnostic stream rather than using
+  // legacy synchronous memcpy semantics, which can form a driver-side
+  // liveness cycle with resident device GIN work on the peer host.
+  internal::throw_cuda(
+      "device-timeline", cudaStreamSynchronize(pool->cancel_stream),
+      identity.rank, identity.world, "timeline", identity.generation,
+      ExchangeKind::ExpertCounts, "drain timeline download");
   profiling::DeviceTimelineSnapshot result;
   result.rank = identity.rank;
   result.generation = identity.generation;
@@ -10332,94 +11172,105 @@ testing::hash_backward_stage_storage_for_validation(
     return reinterpret_cast<const transport::BFloat16 *>(
         at<const float>(slot.device, offset));
   };
-  const auto rows_hidden = checked_mul(impl.incoming_rows, impl.hidden,
-                                       "stage hash rows hidden");
+  const auto rows_hidden =
+      checked_mul(impl.incoming_rows, impl.hidden, "stage hash rows hidden");
   const auto rows_intermediate = checked_mul(
-      impl.incoming_rows, impl.intermediate,
-      "stage hash rows intermediate");
+      impl.incoming_rows, impl.intermediate, "stage hash rows intermediate");
   const auto padded_intermediate = checked_mul(
       padded_rows, impl.intermediate, "stage hash padded intermediate");
   const auto tiles = (impl.intermediate + 255ULL) / 256ULL;
   BackwardStageStorageHashes hashes;
   hashes.incoming_rows = impl.incoming_rows;
   hashes.padded_reduction_rows = padded_rows;
-  hashes.canonical_x = hash_one(bf16(layout.canonical_rows), rows_hidden,
-                                "canonical X");
-  hashes.canonical_dy = hash_one(bf16(layout.backward_dy_canonical),
-                                 rows_hidden, "canonical dY");
+  hashes.canonical_x =
+      hash_one(bf16(layout.canonical_rows), rows_hidden, "canonical X");
+  hashes.canonical_dy =
+      hash_one(bf16(layout.backward_dy_canonical), rows_hidden, "canonical dY");
+  hashes.canonical_gate =
+      hash_one(float_words(layout.backward_canonical_gate),
+               checked_mul(impl.incoming_rows, 2ULL,
+                           "stage hash canonical gate BF16 words"),
+               "canonical gate");
   // TMA supplies zero for the rounded tail beyond the canonical tensor-map
   // extent, so the actual nonzero dW2 input extent is exactly canonical dY.
   hashes.dy_dw2_reduction_extent = hashes.canonical_dy;
-  const auto ab_offset = impl.used_forward_cache
-                             ? layout.forward_ab_cache
-                             : layout.backward_recompute_ab;
+  const auto ab_offset = impl.used_forward_cache ? layout.forward_ab_cache
+                                                 : layout.backward_recompute_ab;
   hashes.active_ab = hash_one(
       bf16(ab_offset), checked_mul(rows_intermediate, 2ULL, "stage hash A/B"),
       "active A/B");
+  hashes.active_a = hash_one(bf16(ab_offset), rows_intermediate, "active A");
+  hashes.active_b = hash_one(
+      bf16(ab_offset) +
+          impl.pool->config.max_destination_rows_per_rank * impl.intermediate,
+      rows_intermediate, "active B");
   hashes.s = hash_one(bf16(layout.forward_s), rows_intermediate, "S");
-  hashes.dv = impl.stage_storage_captured
-                  ? hash_one(bf16(layout.backward_forward_output),
-                             rows_intermediate, "dV")
-                  : DeviceStorageHash128{kWeightHashSeedLow,
-                                         kWeightHashSeedHigh, 0};
+  hashes.dv =
+      impl.stage_storage_captured
+          ? hash_one(bf16(layout.backward_forward_output), rows_intermediate,
+                     "dV")
+          : DeviceStorageHash128{kWeightHashSeedLow, kWeightHashSeedHigh, 0};
+  hashes.dy_local_snapshot =
+      impl.localized_dy_snapshot
+          ? hash_one(bf16(layout.backward_forward_output), rows_hidden,
+                     "localized dY snapshot")
+          : DeviceStorageHash128{kWeightHashSeedLow, kWeightHashSeedHigh, 0};
   hashes.u_transpose = hash_one(bf16(layout.backward_u_transpose),
                                 padded_intermediate, "U transpose");
-  hashes.dab = hash_one(
-      bf16(layout.backward_dab),
-      checked_mul(rows_intermediate, 2ULL, "stage hash dAB"), "dAB");
+  hashes.dab =
+      hash_one(bf16(layout.backward_dab),
+               checked_mul(rows_intermediate, 2ULL, "stage hash dAB"), "dAB");
   hashes.dab_transpose = hash_one(
       bf16(layout.backward_dab_transpose),
       checked_mul(padded_intermediate, 2ULL, "stage hash dAB transpose"),
       "dAB transpose");
-  hashes.dgate_partial = hash_one(
-      float_words(layout.backward_dgate_partial),
-      checked_mul(checked_mul(impl.incoming_rows, tiles,
-                              "stage hash dGate partials"),
-                  2ULL, "stage hash dGate partial words"),
-      "dGate partial");
+  hashes.dgate_partial =
+      hash_one(float_words(layout.backward_dgate_partial),
+               checked_mul(checked_mul(impl.incoming_rows, tiles,
+                                       "stage hash dGate partials"),
+                           2ULL, "stage hash dGate partial words"),
+               "dGate partial");
   hashes.dgate_canonical = hash_one(
       float_words(layout.backward_dgate_canonical),
-      checked_mul(impl.incoming_rows, 2ULL,
-                  "stage hash canonical dGate words"),
+      checked_mul(impl.incoming_rows, 2ULL, "stage hash canonical dGate words"),
       "canonical dGate");
   hashes.dgate_final = hash_one(
       float_words(layout.backward_dgate),
       checked_mul(impl.route_count, 2ULL, "stage hash final dGate words"),
       "final dGate");
-  const auto dw1_elements = checked_mul(
-      checked_mul(impl.owned_experts, 2ULL * impl.intermediate,
-                  "stage hash dW1 rows"),
-      impl.hidden, "stage hash dW1");
+  const auto dw1_elements =
+      checked_mul(checked_mul(impl.owned_experts, 2ULL * impl.intermediate,
+                              "stage hash dW1 rows"),
+                  impl.hidden, "stage hash dW1");
   const auto dw2_elements = checked_mul(
       checked_mul(impl.owned_experts, impl.hidden, "stage hash dW2 rows"),
       impl.intermediate, "stage hash dW2");
   hashes.dw2 = hash_one(bf16(layout.backward_dw2), dw2_elements, "dW2");
   hashes.dw1 = hash_one(bf16(layout.backward_dw1), dw1_elements, "dW1");
   hashes.return_signal_epoch = hash_one(
-      reinterpret_cast<const transport::BFloat16 *>(at<const std::uint64_t>(
-          slot.device, layout.outgoing_route_sequence)),
-      checked_mul(checked_mul(impl.identity.world,
-                              impl.pool->config.channels,
+      reinterpret_cast<const transport::BFloat16 *>(
+          at<const std::uint64_t>(slot.device, layout.outgoing_route_sequence)),
+      checked_mul(checked_mul(impl.identity.world, impl.pool->config.channels,
                               "stage hash return signals"),
                   4ULL, "stage hash return signal BF16 words"),
       "return signal/epoch");
   if (impl.stage_storage_captured) {
-    hashes.route_return_coverage = hash_one(
-        reinterpret_cast<const transport::BFloat16 *>(
-            at<const std::uint32_t>(slot.device, layout.packet_claim)),
-        checked_mul(impl.route_count, 2ULL,
-                    "stage hash return coverage BF16 words"),
-        "route return coverage");
+    hashes.route_return_coverage =
+        hash_one(reinterpret_cast<const transport::BFloat16 *>(
+                     at<const std::uint32_t>(slot.device, layout.packet_claim)),
+                 checked_mul(impl.route_count, 2ULL,
+                             "stage hash return coverage BF16 words"),
+                 "route return coverage");
     std::vector<std::uint32_t> coverage(
         checked_size(impl.route_count, "route return coverage elements"));
     if (!coverage.empty()) {
       internal::throw_cuda(
           "backward-stage-hash",
-          cudaMemcpyAsync(coverage.data(),
-                          at<const std::uint32_t>(slot.device,
-                                                  layout.packet_claim),
-                          coverage.size() * sizeof(std::uint32_t),
-                          cudaMemcpyDeviceToHost, state->stream),
+          cudaMemcpyAsync(
+              coverage.data(),
+              at<const std::uint32_t>(slot.device, layout.packet_claim),
+              coverage.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+              state->stream),
           impl.identity.rank, impl.identity.world, "backward-validation",
           impl.identity.generation, ExchangeKind::ExpertCounts,
           "copy route return coverage");
@@ -11211,8 +12062,20 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   }
   ncclDevCommRequirements_t requirements =
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  backend->full_connections = true;
   constexpr std::uint32_t kGinContextCount = 8;
-  requirements.ginContextCount = kGinContextCount;
+  // FULL Return must not share an exclusive context with an outstanding
+  // same-rail
+  // Dispatch queue.  Keep the logical topology at eight contexts/CTAs, but
+  // give every FULL owner a second physical QP: [0, 8) is Dispatch and
+  // [8, 16) is Return.  DeepEP routinely allocates more than this, and the
+  // separation lets a single permanent RDMA CTA progress both queues without
+  // mixing teams on one context.
+  const auto allocated_context_count = 2U * kGinContextCount;
+  requirements.ginContextCount = allocated_context_count;
+  // One permanent RDMA CTA owns a same-rail Dispatch QP and an independent
+  // FULL Return QP. Compute CTAs publish byte-range descriptors and never
+  // touch a GIN context.
   requirements.ginExclusiveContexts = true;
   requirements.ginQueueDepth = 64;
   // 0=dispatch arrival, 1=return arrival.
@@ -11220,8 +12083,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   // fixed terminal production-status epoch and is touched only once per
   // generation, never on the per-task success path.
   requirements.ginSignalCount = 3;
-  requirements.ginCounterCount = 1;
-  requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+  // Counter 0 belongs to Dispatch; direct/stream Return overlaps it and uses
+  // counter 1.  Request both explicitly (the previous count of one made every
+  // counter-1 access formally out of bounds).
+  requirements.ginCounterCount = 2;
+  requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
   internal::throw_nccl(
       "gin-create",
       dev_comm_create(nccl->comm, &requirements, &backend->dev_comm),
@@ -11230,6 +12096,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
       "ncclDevCommCreate(activation GIN)");
   backend->dev_comm_created = true;
   backend->gin_context_count = kGinContextCount;
+  backend->gin_allocated_context_count = allocated_context_count;
   try {
     backend->windows.reserve(pool->slots.size());
     for (auto &slot : pool->slots) {
@@ -11297,8 +12164,12 @@ ActivationTransportResourcePool make_activation_transport_pool(
                     "transport-pool-create", "timeline CTA capacity", 0,
                     "positive SM count",
                     std::to_string(timeline_device_properties.multiProcessorCount));
+  // Forward's transport, FC1 and FC2 grids execute concurrently.  Give their
+  // lock-free trace writers disjoint logical CTA ranges; one-SM capacity was
+  // sufficient only while FC1 and FC2 were accidentally stream-serialized.
   state->timeline_max_ctas =
-      static_cast<std::uint32_t>(timeline_device_properties.multiProcessorCount);
+      3U * static_cast<std::uint32_t>(
+               timeline_device_properties.multiProcessorCount);
   state->timeline_layout =
       make_timeline_allocation_layout(state->timeline_max_ctas);
 #endif
@@ -11388,16 +12259,35 @@ ActivationTransportResourcePool make_activation_transport_pool(
             "canonical X");
         slot.forward_s_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
-            config.max_intermediate_size,
-            config.max_destination_rows_per_rank, 128, "SwiGLU S");
+            config.max_intermediate_size, config.max_destination_rows_per_rank,
+            128, "SwiGLU S");
+        slot.forward_x_m64_map = make_bf16_tma_map(
+            at<void>(slot.device, state->layout.canonical_rows),
+            config.max_hidden_size, config.max_destination_rows_per_rank, 64,
+            "canonical X M64");
+        slot.forward_s_m64_map = make_bf16_tma_map(
+            at<void>(slot.device, state->layout.forward_s),
+            config.max_intermediate_size, config.max_destination_rows_per_rank,
+            64, "SwiGLU S M64");
+        slot.forward_output_store_map = make_bf16_tma_store_map(
+            at<void>(slot.device,
+                     config.enable_backward
+                         ? state->layout.backward_forward_output
+                         : state->layout.canonical_rows),
+            config.max_hidden_size, config.max_destination_rows_per_rank,
+            "Forward canonical output");
+        if (slot.gin_window != nullptr)
+          slot.forward_staging_store_map = make_bf16_tma_store_map(
+              at<void>(slot.gin_window, state->gin_layout.return_staging),
+              config.max_hidden_size, config.max_destination_rows_per_rank,
+              "Forward GIN return staging");
         slot.forward_maps_valid = true;
         if (config.enable_backward) {
           const auto rows = config.max_destination_rows_per_rank;
-          const auto reduction_rows =
-              (rows + static_cast<std::uint64_t>(config.max_owned_experts) *
-                          63ULL +
-               63ULL) &
-              ~63ULL;
+          const auto reduction_rows = persistent_v3::align_up<std::uint64_t>(
+              rows +
+                  static_cast<std::uint64_t>(config.max_owned_experts) * 127ULL,
+              128U);
           slot.backward_dy_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dy_canonical),
               config.max_hidden_size, rows, 128, "backward canonical dY");
@@ -11419,12 +12309,25 @@ ActivationTransportResourcePool make_activation_transport_pool(
               at<void>(slot.device, state->layout.backward_dab_transpose),
               reduction_rows, 2ULL * config.max_intermediate_size, 128,
               "backward dAB transpose");
+          // dX consumes the same padded [feature, row] allocation through an
+          // MN-major WGMMA A descriptor.  Its 64x64 tensor-map box differs
+          // from the 64x128 K-major descriptor used by dW1.
+          slot.backward_dab_dx_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_dab_transpose),
+              reduction_rows, 2ULL * config.max_intermediate_size,
+              "backward dAB for dX MN");
           slot.backward_dw1_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_dw1),
               config.max_hidden_size,
               static_cast<std::uint64_t>(config.max_owned_experts) * 2ULL *
                   config.max_intermediate_size,
               "backward dW1 output");
+          slot.backward_dw2_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_dw2),
+              config.max_intermediate_size,
+              static_cast<std::uint64_t>(config.max_owned_experts) *
+                  config.max_hidden_size,
+              "backward dW2 output");
           slot.backward_maps_valid = true;
         }
       } else if (config.max_intermediate_size != 0) {
@@ -11542,8 +12445,57 @@ ActivationTransportResourcePool make_activation_transport_pool(
             ExchangeKind::ExpertCounts, name);
         internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
       };
+      int least_stream_priority = 0;
+      int greatest_stream_priority = 0;
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaDeviceGetStreamPriorityRange(&least_stream_priority,
+                                           &greatest_stream_priority),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaDeviceGetStreamPriorityRange(Forward roles)");
+      internal::throw_cuda("transport-pool-create",
+                           cudaStreamCreateWithPriority(
+                               &slot.forward_transport_stream,
+                               cudaStreamNonBlocking, greatest_stream_priority),
+                           0, session.world_size(), session.identity(),
+                           session.generation(), ExchangeKind::ExpertCounts,
+                           "cudaStreamCreateWithPriority(Forward transport)");
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaStreamCreateWithPriority(&slot.forward_m64_head_stream,
+                                       cudaStreamNonBlocking,
+                                       greatest_stream_priority),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaStreamCreateWithPriority(Forward M64 head)");
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaStreamCreateWithPriority(&slot.forward_compute_stream,
+                                       cudaStreamNonBlocking,
+                                       least_stream_priority),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaStreamCreateWithPriority(Forward compute)");
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaStreamCreateWithPriority(&slot.backward_dw2_stream,
+                                       cudaStreamNonBlocking, 0),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaStreamCreateWithPriority(Backward dW2)");
       create_event(&slot.producer_ready, "cudaEventCreate(producer-ready)");
       create_event(&slot.backward_ready, "cudaEventCreate(backward-ready)");
+      create_event(&slot.forward_roles_ready,
+                   "cudaEventCreate(Forward roles ready)");
+      create_event(&slot.forward_transport_done,
+                   "cudaEventCreate(Forward transport done)");
+      create_event(&slot.forward_m64_head_done,
+                   "cudaEventCreate(Forward M64 head done)");
+      create_event(&slot.forward_compute_done,
+                   "cudaEventCreate(Forward compute done)");
+      create_event(&slot.backward_dw2_done,
+                   "cudaEventCreate(Backward dW2 done)");
       internal::throw_cuda(
           "transport-pool-create", cudaEventCreate(&slot.start), 0,
           session.world_size(), session.identity(), session.generation(),
@@ -13330,9 +14282,9 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaMemsetAsync(GIN reset barrier)");
-  gin_signal_reset_kernel<<<backend->gin_context_count, 1, 0,
-                               exec->stream>>>(backend->dev_comm,
-                                               backend->gin_context_count);
+  gin_signal_reset_kernel<<<backend->gin_allocated_context_count, 1, 0,
+                            exec->stream>>>(
+      backend->dev_comm, backend->gin_allocated_context_count);
   internal::throw_cuda(
       "gin-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -13558,6 +14510,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[activation.slot->index];
   const auto &layout = state->layout;
+#if MEGAMOE_DEBUG_VALIDATE
+  const auto debug_forward_host_phase = [&](const char *phase) {
+    if (std::getenv("MEGAMOE_FORWARD_PROGRESS") != nullptr)
+      std::cerr << "FORWARD_RUN_HOST rank=" << id.calling_rank
+                << " generation=" << id.generation << " phase=" << phase
+                << std::endl;
+  };
+  debug_forward_host_phase("consumer_acquired");
+#endif
   if (view.sizes.incoming_row_count >
           state->config.max_destination_rows_per_rank ||
       view.sizes.route_count > checked_mul(state->config.max_tokens_per_rank,
@@ -13568,32 +14529,33 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                     "exceeded");
 
   __atomic_store_n(slot.host_cancel_epoch,
-                   options.cancellation.cancellation_requested()
-                       ? id.generation
-                       : 0ULL,
+                   options.cancellation.cancellation_requested() ? id.generation
+                                                                 : 0ULL,
                    __ATOMIC_RELEASE);
   internal::throw_cuda(
       "forward-run",
       cudaMemcpyAsync(slot.device_cancel_epoch, slot.host_cancel_epoch,
                       sizeof(std::uint64_t), cudaMemcpyHostToDevice,
                       exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "H2D initialize cancel epoch");
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts, "H2D initialize cancel epoch");
   internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
                             sizeof(std::uint64_t));
   internal::throw_cuda(
       "forward-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(activation ready)");
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(activation ready)");
   internal::throw_cuda(
       "forward-run",
       cudaStreamWaitEvent(exec->stream, weight.allocation->ready),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(weights ready)");
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(weights ready)");
   ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("stream_dependencies_enqueued");
+#endif
 
   if (slot.transport_epoch >= (1ULL << 63U) - 1ULL)
     transport_error(NotifyErrorCode::ArithmeticOverflow, "forward-run",
@@ -13690,29 +14652,45 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 
   if (use_gin) {
 #if __has_include(<nccl_device.h>)
-    auto *gin_barrier = at<std::uint64_t>(slot.gin_window,
-                                          state->gin_layout.barrier);
+    auto *gin_barrier =
+        at<std::uint64_t>(slot.gin_window, state->gin_layout.barrier);
     internal::throw_cuda(
         "forward-run",
         cudaMemsetAsync(gin_barrier, 0, sizeof(std::uint64_t), exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "reset Forward GIN barrier");
-    gin_signal_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
-                                 exec->stream>>>(
-        gin_backend->dev_comm, gin_backend->gin_context_count);
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts, "reset Forward GIN barrier");
     internal::throw_cuda(
-        "forward-run", cudaGetLastError(), id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "reset Forward GIN signal/counter");
+        "forward-run",
+        cudaMemsetAsync(
+            at<void>(slot.gin_window,
+                     state->gin_layout.return_fragment_ready),
+            0,
+            checked_size(checked_mul(state->config.max_tokens_per_rank,
+                                     state->config.max_top_k,
+                                     "Forward direct Return counters"),
+                         "Forward direct Return counter count") *
+                sizeof(std::uint64_t),
+            exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "reset Forward direct Return fragment counters");
+    gin_signal_reset_kernel<<<gin_backend->gin_allocated_context_count, 1, 0,
+                              exec->stream>>>(
+        gin_backend->dev_comm, gin_backend->gin_allocated_context_count);
+    internal::throw_cuda("forward-run", cudaGetLastError(), id.calling_rank,
+                         id.world_size, backend->session.session().identity(),
+                         id.generation, ExchangeKind::ExpertCounts,
+                         "reset Forward GIN signal/counter");
     internal::throw_nccl(
         "forward-run",
         ncclAllReduce(gin_barrier, gin_barrier, 1, ncclUint64, ncclSum,
                       backend->nccl->comm, exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
         "ncclAllReduce(Forward GIN reset agreement)");
+#if MEGAMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("gin_reset_enqueued");
+#endif
 #endif
   }
   if (!use_socket) {
@@ -13721,19 +14699,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         layout.ingress_published_sequence, layout.outgoing_route_sequence,
         layout.p2p_barrier_receive, layout.gin_local_compute_ready,
         layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
-        view.sizes.mtile_count, layout.forward_completion,
-        layout.backward_completion, layout.forward_context_completion,
-        layout.backward_context_completion,
+        view.sizes.mtile_count, view.sizes.incoming_row_count,
+        layout.forward_completion, layout.backward_completion,
+        layout.forward_context_completion, layout.backward_context_completion,
         static_cast<std::uint32_t>((state->config.max_nodes - 1U) * 8U),
-        id.generation,
-        id.calling_rank, id.world_size, state->config.channels,
+        id.generation, id.calling_rank, id.world_size, state->config.channels,
         generation_epoch,
         use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
         use_gin ? gin_backend->local_world_size : id.world_size);
   } else if (socket_incoming != 0) {
     socket_install_forward_headers_kernel<<<
-        static_cast<unsigned int>((socket_incoming + 255ULL) / 256ULL), 256,
-        0, exec->stream>>>(
+        static_cast<unsigned int>((socket_incoming + 255ULL) / 256ULL), 256, 0,
+        exec->stream>>>(
         at<LocalP2pRouteHeader>(slot.device, layout.socket_header_receive),
         at<LocalP2pRouteHeader>(slot.device, layout.direct_route_headers),
         socket_incoming, id.generation, generation_epoch, id.calling_rank,
@@ -13745,6 +14722,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "initialize owner completion signals and wait peer setup epoch");
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("generation_init_enqueued");
+#endif
   ForwardKernelArgs args{};
   args.dispatch = view;
   args.dispatch_waves = dispatch_waves;
@@ -13800,6 +14780,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     args.gin_receive_payload_offset = state->gin_layout.receive_payload;
     args.gin_return_staging_offset = state->gin_layout.return_staging;
     args.gin_return_receive_offset = state->gin_layout.return_receive;
+    args.gin_return_fragment_ready_offset =
+        state->gin_layout.return_fragment_ready;
     args.gin_production_error_records_offset =
         state->gin_layout.production_error_records;
     args.node = gin_backend->node;
@@ -13822,28 +14804,76 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_ab_cache_offset = layout.forward_ab_cache;
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
+  args.forward_fc1_published_offset = layout.forward_fc1_published;
   args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
-  args.forward_output_ready_epoch_offset =
-      layout.forward_output_ready_epoch;
+  args.forward_output_ready_epoch_offset = layout.forward_output_ready_epoch;
   args.forward_return_chunk_directory_offset =
       layout.forward_return_chunk_directory;
-  args.forward_return_chunk_state_offset =
-      layout.forward_return_chunk_state;
+  args.forward_return_chunk_state_offset = layout.forward_return_chunk_state;
   args.forward_return_chunk_ready_count_offset =
       layout.forward_return_chunk_ready_count;
   args.forward_return_fragment_index_offset =
       layout.forward_return_fragment_index;
   args.forward_return_source_compact_index_offset =
       layout.forward_return_source_compact_index;
-  args.forward_return_chunk_capacity =
-      layout.forward_return_chunk_capacity;
+  args.forward_return_source_route_index_offset =
+      layout.forward_return_source_route_index;
+  args.forward_direct_source_compact_index_offset =
+      layout.forward_direct_source_compact_index;
+  args.forward_reduce_route_count_offset =
+      layout.forward_reduce_route_count;
+  args.forward_reduce_ready_token_offset =
+      layout.forward_reduce_ready_token;
+  args.forward_direct_return_fragment_offset =
+      layout.forward_direct_return_fragment;
+  args.forward_return_chunk_capacity = layout.forward_return_chunk_capacity;
+  args.forward_direct_return_fragment_capacity =
+      layout.forward_direct_return_fragment_capacity;
+  // Cross-node Forward has a single Return transport: FULL GIN. Dispatch
+  // intentionally remains same-rail, while the second physical context set
+  // gives each permanent RDMA CTA an independent FULL Return QP.
+  if (use_gin && id.num_nodes != 2U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                    "FULL Return topology", id.calling_rank,
+                    "exactly two nodes", std::to_string(id.num_nodes));
+  if (use_gin && !gin_backend->full_connections)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                    "FULL Return connections", id.calling_rank,
+                    "NCCL_GIN_CONNECTION_FULL", "unavailable");
+  if (const auto *chunk_rows =
+          std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS")) {
+    const auto parsed = std::stoull(chunk_rows);
+    if (parsed != 0ULL)
+      args.forward_return_chunk_rows = parsed;
+  }
+  const bool reduce_queue_requested =
+      std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE") != nullptr;
+  const bool reduce_scan_requested =
+      std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN") != nullptr;
+  const bool legacy_reduce_requested =
+      std::getenv("MEGAMOE_FORWARD_LEGACY_REDUCE") != nullptr;
+  if (static_cast<unsigned int>(reduce_queue_requested) +
+          static_cast<unsigned int>(reduce_scan_requested) +
+          static_cast<unsigned int>(legacy_reduce_requested) >
+      1U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                    "MEGAMOE_FORWARD_LEGACY_REDUCE", id.calling_rank,
+                    "only one reduce scheduler override",
+                    "queue, scan, or legacy");
+  // Route-ready queueing is the production scheduler.  The explicit queue
+  // variable remains accepted for reproducible A/B commands; scan and fixed
+  // token stripes are diagnostic fallbacks.
+  args.forward_dynamic_reduce_scan = reduce_scan_requested;
+  args.forward_dynamic_reduce_queue = !reduce_scan_requested &&
+                                      !legacy_reduce_requested;
   args.forward_scheduler_offset = layout.forward_scheduler;
+  args.forward_v3_control_offset = layout.forward_v3_control;
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
   args.production_error_records_offset = layout.production_error_records;
-  args.cancel_epoch = reinterpret_cast<const unsigned long long *>(
-      slot.device_cancel_epoch);
-#if MEGAMOE_DEBUG_VALIDATE
+  args.cancel_epoch =
+      reinterpret_cast<const unsigned long long *>(slot.device_cancel_epoch);
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
   const auto forward_progress_base =
       32ULL + static_cast<std::size_t>(state->config.max_owned_experts) * 8ULL;
   if (std::getenv("MEGAMOE_BACKWARD_PROGRESS_DUMP") != nullptr) {
@@ -13872,94 +14902,655 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     fallback_launch.numAttrs = 1;
     internal::throw_cuda(
         "forward-run",
-        cudaLaunchKernelEx(&fallback_launch,
-                           runtime_shape_forward_megakernel, args),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
+        cudaLaunchKernelEx(&fallback_launch, runtime_shape_forward_megakernel,
+                           args),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
         "single persistent runtime-shape Forward launch");
   } else {
-  int sms = 0;
-  internal::throw_cuda(
-      "forward-run",
-      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
-                             static_cast<int>(exec->device)),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaDeviceGetAttribute(SM count)");
-  const auto grid_blocks = static_cast<unsigned int>(sms);
-  if (grid_blocks == 0)
-    throw NotifyDispatchError(NotifyErrorCode::BackendUnavailable,
-                              "phase=forward-run, field=SM count, rank=" +
-                                  std::to_string(id.calling_rank) +
-                                  ", expected>=2, actual=" +
-                                  std::to_string(sms));
-  const std::size_t forward_smem =
-      (4U * 128U * 64U + 4U * 256U * 64U) *
-          sizeof(transport::BFloat16) +
-      8U * sizeof(std::uint64_t) +
-      static_cast<std::size_t>(id.world_size) * sizeof(std::uint32_t);
-  const bool remote_transport = use_gin || use_socket;
-  internal::throw_cuda(
-      "forward-run",
-      remote_transport
-          ? cudaFuncSetAttribute(local_p2p_forward_megakernel<false>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(forward_smem))
-          : cudaFuncSetAttribute(local_p2p_forward_megakernel<true>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(forward_smem)),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaFuncSetAttribute(dynamic smem)");
-  cudaLaunchAttribute attributes[1]{};
-  attributes[0].id = cudaLaunchAttributeCooperative;
-  attributes[0].val.cooperative = 1;
-  cudaLaunchConfig_t launch{};
-  launch.gridDim = dim3(grid_blocks, 1, 1);
-  launch.blockDim = dim3(384, 1, 1);
-  launch.dynamicSmemBytes = forward_smem;
-  launch.stream = exec->stream;
-  launch.attrs = attributes;
-  launch.numAttrs = 1;
-  internal::throw_cuda(
-      "forward-run",
-      cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
-                             static_cast<int>(exec->device)),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaDevAttrClusterLaunch");
-  const auto *forward_kernel = remote_transport
-                                   ? reinterpret_cast<const void *>(
-                                         local_p2p_forward_megakernel<false>)
-                                   : reinterpret_cast<const void *>(
-                                         local_p2p_forward_megakernel<true>);
-  internal::throw_cuda(
-      "forward-run",
-      cudaOccupancyMaxActiveClusters(&max_active_clusters, forward_kernel,
-                                     &launch),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaOccupancyMaxActiveClusters");
-  const auto launch_forward = remote_transport
-                                  ? cudaLaunchKernelEx(
-                                        &launch,
-                                        local_p2p_forward_megakernel<false>,
-                                        args, slot.forward_x_map,
-                                        slot.forward_s_map, weight.w1_map,
-                                        weight.w2_map)
-                                  : cudaLaunchKernelEx(
-                                        &launch,
-                                        local_p2p_forward_megakernel<true>,
-                                        args, slot.forward_x_map,
-                                        slot.forward_s_map, weight.w1_map,
-                                        weight.w2_map);
-  internal::throw_cuda(
-      "forward-run", launch_forward,
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts,
-      "single persistent WGMMA/TMA forward launch");
+    int sms = 0;
+    internal::throw_cuda(
+        "forward-run",
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                               static_cast<int>(exec->device)),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaDeviceGetAttribute(SM count)");
+    const auto grid_blocks = static_cast<unsigned int>(sms);
+    if (grid_blocks == 0)
+      throw NotifyDispatchError(
+          NotifyErrorCode::BackendUnavailable,
+          "phase=forward-run, field=SM count, rank=" +
+              std::to_string(id.calling_rank) +
+              ", expected>=2, actual=" + std::to_string(sms));
+    const std::size_t forward_smem =
+        (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16) +
+        16U * sizeof(std::uint64_t) +
+        static_cast<std::size_t>(id.world_size) * sizeof(std::uint32_t);
+    const bool remote_transport = use_gin || use_socket;
+    const bool split_gin_roles =
+        use_gin && view.identity.num_nodes == 2U &&
+        args.gin_context_count == persistent_v3::kRdmaCtaCount;
+    cudaError_t launch_forward = cudaSuccess;
+    if (split_gin_roles) {
+      args.forward_relay_cta_count = persistent_v3::kDefaultRelayCtaCount;
+      if (const auto *relay_ctas =
+              std::getenv("MEGAMOE_FORWARD_RELAY_CTAS"))
+        args.forward_relay_cta_count =
+            static_cast<std::uint32_t>(std::stoul(relay_ctas));
+      if (args.forward_relay_cta_count < persistent_v3::kRdmaCtaCount ||
+          args.forward_relay_cta_count % persistent_v3::kRdmaCtaCount != 0U ||
+          args.forward_relay_cta_count > 24U)
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                        "MEGAMOE_FORWARD_RELAY_CTAS", id.calling_rank,
+                        "one of 8, 16, or 24",
+                        std::to_string(args.forward_relay_cta_count));
+      const unsigned int kTransportBlocks =
+          persistent_v3::kRdmaCtaCount + args.forward_relay_cta_count;
+      if (grid_blocks <= kTransportBlocks)
+        throw NotifyDispatchError(
+            NotifyErrorCode::BackendUnavailable,
+            "phase=forward-run, field=split role residency, rank=" +
+                std::to_string(id.calling_rank) + ", expected SMs>" +
+                std::to_string(kTransportBlocks) +
+                ", actual=" + std::to_string(grid_blocks));
+      args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
+      args.forward_relay_local_return =
+          std::getenv("MEGAMOE_FORWARD_COMPUTE_LOCAL_RETURN") == nullptr;
+      // Eight Relay CTAs with all twelve independent row streams are the
+      // Hopper production point. A value of zero retains the exact vector
+      // implementation for autotuner/regression A/B runs.
+      args.forward_relay_tma_warps = persistent_v3::kWarpsPerCta;
+      if (const auto *tma_warps =
+              std::getenv("MEGAMOE_FORWARD_RELAY_TMA_WARPS"))
+        args.forward_relay_tma_warps =
+            static_cast<std::uint32_t>(std::stoul(tma_warps));
+      if (args.forward_relay_tma_warps != 0U &&
+          args.forward_relay_tma_warps != 4U &&
+          args.forward_relay_tma_warps != 8U &&
+          args.forward_relay_tma_warps != persistent_v3::kWarpsPerCta)
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                        "MEGAMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
+                        "one of 0, 4, 8, or 12",
+                        std::to_string(args.forward_relay_tma_warps));
+      // FC2 writes its result exactly once into the registered Return plane.
+      // Relay TMA and remote GIN then consume that same immutable storage,
+      // avoiding a full output-sized duplicate GMEM write.  Keep an explicit
+      // 0/1 override for regression A/B and future autotuning.
+      args.forward_registered_output = true;
+      if (const auto *registered_output =
+              std::getenv("MEGAMOE_FORWARD_REGISTERED_OUTPUT")) {
+        const std::string value(registered_output);
+        if (value != "0" && value != "1")
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                          "forward-run",
+                          "MEGAMOE_FORWARD_REGISTERED_OUTPUT",
+                          id.calling_rank, "0 or 1", value);
+        args.forward_registered_output = value == "1";
+      }
+      const bool forward_m64 =
+          std::getenv("MEGAMOE_FORWARD_M64") != nullptr;
+      const bool forward_m64_head =
+          std::getenv("MEGAMOE_FORWARD_M64_HEAD") != nullptr;
+      const bool forward_specialize_stages =
+          std::getenv("MEGAMOE_FORWARD_SPECIALIZE_STAGES") != nullptr;
+      const bool forward_fc2_tma_store =
+          std::getenv("MEGAMOE_FORWARD_FC2_TMA_STORE") != nullptr;
+      // The H200 main-shape autotune selects four async TMA stages for both
+      // GEMMs.  Environment overrides retain the other compiled candidates
+      // for topology/shape-specific retuning without an inner-loop branch.
+      std::uint32_t forward_fc1_stages = 4U;
+      std::uint32_t forward_fc2_stages = 4U;
+      if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC1_STAGES"))
+        forward_fc1_stages =
+            static_cast<std::uint32_t>(std::stoul(stages));
+      if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC2_STAGES"))
+        forward_fc2_stages =
+            static_cast<std::uint32_t>(std::stoul(stages));
+      const bool supported_stage_pair =
+          (forward_fc1_stages == 2U && forward_fc2_stages == 4U) ||
+          (forward_fc1_stages == 3U && forward_fc2_stages == 3U) ||
+          (forward_fc1_stages == 3U && forward_fc2_stages == 4U) ||
+          (forward_fc1_stages == 4U && forward_fc2_stages == 4U);
+      if (!supported_stage_pair)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "Forward FC1/FC2 TMA stages", id.calling_rank,
+            "one of 2x4, 3x3, 3x4, or 4x4",
+            std::to_string(forward_fc1_stages) + "x" +
+                std::to_string(forward_fc2_stages));
+      if ((forward_fc1_stages != 3U || forward_fc2_stages != 4U) &&
+          (forward_m64 || forward_m64_head || forward_specialize_stages))
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "Forward FC1/FC2 TMA stages", id.calling_rank,
+            "the production mixed M128 scheduler",
+            "combined with an obsolete M64/stage-split experiment");
+      if (forward_m64 && forward_m64_head)
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                        "Forward M tile mode", id.calling_rank,
+                        "at most one of MEGAMOE_FORWARD_M64 and "
+                        "MEGAMOE_FORWARD_M64_HEAD",
+                        "both enabled");
+      if (forward_specialize_stages && (forward_m64 || forward_m64_head))
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                        "Forward stage specialization", id.calling_rank,
+                        "M128 without an M64 experiment",
+                        "MEGAMOE_FORWARD_SPECIALIZE_STAGES with M64");
+      if (forward_fc2_tma_store && !forward_specialize_stages)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
+            "stage-specialized Forward mode",
+            "unspecialized Forward stages");
+      if (forward_m64)
+        args.forward_mblock_rows = 64U;
+      args.forward_m64_head_wavefront = forward_m64_head;
+      if (forward_m64_head) {
+        args.forward_m64_head_expert_count = 1U;
+        if (const auto *head_experts =
+                std::getenv("MEGAMOE_FORWARD_M64_HEAD_EXPERTS"))
+          args.forward_m64_head_expert_count =
+              static_cast<std::uint32_t>(std::stoul(head_experts));
+        if (args.forward_m64_head_expert_count == 0U ||
+            args.forward_m64_head_expert_count >
+                view.sizes.owned_expert_count)
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+              "MEGAMOE_FORWARD_M64_HEAD_EXPERTS", id.calling_rank,
+              "an integer in [1, owned_expert_count]",
+              std::to_string(args.forward_m64_head_expert_count));
+        args.forward_m64_head_cta_count = persistent_v3::kRdmaCtaCount;
+        if (const auto *head_ctas =
+                std::getenv("MEGAMOE_FORWARD_M64_HEAD_CTAS"))
+          args.forward_m64_head_cta_count =
+              static_cast<std::uint32_t>(std::stoul(head_ctas));
+        if (args.forward_m64_head_cta_count == 0U ||
+            args.forward_m64_head_cta_count >=
+                args.forward_compute_cta_count)
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                          "MEGAMOE_FORWARD_M64_HEAD_CTAS", id.calling_rank,
+                          "an integer in [1, compute_ctas - 1]",
+                          std::to_string(args.forward_m64_head_cta_count));
+      }
+      const auto forward_main_compute_ctas =
+          args.forward_compute_cta_count -
+          (forward_m64_head ? args.forward_m64_head_cta_count : 0U);
+      // Expert storage remains padded to M=128. Repeated 32..512-row FULL
+      // sweeps selected 256-row completion chunks: fewer marker scans and WQEs
+      // with no measurable loss of FC2/Return overlap.
+      if (std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS") == nullptr)
+        args.forward_return_chunk_rows = 256ULL;
+
+      // FC1 carries about twice FC2's FLOPs, but FC2 is released in a burst
+      // behind each completed M-block.  Repeated 16-GPU H200 sweeps selected
+      // 68 initial FC1 owners and 48 early FC2 consumers; FC1 owners borrow
+      // into the FC2 queue as soon as the FC1 claim counter is exhausted.
+      constexpr std::uint32_t kDefaultEarlyFc2Ctas = 48U;
+      args.forward_fc1_cta_count =
+          args.forward_compute_cta_count - kDefaultEarlyFc2Ctas;
+      if (const auto *fc1_ctas = std::getenv("MEGAMOE_FORWARD_FC1_CTAS"))
+        args.forward_fc1_cta_count =
+            static_cast<std::uint32_t>(std::stoul(fc1_ctas));
+      if (args.forward_fc1_cta_count == 0U ||
+          args.forward_fc1_cta_count >= forward_main_compute_ctas)
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                        "MEGAMOE_FORWARD_FC1_CTAS", id.calling_rank,
+                        "an integer in [1, initial body compute_ctas - 1]",
+                        std::to_string(args.forward_fc1_cta_count));
+      // In head-wavefront mode the initial resident set is exactly one CTA per
+      // SM: 16 transport + head + main body.  A same-stream FC2-only tail grid
+      // replaces the head CTAs after they exit, restoring all 116 compute
+      // owners without ever starving the cooperative transport launch.
+      args.forward_reduce_cta_count = forward_main_compute_ctas;
+      internal::throw_cuda(
+          "forward-run",
+          cudaFuncSetAttribute(
+              local_p2p_forward_megakernel<false,
+                                           ForwardKernelRole::TransportOnly>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(forward_smem)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(split transport dynamic smem)");
+      cudaError_t compute_attribute = cudaSuccess;
+      if (forward_specialize_stages)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_compute_kernel<
+                false, true, false, ForwardTaskPartition::All, false, false,
+                true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_smem));
+      else if (forward_m64)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_compute_kernel<false, true, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_smem));
+      else if (forward_m64_head)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_compute_kernel<
+                false, true, false,
+                ForwardTaskPartition::Body>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_smem));
+      else {
+        const auto set_mixed_compute_attribute = [&](auto kernel) {
+          return cudaFuncSetAttribute(
+              kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(forward_smem));
+        };
+        if (forward_fc1_stages == 2U)
+          compute_attribute = set_mixed_compute_attribute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 2U, 4U>);
+        else if (forward_fc2_stages == 3U)
+          compute_attribute = set_mixed_compute_attribute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 3U, 3U>);
+        else if (forward_fc1_stages == 4U)
+          compute_attribute = set_mixed_compute_attribute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 4U, 4U>);
+        else
+          compute_attribute = set_mixed_compute_attribute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 3U, 4U>);
+      }
+      internal::throw_cuda(
+          "forward-run", compute_attribute,
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(queued FC1/FC2 dynamic smem)");
+      if (forward_specialize_stages) {
+        cudaError_t fc2_attribute = cudaSuccess;
+        if (!forward_fc2_tma_store)
+          fc2_attribute = cudaFuncSetAttribute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, true>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(forward_smem));
+        else
+          fc2_attribute = cudaFuncSetAttribute(
+              local_p2p_forward_fc2_tma_store_kernel<false, true>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize,
+              static_cast<int>(forward_smem));
+        internal::throw_cuda(
+            "forward-run", fc2_attribute, id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaFuncSetAttribute(FC2-only dynamic smem)");
+      }
+      if (forward_m64_head || forward_specialize_stages)
+        internal::throw_cuda(
+            "forward-run",
+            cudaFuncSetAttribute(local_p2p_forward_m64_head_kernel<false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(forward_smem)),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaFuncSetAttribute(M64 head dynamic smem)");
+      if (forward_m64_head)
+        internal::throw_cuda(
+            "forward-run",
+            cudaFuncSetAttribute(
+                local_p2p_forward_compute_kernel<
+                    false, true, false, ForwardTaskPartition::Body, false,
+                    true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(forward_smem)),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaFuncSetAttribute(M128 body FC2 tail dynamic smem)");
+
+      internal::throw_cuda(
+          "forward-run",
+          cudaEventRecord(slot.forward_roles_ready, exec->stream),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaEventRecord(split Forward roles ready)");
+      internal::throw_cuda(
+          "forward-run",
+          cudaStreamWaitEvent(slot.forward_transport_stream,
+                              slot.forward_roles_ready),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaStreamWaitEvent(split Forward transport ready)");
+      if (forward_m64_head || forward_specialize_stages)
+        internal::throw_cuda(
+            "forward-run",
+            cudaStreamWaitEvent(slot.forward_m64_head_stream,
+                                slot.forward_roles_ready),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaStreamWaitEvent(split Forward auxiliary compute ready)");
+      internal::throw_cuda("forward-run",
+                           cudaStreamWaitEvent(slot.forward_compute_stream,
+                                               slot.forward_roles_ready),
+                           id.calling_rank, id.world_size,
+                           backend->session.session().identity(), id.generation,
+                           ExchangeKind::ExpertCounts,
+                           "cudaStreamWaitEvent(split Forward compute ready)");
+
+      cudaLaunchAttribute transport_attributes[1]{};
+      transport_attributes[0].id = cudaLaunchAttributeCooperative;
+      transport_attributes[0].val.cooperative = 1;
+      cudaLaunchConfig_t transport_launch{};
+      transport_launch.gridDim = dim3(kTransportBlocks, 1, 1);
+      transport_launch.blockDim = dim3(384, 1, 1);
+      transport_launch.dynamicSmemBytes = forward_smem;
+      transport_launch.stream = slot.forward_transport_stream;
+      transport_launch.attrs = transport_attributes;
+      transport_launch.numAttrs = 1;
+      launch_forward = cudaLaunchKernelEx(
+          &transport_launch,
+          local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
+          args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+          weight.w2_map);
+      internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
+                           id.world_size, backend->session.session().identity(),
+                           id.generation, ExchangeKind::ExpertCounts,
+                           "persistent 8-RDMA/tunable-Relay Forward launch");
+      internal::throw_cuda("forward-run",
+                           cudaEventRecord(slot.forward_transport_done,
+                                           slot.forward_transport_stream),
+                           id.calling_rank, id.world_size,
+                           backend->session.session().identity(), id.generation,
+                           ExchangeKind::ExpertCounts,
+                           "cudaEventRecord(split Forward transport done)");
+
+      if (forward_m64_head) {
+        auto head_args = args;
+#if MEGAMOE_DEVICE_TIMELINE
+        head_args.timeline.cta_base = kTransportBlocks;
+#endif
+        cudaLaunchConfig_t head_launch{};
+        head_launch.gridDim = dim3(args.forward_m64_head_cta_count, 1, 1);
+        head_launch.blockDim = dim3(384, 1, 1);
+        head_launch.dynamicSmemBytes = forward_smem;
+        head_launch.stream = slot.forward_m64_head_stream;
+        launch_forward = cudaLaunchKernelEx(
+            &head_launch, local_p2p_forward_m64_head_kernel<false>, head_args,
+            slot.forward_x_m64_map, slot.forward_s_m64_map, weight.w1_map,
+            weight.w2_map);
+        internal::throw_cuda(
+            "forward-run", launch_forward, id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "concurrent M64 head FC1/FC2 WGMMA/TMA Forward launch");
+
+        auto tail_args = args;
+        tail_args.forward_fc1_cta_count = 0U;
+#if MEGAMOE_DEVICE_TIMELINE
+        // The tail runs after the head in this stream, so it can reuse the
+        // head CTA timeline lanes without overlapping their records.
+        tail_args.timeline.cta_base = kTransportBlocks;
+#endif
+        cudaLaunchConfig_t tail_launch{};
+        tail_launch.gridDim = dim3(args.forward_m64_head_cta_count, 1, 1);
+        tail_launch.blockDim = dim3(384, 1, 1);
+        tail_launch.dynamicSmemBytes = forward_smem;
+        tail_launch.stream = slot.forward_m64_head_stream;
+        launch_forward = cudaLaunchKernelEx(
+            &tail_launch,
+            local_p2p_forward_compute_kernel<
+                false, true, false, ForwardTaskPartition::Body, false, true>,
+            tail_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map);
+        internal::throw_cuda(
+            "forward-run", launch_forward, id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "post-head M128 body FC2 queue-consumer Forward launch");
+        internal::throw_cuda(
+            "forward-run",
+            cudaEventRecord(slot.forward_m64_head_done,
+                            slot.forward_m64_head_stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaEventRecord(split Forward M64 head done)");
+      } else if (forward_specialize_stages) {
+        const auto early_fc2_ctas =
+            forward_main_compute_ctas - args.forward_fc1_cta_count;
+
+        auto fc1_args = args;
+        fc1_args.forward_reduce_cta_offset = 0U;
+#if MEGAMOE_DEVICE_TIMELINE
+        fc1_args.timeline.cta_base = kTransportBlocks;
+#endif
+        cudaLaunchConfig_t fc1_launch{};
+        fc1_launch.gridDim = dim3(args.forward_fc1_cta_count, 1, 1);
+        fc1_launch.blockDim = dim3(384, 1, 1);
+        fc1_launch.dynamicSmemBytes = forward_smem;
+        fc1_launch.stream = slot.forward_m64_head_stream;
+        launch_forward = cudaLaunchKernelEx(
+            &fc1_launch,
+            local_p2p_forward_compute_kernel<
+                false, true, false, ForwardTaskPartition::All, false, false,
+                true>,
+            fc1_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map);
+        internal::throw_cuda(
+            "forward-run", launch_forward, id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "compiler-specialized FC1 WGMMA/TMA Forward launch");
+
+        // This launch is stream-ordered after the FC1 grid.  The 36 early FC2
+        // CTAs below keep FC1/FC2 overlapped; these CTAs refill each FC1 SM
+        // once the balanced FC1 grid has drained, without carrying FC1 live
+        // ranges into the FC2 kernel symbol.
+        auto tail_args = args;
+        tail_args.forward_reduce_cta_offset = early_fc2_ctas;
+#if MEGAMOE_DEVICE_TIMELINE
+        tail_args.timeline.cta_base = kTransportBlocks;
+#endif
+        cudaLaunchConfig_t tail_launch{};
+        tail_launch.gridDim = dim3(args.forward_fc1_cta_count, 1, 1);
+        tail_launch.blockDim = dim3(384, 1, 1);
+        tail_launch.dynamicSmemBytes = forward_smem;
+        tail_launch.stream = slot.forward_m64_head_stream;
+        if (forward_fc2_tma_store)
+          launch_forward = cudaLaunchKernelEx(
+              &tail_launch,
+              local_p2p_forward_fc2_tma_store_kernel<false, true>, tail_args,
+              slot.forward_s_map, weight.w2_map,
+              slot.forward_staging_store_map);
+        else
+          launch_forward = cudaLaunchKernelEx(
+              &tail_launch,
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, true>,
+              tail_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+              weight.w2_map);
+        internal::throw_cuda(
+            "forward-run", launch_forward, id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "post-FC1 compiler-specialized FC2 Forward launch");
+        internal::throw_cuda(
+            "forward-run",
+            cudaEventRecord(slot.forward_m64_head_done,
+                            slot.forward_m64_head_stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaEventRecord(specialized FC1/tail-FC2 done)");
+      }
+
+      auto compute_args = args;
+#if MEGAMOE_DEVICE_TIMELINE
+      compute_args.timeline.cta_base =
+          kTransportBlocks +
+          (forward_m64_head ? args.forward_m64_head_cta_count : 0U);
+#endif
+      cudaLaunchConfig_t compute_launch{};
+      compute_launch.gridDim = dim3(
+          forward_specialize_stages
+              ? forward_main_compute_ctas - args.forward_fc1_cta_count
+              : forward_main_compute_ctas,
+          1, 1);
+      compute_launch.blockDim = dim3(384, 1, 1);
+      compute_launch.dynamicSmemBytes = forward_smem;
+      compute_launch.stream = slot.forward_compute_stream;
+      if (forward_specialize_stages) {
+        compute_args.forward_reduce_cta_offset = 0U;
+#if MEGAMOE_DEVICE_TIMELINE
+        compute_args.timeline.cta_base =
+            kTransportBlocks + args.forward_fc1_cta_count;
+#endif
+        if (forward_fc2_tma_store)
+          launch_forward = cudaLaunchKernelEx(
+              &compute_launch,
+              local_p2p_forward_fc2_tma_store_kernel<false, true>,
+              compute_args, slot.forward_s_map, weight.w2_map,
+              slot.forward_staging_store_map);
+        else
+          launch_forward = cudaLaunchKernelEx(
+              &compute_launch,
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, true>,
+              compute_args, slot.forward_x_map, slot.forward_s_map,
+              weight.w1_map, weight.w2_map);
+      } else if (forward_m64)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<false, true, true>, compute_args,
+            slot.forward_x_m64_map, slot.forward_s_m64_map, weight.w1_map,
+            weight.w2_map);
+      else if (forward_m64_head)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<
+                false, true, false,
+                ForwardTaskPartition::Body>,
+            compute_args, slot.forward_x_map, slot.forward_s_map,
+            weight.w1_map, weight.w2_map);
+      else {
+        const auto launch_mixed_compute = [&](auto kernel) {
+          return cudaLaunchKernelEx(
+              &compute_launch, kernel, compute_args, slot.forward_x_map,
+              slot.forward_s_map, weight.w1_map, weight.w2_map);
+        };
+        if (forward_fc1_stages == 2U)
+          launch_forward = launch_mixed_compute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 2U, 4U>);
+        else if (forward_fc2_stages == 3U)
+          launch_forward = launch_mixed_compute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 3U, 3U>);
+        else if (forward_fc1_stages == 4U)
+          launch_forward = launch_mixed_compute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 4U, 4U>);
+        else
+          launch_forward = launch_mixed_compute(
+              local_p2p_forward_compute_kernel<
+                  false, true, false, ForwardTaskPartition::All, true, false,
+                  false, 3U, 4U>);
+      }
+      internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
+                           id.world_size, backend->session.session().identity(),
+                           id.generation, ExchangeKind::ExpertCounts,
+                           "persistent queued FC1/FC2 WGMMA/TMA Forward launch");
+
+      internal::throw_cuda("forward-run",
+                           cudaEventRecord(slot.forward_compute_done,
+                                           slot.forward_compute_stream),
+                           id.calling_rank, id.world_size,
+                           backend->session.session().identity(), id.generation,
+                           ExchangeKind::ExpertCounts,
+                           "cudaEventRecord(split Forward compute done)");
+      internal::throw_cuda(
+          "forward-run",
+          cudaStreamWaitEvent(exec->stream, slot.forward_transport_done),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaStreamWaitEvent(split Forward transport done)");
+      if (forward_m64_head || forward_specialize_stages)
+        internal::throw_cuda(
+            "forward-run",
+            cudaStreamWaitEvent(exec->stream, slot.forward_m64_head_done),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaStreamWaitEvent(split Forward auxiliary compute done)");
+      internal::throw_cuda(
+          "forward-run",
+          cudaStreamWaitEvent(exec->stream, slot.forward_compute_done),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaStreamWaitEvent(split Forward compute done)");
+    } else {
+      internal::throw_cuda(
+          "forward-run",
+          remote_transport ? cudaFuncSetAttribute(
+                                 local_p2p_forward_megakernel<false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(forward_smem))
+                           : cudaFuncSetAttribute(
+                                 local_p2p_forward_megakernel<true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(forward_smem)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(dynamic smem)");
+      cudaLaunchAttribute attributes[1]{};
+      attributes[0].id = cudaLaunchAttributeCooperative;
+      attributes[0].val.cooperative = 1;
+      cudaLaunchConfig_t launch{};
+      launch.gridDim = dim3(grid_blocks, 1, 1);
+      launch.blockDim = dim3(384, 1, 1);
+      launch.dynamicSmemBytes = forward_smem;
+      launch.stream = exec->stream;
+      launch.attrs = attributes;
+      launch.numAttrs = 1;
+      internal::throw_cuda(
+          "forward-run",
+          cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
+                                 static_cast<int>(exec->device)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaDevAttrClusterLaunch");
+      const auto *forward_kernel =
+          remote_transport ? reinterpret_cast<const void *>(
+                                 local_p2p_forward_megakernel<false>)
+                           : reinterpret_cast<const void *>(
+                                 local_p2p_forward_megakernel<true>);
+      internal::throw_cuda("forward-run",
+                           cudaOccupancyMaxActiveClusters(
+                               &max_active_clusters, forward_kernel, &launch),
+                           id.calling_rank, id.world_size,
+                           backend->session.session().identity(), id.generation,
+                           ExchangeKind::ExpertCounts,
+                           "cudaOccupancyMaxActiveClusters");
+      launch_forward =
+          remote_transport
+              ? cudaLaunchKernelEx(&launch, local_p2p_forward_megakernel<false>,
+                                   args, slot.forward_x_map, slot.forward_s_map,
+                                   weight.w1_map, weight.w2_map)
+              : cudaLaunchKernelEx(&launch, local_p2p_forward_megakernel<true>,
+                                   args, slot.forward_x_map, slot.forward_s_map,
+                                   weight.w1_map, weight.w2_map);
+    }
+#if MEGAMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("kernel_launch_returned");
+#endif
+    internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
+                         id.world_size, backend->session.session().identity(),
+                         id.generation, ExchangeKind::ExpertCounts,
+                         "single persistent WGMMA/TMA forward launch");
   }
   if (use_socket) {
     std::vector<std::uint64_t> send_prefix(
@@ -14158,39 +15749,55 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     return DeviceForwardHandle(std::move(result));
   }
 
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("consumer_submit_enter");
+#endif
+  std::atomic<bool> forward_stream_done{false};
   ActivationTransportBridge::submit(consumer);
+  internal::throw_cuda(
+      "forward-run",
+      cudaLaunchHostFunc(exec->stream, publish_stream_completion,
+                         &forward_stream_done),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaLaunchHostFunc(Forward completion notification)");
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("consumer_submit_done");
+#endif
 
   const auto wait_start = std::chrono::steady_clock::now();
   bool cancelled = false;
-#if MEGAMOE_DEBUG_VALIDATE
-  bool progress_dumped = false;
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+  unsigned int progress_dump_count = 0U;
 #endif
   while (true) {
-    const auto query = cudaEventQuery(slot.forward_complete);
-    if (query == cudaSuccess)
+    if (forward_stream_done.load(std::memory_order_acquire))
       break;
-    if (query != cudaErrorNotReady)
-      internal::throw_cuda(
-          "forward-run", query, id.calling_rank, id.world_size,
-          backend->session.session().identity(), id.generation,
-          ExchangeKind::ExpertCounts, "cudaEventQuery(forward complete)");
-    const auto expired = options.deadline_after.count() > 0 &&
-                         std::chrono::steady_clock::now() - wait_start >=
-                             options.deadline_after;
-#if MEGAMOE_DEBUG_VALIDATE
+    const auto expired =
+        options.deadline_after.count() > 0 &&
+        std::chrono::steady_clock::now() - wait_start >= options.deadline_after;
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
     const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
-    if (!progress_dumped && use_gin && args.progress != nullptr &&
-        stalled_for >= std::chrono::seconds(30)) {
+    const auto progress_dump_after = progress_dump_count == 0U
+                                         ? std::chrono::seconds(3)
+                                         : std::chrono::seconds(30);
+    if (progress_dump_count < 2U && use_gin && args.progress != nullptr &&
+        stalled_for >= progress_dump_after) {
       const auto forward_progress_base =
-          32ULL + static_cast<std::size_t>(state->config.max_owned_experts) *
-                      8ULL;
+          32ULL +
+          static_cast<std::size_t>(state->config.max_owned_experts) * 8ULL;
       const auto progress = [&](std::uint32_t word) {
         return __atomic_load_n(slot.host_backward_progress +
                                    forward_progress_base + word,
                                __ATOMIC_ACQUIRE);
       };
-      std::cerr << "FORWARD_PROGRESS rank=" << id.calling_rank
+      // Emit the mapped coarse milestones before attempting a device-memory
+      // snapshot. If a platform cannot schedule the diagnostic D2H while the
+      // persistent grid is resident, this line still identifies the stalled
+      // phase instead of losing the entire diagnostic.
+      std::cerr << "FORWARD_PROGRESS_COARSE rank=" << id.calling_rank
                 << " generation=" << id.generation
+                << " sample=" << progress_dump_count
                 << " entered=" << progress(kForwardEntered)
                 << " setup=" << progress(kForwardSetupComplete)
                 << " dispatch_stored=" << progress(kForwardDispatchStored)
@@ -14200,14 +15807,48 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 << " fc2=" << progress(kForwardFc2Complete)
                 << " return=" << progress(kForwardReturnObserved)
                 << " reduce=" << progress(kForwardReduceComplete)
-                << " terminal=" << progress(kForwardTerminal);
-      dump_generation_completion(
-          std::cerr,
-          slot.host_backward_progress + forward_progress_base +
-              kForwardProgressWords,
-          slot.generation_debug_contexts, "forward_completion");
+                << " terminal=" << progress(kForwardTerminal) << std::endl;
+      // Keep production completion atomics in device memory even in debug
+      // builds. Redirecting the per-task counters to mapped host memory
+      // perturbs the Forward schedule by hundreds of milliseconds and can
+      // hide the race being diagnosed. A pair of copy-engine snapshots on the
+      // independent cancel stream remains observable while the persistent
+      // kernel occupies every SM.
+      auto *completion_snapshot = slot.host_backward_progress +
+                                  forward_progress_base + kForwardProgressWords;
+      internal::throw_cuda(
+          "forward-progress-snapshot",
+          cudaMemcpyAsync(completion_snapshot,
+                          at<void>(slot.device, layout.forward_completion),
+                          sizeof(transport_state::GenerationCompletionVector),
+                          cudaMemcpyDeviceToHost, state->cancel_stream),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "D2H Forward generation completion snapshot");
+      internal::throw_cuda(
+          "forward-progress-snapshot",
+          cudaMemcpyAsync(
+              completion_snapshot + transport_state::kGenerationCompletionWords,
+              at<void>(slot.device, layout.forward_context_completion),
+              static_cast<std::size_t>(slot.generation_debug_contexts) *
+                  sizeof(transport_state::ContextCompletionRecord),
+              cudaMemcpyDeviceToHost, state->cancel_stream),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "D2H Forward context completion snapshot");
+      internal::throw_cuda(
+          "forward-progress-snapshot",
+          cudaStreamSynchronize(state->cancel_stream), id.calling_rank,
+          id.world_size, backend->session.session().identity(), id.generation,
+          ExchangeKind::ExpertCounts, "drain Forward completion snapshot");
+      std::cerr << "FORWARD_PROGRESS rank=" << id.calling_rank
+                << " generation=" << id.generation
+                << " sample=" << progress_dump_count;
+      dump_generation_completion(std::cerr, completion_snapshot,
+                                 slot.generation_debug_contexts,
+                                 "forward_completion");
       std::cerr << std::endl;
-      progress_dumped = true;
+      ++progress_dump_count;
     }
 #endif
     if (!cancelled &&
@@ -14218,23 +15859,44 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           cudaMemcpyAsync(slot.device_cancel_epoch, slot.host_cancel_epoch,
                           sizeof(std::uint64_t), cudaMemcpyHostToDevice,
                           state->cancel_stream),
-          id.calling_rank, id.world_size,
-          backend->session.session().identity(), id.generation,
-          ExchangeKind::ExpertCounts, "H2D publish forward cancel");
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "H2D publish forward cancel");
       internal::throw_cuda(
           "forward-cancel", cudaStreamSynchronize(state->cancel_stream),
-          id.calling_rank, id.world_size,
-          backend->session.session().identity(), id.generation,
-          ExchangeKind::ExpertCounts, "drain forward cancel stream");
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "drain forward cancel stream");
       cancelled = true;
     }
-    std::this_thread::yield();
+    // Do not call CUDA event-query APIs while the resident GIN kernel is
+    // active. On the remote host that can hold a driver-side progress lock and
+    // form a liveness cycle with device GIN. The stream callback above is the
+    // completion notification; this sleep only bounds host polling overhead.
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("stream_completion_observed");
+#endif
+  internal::throw_cuda(
+      "forward-run", cudaEventQuery(slot.forward_complete), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventQuery(completed Forward event)");
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("event_verified");
+#endif
   consumer.finish();
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("consumer_finished");
+  debug_forward_host_phase("terminal_agreement_enter");
+#endif
   const auto production_agreement = agree_production_terminal_status(
       backend, slot, ProductionStatusPhase::Forward, id.generation,
-      id.generation, id.calling_rank, id.world_size,
-      *slot.host_forward_status, slot.forward_complete);
+      id.generation, id.calling_rank, id.world_size, *slot.host_forward_status,
+      slot.forward_complete);
+#if MEGAMOE_DEBUG_VALIDATE
+  debug_forward_host_phase("terminal_agreement_done");
+#endif
   if (cancelled || slot.host_forward_status->error == 2U)
     throw NotifyDispatchError(
         NotifyErrorCode::TransportTimeout,
@@ -14389,31 +16051,39 @@ SelectedOutputGradientLease testing_upload_output_gradient_for_backward(
                     std::to_string(elements), std::to_string(host.size()));
   const auto exec = internal::checked_execution_state(execution);
   auto &slot = f.pool->slots[f.slot->index];
-  const auto bytes = checked_size(
-      checked_mul(elements, sizeof(transport::BFloat16),
-                  "backward dY upload bytes"),
-      "backward dY upload bytes");
+  const auto gin_backend =
+      std::dynamic_pointer_cast<GinBackendState>(f.backend);
+  const bool direct_gin_dy =
+      gin_backend &&
+      std::getenv("MEGAMOE_BACKWARD_V3_DIRECT_DY_INPUT") != nullptr;
+  auto *dy_target =
+      direct_gin_dy ? at<transport::BFloat16>(
+                          slot.gin_window, f.pool->gin_layout.backward_dy_input)
+                    : at<transport::BFloat16>(slot.device,
+                                              f.pool->layout.backward_dy_input);
+  const auto bytes =
+      checked_size(checked_mul(elements, sizeof(transport::BFloat16),
+                               "backward dY upload bytes"),
+                   "backward dY upload bytes");
   if (bytes != 0) {
-    internal::throw_cuda(
-        "backward-dy-upload",
-        cudaMemcpyAsync(at<void>(slot.device, f.pool->layout.backward_dy_input),
-                        host.data(), bytes, cudaMemcpyHostToDevice,
-                        exec->stream),
-        f.identity.rank, f.identity.world, f.backend->session.session().identity(),
-        f.identity.generation, ExchangeKind::ExpertCounts,
-        "H2D explicit test dY upload");
+    internal::throw_cuda("backward-dy-upload",
+                         cudaMemcpyAsync(dy_target, host.data(), bytes,
+                                         cudaMemcpyHostToDevice, exec->stream),
+                         f.identity.rank, f.identity.world,
+                         f.backend->session.session().identity(),
+                         f.identity.generation, ExchangeKind::ExpertCounts,
+                         "H2D explicit test dY upload");
     internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
   }
   internal::throw_cuda(
       "backward-dy-upload", cudaEventRecord(slot.backward_ready, exec->stream),
-      f.identity.rank, f.identity.world, f.backend->session.session().identity(),
-      f.identity.generation, ExchangeKind::ExpertCounts,
-      "cudaEventRecord(backward dY ready)");
+      f.identity.rank, f.identity.world,
+      f.backend->session.session().identity(), f.identity.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(backward dY ready)");
   auto impl = std::make_shared<SelectedOutputGradientLease::Impl>();
   impl->slot = f.slot;
   impl->pool = f.pool;
-  impl->pointer = at<const transport::BFloat16>(
-      slot.device, f.pool->layout.backward_dy_input);
+  impl->pointer = dy_target;
   impl->session_identity = f.pool->session_identity;
   impl->producer_execution = execution.token();
   impl->generation = f.identity.generation;
@@ -14429,22 +16099,31 @@ SelectedOutputGradientLease testing_reissue_output_gradient_for_benchmark(
     const SelectedOutputGradientLease &storage,
     const CudaExecution &execution) {
   if (!forward || !storage || !execution)
-    transport_error(NotifyErrorCode::InvalidHandle,
-                    "backward-dy-reissue", "forward/storage/execution", 0,
-                    "valid", "empty");
+    transport_error(NotifyErrorCode::InvalidHandle, "backward-dy-reissue",
+                    "forward/storage/execution", 0, "valid", "empty");
   const auto &f = *forward.impl_;
   const auto &source = *storage.impl_;
+  const auto gin_backend =
+      std::dynamic_pointer_cast<GinBackendState>(f.backend);
+  const auto &slot = f.pool->slots[f.slot->index];
+  const bool direct_gin_dy =
+      gin_backend &&
+      std::getenv("MEGAMOE_BACKWARD_V3_DIRECT_DY_INPUT") != nullptr;
+  const auto *expected_pointer =
+      direct_gin_dy
+          ? at<const transport::BFloat16>(slot.gin_window,
+                                          f.pool->gin_layout.backward_dy_input)
+          : at<const transport::BFloat16>(slot.device,
+                                          f.pool->layout.backward_dy_input);
   if (source.pool.get() != f.pool.get() ||
       source.slot->index != f.slot->index ||
-      source.pointer != at<const transport::BFloat16>(
-                            f.pool->slots[f.slot->index].device,
-                            f.pool->layout.backward_dy_input) ||
-      source.tokens != f.identity.tokens || source.hidden != f.identity.hidden ||
+      source.pointer != expected_pointer ||
+      source.tokens != f.identity.tokens ||
+      source.hidden != f.identity.hidden ||
       source.device != execution.device_ordinal() ||
       !execution.token().same_instance(f.backend->execution.token()))
-    transport_error(NotifyErrorCode::WorkspaceMismatch,
-                    "backward-dy-reissue", "storage provenance",
-                    f.identity.rank,
+    transport_error(NotifyErrorCode::WorkspaceMismatch, "backward-dy-reissue",
+                    "storage provenance", f.identity.rank,
                     "same preallocated slot/pool/execution/shape", "mismatch");
   auto impl = std::make_shared<SelectedOutputGradientLease::Impl>();
   impl->slot = f.slot;
@@ -14859,58 +16538,85 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
         id.world_size, backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "relay Socket Backward dY/gate");
   }
-  if (use_gin) {
-#if __has_include(<nccl_device.h>)
-    auto *gin_barrier = at<std::uint64_t>(slot.gin_window,
-                                          state->gin_layout.barrier);
+  // The strong dY-publication diagnostic must run before the node-local setup
+  // handshake.  Clearing after that handshake races a fast peer's Relay
+  // stores and can erase correctly published rows while leaving their arrival
+  // counters intact, manufacturing the exact failure this diagnostic is
+  // intended to detect.
+  if (!use_socket &&
+      std::getenv("MEGAMOE_BACKWARD_V3_CLEAR_CANONICAL_DY") != nullptr) {
+    const auto canonical_dy_elements =
+        checked_mul(view.sizes.incoming_row_count, config.hidden_size,
+                    "V3 canonical dY diagnostic elements");
     internal::throw_cuda(
         "backward-run",
-        cudaMemsetAsync(gin_barrier, 0, sizeof(std::uint64_t), exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "reset Backward GIN barrier");
-    gin_signal_reset_kernel<<<gin_backend->gin_context_count, 1, 0,
-                                 exec->stream>>>(
-        gin_backend->dev_comm, gin_backend->gin_context_count);
-    internal::throw_cuda(
-        "backward-run", cudaGetLastError(), id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "reset Backward GIN signal/counter");
-    internal::throw_nccl(
-        "backward-run",
-        ncclAllReduce(gin_barrier, gin_barrier, 1, ncclUint64, ncclSum,
-                      backend->nccl->comm, exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
-        "ncclAllReduce(Backward GIN reset agreement)");
-#endif
+        cudaMemsetAsync(
+            at<void>(slot.device, layout.backward_dy_canonical), 0,
+            checked_size(canonical_dy_elements * sizeof(transport::BFloat16),
+                         "V3 canonical dY diagnostic bytes"),
+            exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "clear V3 canonical dY before setup handshake");
   }
   if (!use_socket)
     initialize_forward_generation_signals_kernel<<<1, 256, 0, exec->stream>>>(
-      slot.device, at<void *>(slot.device, layout.peer_bases),
-      layout.ingress_published_sequence, layout.outgoing_route_sequence,
-      layout.p2p_barrier_receive, layout.gin_local_compute_ready,
-      layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
-      view.sizes.mtile_count, layout.forward_completion,
-      layout.backward_completion, layout.forward_context_completion,
-      layout.backward_context_completion,
-      static_cast<std::uint32_t>((state->config.max_nodes - 1U) * 8U),
-      id.generation,
-      id.calling_rank, id.world_size, state->config.channels, generation_epoch,
-      use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
-      use_gin ? gin_backend->local_world_size : id.world_size);
+        slot.device, at<void *>(slot.device, layout.peer_bases),
+        layout.ingress_published_sequence, layout.outgoing_route_sequence,
+        layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+        layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
+        view.sizes.mtile_count, view.sizes.incoming_row_count,
+        layout.forward_completion, layout.backward_completion,
+        layout.forward_context_completion, layout.backward_context_completion,
+        static_cast<std::uint32_t>((state->config.max_nodes - 1U) * 8U),
+        id.generation, id.calling_rank, id.world_size, state->config.channels,
+        generation_epoch,
+        use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
+        use_gin ? gin_backend->local_world_size : id.world_size);
   internal::throw_cuda(
       "backward-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "initialize Backward owner signals and peer setup epoch");
 
+  if (use_gin) {
+#if __has_include(<nccl_device.h>)
+    // This existing GIN rendezvous must follow owner initialization.  The
+    // CUDA-IPC setup epoch above only covers peers on this node; placing the
+    // cross-node agreement before it allowed a fast node to issue dY puts
+    // while a slow destination was still clearing its canonical payload and
+    // per-rail arrival counters.  Keeping the reset and AllReduce here gives
+    // every RDMA/Relay role a global post-initialization start edge without
+    // adding a second collective or any in-kernel grid synchronization.
+    auto *gin_barrier =
+        at<std::uint64_t>(slot.gin_window, state->gin_layout.barrier);
+    internal::throw_cuda(
+        "backward-run",
+        cudaMemsetAsync(gin_barrier, 0, sizeof(std::uint64_t), exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "reset Backward GIN barrier");
+    gin_signal_reset_kernel<<<gin_backend->gin_allocated_context_count, 1, 0,
+                              exec->stream>>>(
+        gin_backend->dev_comm, gin_backend->gin_allocated_context_count);
+    internal::throw_cuda("backward-run", cudaGetLastError(), id.calling_rank,
+                         id.world_size, backend->session.session().identity(),
+                         id.generation, ExchangeKind::ExpertCounts,
+                         "reset Backward GIN signal/counter");
+    internal::throw_nccl(
+        "backward-run",
+        ncclAllReduce(gin_barrier, gin_barrier, 1, ncclUint64, ncclSum,
+                      backend->nccl->comm, exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "ncclAllReduce(Backward post-init GIN reset agreement)");
+#endif
+  }
+
 #if MEGAMOE_DEVICE_TIMELINE
-  reset_timeline("backward-run", slot.backward_timeline,
-                 state->timeline_layout, state->timeline_max_ctas,
-                 exec->stream, id.calling_rank, id.world_size,
-                 id.generation, backend->session);
+  reset_timeline("backward-run", slot.backward_timeline, state->timeline_layout,
+                 state->timeline_max_ctas, exec->stream, id.calling_rank,
+                 id.world_size, id.generation, backend->session);
 #endif
 
   BackwardKernelArgs args{};
@@ -14923,11 +16629,10 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.hidden = config.hidden_size;
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = state->config.max_destination_rows_per_rank;
-  args.reduction_rows =
-      (state->config.max_destination_rows_per_rank +
-       static_cast<std::uint64_t>(state->config.max_owned_experts) * 63ULL +
-       63ULL) &
-      ~63ULL;
+  args.reduction_rows = persistent_v3::align_up<std::uint64_t>(
+      state->config.max_destination_rows_per_rank +
+          static_cast<std::uint64_t>(state->config.max_owned_experts) * 127ULL,
+      128U);
   args.rank = id.calling_rank;
   args.world = id.world_size;
   args.channels = state->config.channels;
@@ -14972,12 +16677,21 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     args.gin_receive_gate_offset = state->gin_layout.receive_gate;
     args.gin_send_payload_offset = state->gin_layout.send_payload;
     args.gin_receive_payload_offset = state->gin_layout.receive_payload;
+    args.gin_backward_dy_input_offset = state->gin_layout.backward_dy_input;
+    args.v3_direct_dy_input =
+        dy_lease.pointer ==
+        at<const transport::BFloat16>(slot.gin_window,
+                                      state->gin_layout.backward_dy_input);
+    args.v3_generic_dy_copy =
+        std::getenv("MEGAMOE_BACKWARD_V3_GENERIC_DY_COPY") != nullptr;
+    args.v3_wait_full_dy_dispatch =
+        std::getenv("MEGAMOE_BACKWARD_V3_WAIT_FULL_DY_DISPATCH") != nullptr;
+    args.v3_localize_dy =
+        std::getenv("MEGAMOE_BACKWARD_V3_LOCALIZE_DY") != nullptr;
     args.gin_return_staging_offset = state->gin_layout.return_staging;
     args.gin_return_receive_offset = state->gin_layout.return_receive;
-    args.gin_return_gate_staging_offset =
-        state->gin_layout.return_gate_staging;
-    args.gin_return_gate_receive_offset =
-        state->gin_layout.return_gate_receive;
+    args.gin_return_gate_staging_offset = state->gin_layout.return_gate_staging;
+    args.gin_return_gate_receive_offset = state->gin_layout.return_gate_receive;
     args.gin_production_error_records_offset =
         state->gin_layout.production_error_records;
     args.node = gin_backend->node;
@@ -15003,8 +16717,85 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   args.dab_transpose_offset = layout.backward_dab_transpose;
   args.dw1_offset = layout.backward_dw1;
   args.dw2_offset = layout.backward_dw2;
+  args.v3_sigmoid_lut_offset = layout.backward_sigmoid_lut;
   args.scheduler_offset = layout.backward_scheduler;
   args.dy_arrived_rows_offset = layout.backward_dy_arrived_rows;
+  args.v3_local_dy_offset = layout.backward_forward_output;
+  args.v3_control_offset = layout.backward_v3_control;
+  args.v3_activation_pair_mailboxes_offset =
+      layout.backward_v3_activation_pair_mailboxes;
+  args.v3_mblock_mapping_offset = layout.backward_v3_mblock_mapping;
+  args.v3_mblock_dv_cursor_offset = layout.backward_v3_mblock_dv_cursor;
+  args.v3_mblock_dv_complete_offset = layout.backward_v3_mblock_dv_complete;
+  args.v3_mblock_ready_offset = layout.backward_v3_mblock_ready;
+  args.v3_mblock_dx_cursor_offset = layout.backward_v3_mblock_dx_cursor;
+  args.v3_mblock_dx_complete_offset = layout.backward_v3_mblock_dx_complete;
+  args.v3_token_state_offset = layout.backward_v3_token_state;
+  args.v3_expert_padded_prefix_offset = layout.backward_v3_expert_padded_prefix;
+  args.v3_expert_dv_complete_offset = layout.backward_v3_expert_dv_complete;
+  args.v3_expert_dw1_cursor_offset = layout.backward_v3_expert_dw1_cursor;
+  args.v3_expert_dw2_cursor_offset = layout.backward_v3_expert_dw2_cursor;
+  args.forward_return_chunk_directory_offset =
+      layout.forward_return_chunk_directory;
+  args.forward_return_chunk_state_offset = layout.forward_return_chunk_state;
+  args.forward_return_chunk_ready_count_offset =
+      layout.forward_return_chunk_ready_count;
+  args.forward_return_fragment_index_offset =
+      layout.forward_return_fragment_index;
+  args.forward_return_source_compact_index_offset =
+      layout.forward_return_source_compact_index;
+  args.v3_return_route_compact_index_offset =
+      layout.forward_return_source_route_index;
+  args.forward_output_ready_epoch_offset = layout.forward_output_ready_epoch;
+  args.forward_scheduler_offset = layout.forward_scheduler;
+  if (const auto *chunk_rows =
+          std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS")) {
+    const auto parsed = std::stoull(chunk_rows);
+    if (parsed != 0ULL)
+      args.forward_return_chunk_rows = parsed;
+  }
+  if (const auto *group_rows =
+          std::getenv("MEGAMOE_BACKWARD_V3_RETURN_GROUP_ROWS")) {
+    const auto parsed = std::stoull(group_rows);
+    if (parsed < args.forward_return_chunk_rows || parsed > UINT16_MAX ||
+        parsed % args.forward_return_chunk_rows != 0ULL)
+      transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                      "MEGAMOE_BACKWARD_V3_RETURN_GROUP_ROWS", id.calling_rank,
+                      "a multiple of Forward chunk rows in [chunk_rows, 65535]",
+                      group_rows);
+    args.v3_return_group_rows = parsed;
+  }
+  if (const auto *weight_divisor =
+          std::getenv("MEGAMOE_BACKWARD_V3_WEIGHT_CTA_DIVISOR")) {
+    const auto parsed = std::stoull(weight_divisor);
+    if (parsed < 2ULL || parsed > 16ULL)
+      transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                      "MEGAMOE_BACKWARD_V3_WEIGHT_CTA_DIVISOR", id.calling_rank,
+                      "an integer in [2, 16]", weight_divisor);
+    args.v3_weight_cta_divisor = static_cast<std::uint32_t>(parsed);
+  }
+  if (const auto *dv_slots =
+          std::getenv("MEGAMOE_BACKWARD_V3_DV_PHASE_SLOTS")) {
+    const auto parsed = std::stoull(dv_slots);
+    if (parsed < 1ULL || parsed > 8ULL)
+      transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                      "MEGAMOE_BACKWARD_V3_DV_PHASE_SLOTS", id.calling_rank,
+                      "an integer in [1, 8]", dv_slots);
+    args.v3_dv_phase_slots = static_cast<std::uint32_t>(parsed);
+  }
+  if (const auto *dx_slots =
+          std::getenv("MEGAMOE_BACKWARD_V3_DX_PHASE_SLOTS")) {
+    const auto parsed = std::stoull(dx_slots);
+    if (parsed < 1ULL || parsed > 8ULL)
+      transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                      "MEGAMOE_BACKWARD_V3_DX_PHASE_SLOTS", id.calling_rank,
+                      "an integer in [1, 8]", dx_slots);
+    args.v3_dx_phase_slots = static_cast<std::uint32_t>(parsed);
+  }
+  args.v3_direct_return_staging =
+      std::getenv("MEGAMOE_BACKWARD_V3_DIRECT_RETURN_STAGING") != nullptr;
+  args.v3_direct_return_consume =
+      std::getenv("MEGAMOE_BACKWARD_V3_DIRECT_RETURN_CONSUME") != nullptr;
   args.dw_timeline_offset = layout.backward_dw_timeline;
   args.claim_offset = layout.forward_task_claim;
   args.incoming_signal_offset = layout.ingress_published_sequence;
@@ -15035,13 +16826,69 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
 #endif
   args.use_forward_cache =
       f.cache_mode == ForwardCacheMode::CacheFc1InputOutput;
-#if MEGAMOE_DEBUG_VALIDATE
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_BUILD_TESTING
   args.debug_dv_offset = layout.backward_forward_output;
   args.debug_coverage_offset = layout.packet_claim;
   args.capture_stage_storage =
       std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr;
 #endif
 
+  const bool production_v3_requested =
+      std::getenv("MEGAMOE_BACKWARD_PERSISTENT_V3") != nullptr;
+  if (production_v3_requested && (!main_shape || !use_gin))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                    "MEGAMOE_BACKWARD_PERSISTENT_V3", id.calling_rank,
+                    "GIN main shape 7168x3072", "unsupported backend/shape");
+  const bool production_v3_backward =
+      production_v3_requested && main_shape && use_gin;
+  const bool production_v3_elastic =
+      production_v3_backward &&
+      std::getenv("MEGAMOE_BACKWARD_V3_ELASTIC") != nullptr;
+  const bool production_v3_cluster_compute =
+      production_v3_elastic &&
+      std::getenv("MEGAMOE_BACKWARD_V3_CLUSTER_COMPUTE") != nullptr;
+  const bool production_v3_activation_multicast =
+      production_v3_cluster_compute &&
+      std::getenv("MEGAMOE_BACKWARD_V3_ACTIVATION_MULTICAST") != nullptr;
+  if (std::getenv("MEGAMOE_BACKWARD_V3_ACTIVATION_MULTICAST") != nullptr &&
+      !production_v3_cluster_compute)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                    "MEGAMOE_BACKWARD_V3_ACTIVATION_MULTICAST", id.calling_rank,
+                    "V3 elastic cluster compute",
+                    "cluster compute is disabled");
+  const bool split_dw1 = main_shape && use_gin && !production_v3_backward &&
+                         std::getenv("MEGAMOE_BACKWARD_SPLIT_DW1") != nullptr;
+  const bool diagnose_dw2 =
+      main_shape && std::getenv("MEGAMOE_BACKWARD_DIAG_DW2") != nullptr;
+  const bool diagnose_dw2_128 =
+      main_shape && std::getenv("MEGAMOE_BACKWARD_DIAG_DW2_128") != nullptr;
+  const bool diagnose_v3_dv_dw2_pipeline =
+      main_shape && use_gin && !production_v3_backward &&
+      std::getenv("MEGAMOE_BACKWARD_DIAG_V3_DV_DW2") != nullptr;
+  if (production_v3_backward &&
+      (std::getenv("MEGAMOE_BACKWARD_DIAG_V3_DV_DW2") != nullptr ||
+       std::getenv("MEGAMOE_BACKWARD_DIAG_V3_VERIFY_ORACLE") != nullptr))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                    "V3 mode", id.calling_rank,
+                    "production or legacy-replay diagnostic, not both",
+                    "conflicting environment controls");
+  const bool verify_v3_activation_oracle =
+      diagnose_v3_dv_dw2_pipeline &&
+      std::getenv("MEGAMOE_BACKWARD_DIAG_V3_VERIFY_ORACLE") != nullptr;
+  bool dw2_128_five_stages = false;
+  if (diagnose_dw2_128) {
+    if (const auto *stages = std::getenv("MEGAMOE_BACKWARD_DW2_128_STAGES")) {
+      if (std::strcmp(stages, "4") == 0) {
+        dw2_128_five_stages = false;
+      } else if (std::strcmp(stages, "5") == 0) {
+        dw2_128_five_stages = true;
+      } else {
+        transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                        "MEGAMOE_BACKWARD_DW2_128_STAGES", id.calling_rank,
+                        "4 or 5", stages);
+      }
+    }
+  }
   if (!main_shape) {
     cudaLaunchAttribute fallback_attribute{};
     fallback_attribute.id = cudaLaunchAttributeCooperative;
@@ -15054,103 +16901,995 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
     fallback_launch.numAttrs = 1;
     internal::throw_cuda(
         "backward-run", cudaEventRecord(slot.start, exec->stream),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "cudaEventRecord(Backward start)");
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaEventRecord(Backward start)");
     internal::throw_cuda(
         "backward-run",
-        cudaLaunchKernelEx(&fallback_launch,
-                           runtime_shape_backward_megakernel, args),
-        id.calling_rank, id.world_size,
-        backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts,
+        cudaLaunchKernelEx(&fallback_launch, runtime_shape_backward_megakernel,
+                           args),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
         "single persistent runtime-shape Backward launch");
   } else {
-  int sms = 0;
-  internal::throw_cuda(
-      "backward-run",
-      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
-                             static_cast<int>(exec->device)),
-      id.calling_rank, id.world_size, backend->session.session().identity(),
-      id.generation, ExchangeKind::ExpertCounts,
-      "cudaDeviceGetAttribute(SM count)");
-  const auto grid_blocks = static_cast<unsigned int>(sms & ~1);
-  const std::size_t smem =
-      (4U * 128U * 64U + 4U * 256U * 64U) *
-          sizeof(transport::BFloat16) +
-      8U * sizeof(std::uint64_t);
-  const bool remote_transport = use_gin || use_socket;
-  internal::throw_cuda(
-      "backward-run",
-      remote_transport
-          ? cudaFuncSetAttribute(local_p2p_backward_megakernel<false>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem))
-          : cudaFuncSetAttribute(local_p2p_backward_megakernel<true>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(smem)),
-      id.calling_rank, id.world_size, backend->session.session().identity(),
-      id.generation, ExchangeKind::ExpertCounts,
-      "cudaFuncSetAttribute(Backward dynamic smem)");
-  cudaLaunchAttribute attributes[2]{};
-  attributes[0].id = cudaLaunchAttributeCooperative;
-  attributes[0].val.cooperative = 1;
-  attributes[1].id = cudaLaunchAttributeClusterDimension;
-  attributes[1].val.clusterDim = {2U, 1U, 1U};
-  cudaLaunchConfig_t launch{};
-  launch.gridDim = dim3(grid_blocks, 1, 1);
-  launch.blockDim = dim3(384, 1, 1);
-  launch.dynamicSmemBytes = smem;
-  launch.stream = exec->stream;
-  launch.attrs = attributes;
-  launch.numAttrs = 2;
-  internal::throw_cuda(
-      "backward-run",
-      cudaEventRecord(slot.start, exec->stream), id.calling_rank,
-      id.world_size, backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(Backward start)");
-  const auto launch_backward = remote_transport
-      ? cudaLaunchKernelEx(
-            &launch, local_p2p_backward_megakernel<false>, args,
-            slot.forward_x_map, slot.backward_dy_map, slot.backward_dab_map,
-            f.weights.impl_->w1_map, f.weights.impl_->w2_transpose_map,
-            f.weights.impl_->w1_transpose_map, slot.backward_dy_mn_map,
-            slot.backward_x_mn_map, slot.backward_u_transpose_map,
-            slot.backward_dab_transpose_map, slot.backward_dw1_store_map)
-      : cudaLaunchKernelEx(
-            &launch, local_p2p_backward_megakernel<true>, args,
-            slot.forward_x_map, slot.backward_dy_map, slot.backward_dab_map,
-            f.weights.impl_->w1_map, f.weights.impl_->w2_transpose_map,
-            f.weights.impl_->w1_transpose_map, slot.backward_dy_mn_map,
-            slot.backward_x_mn_map, slot.backward_u_transpose_map,
-            slot.backward_dab_transpose_map, slot.backward_dw1_store_map);
-  internal::throw_cuda(
-      "backward-run", launch_backward,
-      id.calling_rank, id.world_size, backend->session.session().identity(),
-      id.generation, ExchangeKind::ExpertCounts,
-      "single persistent WGMMA/TMA Backward launch");
+    int sms = 0;
+    internal::throw_cuda(
+        "backward-run",
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                               static_cast<int>(exec->device)),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaDeviceGetAttribute(SM count)");
+    const auto grid_blocks = static_cast<unsigned int>(sms & ~1);
+    constexpr std::size_t kActivationSmem =
+        (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16) +
+        8U * sizeof(std::uint64_t);
+    constexpr std::size_t kIndependentWeightSmem =
+        (3U * 128U * 64U + 3U * 256U * 64U + 128U * 256U) *
+            sizeof(transport::BFloat16) +
+        6U * sizeof(std::uint64_t);
+    const std::size_t smem = production_v3_cluster_compute
+                                 ? kIndependentWeightSmem
+                                 : kActivationSmem;
+    const bool remote_transport = use_gin || use_socket;
+    if (!production_v3_backward)
+      internal::throw_cuda(
+          "backward-run",
+          remote_transport
+              ? (split_dw1 ? cudaFuncSetAttribute(
+                                 local_p2p_backward_megakernel<false, true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem))
+                           : cudaFuncSetAttribute(
+                                 local_p2p_backward_megakernel<false, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)))
+              : cudaFuncSetAttribute(
+                    local_p2p_backward_megakernel<true, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(Backward dynamic smem)");
+    cudaLaunchAttribute attributes[2]{};
+    attributes[0].id = cudaLaunchAttributeCooperative;
+    attributes[0].val.cooperative = 1;
+    attributes[1].id = cudaLaunchAttributeClusterDimension;
+    attributes[1].val.clusterDim = {2U, 1U, 1U};
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = dim3(grid_blocks, 1, 1);
+    launch.blockDim = dim3(384, 1, 1);
+    launch.dynamicSmemBytes = smem;
+    launch.stream = exec->stream;
+    launch.attrs = attributes;
+    launch.numAttrs = 2;
+    internal::throw_cuda(
+        "backward-run", cudaEventRecord(slot.start, exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaEventRecord(Backward start)");
+    if (!production_v3_backward) {
+      const auto launch_backward =
+          remote_transport
+              ? (split_dw1
+                     ? cudaLaunchKernelEx(
+                           &launch, local_p2p_backward_megakernel<false, true>,
+                           args, slot.forward_x_map, slot.backward_dy_map,
+                           slot.backward_dab_map, f.weights.impl_->w1_map,
+                           f.weights.impl_->w2_transpose_map,
+                           f.weights.impl_->w1_transpose_map,
+                           slot.backward_dy_mn_map, slot.backward_x_mn_map,
+                           slot.backward_u_transpose_map,
+                           slot.backward_dab_transpose_map,
+                           slot.backward_dw1_store_map)
+                     : cudaLaunchKernelEx(
+                           &launch, local_p2p_backward_megakernel<false, false>,
+                           args, slot.forward_x_map, slot.backward_dy_map,
+                           slot.backward_dab_map, f.weights.impl_->w1_map,
+                           f.weights.impl_->w2_transpose_map,
+                           f.weights.impl_->w1_transpose_map,
+                           slot.backward_dy_mn_map, slot.backward_x_mn_map,
+                           slot.backward_u_transpose_map,
+                           slot.backward_dab_transpose_map,
+                           slot.backward_dw1_store_map))
+              : cudaLaunchKernelEx(
+                    &launch, local_p2p_backward_megakernel<true, false>, args,
+                    slot.forward_x_map, slot.backward_dy_map,
+                    slot.backward_dab_map, f.weights.impl_->w1_map,
+                    f.weights.impl_->w2_transpose_map,
+                    f.weights.impl_->w1_transpose_map, slot.backward_dy_mn_map,
+                    slot.backward_x_mn_map, slot.backward_u_transpose_map,
+                    slot.backward_dab_transpose_map,
+                    slot.backward_dw1_store_map);
+      internal::throw_cuda("backward-run", launch_backward, id.calling_rank,
+                           id.world_size, backend->session.session().identity(),
+                           id.generation, ExchangeKind::ExpertCounts,
+                           "single persistent WGMMA/TMA Backward launch");
+    }
+    if (split_dw1) {
+      internal::throw_cuda(
+          "backward-run",
+          cudaFuncSetAttribute(backward_dw1_specialized_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(smem)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(role-isolated dW1 dynamic smem)");
+      cudaLaunchAttribute dw1_attribute{};
+      dw1_attribute.id = cudaLaunchAttributeCooperative;
+      dw1_attribute.val.cooperative = 1;
+      cudaLaunchConfig_t dw1_launch{};
+      dw1_launch.gridDim = dim3(grid_blocks, 1, 1);
+      dw1_launch.blockDim = dim3(384, 1, 1);
+      dw1_launch.dynamicSmemBytes = smem;
+      dw1_launch.stream = exec->stream;
+      dw1_launch.attrs = &dw1_attribute;
+      dw1_launch.numAttrs = 1;
+      internal::throw_cuda(
+          "backward-run",
+          cudaLaunchKernelEx(&dw1_launch, backward_dw1_specialized_kernel, args,
+                             slot.backward_x_mn_map,
+                             slot.backward_dab_transpose_map,
+                             slot.backward_dw1_store_map),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "role-isolated WGMMA/TMA dW1 launch");
+    }
+    if (diagnose_dw2) {
+      internal::throw_cuda(
+          "backward-run",
+          cudaFuncSetAttribute(backward_dw2_specialized_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(smem)),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaFuncSetAttribute(role-isolated dW2 dynamic smem)");
+      cudaLaunchAttribute dw2_attribute{};
+      dw2_attribute.id = cudaLaunchAttributeCooperative;
+      dw2_attribute.val.cooperative = 1;
+      cudaLaunchConfig_t dw2_launch{};
+      dw2_launch.gridDim = dim3(grid_blocks, 1, 1);
+      dw2_launch.blockDim = dim3(384, 1, 1);
+      dw2_launch.dynamicSmemBytes = smem;
+      dw2_launch.stream = exec->stream;
+      dw2_launch.attrs = &dw2_attribute;
+      dw2_launch.numAttrs = 1;
+      internal::throw_cuda(
+          "backward-run",
+          cudaLaunchKernelEx(&dw2_launch, backward_dw2_specialized_kernel, args,
+                             slot.backward_dy_mn_map,
+                             slot.backward_u_transpose_map),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "role-isolated WGMMA/TMA dW2 launch");
+    }
+    if (diagnose_dw2_128) {
+      const auto attribute_result =
+          dw2_128_five_stages ? cudaFuncSetAttribute(
+                                    backward_dw2_128x128_diagnostic_kernel<5U>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(smem))
+                              : cudaFuncSetAttribute(
+                                    backward_dw2_128x128_diagnostic_kernel<4U>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(smem));
+      internal::throw_cuda("backward-run", attribute_result, id.calling_rank,
+                           id.world_size, backend->session.session().identity(),
+                           id.generation, ExchangeKind::ExpertCounts,
+                           "cudaFuncSetAttribute(V3 128x128 dW2 dynamic smem)");
+      cudaLaunchAttribute dw2_attribute{};
+      dw2_attribute.id = cudaLaunchAttributeCooperative;
+      dw2_attribute.val.cooperative = 1;
+      cudaLaunchConfig_t dw2_launch{};
+      dw2_launch.gridDim = dim3(grid_blocks, 1, 1);
+      dw2_launch.blockDim = dim3(384, 1, 1);
+      dw2_launch.dynamicSmemBytes = smem;
+      dw2_launch.stream = exec->stream;
+      dw2_launch.attrs = &dw2_attribute;
+      dw2_launch.numAttrs = 1;
+      const auto launch_result =
+          dw2_128_five_stages
+              ? cudaLaunchKernelEx(&dw2_launch,
+                                   backward_dw2_128x128_diagnostic_kernel<5U>,
+                                   args, slot.backward_dy_mn_map,
+                                   slot.backward_u_transpose_map)
+              : cudaLaunchKernelEx(&dw2_launch,
+                                   backward_dw2_128x128_diagnostic_kernel<4U>,
+                                   args, slot.backward_dy_mn_map,
+                                   slot.backward_u_transpose_map);
+      internal::throw_cuda("backward-run", launch_result, id.calling_rank,
+                           id.world_size, backend->session.session().identity(),
+                           id.generation, ExchangeKind::ExpertCounts,
+                           "V3 diagnostic 128x128 WGMMA/TMA dW2 launch");
+    }
+    if (production_v3_backward || diagnose_v3_dv_dw2_pipeline) {
+      auto v3_dy_map = slot.backward_dy_map;
+      if (production_v3_backward && args.v3_localize_dy) {
+        v3_dy_map = make_bf16_tma_map(
+            at<void>(slot.device, layout.backward_forward_output),
+            config.hidden_size, state->config.max_destination_rows_per_rank,
+            128, "V3 localized canonical dY");
+        // backward_forward_output is the immutable local dY snapshot in this
+        // diagnostic.  Do not let direct dV capture overwrite its input while
+        // sibling N tiles for the same M-block are still running.
+        args.capture_stage_storage = false;
+      }
+#if MEGAMOE_BUILD_TESTING
+      const bool snapshot_v3_dy =
+          production_v3_backward &&
+          std::getenv("MEGAMOE_BACKWARD_V3_SNAPSHOT_DY") != nullptr;
+      if (snapshot_v3_dy)
+        v3_dy_map = make_bf16_tma_map(
+            at<void>(slot.device, layout.backward_forward_output),
+            config.hidden_size, state->config.max_destination_rows_per_rank,
+            128, "testing-only V3 canonical dY snapshot");
+      if (snapshot_v3_dy)
+        args.capture_stage_storage = false;
+#else
+      constexpr bool snapshot_v3_dy = false;
+#endif
+#if __has_include(<nccl_device.h>)
+      if (verify_v3_activation_oracle) {
+        // Temporary dV binary-split diagnostic.  The forward-cache path leaves
+        // recompute_ab unused, and it has exactly the same row*2I capacity as
+        // dAB.  Preserve the legacy dAB oracle before V3 overwrites that plane.
+        const auto dab_elements = checked_mul(view.sizes.incoming_row_count,
+                                              2ULL * config.intermediate_size,
+                                              "V3 dAB oracle elements");
+        internal::throw_cuda(
+            "backward-run",
+            cudaMemcpyAsync(
+                at<void>(slot.device, layout.backward_recompute_ab),
+                at<const void>(slot.device, layout.backward_dab),
+                checked_size(dab_elements * sizeof(transport::BFloat16),
+                             "V3 dAB oracle bytes"),
+                cudaMemcpyDeviceToDevice, exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "preserve legacy dAB for V3 oracle");
+        const auto dy_elements =
+            checked_mul(view.sizes.incoming_row_count, config.hidden_size,
+                        "V3 immutable dY elements");
+        internal::throw_cuda(
+            "backward-run",
+            cudaMemcpyAsync(
+                at<void>(slot.device, layout.backward_forward_output),
+                at<const void>(slot.device, layout.backward_dy_canonical),
+                checked_size(dy_elements * sizeof(transport::BFloat16),
+                             "V3 immutable dY bytes"),
+                cudaMemcpyDeviceToDevice, exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "preserve immutable dY for V3 oracle");
+        v3_dy_map = make_bf16_tma_map(
+            at<void>(slot.device, layout.backward_forward_output),
+            config.hidden_size, state->config.max_destination_rows_per_rank,
+            128, "V3 immutable canonical dY");
+      }
+      if (diagnose_v3_dv_dw2_pipeline) {
+        // A diagnostic replay follows the legacy kernel, so it must reset the
+        // dY readiness plane and GIN context counters.  The production V3 path
+        // is the first and only Backward kernel and consumes the reset already
+        // performed above; it never crosses this extra host/NCCL barrier.
+        internal::throw_cuda(
+            "backward-run",
+            cudaMemsetAsync(
+                at<void>(slot.device, layout.backward_dy_arrived_rows), 0,
+                checked_size(view.sizes.incoming_row_count *
+                                 sizeof(std::uint64_t),
+                             "V3 dY row-ready reset bytes"),
+                exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "reset V3 dY M-block arrivals");
+        auto *v3_gin_barrier =
+            at<std::uint64_t>(slot.gin_window, state->gin_layout.barrier);
+        internal::throw_cuda(
+            "backward-run",
+            cudaMemsetAsync(v3_gin_barrier, 0, sizeof(std::uint64_t),
+                            exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "reset V3 diagnostic GIN barrier");
+        gin_signal_reset_kernel<<<gin_backend->gin_allocated_context_count, 1,
+                                  0, exec->stream>>>(
+            gin_backend->dev_comm,
+            gin_backend->gin_allocated_context_count);
+        internal::throw_cuda("backward-run", cudaGetLastError(),
+                             id.calling_rank, id.world_size,
+                             backend->session.session().identity(),
+                             id.generation, ExchangeKind::ExpertCounts,
+                             "reset V3 diagnostic GIN signals/counters");
+        internal::throw_nccl(
+            "backward-run",
+            ncclAllReduce(v3_gin_barrier, v3_gin_barrier, 1, ncclUint64,
+                          ncclSum, backend->nccl->comm, exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "ncclAllReduce(V3 diagnostic GIN reset agreement)");
+      }
+#endif
+      auto probe_args = args;
+      if (verify_v3_activation_oracle) {
+        // backward_forward_output is dead after the legacy Backward oracle and
+        // has exactly one canonical row-hidden plane. The legacy scheduler is
+        // likewise dead and is large enough for one canonical float dGate row.
+        probe_args.dx_canonical_offset = layout.backward_forward_output;
+        probe_args.dgate_canonical_offset = layout.backward_scheduler;
+      }
+      if (production_v3_backward) {
+        constexpr unsigned int kTransportCtas =
+            persistent_v3::kRdmaCtaCount + persistent_v3::kDefaultRelayCtaCount;
+        if (grid_blocks <= kTransportCtas)
+          transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
+                          "V3 split role residency", id.calling_rank,
+                          "more SMs than fixed transport CTAs",
+                          std::to_string(grid_blocks));
+        const auto total_compute_ctas = grid_blocks - kTransportCtas;
+        const bool elastic_compute = production_v3_elastic;
+        const bool split_compute =
+            !elastic_compute &&
+            std::getenv("MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE") != nullptr;
+        const bool weight_cluster2 =
+            !elastic_compute && !split_compute &&
+            std::getenv("MEGAMOE_BACKWARD_V3_WEIGHT_CLUSTER2") != nullptr;
+        auto activation_ctas = split_compute ? std::min(64U, total_compute_ctas)
+                                             : total_compute_ctas;
+        if (const auto *configured =
+                std::getenv("MEGAMOE_BACKWARD_V3_ACTIVATION_CTAS")) {
+          if (!split_compute)
+            transport_error(
+                NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                "MEGAMOE_BACKWARD_V3_ACTIVATION_CTAS", id.calling_rank,
+                "MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE", "split compute disabled");
+          activation_ctas = static_cast<unsigned int>(std::stoul(configured));
+        }
+        if (activation_ctas == 0U || activation_ctas > total_compute_ctas ||
+            (split_compute && activation_ctas + 2U > total_compute_ctas))
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+              "MEGAMOE_BACKWARD_V3_ACTIVATION_CTAS", id.calling_rank,
+              split_compute ? "an integer in [1, total_compute_ctas - 2]"
+                            : "an integer in [1, total_compute_ctas]",
+              std::to_string(activation_ctas));
+        auto reduce_ctas = elastic_compute ? total_compute_ctas
+                           : split_compute ? std::min(8U, activation_ctas)
+                                           : 0U;
+        if (const auto *configured =
+                std::getenv("MEGAMOE_BACKWARD_V3_REDUCE_CTAS")) {
+          if (!split_compute)
+            transport_error(
+                NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                "MEGAMOE_BACKWARD_V3_REDUCE_CTAS", id.calling_rank,
+                "MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE", "split compute disabled");
+          reduce_ctas = static_cast<unsigned int>(std::stoul(configured));
+        }
+        if (split_compute &&
+            (reduce_ctas == 0U || reduce_ctas > activation_ctas))
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_REDUCE_CTAS", id.calling_rank,
+                          "an integer in [1, activation_ctas]",
+                          std::to_string(reduce_ctas));
+        auto dw1_ctas = elastic_compute ? 0U : total_compute_ctas;
+        auto dw2_ctas = elastic_compute ? 0U : total_compute_ctas;
+        if (split_compute) {
+          const auto weight_ctas = total_compute_ctas - activation_ctas;
+          dw1_ctas = (2U * weight_ctas + 1U) / 3U;
+          if (const auto *configured =
+                  std::getenv("MEGAMOE_BACKWARD_V3_DW1_CTAS"))
+            dw1_ctas = static_cast<unsigned int>(std::stoul(configured));
+          if (dw1_ctas == 0U || dw1_ctas >= weight_ctas)
+            transport_error(
+                NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                "MEGAMOE_BACKWARD_V3_DW1_CTAS", id.calling_rank,
+                "an integer in [1, total_compute_ctas - activation_ctas - 1]",
+                std::to_string(dw1_ctas));
+          dw2_ctas = weight_ctas - dw1_ctas;
+        } else if (std::getenv("MEGAMOE_BACKWARD_V3_DW1_CTAS") != nullptr) {
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_DW1_CTAS", id.calling_rank,
+                          "MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE",
+                          "split compute disabled");
+        }
+        // Split compute partitions every non-transport SM among three
+        // compile-isolated persistent grids.  The 2:1 dW1:dW2 split follows
+        // their work ratio.  Expert-local readiness lets both weight grids make
+        // progress while activation waits for remote dY, without oversubscribed
+        // grids, cross-role CTAs, or grid.sync().  Keep the phase-serial path
+        // as a correctness/performance control.
+        const auto launched_compute_ctas =
+            elastic_compute ? total_compute_ctas
+            : split_compute ? activation_ctas + dw2_ctas + dw1_ctas
+                            : 4U * total_compute_ctas;
+        if (production_v3_activation_multicast &&
+            total_compute_ctas / 2U >
+                persistent_v3::kBackwardActivationPairCapacity)
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+              "V3 activation cluster pairs", id.calling_rank,
+              "at most " + std::to_string(
+                               persistent_v3::kBackwardActivationPairCapacity),
+              std::to_string(total_compute_ctas / 2U));
+        // Cluster pairs must transition between activation and weight roles
+        // together.  Keep only a bounded, even number of CTAs on the
+        // communication-dependent Return/Reduce tail; the remaining pairs can
+        // fill that communication window with dW without competing with dV/dX.
+        auto cluster_reduce_ctas = std::min(24U, total_compute_ctas & ~1U);
+        if (const auto *configured =
+                std::getenv("MEGAMOE_BACKWARD_V3_CLUSTER_REDUCE_CTAS"))
+          cluster_reduce_ctas =
+              static_cast<unsigned int>(std::stoul(configured));
+        if (production_v3_cluster_compute &&
+            (cluster_reduce_ctas < 2U ||
+             cluster_reduce_ctas > total_compute_ctas ||
+             cluster_reduce_ctas % 2U != 0U))
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_CLUSTER_REDUCE_CTAS",
+                          id.calling_rank,
+                          "an even integer in [2, total_compute_ctas]",
+                          std::to_string(cluster_reduce_ctas));
+        // Keep 128x256 as the default control while allowing the
+        // compile-isolated 128x128 specialization to be timed with the
+        // identical role graph.
+        auto dw_tile_n = 256U;
+        if (const auto *configured =
+                std::getenv("MEGAMOE_BACKWARD_V3_DW_TILE_N"))
+          dw_tile_n = static_cast<unsigned int>(std::stoul(configured));
+        if (dw_tile_n != 128U && dw_tile_n != 256U)
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_DW_TILE_N", id.calling_rank,
+                          "128 or 256", std::to_string(dw_tile_n));
+        if (weight_cluster2 && dw_tile_n != 256U)
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_WEIGHT_CLUSTER2",
+                          id.calling_rank, "128x256 dW tiles",
+                          "dW tile N is " + std::to_string(dw_tile_n));
+        if (elastic_compute && dw_tile_n != 256U)
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-run",
+                          "MEGAMOE_BACKWARD_V3_DW_TILE_N", id.calling_rank,
+                          "256 for dynamic compute mode",
+                          std::to_string(dw_tile_n));
+        probe_args.v3_dw_tile_n = dw_tile_n;
+        internal::throw_cuda(
+            "backward-run",
+            cudaFuncSetAttribute(backward_v3_transport_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaFuncSetAttribute(V3 transport smem residency)");
+        if (elastic_compute) {
+          // These entry points intentionally have different parameter lists:
+          // the cluster path also receives its paired Reduce cohort size.
+          const auto dynamic_compute_attribute_status =
+              production_v3_cluster_compute
+                  ? (production_v3_activation_multicast
+                         ? cudaFuncSetAttribute(
+                               backward_v3_cluster_compute_kernel<true>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(smem))
+                         : cudaFuncSetAttribute(
+                               backward_v3_cluster_compute_kernel<false>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(smem)))
+                  : cudaFuncSetAttribute(
+                        backward_v3_dynamic_compute_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(smem));
+          internal::throw_cuda(
+              "backward-run", dynamic_compute_attribute_status, id.calling_rank,
+              id.world_size, backend->session.session().identity(),
+              id.generation, ExchangeKind::ExpertCounts,
+              production_v3_cluster_compute
+                  ? "cudaFuncSetAttribute(V3 cluster compute smem residency)"
+                  : "cudaFuncSetAttribute(V3 dynamic compute smem residency)");
+        } else {
+          internal::throw_cuda(
+              "backward-run",
+              cudaFuncSetAttribute(backward_v3_compute_kernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(smem)),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              "cudaFuncSetAttribute(V3 compute smem residency)");
+          const auto dw1_attribute_status =
+              dw_tile_n == 128U
+                  ? cudaFuncSetAttribute(
+                        backward_v3_dw1_compute_kernel<128U>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(smem))
+              : weight_cluster2
+                  ? cudaFuncSetAttribute(
+                        backward_v3_dw1_compute_kernel<256U, true, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(kIndependentWeightSmem))
+                  : cudaFuncSetAttribute(
+                        backward_v3_dw1_compute_kernel<256U, false, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(kIndependentWeightSmem));
+          internal::throw_cuda(
+              "backward-run", dw1_attribute_status, id.calling_rank,
+              id.world_size, backend->session.session().identity(),
+              id.generation, ExchangeKind::ExpertCounts,
+              "cudaFuncSetAttribute(V3 dW1 compute smem residency)");
+          const auto dw2_attribute_status =
+              dw_tile_n == 128U
+                  ? cudaFuncSetAttribute(
+                        backward_v3_dw2_compute_kernel<128U>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(smem))
+              : weight_cluster2
+                  ? cudaFuncSetAttribute(
+                        backward_v3_dw2_compute_kernel<256U, true, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(kIndependentWeightSmem))
+                  : cudaFuncSetAttribute(
+                        backward_v3_dw2_compute_kernel<256U, false, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(kIndependentWeightSmem));
+          internal::throw_cuda(
+              "backward-run", dw2_attribute_status, id.calling_rank,
+              id.world_size, backend->session.session().identity(),
+              id.generation, ExchangeKind::ExpertCounts,
+              "cudaFuncSetAttribute(V3 dW2 compute smem residency)");
+          internal::throw_cuda(
+              "backward-run",
+              cudaFuncSetAttribute(backward_v3_reduce_compute_kernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(smem)),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              "cudaFuncSetAttribute(V3 Reduce compute smem residency)");
+        }
+        internal::throw_cuda(
+            "backward-run",
+            cudaEventRecord(slot.forward_roles_ready, exec->stream),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaEventRecord(V3 Backward roles ready)");
+        internal::throw_cuda(
+            "backward-run",
+            cudaStreamWaitEvent(slot.forward_transport_stream,
+                                slot.forward_roles_ready),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaStreamWaitEvent(V3 Backward transport ready)");
+        internal::throw_cuda("backward-run",
+                             cudaStreamWaitEvent(slot.forward_compute_stream,
+                                                 slot.forward_roles_ready),
+                             id.calling_rank, id.world_size,
+                             backend->session.session().identity(),
+                             id.generation, ExchangeKind::ExpertCounts,
+                             "cudaStreamWaitEvent(V3 Backward compute ready)");
+        if (split_compute)
+          internal::throw_cuda(
+              "backward-run",
+              cudaStreamWaitEvent(slot.backward_dw2_stream,
+                                  slot.forward_roles_ready),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              "cudaStreamWaitEvent(V3 Backward weight compute ready)");
+        cudaLaunchConfig_t transport_launch{};
+        transport_launch.gridDim = dim3(kTransportCtas, 1, 1);
+        transport_launch.blockDim = dim3(384, 1, 1);
+        transport_launch.dynamicSmemBytes = smem;
+        transport_launch.stream = slot.forward_transport_stream;
+        internal::throw_cuda(
+            "backward-run",
+            cudaLaunchKernelEx(&transport_launch, backward_v3_transport_kernel,
+                               probe_args),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "persistent 8-RDMA/8-Relay Backward transport launch");
+        internal::throw_cuda("backward-run",
+                             cudaEventRecord(slot.forward_transport_done,
+                                             slot.forward_transport_stream),
+                             id.calling_rank, id.world_size,
+                             backend->session.session().identity(),
+                             id.generation, ExchangeKind::ExpertCounts,
+                             "cudaEventRecord(V3 Backward transport done)");
+
+        auto compute_args = probe_args;
+#if MEGAMOE_DEVICE_TIMELINE
+        compute_args.timeline.cta_base = kTransportCtas;
+#endif
+#if MEGAMOE_BUILD_TESTING
+        if (snapshot_v3_dy && view.sizes.mtile_count != 0ULL) {
+          backward_v3_snapshot_dy_kernel<<<
+              static_cast<unsigned int>(view.sizes.mtile_count), 256, 0,
+              slot.forward_compute_stream>>>(compute_args);
+          internal::throw_cuda("backward-run", cudaGetLastError(),
+                               id.calling_rank, id.world_size,
+                               backend->session.session().identity(),
+                               id.generation, ExchangeKind::ExpertCounts,
+                               "testing-only V3 canonical dY snapshot launch");
+        }
+#endif
+        cudaLaunchConfig_t compute_launch{};
+        compute_launch.gridDim = dim3(activation_ctas, 1, 1);
+        compute_launch.blockDim = dim3(384, 1, 1);
+        compute_launch.dynamicSmemBytes = smem;
+        compute_launch.stream = slot.forward_compute_stream;
+        cudaLaunchAttribute compute_cluster_attribute{};
+        if (production_v3_cluster_compute) {
+          compute_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+          compute_cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+          compute_launch.attrs = &compute_cluster_attribute;
+          compute_launch.numAttrs = 1U;
+        }
+        const auto compute_launch_status =
+            production_v3_cluster_compute
+                ? (production_v3_activation_multicast
+                       ? cudaLaunchKernelEx(
+                             &compute_launch,
+                             backward_v3_cluster_compute_kernel<true>,
+                             compute_args, v3_dy_map,
+                             f.weights.impl_->w2_transpose_map,
+                             slot.backward_dab_dx_map,
+                             f.weights.impl_->w1_transpose_map,
+                             slot.backward_x_mn_map,
+                             slot.backward_dab_transpose_map,
+                             slot.backward_dy_mn_map,
+                             slot.backward_u_transpose_map,
+                             slot.backward_dw1_store_map,
+                             slot.backward_dw2_store_map, cluster_reduce_ctas,
+                             launched_compute_ctas)
+                       : cudaLaunchKernelEx(
+                             &compute_launch,
+                             backward_v3_cluster_compute_kernel<false>,
+                             compute_args, v3_dy_map,
+                             f.weights.impl_->w2_transpose_map,
+                             slot.backward_dab_dx_map,
+                             f.weights.impl_->w1_transpose_map,
+                             slot.backward_x_mn_map,
+                             slot.backward_dab_transpose_map,
+                             slot.backward_dy_mn_map,
+                             slot.backward_u_transpose_map,
+                             slot.backward_dw1_store_map,
+                             slot.backward_dw2_store_map, cluster_reduce_ctas,
+                             launched_compute_ctas))
+            : elastic_compute
+                ? cudaLaunchKernelEx(
+                      &compute_launch, backward_v3_dynamic_compute_kernel,
+                      compute_args, v3_dy_map,
+                      f.weights.impl_->w2_transpose_map,
+                      slot.backward_dab_dx_map,
+                      f.weights.impl_->w1_transpose_map, slot.backward_x_mn_map,
+                      slot.backward_dab_transpose_map, slot.backward_dy_mn_map,
+                      slot.backward_u_transpose_map,
+                      slot.backward_dw1_store_map, slot.backward_dw2_store_map,
+                      launched_compute_ctas)
+                : cudaLaunchKernelEx(
+                      &compute_launch, backward_v3_compute_kernel, compute_args,
+                      v3_dy_map, f.weights.impl_->w2_transpose_map,
+                      slot.backward_dab_dx_map,
+                      f.weights.impl_->w1_transpose_map, slot.backward_x_mn_map,
+                      slot.backward_dab_transpose_map, slot.backward_dy_mn_map,
+                      slot.backward_u_transpose_map,
+                      slot.backward_dw1_store_map, slot.backward_dw2_store_map,
+                      reduce_ctas, launched_compute_ctas, split_compute);
+        internal::throw_cuda(
+            "backward-run", compute_launch_status, id.calling_rank,
+            id.world_size, backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            production_v3_cluster_compute
+                ? "persistent Backward cluster Compute launch"
+            : elastic_compute
+                ? "persistent Backward dynamic Compute launch"
+                : "persistent Backward activation Compute launch");
+        if (elastic_compute || split_compute)
+          internal::throw_cuda(
+              "backward-run",
+              cudaEventRecord(slot.forward_compute_done,
+                              slot.forward_compute_stream),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              split_compute
+                  ? "cudaEventRecord(V3 Backward split activation done)"
+                  : "cudaEventRecord(V3 Backward dynamic compute done)");
+
+        if (!elastic_compute) {
+          auto dw2_args = probe_args;
+#if MEGAMOE_DEVICE_TIMELINE
+          // The activation, dW2 and dW1 grids are stream-ordered in the
+          // production phase-serial path.  Reuse the compute CTA slices so all
+          // three phases fit in the physical 132-CTA timeline allocation; the
+          // per-CTA counters append records across consecutive kernels.
+          dw2_args.timeline.cta_base = kTransportCtas;
+#endif
+          cudaLaunchConfig_t dw2_launch{};
+          dw2_launch.gridDim = dim3(dw2_ctas, 1, 1);
+          dw2_launch.blockDim = dim3(384, 1, 1);
+          dw2_launch.dynamicSmemBytes =
+              dw_tile_n == 256U ? kIndependentWeightSmem : smem;
+          dw2_launch.stream = split_compute ? slot.backward_dw2_stream
+                                            : slot.forward_compute_stream;
+          cudaLaunchAttribute dw2_cluster_attribute{};
+          if (weight_cluster2) {
+            dw2_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+            dw2_cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+            dw2_launch.attrs = &dw2_cluster_attribute;
+            dw2_launch.numAttrs = 1U;
+          }
+          const auto dw2_launch_status =
+              dw_tile_n == 128U
+                  ? cudaLaunchKernelEx(
+                        &dw2_launch, backward_v3_dw2_compute_kernel<128U>,
+                        dw2_args, slot.backward_dy_mn_map,
+                        slot.backward_u_transpose_map,
+                        slot.backward_dw2_store_map, activation_ctas,
+                        launched_compute_ctas, false)
+              : weight_cluster2
+                  ? cudaLaunchKernelEx(
+                        &dw2_launch,
+                        backward_v3_dw2_compute_kernel<256U, true, true>,
+                        dw2_args, slot.backward_dy_mn_map,
+                        slot.backward_u_transpose_map,
+                        slot.backward_dw2_store_map, activation_ctas,
+                        launched_compute_ctas, false)
+                  : cudaLaunchKernelEx(
+                        &dw2_launch,
+                        backward_v3_dw2_compute_kernel<256U, false, true>,
+                        dw2_args, slot.backward_dy_mn_map,
+                        slot.backward_u_transpose_map,
+                        slot.backward_dw2_store_map, activation_ctas,
+                        launched_compute_ctas, false);
+          internal::throw_cuda(
+              "backward-run", dw2_launch_status, id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              split_compute ? "split-resident Backward dW2 launch"
+                            : "phase-serial full-SM Backward dW2 launch");
+
+          auto dw1_args = probe_args;
+#if MEGAMOE_DEVICE_TIMELINE
+          dw1_args.timeline.cta_base = kTransportCtas;
+#endif
+          cudaLaunchConfig_t dw1_launch{};
+          dw1_launch.gridDim = dim3(dw1_ctas, 1, 1);
+          dw1_launch.blockDim = dim3(384, 1, 1);
+          dw1_launch.dynamicSmemBytes =
+              dw_tile_n == 256U ? kIndependentWeightSmem : smem;
+          // In split mode dW1 and dW2 are independent fixed-residency grids.
+          // The caller stream is already ordered after forward_roles_ready and
+          // gives dW1 a third concurrent stream without another pool resource.
+          dw1_launch.stream =
+              split_compute ? exec->stream : slot.forward_compute_stream;
+          cudaLaunchAttribute dw1_cluster_attribute{};
+          if (weight_cluster2) {
+            dw1_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+            dw1_cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+            dw1_launch.attrs = &dw1_cluster_attribute;
+            dw1_launch.numAttrs = 1U;
+          }
+          const auto dw1_launch_status =
+              dw_tile_n == 128U
+                  ? cudaLaunchKernelEx(
+                        &dw1_launch, backward_v3_dw1_compute_kernel<128U>,
+                        dw1_args, slot.backward_dab_transpose_map,
+                        slot.backward_x_mn_map, slot.backward_dw1_store_map,
+                        activation_ctas + dw2_ctas, launched_compute_ctas,
+                        false)
+              : weight_cluster2
+                  ? cudaLaunchKernelEx(
+                        &dw1_launch,
+                        backward_v3_dw1_compute_kernel<256U, true, true>,
+                        dw1_args, slot.backward_dab_transpose_map,
+                        slot.backward_x_mn_map, slot.backward_dw1_store_map,
+                        activation_ctas + dw2_ctas, launched_compute_ctas,
+                        false)
+                  : cudaLaunchKernelEx(
+                        &dw1_launch,
+                        backward_v3_dw1_compute_kernel<256U, false, true>,
+                        dw1_args, slot.backward_dab_transpose_map,
+                        slot.backward_x_mn_map, slot.backward_dw1_store_map,
+                        activation_ctas + dw2_ctas, launched_compute_ctas,
+                        false);
+          internal::throw_cuda(
+              "backward-run", dw1_launch_status, id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              split_compute ? "split-resident Backward dW1 launch"
+                            : "phase-serial full-SM Backward dW1 launch");
+
+          if (split_compute) {
+            internal::throw_cuda(
+                "backward-run",
+                cudaEventRecord(slot.backward_dw2_done,
+                                slot.backward_dw2_stream),
+                id.calling_rank, id.world_size,
+                backend->session.session().identity(), id.generation,
+                ExchangeKind::ExpertCounts,
+                "cudaEventRecord(V3 Backward split weight compute done)");
+          } else {
+            auto reduce_args = probe_args;
+#if MEGAMOE_DEVICE_TIMELINE
+            // Reduce is stream-ordered after activation, dW2, and dW1.  Reuse
+            // the same logical compute CTA slices so its records append to the
+            // preceding phases without colliding with the 16 transport CTAs.
+            reduce_args.timeline.cta_base = kTransportCtas;
+#endif
+            cudaLaunchConfig_t reduce_launch{};
+            reduce_launch.gridDim = dim3(total_compute_ctas, 1, 1);
+            reduce_launch.blockDim = dim3(384, 1, 1);
+            reduce_launch.dynamicSmemBytes = smem;
+            reduce_launch.stream = slot.forward_compute_stream;
+            internal::throw_cuda(
+                "backward-run",
+                cudaLaunchKernelEx(&reduce_launch,
+                                   backward_v3_reduce_compute_kernel,
+                                   reduce_args, launched_compute_ctas),
+                id.calling_rank, id.world_size,
+                backend->session.session().identity(), id.generation,
+                ExchangeKind::ExpertCounts,
+                "phase-serial full-SM Backward Reduce launch");
+            internal::throw_cuda(
+                "backward-run",
+                cudaEventRecord(slot.forward_compute_done,
+                                slot.forward_compute_stream),
+                id.calling_rank, id.world_size,
+                backend->session.session().identity(), id.generation,
+                ExchangeKind::ExpertCounts,
+                "cudaEventRecord(V3 Backward phase-serial compute done)");
+          }
+        }
+        internal::throw_cuda(
+            "backward-run",
+            cudaStreamWaitEvent(exec->stream, slot.forward_transport_done),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaStreamWaitEvent(V3 Backward transport done)");
+        internal::throw_cuda(
+            "backward-run",
+            cudaStreamWaitEvent(exec->stream, slot.forward_compute_done),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaStreamWaitEvent(V3 Backward compute done)");
+        if (split_compute)
+          internal::throw_cuda(
+              "backward-run",
+              cudaStreamWaitEvent(exec->stream, slot.backward_dw2_done),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              "cudaStreamWaitEvent(V3 Backward weight compute done)");
+      } else {
+        internal::throw_cuda(
+            "backward-run",
+            cudaFuncSetAttribute(backward_v3_dv_dw2_pipeline_probe_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "cudaFuncSetAttribute(V3 dV/dW2 pipeline probe smem)");
+        cudaLaunchConfig_t probe_launch{};
+        probe_launch.gridDim = dim3(grid_blocks, 1, 1);
+        probe_launch.blockDim = dim3(384, 1, 1);
+        probe_launch.dynamicSmemBytes = smem;
+        probe_launch.stream = exec->stream;
+        internal::throw_cuda(
+            "backward-run",
+            cudaLaunchKernelEx(
+                &probe_launch, backward_v3_dv_dw2_pipeline_probe_kernel,
+                probe_args, v3_dy_map, f.weights.impl_->w2_transpose_map,
+                slot.backward_dab_dx_map, f.weights.impl_->w1_transpose_map,
+                slot.backward_x_mn_map, slot.backward_dab_transpose_map,
+                slot.backward_dy_mn_map, slot.backward_u_transpose_map,
+                slot.backward_dw1_store_map, slot.backward_dw2_store_map),
+            id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "V3 fixed-role dV/dW2 pipeline probe launch");
+      }
+      bool materialize_canonical_dab = verify_v3_activation_oracle;
+#if MEGAMOE_BUILD_TESTING
+      // The transpose tensor maps use the pool's maximum padded-row capacity as
+      // their physical leading dimension.  Hashing the first
+      // actual_padded_rows*features elements therefore includes unwritten holes
+      // and misses valid later features.  Materialize the valid strided plane
+      // into the contiguous canonical diagnostic buffer before stage hashing.
+      // This is testing-only and is never enqueued on the production path.
+      materialize_canonical_dab =
+          materialize_canonical_dab ||
+          (std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr &&
+           !args.capture_stage_storage);
+#endif
+      if (materialize_canonical_dab && view.sizes.incoming_row_count != 0ULL) {
+        const auto elements = checked_mul(
+            view.sizes.incoming_row_count, 2ULL * config.intermediate_size,
+            "V3 diagnostic canonical dAB elements");
+        const auto blocks = static_cast<unsigned int>(
+            std::min<std::uint64_t>(1024ULL, (elements + 255ULL) / 256ULL));
+        materialize_v3_canonical_dab_kernel<<<blocks, 256, 0, exec->stream>>>(
+            at<const transport::BFloat16>(slot.device,
+                                          layout.backward_dab_transpose),
+            at<transport::BFloat16>(slot.device, layout.backward_dab),
+            args.dispatch.expert_row_prefix,
+            at<const unsigned long long>(
+                slot.device, layout.backward_v3_expert_padded_prefix),
+            view.sizes.owned_expert_count, view.sizes.incoming_row_count,
+            config.intermediate_size, args.reduction_rows);
+        internal::throw_cuda("backward-run", cudaGetLastError(),
+                             id.calling_rank, id.world_size,
+                             backend->session.session().identity(),
+                             id.generation, ExchangeKind::ExpertCounts,
+                             "materialize diagnostic canonical V3 dAB");
+      }
+      if (verify_v3_activation_oracle) {
+        // Compare the V3 dV output directly. This temporary diagnostic keeps
+        // the task graph intact and distinguishes dAB corruption from a dX
+        // consumer error without relying on timing-sensitive downstream
+        // symptoms.
+        const auto dab_elements = checked_mul(view.sizes.incoming_row_count,
+                                              2ULL * config.intermediate_size,
+                                              "V3 dAB oracle elements");
+        const auto comparison_elements = dab_elements;
+        if (comparison_elements != 0ULL) {
+          const auto comparison_blocks =
+              static_cast<unsigned int>(std::min<std::uint64_t>(
+                  1024ULL, (comparison_elements + 255ULL) / 256ULL));
+          compare_v3_dab_oracle_kernel<<<comparison_blocks, 256, 0,
+                                         exec->stream>>>(
+              at<const transport::BFloat16>(slot.device, layout.backward_dab),
+              at<const transport::BFloat16>(slot.device,
+                                            layout.backward_dab_transpose),
+              at<const transport::BFloat16>(slot.device,
+                                            layout.backward_recompute_ab),
+              at<const transport::BFloat16>(slot.device,
+                                            layout.backward_dy_canonical),
+              f.weights.impl_->w2_transpose,
+              at<const transport::BFloat16>(slot.device,
+                                            layout.forward_ab_cache),
+              at<const float>(slot.device, layout.backward_canonical_gate),
+              args.dispatch.expert_row_prefix,
+              at<const unsigned long long>(
+                  slot.device, layout.backward_v3_expert_padded_prefix),
+              view.sizes.owned_expert_count, view.sizes.incoming_row_count,
+              config.hidden_size, config.intermediate_size,
+              args.max_destination_rows, args.reduction_rows,
+              at<BackwardDeviceStatus>(slot.device, layout.backward_status),
+              id.calling_rank);
+        }
+        internal::throw_cuda(
+            "backward-run", cudaGetLastError(), id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts,
+            "compare V3 canonical dX/dGate against legacy oracle");
+      }
+    }
   }
   const auto backward_launch_enqueued = std::chrono::steady_clock::now();
   if (use_socket) {
-    auto *send_headers = at<LocalP2pRouteHeader>(
-        slot.device, layout.socket_header_send);
-    auto *receive_headers = at<LocalP2pRouteHeader>(
-        slot.device, layout.socket_header_receive);
-    auto *send_payload = at<transport::BFloat16>(
-        slot.device, layout.contribution);
-    auto *receive_payload = at<transport::BFloat16>(
-        slot.device, layout.socket_payload_receive);
-    auto *return_gate_staging = at<float>(
-        slot.device, layout.backward_dgate_partial);
-    auto *return_gate_receive = at<float>(
-        slot.device, layout.backward_canonical_gate);
+    auto *send_headers =
+        at<LocalP2pRouteHeader>(slot.device, layout.socket_header_send);
+    auto *receive_headers =
+        at<LocalP2pRouteHeader>(slot.device, layout.socket_header_receive);
+    auto *send_payload =
+        at<transport::BFloat16>(slot.device, layout.contribution);
+    auto *receive_payload =
+        at<transport::BFloat16>(slot.device, layout.socket_payload_receive);
+    auto *return_gate_staging =
+        at<float>(slot.device, layout.backward_dgate_partial);
+    auto *return_gate_receive =
+        at<float>(slot.device, layout.backward_canonical_gate);
     if (socket_incoming != 0)
       socket_gather_backward_returns_kernel<<<
-          static_cast<unsigned int>(socket_incoming), 256, 0,
-          exec->stream>>>(
+          static_cast<unsigned int>(socket_incoming), 256, 0, exec->stream>>>(
           receive_headers,
           at<const transport::BFloat16>(slot.device,
-                                         layout.backward_dx_canonical),
+                                        layout.backward_dx_canonical),
           at<const float>(slot.device, layout.backward_dgate_canonical),
           receive_payload, return_gate_staging, socket_incoming,
           config.hidden_size);
@@ -15354,6 +18093,19 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
                  checked_mul(view.sizes.route_count, 2ULL,
                              "captured Backward dGate words"),
                  3U, "capture Backward dGate hash");
+    if (std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr) {
+      enqueue_hash(at<const transport::BFloat16>(slot.device,
+                                                 layout.backward_dx_canonical),
+                   checked_mul(view.sizes.incoming_row_count,
+                               config.hidden_size,
+                               "captured canonical dX elements"),
+                   4U, "capture canonical dX hash");
+      enqueue_hash(
+          at<const transport::BFloat16>(slot.device, layout.backward_dx_return),
+          checked_mul(view.sizes.route_count, config.hidden_size,
+                      "captured route dX elements"),
+          5U, "capture route dX hash");
+    }
   }
   static_assert(sizeof(BackwardDeviceStatus) <= sizeof(TransportDeviceStatus));
   internal::throw_cuda(
@@ -15435,18 +18187,43 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
                 << " dw1_done=" << progress(kBackwardDw1Complete)
                 << " reduced_tokens=" << progress(kBackwardReduceComplete)
                 << " terminal=" << progress(kBackwardTerminal);
-      for (std::uint32_t expert = 0;
-           expert < view.sizes.owned_expert_count; ++expert)
+      for (std::uint32_t expert = 0; expert < view.sizes.owned_expert_count;
+           ++expert)
         std::cerr << " expert[" << expert << "].rows="
                   << progress(kBackwardProgressExpertBase + expert * 8U);
+      for (std::uint32_t context = 0;
+           context < std::min<std::uint32_t>(8U, view.sizes.owned_expert_count);
+           ++context) {
+        const auto base = kBackwardProgressExpertBase + context * 8U;
+        const auto catalog = progress(base + 1U);
+        const auto pack = progress(base + 2U);
+        const auto compute = progress(base + 3U);
+        const auto rdma = progress(base + 7U);
+        const auto blocked_word = (pack >> 16U) & 0xffffULL;
+        std::cerr << " v3_context[" << context
+                  << "]={chunks=" << (catalog >> 32U)
+                  << ",groups=" << (catalog & 0xffffffffULL)
+                  << ",packed=" << (pack & 0xffffULL) << ",blocked_chunk="
+                  << (blocked_word == 0ULL ? ~0ULL : blocked_word - 1ULL)
+                  << ",blocked_ready=" << ((pack >> 32U) & 0xffULL)
+                  << ",blocked_expected=" << ((pack >> 40U) & 0xffULL)
+                  << ",blocked_state=" << ((pack >> 48U) & 0xffULL)
+                  << ",dx_complete=" << (compute >> 32U)
+                  << ",groups_issued=" << (compute & 0xffffffffULL)
+                  << ",relay_flags=" << progress(base + 4U)
+                  << ",rdma_issued=" << progress(base + 5U)
+                  << ",rdma_published=" << progress(base + 6U)
+                  << ",rdma_expected=" << (rdma >> 32U)
+                  << ",rdma_complete=" << ((rdma >> 16U) & 0xffffULL)
+                  << ",rdma_flags=" << (rdma & 0xffffULL) << '}';
+      }
 #if MEGAMOE_DEBUG_VALIDATE
       if (use_gin) {
         const auto debug_words = slot.generation_debug_words;
-        const auto backward_debug_base = backward_progress_words +
-                                         kForwardProgressWords + debug_words;
+        const auto backward_debug_base =
+            backward_progress_words + kForwardProgressWords + debug_words;
         dump_generation_completion(
-            std::cerr,
-            slot.host_backward_progress + backward_debug_base,
+            std::cerr, slot.host_backward_progress + backward_debug_base,
             slot.generation_debug_contexts, "backward_completion");
       }
 #endif
@@ -15599,8 +18376,9 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->hidden = config.hidden_size;
   result->intermediate = config.intermediate_size;
   result->used_forward_cache = args.use_forward_cache;
-#if MEGAMOE_DEBUG_VALIDATE
+#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_BUILD_TESTING
   result->stage_storage_captured = args.capture_stage_storage;
+  result->localized_dy_snapshot = args.v3_localize_dy;
 #endif
   result->padded_reduction_rows = status.padded_reduction_rows;
   result->hashes_captured = capture_hashes;
@@ -15611,25 +18389,37 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
                                          "captured dX hash elements");
     const auto dw1_elements = checked_mul(
         checked_mul(view.sizes.owned_expert_count,
-                    2ULL * config.intermediate_size,
-                    "captured dW1 hash rows"),
+                    2ULL * config.intermediate_size, "captured dW1 hash rows"),
         config.hidden_size, "captured dW1 hash elements");
-    const auto dw2_elements = checked_mul(
-        checked_mul(view.sizes.owned_expert_count, config.hidden_size,
-                    "captured dW2 hash rows"),
-        config.intermediate_size, "captured dW2 hash elements");
+    const auto dw2_elements =
+        checked_mul(checked_mul(view.sizes.owned_expert_count,
+                                config.hidden_size, "captured dW2 hash rows"),
+                    config.intermediate_size, "captured dW2 hash elements");
     result->hashes.dx = {captured[0].low, captured[0].high, dx_elements};
     result->hashes.dw1 = {captured[1].low, captured[1].high, dw1_elements};
     result->hashes.dw2 = {captured[2].low, captured[2].high, dw2_elements};
-    result->hashes.dgate = {
-        captured[3].low, captured[3].high,
-        checked_mul(view.sizes.route_count, 2ULL,
-                    "captured dGate hash BF16 words")};
+    result->hashes.dgate = {captured[3].low, captured[3].high,
+                            checked_mul(view.sizes.route_count, 2ULL,
+                                        "captured dGate hash BF16 words")};
+    if (std::getenv("MEGAMOE_BACKWARD_STAGE_HASHES") != nullptr)
+      std::cout << "BACKWARD_V3_DX_HASH rank=" << id.calling_rank
+                << " canonical_low=" << captured[4].low
+                << " canonical_high=" << captured[4].high
+                << " return_low=" << captured[5].low
+                << " return_high=" << captured[5].high
+                << " combined_low=" << captured[0].low
+                << " combined_high=" << captured[0].high << std::endl;
   }
   result->audit.specialization =
-      main_shape ? BackwardKernelSpecialization::Sm90WgmmaTma7168x3072
-                 : BackwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
-  result->audit.persistent_kernel_launches = 1;
+      main_shape
+          ? BackwardKernelSpecialization::Sm90WgmmaTma7168x3072
+          : BackwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
+  result->audit.persistent_kernel_launches =
+      (production_v3_backward ? (production_v3_elastic ? 2U : 5U) : 1U) +
+      static_cast<std::uint32_t>(split_dw1) +
+      static_cast<std::uint32_t>(diagnose_dw2) +
+      static_cast<std::uint32_t>(diagnose_dw2_128) +
+      static_cast<std::uint32_t>(diagnose_v3_dv_dw2_pipeline);
   result->audit.wgmma_instructions = status.wgmma_instructions;
   result->audit.tma_loads = status.tma_loads;
   result->audit.dv_tasks = status.dv_tasks;
@@ -15655,36 +18445,61 @@ DeviceBackwardHandle LocalCudaP2pBackwardMegaKernel::run(
   result->audit.dispatch_consumer_acquires = had_deferred_forward ? 1U : 0U;
   result->audit.dispatch_consumer_releases = had_deferred_forward ? 1U : 0U;
   result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
-  result->timings.terminal_status_agreement_us =
-      backward_agreement.elapsed_us;
+  result->timings.terminal_status_agreement_us = backward_agreement.elapsed_us;
+  result->timings.v3_local_delivery_complete_us =
+      elapsed(status.start_clock, status.v3_local_delivery_complete_clock);
+  result->timings.v3_outbound_pack_complete_us =
+      elapsed(status.start_clock, status.v3_outbound_pack_complete_clock);
+  result->timings.v3_rdma_complete_us =
+      elapsed(status.start_clock, status.v3_rdma_complete_clock);
+  result->timings.v3_inbound_relay_complete_us =
+      elapsed(status.start_clock, status.dy_dispatch_complete_clock);
+  result->timings.v3_dv_first_start_us =
+      status.dv_start_clock == ~0ULL
+          ? 0.0
+          : elapsed(status.start_clock, status.dv_start_clock);
+  result->timings.v3_dv_complete_us =
+      elapsed(status.start_clock, status.dv_complete_clock);
+  result->timings.v3_dw2_first_ready_us =
+      status.dw2_first_ready_clock == ~0ULL
+          ? 0.0
+          : elapsed(status.start_clock, status.dw2_first_ready_clock);
+  result->timings.v3_dw2_first_start_us =
+      status.dw2_first_start_clock == ~0ULL
+          ? 0.0
+          : elapsed(status.start_clock, status.dw2_first_start_clock);
+  result->timings.v3_dw2_last_complete_us =
+      elapsed(status.start_clock, status.dw2_last_complete_clock);
+  result->timings.v3_terminal_complete_us =
+      elapsed(status.start_clock, status.complete_clock);
   result->timings.dy_dispatch_us =
       elapsed(status.start_clock, status.dy_dispatch_complete_clock);
-  result->timings.dv_swiglu_backward_us = elapsed(
-      status.dy_dispatch_complete_clock, status.dv_complete_clock);
+  result->timings.dv_swiglu_backward_us =
+      elapsed(status.dy_dispatch_complete_clock, status.dv_complete_clock);
   result->timings.dgate_reduce_us =
       elapsed(status.dv_complete_clock, status.dgate_complete_clock);
   result->timings.transpose_us =
       elapsed(status.dgate_complete_clock, status.transpose_complete_clock);
-  result->timings.dx_us = elapsed(status.transpose_complete_clock,
-                                  status.dx_complete_clock);
-  result->timings.dw1_us = elapsed(status.dw1_first_start_clock,
-                                  status.dw1_last_complete_clock);
-  result->timings.dw2_us = elapsed(status.dw2_first_start_clock,
-                                  status.dw2_last_complete_clock);
-  result->timings.dw1_ready_to_start_us = elapsed(
-      status.dw1_first_ready_clock, status.dw1_first_start_clock);
-  result->timings.dw2_ready_to_start_us = elapsed(
-      status.dw2_first_ready_clock, status.dw2_first_start_clock);
+  result->timings.dx_us =
+      elapsed(status.transpose_complete_clock, status.dx_complete_clock);
+  result->timings.dw1_us =
+      elapsed(status.dw1_first_start_clock, status.dw1_last_complete_clock);
+  result->timings.dw2_us =
+      elapsed(status.dw2_first_start_clock, status.dw2_last_complete_clock);
+  result->timings.dw1_ready_to_start_us =
+      elapsed(status.dw1_first_ready_clock, status.dw1_first_start_clock);
+  result->timings.dw2_ready_to_start_us =
+      elapsed(status.dw2_first_ready_clock, status.dw2_first_start_clock);
   result->timings.dw1_max_expert_ready_to_start_us =
       static_cast<double>(status.dw1_max_ready_wait) / 1000.0;
   result->timings.dw2_max_expert_ready_to_start_us =
       static_cast<double>(status.dw2_max_ready_wait) / 1000.0;
-  result->timings.dw1_tail_us = elapsed(
-      max(status.dx_complete_clock, status.dw1_first_start_clock),
-      status.dw1_last_complete_clock);
-  result->timings.dw2_tail_us = elapsed(
-      max(status.dx_complete_clock, status.dw2_first_start_clock),
-      status.dw2_last_complete_clock);
+  result->timings.dw1_tail_us =
+      elapsed(max(status.dx_complete_clock, status.dw1_first_start_clock),
+              status.dw1_last_complete_clock);
+  result->timings.dw2_tail_us =
+      elapsed(max(status.dx_complete_clock, status.dw2_first_start_clock),
+              status.dw2_last_complete_clock);
   const auto overlap = [](std::uint64_t begin, std::uint64_t end,
                           std::uint64_t window_begin,
                           std::uint64_t window_end) {
@@ -16337,6 +19152,353 @@ testing::run_distributed_gin_put_signal_probe(
                       std::to_string(probe.received_hash));
     cleanup();
     return probe;
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+#endif
+}
+
+testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
+    const NcclSession &session, const CudaExecution &execution,
+    GinConnectionMode mode, std::uint32_t target_shift,
+    const std::vector<std::uint64_t> &payload_bytes, std::uint32_t warmup,
+    std::uint32_t measured, std::uint32_t throughput_puts_per_sample) {
+#if !__has_include(<nccl_device.h>)
+  (void)session;
+  (void)execution;
+  (void)mode;
+  (void)target_shift;
+  (void)payload_bytes;
+  (void)warmup;
+  (void)measured;
+  (void)throughput_puts_per_sample;
+  throw NotifyDispatchError(
+      NotifyErrorCode::BackendUnavailable,
+      "phase=gin-link-benchmark, field=headers, rank=0, "
+      "expected=nccl_device.h, actual=unavailable");
+#else
+  const auto nccl = internal::NcclSessionAccess::checked(session);
+  const auto exec = internal::checked_execution_state(execution);
+  if (nccl->device != exec->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "gin-link-benchmark", "device", nccl->rank,
+                    std::to_string(nccl->device),
+                    std::to_string(exec->device));
+  if (payload_bytes.empty() || measured == 0U ||
+      throughput_puts_per_sample == 0U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "gin-link-benchmark", "benchmark shape", nccl->rank,
+                    "non-empty payloads and positive samples/puts", "invalid");
+  const auto maximum_payload =
+      *std::max_element(payload_bytes.begin(), payload_bytes.end());
+  if (maximum_payload == 0ULL)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "gin-link-benchmark", "payload_bytes", nccl->rank,
+                    "positive", "0");
+  for (const auto bytes : payload_bytes)
+    if (bytes == 0ULL || bytes > maximum_payload)
+      transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                      "gin-link-benchmark", "payload_bytes", nccl->rank,
+                      "1..max_payload", std::to_string(bytes));
+
+  using QueryPropertiesFn = ncclResult_t (*)(ncclComm_t,
+                                              ncclCommProperties_t *);
+  using DevCommCreateFn = ncclResult_t (*)(
+      ncclComm_t, const ncclDevCommRequirements_t *, ncclDevComm_t *);
+  using DevCommDestroyFn = ncclResult_t (*)(ncclComm_t,
+                                             const ncclDevComm_t *);
+  using WindowRegisterFn = ncclResult_t (*)(ncclComm_t, void *, std::size_t,
+                                             ncclWindow_t *, int);
+  using WindowDeregisterFn = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+  using MemAllocFn = ncclResult_t (*)(void **, std::size_t);
+  using MemFreeFn = ncclResult_t (*)(void *);
+  using TeamFn = ncclTeam_t (*)(ncclComm_t);
+  const auto load = [](const char *name) {
+    auto *symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol == nullptr)
+      throw NotifyDispatchError(
+          NotifyErrorCode::BackendUnavailable,
+          std::string("phase=gin-link-benchmark, field=symbol, rank=0, "
+                      "expected=") +
+              name + ", actual=missing from loaded runtime");
+    return symbol;
+  };
+  const auto query_properties = reinterpret_cast<QueryPropertiesFn>(
+      load("ncclCommQueryProperties"));
+  const auto dev_comm_create = reinterpret_cast<DevCommCreateFn>(
+      load("ncclDevCommCreate"));
+  const auto dev_comm_destroy = reinterpret_cast<DevCommDestroyFn>(
+      load("ncclDevCommDestroy"));
+  const auto window_register = reinterpret_cast<WindowRegisterFn>(
+      load("ncclCommWindowRegister"));
+  const auto window_deregister = reinterpret_cast<WindowDeregisterFn>(
+      load("ncclCommWindowDeregister"));
+  const auto mem_alloc = reinterpret_cast<MemAllocFn>(load("ncclMemAlloc"));
+  const auto mem_free = reinterpret_cast<MemFreeFn>(load("ncclMemFree"));
+  const auto team_rail = reinterpret_cast<TeamFn>(load("ncclTeamRail"));
+  const auto team_lsa = reinterpret_cast<TeamFn>(load("ncclTeamLsa"));
+
+  ncclCommProperties_t properties{};
+  properties.size = sizeof(properties);
+  properties.magic = NCCL_API_MAGIC;
+  properties.version = NCCL_VERSION_CODE;
+  auto nccl_result = query_properties(nccl->comm, &properties);
+  if (nccl_result != ncclSuccess)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-link-benchmark, field=properties, rank=" +
+            std::to_string(nccl->rank) + ", actual=" +
+            ncclGetErrorString(nccl_result));
+  const auto selected_type =
+      mode == GinConnectionMode::Rail ? properties.railedGinType
+                                      : properties.ginType;
+  if (selected_type == NCCL_GIN_TYPE_NONE)
+    throw NotifyDispatchError(
+        NotifyErrorCode::BackendUnavailable,
+        "phase=gin-link-benchmark, field=" +
+            std::string(mode == GinConnectionMode::Rail ? "railedGinType"
+                                                        : "ginType") +
+            ", rank=" + std::to_string(nccl->rank) +
+            ", expected=available, actual=NCCL_GIN_TYPE_NONE");
+
+  const auto rail = team_rail(nccl->comm);
+  const auto lsa = team_lsa(nccl->comm);
+  if (rail.nRanks < 2 || lsa.nRanks <= 0 ||
+      nccl->world % static_cast<std::uint32_t>(lsa.nRanks) != 0U)
+    transport_error(NotifyErrorCode::BackendUnavailable,
+                    "gin-link-benchmark", "homogeneous topology", nccl->rank,
+                    "at least two nodes and positive LSA", "rail=" +
+                        std::to_string(rail.nRanks) + ",lsa=" +
+                        std::to_string(lsa.nRanks));
+  target_shift %= static_cast<std::uint32_t>(lsa.nRanks);
+  const auto destination_node = (rail.rank + 1) % rail.nRanks;
+  const auto destination_local =
+      (lsa.rank + static_cast<int>(target_shift)) % lsa.nRanks;
+  const auto destination =
+      mode == GinConnectionMode::Rail
+          ? destination_node
+          : destination_node * lsa.nRanks + destination_local;
+  const bool fanout_full = mode == GinConnectionMode::Full &&
+                           std::getenv("MEGAMOE_GIN_BENCH_FANOUT") != nullptr;
+
+  const auto align_4k = [](std::uint64_t value, const char *field) {
+    return checked_add(value, 4095ULL, field) / 4096ULL * 4096ULL;
+  };
+  const auto receive_offset = align_4k(maximum_payload, "GIN receive offset");
+  const auto barrier_offset = align_4k(
+      checked_add(receive_offset, maximum_payload,
+                  "GIN benchmark receive extent"),
+      "GIN benchmark barrier offset");
+  const auto allocation_bytes = checked_size(
+      checked_add(barrier_offset, 4096ULL, "GIN benchmark window bytes"),
+      "GIN benchmark window bytes");
+  const auto duration_bytes = checked_size(
+      checked_mul(measured, sizeof(unsigned long long),
+                  "GIN benchmark duration bytes"),
+      "GIN benchmark duration bytes");
+
+  ncclDevCommRequirements_t requirements =
+      NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  requirements.ginContextCount = 1;
+  requirements.ginExclusiveContexts = true;
+  requirements.ginQueueDepth = 64;
+  requirements.ginSignalCount = 1;
+  requirements.ginCounterCount = 1;
+  requirements.ginConnectionType =
+      mode == GinConnectionMode::Rail ? NCCL_GIN_CONNECTION_RAIL
+                                      : NCCL_GIN_CONNECTION_FULL;
+  ncclDevComm_t dev_comm{};
+  ncclWindow_t window = nullptr;
+  void *allocation = nullptr;
+  unsigned long long *device_duration = nullptr;
+  unsigned int *device_error = nullptr;
+  bool dev_comm_created = false;
+  const auto cleanup = [&]() noexcept {
+    if (device_error != nullptr)
+      (void)cudaFree(device_error);
+    if (device_duration != nullptr)
+      (void)cudaFree(device_duration);
+    if (window != nullptr)
+      (void)window_deregister(nccl->comm, window);
+    if (allocation != nullptr)
+      (void)mem_free(allocation);
+    if (dev_comm_created)
+      (void)dev_comm_destroy(nccl->comm, &dev_comm);
+  };
+
+  try {
+    internal::throw_nccl(
+        "gin-link-benchmark",
+        dev_comm_create(nccl->comm, &requirements, &dev_comm), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        mode == GinConnectionMode::Rail ? "ncclDevCommCreate(RAIL)"
+                                        : "ncclDevCommCreate(FULL)");
+    dev_comm_created = true;
+    internal::throw_nccl(
+        "gin-link-benchmark", mem_alloc(&allocation, allocation_bytes),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclMemAlloc(GIN link benchmark)");
+    internal::throw_cuda(
+        "gin-link-benchmark", cudaMalloc(&device_duration, duration_bytes),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMalloc(GIN duration samples)");
+    internal::throw_cuda(
+        "gin-link-benchmark", cudaMalloc(&device_error, sizeof(*device_error)),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMalloc(GIN device error)");
+    internal::throw_cuda(
+        "gin-link-benchmark",
+        cudaMemsetAsync(allocation, 0, allocation_bytes, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemsetAsync(GIN benchmark window)");
+    std::vector<std::uint8_t> send(
+        checked_size(maximum_payload, "GIN benchmark source"));
+    for (std::size_t index = 0; index < send.size(); ++index)
+      send[index] = static_cast<std::uint8_t>(
+          ((fanout_full ? 0ULL : static_cast<std::uint64_t>(nccl->rank)) *
+               17ULL +
+           static_cast<std::uint64_t>(index) * 13ULL) %
+          251ULL);
+    internal::throw_cuda(
+        "gin-link-benchmark",
+        cudaMemcpyAsync(allocation, send.data(), send.size(),
+                        cudaMemcpyHostToDevice, exec->stream),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemcpyAsync(GIN benchmark source)");
+    internal::throw_cuda(
+        "gin-link-benchmark", cudaStreamSynchronize(exec->stream), nccl->rank,
+        nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaStreamSynchronize(before GIN benchmark registration)");
+    internal::throw_nccl(
+        "gin-link-benchmark",
+        window_register(nccl->comm, allocation, allocation_bytes, &window,
+                        NCCL_WIN_STRICT_ORDERING),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "ncclCommWindowRegister(GIN link benchmark)");
+
+    GinLinkBenchmarkResult benchmark;
+    benchmark.mode = mode;
+    benchmark.target_shift = target_shift;
+    benchmark.rank = nccl->rank;
+    benchmark.world = nccl->world;
+    benchmark.local_rank = static_cast<std::uint32_t>(lsa.rank);
+    benchmark.local_world = static_cast<std::uint32_t>(lsa.nRanks);
+    benchmark.gin_type = static_cast<std::uint32_t>(properties.ginType);
+    benchmark.railed_gin_type =
+        static_cast<std::uint32_t>(properties.railedGinType);
+
+    std::vector<std::uint32_t> batches{1U};
+    if (throughput_puts_per_sample != 1U)
+      batches.push_back(throughput_puts_per_sample);
+    auto *barrier = reinterpret_cast<std::uint64_t *>(
+        static_cast<std::byte *>(allocation) + barrier_offset);
+    for (const auto bytes : payload_bytes) {
+      for (const auto puts : batches) {
+        gin_probe_reset_kernel<<<1, 1, 0, exec->stream>>>(dev_comm);
+        internal::throw_cuda(
+            "gin-link-benchmark",
+            cudaMemsetAsync(device_error, 0, sizeof(*device_error),
+                            exec->stream),
+            nccl->rank, nccl->world, session.session().identity(),
+            session.session().generation(), ExchangeKind::ExpertCounts,
+            "cudaMemsetAsync(GIN benchmark error)");
+        internal::throw_nccl(
+            "gin-link-benchmark",
+            ncclAllReduce(barrier, barrier, 1, ncclUint64, ncclSum,
+                          nccl->comm, exec->stream),
+            nccl->rank, nccl->world, session.session().identity(),
+            session.session().generation(), ExchangeKind::ExpertCounts,
+            "ncclAllReduce(after GIN benchmark reset)");
+        gin_link_benchmark_kernel<<<1, 1, 0, exec->stream>>>(
+            dev_comm, window, mode == GinConnectionMode::Full, fanout_full,
+            destination, lsa.nRanks,
+            checked_size(bytes, "GIN benchmark payload"),
+            checked_size(receive_offset, "GIN benchmark receive offset"),
+            warmup, measured, puts, device_duration, device_error);
+        internal::throw_cuda(
+            "gin-link-benchmark", cudaGetLastError(), nccl->rank, nccl->world,
+            session.session().identity(), session.session().generation(),
+            ExchangeKind::ExpertCounts, "GIN benchmark kernel launch");
+        internal::throw_cuda(
+            "gin-link-benchmark", cudaStreamSynchronize(exec->stream),
+            nccl->rank, nccl->world, session.session().identity(),
+            session.session().generation(), ExchangeKind::ExpertCounts,
+            "cudaStreamSynchronize(GIN link benchmark)");
+        unsigned int host_error = 0U;
+        internal::throw_cuda(
+            "gin-link-benchmark",
+            cudaMemcpy(&host_error, device_error, sizeof(host_error),
+                       cudaMemcpyDeviceToHost),
+            nccl->rank, nccl->world, session.session().identity(),
+            session.session().generation(), ExchangeKind::ExpertCounts,
+            "cudaMemcpy(GIN benchmark error)");
+        if (host_error != 0U)
+          transport_error(NotifyErrorCode::NcclFailure,
+                          "gin-link-benchmark", "device_error", nccl->rank,
+                          "0", std::to_string(host_error));
+        GinLinkBenchmarkCaseResult sample;
+        sample.payload_bytes = bytes;
+        sample.puts_per_sample = puts;
+        sample.duration_ns.resize(measured);
+        internal::throw_cuda(
+            "gin-link-benchmark",
+            cudaMemcpy(sample.duration_ns.data(), device_duration,
+                       duration_bytes, cudaMemcpyDeviceToHost),
+            nccl->rank, nccl->world, session.session().identity(),
+            session.session().generation(), ExchangeKind::ExpertCounts,
+            "cudaMemcpy(GIN benchmark durations)");
+        benchmark.cases.push_back(std::move(sample));
+      }
+    }
+
+    std::vector<std::uint8_t> received(send.size());
+    internal::throw_cuda(
+        "gin-link-benchmark",
+        cudaMemcpy(received.data(),
+                   static_cast<std::byte *>(allocation) + receive_offset,
+                   received.size(), cudaMemcpyDeviceToHost),
+        nccl->rank, nccl->world, session.session().identity(),
+        session.session().generation(), ExchangeKind::ExpertCounts,
+        "cudaMemcpy(GIN benchmark received payload)");
+    const auto source_node =
+        (rail.rank + rail.nRanks - 1) % rail.nRanks;
+    const auto source_local =
+        mode == GinConnectionMode::Rail
+            ? lsa.rank
+            : (lsa.rank + lsa.nRanks - static_cast<int>(target_shift)) %
+                  lsa.nRanks;
+    const auto source_rank = source_node * lsa.nRanks + source_local;
+    std::vector<std::uint8_t> expected(received.size());
+    for (std::size_t index = 0; index < expected.size(); ++index)
+      expected[index] = static_cast<std::uint8_t>(
+          ((fanout_full ? 0ULL : static_cast<std::uint64_t>(source_rank)) *
+               17ULL +
+           static_cast<std::uint64_t>(index) * 13ULL) %
+          251ULL);
+    const auto hash = [](const std::vector<std::uint8_t> &bytes) {
+      std::uint64_t value = 1469598103934665603ULL;
+      for (const auto byte : bytes)
+        value = (value ^ byte) * 1099511628211ULL;
+      return value;
+    };
+    benchmark.received_hash = hash(received);
+    benchmark.expected_hash = hash(expected);
+    if (received != expected)
+      transport_error(NotifyErrorCode::NcclFailure,
+                      "gin-link-benchmark", "received payload hash",
+                      nccl->rank, std::to_string(benchmark.expected_hash),
+                      std::to_string(benchmark.received_hash));
+    cleanup();
+    return benchmark;
   } catch (...) {
     cleanup();
     throw;
@@ -17075,9 +20237,10 @@ bool run_world1_forward_backward_sanitizer_harness(
         layout.ingress_published_sequence, layout.outgoing_route_sequence,
         layout.p2p_barrier_receive, layout.gin_local_compute_ready,
         layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
-        view.sizes.mtile_count, layout.forward_completion,
-        layout.backward_completion, layout.forward_context_completion,
-        layout.backward_context_completion, 0, 1, 0, 1, 1, 1, 0, 1);
+        view.sizes.mtile_count, view.sizes.incoming_row_count,
+        layout.forward_completion, layout.backward_completion,
+        layout.forward_context_completion, layout.backward_context_completion,
+        0, 1, 0, 1, 1, 1, 0, 1);
     ForwardKernelArgs args{};
     args.dispatch = view;
     args.input = input;
@@ -17106,13 +20269,20 @@ bool run_world1_forward_backward_sanitizer_harness(
     args.forward_ab_cache_offset = layout.forward_ab_cache;
     args.forward_task_claim_offset = layout.forward_task_claim;
     args.forward_fc1_done_offset = layout.forward_fc1_done;
+    args.forward_fc1_published_offset = layout.forward_fc1_published;
+    args.forward_reduce_route_count_offset =
+        layout.forward_reduce_route_count;
+    args.forward_reduce_ready_token_offset =
+        layout.forward_reduce_ready_token;
     args.forward_scheduler_offset = layout.forward_scheduler;
+    args.forward_v3_control_offset = layout.forward_v3_control;
     args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
     args.terminal_epoch_offset = layout.p2p_barrier_receive;
     args.production_error_records_offset = layout.production_error_records;
     args.cancel_epoch =
         reinterpret_cast<const unsigned long long *>(cancel_epoch);
     args.cache_fc1 = true;
+    args.forward_dynamic_reduce_scan = true;
     const bool main_shape = hidden == 7168 && intermediate == 3072;
     CUtensorMap x_map{};
     CUtensorMap s_map{};
@@ -17132,7 +20302,7 @@ bool run_world1_forward_backward_sanitizer_harness(
     }
     const std::size_t smem =
         (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(*input) +
-        8U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
+        16U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
     internal::throw_cuda(
         "forward-sanitizer",
         cudaFuncSetAttribute(local_p2p_forward_megakernel<true>,
@@ -17195,9 +20365,10 @@ bool run_world1_forward_backward_sanitizer_harness(
           layout.ingress_published_sequence, layout.outgoing_route_sequence,
           layout.p2p_barrier_receive, layout.gin_local_compute_ready,
           layout.forward_x_arrived_rows, layout.backward_dy_arrived_rows,
-          view.sizes.mtile_count, layout.forward_completion,
-          layout.backward_completion, layout.forward_context_completion,
-          layout.backward_context_completion, 0, 2, 0, 1, 1, 2, 0, 1);
+          view.sizes.mtile_count, view.sizes.incoming_row_count,
+          layout.forward_completion, layout.backward_completion,
+          layout.forward_context_completion, layout.backward_context_completion,
+          0, 2, 0, 1, 1, 2, 0, 1);
       BackwardKernelArgs backward{};
       backward.dispatch = view;
       backward.dy_input = dy_input;
@@ -17207,7 +20378,7 @@ bool run_world1_forward_backward_sanitizer_harness(
       backward.hidden = hidden;
       backward.intermediate = intermediate;
       backward.max_destination_rows = 1;
-      backward.reduction_rows = 64;
+      backward.reduction_rows = 128;
       backward.rank = 0;
       backward.world = 1;
       backward.channels = 1;
@@ -17303,38 +20474,89 @@ bool run_world1_forward_backward_sanitizer_harness(
       internal::throw_cuda(
           "backward-sanitizer",
           main_shape
-              ? cudaLaunchKernelEx(
-                    &launch, local_p2p_backward_megakernel<true>, backward, x_map,
-                    dy_map, dab_map, w1_map, w2_transpose_map,
-                    w1_transpose_map, canonical_dy_mn_map,
-                    canonical_x_mn_map, u_mn_map, dab_mn_map, dw1_store_map)
-              : cudaLaunchKernelEx(&launch,
-                                   runtime_shape_backward_megakernel,
+              ? cudaLaunchKernelEx(&launch, local_p2p_backward_megakernel<true>,
+                                   backward, x_map, dy_map, dab_map, w1_map,
+                                   w2_transpose_map, w1_transpose_map,
+                                   canonical_dy_mn_map, canonical_x_mn_map,
+                                   u_mn_map, dab_mn_map, dw1_store_map)
+              : cudaLaunchKernelEx(&launch, runtime_shape_backward_megakernel,
                                    backward),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "production Backward persistent kernel");
+      const bool profile_dw2_256 =
+          std::getenv("MEGAMOE_BACKWARD_DIAG_DW2") != nullptr;
+      const bool profile_dw2_128 =
+          std::getenv("MEGAMOE_BACKWARD_DIAG_DW2_128") != nullptr;
+      if (main_shape && (profile_dw2_256 || profile_dw2_128)) {
+        int sms = 0;
+        internal::throw_cuda(
+            "backward-sanitizer",
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0), 0,
+            1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
+            "query SM count for isolated dW2");
+        cudaLaunchAttribute dw2_attribute{};
+        dw2_attribute.id = cudaLaunchAttributeCooperative;
+        dw2_attribute.val.cooperative = 1;
+        cudaLaunchConfig_t dw2_launch{};
+        dw2_launch.gridDim = dim3(static_cast<unsigned int>(sms), 1, 1);
+        dw2_launch.blockDim = dim3(384, 1, 1);
+        dw2_launch.dynamicSmemBytes = backward_smem;
+        dw2_launch.stream = stream;
+        dw2_launch.attrs = &dw2_attribute;
+        dw2_launch.numAttrs = 1;
+        if (profile_dw2_256) {
+          internal::throw_cuda(
+              "backward-sanitizer",
+              cudaFuncSetAttribute(backward_dw2_specialized_kernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(backward_smem)),
+              0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
+              "set isolated 128x256 dW2 dynamic shared memory");
+          internal::throw_cuda(
+              "backward-sanitizer",
+              cudaLaunchKernelEx(&dw2_launch, backward_dw2_specialized_kernel,
+                                 backward, canonical_dy_mn_map, u_mn_map),
+              0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
+              "isolated 128x256 dW2 profile launch");
+        }
+        if (profile_dw2_128) {
+          internal::throw_cuda(
+              "backward-sanitizer",
+              cudaFuncSetAttribute(backward_dw2_128x128_diagnostic_kernel<4U>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(backward_smem)),
+              0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
+              "set isolated 128x128 dW2 dynamic shared memory");
+          internal::throw_cuda(
+              "backward-sanitizer",
+              cudaLaunchKernelEx(&dw2_launch,
+                                 backward_dw2_128x128_diagnostic_kernel<4U>,
+                                 backward, canonical_dy_mn_map, u_mn_map),
+              0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
+              "isolated 128x128 dW2 profile launch");
+        }
+      }
       BackwardDeviceStatus backward_status{};
       internal::throw_cuda(
           "backward-sanitizer",
-          cudaMemcpyAsync(&backward_status,
-                          at<void>(arena, layout.backward_status),
-                          sizeof(backward_status), cudaMemcpyDeviceToHost,
-                          stream),
+          cudaMemcpyAsync(
+              &backward_status, at<void>(arena, layout.backward_status),
+              sizeof(backward_status), cudaMemcpyDeviceToHost, stream),
           0, 1, "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
           "download Backward status");
-      internal::throw_cuda(
-          "backward-sanitizer", cudaStreamSynchronize(stream), 0, 1,
-          "world1-no-nccl", 1, ExchangeKind::ExpertCounts,
-          "wait production Backward kernel");
-      passed = backward_status.error == 0U &&
-               (main_shape
-                    ? (backward_status.wgmma_instructions != 0ULL &&
-                       backward_status.tma_loads != 0ULL)
-                    : (backward_status.dv_tasks == intermediate &&
-                       backward_status.dx_tasks == hidden &&
-                       backward_status.dw1_tasks ==
-                           2ULL * intermediate * hidden &&
-                       backward_status.dw2_tasks == hidden * intermediate));
+      internal::throw_cuda("backward-sanitizer", cudaStreamSynchronize(stream),
+                           0, 1, "world1-no-nccl", 1,
+                           ExchangeKind::ExpertCounts,
+                           "wait production Backward kernel");
+      passed =
+          backward_status.error == 0U &&
+          (main_shape
+               ? (backward_status.wgmma_instructions != 0ULL &&
+                  backward_status.tma_loads != 0ULL)
+               : (backward_status.dv_tasks == intermediate &&
+                  backward_status.dx_tasks == hidden &&
+                  backward_status.dw1_tasks == 2ULL * intermediate * hidden &&
+                  backward_status.dw2_tasks == hidden * intermediate));
       if (!main_shape && passed) {
         std::vector<transport::BFloat16> actual_forward(hidden);
         std::vector<transport::BFloat16> actual_dx(hidden);
@@ -17470,6 +20692,524 @@ bool testing::run_forward_world1_sanitizer_harness() {
 
 bool testing::run_backward_world1_sanitizer_harness() {
   return run_world1_forward_backward_sanitizer_harness(true);
+}
+
+testing::BackwardActivationCoreProfile testing::profile_backward_v3_dv_core(
+    std::uint32_t warmup, std::uint32_t measured, std::uint32_t tasks_per_cta) {
+  if (measured == 0U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "dv-core-profile",
+                    "measured", 0, "> 0", "0");
+  if (tasks_per_cta == 0U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "dv-core-profile",
+                    "tasks_per_cta", 0, "> 0", "0");
+
+  constexpr std::uint64_t kHidden = 7168ULL;
+  constexpr std::uint64_t kIntermediate = 3072ULL;
+  constexpr std::uint64_t kRows = 128ULL;
+  constexpr std::uint64_t kTileRows = 128ULL;
+  constexpr std::uint64_t kTileColumns = 256ULL;
+  constexpr std::uint32_t kStages = 4U;
+  constexpr std::size_t kSmem =
+      3U * kStages * 128U * 64U * sizeof(transport::BFloat16) +
+      2U * kStages * sizeof(std::uint64_t);
+  constexpr std::uint16_t kOne = 0x3f80U;
+  constexpr std::uint16_t kExpected = 0x45e0U; // BF16(7168.0f)
+
+  transport::BFloat16 *dy = nullptr;
+  transport::BFloat16 *w2_transpose = nullptr;
+  transport::BFloat16 *output = nullptr;
+  unsigned long long *mismatches = nullptr;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  testing::BackwardActivationCoreProfile result{};
+
+  const auto check = [](cudaError_t status, const char *field) {
+    internal::throw_cuda("dv-core-profile", status, 0, 1, "world1-no-nccl", 1,
+                         ExchangeKind::ExpertCounts, field);
+  };
+  const auto cleanup = [&]() noexcept {
+    if (stream)
+      (void)cudaStreamSynchronize(stream);
+    if (stop)
+      (void)cudaEventDestroy(stop);
+    if (start)
+      (void)cudaEventDestroy(start);
+    if (stream)
+      (void)cudaStreamDestroy(stream);
+    if (mismatches)
+      (void)cudaFree(mismatches);
+    if (output)
+      (void)cudaFree(output);
+    if (w2_transpose)
+      (void)cudaFree(w2_transpose);
+    if (dy)
+      (void)cudaFree(dy);
+  };
+
+  try {
+    check(cudaSetDevice(0), "select device");
+    int sms = 0;
+    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0),
+          "query SM count");
+    if (sms <= 0)
+      transport_error(NotifyErrorCode::BackendUnavailable, "dv-core-profile",
+                      "SM count", 0, "> 0", "0");
+    if (static_cast<std::uint64_t>(sms) * tasks_per_cta > UINT32_MAX)
+      transport_error(NotifyErrorCode::ArithmeticOverflow, "dv-core-profile",
+                      "tasks", 0, "uint32 range", "overflow");
+
+    result.sm_count = static_cast<std::uint32_t>(sms);
+    result.tasks_per_cta = tasks_per_cta;
+    result.tasks = static_cast<std::uint64_t>(result.sm_count) * tasks_per_cta;
+    const auto dy_elements =
+        checked_mul(kRows, kHidden, "dV profile dY elements");
+    const auto w2_elements =
+        checked_mul(kIntermediate, kHidden, "dV profile W2 elements");
+    const auto output_elements = checked_mul(
+        result.tasks, kTileRows * kTileColumns, "dV profile output elements");
+
+    check(cudaMalloc(
+              reinterpret_cast<void **>(&dy),
+              checked_size(dy_elements * sizeof(*dy), "dV profile dY bytes")),
+          "allocate dY");
+    check(cudaMalloc(reinterpret_cast<void **>(&w2_transpose),
+                     checked_size(w2_elements * sizeof(*w2_transpose),
+                                  "dV profile W2 bytes")),
+          "allocate W2 transpose");
+    check(cudaMalloc(reinterpret_cast<void **>(&output),
+                     checked_size(output_elements * sizeof(*output),
+                                  "dV profile output bytes")),
+          "allocate output");
+    check(
+        cudaMalloc(reinterpret_cast<void **>(&mismatches), sizeof(*mismatches)),
+        "allocate mismatch counter");
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+          "create profile stream");
+    check(cudaEventCreate(&start), "create start event");
+    check(cudaEventCreate(&stop), "create stop event");
+
+    const auto fill = [&](transport::BFloat16 *pointer, std::uint64_t elements,
+                          const char *field) {
+      const auto blocks = static_cast<unsigned int>(
+          std::min<std::uint64_t>(static_cast<std::uint64_t>(sms) * 4ULL,
+                                  (elements + 255ULL) / 256ULL));
+      backward_v3_fill_bf16_profile_kernel<<<blocks, 256, 0, stream>>>(
+          pointer, elements, kOne);
+      check(cudaPeekAtLastError(), field);
+    };
+    fill(dy, dy_elements, "initialize dY");
+    fill(w2_transpose, w2_elements, "initialize W2 transpose");
+
+    const auto dy_map =
+        make_bf16_tma_map(dy, kHidden, kRows, 128U, "dV profile dY");
+    const auto w2_map = make_bf16_tma_map(w2_transpose, kHidden, kIntermediate,
+                                          128U, "dV profile W2 transpose");
+    check(cudaFuncSetAttribute(backward_v3_dv_core_profile_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(kSmem)),
+          "set dV profile dynamic shared memory");
+    check(cudaStreamSynchronize(stream), "finish profile initialization");
+
+    double total_ms = 0.0;
+    result.min_ms = std::numeric_limits<double>::infinity();
+    for (std::uint32_t iteration = 0; iteration < warmup + measured;
+         ++iteration) {
+      check(cudaMemsetAsync(output, 0,
+                            checked_size(output_elements * sizeof(*output),
+                                         "dV profile output bytes"),
+                            stream),
+            "clear dV profile output");
+      check(cudaEventRecord(start, stream), "record dV profile start");
+      backward_v3_dv_core_profile_kernel<<<static_cast<unsigned int>(sms), 384,
+                                           kSmem, stream>>>(
+          dy_map, w2_map, output, static_cast<std::uint32_t>(result.tasks));
+      check(cudaPeekAtLastError(), "launch dV profile kernel");
+      check(cudaEventRecord(stop, stream), "record dV profile stop");
+      check(cudaEventSynchronize(stop), "wait dV profile kernel");
+      if (iteration >= warmup) {
+        float elapsed_ms = 0.0F;
+        check(cudaEventElapsedTime(&elapsed_ms, start, stop),
+              "measure dV profile kernel");
+        const auto elapsed = static_cast<double>(elapsed_ms);
+        total_ms += elapsed;
+        result.min_ms = std::min(result.min_ms, elapsed);
+        result.max_ms = std::max(result.max_ms, elapsed);
+      }
+
+      check(cudaMemsetAsync(mismatches, 0, sizeof(*mismatches), stream),
+            "reset mismatch counter");
+      const auto validation_blocks =
+          static_cast<unsigned int>(std::min<std::uint64_t>(
+              4096ULL, (output_elements + 255ULL) / 256ULL));
+      backward_v3_validate_bf16_profile_kernel<<<validation_blocks, 256, 0,
+                                                 stream>>>(
+          output, output_elements, kExpected, mismatches);
+      check(cudaPeekAtLastError(), "validate dV profile output");
+      unsigned long long host_mismatches = 0ULL;
+      check(cudaMemcpyAsync(&host_mismatches, mismatches,
+                            sizeof(host_mismatches), cudaMemcpyDeviceToHost,
+                            stream),
+            "copy dV profile mismatch count");
+      check(cudaStreamSynchronize(stream), "finish dV profile validation");
+      result.mismatches += host_mismatches;
+    }
+
+    result.mean_ms = total_ms / measured;
+    const auto flops = 2.0 * static_cast<double>(result.tasks) * kTileRows *
+                       kTileColumns * kHidden;
+    result.tflops = flops / (result.mean_ms * 1.0e9);
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
+  return result;
+}
+
+testing::BackwardDw1CoreProfile
+testing::profile_backward_v3_dw1_core(std::uint32_t warmup,
+                                      std::uint32_t measured, bool k_major_x,
+                                      bool cluster2, bool independent_tasks) {
+  if (measured == 0U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "dw1-core-profile",
+                    "measured", 0, "> 0", "0");
+  constexpr std::uint32_t kExperts = 24U;
+  constexpr std::uint32_t kRowsPerExpert = 2048U;
+  constexpr std::uint64_t kHidden = 7168ULL;
+  constexpr std::uint64_t kIntermediate = 3072ULL;
+  constexpr std::uint32_t kTileN = 256U;
+  constexpr std::uint32_t kStages = 3U;
+  constexpr std::uint64_t kReductionRows =
+      static_cast<std::uint64_t>(kExperts) * kRowsPerExpert;
+  constexpr std::uint64_t kOutputRows = 2ULL * kIntermediate;
+  constexpr std::uint64_t kMtiles = (kOutputRows + 127ULL) / 128ULL;
+  constexpr std::uint64_t kNtiles = (kHidden + kTileN - 1ULL) / kTileN;
+  constexpr std::uint64_t kTasks =
+      static_cast<std::uint64_t>(kExperts) * kMtiles * kNtiles;
+  constexpr std::size_t kPipelineSmem =
+      (kStages * 128U * 64U + kStages * kTileN * 64U) *
+          sizeof(transport::BFloat16) +
+      2U * kStages * sizeof(std::uint64_t);
+  constexpr std::size_t kOutputSmem =
+      128U * kTileN * sizeof(transport::BFloat16);
+  const auto smem = kPipelineSmem + (independent_tasks ? kOutputSmem : 0U);
+
+  void *arena = nullptr;
+  transport::BFloat16 *dab_transpose = nullptr;
+  transport::BFloat16 *canonical_x = nullptr;
+  transport::BFloat16 *dw1 = nullptr;
+  std::uint64_t *expert_row_count = nullptr;
+  std::uint64_t *expert_row_prefix = nullptr;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  testing::BackwardDw1CoreProfile result{};
+
+  std::size_t arena_cursor = 0;
+  const auto control_offset =
+      append(arena_cursor, 1, sizeof(persistent_v3::BackwardPipelineControl),
+             "dW1 profile control");
+  const auto status_offset = append(
+      arena_cursor, 1, sizeof(BackwardDeviceStatus), "dW1 profile status");
+  const auto padded_prefix_offset =
+      append(arena_cursor, kExperts, sizeof(std::uint64_t),
+             "dW1 profile padded prefix");
+  const auto expert_ready_offset =
+      append(arena_cursor, kExperts, sizeof(std::uint64_t),
+             "dW1 profile expert readiness");
+  const auto expert_cursor_offset =
+      append(arena_cursor, kExperts, sizeof(std::uint64_t),
+             "dW1 profile expert cursor");
+  const auto cancel_offset =
+      append(arena_cursor, 1, sizeof(std::uint64_t), "dW1 profile cancel");
+
+  const auto check = [](cudaError_t status, const char *field) {
+    internal::throw_cuda("dw1-core-profile", status, 0, 1, "world1-no-nccl", 1,
+                         ExchangeKind::ExpertCounts, field);
+  };
+  const auto cleanup = [&]() noexcept {
+    if (stream)
+      (void)cudaStreamSynchronize(stream);
+    if (stop)
+      (void)cudaEventDestroy(stop);
+    if (start)
+      (void)cudaEventDestroy(start);
+    if (stream)
+      (void)cudaStreamDestroy(stream);
+    if (expert_row_prefix)
+      (void)cudaFree(expert_row_prefix);
+    if (expert_row_count)
+      (void)cudaFree(expert_row_count);
+    if (dw1)
+      (void)cudaFree(dw1);
+    if (canonical_x)
+      (void)cudaFree(canonical_x);
+    if (dab_transpose)
+      (void)cudaFree(dab_transpose);
+    if (arena)
+      (void)cudaFree(arena);
+  };
+
+  try {
+    check(cudaSetDevice(0), "select device");
+    int sms = 0;
+    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0),
+          "query SM count");
+    if (sms <= 0)
+      transport_error(NotifyErrorCode::BackendUnavailable, "dw1-core-profile",
+                      "SM count", 0, "> 0", "0");
+    result.sm_count = static_cast<std::uint32_t>(sms);
+    result.experts = kExperts;
+    result.rows_per_expert = kRowsPerExpert;
+
+    const auto dab_elements =
+        checked_mul(kReductionRows, kOutputRows, "dW1 profile dAB elements");
+    const auto x_elements =
+        checked_mul(kReductionRows, kHidden, "dW1 profile X elements");
+    const auto dw1_elements =
+        checked_mul(static_cast<std::uint64_t>(kExperts) * kOutputRows, kHidden,
+                    "dW1 profile output elements");
+    check(cudaMalloc(&arena, arena_cursor), "allocate profile control arena");
+    check(cudaMalloc(reinterpret_cast<void **>(&dab_transpose),
+                     checked_size(dab_elements * sizeof(*dab_transpose),
+                                  "dW1 profile dAB bytes")),
+          "allocate dAB transpose");
+    check(cudaMalloc(reinterpret_cast<void **>(&canonical_x),
+                     checked_size(x_elements * sizeof(*canonical_x),
+                                  "dW1 profile X bytes")),
+          "allocate canonical X");
+    check(cudaMalloc(reinterpret_cast<void **>(&dw1),
+                     checked_size(dw1_elements * sizeof(*dw1),
+                                  "dW1 profile output bytes")),
+          "allocate dW1 output");
+    check(cudaMalloc(reinterpret_cast<void **>(&expert_row_count),
+                     kExperts * sizeof(*expert_row_count)),
+          "allocate expert row counts");
+    check(cudaMalloc(reinterpret_cast<void **>(&expert_row_prefix),
+                     (kExperts + 1U) * sizeof(*expert_row_prefix)),
+          "allocate expert row prefix");
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+          "create profile stream");
+    check(cudaEventCreate(&start), "create start event");
+    check(cudaEventCreate(&stop), "create stop event");
+
+    check(cudaMemsetAsync(arena, 0, arena_cursor, stream),
+          "initialize control arena");
+    check(cudaMemsetAsync(dab_transpose, 0,
+                          checked_size(dab_elements * sizeof(*dab_transpose),
+                                       "dW1 profile dAB bytes"),
+                          stream),
+          "initialize dAB transpose");
+    check(cudaMemsetAsync(canonical_x, 0,
+                          checked_size(x_elements * sizeof(*canonical_x),
+                                       "dW1 profile X bytes"),
+                          stream),
+          "initialize canonical X");
+
+    std::array<std::uint64_t, kExperts> host_counts{};
+    std::array<std::uint64_t, kExperts + 1U> host_prefix{};
+    std::array<std::uint64_t, kExperts> host_padded_prefix{};
+    std::array<std::uint64_t, kExperts> host_ready{};
+    constexpr auto dv_ntiles = (kIntermediate + 255ULL) / 256ULL;
+    constexpr auto ready_value =
+        (1ULL << 63U) |
+        (static_cast<std::uint64_t>(kRowsPerExpert / 128U) * dv_ntiles);
+    for (std::uint32_t expert = 0; expert < kExperts; ++expert) {
+      host_counts[expert] = kRowsPerExpert;
+      host_prefix[expert] = static_cast<std::uint64_t>(expert) * kRowsPerExpert;
+      host_padded_prefix[expert] = host_prefix[expert];
+      host_ready[expert] = ready_value;
+    }
+    host_prefix[kExperts] = kReductionRows;
+    check(cudaMemcpyAsync(expert_row_count, host_counts.data(),
+                          sizeof(host_counts), cudaMemcpyHostToDevice, stream),
+          "upload expert row counts");
+    check(cudaMemcpyAsync(expert_row_prefix, host_prefix.data(),
+                          sizeof(host_prefix), cudaMemcpyHostToDevice, stream),
+          "upload expert row prefix");
+    check(cudaMemcpyAsync(at<void>(arena, padded_prefix_offset),
+                          host_padded_prefix.data(), sizeof(host_padded_prefix),
+                          cudaMemcpyHostToDevice, stream),
+          "upload padded expert prefix");
+    check(cudaMemcpyAsync(at<void>(arena, expert_ready_offset),
+                          host_ready.data(), sizeof(host_ready),
+                          cudaMemcpyHostToDevice, stream),
+          "upload expert readiness");
+
+    BackwardKernelArgs args{};
+    args.dispatch.sizes.owned_expert_count = kExperts;
+    args.dispatch.expert_row_count = expert_row_count;
+    args.dispatch.expert_row_prefix = expert_row_prefix;
+    args.hidden = kHidden;
+    args.intermediate = kIntermediate;
+    args.epoch = 1ULL;
+    args.local_base = arena;
+    args.status_offset = status_offset;
+    args.cancel_epoch = at<unsigned long long>(arena, cancel_offset);
+    args.v3_control_offset = control_offset;
+    args.v3_expert_padded_prefix_offset = padded_prefix_offset;
+    args.v3_expert_dv_complete_offset = expert_ready_offset;
+    args.v3_expert_dw1_cursor_offset = expert_cursor_offset;
+    args.v3_dw_tile_n = kTileN;
+
+    const auto dab_map =
+        make_bf16_tma_map(dab_transpose, kReductionRows, kOutputRows, 128,
+                          "dW1 profile dAB transpose");
+    const auto x_map =
+        k_major_x ? make_bf16_tma_map(canonical_x, kReductionRows, kHidden,
+                                      kTileN, "dW1 profile K-major X")
+                  : make_bf16_tma_map_mn(canonical_x, kHidden, kReductionRows,
+                                         "dW1 profile canonical X");
+    const auto output_map = make_bf16_tma_store_map(
+        dw1, kHidden, static_cast<std::uint64_t>(kExperts) * kOutputRows,
+        "dW1 profile output");
+    cudaError_t attribute_status = cudaSuccess;
+    if (cluster2) {
+      if (k_major_x) {
+        attribute_status =
+            independent_tasks
+                ? cudaFuncSetAttribute(
+                      backward_v3_dw1_profile_kernel<kTileN, true, true, true>,
+                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                      static_cast<int>(smem))
+                : cudaFuncSetAttribute(
+                      backward_v3_dw1_profile_kernel<kTileN, true, true, false>,
+                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                      static_cast<int>(smem));
+      } else {
+        attribute_status =
+            independent_tasks
+                ? cudaFuncSetAttribute(
+                      backward_v3_dw1_profile_kernel<kTileN, false, true, true>,
+                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                      static_cast<int>(smem))
+                : cudaFuncSetAttribute(
+                      backward_v3_dw1_profile_kernel<kTileN, false, true,
+                                                     false>,
+                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                      static_cast<int>(smem));
+      }
+    } else if (k_major_x) {
+      attribute_status =
+          independent_tasks
+              ? cudaFuncSetAttribute(
+                    backward_v3_dw1_profile_kernel<kTileN, true, false, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem))
+              : cudaFuncSetAttribute(
+                    backward_v3_dw1_profile_kernel<kTileN, true, false, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem));
+    } else {
+      attribute_status =
+          independent_tasks
+              ? cudaFuncSetAttribute(
+                    backward_v3_dw1_profile_kernel<kTileN, false, false, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem))
+              : cudaFuncSetAttribute(
+                    backward_v3_dw1_profile_kernel<kTileN, false, false, false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem));
+    }
+    check(attribute_status, "set dW1 profile dynamic shared memory");
+
+    persistent_v3::BackwardPipelineControl host_control{};
+    host_control.dw1_tasks = kTasks;
+    double total_ms = 0.0;
+    result.min_ms = std::numeric_limits<double>::infinity();
+    for (std::uint32_t iteration = 0; iteration < warmup + measured;
+         ++iteration) {
+      check(cudaMemcpyAsync(at<void>(arena, control_offset), &host_control,
+                            sizeof(host_control), cudaMemcpyHostToDevice,
+                            stream),
+            "reset dW1 profile control");
+      check(cudaMemsetAsync(at<void>(arena, expert_cursor_offset), 0,
+                            kExperts * sizeof(std::uint64_t), stream),
+            "reset dW1 expert cursors");
+      check(cudaEventRecord(start, stream), "record dW1 profile start");
+      if (cluster2) {
+        cudaLaunchAttribute cluster_attribute{};
+        cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+        cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+        cudaLaunchConfig_t cluster_launch{};
+        cluster_launch.gridDim = dim3(static_cast<unsigned int>(sms), 1U, 1U);
+        cluster_launch.blockDim = dim3(384U, 1U, 1U);
+        cluster_launch.dynamicSmemBytes = smem;
+        cluster_launch.stream = stream;
+        cluster_launch.attrs = &cluster_attribute;
+        cluster_launch.numAttrs = 1U;
+        cudaError_t launch_status = cudaSuccess;
+        if (k_major_x) {
+          launch_status = independent_tasks
+                              ? cudaLaunchKernelEx(
+                                    &cluster_launch,
+                                    backward_v3_dw1_profile_kernel<kTileN, true,
+                                                                   true, true>,
+                                    args, dab_map, x_map, output_map)
+                              : cudaLaunchKernelEx(
+                                    &cluster_launch,
+                                    backward_v3_dw1_profile_kernel<kTileN, true,
+                                                                   true, false>,
+                                    args, dab_map, x_map, output_map);
+        } else {
+          launch_status =
+              independent_tasks
+                  ? cudaLaunchKernelEx(
+                        &cluster_launch,
+                        backward_v3_dw1_profile_kernel<kTileN, false, true,
+                                                       true>,
+                        args, dab_map, x_map, output_map)
+                  : cudaLaunchKernelEx(
+                        &cluster_launch,
+                        backward_v3_dw1_profile_kernel<kTileN, false, true,
+                                                       false>,
+                        args, dab_map, x_map, output_map);
+        }
+        check(launch_status, "launch cluster dW1 profile kernel");
+      } else if (k_major_x) {
+        if (independent_tasks)
+          backward_v3_dw1_profile_kernel<kTileN, true, false, true>
+              <<<static_cast<unsigned int>(sms), 384, smem, stream>>>(
+                  args, dab_map, x_map, output_map);
+        else
+          backward_v3_dw1_profile_kernel<kTileN, true, false, false>
+              <<<static_cast<unsigned int>(sms), 384, smem, stream>>>(
+                  args, dab_map, x_map, output_map);
+        check(cudaPeekAtLastError(), "launch K-major dW1 profile kernel");
+      } else {
+        if (independent_tasks)
+          backward_v3_dw1_profile_kernel<kTileN, false, false, true>
+              <<<static_cast<unsigned int>(sms), 384, smem, stream>>>(
+                  args, dab_map, x_map, output_map);
+        else
+          backward_v3_dw1_profile_kernel<kTileN, false, false, false>
+              <<<static_cast<unsigned int>(sms), 384, smem, stream>>>(
+                  args, dab_map, x_map, output_map);
+        check(cudaPeekAtLastError(), "launch MN-major dW1 profile kernel");
+      }
+      check(cudaEventRecord(stop, stream), "record dW1 profile stop");
+      check(cudaEventSynchronize(stop), "wait dW1 profile kernel");
+      if (iteration >= warmup) {
+        float elapsed_ms = 0.0F;
+        check(cudaEventElapsedTime(&elapsed_ms, start, stop),
+              "measure dW1 profile kernel");
+        const auto elapsed = static_cast<double>(elapsed_ms);
+        total_ms += elapsed;
+        result.min_ms = std::min(result.min_ms, elapsed);
+        result.max_ms = std::max(result.max_ms, elapsed);
+      }
+    }
+    result.mean_ms = total_ms / measured;
+    const auto flops = 2.0 * kExperts * kOutputRows * kHidden * kRowsPerExpert;
+    result.tflops = flops / (result.mean_ms * 1.0e9);
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
+  return result;
 }
 
 bool testing::run_runtime_shape_world1_harness(std::uint64_t hidden,

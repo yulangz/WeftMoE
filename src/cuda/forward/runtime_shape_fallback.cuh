@@ -1179,7 +1179,7 @@ __global__ void runtime_shape_forward_megakernel(ForwardKernelArgs a) {
   publish_production_terminal_status<false>(
       a, status, ProductionStatusPhase::Forward,
       a.production_error_records_offset,
-      a.gin_production_error_records_offset);
+      a.gin_production_error_records_offset, 0ULL);
 }
 
 // Correctness-only runtime H/I Backward.  The phase order is fixed inside one
@@ -1544,5 +1544,5 @@ __global__ void runtime_shape_backward_megakernel(BackwardKernelArgs a) {
   publish_production_terminal_status<false>(
       a, status, ProductionStatusPhase::Backward,
       a.production_error_records_offset,
-      a.gin_production_error_records_offset);
+      a.gin_production_error_records_offset, 0ULL);
 }
