@@ -4391,6 +4391,13 @@ enum ForwardMixedSchedulerWord : std::uint32_t {
   kForwardBodyFc1Claim = 2U,
   kForwardBodyFc2Publish = 3U,
   kForwardBodyFc2Claim = 4U,
+  // The last three words in the aligned scheduler gap form a transport-only
+  // startup rendezvous.  Keeping one immutable epoch publication and two
+  // monotonic arrival counters avoids resetting a reusable barrier while a
+  // slower CTA can still be observing the previous phase.
+  kForwardTransportInitEpoch = 5U,
+  kForwardTransportClearArrivals = 6U,
+  kForwardTransportMapArrivals = 7U,
 };
 
 enum class ForwardTaskPartition : std::uint32_t {
@@ -4411,6 +4418,34 @@ __device__ __forceinline__ unsigned long long *forward_mixed_scheduler_word(
                           2ULL * partitions * a.gin_context_count;
   return scheduler + mixed_base +
          static_cast<std::uint32_t>(word);
+}
+
+__device__ __forceinline__ void forward_transport_wait_epoch(
+    unsigned long long *word, unsigned long long epoch) {
+  if (threadIdx.x == 0U) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        published(*word);
+    while (published.load(::cuda::memory_order_acquire) != epoch)
+      __nanosleep(256U);
+  }
+  __syncthreads();
+}
+
+// A fixed transport grid needs only a CTA-arrival barrier, not cooperative
+// launch semantics.  Every CTA first releases all of its lanes' stores through
+// one acq_rel RMW.  Waiting on the terminal counter value then acquires the
+// complete RMW release sequence before the next initialization phase begins.
+__device__ __forceinline__ void forward_transport_cta_barrier(
+    unsigned long long *arrivals, unsigned int expected_ctas) {
+  __syncthreads();
+  if (threadIdx.x == 0U) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> count(
+        *arrivals);
+    count.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+    while (count.load(::cuda::memory_order_acquire) < expected_ctas)
+      __nanosleep(256U);
+  }
+  __syncthreads();
 }
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -4835,6 +4870,12 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Publish) =
           0ULL;
       *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Claim) = 0ULL;
+      *forward_mixed_scheduler_word(a, scheduler,
+                                    kForwardTransportInitEpoch) = 0ULL;
+      *forward_mixed_scheduler_word(a, scheduler,
+                                    kForwardTransportClearArrivals) = 0ULL;
+      *forward_mixed_scheduler_word(a, scheduler,
+                                    kForwardTransportMapArrivals) = 0ULL;
       for (std::uint32_t expert = 0;
            expert < a.dispatch.sizes.owned_expert_count; ++expert) {
         scheduler[3] += forward_expert_mblock_count(a, expert);
@@ -4903,6 +4944,15 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
               completion->directory_expected + dispatch_waves;
         }
       }
+      // This release replaces the first transport-grid barrier.  No other CTA
+      // can consume scheduler bounds or phase counters until all scalar
+      // generation initialization above is visible.
+      if constexpr (KernelRole == ForwardKernelRole::TransportOnly) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            init_epoch(*forward_mixed_scheduler_word(
+                a, scheduler, kForwardTransportInitEpoch));
+        init_epoch.store(a.epoch, ::cuda::memory_order_release);
+      }
     }
     if (threadIdx.x == 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -4924,7 +4974,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     // entries when the forward M-block shape changes (notably M128 -> M64).
     // This rendezvous is confined to the fixed transport grid and precedes
     // compute setup publication, so it is not an FC1/FC2 pipeline barrier.
-    grid.sync();
+    if constexpr (KernelRole == ForwardKernelRole::TransportOnly)
+      forward_transport_wait_epoch(
+          forward_mixed_scheduler_word(a, scheduler,
+                                       kForwardTransportInitEpoch),
+          a.epoch);
+    else
+      grid.sync();
     // One completion word per destination->source rank replaces a system-scope
     // signal for every route.  The high word is immutable expected rows; return
     // CTAs add to the low word after their peer stores have been fenced.
@@ -4980,7 +5036,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
            word += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
         control_words[word] = 0ULL;
     }
-    grid.sync();
+    if constexpr (KernelRole == ForwardKernelRole::TransportOnly)
+      forward_transport_cta_barrier(
+          forward_mixed_scheduler_word(a, scheduler,
+                                       kForwardTransportClearArrivals),
+          gridDim.x);
+    else
+      grid.sync();
     forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     const auto setup_fc1_ntiles =
@@ -5013,12 +5075,21 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
          task < setup_task_count;
          task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
       claims[setup_mblocks + task] = 0ULL;
-    grid.sync();
+    if constexpr (KernelRole == ForwardKernelRole::TransportOnly)
+      forward_transport_cta_barrier(
+          forward_mixed_scheduler_word(a, scheduler,
+                                       kForwardTransportMapArrivals),
+          gridDim.x);
+    else
+      grid.sync();
     if (blockIdx.x == 0U && threadIdx.x == 0U) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           setup_ready(scheduler[8ULL + 2ULL * a.world]);
       setup_ready.store(a.epoch, ::cuda::memory_order_release);
     }
+    if constexpr (KernelRole == ForwardKernelRole::TransportOnly)
+      forward_transport_wait_epoch(
+          &scheduler[8ULL + 2ULL * a.world], a.epoch);
 #endif
 
     // Socket correctness mode has already placed every incoming activation and
@@ -15238,16 +15309,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                            ExchangeKind::ExpertCounts,
                            "cudaStreamWaitEvent(split Forward compute ready)");
 
-      cudaLaunchAttribute transport_attributes[1]{};
-      transport_attributes[0].id = cudaLaunchAttributeCooperative;
-      transport_attributes[0].val.cooperative = 1;
       cudaLaunchConfig_t transport_launch{};
       transport_launch.gridDim = dim3(kTransportBlocks, 1, 1);
       transport_launch.blockDim = dim3(384, 1, 1);
       transport_launch.dynamicSmemBytes = forward_smem;
       transport_launch.stream = slot.forward_transport_stream;
-      transport_launch.attrs = transport_attributes;
-      transport_launch.numAttrs = 1;
       launch_forward = cudaLaunchKernelEx(
           &transport_launch,
           local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,

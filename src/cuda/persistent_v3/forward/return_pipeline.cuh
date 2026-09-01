@@ -44,9 +44,9 @@ __device__ __forceinline__ unsigned long long source_compact_rows(
 __device__ __forceinline__ unsigned long long direct_scheduler_base(
     const ForwardKernelArgs &a) {
   const auto partitions = a.dispatch.identity.num_nodes - 1ULL;
-  // The first five words after the directory arrays belong to the mixed
-  // M64/M128 task scheduler.  Keep a small aligned gap so direct counters can
-  // never alias that state when a scheduling mode is enabled at runtime.
+  // Eight words after the directory arrays belong to mixed scheduling and the
+  // transport-only startup rendezvous.  Start direct counters after that
+  // aligned block so neither state can alias Return ownership metadata.
   return 16ULL + 2ULL * a.world +
          2ULL * partitions * a.gin_context_count + 8ULL;
 }
