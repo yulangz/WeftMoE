@@ -879,10 +879,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                                             kMathDoneBarrier);
         }
       }
-      // FULL selects the registered staging descriptor; retain one scalar
-      // canonical store for local combine/backward consumers. This keeps the
-      // proven three-tensor-map kernel ABI and removes the branchy scalar
-      // staging write from every remote row.
+      // When TMA targets a separate Return staging plane, retain the scalar
+      // canonical store for local/backward consumers. Production aliases its
+      // canonical output with registered staging, so a full tile needs only
+      // the TMA store; partial expert tails remain on the checked scalar path.
       if (!full_tma_tile || TmaFc2StoreToStaging) {
         const auto store_fc2 =
             [&](std::uint32_t wg, std::uint32_t m, std::uint32_t column,
@@ -1185,13 +1185,16 @@ __global__ __launch_bounds__(384, 1) void local_p2p_forward_compute_kernel(
 #endif
 }
 
-// Production FC2-only symbol with a compile-time STSM/TMA epilogue.  Keeping
-// it separate from the generic compute kernel prevents the output descriptor
-// and scalar/TMA branch from extending FC1's register live ranges.
-template <bool StaticLocal, bool StoreToStaging = false>
+// Compile-time STSM/TMA FC2 epilogue. DoFc1 selects the production
+// FC2-priority mixed scheduler or the retained FC2-only tuning candidate
+// without duplicating the kernel wrapper.
+template <bool StaticLocal, bool DoFc1,
+          bool StoreToStaging = false>
 __global__ __launch_bounds__(384, 1) void
-local_p2p_forward_fc2_tma_store_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap s_map,
+local_p2p_forward_tma_store_kernel(
+    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ CUtensorMap s_map,
+    const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map,
     const __grid_constant__ CUtensorMap output_store_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
@@ -1212,9 +1215,9 @@ local_p2p_forward_fc2_tma_store_kernel(
   }
   __syncthreads();
   forward_compute_detail::persistent_role<
-      StaticLocal, false, true, false, ForwardTaskPartition::All, true,
-      StoreToStaging>(
-      a, s_map, s_map, w2_map, w2_map, storage, &task_shared,
+      StaticLocal, DoFc1, true, false, ForwardTaskPartition::All, true,
+      StoreToStaging, 4U, 4U>(
+      a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
       &task_kind_shared, &return_mblock_shared, &output_store_map);
   forward_compute_detail::rebalance_registers_for_reduce();
   const auto reduce_role_index =
@@ -1228,7 +1231,9 @@ local_p2p_forward_fc2_tma_store_kernel(
     MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 #else
   (void)a;
+  (void)x_map;
   (void)s_map;
+  (void)w1_map;
   (void)w2_map;
   (void)output_store_map;
 #endif

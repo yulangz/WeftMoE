@@ -15097,8 +15097,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           std::getenv("MEGAMOE_FORWARD_M64_HEAD") != nullptr;
       const bool forward_specialize_stages =
           std::getenv("MEGAMOE_FORWARD_SPECIALIZE_STAGES") != nullptr;
-      const bool forward_fc2_tma_store =
-          std::getenv("MEGAMOE_FORWARD_FC2_TMA_STORE") != nullptr;
+      bool forward_fc2_tma_store = true;
+      if (const auto *tma_store =
+              std::getenv("MEGAMOE_FORWARD_FC2_TMA_STORE")) {
+        const std::string value(tma_store);
+        if (value != "0" && value != "1")
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                          "forward-run", "MEGAMOE_FORWARD_FC2_TMA_STORE",
+                          id.calling_rank, "0 or 1", value);
+        forward_fc2_tma_store = value == "1";
+      }
       // The H200 main-shape autotune selects four async TMA stages for both
       // GEMMs.  Environment overrides retain the other compiled candidates
       // for topology/shape-specific retuning without an inner-loop branch.
@@ -15140,12 +15148,21 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         "Forward stage specialization", id.calling_rank,
                         "M128 without an M64 experiment",
                         "MEGAMOE_FORWARD_SPECIALIZE_STAGES with M64");
-      if (forward_fc2_tma_store && !forward_specialize_stages)
+      if (forward_fc2_tma_store &&
+          (forward_m64 || forward_m64_head ||
+           forward_fc1_stages != 4U || forward_fc2_stages != 4U))
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
             "MEGAMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
-            "stage-specialized Forward mode",
-            "unspecialized Forward stages");
+            "the production M128 4x4-stage scheduler",
+            "an incompatible M tile or TMA stage configuration");
+      if (forward_fc2_tma_store && args.use_gin &&
+          !args.forward_registered_output)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
+            "registered output enabled for GIN Return",
+            "MEGAMOE_FORWARD_REGISTERED_OUTPUT=0");
       if (forward_m64)
         args.forward_mblock_rows = 64U;
       args.forward_m64_head_wavefront = forward_m64_head;
@@ -15239,6 +15256,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(forward_smem));
+      else if (forward_fc2_tma_store)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_smem));
       else if (forward_m64)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<false, true, true>,
@@ -15293,7 +15315,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
               static_cast<int>(forward_smem));
         else
           fc2_attribute = cudaFuncSetAttribute(
-              local_p2p_forward_fc2_tma_store_kernel<false, true>,
+              local_p2p_forward_tma_store_kernel<false, false, true>,
               cudaFuncAttributeMaxDynamicSharedMemorySize,
               static_cast<int>(forward_smem));
         internal::throw_cuda(
@@ -15473,8 +15495,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         if (forward_fc2_tma_store)
           launch_forward = cudaLaunchKernelEx(
               &tail_launch,
-              local_p2p_forward_fc2_tma_store_kernel<false, true>, tail_args,
-              slot.forward_s_map, weight.w2_map,
+              local_p2p_forward_tma_store_kernel<false, false, true>,
+              tail_args, slot.forward_s_map, slot.forward_s_map,
+              weight.w2_map, weight.w2_map,
               slot.forward_staging_store_map);
         else
           launch_forward = cudaLaunchKernelEx(
@@ -15522,8 +15545,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         if (forward_fc2_tma_store)
           launch_forward = cudaLaunchKernelEx(
               &compute_launch,
-              local_p2p_forward_fc2_tma_store_kernel<false, true>,
-              compute_args, slot.forward_s_map, weight.w2_map,
+              local_p2p_forward_tma_store_kernel<false, false, true>,
+              compute_args, slot.forward_s_map, slot.forward_s_map,
+              weight.w2_map, weight.w2_map,
               slot.forward_staging_store_map);
         else
           launch_forward = cudaLaunchKernelEx(
@@ -15532,6 +15556,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                   false, true, false, ForwardTaskPartition::All, true, true>,
               compute_args, slot.forward_x_map, slot.forward_s_map,
               weight.w1_map, weight.w2_map);
+      } else if (forward_fc2_tma_store) {
+        const auto &output_store_map =
+            args.use_gin && args.forward_registered_output
+                ? slot.forward_staging_store_map
+                : slot.forward_output_store_map;
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<false, true>,
+            compute_args, slot.forward_x_map, slot.forward_s_map,
+            weight.w1_map, weight.w2_map, output_store_map);
       } else if (forward_m64)
         launch_forward = cudaLaunchKernelEx(
             &compute_launch,
