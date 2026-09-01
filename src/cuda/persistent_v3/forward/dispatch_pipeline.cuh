@@ -818,8 +818,11 @@ __device__ __forceinline__ void relay_role(
       progressed = local_return_progressed || progressed;
       if (threadIdx.x == 0U &&
           forward_return_detail::direct_local_return_terminal(
-              a, scheduler, local_return_state))
+              a, scheduler, local_return_state)) {
         local_return_done = 1U;
+        MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
+                                context, local_return_state.cursor, a.epoch);
+      }
       __syncthreads();
     }
 
@@ -886,8 +889,11 @@ __device__ __forceinline__ void relay_role(
                    progressed;
       if (threadIdx.x == 0U &&
           forward_return_detail::direct_local_return_terminal(
-              a, scheduler, local_return_state))
+              a, scheduler, local_return_state)) {
         local_return_done = 1U;
+        MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
+                                context, local_return_state.cursor, a.epoch);
+      }
       __syncthreads();
     }
 #endif

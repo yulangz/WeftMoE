@@ -264,12 +264,16 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   if (state.chunk_ready == 0U)
     return false;
 
+  MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
+                          context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
   }
   publish_direct_full_source_chunk(a, row_begin, state.selected_rows);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
+                          context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
         chunk_state[state.selected_chunk]);
@@ -346,6 +350,9 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
 
   const auto local_source = a.node * a.local_world_size + context;
   if (state.active != 0U) {
+    MEGAMOE_TIMELINE_RECORD(
+        a.timeline, LocalReturnBatchStart, LocalReturn, context,
+        (state.cursor << 32U) | state.active, a.epoch);
     if (threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -483,6 +490,9 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       }
     }
     __syncthreads();
+    MEGAMOE_TIMELINE_RECORD(
+        a.timeline, LocalReturnBatchEnd, LocalReturn, context,
+        (state.cursor << 32U) | state.copied_rows, a.epoch);
   }
 
   if (threadIdx.x == 0U)

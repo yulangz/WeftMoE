@@ -9,7 +9,7 @@
 
 namespace megamoe::cuda::profiling {
 
-inline constexpr std::uint32_t kTimelineSchemaVersion = 6;
+inline constexpr std::uint32_t kTimelineSchemaVersion = 7;
 // Main-shape compute CTAs can retire more than 256 FC tiles.  A truncated
 // suffix makes the apparent FC2/Return tail shorter than the real one, so the
 // profiling build deliberately spends a few extra MiB per GPU for a complete
@@ -26,6 +26,7 @@ enum class TimelineRole : std::uint16_t {
   GinReturn = 4,
   SourceRelay = 5,
   Reduce = 6,
+  LocalReturn = 7,
 };
 
 enum class TimelineEvent : std::uint16_t {
@@ -102,6 +103,12 @@ enum class TimelineEvent : std::uint16_t {
   Fc2First = 71,
   Fc2Last = 72,
   ReduceTokenReadyObserved = 73,
+  LocalReturnBatchStart = 74,
+  LocalReturnBatchEnd = 75,
+  LocalReturnTerminal = 76,
+  FullReturnChunkReady = 77,
+  FullReturnChunkPublished = 78,
+  Fc2MblockReturnReady = 79,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

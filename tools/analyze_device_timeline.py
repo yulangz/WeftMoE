@@ -88,6 +88,12 @@ EVENTS = {
     71: "fc2_first",
     72: "fc2_last",
     73: "reduce_token_ready_observed",
+    74: "local_return_batch_start",
+    75: "local_return_batch_end",
+    76: "local_return_terminal",
+    77: "full_return_chunk_ready",
+    78: "full_return_chunk_published",
+    79: "fc2_mblock_return_ready",
 }
 
 PAIRS = {
@@ -129,6 +135,8 @@ PAIRS = {
     "dx_epilogue": (69, 70),
     "fc2": (71, 72),
     "fc1_end_to_fc2_start": (10, 71),
+    "local_return_batch": (74, 75),
+    "full_return_chunk_publish": (77, 78),
 }
 
 

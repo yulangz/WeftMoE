@@ -988,12 +988,14 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           }
           if constexpr (!StaticLocal) {
             if (a.use_gin) {
-            // Lane 0 publishes one maximal contiguous descriptor to the fixed
-            // FULL GIN owners. No context state or network register live range
-            // enters this WGMMA kernel.
-            forward_return_detail::issue_direct_full_mblock(
-                a, scheduler, row, valid_rows,
-                *return_context_masks_shared);
+              // Lane 0 publishes one maximal contiguous descriptor to the
+              // fixed FULL GIN owners. No context state or network register
+              // live range enters this WGMMA kernel.
+              forward_return_detail::issue_direct_full_mblock(
+                  a, scheduler, row, valid_rows,
+                  *return_context_masks_shared);
+              MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
+                                      Compute, 0U, mblock, a.epoch);
             }
           }
         }
