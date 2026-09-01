@@ -15121,10 +15121,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
       args.forward_relay_local_return =
           std::getenv("MEGAMOE_FORWARD_COMPUTE_LOCAL_RETURN") == nullptr;
-      // Eight Relay CTAs with all twelve independent row streams are the
-      // Hopper production point. A value of zero retains the exact vector
-      // implementation for autotuner/regression A/B runs.
-      args.forward_relay_tma_warps = persistent_v3::kWarpsPerCta;
+      // Eight Relay CTAs with eight independent row streams are the Hopper
+      // production point.  Twelve streams slightly improve isolated NVLink
+      // copy throughput, but contend more heavily with the paired FC1/FC2
+      // pipeline and produce a longer end-to-end Return tail.  A value of
+      // zero retains the exact vector implementation for autotuner/regression
+      // A/B runs.
+      args.forward_relay_tma_warps = 8U;
       if (const auto *tma_warps =
               std::getenv("MEGAMOE_FORWARD_RELAY_TMA_WARPS"))
         args.forward_relay_tma_warps =
@@ -15257,9 +15260,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                           id.calling_rank, "0 or 1", value);
         forward_fc2_tma_store = value == "1";
       }
-      bool forward_cluster2 = false;
+      bool forward_cluster2 = true;
+      bool forward_cluster2_explicit = false;
       if (const auto *cluster2 =
               std::getenv("MEGAMOE_FORWARD_CLUSTER2")) {
+        forward_cluster2_explicit = true;
         const std::string value(cluster2);
         if (value != "0" && value != "1")
           transport_error(NotifyErrorCode::InvalidRuntimeConfig,
@@ -15363,32 +15368,40 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       const auto forward_main_compute_ctas =
           args.forward_compute_cta_count -
           (forward_m64_head ? args.forward_m64_head_cta_count : 0U);
-      if (forward_cluster2 &&
-          (!forward_fc2_tma_store || forward_m64 || forward_m64_head ||
-           forward_specialize_stages || forward_fc1_stages != 4U ||
-           forward_fc2_stages != 4U))
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
-            "the production M128 4x4-stage TMA-store scheduler",
-            "an incompatible Forward experiment");
+      const bool forward_cluster2_pipeline_compatible =
+          forward_fc2_tma_store && !forward_m64 && !forward_m64_head &&
+          !forward_specialize_stages && forward_fc1_stages == 4U &&
+          forward_fc2_stages == 4U;
+      if (forward_cluster2 && !forward_cluster2_pipeline_compatible) {
+        if (forward_cluster2_explicit)
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+              "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
+              "the production M128 4x4-stage TMA-store scheduler",
+              "an incompatible Forward experiment");
+        forward_cluster2 = false;
+      }
       const auto forward_fc1_ntiles =
           static_cast<std::uint32_t>((args.intermediate + 127ULL) / 128ULL);
       const auto forward_fc2_ntiles =
           static_cast<std::uint32_t>((args.hidden + 255ULL) / 256ULL);
-      if (forward_cluster2 &&
-          ((forward_main_compute_ctas & 1U) != 0U ||
-           (forward_fc1_ntiles & 1U) != 0U ||
-           (forward_fc2_ntiles & 1U) != 0U ||
-           forward_main_compute_ctas / 2U >
-               persistent_v3::kForwardComputePairCapacity))
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
-            "even compute/FC1/FC2 task extents within mailbox capacity",
-            std::to_string(forward_main_compute_ctas) + ":" +
-                std::to_string(forward_fc1_ntiles) + ":" +
-                std::to_string(forward_fc2_ntiles));
+      const bool forward_cluster2_extent_compatible =
+          (forward_main_compute_ctas & 1U) == 0U &&
+          (forward_fc1_ntiles & 1U) == 0U &&
+          (forward_fc2_ntiles & 1U) == 0U &&
+          forward_main_compute_ctas / 2U <=
+              persistent_v3::kForwardComputePairCapacity;
+      if (forward_cluster2 && !forward_cluster2_extent_compatible) {
+        if (forward_cluster2_explicit)
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+              "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
+              "even compute/FC1/FC2 task extents within mailbox capacity",
+              std::to_string(forward_main_compute_ctas) + ":" +
+                  std::to_string(forward_fc1_ntiles) + ":" +
+                  std::to_string(forward_fc2_ntiles));
+        forward_cluster2 = false;
+      }
       // Expert storage remains padded to M=128. Repeated 32..512-row FULL
       // sweeps selected 256-row completion chunks: fewer marker scans and WQEs
       // with no measurable loss of FC2/Return overlap.
