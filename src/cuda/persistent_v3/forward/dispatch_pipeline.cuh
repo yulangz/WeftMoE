@@ -1122,8 +1122,17 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
 
       std::uint32_t group_mblocks = 1U;
       if (local_mblock >= kStartupMblocks) {
+        // Four-way N-tile-major publication gives the best W1 L2 reuse, but
+        // using it for an expert's first or last body blocks makes FC2 and
+        // Return arrive in large bursts.  Keep the configured two-block
+        // cadence at both ends and widen only the saturated middle window.
+        const bool middle_group4 =
+            locality_group == 2U && local_mblock >= 4U &&
+            local_mblock < 12U;
+        const auto effective_group = middle_group4 ? 4U : locality_group;
+        const auto group_origin = middle_group4 ? 4U : kStartupMblocks;
         const auto group_offset =
-            (local_mblock - kStartupMblocks) % locality_group;
+            (local_mblock - group_origin) % effective_group;
         if (group_offset != 0U) {
           // Body mappings are expert-major and therefore contiguous. The
           // leader marks every follower before marking itself; observing the
@@ -1146,7 +1155,7 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
           const auto expert_mblocks = static_cast<std::uint32_t>(
               forward_expert_mblock_count(a, expert));
           group_mblocks =
-              min(locality_group, expert_mblocks - local_mblock);
+              min(effective_group, expert_mblocks - local_mblock);
           bool group_ready = true;
           for (std::uint32_t member = 0; member < group_mblocks; ++member) {
             const auto sibling = mblock + member;
