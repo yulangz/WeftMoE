@@ -127,6 +127,11 @@ struct ForwardKernelArgs {
   // Publish Dispatch readiness after this many source packets. Relay keeps
   // copying the rest of the GIN wave while FC1 consumes an earlier microbatch.
   std::uint32_t forward_dispatch_publish_batch_rows = 32;
+  // Preserve the first two M-block waves for startup latency, then publish
+  // this many ready M-blocks from one expert in N-tile-major order. Adjacent
+  // compute CTAs can consequently reuse the same W1 tile through L2 without
+  // delaying Dispatch itself or requiring a cluster-wide rendezvous.
+  std::uint32_t forward_fc1_locality_group = 1;
   // Bound outstanding FULL Return puts per physical GIN context. Zero keeps
   // the legacy unbounded issue behavior for autotuner/regression A/B runs.
   std::uint32_t forward_return_max_inflight = 16;

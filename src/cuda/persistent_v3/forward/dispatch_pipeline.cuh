@@ -936,9 +936,145 @@ __device__ __forceinline__ bool publish_one_inbound_wave_sequence(
 // publication. Eight lanes total scan the destination-local Forward M-blocks
 // without a 116-compute-CTA system-atomic polling storm. A ready M-block is
 // expanded once into its FC1 N-tile tasks in a device-local queue.
+__device__ __forceinline__ void publish_ready_fc1_locality_groups(
+    const ForwardKernelArgs &a, std::uint32_t context,
+    unsigned long long *scheduler) {
+  constexpr std::uint32_t kStartupMblocks = 2U;
+  const auto locality_group = a.forward_fc1_locality_group;
+  const auto forward_mblocks = scheduler[3];
+  const auto fc1_ntiles =
+      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+  auto *claims = peer_at<unsigned long long>(
+      a.local_base, a.forward_task_claim_offset);
+  auto *fc1_ready_queue = claims + forward_mblocks;
+  auto *published_mblocks = peer_at<unsigned long long>(
+      a.local_base, a.forward_fc1_published_offset);
+#if MEGAMOE_DEBUG_VALIDATE
+  auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
+      a.peer_bases[a.world]);
+#endif
+
+  while (!forward_cancelled(a)) {
+    bool pending = false;
+    bool progressed = false;
+    for (std::uint64_t mblock = context; mblock < forward_mblocks;
+         mblock += persistent_v3::kRdmaCtaCount) {
+      if (atomicAdd(&published_mblocks[mblock], 0ULL) != 0ULL)
+        continue;
+      pending = true;
+      const auto mapping = claims[mblock];
+      const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+      const auto local_mblock = static_cast<std::uint32_t>(mapping);
+
+      std::uint32_t group_mblocks = 1U;
+      if (local_mblock >= kStartupMblocks) {
+        const auto group_offset =
+            (local_mblock - kStartupMblocks) % locality_group;
+        if (group_offset != 0U) {
+          // Body mappings are expert-major and therefore contiguous. The
+          // leader marks every follower before marking itself; observing the
+          // leader published is consequently sufficient to retire this lane.
+          const auto leader = mblock - group_offset;
+          const auto leader_mapping = claims[leader];
+          const bool valid_leader =
+              static_cast<std::uint32_t>(leader_mapping >> 32U) == expert &&
+              static_cast<std::uint32_t>(leader_mapping) + group_offset ==
+                  local_mblock;
+          if (valid_leader &&
+              atomicAdd(&published_mblocks[leader], 0ULL) == 0ULL)
+            continue;
+          if (atomicAdd(&published_mblocks[mblock], 0ULL) != 0ULL)
+            continue;
+          // A malformed/tail mapping must make progress rather than leaving a
+          // follower permanently owned by a leader that cannot include it.
+          group_mblocks = 1U;
+        } else {
+          const auto expert_mblocks = static_cast<std::uint32_t>(
+              forward_expert_mblock_count(a, expert));
+          group_mblocks =
+              min(locality_group, expert_mblocks - local_mblock);
+          bool group_ready = true;
+          for (std::uint32_t member = 0; member < group_mblocks; ++member) {
+            const auto sibling = mblock + member;
+            if (sibling >= forward_mblocks) {
+              group_ready = false;
+              break;
+            }
+            const auto sibling_mapping = claims[sibling];
+            if (static_cast<std::uint32_t>(sibling_mapping >> 32U) != expert ||
+                static_cast<std::uint32_t>(sibling_mapping) !=
+                    local_mblock + member ||
+                atomicAdd(&published_mblocks[sibling], 0ULL) != 0ULL) {
+              group_ready = false;
+              break;
+            }
+            const auto sibling_row =
+                forward_mblock_local_row(a, expert, local_mblock + member);
+            const auto sibling_rows =
+                forward_mblock_valid_rows(a, expert, local_mblock + member);
+            if (!forward_mblock_rows_ready<false>(
+                    a, expert, sibling_row, sibling_rows)) {
+              group_ready = false;
+              break;
+            }
+          }
+          if (!group_ready)
+            continue;
+        }
+      } else {
+        const auto local_row =
+            forward_mblock_local_row(a, expert, local_mblock);
+        const auto valid_rows =
+            forward_mblock_valid_rows(a, expert, local_mblock);
+        if (!forward_mblock_rows_ready<false>(a, expert, local_row,
+                                               valid_rows))
+          continue;
+      }
+
+      // Followers become visible before their leader. A follower lane that
+      // acquires the leader flag can therefore never race a partial group.
+      for (std::uint32_t member = group_mblocks; member != 0U; --member)
+        atomicExch(&published_mblocks[mblock + member - 1U], 1ULL);
+      const auto queue_base =
+          atomicAdd(&scheduler[12ULL + 2ULL * a.world],
+                    static_cast<unsigned long long>(group_mblocks) *
+                        fc1_ntiles);
+      for (std::uint32_t ntile = 0; ntile < fc1_ntiles; ++ntile) {
+        for (std::uint32_t member = 0; member < group_mblocks; ++member) {
+          const auto queue_slot =
+              queue_base + static_cast<unsigned long long>(ntile) *
+                               group_mblocks + member;
+          const auto task = (mblock + member) * fc1_ntiles + ntile;
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              entry(fc1_ready_queue[queue_slot]);
+          entry.store(task + 1ULL, ::cuda::memory_order_release);
+        }
+      }
+      progressed = true;
+#if MEGAMOE_DEBUG_VALIDATE
+      atomicMax(&completion->bulk_pack_complete,
+                queue_base +
+                    static_cast<unsigned long long>(group_mblocks) *
+                        fc1_ntiles);
+#endif
+    }
+    if (!pending)
+      break;
+    if (!progressed)
+      __nanosleep(256U);
+  }
+#if MEGAMOE_DEBUG_VALIDATE
+  atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
+#endif
+}
+
 __device__ __forceinline__ void publish_ready_fc1_tasks(
     const ForwardKernelArgs &a, std::uint32_t context,
     unsigned long long *scheduler) {
+  if (a.forward_fc1_locality_group > 1U) {
+    publish_ready_fc1_locality_groups(a, context, scheduler);
+    return;
+  }
   const auto forward_mblocks = scheduler[3];
   const auto fc1_ntiles =
       static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);

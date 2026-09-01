@@ -4530,6 +4530,46 @@ __device__ std::uint32_t forward_wavefront_mblock_expert(
   return a.dispatch.sizes.owned_expert_count;
 }
 
+// The readiness queue, rather than this immutable lookup, now determines
+// when a GIN FC1 task becomes runnable. Keep two tile-first waves for startup
+// latency, then place each expert's body M-blocks contiguously so a readiness
+// publisher can release small weight-local groups without changing the wire
+// order or waiting for all Dispatch traffic.
+__device__ std::uint32_t forward_locality_mblock_expert(
+    const ForwardKernelArgs &a, std::uint64_t ordinal,
+    std::uint64_t &local_mblock) {
+  if (a.forward_fc1_locality_group <= 1U ||
+      a.forward_m64_head_wavefront)
+    return forward_wavefront_mblock_expert(a, ordinal, local_mblock);
+
+  constexpr std::uint64_t kStartupMblocks = 2ULL;
+  for (std::uint64_t tile = 0; tile < kStartupMblocks; ++tile) {
+    for (std::uint32_t expert = 0;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      if (tile >= forward_expert_mblock_count(a, expert))
+        continue;
+      if (ordinal == 0ULL) {
+        local_mblock = tile;
+        return expert;
+      }
+      --ordinal;
+    }
+  }
+  for (std::uint32_t expert = 0;
+       expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+    const auto blocks = forward_expert_mblock_count(a, expert);
+    for (std::uint64_t tile = kStartupMblocks; tile < blocks; ++tile) {
+      if (ordinal == 0ULL) {
+        local_mblock = tile;
+        return expert;
+      }
+      --ordinal;
+    }
+  }
+  local_mblock = 0ULL;
+  return a.dispatch.sizes.owned_expert_count;
+}
+
 #endif
 
 __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
@@ -5059,7 +5099,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
          mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
       std::uint64_t local_mblock = 0;
       const auto expert =
-          forward_wavefront_mblock_expert(a, mblock, local_mblock);
+          forward_locality_mblock_expert(a, mblock, local_mblock);
       claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
                        static_cast<std::uint32_t>(local_mblock);
     }
@@ -15074,6 +15114,23 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS", id.calling_rank,
             "one of 4, 8, 16, 32, 64, or 128",
             std::to_string(args.forward_dispatch_publish_batch_rows));
+      // Two adjacent M-blocks retain W1 in L2 while keeping FC2/Return
+      // readiness fine-grained. Group four improves isolated GEMM time but
+      // measurably lengthens the Return/Reduce tail on the H200 world-16
+      // production shape; group one remains the exact regression control.
+      args.forward_fc1_locality_group = 2U;
+      if (const auto *locality_group =
+              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP"))
+        args.forward_fc1_locality_group =
+            static_cast<std::uint32_t>(std::stoul(locality_group));
+      if (args.forward_fc1_locality_group != 1U &&
+          args.forward_fc1_locality_group != 2U &&
+          args.forward_fc1_locality_group != 4U)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
+            "one of 1, 2, or 4",
+            std::to_string(args.forward_fc1_locality_group));
       args.forward_return_max_inflight = 16U;
       if (const auto *max_inflight =
               std::getenv("MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT"))
@@ -15157,6 +15214,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         "at most one of MEGAMOE_FORWARD_M64 and "
                         "MEGAMOE_FORWARD_M64_HEAD",
                         "both enabled");
+      if (args.forward_fc1_locality_group > 1U &&
+          (forward_m64 || forward_m64_head))
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
+            "M128 without an M64 experiment",
+            std::to_string(args.forward_fc1_locality_group));
       if (forward_specialize_stages && (forward_m64 || forward_m64_head))
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                         "Forward stage specialization", id.calling_rank,
