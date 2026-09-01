@@ -111,6 +111,112 @@ __device__ __forceinline__ bool context_wave_span(
   return true;
 }
 
+#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+
+// Transport-only Hopper path. Each warp leader stages one 14-KiB row through
+// the SMEM slot and mbarrier already reserved for local Return. Dispatch and
+// Return progress serially in a Relay CTA, so this adds no shared memory and
+// keeps twelve independent bulk-async streams in flight across the CTA.
+__device__ __forceinline__ void publish_local_batch(
+    const ForwardKernelArgs &a, std::uint64_t route_begin,
+    std::uint64_t route_end,
+    transport_state::GenerationCompletionVector *completion,
+    std::byte *tma_storage,
+    forward_return_detail::DirectLocalReturnBarrier *tma_full) {
+  const auto routes = route_end - route_begin;
+  constexpr std::uint32_t kWarps = persistent_v3::kWarpsPerCta;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  const auto copy_bytes = static_cast<std::uint32_t>(
+      a.hidden * sizeof(transport::BFloat16));
+  bool copied = false;
+  for (std::uint64_t local = warp; local < routes; local += kWarps) {
+    const auto route =
+        a.dispatch_waves.local_route_order[route_begin + local];
+    if (lane == 0U) {
+      const auto destination = a.dispatch.route_dst_rank[route];
+      const auto row = a.dispatch.route_dst_row[route];
+      const auto token = route / a.dispatch.identity.top_k;
+      const auto expert = a.dispatch.expert_id[route];
+      const auto topk_slot = static_cast<std::uint32_t>(
+          route % a.dispatch.identity.top_k);
+      auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+          a.peer_bases[destination], a.direct_headers_offset);
+      destination_headers[row] = LocalP2pRouteHeader{
+          transport::kActivationTransportSchemaVersion,
+          a.rank,
+          destination,
+          0U,
+          a.dispatch.identity.generation,
+          a.epoch,
+          route,
+          route,
+          token,
+          row,
+          expert,
+          topk_slot};
+      auto *destination_rows = peer_at<transport::BFloat16>(
+          a.peer_bases[destination], a.canonical_rows_offset);
+      auto *warp_storage = tma_storage + warp * copy_bytes;
+      auto &warp_full = tma_full[warp];
+      ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+          warp_storage, a.input + token * a.hidden, copy_bytes, warp_full);
+      auto token_barrier =
+          ::cuda::device::barrier_arrive_tx(warp_full, 1U, copy_bytes);
+      warp_full.wait(static_cast<decltype(token_barrier) &&>(token_barrier));
+      ::cuda::device::experimental::cp_async_bulk_shared_to_global(
+          destination_rows + row * a.hidden, warp_storage, copy_bytes);
+      ::cuda::device::experimental::cp_async_bulk_commit_group();
+      ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
+      copied = true;
+    }
+  }
+  if (copied) {
+    ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
+    __threadfence_system();
+  }
+  __syncthreads();
+  if (threadIdx.x < routes) {
+    const auto route =
+        a.dispatch_waves.local_route_order[route_begin + threadIdx.x];
+    const auto destination = a.dispatch.route_dst_rank[route];
+    auto *arrived = peer_at<unsigned long long>(
+        a.peer_bases[destination], a.x_arrived_rows_offset);
+    const auto rail = a.rank % a.local_world_size;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+        ready(arrived[a.dispatch_waves.route_dst_mtile[route] *
+                          a.local_world_size +
+                      rail]);
+    ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+#if MEGAMOE_DEBUG_VALIDATE
+    atomicAdd(&completion->local_rows_published, 1ULL);
+    const auto tile = a.dispatch_waves.route_dst_mtile[route];
+    if (tile < 64U)
+      atomicOr(&completion->published_tile_mask, 1ULL << tile);
+#endif
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0U) {
+    unsigned long long peer_rows = 0ULL;
+    for (auto position = route_begin; position < route_end; ++position) {
+      const auto route = a.dispatch_waves.local_route_order[position];
+      peer_rows += a.dispatch.route_dst_rank[route] != a.rank;
+    }
+    if (peer_rows != 0ULL) {
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      atomicAdd(&status->actual_dispatch_peer_bytes,
+                peer_rows * a.hidden * sizeof(transport::BFloat16));
+    }
+  }
+}
+
+#else
+
+// Keep the established vector path in the compute translation unit.  The
+// separately compiled transport object owns the evolving TMA implementation,
+// so transport changes cannot perturb WGMMA register/stack allocation.
 // Copy one node-local batch and release exact 128-row M-block counters only
 // after every payload/header store made by the CTA is system-visible.  A warp
 // owns a row, so the 14 KiB main-shape copy uses broad contiguous transactions
@@ -208,6 +314,8 @@ __device__ __forceinline__ void publish_local_batch(
     }
   }
 }
+
+#endif // MEGAMOE_FORWARD_TRANSPORT_TU
 
 // RDMA-resident variant of pack_outbound_wave.  Threads [64, 384) form an
 // independent ten-warp bulk group; the GIN owner in warp 0 can issue wave N
@@ -693,6 +801,43 @@ __device__ __forceinline__ void relay_role(
         inbound_terminal = true;
     }
 
+#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+    // Mirror the compute scheduler's FC2-first policy at the node-local
+    // transport boundary.  Once an FC2 M-block is available, retire one
+    // bounded Return batch before issuing another Dispatch batch.  Skipping
+    // Dispatch only in the iteration that actually consumed a descriptor
+    // prevents the TMA streams from competing for the same Relay CTA and
+    // NVLink path while keeping the scheduler work-conserving.
+    bool local_return_progressed = false;
+    if (local_return_done == 0U) {
+      local_return_progressed =
+          forward_return_detail::progress_direct_local_return_once(
+              a, control, context, scheduler, local_return_state,
+              reinterpret_cast<std::byte *>(storage),
+              local_return_tma_full);
+      progressed = local_return_progressed || progressed;
+      if (threadIdx.x == 0U &&
+          forward_return_detail::direct_local_return_terminal(
+              a, scheduler, local_return_state))
+        local_return_done = 1U;
+      __syncthreads();
+    }
+
+    if (!local_return_progressed && local_begin < local_routes) {
+      const auto local_end = min(
+          local_begin + static_cast<std::uint64_t>(kLocalRouteBatch),
+          local_routes);
+      publish_local_batch(a, local_begin, local_end, completion,
+                          reinterpret_cast<std::byte *>(storage),
+                          local_return_tma_full);
+      if (local_begin ==
+          static_cast<std::uint64_t>(relay_ordinal) * kLocalRouteBatch)
+        MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+                                GinDispatch, context, local_begin, a.epoch);
+      local_begin += local_stride;
+      progressed = true;
+    }
+#else
     if (local_begin < local_routes) {
       const auto local_end = min(
           local_begin + static_cast<std::uint64_t>(kLocalRouteBatch),
@@ -705,6 +850,7 @@ __device__ __forceinline__ void relay_role(
       local_begin += local_stride;
       progressed = true;
     }
+#endif
 
     const bool dispatch_terminal =
         inbound_terminal && local_begin >= local_routes;
@@ -728,6 +874,7 @@ __device__ __forceinline__ void relay_role(
       progressed = true;
     }
 
+#if !defined(MEGAMOE_FORWARD_TRANSPORT_TU)
     // One bounded unit from each Return plane keeps Dispatch latency favored
     // without delaying already-computed FC2 rows until the complete Dispatch
     // or FC2 task spaces drain.
@@ -743,6 +890,7 @@ __device__ __forceinline__ void relay_role(
         local_return_done = 1U;
       __syncthreads();
     }
+#endif
 
     if (owns_context_transport && completion_done == 0U) {
       progressed =

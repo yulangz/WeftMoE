@@ -6678,6 +6678,38 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
   }
 }
 
+#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+
+} // namespace
+
+namespace forward_transport_launch {
+
+cudaError_t set_max_dynamic_shared_memory(int bytes) {
+  return cudaFuncSetAttribute(
+      local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+}
+
+cudaError_t launch(const cudaLaunchConfig_t *config, const void *opaque_args,
+                   std::size_t args_bytes, const CUtensorMap &x_map,
+                   const CUtensorMap &s_map, const CUtensorMap &w1_map,
+                   const CUtensorMap &w2_map) {
+  if (opaque_args == nullptr || args_bytes != sizeof(ForwardKernelArgs))
+    return cudaErrorInvalidValue;
+  static_assert(__is_trivially_copyable(ForwardKernelArgs));
+  ForwardKernelArgs args{};
+  std::memcpy(&args, opaque_args, sizeof(args));
+  return cudaLaunchKernelEx(
+      config,
+      local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
+      args, x_map, s_map, w1_map, w2_map);
+}
+
+} // namespace forward_transport_launch
+} // namespace megamoe::cuda
+
+#else
+
 #include "cuda/backward/kernel_contract.cuh"
 
 __device__ bool backward_cancelled(const BackwardKernelArgs &a);
@@ -10071,6 +10103,8 @@ __global__ __launch_bounds__(384, 1) void backward_dw2_specialized_kernel(
 }
 
 } // namespace
+
+#include "cuda/forward/transport_launch.hpp"
 
 struct ActivationTransportResourcePool::Impl {
   std::shared_ptr<ActivationPoolState> state;
@@ -15318,10 +15352,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       args.forward_reduce_cta_count = forward_main_compute_ctas;
       internal::throw_cuda(
           "forward-run",
-          cudaFuncSetAttribute(
-              local_p2p_forward_megakernel<false,
-                                           ForwardKernelRole::TransportOnly>,
-              cudaFuncAttributeMaxDynamicSharedMemorySize,
+          forward_transport_launch::set_max_dynamic_shared_memory(
               static_cast<int>(forward_smem)),
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
@@ -15461,11 +15492,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       transport_launch.blockDim = dim3(384, 1, 1);
       transport_launch.dynamicSmemBytes = forward_smem;
       transport_launch.stream = slot.forward_transport_stream;
-      launch_forward = cudaLaunchKernelEx(
-          &transport_launch,
-          local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
-          args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-          weight.w2_map);
+      launch_forward = forward_transport_launch::launch(
+          &transport_launch, &args, sizeof(args), slot.forward_x_map,
+          slot.forward_s_map, weight.w1_map, weight.w2_map);
       internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
                            id.world_size, backend->session.session().identity(),
                            id.generation, ExchangeKind::ExpertCounts,
@@ -21445,3 +21474,5 @@ bool testing::run_runtime_shape_world1_harness(std::uint64_t hidden,
 }
 
 } // namespace megamoe::cuda
+
+#endif // MEGAMOE_FORWARD_TRANSPORT_TU

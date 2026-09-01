@@ -76,8 +76,11 @@ CUDA_LIB_SOURCES := \
 	src/cuda/activation_transport.cu \
 	src/cuda/persistent_v3/kernel_entry.cu \
 	src/transport/nccl_count_exchange.cu
-CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
-PROD_CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
+CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o) \
+	$(BUILD_DIR)/src/cuda/forward_transport.o
+PROD_CUDA_LIB_OBJECTS := \
+	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
+	$(BUILD_DIR)/production/src/cuda/forward_transport.o
 
 .PHONY: all test reference-test launcher-security-test rdma-launcher-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
@@ -102,6 +105,7 @@ $(BUILD_DIR)/production/%.o: %.cu
 $(BUILD_DIR)/src/cuda/activation_transport.o \
 $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/transport_launch.hpp \
 	src/cuda/forward/runtime_shape_fallback.cuh \
 	src/cuda/backward/kernel_contract.cuh \
 	src/cuda/persistent_v3/contracts.hpp \
@@ -122,6 +126,43 @@ $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/persistent_v3/gemm/dw2_128x128_kernel.cuh \
 	src/cuda/profiling/device_timeline.cuh \
 	src/cuda/profiling/device_timeline_types.hpp
+
+$(BUILD_DIR)/src/cuda/forward_transport.o \
+$(BUILD_DIR)/production/src/cuda/forward_transport.o: \
+	src/cuda/activation_transport.cu \
+	src/cuda/activation_transport_internal.hpp \
+	src/cuda/cuda_internal.hpp \
+	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/transport_launch.hpp \
+	src/cuda/persistent_v3/backward/pipeline_state.cuh \
+	src/cuda/persistent_v3/contracts.hpp \
+	src/cuda/persistent_v3/queues.cuh \
+	src/cuda/persistent_v3/roles/common.cuh \
+	src/cuda/persistent_v3/forward/pipeline_state.cuh \
+	src/cuda/persistent_v3/forward/reduce_queue.cuh \
+	src/cuda/persistent_v3/forward/dispatch_pipeline.cuh \
+	src/cuda/persistent_v3/forward/return_pipeline.cuh \
+	src/cuda/persistent_v3/forward/finalize_pipeline.cuh \
+	src/cuda/persistent_v3/forward/compute_kernel.cuh \
+	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
+	src/cuda/profiling/device_timeline.cuh \
+	src/cuda/profiling/device_timeline_types.hpp \
+	src/cuda/testing/harnesses.hpp \
+	src/cuda/transport_generation_completion.cuh
+
+$(BUILD_DIR)/src/cuda/forward_transport.o:
+	@mkdir -p $(@D)
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 \
+		-DMEGAMOE_FORWARD_TRANSPORT_TU=1 -diag-suppress=177 $(CUDA_NVCCFLAGS) \
+		$(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror \
+		-c src/cuda/activation_transport.cu -o $@
+
+$(BUILD_DIR)/production/src/cuda/forward_transport.o:
+	@mkdir -p $(@D)
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 \
+		-DMEGAMOE_FORWARD_TRANSPORT_TU=1 -diag-suppress=177 $(CUDA_NVCCFLAGS) \
+		$(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror \
+		-c src/cuda/activation_transport.cu -o $@
 
 $(BUILD_DIR)/src/cuda/persistent_v3/kernel_entry.o \
 $(BUILD_DIR)/production/src/cuda/persistent_v3/kernel_entry.o: \
