@@ -15044,6 +15044,38 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         "MEGAMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
                         "one of 0, 4, 8, or 12",
                         std::to_string(args.forward_relay_tma_warps));
+      args.forward_dispatch_publish_batch_rows = 32U;
+      if (const auto *batch_rows =
+              std::getenv("MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS"))
+        args.forward_dispatch_publish_batch_rows =
+            static_cast<std::uint32_t>(std::stoul(batch_rows));
+      if (args.forward_dispatch_publish_batch_rows != 4U &&
+          args.forward_dispatch_publish_batch_rows != 8U &&
+          args.forward_dispatch_publish_batch_rows != 16U &&
+          args.forward_dispatch_publish_batch_rows != 32U &&
+          args.forward_dispatch_publish_batch_rows != 64U &&
+          args.forward_dispatch_publish_batch_rows != 128U)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS", id.calling_rank,
+            "one of 4, 8, 16, 32, 64, or 128",
+            std::to_string(args.forward_dispatch_publish_batch_rows));
+      args.forward_return_max_inflight = 16U;
+      if (const auto *max_inflight =
+              std::getenv("MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT"))
+        args.forward_return_max_inflight =
+            static_cast<std::uint32_t>(std::stoul(max_inflight));
+      if (args.forward_return_max_inflight != 0U &&
+          args.forward_return_max_inflight != 4U &&
+          args.forward_return_max_inflight != 8U &&
+          args.forward_return_max_inflight != 16U &&
+          args.forward_return_max_inflight != 32U &&
+          args.forward_return_max_inflight != 64U)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT", id.calling_rank,
+            "one of 0, 4, 8, 16, 32, or 64",
+            std::to_string(args.forward_return_max_inflight));
       // FC2 writes its result exactly once into the registered Return plane.
       // Relay TMA and remote GIN then consume that same immutable storage,
       // avoiding a full output-sized duplicate GMEM write.  Keep an explicit

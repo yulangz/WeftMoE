@@ -578,31 +578,56 @@ __device__ __forceinline__ void flush_direct_full_run(
   run.rows = 0U;
 }
 
-// Every context owner scans the small M-block record, but only emits runs whose
-// immutable compact chunk maps to that context.  A zero map is unambiguous here:
-// the canonical header says whether the row is local or whether its eager
-// remote mapping is still in flight.  Waiting parks only the RDMA owner, never
-// the FC2 producer.
-__device__ __forceinline__ void issue_direct_full_mblock_rdmacta(
+struct DirectFullRdmaState {
+  unsigned long long cursor = 0ULL;
+  unsigned long long issued = 0ULL;
+  unsigned long long completed = 0ULL;
+  std::uint32_t local_row = 0U;
+  DirectFullPendingRun run{};
+};
+
+__device__ __forceinline__ bool direct_full_return_has_credit(
+    const ForwardKernelArgs &a, const ncclGin &gin,
+    DirectFullRdmaState &state) {
+  const auto limit =
+      static_cast<unsigned long long>(a.forward_return_max_inflight);
+  if (limit == 0ULL || state.issued - state.completed < limit)
+    return true;
+  const auto completed =
+      gin.readCounter(1, 56, ::cuda::memory_order_acquire);
+  state.completed = completed < state.issued ? completed : state.issued;
+  return state.issued - state.completed < limit;
+}
+
+// Scan one M-block incrementally and emit at most one coalesced run per call.
+// The row cursor and pending run make a full Return QP non-blocking: Dispatch
+// retains priority on the same RDMA CTA instead of waiting for queue credit or
+// issuing every run in a 128-row block as one unbounded burst.
+__device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
     const ForwardKernelArgs &a,
     persistent_v3::ForwardPipelineControl &control, const ncclGin &gin,
     ncclTeam world, std::uint32_t context,
     const ForwardDirectReturnFragment &mblock,
     transport_state::GenerationCompletionVector *completion,
     transport_state::ContextCompletionRecord *context_completion,
-    unsigned long long &issued) {
+    DirectFullRdmaState &state) {
   auto *mapping = peer_at<unsigned long long>(
       a.local_base, a.forward_output_ready_epoch_offset);
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
       a.local_base, a.direct_headers_offset);
-  DirectFullPendingRun run{};
 
-  for (std::uint32_t local_row = 0U; local_row < mblock.row_count; ++local_row) {
-    const auto canonical_row = mblock.canonical_row + local_row;
+  while (state.local_row < mblock.row_count) {
+    const auto canonical_row = mblock.canonical_row + state.local_row;
     const auto source = headers[canonical_row].source_rank;
     if (source / a.local_world_size == a.node) {
-      flush_direct_full_run(a, gin, world, context, run, completion,
-                            context_completion, issued);
+      if (state.run.rows != 0U) {
+        if (!direct_full_return_has_credit(a, gin, state))
+          return false;
+        flush_direct_full_run(a, gin, world, context, state.run, completion,
+                              context_completion, state.issued);
+        return true;
+      }
+      ++state.local_row;
       continue;
     }
     // The immutable canonical header already identifies the only FULL
@@ -612,8 +637,14 @@ __device__ __forceinline__ void issue_direct_full_mblock_rdmacta(
     // after the expensive system-scope load completed.
     const auto direct_context = source % a.local_world_size;
     if (direct_context != context) {
-      flush_direct_full_run(a, gin, world, context, run, completion,
-                            context_completion, issued);
+      if (state.run.rows != 0U) {
+        if (!direct_full_return_has_credit(a, gin, state))
+          return false;
+        flush_direct_full_run(a, gin, world, context, state.run, completion,
+                              context_completion, state.issued);
+        return true;
+      }
+      ++state.local_row;
       continue;
     }
 #if MEGAMOE_DEBUG_VALIDATE
@@ -621,49 +652,54 @@ __device__ __forceinline__ void issue_direct_full_mblock_rdmacta(
 #endif
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(mapping[canonical_row]);
-    auto encoded = published.load(::cuda::memory_order_acquire);
+    const auto encoded = published.load(::cuda::memory_order_acquire);
 #if MEGAMOE_DEBUG_VALIDATE
     if (encoded == 0ULL)
       atomicMax(&completion->fc2_scheduler_value, 5000ULL + canonical_row);
 #endif
-    while (encoded == 0ULL && !cancelled(a, control)) {
-      __nanosleep(32U);
-      encoded = published.load(::cuda::memory_order_acquire);
-    }
-    if (cancelled(a, control)) {
-      run.rows = 0U;
-      return;
-    }
+    // The helper's per-context release certificate is acquired before this
+    // scan, so a zero mapping means that helper has not completed yet. Leave
+    // the row cursor in place and let Dispatch make progress before retrying.
+    if (encoded == 0ULL || cancelled(a, control))
+      return false;
 #if MEGAMOE_DEBUG_VALIDATE
     atomicMax(&completion->fc2_scheduler_value, 6000ULL + canonical_row);
 #endif
     const auto compact = return_mapping_compact_row(encoded);
     const auto chunk = return_mapping_chunk(encoded);
     const bool extends =
-        run.rows != 0U && source == run.source && chunk == run.chunk &&
-        compact == run.compact + run.rows &&
-        canonical_row == run.canonical + run.rows;
+        state.run.rows != 0U && source == state.run.source &&
+        chunk == state.run.chunk &&
+        compact == state.run.compact + state.run.rows &&
+        canonical_row == state.run.canonical + state.run.rows;
     if (!extends) {
-      flush_direct_full_run(a, gin, world, context, run, completion,
-                            context_completion, issued);
-      run.source = source;
-      run.canonical = canonical_row;
-      run.compact = compact;
-      run.chunk = chunk;
-      run.rows = 1U;
+      if (state.run.rows != 0U) {
+        if (!direct_full_return_has_credit(a, gin, state))
+          return false;
+        flush_direct_full_run(a, gin, world, context, state.run, completion,
+                              context_completion, state.issued);
+        return true;
+      }
+      state.run.source = source;
+      state.run.canonical = canonical_row;
+      state.run.compact = compact;
+      state.run.chunk = chunk;
+      state.run.rows = 1U;
     } else {
-      ++run.rows;
+      ++state.run.rows;
     }
+    ++state.local_row;
   }
-  if (!cancelled(a, control))
-    flush_direct_full_run(a, gin, world, context, run, completion,
-                          context_completion, issued);
+  if (state.run.rows != 0U) {
+    if (!direct_full_return_has_credit(a, gin, state))
+      return false;
+    flush_direct_full_run(a, gin, world, context, state.run, completion,
+                          context_completion, state.issued);
+  }
+  state.local_row = 0U;
+  ++state.cursor;
+  return true;
 }
-
-struct DirectFullRdmaState {
-  unsigned long long cursor = 0ULL;
-  unsigned long long issued = 0ULL;
-};
 
 // Once RDMA packing has drained, its ten data warps have no more useful work
 // while lane 0 remains the permanent GIN owner.  Use those otherwise-idle
@@ -757,10 +793,10 @@ __device__ __forceinline__ bool direct_full_mblock_mapping_ready(
          0ULL;
 }
 
-// Consume at most one immutable M-block record.  Calling this once from each
-// Dispatch scheduler iteration gives Rail Dispatch priority while opportunistic
-// FULL puts fill otherwise idle network time.  Every context has an independent
-// cursor over the fixed record array and remains the sole owner of its GIN QP.
+// Consume at most one coalesced run. Calling this once from each Dispatch
+// scheduler iteration gives Rail Dispatch priority while opportunistic FULL
+// puts fill otherwise idle network time. Every context remains the sole owner
+// of its GIN QP.
 __device__ __forceinline__ bool progress_direct_full_rdma_once(
     const ForwardKernelArgs &a,
     persistent_v3::ForwardPipelineControl &control, const ncclGin &gin,
@@ -784,10 +820,12 @@ __device__ __forceinline__ bool progress_direct_full_rdma_once(
   if ((fragment.reserved & (1U << context)) != 0U) {
     if (!direct_full_mblock_mapping_ready(a, context, fragment))
       return false;
-    issue_direct_full_mblock_rdmacta(
+    return progress_direct_full_mblock_rdmacta(
         a, control, gin, world, context, fragment, completion,
-        context_completion, state.issued);
+        context_completion, state);
   }
+  state.local_row = 0U;
+  state.run.rows = 0U;
   ++state.cursor;
   return true;
 }

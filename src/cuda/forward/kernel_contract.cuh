@@ -120,6 +120,12 @@ struct ForwardKernelArgs {
   // bulk store to the peer UVA destination. This is an explicit A/B knob until
   // the end-to-end tuner proves it better than the warp-vector path.
   std::uint32_t forward_relay_tma_warps = 0;
+  // Publish Dispatch readiness after this many source packets. Relay keeps
+  // copying the rest of the GIN wave while FC1 consumes an earlier microbatch.
+  std::uint32_t forward_dispatch_publish_batch_rows = 32;
+  // Bound outstanding FULL Return puts per physical GIN context. Zero keeps
+  // the legacy unbounded issue behavior for autotuner/regression A/B runs.
+  std::uint32_t forward_return_max_inflight = 16;
   // When enabled, FC2 writes every canonical output row once into the GIN
   // registered staging plane. Both local Relay TMA and remote FULL puts then
   // consume that same allocation, eliminating the second remote-row store.

@@ -411,117 +411,123 @@ __device__ __forceinline__ void relay_inbound_wave(
   const auto partition_fanout_base =
       partition_packet_base * a.dispatch.identity.top_k;
   const auto vector_count = a.hidden / 8ULL;
-  const auto fanout_items = static_cast<std::uint64_t>(task.row_count) *
-                            a.dispatch.identity.top_k;
   constexpr std::uint32_t kWarps = persistent_v3::kWarpsPerCta;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
-  for (std::uint64_t item = warp; item < fanout_items; item += kWarps) {
-    const auto packet_in_wave = item / a.dispatch.identity.top_k;
-    const auto fanout_slot = item % a.dispatch.identity.top_k;
-    const auto sequence = task.row_begin + packet_in_wave;
-    const auto packet = partition_packet_base + sequence;
-    std::uint32_t valid = 0U;
-    std::uint32_t destination_local_rank = 0U;
-    std::uint64_t destination_row = 0ULL;
-    if (lane == 0U) {
-      const auto header = receive_headers[packet];
-      if (fanout_slot < header.route_index) {
-        const auto packed =
-            partition_fanout_base + header.dst_row + fanout_slot;
-        const auto target = receive_fanout[packed];
-        valid = 1U;
-        destination_local_rank = target.destination_local_rank;
-        destination_row = target.dst_row;
-        const auto destination =
-            a.node * a.local_world_size + destination_local_rank;
-        auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-            a.peer_bases[destination], a.direct_headers_offset);
-        const auto route = header.local_token_id *
-                               a.dispatch.identity.top_k +
-                           target.topk_slot;
-        destination_headers[destination_row] = LocalP2pRouteHeader{
-            transport::kActivationTransportSchemaVersion,
-            header.source_rank,
-            destination,
-            header.channel,
-            header.generation,
-            a.epoch,
-            header.sequence,
-            route,
-            header.local_token_id,
-            destination_row,
-            target.expert_id,
-            target.topk_slot};
+  const auto publish_batch_rows = min(
+      static_cast<std::uint64_t>(a.forward_dispatch_publish_batch_rows),
+      static_cast<std::uint64_t>(task.row_count));
+  for (std::uint64_t batch_row_begin = 0ULL; batch_row_begin < task.row_count;
+       batch_row_begin += publish_batch_rows) {
+    const auto batch_row_end = min(batch_row_begin + publish_batch_rows,
+                                   static_cast<std::uint64_t>(task.row_count));
+    const auto batch_item_begin = batch_row_begin * a.dispatch.identity.top_k;
+    const auto batch_item_end = batch_row_end * a.dispatch.identity.top_k;
+    for (std::uint64_t item = batch_item_begin + warp;
+         item < batch_item_end; item += kWarps) {
+      const auto packet_in_wave = item / a.dispatch.identity.top_k;
+      const auto fanout_slot = item % a.dispatch.identity.top_k;
+      const auto sequence = task.row_begin + packet_in_wave;
+      const auto packet = partition_packet_base + sequence;
+      std::uint32_t valid = 0U;
+      std::uint32_t destination_local_rank = 0U;
+      std::uint64_t destination_row = 0ULL;
+      if (lane == 0U) {
+        const auto header = receive_headers[packet];
+        if (fanout_slot < header.route_index) {
+          const auto packed =
+              partition_fanout_base + header.dst_row + fanout_slot;
+          const auto target = receive_fanout[packed];
+          valid = 1U;
+          destination_local_rank = target.destination_local_rank;
+          destination_row = target.dst_row;
+          const auto destination =
+              a.node * a.local_world_size + destination_local_rank;
+          auto *destination_headers = peer_at<LocalP2pRouteHeader>(
+              a.peer_bases[destination], a.direct_headers_offset);
+          const auto route = header.local_token_id * a.dispatch.identity.top_k +
+                             target.topk_slot;
+          destination_headers[destination_row] =
+              LocalP2pRouteHeader{transport::kActivationTransportSchemaVersion,
+                                  header.source_rank,
+                                  destination,
+                                  header.channel,
+                                  header.generation,
+                                  a.epoch,
+                                  header.sequence,
+                                  route,
+                                  header.local_token_id,
+                                  destination_row,
+                                  target.expert_id,
+                                  target.topk_slot};
+        }
       }
+      valid = __shfl_sync(0xffffffffU, valid, 0U);
+      if (valid == 0U)
+        continue;
+      destination_local_rank =
+          __shfl_sync(0xffffffffU, destination_local_rank, 0U);
+      destination_row = __shfl_sync(0xffffffffU, destination_row, 0U);
+      const auto destination =
+          a.node * a.local_world_size + destination_local_rank;
+      auto *destination_rows = peer_at<transport::BFloat16>(
+          a.peer_bases[destination], a.canonical_rows_offset);
+      auto *target = reinterpret_cast<uint4 *>(destination_rows) +
+                     destination_row * vector_count;
+      const auto *source = reinterpret_cast<const uint4 *>(receive_payload) +
+                           packet * vector_count;
+      for (std::uint64_t vector = lane; vector < vector_count; vector += 32ULL)
+        target[vector] = source[vector];
     }
-    valid = __shfl_sync(0xffffffffU, valid, 0U);
-    if (valid == 0U)
-      continue;
-    destination_local_rank =
-        __shfl_sync(0xffffffffU, destination_local_rank, 0U);
-    destination_row =
-        __shfl_sync(0xffffffffU, destination_row, 0U);
-    const auto destination =
-        a.node * a.local_world_size + destination_local_rank;
-    auto *destination_rows = peer_at<transport::BFloat16>(
-        a.peer_bases[destination], a.canonical_rows_offset);
-    auto *target = reinterpret_cast<uint4 *>(destination_rows) +
-                   destination_row * vector_count;
-    const auto *source = reinterpret_cast<const uint4 *>(receive_payload) +
-                         packet * vector_count;
-    for (std::uint64_t vector = lane; vector < vector_count; vector += 32ULL)
-      target[vector] = source[vector];
-  }
 
-  __threadfence_system();
-  __syncthreads();
-  for (std::uint64_t item = threadIdx.x; item < fanout_items;
-       item += blockDim.x) {
-    const auto packet_in_wave = item / a.dispatch.identity.top_k;
-    const auto fanout_slot = item % a.dispatch.identity.top_k;
-    const auto packet = partition_packet_base + task.row_begin +
-                        packet_in_wave;
-    const auto header = receive_headers[packet];
-    if (fanout_slot >= header.route_index)
-      continue;
-    const auto target = receive_fanout[
-        partition_fanout_base + header.dst_row + fanout_slot];
-    const auto destination =
-        a.node * a.local_world_size + target.destination_local_rank;
-    auto *arrived = peer_at<unsigned long long>(
-        a.peer_bases[destination], a.x_arrived_rows_offset);
-    const auto rail = a.rank % a.local_world_size;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        ready(arrived[target.reserved * a.local_world_size + rail]);
-    ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
-    // X readiness is the FC1 dependency; do not lengthen it with reverse-map
-    // publication. FC2's descriptor is consumed only after the FULL mapping
-    // helper acquires this release.
-    const auto compact_row = target.return_compact_row;
-    const auto chunk = compact_row / a.forward_return_chunk_rows;
-    fragment_index[partition_fanout_base + compact_row] =
-        header.dst_row + fanout_slot;
-    auto *peer_map = peer_at<unsigned long long>(
-        a.peer_bases[destination], a.forward_output_ready_epoch_offset);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        published(peer_map[target.dst_row]);
-    published.store(
-        encode_return_row_mapping(a.rank, chunk,
-                                  partition_fanout_base + compact_row),
-        ::cuda::memory_order_release);
+    __threadfence_system();
+    __syncthreads();
+    for (std::uint64_t item = batch_item_begin + threadIdx.x;
+         item < batch_item_end; item += blockDim.x) {
+      const auto packet_in_wave = item / a.dispatch.identity.top_k;
+      const auto fanout_slot = item % a.dispatch.identity.top_k;
+      const auto packet =
+          partition_packet_base + task.row_begin + packet_in_wave;
+      const auto header = receive_headers[packet];
+      if (fanout_slot >= header.route_index)
+        continue;
+      const auto target =
+          receive_fanout[partition_fanout_base + header.dst_row + fanout_slot];
+      const auto destination =
+          a.node * a.local_world_size + target.destination_local_rank;
+      auto *arrived = peer_at<unsigned long long>(a.peer_bases[destination],
+                                                  a.x_arrived_rows_offset);
+      const auto rail = a.rank % a.local_world_size;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+          arrived[target.reserved * a.local_world_size + rail]);
+      ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+      // X readiness is the FC1 dependency; do not lengthen it with reverse-map
+      // publication. FC2's descriptor is consumed only after the FULL mapping
+      // helper acquires this release.
+      const auto compact_row = target.return_compact_row;
+      const auto chunk = compact_row / a.forward_return_chunk_rows;
+      fragment_index[partition_fanout_base + compact_row] =
+          header.dst_row + fanout_slot;
+      auto *peer_map = peer_at<unsigned long long>(
+          a.peer_bases[destination], a.forward_output_ready_epoch_offset);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          published(peer_map[target.dst_row]);
+      published.store(encode_return_row_mapping(
+                          a.rank, chunk, partition_fanout_base + compact_row),
+                      ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
-    const auto record_index =
-        source_partition * a.gin_context_count + task.context;
-    atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
-    if (target.reserved == 0U)
-      atomicAdd(&context_completion[record_index].relay_tile0_rows, 1ULL);
-    atomicAdd(&completion->remote_rows_published, 1ULL);
-    if (target.reserved < 64U)
-      atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
+      const auto record_index =
+          source_partition * a.gin_context_count + task.context;
+      atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
+      if (target.reserved == 0U)
+        atomicAdd(&context_completion[record_index].relay_tile0_rows, 1ULL);
+      atomicAdd(&completion->remote_rows_published, 1ULL);
+      if (target.reserved < 64U)
+        atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
 #endif
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   if (threadIdx.x == 0U) {
     const auto record_index =
