@@ -1127,10 +1127,13 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
         // Return arrive in large bursts.  Keep the configured two-block
         // cadence at both ends and widen only the saturated middle window.
         const bool middle_group4 =
-            locality_group == 2U && local_mblock >= 4U &&
-            local_mblock < 12U;
+            locality_group == 2U &&
+            local_mblock >= a.forward_fc1_locality_group4_begin &&
+            local_mblock < a.forward_fc1_locality_group4_end;
         const auto effective_group = middle_group4 ? 4U : locality_group;
-        const auto group_origin = middle_group4 ? 4U : kStartupMblocks;
+        const auto group_origin =
+            middle_group4 ? a.forward_fc1_locality_group4_begin
+                          : kStartupMblocks;
         const auto group_offset =
             (local_mblock - group_origin) % effective_group;
         if (group_offset != 0U) {

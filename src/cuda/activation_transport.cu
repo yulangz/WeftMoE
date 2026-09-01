@@ -15148,10 +15148,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS", id.calling_rank,
             "one of 4, 8, 16, 32, 64, or 128",
             std::to_string(args.forward_dispatch_publish_batch_rows));
-      // Two adjacent M-blocks retain W1 in L2 while keeping FC2/Return
-      // readiness fine-grained. Group four improves isolated GEMM time but
-      // measurably lengthens the Return/Reduce tail on the H200 world-16
-      // production shape; group one remains the exact regression control.
+      // A two-block base cadence keeps FC2/Return readiness fine-grained. The
+      // saturated middle window widens to four for stronger W1 L2 reuse;
+      // keeping its bounds tunable is important because widening near the
+      // tail improves isolated GEMM time but lengthens Return/Reduce sharply.
       args.forward_fc1_locality_group = 2U;
       if (const auto *locality_group =
               std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP"))
@@ -15165,6 +15165,32 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
             "one of 1, 2, or 4",
             std::to_string(args.forward_fc1_locality_group));
+      std::uint32_t locality_group4_begin = 4U;
+      std::uint32_t locality_group4_end = 12U;
+      if (const auto *begin =
+              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN"))
+        locality_group4_begin =
+            static_cast<std::uint32_t>(std::stoul(begin));
+      if (const auto *end =
+              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_END"))
+        locality_group4_end = static_cast<std::uint32_t>(std::stoul(end));
+      const auto locality_group4_span =
+          locality_group4_end - locality_group4_begin;
+      if (locality_group4_begin < 2U || locality_group4_end > UINT8_MAX ||
+          (locality_group4_begin & 1U) != 0U ||
+          locality_group4_end < locality_group4_begin ||
+          (locality_group4_span & 3U) != 0U)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN/END",
+            id.calling_rank,
+            "begin>=2 and even; end<=255; end>=begin; span divisible by 4",
+            std::to_string(locality_group4_begin) + ":" +
+                std::to_string(locality_group4_end));
+      args.forward_fc1_locality_group4_begin =
+          static_cast<std::uint8_t>(locality_group4_begin);
+      args.forward_fc1_locality_group4_end =
+          static_cast<std::uint8_t>(locality_group4_end);
       args.forward_return_max_inflight = 16U;
       if (const auto *max_inflight =
               std::getenv("MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT"))

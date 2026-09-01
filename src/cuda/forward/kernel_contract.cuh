@@ -144,6 +144,10 @@ struct ForwardKernelArgs {
   // all other experts remain M128 so the startup dependency shrinks without
   // turning the entire expert wavefront into competing M64 traffic.
   bool forward_m64_head_wavefront = false;
+  // Fill the two bytes that would otherwise pad the adjacent mode flags.
+  // When locality_group is two, this half-open window uses groups of four.
+  std::uint8_t forward_fc1_locality_group4_begin = 4;
+  std::uint8_t forward_fc1_locality_group4_end = 12;
   std::uint32_t forward_m64_head_cta_count = 0;
   std::uint32_t forward_m64_head_expert_count = 0;
   // Forward scheduling may release a 64-row compute tile as soon as Notify's
