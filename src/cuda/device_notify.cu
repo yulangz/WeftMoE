@@ -1256,8 +1256,23 @@ __global__ void materialize_wave_sort_keys_kernel(
     key = a.packet_headers[packet].local_token_id;
   else if constexpr (Field == WaveSortField::DestinationRank)
     key = a.packet_primary_rank[packet];
-  else if constexpr (Field == WaveSortField::Expert)
+  else if constexpr (Field == WaveSortField::Expert) {
     key = a.packet_primary_expert[packet];
+    // Preserve complete expert runs, but transpose the two four-GPU halves of
+    // an eight-GPU node.  The natural global-expert order leaves the same
+    // middle rails (notably local ranks 4 and 6) on the late side of multiple
+    // 128-packet wave/context boundaries.  This bounded permutation keeps the
+    // Return-friendly expert-major stream while distributing those boundaries
+    // in three-bit bit-reversed order.  Other topology widths retain their
+    // canonical order.
+    if (a.nodes != 0U && a.world == a.nodes * 8U) {
+      const auto local =
+          a.rank_to_local[a.packet_primary_rank[packet]];
+      const auto priority = ((local & 1U) << 2U) | (local & 2U) |
+                            ((local & 4U) >> 2U);
+      key += static_cast<std::uint64_t>(priority) * a.experts;
+    }
+  }
   else if constexpr (Field == WaveSortField::MTile)
     key = a.packet_primary_tile[packet];
   else
