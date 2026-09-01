@@ -120,6 +120,10 @@ struct ForwardKernelArgs {
   // bulk store to the peer UVA destination. This is an explicit A/B knob until
   // the end-to-end tuner proves it better than the warp-vector path.
   std::uint32_t forward_relay_tma_warps = 0;
+  // Batch only descriptors that are already published. This amortizes the
+  // issuing warp's system fence and route-ready publication without waiting
+  // for a future FC2 M-block at the tail.
+  std::uint32_t forward_local_return_batch_mblocks = 4;
   // Publish Dispatch readiness after this many source packets. Relay keeps
   // copying the rest of the GIN wave while FC1 consumes an earlier microbatch.
   std::uint32_t forward_dispatch_publish_batch_rows = 32;

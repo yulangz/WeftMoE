@@ -156,7 +156,7 @@ __device__ __forceinline__ void publish_direct_full_source_chunk(
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
         route_ready[route]);
     if (a.forward_dynamic_reduce_queue)
-      forward_reduce_detail::publish_ready_route(a, a.local_base, route);
+      forward_reduce_detail::publish_ready_route(a, a.local_base, route, 1U);
     else
       ready.store(a.epoch, ::cuda::memory_order_release);
   }
@@ -281,11 +281,15 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   return state.progressed != 0U;
 }
 
+inline constexpr std::uint32_t kMaxDirectLocalReturnBatch = 8U;
+
 struct DirectLocalReturnState {
   unsigned long long cursor = 0ULL;
   unsigned long long stride = 1ULL;
   std::uint32_t selected = 0U;
+  std::uint32_t active = 0U;
   std::uint32_t copied_rows = 0U;
+  ForwardDirectReturnFragment batch[kMaxDirectLocalReturnBatch]{};
 };
 
 __device__ __forceinline__ bool direct_local_return_terminal(
@@ -300,12 +304,12 @@ __device__ __forceinline__ bool direct_local_return_terminal(
 }
 
 // Consume one stripe of immutable FC2 M-block descriptors for this node-local
-// source rank. Compute only paid one M-block system fence and descriptor
-// release before returning to the GEMM scheduler. The production candidate
-// stages each contiguous row through shared memory with Hopper bulk async;
-// the warp-vector implementation remains as an exact A/B fallback. Multiple
-// Relay CTAs paired with one context use disjoint cursor/stride pairs and
-// therefore need no shared work queue or claim atomic.
+// source rank. Only descriptors already published at entry are batched, so an
+// incomplete tail never delays an earlier M-block. Hopper bulk async stages
+// each contiguous row through shared memory; the warp-vector implementation
+// remains as an exact A/B fallback. Multiple Relay CTAs paired with one context
+// use disjoint cursor/stride pairs and therefore need no shared work queue or
+// claim atomic.
 __device__ __forceinline__ bool progress_direct_local_return_once(
     const ForwardKernelArgs &a,
     persistent_v3::ForwardPipelineControl &control, std::uint32_t context,
@@ -315,23 +319,33 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       a.local_base, a.forward_direct_return_fragment_offset);
   if (threadIdx.x == 0U) {
     state.selected = 0U;
+    state.active = 0U;
     state.copied_rows = 0U;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
         direct_fragment_tail(a, scheduler));
-    if (state.cursor < tail.load(::cuda::memory_order_acquire)) {
+    const auto published_tail = tail.load(::cuda::memory_order_acquire);
+    for (std::uint32_t item = 0U;
+         item < a.forward_local_return_batch_mblocks; ++item) {
+      const auto slot = state.cursor +
+                        static_cast<unsigned long long>(item) * state.stride;
+      if (slot >= published_tail)
+        break;
       ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
-          fragments[state.cursor].epoch);
-      if (published.load(::cuda::memory_order_acquire) == a.epoch)
-        state.selected = 1U;
+          fragments[slot].epoch);
+      if (published.load(::cuda::memory_order_acquire) != a.epoch)
+        break;
+      state.batch[state.selected] = fragments[slot];
+      if ((state.batch[state.selected].source_rank & (1U << context)) != 0U)
+        ++state.active;
+      ++state.selected;
     }
   }
   __syncthreads();
   if (state.selected == 0U || cancelled(a, control))
     return false;
 
-  const auto fragment = fragments[state.cursor];
   const auto local_source = a.node * a.local_world_size + context;
-  if ((fragment.source_rank & (1U << context)) != 0U) {
+  if (state.active != 0U) {
     if (threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -363,28 +377,36 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       if (warp < tma_warps && lane == 0U) {
         auto *warp_storage = tma_storage + warp * copy_bytes;
         auto &warp_full = tma_full[warp];
-        for (std::uint32_t local_row = warp;
-             local_row < fragment.row_count; local_row += tma_warps) {
-          const auto canonical_row = fragment.canonical_row + local_row;
-          const auto header = headers[canonical_row];
-          if (header.source_rank != local_source)
+        bool copied = false;
+        for (std::uint32_t item = 0U; item < state.selected; ++item) {
+          const auto fragment = state.batch[item];
+          if ((fragment.source_rank & (1U << context)) == 0U)
             continue;
-          const auto *source = forward_output + canonical_row * a.hidden;
-          auto *target =
-              source_contribution + header.route_index * a.hidden;
-          ::cuda::device::experimental::cp_async_bulk_global_to_shared(
-              warp_storage, source, copy_bytes, warp_full);
-          auto token = ::cuda::device::barrier_arrive_tx(
-              warp_full, 1U, copy_bytes);
-          warp_full.wait(static_cast<decltype(token) &&>(token));
-          ::cuda::device::experimental::cp_async_bulk_shared_to_global(
-              target, warp_storage, copy_bytes);
-          ::cuda::device::experimental::cp_async_bulk_commit_group();
-          ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
-          atomicAdd(&state.copied_rows, 1U);
+          for (std::uint32_t local_row = warp;
+               local_row < fragment.row_count; local_row += tma_warps) {
+            const auto canonical_row = fragment.canonical_row + local_row;
+            const auto header = headers[canonical_row];
+            if (header.source_rank != local_source)
+              continue;
+            const auto *source = forward_output + canonical_row * a.hidden;
+            auto *target =
+                source_contribution + header.route_index * a.hidden;
+            ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+                warp_storage, source, copy_bytes, warp_full);
+            auto token = ::cuda::device::barrier_arrive_tx(
+                warp_full, 1U, copy_bytes);
+            warp_full.wait(static_cast<decltype(token) &&>(token));
+            ::cuda::device::experimental::cp_async_bulk_shared_to_global(
+                target, warp_storage, copy_bytes);
+            ::cuda::device::experimental::cp_async_bulk_commit_group();
+            ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
+            copied = true;
+          }
         }
-        ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
-        __threadfence_system();
+        if (copied) {
+          ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
+          __threadfence_system();
+        }
       }
     } else {
       const auto vector_count = a.hidden / 8ULL;
@@ -392,43 +414,57 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       const auto lane = threadIdx.x & 31U;
       constexpr auto kWarps = persistent_v3::kWarpsPerCta;
       // A warp owns one row. Twelve independent copy streams expose enough
-      // outstanding peer transactions to fill NVLink without serializing the
-      // M-block into 128 CTA-wide row copies.
-      for (std::uint32_t local_row = warp; local_row < fragment.row_count;
-           local_row += kWarps) {
-        const auto canonical_row = fragment.canonical_row + local_row;
-        const auto header = headers[canonical_row];
-        if (header.source_rank != local_source)
+      // outstanding peer transactions to fill NVLink. Batching only changes
+      // the fence cadence; each row keeps the same warp ownership.
+      for (std::uint32_t item = 0U; item < state.selected; ++item) {
+        const auto fragment = state.batch[item];
+        if ((fragment.source_rank & (1U << context)) == 0U)
           continue;
-        const auto *source128 = reinterpret_cast<const uint4 *>(
-            forward_output + canonical_row * a.hidden);
-        auto *target128 = reinterpret_cast<uint4 *>(
-            source_contribution + header.route_index * a.hidden);
-        for (std::uint64_t vector = lane; vector < vector_count;
-             vector += 32ULL)
-          target128[vector] = source128[vector];
-        if (lane == 0U)
-          atomicAdd(&state.copied_rows, 1U);
+        for (std::uint32_t local_row = warp; local_row < fragment.row_count;
+             local_row += kWarps) {
+          const auto canonical_row = fragment.canonical_row + local_row;
+          const auto header = headers[canonical_row];
+          if (header.source_rank != local_source)
+            continue;
+          const auto *source128 = reinterpret_cast<const uint4 *>(
+              forward_output + canonical_row * a.hidden);
+          auto *target128 = reinterpret_cast<uint4 *>(
+              source_contribution + header.route_index * a.hidden);
+          for (std::uint64_t vector = lane; vector < vector_count;
+               vector += 32ULL)
+            target128[vector] = source128[vector];
+        }
       }
       __threadfence_system();
     }
     __syncthreads();
-    for (std::uint32_t local_row = threadIdx.x;
-         local_row < fragment.row_count; local_row += blockDim.x) {
-      const auto canonical_row = fragment.canonical_row + local_row;
-      const auto header = headers[canonical_row];
-      if (header.source_rank != local_source)
+    std::uint32_t published_rows = 0U;
+    for (std::uint32_t item = 0U; item < state.selected; ++item) {
+      const auto fragment = state.batch[item];
+      if ((fragment.source_rank & (1U << context)) == 0U)
         continue;
-      auto *source_route_ready = peer_at<unsigned long long>(
-          a.peer_bases[local_source], a.return_ready_epoch_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          source_route_ready[header.route_index]);
-      if (a.forward_dynamic_reduce_queue)
-        forward_reduce_detail::publish_ready_route(
-            a, a.peer_bases[local_source], header.route_index);
-      else
-        ready.store(a.epoch, ::cuda::memory_order_release);
+      for (std::uint32_t local_row = threadIdx.x;
+           local_row < fragment.row_count; local_row += blockDim.x) {
+        const auto canonical_row = fragment.canonical_row + local_row;
+        const auto header = headers[canonical_row];
+        if (header.source_rank != local_source)
+          continue;
+        auto *source_route_ready = peer_at<unsigned long long>(
+            a.peer_bases[local_source], a.return_ready_epoch_offset);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            ready(source_route_ready[header.route_index]);
+        if (a.forward_dynamic_reduce_queue)
+          forward_reduce_detail::publish_ready_route(
+              a, a.peer_bases[local_source], header.route_index, 2U);
+        else
+          ready.store(a.epoch, ::cuda::memory_order_release);
+        ++published_rows;
+      }
     }
+    constexpr unsigned int kWarpMask = 0xffffffffU;
+    const auto warp_rows = __reduce_add_sync(kWarpMask, published_rows);
+    if ((threadIdx.x & 31U) == 0U && warp_rows != 0U)
+      atomicAdd(&state.copied_rows, warp_rows);
     __syncthreads();
 
     if (threadIdx.x == 0U && state.copied_rows != 0U) {
@@ -450,7 +486,8 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
   }
 
   if (threadIdx.x == 0U)
-    state.cursor += state.stride;
+    state.cursor += static_cast<unsigned long long>(state.selected) *
+                    state.stride;
   __syncthreads();
   return true;
 }

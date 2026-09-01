@@ -101,6 +101,7 @@ enum class TimelineEvent : std::uint16_t {
   DxTileEnd = 70,
   Fc2First = 71,
   Fc2Last = 72,
+  ReduceTokenReadyObserved = 73,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

@@ -8,7 +8,8 @@
 namespace forward_reduce_detail {
 
 __device__ __forceinline__ void publish_ready_route(
-    const ForwardKernelArgs &a, void *source_base, std::uint64_t route) {
+    const ForwardKernelArgs &a, void *source_base, std::uint64_t route,
+    std::uint32_t publisher_kind) {
   if (!a.forward_dynamic_reduce_queue)
     return;
 
@@ -41,7 +42,16 @@ __device__ __forceinline__ void publish_ready_route(
   // Zero means unpublished. Generation setup clears the active range before
   // setup_ready releases producers, so token+1 is both the payload and the
   // release marker without a second queue-sized epoch array.
-  token_word.store(token + 1ULL, ::cuda::memory_order_release);
+  auto encoded = token + 1ULL;
+#if MEGAMOE_DEVICE_TIMELINE
+  // Profiling builds tag the otherwise-unused high byte so the source-local
+  // Reduce consumer can attribute the exact token-ready observation without
+  // comparing clocks from the peer GPU that published it.
+  encoded |= static_cast<unsigned long long>(publisher_kind) << 56U;
+#else
+  (void)publisher_kind;
+#endif
+  token_word.store(encoded, ::cuda::memory_order_release);
 }
 
 } // namespace forward_reduce_detail

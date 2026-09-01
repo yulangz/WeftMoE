@@ -15044,6 +15044,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         "MEGAMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
                         "one of 0, 4, 8, or 12",
                         std::to_string(args.forward_relay_tma_warps));
+      args.forward_local_return_batch_mblocks = 4U;
+      if (const auto *batch_mblocks =
+              std::getenv("MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS"))
+        args.forward_local_return_batch_mblocks =
+            static_cast<std::uint32_t>(std::stoul(batch_mblocks));
+      if (args.forward_local_return_batch_mblocks != 1U &&
+          args.forward_local_return_batch_mblocks != 2U &&
+          args.forward_local_return_batch_mblocks != 4U &&
+          args.forward_local_return_batch_mblocks != 8U)
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS", id.calling_rank,
+            "one of 1, 2, 4, or 8",
+            std::to_string(args.forward_local_return_batch_mblocks));
       args.forward_dispatch_publish_batch_rows = 32U;
       if (const auto *batch_rows =
               std::getenv("MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS"))

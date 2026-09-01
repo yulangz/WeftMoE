@@ -87,6 +87,7 @@ EVENTS = {
     70: "dx_tile_end",
     71: "fc2_first",
     72: "fc2_last",
+    73: "reduce_token_ready_observed",
 }
 
 PAIRS = {

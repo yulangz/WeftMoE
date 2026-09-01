@@ -1046,7 +1046,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   route_ready(source_route_ready[header.route_index]);
               if (a.forward_dynamic_reduce_queue)
                 forward_reduce_detail::publish_ready_route(
-                    a, a.peer_bases[header.source_rank], header.route_index);
+                    a, a.peer_bases[header.source_rank], header.route_index,
+                    3U);
               else
                 route_ready.store(a.epoch, ::cuda::memory_order_release);
             }

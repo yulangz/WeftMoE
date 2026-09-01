@@ -213,7 +213,18 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
             encoded = published.load(::cuda::memory_order_acquire);
           }
           if (encoded != 0ULL) {
+#if MEGAMOE_DEVICE_TIMELINE
+            constexpr unsigned long long kTokenMask =
+                (1ULL << 56U) - 1ULL;
+            const auto publisher_kind =
+                static_cast<std::uint32_t>(encoded >> 56U);
+            token = (encoded & kTokenMask) - 1ULL;
+            MEGAMOE_TIMELINE_RECORD_IF(
+                a.timeline, true, ReduceTokenReadyObserved, Reduce,
+                publisher_kind, token, a.epoch);
+#else
             token = encoded - 1ULL;
+#endif
             token_ready = 1U;
           }
         }
