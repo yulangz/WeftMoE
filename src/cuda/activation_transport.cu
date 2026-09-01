@@ -676,6 +676,7 @@ struct Layout {
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_fc1_published = 0;
+  std::size_t forward_compute_pair_mailboxes = 0;
   std::size_t forward_x_arrived_rows = 0;
   std::size_t forward_output_ready_epoch = 0;
   std::size_t forward_return_chunk_directory = 0;
@@ -1031,6 +1032,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_fc1_published = append(
         cursor, max_mblocks, sizeof(std::uint64_t),
         "forward FC1 readiness publication bitmap");
+    layout.forward_compute_pair_mailboxes = append(
+        cursor, persistent_v3::kForwardComputePairCapacity,
+        sizeof(persistent_v3::ForwardComputePairMailbox),
+        "forward compute pair mailboxes");
     // A destination tile is produced concurrently by every node-local rail.
     // Keep one row counter per local-rank/rail instead of issuing contended
     // system-scope atomics from several GPUs into one peer word. The consumer
@@ -4868,6 +4873,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
   auto *fc1_published = peer_at<unsigned long long>(
       a.local_base, a.forward_fc1_published_offset);
+  auto *forward_compute_pair_mailboxes =
+      peer_at<persistent_v3::ForwardComputePairMailbox>(
+          a.local_base, a.forward_compute_pair_mailboxes_offset);
   auto *forward_reduce_route_count = peer_at<unsigned int>(
       a.local_base, a.forward_reduce_route_count_offset);
   auto *forward_reduce_ready_token = peer_at<unsigned long long>(
@@ -5043,6 +5051,15 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
          mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
       fc1_done[mtile] = a.epoch << 32U;
       fc1_published[mtile] = 0ULL;
+    }
+    for (std::uint64_t pair =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         pair < persistent_v3::kForwardComputePairCapacity;
+         pair += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+      forward_compute_pair_mailboxes[pair].sequence = 0ULL;
+      forward_compute_pair_mailboxes[pair].tasks[0] = 0ULL;
+      forward_compute_pair_mailboxes[pair].tasks[1] = 0ULL;
+      forward_compute_pair_mailboxes[pair].metadata = 0ULL;
     }
     // The same allocation is a generation-local row->(proxy,chunk) map for
     // remote Return. Clear only the actual canonical rows; peer proxies fill
@@ -14950,6 +14967,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
   args.forward_fc1_published_offset = layout.forward_fc1_published;
+  args.forward_compute_pair_mailboxes_offset =
+      layout.forward_compute_pair_mailboxes;
   args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
   args.forward_output_ready_epoch_offset = layout.forward_output_ready_epoch;
   args.forward_return_chunk_directory_offset =
@@ -15238,6 +15257,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                           id.calling_rank, "0 or 1", value);
         forward_fc2_tma_store = value == "1";
       }
+      bool forward_cluster2 = false;
+      if (const auto *cluster2 =
+              std::getenv("MEGAMOE_FORWARD_CLUSTER2")) {
+        const std::string value(cluster2);
+        if (value != "0" && value != "1")
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                          "forward-run", "MEGAMOE_FORWARD_CLUSTER2",
+                          id.calling_rank, "0 or 1", value);
+        forward_cluster2 = value == "1";
+      }
       // The H200 main-shape autotune selects four async TMA stages for both
       // GEMMs.  Environment overrides retain the other compiled candidates
       // for topology/shape-specific retuning without an inner-loop branch.
@@ -15334,6 +15363,32 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       const auto forward_main_compute_ctas =
           args.forward_compute_cta_count -
           (forward_m64_head ? args.forward_m64_head_cta_count : 0U);
+      if (forward_cluster2 &&
+          (!forward_fc2_tma_store || forward_m64 || forward_m64_head ||
+           forward_specialize_stages || forward_fc1_stages != 4U ||
+           forward_fc2_stages != 4U))
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
+            "the production M128 4x4-stage TMA-store scheduler",
+            "an incompatible Forward experiment");
+      const auto forward_fc1_ntiles =
+          static_cast<std::uint32_t>((args.intermediate + 127ULL) / 128ULL);
+      const auto forward_fc2_ntiles =
+          static_cast<std::uint32_t>((args.hidden + 255ULL) / 256ULL);
+      if (forward_cluster2 &&
+          ((forward_main_compute_ctas & 1U) != 0U ||
+           (forward_fc1_ntiles & 1U) != 0U ||
+           (forward_fc2_ntiles & 1U) != 0U ||
+           forward_main_compute_ctas / 2U >
+               persistent_v3::kForwardComputePairCapacity))
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "MEGAMOE_FORWARD_CLUSTER2", id.calling_rank,
+            "even compute/FC1/FC2 task extents within mailbox capacity",
+            std::to_string(forward_main_compute_ctas) + ":" +
+                std::to_string(forward_fc1_ntiles) + ":" +
+                std::to_string(forward_fc2_ntiles));
       // Expert storage remains padded to M=128. Repeated 32..512-row FULL
       // sweeps selected 256-row completion chunks: fewer marker scans and WQEs
       // with no measurable loss of FC2/Return overlap.
@@ -15389,6 +15444,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             local_p2p_forward_compute_kernel<
                 false, true, false, ForwardTaskPartition::All, false, false,
                 true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_smem));
+      else if (forward_cluster2)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<false, true, false, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(forward_smem));
       else if (forward_fc2_tma_store)
@@ -15669,6 +15729,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       compute_launch.blockDim = dim3(384, 1, 1);
       compute_launch.dynamicSmemBytes = forward_smem;
       compute_launch.stream = slot.forward_compute_stream;
+      cudaLaunchAttribute compute_cluster_attribute{};
+      if (forward_cluster2) {
+        compute_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+        compute_cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+        compute_launch.attrs = &compute_cluster_attribute;
+        compute_launch.numAttrs = 1U;
+      }
       if (forward_specialize_stages) {
         compute_args.forward_reduce_cta_offset = 0U;
 #if MEGAMOE_DEVICE_TIMELINE
@@ -15689,6 +15756,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                   false, true, false, ForwardTaskPartition::All, true, true>,
               compute_args, slot.forward_x_map, slot.forward_s_map,
               weight.w1_map, weight.w2_map);
+      } else if (forward_cluster2) {
+        const auto &output_store_map =
+            args.use_gin && args.forward_registered_output
+                ? slot.forward_staging_store_map
+                : slot.forward_output_store_map;
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<false, true, false, true>,
+            compute_args, slot.forward_x_map, slot.forward_s_map,
+            weight.w1_map, weight.w2_map, output_store_map);
       } else if (forward_fc2_tma_store) {
         const auto &output_store_map =
             args.use_gin && args.forward_registered_output

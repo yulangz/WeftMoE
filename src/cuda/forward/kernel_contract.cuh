@@ -55,6 +55,7 @@ struct ForwardKernelArgs {
   std::size_t forward_task_claim_offset;
   std::size_t forward_fc1_done_offset;
   std::size_t forward_fc1_published_offset;
+  std::size_t forward_compute_pair_mailboxes_offset;
   std::size_t forward_scheduler_offset;
   std::size_t forward_v3_control_offset;
   std::size_t gin_local_compute_ready_offset;

@@ -6,6 +6,24 @@
 
 namespace megamoe::cuda::persistent_v3 {
 
+// Hopper exposes at most 132 SMs.  After the fixed RDMA/Relay reservation the
+// Forward compute grid contains at most 58 two-CTA clusters.  Keep a little
+// headroom so an experimental cluster scheduler can use one mailbox per pair
+// without coupling the arena size to a particular device's SM count.
+inline constexpr std::uint32_t kForwardComputePairCapacity = 64U;
+
+// The leader assigns one same-kind task to each CTA.  Odd sequence values
+// publish a pair; the follower changes the value to the next even sequence
+// after finishing.  This thread-0 handshake avoids a full-cluster barrier at
+// every GEMM boundary while retaining the lockstep required by TMA multicast.
+struct alignas(32) ForwardComputePairMailbox {
+  unsigned long long sequence = 0;
+  unsigned long long tasks[2] = {0, 0};
+  unsigned long long metadata = 0;
+};
+
+static_assert(sizeof(ForwardComputePairMailbox) == 32U);
+
 // Dispatch storage is generation-static and every context owns a contiguous
 // wave interval, so its hot handoffs need only monotonic prefixes.  Outbound
 // fields connect the ten RDMA-resident packing warps to the scalar GIN owner;
