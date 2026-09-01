@@ -15185,22 +15185,37 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       if (std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS") == nullptr)
         args.forward_return_chunk_rows = 256ULL;
 
-      // FC1 carries about twice FC2's FLOPs, but FC2 is released in a burst
-      // behind each completed M-block.  Repeated 16-GPU H200 sweeps selected
-      // 68 initial FC1 owners and 48 early FC2 consumers; FC1 owners borrow
-      // into the FC2 queue as soon as the FC1 claim counter is exhausted.
-      constexpr std::uint32_t kDefaultEarlyFc2Ctas = 48U;
-      args.forward_fc1_cta_count =
-          args.forward_compute_cta_count - kDefaultEarlyFc2Ctas;
-      if (const auto *fc1_ctas = std::getenv("MEGAMOE_FORWARD_FC1_CTAS"))
+      // Production launches every compute CTA into one FC2-priority mixed
+      // scheduler, so there is no fixed FC1/FC2 ownership split. Keep the
+      // split count scoped to the obsolete compiler-specialization A/B path.
+      args.forward_fc1_cta_count = 0U;
+      if (forward_specialize_stages) {
+        constexpr std::uint32_t kDefaultEarlyFc2Ctas = 48U;
+        if (forward_main_compute_ctas <= kDefaultEarlyFc2Ctas)
+          transport_error(
+              NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+              "Forward specialized compute CTAs", id.calling_rank,
+              "more than 48 main compute CTAs",
+              std::to_string(forward_main_compute_ctas));
         args.forward_fc1_cta_count =
-            static_cast<std::uint32_t>(std::stoul(fc1_ctas));
-      if (args.forward_fc1_cta_count == 0U ||
-          args.forward_fc1_cta_count >= forward_main_compute_ctas)
+            forward_main_compute_ctas - kDefaultEarlyFc2Ctas;
+        if (const auto *fc1_ctas =
+                std::getenv("MEGAMOE_FORWARD_FC1_CTAS"))
+          args.forward_fc1_cta_count =
+              static_cast<std::uint32_t>(std::stoul(fc1_ctas));
+        if (args.forward_fc1_cta_count == 0U ||
+            args.forward_fc1_cta_count >= forward_main_compute_ctas)
+          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                          "forward-run", "MEGAMOE_FORWARD_FC1_CTAS",
+                          id.calling_rank,
+                          "an integer in [1, initial body compute_ctas - 1]",
+                          std::to_string(args.forward_fc1_cta_count));
+      } else if (std::getenv("MEGAMOE_FORWARD_FC1_CTAS") != nullptr) {
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                         "MEGAMOE_FORWARD_FC1_CTAS", id.calling_rank,
-                        "an integer in [1, initial body compute_ctas - 1]",
-                        std::to_string(args.forward_fc1_cta_count));
+                        "MEGAMOE_FORWARD_SPECIALIZE_STAGES enabled",
+                        "set for the production mixed scheduler");
+      }
       // In head-wavefront mode the initial resident set is exactly one CTA per
       // SM: 16 transport + head + main body.  A same-stream FC2-only tail grid
       // replaces the head CTAs after they exit, restoring all 116 compute
