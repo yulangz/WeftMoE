@@ -408,10 +408,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
     cutlass::arch::warpgroup_reg_dealloc<40>();
     std::uint32_t fc1_pipeline = 0U;
     std::uint32_t fc2_pipeline = 0U;
+    // The math scheduler publishes the first task through this one-time
+    // barrier.  At every later boundary kTaskDoneBarrier also publishes the
+    // next task, avoiding a second CTA-wide rendezvous per GEMM tile.
+    cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
     while (true) {
       if constexpr (DoFc1) {
       while (true) {
-        cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
         const auto task = *task_shared;
         if (*task_kind_shared != kComputeTaskFc1)
           break;
@@ -479,7 +482,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
       if constexpr (DoFc2) {
       while (true) {
-        cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
         const auto task = *task_shared;
         if (*task_kind_shared != kComputeTaskFc2)
           break;
@@ -546,10 +548,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   select_priority_compute_task<StaticLocal, DoFc1, DoFc2, Partition>(
       a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks, fc1_ntiles,
       fc2_ntiles, completion, task_shared, task_kind_shared);
+  cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
   while (true) {
     if constexpr (DoFc1) {
     while (true) {
-      cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
       const auto task = *task_shared;
       if (*task_kind_shared != kComputeTaskFc1)
         break;
@@ -744,10 +746,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         }
       }
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
-      cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
       select_priority_compute_task<StaticLocal, DoFc1, DoFc2, Partition>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared);
+      cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
     }
 
@@ -756,7 +758,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
     if constexpr (DoFc2) {
     while (true) {
-      cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
       if (*task_kind_shared != kComputeTaskFc2)
         break;
 #if MEGAMOE_DEVICE_TIMELINE
@@ -1088,10 +1089,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         completion->forward_fc2_cta_tiles_completed[blockIdx.x] = task + 1ULL;
       }
 #endif
-      cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
       select_priority_compute_task<StaticLocal, DoFc1, DoFc2, Partition>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared);
+      cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
     }
 
