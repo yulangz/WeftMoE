@@ -14996,7 +14996,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
               ", expected>=2, actual=" + std::to_string(sms));
     const std::size_t forward_smem =
         (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16) +
-        16U * sizeof(std::uint64_t) +
+        20U * sizeof(std::uint64_t) +
         static_cast<std::size_t>(id.world_size) * sizeof(std::uint32_t);
     const bool remote_transport = use_gin || use_socket;
     const bool split_gin_roles =

@@ -352,7 +352,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       storage +
       (4U * kAStageElements + 4U * kFc2BStageElements) *
           sizeof(transport::BFloat16) +
-      16U * sizeof(std::uint64_t));
+      20U * sizeof(std::uint64_t));
   // This naturally aligned scratch word is dead until the compatibility local
   // Return copy starts. Reuse it to build the immutable descriptor's remote
   // and local context masks in parallel; this is the explicit shared-memory
@@ -385,11 +385,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *fc1_empty = fc1_full + Fc1StageCount;
   auto *fc2_full = fc1_empty + Fc1StageCount;
   auto *fc2_empty = fc2_full + Fc2StageCount;
+  auto *fc1_b2_full = fc2_empty + Fc2StageCount;
 
   if (threadIdx.x == kMathThreads) {
     for (std::uint32_t stage = 0; stage < Fc1StageCount; ++stage) {
       fc1_full[stage].init(1);
       fc1_empty[stage].init(kMathThreads / 32U);
+      fc1_b2_full[stage].init(1);
     }
     for (std::uint32_t stage = 0; stage < Fc2StageCount; ++stage) {
       fc2_full[stage].init(1);
@@ -455,14 +457,16 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 &w1_map, &fc1_full[stage], stage_b1, k_base,
                 static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n));
             deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
-                &w1_map, &fc1_full[stage], stage_b2, k_base,
+                &w1_map, &fc1_b2_full[stage], stage_b2, k_base,
                 static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
                                            a.intermediate + n));
             constexpr auto a_stage_elements =
                 M64 ? 64U * 64U : kAStageElements;
             fc1_full[stage].arrive_and_expect_tx(
-                (a_stage_elements + 2U * kFc1BStageElements) *
+                (a_stage_elements + kFc1BStageElements) *
                 sizeof(transport::BFloat16));
+            fc1_b2_full[stage].arrive_and_expect_tx(
+                kFc1BStageElements * sizeof(transport::BFloat16));
           }
           fc1_pipeline += iterations;
         }
@@ -596,12 +600,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         auto *stage_b2 = reinterpret_cast<cutlass::bfloat16_t *>(
             fc1_b2 + stage * kFc1BStageElements +
             (M64 ? warpgroup * 64U * 64U : 0U));
+        // A and gate share the first completion barrier, while up has its own.
+        // Start the gate WGMMA group as soon as 32 KiB is ready so its issue
+        // overlaps the tail of the independent 16 KiB up-weight TMA.
         fc1_full[stage].wait(phase);
 #pragma unroll
-        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index) {
+        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
           deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
-          deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
-        }
         deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
         for (std::uint32_t k = 0; k < 64U / Fc1TileMma::K; ++k) {
@@ -609,17 +614,30 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               stage_a + k * Fc1TileMma::K, 1);
           const auto desc_b1 = deep_gemm::mma::sm90::make_smem_desc(
               stage_b1 + k * Fc1TileMma::K, 1);
+          Fc1TileMma::wgmma(desc_a, desc_b1, accum_a, 1);
+        }
+        deep_gemm::ptx::warpgroup_commit_batch();
+#pragma unroll
+        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+
+        fc1_b2_full[stage].wait(phase);
+#pragma unroll
+        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
+          deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+        deep_gemm::ptx::warpgroup_arrive();
+#pragma unroll
+        for (std::uint32_t k = 0; k < 64U / Fc1TileMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+              stage_a + k * Fc1TileMma::K, 1);
           const auto desc_b2 = deep_gemm::mma::sm90::make_smem_desc(
               stage_b2 + k * Fc1TileMma::K, 1);
-          Fc1TileMma::wgmma(desc_a, desc_b1, accum_a, 1);
           Fc1TileMma::wgmma(desc_a, desc_b2, accum_b, 1);
         }
         deep_gemm::ptx::warpgroup_commit_batch();
 #pragma unroll
-        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index) {
-          deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+        for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
           deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
-        }
         deep_gemm::ptx::warpgroup_wait<0>();
         if ((threadIdx.x & 31U) == 0U)
           fc1_empty[stage].arrive();
