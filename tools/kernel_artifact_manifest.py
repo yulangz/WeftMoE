@@ -13,13 +13,13 @@ from pathlib import Path
 
 
 KERNELS = {
-    "forward_local_main": {
-        "name": "local_p2p_forward_megakernel",
-        "template": "ILb1EE",
-        "configured_dynamic_shared_bytes": 196704,
+    "forward_compute_main": {
+        "name": "local_p2p_forward_tma_store_kernel",
+        "template": "ILb0ELb1ELb0ELb1ELj4ELj4EE",
+        "configured_dynamic_shared_bytes": 196832,
     },
 }
-ARCHES = ("sm_90", "sm_90a")
+ARCHES = ("sm_90a",)
 
 
 def run_cuobjdump(binary: Path, option: str) -> str:
@@ -102,10 +102,10 @@ def collect(binary: Path) -> dict[str, object]:
     sass = split_arches(run_cuobjdump(binary, "--dump-sass"))
     result: dict[str, object] = {
         "schema": 1,
-        "runtime_arch": "sm_90",
-        "compile_only_arches": ["sm_90a"],
+        "runtime_arch": "sm_90a",
+        "compile_only_arches": [],
         "artifact": "src/cuda/activation_transport.o",
-        "dynamic_shared_shape": "main-shape world=8",
+        "dynamic_shared_shape": "main-shape world=16",
         "kernels": {},
     }
     kernels = result["kernels"]

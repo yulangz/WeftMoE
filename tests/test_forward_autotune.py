@@ -77,6 +77,15 @@ class ForwardAutotuneTest(unittest.TestCase):
         for macro in tune.PARAMETER_MACROS.values():
             self.assertEqual(header.count(f"#define {macro} "), 1)
 
+    def test_default_source_is_compile_time_specialized(self):
+        header = (ROOT / "src" / "cuda" / "forward" /
+                  "tuning_config.hpp").read_text(encoding="utf-8")
+        self.assertRegex(header,
+                         r"(?m)^#define MEGAMOE_FWD_COMPILED_TUNING 1$")
+        self.assertRegex(
+            header,
+            r"(?m)^#define MEGAMOE_FWD_ENABLE_LEGACY_ENV 0$")
+
     def test_generated_header_is_stable(self):
         candidate = self.candidates[0]
         first = tune.generated_header(candidate["name"], candidate["config"])

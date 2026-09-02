@@ -10,9 +10,7 @@ MEGAMOE_2 {
     _ZN7megamoe14DispatchHandleD1Ev;
     _ZN7megamoe14DispatchHandleD2Ev;
     _ZN7megamoe16DispatchMetadataC1EOS0_;
-    _ZN7megamoe16DispatchMetadataC1ERKS0_;
     _ZN7megamoe16DispatchMetadataC2EOS0_;
-    _ZN7megamoe16DispatchMetadataC2ERKS0_;
     _ZN7megamoe16DispatchMetadataD1Ev;
     _ZN7megamoe16DispatchMetadataD2Ev;
     _ZN7megamoe19CollectiveOperation4waitEv;

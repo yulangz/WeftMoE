@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
     if not output.is_file():
         raise SystemExit("minimal installed-prefix program produced no executable")
     subprocess.run(
-        [str(output)], cwd=root, check=True,
+        [str(output)], cwd=root, check=True, timeout=180,
         env={**os.environ,
              "LD_LIBRARY_PATH": str(prefix / "lib") + os.pathsep +
              absolute_library_path(

@@ -1,31 +1,20 @@
 {
   "artifact": "src/cuda/activation_transport.o",
-  "compile_only_arches": [
-    "sm_90a"
-  ],
-  "dynamic_shared_shape": "main-shape world=8",
+  "compile_only_arches": [],
+  "dynamic_shared_shape": "main-shape world=16",
   "kernels": {
-    "forward_local_main": {
-      "sm_90": {
-        "configured_dynamic_shared_bytes": 196704,
-        "instruction_count": 2744,
-        "local_bytes": 0,
-        "normalized_sass_sha256": "ffa5bd918c5d84bc90adc726b5ac3fe7cb92ebd9f5ad3c22089f54ea03dbd3c0",
-        "registers": 61,
-        "stack_bytes": 0,
-        "static_shared_bytes": 0
-      },
+    "forward_compute_main": {
       "sm_90a": {
-        "configured_dynamic_shared_bytes": 196704,
-        "instruction_count": 14056,
+        "configured_dynamic_shared_bytes": 196832,
+        "instruction_count": 18048,
         "local_bytes": 0,
-        "normalized_sass_sha256": "3073e7f66b339a96fe8bed5aff96a40daba4f80dfe70093e5f0ca57a4ef55f7e",
+        "normalized_sass_sha256": "0a07fa6a89e851987650fb9518e7e4541ef3a0bcef8d0d08dee96287005d83d7",
         "registers": 168,
-        "stack_bytes": 16,
+        "stack_bytes": 1304,
         "static_shared_bytes": 2048
       }
     }
   },
-  "runtime_arch": "sm_90",
+  "runtime_arch": "sm_90a",
   "schema": 1
 }
