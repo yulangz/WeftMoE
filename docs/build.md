@@ -330,14 +330,15 @@ python3 tools/autotune_forward.py \
 Run the complete narrow world-16 search and the independent 100-sample final
 validation with `make forward-autotune`. Each candidate uses 10 warmups and
 100 measured generations because the remaining sub-percent candidates are
-inside the run-to-run noise of a 20-sample screen. The Python launcher writes one generated header
-and one build directory per candidate, verifies that the resulting cubin has
-exactly one split Forward kernel, compares all input/weight/output hashes, and
-selects `forward_slowest_rank_us.mean`. Result JSON and build/launcher logs are
-written below `artifacts/forward-autotune/`. Kernel choices are not carried in
-environment variables. Seed, token count, top-k, FC1-cache mode, generation
-base, and sample counts are also explicit in the JSON; the launch layer only
-translates the subset required by the existing benchmark executable ABI.
+inside the run-to-run noise of a 20-sample screen. The Python launcher writes
+one generated header and one build directory per candidate, verifies that the
+resulting cubin has exactly one split Forward kernel, compares all
+input/weight/output hashes, and selects `forward_slowest_rank_us.mean`. Result
+JSON and build/launcher logs are written below `artifacts/forward-autotune/`.
+Kernel choices are not carried in environment variables. Seed, token count,
+top-k, FC1-cache mode, generation base, and sample counts are also explicit in
+the JSON; the launch layer only translates the subset required by the existing
+benchmark executable ABI.
 
 The production main-shape GIN benchmark runs without a host payload phase:
 

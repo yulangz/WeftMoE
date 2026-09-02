@@ -51,6 +51,22 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.assertEqual(cpp_macros - controls,
                          set(tune.PARAMETER_MACROS.values()))
 
+    def test_cpp_defaults_match_explicit_production_point(self):
+        header = (ROOT / "src" / "cuda" / "forward" /
+                  "tuning_config.hpp").read_text(encoding="utf-8")
+        cpp_defaults = dict(re.findall(
+            r"^#define (MEGAMOE_FWD_[A-Z0-9_]+) ([0-9]+)$", header,
+            flags=re.MULTILINE))
+        production = self.candidates[0]["config"]
+        for key, macro in tune.PARAMETER_MACROS.items():
+            expected = production[key]
+            if key in tune.BOOLEAN_PARAMETERS:
+                expected = int(expected)
+            elif key in tune.ENUM_PARAMETERS:
+                expected = tune.ENUM_PARAMETERS[key][expected]
+            self.assertEqual(int(cpp_defaults[macro]), expected,
+                             f"C++ default differs for {key}")
+
     def test_generated_header_disables_runtime_tuning(self):
         candidate = self.candidates[0]
         header = tune.generated_header(candidate["name"],
