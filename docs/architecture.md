@@ -577,9 +577,13 @@ primary key is the minimum of its fan-out keys, and packet consumption order is
 the explicit total order:
 
 ```text
-(destination_node, primary_m_tile, primary_expert,
+(destination_node, primary_m_tile, scheduled_expert,
  destination_rank, local_token_id)
 ```
+
+On eight-GPU nodes, `scheduled_expert` prefixes the natural expert ID with the
+three-bit-reversed destination-local-rank priority used to balance wave
+boundaries; on other node widths it is the natural expert ID.
 
 Runtime-width fields are sorted with stable radix passes; token ID is an
 explicit key component, so correctness does not depend on an unspecified tie

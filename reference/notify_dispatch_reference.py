@@ -385,7 +385,14 @@ def materialize_rank_metadata(local: LocalHistogram, count_matrix: Sequence[Sequ
              target["expert_id"],
              config.topology.expert_to_rank[target["expert_id"]])
             for target in packet["fanout"])
-        priorities.append((packet["identity"]["destination_node"], *primary,
+        tile, expert, destination_rank = primary
+        scheduled_expert = expert
+        if gpus_per_node == 8:
+            local = config.topology.rank_to_local_rank[destination_rank]
+            local_priority = ((local & 1) << 2) | (local & 2) | ((local & 4) >> 2)
+            scheduled_expert += local_priority * config.num_experts
+        priorities.append((packet["identity"]["destination_node"], tile,
+                           scheduled_expert, destination_rank,
                            packet["local_token_id"], packet_index))
     priorities.sort()
     wave_order = [entry[-1] for entry in priorities]
@@ -411,7 +418,7 @@ def materialize_rank_metadata(local: LocalHistogram, count_matrix: Sequence[Sequ
             wave_payload_bytes.append(0)
             previous = key
         wave_packet_counts[-1] += 1
-        wave_payload_bytes[-1] += 32 + 24 * len(packets[packet_index]["fanout"])
+        wave_payload_bytes[-1] += 32 + 32 * len(packets[packet_index]["fanout"])
     if priorities:
         wave_offsets.append(len(priorities))
 

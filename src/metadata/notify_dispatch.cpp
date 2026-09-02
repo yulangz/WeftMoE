@@ -700,16 +700,30 @@ void materialize_dispatch_waves(TransportMetadata &transport,
     }
     priorities.push_back(primary);
   }
+  const auto scheduled_expert = [&](const PacketPriority &priority) {
+    auto key = static_cast<std::uint64_t>(priority.expert);
+    if (config.topology.num_nodes != 0U &&
+        config.topology.world_size == config.topology.num_nodes * 8U) {
+      const auto local =
+          config.topology.rank_to_local_rank[priority.destination_rank];
+      const auto local_priority = ((local & 1U) << 2U) | (local & 2U) |
+                                  ((local & 4U) >> 2U);
+      key += static_cast<std::uint64_t>(local_priority) * config.num_experts;
+    }
+    return key;
+  };
   std::sort(priorities.begin(), priorities.end(),
             [&](const auto &lhs, const auto &rhs) {
               const auto &left = transport.outgoing_packets[lhs.packet];
               const auto &right = transport.outgoing_packets[rhs.packet];
-              return std::tie(left.identity.destination_node, lhs.tile,
-                              lhs.expert, lhs.destination_rank,
-                              left.local_token_id) <
-                     std::tie(right.identity.destination_node, rhs.tile,
-                              rhs.expert, rhs.destination_rank,
-                              right.local_token_id);
+              return std::make_tuple(left.identity.destination_node, lhs.tile,
+                                     scheduled_expert(lhs),
+                                     lhs.destination_rank,
+                                     left.local_token_id) <
+                     std::make_tuple(right.identity.destination_node, rhs.tile,
+                                     scheduled_expert(rhs),
+                                     rhs.destination_rank,
+                                     right.local_token_id);
             });
   auto &order = transport.dispatch_wave_packet_order;
   auto &offsets = transport.dispatch_wave_offsets;
