@@ -327,8 +327,10 @@ python3 tools/autotune_forward.py \
   --candidate current_m128_n128_n256 --build-only
 ```
 
-Run the complete narrow world-16 search and the 100-sample final validation
-with `make forward-autotune`. The Python launcher writes one generated header
+Run the complete narrow world-16 search and the independent 100-sample final
+validation with `make forward-autotune`. Each candidate uses 10 warmups and
+100 measured generations because the remaining sub-percent candidates are
+inside the run-to-run noise of a 20-sample screen. The Python launcher writes one generated header
 and one build directory per candidate, verifies that the resulting cubin has
 exactly one split Forward kernel, compares all input/weight/output hashes, and
 selects `forward_slowest_rank_us.mean`. Result JSON and build/launcher logs are

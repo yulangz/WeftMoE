@@ -21,7 +21,7 @@
     "top_k": 6,
     "fc1_output_cache": false,
     "generation_base": 1000,
-    "tune_rounds": 30,
+    "tune_rounds": 110,
     "final_rounds": 110,
     "timeout_seconds": 180,
     "selection_metric": "forward_slowest_rank_us.mean",
