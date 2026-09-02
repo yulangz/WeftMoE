@@ -166,9 +166,10 @@ std::size_t append(std::size_t &cursor, std::uint64_t count,
 CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
                               std::uint64_t outer,
                               std::uint32_t box_outer,
-                              const char *field) {
+                              const char *field,
+                              std::uint32_t box_inner = 64U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
-      outer > UINT32_MAX || box_outer == 0)
+      outer > UINT32_MAX || box_outer == 0 || box_inner == 0)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "forward-tma-map", field, 0,
                     "nonzero uint32 dimensions and valid base", "invalid");
@@ -176,7 +177,7 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   const cuuint64_t dims[2] = {inner, outer};
   const cuuint64_t strides[1] = {
       checked_mul(inner, sizeof(transport::BFloat16), field)};
-  const cuuint32_t box[2] = {64U, box_outer};
+  const cuuint32_t box[2] = {box_inner, box_outer};
   const cuuint32_t element_strides[2] = {1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
       &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,
@@ -1018,9 +1019,11 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     // ceil(rows/64) estimate.
     const auto max_mblocks = config.max_destination_rows_per_rank;
     const auto fc1_ntiles =
-        (config.max_intermediate_size + 127ULL) / 128ULL;
+        (config.max_intermediate_size + forward_tuning::kFc1TileN - 1ULL) /
+        forward_tuning::kFc1TileN;
     const auto fc2_ntiles =
-        (config.max_hidden_size + 255ULL) / 256ULL;
+        (config.max_hidden_size + forward_tuning::kFc2TileN - 1ULL) /
+        forward_tuning::kFc2TileN;
     layout.forward_task_claim = append(
         cursor,
         checked_mul(max_mblocks, 2ULL + fc1_ntiles + fc2_ntiles,
@@ -3995,6 +3998,21 @@ using ForwardMmaNarrow =
 using ForwardMma = typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
 using ForwardMmaWide =
     typename deep_gemm::mma::sm90::BF16MMASelector<256>::type;
+// The split Forward kernel is compiled once per explicit tuning record.  Keep
+// the historical aliases above for Backward/diagnostic kernels and give the
+// production FC1/FC2 paths independent N shapes.
+using TunedForwardFc1Mma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<
+        forward_tuning::kFc1TileN>::type;
+using TunedForwardFc1M64Mma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<
+        forward_tuning::kFc1TileN / 2U>::type;
+using TunedForwardFc2Mma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<
+        forward_tuning::kFc2TileN>::type;
+using TunedForwardFc2M64Mma =
+    typename deep_gemm::mma::sm90::BF16MMASelector<
+        forward_tuning::kFc2TileN / 2U>::type;
 using BackwardDwMma =
     typename deep_gemm::mma::sm90::BF16MMASelector<256, cute::UMMA::Major::MN,
                                                    cute::UMMA::Major::MN>::type;
@@ -4960,8 +4978,12 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                ++wave)
             if (a.dispatch_waves.destination_node[wave] != a.node)
               ++dispatch_waves;
-          const auto fc1_ntiles = (a.intermediate + 127ULL) / 128ULL;
-          const auto fc2_ntiles = (a.hidden + 255ULL) / 256ULL;
+          const auto fc1_ntiles =
+              (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+              forward_tuning::kFc1TileN;
+          const auto fc2_ntiles =
+              (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+              forward_tuning::kFc2TileN;
           completion_task(completion, transport_state::TaskClass::DispatchWave)
               .expected = dispatch_waves;
           unsigned long long relay_packets = 0ULL;
@@ -5103,9 +5125,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     const auto setup_fc1_ntiles =
-        static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+        static_cast<std::uint32_t>(
+            (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+            forward_tuning::kFc1TileN);
     const auto setup_fc2_ntiles =
-        static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+        static_cast<std::uint32_t>(
+            (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+            forward_tuning::kFc2TileN);
     const auto setup_mblocks = scheduler[3];
     // The first words are an immutable expert/local-M lookup in Notify's M-tile
     // wavefront order.  The following regions are generation-local,
@@ -6004,11 +6030,15 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   const auto fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+      static_cast<std::uint32_t>(
+          (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+          forward_tuning::kFc1TileN);
   const auto forward_mblocks = scheduler[3];
   const auto fc1_tasks = forward_mblocks * fc1_ntiles;
   const auto fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+      static_cast<std::uint32_t>(
+          (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+          forward_tuning::kFc2TileN);
   const auto fc2_tasks = forward_mblocks * fc2_ntiles;
   const bool rdma_worker_cta = KernelRole != ForwardKernelRole::ComputeOnly &&
                                remote_backend_enabled<StaticLocal>(a.use_gin) &&
@@ -10850,10 +10880,11 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
     impl->w1_map = make_bf16_tma_map(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        128, "W1");
+        forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
-        static_cast<std::uint64_t>(owned_experts) * hidden_size, 256, "W2");
+        static_cast<std::uint64_t>(owned_experts) * hidden_size,
+        forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -10926,10 +10957,11 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
     impl->w1_map = make_bf16_tma_map(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        128, "W1");
+        forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
-        static_cast<std::uint64_t>(owned_experts) * hidden_size, 256, "W2");
+        static_cast<std::uint64_t>(owned_experts) * hidden_size,
+        forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -12417,12 +12449,12 @@ ActivationTransportResourcePool make_activation_transport_pool(
           config.max_intermediate_size == 3072) {
         slot.forward_x_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
-            config.max_hidden_size, config.max_destination_rows_per_rank, 128,
-            "canonical X");
+            config.max_hidden_size, config.max_destination_rows_per_rank,
+            forward_tuning::kTileM, "canonical X", forward_tuning::kTileK);
         slot.forward_s_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, config.max_destination_rows_per_rank,
-            128, "SwiGLU S");
+            forward_tuning::kTileM, "SwiGLU S", forward_tuning::kTileK);
         slot.forward_x_m64_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank, 64,
@@ -15004,18 +15036,26 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                     "FULL Return connections", id.calling_rank,
                     "NCCL_GIN_CONNECTION_FULL", "unavailable");
-  if (const auto *chunk_rows =
-          std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS")) {
-    const auto parsed = std::stoull(chunk_rows);
-    if (parsed != 0ULL)
-      args.forward_return_chunk_rows = parsed;
+  args.forward_return_chunk_rows = forward_tuning::kReturnChunkRows;
+  if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+    if (const auto *chunk_rows =
+            std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS")) {
+      const auto parsed = std::stoull(chunk_rows);
+      if (parsed != 0ULL)
+        args.forward_return_chunk_rows = parsed;
+    }
   }
-  const bool reduce_queue_requested =
-      std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE") != nullptr;
-  const bool reduce_scan_requested =
-      std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN") != nullptr;
-  const bool legacy_reduce_requested =
-      std::getenv("MEGAMOE_FORWARD_LEGACY_REDUCE") != nullptr;
+  bool reduce_queue_requested = false;
+  bool reduce_scan_requested = false;
+  bool legacy_reduce_requested = false;
+  if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+    reduce_queue_requested =
+        std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE") != nullptr;
+    reduce_scan_requested =
+        std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN") != nullptr;
+    legacy_reduce_requested =
+        std::getenv("MEGAMOE_FORWARD_LEGACY_REDUCE") != nullptr;
+  }
   if (static_cast<unsigned int>(reduce_queue_requested) +
           static_cast<unsigned int>(reduce_scan_requested) +
           static_cast<unsigned int>(legacy_reduce_requested) >
@@ -15087,21 +15127,26 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           "phase=forward-run, field=SM count, rank=" +
               std::to_string(id.calling_rank) +
               ", expected>=2, actual=" + std::to_string(sms));
+    const std::size_t forward_compute_smem =
+        forward_tuning::compute_smem_bytes(id.world_size);
+    const std::size_t forward_transport_smem =
+        forward_tuning::transport_smem_bytes(
+            static_cast<std::uint32_t>(args.hidden), id.world_size);
     const std::size_t forward_smem =
-        (4U * 128U * 64U + 4U * 256U * 64U) * sizeof(transport::BFloat16) +
-        20U * sizeof(std::uint64_t) +
-        static_cast<std::size_t>(id.world_size) * sizeof(std::uint32_t);
+        std::max(forward_compute_smem, forward_transport_smem);
     const bool remote_transport = use_gin || use_socket;
     const bool split_gin_roles =
         use_gin && view.identity.num_nodes == 2U &&
         args.gin_context_count == persistent_v3::kRdmaCtaCount;
     cudaError_t launch_forward = cudaSuccess;
     if (split_gin_roles) {
-      args.forward_relay_cta_count = persistent_v3::kDefaultRelayCtaCount;
-      if (const auto *relay_ctas =
-              std::getenv("MEGAMOE_FORWARD_RELAY_CTAS"))
-        args.forward_relay_cta_count =
-            static_cast<std::uint32_t>(std::stoul(relay_ctas));
+      args.forward_relay_cta_count = forward_tuning::kRelayCtas;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *relay_ctas =
+                std::getenv("MEGAMOE_FORWARD_RELAY_CTAS"))
+          args.forward_relay_cta_count =
+              static_cast<std::uint32_t>(std::stoul(relay_ctas));
+      }
       if (args.forward_relay_cta_count < persistent_v3::kRdmaCtaCount ||
           args.forward_relay_cta_count % persistent_v3::kRdmaCtaCount != 0U ||
           args.forward_relay_cta_count > 24U)
@@ -15119,19 +15164,23 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 std::to_string(kTransportBlocks) +
                 ", actual=" + std::to_string(grid_blocks));
       args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
-      args.forward_relay_local_return =
-          std::getenv("MEGAMOE_FORWARD_COMPUTE_LOCAL_RETURN") == nullptr;
+      args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment)
+        args.forward_relay_local_return =
+            std::getenv("MEGAMOE_FORWARD_COMPUTE_LOCAL_RETURN") == nullptr;
       // Eight Relay CTAs with eight independent row streams are the Hopper
       // production point.  Twelve streams slightly improve isolated NVLink
       // copy throughput, but contend more heavily with the paired FC1/FC2
       // pipeline and produce a longer end-to-end Return tail.  A value of
       // zero retains the exact vector implementation for autotuner/regression
       // A/B runs.
-      args.forward_relay_tma_warps = 8U;
-      if (const auto *tma_warps =
-              std::getenv("MEGAMOE_FORWARD_RELAY_TMA_WARPS"))
-        args.forward_relay_tma_warps =
-            static_cast<std::uint32_t>(std::stoul(tma_warps));
+      args.forward_relay_tma_warps = forward_tuning::kRelayTmaWarps;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *tma_warps =
+                std::getenv("MEGAMOE_FORWARD_RELAY_TMA_WARPS"))
+          args.forward_relay_tma_warps =
+              static_cast<std::uint32_t>(std::stoul(tma_warps));
+      }
       if (args.forward_relay_tma_warps != 0U &&
           args.forward_relay_tma_warps != 4U &&
           args.forward_relay_tma_warps != 8U &&
@@ -15140,11 +15189,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         "MEGAMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
                         "one of 0, 4, 8, or 12",
                         std::to_string(args.forward_relay_tma_warps));
-      args.forward_local_return_batch_mblocks = 4U;
-      if (const auto *batch_mblocks =
-              std::getenv("MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS"))
-        args.forward_local_return_batch_mblocks =
-            static_cast<std::uint32_t>(std::stoul(batch_mblocks));
+      args.forward_local_return_batch_mblocks =
+          forward_tuning::kLocalReturnBatchMblocks;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *batch_mblocks =
+                std::getenv("MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS"))
+          args.forward_local_return_batch_mblocks =
+              static_cast<std::uint32_t>(std::stoul(batch_mblocks));
+      }
       if (args.forward_local_return_batch_mblocks != 1U &&
           args.forward_local_return_batch_mblocks != 2U &&
           args.forward_local_return_batch_mblocks != 4U &&
@@ -15154,11 +15206,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS", id.calling_rank,
             "one of 1, 2, 4, or 8",
             std::to_string(args.forward_local_return_batch_mblocks));
-      args.forward_dispatch_publish_batch_rows = 32U;
-      if (const auto *batch_rows =
-              std::getenv("MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS"))
-        args.forward_dispatch_publish_batch_rows =
-            static_cast<std::uint32_t>(std::stoul(batch_rows));
+      args.forward_dispatch_publish_batch_rows =
+          forward_tuning::kDispatchPublishBatchRows;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *batch_rows =
+                std::getenv("MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS"))
+          args.forward_dispatch_publish_batch_rows =
+              static_cast<std::uint32_t>(std::stoul(batch_rows));
+      }
       if (args.forward_dispatch_publish_batch_rows != 4U &&
           args.forward_dispatch_publish_batch_rows != 8U &&
           args.forward_dispatch_publish_batch_rows != 16U &&
@@ -15174,11 +15229,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       // saturated middle window widens to four for stronger W1 L2 reuse;
       // keeping its bounds tunable is important because widening near the
       // tail improves isolated GEMM time but lengthens Return/Reduce sharply.
-      args.forward_fc1_locality_group = 2U;
-      if (const auto *locality_group =
-              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP"))
-        args.forward_fc1_locality_group =
-            static_cast<std::uint32_t>(std::stoul(locality_group));
+      args.forward_fc1_locality_group = forward_tuning::kFc1LocalityGroup;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *locality_group =
+                std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP"))
+          args.forward_fc1_locality_group =
+              static_cast<std::uint32_t>(std::stoul(locality_group));
+      }
       if (args.forward_fc1_locality_group != 1U &&
           args.forward_fc1_locality_group != 2U &&
           args.forward_fc1_locality_group != 4U)
@@ -15187,15 +15244,19 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
             "one of 1, 2, or 4",
             std::to_string(args.forward_fc1_locality_group));
-      std::uint32_t locality_group4_begin = 4U;
-      std::uint32_t locality_group4_end = 12U;
-      if (const auto *begin =
-              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN"))
-        locality_group4_begin =
-            static_cast<std::uint32_t>(std::stoul(begin));
-      if (const auto *end =
-              std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_END"))
-        locality_group4_end = static_cast<std::uint32_t>(std::stoul(end));
+      std::uint32_t locality_group4_begin =
+          forward_tuning::kFc1LocalityGroup4Begin;
+      std::uint32_t locality_group4_end =
+          forward_tuning::kFc1LocalityGroup4End;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *begin =
+                std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN"))
+          locality_group4_begin =
+              static_cast<std::uint32_t>(std::stoul(begin));
+        if (const auto *end =
+                std::getenv("MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_END"))
+          locality_group4_end = static_cast<std::uint32_t>(std::stoul(end));
+      }
       const auto locality_group4_span =
           locality_group4_end - locality_group4_begin;
       if (locality_group4_begin < 2U || locality_group4_end > UINT8_MAX ||
@@ -15213,11 +15274,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           static_cast<std::uint8_t>(locality_group4_begin);
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
-      args.forward_return_max_inflight = 16U;
-      if (const auto *max_inflight =
-              std::getenv("MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT"))
-        args.forward_return_max_inflight =
-            static_cast<std::uint32_t>(std::stoul(max_inflight));
+      args.forward_return_max_inflight = forward_tuning::kReturnMaxInflight;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *max_inflight =
+                std::getenv("MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT"))
+          args.forward_return_max_inflight =
+              static_cast<std::uint32_t>(std::stoul(max_inflight));
+      }
       if (args.forward_return_max_inflight != 0U &&
           args.forward_return_max_inflight != 4U &&
           args.forward_return_max_inflight != 8U &&
@@ -15233,56 +15296,66 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       // Relay TMA and remote GIN then consume that same immutable storage,
       // avoiding a full output-sized duplicate GMEM write.  Keep an explicit
       // 0/1 override for regression A/B and future autotuning.
-      args.forward_registered_output = true;
-      if (const auto *registered_output =
-              std::getenv("MEGAMOE_FORWARD_REGISTERED_OUTPUT")) {
-        const std::string value(registered_output);
-        if (value != "0" && value != "1")
-          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                          "forward-run",
-                          "MEGAMOE_FORWARD_REGISTERED_OUTPUT",
-                          id.calling_rank, "0 or 1", value);
-        args.forward_registered_output = value == "1";
+      args.forward_registered_output = forward_tuning::kRegisteredOutput;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *registered_output =
+                std::getenv("MEGAMOE_FORWARD_REGISTERED_OUTPUT")) {
+          const std::string value(registered_output);
+          if (value != "0" && value != "1")
+            transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                            "forward-run",
+                            "MEGAMOE_FORWARD_REGISTERED_OUTPUT",
+                            id.calling_rank, "0 or 1", value);
+          args.forward_registered_output = value == "1";
+        }
       }
-      const bool forward_m64 =
-          std::getenv("MEGAMOE_FORWARD_M64") != nullptr;
-      const bool forward_m64_head =
-          std::getenv("MEGAMOE_FORWARD_M64_HEAD") != nullptr;
-      const bool forward_specialize_stages =
-          std::getenv("MEGAMOE_FORWARD_SPECIALIZE_STAGES") != nullptr;
-      bool forward_fc2_tma_store = true;
-      if (const auto *tma_store =
-              std::getenv("MEGAMOE_FORWARD_FC2_TMA_STORE")) {
-        const std::string value(tma_store);
-        if (value != "0" && value != "1")
-          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                          "forward-run", "MEGAMOE_FORWARD_FC2_TMA_STORE",
-                          id.calling_rank, "0 or 1", value);
-        forward_fc2_tma_store = value == "1";
+      bool forward_m64 = forward_tuning::kTileM == 64U;
+      bool forward_m64_head = false;
+      bool forward_specialize_stages = false;
+      bool forward_fc2_tma_store = forward_tuning::kFc2TmaStore;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        forward_m64 = std::getenv("MEGAMOE_FORWARD_M64") != nullptr;
+        forward_m64_head =
+            std::getenv("MEGAMOE_FORWARD_M64_HEAD") != nullptr;
+        forward_specialize_stages =
+            std::getenv("MEGAMOE_FORWARD_SPECIALIZE_STAGES") != nullptr;
+        if (const auto *tma_store =
+                std::getenv("MEGAMOE_FORWARD_FC2_TMA_STORE")) {
+          const std::string value(tma_store);
+          if (value != "0" && value != "1")
+            transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                            "forward-run", "MEGAMOE_FORWARD_FC2_TMA_STORE",
+                            id.calling_rank, "0 or 1", value);
+          forward_fc2_tma_store = value == "1";
+        }
       }
-      bool forward_cluster2 = true;
+      bool forward_cluster2 = forward_tuning::kClusterSize == 2U;
       bool forward_cluster2_explicit = false;
-      if (const auto *cluster2 =
-              std::getenv("MEGAMOE_FORWARD_CLUSTER2")) {
-        forward_cluster2_explicit = true;
-        const std::string value(cluster2);
-        if (value != "0" && value != "1")
-          transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                          "forward-run", "MEGAMOE_FORWARD_CLUSTER2",
-                          id.calling_rank, "0 or 1", value);
-        forward_cluster2 = value == "1";
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *cluster2 =
+                std::getenv("MEGAMOE_FORWARD_CLUSTER2")) {
+          forward_cluster2_explicit = true;
+          const std::string value(cluster2);
+          if (value != "0" && value != "1")
+            transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                            "forward-run", "MEGAMOE_FORWARD_CLUSTER2",
+                            id.calling_rank, "0 or 1", value);
+          forward_cluster2 = value == "1";
+        }
       }
       // The H200 main-shape autotune selects four async TMA stages for both
       // GEMMs.  Environment overrides retain the other compiled candidates
       // for topology/shape-specific retuning without an inner-loop branch.
-      std::uint32_t forward_fc1_stages = 4U;
-      std::uint32_t forward_fc2_stages = 4U;
-      if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC1_STAGES"))
-        forward_fc1_stages =
-            static_cast<std::uint32_t>(std::stoul(stages));
-      if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC2_STAGES"))
-        forward_fc2_stages =
-            static_cast<std::uint32_t>(std::stoul(stages));
+      std::uint32_t forward_fc1_stages = forward_tuning::kFc1Stages;
+      std::uint32_t forward_fc2_stages = forward_tuning::kFc2Stages;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC1_STAGES"))
+          forward_fc1_stages =
+              static_cast<std::uint32_t>(std::stoul(stages));
+        if (const auto *stages = std::getenv("MEGAMOE_FORWARD_FC2_STAGES"))
+          forward_fc2_stages =
+              static_cast<std::uint32_t>(std::stoul(stages));
+      }
       const bool supported_stage_pair =
           (forward_fc1_stages == 2U && forward_fc2_stages == 4U) ||
           (forward_fc1_stages == 3U && forward_fc2_stages == 3U) ||
@@ -15382,9 +15455,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         forward_cluster2 = false;
       }
       const auto forward_fc1_ntiles =
-          static_cast<std::uint32_t>((args.intermediate + 127ULL) / 128ULL);
+          static_cast<std::uint32_t>(
+              (args.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+              forward_tuning::kFc1TileN);
       const auto forward_fc2_ntiles =
-          static_cast<std::uint32_t>((args.hidden + 255ULL) / 256ULL);
+          static_cast<std::uint32_t>(
+              (args.hidden + forward_tuning::kFc2TileN - 1ULL) /
+              forward_tuning::kFc2TileN);
       const bool forward_cluster2_extent_compatible =
           (forward_main_compute_ctas & 1U) == 0U &&
           (forward_fc1_ntiles & 1U) == 0U &&
@@ -15405,13 +15482,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       // Expert storage remains padded to M=128. Repeated 32..512-row FULL
       // sweeps selected 256-row completion chunks: fewer marker scans and WQEs
       // with no measurable loss of FC2/Return overlap.
-      if (std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS") == nullptr)
-        args.forward_return_chunk_rows = 256ULL;
+      if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+        if (std::getenv("MEGAMOE_FORWARD_RETURN_CHUNK_ROWS") == nullptr)
+          args.forward_return_chunk_rows = forward_tuning::kReturnChunkRows;
+      }
 
       // Production launches every compute CTA into one FC2-priority mixed
       // scheduler, so there is no fixed FC1/FC2 ownership split. Keep the
       // split count scoped to the obsolete compiler-specialization A/B path.
       args.forward_fc1_cta_count = 0U;
+#if !MEGAMOE_FWD_COMPILED_TUNING
       if (forward_specialize_stages) {
         constexpr std::uint32_t kDefaultEarlyFc2Ctas = 48U;
         if (forward_main_compute_ctas <= kDefaultEarlyFc2Ctas)
@@ -15433,59 +15513,91 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                           id.calling_rank,
                           "an integer in [1, initial body compute_ctas - 1]",
                           std::to_string(args.forward_fc1_cta_count));
-      } else if (std::getenv("MEGAMOE_FORWARD_FC1_CTAS") != nullptr) {
+      } else if (forward_tuning::kEnableLegacyEnvironment &&
+                 std::getenv("MEGAMOE_FORWARD_FC1_CTAS") != nullptr) {
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                         "MEGAMOE_FORWARD_FC1_CTAS", id.calling_rank,
                         "MEGAMOE_FORWARD_SPECIALIZE_STAGES enabled",
                         "set for the production mixed scheduler");
       }
+#endif
       // In head-wavefront mode the initial resident set is exactly one CTA per
       // SM: 16 transport + head + main body.  A same-stream FC2-only tail grid
       // replaces the head CTAs after they exit, restoring all 116 compute
       // owners without ever starving the cooperative transport launch.
-      args.forward_reduce_cta_count = forward_main_compute_ctas;
+      args.forward_reduce_cta_count =
+          (forward_main_compute_ctas + forward_tuning::kReduceCtaDivisor -
+           1U) /
+          forward_tuning::kReduceCtaDivisor;
       internal::throw_cuda(
           "forward-run",
           forward_transport_launch::set_max_dynamic_shared_memory(
-              static_cast<int>(forward_smem)),
+              static_cast<int>(forward_transport_smem)),
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaFuncSetAttribute(split transport dynamic smem)");
       cudaError_t compute_attribute = cudaSuccess;
+#if MEGAMOE_FWD_COMPILED_TUNING
+#if MEGAMOE_FWD_FC2_TMA_STORE
+#if MEGAMOE_FWD_CLUSTER_SIZE == 2
+      compute_attribute = cudaFuncSetAttribute(
+          local_p2p_forward_tma_store_kernel<
+              false, true, false, true, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(forward_compute_smem));
+#else
+      compute_attribute = cudaFuncSetAttribute(
+          local_p2p_forward_tma_store_kernel<
+              false, true, false, false, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(forward_compute_smem));
+#endif
+#else
+      compute_attribute = cudaFuncSetAttribute(
+          local_p2p_forward_compute_kernel<
+              false, true, MEGAMOE_FWD_TILE_M == 64,
+              ForwardTaskPartition::All, true, false, false,
+              forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(forward_compute_smem));
+#endif
+#else
       if (forward_specialize_stages)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<
                 false, true, false, ForwardTaskPartition::All, false, false,
                 true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_smem));
+            static_cast<int>(forward_compute_smem));
       else if (forward_cluster2)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_tma_store_kernel<false, true, false, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_smem));
+            static_cast<int>(forward_compute_smem));
       else if (forward_fc2_tma_store)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_tma_store_kernel<false, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_smem));
+            static_cast<int>(forward_compute_smem));
       else if (forward_m64)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<false, true, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_smem));
+            static_cast<int>(forward_compute_smem));
       else if (forward_m64_head)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<
                 false, true, false,
                 ForwardTaskPartition::Body>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_smem));
+            static_cast<int>(forward_compute_smem));
       else {
         const auto set_mixed_compute_attribute = [&](auto kernel) {
           return cudaFuncSetAttribute(
               kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-              static_cast<int>(forward_smem));
+              static_cast<int>(forward_compute_smem));
         };
         if (forward_fc1_stages == 2U)
           compute_attribute = set_mixed_compute_attribute(
@@ -15508,11 +15620,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                   false, true, false, ForwardTaskPartition::All, true, false,
                   false, 3U, 4U>);
       }
+#endif
       internal::throw_cuda(
           "forward-run", compute_attribute,
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaFuncSetAttribute(queued FC1/FC2 dynamic smem)");
+#if !MEGAMOE_FWD_COMPILED_TUNING
       if (forward_specialize_stages) {
         cudaError_t fc2_attribute = cudaSuccess;
         if (!forward_fc2_tma_store)
@@ -15520,12 +15634,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
               local_p2p_forward_compute_kernel<
                   false, true, false, ForwardTaskPartition::All, true, true>,
               cudaFuncAttributeMaxDynamicSharedMemorySize,
-              static_cast<int>(forward_smem));
+              static_cast<int>(forward_compute_smem));
         else
           fc2_attribute = cudaFuncSetAttribute(
               local_p2p_forward_tma_store_kernel<false, false, true>,
               cudaFuncAttributeMaxDynamicSharedMemorySize,
-              static_cast<int>(forward_smem));
+              static_cast<int>(forward_compute_smem));
         internal::throw_cuda(
             "forward-run", fc2_attribute, id.calling_rank, id.world_size,
             backend->session.session().identity(), id.generation,
@@ -15537,7 +15651,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             "forward-run",
             cudaFuncSetAttribute(local_p2p_forward_m64_head_kernel<false>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(forward_smem)),
+                                 static_cast<int>(forward_compute_smem)),
             id.calling_rank, id.world_size,
             backend->session.session().identity(), id.generation,
             ExchangeKind::ExpertCounts,
@@ -15550,11 +15664,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                     false, true, false, ForwardTaskPartition::Body, false,
                     true>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(forward_smem)),
+                static_cast<int>(forward_compute_smem)),
             id.calling_rank, id.world_size,
             backend->session.session().identity(), id.generation,
             ExchangeKind::ExpertCounts,
             "cudaFuncSetAttribute(M128 body FC2 tail dynamic smem)");
+#endif
 
       internal::throw_cuda(
           "forward-run",
@@ -15569,6 +15684,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaStreamWaitEvent(split Forward transport ready)");
+#if !MEGAMOE_FWD_COMPILED_TUNING
       if (forward_m64_head || forward_specialize_stages)
         internal::throw_cuda(
             "forward-run",
@@ -15578,6 +15694,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             backend->session.session().identity(), id.generation,
             ExchangeKind::ExpertCounts,
             "cudaStreamWaitEvent(split Forward auxiliary compute ready)");
+#endif
       internal::throw_cuda("forward-run",
                            cudaStreamWaitEvent(slot.forward_compute_stream,
                                                slot.forward_roles_ready),
@@ -15588,8 +15705,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 
       cudaLaunchConfig_t transport_launch{};
       transport_launch.gridDim = dim3(kTransportBlocks, 1, 1);
-      transport_launch.blockDim = dim3(384, 1, 1);
-      transport_launch.dynamicSmemBytes = forward_smem;
+      transport_launch.blockDim =
+          dim3(forward_tuning::kComputeThreads, 1, 1);
+      transport_launch.dynamicSmemBytes = forward_transport_smem;
       transport_launch.stream = slot.forward_transport_stream;
       launch_forward = forward_transport_launch::launch(
           &transport_launch, &args, sizeof(args), slot.forward_x_map,
@@ -15606,6 +15724,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                            ExchangeKind::ExpertCounts,
                            "cudaEventRecord(split Forward transport done)");
 
+#if !MEGAMOE_FWD_COMPILED_TUNING
       if (forward_m64_head) {
         auto head_args = args;
 #if MEGAMOE_DEVICE_TIMELINE
@@ -15614,7 +15733,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         cudaLaunchConfig_t head_launch{};
         head_launch.gridDim = dim3(args.forward_m64_head_cta_count, 1, 1);
         head_launch.blockDim = dim3(384, 1, 1);
-        head_launch.dynamicSmemBytes = forward_smem;
+        head_launch.dynamicSmemBytes = forward_compute_smem;
         head_launch.stream = slot.forward_m64_head_stream;
         launch_forward = cudaLaunchKernelEx(
             &head_launch, local_p2p_forward_m64_head_kernel<false>, head_args,
@@ -15636,7 +15755,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         cudaLaunchConfig_t tail_launch{};
         tail_launch.gridDim = dim3(args.forward_m64_head_cta_count, 1, 1);
         tail_launch.blockDim = dim3(384, 1, 1);
-        tail_launch.dynamicSmemBytes = forward_smem;
+        tail_launch.dynamicSmemBytes = forward_compute_smem;
         tail_launch.stream = slot.forward_m64_head_stream;
         launch_forward = cudaLaunchKernelEx(
             &tail_launch,
@@ -15669,7 +15788,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         cudaLaunchConfig_t fc1_launch{};
         fc1_launch.gridDim = dim3(args.forward_fc1_cta_count, 1, 1);
         fc1_launch.blockDim = dim3(384, 1, 1);
-        fc1_launch.dynamicSmemBytes = forward_smem;
+        fc1_launch.dynamicSmemBytes = forward_compute_smem;
         fc1_launch.stream = slot.forward_m64_head_stream;
         launch_forward = cudaLaunchKernelEx(
             &fc1_launch,
@@ -15696,7 +15815,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         cudaLaunchConfig_t tail_launch{};
         tail_launch.gridDim = dim3(args.forward_fc1_cta_count, 1, 1);
         tail_launch.blockDim = dim3(384, 1, 1);
-        tail_launch.dynamicSmemBytes = forward_smem;
+        tail_launch.dynamicSmemBytes = forward_compute_smem;
         tail_launch.stream = slot.forward_m64_head_stream;
         if (forward_fc2_tma_store)
           launch_forward = cudaLaunchKernelEx(
@@ -15726,6 +15845,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             ExchangeKind::ExpertCounts,
             "cudaEventRecord(specialized FC1/tail-FC2 done)");
       }
+#endif
 
       auto compute_args = args;
 #if MEGAMOE_DEVICE_TIMELINE
@@ -15735,20 +15855,69 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 #endif
       cudaLaunchConfig_t compute_launch{};
       compute_launch.gridDim = dim3(
+#if MEGAMOE_FWD_COMPILED_TUNING
+          forward_main_compute_ctas,
+#else
           forward_specialize_stages
               ? forward_main_compute_ctas - args.forward_fc1_cta_count
               : forward_main_compute_ctas,
+#endif
           1, 1);
-      compute_launch.blockDim = dim3(384, 1, 1);
-      compute_launch.dynamicSmemBytes = forward_smem;
+      compute_launch.blockDim =
+          dim3(forward_tuning::kComputeThreads, 1, 1);
+      compute_launch.dynamicSmemBytes = forward_compute_smem;
       compute_launch.stream = slot.forward_compute_stream;
       cudaLaunchAttribute compute_cluster_attribute{};
       if (forward_cluster2) {
         compute_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-        compute_cluster_attribute.val.clusterDim = {2U, 1U, 1U};
+        compute_cluster_attribute.val.clusterDim = {
+            forward_tuning::kClusterSize, 1U, 1U};
         compute_launch.attrs = &compute_cluster_attribute;
         compute_launch.numAttrs = 1U;
       }
+#if MEGAMOE_FWD_COMPILED_TUNING
+#if MEGAMOE_FWD_FC2_TMA_STORE
+      const auto &output_store_map =
+          args.use_gin && args.forward_registered_output
+              ? slot.forward_staging_store_map
+              : slot.forward_output_store_map;
+#if MEGAMOE_FWD_CLUSTER_SIZE == 2
+      launch_forward = cudaLaunchKernelEx(
+          &compute_launch,
+          local_p2p_forward_tma_store_kernel<
+              false, true, false, true, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+          weight.w2_map, output_store_map);
+#else
+      launch_forward = cudaLaunchKernelEx(
+          &compute_launch,
+          local_p2p_forward_tma_store_kernel<
+              false, true, false, false, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+          weight.w2_map, output_store_map);
+#endif
+#elif MEGAMOE_FWD_TILE_M == 64
+      launch_forward = cudaLaunchKernelEx(
+          &compute_launch,
+          local_p2p_forward_compute_kernel<
+              false, true, true, ForwardTaskPartition::All, true, false,
+              false, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
+          weight.w1_map, weight.w2_map);
+#else
+      launch_forward = cudaLaunchKernelEx(
+          &compute_launch,
+          local_p2p_forward_compute_kernel<
+              false, true, false, ForwardTaskPartition::All, true, false,
+              false, forward_tuning::kFc1Stages,
+              forward_tuning::kFc2Stages>,
+          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+          weight.w2_map);
+#endif
+#else
       if (forward_specialize_stages) {
         compute_args.forward_reduce_cta_offset = 0U;
 #if MEGAMOE_DEVICE_TIMELINE
@@ -15830,6 +15999,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                   false, true, false, ForwardTaskPartition::All, true, false,
                   false, 3U, 4U>);
       }
+#endif
       internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
                            id.world_size, backend->session.session().identity(),
                            id.generation, ExchangeKind::ExpertCounts,
@@ -15848,6 +16018,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaStreamWaitEvent(split Forward transport done)");
+#if !MEGAMOE_FWD_COMPILED_TUNING
       if (forward_m64_head || forward_specialize_stages)
         internal::throw_cuda(
             "forward-run",
@@ -15856,6 +16027,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             backend->session.session().identity(), id.generation,
             ExchangeKind::ExpertCounts,
             "cudaStreamWaitEvent(split Forward auxiliary compute done)");
+#endif
       internal::throw_cuda(
           "forward-run",
           cudaStreamWaitEvent(exec->stream, slot.forward_compute_done),

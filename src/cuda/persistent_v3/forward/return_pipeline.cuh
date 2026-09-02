@@ -175,6 +175,7 @@ struct DirectFullCompletionState {
   std::uint32_t selected = 0U;
   std::uint32_t chunk_ready = 0U;
   std::uint32_t progressed = 0U;
+  unsigned long long marker_ready[persistent_v3::kWarpsPerCta]{};
 };
 
 __device__ __forceinline__ bool direct_full_completion_terminal(
@@ -246,19 +247,30 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   const auto *fragment_ready = reinterpret_cast<const unsigned long long *>(
       static_cast<const std::byte *>(a.gin_window_base) +
       a.gin_return_fragment_ready_offset);
-  if (threadIdx.x < 32U) {
+  constexpr auto kMarkerWarps = forward_tuning::kCompletionMarkerWarps;
+  if (threadIdx.x < kMarkerWarps * 32U) {
     constexpr unsigned int kWarpMask = 0xffffffffU;
+    const auto warp = threadIdx.x / 32U;
     const auto lane = threadIdx.x & 31U;
     // GIN writes arrive through the async proxy.  One coherence handoff and one
     // parallel marker pass are enough for this opportunistic probe.
     asm volatile("fence.proxy.async.global;" : : : "memory");
     unsigned long long ready_rows = 0ULL;
-    for (std::uint32_t row = lane; row < state.selected_rows; row += 32U)
+    for (std::uint32_t row = warp * 32U + lane;
+         row < state.selected_rows; row += kMarkerWarps * 32U)
       ready_rows += fragment_ready[row_begin + row];
     for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U)
       ready_rows += __shfl_down_sync(kWarpMask, ready_rows, offset);
     if (lane == 0U)
-      state.chunk_ready = ready_rows >= state.selected_rows ? 1U : 0U;
+      state.marker_ready[warp] = ready_rows;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0U) {
+    unsigned long long ready_rows = 0ULL;
+#pragma unroll
+    for (std::uint32_t warp = 0U; warp < kMarkerWarps; ++warp)
+      ready_rows += state.marker_ready[warp];
+    state.chunk_ready = ready_rows >= state.selected_rows ? 1U : 0U;
   }
   __syncthreads();
   if (state.chunk_ready == 0U)
@@ -783,7 +795,7 @@ __device__ __forceinline__ void direct_full_mapping_helper(
         fragment.epoch);
     while (published.load(::cuda::memory_order_acquire) != a.epoch &&
            !cancelled(a, control))
-      __nanosleep(32U);
+      __nanosleep(forward_tuning::kReturnIdleNanosleep);
     if (cancelled(a, control))
       return;
 
@@ -809,7 +821,7 @@ __device__ __forceinline__ void direct_full_mapping_helper(
       }
       ready = __ballot_sync(kWarpMask, missing) == 0U;
       if (!ready && lane == 0U)
-        __nanosleep(32U);
+        __nanosleep(forward_tuning::kReturnIdleNanosleep);
       __syncwarp(kWarpMask);
     }
     if (cancelled(a, control))
@@ -905,7 +917,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
         state.cursor >= tail.load(::cuda::memory_order_acquire))
       break;
     if (!progressed)
-      __nanosleep(32U);
+      __nanosleep(forward_tuning::kReturnIdleNanosleep);
   }
 
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -913,7 +925,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
   issued_count.store(state.issued, ::cuda::memory_order_release);
   while (gin.readCounter(1, 56, ::cuda::memory_order_acquire) < state.issued &&
          !cancelled(a, control))
-    __nanosleep(64U);
+    __nanosleep(forward_tuning::kTransportIdleNanosleep);
 
   if (state.issued != 0ULL) {
     complete_completion_tasks(completion, transport_state::TaskClass::Return,

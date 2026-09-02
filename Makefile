@@ -16,6 +16,7 @@ WERROR ?= 0
 MEGAMOE_DEBUG_VALIDATE ?= 0
 MEGAMOE_DEVICE_TIMELINE ?= 0
 MEGAMOE_FORWARD_LIGHT_PROGRESS ?= 0
+FORWARD_TUNING_INCLUDE_DIR ?=
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
@@ -46,6 +47,10 @@ CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
 CUDA_CPPFLAGS += -DMEGAMOE_DEVICE_TIMELINE=$(MEGAMOE_DEVICE_TIMELINE)
 CPPFLAGS += -DMEGAMOE_FORWARD_LIGHT_PROGRESS=$(MEGAMOE_FORWARD_LIGHT_PROGRESS)
 CUDA_CPPFLAGS += -DMEGAMOE_FORWARD_LIGHT_PROGRESS=$(MEGAMOE_FORWARD_LIGHT_PROGRESS)
+ifneq ($(strip $(FORWARD_TUNING_INCLUDE_DIR)),)
+override CUDA_CPPFLAGS += -I$(abspath $(FORWARD_TUNING_INCLUDE_DIR)) \
+	-DMEGAMOE_FORWARD_USE_GENERATED_TUNING=1
+endif
 
 LIB_SOURCES := \
 	src/cuda/control_protocol.cpp \
@@ -82,7 +87,13 @@ PROD_CUDA_LIB_OBJECTS := \
 	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
 	$(BUILD_DIR)/production/src/cuda/forward_transport.o
 
-.PHONY: all test reference-test launcher-security-test rdma-launcher-test cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test rdma-launcher-test forward-autotune-test forward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+
+forward-autotune-test:
+	python3 tests/test_forward_autotune.py
+
+forward-autotune:
+	python3 tools/autotune_forward.py --config configs/forward_h200_autotune.json
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
@@ -105,6 +116,7 @@ $(BUILD_DIR)/production/%.o: %.cu
 $(BUILD_DIR)/src/cuda/activation_transport.o \
 $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
 	src/cuda/forward/runtime_shape_fallback.cuh \
 	src/cuda/backward/kernel_contract.cuh \
@@ -133,6 +145,7 @@ $(BUILD_DIR)/production/src/cuda/forward_transport.o: \
 	src/cuda/activation_transport_internal.hpp \
 	src/cuda/cuda_internal.hpp \
 	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
 	src/cuda/persistent_v3/backward/pipeline_state.cuh \
 	src/cuda/persistent_v3/contracts.hpp \

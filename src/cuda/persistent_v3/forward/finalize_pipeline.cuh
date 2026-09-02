@@ -15,7 +15,7 @@ __device__ __forceinline__ bool wait_for_count(
              counter.value) < expected) {
     if (forward_cancelled(a))
       return false;
-    __nanosleep(128U);
+    __nanosleep(forward_tuning::kFinalizeNanosleep);
   }
   return true;
 }
@@ -124,19 +124,29 @@ __device__ __forceinline__ void split_transport_finalize(
   if (threadIdx.x == 0U) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     const auto mblocks = scheduler[3];
-    const auto fc1_ntiles = (a.intermediate + 127ULL) / 128ULL;
-    const auto fc2_ntiles = (a.hidden + 255ULL) / 256ULL;
+    const auto fc1_ntiles =
+        (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+        forward_tuning::kFc1TileN;
+    const auto fc2_ntiles =
+        (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+        forward_tuning::kFc2TileN;
     const auto fc1_tasks = mblocks * fc1_ntiles;
     const auto fc2_tasks = mblocks * fc2_ntiles;
-    const auto fc1_k_blocks = (a.hidden + 63ULL) / 64ULL;
-    const auto fc2_k_blocks = (a.intermediate + 63ULL) / 64ULL;
+    const auto fc1_k_blocks =
+        (a.hidden + forward_tuning::kTileK - 1ULL) /
+        forward_tuning::kTileK;
+    const auto fc2_k_blocks =
+        (a.intermediate + forward_tuning::kTileK - 1ULL) /
+        forward_tuning::kTileK;
     status->fc1_tasks_done = fc1_tasks;
     status->fc2_tasks_done = fc2_tasks;
     status->tma_loads = fc1_tasks * 2ULL * fc1_k_blocks * 2ULL +
                         fc2_tasks * fc2_k_blocks * 2ULL;
     status->wgmma_instructions =
-        (fc1_tasks * 2ULL * fc1_k_blocks + fc2_tasks * fc2_k_blocks) *
-        2ULL * (64ULL / ForwardMma::K);
+        fc1_tasks * 2ULL * fc1_k_blocks * 2ULL *
+            (forward_tuning::kTileK / TunedForwardFc1Mma::K) +
+        fc2_tasks * fc2_k_blocks * 2ULL *
+            (forward_tuning::kTileK / TunedForwardFc2Mma::K);
 #endif
     status->complete_clock = device_globaltimer_ns();
   }

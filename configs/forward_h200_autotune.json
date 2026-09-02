@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "description": "Narrow two-host H200 Forward search. Every candidate is a separately compiled specialization; fixed entries are explicit singleton hyperparameters.",
+  "max_candidates": 8,
+  "build": {
+    "build_root": "build/forward-autotune",
+    "jobs": 8,
+    "cuda_arch_flags": "-gencode arch=compute_90a,code=sm_90a",
+    "target": "test_cuda_notify",
+    "timeout_seconds": 1800
+  },
+  "benchmark": {
+    "remote": "root@10.10.19.233",
+    "port": 2222,
+    "gpus_per_node": 8,
+    "nccl_lib_dir": "/storage/openpsi/codes/wanghaitao.wht/deps/nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu",
+    "socket_ifname": "eth0",
+    "enable_ib": true,
+    "tokens_per_rank": 8192,
+    "tune_rounds": 30,
+    "final_rounds": 110,
+    "timeout_seconds": 900,
+    "selection_metric": "forward_slowest_rank_us.mean",
+    "result_dir": "artifacts/forward-autotune"
+  },
+  "fixed": {
+    "1_gemm": {
+      "main_hidden": 7168,
+      "main_intermediate": 3072,
+      "tile_m": 128,
+      "fc1_tile_n": 128,
+      "fc2_tile_n": 256,
+      "tile_k": 64,
+      "fc1_stages": 4,
+      "fc2_stages": 4,
+      "compute_threads": 384,
+      "math_warpgroups": 2,
+      "producer_warpgroups": 1,
+      "math_registers": 232,
+      "producer_registers": 40,
+      "wgmma_wait_group": 0,
+      "fc2_store_atom_n": 64,
+      "cluster_size": 2,
+      "fc2_tma_store": true
+    },
+    "2_transport": {
+      "rdma_ctas": 8,
+      "relay_ctas": 8,
+      "rdma_control_warps": 2,
+      "relay_tma_warps": 8,
+      "local_dispatch_tma_warps": 12,
+      "relay_scatter_warps": 12,
+      "local_return_batch_mblocks": 4,
+      "dispatch_publish_batch_rows": 32,
+      "return_chunk_rows": 256,
+      "return_max_inflight": 16,
+      "registered_output": true,
+      "relay_local_return": true
+    },
+    "3_scheduler": {
+      "local_route_batch_rows": 128,
+      "startup_mblocks": 2,
+      "fc1_locality_group": 2,
+      "fc1_locality_group4_begin": 4,
+      "fc1_locality_group4_end": 12,
+      "fc2_priority_burst": 0,
+      "task_claim_chunk": 1,
+      "task_idle_nanosleep": 64,
+      "transport_idle_nanosleep": 64,
+      "setup_nanosleep": 256
+    },
+    "4_completion_reduce": {
+      "completion_chunks_per_pass": 1,
+      "completion_marker_warps": 1,
+      "reduce_cta_divisor": 1,
+      "reduce_warps": 12,
+      "reduce_tokens_per_claim": 12,
+      "reduce_registers": 168,
+      "return_idle_nanosleep": 32,
+      "reduce_queue_nanosleep": 128,
+      "finalize_nanosleep": 128
+    }
+  },
+  "candidates": [
+    {
+      "name": "current_m128_n128_n256",
+      "description": "Current evidence-backed production point.",
+      "override": {}
+    },
+    {
+      "name": "fc2_n128",
+      "description": "Finer FC2 readiness and return granularity at the cost of twice as many FC2 tasks.",
+      "override": {
+        "1_gemm": {
+          "fc2_tile_n": 128
+        }
+      }
+    },
+    {
+      "name": "regs_math224_producer48",
+      "description": "Move eight registers per producer thread from the two math warpgroups to the producer warpgroup.",
+      "override": {
+        "1_gemm": {
+          "math_registers": 224,
+          "producer_registers": 48
+        }
+      }
+    },
+    {
+      "name": "cluster1",
+      "description": "Avoid the paired-CTA cluster protocol on the current driver where runtime cluster support reports unavailable.",
+      "override": {
+        "1_gemm": {
+          "cluster_size": 1
+        }
+      }
+    },
+    {
+      "name": "relay16",
+      "description": "Trade eight compute CTAs for additional local NVLink relay concurrency.",
+      "override": {
+        "2_transport": {
+          "relay_ctas": 16
+        }
+      }
+    },
+    {
+      "name": "dispatch_tma8",
+      "description": "Use eight rather than twelve local dispatch TMA streams to reduce transport-side contention.",
+      "override": {
+        "2_transport": {
+          "local_dispatch_tma_warps": 8
+        }
+      }
+    },
+    {
+      "name": "reduce_half_ctas",
+      "description": "Keep only half of the compute CTAs alive for the terminal reduction queue.",
+      "override": {
+        "4_completion_reduce": {
+          "reduce_cta_divisor": 2
+        }
+      }
+    }
+  ]
+}

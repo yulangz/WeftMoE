@@ -10,19 +10,21 @@
 
 namespace forward_dispatch_detail {
 
-inline constexpr std::uint32_t kLocalRouteBatch = 128U;
+inline constexpr std::uint32_t kLocalRouteBatch =
+    forward_tuning::kLocalRouteBatchRows;
 inline constexpr std::uint16_t kDispatchDirectoryTask = 1U;
 // Warp 0 owns the GIN context and warp 1 contributes the scalar FC1-ready
 // publisher.  The remaining ten complete warps used to sit idle while the
 // paired Relay CTA both packed outbound packets and scattered inbound ones.
 // Keep the two control warps out of every packing barrier so GIN progress and
 // FC1 publication remain independent from the bulk HBM copy.
-inline constexpr std::uint32_t kRdmaControlWarps = 2U;
+inline constexpr std::uint32_t kRdmaControlWarps =
+    forward_tuning::kRdmaControlWarps;
 inline constexpr std::uint32_t kRdmaPackWarps =
     persistent_v3::kWarpsPerCta - kRdmaControlWarps;
 inline constexpr std::uint32_t kRdmaPackThreads = kRdmaPackWarps * 32U;
 
-static_assert(kRdmaPackWarps == 10U);
+static_assert(kRdmaPackWarps > 0U);
 
 __device__ __forceinline__ void rdma_pack_group_sync() {
   // Named barrier 1 belongs exclusively to threads [64, 384).  Warp 0 and
@@ -79,7 +81,7 @@ __device__ __forceinline__ void wait_for_local_map_clear(
           observed(peer_control->generation.contexts[0].rx_published.value);
       while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
              !cancelled(a, control))
-        __nanosleep(128U);
+        __nanosleep(forward_tuning::kReduceQueueNanosleep);
     }
   }
   __syncthreads();
@@ -124,13 +126,15 @@ __device__ __forceinline__ void publish_local_batch(
     std::byte *tma_storage,
     forward_return_detail::DirectLocalReturnBarrier *tma_full) {
   const auto routes = route_end - route_begin;
-  constexpr std::uint32_t kWarps = persistent_v3::kWarpsPerCta;
+  constexpr std::uint32_t kWarps =
+      forward_tuning::kLocalDispatchTmaWarps;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
   const auto copy_bytes = static_cast<std::uint32_t>(
       a.hidden * sizeof(transport::BFloat16));
   bool copied = false;
-  for (std::uint64_t local = warp; local < routes; local += kWarps) {
+  for (std::uint64_t local = warp; warp < kWarps && local < routes;
+       local += kWarps) {
     const auto route =
         a.dispatch_waves.local_route_order[route_begin + local];
     if (lane == 0U) {
@@ -227,10 +231,11 @@ __device__ __forceinline__ void publish_local_batch(
     transport_state::GenerationCompletionVector *completion) {
   const auto routes = route_end - route_begin;
   const auto vector_count = a.hidden / 8ULL;
-  constexpr std::uint32_t kWarps = persistent_v3::kWarpsPerCta;
+  constexpr std::uint32_t kWarps = forward_tuning::kRelayScatterWarps;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
-  for (std::uint64_t local = warp; local < routes; local += kWarps) {
+  for (std::uint64_t local = warp; warp < kWarps && local < routes;
+       local += kWarps) {
     const auto route =
         a.dispatch_waves.local_route_order[route_begin + local];
     std::uint32_t destination = 0U;
@@ -449,7 +454,7 @@ __device__ __forceinline__ void rdma_pack_outbound_context(
                control.generation.contexts[context]
                    .tx_local_complete.value) < a.epoch &&
            !cancelled(a, control))
-      __nanosleep(64U);
+      __nanosleep(forward_tuning::kTransportIdleNanosleep);
     pack_enabled = cancelled(a, control) ? 0U : 1U;
     context_wave_span(a, context, remote_node, pack_node_wave_begin,
                       pack_wave_begin, pack_wave_end);
@@ -519,7 +524,7 @@ __device__ __forceinline__ void relay_inbound_wave(
   const auto partition_fanout_base =
       partition_packet_base * a.dispatch.identity.top_k;
   const auto vector_count = a.hidden / 8ULL;
-  constexpr std::uint32_t kWarps = persistent_v3::kWarpsPerCta;
+  constexpr std::uint32_t kWarps = forward_tuning::kRelayScatterWarps;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
   const auto publish_batch_rows = min(
@@ -532,7 +537,7 @@ __device__ __forceinline__ void relay_inbound_wave(
     const auto batch_item_begin = batch_row_begin * a.dispatch.identity.top_k;
     const auto batch_item_end = batch_row_end * a.dispatch.identity.top_k;
     for (std::uint64_t item = batch_item_begin + warp;
-         item < batch_item_end; item += kWarps) {
+         warp < kWarps && item < batch_item_end; item += kWarps) {
       const auto packet_in_wave = item / a.dispatch.identity.top_k;
       const auto fanout_slot = item % a.dispatch.identity.top_k;
       const auto sequence = task.row_begin + packet_in_wave;
@@ -899,10 +904,16 @@ __device__ __forceinline__ void relay_role(
 #endif
 
     if (owns_context_transport && completion_done == 0U) {
-      progressed =
-          forward_return_detail::progress_direct_full_completion_once(
-              a, control, context, scheduler, completion_state) ||
-          progressed;
+      for (std::uint32_t pass = 0U;
+           pass < forward_tuning::kCompletionChunksPerPass; ++pass) {
+        const auto completion_progressed =
+            forward_return_detail::progress_direct_full_completion_once(
+                a, control, context, scheduler, completion_state);
+        progressed = completion_progressed || progressed;
+        if (forward_return_detail::direct_full_completion_terminal(
+                completion_state))
+          break;
+      }
       if (!completion_timeline_started && completion_state.initialized != 0U) {
         MEGAMOE_TIMELINE_RECORD(
             a.timeline, SourceRelayStart, SourceRelay, context,
@@ -926,7 +937,7 @@ __device__ __forceinline__ void relay_role(
     }
 
     if (!progressed && threadIdx.x == 0U)
-      __nanosleep(64U);
+      __nanosleep(forward_tuning::kTransportIdleNanosleep);
     __syncthreads();
   }
 }
@@ -1093,11 +1104,14 @@ __device__ __forceinline__ bool publish_one_inbound_wave_sequence(
 __device__ __forceinline__ void publish_ready_fc1_locality_groups(
     const ForwardKernelArgs &a, std::uint32_t context,
     unsigned long long *scheduler) {
-  constexpr std::uint32_t kStartupMblocks = 2U;
+  constexpr std::uint32_t kStartupMblocks =
+      forward_tuning::kStartupMblocks;
   const auto locality_group = a.forward_fc1_locality_group;
   const auto forward_mblocks = scheduler[3];
   const auto fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+      static_cast<std::uint32_t>(
+          (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+          forward_tuning::kFc1TileN);
   auto *claims = peer_at<unsigned long long>(
       a.local_base, a.forward_task_claim_offset);
   auto *fc1_ready_queue = claims + forward_mblocks;
@@ -1227,7 +1241,7 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
     if (!pending)
       break;
     if (!progressed)
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
 #if MEGAMOE_DEBUG_VALIDATE
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
@@ -1243,7 +1257,9 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
   }
   const auto forward_mblocks = scheduler[3];
   const auto fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+      static_cast<std::uint32_t>(
+          (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+          forward_tuning::kFc1TileN);
   auto *claims = peer_at<unsigned long long>(
       a.local_base, a.forward_task_claim_offset);
   auto *fc1_ready_queue = claims + forward_mblocks;
@@ -1305,7 +1321,7 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
 #endif
     }
     if (!progressed)
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
 #if MEGAMOE_DEBUG_VALIDATE
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
@@ -1476,7 +1492,7 @@ __device__ __forceinline__ void rdma_role(
           progressed;
 
       if (!progressed)
-        __nanosleep(64U);
+        __nanosleep(forward_tuning::kTransportIdleNanosleep);
     }
 
     if (issued_completions != 0ULL) {
@@ -1486,7 +1502,7 @@ __device__ __forceinline__ void rdma_role(
         if (!forward_return_detail::progress_direct_full_rdma_once(
                 a, control, return_gin, world, context, completion,
                 context_completion, scheduler, direct_full_state))
-          __nanosleep(64U);
+          __nanosleep(forward_tuning::kTransportIdleNanosleep);
       }
     }
     MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,

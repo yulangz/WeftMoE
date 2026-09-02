@@ -51,7 +51,7 @@ __device__ __forceinline__ void reduce_one_token(
           route_ready[lane_route]);
       while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
              !forward_cancelled(a))
-        __nanosleep(64U);
+        __nanosleep(forward_tuning::kTaskIdleNanosleep);
       if (a.dispatch.route_dst_node[lane_route] != a.node) {
         lane_row = direct_source_compact_index[lane_route];
         lane_direct = 1U;
@@ -62,7 +62,7 @@ __device__ __forceinline__ void reduce_one_token(
           source_ready[destination * a.channels]);
       while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
              !forward_cancelled(a))
-        __nanosleep(64U);
+        __nanosleep(forward_tuning::kTaskIdleNanosleep);
     }
   }
   __syncwarp();
@@ -137,7 +137,12 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           a.peer_bases[a.world]);
   }
 
-  constexpr std::uint32_t kWarpsPerCta = kThreads / 32U;
+  constexpr std::uint32_t kPhysicalWarpsPerCta = kThreads / 32U;
+  constexpr std::uint32_t kReduceWarps = forward_tuning::kReduceWarps;
+  constexpr std::uint32_t kTokensPerClaim =
+      forward_tuning::kReduceTokensPerClaim;
+  static_assert(kReduceWarps <= kPhysicalWarpsPerCta);
+  static_assert(kTokensPerClaim <= kReduceWarps);
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
   MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
@@ -181,7 +186,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                 published < token_count ? published : token_count;
             if (candidate < available) {
               const auto count = static_cast<unsigned int>(
-                  min(static_cast<unsigned long long>(kWarpsPerCta),
+                  min(static_cast<unsigned long long>(kTokensPerClaim),
                       available - candidate));
               if (head.compare_exchange_strong(
                       candidate, candidate + count,
@@ -191,7 +196,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                 batch_count = count;
               }
             } else {
-              __nanosleep(128U);
+              __nanosleep(forward_tuning::kReduceQueueNanosleep);
             }
           }
         }
@@ -209,7 +214,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
               published(ready_token[slot]);
           auto encoded = published.load(::cuda::memory_order_acquire);
           while (encoded == 0ULL && !forward_cancelled(a)) {
-            __nanosleep(64U);
+            __nanosleep(forward_tuning::kTaskIdleNanosleep);
             encoded = published.load(::cuda::memory_order_acquire);
           }
           if (encoded != 0ULL) {
@@ -260,7 +265,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
         } else {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
               cursor(control->reduce_ready_head.value);
-          batch_begin = cursor.fetch_add(kWarpsPerCta,
+          batch_begin = cursor.fetch_add(kTokensPerClaim,
                                          ::cuda::memory_order_relaxed);
         }
       }
@@ -268,64 +273,67 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
       if (scan_done != 0U)
         break;
 
-      const auto token =
-          (batch_begin + warp) % a.dispatch.identity.num_tokens;
-      unsigned int open = 0U;
-      if (lane == 0U) {
-        ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device> state(
-            token_state[token]);
-        open = state.load(::cuda::memory_order_relaxed) == 0U ? 1U : 0U;
-      }
-      open = __shfl_sync(0xffffffffU, open, 0U);
-
-      bool route_is_ready = open != 0U;
-      if (route_is_ready && lane < a.dispatch.identity.top_k) {
-        const auto route = token * a.dispatch.identity.top_k + lane;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            published(route_ready[route]);
-        route_is_ready =
-            published.load(::cuda::memory_order_acquire) >= a.epoch;
-      }
-      const auto ready_lanes = __ballot_sync(0xffffffffU, route_is_ready);
-      const auto route_mask =
-          (1U << a.dispatch.identity.top_k) - 1U;
-      unsigned int owner = 0U;
-      if (lane == 0U && open != 0U &&
-          (ready_lanes & route_mask) == route_mask) {
-        owner = atomicCAS(&token_state[token], 0U, 1U) == 0U ? 1U : 0U;
-        if (owner != 0U)
-          atomicAdd(&batch_progress, 1U);
-      }
-      owner = __shfl_sync(0xffffffffU, owner, 0U);
-      if (owner != 0U) {
-        reduce_one_token<StaticLocal>(
-            a, token, status, contribution, source_ready, route_ready,
-            direct_source_compact_index, direct_return_receive, combined,
-            completion);
+      if (warp < kTokensPerClaim) {
+        const auto token =
+            (batch_begin + warp) % a.dispatch.identity.num_tokens;
+        unsigned int open = 0U;
         if (lane == 0U) {
           ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device> state(
               token_state[token]);
-          state.store(2U, ::cuda::memory_order_release);
-          ::cuda::atomic_ref<unsigned long long,
-                             ::cuda::thread_scope_device>
-              completed(control->reduce_tokens_complete.value);
-          completed.fetch_add(1ULL, ::cuda::memory_order_release);
+          open = state.load(::cuda::memory_order_relaxed) == 0U ? 1U : 0U;
+        }
+        open = __shfl_sync(0xffffffffU, open, 0U);
+
+        bool route_is_ready = open != 0U;
+        if (route_is_ready && lane < a.dispatch.identity.top_k) {
+          const auto route = token * a.dispatch.identity.top_k + lane;
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              published(route_ready[route]);
+          route_is_ready =
+              published.load(::cuda::memory_order_acquire) >= a.epoch;
+        }
+        const auto ready_lanes = __ballot_sync(0xffffffffU, route_is_ready);
+        const auto route_mask = (1U << a.dispatch.identity.top_k) - 1U;
+        unsigned int owner = 0U;
+        if (lane == 0U && open != 0U &&
+            (ready_lanes & route_mask) == route_mask) {
+          owner = atomicCAS(&token_state[token], 0U, 1U) == 0U ? 1U : 0U;
+          if (owner != 0U)
+            atomicAdd(&batch_progress, 1U);
+        }
+        owner = __shfl_sync(0xffffffffU, owner, 0U);
+        if (owner != 0U) {
+          reduce_one_token<StaticLocal>(
+              a, token, status, contribution, source_ready, route_ready,
+              direct_source_compact_index, direct_return_receive, combined,
+              completion);
+          if (lane == 0U) {
+            ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device>
+                state(token_state[token]);
+            state.store(2U, ::cuda::memory_order_release);
+            ::cuda::atomic_ref<unsigned long long,
+                               ::cuda::thread_scope_device>
+                completed(control->reduce_tokens_complete.value);
+            completed.fetch_add(1ULL, ::cuda::memory_order_release);
+          }
         }
       }
       __syncthreads();
       if (threadIdx.x == 0U && batch_progress == 0U)
-        __nanosleep(256U);
+        __nanosleep(forward_tuning::kSetupNanosleep);
       __syncthreads();
     }
   } else {
-    for (std::uint64_t token =
-             static_cast<std::uint64_t>(role_index) * kWarpsPerCta + warp;
-         token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
-         token += static_cast<std::uint64_t>(role_count) * kWarpsPerCta) {
-      reduce_one_token<StaticLocal>(
-          a, token, status, contribution, source_ready, route_ready,
-          direct_source_compact_index, direct_return_receive, combined,
-          completion);
+    if (warp < kReduceWarps) {
+      for (std::uint64_t token =
+               static_cast<std::uint64_t>(role_index) * kReduceWarps + warp;
+           token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
+           token += static_cast<std::uint64_t>(role_count) * kReduceWarps) {
+        reduce_one_token<StaticLocal>(
+            a, token, status, contribution, source_ready, route_ready,
+            direct_source_compact_index, direct_return_receive, combined,
+            completion);
+      }
     }
   }
 

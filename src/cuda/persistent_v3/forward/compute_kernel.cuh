@@ -11,21 +11,25 @@
 
 namespace forward_compute_detail {
 
-constexpr std::uint32_t kThreads = 384U;
-constexpr std::uint32_t kMathThreads = 256U;
-constexpr std::uint32_t kMathWarpGroups = 2U;
+constexpr std::uint32_t kThreads = forward_tuning::kComputeThreads;
+constexpr std::uint32_t kMathWarpGroups = forward_tuning::kMathWarpgroups;
+constexpr std::uint32_t kMathThreads = kMathWarpGroups * 128U;
 constexpr std::uint32_t kTaskReadyBarrier = 0U;
 constexpr std::uint32_t kTaskDoneBarrier = 1U;
 constexpr std::uint32_t kMathReadyBarrier = 2U;
 constexpr std::uint32_t kMathDoneBarrier = 3U;
 constexpr std::uint32_t kReduceRegisterReleaseBarrier = 4U;
 constexpr std::uint32_t kReduceRegisterAcquireBarrier = 5U;
-constexpr std::uint32_t kFc1Stages = 3U;
-constexpr std::uint32_t kFc2Stages = 4U;
-constexpr std::uint32_t kFc2Iterations = 3072U / 64U;
-constexpr std::uint32_t kAStageElements = 128U * 64U;
-constexpr std::uint32_t kFc1BStageElements = 128U * 64U;
-constexpr std::uint32_t kFc2BStageElements = 256U * 64U;
+constexpr std::uint32_t kFc1Stages = forward_tuning::kFc1Stages;
+constexpr std::uint32_t kFc2Stages = forward_tuning::kFc2Stages;
+constexpr std::uint32_t kFc2Iterations =
+    forward_tuning::kMainIntermediate / forward_tuning::kTileK;
+constexpr std::uint32_t kAStageElements =
+    static_cast<std::uint32_t>(forward_tuning::kAStageElements);
+constexpr std::uint32_t kFc1BStageElements =
+    static_cast<std::uint32_t>(forward_tuning::kFc1BStageElements);
+constexpr std::uint32_t kFc2BStageElements =
+    static_cast<std::uint32_t>(forward_tuning::kFc2BStageElements);
 
 enum ForwardComputeTaskKind : std::uint32_t {
   kComputeTaskNone = 0U,
@@ -40,21 +44,61 @@ enum ForwardComputePairOperand : std::uint32_t {
   kComputePairShareB = 2U,
 };
 
-// FC1/FC2 lends most of the CTA register file to the two WGMMA warpgroups:
-// 2 * 128 * 232 + 128 * 40 == 384 * 168. Once the final GEMM tile has
+template <typename TileMma, class Callback>
+__device__ __forceinline__ void visit_m128_accumulator(float *accum,
+                                                        Callback callback) {
+  const auto warpgroup = threadIdx.x / 128U;
+  const auto warpgroup_thread = threadIdx.x % 128U;
+  const auto warp = warpgroup_thread / 32U;
+  const auto lane = warpgroup_thread % 32U;
+  const auto row0 = warp * 16U + lane / 4U;
+  const auto row1 = row0 + 8U;
+#pragma unroll
+  for (std::uint32_t index = 0; index < TileMma::kNumAccum / 4U; ++index) {
+    const auto column = (lane % 4U) * 2U + index * 8U;
+    callback(warpgroup, row0, column, accum[index * 4U],
+             accum[index * 4U + 1U]);
+    callback(warpgroup, row1, column, accum[index * 4U + 2U],
+             accum[index * 4U + 3U]);
+  }
+}
+
+template <typename TileMma, class Callback>
+__device__ __forceinline__ void visit_m128_accumulator_pair(
+    float *accum_a, float *accum_b, Callback callback) {
+  const auto warpgroup = threadIdx.x / 128U;
+  const auto warpgroup_thread = threadIdx.x % 128U;
+  const auto warp = warpgroup_thread / 32U;
+  const auto lane = warpgroup_thread % 32U;
+  const auto row0 = warp * 16U + lane / 4U;
+  const auto row1 = row0 + 8U;
+#pragma unroll
+  for (std::uint32_t index = 0; index < TileMma::kNumAccum / 4U; ++index) {
+    const auto column = (lane % 4U) * 2U + index * 8U;
+    callback(warpgroup, row0, column, accum_a[index * 4U],
+             accum_a[index * 4U + 1U], accum_b[index * 4U],
+             accum_b[index * 4U + 1U]);
+    callback(warpgroup, row1, column, accum_a[index * 4U + 2U],
+             accum_a[index * 4U + 3U], accum_b[index * 4U + 2U],
+             accum_b[index * 4U + 3U]);
+  }
+}
+
+// FC1/FC2 lends most of the CTA register file to the WGMMA warpgroups, with a
+// separately tuned quota for the TMA producer. Once the final GEMM tile has
 // retired, those asymmetric roles no longer overlap with Reduce. Rebalance
-// the same fixed register budget so every warp can run the token combiner
-// without carrying the producer warpgroup's 40-register constraint into the
-// tail. The named barriers are CTA-local; this is not a grid-wide phase
+// the same physical register file to the tuned uniform Reduce quota instead
+// of carrying either compute role's live-range budget into the terminal
+// phase. The named barriers are CTA-local; this is not a grid-wide phase
 // barrier and Return/RDMA/Relay continue concurrently on their own CTAs.
 __device__ __forceinline__ void rebalance_registers_for_reduce() {
   const auto warpgroup = threadIdx.x / 128U;
   if (warpgroup < kMathWarpGroups)
-    cutlass::arch::warpgroup_reg_dealloc<168>();
+    cutlass::arch::warpgroup_reg_dealloc<forward_tuning::kReduceRegisters>();
   cutlass::arch::NamedBarrier::sync(kThreads,
                                     kReduceRegisterReleaseBarrier);
   if (warpgroup >= kMathWarpGroups)
-    cutlass::arch::warpgroup_reg_alloc<168>();
+    cutlass::arch::warpgroup_reg_alloc<forward_tuning::kReduceRegisters>();
   cutlass::arch::NamedBarrier::sync(kThreads,
                                     kReduceRegisterAcquireBarrier);
 }
@@ -433,17 +477,23 @@ __device__ __forceinline__ void select_priority_compute_task(
     unsigned long long fc1_tasks, unsigned long long fc2_tasks,
     std::uint32_t fc1_ntiles, std::uint32_t fc2_ntiles,
     transport_state::GenerationCompletionVector *completion,
-    unsigned long long *task_shared, unsigned int *task_kind_shared) {
+    unsigned long long *task_shared, unsigned int *task_kind_shared,
+    unsigned int &fc2_streak) {
   if (threadIdx.x != 0U)
     return;
   while (!forward_cancelled(a)) {
     bool fc1_exhausted = !DoFc1;
     bool fc2_exhausted = !DoFc2;
     unsigned long long task = 0ULL;
+    const bool fc2_first =
+        forward_tuning::kFc2PriorityBurst == 0U ||
+        fc2_streak < forward_tuning::kFc2PriorityBurst;
     if constexpr (DoFc2) {
-      if (try_claim_fc2_task<StaticLocal, Partition>(
+      if (fc2_first &&
+          try_claim_fc2_task<StaticLocal, Partition>(
               a, scheduler, fc2_ready_queue, fc2_tasks, fc2_ntiles,
               completion, task, fc2_exhausted)) {
+        ++fc2_streak;
         *task_shared = task;
         *task_kind_shared = kComputeTaskFc2;
         return;
@@ -453,8 +503,20 @@ __device__ __forceinline__ void select_priority_compute_task(
       if (try_claim_fc1_task<StaticLocal, Partition>(
               a, scheduler, claims, fc1_tasks, fc1_ntiles, completion, task,
               fc1_exhausted)) {
+        fc2_streak = 0U;
         *task_shared = task;
         *task_kind_shared = kComputeTaskFc1;
+        return;
+      }
+    }
+    if constexpr (DoFc2) {
+      if (!fc2_first &&
+          try_claim_fc2_task<StaticLocal, Partition>(
+              a, scheduler, fc2_ready_queue, fc2_tasks, fc2_ntiles,
+              completion, task, fc2_exhausted)) {
+        ++fc2_streak;
+        *task_shared = task;
+        *task_kind_shared = kComputeTaskFc2;
         return;
       }
     }
@@ -462,7 +524,7 @@ __device__ __forceinline__ void select_priority_compute_task(
       *task_kind_shared = kComputeTaskDone;
       return;
     }
-    __nanosleep(64U);
+    __nanosleep(forward_tuning::kTaskIdleNanosleep);
   }
   *task_kind_shared = kComputeTaskDone;
 }
@@ -476,7 +538,8 @@ __device__ __forceinline__ void select_priority_compute_task_pair(
     std::uint32_t fc1_ntiles, std::uint32_t fc2_ntiles,
     transport_state::GenerationCompletionVector *completion,
     unsigned long long *task_shared, unsigned int *task_kind_shared,
-    unsigned int *pair_operand_shared, unsigned long long &pair_round) {
+    unsigned int *pair_operand_shared, unsigned long long &pair_round,
+    unsigned int &fc2_streak) {
   if (threadIdx.x != 0U)
     return;
   const auto cluster_rank = cute::block_rank_in_cluster();
@@ -495,7 +558,7 @@ __device__ __forceinline__ void select_priority_compute_task_pair(
     } else {
       while (persistent_v3::load_acquire<::cuda::thread_scope_device>(
                  mailbox.sequence) != complete_sequence)
-        __nanosleep(64U);
+        __nanosleep(forward_tuning::kTaskIdleNanosleep);
     }
   }
 
@@ -508,10 +571,15 @@ __device__ __forceinline__ void select_priority_compute_task_pair(
     while (!forward_cancelled(a)) {
       bool fc1_exhausted = !DoFc1;
       bool fc2_exhausted = !DoFc2;
+      const bool fc2_first =
+          forward_tuning::kFc2PriorityBurst == 0U ||
+          fc2_streak < forward_tuning::kFc2PriorityBurst;
       if constexpr (DoFc2) {
-        if (try_claim_fc2_task_pair<StaticLocal, Partition>(
+        if (fc2_first &&
+            try_claim_fc2_task_pair<StaticLocal, Partition>(
                 a, scheduler, fc2_ready_queue, fc2_tasks, fc2_ntiles,
                 completion, task0, task1, pair_operand, fc2_exhausted)) {
+          ++fc2_streak;
           task_kind = kComputeTaskFc2;
           break;
         }
@@ -520,13 +588,24 @@ __device__ __forceinline__ void select_priority_compute_task_pair(
         if (try_claim_fc1_task_pair<StaticLocal, Partition>(
                 a, scheduler, claims, fc1_tasks, fc1_ntiles, completion,
                 task0, task1, pair_operand, fc1_exhausted)) {
+          fc2_streak = 0U;
           task_kind = kComputeTaskFc1;
+          break;
+        }
+      }
+      if constexpr (DoFc2) {
+        if (!fc2_first &&
+            try_claim_fc2_task_pair<StaticLocal, Partition>(
+                a, scheduler, fc2_ready_queue, fc2_tasks, fc2_ntiles,
+                completion, task0, task1, pair_operand, fc2_exhausted)) {
+          ++fc2_streak;
+          task_kind = kComputeTaskFc2;
           break;
         }
       }
       if (fc1_exhausted && fc2_exhausted)
         break;
-      __nanosleep(64U);
+      __nanosleep(forward_tuning::kTaskIdleNanosleep);
     }
     mailbox.tasks[0] = task0;
     mailbox.tasks[1] = task1;
@@ -540,7 +619,7 @@ __device__ __forceinline__ void select_priority_compute_task_pair(
   } else {
     while (persistent_v3::load_acquire<::cuda::thread_scope_device>(
                mailbox.sequence) != ready_sequence)
-      __nanosleep(64U);
+      __nanosleep(forward_tuning::kTaskIdleNanosleep);
     const auto metadata = mailbox.metadata;
     *task_shared = mailbox.tasks[1];
     *task_kind_shared = static_cast<std::uint32_t>(metadata);
@@ -558,16 +637,18 @@ __device__ __forceinline__ void select_compute_task(
     std::uint32_t fc1_ntiles, std::uint32_t fc2_ntiles,
     transport_state::GenerationCompletionVector *completion,
     unsigned long long *task_shared, unsigned int *task_kind_shared,
-    unsigned int *pair_operand_shared, unsigned long long &pair_round) {
+    unsigned int *pair_operand_shared, unsigned long long &pair_round,
+    unsigned int &fc2_streak) {
   if constexpr (Cluster2) {
     select_priority_compute_task_pair<StaticLocal, DoFc1, DoFc2, Partition>(
         a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
         fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-        pair_operand_shared, pair_round);
+        pair_operand_shared, pair_round, fc2_streak);
   } else {
     select_priority_compute_task<StaticLocal, DoFc1, DoFc2, Partition>(
         a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
-        fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared);
+        fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
+        fc2_streak);
   }
 }
 
@@ -589,14 +670,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 "staging specialization requires the TMA FC2 epilogue");
   static_assert(!Cluster2 || !M64,
                 "cluster multicast requires the production M128 tile");
-  static_assert(Fc1StageCount >= 2U && Fc1StageCount <= kFc2Stages,
+  static_assert(Fc1StageCount >= 2U && Fc1StageCount <= 4U,
                 "FC1 supports two to four TMA stages");
-  static_assert(Fc2StageCount >= 2U && Fc2StageCount <= kFc2Stages,
+  static_assert(Fc2StageCount >= 2U && Fc2StageCount <= 4U,
                 "FC2 supports two to four TMA stages");
   static_assert(kFc2Iterations % Fc2StageCount == 0U,
                 "the fixed FC2 reduction must divide evenly into stages");
   constexpr auto kConfiguredFc2Waves =
       kFc2Iterations / Fc2StageCount;
+  constexpr auto kConfiguredAStorageElements =
+      (Fc1StageCount > Fc2StageCount ? Fc1StageCount : Fc2StageCount) *
+      kAStageElements;
+  constexpr auto kConfiguredBStorageElements =
+      2U * Fc1StageCount * kFc1BStageElements >
+              Fc2StageCount * kFc2BStageElements
+          ? 2U * Fc1StageCount * kFc1BStageElements
+          : Fc2StageCount * kFc2BStageElements;
+  constexpr auto kConfiguredGemmStorageElements =
+      kConfiguredAStorageElements + kConfiguredBStorageElements;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
@@ -625,10 +716,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *headers =
       peer_at<LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   auto *return_rows_by_source = reinterpret_cast<unsigned int *>(
-      storage +
-      (4U * kAStageElements + 4U * kFc2BStageElements) *
-          sizeof(transport::BFloat16) +
-      20U * sizeof(std::uint64_t));
+      storage + kConfiguredGemmStorageElements *
+                    sizeof(transport::BFloat16) +
+      (3U * Fc1StageCount + 2U * Fc2StageCount) * sizeof(std::uint64_t));
   // This naturally aligned scratch word is dead until the compatibility local
   // Return copy starts. Reuse it to build the immutable descriptor's remote
   // and local context masks in parallel; this is the explicit shared-memory
@@ -645,19 +735,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
   const auto forward_mblocks = scheduler[3];
   const auto fc1_ntiles =
-      static_cast<std::uint32_t>((a.intermediate + 127ULL) / 128ULL);
+      static_cast<std::uint32_t>(
+          (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+          forward_tuning::kFc1TileN);
   const auto fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + 255ULL) / 256ULL);
+      static_cast<std::uint32_t>(
+          (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+          forward_tuning::kFc2TileN);
   const auto fc1_tasks = forward_mblocks * fc1_ntiles;
   const auto fc2_tasks = forward_mblocks * fc2_ntiles;
   auto *fc1_ready_queue = claims + forward_mblocks;
   auto *fc2_ready_queue = fc1_ready_queue + fc1_tasks;
 
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
-  auto *smem_b = smem_a + 4U * kAStageElements;
+  auto *smem_b = smem_a + kConfiguredAStorageElements;
   auto *fc1_b2 = smem_b + Fc1StageCount * kFc1BStageElements;
   auto *fc1_full =
-      reinterpret_cast<ForwardBarrier *>(smem_b + 4U * kFc2BStageElements);
+      reinterpret_cast<ForwardBarrier *>(smem_b +
+                                         kConfiguredBStorageElements);
   auto *fc1_empty = fc1_full + Fc1StageCount;
   auto *fc2_full = fc1_empty + Fc1StageCount;
   auto *fc2_empty = fc2_full + Fc2StageCount;
@@ -686,7 +781,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   if (warpgroup >= kMathWarpGroups) {
     // Only the first producer-warpgroup lane issues TMA; the remaining lanes carry
     // the CTA task/barrier protocol with a deliberately small register set.
-    cutlass::arch::warpgroup_reg_dealloc<40>();
+    cutlass::arch::warpgroup_reg_dealloc<
+        forward_tuning::kProducerRegisters>();
     std::uint32_t fc1_pipeline = 0U;
     std::uint32_t fc2_pipeline = 0U;
     // The math scheduler publishes the first task through this one-time
@@ -713,7 +809,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           // the first load for the claimed M block.
           asm volatile("fence.proxy.async.global;" : : : "memory");
           const auto iterations =
-              static_cast<std::uint32_t>((a.hidden + 63ULL) / 64ULL);
+              static_cast<std::uint32_t>(
+                  (a.hidden + forward_tuning::kTileK - 1ULL) /
+                  forward_tuning::kTileK);
           for (std::uint32_t iteration = 0; iteration < iterations;
                ++iteration) {
             const auto current = fc1_pipeline + iteration;
@@ -726,8 +824,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 smem_b + stage * kFc1BStageElements);
             auto *stage_b2 = reinterpret_cast<cutlass::bfloat16_t *>(
                 fc1_b2 + stage * kFc1BStageElements);
-            const auto k_base = iteration * 64U;
-            const auto n = n_tile * 128U;
+            const auto k_base = iteration * forward_tuning::kTileK;
+            const auto n = n_tile * forward_tuning::kFc1TileN;
             const auto multicast_a =
                 Cluster2 && *pair_operand_shared == kComputePairShareA ? 2U
                                                                        : 1U;
@@ -735,25 +833,32 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 Cluster2 && *pair_operand_shared == kComputePairShareB ? 2U
                                                                        : 1U;
             if constexpr (M64) {
-              deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+              deep_gemm::tma::copy<forward_tuning::kTileK, 64, 128,
+                                   cutlass::bfloat16_t>(
                   &x_map, &fc1_full[stage], stage_a, k_base,
                   static_cast<std::uint32_t>(row), multicast_a);
             } else {
-              deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+              deep_gemm::tma::copy<forward_tuning::kTileK,
+                                   forward_tuning::kTileM, 128,
+                                   cutlass::bfloat16_t>(
                   &x_map, &fc1_full[stage], stage_a, k_base,
                   static_cast<std::uint32_t>(row), multicast_a);
             }
-            deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+            deep_gemm::tma::copy<forward_tuning::kTileK,
+                                 forward_tuning::kFc1TileN, 128,
+                                 cutlass::bfloat16_t>(
                 &w1_map, &fc1_full[stage], stage_b1, k_base,
                 static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n),
                 multicast_b);
-            deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+            deep_gemm::tma::copy<forward_tuning::kTileK,
+                                 forward_tuning::kFc1TileN, 128,
+                                 cutlass::bfloat16_t>(
                 &w1_map, &fc1_b2_full[stage], stage_b2, k_base,
                 static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
                                            a.intermediate + n),
                 multicast_b);
             constexpr auto a_stage_elements =
-                M64 ? 64U * 64U : kAStageElements;
+                M64 ? 64U * forward_tuning::kTileK : kAStageElements;
             fc1_full[stage].arrive_and_expect_tx(
                 (a_stage_elements + kFc1BStageElements) *
                 sizeof(transport::BFloat16));
@@ -794,25 +899,31 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   smem_a + stage * kAStageElements);
               auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
                   smem_b + stage * kFc2BStageElements);
-              const auto k_base = (wave * Fc2StageCount + stage) * 64U;
-              const auto n = n_tile * 256U;
+              const auto k_base =
+                  (wave * Fc2StageCount + stage) * forward_tuning::kTileK;
+              const auto n = n_tile * forward_tuning::kFc2TileN;
               const auto multicast_a =
                   Cluster2 && *pair_operand_shared == kComputePairShareA ? 2U
                                                                          : 1U;
               if constexpr (M64) {
-                deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+                deep_gemm::tma::copy<forward_tuning::kTileK, 64, 128,
+                                     cutlass::bfloat16_t>(
                     &s_map, &fc2_full[stage], stage_a, k_base,
                     static_cast<std::uint32_t>(row), multicast_a);
               } else {
-                deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+                deep_gemm::tma::copy<forward_tuning::kTileK,
+                                     forward_tuning::kTileM, 128,
+                                     cutlass::bfloat16_t>(
                     &s_map, &fc2_full[stage], stage_a, k_base,
                     static_cast<std::uint32_t>(row), multicast_a);
               }
-              deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+              deep_gemm::tma::copy<forward_tuning::kTileK,
+                                   forward_tuning::kFc2TileN, 128,
+                                   cutlass::bfloat16_t>(
                   &w2_map, &fc2_full[stage], stage_b, k_base,
                   static_cast<std::uint32_t>(expert * a.hidden + n));
               constexpr auto a_stage_elements =
-                  M64 ? 64U * 64U : kAStageElements;
+                  M64 ? 64U * forward_tuning::kTileK : kAStageElements;
               fc2_full[stage].arrive_and_expect_tx(
                   (a_stage_elements + kFc2BStageElements) *
                   sizeof(transport::BFloat16));
@@ -832,10 +943,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
     return;
   }
 
-  cutlass::arch::warpgroup_reg_alloc<232>();
+  cutlass::arch::warpgroup_reg_alloc<forward_tuning::kMathRegisters>();
   std::uint32_t fc1_pipeline = 0U;
   std::uint32_t fc2_pipeline = 0U;
   unsigned long long pair_round = 0ULL;
+  unsigned int fc2_streak = 0U;
 #if MEGAMOE_DEVICE_TIMELINE
   bool timeline_fc1_started = false;
   bool timeline_fc2_started = false;
@@ -843,7 +955,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   select_compute_task<Cluster2, StaticLocal, DoFc1, DoFc2, Partition>(
       a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks, fc1_ntiles,
       fc2_ntiles, completion, task_shared, task_kind_shared,
-      pair_operand_shared, pair_round);
+      pair_operand_shared, pair_round, fc2_streak);
   cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
   while (true) {
     if constexpr (DoFc1) {
@@ -873,9 +985,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                        forward_mblock_local_row(a, expert, local_mblock);
       const auto valid_rows =
           forward_mblock_valid_rows(a, expert, local_mblock);
-      const auto n = n_tile * 128U;
+      const auto n = n_tile * forward_tuning::kFc1TileN;
       using Fc1TileMma =
-          typename std::conditional<M64, ForwardMmaNarrow, ForwardMma>::type;
+          typename std::conditional<M64, TunedForwardFc1M64Mma,
+                                    TunedForwardFc1Mma>::type;
       float accum_a[Fc1TileMma::kNumAccum];
       float accum_b[Fc1TileMma::kNumAccum];
 #pragma unroll
@@ -884,20 +997,26 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         accum_b[index] = 0.0F;
       }
       const auto iterations =
-          static_cast<std::uint32_t>((a.hidden + 63ULL) / 64ULL);
+          static_cast<std::uint32_t>(
+              (a.hidden + forward_tuning::kTileK - 1ULL) /
+              forward_tuning::kTileK);
       for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
         const auto current = fc1_pipeline + iteration;
         const auto stage = current % Fc1StageCount;
         const auto phase = (current / Fc1StageCount) & 1U;
         auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
             smem_a + stage * kAStageElements +
-            (M64 ? 0U : warpgroup * 64U * 64U));
+            (M64 ? 0U : warpgroup * 64U * forward_tuning::kTileK));
         auto *stage_b1 = reinterpret_cast<cutlass::bfloat16_t *>(
             smem_b + stage * kFc1BStageElements +
-            (M64 ? warpgroup * 64U * 64U : 0U));
+            (M64 ? warpgroup * (forward_tuning::kFc1TileN / 2U) *
+                           forward_tuning::kTileK
+                 : 0U));
         auto *stage_b2 = reinterpret_cast<cutlass::bfloat16_t *>(
             fc1_b2 + stage * kFc1BStageElements +
-            (M64 ? warpgroup * 64U * 64U : 0U));
+            (M64 ? warpgroup * (forward_tuning::kFc1TileN / 2U) *
+                           forward_tuning::kTileK
+                 : 0U));
         // A and gate share the first completion barrier, while up has its own.
         // Start the gate WGMMA group as soon as 32 KiB is ready so its issue
         // overlaps the tail of the independent 16 KiB up-weight TMA.
@@ -907,7 +1026,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
         deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
-        for (std::uint32_t k = 0; k < 64U / Fc1TileMma::K; ++k) {
+        for (std::uint32_t k = 0;
+             k < forward_tuning::kTileK / Fc1TileMma::K; ++k) {
           const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
               stage_a + k * Fc1TileMma::K, 1);
           const auto desc_b1 = deep_gemm::mma::sm90::make_smem_desc(
@@ -925,7 +1045,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
         deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
-        for (std::uint32_t k = 0; k < 64U / Fc1TileMma::K; ++k) {
+        for (std::uint32_t k = 0;
+             k < forward_tuning::kTileK / Fc1TileMma::K; ++k) {
           const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
               stage_a + k * Fc1TileMma::K, 1);
           const auto desc_b2 = deep_gemm::mma::sm90::make_smem_desc(
@@ -936,7 +1057,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
           deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
-        deep_gemm::ptx::warpgroup_wait<0>();
+        deep_gemm::ptx::warpgroup_wait<
+            forward_tuning::kWgmmaWaitGroup>();
         if constexpr (Cluster2) {
           const auto lane = threadIdx.x & 31U;
           if (lane < 2U)
@@ -996,7 +1118,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       if constexpr (M64)
         visit_m64_accumulator_pair<Fc1TileMma>(accum_a, accum_b, store_fc1);
       else
-        visit_forward_accumulator_pair(accum_a, accum_b, store_fc1);
+        visit_m128_accumulator_pair<Fc1TileMma>(accum_a, accum_b, store_fc1);
       __threadfence();
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
       if (threadIdx.x == 0U) {
@@ -1050,7 +1172,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       select_compute_task<Cluster2, StaticLocal, DoFc1, DoFc2, Partition>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-          pair_operand_shared, pair_round);
+          pair_operand_shared, pair_round, fc2_streak);
       cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
     }
@@ -1072,7 +1194,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       if (threadIdx.x == 0U)
         atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
       using Fc2TileMma =
-          typename std::conditional<M64, ForwardMma, ForwardMmaWide>::type;
+          typename std::conditional<M64, TunedForwardFc2M64Mma,
+                                    TunedForwardFc2Mma>::type;
       float accum[Fc2TileMma::kNumAccum];
 #pragma unroll
       for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
@@ -1083,17 +1206,20 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           const auto phase = wave & 1U;
           auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
               smem_a + stage * kAStageElements +
-              (M64 ? 0U : warpgroup * 64U * 64U));
+              (M64 ? 0U : warpgroup * 64U * forward_tuning::kTileK));
           auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
               smem_b + stage * kFc2BStageElements +
-              (M64 ? warpgroup * 128U * 64U : 0U));
+              (M64 ? warpgroup * (forward_tuning::kFc2TileN / 2U) *
+                           forward_tuning::kTileK
+                   : 0U));
           fc2_full[stage].wait(phase);
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
             deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
           deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
-          for (std::uint32_t k = 0; k < 64U / Fc2TileMma::K; ++k) {
+          for (std::uint32_t k = 0;
+               k < forward_tuning::kTileK / Fc2TileMma::K; ++k) {
             const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
                 stage_a + k * Fc2TileMma::K, 1);
             const auto desc_b = deep_gemm::mma::sm90::make_smem_desc(
@@ -1108,7 +1234,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           // math side completes one K=64 group before recycling that stage; the
           // previous wait<1> needed a second live accumulator generation and
           // made ptxas serialize every individual WGMMA instruction.
-          deep_gemm::ptx::warpgroup_wait<0>();
+          deep_gemm::ptx::warpgroup_wait<
+              forward_tuning::kWgmmaWaitGroup>();
           if constexpr (Cluster2) {
             const auto lane = threadIdx.x & 31U;
             if (lane < 2U)
@@ -1133,10 +1260,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                        forward_mblock_local_row(a, expert, local_mblock);
       const auto valid_rows =
           forward_mblock_valid_rows(a, expert, local_mblock);
-      const auto n = n_tile * 256U;
+      const auto n = n_tile * forward_tuning::kFc2TileN;
 
-      const bool full_tma_tile = TmaFc2Store && !M64 && valid_rows == 128U &&
-                                 n + 256ULL <= a.hidden;
+      const bool full_tma_tile =
+          TmaFc2Store && !M64 && valid_rows == forward_tuning::kTileM &&
+                                 n + forward_tuning::kFc2TileN <= a.hidden;
       if constexpr (TmaFc2Store) {
         if (full_tma_tile) {
           // Reuse the 64 KiB FC2 input-stage union after its final consumer.
@@ -1150,7 +1278,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           const auto lane = threadIdx.x & 31U;
 #pragma unroll
           for (std::uint32_t index = 0;
-               index < ForwardMmaWide::kNumAccum / 4U; ++index) {
+               index < Fc2TileMma::kNumAccum / 4U; ++index) {
             constexpr std::uint32_t kBankGroupBytes = 16U;
             const auto atom = index / (64U / 8U);
             const auto in_atom = index % (64U / 8U);
@@ -1171,11 +1299,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           cute::tma_store_fence();
           cutlass::arch::NamedBarrier::sync(kMathThreads,
                                             kMathReadyBarrier);
-          if (threadIdx.x < 4U) {
+          if (threadIdx.x <
+              forward_tuning::kFc2TileN / forward_tuning::kFc2StoreAtomN) {
             const auto atom = threadIdx.x;
             cute::SM90_TMA_STORE_2D::copy(
                 output_store_map, output_tile + atom * 128U * 64U,
-                static_cast<std::uint32_t>(n + atom * 64ULL),
+                static_cast<std::uint32_t>(
+                    n + atom * forward_tuning::kFc2StoreAtomN),
                 static_cast<std::uint32_t>(row));
             cute::tma_store_arrive();
             // The unqualified wait both protects the shared-memory union from
@@ -1222,10 +1352,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                       value;
               }
             };
-        if constexpr (M64)
-          visit_m64_accumulator<Fc2TileMma>(accum, store_fc2);
-        else
-          visit_forward_accumulator_wide(accum, store_fc2);
+      if constexpr (M64)
+        visit_m64_accumulator<Fc2TileMma>(accum, store_fc2);
+      else
+        visit_m128_accumulator<Fc2TileMma>(accum, store_fc2);
       }
       // N-tiles synchronize only through this GPU-local completion chain.
       // A device fence is sufficient here; the final N-tile acquires the
@@ -1399,7 +1529,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       select_compute_task<Cluster2, StaticLocal, DoFc1, DoFc2, Partition>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-          pair_operand_shared, pair_round);
+          pair_operand_shared, pair_round, fc2_streak);
       cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
     }
@@ -1425,9 +1555,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 template <bool StaticLocal, bool SplitStages = false, bool M64 = false,
           ForwardTaskPartition Partition = ForwardTaskPartition::All,
           bool ReduceStage = true, bool Fc2Only = false,
-          bool Fc1Only = false, std::uint32_t Fc1StageCount = 3U,
-          std::uint32_t Fc2StageCount = 4U>
-__global__ __launch_bounds__(384, 1) void local_p2p_forward_compute_kernel(
+          bool Fc1Only = false,
+          std::uint32_t Fc1StageCount = forward_tuning::kFc1Stages,
+          std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
+__global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
+local_p2p_forward_compute_kernel(
     ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
@@ -1446,7 +1578,7 @@ __global__ __launch_bounds__(384, 1) void local_p2p_forward_compute_kernel(
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
     while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
            !forward_cancelled(a))
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
   static_assert(!(Fc1Only && Fc2Only),
@@ -1479,14 +1611,17 @@ __global__ __launch_bounds__(384, 1) void local_p2p_forward_compute_kernel(
         &task_kind_shared, &return_mblock_shared);
   }
   if constexpr (ReduceStage) {
-    forward_compute_detail::rebalance_registers_for_reduce();
     const auto reduce_role_index =
         a.forward_reduce_cta_offset + static_cast<std::uint32_t>(blockIdx.x);
-    forward_compute_detail::reduce_role<StaticLocal>(
-        a, reduce_role_index,
+    const auto reduce_role_count =
         a.forward_reduce_cta_count != 0U
             ? a.forward_reduce_cta_count
-            : static_cast<std::uint32_t>(gridDim.x));
+            : static_cast<std::uint32_t>(gridDim.x);
+    if (reduce_role_index < reduce_role_count) {
+      forward_compute_detail::rebalance_registers_for_reduce();
+      forward_compute_detail::reduce_role<StaticLocal>(
+          a, reduce_role_index, reduce_role_count);
+    }
   }
   if (threadIdx.x == 0U)
     MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
@@ -1503,8 +1638,10 @@ __global__ __launch_bounds__(384, 1) void local_p2p_forward_compute_kernel(
 // FC2-priority mixed scheduler or the retained FC2-only tuning candidate
 // without duplicating the kernel wrapper.
 template <bool StaticLocal, bool DoFc1, bool StoreToStaging = false,
-          bool Cluster2 = false>
-__global__ __launch_bounds__(384, 1) void
+          bool Cluster2 = false,
+          std::uint32_t Fc1StageCount = forward_tuning::kFc1Stages,
+          std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
+__global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
 local_p2p_forward_tma_store_kernel(
     ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
@@ -1526,23 +1663,26 @@ local_p2p_forward_tma_store_kernel(
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
     while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
            !forward_cancelled(a))
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
   forward_compute_detail::persistent_role<
       StaticLocal, DoFc1, true, false, ForwardTaskPartition::All, true,
-      StoreToStaging, 4U, 4U, Cluster2>(
+      StoreToStaging, Fc1StageCount, Fc2StageCount, Cluster2>(
       a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
       &task_kind_shared, &return_mblock_shared, &pair_operand_shared,
       &output_store_map);
-  forward_compute_detail::rebalance_registers_for_reduce();
   const auto reduce_role_index =
       a.forward_reduce_cta_offset + static_cast<std::uint32_t>(blockIdx.x);
-  forward_compute_detail::reduce_role<StaticLocal>(
-      a, reduce_role_index,
+  const auto reduce_role_count =
       a.forward_reduce_cta_count != 0U
           ? a.forward_reduce_cta_count
-          : static_cast<std::uint32_t>(gridDim.x));
+          : static_cast<std::uint32_t>(gridDim.x);
+  if (reduce_role_index < reduce_role_count) {
+    forward_compute_detail::rebalance_registers_for_reduce();
+    forward_compute_detail::reduce_role<StaticLocal>(
+        a, reduce_role_index, reduce_role_count);
+  }
   if (threadIdx.x == 0U)
     MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 #else
@@ -1579,7 +1719,7 @@ __global__ __launch_bounds__(384, 1) void local_p2p_forward_m64_head_kernel(
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
     while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
            !forward_cancelled(a))
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
   forward_compute_detail::persistent_role<
@@ -1623,7 +1763,7 @@ __global__ __launch_bounds__(256, 1) void local_p2p_forward_stage_kernel(
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
     while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
            !forward_cancelled(a))
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
   if constexpr (Fc1Stage) {
@@ -1668,7 +1808,7 @@ __launch_bounds__(256,
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
     while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
            !forward_cancelled(a))
-      __nanosleep(256U);
+      __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
   forward_compute_detail::reduce_role<StaticLocal>(

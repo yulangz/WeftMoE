@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "cuda/forward/tuning_config.hpp"
+
 #if defined(__CUDACC__)
 #define MEGAMOE_V3_HOST_DEVICE __host__ __device__
 #define MEGAMOE_V3_DEVICE __device__
@@ -18,9 +20,11 @@ namespace megamoe::cuda::persistent_v3 {
 // The final block of every expert is physically padded, not merely predicated,
 // so dW can traverse a uniform, deterministic K extent in 64-row WGMMA steps.
 inline constexpr std::uint32_t kMBlockRows = 128U;
-inline constexpr std::uint32_t kRdmaCtaCount = 8U;
-inline constexpr std::uint32_t kDefaultRelayCtaCount = 8U;
-inline constexpr std::uint32_t kThreadsPerCta = 384U;
+inline constexpr std::uint32_t kRdmaCtaCount = forward_tuning::kRdmaCtas;
+inline constexpr std::uint32_t kDefaultRelayCtaCount =
+    forward_tuning::kRelayCtas;
+inline constexpr std::uint32_t kThreadsPerCta =
+    forward_tuning::kComputeThreads;
 inline constexpr std::uint32_t kWarpsPerCta = kThreadsPerCta / 32U;
 inline constexpr std::uint32_t kInvalidTask = ~0U;
 
