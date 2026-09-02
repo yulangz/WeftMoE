@@ -1,7 +1,8 @@
 {
   "schema": 1,
-  "commit": "eec34ec4a5c9d45935faf29d368804bfd4cc7142",
-  "recorded_utc": "2026-09-02T12:10:13Z",
+  "search_commit": "eec34ec4a5c9d45935faf29d368804bfd4cc7142",
+  "final_validation_commit": "a6cb12369d9bcd535ae2ff915f372468af9353c6",
+  "recorded_utc": "2026-09-02T12:24:58Z",
   "hardware": "8x H200 per node (driver label NVIDIA L20X)",
   "workload": {
     "tokens_per_rank": 8192,
@@ -81,5 +82,37 @@
     "all_candidate_fingerprints_equal": true,
     "world8_split_forward_smoke": "pass",
     "world16_final_validation": "pass"
+  },
+  "final_commit_revalidation": {
+    "world8": {
+      "elapsed_seconds": 64.986,
+      "candidate_digest": "d77881727d7b",
+      "final_measured_rounds": 100,
+      "forward_slowest_rank_us": {
+        "mean": 14692.013,
+        "p50": 14778.100,
+        "p95": 15016.000,
+        "min": 14102.900,
+        "max": 15165.000
+      },
+      "change_from_pre_cleanup_percent": -2.206
+    },
+    "world16": {
+      "candidate_digest": "072fd0b465fc",
+      "independent_invocations": 2,
+      "measured_intervals": 4,
+      "measured_rounds_per_interval": 100,
+      "interval_mean_us": [
+        21267.530,
+        21736.928,
+        21692.352,
+        21506.243
+      ],
+      "aggregate_interval_mean_us": 21550.763,
+      "interval_mean_range_us": [21267.530, 21736.928],
+      "change_from_pre_cleanup_percent": 0.007,
+      "speedup_over_megatron": 1.454,
+      "elapsed_seconds": [110.567, 64.354]
+    }
   }
 }

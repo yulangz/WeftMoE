@@ -17,6 +17,16 @@ same main-shape workload. The post-cleanup MegaMOE result is 1.475x faster.
 Every compiled candidate and each final validation produced the same input,
 route, gate, weight, and output correctness fingerprint.
 
+The winners were rebuilt and measured again at final commit `a6cb123`. World 8
+measured 14.6920 ms over 100 iterations, 2.21% below its pre-cleanup result.
+World 16 was deliberately repeated because run-to-run jitter was larger than
+the tuning margin: four independent 100-iteration intervals ranged from
+21.2675 to 21.7369 ms and averaged 21.5508 ms. That aggregate differs from the
+21.5492 ms pre-cleanup result by 0.007%, so the cleanup introduced no
+measurable regression; even the conservative aggregate remains 1.454x faster
+than the 31.334 ms Megatron reference. Both rebuilt winners retained the same
+correctness fingerprints and compiled-kernel digests as the search winners.
+
 The selected common compute shape is M128, FC1-N128, FC2-N256, K64, with four
 TMA stages in each GEMM, a two-CTA cluster, 232 math registers, 40 producer
 registers, FC2 TMA store, and queue-based reduction. Topology-specific role
