@@ -306,6 +306,36 @@ GIN execution or a single cross-node persistent payload kernel.
 
 ### World-16 full GIN Forward/Backward and Megatron network baselines
 
+The H200 Forward specialization has an explicit, narrow compile-time tuning
+plan in `configs/forward_h200_autotune.json`. Its four numbered sections cover
+GEMM geometry/register allocation, RDMA/Relay role structure, mixed-scheduler
+granularity, and completion/Reduce behavior. Every value is present in the
+JSON, including parameters intentionally held to a single proven value. The
+candidate list is explicit rather than a Cartesian product.
+
+Validate the plan and generator without CUDA compilation with:
+
+```bash
+make forward-autotune-test
+python3 tools/autotune_forward.py --generate-only
+```
+
+Build one content-addressed specialization without running the benchmark:
+
+```bash
+python3 tools/autotune_forward.py \
+  --candidate current_m128_n128_n256 --build-only
+```
+
+Run the complete narrow world-16 search and the 100-sample final validation
+with `make forward-autotune`. The Python launcher writes one generated header
+and one build directory per candidate, verifies that the resulting cubin has
+exactly one split Forward kernel, compares all input/weight/output hashes, and
+selects `forward_slowest_rank_us.mean`. Result JSON and build/launcher logs are
+written below `artifacts/forward-autotune/`. Kernel choices are not carried in
+environment variables; only existing benchmark controls such as sample count
+and token count are passed to the test executable.
+
 The production main-shape GIN benchmark runs without a host payload phase:
 
 ```bash

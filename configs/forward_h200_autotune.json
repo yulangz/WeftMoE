@@ -19,7 +19,7 @@
     "tokens_per_rank": 8192,
     "tune_rounds": 30,
     "final_rounds": 110,
-    "timeout_seconds": 900,
+    "timeout_seconds": 180,
     "selection_metric": "forward_slowest_rank_us.mean",
     "result_dir": "artifacts/forward-autotune"
   },
@@ -73,6 +73,7 @@
       "completion_chunks_per_pass": 1,
       "completion_marker_warps": 1,
       "reduce_cta_divisor": 1,
+      "reduce_scheduler": "queue",
       "reduce_warps": 12,
       "reduce_tokens_per_claim": 12,
       "reduce_registers": 168,

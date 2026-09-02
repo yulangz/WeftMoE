@@ -33,7 +33,7 @@ __device__ __forceinline__ void split_transport_finalize(
   if (blockIdx.x == persistent_v3::kRdmaCtaCount) {
     if (threadIdx.x == 0U)
       wait_for_count(a, control.return_receive_roles_complete,
-                     persistent_v3::kDefaultRelayCtaCount);
+                     persistent_v3::kRdmaCtaCount);
     __syncthreads();
 
     const auto remote_fanout =

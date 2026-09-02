@@ -15045,10 +15045,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         args.forward_return_chunk_rows = parsed;
     }
   }
-  bool reduce_queue_requested = false;
-  bool reduce_scan_requested = false;
-  bool legacy_reduce_requested = false;
+  bool reduce_queue_requested = forward_tuning::kReduceScheduler == 0U;
+  bool reduce_scan_requested = forward_tuning::kReduceScheduler == 1U;
+  bool legacy_reduce_requested = forward_tuning::kReduceScheduler == 2U;
   if constexpr (forward_tuning::kEnableLegacyEnvironment) {
+    reduce_queue_requested = false;
+    reduce_scan_requested = false;
+    legacy_reduce_requested = false;
     reduce_queue_requested =
         std::getenv("MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE") != nullptr;
     reduce_scan_requested =

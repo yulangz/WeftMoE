@@ -46,6 +46,7 @@ class ForwardAutotuneTest(unittest.TestCase):
                                        candidate["config"])
         self.assertIn("#define MEGAMOE_FWD_COMPILED_TUNING 1", header)
         self.assertIn("#define MEGAMOE_FWD_ENABLE_LEGACY_ENV 0", header)
+        self.assertIn("#define MEGAMOE_FWD_REDUCE_SCHEDULER 0", header)
         for macro in tune.PARAMETER_MACROS.values():
             self.assertEqual(header.count(f"#define {macro} "), 1)
 
@@ -79,6 +80,11 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(paths["header"].read_text(encoding="utf-8"),
                              tune.generated_header(candidate["name"],
                                                    candidate["config"]))
+
+    def test_shared_memory_model_matches_current_m128_shape(self):
+        memory = tune.dynamic_shared_memory(self.candidates[0]["config"], 16)
+        self.assertEqual(memory["compute_bytes"], 196832)
+        self.assertEqual(memory["transport_bytes"], 196832)
 
 
 if __name__ == "__main__":

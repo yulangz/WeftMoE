@@ -21,8 +21,10 @@ namespace megamoe::cuda::persistent_v3 {
 // so dW can traverse a uniform, deterministic K extent in 64-row WGMMA steps.
 inline constexpr std::uint32_t kMBlockRows = 128U;
 inline constexpr std::uint32_t kRdmaCtaCount = forward_tuning::kRdmaCtas;
-inline constexpr std::uint32_t kDefaultRelayCtaCount =
-    forward_tuning::kRelayCtas;
+// Backward and the generic persistent-v3 entry retain their fixed eight-CTA
+// relay contract. Forward carries its independently tuned relay count in
+// ForwardKernelArgs and must not silently alter Backward's role layout.
+inline constexpr std::uint32_t kDefaultRelayCtaCount = 8U;
 inline constexpr std::uint32_t kThreadsPerCta =
     forward_tuning::kComputeThreads;
 inline constexpr std::uint32_t kWarpsPerCta = kThreadsPerCta / 32U;

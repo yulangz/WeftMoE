@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -82,6 +83,7 @@ PARAMETER_MACROS = {
         "MEGAMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
     "completion_marker_warps": "MEGAMOE_FWD_COMPLETION_MARKER_WARPS",
     "reduce_cta_divisor": "MEGAMOE_FWD_REDUCE_CTA_DIVISOR",
+    "reduce_scheduler": "MEGAMOE_FWD_REDUCE_SCHEDULER",
     "reduce_warps": "MEGAMOE_FWD_REDUCE_WARPS",
     "reduce_tokens_per_claim": "MEGAMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
     "reduce_registers": "MEGAMOE_FWD_REDUCE_REGISTERS",
@@ -94,6 +96,14 @@ BOOLEAN_PARAMETERS = {
     "fc2_tma_store",
     "registered_output",
     "relay_local_return",
+}
+
+ENUM_PARAMETERS = {
+    "reduce_scheduler": {
+        "queue": 0,
+        "scan": 1,
+        "static": 2,
+    },
 }
 
 CORRECTNESS_KEYS = (
@@ -156,6 +166,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     for key, value in config.items():
         if key in BOOLEAN_PARAMETERS:
             _require(type(value) is bool, f"{key} must be true or false")
+        elif key in ENUM_PARAMETERS:
+            _require(value in ENUM_PARAMETERS[key],
+                     f"{key}={value!r}, expected one of "
+                     f"{tuple(ENUM_PARAMETERS[key])}")
         else:
             _require(type(value) is int, f"{key} must be an integer")
             _require(value >= 0, f"{key} must be non-negative")
@@ -325,6 +339,8 @@ def generated_header(name: str, config: Mapping[str, Any]) -> str:
         value = config[key]
         if key in BOOLEAN_PARAMETERS:
             value = int(value)
+        elif key in ENUM_PARAMETERS:
+            value = ENUM_PARAMETERS[key][value]
         lines.append(f"#define {macro} {value}")
     lines.append("")
     return "\n".join(lines)
@@ -349,6 +365,68 @@ def materialize_candidate(candidate: Mapping[str, Any],
         "build_dir": build_dir,
         "include_dir": include_dir,
         "header": header,
+    }
+
+
+def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
+    a_stage = config["tile_m"] * config["tile_k"]
+    fc1_b_stage = config["fc1_tile_n"] * config["tile_k"]
+    fc2_b_stage = config["fc2_tile_n"] * config["tile_k"]
+    a_storage = max(config["fc1_stages"], config["fc2_stages"]) * a_stage
+    b_storage = max(2 * config["fc1_stages"] * fc1_b_stage,
+                    config["fc2_stages"] * fc2_b_stage)
+    barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
+    gemm_bytes = 2 * (a_storage + b_storage)
+    control_bytes = barriers * 8 + world * 4
+    row_streams = max(config["local_dispatch_tma_warps"],
+                      config["relay_tma_warps"])
+    transport_rows = row_streams * config["main_hidden"] * 2
+    return {
+        "compute_bytes": gemm_bytes + control_bytes,
+        "transport_bytes": max(gemm_bytes, transport_rows) + control_bytes,
+    }
+
+
+def inspect_forward_kernel(binary: Path, log_path: Path,
+                           config: Mapping[str, Any]) -> dict[str, Any]:
+    cuobjdump = shutil.which("cuobjdump")
+    if cuobjdump is None:
+        return {"available": False, "reason": "cuobjdump not found"}
+    completed = subprocess.run(
+        [cuobjdump, "--dump-resource-usage", str(binary)],
+        cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, check=False)
+    log_path.write_text(completed.stdout, encoding="utf-8")
+    functions = []
+    lines = completed.stdout.splitlines()
+    kernel_names = (
+        "local_p2p_forward_tma_store_kernel",
+        "local_p2p_forward_compute_kernel",
+    )
+    resource_pattern = re.compile(
+        r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
+    for index, line in enumerate(lines[:-1]):
+        if not line.startswith(" Function ") or not any(
+                name in line for name in kernel_names):
+            continue
+        resources = resource_pattern.search(lines[index + 1])
+        if resources is None:
+            continue
+        functions.append({
+            "mangled_name": line[len(" Function "):-1],
+            "registers_per_thread": int(resources.group(1)),
+            "stack_bytes_per_thread": int(resources.group(2)),
+            "static_shared_bytes": int(resources.group(3)),
+            "local_bytes": int(resources.group(4)),
+        })
+    return {
+        "available": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "single_compiled_split_kernel": len(functions) == 1,
+        "compiled_split_kernel_count": len(functions),
+        "kernels": functions,
+        "dynamic_shared_memory_world16": dynamic_shared_memory(config, 16),
+        "log": str(log_path),
     }
 
 
@@ -410,7 +488,7 @@ def compile_candidate(candidate: Mapping[str, Any], paths: Mapping[str, Path],
     elapsed, returncode = _run_to_log(
         command, log_path, timeout=int(build["timeout_seconds"]),
         environment=environment)
-    return {
+    result = {
         "command": command,
         "elapsed_seconds": elapsed,
         "returncode": returncode,
@@ -418,6 +496,17 @@ def compile_candidate(candidate: Mapping[str, Any], paths: Mapping[str, Path],
         "binary_preexisted": existed,
         "log": str(log_path),
     }
+    if returncode == 0:
+        resources = inspect_forward_kernel(
+            binary, log_dir / f"{candidate['name']}.resources.log",
+            candidate["config"])
+        result["resources"] = resources
+        if (resources.get("available") and
+                not resources.get("single_compiled_split_kernel")):
+            result["returncode"] = 125
+            result["resource_validation_error"] = (
+                "expected exactly one compiled split Forward kernel")
+    return result
 
 
 def launcher_command(binary: Path, benchmark: Mapping[str, Any],
@@ -575,6 +664,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="run only this named candidate (repeatable)")
     parser.add_argument("--generate-only", action="store_true",
                         help="validate and generate headers without building")
+    parser.add_argument("--build-only", action="store_true",
+                        help="dynamically compile requested candidates without benchmarking")
     parser.add_argument("--skip-final", action="store_true",
                         help="do not rerun the winner with final_rounds")
     parser.add_argument("--output", type=Path,
@@ -590,6 +681,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    _require(not (args.generate_only and args.build_only),
+             "--generate-only and --build-only are mutually exclusive")
+    _require(not args.build_only or args.candidate,
+             "--build-only requires at least one explicit --candidate")
     config_path = args.config.resolve()
     plan = load_plan(config_path)
     _configure_from_cli(plan, args)
@@ -634,6 +729,38 @@ def main(argv: list[str] | None = None) -> int:
         _write_result(output_path, manifest)
         print(f"generated {len(candidates)} specializations: {output_path}")
         return 0
+
+    if args.build_only:
+        environment = _sanitized_environment()
+        start_build_only = time.monotonic()
+        manifest: dict[str, Any] = {
+            "schema": 1,
+            "mode": "dynamic-compile",
+            "config_path": str(config_path),
+            "git": _git_revision(),
+            "candidates": [],
+        }
+        all_valid = True
+        for ordinal, candidate in enumerate(candidates, 1):
+            print(f"[{ordinal}/{len(candidates)}] compile {candidate['name']}",
+                  flush=True)
+            paths = materialized[candidate["name"]]
+            build_result = compile_candidate(candidate, paths, build, log_dir,
+                                             environment)
+            valid = build_result["returncode"] == 0
+            all_valid = all_valid and valid
+            manifest["candidates"].append({
+                **candidate,
+                "digest": candidate_digest(candidate["config"]),
+                "generated_header": str(paths["header"]),
+                "status": "built" if valid else "build_failed",
+                "build": build_result,
+            })
+        manifest["status"] = "complete" if all_valid else "build_failed"
+        manifest["elapsed_seconds"] = time.monotonic() - start_build_only
+        _write_result(output_path, manifest)
+        print(f"dynamic compile result: {output_path}")
+        return 0 if all_valid else 1
 
     start_total = time.monotonic()
     environment = _sanitized_environment()
@@ -701,6 +828,15 @@ def main(argv: list[str] | None = None) -> int:
              if item["status"] == "valid"]
     if not valid:
         result["elapsed_seconds"] = time.monotonic() - start_total
+        result["timing"] = {
+            "build_seconds": sum(item["build"]["elapsed_seconds"]
+                                 for item in result["candidates"]),
+            "tune_benchmark_seconds": sum(
+                item.get("tune", {}).get("elapsed_seconds", 0.0)
+                for item in result["candidates"]),
+            "final_benchmark_seconds": 0.0,
+            "total_seconds": result["elapsed_seconds"],
+        }
         result["status"] = "no_valid_candidate"
         _write_result(output_path, result)
         print(f"no valid candidate; partial result: {output_path}", file=sys.stderr)
@@ -743,6 +879,16 @@ def main(argv: list[str] | None = None) -> int:
 
     result["status"] = "complete"
     result["elapsed_seconds"] = time.monotonic() - start_total
+    result["timing"] = {
+        "build_seconds": sum(item["build"]["elapsed_seconds"]
+                             for item in result["candidates"]),
+        "tune_benchmark_seconds": sum(
+            item.get("tune", {}).get("elapsed_seconds", 0.0)
+            for item in result["candidates"]),
+        "final_benchmark_seconds": result["selected"].get(
+            "final", {}).get("elapsed_seconds", 0.0),
+        "total_seconds": result["elapsed_seconds"],
+    }
     result["completed_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
     _write_result(output_path, result)
     print(f"selected {winner['name']} at "

@@ -128,6 +128,10 @@
 #ifndef MEGAMOE_FWD_REDUCE_CTA_DIVISOR
 #define MEGAMOE_FWD_REDUCE_CTA_DIVISOR 1
 #endif
+#ifndef MEGAMOE_FWD_REDUCE_SCHEDULER
+// 0=ready queue, 1=dynamic scan, 2=static token stripes.
+#define MEGAMOE_FWD_REDUCE_SCHEDULER 0
+#endif
 #ifndef MEGAMOE_FWD_REDUCE_WARPS
 #define MEGAMOE_FWD_REDUCE_WARPS 12
 #endif
@@ -232,6 +236,8 @@ inline constexpr std::uint32_t kCompletionMarkerWarps =
     MEGAMOE_FWD_COMPLETION_MARKER_WARPS;
 inline constexpr std::uint32_t kReduceCtaDivisor =
     MEGAMOE_FWD_REDUCE_CTA_DIVISOR;
+inline constexpr std::uint32_t kReduceScheduler =
+    MEGAMOE_FWD_REDUCE_SCHEDULER;
 inline constexpr std::uint32_t kReduceWarps = MEGAMOE_FWD_REDUCE_WARPS;
 inline constexpr std::uint32_t kReduceTokensPerClaim =
     MEGAMOE_FWD_REDUCE_TOKENS_PER_CLAIM;
@@ -332,6 +338,7 @@ static_assert(kCompletionChunksPerPass > 0U &&
 static_assert(kCompletionMarkerWarps > 0U &&
               kCompletionMarkerWarps <= kComputeThreads / 32U);
 static_assert(kReduceCtaDivisor > 0U);
+static_assert(kReduceScheduler <= 2U);
 static_assert(kReduceWarps > 0U &&
               kReduceWarps <= kComputeThreads / 32U);
 static_assert(kReduceTokensPerClaim > 0U &&
