@@ -67,12 +67,6 @@ def benchmark_arguments(args):
         "--gate-mode", args.gate_mode,
         "--expert-body", args.expert_body,
     ]
-    if args.benchmark_backward:
-        result.append("--benchmark-backward")
-    if args.training_only:
-        result.append("--training-only")
-    if getattr(args, "collective_breakdown", False):
-        result.append("--collective-breakdown")
     return result
 
 
@@ -111,9 +105,6 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="te-grouped-mlp")
-    parser.add_argument("--benchmark-backward", action="store_true")
-    parser.add_argument("--training-only", action="store_true")
-    parser.add_argument("--collective-breakdown", action="store_true")
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")

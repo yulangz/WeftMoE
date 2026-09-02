@@ -18,11 +18,6 @@ KERNELS = {
         "template": "ILb1EE",
         "configured_dynamic_shared_bytes": 196704,
     },
-    "backward_local_main": {
-        "name": "local_p2p_backward_megakernel",
-        "template": "ILb1EE",
-        "configured_dynamic_shared_bytes": 196672,
-    },
 }
 ARCHES = ("sm_90", "sm_90a")
 

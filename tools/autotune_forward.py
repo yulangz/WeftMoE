@@ -291,7 +291,6 @@ def load_plan(path: Path) -> dict[str, Any]:
         "seed",
         "tokens_per_rank",
         "top_k",
-        "fc1_output_cache",
         "generation_base",
         "tune_rounds",
         "final_rounds",
@@ -325,8 +324,6 @@ def load_plan(path: Path) -> dict[str, Any]:
     if launcher == "local":
         _require(benchmark["world"] in (1, 2, 8),
                  "local benchmark.world must be 1, 2, or 8")
-    _require(type(benchmark["fc1_output_cache"]) is bool,
-             "benchmark.fc1_output_cache must be true or false")
     _require(benchmark["top_k"] in (1, 6),
              "benchmark.top_k must be 1 or 6")
     _require(benchmark["tune_rounds"] > 10 and
@@ -637,8 +634,6 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     run_environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
     run_environment["MEGAMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
         int(benchmark["generation_base"]))
-    if benchmark["fc1_output_cache"]:
-        run_environment["MEGAMOE_FORWARD_CACHE"] = "1"
     if benchmark.get("launcher", "multinode") == "local":
         nccl_lib_dir = benchmark.get("nccl_lib_dir")
         if nccl_lib_dir:

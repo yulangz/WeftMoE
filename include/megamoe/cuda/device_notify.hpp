@@ -147,7 +147,7 @@ private:
   friend class DeviceDispatchConsumerLease;
 };
 
-// Versioned POD fields directly consumed by future forward/backward kernels.
+// Versioned POD fields directly consumed by persistent kernels.
 // 64-bit fields precede 32-bit fields so the CUDA/host ABI has no hidden
 // interior padding; fixed sizes below are part of layout version 1.
 struct DeviceReverseRouteRecord {
@@ -178,7 +178,7 @@ struct DevicePacketHeaderRecord {
 struct DeviceFanoutRecord {
   std::uint64_t dst_row;
   // Dense within one (source rank, destination node) pair and ordered by
-  // destination local rank then canonical row.  Forward and Backward reuse
+  // destination local rank then canonical row. Forward reuses
   // this immutable identity so Return wire groups follow compute M blocks
   // instead of the token/packet dispatch order.
   std::uint64_t return_compact_row;

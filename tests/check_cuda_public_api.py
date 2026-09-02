@@ -179,13 +179,6 @@ int main() {
       megamoe::transport::ActivationTransportBackend::LocalCudaP2p);
 }
 ''',
-    "internal_runtime_shape_harness": r'''
-#include "megamoe/cuda/activation_transport.hpp"
-int main() {
-  return megamoe::cuda::testing::run_runtime_shape_world1_harness(64, 32,
-                                                                   true);
-}
-''',
     "installed_testing_namespace": r'''
 #include "megamoe/cuda/activation_transport.hpp"
 int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
@@ -207,10 +200,6 @@ int main() {
   (void)megamoe::cuda::download_forward_output_for_validation(handle,
                                                                execution);
 }
-''',
-    "installed_backward_mutation": r'''
-#include "megamoe/cuda/activation_transport.hpp"
-int main() { (void)megamoe::cuda::testing::flip_backward_storage_byte_for_validation; }
 ''',
     "installed_host_oracle_wrapper": r'''
 #include "megamoe/api/notify_dispatch.hpp"

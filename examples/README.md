@@ -2,17 +2,17 @@
 
 These snippets show ownership and call order. Application bootstrap supplies
 the rank-local `NcclBootstrapId`; the router supplies typed device-resident
-route, gate and activation leases, and autograd supplies typed dY. None of the
-public handles exposes a native CUDA, IPC or GIN pointer.
+route, gate and activation leases. None of the public handles exposes a native
+CUDA, IPC or GIN pointer.
 
-## Single host Forward and Backward
+## Single-host Forward
 
 ```cpp
 using namespace megamoe;
 
 auto base = cuda::make_nccl_session("ep-team", world, rank, 1, device,
                                     bootstrap_id);
-auto exec = cuda::make_cuda_execution("training", device);
+auto exec = cuda::make_cuda_execution("forward", device);
 auto notify_pool = cuda::make_device_notify_resource_pool(
     base, exec, notify_pool_config);
 auto data_pool = cuda::make_activation_transport_pool(
@@ -29,11 +29,7 @@ for (std::uint64_t generation = 1; generation != steps + 1; ++generation) {
       session, exec, data_pool);
   auto fwd = forward.run(notified.dispatch(), router.activations(generation),
                          weights, forward_config);
-
-  cuda::LocalCudaP2pBackwardMegaKernel backward(
-      session, exec, data_pool);
-  auto bwd = backward.run(fwd, autograd.dy(generation), backward_config);
-  optimizer.consume(std::move(bwd));
+  consumer.consume(std::move(fwd));
 }
 ```
 
@@ -50,16 +46,13 @@ pool and construct the explicitly typed GIN adapters:
 cuda::GinRdmaForwardMegaKernel forward(session, exec, data_pool);
 auto fwd = forward.run(notified.dispatch(), router.activations(generation),
                        weights, forward_config);
-
-cuda::GinRdmaBackwardMegaKernel backward(session, exec, data_pool);
-auto bwd = backward.run(fwd, autograd.dy(generation), backward_config);
 ```
 
 All ranks use a common raw stable session identity and runtime homogeneous
 topology. GIN is available only when the capability report says
 `gin_usable=true`; otherwise construction fails with `BackendUnavailable`.
-Select `NcclSocketFallbackForwardMegaKernel`/`BackwardMegaKernel` explicitly
-for the host-enqueued correctness fallback—there is no enum that silently
+Select `NcclSocketFallbackForwardMegaKernel` explicitly for the host-enqueued
+correctness fallback—there is no enum that silently
 changes a requested GIN backend into Socket or simulation.
 
 The complete executable bootstrap/launcher reference is

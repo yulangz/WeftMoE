@@ -56,7 +56,6 @@ struct ForwardKernelArgs {
   std::size_t outgoing_sequence_offset;
   std::size_t status_offset;
   std::size_t forward_s_offset;
-  std::size_t forward_ab_cache_offset;
   std::size_t forward_task_claim_offset;
   std::size_t forward_fc1_done_offset;
   std::size_t forward_fc1_published_offset;
@@ -75,7 +74,6 @@ struct ForwardKernelArgs {
   unsigned long long *progress;
   std::uint32_t progress_contexts;
 #endif
-  bool cache_fc1;
   DispatchWaveKernelView dispatch_waves;
   std::size_t gin_send_dispatch_directory_offset = 0;
   std::size_t gin_receive_dispatch_directory_offset = 0;
@@ -90,8 +88,7 @@ struct ForwardKernelArgs {
   // FULL Return keeps payloads in the registered compact receive plane.
   // Completion CTAs publish this source-route -> compact-row map together with
   // the ordinary per-route ready epoch so Reduce can consume without a second
-  // NVLink payload scatter.  Keep it separate from the fanout-indexed map
-  // reused by Backward.
+  // NVLink payload scatter.
   std::size_t forward_direct_source_compact_index_offset = 0;
   // Token-ready reduction queue.  Every route publication increments the
   // owning source token's counter; the top-k completion appends the token.
@@ -102,8 +99,7 @@ struct ForwardKernelArgs {
   std::size_t forward_direct_return_fragment_offset = 0;
   std::uint64_t forward_return_chunk_capacity = 0;
   std::uint64_t forward_direct_return_fragment_capacity = 0;
-  // Backward reuses the compact reverse-route catalog; Forward Return itself
-  // has one cross-node transport policy: FULL GIN into the registered receive
+  // Forward Return has one cross-node transport policy: FULL GIN into the registered receive
   // plane, followed by per-route readiness publication.
   // Forward keeps one fixed owner per physical GIN context, while the Relay
   // team is runtime-tunable in whole context-sized groups.  Extra Relay CTAs
@@ -157,8 +153,8 @@ struct ForwardKernelArgs {
   std::uint32_t forward_m64_head_cta_count = 0;
   std::uint32_t forward_m64_head_expert_count = 0;
   // Forward scheduling may release a 64-row compute tile as soon as Notify's
-  // matching 64-row dispatch tile arrives.  Backward storage remains padded to
-  // the canonical 128-row physical quantum.
+  // matching 64-row dispatch tile arrives. Physical storage remains padded to
+  // the canonical 128-row quantum.
   std::uint32_t forward_mblock_rows = 128;
   std::uint64_t forward_return_chunk_rows = 128;
   // Production ready-token scheduler: reduction consumes only tokens whose

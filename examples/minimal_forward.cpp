@@ -53,12 +53,12 @@ bf16_values(std::size_t count, float scale) {
   return result;
 }
 
-int run_world1_training() {
+int run_world1_forward() {
   constexpr std::uint64_t tokens = 1;
   constexpr std::uint32_t top_k = 1;
   constexpr std::uint32_t experts = 1;
-  constexpr std::uint64_t hidden = 64;
-  constexpr std::uint64_t intermediate = 32;
+  constexpr std::uint64_t hidden = 7168;
+  constexpr std::uint64_t intermediate = 3072;
   constexpr std::uint64_t generation = 1;
 
   auto bootstrap = megamoe::cuda::make_nccl_bootstrap_id();
@@ -93,10 +93,6 @@ int run_world1_training() {
       producer_stream,
       bf16_values(static_cast<std::size_t>(experts * hidden * intermediate),
                   0.0007F));
-  auto dy_storage = upload(
-      producer_stream, bf16_values(static_cast<std::size_t>(tokens * hidden),
-                                   0.02F));
-
   auto producer_routes = producer.publish_selected_experts(
       route_storage.data, route_storage.elements, tokens, top_k,
       route_storage.owner);
@@ -111,7 +107,7 @@ int run_world1_training() {
   megamoe::RuntimeConfig config;
   config.num_experts = experts;
   config.top_k = top_k;
-  config.m_tile_rows = 16;
+  config.m_tile_rows = 128;
   config.topology.world_size = 1;
   config.topology.num_nodes = 1;
   config.topology.rank_to_node = {0};
@@ -141,8 +137,6 @@ int run_world1_training() {
   data_pool_config.max_owned_experts = experts;
   data_pool_config.ring_slots_per_source_channel = 2;
   data_pool_config.max_inflight_generations = 1;
-  data_pool_config.enable_forward_cache = true;
-  data_pool_config.enable_backward = true;
   auto data_pool = megamoe::cuda::make_activation_transport_pool(
       session.session(), execution, data_pool_config);
 
@@ -152,8 +146,6 @@ int run_world1_training() {
   auto weights = producer.publish_weights(
       w1_storage.data, w1_storage.elements, w1_storage.owner, w2_storage.data,
       w2_storage.elements, w2_storage.owner, experts, 0, hidden, intermediate);
-  megamoe::cuda::prepare_forward_weights_for_backward(weights, execution);
-
   megamoe::cuda::DeviceNotifyGenerationRequest notify_request;
   notify_request.config = config;
   notify_request.local_routes = std::move(routes);
@@ -163,23 +155,14 @@ int run_world1_training() {
 
   megamoe::cuda::LocalCudaP2pForwardMegaKernel forward_kernel(
       session, execution, data_pool);
-  megamoe::cuda::LocalCudaP2pBackwardMegaKernel backward_kernel(
-      session, execution, data_pool);
   const megamoe::cuda::ForwardMegaKernelConfig forward_config{
-      hidden, intermediate,
-      megamoe::cuda::ForwardCacheMode::CacheFc1InputOutput};
-  const megamoe::cuda::BackwardMegaKernelConfig backward_config{
-      hidden, intermediate,
-      megamoe::cuda::BackwardWeightGradientDType::BFloat16};
+      hidden, intermediate};
   auto forward = forward_kernel.run(dispatch.dispatch(), activations, weights,
                                     forward_config);
-  auto dy = producer.publish_output_gradient(
-      forward, dy_storage.data, dy_storage.elements, dy_storage.owner);
-  auto backward = backward_kernel.run(forward, dy, backward_config);
-  if (!backward)
-    throw std::runtime_error("Backward returned an empty result");
+  if (!forward)
+    throw std::runtime_error("Forward returned an empty result");
   std::cout << "MegaMOE API v" << megamoe::kPublicApiVersionMajor
-            << " world1 Forward+Backward complete\n";
+            << " world1 Forward complete\n";
   return 0;
 }
 
@@ -187,7 +170,7 @@ int run_world1_training() {
 
 int main() {
   try {
-    return run_world1_training();
+    return run_world1_forward();
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

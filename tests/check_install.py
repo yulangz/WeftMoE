@@ -14,6 +14,7 @@ EXPECTED = {
     "megamoe/api/notify_dispatch.hpp",
     "megamoe/config/runtime_config.hpp",
     "megamoe/cuda/activation_transport.hpp",
+    "megamoe/cuda/backward.hpp",
     "megamoe/cuda/control_protocol.hpp",
     "megamoe/cuda/device_notify.hpp",
     "megamoe/cuda/nccl_count_exchange.hpp",
@@ -51,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         extra = sorted(installed - EXPECTED)
         raise SystemExit(f"installed header mismatch: missing={missing}, extra={extra}")
 
-    output = root / "minimal_training"
+    output = root / "minimal_forward"
     # The installed .pc file is link metadata for package-aware clients.  The
     # acceptance test deliberately has no pkg-config runtime dependency.
     flags = ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
@@ -62,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
         "-std=c++17",
         "-I",
         str(prefix / "include"),
-        str(ROOT / "examples/minimal_training.cpp"),
+        str(ROOT / "examples/minimal_forward.cpp"),
         "-o",
         str(output),
     ] + flags

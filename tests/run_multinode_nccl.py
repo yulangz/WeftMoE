@@ -69,44 +69,20 @@ def sample_stats(values):
     }
 
 
-def aggregate_gin_benchmark(outputs, scenario):
-    forward = scenario == "gin_forward_bench"
-    marker = "FORWARD_BENCH " if forward else "BACKWARD_BENCH "
-    records = [parse_fields(item.stdout, marker) for item in outputs]
-    if forward:
-        schedulers = {item.get("reduce_scheduler") for item in records}
-        if len(schedulers) != 1 or None in schedulers:
-            raise RuntimeError(
-                "Forward ranks disagree on reduce scheduler: " +
-                ",".join(sorted(str(item) for item in schedulers)))
-    stage_keys = (("wall", "notify", "forward", "dispatch", "fc1", "fc2",
-                   "return", "reduce", "fc1_fc2_overlap",
-                   "fc2_return_overlap", "return_reduce_overlap",
-                   "terminal_status_agreement") if forward
-                  else
-                  ("notify_inclusive_training_step_wall",
-                   "post_notify_training_step_wall", "notify_wall",
-                   "forward_wall", "backward_wall", "dy_dispatch", "dv",
-                   "dgate", "transpose", "dx", "dw1", "dw2",
-                   "v3_local_delivery_complete",
-                   "v3_outbound_pack_complete", "v3_rdma_complete",
-                   "v3_inbound_relay_complete", "v3_dv_first_start",
-                   "v3_dv_complete", "v3_dw2_first_ready",
-                   "v3_dw2_first_start", "v3_dw2_last_complete",
-                   "v3_terminal_complete",
-                   "dw1_ready_wait", "dw2_ready_wait",
-                   "dw1_max_expert_wait", "dw2_max_expert_wait",
-                   "dw1_tail", "dw2_tail", "dw1_overlap_dv_dx",
-                   "dw2_overlap_dv_dx", "reduce", "forward_call_host",
-                   "dy_ready_host", "backward_call_host",
-                   "integration_overhead", "handoff", "backward_setup_host",
-                   "forward_consumer_drain", "final_drain",
-                   "forward_terminal_status_agreement",
-                   "backward_terminal_status_agreement",
-                   "notify_pool_acquire", "notify_local_histogram_wall",
-                   "notify_local_mapping_device",
-                   "notify_collective_enqueue", "notify_collective_wait",
-                   "notify_materialization", "notify_publish"))
+
+def aggregate_gin_benchmark(outputs):
+    records = [parse_fields(item.stdout, "FORWARD_BENCH ")
+               for item in outputs]
+    schedulers = {item.get("reduce_scheduler") for item in records}
+    if len(schedulers) != 1 or None in schedulers:
+        raise RuntimeError(
+            "Forward ranks disagree on reduce scheduler: " +
+            ",".join(sorted(str(item) for item in schedulers)))
+
+    stage_keys = (
+        "wall", "notify", "forward", "dispatch", "fc1", "fc2", "return",
+        "reduce", "fc1_fc2_overlap", "fc2_return_overlap",
+        "return_reduce_overlap", "terminal_status_agreement")
     measured = None
     for rank, record in enumerate(records):
         if record.get("backend") != "gin-rdma":
@@ -121,15 +97,16 @@ def aggregate_gin_benchmark(outputs, scenario):
                 raise RuntimeError(
                     f"rank={rank} stage={key} sample count={len(samples)} "
                     f"expected={measured}")
+
     summary = {}
     for key in stage_keys:
         slowest = [max(record[key][iteration] for record in records)
                    for iteration in range(measured)]
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
-    result = {
+
+    return {
         "schema": 1,
-        "benchmark": ("multinode-gin-forward-main-shape" if forward else
-                      "multinode-gin-forward-backward-main-shape"),
+        "benchmark": "multinode-gin-forward-main-shape",
         "backend": "gin-rdma-device-persistent",
         "world": len(records),
         "warmup": int(records[0].get("warmup", "10")),
@@ -141,6 +118,7 @@ def aggregate_gin_benchmark(outputs, scenario):
             "experts": int(records[0]["experts"]),
             "top_k": int(records[0]["top_k"]),
         },
+        "reduce_scheduler": records[0]["reduce_scheduler"],
         "per_rank_activation_hash": [int(item["activation_hash"])
                                      for item in records],
         "per_rank_route_hash": [int(item["route_hash"])
@@ -153,124 +131,40 @@ def aggregate_gin_benchmark(outputs, scenario):
         "per_rank_actual_w2_device_hash": [
             [int(item["actual_w2_hash_low"]),
              int(item["actual_w2_hash_high"])] for item in records],
+        "per_rank_device_pool_bytes": [int(item["device_pool_bytes"])
+                                       for item in records],
+        "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
+                                        for item in records],
+        "per_rank_gin_registered_bytes": [
+            int(item["gin_registered_bytes"]) for item in records],
+        "per_rank_pinned_pool_bytes": [int(item["pinned_pool_bytes"])
+                                       for item in records],
+        "per_rank_pool_events": [int(item["pool_events"])
+                                 for item in records],
+        "per_rank_weight_bytes": [int(item["weight_bytes"])
+                                  for item in records],
+        "per_rank_dispatch_peer_bytes": [int(item["dispatch_peer_bytes"])
+                                         for item in records],
+        "per_rank_return_peer_bytes": [int(item["return_peer_bytes"])
+                                       for item in records],
+        "per_rank_gin_dispatch_puts": [int(item["gin_dispatch_puts"])
+                                       for item in records],
+        "per_rank_raw_remote_route_bytes": [
+            int(item["raw_remote_route_bytes"]) for item in records],
+        "per_rank_gin_dispatch_payload_bytes": [
+            int(item["gin_dispatch_payload_bytes"]) for item in records],
+        "per_rank_gin_return_payload_bytes": [
+            int(item["gin_return_payload_bytes"]) for item in records],
+        "per_rank_gin_return_puts": [int(item["gin_return_puts"])
+                                     for item in records],
+        "per_rank_gin_signals": [int(item["gin_signals"])
+                                 for item in records],
+        "per_rank_gin_metadata_bytes": [int(item["gin_metadata_bytes"])
+                                        for item in records],
+        "per_rank_output_hash": [int(item["output_hash"])
+                                 for item in records],
         **summary,
     }
-    if forward:
-        result.update({
-            "reduce_scheduler": records[0]["reduce_scheduler"],
-            "per_rank_device_pool_bytes": [int(item["device_pool_bytes"])
-                                           for item in records],
-            "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
-                                            for item in records],
-            "per_rank_gin_registered_bytes": [
-                int(item["gin_registered_bytes"]) for item in records],
-            "per_rank_pinned_pool_bytes": [int(item["pinned_pool_bytes"])
-                                           for item in records],
-            "per_rank_pool_events": [int(item["pool_events"])
-                                     for item in records],
-            "per_rank_weight_bytes": [int(item["weight_bytes"])
-                                      for item in records],
-            "per_rank_dispatch_peer_bytes": [
-                int(item["dispatch_peer_bytes"]) for item in records],
-            "per_rank_return_peer_bytes": [
-                int(item["return_peer_bytes"]) for item in records],
-            "per_rank_gin_dispatch_puts": [int(item["gin_dispatch_puts"])
-                                           for item in records],
-            "per_rank_raw_remote_route_bytes": [
-                int(item["raw_remote_route_bytes"]) for item in records],
-            "per_rank_gin_dispatch_payload_bytes": [
-                int(item["gin_dispatch_payload_bytes"]) for item in records],
-            "per_rank_gin_return_payload_bytes": [
-                int(item["gin_return_payload_bytes"]) for item in records],
-            "per_rank_gin_return_puts": [int(item["gin_return_puts"])
-                                         for item in records],
-            "per_rank_gin_signals": [int(item["gin_signals"])
-                                     for item in records],
-            "per_rank_gin_metadata_bytes": [
-                int(item["gin_metadata_bytes"]) for item in records],
-            "per_rank_output_hash": [int(item["output_hash"])
-                                     for item in records],
-        })
-    else:
-        result.update({
-            "per_rank_workspace_bytes": [int(item["workspace"])
-                                         for item in records],
-            "per_rank_compute_pool_bytes": [int(item["compute_pool_bytes"])
-                                            for item in records],
-            "per_rank_gin_registered_bytes": [
-                int(item["gin_registered_bytes"]) for item in records],
-            "per_rank_pinned_pool_bytes": [int(item["pinned_pool_bytes"])
-                                           for item in records],
-            "per_rank_pool_events": [int(item["pool_events"])
-                                     for item in records],
-            "per_rank_forward_dispatch_peer_bytes": [
-                int(item["forward_dispatch_peer_bytes"])
-                for item in records],
-            "per_rank_forward_return_peer_bytes": [
-                int(item["forward_return_peer_bytes"]) for item in records],
-            "per_rank_forward_gin_dispatch_puts": [
-                int(item["forward_gin_dispatch_puts"]) for item in records],
-            "per_rank_forward_raw_remote_route_bytes": [
-                int(item["forward_raw_remote_route_bytes"])
-                for item in records],
-            "per_rank_forward_gin_dispatch_payload_bytes": [
-                int(item["forward_gin_dispatch_payload_bytes"])
-                for item in records],
-            "per_rank_forward_gin_return_payload_bytes": [
-                int(item["forward_gin_return_payload_bytes"])
-                for item in records],
-            "per_rank_forward_gin_return_puts": [
-                int(item["forward_gin_return_puts"]) for item in records],
-            "per_rank_forward_gin_signals": [
-                int(item["forward_gin_signals"]) for item in records],
-            "per_rank_forward_gin_metadata_bytes": [
-                int(item["forward_gin_metadata_bytes"]) for item in records],
-            "per_rank_backward_dy_peer_bytes": [
-                int(item["backward_dy_peer_bytes"]) for item in records],
-            "per_rank_backward_dx_peer_bytes": [
-                int(item["backward_dx_peer_bytes"]) for item in records],
-            "per_rank_backward_gin_dispatch_puts": [
-                int(item["backward_gin_dispatch_puts"])
-                for item in records],
-            "per_rank_backward_raw_remote_dy_bytes": [
-                int(item["backward_raw_remote_dy_bytes"])
-                for item in records],
-            "per_rank_backward_gin_dy_payload_bytes": [
-                int(item["backward_gin_dy_payload_bytes"])
-                for item in records],
-            "per_rank_backward_gin_dx_payload_bytes": [
-                int(item["backward_gin_dx_payload_bytes"])
-                for item in records],
-            "per_rank_backward_gin_return_puts": [
-                int(item["backward_gin_return_puts"]) for item in records],
-            "per_rank_backward_gin_signals": [
-                int(item["backward_gin_signals"]) for item in records],
-            "per_rank_backward_gin_metadata_bytes": [
-                int(item["backward_gin_metadata_bytes"])
-                for item in records],
-            "per_rank_output_gradient_hash": [
-                int(item["output_gradient_hash"]) for item in records],
-            "per_rank_actual_dx_device_hash": [
-                [int(item["actual_dx_hash_low"]),
-                 int(item["actual_dx_hash_high"])] for item in records],
-            "per_rank_actual_dw1_device_hash": [
-                [int(item["actual_dw1_hash_low"]),
-                 int(item["actual_dw1_hash_high"])] for item in records],
-            "per_rank_actual_dw2_device_hash": [
-                [int(item["actual_dw2_hash_low"]),
-                 int(item["actual_dw2_hash_high"])] for item in records],
-            "per_rank_actual_dgate_device_hash": [
-                [int(item["actual_dgate_hash_low"]),
-                 int(item["actual_dgate_hash_high"])] for item in records],
-            "per_rank_notify_collective_audit": [{
-                "fused": int(item["notify_fused_enqueues"]),
-                "control": int(item["notify_control_enqueues"]),
-                "config": int(item["notify_config_enqueues"]),
-                "count": int(item["notify_count_enqueues"]),
-                "summary": int(item["notify_summary_enqueues"]),
-            } for item in records],
-        })
-    return result
 
 
 def scrub_output(value, bootstrap=None):
@@ -390,46 +284,7 @@ def environment_overrides(args):
         "MEGAMOE_FORWARD_BENCH_GENERATION_BASE",
         "MEGAMOE_FORWARD_PROGRESS",
         "MEGAMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
-        "MEGAMOE_BACKWARD_BENCH_ROUNDS",
-        "MEGAMOE_BACKWARD_BENCH_TRACE",
-        "MEGAMOE_BACKWARD_HASH_REPEATS",
-        "MEGAMOE_BACKWARD_ROUTE_CASE",
-        "MEGAMOE_BACKWARD_SMOKE_REPEATS",
         "MEGAMOE_FORWARD_SMOKE_REPEATS",
-        "MEGAMOE_BACKWARD_SMOKE_TRACE",
-        "MEGAMOE_BACKWARD_POOL2_VALIDATE",
-        "MEGAMOE_BACKWARD_CAPTURE_HASH",
-        "MEGAMOE_BACKWARD_STAGE_HASHES",
-        "MEGAMOE_BACKWARD_PROGRESS_DUMP",
-        "MEGAMOE_BACKWARD_SPLIT_DW1",
-        "MEGAMOE_BACKWARD_DIAG_DW2",
-        "MEGAMOE_BACKWARD_DIAG_DW2_128",
-        "MEGAMOE_BACKWARD_DW2_128_STAGES",
-        "MEGAMOE_BACKWARD_DIAG_V3_DV_DW2",
-        "MEGAMOE_BACKWARD_DIAG_V3_VERIFY_ORACLE",
-        "MEGAMOE_BACKWARD_PERSISTENT_V3",
-        "MEGAMOE_BACKWARD_V3_RETURN_GROUP_ROWS",
-        "MEGAMOE_BACKWARD_V3_WEIGHT_CTA_DIVISOR",
-        "MEGAMOE_BACKWARD_V3_DV_PHASE_SLOTS",
-        "MEGAMOE_BACKWARD_V3_DX_PHASE_SLOTS",
-        "MEGAMOE_BACKWARD_V3_ACTIVATION_CTAS",
-        "MEGAMOE_BACKWARD_V3_DW1_CTAS",
-        "MEGAMOE_BACKWARD_V3_DW_TILE_N",
-        "MEGAMOE_BACKWARD_V3_WEIGHT_CLUSTER2",
-        "MEGAMOE_BACKWARD_V3_SPLIT_COMPUTE",
-        "MEGAMOE_BACKWARD_V3_ELASTIC",
-        "MEGAMOE_BACKWARD_V3_CLUSTER_COMPUTE",
-        "MEGAMOE_BACKWARD_V3_ACTIVATION_MULTICAST",
-        "MEGAMOE_BACKWARD_V3_CLUSTER_REDUCE_CTAS",
-        "MEGAMOE_BACKWARD_V3_DIRECT_DY_INPUT",
-        "MEGAMOE_BACKWARD_V3_REDUCE_CTAS",
-        "MEGAMOE_BACKWARD_V3_DIRECT_RETURN_STAGING",
-        "MEGAMOE_BACKWARD_V3_DIRECT_RETURN_CONSUME",
-        "MEGAMOE_BACKWARD_V3_GENERIC_DY_COPY",
-        "MEGAMOE_BACKWARD_V3_WAIT_FULL_DY_DISPATCH",
-        "MEGAMOE_BACKWARD_V3_CLEAR_CANONICAL_DY",
-        "MEGAMOE_BACKWARD_V3_SNAPSHOT_DY",
-        "MEGAMOE_BACKWARD_V3_LOCALIZE_DY",
         "MEGAMOE_FORWARD_RETURN_CHUNK_ROWS",
         "MEGAMOE_FORWARD_DYNAMIC_REDUCE_QUEUE",
         "MEGAMOE_FORWARD_DYNAMIC_REDUCE_SCAN",
@@ -460,17 +315,11 @@ def environment_overrides(args):
         "MEGAMOE_GIN_BENCH_WARMUP",
         "MEGAMOE_GIN_BENCH_MEASURED",
         "MEGAMOE_GIN_BENCH_BATCH",
-        "MEGAMOE_BACKWARD_INJECT_HASH_MISMATCH",
-        "MEGAMOE_BACKWARD_CACHE_FIRST",
         "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE",
-        "MEGAMOE_FORWARD_CACHE",
-        "MEGAMOE_BACKWARD_CACHE",
         "MEGAMOE_P2P_TOP_K",
         "MEGAMOE_P2P_RING_SLOTS",
         "MEGAMOE_P2P_NO_WRAP",
         "MEGAMOE_GATE_MODE",
-        "MEGAMOE_RUNTIME_HIDDEN",
-        "MEGAMOE_RUNTIME_INTERMEDIATE",
         "MEGAMOE_DEVICE_TIMELINE_PREFIX",
         "NCCL_IB_HCA",
         "NCCL_IB_GID_INDEX",
@@ -676,7 +525,6 @@ def cleanup_diagnostic(outputs):
             "FORWARD_PROGRESS_COARSE",
             "FORWARD_HOST_PROGRESS",
             "FORWARD_RUN_HOST",
-            "BACKWARD_PROGRESS rank=",
             "[FAIL]",
             "terminate called",
             "what():",
@@ -689,9 +537,7 @@ def cleanup_diagnostic(outputs):
                 # The detailed generation-completion record is useful, but
                 # cap a malformed/expanded record without dropping the coarse
                 # milestone that precedes it.
-                selected.append(match[-10000:] if
-                                "BACKWARD_PROGRESS rank=" in match else
-                                match[-2000:])
+                selected.append(match[-2000:])
         detailed = next(
             (line for line in reversed(lines)
              if "FORWARD_PROGRESS rank=" in line),
@@ -766,12 +612,8 @@ def parse_args(argv=None):
                  "gin_probe", "gin_put_probe", "gin_link_bench",
                  "gin_team_pool",
                  "gin_forward_smoke",
-                 "gin_backward_smoke",
-                 "socket_backward_smoke",
                  "gin_forward_bench",
-                 "gin_backward_bench",
                  "socket_forward_bench",
-                 "socket_backward_bench",
                  "activation_socket",
                  "activation_gin"),
         default="valid",
@@ -880,10 +722,6 @@ def main(argv=None):
     launch_environment = environment_overrides(args)
     print(
         "LAUNCH_CONFIG "
-        f"route_case={launch_environment.get('MEGAMOE_BACKWARD_ROUTE_CASE', 'regular')} "
-        f"repeats={launch_environment.get('MEGAMOE_BACKWARD_SMOKE_REPEATS', '1')} "
-        f"pool2={int(launch_environment.get('MEGAMOE_BACKWARD_POOL2_VALIDATE') == '1')} "
-        f"cache_first={int('MEGAMOE_BACKWARD_CACHE_FIRST' in launch_environment)} "
         f"NCCL_IB_DISABLE={launch_environment.get('NCCL_IB_DISABLE', 'inherit')}"
     )
     outputs = launch_rank_processes(args)
@@ -1034,128 +872,51 @@ def main(argv=None):
         print(f"[PASS] runtime GIN rail/local-team/pool world={world}")
         return
 
-    if args.scenario in ("gin_forward_smoke", "gin_backward_smoke",
-                         "socket_backward_smoke"):
-        status_fault_phase = os.environ.get(
-            "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
-        if status_fault_phase:
-            failures = []
-            evidence = []
-            error_hashes = set()
-            expected_field = "field=120" if status_fault_phase == "forward" \
-                else "field=220"
-            for result in outputs:
-                lines = [line for line in result.stdout.splitlines()
-                         if line.startswith("PRODUCTION_STATUS_FAULT ")]
-                if result.returncode != 0 or len(lines) != 1:
-                    failures.append(
-                        f"rank={result.rank} exit={result.returncode}; "
-                        f"stdout={result.stdout[-5000:]}; "
-                        f"stderr={result.stderr[-5000:]}"
-                    )
-                    continue
-                line = lines[0]
-                fields = dict(item.split("=", 1) for item in line.split()[1:])
-                if (fields.get("origin_rank") != "1" or
-                        expected_field not in line or
-                        fields.get("recovered") != "1"):
-                    failures.append(f"rank={result.rank} malformed={line}")
-                    continue
-                error_hashes.add(fields.get("error_hash"))
-                evidence.append(line)
-            if len(error_hashes) != 1:
-                failures.append(
-                    "production status errors were not byte-identical: " +
-                    repr(sorted(error_hashes)))
-            if failures:
-                raise RuntimeError(
-                    "production terminal status agreement failed:\n" +
-                    "\n".join(failures))
-            print("\n".join(evidence))
-            print(f"[PASS] production {status_fault_phase} status agreement "
-                  f"and same-communicator recovery world={world}")
-            return
+
+    if args.scenario == "gin_forward_smoke":
         failures = []
         evidence = []
         for result in outputs:
-            marker = ("FORWARD_SMOKE " if args.scenario == "gin_forward_smoke"
-                      else "BACKWARD_SMOKE ")
             lines = [line for line in result.stdout.splitlines()
-                     if line.startswith(marker)]
+                     if line.startswith("FORWARD_SMOKE ")]
             if result.returncode != 0 or len(lines) != 1:
                 failures.append(
                     f"rank={result.rank} exit={result.returncode}; "
                     f"stdout={result.stdout[-5000:]}; "
-                    f"stderr={result.stderr[-5000:]}"
-                )
+                    f"stderr={result.stderr[-5000:]}")
             else:
                 evidence.append(lines[0])
         if failures:
-            raise RuntimeError("distributed GIN MegaKernel failed:\n" +
+            raise RuntimeError("distributed GIN Forward failed:\n" +
                                "\n".join(failures))
         print("\n".join(evidence))
-        if args.scenario in ("gin_backward_smoke", "socket_backward_smoke"):
-            stage_evidence = []
-            for result in outputs:
-                stage_evidence.extend(
-                    line for line in result.stdout.splitlines()
-                    if line.startswith("BACKWARD_HASH_RECOVERY ")
-                )
-                stage_evidence.extend(
-                    line for line in result.stderr.splitlines()
-                    if line.startswith("BACKWARD_STAGE_HASH ") or
-                    line.startswith("BACKWARD_STAGE_FIRST_MISMATCH ")
-                )
-            if stage_evidence:
-                print("\n".join(stage_evidence))
-        stage = "Forward" if args.scenario == "gin_forward_smoke" else "Backward"
-        backend = ("host-enqueued Socket fallback"
-                   if args.scenario == "socket_backward_smoke"
-                   else "same-rail GIN")
-        print(f"[PASS] {backend} {stage} persistent kernel world={world}")
+        print(f"[PASS] same-rail GIN Forward persistent kernel world={world}")
         return
 
-    if args.scenario in ("gin_forward_bench", "gin_backward_bench"):
+    if args.scenario == "gin_forward_bench":
         failures = []
         evidence = []
-        pool2 = (args.scenario == "gin_backward_bench" and
-                 os.environ.get("MEGAMOE_BACKWARD_POOL2_VALIDATE") == "1")
-        marker = ("FORWARD_BENCH " if args.scenario == "gin_forward_bench"
-                  else ("BACKWARD_POOL2 " if pool2 else "BACKWARD_BENCH "))
         for result in outputs:
             lines = [line for line in result.stdout.splitlines()
-                     if line.startswith(marker)]
+                     if line.startswith("FORWARD_BENCH ")]
             if result.returncode != 0 or len(lines) != 1:
                 failures.append(
                     f"rank={result.rank} exit={result.returncode}; "
                     f"stdout={result.stdout[-5000:]}; "
-                    f"stderr={result.stderr[-5000:]}"
-                )
+                    f"stderr={result.stderr[-5000:]}")
             else:
                 evidence.append(lines[0])
-                if not pool2 and "backend=gin-rdma" not in lines[0]:
+                if "backend=gin-rdma" not in lines[0]:
                     failures.append(
                         f"rank={result.rank} wrong benchmark backend: "
-                        f"{lines[0]}"
-                    )
+                        f"{lines[0]}")
         if failures:
             raise RuntimeError("distributed GIN benchmark failed:\n" +
                                "\n".join(failures))
-        if (args.scenario == "gin_backward_bench" and
-                os.environ.get("MEGAMOE_BACKWARD_STAGE_HASHES")):
-            for result in outputs:
-                evidence.extend(
-                    line for line in result.stdout.splitlines()
-                    if line.startswith("BACKWARD_V3_DX_HASH ")
-                )
         print("\n".join(evidence))
-        if pool2:
-            print(f"[PASS] same-rail GIN Backward pool=2 lifecycle world={world}")
-        else:
-            print("GIN_BENCH_JSON " + json.dumps(
-                aggregate_gin_benchmark(outputs, args.scenario),
-                sort_keys=True))
-            print(f"[PASS] same-rail GIN benchmark world={world}")
+        print("GIN_BENCH_JSON " + json.dumps(
+            aggregate_gin_benchmark(outputs), sort_keys=True))
+        print(f"[PASS] same-rail GIN benchmark world={world}")
         return
 
     if args.scenario == "socket_forward_bench":
@@ -1182,35 +943,6 @@ def main(argv=None):
                                "\n".join(failures))
         print("\n".join(evidence))
         print(f"[PASS] host-enqueued Socket full Forward world={world}")
-        return
-
-    if args.scenario == "socket_backward_bench":
-        failures = []
-        evidence = []
-        pool2 = os.environ.get("MEGAMOE_BACKWARD_POOL2_VALIDATE") == "1"
-        marker = "BACKWARD_POOL2 " if pool2 else "BACKWARD_BENCH "
-        for result in outputs:
-            lines = [line for line in result.stdout.splitlines()
-                     if line.startswith(marker)]
-            if result.returncode != 0 or len(lines) != 1:
-                failures.append(
-                    f"rank={result.rank} exit={result.returncode}; "
-                    f"stdout={result.stdout[-5000:]}; "
-                    f"stderr={result.stderr[-5000:]}"
-                )
-            else:
-                evidence.append(lines[0])
-                if not pool2 and "backend=nccl-socket-fallback" not in lines[0]:
-                    failures.append(
-                        f"rank={result.rank} wrong Socket Backward backend: "
-                        f"{lines[0]}"
-                    )
-        if failures:
-            raise RuntimeError("distributed Socket Backward failed:\n" +
-                               "\n".join(failures))
-        print("\n".join(evidence))
-        suffix = "pool=2 lifecycle" if pool2 else "full Backward"
-        print(f"[PASS] host-enqueued Socket {suffix} world={world}")
         return
 
     if args.scenario == "activation_socket":

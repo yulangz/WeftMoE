@@ -220,9 +220,6 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="te-grouped-mlp")
-    parser.add_argument("--benchmark-backward", action="store_true")
-    parser.add_argument("--training-only", action="store_true")
-    parser.add_argument("--collective-breakdown", action="store_true")
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")

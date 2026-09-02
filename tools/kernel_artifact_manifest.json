@@ -5,26 +5,6 @@
   ],
   "dynamic_shared_shape": "main-shape world=8",
   "kernels": {
-    "backward_local_main": {
-      "sm_90": {
-        "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 2080,
-        "local_bytes": 0,
-        "normalized_sass_sha256": "0de7b814fa516c3e99a8bd56a569bd772b111c2c9d7c8f23227bb10c90fe134d",
-        "registers": 64,
-        "stack_bytes": 0,
-        "static_shared_bytes": 0
-      },
-      "sm_90a": {
-        "configured_dynamic_shared_bytes": 196672,
-        "instruction_count": 22888,
-        "local_bytes": 0,
-        "normalized_sass_sha256": "0251abe10a7e167ec13996e92d4f9b13952104bb72255a5ac06e96d3f706792e",
-        "registers": 168,
-        "stack_bytes": 120,
-        "static_shared_bytes": 2048
-      }
-    },
     "forward_local_main": {
       "sm_90": {
         "configured_dynamic_shared_bytes": 196704,

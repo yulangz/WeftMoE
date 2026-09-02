@@ -181,7 +181,7 @@ struct DeviceDispatchKernelView {
 };
 
 // GIN-only scheduling view.  Keeping the wavefront permutation outside
-// DeviceDispatchKernelView means the frozen LocalCudaP2p Forward/Backward
+// DeviceDispatchKernelView means the frozen LocalCudaP2p Forward
 // launch contract and its generated SASS do not grow when the remote backend
 // learns a new packet scheduling policy.
 struct DispatchWaveKernelView {

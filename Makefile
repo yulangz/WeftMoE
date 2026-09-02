@@ -33,6 +33,7 @@ PUBLIC_HEADERS := \
 	include/megamoe/api/notify_dispatch.hpp \
 	include/megamoe/config/runtime_config.hpp \
 	include/megamoe/cuda/activation_transport.hpp \
+	include/megamoe/cuda/backward.hpp \
 	include/megamoe/cuda/control_protocol.hpp \
 	include/megamoe/cuda/device_notify.hpp \
 	include/megamoe/cuda/nccl_count_exchange.hpp \
@@ -53,6 +54,7 @@ override CUDA_CPPFLAGS += -I$(abspath $(FORWARD_TUNING_INCLUDE_DIR)) \
 endif
 
 LIB_SOURCES := \
+	src/cuda/backward_stub.cpp \
 	src/cuda/control_protocol.cpp \
 	src/metadata/notify_dispatch.cpp \
 	src/metadata/serialize.cpp \
@@ -87,7 +89,7 @@ PROD_CUDA_LIB_OBJECTS := \
 	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
 	$(BUILD_DIR)/production/src/cuda/forward_transport.o
 
-.PHONY: all test reference-test launcher-security-test rdma-launcher-test forward-autotune-test forward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench fair-backward-bench dw1-roofline-bench cuda-lib cuda-test cuda-runtime-shape-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-backward-test cuda-backward-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 forward-autotune-test:
 	python3 tests/test_forward_autotune.py
@@ -116,26 +118,22 @@ $(BUILD_DIR)/production/%.o: %.cu
 $(BUILD_DIR)/src/cuda/activation_transport.o \
 $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/kernel_support.cuh \
+	src/cuda/forward/device_kernels.cuh \
+	src/cuda/forward/runtime_state.inc \
+	src/cuda/forward/host_launch.inc \
+	src/cuda/testing/transport_probes.inc \
 	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
-	src/cuda/forward/runtime_shape_fallback.cuh \
-	src/cuda/backward/kernel_contract.cuh \
 	src/cuda/persistent_v3/contracts.hpp \
 	src/cuda/persistent_v3/queues.cuh \
 	src/cuda/persistent_v3/roles/common.cuh \
-	src/cuda/persistent_v3/backward/pipeline_state.cuh \
 	src/cuda/persistent_v3/forward/pipeline_state.cuh \
 	src/cuda/persistent_v3/forward/dispatch_pipeline.cuh \
 	src/cuda/persistent_v3/forward/return_pipeline.cuh \
 	src/cuda/persistent_v3/forward/finalize_pipeline.cuh \
 	src/cuda/persistent_v3/forward/compute_kernel.cuh \
 	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
-	src/cuda/persistent_v3/backward/dy_transport.cuh \
-	src/cuda/persistent_v3/backward/dv_dw2_pipeline_probe.cuh \
-	src/cuda/persistent_v3/backward/weight_compute.cuh \
-	src/cuda/persistent_v3/gemm/wgmma_wait_accumulator.cuh \
-	src/cuda/persistent_v3/gemm/dw_128x128_task.cuh \
-	src/cuda/persistent_v3/gemm/dw2_128x128_kernel.cuh \
 	src/cuda/profiling/device_timeline.cuh \
 	src/cuda/profiling/device_timeline_types.hpp
 
@@ -145,9 +143,13 @@ $(BUILD_DIR)/production/src/cuda/forward_transport.o: \
 	src/cuda/activation_transport_internal.hpp \
 	src/cuda/cuda_internal.hpp \
 	src/cuda/forward/kernel_contract.cuh \
+	src/cuda/forward/kernel_support.cuh \
+	src/cuda/forward/device_kernels.cuh \
+	src/cuda/forward/runtime_state.inc \
+	src/cuda/forward/host_launch.inc \
+	src/cuda/testing/transport_probes.inc \
 	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
-	src/cuda/persistent_v3/backward/pipeline_state.cuh \
 	src/cuda/persistent_v3/contracts.hpp \
 	src/cuda/persistent_v3/queues.cuh \
 	src/cuda/persistent_v3/roles/common.cuh \
@@ -160,7 +162,6 @@ $(BUILD_DIR)/production/src/cuda/forward_transport.o: \
 	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
 	src/cuda/profiling/device_timeline.cuh \
 	src/cuda/profiling/device_timeline_types.hpp \
-	src/cuda/testing/harnesses.hpp \
 	src/cuda/transport_generation_completion.cuh
 
 $(BUILD_DIR)/src/cuda/forward_transport.o:
@@ -258,10 +259,12 @@ release-check-inner:
 	+$(MAKE) BUILD_DIR=$(BUILD_DIR)-werror ENABLE_CUDA=1 WERROR=1 shared-lib
 
 CUDA_TEST_SOURCES := \
-	tests/test_cuda_notify.cpp \
-	tests/cuda/runtime_shape_tests.cpp
+	tests/test_cuda_notify.cpp
+CUDA_TEST_DEPS := \
+	tests/cuda/distributed_runner.inc \
+	tests/cuda/transport_benchmarks.inc
 
-$(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES)
+$(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES) $(CUDA_TEST_DEPS)
 	@mkdir -p $(@D)
 	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) \
 		$(CUDA_TEST_SOURCES) -Xlinker=--whole-archive \
@@ -271,18 +274,7 @@ $(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOU
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --device-smoke
-	$(MAKE) BUILD_DIR=$(BUILD_DIR) cuda-runtime-shape-test
 	$(CUDA_RUN_ENV) python3 tests/run_control_protocol_regressions.py --binary $(BUILD_DIR)/test_cuda_notify
-
-cuda-runtime-shape-test: $(BUILD_DIR)/test_cuda_notify
-	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 64 32 1
-	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 96 48 1
-	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 127 65 1
-	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --runtime-shape 256 192 1
-	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py \
-		--binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 2 \
-		--backward-smoke --runtime-hidden 127 --runtime-intermediate 65 \
-		--backward-smoke-repeats 1 --timeout 180
 
 cuda-test-local: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1
@@ -312,29 +304,12 @@ cuda-p2p-bench: $(BUILD_DIR)/test_cuda_notify
 cuda-integrated-bench: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(BUILD_DIR)/test_cuda_notify --world 8 --integrated-benchmark --timeout 900
 
-cuda-backward-test: $(BUILD_DIR)/test_cuda_notify
-	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 1 --backward-smoke --timeout 300
-	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 2 --backward-smoke --timeout 600
-	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 8 --backward-smoke --timeout 900
-
-cuda-backward-bench: $(BUILD_DIR)/test_cuda_notify
-	$(CUDA_RUN_ENV) python3 tests/run_local_activation_p2p.py --binary $(abspath $(BUILD_DIR)/test_cuda_notify) --world 8 --backward-benchmark --backward-cache --rounds 110 --timeout 1800
-
 megatron-bench:
 	torchrun --standalone --nproc-per-node=8 benchmarks/megatron_dispatch_baseline.py
 
 fair-integrated-bench: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) python3 benchmarks/run_integrated_comparison.py \
 		--binary $(BUILD_DIR)/test_cuda_notify $(if $(NCCL_RUNTIME_LIB_DIR),--nccl-lib-dir $(NCCL_RUNTIME_LIB_DIR),)
-
-# Usage: make fair-backward-bench MEGAMOE_RUNS='run1.log run2.log run3.log' \
-#   MEGATRON_RUN=megatron.log
-fair-backward-bench:
-	python3 benchmarks/compare_backward_training.py \
-		--megamoe $(MEGAMOE_RUNS) --megatron $(MEGATRON_RUN)
-
-dw1-roofline-bench:
-	python3 benchmarks/dw1_roofline_baseline.py
 
 cuda-transport-bench: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --transport-bench
@@ -343,12 +318,6 @@ cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
 	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --device-smoke
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --forward-sanitizer
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool memcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool racecheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
-	$(CUDA_RUN_ENV) $(COMPUTE_SANITIZER) --tool initcheck --error-exitcode=1 $(BUILD_DIR)/test_cuda_notify --backward-sanitizer
 
 cuda-sm90-compile:
 	$(MAKE) BUILD_DIR=$(BUILD_DIR)-sm90 CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' cuda-lib
@@ -370,9 +339,6 @@ reference-test:
 
 launcher-security-test:
 	PYTHONPATH=. python3 tests/test_launcher_security.py
-
-rdma-launcher-test:
-	PYTHONPATH=. python3 tests/test_megatron_rdma_launcher.py
 
 cross-check: $(BUILD_DIR)/metadata_dump
 	$(CROSS_CHECK_ENV) $(BUILD_DIR)/metadata_dump > $(BUILD_DIR)/cpp_metadata.json
@@ -396,8 +362,8 @@ install: shared-lib
 	@mkdir -p $(DESTDIR)$(PKGCONFIGDIR)
 	sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@VERSION@|$(LIBMEGAMOE_VERSION)|g' \
 		packaging/megamoe.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/megamoe.pc
-	install -D -m 0644 examples/minimal_training.cpp \
-		$(DESTDIR)$(DATADIR)/examples/minimal_training.cpp
+	install -D -m 0644 examples/minimal_forward.cpp \
+		$(DESTDIR)$(DATADIR)/examples/minimal_forward.cpp
 	install -D -m 0644 LICENSE $(DESTDIR)$(DATADIR)/LICENSE
 	install -D -m 0644 NOTICE $(DESTDIR)$(DATADIR)/NOTICE
 	install -D -m 0644 THIRD_PARTY_NOTICES.md \
@@ -408,7 +374,7 @@ install: shared-lib
 		echo '$(LIBDIR)/$(LIBMEGAMOE_SONAME)'; \
 		echo '$(LIBDIR)/libmegamoe.so'; \
 		echo '$(PKGCONFIGDIR)/megamoe.pc'; \
-		echo '$(DATADIR)/examples/minimal_training.cpp'; \
+		echo '$(DATADIR)/examples/minimal_forward.cpp'; \
 		echo '$(DATADIR)/LICENSE'; \
 		echo '$(DATADIR)/NOTICE'; \
 		echo '$(DATADIR)/THIRD_PARTY_NOTICES.md'; \
@@ -422,7 +388,7 @@ uninstall-manifest:
 install-test:
 	CXX='$(CXX)' python3 tests/check_install.py
 
-test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test rdma-launcher-test cross-check header-test api-negative-test
+test: $(BUILD_DIR)/test_notify_dispatch reference-test launcher-security-test cross-check header-test api-negative-test
 	$(BUILD_DIR)/test_notify_dispatch
 
 ifeq ($(ENABLE_CUDA),1)

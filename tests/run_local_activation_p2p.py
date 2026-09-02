@@ -267,20 +267,7 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
-    parser.add_argument("--backward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
-    parser.add_argument("--backward-benchmark", action="store_true")
-    parser.add_argument("--backward-cache", action="store_true")
-    parser.add_argument("--backward-cache-pool2-validation",
-                        action="store_true")
-    parser.add_argument("--backward-smoke-repeats", type=int, default=1)
-    parser.add_argument("--backward-route-case",
-                        choices=("regular", "concentrated", "zero-rank"),
-                        default="regular")
-    parser.add_argument("--runtime-hidden", type=int)
-    parser.add_argument("--runtime-intermediate", type=int)
-    parser.add_argument("--forward-cache", action="store_true")
-    parser.add_argument("--forward-cache-pool2-validation", action="store_true")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
@@ -292,11 +279,10 @@ def main():
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
     if sum((args.benchmark, args.integrated_benchmark,
-            args.forward_smoke, args.backward_smoke,
-            args.forward_benchmark, args.backward_benchmark)) > 1:
+            args.forward_smoke, args.forward_benchmark)) > 1:
         parser.error("choose only one benchmark/smoke mode")
     benchmark_mode = (args.benchmark or args.integrated_benchmark or
-                      args.forward_benchmark or args.backward_benchmark)
+                      args.forward_benchmark)
     if args.rounds is None:
         args.rounds = 110 if benchmark_mode else 1
     if benchmark_mode and args.rounds <= 10:
@@ -305,50 +291,14 @@ def main():
     environment.setdefault("NCCL_DEBUG", "WARN")
     environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
     environment["MEGAMOE_GATE_MODE"] = args.gate_mode
-    if args.forward_cache:
-        if not (args.forward_benchmark or args.forward_smoke):
-            parser.error("--forward-cache requires a Forward mode")
-        environment["MEGAMOE_FORWARD_CACHE"] = "1"
-    if args.forward_cache_pool2_validation:
-        if not args.forward_benchmark:
-            parser.error("--forward-cache-pool2-validation requires "
-                         "--forward-benchmark")
-        environment["MEGAMOE_FORWARD_CACHE_POOL2_VALIDATE"] = "1"
-        environment["MEGAMOE_FORWARD_CACHE"] = "1"
-    if args.backward_cache_pool2_validation and not args.backward_benchmark:
-        parser.error("--backward-cache-pool2-validation requires "
-                     "--backward-benchmark")
     if args.integrated_benchmark:
         environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
     elif args.forward_benchmark:
         environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
-    elif args.backward_benchmark:
-        environment["MEGAMOE_BACKWARD_BENCH_ROUNDS"] = str(args.rounds)
-        if args.backward_cache:
-            environment["MEGAMOE_BACKWARD_CACHE"] = "1"
-        if args.backward_cache_pool2_validation:
-            environment["MEGAMOE_BACKWARD_POOL2_VALIDATE"] = "1"
-            environment["MEGAMOE_BACKWARD_CACHE"] = "1"
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
-    if args.backward_smoke:
-        if args.backward_smoke_repeats < 1:
-            parser.error("--backward-smoke-repeats must be positive")
-        environment["MEGAMOE_BACKWARD_CAPTURE_HASH"] = "1"
-        environment["MEGAMOE_BACKWARD_PROGRESS_DUMP"] = "1"
-        environment["MEGAMOE_BACKWARD_SMOKE_REPEATS"] = str(
-            args.backward_smoke_repeats)
-        environment["MEGAMOE_BACKWARD_ROUTE_CASE"] = args.backward_route_case
-        if (args.runtime_hidden is None) != (args.runtime_intermediate is None):
-            parser.error("runtime hidden/intermediate must be provided together")
-        if args.runtime_hidden is not None:
-            if args.runtime_hidden <= 0 or args.runtime_intermediate <= 0:
-                parser.error("runtime hidden/intermediate must be positive")
-            environment["MEGAMOE_RUNTIME_HIDDEN"] = str(args.runtime_hidden)
-            environment["MEGAMOE_RUNTIME_INTERMEDIATE"] = str(
-                args.runtime_intermediate)
     if args.forward_output_dir:
         if not (args.forward_benchmark or args.forward_smoke):
             parser.error("--forward-output-dir requires a Forward mode")
@@ -365,13 +315,11 @@ def main():
     read_fd, write_fd = os.pipe()
     processes = []
     scenario = ("forward_bench" if args.forward_benchmark else
-                ("backward_bench" if args.backward_benchmark else
                 ("forward_smoke" if args.forward_smoke else
-                ("backward_smoke" if args.backward_smoke else
-                ("activation_integrated_bench" if args.integrated_benchmark else
-                ("activation_p2p_bench" if args.benchmark else
-                 ("activation_p2p_cancel" if args.cancel else
-                  "activation_p2p")))))))
+                 ("activation_integrated_bench" if args.integrated_benchmark else
+                  ("activation_p2p_bench" if args.benchmark else
+                   ("activation_p2p_cancel" if args.cancel else
+                    "activation_p2p")))))
     try:
         rank0 = subprocess.Popen(
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
@@ -461,50 +409,12 @@ def main():
                 if (item.get("specialization") !=
                         "sm90-wgmma-tma-7168x3072" or
                         item.get("persistent_launches") != "1" or
-                        item.get("cache_equal") != "1" or
                         item.get("repeat_equal") != "1" or
                         item.get("repeats") != "20" or
                         item.get("gate_mode") != args.gate_mode or
                         item.get("top_k") != str(args.top_k)):
                     raise AssertionError(
                         f"rank={rank} invalid forward smoke audit: {item}")
-                observed.append(item)
-                continue
-            if args.backward_smoke:
-                status_fault_phase = os.environ.get(
-                    "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
-                if status_fault_phase:
-                    item = parse_fields(stdout, "PRODUCTION_STATUS_FAULT ")
-                    expected_field = "120" if status_fault_phase == "forward" \
-                        else "220"
-                    if (item.get("origin_rank") != "1" or
-                            item.get("field") != expected_field or
-                            item.get("recovered") != "1"):
-                        raise AssertionError(
-                            f"rank={rank} invalid production status fault: "
-                            f"{item}")
-                    observed.append(item)
-                    continue
-                item = parse_fields(stdout, "BACKWARD_SMOKE ")
-                if (item.get("cache_no_cache_equal") != "1" or
-                        item.get("persistent_launches") != "1" or
-                        item.get("top_k") != str(args.top_k) or
-                        item.get("repeats") !=
-                        str(args.backward_smoke_repeats) or
-                        item.get("route_case") != args.backward_route_case):
-                    raise AssertionError(
-                        f"rank={rank} invalid backward smoke audit: {item}")
-                if args.world == 1 and any(
-                        item.get(field) != "1" for field in
-                        ("mutation_dx", "mutation_dw1", "mutation_dw2",
-                         "mutation_dgate")):
-                    raise AssertionError(
-                        f"rank={rank} incomplete gradient mutation audit: "
-                        f"{item}")
-                observed.append(item)
-                continue
-            if args.backward_cache_pool2_validation:
-                item = parse_fields(stdout, "BACKWARD_POOL2 ")
                 observed.append(item)
                 continue
             if args.cancel:
@@ -514,305 +424,27 @@ def main():
                     raise AssertionError(f"rank={rank} bad cancellation audit")
             else:
                 marker = ("FORWARD_BENCH " if args.forward_benchmark else
-                          ("BACKWARD_BENCH " if args.backward_benchmark else
                           ("INTEGRATED_BENCH "
                            if args.integrated_benchmark else "P2P_BENCH "))
-                          )
                 item = (parse_fields(stdout, marker)
                         if benchmark_mode else parse_result(stdout))
                 if benchmark_mode:
                     runtime = parse_fields(stdout, "NCCL_RUNTIME ")
                     item["_nccl_runtime"] = runtime["runtime"]
                     item["_nccl_library"] = runtime["library"]
-                    if args.forward_cache_pool2_validation:
-                        item["_cache_pool2"] = parse_fields(
-                            stdout, "FORWARD_CACHE_POOL2 ")
                 observed.append(item)
         if args.forward_smoke:
             hashes = [item["output_hash"] for item in observed]
             if len(hashes) != args.world:
                 raise AssertionError("missing forward ranks")
-            specialization = ("runtime-shape-correctness-fallback"
-                              if args.runtime_hidden is not None
-                              else "WGMMA/TMA-7168x3072")
             print(f"[PASS] LocalCudaP2p Forward MegaKernel world={args.world} "
-                  f"single-launch {specialization} cache/no-cache smoke "
+                  "split-role WGMMA/TMA-7168x3072 smoke "
                   f"rank0_output_hash={hashes[0]}")
-            return
-        if args.backward_smoke:
-            if len(observed) != args.world:
-                raise AssertionError("missing backward ranks")
-            if args.runtime_hidden is not None:
-                hidden = args.runtime_hidden
-                intermediate = args.runtime_intermediate
-                expected_dv = sum(int(item["local_tokens"])
-                                  for item in observed) * args.top_k * intermediate
-                actual_dv = sum(int(item["dv_tasks"]) for item in observed)
-                if actual_dv != expected_dv:
-                    raise AssertionError(
-                        f"generic dV task audit mismatch: expected="
-                        f"{expected_dv}, actual={actual_dv}")
-                experts = int(observed[0]["experts"])
-                if experts % args.world != 0:
-                    raise AssertionError("generic fixture ownership is uneven")
-                owned = experts // args.world
-                expected_dw1 = owned * 2 * intermediate * hidden
-                expected_dw2 = owned * hidden * intermediate
-                if any(int(item["dw1_tasks"]) != expected_dw1 or
-                       int(item["dw2_tasks"]) != expected_dw2
-                       for item in observed):
-                    raise AssertionError(
-                        "generic dW task audit mismatch: "
-                        f"expected dw1/dw2={expected_dw1}/{expected_dw2}, "
-                        f"actual={[(item['dw1_tasks'], item['dw2_tasks']) for item in observed]}")
-            status_fault_phase = os.environ.get(
-                "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE")
-            if status_fault_phase:
-                hashes = {item["error_hash"] for item in observed}
-                if len(hashes) != 1:
-                    raise AssertionError(
-                        "production status error was not byte-identical: " +
-                        repr(observed))
-                print(f"[PASS] production {status_fault_phase} status "
-                      f"agreement and same-communicator recovery "
-                      f"world={args.world}")
-                return
-            if args.world == 8 and args.top_k == 1:
-                if not any(int(item["dv_tasks"]) == 0 for item in observed):
-                    raise AssertionError(
-                        "world=8/top-k=1 did not exercise an all-empty owner")
-                if any(int(item["dw1_tasks"]) == 0 or
-                       int(item["dw2_tasks"]) == 0 for item in observed):
-                    raise AssertionError(
-                        "empty-expert zero-store tasks were not completed")
-                if args.backward_route_case == "concentrated":
-                    for rank, item in enumerate(observed[1:], start=1):
-                        if (item.get("empty_zero_nonzero_dw1") != "0" or
-                                item.get("empty_zero_nonzero_dw2") != "0" or
-                                item.get("empty_zero_dw1_expected") !=
-                                item.get("empty_zero_dw1_completed") or
-                                item.get("empty_zero_dw2_expected") !=
-                                item.get("empty_zero_dw2_completed") or
-                                int(item.get("empty_zero_check_repeats", "0"))
-                                < min(args.backward_smoke_repeats, 2)):
-                            raise AssertionError(
-                                f"rank={rank} incomplete empty-expert full "
-                                f"zero audit: {item}")
-            if args.backward_route_case == "zero-rank":
-                if observed[-1]["local_tokens"] != "0":
-                    raise AssertionError("zero-token rank was not exercised")
-            if args.world == 1 and args.top_k == 1:
-                oracle_keys = (
-                    "oracle_dx_bits", "oracle_dgate", "oracle_dw1_bits",
-                    "oracle_dw2_bits", "oracle_ab_bits", "oracle_dab_bits",
-                    "oracle_dw1_row0_bits")
-                if not all(key in observed[0] for key in oracle_keys):
-                    raise AssertionError("missing Backward oracle samples")
-                print("BACKWARD_ORACLE_JSON " + json.dumps(
-                    {key: observed[0][key] for key in oracle_keys},
-                    sort_keys=True))
-            specialization = ("runtime-shape-correctness-fallback"
-                              if args.runtime_hidden is not None
-                              else "WGMMA/TMA-7168x3072")
-            print(f"[PASS] LocalCudaP2p Backward MegaKernel world={args.world} "
-                  f"single-launch {specialization} cache/no-cache smoke "
-                  f"rank0_dx_hash={observed[0]['dx_hash']} "
-                  f"rank0_dw1_hash={observed[0]['dw1_hash']} "
-                  f"rank0_dw2_hash={observed[0]['dw2_hash']} "
-                  f"rank0_dgate_hash={observed[0]['dgate_hash']}")
-            return
-        if args.backward_cache_pool2_validation:
-            required = ("disjoint", "first_stable", "second_stable",
-                        "third_exhausted", "selective_reuse")
-            if len(observed) != args.world or any(
-                    item.get(field) != "1"
-                    for item in observed for field in required):
-                raise AssertionError(
-                    f"invalid Backward pool=2 lifecycle audit: {observed}")
-            print(f"[PASS] Backward main-shape pool=2 lifecycle world="
-                  f"{args.world} disjoint/exhaustion/selective-reuse")
             return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")
             return
         if benchmark_mode:
-            if args.backward_benchmark:
-                stage_keys = (
-                              "notify_inclusive_training_step_wall",
-                              "post_notify_training_step_wall", "notify_wall",
-                              "forward_wall", "backward_wall",
-                              "dy_dispatch", "dv", "dgate", "transpose",
-                              "dx", "dw1", "dw2",
-                              "dw1_ready_wait", "dw2_ready_wait",
-                              "dw1_max_expert_wait", "dw2_max_expert_wait",
-                              "dw1_tail", "dw2_tail",
-                              "dw1_overlap_dv_dx", "dw2_overlap_dv_dx",
-                              "reduce", "forward_call_host", "dy_ready_host",
-                              "backward_call_host", "integration_overhead",
-                              "handoff",
-                              "backward_setup_host",
-                              "forward_consumer_drain",
-                              "final_drain", "notify_pool_acquire",
-                              "notify_local_histogram_wall",
-                              "notify_local_mapping_device",
-                              "notify_collective_enqueue",
-                              "notify_collective_wait",
-                              "notify_materialization", "notify_publish")
-                for rank, item in enumerate(observed):
-                    if (item["specialization"] !=
-                            "sm90-wgmma-tma-7168x3072" or
-                            item["persistent_launches"] != "1" or
-                            item["steady_forbidden_cuda_api_calls"] != "0" or
-                            item.get("gradient_hash_repeats") != "20" or
-                            item.get("notify_fused_enqueues") != "1" or
-                            any(item.get(field) != "0" for field in
-                                ("notify_control_enqueues",
-                                 "notify_config_enqueues",
-                                 "notify_count_enqueues",
-                                 "notify_summary_enqueues")) or
-                            item.get("consumer_acquires") != "1" or
-                            item.get("consumer_releases") != "1"):
-                        raise AssertionError(
-                            f"rank={rank} invalid backward audit: {item}")
-                    for key in stage_keys:
-                        item[key] = [float(value)
-                                     for value in item[key].split(",")]
-                        if len(item[key]) != args.rounds - 10:
-                            raise AssertionError(
-                                f"rank={rank} stage={key} bad sample count")
-
-                def stats(values):
-                    ordered = sorted(values)
-                    def percentile(fraction):
-                        ordinal = max(
-                            1, int(len(ordered) * fraction + 0.999999))
-                        return ordered[ordinal - 1]
-                    return {"mean": statistics.fmean(values),
-                            "p50": percentile(0.50),
-                            "p95": percentile(0.95),
-                            "min": ordered[0], "max": ordered[-1]}
-
-                summary = {}
-                for key in stage_keys:
-                    slowest = [max(item[key][iteration]
-                                   for item in observed)
-                               for iteration in range(args.rounds - 10)]
-                    summary[key + "_slowest_rank_us"] = stats(slowest)
-
-                # Keep the formal critical path in one rank/time domain.  A
-                # table assembled from the independently slowest rank of each
-                # stage cannot explain full-wall latency because those maxima
-                # frequently come from different ranks.  Select the rank with
-                # the largest formal route-ready -> final-drain sample, then
-                # report every component from that same rank and iteration.
-                formal_key = "notify_inclusive_training_step_wall"
-                critical_ranks = [
-                    max(range(args.world),
-                        key=lambda rank: observed[rank][formal_key][iteration])
-                    for iteration in range(args.rounds - 10)
-                ]
-                for key in stage_keys:
-                    same_rank = [
-                        observed[critical_ranks[iteration]][key][iteration]
-                        for iteration in range(args.rounds - 10)
-                    ]
-                    summary["critical_path_" + key + "_us"] = stats(
-                        same_rank)
-                notify_components = (
-                    "notify_pool_acquire", "notify_local_histogram_wall",
-                    "notify_collective_enqueue", "notify_collective_wait",
-                    "notify_materialization", "notify_publish")
-                notify_residual = []
-                for iteration, rank in enumerate(critical_ranks):
-                    notify_residual.append(
-                        observed[rank]["notify_wall"][iteration] - sum(
-                            observed[rank][key][iteration]
-                            for key in notify_components))
-                summary["critical_path_notify_unattributed_us"] = stats(
-                    notify_residual)
-                result = {
-                    "schema": 1,
-                    "benchmark": "single-persistent-backward-main-shape",
-                    "world": args.world,
-                    "cache_mode": ("cache-fc1-input-output"
-                                   if (args.backward_cache or
-                                       args.backward_cache_pool2_validation)
-                                   else "no-cache"),
-                    "warmup": 10,
-                    "measured": args.rounds - 10,
-                    "shape": {"tokens_per_rank": 8192, "hidden": 7168,
-                              "intermediate": 3072, "experts": 384,
-                              "top_k": args.top_k},
-                    "per_rank_workspace_bytes": [
-                        int(item["workspace"]) for item in observed],
-                    "per_rank_wgmma_instructions": [
-                        int(item["wgmma"]) for item in observed],
-                    "per_rank_tma_loads": [int(item["tma"])
-                                           for item in observed],
-                    "per_rank_one_time_setup_us": [
-                        float(item["one_time_setup"]) for item in observed],
-                    "per_rank_activation_hash": [
-                        int(item["activation_hash"]) for item in observed],
-                    "per_rank_output_gradient_hash": [
-                        int(item["output_gradient_hash"])
-                        for item in observed],
-                    "per_rank_route_hash": [
-                        int(item["route_hash"]) for item in observed],
-                    "per_rank_gate_hash": [
-                        int(item["gate_hash"]) for item in observed],
-                    "per_rank_actual_w1_device_hash": [
-                        [int(item["actual_w1_hash_low"]),
-                         int(item["actual_w1_hash_high"])]
-                        for item in observed],
-                    "per_rank_actual_w2_device_hash": [
-                        [int(item["actual_w2_hash_low"]),
-                         int(item["actual_w2_hash_high"])]
-                        for item in observed],
-                    "per_rank_actual_dx_device_hash": [
-                        [int(item["actual_dx_hash_low"]),
-                         int(item["actual_dx_hash_high"])]
-                        for item in observed],
-                    "per_rank_actual_dw1_device_hash": [
-                        [int(item["actual_dw1_hash_low"]),
-                         int(item["actual_dw1_hash_high"])]
-                        for item in observed],
-                    "per_rank_actual_dw2_device_hash": [
-                        [int(item["actual_dw2_hash_low"]),
-                         int(item["actual_dw2_hash_high"])]
-                        for item in observed],
-                    "per_rank_actual_dgate_device_hash": [
-                        [int(item["actual_dgate_hash_low"]),
-                         int(item["actual_dgate_hash_high"])]
-                        for item in observed],
-                    "gradient_hash_repeats": 20,
-                    "weight_gradient_dtype": observed[0]["dw_dtype"],
-                    "per_rank_notify_collective_audit": [{
-                        "fused": int(item["notify_fused_enqueues"]),
-                        "control": int(item["notify_control_enqueues"]),
-                        "config": int(item["notify_config_enqueues"]),
-                        "count": int(item["notify_count_enqueues"]),
-                        "summary": int(item["notify_summary_enqueues"]),
-                    } for item in observed],
-                    "formal_critical_path_rank_by_iteration": critical_ranks,
-                    "per_rank_dispatch_consumer_acquires": [
-                        int(item["consumer_acquires"]) for item in observed],
-                    "per_rank_dispatch_consumer_releases": [
-                        int(item["consumer_releases"]) for item in observed],
-                    "per_rank_forward_cluster_requested": [
-                        int(item["forward_cluster_requested"])
-                        for item in observed],
-                    "per_rank_forward_cluster_actual": [
-                        int(item["forward_cluster_actual"])
-                        for item in observed],
-                    "per_rank_nccl_runtime": [
-                        item["_nccl_runtime"] for item in observed],
-                    "per_rank_nccl_library": [
-                        item["_nccl_library"] for item in observed],
-                    **summary,
-                }
-                print("BACKWARD_BENCH_JSON " +
-                      json.dumps(result, sort_keys=True))
-                return
             if args.forward_benchmark:
                 stage_keys = ("wall", "notify", "forward", "dispatch",
                               "fc1", "fc2", "return", "reduce",
@@ -852,10 +484,6 @@ def main():
                     "schema": 1,
                     "benchmark": "single-persistent-forward-main-shape",
                     "world": args.world,
-                    "cache_mode": ("cache-fc1-input-output"
-                                   if (args.forward_cache or
-                                       args.forward_cache_pool2_validation)
-                                   else "no-cache"),
                     "warmup": 10,
                     "measured": args.rounds - 10,
                     "shape": {"tokens_per_rank": 8192, "hidden": 7168,
@@ -911,8 +539,6 @@ def main():
                                            for item in observed],
                     "per_rank_tma_multicast_loads": [
                         int(item["multicast"]) for item in observed],
-                    "per_rank_cache_pool2_validation": [
-                        item.get("_cache_pool2") for item in observed],
                     "per_rank_nccl_runtime": [
                         item["_nccl_runtime"] for item in observed],
                     "per_rank_nccl_library": [

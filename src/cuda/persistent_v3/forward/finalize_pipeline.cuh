@@ -172,9 +172,9 @@ __device__ __forceinline__ void split_transport_finalize(
     // proven static spaces once instead of issuing four contended atomics per
     // task from the GEMM/reduction hot paths.
     mark_task_space_complete(
-        completion_task(completion, transport_state::TaskClass::Fc1OrDv));
+        completion_task(completion, transport_state::TaskClass::Fc1));
     mark_task_space_complete(
-        completion_task(completion, transport_state::TaskClass::Fc2OrDx));
+        completion_task(completion, transport_state::TaskClass::Fc2));
     mark_task_space_complete(
         completion_task(completion, transport_state::TaskClass::Reduce));
 #endif

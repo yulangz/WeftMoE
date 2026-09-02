@@ -1,43 +1,11 @@
-# Checked-in benchmark evidence
+# Benchmark results
 
-These files are compact machine-readable extracts from the clean release runs
-documented in `docs/build.md`; they are evidence, not hard-coded benchmark
-expectations.
+Only results produced from the current Forward-only implementation belong in
+this directory. Historical single-node fallback, cache, and Backward records
+were removed because their kernels and measurement boundaries no longer exist.
 
-- `forward_release_world8.json` records the three independent MegaMOE and
-  Megatron-Core 0.17.0 Forward sessions and the formal per-run comparison,
-  exact cross-implementation fixture hashes, cache/no-cache workspace and
-  timing, the independent NumPy FP64 oracle, runtime cluster audit, and the
-  remote clean-export reproduction.
-- `backward_integrated_world8.json` records three true same-generation
-  Forward-to-Backward event-handoff sessions and the native Megatron
-  Backward/F+B comparison.
-- `gin_world16_training_20260826.json` records three two-node world-16 GIN
-  Forward and F+B sessions, exact fixture agreement, runtime put/signal/byte
-  counters, and the historical per-run Megatron Socket comparison. Socket is a
-  lower-bound result and is not a fair RDMA acceleration claim.
-- `gin_vs_megatron_rdma_world16_20260827.json` is the formal transport-fair
-  result: three independent MegaMOE GIN and Megatron NCCL RDMA/RoCE sessions,
-  10 warmups plus 100 samples each. It contains exact input/device-weight/dY
-  hash agreement, slowest-rank mean/P50/P95/min/max, per-session and aggregate
-  speedups, NCCL `NET/IB`/GDRDMA evidence, all-rail HCA counter deltas,
-  collective timings and GIN put/signal/byte audits. It records that MegaMOE
-  does not beat Megatron on this RDMA baseline.
-- `socket_world16_fallback_20260826.json` records the corresponding three-run
-  full-FC NCCL Socket correctness/performance lower bound. Its explicit host
-  payload phases are included and every GIN audit field is zero.
-- `forward_main_world1_ncu.csv` records the available Nsight Compute metrics
-  for the same main-shape kernel in world 1. Multi-process replay was not used
-  because pausing one process independently invalidates the live peer data-plane
-  timing and progress assumptions.
-- `gin_device_timeline_world2_20260827.json` and
-  `gin_device_timeline_world16_20260827.json` are `%globaltimer` summaries for
-  the pre-streaming GIN Forward/Backward baseline. Timestamps are only
-  subtracted within one GPU; the world-16 data proves that the roughly 352 MB
-  Forward and dX returns start after compute and each occupy about 14.8 ms.
-
-The optimized capture improves kernel duration from 25.349 to 19.432 ms, SM
-throughput from 42.37% to 55.97%, and DRAM throughput from 48.87% to 66.55%.
-The profiler still emits `ptxas` WGMMA dependency diagnostics; barrier and
-long-scoreboard stalls are now the primary remaining leads. No Nsight Systems
-executable was available on the inspected host.
+Use `tools/autotune_forward.py` for tuning and the Forward benchmark scenarios
+in `tests/run_local_activation_p2p.py` or `tests/run_multinode_nccl.py` for
+performance runs. Keep checked-in records compact and include the commit,
+topology, tuning configuration, warmup/sample counts, correctness hashes, and
+slowest-rank latency statistics.

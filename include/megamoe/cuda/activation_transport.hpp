@@ -22,7 +22,6 @@ template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;
 class ForwardWeightLease;
-class SelectedOutputGradientLease;
 class ExternalCudaProducer;
 
 inline constexpr std::uint32_t kSelectedActivationLayoutVersion = 1;
@@ -49,9 +48,6 @@ private:
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend class GinRdmaBackwardMegaKernel;
-  friend class NcclSocketFallbackBackwardMegaKernel;
   friend class ExternalCudaProducer;
 };
 
@@ -67,10 +63,6 @@ struct ActivationTransportPoolConfig {
   std::uint32_t max_inflight_generations = 2;
   std::uint64_t max_intermediate_size = 0;
   std::uint32_t max_owned_experts = 0;
-  bool enable_forward_cache = false;
-  // Reserves the generation-local Backward arena.  It is deliberately opt-in
-  // so the frozen Forward-only pool footprint is unchanged.
-  bool enable_backward = false;
   // Reserves compact route/payload staging for the explicitly host-enqueued
   // NCCL Socket correctness backend. Disabled for the frozen local P2P path.
   bool enable_socket_fallback = false;
@@ -109,9 +101,6 @@ private:
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend class GinRdmaBackwardMegaKernel;
-  friend class NcclSocketFallbackBackwardMegaKernel;
   friend class ExternalCudaProducer;
 };
 
@@ -133,30 +122,19 @@ struct ActivationTransportRunOptions {
   // Zero means no deadline. Multi-rank cancellation/deadline must be requested
   // consistently by every healthy rank in the local P2P team.
   std::chrono::microseconds deadline_after{0};
-  // Training-step fast path: enqueue Forward and transfer its completion/cache
-  // lease directly to Backward. The Forward handle remains owning, but audit
-  // and timing access is valid only after Backward completes the handoff.
-  bool defer_forward_completion_to_backward = false;
 };
 
 // A real, node-local, multi-process CUDA IPC backend. Construction exchanges
 // and validates pool IPC handles over the existing node-local NCCL session.
 // It fails closed unless every local peer mapping is established.
 
-enum class ForwardCacheMode : std::uint8_t {
-  CacheFc1InputOutput,
-  NoFc1OutputCache,
-};
-
 enum class ForwardKernelSpecialization : std::uint8_t {
   Sm90WgmmaTma7168x3072,
-  RuntimeShapeCorrectnessFallback,
 };
 
 struct ForwardMegaKernelConfig {
   std::uint64_t hidden_size = 0;
   std::uint64_t intermediate_size = 0;
-  ForwardCacheMode cache_mode = ForwardCacheMode::NoFc1OutputCache;
 };
 
 class ForwardWeightLease {
@@ -175,8 +153,6 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pForwardMegaKernel;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend struct ForwardBackwardWeightAccess;
   friend class ExternalCudaProducer;
 };
 
@@ -196,7 +172,7 @@ struct ForwardMegaKernelTimings {
 
 struct ForwardMegaKernelAudit {
   ForwardKernelSpecialization specialization =
-      ForwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
+      ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
   std::uint64_t persistent_kernel_launches = 0;
   std::uint64_t wgmma_instructions = 0;
   std::uint64_t tma_loads = 0;
@@ -232,10 +208,6 @@ public:
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
-  // Owning one-shot handoff used by Backward. It transfers the already
-  // acquired Forward dispatch consumer; it never exposes a kernel view or
-  // acquires a second consumer event/slot lease.
-  DeviceDispatchConsumerLease transfer_consumer_to_backward() const;
   struct Impl;
   explicit DeviceForwardHandle(std::shared_ptr<const Impl> impl)
       : impl_(std::move(impl)) {}
@@ -243,11 +215,7 @@ private:
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
-  friend class SelectedOutputGradientLease;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend class GinRdmaBackwardMegaKernel;
   friend class ExternalCudaProducer;
-  friend class NcclSocketFallbackBackwardMegaKernel;
 };
 
 // CUDA-specific zero-copy producer boundary. It records readiness on the
@@ -285,12 +253,6 @@ public:
       std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
       std::uint32_t global_expert_begin, std::uint64_t hidden_size,
       std::uint64_t intermediate_size) const;
-  SelectedOutputGradientLease publish_output_gradient(
-      const DeviceForwardHandle &forward,
-      const transport::BFloat16 *device_data,
-      std::uint64_t capacity_elements,
-      std::shared_ptr<const void> allocation_owner) const;
-
 private:
   struct State;
   explicit ExternalCudaProducer(std::shared_ptr<const State> state)
@@ -368,179 +330,6 @@ private:
 };
 
 
-// Immutable autograd -> Backward handoff.  dY is BF16 [tokens, hidden] and is
-// bound to the exact Forward generation/slot.  No native pointer is exposed.
-class SelectedOutputGradientLease {
-public:
-  SelectedOutputGradientLease() = default;
-  std::uint64_t num_tokens() const;
-  std::uint64_t hidden_size() const;
-  std::uint64_t generation() const;
-  std::uint32_t device_ordinal() const;
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit SelectedOutputGradientLease(std::shared_ptr<const Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<const Impl> impl_;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend class GinRdmaBackwardMegaKernel;
-  friend class ExternalCudaProducer;
-};
-
-enum class BackwardWeightGradientDType : std::uint8_t { BFloat16 };
-
-struct BackwardMegaKernelConfig {
-  std::uint64_t hidden_size = 0;
-  std::uint64_t intermediate_size = 0;
-  BackwardWeightGradientDType weight_gradient_dtype =
-      BackwardWeightGradientDType::BFloat16;
-};
-
-enum class BackwardKernelSpecialization : std::uint8_t {
-  Sm90WgmmaTma7168x3072,
-  RuntimeShapeCorrectnessFallback,
-};
-
-struct BackwardMegaKernelTimings {
-  double forward_to_backward_handoff_us = 0;
-  double backward_setup_to_launch_host_us = 0;
-  double forward_consumer_drain_host_us = 0;
-  double final_consumer_drain_host_us = 0;
-  double v3_local_delivery_complete_us = 0;
-  double v3_outbound_pack_complete_us = 0;
-  double v3_rdma_complete_us = 0;
-  double v3_inbound_relay_complete_us = 0;
-  double v3_dv_first_start_us = 0;
-  double v3_dv_complete_us = 0;
-  double v3_dw2_first_ready_us = 0;
-  double v3_dw2_first_start_us = 0;
-  double v3_dw2_last_complete_us = 0;
-  double v3_terminal_complete_us = 0;
-  double dy_dispatch_us = 0;
-  double dv_swiglu_backward_us = 0;
-  double dgate_reduce_us = 0;
-  double transpose_us = 0;
-  double dx_us = 0;
-  double dw1_us = 0;
-  double dw2_us = 0;
-  double dw1_ready_to_start_us = 0;
-  double dw2_ready_to_start_us = 0;
-  double dw1_max_expert_ready_to_start_us = 0;
-  double dw2_max_expert_ready_to_start_us = 0;
-  double dw1_tail_us = 0;
-  double dw2_tail_us = 0;
-  double dw1_overlap_dv_dx_us = 0;
-  double dw2_overlap_dv_dx_us = 0;
-  double dx_combine_reduce_us = 0;
-  double terminal_status_agreement_us = 0;
-  double total_us = 0;
-};
-
-struct BackwardMegaKernelAudit {
-  BackwardKernelSpecialization specialization =
-      BackwardKernelSpecialization::RuntimeShapeCorrectnessFallback;
-  std::uint64_t persistent_kernel_launches = 0;
-  std::uint64_t wgmma_instructions = 0;
-  std::uint64_t tma_loads = 0;
-  std::uint64_t dv_tasks = 0;
-  std::uint64_t dx_tasks = 0;
-  std::uint64_t dw1_tasks = 0;
-  std::uint64_t dw2_tasks = 0;
-  std::uint64_t actual_dy_peer_bytes = 0;
-  std::uint64_t actual_dx_peer_bytes = 0;
-  std::uint64_t raw_cross_node_dy_bytes = 0;
-  std::uint64_t gin_dy_payload_bytes = 0;
-  std::uint64_t gin_dx_payload_bytes = 0;
-  std::uint64_t gin_dispatch_put_count = 0;
-  std::uint64_t gin_return_put_count = 0;
-  std::uint64_t gin_signal_count = 0;
-  std::uint64_t gin_metadata_bytes = 0;
-  std::uint64_t hot_path_allocations = 0;
-  std::uint64_t workspace_bytes = 0;
-  bool recomputed_fc1 = false;
-  std::uint64_t dispatch_consumer_acquires = 0;
-  std::uint64_t dispatch_consumer_releases = 0;
-  BackwardWeightGradientDType weight_gradient_dtype =
-      BackwardWeightGradientDType::BFloat16;
-};
-
-class DeviceBackwardHandle {
-public:
-  DeviceBackwardHandle() = default;
-  const ActivationTransportExpectation &identity() const;
-  const BackwardMegaKernelAudit &audit() const;
-  const BackwardMegaKernelTimings &timings() const;
-  explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
-
-private:
-  struct Impl;
-  explicit DeviceBackwardHandle(std::shared_ptr<const Impl> impl)
-      : impl_(std::move(impl)) {}
-  std::shared_ptr<const Impl> impl_;
-  friend class LocalCudaP2pBackwardMegaKernel;
-  friend class GinRdmaBackwardMegaKernel;
-};
-
-
-class LocalCudaP2pBackwardMegaKernel {
-public:
-  LocalCudaP2pBackwardMegaKernel(
-      const NcclSession &session, const CudaExecution &execution,
-      const ActivationTransportResourcePool &pool);
-
-  DeviceBackwardHandle run(
-      const DeviceForwardHandle &forward,
-      const SelectedOutputGradientLease &output_gradient,
-      const BackwardMegaKernelConfig &config,
-      const ActivationTransportRunOptions &options = {});
-
-private:
-  LocalCudaP2pBackwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &, bool use_gin);
-  LocalCudaP2pBackwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &, bool use_gin,
-      bool use_socket);
-  struct Impl;
-  std::shared_ptr<Impl> impl_;
-  friend class GinRdmaBackwardMegaKernel;
-  friend class NcclSocketFallbackBackwardMegaKernel;
-};
-
-class GinRdmaBackwardMegaKernel {
-public:
-  GinRdmaBackwardMegaKernel(const NcclSession &, const CudaExecution &,
-                            const ActivationTransportResourcePool &);
-  DeviceBackwardHandle run(
-      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
-      const BackwardMegaKernelConfig &,
-      const ActivationTransportRunOptions & = {});
-
-private:
-  std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
-};
-
-// Host-enqueued NCCL Socket correctness fallback for complete Backward
-// semantics. dY/dX/dGate cross explicit aggregate Socket phase boundaries;
-// dV/dX/dW reuse the frozen WGMMA/TMA core and deterministic dX reduce.
-class NcclSocketFallbackBackwardMegaKernel {
-public:
-  NcclSocketFallbackBackwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &);
-  DeviceBackwardHandle run(
-      const DeviceForwardHandle &, const SelectedOutputGradientLease &,
-      const BackwardMegaKernelConfig &,
-      const ActivationTransportRunOptions & = {});
-
-private:
-  std::shared_ptr<LocalCudaP2pBackwardMegaKernel> delegate_;
-};
-
-
 struct ActivationTransportCapability {
   std::uint32_t compiled_nccl_version = 0;
   std::uint32_t runtime_nccl_version = 0;
@@ -564,12 +353,6 @@ ActivationTransportCapability probe_activation_transport_capability(
 // returned value contains no native NCCL/CUDA handles.
 ActivationTransportCapability probe_activation_transport_capability(
     const NcclSession &session, const CudaExecution &execution);
-
-// One-time training-session preparation. It builds device-resident W1^T/W2^T
-// and their TMA descriptors; Forward-only users do not call it.
-void prepare_forward_weights_for_backward(
-    const ForwardWeightLease &weights, const CudaExecution &execution);
-
 
 } // namespace megamoe::cuda
 

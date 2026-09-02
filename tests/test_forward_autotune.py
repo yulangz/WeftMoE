@@ -31,7 +31,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         benchmark = self.plan["benchmark"]
         self.assertEqual(benchmark["seed"], 0x4D554C54)
         self.assertEqual(benchmark["top_k"], 6)
-        self.assertFalse(benchmark["fc1_output_cache"])
+        self.assertEqual(benchmark["tokens_per_rank"], 8192)
         command = tune.launcher_command(
             Path("/tmp/test_cuda_notify"), benchmark,
             rounds=benchmark["tune_rounds"])

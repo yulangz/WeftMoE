@@ -1284,7 +1284,6 @@ void test_handle_copy_move_workspace_and_overflow() {
   const auto plan = megamoe::make_workspace_plan(handles[0]);
   megamoe::validate_workspace_plan(handles[0], plan);
   (void)megamoe::ForwardPersistentInputs::checked(handles[0], plan);
-  (void)megamoe::BackwardPersistentInputs::checked(handles[0], plan);
   megamoe::WorkspacePlan empty_plan;
   expect_error(NotifyErrorCode::WorkspaceMismatch,
                [&] { (void)empty_plan.requirements(); }, {"default/invalid"});

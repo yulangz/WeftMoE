@@ -1149,9 +1149,24 @@ void validate_dispatch_metadata_object(const DispatchMetadata &metadata,
   const auto require_wave_field = [&](const auto &actual,
                                       const auto &expected,
                                       const char *field) {
-    if (actual != expected)
+    if (actual != expected) {
+      std::size_t mismatch = 0;
+      while (mismatch < actual.size() && mismatch < expected.size() &&
+             actual[mismatch] == expected[mismatch])
+        ++mismatch;
+      const auto actual_value =
+          mismatch < actual.size() ? std::to_string(actual[mismatch]) : "end";
+      const auto expected_value = mismatch < expected.size()
+                                      ? std::to_string(expected[mismatch])
+                                      : "end";
       metadata_failure(NotifyErrorCode::InvalidHandle, phase, field, rank,
-                       "canonical tile-priority descriptor", "mismatch");
+                       "size=" + std::to_string(expected.size()) +
+                           ", index=" + std::to_string(mismatch) +
+                           ", value=" + expected_value,
+                       "size=" + std::to_string(actual.size()) +
+                           ", index=" + std::to_string(mismatch) +
+                           ", value=" + actual_value);
+    }
   };
   require_wave_field(metadata.transport.dispatch_wave_packet_order,
                      expected_transport.dispatch_wave_packet_order,

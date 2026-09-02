@@ -218,7 +218,7 @@ __device__ __forceinline__ bool try_claim_fc1_task(
 #if MEGAMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
-      claim_completion_tasks(completion, transport_state::TaskClass::Fc1OrDv);
+      claim_completion_tasks(completion, transport_state::TaskClass::Fc1);
       completion->fc1_scheduler_value = slot;
       completion->bulk_local_ready = 11ULL;
     }
@@ -306,8 +306,8 @@ __device__ __forceinline__ bool try_claim_fc1_task_pair(
 #if MEGAMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
-      claim_completion_tasks(completion, transport_state::TaskClass::Fc1OrDv);
-      claim_completion_tasks(completion, transport_state::TaskClass::Fc1OrDv);
+      claim_completion_tasks(completion, transport_state::TaskClass::Fc1);
+      claim_completion_tasks(completion, transport_state::TaskClass::Fc1);
       completion->fc1_scheduler_value = slot + 1ULL;
       completion->bulk_local_ready = 11ULL;
     }
@@ -375,7 +375,7 @@ __device__ __forceinline__ bool try_claim_fc2_task(
     if constexpr (!StaticLocal) {
       if (a.use_gin)
         claim_completion_tasks(completion,
-                               transport_state::TaskClass::Fc2OrDx);
+                               transport_state::TaskClass::Fc2);
     }
     if (a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas) {
       completion->fc2_scheduler_value = slot * fc2_ntiles + n_tile;
@@ -442,9 +442,9 @@ __device__ __forceinline__ bool try_claim_fc2_task_pair(
     if constexpr (!StaticLocal) {
       if (a.use_gin) {
         claim_completion_tasks(completion,
-                               transport_state::TaskClass::Fc2OrDx);
+                               transport_state::TaskClass::Fc2);
         claim_completion_tasks(completion,
-                               transport_state::TaskClass::Fc2OrDx);
+                               transport_state::TaskClass::Fc2);
       }
     }
     if (a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas) {
@@ -692,10 +692,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
-  auto *ab_cache = a.forward_ab_cache_offset == 0
-                       ? static_cast<transport::BFloat16 *>(nullptr)
-                       : peer_at<transport::BFloat16>(
-                             a.local_base, a.forward_ab_cache_offset);
   auto *forward_output =
       a.use_gin && a.forward_registered_output
           ? reinterpret_cast<transport::BFloat16 *>(
@@ -1079,15 +1075,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
                   float2_to_bf16x2_bits((av0 * sigmoid0) * bv0,
                                         (av1 * sigmoid1) * bv1);
-              if (a.cache_fc1 && ab_cache) {
-                reinterpret_cast<std::uint32_t *>(
-                    ab_cache)[output_index / 2ULL] =
-                    float2_to_bf16x2_bits(av0, av1);
-                const auto b_index =
-                    a.max_destination_rows * a.intermediate + output_index;
-                reinterpret_cast<std::uint32_t *>(ab_cache)[b_index / 2ULL] =
-                    float2_to_bf16x2_bits(bv0, bv1);
-              }
             } else if (block_m < valid_rows) {
               const float av[2] = {av0, av1};
               const float bv[2] = {bv0, bv1};
@@ -1100,13 +1087,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
                   s[output_index] = transport::BFloat16{
                       float_to_bf16_bits((av[value] * sigmoid) * bv[value])};
-                  if (a.cache_fc1 && ab_cache) {
-                    ab_cache[output_index] =
-                        transport::BFloat16{float_to_bf16_bits(av[value])};
-                    ab_cache[a.max_destination_rows * a.intermediate +
-                             output_index] =
-                        transport::BFloat16{float_to_bf16_bits(bv[value])};
-                  }
                 }
               }
             }
@@ -1125,7 +1105,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         if constexpr (!StaticLocal) {
           if (a.use_gin)
             complete_completion_tasks(completion,
-                                      transport_state::TaskClass::Fc1OrDv);
+                                      transport_state::TaskClass::Fc1);
         }
 #endif
         if ((old & 0xffffULL) + 1ULL == fc1_ntiles) {
@@ -1314,7 +1294,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         }
       }
       // When TMA targets a separate Return staging plane, retain the scalar
-      // canonical store for local/backward consumers. Production aliases its
+      // canonical store for local consumers. Production aliases its
       // canonical output with registered staging, so a full tile needs only
       // the TMA store; partial expert tails remain on the checked scalar path.
       if (!full_tma_tile || TmaFc2StoreToStaging) {
@@ -1369,7 +1349,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         if constexpr (!StaticLocal) {
           if (a.use_gin)
             complete_completion_tasks(completion,
-                                      transport_state::TaskClass::Fc2OrDx);
+                                      transport_state::TaskClass::Fc2);
         }
 #endif
       }
@@ -1421,7 +1401,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             forward_publish_progress(a, kForwardFc2Complete, fc2_tasks);
           }
           if constexpr (!StaticLocal) {
-            if (a.use_gin) {
+            if (a.use_gin || (a.forward_stream_local_dispatch &&
+                              a.forward_relay_local_return)) {
               // Lane 0 publishes one maximal contiguous descriptor to the
               // fixed FULL GIN owners. No context state or network register
               // live range enters this WGMMA kernel.

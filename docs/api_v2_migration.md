@@ -1,25 +1,23 @@
-# Public API v2 migration
+# API v2 migration
 
-Version 2 is an intentional breaking cleanup for this new repository. The
-installed surface contains production session/topology, Notify, typed input
-leases, resource pools, backend capability/selection, Forward/Backward owning
-handles and production errors/status only.
+API v2 uses owning, typed CUDA leases rather than raw pointers or public kernel
+PODs. Callers should:
 
-The following declarations are no longer installed:
+1. create one Notify pool and one activation pool for the maximum shape;
+2. publish router routes, gates, activations, and weights through
+   `ExternalCudaProducer`;
+3. run `CudaNotifyGenerationCoordinator::run_device` for the exact generation;
+4. select `LocalCudaP2pForwardMegaKernel` or `GinRdmaForwardMegaKernel`;
+5. retain the returned `DeviceForwardHandle` until its output consumer has
+   completed.
 
-- `megamoe::cuda::testing::*` and `megamoe::testing::*`;
-- synthetic transport handles/backends and `run_synthetic`;
-- `*_for_validation`, download/oracle and mutation helpers;
-- unpooled coordinators, fault injection and runtime-shape harnesses;
-- raw/private kernel views, IPC/GIN factories and backend handles.
+Generic device buffers cannot be rebound as route or activation inputs.
+Session, generation, device, execution stream, shape, layout, and allocation
+owner are checked at every handoff. Test upload/download helpers are private and
+are not installed.
 
-Repository tests include `src/cuda/testing/api.hpp` or
-`src/metadata/testing_api.hpp` explicitly. Applications must not add `src/` to
-their include path. Replace host test uploads/downloads with the typed
-router/autograd producer leases and owning result/consumer handles. Perform
-one-time Backward weight preparation with
-`prepare_forward_weights_for_backward`, then destroy results before pools and
-sessions unless a retained handle intentionally extends pool lifetime.
-
-Run `make install-test` to validate the exact installed manifest and compile
-the minimal lifecycle example from an isolated prefix.
+The old single-node fallback, runtime-shape entry points, Forward cache modes,
+and Backward handles/configuration have been removed. Code that conditionally
+supports training should include `megamoe/cuda/backward.hpp` and require
+`backward_pipeline_available()` before constructing a training path; it returns
+false in this revision.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare actual per-rank Forward/Backward storage hashes across backends."""
+"""Compare actual per-rank Forward storage hashes across backends."""
 
 import argparse
 import json
@@ -50,8 +50,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gin-forward", required=True)
     parser.add_argument("--socket-forward", required=True)
-    parser.add_argument("--gin-backward", required=True)
-    parser.add_argument("--socket-backward", required=True)
     args = parser.parse_args()
 
     fixture_fields = [
@@ -61,26 +59,14 @@ def main():
         "actual_w2_hash_low", "actual_w2_hash_high",
     ]
     forward_fields = fixture_fields + ["output_hash"]
-    backward_fields = fixture_fields + [
-        "output_gradient_hash",
-        "actual_dx_hash_low", "actual_dx_hash_high",
-        "actual_dw1_hash_low", "actual_dw1_hash_high",
-        "actual_dw2_hash_low", "actual_dw2_hash_high",
-        "actual_dgate_hash_low", "actual_dgate_hash_high",
-    ]
     gin_forward = records(args.gin_forward, "FORWARD_BENCH")
     socket_forward = records(args.socket_forward, "FORWARD_BENCH")
-    gin_backward = records(args.gin_backward, "BACKWARD_BENCH")
-    socket_backward = records(args.socket_backward, "BACKWARD_BENCH")
     forward_checks = compare(
         gin_forward, socket_forward, forward_fields, "Forward")
-    backward_checks = compare(
-        gin_backward, socket_backward, backward_fields, "Backward")
     result = {
         "schema": 1,
         "world": len(gin_forward),
         "forward_rank_field_checks": forward_checks,
-        "backward_rank_field_checks": backward_checks,
         "socket_backend": "nccl-socket-fallback",
         "gin_backend": "gin-rdma",
         "byte_identical": True,

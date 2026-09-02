@@ -276,8 +276,9 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
   Layout layout;
   std::size_t cursor = 0;
   const auto routes = std::max<std::uint64_t>(plan.route_count, 1);
-  layout.keys_in = append_region(cursor, routes, sizeof(std::uint64_t), "keys_in");
-  layout.keys_out = append_region(cursor, routes, sizeof(std::uint64_t), "keys_out");
+  const auto sort_keys = std::max<std::uint64_t>(routes, plan.num_nodes);
+  layout.keys_in = append_region(cursor, sort_keys, sizeof(std::uint64_t), "keys_in");
+  layout.keys_out = append_region(cursor, sort_keys, sizeof(std::uint64_t), "keys_out");
   layout.indices_in = append_region(cursor, routes, sizeof(std::uint64_t), "indices_in");
   layout.indices_out = append_region(cursor, routes, sizeof(std::uint64_t), "indices_out");
   layout.sorted_experts = append_region(cursor, routes, sizeof(std::uint32_t), "sorted_experts");
@@ -3985,7 +3986,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
     // Build the immutable Return wire order only after the Dispatch and local
     // delivery permutations have been materialized into their final buffers.
     // One packed, unique key needs a single radix pass and is outside the
-    // steady Forward/Backward path.
+    // steady Forward path.
     materialize_return_order_init_kernel<<<
         blocks_for(plan.route_count, "return_order_init_grid"), threads, 0,
         exec->stream>>>(args);

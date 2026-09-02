@@ -9,14 +9,12 @@ namespace megamoe::cuda::transport_state {
 enum class TaskClass : std::uint32_t {
   DispatchWave = 0,
   RelayWave = 1,
-  Fc1OrDv = 2,
-  Fc2OrDx = 3,
+  Fc1 = 2,
+  Fc2 = 3,
   Return = 4,
   SourceArrival = 5,
   Reduce = 6,
-  Dw1 = 7,
-  Dw2 = 8,
-  Count = 9,
+  Count = 7,
 };
 
 constexpr std::size_t kTaskClassCount =
