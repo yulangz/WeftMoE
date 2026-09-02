@@ -27,6 +27,17 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(set(candidate["config"]),
                              set(tune.PARAMETER_MACROS))
 
+    def test_benchmark_workload_is_explicit(self):
+        benchmark = self.plan["benchmark"]
+        self.assertEqual(benchmark["seed"], 0x4D554C54)
+        self.assertEqual(benchmark["top_k"], 6)
+        self.assertFalse(benchmark["fc1_output_cache"])
+        command = tune.launcher_command(
+            Path("/tmp/test_cuda_notify"), benchmark,
+            rounds=benchmark["tune_rounds"])
+        self.assertEqual(command[command.index("--seed") + 1],
+                         str(benchmark["seed"]))
+
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")

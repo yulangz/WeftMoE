@@ -277,6 +277,43 @@ def load_plan(path: Path) -> dict[str, Any]:
     _require(isinstance(document["build"], dict), "build must be an object")
     _require(isinstance(document["benchmark"], dict),
              "benchmark must be an object")
+    benchmark = document["benchmark"]
+    for key in (
+        "remote",
+        "port",
+        "gpus_per_node",
+        "seed",
+        "tokens_per_rank",
+        "top_k",
+        "fc1_output_cache",
+        "generation_base",
+        "tune_rounds",
+        "final_rounds",
+        "timeout_seconds",
+        "selection_metric",
+        "result_dir",
+    ):
+        _require(key in benchmark, f"benchmark omits {key}")
+    for key in (
+        "port",
+        "gpus_per_node",
+        "seed",
+        "tokens_per_rank",
+        "top_k",
+        "generation_base",
+        "tune_rounds",
+        "final_rounds",
+        "timeout_seconds",
+    ):
+        _require(type(benchmark[key]) is int and benchmark[key] > 0,
+                 f"benchmark.{key} must be a positive integer")
+    _require(type(benchmark["fc1_output_cache"]) is bool,
+             "benchmark.fc1_output_cache must be true or false")
+    _require(benchmark["top_k"] in (1, 6),
+             "benchmark.top_k must be 1 or 6")
+    _require(benchmark["tune_rounds"] > 10 and
+             benchmark["final_rounds"] > 10,
+             "Forward benchmark rounds must be >10")
     _require(isinstance(document["candidates"], list) and
              document["candidates"], "candidates must be a non-empty array")
     maximum = document.get("max_candidates", 8)
@@ -519,6 +556,7 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any],
         "--port", str(int(benchmark["port"])),
         "--remote-binary", str(binary),
         "--gpus-per-node", str(int(benchmark["gpus_per_node"])),
+        "--seed", str(int(benchmark["seed"])),
         "--scenario", "gin_forward_bench",
         "--timeout", str(int(benchmark["timeout_seconds"])),
     ]
@@ -560,8 +598,12 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     run_environment = dict(environment)
     run_environment["MEGAMOE_P2P_BENCH_TOKENS"] = str(
         int(benchmark["tokens_per_rank"]))
+    run_environment["MEGAMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
     run_environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
-    run_environment["MEGAMOE_FORWARD_BENCH_GENERATION_BASE"] = "1000"
+    run_environment["MEGAMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
+        int(benchmark["generation_base"]))
+    if benchmark["fc1_output_cache"]:
+        run_environment["MEGAMOE_FORWARD_CACHE"] = "1"
     log_path = log_dir / f"{candidate['name']}.{suffix}.log"
     start = time.monotonic()
     try:
