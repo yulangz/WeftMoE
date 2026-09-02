@@ -41,6 +41,11 @@ struct ForwardKernelArgs {
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
   bool use_socket = false;
+  // A one-node split launch streams CUDA-IPC/NVLink rows through dedicated
+  // Relay CTAs.  Unlike the legacy StaticLocal path, compute must consume the
+  // same per-M-block ready queue used by GIN instead of assuming that the
+  // complete Dispatch grid has already joined.
+  bool forward_stream_local_dispatch = false;
   std::size_t canonical_rows_offset;
   std::size_t forward_output_rows_offset;
   std::size_t direct_headers_offset;

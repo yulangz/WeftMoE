@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "description": "Narrow one-host H200 Forward search. The split topology has zero RDMA CTAs; Relay and compute run concurrently over NVLink/CUDA IPC.",
+  "max_candidates": 4,
+  "build": {
+    "build_root": "build/forward-autotune",
+    "jobs": 8,
+    "cuda_arch_flags": "-gencode arch=compute_90a,code=sm_90a",
+    "target": "test_cuda_notify",
+    "timeout_seconds": 1800
+  },
+  "benchmark": {
+    "launcher": "local",
+    "world": 8,
+    "nccl_lib_dir": "/storage/openpsi/codes/wanghaitao.wht/deps/nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu",
+    "socket_ifname": "eth0",
+    "disable_ib": true,
+    "seed": 1297435732,
+    "tokens_per_rank": 8192,
+    "top_k": 6,
+    "gate_mode": "fixed-random",
+    "fc1_output_cache": false,
+    "generation_base": 1000,
+    "tune_rounds": 40,
+    "final_rounds": 110,
+    "timeout_seconds": 180,
+    "selection_metric": "forward_slowest_rank_us.mean",
+    "result_dir": "artifacts/forward-autotune"
+  },
+  "fixed": {
+    "1_gemm": {
+      "main_hidden": 7168,
+      "main_intermediate": 3072,
+      "tile_m": 128,
+      "fc1_tile_n": 128,
+      "fc2_tile_n": 256,
+      "tile_k": 64,
+      "fc1_stages": 4,
+      "fc2_stages": 4,
+      "compute_threads": 384,
+      "math_warpgroups": 2,
+      "producer_warpgroups": 1,
+      "math_registers": 232,
+      "producer_registers": 40,
+      "wgmma_wait_group": 0,
+      "fc2_store_atom_n": 64,
+      "cluster_size": 2,
+      "fc2_tma_store": true
+    },
+    "2_transport": {
+      "rdma_ctas": 0,
+      "relay_ctas": 16,
+      "rdma_control_warps": 2,
+      "relay_tma_warps": 0,
+      "local_dispatch_tma_warps": 8,
+      "relay_scatter_warps": 12,
+      "local_return_batch_mblocks": 4,
+      "dispatch_publish_batch_rows": 32,
+      "return_chunk_rows": 256,
+      "return_max_inflight": 16,
+      "registered_output": true,
+      "relay_local_return": true
+    },
+    "3_scheduler": {
+      "local_route_batch_rows": 128,
+      "startup_mblocks": 2,
+      "fc1_locality_group": 2,
+      "fc1_locality_group4_begin": 4,
+      "fc1_locality_group4_end": 12,
+      "fc2_priority_burst": 0,
+      "task_claim_chunk": 1,
+      "task_idle_nanosleep": 64,
+      "transport_idle_nanosleep": 64,
+      "setup_nanosleep": 256
+    },
+    "4_completion_reduce": {
+      "completion_chunks_per_pass": 1,
+      "completion_marker_warps": 1,
+      "reduce_cta_divisor": 1,
+      "reduce_scheduler": "queue",
+      "reduce_warps": 12,
+      "reduce_tokens_per_claim": 12,
+      "reduce_registers": 168,
+      "return_idle_nanosleep": 32,
+      "reduce_queue_nanosleep": 128,
+      "finalize_nanosleep": 128
+    }
+  },
+  "candidates": [
+    {
+      "name": "world8_relay16_tma4",
+      "description": "Sixteen Relay CTAs use four row-sized TMA streams and leave seven warps free while the publisher polls readiness.",
+      "override": {
+        "2_transport": {
+          "relay_ctas": 16,
+          "local_dispatch_tma_warps": 4
+        }
+      }
+    },
+    {
+      "name": "world8_relay16_tma8",
+      "description": "Validated sixteen-Relay, eight-stream TMA reference point.",
+      "override": {}
+    },
+    {
+      "name": "world8_relay24_tma8",
+      "description": "Twenty-four Relay CTAs trade eight compute SMs for more concurrent TMA/NVLink streams.",
+      "override": {
+        "2_transport": {
+          "relay_ctas": 24
+        }
+      }
+    },
+    {
+      "name": "world8_relay32_tma8",
+      "description": "Thirty-two Relay CTAs test the upper TMA/NVLink concurrency point with 100 compute SMs.",
+      "override": {
+        "2_transport": {
+          "relay_ctas": 32
+        }
+      }
+    }
+  ]
+}

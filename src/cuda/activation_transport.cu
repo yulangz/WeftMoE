@@ -4605,9 +4605,11 @@ template <bool StaticLocal>
 __device__ __forceinline__ bool
 forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
                           std::uint64_t local_row, std::uint32_t valid_rows) {
-  if constexpr (StaticLocal)
-    return true;
-  if (!a.use_gin || valid_rows == 0U)
+  if constexpr (StaticLocal) {
+    if (!a.forward_stream_local_dispatch)
+      return true;
+  }
+  if ((!a.use_gin && !a.forward_stream_local_dispatch) || valid_rows == 0U)
     return true;
   const auto end_row = local_row + valid_rows;
   const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
@@ -4849,7 +4851,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
   const auto forward_rdma_ctas =
-      a.gin_context_count < gridDim.x ? a.gin_context_count : gridDim.x;
+      StaticLocal ? 0U
+                  : (a.gin_context_count < gridDim.x ? a.gin_context_count
+                                                     : gridDim.x);
   const auto configured_relay_ctas = a.forward_relay_cta_count;
   const auto relay_cta_capacity = gridDim.x - forward_rdma_ctas;
   const auto forward_relay_ctas = configured_relay_ctas < relay_cta_capacity
@@ -4866,6 +4870,10 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       forward_relay_ctas == configured_relay_ctas &&
       forward_relay_ctas >= persistent_v3::kRdmaCtaCount &&
       forward_relay_ctas % persistent_v3::kRdmaCtaCount == 0U;
+  const bool stream_local_dispatch =
+      KernelRole == ForwardKernelRole::TransportOnly && StaticLocal &&
+      a.forward_stream_local_dispatch &&
+      gridDim.x == a.forward_relay_cta_count;
   const bool stream_remote_return_pipeline = stream_remote_dispatch;
   auto *forward_v3_control = peer_at<persistent_v3::ForwardPipelineControl>(
       a.local_base, a.forward_v3_control_offset);
@@ -5102,7 +5110,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           forward_reduce_ready_token[token] = 0ULL;
       }
     }
-    if (stream_remote_dispatch) {
+    if (stream_remote_dispatch || stream_local_dispatch) {
       auto *control_words =
           reinterpret_cast<unsigned long long *>(forward_v3_control);
       constexpr auto control_words_count =
@@ -5181,7 +5189,19 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     // core.
     if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
 #if __has_include(<nccl_device.h>)
-      if (stream_remote_dispatch) {
+      if (stream_local_dispatch) {
+#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+        forward_dispatch_detail::local_relay_role(
+            a, *forward_v3_control, static_cast<std::uint32_t>(blockIdx.x),
+            scheduler, storage);
+        forward_publish_progress(a, kForwardDispatchStored,
+                                 a.dispatch.sizes.route_count);
+        forward_publish_progress(a, kForwardDispatchObserved,
+                                 a.dispatch.sizes.incoming_row_count);
+        forward_finalize_detail::local_split_transport_finalize(
+            a, *forward_v3_control, scheduler, status);
+#endif
+      } else if (stream_remote_dispatch) {
         forward_dispatch_detail::dispatch_role(
             a, *forward_v3_control, forward_relay_cta_begin, completion,
             context_completion, scheduler, storage);
@@ -6003,6 +6023,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                             a.dispatch.sizes.mtile_count, a.epoch);
 
     if constexpr (KernelRole == ForwardKernelRole::TransportOnly) {
+      if (stream_local_dispatch)
+        return;
       if (!stream_remote_return_pipeline) {
         if (blockIdx.x == 0U && threadIdx.x == 0U)
           publish_local_structured_error(status, a.rank, 133U, 1U, 1ULL, 0ULL);
@@ -6737,6 +6759,12 @@ cudaError_t set_max_dynamic_shared_memory(int bytes) {
       cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
 }
 
+cudaError_t set_local_max_dynamic_shared_memory(int bytes) {
+  return cudaFuncSetAttribute(
+      local_p2p_forward_megakernel<true, ForwardKernelRole::TransportOnly>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+}
+
 cudaError_t launch(const cudaLaunchConfig_t *config, const void *opaque_args,
                    std::size_t args_bytes, const CUtensorMap &x_map,
                    const CUtensorMap &s_map, const CUtensorMap &w1_map,
@@ -6749,6 +6777,22 @@ cudaError_t launch(const cudaLaunchConfig_t *config, const void *opaque_args,
   return cudaLaunchKernelEx(
       config,
       local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
+      args, x_map, s_map, w1_map, w2_map);
+}
+
+cudaError_t launch_local(const cudaLaunchConfig_t *config,
+                         const void *opaque_args, std::size_t args_bytes,
+                         const CUtensorMap &x_map, const CUtensorMap &s_map,
+                         const CUtensorMap &w1_map,
+                         const CUtensorMap &w2_map) {
+  if (opaque_args == nullptr || args_bytes != sizeof(ForwardKernelArgs))
+    return cudaErrorInvalidValue;
+  static_assert(__is_trivially_copyable(ForwardKernelArgs));
+  ForwardKernelArgs args{};
+  std::memcpy(&args, opaque_args, sizeof(args));
+  return cudaLaunchKernelEx(
+      config,
+      local_p2p_forward_megakernel<true, ForwardKernelRole::TransportOnly>,
       args, x_map, s_map, w1_map, w2_map);
 }
 
@@ -14692,9 +14736,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.config_digest_word0, id.config_digest_word1};
   auto consumer = dispatch.acquire_consumer(backend->execution, expectation);
   auto view = ActivationTransportBridge::view(consumer);
-  const auto dispatch_waves = use_gin
-                                  ? ActivationTransportBridge::wave_view(consumer)
-                                  : DispatchWaveKernelView{};
+  // Notify materializes the route permutation and destination M-tile map for
+  // every topology.  The split one-node transport consumes the same metadata
+  // as GIN Dispatch even though it has no RDMA waves of its own.
+  const bool split_local_metadata =
+      !use_gin && !use_socket && id.num_nodes == 1U &&
+      forward_tuning::kRdmaCtas == 0U;
+  const auto dispatch_waves =
+      use_gin || split_local_metadata
+          ? ActivationTransportBridge::wave_view(consumer)
+          : DispatchWaveKernelView{};
   if (weight.owned_experts != view.sizes.owned_expert_count)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                     "owned_experts", id.calling_rank,
@@ -15140,9 +15191,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     const bool remote_transport = use_gin || use_socket;
     const bool split_gin_roles =
         use_gin && view.identity.num_nodes == 2U &&
-        args.gin_context_count == persistent_v3::kRdmaCtaCount;
+        args.gin_context_count == persistent_v3::kRdmaCtaCount &&
+        forward_tuning::kRdmaCtas == persistent_v3::kRdmaCtaCount;
+    const bool split_local_roles =
+        !remote_transport && view.identity.num_nodes == 1U &&
+        forward_tuning::kRdmaCtas == 0U;
+    const bool split_forward_roles = split_gin_roles || split_local_roles;
     cudaError_t launch_forward = cudaSuccess;
-    if (split_gin_roles) {
+    if (split_forward_roles) {
       args.forward_relay_cta_count = forward_tuning::kRelayCtas;
       if constexpr (forward_tuning::kEnableLegacyEnvironment) {
         if (const auto *relay_ctas =
@@ -15150,15 +15206,27 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_relay_cta_count =
               static_cast<std::uint32_t>(std::stoul(relay_ctas));
       }
-      if (args.forward_relay_cta_count < persistent_v3::kRdmaCtaCount ||
-          args.forward_relay_cta_count % persistent_v3::kRdmaCtaCount != 0U ||
-          args.forward_relay_cta_count > 24U)
+      const bool valid_relay_count =
+          split_local_roles
+              ? args.forward_relay_cta_count >=
+                        std::max(4U, args.local_world_size) &&
+                    args.forward_relay_cta_count <= 32U &&
+                    (args.forward_relay_cta_count % 4U) == 0U
+              : args.forward_relay_cta_count >=
+                        persistent_v3::kRdmaCtaCount &&
+                    args.forward_relay_cta_count %
+                            persistent_v3::kRdmaCtaCount ==
+                        0U &&
+                    args.forward_relay_cta_count <= 24U;
+      if (!valid_relay_count)
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                         "MEGAMOE_FORWARD_RELAY_CTAS", id.calling_rank,
-                        "one of 8, 16, or 24",
+                        split_local_roles ? "one of 4, 8, ..., 32"
+                                          : "one of 8, 16, or 24",
                         std::to_string(args.forward_relay_cta_count));
       const unsigned int kTransportBlocks =
-          persistent_v3::kRdmaCtaCount + args.forward_relay_cta_count;
+          (split_gin_roles ? persistent_v3::kRdmaCtaCount : 0U) +
+          args.forward_relay_cta_count;
       if (grid_blocks <= kTransportBlocks)
         throw NotifyDispatchError(
             NotifyErrorCode::BackendUnavailable,
@@ -15167,6 +15235,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 std::to_string(kTransportBlocks) +
                 ", actual=" + std::to_string(grid_blocks));
       args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
+      args.forward_stream_local_dispatch = split_local_roles;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       if constexpr (forward_tuning::kEnableLegacyEnvironment)
         args.forward_relay_local_return =
@@ -15534,8 +15603,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           forward_tuning::kReduceCtaDivisor;
       internal::throw_cuda(
           "forward-run",
-          forward_transport_launch::set_max_dynamic_shared_memory(
-              static_cast<int>(forward_transport_smem)),
+          split_local_roles
+              ? forward_transport_launch::set_local_max_dynamic_shared_memory(
+                    static_cast<int>(forward_transport_smem))
+              : forward_transport_launch::set_max_dynamic_shared_memory(
+                    static_cast<int>(forward_transport_smem)),
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaFuncSetAttribute(split transport dynamic smem)");
@@ -15543,28 +15615,53 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 #if MEGAMOE_FWD_COMPILED_TUNING
 #if MEGAMOE_FWD_FC2_TMA_STORE
 #if MEGAMOE_FWD_CLUSTER_SIZE == 2
-      compute_attribute = cudaFuncSetAttribute(
-          local_p2p_forward_tma_store_kernel<
-              false, true, false, true, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(forward_compute_smem));
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<
+                true, true, false, true, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
+      else
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<
+                false, true, false, true, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
 #else
-      compute_attribute = cudaFuncSetAttribute(
-          local_p2p_forward_tma_store_kernel<
-              false, true, false, false, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(forward_compute_smem));
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<
+                true, true, false, false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
+      else
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_tma_store_kernel<
+                false, true, false, false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
 #endif
 #else
-      compute_attribute = cudaFuncSetAttribute(
-          local_p2p_forward_compute_kernel<
-              false, true, MEGAMOE_FWD_TILE_M == 64,
-              ForwardTaskPartition::All, true, false, false,
-              forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(forward_compute_smem));
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_compute_kernel<
+                true, true, MEGAMOE_FWD_TILE_M == 64,
+                ForwardTaskPartition::All, true, false, false,
+                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
+      else
+        compute_attribute = cudaFuncSetAttribute(
+            local_p2p_forward_compute_kernel<
+                false, true, MEGAMOE_FWD_TILE_M == 64,
+                ForwardTaskPartition::All, true, false, false,
+                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
 #endif
 #else
       if (forward_specialize_stages)
@@ -15712,13 +15809,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           dim3(forward_tuning::kComputeThreads, 1, 1);
       transport_launch.dynamicSmemBytes = forward_transport_smem;
       transport_launch.stream = slot.forward_transport_stream;
-      launch_forward = forward_transport_launch::launch(
-          &transport_launch, &args, sizeof(args), slot.forward_x_map,
-          slot.forward_s_map, weight.w1_map, weight.w2_map);
+      launch_forward =
+          split_local_roles
+              ? forward_transport_launch::launch_local(
+                    &transport_launch, &args, sizeof(args), slot.forward_x_map,
+                    slot.forward_s_map, weight.w1_map, weight.w2_map)
+              : forward_transport_launch::launch(
+                    &transport_launch, &args, sizeof(args), slot.forward_x_map,
+                    slot.forward_s_map, weight.w1_map, weight.w2_map);
       internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
                            id.world_size, backend->session.session().identity(),
                            id.generation, ExchangeKind::ExpertCounts,
-                           "persistent 8-RDMA/tunable-Relay Forward launch");
+                           split_local_roles
+                               ? "persistent 0-RDMA/tunable-Relay Forward launch"
+                               : "persistent 8-RDMA/tunable-Relay Forward launch");
       internal::throw_cuda("forward-run",
                            cudaEventRecord(slot.forward_transport_done,
                                            slot.forward_transport_stream),
@@ -15885,40 +15989,78 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
               ? slot.forward_staging_store_map
               : slot.forward_output_store_map;
 #if MEGAMOE_FWD_CLUSTER_SIZE == 2
-      launch_forward = cudaLaunchKernelEx(
-          &compute_launch,
-          local_p2p_forward_tma_store_kernel<
-              false, true, false, true, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-          weight.w2_map, output_store_map);
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<
+                true, true, false, true, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map, output_store_map);
+      else
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<
+                false, true, false, true, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map, output_store_map);
 #else
-      launch_forward = cudaLaunchKernelEx(
-          &compute_launch,
-          local_p2p_forward_tma_store_kernel<
-              false, true, false, false, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-          weight.w2_map, output_store_map);
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<
+                true, true, false, false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map, output_store_map);
+      else
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_tma_store_kernel<
+                false, true, false, false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map, output_store_map);
 #endif
 #elif MEGAMOE_FWD_TILE_M == 64
-      launch_forward = cudaLaunchKernelEx(
-          &compute_launch,
-          local_p2p_forward_compute_kernel<
-              false, true, true, ForwardTaskPartition::All, true, false,
-              false, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
-          weight.w1_map, weight.w2_map);
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<
+                true, true, true, ForwardTaskPartition::All, true, false,
+                false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
+            weight.w1_map, weight.w2_map);
+      else
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<
+                false, true, true, ForwardTaskPartition::All, true, false,
+                false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
+            weight.w1_map, weight.w2_map);
 #else
-      launch_forward = cudaLaunchKernelEx(
-          &compute_launch,
-          local_p2p_forward_compute_kernel<
-              false, true, false, ForwardTaskPartition::All, true, false,
-              false, forward_tuning::kFc1Stages,
-              forward_tuning::kFc2Stages>,
-          compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-          weight.w2_map);
+      if constexpr (forward_tuning::kRdmaCtas == 0U)
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<
+                true, true, false, ForwardTaskPartition::All, true, false,
+                false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map);
+      else
+        launch_forward = cudaLaunchKernelEx(
+            &compute_launch,
+            local_p2p_forward_compute_kernel<
+                false, true, false, ForwardTaskPartition::All, true, false,
+                false, forward_tuning::kFc1Stages,
+                forward_tuning::kFc2Stages>,
+            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
+            weight.w2_map);
 #endif
 #else
       if (forward_specialize_stages) {

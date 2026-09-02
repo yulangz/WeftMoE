@@ -1280,6 +1280,36 @@ __global__ void materialize_wave_sort_keys_kernel(
   a.sort_keys_in[position] = key;
 }
 
+// A one-node route has a bounded mixed-radix key, so the five stable packet
+// sorts can be represented by one exact key.  Multi-node keeps the existing
+// field-by-field implementation below; this specialization neither changes
+// its wire order nor enters its synchronization protocol.
+__global__ void materialize_one_node_wave_sort_keys_kernel(
+    DeviceMaterializeArgs a, const std::uint64_t *packet_indices) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.status->packet_count) {
+    if (position < a.routes)
+      a.sort_keys_in[position] = ~std::uint64_t{0};
+    return;
+  }
+  const auto packet = packet_indices[position];
+  auto expert = static_cast<std::uint64_t>(a.packet_primary_expert[packet]);
+  auto expert_domain = static_cast<std::uint64_t>(a.experts);
+  if (a.world == 8U) {
+    const auto local = a.rank_to_local[a.packet_primary_rank[packet]];
+    const auto priority = ((local & 1U) << 2U) | (local & 2U) |
+                          ((local & 4U) >> 2U);
+    expert += static_cast<std::uint64_t>(priority) * a.experts;
+    expert_domain *= 8ULL;
+  }
+  auto key = a.packet_primary_tile[packet];
+  key = key * expert_domain + expert;
+  key = key * a.world + a.packet_primary_rank[packet];
+  key = key * a.max_tokens + a.packet_headers[packet].local_token_id;
+  a.sort_keys_in[position] = key;
+}
+
 enum class LocalRouteSortField : std::uint32_t {
   Expert,
   MTile,
@@ -1369,6 +1399,18 @@ __global__ void materialize_local_route_sort_keys_kernel(
     key = a.route_dst_node[route] == local_node ? 0ULL : 1ULL;
   }
   a.sort_keys_in[position] = key;
+}
+
+__global__ void materialize_one_node_local_route_sort_keys_kernel(
+    DeviceMaterializeArgs a, const std::uint64_t *route_indices) {
+  const auto position = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  if (a.status->error != 0 || position >= a.routes)
+    return;
+  const auto route = route_indices[position];
+  a.sort_keys_in[position] =
+      static_cast<std::uint64_t>(a.route_dst_mtile[route]) * a.experts +
+      a.expert_id[route];
 }
 
 inline constexpr std::uint64_t kDispatchPrimaryTilesPerWave = 1;
@@ -3777,6 +3819,24 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
     materialize_packet_primary_kernel<<<
         blocks_for(plan.route_count, "wave_primary_grid"), threads, 0,
         exec->stream>>>(args);
+    const auto packed_one_node_wave_key_fits = [&] {
+      if (plan.num_nodes != 1U || plan.world_size == 0U ||
+          plan.max_tokens_per_rank == 0U)
+        return false;
+      const auto max_value = std::numeric_limits<std::uint64_t>::max();
+      auto key_space = plan.max_incoming_rows;
+      auto extend = [&](std::uint64_t radix) {
+        if (radix == 0U || key_space > (max_value - (radix - 1U)) / radix)
+          return false;
+        key_space = key_space * radix + radix - 1U;
+        return true;
+      };
+      const auto expert_radix =
+          static_cast<std::uint64_t>(plan.num_experts) *
+          (plan.world_size == 8U ? 8ULL : 1ULL);
+      return extend(expert_radix) && extend(plan.world_size) &&
+             extend(plan.max_tokens_per_rank);
+    }();
     const auto sort_pass = [&](WaveSortField field,
                                const std::uint64_t *indices_input,
                                std::uint64_t *indices_output) {
@@ -3815,16 +3875,33 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
           context.session().generation(), ExchangeKind::ExpertCounts,
           "wave cub::DeviceRadixSort::SortPairs");
     };
-    sort_pass(WaveSortField::Token, args.sort_indices_in,
-              args.sort_indices_out);
-    sort_pass(WaveSortField::DestinationRank, args.sort_indices_out,
-              args.sort_indices_in);
-    sort_pass(WaveSortField::Expert, args.sort_indices_in,
-              args.sort_indices_out);
-    sort_pass(WaveSortField::MTile, args.sort_indices_out,
-              args.sort_indices_in);
-    sort_pass(WaveSortField::DestinationNode, args.sort_indices_in,
-              args.sort_indices_out);
+    if (packed_one_node_wave_key_fits) {
+      materialize_one_node_wave_sort_keys_kernel<<<
+          blocks_for(plan.route_count, "wave_sort_grid"), threads, 0,
+          exec->stream>>>(args, args.sort_indices_in);
+      auto sort_bytes = checked_size(state->plan.sort_temp_bytes,
+                                     "wave_sort_temp_bytes");
+      internal::throw_cuda(
+          "device-materialize",
+          cub::DeviceRadixSort::SortPairs(
+              at<void>(base, dl.temp), sort_bytes, args.sort_keys_in,
+              args.sort_keys_out, args.sort_indices_in, args.sort_indices_out,
+              static_cast<int>(plan.route_count), 0, 64, exec->stream),
+          rank, context.session().world_size(), context.session().identity(),
+          context.session().generation(), ExchangeKind::ExpertCounts,
+          "one-node wave cub::DeviceRadixSort::SortPairs");
+    } else {
+      sort_pass(WaveSortField::Token, args.sort_indices_in,
+                args.sort_indices_out);
+      sort_pass(WaveSortField::DestinationRank, args.sort_indices_out,
+                args.sort_indices_in);
+      sort_pass(WaveSortField::Expert, args.sort_indices_in,
+                args.sort_indices_out);
+      sort_pass(WaveSortField::MTile, args.sort_indices_out,
+                args.sort_indices_in);
+      sort_pass(WaveSortField::DestinationNode, args.sort_indices_in,
+                args.sort_indices_out);
+    }
     materialize_wave_flags_kernel<<<
         blocks_for(plan.route_count, "wave_flag_grid"), threads, 0,
         exec->stream>>>(args);
@@ -3880,12 +3957,30 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
           context.session().generation(), ExchangeKind::ExpertCounts,
           "local route cub::DeviceRadixSort::SortPairs");
     };
-    local_route_sort_pass(LocalRouteSortField::Expert,
-                          args.sort_indices_in, args.local_route_order);
-    local_route_sort_pass(LocalRouteSortField::MTile,
-                          args.local_route_order, args.sort_indices_in);
-    local_route_sort_pass(LocalRouteSortField::Locality,
-                          args.sort_indices_in, args.local_route_order);
+    if (plan.num_nodes == 1U) {
+      materialize_one_node_local_route_sort_keys_kernel<<<
+          blocks_for(plan.route_count, "local_route_sort_grid"), threads, 0,
+          exec->stream>>>(args, args.sort_indices_in);
+      auto sort_bytes = checked_size(state->plan.sort_temp_bytes,
+                                     "local_route_sort_temp_bytes");
+      internal::throw_cuda(
+          "device-materialize",
+          cub::DeviceRadixSort::SortPairs(
+              at<void>(base, dl.temp), sort_bytes, args.sort_keys_in,
+              args.sort_keys_out, args.sort_indices_in,
+              args.local_route_order, static_cast<int>(plan.route_count), 0,
+              64, exec->stream),
+          rank, context.session().world_size(), context.session().identity(),
+          context.session().generation(), ExchangeKind::ExpertCounts,
+          "one-node local route cub::DeviceRadixSort::SortPairs");
+    } else {
+      local_route_sort_pass(LocalRouteSortField::Expert,
+                            args.sort_indices_in, args.local_route_order);
+      local_route_sort_pass(LocalRouteSortField::MTile,
+                            args.local_route_order, args.sort_indices_in);
+      local_route_sort_pass(LocalRouteSortField::Locality,
+                            args.sort_indices_in, args.local_route_order);
+    }
 
     // Build the immutable Return wire order only after the Dispatch and local
     // delivery permutations have been materialized into their final buffers.

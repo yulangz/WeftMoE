@@ -318,8 +318,20 @@ static_assert(kWgmmaWaitGroup <= 1U);
 static_assert(kFc2StoreAtomN == 64U);
 static_assert(!kFc2TmaStore || kTileM == 128U);
 static_assert(kClusterSize == 1U || kClusterSize == 2U);
-static_assert(kRdmaCtas > 0U && kRelayCtas >= kRdmaCtas &&
-              kRelayCtas % kRdmaCtas == 0U);
+// GIN owns eight physical contexts.  A one-node specialization has no RDMA
+// role at all and may tune Relay independently; multi-node keeps Relay in
+// whole context-sized groups.
+constexpr bool valid_transport_role_counts() {
+  if constexpr (kRdmaCtas == 0U)
+    return kRelayCtas > 0U;
+  else
+    return kRdmaCtas == 8U && kRelayCtas >= kRdmaCtas &&
+           kRelayCtas % (kRdmaCtas == 0U ? 1U : kRdmaCtas) == 0U;
+}
+static_assert(valid_transport_role_counts());
+static_assert(kRdmaCtas != 0U ||
+              kLocalDispatchTmaWarps < kComputeThreads / 32U,
+              "local split Relay reserves one warp for FC1-ready publication");
 static_assert(kRdmaControlWarps >= 2U &&
               kRdmaControlWarps < kComputeThreads / 32U);
 static_assert(kRelayTmaWarps <= kComputeThreads / 32U);

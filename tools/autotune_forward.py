@@ -214,13 +214,19 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require(config["fc2_tma_store"],
                  "cluster_size=2 requires the paired FC2 TMA-store kernel")
 
-    # RDMA is an explicit singleton for this 8-rail topology; Relay remains a
-    # narrow performance axis.
-    _require(config["rdma_ctas"] == 8,
-             "the current two-host topology contract requires rdma_ctas=8")
-    _require_choice(config, "relay_ctas", (8, 16, 24))
-    _require(config["relay_ctas"] % config["rdma_ctas"] == 0,
-             "relay_ctas must be a multiple of rdma_ctas")
+    # Two-host GIN owns eight physical contexts. One-node NVLink has no RDMA
+    # owner and tunes Relay independently in small four-CTA increments.
+    _require_choice(config, "rdma_ctas", (0, 8))
+    if config["rdma_ctas"] == 0:
+        _require_choice(config, "relay_ctas",
+                        (4, 8, 12, 16, 20, 24, 28, 32))
+        _require(config["local_dispatch_tma_warps"] <
+                 config["compute_threads"] // 32,
+                 "local split Relay reserves one FC1-ready publisher warp")
+    else:
+        _require_choice(config, "relay_ctas", (8, 16, 24))
+        _require(config["relay_ctas"] % config["rdma_ctas"] == 0,
+                 "relay_ctas must be a multiple of rdma_ctas")
     _require(config["rdma_control_warps"] == 2,
              "the current RDMA protocol has exactly issue and completion warps")
     _require_choice(config, "relay_tma_warps", (0, 4, 8, 12))
@@ -278,10 +284,10 @@ def load_plan(path: Path) -> dict[str, Any]:
     _require(isinstance(document["benchmark"], dict),
              "benchmark must be an object")
     benchmark = document["benchmark"]
-    for key in (
-        "remote",
-        "port",
-        "gpus_per_node",
+    launcher = benchmark.get("launcher", "multinode")
+    _require(launcher in ("multinode", "local"),
+             "benchmark.launcher must be multinode or local")
+    common_benchmark_keys = (
         "seed",
         "tokens_per_rank",
         "top_k",
@@ -292,11 +298,15 @@ def load_plan(path: Path) -> dict[str, Any]:
         "timeout_seconds",
         "selection_metric",
         "result_dir",
-    ):
+    )
+    for key in common_benchmark_keys:
         _require(key in benchmark, f"benchmark omits {key}")
+    if launcher == "multinode":
+        for key in ("remote", "port", "gpus_per_node"):
+            _require(key in benchmark, f"benchmark omits {key}")
+    else:
+        _require("world" in benchmark, "local benchmark omits world")
     for key in (
-        "port",
-        "gpus_per_node",
         "seed",
         "tokens_per_rank",
         "top_k",
@@ -307,6 +317,14 @@ def load_plan(path: Path) -> dict[str, Any]:
     ):
         _require(type(benchmark[key]) is int and benchmark[key] > 0,
                  f"benchmark.{key} must be a positive integer")
+    topology_integer_keys = (("port", "gpus_per_node")
+                             if launcher == "multinode" else ("world",))
+    for key in topology_integer_keys:
+        _require(type(benchmark[key]) is int and benchmark[key] > 0,
+                 f"benchmark.{key} must be a positive integer")
+    if launcher == "local":
+        _require(benchmark["world"] in (1, 2, 8),
+                 "local benchmark.world must be 1, 2, or 8")
     _require(type(benchmark["fc1_output_cache"]) is bool,
              "benchmark.fc1_output_cache must be true or false")
     _require(benchmark["top_k"] in (1, 6),
@@ -548,6 +566,19 @@ def compile_candidate(candidate: Mapping[str, Any], paths: Mapping[str, Path],
 
 def launcher_command(binary: Path, benchmark: Mapping[str, Any],
                      *, rounds: int) -> list[str]:
+    if benchmark.get("launcher", "multinode") == "local":
+        return [
+            sys.executable,
+            str(REPO_ROOT / "tests" / "run_local_activation_p2p.py"),
+            "--binary", str(binary),
+            "--world", str(int(benchmark["world"])),
+            "--seed", str(int(benchmark["seed"])),
+            "--timeout", str(int(benchmark["timeout_seconds"])),
+            "--rounds", str(rounds),
+            "--forward-benchmark",
+            "--top-k", str(int(benchmark["top_k"])),
+            "--gate-mode", str(benchmark.get("gate_mode", "fixed-random")),
+        ]
     command = [
         sys.executable,
         str(REPO_ROOT / "tests" / "run_multinode_nccl.py"),
@@ -577,15 +608,19 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any],
     return command
 
 
-def extract_benchmark_json(output: str) -> dict[str, Any]:
-    prefix = "GIN_BENCH_JSON "
+def extract_benchmark_json(output: str,
+                           benchmark: Mapping[str, Any]) -> dict[str, Any]:
+    local = benchmark.get("launcher", "multinode") == "local"
+    prefix = "FORWARD_BENCH_JSON " if local else "GIN_BENCH_JSON "
     payloads = [line[len(prefix):] for line in output.splitlines()
                 if line.startswith(prefix)]
     if len(payloads) != 1:
         raise RuntimeError(
-            f"launcher emitted {len(payloads)} GIN_BENCH_JSON records")
+            f"launcher emitted {len(payloads)} {prefix.strip()} records")
     result = json.loads(payloads[0])
-    if result.get("benchmark") != "multinode-gin-forward-main-shape":
+    expected = ("single-persistent-forward-main-shape" if local else
+                "multinode-gin-forward-main-shape")
+    if result.get("benchmark") != expected:
         raise RuntimeError(f"unexpected benchmark record: {result.get('benchmark')}")
     return result
 
@@ -604,6 +639,17 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
         int(benchmark["generation_base"]))
     if benchmark["fc1_output_cache"]:
         run_environment["MEGAMOE_FORWARD_CACHE"] = "1"
+    if benchmark.get("launcher", "multinode") == "local":
+        nccl_lib_dir = benchmark.get("nccl_lib_dir")
+        if nccl_lib_dir:
+            prior = run_environment.get("LD_LIBRARY_PATH", "")
+            run_environment["LD_LIBRARY_PATH"] = (
+                str(nccl_lib_dir) + ((":" + prior) if prior else ""))
+        if benchmark.get("socket_ifname"):
+            run_environment["NCCL_SOCKET_IFNAME"] = str(
+                benchmark["socket_ifname"])
+        if benchmark.get("disable_ib", True):
+            run_environment["NCCL_IB_DISABLE"] = "1"
     log_path = log_dir / f"{candidate['name']}.{suffix}.log"
     start = time.monotonic()
     try:
@@ -629,7 +675,7 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     parse_error = None
     if returncode == 0:
         try:
-            record = extract_benchmark_json(output)
+            record = extract_benchmark_json(output, benchmark)
         except (RuntimeError, json.JSONDecodeError) as error:
             parse_error = str(error)
     return {

@@ -99,10 +99,12 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
       fragment.epoch);
   published.store(a.epoch, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
-  auto *completion =
-      static_cast<transport_state::GenerationCompletionVector *>(
-          a.peer_bases[a.world]);
-  atomicMax(&completion->bulk_local_ready, 1001ULL + slot);
+  if (a.use_gin) {
+    auto *completion =
+        static_cast<transport_state::GenerationCompletionVector *>(
+            a.peer_bases[a.world]);
+    atomicMax(&completion->bulk_local_ready, 1001ULL + slot);
+  }
 #endif
 }
 
@@ -122,10 +124,12 @@ __device__ __noinline__ void issue_direct_full_mblock(
   const auto completed =
       done.fetch_add(1ULL, ::cuda::memory_order_release) + 1ULL;
 #if MEGAMOE_DEBUG_VALIDATE
-  auto *completion =
-      static_cast<transport_state::GenerationCompletionVector *>(
-          a.peer_bases[a.world]);
-  atomicMax(&completion->progress_ctas_at_bulk_return, 1000ULL + completed);
+  if (a.use_gin) {
+    auto *completion =
+        static_cast<transport_state::GenerationCompletionVector *>(
+            a.peer_bases[a.world]);
+    atomicMax(&completion->progress_ctas_at_bulk_return, 1000ULL + completed);
+  }
 #endif
 }
 
@@ -487,6 +491,13 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
     __syncthreads();
 
     if (threadIdx.x == 0U && state.copied_rows != 0U) {
+      if (a.forward_stream_local_dispatch && local_source != a.rank) {
+        auto *status =
+            peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+        atomicAdd(&status->actual_return_peer_bytes,
+                  static_cast<unsigned long long>(state.copied_rows) *
+                      a.hidden * sizeof(transport::BFloat16));
+      }
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           completed(scheduler[4U + local_source]);
       const auto old = completed.fetch_add(state.copied_rows,

@@ -195,18 +195,16 @@ __device__ __forceinline__ bool try_claim_fc1_task(
   }
 
   auto selected = partition_begin + slot;
-  if constexpr (!StaticLocal) {
-    if (a.use_gin) {
-      auto *ready_queue = claims + forward_mblocks;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          published(ready_queue[partition_begin + slot]);
-      const auto encoded = published.load(::cuda::memory_order_acquire);
-      if (encoded == 0ULL) {
-        exhausted = false;
-        return false;
-      }
-      selected = encoded - 1ULL;
+  if (a.use_gin || a.forward_stream_local_dispatch) {
+    auto *ready_queue = claims + forward_mblocks;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        published(ready_queue[partition_begin + slot]);
+    const auto encoded = published.load(::cuda::memory_order_acquire);
+    if (encoded == 0ULL) {
+      exhausted = false;
+      return false;
     }
+    selected = encoded - 1ULL;
   }
 
   if (!cursor.compare_exchange_strong(slot, slot + 1ULL,
@@ -268,22 +266,20 @@ __device__ __forceinline__ bool try_claim_fc1_task_pair(
 
   auto selected0 = partition_begin + slot;
   auto selected1 = selected0 + 1ULL;
-  if constexpr (!StaticLocal) {
-    if (a.use_gin) {
-      auto *ready_queue = claims + forward_mblocks;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          published0(ready_queue[partition_begin + slot]);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          published1(ready_queue[partition_begin + slot + 1ULL]);
-      const auto encoded0 = published0.load(::cuda::memory_order_acquire);
-      const auto encoded1 = published1.load(::cuda::memory_order_acquire);
-      if (encoded0 == 0ULL || encoded1 == 0ULL) {
-        exhausted = false;
-        return false;
-      }
-      selected0 = encoded0 - 1ULL;
-      selected1 = encoded1 - 1ULL;
+  if (a.use_gin || a.forward_stream_local_dispatch) {
+    auto *ready_queue = claims + forward_mblocks;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        published0(ready_queue[partition_begin + slot]);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+        published1(ready_queue[partition_begin + slot + 1ULL]);
+    const auto encoded0 = published0.load(::cuda::memory_order_acquire);
+    const auto encoded1 = published1.load(::cuda::memory_order_acquire);
+    if (encoded0 == 0ULL || encoded1 == 0ULL) {
+      exhausted = false;
+      return false;
     }
+    selected0 = encoded0 - 1ULL;
+    selected1 = encoded1 - 1ULL;
   }
 
   if (!cursor.compare_exchange_strong(slot, slot + 2ULL,
@@ -1435,6 +1431,17 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
                                       Compute, 0U, mblock, a.epoch);
             }
+          } else if (a.forward_stream_local_dispatch &&
+                     a.forward_relay_local_return) {
+            // One-node split Forward uses the identical immutable M-block
+            // directory, but only its node-local context mask is consumed.
+            // The compute CTA returns to the FC2-priority queue immediately;
+            // permanent Relay CTAs own all peer copies and readiness stores.
+            forward_return_detail::issue_direct_full_mblock(
+                a, scheduler, row, valid_rows,
+                *return_context_masks_shared);
+            MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
+                                    Compute, 0U, mblock, a.epoch);
           }
         }
         cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
@@ -1443,8 +1450,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         // descriptor as RDMA and own all node-local NVLink Return work.  Keep
         // this compatibility copy only for the non-GIN local P2P path; a math
         // CTA must become schedulable again immediately after publication.
-        if (!a.use_socket &&
-            (!a.use_gin || !a.forward_relay_local_return)) {
+        const bool split_relay_return =
+            (a.use_gin || a.forward_stream_local_dispatch) &&
+            a.forward_relay_local_return;
+        if (!a.use_socket && !split_relay_return) {
           for (std::uint32_t source = threadIdx.x; source < a.world;
                source += kMathThreads)
             return_rows_by_source[source] = 0U;

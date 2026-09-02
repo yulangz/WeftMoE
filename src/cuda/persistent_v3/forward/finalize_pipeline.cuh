@@ -20,6 +20,75 @@ __device__ __forceinline__ bool wait_for_count(
   return true;
 }
 
+// One-node split Forward has Relay and Compute in independent grids, but no
+// RDMA/completion-vector roles.  Relay CTA 0 performs the same fixed terminal
+// agreement only after every local Return owner and every Reduce role has
+// released its counter.  No grid-wide barrier is introduced, and the GIN
+// finalizer below remains unchanged.
+__device__ __forceinline__ void local_split_transport_finalize(
+    const ForwardKernelArgs &a,
+    persistent_v3::ForwardPipelineControl &control,
+    unsigned long long *scheduler, TransportDeviceStatus *status) {
+  if (threadIdx.x == 0U)
+    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+        control.rdma_return_roles_complete.value, 1ULL);
+  __syncthreads();
+  if (blockIdx.x != 0U)
+    return;
+
+  if (threadIdx.x == 0U) {
+    wait_for_count(a, control.rdma_return_roles_complete,
+                   a.forward_relay_cta_count);
+    status->return_complete_clock = device_globaltimer_ns();
+    wait_for_count(a, control.compute_reduce_roles_complete,
+                   a.forward_reduce_cta_count);
+    forward_publish_progress(a, kForwardReturnObserved, scheduler[3]);
+    forward_publish_progress(a, kForwardReduceComplete,
+                             a.dispatch.identity.num_tokens);
+    if (a.injected_status_error_rank == static_cast<int>(a.rank))
+      publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
+  }
+  __syncthreads();
+
+  publish_production_terminal_status<true>(
+      a, status, ProductionStatusPhase::Forward,
+      a.production_error_records_offset,
+      a.gin_production_error_records_offset, 0ULL);
+  __syncthreads();
+
+  if (threadIdx.x == 0U) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+    const auto mblocks = scheduler[3];
+    const auto fc1_ntiles =
+        (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+        forward_tuning::kFc1TileN;
+    const auto fc2_ntiles =
+        (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
+        forward_tuning::kFc2TileN;
+    const auto fc1_tasks = mblocks * fc1_ntiles;
+    const auto fc2_tasks = mblocks * fc2_ntiles;
+    const auto fc1_k_blocks =
+        (a.hidden + forward_tuning::kTileK - 1ULL) /
+        forward_tuning::kTileK;
+    const auto fc2_k_blocks =
+        (a.intermediate + forward_tuning::kTileK - 1ULL) /
+        forward_tuning::kTileK;
+    status->fc1_tasks_done = fc1_tasks;
+    status->fc2_tasks_done = fc2_tasks;
+    status->tma_loads = fc1_tasks * 2ULL * fc1_k_blocks * 2ULL +
+                        fc2_tasks * fc2_k_blocks * 2ULL;
+    status->wgmma_instructions =
+        fc1_tasks * 2ULL * fc1_k_blocks * 2ULL *
+            (forward_tuning::kTileK / TunedForwardFc1Mma::K) +
+        fc2_tasks * fc2_k_blocks * 2ULL *
+            (forward_tuning::kTileK / TunedForwardFc2Mma::K);
+#endif
+    status->complete_clock = device_globaltimer_ns();
+  }
+  forward_publish_progress(a, kForwardTerminal, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+}
+
 template <bool StaticLocal>
 __device__ __forceinline__ void split_transport_finalize(
     const ForwardKernelArgs &a,

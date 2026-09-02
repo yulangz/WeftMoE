@@ -20,7 +20,11 @@ namespace megamoe::cuda::persistent_v3 {
 // The final block of every expert is physically padded, not merely predicated,
 // so dW can traverse a uniform, deterministic K extent in 64-row WGMMA steps.
 inline constexpr std::uint32_t kMBlockRows = 128U;
-inline constexpr std::uint32_t kRdmaCtaCount = forward_tuning::kRdmaCtas;
+// Wire/context cardinality, not a launch-policy knob.  A two-node H200 job has
+// eight physical GIN contexts; a one-node specialization launches zero RDMA
+// workers but must not turn protocol divisions (also reused by Backward) into
+// divisions by zero.
+inline constexpr std::uint32_t kRdmaCtaCount = 8U;
 // Backward and the generic persistent-v3 entry retain their fixed eight-CTA
 // relay contract. Forward carries its independently tuned relay count in
 // ForwardKernelArgs and must not silently alter Backward's role layout.
