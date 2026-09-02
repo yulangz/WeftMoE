@@ -1329,9 +1329,9 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
 
 #if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
 
-// One-node Forward has no GIN context owner.  Each Relay CTA gives its first
+// One-node Forward has no GIN context owner. Each Relay CTA gives up to
 // kLocalDispatchTmaWarps warps independent row-sized TMA streams and reserves
-// the final warp's leader for destination-local FC1 queue publication.  The
+// the final warp's leader for destination-local FC1 queue publication. The
 // two roles do not rendezvous until both their complete finite workspaces have
 // drained, so incoming NVLink rows can release FC1 while this CTA is still
 // sending later rows to its peers.
@@ -1340,11 +1340,17 @@ __device__ __forceinline__ void local_relay_role(
     persistent_v3::ForwardPipelineControl &control,
     std::uint32_t relay_ordinal, unsigned long long *scheduler,
     unsigned char *storage) {
-  constexpr std::uint32_t kCopyWarps =
-      forward_tuning::kLocalDispatchTmaWarps;
   constexpr std::uint32_t kPhysicalWarps =
       forward_tuning::kComputeThreads / 32U;
   constexpr std::uint32_t kPublisherWarp = kPhysicalWarps - 1U;
+  // The source default is the two-node production point and may use every
+  // warp for rail-local Dispatch. A one-node launch has no RDMA owner, so it
+  // must retain one publisher warp even when run without a world-8 generated
+  // tuning header.
+  constexpr std::uint32_t kCopyWarps =
+      forward_tuning::kLocalDispatchTmaWarps < kPublisherWarp
+          ? forward_tuning::kLocalDispatchTmaWarps
+          : kPublisherWarp;
   constexpr std::uint32_t kCopyThreads = kCopyWarps * 32U;
   constexpr std::uint64_t kPublishBatchRows =
       forward_tuning::kDispatchPublishBatchRows;

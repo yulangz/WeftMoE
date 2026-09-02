@@ -51,7 +51,7 @@
       "relay_ctas": 16,
       "rdma_control_warps": 2,
       "relay_tma_warps": 0,
-      "local_dispatch_tma_warps": 8,
+      "local_dispatch_tma_warps": 4,
       "relay_scatter_warps": 12,
       "local_return_batch_mblocks": 4,
       "dispatch_publish_batch_rows": 32,
@@ -88,25 +88,25 @@
   "candidates": [
     {
       "name": "world8_relay16_tma4",
-      "description": "Sixteen Relay CTAs use four row-sized TMA streams and leave seven warps free while the publisher polls readiness.",
-      "override": {
-        "2_transport": {
-          "relay_ctas": 16,
-          "local_dispatch_tma_warps": 4
-        }
-      }
+      "description": "Current single-node production point: sixteen Relay CTAs and four row-sized TMA streams.",
+      "override": {}
     },
     {
       "name": "world8_relay16_tma8",
       "description": "Validated sixteen-Relay, eight-stream TMA reference point.",
-      "override": {}
+      "override": {
+        "2_transport": {
+          "local_dispatch_tma_warps": 8
+        }
+      }
     },
     {
       "name": "world8_relay24_tma8",
       "description": "Twenty-four Relay CTAs trade eight compute SMs for more concurrent TMA/NVLink streams.",
       "override": {
         "2_transport": {
-          "relay_ctas": 24
+          "relay_ctas": 24,
+          "local_dispatch_tma_warps": 8
         }
       }
     },
@@ -115,7 +115,8 @@
       "description": "Thirty-two Relay CTAs test the upper TMA/NVLink concurrency point with 100 compute SMs.",
       "override": {
         "2_transport": {
-          "relay_ctas": 32
+          "relay_ctas": 32,
+          "local_dispatch_tma_warps": 8
         }
       }
     }

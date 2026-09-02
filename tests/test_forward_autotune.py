@@ -27,6 +27,16 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(set(candidate["config"]),
                              set(tune.PARAMETER_MACROS))
 
+    def test_world8_plan_is_narrow_and_unique(self):
+        plan = tune.load_plan(
+            ROOT / "configs" / "forward_h200_world8_autotune.json")
+        candidates = tune.expand_candidates(plan)
+        self.assertEqual(len(candidates), 4)
+        selected = candidates[0]["config"]
+        self.assertEqual(selected["rdma_ctas"], 0)
+        self.assertEqual(selected["relay_ctas"], 16)
+        self.assertEqual(selected["local_dispatch_tma_warps"], 4)
+
     def test_benchmark_workload_is_explicit(self):
         benchmark = self.plan["benchmark"]
         self.assertEqual(benchmark["seed"], 0x4D554C54)
