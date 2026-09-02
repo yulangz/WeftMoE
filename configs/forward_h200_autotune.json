@@ -52,7 +52,7 @@
       "relay_ctas": 8,
       "rdma_control_warps": 2,
       "relay_tma_warps": 8,
-      "local_dispatch_tma_warps": 12,
+      "local_dispatch_tma_warps": 8,
       "relay_scatter_warps": 12,
       "local_return_batch_mblocks": 4,
       "dispatch_publish_batch_rows": 32,
@@ -130,11 +130,11 @@
       }
     },
     {
-      "name": "dispatch_tma8",
-      "description": "Use eight rather than twelve local dispatch TMA streams to reduce transport-side contention.",
+      "name": "dispatch_tma12",
+      "description": "Restore twelve local dispatch TMA streams as a control for the tuned eight-stream production point.",
       "override": {
         "2_transport": {
-          "local_dispatch_tma_warps": 8
+          "local_dispatch_tma_warps": 12
         }
       }
     },
