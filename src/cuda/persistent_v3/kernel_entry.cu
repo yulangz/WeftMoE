@@ -8,14 +8,11 @@
 #include <string>
 
 #include "cuda/persistent_v3/roles/compute_role.cuh"
-#include "cuda/persistent_v3/roles/rdma_role.cuh"
-#include "cuda/persistent_v3/roles/relay_role.cuh"
 #include "cuda/persistent_v3/shared_storage.cuh"
 
 namespace megamoe::cuda::persistent_v3 {
 namespace {
 
-inline constexpr std::uint32_t kProbeQueueCapacity = 16U;
 inline constexpr std::uint32_t kProbeMaxTasksPerContext = 128U;
 inline constexpr std::uint32_t kProbeMaxTasks =
     kRdmaCtaCount * kProbeMaxTasksPerContext;
@@ -23,8 +20,11 @@ inline constexpr unsigned long long kProbeEpoch = 17ULL;
 
 struct alignas(128) ProtocolProbeWorkspace {
   GenerationState generation;
-  SpscRing<PipelineTask, kProbeQueueCapacity> rdma_to_relay[kRdmaCtaCount];
-  SpscRing<PipelineTask, kProbeQueueCapacity> relay_to_rdma[kRdmaCtaCount];
+  // The probe mirrors the production fixed-address handoff.  Every dispatch
+  // task and return completion has a generation-static slot; monotonic
+  // per-context prefixes publish those slots without a ring or ticket wrap.
+  PipelineTask dispatch_slots[kProbeMaxTasks];
+  PipelineTask return_slots[kRdmaCtaCount];
   ScoreboardTask tasks[kProbeMaxTasks];
   PaddedCounter compute_scan_cursor;
   PaddedCounter compute_completed;
@@ -49,18 +49,6 @@ probe_output_value(unsigned long long input, std::uint32_t global_task) {
          static_cast<unsigned long long>(global_task + 1U) * 128ULL;
 }
 
-__global__ void initialize_protocol_probe_kernel(ProtocolProbeWorkspace *work) {
-  const auto global_thread = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto global_threads = gridDim.x * blockDim.x;
-  for (std::uint32_t context = 0; context < kRdmaCtaCount; ++context) {
-    for (std::uint32_t slot = global_thread; slot < kProbeQueueCapacity;
-         slot += global_threads) {
-      work->rdma_to_relay[context].slots[slot].sequence = slot;
-      work->relay_to_rdma[context].slots[slot].sequence = slot;
-    }
-  }
-}
-
 MEGAMOE_V3_DEVICE inline void run_protocol_rdma_role(
     ProtocolProbeWorkspace &work, std::uint32_t context,
     std::uint32_t tasks_per_context) {
@@ -75,17 +63,19 @@ MEGAMOE_V3_DEVICE inline void run_protocol_rdma_role(
       task.context = static_cast<std::uint8_t>(context);
       task.row_begin = local_task * kMBlockRows;
       task.row_count = kMBlockRows;
-      if (!rdma_publish_to_relay(work.rdma_to_relay[context], work.generation,
-                                 task))
-        break;
-      fetch_add_release<::cuda::thread_scope_device>(
-          work.generation.contexts[context].rx_published.value, 1ULL);
+      work.dispatch_slots[global_task] = task;
+      store_release<::cuda::thread_scope_device>(
+          work.generation.contexts[context].rx_published.value,
+          static_cast<unsigned long long>(local_task + 1U));
     }
 
-    PipelineTask completion{};
-    if (!generation_cancelled(work.generation, kProbeEpoch) &&
-        rdma_consume_from_relay(work.relay_to_rdma[context], work.generation,
-                                kProbeEpoch, completion)) {
+    while (!generation_cancelled(work.generation, kProbeEpoch) &&
+           load_acquire<::cuda::thread_scope_device>(
+               work.generation.contexts[context].tx_published.value) < 1ULL) {
+      __nanosleep(64U);
+    }
+    if (!generation_cancelled(work.generation, kProbeEpoch)) {
+      const auto completion = work.return_slots[context];
       if (completion.epoch != kProbeEpoch ||
           completion.context != context ||
           completion.index != tasks_per_context) {
@@ -108,11 +98,16 @@ MEGAMOE_V3_DEVICE inline void run_protocol_relay_role(
   if (threadIdx.x == 0U) {
     for (std::uint32_t local_task = 0; local_task < tasks_per_context;
          ++local_task) {
-      PipelineTask task{};
-      if (!relay_consume_from_rdma(work.rdma_to_relay[context],
-                                   work.generation, kProbeEpoch, task))
+      while (!generation_cancelled(work.generation, kProbeEpoch) &&
+             load_acquire<::cuda::thread_scope_device>(
+                 work.generation.contexts[context].rx_published.value) <
+                 static_cast<unsigned long long>(local_task + 1U)) {
+        __nanosleep(64U);
+      }
+      if (generation_cancelled(work.generation, kProbeEpoch))
         break;
       const auto expected_index = context * tasks_per_context + local_task;
+      const auto task = work.dispatch_slots[expected_index];
       if (task.epoch != kProbeEpoch || task.context != context ||
           task.index != expected_index || task.row_count != kMBlockRows) {
         publish_error_once(work.generation, 201ULL);
@@ -122,8 +117,9 @@ MEGAMOE_V3_DEVICE inline void run_protocol_relay_role(
       record.input = probe_input_value(context, local_task, task.index);
       record.context = context;
       publish_ready(record, kProbeEpoch);
-      fetch_add_release<::cuda::thread_scope_device>(
-          work.generation.contexts[context].rx_consumed.value, 1ULL);
+      store_release<::cuda::thread_scope_device>(
+          work.generation.contexts[context].rx_consumed.value,
+          static_cast<unsigned long long>(local_task + 1U));
       fetch_add_release<::cuda::thread_scope_device>(
           work.generation.pipeline
               .completed[static_cast<std::uint32_t>(TaskKind::DispatchRelay)]
@@ -160,16 +156,14 @@ MEGAMOE_V3_DEVICE inline void run_protocol_relay_role(
       completion.index = tasks_per_context;
       completion.kind = static_cast<std::uint8_t>(TaskKind::ReturnRelay);
       completion.context = static_cast<std::uint8_t>(context);
-      if (relay_publish_to_rdma(work.relay_to_rdma[context], work.generation,
-                                completion)) {
-        fetch_add_release<::cuda::thread_scope_device>(
-            work.generation.contexts[context].tx_published.value, 1ULL);
-        fetch_add_release<::cuda::thread_scope_device>(
-            work.generation.pipeline
-                .completed[static_cast<std::uint32_t>(TaskKind::ReturnRelay)]
-                .value,
-            1ULL);
-      }
+      work.return_slots[context] = completion;
+      store_release<::cuda::thread_scope_device>(
+          work.generation.contexts[context].tx_published.value, 1ULL);
+      fetch_add_release<::cuda::thread_scope_device>(
+          work.generation.pipeline
+              .completed[static_cast<std::uint32_t>(TaskKind::ReturnRelay)]
+              .value,
+          1ULL);
     }
     fetch_add_release<::cuda::thread_scope_device>(
         work.relay_roles_completed.value, 1ULL);
@@ -198,10 +192,7 @@ MEGAMOE_V3_DEVICE inline bool protocol_probe_terminal_ready(
         load_acquire<::cuda::thread_scope_device>(
             work.generation.contexts[context].tx_published.value) != 1ULL ||
         load_acquire<::cuda::thread_scope_device>(
-            work.generation.contexts[context].tx_local_complete.value) !=
-            1ULL ||
-        !ring_drained(work.rdma_to_relay[context]) ||
-        !ring_drained(work.relay_to_rdma[context]))
+            work.generation.contexts[context].tx_local_complete.value) != 1ULL)
       return false;
   }
   return true;
@@ -347,8 +338,6 @@ run_persistent_v3_protocol_probe(std::uint32_t tasks_per_context) {
   throw_cuda_error(cudaMemset(raw_workspace, 0, sizeof(ProtocolProbeWorkspace)),
                    "cudaMemset(V3 protocol probe)");
 
-  initialize_protocol_probe_kernel<<<1, 256>>>(raw_workspace);
-  throw_cuda_error(cudaGetLastError(), "initialize V3 protocol probe launch");
   persistent_v3_protocol_probe_kernel<<<roles.total_ctas, kThreadsPerCta>>>(
       raw_workspace, tasks_per_context, roles);
   throw_cuda_error(cudaGetLastError(), "persistent V3 protocol probe launch");

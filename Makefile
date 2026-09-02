@@ -172,8 +172,6 @@ $(BUILD_DIR)/production/src/cuda/persistent_v3/kernel_entry.o: \
 	src/cuda/persistent_v3/shared_storage.cuh \
 	src/cuda/persistent_v3/pipelines/task_scoreboard.cuh \
 	src/cuda/persistent_v3/roles/common.cuh \
-	src/cuda/persistent_v3/roles/rdma_role.cuh \
-	src/cuda/persistent_v3/roles/relay_role.cuh \
 	src/cuda/persistent_v3/roles/compute_role.cuh \
 	src/cuda/persistent_v3/testing.hpp
 
