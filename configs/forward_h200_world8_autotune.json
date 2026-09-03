@@ -17,7 +17,7 @@
   "benchmark": {
     "launcher": "local",
     "world": 8,
-    "nccl_lib_dir": "/opt/nccl/lib",
+    "nccl_lib_dir": "/storage/openpsi/codes/wanghaitao.wht/deps/nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu",
     "socket_ifname": "eth0",
     "disable_ib": true,
     "seed": 1297435732,

@@ -896,6 +896,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
   auto *forward_return_source_route_index = peer_at<unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
+  const auto *canonical_gates =
+      peer_at<const float>(a.local_base, a.canonical_gates_offset);
   if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       status->start_clock = device_globaltimer_ns();
@@ -1207,6 +1209,11 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           for (std::uint64_t vector = threadIdx.x; vector < a.hidden / 8ULL;
                vector += blockDim.x)
             target128[vector] = source128[vector];
+          if (threadIdx.x == 0) {
+            auto *destination_gates = peer_at<float>(
+                destination_base, a.canonical_gates_offset);
+            destination_gates[row] = a.gates[route];
+          }
           if (remote_backend_enabled<StaticLocal>(a.use_gin)) {
             // Every lane's row stores precede the exact destination M-tile row
             // increment.  The destination compute worker acquires this counter;
@@ -1266,7 +1273,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
           auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
               window_bytes + a.gin_send_header_offset);
-          auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+          auto *send_fanout = reinterpret_cast<ForwardDispatchFanoutRecord *>(
               window_bytes + a.gin_send_fanout_offset);
           auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
               window_bytes + a.gin_send_payload_offset);
@@ -1307,16 +1314,30 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                packed += global_threads) {
             const auto wave_position = packed / a.dispatch.identity.top_k;
             const auto packet = a.dispatch_waves.packet_order[wave_position];
+            const auto descriptor = a.dispatch.packet_headers[packet];
             const auto fanout_slot = packed % a.dispatch.identity.top_k;
             const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
             const auto fanout_end =
                 a.dispatch.packet_fanout_offsets[packet + 1U];
-            if (fanout_begin + fanout_slot < fanout_end)
-              send_fanout[packed] =
+            if (fanout_begin + fanout_slot < fanout_end) {
+              const auto target =
                   a.dispatch.packet_fanout[fanout_begin + fanout_slot];
+              const auto route = descriptor.local_token_id *
+                                     a.dispatch.identity.top_k +
+                                 target.topk_slot;
+              send_fanout[packed] = ForwardDispatchFanoutRecord{
+                  target.dst_row,
+                  target.return_compact_row,
+                  target.topk_slot,
+                  static_cast<std::uint16_t>(target.destination_local_rank),
+                  static_cast<std::uint16_t>(target.expert_id),
+                  target.reserved,
+                  a.gates[route]};
+            }
 #if MEGAMOE_DEVICE_TIMELINE
             if (fanout_begin + fanout_slot < fanout_end)
-              dispatch_pack_thread_bytes += sizeof(DeviceFanoutRecord);
+              dispatch_pack_thread_bytes +=
+                  sizeof(ForwardDispatchFanoutRecord);
 #endif
           }
           for (std::uint64_t wave_position = global_thread;
@@ -1376,7 +1397,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
               window_bytes + a.gin_send_header_offset);
 #if MEGAMOE_DEBUG_VALIDATE
-          auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+          auto *send_fanout =
+              reinterpret_cast<ForwardDispatchFanoutRecord *>(
               window_bytes + a.gin_send_fanout_offset);
 #endif
           // The owner-side initialization kernel only rendezvous with CUDA-IPC
@@ -1526,13 +1548,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                             (source_partition * a.max_tokens_per_rank +
                              wire_begin) *
                                 a.dispatch.identity.top_k *
-                                sizeof(DeviceFanoutRecord),
+                                sizeof(ForwardDispatchFanoutRecord),
                         a.gin_window,
                         a.gin_send_fanout_offset +
                             wave_begin * a.dispatch.identity.top_k *
-                                sizeof(DeviceFanoutRecord),
+                                sizeof(ForwardDispatchFanoutRecord),
                         wave_packets * a.dispatch.identity.top_k *
-                            sizeof(DeviceFanoutRecord));
+                            sizeof(ForwardDispatchFanoutRecord));
                 gin.put(
                     rail, static_cast<int>(remote_node), a.gin_window,
                     a.gin_receive_payload_offset +
@@ -1551,7 +1573,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 atomicAdd(&status->gin_metadata_bytes,
                           wave_packets * (sizeof(LocalP2pRouteHeader) +
                                           a.dispatch.identity.top_k *
-                                              sizeof(DeviceFanoutRecord)));
+                                              sizeof(
+                                                  ForwardDispatchFanoutRecord)));
               }
               __syncthreads();
             }
@@ -1604,7 +1627,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                       send_fanout[(node_packet_begin + position) *
                                       a.dispatch.identity.top_k +
                                   fanout]
-                          .reserved == 0U;
+                          .mtile == 0U;
               }
 #endif
               atomicAdd(&completion->directory_ready, 1ULL);
@@ -1721,7 +1744,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           auto *window_bytes = static_cast<std::byte *>(a.gin_window_base);
           auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
               window_bytes + a.gin_receive_header_offset);
-          auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+          auto *receive_fanout =
+              reinterpret_cast<ForwardDispatchFanoutRecord *>(
               window_bytes + a.gin_receive_fanout_offset);
           auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
               window_bytes + a.gin_receive_payload_offset);
@@ -1807,6 +1831,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                                    header.dst_row + fanout];
                 const auto destination =
                     a.node * a.local_world_size + target.destination_local_rank;
+                const auto gate = target.gate;
                 auto *destination_headers = peer_at<LocalP2pRouteHeader>(
                     a.peer_bases[destination], a.direct_headers_offset);
                 const auto route =
@@ -1825,6 +1850,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                     target.dst_row,
                     target.expert_id,
                     target.topk_slot};
+                auto *destination_gates = peer_at<float>(
+                    a.peer_bases[destination], a.canonical_gates_offset);
+                destination_gates[target.dst_row] = gate;
               }
             }
           }
@@ -1883,20 +1911,20 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 ::cuda::atomic_ref<unsigned long long,
                                    ::cuda::thread_scope_system>
                     counter(
-                        arrived[target.reserved * a.local_world_size + rail]);
+                        arrived[target.mtile * a.local_world_size + rail]);
                 counter.fetch_add(1ULL, ::cuda::memory_order_release);
 #if MEGAMOE_DEBUG_VALIDATE
                 const auto record_index =
                     source_partition * a.gin_context_count + directory_context;
                 atomicAdd(&context_completion[record_index].relay_fanout_rows,
                           1ULL);
-                if (target.reserved == 0U)
+                if (target.mtile == 0U)
                   atomicAdd(&context_completion[record_index].relay_tile0_rows,
                             1ULL);
                 atomicAdd(&completion->remote_rows_published, 1ULL);
-                if (target.reserved < 64U)
+                if (target.mtile < 64U)
                   atomicOr(&completion->published_tile_mask,
-                           1ULL << target.reserved);
+                           1ULL << target.mtile);
 #endif
               }
             }
@@ -2174,30 +2202,34 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                     (a.intermediate & 1ULL) == 0ULL) {
                   const auto output_index =
                       (row + block_m) * a.intermediate + output_column;
+                  const auto gate = canonical_gates[row + block_m];
                   // Each WGMMA lane owns two adjacent BF16 outputs.  Publish
-                  // the pair as one naturally aligned store for S.
-                  const auto sigmoid0 = 1.0F / (1.0F + __expf(-av0));
-                  const auto sigmoid1 = 1.0F / (1.0F + __expf(-av1));
+                  // the pair as one naturally aligned store for gated U.
                   const auto pack = [](std::uint16_t low, std::uint16_t high) {
                     return static_cast<std::uint32_t>(low) |
                            (static_cast<std::uint32_t>(high) << 16U);
                   };
                   reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
-                      pack(float_to_bf16_bits((av0 * sigmoid0) * bv0),
-                           float_to_bf16_bits((av1 * sigmoid1) * bv1));
+                      pack(float_to_bf16_bits(
+                               forward_compute_detail::gated_swiglu_fc2_input(
+                                   av0, bv0, gate)),
+                           float_to_bf16_bits(
+                               forward_compute_detail::gated_swiglu_fc2_input(
+                                   av1, bv1, gate)));
                 } else if (block_m < valid_rows) {
                   // Retain checked scalar stores for non-main odd-N fixtures.
                   const float av[2] = {av0, av1};
                   const float bv[2] = {bv0, bv1};
+                  const auto gate = canonical_gates[row + block_m];
 #pragma unroll
                   for (std::uint32_t value = 0; value < 2U; ++value) {
                     const auto tail_column = output_column + value;
                     if (tail_column < a.intermediate) {
                       const auto output_index =
                           (row + block_m) * a.intermediate + tail_column;
-                      const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
                       s[output_index] = transport::BFloat16{float_to_bf16_bits(
-                          (av[value] * sigmoid) * bv[value])};
+                          forward_compute_detail::gated_swiglu_fc2_input(
+                              av[value], bv[value], gate))};
                     }
                   }
                 }
@@ -2562,13 +2594,11 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       unsigned long long lane_route = 0ULL;
       unsigned long long lane_row = 0ULL;
       unsigned int lane_direct = 0U;
-      float lane_gate = 0.0F;
       if (lane < a.dispatch.identity.top_k) {
         const auto slot =
             a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
         lane_route = token * a.dispatch.identity.top_k + slot;
         lane_row = lane_route;
-        lane_gate = a.gates[lane_route];
         const auto destination = a.dispatch.route_dst_rank[lane_route];
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
             ready(source_ready[destination * a.channels]);
@@ -2591,7 +2621,6 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           const auto row = __shfl_sync(0xffffffffU, lane_row, order);
           const auto direct =
               __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
-          const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
           const auto *source = direct ? direct_return_receive : contribution;
           const auto packed = reinterpret_cast<const uint4 *>(
               source + row * a.hidden)[vector];
@@ -2599,11 +2628,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                                          packed.w};
 #pragma unroll
           for (std::uint32_t word = 0; word < 4U; ++word) {
-            sums[word * 2U] = gate_after_accumulate(
-                sums[word * 2U], gate, static_cast<std::uint16_t>(words[word]));
-            sums[word * 2U + 1U] = gate_after_accumulate(
-                sums[word * 2U + 1U], gate,
-                static_cast<std::uint16_t>(words[word] >> 16U));
+            sums[word * 2U] = __fadd_rn(
+                sums[word * 2U],
+                bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
+            sums[word * 2U + 1U] = __fadd_rn(
+                sums[word * 2U + 1U], bf16_bits_to_float(
+                                          static_cast<std::uint16_t>(
+                                              words[word] >> 16U)));
           }
         }
         unsigned int words[4];

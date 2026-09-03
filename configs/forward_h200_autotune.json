@@ -15,10 +15,10 @@
     "minimum_improvement_percent": 0.5
   },
   "benchmark": {
-    "remote": "user@remote-host",
+    "remote": "root@10.10.19.233",
     "port": 2222,
     "gpus_per_node": 8,
-    "nccl_lib_dir": "/opt/nccl/lib",
+    "nccl_lib_dir": "/storage/openpsi/codes/wanghaitao.wht/deps/nccl-2.29.7-cuda12.9/root/usr/lib/x86_64-linux-gnu",
     "socket_ifname": "eth0",
     "enable_ib": true,
     "seed": 1297435732,

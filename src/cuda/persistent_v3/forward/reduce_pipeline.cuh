@@ -31,13 +31,11 @@ __device__ __forceinline__ void reduce_one_token(
   unsigned long long lane_route = 0ULL;
   unsigned long long lane_row = 0ULL;
   unsigned int lane_direct = 0U;
-  float lane_gate = 0.0F;
   if (lane < a.dispatch.identity.top_k) {
     const auto slot =
         a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
     lane_route = token * a.dispatch.identity.top_k + slot;
     lane_row = lane_route;
-    lane_gate = a.gates[lane_route];
     if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
       // The queue-slot acquire already covers the release sequence of all
       // top-k publishers, including payload and direct-map stores.
@@ -75,18 +73,19 @@ __device__ __forceinline__ void reduce_one_token(
       const auto row = __shfl_sync(0xffffffffU, lane_row, order);
       const auto direct =
           __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
-      const auto gate = __shfl_sync(0xffffffffU, lane_gate, order);
       const auto *source = direct ? direct_return_receive : contribution;
       const auto packed =
           reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
       for (std::uint32_t word = 0; word < 4U; ++word) {
-        sums[word * 2U] = gate_after_accumulate(
-            sums[word * 2U], gate, static_cast<std::uint16_t>(words[word]));
-        sums[word * 2U + 1U] = gate_after_accumulate(
-            sums[word * 2U + 1U], gate,
-            static_cast<std::uint16_t>(words[word] >> 16U));
+        sums[word * 2U] = __fadd_rn(
+            sums[word * 2U],
+            bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
+        sums[word * 2U + 1U] = __fadd_rn(
+            sums[word * 2U + 1U], bf16_bits_to_float(
+                                      static_cast<std::uint16_t>(
+                                          words[word] >> 16U)));
       }
     }
     unsigned int words[4];

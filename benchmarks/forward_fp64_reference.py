@@ -4,7 +4,8 @@
 This module does not import MegaMOE, Megatron, TransformerEngine, or PyTorch.
 It rebuilds the documented BF16 input/weight/gate fixture with NumPy, performs
 FP64 dot products, applies the documented BF16 phase casts, and checks selected
-output columns plus the complete cached FC1 A/B checkpoint.
+output columns.  When supplied, it also checks the complete cached FC1 A/B
+checkpoint.
 """
 
 import argparse
@@ -103,16 +104,19 @@ def fc1(expert, activation):
     a = accum[:INTERMEDIATE]
     b = accum[INTERMEDIATE:]
     # FP64 is the high-precision oracle; production uses Hopper __expf at this
-    # documented location and then casts S once to BF16.
-    s = quantize_bf16((a / (1.0 + np.exp(-a))) * b)
+    # documented location and keeps S in the FC1 epilogue until applying gate.
+    s = (a / (1.0 + np.exp(-a))) * b
     return accum, s
 
 
-def expert_selected_output(expert, activation):
+def expert_selected_output(expert, activation, gate):
     accum, s = fc1(expert, activation)
+    # Forward multiplies the route-local FP32 gate into the FC1 epilogue and
+    # rounds U = g*S once to BF16 before WGMMA consumes it.
+    u = quantize_bf16(np.float32(gate) * s)
     rows = np.asarray(OUTPUT_COLUMNS, dtype=np.uint32)[:, None]
     columns = np.arange(INTERMEDIATE, dtype=np.uint32)[None, :]
-    y = weight(expert, 2, rows, columns) @ s
+    y = weight(expert, 2, rows, columns) @ u
     return accum, quantize_bf16(y)
 
 
@@ -135,24 +139,23 @@ def metrics(actual, reference, coordinates):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--cache", type=Path)
     args = parser.parse_args()
     activations = [
         (((token * HIDDEN + np.arange(HIDDEN, dtype=np.int64)) % 127) - 63)
         .astype(np.float64) / 64.0 for token in range(len(ROUTES))]
     expert_results = {}
     for token, token_routes in enumerate(ROUTES):
-        for expert in token_routes:
-            expert_results[expert] = expert_selected_output(
-                expert, activations[token])
+        gates = selected_gates(token)
+        for slot, expert in enumerate(token_routes):
+            expert_results[(token, expert)] = expert_selected_output(
+                expert, activations[token], gates[slot])
     combined_reference = []
     for token, token_routes in enumerate(ROUTES):
-        gates = selected_gates(token)
         combined = np.zeros(len(OUTPUT_COLUMNS), dtype=np.float32)
         for expert in sorted(token_routes):
-            slot = token_routes.index(expert)
-            combined = combined + (
-                gates[slot] * expert_results[expert][1]).astype(np.float32)
+            combined = combined + expert_results[(token, expert)][1].astype(
+                np.float32)
         combined_reference.append(quantize_bf16(combined))
     combined_reference = np.stack(combined_reference)
     output_bits = np.fromfile(args.output, dtype="<u2")
@@ -177,34 +180,38 @@ def main():
         [f"output[{token},{column}]" for token in range(len(ROUTES))
          for column in OUTPUT_COLUMNS])
 
-    cache_bits = np.fromfile(args.cache, dtype="<u2")
-    canonical_experts = sorted(expert_results)
-    expected_cache_elements = len(canonical_experts) * 2 * INTERMEDIATE
-    if cache_bits.size != expected_cache_elements:
-        raise RuntimeError(
-            f"cache elements expected={expected_cache_elements} "
-            f"actual={cache_bits.size}")
-    # Download schema is all A rows followed by all B rows.
-    actual_cache = bf16_bits_to_float64(cache_bits).reshape(
-        2, len(canonical_experts), INTERMEDIATE)
-    cache_reference = np.stack(
-        [expert_results[expert][0] for expert in canonical_experts])
-    reference_cache = np.stack((cache_reference[:, :INTERMEDIATE],
-                                cache_reference[:, INTERMEDIATE:]))
-    cache_coordinates = [
-        f"cache[{plane},{route},{column}]"
-        for plane in ("A", "B")
-        for route in range(len(canonical_experts))
-        for column in range(INTERMEDIATE)]
-    cache_metrics = metrics(actual_cache.reshape(-1),
-                            reference_cache.reshape(-1), cache_coordinates)
+    cache_metrics = None
+    if args.cache is not None:
+        cache_bits = np.fromfile(args.cache, dtype="<u2")
+        canonical_routes = sorted(expert_results, key=lambda item: item[1])
+        expected_cache_elements = len(canonical_routes) * 2 * INTERMEDIATE
+        if cache_bits.size != expected_cache_elements:
+            raise RuntimeError(
+                f"cache elements expected={expected_cache_elements} "
+                f"actual={cache_bits.size}")
+        # Download schema is all A rows followed by all B rows.
+        actual_cache = bf16_bits_to_float64(cache_bits).reshape(
+            2, len(canonical_routes), INTERMEDIATE)
+        cache_reference = np.stack(
+            [expert_results[route][0] for route in canonical_routes])
+        reference_cache = np.stack((cache_reference[:, :INTERMEDIATE],
+                                    cache_reference[:, INTERMEDIATE:]))
+        cache_coordinates = [
+            f"cache[{plane},{route},{column}]"
+            for plane in ("A", "B")
+            for route in range(len(canonical_routes))
+            for column in range(INTERMEDIATE)]
+        cache_metrics = metrics(actual_cache.reshape(-1),
+                                reference_cache.reshape(-1),
+                                cache_coordinates)
     passed = (
         output_metrics["max_abs"] <= MAX_ABS and
         output_metrics["rmse"] <= MAX_RMSE and
         output_metrics["max_relative_above_floor"] <= MAX_RELATIVE and
-        cache_metrics["max_abs"] <= MAX_ABS and
-        cache_metrics["rmse"] <= MAX_RMSE and
-        cache_metrics["max_relative_above_floor"] <= MAX_RELATIVE)
+        (cache_metrics is None or (
+            cache_metrics["max_abs"] <= MAX_ABS and
+            cache_metrics["rmse"] <= MAX_RMSE and
+            cache_metrics["max_relative_above_floor"] <= MAX_RELATIVE)))
     sample_hashes = {
         f"expert_{expert}_{tensor}": sampled_weight_hash(expert, kind)
         for expert in (0, 1, 47, 48, 191, 383)
@@ -213,8 +220,8 @@ def main():
     if len(set(sample_hashes.values())) != len(sample_hashes):
         raise RuntimeError("expert-aware W1/W2 fixture sample hashes collided")
     result = {
-        "schema": 1,
-        "oracle": "independent NumPy FP64; BF16 phase casts",
+        "schema": 2,
+        "oracle": "independent NumPy FP64; gate-before-FC2 BF16 phase casts",
         "shape": {"tokens": len(ROUTES), "hidden": HIDDEN,
                   "intermediate": INTERMEDIATE, "global_experts": 384,
                   "top_k": len(ROUTES[0])},

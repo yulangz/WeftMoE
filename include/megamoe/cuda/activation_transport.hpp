@@ -313,8 +313,9 @@ private:
 
 // Host-enqueued NCCL Socket correctness fallback for the complete Forward
 // semantics. Dispatch and return have explicit host phase boundaries; the FC
-// body reuses the frozen WGMMA/TMA compute core and deterministic gate-after
-// reduce. This type never reports a GIN or single-persistent audit label.
+// body reuses the frozen WGMMA/TMA compute core, gate-before-FC2 semantics, and
+// deterministic unweighted reduce. This type never reports a GIN or
+// single-persistent audit label.
 class NcclSocketFallbackForwardMegaKernel {
 public:
   NcclSocketFallbackForwardMegaKernel(

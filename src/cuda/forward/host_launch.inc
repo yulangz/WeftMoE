@@ -792,9 +792,9 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   auto *prefix = at<unsigned long long>(slot.device,
                                         layout.p2p_barrier_receive);
   auto *route_ids = at<unsigned int>(slot.device, layout.packet_claim);
-  auto *send_headers = at<LocalP2pRouteHeader>(
+  auto *send_headers = at<SocketRouteHeader>(
       slot.device, layout.socket_header_send);
-  auto *receive_headers = at<LocalP2pRouteHeader>(
+  auto *receive_headers = at<SocketRouteHeader>(
       slot.device, layout.socket_header_receive);
   auto *send_payload = at<transport::BFloat16>(slot.device,
                                                 layout.contribution);
@@ -843,8 +843,9 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
         view, prefix, route_ids);
     socket_pack_routes_kernel<<<static_cast<unsigned int>(route_count), 256, 0,
                                 exec->stream>>>(
-        view, activation.pointer, config.hidden_size, activation.slot->epoch,
-        route_ids, send_headers, send_payload);
+        view, activation.pointer,
+        ActivationTransportBridge::gate_pointer(dispatch), config.hidden_size,
+        activation.slot->epoch, route_ids, send_headers, send_payload);
   }
   internal::throw_cuda(
       "socket-run", cudaGetLastError(), id.calling_rank, world,
@@ -998,7 +999,8 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   if (incoming != 0)
     socket_relay_transport_kernel<<<static_cast<unsigned int>(incoming), 256,
                                      0, exec->stream>>>(
-        receive_headers, receive_payload, canonical, incoming,
+        receive_headers, receive_payload, canonical,
+        at<float>(slot.device, layout.canonical_gates), incoming,
         config.hidden_size, id.generation, id.calling_rank,
         state->config.max_destination_rows_per_rank,
         config.expert_transform ==
@@ -1446,6 +1448,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
             " and exact NCCL world/rank, actual=" +
             std::to_string(id.num_nodes) + " nodes, world=" +
             std::to_string(id.world_size));
+  // The hot GIN fanout record keeps its established 32-byte width by storing
+  // the node-local rank and global expert ID in 16 bits.  Reject wider
+  // topologies before any device-side narrowing instead of silently wrapping.
+  if (use_gin &&
+      (id.world_size > std::numeric_limits<std::uint16_t>::max() ||
+       id.num_experts > std::numeric_limits<std::uint16_t>::max()))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                    "GIN fanout identity width", id.calling_rank,
+                    "world_size and num_experts <= 65535",
+                    std::to_string(id.world_size) + "/" +
+                        std::to_string(id.num_experts));
   if (activation.pool.get() != state.get() ||
       activation.generation != id.generation ||
       activation.tokens != id.num_tokens ||
@@ -1696,7 +1709,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     socket_install_forward_headers_kernel<<<
         static_cast<unsigned int>((socket_incoming + 255ULL) / 256ULL), 256, 0,
         exec->stream>>>(
-        at<LocalP2pRouteHeader>(slot.device, layout.socket_header_receive),
+        at<SocketRouteHeader>(slot.device, layout.socket_header_receive),
         at<LocalP2pRouteHeader>(slot.device, layout.direct_route_headers),
         socket_incoming, id.generation, generation_epoch, id.calling_rank,
         state->config.max_destination_rows_per_rank,
@@ -1775,6 +1788,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   }
   args.canonical_rows_offset = layout.canonical_rows;
+  args.canonical_gates_offset = layout.canonical_gates;
   args.forward_output_rows_offset = layout.canonical_rows;
   args.direct_headers_offset = layout.direct_route_headers;
   args.contribution_offset = layout.contribution;
@@ -2967,9 +2981,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       transport_error(NotifyErrorCode::TransportProtocolFailure,
                       "socket-forward-return", "route counts",
                       id.calling_rank, "exact preload counts", "mismatch");
-    auto *send_headers = at<LocalP2pRouteHeader>(
+    auto *send_headers = at<SocketRouteHeader>(
         slot.device, layout.socket_header_send);
-    auto *receive_headers = at<LocalP2pRouteHeader>(
+    auto *receive_headers = at<SocketRouteHeader>(
         slot.device, layout.socket_header_receive);
     auto *send_payload = at<transport::BFloat16>(
         slot.device, layout.contribution);
@@ -3058,16 +3072,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                                                   layout.combine_return),
                           view.sizes.route_count, config.hidden_size);
     if (id.num_tokens != 0)
-      socket_gate_reduce_kernel<<<static_cast<unsigned int>(id.num_tokens),
-                                  256, 0, exec->stream>>>(
-          view, ActivationTransportBridge::gate_pointer(dispatch),
+      socket_sum_forward_routes_kernel<<<
+          static_cast<unsigned int>(id.num_tokens), 256, 0, exec->stream>>>(
+          view,
           at<transport::BFloat16>(slot.device, layout.combine_return),
           at<transport::BFloat16>(slot.device, layout.combined),
           config.hidden_size);
     internal::throw_cuda(
         "socket-forward-return", cudaGetLastError(), id.calling_rank,
         id.world_size, backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "Socket scatter/gate-after reduce");
+        ExchangeKind::ExpertCounts, "Socket scatter/unweighted reduce");
   }
   internal::throw_cuda(
       "forward-run",

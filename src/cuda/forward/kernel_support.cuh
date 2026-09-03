@@ -250,6 +250,30 @@ struct LocalP2pRouteHeader {
 };
 static_assert(sizeof(LocalP2pRouteHeader) == 72);
 
+// Socket is a correctness fallback and carries one route per packet, so it can
+// append the gate to its header without changing the hot local/GIN record.
+struct SocketRouteHeader {
+  LocalP2pRouteHeader route;
+  float gate;
+  std::uint32_t reserved;
+};
+static_assert(sizeof(SocketRouteHeader) == 80);
+
+// Forward's cross-node fanout wire record carries the route gate without
+// growing the existing 32-byte metadata item or adding a fifth GIN put.  The
+// production contract has far fewer than 65536 local ranks and experts; the
+// canonical row and compact Return identity retain their full 64-bit range.
+struct alignas(16) ForwardDispatchFanoutRecord {
+  std::uint64_t dst_row;
+  std::uint64_t return_compact_row;
+  std::uint32_t topk_slot;
+  std::uint16_t destination_local_rank;
+  std::uint16_t expert_id;
+  std::uint32_t mtile;
+  float gate;
+};
+static_assert(sizeof(ForwardDispatchFanoutRecord) == 32);
+
 // One directory entry is exchanged before a context starts publishing its
 // M-tile waves.  It lets the peer consume context-local wire ranges without
 // assuming that independently progressing GIN contexts complete in lockstep.
@@ -487,6 +511,10 @@ struct Layout {
   std::size_t production_status_matrix = 0;
   std::size_t packet_claim = 0;
   std::size_t canonical_rows = 0;
+  // Route-local FP32 gates in the same canonical expert-row order as X.
+  // Dispatch publishes each entry before the corresponding X-ready counter;
+  // FC1 consumes it while materializing the gated FC2 input U = g*S.
+  std::size_t canonical_gates = 0;
   std::size_t contribution = 0;
   std::size_t combine_return = 0;
   std::size_t combined = 0;
@@ -531,15 +559,11 @@ struct GinWindowLayout {
   std::size_t receive_packet_headers = 0;
   std::size_t send_fanout = 0;
   std::size_t receive_fanout = 0;
-  std::size_t send_gate = 0;
-  std::size_t receive_gate = 0;
   std::size_t send_payload = 0;
   std::size_t receive_payload = 0;
   std::size_t return_staging = 0;
   std::size_t return_receive = 0;
   std::size_t return_fragment_ready = 0;
-  std::size_t return_gate_staging = 0;
-  std::size_t return_gate_receive = 0;
   std::size_t barrier = 0;
   std::size_t production_error_records = 0;
   std::size_t total = 0;
@@ -619,20 +643,16 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   // contribute one node-deduplicated packet to every node, so packet-position
   // indexing requires nodes*tokens*top-k capacity even though the number of
   // logical routes remains tokens*top-k. The previous route-sized allocation
-  // made the first remote-node packet range alias send_gate/send_payload.
+  // made the first remote-node packet range overrun the following planes.
   layout.send_fanout = append(cursor, outgoing_fanout,
-                              sizeof(DeviceFanoutRecord), "GIN send fanout");
+                              sizeof(ForwardDispatchFanoutRecord),
+                              "GIN send Forward fanout");
   layout.receive_fanout =
       append(cursor,
              checked_mul(incoming_packets, config.max_top_k,
                          "GIN receive fanout capacity"),
-             sizeof(DeviceFanoutRecord), "GIN receive fanout");
-  layout.send_gate =
-      append(cursor, outgoing_fanout, sizeof(float), "GIN send route gates");
-  layout.receive_gate = append(cursor,
-                               checked_mul(incoming_packets, config.max_top_k,
-                                           "GIN receive gate capacity"),
-                               sizeof(float), "GIN receive route gates");
+             sizeof(ForwardDispatchFanoutRecord),
+             "GIN receive Forward fanout");
   layout.send_payload = append(cursor, packet_payload,
                                sizeof(transport::BFloat16), "GIN send payload");
   layout.receive_payload =
@@ -651,12 +671,6 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.return_fragment_ready =
       append(cursor, routes, sizeof(std::uint64_t),
              "GIN return fragment ready counters");
-  layout.return_gate_staging = append(
-      cursor,
-      checked_mul(remote_nodes, routes, "GIN return gate staging elements"),
-      sizeof(float), "GIN return gate staging");
-  layout.return_gate_receive =
-      append(cursor, routes, sizeof(float), "GIN return gate receive");
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
@@ -760,6 +774,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       cursor, checked_mul(config.max_destination_rows_per_rank,
                           config.max_hidden_size, "canonical rows"),
       sizeof(transport::BFloat16), "canonical rows");
+  layout.canonical_gates =
+      append(cursor, config.max_destination_rows_per_rank, sizeof(float),
+             "canonical route gates");
   const auto route_elements =
       checked_mul(routes, config.max_hidden_size, "route elements");
   layout.contribution = append(cursor, route_elements,
@@ -776,10 +793,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                             "Socket count matrix"),
         sizeof(std::uint64_t), "Socket count matrix");
     layout.socket_header_send = append(
-        cursor, routes, sizeof(LocalP2pRouteHeader), "Socket send headers");
+        cursor, routes, sizeof(SocketRouteHeader), "Socket send headers");
     layout.socket_header_receive = append(
         cursor, config.max_destination_rows_per_rank,
-        sizeof(LocalP2pRouteHeader), "Socket receive headers");
+        sizeof(SocketRouteHeader), "Socket receive headers");
     layout.socket_payload_receive = append(
         cursor, checked_mul(config.max_destination_rows_per_rank,
                             config.max_hidden_size,
@@ -789,9 +806,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   if (config.max_intermediate_size != 0) {
     const auto forward_elements = checked_mul(
         config.max_destination_rows_per_rank,
-        config.max_intermediate_size, "forward S elements");
+        config.max_intermediate_size, "forward gated U elements");
     layout.forward_s = append(cursor, forward_elements,
-                              sizeof(transport::BFloat16), "forward S");
+                              sizeof(transport::BFloat16), "forward gated U");
     // Expert segmentation can make every incoming row a distinct partial
     // M-block.  Capacity must therefore be bounded by rows, not by a dense
     // ceil(rows/64) estimate.
@@ -1513,8 +1530,8 @@ __global__ void socket_stable_route_ids_kernel(
 
 __global__ void socket_pack_routes_kernel(
     DeviceDispatchKernelView dispatch, const transport::BFloat16 *input,
-    std::uint64_t hidden, std::uint64_t epoch,
-    const unsigned int *route_ids, LocalP2pRouteHeader *headers,
+    const float *gates, std::uint64_t hidden, std::uint64_t epoch,
+    const unsigned int *route_ids, SocketRouteHeader *headers,
     transport::BFloat16 *payload) {
   const auto packed = static_cast<std::uint64_t>(blockIdx.x);
   if (packed >= dispatch.sizes.route_count)
@@ -1523,48 +1540,52 @@ __global__ void socket_pack_routes_kernel(
   const auto token = route / dispatch.identity.top_k;
   const auto slot = static_cast<std::uint32_t>(route % dispatch.identity.top_k);
   if (threadIdx.x == 0) {
-    headers[packed] = LocalP2pRouteHeader{
-        transport::kActivationTransportSchemaVersion,
-        dispatch.identity.calling_rank,
-        dispatch.route_dst_rank[route], 0U, dispatch.identity.generation,
-        epoch, packed, route, token, dispatch.route_dst_row[route],
-        dispatch.expert_id[route], slot};
+    headers[packed] = SocketRouteHeader{
+        LocalP2pRouteHeader{transport::kActivationTransportSchemaVersion,
+                            dispatch.identity.calling_rank,
+                            dispatch.route_dst_rank[route], 0U,
+                            dispatch.identity.generation, epoch, packed, route,
+                            token, dispatch.route_dst_row[route],
+                            dispatch.expert_id[route], slot},
+        gates[route], 0U};
   }
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
     payload[packed * hidden + h] = input[token * hidden + h];
 }
 
 __global__ void socket_relay_transport_kernel(
-    LocalP2pRouteHeader *headers, transport::BFloat16 *compact_payload,
-    transport::BFloat16 *canonical_rows, std::uint64_t incoming,
-    std::uint64_t hidden, std::uint64_t generation,
+    SocketRouteHeader *headers, transport::BFloat16 *compact_payload,
+    transport::BFloat16 *canonical_rows, float *canonical_gates,
+    std::uint64_t incoming, std::uint64_t hidden, std::uint64_t generation,
     std::uint32_t destination_rank, std::uint64_t max_rows,
     bool identity_expert, TransportDeviceStatus *status) {
   const auto incoming_index = static_cast<std::uint64_t>(blockIdx.x);
   if (incoming_index >= incoming)
     return;
   const auto header = headers[incoming_index];
+  const auto route = header.route;
   const bool valid =
-      header.schema_version == transport::kActivationTransportSchemaVersion &&
-      header.generation == generation &&
-      header.destination_rank == destination_rank &&
-      header.dst_row < max_rows;
+      route.schema_version == transport::kActivationTransportSchemaVersion &&
+      route.generation == generation &&
+      route.destination_rank == destination_rank && route.dst_row < max_rows;
   if (!valid) {
     if (threadIdx.x == 0)
       publish_local_structured_error(status, destination_rank, 40U, 1U,
-                                     max_rows, header.dst_row);
+                                     max_rows, route.dst_row);
     return;
   }
+  if (threadIdx.x == 0)
+    canonical_gates[route.dst_row] = header.gate;
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
     const auto value = compact_payload[incoming_index * hidden + h];
-    canonical_rows[header.dst_row * hidden + h] = value;
+    canonical_rows[route.dst_row * hidden + h] = value;
     compact_payload[incoming_index * hidden + h] =
-        synthetic_value(value, header.expert_id, h, identity_expert);
+        synthetic_value(value, route.expert_id, h, identity_expert);
   }
 }
 
 __global__ void socket_install_forward_headers_kernel(
-    const LocalP2pRouteHeader *compact_headers,
+    const SocketRouteHeader *compact_headers,
     LocalP2pRouteHeader *canonical_headers, std::uint64_t incoming,
     std::uint64_t generation, std::uint64_t epoch,
     std::uint32_t destination_rank, std::uint64_t max_rows,
@@ -1573,7 +1594,7 @@ __global__ void socket_install_forward_headers_kernel(
                      threadIdx.x;
   if (index >= incoming)
     return;
-  auto header = compact_headers[index];
+  auto header = compact_headers[index].route;
   if (header.schema_version != transport::kActivationTransportSchemaVersion ||
       header.generation != generation ||
       header.destination_rank != destination_rank ||
@@ -1587,27 +1608,27 @@ __global__ void socket_install_forward_headers_kernel(
 }
 
 __global__ void socket_gather_forward_returns_kernel(
-    const LocalP2pRouteHeader *headers,
+    const SocketRouteHeader *headers,
     const transport::BFloat16 *canonical_output,
     transport::BFloat16 *compact, std::uint64_t incoming,
     std::uint64_t hidden) {
   const auto packed = static_cast<std::uint64_t>(blockIdx.x);
   if (packed >= incoming)
     return;
-  const auto row = headers[packed].dst_row;
+  const auto row = headers[packed].route.dst_row;
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
     compact[packed * hidden + h] = canonical_output[row * hidden + h];
 }
 
 __global__ void socket_scatter_returns_kernel(
-    const LocalP2pRouteHeader *headers,
+    const SocketRouteHeader *headers,
     const transport::BFloat16 *compact,
     transport::BFloat16 *by_route, std::uint64_t routes,
     std::uint64_t hidden) {
   const auto packed = static_cast<std::uint64_t>(blockIdx.x);
   if (packed >= routes)
     return;
-  const auto route = headers[packed].route_index;
+  const auto route = headers[packed].route.route_index;
   for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
     by_route[route * hidden + h] = compact[packed * hidden + h];
 }
@@ -1627,6 +1648,30 @@ __global__ void socket_gate_reduce_kernel(
       const auto route = token * dispatch.identity.top_k + original;
       sum = gate_after_accumulate(sum, gates[route],
                                   by_route[route * hidden + h].bits);
+    }
+    combined[token * hidden + h] =
+        transport::BFloat16{float_to_bf16_bits(sum)};
+  }
+}
+
+// Full Forward has already applied each route gate to the BF16 FC2 input.
+// Its Socket correctness fallback therefore combines returned route vectors
+// with the same fixed-order, unweighted FP32 sum as the split CUDA path.
+__global__ void socket_sum_forward_routes_kernel(
+    DeviceDispatchKernelView dispatch,
+    const transport::BFloat16 *by_route,
+    transport::BFloat16 *combined, std::uint64_t hidden) {
+  const auto token = static_cast<std::uint64_t>(blockIdx.x);
+  if (token >= dispatch.identity.num_tokens)
+    return;
+  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t order = 0; order < dispatch.identity.top_k; ++order) {
+      const auto slot = dispatch.combine_order[
+          token * dispatch.identity.top_k + order];
+      const auto route = token * dispatch.identity.top_k + slot;
+      sum = __fadd_rn(
+          sum, bf16_bits_to_float(by_route[route * hidden + h].bits));
     }
     combined[token * hidden + h] =
         transport::BFloat16{float_to_bf16_bits(sum)};

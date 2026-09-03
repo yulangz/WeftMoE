@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "description": "Forward gate-before-FC2 semantic alignment and regression validation",
+  "tested_worktree_base_commit": "7c45a01b2efe4e2c8567e177add312e2c7651e90",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "measured_iterations_per_interval": 100,
+    "metric": "forward_slowest_rank_us.mean"
+  },
+  "semantics": {
+    "fc2_input": "U = bf16(fp32(gate) * SwiGLU(A, B))",
+    "combine": "fixed expert-ID order, unweighted FP32 sum, final BF16 cast",
+    "gin_dispatch_gate_transport": "gate embedded in the existing 32-byte fanout record; no additional put"
+  },
+  "build": {
+    "architecture": "sm_90a",
+    "cuda": "12.9",
+    "nccl": "2.29.7+cuda12.9",
+    "world8": {
+      "candidate": "world8_relay16_tma4",
+      "final_cache_key": "f0b4cf0887fe1e05ff2030d3146b65824b5b172b9c32123d7e9deb227c96b9b3",
+      "representative_cold_compile_seconds": 39.098,
+      "sass_sha256": "2a525a0a72c86b1ee9a700d2010b974e4aab26807dd7b354d3e844f179ea9e19"
+    },
+    "world16": {
+      "candidate": "current_m128_n128_n256",
+      "final_cache_key": "63ef996ca9036a866818031d152e31dd9430e8aee33995bb422d0656cab8be46",
+      "representative_cold_compile_seconds": 33.612,
+      "sass_sha256": "8a7d9d2640c4d82d423967612d3a55b0357daf804eb8bb9a385d252d2a11b0f6"
+    },
+    "persistent_compute_kernel": {
+      "registers_per_thread": 168,
+      "stack_bytes_per_thread": 1312,
+      "static_shared_bytes": 2048
+    }
+  },
+  "correctness": {
+    "world8_smoke_repeats": 20,
+    "world16_gin_smoke_repeats": 5,
+    "rank0_smoke_output_hash": "9733221173292816764",
+    "independent_fp64_oracle": {
+      "passed": true,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "max_relative_above_floor": 0.0
+    },
+    "socket_activation_world16": "pass",
+    "socket_full_forward_world16": "pass"
+  },
+  "performance": {
+    "world8": {
+      "interval_mean_us": [14581.352, 14741.808],
+      "aggregate_interval_mean_us": 14661.58,
+      "latest_interval_p95_us": 15004.9,
+      "previous_selected_mean_us": 14733.121,
+      "change_vs_previous_percent": -0.486
+    },
+    "world16_gin": {
+      "interval_mean_us": [21514.383, 21384.762, 21778.714],
+      "aggregate_interval_mean_us": 21559.286,
+      "interval_mean_range_us": [21384.762, 21778.714],
+      "previous_four_interval_mean_us": 21550.763,
+      "change_vs_previous_percent": 0.04,
+      "megatron_reference_mean_us": 31334.0,
+      "speedup_vs_megatron": 1.453
+    }
+  },
+  "world16_gin_protocol": {
+    "dispatch_puts_per_rank_range": [260, 268],
+    "metadata_bytes_per_rank": 2162688,
+    "registered_bytes_per_rank": 1885931776,
+    "raw_remote_route_bytes_per_rank": 0
+  },
+  "tests": {
+    "cpu_control_plane": "pass: 13/13 C++ tests plus Python/reference/header/security checks",
+    "forward_autotune": "pass: 19/19",
+    "device_smoke": "pass",
+    "v3_protocol_smoke": "pass",
+    "protocol_regressions": "pass"
+  }
+}

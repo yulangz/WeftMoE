@@ -44,6 +44,16 @@ enum ForwardComputePairOperand : std::uint32_t {
   kComputePairShareB = 2U,
 };
 
+// FC2 consumes BF16 U = g*S.  Apply the FP32 route gate to the SwiGLU result
+// in the FC1 epilogue, then perform the single BF16 phase cast consumed by
+// WGMMA.  Backward can therefore use the algebraically matching
+// dW2 = dY^T*U and dGate = <dY*W2, S> without retaining FC2 output.
+__device__ __forceinline__ float gated_swiglu_fc2_input(float a, float b,
+                                                         float gate) {
+  const auto sigmoid = 1.0F / (1.0F + __expf(-a));
+  return __fmul_rn((a * sigmoid) * b, gate);
+}
+
 template <typename TileMma, class Callback>
 __device__ __forceinline__ void visit_m128_accumulator(float *accum,
                                                         Callback callback) {
@@ -692,6 +702,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
+  const auto *canonical_gates =
+      peer_at<const float>(a.local_base, a.canonical_gates_offset);
   auto *forward_output =
       a.use_gin && a.forward_registered_output
           ? reinterpret_cast<transport::BFloat16 *>(
@@ -1070,23 +1082,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 (a.intermediate & 1ULL) == 0ULL) {
               const auto output_index =
                   (row + block_m) * a.intermediate + output_column;
-              const auto sigmoid0 = 1.0F / (1.0F + __expf(-av0));
-              const auto sigmoid1 = 1.0F / (1.0F + __expf(-av1));
+              const auto gate = canonical_gates[row + block_m];
               reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
-                  float2_to_bf16x2_bits((av0 * sigmoid0) * bv0,
-                                        (av1 * sigmoid1) * bv1);
+                  float2_to_bf16x2_bits(
+                      gated_swiglu_fc2_input(av0, bv0, gate),
+                      gated_swiglu_fc2_input(av1, bv1, gate));
             } else if (block_m < valid_rows) {
               const float av[2] = {av0, av1};
               const float bv[2] = {bv0, bv1};
+              const auto gate = canonical_gates[row + block_m];
 #pragma unroll
               for (std::uint32_t value = 0; value < 2U; ++value) {
                 const auto tail_column = output_column + value;
                 if (tail_column < a.intermediate) {
                   const auto output_index =
                       (row + block_m) * a.intermediate + tail_column;
-                  const auto sigmoid = 1.0F / (1.0F + __expf(-av[value]));
                   s[output_index] = transport::BFloat16{
-                      float_to_bf16_bits((av[value] * sigmoid) * bv[value])};
+                      float_to_bf16_bits(gated_swiglu_fc2_input(
+                          av[value], bv[value], gate))};
                 }
               }
             }

@@ -48,3 +48,23 @@ The explicit winner defaults and retained regression candidates are in
 `configs/forward_h200_autotune.json`. Historical cache, generic single-node
 fallback, and Backward results were removed because those data paths and
 measurement boundaries no longer exist.
+
+## Gate-before-FC2 semantic alignment
+
+The subsequent semantic correction applies each route's FP32 gate in the FC1
+epilogue before the single BF16 cast consumed by FC2. Return reduction is now
+an unweighted, fixed-expert-order FP32 sum. An independent NumPy FP64 oracle
+matched all selected coordinates exactly (`max_abs=0`, `rmse=0`), and both GIN
+and Socket two-host paths passed their correctness runs.
+
+The selected tile/stage/CTA configuration was not retuned because the change
+does not alter GEMM or transport geometry. Two world-8 intervals averaged
+14.6616 ms. Three world-16 GIN intervals ranged from 21.3848 to 21.7787 ms and
+averaged 21.5593 ms. The latter differs by 0.04% from the previous four-run
+21.5508 ms aggregate and remains 1.453x faster than the 31.334 ms Megatron
+reference. The hot GIN fanout record remains 32 bytes, Dispatch remains four
+puts per wave, and the compiled compute kernel remains at 168 registers per
+thread.
+
+The compact evidence is
+[`benchmarks/results/forward_gate_before_20260903.json`](../benchmarks/results/forward_gate_before_20260903.json).

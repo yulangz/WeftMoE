@@ -3,8 +3,11 @@
 ## Scope and invariants
 
 The production data plane implements one fixed Hopper Forward shape:
-`H=7168`, `I=3072`, BF16 inputs/weights/outputs, and FP32 gate-after
-accumulation. Every expert row range is padded to an M-block boundary of 128.
+`H=7168`, `I=3072`, and BF16 inputs/weights/outputs. The FC1 epilogue applies
+the route-local FP32 gate to its SwiGLU result and rounds the resulting FC2
+input once to BF16. Returned routes are accumulated in FP32 without another
+gate multiplication. Every expert row range is padded to an M-block boundary
+of 128.
 The same M-block identity is used by Notify, Dispatch, FC1, FC2, Return, and
 Reduce; a phase cannot silently reinterpret a tail.
 
@@ -52,7 +55,7 @@ RDMA issue/completion  ---> remote ingress readiness
                             FC1-ready queue
                                   |
                                   v
-                     FC1 + SwiGLU (TMA/WGMMA)
+                 FC1 + SwiGLU + route gate (TMA/WGMMA)
                                   |
                                   v
                          FC2-priority queue
@@ -68,7 +71,7 @@ RDMA issue/completion  ---> remote ingress readiness
                          token-ready Reduce queue
                                   |
                                   v
-                    fixed expert-order FP32 reduce
+                 fixed expert-order unweighted FP32 sum
 ```
 
 The grids never synchronize with a whole-grid cross-role barrier. They exchange
@@ -108,6 +111,20 @@ work-conserving: a ready FC2 M-block is selected before new FC1 work so return
 traffic begins while other experts still compute. After compute and return
 work drain, these CTAs consume the token reduce queue; there is no separate
 global reduction launch.
+
+For each canonical route row, the numeric contract is:
+
+```text
+S = SwiGLU(A, B)
+U = bf16(fp32(gate) * S)
+R = bf16(FC2(U))
+Y[token] = bf16(sum_fp32_in_expert_order(R[route]))
+```
+
+Dispatch carries the FP32 gate beside the deduplicated activation packet and
+publishes it into canonical expert-row order before the row's FC1-ready release.
+This placement lets Backward form `dGate = <dU, S>` without retaining FC2
+output, while `dW2` consumes the exact gated BF16 input `U` used by Forward.
 
 ## GEMM implementation
 

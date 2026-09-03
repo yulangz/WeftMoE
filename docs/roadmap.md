@@ -13,15 +13,16 @@
 ## Backward redesign
 
 Backward will not reuse the deleted monolithic implementation. Its new design
-must start from the Forward invariants:
+is specified in [backward_design.md](backward_design.md) and starts from the
+Forward invariants:
 
 - fixed communication, relay, and compute ownership;
-- generation-tagged counters and bounded queues instead of phase-wide
+- generation-tagged counters and fixed task tables instead of phase-wide
   `grid.sync()`;
 - M blocks padded to 128 and compile-time TMA/WGMMA specializations;
 - communication/computation overlap only where it shortens the critical path;
-- independently optimized dV/dW compute kernels with no artificial folding
-  requirement when all SMs are already busy;
+- activation-priority multi-queue scheduling where otherwise-idle compute CTAs
+  may claim `dW1/dW2` without waiting for all `dX` to be sent;
 - explicit JSON autotuning and the same slowest-rank correctness/performance
   evidence used by Forward.
 

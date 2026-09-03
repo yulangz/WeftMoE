@@ -16,7 +16,10 @@ The current records are:
   post-cleanup kernel baseline;
 - [`forward_python_jit_20260903.json`](forward_python_jit_20260903.json), the
   cold/warm Python-JIT timings, noise-resistant selection, and final world-8
-  and world-16 validation.
+  and world-16 validation;
+- [`forward_gate_before_20260903.json`](forward_gate_before_20260903.json), the
+  gate-before-FC2 semantic change, independent oracle, and world-8/world-16
+  performance regression evidence.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

@@ -1461,7 +1461,8 @@ ActivationTransportResourcePool make_activation_transport_pool(
         slot.forward_s_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, config.max_destination_rows_per_rank,
-            forward_tuning::kTileM, "SwiGLU S", forward_tuning::kTileK);
+            forward_tuning::kTileM, "gated SwiGLU U",
+            forward_tuning::kTileK);
         slot.forward_x_m64_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank, 64,
@@ -1469,7 +1470,7 @@ ActivationTransportResourcePool make_activation_transport_pool(
         slot.forward_s_m64_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, config.max_destination_rows_per_rank,
-            64, "SwiGLU S M64");
+            64, "gated SwiGLU U M64");
         slot.forward_output_store_map = make_bf16_tma_store_map(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank,

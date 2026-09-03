@@ -456,8 +456,8 @@ def main():
             hidden, routing, probabilities)
         remote_hidden, remote_probs = dispatcher.token_dispatch(
             local_hidden, local_probs)
-        expert_input, local_counts, remote_gate = dispatcher.dispatch_postprocess(
-            remote_hidden, remote_probs)
+        expert_input, local_counts, remote_gate = (
+            dispatcher.dispatch_postprocess(remote_hidden, remote_probs))
         expert_output, _ = experts_module(
             expert_input, local_counts, remote_gate)
         combine_input = dispatcher.combine_preprocess(expert_output)
@@ -469,15 +469,12 @@ def main():
             hidden, routing, probabilities)
         remote_hidden, remote_probs = dispatcher.token_dispatch(
             local_hidden, local_probs)
-        expert_input, local_counts, _ = dispatcher.dispatch_postprocess(
+        expert_input, local_counts, remote_gate = dispatcher.dispatch_postprocess(
             remote_hidden, remote_probs)
-        # Disable Megatron's expert-side gate-before for this reference-oriented
-        # path. The returned per-route BF16 expert output is reduced at source
-        # with the same fixed expert-ID FP32 gate-after semantics as MegaMOE.
-        unit_remote_gate = torch.ones(
-            expert_input.shape[0], dtype=torch.float32, device="cuda")
+        # Keep Megatron's expert-side gate-before-FC2 path, then replace only
+        # its final BF16 combine with MegaMOE's fixed expert-ID FP32 sum.
         expert_output, _ = experts_module(
-            expert_input, local_counts, unit_remote_gate)
+            expert_input, local_counts, remote_gate)
         combine_input = dispatcher.combine_preprocess(expert_output)
         returned = dispatcher.token_combine(combine_input)
         route_count = args.tokens * args.top_k
@@ -491,11 +488,9 @@ def main():
         token_base = (torch.arange(args.tokens, device="cuda",
                                    dtype=torch.long) * args.top_k)
         common = torch.zeros_like(hidden, dtype=torch.float32)
-        flat_gate = selected_gates.reshape(-1)
         for position in range(args.top_k):
             routes = token_base + slot_order[:, position]
-            common = common + (route_output[routes].float() *
-                               flat_gate[routes].unsqueeze(-1))
+            common = common + route_output[routes].float()
         return common.to(torch.bfloat16)
 
     def common_semantics_roundtrip():
@@ -660,6 +655,9 @@ def main():
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
             "sum; final BF16 cast"),
+        "forward_reference": (
+            "expert-side gate-before-FC2; source-side fixed expert-ID "
+            "unweighted FP32 sum; final BF16 cast"),
         "derived_payload_bytes_per_rank": {
             "dispatch_activation_peer": activation_peer_bytes,
             "dispatch_probability_peer": probability_peer_bytes,

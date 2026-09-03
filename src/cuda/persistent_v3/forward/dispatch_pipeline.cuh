@@ -144,6 +144,7 @@ __device__ __forceinline__ void publish_local_batch(
       const auto expert = a.dispatch.expert_id[route];
       const auto topk_slot = static_cast<std::uint32_t>(
           route % a.dispatch.identity.top_k);
+      const auto gate = a.gates[route];
       auto *destination_headers = peer_at<LocalP2pRouteHeader>(
           a.peer_bases[destination], a.direct_headers_offset);
       destination_headers[row] = LocalP2pRouteHeader{
@@ -159,6 +160,9 @@ __device__ __forceinline__ void publish_local_batch(
           row,
           expert,
           topk_slot};
+      auto *destination_gates = peer_at<float>(
+          a.peer_bases[destination], a.canonical_gates_offset);
+      destination_gates[row] = gate;
       auto *destination_rows = peer_at<transport::BFloat16>(
           a.peer_bases[destination], a.canonical_rows_offset);
       auto *warp_storage = tma_storage + warp * copy_bytes;
@@ -250,6 +254,7 @@ __device__ __forceinline__ void publish_local_batch(
       expert = a.dispatch.expert_id[route];
       topk_slot = static_cast<std::uint32_t>(
           route % a.dispatch.identity.top_k);
+      const auto gate = a.gates[route];
       auto *destination_headers = peer_at<LocalP2pRouteHeader>(
           a.peer_bases[destination], a.direct_headers_offset);
       destination_headers[row] = LocalP2pRouteHeader{
@@ -265,6 +270,9 @@ __device__ __forceinline__ void publish_local_batch(
           row,
           expert,
           topk_slot};
+      auto *destination_gates = peer_at<float>(
+          a.peer_bases[destination], a.canonical_gates_offset);
+      destination_gates[row] = gate;
     }
     destination = __shfl_sync(0xffffffffU, destination, 0U);
     row = __shfl_sync(0xffffffffU, row, 0U);
@@ -339,7 +347,7 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
   auto *bytes = static_cast<std::byte *>(a.gin_window_base);
   auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.gin_send_header_offset);
-  auto *send_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+  auto *send_fanout = reinterpret_cast<ForwardDispatchFanoutRecord *>(
       bytes + a.gin_send_fanout_offset);
   auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.gin_send_payload_offset);
@@ -380,11 +388,18 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
         continue;
       const auto fanout = fanout_begin + fanout_slot;
       const auto target = a.dispatch.packet_fanout[fanout];
-      send_fanout[position * a.dispatch.identity.top_k + fanout_slot] =
-          target;
       source_compact_index[fanout] = target.return_compact_row;
       const auto route =
           token * a.dispatch.identity.top_k + target.topk_slot;
+      send_fanout[position * a.dispatch.identity.top_k + fanout_slot] =
+          ForwardDispatchFanoutRecord{
+              target.dst_row,
+              target.return_compact_row,
+              target.topk_slot,
+              static_cast<std::uint16_t>(target.destination_local_rank),
+              static_cast<std::uint16_t>(target.expert_id),
+              target.reserved,
+              a.gates[route]};
       source_route_index[target.return_compact_row] = route;
       // FULL Return lands directly in compact receive storage.  Its inverse
       // route map is generation-static, so publish it while Dispatch is already
@@ -512,7 +527,7 @@ __device__ __forceinline__ void relay_inbound_wave(
   auto *bytes = static_cast<std::byte *>(a.gin_window_base);
   auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.gin_receive_header_offset);
-  auto *receive_fanout = reinterpret_cast<DeviceFanoutRecord *>(
+  auto *receive_fanout = reinterpret_cast<ForwardDispatchFanoutRecord *>(
       bytes + a.gin_receive_fanout_offset);
   auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.gin_receive_payload_offset);
@@ -551,6 +566,7 @@ __device__ __forceinline__ void relay_inbound_wave(
           const auto packed =
               partition_fanout_base + header.dst_row + fanout_slot;
           const auto target = receive_fanout[packed];
+          const auto gate = target.gate;
           valid = 1U;
           destination_local_rank = target.destination_local_rank;
           destination_row = target.dst_row;
@@ -573,6 +589,9 @@ __device__ __forceinline__ void relay_inbound_wave(
                                   destination_row,
                                   target.expert_id,
                                   target.topk_slot};
+          auto *destination_gates = peer_at<float>(
+              a.peer_bases[destination], a.canonical_gates_offset);
+          destination_gates[destination_row] = gate;
         }
       }
       valid = __shfl_sync(0xffffffffU, valid, 0U);
@@ -612,7 +631,7 @@ __device__ __forceinline__ void relay_inbound_wave(
                                                   a.x_arrived_rows_offset);
       const auto rail = a.rank % a.local_world_size;
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          arrived[target.reserved * a.local_world_size + rail]);
+          arrived[target.mtile * a.local_world_size + rail]);
       ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
       // X readiness is the FC1 dependency; do not lengthen it with reverse-map
       // publication. FC2's descriptor is consumed only after the FULL mapping
@@ -632,11 +651,11 @@ __device__ __forceinline__ void relay_inbound_wave(
       const auto record_index =
           source_partition * a.gin_context_count + task.context;
       atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
-      if (target.reserved == 0U)
+      if (target.mtile == 0U)
         atomicAdd(&context_completion[record_index].relay_tile0_rows, 1ULL);
       atomicAdd(&completion->remote_rows_published, 1ULL);
-      if (target.reserved < 64U)
-        atomicOr(&completion->published_tile_mask, 1ULL << target.reserved);
+      if (target.mtile < 64U)
+        atomicOr(&completion->published_tile_mask, 1ULL << target.mtile);
 #endif
     }
     __syncthreads();
@@ -983,13 +1002,14 @@ __device__ __forceinline__ void issue_outbound_task(
   gin.put(rail, static_cast<int>(remote_node), a.gin_window,
           a.gin_receive_fanout_offset +
               receive_packet * a.dispatch.identity.top_k *
-                  sizeof(DeviceFanoutRecord),
+                  sizeof(ForwardDispatchFanoutRecord),
           a.gin_window,
           a.gin_send_fanout_offset +
               static_cast<std::size_t>(task.index) *
-                  a.dispatch.identity.top_k * sizeof(DeviceFanoutRecord),
+                  a.dispatch.identity.top_k *
+                  sizeof(ForwardDispatchFanoutRecord),
           packets * a.dispatch.identity.top_k *
-              sizeof(DeviceFanoutRecord));
+              sizeof(ForwardDispatchFanoutRecord));
   gin.put(rail, static_cast<int>(remote_node), a.gin_window,
           a.gin_receive_payload_offset +
               receive_packet * a.hidden * sizeof(transport::BFloat16),
@@ -1024,7 +1044,7 @@ __device__ __forceinline__ void issue_outbound_task(
   atomicAdd(&status->gin_metadata_bytes,
             packets * (sizeof(LocalP2pRouteHeader) +
                        a.dispatch.identity.top_k *
-                           sizeof(DeviceFanoutRecord)));
+                           sizeof(ForwardDispatchFanoutRecord)));
 }
 
 // Ring-free Dispatch arrival publication.  The GIN owner remains responsible
@@ -1394,6 +1414,7 @@ __device__ __forceinline__ void local_relay_role(
           const auto destination = a.dispatch.route_dst_rank[route];
           const auto row = a.dispatch.route_dst_row[route];
           const auto token = route / a.dispatch.identity.top_k;
+          const auto gate = a.gates[route];
           auto *destination_headers = peer_at<LocalP2pRouteHeader>(
               a.peer_bases[destination], a.direct_headers_offset);
           destination_headers[row] = LocalP2pRouteHeader{
@@ -1410,6 +1431,10 @@ __device__ __forceinline__ void local_relay_role(
               a.dispatch.expert_id[route],
               static_cast<std::uint32_t>(route %
                                          a.dispatch.identity.top_k)};
+
+          auto *destination_gates = peer_at<float>(
+              a.peer_bases[destination], a.canonical_gates_offset);
+          destination_gates[row] = gate;
 
           auto *destination_rows = peer_at<transport::BFloat16>(
               a.peer_bases[destination], a.canonical_rows_offset);

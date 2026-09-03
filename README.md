@@ -2,12 +2,14 @@
 
 MegaMOE is a Hopper-focused Mixture-of-Experts Forward pipeline. It overlaps
 Notify, activation dispatch, FC1/SwiGLU, FC2, return, and deterministic
-gate-after reduction without a whole-grid barrier between the split transport
-and compute kernels.
+unweighted reduction without a whole-grid barrier between the split transport
+and compute kernels. Each route gate is applied to the BF16 SwiGLU result
+before FC2, matching the intended Forward/Backward algebra.
 
 The current optimized contract is intentionally narrow:
 
-- BF16 activations, weights, and outputs with FP32 gate/reduction arithmetic;
+- BF16 activations, weights, FC2 inputs, and outputs with FP32 gate/reduction
+  arithmetic;
 - hidden size 7168, intermediate size 3072, 384 experts, top-k 1 or 6;
 - expert M blocks padded to 128 rows;
 - one CTA per SM, with compile-time-specialized Hopper TMA/WGMMA kernels;

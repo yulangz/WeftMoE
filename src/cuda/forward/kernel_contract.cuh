@@ -47,6 +47,7 @@ struct ForwardKernelArgs {
   // complete Dispatch grid has already joined.
   bool forward_stream_local_dispatch = false;
   std::size_t canonical_rows_offset;
+  std::size_t canonical_gates_offset;
   std::size_t forward_output_rows_offset;
   std::size_t direct_headers_offset;
   std::size_t contribution_offset;

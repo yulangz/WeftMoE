@@ -3,7 +3,7 @@
 #include "megamoe/transport/activation_protocol.hpp"
 
 namespace megamoe::transport {
-inline constexpr std::uint32_t kActivationTransportSchemaVersion = 1;
+inline constexpr std::uint32_t kActivationTransportSchemaVersion = 2;
 enum class ActivationExpertTransform : std::uint8_t { SyntheticValidation, Identity };
 enum class ActivationGatePlacement : std::uint8_t {
   SourceAfter,
