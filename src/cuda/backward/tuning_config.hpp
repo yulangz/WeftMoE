@@ -65,10 +65,13 @@
 #define MEGAMOE_BWD_RDMA_CTAS 8
 #endif
 #ifndef MEGAMOE_BWD_RELAY_CTAS
-#define MEGAMOE_BWD_RELAY_CTAS 8
+#define MEGAMOE_BWD_RELAY_CTAS 16
 #endif
 #ifndef MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP
 #define MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP 64
+#endif
+#ifndef MEGAMOE_BWD_DISPATCH_BATCH_ROWS
+#define MEGAMOE_BWD_DISPATCH_BATCH_ROWS 32
 #endif
 
 namespace megamoe::cuda::backward_tuning {
@@ -100,6 +103,8 @@ inline constexpr std::uint32_t kRdmaCtas = MEGAMOE_BWD_RDMA_CTAS;
 inline constexpr std::uint32_t kRelayCtas = MEGAMOE_BWD_RELAY_CTAS;
 inline constexpr std::uint32_t kQueueIdleNanosleep =
     MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP;
+inline constexpr std::uint32_t kDispatchBatchRows =
+    MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
 
 static_assert(kMainHidden == 7168U && kMainIntermediate == 3072U);
 static_assert(kTileM == 128U);
@@ -120,5 +125,7 @@ static_assert((kMathWarpgroups * kMathRegisters +
               65536U);
 static_assert(kRdmaCtas == 8U);
 static_assert(kRelayCtas >= 8U && kRelayCtas % 8U == 0U);
+static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
+              kDispatchBatchRows <= 128U);
 
 } // namespace megamoe::cuda::backward_tuning

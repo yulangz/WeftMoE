@@ -77,6 +77,28 @@ __global__ void backward_pack_cached_state_kernel(BackwardKernelArgs a,
   }
 }
 
+__global__ void backward_pack_gate_kernel(BackwardKernelArgs a) {
+  const auto expert = static_cast<std::uint32_t>(blockIdx.x);
+  if (expert >= a.dispatch.sizes.owned_expert_count)
+    return;
+  const auto compact_begin = a.dispatch.expert_row_prefix[expert];
+  const auto valid_rows = a.dispatch.expert_row_count[expert];
+  const auto *padded_rows = peer_at<const unsigned long long>(
+      a.local_base, a.padded_expert_rows_offset);
+  const auto *padded_offsets = peer_at<const unsigned long long>(
+      a.local_base, a.padded_expert_offsets_offset);
+  const auto *compact_gate = peer_at<const float>(
+      a.local_base, a.canonical_gate_offset);
+  auto *padded_gate = peer_at<float>(a.local_base, a.dgate_rows_offset);
+  for (std::uint64_t local_row = threadIdx.x;
+       local_row < padded_rows[expert]; local_row += blockDim.x) {
+    const auto padded_row = padded_offsets[expert] + local_row;
+    padded_gate[padded_row] =
+        local_row < valid_rows ? compact_gate[compact_begin + local_row]
+                               : 0.0F;
+  }
+}
+
 __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
   if (blockIdx.x != 0U)
     return;
@@ -147,38 +169,22 @@ __global__ void backward_wait_for_dispatch_rows_kernel(BackwardKernelArgs a,
     __nanosleep(256U);
 }
 
-__global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
-                                                 std::uint64_t rows) {
-  const auto row = static_cast<std::uint64_t>(blockIdx.x);
-  if (row >= rows)
-    return;
-  __shared__ unsigned int valid_row;
-  if (threadIdx.x == 0U) {
-    valid_row = 0U;
-    const auto *padded_offsets = peer_at<const unsigned long long>(
-        a.local_base, a.padded_expert_offsets_offset);
-    for (std::uint32_t expert = 0U;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-      const auto begin = padded_offsets[expert];
-      const auto end = padded_offsets[expert + 1U];
-      if (row >= begin && row < end) {
-        valid_row = row - begin < a.dispatch.expert_row_count[expert] ? 1U : 0U;
-        break;
-      }
-    }
-  }
-  __syncthreads();
-  const auto *du = peer_at<const transport::BFloat16>(
-      a.local_base, a.dx_rows_offset);
-  const auto *ab = peer_at<const transport::BFloat16>(
-      a.local_base, a.padded_ab_offset);
+__device__ __forceinline__ void backward_swiglu_epilogue_row(
+    const BackwardKernelArgs &a, std::uint64_t row, bool valid_row,
+    float *reduction) {
+  constexpr std::uint32_t kEpilogueThreads = 256U;
+  const bool active = threadIdx.x < kEpilogueThreads;
   auto *u = peer_at<transport::BFloat16>(a.local_base,
                                          a.recomputed_u_offset);
+  const auto *du = u;
+  const auto *ab = peer_at<const transport::BFloat16>(
+      a.local_base, a.padded_ab_offset);
   auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
   auto *dgate = peer_at<float>(a.local_base, a.dgate_rows_offset);
-  if (valid_row == 0U) {
-    for (std::uint64_t column = threadIdx.x; column < a.intermediate;
-         column += blockDim.x) {
+  if (!valid_row) {
+    for (std::uint64_t column = threadIdx.x;
+         active && column < a.intermediate;
+         column += kEpilogueThreads) {
       const auto index = row * a.intermediate + column;
       const auto output_base = row * 2ULL * a.intermediate;
       u[index] = transport::BFloat16{0U};
@@ -188,12 +194,14 @@ __global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
     }
     if (threadIdx.x == 0U)
       dgate[row] = 0.0F;
+    __syncthreads();
     return;
   }
   const auto gate = dgate[row];
   float partial = 0.0F;
-  for (std::uint64_t column = threadIdx.x; column < a.intermediate;
-       column += blockDim.x) {
+  for (std::uint64_t column = threadIdx.x;
+       active && column < a.intermediate;
+       column += kEpilogueThreads) {
     const auto index = row * a.intermediate + column;
     const auto av = bf16_bits_to_float(ab[index].bits);
     const auto bv = bf16_bits_to_float(
@@ -214,10 +222,10 @@ __global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
         float_to_bf16_bits(gate * s)};
     partial = fmaf(duv, s, partial);
   }
-  __shared__ float reduction[256];
-  reduction[threadIdx.x] = partial;
+  if (active)
+    reduction[threadIdx.x] = partial;
   __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0U;
+  for (std::uint32_t stride = kEpilogueThreads / 2U; stride != 0U;
        stride >>= 1U) {
     if (threadIdx.x < stride)
       reduction[threadIdx.x] += reduction[threadIdx.x + stride];
@@ -225,6 +233,31 @@ __global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
   }
   if (threadIdx.x == 0U)
     dgate[row] = reduction[0];
+}
+
+__global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
+                                                 std::uint64_t rows) {
+  const auto row = static_cast<std::uint64_t>(blockIdx.x);
+  if (row >= rows)
+    return;
+  __shared__ unsigned int valid_row;
+  __shared__ float reduction[256];
+  if (threadIdx.x == 0U) {
+    valid_row = 0U;
+    const auto *padded_offsets = peer_at<const unsigned long long>(
+        a.local_base, a.padded_expert_offsets_offset);
+    for (std::uint32_t expert = 0U;
+         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+      const auto begin = padded_offsets[expert];
+      const auto end = padded_offsets[expert + 1U];
+      if (row >= begin && row < end) {
+        valid_row = row - begin < a.dispatch.expert_row_count[expert] ? 1U : 0U;
+        break;
+      }
+    }
+  }
+  __syncthreads();
+  backward_swiglu_epilogue_row(a, row, valid_row != 0U, reduction);
 }
 
 __global__ void backward_return_local_kernel(BackwardKernelArgs a,
@@ -300,3 +333,5 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
         transport::BFloat16{float_to_bf16_bits(sum)};
   }
 }
+
+#include "cuda/persistent_v3/backward/pipeline_kernels.cuh"

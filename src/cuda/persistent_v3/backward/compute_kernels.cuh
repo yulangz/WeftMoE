@@ -49,15 +49,8 @@ __device__ __forceinline__ void store_m128_accumulator(
 }
 
 template <std::uint32_t TileN>
-__device__ __forceinline__ void run_k_mn_tile(
-    const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
-    std::uint32_t activation_row, std::uint32_t weight_reduction_start,
-    std::uint32_t reduction, transport::BFloat16 *output,
-    std::uint64_t output_width, std::uint32_t output_column,
+__device__ __forceinline__ void initialize_k_mn_pipeline(
     unsigned char *storage) {
-  static_assert(TileN == 128U || TileN == 256U);
-  using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-      TileN, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
   constexpr std::uint32_t kAStageElements = kStageM * kStageK;
   constexpr std::uint32_t kBStageElements = TileN * kStageK;
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
@@ -65,7 +58,6 @@ __device__ __forceinline__ void run_k_mn_tile(
   auto *full = reinterpret_cast<ForwardBarrier *>(
       smem_b + kStages * kBStageElements);
   auto *empty = full + kStages;
-
   if (threadIdx.x == kMathThreads) {
 #pragma unroll
     for (std::uint32_t stage = 0U; stage < kStages; ++stage) {
@@ -75,20 +67,40 @@ __device__ __forceinline__ void run_k_mn_tile(
     cutlass::arch::fence_barrier_init();
   }
   __syncthreads();
-
   const auto warpgroup = threadIdx.x / 128U;
   if (warpgroup < kMathWarpGroups)
     cutlass::arch::warpgroup_reg_alloc<backward_tuning::kMathRegisters>();
   else
     cutlass::arch::warpgroup_reg_dealloc<
         backward_tuning::kProducerRegisters>();
+}
+
+template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN>
+__device__ __forceinline__ void run_k_mn_tile(
+    const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
+    std::uint32_t activation_row, std::uint32_t weight_reduction_start,
+    std::uint32_t reduction, transport::BFloat16 *output,
+    std::uint64_t output_width, std::uint32_t output_column,
+    unsigned char *storage, std::uint32_t &pipeline) {
+  static_assert(TileN == 128U || TileN == 256U);
+  using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
+      TileN, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
+  constexpr std::uint32_t kAStageElements = kStageM * kStageK;
+  static_assert(StorageTileN >= TileN);
+  constexpr std::uint32_t kBStageElements = StorageTileN * kStageK;
+  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
+  auto *smem_b = smem_a + kStages * kAStageElements;
+  auto *full = reinterpret_cast<ForwardBarrier *>(
+      smem_b + kStages * kBStageElements);
+  auto *empty = full + kStages;
+
+  const auto warpgroup = threadIdx.x / 128U;
 
   // The scheduler/dispatch acquire is in the generic proxy. Make its dR/dAB
   // payload writes visible before the producer issues the first TMA load.
   if (threadIdx.x == kMathThreads)
     asm volatile("fence.proxy.async.global;" : : : "memory");
 
-  std::uint32_t pipeline = 0U;
   float accum[TileMma::kNumAccum];
   if (warpgroup < kMathWarpGroups) {
 #pragma unroll
@@ -113,7 +125,7 @@ __device__ __forceinline__ void run_k_mn_tile(
           &weight_mn_map, &full[stage], stage_b, output_column,
           weight_reduction_start + k);
       full[stage].arrive_and_expect_tx(
-          (kAStageElements + kBStageElements) *
+          (kAStageElements + TileN * kStageK) *
           sizeof(transport::BFloat16));
     }
   } else if (warpgroup < kMathWarpGroups) {
@@ -154,6 +166,7 @@ __device__ __forceinline__ void run_k_mn_tile(
   store_m128_accumulator<TileN>(accum, output, activation_row, output_column,
                                 output_width);
   __syncthreads();
+  pipeline += iterations;
 }
 #endif
 
@@ -166,6 +179,8 @@ backward_du_wgmma_kernel(
     const __grid_constant__ CUtensorMap w2_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   extern __shared__ __align__(1024) unsigned char storage[];
+  backward_compute_detail::initialize_k_mn_pipeline<TileN>(storage);
+  std::uint32_t pipeline = 0U;
   const auto ntiles = static_cast<std::uint32_t>(a.intermediate / TileN);
   const auto task = static_cast<std::uint64_t>(blockIdx.x);
   const auto mblock = task / ntiles;
@@ -176,12 +191,13 @@ backward_du_wgmma_kernel(
   const auto expert = backward_compute_detail::find_padded_expert(a, row);
   if (expert >= a.dispatch.sizes.owned_expert_count)
     return;
-  auto *du = peer_at<transport::BFloat16>(a.local_base, a.dx_rows_offset);
+  auto *du = peer_at<transport::BFloat16>(a.local_base,
+                                          a.recomputed_u_offset);
   backward_compute_detail::run_k_mn_tile<TileN>(
       dr_map, w2_map, static_cast<std::uint32_t>(row),
       static_cast<std::uint32_t>(expert * a.hidden),
       static_cast<std::uint32_t>(a.hidden), du, a.intermediate,
-      ntile * TileN, storage);
+      ntile * TileN, storage, pipeline);
 #else
   (void)a;
   (void)dr_map;
@@ -196,6 +212,8 @@ backward_dx_wgmma_kernel(
     const __grid_constant__ CUtensorMap w1_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   extern __shared__ __align__(1024) unsigned char storage[];
+  backward_compute_detail::initialize_k_mn_pipeline<TileN>(storage);
+  std::uint32_t pipeline = 0U;
   const auto ntiles = static_cast<std::uint32_t>(a.hidden / TileN);
   const auto task = static_cast<std::uint64_t>(blockIdx.x);
   const auto mblock = task / ntiles;
@@ -211,7 +229,7 @@ backward_dx_wgmma_kernel(
       dab_map, w1_map, static_cast<std::uint32_t>(row),
       static_cast<std::uint32_t>(expert * 2ULL * a.intermediate),
       static_cast<std::uint32_t>(2ULL * a.intermediate), dx, a.hidden,
-      ntile * TileN, storage);
+      ntile * TileN, storage, pipeline);
 #else
   (void)a;
   (void)dab_map;

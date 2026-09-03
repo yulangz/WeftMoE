@@ -2,13 +2,17 @@
 // implementation. This header is included only by the CUDA aggregation TU.
 struct BackwardKernelArgs {
   DeviceDispatchKernelView dispatch;
+  DispatchWaveKernelView dispatch_waves;
   const transport::BFloat16 *dy = nullptr;
   std::uint64_t hidden = 0;
   std::uint64_t intermediate = 0;
   std::uint64_t max_destination_rows = 0;
   std::uint64_t padded_capacity_rows = 0;
   std::uint64_t padded_rows = 0;
+  std::uint64_t scheduler_words = 0;
   std::uint64_t epoch = 0;
+  std::uint32_t scheduler_mblock_capacity = 0;
+  std::uint32_t mblocks = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
   void *local_base = nullptr;
@@ -33,4 +37,6 @@ struct BackwardKernelArgs {
   std::size_t setup_epoch_offset = 0;
   std::size_t dispatch_ready_offset = 0;
   std::size_t return_ready_offset = 0;
+  std::size_t scheduler_offset = 0;
+  std::size_t status_offset = 0;
 };

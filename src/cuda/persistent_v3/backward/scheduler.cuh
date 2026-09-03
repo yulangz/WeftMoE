@@ -75,6 +75,34 @@ MEGAMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
   ready.fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
 }
 
+// Publish only the leading tile prefix of an otherwise fixed-size domain.
+// Bits outside the prefix start in the claimed state, so the ordinary claim
+// path removes the owner-ready bit as soon as the exposed phase is drained.
+// A later phase can reset and republish the same immutable owner descriptor.
+MEGAMOE_V3_DEVICE inline void publish_owner_prefix(
+    TileDomain domain, std::uint32_t owner, std::uint32_t prefix_tiles) {
+  if (owner >= domain.owner_count || prefix_tiles == 0U ||
+      prefix_tiles > domain.tiles_per_owner)
+    return;
+  const auto claim_word_begin = owner * domain.claim_words_per_owner();
+  for (std::uint32_t word = 0U; word < domain.claim_words_per_owner();
+       ++word) {
+    const auto begin = word * 64U;
+    const auto remaining = prefix_tiles <= begin ? 0U : prefix_tiles - begin;
+    const auto available = remaining < 64U ? remaining : 64U;
+    const auto available_mask =
+        available == 64U ? ~0ULL : ((1ULL << available) - 1ULL);
+    const auto initially_claimed =
+        domain.valid_claim_mask(word) & ~available_mask;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
+        domain.claim_words[claim_word_begin + word]);
+    claim.store(initially_claimed, ::cuda::memory_order_relaxed);
+  }
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
+      domain.ready_words[owner / 64U]);
+  ready.fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
+}
+
 MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
                                                    std::uint32_t owner) {
   const auto words = domain.claim_words_per_owner();
