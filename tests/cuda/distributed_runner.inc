@@ -252,6 +252,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   if (benchmark_forward) {
     constexpr std::uint64_t hidden = 7168;
     constexpr std::uint64_t intermediate = 3072;
+    const bool retain_backward_state =
+        std::getenv("MEGAMOE_FORWARD_BENCH_RETAIN_STATE") != nullptr;
     auto setup_generation = megamoe::cuda::make_nccl_generation(
         base, "cuda-forward-bench", 701);
     auto setup_context = megamoe::make_rank_collective_context(
@@ -278,6 +280,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.max_inflight_generations = 1U;
     transport_config.max_intermediate_size = intermediate;
     transport_config.max_owned_experts = experts / world;
+    transport_config.enable_backward_state = retain_backward_state;
     transport_config.enable_gin_rdma = gin_forward_benchmark;
     transport_config.enable_socket_fallback = socket_forward_benchmark;
     const auto setup_start = Clock::now();
@@ -434,7 +437,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << std::endl;
       auto output = run_forward(
           notify.dispatch(), activations, weights,
-          {hidden, intermediate}, run_options);
+          {hidden, intermediate, retain_backward_state}, run_options);
       if (std::getenv("MEGAMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
                   << " round=" << round << " phase=forward_done"
@@ -549,6 +552,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                       : socket_forward_benchmark ? "nccl-socket-fallback"
                                                  : "local-cuda-p2p")
               << " specialization=sm90-wgmma-tma-7168x3072"
+              << " retained_backward_state=" << retain_backward_state
               << " reduce_scheduler=" << reduce_scheduler
               << " setup_us=" << one_time_setup_us
               << " device_pool_bytes=" << usage.device_bytes

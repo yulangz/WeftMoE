@@ -23,15 +23,15 @@
     "nccl": "2.29.7+cuda12.9",
     "world8": {
       "candidate": "world8_relay16_tma4",
-      "cache_key": "527f9005168a6c64a2d6b337de985ffe287d449b57aea8beea5cb36d85b5d8d9",
-      "cold_compile_seconds": 45.205,
+      "cache_key": "1431535edeffb17a02c76e9138adee75c45c0fecfe3484e03957deb8c89279cd",
+      "cold_compile_seconds": 44.832,
       "inference_instruction_count": 18968,
       "training_instruction_count": 19896
     },
     "world16": {
       "candidate": "current_m128_n128_n256",
-      "cache_key": "c7c25248a11fad5692c55b29c5df72ae1c1ce083a3a6d8a58d2e43539f3491d7",
-      "cold_compile_seconds": 37.185,
+      "cache_key": "2def34639aa5b20390918b315d9c92bc6387e387da8ea2f453dd24c0c1b84367",
+      "cold_compile_seconds": 37.533,
       "inference_instruction_count": 18976,
       "training_instruction_count": 19904
     },
@@ -68,6 +68,24 @@
       "change_percent": -0.494,
       "megatron_reference_mean_us": 31334.0,
       "speedup_vs_megatron": 1.463
+    },
+    "retained_state_write_overhead": {
+      "world8": {
+        "ordinary_mean_us": 14942.469,
+        "ordinary_p95_us": 15205.2,
+        "retained_mean_us": 15508.493,
+        "retained_p95_us": 15727.2,
+        "overhead_us": 566.024,
+        "overhead_percent": 3.788
+      },
+      "world16_gin": {
+        "ordinary_mean_us": 21332.876,
+        "ordinary_p95_us": 21913.5,
+        "retained_mean_us": 21838.41,
+        "retained_p95_us": 23168.9,
+        "overhead_us": 505.534,
+        "overhead_percent": 2.370
+      }
     }
   },
   "tests": {
