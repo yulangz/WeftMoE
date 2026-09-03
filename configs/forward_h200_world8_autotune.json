@@ -1,13 +1,18 @@
 {
-  "schema": 1,
-  "description": "Narrow one-host H200 Forward search. The split topology has zero RDMA CTAs; Relay and compute run concurrently over NVLink/CUDA IPC.",
+  "schema": 2,
+  "description": "Narrow one-host H200 Forward search. Python JIT-compiles each split specialization; the topology has zero RDMA CTAs and overlaps Relay with compute over NVLink/CUDA IPC.",
   "max_candidates": 4,
-  "build": {
-    "build_root": "artifacts/forward-autotune/build/world8",
+  "jit": {
+    "cache_root": "artifacts/forward-jit",
     "jobs": 8,
-    "cuda_arch_flags": "-gencode arch=compute_90a,code=sm_90a",
-    "target": "test_cuda_notify",
+    "architecture": "sm_90a",
     "timeout_seconds": 1800
+  },
+  "selection": {
+    "confirmation_candidates": 2,
+    "confirmation_repeats": 2,
+    "confirmation_rounds": 110,
+    "minimum_improvement_percent": 0.5
   },
   "benchmark": {
     "launcher": "local",

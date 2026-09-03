@@ -1,13 +1,18 @@
 {
-  "schema": 1,
-  "description": "Narrow two-host H200 Forward search. Every candidate is a separately compiled specialization; fixed entries are explicit singleton hyperparameters.",
+  "schema": 2,
+  "description": "Narrow two-host H200 Forward search. Python JIT-compiles every candidate into an atomic content-addressed cache; fixed entries are explicit singleton hyperparameters.",
   "max_candidates": 8,
-  "build": {
-    "build_root": "artifacts/forward-autotune/build/world16",
+  "jit": {
+    "cache_root": "artifacts/forward-jit",
     "jobs": 8,
-    "cuda_arch_flags": "-gencode arch=compute_90a,code=sm_90a",
-    "target": "test_cuda_notify",
+    "architecture": "sm_90a",
     "timeout_seconds": 1800
+  },
+  "selection": {
+    "confirmation_candidates": 2,
+    "confirmation_repeats": 2,
+    "confirmation_rounds": 110,
+    "minimum_improvement_percent": 0.5
   },
   "benchmark": {
     "remote": "user@remote-host",

@@ -88,8 +88,9 @@ The complete command matrix and runtime-library notes are in
 ## Autotuning
 
 Tuning values are explicit JSON and become compile-time constants in a
-generated header. The default two-node and single-node searches are deliberately
-small:
+generated header. Python performs content-addressed runtime compilation and
+autotuning directly; candidate compilation does not call Make. The default
+two-node and single-node searches are deliberately small:
 
 ```bash
 python3 tools/autotune_forward.py \
@@ -99,10 +100,23 @@ python3 tools/autotune_forward.py \
   --config configs/forward_h200_world8_autotune.json
 ```
 
-Candidate builds live under the ignored `artifacts/forward-autotune/build`
-tree so tuning no longer creates hundreds of root-level `build-*` directories.
-The result JSON records expanded parameters, compile/resource evidence,
+JIT binaries live under the ignored `artifacts/forward-jit/cache` tree. Cache
+keys cover generated code, repository and external header content, compiler
+identity, architecture, and flags; completed artifacts are published with an
+atomic directory rename. Intermediate objects are discarded. The result JSON
+records expanded parameters, cache provenance, compile/resource evidence,
 correctness fingerprints, elapsed time, and slowest-rank latency.
+
+The configured job count is a global budget: candidates compile concurrently,
+each with lanes for both specialized Forward translation units, while the
+shared host archive is created once.
+
+The tuner compiles the whole candidate set before measuring any candidate.
+It then confirms the incumbent and strongest challenger in two longer passes,
+reversing their order for the second pass; the challenger must beat the
+incumbent by the explicit JSON threshold before it can replace the production
+point. This prevents sub-percent run-to-run noise from becoming a
+generated-kernel change.
 
 ## Repository layout
 

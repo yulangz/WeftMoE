@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Compile and tune explicit MegaMOE Forward specializations.
+"""JIT-compile and tune explicit MegaMOE Forward specializations.
 
 The search plan is JSON rather than a collection of shell environment
-variables.  Each candidate gets a generated header and a distinct build
-directory, so its hot-path decisions are compile-time constants and its binary
-can be reproduced directly from the result artifact.
+variables.  Python generates each specialization, compiles it into an atomic
+content-addressed cache without Make, and benchmarks the cached executable.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import datetime as dt
 import hashlib
@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -271,16 +273,46 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require_choice(config, key, (0, 16, 32, 64, 128, 256, 512))
 
 
+def validate_selection(selection: Mapping[str, Any],
+                       candidate_count: int) -> None:
+    _require(isinstance(selection, dict), "selection must be an object")
+    expected = {
+        "confirmation_candidates",
+        "confirmation_repeats",
+        "confirmation_rounds",
+        "minimum_improvement_percent",
+    }
+    _require(set(selection) == expected,
+             "selection must contain exactly " + ", ".join(sorted(expected)))
+    count = selection["confirmation_candidates"]
+    repeats = selection["confirmation_repeats"]
+    rounds = selection["confirmation_rounds"]
+    threshold = selection["minimum_improvement_percent"]
+    _require(type(count) is int and 1 <= count <= candidate_count,
+             "selection.confirmation_candidates must be in "
+             f"[1, {candidate_count}]")
+    _require(type(rounds) is int and rounds > 10,
+             "selection.confirmation_rounds must be an integer >10")
+    _require(type(repeats) is int and 1 <= repeats <= 4,
+             "selection.confirmation_repeats must be in [1, 4]")
+    _require(type(threshold) in (int, float) and 0.0 <= threshold <= 10.0,
+             "selection.minimum_improvement_percent must be in [0, 10]")
+
+
 def load_plan(path: Path) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     _require(isinstance(document, dict), "top-level plan must be an object")
-    _require(document.get("schema") == 1, "plan schema must be 1")
-    for section in ("build", "benchmark", "fixed", "candidates"):
+    _require(document.get("schema") == 2, "plan schema must be 2")
+    for section in ("jit", "benchmark", "selection", "fixed", "candidates"):
         _require(section in document, f"plan omits {section}")
-    _require(isinstance(document["build"], dict), "build must be an object")
+    _require(isinstance(document["jit"], dict), "jit must be an object")
+    try:
+        validate_jit_config(document["jit"])
+    except JitError as error:
+        raise PlanError(str(error)) from error
     _require(isinstance(document["benchmark"], dict),
              "benchmark must be an object")
     benchmark = document["benchmark"]
@@ -336,6 +368,7 @@ def load_plan(path: Path) -> dict[str, Any]:
              "max_candidates must be in [1, 16]")
     _require(len(document["candidates"]) <= maximum,
              f"candidate count exceeds max_candidates={maximum}")
+    validate_selection(document["selection"], len(document["candidates"]))
     flatten_groups(document["fixed"], require_all=True)
     return document
 
@@ -500,57 +533,23 @@ def _sanitized_environment() -> dict[str, str]:
     return environment
 
 
-def _run_to_log(command: list[str], log_path: Path, *, timeout: int,
-                environment: Mapping[str, str]) -> tuple[float, int]:
-    start = time.monotonic()
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write("COMMAND " + json.dumps(command) + "\n")
-        log.flush()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=REPO_ROOT,
-                env=dict(environment),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            return time.monotonic() - start, completed.returncode
-        except subprocess.TimeoutExpired:
-            log.write(f"\nTIMEOUT after {timeout}s\n")
-            return time.monotonic() - start, 124
-
-
-def compile_candidate(candidate: Mapping[str, Any], paths: Mapping[str, Path],
-                      build: Mapping[str, Any], log_dir: Path,
-                      environment: Mapping[str, str]) -> dict[str, Any]:
-    binary = paths["build_dir"] / str(build["target"])
-    existed = binary.exists()
-    command = [
-        "make",
-        f"-j{int(build['jobs'])}",
-        f"BUILD_DIR={paths['build_dir']}",
-        f"FORWARD_TUNING_INCLUDE_DIR={paths['include_dir']}",
-        f"CUDA_ARCH_FLAGS={build['cuda_arch_flags']}",
-        str(binary),
-    ]
+def compile_candidate(candidate: Mapping[str, Any],
+                      compiler: ForwardJitCompiler,
+                      log_dir: Path, *,
+                      command_jobs: int | None = None) -> dict[str, Any]:
     log_path = log_dir / f"{candidate['name']}.build.log"
-    elapsed, returncode = _run_to_log(
-        command, log_path, timeout=int(build["timeout_seconds"]),
-        environment=environment)
-    result = {
-        "command": command,
-        "elapsed_seconds": elapsed,
-        "returncode": returncode,
-        "binary": str(binary),
-        "binary_preexisted": existed,
-        "log": str(log_path),
-    }
-    if returncode == 0:
+    result = compiler.build(
+        candidate_name=str(candidate["name"]),
+        config_digest=candidate_digest(candidate["config"]),
+        generated_header=generated_header(
+            str(candidate["name"]), candidate["config"]),
+        log_path=log_path,
+        command_jobs=command_jobs,
+    )
+    if result["returncode"] == 0:
         resources = inspect_forward_kernel(
-            binary, log_dir / f"{candidate['name']}.resources.log",
+            Path(result["binary"]),
+            log_dir / f"{candidate['name']}.resources.log",
             candidate["config"])
         result["resources"] = resources
         if (resources.get("available") and
@@ -559,6 +558,48 @@ def compile_candidate(candidate: Mapping[str, Any], paths: Mapping[str, Path],
             result["resource_validation_error"] = (
                 "expected exactly one compiled split Forward kernel")
     return result
+
+
+def compile_candidates(candidates: list[dict[str, Any]],
+                       compiler: ForwardJitCompiler,
+                       log_dir: Path) -> dict[str, dict[str, Any]]:
+    # Each specialization has two expensive activation_transport variants.
+    # Give both a compiler lane, then spend remaining global lanes on other
+    # candidates. The shared host archive is serialized inside the compiler.
+    workers = min(len(candidates), max(1, compiler.jobs // 2))
+    command_jobs = max(1, compiler.jobs // workers)
+    print(f"compile scheduling: candidates={len(candidates)} "
+          f"workers={workers} commands_per_worker={command_jobs}", flush=True)
+    results: dict[str, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                compile_candidate, candidate, compiler, log_dir,
+                command_jobs=command_jobs,
+            ): candidate
+            for candidate in candidates
+        }
+        completed_count = 0
+        for future in concurrent.futures.as_completed(futures):
+            candidate = futures[future]
+            completed_count += 1
+            try:
+                build_result = future.result()
+            except Exception as error:
+                build_result = {
+                    "backend": "python-content-addressed-jit",
+                    "returncode": 1,
+                    "error": f"{type(error).__name__}: {error}",
+                    "elapsed_seconds": 0.0,
+                    "log": str(log_dir / f"{candidate['name']}.build.log"),
+                }
+            results[candidate["name"]] = build_result
+            outcome = ("cache hit" if build_result.get("cache_hit") else
+                       "built" if build_result.get("returncode") == 0 else
+                       "failed")
+            print(f"[compile {completed_count}/{len(candidates)}] "
+                  f"{candidate['name']}: {outcome}", flush=True)
+    return results
 
 
 def launcher_command(binary: Path, benchmark: Mapping[str, Any],
@@ -694,6 +735,77 @@ def metric_value(record: Mapping[str, Any], dotted_name: str) -> float:
     return float(value)
 
 
+def weighted_metric(records: Iterable[Mapping[str, Any]],
+                    dotted_name: str) -> float:
+    weighted_sum = 0.0
+    measured_sum = 0
+    for record in records:
+        measured = record.get("measured")
+        _require(type(measured) is int and measured > 0,
+                 "benchmark record measured count must be a positive integer")
+        weighted_sum += metric_value(record, dotted_name) * measured
+        measured_sum += measured
+    _require(measured_sum > 0, "cannot aggregate an empty benchmark record set")
+    return weighted_sum / measured_sum
+
+
+def confirmation_finalists(valid: Iterable[dict[str, Any]],
+                           incumbent_name: str,
+                           count: int) -> list[dict[str, Any]]:
+    ranked = sorted(valid, key=lambda item: item["selection_metric_us"])
+    incumbent = next(
+        (item for item in ranked if item["name"] == incumbent_name), None)
+    finalists = [incumbent] if incumbent is not None else []
+    finalists.extend(item for item in ranked if item is not incumbent)
+    return finalists[:count]
+
+
+def choose_confirmed_candidate(
+        finalists: Iterable[dict[str, Any]], incumbent_name: str,
+        minimum_improvement_percent: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    confirmed = [item for item in finalists
+                 if "aggregate_metric_us" in item]
+    _require(bool(confirmed), "no candidate completed confirmation")
+    best = min(confirmed, key=lambda item: item["aggregate_metric_us"])
+    incumbent = next(
+        (item for item in confirmed if item["name"] == incumbent_name), None)
+    decision: dict[str, Any] = {
+        "incumbent": incumbent_name,
+        "best_confirmed": best["name"],
+        "minimum_improvement_percent": minimum_improvement_percent,
+    }
+    if incumbent is None:
+        decision.update({
+            "selected": best["name"],
+            "reason": "incumbent_not_confirmed",
+            "challenger_improvement_percent": None,
+        })
+        return best, decision
+    if best is incumbent:
+        decision.update({
+            "selected": incumbent["name"],
+            "reason": "incumbent_fastest",
+            "challenger_improvement_percent": 0.0,
+        })
+        return incumbent, decision
+    improvement = 100.0 * (
+        incumbent["aggregate_metric_us"] - best["aggregate_metric_us"]
+    ) / incumbent["aggregate_metric_us"]
+    if improvement >= minimum_improvement_percent:
+        winner = best
+        reason = "challenger_exceeds_threshold"
+    else:
+        winner = incumbent
+        reason = "challenger_below_threshold"
+    decision.update({
+        "selected": winner["name"],
+        "reason": reason,
+        "challenger_improvement_percent": improvement,
+    })
+    return winner, decision
+
+
 def correctness_fingerprint(record: Mapping[str, Any]) -> str:
     missing = [key for key in CORRECTNESS_KEYS if key not in record]
     if missing:
@@ -723,11 +835,39 @@ def _write_result(path: Path, result: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _timing_summary(result: Mapping[str, Any], elapsed: float) -> dict[str, float]:
+    candidates = result.get("candidates", [])
+    selected = result.get("selected", {})
+    phase_wall = result.get("phase_wall_seconds", {})
+    return {
+        "build_seconds": phase_wall.get("compile", sum(
+            item.get("build", {}).get("elapsed_seconds", 0.0)
+            for item in candidates)),
+        "tune_benchmark_seconds": phase_wall.get("tune", sum(
+            item.get("tune", {}).get("elapsed_seconds", 0.0)
+            for item in candidates)),
+        "confirmation_benchmark_seconds": phase_wall.get("confirmation", sum(
+            sum(run.get("elapsed_seconds", 0.0)
+                for run in item.get("confirmations", []))
+            for item in candidates)),
+        "final_benchmark_seconds": phase_wall.get("final", selected.get(
+            "final", {}).get("elapsed_seconds", 0.0)),
+        "total_seconds": elapsed,
+    }
+
+
 def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
-    build = plan["build"]
+    jit = plan["jit"]
     benchmark = plan["benchmark"]
+    selection = plan["selection"]
     if args.jobs is not None:
-        build["jobs"] = args.jobs
+        jit["jobs"] = args.jobs
+    if args.cache_root is not None:
+        jit["cache_root"] = args.cache_root
+    if args.nvcc is not None:
+        jit["nvcc"] = args.nvcc
+    if args.cxx is not None:
+        jit["cxx"] = args.cxx
     if args.remote is not None:
         benchmark["remote"] = args.remote
     if args.port is not None:
@@ -738,6 +878,13 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
         benchmark["tune_rounds"] = args.tune_rounds
     if args.final_rounds is not None:
         benchmark["final_rounds"] = args.final_rounds
+    if args.confirmation_rounds is not None:
+        selection["confirmation_rounds"] = args.confirmation_rounds
+    if args.confirmation_repeats is not None:
+        selection["confirmation_repeats"] = args.confirmation_repeats
+    if args.minimum_improvement_percent is not None:
+        selection["minimum_improvement_percent"] = (
+            args.minimum_improvement_percent)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -754,11 +901,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path,
                         help="explicit result JSON path")
     parser.add_argument("--jobs", type=int)
+    parser.add_argument("--cache-root")
+    parser.add_argument("--nvcc")
+    parser.add_argument("--cxx")
     parser.add_argument("--remote")
     parser.add_argument("--port", type=int)
     parser.add_argument("--nccl-lib-dir")
     parser.add_argument("--tune-rounds", type=int)
     parser.add_argument("--final-rounds", type=int)
+    parser.add_argument("--confirmation-rounds", type=int)
+    parser.add_argument("--confirmation-repeats", type=int)
+    parser.add_argument("--minimum-improvement-percent", type=float)
     return parser.parse_args(argv)
 
 
@@ -771,6 +924,7 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config.resolve()
     plan = load_plan(config_path)
     _configure_from_cli(plan, args)
+    validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)
     requested = set(args.candidate)
     if requested:
@@ -780,10 +934,18 @@ def main(argv: list[str] | None = None) -> int:
         candidates = [candidate for candidate in candidates
                       if candidate["name"] in requested]
     _require(candidates, "candidate filter selected no configurations")
+    validate_selection(plan["selection"], len(plan["candidates"]))
 
-    build = plan["build"]
+    jit = plan["jit"]
     benchmark = plan["benchmark"]
-    build_root = _resolve_repo_path(str(build["build_root"]))
+    selection = plan["selection"]
+    _require(type(benchmark["tune_rounds"]) is int and
+             benchmark["tune_rounds"] > 10,
+             "benchmark.tune_rounds must be an integer >10")
+    _require(type(benchmark["final_rounds"]) is int and
+             benchmark["final_rounds"] > 10,
+             "benchmark.final_rounds must be an integer >10")
+    cache_root = _resolve_repo_path(str(jit["cache_root"]))
     result_dir = _resolve_repo_path(str(benchmark["result_dir"]))
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_path = (args.output.resolve() if args.output else
@@ -792,14 +954,16 @@ def main(argv: list[str] | None = None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     materialized = {
-        candidate["name"]: materialize_candidate(candidate, build_root)
+        candidate["name"]: materialize_candidate(
+            candidate, cache_root / "generated")
         for candidate in candidates
-    }
+    } if args.generate_only else {}
     if args.generate_only:
         manifest = {
             "schema": 1,
             "mode": "generate-only",
             "config_path": str(config_path),
+            "jit": copy.deepcopy(jit),
             "candidates": [
                 {
                     **candidate,
@@ -815,27 +979,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.build_only:
         environment = _sanitized_environment()
+        compiler = ForwardJitCompiler(
+            REPO_ROOT, jit, environment,
+            nccl_lib_dir=benchmark.get("nccl_lib_dir"),
+        )
         start_build_only = time.monotonic()
         manifest: dict[str, Any] = {
             "schema": 1,
             "mode": "dynamic-compile",
             "config_path": str(config_path),
             "git": _git_revision(),
+            "jit": copy.deepcopy(jit),
             "candidates": [],
         }
         all_valid = True
-        for ordinal, candidate in enumerate(candidates, 1):
-            print(f"[{ordinal}/{len(candidates)}] compile {candidate['name']}",
-                  flush=True)
-            paths = materialized[candidate["name"]]
-            build_result = compile_candidate(candidate, paths, build, log_dir,
-                                             environment)
+        start_compile = time.monotonic()
+        build_results = compile_candidates(candidates, compiler, log_dir)
+        manifest["compile_wall_seconds"] = time.monotonic() - start_compile
+        for candidate in candidates:
+            build_result = build_results[candidate["name"]]
             valid = build_result["returncode"] == 0
             all_valid = all_valid and valid
             manifest["candidates"].append({
                 **candidate,
                 "digest": candidate_digest(candidate["config"]),
-                "generated_header": str(paths["header"]),
+                "generated_header": build_result.get("generated_header"),
                 "status": "built" if valid else "build_failed",
                 "build": build_result,
             })
@@ -847,6 +1015,10 @@ def main(argv: list[str] | None = None) -> int:
 
     start_total = time.monotonic()
     environment = _sanitized_environment()
+    compiler = ForwardJitCompiler(
+        REPO_ROOT, jit, environment,
+        nccl_lib_dir=benchmark.get("nccl_lib_dir"),
+    )
     result: dict[str, Any] = {
         "schema": 1,
         "mode": "compile-and-tune",
@@ -854,33 +1026,53 @@ def main(argv: list[str] | None = None) -> int:
         "config_path": str(config_path),
         "git": _git_revision(),
         "selection_metric": benchmark["selection_metric"],
-        "build": copy.deepcopy(build),
+        "selection_policy": copy.deepcopy(selection),
+        "jit": copy.deepcopy(jit),
         "benchmark": copy.deepcopy(benchmark),
+        "phase_wall_seconds": {},
         "candidates": [],
     }
-    reference_fingerprint = None
-    for ordinal, candidate in enumerate(candidates, 1):
-        print(f"[{ordinal}/{len(candidates)}] compile {candidate['name']}",
-              flush=True)
-        paths = materialized[candidate["name"]]
+
+    # Finish compilation before touching the benchmark fabric. This keeps
+    # candidate measurements under the same thermal/runtime conditions and
+    # makes a cold cache affect wall time, never the ordering of measurements.
+    for candidate in candidates:
         candidate_result: dict[str, Any] = {
             **candidate,
             "digest": candidate_digest(candidate["config"]),
-            "generated_header": str(paths["header"]),
             "status": "building",
         }
         result["candidates"].append(candidate_result)
-        build_result = compile_candidate(candidate, paths, build, log_dir,
-                                         environment)
+    _write_result(output_path, result)
+    start_compile = time.monotonic()
+    build_results = compile_candidates(candidates, compiler, log_dir)
+    result["phase_wall_seconds"]["compile"] = (
+        time.monotonic() - start_compile)
+    for candidate_result in result["candidates"]:
+        build_result = build_results[candidate_result["name"]]
         candidate_result["build"] = build_result
+        candidate_result["generated_header"] = build_result.get(
+            "generated_header")
         if build_result["returncode"] != 0:
             candidate_result["status"] = "build_failed"
             print(f"  build failed; see {build_result['log']}", flush=True)
-            _write_result(output_path, result)
             continue
-        print(f"  benchmark {int(benchmark['tune_rounds'])} rounds", flush=True)
+        candidate_result["status"] = "built"
+    _write_result(output_path, result)
+
+    reference_fingerprint = None
+    candidate_by_name = {candidate["name"]: candidate
+                         for candidate in candidates}
+    benchmarkable = [item for item in result["candidates"]
+                     if item["status"] == "built"]
+    start_tune = time.monotonic()
+    for ordinal, candidate_result in enumerate(benchmarkable, 1):
+        candidate = candidate_by_name[candidate_result["name"]]
+        print(f"[tune {ordinal}/{len(benchmarkable)}] {candidate['name']}: "
+              f"{int(benchmark['tune_rounds'])} rounds", flush=True)
         bench_result = benchmark_candidate(
-            candidate, Path(build_result["binary"]), benchmark, log_dir,
+            candidate, Path(candidate_result["build"]["binary"]), benchmark,
+            log_dir,
             environment, rounds=int(benchmark["tune_rounds"]))
         candidate_result["tune"] = bench_result
         if bench_result["returncode"] != 0 or bench_result["record"] is None:
@@ -906,30 +1098,119 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  forward mean={forward_stats['mean']:.3f} us "
               f"p95={forward_stats['p95']:.3f} us", flush=True)
         _write_result(output_path, result)
+    result["phase_wall_seconds"]["tune"] = time.monotonic() - start_tune
 
     valid = [item for item in result["candidates"]
              if item["status"] == "valid"]
     if not valid:
         result["elapsed_seconds"] = time.monotonic() - start_total
-        result["timing"] = {
-            "build_seconds": sum(item["build"]["elapsed_seconds"]
-                                 for item in result["candidates"]),
-            "tune_benchmark_seconds": sum(
-                item.get("tune", {}).get("elapsed_seconds", 0.0)
-                for item in result["candidates"]),
-            "final_benchmark_seconds": 0.0,
-            "total_seconds": result["elapsed_seconds"],
-        }
+        result["timing"] = _timing_summary(
+            result, result["elapsed_seconds"])
         result["status"] = "no_valid_candidate"
         _write_result(output_path, result)
         print(f"no valid candidate; partial result: {output_path}", file=sys.stderr)
         return 1
-    winner = min(valid, key=lambda item: item["selection_metric_us"])
+    incumbent_name = candidates[0]["name"]
+    finalist_count = min(int(selection["confirmation_candidates"]), len(valid))
+    finalists = confirmation_finalists(
+        valid, incumbent_name, finalist_count)
+    result["selection_finalists"] = [item["name"] for item in finalists]
+    confirmation_repeats = int(selection["confirmation_repeats"])
+    for candidate_result in finalists:
+        candidate_result["confirmations"] = []
+        candidate_result["confirmation_status"] = "running"
+    start_confirmation = time.monotonic()
+    total_confirmation_runs = len(finalists) * confirmation_repeats
+    completed_confirmation_runs = 0
+    for repeat in range(confirmation_repeats):
+        ordered = finalists if repeat % 2 == 0 else list(reversed(finalists))
+        for candidate_result in ordered:
+            completed_confirmation_runs += 1
+            if candidate_result["confirmation_status"] != "running":
+                continue
+            candidate = candidate_by_name[candidate_result["name"]]
+            print(f"[confirm {completed_confirmation_runs}/"
+                  f"{total_confirmation_runs}] {candidate['name']} "
+                  f"pass={repeat + 1}: "
+                  f"{int(selection['confirmation_rounds'])} rounds", flush=True)
+            confirmation = benchmark_candidate(
+                candidate, Path(candidate_result["build"]["binary"]),
+                benchmark, log_dir, environment,
+                rounds=int(selection["confirmation_rounds"]),
+                suffix=f"confirm{repeat + 1}")
+            candidate_result["confirmations"].append(confirmation)
+            if (confirmation["returncode"] != 0 or
+                    confirmation["record"] is None):
+                candidate_result["confirmation_status"] = "benchmark_failed"
+                print(f"  confirmation failed; see {confirmation['log']}",
+                      flush=True)
+                _write_result(output_path, result)
+                continue
+            fingerprint = correctness_fingerprint(confirmation["record"])
+            confirmation["correctness_fingerprint"] = fingerprint
+            if fingerprint != reference_fingerprint:
+                candidate_result["confirmation_status"] = (
+                    "correctness_mismatch")
+                print("  confirmation correctness fingerprint changed",
+                      flush=True)
+                _write_result(output_path, result)
+                continue
+            confirmation_metric = metric_value(
+                confirmation["record"], str(benchmark["selection_metric"]))
+            confirmation["metric_us"] = confirmation_metric
+            print(f"  confirmation mean={confirmation_metric:.3f} us",
+                  flush=True)
+            _write_result(output_path, result)
+
+    for candidate_result in finalists:
+        if candidate_result["confirmation_status"] != "running":
+            continue
+        confirmation_records = [
+            confirmation["record"]
+            for confirmation in candidate_result["confirmations"]
+        ]
+        if len(confirmation_records) != confirmation_repeats:
+            candidate_result["confirmation_status"] = "incomplete"
+            continue
+        candidate_result["confirmation_metrics_us"] = [
+            confirmation["metric_us"]
+            for confirmation in candidate_result["confirmations"]
+        ]
+        candidate_result["confirmation_metric_us"] = weighted_metric(
+            confirmation_records, str(benchmark["selection_metric"]))
+        candidate_result["aggregate_metric_us"] = weighted_metric(
+            [candidate_result["tune"]["record"], *confirmation_records],
+            str(benchmark["selection_metric"]))
+        candidate_result["confirmation_status"] = "confirmed"
+        print(f"[confirm aggregate] {candidate_result['name']}: "
+              f"{candidate_result['aggregate_metric_us']:.3f} us", flush=True)
+    _write_result(output_path, result)
+    result["phase_wall_seconds"]["confirmation"] = (
+        time.monotonic() - start_confirmation)
+
+    confirmed = [item for item in finalists
+                 if item.get("confirmation_status") == "confirmed"]
+    if not confirmed:
+        result["elapsed_seconds"] = time.monotonic() - start_total
+        result["status"] = "no_confirmed_candidate"
+        result["timing"] = _timing_summary(
+            result, result["elapsed_seconds"])
+        _write_result(output_path, result)
+        print(f"no candidate completed confirmation; partial result: "
+              f"{output_path}", file=sys.stderr)
+        return 1
+
+    winner, decision = choose_confirmed_candidate(
+        confirmed, incumbent_name,
+        float(selection["minimum_improvement_percent"]))
+    result["selection_decision"] = decision
     result["selected"] = {
         "name": winner["name"],
         "digest": winner["digest"],
         "config": winner["config"],
-        "selection_metric_us": winner["selection_metric_us"],
+        "initial_metric_us": winner["selection_metric_us"],
+        "selection_metric_us": winner["aggregate_metric_us"],
+        "aggregate_metric_us": winner["aggregate_metric_us"],
         "binary": winner["build"]["binary"],
     }
 
@@ -938,14 +1219,18 @@ def main(argv: list[str] | None = None) -> int:
               f"{int(benchmark['final_rounds'])} rounds", flush=True)
         winner_candidate = next(candidate for candidate in candidates
                                 if candidate["name"] == winner["name"])
+        start_final = time.monotonic()
         final_result = benchmark_candidate(
             winner_candidate, Path(winner["build"]["binary"]), benchmark,
             log_dir, environment, rounds=int(benchmark["final_rounds"]),
             suffix="final")
+        result["phase_wall_seconds"]["final"] = time.monotonic() - start_final
         result["selected"]["final"] = final_result
         if final_result["returncode"] != 0 or final_result["record"] is None:
             result["status"] = "final_validation_failed"
             result["elapsed_seconds"] = time.monotonic() - start_total
+            result["timing"] = _timing_summary(
+                result, result["elapsed_seconds"])
             _write_result(output_path, result)
             print(f"final validation failed; see {final_result['log']}",
                   file=sys.stderr)
@@ -953,6 +1238,8 @@ def main(argv: list[str] | None = None) -> int:
         if correctness_fingerprint(final_result["record"]) != reference_fingerprint:
             result["status"] = "final_correctness_mismatch"
             result["elapsed_seconds"] = time.monotonic() - start_total
+            result["timing"] = _timing_summary(
+                result, result["elapsed_seconds"])
             _write_result(output_path, result)
             print("final validation correctness fingerprint changed",
                   file=sys.stderr)
@@ -962,26 +1249,18 @@ def main(argv: list[str] | None = None) -> int:
 
     result["status"] = "complete"
     result["elapsed_seconds"] = time.monotonic() - start_total
-    result["timing"] = {
-        "build_seconds": sum(item["build"]["elapsed_seconds"]
-                             for item in result["candidates"]),
-        "tune_benchmark_seconds": sum(
-            item.get("tune", {}).get("elapsed_seconds", 0.0)
-            for item in result["candidates"]),
-        "final_benchmark_seconds": result["selected"].get(
-            "final", {}).get("elapsed_seconds", 0.0),
-        "total_seconds": result["elapsed_seconds"],
-    }
+    result["timing"] = _timing_summary(result, result["elapsed_seconds"])
     result["completed_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
     _write_result(output_path, result)
     print(f"selected {winner['name']} at "
-          f"{winner['selection_metric_us']:.3f} us; result {output_path}")
+          f"{winner['aggregate_metric_us']:.3f} us "
+          f"({decision['reason']}); result {output_path}")
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except PlanError as error:
+    except (PlanError, JitError) as error:
         print(f"configuration error: {error}", file=sys.stderr)
         raise SystemExit(2)

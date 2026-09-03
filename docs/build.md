@@ -111,10 +111,44 @@ python3 tools/autotune_forward.py \
   --config configs/forward_h200_world8_autotune.json
 ```
 
-Each candidate receives a generated tuning header and its own content-addressed
-build directory. All kernel choices are compiled constants. Environment
-variables remain only for benchmark workload controls and runtime library
-selection; they do not select a tuned kernel.
+Each plan also has an explicit selection policy. The maintained plans confirm
+the incumbent and the fastest initial challenger twice for 110 rounds each,
+reversing their order in the second pass, and only replace the incumbent for
+an aggregate improvement of at least 0.5%. The initial and confirmation means
+are weighted by their reported measured-iteration counts.
+`--confirmation-repeats`, `--confirmation-rounds`, and
+`--minimum-improvement-percent` are available for deliberate experiments; the
+checked-in JSON remains the source of truth.
+
+Compilation and tuning are both driven at Python runtime. The autotuner does
+not call Make: it generates the tuning header, invokes `g++`, `nvcc`, and `ar`
+with argument arrays, links the validation executable, inspects its kernel
+resources, and then launches the benchmark. To compile one specialization
+without measuring it:
+
+```bash
+python3 tools/autotune_forward.py \
+  --config configs/forward_h200_world8_autotune.json \
+  --candidate world8_relay16_tma4 --build-only
+```
+
+`jit.jobs` is a global compilation budget. The compiler gives each active
+specialization at least two command lanes for its two heavy Forward translation
+units and compiles several candidates concurrently when the budget permits.
+The invariant host archive is protected by a process-local lock and published
+once into the same content cache.
+
+The JIT design follows DeepGEMM's default NVCC path. A cache key covers the
+fully generated header, repository source bytes, the installed
+DeepGEMM/CUTLASS include tree, architecture, flags, compiler versions, and
+NCCL library location. Compilation occurs in a same-filesystem UUID temporary
+directory. Files are flushed and the complete directory is atomically renamed
+into the cache, so another process can never observe a partial binary.
+
+All kernel choices remain compile-time constants. Environment variables are
+used only by the benchmark harness for workload controls and runtime library
+selection; they never select a tuned kernel. Compiler paths and the cache root
+can be overridden explicitly with `--nvcc`, `--cxx`, and `--cache-root`.
 
 The JSON result contains:
 
@@ -122,12 +156,27 @@ The JSON result contains:
 - build time and SASS resource inspection;
 - slowest-rank mean/P50/P95/min/max;
 - a correctness fingerprint over inputs, weights, routes, gates, and output;
-- winner and final-validation timing;
+- initial and confirmation measurements, the threshold decision, and final
+  winner-validation timing;
 - total autotune duration.
 
-Candidate builds are placed under `artifacts/forward-autotune/build`, not in
-root-level `build-*` directories. They may be removed after the result JSON and
-selected configuration have been retained.
+JIT artifacts are placed under `artifacts/forward-jit/cache`, not in root-level
+`build-*` directories. Intermediate objects are deleted before publication;
+each candidate retains only its executable, generated header, and provenance
+manifest. A cold compile populates the cache, while an identical later request
+performs only dependency hashing and resource inspection. The cache may be
+removed after the result JSON and selected configuration have been retained.
+
+This path deliberately uses NVCC rather than NVRTC. MegaMOE's current Forward
+specialization spans CUDA kernels, NCCL GIN device code, host transport state,
+and the distributed validation entry point. Extracting a standalone cubin ABI
+would couple communication-resource lifetime changes to this build-system
+change; that can be considered separately after the Forward API is stable.
+
+Compilation is a distinct first phase: all candidates are present in the
+content cache before any benchmark starts. This avoids interleaving a cold,
+CPU-heavy compile with distributed measurements and gives every candidate the
+same benchmark phase conditions.
 
 ## ABI and release checks
 

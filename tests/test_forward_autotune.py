@@ -12,6 +12,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import autotune_forward as tune  # noqa: E402
+import forward_jit  # noqa: E402
+
+
+def makefile_list(variable: str) -> tuple[str, ...]:
+    lines = (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()
+    prefix = f"{variable} := "
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+        values = []
+        remainder = line[len(prefix):].strip()
+        while True:
+            continued = remainder.endswith("\\")
+            if continued:
+                remainder = remainder[:-1].strip()
+            values.extend(remainder.split())
+            if not continued:
+                return tuple(values)
+            index += 1
+            remainder = lines[index].strip()
+    raise AssertionError(f"Makefile variable {variable} is absent")
 
 
 class ForwardAutotuneTest(unittest.TestCase):
@@ -21,6 +42,16 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_default_plan_is_narrow_and_complete(self):
+        self.assertEqual(self.plan["schema"], 2)
+        self.assertIn("jit", self.plan)
+        self.assertNotIn("build", self.plan)
+        self.assertEqual(self.plan["jit"]["architecture"], "sm_90a")
+        self.assertEqual(self.plan["selection"], {
+            "confirmation_candidates": 2,
+            "confirmation_repeats": 2,
+            "confirmation_rounds": 110,
+            "minimum_improvement_percent": 0.5,
+        })
         self.assertEqual(len(self.candidates), 7)
         self.assertLessEqual(len(self.candidates), self.plan["max_candidates"])
         for candidate in self.candidates:
@@ -103,6 +134,89 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(tune.candidate_digest(candidate["config"]),
                          tune.candidate_digest(candidate["config"]))
+
+    def test_jit_cache_key_covers_signature_and_generated_source(self):
+        signature = {"nvcc": "12.9", "architecture": "sm_90a"}
+        first = forward_jit.content_cache_key(signature, "#define TILE_M 128\n")
+        self.assertEqual(
+            first,
+            forward_jit.content_cache_key(
+                {"architecture": "sm_90a", "nvcc": "12.9"},
+                "#define TILE_M 128\n"))
+        self.assertNotEqual(
+            first,
+            forward_jit.content_cache_key(signature, "#define TILE_M 64\n"))
+        self.assertNotEqual(
+            first,
+            forward_jit.content_cache_key(
+                {"nvcc": "12.9", "architecture": "sm_100a"},
+                "#define TILE_M 128\n"))
+
+    def test_jit_settings_are_explicit_and_closed(self):
+        forward_jit.validate_jit_config(self.plan["jit"])
+        invalid = copy.deepcopy(self.plan["jit"])
+        invalid["shell_command"] = "make"
+        with self.assertRaisesRegex(forward_jit.JitError,
+                                    "unknown JIT settings"):
+            forward_jit.validate_jit_config(invalid)
+
+    def test_jit_source_graph_matches_conventional_testing_build(self):
+        self.assertEqual(makefile_list("LIB_SOURCES"),
+                         forward_jit.HOST_SOURCES)
+        self.assertEqual(makefile_list("CUDA_LIB_SOURCES"),
+                         forward_jit.CUDA_SOURCES)
+        self.assertEqual(makefile_list("CUDA_TEST_SOURCES"),
+                         (forward_jit.TEST_SOURCE,))
+
+    def test_selection_settings_are_explicit_and_closed(self):
+        invalid = copy.deepcopy(self.plan["selection"])
+        invalid["shell_command"] = "benchmark-once"
+        with self.assertRaisesRegex(tune.PlanError,
+                                    "selection must contain exactly"):
+            tune.validate_selection(invalid, len(self.candidates))
+
+    def test_weighted_metric_uses_measured_iterations(self):
+        records = [
+            {"measured": 30, "forward": {"mean": 10.0}},
+            {"measured": 100, "forward": {"mean": 20.0}},
+        ]
+        self.assertAlmostEqual(
+            tune.weighted_metric(records, "forward.mean"),
+            (30 * 10.0 + 100 * 20.0) / 130)
+
+    def test_confirmation_threshold_rejects_noise(self):
+        incumbent = {
+            "name": "baseline",
+            "selection_metric_us": 100.1,
+            "aggregate_metric_us": 100.0,
+        }
+        challenger = {
+            "name": "challenger",
+            "selection_metric_us": 99.8,
+            "aggregate_metric_us": 99.8,
+        }
+        winner, decision = tune.choose_confirmed_candidate(
+            [incumbent, challenger], "baseline", 0.5)
+        self.assertIs(winner, incumbent)
+        self.assertEqual(decision["reason"], "challenger_below_threshold")
+        challenger["aggregate_metric_us"] = 99.0
+        winner, decision = tune.choose_confirmed_candidate(
+            [incumbent, challenger], "baseline", 0.5)
+        self.assertIs(winner, challenger)
+        self.assertEqual(decision["reason"],
+                         "challenger_exceeds_threshold")
+
+    def test_timing_summary_uses_parallel_phase_wall_time(self):
+        result = {
+            "phase_wall_seconds": {"compile": 7.0},
+            "candidates": [
+                {"build": {"elapsed_seconds": 6.0}},
+                {"build": {"elapsed_seconds": 6.5}},
+            ],
+        }
+        timing = tune._timing_summary(result, 8.0)
+        self.assertEqual(timing["build_seconds"], 7.0)
+        self.assertEqual(timing["total_seconds"], 8.0)
 
     def test_register_file_overflow_is_rejected(self):
         invalid = copy.deepcopy(self.candidates[0]["config"])
