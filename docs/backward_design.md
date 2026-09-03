@@ -91,20 +91,21 @@ register split, and cluster policy remain compile-time autotuning parameters.
 
 ## Work-conserving CTA policy
 
-Compute CTAs poll all four logical queues at every task boundary. They are
-split into compile-time-tuned cohorts so production of new `dX` work cannot be
-starved:
+All compute CTAs belong to one work-conserving pool. At every task boundary a
+CTA probes each logical queue at most once, in this fixed priority order:
 
 ```text
-dX-latency cohort:  Q_DX  > Q_DAB > Q_DW2 > Q_DW1
-dAB-feeder cohort:  Q_DAB > Q_DX  > Q_DW2 > Q_DW1
+Q_DX > Q_DAB > Q_DW2 > Q_DW1
 ```
 
-If neither activation queue currently has an issuable task, either cohort may
-claim dW immediately. Once a dW tile starts it is not preempted, so a small
-activation-reserve cohort and the 128x128 dW tile duration bound the wake-up
-latency when a later `dR` wave arrives. There is no age-based fairness between
-`dW1` and `dW2`; their order is a throughput/locality tuning choice.
+There is no second `Q_DX` probe before falling through to dW. Queue descriptors
+and their readiness state persist, so a task published just after its probe is
+not lost; a CTA observes it at its next task boundary. If neither activation
+queue currently has an issuable task, the CTA may claim dW immediately. Once a
+dW tile starts it is not preempted, so its tile duration bounds the wake-up
+latency when a later `dR` wave arrives. There is no static CTA reservation, CTA
+cohort, priority-burst policy, or age-based fairness. The order between `dW1`
+and `dW2` remains a throughput/locality tuning choice.
 
 The execution therefore has two conceptual periods but no physical phase
 transition:
