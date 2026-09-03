@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "cuda/persistent_v3/backward/scheduler_probe.cuh"
 #include "cuda/persistent_v3/roles/compute_role.cuh"
 #include "cuda/persistent_v3/shared_storage.cuh"
 
@@ -373,6 +374,98 @@ run_persistent_v3_protocol_probe(std::uint32_t tasks_per_context) {
           probe_input_value(context, local_task, global_task), global_task);
     }
   }
+  return result;
+}
+
+} // namespace megamoe::cuda::testing
+
+namespace megamoe::cuda::testing {
+
+BackwardSchedulerProbeResult run_backward_scheduler_probe() {
+  using namespace persistent_v3;
+  using namespace persistent_v3::backward;
+
+  int device = 0;
+  throw_cuda_error(cudaGetDevice(&device),
+                   "cudaGetDevice(BWD scheduler probe)");
+  cudaDeviceProp properties{};
+  throw_cuda_error(cudaGetDeviceProperties(&properties, device),
+                   "cudaGetDeviceProperties(BWD scheduler probe)");
+  const auto sm_count =
+      static_cast<std::uint32_t>(properties.multiProcessorCount);
+  if (sm_count <= kRdmaCtaCount + kDefaultRelayCtaCount ||
+      sm_count > kSchedulerProbeMaxCtas)
+    throw std::runtime_error(
+        "BWD scheduler probe requires 17..256 SMs");
+  const auto compute_ctas =
+      sm_count - kRdmaCtaCount - kDefaultRelayCtaCount;
+
+  int active_per_sm = 0;
+  throw_cuda_error(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &active_per_sm, backward_scheduler_probe_kernel,
+          backward_tuning::kComputeThreads, 0),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(BWD scheduler probe)");
+  if (active_per_sm < 1)
+    throw std::runtime_error("BWD scheduler probe kernel is not resident");
+
+  BackwardSchedulerProbeWorkspace *raw_workspace = nullptr;
+  throw_cuda_error(
+      cudaMalloc(reinterpret_cast<void **>(&raw_workspace),
+                 sizeof(BackwardSchedulerProbeWorkspace)),
+      "cudaMalloc(BWD scheduler probe)");
+  struct WorkspaceDeleter {
+    void operator()(BackwardSchedulerProbeWorkspace *pointer) const noexcept {
+      if (pointer != nullptr)
+        (void)cudaFree(pointer);
+    }
+  };
+  std::unique_ptr<BackwardSchedulerProbeWorkspace, WorkspaceDeleter> workspace(
+      raw_workspace);
+  throw_cuda_error(
+      cudaMemset(raw_workspace, 0, sizeof(BackwardSchedulerProbeWorkspace)),
+      "cudaMemset(BWD scheduler probe)");
+
+  backward_scheduler_probe_setup_kernel<<<1, 32>>>(raw_workspace);
+  throw_cuda_error(cudaGetLastError(), "BWD scheduler setup launch");
+  backward_scheduler_probe_kernel<<<compute_ctas,
+                                    backward_tuning::kComputeThreads>>>(
+      raw_workspace);
+  throw_cuda_error(cudaGetLastError(), "BWD scheduler probe launch");
+  throw_cuda_error(cudaDeviceSynchronize(),
+                   "cudaDeviceSynchronize(BWD scheduler probe)");
+
+  auto host = std::make_unique<BackwardSchedulerProbeWorkspace>();
+  throw_cuda_error(cudaMemcpy(host.get(), raw_workspace, sizeof(*host),
+                              cudaMemcpyDeviceToHost),
+                   "cudaMemcpy(BWD scheduler probe result)");
+
+  BackwardSchedulerProbeResult result;
+  result.sm_count = sm_count;
+  result.compute_ctas = compute_ctas;
+  for (std::uint32_t cta = 0U; cta < compute_ctas; ++cta) {
+    if (host->cta_claims[cta] != 0ULL)
+      ++result.participating_ctas;
+  }
+  result.dx_completed =
+      host->completed[static_cast<std::uint32_t>(backward::TaskKind::Dx)]
+          .value;
+  result.dab_completed =
+      host->completed[static_cast<std::uint32_t>(backward::TaskKind::Dab)]
+          .value;
+  result.dw2_completed =
+      host->completed[static_cast<std::uint32_t>(backward::TaskKind::Dw2)]
+          .value;
+  result.dw1_completed =
+      host->completed[static_cast<std::uint32_t>(backward::TaskKind::Dw1)]
+          .value;
+  result.total_completed = host->total_completed.value;
+  result.duplicate_claims = host->duplicate_claims.value;
+  result.dependency_errors = host->dependency_errors.value;
+  result.priority_errors = host->priority_errors.value;
+  result.timeout_errors = host->timeout_errors.value;
+  result.terminal_epoch = host->terminal_epoch.value;
+  result.terminal_publish_count = host->terminal_publish_count.value;
   return result;
 }
 

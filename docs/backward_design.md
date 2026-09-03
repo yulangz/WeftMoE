@@ -104,8 +104,8 @@ not lost; a CTA observes it at its next task boundary. If neither activation
 queue currently has an issuable task, the CTA may claim dW immediately. Once a
 dW tile starts it is not preempted, so its tile duration bounds the wake-up
 latency when a later `dR` wave arrives. There is no static CTA reservation, CTA
-cohort, priority-burst policy, or age-based fairness. The order between `dW1`
-and `dW2` remains a throughput/locality tuning choice.
+cohort, priority-burst policy, or age-based fairness. `dW2` is always probed
+before `dW1`; tile shape and stage count remain compile-time tuning choices.
 
 The execution therefore has two conceptual periods but no physical phase
 transition:

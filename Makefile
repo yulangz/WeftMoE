@@ -184,6 +184,9 @@ $(BUILD_DIR)/production/src/cuda/persistent_v3/kernel_entry.o: \
 	src/cuda/persistent_v3/pipelines/task_scoreboard.cuh \
 	src/cuda/persistent_v3/roles/common.cuh \
 	src/cuda/persistent_v3/roles/compute_role.cuh \
+	src/cuda/backward/tuning_config.hpp \
+	src/cuda/persistent_v3/backward/scheduler.cuh \
+	src/cuda/persistent_v3/backward/scheduler_probe.cuh \
 	src/cuda/persistent_v3/testing.hpp
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)

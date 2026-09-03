@@ -2452,6 +2452,25 @@ int main(int argc, char **argv) {
                 << " tasks=" << probe.tasks_completed
                 << " terminal_publish_count="
                 << probe.terminal_publish_count << '\n';
+      const auto backward_probe =
+          megamoe::cuda::testing::run_backward_scheduler_probe();
+      require(backward_probe.dx_completed == 36ULL &&
+                  backward_probe.dab_completed == 60ULL &&
+                  backward_probe.dw2_completed == 28ULL &&
+                  backward_probe.dw1_completed == 268ULL &&
+                  backward_probe.total_completed == 392ULL &&
+                  backward_probe.duplicate_claims == 0ULL &&
+                  backward_probe.dependency_errors == 0ULL &&
+                  backward_probe.priority_errors == 0ULL &&
+                  backward_probe.timeout_errors == 0ULL &&
+                  backward_probe.terminal_epoch != 0ULL &&
+                  backward_probe.terminal_publish_count == 1ULL,
+              "BWD four-queue scheduler probe failed");
+      std::cout << "[PASS] BWD scheduler compute="
+                << backward_probe.compute_ctas
+                << " participating=" << backward_probe.participating_ctas
+                << " tasks=" << backward_probe.total_completed
+                << " priority=dx>dab>dw2>dw1\n";
       return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--resource-pool-test") {
