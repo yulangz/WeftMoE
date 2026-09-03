@@ -13,10 +13,31 @@ constexpr std::uint32_t kNoMblock = ~0U;
 constexpr std::uint32_t kNoTask = ~0U;
 constexpr std::uint32_t kTerminalTask = ~1U;
 constexpr std::uint32_t kDabRowsPerMblock = backward_tuning::kTileM;
+constexpr std::uint32_t kDw2MTiles =
+    backward_tuning::kMainHidden / backward_tuning::kDwTileM;
+constexpr std::uint32_t kDw2NTiles =
+    backward_tuning::kMainIntermediate / backward_tuning::kDwTileN;
+constexpr std::uint32_t kDw1MTiles =
+    (2U * backward_tuning::kMainIntermediate) /
+    backward_tuning::kDwTileM;
+constexpr std::uint32_t kDw1NTiles =
+    backward_tuning::kMainHidden / backward_tuning::kDwTileN;
+constexpr std::uint32_t kDw2TilesPerExpert =
+    backward_tuning::kDw2TilesPerExpert;
+constexpr std::uint32_t kDw1TilesPerExpert =
+    backward_tuning::kDw1TilesPerExpert;
 
 static_assert(kDabRowsPerMblock ==
               megamoe::cuda::persistent_v3::backward::
                   kDabPhaseTileCapacity);
+static_assert(backward_tuning::kMainHidden % backward_tuning::kDwTileM == 0U);
+static_assert(backward_tuning::kMainIntermediate %
+                  backward_tuning::kDwTileN ==
+              0U);
+static_assert((2U * backward_tuning::kMainIntermediate) %
+                  backward_tuning::kDwTileM ==
+              0U);
+static_assert(backward_tuning::kMainHidden % backward_tuning::kDwTileN == 0U);
 
 __device__ __forceinline__ unsigned long long *scheduler_words(
     const BackwardKernelArgs &a) {
@@ -49,6 +70,36 @@ __device__ __forceinline__ TileDomain make_dab_domain(
       TaskKind::Dab};
 }
 
+__device__ __forceinline__ TileDomain make_dw2_domain(
+    const BackwardKernelArgs &a, unsigned long long *words,
+    const megamoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
+        &layout) {
+  return TileDomain{
+      words + layout.dw2_ready,
+      words + layout.dw2_claim,
+      reinterpret_cast<PaddedCounter *>(words + layout.dw2_scan),
+      a.dispatch.sizes.owned_expert_count,
+      kDw2TilesPerExpert,
+      TaskKind::Dw2,
+      true,
+      backward_tuning::kDwClaimTiles};
+}
+
+__device__ __forceinline__ TileDomain make_dw1_domain(
+    const BackwardKernelArgs &a, unsigned long long *words,
+    const megamoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
+        &layout) {
+  return TileDomain{
+      words + layout.dw1_ready,
+      words + layout.dw1_claim,
+      reinterpret_cast<PaddedCounter *>(words + layout.dw1_scan),
+      a.dispatch.sizes.owned_expert_count,
+      kDw1TilesPerExpert,
+      TaskKind::Dw1,
+      true,
+      backward_tuning::kDwClaimTiles};
+}
+
 __device__ __forceinline__ WorkQueues make_work_queues(
     const BackwardKernelArgs &a, unsigned long long *words,
     const megamoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
@@ -56,6 +107,8 @@ __device__ __forceinline__ WorkQueues make_work_queues(
   WorkQueues queues{};
   queues.dx = make_dx_domain(a, words, layout);
   queues.dab = make_dab_domain(a, words, layout);
+  queues.dw2 = make_dw2_domain(a, words, layout);
+  queues.dw1 = make_dw1_domain(a, words, layout);
   return queues;
 }
 
@@ -70,6 +123,10 @@ __device__ __forceinline__ void initialize_status(
   status->fc2_complete_clock = 0ULL;
   status->reduce_blocks_done = ~0ULL; // First returned M-block.
   status->return_complete_clock = 0ULL;
+  status->backward_dw2_start_clock = ~0ULL;
+  status->backward_dw2_complete_clock = 0ULL;
+  status->backward_dw1_start_clock = ~0ULL;
+  status->backward_dw1_complete_clock = 0ULL;
 }
 
 __device__ __forceinline__ void publish_dispatch_if_ready(
@@ -118,7 +175,8 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
       megamoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
           a.scheduler_mblock_capacity,
           static_cast<std::uint32_t>(a.hidden /
-                                     backward_tuning::kDxTileN));
+                                     backward_tuning::kDxTileN),
+          a.scheduler_expert_capacity);
   for (std::uint64_t word = threadIdx.x; word < a.scheduler_words;
        word += blockDim.x)
     words[word] = 0ULL;
@@ -152,6 +210,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
                                    local_row),
         static_cast<std::uint32_t>(padded_row), expert, valid_rows};
   }
+  __syncthreads();
   if (threadIdx.x == 0U)
     initialize_status(a);
   __syncthreads();
@@ -202,7 +261,8 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
       megamoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
           a.scheduler_mblock_capacity,
           static_cast<std::uint32_t>(a.hidden /
-                                     backward_tuning::kDxTileN));
+                                     backward_tuning::kDxTileN),
+          a.scheduler_expert_capacity);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   constexpr std::uint32_t kWarps =
       backward_tuning::kComputeThreads / 32U;
@@ -426,19 +486,27 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
   }
 }
 
-template <std::uint32_t DabTileN, std::uint32_t DxTileN>
+template <std::uint32_t DabTileN, std::uint32_t DxTileN,
+          std::uint32_t DwTileN>
 __global__ __launch_bounds__(backward_tuning::kComputeThreads, 1) void
 backward_local_compute_kernel(
     BackwardKernelArgs a, const __grid_constant__ CUtensorMap dr_map,
     const __grid_constant__ CUtensorMap dab_map,
     const __grid_constant__ CUtensorMap w2_map,
-    const __grid_constant__ CUtensorMap w1_map) {
+    const __grid_constant__ CUtensorMap w1_map,
+    const __grid_constant__ CUtensorMap dr_mn_map,
+    const __grid_constant__ CUtensorMap u_mn_map,
+    const __grid_constant__ CUtensorMap dab_mn_map,
+    const __grid_constant__ CUtensorMap x_mn_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   using namespace backward_pipeline_detail;
   static_assert(backward_tuning::kMainIntermediate % DabTileN == 0U);
   static_assert(backward_tuning::kMainHidden % DxTileN == 0U);
-  constexpr std::uint32_t kStorageTileN =
+  static_assert(DwTileN == backward_tuning::kDwTileN);
+  constexpr std::uint32_t kActivationStorageTileN =
       DabTileN > DxTileN ? DabTileN : DxTileN;
+  constexpr std::uint32_t kStorageTileN =
+      kActivationStorageTileN > DwTileN ? kActivationStorageTileN : DwTileN;
   constexpr std::uint32_t kDuTiles =
       backward_tuning::kMainIntermediate / DabTileN;
   constexpr std::uint32_t kDxTiles =
@@ -455,28 +523,99 @@ backward_local_compute_kernel(
   auto *words = scheduler_words(a);
   const auto layout =
       megamoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
-          a.scheduler_mblock_capacity, kDxTiles);
+          a.scheduler_mblock_capacity, kDxTiles,
+          a.scheduler_expert_capacity);
   const auto queues = make_work_queues(a, words, layout);
   const auto *descriptors = reinterpret_cast<const BackwardMblockDescriptor *>(
       words + layout.descriptors);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  bool activation_complete = false;
+  std::uint32_t pending_dw2_owner = 0U;
+  std::uint32_t pending_dw2_next = 0U;
+  std::uint32_t pending_dw2_end = 0U;
+  std::uint32_t pending_dw1_owner = 0U;
+  std::uint32_t pending_dw1_next = 0U;
+  std::uint32_t pending_dw1_end = 0U;
 
   while (true) {
     if (threadIdx.x == 0U) {
       TileTask task{};
-      if (megamoe::cuda::persistent_v3::backward::try_claim_work(queues,
-                                                                  task)) {
+      bool claimed = false;
+      if (!activation_complete) {
+        claimed =
+            megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                queues.dx, task) ||
+            megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                queues.dab, task);
+        if (!claimed) {
+          auto *dx_counter = reinterpret_cast<PaddedCounter *>(
+              words + layout.completed_dx_tiles);
+          ::cuda::atomic_ref<unsigned long long,
+                             ::cuda::thread_scope_device>
+              completed_dx(dx_counter->value);
+          activation_complete =
+              completed_dx.load(::cuda::memory_order_acquire) ==
+              static_cast<unsigned long long>(a.mblocks) * kDxTiles;
+        }
+      }
+      if (!claimed) {
+        if (pending_dw2_next != pending_dw2_end) {
+          task = TileTask{pending_dw2_owner, pending_dw2_next++,
+                          TaskKind::Dw2, 1U};
+          claimed = true;
+        } else {
+          claimed =
+              megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  queues.dw2, task);
+          if (claimed && task.tile_count > 1U) {
+            pending_dw2_owner = task.owner;
+            pending_dw2_next = task.tile + 1U;
+            pending_dw2_end = task.tile + task.tile_count;
+          }
+        }
+      }
+      if (!claimed) {
+        if (pending_dw1_next != pending_dw1_end) {
+          task = TileTask{pending_dw1_owner, pending_dw1_next++,
+                          TaskKind::Dw1, 1U};
+          claimed = true;
+        } else {
+          claimed =
+              megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  queues.dw1, task);
+          if (claimed && task.tile_count > 1U) {
+            pending_dw1_owner = task.owner;
+            pending_dw1_next = task.tile + 1U;
+            pending_dw1_end = task.tile + task.tile_count;
+          }
+        }
+      }
+      if (claimed) {
         task_kind_shared = static_cast<std::uint32_t>(task.kind);
         task_owner_shared = task.owner;
         task_tile_shared = task.tile;
       } else {
-        auto *counter = reinterpret_cast<PaddedCounter *>(
+        auto *dx_counter = reinterpret_cast<PaddedCounter *>(
             words + layout.completed_dx_tiles);
+        auto *dw2_counter = reinterpret_cast<PaddedCounter *>(
+            words + layout.completed_dw2_tiles);
+        auto *dw1_counter = reinterpret_cast<PaddedCounter *>(
+            words + layout.completed_dw1_tiles);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed(counter->value);
+            completed_dx(dx_counter->value);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed_dw2(dw2_counter->value);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed_dw1(dw1_counter->value);
         task_kind_shared =
-            completed.load(::cuda::memory_order_acquire) ==
-                    static_cast<unsigned long long>(a.mblocks) * kDxTiles
+            completed_dx.load(::cuda::memory_order_acquire) ==
+                    static_cast<unsigned long long>(a.mblocks) * kDxTiles &&
+                    completed_dw2.load(::cuda::memory_order_acquire) ==
+                        static_cast<unsigned long long>(a.active_experts) *
+                            kDw2TilesPerExpert &&
+                    completed_dw1.load(::cuda::memory_order_acquire) ==
+                        static_cast<unsigned long long>(a.active_experts) *
+                            kDw1TilesPerExpert
                 ? kTerminalTask
                 : kNoTask;
       }
@@ -546,6 +685,25 @@ backward_local_compute_kernel(
             phase.store(3ULL, ::cuda::memory_order_release);
             megamoe::cuda::persistent_v3::backward::publish_owner(
                 queues.dx, owner);
+            ::cuda::atomic_ref<unsigned long long,
+                               ::cuda::thread_scope_device>
+                expert_completed(
+                    words[layout.expert_mblocks_completed +
+                          descriptor.expert]);
+            const auto expert_done = expert_completed.fetch_add(
+                                         1ULL,
+                                         ::cuda::memory_order_acq_rel) +
+                                     1ULL;
+            const auto *padded_rows = peer_at<const unsigned long long>(
+                a.local_base, a.padded_expert_rows_offset);
+            if (expert_done ==
+                padded_rows[descriptor.expert] /
+                    backward_tuning::kTileM) {
+              megamoe::cuda::persistent_v3::backward::publish_owner(
+                  queues.dw2, descriptor.expert);
+              megamoe::cuda::persistent_v3::backward::publish_owner(
+                  queues.dw1, descriptor.expert);
+            }
             atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
           }
         }
@@ -578,6 +736,75 @@ backward_local_compute_kernel(
         if (done == static_cast<unsigned long long>(a.mblocks) * kDxTiles)
           atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
       }
+    } else if (task_kind_shared ==
+               static_cast<std::uint32_t>(TaskKind::Dw2)) {
+      if (threadIdx.x == 0U)
+        atomicMin(&status->backward_dw2_start_clock,
+                  device_globaltimer_ns());
+      const auto m_tile = tile / kDw2NTiles;
+      const auto n_tile = tile % kDw2NTiles;
+      const auto *padded_rows = peer_at<const unsigned long long>(
+          a.local_base, a.padded_expert_rows_offset);
+      const auto *padded_offsets = peer_at<const unsigned long long>(
+          a.local_base, a.padded_expert_offsets_offset);
+      auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
+      backward_compute_detail::run_mn_mn_tile<
+          backward_tuning::kDwTileM, DwTileN, kStorageTileN>(
+          dr_mn_map, u_mn_map,
+          m_tile * backward_tuning::kDwTileM, n_tile * DwTileN,
+          static_cast<std::uint32_t>(padded_offsets[owner]),
+          static_cast<std::uint32_t>(padded_rows[owner]), dw2,
+          a.intermediate,
+          owner * static_cast<std::uint32_t>(a.hidden) +
+              m_tile * backward_tuning::kDwTileM,
+          storage, pipeline);
+      if (threadIdx.x == 0U) {
+        auto *counter = reinterpret_cast<PaddedCounter *>(
+            words + layout.completed_dw2_tiles);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed(counter->value);
+        const auto done = completed.fetch_add(
+                              1ULL, ::cuda::memory_order_acq_rel) +
+                          1ULL;
+        if (done == static_cast<unsigned long long>(a.active_experts) *
+                        kDw2TilesPerExpert)
+          atomicMax(&status->backward_dw2_complete_clock,
+                    device_globaltimer_ns());
+      }
+    } else if (task_kind_shared ==
+               static_cast<std::uint32_t>(TaskKind::Dw1)) {
+      if (threadIdx.x == 0U)
+        atomicMin(&status->backward_dw1_start_clock,
+                  device_globaltimer_ns());
+      const auto m_tile = tile / kDw1NTiles;
+      const auto n_tile = tile % kDw1NTiles;
+      const auto *padded_rows = peer_at<const unsigned long long>(
+          a.local_base, a.padded_expert_rows_offset);
+      const auto *padded_offsets = peer_at<const unsigned long long>(
+          a.local_base, a.padded_expert_offsets_offset);
+      auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset);
+      backward_compute_detail::run_mn_mn_tile<
+          backward_tuning::kDwTileM, DwTileN, kStorageTileN>(
+          dab_mn_map, x_mn_map,
+          m_tile * backward_tuning::kDwTileM, n_tile * DwTileN,
+          static_cast<std::uint32_t>(padded_offsets[owner]),
+          static_cast<std::uint32_t>(padded_rows[owner]), dw1, a.hidden,
+          owner * static_cast<std::uint32_t>(2ULL * a.intermediate) +
+              m_tile * backward_tuning::kDwTileM,
+          storage, pipeline);
+      if (threadIdx.x == 0U) {
+        auto *counter = reinterpret_cast<PaddedCounter *>(
+            words + layout.completed_dw1_tiles);
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed(counter->value);
+        const auto done = completed.fetch_add(
+                              1ULL, ::cuda::memory_order_acq_rel) +
+                          1ULL;
+        if (done == static_cast<unsigned long long>(a.active_experts) *
+                        kDw1TilesPerExpert)
+          atomicMax(&status->backward_dw1_complete_clock,
+                    device_globaltimer_ns());
+      }
     }
     __syncthreads();
   }
@@ -587,5 +814,9 @@ backward_local_compute_kernel(
   (void)dab_map;
   (void)w2_map;
   (void)w1_map;
+  (void)dr_mn_map;
+  (void)u_mn_map;
+  (void)dab_mn_map;
+  (void)x_mn_map;
 #endif
 }

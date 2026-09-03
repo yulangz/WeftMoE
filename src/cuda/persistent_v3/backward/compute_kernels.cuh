@@ -9,9 +9,17 @@ constexpr std::uint32_t kStageK = backward_tuning::kTileK;
 constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 
 template <std::uint32_t TileN>
+constexpr std::uint32_t stage_storage_elements() {
+  constexpr auto activation_elements = (kStageM + TileN) * kStageK;
+  constexpr auto dw_elements =
+      (backward_tuning::kDwTileM + backward_tuning::kDwTileN) * kStageK;
+  return activation_elements > dw_elements ? activation_elements
+                                           : dw_elements;
+}
+
+template <std::uint32_t TileN>
 constexpr std::size_t dynamic_shared_bytes() {
-  return static_cast<std::size_t>(kStages) *
-             (kStageM * kStageK + TileN * kStageK) *
+  return static_cast<std::size_t>(kStages) * stage_storage_elements<TileN>() *
              sizeof(transport::BFloat16) +
          2U * kStages *
              sizeof(cutlass::arch::ClusterTransactionBarrier);
@@ -51,12 +59,10 @@ __device__ __forceinline__ void store_m128_accumulator(
 template <std::uint32_t TileN>
 __device__ __forceinline__ void initialize_k_mn_pipeline(
     unsigned char *storage) {
-  constexpr std::uint32_t kAStageElements = kStageM * kStageK;
-  constexpr std::uint32_t kBStageElements = TileN * kStageK;
-  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
-  auto *smem_b = smem_a + kStages * kAStageElements;
+  constexpr auto kStageStorageElements = stage_storage_elements<TileN>();
+  auto *smem = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *full = reinterpret_cast<ForwardBarrier *>(
-      smem_b + kStages * kBStageElements);
+      smem + kStages * kStageStorageElements);
   auto *empty = full + kStages;
   if (threadIdx.x == kMathThreads) {
 #pragma unroll
@@ -75,23 +81,30 @@ __device__ __forceinline__ void initialize_k_mn_pipeline(
         backward_tuning::kProducerRegisters>();
 }
 
-template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN>
-__device__ __forceinline__ void run_k_mn_tile(
-    const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
-    std::uint32_t activation_row, std::uint32_t weight_reduction_start,
-    std::uint32_t reduction, transport::BFloat16 *output,
-    std::uint64_t output_width, std::uint32_t output_column,
+template <std::uint32_t TileM, std::uint32_t TileN,
+          std::uint32_t StorageTileN,
+          cute::UMMA::Major MajorA, cute::UMMA::Major MajorB>
+__device__ __forceinline__ void run_wgmma_tile(
+    const CUtensorMap &a_map, const CUtensorMap &b_map,
+    std::uint32_t a_m, std::uint32_t b_n, std::uint32_t a_k,
+    std::uint32_t b_k, std::uint32_t reduction,
+    transport::BFloat16 *output, std::uint64_t output_width,
+    std::uint32_t output_row, std::uint32_t output_column,
     unsigned char *storage, std::uint32_t &pipeline) {
+  static_assert(TileM == 128U || TileM == 256U);
   static_assert(TileN == 128U || TileN == 256U);
+  constexpr std::uint32_t kMWaves = TileM / kStageM;
   using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-      TileN, cute::UMMA::Major::K, cute::UMMA::Major::MN>::type;
-  constexpr std::uint32_t kAStageElements = kStageM * kStageK;
-  static_assert(StorageTileN >= TileN);
-  constexpr std::uint32_t kBStageElements = StorageTileN * kStageK;
-  auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
-  auto *smem_b = smem_a + kStages * kAStageElements;
+      TileN, MajorA, MajorB>::type;
+  constexpr std::uint32_t kAStageElements = TileM * kStageK;
+  constexpr std::uint32_t kBStageElements = TileN * kStageK;
+  constexpr auto kStageStorageElements =
+      stage_storage_elements<StorageTileN>();
+  static_assert(kAStageElements + kBStageElements <=
+                kStageStorageElements);
+  auto *smem = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *full = reinterpret_cast<ForwardBarrier *>(
-      smem_b + kStages * kBStageElements);
+      smem + kStages * kStageStorageElements);
   auto *empty = full + kStages;
 
   const auto warpgroup = threadIdx.x / 128U;
@@ -101,10 +114,10 @@ __device__ __forceinline__ void run_k_mn_tile(
   if (threadIdx.x == kMathThreads)
     asm volatile("fence.proxy.async.global;" : : : "memory");
 
-  float accum[TileMma::kNumAccum];
+  float accum[TileMma::kNumAccum * kMWaves];
   if (warpgroup < kMathWarpGroups) {
 #pragma unroll
-    for (int index = 0; index < TileMma::kNumAccum; ++index)
+    for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
       accum[index] = 0.0F;
   }
   const auto iterations = reduction / kStageK;
@@ -115,17 +128,27 @@ __device__ __forceinline__ void run_k_mn_tile(
       const auto phase = (current / kStages) & 1U;
       empty[stage].wait(phase ^ 1U);
       auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
-          smem_a + stage * kAStageElements);
-      auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
-          smem_b + stage * kBStageElements);
+          smem + stage * kStageStorageElements);
+      auto *stage_b = stage_a + kAStageElements;
       const auto k = iteration * kStageK;
-      deep_gemm::tma::copy<kStageK, kStageM, 128, cutlass::bfloat16_t>(
-          &activation_map, &full[stage], stage_a, k, activation_row);
-      deep_gemm::tma::copy<TileN, kStageK, 128, cutlass::bfloat16_t>(
-          &weight_mn_map, &full[stage], stage_b, output_column,
-          weight_reduction_start + k);
+      if constexpr (MajorA == cute::UMMA::Major::K)
+        deep_gemm::tma::copy<kStageK, TileM, 128,
+                             cutlass::bfloat16_t>(
+            &a_map, &full[stage], stage_a, a_k + k, a_m);
+      else
+        deep_gemm::tma::copy<TileM, kStageK, 128,
+                             cutlass::bfloat16_t>(
+            &a_map, &full[stage], stage_a, a_m, a_k + k);
+      if constexpr (MajorB == cute::UMMA::Major::K)
+        deep_gemm::tma::copy<kStageK, TileN, 128,
+                             cutlass::bfloat16_t>(
+            &b_map, &full[stage], stage_b, b_k + k, b_n);
+      else
+        deep_gemm::tma::copy<TileN, kStageK, 128,
+                             cutlass::bfloat16_t>(
+            &b_map, &full[stage], stage_b, b_n, b_k + k);
       full[stage].arrive_and_expect_tx(
-          (kAStageElements + TileN * kStageK) *
+          (kAStageElements + kBStageElements) *
           sizeof(transport::BFloat16));
     }
   } else if (warpgroup < kMathWarpGroups) {
@@ -134,39 +157,84 @@ __device__ __forceinline__ void run_k_mn_tile(
       const auto stage = current % kStages;
       const auto phase = (current / kStages) & 1U;
       auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
-          smem_a + stage * kAStageElements);
-      auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
-          smem_b + stage * kBStageElements);
+          smem + stage * kStageStorageElements);
+      auto *stage_b = stage_a + kAStageElements;
       full[stage].wait(phase);
 #pragma unroll
-      for (int index = 0; index < TileMma::kNumAccum; ++index)
+      for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
       deep_gemm::ptx::warpgroup_arrive();
 #pragma unroll
-      for (std::uint32_t k = 0U; k < kStageK / TileMma::K; ++k) {
-        const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
-            cute::UMMA::Major::K, kStageM, kStageK, 128,
-            cutlass::bfloat16_t>(stage_a, warpgroup * 64U,
-                                 k * TileMma::K);
-        const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
-            cute::UMMA::Major::MN, TileN, kStageK, 128,
-            cutlass::bfloat16_t>(stage_b, 0U, k * TileMma::K);
-        TileMma::wgmma(desc_a, desc_b, accum, 1);
-      }
+      for (std::uint32_t wave = 0U; wave < kMWaves; ++wave)
+#pragma unroll
+        for (std::uint32_t k = 0U; k < kStageK / TileMma::K; ++k) {
+          const auto desc_a = deep_gemm::mma::sm90::make_gmma_desc<
+              MajorA, TileM, kStageK, 128,
+              cutlass::bfloat16_t>(
+              stage_a, wave * kStageM + warpgroup * 64U,
+              k * TileMma::K);
+          const auto desc_b = deep_gemm::mma::sm90::make_gmma_desc<
+              MajorB, TileN, kStageK, 128,
+              cutlass::bfloat16_t>(stage_b, 0U, k * TileMma::K);
+          TileMma::wgmma(desc_a, desc_b,
+                         accum + wave * TileMma::kNumAccum, 1);
+        }
       deep_gemm::ptx::warpgroup_commit_batch();
 #pragma unroll
-      for (int index = 0; index < TileMma::kNumAccum; ++index)
+      for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
         deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+      if (iteration != 0U) {
+        deep_gemm::ptx::warpgroup_wait<1>();
+        const auto completed = pipeline + iteration - 1U;
+        if ((threadIdx.x & 31U) == 0U)
+          empty[completed % kStages].arrive();
+      }
+    }
+    if (iterations != 0U) {
       deep_gemm::ptx::warpgroup_wait<0>();
+      const auto completed = pipeline + iterations - 1U;
       if ((threadIdx.x & 31U) == 0U)
-        empty[stage].arrive();
+        empty[completed % kStages].arrive();
     }
   }
   __syncthreads();
-  store_m128_accumulator<TileN>(accum, output, activation_row, output_column,
-                                output_width);
+#pragma unroll
+  for (std::uint32_t wave = 0U; wave < kMWaves; ++wave)
+    store_m128_accumulator<TileN>(
+        accum + wave * TileMma::kNumAccum, output,
+        output_row + wave * kStageM, output_column, output_width);
   __syncthreads();
   pipeline += iterations;
+}
+
+template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN>
+__device__ __forceinline__ void run_k_mn_tile(
+    const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
+    std::uint32_t activation_row, std::uint32_t weight_reduction_start,
+    std::uint32_t reduction, transport::BFloat16 *output,
+    std::uint64_t output_width, std::uint32_t output_column,
+    unsigned char *storage, std::uint32_t &pipeline) {
+  run_wgmma_tile<kStageM, TileN, StorageTileN, cute::UMMA::Major::K,
+                 cute::UMMA::Major::MN>(
+      activation_map, weight_mn_map, activation_row, output_column, 0U,
+      weight_reduction_start, reduction, output, output_width,
+      activation_row, output_column, storage, pipeline);
+}
+
+template <std::uint32_t TileM, std::uint32_t TileN,
+          std::uint32_t StorageTileN = TileN>
+__device__ __forceinline__ void run_mn_mn_tile(
+    const CUtensorMap &left_map, const CUtensorMap &right_map,
+    std::uint32_t output_row, std::uint32_t output_column,
+    std::uint32_t reduction_start, std::uint32_t reduction,
+    transport::BFloat16 *output, std::uint64_t output_width,
+    std::uint32_t global_output_row, unsigned char *storage,
+    std::uint32_t &pipeline) {
+  run_wgmma_tile<TileM, TileN, StorageTileN, cute::UMMA::Major::MN,
+                 cute::UMMA::Major::MN>(
+      left_map, right_map, output_row, output_column, reduction_start,
+      reduction_start, reduction, output, output_width, global_output_row,
+      output_column, storage, pipeline);
 }
 #endif
 

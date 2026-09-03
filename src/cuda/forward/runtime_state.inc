@@ -1598,6 +1598,26 @@ ActivationTransportResourcePool make_activation_transport_pool(
               state->layout.backward_padded_capacity_rows,
               backward_tuning::kTileM, "Backward padded dAB",
               backward_tuning::kTileK);
+          slot.backward_dr_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_padded_dr),
+              config.max_hidden_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dW2 dR MN-major");
+          slot.backward_u_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_u),
+              config.max_intermediate_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dW2 U MN-major");
+          slot.backward_dab_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_dab_rows),
+              2ULL * config.max_intermediate_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dW1 dAB MN-major");
+          slot.backward_x_mn_map = make_bf16_tma_map_mn(
+              at<void>(slot.device, state->layout.backward_padded_x),
+              config.max_hidden_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dW1 X MN-major");
           slot.backward_maps_valid = true;
         }
         if (slot.gin_window != nullptr)

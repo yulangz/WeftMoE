@@ -24,6 +24,7 @@ struct TileTask {
   std::uint32_t owner = 0U;
   std::uint32_t tile = 0U;
   TaskKind kind = TaskKind::None;
+  std::uint32_t tile_count = 1U;
 };
 
 struct TileDomain {
@@ -33,6 +34,8 @@ struct TileDomain {
   std::uint32_t owner_count = 0U;
   std::uint32_t tiles_per_owner = 0U;
   TaskKind kind = TaskKind::None;
+  bool linear_claim = false;
+  std::uint32_t claim_granularity = 1U;
 
   MEGAMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
     return (owner_count + 63U) / 64U;
@@ -40,6 +43,8 @@ struct TileDomain {
 
   MEGAMOE_V3_HOST_DEVICE constexpr std::uint32_t
   claim_words_per_owner() const {
+    if (linear_claim)
+      return 1U;
     return (tiles_per_owner + 63U) / 64U;
   }
 
@@ -105,6 +110,12 @@ MEGAMOE_V3_DEVICE inline void publish_owner_prefix(
 
 MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
                                                    std::uint32_t owner) {
+  if (domain.linear_claim) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
+        domain.claim_words[owner]);
+    return claim.load(::cuda::memory_order_relaxed) >=
+           domain.tiles_per_owner;
+  }
   const auto words = domain.claim_words_per_owner();
   const auto begin = owner * words;
   for (std::uint32_t word = 0U; word < words; ++word) {
@@ -120,6 +131,21 @@ MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
 MEGAMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
                                                     std::uint32_t owner,
                                                     TileTask &task) {
+  if (domain.linear_claim) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
+        domain.claim_words[owner]);
+    const auto tile = claim.fetch_add(domain.claim_granularity,
+                                      ::cuda::memory_order_relaxed);
+    if (tile >= domain.tiles_per_owner)
+      return false;
+    const auto remaining = domain.tiles_per_owner -
+                           static_cast<std::uint32_t>(tile);
+    task = TileTask{owner, static_cast<std::uint32_t>(tile), domain.kind,
+                    remaining < domain.claim_granularity
+                        ? remaining
+                        : domain.claim_granularity};
+    return true;
+  }
   const auto words = domain.claim_words_per_owner();
   const auto begin = owner * words;
   for (std::uint32_t word = 0U; word < words; ++word) {
@@ -134,7 +160,7 @@ MEGAMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
       if (claim.compare_exchange_weak(observed, desired,
                                       ::cuda::memory_order_relaxed,
                                       ::cuda::memory_order_relaxed)) {
-        task = TileTask{owner, word * 64U + bit, domain.kind};
+        task = TileTask{owner, word * 64U + bit, domain.kind, 1U};
         return true;
       }
     }

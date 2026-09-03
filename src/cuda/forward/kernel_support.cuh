@@ -239,6 +239,10 @@ struct TransportDeviceStatus {
   unsigned long long fc1_complete_clock;
   unsigned long long fc2_complete_clock;
   unsigned long long return_complete_clock;
+  unsigned long long backward_dw2_start_clock;
+  unsigned long long backward_dw2_complete_clock;
+  unsigned long long backward_dw1_start_clock;
+  unsigned long long backward_dw1_complete_clock;
   unsigned long long wgmma_instructions;
   unsigned long long tma_loads;
   unsigned long long tma_multicast_loads;
@@ -967,11 +971,27 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     const auto fc2_ntiles =
         (config.max_hidden_size + forward_tuning::kFc2TileN - 1ULL) /
         forward_tuning::kFc2TileN;
-    layout.forward_task_claim = append(
-        cursor,
-        checked_mul(max_mblocks, 2ULL + fc1_ntiles + fc2_ntiles,
-                    "forward task claims"),
-        sizeof(std::uint64_t), "forward task claims");
+    const auto forward_claim_words = checked_mul(
+        max_mblocks, 2ULL + fc1_ntiles + fc2_ntiles,
+        "forward task claims");
+    auto task_claim_words = forward_claim_words;
+    if (config.enable_backward_state) {
+      const auto backward_mblocks =
+          (layout.backward_padded_capacity_rows +
+           backward_tuning::kTileM - 1ULL) /
+          backward_tuning::kTileM;
+      const auto backward_scheduler =
+          persistent_v3::backward::make_backward_scheduler_layout(
+              backward_mblocks,
+              static_cast<std::uint32_t>(config.max_hidden_size /
+                                         backward_tuning::kDxTileN),
+              config.max_owned_experts);
+      if (backward_scheduler.total_words > task_claim_words)
+        task_claim_words = backward_scheduler.total_words;
+    }
+    layout.forward_task_claim =
+        append(cursor, task_claim_words, sizeof(std::uint64_t),
+               "forward/backward aliased task claims");
     layout.forward_fc1_done = append(cursor, max_mblocks,
                                      sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
@@ -1116,6 +1136,10 @@ struct PoolSlot {
   bool forward_maps_valid = false;
   CUtensorMap backward_dr_map{};
   CUtensorMap backward_dab_map{};
+  CUtensorMap backward_dr_mn_map{};
+  CUtensorMap backward_u_mn_map{};
+  CUtensorMap backward_dab_mn_map{};
+  CUtensorMap backward_x_mn_map{};
   bool backward_maps_valid = false;
 };
 

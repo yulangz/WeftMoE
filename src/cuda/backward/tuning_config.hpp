@@ -29,7 +29,7 @@
 #define MEGAMOE_BWD_DW_TILE_M 128
 #endif
 #ifndef MEGAMOE_BWD_DW_TILE_N
-#define MEGAMOE_BWD_DW_TILE_N 128
+#define MEGAMOE_BWD_DW_TILE_N 256
 #endif
 #ifndef MEGAMOE_BWD_TILE_K
 #define MEGAMOE_BWD_TILE_K 64
@@ -73,6 +73,9 @@
 #ifndef MEGAMOE_BWD_DISPATCH_BATCH_ROWS
 #define MEGAMOE_BWD_DISPATCH_BATCH_ROWS 32
 #endif
+#ifndef MEGAMOE_BWD_DW_CLAIM_TILES
+#define MEGAMOE_BWD_DW_CLAIM_TILES 8
+#endif
 
 namespace megamoe::cuda::backward_tuning {
 
@@ -105,13 +108,23 @@ inline constexpr std::uint32_t kQueueIdleNanosleep =
     MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kDispatchBatchRows =
     MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
+inline constexpr std::uint32_t kDwClaimTiles = MEGAMOE_BWD_DW_CLAIM_TILES;
+inline constexpr std::uint32_t kDw2TilesPerExpert =
+    (kMainHidden / kDwTileM) * (kMainIntermediate / kDwTileN);
+inline constexpr std::uint32_t kDw1TilesPerExpert =
+    ((2U * kMainIntermediate) / kDwTileM) *
+    (kMainHidden / kDwTileN);
 
 static_assert(kMainHidden == 7168U && kMainIntermediate == 3072U);
 static_assert(kTileM == 128U);
 static_assert(kDabTileN == 128U || kDabTileN == 256U);
 static_assert(kDxTileN == 128U || kDxTileN == 256U);
-static_assert(kDwTileM == 128U);
+static_assert(kDwTileM == 128U || kDwTileM == 256U);
 static_assert(kDwTileN == 128U || kDwTileN == 256U);
+static_assert(kMainHidden % kDwTileM == 0U);
+static_assert(kMainIntermediate % kDwTileN == 0U);
+static_assert((2U * kMainIntermediate) % kDwTileM == 0U);
+static_assert(kMainHidden % kDwTileN == 0U);
 static_assert(kTileK == 64U);
 static_assert(kDabStages >= 2U && kDabStages <= 4U);
 static_assert(kDxStages >= 2U && kDxStages <= 4U);
@@ -127,5 +140,7 @@ static_assert(kRdmaCtas == 8U);
 static_assert(kRelayCtas >= 8U && kRelayCtas % 8U == 0U);
 static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
+static_assert(kDwClaimTiles == 1U || kDwClaimTiles == 4U ||
+              kDwClaimTiles == 8U || kDwClaimTiles == 16U);
 
 } // namespace megamoe::cuda::backward_tuning

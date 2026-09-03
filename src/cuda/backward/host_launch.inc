@@ -1,20 +1,5 @@
 namespace {
 
-void launch_backward_gemm(cublasHandle_t handle, cublasOperation_t op_a,
-                          cublasOperation_t op_b, int m, int n, int k,
-                          const transport::BFloat16 *a, int lda,
-                          const transport::BFloat16 *b, int ldb,
-                          transport::BFloat16 *c, int ldc, float beta,
-                          std::uint32_t rank, const char *name) {
-  constexpr float alpha = 1.0F;
-  throw_cublas(
-      "backward-gemm",
-      cublasGemmEx(handle, op_a, op_b, m, n, k, &alpha, a, CUDA_R_16BF, lda,
-                   b, CUDA_R_16BF, ldb, &beta, c, CUDA_R_16BF, ldc,
-                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-      rank, name);
-}
-
 double backward_elapsed_us(cudaEvent_t begin, cudaEvent_t end,
                            const ActivationTransportExpectation &identity,
                            const char *name) {
@@ -74,7 +59,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                     "one-node LocalCudaP2p retained Forward", "non-local");
   const auto &pool = retained.pool;
   const auto &layout = pool->layout;
-  if (!pool->config.enable_backward_state || !pool->backward_blas ||
+  if (!pool->config.enable_backward_state ||
       layout.backward_dab_rows == 0 || layout.backward_dx_rows == 0 ||
       layout.backward_dw1 == 0 || layout.backward_dw2 == 0 ||
       !pool->slots[retained.slot->index].backward_maps_valid)
@@ -218,7 +203,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       persistent_v3::backward::make_backward_scheduler_layout(
           scheduler_mblock_capacity,
           static_cast<std::uint32_t>(config.hidden_size /
-                                     backward_tuning::kDxTileN));
+                                     backward_tuning::kDxTileN),
+          pool->config.max_owned_experts);
   const auto scheduler_capacity_words =
       (layout.forward_fc1_done - layout.forward_task_claim) /
       sizeof(unsigned long long);
@@ -239,8 +225,13 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.scheduler_words = scheduler_layout.total_words;
   args.scheduler_mblock_capacity =
       static_cast<std::uint32_t>(scheduler_mblock_capacity);
+  args.scheduler_expert_capacity = pool->config.max_owned_experts;
   args.mblocks = static_cast<std::uint32_t>(
       retained.backward_padded_rows / backward_tuning::kTileM);
+  args.active_experts = static_cast<std::uint32_t>(std::count_if(
+      retained.backward_padded_expert_rows.begin(),
+      retained.backward_padded_expert_rows.end(),
+      [](std::uint64_t rows) { return rows != 0ULL; }));
   args.rank = identity.rank;
   args.world = identity.world;
   args.local_base = slot.device;
@@ -256,6 +247,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.dx_rows_offset = layout.backward_dx_rows;
   args.dgate_rows_offset = layout.backward_dgate_rows;
   args.dgate_output_offset = layout.backward_dgate_output;
+  args.dw1_offset = layout.backward_dw1;
+  args.dw2_offset = layout.backward_dw2;
   args.contribution_offset = layout.contribution;
   args.combined_dx_offset = layout.combined;
   args.direct_headers_offset = layout.direct_route_headers;
@@ -284,10 +277,14 @@ DeviceBackwardHandle BackwardMegaKernel::run(
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                     "split Backward role residency", identity.rank,
                     "more SMs than Relay CTAs", std::to_string(sm_count));
-  constexpr std::uint32_t kStorageTileN =
+  constexpr std::uint32_t kActivationStorageTileN =
       backward_tuning::kDabTileN > backward_tuning::kDxTileN
           ? backward_tuning::kDabTileN
           : backward_tuning::kDxTileN;
+  constexpr std::uint32_t kStorageTileN =
+      kActivationStorageTileN > backward_tuning::kDwTileN
+          ? kActivationStorageTileN
+          : backward_tuning::kDwTileN;
   constexpr auto kPersistentSmem =
       backward_compute_detail::dynamic_shared_bytes<kStorageTileN>();
   internal::throw_cuda(
@@ -303,7 +300,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "backward-run",
       cudaFuncSetAttribute(
           backward_local_compute_kernel<backward_tuning::kDabTileN,
-                                        backward_tuning::kDxTileN>,
+                                        backward_tuning::kDxTileN,
+                                        backward_tuning::kDwTileN>,
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(kPersistentSmem)),
       identity.rank, identity.world, "backward", identity.generation,
@@ -343,6 +341,32 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         "backward-run", cudaGetLastError(), identity.rank, identity.world,
         "backward", identity.generation, ExchangeKind::ExpertCounts,
         "materialize immutable Backward cache and per-run gates");
+    internal::throw_cuda(
+        "backward-run",
+        cudaMemsetAsync(at<void>(slot.device, layout.backward_dw1), 0,
+                        checked_size(
+                            static_cast<std::uint64_t>(
+                                view.sizes.owned_expert_count) *
+                                2ULL * config.intermediate_size *
+                                config.hidden_size *
+                                sizeof(transport::BFloat16),
+                            "Backward dW1 clear bytes"),
+                        transport_stream),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "clear Backward dW1 output");
+    internal::throw_cuda(
+        "backward-run",
+        cudaMemsetAsync(at<void>(slot.device, layout.backward_dw2), 0,
+                        checked_size(
+                            static_cast<std::uint64_t>(
+                                view.sizes.owned_expert_count) *
+                                config.hidden_size *
+                                config.intermediate_size *
+                                sizeof(transport::BFloat16),
+                            "Backward dW2 clear bytes"),
+                        transport_stream),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "clear Backward dW2 output");
   }
   internal::throw_cuda(
       "backward-run", cudaEventRecord(slot.forward_roles_ready,
@@ -368,16 +392,21 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "start Backward compute roles");
   backward_local_compute_kernel<backward_tuning::kDabTileN,
-                                backward_tuning::kDxTileN>
+                                backward_tuning::kDxTileN,
+                                backward_tuning::kDwTileN>
       <<<static_cast<unsigned int>(sm_count) - backward_tuning::kRelayCtas,
          backward_tuning::kComputeThreads, kPersistentSmem,
          compute_stream>>>(args, slot.backward_dr_map, slot.backward_dab_map,
                            retained.weights.impl_->backward_w2_map,
-                           retained.weights.impl_->backward_w1_map);
+                           retained.weights.impl_->backward_w1_map,
+                           slot.backward_dr_mn_map,
+                           slot.backward_u_mn_map,
+                           slot.backward_dab_mn_map,
+                           slot.backward_x_mn_map);
   internal::throw_cuda(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
       "backward", identity.generation, ExchangeKind::ExpertCounts,
-      "persistent priority DAB/DX TMA-WGMMA launch");
+      "persistent priority DAB/DX/dW TMA-WGMMA launch");
   internal::throw_cuda(
       "backward-run", cudaEventRecord(slot.backward_dab_done, compute_stream),
       identity.rank, identity.world, "backward", identity.generation,
@@ -386,86 +415,14 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "backward-run", cudaEventRecord(slot.backward_dx_done, compute_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record pipelined dX completion");
-  const auto hidden = static_cast<int>(config.hidden_size);
-  const auto intermediate = static_cast<int>(config.intermediate_size);
-  auto *dr = at<transport::BFloat16>(slot.device, layout.backward_padded_dr);
-  auto *u = at<transport::BFloat16>(slot.device, layout.backward_u);
-  auto *dab = at<transport::BFloat16>(slot.device, layout.backward_dab_rows);
-  auto *x = at<const transport::BFloat16>(slot.device,
-                                          layout.backward_padded_x);
-  auto *dw1 = at<transport::BFloat16>(slot.device, layout.backward_dw1);
-  auto *dw2 = at<transport::BFloat16>(slot.device, layout.backward_dw2);
-  std::uint64_t gemm_launches = 0ULL;
-  {
-    std::lock_guard<std::mutex> blas_lock(pool->backward_blas_mutex);
-    throw_cublas("backward-run",
-                 cublasSetStream(pool->backward_blas, compute_stream),
-                 identity.rank, "cublasSetStream(Backward)");
-    if (retained.backward_padded_rows != 0ULL)
-      ++gemm_launches;
-    for (std::uint32_t expert = 0;
-         expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_padded_expert_rows[expert];
-      const auto row = retained.backward_padded_expert_offsets[expert];
-      auto *expert_dw2 =
-          dw2 + expert * config.hidden_size * config.intermediate_size;
-      if (rows == 0ULL) {
-        internal::throw_cuda(
-            "backward-run",
-            cudaMemsetAsync(expert_dw2, 0,
-                            checked_size(config.hidden_size *
-                                             config.intermediate_size *
-                                             sizeof(transport::BFloat16),
-                                         "empty expert dW2 bytes"),
-                            compute_stream),
-            identity.rank, identity.world, "backward", identity.generation,
-            ExchangeKind::ExpertCounts, "zero empty expert dW2");
-        continue;
-      }
-      launch_backward_gemm(
-          pool->backward_blas, CUBLAS_OP_N, CUBLAS_OP_T, intermediate, hidden,
-          static_cast<int>(rows), u + row * config.intermediate_size,
-          intermediate, dr + row * config.hidden_size, hidden, expert_dw2,
-          intermediate, 0.0F, identity.rank, "dW2 = dR^T * U");
-      ++gemm_launches;
-    }
-    internal::throw_cuda(
-        "backward-run", cudaEventRecord(slot.backward_dw2_done, compute_stream),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "record dW2 done");
-    for (std::uint32_t expert = 0;
-         expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_padded_expert_rows[expert];
-      const auto row = retained.backward_padded_expert_offsets[expert];
-      auto *expert_dw1 = dw1 + expert * 2ULL * config.intermediate_size *
-                                   config.hidden_size;
-      if (rows == 0ULL) {
-        internal::throw_cuda(
-            "backward-run",
-            cudaMemsetAsync(expert_dw1, 0,
-                            checked_size(2ULL * config.intermediate_size *
-                                             config.hidden_size *
-                                             sizeof(transport::BFloat16),
-                                         "empty expert dW1 bytes"),
-                            compute_stream),
-            identity.rank, identity.world, "backward", identity.generation,
-            ExchangeKind::ExpertCounts, "zero empty expert dW1");
-        continue;
-      }
-      launch_backward_gemm(
-          pool->backward_blas, CUBLAS_OP_N, CUBLAS_OP_T, hidden,
-          2 * intermediate, static_cast<int>(rows),
-          x + row * config.hidden_size, hidden,
-          dab + row * 2ULL * config.intermediate_size, 2 * intermediate,
-          expert_dw1, hidden, 0.0F, identity.rank,
-          "dW1 = dAB^T * X");
-      ++gemm_launches;
-    }
-    internal::throw_cuda(
-        "backward-run", cudaEventRecord(slot.backward_dw1_done, compute_stream),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "record dW1 done");
-  }
+  internal::throw_cuda(
+      "backward-run", cudaEventRecord(slot.backward_dw2_done, compute_stream),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "record pipelined dW2 completion");
+  internal::throw_cuda(
+      "backward-run", cudaEventRecord(slot.backward_dw1_done, compute_stream),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "record pipelined dW1 completion");
 
   // The persistent Relay grid has already copied each completed dX M-block
   // and published its fixed route markers. Reduction remains a compact tail
@@ -529,7 +486,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   result->intermediate = config.intermediate_size;
   result->audit.specialization =
       BackwardKernelSpecialization::Sm90CachedXAb7168x3072;
-  result->audit.gemm_launches = gemm_launches;
+  result->audit.gemm_launches = 1ULL;
   result->audit.actual_dispatch_peer_bytes =
       retained.audit.actual_dispatch_peer_bytes;
   const auto remote_return_rows =
@@ -554,18 +511,18 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   result->timings.dx_us = device_span_us(
       slot.host_status->relay_blocks_done,
       slot.host_status->fc2_complete_clock);
-  result->timings.dw2_us = backward_elapsed_us(
-      slot.backward_dx_done, slot.backward_dw2_done, identity,
-      "Backward dW2 elapsed");
-  result->timings.dw1_us = backward_elapsed_us(
-      slot.backward_dw2_done, slot.backward_dw1_done, identity,
-      "Backward dW1 elapsed");
-  result->timings.combine_us = backward_elapsed_us(
-      slot.backward_dx_done, slot.backward_return_done, identity,
-      "Backward combine elapsed");
-  const auto dw_after_dx = backward_elapsed_us(
-      slot.backward_dx_done, slot.backward_dw1_done, identity,
-      "Backward dW span");
+  result->timings.dw2_us = device_span_us(
+      slot.host_status->backward_dw2_start_clock,
+      slot.host_status->backward_dw2_complete_clock);
+  result->timings.dw1_us = device_span_us(
+      slot.host_status->backward_dw1_start_clock,
+      slot.host_status->backward_dw1_complete_clock);
+  result->timings.combine_us = device_span_us(
+      slot.host_status->fc2_complete_clock,
+      slot.host_status->return_complete_clock);
+  const auto dw_after_dx = device_span_us(
+      slot.host_status->fc2_complete_clock,
+      slot.host_status->backward_dw1_complete_clock);
   result->timings.dw_combine_overlap_us =
       std::min(dw_after_dx, result->timings.combine_us);
   result->timings.total_us = backward_elapsed_us(

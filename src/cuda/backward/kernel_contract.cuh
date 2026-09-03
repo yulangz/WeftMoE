@@ -12,7 +12,9 @@ struct BackwardKernelArgs {
   std::uint64_t scheduler_words = 0;
   std::uint64_t epoch = 0;
   std::uint32_t scheduler_mblock_capacity = 0;
+  std::uint32_t scheduler_expert_capacity = 0;
   std::uint32_t mblocks = 0;
+  std::uint32_t active_experts = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
   void *local_base = nullptr;
@@ -28,6 +30,8 @@ struct BackwardKernelArgs {
   std::size_t dx_rows_offset = 0;
   std::size_t dgate_rows_offset = 0;
   std::size_t dgate_output_offset = 0;
+  std::size_t dw1_offset = 0;
+  std::size_t dw2_offset = 0;
   std::size_t contribution_offset = 0;
   std::size_t combined_dx_offset = 0;
   std::size_t direct_headers_offset = 0;
