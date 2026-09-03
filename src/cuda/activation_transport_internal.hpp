@@ -180,6 +180,14 @@ public:
 
 std::vector<transport::BFloat16> download_forward_output_for_validation(
     const DeviceForwardHandle &, const CudaExecution &);
+struct ForwardBackwardStateValidationDownload {
+  std::vector<transport::BFloat16> canonical_x;
+  // Plane-major: all compact A rows followed by all compact B rows.
+  std::vector<transport::BFloat16> fc1_ab;
+};
+ForwardBackwardStateValidationDownload
+download_forward_backward_state_for_validation(
+    const DeviceForwardHandle &, const CudaExecution &);
 ActivationTransportValidationDownload
 download_activation_transport_for_validation(
     const DeviceActivationTransportHandle &, const CudaExecution &);

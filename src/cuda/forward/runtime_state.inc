@@ -347,6 +347,7 @@ struct DeviceForwardHandle::Impl {
   ActivationTransportExpectation identity;
   ForwardMegaKernelAudit audit;
   ForwardMegaKernelTimings timings;
+  bool retained_backward_state = false;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
@@ -1475,6 +1476,11 @@ ActivationTransportResourcePool make_activation_transport_pool(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank,
             "Forward canonical output");
+        if (config.enable_backward_state)
+          slot.forward_training_output_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.forward_training_output),
+              config.max_hidden_size, config.max_destination_rows_per_rank,
+              "Forward training output");
         if (slot.gin_window != nullptr)
           slot.forward_staging_store_map = make_bf16_tma_store_map(
               at<void>(slot.gin_window, state->gin_layout.return_staging),

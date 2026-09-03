@@ -10,8 +10,8 @@ pipeline is correct and benchmarked.
 For one canonical routed row, Forward is:
 
 ```text
-[A, B] = FC1(X)
-S      = SiLU(A) * B
+[A, B] = bf16(FC1(X))
+S      = SiLU(fp32(A)) * fp32(B)
 U      = bf16(gate * S)
 R      = FC2(U)
 Y      = fixed-expert-order sum_fp32(R), followed by one BF16 cast
@@ -40,10 +40,10 @@ canonical `X`; the inference-only alias that overwrites `X` cannot be used by
 Backward. `S`, `U`, and FC2 output are not retained across Forward/Backward.
 
 The `A/B` checkpoint precision is part of the numeric contract, not merely a
-storage choice. The implementation must either retain the values at the same
-precision consumed by Forward's SwiGLU or insert the same cast in Forward and
-Backward. This must be decided against the framework reference before enabling
-the training API.
+storage choice. Forward now rounds both projections to BF16 before SwiGLU and
+stores those same BF16 values when `retain_backward_state` is enabled. Backward
+must convert the checkpoints to FP32 for SwiGLU recomputation, so the operands
+match Forward exactly without retaining `S`.
 
 ## Fused activation-gradient task
 

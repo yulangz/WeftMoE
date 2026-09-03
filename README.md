@@ -3,8 +3,9 @@
 MegaMOE is a Hopper-focused Mixture-of-Experts Forward pipeline. It overlaps
 Notify, activation dispatch, FC1/SwiGLU, FC2, return, and deterministic
 unweighted reduction without a whole-grid barrier between the split transport
-and compute kernels. Each route gate is applied to the BF16 SwiGLU result
-before FC2, matching the intended Forward/Backward algebra.
+and compute kernels. SwiGLU consumes BF16-rounded FC1 A/B, and each route gate
+is applied before the BF16 FC2 input cast, matching the intended
+Forward/Backward algebra.
 
 The current optimized contract is intentionally narrow:
 
@@ -20,6 +21,10 @@ There is no generic-shape or legacy single-node compute fallback. Unsupported
 shapes fail closed. Backward is deliberately unavailable while it is redesigned
 around this Forward architecture; `cuda::backward_pipeline_available()` is the
 only retained Backward API and currently returns `false`.
+
+A pool may explicitly reserve Backward state. In that mode Forward preserves
+post-Dispatch canonical X, writes plane-major BF16 A/B checkpoints, and uses a
+separate FC2 output plane. Inference pools allocate none of those extra bytes.
 
 ## Pipeline
 

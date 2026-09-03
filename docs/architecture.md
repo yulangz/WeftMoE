@@ -3,11 +3,12 @@
 ## Scope and invariants
 
 The production data plane implements one fixed Hopper Forward shape:
-`H=7168`, `I=3072`, and BF16 inputs/weights/outputs. The FC1 epilogue applies
-the route-local FP32 gate to its SwiGLU result and rounds the resulting FC2
-input once to BF16. Returned routes are accumulated in FP32 without another
-gate multiplication. Every expert row range is padded to an M-block boundary
-of 128.
+`H=7168`, `I=3072`, and BF16 inputs/weights/outputs. FC1 accumulates in FP32,
+rounds A/B to BF16, and evaluates SwiGLU from those exact rounded operands.
+The epilogue then applies the route-local FP32 gate and rounds the resulting
+FC2 input once to BF16. Returned routes are accumulated in FP32 without
+another gate multiplication. Every expert row range is padded to an M-block
+boundary of 128.
 The same M-block identity is used by Notify, Dispatch, FC1, FC2, Return, and
 Reduce; a phase cannot silently reinterpret a tail.
 
@@ -115,7 +116,9 @@ global reduction launch.
 For each canonical route row, the numeric contract is:
 
 ```text
-S = SwiGLU(A, B)
+A_bf16 = bf16(FC1_A(X))
+B_bf16 = bf16(FC1_B(X))
+S = SwiGLU(fp32(A_bf16), fp32(B_bf16))
 U = bf16(fp32(gate) * S)
 R = bf16(FC2(U))
 Y[token] = bf16(sum_fp32_in_expert_order(R[route]))
@@ -125,6 +128,11 @@ Dispatch carries the FP32 gate beside the deduplicated activation packet and
 publishes it into canonical expert-row order before the row's FC1-ready release.
 This placement lets Backward form `dGate = <dU, S>` without retaining FC2
 output, while `dW2` consumes the exact gated BF16 input `U` used by Forward.
+
+The inference configuration aliases canonical X with the temporary FC2 output
+plane after FC1 has consumed it. An opt-in Backward-state pool instead keeps X
+immutable, writes plane-major BF16 A/B checkpoints, and selects a separate FC2
+output plane. The returned Forward handle owns that generation-local storage.
 
 ## GEMM implementation
 

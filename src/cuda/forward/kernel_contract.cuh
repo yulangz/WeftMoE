@@ -57,6 +57,7 @@ struct ForwardKernelArgs {
   std::size_t outgoing_sequence_offset;
   std::size_t status_offset;
   std::size_t forward_s_offset;
+  std::size_t forward_ab_cache_offset;
   std::size_t forward_task_claim_offset;
   std::size_t forward_fc1_done_offset;
   std::size_t forward_fc1_published_offset;
@@ -158,6 +159,7 @@ struct ForwardKernelArgs {
   // the canonical 128-row quantum.
   std::uint32_t forward_mblock_rows = 128;
   std::uint64_t forward_return_chunk_rows = 128;
+  bool retain_backward_state = false;
   // Production ready-token scheduler: reduction consumes only tokens whose
   // complete top-k route set has arrived instead of waiting on a fixed token
   // stripe.  The host enables this by default; the false initializer keeps

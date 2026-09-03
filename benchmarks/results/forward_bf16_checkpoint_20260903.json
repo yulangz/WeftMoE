@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "description": "BF16 FC1 checkpoint contract and opt-in retained Forward state",
+  "tested_worktree_base_commit": "89eb7271d986e5e1b3debbb3d1fbbf97745921d1",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "measured_iterations": 100,
+    "metric": "forward_slowest_rank_us.mean"
+  },
+  "semantics": {
+    "fc1_checkpoint": "A_bf16 = bf16(FC1_A(X)); B_bf16 = bf16(FC1_B(X))",
+    "fc2_input": "U = bf16(fp32(gate) * SwiGLU(fp32(A_bf16), fp32(B_bf16)))",
+    "retained_state": "canonical post-Dispatch X plus plane-major BF16 A/B; FC2 output does not alias X",
+    "ordinary_inference": "no checkpoint allocation or checkpoint stores"
+  },
+  "build": {
+    "architecture": "sm_90a",
+    "cuda": "12.9",
+    "nccl": "2.29.7+cuda12.9",
+    "world8": {
+      "candidate": "world8_relay16_tma4",
+      "cache_key": "527f9005168a6c64a2d6b337de985ffe287d449b57aea8beea5cb36d85b5d8d9",
+      "cold_compile_seconds": 45.205,
+      "inference_instruction_count": 18968,
+      "training_instruction_count": 19896
+    },
+    "world16": {
+      "candidate": "current_m128_n128_n256",
+      "cache_key": "c7c25248a11fad5692c55b29c5df72ae1c1ce083a3a6d8a58d2e43539f3491d7",
+      "cold_compile_seconds": 37.185,
+      "inference_instruction_count": 18976,
+      "training_instruction_count": 19904
+    },
+    "persistent_compute_kernel": {
+      "registers_per_thread": 168,
+      "stack_bytes_per_thread": 1320,
+      "static_shared_bytes": 2048
+    }
+  },
+  "correctness": {
+    "world8_smoke_repeats": 20,
+    "world16_gin_smoke_repeats": 20,
+    "rank0_output_hash": "14317364223304689411",
+    "inference_training_output_equal": true,
+    "retained_x_immutable": true,
+    "retained_ab_repeat_equal": true,
+    "independent_oracle": {
+      "passed": true,
+      "output_max_abs": 0.0,
+      "output_rmse": 0.0,
+      "fc1_cache_max_abs": 0.0,
+      "fc1_cache_rmse": 0.0
+    }
+  },
+  "performance": {
+    "world8_back_to_back": {
+      "pre_change_mean_us": 14795.355,
+      "bf16_checkpoint_contract_mean_us": 15012.907,
+      "change_percent": 1.470
+    },
+    "world16_gin_back_to_back": {
+      "pre_change_mean_us": 21530.438,
+      "bf16_checkpoint_contract_mean_us": 21424.078,
+      "change_percent": -0.494,
+      "megatron_reference_mean_us": 31334.0,
+      "speedup_vs_megatron": 1.463
+    }
+  },
+  "tests": {
+    "cpu_control_plane": "pass: 13/13 C++ tests plus Python/reference/header/security checks",
+    "forward_autotune": "pass: 19/19",
+    "world8_split_smoke": "pass",
+    "world16_gin_smoke": "pass",
+    "kernel_artifact_manifest": "updated for the BF16 numeric contract"
+  }
+}

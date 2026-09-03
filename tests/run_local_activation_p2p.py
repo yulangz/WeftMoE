@@ -410,6 +410,7 @@ def main():
                         "sm90-wgmma-tma-7168x3072" or
                         item.get("persistent_launches") != "1" or
                         item.get("repeat_equal") != "1" or
+                        item.get("backward_state_equal") != "1" or
                         item.get("repeats") != "20" or
                         item.get("gate_mode") != args.gate_mode or
                         item.get("top_k") != str(args.top_k)):

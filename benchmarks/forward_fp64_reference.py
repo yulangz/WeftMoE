@@ -101,12 +101,16 @@ def fc1(expert, activation):
         end = min(2 * INTERMEDIATE, begin + 64)
         rows = np.arange(begin, end, dtype=np.uint32)[:, None]
         accum[begin:end] = weight(expert, 1, rows, columns) @ activation
-    a = accum[:INTERMEDIATE]
-    b = accum[INTERMEDIATE:]
-    # FP64 is the high-precision oracle; production uses Hopper __expf at this
-    # documented location and keeps S in the FC1 epilogue until applying gate.
+    # Forward checkpoints the FC1 projections in BF16 and SwiGLU consumes the
+    # exact same rounded values. This makes a later Backward recomputation of
+    # S bitwise operand-identical without retaining S itself.
+    checkpoint = quantize_bf16(accum)
+    a = checkpoint[:INTERMEDIATE]
+    b = checkpoint[INTERMEDIATE:]
+    # Production uses Hopper __expf at this documented location and keeps S in
+    # FP32 through the gate multiply before rounding U to BF16.
     s = (a / (1.0 + np.exp(-a))) * b
-    return accum, s
+    return checkpoint, s
 
 
 def expert_selected_output(expert, activation, gate):
@@ -140,10 +144,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--world", type=int, default=1)
+    parser.add_argument("--source-rank", type=int, default=0)
+    parser.add_argument("--cache-owner-rank", type=int, default=0)
     args = parser.parse_args()
-    activations = [
-        (((token * HIDDEN + np.arange(HIDDEN, dtype=np.int64)) % 127) - 63)
-        .astype(np.float64) / 64.0 for token in range(len(ROUTES))]
+    if (args.world <= 0 or 384 % args.world != 0):
+        parser.error("--world must be a positive divisor of 384")
+    if not 0 <= args.source_rank < args.world:
+        parser.error("--source-rank must be in [0, world)")
+    if not 0 <= args.cache_owner_rank < args.world:
+        parser.error("--cache-owner-rank must be in [0, world)")
+
+    def activation(token, source_rank):
+        linear = token * HIDDEN + np.arange(HIDDEN, dtype=np.int64)
+        return (((linear + source_rank * 13) % 127) - 63).astype(
+            np.float64) / 64.0
+
+    activations = [activation(token, args.source_rank)
+                   for token in range(len(ROUTES))]
     expert_results = {}
     for token, token_routes in enumerate(ROUTES):
         gates = selected_gates(token)
@@ -183,23 +201,37 @@ def main():
     cache_metrics = None
     if args.cache is not None:
         cache_bits = np.fromfile(args.cache, dtype="<u2")
-        canonical_routes = sorted(expert_results, key=lambda item: item[1])
-        expected_cache_elements = len(canonical_routes) * 2 * INTERMEDIATE
+        experts_per_rank = 384 // args.world
+        expert_begin = args.cache_owner_rank * experts_per_rank
+        expert_end = expert_begin + experts_per_rank
+        token_by_expert = {
+            expert: token for token, token_routes in enumerate(ROUTES)
+            for expert in token_routes
+        }
+        canonical_rows = [
+            (source, expert, token_by_expert[expert])
+            for expert in sorted(token_by_expert)
+            if expert_begin <= expert < expert_end
+            for source in range(args.world)
+        ]
+        expected_cache_elements = len(canonical_rows) * 2 * INTERMEDIATE
         if cache_bits.size != expected_cache_elements:
             raise RuntimeError(
                 f"cache elements expected={expected_cache_elements} "
                 f"actual={cache_bits.size}")
         # Download schema is all A rows followed by all B rows.
         actual_cache = bf16_bits_to_float64(cache_bits).reshape(
-            2, len(canonical_routes), INTERMEDIATE)
-        cache_reference = np.stack(
-            [expert_results[route][0] for route in canonical_routes])
+            2, len(canonical_rows), INTERMEDIATE)
+        cache_reference = (np.stack([
+            fc1(expert, activation(token, source))[0]
+            for source, expert, token in canonical_rows
+        ]) if canonical_rows else np.empty((0, 2 * INTERMEDIATE)))
         reference_cache = np.stack((cache_reference[:, :INTERMEDIATE],
                                     cache_reference[:, INTERMEDIATE:]))
         cache_coordinates = [
             f"cache[{plane},{route},{column}]"
             for plane in ("A", "B")
-            for route in range(len(canonical_routes))
+            for route in range(len(canonical_rows))
             for column in range(INTERMEDIATE)]
         cache_metrics = metrics(actual_cache.reshape(-1),
                                 reference_cache.reshape(-1),
@@ -220,11 +252,14 @@ def main():
     if len(set(sample_hashes.values())) != len(sample_hashes):
         raise RuntimeError("expert-aware W1/W2 fixture sample hashes collided")
     result = {
-        "schema": 2,
-        "oracle": "independent NumPy FP64; gate-before-FC2 BF16 phase casts",
+        "schema": 3,
+        "oracle": ("independent NumPy FP64; BF16 A/B checkpoint operands; "
+                   "gate-before-FC2 BF16 U/output phase casts"),
         "shape": {"tokens": len(ROUTES), "hidden": HIDDEN,
                   "intermediate": INTERMEDIATE, "global_experts": 384,
-                  "top_k": len(ROUTES[0])},
+                  "top_k": len(ROUTES[0]), "world": args.world,
+                  "source_rank": args.source_rank,
+                  "cache_owner_rank": args.cache_owner_rank},
         "routes": [list(routes) for routes in ROUTES],
         "output_columns": list(OUTPUT_COLUMNS),
         "thresholds_fixed_before_measurement": {

@@ -44,14 +44,20 @@ enum ForwardComputePairOperand : std::uint32_t {
   kComputePairShareB = 2U,
 };
 
-// FC2 consumes BF16 U = g*S.  Apply the FP32 route gate to the SwiGLU result
-// in the FC1 epilogue, then perform the single BF16 phase cast consumed by
-// WGMMA.  Backward can therefore use the algebraically matching
-// dW2 = dY^T*U and dGate = <dY*W2, S> without retaining FC2 output.
+// FC1's WGMMA accumulator is FP32, but the training contract checkpoints A/B
+// in BF16. Forward must consume those exact checkpoint values as well, or a
+// later SwiGLU recomputation would silently use different operands. FC2 then
+// consumes the separately rounded BF16 U = gate*S.
 __device__ __forceinline__ float gated_swiglu_fc2_input(float a, float b,
-                                                         float gate) {
+                                                        float gate) {
   const auto sigmoid = 1.0F / (1.0F + __expf(-a));
   return __fmul_rn((a * sigmoid) * b, gate);
+}
+
+__device__ __forceinline__ float gated_swiglu_fc2_input_from_bf16(
+    std::uint16_t a_bits, std::uint16_t b_bits, float gate) {
+  return gated_swiglu_fc2_input(bf16_bits_to_float(a_bits),
+                                bf16_bits_to_float(b_bits), gate);
 }
 
 template <typename TileMma, class Callback>
@@ -662,7 +668,8 @@ template <bool StaticLocal, bool DoFc1, bool DoFc2, bool M64 = false,
           ForwardTaskPartition Partition = ForwardTaskPartition::All,
           bool TmaFc2Store = false, bool TmaFc2StoreToStaging = false,
           std::uint32_t Fc1StageCount = kFc1Stages,
-          std::uint32_t Fc2StageCount = kFc2Stages, bool Cluster2 = false>
+          std::uint32_t Fc2StageCount = kFc2Stages, bool Cluster2 = false,
+          bool RetainBackwardState = false>
 __device__ __forceinline__ void
 persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 const CUtensorMap &s_map, const CUtensorMap &w1_map,
@@ -702,6 +709,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
+  transport::BFloat16 *ab_cache = nullptr;
+  if constexpr (RetainBackwardState)
+    ab_cache = peer_at<transport::BFloat16>(a.local_base,
+                                            a.forward_ab_cache_offset);
   const auto *canonical_gates =
       peer_at<const float>(a.local_base, a.canonical_gates_offset);
   auto *forward_output =
@@ -1083,10 +1094,22 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               const auto output_index =
                   (row + block_m) * a.intermediate + output_column;
               const auto gate = canonical_gates[row + block_m];
+              const auto a_pair = float2_to_bf16x2_bits(av0, av1);
+              const auto b_pair = float2_to_bf16x2_bits(bv0, bv1);
+              const auto a_values = bf16x2_bits_to_float2(a_pair);
+              const auto b_values = bf16x2_bits_to_float2(b_pair);
+              if constexpr (RetainBackwardState) {
+                reinterpret_cast<std::uint32_t *>(
+                    ab_cache)[output_index / 2ULL] = a_pair;
+                const auto b_index =
+                    a.max_destination_rows * a.intermediate + output_index;
+                reinterpret_cast<std::uint32_t *>(
+                    ab_cache)[b_index / 2ULL] = b_pair;
+              }
               reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
                   float2_to_bf16x2_bits(
-                      gated_swiglu_fc2_input(av0, bv0, gate),
-                      gated_swiglu_fc2_input(av1, bv1, gate));
+                      gated_swiglu_fc2_input(a_values.x, b_values.x, gate),
+                      gated_swiglu_fc2_input(a_values.y, b_values.y, gate));
             } else if (block_m < valid_rows) {
               const float av[2] = {av0, av1};
               const float bv[2] = {bv0, bv1};
@@ -1097,9 +1120,17 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 if (tail_column < a.intermediate) {
                   const auto output_index =
                       (row + block_m) * a.intermediate + tail_column;
+                  const auto a_bits = float_to_bf16_bits(av[value]);
+                  const auto b_bits = float_to_bf16_bits(bv[value]);
+                  if constexpr (RetainBackwardState) {
+                    ab_cache[output_index] =
+                        transport::BFloat16{a_bits};
+                    ab_cache[a.max_destination_rows * a.intermediate +
+                             output_index] = transport::BFloat16{b_bits};
+                  }
                   s[output_index] = transport::BFloat16{
-                      float_to_bf16_bits(gated_swiglu_fc2_input(
-                          av[value], bv[value], gate))};
+                      float_to_bf16_bits(gated_swiglu_fc2_input_from_bf16(
+                          a_bits, b_bits, gate))};
                 }
               }
             }
@@ -1640,25 +1671,19 @@ local_p2p_forward_compute_kernel(
 // Compile-time STSM/TMA FC2 epilogue. DoFc1 selects the production
 // FC2-priority mixed scheduler or the retained FC2-only tuning candidate
 // without duplicating the kernel wrapper.
-template <bool StaticLocal, bool DoFc1, bool StoreToStaging = false,
-          bool Cluster2 = false,
-          std::uint32_t Fc1StageCount = forward_tuning::kFc1Stages,
-          std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
-__global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
-local_p2p_forward_tma_store_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
-    const __grid_constant__ CUtensorMap s_map,
-    const __grid_constant__ CUtensorMap w1_map,
-    const __grid_constant__ CUtensorMap w2_map,
-    const __grid_constant__ CUtensorMap output_store_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+template <bool StaticLocal, bool DoFc1, bool StoreToStaging, bool Cluster2,
+          std::uint32_t Fc1StageCount, std::uint32_t Fc2StageCount,
+          bool RetainBackwardState>
+__device__ __forceinline__ void local_p2p_forward_tma_store_role(
+    const ForwardKernelArgs &a, const CUtensorMap &x_map,
+    const CUtensorMap &s_map, const CUtensorMap &w1_map,
+    const CUtensorMap &w2_map, const CUtensorMap &output_store_map,
+    unsigned char *storage, unsigned long long *task_shared,
+    unsigned int *task_kind_shared, unsigned int *return_mblock_shared,
+    unsigned int *pair_operand_shared) {
   if (threadIdx.x == 0U)
     MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
-  extern __shared__ __align__(1024) unsigned char storage[];
-  __shared__ unsigned long long task_shared;
-  __shared__ unsigned int task_kind_shared;
-  __shared__ unsigned int pair_operand_shared;
-  __shared__ unsigned int return_mblock_shared;
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
   if (threadIdx.x == 0U) {
@@ -1671,9 +1696,10 @@ local_p2p_forward_tma_store_kernel(
   __syncthreads();
   forward_compute_detail::persistent_role<
       StaticLocal, DoFc1, true, false, ForwardTaskPartition::All, true,
-      StoreToStaging, Fc1StageCount, Fc2StageCount, Cluster2>(
-      a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
-      &task_kind_shared, &return_mblock_shared, &pair_operand_shared,
+      StoreToStaging, Fc1StageCount, Fc2StageCount, Cluster2,
+      RetainBackwardState>(
+      a, x_map, s_map, w1_map, w2_map, storage, task_shared,
+      task_kind_shared, return_mblock_shared, pair_operand_shared,
       &output_store_map);
   const auto reduce_role_index =
       a.forward_reduce_cta_offset + static_cast<std::uint32_t>(blockIdx.x);
@@ -1688,6 +1714,69 @@ local_p2p_forward_tma_store_kernel(
   }
   if (threadIdx.x == 0U)
     MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+}
+#endif
+
+template <bool StaticLocal, bool DoFc1, bool StoreToStaging = false,
+          bool Cluster2 = false,
+          std::uint32_t Fc1StageCount = forward_tuning::kFc1Stages,
+          std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
+__global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
+local_p2p_forward_tma_store_kernel(
+    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ CUtensorMap s_map,
+    const __grid_constant__ CUtensorMap w1_map,
+    const __grid_constant__ CUtensorMap w2_map,
+    const __grid_constant__ CUtensorMap output_store_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  extern __shared__ __align__(1024) unsigned char storage[];
+  __shared__ unsigned long long task_shared;
+  __shared__ unsigned int task_kind_shared;
+  __shared__ unsigned int pair_operand_shared;
+  __shared__ unsigned int return_mblock_shared;
+  local_p2p_forward_tma_store_role<
+      StaticLocal, DoFc1, StoreToStaging, Cluster2, Fc1StageCount,
+      Fc2StageCount, false>(
+      a, x_map, s_map, w1_map, w2_map, output_store_map, storage,
+      &task_shared, &task_kind_shared, &return_mblock_shared,
+      &pair_operand_shared);
+#else
+  (void)a;
+  (void)x_map;
+  (void)s_map;
+  (void)w1_map;
+  (void)w2_map;
+  (void)output_store_map;
+#endif
+}
+
+// Training has a separate entry symbol so the ordinary inference kernel is
+// compiled without checkpoint addressing, branches, or stores. Both entries
+// execute the same mixed scheduler and differ only in the compile-time FC1
+// epilogue policy.
+template <bool StaticLocal, bool StoreToStaging = false,
+          bool Cluster2 = false,
+          std::uint32_t Fc1StageCount = forward_tuning::kFc1Stages,
+          std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
+__global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
+local_p2p_forward_training_tma_store_kernel(
+    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ CUtensorMap s_map,
+    const __grid_constant__ CUtensorMap w1_map,
+    const __grid_constant__ CUtensorMap w2_map,
+    const __grid_constant__ CUtensorMap output_store_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  extern __shared__ __align__(1024) unsigned char storage[];
+  __shared__ unsigned long long task_shared;
+  __shared__ unsigned int task_kind_shared;
+  __shared__ unsigned int pair_operand_shared;
+  __shared__ unsigned int return_mblock_shared;
+  local_p2p_forward_tma_store_role<
+      StaticLocal, true, StoreToStaging, Cluster2, Fc1StageCount,
+      Fc2StageCount, true>(
+      a, x_map, s_map, w1_map, w2_map, output_store_map, storage,
+      &task_shared, &task_kind_shared, &return_mblock_shared,
+      &pair_operand_shared);
 #else
   (void)a;
   (void)x_map;

@@ -70,6 +70,12 @@ struct ActivationTransportPoolConfig {
   // constructed GinRdma backend. It never enables or selects that backend by
   // itself.
   bool enable_gin_rdma = false;
+  // Reserve generation-local state consumed by the future Backward pipeline:
+  // immutable canonical X, BF16 FC1 A/B checkpoints, and a Forward output
+  // plane that does not alias X. The ordinary inference footprint is
+  // unchanged unless this is enabled explicitly. Kept last for aggregate
+  // source compatibility with the pre-checkpoint configuration.
+  bool enable_backward_state = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -135,6 +141,10 @@ enum class ForwardKernelSpecialization : std::uint8_t {
 struct ForwardMegaKernelConfig {
   std::uint64_t hidden_size = 0;
   std::uint64_t intermediate_size = 0;
+  // Preserve the post-Dispatch canonical X and the exact BF16 A/B values
+  // consumed by Forward's SwiGLU. The pool must have been constructed with
+  // enable_backward_state=true. Backward itself remains unavailable.
+  bool retain_backward_state = false;
 };
 
 class ForwardWeightLease {

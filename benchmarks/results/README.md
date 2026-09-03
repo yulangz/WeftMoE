@@ -19,7 +19,10 @@ The current records are:
   and world-16 validation;
 - [`forward_gate_before_20260903.json`](forward_gate_before_20260903.json), the
   gate-before-FC2 semantic change, independent oracle, and world-8/world-16
-  performance regression evidence.
+  performance regression evidence;
+- [`forward_bf16_checkpoint_20260903.json`](forward_bf16_checkpoint_20260903.json),
+  the BF16 FC1 checkpoint contract, retained-state correctness, compile-time
+  inference/training split, and paired world-8/world-16 regression evidence.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

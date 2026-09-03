@@ -4,6 +4,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               int bootstrap_output_fd,
               const std::string &scenario) {
   const auto world = nodes * gpus_per_node;
+  constexpr std::array<std::uint32_t, 12> kCrossEpExperts{
+      1U, 68U, 135U, 202U, 269U, 336U,
+      145U, 289U, 10U, 90U, 230U, 350U};
   const auto benchmark_p2p = scenario == "activation_p2p_bench";
   const auto benchmark_integrated =
       scenario == "activation_integrated_bench";
@@ -82,13 +85,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           expert / (experts / world);
     common_routes.num_tokens = max_tokens;
     common_routes.selected_experts.clear();
-    constexpr std::array<std::uint32_t, 12> cross_ep_experts{
-        1U, 68U, 135U, 202U, 269U, 336U,
-        145U, 289U, 10U, 90U, 230U, 350U};
     for (std::uint64_t token = 0; token < max_tokens; ++token)
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
         common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            cross_ep_experts[token * 6U + slot]));
+            kCrossEpExperts[token * 6U + slot]));
   }
   if (scenario == "activation_gin") {
     common_routes.num_tokens = max_tokens;
@@ -656,6 +656,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.ring_slots_per_source_channel = 1;
     transport_config.max_inflight_generations = world == 1U ? 2U : 1U;
     transport_config.max_intermediate_size = intermediate;
+    transport_config.enable_backward_state = true;
     transport_config.enable_gin_rdma = gin_forward_smoke;
     auto transport_pool = megamoe::cuda::make_activation_transport_pool(
         generation.session(), execution, transport_config);
@@ -777,6 +778,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               input, max_tokens, hidden, context, execution, transport_pool);
     }
     std::vector<megamoe::transport::BFloat16> reference_output;
+    megamoe::cuda::ForwardBackwardStateValidationDownload
+        reference_backward_state;
+    bool saw_backward_state = false;
     megamoe::cuda::ForwardMegaKernelAudit reference_audit;
     megamoe::cuda::ForwardMegaKernelTimings reference_timings;
     const auto forward_smoke_repeats =
@@ -807,11 +811,69 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           repeat_generation, execution, pool);
       auto notify = coordinator.run_device(
           {common_config, repeat_routes, repeat_gates, max_tokens});
+      const bool retain_backward_state = (repeat & 1U) != 0U;
+      auto retained_metadata =
+          retain_backward_state && !saw_backward_state
+              ? megamoe::cuda::download_device_metadata_for_validation(
+                    notify.dispatch(), execution)
+              : megamoe::DispatchHandle{};
       auto current = run_forward(notify.dispatch(), repeat_activations, weights,
-                                 {hidden, intermediate}, run_options);
+                                 {hidden, intermediate,
+                                  retain_backward_state},
+                                 run_options);
       const auto current_output =
           megamoe::cuda::download_forward_output_for_validation(current,
                                                                  execution);
+      if (retain_backward_state) {
+        const auto state =
+            megamoe::cuda::download_forward_backward_state_for_validation(
+                current, execution);
+        require(state.fc1_ab.size() % (2ULL * intermediate) == 0ULL &&
+                    state.canonical_x.size() % hidden == 0ULL &&
+                    state.fc1_ab.size() / (2ULL * intermediate) ==
+                        state.canonical_x.size() / hidden,
+                "retained Forward state has inconsistent compact row shapes");
+        if (!state.fc1_ab.empty())
+          require(std::any_of(state.fc1_ab.begin(), state.fc1_ab.end(),
+                              [](const auto value) {
+                                return value.bits != 0U;
+                              }),
+                  "retained BF16 FC1 A/B checkpoint is all zero");
+        if (!saw_backward_state) {
+          require(retained_metadata &&
+                      retained_metadata->incoming.incoming_rows.size() ==
+                          state.canonical_x.size() / hidden,
+                  "retained canonical X metadata shape mismatch");
+          for (const auto &row :
+               retained_metadata->incoming.incoming_rows) {
+            const auto route = std::find(kCrossEpExperts.begin(),
+                                         kCrossEpExperts.end(),
+                                         row.expert_id);
+            require(route != kCrossEpExperts.end(),
+                    "retained canonical X referenced an unknown smoke expert");
+            const auto token =
+                static_cast<std::uint64_t>(route - kCrossEpExperts.begin()) /
+                6ULL;
+            for (std::uint64_t column = 0; column < hidden; ++column) {
+              const auto linear = token * hidden + column;
+              const auto expected =
+                  megamoe::transport::float_to_bfloat16(
+                      static_cast<float>(static_cast<int>(
+                          (linear + row.source_rank * 13U) % 127U) - 63) /
+                      64.0F);
+              require(state.canonical_x[static_cast<std::size_t>(
+                          row.dst_row * hidden + column)] == expected,
+                      "retained canonical X was overwritten by FC2 output");
+            }
+          }
+          reference_backward_state = state;
+          saw_backward_state = true;
+        } else {
+          require(state.canonical_x == reference_backward_state.canonical_x &&
+                      state.fc1_ab == reference_backward_state.fc1_ab,
+                  "retained Forward state changed across identical runs");
+        }
+      }
       if (std::getenv("MEGAMOE_FORWARD_PROGRESS")) {
         std::uint64_t repeat_hash = 1469598103934665603ULL;
         for (const auto value : current_output)
@@ -846,6 +908,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   reference_audit.tma_loads != 0) ||
                  reference_audit.fc1_tasks == 0),
             "forward smoke did not execute one WGMMA/TMA persistent kernel");
+    require(saw_backward_state,
+            "forward smoke did not exercise retained Backward state");
     std::uint64_t output_hash = 1469598103934665603ULL;
     for (const auto value : reference_output)
       output_hash = (output_hash ^ value.bits) * 1099511628211ULL;
@@ -858,6 +922,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       output_file.write(reinterpret_cast<const char *>(reference_output.data()),
                         static_cast<std::streamsize>(
                             reference_output.size() * sizeof(reference_output[0])));
+      std::ofstream cache_file(prefix + ".ab.bf16",
+                               std::ios::binary | std::ios::trunc);
+      require(cache_file.good(),
+              "failed to open Forward A/B checkpoint artifact");
+      cache_file.write(
+          reinterpret_cast<const char *>(
+              reference_backward_state.fc1_ab.data()),
+          static_cast<std::streamsize>(
+              reference_backward_state.fc1_ab.size() *
+              sizeof(reference_backward_state.fc1_ab[0])));
     }
     std::cout << "FORWARD_SMOKE rank=" << rank
               << " specialization=sm90-wgmma-tma-7168x3072"
@@ -872,6 +946,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << gate_mode << " top_k=" << top_k
               << " output_hash=" << output_hash
               << " pool2_isolated=1"
+              << " backward_state_equal=1"
               << " total_us=" << reference_timings.total_us
               << " dispatch_us=" << reference_timings.dispatch_us
               << " fc1_us=" << reference_timings.fc1_swiglu_us

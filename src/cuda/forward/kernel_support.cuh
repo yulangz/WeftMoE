@@ -523,6 +523,10 @@ struct Layout {
   std::size_t socket_header_receive = 0;
   std::size_t socket_payload_receive = 0;
   std::size_t forward_s = 0;
+  // Optional training-only planes. A/B uses two plane-major BF16 matrices;
+  // Forward output is separate so canonical post-Dispatch X stays immutable.
+  std::size_t forward_ab_cache = 0;
+  std::size_t forward_training_output = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_fc1_published = 0;
@@ -809,6 +813,18 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         config.max_intermediate_size, "forward gated U elements");
     layout.forward_s = append(cursor, forward_elements,
                               sizeof(transport::BFloat16), "forward gated U");
+    if (config.enable_backward_state) {
+      layout.forward_ab_cache = append(
+          cursor, checked_mul(forward_elements, 2ULL,
+                              "forward BF16 A/B checkpoint elements"),
+          sizeof(transport::BFloat16), "forward BF16 A/B checkpoints");
+      layout.forward_training_output = append(
+          cursor,
+          checked_mul(config.max_destination_rows_per_rank,
+                      config.max_hidden_size,
+                      "forward training output elements"),
+          sizeof(transport::BFloat16), "forward training output");
+    }
     // Expert segmentation can make every incoming row a distinct partial
     // M-block.  Capacity must therefore be bounded by rows, not by a dense
     // ceil(rows/64) estimate.
@@ -954,6 +970,7 @@ struct PoolSlot {
   CUtensorMap forward_x_m64_map{};
   CUtensorMap forward_s_m64_map{};
   CUtensorMap forward_output_store_map{};
+  CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};
   bool forward_maps_valid = false;
 };
@@ -1204,6 +1221,15 @@ __device__ __forceinline__ std::uint32_t float2_to_bf16x2_bits(float low,
       __float22bfloat162_rn(make_float2(low, high)));
   return static_cast<std::uint32_t>(pair.x) |
          (static_cast<std::uint32_t>(pair.y) << 16U);
+}
+
+__device__ __forceinline__ float2
+bf16x2_bits_to_float2(std::uint32_t pair) {
+  // A promoted BF16 is its 16 bits in the high half of an FP32 word. Decode
+  // both packed lanes together so the FC1 epilogue needs only one shift and
+  // one mask per pair instead of separately extracting two uint16_t values.
+  return make_float2(__uint_as_float(pair << 16U),
+                     __uint_as_float(pair & 0xffff0000U));
 }
 
 __device__ float bf16_bits_to_float(std::uint16_t value) {

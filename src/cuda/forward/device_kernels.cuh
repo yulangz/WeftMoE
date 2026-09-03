@@ -896,6 +896,11 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
   auto *forward_return_source_route_index = peer_at<unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
+  auto *ab_cache =
+      a.retain_backward_state
+          ? peer_at<transport::BFloat16>(a.local_base,
+                                         a.forward_ab_cache_offset)
+          : static_cast<transport::BFloat16 *>(nullptr);
   const auto *canonical_gates =
       peer_at<const float>(a.local_base, a.canonical_gates_offset);
   if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
@@ -2205,17 +2210,27 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                   const auto gate = canonical_gates[row + block_m];
                   // Each WGMMA lane owns two adjacent BF16 outputs.  Publish
                   // the pair as one naturally aligned store for gated U.
-                  const auto pack = [](std::uint16_t low, std::uint16_t high) {
-                    return static_cast<std::uint32_t>(low) |
-                           (static_cast<std::uint32_t>(high) << 16U);
-                  };
+                  const auto a_pair = float2_to_bf16x2_bits(av0, av1);
+                  const auto b_pair = float2_to_bf16x2_bits(bv0, bv1);
+                  const auto a_values = bf16x2_bits_to_float2(a_pair);
+                  const auto b_values = bf16x2_bits_to_float2(b_pair);
+                  if (ab_cache != nullptr) {
+                    reinterpret_cast<std::uint32_t *>(
+                        ab_cache)[output_index / 2ULL] = a_pair;
+                    const auto b_index =
+                        a.max_destination_rows * a.intermediate +
+                        output_index;
+                    reinterpret_cast<std::uint32_t *>(
+                        ab_cache)[b_index / 2ULL] = b_pair;
+                  }
                   reinterpret_cast<std::uint32_t *>(s)[output_index / 2ULL] =
-                      pack(float_to_bf16_bits(
-                               forward_compute_detail::gated_swiglu_fc2_input(
-                                   av0, bv0, gate)),
-                           float_to_bf16_bits(
-                               forward_compute_detail::gated_swiglu_fc2_input(
-                                   av1, bv1, gate)));
+                      float2_to_bf16x2_bits(
+                          forward_compute_detail::
+                              gated_swiglu_fc2_input(a_values.x, b_values.x,
+                                                    gate),
+                          forward_compute_detail::
+                              gated_swiglu_fc2_input(a_values.y, b_values.y,
+                                                    gate));
                 } else if (block_m < valid_rows) {
                   // Retain checked scalar stores for non-main odd-N fixtures.
                   const float av[2] = {av0, av1};
@@ -2227,9 +2242,19 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                     if (tail_column < a.intermediate) {
                       const auto output_index =
                           (row + block_m) * a.intermediate + tail_column;
+                      const auto a_bits = float_to_bf16_bits(av[value]);
+                      const auto b_bits = float_to_bf16_bits(bv[value]);
+                      if (ab_cache != nullptr) {
+                        ab_cache[output_index] =
+                            transport::BFloat16{a_bits};
+                        ab_cache[a.max_destination_rows * a.intermediate +
+                                 output_index] =
+                            transport::BFloat16{b_bits};
+                      }
                       s[output_index] = transport::BFloat16{float_to_bf16_bits(
-                          forward_compute_detail::gated_swiglu_fc2_input(
-                              av[value], bv[value], gate))};
+                          forward_compute_detail::
+                              gated_swiglu_fc2_input_from_bf16(
+                                  a_bits, b_bits, gate))};
                     }
                   }
                 }
