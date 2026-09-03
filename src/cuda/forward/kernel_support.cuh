@@ -1140,6 +1140,10 @@ struct PoolSlot {
   CUtensorMap backward_u_mn_map{};
   CUtensorMap backward_dab_mn_map{};
   CUtensorMap backward_x_mn_map{};
+  CUtensorMap backward_u_store_map{};
+  CUtensorMap backward_dx_store_map{};
+  CUtensorMap backward_dw2_store_map{};
+  CUtensorMap backward_dw1_store_map{};
   bool backward_maps_valid = false;
 };
 

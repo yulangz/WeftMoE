@@ -41,10 +41,10 @@
 #define MEGAMOE_BWD_DX_STAGES 4
 #endif
 #ifndef MEGAMOE_BWD_DW1_STAGES
-#define MEGAMOE_BWD_DW1_STAGES 4
+#define MEGAMOE_BWD_DW1_STAGES 3
 #endif
 #ifndef MEGAMOE_BWD_DW2_STAGES
-#define MEGAMOE_BWD_DW2_STAGES 4
+#define MEGAMOE_BWD_DW2_STAGES 3
 #endif
 #ifndef MEGAMOE_BWD_COMPUTE_THREADS
 #define MEGAMOE_BWD_COMPUTE_THREADS 384
@@ -65,7 +65,7 @@
 #define MEGAMOE_BWD_RDMA_CTAS 8
 #endif
 #ifndef MEGAMOE_BWD_RELAY_CTAS
-#define MEGAMOE_BWD_RELAY_CTAS 16
+#define MEGAMOE_BWD_RELAY_CTAS 12
 #endif
 #ifndef MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP
 #define MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP 64
@@ -137,7 +137,7 @@ static_assert((kMathWarpgroups * kMathRegisters +
                   128U <=
               65536U);
 static_assert(kRdmaCtas == 8U);
-static_assert(kRelayCtas >= 8U && kRelayCtas % 8U == 0U);
+static_assert(kRelayCtas >= 8U && kRelayCtas % 4U == 0U);
 static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
 static_assert(kDwClaimTiles == 1U || kDwClaimTiles == 4U ||

@@ -402,7 +402,11 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                            slot.backward_dr_mn_map,
                            slot.backward_u_mn_map,
                            slot.backward_dab_mn_map,
-                           slot.backward_x_mn_map);
+                           slot.backward_x_mn_map,
+                           slot.backward_u_store_map,
+                           slot.backward_dx_store_map,
+                           slot.backward_dw2_store_map,
+                           slot.backward_dw1_store_map);
   internal::throw_cuda(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
       "backward", identity.generation, ExchangeKind::ExpertCounts,

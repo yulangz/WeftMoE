@@ -522,7 +522,7 @@ def main():
                 summary[key + "_slowest_rank_us"] = backward_stats(slowest)
             result = {
                 "schema": 1,
-                "benchmark": "cached-x-ab-local-backward-scaffold",
+                "benchmark": "cached-x-ab-local-backward-pipeline",
                 "world": args.world,
                 "warmup": 10,
                 "measured": measured,

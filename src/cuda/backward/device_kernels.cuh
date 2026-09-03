@@ -235,6 +235,87 @@ __device__ __forceinline__ void backward_swiglu_epilogue_row(
     dgate[row] = reduction[0];
 }
 
+// A persistent compute CTA has twelve warps but the original row epilogue
+// used only eight of them and returned to the global scheduler after every
+// row.  Give one row to each warp and have its 32 lanes emulate the original
+// 256 logical lanes.  The eight partial streams are reduced in the same tree
+// order as backward_swiglu_epilogue_row, preserving bitwise dGate results
+// while amortizing queue and CTA-barrier traffic across twelve rows.
+__device__ __forceinline__ void backward_swiglu_epilogue_warp_rows(
+    const BackwardKernelArgs &a, std::uint64_t first_row,
+    std::uint32_t valid_rows, std::uint32_t rows) {
+  constexpr std::uint32_t kLogicalThreads = 256U;
+  constexpr std::uint32_t kLogicalLanesPerWarp =
+      kLogicalThreads / 32U;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  if (warp >= rows)
+    return;
+
+  const auto row = first_row + warp;
+  auto *u = peer_at<transport::BFloat16>(a.local_base,
+                                         a.recomputed_u_offset);
+  const auto *ab = peer_at<const transport::BFloat16>(
+      a.local_base, a.padded_ab_offset);
+  auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
+  auto *dgate = peer_at<float>(a.local_base, a.dgate_rows_offset);
+  const auto output_base = row * 2ULL * a.intermediate;
+  const auto row_is_valid = warp < valid_rows;
+  if (!row_is_valid) {
+    for (std::uint64_t column = lane; column < a.intermediate;
+         column += 32U) {
+      const auto index = row * a.intermediate + column;
+      u[index] = transport::BFloat16{0U};
+      dab[output_base + column] = transport::BFloat16{0U};
+      dab[output_base + a.intermediate + column] =
+          transport::BFloat16{0U};
+    }
+    if (lane == 0U)
+      dgate[row] = 0.0F;
+    return;
+  }
+
+  const auto gate = dgate[row];
+  float partial[kLogicalLanesPerWarp]{};
+#pragma unroll
+  for (std::uint32_t stream = 0U; stream < kLogicalLanesPerWarp;
+       ++stream) {
+    const auto logical_lane = lane + stream * 32U;
+    for (std::uint64_t column = logical_lane; column < a.intermediate;
+         column += kLogicalThreads) {
+      const auto index = row * a.intermediate + column;
+      const auto av = bf16_bits_to_float(ab[index].bits);
+      const auto bv = bf16_bits_to_float(
+          ab[a.padded_capacity_rows * a.intermediate + index].bits);
+      const auto duv = bf16_bits_to_float(u[index].bits);
+      const auto sigmoid = 1.0F / (1.0F + expf(-av));
+      const auto silu = av * sigmoid;
+      const auto s = silu * bv;
+      const auto ds = gate * duv;
+      const auto silu_derivative =
+          sigmoid * (1.0F + av * (1.0F - sigmoid));
+      dab[output_base + column] = transport::BFloat16{
+          float_to_bf16_bits(ds * bv * silu_derivative)};
+      dab[output_base + a.intermediate + column] =
+          transport::BFloat16{float_to_bf16_bits(ds * silu)};
+      u[index] =
+          transport::BFloat16{float_to_bf16_bits(gate * s)};
+      partial[stream] = fmaf(duv, s, partial[stream]);
+    }
+  }
+#pragma unroll
+  for (std::uint32_t stream = 0U; stream < 4U; ++stream)
+    partial[stream] += partial[stream + 4U];
+  partial[0] += partial[2];
+  partial[1] += partial[3];
+  partial[0] += partial[1];
+#pragma unroll
+  for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U)
+    partial[0] += __shfl_down_sync(0xffffffffU, partial[0], stride);
+  if (lane == 0U)
+    dgate[row] = partial[0];
+}
+
 __global__ void backward_swiglu_epilogue_kernel(BackwardKernelArgs a,
                                                  std::uint64_t rows) {
   const auto row = static_cast<std::uint64_t>(blockIdx.x);

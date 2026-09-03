@@ -1618,6 +1618,29 @@ ActivationTransportResourcePool make_activation_transport_pool(
               config.max_hidden_size,
               state->layout.backward_padded_capacity_rows,
               "Backward dW1 X MN-major");
+          slot.backward_u_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_u),
+              config.max_intermediate_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dU output");
+          slot.backward_dx_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_dx_rows),
+              config.max_hidden_size,
+              state->layout.backward_padded_capacity_rows,
+              "Backward dX output");
+          slot.backward_dw2_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_dw2),
+              config.max_intermediate_size,
+              checked_mul(config.max_owned_experts, config.max_hidden_size,
+                          "Backward dW2 output rows"),
+              "Backward dW2 output");
+          slot.backward_dw1_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.backward_dw1),
+              config.max_hidden_size,
+              checked_mul(config.max_owned_experts,
+                          2ULL * config.max_intermediate_size,
+                          "Backward dW1 output rows"),
+              "Backward dW1 output");
           slot.backward_maps_valid = true;
         }
         if (slot.gin_window != nullptr)
