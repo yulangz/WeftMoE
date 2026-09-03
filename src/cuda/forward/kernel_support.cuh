@@ -633,6 +633,11 @@ struct GinWindowLayout {
   std::size_t return_staging = 0;
   std::size_t return_receive = 0;
   std::size_t return_fragment_ready = 0;
+  // Backward reuses the BF16 Forward Return planes for dX.  dGate is FP32 and
+  // follows the same canonical-producer -> compact-source row mapping, so it
+  // needs only these two small registered companion planes.
+  std::size_t backward_return_gate_staging = 0;
+  std::size_t backward_return_gate_receive = 0;
   std::size_t barrier = 0;
   std::size_t production_error_records = 0;
   std::size_t total = 0;
@@ -740,6 +745,14 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.return_fragment_ready =
       append(cursor, routes, sizeof(std::uint64_t),
              "GIN return fragment ready counters");
+  if (config.enable_backward_state) {
+    layout.backward_return_gate_staging =
+        append(cursor, direct_return_rows, sizeof(float),
+               "GIN Backward dGate return staging");
+    layout.backward_return_gate_receive =
+        append(cursor, routes, sizeof(float),
+               "GIN Backward dGate return receive");
+  }
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),

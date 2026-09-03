@@ -17,8 +17,31 @@ struct BackwardKernelArgs {
   std::uint32_t active_experts = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
+  std::uint32_t node = 0;
+  std::uint32_t local_world_size = 0;
+  std::uint32_t gin_context_count = 0;
+  std::uint64_t max_tokens_per_rank = 0;
+  bool use_gin = false;
   void *local_base = nullptr;
   void **peer_bases = nullptr;
+#if __has_include(<nccl_device.h>)
+  ncclDevComm_t gin_dev_comm{};
+  ncclWindow_t gin_window = nullptr;
+#endif
+  void *gin_window_base = nullptr;
+  std::size_t gin_send_dispatch_directory_offset = 0;
+  std::size_t gin_receive_dispatch_directory_offset = 0;
+  std::size_t gin_send_header_offset = 0;
+  std::size_t gin_receive_header_offset = 0;
+  std::size_t gin_send_fanout_offset = 0;
+  std::size_t gin_receive_fanout_offset = 0;
+  std::size_t gin_send_payload_offset = 0;
+  std::size_t gin_receive_payload_offset = 0;
+  std::size_t gin_return_staging_offset = 0;
+  std::size_t gin_return_receive_offset = 0;
+  std::size_t gin_return_fragment_ready_offset = 0;
+  std::size_t gin_return_gate_staging_offset = 0;
+  std::size_t gin_return_gate_receive_offset = 0;
   std::size_t canonical_x_offset = 0;
   std::size_t canonical_gate_offset = 0;
   std::size_t cached_ab_offset = 0;
@@ -41,6 +64,9 @@ struct BackwardKernelArgs {
   std::size_t setup_epoch_offset = 0;
   std::size_t dispatch_ready_offset = 0;
   std::size_t return_ready_offset = 0;
+  std::size_t forward_output_ready_epoch_offset = 0;
+  std::size_t forward_return_source_route_index_offset = 0;
+  std::size_t forward_direct_source_compact_index_offset = 0;
   std::size_t scheduler_offset = 0;
   std::size_t status_offset = 0;
 };
