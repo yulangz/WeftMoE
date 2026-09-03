@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nccl_library import configure_nccl_library
 from run_multinode_megatron_socket import (
-    benchmark_arguments,
     extract_record,
     remote_cleanup,
     terminate,
@@ -220,6 +219,9 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="te-grouped-mlp")
+    parser.add_argument("--workload", choices=("forward", "backward"),
+                        default="forward")
+    parser.add_argument("--validation-repeats", type=int, default=0)
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")

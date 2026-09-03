@@ -68,3 +68,23 @@ thread.
 
 The compact evidence is
 [`benchmarks/results/forward_gate_before_20260903.json`](../benchmarks/results/forward_gate_before_20260903.json).
+
+## Backward target baseline
+
+Before implementing the new Backward pipeline, Megatron-Core 0.17.0 was
+measured with the same retained-state contract. Forward setup is outside the
+timed region; selective `moe_act` recomputation retains routed X and BF16 FC1
+A/B, releases U, and recomputes SwiGLU plus the gate multiply during Backward.
+The timed region includes dY dispatch, dAB, dX, dGate, dW1, dW2, and dX
+combine.
+
+| topology | mean BWD-only host wall | p95 |
+| --- | ---: | ---: |
+| world 8, one H200 node | 30.2048 ms | 31.2478 ms |
+| world 16, two H200 nodes, RDMA | 43.0583 ms | 43.4779 ms |
+
+On both topologies, selective recomputation matched Megatron without activation
+recomputation byte-for-byte for dX, dGate, dW1, and dW2, and a second cached
+X/A/B Backward execution was byte-identical. The world-16 run used all eight
+RoCE rails with GDRDMA and no Socket payload fallback. Compact evidence is in
+[`benchmarks/results/backward_megatron_cache_x_ab_20260903.json`](../benchmarks/results/backward_megatron_cache_x_ab_20260903.json).

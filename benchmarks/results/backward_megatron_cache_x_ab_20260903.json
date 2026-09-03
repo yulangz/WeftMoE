@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "description": "Megatron Backward-only baseline with the same cached X/A/B contract as MegaMOE",
+  "tested_worktree_base_commit": "bbfc08295aa75a12aeb6b39e8a47d8294ead021c",
+  "recorded_utc": "2026-09-03T10:19:38Z",
+  "hardware": "8x H200 per node (driver label NVIDIA L20X)",
+  "software": {
+    "megatron_core": "0.17.0",
+    "transformer_engine": "2.14.1+27de67e1",
+    "torch": "2.9.1+cu129",
+    "nccl_runtime": "2.29.7+cuda12.9"
+  },
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "measured_iterations": 100,
+    "aggregation": "slowest rank per iteration"
+  },
+  "checkpoint_contract": {
+    "retained_before_timing": [
+      "canonical routed X",
+      "BF16 FC1 A/B"
+    ],
+    "released_before_timing": "gated BF16 SwiGLU output U",
+    "recomputed_inside_timing": [
+      "SwiGLU",
+      "gate multiply",
+      "U"
+    ],
+    "megatron_config": {
+      "recompute_granularity": "selective",
+      "recompute_modules": ["moe_act"]
+    },
+    "forward_setup_in_timed_region": false
+  },
+  "timed_work": [
+    "dY dispatch",
+    "dAB",
+    "dX",
+    "dGate",
+    "dW1",
+    "dW2",
+    "dX combine"
+  ],
+  "world8": {
+    "backend": "NVLink through Megatron/NCCL all-to-all",
+    "cuda_event_ms": {
+      "mean": 30.180962,
+      "p50": 30.147808,
+      "p95": 31.223680,
+      "min": 29.374369,
+      "max": 32.707455
+    },
+    "host_wall_ms": {
+      "mean": 30.204765,
+      "p50": 30.170343,
+      "p95": 31.247838,
+      "min": 29.399904,
+      "max": 32.732197
+    }
+  },
+  "world16": {
+    "backend": "NCCL RoCE/GDRDMA over eight 200-Gb/s rails",
+    "cuda_event_ms": {
+      "mean": 43.033856,
+      "p50": 43.050079,
+      "p95": 43.455551,
+      "min": 42.501663,
+      "max": 43.767586
+    },
+    "host_wall_ms": {
+      "mean": 43.058305,
+      "p50": 43.078200,
+      "p95": 43.477927,
+      "min": 42.523266,
+      "max": 43.791734
+    },
+    "rdma_validation": {
+      "all_eight_rails_bidirectional": true,
+      "gdrdma_observed": true,
+      "socket_payload_fallback_observed": false,
+      "aggregate_local_tx_gbytes_per_second_over_full_launch": 28.961552,
+      "aggregate_local_rx_gbytes_per_second_over_full_launch": 28.961554
+    }
+  },
+  "correctness": {
+    "comparison": "selective X/A/B recompute versus Megatron without activation recompute",
+    "world8_all_ranks": {
+      "dx_byte_identical": true,
+      "dgate_byte_identical": true,
+      "dw1_byte_identical": true,
+      "dw2_byte_identical": true,
+      "maximum_absolute_error": 0.0,
+      "repeat_byte_identical": true
+    },
+    "world16_all_ranks": {
+      "dx_byte_identical": true,
+      "dgate_byte_identical": true,
+      "dw1_byte_identical": true,
+      "dw2_byte_identical": true,
+      "maximum_absolute_error": 0.0,
+      "repeat_byte_identical": true
+    }
+  }
+}

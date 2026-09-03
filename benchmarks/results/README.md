@@ -1,8 +1,10 @@
 # Benchmark results
 
-Only results produced from the current Forward-only implementation belong in
-this directory. Historical single-node fallback, cache, and Backward records
-were removed because their kernels and measurement boundaries no longer exist.
+Only results produced from current code and active measurement boundaries
+belong in this directory. Historical single-node fallback, cache, and retired
+Backward records were removed because their kernels no longer exist. A new
+Backward record must identify whether Forward setup and retained-state creation
+are inside or outside its timed boundary.
 
 Use `tools/autotune_forward.py` for tuning and the Forward benchmark scenarios
 in `tests/run_local_activation_p2p.py` or `tests/run_multinode_nccl.py` for
@@ -22,7 +24,10 @@ The current records are:
   performance regression evidence;
 - [`forward_bf16_checkpoint_20260903.json`](forward_bf16_checkpoint_20260903.json),
   the BF16 FC1 checkpoint contract, retained-state correctness, compile-time
-  inference/training split, and paired world-8/world-16 regression evidence.
+  inference/training split, and paired world-8/world-16 regression evidence;
+- [`backward_megatron_cache_x_ab_20260903.json`](backward_megatron_cache_x_ab_20260903.json),
+  the pre-implementation Megatron BWD target using selective SwiGLU
+  recomputation from cached X and BF16 A/B.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

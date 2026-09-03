@@ -11,7 +11,6 @@ import json
 import os
 import secrets
 import shlex
-import signal
 import subprocess
 import sys
 import tempfile
@@ -54,8 +53,13 @@ def remote_cleanup(args, launch_id, requested_signal):
 
 
 def benchmark_arguments(args):
+    benchmark = (
+        "benchmarks/megatron_backward_baseline.py"
+        if args.workload == "backward"
+        else "benchmarks/megatron_dispatch_baseline.py"
+    )
     result = [
-        "benchmarks/megatron_dispatch_baseline.py",
+        benchmark,
         "--tokens", str(args.tokens),
         "--hidden", str(args.hidden),
         "--intermediate", str(args.intermediate),
@@ -65,8 +69,13 @@ def benchmark_arguments(args):
         "--iterations", str(args.iterations),
         "--runs", "1",
         "--gate-mode", args.gate_mode,
-        "--expert-body", args.expert_body,
     ]
+    if args.workload == "backward":
+        result.extend([
+            "--validation-repeats", str(args.validation_repeats),
+        ])
+    else:
+        result.extend(["--expert-body", args.expert_body])
     return result
 
 
@@ -105,6 +114,9 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="te-grouped-mlp")
+    parser.add_argument("--workload", choices=("forward", "backward"),
+                        default="forward")
+    parser.add_argument("--validation-repeats", type=int, default=0)
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")
