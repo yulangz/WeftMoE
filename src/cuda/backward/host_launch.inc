@@ -341,32 +341,38 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         "backward-run", cudaGetLastError(), identity.rank, identity.world,
         "backward", identity.generation, ExchangeKind::ExpertCounts,
         "materialize immutable Backward cache and per-run gates");
-    internal::throw_cuda(
-        "backward-run",
-        cudaMemsetAsync(at<void>(slot.device, layout.backward_dw1), 0,
-                        checked_size(
-                            static_cast<std::uint64_t>(
-                                view.sizes.owned_expert_count) *
-                                2ULL * config.intermediate_size *
-                                config.hidden_size *
-                                sizeof(transport::BFloat16),
-                            "Backward dW1 clear bytes"),
-                        transport_stream),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "clear Backward dW1 output");
-    internal::throw_cuda(
-        "backward-run",
-        cudaMemsetAsync(at<void>(slot.device, layout.backward_dw2), 0,
-                        checked_size(
-                            static_cast<std::uint64_t>(
-                                view.sizes.owned_expert_count) *
-                                config.hidden_size *
-                                config.intermediate_size *
-                                sizeof(transport::BFloat16),
-                            "Backward dW2 clear bytes"),
-                        transport_stream),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "clear Backward dW2 output");
+    // Every active expert writes every dW tile.  The dense training shape has
+    // no inactive expert, so clearing several GiB immediately before those
+    // stores is pure HBM traffic.  Sparse fixtures retain the full clear to
+    // preserve the public zero-gradient contract for inactive experts.
+    if (args.active_experts != view.sizes.owned_expert_count) {
+      internal::throw_cuda(
+          "backward-run",
+          cudaMemsetAsync(at<void>(slot.device, layout.backward_dw1), 0,
+                          checked_size(
+                              static_cast<std::uint64_t>(
+                                  view.sizes.owned_expert_count) *
+                                  2ULL * config.intermediate_size *
+                                  config.hidden_size *
+                                  sizeof(transport::BFloat16),
+                              "Backward dW1 clear bytes"),
+                          transport_stream),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "clear sparse Backward dW1 output");
+      internal::throw_cuda(
+          "backward-run",
+          cudaMemsetAsync(at<void>(slot.device, layout.backward_dw2), 0,
+                          checked_size(
+                              static_cast<std::uint64_t>(
+                                  view.sizes.owned_expert_count) *
+                                  config.hidden_size *
+                                  config.intermediate_size *
+                                  sizeof(transport::BFloat16),
+                              "Backward dW2 clear bytes"),
+                          transport_stream),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "clear sparse Backward dW2 output");
+    }
   }
   internal::throw_cuda(
       "backward-run", cudaEventRecord(slot.forward_roles_ready,
