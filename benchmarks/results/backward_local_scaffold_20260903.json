@@ -33,6 +33,30 @@
     "dw1_byte_identical": true,
     "dw2_byte_identical": true
   },
+  "main_shape_performance": {
+    "world": 8,
+    "warmup_iterations": 10,
+    "measured_iterations": 10,
+    "aggregation": "slowest rank per iteration",
+    "cuda_event_us": {
+      "total_mean": 23909.03,
+      "total_p95": 24309.1,
+      "dispatch_mean": 1858.058,
+      "dab_mean": 3547.359,
+      "dx_mean": 6214.318,
+      "dw2_mean": 5817.171,
+      "dw1_mean": 6512.768,
+      "combine_mean": 2970.086,
+      "dw_combine_overlap_mean": 2970.086
+    },
+    "host_wall_us": {
+      "mean": 24343.45,
+      "p95": 25079.2
+    },
+    "megatron_host_wall_mean_us": 30204.765,
+    "speedup_over_megatron": 1.240774,
+    "interpretation": "Return/combine is fully hidden by dW, while the rank-wide dY wait serializes the complete 1.86 ms Dispatch head."
+  },
   "independent_reference": {
     "implementation": "PyTorch autograd from exact cached BF16 X/A/B",
     "accuracy": {
@@ -61,6 +85,7 @@
   },
   "commands": [
     "python3 tests/run_local_activation_p2p.py --binary build-bwd/test_cuda_notify --world 8 --backward-validation --backward-tokens 2 --rounds 1 --timeout 180",
-    "torchrun --standalone --nproc_per_node=8 benchmarks/compare_backward_outputs.py --artifact-dir artifacts/backward-validation-m1-contiguous --tokens 2 --experts 16"
+    "torchrun --standalone --nproc_per_node=8 benchmarks/compare_backward_outputs.py --artifact-dir artifacts/backward-validation-m1-contiguous --tokens 2 --experts 16",
+    "python3 tests/run_local_activation_p2p.py --binary build-bwd/test_cuda_notify --world 8 --backward-benchmark --backward-tokens 8192 --top-k 6 --rounds 20 --timeout 600"
   ]
 }
