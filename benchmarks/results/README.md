@@ -27,7 +27,11 @@ The current records are:
   inference/training split, and paired world-8/world-16 regression evidence;
 - [`backward_megatron_cache_x_ab_20260903.json`](backward_megatron_cache_x_ab_20260903.json),
   the pre-implementation Megatron BWD target using selective SwiGLU
-  recomputation from cached X and BF16 A/B.
+  recomputation from cached X and BF16 A/B;
+- [`backward_local_scaffold_20260903.json`](backward_local_scaffold_20260903.json),
+  the first local cached-state BWD implementation milestone and its independent
+  PyTorch-autograd accuracy evidence. This is a correctness scaffold, not the
+  persistent performance-qualified pipeline.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

@@ -268,6 +268,10 @@ def main():
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
+    parser.add_argument("--backward-validation", action="store_true")
+    parser.add_argument("--backward-benchmark", action="store_true")
+    parser.add_argument("--backward-tokens", type=int)
+    parser.add_argument("--backward-output-dir")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
@@ -279,13 +283,16 @@ def main():
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
     if sum((args.benchmark, args.integrated_benchmark,
-            args.forward_smoke, args.forward_benchmark)) > 1:
+            args.forward_smoke, args.forward_benchmark,
+            args.backward_validation, args.backward_benchmark)) > 1:
         parser.error("choose only one benchmark/smoke mode")
     benchmark_mode = (args.benchmark or args.integrated_benchmark or
-                      args.forward_benchmark)
+                      args.forward_benchmark or args.backward_benchmark)
     if args.rounds is None:
-        args.rounds = 110 if benchmark_mode else 1
-    if benchmark_mode and args.rounds <= 10:
+        args.rounds = (30 if args.backward_benchmark else
+                       (2 if args.backward_validation else
+                        (110 if benchmark_mode else 1)))
+    if benchmark_mode and not args.backward_benchmark and args.rounds <= 10:
         parser.error("--benchmark requires more than 10 total rounds")
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
@@ -296,6 +303,17 @@ def main():
         environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
     elif args.forward_benchmark:
         environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
+    elif args.backward_validation or args.backward_benchmark:
+        environment["MEGAMOE_BACKWARD_ROUNDS"] = str(args.rounds)
+        environment["MEGAMOE_BACKWARD_WARMUPS"] = (
+            "0" if args.backward_validation else "10")
+        if args.backward_tokens is not None:
+            if args.backward_tokens <= 0:
+                parser.error("--backward-tokens must be positive")
+            environment[
+                "MEGAMOE_BACKWARD_TOKENS" if args.backward_validation
+                else "MEGAMOE_P2P_BENCH_TOKENS"
+            ] = str(args.backward_tokens)
     else:
         environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
                     "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
@@ -305,6 +323,12 @@ def main():
         os.makedirs(args.forward_output_dir, mode=0o700, exist_ok=True)
         environment["MEGAMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
             args.forward_output_dir)
+    if args.backward_output_dir:
+        if not args.backward_validation:
+            parser.error("--backward-output-dir requires validation mode")
+        os.makedirs(args.backward_output_dir, mode=0o700, exist_ok=True)
+        environment["MEGAMOE_BACKWARD_OUTPUT_DIR"] = os.path.abspath(
+            args.backward_output_dir)
     if args.no_wrap:
         environment["MEGAMOE_P2P_NO_WRAP"] = "1"
     if args.ring_slots is not None:
@@ -314,12 +338,22 @@ def main():
                "--print-limit=10", "--error-exitcode=1"))
     read_fd, write_fd = os.pipe()
     processes = []
-    scenario = ("forward_bench" if args.forward_benchmark else
-                ("forward_smoke" if args.forward_smoke else
-                 ("activation_integrated_bench" if args.integrated_benchmark else
-                  ("activation_p2p_bench" if args.benchmark else
-                   ("activation_p2p_cancel" if args.cancel else
-                    "activation_p2p")))))
+    if args.backward_benchmark:
+        scenario = "backward_bench"
+    elif args.backward_validation:
+        scenario = "backward_validate"
+    elif args.forward_benchmark:
+        scenario = "forward_bench"
+    elif args.forward_smoke:
+        scenario = "forward_smoke"
+    elif args.integrated_benchmark:
+        scenario = "activation_integrated_bench"
+    elif args.benchmark:
+        scenario = "activation_p2p_bench"
+    elif args.cancel:
+        scenario = "activation_p2p_cancel"
+    else:
+        scenario = "activation_p2p"
     try:
         rank0 = subprocess.Popen(
             runner(args.binary, 0, args.world, args.seed, write_fd, True,
@@ -418,6 +452,12 @@ def main():
                         f"rank={rank} invalid forward smoke audit: {item}")
                 observed.append(item)
                 continue
+            if args.backward_validation or args.backward_benchmark:
+                item = parse_fields(stdout, "BACKWARD_RESULT ")
+                item["_nccl_runtime"] = parse_fields(
+                    stdout, "NCCL_RUNTIME ")["runtime"]
+                observed.append(item)
+                continue
             if args.cancel:
                 cancelled = parse_fields(stdout, "P2P_CANCEL ")
                 if cancelled.get("cancelled") != "1" or \
@@ -441,6 +481,64 @@ def main():
             print(f"[PASS] LocalCudaP2p Forward MegaKernel world={args.world} "
                   "split-role WGMMA/TMA-7168x3072 smoke "
                   f"rank0_output_hash={hashes[0]}")
+            return
+        if args.backward_validation:
+            if any(item["mode"] != "validation" or
+                   item["repeat_equal"] != "1" for item in observed):
+                raise AssertionError("Backward repeat stability failed")
+            print(f"[PASS] cached-state Backward stability world={args.world} "
+                  f"tokens={args.backward_tokens or 8}")
+            return
+        if args.backward_benchmark:
+            stage_keys = ("wall", "total", "dispatch", "dab", "dx",
+                          "dw2", "dw1", "combine",
+                          "dw_combine_overlap")
+            measured = args.rounds - 10
+            for rank, item in enumerate(observed):
+                if item["mode"] != "benchmark":
+                    raise AssertionError(
+                        f"rank={rank} invalid Backward mode: {item}")
+                for key in stage_keys:
+                    item[key] = [float(value)
+                                 for value in item[key].split(",")]
+                    if len(item[key]) != measured:
+                        raise AssertionError(
+                            f"rank={rank} stage={key} bad sample count")
+
+            def backward_stats(values):
+                ordered = sorted(values)
+                def percentile(fraction):
+                    ordinal = max(1, int(len(ordered) * fraction + 0.999999))
+                    return ordered[ordinal - 1]
+                return {"mean": statistics.fmean(values),
+                        "p50": percentile(0.50),
+                        "p95": percentile(0.95),
+                        "min": ordered[0], "max": ordered[-1]}
+
+            summary = {}
+            for key in stage_keys:
+                slowest = [max(item[key][iteration] for item in observed)
+                           for iteration in range(measured)]
+                summary[key + "_slowest_rank_us"] = backward_stats(slowest)
+            result = {
+                "schema": 1,
+                "benchmark": "cached-x-ab-local-backward-scaffold",
+                "world": args.world,
+                "warmup": 10,
+                "measured": measured,
+                "shape": {"tokens_per_rank": args.backward_tokens or 8192,
+                          "hidden": 7168, "intermediate": 3072,
+                          "experts": 384, "top_k": args.top_k},
+                "per_rank_workspace_bytes": [
+                    int(item["workspace_bytes"]) for item in observed],
+                "per_rank_gemm_launches": [
+                    int(item["gemm_launches"]) for item in observed],
+                "per_rank_nccl_runtime": [
+                    item["_nccl_runtime"] for item in observed],
+                **summary,
+            }
+            print("BACKWARD_BENCH_JSON " +
+                  json.dumps(result, sort_keys=True))
             return
         if args.cancel:
             print(f"[PASS] LocalCudaP2p all-rank cancel/quarantine world={args.world}")

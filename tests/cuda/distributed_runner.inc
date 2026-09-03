@@ -14,12 +14,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto gin_forward_benchmark = scenario == "gin_forward_bench";
   const auto socket_forward_benchmark =
       scenario == "socket_forward_bench";
+  const auto backward_validation = scenario == "backward_validate";
+  const auto backward_benchmark = scenario == "backward_bench";
   const auto forward_smoke = scenario == "forward_smoke" || gin_forward_smoke;
   const auto benchmark_forward =
       scenario == "forward_bench" || gin_forward_benchmark ||
       socket_forward_benchmark;
-  const auto benchmark_shape =
-      benchmark_p2p || benchmark_integrated || benchmark_forward;
+  const auto benchmark_shape = benchmark_p2p || benchmark_integrated ||
+                               benchmark_forward || backward_benchmark;
   auto experts = std::max<std::uint32_t>(16, world * 2);
   auto top_k = std::min<std::uint32_t>(6, experts);
   if (const auto *p2p_top_k = std::getenv("MEGAMOE_P2P_TOP_K"))
@@ -33,7 +35,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         gin_forward_benchmark || socket_forward_benchmark;
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
-              (benchmark_forward && (world == 1 || world == 8)) ||
+              ((benchmark_forward || backward_benchmark) &&
+               (world == 1 || world == 8)) ||
               (benchmark_integrated && (world == 2 || world == 8)))) ||
                 (cross_host_benchmark && nodes == 2 &&
                  (world == 2 || world == 16)),
@@ -103,6 +106,30 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             (base_expert + slot * 5U) % experts));
     }
   }
+  if (backward_validation) {
+    require(nodes == 1U && (world == 1U || world == 2U || world == 8U),
+            "Backward validation requires local 1/2/8 GPUs");
+    // Keep at least the small topology already exercised by the Forward
+    // scheduler; one-expert fixtures do not provide its split-role terminal
+    // accounting with a representative task domain.
+    experts = std::max<std::uint32_t>(16U, world * 2U);
+    top_k = 1U;
+    const auto *tokens_text = std::getenv("MEGAMOE_BACKWARD_TOKENS");
+    max_tokens = tokens_text ? std::stoull(tokens_text) : 8ULL;
+    // Forward publishes 64-row Dispatch arrival tiles. Backward later groups
+    // and pads those immutable rows into its own 128-row dependency blocks.
+    common_config = make_config(nodes, gpus_per_node, experts, top_k, 64U);
+    for (std::uint32_t expert = 0; expert < experts; ++expert)
+      common_config.topology.expert_to_rank[expert] =
+          expert / (experts / world);
+    common_routes.num_tokens = max_tokens;
+    common_routes.selected_experts.clear();
+    common_routes.selected_experts.reserve(
+        static_cast<std::size_t>(max_tokens));
+    for (std::uint64_t token = 0; token < max_tokens; ++token)
+      common_routes.selected_experts.push_back(
+          static_cast<std::int32_t>((token * world + rank) % experts));
+  }
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (rank == 0) {
     require(rank == 0, "only rank 0 may generate bootstrap ID");
@@ -125,6 +152,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "multinode-exec-" + std::to_string(rank), local_rank);
   auto base = megamoe::cuda::make_nccl_session(
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
+  if (backward_validation || backward_benchmark) {
+    run_cached_backward_rank(rank, nodes, world, experts, top_k, max_tokens,
+                             common_config, common_routes, base, execution,
+                             backward_validation);
+    return;
+  }
   if (scenario == "gin_probe") {
     const auto capability =
         megamoe::cuda::probe_activation_transport_capability(base, execution);

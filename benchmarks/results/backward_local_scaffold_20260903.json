@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "description": "First local cached-state MegaMOE Backward correctness scaffold",
+  "tested_worktree_base_commit": "0a34acb3d3640edf189426649746b04584d7474a",
+  "recorded_utc": "2026-09-03T10:59:26Z",
+  "hardware": "8x H200 (driver label NVIDIA L20X)",
+  "status": {
+    "performance_qualified": false,
+    "backward_pipeline_available": false,
+    "scope": "one-node LocalCudaP2p retained Forward state"
+  },
+  "shape": {
+    "world": 8,
+    "tokens_per_rank": 2,
+    "experts": 16,
+    "top_k": 1,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "expert_ownership": "contiguous"
+  },
+  "implementation": {
+    "retained_inputs": ["canonical BF16 X", "plane-major BF16 FC1 A/B"],
+    "recomputed": ["SwiGLU", "gate multiply", "BF16 FC2 input U"],
+    "gemm_backend": "deterministic BF16 cuBLAS with FP32 accumulation",
+    "transport": "fixed-slot local peer copies with release/acquire counters",
+    "global_grid_sync": false,
+    "hot_path_allocations": 0
+  },
+  "repeatability": {
+    "executions_on_same_forward_cache": 3,
+    "dx_byte_identical": true,
+    "dgate_byte_identical": true,
+    "dw1_byte_identical": true,
+    "dw2_byte_identical": true
+  },
+  "independent_reference": {
+    "implementation": "PyTorch autograd from exact cached BF16 X/A/B",
+    "accuracy": {
+      "dx": {
+        "max_abs_error": 0.00006103515625,
+        "rmse": 5.126743466088046e-7,
+        "relative_l2": 0.00010289178168247943
+      },
+      "dgate": {
+        "max_abs_error": 5.960464477539063e-8,
+        "rmse": 2.658758763898201e-8,
+        "relative_l2": 2.0776826985227553e-7
+      },
+      "dw1": {
+        "max_abs_error": 0.00006103515625,
+        "rmse": 1.2341405749157892e-7,
+        "relative_l2": 0.00001323856268907975
+      },
+      "dw2": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "relative_l2": 0.0,
+        "byte_identical": true
+      }
+    }
+  },
+  "commands": [
+    "python3 tests/run_local_activation_p2p.py --binary build-bwd/test_cuda_notify --world 8 --backward-validation --backward-tokens 2 --rounds 1 --timeout 180",
+    "torchrun --standalone --nproc_per_node=8 benchmarks/compare_backward_outputs.py --artifact-dir artifacts/backward-validation-m1-contiguous --tokens 2 --experts 16"
+  ]
+}

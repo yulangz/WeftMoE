@@ -5,6 +5,7 @@
 #include <cuda/barrier>
 #include <cuda/ptx>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <cooperative_groups.h>
 #include <nccl.h>
 #include <cutlass/arch/barrier.h>
@@ -54,6 +55,9 @@ struct ActivationMegaKernelBackendState;
 namespace {
 
 #include "cuda/forward/device_kernels.cuh"
+#if !defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#include "cuda/backward/device_kernels.cuh"
+#endif
 
 #if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
 
@@ -111,6 +115,7 @@ cudaError_t launch_local(const cudaLaunchConfig_t *config,
 
 #include "cuda/forward/runtime_state.inc"
 #include "cuda/forward/host_launch.inc"
+#include "cuda/backward/host_launch.inc"
 #include "cuda/testing/transport_probes.inc"
 
 

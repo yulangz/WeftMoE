@@ -640,7 +640,9 @@ class ForwardJitCompiler:
             ]
             if self.nccl_lib_dir is not None:
                 link_command.extend(("-L", str(self.nccl_lib_dir)))
-            link_command.extend(("-lnccl", "-lcuda", "-ldl", "-o", str(binary)))
+            link_command.extend(
+                ("-lnccl", "-lcublas", "-lcuda", "-ldl", "-o", str(binary))
+            )
             returncode, output = _run_command(
                 link_command, self.repo_root, self.environment, self.timeout
             )

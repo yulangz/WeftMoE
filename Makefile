@@ -114,6 +114,9 @@ $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
 	src/cuda/forward/kernel_support.cuh \
 	src/cuda/forward/device_kernels.cuh \
+	src/cuda/backward/kernel_contract.cuh \
+	src/cuda/backward/device_kernels.cuh \
+	src/cuda/backward/host_launch.inc \
 	src/cuda/forward/runtime_state.inc \
 	src/cuda/forward/host_launch.inc \
 	src/cuda/testing/transport_probes.inc \
@@ -191,7 +194,7 @@ $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME): $(PROD_LIB_OBJECTS) $(PROD_CUDA_LIB_OBJECTS
 		-Xlinker=-soname -Xlinker=$(LIBMEGAMOE_SONAME) \
 		-Xlinker=--version-script=$(CURDIR)/abi/libmegamoe.map \
 		-Xlinker=--gc-sections \
-		$(LDFLAGS) $(filter %.o,$^) -lnccl -lcudart -lcuda -ldl -o $@
+		$(LDFLAGS) $(filter %.o,$^) -lnccl -lcublas -lcudart -lcuda -ldl -o $@
 
 shared-lib: $(BUILD_DIR)/$(LIBMEGAMOE_REALNAME)
 
@@ -255,6 +258,7 @@ release-check-inner:
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp
 CUDA_TEST_DEPS := \
+	tests/cuda/backward_runner.inc \
 	tests/cuda/distributed_runner.inc \
 	tests/cuda/transport_benchmarks.inc
 
@@ -263,7 +267,7 @@ $(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOU
 	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) \
 		$(CUDA_TEST_SOURCES) -Xlinker=--whole-archive \
 		$(BUILD_DIR)/libmegamoe_testing.a -Xlinker=--no-whole-archive \
-		-lnccl -lcuda -ldl -o $@
+		-lnccl -lcublas -lcuda -ldl -o $@
 
 cuda-test: $(BUILD_DIR)/test_cuda_notify
 	$(CUDA_RUN_ENV) $(BUILD_DIR)/test_cuda_notify --local 1

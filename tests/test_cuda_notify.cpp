@@ -2311,6 +2311,7 @@ void test_resource_pool_and_cuda_api_audit() {
             << after.d2d_bytes - before.d2d_bytes << '\n';
 }
 
+#include "cuda/backward_runner.inc"
 #include "cuda/distributed_runner.inc"
 #include "cuda/transport_benchmarks.inc"
 

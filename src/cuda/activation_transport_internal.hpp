@@ -6,6 +6,7 @@
 #define private public
 #include "megamoe/cuda/activation_transport.hpp"
 #undef private
+#include "megamoe/cuda/backward.hpp"
 
 namespace megamoe::cuda {
 
@@ -188,6 +189,26 @@ struct ForwardBackwardStateValidationDownload {
 ForwardBackwardStateValidationDownload
 download_forward_backward_state_for_validation(
     const DeviceForwardHandle &, const CudaExecution &);
+
+struct BackwardValidationDownload {
+  std::vector<transport::BFloat16> dx;
+  std::vector<float> dgate;
+  std::vector<transport::BFloat16> dw1;
+  std::vector<transport::BFloat16> dw2;
+};
+
+class BackwardValidationBridge {
+public:
+  static BFloat16OutputGradientLease upload_for_testing(
+      const std::vector<transport::BFloat16> &host,
+      std::uint64_t num_tokens, std::uint64_t hidden_size,
+      const RankCollectiveContext &, const CudaExecution &);
+  static BFloat16OutputGradientLease reissue_for_benchmark(
+      const BFloat16OutputGradientLease &, const RankCollectiveContext &,
+      const CudaExecution &);
+  static BackwardValidationDownload download(
+      const DeviceBackwardHandle &, const CudaExecution &);
+};
 ActivationTransportValidationDownload
 download_activation_transport_for_validation(
     const DeviceActivationTransportHandle &, const CudaExecution &);

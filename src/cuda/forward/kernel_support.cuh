@@ -15,6 +15,15 @@ void CUDART_CB publish_stream_completion(void *opaque) {
                 ", actual=" + actual);
 }
 
+void throw_cublas(const char *phase, cublasStatus_t status,
+                  std::uint32_t rank, const char *operation) {
+  if (status == CUBLAS_STATUS_SUCCESS)
+    return;
+  transport_error(NotifyErrorCode::CudaFailure, phase, operation, rank,
+                  "CUBLAS_STATUS_SUCCESS",
+                  std::to_string(static_cast<unsigned int>(status)));
+}
+
 std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b,
                           const char *field) {
   if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a)
@@ -527,6 +536,19 @@ struct Layout {
   // Forward output is separate so canonical post-Dispatch X stays immutable.
   std::size_t forward_ab_cache = 0;
   std::size_t forward_training_output = 0;
+  // Backward reuses forward_training_output as canonical dR, forward_s as U,
+  // while the immutable A/B checkpoint stays intact across repeated Backward
+  // executions. dX must remain disjoint from dR so its M-blocks may return
+  // while dW2 still consumes dR.
+  std::size_t backward_dab_rows = 0;
+  std::size_t backward_dx_rows = 0;
+  std::size_t backward_dgate_rows = 0;
+  std::size_t backward_dgate_output = 0;
+  std::size_t backward_dw1 = 0;
+  std::size_t backward_dw2 = 0;
+  std::size_t backward_setup_epoch = 0;
+  std::size_t backward_dispatch_arrived = 0;
+  std::size_t backward_return_arrived = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_fc1_published = 0;
@@ -824,6 +846,41 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                       config.max_hidden_size,
                       "forward training output elements"),
           sizeof(transport::BFloat16), "forward training output");
+      layout.backward_dab_rows = append(
+          cursor, checked_mul(forward_elements, 2ULL,
+                              "backward interleaved dAB elements"),
+          sizeof(transport::BFloat16), "backward interleaved dAB");
+      layout.backward_dx_rows = append(
+          cursor,
+          checked_mul(config.max_destination_rows_per_rank,
+                      config.max_hidden_size, "backward dX rows"),
+          sizeof(transport::BFloat16), "backward dX rows");
+      layout.backward_dgate_rows = append(
+          cursor, config.max_destination_rows_per_rank, sizeof(float),
+          "backward canonical dGate rows");
+      layout.backward_dgate_output = append(
+          cursor, routes, sizeof(float), "backward source dGate");
+      if (config.max_owned_experts != 0) {
+        const auto weight_matrix_elements = checked_mul(
+            checked_mul(config.max_owned_experts,
+                        config.max_intermediate_size,
+                        "backward expert weight rows"),
+            config.max_hidden_size, "backward expert weight elements");
+        layout.backward_dw1 = append(
+            cursor, checked_mul(2ULL, weight_matrix_elements,
+                                "backward dW1 elements"),
+            sizeof(transport::BFloat16), "backward dW1");
+        layout.backward_dw2 = append(
+            cursor, weight_matrix_elements, sizeof(transport::BFloat16),
+            "backward dW2");
+      }
+      layout.backward_setup_epoch = append(
+          cursor, config.max_world_size, sizeof(std::uint64_t),
+          "backward setup epochs");
+      layout.backward_dispatch_arrived = append(
+          cursor, 1, sizeof(std::uint64_t), "backward dR rows arrived");
+      layout.backward_return_arrived = append(
+          cursor, 1, sizeof(std::uint64_t), "backward dX rows returned");
     }
     // Expert segmentation can make every incoming row a distinct partial
     // M-block.  Capacity must therefore be bounded by rows, not by a dense
@@ -959,11 +1016,20 @@ struct PoolSlot {
   cudaEvent_t forward_transport_done = nullptr;
   cudaEvent_t forward_m64_head_done = nullptr;
   cudaEvent_t forward_compute_done = nullptr;
+  cudaEvent_t backward_start = nullptr;
+  cudaEvent_t backward_dispatch_done = nullptr;
+  cudaEvent_t backward_dab_done = nullptr;
+  cudaEvent_t backward_dx_done = nullptr;
+  cudaEvent_t backward_dw2_done = nullptr;
+  cudaEvent_t backward_dw1_done = nullptr;
+  cudaEvent_t backward_return_done = nullptr;
+  cudaEvent_t backward_complete = nullptr;
   cudaEvent_t dispatch_complete = nullptr;
   cudaEvent_t complete = nullptr;
   SlotState state = SlotState::Available;
   std::uint64_t epoch = 0;
   std::uint64_t transport_epoch = 0;
+  std::uint64_t backward_epoch = 0;
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};
@@ -1044,9 +1110,13 @@ struct ActivationPoolState {
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
+  cublasHandle_t backward_blas = nullptr;
+  std::mutex backward_blas_mutex;
 
   ~ActivationPoolState() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
+    if (backward_blas)
+      (void)cublasDestroy(backward_blas);
     for (auto &slot : slots) {
       if (slot.completion_recorded && slot.complete)
         (void)cudaEventSynchronize(slot.complete);
@@ -1086,6 +1156,17 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.forward_compute_done)
         (void)cudaEventDestroy(slot.forward_compute_done);
+      const cudaEvent_t backward_events[] = {
+          slot.backward_start,       slot.backward_dispatch_done,
+          slot.backward_dab_done,    slot.backward_dx_done,
+          slot.backward_dw2_done,    slot.backward_dw1_done,
+          slot.backward_return_done, slot.backward_complete};
+      for (const auto event : backward_events) {
+        if (event)
+          internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+        if (event)
+          (void)cudaEventDestroy(event);
+      }
       if (slot.forward_transport_stream)
         (void)cudaStreamDestroy(slot.forward_transport_stream);
       if (slot.forward_m64_head_stream)

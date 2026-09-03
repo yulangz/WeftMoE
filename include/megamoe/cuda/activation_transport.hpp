@@ -21,6 +21,9 @@ namespace megamoe::cuda {
 template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;
+class BFloat16OutputGradientLease;
+class BackwardMegaKernel;
+class BackwardValidationBridge;
 class ForwardWeightLease;
 class ExternalCudaProducer;
 
@@ -49,6 +52,8 @@ private:
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
   friend class ExternalCudaProducer;
+  friend class BackwardMegaKernel;
+  friend class BackwardValidationBridge;
 };
 
 struct ActivationTransportPoolConfig {
@@ -255,6 +260,14 @@ public:
       const transport::BFloat16 *device_data,
       std::uint64_t capacity_elements, std::uint64_t num_tokens,
       std::uint64_t hidden_size, const ActivationTransportResourcePool &pool,
+      std::shared_ptr<const void> allocation_owner) const;
+  // dY is caller-owned and does not reserve a second transport-pool slot.
+  // The returned lease records producer-stream readiness and retains the
+  // allocation until Backward has consumed it.
+  BFloat16OutputGradientLease publish_output_gradients(
+      const transport::BFloat16 *device_data,
+      std::uint64_t capacity_elements, std::uint64_t num_tokens,
+      std::uint64_t hidden_size,
       std::shared_ptr<const void> allocation_owner) const;
   ForwardWeightLease publish_weights(
       const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,

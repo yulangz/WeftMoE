@@ -22,6 +22,38 @@ struct SelectedActivationLease<transport::BFloat16>::Impl {
   std::shared_ptr<const internal::ExternalCudaProducerState> external_producer;
 };
 
+struct BackwardGradientAllocation {
+  void *data = nullptr;
+  cudaEvent_t ready = nullptr;
+  std::uint32_t device = 0;
+  bool owns_data = true;
+  std::shared_ptr<const void> external_owner;
+  std::shared_ptr<const internal::ExternalCudaProducerState> external_producer;
+
+  ~BackwardGradientAllocation() noexcept {
+    (void)cudaSetDevice(static_cast<int>(device));
+    if (ready) {
+      internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
+      (void)cudaEventDestroy(ready);
+    }
+    if (data && owns_data) {
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
+      (void)cudaFree(data);
+    }
+  }
+};
+
+struct BFloat16OutputGradientLease::Impl {
+  std::shared_ptr<BackwardGradientAllocation> allocation;
+  const transport::BFloat16 *pointer = nullptr;
+  std::vector<std::byte> session_identity;
+  ExecutionToken producer_execution;
+  std::uint64_t generation = 0;
+  std::uint64_t tokens = 0;
+  std::uint64_t hidden = 0;
+  std::uint32_t device = 0;
+};
+
 struct LocalP2pBackendState;
 struct SocketBackendState;
 struct GinBackendState;
@@ -350,10 +382,29 @@ struct DeviceForwardHandle::Impl {
   bool retained_backward_state = false;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
+  // The compact expert counts are immutable Dispatch metadata. Backward
+  // lazily snapshots the tiny vector before its first timed launch and reuses
+  // it for repeated executions of the same retained Forward state.
+  mutable std::mutex backward_plan_mutex;
+  mutable std::vector<std::uint64_t> backward_expert_rows;
+  mutable std::vector<std::uint64_t> backward_expert_offsets;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;
   std::uint64_t socket_raw_cross_node_route_bytes = 0;
+};
+
+struct DeviceBackwardHandle::Impl {
+  std::shared_ptr<SlotLease> slot;
+  std::shared_ptr<ActivationPoolState> pool;
+  DeviceForwardHandle forward;
+  BFloat16OutputGradientLease output_gradients;
+  ActivationTransportExpectation identity;
+  BackwardMegaKernelAudit audit;
+  BackwardMegaKernelTimings timings;
+  std::uint32_t owned_experts = 0;
+  std::uint64_t incoming_rows = 0;
+  std::uint64_t intermediate = 0;
 };
 
 struct LocalCudaP2pForwardMegaKernel::Impl {
@@ -1369,6 +1420,15 @@ ActivationTransportResourcePool make_activation_transport_pool(
                        session.world_size(), session.identity(),
                        session.generation(), ExchangeKind::ExpertCounts,
                        "cudaSetDevice");
+  if (config.enable_backward_state) {
+    throw_cublas("transport-pool-create",
+                 cublasCreate(&state->backward_blas), 0,
+                 "cublasCreate(Backward)");
+    throw_cublas("transport-pool-create",
+                 cublasSetAtomicsMode(state->backward_blas,
+                                      CUBLAS_ATOMICS_NOT_ALLOWED),
+                 0, "cublasSetAtomicsMode(Backward deterministic)");
+  }
 #if MEGAMOE_DEVICE_TIMELINE
   cudaDeviceProp timeline_device_properties{};
   internal::throw_cuda(
@@ -1593,6 +1653,13 @@ ActivationTransportResourcePool make_activation_transport_pool(
             ExchangeKind::ExpertCounts, name);
         internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
       };
+      auto create_timing_event = [&](cudaEvent_t *event, const char *name) {
+        internal::throw_cuda(
+            "transport-pool-create", cudaEventCreate(event), 0,
+            session.world_size(), session.identity(), session.generation(),
+            ExchangeKind::ExpertCounts, name);
+        internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+      };
       int least_stream_priority = 0;
       int greatest_stream_priority = 0;
       internal::throw_cuda(
@@ -1634,6 +1701,24 @@ ActivationTransportResourcePool make_activation_transport_pool(
                    "cudaEventCreate(Forward M64 head done)");
       create_event(&slot.forward_compute_done,
                    "cudaEventCreate(Forward compute done)");
+      if (config.enable_backward_state) {
+        create_timing_event(&slot.backward_start,
+                            "cudaEventCreate(Backward start)");
+        create_timing_event(&slot.backward_dispatch_done,
+                            "cudaEventCreate(Backward dispatch done)");
+        create_timing_event(&slot.backward_dab_done,
+                            "cudaEventCreate(Backward dAB done)");
+        create_timing_event(&slot.backward_dx_done,
+                            "cudaEventCreate(Backward dX done)");
+        create_timing_event(&slot.backward_dw2_done,
+                            "cudaEventCreate(Backward dW2 done)");
+        create_timing_event(&slot.backward_dw1_done,
+                            "cudaEventCreate(Backward dW1 done)");
+        create_timing_event(&slot.backward_return_done,
+                            "cudaEventCreate(Backward return done)");
+        create_timing_event(&slot.backward_complete,
+                            "cudaEventCreate(Backward complete)");
+      }
       internal::throw_cuda(
           "transport-pool-create", cudaEventCreate(&slot.start), 0,
           session.world_size(), session.identity(), session.generation(),
@@ -1728,7 +1813,10 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
                   "pool pinned plus Socket bytes"),
       state->slots.size(),
                                     "pool pinned bytes");
-  result.event_count = checked_mul(8, state->slots.size(), "pool events");
+  const auto events_per_slot =
+      11ULL + (state->config.enable_backward_state ? 8ULL : 0ULL);
+  result.event_count =
+      checked_mul(events_per_slot, state->slots.size(), "pool events");
   result.epoch_high_watermark = state->epoch_high;
   return result;
 }
@@ -1765,6 +1853,121 @@ std::uint32_t BFloat16ActivationLease::layout_version() const {
     transport_error(NotifyErrorCode::InvalidHandle, "activation-lease",
                     "lease", 0, "valid", "empty");
   return impl_->layout;
+}
+
+std::uint64_t BFloat16OutputGradientLease::num_tokens() const {
+  if (!impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "output-gradient-lease",
+                    "lease", 0, "valid", "empty");
+  return impl_->tokens;
+}
+
+std::uint64_t BFloat16OutputGradientLease::hidden_size() const {
+  if (!impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "output-gradient-lease",
+                    "lease", 0, "valid", "empty");
+  return impl_->hidden;
+}
+
+std::uint64_t BFloat16OutputGradientLease::element_count() const {
+  return checked_mul(num_tokens(), hidden_size(), "output gradient elements");
+}
+
+std::uint64_t BFloat16OutputGradientLease::generation() const {
+  if (!impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "output-gradient-lease",
+                    "lease", 0, "valid", "empty");
+  return impl_->generation;
+}
+
+std::uint32_t BFloat16OutputGradientLease::device_ordinal() const {
+  if (!impl_)
+    transport_error(NotifyErrorCode::InvalidHandle, "output-gradient-lease",
+                    "lease", 0, "valid", "empty");
+  return impl_->device;
+}
+
+BFloat16OutputGradientLease BackwardValidationBridge::upload_for_testing(
+    const std::vector<transport::BFloat16> &host,
+    std::uint64_t tokens, std::uint64_t hidden,
+    const RankCollectiveContext &context, const CudaExecution &execution) {
+  if (!context || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "output-gradient-test-upload", "context/execution", 0,
+                    "valid", "empty");
+  const auto &identity = context.session();
+  if (tokens == 0 || hidden == 0 ||
+      host.size() != checked_size(checked_mul(tokens, hidden,
+                                             "output gradient elements"),
+                                  "output gradient elements"))
+    transport_error(NotifyErrorCode::InvalidRouteShape,
+                    "output-gradient-test-upload", "host shape",
+                    context.calling_rank(), "exact nonempty [tokens, hidden]",
+                    std::to_string(host.size()));
+  const auto bytes = checked_size(
+      checked_mul(host.size(), sizeof(transport::BFloat16),
+                  "output gradient upload bytes"),
+      "output gradient upload bytes");
+  auto exec = internal::checked_execution_state(execution);
+  auto allocation = std::make_shared<BackwardGradientAllocation>();
+  allocation->device = exec->device;
+  internal::throw_cuda(
+      "output-gradient-test-upload", cudaMalloc(&allocation->data, bytes),
+      context.calling_rank(), identity.world_size(), identity.identity(),
+      identity.generation(), ExchangeKind::ExpertCounts,
+      "cudaMalloc(output gradient)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+  internal::throw_cuda(
+      "output-gradient-test-upload",
+      cudaEventCreateWithFlags(&allocation->ready, cudaEventDisableTiming),
+      context.calling_rank(), identity.world_size(), identity.identity(),
+      identity.generation(), ExchangeKind::ExpertCounts,
+      "cudaEventCreate(output gradient ready)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda(
+      "output-gradient-test-upload",
+      cudaMemcpyAsync(allocation->data, host.data(), bytes,
+                      cudaMemcpyHostToDevice, exec->stream),
+      context.calling_rank(), identity.world_size(), identity.identity(),
+      identity.generation(), ExchangeKind::ExpertCounts,
+      "cudaMemcpyAsync(output gradient)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
+  internal::throw_cuda(
+      "output-gradient-test-upload",
+      cudaEventRecord(allocation->ready, exec->stream), context.calling_rank(),
+      identity.world_size(), identity.identity(), identity.generation(),
+      ExchangeKind::ExpertCounts, "cudaEventRecord(output gradient ready)");
+  auto impl = std::make_shared<BFloat16OutputGradientLease::Impl>();
+  impl->allocation = std::move(allocation);
+  impl->pointer = static_cast<const transport::BFloat16 *>(impl->allocation->data);
+  impl->session_identity = identity.stable_identity_bytes();
+  impl->producer_execution = execution.token();
+  impl->generation = identity.generation();
+  impl->tokens = tokens;
+  impl->hidden = hidden;
+  impl->device = exec->device;
+  return BFloat16OutputGradientLease(std::move(impl));
+}
+
+BFloat16OutputGradientLease BackwardValidationBridge::reissue_for_benchmark(
+    const BFloat16OutputGradientLease &storage,
+    const RankCollectiveContext &context, const CudaExecution &execution) {
+  if (!storage.impl_ || !context || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "output-gradient-benchmark-reissue", "input", 0,
+                    "valid", "empty");
+  const auto &source = *storage.impl_;
+  if (!source.allocation || !source.allocation->ready ||
+      source.session_identity != context.session().stable_identity_bytes() ||
+      source.device != execution.device_ordinal() ||
+      !source.producer_execution.same_instance(execution.token()))
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "output-gradient-benchmark-reissue", "provenance",
+                    context.calling_rank(),
+                    "same storage/session/execution/device/ready", "mismatch");
+  auto impl = std::make_shared<BFloat16OutputGradientLease::Impl>(source);
+  impl->generation = context.session().generation();
+  return BFloat16OutputGradientLease(std::move(impl));
 }
 
 BFloat16ActivationLease ActivationTransportBridge::upload_for_testing(
@@ -1912,6 +2115,58 @@ BFloat16ActivationLease ExternalCudaProducer::publish_activations(
   impl->external_owner = std::move(allocation_owner);
   impl->external_producer = state_->backend;
   return BFloat16ActivationLease(std::move(impl));
+}
+
+BFloat16OutputGradientLease ExternalCudaProducer::publish_output_gradients(
+    const transport::BFloat16 *device_data,
+    std::uint64_t capacity_elements, std::uint64_t num_tokens,
+    std::uint64_t hidden_size,
+    std::shared_ptr<const void> allocation_owner) const {
+  if (!state_ || !allocation_owner || num_tokens == 0 || hidden_size == 0)
+    transport_error(NotifyErrorCode::InvalidHandle,
+                    "external-output-gradient-publish",
+                    "producer/owner/shape", 0, "valid and nonzero", "empty");
+  const auto elements = checked_mul(num_tokens, hidden_size,
+                                    "external output gradient elements");
+  validate_external_cuda_range(device_data, elements, capacity_elements,
+                               sizeof(transport::BFloat16),
+                               state_->backend->device, "output gradients");
+  auto allocation = std::make_shared<BackwardGradientAllocation>();
+  allocation->device = state_->backend->device;
+  allocation->data = const_cast<transport::BFloat16 *>(device_data);
+  allocation->owns_data = false;
+  allocation->external_owner = std::move(allocation_owner);
+  allocation->external_producer = state_->backend;
+  internal::throw_cuda(
+      "external-output-gradient-publish",
+      cudaEventCreateWithFlags(&allocation->ready, cudaEventDisableTiming),
+      state_->backend->context.calling_rank(),
+      state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(),
+      ExchangeKind::ExpertCounts,
+      "cudaEventCreate(output gradient ready)");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda(
+      "external-output-gradient-publish",
+      cudaEventRecord(allocation->ready, state_->backend->stream),
+      state_->backend->context.calling_rank(),
+      state_->backend->context.session().world_size(),
+      state_->backend->context.session().identity(),
+      state_->backend->context.session().generation(),
+      ExchangeKind::ExpertCounts,
+      "cudaEventRecord(output gradient ready)");
+  auto impl = std::make_shared<BFloat16OutputGradientLease::Impl>();
+  impl->allocation = std::move(allocation);
+  impl->pointer = device_data;
+  impl->session_identity =
+      state_->backend->context.session().stable_identity_bytes();
+  impl->producer_execution = state_->backend->execution;
+  impl->generation = state_->backend->context.session().generation();
+  impl->tokens = num_tokens;
+  impl->hidden = hidden_size;
+  impl->device = state_->backend->device;
+  return BFloat16OutputGradientLease(std::move(impl));
 }
 
 DeviceActivationTransport::DeviceActivationTransport(
