@@ -536,10 +536,16 @@ struct Layout {
   // Forward output is separate so canonical post-Dispatch X stays immutable.
   std::size_t forward_ab_cache = 0;
   std::size_t forward_training_output = 0;
-  // Backward reuses forward_training_output as canonical dR, forward_s as U,
-  // while the immutable A/B checkpoint stays intact across repeated Backward
-  // executions. dX must remain disjoint from dR so its M-blocks may return
-  // while dW2 still consumes dR.
+  // The immutable compact X/A/B checkpoint stays intact across repeated
+  // Backward executions. Its compute directory pads every expert independently
+  // to 128 rows, so all padded tensors use a capacity larger than compact
+  // Forward storage by at most 127 rows per owned expert. dX remains disjoint
+  // from dR so its M-blocks may return while dW2 still consumes dR.
+  std::uint64_t backward_padded_capacity_rows = 0;
+  std::size_t backward_padded_x = 0;
+  std::size_t backward_padded_ab = 0;
+  std::size_t backward_padded_dr = 0;
+  std::size_t backward_u = 0;
   std::size_t backward_dab_rows = 0;
   std::size_t backward_dx_rows = 0;
   std::size_t backward_dgate_rows = 0;
@@ -547,8 +553,11 @@ struct Layout {
   std::size_t backward_dw1 = 0;
   std::size_t backward_dw2 = 0;
   std::size_t backward_setup_epoch = 0;
-  std::size_t backward_dispatch_arrived = 0;
-  std::size_t backward_return_arrived = 0;
+  std::size_t backward_dispatch_ready = 0;
+  std::size_t backward_return_ready = 0;
+  std::size_t backward_compact_to_padded = 0;
+  std::size_t backward_padded_expert_rows = 0;
+  std::size_t backward_padded_expert_offsets = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_fc1_published = 0;
@@ -846,17 +855,42 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                       config.max_hidden_size,
                       "forward training output elements"),
           sizeof(transport::BFloat16), "forward training output");
+      layout.backward_padded_capacity_rows = checked_add(
+          config.max_destination_rows_per_rank,
+          checked_mul(config.max_owned_experts, 127ULL,
+                      "backward expert padding rows"),
+          "backward padded row capacity");
+      const auto backward_padded_elements = checked_mul(
+          layout.backward_padded_capacity_rows,
+          config.max_intermediate_size, "backward padded elements");
+      layout.backward_padded_x = append(
+          cursor,
+          checked_mul(layout.backward_padded_capacity_rows,
+                      config.max_hidden_size, "backward padded X elements"),
+          sizeof(transport::BFloat16), "backward padded X");
+      layout.backward_padded_ab = append(
+          cursor, checked_mul(backward_padded_elements, 2ULL,
+                              "backward padded A/B elements"),
+          sizeof(transport::BFloat16), "backward padded A/B");
+      layout.backward_padded_dr = append(
+          cursor,
+          checked_mul(layout.backward_padded_capacity_rows,
+                      config.max_hidden_size, "backward padded dR elements"),
+          sizeof(transport::BFloat16), "backward padded dR");
+      layout.backward_u = append(
+          cursor, backward_padded_elements, sizeof(transport::BFloat16),
+          "backward padded U");
       layout.backward_dab_rows = append(
-          cursor, checked_mul(forward_elements, 2ULL,
+          cursor, checked_mul(backward_padded_elements, 2ULL,
                               "backward interleaved dAB elements"),
           sizeof(transport::BFloat16), "backward interleaved dAB");
       layout.backward_dx_rows = append(
           cursor,
-          checked_mul(config.max_destination_rows_per_rank,
+          checked_mul(layout.backward_padded_capacity_rows,
                       config.max_hidden_size, "backward dX rows"),
           sizeof(transport::BFloat16), "backward dX rows");
       layout.backward_dgate_rows = append(
-          cursor, config.max_destination_rows_per_rank, sizeof(float),
+          cursor, layout.backward_padded_capacity_rows, sizeof(float),
           "backward canonical dGate rows");
       layout.backward_dgate_output = append(
           cursor, routes, sizeof(float), "backward source dGate");
@@ -877,10 +911,21 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       layout.backward_setup_epoch = append(
           cursor, config.max_world_size, sizeof(std::uint64_t),
           "backward setup epochs");
-      layout.backward_dispatch_arrived = append(
-          cursor, 1, sizeof(std::uint64_t), "backward dR rows arrived");
-      layout.backward_return_arrived = append(
-          cursor, 1, sizeof(std::uint64_t), "backward dX rows returned");
+      layout.backward_dispatch_ready = append(
+          cursor, config.max_destination_rows_per_rank,
+          sizeof(std::uint64_t), "backward dR row-ready epochs");
+      layout.backward_return_ready = append(
+          cursor, routes, sizeof(std::uint64_t),
+          "backward dX route-ready epochs");
+      layout.backward_compact_to_padded = append(
+          cursor, config.max_destination_rows_per_rank,
+          sizeof(std::uint32_t), "backward compact-to-padded rows");
+      layout.backward_padded_expert_rows = append(
+          cursor, config.max_owned_experts, sizeof(std::uint64_t),
+          "backward padded expert rows");
+      layout.backward_padded_expert_offsets = append(
+          cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
+          sizeof(std::uint64_t), "backward padded expert offsets");
     }
     // Expert segmentation can make every incoming row a distinct partial
     // M-block.  Capacity must therefore be bounded by rows, not by a dense

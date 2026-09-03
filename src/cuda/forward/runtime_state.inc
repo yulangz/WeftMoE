@@ -388,6 +388,11 @@ struct DeviceForwardHandle::Impl {
   mutable std::mutex backward_plan_mutex;
   mutable std::vector<std::uint64_t> backward_expert_rows;
   mutable std::vector<std::uint64_t> backward_expert_offsets;
+  mutable std::vector<std::uint64_t> backward_padded_expert_rows;
+  mutable std::vector<std::uint64_t> backward_padded_expert_offsets;
+  mutable std::vector<std::uint32_t> backward_compact_to_padded;
+  mutable std::uint64_t backward_padded_rows = 0;
+  mutable bool backward_plan_uploaded = false;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;

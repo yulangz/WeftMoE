@@ -132,6 +132,73 @@ DeviceBackwardHandle BackwardMegaKernel::run(
           "backward-plan", cudaStreamSynchronize(exec->stream), identity.rank,
           identity.world, "backward", identity.generation,
           ExchangeKind::ExpertCounts, "cache expert row plan");
+      retained.backward_padded_expert_rows.resize(
+          view.sizes.owned_expert_count);
+      retained.backward_padded_expert_offsets.resize(
+          static_cast<std::size_t>(view.sizes.owned_expert_count) + 1ULL);
+      retained.backward_compact_to_padded.resize(
+          checked_size(view.sizes.incoming_row_count,
+                       "Backward compact-to-padded entries"));
+      std::uint64_t padded_cursor = 0ULL;
+      for (std::uint32_t expert = 0U;
+           expert < view.sizes.owned_expert_count; ++expert) {
+        const auto rows = retained.backward_expert_rows[expert];
+        const auto padded = checked_mul((rows + 127ULL) / 128ULL, 128ULL,
+                                        "Backward padded expert rows");
+        retained.backward_padded_expert_offsets[expert] = padded_cursor;
+        retained.backward_padded_expert_rows[expert] = padded;
+        const auto compact_begin = retained.backward_expert_offsets[expert];
+        for (std::uint64_t local_row = 0ULL; local_row < rows; ++local_row) {
+          retained.backward_compact_to_padded[checked_size(
+              compact_begin + local_row,
+              "Backward compact-to-padded index")] =
+              static_cast<std::uint32_t>(padded_cursor + local_row);
+        }
+        padded_cursor = checked_add(padded_cursor, padded,
+                                    "Backward padded row count");
+      }
+      retained.backward_padded_expert_offsets[view.sizes.owned_expert_count] =
+          padded_cursor;
+      retained.backward_padded_rows = padded_cursor;
+      if (padded_cursor > layout.backward_padded_capacity_rows ||
+          padded_cursor > UINT32_MAX)
+        transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                        "backward-plan", "padded expert rows", identity.rank,
+                        std::to_string(layout.backward_padded_capacity_rows),
+                        std::to_string(padded_cursor));
+    }
+    if (!retained.backward_plan_uploaded) {
+      const auto copy_plan = [&](std::size_t offset, const auto &values,
+                                 const char *name) {
+        if (values.empty())
+          return;
+        const auto bytes = checked_mul(values.size(), sizeof(values.front()),
+                                       name);
+        internal::throw_cuda(
+            "backward-plan",
+            cudaMemcpyAsync(
+                at<void>(pool->slots[retained.slot->index].device, offset),
+                            values.data(), checked_size(bytes, name),
+                            cudaMemcpyHostToDevice, exec->stream),
+            identity.rank, identity.world, "backward", identity.generation,
+            ExchangeKind::ExpertCounts, name);
+        internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
+                                  bytes);
+      };
+      copy_plan(layout.backward_compact_to_padded,
+                retained.backward_compact_to_padded,
+                "upload Backward compact-to-padded directory");
+      copy_plan(layout.backward_padded_expert_rows,
+                retained.backward_padded_expert_rows,
+                "upload Backward padded expert rows");
+      copy_plan(layout.backward_padded_expert_offsets,
+                retained.backward_padded_expert_offsets,
+                "upload Backward padded expert offsets");
+      internal::throw_cuda(
+          "backward-plan", cudaStreamSynchronize(exec->stream), identity.rank,
+          identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "publish padded Backward directory");
+      retained.backward_plan_uploaded = true;
     }
   }
 
@@ -143,15 +210,19 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.hidden = config.hidden_size;
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = pool->config.max_destination_rows_per_rank;
+  args.padded_capacity_rows = layout.backward_padded_capacity_rows;
+  args.padded_rows = retained.backward_padded_rows;
   args.rank = identity.rank;
   args.world = identity.world;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.canonical_x_offset = layout.canonical_rows;
   args.canonical_gate_offset = layout.canonical_gates;
-  args.canonical_dr_offset = layout.forward_training_output;
   args.cached_ab_offset = layout.forward_ab_cache;
-  args.recomputed_u_offset = layout.forward_s;
+  args.padded_x_offset = layout.backward_padded_x;
+  args.padded_ab_offset = layout.backward_padded_ab;
+  args.padded_dr_offset = layout.backward_padded_dr;
+  args.recomputed_u_offset = layout.backward_u;
   args.dab_offset = layout.backward_dab_rows;
   args.dx_rows_offset = layout.backward_dx_rows;
   args.dgate_rows_offset = layout.backward_dgate_rows;
@@ -159,9 +230,12 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.contribution_offset = layout.contribution;
   args.combined_dx_offset = layout.combined;
   args.direct_headers_offset = layout.direct_route_headers;
+  args.compact_to_padded_offset = layout.backward_compact_to_padded;
+  args.padded_expert_rows_offset = layout.backward_padded_expert_rows;
+  args.padded_expert_offsets_offset = layout.backward_padded_expert_offsets;
   args.setup_epoch_offset = layout.backward_setup_epoch;
-  args.dispatch_arrived_offset = layout.backward_dispatch_arrived;
-  args.return_arrived_offset = layout.backward_return_arrived;
+  args.dispatch_ready_offset = layout.backward_dispatch_ready;
+  args.return_ready_offset = layout.backward_return_ready;
   args.epoch = ++slot.backward_epoch;
   if (args.epoch == 0ULL)
     args.epoch = ++slot.backward_epoch;
@@ -207,21 +281,35 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       cudaStreamWaitEvent(compute_stream, slot.backward_start), identity.rank,
       identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "start Backward compute");
-  backward_wait_for_dispatch_kernel<<<1, 1, 0, compute_stream>>>(
-      args, view.sizes.incoming_row_count);
-  internal::throw_cuda(
-      "backward-run", cudaGetLastError(), identity.rank, identity.world,
-      "backward", identity.generation, ExchangeKind::ExpertCounts,
-      "wait dR arrivals launch");
+  constexpr std::uint32_t kPackChunksPerExpert = 4U;
+  if (view.sizes.owned_expert_count != 0U) {
+    backward_pack_cached_state_kernel<<<
+        view.sizes.owned_expert_count * kPackChunksPerExpert, 256, 0,
+        compute_stream>>>(args, kPackChunksPerExpert);
+    internal::throw_cuda(
+        "backward-run", cudaGetLastError(), identity.rank, identity.world,
+        "backward", identity.generation, ExchangeKind::ExpertCounts,
+        "pack cached X/A/B into padded Backward rows");
+  }
+  if (view.sizes.incoming_row_count != 0ULL) {
+    backward_wait_for_dispatch_rows_kernel<<<
+        static_cast<unsigned int>(view.sizes.incoming_row_count), 32, 0,
+        compute_stream>>>(args, view.sizes.incoming_row_count);
+    internal::throw_cuda(
+        "backward-run", cudaGetLastError(), identity.rank, identity.world,
+        "backward", identity.generation, ExchangeKind::ExpertCounts,
+        "wait for fixed-slot dR rows launch");
+  }
 
   const auto hidden = static_cast<int>(config.hidden_size);
   const auto intermediate = static_cast<int>(config.intermediate_size);
-  auto *dr = at<transport::BFloat16>(slot.device, layout.forward_training_output);
+  auto *dr = at<transport::BFloat16>(slot.device, layout.backward_padded_dr);
   auto *du = at<transport::BFloat16>(slot.device, layout.backward_dx_rows);
-  auto *u = at<transport::BFloat16>(slot.device, layout.forward_s);
+  auto *u = at<transport::BFloat16>(slot.device, layout.backward_u);
   auto *dab = at<transport::BFloat16>(slot.device, layout.backward_dab_rows);
   auto *dx = at<transport::BFloat16>(slot.device, layout.backward_dx_rows);
-  auto *x = at<const transport::BFloat16>(slot.device, layout.canonical_rows);
+  auto *x = at<const transport::BFloat16>(slot.device,
+                                          layout.backward_padded_x);
   auto *dw1 = at<transport::BFloat16>(slot.device, layout.backward_dw1);
   auto *dw2 = at<transport::BFloat16>(slot.device, layout.backward_dw2);
   const auto *w1 = retained.weights.impl_->w1;
@@ -234,8 +322,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                  identity.rank, "cublasSetStream(Backward)");
     for (std::uint32_t expert = 0;
          expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_expert_rows[expert];
-      const auto row = retained.backward_expert_offsets[expert];
+      const auto rows = retained.backward_padded_expert_rows[expert];
+      const auto row = retained.backward_padded_expert_offsets[expert];
       if (rows == 0ULL)
         continue;
       launch_backward_gemm(
@@ -247,10 +335,10 @@ DeviceBackwardHandle BackwardMegaKernel::run(
           identity.rank, "dU = dR * W2");
       ++gemm_launches;
     }
-    if (view.sizes.incoming_row_count != 0ULL) {
+    if (retained.backward_padded_rows != 0ULL) {
       backward_swiglu_epilogue_kernel<<<
-          static_cast<unsigned int>(view.sizes.incoming_row_count), 256, 0,
-          compute_stream>>>(args, view.sizes.incoming_row_count);
+          static_cast<unsigned int>(retained.backward_padded_rows), 256, 0,
+          compute_stream>>>(args, retained.backward_padded_rows);
       internal::throw_cuda(
           "backward-run", cudaGetLastError(), identity.rank, identity.world,
           "backward", identity.generation, ExchangeKind::ExpertCounts,
@@ -262,8 +350,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         ExchangeKind::ExpertCounts, "record dAB done");
     for (std::uint32_t expert = 0;
          expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_expert_rows[expert];
-      const auto row = retained.backward_expert_offsets[expert];
+      const auto rows = retained.backward_padded_expert_rows[expert];
+      const auto row = retained.backward_padded_expert_offsets[expert];
       if (rows == 0ULL)
         continue;
       launch_backward_gemm(
@@ -281,8 +369,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         ExchangeKind::ExpertCounts, "record dX done");
     for (std::uint32_t expert = 0;
          expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_expert_rows[expert];
-      const auto row = retained.backward_expert_offsets[expert];
+      const auto rows = retained.backward_padded_expert_rows[expert];
+      const auto row = retained.backward_padded_expert_offsets[expert];
       auto *expert_dw2 =
           dw2 + expert * config.hidden_size * config.intermediate_size;
       if (rows == 0ULL) {
@@ -311,8 +399,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         ExchangeKind::ExpertCounts, "record dW2 done");
     for (std::uint32_t expert = 0;
          expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_expert_rows[expert];
-      const auto row = retained.backward_expert_offsets[expert];
+      const auto rows = retained.backward_padded_expert_rows[expert];
+      const auto row = retained.backward_padded_expert_offsets[expert];
       auto *expert_dw1 = dw1 + expert * 2ULL * config.intermediate_size *
                                    config.hidden_size;
       if (rows == 0ULL) {
@@ -357,11 +445,6 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         "backward", identity.generation, ExchangeKind::ExpertCounts,
         "Backward local return launch");
   }
-  backward_wait_for_return_kernel<<<1, 1, 0, transport_stream>>>(args);
-  internal::throw_cuda(
-      "backward-run", cudaGetLastError(), identity.rank, identity.world,
-      "backward", identity.generation, ExchangeKind::ExpertCounts,
-      "wait Backward returns launch");
   if (identity.tokens != 0ULL) {
     backward_reduce_dx_kernel<<<static_cast<unsigned int>(identity.tokens),
                                 256, 0, transport_stream>>>(args);

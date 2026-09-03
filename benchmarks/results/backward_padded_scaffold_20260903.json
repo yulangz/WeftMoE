@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "description": "Expert-wise 128-row padded local Backward scaffold",
+  "tested_worktree_base_commit": "503de1944d017c194dbb68fc2dee39f5195e422d",
+  "recorded_utc": "2026-09-03T11:33:07Z",
+  "hardware": "8x H200 (driver label NVIDIA L20X)",
+  "status": {
+    "performance_qualified": false,
+    "backward_pipeline_available": false,
+    "scope": "one-node LocalCudaP2p retained Forward state"
+  },
+  "implementation": {
+    "expert_row_alignment": 128,
+    "retained_inputs": [
+      "compact canonical BF16 X",
+      "compact plane-major BF16 FC1 A/B"
+    ],
+    "padded_compute_tensors": ["X", "A/B", "dR", "U", "dA/dB", "dX"],
+    "transport": "direct final-slot peer writes with per-row/per-route epoch markers",
+    "global_grid_sync": false,
+    "hot_path_allocations": 0,
+    "known_scaffold_cost": "Compact X/A/B are packed by a separate kernel before cuBLAS; the persistent kernel milestone must fuse or eliminate this cost."
+  },
+  "correctness": {
+    "same_forward_cache_executions": 5,
+    "all_outputs_byte_stable": true,
+    "independent_reference": "PyTorch autograd from exact cached BF16 X/A/B",
+    "accuracy": {
+      "dx": {
+        "max_abs_error": 0.00006103515625,
+        "rmse": 5.13098840045415e-7,
+        "relative_l2": 0.00010297697589259404
+      },
+      "dgate": {
+        "max_abs_error": 5.960464477539063e-8,
+        "rmse": 2.658758763898201e-8,
+        "relative_l2": 2.0776826985227553e-7
+      },
+      "dw1": {
+        "max_abs_error": 0.00006103515625,
+        "rmse": 1.2341405749157892e-7,
+        "relative_l2": 0.00001323856268907975
+      },
+      "dw2": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "relative_l2": 0.0,
+        "byte_identical": true
+      }
+    }
+  },
+  "main_shape_performance": {
+    "shape": {
+      "world": 8,
+      "tokens_per_rank": 8192,
+      "experts": 384,
+      "top_k": 6,
+      "hidden": 7168,
+      "intermediate": 3072
+    },
+    "warmup_iterations": 10,
+    "measured_iterations": 10,
+    "aggregation": "slowest rank per iteration",
+    "cuda_event_us": {
+      "total_mean": 25893.33,
+      "total_p95": 26545.5,
+      "dispatch_mean": 1800.976,
+      "dab_mean": 5338.225,
+      "dx_mean": 6332.364,
+      "dw2_mean": 6032.541,
+      "dw1_mean": 6656.035,
+      "combine_mean": 2971.309,
+      "dw_combine_overlap_mean": 2971.309
+    },
+    "host_wall_us": {
+      "mean": 26286.04,
+      "p95": 26605.6
+    },
+    "previous_unpadded_scaffold_wall_mean_us": 24343.45,
+    "wall_regression_percent": 7.9802,
+    "megatron_host_wall_mean_us": 30204.765,
+    "speedup_over_megatron": 1.149083,
+    "interpretation": "Still faster than the measured Megatron baseline, but padding pack and stage-wide cuBLAS launch boundaries are deliberately not performance-qualified."
+  },
+  "resolved_bug": {
+    "symptom": "The first valid row of every expert after the first changed across executions after padding.",
+    "cause": "The SwiGLU epilogue indexed compact gate storage with a padded row index.",
+    "fix": "Pack gate into padded scratch and consume the padded scalar before overwriting the same slot with dGate."
+  },
+  "commands": [
+    "python3 tests/run_local_activation_p2p.py --binary build-bwd/test_cuda_notify --world 8 --backward-validation --backward-tokens 2 --rounds 5 --timeout 180",
+    "torchrun --standalone --nproc_per_node=8 benchmarks/compare_backward_outputs.py --artifact-dir artifacts/backward-validation-m2-padded --tokens 2 --experts 16",
+    "python3 tests/run_local_activation_p2p.py --binary build-bwd/test_cuda_notify --world 8 --backward-benchmark --backward-tokens 8192 --top-k 6 --rounds 20 --timeout 600"
+  ]
+}
