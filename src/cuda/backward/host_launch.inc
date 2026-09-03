@@ -76,7 +76,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   const auto &layout = pool->layout;
   if (!pool->config.enable_backward_state || !pool->backward_blas ||
       layout.backward_dab_rows == 0 || layout.backward_dx_rows == 0 ||
-      layout.backward_dw1 == 0 || layout.backward_dw2 == 0)
+      layout.backward_dw1 == 0 || layout.backward_dw2 == 0 ||
+      !pool->slots[retained.slot->index].backward_maps_valid)
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "backward-run", "Backward workspace", identity.rank,
                     "training-enabled pool with owned expert capacity",
@@ -304,35 +305,34 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   const auto hidden = static_cast<int>(config.hidden_size);
   const auto intermediate = static_cast<int>(config.intermediate_size);
   auto *dr = at<transport::BFloat16>(slot.device, layout.backward_padded_dr);
-  auto *du = at<transport::BFloat16>(slot.device, layout.backward_dx_rows);
   auto *u = at<transport::BFloat16>(slot.device, layout.backward_u);
   auto *dab = at<transport::BFloat16>(slot.device, layout.backward_dab_rows);
-  auto *dx = at<transport::BFloat16>(slot.device, layout.backward_dx_rows);
   auto *x = at<const transport::BFloat16>(slot.device,
                                           layout.backward_padded_x);
   auto *dw1 = at<transport::BFloat16>(slot.device, layout.backward_dw1);
   auto *dw2 = at<transport::BFloat16>(slot.device, layout.backward_dw2);
-  const auto *w1 = retained.weights.impl_->w1;
-  const auto *w2 = retained.weights.impl_->w2;
   std::uint64_t gemm_launches = 0ULL;
   {
     std::lock_guard<std::mutex> blas_lock(pool->backward_blas_mutex);
     throw_cublas("backward-run",
                  cublasSetStream(pool->backward_blas, compute_stream),
                  identity.rank, "cublasSetStream(Backward)");
-    for (std::uint32_t expert = 0;
-         expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_padded_expert_rows[expert];
-      const auto row = retained.backward_padded_expert_offsets[expert];
-      if (rows == 0ULL)
-        continue;
-      launch_backward_gemm(
-          pool->backward_blas, CUBLAS_OP_N, CUBLAS_OP_N, intermediate,
-          static_cast<int>(rows), hidden, w2 + expert * config.hidden_size *
-                                                   config.intermediate_size,
-          intermediate, dr + row * config.hidden_size, hidden,
-          du + row * config.intermediate_size, intermediate, 0.0F,
-          identity.rank, "dU = dR * W2");
+    if (retained.backward_padded_rows != 0ULL) {
+      const auto mblocks = retained.backward_padded_rows /
+                           backward_tuning::kTileM;
+      const auto ntiles = config.intermediate_size /
+                          backward_tuning::kDabTileN;
+      backward_du_wgmma_kernel<backward_tuning::kDabTileN>
+          <<<static_cast<unsigned int>(mblocks * ntiles),
+             backward_tuning::kComputeThreads,
+             backward_compute_detail::dynamic_shared_bytes<
+                 backward_tuning::kDabTileN>(),
+             compute_stream>>>(args, slot.backward_dr_map,
+                               retained.weights.impl_->backward_w2_map);
+      internal::throw_cuda(
+          "backward-run", cudaGetLastError(), identity.rank, identity.world,
+          "backward", identity.generation, ExchangeKind::ExpertCounts,
+          "Backward dU TMA/WGMMA launch");
       ++gemm_launches;
     }
     if (retained.backward_padded_rows != 0ULL) {
@@ -348,19 +348,21 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         "backward-run", cudaEventRecord(slot.backward_dab_done, compute_stream),
         identity.rank, identity.world, "backward", identity.generation,
         ExchangeKind::ExpertCounts, "record dAB done");
-    for (std::uint32_t expert = 0;
-         expert < view.sizes.owned_expert_count; ++expert) {
-      const auto rows = retained.backward_padded_expert_rows[expert];
-      const auto row = retained.backward_padded_expert_offsets[expert];
-      if (rows == 0ULL)
-        continue;
-      launch_backward_gemm(
-          pool->backward_blas, CUBLAS_OP_N, CUBLAS_OP_N, hidden,
-          static_cast<int>(rows), 2 * intermediate,
-          w1 + expert * 2ULL * config.intermediate_size * config.hidden_size,
-          hidden, dab + row * 2ULL * config.intermediate_size,
-          2 * intermediate, dx + row * config.hidden_size, hidden, 0.0F,
-          identity.rank, "dX = dAB * W1");
+    if (retained.backward_padded_rows != 0ULL) {
+      const auto mblocks = retained.backward_padded_rows /
+                           backward_tuning::kTileM;
+      const auto ntiles = config.hidden_size / backward_tuning::kDxTileN;
+      backward_dx_wgmma_kernel<backward_tuning::kDxTileN>
+          <<<static_cast<unsigned int>(mblocks * ntiles),
+             backward_tuning::kComputeThreads,
+             backward_compute_detail::dynamic_shared_bytes<
+                 backward_tuning::kDxTileN>(),
+             compute_stream>>>(args, slot.backward_dab_map,
+                               retained.weights.impl_->backward_w1_map);
+      internal::throw_cuda(
+          "backward-run", cudaGetLastError(), identity.rank, identity.world,
+          "backward", identity.generation, ExchangeKind::ExpertCounts,
+          "Backward dX TMA/WGMMA launch");
       ++gemm_launches;
     }
     internal::throw_cuda(

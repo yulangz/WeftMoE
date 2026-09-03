@@ -116,6 +116,8 @@ $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/device_kernels.cuh \
 	src/cuda/backward/kernel_contract.cuh \
 	src/cuda/backward/device_kernels.cuh \
+	src/cuda/backward/tuning_config.hpp \
+	src/cuda/persistent_v3/backward/compute_kernels.cuh \
 	src/cuda/backward/host_launch.inc \
 	src/cuda/forward/runtime_state.inc \
 	src/cuda/forward/host_launch.inc \

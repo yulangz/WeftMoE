@@ -38,6 +38,7 @@
 #include <thread>
 
 #include "cuda/cuda_internal.hpp"
+#include "cuda/backward/tuning_config.hpp"
 #include "cuda/persistent_v3/contracts.hpp"
 #include "cuda/persistent_v3/forward/pipeline_state.cuh"
 #include "cuda/persistent_v3/queues.cuh"

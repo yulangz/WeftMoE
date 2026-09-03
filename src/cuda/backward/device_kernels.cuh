@@ -1,4 +1,5 @@
 #include "cuda/backward/kernel_contract.cuh"
+#include "cuda/persistent_v3/backward/compute_kernels.cuh"
 
 __global__ void backward_pack_cached_state_kernel(BackwardKernelArgs a,
                                                    std::uint32_t chunks) {

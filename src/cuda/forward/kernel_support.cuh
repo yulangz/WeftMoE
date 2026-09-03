@@ -174,6 +174,36 @@ CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
   return map;
 }
 
+CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
+                                 std::uint64_t outer, const char *field) {
+  if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
+      outer > UINT32_MAX)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "backward-tma-map", field, 0,
+                    "nonzero uint32 dimensions and valid base", "invalid");
+  CUtensorMap map{};
+  const cuuint64_t dims[2] = {inner, outer};
+  const cuuint64_t strides[1] = {
+      checked_mul(inner, sizeof(transport::BFloat16), field)};
+  // MN-major WGMMA consumes a row-major [K,N] operand as 64 contiguous N
+  // columns by one 64-row K slice. Wider N tiles assemble adjacent atoms.
+  const cuuint32_t box[2] = {64U, 64U};
+  const cuuint32_t element_strides[2] = {1U, 1U};
+  const auto result = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    const char *text = nullptr;
+    (void)cuGetErrorString(result, &text);
+    transport_error(NotifyErrorCode::CudaFailure, "backward-tma-map", field,
+                    0, "cuTensorMapEncodeTiled success",
+                    text ? text : "unknown CUDA driver error");
+  }
+  return map;
+}
+
 struct TransportDeviceStatus {
   unsigned long long packet_claim_cursor;
   unsigned long long packets_done;
@@ -1084,6 +1114,9 @@ struct PoolSlot {
   CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};
   bool forward_maps_valid = false;
+  CUtensorMap backward_dr_map{};
+  CUtensorMap backward_dab_map{};
+  bool backward_maps_valid = false;
 };
 
 template <typename T>

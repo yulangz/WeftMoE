@@ -360,6 +360,8 @@ struct ForwardWeightLease::Impl {
   std::uint32_t device = 0;
   CUtensorMap w1_map{};
   CUtensorMap w2_map{};
+  CUtensorMap backward_w1_map{};
+  CUtensorMap backward_w2_map{};
 };
 
 struct ForwardWeightStorageHashAccess {
@@ -632,6 +634,14 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
+    impl->backward_w1_map = make_bf16_tma_map_mn(
+        impl->allocation->w1, hidden_size,
+        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
+        "Backward W1 MN-major");
+    impl->backward_w2_map = make_bf16_tma_map_mn(
+        impl->allocation->w2, intermediate_size,
+        static_cast<std::uint64_t>(owned_experts) * hidden_size,
+        "Backward W2 MN-major");
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -709,6 +719,14 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
+    impl->backward_w1_map = make_bf16_tma_map_mn(
+        impl->allocation->w1, hidden_size,
+        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
+        "Backward W1 MN-major");
+    impl->backward_w2_map = make_bf16_tma_map_mn(
+        impl->allocation->w2, intermediate_size,
+        static_cast<std::uint64_t>(owned_experts) * hidden_size,
+        "Backward W2 MN-major");
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -1426,6 +1444,26 @@ ActivationTransportResourcePool make_activation_transport_pool(
                        session.generation(), ExchangeKind::ExpertCounts,
                        "cudaSetDevice");
   if (config.enable_backward_state) {
+    internal::throw_cuda(
+        "transport-pool-create",
+        cudaFuncSetAttribute(
+            backward_du_wgmma_kernel<backward_tuning::kDabTileN>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(backward_compute_detail::dynamic_shared_bytes<
+                             backward_tuning::kDabTileN>())),
+        0, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::ExpertCounts,
+        "cudaFuncSetAttribute(Backward dU shared memory)");
+    internal::throw_cuda(
+        "transport-pool-create",
+        cudaFuncSetAttribute(
+            backward_dx_wgmma_kernel<backward_tuning::kDxTileN>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(backward_compute_detail::dynamic_shared_bytes<
+                             backward_tuning::kDxTileN>())),
+        0, session.world_size(), session.identity(), session.generation(),
+        ExchangeKind::ExpertCounts,
+        "cudaFuncSetAttribute(Backward dX shared memory)");
     throw_cublas("transport-pool-create",
                  cublasCreate(&state->backward_blas), 0,
                  "cublasCreate(Backward)");
@@ -1546,6 +1584,21 @@ ActivationTransportResourcePool make_activation_transport_pool(
               at<void>(slot.device, state->layout.forward_training_output),
               config.max_hidden_size, config.max_destination_rows_per_rank,
               "Forward training output");
+        if (config.enable_backward_state) {
+          slot.backward_dr_map = make_bf16_tma_map(
+              at<void>(slot.device, state->layout.backward_padded_dr),
+              config.max_hidden_size,
+              state->layout.backward_padded_capacity_rows,
+              backward_tuning::kTileM, "Backward padded dR",
+              backward_tuning::kTileK);
+          slot.backward_dab_map = make_bf16_tma_map(
+              at<void>(slot.device, state->layout.backward_dab_rows),
+              2ULL * config.max_intermediate_size,
+              state->layout.backward_padded_capacity_rows,
+              backward_tuning::kTileM, "Backward padded dAB",
+              backward_tuning::kTileK);
+          slot.backward_maps_valid = true;
+        }
         if (slot.gin_window != nullptr)
           slot.forward_staging_store_map = make_bf16_tma_store_map(
               at<void>(slot.gin_window, state->gin_layout.return_staging),
