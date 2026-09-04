@@ -36,7 +36,11 @@ The current records are:
 - [`backward_python_jit_20260904.json`](backward_python_jit_20260904.json), the
   runtime-JIT search, topology-specific scheduler winners, resource evidence,
   final 100-iteration validation, and comparison with the cached-state
-  Megatron baseline.
+  Megatron baseline;
+- [`backward_late_workers_20260904.json`](backward_late_workers_20260904.json),
+  the post-transport compute-worker handoff, paired world-8/world-16 latency,
+  full-shape repeated-output validation, and the rejected initial-grid
+  oversubscription precursor.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

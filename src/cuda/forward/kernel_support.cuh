@@ -1149,6 +1149,7 @@ struct PoolSlot {
   cudaEvent_t backward_compute_done = nullptr;
   cudaEvent_t backward_transport_done = nullptr;
   cudaEvent_t backward_reduce_done = nullptr;
+  cudaEvent_t backward_late_compute_done = nullptr;
   cudaEvent_t backward_complete = nullptr;
   cudaEvent_t dispatch_complete = nullptr;
   cudaEvent_t complete = nullptr;
@@ -1296,7 +1297,8 @@ struct ActivationPoolState {
       const cudaEvent_t backward_events[] = {
           slot.backward_start,         slot.backward_compute_start,
           slot.backward_compute_done,  slot.backward_transport_done,
-          slot.backward_reduce_done,   slot.backward_complete};
+          slot.backward_reduce_done,   slot.backward_late_compute_done,
+          slot.backward_complete};
       for (const auto event : backward_events) {
         if (event)
           internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);

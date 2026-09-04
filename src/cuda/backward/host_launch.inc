@@ -365,6 +365,26 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts,
       "set persistent Backward compute shared memory");
+  const auto launch_compute_workers =
+      [&](std::uint32_t ctas, cudaStream_t stream, const char *detail) {
+        backward_local_compute_kernel<backward_tuning::kDabTileN,
+                                      backward_tuning::kDxTileN,
+                                      backward_tuning::kDwTileN>
+            <<<ctas, backward_tuning::kComputeThreads, kPersistentSmem,
+               stream>>>(args, slot.backward_dr_map, slot.backward_dab_map,
+                          retained.weights.impl_->backward_w2_map,
+                          retained.weights.impl_->backward_w1_map,
+                          slot.backward_dr_mn_map, slot.backward_u_mn_map,
+                          slot.backward_dab_mn_map, slot.backward_x_mn_map,
+                          slot.backward_u_store_map,
+                          slot.backward_dx_store_map,
+                          slot.backward_dw2_store_map,
+                          slot.backward_dw1_store_map);
+        internal::throw_cuda(
+            "backward-run", cudaGetLastError(), identity.rank,
+            identity.world, "backward", identity.generation,
+            ExchangeKind::ExpertCounts, detail);
+      };
   internal::throw_cuda(
       "backward-run", cudaStreamWaitEvent(transport_stream,
                                            slot.forward_complete),
@@ -479,25 +499,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       cudaStreamWaitEvent(compute_stream, slot.forward_roles_ready),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "start Backward compute roles");
-  backward_local_compute_kernel<backward_tuning::kDabTileN,
-                                backward_tuning::kDxTileN,
-                                backward_tuning::kDwTileN>
-      <<<static_cast<unsigned int>(sm_count) - transport_ctas,
-         backward_tuning::kComputeThreads, kPersistentSmem,
-         compute_stream>>>(args, slot.backward_dr_map, slot.backward_dab_map,
-                           retained.weights.impl_->backward_w2_map,
-                           retained.weights.impl_->backward_w1_map,
-                           slot.backward_dr_mn_map,
-                           slot.backward_u_mn_map,
-                           slot.backward_dab_mn_map,
-                           slot.backward_x_mn_map,
-                           slot.backward_u_store_map,
-                           slot.backward_dx_store_map,
-                           slot.backward_dw2_store_map,
-                           slot.backward_dw1_store_map);
-  internal::throw_cuda(
-      "backward-run", cudaGetLastError(), identity.rank, identity.world,
-      "backward", identity.generation, ExchangeKind::ExpertCounts,
+  launch_compute_workers(
+      static_cast<std::uint32_t>(sm_count) - transport_ctas, compute_stream,
       "persistent priority DAB/DX/dW TMA-WGMMA launch");
   internal::throw_cuda(
       "backward-run",
@@ -523,6 +526,19 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       cudaEventRecord(slot.backward_reduce_done, transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward reduction completion");
+  // Once transport and reduction release their dedicated SMs, add an equal
+  // number of workers to the same global queues for the remaining dW tail.
+  // Sequencing this launch on the transport stream preserves initial role
+  // residency; unlike an over-subscribed initial grid, it cannot starve the
+  // communication CTAs needed to make activation progress.
+  launch_compute_workers(transport_ctas, transport_stream,
+                         "late Backward compute-worker launch");
+  internal::throw_cuda(
+      "backward-run",
+      cudaEventRecord(slot.backward_late_compute_done, transport_stream),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts,
+      "record late Backward compute-worker completion");
   internal::throw_cuda(
       "backward-run",
       cudaStreamWaitEvent(exec->stream, slot.backward_compute_done),
@@ -530,9 +546,10 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       ExchangeKind::ExpertCounts, "join Backward compute roles");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(exec->stream, slot.backward_reduce_done),
+      cudaStreamWaitEvent(exec->stream, slot.backward_late_compute_done),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "join Backward reduction");
+      ExchangeKind::ExpertCounts,
+      "join late Backward compute workers and reduction");
   internal::throw_cuda(
       "backward-run",
       cudaMemcpyAsync(slot.host_status,
@@ -570,7 +587,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   result->intermediate = config.intermediate_size;
   result->audit.specialization =
       BackwardKernelSpecialization::Sm90CachedXAb7168x3072;
-  result->audit.gemm_launches = 1ULL;
+  result->audit.gemm_launches = 2ULL;
   result->audit.actual_dispatch_peer_bytes =
       retained.audit.actual_dispatch_peer_bytes;
   const auto remote_return_rows =
@@ -594,9 +611,13 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   result->timings.prepare_us = backward_elapsed_us(
       slot.backward_start, slot.backward_compute_start, identity,
       "Backward cache preparation elapsed");
-  result->timings.compute_us = backward_elapsed_us(
+  const auto primary_compute_us = backward_elapsed_us(
       slot.backward_compute_start, slot.backward_compute_done, identity,
-      "Backward persistent compute elapsed");
+      "Backward primary persistent compute elapsed");
+  const auto late_compute_us = backward_elapsed_us(
+      slot.backward_compute_start, slot.backward_late_compute_done, identity,
+      "Backward late compute elapsed");
+  result->timings.compute_us = std::max(primary_compute_us, late_compute_us);
   result->timings.reduce_us = backward_elapsed_us(
       slot.backward_transport_done, slot.backward_reduce_done, identity,
       "Backward dX reduction elapsed");

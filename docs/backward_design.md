@@ -121,6 +121,17 @@ already be in flight while later experts are still producing or returning
 `dX`. Communication CTAs continue draining `dX` after compute has shifted
 mostly to dW.
 
+The primary compute grid contains `SM count - transport CTAs` workers, which
+guarantees that every RDMA and Relay CTA can remain resident. After the
+persistent transport grid exits and the queued dX reduction drains, the now
+free SMs receive a second, small launch of the same compute kernel. These late
+workers join the existing global queues and terminal counters; they are not a
+separate dW implementation and do not wait for or synchronize the primary
+compute grid. In the steady benchmark they find the remaining dW tail, while
+the scheduler remains correct if another task kind is still visible. This
+stream-ordered handoff avoids leaving the former communication SMs idle
+without relying on CUDA stream priority to reserve SM residency.
+
 ## Readiness and immediate return
 
 The dependency chain is entirely release/acquire based:
@@ -159,8 +170,9 @@ that launches dW.
   metadata/marker when that does not add a GIN put.
 
 RDMA and Relay CTAs remain dedicated transport owners for the full generation.
-They never enter the dW queues. Only compute CTAs use opportunistic dW work to
-fill communication dependency holes.
+They never enter the dW queues. The late workers are newly launched compute
+CTAs after those transport CTAs have exited; only compute CTAs use
+opportunistic dW work to fill communication dependency holes.
 
 ## Completion contract
 

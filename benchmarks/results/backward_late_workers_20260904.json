@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "description": "Late compute workers reclaim SMs after Backward transport and dX reduction without changing transport CTA roles or scheduler queues",
+  "tested_worktree_base_commit": "35f4971fdaa886f05fc25be0961bada68a4d3808",
+  "recorded_utc": "2026-09-04T11:22:16Z",
+  "hardware": "8x H200 per node (driver label NVIDIA L20X)",
+  "toolchain": {
+    "cuda": "12.9.86",
+    "cxx": "GCC 13.3.0",
+    "nccl": "2.29.7+cuda12.9",
+    "architecture": "sm_90a"
+  },
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "measured_iterations_per_long_run": 300,
+    "aggregation": "slowest rank per iteration",
+    "retained_state": ["routed X", "BF16 FC1 A/B"]
+  },
+  "implementation": {
+    "initial_compute_ctas": "SM count minus dedicated transport CTAs",
+    "late_compute_ctas": "the released transport CTA count",
+    "late_launch_dependency": "same stream, after persistent transport and dX reduction",
+    "scheduler": "same global Q_DX > Q_DAB > Q_DW2 > Q_DW1 queues",
+    "grid_sync": false,
+    "distinct_compute_kernel_implementations": 1,
+    "compute_kernel_launches": 2
+  },
+  "selected_kernel_resources": {
+    "compute_registers_per_thread": 168,
+    "compute_stack_bytes_per_thread": 24,
+    "compute_local_bytes_per_thread": 0,
+    "transport_registers_per_thread": 72,
+    "transport_stack_bytes_per_thread": 8,
+    "dynamic_shared_bytes": 213104
+  },
+  "profile_before_change": {
+    "report": "artifacts/backward_rank0_35f4971.nsys-rep",
+    "compute_interval_metrics_percent": {
+      "sms_active": 96.94,
+      "tensor_pipe_active": 59.11,
+      "issue_active": 12.54,
+      "warps_active": 36.64,
+      "register_quanta_allocated": 91.92
+    },
+    "tensor_pipe_active_by_phase_percent": {
+      "compute_0_to_7_ms": 44.54,
+      "compute_7_to_16_ms": 52.73,
+      "compute_16_ms_to_end": 71.97
+    }
+  },
+  "world8": {
+    "transport": "CUDA IPC/NVLink; 12 dedicated Relay CTAs",
+    "predecessor_total_mean_us_runs": [29123.806, 29134.598],
+    "late_worker_total_mean_us_runs": [28756.036, 28796.484],
+    "predecessor_aggregate_mean_us": 29129.202,
+    "late_worker_aggregate_mean_us": 28776.260,
+    "latency_improvement_percent": 1.212,
+    "clean_event_accounting_confirmation_100_iteration_mean_us": 28771.071,
+    "megatron_device_mean_us": 30180.962,
+    "speedup_over_megatron": 1.049
+  },
+  "world16": {
+    "transport": "GIN/GDRDMA over eight 200-Gb/s rails; 8 RDMA plus 12 Relay CTAs",
+    "predecessor_total_mean_us_runs": [31277.137, 31298.071, 31300.783],
+    "late_worker_total_mean_us_runs": [30554.833, 30607.753],
+    "predecessor_aggregate_mean_us": 31291.997,
+    "late_worker_aggregate_mean_us": 30581.293,
+    "latency_improvement_percent": 2.271,
+    "clean_event_accounting_confirmation_100_iteration_mean_us": 30638.593,
+    "clean_reduce_mean_us": 1472.962,
+    "megatron_device_mean_us": 43033.856,
+    "speedup_over_megatron": 1.407
+  },
+  "correctness": {
+    "world8_small_shape_repeats": 5,
+    "world8_full_shape_repeats": 5,
+    "world16_small_shape_repeats": 3,
+    "world16_full_shape_repeats": 3,
+    "all_four_outputs_repeat_byte_identical": true,
+    "small_shape_all_rank_fingerprints_match_predecessor": true,
+    "arithmetic_or_tile_traversal_changed": false,
+    "independent_pytorch_oracle": "inherited from the byte-identical qualified predecessor"
+  },
+  "rejected_precursor": {
+    "change": "oversubscribe the initial compute grid to all 132 SMs",
+    "result": "deterministic residency deadlock in world-8 validation",
+    "reason": "CUDA stream priority does not reserve SMs or guarantee cross-stream block launch order"
+  }
+}

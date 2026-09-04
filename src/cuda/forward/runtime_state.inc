@@ -1827,6 +1827,8 @@ ActivationTransportResourcePool make_activation_transport_pool(
                             "cudaEventCreate(Backward transport done)");
         create_timing_event(&slot.backward_reduce_done,
                             "cudaEventCreate(Backward reduce done)");
+        create_timing_event(&slot.backward_late_compute_done,
+                            "cudaEventCreate(Backward late compute done)");
         create_timing_event(&slot.backward_complete,
                             "cudaEventCreate(Backward complete)");
       }

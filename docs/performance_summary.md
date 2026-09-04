@@ -114,3 +114,27 @@ matched all four output fingerprints, repeated execution was byte-identical,
 and an independent PyTorch oracle remained within BF16 accumulation tolerance.
 Compact evidence is in
 [`benchmarks/results/backward_python_jit_20260904.json`](../benchmarks/results/backward_python_jit_20260904.json).
+
+## Backward late-worker checkpoint
+
+The transport and reduction grids finish before the dW critical path. A
+stream-ordered second launch of the same persistent compute kernel now fills
+the SMs released by those dedicated roles and joins the existing global work
+queues. It does not add a dW-only kernel, change a transport CTA into a compute
+CTA, or introduce a grid-wide synchronization.
+
+Paired 300-iteration runs measured the following slowest-rank means:
+
+| topology | previous MegaMOE | late workers | latency reduction | Megatron speedup |
+| --- | ---: | ---: | ---: | ---: |
+| world 8, one H200 node | 29.1292 ms | 28.7763 ms | 1.21% | 1.049x |
+| world 16, two H200 nodes, GIN | 31.2920 ms | 30.5813 ms | 2.27% | 1.407x |
+
+The compute kernel remains at 168 registers, 24 stack bytes, zero local bytes,
+and 213104 dynamic shared-memory bytes per CTA. Small- and full-shape repeated
+validation was byte-identical on all four outputs for both topologies. A first
+attempt to over-subscribe the initial compute grid deadlocked because stream
+priority does not reserve transport residency; the retained design launches
+late workers only after transport and reduction have completed. Compact
+evidence is in
+[`benchmarks/results/backward_late_workers_20260904.json`](../benchmarks/results/backward_late_workers_20260904.json).
