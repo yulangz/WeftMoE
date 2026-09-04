@@ -76,8 +76,11 @@
 #ifndef MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK
 #define MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK 12
 #endif
-#ifndef MEGAMOE_BWD_DW_CLAIM_TILES
-#define MEGAMOE_BWD_DW_CLAIM_TILES 4
+#ifndef MEGAMOE_BWD_DW2_CLAIM_TILES
+#define MEGAMOE_BWD_DW2_CLAIM_TILES 4
+#endif
+#ifndef MEGAMOE_BWD_DW1_CLAIM_TILES
+#define MEGAMOE_BWD_DW1_CLAIM_TILES 4
 #endif
 #ifndef MEGAMOE_BWD_GIN_MAX_INFLIGHT
 #define MEGAMOE_BWD_GIN_MAX_INFLIGHT 24
@@ -134,7 +137,10 @@ inline constexpr std::uint32_t kDispatchBatchRows =
     MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
 inline constexpr std::uint32_t kEpilogueRowsPerTask =
     MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK;
-inline constexpr std::uint32_t kDwClaimTiles = MEGAMOE_BWD_DW_CLAIM_TILES;
+inline constexpr std::uint32_t kDw2ClaimTiles =
+    MEGAMOE_BWD_DW2_CLAIM_TILES;
+inline constexpr std::uint32_t kDw1ClaimTiles =
+    MEGAMOE_BWD_DW1_CLAIM_TILES;
 inline constexpr std::uint32_t kGinMaxInflight =
     MEGAMOE_BWD_GIN_MAX_INFLIGHT;
 inline constexpr std::uint32_t kSetupThreads = MEGAMOE_BWD_SETUP_THREADS;
@@ -179,8 +185,10 @@ static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
 static_assert(kEpilogueRowsPerTask >= kComputeThreads / 32U &&
               kEpilogueRowsPerTask <= kTileM);
-static_assert(kDwClaimTiles == 1U || kDwClaimTiles == 4U ||
-              kDwClaimTiles == 8U || kDwClaimTiles == 16U);
+static_assert(kDw2ClaimTiles == 1U || kDw2ClaimTiles == 4U ||
+              kDw2ClaimTiles == 8U || kDw2ClaimTiles == 16U);
+static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 4U ||
+              kDw1ClaimTiles == 8U || kDw1ClaimTiles == 16U);
 static_assert(kGinMaxInflight >= 1U && kGinMaxInflight <= 64U);
 static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
               kSetupThreads % 32U == 0U);

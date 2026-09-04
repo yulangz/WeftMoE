@@ -73,7 +73,8 @@
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
       "epilogue_rows_per_task": 12,
-      "dw_claim_tiles": 4
+      "dw2_claim_tiles": 4,
+      "dw1_claim_tiles": 4
     },
     "4_completion_reduce": {
       "reduce_threads": 256,
@@ -90,11 +91,6 @@
       "name": "dispatch_rows32",
       "description": "Restore smaller dispatch waves while retaining short dW claims.",
       "override": {"2_transport": {"dispatch_batch_rows": 32}}
-    },
-    {
-      "name": "dw_claim8",
-      "description": "Restore longer dW claims while retaining larger dispatch waves.",
-      "override": {"3_scheduler": {"dw_claim_tiles": 8}}
     },
     {
       "name": "gin_inflight64",
@@ -121,7 +117,7 @@
       "description": "Retain the previous production point as an interaction control.",
       "override": {
         "2_transport": {"dispatch_batch_rows": 32},
-        "3_scheduler": {"dw_claim_tiles": 8}
+        "3_scheduler": {"dw2_claim_tiles": 8, "dw1_claim_tiles": 8}
       }
     }
   ]

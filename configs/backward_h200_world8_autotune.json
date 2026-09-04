@@ -71,7 +71,8 @@
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
       "epilogue_rows_per_task": 12,
-      "dw_claim_tiles": 8
+      "dw2_claim_tiles": 8,
+      "dw1_claim_tiles": 8
     },
     "4_completion_reduce": {
       "reduce_threads": 256,
@@ -93,11 +94,6 @@
       "name": "relay16",
       "description": "Trade four compute SMs for more NVLink Relay concurrency.",
       "override": {"2_transport": {"relay_ctas": 16}}
-    },
-    {
-      "name": "dw_claim4",
-      "description": "Shorter dW chunks revisit activation priority more frequently.",
-      "override": {"3_scheduler": {"dw_claim_tiles": 4}}
     },
     {
       "name": "epilogue_rows24",

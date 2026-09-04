@@ -83,7 +83,7 @@ __device__ __forceinline__ TileDomain make_dw2_domain(
       kDw2TilesPerExpert,
       TaskKind::Dw2,
       true,
-      backward_tuning::kDwClaimTiles};
+      backward_tuning::kDw2ClaimTiles};
 }
 
 __device__ __forceinline__ TileDomain make_dw1_domain(
@@ -97,7 +97,7 @@ __device__ __forceinline__ TileDomain make_dw1_domain(
       kDw1TilesPerExpert,
       TaskKind::Dw1,
       true,
-      backward_tuning::kDwClaimTiles};
+      backward_tuning::kDw1ClaimTiles};
 }
 
 __device__ __forceinline__ WorkQueues make_work_queues(
