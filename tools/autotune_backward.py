@@ -168,7 +168,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require(config["rdma_ctas"] == 8,
             "the physical GIN context contract requires eight RDMA CTAs")
     require_choice(config, "relay_ctas", (8, 12, 16, 20, 24))
-    require_choice(config, "dispatch_batch_rows", (16, 32, 64, 128))
+    require_choice(config, "dispatch_batch_rows", (12, 16, 32, 64, 128))
     require_choice(config, "gin_max_inflight", (8, 16, 24, 32, 64))
     for key in ("setup_threads", "cache_threads", "reduce_threads"):
         require_choice(config, key, (128, 256, 384, 512))

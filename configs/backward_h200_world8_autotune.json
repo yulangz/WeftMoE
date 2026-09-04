@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "description": "Narrow one-host H200 cached-state Backward search using the same split Compute/Relay architecture without launching RDMA CTAs.",
-  "max_candidates": 6,
+  "max_candidates": 7,
   "jit": {
     "cache_root": "artifacts/backward-jit",
     "jobs": 8,
@@ -106,6 +106,11 @@
       "name": "dispatch_rows32",
       "description": "Retain the former thirty-two-row publication wave as a regression candidate.",
       "override": {"2_transport": {"dispatch_batch_rows": 32}}
+    },
+    {
+      "name": "dispatch_rows12",
+      "description": "Publish one row per Relay warp at the minimum batch size.",
+      "override": {"2_transport": {"dispatch_batch_rows": 12}}
     },
     {
       "name": "activation_owner_group2",

@@ -277,5 +277,14 @@ from 15.3734 ms to 15.1080 ms.  The dAB/dX duration counters grow because
 their start timestamp moves earlier; their completion relative to kernel
 launch is what improves.  Top-k=1 and top-k=6 five-repeat validation passed
 the independent oracle and remained byte-identical.  The world-16 GIN point
-keeps its independently selected 64-row batch.  Compact evidence is in
+keeps its independently selected 64-row batch.  A 210-iteration lower-bound
+control measured 25.6143 ms at 12 rows versus 25.5903 ms at 16 rows, so 12 is
+retained only as a nearby autotune candidate.
+
+A rank-0 Nsight profile independently reduced the primary compute interval
+from 25.8144 ms to 25.5135 ms and transport from 15.3707 ms to 15.0505 ms.
+During the first 2 ms, Tensor Pipe activity rose from 29.97% to 40.91% and L2
+hit rate from 25.82% to 27.36%; subsequent activation buckets remain near 60%
+Tensor activity.  This localizes the gain to the initial readiness wave rather
+than a change in steady GEMM throughput.  Compact evidence is in
 [`benchmarks/results/backward_dispatch_wavefront_20260904.json`](../benchmarks/results/backward_dispatch_wavefront_20260904.json).

@@ -51,6 +51,32 @@
     "batch16_p95_mean_us": 27412.4,
     "batch32_p95_mean_us": 27480.4
   },
+  "lower_boundary_control": {
+    "measured_iterations": 210,
+    "batch16_total_mean_us": 25590.322381,
+    "batch12_total_mean_us": 25614.315238,
+    "batch12_regression_percent": 0.093758,
+    "decision": "Keep batch16 selected; retain batch12 only as a nearby autotune candidate."
+  },
+  "nsys_rank0": {
+    "batch32_report": "artifacts/backward_rank0_activation_owner_group4.nsys-rep",
+    "batch16_report": "artifacts/backward_rank0_dispatch16.nsys-rep",
+    "batch32_primary_compute_mean_ms": 25.814376,
+    "batch16_primary_compute_mean_ms": 25.51347,
+    "primary_compute_improvement_percent": 1.16566,
+    "batch32_transport_mean_ms": 15.370736,
+    "batch16_transport_mean_ms": 15.050513,
+    "transport_improvement_percent": 2.08334,
+    "first_2ms": {
+      "batch32_tensor_pipe_active_percent": 29.97,
+      "batch16_tensor_pipe_active_percent": 40.91,
+      "batch32_l2_hit_percent": 25.82,
+      "batch16_l2_hit_percent": 27.36,
+      "batch32_hbm_pressure_percent": 46.04,
+      "batch16_hbm_pressure_percent": 60.16
+    },
+    "steady_activation_tensor_pipe_percent": "approximately 60 for both batches after 2 ms"
+  },
   "interpretation": {
     "batch16_dispatch_complete_mean_us": 11310.018095,
     "batch32_dispatch_complete_mean_us": 6761.285119,

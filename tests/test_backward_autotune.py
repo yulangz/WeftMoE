@@ -35,7 +35,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         plan = tune.load_plan(
             ROOT / "configs" / "backward_h200_world8_autotune.json")
         candidates = tune.expand_candidates(plan)
-        self.assertEqual(len(candidates), 6)
+        self.assertEqual(len(candidates), 7)
         self.assertEqual(plan["benchmark"]["launcher"], "local")
         self.assertEqual(candidates[0]["config"]["relay_ctas"], 12)
         self.assertEqual(candidates[0]["config"]["rdma_ctas"], 8)
@@ -44,6 +44,12 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.assertEqual(candidates[0]["config"]["dw1_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["ready_word_stagger"], 0)
         self.assertEqual(candidates[0]["config"]["activation_owner_group"], 4)
+        self.assertEqual(
+            next(candidate for candidate in candidates
+                 if candidate["name"] == "dispatch_rows12")["config"]
+            ["dispatch_batch_rows"],
+            12,
+        )
 
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "backward" /
