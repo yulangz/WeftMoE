@@ -199,9 +199,7 @@ __device__ __forceinline__ bool progress_inbound_once(
             fanout[partition_fanout_base + header.dst_row + fanout_slot];
         destination =
             a.node * a.local_world_size + target.destination_local_rank;
-        const auto *compact_to_padded = peer_at<const unsigned int>(
-            a.peer_bases[destination], a.compact_to_padded_offset);
-        destination_row = compact_to_padded[target.dst_row];
+        destination_row = target.dst_row;
         valid = 1U;
       }
     }
@@ -211,7 +209,7 @@ __device__ __forceinline__ bool progress_inbound_once(
     destination = __shfl_sync(0xffffffffU, destination, 0U);
     destination_row = __shfl_sync(0xffffffffU, destination_row, 0U);
     auto *destination_dr = peer_at<transport::BFloat16>(
-        a.peer_bases[destination], a.padded_dr_offset);
+        a.peer_bases[destination], a.compact_dr_offset);
     auto *target = reinterpret_cast<uint4 *>(destination_dr) +
                    static_cast<std::uint64_t>(destination_row) * vector_count;
     const auto *source = reinterpret_cast<const uint4 *>(payload) +

@@ -12,7 +12,6 @@ using megamoe::cuda::persistent_v3::backward::WorkQueues;
 constexpr std::uint32_t kNoMblock = ~0U;
 constexpr std::uint32_t kNoTask = ~0U;
 constexpr std::uint32_t kTerminalTask = ~1U;
-constexpr unsigned long long kPreparingDispatchPhase = 5ULL;
 constexpr std::uint32_t kDabRowsPerMblock = backward_tuning::kTileM;
 constexpr std::uint32_t kDabRowsPerTask =
     backward_tuning::kEpilogueRowsPerTask;
@@ -132,12 +131,12 @@ __device__ __forceinline__ void initialize_status(
   status->gin_return_payload_bytes = 0ULL;
 }
 
-__device__ __forceinline__ std::uint32_t claim_dispatch_if_ready(
+__device__ __forceinline__ void publish_dispatch_if_ready(
     const BackwardKernelArgs &a, unsigned long long *words,
     const megamoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
         &layout) {
   if (a.mblocks == 0U)
-    return kNoMblock;
+    return;
   auto *cursor = reinterpret_cast<PaddedCounter *>(words + layout.dispatch_scan);
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> scan(
       cursor->value);
@@ -146,51 +145,19 @@ __device__ __forceinline__ std::uint32_t claim_dispatch_if_ready(
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> phase(
       words[layout.phase + mblock]);
   if (phase.load(::cuda::memory_order_acquire) != 0ULL)
-    return kNoMblock;
+    return;
   const auto *descriptors = reinterpret_cast<const BackwardMblockDescriptor *>(
       words + layout.descriptors);
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> arrived(
       words[layout.dispatch_arrived + mblock]);
   if (arrived.load(::cuda::memory_order_acquire) !=
       descriptors[mblock].valid_rows)
-    return kNoMblock;
+    return;
   auto expected = 0ULL;
-  if (!phase.compare_exchange_strong(expected, kPreparingDispatchPhase,
+  if (!phase.compare_exchange_strong(expected, 1ULL,
                                      ::cuda::memory_order_acq_rel,
                                      ::cuda::memory_order_relaxed))
-    return kNoMblock;
-  return mblock;
-}
-
-__device__ __forceinline__ void zero_dispatch_padding(
-    const BackwardKernelArgs &a, const BackwardMblockDescriptor &descriptor) {
-  constexpr std::uint32_t kBf16PerVector =
-      sizeof(uint4) / sizeof(transport::BFloat16);
-  constexpr std::uint32_t kWarps = backward_tuning::kComputeThreads / 32U;
-  const auto warp = threadIdx.x / 32U;
-  const auto lane = threadIdx.x & 31U;
-  auto *padded_dr = peer_at<transport::BFloat16>(a.local_base,
-                                                 a.padded_dr_offset);
-  const auto x_vectors = a.hidden / kBf16PerVector;
-  for (std::uint32_t row = descriptor.valid_rows + warp;
-       row < backward_tuning::kTileM;
-       row += kWarps) {
-    const auto padded_row = descriptor.padded_row + row;
-    auto *target_dr = reinterpret_cast<uint4 *>(
-        padded_dr + static_cast<std::uint64_t>(padded_row) * a.hidden);
-    for (std::uint64_t vector = lane; vector < x_vectors; vector += 32ULL)
-      target_dr[vector] = uint4{};
-  }
-}
-
-__device__ __forceinline__ void publish_dispatched_mblock(
-    const BackwardKernelArgs &a, unsigned long long *words,
-    const megamoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
-        &layout,
-    std::uint32_t mblock) {
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> phase(
-      words[layout.phase + mblock]);
-  phase.store(1ULL, ::cuda::memory_order_release);
+    return;
   auto dab = make_dab_domain(a, words, layout);
   const auto du_tiles =
       static_cast<std::uint32_t>(a.intermediate /
@@ -331,7 +298,6 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
       (a.use_gin ? backward_tuning::kRdmaCtas : 0U);
   (void)reservation;
   __shared__ unsigned long long route_shared;
-  __shared__ std::uint32_t dispatch_ready_mblock_shared;
   __shared__ std::uint32_t return_mblock_shared;
   __shared__ std::uint32_t stop_shared;
   __shared__ std::uint32_t progressed_shared;
@@ -410,7 +376,7 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
               destination_row / backward_tuning::kTileM);
           const auto token = route / a.dispatch.identity.top_k;
           auto *destination_dr = peer_at<transport::BFloat16>(
-              a.peer_bases[destination], a.padded_dr_offset);
+              a.peer_bases[destination], a.compact_dr_offset);
           auto *warp_storage = reinterpret_cast<std::byte *>(reservation) +
                                static_cast<std::size_t>(warp) * copy_bytes;
           auto &full = dispatch_full[warp];
@@ -420,7 +386,8 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
               ::cuda::device::barrier_arrive_tx(full, 1U, copy_bytes);
           full.wait(static_cast<decltype(token_barrier) &&>(token_barrier));
           ::cuda::device::experimental::cp_async_bulk_shared_to_global(
-              destination_dr + destination_row * a.hidden, warp_storage,
+              destination_dr + compact_destination_row * a.hidden,
+              warp_storage,
               copy_bytes);
           ::cuda::device::experimental::cp_async_bulk_commit_group();
           ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
@@ -481,24 +448,7 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
 #endif
 
     if (threadIdx.x == 0U)
-      dispatch_ready_mblock_shared = claim_dispatch_if_ready(a, words, layout);
-    __syncthreads();
-    if (dispatch_ready_mblock_shared != kNoMblock) {
-      const auto *descriptors =
-          reinterpret_cast<const BackwardMblockDescriptor *>(
-              words + layout.descriptors);
-      const auto descriptor = descriptors[dispatch_ready_mblock_shared];
-      if (descriptor.valid_rows != backward_tuning::kTileM) {
-        zero_dispatch_padding(a, descriptor);
-        __threadfence();
-      }
-      __syncthreads();
-      if (threadIdx.x == 0U) {
-        publish_dispatched_mblock(a, words, layout,
-                                  dispatch_ready_mblock_shared);
-        progressed_shared = 1U;
-      }
-    }
+      publish_dispatch_if_ready(a, words, layout);
     __syncthreads();
 
     if (threadIdx.x == 0U) {
@@ -793,7 +743,7 @@ backward_local_compute_kernel(
             a.local_base, a.recomputed_u_offset);
         backward_compute_detail::run_k_mn_tile_tma_store<
             DabTileN, kStorageTileN>(
-            dr_map, w2_map, u_store_map, descriptor.padded_row,
+            dr_map, w2_map, u_store_map, descriptor.compact_row,
             descriptor.expert * static_cast<std::uint32_t>(a.hidden),
             static_cast<std::uint32_t>(a.hidden), du, a.intermediate,
             descriptor.padded_row, tile * DabTileN, storage,
@@ -923,13 +873,15 @@ backward_local_compute_kernel(
           a.local_base, a.padded_expert_offsets_offset);
       const auto reduction_rows = static_cast<std::uint32_t>(
           words[layout.dw_reduction_rows + owner]);
+      const auto compact_reduction_start = static_cast<std::uint32_t>(
+          a.dispatch.expert_row_prefix[owner]);
       auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
       if (task_count_shared > 1U) {
         backward_compute_detail::run_mn_mn_chunk<
             backward_tuning::kDwTileM, DwTileN, kStorageTileN>(
             dr_mn_map, u_mn_map, dw2_store_map, tile,
             task_count_shared, kDw2NTiles,
-            static_cast<std::uint32_t>(padded_offsets[owner]),
+            compact_reduction_start,
             static_cast<std::uint32_t>(padded_offsets[owner]),
             reduction_rows,
             static_cast<std::uint32_t>(a.intermediate),
@@ -944,7 +896,7 @@ backward_local_compute_kernel(
             dr_mn_map, u_mn_map,
             current_m_tile * backward_tuning::kDwTileM,
             current_n_tile * DwTileN,
-            static_cast<std::uint32_t>(padded_offsets[owner]),
+            compact_reduction_start,
             static_cast<std::uint32_t>(padded_offsets[owner]),
             reduction_rows, dw2,
             a.intermediate,

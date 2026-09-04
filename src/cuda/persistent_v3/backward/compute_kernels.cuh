@@ -338,14 +338,15 @@ __device__ __forceinline__ void run_k_mn_tile(
     const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
     std::uint32_t activation_row, std::uint32_t weight_reduction_start,
     std::uint32_t reduction, transport::BFloat16 *output,
-    std::uint64_t output_width, std::uint32_t output_column,
+    std::uint64_t output_width, std::uint32_t output_row,
+    std::uint32_t output_column,
     unsigned char *storage, std::uint32_t &pipeline) {
   run_wgmma_tile<kStageM, TileN, StorageTileN, cute::UMMA::Major::K,
                  cute::UMMA::Major::MN, false, kActivationStages, 0U, 0U>(
       activation_map, weight_mn_map, activation_map, activation_row,
       output_column, 0U,
       weight_reduction_start, reduction, output, output_width,
-      activation_row, output_column, storage, pipeline);
+      output_row, output_column, storage, pipeline);
 }
 
 template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN>
@@ -550,13 +551,17 @@ backward_du_wgmma_kernel(
   const auto expert = backward_compute_detail::find_padded_expert(a, row);
   if (expert >= a.dispatch.sizes.owned_expert_count)
     return;
+  const auto *padded_offsets = peer_at<const unsigned long long>(
+      a.local_base, a.padded_expert_offsets_offset);
+  const auto compact_row = a.dispatch.expert_row_prefix[expert] +
+                           row - padded_offsets[expert];
   auto *du = peer_at<transport::BFloat16>(a.local_base,
                                           a.recomputed_u_offset);
   backward_compute_detail::run_k_mn_tile<TileN>(
-      dr_map, w2_map, static_cast<std::uint32_t>(row),
+      dr_map, w2_map, static_cast<std::uint32_t>(compact_row),
       static_cast<std::uint32_t>(expert * a.hidden),
       static_cast<std::uint32_t>(a.hidden), du, a.intermediate,
-      ntile * TileN, storage, pipeline);
+      static_cast<std::uint32_t>(row), ntile * TileN, storage, pipeline);
 #else
   (void)a;
   (void)dr_map;
@@ -588,7 +593,7 @@ backward_dx_wgmma_kernel(
       dab_map, w1_map, static_cast<std::uint32_t>(row),
       static_cast<std::uint32_t>(expert * 2ULL * a.intermediate),
       static_cast<std::uint32_t>(2ULL * a.intermediate), dx, a.hidden,
-      ntile * TileN, storage, pipeline);
+      static_cast<std::uint32_t>(row), ntile * TileN, storage, pipeline);
 #else
   (void)a;
   (void)dab_map;

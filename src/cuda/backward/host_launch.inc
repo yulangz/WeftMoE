@@ -280,7 +280,9 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   }
   args.canonical_gate_offset = layout.canonical_gates;
   args.cached_ab_offset = layout.forward_ab_cache;
-  args.padded_dr_offset = layout.backward_padded_dr;
+  // FC2 output is dead after Forward reduction. Reuse its compact plane for
+  // the reverse dY dispatch instead of allocating and filling padded dR.
+  args.compact_dr_offset = layout.forward_training_output;
   args.recomputed_u_offset = layout.backward_u;
   args.dab_offset = layout.backward_dab_rows;
   args.dx_rows_offset = layout.backward_dx_rows;

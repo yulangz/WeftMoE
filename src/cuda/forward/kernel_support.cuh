@@ -581,11 +581,11 @@ struct Layout {
   std::size_t forward_training_output = 0;
   // The immutable compact X/A/B checkpoint stays intact across repeated
   // Backward executions. Its compute directory pads every expert independently
-  // to 128 rows, so all padded tensors use a capacity larger than compact
-  // Forward storage by at most 127 rows per owned expert. dX remains disjoint
-  // from dR so its M-blocks may return while dW2 still consumes dR.
+  // to 128 rows, so mutable padded tensors use a capacity larger than compact
+  // Forward storage by at most 127 rows per owned expert. The dead compact
+  // Forward output plane is reused for dR. dX remains disjoint so its M-blocks
+  // may return while dW2 still consumes dR.
   std::uint64_t backward_padded_capacity_rows = 0;
-  std::size_t backward_padded_dr = 0;
   std::size_t backward_u = 0;
   std::size_t backward_dab_rows = 0;
   std::size_t backward_dx_rows = 0;
@@ -928,11 +928,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       const auto backward_padded_elements = checked_mul(
           layout.backward_padded_capacity_rows,
           config.max_intermediate_size, "backward padded elements");
-      layout.backward_padded_dr = append(
-          cursor,
-          checked_mul(layout.backward_padded_capacity_rows,
-                      config.max_hidden_size, "backward padded dR elements"),
-          sizeof(transport::BFloat16), "backward padded dR");
       layout.backward_u = append(
           cursor, backward_padded_elements, sizeof(transport::BFloat16),
           "backward padded U");

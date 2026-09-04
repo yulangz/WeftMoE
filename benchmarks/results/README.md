@@ -63,6 +63,9 @@ The current records are:
 - [`backward_compact_cache_20260904.json`](backward_compact_cache_20260904.json),
   direct compact retained-state consumption, first-Backward and repeated-handle
   timing boundaries, workspace reduction, and independent PyTorch accuracy.
+- [`backward_compact_dr_20260904.json`](backward_compact_dr_20260904.json),
+  compact dR reuse of dead Forward output storage, reproducible zero-warmup
+  timing, one-/two-node performance, and unchanged independent accuracy.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

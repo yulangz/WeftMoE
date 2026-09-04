@@ -343,3 +343,34 @@ X/A/B values measured maximum absolute errors of 3.43e-5 for dX, 1.34e-7 for
 dGate, 3.05e-5 for dW1, and zero for dW2.  Five-repeat top-k 1/6 world-8 and
 actual two-node top-k-6 runs remained byte-stable.  Compact evidence is in
 [`benchmarks/results/backward_compact_cache_20260904.json`](../benchmarks/results/backward_compact_cache_20260904.json).
+
+## Backward compact dR reuse
+
+The subsequent step also removes padded dR. Once Forward's expert FC2 output
+has been reduced back to source tokens, that compact output plane is dead;
+Backward now reuses it as the dR dispatch destination. dU reads compact dR and
+writes padded U with independent TMA row origins. dW2 similarly uses a compact
+dR K origin and a padded U K origin. Arrival counters, M128 task identity,
+queue priority, Relay/RDMA ownership, and FULL return are unchanged. The
+previous per-Mblock dR padding clear and its temporary phase are gone.
+
+Three zero-warmup world-8 pairs improved the first-Backward kernel total from
+24.9984 to 23.7016 ms (5.19%) and wall time from 25.5910 to 24.2918 ms
+(5.08%). This is another 0.81% beyond direct compact X/A/B consumption. One
+actual two-node GIN first-Backward run measured 26.7819 ms, 9.96% below the
+original 29.7431 ms padded-cache path and 1.58% below the compact-X/A/B-only
+point. The corresponding retained-state Megatron speedups are 1.273x and
+1.607x.
+
+The synthetic repeated-handle boundary no longer regresses: two world-8 runs
+averaged 25.2687 ms, within 0.03% of the 25.2739 ms qualified predecessor;
+world 16 measured 27.6354 ms, 0.13% faster than its 27.6718 ms predecessor.
+World-8 workspace is now 12,812,678,776 bytes per GPU, 2.42 GiB below the
+original padded-cache implementation. The compute kernel remains at 168
+registers and 56 stack bytes, so producer-only K-origin code generation is
+still a valid follow-up independent of the retained layout.
+
+Top-k 1/6 world-8 and actual two-node GIN five-repeat checks were byte-stable.
+The independent PyTorch oracle reproduced the same error bounds as the
+compact-X/A/B milestone, including byte-exact dW2. Compact evidence is in
+[`benchmarks/results/backward_compact_dr_20260904.json`](../benchmarks/results/backward_compact_dr_20260904.json).

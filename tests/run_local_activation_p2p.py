@@ -271,6 +271,7 @@ def main():
     parser.add_argument("--backward-validation", action="store_true")
     parser.add_argument("--backward-benchmark", action="store_true")
     parser.add_argument("--backward-tokens", type=int)
+    parser.add_argument("--backward-warmups", type=int)
     parser.add_argument("--backward-output-dir")
     parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
@@ -294,6 +295,17 @@ def main():
                         (110 if benchmark_mode else 1)))
     if benchmark_mode and not args.backward_benchmark and args.rounds <= 10:
         parser.error("--benchmark requires more than 10 total rounds")
+    if args.backward_warmups is not None and not (
+            args.backward_validation or args.backward_benchmark):
+        parser.error("--backward-warmups requires a Backward mode")
+    backward_warmups = args.backward_warmups
+    if backward_warmups is None:
+        backward_warmups = 0 if args.backward_validation else 10
+    if backward_warmups < 0 or (
+            args.backward_benchmark and backward_warmups >= args.rounds):
+        parser.error(
+            "Backward warmups must be non-negative and leave a measured round"
+        )
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
     environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
@@ -305,8 +317,7 @@ def main():
         environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
     elif args.backward_validation or args.backward_benchmark:
         environment["MEGAMOE_BACKWARD_ROUNDS"] = str(args.rounds)
-        environment["MEGAMOE_BACKWARD_WARMUPS"] = (
-            "0" if args.backward_validation else "10")
+        environment["MEGAMOE_BACKWARD_WARMUPS"] = str(backward_warmups)
         if args.backward_tokens is not None:
             if args.backward_tokens <= 0:
                 parser.error("--backward-tokens must be positive")
@@ -517,7 +528,7 @@ def main():
                           "transport", "dispatch", "dab", "dx",
                           "dw2", "dw1", "combine",
                           "dw_combine_overlap")
-            measured = args.rounds - 10
+            measured = args.rounds - backward_warmups
             for rank, item in enumerate(observed):
                 if item["mode"] != "benchmark":
                     raise AssertionError(
@@ -548,7 +559,7 @@ def main():
                 "schema": 1,
                 "benchmark": "cached-x-ab-local-backward-pipeline",
                 "world": args.world,
-                "warmup": 10,
+                "warmup": backward_warmups,
                 "measured": measured,
                 "shape": {"tokens_per_rank": args.backward_tokens or 8192,
                           "hidden": 7168, "intermediate": 3072,

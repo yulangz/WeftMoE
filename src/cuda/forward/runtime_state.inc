@@ -1589,10 +1589,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
               "Forward training output");
         if (config.enable_backward_state) {
           slot.backward_dr_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_padded_dr),
-              config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows,
-              backward_tuning::kTileM, "Backward padded dR",
+              at<void>(slot.device, state->layout.forward_training_output),
+              config.max_hidden_size, config.max_destination_rows_per_rank,
+              backward_tuning::kTileM, "Backward compact dR",
               backward_tuning::kTileK);
           slot.backward_dab_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dab_rows),
@@ -1601,10 +1600,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
               backward_tuning::kTileM, "Backward padded dAB",
               backward_tuning::kTileK);
           slot.backward_dr_mn_map = make_bf16_tma_map_mn(
-              at<void>(slot.device, state->layout.backward_padded_dr),
-              config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dW2 dR MN-major");
+              at<void>(slot.device, state->layout.forward_training_output),
+              config.max_hidden_size, config.max_destination_rows_per_rank,
+              "Backward compact dW2 dR MN-major");
           slot.backward_u_mn_map = make_bf16_tma_map_mn(
               at<void>(slot.device, state->layout.backward_u),
               config.max_intermediate_size,

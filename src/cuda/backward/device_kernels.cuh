@@ -30,16 +30,13 @@ __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
     return;
   const auto destination = a.dispatch.route_dst_rank[route];
   const auto compact_destination_row = a.dispatch.route_dst_row[route];
-  const auto *compact_to_padded = peer_at<const unsigned int>(
-      a.peer_bases[destination], a.compact_to_padded_offset);
-  const auto destination_row = compact_to_padded[compact_destination_row];
   const auto token = route / a.dispatch.identity.top_k;
   auto *destination_dr = peer_at<transport::BFloat16>(
-      a.peer_bases[destination], a.padded_dr_offset);
+      a.peer_bases[destination], a.compact_dr_offset);
   const auto *source = reinterpret_cast<const uint4 *>(
       a.dy + token * a.hidden);
   auto *target = reinterpret_cast<uint4 *>(
-      destination_dr + destination_row * a.hidden);
+      destination_dr + compact_destination_row * a.hidden);
   const auto vectors = a.hidden / 8ULL;
   for (std::uint64_t vector = threadIdx.x; vector < vectors;
        vector += blockDim.x)

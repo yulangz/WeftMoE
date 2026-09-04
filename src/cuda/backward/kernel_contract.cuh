@@ -44,7 +44,7 @@ struct BackwardKernelArgs {
   std::uint64_t gin_return_row_bytes = 0;
   std::size_t canonical_gate_offset = 0;
   std::size_t cached_ab_offset = 0;
-  std::size_t padded_dr_offset = 0;
+  std::size_t compact_dr_offset = 0;
   std::size_t recomputed_u_offset = 0;
   std::size_t dab_offset = 0;
   std::size_t dx_rows_offset = 0;

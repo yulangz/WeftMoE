@@ -38,8 +38,9 @@ retain the immutable Dispatch context, canonical compact `X`, canonical
 compact gates, and its compact `A/B` checkpoints. It must also keep Forward
 output storage separate from canonical `X`; the inference-only alias that
 overwrites `X` cannot be used by Backward. `S`, `U`, and FC2 output are not
-retained across Forward/Backward. Backward consumes these retained buffers in
-place; it does not first copy them into a second padded cache.
+needed as Backward inputs. After Forward return reduction, the dead compact
+FC2-output plane is reused as compact `dR` storage. Backward consumes retained
+X/A/B/gates in place; it does not first copy them into a second padded cache.
 
 The `A/B` checkpoint precision is part of the numeric contract, not merely a
 storage choice. Forward now rounds both projections to BF16 before SwiGLU and
@@ -65,23 +66,23 @@ epilogue avoids extending every WGMMA task with the long dependency chain of
 SwiGLU recomputation; a fused experiment regressed both local and two-node
 latency and was removed.
 
-Dependency ranges and mutable gradient workspaces are physically padded to
-128 rows. Retained `X`, A/B, and gates stay in Forward's compact canonical
-layout. Padding rows are zero in `dR`, `U`, `dAB`, and the generated `dX`, so
-the GEMM inner loops do not need divergent tail handling. The Relay/RDMA
-dispatch claimant zeros only the invalid dR rows of a newly complete M-block,
-then publishes that individual M-block; this is a local release edge rather
-than a rank-wide preparation phase.
+Dependency M-blocks and mutable `U`, `dAB`, and `dX` workspaces are physically
+padded to 128 rows. Retained `X`, A/B, and gates stay in Forward's compact
+canonical layout, and dY dispatch writes dR into the reused compact
+FC2-output plane. Padding rows are explicitly zero in `U`, `dAB`, and the
+generated `dX`, so the GEMM inner loops do not need divergent tail handling.
+Relay/RDMA publishes an individual M-block as soon as all of its valid compact
+dR rows arrive; there is no padding clear or rank-wide preparation phase.
 
 A 128-row dependency M-block remains the canonical identity even if
 autotuning chooses an internal M64 compute tile. The setup kernel separately
 precomputes each expert's dW reduction extent as the valid row count rounded up
 to the 64-row WGMMA K tile. dW therefore skips a final all-zero 64-row K stage
-when the physical 128-row padding does not require it. dW2 uses padded dR and U
-origins. dW1 supplies independent TMA K origins for padded dAB and compact X;
-its explicitly zero dAB tail masks the compact-X rows beyond the expert's
-valid extent. Storage readiness and M-block identity remain padded to 128
-without allocating padded X or A/B replicas.
+when the physical 128-row padding does not require it. dW2 supplies independent
+TMA K origins for compact dR and padded U; dW1 does the same for padded dAB and
+compact X. The explicitly zero padded operand masks compact rows beyond each
+expert's valid extent. Storage readiness and M-block identity remain padded to
+128 without allocating padded X, A/B, or dR replicas.
 
 ## Four logical work queues
 
