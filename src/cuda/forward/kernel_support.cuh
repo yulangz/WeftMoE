@@ -585,8 +585,6 @@ struct Layout {
   // Forward storage by at most 127 rows per owned expert. dX remains disjoint
   // from dR so its M-blocks may return while dW2 still consumes dR.
   std::uint64_t backward_padded_capacity_rows = 0;
-  std::size_t backward_padded_x = 0;
-  std::size_t backward_padded_ab = 0;
   std::size_t backward_padded_dr = 0;
   std::size_t backward_u = 0;
   std::size_t backward_dab_rows = 0;
@@ -930,15 +928,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       const auto backward_padded_elements = checked_mul(
           layout.backward_padded_capacity_rows,
           config.max_intermediate_size, "backward padded elements");
-      layout.backward_padded_x = append(
-          cursor,
-          checked_mul(layout.backward_padded_capacity_rows,
-                      config.max_hidden_size, "backward padded X elements"),
-          sizeof(transport::BFloat16), "backward padded X");
-      layout.backward_padded_ab = append(
-          cursor, checked_mul(backward_padded_elements, 2ULL,
-                              "backward padded A/B elements"),
-          sizeof(transport::BFloat16), "backward padded A/B");
       layout.backward_padded_dr = append(
           cursor,
           checked_mul(layout.backward_padded_capacity_rows,

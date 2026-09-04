@@ -398,7 +398,6 @@ struct DeviceForwardHandle::Impl {
   mutable std::vector<std::uint32_t> backward_compact_to_padded;
   mutable std::uint64_t backward_padded_rows = 0;
   mutable bool backward_plan_uploaded = false;
-  mutable bool backward_cache_packed = false;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;
@@ -1617,10 +1616,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
               state->layout.backward_padded_capacity_rows,
               "Backward dW1 dAB MN-major");
           slot.backward_x_mn_map = make_bf16_tma_map_mn(
-              at<void>(slot.device, state->layout.backward_padded_x),
-              config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dW1 X MN-major");
+              at<void>(slot.device, state->layout.canonical_rows),
+              config.max_hidden_size, config.max_destination_rows_per_rank,
+              "Backward compact dW1 X MN-major");
           slot.backward_u_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_u),
               config.max_intermediate_size,

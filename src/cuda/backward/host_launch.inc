@@ -278,11 +278,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         pool->gin_layout.return_fragment_ready;
     args.gin_return_row_bytes = pool->gin_layout.backward_return_row_bytes;
   }
-  args.canonical_x_offset = layout.canonical_rows;
   args.canonical_gate_offset = layout.canonical_gates;
   args.cached_ab_offset = layout.forward_ab_cache;
-  args.padded_x_offset = layout.backward_padded_x;
-  args.padded_ab_offset = layout.backward_padded_ab;
   args.padded_dr_offset = layout.backward_padded_dr;
   args.recomputed_u_offset = layout.backward_u;
   args.dab_offset = layout.backward_dab_rows;
@@ -423,21 +420,6 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward start");
   if (view.sizes.owned_expert_count != 0U) {
-    if (!retained.backward_cache_packed) {
-      backward_pack_cached_state_kernel<<<
-          view.sizes.owned_expert_count * backward_tuning::kCachePackChunks,
-          backward_tuning::kCacheThreads, 0, transport_stream>>>(
-          args, backward_tuning::kCachePackChunks);
-      retained.backward_cache_packed = true;
-    } else {
-      backward_pack_gate_kernel<<<view.sizes.owned_expert_count,
-                                  backward_tuning::kCacheThreads, 0,
-                                  transport_stream>>>(args);
-    }
-    internal::throw_cuda(
-        "backward-run", cudaGetLastError(), identity.rank, identity.world,
-        "backward", identity.generation, ExchangeKind::ExpertCounts,
-        "materialize immutable Backward cache and per-run gates");
     // Every active expert writes every dW tile.  The dense training shape has
     // no inactive expert, so clearing several GiB immediately before those
     // stores is pure HBM traffic.  Sparse fixtures retain the full clear to
@@ -475,7 +457,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "backward-run", cudaEventRecord(slot.forward_roles_ready,
                                        transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "publish Backward cached rows");
+      ExchangeKind::ExpertCounts, "publish Backward launch prerequisites");
   internal::throw_cuda(
       "backward-run",
       cudaEventRecord(slot.backward_compute_start, transport_stream),

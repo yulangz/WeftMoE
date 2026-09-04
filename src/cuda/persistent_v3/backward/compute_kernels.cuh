@@ -371,7 +371,8 @@ template <std::uint32_t TileM, std::uint32_t TileN,
 __device__ __forceinline__ void run_mn_mn_tile(
     const CUtensorMap &left_map, const CUtensorMap &right_map,
     std::uint32_t output_row, std::uint32_t output_column,
-    std::uint32_t reduction_start, std::uint32_t reduction,
+    std::uint32_t left_reduction_start,
+    std::uint32_t right_reduction_start, std::uint32_t reduction,
     transport::BFloat16 *output, std::uint64_t output_width,
     std::uint32_t global_output_row, const CUtensorMap &output_store_map,
     unsigned char *storage,
@@ -383,7 +384,8 @@ __device__ __forceinline__ void run_mn_mn_tile(
                  WaitPreviousStore,
                  WaitCurrentStore>(
       left_map, right_map, output_store_map, output_row, output_column,
-      reduction_start, reduction_start, reduction, output, output_width,
+      left_reduction_start, right_reduction_start, reduction, output,
+      output_width,
       global_output_row, output_column, storage, pipeline);
 }
 
@@ -398,7 +400,8 @@ __device__ __forceinline__ void run_mn_mn_chunk(
     const CUtensorMap &left_map, const CUtensorMap &right_map,
     const CUtensorMap &output_store_map, std::uint32_t first_tile,
     std::uint32_t tile_count, std::uint32_t n_tiles,
-    std::uint32_t reduction_start, std::uint32_t reduction,
+    std::uint32_t left_reduction_start,
+    std::uint32_t right_reduction_start, std::uint32_t reduction,
     std::uint32_t output_width, std::uint32_t output_owner_row,
     unsigned char *storage, std::uint32_t &pipeline) {
   using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
@@ -435,13 +438,14 @@ __device__ __forceinline__ void run_mn_mn_chunk(
         auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
             smem + stage * kStageStorageElements);
         auto *stage_b = stage_a + kAStageElements;
-        const auto k = reduction_start + iteration * kStageK;
+        const auto left_k = left_reduction_start + iteration * kStageK;
+        const auto right_k = right_reduction_start + iteration * kStageK;
         deep_gemm::tma::copy<TileM, kStageK, 128,
                              cutlass::bfloat16_t>(
-            &left_map, &full[stage], stage_a, m_tile * TileM, k);
+            &left_map, &full[stage], stage_a, m_tile * TileM, left_k);
         deep_gemm::tma::copy<TileN, kStageK, 128,
                              cutlass::bfloat16_t>(
-            &right_map, &full[stage], stage_b, n_tile * TileN, k);
+            &right_map, &full[stage], stage_b, n_tile * TileN, right_k);
         full[stage].arrive_and_expect_tx(
             (kAStageElements + kBStageElements) *
             sizeof(transport::BFloat16));

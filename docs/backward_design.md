@@ -34,10 +34,12 @@ dW2    = dR^T * U
 ```
 
 There is no FC1 recomputation. A training-enabled Forward specialization must
-retain the immutable Dispatch context, canonical `X`, canonical gates, and its
-`A/B` checkpoints. It must also keep Forward output storage separate from
-canonical `X`; the inference-only alias that overwrites `X` cannot be used by
-Backward. `S`, `U`, and FC2 output are not retained across Forward/Backward.
+retain the immutable Dispatch context, canonical compact `X`, canonical
+compact gates, and its compact `A/B` checkpoints. It must also keep Forward
+output storage separate from canonical `X`; the inference-only alias that
+overwrites `X` cannot be used by Backward. `S`, `U`, and FC2 output are not
+retained across Forward/Backward. Backward consumes these retained buffers in
+place; it does not first copy them into a second padded cache.
 
 The `A/B` checkpoint precision is part of the numeric contract, not merely a
 storage choice. Forward now rounds both projections to BF16 before SwiGLU and
@@ -51,10 +53,11 @@ The activation path deliberately uses two dependency-local task types:
 
 1. `(expert, M-block, intermediate-N tile)` TMA/WGMMA tasks materialize BF16
    `dU = dR * W2` into the reusable U workspace;
-2. after all N tiles for that M-block complete, warp-row epilogue tasks load
-   cached A/B and the FP32 gate, recompute S, write BF16 dA/dB, reduce dGate in
-   a fixed column order, and overwrite the temporary dU row with the exact
-   BF16 `U = gate * S` consumed by dW2.
+2. after all N tiles for that M-block complete, warp-row epilogue tasks map the
+   padded output row back to its compact canonical row, load cached A/B and the
+   FP32 gate directly, recompute S, write padded BF16 dA/dB, reduce dGate in a
+   fixed column order, and overwrite the temporary dU row with the exact BF16
+   `U = gate * S` consumed by dW2.
 
 The dU buffer is phase-local rather than retained state. No FP32 atomics or
 cross-CTA dGate partial reduction are used. Splitting the GEMM and scalar
@@ -62,15 +65,23 @@ epilogue avoids extending every WGMMA task with the long dependency chain of
 SwiGLU recomputation; a fused experiment regressed both local and two-node
 latency and was removed.
 
-All expert row ranges are physically padded to 128. Padding rows are zero in
-`X`, `dR`, `A/B`, `U`, and `dAB`, so the GEMM inner loops do not need
-divergent tail handling. A 128-row dependency M-block remains the canonical
-identity even if autotuning chooses an internal M64 compute tile. The setup
-kernel separately precomputes each expert's dW reduction extent as the valid
-row count rounded up to the 64-row WGMMA K tile. dW therefore skips a final
-all-zero 64-row K stage when the physical 128-row padding does not require it;
-storage addresses, readiness accounting, and M-block identity remain padded
-to 128.
+Dependency ranges and mutable gradient workspaces are physically padded to
+128 rows. Retained `X`, A/B, and gates stay in Forward's compact canonical
+layout. Padding rows are zero in `dR`, `U`, `dAB`, and the generated `dX`, so
+the GEMM inner loops do not need divergent tail handling. The Relay/RDMA
+dispatch claimant zeros only the invalid dR rows of a newly complete M-block,
+then publishes that individual M-block; this is a local release edge rather
+than a rank-wide preparation phase.
+
+A 128-row dependency M-block remains the canonical identity even if
+autotuning chooses an internal M64 compute tile. The setup kernel separately
+precomputes each expert's dW reduction extent as the valid row count rounded up
+to the 64-row WGMMA K tile. dW therefore skips a final all-zero 64-row K stage
+when the physical 128-row padding does not require it. dW2 uses padded dR and U
+origins. dW1 supplies independent TMA K origins for padded dAB and compact X;
+its explicitly zero dAB tail masks the compact-X rows beyond the expert's
+valid extent. Storage readiness and M-block identity remain padded to 128
+without allocating padded X or A/B replicas.
 
 ## Four logical work queues
 

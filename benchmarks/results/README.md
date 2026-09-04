@@ -60,6 +60,9 @@ The current records are:
 - [`backward_deferred_dw_store_20260904.json`](backward_deferred_dw_store_20260904.json),
   the resource-neutral dW TMA-store overlap across scheduler task boundaries,
   paired one-/two-node timing, and terminal-drain correctness evidence.
+- [`backward_compact_cache_20260904.json`](backward_compact_cache_20260904.json),
+  direct compact retained-state consumption, first-Backward and repeated-handle
+  timing boundaries, workspace reduction, and independent PyTorch accuracy.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

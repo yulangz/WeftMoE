@@ -71,8 +71,6 @@ PARAMETER_MACROS = {
     "gin_max_inflight": "MEGAMOE_BWD_GIN_MAX_INFLIGHT",
     "setup_threads": "MEGAMOE_BWD_SETUP_THREADS",
     "setup_idle_nanosleep": "MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP",
-    "cache_threads": "MEGAMOE_BWD_CACHE_THREADS",
-    "cache_pack_chunks": "MEGAMOE_BWD_CACHE_PACK_CHUNKS",
     "queue_idle_nanosleep": "MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP",
     "ready_word_stagger": "MEGAMOE_BWD_READY_WORD_STAGGER",
     "activation_owner_group": "MEGAMOE_BWD_ACTIVATION_OWNER_GROUP",
@@ -170,9 +168,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require_choice(config, "relay_ctas", (8, 12, 16, 20, 24))
     require_choice(config, "dispatch_batch_rows", (12, 16, 32, 64, 128))
     require_choice(config, "gin_max_inflight", (8, 16, 24, 32, 64))
-    for key in ("setup_threads", "cache_threads", "reduce_threads"):
+    for key in ("setup_threads", "reduce_threads"):
         require_choice(config, key, (128, 256, 384, 512))
-    require_choice(config, "cache_pack_chunks", (1, 2, 4, 8, 16))
     require_choice(config, "ready_word_stagger", (0, 1))
     require_choice(config, "activation_owner_group", (1, 2, 4, 8, 16, 32))
     require_choice(config, "epilogue_rows_per_task",

@@ -308,3 +308,38 @@ topologies agree and the policy has no resource or protocol cost.  Five-repeat
 top-k 1/6 local and actual two-node top-k 6 validation stayed byte-stable.
 Compact evidence is in
 [`benchmarks/results/backward_deferred_dw_store_20260904.json`](../benchmarks/results/backward_deferred_dw_store_20260904.json).
+
+## Backward compact retained-state consumption
+
+The retained Forward X and A/B checkpoints are now consumed directly in their
+compact canonical layout.  The former first-Backward kernel copied roughly
+1.57 GiB per GPU into padded X/A/B replicas before any persistent work could
+start.  SwiGLU maps each padded output row to its compact input row, while dW1
+uses distinct TMA K origins for padded dAB and compact X.  Mutable dR/U/dAB/dX
+workspaces and dependency M-blocks remain padded to 128; a transport claimant
+zeros only the invalid dR tail before releasing that M-block.  There is no
+rank-wide cache-preparation barrier or `grid.sync()`.
+
+The meaningful training boundary is the first and only Backward associated
+with a retained Forward handle.  With zero BWD warmups, three order-paired
+world-8 runs improved kernel total from 25.0954 to 23.8962 ms (4.78%) and host
+wall from 25.7323 to 24.4642 ms (4.93%).  A two-node GIN run improved kernel
+total from 29.7431 to 27.2120 ms (8.51%) and host wall from 30.4845 to
+27.8534 ms (8.63%).  Against the retained-state Megatron device baselines,
+these kernel totals are 1.263x and 1.581x faster respectively.  Workspace fell
+from 15,411,181,176 to 13,722,154,616 bytes per GPU.
+
+Repeated Backward calls on the same Forward handle are useful for stability
+testing but are not a normal autograd lifetime.  That synthetic hot-cache
+boundary is approximately neutral on two nodes (+0.13%) and currently
+0.4--1.2% slower on one node because padding initialization moved onto the
+per-run dispatch wave and the split dW1 K origins increase stack use from 32
+to 56 bytes per thread.  Registers remain 168 and occupancy is unchanged.
+This cost is recorded rather than hidden and is the next code-generation and
+dR-layout optimization target.
+
+An independent PyTorch-autograd oracle built from the exact retained BF16
+X/A/B values measured maximum absolute errors of 3.43e-5 for dX, 1.34e-7 for
+dGate, 3.05e-5 for dW1, and zero for dW2.  Five-repeat top-k 1/6 world-8 and
+actual two-node top-k-6 runs remained byte-stable.  Compact evidence is in
+[`benchmarks/results/backward_compact_cache_20260904.json`](../benchmarks/results/backward_compact_cache_20260904.json).

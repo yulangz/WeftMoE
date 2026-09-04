@@ -66,9 +66,7 @@
       "dispatch_batch_rows": 64,
       "gin_max_inflight": 24,
       "setup_threads": 256,
-      "setup_idle_nanosleep": 128,
-      "cache_threads": 256,
-      "cache_pack_chunks": 4
+      "setup_idle_nanosleep": 128
     },
     "3_scheduler": {
       "queue_idle_nanosleep": 64,

@@ -1,0 +1,143 @@
+{
+  "schema": 1,
+  "description": "Consume retained Forward X/A/B directly in compact canonical storage and remove the first-Backward padded-cache materialization",
+  "tested_worktree_base_commit": "d3526aa",
+  "recorded_utc": "2026-09-04T21:03:45Z",
+  "hardware": "8x H200 per node (driver label NVIDIA L20X)",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "aggregation": "slowest rank per iteration"
+  },
+  "implementation": {
+    "retained_inputs": "compact canonical X, compact BF16 A/B, and compact FP32 gates",
+    "padded_mutable_rows": ["dR", "U", "dAB", "dX"],
+    "mblock_rows": 128,
+    "dw_reduction_rounding_rows": 64,
+    "dispatch_publication": "claim complete Mblock, zero only invalid dR rows, then release that Mblock",
+    "dw1_left_k_origin": "padded dAB expert offset",
+    "dw1_right_k_origin": "compact X expert prefix",
+    "rank_wide_prepare_barrier_added": false,
+    "grid_sync_added": false,
+    "communication_protocol_changed": false,
+    "removed_tuning_parameters": ["cache_threads", "cache_pack_chunks"],
+    "old_workspace_bytes_per_gpu": 15411181176,
+    "new_workspace_bytes_per_gpu": 13722154616,
+    "workspace_bytes_saved_per_gpu": 1689026560,
+    "workspace_gib_saved_per_gpu": 1.573029
+  },
+  "first_backward_boundary": {
+    "definition": "first and only Backward on a newly retained Forward handle; Forward is outside the timed region; zero BWD warmups",
+    "world8": {
+      "rdma_ctas_launched": 0,
+      "relay_ctas": 12,
+      "ordering": "three paired baseline/candidate process runs",
+      "baseline_total_ms_runs": [25.0363, 25.1462, 25.1037],
+      "candidate_total_ms_runs": [23.8284, 23.9861, 23.8740],
+      "baseline_total_mean_ms": 25.0954,
+      "candidate_total_mean_ms": 23.896167,
+      "total_reduction_ms": 1.199233,
+      "total_reduction_percent": 4.778698,
+      "baseline_wall_mean_ms": 25.7323,
+      "candidate_wall_mean_ms": 24.4642,
+      "wall_reduction_percent": 4.928048,
+      "old_cache_pack_prepare_ms_approx": 1.275,
+      "candidate_prepare_us": 3.04,
+      "megatron_device_mean_ms": 30.180962,
+      "speedup_over_megatron_device": 1.263004
+    },
+    "world16": {
+      "rdma_ctas": 8,
+      "relay_ctas": 16,
+      "transport": "actual two-node GIN",
+      "baseline_total_ms": 29.7431,
+      "candidate_total_ms": 27.2120,
+      "total_reduction_ms": 2.5311,
+      "total_reduction_percent": 8.509873,
+      "baseline_wall_ms": 30.4845,
+      "candidate_wall_ms": 27.8534,
+      "wall_reduction_percent": 8.630944,
+      "baseline_prepare_us": 2250.69,
+      "candidate_prepare_us": 3.392,
+      "candidate_compute_ms": 27.1979,
+      "candidate_transport_ms": 23.0587,
+      "candidate_dispatch_ms": 5.3433,
+      "candidate_combine_ms": 8.108,
+      "megatron_device_mean_ms": 43.033856,
+      "speedup_over_megatron_device": 1.581429
+    }
+  },
+  "repeated_handle_boundary": {
+    "definition": "ten warmups then repeated Backward on one retained Forward handle; diagnostic and stability boundary, not a normal autograd lifetime",
+    "world8_paired_earlier": {
+      "baseline_total_mean_ms_runs": [25.225274, 25.175049],
+      "candidate_total_mean_ms_runs": [25.239530, 25.371508],
+      "baseline_mean_ms": 25.200162,
+      "candidate_mean_ms": 25.305519,
+      "candidate_change_percent": 0.418082
+    },
+    "world8_final_binary": {
+      "measured_iterations_per_run": 100,
+      "candidate_total_mean_ms_runs": [25.396818, 25.383433],
+      "candidate_total_mean_ms": 25.390126,
+      "candidate_p50_ms_runs": [24.9186, 24.9259],
+      "candidate_p95_ms_runs": [27.2617, 27.7903]
+    },
+    "world16": {
+      "measured_iterations": 100,
+      "predecessor_total_mean_ms": 27.671762,
+      "candidate_total_mean_ms": 27.707934,
+      "candidate_change_percent": 0.130708,
+      "candidate_p50_ms": 27.3465,
+      "candidate_p95_ms": 29.5027
+    }
+  },
+  "compiled_resources": {
+    "compute_registers_per_thread": 168,
+    "compute_stack_bytes_per_thread": 56,
+    "compute_local_bytes_per_thread": 0,
+    "compute_static_shared_bytes": 2048,
+    "compute_dynamic_shared_bytes": 213104,
+    "transport_registers_per_thread": 70,
+    "transport_stack_bytes_per_thread": 8,
+    "transport_local_bytes_per_thread": 0,
+    "sass_instructions": 20756,
+    "hgmma_instructions": 72,
+    "dependency_barrier_instructions": 29,
+    "ldl_instructions": 26,
+    "stl_instructions": 12
+  },
+  "correctness": {
+    "world8_repeat_top_k": [1, 6],
+    "world8_repeats": 5,
+    "world16_repeat_top_k": [6],
+    "world16_repeats": 5,
+    "all_four_outputs_repeat_byte_identical": true,
+    "independent_oracle": "PyTorch autograd from exact cached BF16 X/A/B, world 8 top-k 6",
+    "max_abs_error": {
+      "dx": 0.000034332275390625,
+      "dgate": 0.0000001341104507446289,
+      "dw1": 0.000030517578125,
+      "dw2": 0.0
+    },
+    "relative_l2": {
+      "dx": 0.00008901684721830735,
+      "dgate": 0.00000023341493308771283,
+      "dw1": 0.000004139265754812277,
+      "dw2": 0.0
+    }
+  },
+  "rejected_precursors": [
+    "Relay CTA direct uint4 cache pack per Mblock: doubled dispatch to roughly 22 ms",
+    "all-Relay TMA row cache pack before publication: no repeatable first-Backward gain and harmed dispatch",
+    "four dedicated Relay cache CTAs with separate cache-ready state: regressed first-Backward to roughly 26.64 ms"
+  ],
+  "decision": {
+    "retained": true,
+    "reason": "One Backward per retained Forward is the training lifetime. Removing a mandatory 1.28-2.25 ms first-use copy materially improves both topologies and saves 1.57 GiB per GPU without a global synchronization or communication-protocol change.",
+    "follow_up": "Remove the 24-byte compute stack increase from split dW1 K origins and investigate compact dR consumption so per-run padding initialization leaves the dispatch wave."
+  }
+}

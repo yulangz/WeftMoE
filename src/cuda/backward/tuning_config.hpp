@@ -97,12 +97,6 @@
 #ifndef MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP
 #define MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP 128
 #endif
-#ifndef MEGAMOE_BWD_CACHE_THREADS
-#define MEGAMOE_BWD_CACHE_THREADS 256
-#endif
-#ifndef MEGAMOE_BWD_CACHE_PACK_CHUNKS
-#define MEGAMOE_BWD_CACHE_PACK_CHUNKS 4
-#endif
 #ifndef MEGAMOE_BWD_REDUCE_THREADS
 #define MEGAMOE_BWD_REDUCE_THREADS 256
 #endif
@@ -156,9 +150,6 @@ inline constexpr std::uint32_t kGinMaxInflight =
 inline constexpr std::uint32_t kSetupThreads = MEGAMOE_BWD_SETUP_THREADS;
 inline constexpr std::uint32_t kSetupIdleNanosleep =
     MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP;
-inline constexpr std::uint32_t kCacheThreads = MEGAMOE_BWD_CACHE_THREADS;
-inline constexpr std::uint32_t kCachePackChunks =
-    MEGAMOE_BWD_CACHE_PACK_CHUNKS;
 inline constexpr std::uint32_t kReduceThreads = MEGAMOE_BWD_REDUCE_THREADS;
 inline constexpr std::uint32_t kReduceIdleNanosleep =
     MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP;
@@ -206,9 +197,6 @@ static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 4U ||
 static_assert(kGinMaxInflight >= 1U && kGinMaxInflight <= 64U);
 static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
               kSetupThreads % 32U == 0U);
-static_assert(kCacheThreads >= 32U && kCacheThreads <= 1024U &&
-              kCacheThreads % 32U == 0U);
-static_assert(kCachePackChunks >= 1U && kCachePackChunks <= 16U);
 static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&
               kReduceThreads % 32U == 0U);
 
