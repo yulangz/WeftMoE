@@ -373,7 +373,10 @@ struct RdmaSharedState {
   std::uint64_t node_packet_begin = 0ULL;
   std::uint64_t wave_begin = 0ULL;
   std::uint64_t wave_end = 0ULL;
-  std::uint32_t mblock = 0U;
+  std::uint32_t mblock_cursor = 0U;
+  std::uint32_t selected_mblock = 0U;
+  std::uint32_t completed_mblocks = 0U;
+  std::uint32_t selected = 0U;
   std::uint32_t row_cursor = 0U;
   std::uint32_t run_canonical = 0U;
   std::uint32_t run_compact = 0U;
@@ -493,22 +496,45 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
       bytes + a.gin_return_gate_staging_offset);
 
   // FULL Return: each context owns exactly the remote source local-rank with
-  // the same ordinal.  It independently scans completed M128 blocks, packs
-  // only its rows into the registered canonical plane, then emits coalesced
-  // compact runs.  Compute and the other seven contexts never wait on it.
-  while (state.mblock < a.mblocks) {
+  // the same ordinal.  Scan completed M128 blocks cyclically so an unfinished
+  // low-numbered block cannot hold up return traffic from later ready blocks.
+  // The fixed per-block bitmask records which contexts have consumed a block;
+  // it is scheduler metadata rather than a producer/consumer ring.
+  while (state.completed_mblocks < a.mblocks) {
     if (threadIdx.x == 0U) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          completed(words[scheduler_layout.dx_completed + state.mblock]);
+      state.selected = 0U;
       const auto expected =
           static_cast<unsigned long long>(a.hidden /
                                           backward_tuning::kDxTileN);
-      while (completed.load(::cuda::memory_order_acquire) != expected)
+      for (std::uint32_t probe = 0U; probe < a.mblocks; ++probe) {
+        auto mblock = state.mblock_cursor + probe;
+        if (mblock >= a.mblocks)
+          mblock -= a.mblocks;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            context_done(
+                words[scheduler_layout.return_context_done + mblock]);
+        if ((context_done.load(::cuda::memory_order_relaxed) &
+             (1ULL << context)) != 0ULL)
+          continue;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            completed(words[scheduler_layout.dx_completed + mblock]);
+        if (completed.load(::cuda::memory_order_acquire) != expected)
+          continue;
+        state.selected_mblock = mblock;
+        state.mblock_cursor = mblock + 1U;
+        if (state.mblock_cursor == a.mblocks)
+          state.mblock_cursor = 0U;
+        state.row_cursor = 0U;
+        state.selected = 1U;
+        break;
+      }
+      if (state.selected == 0U)
         __nanosleep(backward_tuning::kQueueIdleNanosleep);
-      state.row_cursor = 0U;
     }
     __syncthreads();
-    const auto descriptor = descriptors[state.mblock];
+    if (state.selected == 0U)
+      continue;
+    const auto descriptor = descriptors[state.selected_mblock];
 
     while (state.row_cursor < descriptor.valid_rows) {
       if (threadIdx.x == 0U) {
@@ -624,8 +650,13 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0U)
-      ++state.mblock;
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          context_done(words[scheduler_layout.return_context_done +
+                             state.selected_mblock]);
+      context_done.fetch_or(1ULL << context, ::cuda::memory_order_release);
+      ++state.completed_mblocks;
+    }
     __syncthreads();
   }
 

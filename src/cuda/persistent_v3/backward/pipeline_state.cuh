@@ -27,6 +27,7 @@ struct BackwardSchedulerLayout {
   std::uint64_t du_completed = 0ULL;
   std::uint64_t dab_completed = 0ULL;
   std::uint64_t dx_completed = 0ULL;
+  std::uint64_t return_context_done = 0ULL;
   std::uint64_t expert_mblocks_completed = 0ULL;
   std::uint64_t dx_ready = 0ULL;
   std::uint64_t dab_ready = 0ULL;
@@ -73,6 +74,8 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
   layout.dab_completed = cursor;
   cursor += mblocks;
   layout.dx_completed = cursor;
+  cursor += mblocks;
+  layout.return_context_done = cursor;
   cursor += mblocks;
   layout.expert_mblocks_completed = cursor;
   cursor += experts;
