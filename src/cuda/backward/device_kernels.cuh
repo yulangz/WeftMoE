@@ -238,9 +238,6 @@ __device__ __forceinline__ void backward_swiglu_epilogue_row(
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
     const BackwardKernelArgs &a, std::uint64_t row, bool row_is_valid,
     std::uint32_t lane) {
-  constexpr std::uint32_t kLogicalThreads = 256U;
-  constexpr std::uint32_t kLogicalLanesPerWarp =
-      kLogicalThreads / 32U;
   auto *u = peer_at<transport::BFloat16>(a.local_base,
                                          a.recomputed_u_offset);
   const auto *ab = peer_at<const transport::BFloat16>(
@@ -263,48 +260,38 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
   }
 
   const auto gate = dgate[row];
-  float partial[kLogicalLanesPerWarp]{};
-#pragma unroll
-  for (std::uint32_t stream = 0U; stream < kLogicalLanesPerWarp;
-       ++stream) {
-    const auto logical_lane = lane + stream * 32U;
-    for (std::uint64_t column = logical_lane; column < a.intermediate;
-         column += kLogicalThreads) {
-      const auto index = row * a.intermediate + column;
-      const auto av = bf16_bits_to_float(ab[index].bits);
-      const auto bv = bf16_bits_to_float(
-          ab[a.padded_capacity_rows * a.intermediate + index].bits);
-      const auto duv = bf16_bits_to_float(u[index].bits);
-      const auto sigmoid = 1.0F / (1.0F + __expf(-av));
-      const auto silu = av * sigmoid;
-      const auto s = silu * bv;
-      const auto ds = gate * duv;
-      const auto silu_derivative =
-          sigmoid * (1.0F + av * (1.0F - sigmoid));
-      dab[output_base + column] = transport::BFloat16{
-          float_to_bf16_bits(ds * bv * silu_derivative)};
-      dab[output_base + a.intermediate + column] =
-          transport::BFloat16{float_to_bf16_bits(ds * silu)};
-      u[index] = transport::BFloat16{float_to_bf16_bits(gate * s)};
-      partial[stream] = fmaf(duv, s, partial[stream]);
-    }
+  float partial = 0.0F;
+  for (std::uint64_t column = lane; column < a.intermediate;
+       column += 32U) {
+    const auto index = row * a.intermediate + column;
+    const auto av = bf16_bits_to_float(ab[index].bits);
+    const auto bv = bf16_bits_to_float(
+        ab[a.padded_capacity_rows * a.intermediate + index].bits);
+    const auto duv = bf16_bits_to_float(u[index].bits);
+    const auto sigmoid = 1.0F / (1.0F + __expf(-av));
+    const auto silu = av * sigmoid;
+    const auto s = silu * bv;
+    const auto ds = gate * duv;
+    const auto silu_derivative =
+        sigmoid * (1.0F + av * (1.0F - sigmoid));
+    dab[output_base + column] = transport::BFloat16{
+        float_to_bf16_bits(ds * bv * silu_derivative)};
+    dab[output_base + a.intermediate + column] =
+        transport::BFloat16{float_to_bf16_bits(ds * silu)};
+    u[index] = transport::BFloat16{float_to_bf16_bits(gate * s)};
+    partial = fmaf(duv, s, partial);
   }
 #pragma unroll
-  for (std::uint32_t stream = 0U; stream < 4U; ++stream)
-    partial[stream] += partial[stream + 4U];
-  partial[0] += partial[2];
-  partial[1] += partial[3];
-  partial[0] += partial[1];
-#pragma unroll
   for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U)
-    partial[0] += __shfl_down_sync(0xffffffffU, partial[0], stride);
+    partial += __shfl_down_sync(0xffffffffU, partial, stride);
   if (lane == 0U)
-    dgate[row] = partial[0];
+    dgate[row] = partial;
 }
 
 // A persistent compute CTA has twelve warps. Give rows to those warps in
-// compile-time-unrolled rounds while preserving the original eight-stream
-// reduction order within each row.
+// compile-time-unrolled rounds and keep one FP32 dGate accumulator per lane so
+// the elementwise epilogue does not extend eight independent live ranges into
+// the surrounding WGMMA scheduler.
 template <std::uint32_t RowsPerTask>
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_rows(
     const BackwardKernelArgs &a, std::uint64_t first_row,
