@@ -172,11 +172,12 @@ MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
     return false;
-  // Every probe already visits the complete ready bitmap. Staggering the
-  // first word by CTA spreads claim traffic without serializing all workers
-  // through a global scan counter (which is especially wasteful for the
-  // single-word dW domains).
-  const auto first = static_cast<std::uint32_t>(blockIdx.x) % words;
+  // M-block owners are contiguous by expert. Starting from the same ready
+  // word lets CTAs consume neighboring M-blocks while their W1/W2 tiles are
+  // still resident in L2; the complete bitmap is still visited on a miss.
+  std::uint32_t first = 0U;
+  if constexpr (backward_tuning::kReadyWordStagger != 0U)
+    first = static_cast<std::uint32_t>(blockIdx.x) % words;
   for (std::uint32_t offset = 0U; offset < words; ++offset) {
     const auto word_index = (first + offset) % words;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(

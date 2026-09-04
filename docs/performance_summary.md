@@ -201,3 +201,31 @@ repeated validation passed, top-k=6 fingerprints matched the qualified
 predecessor exactly, and the two-node GIN path passed all-rank repeated-output
 validation. Compact evidence is in
 [`benchmarks/results/backward_dw_k64_20260904.json`](../benchmarks/results/backward_dw_k64_20260904.json).
+
+## Backward expert-local queue probing
+
+Activation M-block owners are laid out contiguously by expert. The scheduler
+now defaults to starting every CTA's complete ready-bitmap scan at word zero,
+so atomic claims consume neighboring M-blocks while the same expert's W1/W2
+tiles are more likely to remain in L2. The old `blockIdx.x % word_count`
+stagger remains an explicit compile-time autotune candidate. The change adds
+no queue cursor, barrier, grid synchronization, or CTA affinity and preserves
+the strict `dX > dAB > dW2 > dW1` probe order.
+
+Paired long runs measured the following slowest-rank means:
+
+| topology | staggered scan | expert-local scan | reduction | Megatron speedup |
+| --- | ---: | ---: | ---: | ---: |
+| world 8, one H200 node | 28.0461 ms | 27.3243 ms | 2.57% | 1.105x |
+| world 16, two H200 nodes, GIN | 29.7332 ms | 28.9468 ms | 2.64% | 1.487x |
+
+The generated final specializations independently measured 27.3165 ms and
+28.9279 ms. A 30-iteration rank-0 Nsight profile shortened the primary
+compute kernel from 27.3461 ms to 26.6242 ms. During its first 16 ms, Tensor
+Pipe activity increased from 48.33% to 50.21% and L2 hit rate from 20.60% to
+23.23%, while SM activity remained effectively 100%. The compute kernel still
+uses 168 registers, 24 stack bytes, zero local bytes, and 213104 dynamic
+shared-memory bytes. Both one-node and actual two-node GIN five-repeat
+validation remained byte-stable for dX, dGate, dW1, and dW2. Compact evidence
+is in
+[`benchmarks/results/backward_owner_locality_20260904.json`](../benchmarks/results/backward_owner_locality_20260904.json).

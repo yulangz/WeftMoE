@@ -118,6 +118,16 @@ tile so that a CTA cannot hoard a long chunk across a newly published dX/dAB
 task. Once dX is complete, the topology-specific compile-time claim size is
 used; the qualified world-8 and world-16 settings both use four tiles.
 
+Activation owners are stored as expert-major, contiguous M128 blocks. The
+selected `ready_word_stagger=0` specialization therefore starts every CTA's
+complete ready-bitmap probe at word zero. Atomic tile claims still distribute
+work across CTAs, but neighboring owners are consumed close enough together
+to reuse their expert's W1/W2 tiles in L2. This is only a scan-order hint: a
+miss visits every bitmap word, queue priority is unchanged, and there is no
+owner affinity, new global cursor, or synchronization. The explicit JSON
+autotune plans retain `ready_word_stagger=1` (start at `blockIdx.x % words`) as
+a regression candidate.
+
 The execution therefore has two conceptual periods but no physical phase
 transition:
 

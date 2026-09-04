@@ -40,7 +40,14 @@ The current records are:
 - [`backward_late_workers_20260904.json`](backward_late_workers_20260904.json),
   the post-transport compute-worker handoff, paired world-8/world-16 latency,
   full-shape repeated-output validation, and the rejected initial-grid
-  oversubscription precursor.
+  oversubscription precursor;
+- [`backward_vector_reduce_20260904.json`](backward_vector_reduce_20260904.json),
+  the vectorized fixed-order dX reducer and thread-count control;
+- [`backward_dw_k64_20260904.json`](backward_dw_k64_20260904.json), the
+  precomputed K64 dW reduction extent over physically M128-padded rows;
+- [`backward_owner_locality_20260904.json`](backward_owner_locality_20260904.json),
+  expert-local ready-bitmap probing, paired one-/two-node latency, and Nsight
+  L2/Tensor-pipe evidence.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

@@ -72,6 +72,7 @@
     },
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
+      "ready_word_stagger": 0,
       "epilogue_rows_per_task": 12,
       "dw2_claim_tiles": 4,
       "dw1_claim_tiles": 4
@@ -118,12 +119,9 @@
       "override": {"3_scheduler": {"dw2_claim_tiles": 8, "dw1_claim_tiles": 8}}
     },
     {
-      "name": "legacy_dispatch32_claim8",
-      "description": "Retain the previous production point as an interaction control.",
-      "override": {
-        "2_transport": {"dispatch_batch_rows": 32},
-        "3_scheduler": {"dw2_claim_tiles": 8, "dw1_claim_tiles": 8}
-      }
+      "name": "staggered_ready_words",
+      "description": "Spread CTA probes over bitmap words instead of preserving expert-local activation work.",
+      "override": {"3_scheduler": {"ready_word_stagger": 1}}
     }
   ]
 }

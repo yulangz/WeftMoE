@@ -42,6 +42,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 32)
         self.assertEqual(candidates[0]["config"]["dw2_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["dw1_claim_tiles"], 4)
+        self.assertEqual(candidates[0]["config"]["ready_word_stagger"], 0)
 
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "backward" /

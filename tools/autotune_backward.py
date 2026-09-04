@@ -74,6 +74,7 @@ PARAMETER_MACROS = {
     "cache_threads": "MEGAMOE_BWD_CACHE_THREADS",
     "cache_pack_chunks": "MEGAMOE_BWD_CACHE_PACK_CHUNKS",
     "queue_idle_nanosleep": "MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP",
+    "ready_word_stagger": "MEGAMOE_BWD_READY_WORD_STAGGER",
     "epilogue_rows_per_task": "MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK",
     "dw2_claim_tiles": "MEGAMOE_BWD_DW2_CLAIM_TILES",
     "dw1_claim_tiles": "MEGAMOE_BWD_DW1_CLAIM_TILES",
@@ -171,6 +172,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     for key in ("setup_threads", "cache_threads", "reduce_threads"):
         require_choice(config, key, (128, 256, 384, 512))
     require_choice(config, "cache_pack_chunks", (1, 2, 4, 8, 16))
+    require_choice(config, "ready_word_stagger", (0, 1))
     require_choice(config, "epilogue_rows_per_task",
                    (12, 16, 24, 32, 48, 64, 96, 128))
     require_choice(config, "dw2_claim_tiles", (1, 4, 8, 16))
