@@ -62,7 +62,7 @@
     },
     "2_transport": {
       "rdma_ctas": 8,
-      "relay_ctas": 12,
+      "relay_ctas": 16,
       "dispatch_batch_rows": 64,
       "gin_max_inflight": 24,
       "setup_threads": 256,
@@ -84,7 +84,7 @@
   "candidates": [
     {
       "name": "incumbent",
-      "description": "Measured two-host winner: larger dispatch waves and short dW claims.",
+      "description": "Measured two-host winner: sixteen Relay CTAs, larger dispatch waves, and short dW claims.",
       "override": {}
     },
     {
@@ -103,14 +103,19 @@
       "override": {"2_transport": {"relay_ctas": 8}}
     },
     {
-      "name": "relay16",
-      "description": "Trade four compute SMs for additional NVLink Relay concurrency.",
-      "override": {"2_transport": {"relay_ctas": 16}}
+      "name": "relay12",
+      "description": "Retain the former twelve-Relay production point as a regression candidate.",
+      "override": {"2_transport": {"relay_ctas": 12}}
     },
     {
       "name": "epilogue_rows24",
       "description": "Process two SwiGLU rows per warp before returning to the queue.",
       "override": {"3_scheduler": {"epilogue_rows_per_task": 24}}
+    },
+    {
+      "name": "dw_claim8",
+      "description": "Test longer dW chunks independently under the late-worker scheduler.",
+      "override": {"3_scheduler": {"dw2_claim_tiles": 8, "dw1_claim_tiles": 8}}
     },
     {
       "name": "legacy_dispatch32_claim8",

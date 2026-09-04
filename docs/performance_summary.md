@@ -136,6 +136,14 @@ by 1.20% under the confirmation policy. The independent final run measured
 28.4960 ms mean and 30.5961 ms p95 over 100 iterations, or 1.059x over the
 30.1810 ms Megatron device baseline. The full search took 175.8 seconds.
 
+The corresponding eight-candidate world-16 search selected 16 Relay CTAs plus
+8 RDMA CTAs, while retaining 64-row dispatch batches and four-tile dW claims.
+Two interleaved confirmation runs improved the selection score by 2.39% over
+the former 12-Relay point. The independent final run measured 30.0128 ms mean
+and 31.6778 ms p95 over 100 iterations, or 1.434x over the 43.0339 ms Megatron
+device baseline. The full compile, preflight, tune, confirmation, and final
+sequence took 587.1 seconds.
+
 The compute kernel remains at 168 registers, 24 stack bytes, zero local bytes,
 and 213104 dynamic shared-memory bytes per CTA. Small- and full-shape repeated
 validation was byte-identical on all four outputs for both topologies. A first

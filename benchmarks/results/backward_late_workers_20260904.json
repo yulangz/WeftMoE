@@ -86,12 +86,29 @@
     "clean_event_accounting_confirmation_100_iteration_mean_us": 30638.593,
     "clean_reduce_mean_us": 1472.962,
     "megatron_device_mean_us": 43033.856,
-    "speedup_over_megatron": 1.407
+    "speedup_over_megatron": 1.407,
+    "post_late_worker_autotune": {
+      "artifact": "artifacts/backward_late_workers_world16_autotune_20260904.json",
+      "wall_seconds": 587.084,
+      "candidate_count": 8,
+      "former_relay_ctas": 12,
+      "selected_relay_ctas": 16,
+      "selected_rdma_ctas": 8,
+      "selected_dw_claim_tiles": 4,
+      "confirmed_selection_improvement_percent": 2.395,
+      "selected_aggregate_metric_us": 29730.578,
+      "final_100_iteration_mean_us": 30012.841,
+      "final_100_iteration_p95_us": 31677.8,
+      "final_compute_mean_us": 29992.651,
+      "final_transport_mean_us": 25732.816,
+      "final_reduce_mean_us": 1248.317,
+      "final_speedup_over_megatron": 1.434
+    }
   },
   "correctness": {
     "world8_small_shape_repeats": 5,
     "world8_full_shape_repeats": 5,
-    "world16_small_shape_repeats": 3,
+    "world16_small_shape_repeats": 5,
     "world16_full_shape_repeats": 3,
     "all_four_outputs_repeat_byte_identical": true,
     "small_shape_all_rank_fingerprints_match_predecessor": true,

@@ -23,7 +23,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_multinode_plan_is_narrow_complete_and_unique(self):
-        self.assertEqual(len(self.candidates), 7)
+        self.assertEqual(len(self.candidates), 8)
         self.assertLessEqual(len(self.candidates),
                              self.plan["max_candidates"])
         self.assertEqual(self.plan["invariants"], tune.EXPECTED_INVARIANTS)

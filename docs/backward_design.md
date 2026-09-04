@@ -135,6 +135,10 @@ compute grid. In the steady benchmark they find the remaining dW tail, while
 the scheduler remains correct if another task kind is still visible. This
 stream-ordered handoff avoids leaving the former communication SMs idle
 without relying on CUDA stream priority to reserve SM residency.
+The qualified world-16 specialization reserves 8 RDMA and 16 Relay CTAs; the
+qualified single-node specialization reserves 12 Relay CTAs and launches no
+RDMA workers. These counts are explicit JIT configuration values rather than
+runtime environment switches.
 
 ## Readiness and immediate return
 
