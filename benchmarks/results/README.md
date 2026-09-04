@@ -53,7 +53,10 @@ The current records are:
   one-/two-node latency, and Nsight L2/Tensor-pipe evidence;
 - [`backward_dispatch_wavefront_20260904.json`](backward_dispatch_wavefront_20260904.json),
   the qualified 16-row single-node dispatch publication wave and its paired
-  critical-path measurements.
+  critical-path measurements;
+- [`backward_swiglu_bf16x2_20260904.json`](backward_swiglu_bf16x2_20260904.json),
+  the paired-BF16 fused SwiGLU epilogue, one-/two-node paired timing, and
+  cross-topology repeated-output validation.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

@@ -244,15 +244,16 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
       a.local_base, a.padded_ab_offset);
   auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
   auto *dgate = peer_at<float>(a.local_base, a.dgate_rows_offset);
+  const auto b_base = a.padded_capacity_rows * a.intermediate;
   const auto output_base = row * 2ULL * a.intermediate;
   if (!row_is_valid) {
-    for (std::uint64_t column = lane; column < a.intermediate;
-         column += 32U) {
+    for (std::uint64_t column = 2ULL * lane; column < a.intermediate;
+         column += 64U) {
       const auto index = row * a.intermediate + column;
-      u[index] = transport::BFloat16{0U};
-      dab[output_base + column] = transport::BFloat16{0U};
-      dab[output_base + a.intermediate + column] =
-          transport::BFloat16{0U};
+      *reinterpret_cast<std::uint32_t *>(u + index) = 0U;
+      *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = 0U;
+      *reinterpret_cast<std::uint32_t *>(
+          dab + output_base + a.intermediate + column) = 0U;
     }
     if (lane == 0U)
       dgate[row] = 0.0F;
@@ -261,25 +262,45 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
 
   const auto gate = dgate[row];
   float partial = 0.0F;
-  for (std::uint64_t column = lane; column < a.intermediate;
-       column += 32U) {
+  for (std::uint64_t column = 2ULL * lane; column < a.intermediate;
+       column += 64U) {
     const auto index = row * a.intermediate + column;
-    const auto av = bf16_bits_to_float(ab[index].bits);
-    const auto bv = bf16_bits_to_float(
-        ab[a.padded_capacity_rows * a.intermediate + index].bits);
-    const auto duv = bf16_bits_to_float(u[index].bits);
-    const auto sigmoid = 1.0F / (1.0F + __expf(-av));
-    const auto silu = av * sigmoid;
-    const auto s = silu * bv;
-    const auto ds = gate * duv;
-    const auto silu_derivative =
-        sigmoid * (1.0F + av * (1.0F - sigmoid));
-    dab[output_base + column] = transport::BFloat16{
-        float_to_bf16_bits(ds * bv * silu_derivative)};
-    dab[output_base + a.intermediate + column] =
-        transport::BFloat16{float_to_bf16_bits(ds * silu)};
-    u[index] = transport::BFloat16{float_to_bf16_bits(gate * s)};
-    partial = fmaf(duv, s, partial);
+    const auto a_pair =
+        *reinterpret_cast<const std::uint32_t *>(ab + index);
+    const auto b_pair =
+        *reinterpret_cast<const std::uint32_t *>(ab + b_base + index);
+    const auto du_pair =
+        *reinterpret_cast<const std::uint32_t *>(u + index);
+    std::uint32_t da_pair = 0U;
+    std::uint32_t db_pair = 0U;
+    std::uint32_t gated_u_pair = 0U;
+#pragma unroll
+    for (std::uint32_t element = 0U; element < 2U; ++element) {
+      const auto shift = element * 16U;
+      const auto av = __uint_as_float((a_pair >> shift) << 16U);
+      const auto bv = __uint_as_float((b_pair >> shift) << 16U);
+      const auto duv = __uint_as_float((du_pair >> shift) << 16U);
+      const auto sigmoid = 1.0F / (1.0F + __expf(-av));
+      const auto silu = av * sigmoid;
+      const auto s = silu * bv;
+      const auto ds = gate * duv;
+      const auto silu_derivative =
+          sigmoid * (1.0F + av * (1.0F - sigmoid));
+      da_pair |= static_cast<std::uint32_t>(
+                     float_to_bf16_bits(ds * bv * silu_derivative))
+                 << shift;
+      db_pair |= static_cast<std::uint32_t>(
+                     float_to_bf16_bits(ds * silu))
+                 << shift;
+      gated_u_pair |= static_cast<std::uint32_t>(
+                          float_to_bf16_bits(gate * s))
+                      << shift;
+      partial = fmaf(duv, s, partial);
+    }
+    *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = da_pair;
+    *reinterpret_cast<std::uint32_t *>(
+        dab + output_base + a.intermediate + column) = db_pair;
+    *reinterpret_cast<std::uint32_t *>(u + index) = gated_u_pair;
   }
 #pragma unroll
   for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U)
