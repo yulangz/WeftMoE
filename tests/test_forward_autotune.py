@@ -132,6 +132,10 @@ class ForwardAutotuneTest(unittest.TestCase):
         first = tune.generated_header(candidate["name"], candidate["config"])
         second = tune.generated_header(candidate["name"], candidate["config"])
         self.assertEqual(first, second)
+        self.assertEqual(
+            first,
+            tune.generated_header("renamed_candidate", candidate["config"]),
+        )
         self.assertEqual(tune.candidate_digest(candidate["config"]),
                          tune.candidate_digest(candidate["config"]))
 

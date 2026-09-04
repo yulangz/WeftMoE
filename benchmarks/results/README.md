@@ -32,7 +32,11 @@ The current records are:
 - [`backward_local_scaffold_20260903.json`](backward_local_scaffold_20260903.json),
   the first local cached-state BWD implementation milestone and its independent
   PyTorch-autograd accuracy evidence. This is a correctness scaffold, not the
-  persistent performance-qualified pipeline.
+  persistent performance-qualified pipeline;
+- [`backward_python_jit_20260904.json`](backward_python_jit_20260904.json), the
+  runtime-JIT search, topology-specific scheduler winners, resource evidence,
+  final 100-iteration validation, and comparison with the cached-state
+  Megatron baseline.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

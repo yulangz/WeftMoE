@@ -88,3 +88,29 @@ recomputation byte-for-byte for dX, dGate, dW1, and dW2, and a second cached
 X/A/B Backward execution was byte-identical. The world-16 run used all eight
 RoCE rails with GDRDMA and no Socket payload fallback. Compact evidence is in
 [`benchmarks/results/backward_megatron_cache_x_ab_20260903.json`](../benchmarks/results/backward_megatron_cache_x_ab_20260903.json).
+
+## Backward split-pipeline checkpoint
+
+The qualification implementation now uses one persistent compute kernel and
+one split-role transport kernel, with dX/dAB queues taking strict priority and
+dW tiles filling otherwise idle compute CTAs. A narrow runtime-JIT search found
+different scheduler points for the two maintained topologies:
+
+| topology | selected dispatch rows | selected dW claim | MegaMOE mean | Megatron device mean | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| world 8, one H200 node | 32 | 8 | 29.8137 ms | 30.1810 ms | 1.012x |
+| world 16, two H200 nodes, GIN | 64 | 4 | 32.1809 ms | 43.0339 ms | 1.337x |
+
+Both final runs discarded ten warmups and measured 100 iterations using the
+slowest rank per iteration. On world 16, compute averaged 31.4047 ms while the
+transport interval averaged 27.7654 ms, so transport is hidden under compute
+at the end-to-end mean boundary. The separately launched dX reduction still
+adds a 0.7931 ms mean tail; folding this work into the work-conserving
+scheduler is the next optimization target.
+
+The selected compute kernel uses 168 registers and 80 stack bytes per thread;
+the transport kernel uses 72 registers and 8 stack bytes. Candidate preflights
+matched all four output fingerprints, repeated execution was byte-identical,
+and an independent PyTorch oracle remained within BF16 accumulation tolerance.
+Compact evidence is in
+[`benchmarks/results/backward_python_jit_20260904.json`](../benchmarks/results/backward_python_jit_20260904.json).

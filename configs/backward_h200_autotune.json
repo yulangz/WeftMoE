@@ -63,7 +63,7 @@
     "2_transport": {
       "rdma_ctas": 8,
       "relay_ctas": 12,
-      "dispatch_batch_rows": 32,
+      "dispatch_batch_rows": 64,
       "gin_max_inflight": 24,
       "setup_threads": 256,
       "setup_idle_nanosleep": 128,
@@ -73,7 +73,7 @@
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
       "epilogue_rows_per_task": 12,
-      "dw_claim_tiles": 8
+      "dw_claim_tiles": 4
     },
     "4_completion_reduce": {
       "reduce_threads": 256,
@@ -83,8 +83,18 @@
   "candidates": [
     {
       "name": "incumbent",
-      "description": "Current evidence-backed M128/N256 pipeline and scheduler point.",
+      "description": "Measured two-host winner: larger dispatch waves and short dW claims.",
       "override": {}
+    },
+    {
+      "name": "dispatch_rows32",
+      "description": "Restore smaller dispatch waves while retaining short dW claims.",
+      "override": {"2_transport": {"dispatch_batch_rows": 32}}
+    },
+    {
+      "name": "dw_claim8",
+      "description": "Restore longer dW claims while retaining larger dispatch waves.",
+      "override": {"3_scheduler": {"dw_claim_tiles": 8}}
     },
     {
       "name": "gin_inflight64",
@@ -92,19 +102,14 @@
       "override": {"2_transport": {"gin_max_inflight": 64}}
     },
     {
-      "name": "dispatch_rows64",
-      "description": "Amortize dY dispatch metadata over twice as many consecutive rows.",
-      "override": {"2_transport": {"dispatch_batch_rows": 64}}
-    },
-    {
       "name": "relay8",
       "description": "Return four Relay SMs to compute while retaining one Relay per local rank.",
       "override": {"2_transport": {"relay_ctas": 8}}
     },
     {
-      "name": "dw_claim4",
-      "description": "Shorter dW chunks revisit activation priority more frequently.",
-      "override": {"3_scheduler": {"dw_claim_tiles": 4}}
+      "name": "relay16",
+      "description": "Trade four compute SMs for additional NVLink Relay concurrency.",
+      "override": {"2_transport": {"relay_ctas": 16}}
     },
     {
       "name": "epilogue_rows24",
@@ -112,10 +117,11 @@
       "override": {"3_scheduler": {"epilogue_rows_per_task": 24}}
     },
     {
-      "name": "dispatch64_inflight64",
-      "description": "Test the interaction between larger dispatch waves and full GIN credits.",
+      "name": "legacy_dispatch32_claim8",
+      "description": "Retain the previous production point as an interaction control.",
       "override": {
-        "2_transport": {"dispatch_batch_rows": 64, "gin_max_inflight": 64}
+        "2_transport": {"dispatch_batch_rows": 32},
+        "3_scheduler": {"dw_claim_tiles": 8}
       }
     }
   ]

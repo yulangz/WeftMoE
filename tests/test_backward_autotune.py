@@ -23,7 +23,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_multinode_plan_is_narrow_complete_and_unique(self):
-        self.assertEqual(len(self.candidates), 7)
+        self.assertEqual(len(self.candidates), 8)
         self.assertLessEqual(len(self.candidates),
                              self.plan["max_candidates"])
         self.assertEqual(self.plan["invariants"], tune.EXPECTED_INVARIANTS)
@@ -39,6 +39,8 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.assertEqual(plan["benchmark"]["launcher"], "local")
         self.assertEqual(candidates[0]["config"]["relay_ctas"], 12)
         self.assertEqual(candidates[0]["config"]["rdma_ctas"], 8)
+        self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 32)
+        self.assertEqual(candidates[0]["config"]["dw_claim_tiles"], 8)
 
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "backward" /
@@ -63,6 +65,10 @@ class BackwardAutotuneTest(unittest.TestCase):
         first = tune.generated_header(candidate["name"], candidate["config"])
         second = tune.generated_header(candidate["name"], candidate["config"])
         self.assertEqual(first, second)
+        self.assertEqual(
+            first,
+            tune.generated_header("renamed_candidate", candidate["config"]),
+        )
         for macro in tune.PARAMETER_MACROS.values():
             self.assertEqual(first.count(f"#define {macro} "), 1)
 
