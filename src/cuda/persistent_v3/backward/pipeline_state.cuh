@@ -46,10 +46,6 @@ struct BackwardSchedulerLayout {
   std::uint64_t dab_claim = 0ULL;
   std::uint64_t dw2_claim = 0ULL;
   std::uint64_t dw1_claim = 0ULL;
-  std::uint64_t dx_scan = 0ULL;
-  std::uint64_t dab_scan = 0ULL;
-  std::uint64_t dw2_scan = 0ULL;
-  std::uint64_t dw1_scan = 0ULL;
   std::uint64_t dispatch_scan = 0ULL;
   std::uint64_t dispatch_route_claim = 0ULL;
   std::uint64_t dispatched_routes = 0ULL;
@@ -114,10 +110,6 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
     field = cursor;
     cursor += kCounterWords;
   };
-  counter(layout.dx_scan);
-  counter(layout.dab_scan);
-  counter(layout.dw2_scan);
-  counter(layout.dw1_scan);
   counter(layout.dispatch_scan);
   counter(layout.dispatch_route_claim);
   counter(layout.dispatched_routes);

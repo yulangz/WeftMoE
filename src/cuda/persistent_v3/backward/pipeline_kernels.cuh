@@ -55,7 +55,6 @@ __device__ __forceinline__ TileDomain make_dx_domain(
   return TileDomain{
       words + layout.dx_ready,
       words + layout.dx_claim,
-      reinterpret_cast<PaddedCounter *>(words + layout.dx_scan),
       a.mblocks,
       static_cast<std::uint32_t>(a.hidden / backward_tuning::kDxTileN),
       TaskKind::Dx};
@@ -68,7 +67,6 @@ __device__ __forceinline__ TileDomain make_dab_domain(
   return TileDomain{
       words + layout.dab_ready,
       words + layout.dab_claim,
-      reinterpret_cast<PaddedCounter *>(words + layout.dab_scan),
       a.mblocks,
       kDabRowsPerMblock,
       TaskKind::Dab};
@@ -81,7 +79,6 @@ __device__ __forceinline__ TileDomain make_dw2_domain(
   return TileDomain{
       words + layout.dw2_ready,
       words + layout.dw2_claim,
-      reinterpret_cast<PaddedCounter *>(words + layout.dw2_scan),
       a.dispatch.sizes.owned_expert_count,
       kDw2TilesPerExpert,
       TaskKind::Dw2,
@@ -96,7 +93,6 @@ __device__ __forceinline__ TileDomain make_dw1_domain(
   return TileDomain{
       words + layout.dw1_ready,
       words + layout.dw1_claim,
-      reinterpret_cast<PaddedCounter *>(words + layout.dw1_scan),
       a.dispatch.sizes.owned_expert_count,
       kDw1TilesPerExpert,
       TaskKind::Dw1,

@@ -46,7 +46,6 @@ struct alignas(128) BackwardSchedulerProbeWorkspace {
   unsigned long long dab_claim[kSchedulerProbeMblocks];
   unsigned long long dw2_claim[kSchedulerProbeExperts];
   unsigned long long dw1_claim[kSchedulerProbeExperts * 2U];
-  PaddedCounter scan[kTaskKindCount];
 
   PaddedCounter dab_tiles_completed[kSchedulerProbeMblocks];
   PaddedCounter expert_dab_tiles_completed[kSchedulerProbeExperts];
@@ -64,42 +63,37 @@ struct alignas(128) BackwardSchedulerProbeWorkspace {
 
   unsigned long long priority_ready[kTaskKindCount];
   unsigned long long priority_claim[kTaskKindCount];
-  PaddedCounter priority_scan[kTaskKindCount];
 };
 
 #if defined(__CUDACC__)
 MEGAMOE_V3_DEVICE inline WorkQueues
 make_scheduler_probe_queues(BackwardSchedulerProbeWorkspace &work) {
   return WorkQueues{
-      TileDomain{work.dx_ready, work.dx_claim,
-                 &work.scan[static_cast<std::uint32_t>(TaskKind::Dx)],
-                 kSchedulerProbeMblocks, kSchedulerProbeDxTiles,
+      TileDomain{work.dx_ready, work.dx_claim, kSchedulerProbeMblocks,
+                 kSchedulerProbeDxTiles,
                  TaskKind::Dx},
-      TileDomain{work.dab_ready, work.dab_claim,
-                 &work.scan[static_cast<std::uint32_t>(TaskKind::Dab)],
-                 kSchedulerProbeMblocks, kSchedulerProbeDabTiles,
+      TileDomain{work.dab_ready, work.dab_claim, kSchedulerProbeMblocks,
+                 kSchedulerProbeDabTiles,
                  TaskKind::Dab},
-      TileDomain{work.dw2_ready, work.dw2_claim,
-                 &work.scan[static_cast<std::uint32_t>(TaskKind::Dw2)],
-                 kSchedulerProbeExperts, kSchedulerProbeDw2Tiles,
+      TileDomain{work.dw2_ready, work.dw2_claim, kSchedulerProbeExperts,
+                 kSchedulerProbeDw2Tiles,
                  TaskKind::Dw2},
-      TileDomain{work.dw1_ready, work.dw1_claim,
-                 &work.scan[static_cast<std::uint32_t>(TaskKind::Dw1)],
-                 kSchedulerProbeExperts, kSchedulerProbeDw1Tiles,
+      TileDomain{work.dw1_ready, work.dw1_claim, kSchedulerProbeExperts,
+                 kSchedulerProbeDw1Tiles,
                  TaskKind::Dw1}};
 }
 
 MEGAMOE_V3_DEVICE inline WorkQueues
 make_scheduler_priority_queues(BackwardSchedulerProbeWorkspace &work) {
   return WorkQueues{
-      TileDomain{&work.priority_ready[0], &work.priority_claim[0],
-                 &work.priority_scan[0], 1U, 1U, TaskKind::Dx},
-      TileDomain{&work.priority_ready[1], &work.priority_claim[1],
-                 &work.priority_scan[1], 1U, 1U, TaskKind::Dab},
-      TileDomain{&work.priority_ready[2], &work.priority_claim[2],
-                 &work.priority_scan[2], 1U, 1U, TaskKind::Dw2},
-      TileDomain{&work.priority_ready[3], &work.priority_claim[3],
-                 &work.priority_scan[3], 1U, 1U, TaskKind::Dw1}};
+      TileDomain{&work.priority_ready[0], &work.priority_claim[0], 1U, 1U,
+                 TaskKind::Dx},
+      TileDomain{&work.priority_ready[1], &work.priority_claim[1], 1U, 1U,
+                 TaskKind::Dab},
+      TileDomain{&work.priority_ready[2], &work.priority_claim[2], 1U, 1U,
+                 TaskKind::Dw2},
+      TileDomain{&work.priority_ready[3], &work.priority_claim[3], 1U, 1U,
+                 TaskKind::Dw1}};
 }
 
 MEGAMOE_V3_DEVICE inline void scheduler_probe_increment(

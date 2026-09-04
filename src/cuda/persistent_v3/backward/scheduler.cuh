@@ -30,7 +30,6 @@ struct TileTask {
 struct TileDomain {
   unsigned long long *ready_words = nullptr;
   unsigned long long *claim_words = nullptr;
-  PaddedCounter *scan_cursor = nullptr;
   std::uint32_t owner_count = 0U;
   std::uint32_t tiles_per_owner = 0U;
   TaskKind kind = TaskKind::None;
@@ -173,10 +172,11 @@ MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
     return false;
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> scan(
-      domain.scan_cursor->value);
-  const auto first = static_cast<std::uint32_t>(
-      scan.fetch_add(1ULL, ::cuda::memory_order_relaxed) % words);
+  // Every probe already visits the complete ready bitmap. Staggering the
+  // first word by CTA spreads claim traffic without serializing all workers
+  // through a global scan counter (which is especially wasteful for the
+  // single-word dW domains).
+  const auto first = static_cast<std::uint32_t>(blockIdx.x) % words;
   for (std::uint32_t offset = 0U; offset < words; ++offset) {
     const auto word_index = (first + offset) % words;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
