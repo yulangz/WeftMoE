@@ -391,10 +391,9 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
 #if __has_include(<nccl_device.h>)
   const auto *direct_receive =
       a.use_gin
-          ? reinterpret_cast<const transport::BFloat16 *>(
-                static_cast<const std::byte *>(a.gin_window_base) +
-                a.gin_return_receive_offset)
-          : static_cast<const transport::BFloat16 *>(nullptr);
+          ? static_cast<const std::byte *>(a.gin_window_base) +
+                a.gin_return_receive_offset
+          : static_cast<const std::byte *>(nullptr);
   const auto *direct_compact =
       a.use_gin
           ? peer_at<const unsigned long long>(
@@ -423,10 +422,14 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
 #if __has_include(<nccl_device.h>)
       const auto remote =
           a.use_gin && a.dispatch.route_dst_node[route] != a.node;
-      const auto value =
+      const auto *remote_row =
           remote
-              ? direct_receive[direct_compact[route] * a.hidden + column]
-              : contribution[route * a.hidden + column];
+              ? reinterpret_cast<const transport::BFloat16 *>(
+                    direct_receive + direct_compact[route] *
+                                         a.gin_return_row_bytes)
+              : static_cast<const transport::BFloat16 *>(nullptr);
+      const auto value = remote ? remote_row[column]
+                                : contribution[route * a.hidden + column];
 #else
       const auto value = contribution[route * a.hidden + column];
 #endif

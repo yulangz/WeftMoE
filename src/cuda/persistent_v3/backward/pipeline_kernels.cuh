@@ -131,6 +131,8 @@ __device__ __forceinline__ void initialize_status(
   status->backward_dw2_complete_clock = 0ULL;
   status->backward_dw1_start_clock = ~0ULL;
   status->backward_dw1_complete_clock = 0ULL;
+  status->gin_return_put_count = 0ULL;
+  status->gin_return_payload_bytes = 0ULL;
 }
 
 __device__ __forceinline__ void publish_dispatch_if_ready(

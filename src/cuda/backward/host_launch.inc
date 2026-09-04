@@ -276,10 +276,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
     args.gin_return_receive_offset = pool->gin_layout.return_receive;
     args.gin_return_fragment_ready_offset =
         pool->gin_layout.return_fragment_ready;
-    args.gin_return_gate_staging_offset =
-        pool->gin_layout.backward_return_gate_staging;
-    args.gin_return_gate_receive_offset =
-        pool->gin_layout.backward_return_gate_receive;
+    args.gin_return_row_bytes = pool->gin_layout.backward_return_row_bytes;
   }
   args.canonical_x_offset = layout.canonical_rows;
   args.canonical_gate_offset = layout.canonical_gates;
@@ -581,7 +578,12 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       retained.audit.actual_return_peer_bytes /
       (config.hidden_size * sizeof(transport::BFloat16));
   result->audit.actual_return_peer_bytes =
-      retained.audit.actual_return_peer_bytes + remote_return_rows * sizeof(float);
+      use_gin ? remote_return_rows * args.gin_return_row_bytes
+              : retained.audit.actual_return_peer_bytes +
+                    remote_return_rows * sizeof(float);
+  result->audit.gin_return_put_count = slot.host_status->gin_return_put_count;
+  result->audit.gin_return_payload_bytes =
+      slot.host_status->gin_return_payload_bytes;
   result->audit.workspace_bytes = pool->layout.total;
   result->audit.hot_path_allocations = 0;
   const auto device_span_us = [](unsigned long long begin,

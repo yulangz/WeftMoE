@@ -59,6 +59,8 @@ struct BackwardMegaKernelAudit {
   std::uint64_t gemm_launches = 0;
   std::uint64_t actual_dispatch_peer_bytes = 0;
   std::uint64_t actual_return_peer_bytes = 0;
+  std::uint64_t gin_return_put_count = 0;
+  std::uint64_t gin_return_payload_bytes = 0;
   std::uint64_t workspace_bytes = 0;
   std::uint64_t hot_path_allocations = 0;
 };

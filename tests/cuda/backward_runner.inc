@@ -213,6 +213,9 @@ void run_cached_backward_rank(
             << " dispatch_peer_bytes="
             << last.audit().actual_dispatch_peer_bytes
             << " return_peer_bytes=" << last.audit().actual_return_peer_bytes
+            << " gin_return_puts=" << last.audit().gin_return_put_count
+            << " gin_return_payload_bytes="
+            << last.audit().gin_return_payload_bytes
             << " workspace_bytes=" << last.audit().workspace_bytes
             << " pool_bytes=" << usage.device_bytes
             << " repeat_equal=" << repeat_equal << " dx_hash=" << dx_hash

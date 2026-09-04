@@ -633,11 +633,10 @@ struct GinWindowLayout {
   std::size_t return_staging = 0;
   std::size_t return_receive = 0;
   std::size_t return_fragment_ready = 0;
-  // Backward reuses the BF16 Forward Return planes for dX.  dGate is FP32 and
-  // follows the same canonical-producer -> compact-source row mapping, so it
-  // needs only these two small registered companion planes.
-  std::size_t backward_return_gate_staging = 0;
-  std::size_t backward_return_gate_receive = 0;
+  // FWD addresses these planes densely as BF16.  BWD reuses their larger
+  // allocation as aligned [dX BF16..., dGate FP32] row records so one FULL
+  // put carries both gradients and the completion signal.
+  std::uint64_t backward_return_row_bytes = 0;
   std::size_t barrier = 0;
   std::size_t production_error_records = 0;
   std::size_t total = 0;
@@ -692,8 +691,6 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
       outgoing_packets, config.max_hidden_size, "GIN send payload elements");
   const auto incoming_payload = checked_mul(
       incoming_packets, config.max_hidden_size, "GIN receive payload elements");
-  const auto return_payload = checked_mul(routes, config.max_hidden_size,
-                                          "GIN return payload elements");
   // FULL's send plane is indexed by canonical producer row and its receive
   // plane by compact source row. Reserve the larger bound so both planes share
   // one registered-window layout without a pre-put pack.
@@ -701,6 +698,16 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
       std::max<std::uint64_t>(
           checked_mul(remote_nodes, routes, "GIN compact return rows"),
           config.max_destination_rows_per_rank);
+  const auto dense_return_row_bytes = checked_mul(
+      config.max_hidden_size, sizeof(transport::BFloat16),
+      "GIN return row bytes");
+  const auto backward_return_row_bytes =
+      config.enable_backward_state
+          ? (checked_add(dense_return_row_bytes, sizeof(float) + 15ULL,
+                         "GIN Backward return row bytes") &
+             ~15ULL)
+          : dense_return_row_bytes;
+  layout.backward_return_row_bytes = backward_return_row_bytes;
   layout.send_dispatch_directory =
       append(cursor, directory_records, sizeof(GinDispatchContextRecord),
              "GIN send dispatch directory");
@@ -733,11 +740,14 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
       append(cursor, incoming_payload, sizeof(transport::BFloat16),
              "GIN receive payload");
   layout.return_staging = append(
-      cursor, checked_mul(direct_return_rows, config.max_hidden_size,
-                          "GIN direct return staging elements"),
-      sizeof(transport::BFloat16), "GIN return staging");
+      cursor, direct_return_rows,
+      checked_size(backward_return_row_bytes,
+                   "GIN direct return staging row bytes"),
+      "GIN return staging");
   layout.return_receive =
-      append(cursor, return_payload, sizeof(transport::BFloat16),
+      append(cursor, routes,
+             checked_size(backward_return_row_bytes,
+                          "GIN return receive row bytes"),
              "GIN return receive");
   // The worst legal fragmentation begins at every row, hence routes marker
   // words are sufficient for every compact Return layout.  The main path
@@ -745,14 +755,6 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.return_fragment_ready =
       append(cursor, routes, sizeof(std::uint64_t),
              "GIN return fragment ready counters");
-  if (config.enable_backward_state) {
-    layout.backward_return_gate_staging =
-        append(cursor, direct_return_rows, sizeof(float),
-               "GIN Backward dGate return staging");
-    layout.backward_return_gate_receive =
-        append(cursor, routes, sizeof(float),
-               "GIN Backward dGate return receive");
-  }
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),

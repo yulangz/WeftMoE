@@ -334,9 +334,9 @@ __device__ __forceinline__ bool progress_source_completion_once(
 
   const auto *route_index = peer_at<const unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);
-  const auto *gate_receive = reinterpret_cast<const float *>(
+  const auto *return_receive =
       static_cast<const std::byte *>(a.gin_window_base) +
-      a.gin_return_gate_receive_offset);
+      a.gin_return_receive_offset;
   auto *gate_output =
       peer_at<float>(a.local_base, a.dgate_output_offset);
   auto *route_ready = peer_at<unsigned long long>(
@@ -345,7 +345,9 @@ __device__ __forceinline__ bool progress_source_completion_once(
        local += blockDim.x) {
     const auto compact = row_begin + local;
     const auto route = route_index[compact];
-    gate_output[route] = gate_receive[compact];
+    gate_output[route] = *reinterpret_cast<const float *>(
+        return_receive + compact * a.gin_return_row_bytes +
+        a.hidden * sizeof(transport::BFloat16));
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
         route_ready[route]);
     ready.store(a.epoch, ::cuda::memory_order_release);
@@ -490,10 +492,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
       a.local_base, a.direct_headers_offset);
   auto *mapping = peer_at<unsigned long long>(
       a.local_base, a.forward_output_ready_epoch_offset);
-  auto *return_staging = reinterpret_cast<transport::BFloat16 *>(
-      bytes + a.gin_return_staging_offset);
-  auto *gate_staging = reinterpret_cast<float *>(
-      bytes + a.gin_return_gate_staging_offset);
+  auto *return_staging = bytes + a.gin_return_staging_offset;
 
   // FULL Return: each context owns exactly the remote source local-rank with
   // the same ordinal.  Scan completed M128 blocks cyclically so an unfinished
@@ -592,16 +591,23 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
            item += blockDim.x) {
         const auto row = item / vector_count;
         const auto vector = item % vector_count;
-        reinterpret_cast<uint4 *>(return_staging)[
+        auto *target = reinterpret_cast<uint4 *>(
+            return_staging +
             (static_cast<std::uint64_t>(state.run_canonical) + row) *
-                vector_count +
-            vector] = reinterpret_cast<const uint4 *>(dx)[
+                a.gin_return_row_bytes);
+        target[vector] = reinterpret_cast<const uint4 *>(dx)[
             (static_cast<std::uint64_t>(padded_begin) + row) * vector_count +
             vector];
       }
       for (std::uint32_t row = threadIdx.x; row < state.run_rows;
-           row += blockDim.x)
-        gate_staging[state.run_canonical + row] = dgate[padded_begin + row];
+           row += blockDim.x) {
+        auto *gate = reinterpret_cast<float *>(
+            return_staging +
+            (static_cast<std::uint64_t>(state.run_canonical) + row) *
+                a.gin_return_row_bytes +
+            a.hidden * sizeof(transport::BFloat16));
+        *gate = dgate[padded_begin + row];
+      }
       __threadfence_system();
       __syncthreads();
 
@@ -610,26 +616,18 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
                                  context + a.gin_context_count);
         const auto world = ncclTeamWorld(a.gin_dev_comm);
         const auto payload_bytes =
-            static_cast<std::uint64_t>(state.run_rows) * a.hidden *
-            sizeof(transport::BFloat16);
+            static_cast<std::uint64_t>(state.run_rows) *
+            a.gin_return_row_bytes;
         return_gin.put(
             world, static_cast<int>(state.run_source), a.gin_window,
             a.gin_return_receive_offset +
-                static_cast<std::uint64_t>(state.run_compact) * a.hidden *
-                    sizeof(transport::BFloat16),
+                static_cast<std::uint64_t>(state.run_compact) *
+                    a.gin_return_row_bytes,
             a.gin_window,
             a.gin_return_staging_offset +
-                static_cast<std::uint64_t>(state.run_canonical) * a.hidden *
-                    sizeof(transport::BFloat16),
-            payload_bytes);
-        return_gin.put(
-            world, static_cast<int>(state.run_source), a.gin_window,
-            a.gin_return_gate_receive_offset +
-                static_cast<std::uint64_t>(state.run_compact) * sizeof(float),
-            a.gin_window,
-            a.gin_return_gate_staging_offset +
-                static_cast<std::uint64_t>(state.run_canonical) * sizeof(float),
-            static_cast<std::uint64_t>(state.run_rows) * sizeof(float),
+                static_cast<std::uint64_t>(state.run_canonical) *
+                    a.gin_return_row_bytes,
+            payload_bytes,
             ncclGin_VASignalAdd{
                 a.gin_window,
                 a.gin_return_fragment_ready_offset +
@@ -645,7 +643,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
         }
         auto *status =
             peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-        atomicAdd(&status->gin_return_put_count, 2ULL);
+        atomicAdd(&status->gin_return_put_count, 1ULL);
         atomicAdd(&status->gin_return_payload_bytes, payload_bytes);
       }
       __syncthreads();
