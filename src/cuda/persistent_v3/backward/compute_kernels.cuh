@@ -172,7 +172,10 @@ __device__ __forceinline__ void store_tma_accumulator(
     if (wait_current)
       asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
   }
-  cutlass::arch::NamedBarrier::sync(kMathThreads, kStoreReadyBarrier);
+  // The next epilogue waits for this store before reusing output_tile.  Do
+  // not hold both math warpgroups here: after their STSM writes have crossed
+  // kStoreDoneBarrier, they may start the next WGMMA tile while TMA drains.
+  __syncwarp();
 }
 
 template <std::uint32_t TileM, std::uint32_t TileN,
