@@ -388,6 +388,19 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
     return;
   const auto *contribution = peer_at<const transport::BFloat16>(
       a.local_base, a.contribution_offset);
+#if __has_include(<nccl_device.h>)
+  const auto *direct_receive =
+      a.use_gin
+          ? reinterpret_cast<const transport::BFloat16 *>(
+                static_cast<const std::byte *>(a.gin_window_base) +
+                a.gin_return_receive_offset)
+          : static_cast<const transport::BFloat16 *>(nullptr);
+  const auto *direct_compact =
+      a.use_gin
+          ? peer_at<const unsigned long long>(
+                a.local_base, a.forward_direct_source_compact_index_offset)
+          : static_cast<const unsigned long long *>(nullptr);
+#endif
   auto *combined = peer_at<transport::BFloat16>(
       a.local_base, a.combined_dx_offset);
   auto *ready = peer_at<unsigned long long>(a.local_base,
@@ -407,8 +420,17 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
          position < a.dispatch.identity.top_k; ++position) {
       const auto slot = a.dispatch.combine_order[route_base + position];
       const auto route = route_base + slot;
-      sum += bf16_bits_to_float(
-          contribution[route * a.hidden + column].bits);
+#if __has_include(<nccl_device.h>)
+      const auto remote =
+          a.use_gin && a.dispatch.route_dst_node[route] != a.node;
+      const auto value =
+          remote
+              ? direct_receive[direct_compact[route] * a.hidden + column]
+              : contribution[route * a.hidden + column];
+#else
+      const auto value = contribution[route * a.hidden + column];
+#endif
+      sum += bf16_bits_to_float(value.bits);
     }
     combined[token * a.hidden + column] =
         transport::BFloat16{float_to_bf16_bits(sum)};

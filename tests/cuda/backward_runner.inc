@@ -7,8 +7,9 @@ void run_cached_backward_rank(
     const megamoe::cuda::CudaExecution &execution, bool validation) {
   constexpr std::uint64_t hidden = 7168;
   constexpr std::uint64_t intermediate = 3072;
-  require(nodes == 1U && (world == 1U || world == 2U || world == 8U),
-          "cached Backward currently requires one local node");
+  require((nodes == 1U && (world == 1U || world == 2U || world == 8U)) ||
+              (nodes == 2U && world == 16U),
+          "cached Backward requires local 1/2/8 GPUs or GIN 2x8 GPUs");
   require(experts % world == 0U && routes.num_tokens == max_tokens,
           "cached Backward fixture shape is inconsistent");
 
@@ -30,7 +31,7 @@ void run_cached_backward_rank(
   pool_config.max_hidden_size = hidden;
   pool_config.max_top_k = top_k;
   pool_config.max_world_size = world;
-  pool_config.max_nodes = 1U;
+  pool_config.max_nodes = nodes;
   pool_config.max_destination_rows_per_rank =
       max_tokens * (top_k + 1ULL) * (world == 2U ? 2ULL : 1ULL);
   pool_config.channels = 1U;
@@ -39,6 +40,7 @@ void run_cached_backward_rank(
   pool_config.max_intermediate_size = intermediate;
   pool_config.max_owned_experts = experts / world;
   pool_config.enable_backward_state = true;
+  pool_config.enable_gin_rdma = nodes == 2U;
   auto activation_pool = megamoe::cuda::make_activation_transport_pool(
       generation.session(), execution, pool_config);
 
@@ -77,13 +79,21 @@ void run_cached_backward_rank(
                 << std::endl;
   };
   progress("notify_done");
-  megamoe::cuda::LocalCudaP2pForwardMegaKernel forward_kernel(
-      generation, execution, activation_pool);
   megamoe::cuda::ActivationTransportRunOptions forward_options;
   forward_options.deadline_after = std::chrono::seconds(300);
-  auto forward = forward_kernel.run(
-      notify.dispatch(), activations, weights,
-      {hidden, intermediate, true}, forward_options);
+  auto forward = [&] {
+    if (nodes == 2U) {
+      megamoe::cuda::GinRdmaForwardMegaKernel forward_kernel(
+          generation, execution, activation_pool);
+      return forward_kernel.run(notify.dispatch(), activations, weights,
+                                {hidden, intermediate, true},
+                                forward_options);
+    }
+    megamoe::cuda::LocalCudaP2pForwardMegaKernel forward_kernel(
+        generation, execution, activation_pool);
+    return forward_kernel.run(notify.dispatch(), activations, weights,
+                              {hidden, intermediate, true}, forward_options);
+  }();
   progress("forward_done");
 
   const auto rounds_text = std::getenv("MEGAMOE_BACKWARD_ROUNDS");
@@ -193,6 +203,7 @@ void run_cached_backward_rank(
   const auto usage = activation_pool.usage();
   std::cout << "BACKWARD_RESULT rank=" << rank << " world=" << world
             << " mode=" << (validation ? "validation" : "benchmark")
+            << " backend=" << (nodes == 2U ? "gin-rdma" : "local-p2p")
             << " tokens=" << max_tokens << " experts=" << experts
             << " top_k=" << top_k << " hidden=" << hidden
             << " intermediate=" << intermediate

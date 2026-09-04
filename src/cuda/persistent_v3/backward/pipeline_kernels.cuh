@@ -168,7 +168,26 @@ __device__ __forceinline__ void publish_dispatch_if_ready(
       dab, mblock, du_tiles);
 }
 
+__device__ __forceinline__ std::uint64_t
+local_route_count(const BackwardKernelArgs &a) {
+  if (!a.use_gin)
+    return a.dispatch.sizes.route_count;
+  std::uint64_t begin = 0ULL;
+  auto end = a.dispatch.sizes.route_count;
+  while (begin < end) {
+    const auto middle = begin + (end - begin) / 2ULL;
+    const auto route = a.dispatch_waves.local_route_order[middle];
+    if (a.dispatch.route_dst_node[route] == a.node)
+      begin = middle + 1ULL;
+    else
+      end = middle;
+  }
+  return begin;
+}
+
 } // namespace backward_pipeline_detail
+
+#include "cuda/persistent_v3/backward/gin_pipeline.cuh"
 
 __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
   using namespace backward_pipeline_detail;
@@ -220,8 +239,11 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
   __syncthreads();
   __threadfence_system();
 
-  for (std::uint32_t peer = threadIdx.x; peer < a.world;
-       peer += blockDim.x) {
+  const auto first_peer = a.use_gin ? a.node * a.local_world_size : 0U;
+  const auto peer_count = a.use_gin ? a.local_world_size : a.world;
+  for (std::uint32_t local_peer = threadIdx.x; local_peer < peer_count;
+       local_peer += blockDim.x) {
+    const auto peer = first_peer + local_peer;
     auto *setup = peer_at<unsigned long long>(a.peer_bases[peer],
                                                a.setup_epoch_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
@@ -231,8 +253,9 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
   __syncthreads();
   auto *local_setup = peer_at<unsigned long long>(a.local_base,
                                                    a.setup_epoch_offset);
-  for (std::uint32_t peer = threadIdx.x; peer < a.world;
-       peer += blockDim.x) {
+  for (std::uint32_t local_peer = threadIdx.x; local_peer < peer_count;
+       local_peer += blockDim.x) {
+    const auto peer = first_peer + local_peer;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(local_setup[peer]);
     while (published.load(::cuda::memory_order_acquire) != a.epoch)
@@ -247,6 +270,15 @@ __global__ __launch_bounds__(backward_tuning::kComputeThreads, 1) void
 backward_local_transport_kernel(BackwardKernelArgs a) {
   using namespace backward_pipeline_detail;
   extern __shared__ __align__(1024) unsigned char reservation[];
+#if __has_include(<nccl_device.h>)
+  if (a.use_gin && blockIdx.x < backward_tuning::kRdmaCtas) {
+    backward_gin_detail::rdma_role(a);
+    return;
+  }
+#endif
+  const auto relay_ordinal =
+      static_cast<std::uint32_t>(blockIdx.x) -
+      (a.use_gin ? backward_tuning::kRdmaCtas : 0U);
   (void)reservation;
   __shared__ unsigned long long route_shared;
   __shared__ std::uint32_t return_mblock_shared;
@@ -274,6 +306,17 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
   const auto lane = threadIdx.x & 31U;
   const auto copy_bytes =
       static_cast<std::uint32_t>(a.hidden * sizeof(transport::BFloat16));
+  const auto local_routes = local_route_count(a);
+#if __has_include(<nccl_device.h>)
+  __shared__ backward_gin_detail::RelayInboundState gin_inbound;
+  __shared__ backward_gin_detail::SourceCompletionState gin_completion;
+  const bool owns_gin_context =
+      a.use_gin && relay_ordinal < backward_tuning::kRdmaCtas;
+  if (owns_gin_context) {
+    backward_gin_detail::initialize_relay_state(
+        a, relay_ordinal, gin_inbound, gin_completion);
+  }
+#endif
   if (lane == 0U)
     init(&dispatch_full[warp], 1U);
   ::cuda::device::experimental::fence_proxy_async_shared_cta();
@@ -294,8 +337,8 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
     }
     __syncthreads();
 
-    if (route_shared < a.dispatch.sizes.route_count) {
-      const auto remaining = a.dispatch.sizes.route_count - route_shared;
+    if (route_shared < local_routes) {
+      const auto remaining = local_routes - route_shared;
       const auto batch =
           remaining < backward_tuning::kDispatchBatchRows
               ? static_cast<std::uint32_t>(remaining)
@@ -366,12 +409,25 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
         const auto done = completed.fetch_add(
                               batch, ::cuda::memory_order_acq_rel) +
                           batch;
-        if (done == a.dispatch.sizes.route_count)
+        if (done == local_routes)
           atomicMax(&status->dispatch_complete_clock, device_globaltimer_ns());
         progressed_shared = 1U;
       }
     }
     __syncthreads();
+
+#if __has_include(<nccl_device.h>)
+    if (owns_gin_context) {
+      const bool inbound_progress =
+          backward_gin_detail::progress_inbound_once(a, gin_inbound);
+      const bool completion_progress =
+          backward_gin_detail::progress_source_completion_once(
+              a, gin_completion);
+      if (threadIdx.x == 0U && (inbound_progress || completion_progress))
+        progressed_shared = 1U;
+      __syncthreads();
+    }
+#endif
 
     if (threadIdx.x == 0U)
       publish_dispatch_if_ready(a, words, layout);
@@ -423,6 +479,9 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
         const auto compact_row = descriptor.compact_row + local_row;
         const auto padded_row = descriptor.padded_row + local_row;
         const auto header = headers[compact_row];
+        if (a.use_gin &&
+            header.source_rank / a.local_world_size != a.node)
+          continue;
         const auto *source = reinterpret_cast<const uint4 *>(
             dx + static_cast<std::uint64_t>(padded_row) * a.hidden);
         auto *destination = peer_at<transport::BFloat16>(
@@ -443,6 +502,9 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
       for (std::uint32_t local_row = threadIdx.x;
            local_row < descriptor.valid_rows; local_row += blockDim.x) {
         const auto header = headers[descriptor.compact_row + local_row];
+        if (a.use_gin &&
+            header.source_rank / a.local_world_size != a.node)
+          continue;
         auto *ready = peer_at<unsigned long long>(
             a.peer_bases[header.source_rank], a.return_ready_offset);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
@@ -476,10 +538,16 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
           returned(return_counter->value);
       stop_shared =
           dispatched.load(::cuda::memory_order_acquire) ==
-                  a.dispatch.sizes.route_count &&
+                  local_routes &&
                   returned.load(::cuda::memory_order_acquire) == a.mblocks
               ? 1U
               : 0U;
+#if __has_include(<nccl_device.h>)
+      if (stop_shared != 0U && owns_gin_context &&
+          (!backward_gin_detail::inbound_terminal(gin_inbound) ||
+           !backward_gin_detail::source_completion_terminal(gin_completion)))
+        stop_shared = 0U;
+#endif
     }
     __syncthreads();
     if (stop_shared != 0U)

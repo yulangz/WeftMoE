@@ -53,10 +53,22 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                     "disabled for local correctness milestone", "requested");
   const auto local_backend =
       std::dynamic_pointer_cast<LocalP2pBackendState>(retained.backend);
-  if (!local_backend || identity.world != local_backend->peer_slot_bases.size())
+  const auto gin_backend =
+      std::dynamic_pointer_cast<GinBackendState>(retained.backend);
+  const bool use_gin = static_cast<bool>(gin_backend);
+  const bool valid_local =
+      local_backend && identity.world == local_backend->peer_slot_bases.size();
+  const bool valid_gin =
+      gin_backend && gin_backend->num_nodes == 2U &&
+      gin_backend->local_world_size == backward_tuning::kRdmaCtas &&
+      gin_backend->gin_context_count == backward_tuning::kRdmaCtas &&
+      gin_backend->full_connections;
+  if (!valid_local && !valid_gin)
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                     "transport backend", identity.rank,
-                    "one-node LocalCudaP2p retained Forward", "non-local");
+                    "one-node LocalCudaP2p or two-node 8-rail GIN retained "
+                    "Forward",
+                    "unsupported");
   const auto &pool = retained.pool;
   const auto &layout = pool->layout;
   if (!pool->config.enable_backward_state ||
@@ -234,8 +246,40 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       [](std::uint64_t rows) { return rows != 0ULL; }));
   args.rank = identity.rank;
   args.world = identity.world;
+  args.node = use_gin ? gin_backend->node : 0U;
+  args.local_world_size =
+      use_gin ? gin_backend->local_world_size : identity.world;
+  args.gin_context_count =
+      use_gin ? gin_backend->gin_context_count : 0U;
+  args.max_tokens_per_rank = pool->config.max_tokens_per_rank;
+  args.use_gin = use_gin;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
+  if (use_gin) {
+#if __has_include(<nccl_device.h>)
+    args.gin_dev_comm = gin_backend->dev_comm;
+    args.gin_window = gin_backend->windows[retained.slot->index];
+#endif
+    args.gin_window_base = slot.gin_window;
+    args.gin_send_dispatch_directory_offset =
+        pool->gin_layout.send_dispatch_directory;
+    args.gin_receive_dispatch_directory_offset =
+        pool->gin_layout.receive_dispatch_directory;
+    args.gin_send_header_offset = pool->gin_layout.send_packet_headers;
+    args.gin_receive_header_offset = pool->gin_layout.receive_packet_headers;
+    args.gin_send_fanout_offset = pool->gin_layout.send_fanout;
+    args.gin_receive_fanout_offset = pool->gin_layout.receive_fanout;
+    args.gin_send_payload_offset = pool->gin_layout.send_payload;
+    args.gin_receive_payload_offset = pool->gin_layout.receive_payload;
+    args.gin_return_staging_offset = pool->gin_layout.return_staging;
+    args.gin_return_receive_offset = pool->gin_layout.return_receive;
+    args.gin_return_fragment_ready_offset =
+        pool->gin_layout.return_fragment_ready;
+    args.gin_return_gate_staging_offset =
+        pool->gin_layout.backward_return_gate_staging;
+    args.gin_return_gate_receive_offset =
+        pool->gin_layout.backward_return_gate_receive;
+  }
   args.canonical_x_offset = layout.canonical_rows;
   args.canonical_gate_offset = layout.canonical_gates;
   args.cached_ab_offset = layout.forward_ab_cache;
@@ -258,11 +302,21 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.setup_epoch_offset = layout.backward_setup_epoch;
   args.dispatch_ready_offset = layout.backward_dispatch_ready;
   args.return_ready_offset = layout.backward_return_ready;
+  args.forward_output_ready_epoch_offset =
+      layout.forward_output_ready_epoch;
+  args.forward_return_source_route_index_offset =
+      layout.forward_return_source_route_index;
+  args.forward_direct_source_compact_index_offset =
+      layout.forward_direct_source_compact_index;
   args.scheduler_offset = layout.forward_task_claim;
   args.status_offset = layout.status;
-  args.epoch = ++slot.backward_epoch;
-  if (args.epoch == 0ULL)
-    args.epoch = ++slot.backward_epoch;
+  auto backward_epoch = ++slot.backward_epoch;
+  if (backward_epoch == 0ULL)
+    backward_epoch = ++slot.backward_epoch;
+  // FWD's retained packet headers use the low epoch namespace.  The high bit
+  // prevents a first BWD launch from accepting an old FWD wave marker with the
+  // same numeric slot epoch.
+  args.epoch = backward_epoch | (1ULL << 63U);
 
   auto transport_stream = slot.forward_transport_stream;
   auto compute_stream = slot.forward_compute_stream;
@@ -273,10 +327,14 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                              static_cast<int>(exec->device)),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "query Backward SM count");
-  if (sm_count <= static_cast<int>(backward_tuning::kRelayCtas))
+  const auto transport_ctas =
+      backward_tuning::kRelayCtas +
+      (use_gin ? backward_tuning::kRdmaCtas : 0U);
+  if (sm_count <= static_cast<int>(transport_ctas))
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                     "split Backward role residency", identity.rank,
-                    "more SMs than Relay CTAs", std::to_string(sm_count));
+                    "more SMs than dedicated transport CTAs",
+                    std::to_string(sm_count));
   constexpr std::uint32_t kActivationStorageTileN =
       backward_tuning::kDabTileN > backward_tuning::kDxTileN
           ? backward_tuning::kDabTileN
@@ -317,6 +375,23 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       cudaStreamWaitEvent(transport_stream, gradient.allocation->ready),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "wait dY producer");
+  if (use_gin) {
+    const auto marker_bytes = checked_size(
+        checked_mul(pool->config.max_tokens_per_rank,
+                    pool->config.max_top_k,
+                    "Backward FULL Return marker rows") *
+            sizeof(std::uint64_t),
+        "Backward FULL Return marker bytes");
+    internal::throw_cuda(
+        "backward-run",
+        cudaMemsetAsync(
+            at<void>(slot.gin_window,
+                     pool->gin_layout.return_fragment_ready),
+            0, marker_bytes, transport_stream),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts,
+        "reset Backward FULL Return fragment counters");
+  }
   backward_setup_pipeline_kernel<<<1, 256, 0, transport_stream>>>(args);
   internal::throw_cuda(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
@@ -379,7 +454,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                                        transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "publish Backward cached rows");
-  backward_local_transport_kernel<<<backward_tuning::kRelayCtas,
+  backward_local_transport_kernel<<<transport_ctas,
                                     backward_tuning::kComputeThreads,
                                     kPersistentSmem,
                                     transport_stream>>>(args);
@@ -400,7 +475,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   backward_local_compute_kernel<backward_tuning::kDabTileN,
                                 backward_tuning::kDxTileN,
                                 backward_tuning::kDwTileN>
-      <<<static_cast<unsigned int>(sm_count) - backward_tuning::kRelayCtas,
+      <<<static_cast<unsigned int>(sm_count) - transport_ctas,
          backward_tuning::kComputeThreads, kPersistentSmem,
          compute_stream>>>(args, slot.backward_dr_map, slot.backward_dab_map,
                            retained.weights.impl_->backward_w2_map,

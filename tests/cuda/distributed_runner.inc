@@ -14,8 +14,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto gin_forward_benchmark = scenario == "gin_forward_bench";
   const auto socket_forward_benchmark =
       scenario == "socket_forward_bench";
-  const auto backward_validation = scenario == "backward_validate";
-  const auto backward_benchmark = scenario == "backward_bench";
+  const auto gin_backward_smoke = scenario == "gin_backward_smoke";
+  const auto gin_backward_benchmark = scenario == "gin_backward_bench";
+  const auto backward_validation =
+      scenario == "backward_validate" || gin_backward_smoke;
+  const auto backward_benchmark =
+      scenario == "backward_bench" || gin_backward_benchmark;
   const auto forward_smoke = scenario == "forward_smoke" || gin_forward_smoke;
   const auto benchmark_forward =
       scenario == "forward_bench" || gin_forward_benchmark ||
@@ -31,8 +35,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   auto common_routes = seeded_inputs(world, experts, top_k, seed)[rank];
   std::uint64_t max_tokens = 10;
   if (benchmark_shape) {
-    const auto cross_host_benchmark =
-        gin_forward_benchmark || socket_forward_benchmark;
+    const auto cross_host_benchmark = gin_forward_benchmark ||
+                                      socket_forward_benchmark ||
+                                      gin_backward_benchmark;
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
               ((benchmark_forward || backward_benchmark) &&
@@ -107,8 +112,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     }
   }
   if (backward_validation) {
-    require(nodes == 1U && (world == 1U || world == 2U || world == 8U),
-            "Backward validation requires local 1/2/8 GPUs");
+    require((!gin_backward_smoke && nodes == 1U &&
+             (world == 1U || world == 2U || world == 8U)) ||
+                (gin_backward_smoke && nodes == 2U && world == 16U),
+            "Backward validation requires local 1/2/8 GPUs or GIN 2x8 "
+            "GPUs");
     // Keep at least the small topology already exercised by the Forward
     // scheduler; one-expert fixtures do not provide its split-role terminal
     // accounting with a representative task domain.

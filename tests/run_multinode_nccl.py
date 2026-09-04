@@ -167,6 +167,54 @@ def aggregate_gin_benchmark(outputs):
     }
 
 
+def aggregate_gin_backward(outputs):
+    records = [parse_fields(item.stdout, "BACKWARD_RESULT ")
+               for item in outputs]
+    stage_keys = (
+        "wall", "total", "dispatch", "dab", "dx", "dw2", "dw1",
+        "combine", "dw_combine_overlap")
+    measured = None
+    for rank, record in enumerate(records):
+        if record.get("backend") != "gin-rdma":
+            raise RuntimeError(
+                f"rank={rank} Backward benchmark did not run GinRdma backend")
+        for key in stage_keys:
+            samples = [float(value) for value in record[key].split(",")]
+            record[key] = samples
+            if measured is None:
+                measured = len(samples)
+            elif len(samples) != measured:
+                raise RuntimeError(
+                    f"rank={rank} stage={key} sample count={len(samples)} "
+                    f"expected={measured}")
+
+    summary = {}
+    for key in stage_keys:
+        slowest = [max(record[key][iteration] for record in records)
+                   for iteration in range(measured)]
+        summary[key + "_slowest_rank_us"] = sample_stats(slowest)
+
+    return {
+        "schema": 1,
+        "benchmark": "multinode-gin-cached-state-backward",
+        "backend": "gin-rdma-device-persistent",
+        "world": len(records),
+        "measured": measured,
+        "shape": {
+            "tokens_per_rank": int(records[0]["tokens"]),
+            "hidden": int(records[0]["hidden"]),
+            "intermediate": int(records[0]["intermediate"]),
+            "experts": int(records[0]["experts"]),
+            "top_k": int(records[0]["top_k"]),
+        },
+        "per_rank_dispatch_peer_bytes": [
+            int(item["dispatch_peer_bytes"]) for item in records],
+        "per_rank_return_peer_bytes": [
+            int(item["return_peer_bytes"]) for item in records],
+        **summary,
+    }
+
+
 def scrub_output(value, bootstrap=None):
     """Remove bootstrap binary/text encodings from any aggregated diagnostic."""
     secret = _active_bootstrap if bootstrap is None else bytes(bootstrap)
@@ -286,6 +334,11 @@ def environment_overrides(args):
         "MEGAMOE_FORWARD_PROGRESS",
         "MEGAMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
         "MEGAMOE_FORWARD_SMOKE_REPEATS",
+        "MEGAMOE_BACKWARD_ROUNDS",
+        "MEGAMOE_BACKWARD_WARMUPS",
+        "MEGAMOE_BACKWARD_TOKENS",
+        "MEGAMOE_BACKWARD_PROGRESS",
+        "MEGAMOE_BACKWARD_OUTPUT_DIR",
         "MEGAMOE_GIN_BENCH_MODE",
         "MEGAMOE_GIN_BENCH_SHIFT",
         "MEGAMOE_GIN_BENCH_FANOUT",
@@ -590,6 +643,8 @@ def parse_args(argv=None):
                  "gin_team_pool",
                  "gin_forward_smoke",
                  "gin_forward_bench",
+                 "gin_backward_smoke",
+                 "gin_backward_bench",
                  "socket_forward_bench",
                  "activation_socket",
                  "activation_gin"),
@@ -894,6 +949,51 @@ def main(argv=None):
         print("GIN_BENCH_JSON " + json.dumps(
             aggregate_gin_benchmark(outputs), sort_keys=True))
         print(f"[PASS] same-rail GIN benchmark world={world}")
+        return
+
+    if args.scenario == "gin_backward_smoke":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("BACKWARD_RESULT ")]
+            if (result.returncode != 0 or len(lines) != 1 or
+                    "backend=gin-rdma" not in (lines[0] if lines else "") or
+                    "repeat_equal=1" not in (lines[0] if lines else "")):
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}")
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN Backward failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print(f"[PASS] GIN Backward repeated-output stability world={world}")
+        return
+
+    if args.scenario == "gin_backward_bench":
+        failures = []
+        evidence = []
+        for result in outputs:
+            lines = [line for line in result.stdout.splitlines()
+                     if line.startswith("BACKWARD_RESULT ")]
+            if (result.returncode != 0 or len(lines) != 1 or
+                    "backend=gin-rdma" not in (lines[0] if lines else "")):
+                failures.append(
+                    f"rank={result.rank} exit={result.returncode}; "
+                    f"stdout={result.stdout[-5000:]}; "
+                    f"stderr={result.stderr[-5000:]}")
+            else:
+                evidence.append(lines[0])
+        if failures:
+            raise RuntimeError("distributed GIN Backward benchmark failed:\n" +
+                               "\n".join(failures))
+        print("\n".join(evidence))
+        print("GIN_BACKWARD_BENCH_JSON " + json.dumps(
+            aggregate_gin_backward(outputs), sort_keys=True))
+        print(f"[PASS] GIN Backward benchmark world={world}")
         return
 
     if args.scenario == "socket_forward_bench":
