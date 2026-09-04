@@ -240,7 +240,7 @@ request the same W1/W2 tile close together. The rule applies only to dAB/dX;
 dW retains the original single-expert order. It adds no atomic, barrier,
 `grid.sync()`, queue pass, or communication dependency.
 
-The explicit compile-time search compared owner groups 1, 4, 8, and 16.
+The explicit compile-time search compared owner groups 1, 2, 4, 8, and 16.
 Group 4 won on both maintained topologies:
 
 | topology | group 1 | group 4 final | reduction | Megatron speedup |
@@ -248,8 +248,9 @@ Group 4 won on both maintained topologies:
 | world 8, one H200 node | 27.3004 ms | 25.8043 ms | 5.48% | 1.170x |
 | world 16, two H200 nodes, GIN | 29.0264 ms | 27.9878 ms | 3.58% | 1.538x |
 
-The world-8 alternatives measured 26.4988 ms for group 8 and 27.4045 ms for
-group 16. World 16 measured 28.3402 ms and 28.7694 ms respectively. Rank-0
+The world-8 alternatives measured 26.0461 ms for group 2, 26.4988 ms for
+group 8, and 27.4045 ms for group 16. World 16 measured 27.9982, 28.3402,
+and 28.7694 ms respectively. Rank-0
 Nsight shortened the primary compute kernel from 26.6242 ms to 25.8144 ms.
 During its first 16 ms, Tensor Pipe activity rose from 50.21% to 57.12% and
 L2 hit rate from 23.23% to 28.95%; SM activity remained 99.9% and L2-to-HBM

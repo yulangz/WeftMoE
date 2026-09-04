@@ -108,9 +108,9 @@
       "override": {"2_transport": {"dispatch_batch_rows": 64}}
     },
     {
-      "name": "activation_owner_group16",
-      "description": "Test a wider activation locality group that may cross expert boundaries on world8.",
-      "override": {"3_scheduler": {"activation_owner_group": 16}}
+      "name": "activation_owner_group2",
+      "description": "Test a narrower two-Mblock activation locality group.",
+      "override": {"3_scheduler": {"activation_owner_group": 2}}
     }
   ]
 }

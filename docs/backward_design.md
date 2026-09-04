@@ -129,7 +129,7 @@ single-owner order because spreading it across experts destroys weight and
 reduction-input locality. This is only a scan-order hint: a miss visits every
 bitmap word, queue priority is unchanged, and there is no owner affinity, new
 global cursor, or synchronization. `activation_owner_group` is a compile-time
-JSON parameter; the narrow plans retain 1, 8, and 16 as regression candidates.
+JSON parameter; the narrow plans retain 1, 2, and 8 as nearby candidates.
 `ready_word_stagger=1` remains representable by the explicit tuning surface
 for deliberate experiments, but is not in the maintained narrow search.
 
