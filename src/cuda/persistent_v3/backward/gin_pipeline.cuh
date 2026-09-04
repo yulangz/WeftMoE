@@ -30,10 +30,14 @@ struct SourceCompletionState {
   unsigned long long scan_cursor = 0ULL;
   unsigned long long completed = 0ULL;
   unsigned long long expected = 0ULL;
+  unsigned long long selected_chunk = 0ULL;
   std::uint32_t context = 0U;
   std::uint32_t selected_rows = 0U;
   std::uint32_t selected = 0U;
+  std::uint32_t chunk_ready = 0U;
   std::uint32_t progressed = 0U;
+  unsigned long long marker_ready[
+      backward_tuning::kComputeThreads / 32U]{};
 };
 
 __device__ __forceinline__ std::uint32_t remote_node(
@@ -264,40 +268,70 @@ __device__ __forceinline__ bool progress_source_completion_once(
   if (threadIdx.x == 0U) {
     state.progressed = 0U;
     state.selected = 0U;
+    state.chunk_ready = 0U;
   }
   __syncthreads();
   if (source_completion_terminal(state) || state.chunk_count == 0ULL)
     return false;
 
+  auto *chunk_state = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_chunk_state_offset);
   if (threadIdx.x == 0U) {
-    const auto chunk = state.scan_cursor;
-    if (chunk < state.chunk_count) {
+    for (unsigned long long attempt = 0ULL; attempt < state.expected;
+         ++attempt) {
+      const auto chunk = state.scan_cursor;
+      state.scan_cursor += a.gin_context_count;
+      if (state.scan_cursor >= state.chunk_count)
+        state.scan_cursor = state.context;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
+          chunk_state[chunk]);
+      if (done.load(::cuda::memory_order_acquire) == a.epoch)
+        continue;
+      state.selected_chunk = chunk;
       const auto row_begin = chunk * a.forward_return_chunk_rows;
       const auto remaining = state.compact_rows - row_begin;
       state.selected_rows = static_cast<std::uint32_t>(
           remaining < a.forward_return_chunk_rows
               ? remaining
               : a.forward_return_chunk_rows);
-
-      asm volatile("fence.proxy.async.global;" : : : "memory");
-      const auto *markers = reinterpret_cast<const unsigned long long *>(
-          static_cast<const std::byte *>(a.gin_window_base) +
-          a.gin_return_fragment_ready_offset);
-      unsigned long long ready_rows = 0ULL;
-      for (std::uint32_t row = 0U; row < state.selected_rows; ++row)
-        ready_rows += markers[row_begin + row];
-      if (ready_rows >= state.selected_rows) {
-        state.selected = static_cast<std::uint32_t>(chunk + 1ULL);
-      }
+      state.selected = 1U;
+      break;
     }
   }
   __syncthreads();
   if (state.selected == 0U)
     return false;
 
-  const auto chunk = static_cast<unsigned long long>(state.selected - 1U);
-  const auto row_begin = chunk * a.forward_return_chunk_rows;
+  const auto row_begin =
+      state.selected_chunk * a.forward_return_chunk_rows;
+  const auto *markers = reinterpret_cast<const unsigned long long *>(
+      static_cast<const std::byte *>(a.gin_window_base) +
+      a.gin_return_fragment_ready_offset);
+  constexpr auto kWarps = backward_tuning::kComputeThreads / 32U;
+  constexpr unsigned int kWarpMask = 0xffffffffU;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
   asm volatile("fence.proxy.async.global;" : : : "memory");
+  unsigned long long ready_rows = 0ULL;
+  for (std::uint32_t row = threadIdx.x; row < state.selected_rows;
+       row += blockDim.x)
+    ready_rows += markers[row_begin + row];
+  for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U)
+    ready_rows += __shfl_down_sync(kWarpMask, ready_rows, offset);
+  if (lane == 0U)
+    state.marker_ready[warp] = ready_rows;
+  __syncthreads();
+  if (threadIdx.x == 0U) {
+    ready_rows = 0ULL;
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kWarps; ++index)
+      ready_rows += state.marker_ready[index];
+    state.chunk_ready = ready_rows >= state.selected_rows ? 1U : 0U;
+  }
+  __syncthreads();
+  if (state.chunk_ready == 0U)
+    return false;
+
   const auto *route_index = peer_at<const unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);
   const auto *gate_receive = reinterpret_cast<const float *>(
@@ -318,8 +352,10 @@ __device__ __forceinline__ bool progress_source_completion_once(
   }
   __syncthreads();
   if (threadIdx.x == 0U) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
+        chunk_state[state.selected_chunk]);
+    done.store(a.epoch, ::cuda::memory_order_release);
     ++state.completed;
-    state.scan_cursor += a.gin_context_count;
     state.progressed = 1U;
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);

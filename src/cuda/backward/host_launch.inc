@@ -305,6 +305,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.return_ready_offset = layout.backward_return_ready;
   args.forward_output_ready_epoch_offset =
       layout.forward_output_ready_epoch;
+  args.forward_return_chunk_state_offset =
+      layout.forward_return_chunk_state;
   args.forward_return_source_route_index_offset =
       layout.forward_return_source_route_index;
   args.forward_direct_source_compact_index_offset =

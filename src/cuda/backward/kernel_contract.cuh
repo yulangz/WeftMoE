@@ -66,6 +66,7 @@ struct BackwardKernelArgs {
   std::size_t dispatch_ready_offset = 0;
   std::size_t return_ready_offset = 0;
   std::size_t forward_output_ready_epoch_offset = 0;
+  std::size_t forward_return_chunk_state_offset = 0;
   std::size_t forward_return_source_route_index_offset = 0;
   std::size_t forward_direct_source_compact_index_offset = 0;
   std::size_t scheduler_offset = 0;
