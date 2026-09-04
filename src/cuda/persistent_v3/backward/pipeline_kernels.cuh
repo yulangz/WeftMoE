@@ -14,7 +14,7 @@ constexpr std::uint32_t kNoTask = ~0U;
 constexpr std::uint32_t kTerminalTask = ~1U;
 constexpr std::uint32_t kDabRowsPerMblock = backward_tuning::kTileM;
 constexpr std::uint32_t kDabRowsPerTask =
-    backward_tuning::kComputeThreads / 32U;
+    backward_tuning::kEpilogueRowsPerTask;
 constexpr std::uint32_t kDabEpilogueTasks =
     (kDabRowsPerMblock + kDabRowsPerTask - 1U) / kDabRowsPerTask;
 constexpr std::uint32_t kDw2MTiles =
@@ -792,7 +792,7 @@ backward_local_compute_kernel(
                        ? descriptor.valid_rows - local_row
                        : rows)
                 : 0U;
-        backward_swiglu_epilogue_warp_rows(
+        backward_swiglu_epilogue_warp_rows<kDabRowsPerTask>(
             a, static_cast<std::uint64_t>(descriptor.padded_row) + local_row,
             valid_rows, rows);
         __threadfence();

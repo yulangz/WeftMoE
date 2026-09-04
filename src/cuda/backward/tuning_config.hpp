@@ -73,6 +73,9 @@
 #ifndef MEGAMOE_BWD_DISPATCH_BATCH_ROWS
 #define MEGAMOE_BWD_DISPATCH_BATCH_ROWS 32
 #endif
+#ifndef MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK
+#define MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK 12
+#endif
 #ifndef MEGAMOE_BWD_DW_CLAIM_TILES
 #define MEGAMOE_BWD_DW_CLAIM_TILES 8
 #endif
@@ -108,6 +111,8 @@ inline constexpr std::uint32_t kQueueIdleNanosleep =
     MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kDispatchBatchRows =
     MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
+inline constexpr std::uint32_t kEpilogueRowsPerTask =
+    MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK;
 inline constexpr std::uint32_t kDwClaimTiles = MEGAMOE_BWD_DW_CLAIM_TILES;
 inline constexpr std::uint32_t kDw2TilesPerExpert =
     (kMainHidden / kDwTileM) * (kMainIntermediate / kDwTileN);
@@ -140,6 +145,8 @@ static_assert(kRdmaCtas == 8U);
 static_assert(kRelayCtas >= 8U && kRelayCtas % 4U == 0U);
 static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
+static_assert(kEpilogueRowsPerTask >= kComputeThreads / 32U &&
+              kEpilogueRowsPerTask <= kTileM);
 static_assert(kDwClaimTiles == 1U || kDwClaimTiles == 4U ||
               kDwClaimTiles == 8U || kDwClaimTiles == 16U);
 
