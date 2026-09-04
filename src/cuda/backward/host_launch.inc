@@ -511,11 +511,15 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   // Queue route reduction behind the persistent transport grid.  The compute
   // CTAs are already resident while transport is active, so reducers can use
   // the SMs released by completed communication roles without delaying dW.
-  // Missing local-return markers are waited independently by each token CTA.
+  // Missing local-return markers are waited independently by each token
+  // warp; uint4 loads preserve the fixed route-order FP32 reduction while
+  // avoiding eight physical warps of scalar work per token.
   if (identity.tokens != 0ULL) {
-    backward_reduce_dx_kernel<<<static_cast<unsigned int>(identity.tokens),
-                                backward_tuning::kReduceThreads, 0,
-                                transport_stream>>>(args);
+    constexpr auto kReduceWarps = backward_tuning::kReduceThreads / 32U;
+    const auto reduce_ctas = static_cast<unsigned int>(
+        (identity.tokens + kReduceWarps - 1ULL) / kReduceWarps);
+    backward_reduce_dx_kernel<<<reduce_ctas, backward_tuning::kReduceThreads,
+                                0, transport_stream>>>(args);
     internal::throw_cuda(
         "backward-run", cudaGetLastError(), identity.rank, identity.world,
         "backward", identity.generation, ExchangeKind::ExpertCounts,

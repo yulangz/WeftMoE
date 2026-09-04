@@ -156,3 +156,24 @@ priority does not reserve transport residency; the retained design launches
 late workers only after transport and reduction have completed. Compact
 evidence is in
 [`benchmarks/results/backward_late_workers_20260904.json`](../benchmarks/results/backward_late_workers_20260904.json).
+
+## Backward vector dX reduction
+
+The source-token reducer now assigns one token to one warp and loads eight
+BF16 values per `uint4`. Lanes 0--5 independently acquire the six route
+markers, while eight FP32 accumulators retain the original route-position
+order and round once to BF16. Both top-k=1 and top-k=6 validation produced the
+same all-rank fingerprints as the scalar predecessor and remained
+byte-identical across repeated executions. The kernel uses 38 registers and
+has no stack or local-memory spill.
+
+Two paired 300-iteration world-8 runs reduced the isolated reduction mean from
+3.0950 ms to 1.6519 ms (46.63%) and the end-to-end mean from 28.4497 ms to
+28.3038 ms (0.51%). Two paired 100-iteration world-16 runs reduced the
+isolated reduction mean from 1.2506 ms to 0.4979 ms (60.18%); because the
+primary compute grid remains the critical path, end-to-end improved only
+0.19%, from 29.9085 ms to 29.8527 ms. A 128/256/512-thread sweep found 128
+threads slightly faster for the isolated world-8 reducer, but less than 0.01%
+apart end-to-end, so the existing 256-thread default remains selected under
+the 0.5% promotion rule. Compact evidence is in
+[`benchmarks/results/backward_vector_reduce_20260904.json`](../benchmarks/results/backward_vector_reduce_20260904.json).

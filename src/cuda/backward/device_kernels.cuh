@@ -383,11 +383,17 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
 }
 
 __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
-  const auto token = static_cast<std::uint64_t>(blockIdx.x);
+  constexpr std::uint32_t kTrainingTopK = 6U;
+  constexpr std::uint32_t kWarpsPerCta =
+      backward_tuning::kReduceThreads / 32U;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  const auto token = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerCta +
+                     warp;
   if (token >= a.dispatch.identity.num_tokens)
     return;
-  constexpr std::uint32_t kTrainingTopK = 6U;
-  __shared__ const transport::BFloat16 *source_rows[kTrainingTopK];
+  __shared__ const transport::BFloat16
+      *source_rows[kWarpsPerCta][kTrainingTopK];
   const auto *contribution = peer_at<const transport::BFloat16>(
       a.local_base, a.contribution_offset);
 #if __has_include(<nccl_device.h>)
@@ -407,61 +413,76 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   auto *ready = peer_at<unsigned long long>(a.local_base,
                                              a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
-  if (a.dispatch.identity.top_k == kTrainingTopK) {
-    if (threadIdx.x < kTrainingTopK) {
-      const auto position = static_cast<std::uint32_t>(threadIdx.x);
-      const auto slot = a.dispatch.combine_order[route_base + position];
-      const auto route = route_base + slot;
-      auto *source = contribution + route * a.hidden;
+  if (lane < a.dispatch.identity.top_k) {
+    const auto position = lane;
+    const auto slot = a.dispatch.combine_order[route_base + position];
+    const auto route = route_base + slot;
+    auto *source = contribution + route * a.hidden;
 #if __has_include(<nccl_device.h>)
-      if (a.use_gin && a.dispatch.route_dst_node[route] != a.node)
-        source = reinterpret_cast<const transport::BFloat16 *>(
-            direct_receive +
-            direct_compact[route] * a.gin_return_row_bytes);
+    if (a.use_gin && a.dispatch.route_dst_node[route] != a.node)
+      source = reinterpret_cast<const transport::BFloat16 *>(
+          direct_receive + direct_compact[route] * a.gin_return_row_bytes);
 #endif
-      source_rows[position] = source;
-    }
-    __syncthreads();
-  }
-  for (std::uint32_t position = 0U;
-       position < a.dispatch.identity.top_k; ++position) {
+    source_rows[warp][position] = source;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);
     while (marker.load(::cuda::memory_order_acquire) != a.epoch)
       __nanosleep(backward_tuning::kReduceIdleNanosleep);
   }
-  for (std::uint64_t column = threadIdx.x; column < a.hidden;
-       column += blockDim.x) {
-    float sum = 0.0F;
+  __syncwarp();
+
+  auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
+  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
+       vector += 32ULL) {
+    float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F,
+                     0.0F, 0.0F, 0.0F, 0.0F};
     if (a.dispatch.identity.top_k == kTrainingTopK) {
 #pragma unroll
       for (std::uint32_t position = 0U; position < kTrainingTopK;
-           ++position)
-        sum += bf16_bits_to_float(source_rows[position][column].bits);
+           ++position) {
+        const auto packed = reinterpret_cast<const uint4 *>(
+            source_rows[warp][position])[vector];
+        const unsigned int words[4] = {packed.x, packed.y, packed.z,
+                                       packed.w};
+#pragma unroll
+        for (std::uint32_t word = 0U; word < 4U; ++word) {
+          sums[word * 2U] = __fadd_rn(
+              sums[word * 2U],
+              bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
+          sums[word * 2U + 1U] = __fadd_rn(
+              sums[word * 2U + 1U],
+              bf16_bits_to_float(
+                  static_cast<std::uint16_t>(words[word] >> 16U)));
+        }
+      }
     } else {
       for (std::uint32_t position = 0U;
            position < a.dispatch.identity.top_k; ++position) {
-        const auto slot = a.dispatch.combine_order[route_base + position];
-        const auto route = route_base + slot;
-#if __has_include(<nccl_device.h>)
-        const auto remote =
-            a.use_gin && a.dispatch.route_dst_node[route] != a.node;
-        const auto *remote_row =
-            remote
-                ? reinterpret_cast<const transport::BFloat16 *>(
-                      direct_receive + direct_compact[route] *
-                                           a.gin_return_row_bytes)
-                : static_cast<const transport::BFloat16 *>(nullptr);
-        const auto value = remote ? remote_row[column]
-                                  : contribution[route * a.hidden + column];
-#else
-        const auto value = contribution[route * a.hidden + column];
-#endif
-        sum += bf16_bits_to_float(value.bits);
+        const auto packed = reinterpret_cast<const uint4 *>(
+            source_rows[warp][position])[vector];
+        const unsigned int words[4] = {packed.x, packed.y, packed.z,
+                                       packed.w};
+#pragma unroll
+        for (std::uint32_t word = 0U; word < 4U; ++word) {
+          sums[word * 2U] = __fadd_rn(
+              sums[word * 2U],
+              bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
+          sums[word * 2U + 1U] = __fadd_rn(
+              sums[word * 2U + 1U],
+              bf16_bits_to_float(
+                  static_cast<std::uint16_t>(words[word] >> 16U)));
+        }
       }
     }
-    combined[token * a.hidden + column] =
-        transport::BFloat16{float_to_bf16_bits(sum)};
+    unsigned int words[4];
+#pragma unroll
+    for (std::uint32_t word = 0U; word < 4U; ++word)
+      words[word] =
+          static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
+          (static_cast<unsigned int>(
+               float_to_bf16_bits(sums[word * 2U + 1U]))
+           << 16U);
+    output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
   }
 }
 
