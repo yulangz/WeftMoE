@@ -384,6 +384,9 @@ struct DeviceForwardHandle::Impl {
   bool retained_backward_state = false;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
+  // Backward reuses Forward's immutable FULL-return row mapping, including
+  // the chunk boundaries encoded in each entry.
+  std::uint64_t forward_return_chunk_rows = 0;
   // The compact expert counts are immutable Dispatch metadata. Backward
   // lazily snapshots the tiny vector before its first timed launch and reuses
   // it for repeated executions of the same retained Forward state.

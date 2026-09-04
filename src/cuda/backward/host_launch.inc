@@ -252,6 +252,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.gin_context_count =
       use_gin ? gin_backend->gin_context_count : 0U;
   args.max_tokens_per_rank = pool->config.max_tokens_per_rank;
+  args.forward_return_chunk_rows = retained.forward_return_chunk_rows;
   args.use_gin = use_gin;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);

@@ -13,7 +13,6 @@ namespace backward_gin_detail {
 using backward_pipeline_detail::BackwardMblockDescriptor;
 using backward_pipeline_detail::PaddedCounter;
 
-inline constexpr std::uint32_t kReturnChunkRows = 128U;
 inline constexpr unsigned long long kMaxInflight = 24ULL;
 
 struct RelayInboundState {
@@ -98,8 +97,8 @@ __device__ __forceinline__ void initialize_relay_state(
                          context]
             .return_row_count;
     completion.chunk_count =
-        (completion.compact_rows + kReturnChunkRows - 1ULL) /
-        kReturnChunkRows;
+        (completion.compact_rows + a.forward_return_chunk_rows - 1ULL) /
+        a.forward_return_chunk_rows;
     completion.scan_cursor = context;
     completion.context = context;
     completion.expected =
@@ -239,10 +238,12 @@ __device__ __forceinline__ bool progress_source_completion_once(
   if (threadIdx.x == 0U) {
     const auto chunk = state.scan_cursor;
     if (chunk < state.chunk_count) {
-      const auto row_begin = chunk * kReturnChunkRows;
+      const auto row_begin = chunk * a.forward_return_chunk_rows;
       const auto remaining = state.compact_rows - row_begin;
       state.selected_rows = static_cast<std::uint32_t>(
-          remaining < kReturnChunkRows ? remaining : kReturnChunkRows);
+          remaining < a.forward_return_chunk_rows
+              ? remaining
+              : a.forward_return_chunk_rows);
 
       asm volatile("fence.proxy.async.global;" : : : "memory");
       const auto *markers = reinterpret_cast<const unsigned long long *>(
@@ -261,7 +262,7 @@ __device__ __forceinline__ bool progress_source_completion_once(
     return false;
 
   const auto chunk = static_cast<unsigned long long>(state.selected - 1U);
-  const auto row_begin = chunk * kReturnChunkRows;
+  const auto row_begin = chunk * a.forward_return_chunk_rows;
   asm volatile("fence.proxy.async.global;" : : : "memory");
   const auto *route_index = peer_at<const unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);

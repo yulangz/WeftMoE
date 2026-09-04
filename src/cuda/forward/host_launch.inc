@@ -3339,6 +3339,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   result->retained_backward_state = config.retain_backward_state;
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
+  result->forward_return_chunk_rows = args.forward_return_chunk_rows;
   result->audit.specialization =
       ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
   result->audit.persistent_kernel_launches = 1;

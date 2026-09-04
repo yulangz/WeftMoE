@@ -21,6 +21,7 @@ struct BackwardKernelArgs {
   std::uint32_t local_world_size = 0;
   std::uint32_t gin_context_count = 0;
   std::uint64_t max_tokens_per_rank = 0;
+  std::uint64_t forward_return_chunk_rows = 0;
   bool use_gin = false;
   void *local_base = nullptr;
   void **peer_bases = nullptr;
