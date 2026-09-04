@@ -19,7 +19,7 @@ struct RelayInboundState {
   unsigned long long packet_cursor = 0ULL;
   unsigned long long packet_end = 0ULL;
   std::uint32_t wave_remaining = 0U;
-  std::uint32_t current_fanout = 0U;
+  std::uint32_t batch_packets = 0U;
   std::uint32_t source_partition = 0U;
   std::uint32_t progressed = 0U;
 };
@@ -121,13 +121,16 @@ __device__ __forceinline__ bool source_completion_terminal(
   return state.completed >= state.expected;
 }
 
-// Consume one remotely arrived packet.  The first header in each Forward wave
-// is reused as the ordered BWD payload marker; all packet/fanout identity stays
-// immutable across repeated Backward executions.
+// Consume one bounded batch from a remotely arrived wave. The first header in
+// each Forward wave is reused as the ordered BWD payload marker; batching
+// amortizes the system fence over many packet fanouts while retaining regular
+// opportunities to service Return completion.
 __device__ __forceinline__ bool progress_inbound_once(
     const BackwardKernelArgs &a, RelayInboundState &state) {
-  if (threadIdx.x == 0U)
+  if (threadIdx.x == 0U) {
     state.progressed = 0U;
+    state.batch_packets = 0U;
+  }
   __syncthreads();
   if (inbound_terminal(state))
     return false;
@@ -145,55 +148,86 @@ __device__ __forceinline__ bool progress_inbound_once(
   const auto partition_fanout_base =
       partition_packet_base * a.dispatch.identity.top_k;
 
-  if (threadIdx.x == 0U && state.wave_remaining == 0U) {
-    const auto packet = partition_packet_base + state.packet_cursor;
-    ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> marker(
-        headers[packet].source_epoch);
-    if (marker.load(::cuda::memory_order_acquire) == a.epoch) {
-      asm volatile("fence.proxy.async.global;" : : : "memory");
-      const auto wave_packets = headers[packet].topk_slot;
-      if (wave_packets != 0U &&
-          state.packet_cursor + wave_packets <= state.packet_end)
-        state.wave_remaining = wave_packets;
+  if (threadIdx.x == 0U) {
+    if (state.wave_remaining == 0U) {
+      const auto packet = partition_packet_base + state.packet_cursor;
+      ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> marker(
+          headers[packet].source_epoch);
+      if (marker.load(::cuda::memory_order_acquire) == a.epoch) {
+        asm volatile("fence.proxy.async.global;" : : : "memory");
+        const auto wave_packets = headers[packet].topk_slot;
+        if (wave_packets != 0U &&
+            state.packet_cursor + wave_packets <= state.packet_end)
+          state.wave_remaining = wave_packets;
+      }
     }
+    if (state.wave_remaining != 0U)
+      state.batch_packets =
+          state.wave_remaining < backward_tuning::kDispatchBatchRows
+              ? state.wave_remaining
+              : backward_tuning::kDispatchBatchRows;
   }
   __syncthreads();
-  if (state.wave_remaining == 0U)
+  if (state.batch_packets == 0U)
     return false;
 
-  const auto packet = partition_packet_base + state.packet_cursor;
-  const auto header = headers[packet];
-  if (threadIdx.x == 0U)
-    state.current_fanout = static_cast<std::uint32_t>(header.route_index);
-  __syncthreads();
   const auto vector_count = a.hidden / 8ULL;
-  const auto items = static_cast<std::uint64_t>(state.current_fanout) *
-                     vector_count;
-  for (std::uint64_t item = threadIdx.x; item < items;
-       item += blockDim.x) {
-    const auto fanout_slot = item / vector_count;
-    const auto vector = item % vector_count;
-    const auto target =
-        fanout[partition_fanout_base + header.dst_row + fanout_slot];
-    const auto destination =
-        a.node * a.local_world_size + target.destination_local_rank;
-    const auto *compact_to_padded = peer_at<const unsigned int>(
-        a.peer_bases[destination], a.compact_to_padded_offset);
-    const auto destination_row = compact_to_padded[target.dst_row];
+  const auto top_k = a.dispatch.identity.top_k;
+  const auto items = static_cast<std::uint64_t>(state.batch_packets) * top_k;
+  constexpr std::uint32_t kWarps =
+      backward_tuning::kComputeThreads / 32U;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  for (std::uint64_t item = warp; warp < kWarps && item < items;
+       item += kWarps) {
+    const auto packet_offset = item / top_k;
+    const auto fanout_slot = item % top_k;
+    const auto packet =
+        partition_packet_base + state.packet_cursor + packet_offset;
+    std::uint32_t valid = 0U;
+    std::uint32_t destination = 0U;
+    std::uint32_t destination_row = 0U;
+    if (lane == 0U) {
+      const auto header = headers[packet];
+      if (fanout_slot < header.route_index) {
+        const auto target =
+            fanout[partition_fanout_base + header.dst_row + fanout_slot];
+        destination =
+            a.node * a.local_world_size + target.destination_local_rank;
+        const auto *compact_to_padded = peer_at<const unsigned int>(
+            a.peer_bases[destination], a.compact_to_padded_offset);
+        destination_row = compact_to_padded[target.dst_row];
+        valid = 1U;
+      }
+    }
+    valid = __shfl_sync(0xffffffffU, valid, 0U);
+    if (valid == 0U)
+      continue;
+    destination = __shfl_sync(0xffffffffU, destination, 0U);
+    destination_row = __shfl_sync(0xffffffffU, destination_row, 0U);
     auto *destination_dr = peer_at<transport::BFloat16>(
         a.peer_bases[destination], a.padded_dr_offset);
-    reinterpret_cast<uint4 *>(destination_dr)[
-        static_cast<std::uint64_t>(destination_row) * vector_count + vector] =
-        reinterpret_cast<const uint4 *>(payload)[packet * vector_count +
-                                                  vector];
+    auto *target = reinterpret_cast<uint4 *>(destination_dr) +
+                   static_cast<std::uint64_t>(destination_row) * vector_count;
+    const auto *source = reinterpret_cast<const uint4 *>(payload) +
+                         packet * vector_count;
+    for (std::uint64_t vector = lane; vector < vector_count; vector += 32ULL)
+      target[vector] = source[vector];
   }
   __threadfence_system();
   __syncthreads();
 
-  for (std::uint32_t fanout_slot = threadIdx.x;
-       fanout_slot < state.current_fanout; fanout_slot += blockDim.x) {
-    const auto target =
-        fanout[partition_fanout_base + header.dst_row + fanout_slot];
+  for (std::uint64_t item = threadIdx.x; item < items;
+       item += blockDim.x) {
+    const auto packet_offset = item / top_k;
+    const auto fanout_slot = item % top_k;
+    const auto packet =
+        partition_packet_base + state.packet_cursor + packet_offset;
+    const auto header = headers[packet];
+    if (fanout_slot >= header.route_index)
+      continue;
+    const auto target = fanout[partition_fanout_base + header.dst_row +
+                               fanout_slot];
     const auto destination =
         a.node * a.local_world_size + target.destination_local_rank;
     const auto *compact_to_padded = peer_at<const unsigned int>(
@@ -214,8 +248,8 @@ __device__ __forceinline__ bool progress_inbound_once(
   }
   __syncthreads();
   if (threadIdx.x == 0U) {
-    ++state.packet_cursor;
-    --state.wave_remaining;
+    state.packet_cursor += state.batch_packets;
+    state.wave_remaining -= state.batch_packets;
     state.progressed = 1U;
   }
   __syncthreads();
