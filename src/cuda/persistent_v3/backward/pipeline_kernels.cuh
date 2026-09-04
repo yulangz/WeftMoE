@@ -211,6 +211,8 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
       words + layout.descriptors);
   const auto *padded_offsets = peer_at<const unsigned long long>(
       a.local_base, a.padded_expert_offsets_offset);
+  const auto *headers = peer_at<const LocalP2pRouteHeader>(
+      a.local_base, a.direct_headers_offset);
   for (std::uint32_t mblock = threadIdx.x; mblock < a.mblocks;
        mblock += blockDim.x) {
     const auto padded_row =
@@ -234,6 +236,14 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
         static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[expert] +
                                    local_row),
         static_cast<std::uint32_t>(padded_row), expert, valid_rows};
+    unsigned long long context_mask = 0ULL;
+    const auto compact_row = descriptors[mblock].compact_row;
+    for (std::uint32_t row = 0U; row < valid_rows; ++row) {
+      const auto source = headers[compact_row + row].source_rank;
+      if (source / a.local_world_size != a.node)
+        context_mask |= 1ULL << (source % a.local_world_size);
+    }
+    words[layout.return_context_mask + mblock] = context_mask;
   }
   __syncthreads();
   if (threadIdx.x == 0U)

@@ -378,6 +378,7 @@ struct RdmaSharedState {
   std::uint32_t mblock_cursor = 0U;
   std::uint32_t selected_mblock = 0U;
   std::uint32_t completed_mblocks = 0U;
+  std::uint32_t expected_mblocks = 0U;
   std::uint32_t selected = 0U;
   std::uint32_t row_cursor = 0U;
   std::uint32_t run_canonical = 0U;
@@ -491,13 +492,22 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
   auto *mapping = peer_at<unsigned long long>(
       a.local_base, a.forward_output_ready_epoch_offset);
   auto *return_staging = bytes + a.gin_return_staging_offset;
+  const auto *context_masks = words + scheduler_layout.return_context_mask;
+
+  if (threadIdx.x == 0U) {
+    const auto context_bit = 1ULL << context;
+    for (std::uint32_t mblock = 0U; mblock < a.mblocks; ++mblock)
+      state.expected_mblocks +=
+          (context_masks[mblock] & context_bit) != 0ULL ? 1U : 0U;
+  }
+  __syncthreads();
 
   // FULL Return: each context owns exactly the remote source local-rank with
   // the same ordinal.  Scan completed M128 blocks cyclically so an unfinished
   // low-numbered block cannot hold up return traffic from later ready blocks.
   // The fixed per-block bitmask records which contexts have consumed a block;
   // it is scheduler metadata rather than a producer/consumer ring.
-  while (state.completed_mblocks < a.mblocks) {
+  while (state.completed_mblocks < state.expected_mblocks) {
     if (threadIdx.x == 0U) {
       state.selected = 0U;
       const auto expected =
@@ -508,6 +518,8 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
         auto mblock = state.mblock_cursor + probe;
         if (mblock >= a.mblocks)
           mblock -= a.mblocks;
+        if ((context_masks[mblock] & (1ULL << context)) == 0ULL)
+          continue;
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             context_done(
                 words[scheduler_layout.return_context_done + mblock]);
