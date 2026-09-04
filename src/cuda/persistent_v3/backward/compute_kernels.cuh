@@ -183,7 +183,9 @@ template <std::uint32_t TileM, std::uint32_t TileN,
           cute::UMMA::Major MajorA, cute::UMMA::Major MajorB,
           bool TmaOutput, std::uint32_t StageCount,
           std::uint32_t BarrierOffset,
-          std::uint32_t OutputOffsetElements>
+          std::uint32_t OutputOffsetElements,
+          bool WaitPreviousStore = false,
+          bool WaitCurrentStore = true>
 __device__ __forceinline__ void run_wgmma_tile(
     const CUtensorMap &a_map, const CUtensorMap &b_map,
     const CUtensorMap &output_store_map,
@@ -318,8 +320,8 @@ __device__ __forceinline__ void run_wgmma_tile(
                   shared_arena_elements<StorageTileN>());
     store_tma_accumulator<TileM, TileN, StorageTileN,
                           OutputOffsetElements>(
-        accum, output_store_map, output_row, output_column, storage, false,
-        true);
+        accum, output_store_map, output_row, output_column, storage,
+        WaitPreviousStore, WaitCurrentStore);
   } else {
 #pragma unroll
     for (std::uint32_t wave = 0U; wave < kMWaves; ++wave)
@@ -363,7 +365,9 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
 }
 
 template <std::uint32_t TileM, std::uint32_t TileN,
-          std::uint32_t StorageTileN = TileN>
+          std::uint32_t StorageTileN = TileN,
+          bool WaitPreviousStore = false,
+          bool WaitCurrentStore = true>
 __device__ __forceinline__ void run_mn_mn_tile(
     const CUtensorMap &left_map, const CUtensorMap &right_map,
     std::uint32_t output_row, std::uint32_t output_column,
@@ -375,7 +379,9 @@ __device__ __forceinline__ void run_mn_mn_tile(
   run_wgmma_tile<TileM, TileN, StorageTileN, cute::UMMA::Major::MN,
                  cute::UMMA::Major::MN, true, kDwStages,
                  2U * kActivationStages,
-                 kDwStages * stage_storage_elements<StorageTileN>()>(
+                 kDwStages * stage_storage_elements<StorageTileN>(),
+                 WaitPreviousStore,
+                 WaitCurrentStore>(
       left_map, right_map, output_store_map, output_row, output_column,
       reduction_start, reduction_start, reduction, output, output_width,
       global_output_row, output_column, storage, pipeline);
@@ -511,7 +517,7 @@ __device__ __forceinline__ void run_mn_mn_chunk(
           kDwStages * stage_storage_elements<StorageTileN>()>(
           accum, output_store_map,
           output_owner_row + m_tile * TileM, n_tile * TileN, storage,
-          offset != 0U, offset + 1U == tile_count);
+          true, false);
     }
   }
   __syncthreads();

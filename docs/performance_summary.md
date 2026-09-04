@@ -288,3 +288,23 @@ hit rate from 25.82% to 27.36%; subsequent activation buckets remain near 60%
 Tensor activity.  This localizes the gain to the initial readiness wave rather
 than a change in steady GEMM throughput.  Compact evidence is in
 [`benchmarks/results/backward_dispatch_wavefront_20260904.json`](../benchmarks/results/backward_dispatch_wavefront_20260904.json).
+
+## Backward dW store overlap
+
+The dW epilogue no longer waits immediately after its final shared-to-global
+TMA store.  A CTA waits only before the next dW epilogue reuses the same
+shared output tile.  In the meantime it can start the following WGMMA task;
+an intervening activation store or the CTA terminal path drains the pending
+store.  This is a compile-time policy with no pending-state variable, queue
+change, communication dependency, or grid synchronization.
+
+The generated compute kernel remains at 168 registers, 32 stack bytes, zero
+local bytes, and 213104 dynamic shared bytes.  Long order-reversed paired
+runs improved slowest-rank mean latency from 25.3281 to 25.2739 ms on one
+node (0.214%) and from 27.7543 to 27.6718 ms on two-node GIN (0.297%).  The
+dW2 span shortened by about 0.18 ms and 0.20 ms respectively.  Although the
+end-to-end change is deliberately small, it is retained because both
+topologies agree and the policy has no resource or protocol cost.  Five-repeat
+top-k 1/6 local and actual two-node top-k 6 validation stayed byte-stable.
+Compact evidence is in
+[`benchmarks/results/backward_deferred_dw_store_20260904.json`](../benchmarks/results/backward_deferred_dw_store_20260904.json).

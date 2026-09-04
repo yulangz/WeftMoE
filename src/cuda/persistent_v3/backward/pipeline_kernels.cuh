@@ -617,6 +617,8 @@ backward_local_compute_kernel(
       backward_tuning::kMainIntermediate / DabTileN;
   constexpr std::uint32_t kDxTiles =
       backward_tuning::kMainHidden / DxTileN;
+  constexpr std::uint32_t kDwStoreIssuers =
+      (backward_tuning::kDwTileM / 128U) * (DwTileN / 64U);
   extern __shared__ __align__(1024) unsigned char storage[];
   __shared__ std::uint32_t task_kind_shared;
   __shared__ std::uint32_t task_owner_shared;
@@ -710,8 +712,12 @@ backward_local_compute_kernel(
       }
     }
     __syncthreads();
-    if (task_kind_shared == kTerminalTask)
+    if (task_kind_shared == kTerminalTask) {
+      if (threadIdx.x < kDwStoreIssuers)
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+      __syncthreads();
       break;
+    }
     if (task_kind_shared == kNoTask) {
       __nanosleep(backward_tuning::kQueueIdleNanosleep);
       __syncthreads();
@@ -881,7 +887,7 @@ backward_local_compute_kernel(
         const auto current_m_tile = current_tile / kDw2NTiles;
         const auto current_n_tile = current_tile % kDw2NTiles;
         backward_compute_detail::run_mn_mn_tile<
-            backward_tuning::kDwTileM, DwTileN, kStorageTileN>(
+            backward_tuning::kDwTileM, DwTileN, kStorageTileN, true, false>(
             dr_mn_map, u_mn_map,
             current_m_tile * backward_tuning::kDwTileM,
             current_n_tile * DwTileN,
@@ -931,7 +937,7 @@ backward_local_compute_kernel(
         const auto current_m_tile = current_tile / kDw1NTiles;
         const auto current_n_tile = current_tile % kDw1NTiles;
         backward_compute_detail::run_mn_mn_tile<
-            backward_tuning::kDwTileM, DwTileN, kStorageTileN>(
+            backward_tuning::kDwTileM, DwTileN, kStorageTileN, true, false>(
             dab_mn_map, x_mn_map,
             current_m_tile * backward_tuning::kDwTileM,
             current_n_tile * DwTileN,

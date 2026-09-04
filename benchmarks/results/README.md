@@ -57,6 +57,9 @@ The current records are:
 - [`backward_swiglu_bf16x2_20260904.json`](backward_swiglu_bf16x2_20260904.json),
   the paired-BF16 fused SwiGLU epilogue, one-/two-node paired timing, and
   cross-topology repeated-output validation.
+- [`backward_deferred_dw_store_20260904.json`](backward_deferred_dw_store_20260904.json),
+  the resource-neutral dW TMA-store overlap across scheduler task boundaries,
+  paired one-/two-node timing, and terminal-drain correctness evidence.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.
