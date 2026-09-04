@@ -177,3 +177,27 @@ threads slightly faster for the isolated world-8 reducer, but less than 0.01%
 apart end-to-end, so the existing 256-thread default remains selected under
 the 0.5% promotion rule. Compact evidence is in
 [`benchmarks/results/backward_vector_reduce_20260904.json`](../benchmarks/results/backward_vector_reduce_20260904.json).
+
+## Backward dW reduction-tail trimming
+
+Physical expert storage and dependency M-blocks remain padded to 128 rows, but
+the setup kernel now records a separate dW reduction extent rounded to the
+64-row WGMMA K tile. dW1 and dW2 read that immutable extent and skip the final
+all-zero K stage where possible. The persistent loop gains no branch, grid
+synchronization, or communication dependency.
+
+Two 300-iteration world-8 candidate runs averaged 28.0376 ms, versus a
+28.3056 ms same-binary-generation control, a 0.95% reduction. Two
+100-iteration world-16 GIN candidate runs averaged 29.7221 ms, versus
+29.8674 ms across two interleaved controls, a 0.49% reduction. The resulting
+means are 1.076x and 1.448x faster than the corresponding retained-state
+Megatron device baselines.
+
+The compute kernel remains at 168 registers, 24 stack bytes, zero local bytes,
+and 213104 dynamic shared-memory bytes. Its static HGMMA and dependency-barrier
+counts remain exactly 72 and 30; earlier runtime-rounding variants increased
+the latter to 80 and regressed, so they were discarded. Top-k=1 and top-k=6
+repeated validation passed, top-k=6 fingerprints matched the qualified
+predecessor exactly, and the two-node GIN path passed all-rank repeated-output
+validation. Compact evidence is in
+[`benchmarks/results/backward_dw_k64_20260904.json`](../benchmarks/results/backward_dw_k64_20260904.json).

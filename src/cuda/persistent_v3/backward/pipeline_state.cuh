@@ -38,6 +38,7 @@ struct BackwardSchedulerLayout {
   std::uint64_t return_context_mask = 0ULL;
   std::uint64_t return_context_done = 0ULL;
   std::uint64_t expert_mblocks_completed = 0ULL;
+  std::uint64_t dw_reduction_rows = 0ULL;
   std::uint64_t dx_ready = 0ULL;
   std::uint64_t dab_ready = 0ULL;
   std::uint64_t dw2_ready = 0ULL;
@@ -118,6 +119,8 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
   counter(layout.completed_dx_tiles);
   counter(layout.completed_dw2_tiles);
   counter(layout.completed_dw1_tiles);
+  layout.dw_reduction_rows = cursor;
+  cursor += experts;
   layout.total_words = align_backward_scheduler_words(cursor);
   return layout;
 }

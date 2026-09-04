@@ -62,10 +62,15 @@ epilogue avoids extending every WGMMA task with the long dependency chain of
 SwiGLU recomputation; a fused experiment regressed both local and two-node
 latency and was removed.
 
-All expert row ranges are padded to 128. Padding rows are zero in `X`, `dR`,
-`A/B`, `U`, and `dAB`, so the GEMM inner loops do not need divergent tail
-handling. A 128-row dependency M-block remains the canonical identity even if
-autotuning chooses an internal M64 compute tile.
+All expert row ranges are physically padded to 128. Padding rows are zero in
+`X`, `dR`, `A/B`, `U`, and `dAB`, so the GEMM inner loops do not need
+divergent tail handling. A 128-row dependency M-block remains the canonical
+identity even if autotuning chooses an internal M64 compute tile. The setup
+kernel separately precomputes each expert's dW reduction extent as the valid
+row count rounded up to the 64-row WGMMA K tile. dW therefore skips a final
+all-zero 64-row K stage when the physical 128-row padding does not require it;
+storage addresses, readiness accounting, and M-block identity remain padded
+to 128.
 
 ## Four logical work queues
 
@@ -86,7 +91,8 @@ complete` prerequisite for an expert's `dW2`, and neither dW queue depends on
 all `dX` being computed or sent.
 
 Each `dW` output tile is owned by one CTA, uses FP32 accumulation, traverses
-the expert's padded M rows in canonical order, and defaults to `split_k=1`.
+the expert's valid M rows plus at most 63 zero padding rows in canonical order,
+and defaults to `split_k=1`.
 The selected dW output tile is 128x256x64 with three stages; its M/N tile,
 stage count, and register split remain compile-time tuning parameters.
 

@@ -209,6 +209,15 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
       a.local_base, a.padded_expert_offsets_offset);
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
       a.local_base, a.direct_headers_offset);
+  for (std::uint32_t expert = threadIdx.x;
+       expert < a.dispatch.sizes.owned_expert_count;
+       expert += blockDim.x) {
+    const auto rows = a.dispatch.expert_row_count[expert];
+    words[layout.dw_reduction_rows + expert] =
+        ((rows + backward_tuning::kTileK - 1ULL) /
+         backward_tuning::kTileK) *
+        backward_tuning::kTileK;
+  }
   for (std::uint32_t mblock = threadIdx.x; mblock < a.mblocks;
        mblock += blockDim.x) {
     const auto padded_row =
@@ -852,10 +861,10 @@ backward_local_compute_kernel(
       if (threadIdx.x == 0U)
         atomicMin(&status->backward_dw2_start_clock,
                   device_globaltimer_ns());
-      const auto *padded_rows = peer_at<const unsigned long long>(
-          a.local_base, a.padded_expert_rows_offset);
       const auto *padded_offsets = peer_at<const unsigned long long>(
           a.local_base, a.padded_expert_offsets_offset);
+      const auto reduction_rows = static_cast<std::uint32_t>(
+          words[layout.dw_reduction_rows + owner]);
       auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset);
       if (task_count_shared > 1U) {
         backward_compute_detail::run_mn_mn_chunk<
@@ -863,7 +872,7 @@ backward_local_compute_kernel(
             dr_mn_map, u_mn_map, dw2_store_map, tile,
             task_count_shared, kDw2NTiles,
             static_cast<std::uint32_t>(padded_offsets[owner]),
-            static_cast<std::uint32_t>(padded_rows[owner]),
+            reduction_rows,
             static_cast<std::uint32_t>(a.intermediate),
             owner * static_cast<std::uint32_t>(a.hidden), storage,
             dw_pipeline);
@@ -877,7 +886,7 @@ backward_local_compute_kernel(
             current_m_tile * backward_tuning::kDwTileM,
             current_n_tile * DwTileN,
             static_cast<std::uint32_t>(padded_offsets[owner]),
-            static_cast<std::uint32_t>(padded_rows[owner]), dw2,
+            reduction_rows, dw2,
             a.intermediate,
             owner * static_cast<std::uint32_t>(a.hidden) +
                 current_m_tile * backward_tuning::kDwTileM,
@@ -902,10 +911,10 @@ backward_local_compute_kernel(
       if (threadIdx.x == 0U)
         atomicMin(&status->backward_dw1_start_clock,
                   device_globaltimer_ns());
-      const auto *padded_rows = peer_at<const unsigned long long>(
-          a.local_base, a.padded_expert_rows_offset);
       const auto *padded_offsets = peer_at<const unsigned long long>(
           a.local_base, a.padded_expert_offsets_offset);
+      const auto reduction_rows = static_cast<std::uint32_t>(
+          words[layout.dw_reduction_rows + owner]);
       auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset);
       if (task_count_shared > 1U) {
         backward_compute_detail::run_mn_mn_chunk<
@@ -913,7 +922,7 @@ backward_local_compute_kernel(
             dab_mn_map, x_mn_map, dw1_store_map, tile,
             task_count_shared, kDw1NTiles,
             static_cast<std::uint32_t>(padded_offsets[owner]),
-            static_cast<std::uint32_t>(padded_rows[owner]),
+            reduction_rows,
             static_cast<std::uint32_t>(a.hidden),
             owner * static_cast<std::uint32_t>(2ULL * a.intermediate),
             storage, dw_pipeline);
@@ -927,7 +936,7 @@ backward_local_compute_kernel(
             current_m_tile * backward_tuning::kDwTileM,
             current_n_tile * DwTileN,
             static_cast<std::uint32_t>(padded_offsets[owner]),
-            static_cast<std::uint32_t>(padded_rows[owner]), dw1, a.hidden,
+            reduction_rows, dw1, a.hidden,
             owner * static_cast<std::uint32_t>(2ULL * a.intermediate) +
                 current_m_tile * backward_tuning::kDwTileM,
             dw1_store_map, storage, dw_pipeline);
