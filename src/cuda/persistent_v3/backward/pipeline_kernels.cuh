@@ -628,12 +628,6 @@ backward_local_compute_kernel(
       words + layout.descriptors);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   bool activation_complete = false;
-  std::uint32_t pending_dw2_owner = 0U;
-  std::uint32_t pending_dw2_next = 0U;
-  std::uint32_t pending_dw2_end = 0U;
-  std::uint32_t pending_dw1_owner = 0U;
-  std::uint32_t pending_dw1_next = 0U;
-  std::uint32_t pending_dw1_end = 0U;
 
   while (true) {
     if (threadIdx.x == 0U) {
@@ -657,46 +651,23 @@ backward_local_compute_kernel(
         }
       }
       if (!claimed) {
-        if (pending_dw2_next != pending_dw2_end) {
-          const auto count = activation_complete
-                                 ? pending_dw2_end - pending_dw2_next
-                                 : 1U;
-          task = TileTask{pending_dw2_owner, pending_dw2_next,
-                          TaskKind::Dw2, count};
-          pending_dw2_next += count;
-          claimed = true;
-        } else {
-          claimed =
-              megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
-                  queues.dw2, task);
-          if (claimed && task.tile_count > 1U && !activation_complete) {
-            pending_dw2_owner = task.owner;
-            pending_dw2_next = task.tile + 1U;
-            pending_dw2_end = task.tile + task.tile_count;
-            task.tile_count = 1U;
-          }
-        }
+        // Do not reserve a private dW backlog while activation work can still
+        // arrive.  Once dX is globally complete, restore the tuned multi-tile
+        // claims so each CTA can keep the dW K pipeline hot.
+        auto dw2 = queues.dw2;
+        if (!activation_complete)
+          dw2.claim_granularity = 1U;
+        claimed =
+            megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                dw2, task);
       }
       if (!claimed) {
-        if (pending_dw1_next != pending_dw1_end) {
-          const auto count = activation_complete
-                                 ? pending_dw1_end - pending_dw1_next
-                                 : 1U;
-          task = TileTask{pending_dw1_owner, pending_dw1_next,
-                          TaskKind::Dw1, count};
-          pending_dw1_next += count;
-          claimed = true;
-        } else {
-          claimed =
-              megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
-                  queues.dw1, task);
-          if (claimed && task.tile_count > 1U && !activation_complete) {
-            pending_dw1_owner = task.owner;
-            pending_dw1_next = task.tile + 1U;
-            pending_dw1_end = task.tile + task.tile_count;
-            task.tile_count = 1U;
-          }
-        }
+        auto dw1 = queues.dw1;
+        if (!activation_complete)
+          dw1.claim_granularity = 1U;
+        claimed =
+            megamoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                dw1, task);
       }
       if (claimed) {
         task_kind_shared = static_cast<std::uint32_t>(task.kind);
