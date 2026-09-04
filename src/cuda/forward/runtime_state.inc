@@ -1819,18 +1819,14 @@ ActivationTransportResourcePool make_activation_transport_pool(
       if (config.enable_backward_state) {
         create_timing_event(&slot.backward_start,
                             "cudaEventCreate(Backward start)");
-        create_timing_event(&slot.backward_dispatch_done,
-                            "cudaEventCreate(Backward dispatch done)");
-        create_timing_event(&slot.backward_dab_done,
-                            "cudaEventCreate(Backward dAB done)");
-        create_timing_event(&slot.backward_dx_done,
-                            "cudaEventCreate(Backward dX done)");
-        create_timing_event(&slot.backward_dw2_done,
-                            "cudaEventCreate(Backward dW2 done)");
-        create_timing_event(&slot.backward_dw1_done,
-                            "cudaEventCreate(Backward dW1 done)");
-        create_timing_event(&slot.backward_return_done,
-                            "cudaEventCreate(Backward return done)");
+        create_timing_event(&slot.backward_compute_start,
+                            "cudaEventCreate(Backward compute start)");
+        create_timing_event(&slot.backward_compute_done,
+                            "cudaEventCreate(Backward compute done)");
+        create_timing_event(&slot.backward_transport_done,
+                            "cudaEventCreate(Backward transport done)");
+        create_timing_event(&slot.backward_reduce_done,
+                            "cudaEventCreate(Backward reduce done)");
         create_timing_event(&slot.backward_complete,
                             "cudaEventCreate(Backward complete)");
       }

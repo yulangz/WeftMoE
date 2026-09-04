@@ -108,6 +108,10 @@ void run_cached_backward_rank(
   require(rounds > warmups, "Backward requires at least one measured round");
   std::vector<double> wall_samples;
   std::vector<double> total_samples;
+  std::vector<double> prepare_samples;
+  std::vector<double> compute_samples;
+  std::vector<double> reduce_samples;
+  std::vector<double> transport_samples;
   std::vector<double> dispatch_samples;
   std::vector<double> dab_samples;
   std::vector<double> dx_samples;
@@ -127,6 +131,10 @@ void run_cached_backward_rank(
       wall_samples.push_back(
           std::chrono::duration<double, std::micro>(end - begin).count());
       total_samples.push_back(output.timings().total_us);
+      prepare_samples.push_back(output.timings().prepare_us);
+      compute_samples.push_back(output.timings().compute_us);
+      reduce_samples.push_back(output.timings().reduce_us);
+      transport_samples.push_back(output.timings().transport_us);
       dispatch_samples.push_back(output.timings().dispatch_us);
       dab_samples.push_back(output.timings().dab_us);
       dx_samples.push_back(output.timings().dx_us);
@@ -223,6 +231,14 @@ void run_cached_backward_rank(
   emit(wall_samples);
   std::cout << " total=";
   emit(total_samples);
+  std::cout << " prepare=";
+  emit(prepare_samples);
+  std::cout << " compute=";
+  emit(compute_samples);
+  std::cout << " reduce=";
+  emit(reduce_samples);
+  std::cout << " transport=";
+  emit(transport_samples);
   std::cout << " dispatch=";
   emit(dispatch_samples);
   std::cout << " dab=";

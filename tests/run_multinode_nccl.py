@@ -171,8 +171,9 @@ def aggregate_gin_backward(outputs):
     records = [parse_fields(item.stdout, "BACKWARD_RESULT ")
                for item in outputs]
     stage_keys = (
-        "wall", "total", "dispatch", "dab", "dx", "dw2", "dw1",
-        "combine", "dw_combine_overlap")
+        "wall", "total", "prepare", "compute", "reduce", "transport",
+        "dispatch", "dab", "dx", "dw2", "dw1", "combine",
+        "dw_combine_overlap")
     measured = None
     for rank, record in enumerate(records):
         if record.get("backend") != "gin-rdma":

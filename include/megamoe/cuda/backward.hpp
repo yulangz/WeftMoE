@@ -43,6 +43,10 @@ struct BackwardMegaKernelConfig {
 };
 
 struct BackwardMegaKernelTimings {
+  double prepare_us = 0;
+  double compute_us = 0;
+  double reduce_us = 0;
+  double transport_us = 0;
   double dispatch_us = 0;
   double dab_us = 0;
   double dx_us = 0;

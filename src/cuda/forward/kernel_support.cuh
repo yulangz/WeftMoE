@@ -1145,12 +1145,10 @@ struct PoolSlot {
   cudaEvent_t forward_m64_head_done = nullptr;
   cudaEvent_t forward_compute_done = nullptr;
   cudaEvent_t backward_start = nullptr;
-  cudaEvent_t backward_dispatch_done = nullptr;
-  cudaEvent_t backward_dab_done = nullptr;
-  cudaEvent_t backward_dx_done = nullptr;
-  cudaEvent_t backward_dw2_done = nullptr;
-  cudaEvent_t backward_dw1_done = nullptr;
-  cudaEvent_t backward_return_done = nullptr;
+  cudaEvent_t backward_compute_start = nullptr;
+  cudaEvent_t backward_compute_done = nullptr;
+  cudaEvent_t backward_transport_done = nullptr;
+  cudaEvent_t backward_reduce_done = nullptr;
   cudaEvent_t backward_complete = nullptr;
   cudaEvent_t dispatch_complete = nullptr;
   cudaEvent_t complete = nullptr;
@@ -1296,10 +1294,9 @@ struct ActivationPoolState {
       if (slot.forward_compute_done)
         (void)cudaEventDestroy(slot.forward_compute_done);
       const cudaEvent_t backward_events[] = {
-          slot.backward_start,       slot.backward_dispatch_done,
-          slot.backward_dab_done,    slot.backward_dx_done,
-          slot.backward_dw2_done,    slot.backward_dw1_done,
-          slot.backward_return_done, slot.backward_complete};
+          slot.backward_start,         slot.backward_compute_start,
+          slot.backward_compute_done,  slot.backward_transport_done,
+          slot.backward_reduce_done,   slot.backward_complete};
       for (const auto event : backward_events) {
         if (event)
           internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);

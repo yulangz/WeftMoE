@@ -454,6 +454,11 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                                        transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "publish Backward cached rows");
+  internal::throw_cuda(
+      "backward-run",
+      cudaEventRecord(slot.backward_compute_start, transport_stream),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "record Backward compute start");
   backward_local_transport_kernel<<<transport_ctas,
                                     backward_tuning::kComputeThreads,
                                     kPersistentSmem,
@@ -464,9 +469,9 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "persistent local Backward Relay launch");
   internal::throw_cuda(
       "backward-run",
-      cudaEventRecord(slot.backward_dispatch_done, transport_stream),
+      cudaEventRecord(slot.backward_transport_done, transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward Relay completion");
+      ExchangeKind::ExpertCounts, "record Backward transport completion");
   internal::throw_cuda(
       "backward-run",
       cudaStreamWaitEvent(compute_stream, slot.forward_roles_ready),
@@ -493,21 +498,10 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "backward", identity.generation, ExchangeKind::ExpertCounts,
       "persistent priority DAB/DX/dW TMA-WGMMA launch");
   internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_dab_done, compute_stream),
+      "backward-run",
+      cudaEventRecord(slot.backward_compute_done, compute_stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record pipelined dAB completion");
-  internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_dx_done, compute_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record pipelined dX completion");
-  internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_dw2_done, compute_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record pipelined dW2 completion");
-  internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_dw1_done, compute_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record pipelined dW1 completion");
+      ExchangeKind::ExpertCounts, "record Backward compute completion");
 
   // Queue route reduction behind the persistent compute grid, not behind the
   // transport grid.  This guarantees all compute CTAs were resident (avoiding
@@ -523,23 +517,19 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   }
   internal::throw_cuda(
       "backward-run",
-      cudaEventRecord(slot.backward_return_done, compute_stream),
+      cudaEventRecord(slot.backward_reduce_done, compute_stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward return done");
+      ExchangeKind::ExpertCounts, "record Backward reduction completion");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(exec->stream, slot.backward_return_done),
+      cudaStreamWaitEvent(exec->stream, slot.backward_reduce_done),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "join Backward reduction");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(exec->stream, slot.backward_dispatch_done),
+      cudaStreamWaitEvent(exec->stream, slot.backward_transport_done),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "join Backward transport roles");
-  internal::throw_cuda(
-      "backward-run", cudaStreamWaitEvent(exec->stream, slot.backward_dw1_done),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "join Backward dW");
   internal::throw_cuda(
       "backward-run",
       cudaMemcpyAsync(slot.host_status,
@@ -598,6 +588,18 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                ? 0.0
                : static_cast<double>(end - begin) / 1000.0;
   };
+  result->timings.prepare_us = backward_elapsed_us(
+      slot.backward_start, slot.backward_compute_start, identity,
+      "Backward cache preparation elapsed");
+  result->timings.compute_us = backward_elapsed_us(
+      slot.backward_compute_start, slot.backward_compute_done, identity,
+      "Backward persistent compute elapsed");
+  result->timings.reduce_us = backward_elapsed_us(
+      slot.backward_compute_done, slot.backward_reduce_done, identity,
+      "Backward dX reduction elapsed");
+  result->timings.transport_us = backward_elapsed_us(
+      slot.backward_compute_start, slot.backward_transport_done, identity,
+      "Backward persistent transport elapsed");
   result->timings.dispatch_us = device_span_us(
       slot.host_status->start_clock,
       slot.host_status->dispatch_complete_clock);

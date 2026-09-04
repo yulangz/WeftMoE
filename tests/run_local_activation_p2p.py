@@ -490,7 +490,8 @@ def main():
                   f"tokens={args.backward_tokens or 8}")
             return
         if args.backward_benchmark:
-            stage_keys = ("wall", "total", "dispatch", "dab", "dx",
+            stage_keys = ("wall", "total", "prepare", "compute", "reduce",
+                          "transport", "dispatch", "dab", "dx",
                           "dw2", "dw1", "combine",
                           "dw_combine_overlap")
             measured = args.rounds - 10
