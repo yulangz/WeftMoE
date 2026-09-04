@@ -102,7 +102,20 @@
       "final_compute_mean_us": 29992.651,
       "final_transport_mean_us": 25732.816,
       "final_reduce_mean_us": 1248.317,
-      "final_speedup_over_megatron": 1.434
+      "final_speedup_over_megatron": 1.434,
+      "relay_extension_search": {
+        "artifact": "artifacts/backward_world16_relay_extension_20260904.json",
+        "wall_seconds": 376.38,
+        "tested_relay_ctas": [16, 20, 24],
+        "selected_relay_ctas": 16,
+        "relay20_confirmed_regression_percent": 0.078,
+        "relay24_initial_mean_us": 30050.235,
+        "final_100_iteration_mean_us": 29882.616,
+        "final_100_iteration_p95_us": 31584.5,
+        "final_compute_mean_us": 29862.108,
+        "final_transport_mean_us": 25450.041,
+        "final_speedup_over_megatron": 1.44
+      }
     }
   },
   "correctness": {

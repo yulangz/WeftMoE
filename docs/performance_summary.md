@@ -143,6 +143,10 @@ the former 12-Relay point. The independent final run measured 30.0128 ms mean
 and 31.6778 ms p95 over 100 iterations, or 1.434x over the 43.0339 ms Megatron
 device baseline. The full compile, preflight, tune, confirmation, and final
 sequence took 587.1 seconds.
+Because 16 Relay CTAs was the upper search boundary, a follow-up search tested
+20 and 24. Relay=20 was 0.08% slower after paired confirmation and relay=24
+regressed further, so 16 remains the interior winner. Its follow-up final run
+measured 29.8826 ms mean (1.440x over Megatron).
 
 The compute kernel remains at 168 registers, 24 stack bytes, zero local bytes,
 and 213104 dynamic shared-memory bytes per CTA. Small- and full-shape repeated
