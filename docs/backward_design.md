@@ -1,9 +1,9 @@
 # Backward pipeline design
 
-This document fixes the Backward dataflow and scheduling contract implemented
-by the CUDA qualification path. `backward_pipeline_available()` remains false
-until the selected world-8 and world-16 configurations complete final
-performance qualification.
+This document fixes the qualified Backward dataflow and scheduling contract.
+The selected world-8 and world-16 configurations have completed correctness,
+stability, and performance qualification; `backward_pipeline_available()`
+therefore returns true in CUDA-backed binaries.
 
 ## Numeric contract and retained Forward state
 

@@ -374,3 +374,39 @@ Top-k 1/6 world-8 and actual two-node GIN five-repeat checks were byte-stable.
 The independent PyTorch oracle reproduced the same error bounds as the
 compact-X/A/B milestone, including byte-exact dW2. Compact evidence is in
 [`benchmarks/results/backward_compact_dr_20260904.json`](../benchmarks/results/backward_compact_dr_20260904.json).
+
+## Backward final qualification
+
+After compact dR landed, both maintained narrow plans were rerun from a clean
+`ef38139` worktree. The searches compiled and correctness-preflighted every
+candidate before timing, then compared the incumbent and strongest challenger
+in two reversed 60-iteration confirmation passes. All candidates produced the
+same four-output fingerprint and repeat-stable results.
+
+| topology | candidates | tune wall | selected Relay / Dispatch rows | final total mean / p95 | final wall mean | Megatron speedup at first-BWD boundary |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| world 8, one H200 node | 7 | 320.85 s | 12 / 16 | 25.218 / 27.305 ms | 25.899 ms | 1.273x |
+| world 16, two H200 nodes, GIN | 8 | 636.49 s | 16 / 64 | 27.617 / 29.632 ms | 28.540 ms | 1.607x |
+
+The world-8 incumbent beat the dispatch-32 challenger in both confirmation
+passes (25.203/25.311 ms versus 25.293/25.429 ms). On world 16, Relay-20 had a
+0.46% short-run lead but lost both confirmation passes (27.539/27.647 ms versus
+27.469/27.464 ms), so Relay-16 remains selected. The common compute point is
+M128, activation N256, dW 128x256x64, four activation stages, three dW stages,
+384 threads, two math warpgroups at 224 registers, and one producer warpgroup
+at 48 registers. Both topologies retain four-tile dW claims, four-owner
+activation locality, twelve epilogue rows per task, and a 256-thread reducer;
+world 8 launches no RDMA CTA while world 16 reserves eight.
+
+The meaningful one-Backward-per-Forward measurements remain 23.702 ms on
+world 8 and 26.782 ms on world 16, versus retained-state Megatron device means
+of 30.181 ms and 43.034 ms. With correctness, stability, topology-specific
+autotuning, and the performance target complete, the public Backward
+availability query is enabled. Compact search evidence is in
+[`benchmarks/results/backward_final_qualification_20260904.json`](../benchmarks/results/backward_final_qualification_20260904.json).
+
+A fresh rebuild after enabling the CUDA availability symbol retained the same
+168-register/56-byte-stack compute kernel and 72-register/8-byte-stack
+transport kernel. Its 100-iteration totals were 25.245 ms on world 8 and
+27.629 ms on world 16, respectively 0.10% and 0.04% from the qualification
+records. The actual two-node GIN stability smoke also remained byte-identical.

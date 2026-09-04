@@ -66,6 +66,9 @@ The current records are:
 - [`backward_compact_dr_20260904.json`](backward_compact_dr_20260904.json),
   compact dR reuse of dead Forward output storage, reproducible zero-warmup
   timing, one-/two-node performance, and unchanged independent accuracy.
+- [`backward_final_qualification_20260904.json`](backward_final_qualification_20260904.json),
+  the post-layout narrow autotune, unchanged topology-specific winners, final
+  100-iteration timing, and the public Backward availability decision.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

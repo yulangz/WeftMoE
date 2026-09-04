@@ -17,10 +17,9 @@ The current optimized contract is intentionally narrow:
 - one-node CUDA IPC/NVLink and two-node NCCL GIN/RDMA execution.
 
 There is no generic-shape or legacy single-node compute fallback. Unsupported
-shapes fail closed. The new Backward implementation is present behind the
-cached-state API and is undergoing final performance qualification;
-`cuda::backward_pipeline_available()` therefore still returns `false` for
-external feature discovery.
+shapes fail closed. The cached-state Backward implementation is qualified on
+the maintained one- and two-node configurations, so CUDA-backed binaries make
+`cuda::backward_pipeline_available()` return `true`.
 
 A pool may explicitly reserve Backward state. In that mode Forward preserves
 post-Dispatch canonical X, writes plane-major BF16 A/B checkpoints, and uses a

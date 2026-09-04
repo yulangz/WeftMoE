@@ -22,6 +22,6 @@ opt-in retained-state flag: construct the activation pool with
 `enable_backward_state=true`, then run Forward with
 `retain_backward_state=true`. This preserves canonical X and BF16 A/B in the
 generation slot without exposing raw pointers. The typed cached-state Backward
-handle and configuration are implemented for qualification; production code
-must still check `backward_pipeline_available()`, which remains false until the
-maintained performance plans are finalized.
+handle and configuration are performance-qualified for the maintained Hopper
+shapes. `backward_pipeline_available()` now returns true in CUDA-backed
+binaries and remains false in CPU-only control-plane builds.

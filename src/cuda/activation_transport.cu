@@ -121,6 +121,7 @@ cudaError_t launch_local(const cudaLaunchConfig_t *config,
 #include "cuda/backward/host_launch.inc"
 #include "cuda/testing/transport_probes.inc"
 
+bool backward_pipeline_available() noexcept { return true; }
 
 } // namespace megamoe::cuda
 

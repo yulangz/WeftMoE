@@ -98,8 +98,8 @@ public:
       const ActivationTransportRunOptions &options = {}) const;
 };
 
-// Remains false until local and GIN paths both use the final persistent,
-// work-conserving queue implementation and pass performance qualification.
+// Reports whether this binary contains the cached-state CUDA implementation
+// that passed the maintained local and GIN qualification.
 bool backward_pipeline_available() noexcept;
 
 } // namespace megamoe::cuda

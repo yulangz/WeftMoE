@@ -2,8 +2,9 @@
 
 - The optimized kernel accepts only hidden 7168 and intermediate 3072. The
   removed generic-shape path is not a supported fallback.
-- Backward is unavailable and will be redesigned from the Forward split-role
-  architecture. The public availability query returns `false`.
+- Backward requires retained Forward X and BF16 A/B state and supports only the
+  maintained cached-state shape and one-/two-node split-role topologies. It has
+  no generic-shape or recompute-FC1 fallback.
 - Production topology requires homogeneous nodes, dense node/local-rank IDs,
   and complete rails. Physical GIN testing currently covers one and two nodes.
 - The target hosts contain eight H200 GPUs but the installed driver reports
