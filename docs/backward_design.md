@@ -107,6 +107,10 @@ dW tile starts it is not preempted, so its tile duration bounds the wake-up
 latency when a later `dR` wave arrives. There is no static CTA reservation, CTA
 cohort, priority-burst policy, or age-based fairness. `dW2` is always probed
 before `dW1`; tile shape and stage count remain compile-time tuning choices.
+While activation work remains, each dW claim is deliberately limited to one
+tile so that a CTA cannot hoard a long chunk across a newly published dX/dAB
+task. Once dX is complete, the topology-specific compile-time claim size is
+used; the qualified world-8 and world-16 settings both use four tiles.
 
 The execution therefore has two conceptual periods but no physical phase
 transition:

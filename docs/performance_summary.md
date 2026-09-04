@@ -130,6 +130,12 @@ Paired 300-iteration runs measured the following slowest-rank means:
 | world 8, one H200 node | 29.1292 ms | 28.7763 ms | 1.21% | 1.049x |
 | world 16, two H200 nodes, GIN | 31.2920 ms | 30.5813 ms | 2.27% | 1.407x |
 
+After adding late workers, the world-8 JIT search was repeated over six narrow
+candidates. It selected four-tile dW claims over the former eight-tile claims
+by 1.20% under the confirmation policy. The independent final run measured
+28.4960 ms mean and 30.5961 ms p95 over 100 iterations, or 1.059x over the
+30.1810 ms Megatron device baseline. The full search took 175.8 seconds.
+
 The compute kernel remains at 168 registers, 24 stack bytes, zero local bytes,
 and 213104 dynamic shared-memory bytes per CTA. Small- and full-shape repeated
 validation was byte-identical on all four outputs for both topologies. A first
