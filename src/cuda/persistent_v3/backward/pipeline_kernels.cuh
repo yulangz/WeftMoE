@@ -446,9 +446,11 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
             scan.fetch_add(1ULL, ::cuda::memory_order_relaxed) % a.mblocks);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             completed(words[layout.dx_completed + mblock]);
-        const auto dx_tiles = static_cast<unsigned long long>(
-            a.hidden / backward_tuning::kDxTileN);
-        if (completed.load(::cuda::memory_order_acquire) == dx_tiles) {
+        const auto dx_ready =
+            megamoe::cuda::persistent_v3::backward::backward_dx_ready_value(
+                static_cast<std::uint32_t>(
+                    a.hidden / backward_tuning::kDxTileN));
+        if (completed.load(::cuda::memory_order_acquire) == dx_ready) {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
               phase(words[layout.phase + mblock]);
           auto expected = 3ULL;
@@ -472,6 +474,11 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
           a.local_base, a.direct_headers_offset);
       const auto *dx = peer_at<const transport::BFloat16>(
           a.local_base, a.dx_rows_offset);
+      const auto *registered_dx =
+          a.use_gin
+              ? static_cast<const std::byte *>(a.gin_window_base) +
+                    a.gin_return_staging_offset
+              : static_cast<const std::byte *>(nullptr);
       const auto *dgate = peer_at<const float>(a.local_base,
                                                a.dgate_rows_offset);
       const auto warp = threadIdx.x / 32U;
@@ -484,8 +491,14 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
         if (a.use_gin &&
             header.source_rank / a.local_world_size != a.node)
           continue;
-        const auto *source = reinterpret_cast<const uint4 *>(
-            dx + static_cast<std::uint64_t>(padded_row) * a.hidden);
+        const auto *source =
+            a.use_gin
+                ? reinterpret_cast<const uint4 *>(
+                      registered_dx +
+                      static_cast<std::uint64_t>(padded_row) *
+                          a.gin_return_row_bytes)
+                : reinterpret_cast<const uint4 *>(
+                      dx + static_cast<std::uint64_t>(padded_row) * a.hidden);
         auto *destination = peer_at<transport::BFloat16>(
             a.peer_bases[header.source_rank], a.contribution_offset);
         auto *target = reinterpret_cast<uint4 *>(
@@ -740,7 +753,8 @@ backward_local_compute_kernel(
             dr_map, w2_map, u_store_map, descriptor.padded_row,
             descriptor.expert * static_cast<std::uint32_t>(a.hidden),
             static_cast<std::uint32_t>(a.hidden), du, a.intermediate,
-            tile * DabTileN, storage, activation_pipeline);
+            descriptor.padded_row, tile * DabTileN, storage,
+            activation_pipeline);
         if (threadIdx.x == 0U) {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
               completed(words[layout.du_completed + owner]);
@@ -822,13 +836,30 @@ backward_local_compute_kernel(
           descriptor.expert *
               static_cast<std::uint32_t>(2ULL * a.intermediate),
           static_cast<std::uint32_t>(2ULL * a.intermediate), dx, a.hidden,
-          tile * DxTileN, storage, activation_pipeline);
+          descriptor.padded_row, tile * DxTileN, storage,
+          activation_pipeline);
       __threadfence();
       __syncthreads();
       if (threadIdx.x == 0U) {
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             owner_completed(words[layout.dx_completed + owner]);
-        owner_completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+        const auto owner_done = owner_completed.fetch_add(
+                                    1ULL, ::cuda::memory_order_acq_rel) +
+                                1ULL;
+        phase_shared = owner_done == kDxTiles ? 1U : 0U;
+      }
+      __syncthreads();
+      if (phase_shared != 0U && a.use_gin)
+        __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0U) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            owner_completed(words[layout.dx_completed + owner]);
+        if (phase_shared != 0U)
+          owner_completed.store(
+              megamoe::cuda::persistent_v3::backward::
+                  backward_dx_ready_value(kDxTiles),
+              ::cuda::memory_order_release);
         auto *counter = reinterpret_cast<PaddedCounter *>(
             words + layout.completed_dx_tiles);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>

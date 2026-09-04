@@ -1626,11 +1626,21 @@ ActivationTransportResourcePool make_activation_transport_pool(
               config.max_intermediate_size,
               state->layout.backward_padded_capacity_rows,
               "Backward dU output");
-          slot.backward_dx_store_map = make_bf16_tma_store_map(
-              at<void>(slot.device, state->layout.backward_dx_rows),
-              config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dX output");
+          if (slot.gin_window != nullptr) {
+            slot.backward_dx_store_map = make_bf16_tma_store_map(
+                at<void>(slot.gin_window,
+                         state->gin_layout.return_staging),
+                config.max_hidden_size,
+                state->layout.backward_padded_capacity_rows,
+                "Backward registered dX output",
+                state->gin_layout.backward_return_row_bytes);
+          } else {
+            slot.backward_dx_store_map = make_bf16_tma_store_map(
+                at<void>(slot.device, state->layout.backward_dx_rows),
+                config.max_hidden_size,
+                state->layout.backward_padded_capacity_rows,
+                "Backward dX output");
+          }
           slot.backward_dw2_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_dw2),
               config.max_intermediate_size,

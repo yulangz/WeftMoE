@@ -147,7 +147,8 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
 
 CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
                                     std::uint64_t outer,
-                                    const char *field) {
+                                    const char *field,
+                                    std::uint64_t row_stride_bytes = 0ULL) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
       outer > UINT32_MAX)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
@@ -155,8 +156,16 @@ CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
                     "nonzero uint32 dimensions and valid base", "invalid");
   CUtensorMap map{};
   const cuuint64_t dims[2] = {inner, outer};
-  const cuuint64_t strides[1] = {
-      checked_mul(inner, sizeof(transport::BFloat16), field)};
+  const auto dense_row_bytes =
+      checked_mul(inner, sizeof(transport::BFloat16), field);
+  if (row_stride_bytes == 0ULL)
+    row_stride_bytes = dense_row_bytes;
+  if (row_stride_bytes < dense_row_bytes || (row_stride_bytes & 15ULL) != 0ULL)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "forward-tma-store-map", field, 0,
+                    "16-byte-aligned stride covering one row",
+                    std::to_string(row_stride_bytes));
+  const cuuint64_t strides[1] = {row_stride_bytes};
   const cuuint32_t box[2] = {64U, 128U};
   const cuuint32_t element_strides[2] = {1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
@@ -692,12 +701,21 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   const auto incoming_payload = checked_mul(
       incoming_packets, config.max_hidden_size, "GIN receive payload elements");
   // FULL's send plane is indexed by canonical producer row and its receive
-  // plane by compact source row. Reserve the larger bound so both planes share
-  // one registered-window layout without a pre-put pack.
-  const auto direct_return_rows =
+  // plane by compact source row. Backward reuses the send plane for padded
+  // M128 dX rows, so reserve the largest index domain without a pre-put pack.
+  const auto backward_padded_rows =
+      config.enable_backward_state
+          ? checked_add(
+                config.max_destination_rows_per_rank,
+                checked_mul(config.max_owned_experts, 127ULL,
+                            "GIN Backward padded return rows"),
+                "GIN Backward padded return rows")
+          : 0ULL;
+  const auto direct_return_rows = std::max<std::uint64_t>(
       std::max<std::uint64_t>(
           checked_mul(remote_nodes, routes, "GIN compact return rows"),
-          config.max_destination_rows_per_rank);
+          config.max_destination_rows_per_rank),
+      backward_padded_rows);
   const auto dense_return_row_bytes = checked_mul(
       config.max_hidden_size, sizeof(transport::BFloat16),
       "GIN return row bytes");

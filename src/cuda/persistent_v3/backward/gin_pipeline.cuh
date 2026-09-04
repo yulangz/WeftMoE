@@ -402,6 +402,8 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
   __syncthreads();
 
   auto *bytes = static_cast<std::byte *>(a.gin_window_base);
+  auto *status =
+      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.gin_send_header_offset);
   auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
@@ -470,8 +472,6 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
     const ncclGin gin(a.gin_dev_comm, context);
     if (state.issued_dispatch != state.completed_dispatch)
       gin.waitCounter(ncclCoopThread{}, 0, state.issued_dispatch);
-    auto *status =
-        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicMax(&status->dispatch_complete_clock, device_globaltimer_ns());
   }
   __syncthreads();
@@ -484,8 +484,6 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
           a.scheduler_expert_capacity);
   const auto *descriptors = reinterpret_cast<const BackwardMblockDescriptor *>(
       words + scheduler_layout.descriptors);
-  const auto *dx = peer_at<const transport::BFloat16>(
-      a.local_base, a.dx_rows_offset);
   const auto *dgate =
       peer_at<const float>(a.local_base, a.dgate_rows_offset);
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
@@ -503,8 +501,9 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
     if (threadIdx.x == 0U) {
       state.selected = 0U;
       const auto expected =
-          static_cast<unsigned long long>(a.hidden /
-                                          backward_tuning::kDxTileN);
+          megamoe::cuda::persistent_v3::backward::backward_dx_ready_value(
+              static_cast<std::uint32_t>(
+                  a.hidden / backward_tuning::kDxTileN));
       for (std::uint32_t probe = 0U; probe < a.mblocks; ++probe) {
         auto mblock = state.mblock_cursor + probe;
         if (mblock >= a.mblocks)
@@ -586,24 +585,11 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
 
       const auto padded_begin =
           descriptor.padded_row + state.run_canonical - descriptor.compact_row;
-      for (std::uint64_t item = threadIdx.x;
-           item < static_cast<std::uint64_t>(state.run_rows) * vector_count;
-           item += blockDim.x) {
-        const auto row = item / vector_count;
-        const auto vector = item % vector_count;
-        auto *target = reinterpret_cast<uint4 *>(
-            return_staging +
-            (static_cast<std::uint64_t>(state.run_canonical) + row) *
-                a.gin_return_row_bytes);
-        target[vector] = reinterpret_cast<const uint4 *>(dx)[
-            (static_cast<std::uint64_t>(padded_begin) + row) * vector_count +
-            vector];
-      }
       for (std::uint32_t row = threadIdx.x; row < state.run_rows;
            row += blockDim.x) {
         auto *gate = reinterpret_cast<float *>(
             return_staging +
-            (static_cast<std::uint64_t>(state.run_canonical) + row) *
+            (static_cast<std::uint64_t>(padded_begin) + row) *
                 a.gin_return_row_bytes +
             a.hidden * sizeof(transport::BFloat16));
         *gate = dgate[padded_begin + row];
@@ -625,7 +611,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
                     a.gin_return_row_bytes,
             a.gin_window,
             a.gin_return_staging_offset +
-                static_cast<std::uint64_t>(state.run_canonical) *
+                static_cast<std::uint64_t>(padded_begin) *
                     a.gin_return_row_bytes,
             payload_bytes,
             ncclGin_VASignalAdd{
@@ -641,8 +627,6 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
           return_gin.waitCounter(ncclCoopThread{}, 1, state.issued_return);
           state.completed_return = state.issued_return;
         }
-        auto *status =
-            peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
         atomicAdd(&status->gin_return_put_count, 1ULL);
         atomicAdd(&status->gin_return_payload_bytes, payload_bytes);
       }

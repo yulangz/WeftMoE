@@ -509,27 +509,33 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record pipelined dW1 completion");
 
-  // The persistent Relay grid has already copied each completed dX M-block
-  // and published its fixed route markers. Reduction remains a compact tail
-  // kernel for this milestone; it no longer waits for a bulk dX return launch.
+  // Queue route reduction behind the persistent compute grid, not behind the
+  // transport grid.  This guarantees all compute CTAs were resident (avoiding
+  // waiting reducers stealing their SMs), then overlaps reduction with the
+  // remaining FULL-return tail on the compute SMs that just became free.
   if (identity.tokens != 0ULL) {
     backward_reduce_dx_kernel<<<static_cast<unsigned int>(identity.tokens),
-                                256, 0, transport_stream>>>(args);
+                                256, 0, compute_stream>>>(args);
     internal::throw_cuda(
         "backward-run", cudaGetLastError(), identity.rank, identity.world,
         "backward", identity.generation, ExchangeKind::ExpertCounts,
-        "Backward dX reduce launch");
+        "streaming Backward dX reduce launch");
   }
   internal::throw_cuda(
       "backward-run",
-      cudaEventRecord(slot.backward_return_done, transport_stream),
+      cudaEventRecord(slot.backward_return_done, compute_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward return done");
   internal::throw_cuda(
       "backward-run",
       cudaStreamWaitEvent(exec->stream, slot.backward_return_done),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "join Backward return");
+      ExchangeKind::ExpertCounts, "join Backward reduction");
+  internal::throw_cuda(
+      "backward-run",
+      cudaStreamWaitEvent(exec->stream, slot.backward_dispatch_done),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "join Backward transport roles");
   internal::throw_cuda(
       "backward-run", cudaStreamWaitEvent(exec->stream, slot.backward_dw1_done),
       identity.rank, identity.world, "backward", identity.generation,

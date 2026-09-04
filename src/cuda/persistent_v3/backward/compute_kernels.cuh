@@ -349,13 +349,14 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
     const CUtensorMap &output_store_map, std::uint32_t activation_row,
     std::uint32_t weight_reduction_start, std::uint32_t reduction,
     transport::BFloat16 *output, std::uint64_t output_width,
-    std::uint32_t output_column, unsigned char *storage,
+    std::uint32_t output_row, std::uint32_t output_column,
+    unsigned char *storage,
     std::uint32_t &pipeline) {
   run_wgmma_tile<kStageM, TileN, StorageTileN, cute::UMMA::Major::K,
                  cute::UMMA::Major::MN, true, kActivationStages, 0U, 0U>(
       activation_map, weight_mn_map, output_store_map, activation_row,
       output_column, 0U, weight_reduction_start, reduction, output,
-      output_width, activation_row, output_column, storage, pipeline);
+      output_width, output_row, output_column, storage, pipeline);
 }
 
 template <std::uint32_t TileM, std::uint32_t TileN,

@@ -7,6 +7,9 @@
 namespace megamoe::cuda::persistent_v3::backward {
 
 inline constexpr std::uint32_t kDabPhaseTileCapacity = 128U;
+// Keep raw tile completion distinct from publication after the final
+// system-scope fence. Return workers may consume only the encoded value.
+inline constexpr unsigned long long kDxMblockReady = 1ULL << 63U;
 inline constexpr std::uint32_t kCounterWords =
     sizeof(PaddedCounter) / sizeof(unsigned long long);
 
@@ -19,6 +22,11 @@ struct BackwardMblockDescriptor {
 
 static_assert(sizeof(BackwardMblockDescriptor) == 16U);
 static_assert(kCounterWords == 16U);
+
+MEGAMOE_V3_HOST_DEVICE constexpr unsigned long long
+backward_dx_ready_value(std::uint32_t tiles) {
+  return kDxMblockReady | static_cast<unsigned long long>(tiles);
+}
 
 struct BackwardSchedulerLayout {
   std::uint64_t descriptors = 0ULL;
