@@ -9,7 +9,6 @@ content-addressed cache without Make, and benchmarks the cached executable.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import copy
 import datetime as dt
 import hashlib
@@ -21,8 +20,23 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
+from autotune_common import (
+    PlanError,
+    candidate_digest,
+    choose_confirmed_candidate,
+    compile_in_parallel,
+    confirmation_finalists,
+    git_revision as _common_git_revision,
+    metric_value,
+    require as _require,
+    require_choice as _require_choice,
+    timing_summary as _common_timing_summary,
+    validate_selection,
+    weighted_metric,
+    write_result as _common_write_result,
+)
 from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
@@ -117,22 +131,6 @@ CORRECTNESS_KEYS = (
     "per_rank_actual_w2_device_hash",
     "per_rank_output_hash",
 )
-
-
-class PlanError(ValueError):
-    """An explicit tuning plan is incomplete or internally inconsistent."""
-
-
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise PlanError(message)
-
-
-def _require_choice(config: Mapping[str, Any], key: str,
-                    choices: Iterable[int]) -> None:
-    choices = tuple(choices)
-    _require(config[key] in choices,
-             f"{key}={config[key]!r}, expected one of {choices}")
 
 
 def flatten_groups(groups: Mapping[str, Any], *, require_all: bool) -> dict[str, Any]:
@@ -273,32 +271,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require_choice(config, key, (0, 16, 32, 64, 128, 256, 512))
 
 
-def validate_selection(selection: Mapping[str, Any],
-                       candidate_count: int) -> None:
-    _require(isinstance(selection, dict), "selection must be an object")
-    expected = {
-        "confirmation_candidates",
-        "confirmation_repeats",
-        "confirmation_rounds",
-        "minimum_improvement_percent",
-    }
-    _require(set(selection) == expected,
-             "selection must contain exactly " + ", ".join(sorted(expected)))
-    count = selection["confirmation_candidates"]
-    repeats = selection["confirmation_repeats"]
-    rounds = selection["confirmation_rounds"]
-    threshold = selection["minimum_improvement_percent"]
-    _require(type(count) is int and 1 <= count <= candidate_count,
-             "selection.confirmation_candidates must be in "
-             f"[1, {candidate_count}]")
-    _require(type(rounds) is int and rounds > 10,
-             "selection.confirmation_rounds must be an integer >10")
-    _require(type(repeats) is int and 1 <= repeats <= 4,
-             "selection.confirmation_repeats must be in [1, 4]")
-    _require(type(threshold) in (int, float) and 0.0 <= threshold <= 10.0,
-             "selection.minimum_improvement_percent must be in [0, 10]")
-
-
 def load_plan(path: Path) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -402,11 +374,6 @@ def expand_candidates(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             "config": values,
         })
     return expanded
-
-
-def candidate_digest(config: Mapping[str, Any]) -> str:
-    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()[:12]
 
 
 def generated_header(name: str, config: Mapping[str, Any]) -> str:
@@ -563,43 +530,9 @@ def compile_candidate(candidate: Mapping[str, Any],
 def compile_candidates(candidates: list[dict[str, Any]],
                        compiler: ForwardJitCompiler,
                        log_dir: Path) -> dict[str, dict[str, Any]]:
-    # Each specialization has two expensive activation_transport variants.
-    # Give both a compiler lane, then spend remaining global lanes on other
-    # candidates. The shared host archive is serialized inside the compiler.
-    workers = min(len(candidates), max(1, compiler.jobs // 2))
-    command_jobs = max(1, compiler.jobs // workers)
-    print(f"compile scheduling: candidates={len(candidates)} "
-          f"workers={workers} commands_per_worker={command_jobs}", flush=True)
-    results: dict[str, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(
-                compile_candidate, candidate, compiler, log_dir,
-                command_jobs=command_jobs,
-            ): candidate
-            for candidate in candidates
-        }
-        completed_count = 0
-        for future in concurrent.futures.as_completed(futures):
-            candidate = futures[future]
-            completed_count += 1
-            try:
-                build_result = future.result()
-            except Exception as error:
-                build_result = {
-                    "backend": "python-content-addressed-jit",
-                    "returncode": 1,
-                    "error": f"{type(error).__name__}: {error}",
-                    "elapsed_seconds": 0.0,
-                    "log": str(log_dir / f"{candidate['name']}.build.log"),
-                }
-            results[candidate["name"]] = build_result
-            outcome = ("cache hit" if build_result.get("cache_hit") else
-                       "built" if build_result.get("returncode") == 0 else
-                       "failed")
-            print(f"[compile {completed_count}/{len(candidates)}] "
-                  f"{candidate['name']}: {outcome}", flush=True)
-    return results
+    return compile_in_parallel(
+        candidates, compiler, log_dir, compile_candidate
+    )
 
 
 def launcher_command(binary: Path, benchmark: Mapping[str, Any],
@@ -724,88 +657,6 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     }
 
 
-def metric_value(record: Mapping[str, Any], dotted_name: str) -> float:
-    value: Any = record
-    for component in dotted_name.split("."):
-        if not isinstance(value, dict) or component not in value:
-            raise PlanError(f"metric {dotted_name} is absent from benchmark JSON")
-        value = value[component]
-    if not isinstance(value, (int, float)):
-        raise PlanError(f"metric {dotted_name} is not numeric")
-    return float(value)
-
-
-def weighted_metric(records: Iterable[Mapping[str, Any]],
-                    dotted_name: str) -> float:
-    weighted_sum = 0.0
-    measured_sum = 0
-    for record in records:
-        measured = record.get("measured")
-        _require(type(measured) is int and measured > 0,
-                 "benchmark record measured count must be a positive integer")
-        weighted_sum += metric_value(record, dotted_name) * measured
-        measured_sum += measured
-    _require(measured_sum > 0, "cannot aggregate an empty benchmark record set")
-    return weighted_sum / measured_sum
-
-
-def confirmation_finalists(valid: Iterable[dict[str, Any]],
-                           incumbent_name: str,
-                           count: int) -> list[dict[str, Any]]:
-    ranked = sorted(valid, key=lambda item: item["selection_metric_us"])
-    incumbent = next(
-        (item for item in ranked if item["name"] == incumbent_name), None)
-    finalists = [incumbent] if incumbent is not None else []
-    finalists.extend(item for item in ranked if item is not incumbent)
-    return finalists[:count]
-
-
-def choose_confirmed_candidate(
-        finalists: Iterable[dict[str, Any]], incumbent_name: str,
-        minimum_improvement_percent: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    confirmed = [item for item in finalists
-                 if "aggregate_metric_us" in item]
-    _require(bool(confirmed), "no candidate completed confirmation")
-    best = min(confirmed, key=lambda item: item["aggregate_metric_us"])
-    incumbent = next(
-        (item for item in confirmed if item["name"] == incumbent_name), None)
-    decision: dict[str, Any] = {
-        "incumbent": incumbent_name,
-        "best_confirmed": best["name"],
-        "minimum_improvement_percent": minimum_improvement_percent,
-    }
-    if incumbent is None:
-        decision.update({
-            "selected": best["name"],
-            "reason": "incumbent_not_confirmed",
-            "challenger_improvement_percent": None,
-        })
-        return best, decision
-    if best is incumbent:
-        decision.update({
-            "selected": incumbent["name"],
-            "reason": "incumbent_fastest",
-            "challenger_improvement_percent": 0.0,
-        })
-        return incumbent, decision
-    improvement = 100.0 * (
-        incumbent["aggregate_metric_us"] - best["aggregate_metric_us"]
-    ) / incumbent["aggregate_metric_us"]
-    if improvement >= minimum_improvement_percent:
-        winner = best
-        reason = "challenger_exceeds_threshold"
-    else:
-        winner = incumbent
-        reason = "challenger_below_threshold"
-    decision.update({
-        "selected": winner["name"],
-        "reason": reason,
-        "challenger_improvement_percent": improvement,
-    })
-    return winner, decision
-
-
 def correctness_fingerprint(record: Mapping[str, Any]) -> str:
     missing = [key for key in CORRECTNESS_KEYS if key not in record]
     if missing:
@@ -816,44 +667,15 @@ def correctness_fingerprint(record: Mapping[str, Any]) -> str:
 
 
 def _git_revision() -> dict[str, Any]:
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        check=False).stdout.strip()
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=REPO_ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        check=False).stdout.strip()
-    return {"commit": revision, "dirty": bool(dirty)}
+    return _common_git_revision(REPO_ROOT)
 
 
 def _write_result(path: Path, result: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n",
-                         encoding="utf-8")
-    temporary.replace(path)
+    _common_write_result(path, result)
 
 
 def _timing_summary(result: Mapping[str, Any], elapsed: float) -> dict[str, float]:
-    candidates = result.get("candidates", [])
-    selected = result.get("selected", {})
-    phase_wall = result.get("phase_wall_seconds", {})
-    return {
-        "build_seconds": phase_wall.get("compile", sum(
-            item.get("build", {}).get("elapsed_seconds", 0.0)
-            for item in candidates)),
-        "tune_benchmark_seconds": phase_wall.get("tune", sum(
-            item.get("tune", {}).get("elapsed_seconds", 0.0)
-            for item in candidates)),
-        "confirmation_benchmark_seconds": phase_wall.get("confirmation", sum(
-            sum(run.get("elapsed_seconds", 0.0)
-                for run in item.get("confirmations", []))
-            for item in candidates)),
-        "final_benchmark_seconds": phase_wall.get("final", selected.get(
-            "final", {}).get("elapsed_seconds", 0.0)),
-        "total_seconds": elapsed,
-    }
+    return _common_timing_summary(result, elapsed)
 
 
 def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Content-addressed runtime compiler for Forward benchmark specializations.
+"""Content-addressed runtime compiler for MegaMOE specializations.
 
 The production library still has a conventional release build.  Autotuning,
-however, needs a different compile-time-specialized Forward kernel for every
-candidate.  This module builds those executables directly from Python, keeps a
-small shared host-object cache, and atomically publishes complete artifacts.
+however, needs a different compile-time-specialized kernel for every candidate.
+Forward and Backward share one source graph and host-object cache while keeping
+their generated headers and binary namespaces distinct.
 
 The cache discipline follows DeepGEMM's JIT implementation: a key includes the
 generated code, compiler identity, flags, repository inputs, and external
@@ -27,12 +27,41 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
 JIT_SCHEMA = 1
 ARTIFACT_KIND = "megamoe-forward-test-binary"
+
+
+@dataclass(frozen=True)
+class JitTarget:
+    """Compile-time specialization metadata for the shared source graph."""
+
+    name: str
+    artifact_kind: str
+    cache_prefix: str
+    generated_header_name: str
+    use_generated_macro: str
+
+
+FORWARD_TARGET = JitTarget(
+    name="forward",
+    artifact_kind=ARTIFACT_KIND,
+    cache_prefix="forward",
+    generated_header_name="megamoe_forward_tuning_generated.hpp",
+    use_generated_macro="MEGAMOE_FORWARD_USE_GENERATED_TUNING",
+)
+
+BACKWARD_TARGET = JitTarget(
+    name="backward",
+    artifact_kind="megamoe-backward-test-binary",
+    cache_prefix="backward",
+    generated_header_name="megamoe_backward_tuning_generated.hpp",
+    use_generated_macro="MEGAMOE_BACKWARD_USE_GENERATED_TUNING",
+)
 
 HOST_SOURCES = (
     "src/cuda/backward_stub.cpp",
@@ -65,11 +94,12 @@ def _canonical_json(value: Any) -> bytes:
 
 
 def content_cache_key(signature: Mapping[str, Any],
-                      generated_header: str) -> str:
+                      generated_header: str, *,
+                      artifact_kind: str = ARTIFACT_KIND) -> str:
     """Return the stable artifact key used by the on-disk JIT cache."""
 
     return hashlib.sha256(_canonical_json({
-        "kind": ARTIFACT_KIND,
+        "kind": artifact_kind,
         "signature": signature,
         "generated_header": generated_header,
     })).hexdigest()
@@ -338,11 +368,12 @@ def _run_parallel(commands: Sequence[Sequence[str]], *, cwd: Path,
         )
 
 
-class ForwardJitCompiler:
-    """Build and cache one compile-time-specialized Forward test executable."""
+class SpecializedJitCompiler:
+    """Build one target specialization from the shared MegaMOE source graph."""
 
     def __init__(self, repo_root: Path, config: Mapping[str, Any],
                  environment: Mapping[str, str], *,
+                 target: JitTarget,
                  nccl_lib_dir: str | None = None):
         validate_jit_config(config)
         self.repo_root = repo_root.resolve()
@@ -355,6 +386,7 @@ class ForwardJitCompiler:
         self.architecture = str(config["architecture"])
         self.arch_flags = _architecture_flags(self.architecture)
         self.environment = dict(environment)
+        self.target = target
         self._host_cache_lock = threading.Lock()
         self.nvcc = _resolve_tool(
             config.get("nvcc"), "nvcc", Path("/usr/local/cuda/bin/nvcc")
@@ -423,6 +455,12 @@ class ForwardJitCompiler:
         )
         self.signature = {
             "schema": JIT_SCHEMA,
+            "target": {
+                "name": target.name,
+                "artifact_kind": target.artifact_kind,
+                "generated_header_name": target.generated_header_name,
+                "use_generated_macro": target.use_generated_macro,
+            },
             "toolchain": self.toolchain,
             "host_flags": self.host_flags,
             "cuda_flags": self.cuda_flags,
@@ -435,11 +473,14 @@ class ForwardJitCompiler:
         }
 
     def cache_key(self, generated_header: str) -> str:
-        return content_cache_key(self.signature, generated_header)
+        return content_cache_key(
+            self.signature, generated_header,
+            artifact_kind=self.target.artifact_kind,
+        )
 
     def artifact_directory(self, generated_header: str) -> Path:
         key = self.cache_key(generated_header)
-        return self.cache_root / "cache" / f"forward.{key}"
+        return self.cache_root / "cache" / f"{self.target.cache_prefix}.{key}"
 
     def _host_cache_key(self) -> str:
         return hashlib.sha256(_canonical_json({
@@ -527,10 +568,14 @@ class ForwardJitCompiler:
             )
         key = self.cache_key(generated_header)
         destination = self.artifact_directory(generated_header)
-        manifest = _cache_manifest(destination, key, ARTIFACT_KIND)
+        manifest = _cache_manifest(
+            destination, key, self.target.artifact_kind
+        )
         if manifest is not None:
             binary = destination / "test_cuda_notify"
-            header = destination / "generated/megamoe_forward_tuning_generated.hpp"
+            header = (
+                destination / "generated" / self.target.generated_header_name
+            )
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise JitError(f"corrupt JIT cache, executable missing: {destination}")
             if (not header.is_file() or
@@ -575,15 +620,18 @@ class ForwardJitCompiler:
             }
         temporary_root = self.cache_root / "tmp"
         temporary_root.mkdir(parents=True, exist_ok=True)
-        staging = temporary_root / f"forward.{uuid.uuid4().hex}"
+        staging = temporary_root / (
+            f"{self.target.cache_prefix}.{uuid.uuid4().hex}"
+        )
         generated_dir = staging / "generated"
         objects = staging / "objects"
         generated_dir.mkdir(parents=True)
         objects.mkdir(parents=True)
-        header = generated_dir / "megamoe_forward_tuning_generated.hpp"
+        header = generated_dir / self.target.generated_header_name
         header.write_text(generated_header, encoding="utf-8")
         specialization_flags = [
-            f"-I{generated_dir}", "-DMEGAMOE_FORWARD_USE_GENERATED_TUNING=1"
+            f"-I{generated_dir}",
+            f"-D{self.target.use_generated_macro}=1",
         ]
 
         object_paths: list[Path] = []
@@ -657,7 +705,7 @@ class ForwardJitCompiler:
             cuda_archive.unlink()
             manifest = {
                 "schema": JIT_SCHEMA,
-                "kind": ARTIFACT_KIND,
+                "kind": self.target.artifact_kind,
                 "cache_key": key,
                 "candidate": candidate_name,
                 "config_digest": config_digest,
@@ -668,10 +716,12 @@ class ForwardJitCompiler:
             _write_json(staging / "manifest.json", manifest)
             published = _publish_directory(staging, destination)
             if not published:
-                _cache_manifest(destination, key, ARTIFACT_KIND)
+                _cache_manifest(
+                    destination, key, self.target.artifact_kind
+                )
             final_binary = destination / "test_cuda_notify"
             final_header = (
-                destination / "generated/megamoe_forward_tuning_generated.hpp"
+                destination / "generated" / self.target.generated_header_name
             )
             return {
                 "backend": "python-content-addressed-jit",
@@ -705,3 +755,27 @@ class ForwardJitCompiler:
                 "log": str(log_path),
                 "toolchain": self.toolchain,
             }
+
+
+class ForwardJitCompiler(SpecializedJitCompiler):
+    """Build and cache a compile-time-specialized Forward executable."""
+
+    def __init__(self, repo_root: Path, config: Mapping[str, Any],
+                 environment: Mapping[str, str], *,
+                 nccl_lib_dir: str | None = None):
+        super().__init__(
+            repo_root, config, environment, target=FORWARD_TARGET,
+            nccl_lib_dir=nccl_lib_dir,
+        )
+
+
+class BackwardJitCompiler(SpecializedJitCompiler):
+    """Build and cache a compile-time-specialized Backward executable."""
+
+    def __init__(self, repo_root: Path, config: Mapping[str, Any],
+                 environment: Mapping[str, str], *,
+                 nccl_lib_dir: str | None = None):
+        super().__init__(
+            repo_root, config, environment, target=BACKWARD_TARGET,
+            nccl_lib_dir=nccl_lib_dir,
+        )

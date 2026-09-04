@@ -46,6 +46,7 @@ Fast source/control checks:
 ```bash
 make BUILD_DIR="$CPU_BUILD" test
 python3 tests/test_forward_autotune.py -v
+python3 tests/test_backward_autotune.py -v
 python3 -m py_compile tests/*.py benchmarks/*.py tools/*.py
 ```
 
@@ -94,12 +95,30 @@ Use `gin_forward_bench` for the measured run. The launcher fails if any rank
 fails, times out, emits inconsistent correctness hashes, or uses a different
 runtime shape.
 
+Cached-state Backward uses the same launchers:
+
+```bash
+python3 tests/run_local_activation_p2p.py \
+  --binary "$CUDA_BUILD/test_cuda_notify" --world 8 \
+  --backward-validation --backward-tokens 8 --rounds 2
+
+python3 tests/run_multinode_nccl.py \
+  --binary "$SHARED_BUILD/test_cuda_notify" \
+  --remote user@remote-host --port 22 \
+  --remote-binary "$SHARED_BUILD/test_cuda_notify" \
+  --gpus-per-node 8 --scenario gin_backward_bench \
+  --nccl-lib-dir "$MEGAMOE_NCCL_DIR" \
+  --socket-ifname eth0 --enable-ib --timeout 600
+```
+
 ## Autotuning
 
-The two maintained plans are:
+The maintained plans are:
 
 - `configs/forward_h200_autotune.json`: two-node world 16, GIN/RDMA;
 - `configs/forward_h200_world8_autotune.json`: one-node world 8, CUDA IPC/NVLink.
+- `configs/backward_h200_autotune.json`: two-node cached-state Backward;
+- `configs/backward_h200_world8_autotune.json`: one-node cached-state Backward.
 
 Run them with:
 
@@ -109,6 +128,12 @@ python3 tools/autotune_forward.py \
 
 python3 tools/autotune_forward.py \
   --config configs/forward_h200_world8_autotune.json
+
+python3 tools/autotune_backward.py \
+  --config configs/backward_h200_autotune.json
+
+python3 tools/autotune_backward.py \
+  --config configs/backward_h200_world8_autotune.json
 ```
 
 Each plan also has an explicit selection policy. The maintained plans confirm
@@ -130,6 +155,10 @@ without measuring it:
 python3 tools/autotune_forward.py \
   --config configs/forward_h200_world8_autotune.json \
   --candidate world8_relay16_tma4 --build-only
+
+python3 tools/autotune_backward.py \
+  --config configs/backward_h200_autotune.json \
+  --candidate incumbent --build-only
 ```
 
 `jit.jobs` is a global compilation budget. The compiler gives each active
@@ -160,18 +189,22 @@ The JSON result contains:
   winner-validation timing;
 - total autotune duration.
 
-JIT artifacts are placed under `artifacts/forward-jit/cache`, not in root-level
-`build-*` directories. Intermediate objects are deleted before publication;
+Backward candidates additionally run an untimed world-8 preflight. It executes
+Backward twice and fingerprints dX, dGate, dW1, and dW2; only candidates whose
+four fingerprints match the incumbent enter performance selection.
+
+JIT artifacts are placed under `artifacts/forward-jit/cache` and
+`artifacts/backward-jit/cache`, not in root-level `build-*` directories.
+Intermediate objects are deleted before publication;
 each candidate retains only its executable, generated header, and provenance
 manifest. A cold compile populates the cache, while an identical later request
 performs only dependency hashing and resource inspection. The cache may be
 removed after the result JSON and selected configuration have been retained.
 
-This path deliberately uses NVCC rather than NVRTC. MegaMOE's current Forward
-specialization spans CUDA kernels, NCCL GIN device code, host transport state,
-and the distributed validation entry point. Extracting a standalone cubin ABI
-would couple communication-resource lifetime changes to this build-system
-change; that can be considered separately after the Forward API is stable.
+This path deliberately uses NVCC rather than NVRTC. MegaMOE's specializations
+span CUDA kernels, NCCL GIN device code, host transport state, and the
+distributed validation entry point. Extracting a standalone cubin ABI would
+couple communication-resource lifetime changes to the build-system change.
 
 Compilation is a distinct first phase: all candidates are present in the
 content cache before any benchmark starts. This avoids interleaving a cold,

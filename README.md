@@ -1,11 +1,10 @@
 # MegaMOE
 
-MegaMOE is a Hopper-focused Mixture-of-Experts Forward pipeline. It overlaps
-Notify, activation dispatch, FC1/SwiGLU, FC2, return, and deterministic
-unweighted reduction without a whole-grid barrier between the split transport
-and compute kernels. SwiGLU consumes BF16-rounded FC1 A/B, and each route gate
-is applied before the BF16 FC2 input cast, matching the intended
-Forward/Backward algebra.
+MegaMOE is a Hopper-focused Mixture-of-Experts Forward and cached-state
+Backward pipeline. It overlaps device-issued communication with TMA/WGMMA
+compute without a whole-grid barrier between the split transport and compute
+kernels. SwiGLU consumes BF16-rounded FC1 A/B, and each route gate is applied
+before the BF16 FC2 input cast, matching the Forward/Backward algebra.
 
 The current optimized contract is intentionally narrow:
 
@@ -18,9 +17,10 @@ The current optimized contract is intentionally narrow:
 - one-node CUDA IPC/NVLink and two-node NCCL GIN/RDMA execution.
 
 There is no generic-shape or legacy single-node compute fallback. Unsupported
-shapes fail closed. Backward is deliberately unavailable while it is redesigned
-around this Forward architecture; `cuda::backward_pipeline_available()` is the
-only retained Backward API and currently returns `false`.
+shapes fail closed. The new Backward implementation is present behind the
+cached-state API and is undergoing final performance qualification;
+`cuda::backward_pipeline_available()` therefore still returns `false` for
+external feature discovery.
 
 A pool may explicitly reserve Backward state. In that mode Forward preserves
 post-Dispatch canonical X, writes plane-major BF16 A/B checkpoints, and uses a
@@ -105,9 +105,16 @@ python3 tools/autotune_forward.py \
 
 python3 tools/autotune_forward.py \
   --config configs/forward_h200_world8_autotune.json
+
+python3 tools/autotune_backward.py \
+  --config configs/backward_h200_autotune.json
+
+python3 tools/autotune_backward.py \
+  --config configs/backward_h200_world8_autotune.json
 ```
 
-JIT binaries live under the ignored `artifacts/forward-jit/cache` tree. Cache
+JIT binaries live under the ignored `artifacts/{forward,backward}-jit/cache`
+trees. Cache
 keys cover generated code, repository and external header content, compiler
 identity, architecture, and flags; completed artifacts are published with an
 atomic directory rename. Intermediate objects are discarded. The result JSON
@@ -132,9 +139,11 @@ include/megamoe/                 installed API
 src/metadata/                    deterministic Notify materialization
 src/cuda/forward/                Forward runtime, launch, and kernel pieces
 src/cuda/persistent_v3/forward/  split role pipelines and queues
+src/cuda/backward/               cached-state Backward contract and launch
+src/cuda/persistent_v3/backward/ split Backward transport/compute scheduler
 src/cuda/testing/                non-installed CUDA probes
 tests/                           focused control, CUDA, and launcher tests
-benchmarks/                      Forward-only MegaMOE/Megatron comparisons
+benchmarks/                      MegaMOE/Megatron comparisons and oracles
 configs/                         explicit autotune plans
 tools/                           tuning, SASS, and timeline utilities
 ```

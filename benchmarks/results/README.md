@@ -6,9 +6,10 @@ Backward records were removed because their kernels no longer exist. A new
 Backward record must identify whether Forward setup and retained-state creation
 are inside or outside its timed boundary.
 
-Use `tools/autotune_forward.py` for tuning and the Forward benchmark scenarios
-in `tests/run_local_activation_p2p.py` or `tests/run_multinode_nccl.py` for
-performance runs. Keep checked-in records compact and include the commit,
+Use `tools/autotune_forward.py` or `tools/autotune_backward.py` for tuning and
+the matching benchmark scenarios in `tests/run_local_activation_p2p.py` or
+`tests/run_multinode_nccl.py` for performance runs. Keep checked-in records
+compact and include the commit,
 topology, tuning configuration, warmup/sample counts, correctness hashes, and
 slowest-rank latency statistics.
 

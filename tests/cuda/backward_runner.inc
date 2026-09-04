@@ -150,6 +150,8 @@ void run_cached_backward_rank(
   bool repeat_equal = true;
   std::uint64_t dx_hash = 0ULL;
   std::uint64_t dgate_hash = 0ULL;
+  std::uint64_t dw1_hash = 0ULL;
+  std::uint64_t dw2_hash = 0ULL;
   if (validation) {
     progress("validation_download_enter");
     auto first = megamoe::cuda::BackwardValidationBridge::download(
@@ -171,6 +173,8 @@ void run_cached_backward_rank(
                    equal_bytes(first.dw2, repeated.dw2);
     dx_hash = hash_bf16_indexed(repeated.dx);
     dgate_hash = hash_fp32(repeated.dgate);
+    dw1_hash = hash_bf16_indexed(repeated.dw1);
+    dw2_hash = hash_bf16_indexed(repeated.dw2);
     if (const auto *artifact_dir = std::getenv("MEGAMOE_BACKWARD_OUTPUT_DIR")) {
       const auto prefix = std::string(artifact_dir) + "/rank-" +
                           std::to_string(rank) + "-";
@@ -227,7 +231,8 @@ void run_cached_backward_rank(
             << " workspace_bytes=" << last.audit().workspace_bytes
             << " pool_bytes=" << usage.device_bytes
             << " repeat_equal=" << repeat_equal << " dx_hash=" << dx_hash
-            << " dgate_hash=" << dgate_hash << " wall=";
+            << " dgate_hash=" << dgate_hash << " dw1_hash=" << dw1_hash
+            << " dw2_hash=" << dw2_hash << " wall=";
   emit(wall_samples);
   std::cout << " total=";
   emit(total_samples);

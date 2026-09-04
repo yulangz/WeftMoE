@@ -486,6 +486,29 @@ def main():
             if any(item["mode"] != "validation" or
                    item["repeat_equal"] != "1" for item in observed):
                 raise AssertionError("Backward repeat stability failed")
+            result = {
+                "schema": 1,
+                "benchmark": "cached-x-ab-local-backward-validation",
+                "world": args.world,
+                "shape": {
+                    "tokens_per_rank": int(observed[0]["tokens"]),
+                    "hidden": int(observed[0]["hidden"]),
+                    "intermediate": int(observed[0]["intermediate"]),
+                    "experts": int(observed[0]["experts"]),
+                    "top_k": int(observed[0]["top_k"]),
+                },
+                "per_rank_dx_hash": [int(item["dx_hash"])
+                                     for item in observed],
+                "per_rank_dgate_hash": [int(item["dgate_hash"])
+                                         for item in observed],
+                "per_rank_dw1_hash": [int(item["dw1_hash"])
+                                       for item in observed],
+                "per_rank_dw2_hash": [int(item["dw2_hash"])
+                                       for item in observed],
+                "repeat_equal": True,
+            }
+            print("BACKWARD_VALIDATION_JSON " +
+                  json.dumps(result, sort_keys=True))
             print(f"[PASS] cached-state Backward stability world={args.world} "
                   f"tokens={args.backward_tokens or 8}")
             return

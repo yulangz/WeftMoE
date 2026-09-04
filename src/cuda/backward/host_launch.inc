@@ -392,7 +392,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         ExchangeKind::ExpertCounts,
         "reset Backward FULL Return fragment counters");
   }
-  backward_setup_pipeline_kernel<<<1, 256, 0, transport_stream>>>(args);
+  backward_setup_pipeline_kernel<<<1, backward_tuning::kSetupThreads, 0,
+                                   transport_stream>>>(args);
   internal::throw_cuda(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
       "backward", identity.generation, ExchangeKind::ExpertCounts,
@@ -401,15 +402,16 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       "backward-run", cudaEventRecord(slot.backward_start, transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward start");
-  constexpr std::uint32_t kPackChunksPerExpert = 4U;
   if (view.sizes.owned_expert_count != 0U) {
     if (!retained.backward_cache_packed) {
       backward_pack_cached_state_kernel<<<
-          view.sizes.owned_expert_count * kPackChunksPerExpert, 256, 0,
-          transport_stream>>>(args, kPackChunksPerExpert);
+          view.sizes.owned_expert_count * backward_tuning::kCachePackChunks,
+          backward_tuning::kCacheThreads, 0, transport_stream>>>(
+          args, backward_tuning::kCachePackChunks);
       retained.backward_cache_packed = true;
     } else {
-      backward_pack_gate_kernel<<<view.sizes.owned_expert_count, 256, 0,
+      backward_pack_gate_kernel<<<view.sizes.owned_expert_count,
+                                  backward_tuning::kCacheThreads, 0,
                                   transport_stream>>>(args);
     }
     internal::throw_cuda(
@@ -509,7 +511,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   // remaining FULL-return tail on the compute SMs that just became free.
   if (identity.tokens != 0ULL) {
     backward_reduce_dx_kernel<<<static_cast<unsigned int>(identity.tokens),
-                                256, 0, compute_stream>>>(args);
+                                backward_tuning::kReduceThreads, 0,
+                                compute_stream>>>(args);
     internal::throw_cuda(
         "backward-run", cudaGetLastError(), identity.rank, identity.world,
         "backward", identity.generation, ExchangeKind::ExpertCounts,

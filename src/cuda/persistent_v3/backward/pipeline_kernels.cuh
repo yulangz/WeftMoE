@@ -271,7 +271,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(local_setup[peer]);
     while (published.load(::cuda::memory_order_acquire) != a.epoch)
-      __nanosleep(128U);
+      __nanosleep(backward_tuning::kSetupIdleNanosleep);
   }
 }
 

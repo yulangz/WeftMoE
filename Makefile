@@ -83,13 +83,19 @@ PROD_CUDA_LIB_OBJECTS := \
 	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
 	$(BUILD_DIR)/production/src/cuda/forward_transport.o
 
-.PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench megatron-backward-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune backward-autotune-test backward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench megatron-backward-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 forward-autotune-test:
 	python3 tests/test_forward_autotune.py
 
 forward-autotune:
 	python3 tools/autotune_forward.py --config configs/forward_h200_autotune.json
+
+backward-autotune-test:
+	python3 tests/test_backward_autotune.py
+
+backward-autotune:
+	python3 tools/autotune_backward.py --config configs/backward_h200_autotune.json
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 

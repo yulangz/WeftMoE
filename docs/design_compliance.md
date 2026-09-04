@@ -21,5 +21,7 @@ carried forward.
 | Unsupported work fails closed | fixed shape/topology/provenance checks | negative API and distributed protocol tests |
 
 The Socket backend is retained for correctness comparison only and does not
-satisfy the device-issued overlap requirement. Backward compliance is pending a
-new design; `backward_pipeline_available()` reports that state explicitly.
+satisfy the device-issued overlap requirement. Cached-state Backward now has
+local and GIN qualification implementations with strict-priority activation
+queues and opportunistic dW work. Its public availability flag stays false
+until the maintained autotune plans pass final performance qualification.

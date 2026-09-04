@@ -79,6 +79,27 @@
 #ifndef MEGAMOE_BWD_DW_CLAIM_TILES
 #define MEGAMOE_BWD_DW_CLAIM_TILES 8
 #endif
+#ifndef MEGAMOE_BWD_GIN_MAX_INFLIGHT
+#define MEGAMOE_BWD_GIN_MAX_INFLIGHT 24
+#endif
+#ifndef MEGAMOE_BWD_SETUP_THREADS
+#define MEGAMOE_BWD_SETUP_THREADS 256
+#endif
+#ifndef MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP
+#define MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP 128
+#endif
+#ifndef MEGAMOE_BWD_CACHE_THREADS
+#define MEGAMOE_BWD_CACHE_THREADS 256
+#endif
+#ifndef MEGAMOE_BWD_CACHE_PACK_CHUNKS
+#define MEGAMOE_BWD_CACHE_PACK_CHUNKS 4
+#endif
+#ifndef MEGAMOE_BWD_REDUCE_THREADS
+#define MEGAMOE_BWD_REDUCE_THREADS 256
+#endif
+#ifndef MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP
+#define MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP 256
+#endif
 
 namespace megamoe::cuda::backward_tuning {
 
@@ -114,6 +135,17 @@ inline constexpr std::uint32_t kDispatchBatchRows =
 inline constexpr std::uint32_t kEpilogueRowsPerTask =
     MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK;
 inline constexpr std::uint32_t kDwClaimTiles = MEGAMOE_BWD_DW_CLAIM_TILES;
+inline constexpr std::uint32_t kGinMaxInflight =
+    MEGAMOE_BWD_GIN_MAX_INFLIGHT;
+inline constexpr std::uint32_t kSetupThreads = MEGAMOE_BWD_SETUP_THREADS;
+inline constexpr std::uint32_t kSetupIdleNanosleep =
+    MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP;
+inline constexpr std::uint32_t kCacheThreads = MEGAMOE_BWD_CACHE_THREADS;
+inline constexpr std::uint32_t kCachePackChunks =
+    MEGAMOE_BWD_CACHE_PACK_CHUNKS;
+inline constexpr std::uint32_t kReduceThreads = MEGAMOE_BWD_REDUCE_THREADS;
+inline constexpr std::uint32_t kReduceIdleNanosleep =
+    MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kDw2TilesPerExpert =
     (kMainHidden / kDwTileM) * (kMainIntermediate / kDwTileN);
 inline constexpr std::uint32_t kDw1TilesPerExpert =
@@ -149,5 +181,13 @@ static_assert(kEpilogueRowsPerTask >= kComputeThreads / 32U &&
               kEpilogueRowsPerTask <= kTileM);
 static_assert(kDwClaimTiles == 1U || kDwClaimTiles == 4U ||
               kDwClaimTiles == 8U || kDwClaimTiles == 16U);
+static_assert(kGinMaxInflight >= 1U && kGinMaxInflight <= 64U);
+static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
+              kSetupThreads % 32U == 0U);
+static_assert(kCacheThreads >= 32U && kCacheThreads <= 1024U &&
+              kCacheThreads % 32U == 0U);
+static_assert(kCachePackChunks >= 1U && kCachePackChunks <= 16U);
+static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&
+              kReduceThreads % 32U == 0U);
 
 } // namespace megamoe::cuda::backward_tuning

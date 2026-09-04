@@ -13,7 +13,8 @@ namespace backward_gin_detail {
 using backward_pipeline_detail::BackwardMblockDescriptor;
 using backward_pipeline_detail::PaddedCounter;
 
-inline constexpr unsigned long long kMaxInflight = 24ULL;
+inline constexpr unsigned long long kMaxInflight =
+    backward_tuning::kGinMaxInflight;
 
 struct RelayInboundState {
   unsigned long long packet_cursor = 0ULL;

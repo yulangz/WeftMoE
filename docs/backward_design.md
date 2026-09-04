@@ -1,9 +1,9 @@
 # Backward pipeline design
 
-This document fixes the Backward dataflow and scheduling contract before CUDA
-implementation begins. Backward remains unavailable in the current revision;
-`backward_pipeline_available()` must continue to return `false` until the full
-pipeline is correct and benchmarked.
+This document fixes the Backward dataflow and scheduling contract implemented
+by the CUDA qualification path. `backward_pipeline_available()` remains false
+until the selected world-8 and world-16 configurations complete final
+performance qualification.
 
 ## Numeric contract and retained Forward state
 
@@ -45,21 +45,22 @@ stores those same BF16 values when `retain_backward_state` is enabled. Backward
 must convert the checkpoints to FP32 for SwiGLU recomputation, so the operands
 match Forward exactly without retaining `S`.
 
-## Fused activation-gradient task
+## Activation-gradient task chain
 
-One `DAB` task owns `(expert, M-block, intermediate-N tile)` and performs:
+The activation path deliberately uses two dependency-local task types:
 
-1. a TMA/WGMMA `dU = dR * W2` tile;
-2. load cached `A/B` and the canonical FP32 gate;
-3. recompute `S` in the epilogue;
-4. form `dA/dB` and a fixed-slot `dGate` partial;
-5. form and store the exact BF16 `U = gate * S` needed by `dW2`;
-6. release-publish completion after every store is visible.
+1. `(expert, M-block, intermediate-N tile)` TMA/WGMMA tasks materialize BF16
+   `dU = dR * W2` into the reusable U workspace;
+2. after all N tiles for that M-block complete, warp-row epilogue tasks load
+   cached A/B and the FP32 gate, recompute S, write BF16 dA/dB, reduce dGate in
+   a fixed column order, and overwrite the temporary dU row with the exact
+   BF16 `U = gate * S` consumed by dW2.
 
-`dU` is never materialized as a long-lived global tensor. `dGate` partials use
-one deterministic slot per intermediate tile; floating-point atomics are not
-used. A small activation-priority finalize task reduces those slots in
-increasing intermediate-tile order.
+The dU buffer is phase-local rather than retained state. No FP32 atomics or
+cross-CTA dGate partial reduction are used. Splitting the GEMM and scalar
+epilogue avoids extending every WGMMA task with the long dependency chain of
+SwiGLU recomputation; a fused experiment regressed both local and two-node
+latency and was removed.
 
 All expert row ranges are padded to 128. Padding rows are zero in `X`, `dR`,
 `A/B`, `U`, and `dAB`, so the GEMM inner loops do not need divergent tail
@@ -75,8 +76,8 @@ runtime enqueue traffic or head-of-line blocking.
 
 | logical queue | task | ready predicate |
 | --- | --- | --- |
-| `Q_DAB` | `dU` plus fused SwiGLU backward | required `dR` rows for the M-block have arrived |
-| `Q_DX` | `dX` output tile or `dGate` finalize | every intermediate `DAB` tile for that M-block is complete |
+| `Q_DAB` | dU N tile, then warp-row SwiGLU backward batches | required dR rows have arrived; row batches wait for all dU N tiles |
+| `Q_DX` | one dX output tile | every SwiGLU row batch for that M-block is complete |
 | `Q_DW2` | one `dW2` output tile | all `dR` and `U` M-blocks for that expert are complete |
 | `Q_DW1` | one `dW1` output tile | all `X` and `dAB` M-blocks for that expert are complete |
 
@@ -86,8 +87,8 @@ all `dX` being computed or sent.
 
 Each `dW` output tile is owned by one CTA, uses FP32 accumulation, traverses
 the expert's padded M rows in canonical order, and defaults to `split_k=1`.
-The initial dW output tile candidate is 128x128; its M-step, TMA/WGMMA stages,
-register split, and cluster policy remain compile-time autotuning parameters.
+The selected dW output tile is 128x256x64 with three stages; its M/N tile,
+stage count, and register split remain compile-time tuning parameters.
 
 ## Work-conserving CTA policy
 
@@ -128,7 +129,7 @@ The dependency chain is entirely release/acquire based:
 dR row stores
   -> release dy_arrived_rows[expert, mblock, rail]
   -> acquire and claim Q_DAB tiles
-  -> store dAB, U, dGate partials
+  -> store dAB, U, and row-complete dGate
   -> release dab_done_tiles[expert, mblock]
   -> acquire and claim Q_DX / per-expert Q_DW tasks
   -> store dX tiles and finalize dGate
@@ -138,10 +139,11 @@ dR row stores
   -> fixed-expert-order FP32 dX reduction
 ```
 
-The last `dX` N tile and `dGate` finalize for an M-block publish its return
-readiness immediately. A system-scope fence orders those stores before a
-Relay/RDMA worker observes the marker; it is local to that producer-consumer
-handoff and is not a barrier. There is never an "all dX output sent" event
+The last dX N tile for an M-block publishes its return readiness immediately;
+dGate is already complete at that point. A system-scope fence orders those
+stores before a Relay/RDMA worker observes the marker; it is local to that
+producer-consumer handoff and is not a barrier. There is never an "all dX
+output sent" event
 that launches dW.
 
 ## Reuse of Forward communication
