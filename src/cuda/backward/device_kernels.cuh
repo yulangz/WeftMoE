@@ -207,7 +207,7 @@ __device__ __forceinline__ void backward_swiglu_epilogue_row(
     const auto bv = bf16_bits_to_float(
         ab[a.padded_capacity_rows * a.intermediate + index].bits);
     const auto duv = bf16_bits_to_float(du[index].bits);
-    const auto sigmoid = 1.0F / (1.0F + expf(-av));
+    const auto sigmoid = 1.0F / (1.0F + __expf(-av));
     const auto silu = av * sigmoid;
     const auto s = silu * bv;
     const auto ds = gate * duv;
@@ -288,7 +288,7 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_rows(
       const auto bv = bf16_bits_to_float(
           ab[a.padded_capacity_rows * a.intermediate + index].bits);
       const auto duv = bf16_bits_to_float(u[index].bits);
-      const auto sigmoid = 1.0F / (1.0F + expf(-av));
+      const auto sigmoid = 1.0F / (1.0F + __expf(-av));
       const auto silu = av * sigmoid;
       const auto s = silu * bv;
       const auto ds = gate * duv;
