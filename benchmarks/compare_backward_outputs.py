@@ -128,6 +128,7 @@ def main():
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int)
+    parser.add_argument("--top-k", type=int, choices=(1, 6), default=1)
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -141,7 +142,7 @@ def main():
     if experts % world:
         raise ValueError("experts must be divisible by world")
     local_experts = experts // world
-    top_k = 1
+    top_k = args.top_k
     root = Path(args.artifact_dir)
 
     all_routes = []
@@ -150,10 +151,18 @@ def main():
     for source in range(world):
         prefix = root / f"rank-{source}-"
         all_routes.append(
-            read_numpy(prefix.with_name(prefix.name + "routes.i32"), np.int32)
+            read_numpy(
+                prefix.with_name(prefix.name + "routes.i32"),
+                np.int32,
+                args.tokens * top_k,
+            )
         )
         all_gates.append(
-            read_numpy(prefix.with_name(prefix.name + "gates.f32"), np.float32)
+            read_numpy(
+                prefix.with_name(prefix.name + "gates.f32"),
+                np.float32,
+                args.tokens * top_k,
+            )
         )
         all_dy.append(
             bf16_from_raw(
@@ -266,11 +275,11 @@ def main():
         (world, args.tokens, args.hidden), dtype=torch.float32, device=device
     )
     global_dgate = torch.zeros(
-        (world, args.tokens), dtype=torch.float32, device=device
+        (world, args.tokens * top_k), dtype=torch.float32, device=device
     )
-    for row, (source, token, _route) in enumerate(row_records):
+    for row, (source, token, route) in enumerate(row_records):
         global_dx[source, token] += dx_rows[row].float()
-        global_dgate[source, token] = dgate_rows[row]
+        global_dgate[source, route] = dgate_rows[row]
     dist.all_reduce(global_dx, op=dist.ReduceOp.SUM)
     dist.all_reduce(global_dgate, op=dist.ReduceOp.SUM)
     reference_dx = global_dx[rank].to(torch.bfloat16)
@@ -288,7 +297,7 @@ def main():
             read_numpy(
                 prefix.with_name(prefix.name + "dgate.f32"),
                 np.float32,
-                args.tokens,
+                args.tokens * top_k,
             ),
             copy=True,
         )

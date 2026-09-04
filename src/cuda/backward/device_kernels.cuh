@@ -386,6 +386,8 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   const auto token = static_cast<std::uint64_t>(blockIdx.x);
   if (token >= a.dispatch.identity.num_tokens)
     return;
+  constexpr std::uint32_t kTrainingTopK = 6U;
+  __shared__ const transport::BFloat16 *source_rows[kTrainingTopK];
   const auto *contribution = peer_at<const transport::BFloat16>(
       a.local_base, a.contribution_offset);
 #if __has_include(<nccl_device.h>)
@@ -405,6 +407,22 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   auto *ready = peer_at<unsigned long long>(a.local_base,
                                              a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
+  if (a.dispatch.identity.top_k == kTrainingTopK) {
+    if (threadIdx.x < kTrainingTopK) {
+      const auto position = static_cast<std::uint32_t>(threadIdx.x);
+      const auto slot = a.dispatch.combine_order[route_base + position];
+      const auto route = route_base + slot;
+      auto *source = contribution + route * a.hidden;
+#if __has_include(<nccl_device.h>)
+      if (a.use_gin && a.dispatch.route_dst_node[route] != a.node)
+        source = reinterpret_cast<const transport::BFloat16 *>(
+            direct_receive +
+            direct_compact[route] * a.gin_return_row_bytes);
+#endif
+      source_rows[position] = source;
+    }
+    __syncthreads();
+  }
   for (std::uint32_t position = 0U;
        position < a.dispatch.identity.top_k; ++position) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
@@ -415,25 +433,32 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   for (std::uint64_t column = threadIdx.x; column < a.hidden;
        column += blockDim.x) {
     float sum = 0.0F;
-    for (std::uint32_t position = 0U;
-         position < a.dispatch.identity.top_k; ++position) {
-      const auto slot = a.dispatch.combine_order[route_base + position];
-      const auto route = route_base + slot;
+    if (a.dispatch.identity.top_k == kTrainingTopK) {
+#pragma unroll
+      for (std::uint32_t position = 0U; position < kTrainingTopK;
+           ++position)
+        sum += bf16_bits_to_float(source_rows[position][column].bits);
+    } else {
+      for (std::uint32_t position = 0U;
+           position < a.dispatch.identity.top_k; ++position) {
+        const auto slot = a.dispatch.combine_order[route_base + position];
+        const auto route = route_base + slot;
 #if __has_include(<nccl_device.h>)
-      const auto remote =
-          a.use_gin && a.dispatch.route_dst_node[route] != a.node;
-      const auto *remote_row =
-          remote
-              ? reinterpret_cast<const transport::BFloat16 *>(
-                    direct_receive + direct_compact[route] *
-                                         a.gin_return_row_bytes)
-              : static_cast<const transport::BFloat16 *>(nullptr);
-      const auto value = remote ? remote_row[column]
-                                : contribution[route * a.hidden + column];
+        const auto remote =
+            a.use_gin && a.dispatch.route_dst_node[route] != a.node;
+        const auto *remote_row =
+            remote
+                ? reinterpret_cast<const transport::BFloat16 *>(
+                      direct_receive + direct_compact[route] *
+                                           a.gin_return_row_bytes)
+                : static_cast<const transport::BFloat16 *>(nullptr);
+        const auto value = remote ? remote_row[column]
+                                  : contribution[route * a.hidden + column];
 #else
-      const auto value = contribution[route * a.hidden + column];
+        const auto value = contribution[route * a.hidden + column];
 #endif
-      sum += bf16_bits_to_float(value.bits);
+        sum += bf16_bits_to_float(value.bits);
+      }
     }
     combined[token * a.hidden + column] =
         transport::BFloat16{float_to_bf16_bits(sum)};

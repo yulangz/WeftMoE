@@ -121,7 +121,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     // scheduler; one-expert fixtures do not provide its split-role terminal
     // accounting with a representative task domain.
     experts = std::max<std::uint32_t>(16U, world * 2U);
-    top_k = 1U;
     const auto *tokens_text = std::getenv("MEGAMOE_BACKWARD_TOKENS");
     max_tokens = tokens_text ? std::stoull(tokens_text) : 8ULL;
     // Forward publishes 64-row Dispatch arrival tiles. Backward later groups
@@ -133,10 +132,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     common_routes.num_tokens = max_tokens;
     common_routes.selected_experts.clear();
     common_routes.selected_experts.reserve(
-        static_cast<std::size_t>(max_tokens));
-    for (std::uint64_t token = 0; token < max_tokens; ++token)
-      common_routes.selected_experts.push_back(
-          static_cast<std::int32_t>((token * world + rank) % experts));
+        static_cast<std::size_t>(max_tokens * top_k));
+    for (std::uint64_t token = 0; token < max_tokens; ++token) {
+      const auto base = static_cast<std::uint32_t>(
+          (token * world + rank) % experts);
+      for (std::uint32_t slot = 0; slot < top_k; ++slot)
+        common_routes.selected_experts.push_back(static_cast<std::int32_t>(
+            (base + slot * 53U) % experts));
+    }
   }
   megamoe::cuda::NcclBootstrapId bootstrap;
   if (rank == 0) {

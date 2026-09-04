@@ -535,7 +535,7 @@ def preflight_candidate(candidate: Mapping[str, Any], binary: Path,
         "--rounds", "2",
         "--backward-validation",
         "--backward-tokens", str(int(benchmark["preflight_tokens"])),
-        "--top-k", "1",
+        "--top-k", str(int(benchmark["top_k"])),
     ]
     run_environment = dict(environment)
     nccl_lib_dir = benchmark.get("nccl_lib_dir")
