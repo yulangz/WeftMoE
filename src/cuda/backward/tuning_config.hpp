@@ -73,6 +73,9 @@
 #ifndef MEGAMOE_BWD_READY_WORD_STAGGER
 #define MEGAMOE_BWD_READY_WORD_STAGGER 0
 #endif
+#ifndef MEGAMOE_BWD_ACTIVATION_OWNER_GROUP
+#define MEGAMOE_BWD_ACTIVATION_OWNER_GROUP 4
+#endif
 #ifndef MEGAMOE_BWD_DISPATCH_BATCH_ROWS
 #define MEGAMOE_BWD_DISPATCH_BATCH_ROWS 64
 #endif
@@ -138,6 +141,8 @@ inline constexpr std::uint32_t kQueueIdleNanosleep =
     MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kReadyWordStagger =
     MEGAMOE_BWD_READY_WORD_STAGGER;
+inline constexpr std::uint32_t kActivationOwnerGroup =
+    MEGAMOE_BWD_ACTIVATION_OWNER_GROUP;
 inline constexpr std::uint32_t kDispatchBatchRows =
     MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
 inline constexpr std::uint32_t kEpilogueRowsPerTask =
@@ -187,6 +192,9 @@ static_assert((kMathWarpgroups * kMathRegisters +
 static_assert(kRdmaCtas == 8U);
 static_assert(kRelayCtas >= 8U && kRelayCtas % 4U == 0U);
 static_assert(kReadyWordStagger <= 1U);
+static_assert(kActivationOwnerGroup >= 1U &&
+              kActivationOwnerGroup <= 32U &&
+              (kActivationOwnerGroup & (kActivationOwnerGroup - 1U)) == 0U);
 static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
 static_assert(kEpilogueRowsPerTask >= kComputeThreads / 32U &&

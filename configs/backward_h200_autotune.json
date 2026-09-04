@@ -73,6 +73,7 @@
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
       "ready_word_stagger": 0,
+      "activation_owner_group": 4,
       "epilogue_rows_per_task": 12,
       "dw2_claim_tiles": 4,
       "dw1_claim_tiles": 4
@@ -85,7 +86,7 @@
   "candidates": [
     {
       "name": "incumbent",
-      "description": "Measured two-host winner: sixteen Relay CTAs, larger dispatch waves, and short dW claims.",
+      "description": "Measured two-host winner: four-Mblock activation locality, sixteen Relay CTAs, larger dispatch waves, and short dW claims.",
       "override": {}
     },
     {
@@ -109,19 +110,19 @@
       "override": {"2_transport": {"relay_ctas": 12}}
     },
     {
-      "name": "epilogue_rows24",
-      "description": "Process two SwiGLU rows per warp before returning to the queue.",
-      "override": {"3_scheduler": {"epilogue_rows_per_task": 24}}
+      "name": "activation_owner_group16",
+      "description": "Spread activation CTAs across sixteen adjacent Mblocks, matching the expected world16 rows per expert.",
+      "override": {"3_scheduler": {"activation_owner_group": 16}}
     },
     {
-      "name": "dw_claim8",
-      "description": "Test longer dW chunks independently under the late-worker scheduler.",
-      "override": {"3_scheduler": {"dw2_claim_tiles": 8, "dw1_claim_tiles": 8}}
+      "name": "activation_owner_group8",
+      "description": "Use a wider eight-Mblock activation locality group.",
+      "override": {"3_scheduler": {"activation_owner_group": 8}}
     },
     {
-      "name": "staggered_ready_words",
-      "description": "Spread CTA probes over bitmap words instead of preserving expert-local activation work.",
-      "override": {"3_scheduler": {"ready_word_stagger": 1}}
+      "name": "activation_owner_group1",
+      "description": "Retain the former single-owner activation claim order as a regression candidate.",
+      "override": {"3_scheduler": {"activation_owner_group": 1}}
     }
   ]
 }

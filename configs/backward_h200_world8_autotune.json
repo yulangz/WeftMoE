@@ -71,6 +71,7 @@
     "3_scheduler": {
       "queue_idle_nanosleep": 64,
       "ready_word_stagger": 0,
+      "activation_owner_group": 4,
       "epilogue_rows_per_task": 12,
       "dw2_claim_tiles": 4,
       "dw1_claim_tiles": 4
@@ -83,7 +84,7 @@
   "candidates": [
     {
       "name": "incumbent",
-      "description": "Current twelve-Relay split architecture.",
+      "description": "Four-Mblock activation locality with the selected twelve-Relay split architecture.",
       "override": {}
     },
     {
@@ -92,14 +93,14 @@
       "override": {"4_completion_reduce": {"reduce_threads": 128}}
     },
     {
-      "name": "reduce_threads512",
-      "description": "Use sixteen vector-reduction warps per CTA.",
-      "override": {"4_completion_reduce": {"reduce_threads": 512}}
+      "name": "activation_owner_group8",
+      "description": "Spread activation CTAs across eight adjacent Mblocks.",
+      "override": {"3_scheduler": {"activation_owner_group": 8}}
     },
     {
-      "name": "epilogue_rows24",
-      "description": "Process two SwiGLU rows per warp before returning to the queue.",
-      "override": {"3_scheduler": {"epilogue_rows_per_task": 24}}
+      "name": "activation_owner_group1",
+      "description": "Retain the former single-owner activation claim order as a regression candidate.",
+      "override": {"3_scheduler": {"activation_owner_group": 1}}
     },
     {
       "name": "dispatch_rows64",
@@ -107,9 +108,9 @@
       "override": {"2_transport": {"dispatch_batch_rows": 64}}
     },
     {
-      "name": "staggered_ready_words",
-      "description": "Spread CTA probes over bitmap words instead of preserving expert-local activation work.",
-      "override": {"3_scheduler": {"ready_word_stagger": 1}}
+      "name": "activation_owner_group16",
+      "description": "Test a wider activation locality group that may cross expert boundaries on world8.",
+      "override": {"3_scheduler": {"activation_owner_group": 16}}
     }
   ]
 }

@@ -48,6 +48,9 @@ The current records are:
 - [`backward_owner_locality_20260904.json`](backward_owner_locality_20260904.json),
   expert-local ready-bitmap probing, paired one-/two-node latency, and Nsight
   L2/Tensor-pipe evidence.
+- [`backward_activation_owner_group_20260904.json`](backward_activation_owner_group_20260904.json),
+  four-Mblock activation locality, compile-time group search, paired
+  one-/two-node latency, and Nsight L2/Tensor-pipe evidence.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

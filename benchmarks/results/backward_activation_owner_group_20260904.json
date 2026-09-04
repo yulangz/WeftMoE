@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "description": "Activation-owner grouping for W1/W2 L2 reuse in cached-state Backward",
+  "tested_worktree_base_commit": "7341b51f1f53d7bcf63732bc8d2a2fcf0b1561b6",
+  "recorded_utc": "2026-09-04T15:10:22Z",
+  "hardware": "8x H200 per node (driver label NVIDIA L20X)",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "aggregation": "slowest rank per iteration"
+  },
+  "implementation": {
+    "parameter": "activation_owner_group",
+    "selected_value": 4,
+    "qualified_values": [1, 4, 8, 16],
+    "affected_queues": ["dx", "dab"],
+    "dw_queue_order_unchanged": true,
+    "ready_word_stagger": 0,
+    "queue_priority": ["dx", "dab", "dw2", "dw1"],
+    "new_global_atomic": false,
+    "grid_sync_added": false,
+    "compute_registers_per_thread": 168,
+    "compute_stack_bytes_per_thread": 24,
+    "compute_local_bytes_per_thread": 0,
+    "compute_dynamic_shared_bytes": 213104
+  },
+  "world8": {
+    "relay_ctas": 12,
+    "measured_iterations_per_run": 100,
+    "group1_total_mean_us": 27300.423,
+    "group8_total_mean_us_runs": [26466.257, 26531.317],
+    "group4_total_mean_us_runs": [25786.436, 25804.336],
+    "group16_total_mean_us": 27404.511,
+    "selected_final_total_mean_us": 25804.336,
+    "latency_reduction_vs_group1_us": 1496.087,
+    "total_improvement_vs_group1_percent": 5.480,
+    "megatron_device_mean_us": 30180.962,
+    "megatron_speedup": 1.170
+  },
+  "world16": {
+    "rdma_ctas": 8,
+    "relay_ctas": 16,
+    "measured_iterations_per_run": 100,
+    "group1_total_mean_us": 29026.383,
+    "group8_total_mean_us": 28340.242,
+    "group4_total_mean_us_runs": [27896.354, 27987.824],
+    "group16_total_mean_us": 28769.432,
+    "selected_final_total_mean_us": 27987.824,
+    "latency_reduction_vs_group1_us": 1038.559,
+    "total_improvement_vs_group1_percent": 3.578,
+    "megatron_device_mean_us": 43033.856,
+    "megatron_speedup": 1.538
+  },
+  "nsys_world8_rank0": {
+    "baseline_report": "artifacts/backward_rank0_owner_locality.nsys-rep",
+    "candidate_report": "artifacts/backward_rank0_activation_owner_group4.nsys-rep",
+    "baseline_primary_compute_mean_ms": 26.624172,
+    "candidate_primary_compute_mean_ms": 25.814376,
+    "primary_compute_improvement_percent": 3.042,
+    "candidate_profile_iterations": 40,
+    "candidate_first_16ms_metric_samples": 960,
+    "baseline_first_16ms": {
+      "sm_active_percent": 99.991,
+      "tensor_pipe_active_percent": 50.213,
+      "l2_bandwidth_percent": 55.212,
+      "l2_to_device_memory_percent": 82.781,
+      "l2_hit_percent": 23.229
+    },
+    "candidate_first_16ms": {
+      "sm_active_percent": 99.906,
+      "tensor_pipe_active_percent": 57.124,
+      "l2_bandwidth_percent": 54.705,
+      "l2_to_device_memory_percent": 82.020,
+      "l2_hit_percent": 28.953
+    }
+  },
+  "correctness": {
+    "world8_top_k_values": [1, 6],
+    "world8_small_shape_repeats": 5,
+    "world16_top_k": 6,
+    "world16_small_shape_repeats": 5,
+    "all_four_outputs_repeat_byte_identical": true,
+    "top_k6_fingerprints_match_group1": true,
+    "independent_oracle": "inherited unchanged numeric path from the qualified predecessor"
+  }
+}

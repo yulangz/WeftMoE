@@ -229,3 +229,32 @@ shared-memory bytes. Both one-node and actual two-node GIN five-repeat
 validation remained byte-stable for dX, dGate, dW1, and dW2. Compact evidence
 is in
 [`benchmarks/results/backward_owner_locality_20260904.json`](../benchmarks/results/backward_owner_locality_20260904.json).
+
+## Backward activation-owner grouping
+
+Starting every bitmap scan at the expert-major head improved locality, but it
+also made many CTAs contend for all N tiles of one M-block at a time. The
+activation scheduler now rotates CTAs over four adjacent ready M-blocks while
+each M-block still claims N tiles in ascending order. This makes nearby CTAs
+request the same W1/W2 tile close together. The rule applies only to dAB/dX;
+dW retains the original single-expert order. It adds no atomic, barrier,
+`grid.sync()`, queue pass, or communication dependency.
+
+The explicit compile-time search compared owner groups 1, 4, 8, and 16.
+Group 4 won on both maintained topologies:
+
+| topology | group 1 | group 4 final | reduction | Megatron speedup |
+| --- | ---: | ---: | ---: | ---: |
+| world 8, one H200 node | 27.3004 ms | 25.8043 ms | 5.48% | 1.170x |
+| world 16, two H200 nodes, GIN | 29.0264 ms | 27.9878 ms | 3.58% | 1.538x |
+
+The world-8 alternatives measured 26.4988 ms for group 8 and 27.4045 ms for
+group 16. World 16 measured 28.3402 ms and 28.7694 ms respectively. Rank-0
+Nsight shortened the primary compute kernel from 26.6242 ms to 25.8144 ms.
+During its first 16 ms, Tensor Pipe activity rose from 50.21% to 57.12% and
+L2 hit rate from 23.23% to 28.95%; SM activity remained 99.9% and L2-to-HBM
+pressure fell from 82.78% to 82.02%. The compute resource footprint remains
+168 registers, 24 stack bytes, zero local bytes, and 213104 dynamic shared
+bytes. Top-k=1/6 local validation and actual two-node top-k=6 validation were
+byte-stable across five repeats. Compact evidence is in
+[`benchmarks/results/backward_activation_owner_group_20260904.json`](../benchmarks/results/backward_activation_owner_group_20260904.json).

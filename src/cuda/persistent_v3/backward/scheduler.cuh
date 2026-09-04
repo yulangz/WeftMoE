@@ -184,7 +184,27 @@ MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
         domain.ready_words[word_index]);
     auto bits = ready.load(::cuda::memory_order_acquire);
     while (bits != 0ULL) {
-      const auto bit = static_cast<std::uint32_t>(__ffsll(bits) - 1);
+      // Spread CTAs over the first compact owner group without giving up the
+      // expert-major ready-word order.  Since each owner claims N tiles from
+      // zero upward, neighboring M-blocks then request the same W1/W2 tile
+      // close together and can reuse it from L2.
+      auto bit = static_cast<std::uint32_t>(__ffsll(bits) - 1);
+      if constexpr (backward_tuning::kActivationOwnerGroup > 1U) {
+        if (domain.kind == TaskKind::Dx || domain.kind == TaskKind::Dab) {
+          constexpr std::uint32_t kOwnerGroup =
+              backward_tuning::kActivationOwnerGroup;
+          const auto group_begin = bit & ~(kOwnerGroup - 1U);
+          const auto group_bits =
+              (bits >> group_begin) & ((1ULL << kOwnerGroup) - 1ULL);
+          const auto rotation =
+              static_cast<std::uint32_t>(blockIdx.x) & (kOwnerGroup - 1U);
+          const auto after_rotation = group_bits & (~0ULL << rotation);
+          const auto selected = after_rotation != 0ULL ? after_rotation
+                                                        : group_bits;
+          bit = group_begin +
+                static_cast<std::uint32_t>(__ffsll(selected) - 1);
+        }
+      }
       const auto owner = word_index * 64U + bit;
       const auto mask = 1ULL << bit;
       if (owner >= domain.owner_count) {

@@ -121,12 +121,17 @@ used; the qualified world-8 and world-16 settings both use four tiles.
 Activation owners are stored as expert-major, contiguous M128 blocks. The
 selected `ready_word_stagger=0` specialization therefore starts every CTA's
 complete ready-bitmap probe at word zero. Atomic tile claims still distribute
-work across CTAs, but neighboring owners are consumed close enough together
-to reuse their expert's W1/W2 tiles in L2. This is only a scan-order hint: a
-miss visits every bitmap word, queue priority is unchanged, and there is no
-owner affinity, new global cursor, or synchronization. The explicit JSON
-autotune plans retain `ready_word_stagger=1` (start at `blockIdx.x % words`) as
-a regression candidate.
+work across CTAs. Within the first non-empty ready word, dAB/dX probes rotate
+over an aligned group of four neighboring owners while each owner continues
+to claim N tiles from zero upward. Neighboring M-blocks consequently request
+the same W1/W2 N tile close together and reuse it from L2. dW probing keeps the
+single-owner order because spreading it across experts destroys weight and
+reduction-input locality. This is only a scan-order hint: a miss visits every
+bitmap word, queue priority is unchanged, and there is no owner affinity, new
+global cursor, or synchronization. `activation_owner_group` is a compile-time
+JSON parameter; the narrow plans retain 1, 8, and 16 as regression candidates.
+`ready_word_stagger=1` remains representable by the explicit tuning surface
+for deliberate experiments, but is not in the maintained narrow search.
 
 The execution therefore has two conceptual periods but no physical phase
 transition:
