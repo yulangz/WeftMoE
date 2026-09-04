@@ -39,7 +39,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         self.assertEqual(plan["benchmark"]["launcher"], "local")
         self.assertEqual(candidates[0]["config"]["relay_ctas"], 12)
         self.assertEqual(candidates[0]["config"]["rdma_ctas"], 8)
-        self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 32)
+        self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 16)
         self.assertEqual(candidates[0]["config"]["dw2_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["dw1_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["ready_word_stagger"], 0)

@@ -259,3 +259,23 @@ pressure fell from 82.78% to 82.02%. The compute resource footprint remains
 bytes. Top-k=1/6 local validation and actual two-node top-k=6 validation were
 byte-stable across five repeats. Compact evidence is in
 [`benchmarks/results/backward_activation_owner_group_20260904.json`](../benchmarks/results/backward_activation_owner_group_20260904.json).
+
+## Backward single-node dispatch wavefront
+
+With four-owner activation locality selected, the single-node Relay batch was
+revisited below the former 32-row boundary.  A 16-row batch performs more
+system fences and therefore moves the all-routes dispatch timestamp later,
+but exposes partially filled expert M-blocks soon enough to shorten the
+persistent compute critical path.  It changes neither the copy operation nor
+the M-block arrival/release protocol and adds no synchronization with compute.
+
+Two 210-iteration measurements in each order produced 25.6292 ms for the
+16-row point and 25.8356 ms for the former 32-row point, a 0.80% reduction in
+slowest-rank mean latency.  The primary compute interval improved by the same
+0.80%, from 25.8169 ms to 25.6110 ms, while the transport interval shortened
+from 15.3734 ms to 15.1080 ms.  The dAB/dX duration counters grow because
+their start timestamp moves earlier; their completion relative to kernel
+launch is what improves.  Top-k=1 and top-k=6 five-repeat validation passed
+the independent oracle and remained byte-identical.  The world-16 GIN point
+keeps its independently selected 64-row batch.  Compact evidence is in
+[`benchmarks/results/backward_dispatch_wavefront_20260904.json`](../benchmarks/results/backward_dispatch_wavefront_20260904.json).

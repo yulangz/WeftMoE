@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "description": "Single-node Backward dispatch publication wavefront qualification",
+  "tested_worktree_base_commit": "79f7219b1636992de5715cd657aa886d9b646823",
+  "recorded_utc": "2026-09-04T15:44:24Z",
+  "hardware": "8x H200 (driver label NVIDIA L20X)",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_iterations": 10,
+    "measured_iterations_per_run": 210,
+    "runs_per_candidate": 2,
+    "ordering": "candidate/control then control/candidate",
+    "aggregation": "slowest rank per iteration"
+  },
+  "implementation": {
+    "selected_dispatch_batch_rows": 16,
+    "previous_dispatch_batch_rows": 32,
+    "world16_dispatch_batch_rows_unchanged": 64,
+    "relay_ctas": 12,
+    "rdma_ctas_launched": 0,
+    "activation_owner_group": 4,
+    "copy_path_changed": false,
+    "arrival_protocol_changed": false,
+    "grid_sync_added": false,
+    "compute_registers_per_thread": 168,
+    "compute_stack_bytes_per_thread": 24,
+    "compute_local_bytes_per_thread": 0,
+    "compute_dynamic_shared_bytes": 213104,
+    "transport_registers_per_thread": 72,
+    "transport_stack_bytes_per_thread": 8
+  },
+  "paired_confirmation": {
+    "batch16_total_mean_us_runs": [25620.592857, 25637.741905],
+    "batch32_total_mean_us_runs": [25834.469048, 25836.640952],
+    "batch16_total_mean_us": 25629.167381,
+    "batch32_total_mean_us": 25835.555,
+    "latency_reduction_us": 206.387619,
+    "improvement_percent": 0.79884,
+    "batch16_primary_compute_mean_us": 25610.968095,
+    "batch32_primary_compute_mean_us": 25816.900476,
+    "compute_improvement_percent": 0.79766,
+    "batch16_transport_mean_us": 15107.994762,
+    "batch32_transport_mean_us": 15373.444762,
+    "transport_improvement_percent": 1.72669,
+    "batch16_p50_mean_us": 25296.05,
+    "batch32_p50_mean_us": 25599.7,
+    "batch16_p95_mean_us": 27412.4,
+    "batch32_p95_mean_us": 27480.4
+  },
+  "interpretation": {
+    "batch16_dispatch_complete_mean_us": 11310.018095,
+    "batch32_dispatch_complete_mean_us": 6761.285119,
+    "reason": "The smaller batch publishes early Mblocks sooner even though extra fences delay the final all-routes completion timestamp.",
+    "dab_dx_duration_note": "Their duration counters start earlier under batch16; the launch-relative completion and end-to-end critical path are shorter."
+  },
+  "correctness": {
+    "top_k_values": [1, 6],
+    "tokens_per_rank": 8,
+    "repeats": 5,
+    "independent_oracle": "pass",
+    "all_four_outputs_repeat_byte_identical": true
+  },
+  "rejected_adjacent_experiments": {
+    "dw_chunk_wgmma_wait1_total_mean_us": 27325.438182,
+    "dw_chunk_wgmma_wait1_regression_percent": 5.69608,
+    "dab_owner_group8_dx_group4_total_mean_us": 26228.06,
+    "dab_owner_group8_dx_group4_regression_percent": 1.45131,
+    "dab_owner_group2_dx_group4_total_mean_us": 26151.863636,
+    "dab_owner_group2_dx_group4_regression_percent": 1.15656,
+    "retained": "Neither; source was restored exactly."
+  },
+  "megatron_device_mean_us": 30180.962,
+  "selected_speedup_over_megatron": 1.17761
+}

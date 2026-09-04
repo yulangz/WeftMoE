@@ -161,6 +161,15 @@ qualified single-node specialization reserves 12 Relay CTAs and launches no
 RDMA workers. These counts are explicit JIT configuration values rather than
 runtime environment switches.
 
+The local Relay path publishes copied rows in bounded batches.  This is a
+wavefront knob, not a correctness boundary: every batch uses the same
+system-fence plus release-counter edge, and compute consumes each completed
+M-block independently.  The qualified single-node point uses 16 rows per
+batch so early dU tasks become visible sooner; the extra fences make the
+all-routes dispatch timestamp later, but shorten the compute critical path.
+The two-node point remains at 64 rows because the same parameter also controls
+the GIN dispatch issue batch and its amortization is different.
+
 ## Readiness and immediate return
 
 The dependency chain is entirely release/acquire based:

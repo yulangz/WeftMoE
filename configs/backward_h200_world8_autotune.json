@@ -61,7 +61,7 @@
     "2_transport": {
       "rdma_ctas": 8,
       "relay_ctas": 12,
-      "dispatch_batch_rows": 32,
+      "dispatch_batch_rows": 16,
       "gin_max_inflight": 24,
       "setup_threads": 256,
       "setup_idle_nanosleep": 128,
@@ -84,7 +84,7 @@
   "candidates": [
     {
       "name": "incumbent",
-      "description": "Four-Mblock activation locality with the selected twelve-Relay split architecture.",
+      "description": "Four-Mblock activation locality with sixteen-row readiness waves and the selected twelve-Relay split architecture.",
       "override": {}
     },
     {
@@ -103,9 +103,9 @@
       "override": {"3_scheduler": {"activation_owner_group": 1}}
     },
     {
-      "name": "dispatch_rows64",
-      "description": "Amortize local dY dispatch publication over larger row batches.",
-      "override": {"2_transport": {"dispatch_batch_rows": 64}}
+      "name": "dispatch_rows32",
+      "description": "Retain the former thirty-two-row publication wave as a regression candidate.",
+      "override": {"2_transport": {"dispatch_batch_rows": 32}}
     },
     {
       "name": "activation_owner_group2",
