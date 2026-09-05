@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "implementation_commit": "abd130ad37db7f39c5c6df4e7a70ea93ed624803",
+  "recorded_utc": "2026-09-05T16:40:00Z",
+  "hardware": "8x H200 per node (driver label NVIDIA L20X), two nodes",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "warmup_rounds": 10,
+    "measured_rounds": 100,
+    "aggregation": "slowest rank per iteration"
+  },
+  "cleanup": {
+    "generated_data_removed_gib_approx": 30.7,
+    "largest_source_lines_after_split": 1405,
+    "retired_forward_lines_removed": 932,
+    "removed_paths": [
+      "artifacts",
+      "build-bwd",
+      "build-bwd-128",
+      "build-bwd-dw256",
+      "build-bwd-r16",
+      "build-bwd-r8",
+      "build-bwd-s3",
+      "build-bwd-wait1",
+      ".pytest_cache",
+      ".ruff_cache",
+      "Python bytecode caches"
+    ]
+  },
+  "forward": {
+    "world8": {
+      "autotune_seconds": 177.760,
+      "selected": "world8_relay16_tma4",
+      "selected_config": {
+        "rdma_ctas": 0,
+        "relay_ctas": 16,
+        "local_dispatch_tma_warps": 4
+      },
+      "confirmed_mean_us": 14814.684,
+      "final_mean_us": 14926.741,
+      "back_to_back_cleanup_check": {
+        "pre_cleanup_commit": "47bec7a",
+        "pre_cleanup_interval_mean_us": [14851.220, 14920.710],
+        "post_cleanup_interval_mean_us": [14809.642, 14810.293],
+        "pre_cleanup_aggregate_mean_us": 14885.965,
+        "post_cleanup_aggregate_mean_us": 14809.968,
+        "change_percent": -0.511
+      }
+    },
+    "world16": {
+      "autotune_seconds": 521.665,
+      "selected": "current_m128_n128_n256",
+      "selected_config": {
+        "rdma_ctas": 8,
+        "relay_ctas": 8,
+        "tile_m": 128,
+        "fc1_tile_n": 128,
+        "fc2_tile_n": 256
+      },
+      "confirmed_mean_us": 21401.910,
+      "final_mean_us": 21446.706,
+      "previous_qualified_mean_us": 21559.286,
+      "change_percent": -0.522,
+      "megatron_reference_mean_us": 31334.000,
+      "speedup_over_megatron": 1.461
+    }
+  },
+  "backward": {
+    "world8": {
+      "autotune_seconds": 326.156,
+      "selected": "incumbent",
+      "confirmed_mean_us": 25147.830,
+      "final_mean_us": 25254.574,
+      "previous_qualified_mean_us": 25218.000,
+      "change_percent": 0.145
+    },
+    "world16": {
+      "autotune_seconds": 635.473,
+      "selected": "incumbent",
+      "confirmed_mean_us": 27461.766,
+      "final_mean_us": 27637.907,
+      "previous_qualified_mean_us": 27617.000,
+      "change_percent": 0.076,
+      "megatron_reference_mean_us": 43034.000,
+      "speedup_over_megatron": 1.557
+    }
+  },
+  "kernel_artifact": {
+    "kernel": "forward_compute_main",
+    "architecture": "sm_90a",
+    "registers_per_thread": 168,
+    "stack_bytes_per_thread": 1312,
+    "static_shared_bytes": 2048,
+    "configured_dynamic_shared_bytes": 196832,
+    "instruction_count": 18832
+  },
+  "correctness": {
+    "cpu_metadata": "13/13 pass",
+    "python_reference": "7/7 pass",
+    "launcher_security": "13/13 pass",
+    "forward_autotune_unit": "18/18 pass",
+    "backward_autotune_unit": "11/11 pass",
+    "cuda_device_and_control_protocol": "pass",
+    "forward_world8_repeat": "20 repeats pass",
+    "forward_world16_repeat_and_retained_state": "20 repeats pass",
+    "backward_world8_dx_dgate_dw1_dw2": "repeat equal",
+    "backward_world16_dx_dgate_dw1_dw2": "repeat equal",
+    "kernel_artifact_manifest": "pass"
+  }
+}
