@@ -6,11 +6,11 @@
     "forward_compute_main": {
       "sm_90a": {
         "configured_dynamic_shared_bytes": 196832,
-        "instruction_count": 18976,
+        "instruction_count": 18832,
         "local_bytes": 0,
-        "normalized_sass_sha256": "08e95fb727936eaf71b806e19f3d03dcbbfccc36f756ae9218e8f31f2f170ede",
+        "normalized_sass_sha256": "cd322cdb1e237e3f992e7399287d5159522798c1c2405bf630184fcb7b935209",
         "registers": 168,
-        "stack_bytes": 1320,
+        "stack_bytes": 1312,
         "static_shared_bytes": 2048
       }
     }
