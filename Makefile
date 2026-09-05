@@ -297,9 +297,9 @@ release-check-inner:
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp
 CUDA_TEST_DEPS := \
-	tests/cuda/backward_runner.inc \
-	tests/cuda/distributed_runner.inc \
-	tests/cuda/transport_benchmarks.inc
+	$(wildcard tests/cuda/*.inc) \
+	$(wildcard tests/cuda/distributed/*.inc)
+METADATA_TEST_DEPS := $(wildcard tests/metadata/*.inc)
 
 $(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES) $(CUDA_TEST_DEPS)
 	@mkdir -p $(@D)
@@ -363,9 +363,10 @@ cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 cuda-sm90-compile:
 	$(MAKE) BUILD_DIR=$(BUILD_DIR)-sm90 CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' cuda-lib
 
-$(BUILD_DIR)/test_notify_dispatch: $(LIB_OBJECTS) tests/test_notify_dispatch.cpp
+$(BUILD_DIR)/test_notify_dispatch: $(LIB_OBJECTS) tests/test_notify_dispatch.cpp $(METADATA_TEST_DEPS)
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $^ -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) \
+		$(LIB_OBJECTS) tests/test_notify_dispatch.cpp -o $@
 
 $(BUILD_DIR)/notify_dispatch_bench: $(LIB_OBJECTS) benchmarks/notify_dispatch_bench.cpp
 	@mkdir -p $(@D)

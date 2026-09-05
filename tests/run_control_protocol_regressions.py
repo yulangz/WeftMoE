@@ -38,7 +38,7 @@ def main() -> None:
         "scenario=topology_mismatch",
         "scenario=expert_capacity_mismatch",
         "scenario=workspace_capacity_mismatch",
-        "20 invalid->valid recovery rounds",
+        "same ncclComm_t 5 categories x 4 invalid->valid recovery rounds",
     )
     missing = [marker for marker in required if marker not in completed.stdout]
     if missing:
