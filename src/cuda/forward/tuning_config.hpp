@@ -11,12 +11,6 @@
 #include <megamoe_forward_tuning_generated.hpp>
 #endif
 
-#ifndef MEGAMOE_FWD_COMPILED_TUNING
-#define MEGAMOE_FWD_COMPILED_TUNING 1
-#endif
-#ifndef MEGAMOE_FWD_ENABLE_LEGACY_ENV
-#define MEGAMOE_FWD_ENABLE_LEGACY_ENV 0
-#endif
 #ifndef MEGAMOE_FWD_MAIN_HIDDEN
 #define MEGAMOE_FWD_MAIN_HIDDEN 7168
 #endif
@@ -168,9 +162,6 @@
 
 namespace megamoe::cuda::forward_tuning {
 
-inline constexpr bool kCompiledTuning = MEGAMOE_FWD_COMPILED_TUNING != 0;
-inline constexpr bool kEnableLegacyEnvironment =
-    MEGAMOE_FWD_ENABLE_LEGACY_ENV != 0;
 inline constexpr std::uint32_t kMainHidden = MEGAMOE_FWD_MAIN_HIDDEN;
 inline constexpr std::uint32_t kMainIntermediate =
     MEGAMOE_FWD_MAIN_INTERMEDIATE;

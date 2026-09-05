@@ -111,8 +111,9 @@ __device__ __forceinline__ void rebalance_registers_for_reduce() {
 template <ForwardTaskPartition Partition>
 __device__ __forceinline__ unsigned long long partition_mblock_begin(
     const ForwardKernelArgs &a, unsigned long long *scheduler) {
-  if constexpr (Partition == ForwardTaskPartition::Body)
-    return *forward_mixed_scheduler_word(a, scheduler, kForwardHeadMblocks);
+  static_assert(Partition == ForwardTaskPartition::All);
+  (void)a;
+  (void)scheduler;
   return 0ULL;
 }
 
@@ -120,13 +121,9 @@ template <ForwardTaskPartition Partition>
 __device__ __forceinline__ unsigned long long partition_mblock_count(
     const ForwardKernelArgs &a, unsigned long long *scheduler) {
   const auto total = scheduler[3];
-  if constexpr (Partition == ForwardTaskPartition::All)
-    return total;
-  const auto head =
-      *forward_mixed_scheduler_word(a, scheduler, kForwardHeadMblocks);
-  if constexpr (Partition == ForwardTaskPartition::Head)
-    return head;
-  return total - head;
+  static_assert(Partition == ForwardTaskPartition::All);
+  (void)a;
+  return total;
 }
 
 // M=64 maps the two resident math warpgroups across adjacent N slices instead
@@ -187,10 +184,7 @@ __device__ __forceinline__ bool try_claim_fc1_task(
       partition_mblock_begin<Partition>(a, scheduler) * fc1_ntiles;
   const auto partition_tasks =
       partition_mblock_count<Partition>(a, scheduler) * fc1_ntiles;
-  auto *claim_word =
-      Partition == ForwardTaskPartition::Body
-          ? forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Claim)
-          : &scheduler[0];
+  auto *claim_word = &scheduler[0];
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> cursor(
       *claim_word);
   auto slot = cursor.load(::cuda::memory_order_relaxed);
@@ -251,10 +245,7 @@ __device__ __forceinline__ bool try_claim_fc1_task_pair(
       partition_mblock_begin<Partition>(a, scheduler) * fc1_ntiles;
   const auto partition_tasks =
       partition_mblock_count<Partition>(a, scheduler) * fc1_ntiles;
-  auto *claim_word =
-      Partition == ForwardTaskPartition::Body
-          ? forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Claim)
-          : &scheduler[0];
+  auto *claim_word = &scheduler[0];
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> cursor(
       *claim_word);
   auto slot = cursor.load(::cuda::memory_order_relaxed);
@@ -335,10 +326,7 @@ __device__ __forceinline__ bool try_claim_fc2_task(
   const auto partition_mblocks =
       partition_mblock_count<Partition>(a, scheduler);
 
-  auto *claim_word =
-      Partition == ForwardTaskPartition::Body
-          ? forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Claim)
-          : &scheduler[1];
+  auto *claim_word = &scheduler[1];
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> cursor(
       *claim_word);
   while (true) {
@@ -407,10 +395,7 @@ __device__ __forceinline__ bool try_claim_fc2_task_pair(
   const auto partition_begin = partition_mblock_begin<Partition>(a, scheduler);
   const auto partition_mblocks =
       partition_mblock_count<Partition>(a, scheduler);
-  auto *claim_word =
-      Partition == ForwardTaskPartition::Body
-          ? forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Claim)
-          : &scheduler[1];
+  auto *claim_word = &scheduler[1];
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> cursor(
       *claim_word);
   while (true) {

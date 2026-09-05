@@ -128,15 +128,6 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       status->reduced_tokens = ~0ULL;       // first reduced token
       status->fc1_start_clock = ~0ULL;
       scheduler[0] = scheduler[1] = scheduler[2] = scheduler[3] = 0ULL;
-      auto *head_mblocks = forward_mixed_scheduler_word(
-          a, scheduler, kForwardHeadMblocks);
-      *head_mblocks = 0ULL;
-      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Publish) =
-          0ULL;
-      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc1Claim) = 0ULL;
-      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Publish) =
-          0ULL;
-      *forward_mixed_scheduler_word(a, scheduler, kForwardBodyFc2Claim) = 0ULL;
       *forward_mixed_scheduler_word(a, scheduler,
                                     kForwardTransportInitEpoch) = 0ULL;
       *forward_mixed_scheduler_word(a, scheduler,
@@ -146,7 +137,6 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       for (std::uint32_t expert = 0;
            expert < a.dispatch.sizes.owned_expert_count; ++expert) {
         scheduler[3] += forward_expert_mblock_count(a, expert);
-        *head_mblocks += forward_expert_head_mblock_count(a, expert);
       }
       scheduler[4U + a.world] = 0ULL;
       scheduler[5U + 2ULL * a.world] = 0ULL;  // GIN headers ready contexts
@@ -1268,4 +1258,3 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     }
     __syncthreads();
   }
-

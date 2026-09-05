@@ -85,12 +85,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         cpp_macros = set(re.findall(
             r"^#ifndef (MEGAMOE_FWD_[A-Z0-9_]+)$", header,
             flags=re.MULTILINE))
-        controls = {
-            "MEGAMOE_FWD_COMPILED_TUNING",
-            "MEGAMOE_FWD_ENABLE_LEGACY_ENV",
-        }
-        self.assertEqual(cpp_macros - controls,
-                         set(tune.PARAMETER_MACROS.values()))
+        self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
 
     def test_cpp_defaults_match_explicit_production_point(self):
         header = (ROOT / "src" / "cuda" / "forward" /
@@ -108,24 +103,13 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(int(cpp_defaults[macro]), expected,
                              f"C++ default differs for {key}")
 
-    def test_generated_header_disables_runtime_tuning(self):
+    def test_generated_header_has_one_definition_per_parameter(self):
         candidate = self.candidates[0]
         header = tune.generated_header(candidate["name"],
                                        candidate["config"])
-        self.assertIn("#define MEGAMOE_FWD_COMPILED_TUNING 1", header)
-        self.assertIn("#define MEGAMOE_FWD_ENABLE_LEGACY_ENV 0", header)
         self.assertIn("#define MEGAMOE_FWD_REDUCE_SCHEDULER 0", header)
         for macro in tune.PARAMETER_MACROS.values():
             self.assertEqual(header.count(f"#define {macro} "), 1)
-
-    def test_default_source_is_compile_time_specialized(self):
-        header = (ROOT / "src" / "cuda" / "forward" /
-                  "tuning_config.hpp").read_text(encoding="utf-8")
-        self.assertRegex(header,
-                         r"(?m)^#define MEGAMOE_FWD_COMPILED_TUNING 1$")
-        self.assertRegex(
-            header,
-            r"(?m)^#define MEGAMOE_FWD_ENABLE_LEGACY_ENV 0$")
 
     def test_generated_header_is_stable(self):
         candidate = self.candidates[0]

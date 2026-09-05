@@ -1122,11 +1122,9 @@ struct PoolSlot {
   // Per-slot non-blocking streams allow both persistent grids to remain
   // resident without serializing independent generations in the pool.
   cudaStream_t forward_transport_stream = nullptr;
-  cudaStream_t forward_m64_head_stream = nullptr;
   cudaStream_t forward_compute_stream = nullptr;
   cudaEvent_t forward_roles_ready = nullptr;
   cudaEvent_t forward_transport_done = nullptr;
-  cudaEvent_t forward_m64_head_done = nullptr;
   cudaEvent_t forward_compute_done = nullptr;
   cudaEvent_t backward_start = nullptr;
   cudaEvent_t backward_compute_start = nullptr;
@@ -1270,10 +1268,6 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.forward_transport_done)
         (void)cudaEventDestroy(slot.forward_transport_done);
-      if (slot.forward_m64_head_done)
-        internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
-      if (slot.forward_m64_head_done)
-        (void)cudaEventDestroy(slot.forward_m64_head_done);
       if (slot.forward_compute_done)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.forward_compute_done)
@@ -1291,8 +1285,6 @@ struct ActivationPoolState {
       }
       if (slot.forward_transport_stream)
         (void)cudaStreamDestroy(slot.forward_transport_stream);
-      if (slot.forward_m64_head_stream)
-        (void)cudaStreamDestroy(slot.forward_m64_head_stream);
       if (slot.forward_compute_stream)
         (void)cudaStreamDestroy(slot.forward_compute_stream);
       if (slot.dispatch_complete)
@@ -1411,4 +1403,3 @@ std::shared_ptr<SlotLease> acquire_slot(
           std::to_string(rank) + ", expected=available deterministic slot=" +
           std::to_string(i) + ", actual=busy/quarantined");
 }
-

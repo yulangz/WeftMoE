@@ -324,54 +324,24 @@ __device__ void visit_forward_accumulator_wide(float *accum,
 
 #endif
 
-// Forward normally uses uniform M128 blocks.  The latency-wavefront variant
-// preserves the same 128-row physical expert padding but exposes the first
-// physical block as two M64 compute tasks: [0,64), [64,128), followed by
-// aligned M128 tasks.  Keeping this address calculation in one helper prevents
-// Dispatch, compute, and Return from silently disagreeing about block identity.
+// Physical expert storage stays padded to 128 rows. The compile-time tile size
+// determines only scheduling and compute granularity.
 __device__ __forceinline__ std::uint64_t forward_expert_mblock_count(
     const ForwardKernelArgs &a, std::uint32_t expert) {
   const auto rows = a.dispatch.expert_row_count[expert];
-  const bool split_head = a.forward_m64_head_wavefront &&
-                          expert < a.forward_m64_head_expert_count;
-  if (!split_head)
-    return (rows + a.forward_mblock_rows - 1ULL) / a.forward_mblock_rows;
-  if (rows == 0ULL)
-    return 0ULL;
-  const auto head_blocks = rows <= 64ULL ? 1ULL : 2ULL;
-  const auto body_rows = rows > 128ULL ? rows - 128ULL : 0ULL;
-  return head_blocks + (body_rows + 127ULL) / 128ULL;
-}
-
-__device__ __forceinline__ std::uint64_t forward_expert_head_mblock_count(
-    const ForwardKernelArgs &a, std::uint32_t expert) {
-  if (!a.forward_m64_head_wavefront ||
-      expert >= a.forward_m64_head_expert_count)
-    return 0ULL;
-  const auto rows = a.dispatch.expert_row_count[expert];
-  return rows == 0ULL ? 0ULL : (rows <= 64ULL ? 1ULL : 2ULL);
+  return (rows + a.forward_mblock_rows - 1ULL) / a.forward_mblock_rows;
 }
 
 __device__ __forceinline__ std::uint64_t forward_mblock_local_row(
     const ForwardKernelArgs &a, std::uint32_t expert,
     std::uint32_t local_mblock) {
-  const bool split_head = a.forward_m64_head_wavefront &&
-                          expert < a.forward_m64_head_expert_count;
-  if (!split_head)
-    return static_cast<std::uint64_t>(local_mblock) * a.forward_mblock_rows;
-  if (local_mblock < 2U)
-    return static_cast<std::uint64_t>(local_mblock) * 64ULL;
-  return 128ULL + static_cast<std::uint64_t>(local_mblock - 2U) * 128ULL;
+  (void)expert;
+  return static_cast<std::uint64_t>(local_mblock) * a.forward_mblock_rows;
 }
 
 __device__ __forceinline__ std::uint32_t forward_mblock_extent(
-    const ForwardKernelArgs &a, std::uint32_t expert,
-    std::uint32_t local_mblock) {
-  return a.forward_m64_head_wavefront &&
-                 expert < a.forward_m64_head_expert_count &&
-                 local_mblock < 2U
-             ? 64U
-             : a.forward_mblock_rows;
+    const ForwardKernelArgs &a) {
+  return a.forward_mblock_rows;
 }
 
 __device__ __forceinline__ std::uint32_t forward_mblock_valid_rows(
@@ -379,16 +349,11 @@ __device__ __forceinline__ std::uint32_t forward_mblock_valid_rows(
     std::uint32_t local_mblock) {
   const auto local_row = forward_mblock_local_row(a, expert, local_mblock);
   const auto remaining = a.dispatch.expert_row_count[expert] - local_row;
-  const auto extent = forward_mblock_extent(a, expert, local_mblock);
+  const auto extent = forward_mblock_extent(a);
   return static_cast<std::uint32_t>(remaining < extent ? remaining : extent);
 }
 
 enum ForwardMixedSchedulerWord : std::uint32_t {
-  kForwardHeadMblocks = 0U,
-  kForwardBodyFc1Publish = 1U,
-  kForwardBodyFc1Claim = 2U,
-  kForwardBodyFc2Publish = 3U,
-  kForwardBodyFc2Claim = 4U,
   // The last three words in the aligned scheduler gap form a transport-only
   // startup rendezvous.  Keeping one immutable epoch publication and two
   // monotonic arrival counters avoids resetting a reusable barrier while a
@@ -400,8 +365,6 @@ enum ForwardMixedSchedulerWord : std::uint32_t {
 
 enum class ForwardTaskPartition : std::uint32_t {
   All = 0U,
-  Head = 1U,
-  Body = 2U,
 };
 
 __device__ __forceinline__ unsigned long long *forward_mixed_scheduler_word(
@@ -454,57 +417,6 @@ __device__ __forceinline__ void forward_transport_cta_barrier(
 __device__ std::uint32_t forward_wavefront_mblock_expert(
     const ForwardKernelArgs &a, std::uint64_t ordinal,
     std::uint64_t &local_mblock) {
-  if (a.forward_m64_head_wavefront) {
-    const auto head_experts =
-        min(a.forward_m64_head_expert_count,
-            a.dispatch.sizes.owned_expert_count);
-    // Keep every M64 task contiguous at the head of the immutable mapping so
-    // the head and body kernels can use independent monotonic queue cursors.
-    for (std::uint32_t expert = 0; expert < head_experts; ++expert) {
-      const auto blocks = forward_expert_head_mblock_count(a, expert);
-      for (std::uint64_t tile = 0; tile < blocks; ++tile) {
-        if (ordinal == 0ULL) {
-          local_mblock = tile;
-          return expert;
-        }
-        --ordinal;
-      }
-    }
-
-    // The body returns to M128 wavefront order. Split experts start at logical
-    // block 2 (physical row 128); unsplit experts start at block 0.
-    std::uint64_t max_body_blocks = 0ULL;
-    for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-      const auto blocks = forward_expert_mblock_count(a, expert);
-      const auto skipped = expert < head_experts
-                               ? forward_expert_head_mblock_count(a, expert)
-                               : 0ULL;
-      const auto body_blocks = blocks - skipped;
-      max_body_blocks = body_blocks > max_body_blocks ? body_blocks
-                                                       : max_body_blocks;
-    }
-    for (std::uint64_t body_tile = 0; body_tile < max_body_blocks;
-         ++body_tile) {
-      for (std::uint32_t expert = 0;
-           expert < a.dispatch.sizes.owned_expert_count; ++expert) {
-        const auto blocks = forward_expert_mblock_count(a, expert);
-        const auto skipped = expert < head_experts
-                                 ? forward_expert_head_mblock_count(a, expert)
-                                 : 0ULL;
-        if (body_tile >= blocks - skipped)
-          continue;
-        if (ordinal == 0ULL) {
-          local_mblock = body_tile + skipped;
-          return expert;
-        }
-        --ordinal;
-      }
-    }
-    local_mblock = 0ULL;
-    return a.dispatch.sizes.owned_expert_count;
-  }
-
   std::uint64_t max_blocks = 0ULL;
   for (std::uint32_t expert = 0;
        expert < a.dispatch.sizes.owned_expert_count; ++expert) {
@@ -536,8 +448,7 @@ __device__ std::uint32_t forward_wavefront_mblock_expert(
 __device__ std::uint32_t forward_locality_mblock_expert(
     const ForwardKernelArgs &a, std::uint64_t ordinal,
     std::uint64_t &local_mblock) {
-  if (a.forward_fc1_locality_group <= 1U ||
-      a.forward_m64_head_wavefront)
+  if (a.forward_fc1_locality_group <= 1U)
     return forward_wavefront_mblock_expert(a, ordinal, local_mblock);
 
   constexpr std::uint64_t kStartupMblocks = 2ULL;
@@ -782,4 +693,3 @@ enum class ForwardKernelRole : std::uint8_t {
 };
 
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
-

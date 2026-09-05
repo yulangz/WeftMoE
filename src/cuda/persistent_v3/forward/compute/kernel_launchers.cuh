@@ -1,7 +1,7 @@
 
 #include "cuda/persistent_v3/forward/reduce_pipeline.cuh"
 
-template <bool StaticLocal, bool SplitStages = false, bool M64 = false,
+template <bool StaticLocal, bool M64 = false,
           ForwardTaskPartition Partition = ForwardTaskPartition::All,
           bool ReduceStage = true, bool Fc2Only = false,
           bool Fc1Only = false,
@@ -44,15 +44,9 @@ local_p2p_forward_compute_kernel(
         Fc2StageCount>(
         a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
         &task_kind_shared, &return_mblock_shared);
-  } else if constexpr (SplitStages) {
+  } else {
     // Every compute CTA is work-conserving. At each tile boundary it probes
     // FC2 first and borrows FC1 only when no FC2 tile is currently published.
-    forward_compute_detail::persistent_role<
-        StaticLocal, true, true, M64, Partition, false, false, Fc1StageCount,
-        Fc2StageCount>(
-        a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
-        &task_kind_shared, &return_mblock_shared);
-  } else {
     forward_compute_detail::persistent_role<
         StaticLocal, true, true, M64, Partition, false, false, Fc1StageCount,
         Fc2StageCount>(
@@ -199,104 +193,6 @@ local_p2p_forward_training_tma_store_kernel(
   (void)w1_map;
   (void)w2_map;
   (void)output_store_map;
-#endif
-}
-
-// A small concurrent grid owns only the two M64 halves of each expert's first
-// physical M128 block.  It exits after FC2 publication, releasing its SMs to
-// queued M128 body CTAs; Return and Reduce retain their existing owners.
-template <bool StaticLocal>
-__global__ __launch_bounds__(384, 1) void local_p2p_forward_m64_head_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
-    const __grid_constant__ CUtensorMap s_map,
-    const __grid_constant__ CUtensorMap w1_map,
-    const __grid_constant__ CUtensorMap w2_map) {
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-  if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 64ULL,
-                            a.epoch);
-  extern __shared__ __align__(1024) unsigned char storage[];
-  __shared__ unsigned long long task_shared;
-  __shared__ unsigned int task_kind_shared;
-  __shared__ unsigned int return_mblock_shared;
-  auto *scheduler =
-      peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
-  if (threadIdx.x == 0U) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        setup_ready(scheduler[8ULL + 2ULL * a.world]);
-    while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
-           !forward_cancelled(a))
-      __nanosleep(forward_tuning::kSetupNanosleep);
-  }
-  __syncthreads();
-  forward_compute_detail::persistent_role<
-      StaticLocal, true, true, true,
-      ForwardTaskPartition::Head>(
-      a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
-      &task_kind_shared, &return_mblock_shared);
-  if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 64ULL, a.epoch);
-#else
-  (void)a;
-  (void)x_map;
-  (void)s_map;
-  (void)w1_map;
-  (void)w2_map;
-#endif
-}
-
-// FC1 and FC2 have no useful overlap in the production wavefront: all FC1
-// tasks drain before the Return directory admits FC2.  Separate stream-ordered
-// entries give ptxas independent WGMMA register/control-flow scopes without
-// changing communication concurrency or adding a device-wide grid barrier.
-template <bool StaticLocal, bool Fc1Stage>
-__global__ __launch_bounds__(256, 1) void local_p2p_forward_stage_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
-    const __grid_constant__ CUtensorMap s_map,
-    const __grid_constant__ CUtensorMap w1_map,
-    const __grid_constant__ CUtensorMap w2_map) {
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-  if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U,
-                            Fc1Stage ? 1ULL : 2ULL, a.epoch);
-  extern __shared__ __align__(1024) unsigned char storage[];
-  __shared__ unsigned long long task_shared;
-  __shared__ unsigned int task_kind_shared;
-  __shared__ unsigned int return_mblock_shared;
-  auto *scheduler =
-      peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
-  if (threadIdx.x == 0U) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        setup_ready(scheduler[8ULL + 2ULL * a.world]);
-    while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
-           !forward_cancelled(a))
-      __nanosleep(forward_tuning::kSetupNanosleep);
-  }
-  __syncthreads();
-  if constexpr (Fc1Stage) {
-    forward_compute_detail::persistent_role<StaticLocal, true, false>(
-        a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
-        &task_kind_shared, &return_mblock_shared);
-  } else {
-    forward_compute_detail::persistent_role<StaticLocal, false, true>(
-        a, x_map, s_map, w1_map, w2_map, storage, &task_shared,
-        &task_kind_shared, &return_mblock_shared);
-    // Preserve the stable persistent lifecycle: transport finalization waits
-    // for one reduction release from every compute CTA.  FC2 and Reduce can
-    // have separate compiler scopes, but must remain the same resident role.
-    forward_compute_detail::reduce_role<StaticLocal>(
-        a, static_cast<std::uint32_t>(blockIdx.x),
-        static_cast<std::uint32_t>(gridDim.x));
-  }
-  if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U,
-                            Fc1Stage ? 1ULL : 2ULL, a.epoch);
-#else
-  (void)a;
-  (void)x_map;
-  (void)s_map;
-  (void)w1_map;
-  (void)w2_map;
 #endif
 }
 

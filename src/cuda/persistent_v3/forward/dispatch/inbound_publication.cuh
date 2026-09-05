@@ -322,10 +322,6 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
   auto *fc1_ready_queue = claims + forward_mblocks;
   auto *published_mblocks = peer_at<unsigned long long>(
       a.local_base, a.forward_fc1_published_offset);
-  const auto head_mblocks = a.forward_m64_head_wavefront
-                                ? *forward_mixed_scheduler_word(
-                                      a, scheduler, kForwardHeadMblocks)
-                                : forward_mblocks;
 #if MEGAMOE_DEBUG_VALIDATE
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
@@ -351,19 +347,9 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
       if (!forward_mblock_rows_ready<false>(a, expert, local_row, valid_rows))
         continue;
       atomicExch(&published_mblocks[mblock], 1ULL);
-      const bool body_task =
-          a.forward_m64_head_wavefront && mblock >= head_mblocks;
-      auto *publish_tail =
-          body_task
-              ? forward_mixed_scheduler_word(a, scheduler,
-                                             kForwardBodyFc1Publish)
-              : &scheduler[12ULL + 2ULL * a.world];
-      const auto partition_base =
-          body_task ? head_mblocks * fc1_ntiles : 0ULL;
-      const auto queue_base =
-          partition_base + atomicAdd(
-                               publish_tail,
-                               static_cast<unsigned long long>(fc1_ntiles));
+      const auto queue_base = atomicAdd(
+          &scheduler[12ULL + 2ULL * a.world],
+          static_cast<unsigned long long>(fc1_ntiles));
       for (std::uint32_t ntile = 0; ntile < fc1_ntiles; ++ntile) {
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             entry(fc1_ready_queue[queue_base + ntile]);
@@ -383,4 +369,3 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
 #endif
 }
-

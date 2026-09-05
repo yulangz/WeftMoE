@@ -364,14 +364,6 @@ ActivationTransportResourcePool make_activation_transport_pool(
                            "cudaStreamCreateWithPriority(Forward transport)");
       internal::throw_cuda(
           "transport-pool-create",
-          cudaStreamCreateWithPriority(&slot.forward_m64_head_stream,
-                                       cudaStreamNonBlocking,
-                                       greatest_stream_priority),
-          0, session.world_size(), session.identity(), session.generation(),
-          ExchangeKind::ExpertCounts,
-          "cudaStreamCreateWithPriority(Forward M64 head)");
-      internal::throw_cuda(
-          "transport-pool-create",
           cudaStreamCreateWithPriority(&slot.forward_compute_stream,
                                        cudaStreamNonBlocking,
                                        least_stream_priority),
@@ -383,8 +375,6 @@ ActivationTransportResourcePool make_activation_transport_pool(
                    "cudaEventCreate(Forward roles ready)");
       create_event(&slot.forward_transport_done,
                    "cudaEventCreate(Forward transport done)");
-      create_event(&slot.forward_m64_head_done,
-                   "cudaEventCreate(Forward M64 head done)");
       create_event(&slot.forward_compute_done,
                    "cudaEventCreate(Forward compute done)");
       if (config.enable_backward_state) {

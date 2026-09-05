@@ -202,21 +202,7 @@
                                     fc1_tasks, a.epoch);
             forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
           }
-          const auto head_mblocks = a.forward_m64_head_wavefront
-                                        ? *forward_mixed_scheduler_word(
-                                              a, scheduler,
-                                              kForwardHeadMblocks)
-                                        : forward_mblocks;
-          const bool body_task =
-              a.forward_m64_head_wavefront && mblock >= head_mblocks;
-          auto *publish_tail =
-              body_task
-                  ? forward_mixed_scheduler_word(a, scheduler,
-                                                 kForwardBodyFc2Publish)
-                  : &scheduler[2];
-          const auto partition_base = body_task ? head_mblocks : 0ULL;
-          const auto queue_slot =
-              partition_base + atomicAdd(publish_tail, 1ULL);
+          const auto queue_slot = atomicAdd(&scheduler[2], 1ULL);
 #if MEGAMOE_DEBUG_VALIDATE
           if (a.use_gin) {
             atomicAdd(&completion->progress_ctas_at_bulk_return, 1ULL);
@@ -240,4 +226,3 @@
 
     if (*task_kind_shared == kComputeTaskDone)
       break;
-
