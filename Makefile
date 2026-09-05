@@ -59,6 +59,17 @@ LIB_SOURCES := \
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 PROD_LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/production/%.o)
 
+NOTIFY_DISPATCH_FRAGMENTS := $(wildcard src/metadata/notify_dispatch/*.inc)
+DEVICE_NOTIFY_FRAGMENTS := $(wildcard src/cuda/notify/*.inc)
+NCCL_COUNT_EXCHANGE_FRAGMENTS := $(wildcard src/transport/nccl_count_exchange/*.inc)
+FORWARD_SOURCE_FRAGMENTS := \
+	$(wildcard src/cuda/forward/host/*.inc) \
+	$(wildcard src/cuda/forward/kernels/*) \
+	$(wildcard src/cuda/forward/runtime/*.inc) \
+	$(wildcard src/cuda/forward/support/*) \
+	$(wildcard src/cuda/persistent_v3/forward/compute/*) \
+	$(wildcard src/cuda/persistent_v3/forward/dispatch/*)
+
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets
 override CUDA_NVCCFLAGS += -Xcompiler=-fPIC,-fvisibility=hidden,-ffunction-sections,-fdata-sections
@@ -115,6 +126,18 @@ $(BUILD_DIR)/production/%.o: %.cu
 	@mkdir -p $(@D)
 	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
 
+$(BUILD_DIR)/src/metadata/notify_dispatch.o \
+$(BUILD_DIR)/production/src/metadata/notify_dispatch.o: \
+	$(NOTIFY_DISPATCH_FRAGMENTS)
+
+$(BUILD_DIR)/src/cuda/device_notify.o \
+$(BUILD_DIR)/production/src/cuda/device_notify.o: \
+	$(DEVICE_NOTIFY_FRAGMENTS)
+
+$(BUILD_DIR)/src/transport/nccl_count_exchange.o \
+$(BUILD_DIR)/production/src/transport/nccl_count_exchange.o: \
+	$(NCCL_COUNT_EXCHANGE_FRAGMENTS)
+
 $(BUILD_DIR)/src/cuda/activation_transport.o \
 $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/forward/kernel_contract.cuh \
@@ -130,6 +153,7 @@ $(BUILD_DIR)/production/src/cuda/activation_transport.o: \
 	src/cuda/backward/host_launch.inc \
 	src/cuda/forward/runtime_state.inc \
 	src/cuda/forward/host_launch.inc \
+	$(FORWARD_SOURCE_FRAGMENTS) \
 	src/cuda/testing/transport_probes.inc \
 	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
@@ -155,6 +179,7 @@ $(BUILD_DIR)/production/src/cuda/forward_transport.o: \
 	src/cuda/forward/device_kernels.cuh \
 	src/cuda/forward/runtime_state.inc \
 	src/cuda/forward/host_launch.inc \
+	$(FORWARD_SOURCE_FRAGMENTS) \
 	src/cuda/testing/transport_probes.inc \
 	src/cuda/forward/tuning_config.hpp \
 	src/cuda/forward/transport_launch.hpp \
