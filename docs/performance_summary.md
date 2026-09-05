@@ -1,4 +1,4 @@
-# Forward performance summary
+# Performance summary
 
 Latency is measured at the end-to-end Forward boundary and aggregated as the
 slowest rank for each iteration. Ten warmups are discarded and the final

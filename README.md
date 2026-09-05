@@ -147,6 +147,7 @@ configs/                         explicit autotune plans
 tools/                           tuning, SASS, and timeline utilities
 ```
 
-Benchmark claims and known limits are documented in
-[performance summary](docs/performance_summary.md) and
+Benchmark claims, the Backward contract, and known limits are documented in the
+[performance summary](docs/performance_summary.md),
+[Backward design](docs/backward_design.md), and
 [known limitations](docs/known_limitations.md).

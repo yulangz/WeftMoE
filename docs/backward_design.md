@@ -84,6 +84,43 @@ compact X. The explicitly zero padded operand masks compact rows beyond each
 expert's valid extent. Storage readiness and M-block identity remain padded to
 128 without allocating padded X, A/B, or dR replicas.
 
+### Compact reads and padded writes
+
+"Consume the compact cache directly" does not mean that the WGMMA problem or
+all Backward storage becomes ragged. It means that immutable Forward
+checkpoints keep their canonical compact row numbering, while mutable
+Backward intermediates keep the regular M128-padded numbering required by the
+task and GEMM geometry. Every `BackwardMblockDescriptor` therefore carries
+both `compact_row` and `padded_row`.
+
+For example, if expert 0 has 150 valid rows and expert 1 has 70, their row
+ranges are:
+
+```text
+                 expert 0       expert 1       total
+compact          [0, 150)       [150, 220)     220 rows
+M128 padded      [0, 256)       [256, 384)     384 rows
+```
+
+Expert 1 local row 10 is read from compact row 160 in retained X/A/B/dR and is
+written to padded row 266 in U/dAB/dX. The final partial M-block is masked or
+zero-filled as required; the WGMMA tile remains regular. This split address
+contract is also why dW1 and dW2 accept independent K origins for their two
+operands.
+
+The first compact-cache milestone removed the full compact-to-padded X/A/B
+materialization, approximately 1.57 GiB per GPU. At the meaningful
+one-Backward-per-Forward boundary it changed the world-8 kernel total from
+25.0954 to 23.8962 ms (-4.78%) and world-16 GIN from 29.7431 to 27.2120 ms
+(-8.51%). Reusing the dead compact Forward FC2-output plane for dR then
+reduced total workspace by approximately 2.42 GiB per GPU relative to the
+original padded-cache implementation. The resulting first-Backward totals
+are 23.7016 ms on world 8 and 26.7819 ms on world 16; the latter is 9.96%
+below the original padded path. These layout results are recorded in
+[`backward_compact_cache_20260904.json`](../benchmarks/results/backward_compact_cache_20260904.json)
+and
+[`backward_compact_dr_20260904.json`](../benchmarks/results/backward_compact_dr_20260904.json).
+
 ## Four logical work queues
 
 The task domains are known after Notify, so the queues should be precomputed
@@ -144,6 +181,20 @@ global cursor, or synchronization. `activation_owner_group` is a compile-time
 JSON parameter; the narrow plans retain 1, 2, and 8 as nearby candidates.
 `ready_word_stagger=1` remains representable by the explicit tuning surface
 for deliberate experiments, but is not in the maintained narrow search.
+
+The scan-order changes were measured independently before the compact-cache
+layout work and their percentages must not be added to the layout percentages
+above. Starting every complete scan at the expert-major head changed the
+slowest-rank mean from 28.0461 to 27.3243 ms on world 8 (-2.57%) and from
+29.7332 to 28.9468 ms on world 16 (-2.64%). Rotating activation claims over
+four neighboring owners then changed group-1 from 27.3004 to 25.8043 ms on
+world 8 (-5.48%) and from 29.0264 to 27.9878 ms on world 16 (-3.58%). In the
+rank-0 Nsight comparison, the four-owner point increased first-16-ms Tensor
+Pipe activity from 50.21% to 57.12% and L2 hit rate from 23.23% to 28.95%,
+while SM activity remained 99.9%. The evidence is in
+[`backward_owner_locality_20260904.json`](../benchmarks/results/backward_owner_locality_20260904.json)
+and
+[`backward_activation_owner_group_20260904.json`](../benchmarks/results/backward_activation_owner_group_20260904.json).
 
 The execution therefore has two conceptual periods but no physical phase
 transition:

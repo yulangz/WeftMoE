@@ -175,6 +175,9 @@ and local split paths use device-visible completion dependencies; the Socket
 path additionally performs collective terminal agreement. Cancellation and
 deadlines are generation-wide, and malformed or stale state fails closed.
 
-Backward has no data-plane implementation in this revision. The retained
-availability query prevents downstream callers from mistaking an absent
-pipeline for a supported slow path.
+The cached-state Backward data plane is now qualified on the same world-8 and
+world-16 topologies. It retains this Forward generation's compact X, BF16 A/B,
+gate, and immutable Dispatch context, and reports availability only from
+CUDA-backed binaries that contain the implementation. Its task dependencies,
+compact/padded address contract, and independent performance evidence are in
+[backward_design.md](backward_design.md).

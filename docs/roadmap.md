@@ -10,11 +10,12 @@
   tails without perturbing release kernels.
 - Validate three- and four-node GIN progress before generalizing topology.
 
-## Backward redesign
+## Backward maintenance
 
-Backward will not reuse the deleted monolithic implementation. Its new design
-is specified in [backward_design.md](backward_design.md) and starts from the
-Forward invariants:
+The replacement cached-state Backward pipeline is implemented and qualified;
+its selected contract is specified in
+[backward_design.md](backward_design.md). Continue to preserve these Forward
+invariants:
 
 - fixed communication, relay, and compute ownership;
 - generation-tagged counters and fixed task tables instead of phase-wide
@@ -25,6 +26,5 @@ Forward invariants:
   may claim `dW1/dW2` without waiting for all `dX` to be sent;
 - explicit JSON autotuning and the same slowest-rank correctness/performance
   evidence used by Forward.
-
-The public availability query remains false until this path has end-to-end
-correctness, lifecycle, and performance validation.
+- keep the CPU-only weak availability query false and the CUDA-backed strong
+  query true, so a binary cannot advertise a data plane it does not contain.
