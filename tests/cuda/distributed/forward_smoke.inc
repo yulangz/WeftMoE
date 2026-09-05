@@ -30,6 +30,7 @@
     transport_config.ring_slots_per_source_channel = 1;
     transport_config.max_inflight_generations = world == 1U ? 2U : 1U;
     transport_config.max_intermediate_size = intermediate;
+    transport_config.max_owned_experts = experts / world;
     transport_config.enable_backward_state = true;
     transport_config.enable_gin_rdma = gin_forward_smoke;
     auto transport_pool = megamoe::cuda::make_activation_transport_pool(
