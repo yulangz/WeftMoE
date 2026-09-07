@@ -222,6 +222,9 @@ def main():
     parser.add_argument("--workload", choices=("forward", "backward"),
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
+    parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
+                        default="alltoall")
+    parser.add_argument("--deepep-num-sms", type=int, default=20)
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")
@@ -319,6 +322,11 @@ def main():
     local_delta = counter_delta(before_local, after_local)
     remote_delta = counter_delta(before_remote, after_remote)
     evidence = validate_rdma_logs(local_text, remote_text)
+    if args.dispatcher == "flex":
+        evidence["scope"] = (
+            "HCA counters cover DeepEP NVSHMEM payload plus NCCL control and "
+            "timing collectives; NCCL logs prove only the NCCL portion"
+        )
     active_rails = sorted({
         hca for hca in hcas
         if local_delta[hca]["tx_bytes"] + local_delta[hca]["rx_bytes"] > 0 and
@@ -352,7 +360,19 @@ def main():
     if record.get("nccl_runtime_version") != "2.29.7":
         raise RuntimeError(
             f"unexpected NCCL runtime {record.get('nccl_runtime_version')}")
-    record["network_backend"] = "nccl-rdma-roce-gdr"
+    if args.dispatcher == "flex":
+        record["network_backend"] = (
+            "deepep-nvshmem-ibgda-hierarchical-rdma"
+        )
+        record["network_control_backend"] = "nccl-rdma-roce-gdr"
+        record["deepep_network_contract"] = {
+            "intranode": "NVLink high-throughput kernel",
+            "internode": "NVSHMEM/IBGDA hierarchical kernel",
+            "rc_qps_per_pe": 24,
+            "nic_selection": "NVSHMEM topology-local automatic mapping",
+        }
+    else:
+        record["network_backend"] = "nccl-rdma-roce-gdr"
     record["network_environment"] = {
         key: value for key, value in rdma_environment.items()
         if key != "MEGAMOE_MULTINODE_LAUNCH_ID"

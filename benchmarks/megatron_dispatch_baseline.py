@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Megatron-Core EP all-to-all dispatch/combine baseline.
+"""Megatron-Core EP dispatch/combine baseline.
 
 Run with ``torchrun --standalone --nproc-per-node=8``.  The benchmark uses
-Megatron-Core's production ``MoEAlltoAllTokenDispatcher`` rather than a raw
-NCCL all-to-all stand-in.  The identity expert body intentionally isolates the
-routing/transport slice that is comparable to MegaMOE's current synthetic
-activation transport; ``intermediate`` is recorded for the future FC baseline.
+Megatron-Core's production AllToAll or Flex+DeepEP dispatcher rather than a
+raw collective stand-in.  The identity expert body isolates routing/transport;
+the TE grouped-MLP body is the full Forward baseline comparable to MegaMOE.
 """
 
 import argparse
@@ -32,7 +31,10 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
-from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -279,6 +281,62 @@ def nccl_runtime_version():
     return f"{value // 10000}.{(value % 10000) // 100}.{value % 100}"
 
 
+def add_dispatcher_arguments(parser):
+    parser.add_argument(
+        "--dispatcher",
+        choices=("alltoall", "flex"),
+        default="alltoall",
+        help="Megatron token dispatcher; flex selects the DeepEP backend",
+    )
+    parser.add_argument(
+        "--deepep-num-sms",
+        type=int,
+        default=20,
+        help="SMs reserved by DeepEP high-throughput kernels (positive/even)",
+    )
+
+
+def validate_dispatcher_arguments(parser, args):
+    if args.dispatcher == "flex" and (
+        args.deepep_num_sms <= 0 or args.deepep_num_sms % 2
+    ):
+        parser.error("--deepep-num-sms must be a positive even number")
+
+
+def validate_dispatcher_runtime(args, world):
+    """Reject DeepEP internode launch shapes that device-assert upstream."""
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+    if args.dispatcher != "flex" or world <= local_world:
+        return
+    if args.hidden % 256:
+        raise ValueError(
+            "Flex+DeepEP internode BF16 requires hidden to be divisible by "
+            "256"
+        )
+    # Megatron-Core's DeepEP Buffer uses the legacy high-throughput backend
+    # with 24 RC QPs per PE. Its internode kernel accepts either no more than
+    # 24 CTAs, or 48 CTAs (24 communication channels).
+    if args.deepep_num_sms > 24 and args.deepep_num_sms != 48:
+        raise ValueError(
+            "Flex+DeepEP internode requires --deepep-num-sms <= 24 or 48 "
+            "with the upstream 24-RC-QP buffer"
+        )
+
+
+def create_dispatcher(args, local_experts, local_expert_indices, config):
+    dispatcher_type = (
+        MoEFlexTokenDispatcher
+        if args.dispatcher == "flex"
+        else MoEAlltoAllTokenDispatcher
+    )
+    return dispatcher_type(
+        local_experts,
+        local_expert_indices,
+        config,
+        get_default_pg_collection(),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=8192)
@@ -295,13 +353,16 @@ def main():
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
                         default="identity")
+    add_dispatcher_arguments(parser)
     args = parser.parse_args()
+    validate_dispatcher_arguments(parser, args)
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
+    validate_dispatcher_runtime(args, world)
     if args.experts % world:
         raise ValueError("experts must be divisible by EP world")
     parallel_state.initialize_model_parallel(
@@ -318,7 +379,9 @@ def main():
         moe_ffn_hidden_size=args.intermediate,
         num_moe_experts=args.experts,
         moe_router_topk=args.top_k,
-        moe_token_dispatcher_type="alltoall",
+        moe_token_dispatcher_type=args.dispatcher,
+        moe_flex_dispatcher_backend="deepep",
+        moe_deepep_num_sms=args.deepep_num_sms,
         expert_model_parallel_size=world,
         expert_tensor_parallel_size=1,
         bf16=True,
@@ -333,11 +396,11 @@ def main():
         moe_grouped_gemm=args.expert_body == "te-grouped-mlp",
     )
     local_experts = args.experts // world
-    dispatcher = MoEAlltoAllTokenDispatcher(
+    dispatcher = create_dispatcher(
+        args,
         local_experts,
         list(range(rank * local_experts, (rank + 1) * local_experts)),
         config,
-        get_default_pg_collection(),
     )
     experts_module = None
     actual_weight_parameters = None
@@ -421,22 +484,25 @@ def main():
     def prepare_dispatch():
         return dispatcher.dispatch_preprocess(hidden, routing, probabilities)
 
-    prepared_hidden, prepared_probabilities = prepare_dispatch()
-    dispatched_hidden, dispatched_probabilities = dispatcher.token_dispatch(
-        prepared_hidden, prepared_probabilities)
-    expert_hidden, tokens_per_expert, expert_probabilities = dispatcher.dispatch_postprocess(
-        dispatched_hidden, dispatched_probabilities)
+    if args.dispatcher == "alltoall":
+        prepared_hidden, prepared_probabilities = prepare_dispatch()
+        dispatched_hidden, dispatched_probabilities = dispatcher.token_dispatch(
+            prepared_hidden, prepared_probabilities)
+        expert_hidden, _, expert_probabilities = dispatcher.dispatch_postprocess(
+            dispatched_hidden, dispatched_probabilities)
 
-    def dispatch_collective():
-        return dispatcher.token_dispatch(prepared_hidden, prepared_probabilities)
+        def dispatch_collective():
+            return dispatcher.token_dispatch(
+                prepared_hidden, prepared_probabilities)
 
-    def combine_roundtrip():
-        weighted = (expert_hidden.float() *
-                    expert_probabilities.float().unsqueeze(-1)).to(
-                        torch.bfloat16)
-        local = dispatcher.combine_preprocess(weighted)
-        returned = dispatcher.token_combine(local)
-        return dispatcher.combine_postprocess(returned)
+        def combine_roundtrip():
+            weighted = (
+                expert_hidden.float()
+                * expert_probabilities.float().unsqueeze(-1)
+            ).to(torch.bfloat16)
+            local = dispatcher.combine_preprocess(weighted)
+            returned = dispatcher.token_combine(local)
+            return dispatcher.combine_postprocess(returned)
 
     def full_roundtrip():
         local_hidden, local_probs = dispatcher.dispatch_preprocess(
@@ -530,28 +596,37 @@ def main():
             "run": run,
             "routing_metadata_and_local_permute": measure(
                 prepare_dispatch, args.warmups, args.iterations),
-            "dispatch_alltoall": measure(
-                dispatch_collective, args.warmups, args.iterations),
-            "combine": measure(
-                combine_roundtrip, args.warmups, args.iterations),
-            "native_identity_e2e": measure(
-                full_roundtrip, args.warmups, args.iterations),
-            "common_semantics_identity_e2e": measure(
-                common_semantics_roundtrip, args.warmups, args.iterations),
         }
+        if args.dispatcher == "alltoall":
+            run_result.update({
+                "dispatch_alltoall": measure(
+                    dispatch_collective, args.warmups, args.iterations),
+                "combine": measure(
+                    combine_roundtrip, args.warmups, args.iterations),
+            })
+        run_result["native_identity_e2e"] = measure(
+            full_roundtrip, args.warmups, args.iterations)
+        if args.dispatcher == "alltoall":
+            run_result["common_semantics_identity_e2e"] = measure(
+                common_semantics_roundtrip, args.warmups, args.iterations)
         if experts_module is not None:
             run_result["native_forward_e2e"] = measure(
                 full_forward_roundtrip, args.warmups, args.iterations)
-            run_result["common_forward_e2e"] = measure(
-                common_forward_roundtrip, args.warmups, args.iterations)
+            if args.dispatcher == "alltoall":
+                run_result["common_forward_e2e"] = measure(
+                    common_forward_roundtrip, args.warmups, args.iterations)
         measured_runs.append(run_result)
 
     native_output = full_roundtrip()
-    common_output = common_semantics_roundtrip()
+    common_output = (common_semantics_roundtrip()
+                     if args.dispatcher == "alltoall" else None)
     native_forward_output = (full_forward_roundtrip()
                              if experts_module is not None else None)
-    common_forward_output = (common_forward_roundtrip()
-                             if experts_module is not None else None)
+    common_forward_output = (
+        common_forward_roundtrip()
+        if experts_module is not None and args.dispatcher == "alltoall"
+        else None
+    )
     torch.cuda.synchronize()
     slot_order = torch.argsort(selected, dim=1, stable=True)
     expected_fp32 = torch.zeros_like(hidden, dtype=torch.float32)
@@ -564,9 +639,6 @@ def main():
     native_absolute = (native_output.float() - expected_output.float()).abs()
     native_relative = (native_absolute /
                        expected_output.float().abs().clamp_min(1.0e-12))
-    common_absolute = (common_output.float() - expected_output.float()).abs()
-    common_relative = (common_absolute /
-                       expected_output.float().abs().clamp_min(1.0e-12))
     output_validation = {
         "native": {
             "byte_identical_to_common_reference": bool(
@@ -574,13 +646,21 @@ def main():
             "max_abs_error": native_absolute.max().item(),
             "max_relative_error": native_relative.max().item(),
         },
-        "common_semantics": {
+    }
+    if common_output is not None:
+        common_absolute = (
+            common_output.float() - expected_output.float()
+        ).abs()
+        common_relative = (
+            common_absolute
+            / expected_output.float().abs().clamp_min(1.0e-12)
+        )
+        output_validation["common_semantics"] = {
             "byte_identical_to_common_reference": bool(
                 torch.equal(common_output, expected_output)),
             "max_abs_error": common_absolute.max().item(),
             "max_relative_error": common_relative.max().item(),
-        },
-    }
+        }
     if args.save_output_dir:
         os.makedirs(args.save_output_dir, mode=0o700, exist_ok=True)
         torch.save({"native": native_output.cpu(),
@@ -618,9 +698,31 @@ def main():
     forward_wall_means = ([
         run["native_forward_e2e"]["host_wall"]["mean_ms"]
         for run in measured_runs] if experts_module is not None else [])
+    implementation = (
+        "Megatron-Core MoEFlexTokenDispatcher + DeepEP"
+        if args.dispatcher == "flex"
+        else "Megatron-Core MoEAlltoAllTokenDispatcher"
+    )
     output = {
         "schema": 2,
-        "implementation": "Megatron-Core MoEAlltoAllTokenDispatcher",
+        "implementation": implementation,
+        "token_dispatcher": args.dispatcher,
+        "flex_backend": "deepep" if args.dispatcher == "flex" else None,
+        "deepep_version": (
+            importlib.metadata.version("deep-ep")
+            if args.dispatcher == "flex" else None
+        ),
+        "deepep_num_sms": (
+            args.deepep_num_sms if args.dispatcher == "flex" else None
+        ),
+        "communication_backend": (
+            "DeepEP NVLink high-throughput"
+            + (" + NVSHMEM/IBGDA internode"
+               if world > int(os.environ.get("LOCAL_WORLD_SIZE", world))
+               else "")
+            if args.dispatcher == "flex"
+            else "Megatron permute + NCCL all-to-all"
+        ),
         "megatron_core_version": importlib.metadata.version("megatron-core"),
         "torch_version": torch.__version__,
         "torch_nccl_version": ".".join(
@@ -652,12 +754,19 @@ def main():
         "per_rank_weight_sample_hash": weight_hashes,
         "per_rank_actual_w1_device_hash": actual_w1_hashes,
         "per_rank_actual_w2_device_hash": actual_w2_hashes,
+        "common_semantics_available": args.dispatcher == "alltoall",
         "combine_reference": (
             "source-side per-route FP32 gate-after; fixed expert-ID FP32 "
-            "sum; final BF16 cast"),
+            "sum; final BF16 cast"
+            if args.dispatcher == "alltoall"
+            else "native DeepEP fused weighted combine"
+        ),
         "forward_reference": (
             "expert-side gate-before-FC2; source-side fixed expert-ID "
-            "unweighted FP32 sum; final BF16 cast"),
+            "unweighted FP32 sum; final BF16 cast"
+            if args.dispatcher == "alltoall"
+            else "expert-side gate-before-FC2; native DeepEP fused combine"
+        ),
         "derived_payload_bytes_per_rank": {
             "dispatch_activation_peer": activation_peer_bytes,
             "dispatch_probability_peer": probability_peer_bytes,
@@ -675,6 +784,7 @@ def main():
             "variance_ms2": statistics.pvariance(native_wall_means),
             "per_run_mean_ms": native_wall_means,
         }
+    if common_wall_means:
         output["common_identity_e2e_host_wall_cross_run"] = {
             "mean_ms": statistics.fmean(common_wall_means),
             "variance_ms2": statistics.pvariance(common_wall_means),
@@ -686,6 +796,7 @@ def main():
             "variance_ms2": statistics.pvariance(forward_wall_means),
             "per_run_mean_ms": forward_wall_means,
         }
+    if experts_module is not None and args.dispatcher == "alltoall":
         common_forward_means = [
             run["common_forward_e2e"]["host_wall"]["mean_ms"]
             for run in measured_runs]

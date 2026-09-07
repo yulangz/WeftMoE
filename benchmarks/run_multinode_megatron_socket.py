@@ -69,6 +69,8 @@ def benchmark_arguments(args):
         "--iterations", str(args.iterations),
         "--runs", "1",
         "--gate-mode", args.gate_mode,
+        "--dispatcher", args.dispatcher,
+        "--deepep-num-sms", str(args.deepep_num_sms),
     ]
     if args.workload == "backward":
         result.extend([
@@ -117,9 +119,17 @@ def main():
     parser.add_argument("--workload", choices=("forward", "backward"),
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
+    parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
+                        default="alltoall")
+    parser.add_argument("--deepep-num-sms", type=int, default=20)
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")
+    if args.dispatcher == "flex":
+        parser.error(
+            "Flex+DeepEP uses its own NVSHMEM/IBGDA internode payload path; "
+            "use run_multinode_megatron_rdma.py"
+        )
 
     launch_id = secrets.token_hex(16)
     environment = os.environ.copy()

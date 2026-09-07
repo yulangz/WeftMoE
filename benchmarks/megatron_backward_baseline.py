@@ -18,11 +18,15 @@ import time
 # This helper loads the explicitly requested NCCL runtime before importing
 # PyTorch. Keep it ahead of every direct torch/Megatron import in this file.
 from megatron_dispatch_baseline import (
+    add_dispatcher_arguments,
+    create_dispatcher,
     fixed_random_selected_gates,
     initialize_megamoe_forward_weights,
     loaded_nccl_libraries,
     nccl_runtime_version,
     stats,
+    validate_dispatcher_arguments,
+    validate_dispatcher_runtime,
 )
 
 import torch
@@ -34,9 +38,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
-from megatron.core.transformer.moe.token_dispatcher import (
-    MoEAlltoAllTokenDispatcher,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -155,7 +156,9 @@ def main():
         "--gate-mode", choices=("fixed-random", "unit"),
         default="fixed-random"
     )
+    add_dispatcher_arguments(parser)
     args = parser.parse_args()
+    validate_dispatcher_arguments(parser, args)
     if args.validation_repeats not in (0, 2):
         parser.error("--validation-repeats must be 0 or 2")
 
@@ -164,6 +167,7 @@ def main():
     world = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
+    validate_dispatcher_runtime(args, world)
     if args.experts % world:
         raise ValueError("experts must be divisible by EP world")
 
@@ -181,7 +185,9 @@ def main():
         moe_ffn_hidden_size=args.intermediate,
         num_moe_experts=args.experts,
         moe_router_topk=args.top_k,
-        moe_token_dispatcher_type="alltoall",
+        moe_token_dispatcher_type=args.dispatcher,
+        moe_flex_dispatcher_backend="deepep",
+        moe_deepep_num_sms=args.deepep_num_sms,
         expert_model_parallel_size=world,
         expert_tensor_parallel_size=1,
         bf16=True,
@@ -199,11 +205,11 @@ def main():
         recompute_modules=["moe_act"],
     )
     local_experts = args.experts // world
-    dispatcher = MoEAlltoAllTokenDispatcher(
+    dispatcher = create_dispatcher(
+        args,
         local_experts,
         list(range(rank * local_experts, (rank + 1) * local_experts)),
         config,
-        get_default_pg_collection(),
     )
     layer_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=args.experts,
@@ -312,9 +318,31 @@ def main():
             ),
         })
 
+    implementation = (
+        "Megatron-Core MoEFlexTokenDispatcher + DeepEP + TEGroupedMLP"
+        if args.dispatcher == "flex"
+        else "Megatron-Core MoEAlltoAllTokenDispatcher + TEGroupedMLP"
+    )
     output = {
         "schema": 1,
-        "implementation": "Megatron-Core MoEAlltoAllTokenDispatcher + TEGroupedMLP",
+        "implementation": implementation,
+        "token_dispatcher": args.dispatcher,
+        "flex_backend": "deepep" if args.dispatcher == "flex" else None,
+        "deepep_version": (
+            importlib.metadata.version("deep-ep")
+            if args.dispatcher == "flex" else None
+        ),
+        "deepep_num_sms": (
+            args.deepep_num_sms if args.dispatcher == "flex" else None
+        ),
+        "communication_backend": (
+            "DeepEP NVLink high-throughput"
+            + (" + NVSHMEM/IBGDA internode"
+               if world > int(os.environ.get("LOCAL_WORLD_SIZE", world))
+               else "")
+            if args.dispatcher == "flex"
+            else "Megatron permute + NCCL all-to-all"
+        ),
         "megatron_core_version": importlib.metadata.version("megatron-core"),
         "transformer_engine_version": importlib.metadata.version(
             "transformer-engine"
