@@ -69,6 +69,10 @@ The current records are:
 - [`backward_final_qualification_20260904.json`](backward_final_qualification_20260904.json),
   the post-layout narrow autotune, unchanged topology-specific winners, final
   100-iteration timing, and the public Backward availability decision.
+- [`megatron_flex_deepep_20260907.json`](megatron_flex_deepep_20260907.json),
+  the tuned Megatron Flex + DeepEP Forward and cached-X/A/B Backward baseline
+  on one and two H200 nodes, including dispatcher semantics, correctness,
+  multi-rail evidence, and comparison with both AllToAll and MegaMOE.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.

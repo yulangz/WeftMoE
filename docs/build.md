@@ -111,6 +111,62 @@ python3 tests/run_multinode_nccl.py \
   --socket-ifname eth0 --enable-ib --timeout 600
 ```
 
+## Megatron Flex + DeepEP baseline
+
+The baseline scripts default to Megatron AllToAll. Select Flex explicitly;
+the one-node Make targets use the tuned 64-SM point:
+
+```bash
+make megatron-flex-bench
+make megatron-flex-backward-bench
+```
+
+Equivalent direct launches are:
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  benchmarks/megatron_dispatch_baseline.py \
+  --dispatcher flex --deepep-num-sms 64
+
+torchrun --standalone --nproc-per-node=8 \
+  benchmarks/megatron_backward_baseline.py \
+  --dispatcher flex --deepep-num-sms 64
+```
+
+Use the RDMA launcher for two nodes. On the installed DeepEP legacy internode
+buffer, 48 is the tuned legal high-SM point:
+
+```bash
+python3 benchmarks/run_multinode_megatron_rdma.py \
+  --remote root@10.10.19.233 --port 2222 \
+  --gpus-per-node 8 --dispatcher flex --deepep-num-sms 48 \
+  --nccl-lib-dir "$MEGAMOE_NCCL_DIR" \
+  --ib-hca 'mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1' \
+  --socket-ifname eth0 --ib-gid-index 3 --timeout 1800
+
+python3 benchmarks/run_multinode_megatron_rdma.py \
+  --remote root@10.10.19.233 --port 2222 \
+  --gpus-per-node 8 --workload backward \
+  --dispatcher flex --deepep-num-sms 48 \
+  --nccl-lib-dir "$MEGAMOE_NCCL_DIR" \
+  --ib-hca 'mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1' \
+  --socket-ifname eth0 --ib-gid-index 3 --timeout 1800
+```
+
+Flex is deliberately rejected by `run_multinode_megatron_socket.py`: DeepEP's
+payload bypasses NCCL Socket through NVSHMEM/IBGDA, so labeling that launch a
+Socket transport benchmark would be false. For BF16 internode dispatch,
+`hidden` must be divisible by 256. This DeepEP build creates 24 RC QPs per PE,
+so its internode SM count must be at most 24 or exactly 48; the launchers check
+these constraints before entering distributed execution.
+
+DeepEP combine is a stateful counterpart to its dispatch and includes fused
+weighted route reduction. Consequently the Flex Forward report contains a
+native paired identity E2E metric and native full-Forward metric, rather than
+fabricating standalone dispatch/combine or common per-route timings. The
+qualified results and precise measurement boundary are recorded in
+`benchmarks/results/megatron_flex_deepep_20260907.json`.
+
 ## Autotuning
 
 The maintained plans are:

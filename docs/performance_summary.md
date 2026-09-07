@@ -5,6 +5,38 @@ slowest rank for each iteration. Ten warmups are discarded and the final
 validation contains 100 measured iterations. Component intervals are
 diagnostic overlap intervals; they are not added to manufacture a total.
 
+## Megatron dispatcher baselines
+
+The earlier Megatron reference in this document used
+`MoEAlltoAllTokenDispatcher`. A second baseline now uses Megatron-Core 0.17.0
+`MoEFlexTokenDispatcher` with DeepEP 1.2.1. DeepEP SM count was tuned using its
+native paired identity path: 64 SMs on world 8 and 48 SMs on world 16. The
+world-16 path uses DeepEP's NVSHMEM/IBGDA hierarchical RDMA transport, not an
+NCCL AllToAll payload path.
+
+| topology and phase | Megatron AllToAll | Megatron Flex + DeepEP | current MegaMOE | result versus Flex |
+| --- | ---: | ---: | ---: | ---: |
+| world 8 Forward | 18.515 ms | 18.189 ms | 14.810 ms | MegaMOE 1.228x faster |
+| world 16 Forward | 31.334 ms | 18.517 ms | 21.447 ms | MegaMOE 15.82% slower |
+| world 8 cached-X/A/B Backward | 30.205 ms | 29.705 ms | 25.255 ms | MegaMOE 1.176x faster |
+| world 16 cached-X/A/B Backward | 43.058 ms | 30.432 ms | 27.638 ms | MegaMOE 1.101x faster |
+
+These are slowest-rank means under the common 8192-token/rank, 384-expert,
+top-6, H7168/I3072 workload. Flex Forward is its native model path: DeepEP
+combine consumes the dispatch handle and performs fused weighted route
+reduction, so it cannot truthfully expose the same independent dispatch and
+combine timings as AllToAll. Its output was checked against the fixed FP32
+reference (`max_abs=0.00390625` on both topologies). Cached-state Flex Backward
+matched the corresponding non-recomputed Megatron execution byte-for-byte for
+dX, dGate, dW1, and dW2 and was repeat-stable on every rank.
+
+This changes the competitive target. MegaMOE still leads the tuned Flex
+baseline on one-node Forward and both Backward cases, but it does not yet lead
+the strongest measured Megatron baseline on two-node Forward. Any older claim
+below that uses 31.334 ms is specifically a comparison against Megatron
+AllToAll. Full evidence is in
+[`benchmarks/results/megatron_flex_deepep_20260907.json`](../benchmarks/results/megatron_flex_deepep_20260907.json).
+
 ## Post-cleanup result
 
 | topology | before cleanup | tuned after cleanup | p95 after | change |
@@ -12,8 +44,9 @@ diagnostic overlap intervals; they are not added to manufacture a total.
 | world 8, one H200 node | 15.0235 ms | 14.6285 ms | 14.9184 ms | -2.63% |
 | world 16, two H200 nodes, GIN | 21.5492 ms | 21.2461 ms | 21.6320 ms | -1.41% |
 
-The immediate pre-cleanup world-16 Megatron reference was 31.334 ms under the
-same main-shape workload. The post-cleanup MegaMOE result is 1.475x faster.
+The immediate pre-cleanup world-16 Megatron AllToAll reference was 31.334 ms
+under the same main-shape workload. The post-cleanup MegaMOE result is 1.475x
+faster.
 Every compiled candidate and each final validation produced the same input,
 route, gate, weight, and output correctness fingerprint.
 
@@ -24,8 +57,9 @@ the tuning margin: four independent 100-iteration intervals ranged from
 21.2675 to 21.7369 ms and averaged 21.5508 ms. That aggregate differs from the
 21.5492 ms pre-cleanup result by 0.007%, so the cleanup introduced no
 measurable regression; even the conservative aggregate remains 1.454x faster
-than the 31.334 ms Megatron reference. Both rebuilt winners retained the same
-correctness fingerprints and compiled-kernel digests as the search winners.
+than the 31.334 ms Megatron AllToAll reference. Both rebuilt winners retained
+the same correctness fingerprints and compiled-kernel digests as the search
+winners.
 
 The selected common compute shape is M128, FC1-N128, FC2-N256, K64, with four
 TMA stages in each GEMM, a two-CTA cluster, 232 math registers, 40 producer
@@ -62,9 +96,9 @@ does not alter GEMM or transport geometry. Two world-8 intervals averaged
 14.6616 ms. Three world-16 GIN intervals ranged from 21.3848 to 21.7787 ms and
 averaged 21.5593 ms. The latter differs by 0.04% from the previous four-run
 21.5508 ms aggregate and remains 1.453x faster than the 31.334 ms Megatron
-reference. The hot GIN fanout record remains 32 bytes, Dispatch remains four
-puts per wave, and the compiled compute kernel remains at 168 registers per
-thread.
+AllToAll reference. The hot GIN fanout record remains 32 bytes, Dispatch
+remains four puts per wave, and the compiled compute kernel remains at 168
+registers per thread.
 
 The compact evidence is
 [`benchmarks/results/forward_gate_before_20260903.json`](../benchmarks/results/forward_gate_before_20260903.json).
