@@ -1,0 +1,225 @@
+{
+  "schema": 1,
+  "description": "Causal Forward stage profile for Megatron Flex + DeepEP",
+  "implementation_commit": "a7a06fb171f789ac26898ca0e8157391cb1ab19d",
+  "recorded_utc": "2026-09-07",
+  "workload": {
+    "tokens_per_rank": 8192,
+    "experts": 384,
+    "top_k": 6,
+    "hidden": 7168,
+    "intermediate": 3072,
+    "activation_and_weights": "BF16",
+    "routing_gate": "FP32 fixed-random",
+    "expert_body": "TransformerEngine TEGroupedMLP",
+    "warmup_iterations": 10,
+    "measured_iterations": 100
+  },
+  "method": {
+    "timing": "CUDA events at causal API boundaries; no synchronize between stages",
+    "communication_stream_contract": "DeepEP completion events make the current stream wait, so dispatch/combine intervals include completion of their communication-stream work",
+    "rank_aggregation": "for each iteration, retain every stage from the rank with the largest profiled CUDA total; stage means therefore add to the reported mean total",
+    "validation": "the split FC1/activation/FC2 path was byte-identical on every rank to the original TEGroupedMLP module Forward",
+    "scope": "Forward only; DeepEP dispatch and combine are fused API intervals, not a claim that their internal layout, NVLink, and RDMA kernels are individually serialized"
+  },
+  "world8": {
+    "topology": "one H200 node, DeepEP high-throughput NVLink",
+    "deepep_num_sms": 64,
+    "unprofiled_native_forward": {
+      "cuda_mean_ms": 18.165038,
+      "cuda_p50_ms": 18.162784,
+      "cuda_p95_ms": 18.516672,
+      "host_mean_ms": 18.189795,
+      "host_p50_ms": 18.184840,
+      "host_p95_ms": 18.539479
+    },
+    "profiled_total": {
+      "cuda_mean_ms": 18.146424,
+      "cuda_p50_ms": 18.118816,
+      "cuda_p95_ms": 18.421087,
+      "host_mean_ms": 18.173223,
+      "host_p50_ms": 18.143265,
+      "host_p95_ms": 18.515969,
+      "instrumentation_change_from_unprofiled_cuda_percent": -0.102472
+    },
+    "stages": {
+      "dispatch_preprocess": {
+        "mean_ms": 0.238586,
+        "p50_ms": 0.237568,
+        "p95_ms": 0.246560,
+        "share_percent": 1.314784
+      },
+      "deepep_dispatch": {
+        "mean_ms": 2.121009,
+        "p50_ms": 2.098240,
+        "p95_ms": 2.325344,
+        "share_percent": 11.688303
+      },
+      "dispatch_postprocess_local_permute": {
+        "mean_ms": 0.868261,
+        "p50_ms": 0.865088,
+        "p95_ms": 0.888736,
+        "share_percent": 4.784751
+      },
+      "expert_metadata_host": {
+        "mean_ms": 0.002966,
+        "p50_ms": 0.002944,
+        "p95_ms": 0.003104,
+        "share_percent": 0.016345
+      },
+      "fc1": {
+        "mean_ms": 5.887916,
+        "p50_ms": 5.844416,
+        "p95_ms": 6.706464,
+        "share_percent": 32.446701
+      },
+      "swiglu_and_gate": {
+        "mean_ms": 1.785323,
+        "p50_ms": 1.782592,
+        "p95_ms": 1.816640,
+        "share_percent": 9.838428
+      },
+      "fc2": {
+        "mean_ms": 2.812172,
+        "p50_ms": 2.800576,
+        "p95_ms": 2.920128,
+        "share_percent": 15.497115
+      },
+      "combine_preprocess_local_unpermute": {
+        "mean_ms": 1.534763,
+        "p50_ms": 1.532032,
+        "p95_ms": 1.575008,
+        "share_percent": 8.457659
+      },
+      "deepep_combine": {
+        "mean_ms": 2.892476,
+        "p50_ms": 3.007968,
+        "p95_ms": 3.552992,
+        "share_percent": 15.939645
+      },
+      "combine_postprocess": {
+        "mean_ms": 0.002952,
+        "p50_ms": 0.002912,
+        "p95_ms": 0.003072,
+        "share_percent": 0.016269
+      }
+    },
+    "groups": {
+      "dispatch_path_ms": 3.227856,
+      "dispatch_path_share_percent": 17.787837,
+      "expert_path_ms": 10.488377,
+      "expert_path_share_percent": 57.798590,
+      "combine_path_ms": 4.430190,
+      "combine_path_share_percent": 24.413573,
+      "deepep_dispatch_plus_combine_ms": 5.013485,
+      "deepep_dispatch_plus_combine_share_percent": 27.627948,
+      "local_permute_plus_unpermute_ms": 2.403024,
+      "local_permute_plus_unpermute_share_percent": 13.242409
+    }
+  },
+  "world16": {
+    "topology": "two H200 nodes, DeepEP NVSHMEM/IBGDA hierarchical RDMA plus intranode NVLink",
+    "deepep_num_sms": 48,
+    "unprofiled_native_forward": {
+      "cuda_mean_ms": 18.196853,
+      "cuda_p50_ms": 18.100609,
+      "cuda_p95_ms": 18.708351,
+      "host_mean_ms": 18.222589,
+      "host_p50_ms": 18.123438,
+      "host_p95_ms": 18.729141
+    },
+    "profiled_total": {
+      "cuda_mean_ms": 18.452390,
+      "cuda_p50_ms": 18.127264,
+      "cuda_p95_ms": 20.034817,
+      "host_mean_ms": 18.479099,
+      "host_p50_ms": 18.163680,
+      "host_p95_ms": 20.058470,
+      "instrumentation_change_from_unprofiled_cuda_percent": 1.404292
+    },
+    "stages": {
+      "dispatch_preprocess": {
+        "mean_ms": 0.235633,
+        "p50_ms": 0.235008,
+        "p95_ms": 0.242112,
+        "share_percent": 1.276978
+      },
+      "deepep_dispatch": {
+        "mean_ms": 2.968429,
+        "p50_ms": 2.843872,
+        "p95_ms": 3.839168,
+        "share_percent": 16.086961
+      },
+      "dispatch_postprocess_local_permute": {
+        "mean_ms": 0.872389,
+        "p50_ms": 0.855520,
+        "p95_ms": 0.891552,
+        "share_percent": 4.727784
+      },
+      "expert_metadata_host": {
+        "mean_ms": 0.002751,
+        "p50_ms": 0.002752,
+        "p95_ms": 0.003168,
+        "share_percent": 0.014911
+      },
+      "fc1": {
+        "mean_ms": 4.865242,
+        "p50_ms": 4.848000,
+        "p95_ms": 4.946656,
+        "share_percent": 26.366460
+      },
+      "swiglu_and_gate": {
+        "mean_ms": 1.780505,
+        "p50_ms": 1.778848,
+        "p95_ms": 1.800096,
+        "share_percent": 9.649182
+      },
+      "fc2": {
+        "mean_ms": 2.630271,
+        "p50_ms": 2.614368,
+        "p95_ms": 2.707872,
+        "share_percent": 14.254364
+      },
+      "combine_preprocess_local_unpermute": {
+        "mean_ms": 1.524997,
+        "p50_ms": 1.524224,
+        "p95_ms": 1.533664,
+        "share_percent": 8.264498
+      },
+      "deepep_combine": {
+        "mean_ms": 3.569202,
+        "p50_ms": 3.400288,
+        "p95_ms": 5.223680,
+        "share_percent": 19.342764
+      },
+      "combine_postprocess": {
+        "mean_ms": 0.002971,
+        "p50_ms": 0.002976,
+        "p95_ms": 0.003072,
+        "share_percent": 0.016099
+      }
+    },
+    "groups": {
+      "dispatch_path_ms": 4.076451,
+      "dispatch_path_share_percent": 22.091723,
+      "expert_path_ms": 9.278769,
+      "expert_path_share_percent": 50.284916,
+      "combine_path_ms": 5.097170,
+      "combine_path_share_percent": 27.623361,
+      "deepep_dispatch_plus_combine_ms": 6.537631,
+      "deepep_dispatch_plus_combine_share_percent": 35.429726,
+      "local_permute_plus_unpermute_ms": 2.397387,
+      "local_permute_plus_unpermute_share_percent": 12.992282
+    }
+  },
+  "cross_topology": {
+    "deepep_dispatch_plus_combine_change_percent": 30.400943,
+    "fc1_swiglu_fc2_change_percent": -11.534060,
+    "local_permute_plus_unpermute_change_percent": -0.234585,
+    "interpretation": [
+      "world16 communication is slower, but 24 larger local-expert GEMMs replace 48 smaller GEMMs and make the expert compute path faster",
+      "world16 DeepEP combine has the dominant communication tail: 3.569 ms mean and 5.224 ms p95",
+      "the conventional Flex call graph waits for complete dispatch before FC1 and starts combine after all FC2 work, so there is no cross-stage communication/GEMM overlap even though DeepEP internally fuses and pipelines its transport kernels"
+    ]
+  }
+}

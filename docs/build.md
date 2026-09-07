@@ -118,6 +118,7 @@ the one-node Make targets use the tuned 64-SM point:
 
 ```bash
 make megatron-flex-bench
+make megatron-flex-stage-profile
 make megatron-flex-backward-bench
 ```
 
@@ -126,7 +127,8 @@ Equivalent direct launches are:
 ```bash
 torchrun --standalone --nproc-per-node=8 \
   benchmarks/megatron_dispatch_baseline.py \
-  --dispatcher flex --deepep-num-sms 64
+  --dispatcher flex --deepep-num-sms 64 \
+  --expert-body te-grouped-mlp
 
 torchrun --standalone --nproc-per-node=8 \
   benchmarks/megatron_backward_baseline.py \
@@ -166,6 +168,14 @@ native paired identity E2E metric and native full-Forward metric, rather than
 fabricating standalone dispatch/combine or common per-route timings. The
 qualified results and precise measurement boundary are recorded in
 `benchmarks/results/megatron_flex_deepep_20260907.json`.
+
+`megatron-flex-stage-profile` additionally records CUDA events at every causal
+Forward boundary. It does not synchronize between stages: DeepEP's own
+communication-stream completion event supplies the dependency observed by the
+next current-stream event. Per iteration, all stage values are retained from
+the same rank with the slowest profiled total, so their means are additive.
+The detailed result is in
+`benchmarks/results/megatron_flex_deepep_stage_profile_20260907.json`.
 
 ## Autotuning
 

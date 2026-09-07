@@ -37,6 +37,39 @@ below that uses 31.334 ms is specifically a comparison against Megatron
 AllToAll. Full evidence is in
 [`benchmarks/results/megatron_flex_deepep_20260907.json`](../benchmarks/results/megatron_flex_deepep_20260907.json).
 
+The corresponding causal Forward profile is:
+
+| stage | world 8 mean / p95 | world 16 mean / p95 |
+| --- | ---: | ---: |
+| dispatch preprocess | 0.239 / 0.247 ms | 0.236 / 0.242 ms |
+| fused DeepEP dispatch | 2.121 / 2.325 ms | 2.968 / 3.839 ms |
+| local expert permute | 0.868 / 0.889 ms | 0.872 / 0.892 ms |
+| FC1 | 5.888 / 6.706 ms | 4.865 / 4.947 ms |
+| SwiGLU and gate | 1.785 / 1.817 ms | 1.781 / 1.800 ms |
+| FC2 | 2.812 / 2.920 ms | 2.630 / 2.708 ms |
+| local output unpermute | 1.535 / 1.575 ms | 1.525 / 1.534 ms |
+| fused DeepEP combine | 2.892 / 3.553 ms | 3.569 / 5.224 ms |
+| profiled total | 18.146 / 18.421 ms | 18.452 / 20.035 ms |
+
+There is no synchronization inserted between these boundaries, and each
+iteration uses all stages from its slowest-total rank, making the means
+additive. The profiled path was byte-identical to the original TEGroupedMLP
+Forward. Inserting the events changed the unprofiled CUDA mean by -0.10% on
+world 8 and +1.40% on world 16.
+
+Direct DeepEP dispatch plus combine rises from 5.013 ms on world 8 to 6.538 ms
+on world 16 (+30.40%). Conversely, FC1/SwiGLU/FC2 falls from 10.485 to 9.276 ms
+(-11.53%): each GPU owns 24 experts rather than 48, so the same approximately
+49152 routed rows form fewer, larger grouped GEMMs. Local permute/unpermute is
+nearly topology-invariant at about 2.40 ms. The largest two-node tail is fused
+combine, whose 3.569-ms mean grows to 5.224 ms at p95.
+
+The additive call chain also makes the structural limitation explicit:
+Megatron waits for full dispatch before FC1 and begins combine only after all
+FC2 work. DeepEP pipelines work inside each fused API, but there is no
+cross-boundary dispatch/GEMM/combine overlap. Full stage evidence is in
+[`benchmarks/results/megatron_flex_deepep_stage_profile_20260907.json`](../benchmarks/results/megatron_flex_deepep_stage_profile_20260907.json).
+
 ## Post-cleanup result
 
 | topology | before cleanup | tuned after cleanup | p95 after | change |

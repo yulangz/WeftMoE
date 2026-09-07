@@ -73,6 +73,10 @@ The current records are:
   the tuned Megatron Flex + DeepEP Forward and cached-X/A/B Backward baseline
   on one and two H200 nodes, including dispatcher semantics, correctness,
   multi-rail evidence, and comparison with both AllToAll and MegaMOE.
+- [`megatron_flex_deepep_stage_profile_20260907.json`](megatron_flex_deepep_stage_profile_20260907.json),
+  the additive causal Forward breakdown across routing, fused DeepEP
+  dispatch/combine, local reorder, FC1, SwiGLU/gate, and FC2 on both maintained
+  topologies.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.
