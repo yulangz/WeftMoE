@@ -11,6 +11,8 @@ __device__ __forceinline__ void local_relay_role(
     persistent_v3::ForwardPipelineControl &control,
     std::uint32_t relay_ordinal, unsigned long long *scheduler,
     unsigned char *storage) {
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay,
+                          relay_ordinal, 0ULL, a.epoch);
   constexpr std::uint32_t kPhysicalWarps =
       forward_tuning::kComputeThreads / 32U;
   constexpr std::uint32_t kPublisherWarp = kPhysicalWarps - 1U;
@@ -167,6 +169,10 @@ __device__ __forceinline__ void local_relay_role(
               peer_rows * a.hidden * sizeof(transport::BFloat16));
   }
   __syncthreads();
+  MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay,
+                          relay_ordinal, route_count, a.epoch);
+  MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay,
+                          relay_ordinal, route_count, a.epoch);
   if (threadIdx.x == 0U) {
     const auto old =
         persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -222,4 +228,3 @@ __device__ __forceinline__ void local_relay_role(
 }
 
 #endif
-

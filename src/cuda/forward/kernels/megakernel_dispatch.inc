@@ -1222,7 +1222,11 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       forward_publish_progress(a, kForwardDispatchObserved,
                                a.dispatch.sizes.incoming_row_count);
     }
-    if (!stream_remote_dispatch && blockIdx.x == 0 && threadIdx.x == 0) {
+    // Streaming split roles publish their real Dispatch completion as soon as
+    // the final Relay CTA drains.  Do not overwrite that timestamp (or the
+    // independently observed FC1 start) after the same CTAs finish Return.
+    if (!stream_remote_dispatch && !stream_local_dispatch && blockIdx.x == 0 &&
+        threadIdx.x == 0) {
       status->dispatch_complete_clock = device_globaltimer_ns();
       status->fc1_start_clock = status->dispatch_complete_clock;
     }
