@@ -77,6 +77,10 @@ The current records are:
   the additive causal Forward breakdown across routing, fused DeepEP
   dispatch/combine, local reorder, FC1, SwiGLU/gate, and FC2 on both maintained
   topologies.
+- [`forward_megamoe_vs_flex_deepep_stage_profile_20260907.json`](forward_megamoe_vs_flex_deepep_stage_profile_20260907.json),
+  the corresponding overlapping MegaMOE Forward spans, normalized device
+  timeline windows, and direct comparison with the additive Flex + DeepEP
+  profile.
 
 Full build and rank logs remain ignored artifacts and are not
 source-controlled.
