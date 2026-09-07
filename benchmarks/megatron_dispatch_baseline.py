@@ -85,6 +85,74 @@ def measure(function, warmups, iterations):
     return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
 
 
+def measure_stage_pipeline(function, stage_names, warmups, iterations):
+    """Measure causal CUDA intervals without synchronizing between stages.
+
+    DeepEP publishes completion events from its communication stream and makes
+    the current stream wait on them. Events recorded at the API boundaries
+    therefore measure the real dependency path without serializing the
+    individual stages. For every iteration, all reported stages come from the
+    same rank that had the largest event-to-event total.
+    """
+    for _ in range(warmups):
+        dist.barrier()
+        function(None)
+        torch.cuda.synchronize()
+
+    stage_samples = {name: [] for name in stage_names}
+    cuda_samples = []
+    wall_samples = []
+    critical_rank_counts = [0] * dist.get_world_size()
+    for _ in range(iterations):
+        events = [torch.cuda.Event(enable_timing=True)
+                  for _ in range(len(stage_names) + 1)]
+        dist.barrier()
+        torch.cuda.synchronize()
+        wall_begin = time.perf_counter_ns()
+        function(events)
+        events[-1].synchronize()
+        wall_ms = (time.perf_counter_ns() - wall_begin) / 1.0e6
+        stage_ms = [events[index].elapsed_time(events[index + 1])
+                    for index in range(len(stage_names))]
+        cuda_ms = events[0].elapsed_time(events[-1])
+        local = torch.tensor(
+            [*stage_ms, cuda_ms, wall_ms],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        gathered = [
+            torch.empty_like(local) for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(gathered, local)
+        rows = [item.cpu().tolist() for item in gathered]
+        critical_rank = max(range(len(rows)),
+                            key=lambda rank: rows[rank][-2])
+        critical_rank_counts[critical_rank] += 1
+        critical = rows[critical_rank]
+        for index, name in enumerate(stage_names):
+            stage_samples[name].append(critical[index])
+        cuda_samples.append(critical[-2])
+        wall_samples.append(max(row[-1] for row in rows))
+
+    return {
+        "method": (
+            "causal CUDA-event intervals from the per-iteration rank with "
+            "the largest profiled total; no inter-stage synchronization"
+        ),
+        "stages": {name: stats(values)
+                   for name, values in stage_samples.items()},
+        "cuda_event": stats(cuda_samples),
+        "host_wall": stats(wall_samples),
+        "critical_rank_iteration_count": {
+            str(rank): count for rank, count in enumerate(critical_rank_counts)
+            if count
+        },
+        "mean_stage_sum_ms": sum(
+            statistics.fmean(values) for values in stage_samples.values()
+        ),
+    }
+
+
 def fixed_random_selected_gates(tokens, top_k, rank,
                                 seed=0x4D4547414D4F4547):
     values = []
@@ -349,6 +417,11 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--save-output-dir")
     parser.add_argument("--trace-dir")
+    parser.add_argument(
+        "--stage-profile",
+        action="store_true",
+        help="measure a causal full-Forward stage breakdown",
+    )
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
     parser.add_argument("--expert-body", choices=("identity", "te-grouped-mlp"),
@@ -356,6 +429,10 @@ def main():
     add_dispatcher_arguments(parser)
     args = parser.parse_args()
     validate_dispatcher_arguments(parser, args)
+    if args.stage_profile and args.expert_body != "te-grouped-mlp":
+        parser.error("--stage-profile requires --expert-body te-grouped-mlp")
+    if args.stage_profile and args.dispatcher != "flex":
+        parser.error("--stage-profile currently profiles Flex+DeepEP only")
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -530,6 +607,60 @@ def main():
         returned = dispatcher.token_combine(combine_input)
         return dispatcher.combine_postprocess(returned)
 
+    stage_names = (
+        "dispatch_preprocess",
+        "deepep_dispatch",
+        "dispatch_postprocess_local_permute",
+        "expert_metadata_host",
+        "fc1",
+        "swiglu_and_gate",
+        "fc2",
+        "combine_preprocess_local_unpermute",
+        "deepep_combine",
+        "combine_postprocess",
+    )
+
+    def staged_forward_roundtrip(events):
+        boundary = 0
+
+        def mark():
+            nonlocal boundary
+            if events is not None:
+                events[boundary].record()
+                boundary += 1
+
+        mark()
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            hidden, routing, probabilities)
+        mark()
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        mark()
+        expert_input, local_counts, remote_gate = (
+            dispatcher.dispatch_postprocess(remote_hidden, remote_probs))
+        mark()
+        tokens_per_expert = local_counts.tolist()
+        permuted_probs = remote_gate.unsqueeze(-1)
+        mark()
+        fc1_output, fc1_bias = experts_module.linear_fc1(
+            expert_input, tokens_per_expert)
+        mark()
+        activated = experts_module.bias_act_func(
+            fc1_output, fc1_bias, permuted_probs)
+        mark()
+        expert_output, fc2_bias = experts_module.linear_fc2(
+            activated, tokens_per_expert)
+        expert_output = experts_module._apply_bias(
+            expert_output, fc2_bias, tokens_per_expert, permuted_probs)
+        mark()
+        combine_input = dispatcher.combine_preprocess(expert_output)
+        mark()
+        returned = dispatcher.token_combine(combine_input)
+        mark()
+        output = dispatcher.combine_postprocess(returned)
+        mark()
+        return output
+
     def common_forward_roundtrip():
         local_hidden, local_probs = dispatcher.dispatch_preprocess(
             hidden, routing, probabilities)
@@ -616,6 +747,33 @@ def main():
                 run_result["common_forward_e2e"] = measure(
                     common_forward_roundtrip, args.warmups, args.iterations)
         measured_runs.append(run_result)
+
+    stage_profile = None
+    if args.stage_profile:
+        reference = full_forward_roundtrip()
+        staged = staged_forward_roundtrip(None)
+        torch.cuda.synchronize()
+        stage_exact = torch.tensor(
+            int(torch.equal(reference, staged)),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        stage_max_abs = (reference.float() - staged.float()).abs().max()
+        dist.all_reduce(stage_exact, op=dist.ReduceOp.MIN)
+        dist.all_reduce(stage_max_abs, op=dist.ReduceOp.MAX)
+        if not stage_exact.item():
+            raise RuntimeError(
+                "stage-profile path differs from TEGroupedMLP Forward: "
+                f"max_abs={stage_max_abs.item()}"
+            )
+        stage_profile = measure_stage_pipeline(
+            staged_forward_roundtrip,
+            stage_names,
+            args.warmups,
+            args.iterations,
+        )
+        stage_profile["output_byte_identical_to_module_forward"] = True
+        stage_profile["output_max_abs_error"] = stage_max_abs.item()
 
     native_output = full_roundtrip()
     common_output = (common_semantics_roundtrip()
@@ -796,6 +954,8 @@ def main():
             "variance_ms2": statistics.pvariance(forward_wall_means),
             "per_run_mean_ms": forward_wall_means,
         }
+    if stage_profile is not None:
+        output["stage_profile"] = stage_profile
     if experts_module is not None and args.dispatcher == "alltoall":
         common_forward_means = [
             run["common_forward_e2e"]["host_wall"]["mean_ms"]
@@ -808,6 +968,16 @@ def main():
     if rank == 0:
         print("MEGATRON_BASELINE_JSON " + json.dumps(output, sort_keys=True),
               flush=True)
+        if stage_profile is not None:
+            print("MEGATRON_STAGE_PROFILE_JSON " + json.dumps({
+                "world": world,
+                "deepep_num_sms": args.deepep_num_sms,
+                "shape": output["shape"],
+                "unprofiled_native_forward": measured_runs[0][
+                    "native_forward_e2e"
+                ],
+                "stage_profile": stage_profile,
+            }, sort_keys=True), flush=True)
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()
 

@@ -78,6 +78,8 @@ def benchmark_arguments(args):
         ])
     else:
         result.extend(["--expert-body", args.expert_body])
+        if getattr(args, "stage_profile", False):
+            result.append("--stage-profile")
     return result
 
 
@@ -119,12 +121,15 @@ def main():
     parser.add_argument("--workload", choices=("forward", "backward"),
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
+    parser.add_argument("--stage-profile", action="store_true")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
                         default="alltoall")
     parser.add_argument("--deepep-num-sms", type=int, default=20)
     args = parser.parse_args()
     if args.gpus_per_node <= 0:
         parser.error("--gpus-per-node must be positive")
+    if args.stage_profile and args.workload != "forward":
+        parser.error("--stage-profile currently profiles Forward only")
     if args.dispatcher == "flex":
         parser.error(
             "Flex+DeepEP uses its own NVSHMEM/IBGDA internode payload path; "

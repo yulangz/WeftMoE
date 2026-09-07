@@ -94,7 +94,7 @@ PROD_CUDA_LIB_OBJECTS := \
 	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
 	$(BUILD_DIR)/production/src/cuda/forward_transport.o
 
-.PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune backward-autotune-test backward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench megatron-backward-bench megatron-flex-bench megatron-flex-backward-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+.PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune backward-autotune-test backward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench megatron-backward-bench megatron-flex-bench megatron-flex-stage-profile megatron-flex-backward-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
 
 forward-autotune-test:
 	python3 tests/test_forward_autotune.py
@@ -351,7 +351,13 @@ megatron-backward-bench:
 megatron-flex-bench:
 	torchrun --standalone --nproc-per-node=8 \
 		benchmarks/megatron_dispatch_baseline.py --dispatcher flex \
-		--deepep-num-sms 64
+		--deepep-num-sms 64 --expert-body te-grouped-mlp
+
+megatron-flex-stage-profile:
+	torchrun --standalone --nproc-per-node=8 \
+		benchmarks/megatron_dispatch_baseline.py --dispatcher flex \
+		--deepep-num-sms 64 --expert-body te-grouped-mlp \
+		--stage-profile --runs 1
 
 megatron-flex-backward-bench:
 	torchrun --standalone --nproc-per-node=8 \
