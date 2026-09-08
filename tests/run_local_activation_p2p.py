@@ -273,7 +273,7 @@ def main():
     parser.add_argument("--backward-tokens", type=int)
     parser.add_argument("--backward-warmups", type=int)
     parser.add_argument("--backward-output-dir")
-    parser.add_argument("--top-k", type=int, choices=(1, 6), default=6)
+    parser.add_argument("--top-k", type=int, choices=(1, 6, 8), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
     parser.add_argument("--forward-output-dir")
@@ -562,8 +562,9 @@ def main():
                 "warmup": backward_warmups,
                 "measured": measured,
                 "shape": {"tokens_per_rank": args.backward_tokens or 8192,
-                          "hidden": 7168, "intermediate": 3072,
-                          "experts": 384, "top_k": args.top_k},
+                          "hidden": int(observed[0]["hidden"]),
+                          "intermediate": int(observed[0]["intermediate"]),
+                          "experts": int(observed[0]["experts"]), "top_k": args.top_k},
                 "per_rank_workspace_bytes": [
                     int(item["workspace_bytes"]) for item in observed],
                 "per_rank_gemm_launches": [
@@ -586,7 +587,7 @@ def main():
                               "return_reduce_overlap")
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=
-                            "sm90-wgmma-tma-7168x3072" or
+                            f"sm90-wgmma-tma-{item['hidden']}x{item['intermediate']}" or
                             item["persistent_launches"] != "1"):
                         raise AssertionError(
                             f"rank={rank} invalid forward audit: {item}")
@@ -620,9 +621,13 @@ def main():
                     "world": args.world,
                     "warmup": 10,
                     "measured": args.rounds - 10,
-                    "shape": {"tokens_per_rank": 8192, "hidden": 7168,
-                              "intermediate": 3072, "experts": 384,
-                              "top_k": 6},
+                    "shape": {
+                        "tokens_per_rank": int(observed[0]["tokens"]),
+                        "hidden": int(observed[0]["hidden"]),
+                        "intermediate": int(observed[0]["intermediate"]),
+                        "experts": int(observed[0]["experts"]),
+                        "top_k": int(observed[0]["top_k"]),
+                    },
                     "per_rank_device_pool_bytes": [
                         int(item["device_pool_bytes"]) for item in observed],
                     "per_rank_weight_bytes": [

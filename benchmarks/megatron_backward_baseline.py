@@ -46,7 +46,7 @@ def deterministic_gradient(shape, rank):
         shape.numel(), dtype=torch.int32, device="cuda"
     ).reshape(shape)
     return (
-        (torch.remainder(elements * 29 + rank * 17, 113) - 56).float()
+        (torch.remainder(torch.remainder(elements, 113) * 29 + rank * 17, 113) - 56).float()
         / 64.0
     ).to(torch.bfloat16)
 

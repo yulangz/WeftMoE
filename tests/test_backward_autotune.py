@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -19,11 +20,13 @@ import forward_jit  # noqa: E402
 class BackwardAutotuneTest(unittest.TestCase):
     def setUp(self):
         self.plan = tune.load_plan(
-            ROOT / "configs" / "backward_h200_autotune.json")
+            ROOT / "configs" / "backward_h200_multi_node_autotune.json",
+            model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
+            system={"remote": "root@example"})
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_multinode_plan_is_narrow_complete_and_unique(self):
-        self.assertEqual(len(self.candidates), 8)
+        self.assertEqual(len(self.candidates), 192)
         self.assertLessEqual(len(self.candidates),
                              self.plan["max_candidates"])
         self.assertEqual(self.plan["invariants"], tune.EXPECTED_INVARIANTS)
@@ -33,23 +36,52 @@ class BackwardAutotuneTest(unittest.TestCase):
 
     def test_world8_plan_reuses_split_architecture(self):
         plan = tune.load_plan(
-            ROOT / "configs" / "backward_h200_world8_autotune.json")
+            ROOT / "configs" / "backward_h200_single_node_autotune.json",
+            model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
         candidates = tune.expand_candidates(plan)
-        self.assertEqual(len(candidates), 7)
+        self.assertEqual(len(candidates), 288)
         self.assertEqual(plan["benchmark"]["launcher"], "local")
         self.assertEqual(candidates[0]["config"]["relay_ctas"], 12)
-        self.assertEqual(candidates[0]["config"]["rdma_ctas"], 8)
+        self.assertEqual(candidates[0]["config"]["rdma_ctas"], 0)
         self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 16)
         self.assertEqual(candidates[0]["config"]["dw2_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["dw1_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["ready_word_stagger"], 0)
         self.assertEqual(candidates[0]["config"]["activation_owner_group"], 4)
-        self.assertEqual(
-            next(candidate for candidate in candidates
-                 if candidate["name"] == "dispatch_rows12")["config"]
-            ["dispatch_batch_rows"],
-            12,
-        )
+        self.assertTrue(any(c["config"]["dispatch_batch_rows"] == 12 for c in candidates))
+
+    def test_dynamic_model_and_system_defaults(self):
+        path = ROOT / "configs/backward_h200_single_node_autotune.json"
+        model = dict(hidden=2560, intermediate=768, experts=512, top_k=8)
+        with self.assertRaises(tune.PlanError):
+            tune.load_plan(path)
+        plan = tune.load_plan(path, model=model, benchmark={"tokens_per_rank": 65536})
+        self.assertEqual(plan["fixed"]["1_gemm"]["main_hidden"], 2560)
+        self.assertEqual(plan["benchmark"]["experts"], 512)
+        self.assertTrue(plan["benchmark"]["disable_ib"])
+        self.assertNotIn("socket_ifname", plan["benchmark"])
+        with self.assertRaises(tune.PlanError):
+            tune.load_plan(path, model=model, system={"world": 16})
+        with mock.patch.object(tune, "_run", return_value={"returncode": 1, "output": ""}) as run:
+            tune.benchmark_candidate(tune.expand_candidates(plan)[0], Path("/tmp/binary"),
+                                     plan["benchmark"], Path("/tmp"), {}, rounds=30)
+        self.assertEqual(run.call_args.args[1]["MEGAMOE_BENCH_EXPERTS"], "512")
+
+    def test_grid_rejects_model_fields_duplicates_and_missing_parameters(self):
+        source = json.loads((ROOT / "configs/backward_h200_single_node_autotune.json").read_text())
+        invalid = []
+        model_axis = copy.deepcopy(source)
+        model_axis["1_gemm"]["main_hidden"] = [2560, 7168]
+        invalid.append(model_axis)
+        duplicate = copy.deepcopy(source)
+        duplicate["2_transport"]["relay_ctas"] = [12, 12]
+        invalid.append(duplicate)
+        missing = copy.deepcopy(source)
+        del missing["3_scheduler"]["dw1_claim_tiles"]
+        invalid.append(missing)
+        for space in invalid:
+            with self.subTest(space=space), self.assertRaises(tune.PlanError):
+                tune.make_runtime_plan(space, model=dict(hidden=2560, intermediate=768, experts=512, top_k=8))
 
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "backward" /

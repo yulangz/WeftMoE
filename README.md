@@ -96,20 +96,24 @@ The complete command matrix and runtime-library notes are in
 Tuning values are explicit JSON and become compile-time constants in a
 generated header. Python performs content-addressed runtime compilation and
 autotuning directly; candidate compilation does not call Make. The default
-two-node and single-node searches are deliberately small:
+files contain only hyperparameter arrays; provide the model explicitly. These commands generate candidates without running GPU benchmarks:
 
 ```bash
 python3 tools/autotune_forward.py \
-  --config configs/forward_h200_autotune.json
+  --config configs/forward_h200_multi_node_autotune.json \
+  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
 
 python3 tools/autotune_forward.py \
-  --config configs/forward_h200_world8_autotune.json
+  --config configs/forward_h200_single_node_autotune.json \
+  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
 
 python3 tools/autotune_backward.py \
-  --config configs/backward_h200_autotune.json
+  --config configs/backward_h200_multi_node_autotune.json \
+  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
 
 python3 tools/autotune_backward.py \
-  --config configs/backward_h200_world8_autotune.json
+  --config configs/backward_h200_single_node_autotune.json \
+  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
 ```
 
 JIT binaries live under the ignored `artifacts/{forward,backward}-jit/cache`

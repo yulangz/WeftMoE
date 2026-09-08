@@ -1,0 +1,107 @@
+{
+  "1_gemm": {
+    "tile_m": [
+      128
+    ],
+    "dab_tile_n": [
+      256,
+      128
+    ],
+    "dx_tile_n": [
+      256,
+      128
+    ],
+    "dw_tile_m": [
+      128
+    ],
+    "dw_tile_n": [
+      256
+    ],
+    "tile_k": [
+      64
+    ],
+    "dab_stages": [
+      4
+    ],
+    "dx_stages": [
+      4
+    ],
+    "dw1_stages": [
+      3
+    ],
+    "dw2_stages": [
+      3
+    ],
+    "compute_threads": [
+      384
+    ],
+    "math_warpgroups": [
+      2
+    ],
+    "producer_warpgroups": [
+      1
+    ],
+    "math_registers": [
+      224
+    ],
+    "producer_registers": [
+      48
+    ]
+  },
+  "2_transport": {
+    "rdma_ctas": [
+      0
+    ],
+    "relay_ctas": [
+      12,
+      8,
+      16,
+      24
+    ],
+    "dispatch_batch_rows": [
+      16,
+      12,
+      32
+    ],
+    "gin_max_inflight": [
+      24
+    ],
+    "setup_threads": [
+      256
+    ],
+    "setup_idle_nanosleep": [
+      128
+    ]
+  },
+  "3_scheduler": {
+    "queue_idle_nanosleep": [
+      64
+    ],
+    "ready_word_stagger": [
+      0
+    ],
+    "activation_owner_group": [
+      4,
+      2,
+      8
+    ],
+    "epilogue_rows_per_task": [
+      12
+    ],
+    "dw2_claim_tiles": [
+      4
+    ],
+    "dw1_claim_tiles": [
+      4
+    ]
+  },
+  "4_completion_reduce": {
+    "reduce_threads": [
+      256,
+      128
+    ],
+    "reduce_idle_nanosleep": [
+      256
+    ]
+  }
+}

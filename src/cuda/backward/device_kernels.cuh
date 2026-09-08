@@ -219,6 +219,9 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
 
 __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   constexpr std::uint32_t kTrainingTopK = 6U;
+  // One lane publishes each route pointer. The dynamic top-k path must not
+  // index the six-entry storage used by the unrolled training fast path.
+  constexpr std::uint32_t kMaxTopK = 32U;
   constexpr std::uint32_t kWarpsPerCta =
       backward_tuning::kReduceThreads / 32U;
   const auto warp = threadIdx.x / 32U;
@@ -228,7 +231,7 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   if (token >= a.dispatch.identity.num_tokens)
     return;
   __shared__ const transport::BFloat16
-      *source_rows[kWarpsPerCta][kTrainingTopK];
+      *source_rows[kWarpsPerCta][kMaxTopK];
   const auto *contribution = peer_at<const transport::BFloat16>(
       a.local_base, a.contribution_offset);
 #if __has_include(<nccl_device.h>)

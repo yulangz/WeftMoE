@@ -822,7 +822,8 @@ def main():
     if args.save_output_dir:
         os.makedirs(args.save_output_dir, mode=0o700, exist_ok=True)
         torch.save({"native": native_output.cpu(),
-                    "common": common_output.cpu(),
+                    "common": (common_output.cpu()
+                               if common_output is not None else None),
                     "native_forward": (native_forward_output.cpu()
                                        if native_forward_output is not None
                                        else None),

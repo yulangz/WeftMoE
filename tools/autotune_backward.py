@@ -8,6 +8,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import itertools
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from autotune_common import (
+    resolve_runtime_settings,
     PlanError,
     candidate_digest,
     choose_confirmed_candidate,
@@ -36,7 +38,7 @@ from forward_jit import BackwardJitCompiler, JitError, validate_jit_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "backward_h200_autotune.json"
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "backward_h200_multi_node_autotune.json"
 GROUP_NAMES = (
     "1_gemm",
     "2_transport",
@@ -123,10 +125,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         require(type(value) is int, f"{key} must be an integer")
         require(value >= 0, f"{key} must be non-negative")
 
-    require(config["main_hidden"] == 7168,
-            "this Backward specialization requires main_hidden=7168")
-    require(config["main_intermediate"] == 3072,
-            "this Backward specialization requires main_intermediate=3072")
+    require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
+             "main_hidden must be a positive multiple of 256")
+    require(config["main_intermediate"] > 0 and config["main_intermediate"] % 256 == 0,
+             "main_intermediate must be a positive multiple of 256")
     require(config["tile_m"] == 128,
             "the activation dependency block is fixed at M128")
     require_choice(config, "dab_tile_n", (128, 256))
@@ -163,8 +165,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require(registers <= 65536,
             f"compute register allocation {registers} exceeds 65536")
 
-    require(config["rdma_ctas"] == 8,
-            "the physical GIN context contract requires eight RDMA CTAs")
+    require(config["rdma_ctas"] in (0, 8),
+            "RDMA CTAs must be zero for local or eight for GIN")
     require_choice(config, "relay_ctas", (8, 12, 16, 20, 24))
     require_choice(config, "dispatch_batch_rows", (12, 16, 32, 64, 128))
     require_choice(config, "gin_max_inflight", (8, 16, 24, 32, 64))
@@ -184,12 +186,58 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         require_choice(config, key, (0, 16, 32, 64, 128, 256, 512))
 
 
-def load_plan(path: Path) -> dict[str, Any]:
+def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | None,
+                      benchmark: Mapping[str, Any] | None = None,
+                      system: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    flat = flatten_groups(space, require_all=False)
+    require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
+            "hyperparameters must cover every tuning parameter and exclude model dimensions")
+    topology, jit_overrides = resolve_runtime_settings(
+        model=model, rdma=flat.get("rdma_ctas"), system=system, repo_root=REPO_ROOT)
+    count = 1
+    for key, values in flat.items():
+        require(isinstance(values, list) and values, f"{key} must be a non-empty array")
+        require(len({json.dumps(v, sort_keys=True) for v in values}) == len(values),
+                f"{key} has duplicate values")
+        count *= len(values)
+    require(count <= 4096, "Cartesian candidate count exceeds 4096")
+    fixed = {g: {k: vs[0] for k, vs in space.get(g, {}).items()} for g in GROUP_NAMES}
+    fixed["1_gemm"].update(main_hidden=model["hidden"], main_intermediate=model["intermediate"])
+    axes = [(g, k, vs) for g in GROUP_NAMES for k, vs in space.get(g, {}).items() if len(vs) > 1]
+    candidates = []
+    for index, values in enumerate(itertools.product(*(axis[2] for axis in axes))):
+        override = {}
+        for (g, k, _), value in zip(axes, values):
+            if value != fixed[g][k]:
+                override.setdefault(g, {})[k] = value
+        candidates.append(dict(name="incumbent" if index == 0 else f"grid_{index:04d}", override=override))
+    workload = dict(benchmark or {})
+    require(not (set(workload) - {"tokens_per_rank", "seed", "tune_rounds", "final_rounds",
+        "timeout_seconds", "result_dir", "preflight_world", "preflight_tokens"}),
+        "benchmark contains model/system fields or unknown settings")
+    return dict(schema=1, max_candidates=4096, fixed=fixed, candidates=candidates,
+        invariants=copy.deepcopy(EXPECTED_INVARIANTS),
+        jit=dict(cache_root="artifacts/backward-jit", jobs=8, architecture="sm_90a",
+                 timeout_seconds=1800) | jit_overrides,
+        selection=dict(confirmation_candidates=min(2, count), confirmation_repeats=2,
+                       confirmation_rounds=60, minimum_improvement_percent=0.5),
+        benchmark=dict(seed=0x4D554C54, tokens_per_rank=8192, top_k=model["top_k"],
+            experts=model["experts"], tune_rounds=30, final_rounds=110, timeout_seconds=600,
+            preflight_world=8, preflight_tokens=8,
+            selection_metric="total_slowest_rank_us.mean", result_dir="artifacts/backward-autotune")
+            | topology | workload)
+
+
+def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
+              benchmark: Mapping[str, Any] | None = None,
+              system: Mapping[str, Any] | None = None) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     require(isinstance(document, dict), "top-level plan must be an object")
+    if "schema" not in document:
+        document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     require(document.get("schema") == 1, "Backward plan schema must be 1")
     required_sections = {
         "jit", "benchmark", "selection", "invariants", "fixed", "candidates"
@@ -217,7 +265,7 @@ def load_plan(path: Path) -> dict[str, Any]:
     for key in common_keys:
         require(key in benchmark, f"benchmark omits {key}")
     if launcher == "multinode":
-        for key in ("remote", "port", "gpus_per_node"):
+        for key in ("port", "gpus_per_node"):
             require(key in benchmark, f"benchmark omits {key}")
     else:
         require("world" in benchmark, "local benchmark omits world")
@@ -228,8 +276,8 @@ def load_plan(path: Path) -> dict[str, Any]:
     ):
         require(type(benchmark[key]) is int and benchmark[key] > 0,
                 f"benchmark.{key} must be a positive integer")
-    require(benchmark["top_k"] in (1, 6),
-            "benchmark.top_k must be 1 or 6")
+    require(benchmark["top_k"] in (1, 6, 8),
+            "benchmark.top_k must be 1, 6, or 8")
     require(benchmark["tune_rounds"] > 10 and
             benchmark["final_rounds"] > 10,
             "Backward benchmark rounds must be >10")
@@ -241,8 +289,8 @@ def load_plan(path: Path) -> dict[str, Any]:
     require(isinstance(document["candidates"], list) and
             document["candidates"], "candidates must be a non-empty array")
     maximum = document.get("max_candidates", 8)
-    require(type(maximum) is int and 1 <= maximum <= 12,
-            "max_candidates must be in [1, 12]")
+    require(type(maximum) is int and 1 <= maximum <= 4096,
+            "max_candidates must be in [1, 4096]")
     require(len(document["candidates"]) <= maximum,
             f"candidate count exceeds max_candidates={maximum}")
     validate_selection(document["selection"], len(document["candidates"]))
@@ -445,8 +493,9 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any], *,
         "--scenario", "gin_backward_bench",
         "--timeout", str(int(benchmark["timeout_seconds"])),
     ]
-    if benchmark.get("nccl_lib_dir"):
-        command += ["--nccl-lib-dir", str(benchmark["nccl_lib_dir"])]
+    library_path = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
+    if library_path:
+        command += ["--nccl-lib-dir", str(library_path)]
     if benchmark.get("socket_ifname"):
         command += ["--socket-ifname", str(benchmark["socket_ifname"])]
     command.append("--enable-ib" if benchmark.get("enable_ib", False)
@@ -484,13 +533,15 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                         environment: Mapping[str, str], *, rounds: int,
                         suffix: str = "tune") -> dict[str, Any]:
     run_environment = dict(environment)
+    if "experts" in benchmark:
+        run_environment["MEGAMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
     run_environment["MEGAMOE_BACKWARD_ROUNDS"] = str(rounds)
     run_environment["MEGAMOE_BACKWARD_WARMUPS"] = "10"
     run_environment["MEGAMOE_P2P_BENCH_TOKENS"] = str(
         int(benchmark["tokens_per_rank"]))
     run_environment["MEGAMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
     if benchmark.get("launcher", "multinode") == "local":
-        nccl_lib_dir = benchmark.get("nccl_lib_dir")
+        nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
         if nccl_lib_dir:
             prior = run_environment.get("LD_LIBRARY_PATH", "")
             run_environment["LD_LIBRARY_PATH"] = (
@@ -541,7 +592,7 @@ def preflight_candidate(candidate: Mapping[str, Any], binary: Path,
         "--top-k", str(int(benchmark["top_k"])),
     ]
     run_environment = dict(environment)
-    nccl_lib_dir = benchmark.get("nccl_lib_dir")
+    nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
     if nccl_lib_dir:
         prior = run_environment.get("LD_LIBRARY_PATH", "")
         run_environment["LD_LIBRARY_PATH"] = (
@@ -604,11 +655,16 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
         plan["selection"]["confirmation_rounds"] = args.confirmation_rounds
     if args.confirmation_repeats is not None:
         plan["selection"]["confirmation_repeats"] = args.confirmation_repeats
+    if args.minimum_improvement_percent is not None:
+        plan["selection"]["minimum_improvement_percent"] = args.minimum_improvement_percent
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--system-config", type=Path)
+    for key in ("hidden", "intermediate", "experts", "top-k", "tokens"):
+        parser.add_argument("--" + key, type=int)
     parser.add_argument("--candidate", action="append", default=[])
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--build-only", action="store_true")
@@ -623,6 +679,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--final-rounds", type=int)
     parser.add_argument("--confirmation-rounds", type=int)
     parser.add_argument("--confirmation-repeats", type=int)
+    parser.add_argument("--minimum-improvement-percent", type=float)
     return parser.parse_args(argv)
 
 
@@ -633,7 +690,21 @@ def main(argv: list[str] | None = None) -> int:
     require(not args.build_only or args.candidate,
             "--build-only requires at least one explicit --candidate")
     config_path = args.config.resolve()
-    plan = load_plan(config_path)
+    model = {key: getattr(args, key) for key in ("hidden", "intermediate", "experts", "top_k")}
+    system = {}
+    if args.system_config:
+        try:
+            system = json.loads(args.system_config.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise PlanError(f"cannot read system config: {error}") from error
+        require(isinstance(system, dict), "system config must be an object")
+    for key in ("remote", "port", "nccl_lib_dir"):
+        if getattr(args, key) is not None:
+            system[key] = getattr(args, key)
+    plan = load_plan(config_path, model=model, system=system,
+                     benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None)
+    if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher") == "multinode":
+        require(bool(plan["benchmark"].get("remote")), "multinode benchmark requires --remote or system.remote")
     _configure_from_cli(plan, args)
     validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)

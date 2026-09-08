@@ -159,7 +159,8 @@ inline constexpr std::uint32_t kDw1TilesPerExpert =
     ((2U * kMainIntermediate) / kDwTileM) *
     (kMainHidden / kDwTileN);
 
-static_assert(kMainHidden == 7168U && kMainIntermediate == 3072U);
+static_assert(kMainHidden > 0U && kMainHidden % 256U == 0U);
+static_assert(kMainIntermediate > 0U && kMainIntermediate % 256U == 0U);
 static_assert(kTileM == 128U);
 static_assert(kDabTileN == 128U || kDabTileN == 256U);
 static_assert(kDxTileN == 128U || kDxTileN == 256U);
@@ -180,7 +181,7 @@ static_assert((kMathWarpgroups * kMathRegisters +
                kProducerWarpgroups * kProducerRegisters) *
                   128U <=
               65536U);
-static_assert(kRdmaCtas == 8U);
+static_assert(kRdmaCtas == 0U || kRdmaCtas == 8U);
 static_assert(kRelayCtas >= 8U && kRelayCtas % 4U == 0U);
 static_assert(kReadyWordStagger <= 1U);
 static_assert(kActivationOwnerGroup >= 1U &&

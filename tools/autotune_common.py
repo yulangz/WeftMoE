@@ -7,6 +7,7 @@ import concurrent.futures
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -225,3 +226,46 @@ def timing_summary(result: Mapping[str, Any], elapsed: float) -> dict[str, float
             "final", {}).get("elapsed_seconds", 0.0)),
         "total_seconds": elapsed,
     }
+
+
+def resolve_runtime_settings(*, model: Mapping[str, Any] | None, rdma: Any,
+                             system: Mapping[str, Any] | None, repo_root: Path):
+    """Resolve caller-owned model/topology and optional runtime libraries."""
+    require(isinstance(model, Mapping) and
+             set(model) == {"hidden", "intermediate", "experts", "top_k"},
+             "model must supply hidden, intermediate, experts and top_k")
+    require(all(type(v) is int and v > 0 for v in model.values()),
+             "model values must be positive integers")
+    require(rdma in ([0], [8]), "rdma_ctas must be fixed to [0] or [8]")
+    local = rdma == [0]
+    settings = dict(system or {})
+    allowed = {"remote", "port", "gpus_per_node", "world", "nccl_lib_dir",
+               "runtime_library_path", "socket_ifname", "disable_ib", "enable_ib", "jit"}
+    require(not (set(settings) - allowed), "unknown system settings")
+    jit_overrides = settings.pop("jit", {})
+    require(isinstance(jit_overrides, dict), "system.jit must be an object")
+    topology = {"launcher": "local", "world": 8, "disable_ib": True} if local else {
+        "launcher": "multinode", "gpus_per_node": 8, "port": 2222, "enable_ib": True}
+    topology.update(settings)
+    require((local and topology.get("world") == 8 and
+              "enable_ib" not in settings and "remote" not in settings and
+              "gpus_per_node" not in settings) or
+             (not local and topology.get("gpus_per_node") == 8 and
+              "disable_ib" not in settings and "world" not in settings),
+             "system topology conflicts with EP8/EP16 hyperparameters")
+    world = 8 if local else 16
+    require(model["experts"] % world == 0 and model["top_k"] <= model["experts"],
+             "experts must divide evenly across ranks and be >= top_k")
+    private_nccl = repo_root / "artifacts/gin_port_fix/build/lib"
+    if "nccl_lib_dir" not in topology and (private_nccl / "libnccl.so").exists():
+        topology["nccl_lib_dir"] = str(private_nccl)
+    if "runtime_library_path" not in topology:
+        paths = [Path("/usr/local/cuda/compat")]
+        if topology.get("nccl_lib_dir"):
+            paths.append(Path(topology["nccl_lib_dir"]))
+        paths.append(Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" /
+                     "site-packages/nvidia/cuda_runtime/lib")
+        libraries = [str(p) for p in paths if p.is_dir()]
+        if libraries:
+            topology["runtime_library_path"] = ":".join(libraries)
+    return topology, jit_overrides

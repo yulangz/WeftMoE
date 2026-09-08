@@ -77,6 +77,7 @@ HOST_SOURCES = (
 CUDA_SOURCES = (
     "src/cuda/device_notify.cu",
     "src/cuda/activation_transport.cu",
+    "src/cuda/forward_transport.cu",
     "src/cuda/persistent_v3/kernel_entry.cu",
     "src/transport/nccl_count_exchange.cu",
 )
@@ -642,19 +643,10 @@ class SpecializedJitCompiler:
             commands.append([
                 str(self.nvcc), *self.cuda_library_flags,
                 *specialization_flags,
+                *(["-diag-suppress=177"]
+                  if source == "src/cuda/forward_transport.cu" else []),
                 "-c", source, "-o", str(output),
             ])
-        transport_object = objects / _object_name(
-            "src/cuda/activation_transport.cu", "transport"
-        )
-        object_paths.append(transport_object)
-        commands.append([
-            str(self.nvcc), *self.cuda_library_flags,
-            *specialization_flags,
-            "-DMEGAMOE_FORWARD_TRANSPORT_TU=1", "-diag-suppress=177",
-            "-c", "src/cuda/activation_transport.cu",
-            "-o", str(transport_object),
-        ])
         test_object = objects / _object_name(TEST_SOURCE)
         commands.append([
             str(self.nvcc), *self.cuda_flags, *specialization_flags,

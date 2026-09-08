@@ -14,7 +14,9 @@ inline constexpr std::uint32_t kTimelineSchemaVersion = 7;
 // suffix makes the apparent FC2/Return tail shorter than the real one, so the
 // profiling build deliberately spends a few extra MiB per GPU for a complete
 // trace.  This allocation is compiled out of production builds.
-inline constexpr std::uint32_t kEventsPerCta = 1024;
+// The top-1 / 49152-token diagnostic records many reduce-ready tokens;
+// 1024 entries truncated some CTA tails in that workload.
+inline constexpr std::uint32_t kEventsPerCta = 4096;
 
 enum class TimelinePhase : std::uint16_t { Forward = 1 };
 

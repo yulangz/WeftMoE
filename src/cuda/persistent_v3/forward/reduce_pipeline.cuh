@@ -99,6 +99,12 @@ __device__ __forceinline__ void reduce_one_token(
     output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
   }
   __syncwarp();
+  if (a.forward_dynamic_reduce_queue && lane == 0U) {
+    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+        a.local_base, a.forward_v3_control_offset);
+    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+        control->reduce_tokens_complete.value, 1ULL);
+  }
 #if MEGAMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin && lane == 0U)
@@ -172,9 +178,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           const auto token_count = static_cast<unsigned long long>(
               a.dispatch.identity.num_tokens);
           if (candidate >= token_count) {
-            // Every queue entry has an owner. Each CTA finishes its claimed
-            // batch before returning, and Transport finalization waits for all
-            // reduce roles, so no per-token completion atomic is required.
+            // Every queue entry has an owner, including opportunistic
+            // transport consumers. Finalization separately waits for the
+            // completed-token counter before publishing terminal status.
             queue_done = 1U;
           } else {
             ::cuda::atomic_ref<unsigned long long,

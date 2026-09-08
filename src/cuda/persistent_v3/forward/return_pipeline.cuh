@@ -1,9 +1,9 @@
 #pragma once
 
 // FULL Return keeps GIN ownership in the fixed RDMA CTAs and lands payloads
-// directly in the registered compact receive plane.  The fixed receive-side
-// completion CTAs publish only route metadata and token readiness; they never
-// copy Return payloads.
+// directly in the registered compact receive plane. All Relay CTAs share
+// local-copy batches and receive-completion chunks. Receive completion only
+// publishes token readiness; it never copies the registered Return payload.
 
 #if __has_include(<nccl_device.h>)
 
@@ -18,14 +18,6 @@ __device__ __forceinline__ bool cancelled(
   return forward_cancelled(a) ||
          persistent_v3::load_acquire<::cuda::thread_scope_device>(
              control.generation.control.error_code.value) != 0ULL;
-}
-
-__device__ __forceinline__ unsigned long long context_task_count(
-    unsigned long long tasks, std::uint32_t context) {
-  return tasks > context
-             ? 1ULL + (tasks - 1ULL - context) /
-                          persistent_v3::kRdmaCtaCount
-             : 0ULL;
 }
 
 __device__ __forceinline__ unsigned long long source_compact_rows(
@@ -133,18 +125,21 @@ __device__ __noinline__ void issue_direct_full_mblock(
 #endif
 }
 
+// Separate work planes share immutable FC2 descriptors and explicit completion
+// counters. None of the local-copy/completion workers owns a GIN context.
 // FULL Return already lands in this rank's registered compact receive plane.
 // Once a chunk's ordered fragment markers are complete, publish only its
 // route-to-compact metadata and readiness.  Reduce then reads that registered
 // payload in place, eliminating the former 352 MiB receive->contribution copy
 // while preserving large contiguous network puts.
-__device__ __forceinline__ void publish_direct_full_source_chunk(
-    const ForwardKernelArgs &a, std::uint64_t row_begin,
-    std::uint32_t row_count) {
+__device__ __forceinline__ void
+publish_direct_full_source_chunk(const ForwardKernelArgs &a,
+                                 std::uint64_t row_begin,
+                                 std::uint32_t row_count) {
   const auto *source_route_index = peer_at<const unsigned long long>(
       a.local_base, a.forward_return_source_route_index_offset);
-  auto *route_ready = peer_at<unsigned long long>(
-      a.local_base, a.return_ready_epoch_offset);
+  auto *route_ready =
+      peer_at<unsigned long long>(a.local_base, a.return_ready_epoch_offset);
 
   // The marker is the completion action of the payload put.  Bring async-proxy
   // writes into the generic proxy before publishing a CUDA-visible ready word.
@@ -170,7 +165,6 @@ __device__ __forceinline__ void publish_direct_full_source_chunk(
 struct DirectFullCompletionState {
   unsigned long long compact_rows = 0ULL;
   unsigned long long chunk_count = 0ULL;
-  unsigned long long scan_cursor = 0ULL;
   unsigned long long completed = 0ULL;
   unsigned long long expected = 0ULL;
   unsigned long long selected_chunk = 0ULL;
@@ -182,35 +176,36 @@ struct DirectFullCompletionState {
   unsigned long long marker_ready[persistent_v3::kWarpsPerCta]{};
 };
 
-__device__ __forceinline__ bool direct_full_completion_terminal(
-    const DirectFullCompletionState &state) {
+__device__ __forceinline__ bool
+direct_full_completion_terminal(const DirectFullCompletionState &state) {
   return state.initialized != 0U && state.completed == state.expected;
 }
 
 // Inspect at most one receive chunk and never wait on it.  The scan cursor
 // advances even on a miss, so a late fragment cannot head-of-line block later
-// chunks owned by the same Relay CTA.  `forward_return_chunk_state` is tagged
-// with the generation epoch and therefore needs no bulk clear between calls.
+// chunks. The epoch-tagged chunk word records ownership; a separate completed
+// counter advances only after publication, so a claimed chunk is not confused
+// with a completed one. Neither a fixed helper nor a blocking wait is required.
 __device__ __forceinline__ bool progress_direct_full_completion_once(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, std::uint32_t context,
-    unsigned long long *scheduler, DirectFullCompletionState &state) {
+    const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+    std::uint32_t context, unsigned long long *scheduler,
+    DirectFullCompletionState &state) {
   if (threadIdx.x == 0U) {
     state.progressed = 0U;
     state.selected = 0U;
     state.chunk_ready = 0U;
     if (state.initialized == 0U &&
         persistent_v3::load_acquire<::cuda::thread_scope_device>(
-            control.dispatch[context].outbound_directory_ready.value) >=
-            a.epoch) {
-      state.compact_rows = source_compact_rows(a, scheduler, context);
+            control.dispatch[0].outbound_directory_ready.value) >= a.epoch) {
+      state.compact_rows = source_compact_rows(a, scheduler);
       state.chunk_count =
           (state.compact_rows + a.forward_return_chunk_rows - 1ULL) /
           a.forward_return_chunk_rows;
-      state.scan_cursor = context;
-      state.expected = context_task_count(state.chunk_count, context);
+      state.expected = state.chunk_count;
       state.initialized = 1U;
     }
+    state.completed = persistent_v3::load_acquire<::cuda::thread_scope_device>(
+        control.return_chunks_complete.value);
   }
   __syncthreads();
   if (state.initialized == 0U || state.completed == state.expected ||
@@ -220,27 +215,22 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   auto *chunk_state = peer_at<unsigned long long>(
       a.local_base, a.forward_return_chunk_state_offset);
   if (threadIdx.x == 0U) {
-    // Walk only this context's stripe.  Finished chunks are normally skipped
-    // in one or two loads; the bounded loop is reached only near the tail.
-    for (unsigned long long attempt = 0ULL; attempt < state.expected;
-         ++attempt) {
-      const auto chunk = state.scan_cursor;
-      state.scan_cursor += a.gin_context_count;
-      if (state.scan_cursor >= state.chunk_count)
-        state.scan_cursor = context;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
-          chunk_state[chunk]);
-      if (done.load(::cuda::memory_order_acquire) == a.epoch)
-        continue;
+    // One bounded probe. Atomic scan distribution avoids a fixed scanner per
+    // rail; a slow/missing chunk is revisited without blocking later chunks.
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> scan(
+        control.return_chunk_scan.value);
+    const auto chunk =
+        scan.fetch_add(1ULL, ::cuda::memory_order_relaxed) % state.chunk_count;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
+        chunk_state[chunk]);
+    if (claimed.load(::cuda::memory_order_acquire) != a.epoch) {
       state.selected_chunk = chunk;
-      const auto row_begin = chunk * a.forward_return_chunk_rows;
-      const auto remaining = state.compact_rows - row_begin;
+      const auto remaining =
+          state.compact_rows - chunk * a.forward_return_chunk_rows;
       state.selected_rows = static_cast<std::uint32_t>(
-          remaining < a.forward_return_chunk_rows
-              ? remaining
-              : a.forward_return_chunk_rows);
+          min(remaining,
+              static_cast<unsigned long long>(a.forward_return_chunk_rows)));
       state.selected = 1U;
-      break;
     }
   }
   __syncthreads();
@@ -260,8 +250,8 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
     // parallel marker pass are enough for this opportunistic probe.
     asm volatile("fence.proxy.async.global;" : : : "memory");
     unsigned long long ready_rows = 0ULL;
-    for (std::uint32_t row = warp * 32U + lane;
-         row < state.selected_rows; row += kMarkerWarps * 32U)
+    for (std::uint32_t row = warp * 32U + lane; row < state.selected_rows;
+         row += kMarkerWarps * 32U)
       ready_rows += fragment_ready[row_begin + row];
     for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U)
       ready_rows += __shfl_down_sync(kWarpMask, ready_rows, offset);
@@ -280,6 +270,21 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   if (state.chunk_ready == 0U)
     return false;
 
+  // Mark ownership only after observing every payload marker. Multiple CTAs
+  // may probe the same chunk, but exactly one publishes its route readiness.
+  if (threadIdx.x == 0U) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
+        chunk_state[state.selected_chunk]);
+    auto old = claimed.load(::cuda::memory_order_relaxed);
+    state.selected =
+        old != a.epoch && claimed.compare_exchange_strong(
+                              old, a.epoch, ::cuda::memory_order_acq_rel,
+                              ::cuda::memory_order_relaxed);
+  }
+  __syncthreads();
+  if (state.selected == 0U)
+    return false;
+
   MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
                           context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
@@ -291,50 +296,60 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
                           context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
-        chunk_state[state.selected_chunk]);
-    done.store(a.epoch, ::cuda::memory_order_release);
-    ++state.completed;
+    state.completed =
+        persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+            control.return_chunks_complete.value, 1ULL) +
+        1ULL;
     state.progressed = 1U;
   }
   __syncthreads();
   return state.progressed != 0U;
 }
-
 inline constexpr std::uint32_t kMaxDirectLocalReturnBatch = 8U;
 
 struct DirectLocalReturnState {
   unsigned long long cursor = 0ULL;
-  unsigned long long stride = 1ULL;
+  unsigned int preferred_stripe = 0U;
+  std::uint32_t context = 0U;
   std::uint32_t selected = 0U;
   std::uint32_t active = 0U;
   std::uint32_t copied_rows = 0U;
   ForwardDirectReturnFragment batch[kMaxDirectLocalReturnBatch]{};
 };
 
-__device__ __forceinline__ bool direct_local_return_terminal(
-    const ForwardKernelArgs &a, unsigned long long *scheduler,
-    const DirectLocalReturnState &state) {
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      direct_fragment_tail(a, scheduler));
+__device__ __forceinline__ bool
+direct_local_return_terminal(const ForwardKernelArgs &a,
+                             unsigned long long *scheduler,
+                             const DirectLocalReturnState &) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> produced(
       direct_mblocks_complete(a, scheduler));
-  return produced.load(::cuda::memory_order_acquire) >= scheduler[3] &&
-         state.cursor >= tail.load(::cuda::memory_order_acquire);
+  if (produced.load(::cuda::memory_order_acquire) < scheduler[3])
+    return false;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
+      direct_fragment_tail(a, scheduler));
+  const auto end = tail.load(::cuda::memory_order_acquire);
+  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+      a.local_base, a.forward_v3_control_offset);
+  const auto stripes = (a.forward_relay_cta_count + a.local_world_size - 1U) /
+      a.local_world_size;
+  for (unsigned int context = 0U; context < a.local_world_size; ++context)
+    for (unsigned int stripe = 0U; stripe < stripes; ++stripe) {
+      const auto count = persistent_v3::load_acquire<::cuda::thread_scope_device>(
+          control->local_return_head[context * stripes + stripe].value);
+      if (stripe + count * stripes < end)
+        return false;
+    }
+  return true;
 }
 
-// Consume one stripe of immutable FC2 M-block descriptors for this node-local
-// source rank. Only descriptors already published at entry are batched, so an
-// incomplete tail never delays an earlier M-block. Hopper bulk async stages
-// each contiguous row through shared memory; the warp-vector implementation
-// remains as an exact A/B fallback. Multiple Relay CTAs paired with one context
-// use disjoint cursor/stride pairs and therefore need no shared work queue or
-// claim atomic.
+// Shared destination/stripe cursors retain interleaved descriptor batches
+// without binding a CTA to a stripe. Prefer the home stripe and destination,
+// then steal another ready batch. Never claim unpublished descriptors.
 __device__ __forceinline__ bool progress_direct_local_return_once(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, std::uint32_t context,
-    unsigned long long *scheduler, DirectLocalReturnState &state,
-    std::byte *tma_storage, DirectLocalReturnBarrier *tma_full) {
+    const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+    std::uint32_t preferred_context, unsigned long long *scheduler,
+    DirectLocalReturnState &state, std::byte *tma_storage,
+    DirectLocalReturnBarrier *tma_full) {
   auto *fragments = peer_at<ForwardDirectReturnFragment>(
       a.local_base, a.forward_direct_return_fragment_offset);
   if (threadIdx.x == 0U) {
@@ -344,31 +359,48 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
         direct_fragment_tail(a, scheduler));
     const auto published_tail = tail.load(::cuda::memory_order_acquire);
-    for (std::uint32_t item = 0U;
-         item < a.forward_local_return_batch_mblocks; ++item) {
-      const auto slot = state.cursor +
-                        static_cast<unsigned long long>(item) * state.stride;
-      if (slot >= published_tail)
-        break;
-      ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
-          fragments[slot].epoch);
-      if (published.load(::cuda::memory_order_acquire) != a.epoch)
-        break;
-      state.batch[state.selected] = fragments[slot];
-      if ((state.batch[state.selected].source_rank & (1U << context)) != 0U)
-        ++state.active;
-      ++state.selected;
+    const auto stripes = (a.forward_relay_cta_count + a.local_world_size - 1U) /
+        a.local_world_size;
+    for (unsigned int attempt = 0U; attempt < a.local_world_size * stripes; ++attempt) {
+      const auto context = (preferred_context + attempt / stripes) % a.local_world_size;
+      const auto stripe = (state.preferred_stripe + attempt % stripes) % stripes;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
+          control.local_return_head[context * stripes + stripe].value);
+      auto begin = head.load(::cuda::memory_order_relaxed);
+      unsigned int count = 0U;
+      while (count < a.forward_local_return_batch_mblocks &&
+             stripe + (begin + count) * stripes < published_tail) {
+        ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> ready(
+            fragments[stripe + (begin + count) * stripes].epoch);
+        if (ready.load(::cuda::memory_order_acquire) != a.epoch)
+          break;
+        ++count;
+      }
+      if (!count || !head.compare_exchange_strong(begin, begin + count,
+                                                  ::cuda::memory_order_acq_rel,
+                                                  ::cuda::memory_order_relaxed))
+        continue;
+      state.cursor = stripe + begin * stripes;
+      state.context = context;
+      state.selected = count;
+      for (unsigned int item = 0U; item < count; ++item) {
+        state.batch[item] = fragments[stripe + (begin + item) * stripes];
+        if ((state.batch[item].source_rank & (1U << context)) != 0U)
+          ++state.active;
+      }
+      break;
     }
   }
   __syncthreads();
   if (state.selected == 0U || cancelled(a, control))
     return false;
 
+  const auto context = state.context;
   const auto local_source = a.node * a.local_world_size + context;
   if (state.active != 0U) {
-    MEGAMOE_TIMELINE_RECORD(
-        a.timeline, LocalReturnBatchStart, LocalReturn, context,
-        (state.cursor << 32U) | state.active, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
+                            context, (state.cursor << 32U) | state.active,
+                            a.epoch);
     if (threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -381,16 +413,15 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
             ? reinterpret_cast<const transport::BFloat16 *>(
                   static_cast<const std::byte *>(a.gin_window_base) +
                   a.gin_return_staging_offset)
-            : peer_at<const transport::BFloat16>(
-                  a.local_base, a.forward_output_rows_offset);
+            : peer_at<const transport::BFloat16>(a.local_base,
+                                                 a.forward_output_rows_offset);
     auto *source_contribution = peer_at<transport::BFloat16>(
         a.peer_bases[local_source], a.contribution_offset);
-    const auto copy_bytes = static_cast<std::uint32_t>(
-        a.hidden * sizeof(transport::BFloat16));
+    const auto copy_bytes =
+        static_cast<std::uint32_t>(a.hidden * sizeof(transport::BFloat16));
     const auto tma_warps = a.forward_relay_tma_warps;
-    const bool use_tma = tma_warps != 0U &&
-                         copy_bytes != 0U && copy_bytes <= 16384U &&
-                         (copy_bytes & 15U) == 0U;
+    const bool use_tma = tma_warps != 0U && copy_bytes != 0U &&
+                         copy_bytes <= 16384U && (copy_bytes & 15U) == 0U;
     if (use_tma) {
       const auto warp = threadIdx.x / 32U;
       const auto lane = threadIdx.x & 31U;
@@ -405,19 +436,18 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
           const auto fragment = state.batch[item];
           if ((fragment.source_rank & (1U << context)) == 0U)
             continue;
-          for (std::uint32_t local_row = warp;
-               local_row < fragment.row_count; local_row += tma_warps) {
+          for (std::uint32_t local_row = warp; local_row < fragment.row_count;
+               local_row += tma_warps) {
             const auto canonical_row = fragment.canonical_row + local_row;
             const auto header = headers[canonical_row];
             if (header.source_rank != local_source)
               continue;
             const auto *source = forward_output + canonical_row * a.hidden;
-            auto *target =
-                source_contribution + header.route_index * a.hidden;
+            auto *target = source_contribution + header.route_index * a.hidden;
             ::cuda::device::experimental::cp_async_bulk_global_to_shared(
                 warp_storage, source, copy_bytes, warp_full);
-            auto token = ::cuda::device::barrier_arrive_tx(
-                warp_full, 1U, copy_bytes);
+            auto token =
+                ::cuda::device::barrier_arrive_tx(warp_full, 1U, copy_bytes);
             warp_full.wait(static_cast<decltype(token) &&>(token));
             ::cuda::device::experimental::cp_async_bulk_shared_to_global(
                 target, warp_storage, copy_bytes);
@@ -500,8 +530,8 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       }
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
           completed(scheduler[4U + local_source]);
-      const auto old = completed.fetch_add(state.copied_rows,
-                                           ::cuda::memory_order_acq_rel);
+      const auto old =
+          completed.fetch_add(state.copied_rows, ::cuda::memory_order_acq_rel);
       const auto expected = old >> 32U;
       const auto actual = (old & 0xffffffffULL) + state.copied_rows;
       if (actual == expected) {
@@ -513,18 +543,13 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       }
     }
     __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(
-        a.timeline, LocalReturnBatchEnd, LocalReturn, context,
-        (state.cursor << 32U) | state.copied_rows, a.epoch);
+    MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
+                            context, (state.cursor << 32U) | state.copied_rows,
+                            a.epoch);
   }
 
-  if (threadIdx.x == 0U)
-    state.cursor += static_cast<unsigned long long>(state.selected) *
-                    state.stride;
-  __syncthreads();
   return true;
 }
-
 // Only the permanent owner of `fragment.context` calls this function.  Keeping
 // both payload and marker on the same exclusive QP gives the receiver a cheap
 // per-fragment release flag without exposing GIN state to FC2 producers.
@@ -649,6 +674,7 @@ __device__ __forceinline__ void flush_direct_full_run(
 }
 
 struct DirectFullRdmaState {
+  forward_reduce_detail::RdmaReduceMailbox *reduce_mailbox = nullptr;
   unsigned long long cursor = 0ULL;
   unsigned long long issued = 0ULL;
   unsigned long long completed = 0ULL;
@@ -928,7 +954,8 @@ __device__ __forceinline__ void direct_full_rdma_thread(
         state.cursor >= tail.load(::cuda::memory_order_acquire))
       break;
     if (!progressed)
-      __nanosleep(forward_tuning::kReturnIdleNanosleep);
+      if (!forward_reduce_detail::try_reduce_rdma_token(a, state.reduce_mailbox))
+        __nanosleep(forward_tuning::kReturnIdleNanosleep);
   }
 
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -936,7 +963,8 @@ __device__ __forceinline__ void direct_full_rdma_thread(
   issued_count.store(state.issued, ::cuda::memory_order_release);
   while (gin.readCounter(1, 56, ::cuda::memory_order_acquire) < state.issued &&
          !cancelled(a, control))
-    __nanosleep(forward_tuning::kTransportIdleNanosleep);
+    if (!forward_reduce_detail::try_reduce_rdma_token(a, state.reduce_mailbox))
+      __nanosleep(forward_tuning::kTransportIdleNanosleep);
 
   if (state.issued != 0ULL) {
     complete_completion_tasks(completion, transport_state::TaskClass::Return,

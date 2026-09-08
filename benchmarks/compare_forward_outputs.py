@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=8192)
     parser.add_argument("--hidden", type=int, default=7168)
+    parser.add_argument("--reference-key", default="common_forward",
+                        choices=("common_forward", "native_forward"))
     parser.add_argument("--max-abs-tolerance", type=float, default=0.02)
     parser.add_argument("--rmse-tolerance", type=float, default=0.008)
     parser.add_argument("--relative-denominator-floor", type=float,
@@ -35,7 +37,7 @@ def main():
                                     size=count).clone()
         record = torch.load(megatron_path, map_location="cpu",
                             weights_only=True)
-        reference = record["common_forward"].contiguous().view(-1)
+        reference = record[args.reference_key].contiguous().view(-1)
         if reference.numel() != count or reference.dtype != torch.bfloat16:
             raise RuntimeError(f"rank={rank} malformed Megatron output")
         reference_bits = reference.view(torch.int16)
@@ -51,6 +53,8 @@ def main():
         ranks.append({
             "rank": rank,
             "byte_identical": equal,
+            "mismatched_elements": int(
+                torch.count_nonzero(mega_bits != reference_bits).item()),
             "max_abs_error": absolute.max().item(),
             "max_relative_error": relative.max().item(),
             "rmse": rmse,
@@ -58,6 +62,7 @@ def main():
         })
         within_tolerance = within_tolerance and accepted
     result = {"schema": 1, "world": args.world,
+              "reference_key": args.reference_key,
               "byte_identical": all(item["byte_identical"] for item in ranks),
               "within_tolerance": within_tolerance,
               "tolerance": {

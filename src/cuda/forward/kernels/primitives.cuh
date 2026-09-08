@@ -682,6 +682,7 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 }
 
 #include "cuda/persistent_v3/forward/reduce_queue.cuh"
+#include "cuda/persistent_v3/forward/opportunistic_reduce.cuh"
 #include "cuda/persistent_v3/forward/return_pipeline.cuh"
 #include "cuda/persistent_v3/forward/dispatch_pipeline.cuh"
 #include "cuda/persistent_v3/forward/finalize_pipeline.cuh"

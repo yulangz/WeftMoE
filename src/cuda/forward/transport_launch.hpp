@@ -5,9 +5,8 @@
 
 #include <cstddef>
 
-// Included after activation_transport.cu's device-only anonymous namespace,
-// while already inside namespace megamoe::cuda.
-namespace forward_transport_launch {
+// Host interface to the separately compiled transport grid.
+namespace megamoe::cuda::forward_transport_launch {
 
 cudaError_t set_max_dynamic_shared_memory(int bytes);
 cudaError_t set_local_max_dynamic_shared_memory(int bytes);
@@ -22,4 +21,4 @@ cudaError_t launch_local(const cudaLaunchConfig_t *config, const void *args,
                          const CUtensorMap &s_map, const CUtensorMap &w1_map,
                          const CUtensorMap &w2_map);
 
-} // namespace forward_transport_launch
+} // namespace megamoe::cuda::forward_transport_launch

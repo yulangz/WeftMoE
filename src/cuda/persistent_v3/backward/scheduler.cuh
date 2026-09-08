@@ -100,7 +100,9 @@ MEGAMOE_V3_DEVICE inline void publish_owner_prefix(
         domain.valid_claim_mask(word) & ~available_mask;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
         domain.claim_words[claim_word_begin + word]);
-    claim.store(initially_claimed, ::cuda::memory_order_relaxed);
+    // A delayed retirement may observe this reset before the ready summary
+    // is republished. Its acquire probe must also observe the new phase.
+    claim.store(initially_claimed, ::cuda::memory_order_release);
   }
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
       domain.ready_words[owner / 64U]);
@@ -125,6 +127,24 @@ MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
       return false;
   }
   return true;
+}
+
+// The dU and SwiGLU epilogue phases reuse the DAB owner. A worker can observe
+// the old phase fully claimed, then retire its ready bit after another worker
+// has already published the next phase. Repair that stale retirement when the
+// new phase still has unclaimed work. Single-publication domains need no probe.
+MEGAMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
+                                                   std::uint32_t owner) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
+      domain.ready_words[owner / 64U]);
+  const auto mask = 1ULL << (owner % 64U);
+  if (domain.kind == TaskKind::Dab) {
+    ready.fetch_and(~mask, ::cuda::memory_order_acq_rel);
+    if (!owner_fully_claimed(domain, owner))
+      ready.fetch_or(mask, ::cuda::memory_order_release);
+  } else {
+    ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
+  }
 }
 
 MEGAMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
@@ -214,11 +234,11 @@ MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
       }
       if (try_claim_owner_tile(domain, owner, task)) {
         if (owner_fully_claimed(domain, owner))
-          ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
+          retire_claimed_owner(domain, owner);
         return true;
       }
       if (owner_fully_claimed(domain, owner))
-        ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
+        retire_claimed_owner(domain, owner);
       bits &= ~mask;
     }
   }

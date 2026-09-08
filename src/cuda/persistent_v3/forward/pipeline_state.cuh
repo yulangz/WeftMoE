@@ -46,6 +46,11 @@ struct alignas(128) ForwardPipelineControl {
   PaddedCounter rdma_return_roles_complete;
   PaddedCounter return_receive_roles_complete;
   PaddedCounter source_ready_published;
+  // Shared destination/stripe cursors. Host validation allows at most 32
+  // Relay CTAs. Reserve padding for rounding up to the local world size.
+  PaddedCounter local_return_head[32U + kRdmaCtaCount - 1U];
+  PaddedCounter return_chunk_scan;
+  PaddedCounter return_chunks_complete;
   // A route publisher increments one source-token counter after making its
   // contribution visible.  The publisher that completes top-k appends that
   // token to the ready queue.  Compute CTAs consume the queue in small batches

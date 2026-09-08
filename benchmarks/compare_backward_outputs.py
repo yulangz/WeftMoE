@@ -128,7 +128,7 @@ def main():
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int)
-    parser.add_argument("--top-k", type=int, choices=(1, 6), default=1)
+    parser.add_argument("--top-k", type=int, choices=(1, 6, 8), default=1)
     args = parser.parse_args()
 
     dist.init_process_group("nccl")

@@ -223,6 +223,8 @@ def main():
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
     parser.add_argument("--stage-profile", action="store_true")
+    parser.add_argument("--save-output-dir",
+                        help="shared directory for per-rank Forward tensors")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
                         default="alltoall")
     parser.add_argument("--deepep-num-sms", type=int, default=20)

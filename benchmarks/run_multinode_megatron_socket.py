@@ -80,6 +80,8 @@ def benchmark_arguments(args):
         result.extend(["--expert-body", args.expert_body])
         if getattr(args, "stage_profile", False):
             result.append("--stage-profile")
+        if getattr(args, "save_output_dir", None):
+            result.extend(["--save-output-dir", args.save_output_dir])
     return result
 
 

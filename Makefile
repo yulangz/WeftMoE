@@ -59,17 +59,6 @@ LIB_SOURCES := \
 LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 PROD_LIB_OBJECTS := $(LIB_SOURCES:%.cpp=$(BUILD_DIR)/production/%.o)
 
-NOTIFY_DISPATCH_FRAGMENTS := $(wildcard src/metadata/notify_dispatch/*.inc)
-DEVICE_NOTIFY_FRAGMENTS := $(wildcard src/cuda/notify/*.inc)
-NCCL_COUNT_EXCHANGE_FRAGMENTS := $(wildcard src/transport/nccl_count_exchange/*.inc)
-FORWARD_SOURCE_FRAGMENTS := \
-	$(wildcard src/cuda/forward/host/*.inc) \
-	$(wildcard src/cuda/forward/kernels/*) \
-	$(wildcard src/cuda/forward/runtime/*.inc) \
-	$(wildcard src/cuda/forward/support/*) \
-	$(wildcard src/cuda/persistent_v3/forward/compute/*) \
-	$(wildcard src/cuda/persistent_v3/forward/dispatch/*)
-
 CUDA_ARCH_FLAGS ?= -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90a,code=sm_90a
 CUDA_NVCCFLAGS ?= -O2 -g -std=c++17 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets
 override CUDA_NVCCFLAGS += -Xcompiler=-fPIC,-fvisibility=hidden,-ffunction-sections,-fdata-sections
@@ -86,144 +75,56 @@ CROSS_CHECK_ENV := $(if $(SANITIZER_PRELOAD),LD_PRELOAD=$(SANITIZER_PRELOAD),)
 CUDA_LIB_SOURCES := \
 	src/cuda/device_notify.cu \
 	src/cuda/activation_transport.cu \
+	src/cuda/forward_transport.cu \
 	src/cuda/persistent_v3/kernel_entry.cu \
 	src/transport/nccl_count_exchange.cu
-CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o) \
-	$(BUILD_DIR)/src/cuda/forward_transport.o
+CUDA_LIB_OBJECTS := $(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/%.o)
 PROD_CUDA_LIB_OBJECTS := \
-	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o) \
-	$(BUILD_DIR)/production/src/cuda/forward_transport.o
+	$(CUDA_LIB_SOURCES:%.cu=$(BUILD_DIR)/production/%.o)
 
 .PHONY: all test reference-test launcher-security-test forward-autotune-test forward-autotune backward-autotune-test backward-autotune cross-check header-test api-negative-test shared-lib testing-lib install uninstall-manifest install-test installed-header-scan release-text-check public-symbol-check retired-symbol-link-negative kernel-artifact-check kernel-artifact-update license-check release-test release-check release-check-inner bench megatron-bench megatron-backward-bench megatron-flex-bench megatron-flex-stage-profile megatron-flex-backward-bench fair-integrated-bench cuda-lib cuda-test cuda-test-local cuda-protocol-test cuda-bench cuda-transport-test cuda-p2p-test cuda-p2p-bench cuda-integrated-bench cuda-transport-bench cuda-sanitizer-smoke cuda-sm90-compile clean
+
+FWD_AUTOTUNE_CONFIG ?= configs/forward_h200_multi_node_autotune.json
+BWD_AUTOTUNE_CONFIG ?= configs/backward_h200_multi_node_autotune.json
+AUTOTUNE_ARGS ?=
 
 forward-autotune-test:
 	python3 tests/test_forward_autotune.py
 
 forward-autotune:
-	python3 tools/autotune_forward.py --config configs/forward_h200_autotune.json
+	python3 tools/autotune_forward.py --config $(FWD_AUTOTUNE_CONFIG) $(AUTOTUNE_ARGS)
 
 backward-autotune-test:
 	python3 tests/test_backward_autotune.py
 
 backward-autotune:
-	python3 tools/autotune_backward.py --config configs/backward_h200_autotune.json
+	python3 tools/autotune_backward.py --config $(BWD_AUTOTUNE_CONFIG) $(AUTOTUNE_ARGS)
 
 all: $(BUILD_DIR)/test_notify_dispatch $(BUILD_DIR)/metadata_dump $(BUILD_DIR)/notify_dispatch_bench
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cu
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/production/%.o: %.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/production/%.o: %.cu
 	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -c $< -o $@
+	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 $(CUDA_NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/src/metadata/notify_dispatch.o \
-$(BUILD_DIR)/production/src/metadata/notify_dispatch.o: \
-	$(NOTIFY_DISPATCH_FRAGMENTS)
+# Track actual transitive headers instead of maintaining fragment lists.
+-include $(LIB_OBJECTS:.o=.d) $(PROD_LIB_OBJECTS:.o=.d) \
+         $(CUDA_LIB_OBJECTS:.o=.d) $(PROD_CUDA_LIB_OBJECTS:.o=.d)
 
-$(BUILD_DIR)/src/cuda/device_notify.o \
-$(BUILD_DIR)/production/src/cuda/device_notify.o: \
-	$(DEVICE_NOTIFY_FRAGMENTS)
-
-$(BUILD_DIR)/src/transport/nccl_count_exchange.o \
-$(BUILD_DIR)/production/src/transport/nccl_count_exchange.o: \
-	$(NCCL_COUNT_EXCHANGE_FRAGMENTS)
-
-$(BUILD_DIR)/src/cuda/activation_transport.o \
-$(BUILD_DIR)/production/src/cuda/activation_transport.o: \
-	src/cuda/forward/kernel_contract.cuh \
-	src/cuda/forward/kernel_support.cuh \
-	src/cuda/forward/device_kernels.cuh \
-	src/cuda/backward/kernel_contract.cuh \
-	src/cuda/backward/device_kernels.cuh \
-	src/cuda/backward/tuning_config.hpp \
-	src/cuda/persistent_v3/backward/compute_kernels.cuh \
-	src/cuda/persistent_v3/backward/pipeline_state.cuh \
-	src/cuda/persistent_v3/backward/pipeline_kernels.cuh \
-	src/cuda/persistent_v3/backward/scheduler.cuh \
-	src/cuda/backward/host_launch.inc \
-	src/cuda/forward/runtime_state.inc \
-	src/cuda/forward/host_launch.inc \
-	$(FORWARD_SOURCE_FRAGMENTS) \
-	src/cuda/testing/transport_probes.inc \
-	src/cuda/forward/tuning_config.hpp \
-	src/cuda/forward/transport_launch.hpp \
-	src/cuda/persistent_v3/contracts.hpp \
-	src/cuda/persistent_v3/queues.cuh \
-	src/cuda/persistent_v3/roles/common.cuh \
-	src/cuda/persistent_v3/forward/pipeline_state.cuh \
-	src/cuda/persistent_v3/forward/dispatch_pipeline.cuh \
-	src/cuda/persistent_v3/forward/return_pipeline.cuh \
-	src/cuda/persistent_v3/forward/finalize_pipeline.cuh \
-	src/cuda/persistent_v3/forward/compute_kernel.cuh \
-	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
-	src/cuda/profiling/device_timeline.cuh \
-	src/cuda/profiling/device_timeline_types.hpp
-
+# Transport intentionally leaves compute/host helpers uninstantiated.
 $(BUILD_DIR)/src/cuda/forward_transport.o \
-$(BUILD_DIR)/production/src/cuda/forward_transport.o: \
-	src/cuda/activation_transport.cu \
-	src/cuda/activation_transport_internal.hpp \
-	src/cuda/cuda_internal.hpp \
-	src/cuda/forward/kernel_contract.cuh \
-	src/cuda/forward/kernel_support.cuh \
-	src/cuda/forward/device_kernels.cuh \
-	src/cuda/forward/runtime_state.inc \
-	src/cuda/forward/host_launch.inc \
-	$(FORWARD_SOURCE_FRAGMENTS) \
-	src/cuda/testing/transport_probes.inc \
-	src/cuda/forward/tuning_config.hpp \
-	src/cuda/forward/transport_launch.hpp \
-	src/cuda/persistent_v3/contracts.hpp \
-	src/cuda/persistent_v3/queues.cuh \
-	src/cuda/persistent_v3/roles/common.cuh \
-	src/cuda/persistent_v3/forward/pipeline_state.cuh \
-	src/cuda/persistent_v3/forward/reduce_queue.cuh \
-	src/cuda/persistent_v3/forward/dispatch_pipeline.cuh \
-	src/cuda/persistent_v3/forward/return_pipeline.cuh \
-	src/cuda/persistent_v3/forward/finalize_pipeline.cuh \
-	src/cuda/persistent_v3/forward/compute_kernel.cuh \
-	src/cuda/persistent_v3/forward/reduce_pipeline.cuh \
-	src/cuda/profiling/device_timeline.cuh \
-	src/cuda/profiling/device_timeline_types.hpp \
-	src/cuda/transport_generation_completion.cuh
-
-$(BUILD_DIR)/src/cuda/forward_transport.o:
-	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=1 \
-		-DMEGAMOE_FORWARD_TRANSPORT_TU=1 -diag-suppress=177 $(CUDA_NVCCFLAGS) \
-		$(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror \
-		-c src/cuda/activation_transport.cu -o $@
-
-$(BUILD_DIR)/production/src/cuda/forward_transport.o:
-	@mkdir -p $(@D)
-	$(NVCC) $(CUDA_CPPFLAGS) -DMEGAMOE_BUILD_TESTING=0 \
-		-DMEGAMOE_FORWARD_TRANSPORT_TU=1 -diag-suppress=177 $(CUDA_NVCCFLAGS) \
-		$(CUDA_ARCH_FLAGS) -Xcompiler=-Wall,-Wextra,-Werror \
-		-c src/cuda/activation_transport.cu -o $@
-
-$(BUILD_DIR)/src/cuda/persistent_v3/kernel_entry.o \
-$(BUILD_DIR)/production/src/cuda/persistent_v3/kernel_entry.o: \
-	src/cuda/persistent_v3/contracts.hpp \
-	src/cuda/persistent_v3/epoch_state.cuh \
-	src/cuda/persistent_v3/queues.cuh \
-	src/cuda/persistent_v3/shared_storage.cuh \
-	src/cuda/persistent_v3/pipelines/task_scoreboard.cuh \
-	src/cuda/persistent_v3/roles/common.cuh \
-	src/cuda/persistent_v3/roles/compute_role.cuh \
-	src/cuda/backward/tuning_config.hpp \
-	src/cuda/persistent_v3/backward/scheduler.cuh \
-	src/cuda/persistent_v3/backward/scheduler_probe.cuh \
-	src/cuda/persistent_v3/testing.hpp
+$(BUILD_DIR)/production/src/cuda/forward_transport.o: CUDA_NVCCFLAGS += -diag-suppress=177
 
 cuda-lib: $(LIB_OBJECTS) $(CUDA_LIB_OBJECTS)
 
@@ -296,12 +197,7 @@ release-check-inner:
 
 CUDA_TEST_SOURCES := \
 	tests/test_cuda_notify.cpp
-CUDA_TEST_DEPS := \
-	$(wildcard tests/cuda/*.inc) \
-	$(wildcard tests/cuda/distributed/*.inc)
-METADATA_TEST_DEPS := $(wildcard tests/metadata/*.inc)
-
-$(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES) $(CUDA_TEST_DEPS)
+$(BUILD_DIR)/test_cuda_notify: $(BUILD_DIR)/libmegamoe_testing.a $(CUDA_TEST_SOURCES)
 	@mkdir -p $(@D)
 	$(NVCC) $(CUDA_ARCH_FLAGS) $(CUDA_NVCCFLAGS) $(CUDA_CPPFLAGS) $(LDFLAGS) \
 		$(CUDA_TEST_SOURCES) -Xlinker=--whole-archive \
@@ -379,7 +275,7 @@ cuda-sanitizer-smoke: $(BUILD_DIR)/test_cuda_notify
 cuda-sm90-compile:
 	$(MAKE) BUILD_DIR=$(BUILD_DIR)-sm90 CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' cuda-lib
 
-$(BUILD_DIR)/test_notify_dispatch: $(LIB_OBJECTS) tests/test_notify_dispatch.cpp $(METADATA_TEST_DEPS)
+$(BUILD_DIR)/test_notify_dispatch: $(LIB_OBJECTS) tests/test_notify_dispatch.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) \
 		$(LIB_OBJECTS) tests/test_notify_dispatch.cpp -o $@

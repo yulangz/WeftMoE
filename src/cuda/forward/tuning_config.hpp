@@ -9,6 +9,10 @@
 // Forward configuration.
 #if defined(MEGAMOE_FORWARD_USE_GENERATED_TUNING)
 #include <megamoe_forward_tuning_generated.hpp>
+#elif defined(MEGAMOE_BACKWARD_USE_GENERATED_TUNING)
+#include <megamoe_backward_tuning_generated.hpp>
+#define MEGAMOE_FWD_MAIN_HIDDEN MEGAMOE_BWD_MAIN_HIDDEN
+#define MEGAMOE_FWD_MAIN_INTERMEDIATE MEGAMOE_BWD_MAIN_INTERMEDIATE
 #endif
 
 #ifndef MEGAMOE_FWD_MAIN_HIDDEN
@@ -119,9 +123,6 @@
 #ifndef MEGAMOE_FWD_COMPLETION_MARKER_WARPS
 #define MEGAMOE_FWD_COMPLETION_MARKER_WARPS 1
 #endif
-#ifndef MEGAMOE_FWD_REDUCE_CTA_DIVISOR
-#define MEGAMOE_FWD_REDUCE_CTA_DIVISOR 1
-#endif
 #ifndef MEGAMOE_FWD_REDUCE_SCHEDULER
 // 0=ready queue, 1=dynamic scan, 2=static token stripes.
 #define MEGAMOE_FWD_REDUCE_SCHEDULER 0
@@ -225,8 +226,6 @@ inline constexpr std::uint32_t kCompletionChunksPerPass =
     MEGAMOE_FWD_COMPLETION_CHUNKS_PER_PASS;
 inline constexpr std::uint32_t kCompletionMarkerWarps =
     MEGAMOE_FWD_COMPLETION_MARKER_WARPS;
-inline constexpr std::uint32_t kReduceCtaDivisor =
-    MEGAMOE_FWD_REDUCE_CTA_DIVISOR;
 inline constexpr std::uint32_t kReduceScheduler =
     MEGAMOE_FWD_REDUCE_SCHEDULER;
 inline constexpr std::uint32_t kReduceWarps = MEGAMOE_FWD_REDUCE_WARPS;
@@ -334,13 +333,13 @@ static_assert(kLocalReturnBatchMblocks >= 1U &&
               kLocalReturnBatchMblocks <= 8U);
 static_assert(kReturnChunkRows > 0U && kReturnMaxInflight <= 64U);
 static_assert(kLocalRouteBatchRows > 0U && kStartupMblocks > 0U);
+static_assert(kRelayLocalReturn, "local Return requires Relay ownership");
 static_assert(kTaskClaimChunk == 1U,
               "only the proven one-task queue claim is currently compiled");
 static_assert(kCompletionChunksPerPass > 0U &&
               kCompletionChunksPerPass <= 4U);
 static_assert(kCompletionMarkerWarps > 0U &&
               kCompletionMarkerWarps <= kComputeThreads / 32U);
-static_assert(kReduceCtaDivisor > 0U);
 static_assert(kReduceScheduler <= 2U);
 static_assert(kReduceWarps > 0U &&
               kReduceWarps <= kComputeThreads / 32U);

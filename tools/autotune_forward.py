@@ -12,6 +12,7 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from autotune_common import (
+    resolve_runtime_settings,
     PlanError,
     candidate_digest,
     choose_confirmed_candidate,
@@ -41,7 +43,7 @@ from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "forward_h200_autotune.json"
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "forward_h200_multi_node_autotune.json"
 GROUP_NAMES = (
     "1_gemm",
     "2_transport",
@@ -98,7 +100,6 @@ PARAMETER_MACROS = {
     "completion_chunks_per_pass":
         "MEGAMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
     "completion_marker_warps": "MEGAMOE_FWD_COMPLETION_MARKER_WARPS",
-    "reduce_cta_divisor": "MEGAMOE_FWD_REDUCE_CTA_DIVISOR",
     "reduce_scheduler": "MEGAMOE_FWD_REDUCE_SCHEDULER",
     "reduce_warps": "MEGAMOE_FWD_REDUCE_WARPS",
     "reduce_tokens_per_claim": "MEGAMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
@@ -174,10 +175,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
             _require(type(value) is int, f"{key} must be an integer")
             _require(value >= 0, f"{key} must be non-negative")
 
-    _require(config["main_hidden"] == 7168,
-             "this Forward specialization requires main_hidden=7168")
-    _require(config["main_intermediate"] == 3072,
-             "this Forward specialization requires main_intermediate=3072")
+    _require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
+             "main_hidden must be a positive multiple of 256")
+    _require(config["main_intermediate"] > 0 and config["main_intermediate"] % 256 == 0,
+             "main_intermediate must be a positive multiple of 256")
     _require_choice(config, "tile_m", (64, 128))
     _require_choice(config, "fc1_tile_n", (64, 128, 256))
     _require_choice(config, "fc2_tile_n", (64, 128, 256))
@@ -227,6 +228,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require_choice(config, "relay_ctas", (8, 16, 24))
         _require(config["relay_ctas"] % config["rdma_ctas"] == 0,
                  "relay_ctas must be a multiple of rdma_ctas")
+    _require(config["relay_local_return"], "local Return requires relay_local_return=true")
     _require(config["rdma_control_warps"] == 2,
              "the current RDMA protocol has exactly issue and completion warps")
     _require_choice(config, "relay_tma_warps", (0, 4, 8, 12))
@@ -256,7 +258,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
 
     _require_choice(config, "completion_chunks_per_pass", (1, 2, 4))
     _require_choice(config, "completion_marker_warps", (1, 2, 4))
-    _require_choice(config, "reduce_cta_divisor", (1, 2, 4))
     _require_choice(config, "reduce_warps", (4, 8, 12))
     _require(1 <= config["reduce_tokens_per_claim"] <= config["reduce_warps"],
              "reduce_tokens_per_claim must be in [1, reduce_warps]")
@@ -271,13 +272,104 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require_choice(config, key, (0, 16, 32, 64, 128, 256, 512))
 
 
-def load_plan(path: Path) -> dict[str, Any]:
+def expand_search_space(document: dict[str, Any]) -> None:
+    """Normalize a complete schema-3 Cartesian grid to explicit candidates."""
+    _require("fixed" not in document and "candidates" not in document,
+             "schema 3 uses search_space, not fixed/candidates")
+    _require("search_space" in document, "plan omits search_space")
+    model = document.get("model")
+    model_keys = {"main_hidden", "main_intermediate"}
+    _require(isinstance(model, dict) and set(model) == model_keys,
+             "schema 3 model must define main_hidden and main_intermediate")
+    for key, value in model.items():
+        _require(type(value) is int and value > 0 and value % 256 == 0,
+                 f"model.{key} must be a positive multiple of 256")
+    space = copy.deepcopy(document["search_space"])
+    provided = flatten_groups(space, require_all=False)
+    _require(not (model_keys & set(provided)),
+             "model dimensions belong in model, not search_space")
+    _require("1_gemm" in space, "search_space omits 1_gemm")
+    space["1_gemm"].update({key: [value] for key, value in model.items()})
+    flat = flatten_groups(space, require_all=True)
+    count = 1
+    for key, values in flat.items():
+        _require(isinstance(values, list) and values,
+                 f"search_space.{key} must be a non-empty array")
+        encoded = [json.dumps(v, sort_keys=True) for v in values]
+        _require(len(set(encoded)) == len(values),
+                 f"search_space.{key} has duplicate values")
+        count *= len(values)
+    maximum = document.get("max_candidates")
+    _require(type(maximum) is int and 1 <= maximum <= 4096,
+             "schema 3 max_candidates must be in [1, 4096]")
+    _require(count <= maximum,
+             f"Cartesian candidate count {count} exceeds max_candidates={maximum}")
+    fixed = {group: {key: values[0] for key, values in space[group].items()}
+             for group in GROUP_NAMES}
+    axes = [(group, key, values) for group in GROUP_NAMES
+            for key, values in space[group].items() if len(values) > 1]
+    candidates = []
+    for index, values in enumerate(itertools.product(*(a[2] for a in axes))):
+        override = {}
+        for (group, key, _), value in zip(axes, values):
+            if value != fixed[group][key]:
+                override.setdefault(group, {})[key] = value
+        candidates.append({"name": "incumbent" if index == 0 else f"grid_{index:04d}",
+                           "override": override})
+    document["fixed"] = fixed
+    document["candidates"] = candidates
+
+
+def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
+                      benchmark: Mapping[str, Any] | None = None,
+                      system: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Combine hyperparameters, caller-owned workload and optional host settings."""
+    flat = flatten_groups(space, require_all=False)
+    topology, jit_overrides = resolve_runtime_settings(
+        model=model, rdma=flat.get("rdma_ctas"), system=system, repo_root=REPO_ROOT)
+    workload = dict(benchmark or {})
+    _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
+        "tune_rounds", "final_rounds", "timeout_seconds", "result_dir"}),
+        "benchmark contains model/system fields or unknown settings")
+    count = 1
+    for values in flat.values():
+        _require(isinstance(values, list) and values,
+                 "hyperparameters must be non-empty arrays")
+        count *= len(values)
+    return {
+        "schema": 3, "search_space": copy.deepcopy(space), "max_candidates": 4096,
+        "model": {"main_hidden": model["hidden"], "main_intermediate": model["intermediate"]},
+        "jit": dict(cache_root="artifacts/forward-jit", jobs=8, architecture="sm_90a",
+                    timeout_seconds=1800) | jit_overrides,
+        "selection": dict(confirmation_candidates=min(2, count), confirmation_repeats=2,
+                          confirmation_rounds=60, minimum_improvement_percent=0.5),
+        "benchmark": dict(seed=0x4D554C54, tokens_per_rank=8192, top_k=model["top_k"],
+            experts=model["experts"], gate_mode="fixed-random", generation_base=1000,
+            tune_rounds=30, final_rounds=110, timeout_seconds=600,
+            selection_metric="forward_slowest_rank_us.mean",
+            result_dir="artifacts/forward-autotune") | topology | workload,
+    }
+
+
+def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
+              benchmark: Mapping[str, Any] | None = None,
+              system: Mapping[str, Any] | None = None) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     _require(isinstance(document, dict), "top-level plan must be an object")
-    _require(document.get("schema") == 2, "plan schema must be 2")
+    if "schema" not in document:
+        document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
+    _require(document.get("schema") in (2, 3), "plan schema must be 2 or 3")
+    if document["schema"] == 2:
+        # Historical frozen plans retain this removed tail-only parameter.
+        # New pure hyperparameter files reject it as unknown.
+        groups = [document.get("fixed", {})] + [c.get("override", {}) for c in document.get("candidates", [])]
+        for group in groups:
+            group.get("4_completion_reduce", {}).pop("reduce_cta_divisor", None)
+    if document["schema"] == 3:
+        expand_search_space(document)
     for section in ("jit", "benchmark", "selection", "fixed", "candidates"):
         _require(section in document, f"plan omits {section}")
     _require(isinstance(document["jit"], dict), "jit must be an object")
@@ -305,7 +397,7 @@ def load_plan(path: Path) -> dict[str, Any]:
     for key in common_benchmark_keys:
         _require(key in benchmark, f"benchmark omits {key}")
     if launcher == "multinode":
-        for key in ("remote", "port", "gpus_per_node"):
+        for key in ("port", "gpus_per_node"):
             _require(key in benchmark, f"benchmark omits {key}")
     else:
         _require("world" in benchmark, "local benchmark omits world")
@@ -328,16 +420,17 @@ def load_plan(path: Path) -> dict[str, Any]:
     if launcher == "local":
         _require(benchmark["world"] in (1, 2, 8),
                  "local benchmark.world must be 1, 2, or 8")
-    _require(benchmark["top_k"] in (1, 6),
-             "benchmark.top_k must be 1 or 6")
+    _require(benchmark["top_k"] in (1, 6, 8),
+             "benchmark.top_k must be 1, 6, or 8")
     _require(benchmark["tune_rounds"] > 10 and
              benchmark["final_rounds"] > 10,
              "Forward benchmark rounds must be >10")
     _require(isinstance(document["candidates"], list) and
              document["candidates"], "candidates must be a non-empty array")
     maximum = document.get("max_candidates", 8)
-    _require(type(maximum) is int and 1 <= maximum <= 16,
-             "max_candidates must be in [1, 16]")
+    limit = 4096 if document["schema"] == 3 else 16
+    _require(type(maximum) is int and 1 <= maximum <= limit,
+             f"max_candidates must be in [1, {limit}]")
     _require(len(document["candidates"]) <= maximum,
              f"candidate count exceeds max_candidates={maximum}")
     validate_selection(document["selection"], len(document["candidates"]))
@@ -560,7 +653,7 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any],
         "--scenario", "gin_forward_bench",
         "--timeout", str(int(benchmark["timeout_seconds"])),
     ]
-    nccl_lib_dir = benchmark.get("nccl_lib_dir")
+    nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
     if nccl_lib_dir:
         command += ["--nccl-lib-dir", str(nccl_lib_dir)]
     socket_ifname = benchmark.get("socket_ifname")
@@ -606,8 +699,10 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     run_environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
     run_environment["MEGAMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
         int(benchmark["generation_base"]))
+    if "experts" in benchmark:
+        run_environment["MEGAMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
     if benchmark.get("launcher", "multinode") == "local":
-        nccl_lib_dir = benchmark.get("nccl_lib_dir")
+        nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
         if nccl_lib_dir:
             prior = run_environment.get("LD_LIBRARY_PATH", "")
             run_environment["LD_LIBRARY_PATH"] = (
@@ -633,7 +728,10 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
         output = completed.stdout
         returncode = completed.returncode
     except subprocess.TimeoutExpired as error:
-        output = (error.stdout or "") + f"\nTIMEOUT: {error}\n"
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        output += f"\nTIMEOUT: {error}\n"
         returncode = 124
     elapsed = time.monotonic() - start
     log_path.write_text("COMMAND " + json.dumps(command) + "\n" + output,
@@ -710,6 +808,12 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--system-config", type=Path)
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
+    parser.add_argument("--experts", type=int)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--tokens", type=int)
     parser.add_argument("--candidate", action="append", default=[],
                         help="run only this named candidate (repeatable)")
     parser.add_argument("--generate-only", action="store_true",
@@ -742,8 +846,25 @@ def main(argv: list[str] | None = None) -> int:
     _require(not args.build_only or args.candidate,
              "--build-only requires at least one explicit --candidate")
     config_path = args.config.resolve()
-    plan = load_plan(config_path)
+    model = {key: getattr(args, key) for key in ("hidden", "intermediate", "experts", "top_k")}
+    system = None
+    if args.system_config:
+        try:
+            system = json.loads(args.system_config.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise PlanError(f"cannot read system config: {error}") from error
+        _require(isinstance(system, dict), "system config must be an object")
+    system = dict(system or {})
+    for key in ("remote", "port", "nccl_lib_dir"):
+        if getattr(args, key) is not None:
+            system[key] = getattr(args, key)
+    plan = load_plan(config_path, model=model,
+                     benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None,
+                     system=system)
     _configure_from_cli(plan, args)
+    if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher", "multinode") == "multinode":
+        _require(bool(plan["benchmark"].get("remote")),
+                 "multinode benchmark requires --remote or system.remote")
     validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)
     requested = set(args.candidate)

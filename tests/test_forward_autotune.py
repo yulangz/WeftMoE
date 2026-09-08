@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import copy
+import json
 import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -36,23 +38,142 @@ def makefile_list(variable: str) -> tuple[str, ...]:
 
 
 class ForwardAutotuneTest(unittest.TestCase):
+    def test_local_runtime_library_path_precedes_inherited_libraries(self):
+        benchmark = dict(self.plan["benchmark"], launcher="local", world=8,
+                         nccl_lib_dir="/link/nccl",
+                         runtime_library_path="/cuda/compat:/runtime/nccl")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                tune.subprocess, "run", return_value=mock.Mock(
+                    returncode=1, stdout="", stderr="")) as run:
+            tune.benchmark_candidate(self.candidates[0], Path("/tmp/binary"),
+                                     benchmark, Path(tmp),
+                                     {"LD_LIBRARY_PATH": "/inherited"}, rounds=30)
+            self.assertEqual(run.call_args.kwargs["env"]["LD_LIBRARY_PATH"],
+                             "/cuda/compat:/runtime/nccl:/inherited")
+
+    def test_global_grids_cover_combinations_and_preserve_incumbents(self):
+        for topology, legacy, count, rdma in (
+            ("single_node", "forward_h200_single_node_autotune.json", 128, 0),
+            ("multi_node", "forward_h200_multi_node_autotune.json", 96, 8),
+        ):
+            plan = tune.load_plan(ROOT / "configs" /
+                                  f"forward_h200_{topology}_autotune.json",
+                                  model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
+            candidates = tune.expand_candidates(plan)
+            source = json.loads((ROOT / "configs" / legacy).read_text())
+            baseline = {"config": {k: v[0] for group in source.values() for k, v in group.items()}}
+            baseline["config"].update(main_hidden=7168, main_intermediate=3072)
+            self.assertEqual(len(candidates), count)
+            self.assertEqual(candidates[0]["name"], "incumbent")
+            self.assertEqual(candidates[0]["config"], baseline["config"])
+            for c in candidates:
+                self.assertEqual(c["config"]["rdma_ctas"], rdma)
+                self.assertEqual(set(c["config"]), set(tune.PARAMETER_MACROS))
+            if rdma == 0:
+                self.assertTrue(any(c["config"]["relay_ctas"] == 32 and
+                                    c["config"]["local_return_batch_mblocks"] == 8 and
+                                    c["config"]["local_dispatch_tma_warps"] == 8
+                                    for c in candidates))
+
+    def test_grid_rejects_missing_duplicate_invalid_and_oversized_axes(self):
+        source = json.loads((ROOT / "configs" /
+                             "forward_h200_single_node_autotune.json").read_text())
+        source = tune.make_runtime_plan(source, model=dict(
+            hidden=7168, intermediate=3072, experts=384, top_k=6))
+        cases = []
+        model_in_search = copy.deepcopy(source)
+        model_in_search["search_space"]["1_gemm"]["main_hidden"] = [2560, 7168]
+        cases.append(model_in_search)
+        missing_model = copy.deepcopy(source)
+        del missing_model["model"]
+        cases.append(missing_model)
+        missing = copy.deepcopy(source)
+        del missing["search_space"]["2_transport"]["rdma_ctas"]
+        cases.append(missing)
+        duplicate = copy.deepcopy(source)
+        duplicate["search_space"]["2_transport"]["relay_ctas"] = [16, 16]
+        cases.append(duplicate)
+        invalid = copy.deepcopy(source)
+        invalid["search_space"]["2_transport"]["local_dispatch_tma_warps"] = [4, 12]
+        cases.append(invalid)
+        oversized = copy.deepcopy(source)
+        oversized["max_candidates"] = 1
+        cases.append(oversized)
+        for document in cases:
+            with self.subTest(document=document), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "plan.json"
+                path.write_text(json.dumps(document))
+                with self.assertRaises(tune.PlanError):
+                    tune.expand_candidates(tune.load_plan(path))
+
+    def test_dynamic_model_and_optional_system_defaults(self):
+        path = ROOT / "configs/forward_h200_single_node_autotune.json"
+        with self.assertRaises(tune.PlanError):
+            tune.load_plan(path)
+        plan = tune.load_plan(path, model=dict(hidden=2560, intermediate=768,
+                                              experts=512, top_k=8),
+                              benchmark=dict(tokens_per_rank=65536))
+        self.assertEqual(plan["fixed"]["1_gemm"]["main_hidden"], 2560)
+        self.assertEqual(plan["benchmark"]["experts"], 512)
+        self.assertTrue(plan["benchmark"]["disable_ib"])
+        self.assertNotIn("socket_ifname", plan["benchmark"])
+        self.assertEqual(plan["benchmark"]["tokens_per_rank"], 65536)
+        with self.assertRaises(tune.PlanError):
+            tune.load_plan(path, model=dict(hidden=2560, intermediate=768,
+                                            experts=512, top_k=8), system={"world": 16})
+        multi = tune.load_plan(ROOT / "configs/forward_h200_multi_node_autotune.json",
+                              model=dict(hidden=2560, intermediate=768, experts=512, top_k=8),
+                              system={"remote": "root@example", "socket_ifname": "eth1"})
+        self.assertTrue(multi["benchmark"]["enable_ib"])
+        self.assertEqual(multi["benchmark"]["socket_ifname"], "eth1")
+
+    def test_dynamic_experts_reach_benchmark_environment(self):
+        benchmark = dict(self.plan["benchmark"], launcher="local", world=8, experts=512)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                tune.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")) as run:
+            tune.benchmark_candidate(self.candidates[0], Path("/tmp/binary"),
+                                     benchmark, Path(tmp), {}, rounds=30)
+            self.assertEqual(run.call_args.kwargs["env"]["MEGAMOE_BENCH_EXPERTS"], "512")
+
     def setUp(self):
         self.plan = tune.load_plan(
-            ROOT / "configs" / "forward_h200_autotune.json")
+            ROOT / "configs" / "forward_h200_multi_node_autotune.json",
+            model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
+            system={"remote": "root@example"})
         self.candidates = tune.expand_candidates(self.plan)
 
+    def test_removed_reduce_divisor_legacy_migration(self):
+        document = copy.deepcopy(self.plan)
+        document["schema"] = 2
+        document["max_candidates"] = 2
+        document["candidates"] = document["candidates"][:2]
+        document["fixed"]["4_completion_reduce"]["reduce_cta_divisor"] = 2
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.json"
+            path.write_text(json.dumps(document))
+            migrated = tune.expand_candidates(tune.load_plan(path))
+        self.assertEqual(migrated[0]["config"], self.candidates[0]["config"])
+        config = dict(self.candidates[0]["config"], reduce_cta_divisor=2)
+        with self.assertRaises(tune.PlanError):
+            tune.validate_tuning(config)
+
+    def test_removed_compute_return_path_is_rejected(self):
+        config = dict(self.candidates[0]["config"], relay_local_return=False)
+        with self.assertRaisesRegex(tune.PlanError, "relay_local_return=true"):
+            tune.validate_tuning(config)
+
     def test_default_plan_is_narrow_and_complete(self):
-        self.assertEqual(self.plan["schema"], 2)
+        self.assertEqual(self.plan["schema"], 3)
         self.assertIn("jit", self.plan)
         self.assertNotIn("build", self.plan)
         self.assertEqual(self.plan["jit"]["architecture"], "sm_90a")
         self.assertEqual(self.plan["selection"], {
             "confirmation_candidates": 2,
             "confirmation_repeats": 2,
-            "confirmation_rounds": 110,
+            "confirmation_rounds": 60,
             "minimum_improvement_percent": 0.5,
         })
-        self.assertEqual(len(self.candidates), 7)
+        self.assertEqual(len(self.candidates), 96)
         self.assertLessEqual(len(self.candidates), self.plan["max_candidates"])
         for candidate in self.candidates:
             self.assertEqual(set(candidate["config"]),
@@ -60,9 +181,10 @@ class ForwardAutotuneTest(unittest.TestCase):
 
     def test_world8_plan_is_narrow_and_unique(self):
         plan = tune.load_plan(
-            ROOT / "configs" / "forward_h200_world8_autotune.json")
+            ROOT / "configs" / "forward_h200_single_node_autotune.json",
+            model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
         candidates = tune.expand_candidates(plan)
-        self.assertEqual(len(candidates), 4)
+        self.assertEqual(len(candidates), 128)
         selected = candidates[0]["config"]
         self.assertEqual(selected["rdma_ctas"], 0)
         self.assertEqual(selected["relay_ctas"], 16)

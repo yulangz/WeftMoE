@@ -23,23 +23,21 @@ __device__ __forceinline__ bool wait_for_count(
 // One-node split Forward has Relay and Compute in independent grids, but no
 // RDMA/completion-vector roles.  Relay CTA 0 performs the same fixed terminal
 // agreement only after every local Return owner and every Reduce role has
-// released its counter.  No grid-wide barrier is introduced, and the GIN
-// finalizer below remains unchanged.
+// released its counter. Idle transport consumers are covered by the separate
+// completed-token count. No grid-wide barrier is introduced.
 __device__ __forceinline__ void local_split_transport_finalize(
     const ForwardKernelArgs &a,
     persistent_v3::ForwardPipelineControl &control,
     unsigned long long *scheduler, TransportDeviceStatus *status) {
-  if (threadIdx.x == 0U)
-    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
-        control.rdma_return_roles_complete.value, 1ULL);
-  __syncthreads();
   if (blockIdx.x != 0U)
     return;
 
   if (threadIdx.x == 0U) {
     wait_for_count(a, control.rdma_return_roles_complete,
                    a.forward_relay_cta_count);
-    status->return_complete_clock = device_globaltimer_ns();
+    if (a.forward_dynamic_reduce_queue)
+      wait_for_count(a, control.reduce_tokens_complete,
+                     a.dispatch.identity.num_tokens);
     wait_for_count(a, control.compute_reduce_roles_complete,
                    a.forward_reduce_cta_count);
     forward_publish_progress(a, kForwardReturnObserved, scheduler[3]);
@@ -96,13 +94,13 @@ __device__ __forceinline__ void split_transport_finalize(
     transport_state::GenerationCompletionVector *completion,
     unsigned long long *scheduler, TransportDeviceStatus *status) {
   // Receive-completion CTA 0 publishes the rank-wide terminal epoch after all
-  // eight marker scanners have published their chunks. RDMA CTA 0 may still be
+  // Relay workers have finished the shared chunk pool. RDMA CTA 0 may still be
   // waiting for unrelated outbound put completion and must not lengthen the
   // per-token Reduce dependency.
   if (blockIdx.x == persistent_v3::kRdmaCtaCount) {
     if (threadIdx.x == 0U)
       wait_for_count(a, control.return_receive_roles_complete,
-                     persistent_v3::kRdmaCtaCount);
+                     a.forward_relay_cta_count);
     __syncthreads();
 
     const auto remote_fanout =
@@ -156,7 +154,9 @@ __device__ __forceinline__ void split_transport_finalize(
   if (threadIdx.x == 0U) {
     wait_for_count(a, control.rdma_return_roles_complete,
                    persistent_v3::kRdmaCtaCount);
-    status->return_complete_clock = device_globaltimer_ns();
+    if (a.forward_dynamic_reduce_queue)
+      wait_for_count(a, control.reduce_tokens_complete,
+                     a.dispatch.identity.num_tokens);
     wait_for_count(a, control.compute_reduce_roles_complete,
                    a.forward_reduce_cta_count);
     wait_for_count(a, control.source_ready_published, 1ULL);

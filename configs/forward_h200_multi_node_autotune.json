@@ -1,0 +1,155 @@
+{
+  "1_gemm": {
+    "tile_m": [
+      128
+    ],
+    "fc1_tile_n": [
+      128,
+      64
+    ],
+    "fc2_tile_n": [
+      256,
+      128
+    ],
+    "tile_k": [
+      64
+    ],
+    "fc1_stages": [
+      4
+    ],
+    "fc2_stages": [
+      4
+    ],
+    "compute_threads": [
+      384
+    ],
+    "math_warpgroups": [
+      2
+    ],
+    "producer_warpgroups": [
+      1
+    ],
+    "math_registers": [
+      232
+    ],
+    "producer_registers": [
+      40
+    ],
+    "wgmma_wait_group": [
+      0
+    ],
+    "fc2_store_atom_n": [
+      64
+    ],
+    "cluster_size": [
+      2
+    ],
+    "fc2_tma_store": [
+      true
+    ]
+  },
+  "2_transport": {
+    "rdma_ctas": [
+      8
+    ],
+    "relay_ctas": [
+      8,
+      16,
+      24
+    ],
+    "rdma_control_warps": [
+      2
+    ],
+    "relay_tma_warps": [
+      8,
+      0
+    ],
+    "local_dispatch_tma_warps": [
+      12,
+      8
+    ],
+    "relay_scatter_warps": [
+      12
+    ],
+    "local_return_batch_mblocks": [
+      4,
+      8
+    ],
+    "dispatch_publish_batch_rows": [
+      32
+    ],
+    "return_chunk_rows": [
+      256
+    ],
+    "return_max_inflight": [
+      16
+    ],
+    "registered_output": [
+      true
+    ],
+    "relay_local_return": [
+      true
+    ]
+  },
+  "3_scheduler": {
+    "local_route_batch_rows": [
+      128
+    ],
+    "startup_mblocks": [
+      2
+    ],
+    "fc1_locality_group": [
+      2
+    ],
+    "fc1_locality_group4_begin": [
+      4
+    ],
+    "fc1_locality_group4_end": [
+      12
+    ],
+    "fc2_priority_burst": [
+      0
+    ],
+    "task_claim_chunk": [
+      1
+    ],
+    "task_idle_nanosleep": [
+      64
+    ],
+    "transport_idle_nanosleep": [
+      64
+    ],
+    "setup_nanosleep": [
+      256
+    ]
+  },
+  "4_completion_reduce": {
+    "completion_chunks_per_pass": [
+      1
+    ],
+    "completion_marker_warps": [
+      1
+    ],
+    "reduce_scheduler": [
+      "queue"
+    ],
+    "reduce_warps": [
+      12
+    ],
+    "reduce_tokens_per_claim": [
+      12
+    ],
+    "reduce_registers": [
+      168
+    ],
+    "return_idle_nanosleep": [
+      32
+    ],
+    "reduce_queue_nanosleep": [
+      128
+    ],
+    "finalize_nanosleep": [
+      128
+    ]
+  }
+}
