@@ -14,6 +14,23 @@
 
 namespace weftmoe::cuda::internal {
 
+// Prepare before launching mutually dependent persistent kernels. Growing the
+// per-thread stack at a later kernel launch can wait for an already-running
+// kernel, which may itself be waiting for the kernel being launched. The local
+// storage requirement is a conservative bound for these nonrecursive kernels.
+// Preserve a larger limit established by the application.
+inline cudaError_t prepare_kernel_stack(const void *kernel) {
+  cudaFuncAttributes attributes{};
+  auto error = cudaFuncGetAttributes(&attributes, kernel);
+  if (error != cudaSuccess || attributes.localSizeBytes == 0U)
+    return error;
+  std::size_t current = 0;
+  error = cudaDeviceGetLimit(&current, cudaLimitStackSize);
+  if (error != cudaSuccess || current >= attributes.localSizeBytes)
+    return error;
+  return cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes);
+}
+
 enum class CudaApiAuditKind {
   DeviceAllocate,
   DeviceFree,

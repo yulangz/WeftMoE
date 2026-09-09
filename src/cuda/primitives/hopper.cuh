@@ -1,7 +1,7 @@
 #pragma once
 
 // Descriptor/address and array adapters derived from DeepGEMM (MIT).
-// See LICENSES/DeepGEMM-MIT.txt at the repository root. Instructions are provided by CuTe/CUTLASS.
+// Instructions are provided by CuTe/CUTLASS.
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>

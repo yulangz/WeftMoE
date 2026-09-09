@@ -188,6 +188,7 @@ local_route_count(const BackwardKernelArgs &a) {
 #include "cuda/persistent_v3/backward/gin_pipeline.cuh"
 
 __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
+  backward_load_row_geometry(a);
   using namespace backward_pipeline_detail;
   if (blockIdx.x != 0U)
     return;
@@ -285,6 +286,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
 // workers instead of opportunistically co-residing on compute SMs.
 __global__ __launch_bounds__(backward_tuning::kComputeThreads, 1) void
 backward_local_transport_kernel(BackwardKernelArgs a) {
+  backward_load_row_geometry(a);
   using namespace backward_pipeline_detail;
   extern __shared__ __align__(1024) unsigned char reservation[];
 #if __has_include(<nccl_device.h>)
@@ -605,6 +607,7 @@ backward_local_compute_kernel(
     const __grid_constant__ CUtensorMap dx_store_map,
     const __grid_constant__ CUtensorMap dw2_store_map,
     const __grid_constant__ CUtensorMap dw1_store_map) {
+  backward_load_row_geometry(a);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   using namespace backward_pipeline_detail;
   static_assert(backward_tuning::kMainIntermediate % DabTileN == 0U);

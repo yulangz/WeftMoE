@@ -220,6 +220,10 @@ public:
   const ActivationTransportExpectation &identity() const;
   const ForwardMegaKernelAudit &audit() const;
   const ForwardMegaKernelTimings &timings() const;
+  // enqueue() returns before GPU completion. wait() collects diagnostics;
+  // wait_on() only inserts a GPU dependency on the caller's stream.
+  void wait() const;
+  void wait_on(CUstream_st *stream) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -297,6 +301,13 @@ public:
       const NcclSession &session, const CudaExecution &execution,
       const ActivationTransportResourcePool &pool);
 
+  DeviceForwardHandle enqueue(
+      const DeviceDispatchHandle &dispatch,
+      const BFloat16ActivationLease &activations,
+      const ForwardWeightLease &weights,
+      const ForwardMegaKernelConfig &config,
+      const ActivationTransportRunOptions &options = {});
+
   DeviceForwardHandle run(
       const DeviceDispatchHandle &dispatch,
       const BFloat16ActivationLease &activations,
@@ -325,6 +336,11 @@ class GinRdmaForwardMegaKernel {
 public:
   GinRdmaForwardMegaKernel(const NcclSession &, const CudaExecution &,
                            const ActivationTransportResourcePool &);
+  DeviceForwardHandle enqueue(
+      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
+      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
+      const ActivationTransportRunOptions & = {});
+
   DeviceForwardHandle run(
       const DeviceDispatchHandle &, const BFloat16ActivationLease &,
       const ForwardWeightLease &, const ForwardMegaKernelConfig &,

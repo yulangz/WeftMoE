@@ -69,9 +69,6 @@
 #ifndef WEFTMOE_FWD_RDMA_CTAS
 #define WEFTMOE_FWD_RDMA_CTAS 8
 #endif
-#ifndef WEFTMOE_FWD_RELAY_CTAS
-#define WEFTMOE_FWD_RELAY_CTAS 8
-#endif
 #ifndef WEFTMOE_FWD_RDMA_CONTROL_WARPS
 #define WEFTMOE_FWD_RDMA_CONTROL_WARPS 2
 #endif
@@ -162,6 +159,14 @@
 #endif
 
 namespace weftmoe::cuda::forward_tuning {
+// Untuned single-node defaults favor enough transport workers for Ling-sized
+// workloads. Explicit tuning overrides apply to either topology unchanged.
+#ifndef WEFTMOE_FWD_RELAY_CTAS
+#define WEFTMOE_FWD_RELAY_CTAS 24
+inline constexpr std::uint32_t kRemoteRelayCtas = 8;
+#else
+inline constexpr std::uint32_t kRemoteRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
+#endif
 
 inline constexpr std::uint32_t kMainHidden = WEFTMOE_FWD_MAIN_HIDDEN;
 inline constexpr std::uint32_t kMainIntermediate =

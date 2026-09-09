@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from autotune_common import (
+    DEFAULT_COMPILE_JOBS, DEFAULT_TUNE_ROUNDS, DEFAULT_FINAL_ROUNDS,
+    configure_preparation, environment_autotune_config,
     resolve_runtime_settings,
     resolve_parallel_settings,
     constrain_transport_space,
@@ -221,12 +223,12 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
         "benchmark contains model/system fields or unknown settings")
     return dict(schema=1, max_candidates=4096, fixed=fixed, candidates=candidates,
         invariants=copy.deepcopy(EXPECTED_INVARIANTS),
-        jit=dict(cache_root="artifacts/backward-jit", jobs=8, architecture="sm_90a",
+        jit=dict(cache_root="artifacts/backward-jit", jobs=DEFAULT_COMPILE_JOBS, architecture="sm_90a",
                  timeout_seconds=1800) | jit_overrides,
         selection=dict(confirmation_candidates=min(2, count), confirmation_repeats=2,
-                       confirmation_rounds=60, minimum_improvement_percent=0.5),
+                       confirmation_rounds=DEFAULT_FINAL_ROUNDS, minimum_improvement_percent=0.5),
         benchmark=dict(seed=0x4D554C54, tokens_per_rank=8192, top_k=model["top_k"],
-            experts=model["experts"], tune_rounds=30, final_rounds=110, timeout_seconds=600,
+            experts=model["experts"], tune_rounds=DEFAULT_TUNE_ROUNDS, final_rounds=DEFAULT_FINAL_ROUNDS, timeout_seconds=600,
             preflight_world=8, preflight_tokens=8,
             selection_metric="total_slowest_rank_us.mean", result_dir="artifacts/backward-autotune")
             | topology | workload)
@@ -240,6 +242,9 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     require(isinstance(document, dict), "top-level plan must be an object")
+    if "backward" in document:
+        document = document["backward"]
+        require(isinstance(document, dict), "phase search space must be an object")
     if "schema" in document and any(k in (system or {}) for k in ("ep", "nodes", "gpus_per_node")):
         requested = resolve_parallel_settings(system)
         frozen = document.get("benchmark", {})
@@ -673,6 +678,7 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exact-tokens", action="store_true", help="tune the exact token count instead of the 64/8192/65536 bucket representative")
     parser.add_argument("--config", type=Path, help="hyperparameter file; default chosen from topology")
     parser.add_argument("--ep", type=int, help="EP world size; must equal nodes * gpus-per-node")
     parser.add_argument("--nodes", type=int, help="node count (default: 1, or ep / gpus-per-node)")
@@ -717,12 +723,13 @@ def main(argv: list[str] | None = None) -> int:
             system[key] = getattr(args, key)
     parallel = resolve_parallel_settings(system)
     topology_name = "single_node" if parallel["nodes"] == 1 else "multi_node"
-    config_path = (args.config or REPO_ROOT / "configs" /
+    config_path = (args.config or environment_autotune_config() or REPO_ROOT / "configs" /
                    f"backward_h200_{topology_name}_autotune.json").resolve()
     plan = load_plan(config_path, model=model, system=system,
                      benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None)
     if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher") == "multinode":
         require(bool(plan["benchmark"].get("remote")), "multinode benchmark requires --remote or system.remote")
+    configure_preparation(plan, "backward", exact_tokens=args.exact_tokens)
     _configure_from_cli(plan, args)
     if not args.generate_only and not args.build_only:
         validate_execution_topology(plan["benchmark"])
@@ -847,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
     for ordinal, item in enumerate(benchmarkable, 1):
         candidate = candidate_by_name[item["name"]]
         print(f"[tune {ordinal}/{len(benchmarkable)}] {item['name']}: "
-              f"{benchmark['tune_rounds']} rounds", flush=True)
+              f"{benchmark['tune_rounds']} rounds (including 10 warmup)", flush=True)
         tune = benchmark_candidate(
             candidate, Path(item["build"]["binary"]), benchmark, log_dir,
             environment, rounds=int(benchmark["tune_rounds"]),
@@ -896,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             candidate = candidate_by_name[item["name"]]
             print(f"[confirm {repeat + 1}/{repeats}] {item['name']}: "
-                  f"{selection['confirmation_rounds']} rounds", flush=True)
+                  f"{selection['confirmation_rounds']} rounds (including 10 warmup)", flush=True)
             confirmation = benchmark_candidate(
                 candidate, Path(item["build"]["binary"]), benchmark, log_dir,
                 environment, rounds=int(selection["confirmation_rounds"]),

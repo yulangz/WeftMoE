@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
+# Native benchmark round counts include warmup iterations.
+DEFAULT_COMPILE_JOBS = 16
+BENCHMARK_WARMUP_ROUNDS = 10
+DEFAULT_TUNE_ROUNDS = BENCHMARK_WARMUP_ROUNDS + 15
+DEFAULT_FINAL_ROUNDS = BENCHMARK_WARMUP_ROUNDS + 30
+
+
 class PlanError(ValueError):
     """An explicit tuning plan is incomplete or internally inconsistent."""
 
@@ -311,3 +318,32 @@ def resolve_runtime_settings(*, model: Mapping[str, Any] | None,
         if libraries:
             topology["runtime_library_path"] = ":".join(libraries)
     return topology, jit_overrides
+
+
+# CLI and future framework adapters use the same runtime settings.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from weftmoe.config import RuntimeSettings, token_bucket
+
+
+def configure_preparation(plan, phase, *, exact_tokens=False):
+    settings = RuntimeSettings.from_environment()
+    plan["jit"]["cache_root"] = str(settings.compile_directory(phase))
+    plan["benchmark"]["result_dir"] = str(settings.tune_directory(phase))
+    requested = plan["benchmark"]["tokens_per_rank"]
+    try:
+        bucket = token_bucket(requested)
+    except ValueError as error:
+        if not exact_tokens:
+            raise PlanError(str(error)) from error
+        bucket = None
+    if not exact_tokens:
+        plan["benchmark"]["tokens_per_rank"] = bucket.tune_tokens
+        print(f"token bucket: requested={requested}, interval=[{bucket.lower}, {bucket.upper}], "
+              f"tune_tokens={bucket.tune_tokens}", flush=True)
+    plan["benchmark"]["requested_tokens_per_rank"] = requested
+    plan["benchmark"]["token_bucket"] = (
+        {"lower": bucket.lower, "upper": bucket.upper} if bucket and not exact_tokens else None)
+
+
+def environment_autotune_config():
+    return RuntimeSettings.from_environment().autotune_config

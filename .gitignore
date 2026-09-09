@@ -5,3 +5,7 @@ __pycache__/
 
 /benchmarks/results/
 /docs/
+/dist/
+/*.egg-info/
+/weftmoe/lib/
+/weftmoe/include/

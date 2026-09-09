@@ -1,153 +1,120 @@
-# WeftMoE autotune 配置
+# Autotune Configuration Reference
 
-这四份 JSON 只描述超参数候选。模型由 Python/CLI 传入，拓扑由调用方显式指定，系统环境可使用独立的 `--system-config`。不要把 hidden、intermediate、experts、top-k、tokens 或网络接口写进搜索空间。
+The configuration files define kernel hyperparameter search spaces for forward
+and backward execution on single-node and multi-node systems. Input dimensions
+and parallel topology are supplied separately by the caller. Compiler, library,
+and network settings are not kernel hyperparameters.
 
-## 默认搜索空间
+Each parameter contains a nonempty array of candidate values. The first values
+form the incumbent configuration; the Cartesian product defines the search
+space. A single value fixes a parameter for that search. Supported values and
+parameter combinations are checked by the autotuner before benchmarking.
 
-每个参数是非空数组：第一项共同组成 incumbent（基准候选），多值参数按笛卡尔积展开。单值表示保留当前选择，不表示实现只支持这个值。候选在测试前一次性确定，不根据中途结果追加候选。
+FWD denotes forward execution; BWD denotes backward execution. A CTA is a CUDA
+thread block. A warp contains 32 threads, and a warpgroup contains four warps.
+An M-block is a block of routed rows belonging to one expert.
 
-| 文件 | 组合数 | 多候选参数 |
-|---|---:|---|
-| [forward_h200_single_node_autotune.json](forward_h200_single_node_autotune.json) | 10 | Relay 8/16/24/32/40；local Return TMA warp 0/8 |
-| [forward_h200_multi_node_autotune.json](forward_h200_multi_node_autotune.json) | 10 | Relay 8/16/24/32/40；local Return TMA warp 8/0 |
-| [backward_h200_single_node_autotune.json](backward_h200_single_node_autotune.json) | 10 | Relay 8/16/24/32/40；Dispatch batch 16/32 |
-| [backward_h200_multi_node_autotune.json](backward_h200_multi_node_autotune.json) | 40 | Relay 8/16/24/32/40；Dispatch batch 64/32；dAB、dX tile N 各 256/128 |
+## GEMM Parameters (`1_gemm`)
 
-每份默认文件不超过 80 个组合。默认收窄历史收益不明显的 owner group、reduce threads、流水线阶段数等轴，保留参数供定向实验使用。修改多个轴时先计算组合数；阶段数等有配对约束，不能任意独立展开。
+Tile dimensions determine work granularity and data reuse. Pipeline stages
+control how many input buffers can overlap data movement with computation.
+Larger tiles or deeper pipelines can improve reuse, but also increase resource
+requirements and reduce scheduling flexibility.
 
-## 运行方式
-
-从仓库根目录运行 Ling 单机 EP8（tokens 是每 rank 的输入 token 数）：
-
-```bash
-OUT="artifacts/ling_autotune_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$OUT"
-for T in 8192 65536; do
-  for phase in forward backward; do
-    python3 "tools/autotune_${phase}.py" \
-      --nodes 1 --gpus-per-node 8 \
-      --config "configs/${phase}_h200_single_node_autotune.json" \
-      --hidden 2560 --intermediate 768 --experts 512 --top-k 8 \
-      --tokens "$T" --jobs 8 \
-      --output "$OUT/${phase}_ep8_t${T}.json"
-  done
-done
-```
-
-加 `--generate-only` 只展开并校验候选，不运行 GPU；`--build-only --candidate incumbent` 只编译指定候选。不要同时启动多组 GPU 性能测试。
-
-多机改用 `--nodes 2 --gpus-per-node 8 --remote root@HOST --port 2222` 和对应 multi_node 文件；也可用 `--ep 16` 代替 `--nodes 2`。不传 `--config` 时按阶段和节点数选默认文件。
-
-`EP = nodes × gpus_per_node`，缺省为单机八卡。配置文件名、`rdma_ctas` 和 remote 地址均不决定 EP。单机展开候选前自动将 `rdma_ctas` 设为 0，不改原文件。当前多机要求八个 GIN owner，`rdma_ctas=8` 与节点数不是同一个概念。计划可以表达更多节点，但当前 GIN 协议和 launcher 实际只支持两机各八卡；更大拓扑仅可生成/编译计划，性能执行会报错。
-
-默认筛选为 10 轮预热 + 20 轮计时；incumbent 和最快 challenger 按正反顺序确认，每次 10 + 50 轮；改善不足 0.5% 时保留 incumbent，最终验证为 10 + 100 轮。以输出 JSON 的实际候选和计时为准。编译通过不代表该配置已完成性能或正确性验证。
-
-## GEMM 参数（1_gemm）
-
-一个 CTA 当前由两个 math warpgroup 和一个 producer warpgroup 组成；一个 warpgroup 有 128 个线程。producer 搬运下一批输入，math 执行 WGMMA。tile 和阶段数共同影响寄存器、共享内存、任务粒度与数据复用。
-
-| 参数 | 阶段 | 作用 |
+| Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `tile_m`、`tile_k` | FWD/BWD | 激活 GEMM 的 M tile 和 K 流水线步长，默认 128、64。 |
-| `fc1_tile_n`、`fc2_tile_n` | FWD | 两层 GEMM 的 N tile。更宽不必然更快，要考虑模型维度、寄存器与复用。 |
-| `dab_tile_n`、`dx_tile_n` | BWD | dAB 前置 GEMM 与 dX GEMM 的 N tile。单机默认均为 256。 |
-| `dw_tile_m`、`dw_tile_n` | BWD | 权重梯度 GEMM 的输出 tile，默认 128×256。 |
-| `fc1_stages`、`fc2_stages` | FWD | 各 GEMM 的输入流水线缓冲级数。 |
-| `dab_stages`、`dx_stages`、`dw1_stages`、`dw2_stages` | BWD | 各 GEMM 的缓冲级数；当前要求 dAB=dX、dW1=dW2。增加阶段会增加共享内存。 |
-| `compute_threads`、`math_warpgroups`、`producer_warpgroups` | FWD/BWD | CTA 线程数与角色划分；默认 384、2、1，是当前实现约束，不宜独立修改。 |
-| `math_registers`、`producer_registers` | FWD/BWD | 各角色的 `setmaxnreg` 寄存器预算请求。不是实际寄存器使用量，编译器可能忽略请求；须查看编译产物。 |
-| `wgmma_wait_group` | FWD | WGMMA wait 时允许尚未完成的提交组数；影响流水线重叠与依赖。 |
-| `fc2_store_atom_n` | FWD | FC2 输出 TMA store 的 N 方向分块宽度。 |
-| `cluster_size` | FWD | CTA cluster 大小，影响协作调度和资源约束。 |
-| `fc2_tma_store` | FWD | 使用共享内存暂存并由 TMA 写出 FC2 结果；当前默认 true。 |
+| `tile_m` | FWD/BWD | Row dimension of activation GEMM tiles. Padding and the number of available row blocks affect utilization. Keep the default unless evaluating another supported tile shape. |
+| `tile_k` | FWD/BWD | Reduction-dimension step of the GEMM pipeline. The current implementation uses 64 to match its shared-memory layout. |
+| `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Wider tiles can improve reuse but increase register pressure and reduce the number of independently schedulable tasks. |
+| `dab_tile_n`, `dx_tile_n` | BWD | Output-column dimensions of the activation-gradient and input-gradient GEMMs. Start with 256 for both; evaluate narrower tiles when dimensions or task parallelism warrant it. Narrower tiles do not necessarily reduce register usage. |
+| `dw_tile_m`, `dw_tile_n` | BWD | Output-tile dimensions of the weight-gradient GEMMs. Larger tiles reuse more input data but require more accumulator storage. |
+| `fc1_stages`, `fc2_stages` | FWD | Number of input-buffer stages for each forward GEMM. More stages can hide load latency at the cost of shared memory. Change only supported stage pairs. |
+| `dab_stages`, `dx_stages` | BWD | Input-buffer stages for activation-gradient and input-gradient GEMMs. These values must match in the current implementation. |
+| `dw1_stages`, `dw2_stages` | BWD | Input-buffer stages for the two weight-gradient GEMMs. These values must match in the current implementation. |
+| `compute_threads` | FWD/BWD | Threads per compute CTA. The current implementation requires 384. |
+| `math_warpgroups` | FWD/BWD | Warpgroups assigned to matrix computation. The current implementation requires two. |
+| `producer_warpgroups` | FWD/BWD | Warpgroups assigned to staging operands. The current implementation requires one. |
+| `math_registers`, `producer_registers` | FWD/BWD | Per-thread register budget requests for the corresponding roles. These are allocation requests, not measured register counts; inspect compiler resource usage when changing them. |
+| `wgmma_wait_group` | FWD | Number of outstanding WGMMA groups permitted at a wait point. Controls the balance between pipeline overlap and operand or accumulator dependencies. |
+| `fc2_store_atom_n` | FWD | Column width of the FC2 output TMA store atom. Determines the granularity of output stores. |
+| `cluster_size` | FWD | Number of CTAs in a compute cluster. Affects cooperative scheduling, TMA multicast, and residency constraints. |
+| `fc2_tma_store` | FWD | Enables FC2 output stores through shared-memory staging and TMA. Keep enabled as the starting point; its supported stage and cluster combinations are constrained. |
 
-## 通信参数（2_transport）
+## Transport Parameters (`2_transport`)
 
-单机也需要通信 CTA：路由后的激活/梯度仍要在八张卡之间 Dispatch 和 Return。Relay 越多，通信可并行处理的任务越多，同时可用计算资源越少。
+Relay CTAs handle node-local data movement and associated progress work. RDMA
+CTAs handle inter-node GIN communication. Increasing transport concurrency can
+improve operand delivery and return progress, but leaves fewer SMs available
+for compute workers.
 
-| 参数 | 阶段 | 作用 |
+| Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `rdma_ctas` | FWD/BWD | 跨节点 GIN 通信角色数量。单机为 0，多机当前为 8。 |
-| `relay_ctas` | FWD/BWD | 节点内搬运及相关进度推进的 CTA 数。重点调优轴；仍受对齐、最低数量和 SM 驻留限制，不是任意整数。 |
-| `rdma_control_warps` | FWD | RDMA CTA 中负责控制/推进的 warp 数，其余 warp 负责数据打包等工作。 |
-| `local_dispatch_tma_warps` | FWD | 每个 Relay CTA 用于节点内 Dispatch 的 TMA 复制 warp 数；单机还须为 ready 发布保留 warp。 |
-| `local_return_tma_warps` | FWD | 节点内 Return 的 TMA 复制 warp 数；0 使用向量复制。入口兼容旧名 `relay_tma_warps`，同一配置不能同时给两个名字；内部缓存键暂保留旧名。 |
-| `relay_scatter_warps` | FWD | Relay scatter 搬运使用的 warp 数。 |
-| `local_return_batch_mblocks` | FWD | 节点内 Return 每批处理的 M-block 数。增大可摊薄领取开销，但会延后其它任务。 |
-| `dispatch_publish_batch_rows` | FWD | Dispatch 到达状态分批发布的行数，平衡原子操作开销与计算启动延迟。 |
-| `return_chunk_rows` | FWD | 跨节点 Return 的 chunk 行数，影响发送/完成跟踪粒度。 |
-| `return_max_inflight` | FWD | Return 的在途窗口上限，平衡发送并行度与资源占用；0 关闭该窗口限制。 |
-| `registered_output` | FWD | 将 FC2 输出放在 GIN 注册窗口中，便于直接发送；GIN 的 FC2 TMA store 要求 true。 |
-| `relay_local_return` | FWD | 由 Relay 处理节点内 Return；当前支持路径要求 true，不作为性能搜索轴。 |
-| `dispatch_batch_rows` | BWD | Relay 每次领取的路由行数；摊薄领取/发布开销，但大 batch 会延后 Return 等任务的服务。 |
-| `gin_max_inflight` | BWD | GIN 传输的在途请求上限，仅影响跨节点路径。 |
-| `setup_threads` | BWD | 初始化/准备 kernel 的线程数。 |
-| `setup_idle_nanosleep` | BWD | 准备阶段等待时的退避参数。 |
+| `rdma_ctas` | FWD/BWD | Number of inter-node GIN communication CTAs. Single-node execution sets this to 0. The current GIN implementation uses 8; this is not the number of nodes or the EP size. |
+| `relay_ctas` | FWD/BWD | Number of CTAs assigned to node-local transport. For small hidden dimensions, include larger values such as 24, 32, and 40: transport progress can limit throughput even on one node. Stop increasing the count when reduced compute capacity outweighs faster transport. Counts remain subject to alignment and residency constraints. |
+| `rdma_control_warps` | FWD | Warps assigned to RDMA issue and completion control. The current protocol requires two. |
+| `local_dispatch_tma_warps` | FWD | Warps per relay CTA used for node-local dispatch copies. More copy streams increase concurrency but compete with progress and readiness publication work. |
+| `local_return_tma_warps` | FWD | Warps used for node-local return TMA copies. A value of 0 selects vector copies. Comparing 0 and 8 is a useful initial search; more TMA streams are not always faster end to end. |
+| `relay_scatter_warps` | FWD | Warps assigned to relay scatter copies. Controls parallelism within a scatter task. |
+| `local_return_batch_mblocks` | FWD | Maximum M-blocks processed in one local return batch. Larger batches amortize scheduling overhead but can delay service of other ready work. |
+| `dispatch_publish_batch_rows` | FWD | Row granularity for publishing dispatch arrival progress. Smaller batches expose compute work sooner; larger batches reduce publication overhead. |
+| `return_chunk_rows` | FWD | Row granularity of inter-node return chunks. Controls transfer and completion-tracking granularity. Chunks must preserve the padded M-block layout. |
+| `return_max_inflight` | FWD | Limit on the return in-flight window. Larger windows allow more outstanding work but consume more tracking resources. A value of 0 disables this window limit. |
+| `registered_output` | FWD | Places FC2 output in the GIN-registered output region for direct transfer. Required by the GIN FC2 TMA store path. |
+| `relay_local_return` | FWD | Assigns local return processing to relay CTAs. Keep enabled; the current supported path requires it. |
+| `dispatch_batch_rows` | BWD | Routed rows claimed in one relay dispatch batch. Start with 16 or 32 for node-local execution. Larger batches can reduce scheduling overhead, while smaller batches improve responsiveness to return work. |
+| `gin_max_inflight` | BWD | Maximum outstanding GIN requests. Relevant only to inter-node communication. Increase when insufficient outstanding work limits transfer throughput. |
+| `setup_threads` | BWD | Threads per setup CTA. Controls parallelism in pipeline initialization. |
+| `setup_idle_nanosleep` | BWD | Backoff hint while setup waits for progress. Keep the default unless initialization waiting is significant. |
 
-## 调度参数（3_scheduler）
+## Scheduler Parameters (`3_scheduler`)
 
-| 参数 | 阶段 | 作用 |
+Scheduler parameters balance queue contention, weight reuse, and how quickly
+newly ready work can execute. Larger batches or locality groups can reduce
+scheduling overhead while increasing the time other tasks spend waiting.
+
+| Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `local_route_batch_rows` | FWD | 节点内 Dispatch 路由工作分配的批大小。 |
-| `startup_mblocks` | FWD | 每个 expert 最前面直接启动的 M-block 数，降低首批计算等待。 |
-| `fc1_locality_group` | FWD | 后续相邻 M-block 的 FC1 发布分组大小，让相同 N tile 接近执行以复用 W1/L2；更大也可能造成 FC2/Return 突发。 |
-| `fc1_locality_group4_begin`、`fc1_locality_group4_end` | FWD | 当 locality_group=2 时，在 expert 内 M-block 索引的 `[begin,end)` 中间区间改用四块分组。默认 `[4,12)`；不是 expert ID 或 GPU 分组。首批仍由 startup_mblocks 控制。 |
-| `fc2_priority_burst` | FWD | 优先连续领取 FC2 的次数限制；0 不限制该连续优先策略。 |
-| `task_claim_chunk` | FWD | 每次领取的计算任务数，权衡原子领取开销与负载均衡。 |
-| `task_idle_nanosleep`、`transport_idle_nanosleep`、`setup_nanosleep` | FWD | 计算、通信、准备阶段空闲轮询时的退避参数。 |
-| `queue_idle_nanosleep` | BWD | 计算 ready 队列无任务时的退避。 |
-| `ready_word_stagger` | BWD | 非零时让不同 CTA 从不同 bitmap word 开始扫描；分散竞争，但可能降低相邻 expert 任务的 L2 复用。 |
-| `activation_owner_group` | BWD | dAB/dX 在相邻 ready owner 的小组内分散领取；owner 对应 M-block，不是通信 owner。默认 4，兼顾竞争和权重复用。 |
-| `epilogue_rows_per_task` | BWD | 每个激活 epilogue 任务处理的行数，影响非 GEMM 计算粒度。 |
-| `dw2_claim_tiles`、`dw1_claim_tiles` | BWD | dW 领取/执行的分块粒度；更大摊薄调度开销，但会影响其它任务的及时推进。 |
+| `local_route_batch_rows` | FWD | Number of local dispatch routes assigned per batch. Larger batches reduce claim overhead but can increase load imbalance. |
+| `startup_mblocks` | FWD | Initial M-blocks per expert published without waiting for subsequent locality groups. Controls how quickly the first compute work becomes available. |
+| `fc1_locality_group` | FWD | Groups adjacent M-blocks when publishing FC1 work to encourage reuse of the same weight tiles in L2. Larger groups can improve reuse but delay FC2 and return progress. |
+| `fc1_locality_group4_begin`, `fc1_locality_group4_end` | FWD | Expert-local M-block interval `[begin, end)` that uses groups of four when the base locality group is two. These are row-block indices, not expert IDs or GPU groups. A bounded middle interval preserves finer scheduling near startup and completion. |
+| `fc2_priority_burst` | FWD | Limit on consecutive priority FC2 task claims. A value of 0 leaves this priority burst unlimited. Smaller finite bursts allow FC1 work to receive service more frequently. |
+| `task_claim_chunk` | FWD | Compute tasks claimed per queue operation. The current implementation supports one task per claim. |
+| `task_idle_nanosleep` | FWD | Backoff hint for idle compute-task polling. |
+| `transport_idle_nanosleep` | FWD | Backoff hint for idle transport polling. |
+| `setup_nanosleep` | FWD | Backoff hint during setup waits. |
+| `queue_idle_nanosleep` | BWD | Backoff hint when no compute-ready task is available. |
+| `ready_word_stagger` | BWD | Starts different CTAs at different ready-bitmap words when enabled. Can reduce contention, but may weaken locality between related tasks. |
+| `activation_owner_group` | BWD | Group size for distributing activation-gradient task claims among neighboring ready M-block owners. These are compute-work owners, not communication ranks. Start with 4 to balance contention and weight reuse. |
+| `epilogue_rows_per_task` | BWD | Rows processed per activation epilogue task. Controls the granularity of non-GEMM activation-gradient work. |
+| `dw2_claim_tiles`, `dw1_claim_tiles` | BWD | Weight-gradient tile claim granularity. Larger claims amortize scheduling overhead but can delay other ready work. |
 
-所有 nanosleep 参数都是 GPU 退避提示，不是精确延迟保证。调小可能改善响应，也可能增加轮询竞争；一般最后再调。
+Nanosleep values are GPU backoff hints, not guaranteed delays. Lower values may
+improve responsiveness while increasing polling contention. Tune these after
+transport concurrency and GEMM tile choices.
 
-## 完成与规约参数（4_completion_reduce）
+## Completion and Reduction Parameters (`4_completion_reduce`)
 
-FWD 的 Return 将每个 top-k route 的结果放入源 token 的固定位置。数据可见后发布到达状态；token 的候选全部就绪后进入 reduce ready queue。空闲 CTA 可领取 token，按固定 top-k 顺序累加，保持规约顺序。跨节点接收端还要先检查 chunk 的 fragment 完成标记，再发布对应 route 的到达。完成检查和规约是不同的工作。
+In FWD, return processing makes each routed contribution available at its
+source token. Once all contributions for a token are ready, the token can enter
+the reduction queue. Idle CTAs may consume ready tokens and accumulate their
+contributions in a fixed top-k order. Inter-node return completion also checks
+fragment markers before publishing route readiness.
 
-| 参数 | 阶段 | 作用 |
+BWD uses a separate input-gradient reduction kernel after persistent transport
+completes. This reduction can overlap remaining weight-gradient computation.
+Its thread-count setting does not change the main compute-worker allocation.
+
+| Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `completion_chunks_per_pass` | FWD | 每轮进度推进尝试处理的 Return completion chunk 数；过大可能挤占其它通信任务。 |
-| `completion_marker_warps` | FWD | 并行检查 fragment 完成标记的 warp 数。 |
-| `reduce_scheduler` | FWD | 规约就绪任务的发现/调度方式；默认 `queue` 使用 ready queue。 |
-| `reduce_warps` | FWD | CTA 执行规约时参与的 warp 数。 |
-| `reduce_tokens_per_claim` | FWD | 每次领取的 token 数，不超过 reduce_warps；增大可减少领取次数。 |
-| `reduce_registers` | FWD | CTA 转入规约角色时的寄存器预算请求。 |
-| `return_idle_nanosleep`、`reduce_queue_nanosleep`、`finalize_nanosleep` | FWD | Return 等待、reduce 队列等待、最终完成等待时的退避。 |
-| `reduce_threads` | BWD | dX reduce kernel 的 CTA 线程数，当前每个 warp 处理一个 token。 |
-| `reduce_idle_nanosleep` | BWD | 等待 dX route 到达时的退避。 |
-
-BWD 当前将 dX reduce 排在 persistent transport 之后，利用释放的 SM，并与尚未完成的 dW 重叠。它与 FWD 的空闲 CTA ready queue 机制不同。增大 reduce_threads 不等于增加主计算资源。
-
-## 系统配置不属于搜索空间
-
-可选系统 JSON 支持 `ep`、`nodes`、`gpus_per_node`、`remote`、`port`、`socket_ifname`、`disable_ib`（单机）、`enable_ib`（多机）、`nccl_lib_dir`、`runtime_library_path` 和 `jit` 等字段。CLI 同名值覆盖系统文件。
-
-- `socket_ifname`：NCCL socket/bootstrap 使用的网卡接口选择，不是 IB HCA/端口分流设置。
-- `disable_ib` / `enable_ib`：控制 launcher 的 NCCL IB 开关；通常采用按拓扑生成的默认值。
-- `nccl_lib_dir`：指定 NCCL 库目录；缺省会检测仓库私有库，不要求手填。
-- `runtime_library_path`：运行时动态库搜索路径覆盖，用于让 CUDA compat、NCCL、Python CUDA runtime 等加载正确版本；不是超参数。
-- `jit.cutlass_include_dir`：独立 CUTLASS 的 include 目录；也可设环境变量 `CUTLASS_INCLUDE_DIR`。不再通过 DeepGEMM Python 包寻找头文件。H200 迁移验证使用 CUTLASS 4.2.0 / CUDA 12.9，建议固定工具链版本后调优。缺省依次检查仓库的 `third_party/cutlass/include`、同级 `cutlass/include`、`/opt/cutlass/include`。
-- `jit`：编译工具、架构、并行度和缓存路径；`--jobs`、`--cache-root` 可直接指定。
-
-## 已测经验：Ling 单机需要覆盖更大的 Relay
-
-2026-09-09，单机八张 H200（驱动显示 L20X），EP8，H=2560、I=768、experts=512、top-k=8。使用 math-only accumulator 修复后的 BWD，固定 dAB/dX N=256、dW M/N=128/256、dispatch batch=16。每组正反顺序各一次，每次 10 轮预热 + 50 轮计时；表格为最慢 rank 耗时的均值。
-
-| Relay CTAs | 8K tokens/rank | 64K tokens/rank |
-|---:|---:|---:|
-| 8 | 12.220 ms | 98.130 ms |
-| 16 | 6.759 ms | 56.719 ms |
-| 24 | 5.323 ms | **54.574 ms** |
-| 32 | 5.028 ms | 56.844 ms |
-| 40 | **5.008 ms** | 59.923 ms |
-
-8K 可从 Relay=40 开始（32 仅慢约 0.4%）；64K 从 24 开始。不要把它们视为其它模型、tokens 或 EP16 的已验证最优值。本次只扫描 Relay，未重新搜索 Dispatch batch。
-
-8K 的 Dispatch 跨度随 Relay 从 8 到 40，由 11.30 ms 缩短到 3.46 ms，数据供给明显改善。64K 中 Relay 超过 24 后，Dispatch 继续缩短但总时间增加，说明必须平衡通信与计算资源。单机不等于无需通信；默认候选应覆盖 32、40 等较大的 Relay。
-
-旧 BWD 的 128/128 激活 tile 搭配 dW N256 曾发生严重寄存器溢出，math-only 作用域修复消除了本次所测编译产物的 LDL/STL。修复前的计算瓶颈掩盖了 Relay 调优收益，不能继续沿用当时选出的 Relay=8。当前单机先保留 256/256，避免同时展开过多低收益轴；这不表示 128 永远更差。
-
-比较时看端到端时间。`compute_us` 含等待及尾部 worker 的时间；dAB/dX/dW 是首末任务跨度，彼此重叠，不能相加或当成纯 GEMM 时间。更换内核、编译器或模型后应重新 autotune。结果和日志保存在被 Git 忽略的 `artifacts/` 或 `benchmarks/results/`，不提交中间产物。
+| `completion_chunks_per_pass` | FWD | Return completion chunks considered in one progress pass. Larger values can accelerate completion discovery but reduce time available for other transport work. |
+| `completion_marker_warps` | FWD | Warps checking return-fragment completion markers. Increase only when marker scanning limits completion progress. |
+| `reduce_scheduler` | FWD | Selects how ready reduction work is discovered and scheduled. Use `queue` as the starting point. |
+| `reduce_warps` | FWD | Warps participating when a CTA executes reduction work. Controls parallelism within the reduction role. |
+| `reduce_tokens_per_claim` | FWD | Tokens claimed in one reduction queue operation. Must not exceed `reduce_warps`. Larger claims reduce queue overhead but can reduce load balance near completion. |
+| `reduce_registers` | FWD | Per-thread register budget request when a CTA enters its reduction role. Inspect compiled resource usage when changing it. |
+| `return_idle_nanosleep` | FWD | Backoff hint while waiting for return progress. |
+| `reduce_queue_nanosleep` | FWD | Backoff hint while waiting for reduction work. |
+| `finalize_nanosleep` | FWD | Backoff hint while waiting for final completion. |
+| `reduce_threads` | BWD | Threads per input-gradient reduction CTA. Each warp handles one token in the current implementation. Start with 256; larger CTAs may reduce scheduling flexibility for short reductions. |
+| `reduce_idle_nanosleep` | BWD | Backoff hint while waiting for input-gradient route contributions. |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Content-addressed runtime compiler for WeftMoE specializations.
 
-The production library still has a conventional release build.  Autotuning,
+The production library is built by the Python package backend. Autotuning,
 however, needs a different compile-time-specialized kernel for every candidate.
 Forward and Backward share one source graph and host-object cache while keeping
 their generated headers and binary namespaces distinct.

@@ -75,6 +75,8 @@ public:
   const ActivationTransportExpectation &identity() const;
   const BackwardMegaKernelAudit &audit() const;
   const BackwardMegaKernelTimings &timings() const;
+  void wait() const;
+  void wait_on(CUstream_st *stream) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
@@ -91,6 +93,12 @@ private:
 // session or route generation.
 class BackwardMegaKernel {
 public:
+  DeviceBackwardHandle enqueue(
+      const DeviceForwardHandle &forward,
+      const BFloat16OutputGradientLease &output_gradients,
+      const BackwardMegaKernelConfig &config,
+      const ActivationTransportRunOptions &options = {}) const;
+
   DeviceBackwardHandle run(
       const DeviceForwardHandle &forward,
       const BFloat16OutputGradientLease &output_gradients,

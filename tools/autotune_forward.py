@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from autotune_common import (
+    DEFAULT_COMPILE_JOBS, DEFAULT_TUNE_ROUNDS, DEFAULT_FINAL_ROUNDS,
+    configure_preparation, environment_autotune_config,
     resolve_runtime_settings,
     resolve_parallel_settings,
     constrain_transport_space,
@@ -352,13 +354,13 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
     return {
         "schema": 3, "search_space": copy.deepcopy(space), "max_candidates": 4096,
         "model": {"main_hidden": model["hidden"], "main_intermediate": model["intermediate"]},
-        "jit": dict(cache_root="artifacts/forward-jit", jobs=8, architecture="sm_90a",
+        "jit": dict(cache_root="artifacts/forward-jit", jobs=DEFAULT_COMPILE_JOBS, architecture="sm_90a",
                     timeout_seconds=1800) | jit_overrides,
         "selection": dict(confirmation_candidates=min(2, count), confirmation_repeats=2,
-                          confirmation_rounds=60, minimum_improvement_percent=0.5),
+                          confirmation_rounds=DEFAULT_FINAL_ROUNDS, minimum_improvement_percent=0.5),
         "benchmark": dict(seed=0x4D554C54, tokens_per_rank=8192, top_k=model["top_k"],
             experts=model["experts"], gate_mode="fixed-random", generation_base=1000,
-            tune_rounds=30, final_rounds=110, timeout_seconds=600,
+            tune_rounds=DEFAULT_TUNE_ROUNDS, final_rounds=DEFAULT_FINAL_ROUNDS, timeout_seconds=600,
             selection_metric="forward_slowest_rank_us.mean",
             result_dir="artifacts/forward-autotune") | topology | workload,
     }
@@ -372,6 +374,9 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     _require(isinstance(document, dict), "top-level plan must be an object")
+    if "forward" in document:
+        document = document["forward"]
+        _require(isinstance(document, dict), "phase search space must be an object")
     if "schema" in document and any(k in (system or {}) for k in ("ep", "nodes", "gpus_per_node")):
         requested = resolve_parallel_settings(system)
         frozen = document.get("benchmark", {})
@@ -828,6 +833,7 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exact-tokens", action="store_true", help="tune the exact token count instead of the 64/8192/65536 bucket representative")
     parser.add_argument("--config", type=Path, help="hyperparameter file; default chosen from topology")
     parser.add_argument("--ep", type=int, help="EP world size; must equal nodes * gpus-per-node")
     parser.add_argument("--nodes", type=int, help="node count (default: 1, or ep / gpus-per-node)")
@@ -883,11 +889,12 @@ def main(argv: list[str] | None = None) -> int:
             system[key] = getattr(args, key)
     parallel = resolve_parallel_settings(system)
     topology_name = "single_node" if parallel["nodes"] == 1 else "multi_node"
-    config_path = (args.config or REPO_ROOT / "configs" /
+    config_path = (args.config or environment_autotune_config() or REPO_ROOT / "configs" /
                    f"forward_h200_{topology_name}_autotune.json").resolve()
     plan = load_plan(config_path, model=model,
                      benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None,
                      system=system)
+    configure_preparation(plan, "forward", exact_tokens=args.exact_tokens)
     _configure_from_cli(plan, args)
     if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher", "multinode") == "multinode":
         _require(bool(plan["benchmark"].get("remote")),
@@ -1040,7 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
     for ordinal, candidate_result in enumerate(benchmarkable, 1):
         candidate = candidate_by_name[candidate_result["name"]]
         print(f"[tune {ordinal}/{len(benchmarkable)}] {candidate['name']}: "
-              f"{int(benchmark['tune_rounds'])} rounds", flush=True)
+              f"{int(benchmark['tune_rounds'])} rounds (including 10 warmup)", flush=True)
         bench_result = benchmark_candidate(
             candidate, Path(candidate_result["build"]["binary"]), benchmark,
             log_dir,
@@ -1103,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[confirm {completed_confirmation_runs}/"
                   f"{total_confirmation_runs}] {candidate['name']} "
                   f"pass={repeat + 1}: "
-                  f"{int(selection['confirmation_rounds'])} rounds", flush=True)
+                  f"{int(selection['confirmation_rounds'])} rounds (including 10 warmup)", flush=True)
             confirmation = benchmark_candidate(
                 candidate, Path(candidate_result["build"]["binary"]),
                 benchmark, log_dir, environment,
@@ -1187,7 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_final:
         print(f"final validation {winner['name']}: "
-              f"{int(benchmark['final_rounds'])} rounds", flush=True)
+              f"{int(benchmark['final_rounds'])} rounds (including 10 warmup)", flush=True)
         winner_candidate = next(candidate for candidate in candidates
                                 if candidate["name"] == winner["name"])
         start_final = time.monotonic()

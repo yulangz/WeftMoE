@@ -29,6 +29,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <limits>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -429,6 +430,44 @@ struct ForwardWeightStorageHashAccess {
   }
 };
 
+// One slot can chain FWD -> BWD, but cannot execute two FWDs or two
+// BWDs concurrently. The completion action retains this guard until drained.
+struct OperatorFlight {
+  std::shared_ptr<SlotLease> lease;
+  bool backward;
+  OperatorFlight(std::shared_ptr<SlotLease> value, bool is_backward)
+      : lease(std::move(value)), backward(is_backward) {
+    std::lock_guard<std::mutex> lock(lease->pool->mutex);
+    if (lease->backward_pending || (!backward && lease->forward_pending))
+      transport_error(NotifyErrorCode::ResourceExhausted, "operator-enqueue",
+                      "slot", 0, "wait for the previous operation", "operation pending");
+    (backward ? lease->backward_pending : lease->forward_pending) = true;
+  }
+  ~OperatorFlight() noexcept {
+    std::lock_guard<std::mutex> lock(lease->pool->mutex);
+    (backward ? lease->backward_pending : lease->forward_pending) = false;
+  }
+};
+
+// Diagnostic completion is explicit. Destroying an unfinished handle drains it
+// before its captured allocations/consumer lease are released.
+struct OperatorCompletion {
+  std::mutex mutex;
+  std::function<void()> finish;
+  std::exception_ptr error;
+  void wait() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (finish) {
+      auto action = std::move(finish);
+      try { action(); } catch (...) { error = std::current_exception(); }
+    }
+    if (error) std::rethrow_exception(error);
+  }
+  ~OperatorCompletion() noexcept {
+    try { wait(); } catch (...) {}
+  }
+};
+
 struct DeviceForwardHandle::Impl {
   std::shared_ptr<SlotLease> slot;
   std::shared_ptr<ActivationPoolState> pool;
@@ -445,21 +484,11 @@ struct DeviceForwardHandle::Impl {
   // Backward reuses Forward's immutable FULL-return row mapping, including
   // the chunk boundaries encoded in each entry.
   std::uint64_t forward_return_chunk_rows = 0;
-  // The compact expert counts are immutable Dispatch metadata. Backward
-  // lazily snapshots the tiny vector before its first timed launch and reuses
-  // it for repeated executions of the same retained Forward state.
-  mutable std::mutex backward_plan_mutex;
-  mutable std::vector<std::uint64_t> backward_expert_rows;
-  mutable std::vector<std::uint64_t> backward_expert_offsets;
-  mutable std::vector<std::uint64_t> backward_padded_expert_rows;
-  mutable std::vector<std::uint64_t> backward_padded_expert_offsets;
-  mutable std::vector<std::uint32_t> backward_compact_to_padded;
-  mutable std::uint64_t backward_padded_rows = 0;
-  mutable bool backward_plan_uploaded = false;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;
   std::uint64_t socket_raw_cross_node_route_bytes = 0;
+  std::unique_ptr<OperatorCompletion> completion;
 };
 
 struct DeviceBackwardHandle::Impl {
@@ -473,6 +502,7 @@ struct DeviceBackwardHandle::Impl {
   std::uint32_t owned_experts = 0;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
+  std::unique_ptr<OperatorCompletion> completion;
 };
 
 struct LocalCudaP2pForwardMegaKernel::Impl {
@@ -2456,6 +2486,13 @@ GinRdmaForwardMegaKernel::GinRdmaForwardMegaKernel(
     : delegate_(std::shared_ptr<LocalCudaP2pForwardMegaKernel>(
           new LocalCudaP2pForwardMegaKernel(session, execution, pool, true))) {}
 
+DeviceForwardHandle GinRdmaForwardMegaKernel::enqueue(
+    const DeviceDispatchHandle &dispatch, const BFloat16ActivationLease &activations,
+    const ForwardWeightLease &weights, const ForwardMegaKernelConfig &config,
+    const ActivationTransportRunOptions &options) {
+  return delegate_->enqueue(dispatch, activations, weights, config, options);
+}
+
 DeviceForwardHandle GinRdmaForwardMegaKernel::run(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
@@ -3894,7 +3931,7 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
 #endif
 }
 
-DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
+DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
     const ForwardWeightLease &weights,
@@ -3993,6 +4030,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                     "owned_experts", id.calling_rank,
                     std::to_string(view.sizes.owned_expert_count),
                     std::to_string(weight.owned_experts));
+  auto flight = std::make_shared<OperatorFlight>(activation.slot, false);
   SlotFailureGuard failure_guard{activation.slot, false};
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[activation.slot->index];
@@ -4392,7 +4430,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           config.retain_backward_state
               ? slot.forward_training_output_store_map
               : slot.forward_output_store_map;
-      args.forward_relay_cta_count = forward_tuning::kRelayCtas;
+      args.forward_relay_cta_count = split_local_roles
+                                         ? forward_tuning::kRelayCtas
+                                         : forward_tuning::kRemoteRelayCtas;
       const bool valid_relay_count =
           split_local_roles
               ? args.forward_relay_cta_count >=
@@ -4423,8 +4463,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
       args.forward_stream_local_dispatch = split_local_roles;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
-      // Eight Relay CTAs with eight independent row streams are the Hopper
-      // production point.  Twelve streams slightly improve isolated NVLink
+      // Eight independent row streams per CTA are the Hopper default.
+      // Twelve streams slightly improve isolated NVLink
       // copy throughput, but contend more heavily with the paired FC1/FC2
       // pipeline and produce a longer end-to-end Return tail.  A value of
       // zero retains the exact vector implementation for autotuner/regression
@@ -4615,13 +4655,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaFuncSetAttribute(split transport dynamic smem)");
+      const auto set_compute_attribute = [&](auto kernel) {
+        const auto error = internal::prepare_kernel_stack(
+            reinterpret_cast<const void *>(kernel));
+        if (error != cudaSuccess)
+          return error;
+        return cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(forward_compute_smem));
+      };
       const auto set_tma_compute_attribute =
           [&](auto inference_kernel, auto training_kernel) {
-            return cudaFuncSetAttribute(
-                config.retain_backward_state ? training_kernel
-                                             : inference_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(forward_compute_smem));
+            return set_compute_attribute(config.retain_backward_state
+                                             ? training_kernel
+                                             : inference_kernel);
           };
       cudaError_t compute_attribute = cudaSuccess;
 #if WEFTMOE_FWD_FC2_TMA_STORE
@@ -4662,21 +4709,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 #endif
 #else
       if constexpr (forward_tuning::kRdmaCtas == 0U)
-        compute_attribute = cudaFuncSetAttribute(
+        compute_attribute = set_compute_attribute(
             local_p2p_forward_compute_kernel<
                 true, WEFTMOE_FWD_TILE_M == 64,
                 ForwardTaskPartition::All, true, false, false,
-                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_compute_smem));
+                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
       else
-        compute_attribute = cudaFuncSetAttribute(
+        compute_attribute = set_compute_attribute(
             local_p2p_forward_compute_kernel<
                 false, WEFTMOE_FWD_TILE_M == 64,
                 ForwardTaskPartition::All, true, false, false,
-                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(forward_compute_smem));
+                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
 #endif
       internal::throw_cuda(
           "forward-run", compute_attribute,
@@ -5074,171 +5117,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
 #if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("consumer_submit_enter");
 #endif
-  std::atomic<bool> forward_stream_done{false};
+  auto forward_stream_done = std::make_shared<std::atomic<bool>>(false);
   ActivationTransportBridge::submit(consumer);
-  internal::throw_cuda(
-      "forward-run",
-      cudaLaunchHostFunc(exec->stream, publish_stream_completion,
-                         &forward_stream_done),
-      id.calling_rank, id.world_size, backend->session.session().identity(),
-      id.generation, ExchangeKind::ExpertCounts,
-      "cudaLaunchHostFunc(Forward completion notification)");
+
 #if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("consumer_submit_done");
 #endif
 
-  const auto wait_start = std::chrono::steady_clock::now();
-  bool cancelled = false;
-#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
-  unsigned int progress_dump_count = 0U;
-#endif
-  while (true) {
-    if (forward_stream_done.load(std::memory_order_acquire))
-      break;
-    const auto expired =
-        options.deadline_after.count() > 0 &&
-        std::chrono::steady_clock::now() - wait_start >= options.deadline_after;
-#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
-    const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
-    const auto progress_dump_after = progress_dump_count == 0U
-                                         ? std::chrono::seconds(3)
-                                         : std::chrono::seconds(30);
-    if (progress_dump_count < 2U && use_gin && args.progress != nullptr &&
-        stalled_for >= progress_dump_after) {
-      constexpr std::size_t forward_progress_base = 0;
-      const auto progress = [&](std::uint32_t word) {
-        return __atomic_load_n(slot.host_forward_progress +
-                                   forward_progress_base + word,
-                               __ATOMIC_ACQUIRE);
-      };
-      // Emit the mapped coarse milestones before attempting a device-memory
-      // snapshot. If a platform cannot schedule the diagnostic D2H while the
-      // persistent grid is resident, this line still identifies the stalled
-      // phase instead of losing the entire diagnostic.
-      std::cerr << "FORWARD_PROGRESS_COARSE rank=" << id.calling_rank
-                << " generation=" << id.generation
-                << " sample=" << progress_dump_count
-                << " entered=" << progress(kForwardEntered)
-                << " setup=" << progress(kForwardSetupComplete)
-                << " dispatch_stored=" << progress(kForwardDispatchStored)
-                << " dispatch_observed="
-                << progress(kForwardDispatchObserved)
-                << " fc1=" << progress(kForwardFc1Complete)
-                << " fc2=" << progress(kForwardFc2Complete)
-                << " return=" << progress(kForwardReturnObserved)
-                << " reduce=" << progress(kForwardReduceComplete)
-                << " terminal=" << progress(kForwardTerminal) << std::endl;
-      // Keep production completion atomics in device memory even in debug
-      // builds. Redirecting the per-task counters to mapped host memory
-      // perturbs the Forward schedule by hundreds of milliseconds and can
-      // hide the race being diagnosed. A pair of copy-engine snapshots on the
-      // independent cancel stream remains observable while the persistent
-      // kernel occupies every SM.
-      auto *completion_snapshot = slot.host_forward_progress +
-                                  forward_progress_base + kForwardProgressWords;
-      internal::throw_cuda(
-          "forward-progress-snapshot",
-          cudaMemcpyAsync(completion_snapshot,
-                          at<void>(slot.device, layout.forward_completion),
-                          sizeof(transport_state::GenerationCompletionVector),
-                          cudaMemcpyDeviceToHost, state->cancel_stream),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "D2H Forward generation completion snapshot");
-      internal::throw_cuda(
-          "forward-progress-snapshot",
-          cudaMemcpyAsync(
-              completion_snapshot + transport_state::kGenerationCompletionWords,
-              at<void>(slot.device, layout.forward_context_completion),
-              static_cast<std::size_t>(slot.generation_debug_contexts) *
-                  sizeof(transport_state::ContextCompletionRecord),
-              cudaMemcpyDeviceToHost, state->cancel_stream),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "D2H Forward context completion snapshot");
-      internal::throw_cuda(
-          "forward-progress-snapshot",
-          cudaStreamSynchronize(state->cancel_stream), id.calling_rank,
-          id.world_size, backend->session.session().identity(), id.generation,
-          ExchangeKind::ExpertCounts, "drain Forward completion snapshot");
-      std::cerr << "FORWARD_PROGRESS rank=" << id.calling_rank
-                << " generation=" << id.generation
-                << " sample=" << progress_dump_count;
-      dump_generation_completion(std::cerr, completion_snapshot,
-                                 slot.generation_debug_contexts,
-                                 "forward_completion");
-      std::cerr << std::endl;
-      ++progress_dump_count;
-    }
-#endif
-    if (!cancelled &&
-        (expired || options.cancellation.cancellation_requested())) {
-      __atomic_store_n(slot.host_cancel_epoch, args.epoch, __ATOMIC_RELEASE);
-      internal::throw_cuda(
-          "forward-cancel",
-          cudaMemcpyAsync(slot.device_cancel_epoch, slot.host_cancel_epoch,
-                          sizeof(std::uint64_t), cudaMemcpyHostToDevice,
-                          state->cancel_stream),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "H2D publish forward cancel");
-      internal::throw_cuda(
-          "forward-cancel", cudaStreamSynchronize(state->cancel_stream),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "drain forward cancel stream");
-      cancelled = true;
-    }
-    // Do not call CUDA event-query APIs while the resident GIN kernel is
-    // active. On the remote host that can hold a driver-side progress lock and
-    // form a liveness cycle with device GIN. The stream callback above is the
-    // completion notification; this sleep only bounds host polling overhead.
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
-  }
-#if WEFTMOE_DEBUG_VALIDATE
-  debug_forward_host_phase("stream_completion_observed");
-#endif
-  internal::throw_cuda(
-      "forward-run", cudaEventQuery(slot.forward_complete), id.calling_rank,
-      id.world_size, backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventQuery(completed Forward event)");
-#if WEFTMOE_DEBUG_VALIDATE
-  debug_forward_host_phase("event_verified");
-#endif
-  consumer.finish();
-#if WEFTMOE_DEBUG_VALIDATE
-  debug_forward_host_phase("consumer_finished");
-  debug_forward_host_phase("terminal_agreement_enter");
-#endif
-  const auto production_agreement = agree_production_terminal_status(
-      backend, slot, ProductionStatusPhase::Forward, id.generation,
-      id.generation, id.calling_rank, id.world_size, *slot.host_forward_status,
-      slot.forward_complete);
-#if WEFTMOE_DEBUG_VALIDATE
-  debug_forward_host_phase("terminal_agreement_done");
-#endif
-  if (cancelled || slot.host_forward_status->error == 2U)
-    throw NotifyDispatchError(
-        NotifyErrorCode::TransportTimeout,
-        "phase=forward-run, field=cancel/deadline, rank=" +
-            std::to_string(id.calling_rank) +
-            ", expected=completed forward, actual=cancelled");
-  if (production_agreement.has_error) {
-    // A logical device-status failure reached the fixed terminal agreement;
-    // all peer work is drained and this slot is recoverable. Backend/CUDA
-    // failures still leave the guard uncommitted and therefore quarantine.
-    failure_guard.committed = true;
-    throw_production_status_error(production_agreement);
-  }
-
-  float total_ms = 0.0F;
-  internal::throw_cuda(
-      "forward-timing",
-      cudaEventElapsedTime(&total_ms, slot.forward_start,
-                           slot.forward_output_ready),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventElapsedTime(forward total)");
   auto result = std::make_shared<DeviceForwardHandle::Impl>();
   result->slot = activation.slot;
   result->pool = state;
@@ -5252,71 +5137,268 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
   result->forward_return_chunk_rows = args.forward_return_chunk_rows;
-  result->audit.specialization =
-      ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
-  result->audit.persistent_kernel_launches = 1;
-  result->audit.wgmma_instructions =
-      slot.host_forward_status->wgmma_instructions;
-  result->audit.tma_loads = slot.host_forward_status->tma_loads;
-  result->audit.tma_multicast_loads =
-      slot.host_forward_status->tma_multicast_loads;
-  result->audit.runtime_cluster_supported = cluster_supported != 0;
-  result->audit.requested_cluster_size = 2;
-  result->audit.runtime_cluster_size =
-      slot.host_forward_status->runtime_cluster_size;
-  result->audit.observed_cluster_rank_mask =
-      slot.host_forward_status->cluster_rank_mask;
-  result->audit.max_active_clusters =
-      static_cast<std::uint32_t>(std::max(max_active_clusters, 0));
-  result->audit.fc1_tasks = slot.host_forward_status->fc1_tasks_done;
-  result->audit.fc2_tasks = slot.host_forward_status->fc2_tasks_done;
-  result->audit.actual_dispatch_peer_bytes =
-      use_socket ? socket_dispatch_peer_bytes
-                 : slot.host_forward_status->actual_dispatch_peer_bytes;
-  result->audit.actual_return_peer_bytes =
-      use_socket ? socket_return_peer_bytes
-                 : slot.host_forward_status->actual_return_peer_bytes;
-  result->audit.gin_dispatch_put_count =
-      slot.host_forward_status->gin_dispatch_put_count;
-  result->audit.raw_cross_node_route_bytes =
-      use_socket ? socket_raw_cross_node_route_bytes
-                 : slot.host_forward_status->raw_cross_node_payload_bytes;
-  result->audit.gin_dispatch_payload_bytes =
-      slot.host_forward_status->deduplicated_cross_node_payload_bytes;
-  result->audit.gin_return_payload_bytes =
-      slot.host_forward_status->gin_return_payload_bytes;
-  result->audit.gin_return_put_count =
-      slot.host_forward_status->gin_return_put_count;
-  result->audit.gin_signal_count =
-      slot.host_forward_status->gin_signal_count;
-  result->audit.gin_metadata_bytes =
-      slot.host_forward_status->gin_metadata_bytes;
-  result->audit.workspace_bytes = state->layout.total;
-  result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
-  result->timings.terminal_status_agreement_us =
-      production_agreement.elapsed_us;
-  const auto &status = *slot.host_forward_status;
-  const auto elapsed = [](std::uint64_t begin, std::uint64_t end) {
-    return end >= begin ? static_cast<double>(end - begin) / 1000.0 : 0.0;
+  result->completion = std::make_unique<OperatorCompletion>();
+  result->completion->finish = [backend, state, flight, lease = activation.slot,
+      id, options, args, use_gin, use_socket, socket_dispatch_peer_bytes,
+      socket_return_peer_bytes, socket_raw_cross_node_route_bytes,
+      cluster_supported, max_active_clusters, forward_stream_done,
+      result = result.get(),
+      consumer_owner = std::make_shared<DeviceDispatchConsumerLease>(std::move(consumer))]() {
+    auto &slot = state->slots[lease->index];
+    auto exec = internal::checked_execution_state(backend->execution);
+    auto &consumer = *consumer_owner;
+    SlotFailureGuard failure_guard{lease, false};
+#if WEFTMOE_DEBUG_VALIDATE
+    const auto debug_forward_host_phase = [](const char *) {};
+#endif
+    internal::throw_cuda(
+        "forward-run",
+        cudaLaunchHostFunc(exec->stream, publish_stream_completion,
+                           forward_stream_done.get()),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts,
+        "cudaLaunchHostFunc(Forward completion notification)");
+    const auto wait_start = std::chrono::steady_clock::now();
+    bool cancelled = false;
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
+    unsigned int progress_dump_count = 0U;
+#endif
+    while (true) {
+      if (forward_stream_done->load(std::memory_order_acquire))
+        break;
+      const auto expired =
+          options.deadline_after.count() > 0 &&
+          std::chrono::steady_clock::now() - wait_start >= options.deadline_after;
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
+      const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
+      const auto progress_dump_after = progress_dump_count == 0U
+                                           ? std::chrono::seconds(3)
+                                           : std::chrono::seconds(30);
+      if (progress_dump_count < 2U && use_gin && args.progress != nullptr &&
+          stalled_for >= progress_dump_after) {
+        constexpr std::size_t forward_progress_base = 0;
+        const auto progress = [&](std::uint32_t word) {
+          return __atomic_load_n(slot.host_forward_progress +
+                                     forward_progress_base + word,
+                                 __ATOMIC_ACQUIRE);
+        };
+        // Emit the mapped coarse milestones before attempting a device-memory
+        // snapshot. If a platform cannot schedule the diagnostic D2H while the
+        // persistent grid is resident, this line still identifies the stalled
+        // phase instead of losing the entire diagnostic.
+        std::cerr << "FORWARD_PROGRESS_COARSE rank=" << id.calling_rank
+                  << " generation=" << id.generation
+                  << " sample=" << progress_dump_count
+                  << " entered=" << progress(kForwardEntered)
+                  << " setup=" << progress(kForwardSetupComplete)
+                  << " dispatch_stored=" << progress(kForwardDispatchStored)
+                  << " dispatch_observed="
+                  << progress(kForwardDispatchObserved)
+                  << " fc1=" << progress(kForwardFc1Complete)
+                  << " fc2=" << progress(kForwardFc2Complete)
+                  << " return=" << progress(kForwardReturnObserved)
+                  << " reduce=" << progress(kForwardReduceComplete)
+                  << " terminal=" << progress(kForwardTerminal) << std::endl;
+        // Keep production completion atomics in device memory even in debug
+        // builds. Redirecting the per-task counters to mapped host memory
+        // perturbs the Forward schedule by hundreds of milliseconds and can
+        // hide the race being diagnosed. A pair of copy-engine snapshots on the
+        // independent cancel stream remains observable while the persistent
+        // kernel occupies every SM.
+        auto *completion_snapshot = slot.host_forward_progress +
+                                    forward_progress_base + kForwardProgressWords;
+        internal::throw_cuda(
+            "forward-progress-snapshot",
+            cudaMemcpyAsync(completion_snapshot,
+                            at<void>(slot.device, layout.forward_completion),
+                            sizeof(transport_state::GenerationCompletionVector),
+                            cudaMemcpyDeviceToHost, state->cancel_stream),
+            id.calling_rank, id.world_size, backend->session.session().identity(),
+            id.generation, ExchangeKind::ExpertCounts,
+            "D2H Forward generation completion snapshot");
+        internal::throw_cuda(
+            "forward-progress-snapshot",
+            cudaMemcpyAsync(
+                completion_snapshot + transport_state::kGenerationCompletionWords,
+                at<void>(slot.device, layout.forward_context_completion),
+                static_cast<std::size_t>(slot.generation_debug_contexts) *
+                    sizeof(transport_state::ContextCompletionRecord),
+                cudaMemcpyDeviceToHost, state->cancel_stream),
+            id.calling_rank, id.world_size, backend->session.session().identity(),
+            id.generation, ExchangeKind::ExpertCounts,
+            "D2H Forward context completion snapshot");
+        internal::throw_cuda(
+            "forward-progress-snapshot",
+            cudaStreamSynchronize(state->cancel_stream), id.calling_rank,
+            id.world_size, backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "drain Forward completion snapshot");
+        std::cerr << "FORWARD_PROGRESS rank=" << id.calling_rank
+                  << " generation=" << id.generation
+                  << " sample=" << progress_dump_count;
+        dump_generation_completion(std::cerr, completion_snapshot,
+                                   slot.generation_debug_contexts,
+                                   "forward_completion");
+        std::cerr << std::endl;
+        ++progress_dump_count;
+      }
+#endif
+      if (!cancelled &&
+          (expired || options.cancellation.cancellation_requested())) {
+        __atomic_store_n(slot.host_cancel_epoch, args.epoch, __ATOMIC_RELEASE);
+        internal::throw_cuda(
+            "forward-cancel",
+            cudaMemcpyAsync(slot.device_cancel_epoch, slot.host_cancel_epoch,
+                            sizeof(std::uint64_t), cudaMemcpyHostToDevice,
+                            state->cancel_stream),
+            id.calling_rank, id.world_size, backend->session.session().identity(),
+            id.generation, ExchangeKind::ExpertCounts,
+            "H2D publish forward cancel");
+        internal::throw_cuda(
+            "forward-cancel", cudaStreamSynchronize(state->cancel_stream),
+            id.calling_rank, id.world_size, backend->session.session().identity(),
+            id.generation, ExchangeKind::ExpertCounts,
+            "drain forward cancel stream");
+        cancelled = true;
+      }
+      // Do not call CUDA event-query APIs while the resident GIN kernel is
+      // active. On the remote host that can hold a driver-side progress lock and
+      // form a liveness cycle with device GIN. The stream callback above is the
+      // completion notification; this sleep only bounds host polling overhead.
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+#if WEFTMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("stream_completion_observed");
+#endif
+    internal::throw_cuda(
+        "forward-run", cudaEventQuery(slot.forward_complete), id.calling_rank,
+        id.world_size, backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts, "cudaEventQuery(completed Forward event)");
+#if WEFTMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("event_verified");
+#endif
+    consumer.finish();
+#if WEFTMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("consumer_finished");
+    debug_forward_host_phase("terminal_agreement_enter");
+#endif
+    const auto production_agreement = agree_production_terminal_status(
+        backend, slot, ProductionStatusPhase::Forward, id.generation,
+        id.generation, id.calling_rank, id.world_size, *slot.host_forward_status,
+        slot.forward_complete);
+#if WEFTMOE_DEBUG_VALIDATE
+    debug_forward_host_phase("terminal_agreement_done");
+#endif
+    if (cancelled || slot.host_forward_status->error == 2U)
+      throw NotifyDispatchError(
+          NotifyErrorCode::TransportTimeout,
+          "phase=forward-run, field=cancel/deadline, rank=" +
+              std::to_string(id.calling_rank) +
+              ", expected=completed forward, actual=cancelled");
+    if (production_agreement.has_error) {
+      // A logical device-status failure reached the fixed terminal agreement;
+      // all peer work is drained and this slot is recoverable. Backend/CUDA
+      // failures still leave the guard uncommitted and therefore quarantine.
+      failure_guard.committed = true;
+      throw_production_status_error(production_agreement);
+    }
+
+    float total_ms = 0.0F;
+    internal::throw_cuda(
+        "forward-timing",
+        cudaEventElapsedTime(&total_ms, slot.forward_start,
+                             slot.forward_output_ready),
+        id.calling_rank, id.world_size,
+        backend->session.session().identity(), id.generation,
+        ExchangeKind::ExpertCounts, "cudaEventElapsedTime(forward total)");
+    result->audit.specialization =
+        ForwardKernelSpecialization::Sm90WgmmaTma7168x3072;
+    result->audit.persistent_kernel_launches = 1;
+    result->audit.wgmma_instructions =
+        slot.host_forward_status->wgmma_instructions;
+    result->audit.tma_loads = slot.host_forward_status->tma_loads;
+    result->audit.tma_multicast_loads =
+        slot.host_forward_status->tma_multicast_loads;
+    result->audit.runtime_cluster_supported = cluster_supported != 0;
+    result->audit.requested_cluster_size = 2;
+    result->audit.runtime_cluster_size =
+        slot.host_forward_status->runtime_cluster_size;
+    result->audit.observed_cluster_rank_mask =
+        slot.host_forward_status->cluster_rank_mask;
+    result->audit.max_active_clusters =
+        static_cast<std::uint32_t>(std::max(max_active_clusters, 0));
+    result->audit.fc1_tasks = slot.host_forward_status->fc1_tasks_done;
+    result->audit.fc2_tasks = slot.host_forward_status->fc2_tasks_done;
+    result->audit.actual_dispatch_peer_bytes =
+        use_socket ? socket_dispatch_peer_bytes
+                   : slot.host_forward_status->actual_dispatch_peer_bytes;
+    result->audit.actual_return_peer_bytes =
+        use_socket ? socket_return_peer_bytes
+                   : slot.host_forward_status->actual_return_peer_bytes;
+    result->audit.gin_dispatch_put_count =
+        slot.host_forward_status->gin_dispatch_put_count;
+    result->audit.raw_cross_node_route_bytes =
+        use_socket ? socket_raw_cross_node_route_bytes
+                   : slot.host_forward_status->raw_cross_node_payload_bytes;
+    result->audit.gin_dispatch_payload_bytes =
+        slot.host_forward_status->deduplicated_cross_node_payload_bytes;
+    result->audit.gin_return_payload_bytes =
+        slot.host_forward_status->gin_return_payload_bytes;
+    result->audit.gin_return_put_count =
+        slot.host_forward_status->gin_return_put_count;
+    result->audit.gin_signal_count =
+        slot.host_forward_status->gin_signal_count;
+    result->audit.gin_metadata_bytes =
+        slot.host_forward_status->gin_metadata_bytes;
+    result->audit.workspace_bytes = state->layout.total;
+    result->timings.total_us = static_cast<double>(total_ms) * 1000.0;
+    result->timings.terminal_status_agreement_us =
+        production_agreement.elapsed_us;
+    const auto &status = *slot.host_forward_status;
+    const auto elapsed = [](std::uint64_t begin, std::uint64_t end) {
+      return end >= begin ? static_cast<double>(end - begin) / 1000.0 : 0.0;
+    };
+    result->timings.dispatch_us =
+        elapsed(status.start_clock, status.dispatch_complete_clock);
+    result->timings.fc1_swiglu_us =
+        elapsed(status.fc1_start_clock, status.fc1_complete_clock);
+    result->timings.fc2_us =
+        elapsed(status.dispatch_blocks_done, status.fc2_complete_clock);
+    result->timings.combine_return_us =
+        elapsed(status.relay_blocks_done, status.return_complete_clock);
+    result->timings.reduce_us =
+        elapsed(status.reduced_tokens, status.reduce_blocks_done);
+    result->timings.fc1_fc2_overlap_us =
+        elapsed(status.dispatch_blocks_done, status.fc1_complete_clock);
+    result->timings.fc2_return_overlap_us =
+        elapsed(status.relay_blocks_done, status.fc2_complete_clock);
+    result->timings.return_reduce_overlap_us =
+        elapsed(status.reduced_tokens, status.return_complete_clock);
+    failure_guard.committed = true;
   };
-  result->timings.dispatch_us =
-      elapsed(status.start_clock, status.dispatch_complete_clock);
-  result->timings.fc1_swiglu_us =
-      elapsed(status.fc1_start_clock, status.fc1_complete_clock);
-  result->timings.fc2_us =
-      elapsed(status.dispatch_blocks_done, status.fc2_complete_clock);
-  result->timings.combine_return_us =
-      elapsed(status.relay_blocks_done, status.return_complete_clock);
-  result->timings.reduce_us =
-      elapsed(status.reduced_tokens, status.reduce_blocks_done);
-  result->timings.fc1_fc2_overlap_us =
-      elapsed(status.dispatch_blocks_done, status.fc1_complete_clock);
-  result->timings.fc2_return_overlap_us =
-      elapsed(status.relay_blocks_done, status.fc2_complete_clock);
-  result->timings.return_reduce_overlap_us =
-      elapsed(status.reduced_tokens, status.return_complete_clock);
   failure_guard.committed = true;
   return DeviceForwardHandle(std::move(result));
+}
+
+DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
+    const DeviceDispatchHandle &dispatch, const BFloat16ActivationLease &activations,
+    const ForwardWeightLease &weights, const ForwardMegaKernelConfig &config,
+    const ActivationTransportRunOptions &options) {
+  auto handle = enqueue(dispatch, activations, weights, config, options);
+  handle.wait();
+  return handle;
+}
+
+void DeviceForwardHandle::wait() const {
+  (void)identity();
+  impl_->completion->wait();
+}
+
+void DeviceForwardHandle::wait_on(CUstream_st *stream) const {
+  (void)identity();
+  internal::throw_cuda("forward-wait-on", cudaStreamWaitEvent(stream,
+      impl_->pool->slots[impl_->slot->index].forward_output_ready),
+      impl_->identity.rank, impl_->identity.world, "forward", impl_->identity.generation,
+      ExchangeKind::ExpertCounts, "wait Forward output on caller stream");
 }
 
 const ActivationTransportExpectation &DeviceForwardHandle::identity() const {
@@ -5330,6 +5412,7 @@ const ForwardMegaKernelAudit &DeviceForwardHandle::audit() const {
   if (!impl_)
     transport_error(NotifyErrorCode::InvalidHandle, "forward-handle", "handle",
                     0, "valid", "empty");
+  wait();
   return impl_->audit;
 }
 
@@ -5337,6 +5420,7 @@ const ForwardMegaKernelTimings &DeviceForwardHandle::timings() const {
   if (!impl_)
     transport_error(NotifyErrorCode::InvalidHandle, "forward-handle", "handle",
                     0, "valid", "empty");
+  wait();
   return impl_->timings;
 }
 
@@ -5577,7 +5661,7 @@ double backward_elapsed_us(cudaEvent_t begin, cudaEvent_t end,
 
 } // namespace
 
-DeviceBackwardHandle BackwardMegaKernel::run(
+DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const DeviceForwardHandle &forward,
     const BFloat16OutputGradientLease &output_gradients,
     const BackwardMegaKernelConfig &config,
@@ -5663,113 +5747,9 @@ DeviceBackwardHandle BackwardMegaKernel::run(
                     "same rows/experts as Forward", "mismatch");
 
   auto exec = internal::checked_execution_state(retained.backend->execution);
-  {
-    std::lock_guard<std::mutex> plan_lock(retained.backward_plan_mutex);
-    if (retained.backward_expert_rows.empty()) {
-      retained.backward_expert_rows.resize(view.sizes.owned_expert_count);
-      retained.backward_expert_offsets.resize(
-          static_cast<std::size_t>(view.sizes.owned_expert_count) + 1ULL);
-      const auto rows_bytes = checked_size(
-          checked_mul(view.sizes.owned_expert_count, sizeof(std::uint64_t),
-                      "Backward expert row plan bytes"),
-          "Backward expert row plan bytes");
-      const auto offsets_bytes = checked_size(
-          checked_mul(static_cast<std::uint64_t>(view.sizes.owned_expert_count) +
-                          1ULL,
-                      sizeof(std::uint64_t),
-                      "Backward expert offset plan bytes"),
-          "Backward expert offset plan bytes");
-      internal::throw_cuda(
-          "backward-plan",
-          cudaMemcpyAsync(retained.backward_expert_rows.data(),
-                          view.expert_row_count, rows_bytes,
-                          cudaMemcpyDeviceToHost, exec->stream),
-          identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "D2H expert row counts");
-      internal::throw_cuda(
-          "backward-plan",
-          cudaMemcpyAsync(retained.backward_expert_offsets.data(),
-                          view.expert_row_prefix, offsets_bytes,
-                          cudaMemcpyDeviceToHost, exec->stream),
-          identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "D2H expert row offsets");
-      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
-                                rows_bytes + offsets_bytes);
-      internal::throw_cuda(
-          "backward-plan", cudaStreamSynchronize(exec->stream), identity.rank,
-          identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "cache expert row plan");
-      retained.backward_padded_expert_rows.resize(
-          view.sizes.owned_expert_count);
-      retained.backward_padded_expert_offsets.resize(
-          static_cast<std::size_t>(view.sizes.owned_expert_count) + 1ULL);
-      retained.backward_compact_to_padded.resize(
-          checked_size(view.sizes.incoming_row_count,
-                       "Backward compact-to-padded entries"));
-      std::uint64_t padded_cursor = 0ULL;
-      for (std::uint32_t expert = 0U;
-           expert < view.sizes.owned_expert_count; ++expert) {
-        const auto rows = retained.backward_expert_rows[expert];
-        const auto padded = checked_mul((rows + 127ULL) / 128ULL, 128ULL,
-                                        "Backward padded expert rows");
-        retained.backward_padded_expert_offsets[expert] = padded_cursor;
-        retained.backward_padded_expert_rows[expert] = padded;
-        const auto compact_begin = retained.backward_expert_offsets[expert];
-        for (std::uint64_t local_row = 0ULL; local_row < rows; ++local_row) {
-          retained.backward_compact_to_padded[checked_size(
-              compact_begin + local_row,
-              "Backward compact-to-padded index")] =
-              static_cast<std::uint32_t>(padded_cursor + local_row);
-        }
-        padded_cursor = checked_add(padded_cursor, padded,
-                                    "Backward padded row count");
-      }
-      retained.backward_padded_expert_offsets[view.sizes.owned_expert_count] =
-          padded_cursor;
-      retained.backward_padded_rows = padded_cursor;
-      if (padded_cursor > layout.backward_padded_capacity_rows ||
-          padded_cursor > UINT32_MAX)
-        transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
-                        "backward-plan", "padded expert rows", identity.rank,
-                        std::to_string(layout.backward_padded_capacity_rows),
-                        std::to_string(padded_cursor));
-    }
-    if (!retained.backward_plan_uploaded) {
-      const auto copy_plan = [&](std::size_t offset, const auto &values,
-                                 const char *name) {
-        if (values.empty())
-          return;
-        const auto bytes = checked_mul(values.size(), sizeof(values.front()),
-                                       name);
-        internal::throw_cuda(
-            "backward-plan",
-            cudaMemcpyAsync(
-                at<void>(pool->slots[retained.slot->index].device, offset),
-                            values.data(), checked_size(bytes, name),
-                            cudaMemcpyHostToDevice, exec->stream),
-            identity.rank, identity.world, "backward", identity.generation,
-            ExchangeKind::ExpertCounts, name);
-        internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
-                                  bytes);
-      };
-      copy_plan(layout.backward_compact_to_padded,
-                retained.backward_compact_to_padded,
-                "upload Backward compact-to-padded directory");
-      copy_plan(layout.backward_padded_expert_rows,
-                retained.backward_padded_expert_rows,
-                "upload Backward padded expert rows");
-      copy_plan(layout.backward_padded_expert_offsets,
-                retained.backward_padded_expert_offsets,
-                "upload Backward padded expert offsets");
-      internal::throw_cuda(
-          "backward-plan", cudaStreamSynchronize(exec->stream), identity.rank,
-          identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "publish padded Backward directory");
-      retained.backward_plan_uploaded = true;
-    }
-  }
 
   auto &slot = pool->slots[retained.slot->index];
+  auto flight = std::make_shared<OperatorFlight>(retained.slot, true);
   SlotFailureGuard failure_guard{retained.slot, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /
@@ -5801,17 +5781,11 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = pool->config.max_destination_rows_per_rank;
   args.padded_capacity_rows = layout.backward_padded_capacity_rows;
-  args.padded_rows = retained.backward_padded_rows;
+  // Actual padded rows and active experts are loaded from the device directory.
   args.scheduler_words = scheduler_layout.total_words;
   args.scheduler_mblock_capacity =
       static_cast<std::uint32_t>(scheduler_mblock_capacity);
   args.scheduler_expert_capacity = pool->config.max_owned_experts;
-  args.mblocks = static_cast<std::uint32_t>(
-      retained.backward_padded_rows / backward_tuning::kTileM);
-  args.active_experts = static_cast<std::uint32_t>(std::count_if(
-      retained.backward_padded_expert_rows.begin(),
-      retained.backward_padded_expert_rows.end(),
-      [](std::uint64_t rows) { return rows != 0ULL; }));
   args.rank = identity.rank;
   args.world = identity.world;
   args.node = use_gin ? gin_backend->node : 0U;
@@ -5913,7 +5887,8 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "query Backward SM count");
   const auto transport_ctas =
-      backward_tuning::kRelayCtas +
+      (use_gin ? backward_tuning::kRemoteRelayCtas
+               : backward_tuning::kRelayCtas) +
       (use_gin ? backward_tuning::kRdmaCtas : 0U);
   if (sm_count <= static_cast<int>(transport_ctas))
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
@@ -5997,6 +5972,10 @@ DeviceBackwardHandle BackwardMegaKernel::run(
         ExchangeKind::ExpertCounts,
         "reset Backward FULL Return fragment counters");
   }
+  backward_build_row_directory_kernel<<<1, 256, 0, transport_stream>>>(args);
+  internal::throw_cuda("backward-plan", cudaGetLastError(), identity.rank,
+      identity.world, "backward", identity.generation, ExchangeKind::ExpertCounts,
+      "build Backward expert directory on device");
   backward_setup_pipeline_kernel<<<1, backward_tuning::kSetupThreads, 0,
                                    transport_stream>>>(args);
   internal::throw_cuda(
@@ -6008,39 +5987,13 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward start");
   if (view.sizes.owned_expert_count != 0U) {
-    // Every active expert writes every dW tile.  The dense training shape has
-    // no inactive expert, so clearing several GiB immediately before those
-    // stores is pure HBM traffic.  Sparse fixtures retain the full clear to
-    // preserve the public zero-gradient contract for inactive experts.
-    if (args.active_experts != view.sizes.owned_expert_count) {
-      internal::throw_cuda(
-          "backward-run",
-          cudaMemsetAsync(at<void>(slot.device, layout.backward_dw1), 0,
-                          checked_size(
-                              static_cast<std::uint64_t>(
-                                  view.sizes.owned_expert_count) *
-                                  2ULL * config.intermediate_size *
-                                  config.hidden_size *
-                                  sizeof(transport::BFloat16),
-                              "Backward dW1 clear bytes"),
-                          transport_stream),
-          identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "clear sparse Backward dW1 output");
-      internal::throw_cuda(
-          "backward-run",
-          cudaMemsetAsync(at<void>(slot.device, layout.backward_dw2), 0,
-                          checked_size(
-                              static_cast<std::uint64_t>(
-                                  view.sizes.owned_expert_count) *
-                                  config.hidden_size *
-                                  config.intermediate_size *
-                                  sizeof(transport::BFloat16),
-                              "Backward dW2 clear bytes"),
-                          transport_stream),
-          identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "clear sparse Backward dW2 output");
-    }
+    backward_clear_inactive_gradients_kernel<<<
+        dim3(128, view.sizes.owned_expert_count), 256, 0, transport_stream>>>(args);
+    internal::throw_cuda("backward-run", cudaGetLastError(), identity.rank,
+        identity.world, "backward", identity.generation, ExchangeKind::ExpertCounts,
+        "clear inactive expert gradients on device");
   }
+
   internal::throw_cuda(
       "backward-run", cudaEventRecord(slot.forward_roles_ready,
                                        transport_stream),
@@ -6144,77 +6097,6 @@ DeviceBackwardHandle BackwardMegaKernel::run(
       ExchangeKind::ExpertCounts, "record pool slot complete");
   slot.completion_recorded = true;
   ActivationTransportBridge::submit(consumer);
-  const bool diagnostic_progress =
-      std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr;
-  const auto diagnostic_status = [&](const TransportDeviceStatus &s,
-                                     bool pending) {
-    std::cerr << "BACKWARD_STATUS rank=" << identity.rank
-              << " epoch=" << backward_epoch << " pending=" << pending
-              << " return_puts=" << s.gin_return_put_count
-              << " return_bytes=" << s.gin_return_payload_bytes
-              << " dispatch_complete=" << s.dispatch_complete_clock
-              << " dx_complete=" << s.fc2_complete_clock
-              << " return_complete=" << s.return_complete_clock
-              << std::endl;
-  };
-  if (diagnostic_progress) {
-    const auto started = std::chrono::steady_clock::now();
-    bool sampled = false;
-    while (cudaEventQuery(slot.backward_complete) == cudaErrorNotReady) {
-      if (!sampled && std::chrono::steady_clock::now() - started >
-                          std::chrono::seconds(3) &&
-          slot.forward_progress_words * sizeof(std::uint64_t) >=
-              sizeof(TransportDeviceStatus)) {
-        internal::throw_cuda(
-            "backward-diagnostic",
-            cudaMemcpyAsync(slot.host_forward_progress,
-                            at<void>(slot.device, layout.status),
-                            sizeof(TransportDeviceStatus), cudaMemcpyDeviceToHost,
-                            pool->cancel_stream),
-            identity.rank, identity.world, "backward", identity.generation,
-            ExchangeKind::ExpertCounts, "snapshot pending Backward status");
-        internal::throw_cuda(
-            "backward-diagnostic", cudaStreamSynchronize(pool->cancel_stream),
-            identity.rank, identity.world, "backward", identity.generation,
-            ExchangeKind::ExpertCounts, "drain Backward status snapshot");
-        diagnostic_status(*reinterpret_cast<const TransportDeviceStatus *>(
-                              slot.host_forward_progress), true);
-        for (std::uint64_t offset = 0; offset < args.scheduler_words;) {
-          const auto count = std::min<std::uint64_t>(
-              slot.forward_progress_words, args.scheduler_words - offset);
-          internal::throw_cuda(
-              "backward-diagnostic",
-              cudaMemcpyAsync(slot.host_forward_progress,
-                  at<std::uint64_t>(slot.device, args.scheduler_offset) + offset,
-                  count * sizeof(std::uint64_t), cudaMemcpyDeviceToHost,
-                  pool->cancel_stream),
-              identity.rank, identity.world, "backward", identity.generation,
-              ExchangeKind::ExpertCounts, "snapshot Backward scheduler");
-          internal::throw_cuda(
-              "backward-diagnostic", cudaStreamSynchronize(pool->cancel_stream),
-              identity.rank, identity.world, "backward", identity.generation,
-              ExchangeKind::ExpertCounts, "drain Backward scheduler snapshot");
-          std::cerr << "BACKWARD_SCHED rank=" << identity.rank
-                    << " epoch=" << backward_epoch << " offset=" << offset
-                    << " values=";
-          for (std::uint64_t i = 0; i < count; ++i)
-            std::cerr << (i ? "," : "") << slot.host_forward_progress[i];
-          std::cerr << std::endl;
-          offset += count;
-        }
-        sampled = true;
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-  }
-  internal::throw_cuda(
-      "backward-run", cudaEventSynchronize(slot.backward_complete),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "wait Backward completion");
-  if (diagnostic_progress)
-    diagnostic_status(*slot.host_status, false);
-  consumer.finish();
-
   auto result = std::make_shared<DeviceBackwardHandle::Impl>();
   result->slot = retained.slot;
   result->pool = pool;
@@ -6224,73 +6106,178 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   result->owned_experts = view.sizes.owned_expert_count;
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
-  result->audit.specialization =
-      BackwardKernelSpecialization::Sm90CachedXAb7168x3072;
-  result->audit.gemm_launches = 2ULL;
-  result->audit.actual_dispatch_peer_bytes =
-      retained.audit.actual_dispatch_peer_bytes;
-  const auto remote_return_rows =
-      retained.audit.actual_return_peer_bytes /
-      (config.hidden_size * sizeof(transport::BFloat16));
-  result->audit.actual_return_peer_bytes =
-      use_gin ? remote_return_rows * args.gin_return_row_bytes
-              : retained.audit.actual_return_peer_bytes +
-                    remote_return_rows * sizeof(float);
-  result->audit.gin_return_put_count = slot.host_status->gin_return_put_count;
-  result->audit.gin_return_payload_bytes =
-      slot.host_status->gin_return_payload_bytes;
-  result->audit.workspace_bytes = pool->layout.total;
-  result->audit.hot_path_allocations = 0;
-  const auto device_span_us = [](unsigned long long begin,
-                                 unsigned long long end) {
-    return begin == ~0ULL || end == 0ULL || end < begin
-               ? 0.0
-               : static_cast<double>(end - begin) / 1000.0;
+  result->completion = std::make_unique<OperatorCompletion>();
+  result->completion->finish = [forward, pool, flight, identity, config, args, use_gin,
+      backward_epoch, result = result.get(),
+      consumer_owner = std::make_shared<DeviceDispatchConsumerLease>(std::move(consumer))]() {
+    forward.wait();
+    const auto &retained = *forward.impl_;
+    auto &slot = pool->slots[retained.slot->index];
+    const auto &layout = pool->layout;
+    auto &consumer = *consumer_owner;
+    SlotFailureGuard failure_guard{retained.slot, false};
+    const bool diagnostic_progress =
+        std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr;
+    const auto diagnostic_status = [&](const TransportDeviceStatus &s,
+                                       bool pending) {
+      std::cerr << "BACKWARD_STATUS rank=" << identity.rank
+                << " epoch=" << backward_epoch << " pending=" << pending
+                << " return_puts=" << s.gin_return_put_count
+                << " return_bytes=" << s.gin_return_payload_bytes
+                << " dispatch_complete=" << s.dispatch_complete_clock
+                << " dx_complete=" << s.fc2_complete_clock
+                << " return_complete=" << s.return_complete_clock
+                << std::endl;
+    };
+    if (diagnostic_progress) {
+      const auto started = std::chrono::steady_clock::now();
+      bool sampled = false;
+      while (cudaEventQuery(slot.backward_complete) == cudaErrorNotReady) {
+        if (!sampled && std::chrono::steady_clock::now() - started >
+                            std::chrono::seconds(3) &&
+            slot.forward_progress_words * sizeof(std::uint64_t) >=
+                sizeof(TransportDeviceStatus)) {
+          internal::throw_cuda(
+              "backward-diagnostic",
+              cudaMemcpyAsync(slot.host_forward_progress,
+                              at<void>(slot.device, layout.status),
+                              sizeof(TransportDeviceStatus), cudaMemcpyDeviceToHost,
+                              pool->cancel_stream),
+              identity.rank, identity.world, "backward", identity.generation,
+              ExchangeKind::ExpertCounts, "snapshot pending Backward status");
+          internal::throw_cuda(
+              "backward-diagnostic", cudaStreamSynchronize(pool->cancel_stream),
+              identity.rank, identity.world, "backward", identity.generation,
+              ExchangeKind::ExpertCounts, "drain Backward status snapshot");
+          diagnostic_status(*reinterpret_cast<const TransportDeviceStatus *>(
+                                slot.host_forward_progress), true);
+          for (std::uint64_t offset = 0; offset < args.scheduler_words;) {
+            const auto count = std::min<std::uint64_t>(
+                slot.forward_progress_words, args.scheduler_words - offset);
+            internal::throw_cuda(
+                "backward-diagnostic",
+                cudaMemcpyAsync(slot.host_forward_progress,
+                    at<std::uint64_t>(slot.device, args.scheduler_offset) + offset,
+                    count * sizeof(std::uint64_t), cudaMemcpyDeviceToHost,
+                    pool->cancel_stream),
+                identity.rank, identity.world, "backward", identity.generation,
+                ExchangeKind::ExpertCounts, "snapshot Backward scheduler");
+            internal::throw_cuda(
+                "backward-diagnostic", cudaStreamSynchronize(pool->cancel_stream),
+                identity.rank, identity.world, "backward", identity.generation,
+                ExchangeKind::ExpertCounts, "drain Backward scheduler snapshot");
+            std::cerr << "BACKWARD_SCHED rank=" << identity.rank
+                      << " epoch=" << backward_epoch << " offset=" << offset
+                      << " values=";
+            for (std::uint64_t i = 0; i < count; ++i)
+              std::cerr << (i ? "," : "") << slot.host_forward_progress[i];
+            std::cerr << std::endl;
+            offset += count;
+          }
+          sampled = true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    }
+    internal::throw_cuda(
+        "backward-run", cudaEventSynchronize(slot.backward_complete),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "wait Backward completion");
+    if (diagnostic_progress)
+      diagnostic_status(*slot.host_status, false);
+    consumer.finish();
+
+    result->audit.specialization =
+        BackwardKernelSpecialization::Sm90CachedXAb7168x3072;
+    result->audit.gemm_launches = 2ULL;
+    result->audit.actual_dispatch_peer_bytes =
+        retained.audit.actual_dispatch_peer_bytes;
+    const auto remote_return_rows =
+        retained.audit.actual_return_peer_bytes /
+        (config.hidden_size * sizeof(transport::BFloat16));
+    result->audit.actual_return_peer_bytes =
+        use_gin ? remote_return_rows * args.gin_return_row_bytes
+                : retained.audit.actual_return_peer_bytes +
+                      remote_return_rows * sizeof(float);
+    result->audit.gin_return_put_count = slot.host_status->gin_return_put_count;
+    result->audit.gin_return_payload_bytes =
+        slot.host_status->gin_return_payload_bytes;
+    result->audit.workspace_bytes = pool->layout.total;
+    result->audit.hot_path_allocations = 0;
+    const auto device_span_us = [](unsigned long long begin,
+                                   unsigned long long end) {
+      return begin == ~0ULL || end == 0ULL || end < begin
+                 ? 0.0
+                 : static_cast<double>(end - begin) / 1000.0;
+    };
+    result->timings.prepare_us = backward_elapsed_us(
+        slot.backward_start, slot.backward_compute_start, identity,
+        "Backward cache preparation elapsed");
+    const auto primary_compute_us = backward_elapsed_us(
+        slot.backward_compute_start, slot.backward_compute_done, identity,
+        "Backward primary persistent compute elapsed");
+    const auto late_compute_us = backward_elapsed_us(
+        slot.backward_compute_start, slot.backward_late_compute_done, identity,
+        "Backward late compute elapsed");
+    result->timings.compute_us = std::max(primary_compute_us, late_compute_us);
+    result->timings.reduce_us = backward_elapsed_us(
+        slot.backward_transport_done, slot.backward_reduce_done, identity,
+        "Backward dX reduction elapsed");
+    result->timings.transport_us = backward_elapsed_us(
+        slot.backward_compute_start, slot.backward_transport_done, identity,
+        "Backward persistent transport elapsed");
+    result->timings.dispatch_us = device_span_us(
+        slot.host_status->start_clock,
+        slot.host_status->dispatch_complete_clock);
+    result->timings.dab_us = device_span_us(
+        slot.host_status->fc1_start_clock,
+        slot.host_status->fc1_complete_clock);
+    result->timings.dx_us = device_span_us(
+        slot.host_status->relay_blocks_done,
+        slot.host_status->fc2_complete_clock);
+    result->timings.dw2_us = device_span_us(
+        slot.host_status->backward_dw2_start_clock,
+        slot.host_status->backward_dw2_complete_clock);
+    result->timings.dw1_us = device_span_us(
+        slot.host_status->backward_dw1_start_clock,
+        slot.host_status->backward_dw1_complete_clock);
+    result->timings.combine_us = device_span_us(
+        slot.host_status->fc2_complete_clock,
+        slot.host_status->return_complete_clock);
+    const auto dw_after_dx = device_span_us(
+        slot.host_status->fc2_complete_clock,
+        slot.host_status->backward_dw1_complete_clock);
+    result->timings.dw_combine_overlap_us =
+        std::min(dw_after_dx, result->timings.combine_us);
+    result->timings.total_us = backward_elapsed_us(
+        slot.backward_start, slot.backward_complete, identity,
+        "Backward total elapsed");
+    failure_guard.committed = true;
   };
-  result->timings.prepare_us = backward_elapsed_us(
-      slot.backward_start, slot.backward_compute_start, identity,
-      "Backward cache preparation elapsed");
-  const auto primary_compute_us = backward_elapsed_us(
-      slot.backward_compute_start, slot.backward_compute_done, identity,
-      "Backward primary persistent compute elapsed");
-  const auto late_compute_us = backward_elapsed_us(
-      slot.backward_compute_start, slot.backward_late_compute_done, identity,
-      "Backward late compute elapsed");
-  result->timings.compute_us = std::max(primary_compute_us, late_compute_us);
-  result->timings.reduce_us = backward_elapsed_us(
-      slot.backward_transport_done, slot.backward_reduce_done, identity,
-      "Backward dX reduction elapsed");
-  result->timings.transport_us = backward_elapsed_us(
-      slot.backward_compute_start, slot.backward_transport_done, identity,
-      "Backward persistent transport elapsed");
-  result->timings.dispatch_us = device_span_us(
-      slot.host_status->start_clock,
-      slot.host_status->dispatch_complete_clock);
-  result->timings.dab_us = device_span_us(
-      slot.host_status->fc1_start_clock,
-      slot.host_status->fc1_complete_clock);
-  result->timings.dx_us = device_span_us(
-      slot.host_status->relay_blocks_done,
-      slot.host_status->fc2_complete_clock);
-  result->timings.dw2_us = device_span_us(
-      slot.host_status->backward_dw2_start_clock,
-      slot.host_status->backward_dw2_complete_clock);
-  result->timings.dw1_us = device_span_us(
-      slot.host_status->backward_dw1_start_clock,
-      slot.host_status->backward_dw1_complete_clock);
-  result->timings.combine_us = device_span_us(
-      slot.host_status->fc2_complete_clock,
-      slot.host_status->return_complete_clock);
-  const auto dw_after_dx = device_span_us(
-      slot.host_status->fc2_complete_clock,
-      slot.host_status->backward_dw1_complete_clock);
-  result->timings.dw_combine_overlap_us =
-      std::min(dw_after_dx, result->timings.combine_us);
-  result->timings.total_us = backward_elapsed_us(
-      slot.backward_start, slot.backward_complete, identity,
-      "Backward total elapsed");
   failure_guard.committed = true;
   return DeviceBackwardHandle(std::move(result));
+}
+
+DeviceBackwardHandle BackwardMegaKernel::run(
+    const DeviceForwardHandle &forward, const BFloat16OutputGradientLease &gradients,
+    const BackwardMegaKernelConfig &config,
+    const ActivationTransportRunOptions &options) const {
+  auto handle = enqueue(forward, gradients, config, options);
+  handle.wait();
+  return handle;
+}
+
+void DeviceBackwardHandle::wait() const {
+  (void)identity();
+  impl_->completion->wait();
+}
+
+void DeviceBackwardHandle::wait_on(CUstream_st *stream) const {
+  (void)identity();
+  internal::throw_cuda("backward-wait-on", cudaStreamWaitEvent(stream,
+      impl_->pool->slots[impl_->slot->index].backward_complete),
+      impl_->identity.rank, impl_->identity.world, "backward", impl_->identity.generation,
+      ExchangeKind::ExpertCounts, "wait Backward output on caller stream");
 }
 
 const ActivationTransportExpectation &DeviceBackwardHandle::identity() const {
@@ -6304,6 +6291,7 @@ const BackwardMegaKernelAudit &DeviceBackwardHandle::audit() const {
   if (!impl_)
     transport_error(NotifyErrorCode::InvalidHandle, "backward-handle",
                     "handle", 0, "valid", "empty");
+  wait();
   return impl_->audit;
 }
 
@@ -6311,6 +6299,7 @@ const BackwardMegaKernelTimings &DeviceBackwardHandle::timings() const {
   if (!impl_)
     transport_error(NotifyErrorCode::InvalidHandle, "backward-handle",
                     "handle", 0, "valid", "empty");
+  wait();
   return impl_->timings;
 }
 

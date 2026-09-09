@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77", "wheel>=0.45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weftmoe"
+version = "2.0.0"
+description = "Weaving communication into computation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[tool.setuptools]
+packages = ["weftmoe"]
+include-package-data = false

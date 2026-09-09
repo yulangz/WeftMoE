@@ -2,162 +2,89 @@
 
 > Weaving communication into computation.
 
-WeftMoE is a Hopper-focused Mixture-of-Experts Forward and cached-state
-Backward pipeline. It overlaps device-issued communication with TMA/WGMMA
-compute without a whole-grid barrier between the split transport and compute
-kernels. SwiGLU consumes BF16-rounded FC1 A/B, and each route gate is applied
-before the BF16 FC2 input cast, matching the Forward/Backward algebra.
+WeftMoE implements fused Mixture-of-Experts forward and backward pipelines for
+Hopper GPUs. It overlaps TMA/WGMMA computation with node-local data movement and
+inter-node NCCL GIN communication. Routed contributions are reduced in a fixed
+order. Compiled specializations are cached, and tuning results are saved for
+inspection.
 
-Build targets, library names, namespaces, environment variables, and paths
-use the `weftmoe` / `WEFTMOE` identifiers. Rebuild existing clients and binaries
-after the rename; the namespace, library names and environment variables changed.
+## Installation
 
-The current optimized contract is intentionally narrow:
-
-- BF16 activations, weights, FC2 inputs, and outputs with FP32 gate/reduction
-  arithmetic;
-- hidden size 7168, intermediate size 3072, 384 experts, top-k 1 or 6;
-- expert M blocks padded to 128 rows;
-- one CTA per SM, with compile-time-specialized Hopper TMA/WGMMA kernels;
-- homogeneous nodes with a dense `(node, local_rank)` topology;
-- one-node CUDA IPC/NVLink and two-node NCCL GIN/RDMA execution.
-
-There is no generic-shape or legacy single-node compute fallback. Unsupported
-shapes fail closed. The cached-state Backward implementation is qualified on
-the maintained one- and two-node configurations, so CUDA-backed binaries make
-`cuda::backward_pipeline_available()` return `true`.
-
-A pool may explicitly reserve Backward state. In that mode Forward preserves
-post-Dispatch canonical X, writes plane-major BF16 A/B checkpoints, and uses a
-separate FC2 output plane. Inference pools allocate none of those extra bytes.
-
-## Pipeline
-
-Notify creates immutable canonical route metadata and fixes every dispatch and
-return address before the data-plane kernels start. The main path then uses
-three disjoint CTA roles:
-
-- RDMA CTAs own cross-node GIN put, signal, and local-completion progress. The
-  world-16 production point reserves eight CTAs, one per rail.
-- Relay CTAs own node-local CUDA IPC/NVLink movement and readiness publication.
-  Row movement uses asynchronous TMA where the topology and alignment permit.
-- Compute CTAs exclusively own FC1/SwiGLU, FC2, and final reduction. A shared
-  work-conserving queue gives ready FC2 work priority so return starts early.
-
-Producers publish bounded byte ranges with release ordering; consumers acquire
-generation-tagged counters or queue entries. FC2 stores directly into the
-precomputed return layout. Transport workers observe M-block/chunk readiness,
-issue remote puts or local relay copies, and publish source-reduce readiness.
-The split kernels do not use an inter-grid `grid.sync()`; their lifecycle is
-closed by monotonic generation counters and terminal status records.
-
-Single-node world 8 reuses the same split architecture with zero RDMA CTAs and
-a tunable Relay/compute partition. The older combined local kernel selection
-has been removed. The host-enqueued NCCL Socket backend remains only as an
-explicit correctness fallback and is not a performance path.
-
-See [architecture](docs/architecture.md) for data ownership and synchronization
-details.
-
-## Build and test
-
-CPU/control-plane tests:
+Build and install from the repository:
 
 ```bash
-make BUILD_DIR=/tmp/weftmoe-cpu -j8 test
+python3 -m pip install .
 ```
 
-Hopper CUDA build and core smoke tests:
+For development, use `python3 -m pip install -e .` and reinstall after modifying
+native code. Environments managed by uv can use `uv pip install .` or
+`uv pip install -e .`. To build a wheel and source distribution, install the
+Python `build` package and run `python3 -m build`.
 
-```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib
-make BUILD_DIR=/tmp/weftmoe-sm90 ENABLE_CUDA=1 \
-  CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' -j8 cuda-test
+Source builds require a C++17 compiler, CUDA with SM90a support, CUTLASS headers,
+and NCCL headers and libraries with GIN support. Configure toolchain discovery
+with `CUDA_HOME`, `NVCC`, `CXX`, `CUTLASS_INCLUDE_DIR`, `NCCL_INCLUDE_DIR`, and
+`NCCL_LIB_DIR`. CUDA and NCCL are external runtime dependencies; the package does
+not bundle them. `MAX_JOBS` controls package-build parallelism.
+
+## Python Usage
+
+The unified repository entry point is [tools/run.py](tools/run.py). It compiles
+and benchmarks a single configuration, or selects a configuration with
+autotuning before running the benchmark. Run the following from the repository
+root after installation:
+
+```python
+from weftmoe import ModelSpec
+from tools.run import run
+
+model = ModelSpec(hidden=4096, intermediate=1536, experts=64, top_k=8)
+
+result = run(
+    model,
+    phase="forward",       # Use "backward" for the backward pipeline.
+    tokens=8192,            # Input tokens per rank.
+    nodes=1,
+    gpus_per_node=8,
+    autotune=False,         # Set True to compile and measure the search space.
+)
+print(result["config"])
+print(result["benchmark"]["record"])
 ```
 
-Single-node Forward validation:
+This entry point executes generated benchmark inputs through the native rank
+launchers. It does not accept application tensors: direct tensor-based forward
+and backward bindings are not implemented yet. Python-driven runtime
+compilation and autotuning are supported; automatic tuning on a tensor
+operator's first call is not.
 
-```bash
-python3 tests/run_local_activation_p2p.py \
-  --binary /tmp/weftmoe-sm90/test_cuda_notify \
-  --world 8 --forward-smoke
-```
+Without autotuning, the entry point compiles one configuration and runs 30
+measured iterations. The single-node defaults use 24 relay CTAs for forward
+and 32 for backward. A supplied `config` file uses its first candidate values.
+With `autotune=True`, it compiles the candidate set, measures each candidate,
+confirms the finalists, and benchmarks the selected configuration at the
+requested token count. An explicit autotune call performs a new measurement;
+compiled binaries can be reused from cache.
 
-Two-node GIN validation uses a binary at the same shared-storage path on both
-hosts and an explicit remote host:
+Additional arguments configure the same workflow:
 
-```bash
-python3 tests/run_multinode_nccl.py \
-  --binary "$PWD/artifacts/validation/sm90/test_cuda_notify" \
-  --remote user@remote-host --port 22 \
-  --remote-binary "$PWD/artifacts/validation/sm90/test_cuda_notify" \
-  --gpus-per-node 8 --scenario gin_forward_smoke --enable-ib
-```
+- `config`: optional hyperparameter search-space JSON path. Workload dimensions
+  and parallel topology are supplied separately from the search space.
+- `system`: optional system settings, including `remote`, `port`,
+  `nccl_lib_dir`, and `runtime_library_path` for multi-node execution.
+- `jobs`: global compilation concurrency budget, default 16.
+- `output`: result JSON path; associated logs are stored alongside it.
+- `generate_only=True`: validate and inspect the configurations without
+  compiling or running GPU work.
 
-The complete command matrix and runtime-library notes are in
-[build and validation](docs/build.md).
+`WEFTMOE_ROOT` selects the compile and tuning cache root, defaulting to
+`~/.cache/weftmoe`. `WEFTMOE_AUTOTUNE_CONFIG` supplies a search-space file when
+`config` is omitted. Parameter definitions and tuning recommendations are in
+[configs/README.md](configs/README.md).
 
-## Autotuning
-
-Tuning values are explicit JSON and become compile-time constants in a
-generated header. Python performs content-addressed runtime compilation and
-autotuning directly; candidate compilation does not call Make. The default
-files contain only hyperparameter arrays; provide the model explicitly. These commands generate candidates without running GPU benchmarks:
-
-```bash
-python3 tools/autotune_forward.py \
-  --config configs/forward_h200_multi_node_autotune.json \
-  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
-
-python3 tools/autotune_forward.py \
-  --config configs/forward_h200_single_node_autotune.json \
-  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
-
-python3 tools/autotune_backward.py \
-  --config configs/backward_h200_multi_node_autotune.json \
-  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
-
-python3 tools/autotune_backward.py \
-  --config configs/backward_h200_single_node_autotune.json \
-  --hidden 2560 --intermediate 768 --experts 512 --top-k 8 --generate-only
-```
-
-JIT binaries live under the ignored `artifacts/{forward,backward}-jit/cache`
-trees. Cache
-keys cover generated code, repository and external header content, compiler
-identity, architecture, and flags; completed artifacts are published with an
-atomic directory rename. Intermediate objects are discarded. The result JSON
-records expanded parameters, cache provenance, compile/resource evidence,
-correctness fingerprints, elapsed time, and slowest-rank latency.
-
-The configured job count is a global budget: candidates compile concurrently,
-each with lanes for both specialized Forward translation units, while the
-shared host archive is created once.
-
-The tuner compiles the whole candidate set before measuring any candidate.
-It then confirms the incumbent and strongest challenger in two longer passes,
-reversing their order for the second pass; the challenger must beat the
-incumbent by the explicit JSON threshold before it can replace the production
-point. This prevents sub-percent run-to-run noise from becoming a
-generated-kernel change.
-
-## Repository layout
-
-```text
-include/weftmoe/                 installed API
-src/metadata/                    deterministic Notify materialization
-src/cuda/forward/                Forward runtime, launch, and kernel pieces
-src/cuda/persistent_v3/forward/  split role pipelines and queues
-src/cuda/backward/               cached-state Backward contract and launch
-src/cuda/persistent_v3/backward/ split Backward transport/compute scheduler
-src/cuda/testing/                non-installed CUDA probes
-tests/                           focused control, CUDA, and launcher tests
-benchmarks/                      WeftMoE/Megatron comparisons and oracles
-configs/                         explicit autotune plans
-tools/                           tuning, SASS, and timeline utilities
-```
-
-Benchmark claims, the Backward contract, and known limits are documented in the
-[performance summary](docs/performance_summary.md),
-[Backward design](docs/backward_design.md), and
-[known limitations](docs/known_limitations.md).
+Tuning uses token buckets with representatives of 64, 8192, and 65536 tokens
+per rank. The final benchmark uses the original token count without padding it
+to the bucket size. The default search uses 15 measured iterations per candidate
+and 30 per finalist confirmation pass. Each run has 10 additional warmup
+iterations. Two confirmation passes reverse candidate order; the final selected
+configuration is benchmarked for 30 measured iterations.

@@ -1,6 +1,57 @@
 #include "cuda/backward/kernel_contract.cuh"
 #include "cuda/persistent_v3/backward/compute_kernels.cuh"
 
+// Rebuilt for each invocation: routing counts may change even at fixed shape.
+// Capacity was checked when the pool and dispatch handle were constructed.
+__global__ void backward_build_row_directory_kernel(BackwardKernelArgs a) {
+  auto *offsets = peer_at<unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
+  auto *rows = peer_at<unsigned long long>(a.local_base, a.padded_expert_rows_offset);
+  auto *mapping = peer_at<unsigned int>(a.local_base, a.compact_to_padded_offset);
+  if (threadIdx.x == 0U) {
+    unsigned long long cursor = 0ULL;
+    for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e) {
+      offsets[e] = cursor;
+      rows[e] = ((a.dispatch.expert_row_count[e] + 127ULL) / 128ULL) * 128ULL;
+      cursor += rows[e];
+    }
+    offsets[a.dispatch.sizes.owned_expert_count] = cursor;
+  }
+  __syncthreads();
+  for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e)
+    for (unsigned long long row = threadIdx.x; row < a.dispatch.expert_row_count[e]; row += blockDim.x)
+      mapping[a.dispatch.expert_row_prefix[e] + row] =
+          static_cast<unsigned int>(offsets[e] + row);
+}
+
+__global__ void backward_clear_inactive_gradients_kernel(BackwardKernelArgs a) {
+  const auto expert = blockIdx.y;
+  if (a.dispatch.expert_row_count[expert] != 0ULL) return;
+  const auto elements = a.hidden * a.intermediate;
+  auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset) + expert * 2ULL * elements;
+  auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset) + expert * elements;
+  for (auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < 2ULL * elements; i += gridDim.x * blockDim.x) {
+    reinterpret_cast<unsigned short *>(dw1)[i] = 0;
+    if (i < elements) reinterpret_cast<unsigned short *>(dw2)[i] = 0;
+  }
+}
+
+__device__ __forceinline__ void backward_load_row_geometry(BackwardKernelArgs &a) {
+  __shared__ unsigned long long geometry[2];
+  if (threadIdx.x == 0U) {
+    const auto *offsets = peer_at<const unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
+    geometry[0] = offsets[a.dispatch.sizes.owned_expert_count];
+    unsigned long long active = 0;
+    for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e)
+      active += a.dispatch.expert_row_count[e] != 0ULL;
+    geometry[1] = active;
+  }
+  __syncthreads();
+  a.padded_rows = geometry[0];
+  a.mblocks = static_cast<unsigned int>(geometry[0] / backward_tuning::kTileM);
+  a.active_experts = static_cast<unsigned int>(geometry[1]);
+}
+
 __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
   if (blockIdx.x != 0U)
     return;

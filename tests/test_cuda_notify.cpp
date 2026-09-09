@@ -2406,13 +2406,15 @@ void run_cached_backward_rank(
     if (nodes == 2U) {
       weftmoe::cuda::GinRdmaForwardMegaKernel forward_kernel(
           generation, execution, activation_pool);
-      return forward_kernel.run(notify.dispatch(), activations, weights,
+      progress("forward_constructed");
+    return forward_kernel.enqueue(notify.dispatch(), activations, weights,
                                 {hidden, intermediate, true},
                                 forward_options);
     }
     weftmoe::cuda::LocalCudaP2pForwardMegaKernel forward_kernel(
         generation, execution, activation_pool);
-    return forward_kernel.run(notify.dispatch(), activations, weights,
+    progress("forward_constructed");
+    return forward_kernel.enqueue(notify.dispatch(), activations, weights,
                               {hidden, intermediate, true}, forward_options);
   }();
   progress("forward_done");
@@ -2445,8 +2447,29 @@ void run_cached_backward_rank(
   for (std::uint32_t round = 0; round < rounds; ++round) {
     progress("backward_enter");
     const auto begin = Clock::now();
-    auto output = backward.run(
+    auto output = backward.enqueue(
         forward, output_gradients, {hidden, intermediate}, {});
+    if (validation) {
+      bool rejected = false;
+      try {
+        (void)backward.enqueue(forward, output_gradients, {hidden, intermediate}, {});
+      } catch (const weftmoe::NotifyDispatchError &error) {
+        rejected = error.code() == weftmoe::NotifyErrorCode::ResourceExhausted;
+      }
+      require(rejected, "overlapping Backward reused the same workspace");
+    }
+    if (validation) {
+      cudaStream_t output_stream = nullptr;
+      require(cudaStreamCreateWithFlags(&output_stream, cudaStreamNonBlocking) == cudaSuccess,
+              "create async consumer stream");
+      output.wait_on(output_stream);
+      require(cudaStreamSynchronize(output_stream) == cudaSuccess,
+              "wait async output dependency");
+      require(cudaStreamDestroy(output_stream) == cudaSuccess,
+              "destroy async consumer stream");
+    }
+    output.wait();
+    if (validation) output.wait();  // completion is idempotent
     const auto end = Clock::now();
     if (round >= warmups) {
       wall_samples.push_back(

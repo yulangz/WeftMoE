@@ -925,6 +925,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           checked_mul(config.max_owned_experts, 127ULL,
                       "backward expert padding rows"),
           "backward padded row capacity");
+      if (layout.backward_padded_capacity_rows > UINT32_MAX)
+        transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
+                        "transport-pool-query", "Backward padded directory", 0,
+                        "uint32 row indices", std::to_string(layout.backward_padded_capacity_rows));
       const auto backward_padded_elements = checked_mul(
           layout.backward_padded_capacity_rows,
           config.max_intermediate_size, "backward padded elements");
@@ -1351,6 +1355,8 @@ struct SlotLease {
   std::size_t index = 0;
   std::uint64_t epoch = 0;
   bool quarantined = false;
+  bool forward_pending = false;
+  bool backward_pending = false;
 
   ~SlotLease() noexcept {
     if (!pool || index >= pool->slots.size())
