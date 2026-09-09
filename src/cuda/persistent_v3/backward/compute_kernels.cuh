@@ -218,22 +218,6 @@ __device__ __forceinline__ void run_wgmma_tile(
   if (threadIdx.x == kMathThreads)
     asm volatile("fence.proxy.async.global;" : : : "memory");
 
-  float accum[TileMma::kNumAccum * kMWaves];
-  if (warpgroup < kMathWarpGroups) {
-#pragma unroll
-    for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
-      accum[index] = 0.0F;
-  }
-  auto a_desc = deep_gemm::mma::sm90::make_gmma_desc<
-      MajorA, TileM, kStageK, 128, cutlass::bfloat16_t>(
-      reinterpret_cast<cutlass::bfloat16_t *>(smem),
-      warpgroup * TileMma::M, 0U);
-  auto b_desc = deep_gemm::mma::sm90::make_gmma_desc<
-      MajorB, TileN, kStageK, 128, cutlass::bfloat16_t>(
-      reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements,
-      0U, 0U);
-  const auto a_desc_lo = __shfl_sync(0xffffffffU, a_desc.reg32_[0], 0);
-  const auto b_desc_lo = __shfl_sync(0xffffffffU, b_desc.reg32_[0], 0);
   const auto iterations = reduction / kStageK;
   if (threadIdx.x == kMathThreads) {
     for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
@@ -266,6 +250,24 @@ __device__ __forceinline__ void run_wgmma_tile(
           sizeof(transport::BFloat16));
     }
   } else if (warpgroup < kMathWarpGroups) {
+    // Keep accumulators entirely in the math role. Conditional initialization
+    // outside this branch lets ptxas carry unused producer-side values across
+    // task kinds, spilling N128 accumulators when dW uses N256.
+    float accum[TileMma::kNumAccum * kMWaves];
+#pragma unroll
+    for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
+      accum[index] = 0.0F;
+    auto a_desc = deep_gemm::mma::sm90::make_gmma_desc<
+        MajorA, TileM, kStageK, 128, cutlass::bfloat16_t>(
+        reinterpret_cast<cutlass::bfloat16_t *>(smem),
+        warpgroup * TileMma::M, 0U);
+    auto b_desc = deep_gemm::mma::sm90::make_gmma_desc<
+        MajorB, TileN, kStageK, 128, cutlass::bfloat16_t>(
+        reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements,
+        0U, 0U);
+    const auto a_desc_lo = __shfl_sync(0xffffffffU, a_desc.reg32_[0], 0);
+    const auto b_desc_lo = __shfl_sync(0xffffffffU, b_desc.reg32_[0], 0);
+
     for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
       const auto current = pipeline + iteration;
       const auto stage = current % StageCount;
@@ -312,23 +314,26 @@ __device__ __forceinline__ void run_wgmma_tile(
       if ((threadIdx.x & 31U) == 0U)
         empty[completed % StageCount].arrive();
     }
-  }
-  __syncthreads();
-  if constexpr (TmaOutput) {
-    static_assert(TileM % 128U == 0U && TileN % 64U == 0U);
-    static_assert(OutputOffsetElements + TileM * TileN <=
-                  shared_arena_elements<StorageTileN>());
-    store_tma_accumulator<TileM, TileN, StorageTileN,
-                          OutputOffsetElements>(
-        accum, output_store_map, output_row, output_column, storage,
-        WaitPreviousStore, WaitCurrentStore);
-  } else {
+    // The final WGMMA wait has consumed the last TMA stage. The TMA store
+    // helper synchronizes both math warpgroups before reusing the arena;
+    // producer threads must not carry accumulators across a CTA-wide join.
+    if constexpr (TmaOutput) {
+      static_assert(TileM % 128U == 0U && TileN % 64U == 0U);
+      static_assert(OutputOffsetElements + TileM * TileN <=
+                    shared_arena_elements<StorageTileN>());
+      store_tma_accumulator<TileM, TileN, StorageTileN,
+                            OutputOffsetElements>(
+          accum, output_store_map, output_row, output_column, storage,
+          WaitPreviousStore, WaitCurrentStore);
+    } else {
 #pragma unroll
-    for (std::uint32_t wave = 0U; wave < kMWaves; ++wave)
-      store_m128_accumulator<TileN>(
-          accum + wave * TileMma::kNumAccum, output,
-          output_row + wave * kStageM, output_column, output_width);
+      for (std::uint32_t wave = 0U; wave < kMWaves; ++wave)
+        store_m128_accumulator<TileN>(
+            accum + wave * TileMma::kNumAccum, output,
+            output_row + wave * kStageM, output_column, output_width);
+    }
   }
+  // All roles rejoin before the next task reuses the stage/barrier state.
   __syncthreads();
   pipeline += iterations;
 }
