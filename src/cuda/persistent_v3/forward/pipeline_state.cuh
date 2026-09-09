@@ -4,7 +4,7 @@
 
 #include "cuda/persistent_v3/epoch_state.cuh"
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 
 // Hopper exposes at most 132 SMs.  After the fixed RDMA/Relay reservation the
 // Forward compute grid contains at most 58 two-CTA clusters.  Keep a little
@@ -69,4 +69,4 @@ struct alignas(128) ForwardPipelineControl {
 
 static_assert(alignof(ForwardPipelineControl) == 128U);
 
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3

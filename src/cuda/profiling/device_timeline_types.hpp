@@ -3,11 +3,11 @@
 #include <cstdint>
 #include <vector>
 
-#ifndef MEGAMOE_DEVICE_TIMELINE
-#define MEGAMOE_DEVICE_TIMELINE 0
+#ifndef WEFTMOE_DEVICE_TIMELINE
+#define WEFTMOE_DEVICE_TIMELINE 0
 #endif
 
-namespace megamoe::cuda::profiling {
+namespace weftmoe::cuda::profiling {
 
 inline constexpr std::uint32_t kTimelineSchemaVersion = 7;
 // Main-shape compute CTAs can retire more than 256 FC tiles.  A truncated
@@ -122,4 +122,4 @@ struct DeviceTimelineSnapshot {
   std::vector<DeviceTimelineRecord> records;
 };
 
-} // namespace megamoe::cuda::profiling
+} // namespace weftmoe::cuda::profiling

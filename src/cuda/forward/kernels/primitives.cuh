@@ -125,7 +125,7 @@ __device__ void forward_wgmma_tile(
     transport::BFloat16 *smem_b_public, ForwardBarrier *full_barriers,
     ForwardBarrier *empty_barriers, float *accum,
     std::uint32_t &pipeline_iteration, std::uint32_t reduction_start = 0U
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     ,
     unsigned long long *debug_producer = nullptr,
     unsigned long long *debug_math0 = nullptr,
@@ -142,12 +142,12 @@ __device__ void forward_wgmma_tile(
     for (int index = 0; index < TileMma::kNumAccum; ++index)
       accum[index] = 0.0F;
   const auto iterations = (reduction + 63U) / 64U;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   const bool debug_first_tile = pipeline_iteration == 0U;
 #endif
   if (threadIdx.x == kMathWarpGroups * 128U) {
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && debug_producer)
         *debug_producer =
             (static_cast<unsigned long long>(iteration) << 8U) | 1ULL;
@@ -156,7 +156,7 @@ __device__ void forward_wgmma_tile(
       const auto stage = pipeline % kStages;
       const auto phase = (pipeline / kStages) & 1U;
       empty_barriers[stage].wait(phase ^ 1U);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && debug_producer)
         *debug_producer =
             (static_cast<unsigned long long>(iteration) << 8U) | 2ULL;
@@ -171,25 +171,25 @@ __device__ void forward_wgmma_tile(
           activation_row);
       hopper::tma_load<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b, k_base, weight_row);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && debug_producer)
         *debug_producer =
             (static_cast<unsigned long long>(iteration) << 8U) | 3ULL;
 #endif
       full_barriers[stage].arrive_and_expect_tx(
           (kAStageElements + kBStageElements) * sizeof(transport::BFloat16));
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && debug_producer)
         *debug_producer =
             (static_cast<unsigned long long>(iteration) << 8U) | 4ULL;
 #endif
     }
   } else if (warpgroup < kMathWarpGroups) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     auto *debug_math = warpgroup == 0U ? debug_math0 : debug_math1;
 #endif
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 1ULL;
 #endif
@@ -202,7 +202,7 @@ __device__ void forward_wgmma_tile(
       auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b_public + stage * kBStageElements);
       full_barriers[stage].wait(phase);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 2ULL;
 #endif
@@ -219,7 +219,7 @@ __device__ void forward_wgmma_tile(
         TileMma::wgmma(desc_a, desc_b, accum, 1);
       }
       cute::warpgroup_commit_batch();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 3ULL;
 #endif
@@ -228,7 +228,7 @@ __device__ void forward_wgmma_tile(
         cute::warpgroup_fence_operand(accum[index]);
       if (iteration != 0U) {
         cute::warpgroup_wait<1>();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
           *debug_math =
               (static_cast<unsigned long long>(iteration) << 8U) | 4ULL;
@@ -240,7 +240,7 @@ __device__ void forward_wgmma_tile(
     }
     if (iterations != 0U) {
       cute::warpgroup_wait<0>();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math =
             (static_cast<unsigned long long>(iterations) << 8U) | 5ULL;
@@ -565,7 +565,7 @@ __device__ void wait_forward_mblock_rows(
       return total;
     };
     auto current = load_arrived();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     if (current < expected && threadIdx.x == 0U) {
       atomicAdd(&completion->tile_waiter_count, 1ULL);
       (void)atomicCAS(&completion->first_waiting_tile, ~0ULL, tile);
@@ -583,7 +583,7 @@ __device__ void wait_forward_mblock_rows(
     }
 #endif
     while (current < expected && !forward_cancelled(a)) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (threadIdx.x == 0U && completion->first_waiting_tile == tile)
         completion->first_wait_arrived = current;
       if (threadIdx.x == 0U && completion->first_waiting_tile == tile)
@@ -661,7 +661,7 @@ __device__ void publish_elected_terminal(
 __device__ void forward_publish_progress(const ForwardKernelArgs &a,
                                          std::uint32_t word,
                                          unsigned long long value) {
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
   if (a.progress != nullptr && blockIdx.x == 0U && threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> field(
         a.progress[word]);

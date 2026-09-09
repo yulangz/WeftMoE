@@ -226,7 +226,7 @@ __device__ __forceinline__ bool try_claim_fc1_task(
   }
   task = selected;
   exhausted = false;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
       claim_completion_tasks(completion, transport_state::TaskClass::Fc1);
@@ -311,7 +311,7 @@ __device__ __forceinline__ bool try_claim_fc1_task_pair(
     pair_operand = kComputePairShareB;
   }
   exhausted = false;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin) {
       claim_completion_tasks(completion, transport_state::TaskClass::Fc1);
@@ -376,7 +376,7 @@ __device__ __forceinline__ bool try_claim_fc2_task(
 
     task = (encoded - 1ULL) * fc2_ntiles + n_tile;
     exhausted = false;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     if constexpr (!StaticLocal) {
       if (a.use_gin)
         claim_completion_tasks(completion,
@@ -440,7 +440,7 @@ __device__ __forceinline__ bool try_claim_fc2_task_pair(
     task1 = task0 + 1ULL;
     pair_operand = kComputePairShareA;
     exhausted = false;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     if constexpr (!StaticLocal) {
       if (a.use_gin) {
         claim_completion_tasks(completion,
@@ -960,7 +960,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   std::uint32_t fc2_pipeline = 0U;
   unsigned long long pair_round = 0ULL;
   unsigned int fc2_streak = 0U;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   bool timeline_fc1_started = false;
   bool timeline_fc2_started = false;
 #endif
@@ -986,13 +986,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       const auto task = *task_shared;
       if (*task_kind_shared != kComputeTaskFc1)
         break;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       if (threadIdx.x == 0U && !timeline_fc1_started) {
-        MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
                                 a.epoch);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
                                 a.epoch);
-        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
                                 a.epoch);
         timeline_fc1_started = true;
       }
@@ -1153,7 +1153,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             ready(fc1_done[mblock]);
         const auto old = ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if constexpr (!StaticLocal) {
           if (a.use_gin)
             complete_completion_tasks(completion,
@@ -1165,12 +1165,12 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               atomicAdd(&scheduler[11ULL + 2ULL * a.world], 1ULL) + 1ULL;
           if (fc1_mblocks_complete == forward_mblocks) {
             status->fc1_complete_clock = device_globaltimer_ns();
-            MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U,
                                     fc1_tasks, a.epoch);
             forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
           }
           const auto queue_slot = atomicAdd(&scheduler[2], 1ULL);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
           if (a.use_gin) {
             atomicAdd(&completion->progress_ctas_at_bulk_return, 1ULL);
             atomicMax(&completion->compute_ctas_at_bulk_return,
@@ -1197,9 +1197,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
     while (true) {
       if (*task_kind_shared != kComputeTaskFc2)
         break;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       if (threadIdx.x == 0U && !timeline_fc2_started) {
-        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2First, Compute, 0U,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2First, Compute, 0U,
                                 *task_shared, a.epoch);
         timeline_fc2_started = true;
       }
@@ -1386,7 +1386,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             complete.fetch_add(1ULL << 16U, ::cuda::memory_order_acq_rel);
         *return_mblock_shared =
             (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if constexpr (!StaticLocal) {
           if (a.use_gin)
             complete_completion_tasks(completion,
@@ -1397,7 +1397,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
 
       if (threadIdx.x == 0U)
-        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
                                 a.epoch);
 
       if (*return_mblock_shared != 0U) {
@@ -1450,7 +1450,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               forward_return_detail::issue_direct_full_mblock(
                   a, scheduler, row, valid_rows,
                   *return_context_masks_shared);
-              MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
+              WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
                                       Compute, 0U, mblock, a.epoch);
             }
           } else if (a.forward_stream_local_dispatch &&
@@ -1462,7 +1462,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             forward_return_detail::issue_direct_full_mblock(
                 a, scheduler, row, valid_rows,
                 *return_context_masks_shared);
-            MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
                                     Compute, 0U, mblock, a.epoch);
           }
         }
@@ -1471,7 +1471,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         // Relay owns node-local Return; compute only publishes descriptors.
       }
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (a.use_gin && threadIdx.x == 0U &&
           blockIdx.x < transport_state::kForwardDebugCtas) {
         completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
@@ -1490,9 +1490,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
     if (*task_kind_shared == kComputeTaskDone)
       break;
   }
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   if (threadIdx.x == 0U && timeline_fc2_started)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2Last, Compute, 0U, fc2_tasks,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2Last, Compute, 0U, fc2_tasks,
                             a.epoch);
 #endif
   if constexpr (Cluster2)
@@ -1519,7 +1519,7 @@ local_p2p_forward_compute_kernel(
     const __grid_constant__ CUtensorMap w2_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
   __shared__ unsigned long long task_shared;
   __shared__ unsigned int task_kind_shared;
@@ -1571,7 +1571,7 @@ local_p2p_forward_compute_kernel(
     }
   }
   if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 #else
   (void)a;
   (void)x_map;
@@ -1596,7 +1596,7 @@ __device__ __forceinline__ void local_p2p_forward_tma_store_role(
     unsigned int *task_kind_shared, unsigned int *return_mblock_shared,
     unsigned int *pair_operand_shared) {
   if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
   if (threadIdx.x == 0U) {
@@ -1626,7 +1626,7 @@ __device__ __forceinline__ void local_p2p_forward_tma_store_role(
         a, reduce_role_index, reduce_role_count);
   }
   if (threadIdx.x == 0U)
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 #endif
 

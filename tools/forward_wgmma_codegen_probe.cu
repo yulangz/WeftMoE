@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 #include <cutlass/arch/reg_reconfig.h>
 
-using Mma128 = typename megamoe::cuda::hopper::BF16MMASelector<128>::type;
-using Mma256 = typename megamoe::cuda::hopper::BF16MMASelector<256>::type;
+using Mma128 = typename weftmoe::cuda::hopper::BF16MMASelector<128>::type;
+using Mma256 = typename weftmoe::cuda::hopper::BF16MMASelector<256>::type;
 
 template <class Mma, bool Dual>
 __global__ __launch_bounds__(384, 1) void wgmma_codegen_probe(float *output) {
@@ -27,11 +27,11 @@ __global__ __launch_bounds__(384, 1) void wgmma_codegen_probe(float *output) {
   cute::warpgroup_arrive();
 #pragma unroll
   for (unsigned k = 0; k < 64U / Mma::K; ++k) {
-    const auto desc_a = megamoe::cuda::hopper::make_smem_desc(
+    const auto desc_a = weftmoe::cuda::hopper::make_smem_desc(
         smem + warpgroup * 64U * 64U + k * Mma::K, 1);
-    const auto desc_b = megamoe::cuda::hopper::make_smem_desc(
+    const auto desc_b = weftmoe::cuda::hopper::make_smem_desc(
         smem + 2U * 64U * 64U + k * Mma::K, 1);
-    const auto desc_b2 = megamoe::cuda::hopper::make_smem_desc(
+    const auto desc_b2 = weftmoe::cuda::hopper::make_smem_desc(
         smem + 4U * 64U * 64U + k * Mma::K, 1);
     Mma::wgmma(desc_a, desc_b, accum_a, 1);
     if constexpr (Dual)

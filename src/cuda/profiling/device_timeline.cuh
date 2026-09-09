@@ -2,9 +2,9 @@
 
 #include "cuda/profiling/device_timeline_types.hpp"
 
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
 
-namespace megamoe::cuda::profiling {
+namespace weftmoe::cuda::profiling {
 
 __device__ __forceinline__ std::uint64_t read_globaltimer_ns() {
   std::uint64_t value;
@@ -54,26 +54,26 @@ __device__ __forceinline__ void record(
   record_if(context, threadIdx.x == 0U, event, role, channel, arg0, arg1);
 }
 
-} // namespace megamoe::cuda::profiling
+} // namespace weftmoe::cuda::profiling
 
-#define MEGAMOE_TIMELINE_RECORD(context, event, role, channel, arg0, epoch) \
-  ::megamoe::cuda::profiling::record(                                    \
-      context, ::megamoe::cuda::profiling::TimelineEvent::event,          \
-      ::megamoe::cuda::profiling::TimelineRole::role, channel, arg0, epoch)
+#define WEFTMOE_TIMELINE_RECORD(context, event, role, channel, arg0, epoch) \
+  ::weftmoe::cuda::profiling::record(                                    \
+      context, ::weftmoe::cuda::profiling::TimelineEvent::event,          \
+      ::weftmoe::cuda::profiling::TimelineRole::role, channel, arg0, epoch)
 
-#define MEGAMOE_TIMELINE_RECORD_IF(context, elected, event, role, channel, \
+#define WEFTMOE_TIMELINE_RECORD_IF(context, elected, event, role, channel, \
                                    arg0, epoch)                           \
-  ::megamoe::cuda::profiling::record_if(                                  \
-      context, elected, ::megamoe::cuda::profiling::TimelineEvent::event, \
-      ::megamoe::cuda::profiling::TimelineRole::role, channel, arg0, epoch)
+  ::weftmoe::cuda::profiling::record_if(                                  \
+      context, elected, ::weftmoe::cuda::profiling::TimelineEvent::event, \
+      ::weftmoe::cuda::profiling::TimelineRole::role, channel, arg0, epoch)
 
 #else
 
-#define MEGAMOE_TIMELINE_RECORD(context, event, role, channel, arg0, epoch) \
+#define WEFTMOE_TIMELINE_RECORD(context, event, role, channel, arg0, epoch) \
   do {                                                                     \
   } while (false)
 
-#define MEGAMOE_TIMELINE_RECORD_IF(context, elected, event, role, channel, \
+#define WEFTMOE_TIMELINE_RECORD_IF(context, elected, event, role, channel, \
                                    arg0, epoch)                            \
   do {                                                                      \
   } while (false)

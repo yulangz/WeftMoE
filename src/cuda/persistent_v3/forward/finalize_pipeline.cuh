@@ -84,7 +84,7 @@ __device__ __forceinline__ void local_split_transport_finalize(
     status->complete_clock = device_globaltimer_ns();
   }
   forward_publish_progress(a, kForwardTerminal, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 
 template <bool StaticLocal>
@@ -136,7 +136,7 @@ __device__ __forceinline__ void split_transport_finalize(
       ready.store(a.epoch, ::cuda::memory_order_release);
     }
     __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay, 0U,
                             remote_fanout, a.epoch);
     if (threadIdx.x == 0U)
       persistent_v3::store_release<::cuda::thread_scope_device>(
@@ -165,7 +165,7 @@ __device__ __forceinline__ void split_transport_finalize(
                              a.dispatch.identity.num_tokens);
     if (a.injected_status_error_rank == static_cast<int>(a.rank))
       publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
-#if !MEGAMOE_DEBUG_VALIDATE
+#if !WEFTMOE_DEBUG_VALIDATE
     // All compute roles can reach their release only after draining FC1/FC2
     // and their claimed Reduce batch.  Queue head==num_tokens establishes the
     // exact reduction task space, so production records these three already-
@@ -220,7 +220,7 @@ __device__ __forceinline__ void split_transport_finalize(
     status->complete_clock = device_globaltimer_ns();
   }
   forward_publish_progress(a, kForwardTerminal, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
 }
 
 } // namespace forward_finalize_detail

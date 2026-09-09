@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JIT-compile and tune explicit MegaMOE Forward specializations.
+"""JIT-compile and tune explicit WeftMoE Forward specializations.
 
 The search plan is JSON rather than a collection of shell environment
 variables.  Python generates each specialization, compiles it into an atomic
@@ -57,58 +57,58 @@ GROUP_NAMES = (
 # it here makes plan validation fail instead of silently falling back to an
 # unreported binary default.
 PARAMETER_MACROS = {
-    "main_hidden": "MEGAMOE_FWD_MAIN_HIDDEN",
-    "main_intermediate": "MEGAMOE_FWD_MAIN_INTERMEDIATE",
-    "tile_m": "MEGAMOE_FWD_TILE_M",
-    "fc1_tile_n": "MEGAMOE_FWD_FC1_TILE_N",
-    "fc2_tile_n": "MEGAMOE_FWD_FC2_TILE_N",
-    "tile_k": "MEGAMOE_FWD_TILE_K",
-    "fc1_stages": "MEGAMOE_FWD_FC1_STAGES",
-    "fc2_stages": "MEGAMOE_FWD_FC2_STAGES",
-    "compute_threads": "MEGAMOE_FWD_COMPUTE_THREADS",
-    "math_warpgroups": "MEGAMOE_FWD_MATH_WARPGROUPS",
-    "producer_warpgroups": "MEGAMOE_FWD_PRODUCER_WARPGROUPS",
-    "math_registers": "MEGAMOE_FWD_MATH_REGISTERS",
-    "producer_registers": "MEGAMOE_FWD_PRODUCER_REGISTERS",
-    "wgmma_wait_group": "MEGAMOE_FWD_WGMMA_WAIT_GROUP",
-    "fc2_store_atom_n": "MEGAMOE_FWD_FC2_STORE_ATOM_N",
-    "cluster_size": "MEGAMOE_FWD_CLUSTER_SIZE",
-    "fc2_tma_store": "MEGAMOE_FWD_FC2_TMA_STORE",
-    "rdma_ctas": "MEGAMOE_FWD_RDMA_CTAS",
-    "relay_ctas": "MEGAMOE_FWD_RELAY_CTAS",
-    "rdma_control_warps": "MEGAMOE_FWD_RDMA_CONTROL_WARPS",
-    "relay_tma_warps": "MEGAMOE_FWD_RELAY_TMA_WARPS",
-    "local_dispatch_tma_warps": "MEGAMOE_FWD_LOCAL_DISPATCH_TMA_WARPS",
-    "relay_scatter_warps": "MEGAMOE_FWD_RELAY_SCATTER_WARPS",
+    "main_hidden": "WEFTMOE_FWD_MAIN_HIDDEN",
+    "main_intermediate": "WEFTMOE_FWD_MAIN_INTERMEDIATE",
+    "tile_m": "WEFTMOE_FWD_TILE_M",
+    "fc1_tile_n": "WEFTMOE_FWD_FC1_TILE_N",
+    "fc2_tile_n": "WEFTMOE_FWD_FC2_TILE_N",
+    "tile_k": "WEFTMOE_FWD_TILE_K",
+    "fc1_stages": "WEFTMOE_FWD_FC1_STAGES",
+    "fc2_stages": "WEFTMOE_FWD_FC2_STAGES",
+    "compute_threads": "WEFTMOE_FWD_COMPUTE_THREADS",
+    "math_warpgroups": "WEFTMOE_FWD_MATH_WARPGROUPS",
+    "producer_warpgroups": "WEFTMOE_FWD_PRODUCER_WARPGROUPS",
+    "math_registers": "WEFTMOE_FWD_MATH_REGISTERS",
+    "producer_registers": "WEFTMOE_FWD_PRODUCER_REGISTERS",
+    "wgmma_wait_group": "WEFTMOE_FWD_WGMMA_WAIT_GROUP",
+    "fc2_store_atom_n": "WEFTMOE_FWD_FC2_STORE_ATOM_N",
+    "cluster_size": "WEFTMOE_FWD_CLUSTER_SIZE",
+    "fc2_tma_store": "WEFTMOE_FWD_FC2_TMA_STORE",
+    "rdma_ctas": "WEFTMOE_FWD_RDMA_CTAS",
+    "relay_ctas": "WEFTMOE_FWD_RELAY_CTAS",
+    "rdma_control_warps": "WEFTMOE_FWD_RDMA_CONTROL_WARPS",
+    "relay_tma_warps": "WEFTMOE_FWD_RELAY_TMA_WARPS",
+    "local_dispatch_tma_warps": "WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS",
+    "relay_scatter_warps": "WEFTMOE_FWD_RELAY_SCATTER_WARPS",
     "local_return_batch_mblocks":
-        "MEGAMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS",
+        "WEFTMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS",
     "dispatch_publish_batch_rows":
-        "MEGAMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS",
-    "return_chunk_rows": "MEGAMOE_FWD_RETURN_CHUNK_ROWS",
-    "return_max_inflight": "MEGAMOE_FWD_RETURN_MAX_INFLIGHT",
-    "registered_output": "MEGAMOE_FWD_REGISTERED_OUTPUT",
-    "relay_local_return": "MEGAMOE_FWD_RELAY_LOCAL_RETURN",
-    "local_route_batch_rows": "MEGAMOE_FWD_LOCAL_ROUTE_BATCH_ROWS",
-    "startup_mblocks": "MEGAMOE_FWD_STARTUP_MBLOCKS",
-    "fc1_locality_group": "MEGAMOE_FWD_FC1_LOCALITY_GROUP",
+        "WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS",
+    "return_chunk_rows": "WEFTMOE_FWD_RETURN_CHUNK_ROWS",
+    "return_max_inflight": "WEFTMOE_FWD_RETURN_MAX_INFLIGHT",
+    "registered_output": "WEFTMOE_FWD_REGISTERED_OUTPUT",
+    "relay_local_return": "WEFTMOE_FWD_RELAY_LOCAL_RETURN",
+    "local_route_batch_rows": "WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS",
+    "startup_mblocks": "WEFTMOE_FWD_STARTUP_MBLOCKS",
+    "fc1_locality_group": "WEFTMOE_FWD_FC1_LOCALITY_GROUP",
     "fc1_locality_group4_begin":
-        "MEGAMOE_FWD_FC1_LOCALITY_GROUP4_BEGIN",
-    "fc1_locality_group4_end": "MEGAMOE_FWD_FC1_LOCALITY_GROUP4_END",
-    "fc2_priority_burst": "MEGAMOE_FWD_FC2_PRIORITY_BURST",
-    "task_claim_chunk": "MEGAMOE_FWD_TASK_CLAIM_CHUNK",
-    "task_idle_nanosleep": "MEGAMOE_FWD_TASK_IDLE_NANOSLEEP",
-    "transport_idle_nanosleep": "MEGAMOE_FWD_TRANSPORT_IDLE_NANOSLEEP",
-    "setup_nanosleep": "MEGAMOE_FWD_SETUP_NANOSLEEP",
+        "WEFTMOE_FWD_FC1_LOCALITY_GROUP4_BEGIN",
+    "fc1_locality_group4_end": "WEFTMOE_FWD_FC1_LOCALITY_GROUP4_END",
+    "fc2_priority_burst": "WEFTMOE_FWD_FC2_PRIORITY_BURST",
+    "task_claim_chunk": "WEFTMOE_FWD_TASK_CLAIM_CHUNK",
+    "task_idle_nanosleep": "WEFTMOE_FWD_TASK_IDLE_NANOSLEEP",
+    "transport_idle_nanosleep": "WEFTMOE_FWD_TRANSPORT_IDLE_NANOSLEEP",
+    "setup_nanosleep": "WEFTMOE_FWD_SETUP_NANOSLEEP",
     "completion_chunks_per_pass":
-        "MEGAMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
-    "completion_marker_warps": "MEGAMOE_FWD_COMPLETION_MARKER_WARPS",
-    "reduce_scheduler": "MEGAMOE_FWD_REDUCE_SCHEDULER",
-    "reduce_warps": "MEGAMOE_FWD_REDUCE_WARPS",
-    "reduce_tokens_per_claim": "MEGAMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
-    "reduce_registers": "MEGAMOE_FWD_REDUCE_REGISTERS",
-    "return_idle_nanosleep": "MEGAMOE_FWD_RETURN_IDLE_NANOSLEEP",
-    "reduce_queue_nanosleep": "MEGAMOE_FWD_REDUCE_QUEUE_NANOSLEEP",
-    "finalize_nanosleep": "MEGAMOE_FWD_FINALIZE_NANOSLEEP",
+        "WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
+    "completion_marker_warps": "WEFTMOE_FWD_COMPLETION_MARKER_WARPS",
+    "reduce_scheduler": "WEFTMOE_FWD_REDUCE_SCHEDULER",
+    "reduce_warps": "WEFTMOE_FWD_REDUCE_WARPS",
+    "reduce_tokens_per_claim": "WEFTMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
+    "reduce_registers": "WEFTMOE_FWD_REDUCE_REGISTERS",
+    "return_idle_nanosleep": "WEFTMOE_FWD_RETURN_IDLE_NANOSLEEP",
+    "reduce_queue_nanosleep": "WEFTMOE_FWD_REDUCE_QUEUE_NANOSLEEP",
+    "finalize_nanosleep": "WEFTMOE_FWD_FINALIZE_NANOSLEEP",
 }
 
 # Preserve internal keys/macros for running autotunes and cached candidates.
@@ -520,7 +520,7 @@ def materialize_candidate(candidate: Mapping[str, Any],
     build_dir = build_root / f"{candidate['name']}-{digest}"
     include_dir = build_dir / "generated"
     include_dir.mkdir(parents=True, exist_ok=True)
-    header = include_dir / "megamoe_forward_tuning_generated.hpp"
+    header = include_dir / "weftmoe_forward_tuning_generated.hpp"
     content = generated_header(candidate["name"], candidate["config"])
     if not header.exists() or header.read_text(encoding="utf-8") != content:
         header.write_text(content, encoding="utf-8")
@@ -598,15 +598,15 @@ def _sanitized_environment() -> dict[str, str]:
     explicit_removals = {
         "NCCL_IB_DISABLE",
         "NCCL_SOCKET_IFNAME",
-        "MEGAMOE_INTEGRATED_TOP_K",
-        "MEGAMOE_P2P_TOP_K",
-        "MEGAMOE_P2P_BENCH_TOKENS",
-        "MEGAMOE_FORWARD_BENCH_ROUNDS",
-        "MEGAMOE_FORWARD_BENCH_GENERATION_BASE",
+        "WEFTMOE_INTEGRATED_TOP_K",
+        "WEFTMOE_P2P_TOP_K",
+        "WEFTMOE_P2P_BENCH_TOKENS",
+        "WEFTMOE_FORWARD_BENCH_ROUNDS",
+        "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
     }
     for key in tuple(environment):
-        if (key.startswith("MEGAMOE_FORWARD_") or
-                key.startswith("MEGAMOE_FWD_") or key in explicit_removals):
+        if (key.startswith("WEFTMOE_FORWARD_") or
+                key.startswith("WEFTMOE_FWD_") or key in explicit_removals):
             environment.pop(key, None)
     return environment
 
@@ -714,14 +714,14 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                         suffix: str = "tune") -> dict[str, Any]:
     command = launcher_command(binary, benchmark, rounds=rounds)
     run_environment = dict(environment)
-    run_environment["MEGAMOE_P2P_BENCH_TOKENS"] = str(
+    run_environment["WEFTMOE_P2P_BENCH_TOKENS"] = str(
         int(benchmark["tokens_per_rank"]))
-    run_environment["MEGAMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
-    run_environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
-    run_environment["MEGAMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
+    run_environment["WEFTMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
+    run_environment["WEFTMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
+    run_environment["WEFTMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
         int(benchmark["generation_base"]))
     if "experts" in benchmark:
-        run_environment["MEGAMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
+        run_environment["WEFTMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
     if benchmark.get("launcher", "multinode") == "local":
         nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
         if nccl_lib_dir:

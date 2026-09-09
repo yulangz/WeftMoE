@@ -19,7 +19,7 @@ __device__ __forceinline__ void reduce_one_token(
     transport::BFloat16 *combined,
     transport_state::GenerationCompletionVector *completion) {
   const auto lane = threadIdx.x & 31U;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin && lane == 0U)
       claim_completion_tasks(completion, transport_state::TaskClass::Reduce);
@@ -105,7 +105,7 @@ __device__ __forceinline__ void reduce_one_token(
     persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
         control->reduce_tokens_complete.value, 1ULL);
   }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin && lane == 0U)
       complete_completion_tasks(completion, transport_state::TaskClass::Reduce);
@@ -150,9 +150,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
   static_assert(kTokensPerClaim <= kReduceWarps);
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
                           a.dispatch.identity.num_tokens, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
                           a.dispatch.identity.num_tokens, a.epoch);
 
   if (a.forward_dynamic_reduce_queue) {
@@ -223,13 +223,13 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
             encoded = published.load(::cuda::memory_order_acquire);
           }
           if (encoded != 0ULL) {
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
             constexpr unsigned long long kTokenMask =
                 (1ULL << 56U) - 1ULL;
             const auto publisher_kind =
                 static_cast<std::uint32_t>(encoded >> 56U);
             token = (encoded & kTokenMask) - 1ULL;
-            MEGAMOE_TIMELINE_RECORD_IF(
+            WEFTMOE_TIMELINE_RECORD_IF(
                 a.timeline, true, ReduceTokenReadyObserved, Reduce,
                 publisher_kind, token, a.epoch);
 #else
@@ -344,7 +344,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
 
   if (lane == 0U)
     atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
                           a.dispatch.identity.num_tokens, a.epoch);
   __threadfence();
   __syncthreads();

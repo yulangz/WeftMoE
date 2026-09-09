@@ -8,7 +8,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     const __grid_constant__ CUtensorMap w2_map) {
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
-  MEGAMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
   extern __shared__ __align__(1024) unsigned char storage[];
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
@@ -162,7 +162,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         if (a.use_gin) {
           completion->generation = a.dispatch.identity.generation;
           completion->epoch = a.epoch;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
           completion->first_waiting_tile = ~0ULL;
 #endif
           unsigned long long dispatch_waves = 0ULL;
@@ -374,7 +374,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     if (!remote_backend_enabled<StaticLocal>(a.use_socket)) {
 #if __has_include(<nccl_device.h>)
       if (stream_local_dispatch) {
-#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#if defined(WEFTMOE_FORWARD_TRANSPORT_TU)
         forward_dispatch_detail::local_relay_role(
             a, *forward_v3_control, static_cast<std::uint32_t>(blockIdx.x),
             scheduler, storage);
@@ -412,7 +412,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         // Local rows use the frozen CUDA-IPC fast path. Cross-node rows are
         // packed once per (token,node) by the same-rail proxy path below.
         unsigned long long dispatch_peer_rows = 0ULL;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
         bool timeline_x_local_recorded = false;
 #endif
         for (std::uint64_t route = blockIdx.x;
@@ -454,7 +454,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                                       a.local_world_size +
                                   rail]);
               counter.fetch_add(1ULL, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
               atomicAdd(&completion->local_rows_published, 1ULL);
               const auto tile = a.dispatch_waves.route_dst_mtile[route];
               if (tile < 64U)
@@ -463,10 +463,10 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
             }
             __syncthreads();
           }
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
           __syncthreads();
           if (!timeline_x_local_recorded) {
-            MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
                                     GinDispatch, 0U, route, a.epoch);
             timeline_x_local_recorded = true;
           }
@@ -506,13 +506,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
               static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
           const auto global_threads =
               static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
           unsigned long long dispatch_pack_thread_bytes = 0ULL;
           __shared__ unsigned long long dispatch_pack_cta_bytes;
           if (threadIdx.x == 0U)
             dispatch_pack_cta_bytes = 0ULL;
           __syncthreads();
-          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch,
                                   0U, 0ULL, a.epoch);
 #endif
           for (std::uint64_t item = global_thread;
@@ -528,7 +528,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 send_payload)[wave_position * vector_count + vector] =
                 reinterpret_cast<const uint4 *>(
                     a.input)[descriptor.local_token_id * vector_count + vector];
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
             dispatch_pack_thread_bytes += sizeof(uint4);
 #endif
           }
@@ -558,7 +558,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                   target.reserved,
                   a.gates[route]};
             }
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
             if (fanout_begin + fanout_slot < fanout_end)
               dispatch_pack_thread_bytes +=
                   sizeof(ForwardDispatchFanoutRecord);
@@ -587,23 +587,23 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 wave_position * a.dispatch.identity.top_k,
                 0,
                 0};
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
             dispatch_pack_thread_bytes += sizeof(LocalP2pRouteHeader);
 #endif
           }
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
           atomicAdd(&dispatch_pack_cta_bytes, dispatch_pack_thread_bytes);
           __syncthreads();
-          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackCtaBytes, GinDispatch,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPackCtaBytes, GinDispatch,
                                   0U, dispatch_pack_cta_bytes, a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch, 0U,
                                   dispatch_pack_cta_bytes, a.epoch);
 #endif
           // GIN's device DMA reads this window after the grid-wide producers
           // have populated it. A cooperative grid barrier orders CUDA threads
           // but does not by itself publish their stores to a system-scope
           // device backend.
-          MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchPacketReady, GinDispatch,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPacketReady, GinDispatch,
                                   blockIdx.x < a.gin_context_count ? blockIdx.x
                                                                    : 0U,
                                   a.dispatch.sizes.packet_count, a.epoch);
@@ -620,7 +620,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
               window_bytes + a.gin_send_dispatch_directory_offset);
           auto *send_headers = reinterpret_cast<LocalP2pRouteHeader *>(
               window_bytes + a.gin_send_header_offset);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
           auto *send_fanout =
               reinterpret_cast<ForwardDispatchFanoutRecord *>(
               window_bytes + a.gin_send_fanout_offset);
@@ -756,7 +756,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 __threadfence_system();
                 const auto receive_packet =
                     source_partition * a.max_tokens_per_rank + wire_begin;
-                MEGAMOE_TIMELINE_RECORD(
+                WEFTMOE_TIMELINE_RECORD(
                     a.timeline, GinPutIssue, GinDispatch, context,
                     wave_packets * a.hidden * sizeof(transport::BFloat16),
                     a.epoch);
@@ -805,7 +805,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           }
           if (threadIdx.x == 0U && issued_completions != 0ULL) {
             gin.waitCounter(ncclCoopThread{}, 0, issued_completions);
-            MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
                                     GinDispatch, context, issued_packets,
                                     a.epoch);
             atomicAdd(&status->deduplicated_cross_node_payload_bytes,
@@ -832,7 +832,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
               record.last_cursor =
                   directory.packet_begin + directory.packet_count;
               record.last_progress_globaltimer = device_globaltimer_ns();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
               std::uint64_t first_node_wave = 0;
               while (first_node_wave < a.dispatch_waves.wave_count &&
                      a.dispatch_waves.destination_node[first_node_wave] <
@@ -908,10 +908,10 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
             if (incoming_waves != 0ULL)
               gin.waitSignal(ncclCoopThread{}, 0,
                              incoming_sources + incoming_waves);
-            MEGAMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved,
                                     GinDispatch, context, incoming_sources,
                                     a.epoch);
-            MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
+            WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
                                     context, incoming_sources, a.epoch);
             // The GIN signal orders the network operation, but the next
             // consumer is now a different CTA/SM.  Bridge async-proxy writes
@@ -976,10 +976,10 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           auto *receive_directory =
               reinterpret_cast<GinDispatchContextRecord *>(
                   window_bytes + a.gin_receive_dispatch_directory_offset);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, 0U,
                                   a.dispatch.sizes.incoming_signal_count,
                                   a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstProxyRelay, ProxyRelay, 0U,
                                   a.dispatch.sizes.incoming_signal_count,
                                   a.epoch);
           const auto vector_count = a.hidden / 8ULL;
@@ -1137,7 +1137,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                     counter(
                         arrived[target.mtile * a.local_world_size + rail]);
                 counter.fetch_add(1ULL, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
                 const auto record_index =
                     source_partition * a.gin_context_count + directory_context;
                 atomicAdd(&context_completion[record_index].relay_fanout_rows,
@@ -1173,9 +1173,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                   completion, transport_state::TaskClass::RelayWave, relayed);
             }
           }
-          MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, 0U,
                                   a.dispatch.sizes.incoming_row_count, a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, 0U,
                                   a.dispatch.sizes.incoming_row_count, a.epoch);
         }
 #endif
@@ -1244,9 +1244,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       status->dispatch_complete_clock = device_globaltimer_ns();
       status->fc1_start_clock = status->dispatch_complete_clock;
     }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
                             a.dispatch.sizes.mtile_count, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
                             a.dispatch.sizes.mtile_count, a.epoch);
 
     if constexpr (KernelRole == ForwardKernelRole::TransportOnly) {
@@ -1332,12 +1332,12 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       __shared__ unsigned int claim_shared;
       auto *fc1_claims = claims + forward_mblocks;
       auto *fc2_claims = fc1_claims + fc1_tasks;
-      constexpr unsigned int kTaskChunk = MEGAMOE_DEBUG_VALIDATE ? 1U : 4U;
+      constexpr unsigned int kTaskChunk = WEFTMOE_DEBUG_VALIDATE ? 1U : 4U;
       unsigned int task_in_chunk = kTaskChunk;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       bool timeline_fc1_started = false;
 #endif
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       if (completion != nullptr && threadIdx.x == 0U) {
         completion->fc1_scheduler_value =
             a.cancel_epoch
@@ -1367,7 +1367,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         if (threadIdx.x == 0U) {
           claim_shared =
               atomicCAS(&fc1_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
           if (completion != nullptr) {
             completion->fc1_scheduler_value = task;
             completion->bulk_local_ready = 11ULL;
@@ -1393,13 +1393,13 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
             a, expert, static_cast<std::uint64_t>(local_mblock) * 128ULL,
             valid_rows, completion);
         __syncthreads();
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
         if (!timeline_fc1_started) {
-          MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U,
                                   task, a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
                                   a.epoch);
-          MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
                                   a.epoch);
           timeline_fc1_started = true;
         }
@@ -1504,7 +1504,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       }
       if (threadIdx.x == 0)
         atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
-      MEGAMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
                               a.epoch);
       forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
 
@@ -1542,7 +1542,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         if (threadIdx.x == 0U) {
           claim_shared =
               atomicCAS(&fc2_claims[task], 0ULL, 1ULL) == 0ULL ? 1U : 0U;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
           if (completion != nullptr)
             completion->fc2_scheduler_value = task;
 #endif
@@ -1554,7 +1554,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           if (a.use_gin && threadIdx.x == 0U)
             claim_completion_tasks(completion,
                                    transport_state::TaskClass::Fc2);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (a.use_gin && threadIdx.x == 0U &&
             blockIdx.x < transport_state::kForwardDebugCtas) {
           completion->forward_fc2_cta_tiles_started[blockIdx.x] = task + 1ULL;
@@ -1574,7 +1574,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                fc1_ntiles) {
         }
         __syncthreads();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (a.use_gin && threadIdx.x == 0U &&
             blockIdx.x < transport_state::kForwardDebugCtas)
           completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
@@ -1593,7 +1593,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
             static_cast<std::uint32_t>(expert * a.hidden + n),
             static_cast<std::uint32_t>(a.intermediate), smem_a, smem_b,
             fc2_full_barriers, fc2_empty_barriers, accum, pipeline_iteration, 0U
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
             ,
             a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas
                 ? &completion->forward_fc2_cta_producer_checkpoint[blockIdx.x]
@@ -1606,7 +1606,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
                 : nullptr
 #endif
         );
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (a.use_gin && threadIdx.x == 0U &&
             blockIdx.x < transport_state::kForwardDebugCtas)
           completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
@@ -1630,7 +1630,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         // CTAs can continue FC2 for unrelated blocks in parallel.
         __threadfence();
         __syncthreads();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (a.use_gin && threadIdx.x == 0U &&
             blockIdx.x < transport_state::kForwardDebugCtas)
           completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
@@ -1661,7 +1661,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           }
           __syncthreads();
         }
-        MEGAMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
                                 a.epoch);
         if (return_mblock_shared != 0U &&
             !remote_backend_enabled<StaticLocal>(a.use_socket)) {
@@ -1738,7 +1738,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
           if (a.use_gin && threadIdx.x == 0U)
             complete_completion_tasks(completion,
                                       transport_state::TaskClass::Fc2);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
         if (a.use_gin && threadIdx.x == 0U &&
             blockIdx.x < transport_state::kForwardDebugCtas) {
           completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] =
@@ -1822,9 +1822,9 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
     const auto warp = threadIdx.x / 32U;
     const auto lane = threadIdx.x & 31U;
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
                             a.dispatch.identity.num_tokens, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
                             a.dispatch.identity.num_tokens, a.epoch);
     const auto token_warp = warp % kWarpsPerToken;
     for (std::uint64_t token =
@@ -1902,7 +1902,7 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
     }
     if (lane == 0U)
       atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
-    MEGAMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
                             a.dispatch.identity.num_tokens, a.epoch);
     __syncthreads();
     grid.sync();
@@ -1972,6 +1972,6 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
       status->complete_clock = device_globaltimer_ns();
     }
     forward_publish_progress(a, kForwardTerminal, a.epoch);
-    MEGAMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
   }
 }

@@ -9,206 +9,206 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 cases = {
     "old_wait": r'''
-#include "megamoe/cuda/device_notify.hpp"
-int main() { megamoe::cuda::CudaNotifyOperation op; (void)op.wait(); }
+#include "weftmoe/cuda/device_notify.hpp"
+int main() { weftmoe::cuda::CudaNotifyOperation op; (void)op.wait(); }
 ''',
     "wait_preflight": r'''
-#include "megamoe/cuda/device_notify.hpp"
-int main() { megamoe::cuda::CudaNotifyOperation op; (void)op.wait_preflight(); }
+#include "weftmoe/cuda/device_notify.hpp"
+int main() { weftmoe::cuda::CudaNotifyOperation op; (void)op.wait_preflight(); }
 ''',
     "raw_notify_start": r'''
-#include "megamoe/cuda/device_notify.hpp"
-int main() { (void)megamoe::cuda::start_cuda_rank_local_notify; }
+#include "weftmoe/cuda/device_notify.hpp"
+int main() { (void)weftmoe::cuda::start_cuda_rank_local_notify; }
 ''',
     "control_starter": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { (void)megamoe::cuda::start_control_collective; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { (void)weftmoe::cuda::start_control_collective; }
 ''',
     "config_starter": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { (void)megamoe::cuda::start_config_collective; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { (void)weftmoe::cuda::start_config_collective; }
 ''',
     "count_starter": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { (void)megamoe::cuda::start_count_collective; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { (void)weftmoe::cuda::start_count_collective; }
 ''',
     "summary_starter": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { (void)megamoe::cuda::start_summary_collective; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { (void)weftmoe::cuda::start_summary_collective; }
 ''',
     "internal_operation": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { megamoe::cuda::NcclControlOperation operation; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { weftmoe::cuda::NcclControlOperation operation; }
 ''',
     "internal_backend": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { megamoe::cuda::NcclAllGatherCountExchange backend; }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { weftmoe::cuda::NcclAllGatherCountExchange backend; }
 ''',
     "bootstrap_hex": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { megamoe::cuda::NcclBootstrapId id; (void)id.hex(); }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { weftmoe::cuda::NcclBootstrapId id; (void)id.hex(); }
 ''',
     "bootstrap_parse": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
-int main() { (void)megamoe::cuda::parse_nccl_bootstrap_id("00"); }
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
+int main() { (void)weftmoe::cuda::parse_nccl_bootstrap_id("00"); }
 ''',
     "unpooled_production_coordinator": r'''
-#include "megamoe/cuda/nccl_count_exchange.hpp"
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
 int main() {
-  megamoe::cuda::NcclSession session;
-  megamoe::cuda::CudaExecution execution;
-  megamoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+  weftmoe::cuda::NcclSession session;
+  weftmoe::cuda::CudaExecution execution;
+  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
                                                                execution);
 }
 ''',
     "generic_route_rebind": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::DeviceBufferLease generic;
-  megamoe::cuda::CudaExecution execution;
-  (void)megamoe::cuda::make_device_route_input(generic, 1, 1, execution);
+  weftmoe::DeviceBufferLease generic;
+  weftmoe::cuda::CudaExecution execution;
+  (void)weftmoe::cuda::make_device_route_input(generic, 1, 1, execution);
 }
 ''',
     "public_test_route_upload": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::RankRoutingInput routes;
-  megamoe::RankCollectiveContext context;
-  megamoe::cuda::CudaExecution execution;
-  (void)megamoe::cuda::upload_device_routes_for_testing(routes, 1, context,
+  weftmoe::RankRoutingInput routes;
+  weftmoe::RankCollectiveContext context;
+  weftmoe::cuda::CudaExecution execution;
+  (void)weftmoe::cuda::upload_device_routes_for_testing(routes, 1, context,
                                                          execution);
 }
 ''',
     "public_generation_reissue": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::CudaRouteInput routes;
-  megamoe::RankCollectiveContext context;
-  megamoe::cuda::CudaExecution execution;
-  (void)megamoe::cuda::reissue_cuda_routes_for_testing(routes, context,
+  weftmoe::cuda::CudaRouteInput routes;
+  weftmoe::RankCollectiveContext context;
+  weftmoe::cuda::CudaExecution execution;
+  (void)weftmoe::cuda::reissue_cuda_routes_for_testing(routes, context,
                                                         execution);
 }
 ''',
     "test_pipeline_handoff": r'''
-#include "megamoe/cuda/device_notify.hpp"
-int main() { (void)megamoe::cuda::test_pipeline_handoff; }
+#include "weftmoe/cuda/device_notify.hpp"
+int main() { (void)weftmoe::cuda::test_pipeline_handoff; }
 ''',
     "unsafe_route_import_without_wait": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::CudaRouteInput routes;
-  megamoe::RankCollectiveContext context;
-  megamoe::cuda::CudaExecution execution;
-  (void)megamoe::cuda::unsafe_import_cuda_routes_without_wait_for_testing(
+  weftmoe::cuda::CudaRouteInput routes;
+  weftmoe::RankCollectiveContext context;
+  weftmoe::cuda::CudaExecution execution;
+  (void)weftmoe::cuda::unsafe_import_cuda_routes_without_wait_for_testing(
       routes, context, execution);
 }
 ''',
     "wrong_route_dtype": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::SelectedExpertRouteLease<std::uint64_t> wrong_dtype;
+  weftmoe::cuda::SelectedExpertRouteLease<std::uint64_t> wrong_dtype;
 }
 ''',
     "wrong_gate_dtype": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::SelectedExpertGateLease<std::uint16_t> wrong_dtype;
+  weftmoe::cuda::SelectedExpertGateLease<std::uint16_t> wrong_dtype;
 }
 ''',
     "generic_gate_rebind": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::DeviceBufferLease generic;
-  (void)megamoe::cuda::make_selected_expert_gate_input(generic);
+  weftmoe::DeviceBufferLease generic;
+  (void)weftmoe::cuda::make_selected_expert_gate_input(generic);
 }
 ''',
     "dispatch_checked_raw_view": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::DeviceDispatchHandle handle;
-  megamoe::cuda::CudaExecution execution;
-  megamoe::cuda::DeviceDispatchViewExpectation expected;
+  weftmoe::cuda::DeviceDispatchHandle handle;
+  weftmoe::cuda::CudaExecution execution;
+  weftmoe::cuda::DeviceDispatchViewExpectation expected;
   auto view = handle.checked_view(execution, expected);
   (void)view.route_dst_row;
 }
 ''',
     "public_kernel_view": r'''
-#include "megamoe/cuda/device_notify.hpp"
-int main() { megamoe::cuda::DeviceDispatchKernelView view; }
+#include "weftmoe/cuda/device_notify.hpp"
+int main() { weftmoe::cuda::DeviceDispatchKernelView view; }
 ''',
     "public_generic_dispatch_buffers": r'''
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 int main() {
-  megamoe::cuda::DeviceDispatchHandle handle;
+  weftmoe::cuda::DeviceDispatchHandle handle;
   (void)handle.device().route_dst_row;
 }
 ''',
     "activation_wrong_dtype": r'''
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 int main() {
-  megamoe::cuda::SelectedActivationLease<std::uint16_t> wrong;
+  weftmoe::cuda::SelectedActivationLease<std::uint16_t> wrong;
 }
 ''',
     "generic_activation_rebind": r'''
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 int main() {
-  megamoe::DeviceBufferLease generic;
-  (void)megamoe::cuda::make_activation_input(generic);
+  weftmoe::DeviceBufferLease generic;
+  (void)weftmoe::cuda::make_activation_input(generic);
 }
 ''',
     "raw_peer_pointer": r'''
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 int main() {
-  megamoe::cuda::LocalCudaP2pActivationTransport backend;
+  weftmoe::cuda::LocalCudaP2pActivationTransport backend;
   (void)backend.peer_pointer(1);
 }
 ''',
     "private_ipc_factory": r'''
-#include "megamoe/cuda/activation_transport.hpp"
-int main() { (void)megamoe::cuda::make_local_p2p_ipc_mapping; }
+#include "weftmoe/cuda/activation_transport.hpp"
+int main() { (void)weftmoe::cuda::make_local_p2p_ipc_mapping; }
 ''',
     "activation_backend_enum_spoof": r'''
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 int main() {
-  megamoe::cuda::DeviceActivationTransport transport;
-  megamoe::cuda::DeviceDispatchHandle dispatch;
-  megamoe::cuda::BFloat16ActivationLease input;
-  megamoe::transport::ActivationTransportConfig config;
+  weftmoe::cuda::DeviceActivationTransport transport;
+  weftmoe::cuda::DeviceDispatchHandle dispatch;
+  weftmoe::cuda::BFloat16ActivationLease input;
+  weftmoe::transport::ActivationTransportConfig config;
   (void)transport.run_synthetic(
       dispatch, input, config,
-      megamoe::transport::ActivationTransportBackend::LocalCudaP2p);
+      weftmoe::transport::ActivationTransportBackend::LocalCudaP2p);
 }
 ''',
     "installed_testing_namespace": r'''
-#include "megamoe/cuda/activation_transport.hpp"
-int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
+#include "weftmoe/cuda/activation_transport.hpp"
+int main() { (void)weftmoe::cuda::testing::cuda_api_audit_snapshot(); }
 ''',
     "retired_testing_macro_cannot_restore_api": r'''
-#define MEGAMOE_INTERNAL_TESTING_API 1
-#include "megamoe/cuda/activation_transport.hpp"
-int main() { (void)megamoe::cuda::testing::cuda_api_audit_snapshot(); }
+#define WEFTMOE_INTERNAL_TESTING_API 1
+#include "weftmoe/cuda/activation_transport.hpp"
+int main() { (void)weftmoe::cuda::testing::cuda_api_audit_snapshot(); }
 ''',
     "installed_synthetic_transport": r'''
-#include "megamoe/cuda/activation_transport.hpp"
-int main() { megamoe::cuda::DeviceActivationTransport transport; }
+#include "weftmoe/cuda/activation_transport.hpp"
+int main() { weftmoe::cuda::DeviceActivationTransport transport; }
 ''',
     "installed_validation_download": r'''
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 int main() {
-  megamoe::cuda::DeviceForwardHandle handle;
-  megamoe::cuda::CudaExecution execution;
-  (void)megamoe::cuda::download_forward_output_for_validation(handle,
+  weftmoe::cuda::DeviceForwardHandle handle;
+  weftmoe::cuda::CudaExecution execution;
+  (void)weftmoe::cuda::download_forward_output_for_validation(handle,
                                                                execution);
 }
 ''',
     "installed_host_oracle_wrapper": r'''
-#include "megamoe/api/notify_dispatch.hpp"
-int main() { (void)megamoe::build_notify_dispatch_for_testing; }
+#include "weftmoe/api/notify_dispatch.hpp"
+int main() { (void)weftmoe::build_notify_dispatch_for_testing; }
 ''',
     "host_integer_row_lifetime_hook": r'''
-#include "megamoe/transport/count_exchange.hpp"
+#include "weftmoe/transport/count_exchange.hpp"
 int main() {
-  megamoe::HostIntegerRow row;
+  weftmoe::HostIntegerRow row;
   (void)row.lifetime_for_testing();
 }
 ''',

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify or explicitly refresh the libmegamoe v2 dynamic-symbol contract."""
+"""Verify or explicitly refresh the libweftmoe v2 dynamic-symbol contract."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def symbols(binary: pathlib.Path) -> list[tuple[str, str]]:
         if len(fields) < 3:
             continue
         name = fields[-1].split("@", 1)[0]
-        if name == "MEGAMOE_2":
+        if name == "WEFTMOE_2":
             continue
         demangled = subprocess.check_output(["c++filt", name], text=True).strip()
         result.append((name, demangled))
@@ -47,7 +47,7 @@ def symbols(binary: pathlib.Path) -> list[tuple[str, str]]:
 def approved(candidates: list[tuple[str, str]]) -> list[str]:
     result = []
     for raw, demangled in candidates:
-        if not demangled.startswith("megamoe::"):
+        if not demangled.startswith("weftmoe::"):
             continue
         lowered = demangled.lower()
         if any(term.lower() in lowered for term in BANNED):
@@ -62,7 +62,7 @@ def write_contract(path: pathlib.Path, names: list[str]) -> None:
 
 
 def write_version_script(path: pathlib.Path, names: list[str]) -> None:
-    lines = ["MEGAMOE_2 {", "  global:"]
+    lines = ["WEFTMOE_2 {", "  global:"]
     lines.extend(f"    {name};" for name in names)
     lines.extend(["  local: *;", "};", ""])
     path.write_text("\n".join(lines), encoding="utf-8")

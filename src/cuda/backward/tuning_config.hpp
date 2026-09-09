@@ -6,153 +6,153 @@
 // Dynamic builds generate this header from an explicit JSON configuration.
 // The checked-in defaults are one auditable Hopper specialization, not a set
 // of runtime environment switches.
-#if defined(MEGAMOE_BACKWARD_USE_GENERATED_TUNING)
-#include <megamoe_backward_tuning_generated.hpp>
+#if defined(WEFTMOE_BACKWARD_USE_GENERATED_TUNING)
+#include <weftmoe_backward_tuning_generated.hpp>
 #endif
 
-#ifndef MEGAMOE_BWD_MAIN_HIDDEN
-#define MEGAMOE_BWD_MAIN_HIDDEN 7168
+#ifndef WEFTMOE_BWD_MAIN_HIDDEN
+#define WEFTMOE_BWD_MAIN_HIDDEN 7168
 #endif
-#ifndef MEGAMOE_BWD_MAIN_INTERMEDIATE
-#define MEGAMOE_BWD_MAIN_INTERMEDIATE 3072
+#ifndef WEFTMOE_BWD_MAIN_INTERMEDIATE
+#define WEFTMOE_BWD_MAIN_INTERMEDIATE 3072
 #endif
-#ifndef MEGAMOE_BWD_TILE_M
-#define MEGAMOE_BWD_TILE_M 128
+#ifndef WEFTMOE_BWD_TILE_M
+#define WEFTMOE_BWD_TILE_M 128
 #endif
-#ifndef MEGAMOE_BWD_DAB_TILE_N
-#define MEGAMOE_BWD_DAB_TILE_N 256
+#ifndef WEFTMOE_BWD_DAB_TILE_N
+#define WEFTMOE_BWD_DAB_TILE_N 256
 #endif
-#ifndef MEGAMOE_BWD_DX_TILE_N
-#define MEGAMOE_BWD_DX_TILE_N 256
+#ifndef WEFTMOE_BWD_DX_TILE_N
+#define WEFTMOE_BWD_DX_TILE_N 256
 #endif
-#ifndef MEGAMOE_BWD_DW_TILE_M
-#define MEGAMOE_BWD_DW_TILE_M 128
+#ifndef WEFTMOE_BWD_DW_TILE_M
+#define WEFTMOE_BWD_DW_TILE_M 128
 #endif
-#ifndef MEGAMOE_BWD_DW_TILE_N
-#define MEGAMOE_BWD_DW_TILE_N 256
+#ifndef WEFTMOE_BWD_DW_TILE_N
+#define WEFTMOE_BWD_DW_TILE_N 256
 #endif
-#ifndef MEGAMOE_BWD_TILE_K
-#define MEGAMOE_BWD_TILE_K 64
+#ifndef WEFTMOE_BWD_TILE_K
+#define WEFTMOE_BWD_TILE_K 64
 #endif
-#ifndef MEGAMOE_BWD_DAB_STAGES
-#define MEGAMOE_BWD_DAB_STAGES 4
+#ifndef WEFTMOE_BWD_DAB_STAGES
+#define WEFTMOE_BWD_DAB_STAGES 4
 #endif
-#ifndef MEGAMOE_BWD_DX_STAGES
-#define MEGAMOE_BWD_DX_STAGES 4
+#ifndef WEFTMOE_BWD_DX_STAGES
+#define WEFTMOE_BWD_DX_STAGES 4
 #endif
-#ifndef MEGAMOE_BWD_DW1_STAGES
-#define MEGAMOE_BWD_DW1_STAGES 3
+#ifndef WEFTMOE_BWD_DW1_STAGES
+#define WEFTMOE_BWD_DW1_STAGES 3
 #endif
-#ifndef MEGAMOE_BWD_DW2_STAGES
-#define MEGAMOE_BWD_DW2_STAGES 3
+#ifndef WEFTMOE_BWD_DW2_STAGES
+#define WEFTMOE_BWD_DW2_STAGES 3
 #endif
-#ifndef MEGAMOE_BWD_COMPUTE_THREADS
-#define MEGAMOE_BWD_COMPUTE_THREADS 384
+#ifndef WEFTMOE_BWD_COMPUTE_THREADS
+#define WEFTMOE_BWD_COMPUTE_THREADS 384
 #endif
-#ifndef MEGAMOE_BWD_MATH_WARPGROUPS
-#define MEGAMOE_BWD_MATH_WARPGROUPS 2
+#ifndef WEFTMOE_BWD_MATH_WARPGROUPS
+#define WEFTMOE_BWD_MATH_WARPGROUPS 2
 #endif
-#ifndef MEGAMOE_BWD_PRODUCER_WARPGROUPS
-#define MEGAMOE_BWD_PRODUCER_WARPGROUPS 1
+#ifndef WEFTMOE_BWD_PRODUCER_WARPGROUPS
+#define WEFTMOE_BWD_PRODUCER_WARPGROUPS 1
 #endif
-#ifndef MEGAMOE_BWD_MATH_REGISTERS
-#define MEGAMOE_BWD_MATH_REGISTERS 224
+#ifndef WEFTMOE_BWD_MATH_REGISTERS
+#define WEFTMOE_BWD_MATH_REGISTERS 224
 #endif
-#ifndef MEGAMOE_BWD_PRODUCER_REGISTERS
-#define MEGAMOE_BWD_PRODUCER_REGISTERS 48
+#ifndef WEFTMOE_BWD_PRODUCER_REGISTERS
+#define WEFTMOE_BWD_PRODUCER_REGISTERS 48
 #endif
-#ifndef MEGAMOE_BWD_RDMA_CTAS
-#define MEGAMOE_BWD_RDMA_CTAS 8
+#ifndef WEFTMOE_BWD_RDMA_CTAS
+#define WEFTMOE_BWD_RDMA_CTAS 8
 #endif
-#ifndef MEGAMOE_BWD_RELAY_CTAS
-#define MEGAMOE_BWD_RELAY_CTAS 16
+#ifndef WEFTMOE_BWD_RELAY_CTAS
+#define WEFTMOE_BWD_RELAY_CTAS 16
 #endif
-#ifndef MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP
-#define MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP 64
+#ifndef WEFTMOE_BWD_QUEUE_IDLE_NANOSLEEP
+#define WEFTMOE_BWD_QUEUE_IDLE_NANOSLEEP 64
 #endif
-#ifndef MEGAMOE_BWD_READY_WORD_STAGGER
-#define MEGAMOE_BWD_READY_WORD_STAGGER 0
+#ifndef WEFTMOE_BWD_READY_WORD_STAGGER
+#define WEFTMOE_BWD_READY_WORD_STAGGER 0
 #endif
-#ifndef MEGAMOE_BWD_ACTIVATION_OWNER_GROUP
-#define MEGAMOE_BWD_ACTIVATION_OWNER_GROUP 4
+#ifndef WEFTMOE_BWD_ACTIVATION_OWNER_GROUP
+#define WEFTMOE_BWD_ACTIVATION_OWNER_GROUP 4
 #endif
-#ifndef MEGAMOE_BWD_DISPATCH_BATCH_ROWS
-#define MEGAMOE_BWD_DISPATCH_BATCH_ROWS 64
+#ifndef WEFTMOE_BWD_DISPATCH_BATCH_ROWS
+#define WEFTMOE_BWD_DISPATCH_BATCH_ROWS 64
 #endif
-#ifndef MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK
-#define MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK 12
+#ifndef WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK
+#define WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK 12
 #endif
-#ifndef MEGAMOE_BWD_DW2_CLAIM_TILES
-#define MEGAMOE_BWD_DW2_CLAIM_TILES 4
+#ifndef WEFTMOE_BWD_DW2_CLAIM_TILES
+#define WEFTMOE_BWD_DW2_CLAIM_TILES 4
 #endif
-#ifndef MEGAMOE_BWD_DW1_CLAIM_TILES
-#define MEGAMOE_BWD_DW1_CLAIM_TILES 4
+#ifndef WEFTMOE_BWD_DW1_CLAIM_TILES
+#define WEFTMOE_BWD_DW1_CLAIM_TILES 4
 #endif
-#ifndef MEGAMOE_BWD_GIN_MAX_INFLIGHT
-#define MEGAMOE_BWD_GIN_MAX_INFLIGHT 24
+#ifndef WEFTMOE_BWD_GIN_MAX_INFLIGHT
+#define WEFTMOE_BWD_GIN_MAX_INFLIGHT 24
 #endif
-#ifndef MEGAMOE_BWD_SETUP_THREADS
-#define MEGAMOE_BWD_SETUP_THREADS 256
+#ifndef WEFTMOE_BWD_SETUP_THREADS
+#define WEFTMOE_BWD_SETUP_THREADS 256
 #endif
-#ifndef MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP
-#define MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP 128
+#ifndef WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP
+#define WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP 128
 #endif
-#ifndef MEGAMOE_BWD_REDUCE_THREADS
-#define MEGAMOE_BWD_REDUCE_THREADS 256
+#ifndef WEFTMOE_BWD_REDUCE_THREADS
+#define WEFTMOE_BWD_REDUCE_THREADS 256
 #endif
-#ifndef MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP
-#define MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP 256
+#ifndef WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP
+#define WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP 256
 #endif
 
-namespace megamoe::cuda::backward_tuning {
+namespace weftmoe::cuda::backward_tuning {
 
-inline constexpr std::uint32_t kMainHidden = MEGAMOE_BWD_MAIN_HIDDEN;
+inline constexpr std::uint32_t kMainHidden = WEFTMOE_BWD_MAIN_HIDDEN;
 inline constexpr std::uint32_t kMainIntermediate =
-    MEGAMOE_BWD_MAIN_INTERMEDIATE;
-inline constexpr std::uint32_t kTileM = MEGAMOE_BWD_TILE_M;
-inline constexpr std::uint32_t kDabTileN = MEGAMOE_BWD_DAB_TILE_N;
-inline constexpr std::uint32_t kDxTileN = MEGAMOE_BWD_DX_TILE_N;
-inline constexpr std::uint32_t kDwTileM = MEGAMOE_BWD_DW_TILE_M;
-inline constexpr std::uint32_t kDwTileN = MEGAMOE_BWD_DW_TILE_N;
-inline constexpr std::uint32_t kTileK = MEGAMOE_BWD_TILE_K;
-inline constexpr std::uint32_t kDabStages = MEGAMOE_BWD_DAB_STAGES;
-inline constexpr std::uint32_t kDxStages = MEGAMOE_BWD_DX_STAGES;
-inline constexpr std::uint32_t kDw1Stages = MEGAMOE_BWD_DW1_STAGES;
-inline constexpr std::uint32_t kDw2Stages = MEGAMOE_BWD_DW2_STAGES;
+    WEFTMOE_BWD_MAIN_INTERMEDIATE;
+inline constexpr std::uint32_t kTileM = WEFTMOE_BWD_TILE_M;
+inline constexpr std::uint32_t kDabTileN = WEFTMOE_BWD_DAB_TILE_N;
+inline constexpr std::uint32_t kDxTileN = WEFTMOE_BWD_DX_TILE_N;
+inline constexpr std::uint32_t kDwTileM = WEFTMOE_BWD_DW_TILE_M;
+inline constexpr std::uint32_t kDwTileN = WEFTMOE_BWD_DW_TILE_N;
+inline constexpr std::uint32_t kTileK = WEFTMOE_BWD_TILE_K;
+inline constexpr std::uint32_t kDabStages = WEFTMOE_BWD_DAB_STAGES;
+inline constexpr std::uint32_t kDxStages = WEFTMOE_BWD_DX_STAGES;
+inline constexpr std::uint32_t kDw1Stages = WEFTMOE_BWD_DW1_STAGES;
+inline constexpr std::uint32_t kDw2Stages = WEFTMOE_BWD_DW2_STAGES;
 inline constexpr std::uint32_t kComputeThreads =
-    MEGAMOE_BWD_COMPUTE_THREADS;
+    WEFTMOE_BWD_COMPUTE_THREADS;
 inline constexpr std::uint32_t kMathWarpgroups =
-    MEGAMOE_BWD_MATH_WARPGROUPS;
+    WEFTMOE_BWD_MATH_WARPGROUPS;
 inline constexpr std::uint32_t kProducerWarpgroups =
-    MEGAMOE_BWD_PRODUCER_WARPGROUPS;
+    WEFTMOE_BWD_PRODUCER_WARPGROUPS;
 inline constexpr std::uint32_t kMathRegisters =
-    MEGAMOE_BWD_MATH_REGISTERS;
+    WEFTMOE_BWD_MATH_REGISTERS;
 inline constexpr std::uint32_t kProducerRegisters =
-    MEGAMOE_BWD_PRODUCER_REGISTERS;
-inline constexpr std::uint32_t kRdmaCtas = MEGAMOE_BWD_RDMA_CTAS;
-inline constexpr std::uint32_t kRelayCtas = MEGAMOE_BWD_RELAY_CTAS;
+    WEFTMOE_BWD_PRODUCER_REGISTERS;
+inline constexpr std::uint32_t kRdmaCtas = WEFTMOE_BWD_RDMA_CTAS;
+inline constexpr std::uint32_t kRelayCtas = WEFTMOE_BWD_RELAY_CTAS;
 inline constexpr std::uint32_t kQueueIdleNanosleep =
-    MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP;
+    WEFTMOE_BWD_QUEUE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kReadyWordStagger =
-    MEGAMOE_BWD_READY_WORD_STAGGER;
+    WEFTMOE_BWD_READY_WORD_STAGGER;
 inline constexpr std::uint32_t kActivationOwnerGroup =
-    MEGAMOE_BWD_ACTIVATION_OWNER_GROUP;
+    WEFTMOE_BWD_ACTIVATION_OWNER_GROUP;
 inline constexpr std::uint32_t kDispatchBatchRows =
-    MEGAMOE_BWD_DISPATCH_BATCH_ROWS;
+    WEFTMOE_BWD_DISPATCH_BATCH_ROWS;
 inline constexpr std::uint32_t kEpilogueRowsPerTask =
-    MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK;
+    WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK;
 inline constexpr std::uint32_t kDw2ClaimTiles =
-    MEGAMOE_BWD_DW2_CLAIM_TILES;
+    WEFTMOE_BWD_DW2_CLAIM_TILES;
 inline constexpr std::uint32_t kDw1ClaimTiles =
-    MEGAMOE_BWD_DW1_CLAIM_TILES;
+    WEFTMOE_BWD_DW1_CLAIM_TILES;
 inline constexpr std::uint32_t kGinMaxInflight =
-    MEGAMOE_BWD_GIN_MAX_INFLIGHT;
-inline constexpr std::uint32_t kSetupThreads = MEGAMOE_BWD_SETUP_THREADS;
+    WEFTMOE_BWD_GIN_MAX_INFLIGHT;
+inline constexpr std::uint32_t kSetupThreads = WEFTMOE_BWD_SETUP_THREADS;
 inline constexpr std::uint32_t kSetupIdleNanosleep =
-    MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP;
-inline constexpr std::uint32_t kReduceThreads = MEGAMOE_BWD_REDUCE_THREADS;
+    WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP;
+inline constexpr std::uint32_t kReduceThreads = WEFTMOE_BWD_REDUCE_THREADS;
 inline constexpr std::uint32_t kReduceIdleNanosleep =
-    MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP;
+    WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP;
 inline constexpr std::uint32_t kDw2TilesPerExpert =
     (kMainHidden / kDwTileM) * (kMainIntermediate / kDwTileN);
 inline constexpr std::uint32_t kDw1TilesPerExpert =
@@ -201,4 +201,4 @@ static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
 static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&
               kReduceThreads % 32U == 0U);
 
-} // namespace megamoe::cuda::backward_tuning
+} // namespace weftmoe::cuda::backward_tuning

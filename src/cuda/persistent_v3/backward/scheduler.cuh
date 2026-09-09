@@ -5,7 +5,7 @@
 #include "cuda/backward/tuning_config.hpp"
 #include "cuda/persistent_v3/queues.cuh"
 
-namespace megamoe::cuda::persistent_v3::backward {
+namespace weftmoe::cuda::persistent_v3::backward {
 
 enum class TaskKind : std::uint8_t {
   Dx = 0U,
@@ -36,18 +36,18 @@ struct TileDomain {
   bool linear_claim = false;
   std::uint32_t claim_granularity = 1U;
 
-  MEGAMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
+  WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
     return (owner_count + 63U) / 64U;
   }
 
-  MEGAMOE_V3_HOST_DEVICE constexpr std::uint32_t
+  WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t
   claim_words_per_owner() const {
     if (linear_claim)
       return 1U;
     return (tiles_per_owner + 63U) / 64U;
   }
 
-  MEGAMOE_V3_HOST_DEVICE constexpr unsigned long long
+  WEFTMOE_V3_HOST_DEVICE constexpr unsigned long long
   valid_claim_mask(std::uint32_t word) const {
     const auto begin = word * 64U;
     const auto remaining = tiles_per_owner - begin;
@@ -63,7 +63,7 @@ struct WorkQueues {
 };
 
 #if defined(__CUDACC__)
-MEGAMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
+WEFTMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
                                              std::uint32_t owner) {
   if (owner >= domain.owner_count || domain.tiles_per_owner == 0U)
     return;
@@ -83,7 +83,7 @@ MEGAMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
 // Bits outside the prefix start in the claimed state, so the ordinary claim
 // path removes the owner-ready bit as soon as the exposed phase is drained.
 // A later phase can reset and republish the same immutable owner descriptor.
-MEGAMOE_V3_DEVICE inline void publish_owner_prefix(
+WEFTMOE_V3_DEVICE inline void publish_owner_prefix(
     TileDomain domain, std::uint32_t owner, std::uint32_t prefix_tiles) {
   if (owner >= domain.owner_count || prefix_tiles == 0U ||
       prefix_tiles > domain.tiles_per_owner)
@@ -109,7 +109,7 @@ MEGAMOE_V3_DEVICE inline void publish_owner_prefix(
   ready.fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
 }
 
-MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
+WEFTMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
                                                    std::uint32_t owner) {
   if (domain.linear_claim) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
@@ -133,7 +133,7 @@ MEGAMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
 // the old phase fully claimed, then retire its ready bit after another worker
 // has already published the next phase. Repair that stale retirement when the
 // new phase still has unclaimed work. Single-publication domains need no probe.
-MEGAMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
+WEFTMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
                                                    std::uint32_t owner) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
       domain.ready_words[owner / 64U]);
@@ -147,7 +147,7 @@ MEGAMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
   }
 }
 
-MEGAMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
+WEFTMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
                                                     std::uint32_t owner,
                                                     TileTask &task) {
   if (domain.linear_claim) {
@@ -187,7 +187,7 @@ MEGAMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
   return false;
 }
 
-MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
+WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
                                                      TileTask &task) {
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
@@ -248,7 +248,7 @@ MEGAMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
 // One scheduling boundary calls each logical queue at most once. Keep this
 // straight-line order explicit: there is deliberately no cohort, burst/age
 // state, or second Q_DX check before dW.
-MEGAMOE_V3_DEVICE inline bool try_claim_work(WorkQueues queues,
+WEFTMOE_V3_DEVICE inline bool try_claim_work(WorkQueues queues,
                                              TileTask &task) {
   if (try_claim_domain_once(queues.dx, task))
     return true;
@@ -260,4 +260,4 @@ MEGAMOE_V3_DEVICE inline bool try_claim_work(WorkQueues queues,
 }
 #endif
 
-} // namespace megamoe::cuda::persistent_v3::backward
+} // namespace weftmoe::cuda::persistent_v3::backward

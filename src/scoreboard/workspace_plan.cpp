@@ -1,10 +1,10 @@
-#include "megamoe/scoreboard/workspace_plan.hpp"
+#include "weftmoe/scoreboard/workspace_plan.hpp"
 
 #include <string>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe {
+namespace weftmoe {
 namespace {
 
 [[noreturn]] void invalid_plan(const std::string& message) {
@@ -111,4 +111,4 @@ void validate_workspace_plan(const DispatchHandle& handle,
     }
 }
 
-}  // namespace megamoe
+}  // namespace weftmoe

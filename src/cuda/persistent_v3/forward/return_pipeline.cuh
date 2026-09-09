@@ -90,7 +90,7 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
       fragment.epoch);
   published.store(a.epoch, ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if (a.use_gin) {
     auto *completion =
         static_cast<transport_state::GenerationCompletionVector *>(
@@ -115,7 +115,7 @@ __device__ __noinline__ void issue_direct_full_mblock(
       direct_mblocks_complete(a, scheduler));
   const auto completed =
       done.fetch_add(1ULL, ::cuda::memory_order_release) + 1ULL;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if (a.use_gin) {
     auto *completion =
         static_cast<transport_state::GenerationCompletionVector *>(
@@ -285,7 +285,7 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   if (state.selected == 0U)
     return false;
 
-  MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
                           context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
     auto *status =
@@ -293,7 +293,7 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
     atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
   }
   publish_direct_full_source_chunk(a, row_begin, state.selected_rows);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
                           context, state.selected_rows, a.epoch);
   if (threadIdx.x == 0U) {
     state.completed =
@@ -398,7 +398,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
   const auto context = state.context;
   const auto local_source = a.node * a.local_world_size + context;
   if (state.active != 0U) {
-    MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
                             context, (state.cursor << 32U) | state.active,
                             a.epoch);
     if (threadIdx.x == 0U) {
@@ -543,7 +543,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       }
     }
     __syncthreads();
-    MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
                             context, (state.cursor << 32U) | state.copied_rows,
                             a.epoch);
   }
@@ -567,7 +567,7 @@ __device__ __forceinline__ void issue_direct_full_fragment_rdmacta(
       static_cast<std::uint64_t>(fragment.row_count) * a.hidden *
       sizeof(transport::BFloat16);
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   // Preserve the exact first WQE owned by this CTA.  If a local completion
   // stops advancing, the timeout dump then identifies the remote rank/context
   // and both source and destination row intervals without perturbing the GIN
@@ -615,7 +615,7 @@ __device__ __forceinline__ void issue_direct_full_fragment_rdmacta(
   atomicAdd(&record.return_claimed, 1ULL);
   atomicAdd(&record.inflight, 1ULL);
 
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn, context,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn, context,
                           payload_bytes, a.epoch);
   gin.put(
       world, static_cast<int>(fragment.source_rank), a.gin_window,
@@ -743,13 +743,13 @@ __device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
       ++state.local_row;
       continue;
     }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     atomicMax(&completion->fc1_scheduler_value, 4000ULL + canonical_row);
 #endif
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(mapping[canonical_row]);
     const auto encoded = published.load(::cuda::memory_order_acquire);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     if (encoded == 0ULL)
       atomicMax(&completion->fc2_scheduler_value, 5000ULL + canonical_row);
 #endif
@@ -758,7 +758,7 @@ __device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
     // the row cursor in place and let Dispatch make progress before retrying.
     if (encoded == 0ULL || cancelled(a, control))
       return false;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     atomicMax(&completion->fc2_scheduler_value, 6000ULL + canonical_row);
 #endif
     const auto compact = return_mapping_compact_row(encoded);
@@ -946,7 +946,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
         a, control, gin, world, context, completion, context_completion,
         scheduler, state)) {
       progressed = true;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       atomicMax(&completion->bulk_pack_complete, 2000ULL + state.cursor);
 #endif
     }
@@ -981,7 +981,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
     atomicAdd(&record.local_completion, state.issued);
     record.last_progress_globaltimer = device_globaltimer_ns();
   }
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
                           context, state.issued, a.epoch);
   persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
       control.rdma_return_roles_complete.value, 1ULL);

@@ -2,7 +2,7 @@
 """Launch independent local CUDA ranks and check the synthetic P2P result.
 
 This oracle intentionally reimplements routing offsets, canonical rows, BF16
-rounding and expert-order reduction. It never imports or invokes MegaMOE's C++
+rounding and expert-order reduction. It never imports or invokes WeftMoE's C++
 reference/materialization code.
 """
 
@@ -308,42 +308,42 @@ def main():
         )
     environment = os.environ.copy()
     environment.setdefault("NCCL_DEBUG", "WARN")
-    environment["MEGAMOE_P2P_TOP_K"] = str(args.top_k)
-    environment["MEGAMOE_GATE_MODE"] = args.gate_mode
+    environment["WEFTMOE_P2P_TOP_K"] = str(args.top_k)
+    environment["WEFTMOE_GATE_MODE"] = args.gate_mode
     if args.integrated_benchmark:
-        environment["MEGAMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
-        environment["MEGAMOE_INTEGRATED_TOP_K"] = str(args.top_k)
+        environment["WEFTMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
+        environment["WEFTMOE_INTEGRATED_TOP_K"] = str(args.top_k)
     elif args.forward_benchmark:
-        environment["MEGAMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
+        environment["WEFTMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
     elif args.backward_validation or args.backward_benchmark:
-        environment["MEGAMOE_BACKWARD_ROUNDS"] = str(args.rounds)
-        environment["MEGAMOE_BACKWARD_WARMUPS"] = str(backward_warmups)
+        environment["WEFTMOE_BACKWARD_ROUNDS"] = str(args.rounds)
+        environment["WEFTMOE_BACKWARD_WARMUPS"] = str(backward_warmups)
         if args.backward_tokens is not None:
             if args.backward_tokens <= 0:
                 parser.error("--backward-tokens must be positive")
             environment[
-                "MEGAMOE_BACKWARD_TOKENS" if args.backward_validation
-                else "MEGAMOE_P2P_BENCH_TOKENS"
+                "WEFTMOE_BACKWARD_TOKENS" if args.backward_validation
+                else "WEFTMOE_P2P_BENCH_TOKENS"
             ] = str(args.backward_tokens)
     else:
-        environment["MEGAMOE_P2P_BENCH_ROUNDS" if args.benchmark else
-                    "MEGAMOE_P2P_ROUNDS"] = str(args.rounds)
+        environment["WEFTMOE_P2P_BENCH_ROUNDS" if args.benchmark else
+                    "WEFTMOE_P2P_ROUNDS"] = str(args.rounds)
     if args.forward_output_dir:
         if not (args.forward_benchmark or args.forward_smoke):
             parser.error("--forward-output-dir requires a Forward mode")
         os.makedirs(args.forward_output_dir, mode=0o700, exist_ok=True)
-        environment["MEGAMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
+        environment["WEFTMOE_FORWARD_OUTPUT_DIR"] = os.path.abspath(
             args.forward_output_dir)
     if args.backward_output_dir:
         if not args.backward_validation:
             parser.error("--backward-output-dir requires validation mode")
         os.makedirs(args.backward_output_dir, mode=0o700, exist_ok=True)
-        environment["MEGAMOE_BACKWARD_OUTPUT_DIR"] = os.path.abspath(
+        environment["WEFTMOE_BACKWARD_OUTPUT_DIR"] = os.path.abspath(
             args.backward_output_dir)
     if args.no_wrap:
-        environment["MEGAMOE_P2P_NO_WRAP"] = "1"
+        environment["WEFTMOE_P2P_NO_WRAP"] = "1"
     if args.ring_slots is not None:
-        environment["MEGAMOE_P2P_RING_SLOTS"] = str(args.ring_slots)
+        environment["WEFTMOE_P2P_RING_SLOTS"] = str(args.ring_slots)
     prefix = (() if args.compute_sanitizer_tool is None else
               ("compute-sanitizer", "--tool", args.compute_sanitizer_tool,
                "--print-limit=10", "--error-exitcode=1"))

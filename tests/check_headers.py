@@ -13,12 +13,12 @@ CXX = os.environ.get("CXX", "c++")
 
 
 def main() -> None:
-    transport = (ROOT / "include/megamoe/transport/count_exchange.hpp").read_text()
+    transport = (ROOT / "include/weftmoe/transport/count_exchange.hpp").read_text()
     for forbidden in ("IntegerBuffer", "uintptr_t", ".address"):
         if forbidden in transport:
             raise RuntimeError(f"unsafe public transport surface remains: {forbidden}")
 
-    with tempfile.TemporaryDirectory(prefix="megamoe-headers-") as temp:
+    with tempfile.TemporaryDirectory(prefix="weftmoe-headers-") as temp:
         source = pathlib.Path(temp) / "header.cpp"
         for header in HEADERS:
             relative = header.relative_to(ROOT / "include")

@@ -24,36 +24,36 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "megamoe/api/errors.hpp"
-#include "megamoe/cuda/control_protocol.hpp"
-#include "megamoe/kernels/persistent_contract.hpp"
-#include "megamoe/metadata/serialize.hpp"
-#include "megamoe/scoreboard/workspace_plan.hpp"
-#include "megamoe/transport/count_exchange.hpp"
+#include "weftmoe/api/errors.hpp"
+#include "weftmoe/cuda/control_protocol.hpp"
+#include "weftmoe/kernels/persistent_contract.hpp"
+#include "weftmoe/metadata/serialize.hpp"
+#include "weftmoe/scoreboard/workspace_plan.hpp"
+#include "weftmoe/transport/count_exchange.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 
 namespace {
 
-using megamoe::BackendCompletion;
-using megamoe::BackendCountExchangeOperation;
-using megamoe::CollectiveOperation;
-using megamoe::CountExchange;
-using megamoe::CountExchangeRequest;
-using megamoe::CountMatrix;
-using megamoe::DispatchHandle;
-using megamoe::ExchangeKind;
-using megamoe::ExchangeState;
-using megamoe::HostFakeCountExchange;
-using megamoe::LocalHistogramHandle;
-using megamoe::NotifyDispatchError;
-using megamoe::NotifyErrorCode;
-using megamoe::RankCollectiveContext;
-using megamoe::RankRoutingInput;
-using megamoe::RuntimeConfig;
-using megamoe::Topology;
-using megamoe::ValidatedCollectiveHandle;
+using weftmoe::BackendCompletion;
+using weftmoe::BackendCountExchangeOperation;
+using weftmoe::CollectiveOperation;
+using weftmoe::CountExchange;
+using weftmoe::CountExchangeRequest;
+using weftmoe::CountMatrix;
+using weftmoe::DispatchHandle;
+using weftmoe::ExchangeKind;
+using weftmoe::ExchangeState;
+using weftmoe::HostFakeCountExchange;
+using weftmoe::LocalHistogramHandle;
+using weftmoe::NotifyDispatchError;
+using weftmoe::NotifyErrorCode;
+using weftmoe::RankCollectiveContext;
+using weftmoe::RankRoutingInput;
+using weftmoe::RuntimeConfig;
+using weftmoe::Topology;
+using weftmoe::ValidatedCollectiveHandle;
 
 struct BootstrapIoScript {
   std::vector<std::uint8_t> input;
@@ -130,14 +130,14 @@ class BootstrapIoHookGuard {
 public:
   explicit BootstrapIoHookGuard(BootstrapIoScript &script) {
     bootstrap_io_script = &script;
-    megamoe::cuda::testing::set_bootstrap_io_hooks(
+    weftmoe::cuda::testing::set_bootstrap_io_hooks(
         scripted_bootstrap_read, scripted_bootstrap_write,
         scripted_bootstrap_close);
   }
   BootstrapIoHookGuard(const BootstrapIoHookGuard &) = delete;
   BootstrapIoHookGuard &operator=(const BootstrapIoHookGuard &) = delete;
   ~BootstrapIoHookGuard() {
-    megamoe::cuda::testing::clear_bootstrap_io_hooks();
+    weftmoe::cuda::testing::clear_bootstrap_io_hooks();
     bootstrap_io_script = nullptr;
   }
 };
@@ -151,26 +151,26 @@ public:
     }                                                                          \
   } while (false)
 
-static_assert(!std::is_aggregate_v<megamoe::HostIntegerRow>);
-static_assert(!std::is_constructible_v<megamoe::HostIntegerRow, std::uintptr_t,
+static_assert(!std::is_aggregate_v<weftmoe::HostIntegerRow>);
+static_assert(!std::is_constructible_v<weftmoe::HostIntegerRow, std::uintptr_t,
                                        std::shared_ptr<const void>>);
 static_assert(std::is_same_v<
               decltype(std::declval<const LocalHistogramHandle &>().outgoing()),
-              const megamoe::SourceRouteMetadata &>);
+              const weftmoe::SourceRouteMetadata &>);
 static_assert(std::is_copy_constructible_v<LocalHistogramHandle>);
 static_assert(std::is_copy_constructible_v<ValidatedCollectiveHandle>);
 static_assert(!std::is_copy_constructible_v<CollectiveOperation>);
 static_assert(std::is_move_constructible_v<CollectiveOperation>);
 static_assert(
-    !std::is_copy_constructible_v<megamoe::cuda::NcclBootstrapInputChannel>);
+    !std::is_copy_constructible_v<weftmoe::cuda::NcclBootstrapInputChannel>);
 static_assert(
     std::is_nothrow_move_constructible_v<
-        megamoe::cuda::NcclBootstrapInputChannel>);
+        weftmoe::cuda::NcclBootstrapInputChannel>);
 static_assert(
-    !std::is_copy_constructible_v<megamoe::cuda::NcclBootstrapOutputChannel>);
+    !std::is_copy_constructible_v<weftmoe::cuda::NcclBootstrapOutputChannel>);
 static_assert(
     std::is_nothrow_move_constructible_v<
-        megamoe::cuda::NcclBootstrapOutputChannel>);
+        weftmoe::cuda::NcclBootstrapOutputChannel>);
 
 Topology homogeneous_topology(std::uint32_t nodes, std::uint32_t gpus,
                               std::uint32_t experts) {
@@ -205,10 +205,10 @@ RankCollectiveContext make_context(const RuntimeConfig &config,
                                    const std::string &identity = "test",
                                    std::uint64_t generation = 1,
                                    const std::string &execution = "exec") {
-  auto session = megamoe::make_collective_session(
+  auto session = weftmoe::make_collective_session(
       identity, config.topology.world_size, generation);
-  return megamoe::make_rank_collective_context(
-      std::move(session), rank, megamoe::make_execution_token(execution));
+  return weftmoe::make_rank_collective_context(
+      std::move(session), rank, weftmoe::make_execution_token(execution));
 }
 
 void expect_error(NotifyErrorCode code, const std::function<void()> &action,
@@ -305,9 +305,9 @@ struct BackendBehavior {
   std::weak_ptr<const void> input_lifetime;
 };
 
-class TestDeviceLease final : public megamoe::BackendDeviceLeaseState {};
+class TestDeviceLease final : public weftmoe::BackendDeviceLeaseState {};
 
-class TestCompletionLease final : public megamoe::BackendCompletionLeaseState {
+class TestCompletionLease final : public weftmoe::BackendCompletionLeaseState {
 public:
   explicit TestCompletionLease(std::shared_ptr<BackendBehavior> behavior)
       : behavior_(std::move(behavior)) {}
@@ -344,16 +344,16 @@ public:
                            ? behavior_->expert_rows
                            : behavior_->summary_rows;
     if (behavior_->return_device) {
-      return megamoe::make_device_backend_completion(
+      return weftmoe::make_device_backend_completion(
           std::move(context), kind,
-          megamoe::make_device_buffer_lease(
+          weftmoe::make_device_buffer_lease(
               static_cast<std::uint32_t>(rows.size()), request_.row_width,
               static_cast<std::uint64_t>(rows.size()) * request_.row_width,
               std::make_shared<TestDeviceLease>()),
           std::make_shared<TestCompletionLease>(behavior_));
     }
-    return megamoe::make_host_backend_completion(
-        std::move(context), kind, megamoe::make_host_count_matrix(rows),
+    return weftmoe::make_host_backend_completion(
+        std::move(context), kind, weftmoe::make_host_count_matrix(rows),
         std::make_shared<TestCompletionLease>(behavior_));
   }
 
@@ -377,7 +377,7 @@ public:
   std::unique_ptr<BackendCountExchangeOperation>
   start(const CountExchangeRequest &request) override {
     behavior_->input_lifetime =
-        megamoe::testing::HostIntegerRowTestAccess::lifetime(request.input);
+        weftmoe::testing::HostIntegerRowTestAccess::lifetime(request.input);
     if (behavior_->start != ThrowMode::None) {
       throw_mode(behavior_->start, "start");
     }
@@ -398,33 +398,33 @@ ValidatedCollectiveHandle complete_scripted(const LocalHistogramHandle &local,
     behavior->summary_rows = rows;
   ScriptedBackend backend(behavior);
   auto operation = kind == ExchangeKind::ExpertCounts
-                       ? megamoe::start_count_exchange(local, backend)
-                       : megamoe::start_notify_summary_exchange(local, backend);
+                       ? weftmoe::start_count_exchange(local, backend)
+                       : weftmoe::start_notify_summary_exchange(local, backend);
   return operation.wait();
 }
 void test_rank_local_async_and_deterministic_mapping() {
   const auto config = make_config(2, 2, 8, 3, 4);
   const auto inputs = seeded_inputs(4, 8, 3, 0x1234ULL);
-  const auto session = megamoe::make_collective_session("async", 4, 9);
+  const auto session = weftmoe::make_collective_session("async", 4, 9);
   std::vector<LocalHistogramHandle> locals;
   for (std::uint32_t rank = 0; rank < 4; ++rank) {
-    auto context = megamoe::make_rank_collective_context(
+    auto context = weftmoe::make_rank_collective_context(
         session, rank,
-        megamoe::make_execution_token("exec-" + std::to_string(rank)));
+        weftmoe::make_execution_token("exec-" + std::to_string(rank)));
     locals.push_back(
-        megamoe::build_rank_local_histogram(config, context, inputs[rank]));
+        weftmoe::build_rank_local_histogram(config, context, inputs[rank]));
   }
   HostFakeCountExchange backend(4, "async");
   std::vector<CollectiveOperation> count_ops;
   count_ops.reserve(4);
-  count_ops.push_back(megamoe::start_count_exchange(locals[0], backend));
+  count_ops.push_back(weftmoe::start_count_exchange(locals[0], backend));
   REQUIRE(count_ops[0].state() == ExchangeState::Pending);
   auto wait0 =
       std::async(std::launch::async, [&] { return count_ops[0].wait(); });
   REQUIRE(wait0.wait_for(std::chrono::milliseconds(20)) ==
           std::future_status::timeout);
   for (std::uint32_t rank = 1; rank < 4; ++rank) {
-    count_ops.push_back(megamoe::start_count_exchange(locals[rank], backend));
+    count_ops.push_back(weftmoe::start_count_exchange(locals[rank], backend));
   }
   std::vector<ValidatedCollectiveHandle> counts;
   counts.push_back(wait0.get());
@@ -435,12 +435,12 @@ void test_rank_local_async_and_deterministic_mapping() {
   summary_ops.reserve(4);
   for (std::uint32_t rank = 0; rank < 4; ++rank) {
     summary_ops.push_back(
-        megamoe::start_notify_summary_exchange(locals[rank], backend));
+        weftmoe::start_notify_summary_exchange(locals[rank], backend));
   }
   std::vector<DispatchHandle> handles;
   for (std::uint32_t rank = 0; rank < 4; ++rank) {
     const auto summary = summary_ops[rank].wait();
-    handles.push_back(megamoe::materialize_rank_metadata(
+    handles.push_back(weftmoe::materialize_rank_metadata(
         locals[rank], counts[rank], summary));
   }
   verify_mapping(handles);
@@ -452,12 +452,12 @@ void test_existing_shapes_descriptors_and_repeatability() {
   inputs[1] = {2, {0, 4, 0, 5}};
   inputs[3] = {1, {0, 6}};
   const auto first =
-      megamoe::build_notify_dispatch_for_testing(config, inputs, "repeat", 7);
+      weftmoe::build_notify_dispatch_for_testing(config, inputs, "repeat", 7);
   const auto second =
-      megamoe::build_notify_dispatch_for_testing(config, inputs, "repeat", 7);
+      weftmoe::build_notify_dispatch_for_testing(config, inputs, "repeat", 7);
   for (std::size_t rank = 0; rank < first.size(); ++rank) {
-    REQUIRE(megamoe::serialize_dispatch_metadata(first[rank]) ==
-            megamoe::serialize_dispatch_metadata(second[rank]));
+    REQUIRE(weftmoe::serialize_dispatch_metadata(first[rank]) ==
+            weftmoe::serialize_dispatch_metadata(second[rank]));
   }
   REQUIRE(first[0]->incoming.mtile_expected_rows[0] ==
           std::vector<std::uint32_t>({4, 2}));
@@ -468,7 +468,7 @@ void test_existing_shapes_descriptors_and_repeatability() {
   packet_config.topology.expert_to_rank = {0, 1, 2, 3, 2, 3};
   std::vector<RankRoutingInput> packet_inputs(4);
   packet_inputs[0] = {2, {2, 4, 3, 0, 2, 5}};
-  const auto packet_handles = megamoe::build_notify_dispatch_for_testing(
+  const auto packet_handles = weftmoe::build_notify_dispatch_for_testing(
       packet_config, packet_inputs, "packet", 3);
   const auto &transport = packet_handles[0]->transport;
   REQUIRE(transport.outgoing_packets.size() == 3);
@@ -484,7 +484,7 @@ void test_existing_shapes_descriptors_and_repeatability() {
   std::vector<RankRoutingInput> many_inputs(73);
   many_inputs[0] = {1, {0, 72}};
   const auto many_handles =
-      megamoe::build_notify_dispatch_for_testing(many, many_inputs, "many", 11);
+      weftmoe::build_notify_dispatch_for_testing(many, many_inputs, "many", 11);
   REQUIRE(many_handles[0]->outgoing.node_mask_words == 2);
   REQUIRE(many_handles[0]->outgoing.destination_node_mask ==
           std::vector<std::uint64_t>({1, std::uint64_t{1} << 8U}));
@@ -496,24 +496,24 @@ void test_activation_transport_protocol_oracle() {
   config.topology.expert_to_rank = {0, 1, 2, 3, 2, 3, 0, 1};
   std::vector<RankRoutingInput> inputs(4);
   inputs[0] = {3, {4, 1, 5, 0, 3, 6, 2, 7, 4}};
-  const auto handles = megamoe::build_notify_dispatch_for_testing(
+  const auto handles = weftmoe::build_notify_dispatch_for_testing(
       config, inputs, "transport-oracle", 77);
-  megamoe::transport::ActivationTransportConfig transport_config;
+  weftmoe::transport::ActivationTransportConfig transport_config;
   transport_config.hidden_size = 33;
   transport_config.channels = 1;
   transport_config.ring_slots_per_source_channel = 2;
-  std::vector<megamoe::transport::BFloat16> activations(3U * 33U);
+  std::vector<weftmoe::transport::BFloat16> activations(3U * 33U);
   for (std::size_t i = 0; i < activations.size(); ++i)
-    activations[i] = megamoe::transport::float_to_bfloat16(
+    activations[i] = weftmoe::transport::float_to_bfloat16(
         static_cast<float>((i * 17U) % 101U) / 32.0F);
   const std::vector<float> gates{0.2F, 0.3F, 0.5F, 0.1F, 0.6F,
                                  0.3F, 0.7F, 0.2F, 0.1F};
-  const auto canonical = megamoe::transport::simulate_activation_transport(
+  const auto canonical = weftmoe::transport::simulate_activation_transport(
       handles[0], activations, gates, transport_config, 1);
   std::vector<std::uint64_t> reversed(
       handles[0]->transport.outgoing_packets.size());
   std::iota(reversed.rbegin(), reversed.rend(), std::uint64_t{0});
-  const auto reordered = megamoe::transport::simulate_activation_transport(
+  const auto reordered = weftmoe::transport::simulate_activation_transport(
       handles[0], activations, gates, transport_config, 1, reversed);
   REQUIRE(canonical.combined_tokens.size() == activations.size());
   REQUIRE(canonical.contribution_by_route == reordered.contribution_by_route);
@@ -524,11 +524,11 @@ void test_activation_transport_protocol_oracle() {
   REQUIRE(canonical.audit.relayed_fanout == 9);
   REQUIRE(canonical.audit.synthetic_contributions == 9);
   const auto bad_sequence =
-      megamoe::testing::NotifyCorruptionHook::with_packet_sequence(
+      weftmoe::testing::NotifyCorruptionHook::with_packet_sequence(
           handles[0], 0, 7);
   expect_error(NotifyErrorCode::InvalidHandle,
                [&] {
-                 (void)megamoe::transport::simulate_activation_transport(
+                 (void)weftmoe::transport::simulate_activation_transport(
                      bad_sequence, activations, gates, transport_config, 1,
                      reversed);
                },
@@ -538,11 +538,11 @@ void test_activation_transport_protocol_oracle() {
   auto many = make_config(73, 1, 73, 2, 8);
   std::vector<RankRoutingInput> many_inputs(73);
   many_inputs[0] = {1, {0, 72}};
-  const auto many_handles = megamoe::build_notify_dispatch_for_testing(
+  const auto many_handles = weftmoe::build_notify_dispatch_for_testing(
       many, many_inputs, "transport-73", 78);
   transport_config.hidden_size = 7;
-  std::vector<megamoe::transport::BFloat16> many_activations(7);
-  const auto many_result = megamoe::transport::simulate_activation_transport(
+  std::vector<weftmoe::transport::BFloat16> many_activations(7);
+  const auto many_result = weftmoe::transport::simulate_activation_transport(
       many_handles[0], many_activations, {0.25F, 0.75F}, transport_config, 2);
   REQUIRE(many_handles[0]->outgoing.node_mask_words == 2);
   REQUIRE(many_result.audit.dispatch_packets == 2);
@@ -563,7 +563,7 @@ void test_activation_transport_protocol_oracle() {
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
         runtime_inputs[source_rank].selected_experts.push_back(
             static_cast<std::int32_t>((token * top_k + slot) % world));
-    const auto runtime_handles = megamoe::build_notify_dispatch_for_testing(
+    const auto runtime_handles = weftmoe::build_notify_dispatch_for_testing(
         runtime, runtime_inputs,
         "runtime-topology-" + std::to_string(nodes) + "x" +
             std::to_string(gpus),
@@ -581,14 +581,14 @@ void test_activation_transport_protocol_oracle() {
         REQUIRE(fanout.destination_local_rank == owner % gpus);
       }
     }
-    megamoe::transport::ActivationTransportConfig runtime_transport;
+    weftmoe::transport::ActivationTransportConfig runtime_transport;
     runtime_transport.hidden_size = 7;
     runtime_transport.channels = 4;
     runtime_transport.ring_slots_per_source_channel = 2;
-    std::vector<megamoe::transport::BFloat16> runtime_activations(14);
+    std::vector<weftmoe::transport::BFloat16> runtime_activations(14);
     std::vector<float> runtime_gates(2ULL * top_k,
                                      1.0F / static_cast<float>(top_k));
-    const auto result = megamoe::transport::simulate_activation_transport(
+    const auto result = weftmoe::transport::simulate_activation_transport(
         runtime_handles[source_rank], runtime_activations, runtime_gates,
         runtime_transport, 3);
     REQUIRE(result.audit.dispatch_packets ==
@@ -606,7 +606,7 @@ void test_activation_transport_protocol_oracle() {
   invalid.ring_slots_per_source_channel = 0;
   expect_error(NotifyErrorCode::TransportProtocolFailure,
                [&] {
-                 (void)megamoe::transport::simulate_activation_transport(
+                 (void)weftmoe::transport::simulate_activation_transport(
                      many_handles[0], many_activations, {0.25F, 0.75F},
                      invalid, 2);
                },
@@ -619,7 +619,7 @@ void test_topology_route_capacity_and_overflow() {
   bad.topology.num_nodes = 4;
   expect_error(NotifyErrorCode::InvalidTopology,
                [&] {
-                 megamoe::build_rank_local_histogram(bad, make_context(bad, 0),
+                 weftmoe::build_rank_local_histogram(bad, make_context(bad, 0),
                                                      {});
                },
                {"heterogeneous"});
@@ -627,7 +627,7 @@ void test_topology_route_capacity_and_overflow() {
   sparse.topology.rank_to_local_rank[1] = 2;
   expect_error(NotifyErrorCode::InvalidTopology,
                [&] {
-                 megamoe::build_rank_local_histogram(
+                 weftmoe::build_rank_local_histogram(
                      sparse, make_context(sparse, 0), {});
                },
                {"local coordinate"});
@@ -636,7 +636,7 @@ void test_topology_route_capacity_and_overflow() {
   duplicate.topology.rank_to_local_rank[2] = 0;
   expect_error(NotifyErrorCode::InvalidTopology,
                [&] {
-                 megamoe::build_rank_local_histogram(
+                 weftmoe::build_rank_local_histogram(
                      duplicate, make_context(duplicate, 0), {});
                },
                {"duplicate topology coordinate", "node=0", "local_rank=0"});
@@ -644,14 +644,14 @@ void test_topology_route_capacity_and_overflow() {
   bad_node.topology.rank_to_node[0] = 2;
   expect_error(NotifyErrorCode::InvalidTopology,
                [&] {
-                 megamoe::build_rank_local_histogram(
+                 weftmoe::build_rank_local_histogram(
                      bad_node, make_context(bad_node, 0), {});
                },
                {"out-of-range node coordinate", "rank=0", "node=2"});
   auto topk = make_config(1, 1, 2, 3, 4);
   expect_error(NotifyErrorCode::InvalidRuntimeConfig,
                [&] {
-                 megamoe::build_rank_local_histogram(topk,
+                 weftmoe::build_rank_local_histogram(topk,
                                                      make_context(topk, 0), {});
                },
                {"top_k exceeds"});
@@ -660,19 +660,19 @@ void test_topology_route_capacity_and_overflow() {
   const auto context = make_context(config, 0);
   expect_error(NotifyErrorCode::DuplicateExpert,
                [&] {
-                 megamoe::build_rank_local_histogram(config, context,
+                 weftmoe::build_rank_local_histogram(config, context,
                                                      {1, {2, 2}});
                },
                {"rank=0", "topk_slot=1"});
   expect_error(NotifyErrorCode::ExpertOutOfRange,
                [&] {
-                 megamoe::build_rank_local_histogram(config, context,
+                 weftmoe::build_rank_local_histogram(config, context,
                                                      {1, {2, 4}});
                },
                {"actual=4"});
   expect_error(NotifyErrorCode::ArithmeticOverflow,
                [&] {
-                 megamoe::build_rank_local_histogram(
+                 weftmoe::build_rank_local_histogram(
                      config, context,
                      {std::numeric_limits<std::uint64_t>::max(), {}});
                },
@@ -681,7 +681,7 @@ void test_topology_route_capacity_and_overflow() {
   const std::vector<RankRoutingInput> inputs{{1, {0, 1}}, {1, {0, 2}}};
   expect_error(NotifyErrorCode::ExpertCapacityExceeded,
                [&] {
-                 megamoe::build_notify_dispatch_for_testing(config, inputs,
+                 weftmoe::build_notify_dispatch_for_testing(config, inputs,
                                                             "capacity", 1);
                },
                {"expert=0"});
@@ -689,20 +689,20 @@ void test_topology_route_capacity_and_overflow() {
   config.capacity.workspace_rows_per_rank = {2, 100};
   expect_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                [&] {
-                 megamoe::build_notify_dispatch_for_testing(config, inputs,
+                 weftmoe::build_notify_dispatch_for_testing(config, inputs,
                                                             "workspace-cap", 1);
                },
                {"destination_rank=0", "actual_rows=3", "capacity=2"});
 }
 void test_operation_move_and_terminal_state_machine() {
   const auto config = make_config(1, 1, 2, 1, 4);
-  const auto local = megamoe::build_rank_local_histogram(
+  const auto local = weftmoe::build_rank_local_histogram(
       config, make_context(config, 0, "state", 1), {1, {0}});
 
   auto success = std::make_shared<BackendBehavior>();
   success->expert_rows = {{1, 0}};
   ScriptedBackend success_backend(success);
-  auto original = megamoe::start_count_exchange(local, success_backend);
+  auto original = weftmoe::start_count_exchange(local, success_backend);
   CollectiveOperation moved(std::move(original));
   REQUIRE(!original);
   auto *self_alias = &moved;
@@ -724,7 +724,7 @@ void test_operation_move_and_terminal_state_machine() {
   cancelled->expert_rows = {{1, 0}};
   ScriptedBackend cancelled_backend(cancelled);
   {
-    auto operation = megamoe::start_count_exchange(local, cancelled_backend);
+    auto operation = weftmoe::start_count_exchange(local, cancelled_backend);
     operation.cancel();
     operation.cancel();
     REQUIRE(cancelled->cancel_calls == 1);
@@ -744,9 +744,9 @@ void test_operation_move_and_terminal_state_machine() {
   ScriptedBackend source_backend(source);
   {
     auto destination_operation =
-        megamoe::start_count_exchange(local, destination_backend);
+        weftmoe::start_count_exchange(local, destination_backend);
     auto source_operation =
-        megamoe::start_count_exchange(local, source_backend);
+        weftmoe::start_count_exchange(local, source_backend);
     destination_operation = std::move(source_operation);
     REQUIRE(destination->cancel_calls == 1);
     REQUIRE(!source_operation);
@@ -759,23 +759,23 @@ void test_operation_move_and_terminal_state_machine() {
   REQUIRE(source->operation_destructs == 1);
 }
 void test_typed_storage_lifetimes_and_unwaited_destruction() {
-  struct SessionState final : megamoe::BackendSessionState {};
-  struct ExecutionState final : megamoe::BackendExecutionState {};
+  struct SessionState final : weftmoe::BackendSessionState {};
+  struct ExecutionState final : weftmoe::BackendExecutionState {};
   const auto config = make_config(1, 1, 2, 1, 4);
   auto session_state = std::make_shared<SessionState>();
   auto execution_state = std::make_shared<ExecutionState>();
   const std::weak_ptr<SessionState> session_lifetime = session_state;
   const std::weak_ptr<ExecutionState> execution_lifetime = execution_state;
   auto session =
-      megamoe::make_collective_session("lifetime", 1, 1, session_state);
-  auto execution = megamoe::make_execution_token("exec", execution_state);
-  auto context = megamoe::make_rank_collective_context(session, 0, execution);
-  auto local = megamoe::build_rank_local_histogram(config, context, {1, {0}});
+      weftmoe::make_collective_session("lifetime", 1, 1, session_state);
+  auto execution = weftmoe::make_execution_token("exec", execution_state);
+  auto context = weftmoe::make_rank_collective_context(session, 0, execution);
+  auto local = weftmoe::build_rank_local_histogram(config, context, {1, {0}});
   auto behavior = std::make_shared<BackendBehavior>();
   behavior->expert_rows = {{1, 0}};
   ScriptedBackend backend(behavior);
   {
-    auto operation = megamoe::start_count_exchange(local, backend);
+    auto operation = weftmoe::start_count_exchange(local, backend);
     local = {};
     context = {};
     execution = {};
@@ -797,11 +797,11 @@ void test_typed_storage_lifetimes_and_unwaited_destruction() {
     throwing->expert_rows = {{1, 0}};
     throwing->cancel = mode;
     ScriptedBackend throwing_backend(throwing);
-    const auto throwing_local = megamoe::build_rank_local_histogram(
+    const auto throwing_local = weftmoe::build_rank_local_histogram(
         config, make_context(config, 0, "destructor", 2), {1, {0}});
     {
       auto operation =
-          megamoe::start_count_exchange(throwing_local, throwing_backend);
+          weftmoe::start_count_exchange(throwing_local, throwing_backend);
       (void)operation;
     }
     REQUIRE(throwing->cancel_calls == 1);
@@ -813,19 +813,19 @@ void test_typed_storage_lifetimes_and_unwaited_destruction() {
   const std::weak_ptr<SessionState> retained_session = retained_session_state;
   const std::weak_ptr<ExecutionState> retained_execution =
       retained_execution_state;
-  auto retained_context = megamoe::make_rank_collective_context(
-      megamoe::make_collective_session("validated-life", 1, 3,
+  auto retained_context = weftmoe::make_rank_collective_context(
+      weftmoe::make_collective_session("validated-life", 1, 3,
                                        retained_session_state),
       0,
-      megamoe::make_execution_token("validated-exec",
+      weftmoe::make_execution_token("validated-exec",
                                     retained_execution_state));
   auto retained_local =
-      megamoe::build_rank_local_histogram(config, retained_context, {1, {0}});
+      weftmoe::build_rank_local_histogram(config, retained_context, {1, {0}});
   auto retained_behavior = std::make_shared<BackendBehavior>();
   retained_behavior->expert_rows = {{1, 0}};
   ScriptedBackend retained_backend(retained_behavior);
   auto retained_operation =
-      megamoe::start_count_exchange(retained_local, retained_backend);
+      weftmoe::start_count_exchange(retained_local, retained_backend);
   auto validated = retained_operation.wait();
   ValidatedCollectiveHandle validated_copy = validated;
   ValidatedCollectiveHandle validated_move = std::move(validated_copy);
@@ -857,14 +857,14 @@ void test_typed_storage_lifetimes_and_unwaited_destruction() {
 
 void test_backend_exception_boundaries_and_device_rejection() {
   const auto config = make_config(1, 1, 2, 1, 4);
-  const auto local = megamoe::build_rank_local_histogram(
+  const auto local = weftmoe::build_rank_local_histogram(
       config, make_context(config, 0, "errors", 3), {1, {0}});
   LocalHistogramHandle empty_local;
   auto unused_behavior = std::make_shared<BackendBehavior>();
   ScriptedBackend unused_backend(unused_behavior);
   expect_error(
       NotifyErrorCode::CountExchangeFailure,
-      [&] { (void)megamoe::start_count_exchange(empty_local, unused_backend); },
+      [&] { (void)weftmoe::start_count_exchange(empty_local, unused_backend); },
       {"phase=start", "actual=empty/default"});
   for (const auto mode :
        {ThrowMode::Notify, ThrowMode::Standard, ThrowMode::Unknown}) {
@@ -872,7 +872,7 @@ void test_backend_exception_boundaries_and_device_rejection() {
     behavior->start = mode;
     ScriptedBackend backend(behavior);
     expect_error(NotifyErrorCode::CountExchangeFailure,
-                 [&] { (void)megamoe::start_count_exchange(local, backend); },
+                 [&] { (void)weftmoe::start_count_exchange(local, backend); },
                  {"phase=start", "kind=expert_counts", "rank=0", "errors",
                   "generation=3", "backend_error"});
   }
@@ -882,7 +882,7 @@ void test_backend_exception_boundaries_and_device_rejection() {
     behavior->wait = mode;
     behavior->expert_rows = {{1, 0}};
     ScriptedBackend backend(behavior);
-    auto operation = megamoe::start_count_exchange(local, backend);
+    auto operation = weftmoe::start_count_exchange(local, backend);
     expect_error(NotifyErrorCode::CountExchangeFailure,
                  [&] { (void)operation.wait(); },
                  {"phase=wait", "backend_error"});
@@ -898,7 +898,7 @@ void test_backend_exception_boundaries_and_device_rejection() {
     behavior->cancel = mode;
     behavior->expert_rows = {{1, 0}};
     ScriptedBackend backend(behavior);
-    auto operation = megamoe::start_count_exchange(local, backend);
+    auto operation = weftmoe::start_count_exchange(local, backend);
     expect_error(NotifyErrorCode::CountExchangeFailure,
                  [&] { operation.cancel(); },
                  {"phase=cancel", "backend_error"});
@@ -911,7 +911,7 @@ void test_backend_exception_boundaries_and_device_rejection() {
   device_behavior->expert_rows = {{1, 0}};
   device_behavior->return_device = true;
   ScriptedBackend device_backend(device_behavior);
-  auto device_op = megamoe::start_count_exchange(local, device_backend);
+  auto device_op = weftmoe::start_count_exchange(local, device_backend);
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] { (void)device_op.wait(); },
                {"typed host matrix", "opaque device lease"});
@@ -921,7 +921,7 @@ void test_backend_exception_boundaries_and_device_rejection() {
   kind_behavior->override_kind = true;
   kind_behavior->returned_kind = ExchangeKind::NotifyPacketSummary;
   ScriptedBackend kind_backend(kind_behavior);
-  auto kind_op = megamoe::start_count_exchange(local, kind_backend);
+  auto kind_op = weftmoe::start_count_exchange(local, kind_backend);
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] { (void)kind_op.wait(); },
                {"collective kind mismatch", "expected=expert_counts",
@@ -930,12 +930,12 @@ void test_backend_exception_boundaries_and_device_rejection() {
   auto shape_behavior = std::make_shared<BackendBehavior>();
   shape_behavior->expert_rows = {};
   ScriptedBackend shape_backend(shape_behavior);
-  auto shape_op = megamoe::start_count_exchange(local, shape_backend);
+  auto shape_op = weftmoe::start_count_exchange(local, shape_backend);
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] { (void)shape_op.wait(); },
                {"field=matrix.rows", "expected=1", "actual=0"});
 
-  const auto valid_device = megamoe::make_device_buffer_lease(
+  const auto valid_device = weftmoe::make_device_buffer_lease(
       2, 3, 8, std::make_shared<TestDeviceLease>());
   REQUIRE(valid_device.rows() == 2);
   REQUIRE(valid_device.row_width() == 3);
@@ -943,32 +943,32 @@ void test_backend_exception_boundaries_and_device_rejection() {
   REQUIRE(valid_device.capacity_elements() == 8);
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::make_device_buffer_lease(
+                 (void)weftmoe::make_device_buffer_lease(
                      0, 3, 3, std::make_shared<TestDeviceLease>());
                },
                {"phase=device-lease-validation", "field=rows", "expected=>0",
                 "actual=0"});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::make_device_buffer_lease(
+                 (void)weftmoe::make_device_buffer_lease(
                      1, 0, 1, std::make_shared<TestDeviceLease>());
                },
                {"field=row_width", "expected=>0", "actual=0"});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::make_device_buffer_lease(
+                 (void)weftmoe::make_device_buffer_lease(
                      2, 4, 7, std::make_shared<TestDeviceLease>());
                },
                {"field=capacity_elements", "expected=>=8", "actual=7"});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::make_device_buffer_lease(
+                 (void)weftmoe::make_device_buffer_lease(
                      1, 1, 0, std::make_shared<TestDeviceLease>());
                },
                {"field=capacity_elements", "expected=>0", "actual=0"});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::make_device_buffer_lease(
+                 (void)weftmoe::make_device_buffer_lease(
                      2, std::numeric_limits<std::uint64_t>::max(),
                      std::numeric_limits<std::uint64_t>::max(),
                      std::make_shared<TestDeviceLease>());
@@ -977,160 +977,160 @@ void test_backend_exception_boundaries_and_device_rejection() {
 }
 void test_context_kind_and_provenance_mismatch_messages() {
   expect_error(NotifyErrorCode::CountExchangeFailure,
-               [&] { (void)megamoe::make_collective_session("", 1, 1); },
+               [&] { (void)weftmoe::make_collective_session("", 1, 1); },
                {"identity", "actual=empty"});
   expect_error(NotifyErrorCode::CountExchangeFailure,
-               [&] { (void)megamoe::make_collective_session("bad", 1, 0); },
+               [&] { (void)weftmoe::make_collective_session("bad", 1, 0); },
                {"generation", "actual=0"});
 
   const auto fake_config = make_config(1, 2, 4, 1, 4);
   const auto fake_session_a =
-      megamoe::make_collective_session("fake-cross", 2, 1);
+      weftmoe::make_collective_session("fake-cross", 2, 1);
   const auto fake_session_b =
-      megamoe::make_collective_session("fake-cross", 2, 1);
-  const auto fake_local_a = megamoe::build_rank_local_histogram(
+      weftmoe::make_collective_session("fake-cross", 2, 1);
+  const auto fake_local_a = weftmoe::build_rank_local_histogram(
       fake_config,
-      megamoe::make_rank_collective_context(
-          fake_session_a, 0, megamoe::make_execution_token("fake-a")),
+      weftmoe::make_rank_collective_context(
+          fake_session_a, 0, weftmoe::make_execution_token("fake-a")),
       {});
-  const auto fake_local_b = megamoe::build_rank_local_histogram(
+  const auto fake_local_b = weftmoe::build_rank_local_histogram(
       fake_config,
-      megamoe::make_rank_collective_context(
-          fake_session_b, 1, megamoe::make_execution_token("fake-b")),
+      weftmoe::make_rank_collective_context(
+          fake_session_b, 1, weftmoe::make_execution_token("fake-b")),
       {});
   HostFakeCountExchange cross_backend(2, "fake-cross");
   auto first_fake_operation =
-      megamoe::start_count_exchange(fake_local_a, cross_backend);
+      weftmoe::start_count_exchange(fake_local_a, cross_backend);
   expect_error(
       NotifyErrorCode::CountExchangeFailure,
-      [&] { (void)megamoe::start_count_exchange(fake_local_b, cross_backend); },
+      [&] { (void)weftmoe::start_count_exchange(fake_local_b, cross_backend); },
       {"phase=start", "cross-session mix", "different session instance"});
   first_fake_operation.cancel();
 
   const auto config = make_config(1, 2, 4, 2, 4);
-  const auto session = megamoe::make_collective_session("base", 2, 4);
-  const auto execution0 = megamoe::make_execution_token("exec0");
+  const auto session = weftmoe::make_collective_session("base", 2, 4);
+  const auto execution0 = weftmoe::make_execution_token("exec0");
   const auto context0 =
-      megamoe::make_rank_collective_context(session, 0, execution0);
+      weftmoe::make_rank_collective_context(session, 0, execution0);
   const auto local0 =
-      megamoe::build_rank_local_histogram(config, context0, {1, {0, 1}});
+      weftmoe::build_rank_local_histogram(config, context0, {1, {0, 1}});
   const auto count0 = complete_scripted(local0, ExchangeKind::ExpertCounts,
                                         {{1, 1, 0, 0}, {0, 0, 0, 0}});
   const auto summary0 =
       complete_scripted(local0, ExchangeKind::NotifyPacketSummary, {{1}, {0}});
-  (void)megamoe::materialize_rank_metadata(local0, count0, summary0);
+  (void)weftmoe::materialize_rank_metadata(local0, count0, summary0);
   expect_error(
       NotifyErrorCode::CountExchangeFailure,
-      [&] { (void)megamoe::materialize_rank_metadata(local0, count0, count0); },
+      [&] { (void)weftmoe::materialize_rank_metadata(local0, count0, count0); },
       {"field=collective.kind", "expected=notify_packet_summary",
        "actual=expert_counts"});
 
-  const auto local_rank1 = megamoe::build_rank_local_histogram(
+  const auto local_rank1 = weftmoe::build_rank_local_histogram(
       config,
-      megamoe::make_rank_collective_context(
-          session, 1, megamoe::make_execution_token("exec1")),
+      weftmoe::make_rank_collective_context(
+          session, 1, weftmoe::make_execution_token("exec1")),
       {});
   const auto count_rank1 = complete_scripted(
       local_rank1, ExchangeKind::ExpertCounts, {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(local0, count_rank1,
+                 (void)weftmoe::materialize_rank_metadata(local0, count_rank1,
                                                           summary0);
                },
                {"field=calling_rank", "expected=0", "actual=1"});
 
-  const auto other_execution = megamoe::build_rank_local_histogram(
+  const auto other_execution = weftmoe::build_rank_local_histogram(
       config,
-      megamoe::make_rank_collective_context(
-          session, 0, megamoe::make_execution_token("other-exec")),
+      weftmoe::make_rank_collective_context(
+          session, 0, weftmoe::make_execution_token("other-exec")),
       {1, {0, 1}});
   const auto other_exec_count =
       complete_scripted(other_execution, ExchangeKind::ExpertCounts,
                         {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local0, other_exec_count, summary0);
                },
                {"field=execution.provenance", "exec0", "other-exec"});
 
   const auto generation_context = make_context(config, 0, "base", 5, "exec0");
-  const auto generation_local = megamoe::build_rank_local_histogram(
+  const auto generation_local = weftmoe::build_rank_local_histogram(
       config, generation_context, {1, {0, 1}});
   const auto generation_count =
       complete_scripted(generation_local, ExchangeKind::ExpertCounts,
                         {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local0, generation_count, summary0);
                },
                {"field=session.generation", "expected=4", "actual=5"});
 
-  const auto session_local = megamoe::build_rank_local_histogram(
+  const auto session_local = weftmoe::build_rank_local_histogram(
       config, make_context(config, 0, "other-session", 4, "exec0"),
       {1, {0, 1}});
   const auto session_count = complete_scripted(
       session_local, ExchangeKind::ExpertCounts, {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(local0, session_count,
+                 (void)weftmoe::materialize_rank_metadata(local0, session_count,
                                                           summary0);
                },
                {"field=session.identity", "base", "other-session"});
 
   const auto same_fields_local =
-      megamoe::build_rank_local_histogram(config, context0, {1, {0, 1}});
+      weftmoe::build_rank_local_histogram(config, context0, {1, {0, 1}});
   const auto same_fields_count =
       complete_scripted(same_fields_local, ExchangeKind::ExpertCounts,
                         {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local0, same_fields_count, summary0);
                },
                {"field=local.provenance"});
 
   const auto same_values_session =
-      megamoe::make_collective_session("base", 2, 4);
-  const auto other_session_instance_local = megamoe::build_rank_local_histogram(
+      weftmoe::make_collective_session("base", 2, 4);
+  const auto other_session_instance_local = weftmoe::build_rank_local_histogram(
       config,
-      megamoe::make_rank_collective_context(same_values_session, 0, execution0),
+      weftmoe::make_rank_collective_context(same_values_session, 0, execution0),
       {1, {0, 1}});
   const auto other_session_instance_count = complete_scripted(
       other_session_instance_local, ExchangeKind::ExpertCounts,
       {{1, 1, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local0, other_session_instance_count, summary0);
                },
                {"field=session.provenance", "different session instance"});
 
   const auto world3 = make_config(1, 3, 4, 2, 4);
-  const auto world3_local = megamoe::build_rank_local_histogram(
+  const auto world3_local = weftmoe::build_rank_local_histogram(
       world3, make_context(world3, 0, "base", 4, "exec0"), {1, {0, 1}});
   const auto world3_count =
       complete_scripted(world3_local, ExchangeKind::ExpertCounts,
                         {{1, 1, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(local0, world3_count,
+                 (void)weftmoe::materialize_rank_metadata(local0, world3_count,
                                                           summary0);
                },
                {"field=world_size", "expected=2", "actual=3"});
 }
 void test_malicious_completion_context_and_corruption_hooks() {
   const auto config = make_config(1, 1, 2, 1, 4);
-  const auto local = megamoe::build_rank_local_histogram(
+  const auto local = weftmoe::build_rank_local_histogram(
       config, make_context(config, 0, "malicious", 2), {1, {0}});
   auto behavior = std::make_shared<BackendBehavior>();
   behavior->expert_rows = {{1, 0}};
   behavior->override_context = true;
-  behavior->returned_context = megamoe::make_rank_collective_context(
-      local.context().session(), 0, megamoe::make_execution_token("other"));
+  behavior->returned_context = weftmoe::make_rank_collective_context(
+      local.context().session(), 0, weftmoe::make_execution_token("other"));
   ScriptedBackend backend(behavior);
-  auto operation = megamoe::start_count_exchange(local, backend);
+  auto operation = weftmoe::start_count_exchange(local, backend);
   expect_error(
       NotifyErrorCode::CountExchangeFailure, [&] { (void)operation.wait(); },
       {"execution token mismatch", "expected='exec'", "actual='other'"});
@@ -1140,144 +1140,144 @@ void test_malicious_completion_context_and_corruption_hooks() {
   const auto summary =
       complete_scripted(local, ExchangeKind::NotifyPacketSummary, {{1}});
   const auto bad_expert =
-      megamoe::testing::NotifyCorruptionHook::with_expert_id(local, 0, 99);
+      weftmoe::testing::NotifyCorruptionHook::with_expert_id(local, 0, 99);
   expect_error(NotifyErrorCode::ExpertOutOfRange,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(bad_expert, count,
+                 (void)weftmoe::materialize_rank_metadata(bad_expert, count,
                                                           summary);
                },
                {"phase=materialize-local", "field=outgoing.expert_id", "rank=0",
                 "expected=[0,2)", "actual=99"});
   const auto truncated =
-      megamoe::testing::NotifyCorruptionHook::with_truncated_expert_ids(local);
+      weftmoe::testing::NotifyCorruptionHook::with_truncated_expert_ids(local);
   expect_error(NotifyErrorCode::InvalidRouteShape,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(truncated, count,
+                 (void)weftmoe::materialize_rank_metadata(truncated, count,
                                                           summary);
                },
                {"phase=materialize-local", "field=expert_id", "rank=0",
                 "expected=1", "actual=0"});
 
   const auto bad_offset =
-      megamoe::testing::NotifyCorruptionHook::with_local_offset(local, 0, 7);
+      weftmoe::testing::NotifyCorruptionHook::with_local_offset(local, 0, 7);
   expect_error(NotifyErrorCode::InvalidRouteShape,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(bad_offset, count,
+                 (void)weftmoe::materialize_rank_metadata(bad_offset, count,
                                                           summary);
                },
                {"phase=materialize-local", "field=outgoing.local_offset",
                 "rank=0", "expected=0", "actual=7"});
   const auto bad_combine =
-      megamoe::testing::NotifyCorruptionHook::with_combine_order(local, 0, 9);
+      weftmoe::testing::NotifyCorruptionHook::with_combine_order(local, 0, 9);
   expect_error(NotifyErrorCode::InvalidRouteShape,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(bad_combine, count,
+                 (void)weftmoe::materialize_rank_metadata(bad_combine, count,
                                                           summary);
                },
                {"phase=materialize-local", "field=outgoing.combine_order",
                 "rank=0", "actual=9"});
   const auto bad_mask =
-      megamoe::testing::NotifyCorruptionHook::with_node_mask(local, 0, 0);
+      weftmoe::testing::NotifyCorruptionHook::with_node_mask(local, 0, 0);
   expect_error(
       NotifyErrorCode::InvalidRouteShape,
       [&] {
-        (void)megamoe::materialize_rank_metadata(bad_mask, count, summary);
+        (void)weftmoe::materialize_rank_metadata(bad_mask, count, summary);
       },
       {"phase=materialize-local", "field=outgoing.destination_node_mask",
        "rank=0", "expected=recomputed node mask", "actual=content mismatch"});
   const auto bad_local_count =
-      megamoe::testing::NotifyCorruptionHook::with_local_expert_count(local, 0,
+      weftmoe::testing::NotifyCorruptionHook::with_local_expert_count(local, 0,
                                                                       8);
   expect_error(NotifyErrorCode::InvalidRouteShape,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(bad_local_count,
+                 (void)weftmoe::materialize_rank_metadata(bad_local_count,
                                                           count, summary);
                },
                {"phase=materialize-local", "field=local_expert_count", "rank=0",
                 "actual=content mismatch"});
 
   const auto bad_matrix_shape =
-      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count, {});
+      weftmoe::testing::NotifyCorruptionHook::with_collective_matrix(count, {});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local, bad_matrix_shape, summary);
                },
                {"phase=materialize", "field=matrix.rows", "rank=0",
                 "expected=1", "actual=0"});
   const auto bad_matrix_width =
-      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
+      weftmoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
                                                                      {{1}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(
+                 (void)weftmoe::materialize_rank_metadata(
                      local, bad_matrix_width, summary);
                },
                {"phase=materialize", "field=matrix.row_width", "rank=0",
                 "expected=2", "actual=1"});
   const auto bad_matrix_row =
-      megamoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
+      weftmoe::testing::NotifyCorruptionHook::with_collective_matrix(count,
                                                                      {{0, 0}});
   expect_error(NotifyErrorCode::CountExchangeFailure,
                [&] {
-                 (void)megamoe::materialize_rank_metadata(local, bad_matrix_row,
+                 (void)weftmoe::materialize_rank_metadata(local, bad_matrix_row,
                                                           summary);
                },
                {"phase=materialize", "field=expert_counts.calling_rank_row",
                 "rank=0", "expected=local histogram count row",
                 "actual=content mismatch"});
 
-  const auto handle = megamoe::materialize_rank_metadata(local, count, summary);
+  const auto handle = weftmoe::materialize_rank_metadata(local, count, summary);
   const auto validate_corrupt = [&](const DispatchHandle &corrupt,
                                     const std::string &field) {
     expect_error(NotifyErrorCode::InvalidHandle,
-                 [&] { (void)megamoe::make_workspace_plan(corrupt); },
+                 [&] { (void)weftmoe::make_workspace_plan(corrupt); },
                  {"phase=dispatch-validation", "field=" + field, "rank=0",
                   "expected=", "actual="});
   };
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_expert_row_count(handle, 0,
+      weftmoe::testing::NotifyCorruptionHook::with_expert_row_count(handle, 0,
                                                                     9),
       "incoming.expert_row_count");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_expert_row_prefix(handle, 1,
+      weftmoe::testing::NotifyCorruptionHook::with_expert_row_prefix(handle, 1,
                                                                      9),
       "incoming.expert_row_prefix");
-  validate_corrupt(megamoe::testing::NotifyCorruptionHook::
+  validate_corrupt(weftmoe::testing::NotifyCorruptionHook::
                        with_packet_identity_destination_node(handle, 0, 9),
                    "transport.packet.identity");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_packet_proxy(handle, 0, 9),
+      weftmoe::testing::NotifyCorruptionHook::with_packet_proxy(handle, 0, 9),
       "transport.packet.proxy_rank");
-  validate_corrupt(megamoe::testing::NotifyCorruptionHook::with_fanout_expert(
+  validate_corrupt(weftmoe::testing::NotifyCorruptionHook::with_fanout_expert(
                        handle, 0, 0, 9),
                    "transport.fanout.expert_id");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_fanout_local_rank(handle, 0,
+      weftmoe::testing::NotifyCorruptionHook::with_fanout_local_rank(handle, 0,
                                                                      0, 9),
       "transport.fanout.destination_local_rank");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_fanout_row(handle, 0, 0, 9),
+      weftmoe::testing::NotifyCorruptionHook::with_fanout_row(handle, 0, 0, 9),
       "transport.fanout.dst_row");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_fanout_slot(handle, 0, 0, 9),
+      weftmoe::testing::NotifyCorruptionHook::with_fanout_slot(handle, 0, 0, 9),
       "transport.fanout.topk_slot");
   validate_corrupt(
-      megamoe::testing::NotifyCorruptionHook::with_mtile_row(handle, 0, 0, 9),
+      weftmoe::testing::NotifyCorruptionHook::with_mtile_row(handle, 0, 0, 9),
       "incoming.mtile_expected_rows");
 }
 
 void test_handle_copy_move_workspace_and_overflow() {
   const auto config = make_config(1, 2, 4, 2, 4);
   const std::vector<RankRoutingInput> inputs{{1, {0, 1}}, {1, {2, 3}}};
-  const auto handles = megamoe::build_notify_dispatch_for_testing(
+  const auto handles = weftmoe::build_notify_dispatch_for_testing(
       config, inputs, "workspace", 5);
   DispatchHandle empty;
   expect_error(NotifyErrorCode::InvalidHandle, [&] { (void)empty.metadata(); });
-  const auto plan = megamoe::make_workspace_plan(handles[0]);
-  megamoe::validate_workspace_plan(handles[0], plan);
-  (void)megamoe::ForwardPersistentInputs::checked(handles[0], plan);
-  megamoe::WorkspacePlan empty_plan;
+  const auto plan = weftmoe::make_workspace_plan(handles[0]);
+  weftmoe::validate_workspace_plan(handles[0], plan);
+  (void)weftmoe::ForwardPersistentInputs::checked(handles[0], plan);
+  weftmoe::WorkspacePlan empty_plan;
   expect_error(NotifyErrorCode::WorkspaceMismatch,
                [&] { (void)empty_plan.requirements(); }, {"default/invalid"});
   expect_error(NotifyErrorCode::WorkspaceMismatch,
@@ -1288,18 +1288,18 @@ void test_handle_copy_move_workspace_and_overflow() {
                [&] { (void)empty_plan.epoch(); }, {"default/invalid"});
   expect_error(
       NotifyErrorCode::WorkspaceMismatch,
-      [&] { megamoe::validate_workspace_plan(handles[0], empty_plan); },
+      [&] { weftmoe::validate_workspace_plan(handles[0], empty_plan); },
       {"default/invalid"});
   expect_error(NotifyErrorCode::WorkspaceMismatch,
-               [&] { megamoe::validate_workspace_plan(handles[1], plan); },
+               [&] { weftmoe::validate_workspace_plan(handles[1], plan); },
                {"another DispatchHandle"});
-  const auto other = megamoe::build_notify_dispatch_for_testing(config, inputs,
+  const auto other = weftmoe::build_notify_dispatch_for_testing(config, inputs,
                                                                 "workspace", 5);
   expect_error(NotifyErrorCode::WorkspaceMismatch,
-               [&] { megamoe::validate_workspace_plan(other[0], plan); },
+               [&] { weftmoe::validate_workspace_plan(other[0], plan); },
                {"another DispatchHandle"});
 
-  const auto local = megamoe::build_rank_local_histogram(
+  const auto local = weftmoe::build_rank_local_histogram(
       config, make_context(config, 0, "overflow", 1), {1, {0, 1}});
   const auto counts = complete_scripted(
       local, ExchangeKind::ExpertCounts,
@@ -1308,53 +1308,53 @@ void test_handle_copy_move_workspace_and_overflow() {
       complete_scripted(local, ExchangeKind::NotifyPacketSummary, {{1}, {0}});
   expect_error(
       NotifyErrorCode::ArithmeticOverflow,
-      [&] { (void)megamoe::materialize_rank_metadata(local, counts, summary); },
+      [&] { (void)weftmoe::materialize_rank_metadata(local, counts, summary); },
       {"source prefix"});
 }
 void test_fixed_control_protocol_agreement() {
   const auto config = make_config(1, 2, 8, 3, 4);
   const auto context0 = make_context(config, 0, "control", 17, "control-exec-0");
   const auto context1 = make_context(config, 1, "control", 17, "control-exec-1");
-  const auto record0 = megamoe::cuda::make_control_record(
+  const auto record0 = weftmoe::cuda::make_control_record(
       config, context0, 2, 6, 10);
-  const auto record1 = megamoe::cuda::make_control_record(
+  const auto record1 = weftmoe::cuda::make_control_record(
       config, context1, 3, 9, 10);
-  megamoe::cuda::validate_control_matrix({record0, record1});
+  weftmoe::cuda::validate_control_matrix({record0, record1});
 
-  const auto expect_control_error = [&](const megamoe::cuda::ControlMatrix &rows,
+  const auto expect_control_error = [&](const weftmoe::cuda::ControlMatrix &rows,
                                         const std::vector<std::string> &fields) {
     expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] { megamoe::cuda::validate_control_matrix(rows); },
+                 [&] { weftmoe::cuda::validate_control_matrix(rows); },
                  fields);
   };
 
-  const auto max_mismatch = megamoe::cuda::make_control_record(
+  const auto max_mismatch = weftmoe::cuda::make_control_record(
       config, context1, 3, 9, 11);
   expect_control_error({record0, max_mismatch},
                        {"phase=control-agreement", "field=max_tokens_per_rank",
                         "origin_rank=1", "expected=10", "actual=11"});
 
   auto expert_config = make_config(1, 2, 9, 3, 4);
-  const auto expert_mismatch = megamoe::cuda::make_control_record(
+  const auto expert_mismatch = weftmoe::cuda::make_control_record(
       expert_config, context1, 3, 9, 10);
   expect_control_error({record0, expert_mismatch},
                        {"field=num_experts", "origin_rank=1"});
 
-  megamoe::cuda::LocalPreflightStatus invalid_route;
-  invalid_route.error = megamoe::cuda::ControlLocalError::ExpertOutOfRange;
-  invalid_route.field = megamoe::cuda::ControlField::LocalValidation;
+  weftmoe::cuda::LocalPreflightStatus invalid_route;
+  invalid_route.error = weftmoe::cuda::ControlLocalError::ExpertOutOfRange;
+  invalid_route.field = weftmoe::cuda::ControlField::LocalValidation;
   invalid_route.token = 4;
   invalid_route.slot = 2;
   invalid_route.expert = 99;
   invalid_route.expected = 8;
   invalid_route.actual = 99;
-  const auto bad_route = megamoe::cuda::make_control_record(
+  const auto bad_route = weftmoe::cuda::make_control_record(
       config, context1, 5, 15, 10, invalid_route);
   expect_control_error({record0, bad_route},
                        {"field=local_validation", "origin_rank=1",
                         "token=4", "slot=2", "expert=99"});
 
-  const auto over_capacity = megamoe::cuda::make_control_record(
+  const auto over_capacity = weftmoe::cuda::make_control_record(
       config, context1, 11, 33, 10);
   expect_control_error({record0, over_capacity},
                        {"field=num_tokens", "origin_rank=1",
@@ -1376,45 +1376,45 @@ void test_fixed_control_protocol_agreement() {
   std::string first_error;
   std::string second_error;
   try {
-    megamoe::cuda::validate_control_matrix({record0, generation_mismatch});
+    weftmoe::cuda::validate_control_matrix({record0, generation_mismatch});
   } catch (const NotifyDispatchError &error) {
     first_error = error.what();
   }
   try {
-    megamoe::cuda::validate_control_matrix({record0, generation_mismatch});
+    weftmoe::cuda::validate_control_matrix({record0, generation_mismatch});
   } catch (const NotifyDispatchError &error) {
     second_error = error.what();
   }
   REQUIRE(!first_error.empty() && first_error == second_error);
 
-  const auto wire0 = megamoe::cuda::encode_control_header(record0);
-  REQUIRE(megamoe::cuda::decode_control_header(wire0).generation == 17);
+  const auto wire0 = weftmoe::cuda::encode_control_header(record0);
+  REQUIRE(weftmoe::cuda::decode_control_header(wire0).generation == 17);
   REQUIRE(static_cast<unsigned>(wire0[0]) == 0x43U &&
           static_cast<unsigned>(wire0[7]) == 0x4dU);
   auto corrupt_wire = wire0;
   corrupt_wire[80] ^= std::byte{1};
   expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] { (void)megamoe::cuda::decode_control_header(corrupt_wire); },
+               [&] { (void)weftmoe::cuda::decode_control_header(corrupt_wire); },
                {"field=checksum"});
   auto byteswapped = wire0;
-  for (std::size_t word = 0; word < megamoe::cuda::kControlSchemaWords;
+  for (std::size_t word = 0; word < weftmoe::cuda::kControlSchemaWords;
        ++word)
     std::reverse(byteswapped.begin() + static_cast<std::ptrdiff_t>(word * 8),
                  byteswapped.begin() +
                      static_cast<std::ptrdiff_t>((word + 1) * 8));
   expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] { (void)megamoe::cuda::decode_control_header(byteswapped); },
+               [&] { (void)weftmoe::cuda::decode_control_header(byteswapped); },
                {"phase=control-agreement"});
 
-  const auto config0 = megamoe::cuda::encode_canonical_config(
+  const auto config0 = weftmoe::cuda::encode_canonical_config(
       config, 10, context0.session().stable_identity_bytes());
   const auto decoded_config =
-      megamoe::cuda::decode_canonical_config(config0);
+      weftmoe::cuda::decode_canonical_config(config0);
   REQUIRE(decoded_config.rank_to_node == config.topology.rank_to_node);
   REQUIRE(decoded_config.expert_to_rank == config.topology.expert_to_rank);
   REQUIRE(decoded_config.stable_session_identity ==
           context0.session().stable_identity_bytes());
-  REQUIRE(config0.size() >= megamoe::cuda::kCanonicalConfigHeaderBytes);
+  REQUIRE(config0.size() >= weftmoe::cuda::kCanonicalConfigHeaderBytes);
   const std::array<std::byte, 16> config_golden{
       std::byte{0x52}, std::byte{0x49}, std::byte{0x57}, std::byte{0x47},
       std::byte{0x46}, std::byte{0x43}, std::byte{0x4d}, std::byte{0x4d},
@@ -1425,7 +1425,7 @@ void test_fixed_control_protocol_agreement() {
   {
     auto byteswapped_config = config0;
     for (std::size_t word = 0;
-         word * 8U < megamoe::cuda::kCanonicalConfigHeaderBytes; ++word)
+         word * 8U < weftmoe::cuda::kCanonicalConfigHeaderBytes; ++word)
       std::reverse(
           byteswapped_config.begin() +
               static_cast<std::ptrdiff_t>(word * 8U),
@@ -1433,7 +1433,7 @@ void test_fixed_control_protocol_agreement() {
               static_cast<std::ptrdiff_t>((word + 1U) * 8U));
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   (void)megamoe::cuda::decode_canonical_config(
+                   (void)weftmoe::cuda::decode_canonical_config(
                        byteswapped_config);
                  },
                  {"magic"});
@@ -1445,17 +1445,17 @@ void test_fixed_control_protocol_agreement() {
   world1_header.calling_rank = 0;
   world1_header.world_size = 1;
   world1_header.config_blob_bytes = config0.size();
-  world1_header.config_digest = megamoe::cuda::config_wire_digest(config0);
-  megamoe::cuda::validate_config_matrix({config0}, {world1_header});
+  world1_header.config_digest = weftmoe::cuda::config_wire_digest(config0);
+  weftmoe::cuda::validate_config_matrix({config0}, {world1_header});
   const auto corrupt_config = [&](std::size_t offset,
                                   const std::string &needle) {
     auto damaged = config0;
     damaged.at(offset) ^= std::byte{1};
     auto header = world1_header;
-    header.config_digest = megamoe::cuda::config_wire_digest(damaged);
+    header.config_digest = weftmoe::cuda::config_wire_digest(damaged);
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   megamoe::cuda::validate_config_matrix({damaged}, {header});
+                   weftmoe::cuda::validate_config_matrix({damaged}, {header});
                  },
                  {needle});
   };
@@ -1471,10 +1471,10 @@ void test_fixed_control_protocol_agreement() {
     truncated.pop_back();
     auto header = world1_header;
     header.config_blob_bytes = truncated.size();
-    header.config_digest = megamoe::cuda::config_wire_digest(truncated);
+    header.config_digest = weftmoe::cuda::config_wire_digest(truncated);
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   megamoe::cuda::validate_config_matrix({truncated}, {header});
+                   weftmoe::cuda::validate_config_matrix({truncated}, {header});
                  },
                  {"truncated"});
   }
@@ -1483,10 +1483,10 @@ void test_fixed_control_protocol_agreement() {
     trailing.push_back(std::byte{0});
     auto header = world1_header;
     header.config_blob_bytes = trailing.size();
-    header.config_digest = megamoe::cuda::config_wire_digest(trailing);
+    header.config_digest = weftmoe::cuda::config_wire_digest(trailing);
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   megamoe::cuda::validate_config_matrix({trailing}, {header});
+                   weftmoe::cuda::validate_config_matrix({trailing}, {header});
                  },
                  {"trailing_bytes"});
   }
@@ -1495,7 +1495,7 @@ void test_fixed_control_protocol_agreement() {
     ++wrong_header_digest.config_digest;
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   megamoe::cuda::validate_config_matrix(
+                   weftmoe::cuda::validate_config_matrix(
                        {config0}, {wrong_header_digest});
                  },
                  {"field=config_digest", "control_header_vs_wire"});
@@ -1503,17 +1503,17 @@ void test_fixed_control_protocol_agreement() {
   auto config_changed = config;
   std::swap(config_changed.topology.expert_to_rank[0],
             config_changed.topology.expert_to_rank[1]);
-  const auto config1 = megamoe::cuda::encode_canonical_config(
+  const auto config1 = weftmoe::cuda::encode_canonical_config(
       config_changed, 10, context1.session().stable_identity_bytes());
   auto same_digest0 = record0;
   auto same_digest1 = record1;
   same_digest0.config_blob_bytes = config0.size();
   same_digest1.config_blob_bytes = config1.size();
-  same_digest0.config_digest = megamoe::cuda::config_wire_digest(config0);
-  same_digest1.config_digest = megamoe::cuda::config_wire_digest(config1);
+  same_digest0.config_digest = weftmoe::cuda::config_wire_digest(config0);
+  same_digest1.config_digest = weftmoe::cuda::config_wire_digest(config1);
   expect_error(NotifyErrorCode::ControlProtocolFailure,
                [&] {
-                 megamoe::cuda::validate_config_matrix(
+                 weftmoe::cuda::validate_config_matrix(
                      {config0, config1}, {same_digest0, same_digest1});
                },
                {"phase=config-agreement", "field=expert_to_rank",
@@ -1526,7 +1526,7 @@ void test_fixed_control_protocol_agreement() {
   forged_digest1.config_digest = same_digest0.config_digest;
   expect_error(NotifyErrorCode::ControlProtocolFailure,
                [&] {
-                 megamoe::cuda::validate_config_matrix(
+                 weftmoe::cuda::validate_config_matrix(
                      {config0, config1}, {same_digest0, forged_digest1});
                },
                {"field=config_digest", "origin_rank=1"});
@@ -1537,30 +1537,30 @@ void test_fixed_control_protocol_agreement() {
       std::byte{0x10}, std::byte{0x20}, std::byte{0x30}};
   const std::vector<std::byte> raw_identity1{
       std::byte{0x10}, std::byte{0x20}, std::byte{0x31}};
-  const auto raw_session0 = megamoe::make_collective_session(
+  const auto raw_session0 = weftmoe::make_collective_session(
       "same-display", raw_identity0, 2, 91);
-  const auto raw_session1 = megamoe::make_collective_session(
+  const auto raw_session1 = weftmoe::make_collective_session(
       "same-display", raw_identity1, 2, 91);
-  const auto raw_context0 = megamoe::make_rank_collective_context(
-      raw_session0, 0, megamoe::make_execution_token("raw-exec-0"));
-  const auto raw_context1 = megamoe::make_rank_collective_context(
-      raw_session1, 1, megamoe::make_execution_token("raw-exec-1"));
-  const auto raw_wire0 = megamoe::cuda::encode_canonical_config(
+  const auto raw_context0 = weftmoe::make_rank_collective_context(
+      raw_session0, 0, weftmoe::make_execution_token("raw-exec-0"));
+  const auto raw_context1 = weftmoe::make_rank_collective_context(
+      raw_session1, 1, weftmoe::make_execution_token("raw-exec-1"));
+  const auto raw_wire0 = weftmoe::cuda::encode_canonical_config(
       config, 10, raw_identity0);
-  const auto raw_wire1 = megamoe::cuda::encode_canonical_config(
+  const auto raw_wire1 = weftmoe::cuda::encode_canonical_config(
       config, 10, raw_identity1);
-  auto raw_header0 = megamoe::cuda::make_control_record(
+  auto raw_header0 = weftmoe::cuda::make_control_record(
       config, raw_context0, 1, 3, 10);
-  auto raw_header1 = megamoe::cuda::make_control_record(
+  auto raw_header1 = weftmoe::cuda::make_control_record(
       config, raw_context1, 1, 3, 10);
   // Simulate an adversarial summary collision: fixed control passes, exact raw
   // identity comparison in config agreement still fails.
   raw_header1.session_id_word0 = raw_header0.session_id_word0;
   raw_header1.session_id_word1 = raw_header0.session_id_word1;
-  megamoe::cuda::validate_control_matrix({raw_header0, raw_header1});
+  weftmoe::cuda::validate_control_matrix({raw_header0, raw_header1});
   expect_error(NotifyErrorCode::ControlProtocolFailure,
                [&] {
-                 megamoe::cuda::validate_config_matrix(
+                 weftmoe::cuda::validate_config_matrix(
                      {raw_wire0, raw_wire1}, {raw_header0, raw_header1});
                },
                {"field=session_identity", "origin_rank=1", "coordinate=2"});
@@ -1569,17 +1569,17 @@ void test_fixed_control_protocol_agreement() {
   const auto context30 = make_context(config3, 0, "common", 44, "e0");
   const auto context31 = make_context(config3, 1, "common", 44, "e1");
   const auto context32 = make_context(config3, 2, "common", 44, "e2");
-  const auto row30 = megamoe::cuda::make_control_record(
+  const auto row30 = weftmoe::cuda::make_control_record(
       config3, context30, 1, 3, 10);
-  auto row31 = megamoe::cuda::make_control_record(
+  auto row31 = weftmoe::cuda::make_control_record(
       config3, context31, 1, 3, 10);
-  auto row32 = megamoe::cuda::make_control_record(
+  auto row32 = weftmoe::cuda::make_control_record(
       config3, context32, 1, 3, 10);
   ++row31.session_id_word1;
   ++row32.generation;
   expect_error(NotifyErrorCode::ControlProtocolFailure,
                [&] {
-                 megamoe::cuda::validate_control_matrix(
+                 weftmoe::cuda::validate_control_matrix(
                      {row30, row31, row32});
                },
                {"field=session_id_word1", "origin_rank=1"});
@@ -1589,14 +1589,14 @@ void test_fixed_control_protocol_agreement() {
   ++row31.generation;
   expect_error(NotifyErrorCode::ControlProtocolFailure,
                [&] {
-                 megamoe::cuda::validate_control_matrix(
+                 weftmoe::cuda::validate_control_matrix(
                      {row30, row31, row32});
                },
                {"field=generation", "origin_rank=1"});
 }
 void test_bootstrap_exact_frame_io() {
   std::vector<std::uint8_t> frame(
-      megamoe::cuda::NcclBootstrapInputChannel::kWireBytes);
+      weftmoe::cuda::NcclBootstrapInputChannel::kWireBytes);
   for (std::size_t index = 0; index < frame.size(); ++index)
     frame[index] = static_cast<std::uint8_t>((index * 37U + 11U) & 0xffU);
 
@@ -1606,13 +1606,13 @@ void test_bootstrap_exact_frame_io() {
     script.read_chunk = chunk;
     script.read_eintr = interrupted;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapInputChannel channel(7);
+    weftmoe::cuda::NcclBootstrapInputChannel channel(7);
     auto result = channel.read();
     REQUIRE(static_cast<bool>(result));
     REQUIRE(script.input_offset == frame.size());
     REQUIRE(script.close_count == 1);
     REQUIRE(channel.state() ==
-            megamoe::cuda::BootstrapChannelState::Consumed);
+            weftmoe::cuda::BootstrapChannelState::Consumed);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { (void)channel.read(); },
                  {"field=read-state", "expected=state=Open",
@@ -1632,12 +1632,12 @@ void test_bootstrap_exact_frame_io() {
     script.input.assign(frame.begin(), frame.begin() + short_size);
     script.read_chunk = 17;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapInputChannel channel(7);
+    weftmoe::cuda::NcclBootstrapInputChannel channel(7);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { (void)channel.read(); },
                  {"phase=bootstrap-channel-read", "field=bytes",
                   "expected=128", "actual=" + std::to_string(short_size)});
-    REQUIRE(channel.state() == megamoe::cuda::BootstrapChannelState::Failed);
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     REQUIRE(script.close_count == 1);
   }
 
@@ -1646,13 +1646,13 @@ void test_bootstrap_exact_frame_io() {
     script.input.resize(oversized, 0x5aU);
     script.read_chunk = 17;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapInputChannel channel(7);
+    weftmoe::cuda::NcclBootstrapInputChannel channel(7);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { (void)channel.read(); },
                  {"phase=bootstrap-channel-read", "field=frame-length",
                   "expected=128", "actual=>=129"});
     REQUIRE(script.input_offset == 129);
-    REQUIRE(channel.state() == megamoe::cuda::BootstrapChannelState::Failed);
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { (void)channel.read(); },
                  {"field=read-state", "actual=state=Failed"});
@@ -1665,12 +1665,12 @@ void test_bootstrap_exact_frame_io() {
     BootstrapIoScript script;
     script.write_chunk = chunk;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapOutputChannel channel(8);
+    weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
     channel.write(bootstrap);
     REQUIRE(script.output == frame);
     REQUIRE(script.close_count == 1);
     REQUIRE(channel.state() ==
-            megamoe::cuda::BootstrapChannelState::Consumed);
+            weftmoe::cuda::BootstrapChannelState::Consumed);
   }
 
   {
@@ -1678,7 +1678,7 @@ void test_bootstrap_exact_frame_io() {
     script.write_chunk = 17;
     script.write_eintr = true;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapOutputChannel channel(8);
+    weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
     channel.write(bootstrap);
     REQUIRE(script.output == frame);
     REQUIRE(script.close_count == 1);
@@ -1687,33 +1687,33 @@ void test_bootstrap_exact_frame_io() {
     BootstrapIoScript script;
     script.write_zero = true;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapOutputChannel channel(8);
+    weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { channel.write(bootstrap); },
                  {"phase=bootstrap-channel-write", "field=write-progress",
                   "expected=>0", "actual=0"});
-    REQUIRE(channel.state() == megamoe::cuda::BootstrapChannelState::Failed);
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     REQUIRE(script.close_count == 1);
   }
   {
     BootstrapIoScript script;
     script.write_broken_pipe = true;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapOutputChannel channel(8);
+    weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { channel.write(bootstrap); },
                  {"phase=bootstrap-channel-write", "field=write",
                   "actual=I/O failure"});
-    REQUIRE(channel.state() == megamoe::cuda::BootstrapChannelState::Failed);
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     REQUIRE(script.close_count == 1);
   }
   {
     BootstrapIoScript script;
     script.input = frame;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapInputChannel source(7);
-    megamoe::cuda::NcclBootstrapInputChannel moved(std::move(source));
-    REQUIRE(source.state() == megamoe::cuda::BootstrapChannelState::Closed);
+    weftmoe::cuda::NcclBootstrapInputChannel source(7);
+    weftmoe::cuda::NcclBootstrapInputChannel moved(std::move(source));
+    REQUIRE(source.state() == weftmoe::cuda::BootstrapChannelState::Closed);
     REQUIRE(source.native_fd_for_testing() == -1);
     expect_error(NotifyErrorCode::NcclFailure,
                  [&] { (void)source.read(); }, {"actual=state=Closed"});
@@ -1726,10 +1726,10 @@ void test_bootstrap_exact_frame_io() {
     BootstrapIoScript script;
     BootstrapIoHookGuard guard(script);
     {
-      megamoe::cuda::NcclBootstrapOutputChannel channel(8);
+      weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
       channel.cancel();
       channel.cancel();
-      REQUIRE(channel.state() == megamoe::cuda::BootstrapChannelState::Closed);
+      REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Closed);
     }
     REQUIRE(script.close_count == 1);
   }
@@ -1737,9 +1737,9 @@ void test_bootstrap_exact_frame_io() {
     BootstrapIoScript script;
     BootstrapIoHookGuard guard(script);
     {
-      megamoe::cuda::NcclBootstrapOutputChannel source(8);
-      megamoe::cuda::NcclBootstrapOutputChannel moved(std::move(source));
-      REQUIRE(source.state() == megamoe::cuda::BootstrapChannelState::Closed);
+      weftmoe::cuda::NcclBootstrapOutputChannel source(8);
+      weftmoe::cuda::NcclBootstrapOutputChannel moved(std::move(source));
+      REQUIRE(source.state() == weftmoe::cuda::BootstrapChannelState::Closed);
       REQUIRE(source.native_fd_for_testing() == -1);
       moved.write(bootstrap);
     }
@@ -1749,10 +1749,10 @@ void test_bootstrap_exact_frame_io() {
   {
     BootstrapIoScript script;
     BootstrapIoHookGuard guard(script);
-    megamoe::cuda::NcclBootstrapInputChannel source(7);
-    megamoe::cuda::NcclBootstrapInputChannel destination(9);
+    weftmoe::cuda::NcclBootstrapInputChannel source(7);
+    weftmoe::cuda::NcclBootstrapInputChannel destination(9);
     destination = std::move(source);
-    REQUIRE(source.state() == megamoe::cuda::BootstrapChannelState::Closed);
+    REQUIRE(source.state() == weftmoe::cuda::BootstrapChannelState::Closed);
     REQUIRE(destination.native_fd_for_testing() == 7);
     REQUIRE(script.close_count == 1);
     REQUIRE(script.closed_fds == std::vector<int>{9});
@@ -1763,7 +1763,7 @@ void test_bootstrap_exact_frame_io() {
   {
     BootstrapIoScript script;
     BootstrapIoHookGuard guard(script);
-    { megamoe::cuda::NcclBootstrapInputChannel abandoned(7); }
+    { weftmoe::cuda::NcclBootstrapInputChannel abandoned(7); }
     REQUIRE(script.close_count == 1);
     REQUIRE(script.closed_fds == std::vector<int>{7});
   }
@@ -1786,7 +1786,7 @@ void write_pipe_frame(int fd, const std::vector<std::uint8_t> &bytes) {
 
 void test_bootstrap_real_pipe_one_shot() {
   std::vector<std::uint8_t> frame(
-      megamoe::cuda::NcclBootstrapInputChannel::kWireBytes);
+      weftmoe::cuda::NcclBootstrapInputChannel::kWireBytes);
   for (std::size_t index = 0; index < frame.size(); ++index)
     frame[index] = static_cast<std::uint8_t>((index * 19U + 5U) & 0xffU);
 
@@ -1800,13 +1800,13 @@ void test_bootstrap_real_pipe_one_shot() {
       bytes = frame;
     write_pipe_frame(descriptors[1], bytes);
     const int original_read_fd = descriptors[0];
-    megamoe::cuda::NcclBootstrapInputChannel channel(original_read_fd);
+    weftmoe::cuda::NcclBootstrapInputChannel channel(original_read_fd);
     bool first_rejected = false;
     if (size == 128) {
       auto id = channel.read();
       REQUIRE(static_cast<bool>(id));
       REQUIRE(channel.state() ==
-              megamoe::cuda::BootstrapChannelState::Consumed);
+              weftmoe::cuda::BootstrapChannelState::Consumed);
     } else {
       try {
         (void)channel.read();
@@ -1815,7 +1815,7 @@ void test_bootstrap_real_pipe_one_shot() {
       }
       REQUIRE(first_rejected);
       REQUIRE(channel.state() ==
-              megamoe::cuda::BootstrapChannelState::Failed);
+              weftmoe::cuda::BootstrapChannelState::Failed);
     }
     errno = 0;
     std::uint8_t probe = 0;
@@ -1829,7 +1829,7 @@ void test_bootstrap_real_pipe_one_shot() {
                 << "\nremaining_128_accepted_as_next_frame = 0\n"
                 << "channel_terminal = "
                 << (channel.state() ==
-                            megamoe::cuda::BootstrapChannelState::Failed
+                            weftmoe::cuda::BootstrapChannelState::Failed
                         ? 1
                         : 0)
                 << '\n';
@@ -1861,7 +1861,7 @@ void test_bootstrap_real_pipe_one_shot() {
     }
     (void)::close(streaming[1]);
   });
-  megamoe::cuda::NcclBootstrapInputChannel streaming_channel(streaming[0]);
+  weftmoe::cuda::NcclBootstrapInputChannel streaming_channel(streaming[0]);
   expect_error(NotifyErrorCode::NcclFailure,
                [&] { (void)streaming_channel.read(); },
                {"field=frame-length", "actual=>=129"});
@@ -1874,14 +1874,14 @@ void test_bootstrap_real_pipe_one_shot() {
   int source_pipe[2] = {-1, -1};
   REQUIRE(::pipe(source_pipe) == 0);
   write_pipe_frame(source_pipe[1], frame);
-  megamoe::cuda::NcclBootstrapInputChannel source(source_pipe[0]);
+  weftmoe::cuda::NcclBootstrapInputChannel source(source_pipe[0]);
   auto id = source.read();
   int output_pipe[2] = {-1, -1};
   REQUIRE(::pipe(output_pipe) == 0);
   const int original_write_fd = output_pipe[1];
-  megamoe::cuda::NcclBootstrapOutputChannel output(original_write_fd);
+  weftmoe::cuda::NcclBootstrapOutputChannel output(original_write_fd);
   output.write(id);
-  REQUIRE(output.state() == megamoe::cuda::BootstrapChannelState::Consumed);
+  REQUIRE(output.state() == weftmoe::cuda::BootstrapChannelState::Consumed);
   errno = 0;
   REQUIRE(::write(original_write_fd, frame.data(), 1) == -1);
   REQUIRE(errno == EBADF);
@@ -1909,7 +1909,7 @@ void test_bootstrap_real_pipe_one_shot() {
   std::vector<std::uint8_t> oversized(129, 0xaaU);
   write_pipe_frame(stale_pipe[1], oversized);
   const int stale_number = stale_pipe[0];
-  megamoe::cuda::NcclBootstrapInputChannel stale(stale_number);
+  weftmoe::cuda::NcclBootstrapInputChannel stale(stale_number);
   expect_error(NotifyErrorCode::NcclFailure,
                [&] { (void)stale.read(); }, {"actual=>=129"});
   int replacement[2] = {-1, -1};

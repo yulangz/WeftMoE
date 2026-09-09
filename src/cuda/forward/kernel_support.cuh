@@ -419,7 +419,7 @@ enum ForwardProgressWord : std::uint32_t {
   kForwardProgressWords = 16,
 };
 
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
 void dump_generation_completion(std::ostream &output,
                                 const std::uint64_t *mapped,
                                 std::uint32_t contexts,
@@ -463,7 +463,7 @@ void dump_generation_completion(std::ostream &output,
          << ",expected=" << word(kTail + 20ULL)
          << ",arrived=" << word(kTail + 21ULL)
          << ",waiters=" << word(kTail + 22ULL) << '}';
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   output << ' ' << prefix << ".tile_wait_rails={";
   for (std::uint32_t rail = 0; rail < 8U; ++rail) {
     if (rail != 0U)
@@ -649,7 +649,7 @@ struct GinWindowLayout {
   std::size_t total = 0;
 };
 
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
 struct TimelineAllocationLayout {
   std::size_t counts = 0;
   std::size_t overflow = 0;
@@ -1099,7 +1099,7 @@ enum class SlotState : std::uint8_t { Available, InUse, Quarantined };
 struct PoolSlot {
   void *device = nullptr;
   void *gin_window = nullptr;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   void *forward_timeline = nullptr;
 #endif
   TransportDeviceStatus *host_status = nullptr;
@@ -1171,7 +1171,7 @@ const T *at(const void *base, std::size_t offset) {
       static_cast<const unsigned char *>(base) + offset);
 }
 
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
 profiling::DeviceTimelineContext make_timeline_context(
     void *allocation, const TimelineAllocationLayout &layout,
     std::uint32_t max_ctas, std::uint32_t rank,
@@ -1217,7 +1217,7 @@ struct ActivationPoolState {
   ActivationTransportPoolConfig config;
   Layout layout;
   GinWindowLayout gin_layout;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   TimelineAllocationLayout timeline_layout;
   std::uint32_t timeline_max_ctas = 0;
 #endif
@@ -1327,7 +1327,7 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       if (slot.device)
         (void)cudaFree(slot.device);
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       if (slot.forward_timeline)
         internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       if (slot.forward_timeline)

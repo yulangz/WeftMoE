@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent FP64 oracle for the main H=7168/I=3072 Forward fixture.
 
-This module does not import MegaMOE, Megatron, TransformerEngine, or PyTorch.
+This module does not import WeftMoE, Megatron, TransformerEngine, or PyTorch.
 It rebuilds the documented BF16 input/weight/gate fixture with NumPy, performs
 FP64 dot products, applies the documented BF16 phase casts, and checks selected
 output columns.  When supplied, it also checks the complete cached FC1 A/B

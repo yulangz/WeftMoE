@@ -239,7 +239,7 @@ __device__ __forceinline__ bool progress_inbound_once(
     auto *peer_words = peer_at<unsigned long long>(
         a.peer_bases[destination], a.scheduler_offset);
     const auto scheduler_layout =
-        megamoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
+        weftmoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
             a.scheduler_mblock_capacity,
             static_cast<std::uint32_t>(a.hidden /
                                        backward_tuning::kDxTileN),
@@ -478,7 +478,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
 
   auto *words = backward_pipeline_detail::scheduler_words(a);
   const auto scheduler_layout =
-      megamoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
+      weftmoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
           a.scheduler_mblock_capacity,
           static_cast<std::uint32_t>(a.hidden / backward_tuning::kDxTileN),
           a.scheduler_expert_capacity);
@@ -510,7 +510,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
     if (threadIdx.x == 0U) {
       state.selected = 0U;
       const auto expected =
-          megamoe::cuda::persistent_v3::backward::backward_dx_ready_value(
+          weftmoe::cuda::persistent_v3::backward::backward_dx_ready_value(
               static_cast<std::uint32_t>(
                   a.hidden / backward_tuning::kDxTileN));
       for (std::uint32_t probe = 0U; probe < a.mblocks; ++probe) {

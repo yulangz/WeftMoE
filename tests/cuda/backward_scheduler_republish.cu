@@ -4,7 +4,7 @@
 
 #include "cuda/persistent_v3/backward/scheduler.cuh"
 
-namespace bwd = megamoe::cuda::persistent_v3::backward;
+namespace bwd = weftmoe::cuda::persistent_v3::backward;
 
 struct Case {
   unsigned old_prefix, new_prefix, owner;

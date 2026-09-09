@@ -69,10 +69,10 @@ struct ForwardKernelArgs {
   std::size_t production_error_records_offset;
   const unsigned long long *cancel_epoch;
   int injected_status_error_rank = -1;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   profiling::DeviceTimelineContext timeline;
 #endif
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
   unsigned long long *progress;
   std::uint32_t progress_contexts;
 #endif

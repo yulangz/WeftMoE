@@ -41,7 +41,7 @@ class RelayTuningTest(unittest.TestCase):
         if compiler is None:
             self.skipTest("C++ compiler unavailable")
         source = r'''#include "cuda/persistent_v3/forward/pipeline_state.cuh"
-using namespace megamoe::cuda;
+using namespace weftmoe::cuda;
 constexpr bool cursors_fit() {
   constexpr auto capacity = sizeof(persistent_v3::ForwardPipelineControl::local_return_head)
       / sizeof(persistent_v3::PaddedCounter);
@@ -58,7 +58,7 @@ static_assert(cursors_fit(), "Return cursor capacity must follow Relay count");
                 result = subprocess.run(
                     [compiler, "-std=c++17", "-x", "c++", "-c", "-",
                      "-I", str(ROOT / "src"), "-I", str(ROOT / "include"),
-                     f"-DMEGAMOE_FWD_RELAY_CTAS={relay}",
+                     f"-DWEFTMOE_FWD_RELAY_CTAS={relay}",
                      "-o", str(Path(tmp) / "layout.o")],
                     input=source, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)

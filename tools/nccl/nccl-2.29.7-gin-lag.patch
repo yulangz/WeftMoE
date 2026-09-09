@@ -6,7 +6,7 @@ Included in upstream NCCL 2.30.7.
 
 Connect all contexts for each remote peer consecutively before self-loop QPs,
 so round-robin RoCE LAG queue affinity can distribute payload traffic.
-Additional MegaMOE fix: rotate the remote connection context order by sender
+Additional WeftMoE fix: rotate the remote connection context order by sender
 rank. This decorrelates LAG affinity across senders for fixed-context return
 traffic, without changing logical QP indices or peer exchange contents.
 

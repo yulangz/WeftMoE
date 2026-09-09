@@ -5,7 +5,7 @@ The forward graph is built before each timed region. Megatron's selective
 ``moe_act`` checkpoint keeps the routed FC1 input and BF16 FC1 output, releases
 the gated SwiGLU output consumed by FC2, and recomputes that output in
 Backward. The timed region therefore starts with the same X/A/B checkpoint
-contract used by MegaMOE and includes both reverse collectives, dX, dGate,
+contract used by WeftMoE and includes both reverse collectives, dX, dGate,
 dW1, and dW2.
 """
 
@@ -21,7 +21,7 @@ from megatron_dispatch_baseline import (
     add_dispatcher_arguments,
     create_dispatcher,
     fixed_random_selected_gates,
-    initialize_megamoe_forward_weights,
+    initialize_weftmoe_forward_weights,
     loaded_nccl_libraries,
     nccl_runtime_version,
     stats,
@@ -220,7 +220,7 @@ def main():
     experts_module = experts_builder(
         local_experts, config, pg_collection=get_default_pg_collection()
     )
-    initialize_megamoe_forward_weights(
+    initialize_weftmoe_forward_weights(
         experts_module,
         rank * local_experts,
         args.hidden,

@@ -19,18 +19,18 @@
 #include "cuda/cuda_internal.hpp"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 
-#if !MEGAMOE_BUILD_TESTING
+#if !WEFTMOE_BUILD_TESTING
 // The release object graph keeps only the counters needed by the production
 // coordinator. Repository fault-control entry points are section-collected;
 // using a distinct namespace also makes accidental retention auditable.
 namespace release_instrumentation {
-using NcclFaultPoint = ::megamoe::cuda::testing::NcclFaultPoint;
+using NcclFaultPoint = ::weftmoe::cuda::testing::NcclFaultPoint;
 using NcclLifecycleSnapshot =
-    ::megamoe::cuda::testing::NcclLifecycleSnapshot;
+    ::weftmoe::cuda::testing::NcclLifecycleSnapshot;
 } // namespace release_instrumentation
 #define testing release_instrumentation
 #endif
@@ -94,7 +94,7 @@ namespace {
   throw NotifyDispatchError(NotifyErrorCode::NcclFailure, message);
 }
 
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
 void maybe_fault(testing::NcclFaultPoint point, const char *stage,
                  const RankCollectiveContext &context) {
   auto expected = static_cast<int>(point);
@@ -307,7 +307,7 @@ NcclSession::~NcclSession() = default;
 namespace {
 std::vector<std::byte> make_nccl_stable_identity(
     const std::vector<std::uint8_t> &bootstrap, const std::string &identity) {
-  constexpr char kDomain[] = "MegaMOE/NCCL/session/v1";
+  constexpr char kDomain[] = "WeftMoE/NCCL/session/v1";
   std::vector<std::byte> result;
   const auto total = sizeof(kDomain) - 1U + 16U + bootstrap.size() +
                      identity.size();
@@ -1875,10 +1875,10 @@ NcclAllGatherCountExchange::start(const CountExchangeRequest &request) {
   return std::make_unique<NcclAllGatherOperation>(impl_, slot, request);
 }
 
-#define MEGAMOE_STRINGIFY_DETAIL(x) #x
-#define MEGAMOE_STRINGIFY(x) MEGAMOE_STRINGIFY_DETAIL(x)
+#define WEFTMOE_STRINGIFY_DETAIL(x) #x
+#define WEFTMOE_STRINGIFY(x) WEFTMOE_STRINGIFY_DETAIL(x)
 const char *compiled_nccl_version() noexcept {
-  return MEGAMOE_STRINGIFY(NCCL_MAJOR) "." MEGAMOE_STRINGIFY(NCCL_MINOR) "." MEGAMOE_STRINGIFY(NCCL_PATCH);
+  return WEFTMOE_STRINGIFY(NCCL_MAJOR) "." WEFTMOE_STRINGIFY(NCCL_MINOR) "." WEFTMOE_STRINGIFY(NCCL_PATCH);
 }
 
 NcclRuntimeInfo nccl_runtime_info() {
@@ -2312,7 +2312,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   ConfigWire config_wire;
   LocalPreflightStatus config_status;
   auto protocol_identity = impl_->context.session().stable_identity_bytes();
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
   std::unique_ptr<testing::IdentityOverride> identity_override;
   if (testing::g_identity_override) {
     identity_override = std::move(testing::g_identity_override);
@@ -2375,10 +2375,10 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   }
 
   bool use_fast_notify = false;
-#if !MEGAMOE_DEBUG_VALIDATE
+#if !WEFTMOE_DEBUG_VALIDATE
   use_fast_notify = request.config.topology.num_nodes == 1 && impl_->pool &&
                     impl_->backend->fast_path_ready()
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
                     && !identity_override &&
                     testing::g_config_corruption_offset == SIZE_MAX &&
                     testing::g_next_fault.load(std::memory_order_acquire) == 0
@@ -2458,7 +2458,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                     : request.local_routes.selected_experts.size(),
       request.max_tokens_per_rank, config_wire.size(),
       config_wire_digest(config_wire), status);
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
   if (identity_override) {
     header.session_id_word0 = identity_override->summary.word0;
     header.session_id_word1 = identity_override->summary.word1;
@@ -2472,7 +2472,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     auto control = impl_->backend->start_control(impl_->context, header);
     auto control_done = control.wait();
 
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
     if (testing::g_config_corruption_offset != SIZE_MAX) {
       const auto offset = testing::g_config_corruption_offset;
       testing::g_config_corruption_offset = SIZE_MAX;
@@ -2789,4 +2789,4 @@ GenerationSetupTimings CudaNotifyGenerationCoordinator::setup_timings() const {
   return impl_->setup;
 }
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

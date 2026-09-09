@@ -1,6 +1,6 @@
 # Third-party notices
 
-MegaMOE's own source is licensed under Apache-2.0. The following permissively
+WeftMoE's own source is licensed under Apache-2.0. The following permissively
 licensed projects are build dependencies or documented design references.
 Their upstream copyright and license terms remain applicable.
 

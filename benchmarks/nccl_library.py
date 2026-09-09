@@ -19,5 +19,5 @@ def configure_nccl_library(environment, raw_directories):
         raise FileNotFoundError(
             "libnccl.so.2 was not found in --nccl-lib-dir entries: " +
             ", ".join(directories))
-    environment["MEGAMOE_NCCL_LIBRARY"] = library
+    environment["WEFTMOE_NCCL_LIBRARY"] = library
     return library

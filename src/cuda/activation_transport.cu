@@ -44,13 +44,13 @@
 #include "cuda/persistent_v3/roles/common.cuh"
 #include "cuda/profiling/device_timeline.cuh"
 #include "cuda/transport_generation_completion.cuh"
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-#ifndef MEGAMOE_FORWARD_LIGHT_PROGRESS
-#define MEGAMOE_FORWARD_LIGHT_PROGRESS 0
+#ifndef WEFTMOE_FORWARD_LIGHT_PROGRESS
+#define WEFTMOE_FORWARD_LIGHT_PROGRESS 0
 #endif
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 struct ActivationMegaKernelBackendState;
 namespace {
 
@@ -480,7 +480,7 @@ struct LocalCudaP2pForwardMegaKernel::Impl {
   std::shared_ptr<NcclSocketFallbackActivationTransport> socket_transport;
 };
 
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
 namespace {
 profiling::DeviceTimelineSnapshot download_device_timeline(
     const std::shared_ptr<ActivationPoolState> &pool,
@@ -1532,7 +1532,7 @@ ActivationTransportResourcePool make_activation_transport_pool(
                                       CUBLAS_ATOMICS_NOT_ALLOWED),
                  0, "cublasSetAtomicsMode(Backward deterministic)");
   }
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   cudaDeviceProp timeline_device_properties{};
   internal::throw_cuda(
       "transport-pool-create",
@@ -1584,7 +1584,7 @@ ActivationTransportResourcePool make_activation_transport_pool(
             ExchangeKind::ExpertCounts, "ncclMemAlloc(GIN window slot)");
       }
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       internal::throw_cuda(
           "transport-pool-create",
           cudaMalloc(&slot.forward_timeline, state->timeline_layout.total),
@@ -1937,7 +1937,7 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
                       "pool compute plus GIN bytes"),
           sizeof(std::uint64_t), "pool slot device bytes"),
       state->slots.size(), "pool device bytes");
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   result.device_bytes = checked_add(
       result.device_bytes,
       checked_mul(state->timeline_layout.total, state->slots.size(),
@@ -2809,7 +2809,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaEventRecord(P2P start)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   zero_async(layout.ring_headers, node_ring_slots,
              sizeof(transport::TransportSlotHeader), "P2P proxy headers");
   zero_async(layout.ring_payload,
@@ -2852,7 +2852,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   // signal here would race a faster rank's release store.
 #endif
   zero_async(layout.status, 1, sizeof(TransportDeviceStatus), "P2P status");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   initialize_transport_credits_kernel<<<
       static_cast<unsigned int>((node_links + 255U) / 256U), 256, 0,
       exec->stream>>>(at<unsigned int>(slot.device, layout.link_credits),
@@ -2940,7 +2940,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   args.world = id.world_size;
   args.channels = config.channels;
   args.ring_slots = config.ring_slots_per_source_channel;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   args.epoch = activation.slot->epoch;
 #else
   // Every rank invokes the trusted team in the same generation order. A
@@ -2983,7 +2983,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
       id.world_size, backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "cudaEventRecord(P2P generation setup complete)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   local_p2p_persistent_kernel<<<sms, 128, 0, exec->stream>>>(args);
   ++kernel_launches;
 #else
@@ -3076,7 +3076,7 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   // release path every source waits for a generation-valued return signal
   // from every destination before producing output. The next Notify control
   // collective is the natural inter-generation barrier.
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   internal::throw_nccl(
       "local-p2p-drain",
       ncclAllGather(at<void>(slot.device, layout.p2p_barrier_send),
@@ -3997,9 +3997,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[activation.slot->index];
   const auto &layout = state->layout;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   const auto debug_forward_host_phase = [&](const char *phase) {
-    if (std::getenv("MEGAMOE_FORWARD_PROGRESS") != nullptr)
+    if (std::getenv("WEFTMOE_FORWARD_PROGRESS") != nullptr)
       std::cerr << "FORWARD_RUN_HOST rank=" << id.calling_rank
                 << " generation=" << id.generation << " phase=" << phase
                 << std::endl;
@@ -4040,7 +4040,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.generation, ExchangeKind::ExpertCounts,
       "cudaStreamWaitEvent(weights ready)");
   ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("stream_dependencies_enqueued");
 #endif
 
@@ -4125,7 +4125,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "clear forward status");
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   reset_timeline("forward-run", slot.forward_timeline,
                  state->timeline_layout, state->timeline_max_ctas,
                  exec->stream, id.calling_rank, id.world_size,
@@ -4175,7 +4175,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
         id.calling_rank, id.world_size, backend->session.session().identity(),
         id.generation, ExchangeKind::ExpertCounts,
         "ncclAllReduce(Forward GIN reset agreement)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("gin_reset_enqueued");
 #endif
 #endif
@@ -4207,7 +4207,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "initialize owner completion signals and wait peer setup epoch");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("generation_init_enqueued");
 #endif
   ForwardKernelArgs args{};
@@ -4231,17 +4231,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   args.timeline = make_timeline_context(
       slot.forward_timeline, state->timeline_layout,
       state->timeline_max_ctas, id.calling_rank,
       profiling::TimelinePhase::Forward, id.generation);
 #endif
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
   if (const auto *fault_rank =
-          std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK")) {
+          std::getenv("WEFTMOE_INTERNAL_FORWARD_STATUS_FAULT_RANK")) {
     const auto *fault_generation =
-        std::getenv("MEGAMOE_INTERNAL_FORWARD_STATUS_FAULT_GENERATION");
+        std::getenv("WEFTMOE_INTERNAL_FORWARD_STATUS_FAULT_GENERATION");
     if (fault_generation == nullptr ||
         std::stoull(fault_generation) == id.generation)
       args.injected_status_error_rank = std::stoi(fault_rank);
@@ -4342,9 +4342,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
   args.production_error_records_offset = layout.production_error_records;
   args.cancel_epoch =
       reinterpret_cast<const unsigned long long *>(slot.device_cancel_epoch);
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
   constexpr std::size_t forward_progress_base = 0;
-  if (std::getenv("MEGAMOE_FORWARD_PROGRESS_DUMP") != nullptr) {
+  if (std::getenv("WEFTMOE_FORWARD_PROGRESS_DUMP") != nullptr) {
     std::fill_n(slot.host_forward_progress + forward_progress_base,
                 kForwardProgressWords + 2ULL * slot.generation_debug_words,
                 0ULL);
@@ -4405,7 +4405,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                         0U;
       if (!valid_relay_count)
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-                        "MEGAMOE_FORWARD_RELAY_CTAS", id.calling_rank,
+                        "WEFTMOE_FORWARD_RELAY_CTAS", id.calling_rank,
                         split_local_roles
                             ? "multiple of 4, at least max(4, local_world_size)"
                             : "positive multiple of the RDMA context count",
@@ -4435,7 +4435,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_relay_tma_warps != 8U &&
           args.forward_relay_tma_warps != persistent_v3::kWarpsPerCta)
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-                        "MEGAMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
+                        "WEFTMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
                         "one of 0, 4, 8, or 12",
                         std::to_string(args.forward_relay_tma_warps));
       args.forward_local_return_batch_mblocks =
@@ -4446,7 +4446,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_local_return_batch_mblocks != 8U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS", id.calling_rank,
+            "WEFTMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS", id.calling_rank,
             "one of 1, 2, 4, or 8",
             std::to_string(args.forward_local_return_batch_mblocks));
       args.forward_dispatch_publish_batch_rows =
@@ -4459,7 +4459,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_dispatch_publish_batch_rows != 128U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS", id.calling_rank,
+            "WEFTMOE_FORWARD_DISPATCH_PUBLISH_BATCH_ROWS", id.calling_rank,
             "one of 4, 8, 16, 32, 64, or 128",
             std::to_string(args.forward_dispatch_publish_batch_rows));
       // A two-block base cadence keeps FC2/Return readiness fine-grained. The
@@ -4472,7 +4472,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_fc1_locality_group != 4U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
+            "WEFTMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
             "one of 1, 2, or 4",
             std::to_string(args.forward_fc1_locality_group));
       const std::uint32_t locality_group4_begin =
@@ -4487,7 +4487,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           (locality_group4_span & 3U) != 0U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN/END",
+            "WEFTMOE_FORWARD_FC1_LOCALITY_GROUP4_BEGIN/END",
             id.calling_rank,
             "begin>=2 and even; end<=255; end>=begin; span divisible by 4",
             std::to_string(locality_group4_begin) + ":" +
@@ -4505,7 +4505,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           args.forward_return_max_inflight != 64U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_RETURN_MAX_INFLIGHT", id.calling_rank,
+            "WEFTMOE_FORWARD_RETURN_MAX_INFLIGHT", id.calling_rank,
             "one of 0, 4, 8, 16, 32, or 64",
             std::to_string(args.forward_return_max_inflight));
       // FC2 writes its result exactly once into the registered Return plane.
@@ -4553,7 +4553,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           forward_m64)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
+            "WEFTMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
             "M128 without an M64 experiment",
             std::to_string(args.forward_fc1_locality_group));
       if (forward_fc2_tma_store &&
@@ -4561,16 +4561,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
            forward_fc2_stages != 4U))
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
+            "WEFTMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
             "the production M128 4x4-stage scheduler",
             "an incompatible M tile or TMA stage configuration");
       if (forward_fc2_tma_store && args.use_gin &&
           !args.forward_registered_output)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "MEGAMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
+            "WEFTMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
             "registered output enabled for GIN Return",
-            "MEGAMOE_FORWARD_REGISTERED_OUTPUT=0");
+            "WEFTMOE_FORWARD_REGISTERED_OUTPUT=0");
       if (forward_m64)
         args.forward_mblock_rows = 64U;
       const auto forward_main_compute_ctas = args.forward_compute_cta_count;
@@ -4624,8 +4624,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 static_cast<int>(forward_compute_smem));
           };
       cudaError_t compute_attribute = cudaSuccess;
-#if MEGAMOE_FWD_FC2_TMA_STORE
-#if MEGAMOE_FWD_CLUSTER_SIZE == 2
+#if WEFTMOE_FWD_FC2_TMA_STORE
+#if WEFTMOE_FWD_CLUSTER_SIZE == 2
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         compute_attribute = set_tma_compute_attribute(
             local_p2p_forward_tma_store_kernel<
@@ -4664,7 +4664,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<
-                true, MEGAMOE_FWD_TILE_M == 64,
+                true, WEFTMOE_FWD_TILE_M == 64,
                 ForwardTaskPartition::All, true, false, false,
                 forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -4672,7 +4672,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       else
         compute_attribute = cudaFuncSetAttribute(
             local_p2p_forward_compute_kernel<
-                false, MEGAMOE_FWD_TILE_M == 64,
+                false, WEFTMOE_FWD_TILE_M == 64,
                 ForwardTaskPartition::All, true, false, false,
                 forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -4733,7 +4733,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                            ExchangeKind::ExpertCounts,
                            "cudaEventRecord(split Forward transport done)");
       auto compute_args = args;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
       compute_args.timeline.cta_base = kTransportBlocks;
 #endif
       cudaLaunchConfig_t compute_launch{};
@@ -4761,12 +4761,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 slot.forward_s_map, weight.w1_map, weight.w2_map,
                 output_store_map);
           };
-#if MEGAMOE_FWD_FC2_TMA_STORE
+#if WEFTMOE_FWD_FC2_TMA_STORE
       const auto &output_store_map =
           args.use_gin && args.forward_registered_output
               ? slot.forward_staging_store_map
               : ordinary_output_store_map;
-#if MEGAMOE_FWD_CLUSTER_SIZE == 2
+#if WEFTMOE_FWD_CLUSTER_SIZE == 2
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         launch_forward = launch_tma_compute(
             local_p2p_forward_tma_store_kernel<
@@ -4805,7 +4805,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
                 forward_tuning::kFc2Stages>,
             output_store_map);
 #endif
-#elif MEGAMOE_FWD_TILE_M == 64
+#elif WEFTMOE_FWD_TILE_M == 64
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         launch_forward = cudaLaunchKernelEx(
             &compute_launch,
@@ -4912,7 +4912,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           slot.forward_x_map, slot.forward_s_map, weight.w1_map,
           weight.w2_map);
     }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("kernel_launch_returned");
 #endif
     internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
@@ -5071,7 +5071,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       ExchangeKind::ExpertCounts, "cudaEventRecord(forward complete)");
   slot.completion_recorded = true;
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("consumer_submit_enter");
 #endif
   std::atomic<bool> forward_stream_done{false};
@@ -5083,13 +5083,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaLaunchHostFunc(Forward completion notification)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("consumer_submit_done");
 #endif
 
   const auto wait_start = std::chrono::steady_clock::now();
   bool cancelled = false;
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
   unsigned int progress_dump_count = 0U;
 #endif
   while (true) {
@@ -5098,7 +5098,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     const auto expired =
         options.deadline_after.count() > 0 &&
         std::chrono::steady_clock::now() - wait_start >= options.deadline_after;
-#if MEGAMOE_DEBUG_VALIDATE || MEGAMOE_FORWARD_LIGHT_PROGRESS
+#if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
     const auto stalled_for = std::chrono::steady_clock::now() - wait_start;
     const auto progress_dump_after = progress_dump_count == 0U
                                          ? std::chrono::seconds(3)
@@ -5195,18 +5195,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
     // completion notification; this sleep only bounds host polling overhead.
     std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("stream_completion_observed");
 #endif
   internal::throw_cuda(
       "forward-run", cudaEventQuery(slot.forward_complete), id.calling_rank,
       id.world_size, backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaEventQuery(completed Forward event)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("event_verified");
 #endif
   consumer.finish();
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("consumer_finished");
   debug_forward_host_phase("terminal_agreement_enter");
 #endif
@@ -5214,7 +5214,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
       backend, slot, ProductionStatusPhase::Forward, id.generation,
       id.generation, id.calling_rank, id.world_size, *slot.host_forward_status,
       slot.forward_complete);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("terminal_agreement_done");
 #endif
   if (cancelled || slot.host_forward_status->error == 2U)
@@ -5884,7 +5884,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   // prevents a first BWD launch from accepting an old FWD wave marker with the
   // same numeric slot epoch.
   args.epoch = backward_epoch | (1ULL << 63U);
-  if (std::getenv("MEGAMOE_BACKWARD_PROGRESS") != nullptr) {
+  if (std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr) {
     std::cerr << "BACKWARD_ADDR rank=" << identity.rank
               << " epoch=" << backward_epoch
               << " status=" << at<void>(slot.device, layout.status)
@@ -6145,7 +6145,7 @@ DeviceBackwardHandle BackwardMegaKernel::run(
   slot.completion_recorded = true;
   ActivationTransportBridge::submit(consumer);
   const bool diagnostic_progress =
-      std::getenv("MEGAMOE_BACKWARD_PROGRESS") != nullptr;
+      std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr;
   const auto diagnostic_status = [&](const TransportDeviceStatus &s,
                                      bool pending) {
     std::cerr << "BACKWARD_STATUS rank=" << identity.rank
@@ -6728,7 +6728,7 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
           ? destination_node
           : destination_node * lsa.nRanks + destination_local;
   const bool fanout_full = mode == GinConnectionMode::Full &&
-                           std::getenv("MEGAMOE_GIN_BENCH_FANOUT") != nullptr;
+                           std::getenv("WEFTMOE_GIN_BENCH_FANOUT") != nullptr;
 
   const auto align_4k = [](std::uint64_t value, const char *field) {
     return checked_add(value, 4095ULL, field) / 4096ULL * 4096ULL;
@@ -7503,4 +7503,4 @@ cleanup:
 
 bool backward_pipeline_available() noexcept { return true; }
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

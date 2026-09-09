@@ -1,8 +1,8 @@
 #pragma once
 
-#include "megamoe/transport/activation_protocol.hpp"
+#include "weftmoe/transport/activation_protocol.hpp"
 
-namespace megamoe::transport {
+namespace weftmoe::transport {
 inline constexpr std::uint32_t kActivationTransportSchemaVersion = 2;
 enum class ActivationExpertTransform : std::uint8_t { SyntheticValidation, Identity };
 enum class ActivationGatePlacement : std::uint8_t {
@@ -61,4 +61,4 @@ SyntheticTransportResult simulate_activation_transport(
     const DispatchHandle &, const std::vector<BFloat16> &,
     const std::vector<float> &, const ActivationTransportConfig &,
     std::uint64_t, const std::vector<std::uint64_t> & = {});
-} // namespace megamoe::transport
+} // namespace weftmoe::transport

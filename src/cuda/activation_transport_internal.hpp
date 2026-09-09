@@ -4,11 +4,11 @@
 #include "cuda/profiling/device_timeline_types.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #define private public
-#include "megamoe/cuda/activation_transport.hpp"
+#include "weftmoe/cuda/activation_transport.hpp"
 #undef private
-#include "megamoe/cuda/backward.hpp"
+#include "weftmoe/cuda/backward.hpp"
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 
 namespace internal {
 struct ExternalCudaProducerState;
@@ -217,7 +217,7 @@ download_activation_output_for_validation(
     const DeviceActivationTransportHandle &, const CudaExecution &);
 
 namespace testing {
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
 profiling::DeviceTimelineSnapshot
 download_forward_device_timeline(const DeviceForwardHandle &);
 #endif
@@ -278,4 +278,4 @@ double measure_local_p2p_put_bandwidth_gbps(
     std::uint32_t);
 } // namespace testing
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

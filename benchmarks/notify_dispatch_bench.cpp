@@ -5,7 +5,7 @@
 #include <iostream>
 #include <vector>
 
-#include "megamoe/transport/count_exchange.hpp"
+#include "weftmoe/transport/count_exchange.hpp"
 
 int main() {
     constexpr std::uint32_t world_size = 8;
@@ -13,7 +13,7 @@ int main() {
     constexpr std::uint32_t top_k = 6;
     constexpr std::uint64_t tokens_per_rank = 8192;
 
-    megamoe::RuntimeConfig config;
+    weftmoe::RuntimeConfig config;
     config.num_experts = num_experts;
     config.top_k = top_k;
     config.m_tile_rows = 64;
@@ -27,7 +27,7 @@ int main() {
         config.topology.expert_to_rank.push_back(expert % world_size);
     }
 
-    std::vector<megamoe::RankRoutingInput> inputs(world_size);
+    std::vector<weftmoe::RankRoutingInput> inputs(world_size);
     for (std::uint32_t rank = 0; rank < world_size; ++rank) {
         inputs[rank].num_tokens = tokens_per_rank;
         inputs[rank].selected_experts.reserve(tokens_per_rank * top_k);
@@ -41,7 +41,7 @@ int main() {
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const auto handles = megamoe::build_notify_dispatch_for_testing(
+    const auto handles = weftmoe::build_notify_dispatch_for_testing(
         config, inputs, "host-benchmark", 1);
     const auto elapsed = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start);

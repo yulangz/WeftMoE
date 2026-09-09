@@ -235,14 +235,14 @@ def self_test() -> tuple[list[str], list[str], list[str]]:
     failures: list[str] = []
     fixtures = (
         (
-            "packaging-private-ip",
-            pathlib.Path("packaging/megamoe.pc.in"),
+            "config-private-ip",
+            pathlib.Path("configs/example.json"),
             "endpoint=" + "192" + ".168.23.41\n",
             "private IPv4",
         ),
         (
-            "reference-absolute-path",
-            pathlib.Path("reference/notify_dispatch_reference.py"),
+            "tool-absolute-path",
+            pathlib.Path("tools/example.py"),
             "path=/" + "storage" + "/machine/input\n",
             "machine storage path",
         ),
@@ -286,7 +286,7 @@ def self_test() -> tuple[list[str], list[str], list[str]]:
     passed: list[str] = []
     for label, relative, content, expected in fixtures:
         with tempfile.TemporaryDirectory(
-                prefix="megamoe-hygiene-") as directory:
+                prefix="weftmoe-hygiene-") as directory:
             root = pathlib.Path(directory)
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,7 +318,7 @@ def self_test() -> tuple[list[str], list[str], list[str]]:
     excluded_passed: list[str] = []
     for label, relative, extra_arguments in exclude_fixtures:
         with tempfile.TemporaryDirectory(
-                prefix="megamoe-hygiene-") as directory:
+                prefix="weftmoe-hygiene-") as directory:
             root = pathlib.Path(directory)
             path = root / relative / "must-not-scan.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,7 +357,7 @@ def main() -> int:
     explicit_excludes, failures = checked_explicit_excludes(
         root, args.exclude_dir)
     files, excluded, mode = release_files(root, explicit_excludes)
-    headers = args.headers or sorted((root / "include" / "megamoe").rglob("*.hpp"))
+    headers = args.headers or sorted((root / "include" / "weftmoe").rglob("*.hpp"))
     text_failures, text_count, binary = scan_release_text(files)
     failures += text_failures
     excluded.extend(

@@ -9,19 +9,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
-    "megamoe/version.hpp",
-    "megamoe/api/errors.hpp",
-    "megamoe/api/notify_dispatch.hpp",
-    "megamoe/config/runtime_config.hpp",
-    "megamoe/cuda/activation_transport.hpp",
-    "megamoe/cuda/backward.hpp",
-    "megamoe/cuda/control_protocol.hpp",
-    "megamoe/cuda/device_notify.hpp",
-    "megamoe/cuda/nccl_count_exchange.hpp",
-    "megamoe/metadata/dispatch_handle.hpp",
-    "megamoe/scoreboard/workspace_plan.hpp",
-    "megamoe/transport/activation_protocol.hpp",
-    "megamoe/transport/count_exchange.hpp",
+    "weftmoe/version.hpp",
+    "weftmoe/api/errors.hpp",
+    "weftmoe/api/notify_dispatch.hpp",
+    "weftmoe/config/runtime_config.hpp",
+    "weftmoe/cuda/activation_transport.hpp",
+    "weftmoe/cuda/backward.hpp",
+    "weftmoe/cuda/control_protocol.hpp",
+    "weftmoe/cuda/device_notify.hpp",
+    "weftmoe/cuda/nccl_count_exchange.hpp",
+    "weftmoe/metadata/dispatch_handle.hpp",
+    "weftmoe/scoreboard/workspace_plan.hpp",
+    "weftmoe/transport/activation_protocol.hpp",
+    "weftmoe/transport/count_exchange.hpp",
 }
 
 
@@ -35,7 +35,7 @@ def absolute_library_path(value):
     return os.pathsep.join(entries)
 
 
-with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
+with tempfile.TemporaryDirectory(prefix="weftmoe-install-") as temporary:
     root = Path(temporary)
     subprocess.run(
         ["make", "install", f"DESTDIR={root}", "PREFIX=/usr/local"],
@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
     # The installed .pc file is link metadata for package-aware clients.  The
     # acceptance test deliberately has no pkg-config runtime dependency.
     flags = ["-I", str(prefix / "include"), "-L", str(prefix / "lib"),
-             "-lmegamoe"]
+             "-lweftmoe"]
     command = [
         os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc"),
         "-Wno-deprecated-gpu-targets",
@@ -79,11 +79,11 @@ with tempfile.TemporaryDirectory(prefix="megamoe-install-") as temporary:
              absolute_library_path(os.environ.get("LD_LIBRARY_PATH", ""))},
     )
 
-    library = prefix / "lib/libmegamoe.so.2.0.0"
+    library = prefix / "lib/libweftmoe.so.2.0.0"
     dynamic = subprocess.check_output(["readelf", "-d", str(library)], text=True)
-    if "SONAME" not in dynamic or "libmegamoe.so.2" not in dynamic:
+    if "SONAME" not in dynamic or "libweftmoe.so.2" not in dynamic:
         raise SystemExit("installed library has the wrong SONAME")
     if "RPATH" in dynamic or "RUNPATH" in dynamic:
         raise SystemExit("installed library unexpectedly contains an rpath")
 
-print("[PASS] installed v2 headers, libmegamoe SONAME, link and run")
+print("[PASS] installed v2 headers, libweftmoe SONAME, link and run")

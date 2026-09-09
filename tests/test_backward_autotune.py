@@ -71,7 +71,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         with mock.patch.object(tune, "_run", return_value={"returncode": 1, "output": ""}) as run:
             tune.benchmark_candidate(tune.expand_candidates(plan)[0], Path("/tmp/binary"),
                                      plan["benchmark"], Path("/tmp"), {}, rounds=30)
-        self.assertEqual(run.call_args.args[1]["MEGAMOE_BENCH_EXPERTS"], "512")
+        self.assertEqual(run.call_args.args[1]["WEFTMOE_BENCH_EXPERTS"], "512")
 
     def test_grid_rejects_model_fields_duplicates_and_missing_parameters(self):
         source = json.loads((ROOT / "configs/backward_h200_single_node_autotune.json").read_text())
@@ -93,7 +93,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         header = (ROOT / "src" / "cuda" / "backward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         cpp_macros = set(re.findall(
-            r"^#ifndef (MEGAMOE_BWD_[A-Z0-9_]+)$", header,
+            r"^#ifndef (WEFTMOE_BWD_[A-Z0-9_]+)$", header,
             flags=re.MULTILINE))
         self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
 
@@ -101,7 +101,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         header = (ROOT / "src" / "cuda" / "backward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         defaults = dict(re.findall(
-            r"^#define (MEGAMOE_BWD_[A-Z0-9_]+) ([0-9]+)$", header,
+            r"^#define (WEFTMOE_BWD_[A-Z0-9_]+) ([0-9]+)$", header,
             flags=re.MULTILINE))
         # Search order may change without changing the untuned C++ fallback.
         config = {key: int(defaults[macro])
@@ -149,7 +149,7 @@ class BackwardAutotuneTest(unittest.TestCase):
             self.assertIn(tune.candidate_digest(candidate["config"]),
                           paths["build_dir"].name)
             self.assertEqual(paths["header"].name,
-                             "megamoe_backward_tuning_generated.hpp")
+                             "weftmoe_backward_tuning_generated.hpp")
 
     def test_shared_memory_model_matches_default(self):
         self.assertEqual(

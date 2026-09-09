@@ -113,7 +113,7 @@ __device__ __forceinline__ bool context_wave_span(
   return true;
 }
 
-#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#if defined(WEFTMOE_FORWARD_TRANSPORT_TU)
 
 // Transport-only Hopper path. Each warp leader stages one 14-KiB row through
 // the SMEM slot and mbarrier already reserved for local Return. Dispatch and
@@ -196,7 +196,7 @@ __device__ __forceinline__ void publish_local_batch(
                           a.local_world_size +
                       rail]);
     ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     atomicAdd(&completion->local_rows_published, 1ULL);
     const auto tile = a.dispatch_waves.route_dst_mtile[route];
     if (tile < 64U)
@@ -304,7 +304,7 @@ __device__ __forceinline__ void publish_local_batch(
     // different Relay CTAs.  Chain their stores through the counter's
     // modification order so the final acquire sees every contributing row.
     ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     atomicAdd(&completion->local_rows_published, 1ULL);
     const auto tile = a.dispatch_waves.route_dst_mtile[route];
     if (tile < 64U)
@@ -328,7 +328,7 @@ __device__ __forceinline__ void publish_local_batch(
   }
 }
 
-#endif // MEGAMOE_FORWARD_TRANSPORT_TU
+#endif // WEFTMOE_FORWARD_TRANSPORT_TU
 
 // RDMA-resident variant of pack_outbound_wave.  Threads [64, 384) form an
 // independent ten-warp bulk group; the GIN owner in warp 0 can issue wave N
@@ -362,7 +362,7 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
   const auto wave_packets = wave_end - wave_begin;
   const auto vector_count = a.hidden / 8ULL;
 
-  MEGAMOE_TIMELINE_RECORD_IF(a.timeline, pack_thread == 0U,
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, pack_thread == 0U,
                              DispatchPackStart, GinDispatch, context,
                              wave_packets, a.epoch);
 
@@ -433,7 +433,7 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
   // packer's conservative fence while the new subgroup protocol is proven.
   __threadfence_system();
   rdma_pack_group_sync();
-  MEGAMOE_TIMELINE_RECORD_IF(
+  WEFTMOE_TIMELINE_RECORD_IF(
       a.timeline, pack_thread == 0U, DispatchPackEnd, GinDispatch, context,
       wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
   if (pack_thread == 0U) {
@@ -647,7 +647,7 @@ __device__ __forceinline__ void relay_inbound_wave(
       published.store(encode_return_row_mapping(
                           a.rank, chunk, partition_fanout_base + compact_row),
                       ::cuda::memory_order_release);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       const auto record_index =
           source_partition * a.gin_context_count + task.context;
       atomicAdd(&context_completion[record_index].relay_fanout_rows, 1ULL);
@@ -741,7 +741,7 @@ __device__ __forceinline__ void relay_role(
   bool dispatch_terminal_published = false;
   bool completion_timeline_started = false;
   bool completion_terminal_published = false;
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, context,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, context,
                           0ULL, a.epoch);
   while ((!dispatch_terminal_published || local_return_done == 0U ||
           completion_done == 0U) &&
@@ -823,7 +823,7 @@ __device__ __forceinline__ void relay_role(
         inbound_terminal = true;
     }
 
-#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#if defined(WEFTMOE_FORWARD_TRANSPORT_TU)
     // Mirror the compute scheduler's FC2-first policy at the node-local
     // transport boundary.  Once an FC2 M-block is available, retire one
     // bounded Return batch before issuing another Dispatch batch.  Skipping
@@ -842,7 +842,7 @@ __device__ __forceinline__ void relay_role(
           forward_return_detail::direct_local_return_terminal(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
-        MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
                                 context, local_return_state.cursor, a.epoch);
       }
       __syncthreads();
@@ -857,7 +857,7 @@ __device__ __forceinline__ void relay_role(
                           local_return_tma_full);
       if (local_begin ==
           static_cast<std::uint64_t>(relay_ordinal) * kLocalRouteBatch)
-        MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
                                 GinDispatch, context, local_begin, a.epoch);
       local_begin += local_stride;
       progressed = true;
@@ -870,7 +870,7 @@ __device__ __forceinline__ void relay_role(
       publish_local_batch(a, local_begin, local_end, completion);
       if (local_begin ==
           static_cast<std::uint64_t>(relay_ordinal) * kLocalRouteBatch)
-        MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
                                 GinDispatch, context, local_begin, a.epoch);
       local_begin += local_stride;
       progressed = true;
@@ -880,9 +880,9 @@ __device__ __forceinline__ void relay_role(
     const bool dispatch_terminal =
         inbound_terminal && local_begin >= local_routes;
     if (dispatch_terminal && !dispatch_terminal_published) {
-      MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, context,
+      WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, context,
                               local_routes, a.epoch);
-      MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, context,
+      WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, context,
                               local_routes, a.epoch);
       if (threadIdx.x == 0U) {
         const auto old =
@@ -899,7 +899,7 @@ __device__ __forceinline__ void relay_role(
       progressed = true;
     }
 
-#if !defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#if !defined(WEFTMOE_FORWARD_TRANSPORT_TU)
     // One bounded unit from each Return plane keeps Dispatch latency favored
     // without delaying already-computed FC2 rows until the complete Dispatch
     // or FC2 task spaces drain.
@@ -913,7 +913,7 @@ __device__ __forceinline__ void relay_role(
           forward_return_detail::direct_local_return_terminal(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
-        MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
+        WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
                                 context, local_return_state.cursor, a.epoch);
       }
       __syncthreads();
@@ -932,7 +932,7 @@ __device__ __forceinline__ void relay_role(
           break;
       }
       if (!completion_timeline_started && completion_state.initialized != 0U) {
-        MEGAMOE_TIMELINE_RECORD(
+        WEFTMOE_TIMELINE_RECORD(
             a.timeline, SourceRelayStart, SourceRelay, context,
             completion_state.expected, a.epoch);
         completion_timeline_started = true;
@@ -940,7 +940,7 @@ __device__ __forceinline__ void relay_role(
       if (forward_return_detail::direct_full_completion_terminal(
               completion_state)) {
         if (!completion_terminal_published) {
-          MEGAMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay,
                                   context, completion_state.completed, a.epoch);
           if (threadIdx.x == 0U) {
             persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -988,7 +988,7 @@ __device__ __forceinline__ void issue_outbound_task(
       static_cast<std::uint64_t>(source_partition) * a.max_tokens_per_rank +
       task.row_begin;
   const auto packets = static_cast<std::uint64_t>(task.row_count);
-  MEGAMOE_TIMELINE_RECORD(
+  WEFTMOE_TIMELINE_RECORD(
       a.timeline, GinPutIssue, GinDispatch, task.context,
       packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
   gin.put(rail, static_cast<int>(remote_node), a.gin_window,
@@ -1137,7 +1137,7 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
   auto *fc1_ready_queue = claims + forward_mblocks;
   auto *published_mblocks = peer_at<unsigned long long>(
       a.local_base, a.forward_fc1_published_offset);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
 #endif
@@ -1251,7 +1251,7 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
         }
       }
       progressed = true;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       atomicMax(&completion->bulk_pack_complete,
                 queue_base +
                     static_cast<unsigned long long>(group_mblocks) *
@@ -1263,7 +1263,7 @@ __device__ __forceinline__ void publish_ready_fc1_locality_groups(
     if (!progressed)
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
 #endif
 }
@@ -1285,7 +1285,7 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
   auto *fc1_ready_queue = claims + forward_mblocks;
   auto *published_mblocks = peer_at<unsigned long long>(
       a.local_base, a.forward_fc1_published_offset);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
 #endif
@@ -1321,18 +1321,18 @@ __device__ __forceinline__ void publish_ready_fc1_tasks(
       }
       --remaining;
       progressed = true;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
       completion->bulk_pack_complete = queue_base + fc1_ntiles;
 #endif
     }
     if (!progressed)
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
 #endif
 }
-#if defined(MEGAMOE_FORWARD_TRANSPORT_TU)
+#if defined(WEFTMOE_FORWARD_TRANSPORT_TU)
 
 // One-node Forward has no GIN context owner. Each Relay CTA gives up to
 // kLocalDispatchTmaWarps warps independent row-sized TMA streams and reserves
@@ -1345,7 +1345,7 @@ __device__ __forceinline__ void local_relay_role(
     persistent_v3::ForwardPipelineControl &control,
     std::uint32_t relay_ordinal, unsigned long long *scheduler,
     unsigned char *storage) {
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay,
                           relay_ordinal, 0ULL, a.epoch);
   constexpr std::uint32_t kPhysicalWarps =
       forward_tuning::kComputeThreads / 32U;
@@ -1486,7 +1486,7 @@ __device__ __forceinline__ void local_relay_role(
         if (destination != a.rank)
           peer_rows += rows;
         if (relay_ordinal == 0U && batch_begin == 0ULL && local == 0ULL)
-          MEGAMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
                                   GinDispatch, 0U, route, a.epoch);
       }
       asm volatile("bar.sync 2, %0;" : : "n"(kCopyThreads) : "memory");
@@ -1503,9 +1503,9 @@ __device__ __forceinline__ void local_relay_role(
               peer_rows * a.hidden * sizeof(transport::BFloat16));
   }
   __syncthreads();
-  MEGAMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay,
                           relay_ordinal, route_count, a.epoch);
-  MEGAMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay,
+  WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay,
                           relay_ordinal, route_count, a.epoch);
   if (threadIdx.x == 0U) {
     const auto old =
@@ -1545,7 +1545,7 @@ __device__ __forceinline__ void local_relay_role(
         if (forward_return_detail::direct_local_return_terminal(
                 a, scheduler, local_return_state)) {
           local_return_done = 1U;
-          MEGAMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal,
+          WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal,
                                   LocalReturn, context,
                                   local_return_state.cursor, a.epoch);
         } else if (!progressed) {
@@ -1713,10 +1713,10 @@ __device__ __forceinline__ void rdma_role(
             waves_published == inbound_directory.wave_count) {
           inbound_terminal = true;
           atomicAdd(&scheduler[5ULL + 2ULL * a.world], 1ULL);
-          MEGAMOE_TIMELINE_RECORD(
+          WEFTMOE_TIMELINE_RECORD(
               a.timeline, RemoteSignalObserved, GinDispatch, context,
               waves_published, a.epoch);
-          MEGAMOE_TIMELINE_RECORD(
+          WEFTMOE_TIMELINE_RECORD(
               a.timeline, XFirstRemoteSignal, GinDispatch, context,
               waves_published, a.epoch);
           progressed = true;
@@ -1744,7 +1744,7 @@ __device__ __forceinline__ void rdma_role(
           __nanosleep(forward_tuning::kTransportIdleNanosleep);
       }
     }
-    MEGAMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
+    WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
                             GinDispatch, context, issued_completions,
                             a.epoch);
 

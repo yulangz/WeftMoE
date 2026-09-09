@@ -139,7 +139,7 @@ class ForwardAutotuneTest(unittest.TestCase):
                 tune.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")) as run:
             tune.benchmark_candidate(self.candidates[0], Path("/tmp/binary"),
                                      benchmark, Path(tmp), {}, rounds=30)
-            self.assertEqual(run.call_args.kwargs["env"]["MEGAMOE_BENCH_EXPERTS"], "512")
+            self.assertEqual(run.call_args.kwargs["env"]["WEFTMOE_BENCH_EXPERTS"], "512")
 
     def setUp(self):
         self.plan = tune.load_plan(
@@ -230,7 +230,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         cpp_macros = set(re.findall(
-            r"^#ifndef (MEGAMOE_FWD_[A-Z0-9_]+)$", header,
+            r"^#ifndef (WEFTMOE_FWD_[A-Z0-9_]+)$", header,
             flags=re.MULTILINE))
         self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
 
@@ -238,7 +238,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         cpp_defaults = dict(re.findall(
-            r"^#define (MEGAMOE_FWD_[A-Z0-9_]+) ([0-9]+)$", header,
+            r"^#define (WEFTMOE_FWD_[A-Z0-9_]+) ([0-9]+)$", header,
             flags=re.MULTILINE))
         config = {}
         for key, macro in tune.PARAMETER_MACROS.items():
@@ -254,7 +254,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         candidate = self.candidates[0]
         header = tune.generated_header(candidate["name"],
                                        candidate["config"])
-        self.assertIn("#define MEGAMOE_FWD_REDUCE_SCHEDULER 0", header)
+        self.assertIn("#define WEFTMOE_FWD_REDUCE_SCHEDULER 0", header)
         for macro in tune.PARAMETER_MACROS.values():
             self.assertEqual(header.count(f"#define {macro} "), 1)
 

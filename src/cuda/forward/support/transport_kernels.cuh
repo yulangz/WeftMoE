@@ -65,7 +65,7 @@ __global__ void initialize_p2p_barrier_kernel(unsigned long long *record,
   }
 }
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
 __global__ void validate_p2p_barrier_kernel(
     const unsigned long long *records, std::uint32_t world,
     unsigned long long expected_slot, unsigned long long expected_epoch,
@@ -87,7 +87,7 @@ template <typename T> __device__ T *peer_at(void *base, std::size_t offset) {
   return reinterpret_cast<T *>(static_cast<unsigned char *>(base) + offset);
 }
 
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
 template <typename Args>
 __device__ __forceinline__ void
 production_terminal_debug_progress(const Args &a, ProductionStatusPhase phase,
@@ -927,7 +927,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
 // Trusted-team release path. Notify has already assigned a unique canonical
 // row to every route. Separate all-SM grids bulk-copy each phase, and tiny
 // kernels publish one system-scope completion per peer rather than per route.
-#if !MEGAMOE_DEBUG_VALIDATE
+#if !WEFTMOE_DEBUG_VALIDATE
 __global__ void local_p2p_bulk_dispatch_kernel(LocalP2pKernelArgs a) {
   const auto route = static_cast<std::uint64_t>(blockIdx.x);
   if (route >= a.dispatch.sizes.route_count)

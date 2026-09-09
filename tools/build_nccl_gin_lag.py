@@ -89,7 +89,7 @@ def main() -> None:
         print(source)
         return
     build_dir = work_dir / "build"
-    # This dependency build targets the SM90 GPUs used by MegaMOE.
+    # This dependency build targets the SM90 GPUs used by WeftMoE.
     command = ["make", "-j", str(args.jobs), "src.build",
                f"BUILDDIR={build_dir}", f"CUDA_HOME={args.cuda_home.resolve()}",
                "NVCC_GENCODE=-gencode=arch=compute_90,code=sm_90"]

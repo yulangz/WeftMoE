@@ -10,9 +10,9 @@
 #include <stdexcept>
 #include <utility>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe {
+namespace weftmoe {
 namespace {
 
 [[noreturn]] void invalid_exchange(const std::string &message) {
@@ -684,4 +684,4 @@ void HostFakeCountExchange::fail_next_completion(std::string message) {
   state_->next_completion_failure = std::move(message);
 }
 
-} // namespace megamoe
+} // namespace weftmoe

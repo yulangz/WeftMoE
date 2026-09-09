@@ -5,7 +5,7 @@
 #include "cuda/persistent_v3/backward/scheduler.cuh"
 #include "cuda/persistent_v3/queues.cuh"
 
-namespace megamoe::cuda::persistent_v3::backward {
+namespace weftmoe::cuda::persistent_v3::backward {
 
 inline constexpr std::uint32_t kSchedulerProbeExperts = 4U;
 inline constexpr std::uint32_t kSchedulerProbeMblocksPerExpert = 3U;
@@ -66,7 +66,7 @@ struct alignas(128) BackwardSchedulerProbeWorkspace {
 };
 
 #if defined(__CUDACC__)
-MEGAMOE_V3_DEVICE inline WorkQueues
+WEFTMOE_V3_DEVICE inline WorkQueues
 make_scheduler_probe_queues(BackwardSchedulerProbeWorkspace &work) {
   return WorkQueues{
       TileDomain{work.dx_ready, work.dx_claim, kSchedulerProbeMblocks,
@@ -83,7 +83,7 @@ make_scheduler_probe_queues(BackwardSchedulerProbeWorkspace &work) {
                  TaskKind::Dw1}};
 }
 
-MEGAMOE_V3_DEVICE inline WorkQueues
+WEFTMOE_V3_DEVICE inline WorkQueues
 make_scheduler_priority_queues(BackwardSchedulerProbeWorkspace &work) {
   return WorkQueues{
       TileDomain{&work.priority_ready[0], &work.priority_claim[0], 1U, 1U,
@@ -96,14 +96,14 @@ make_scheduler_priority_queues(BackwardSchedulerProbeWorkspace &work) {
                  TaskKind::Dw1}};
 }
 
-MEGAMOE_V3_DEVICE inline void scheduler_probe_increment(
+WEFTMOE_V3_DEVICE inline void scheduler_probe_increment(
     unsigned long long &word) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> value(
       word);
   value.fetch_add(1ULL, ::cuda::memory_order_relaxed);
 }
 
-MEGAMOE_V3_DEVICE inline std::uint32_t
+WEFTMOE_V3_DEVICE inline std::uint32_t
 scheduler_probe_visit_index(const TileTask &task) {
   switch (task.kind) {
   case TaskKind::Dx:
@@ -123,7 +123,7 @@ scheduler_probe_visit_index(const TileTask &task) {
   }
 }
 
-MEGAMOE_V3_DEVICE inline void complete_scheduler_probe_task(
+WEFTMOE_V3_DEVICE inline void complete_scheduler_probe_task(
     BackwardSchedulerProbeWorkspace &work, WorkQueues queues,
     const TileTask &task) {
   const auto visit = scheduler_probe_visit_index(task);
@@ -247,4 +247,4 @@ void backward_scheduler_probe_kernel(BackwardSchedulerProbeWorkspace *work) {
 }
 #endif
 
-} // namespace megamoe::cuda::persistent_v3::backward
+} // namespace weftmoe::cuda::persistent_v3::backward

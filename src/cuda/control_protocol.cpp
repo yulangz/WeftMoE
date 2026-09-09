@@ -1,4 +1,4 @@
-#include "megamoe/cuda/control_protocol.hpp"
+#include "weftmoe/cuda/control_protocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,9 +8,9 @@
 #include <string>
 #include <utility>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 namespace {
 
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -881,4 +881,4 @@ const char *control_error_name(ControlLocalError error) noexcept {
   return "unknown";
 }
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

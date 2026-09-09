@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Content-addressed runtime compiler for MegaMOE specializations.
+"""Content-addressed runtime compiler for WeftMoE specializations.
 
 The production library still has a conventional release build.  Autotuning,
 however, needs a different compile-time-specialized kernel for every candidate.
@@ -32,7 +32,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 JIT_SCHEMA = 1
-ARTIFACT_KIND = "megamoe-forward-test-binary"
+ARTIFACT_KIND = "weftmoe-forward-test-binary"
 
 
 @dataclass(frozen=True)
@@ -50,16 +50,16 @@ FORWARD_TARGET = JitTarget(
     name="forward",
     artifact_kind=ARTIFACT_KIND,
     cache_prefix="forward",
-    generated_header_name="megamoe_forward_tuning_generated.hpp",
-    use_generated_macro="MEGAMOE_FORWARD_USE_GENERATED_TUNING",
+    generated_header_name="weftmoe_forward_tuning_generated.hpp",
+    use_generated_macro="WEFTMOE_FORWARD_USE_GENERATED_TUNING",
 )
 
 BACKWARD_TARGET = JitTarget(
     name="backward",
-    artifact_kind="megamoe-backward-test-binary",
+    artifact_kind="weftmoe-backward-test-binary",
     cache_prefix="backward",
-    generated_header_name="megamoe_backward_tuning_generated.hpp",
-    use_generated_macro="MEGAMOE_BACKWARD_USE_GENERATED_TUNING",
+    generated_header_name="weftmoe_backward_tuning_generated.hpp",
+    use_generated_macro="WEFTMOE_BACKWARD_USE_GENERATED_TUNING",
 )
 
 HOST_SOURCES = (
@@ -373,7 +373,7 @@ def _run_parallel(commands: Sequence[Sequence[str]], *, cwd: Path,
 
 
 class SpecializedJitCompiler:
-    """Build one target specialization from the shared MegaMOE source graph."""
+    """Build one target specialization from the shared WeftMoE source graph."""
 
     def __init__(self, repo_root: Path, config: Mapping[str, Any],
                  environment: Mapping[str, str], *,
@@ -407,10 +407,10 @@ class SpecializedJitCompiler:
 
         self.host_flags = [
             "-Iinclude", "-Isrc", "-Itests", "-pthread",
-            "-DMEGAMOE_DEBUG_VALIDATE=0", "-DMEGAMOE_BUILD_SHARED=1",
-            "-DMEGAMOE_DEVICE_TIMELINE=0",
-            "-DMEGAMOE_FORWARD_LIGHT_PROGRESS=0",
-            "-DMEGAMOE_BUILD_TESTING=1", "-O2", "-g", "-std=c++17",
+            "-DWEFTMOE_DEBUG_VALIDATE=0", "-DWEFTMOE_BUILD_SHARED=1",
+            "-DWEFTMOE_DEVICE_TIMELINE=0",
+            "-DWEFTMOE_FORWARD_LIGHT_PROGRESS=0",
+            "-DWEFTMOE_BUILD_TESTING=1", "-O2", "-g", "-std=c++17",
             "-Wall", "-Wextra", "-Wpedantic", "-Wconversion", "-Wshadow",
             "-fPIC", "-fvisibility=hidden", "-ffunction-sections",
             "-fdata-sections",
@@ -418,10 +418,10 @@ class SpecializedJitCompiler:
         self.cuda_flags = [
             "-Iinclude", "-Isrc", "-Itests", "-Xcompiler=-pthread",
             "-isystem", str(self.cutlass_include),
-            "-DMEGAMOE_DEBUG_VALIDATE=0", "-DMEGAMOE_BUILD_SHARED=1",
-            "-DMEGAMOE_DEVICE_TIMELINE=0",
-            "-DMEGAMOE_FORWARD_LIGHT_PROGRESS=0",
-            "-DMEGAMOE_BUILD_TESTING=1", "-O2", "-g", "-std=c++17",
+            "-DWEFTMOE_DEBUG_VALIDATE=0", "-DWEFTMOE_BUILD_SHARED=1",
+            "-DWEFTMOE_DEVICE_TIMELINE=0",
+            "-DWEFTMOE_FORWARD_LIGHT_PROGRESS=0",
+            "-DWEFTMOE_BUILD_TESTING=1", "-O2", "-g", "-std=c++17",
             "--expt-relaxed-constexpr", "-Wno-deprecated-gpu-targets",
             "-Xcompiler=-fPIC,-fvisibility=hidden,-ffunction-sections,-fdata-sections",
             *self.arch_flags,
@@ -486,7 +486,7 @@ class SpecializedJitCompiler:
 
     def _host_cache_key(self) -> str:
         return hashlib.sha256(_canonical_json({
-            "kind": "megamoe-host-testing-archive",
+            "kind": "weftmoe-host-testing-archive",
             "toolchain": self.toolchain["cxx_version"],
             "compiler": str(self.cxx),
             "archiver": str(self.archiver),
@@ -502,10 +502,10 @@ class SpecializedJitCompiler:
         key = self._host_cache_key()
         destination = self.cache_root / "cache" / f"host.{key}"
         manifest = _cache_manifest(
-            destination, key, "megamoe-host-testing-archive"
+            destination, key, "weftmoe-host-testing-archive"
         )
         if manifest is not None:
-            archive = destination / "libmegamoe_host_testing.a"
+            archive = destination / "libweftmoe_host_testing.a"
             if not archive.is_file():
                 raise JitError(f"corrupt JIT host cache: {destination}")
             return archive, True
@@ -529,7 +529,7 @@ class SpecializedJitCompiler:
                 commands, cwd=self.repo_root, environment=self.environment,
                 jobs=self.jobs, timeout=self.timeout, log_path=log_path,
             )
-            archive = staging / "libmegamoe_host_testing.a"
+            archive = staging / "libweftmoe_host_testing.a"
             command = [str(self.archiver), "rcs", str(archive), *map(str, object_paths)]
             returncode, output = _run_command(
                 command, self.repo_root, self.environment, self.timeout
@@ -542,7 +542,7 @@ class SpecializedJitCompiler:
             shutil.rmtree(objects)
             _write_json(staging / "manifest.json", {
                 "schema": JIT_SCHEMA,
-                "kind": "megamoe-host-testing-archive",
+                "kind": "weftmoe-host-testing-archive",
                 "cache_key": key,
                 "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "toolchain": self.toolchain,
@@ -551,9 +551,9 @@ class SpecializedJitCompiler:
             published = _publish_directory(staging, destination)
             if not published:
                 _cache_manifest(
-                    destination, key, "megamoe-host-testing-archive"
+                    destination, key, "weftmoe-host-testing-archive"
                 )
-            return destination / "libmegamoe_host_testing.a", False
+            return destination / "libweftmoe_host_testing.a", False
         except BaseException:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -658,7 +658,7 @@ class SpecializedJitCompiler:
                 commands, cwd=self.repo_root, environment=self.environment,
                 jobs=parallel_jobs, timeout=self.timeout, log_path=log_path,
             )
-            cuda_archive = staging / "libmegamoe_cuda_testing.a"
+            cuda_archive = staging / "libweftmoe_cuda_testing.a"
             archive_command = [
                 str(self.archiver), "rcs", str(cuda_archive),
                 *map(str, object_paths),

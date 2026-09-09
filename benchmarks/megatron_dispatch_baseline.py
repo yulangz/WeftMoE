@@ -4,7 +4,7 @@
 Run with ``torchrun --standalone --nproc-per-node=8``.  The benchmark uses
 Megatron-Core's production AllToAll or Flex+DeepEP dispatcher rather than a
 raw collective stand-in.  The identity expert body isolates routing/transport;
-the TE grouped-MLP body is the full Forward baseline comparable to MegaMOE.
+the TE grouped-MLP body is the full Forward baseline comparable to WeftMoE.
 """
 
 import argparse
@@ -20,7 +20,7 @@ import time
 # Load the requested NCCL runtime before importing PyTorch. This makes the
 # executable baseline independent of LD_PRELOAD and lets the reported version
 # come from the exact handle that established the process runtime.
-_NCCL_LIBRARY_REQUEST = os.environ.get("MEGAMOE_NCCL_LIBRARY",
+_NCCL_LIBRARY_REQUEST = os.environ.get("WEFTMOE_NCCL_LIBRARY",
                                        "libnccl.so.2")
 _NCCL_RUNTIME = ctypes.CDLL(_NCCL_LIBRARY_REQUEST,
                            mode=ctypes.RTLD_GLOBAL)
@@ -219,7 +219,7 @@ def _signed_u64(value):
 
 @torch.no_grad()
 def actual_device_bf16_hash(tensors):
-    """Hash complete device BF16 storage with MegaMOE's fixed definition."""
+    """Hash complete device BF16 storage with WeftMoE's fixed definition."""
     tensors = [tensor.detach().contiguous().view(torch.uint16).view(-1)
                for tensor in tensors]
     elements = sum(tensor.numel() for tensor in tensors)
@@ -286,9 +286,9 @@ def forward_weight_sample_hash(expert_begin, expert_count, hidden,
 
 
 @torch.no_grad()
-def initialize_megamoe_forward_weights(module, global_expert_begin,
+def initialize_weftmoe_forward_weights(module, global_expert_begin,
                                         hidden, intermediate):
-    """Load the exact BF16 fixture used by MegaMOE's device initializer."""
+    """Load the exact BF16 fixture used by WeftMoE's device initializer."""
     chunk = 4 * 1024 * 1024
     actual_parameters = {"w1": [], "w2": []}
     for name, parameter in module.named_parameters():
@@ -488,11 +488,11 @@ def main():
         experts_builder = layer_spec.submodules.mlp.submodules.experts
         experts_module = experts_builder(
             local_experts, config, pg_collection=get_default_pg_collection())
-        actual_weight_parameters = initialize_megamoe_forward_weights(
+        actual_weight_parameters = initialize_weftmoe_forward_weights(
             experts_module, rank * local_experts, args.hidden,
             args.intermediate)
 
-    # Shared MegaMOE/Megatron BF16 fixture v3. Rank and flat index enter the
+    # Shared WeftMoE/Megatron BF16 fixture v3. Rank and flat index enter the
     # same expression on both implementations before the BF16 cast.
     flat = torch.arange(args.tokens * args.hidden, dtype=torch.int32,
                         device="cuda")
@@ -669,7 +669,7 @@ def main():
         expert_input, local_counts, remote_gate = dispatcher.dispatch_postprocess(
             remote_hidden, remote_probs)
         # Keep Megatron's expert-side gate-before-FC2 path, then replace only
-        # its final BF16 combine with MegaMOE's fixed expert-ID FP32 sum.
+        # its final BF16 combine with WeftMoE's fixed expert-ID FP32 sum.
         expert_output, _ = experts_module(
             expert_input, local_counts, remote_gate)
         combine_input = dispatcher.combine_preprocess(expert_output)
@@ -901,10 +901,10 @@ def main():
         "expert_body": args.expert_body,
         "gemm_backend": ("TransformerEngine TEGroupedMLP"
                          if experts_module is not None else "none"),
-        "weight_fixture": ("MegaMOE four-coordinate PRNG BF16 v3"
+        "weight_fixture": ("WeftMoE four-coordinate PRNG BF16 v3"
                            if experts_module is not None else "none"),
         "weight_generator_version": 3 if experts_module is not None else None,
-        "activation_fixture": "MegaMOE rank-flat BF16 v2",
+        "activation_fixture": "WeftMoE rank-flat BF16 v2",
         "per_rank_activation_hash": activation_hashes,
         "per_rank_route_hash": route_hashes,
         "gate_mode": args.gate_mode,

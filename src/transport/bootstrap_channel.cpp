@@ -9,9 +9,9 @@
 
 #include <unistd.h>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 namespace {
 
 thread_local testing::BootstrapReadHook read_hook = nullptr;
@@ -267,4 +267,4 @@ void NcclBootstrapOutputChannel::cancel() noexcept {
     finish(BootstrapChannelState::Closed);
 }
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

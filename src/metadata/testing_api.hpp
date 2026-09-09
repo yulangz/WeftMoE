@@ -8,10 +8,10 @@
 #include <vector>
 
 #define private public
-#include "megamoe/api/notify_dispatch.hpp"
+#include "weftmoe/api/notify_dispatch.hpp"
 #undef private
 
-namespace megamoe::testing {
+namespace weftmoe::testing {
 
 class HostIntegerRowTestAccess {
 public:
@@ -19,11 +19,11 @@ public:
       const HostIntegerRow &row) noexcept;
 };
 
-} // namespace megamoe::testing
+} // namespace weftmoe::testing
 
-namespace megamoe {
+namespace weftmoe {
 std::vector<DispatchHandle> build_notify_dispatch_for_testing(
     const RuntimeConfig &, const std::vector<RankRoutingInput> &,
     const std::string &communicator_id = "host-fake",
     std::uint64_t generation = 1);
-} // namespace megamoe
+} // namespace weftmoe

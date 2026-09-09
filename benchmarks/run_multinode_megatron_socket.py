@@ -44,7 +44,7 @@ def terminate(process):
 
 
 def remote_cleanup(args, launch_id, requested_signal):
-    pattern = f"MEGAMOE_MULTINODE_LAUNCH_ID={launch_id}"
+    pattern = f"WEFTMOE_MULTINODE_LAUNCH_ID={launch_id}"
     subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-p", str(args.port), args.remote,
          f"pkill -{requested_signal} -f -- {shlex.quote(pattern)} || true"],
@@ -145,13 +145,13 @@ def main():
         "NCCL_DEBUG": "WARN",
         "NCCL_IB_DISABLE": "1",
         "NCCL_SOCKET_IFNAME": args.socket_ifname,
-        "MEGAMOE_MULTINODE_LAUNCH_ID": launch_id,
+        "WEFTMOE_MULTINODE_LAUNCH_ID": launch_id,
     })
     remote_overrides = {
         key: environment[key] for key in
-        ("LD_LIBRARY_PATH", "MEGAMOE_NCCL_LIBRARY", "NCCL_DEBUG",
+        ("LD_LIBRARY_PATH", "WEFTMOE_NCCL_LIBRARY", "NCCL_DEBUG",
          "NCCL_IB_DISABLE", "NCCL_SOCKET_IFNAME",
-         "MEGAMOE_MULTINODE_LAUNCH_ID")
+         "WEFTMOE_MULTINODE_LAUNCH_ID")
     }
     local_process = None
     remote_process = None

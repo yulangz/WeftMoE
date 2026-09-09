@@ -41,7 +41,7 @@ struct ReduceTokenView {
   std::uint64_t hidden;
   std::uint32_t top_k;
   std::uint32_t node;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   transport_state::GenerationCompletionVector *completion;
 #endif
 };
@@ -66,7 +66,7 @@ reduce_token_view(const ForwardKernelArgs &a) {
   v.hidden = a.hidden;
   v.top_k = a.dispatch.identity.top_k;
   v.node = a.node;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   v.completion =
       a.use_gin ? static_cast<transport_state::GenerationCompletionVector *>(
                       a.peer_bases[a.world])
@@ -86,11 +86,11 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
   // token index but is not a memory fence; hand payload visibility to all lanes.
   if constexpr (Warp)
     __syncwarp();
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   encoded &= (1ULL << 56U) - 1ULL;
 #endif
   const auto token = encoded - 1ULL;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   if (v.completion && lane == 0U)
     claim_completion_tasks(v.completion, transport_state::TaskClass::Reduce);
 #endif
@@ -131,7 +131,7 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
   if constexpr (Warp)
     __syncwarp();
   if (lane == 0U) {
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
     if (v.completion)
       complete_completion_tasks(v.completion,
                                 transport_state::TaskClass::Reduce);

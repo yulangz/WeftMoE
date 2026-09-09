@@ -19,7 +19,7 @@ SPEC.loader.exec_module(builder)
 
 class NcclBuildTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="megamoe-nccl-build-")
+        temporary = tempfile.TemporaryDirectory(prefix="weftmoe-nccl-build-")
         self.addCleanup(temporary.cleanup)
         self.work = Path(temporary.name)
         self.source = self.work / "source"

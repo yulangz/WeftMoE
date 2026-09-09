@@ -8,7 +8,7 @@ CUDA, IPC or GIN pointer.
 ## Single-host Forward
 
 ```cpp
-using namespace megamoe;
+using namespace weftmoe;
 
 auto base = cuda::make_nccl_session("ep-team", world, rank, 1, device,
                                     bootstrap_id);

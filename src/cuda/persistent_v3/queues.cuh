@@ -10,7 +10,7 @@
 #include <cuda/atomic>
 #endif
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 
 template <class T> struct SpscSlot {
   unsigned long long sequence = 0;
@@ -29,42 +29,42 @@ template <class T, std::uint32_t Capacity> struct alignas(128) SpscRing {
 
 #if defined(__CUDACC__)
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline unsigned long long
+WEFTMOE_V3_DEVICE inline unsigned long long
 load_acquire(unsigned long long &word) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
   return value.load(::cuda::memory_order_acquire);
 }
 
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline unsigned long long
+WEFTMOE_V3_DEVICE inline unsigned long long
 load_relaxed(unsigned long long &word) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
   return value.load(::cuda::memory_order_relaxed);
 }
 
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline void store_release(unsigned long long &word,
+WEFTMOE_V3_DEVICE inline void store_release(unsigned long long &word,
                                              unsigned long long next) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
   value.store(next, ::cuda::memory_order_release);
 }
 
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline void store_relaxed(unsigned long long &word,
+WEFTMOE_V3_DEVICE inline void store_relaxed(unsigned long long &word,
                                              unsigned long long next) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
   value.store(next, ::cuda::memory_order_relaxed);
 }
 
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline unsigned long long
+WEFTMOE_V3_DEVICE inline unsigned long long
 fetch_add_release(unsigned long long &word, unsigned long long increment) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
   return value.fetch_add(increment, ::cuda::memory_order_release);
 }
 
 template <::cuda::thread_scope Scope>
-MEGAMOE_V3_DEVICE inline bool compare_exchange_acq_rel(
+WEFTMOE_V3_DEVICE inline bool compare_exchange_acq_rel(
     unsigned long long &word, unsigned long long &expected,
     unsigned long long desired) {
   ::cuda::atomic_ref<unsigned long long, Scope> value(word);
@@ -74,7 +74,7 @@ MEGAMOE_V3_DEVICE inline bool compare_exchange_acq_rel(
 }
 
 template <class T, std::uint32_t Capacity>
-MEGAMOE_V3_DEVICE inline bool try_push(SpscRing<T, Capacity> &ring,
+WEFTMOE_V3_DEVICE inline bool try_push(SpscRing<T, Capacity> &ring,
                                        const T &payload) {
   const auto ticket = load_relaxed<::cuda::thread_scope_device>(
       ring.producer_ticket.value);
@@ -89,7 +89,7 @@ MEGAMOE_V3_DEVICE inline bool try_push(SpscRing<T, Capacity> &ring,
 }
 
 template <class T, std::uint32_t Capacity>
-MEGAMOE_V3_DEVICE inline bool try_pop(SpscRing<T, Capacity> &ring,
+WEFTMOE_V3_DEVICE inline bool try_pop(SpscRing<T, Capacity> &ring,
                                       T &payload) {
   const auto ticket = load_relaxed<::cuda::thread_scope_device>(
       ring.consumer_ticket.value);
@@ -105,7 +105,7 @@ MEGAMOE_V3_DEVICE inline bool try_pop(SpscRing<T, Capacity> &ring,
 }
 
 template <class T, std::uint32_t Capacity>
-MEGAMOE_V3_DEVICE inline bool ring_drained(SpscRing<T, Capacity> &ring) {
+WEFTMOE_V3_DEVICE inline bool ring_drained(SpscRing<T, Capacity> &ring) {
   return load_acquire<::cuda::thread_scope_device>(
              ring.producer_ticket.value) ==
          load_acquire<::cuda::thread_scope_device>(
@@ -113,4 +113,4 @@ MEGAMOE_V3_DEVICE inline bool ring_drained(SpscRing<T, Capacity> &ring) {
 }
 #endif
 
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3

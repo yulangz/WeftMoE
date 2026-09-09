@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small target-independent helpers for MegaMOE kernel autotuners."""
+"""Small target-independent helpers for WeftMoE kernel autotuners."""
 
 from __future__ import annotations
 

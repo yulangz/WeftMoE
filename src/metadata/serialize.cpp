@@ -1,11 +1,11 @@
-#include "megamoe/metadata/serialize.hpp"
+#include "weftmoe/metadata/serialize.hpp"
 
 #include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
 
-namespace megamoe {
+namespace weftmoe {
 namespace {
 
 std::string json_string(const std::string& value) {
@@ -202,4 +202,4 @@ std::string serialize_dispatch_metadata(const DispatchHandle& handle) {
     return out.str();
 }
 
-}  // namespace megamoe
+}  // namespace weftmoe

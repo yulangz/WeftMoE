@@ -8,9 +8,9 @@
 #include <sstream>
 #include <unordered_set>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe::transport {
+namespace weftmoe::transport {
 namespace {
 
 [[noreturn]] void protocol_error(const std::string &field,
@@ -305,4 +305,4 @@ SyntheticTransportResult simulate_activation_transport(
   return result;
 }
 
-} // namespace megamoe::transport
+} // namespace weftmoe::transport

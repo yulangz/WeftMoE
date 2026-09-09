@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare cached-state MegaMOE Backward artifacts with PyTorch autograd.
+"""Compare cached-state WeftMoE Backward artifacts with PyTorch autograd.
 
 The oracle consumes the exact canonical X and BF16 A/B values retained by the
 tested Forward invocation. It independently rebuilds only the deterministic

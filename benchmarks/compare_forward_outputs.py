@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare explicit MegaMOE and high-precision/common Forward outputs."""
+"""Compare explicit WeftMoE and high-precision/common Forward outputs."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ import torch
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--megamoe-dir", required=True)
+    parser.add_argument("--weftmoe-dir", required=True)
     parser.add_argument("--megatron-dir", required=True)
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--tokens", type=int, default=8192)
@@ -28,11 +28,11 @@ def main():
     within_tolerance = True
     for rank in range(args.world):
         mega_path = os.path.join(
-            args.megamoe_dir, f"megamoe-rank-{rank}.bf16")
+            args.weftmoe_dir, f"weftmoe-rank-{rank}.bf16")
         megatron_path = os.path.join(
             args.megatron_dir, f"megatron-rank-{rank}.pt")
         if os.path.getsize(mega_path) != count * 2:
-            raise RuntimeError(f"rank={rank} malformed MegaMOE output")
+            raise RuntimeError(f"rank={rank} malformed WeftMoE output")
         mega_bits = torch.from_file(mega_path, dtype=torch.int16,
                                     size=count).clone()
         record = torch.load(megatron_path, map_location="cpu",

@@ -9,10 +9,10 @@
 #include <vector>
 
 #define private public
-#include "megamoe/cuda/device_notify.hpp"
+#include "weftmoe/cuda/device_notify.hpp"
 #undef private
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 
 class CudaNotifyWorkspace;
 class CudaNotifyOperation;
@@ -333,4 +333,4 @@ CudaNotifyOperation start_cuda_rank_local_notify(
     const CudaExecution &execution, const CudaRouteInput &routes,
     const CudaGateInput &gates, CudaNotifyWorkspace workspace);
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

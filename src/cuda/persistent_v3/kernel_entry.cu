@@ -11,7 +11,7 @@
 #include "cuda/persistent_v3/roles/compute_role.cuh"
 #include "cuda/persistent_v3/shared_storage.cuh"
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 namespace {
 
 inline constexpr std::uint32_t kProbeMaxTasksPerContext = 128U;
@@ -35,7 +35,7 @@ struct alignas(128) ProtocolProbeWorkspace {
   PaddedCounter relay_roles_completed;
 };
 
-MEGAMOE_V3_HOST_DEVICE constexpr unsigned long long
+WEFTMOE_V3_HOST_DEVICE constexpr unsigned long long
 probe_input_value(std::uint32_t context, std::uint32_t local_task,
                   std::uint32_t global_task) {
   return (static_cast<unsigned long long>(context + 1U) << 56U) ^
@@ -44,13 +44,13 @@ probe_input_value(std::uint32_t context, std::uint32_t local_task,
           0x9e3779b97f4a7c15ULL);
 }
 
-MEGAMOE_V3_HOST_DEVICE constexpr unsigned long long
+WEFTMOE_V3_HOST_DEVICE constexpr unsigned long long
 probe_output_value(unsigned long long input, std::uint32_t global_task) {
   return (input ^ 0xd1b54a32d192ed03ULL) +
          static_cast<unsigned long long>(global_task + 1U) * 128ULL;
 }
 
-MEGAMOE_V3_DEVICE inline void run_protocol_rdma_role(
+WEFTMOE_V3_DEVICE inline void run_protocol_rdma_role(
     ProtocolProbeWorkspace &work, std::uint32_t context,
     std::uint32_t tasks_per_context) {
   if (threadIdx.x == 0U) {
@@ -93,7 +93,7 @@ MEGAMOE_V3_DEVICE inline void run_protocol_rdma_role(
   __syncthreads();
 }
 
-MEGAMOE_V3_DEVICE inline void run_protocol_relay_role(
+WEFTMOE_V3_DEVICE inline void run_protocol_relay_role(
     ProtocolProbeWorkspace &work, std::uint32_t context,
     std::uint32_t tasks_per_context) {
   if (threadIdx.x == 0U) {
@@ -173,7 +173,7 @@ MEGAMOE_V3_DEVICE inline void run_protocol_relay_role(
   __syncthreads();
 }
 
-MEGAMOE_V3_DEVICE inline bool protocol_probe_terminal_ready(
+WEFTMOE_V3_DEVICE inline bool protocol_probe_terminal_ready(
     ProtocolProbeWorkspace &work, std::uint32_t total_tasks) {
   if (load_acquire<::cuda::thread_scope_device>(
           work.compute_completed.value) != total_tasks ||
@@ -199,7 +199,7 @@ MEGAMOE_V3_DEVICE inline bool protocol_probe_terminal_ready(
   return true;
 }
 
-MEGAMOE_V3_DEVICE inline void publish_protocol_terminal(
+WEFTMOE_V3_DEVICE inline void publish_protocol_terminal(
     ProtocolProbeWorkspace &work, std::uint32_t total_tasks) {
   while (true) {
     const auto error = load_acquire<::cuda::thread_scope_device>(
@@ -218,7 +218,7 @@ MEGAMOE_V3_DEVICE inline void publish_protocol_terminal(
   }
 }
 
-MEGAMOE_V3_DEVICE inline void run_protocol_compute_role(
+WEFTMOE_V3_DEVICE inline void run_protocol_compute_role(
     ProtocolProbeWorkspace &work, std::uint32_t compute_ordinal,
     std::uint32_t tasks_per_context) {
   const auto total_tasks = tasks_per_context * kRdmaCtaCount;
@@ -297,9 +297,9 @@ struct CudaWorkspaceDeleter {
 };
 
 } // namespace
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3
 
-namespace megamoe::cuda::testing {
+namespace weftmoe::cuda::testing {
 
 PersistentV3ProtocolProbeResult
 run_persistent_v3_protocol_probe(std::uint32_t tasks_per_context) {
@@ -377,9 +377,9 @@ run_persistent_v3_protocol_probe(std::uint32_t tasks_per_context) {
   return result;
 }
 
-} // namespace megamoe::cuda::testing
+} // namespace weftmoe::cuda::testing
 
-namespace megamoe::cuda::testing {
+namespace weftmoe::cuda::testing {
 
 BackwardSchedulerProbeResult run_backward_scheduler_probe() {
   using namespace persistent_v3;
@@ -469,4 +469,4 @@ BackwardSchedulerProbeResult run_backward_scheduler_probe() {
   return result;
 }
 
-} // namespace megamoe::cuda::testing
+} // namespace weftmoe::cuda::testing

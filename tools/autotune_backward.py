@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JIT-compile and tune explicit MegaMOE Backward specializations."""
+"""JIT-compile and tune explicit WeftMoE Backward specializations."""
 
 from __future__ import annotations
 
@@ -52,37 +52,37 @@ GROUP_NAMES = (
 # must fail the source/config parity test instead of becoming an invisible
 # tuning input.
 PARAMETER_MACROS = {
-    "main_hidden": "MEGAMOE_BWD_MAIN_HIDDEN",
-    "main_intermediate": "MEGAMOE_BWD_MAIN_INTERMEDIATE",
-    "tile_m": "MEGAMOE_BWD_TILE_M",
-    "dab_tile_n": "MEGAMOE_BWD_DAB_TILE_N",
-    "dx_tile_n": "MEGAMOE_BWD_DX_TILE_N",
-    "dw_tile_m": "MEGAMOE_BWD_DW_TILE_M",
-    "dw_tile_n": "MEGAMOE_BWD_DW_TILE_N",
-    "tile_k": "MEGAMOE_BWD_TILE_K",
-    "dab_stages": "MEGAMOE_BWD_DAB_STAGES",
-    "dx_stages": "MEGAMOE_BWD_DX_STAGES",
-    "dw1_stages": "MEGAMOE_BWD_DW1_STAGES",
-    "dw2_stages": "MEGAMOE_BWD_DW2_STAGES",
-    "compute_threads": "MEGAMOE_BWD_COMPUTE_THREADS",
-    "math_warpgroups": "MEGAMOE_BWD_MATH_WARPGROUPS",
-    "producer_warpgroups": "MEGAMOE_BWD_PRODUCER_WARPGROUPS",
-    "math_registers": "MEGAMOE_BWD_MATH_REGISTERS",
-    "producer_registers": "MEGAMOE_BWD_PRODUCER_REGISTERS",
-    "rdma_ctas": "MEGAMOE_BWD_RDMA_CTAS",
-    "relay_ctas": "MEGAMOE_BWD_RELAY_CTAS",
-    "dispatch_batch_rows": "MEGAMOE_BWD_DISPATCH_BATCH_ROWS",
-    "gin_max_inflight": "MEGAMOE_BWD_GIN_MAX_INFLIGHT",
-    "setup_threads": "MEGAMOE_BWD_SETUP_THREADS",
-    "setup_idle_nanosleep": "MEGAMOE_BWD_SETUP_IDLE_NANOSLEEP",
-    "queue_idle_nanosleep": "MEGAMOE_BWD_QUEUE_IDLE_NANOSLEEP",
-    "ready_word_stagger": "MEGAMOE_BWD_READY_WORD_STAGGER",
-    "activation_owner_group": "MEGAMOE_BWD_ACTIVATION_OWNER_GROUP",
-    "epilogue_rows_per_task": "MEGAMOE_BWD_EPILOGUE_ROWS_PER_TASK",
-    "dw2_claim_tiles": "MEGAMOE_BWD_DW2_CLAIM_TILES",
-    "dw1_claim_tiles": "MEGAMOE_BWD_DW1_CLAIM_TILES",
-    "reduce_threads": "MEGAMOE_BWD_REDUCE_THREADS",
-    "reduce_idle_nanosleep": "MEGAMOE_BWD_REDUCE_IDLE_NANOSLEEP",
+    "main_hidden": "WEFTMOE_BWD_MAIN_HIDDEN",
+    "main_intermediate": "WEFTMOE_BWD_MAIN_INTERMEDIATE",
+    "tile_m": "WEFTMOE_BWD_TILE_M",
+    "dab_tile_n": "WEFTMOE_BWD_DAB_TILE_N",
+    "dx_tile_n": "WEFTMOE_BWD_DX_TILE_N",
+    "dw_tile_m": "WEFTMOE_BWD_DW_TILE_M",
+    "dw_tile_n": "WEFTMOE_BWD_DW_TILE_N",
+    "tile_k": "WEFTMOE_BWD_TILE_K",
+    "dab_stages": "WEFTMOE_BWD_DAB_STAGES",
+    "dx_stages": "WEFTMOE_BWD_DX_STAGES",
+    "dw1_stages": "WEFTMOE_BWD_DW1_STAGES",
+    "dw2_stages": "WEFTMOE_BWD_DW2_STAGES",
+    "compute_threads": "WEFTMOE_BWD_COMPUTE_THREADS",
+    "math_warpgroups": "WEFTMOE_BWD_MATH_WARPGROUPS",
+    "producer_warpgroups": "WEFTMOE_BWD_PRODUCER_WARPGROUPS",
+    "math_registers": "WEFTMOE_BWD_MATH_REGISTERS",
+    "producer_registers": "WEFTMOE_BWD_PRODUCER_REGISTERS",
+    "rdma_ctas": "WEFTMOE_BWD_RDMA_CTAS",
+    "relay_ctas": "WEFTMOE_BWD_RELAY_CTAS",
+    "dispatch_batch_rows": "WEFTMOE_BWD_DISPATCH_BATCH_ROWS",
+    "gin_max_inflight": "WEFTMOE_BWD_GIN_MAX_INFLIGHT",
+    "setup_threads": "WEFTMOE_BWD_SETUP_THREADS",
+    "setup_idle_nanosleep": "WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP",
+    "queue_idle_nanosleep": "WEFTMOE_BWD_QUEUE_IDLE_NANOSLEEP",
+    "ready_word_stagger": "WEFTMOE_BWD_READY_WORD_STAGGER",
+    "activation_owner_group": "WEFTMOE_BWD_ACTIVATION_OWNER_GROUP",
+    "epilogue_rows_per_task": "WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK",
+    "dw2_claim_tiles": "WEFTMOE_BWD_DW2_CLAIM_TILES",
+    "dw1_claim_tiles": "WEFTMOE_BWD_DW1_CLAIM_TILES",
+    "reduce_threads": "WEFTMOE_BWD_REDUCE_THREADS",
+    "reduce_idle_nanosleep": "WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP",
 }
 
 EXPECTED_INVARIANTS = {
@@ -366,7 +366,7 @@ def materialize_candidate(candidate: Mapping[str, Any],
     build_dir = build_root / f"{candidate['name']}-{digest}"
     include_dir = build_dir / "generated"
     include_dir.mkdir(parents=True, exist_ok=True)
-    header = include_dir / "megamoe_backward_tuning_generated.hpp"
+    header = include_dir / "weftmoe_backward_tuning_generated.hpp"
     content = generated_header(candidate["name"], candidate["config"])
     if not header.exists() or header.read_text(encoding="utf-8") != content:
         header.write_text(content, encoding="utf-8")
@@ -437,13 +437,13 @@ def inspect_backward_kernels(binary: Path, log_path: Path,
 def sanitized_environment() -> dict[str, str]:
     environment = os.environ.copy()
     explicit = {
-        "NCCL_IB_DISABLE", "NCCL_SOCKET_IFNAME", "MEGAMOE_P2P_TOP_K",
-        "MEGAMOE_P2P_BENCH_TOKENS", "MEGAMOE_BACKWARD_ROUNDS",
-        "MEGAMOE_BACKWARD_WARMUPS", "MEGAMOE_BACKWARD_TOKENS",
-        "MEGAMOE_BACKWARD_OUTPUT_DIR",
+        "NCCL_IB_DISABLE", "NCCL_SOCKET_IFNAME", "WEFTMOE_P2P_TOP_K",
+        "WEFTMOE_P2P_BENCH_TOKENS", "WEFTMOE_BACKWARD_ROUNDS",
+        "WEFTMOE_BACKWARD_WARMUPS", "WEFTMOE_BACKWARD_TOKENS",
+        "WEFTMOE_BACKWARD_OUTPUT_DIR",
     }
     for key in tuple(environment):
-        if key.startswith("MEGAMOE_BWD_") or key in explicit:
+        if key.startswith("WEFTMOE_BWD_") or key in explicit:
             environment.pop(key, None)
     return environment
 
@@ -546,12 +546,12 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                         suffix: str = "tune") -> dict[str, Any]:
     run_environment = dict(environment)
     if "experts" in benchmark:
-        run_environment["MEGAMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
-    run_environment["MEGAMOE_BACKWARD_ROUNDS"] = str(rounds)
-    run_environment["MEGAMOE_BACKWARD_WARMUPS"] = "10"
-    run_environment["MEGAMOE_P2P_BENCH_TOKENS"] = str(
+        run_environment["WEFTMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
+    run_environment["WEFTMOE_BACKWARD_ROUNDS"] = str(rounds)
+    run_environment["WEFTMOE_BACKWARD_WARMUPS"] = "10"
+    run_environment["WEFTMOE_P2P_BENCH_TOKENS"] = str(
         int(benchmark["tokens_per_rank"]))
-    run_environment["MEGAMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
+    run_environment["WEFTMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
     if benchmark.get("launcher", "multinode") == "local":
         nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
         if nccl_lib_dir:

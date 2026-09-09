@@ -9,7 +9,7 @@
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cutlass/arch/barrier.h>
 
-namespace megamoe::cuda::hopper {
+namespace weftmoe::cuda::hopper {
 using Major = cute::SM90::GMMA::Major;
 
 template <int Columns, Major MajorA = Major::K, Major MajorB = Major::K>
@@ -114,4 +114,4 @@ struct StoreMatrixX2 {
         *reinterpret_cast<cute::uint128_t*>(shared));
   }
 };
-} // namespace megamoe::cuda::hopper
+} // namespace weftmoe::cuda::hopper

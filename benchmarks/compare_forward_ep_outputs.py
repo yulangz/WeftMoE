@@ -14,7 +14,7 @@ import numpy as np
 
 
 def read_tensor(directory, rank, suffix, dtype, tokens, width):
-    path = directory / f"megamoe-rank-{rank}{suffix}"
+    path = directory / f"weftmoe-rank-{rank}{suffix}"
     expected = tokens * width * np.dtype(dtype).itemsize
     if path.stat().st_size != expected:
         raise ValueError(f"{path}: expected {expected} bytes")

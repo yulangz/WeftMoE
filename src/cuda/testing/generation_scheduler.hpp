@@ -8,7 +8,7 @@
 
 #include "cuda/transport_generation_completion.cuh"
 
-namespace megamoe::cuda::testing {
+namespace weftmoe::cuda::testing {
 
 // CPU model of the production counter protocol.  It deliberately models no
 // work queue: a randomized driver chooses among ready WAITING tasks, and the
@@ -119,4 +119,4 @@ class GenerationSchedulerModel {
   std::uint32_t terminal_publish_count_ = 0;
 };
 
-} // namespace megamoe::cuda::testing
+} // namespace weftmoe::cuda::testing

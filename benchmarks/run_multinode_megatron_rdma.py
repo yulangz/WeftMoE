@@ -252,12 +252,12 @@ def main():
         "NCCL_NET_GDR_LEVEL": args.net_gdr_level,
         "NCCL_IB_PCI_RELAXED_ORDERING": args.ib_pci_relaxed_ordering,
         "NCCL_SOCKET_IFNAME": args.socket_ifname,
-        "MEGAMOE_MULTINODE_LAUNCH_ID": launch_id,
+        "WEFTMOE_MULTINODE_LAUNCH_ID": launch_id,
     }
     environment.update(rdma_environment)
     remote_overrides = {
         key: environment[key] for key in
-        ("LD_LIBRARY_PATH", "MEGAMOE_NCCL_LIBRARY", *rdma_environment.keys())
+        ("LD_LIBRARY_PATH", "WEFTMOE_NCCL_LIBRARY", *rdma_environment.keys())
     }
     before_local = local_counter_snapshot(hcas, args.ib_gid_index)
     before_remote = remote_counter_snapshot(args, hcas)
@@ -380,7 +380,7 @@ def main():
         record["network_backend"] = "nccl-rdma-roce-gdr"
     record["network_environment"] = {
         key: value for key, value in rdma_environment.items()
-        if key != "MEGAMOE_MULTINODE_LAUNCH_ID"
+        if key != "WEFTMOE_MULTINODE_LAUNCH_ID"
     }
     record["explicit_nccl_library_path"] = library
     record["rdma_evidence"] = evidence

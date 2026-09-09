@@ -1,16 +1,16 @@
 #pragma once
 
-#ifndef MEGAMOE_INTERNAL_TESTING_API
-#define MEGAMOE_INTERNAL_TESTING_API 1
+#ifndef WEFTMOE_INTERNAL_TESTING_API
+#define WEFTMOE_INTERNAL_TESTING_API 1
 #endif
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
-#include "megamoe/api/notify_dispatch.hpp"
+#include "weftmoe/api/notify_dispatch.hpp"
 
-namespace megamoe::testing {
+namespace weftmoe::testing {
 
 // Internal sanitizer-only/test-only hook. This header is intentionally outside
 // the public include tree.
@@ -75,4 +75,4 @@ public:
                                        std::uint32_t value);
 };
 
-} // namespace megamoe::testing
+} // namespace weftmoe::testing

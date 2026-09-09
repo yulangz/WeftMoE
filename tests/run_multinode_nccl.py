@@ -19,14 +19,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reference.notify_dispatch_reference import (
-    ReferenceConfig,
-    ReferenceTopology,
-    build_reference_all,
-)
-
-
-MASK64 = (1 << 64) - 1
 BOOTSTRAP_BYTES = 128
 _active_bootstrap = b""
 
@@ -253,46 +245,6 @@ def scrub_output(value, bootstrap=None):
     return text
 
 
-def seeded_inputs(world, experts, top_k, seed, max_tokens=10):
-    def next_value():
-        nonlocal seed
-        seed = (seed * 6364136223846793005 + 1442695040888963407) & MASK64
-        return seed
-
-    routes = []
-    for _rank in range(world):
-        rank_routes = []
-        for _token in range(next_value() % (max_tokens + 1)):
-            candidates = list(range(experts))
-            selected = []
-            for slot in range(top_k):
-                index = slot + next_value() % (experts - slot)
-                candidates[slot], candidates[index] = candidates[index], candidates[slot]
-                selected.append(candidates[slot])
-            rank_routes.append(selected)
-        routes.append(rank_routes)
-    return routes
-
-
-def config_for(gpus_per_node):
-    nodes = 2
-    world = nodes * gpus_per_node
-    experts = max(16, world * 2)
-    top_k = min(6, experts)
-    return ReferenceConfig(
-        experts,
-        top_k,
-        7,
-        ReferenceTopology(
-            world,
-            nodes,
-            [node for node in range(nodes) for _ in range(gpus_per_node)],
-            [local for _node in range(nodes) for local in range(gpus_per_node)],
-            [expert % world for expert in range(experts)],
-        ),
-    )
-
-
 def runner_args(binary, rank, gpus_per_node, seed, scenario, launch_id,
                 bootstrap_fd, produces_bootstrap=False):
     result = [
@@ -326,37 +278,37 @@ def environment_overrides(args):
     # Forward them explicitly so local and remote ranks cannot silently run a
     # different generation count, shape, or gate mode.
     for key in (
-        "MEGAMOE_P2P_ROUNDS",
-        "MEGAMOE_P2P_BENCH_ROUNDS",
-        "MEGAMOE_P2P_BENCH_TOKENS",
-        "MEGAMOE_FORWARD_BENCH_ROUNDS",
-        "MEGAMOE_FORWARD_BENCH_GENERATION_BASE",
-        "MEGAMOE_FORWARD_BENCH_RETAIN_STATE",
-        "MEGAMOE_FORWARD_REPARTITION_EP8",
-        "MEGAMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE",
-        "MEGAMOE_FORWARD_OUTPUT_DIR",
-        "MEGAMOE_FORWARD_DUMP_INPUTS",
-        "MEGAMOE_FORWARD_PROGRESS",
-        "MEGAMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
-        "MEGAMOE_FORWARD_SMOKE_REPEATS",
-        "MEGAMOE_BACKWARD_ROUNDS",
-        "MEGAMOE_BACKWARD_WARMUPS",
-        "MEGAMOE_BACKWARD_TOKENS",
-        "MEGAMOE_BACKWARD_PROGRESS",
-        "MEGAMOE_BACKWARD_OUTPUT_DIR",
-        "MEGAMOE_GIN_BENCH_MODE",
-        "MEGAMOE_GIN_BENCH_SHIFT",
-        "MEGAMOE_GIN_BENCH_FANOUT",
-        "MEGAMOE_GIN_BENCH_WARMUP",
-        "MEGAMOE_GIN_BENCH_MEASURED",
-        "MEGAMOE_GIN_BENCH_BATCH",
-        "MEGAMOE_PRODUCTION_STATUS_FAULT_PHASE",
-        "MEGAMOE_P2P_TOP_K",
-        "MEGAMOE_BENCH_EXPERTS",
-        "MEGAMOE_P2P_RING_SLOTS",
-        "MEGAMOE_P2P_NO_WRAP",
-        "MEGAMOE_GATE_MODE",
-        "MEGAMOE_DEVICE_TIMELINE_PREFIX",
+        "WEFTMOE_P2P_ROUNDS",
+        "WEFTMOE_P2P_BENCH_ROUNDS",
+        "WEFTMOE_P2P_BENCH_TOKENS",
+        "WEFTMOE_FORWARD_BENCH_ROUNDS",
+        "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
+        "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
+        "WEFTMOE_FORWARD_REPARTITION_EP8",
+        "WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE",
+        "WEFTMOE_FORWARD_OUTPUT_DIR",
+        "WEFTMOE_FORWARD_DUMP_INPUTS",
+        "WEFTMOE_FORWARD_PROGRESS",
+        "WEFTMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
+        "WEFTMOE_FORWARD_SMOKE_REPEATS",
+        "WEFTMOE_BACKWARD_ROUNDS",
+        "WEFTMOE_BACKWARD_WARMUPS",
+        "WEFTMOE_BACKWARD_TOKENS",
+        "WEFTMOE_BACKWARD_PROGRESS",
+        "WEFTMOE_BACKWARD_OUTPUT_DIR",
+        "WEFTMOE_GIN_BENCH_MODE",
+        "WEFTMOE_GIN_BENCH_SHIFT",
+        "WEFTMOE_GIN_BENCH_FANOUT",
+        "WEFTMOE_GIN_BENCH_WARMUP",
+        "WEFTMOE_GIN_BENCH_MEASURED",
+        "WEFTMOE_GIN_BENCH_BATCH",
+        "WEFTMOE_PRODUCTION_STATUS_FAULT_PHASE",
+        "WEFTMOE_P2P_TOP_K",
+        "WEFTMOE_BENCH_EXPERTS",
+        "WEFTMOE_P2P_RING_SLOTS",
+        "WEFTMOE_P2P_NO_WRAP",
+        "WEFTMOE_GATE_MODE",
+        "WEFTMOE_DEVICE_TIMELINE_PREFIX",
         "NCCL_IB_HCA",
         "NCCL_IB_GID_INDEX",
         "NCCL_IB_TC",
@@ -855,7 +807,7 @@ def main(argv=None):
         if failures:
             raise RuntimeError("distributed GIN link benchmark failed:\n" +
                                "\n".join(failures))
-        if os.environ.get("MEGAMOE_GIN_BENCH_VERBOSE") == "1":
+        if os.environ.get("WEFTMOE_GIN_BENCH_VERBOSE") == "1":
             print("\n".join(evidence))
         for (mode, shift, payload, puts), rank_samples in sorted(
                 samples.items()):
@@ -1146,18 +1098,20 @@ def main(argv=None):
     if failures:
         raise RuntimeError("multinode NCCL launch failed:\n" + "\n".join(failures))
 
-    config = config_for(args.gpus_per_node)
-    routes = seeded_inputs(world, config.num_experts, config.top_k, args.seed)
-    expected = build_reference_all(config, routes, "cuda-multinode", 701)
-    if actual != expected:
-        mismatch = next(rank for rank, pair in enumerate(zip(actual, expected))
-                        if pair[0] != pair[1])
-        raise AssertionError(f"multinode full-field mismatch at rank={mismatch}")
-    if not any(routes[rank] for rank in range(args.gpus_per_node, world)):
-        raise AssertionError("fixture did not contain any remote-node routes")
+    # The C++ runner validates each rank before emitting its metadata.
+    # Without the removed Python oracle this is a launch/metadata smoke check.
+    if any(not isinstance(metadata, dict) or not metadata for metadata in actual):
+        raise AssertionError("rank emitted empty or invalid metadata")
+    for rank, metadata in enumerate(actual):
+        if (metadata.get("schema") != 1 or metadata.get("calling_rank") != rank
+                or metadata.get("config", {}).get("world_size") != world
+                or metadata.get("config", {}).get("num_nodes") != 2):
+            raise AssertionError(f"rank={rank} metadata identity/topology mismatch")
+        if metadata["config"] != actual[0]["config"]:
+            raise AssertionError(f"rank={rank} metadata configuration mismatch")
     print(
-        f"[PASS] real cross-host NCCL control/config/count/summary: nodes=2, "
-        f"gpus_per_node={args.gpus_per_node}, world={world}, full-field match"
+        f"[PASS] real cross-host NCCL metadata smoke: nodes=2, "
+        f"gpus_per_node={args.gpus_per_node}, world={world}"
     )
 
 

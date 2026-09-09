@@ -10,11 +10,11 @@
 #include <unordered_set>
 #include <utility>
 
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 #include "cuda/device_notify_bridge.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 
-namespace megamoe {
+namespace weftmoe {
 
 struct LocalHistogramHandle::Impl {
   RuntimeConfig config;
@@ -2227,4 +2227,4 @@ std::vector<DispatchHandle> build_notify_dispatch_for_testing(
   return handles;
 }
 
-} // namespace megamoe
+} // namespace weftmoe

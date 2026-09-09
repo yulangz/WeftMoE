@@ -4,7 +4,7 @@
 
 #include "cuda/persistent_v3/contracts.hpp"
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 
 // The union intentionally applies to shared memory only. CUDA register
 // allocation is a whole-function compiler decision, so V3 controls register
@@ -26,4 +26,4 @@ struct alignas(1024) SharedStorage {
   } phase;
 };
 
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3

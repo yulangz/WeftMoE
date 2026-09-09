@@ -19,9 +19,9 @@
 
 #include "cuda/cuda_internal.hpp"
 #include "cuda/device_notify_bridge.hpp"
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 
 namespace {
 std::atomic<std::uint64_t> g_cuda_device_allocations{0};
@@ -34,7 +34,7 @@ std::atomic<std::uint64_t> g_cuda_device_synchronizes{0};
 std::atomic<std::uint64_t> g_cuda_h2d_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2h_bytes{0};
 std::atomic<std::uint64_t> g_cuda_d2d_bytes{0};
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
 std::atomic<std::uint8_t> g_consumer_fault{0};
 
 bool take_consumer_fault(testing::ConsumerFaultPoint point) noexcept {
@@ -51,7 +51,7 @@ constexpr bool take_consumer_fault(Point) noexcept {
 #endif
 } // namespace
 
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
 void testing::inject_next_consumer_fault(ConsumerFaultPoint point) noexcept {
   g_consumer_fault.store(static_cast<std::uint8_t>(point));
 }
@@ -76,7 +76,7 @@ void record_cuda_api(CudaApiAuditKind kind, std::uint64_t bytes) noexcept {
 }
 } // namespace internal
 
-#if MEGAMOE_BUILD_TESTING
+#if WEFTMOE_BUILD_TESTING
 testing::CudaApiAuditSnapshot testing::cuda_api_audit_snapshot() noexcept {
   return {g_cuda_device_allocations.load(), g_cuda_device_frees.load(),
           g_cuda_pinned_allocations.load(), g_cuda_pinned_frees.load(),
@@ -1488,7 +1488,7 @@ __global__ void materialize_signals_kernel(DeviceMaterializeArgs a) {
       expected, expected, node, source_node, source_rank, a.rank, rail, 0};
 }
 
-#if !MEGAMOE_DEBUG_VALIDATE
+#if !WEFTMOE_DEBUG_VALIDATE
 __global__ void publish_materialization_status_kernel(
     const DeviceMaterializationStatus *source,
     DeviceMaterializationStatus *mapped_status,
@@ -3565,7 +3565,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   const auto &dl = state->device_layout;
   auto *base = state->allocation->device_ptr;
   const auto rank = context.calling_rank();
-#if !MEGAMOE_DEBUG_VALIDATE
+#if !WEFTMOE_DEBUG_VALIDATE
   auto *host_ready = at<std::uint32_t>(
       state->allocation->host_ptr,
       state->host_layout.materialization_ready);
@@ -3782,7 +3782,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(prefix planning start)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   materialize_prefix_plan_kernel<<<1, 1, 0, exec->stream>>>(args);
 #else
   materialize_plan_init_kernel<<<1, 1, 0, exec->stream>>>(args);
@@ -4023,7 +4023,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       context.session().world_size(), context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "cudaEventRecord(materialization complete)");
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   internal::throw_cuda(
       "device-materialize",
       cudaMemcpyAsync(at<void>(state->allocation->host_ptr,
@@ -4873,4 +4873,4 @@ void validate_cuda_dispatch_metadata(const DeviceDispatchHandle &handle,
   (void)download_device_metadata_for_validation(handle, execution);
 }
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

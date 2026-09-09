@@ -1,10 +1,16 @@
-# MegaMOE
+# WeftMoE
 
-MegaMOE is a Hopper-focused Mixture-of-Experts Forward and cached-state
+> Weaving communication into computation.
+
+WeftMoE is a Hopper-focused Mixture-of-Experts Forward and cached-state
 Backward pipeline. It overlaps device-issued communication with TMA/WGMMA
 compute without a whole-grid barrier between the split transport and compute
 kernels. SwiGLU consumes BF16-rounded FC1 A/B, and each route gate is applied
 before the BF16 FC2 input cast, matching the Forward/Backward algebra.
+
+Build targets, library names, namespaces, environment variables, and paths
+use the `weftmoe` / `WEFTMOE` identifiers. Rebuild existing clients and binaries
+after the rename; the namespace, library names and environment variables changed.
 
 The current optimized contract is intentionally narrow:
 
@@ -58,14 +64,14 @@ details.
 CPU/control-plane tests:
 
 ```bash
-make BUILD_DIR=/tmp/megamoe-cpu -j8 test
+make BUILD_DIR=/tmp/weftmoe-cpu -j8 test
 ```
 
 Hopper CUDA build and core smoke tests:
 
 ```bash
 export LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib
-make BUILD_DIR=/tmp/megamoe-sm90 ENABLE_CUDA=1 \
+make BUILD_DIR=/tmp/weftmoe-sm90 ENABLE_CUDA=1 \
   CUDA_ARCH_FLAGS='-gencode arch=compute_90a,code=sm_90a' -j8 cuda-test
 ```
 
@@ -73,7 +79,7 @@ Single-node Forward validation:
 
 ```bash
 python3 tests/run_local_activation_p2p.py \
-  --binary /tmp/megamoe-sm90/test_cuda_notify \
+  --binary /tmp/weftmoe-sm90/test_cuda_notify \
   --world 8 --forward-smoke
 ```
 
@@ -138,7 +144,7 @@ generated-kernel change.
 ## Repository layout
 
 ```text
-include/megamoe/                 installed API
+include/weftmoe/                 installed API
 src/metadata/                    deterministic Notify materialization
 src/cuda/forward/                Forward runtime, launch, and kernel pieces
 src/cuda/persistent_v3/forward/  split role pipelines and queues
@@ -146,7 +152,7 @@ src/cuda/backward/               cached-state Backward contract and launch
 src/cuda/persistent_v3/backward/ split Backward transport/compute scheduler
 src/cuda/testing/                non-installed CUDA probes
 tests/                           focused control, CUDA, and launcher tests
-benchmarks/                      MegaMOE/Megatron comparisons and oracles
+benchmarks/                      WeftMoE/Megatron comparisons and oracles
 configs/                         explicit autotune plans
 tools/                           tuning, SASS, and timeline utilities
 ```

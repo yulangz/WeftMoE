@@ -2,10 +2,10 @@
 
 #include "cuda/persistent_v3/roles/common.cuh"
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 
 #if defined(__CUDACC__)
-MEGAMOE_V3_DEVICE inline std::uint32_t
+WEFTMOE_V3_DEVICE inline std::uint32_t
 try_claim_ready_task(ScoreboardTask *tasks, std::uint32_t task_count,
                      PaddedCounter &scan_cursor, unsigned long long epoch) {
   if (task_count == 0U)
@@ -16,4 +16,4 @@ try_claim_ready_task(ScoreboardTask *tasks, std::uint32_t task_count,
 }
 #endif
 
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3

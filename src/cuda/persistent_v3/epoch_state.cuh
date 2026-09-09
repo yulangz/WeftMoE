@@ -5,7 +5,7 @@
 
 #include "cuda/persistent_v3/contracts.hpp"
 
-namespace megamoe::cuda::persistent_v3 {
+namespace weftmoe::cuda::persistent_v3 {
 
 // Hopper's L2 sector and the system-visible atomics used by the transport
 // path make false sharing between producer and consumer cursors expensive.
@@ -41,4 +41,4 @@ struct alignas(128) GenerationState {
   PipelineProgress pipeline;
 };
 
-} // namespace megamoe::cuda::persistent_v3
+} // namespace weftmoe::cuda::persistent_v3

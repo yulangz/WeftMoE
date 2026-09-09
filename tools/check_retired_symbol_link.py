@@ -10,7 +10,7 @@ import tempfile
 
 
 RETIRED = (
-    "_ZN7megamoe4cuda39download_device_metadata_for_validation"
+    "_ZN7weftmoe4cuda39download_device_metadata_for_validation"
     "ERKNS0_20DeviceDispatchHandleERKNS0_13CudaExecutionE"
 )
 
@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library-dir", required=True, type=pathlib.Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="megamoe-retired-link-") as directory:
+    with tempfile.TemporaryDirectory(prefix="weftmoe-retired-link-") as directory:
         root = pathlib.Path(directory)
         source = root / "retired.cpp"
         source.write_text(
@@ -28,7 +28,7 @@ def main() -> int:
             encoding="utf-8",
         )
         result = subprocess.run(
-            ["c++", str(source), f"-L{args.library_dir}", "-lmegamoe",
+            ["c++", str(source), f"-L{args.library_dir}", "-lweftmoe",
              f"-Wl,-rpath,{args.library_dir}", "-o", str(root / "retired")],
             text=True, capture_output=True,
         )

@@ -4,7 +4,7 @@
 
 #include "cuda/persistent_v3/queues.cuh"
 
-namespace megamoe::cuda::persistent_v3::backward {
+namespace weftmoe::cuda::persistent_v3::backward {
 
 inline constexpr std::uint32_t kDabPhaseTileCapacity = 128U;
 // Keep raw tile completion distinct from publication after the final
@@ -23,7 +23,7 @@ struct BackwardMblockDescriptor {
 static_assert(sizeof(BackwardMblockDescriptor) == 16U);
 static_assert(kCounterWords == 16U);
 
-MEGAMOE_V3_HOST_DEVICE constexpr unsigned long long
+WEFTMOE_V3_HOST_DEVICE constexpr unsigned long long
 backward_dx_ready_value(std::uint32_t tiles) {
   return kDxMblockReady | static_cast<unsigned long long>(tiles);
 }
@@ -58,12 +58,12 @@ struct BackwardSchedulerLayout {
   std::uint64_t total_words = 0ULL;
 };
 
-MEGAMOE_V3_HOST_DEVICE constexpr std::uint64_t
+WEFTMOE_V3_HOST_DEVICE constexpr std::uint64_t
 align_backward_scheduler_words(std::uint64_t words) {
   return (words + kCounterWords - 1ULL) & ~(kCounterWords - 1ULL);
 }
 
-MEGAMOE_V3_HOST_DEVICE constexpr BackwardSchedulerLayout
+WEFTMOE_V3_HOST_DEVICE constexpr BackwardSchedulerLayout
 make_backward_scheduler_layout(std::uint64_t mblocks,
                                std::uint32_t dx_tiles,
                                std::uint64_t experts) {
@@ -125,4 +125,4 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
   return layout;
 }
 
-} // namespace megamoe::cuda::persistent_v3::backward
+} // namespace weftmoe::cuda::persistent_v3::backward

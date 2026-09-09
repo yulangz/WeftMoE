@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Summarize per-GPU MegaMOE %globaltimer traces.
+"""Summarize per-GPU WeftMoE %globaltimer traces.
 
 Timestamps are never compared across ranks. Every duration is formed within
 one rank/CTA/channel and aggregate percentiles are computed only afterwards.

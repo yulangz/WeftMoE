@@ -8,14 +8,14 @@
 #include <utility>
 #include <vector>
 
-#include "megamoe/metadata/serialize.hpp"
+#include "weftmoe/metadata/serialize.hpp"
 
 namespace {
 
-megamoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
+weftmoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
                                    std::uint32_t experts, std::uint32_t top_k,
                                    std::uint32_t mtile) {
-    megamoe::RuntimeConfig config;
+    weftmoe::RuntimeConfig config;
     config.num_experts = experts;
     config.top_k = top_k;
     config.m_tile_rows = mtile;
@@ -34,7 +34,7 @@ megamoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
     return config;
 }
 
-std::vector<megamoe::RankRoutingInput> seeded_inputs(std::uint32_t world_size,
+std::vector<weftmoe::RankRoutingInput> seeded_inputs(std::uint32_t world_size,
                                                      std::uint32_t experts,
                                                      std::uint32_t top_k,
                                                      std::uint64_t seed) {
@@ -42,7 +42,7 @@ std::vector<megamoe::RankRoutingInput> seeded_inputs(std::uint32_t world_size,
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
         return seed;
     };
-    std::vector<megamoe::RankRoutingInput> inputs(world_size);
+    std::vector<weftmoe::RankRoutingInput> inputs(world_size);
     for (std::uint32_t rank = 0; rank < world_size; ++rank) {
         inputs[rank].num_tokens = next() % 6U;
         for (std::uint64_t token = 0; token < inputs[rank].num_tokens;
@@ -62,31 +62,31 @@ std::vector<megamoe::RankRoutingInput> seeded_inputs(std::uint32_t world_size,
     return inputs;
 }
 
-void emit_handles(const std::vector<megamoe::DispatchHandle>& handles) {
+void emit_handles(const std::vector<weftmoe::DispatchHandle>& handles) {
     std::cout << '[';
     for (std::size_t i = 0; i < handles.size(); ++i) {
         if (i != 0)
             std::cout << ',';
-        std::cout << megamoe::serialize_dispatch_metadata(handles[i]);
+        std::cout << weftmoe::serialize_dispatch_metadata(handles[i]);
     }
     std::cout << ']';
 }
 
-std::vector<megamoe::DispatchHandle>
-build_repeat_checked(const megamoe::RuntimeConfig& config,
-                     const std::vector<megamoe::RankRoutingInput>& routes,
+std::vector<weftmoe::DispatchHandle>
+build_repeat_checked(const weftmoe::RuntimeConfig& config,
+                     const std::vector<weftmoe::RankRoutingInput>& routes,
                      const std::string& communicator,
                      std::uint64_t generation) {
-    auto first = megamoe::build_notify_dispatch_for_testing(
+    auto first = weftmoe::build_notify_dispatch_for_testing(
         config, routes, communicator, generation);
-    const auto second = megamoe::build_notify_dispatch_for_testing(
+    const auto second = weftmoe::build_notify_dispatch_for_testing(
         config, routes, communicator, generation);
     if (first.size() != second.size()) {
         throw std::runtime_error("repeat handle count mismatch");
     }
     for (std::size_t rank = 0; rank < first.size(); ++rank) {
-        if (megamoe::serialize_dispatch_metadata(first[rank]) !=
-            megamoe::serialize_dispatch_metadata(second[rank])) {
+        if (weftmoe::serialize_dispatch_metadata(first[rank]) !=
+            weftmoe::serialize_dispatch_metadata(second[rank])) {
             throw std::runtime_error("byte-for-byte repeat mismatch at rank=" +
                                      std::to_string(rank) + ", communicator='" +
                                      communicator + "'");
@@ -102,7 +102,7 @@ int main() {
 
     auto targeted_config = make_config(2, 2, 6, 3, 4);
     targeted_config.topology.expert_to_rank = {0, 1, 2, 3, 2, 3};
-    std::vector<megamoe::RankRoutingInput> targeted_routes(4);
+    std::vector<weftmoe::RankRoutingInput> targeted_routes(4);
     targeted_routes[0] = {2, {2, 4, 3, 0, 2, 5}};
     std::cout << "\"targeted\":";
     emit_handles(build_repeat_checked(targeted_config, targeted_routes,
@@ -128,14 +128,14 @@ int main() {
     }
 
     const auto many_config = make_config(73, 1, 73, 2, 8);
-    std::vector<megamoe::RankRoutingInput> many_routes(73);
+    std::vector<weftmoe::RankRoutingInput> many_routes(73);
     many_routes[0] = {1, {0, 72}};
     std::cout << ",\"many_nodes\":";
     emit_handles(
         build_repeat_checked(many_config, many_routes, "cross-nodes", 23));
 
     auto skew_config = make_config(2, 2, 8, 2, 4);
-    std::vector<megamoe::RankRoutingInput> skew_routes(4);
+    std::vector<weftmoe::RankRoutingInput> skew_routes(4);
     skew_routes[0] = {3, {0, 1, 0, 2, 0, 3}};
     skew_routes[1] = {2, {0, 4, 0, 5}};
     skew_routes[3] = {1, {0, 6}};

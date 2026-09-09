@@ -6,10 +6,10 @@
 
 #include "cuda/device_notify_internal.hpp"
 #define private public
-#include "megamoe/cuda/nccl_count_exchange.hpp"
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
 #undef private
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 
 namespace testing {
 CudaNotifyGenerationCoordinator make_unpooled_coordinator_for_testing(
@@ -234,4 +234,4 @@ private:
   friend class CudaNotifyGenerationCoordinator;
 };
 
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

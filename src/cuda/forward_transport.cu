@@ -1,6 +1,6 @@
 #include "cuda/primitives/hopper.cuh"
 // Dedicated transport grid compilation; compute keeps its own register budget.
-#define MEGAMOE_FORWARD_TRANSPORT_TU 1
+#define WEFTMOE_FORWARD_TRANSPORT_TU 1
 
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/forward/transport_launch.hpp"
@@ -47,13 +47,13 @@
 #include "cuda/persistent_v3/roles/common.cuh"
 #include "cuda/profiling/device_timeline.cuh"
 #include "cuda/transport_generation_completion.cuh"
-#include "megamoe/api/errors.hpp"
+#include "weftmoe/api/errors.hpp"
 
-#ifndef MEGAMOE_FORWARD_LIGHT_PROGRESS
-#define MEGAMOE_FORWARD_LIGHT_PROGRESS 0
+#ifndef WEFTMOE_FORWARD_LIGHT_PROGRESS
+#define WEFTMOE_FORWARD_LIGHT_PROGRESS 0
 #endif
 
-namespace megamoe::cuda {
+namespace weftmoe::cuda {
 struct ActivationMegaKernelBackendState;
 namespace {
 
@@ -107,4 +107,4 @@ cudaError_t launch_local(const cudaLaunchConfig_t *config,
 }
 
 } // namespace forward_transport_launch
-} // namespace megamoe::cuda
+} // namespace weftmoe::cuda

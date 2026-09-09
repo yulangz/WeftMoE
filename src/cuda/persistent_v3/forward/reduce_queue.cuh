@@ -43,7 +43,7 @@ __device__ __forceinline__ void publish_ready_route(
   // setup_ready releases producers, so token+1 is both the payload and the
   // release marker without a second queue-sized epoch array.
   auto encoded = token + 1ULL;
-#if MEGAMOE_DEVICE_TIMELINE
+#if WEFTMOE_DEVICE_TIMELINE
   // Profiling builds tag the otherwise-unused high byte so the source-local
   // Reduce consumer can attribute the exact token-ready observation without
   // comparing clocks from the peer GPU that published it.

@@ -10,9 +10,9 @@
 #include <mutex>
 #include <vector>
 
-#include "megamoe/cuda/nccl_count_exchange.hpp"
+#include "weftmoe/cuda/nccl_count_exchange.hpp"
 
-namespace megamoe::cuda::internal {
+namespace weftmoe::cuda::internal {
 
 enum class CudaApiAuditKind {
   DeviceAllocate,
@@ -138,4 +138,4 @@ void throw_nccl(const char *phase, ncclResult_t error, std::uint32_t rank,
 std::shared_ptr<const CudaExecutionState>
 checked_execution_state(const CudaExecution &execution);
 
-} // namespace megamoe::cuda::internal
+} // namespace weftmoe::cuda::internal

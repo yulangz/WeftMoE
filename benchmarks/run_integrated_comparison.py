@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run independent MegaMOE/Megatron full Forward baselines and compare E2E.
+"""Run independent WeftMoE/Megatron full Forward baselines and compare E2E.
 
 Only comparable host-wall, slowest-rank integrated measurements enter the
 reported speedup. Component means are retained for diagnosis, never summed to
@@ -33,13 +33,13 @@ def verify_fixture_agreement(mega_runs, megatron_launches):
         for run_index, run_record in enumerate(mega_runs):
             if run_record.get(field) != mega_values:
                 raise RuntimeError(
-                    f"MegaMOE fixture changed field={field} run={run_index}")
+                    f"WeftMoE fixture changed field={field} run={run_index}")
         for run_index, launch in enumerate(megatron_launches):
             actual = launch.get(field)
             if actual != mega_values:
                 raise RuntimeError(
                     f"fixture mismatch field={field} run={run_index} "
-                    f"MegaMOE={mega_values} Megatron={actual}")
+                    f"WeftMoE={mega_values} Megatron={actual}")
         agreement[field] = mega_values
     return agreement
 
@@ -111,7 +111,7 @@ def main():
             "MEGATRON_BASELINE_JSON "))
 
     # Preserve one self-contained Megatron record while making the aggregate
-    # explicitly span separate process/NCCL-session launches, just as MegaMOE.
+    # explicitly span separate process/NCCL-session launches, just as WeftMoE.
     megatron = dict(megatron_launches[0])
     megatron["runs"] = [launch["runs"][0]
                          for launch in megatron_launches]
@@ -166,7 +166,7 @@ def main():
             "rank_aggregation": "MAX",
             "clock": "host wall through output-ready and required drain",
         },
-        "megamoe_integrated_e2e_ms": {
+        "weftmoe_integrated_e2e_ms": {
             "per_run_mean": mega_means_ms,
             "mean": mega_mean,
             "variance": statistics.pvariance(mega_means_ms),
@@ -193,7 +193,7 @@ def main():
             "byte_identical": False,
             "status": "not asserted by timing-only invocation",
         },
-        "megamoe_runs": mega_runs,
+        "weftmoe_runs": mega_runs,
         "megatron": megatron,
         "environment_overrides": {
             key: environment[key] for key in (
@@ -201,12 +201,12 @@ def main():
                 "NCCL_P2P_LEVEL", "NCCL_DEBUG") if key in environment
         },
         "runtime_parity": {
-            "megamoe_nccl_runtime_versions": sorted(mega_nccl),
+            "weftmoe_nccl_runtime_versions": sorted(mega_nccl),
             "megatron_torch_nccl_version": megatron_nccl,
             "megatron_torch_build_nccl_version":
                 megatron_launches[0]["torch_nccl_version"],
             "nccl_versions_identical": mega_nccl == {megatron_nccl},
-            "megamoe_loaded_libraries": sorted({
+            "weftmoe_loaded_libraries": sorted({
                 library for item in mega_runs
                 for library in item["per_rank_nccl_library"]}),
             "cpu_affinity": sorted(os.sched_getaffinity(0)),

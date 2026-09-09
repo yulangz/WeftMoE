@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace megamoe::cuda::transport_state {
+namespace weftmoe::cuda::transport_state {
 
 enum class TaskClass : std::uint32_t {
   DispatchWave = 0,
@@ -19,7 +19,7 @@ enum class TaskClass : std::uint32_t {
 
 constexpr std::size_t kTaskClassCount =
     static_cast<std::size_t>(TaskClass::Count);
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
 constexpr std::size_t kForwardDebugCtas = 160;
 #endif
 
@@ -60,7 +60,7 @@ struct GenerationCompletionVector {
   unsigned long long first_wait_expected;
   unsigned long long first_wait_arrived;
   unsigned long long tile_waiter_count;
-#if MEGAMOE_DEBUG_VALIDATE
+#if WEFTMOE_DEBUG_VALIDATE
   std::array<unsigned long long, 8> first_wait_arrived_by_rail;
   // Aggregate CTA checkpoints isolate a Forward FC2 stall without adding any
   // instrumentation to release kernels. A count drop between adjacent phases
@@ -126,4 +126,4 @@ constexpr std::size_t completion_debug_words(std::size_t contexts) {
   return kGenerationCompletionWords + contexts * kContextCompletionWords;
 }
 
-} // namespace megamoe::cuda::transport_state
+} // namespace weftmoe::cuda::transport_state

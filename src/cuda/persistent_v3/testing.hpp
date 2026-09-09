@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace megamoe::cuda::testing {
+namespace weftmoe::cuda::testing {
 
 struct PersistentV3ProtocolProbeResult {
   std::uint32_t sm_count = 0;
@@ -40,4 +40,4 @@ struct BackwardSchedulerProbeResult {
 
 BackwardSchedulerProbeResult run_backward_scheduler_probe();
 
-} // namespace megamoe::cuda::testing
+} // namespace weftmoe::cuda::testing
