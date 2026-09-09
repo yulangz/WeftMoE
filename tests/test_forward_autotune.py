@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import re
 import sys
 import tempfile
@@ -37,6 +38,11 @@ def makefile_list(variable: str) -> tuple[str, ...]:
     raise AssertionError(f"Makefile variable {variable} is absent")
 
 
+def grid_count(topology):
+    source = json.loads((ROOT / f"configs/forward_h200_{topology}_autotune.json").read_text())
+    return math.prod(len(values) for group in source.values() for values in group.values())
+
+
 class ForwardAutotuneTest(unittest.TestCase):
     def test_local_runtime_library_path_precedes_inherited_libraries(self):
         benchmark = dict(self.plan["benchmark"], launcher="local", world=8,
@@ -52,28 +58,28 @@ class ForwardAutotuneTest(unittest.TestCase):
                              "/cuda/compat:/runtime/nccl:/inherited")
 
     def test_global_grids_cover_combinations_and_preserve_incumbents(self):
-        for topology, legacy, count, rdma in (
-            ("single_node", "forward_h200_single_node_autotune.json", 128, 0),
-            ("multi_node", "forward_h200_multi_node_autotune.json", 96, 8),
+        for topology, legacy, rdma in (
+            ("single_node", "forward_h200_single_node_autotune.json", 0),
+            ("multi_node", "forward_h200_multi_node_autotune.json", 8),
         ):
             plan = tune.load_plan(ROOT / "configs" /
                                   f"forward_h200_{topology}_autotune.json",
-                                  model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
+                                  model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
+                                  system={"nodes": 1 if rdma == 0 else 2})
             candidates = tune.expand_candidates(plan)
             source = json.loads((ROOT / "configs" / legacy).read_text())
-            baseline = {"config": {k: v[0] for group in source.values() for k, v in group.items()}}
+            baseline = {"config": {k: v[0] for k, v in
+                                   tune.flatten_groups(source, require_all=False).items()}}
             baseline["config"].update(main_hidden=7168, main_intermediate=3072)
-            self.assertEqual(len(candidates), count)
+            self.assertEqual(len(candidates), grid_count(topology))
             self.assertEqual(candidates[0]["name"], "incumbent")
             self.assertEqual(candidates[0]["config"], baseline["config"])
             for c in candidates:
                 self.assertEqual(c["config"]["rdma_ctas"], rdma)
                 self.assertEqual(set(c["config"]), set(tune.PARAMETER_MACROS))
-            if rdma == 0:
-                self.assertTrue(any(c["config"]["relay_ctas"] == 32 and
-                                    c["config"]["local_return_batch_mblocks"] == 8 and
-                                    c["config"]["local_dispatch_tma_warps"] == 8
-                                    for c in candidates))
+            # Check coverage of caller-editable axes, not historical default values.
+            for key, values in tune.flatten_groups(source, require_all=False).items():
+                self.assertEqual({c["config"][key] for c in candidates}, set(values))
 
     def test_grid_rejects_missing_duplicate_invalid_and_oversized_axes(self):
         source = json.loads((ROOT / "configs" /
@@ -123,7 +129,7 @@ class ForwardAutotuneTest(unittest.TestCase):
                                             experts=512, top_k=8), system={"world": 16})
         multi = tune.load_plan(ROOT / "configs/forward_h200_multi_node_autotune.json",
                               model=dict(hidden=2560, intermediate=768, experts=512, top_k=8),
-                              system={"remote": "root@example", "socket_ifname": "eth1"})
+                              system={"ep": 16, "remote": "root@example", "socket_ifname": "eth1"})
         self.assertTrue(multi["benchmark"]["enable_ib"])
         self.assertEqual(multi["benchmark"]["socket_ifname"], "eth1")
 
@@ -139,7 +145,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.plan = tune.load_plan(
             ROOT / "configs" / "forward_h200_multi_node_autotune.json",
             model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
-            system={"remote": "root@example"})
+            system={"ep": 16, "remote": "root@example"})
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_removed_reduce_divisor_legacy_migration(self):
@@ -173,7 +179,7 @@ class ForwardAutotuneTest(unittest.TestCase):
             "confirmation_rounds": 60,
             "minimum_improvement_percent": 0.5,
         })
-        self.assertEqual(len(self.candidates), 96)
+        self.assertEqual(len(self.candidates), grid_count("multi_node"))
         self.assertLessEqual(len(self.candidates), self.plan["max_candidates"])
         for candidate in self.candidates:
             self.assertEqual(set(candidate["config"]),
@@ -184,11 +190,13 @@ class ForwardAutotuneTest(unittest.TestCase):
             ROOT / "configs" / "forward_h200_single_node_autotune.json",
             model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
         candidates = tune.expand_candidates(plan)
-        self.assertEqual(len(candidates), 128)
+        self.assertEqual(len(candidates), grid_count("single_node"))
         selected = candidates[0]["config"]
         self.assertEqual(selected["rdma_ctas"], 0)
-        self.assertEqual(selected["relay_ctas"], 16)
-        self.assertEqual(selected["local_dispatch_tma_warps"], 4)
+        self.assertEqual(selected["relay_ctas"], 8)
+        source = json.loads((ROOT / "configs/forward_h200_single_node_autotune.json").read_text())
+        self.assertEqual(selected["local_dispatch_tma_warps"],
+                         source["2_transport"]["local_dispatch_tma_warps"][0])
 
     def test_benchmark_workload_is_explicit(self):
         benchmark = self.plan["benchmark"]
@@ -209,21 +217,21 @@ class ForwardAutotuneTest(unittest.TestCase):
             flags=re.MULTILINE))
         self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
 
-    def test_cpp_defaults_match_explicit_production_point(self):
+    def test_cpp_defaults_form_a_valid_tuning_point(self):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         cpp_defaults = dict(re.findall(
             r"^#define (MEGAMOE_FWD_[A-Z0-9_]+) ([0-9]+)$", header,
             flags=re.MULTILINE))
-        production = self.candidates[0]["config"]
+        config = {}
         for key, macro in tune.PARAMETER_MACROS.items():
-            expected = production[key]
+            value = int(cpp_defaults[macro])
             if key in tune.BOOLEAN_PARAMETERS:
-                expected = int(expected)
+                value = bool(value)
             elif key in tune.ENUM_PARAMETERS:
-                expected = tune.ENUM_PARAMETERS[key][expected]
-            self.assertEqual(int(cpp_defaults[macro]), expected,
-                             f"C++ default differs for {key}")
+                value = {v: k for k, v in tune.ENUM_PARAMETERS[key].items()}[value]
+            config[key] = value
+        tune.validate_tuning(config)
 
     def test_generated_header_has_one_definition_per_parameter(self):
         candidate = self.candidates[0]

@@ -20,6 +20,9 @@ from typing import Any, Mapping
 
 from autotune_common import (
     resolve_runtime_settings,
+    resolve_parallel_settings,
+    constrain_transport_space,
+    validate_execution_topology,
     PlanError,
     candidate_digest,
     choose_confirmed_candidate,
@@ -38,7 +41,6 @@ from forward_jit import BackwardJitCompiler, JitError, validate_jit_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "backward_h200_multi_node_autotune.json"
 GROUP_NAMES = (
     "1_gemm",
     "2_transport",
@@ -167,7 +169,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
 
     require(config["rdma_ctas"] in (0, 8),
             "RDMA CTAs must be zero for local or eight for GIN")
-    require_choice(config, "relay_ctas", (8, 12, 16, 20, 24))
+    require(config["relay_ctas"] >= 8 and config["relay_ctas"] % 4 == 0,
+            "relay_ctas must be >=8 and a multiple of 4")
     require_choice(config, "dispatch_batch_rows", (12, 16, 32, 64, 128))
     require_choice(config, "gin_max_inflight", (8, 16, 24, 32, 64))
     for key in ("setup_threads", "reduce_threads"):
@@ -189,11 +192,12 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
 def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | None,
                       benchmark: Mapping[str, Any] | None = None,
                       system: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    topology, jit_overrides = resolve_runtime_settings(
+        model=model, system=system, repo_root=REPO_ROOT)
+    space = constrain_transport_space(space, topology)
     flat = flatten_groups(space, require_all=False)
     require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
             "hyperparameters must cover every tuning parameter and exclude model dimensions")
-    topology, jit_overrides = resolve_runtime_settings(
-        model=model, rdma=flat.get("rdma_ctas"), system=system, repo_root=REPO_ROOT)
     count = 1
     for key, values in flat.items():
         require(isinstance(values, list) and values, f"{key} must be a non-empty array")
@@ -236,6 +240,13 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     require(isinstance(document, dict), "top-level plan must be an object")
+    if "schema" in document and any(k in (system or {}) for k in ("ep", "nodes", "gpus_per_node")):
+        requested = resolve_parallel_settings(system)
+        frozen = document.get("benchmark", {})
+        actual_nodes = frozen.get("nodes", 1 if frozen.get("launcher") == "local" else 2)
+        actual_gpus = frozen.get("gpus_per_node", frozen.get("world", 8))
+        require(requested["nodes"] == actual_nodes and requested["gpus_per_node"] == actual_gpus,
+                "explicit parallel settings conflict with frozen plan topology")
     if "schema" not in document:
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     require(document.get("schema") == 1, "Backward plan schema must be 1")
@@ -481,6 +492,7 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any], *,
             "--backward-tokens", str(int(benchmark["tokens_per_rank"])),
             "--top-k", str(int(benchmark["top_k"])),
         ]
+    validate_execution_topology(benchmark)
     command = [
         sys.executable,
         str(REPO_ROOT / "tests" / "run_multinode_nccl.py"),
@@ -661,7 +673,10 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, help="hyperparameter file; default chosen from topology")
+    parser.add_argument("--ep", type=int, help="EP world size; must equal nodes * gpus-per-node")
+    parser.add_argument("--nodes", type=int, help="node count (default: 1, or ep / gpus-per-node)")
+    parser.add_argument("--gpus-per-node", type=int, help="GPUs per node (default: 8)")
     parser.add_argument("--system-config", type=Path)
     for key in ("hidden", "intermediate", "experts", "top-k", "tokens"):
         parser.add_argument("--" + key, type=int)
@@ -689,7 +704,6 @@ def main(argv: list[str] | None = None) -> int:
             "--generate-only and --build-only are mutually exclusive")
     require(not args.build_only or args.candidate,
             "--build-only requires at least one explicit --candidate")
-    config_path = args.config.resolve()
     model = {key: getattr(args, key) for key in ("hidden", "intermediate", "experts", "top_k")}
     system = {}
     if args.system_config:
@@ -698,14 +712,20 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError) as error:
             raise PlanError(f"cannot read system config: {error}") from error
         require(isinstance(system, dict), "system config must be an object")
-    for key in ("remote", "port", "nccl_lib_dir"):
+    for key in ("ep", "nodes", "gpus_per_node", "remote", "port", "nccl_lib_dir"):
         if getattr(args, key) is not None:
             system[key] = getattr(args, key)
+    parallel = resolve_parallel_settings(system)
+    topology_name = "single_node" if parallel["nodes"] == 1 else "multi_node"
+    config_path = (args.config or REPO_ROOT / "configs" /
+                   f"backward_h200_{topology_name}_autotune.json").resolve()
     plan = load_plan(config_path, model=model, system=system,
                      benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None)
     if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher") == "multinode":
         require(bool(plan["benchmark"].get("remote")), "multinode benchmark requires --remote or system.remote")
     _configure_from_cli(plan, args)
+    if not args.generate_only and not args.build_only:
+        validate_execution_topology(plan["benchmark"])
     validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)
     requested = set(args.candidate)
@@ -738,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         write_result(output_path, {
             "schema": 1, "mode": "generate-only",
+            "benchmark": copy.deepcopy(plan["benchmark"]),
             "config_path": str(config_path), "candidates": generated,
         })
         print(f"generated {len(generated)} specializations: {output_path}")

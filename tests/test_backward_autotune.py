@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import re
 import sys
 import tempfile
@@ -17,16 +18,21 @@ import autotune_backward as tune  # noqa: E402
 import forward_jit  # noqa: E402
 
 
+def grid_count(topology):
+    source = json.loads((ROOT / f"configs/backward_h200_{topology}_autotune.json").read_text())
+    return math.prod(len(values) for group in source.values() for values in group.values())
+
+
 class BackwardAutotuneTest(unittest.TestCase):
     def setUp(self):
         self.plan = tune.load_plan(
             ROOT / "configs" / "backward_h200_multi_node_autotune.json",
             model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
-            system={"remote": "root@example"})
+            system={"ep": 16, "remote": "root@example"})
         self.candidates = tune.expand_candidates(self.plan)
 
     def test_multinode_plan_is_narrow_complete_and_unique(self):
-        self.assertEqual(len(self.candidates), 192)
+        self.assertEqual(len(self.candidates), grid_count("multi_node"))
         self.assertLessEqual(len(self.candidates),
                              self.plan["max_candidates"])
         self.assertEqual(self.plan["invariants"], tune.EXPECTED_INVARIANTS)
@@ -39,16 +45,16 @@ class BackwardAutotuneTest(unittest.TestCase):
             ROOT / "configs" / "backward_h200_single_node_autotune.json",
             model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6))
         candidates = tune.expand_candidates(plan)
-        self.assertEqual(len(candidates), 288)
+        self.assertEqual(len(candidates), grid_count("single_node"))
         self.assertEqual(plan["benchmark"]["launcher"], "local")
-        self.assertEqual(candidates[0]["config"]["relay_ctas"], 12)
+        self.assertEqual(candidates[0]["config"]["relay_ctas"], 8)
         self.assertEqual(candidates[0]["config"]["rdma_ctas"], 0)
         self.assertEqual(candidates[0]["config"]["dispatch_batch_rows"], 16)
         self.assertEqual(candidates[0]["config"]["dw2_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["dw1_claim_tiles"], 4)
         self.assertEqual(candidates[0]["config"]["ready_word_stagger"], 0)
         self.assertEqual(candidates[0]["config"]["activation_owner_group"], 4)
-        self.assertTrue(any(c["config"]["dispatch_batch_rows"] == 12 for c in candidates))
+        self.assertEqual({c["config"]["dispatch_batch_rows"] for c in candidates}, {16, 32})
 
     def test_dynamic_model_and_system_defaults(self):
         path = ROOT / "configs/backward_h200_single_node_autotune.json"
@@ -91,15 +97,16 @@ class BackwardAutotuneTest(unittest.TestCase):
             flags=re.MULTILINE))
         self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
 
-    def test_cpp_defaults_match_incumbent(self):
+    def test_cpp_defaults_are_valid_independently_of_search_incumbent(self):
         header = (ROOT / "src" / "cuda" / "backward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
         defaults = dict(re.findall(
             r"^#define (MEGAMOE_BWD_[A-Z0-9_]+) ([0-9]+)$", header,
             flags=re.MULTILINE))
-        incumbent = self.candidates[0]["config"]
-        for key, macro in tune.PARAMETER_MACROS.items():
-            self.assertEqual(int(defaults[macro]), incumbent[key], key)
+        # Search order may change without changing the untuned C++ fallback.
+        config = {key: int(defaults[macro])
+                  for key, macro in tune.PARAMETER_MACROS.items()}
+        tune.validate_tuning(config)
 
     def test_generated_header_is_complete_and_stable(self):
         candidate = self.candidates[0]

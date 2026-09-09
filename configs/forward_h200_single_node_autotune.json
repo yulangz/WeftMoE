@@ -4,11 +4,9 @@
       128
     ],
     "fc1_tile_n": [
-      128,
-      64
+      128
     ],
     "fc2_tile_n": [
-      256,
       128
     ],
     "tile_k": [
@@ -53,28 +51,27 @@
       0
     ],
     "relay_ctas": [
-      16,
       8,
+      16,
       24,
-      32
+      32,
+      40
     ],
     "rdma_control_warps": [
       2
     ],
-    "relay_tma_warps": [
+    "local_return_tma_warps": [
       0,
       8
     ],
     "local_dispatch_tma_warps": [
-      4,
       8
     ],
     "relay_scatter_warps": [
       12
     ],
     "local_return_batch_mblocks": [
-      4,
-      8
+      4
     ],
     "dispatch_publish_batch_rows": [
       32

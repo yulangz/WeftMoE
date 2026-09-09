@@ -25,6 +25,9 @@ from typing import Any, Mapping
 
 from autotune_common import (
     resolve_runtime_settings,
+    resolve_parallel_settings,
+    constrain_transport_space,
+    validate_execution_topology,
     PlanError,
     candidate_digest,
     choose_confirmed_candidate,
@@ -43,7 +46,6 @@ from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "forward_h200_multi_node_autotune.json"
 GROUP_NAMES = (
     "1_gemm",
     "2_transport",
@@ -109,6 +111,9 @@ PARAMETER_MACROS = {
     "finalize_nanosleep": "MEGAMOE_FWD_FINALIZE_NANOSLEEP",
 }
 
+# Preserve internal keys/macros for running autotunes and cached candidates.
+PARAMETER_ALIASES = {"local_return_tma_warps": "relay_tma_warps"}
+
 BOOLEAN_PARAMETERS = {
     "fc2_tma_store",
     "registered_output",
@@ -148,6 +153,7 @@ def flatten_groups(groups: Mapping[str, Any], *, require_all: bool) -> dict[str,
         group = groups.get(group_name, {})
         _require(isinstance(group, dict), f"{group_name} must be an object")
         for key, value in group.items():
+            key = PARAMETER_ALIASES.get(key, key)
             _require(key in PARAMETER_MACROS,
                      f"unknown Forward parameter {group_name}.{key}")
             _require(key not in flat,
@@ -219,13 +225,14 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     # owner and tunes Relay independently in small four-CTA increments.
     _require_choice(config, "rdma_ctas", (0, 8))
     if config["rdma_ctas"] == 0:
-        _require_choice(config, "relay_ctas",
-                        (4, 8, 12, 16, 20, 24, 28, 32))
+        _require(config["relay_ctas"] >= 4 and config["relay_ctas"] % 4 == 0,
+                 "relay_ctas must be a positive multiple of 4")
         _require(config["local_dispatch_tma_warps"] <
                  config["compute_threads"] // 32,
                  "local split Relay reserves one FC1-ready publisher warp")
     else:
-        _require_choice(config, "relay_ctas", (8, 16, 24))
+        _require(config["relay_ctas"] >= config["rdma_ctas"],
+                 "relay_ctas must cover every RDMA context")
         _require(config["relay_ctas"] % config["rdma_ctas"] == 0,
                  "relay_ctas must be a multiple of rdma_ctas")
     _require(config["relay_local_return"], "local Return requires relay_local_return=true")
@@ -286,6 +293,11 @@ def expand_search_space(document: dict[str, Any]) -> None:
                  f"model.{key} must be a positive multiple of 256")
     space = copy.deepcopy(document["search_space"])
     provided = flatten_groups(space, require_all=False)
+    # Normalize without reordering axes so candidate names and overrides stay
+    # identical when a configuration adopts the new public spelling.
+    space = {group: {PARAMETER_ALIASES.get(key, key): value
+                     for key, value in values.items()}
+             for group, values in space.items()}
     _require(not (model_keys & set(provided)),
              "model dimensions belong in model, not search_space")
     _require("1_gemm" in space, "search_space omits 1_gemm")
@@ -324,9 +336,10 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
                       benchmark: Mapping[str, Any] | None = None,
                       system: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Combine hyperparameters, caller-owned workload and optional host settings."""
-    flat = flatten_groups(space, require_all=False)
     topology, jit_overrides = resolve_runtime_settings(
-        model=model, rdma=flat.get("rdma_ctas"), system=system, repo_root=REPO_ROOT)
+        model=model, system=system, repo_root=REPO_ROOT)
+    space = constrain_transport_space(space, topology)
+    flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
         "tune_rounds", "final_rounds", "timeout_seconds", "result_dir"}),
@@ -359,6 +372,13 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     _require(isinstance(document, dict), "top-level plan must be an object")
+    if "schema" in document and any(k in (system or {}) for k in ("ep", "nodes", "gpus_per_node")):
+        requested = resolve_parallel_settings(system)
+        frozen = document.get("benchmark", {})
+        actual_nodes = frozen.get("nodes", 1 if frozen.get("launcher") == "local" else 2)
+        actual_gpus = frozen.get("gpus_per_node", frozen.get("world", 8))
+        _require(requested["nodes"] == actual_nodes and requested["gpus_per_node"] == actual_gpus,
+                "explicit parallel settings conflict with frozen plan topology")
     if "schema" not in document:
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     _require(document.get("schema") in (2, 3), "plan schema must be 2 or 3")
@@ -641,6 +661,7 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any],
             "--top-k", str(int(benchmark["top_k"])),
             "--gate-mode", str(benchmark.get("gate_mode", "fixed-random")),
         ]
+    validate_execution_topology(benchmark)
     command = [
         sys.executable,
         str(REPO_ROOT / "tests" / "run_multinode_nccl.py"),
@@ -807,7 +828,10 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, help="hyperparameter file; default chosen from topology")
+    parser.add_argument("--ep", type=int, help="EP world size; must equal nodes * gpus-per-node")
+    parser.add_argument("--nodes", type=int, help="node count (default: 1, or ep / gpus-per-node)")
+    parser.add_argument("--gpus-per-node", type=int, help="GPUs per node (default: 8)")
     parser.add_argument("--system-config", type=Path)
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate", type=int)
@@ -845,7 +869,6 @@ def main(argv: list[str] | None = None) -> int:
              "--generate-only and --build-only are mutually exclusive")
     _require(not args.build_only or args.candidate,
              "--build-only requires at least one explicit --candidate")
-    config_path = args.config.resolve()
     model = {key: getattr(args, key) for key in ("hidden", "intermediate", "experts", "top_k")}
     system = None
     if args.system_config:
@@ -855,9 +878,13 @@ def main(argv: list[str] | None = None) -> int:
             raise PlanError(f"cannot read system config: {error}") from error
         _require(isinstance(system, dict), "system config must be an object")
     system = dict(system or {})
-    for key in ("remote", "port", "nccl_lib_dir"):
+    for key in ("ep", "nodes", "gpus_per_node", "remote", "port", "nccl_lib_dir"):
         if getattr(args, key) is not None:
             system[key] = getattr(args, key)
+    parallel = resolve_parallel_settings(system)
+    topology_name = "single_node" if parallel["nodes"] == 1 else "multi_node"
+    config_path = (args.config or REPO_ROOT / "configs" /
+                   f"forward_h200_{topology_name}_autotune.json").resolve()
     plan = load_plan(config_path, model=model,
                      benchmark={"tokens_per_rank": args.tokens} if args.tokens is not None else None,
                      system=system)
@@ -865,6 +892,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.generate_only and not args.build_only and plan["benchmark"].get("launcher", "multinode") == "multinode":
         _require(bool(plan["benchmark"].get("remote")),
                  "multinode benchmark requires --remote or system.remote")
+    if not args.generate_only and not args.build_only:
+        validate_execution_topology(plan["benchmark"])
     validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)
     requested = set(args.candidate)
@@ -903,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest = {
             "schema": 1,
             "mode": "generate-only",
+            "benchmark": copy.deepcopy(plan["benchmark"]),
             "config_path": str(config_path),
             "jit": copy.deepcopy(jit),
             "candidates": [

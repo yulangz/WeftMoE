@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 import hashlib
 import json
@@ -228,7 +229,50 @@ def timing_summary(result: Mapping[str, Any], elapsed: float) -> dict[str, float
     }
 
 
-def resolve_runtime_settings(*, model: Mapping[str, Any] | None, rdma: Any,
+def resolve_parallel_settings(system: Mapping[str, Any] | None = None) -> dict[str, int]:
+    """Resolve topology from caller settings only, never tuning axes or host names."""
+    settings = dict(system or {})
+    gpus = settings.get("gpus_per_node", 8)
+    nodes = settings.get("nodes")
+    ep = settings.get("ep")
+    for name, value in (("gpus_per_node", gpus), ("nodes", nodes), ("ep", ep)):
+        require(value is None or (type(value) is int and value > 0),
+                f"system.{name} must be a positive integer")
+    if nodes is None:
+        require(ep is None or ep % gpus == 0, "ep must be divisible by gpus_per_node")
+        nodes = ep // gpus if ep is not None else 1
+    require(ep is None or ep == nodes * gpus, "ep must equal nodes * gpus_per_node")
+    require("world" not in settings or (nodes == 1 and settings["world"] == gpus),
+            "system.world is a legacy local setting; use ep or nodes/gpus_per_node")
+    return dict(nodes=nodes, gpus_per_node=gpus, ep=nodes * gpus)
+
+
+def constrain_transport_space(space: Mapping[str, Any], topology: Mapping[str, Any]):
+    """Copy before constraining axes, so caller-owned grids stay unchanged."""
+    require(isinstance(space, Mapping), "hyperparameters must be an object")
+    result = copy.deepcopy(space)
+    transport = result.get("2_transport", {})
+    require(isinstance(transport, dict), "2_transport must be an object")
+    require("rdma_ctas" in transport, "hyperparameters omit rdma_ctas")
+    if topology["nodes"] == 1:
+        transport["rdma_ctas"] = [0]
+    else:
+        # Eight logical GIN owners are a kernel constraint, not the EP size.
+        require(transport["rdma_ctas"] == [8],
+                "multinode currently requires rdma_ctas=[8] (eight GIN owners)")
+    return result
+
+
+def validate_execution_topology(benchmark: Mapping[str, Any]) -> None:
+    """Keep unsupported plans away from the current two-host GIN protocol."""
+    if benchmark.get("launcher", "multinode") == "multinode":
+        require(benchmark.get("nodes", 2) == 2 and benchmark["gpus_per_node"] == 8,
+                "runtime currently supports two nodes with eight GPUs each; larger topology "
+                "plans can be generated, but require generalizing the FWD/BWD GIN protocol "
+                "and launcher before benchmarking")
+
+
+def resolve_runtime_settings(*, model: Mapping[str, Any] | None,
                              system: Mapping[str, Any] | None, repo_root: Path):
     """Resolve caller-owned model/topology and optional runtime libraries."""
     require(isinstance(model, Mapping) and
@@ -236,24 +280,22 @@ def resolve_runtime_settings(*, model: Mapping[str, Any] | None, rdma: Any,
              "model must supply hidden, intermediate, experts and top_k")
     require(all(type(v) is int and v > 0 for v in model.values()),
              "model values must be positive integers")
-    require(rdma in ([0], [8]), "rdma_ctas must be fixed to [0] or [8]")
-    local = rdma == [0]
+    parallel = resolve_parallel_settings(system)
+    local = parallel["nodes"] == 1
     settings = dict(system or {})
-    allowed = {"remote", "port", "gpus_per_node", "world", "nccl_lib_dir",
+    allowed = {"ep", "nodes", "remote", "port", "gpus_per_node", "world", "nccl_lib_dir",
                "runtime_library_path", "socket_ifname", "disable_ib", "enable_ib", "jit"}
     require(not (set(settings) - allowed), "unknown system settings")
     jit_overrides = settings.pop("jit", {})
     require(isinstance(jit_overrides, dict), "system.jit must be an object")
-    topology = {"launcher": "local", "world": 8, "disable_ib": True} if local else {
-        "launcher": "multinode", "gpus_per_node": 8, "port": 2222, "enable_ib": True}
+    require(not local or ("remote" not in settings and "enable_ib" not in settings),
+            "single-node topology cannot use remote/enable_ib; specify --nodes or --ep explicitly")
+    require(local or "disable_ib" not in settings, "multinode uses enable_ib, not disable_ib")
+    topology = {"launcher": "local", "world": parallel["ep"], "disable_ib": True} if local else {
+        "launcher": "multinode", "port": 2222, "enable_ib": True}
     topology.update(settings)
-    require((local and topology.get("world") == 8 and
-              "enable_ib" not in settings and "remote" not in settings and
-              "gpus_per_node" not in settings) or
-             (not local and topology.get("gpus_per_node") == 8 and
-              "disable_ib" not in settings and "world" not in settings),
-             "system topology conflicts with EP8/EP16 hyperparameters")
-    world = 8 if local else 16
+    topology.update(parallel)
+    world = parallel["ep"]
     require(model["experts"] % world == 0 and model["top_k"] <= model["experts"],
              "experts must divide evenly across ranks and be >= top_k")
     private_nccl = repo_root / "artifacts/gin_port_fix/build/lib"

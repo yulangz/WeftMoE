@@ -4,12 +4,10 @@
       128
     ],
     "dab_tile_n": [
-      256,
-      128
+      256
     ],
     "dx_tile_n": [
-      256,
-      128
+      256
     ],
     "dw_tile_m": [
       128
@@ -53,14 +51,14 @@
       0
     ],
     "relay_ctas": [
-      12,
       8,
       16,
-      24
+      24,
+      32,
+      40
     ],
     "dispatch_batch_rows": [
       16,
-      12,
       32
     ],
     "gin_max_inflight": [
@@ -81,9 +79,7 @@
       0
     ],
     "activation_owner_group": [
-      4,
-      2,
-      8
+      4
     ],
     "epilogue_rows_per_task": [
       12
@@ -97,8 +93,7 @@
   },
   "4_completion_reduce": {
     "reduce_threads": [
-      256,
-      128
+      256
     ],
     "reduce_idle_nanosleep": [
       256

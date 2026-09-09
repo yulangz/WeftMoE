@@ -4401,19 +4401,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::run(
           split_local_roles
               ? args.forward_relay_cta_count >=
                         std::max(4U, args.local_world_size) &&
-                    args.forward_relay_cta_count <= 32U &&
                     (args.forward_relay_cta_count % 4U) == 0U
               : args.forward_relay_cta_count >=
                         persistent_v3::kRdmaCtaCount &&
                     args.forward_relay_cta_count %
                             persistent_v3::kRdmaCtaCount ==
-                        0U &&
-                    args.forward_relay_cta_count <= 24U;
+                        0U;
       if (!valid_relay_count)
         transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                         "MEGAMOE_FORWARD_RELAY_CTAS", id.calling_rank,
-                        split_local_roles ? "one of 4, 8, ..., 32"
-                                          : "one of 8, 16, or 24",
+                        split_local_roles
+                            ? "multiple of 4, at least max(4, local_world_size)"
+                            : "positive multiple of the RDMA context count",
                         std::to_string(args.forward_relay_cta_count));
       const unsigned int kTransportBlocks =
           (split_gin_roles ? persistent_v3::kRdmaCtaCount : 0U) +
