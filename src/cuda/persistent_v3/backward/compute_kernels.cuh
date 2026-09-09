@@ -111,8 +111,8 @@ __device__ __forceinline__ void store_tma_accumulator(
     float *accum, const CUtensorMap &output_store_map,
     std::uint32_t output_row, std::uint32_t output_column,
     unsigned char *storage, bool wait_previous, bool wait_current) {
-  using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-      TileN, cute::UMMA::Major::MN, cute::UMMA::Major::MN>::type;
+  using TileMma = typename hopper::BF16MMASelector<
+      TileN, cute::SM90::GMMA::Major::MN, cute::SM90::GMMA::Major::MN>::type;
   constexpr std::uint32_t kMWaves = TileM / kStageM;
   constexpr std::uint32_t kNAtoms = TileN / 64U;
   constexpr std::uint32_t kMHalves = TileM / 128U;
@@ -150,7 +150,7 @@ __device__ __forceinline__ void store_tma_accumulator(
           warp * 16U * kSwizzleBytes +
           swizzle_row * kSwizzleBytes +
           swizzle_column * kBankGroupBytes;
-      deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+      hopper::StoreMatrixX2<__nv_bfloat162>::copy(
           __float22bfloat162_rn(make_float2(
               wave_accum[index * 4U], wave_accum[index * 4U + 1U])),
           __float22bfloat162_rn(make_float2(
@@ -180,7 +180,7 @@ __device__ __forceinline__ void store_tma_accumulator(
 
 template <std::uint32_t TileM, std::uint32_t TileN,
           std::uint32_t StorageTileN,
-          cute::UMMA::Major MajorA, cute::UMMA::Major MajorB,
+          cute::SM90::GMMA::Major MajorA, cute::SM90::GMMA::Major MajorB,
           bool TmaOutput, std::uint32_t StageCount,
           std::uint32_t BarrierOffset,
           std::uint32_t OutputOffsetElements,
@@ -197,7 +197,7 @@ __device__ __forceinline__ void run_wgmma_tile(
   static_assert(TileM == 128U || TileM == 256U);
   static_assert(TileN == 128U || TileN == 256U);
   constexpr std::uint32_t kMWaves = TileM / kStageM;
-  using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
+  using TileMma = typename hopper::BF16MMASelector<
       TileN, MajorA, MajorB>::type;
   constexpr std::uint32_t kAStageElements = TileM * kStageK;
   constexpr std::uint32_t kBStageElements = TileN * kStageK;
@@ -229,20 +229,20 @@ __device__ __forceinline__ void run_wgmma_tile(
           smem + stage * kStageStorageElements);
       auto *stage_b = stage_a + kAStageElements;
       const auto k = iteration * kStageK;
-      if constexpr (MajorA == cute::UMMA::Major::K)
-        deep_gemm::tma::copy<kStageK, TileM, 128,
+      if constexpr (MajorA == cute::SM90::GMMA::Major::K)
+        hopper::tma_load<kStageK, TileM, 128,
                              cutlass::bfloat16_t>(
             &a_map, &full[stage], stage_a, a_k + k, a_m);
       else
-        deep_gemm::tma::copy<TileM, kStageK, 128,
+        hopper::tma_load<TileM, kStageK, 128,
                              cutlass::bfloat16_t>(
             &a_map, &full[stage], stage_a, a_m, a_k + k);
-      if constexpr (MajorB == cute::UMMA::Major::K)
-        deep_gemm::tma::copy<kStageK, TileN, 128,
+      if constexpr (MajorB == cute::SM90::GMMA::Major::K)
+        hopper::tma_load<kStageK, TileN, 128,
                              cutlass::bfloat16_t>(
             &b_map, &full[stage], stage_b, b_k + k, b_n);
       else
-        deep_gemm::tma::copy<TileN, kStageK, 128,
+        hopper::tma_load<TileN, kStageK, 128,
                              cutlass::bfloat16_t>(
             &b_map, &full[stage], stage_b, b_n, b_k + k);
       full[stage].arrive_and_expect_tx(
@@ -257,11 +257,11 @@ __device__ __forceinline__ void run_wgmma_tile(
 #pragma unroll
     for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
       accum[index] = 0.0F;
-    auto a_desc = deep_gemm::mma::sm90::make_gmma_desc<
+    auto a_desc = hopper::make_gmma_desc<
         MajorA, TileM, kStageK, 128, cutlass::bfloat16_t>(
         reinterpret_cast<cutlass::bfloat16_t *>(smem),
         warpgroup * TileMma::M, 0U);
-    auto b_desc = deep_gemm::mma::sm90::make_gmma_desc<
+    auto b_desc = hopper::make_gmma_desc<
         MajorB, TileN, kStageK, 128, cutlass::bfloat16_t>(
         reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements,
         0U, 0U);
@@ -275,8 +275,8 @@ __device__ __forceinline__ void run_wgmma_tile(
       full[stage].wait(phase);
 #pragma unroll
       for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
-        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-      deep_gemm::ptx::warpgroup_arrive();
+        cute::warpgroup_fence_operand(accum[index]);
+      cute::warpgroup_arrive();
       const auto stage_desc_offset =
           stage * kStageStorageElements * sizeof(transport::BFloat16) / 16U;
 #pragma unroll
@@ -284,32 +284,32 @@ __device__ __forceinline__ void run_wgmma_tile(
 #pragma unroll
         for (std::uint32_t k = 0U; k < kStageK / TileMma::K; ++k) {
           a_desc.reg32_[0] =
-              deep_gemm::mma::sm90::advance_gmma_desc_lo<
+              hopper::advance_gmma_desc_lo<
                   MajorA, TileM, kStageK, 128,
                   cutlass::bfloat16_t>(
                   a_desc_lo + stage_desc_offset, wave * kStageM,
                   k * TileMma::K);
           b_desc.reg32_[0] =
-              deep_gemm::mma::sm90::advance_gmma_desc_lo<
+              hopper::advance_gmma_desc_lo<
                   MajorB, TileN, kStageK, 128,
                   cutlass::bfloat16_t>(
                   b_desc_lo + stage_desc_offset, 0U, k * TileMma::K);
           TileMma::wgmma(a_desc, b_desc,
                          accum + wave * TileMma::kNumAccum, 1);
         }
-      deep_gemm::ptx::warpgroup_commit_batch();
+      cute::warpgroup_commit_batch();
 #pragma unroll
       for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
-        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        cute::warpgroup_fence_operand(accum[index]);
       if (iteration != 0U) {
-        deep_gemm::ptx::warpgroup_wait<1>();
+        cute::warpgroup_wait<1>();
         const auto completed = pipeline + iteration - 1U;
         if ((threadIdx.x & 31U) == 0U)
           empty[completed % StageCount].arrive();
       }
     }
     if (iterations != 0U) {
-      deep_gemm::ptx::warpgroup_wait<0>();
+      cute::warpgroup_wait<0>();
       const auto completed = pipeline + iterations - 1U;
       if ((threadIdx.x & 31U) == 0U)
         empty[completed % StageCount].arrive();
@@ -346,8 +346,8 @@ __device__ __forceinline__ void run_k_mn_tile(
     std::uint64_t output_width, std::uint32_t output_row,
     std::uint32_t output_column,
     unsigned char *storage, std::uint32_t &pipeline) {
-  run_wgmma_tile<kStageM, TileN, StorageTileN, cute::UMMA::Major::K,
-                 cute::UMMA::Major::MN, false, kActivationStages, 0U, 0U>(
+  run_wgmma_tile<kStageM, TileN, StorageTileN, cute::SM90::GMMA::Major::K,
+                 cute::SM90::GMMA::Major::MN, false, kActivationStages, 0U, 0U>(
       activation_map, weight_mn_map, activation_map, activation_row,
       output_column, 0U,
       weight_reduction_start, reduction, output, output_width,
@@ -363,8 +363,8 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
     std::uint32_t output_row, std::uint32_t output_column,
     unsigned char *storage,
     std::uint32_t &pipeline) {
-  run_wgmma_tile<kStageM, TileN, StorageTileN, cute::UMMA::Major::K,
-                 cute::UMMA::Major::MN, true, kActivationStages, 0U, 0U>(
+  run_wgmma_tile<kStageM, TileN, StorageTileN, cute::SM90::GMMA::Major::K,
+                 cute::SM90::GMMA::Major::MN, true, kActivationStages, 0U, 0U>(
       activation_map, weight_mn_map, output_store_map, activation_row,
       output_column, 0U, weight_reduction_start, reduction, output,
       output_width, output_row, output_column, storage, pipeline);
@@ -383,8 +383,8 @@ __device__ __forceinline__ void run_mn_mn_tile(
     std::uint32_t global_output_row, const CUtensorMap &output_store_map,
     unsigned char *storage,
     std::uint32_t &pipeline) {
-  run_wgmma_tile<TileM, TileN, StorageTileN, cute::UMMA::Major::MN,
-                 cute::UMMA::Major::MN, true, kDwStages,
+  run_wgmma_tile<TileM, TileN, StorageTileN, cute::SM90::GMMA::Major::MN,
+                 cute::SM90::GMMA::Major::MN, true, kDwStages,
                  2U * kActivationStages,
                  kDwStages * stage_storage_elements<StorageTileN>(),
                  WaitPreviousStore,
@@ -410,8 +410,8 @@ __device__ __forceinline__ void run_mn_mn_chunk(
     std::uint32_t right_reduction_start, std::uint32_t reduction,
     std::uint32_t output_width, std::uint32_t output_owner_row,
     unsigned char *storage, std::uint32_t &pipeline) {
-  using TileMma = typename deep_gemm::mma::sm90::BF16MMASelector<
-      TileN, cute::UMMA::Major::MN, cute::UMMA::Major::MN>::type;
+  using TileMma = typename hopper::BF16MMASelector<
+      TileN, cute::SM90::GMMA::Major::MN, cute::SM90::GMMA::Major::MN>::type;
   constexpr std::uint32_t kMWaves = TileM / kStageM;
   constexpr std::uint32_t kAStageElements = TileM * kStageK;
   constexpr std::uint32_t kBStageElements = TileN * kStageK;
@@ -446,10 +446,10 @@ __device__ __forceinline__ void run_mn_mn_chunk(
         auto *stage_b = stage_a + kAStageElements;
         const auto left_k = left_reduction_start + iteration * kStageK;
         const auto right_k = right_reduction_start + iteration * kStageK;
-        deep_gemm::tma::copy<TileM, kStageK, 128,
+        hopper::tma_load<TileM, kStageK, 128,
                              cutlass::bfloat16_t>(
             &left_map, &full[stage], stage_a, m_tile * TileM, left_k);
-        deep_gemm::tma::copy<TileN, kStageK, 128,
+        hopper::tma_load<TileN, kStageK, 128,
                              cutlass::bfloat16_t>(
             &right_map, &full[stage], stage_b, n_tile * TileN, right_k);
         full[stage].arrive_and_expect_tx(
@@ -458,13 +458,13 @@ __device__ __forceinline__ void run_mn_mn_chunk(
       }
     }
   } else if (warpgroup < kMathWarpGroups) {
-    auto a_desc = deep_gemm::mma::sm90::make_gmma_desc<
-        cute::UMMA::Major::MN, TileM, kStageK, 128,
+    auto a_desc = hopper::make_gmma_desc<
+        cute::SM90::GMMA::Major::MN, TileM, kStageK, 128,
         cutlass::bfloat16_t>(
         reinterpret_cast<cutlass::bfloat16_t *>(smem),
         warpgroup * TileMma::M, 0U);
-    auto b_desc = deep_gemm::mma::sm90::make_gmma_desc<
-        cute::UMMA::Major::MN, TileN, kStageK, 128,
+    auto b_desc = hopper::make_gmma_desc<
+        cute::SM90::GMMA::Major::MN, TileN, kStageK, 128,
         cutlass::bfloat16_t>(
         reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements,
         0U, 0U);
@@ -486,8 +486,8 @@ __device__ __forceinline__ void run_mn_mn_chunk(
         full[stage].wait(phase);
 #pragma unroll
         for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-        deep_gemm::ptx::warpgroup_arrive();
+          cute::warpgroup_fence_operand(accum[index]);
+        cute::warpgroup_arrive();
         const auto stage_desc_offset =
             stage * kStageStorageElements * sizeof(transport::BFloat16) /
             16U;
@@ -496,25 +496,25 @@ __device__ __forceinline__ void run_mn_mn_chunk(
 #pragma unroll
           for (std::uint32_t k = 0U; k < kStageK / TileMma::K; ++k) {
             a_desc.reg32_[0] =
-                deep_gemm::mma::sm90::advance_gmma_desc_lo<
-                    cute::UMMA::Major::MN, TileM, kStageK, 128,
+                hopper::advance_gmma_desc_lo<
+                    cute::SM90::GMMA::Major::MN, TileM, kStageK, 128,
                     cutlass::bfloat16_t>(
                     a_desc_lo + stage_desc_offset, wave * kStageM,
                     k * TileMma::K);
             b_desc.reg32_[0] =
-                deep_gemm::mma::sm90::advance_gmma_desc_lo<
-                    cute::UMMA::Major::MN, TileN, kStageK, 128,
+                hopper::advance_gmma_desc_lo<
+                    cute::SM90::GMMA::Major::MN, TileN, kStageK, 128,
                     cutlass::bfloat16_t>(
                     b_desc_lo + stage_desc_offset, 0U,
                     k * TileMma::K);
             TileMma::wgmma(a_desc, b_desc,
                            accum + wave * TileMma::kNumAccum, 1);
           }
-        deep_gemm::ptx::warpgroup_commit_batch();
+        cute::warpgroup_commit_batch();
 #pragma unroll
         for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-        deep_gemm::ptx::warpgroup_wait<0>();
+          cute::warpgroup_fence_operand(accum[index]);
+        cute::warpgroup_wait<0>();
         if ((threadIdx.x & 31U) == 0U)
           empty[stage].arrive();
       }

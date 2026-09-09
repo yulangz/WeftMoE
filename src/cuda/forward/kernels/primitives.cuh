@@ -2,23 +2,23 @@
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
 using ForwardMmaNarrow =
-    typename deep_gemm::mma::sm90::BF16MMASelector<64>::type;
-using ForwardMma = typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
+    typename hopper::BF16MMASelector<64>::type;
+using ForwardMma = typename hopper::BF16MMASelector<128>::type;
 using ForwardMmaWide =
-    typename deep_gemm::mma::sm90::BF16MMASelector<256>::type;
+    typename hopper::BF16MMASelector<256>::type;
 // The split Forward kernel is compiled once per explicit tuning record.  Keep
   // Give the production FC1/FC2 paths independent N shapes.
 using TunedForwardFc1Mma =
-    typename deep_gemm::mma::sm90::BF16MMASelector<
+    typename hopper::BF16MMASelector<
         forward_tuning::kFc1TileN>::type;
 using TunedForwardFc1M64Mma =
-    typename deep_gemm::mma::sm90::BF16MMASelector<
+    typename hopper::BF16MMASelector<
         forward_tuning::kFc1TileN / 2U>::type;
 using TunedForwardFc2Mma =
-    typename deep_gemm::mma::sm90::BF16MMASelector<
+    typename hopper::BF16MMASelector<
         forward_tuning::kFc2TileN>::type;
 using TunedForwardFc2M64Mma =
-    typename deep_gemm::mma::sm90::BF16MMASelector<
+    typename hopper::BF16MMASelector<
         forward_tuning::kFc2TileN / 2U>::type;
 using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -62,12 +62,12 @@ __device__ void forward_wgmma_swiglu_tile(
           smem_b_public + stage * kStageElements);
       auto *smem_b2 = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b2_public + stage * kStageElements);
-      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+      hopper::tma_load<64, 128, 128, cutlass::bfloat16_t>(
           &activation_map, &full_barriers[stage], smem_a, k_base,
           activation_row);
-      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+      hopper::tma_load<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b1, k_base, weight_a_row);
-      deep_gemm::tma::copy<64, 64, 128, cutlass::bfloat16_t>(
+      hopper::tma_load<64, 64, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b2, k_base, weight_b_row);
       full_barriers[stage].arrive_and_expect_tx(
           3U * kStageElements * sizeof(transport::BFloat16));
@@ -87,28 +87,28 @@ __device__ void forward_wgmma_swiglu_tile(
       full_barriers[stage].wait(phase);
 #pragma unroll
       for (int index = 0; index < ForwardMma::kNumAccum; ++index) {
-        deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
-        deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+        cute::warpgroup_fence_operand(accum_a[index]);
+        cute::warpgroup_fence_operand(accum_b[index]);
       }
-      deep_gemm::ptx::warpgroup_arrive();
+      cute::warpgroup_arrive();
 #pragma unroll
       for (std::uint32_t k = 0; k < 64U / ForwardMma::K; ++k) {
-        const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+        const auto desc_a = hopper::make_smem_desc(
             smem_a + k * ForwardMma::K, 1);
-        const auto desc_b1 = deep_gemm::mma::sm90::make_smem_desc(
+        const auto desc_b1 = hopper::make_smem_desc(
             smem_b1 + k * ForwardMma::K, 1);
-        const auto desc_b2 = deep_gemm::mma::sm90::make_smem_desc(
+        const auto desc_b2 = hopper::make_smem_desc(
             smem_b2 + k * ForwardMma::K, 1);
         ForwardMma::wgmma(desc_a, desc_b1, accum_a, 1);
         ForwardMma::wgmma(desc_a, desc_b2, accum_b, 1);
       }
-      deep_gemm::ptx::warpgroup_commit_batch();
+      cute::warpgroup_commit_batch();
 #pragma unroll
       for (int index = 0; index < ForwardMma::kNumAccum; ++index) {
-        deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
-        deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+        cute::warpgroup_fence_operand(accum_a[index]);
+        cute::warpgroup_fence_operand(accum_b[index]);
       }
-      deep_gemm::ptx::warpgroup_wait<0>();
+      cute::warpgroup_wait<0>();
       if ((threadIdx.x & 31U) == 0U)
         empty_barriers[stage].arrive();
     }
@@ -166,10 +166,10 @@ __device__ void forward_wgmma_tile(
           smem_a_public + stage * kAStageElements);
       auto *smem_b = reinterpret_cast<cutlass::bfloat16_t *>(
           smem_b_public + stage * kBStageElements);
-      deep_gemm::tma::copy<64, TileColumns, 128, cutlass::bfloat16_t>(
+      hopper::tma_load<64, TileColumns, 128, cutlass::bfloat16_t>(
           &activation_map, &full_barriers[stage], smem_a, k_base,
           activation_row);
-      deep_gemm::tma::copy<64, 128, 128, cutlass::bfloat16_t>(
+      hopper::tma_load<64, 128, 128, cutlass::bfloat16_t>(
           &weight_map, &full_barriers[stage], smem_b, k_base, weight_row);
 #if MEGAMOE_DEBUG_VALIDATE
       if (debug_first_tile && debug_producer)
@@ -208,26 +208,26 @@ __device__ void forward_wgmma_tile(
 #endif
 #pragma unroll
       for (int index = 0; index < TileMma::kNumAccum; ++index)
-        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-      deep_gemm::ptx::warpgroup_arrive();
+        cute::warpgroup_fence_operand(accum[index]);
+      cute::warpgroup_arrive();
 #pragma unroll
       for (std::uint32_t k = 0; k < 64U / TileMma::K; ++k) {
         const auto desc_a =
-            deep_gemm::mma::sm90::make_smem_desc(smem_a + k * TileMma::K, 1);
+            hopper::make_smem_desc(smem_a + k * TileMma::K, 1);
         const auto desc_b =
-            deep_gemm::mma::sm90::make_smem_desc(smem_b + k * TileMma::K, 1);
+            hopper::make_smem_desc(smem_b + k * TileMma::K, 1);
         TileMma::wgmma(desc_a, desc_b, accum, 1);
       }
-      deep_gemm::ptx::warpgroup_commit_batch();
+      cute::warpgroup_commit_batch();
 #if MEGAMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math = (static_cast<unsigned long long>(iteration) << 8U) | 3ULL;
 #endif
 #pragma unroll
       for (int index = 0; index < TileMma::kNumAccum; ++index)
-        deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+        cute::warpgroup_fence_operand(accum[index]);
       if (iteration != 0U) {
-        deep_gemm::ptx::warpgroup_wait<1>();
+        cute::warpgroup_wait<1>();
 #if MEGAMOE_DEBUG_VALIDATE
         if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
           *debug_math =
@@ -239,7 +239,7 @@ __device__ void forward_wgmma_tile(
       }
     }
     if (iterations != 0U) {
-      deep_gemm::ptx::warpgroup_wait<0>();
+      cute::warpgroup_wait<0>();
 #if MEGAMOE_DEBUG_VALIDATE
       if (debug_first_tile && (threadIdx.x & 127U) == 0U && debug_math)
         *debug_math =

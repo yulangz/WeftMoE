@@ -185,6 +185,23 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(set(candidate["config"]),
                              set(tune.PARAMETER_MACROS))
 
+    def test_standalone_cutlass_path_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            include = root / "cutlass/include"
+            for relative in ("cute/arch/mma_sm90_gmma.hpp", "cutlass/arch/barrier.h"):
+                file = include / relative
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+            self.assertEqual(forward_jit._cutlass_include(
+                {}, {"CUTLASS_INCLUDE_DIR": str(include)}, root), include)
+            self.assertEqual(forward_jit._cutlass_include(
+                {"cutlass_include_dir": str(include)},
+                {"CUTLASS_INCLUDE_DIR": str(root / "missing")}, root), include)
+            with self.assertRaises(forward_jit.JitError):
+                forward_jit._cutlass_include(
+                    {"cutlass_include_dir": str(root / "missing")}, {}, root)
+
     def test_world8_plan_is_narrow_and_unique(self):
         plan = tune.load_plan(
             ROOT / "configs" / "forward_h200_single_node_autotune.json",

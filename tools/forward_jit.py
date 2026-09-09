@@ -18,7 +18,6 @@ import concurrent.futures
 import datetime as dt
 import errno
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -170,15 +169,19 @@ def _resolve_tool(configured: str | None, fallback: str,
     return Path(resolved).resolve()
 
 
-def _deep_gemm_include() -> Path:
-    spec = importlib.util.find_spec("deep_gemm")
-    if spec is not None and spec.origin is not None:
-        installed = Path(spec.origin).resolve().parent / "include"
-        if installed.is_dir():
-            return installed
-    raise JitError(
-        "cannot locate the installed deep_gemm include tree containing CUTLASS/CUTE"
-    )
+def _cutlass_include(config: Mapping[str, Any], environment: Mapping[str, str],
+                     repo_root: Path) -> Path:
+    explicit = config.get("cutlass_include_dir") or environment.get("CUTLASS_INCLUDE_DIR")
+    candidates = [Path(explicit).expanduser()] if explicit else [
+        repo_root / "third_party/cutlass/include",
+        repo_root.parent / "cutlass/include", Path("/opt/cutlass/include"),
+    ]
+    for path in candidates:
+        if ((path / "cute/arch/mma_sm90_gmma.hpp").is_file() and
+                (path / "cutlass/arch/barrier.h").is_file()):
+            return path.resolve()
+    raise JitError("cannot locate CUTLASS/CuTe headers; set jit.cutlass_include_dir "
+                   "or CUTLASS_INCLUDE_DIR to the CUTLASS include directory")
 
 
 def _architecture_flags(architecture: str) -> list[str]:
@@ -229,7 +232,7 @@ def _nccl_identity(library_dir: Path | None) -> dict[str, Any]:
 def validate_jit_config(config: Mapping[str, Any]) -> None:
     allowed = {
         "cache_root", "jobs", "architecture", "timeout_seconds",
-        "nvcc", "cxx", "archiver",
+        "nvcc", "cxx", "archiver", "cutlass_include_dir",
     }
     unknown = set(config) - allowed
     if unknown:
@@ -246,7 +249,7 @@ def validate_jit_config(config: Mapping[str, Any]) -> None:
             config["timeout_seconds"] <= 0):
         raise JitError("jit.timeout_seconds must be a positive integer")
     _architecture_flags(str(config["architecture"]))
-    for key in ("nvcc", "cxx", "archiver"):
+    for key in ("nvcc", "cxx", "archiver", "cutlass_include_dir"):
         if key in config and (not isinstance(config[key], str) or not config[key]):
             raise JitError(f"jit.{key} must be a non-empty string")
 
@@ -394,8 +397,7 @@ class SpecializedJitCompiler:
         )
         self.cxx = _resolve_tool(config.get("cxx"), "g++")
         self.archiver = _resolve_tool(config.get("archiver"), "ar")
-        self.deep_gemm_include = _deep_gemm_include().resolve()
-        self.vendor_include = (self.repo_root / "src/cuda/vendor").resolve()
+        self.cutlass_include = _cutlass_include(config, environment, self.repo_root)
         configured_nccl = Path(nccl_lib_dir).resolve() if nccl_lib_dir else None
         self.nccl_lib_dir = (
             configured_nccl if configured_nccl is not None and
@@ -415,8 +417,7 @@ class SpecializedJitCompiler:
         ]
         self.cuda_flags = [
             "-Iinclude", "-Isrc", "-Itests", "-Xcompiler=-pthread",
-            "-isystem", str(self.vendor_include),
-            "-isystem", str(self.deep_gemm_include),
+            "-isystem", str(self.cutlass_include),
             "-DMEGAMOE_DEBUG_VALIDATE=0", "-DMEGAMOE_BUILD_SHARED=1",
             "-DMEGAMOE_DEVICE_TIMELINE=0",
             "-DMEGAMOE_FORWARD_LIGHT_PROGRESS=0",
@@ -451,8 +452,8 @@ class SpecializedJitCompiler:
             repository_inputs, relative_to=self.repo_root
         )
         self.external_include_digest = digest_files(
-            _regular_files(self.deep_gemm_include),
-            relative_to=self.deep_gemm_include,
+            _regular_files(self.cutlass_include),
+            relative_to=self.cutlass_include,
         )
         self.signature = {
             "schema": JIT_SCHEMA,

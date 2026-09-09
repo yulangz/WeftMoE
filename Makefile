@@ -3,13 +3,9 @@ NVCC ?= /usr/local/cuda/bin/nvcc
 BUILD_DIR ?= build
 CPPFLAGS := -Iinclude -Isrc -Itests -pthread
 CUDA_CPPFLAGS := -Iinclude -Isrc -Itests -Xcompiler=-pthread
-# The exact MIT-licensed DeepGEMM headers used by the frozen SM90 kernels are
-# kept in-tree so a git archive is a complete source release. CUTLASS/CUTE
-# remains an external build dependency and is discovered from the installed
-# DeepGEMM package unless explicitly overridden.
-DEEPGEMM_INCLUDE_DIR ?= src/cuda/vendor
-CUTLASS_INCLUDE_DIR ?= $(shell python3 -c 'import importlib.util,os;s=importlib.util.find_spec("deep_gemm");print(os.path.join(os.path.dirname(s.origin),"include") if s else "../DeepGEMM/third-party/cutlass/include")')
-CUDA_CPPFLAGS += -isystem $(DEEPGEMM_INCLUDE_DIR) -isystem $(CUTLASS_INCLUDE_DIR)
+# Use a standalone CUTLASS checkout/install; no DeepGEMM Python package is needed.
+CUTLASS_INCLUDE_DIR ?= /opt/cutlass/include
+CUDA_CPPFLAGS += -isystem $(CUTLASS_INCLUDE_DIR)
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 override CXXFLAGS += -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections
 WERROR ?= 0

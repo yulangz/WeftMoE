@@ -842,24 +842,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 Cluster2 && *pair_operand_shared == kComputePairShareB ? 2U
                                                                        : 1U;
             if constexpr (M64) {
-              deep_gemm::tma::copy<forward_tuning::kTileK, 64, 128,
+              hopper::tma_load<forward_tuning::kTileK, 64, 128,
                                    cutlass::bfloat16_t>(
                   &x_map, &fc1_full[stage], stage_a, k_base,
                   static_cast<std::uint32_t>(row), multicast_a);
             } else {
-              deep_gemm::tma::copy<forward_tuning::kTileK,
+              hopper::tma_load<forward_tuning::kTileK,
                                    forward_tuning::kTileM, 128,
                                    cutlass::bfloat16_t>(
                   &x_map, &fc1_full[stage], stage_a, k_base,
                   static_cast<std::uint32_t>(row), multicast_a);
             }
-            deep_gemm::tma::copy<forward_tuning::kTileK,
+            hopper::tma_load<forward_tuning::kTileK,
                                  forward_tuning::kFc1TileN, 128,
                                  cutlass::bfloat16_t>(
                 &w1_map, &fc1_full[stage], stage_b1, k_base,
                 static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n),
                 multicast_b);
-            deep_gemm::tma::copy<forward_tuning::kTileK,
+            hopper::tma_load<forward_tuning::kTileK,
                                  forward_tuning::kFc1TileN, 128,
                                  cutlass::bfloat16_t>(
                 &w1_map, &fc1_b2_full[stage], stage_b2, k_base,
@@ -918,18 +918,18 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   Cluster2 && *pair_operand_shared == kComputePairShareA ? 2U
                                                                          : 1U;
               if constexpr (M64) {
-                deep_gemm::tma::copy<forward_tuning::kTileK, 64, 128,
+                hopper::tma_load<forward_tuning::kTileK, 64, 128,
                                      cutlass::bfloat16_t>(
                     &s_map, &fc2_full[stage], stage_a, k_base,
                     static_cast<std::uint32_t>(row), multicast_a);
               } else {
-                deep_gemm::tma::copy<forward_tuning::kTileK,
+                hopper::tma_load<forward_tuning::kTileK,
                                      forward_tuning::kTileM, 128,
                                      cutlass::bfloat16_t>(
                     &s_map, &fc2_full[stage], stage_a, k_base,
                     static_cast<std::uint32_t>(row), multicast_a);
               }
-              deep_gemm::tma::copy<forward_tuning::kTileK,
+              hopper::tma_load<forward_tuning::kTileK,
                                    forward_tuning::kFc2TileN, 128,
                                    cutlass::bfloat16_t>(
                   &w2_map, &fc2_full[stage], stage_b, k_base,
@@ -1046,41 +1046,41 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         fc1_full[stage].wait(phase);
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
-        deep_gemm::ptx::warpgroup_arrive();
+          cute::warpgroup_fence_operand(accum_a[index]);
+        cute::warpgroup_arrive();
 #pragma unroll
         for (std::uint32_t k = 0;
              k < forward_tuning::kTileK / Fc1TileMma::K; ++k) {
-          const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+          const auto desc_a = hopper::make_smem_desc(
               stage_a + k * Fc1TileMma::K, 1);
-          const auto desc_b1 = deep_gemm::mma::sm90::make_smem_desc(
+          const auto desc_b1 = hopper::make_smem_desc(
               stage_b1 + k * Fc1TileMma::K, 1);
           Fc1TileMma::wgmma(desc_a, desc_b1, accum_a, 1);
         }
-        deep_gemm::ptx::warpgroup_commit_batch();
+        cute::warpgroup_commit_batch();
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+          cute::warpgroup_fence_operand(accum_a[index]);
 
         fc1_b2_full[stage].wait(phase);
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
-        deep_gemm::ptx::warpgroup_arrive();
+          cute::warpgroup_fence_operand(accum_b[index]);
+        cute::warpgroup_arrive();
 #pragma unroll
         for (std::uint32_t k = 0;
              k < forward_tuning::kTileK / Fc1TileMma::K; ++k) {
-          const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+          const auto desc_a = hopper::make_smem_desc(
               stage_a + k * Fc1TileMma::K, 1);
-          const auto desc_b2 = deep_gemm::mma::sm90::make_smem_desc(
+          const auto desc_b2 = hopper::make_smem_desc(
               stage_b2 + k * Fc1TileMma::K, 1);
           Fc1TileMma::wgmma(desc_a, desc_b2, accum_b, 1);
         }
-        deep_gemm::ptx::warpgroup_commit_batch();
+        cute::warpgroup_commit_batch();
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
-          deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
-        deep_gemm::ptx::warpgroup_wait<
+          cute::warpgroup_fence_operand(accum_b[index]);
+        cute::warpgroup_wait<
             forward_tuning::kWgmmaWaitGroup>();
         if constexpr (Cluster2) {
           const auto lane = threadIdx.x & 31U;
@@ -1232,26 +1232,26 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           fc2_full[stage].wait(phase);
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
-            deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
-          deep_gemm::ptx::warpgroup_arrive();
+            cute::warpgroup_fence_operand(accum[index]);
+          cute::warpgroup_arrive();
 #pragma unroll
           for (std::uint32_t k = 0;
                k < forward_tuning::kTileK / Fc2TileMma::K; ++k) {
-            const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+            const auto desc_a = hopper::make_smem_desc(
                 stage_a + k * Fc2TileMma::K, 1);
-            const auto desc_b = deep_gemm::mma::sm90::make_smem_desc(
+            const auto desc_b = hopper::make_smem_desc(
                 stage_b + k * Fc2TileMma::K, 1);
             Fc2TileMma::wgmma(desc_a, desc_b, accum, 1);
           }
-          deep_gemm::ptx::warpgroup_commit_batch();
+          cute::warpgroup_commit_batch();
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
-            deep_gemm::ptx::warpgroup_fence_operand(accum[index]);
+            cute::warpgroup_fence_operand(accum[index]);
           // TMA remains four-stage asynchronous in the producer warpgroup.  The
           // math side completes one K=64 group before recycling that stage; the
           // previous wait<1> needed a second live accumulator generation and
           // made ptxas serialize every individual WGMMA instruction.
-          deep_gemm::ptx::warpgroup_wait<
+          cute::warpgroup_wait<
               forward_tuning::kWgmmaWaitGroup>();
           if constexpr (Cluster2) {
             const auto lane = threadIdx.x & 31U;
@@ -1306,7 +1306,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 reinterpret_cast<std::uint8_t *>(output_tile) +
                 warp * 16U * 128U + atom * 128U * 128U +
                 swizzle_row * 128U + swizzle_column * kBankGroupBytes;
-            deep_gemm::ptx::SM90_U32x2_STSM_N<__nv_bfloat162>::copy(
+            hopper::StoreMatrixX2<__nv_bfloat162>::copy(
                 __float22bfloat162_rn(
                     make_float2(accum[index * 4U], accum[index * 4U + 1U])),
                 __float22bfloat162_rn(make_float2(accum[index * 4U + 2U],

@@ -129,6 +129,7 @@ BWD 当前将 dX reduce 排在 persistent transport 之后，利用释放的 SM�
 - `disable_ib` / `enable_ib`：控制 launcher 的 NCCL IB 开关；通常采用按拓扑生成的默认值。
 - `nccl_lib_dir`：指定 NCCL 库目录；缺省会检测仓库私有库，不要求手填。
 - `runtime_library_path`：运行时动态库搜索路径覆盖，用于让 CUDA compat、NCCL、Python CUDA runtime 等加载正确版本；不是超参数。
+- `jit.cutlass_include_dir`：独立 CUTLASS 的 include 目录；也可设环境变量 `CUTLASS_INCLUDE_DIR`。不再通过 DeepGEMM Python 包寻找头文件。H200 迁移验证使用 CUTLASS 4.2.0 / CUDA 12.9，建议固定工具链版本后调优。缺省依次检查仓库的 `third_party/cutlass/include`、同级 `cutlass/include`、`/opt/cutlass/include`。
 - `jit`：编译工具、架构、并行度和缓存路径；`--jobs`、`--cache-root` 可直接指定。
 
 ## 已测经验：Ling 单机需要覆盖更大的 Relay

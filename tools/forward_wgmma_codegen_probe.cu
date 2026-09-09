@@ -1,12 +1,9 @@
+#include "cuda/primitives/hopper.cuh"
 #include <cuda_runtime.h>
 #include <cutlass/arch/reg_reconfig.h>
-#include <deep_gemm/common/tma_copy.cuh>
-#include <deep_gemm/common/math.cuh>
-#include <deep_gemm/mma/sm90.cuh>
-#include <deep_gemm/ptx/wgmma.cuh>
 
-using Mma128 = typename deep_gemm::mma::sm90::BF16MMASelector<128>::type;
-using Mma256 = typename deep_gemm::mma::sm90::BF16MMASelector<256>::type;
+using Mma128 = typename megamoe::cuda::hopper::BF16MMASelector<128>::type;
+using Mma256 = typename megamoe::cuda::hopper::BF16MMASelector<256>::type;
 
 template <class Mma, bool Dual>
 __global__ __launch_bounds__(384, 1) void wgmma_codegen_probe(float *output) {
@@ -23,31 +20,31 @@ __global__ __launch_bounds__(384, 1) void wgmma_codegen_probe(float *output) {
   float accum_b[Mma::kNumAccum] = {0.0F};
 #pragma unroll
   for (int index = 0; index < Mma::kNumAccum; ++index) {
-    deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+    cute::warpgroup_fence_operand(accum_a[index]);
     if constexpr (Dual)
-      deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+      cute::warpgroup_fence_operand(accum_b[index]);
   }
-  deep_gemm::ptx::warpgroup_arrive();
+  cute::warpgroup_arrive();
 #pragma unroll
   for (unsigned k = 0; k < 64U / Mma::K; ++k) {
-    const auto desc_a = deep_gemm::mma::sm90::make_smem_desc(
+    const auto desc_a = megamoe::cuda::hopper::make_smem_desc(
         smem + warpgroup * 64U * 64U + k * Mma::K, 1);
-    const auto desc_b = deep_gemm::mma::sm90::make_smem_desc(
+    const auto desc_b = megamoe::cuda::hopper::make_smem_desc(
         smem + 2U * 64U * 64U + k * Mma::K, 1);
-    const auto desc_b2 = deep_gemm::mma::sm90::make_smem_desc(
+    const auto desc_b2 = megamoe::cuda::hopper::make_smem_desc(
         smem + 4U * 64U * 64U + k * Mma::K, 1);
     Mma::wgmma(desc_a, desc_b, accum_a, 1);
     if constexpr (Dual)
       Mma::wgmma(desc_a, desc_b2, accum_b, 1);
   }
-  deep_gemm::ptx::warpgroup_commit_batch();
+  cute::warpgroup_commit_batch();
 #pragma unroll
   for (int index = 0; index < Mma::kNumAccum; ++index) {
-    deep_gemm::ptx::warpgroup_fence_operand(accum_a[index]);
+    cute::warpgroup_fence_operand(accum_a[index]);
     if constexpr (Dual)
-      deep_gemm::ptx::warpgroup_fence_operand(accum_b[index]);
+      cute::warpgroup_fence_operand(accum_b[index]);
   }
-  deep_gemm::ptx::warpgroup_wait<0>();
+  cute::warpgroup_wait<0>();
   output[static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
          threadIdx.x] = accum_a[0] + (Dual ? accum_b[0] : 0.0F);
 #else

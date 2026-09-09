@@ -1,3 +1,4 @@
+#include "cuda/primitives/hopper.cuh"
 // Dedicated transport grid compilation; compute keeps its own register budget.
 #define MEGAMOE_FORWARD_TRANSPORT_TU 1
 
@@ -15,11 +16,6 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cute/arch/cluster_sm90.hpp>
-#include <deep_gemm/common/tma_copy.cuh>
-#include <deep_gemm/common/math.cuh>
-#include <deep_gemm/mma/sm90.cuh>
-#include <deep_gemm/ptx/wgmma.cuh>
-#include <deep_gemm/ptx/ld_st.cuh>
 #if __has_include(<nccl_device/core.h>)
 #include <nccl_device/core.h>
 #include <nccl_device/impl/comm__types.h>
