@@ -88,7 +88,7 @@
 #define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 32
 #endif
 #ifndef WEFTMOE_FWD_RETURN_CHUNK_ROWS
-#define WEFTMOE_FWD_RETURN_CHUNK_ROWS 256
+#define WEFTMOE_FWD_RETURN_CHUNK_ROWS 128
 #endif
 #ifndef WEFTMOE_FWD_RETURN_MAX_INFLIGHT
 #define WEFTMOE_FWD_RETURN_MAX_INFLIGHT 16
@@ -116,9 +116,6 @@
 #endif
 #ifndef WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS
 #define WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS 1
-#endif
-#ifndef WEFTMOE_FWD_COMPLETION_MARKER_WARPS
-#define WEFTMOE_FWD_COMPLETION_MARKER_WARPS 1
 #endif
 #ifndef WEFTMOE_FWD_REDUCE_SCHEDULER
 // 0=ready queue, 1=dynamic scan, 2=static token stripes.
@@ -159,11 +156,11 @@
 #endif
 
 namespace weftmoe::cuda::forward_tuning {
-// Untuned single-node defaults favor enough transport workers for Ling-sized
-// workloads. Explicit tuning overrides apply to either topology unchanged.
+// Both topologies need enough workers for local copies and received-chunk
+// expansion. Explicit tuning overrides apply unchanged.
 #ifndef WEFTMOE_FWD_RELAY_CTAS
 #define WEFTMOE_FWD_RELAY_CTAS 24
-inline constexpr std::uint32_t kRemoteRelayCtas = 8;
+inline constexpr std::uint32_t kRemoteRelayCtas = 24;
 #else
 inline constexpr std::uint32_t kRemoteRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
 #endif
@@ -179,6 +176,9 @@ inline constexpr std::uint32_t kFc1Stages = WEFTMOE_FWD_FC1_STAGES;
 inline constexpr std::uint32_t kFc2Stages = WEFTMOE_FWD_FC2_STAGES;
 inline constexpr std::uint32_t kComputeThreads =
     WEFTMOE_FWD_COMPUTE_THREADS;
+// Local transport has no WGMMA register partition. Four warpgroups expose
+// more independent peer-copy streams while fitting one CTA per Hopper SM.
+inline constexpr std::uint32_t kLocalTransportThreads = 512U;
 inline constexpr std::uint32_t kMathWarpgroups =
     WEFTMOE_FWD_MATH_WARPGROUPS;
 inline constexpr std::uint32_t kProducerWarpgroups =
@@ -229,8 +229,6 @@ inline constexpr std::uint32_t kTaskClaimChunk =
     WEFTMOE_FWD_TASK_CLAIM_CHUNK;
 inline constexpr std::uint32_t kCompletionChunksPerPass =
     WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS;
-inline constexpr std::uint32_t kCompletionMarkerWarps =
-    WEFTMOE_FWD_COMPLETION_MARKER_WARPS;
 inline constexpr std::uint32_t kReduceScheduler =
     WEFTMOE_FWD_REDUCE_SCHEDULER;
 inline constexpr std::uint32_t kReduceWarps = WEFTMOE_FWD_REDUCE_WARPS;
@@ -281,7 +279,8 @@ inline constexpr std::size_t compute_smem_bytes(std::uint32_t world) {
 
 inline constexpr std::size_t transport_smem_bytes(std::uint32_t hidden,
                                                    std::uint32_t world) {
-  const auto streams = max_size(kLocalDispatchTmaWarps, kRelayTmaWarps);
+  const auto streams = max_size(
+      max_size(kLocalDispatchTmaWarps, kRelayTmaWarps), kRelayScatterWarps);
   const auto row_staging = streams * static_cast<std::size_t>(hidden) *
                            sizeof(std::uint16_t);
   return max_size(kGemmStorageBytes, row_staging) +
@@ -343,8 +342,6 @@ static_assert(kTaskClaimChunk == 1U,
               "only the proven one-task queue claim is currently compiled");
 static_assert(kCompletionChunksPerPass > 0U &&
               kCompletionChunksPerPass <= 4U);
-static_assert(kCompletionMarkerWarps > 0U &&
-              kCompletionMarkerWarps <= kComputeThreads / 32U);
 static_assert(kReduceScheduler <= 2U);
 static_assert(kReduceWarps > 0U &&
               kReduceWarps <= kComputeThreads / 32U);

@@ -24,6 +24,48 @@ def grid_count(topology):
 
 
 class ForwardAutotuneTest(unittest.TestCase):
+    def test_runtime_does_not_select_checkout_nccl_artifacts(self):
+        from autotune_common import resolve_runtime_settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "artifacts/gin_port_fix/build/lib"
+            private.mkdir(parents=True)
+            (private / "libnccl.so").touch()
+            model = dict(hidden=2560, intermediate=768, experts=512, top_k=8)
+            settings, _ = resolve_runtime_settings(
+                model=model, system={"nodes": 2}, repo_root=root)
+            self.assertNotIn("nccl_lib_dir", settings)
+            self.assertNotIn(str(private), settings.get("runtime_library_path", ""))
+            settings, _ = resolve_runtime_settings(
+                model=model, system={"nodes": 2, "nccl_lib_dir": "/explicit/nccl"},
+                repo_root=root)
+            self.assertEqual(settings["nccl_lib_dir"], "/explicit/nccl")
+
+    def test_tma_store_accepts_shorter_stage_pipelines(self):
+        for fc1_stages in (2, 3, 4):
+            for fc2_stages in (2, 3, 4):
+                config = dict(self.candidates[0]["config"],
+                              main_intermediate=768,
+                              fc1_stages=fc1_stages,
+                              fc2_stages=fc2_stages,
+                              fc2_tma_store=True, cluster_size=2)
+                tune.validate_tuning(config)
+
+    def test_fc2_stages_must_divide_reduction_iterations(self):
+        config = dict(self.candidates[0]["config"],
+                      main_intermediate=2048, fc2_stages=3)
+        with self.assertRaisesRegex(tune.PlanError, "divisible"):
+            tune.validate_tuning(config)
+
+    def test_odd_n_tile_count_requires_single_cta_specialization(self):
+        config = dict(self.candidates[0]["config"], main_intermediate=768,
+                      fc1_tile_n=256, fc1_stages=2, cluster_size=2)
+        with self.assertRaisesRegex(tune.PlanError, "even"):
+            tune.validate_tuning(config)
+        config["cluster_size"] = 1
+        tune.validate_tuning(config)
+
     def test_local_runtime_library_path_precedes_inherited_libraries(self):
         benchmark = dict(self.plan["benchmark"], launcher="local", world=8,
                          nccl_lib_dir="/link/nccl",
@@ -190,7 +232,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.assertEqual(len(candidates), grid_count("single_node"))
         selected = candidates[0]["config"]
         self.assertEqual(selected["rdma_ctas"], 0)
-        self.assertEqual(selected["relay_ctas"], 8)
+        self.assertEqual(selected["relay_ctas"], 24)
         source = json.loads((ROOT / "configs/forward_h200_single_node_autotune.json").read_text())
         self.assertEqual(selected["local_dispatch_tma_warps"],
                          source["2_transport"]["local_dispatch_tma_warps"][0])

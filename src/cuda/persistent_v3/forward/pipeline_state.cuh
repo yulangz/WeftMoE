@@ -28,13 +28,16 @@ static_assert(sizeof(ForwardComputePairMailbox) == 32U);
 // wave interval, so its hot handoffs need only monotonic prefixes.  Outbound
 // fields connect the ten RDMA-resident packing warps to the scalar GIN owner;
 // inbound fields connect that owner (after signal/proxy acquisition) to the
-// paired Dispatch Relay CTA.
+// shared Relay consumers for that channel.
 struct alignas(128) ForwardDispatchSequence {
   PaddedCounter outbound_directory_ready;
   PaddedCounter outbound_waves_packed;
   PaddedCounter outbound_pack_complete;
   PaddedCounter inbound_directory_ready;
   PaddedCounter inbound_waves_ready;
+  // Packed {claimed wave count, relative packet cursor}; CAS assigns each
+  // variable-length wave exactly once to any Relay CTA on this channel.
+  PaddedCounter inbound_claim;
 };
 
 struct alignas(128) ForwardPipelineControl {

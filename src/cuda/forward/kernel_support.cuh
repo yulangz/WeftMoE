@@ -356,19 +356,29 @@ struct ForwardReturnChunkRecord {
 };
 static_assert(sizeof(ForwardReturnChunkRecord) == 32);
 
-// Compute publishes only immutable byte ranges.  The fixed RDMA team scans
-// this generation-local catalog and the context named by each record is its
-// sole GIN issuer.  `epoch` is stored last with device-release ordering.
-struct alignas(16) ForwardDirectReturnFragment {
+// An immutable compute-tile task shared by local copy and RDMA consumers.
+// A certified contiguous range has one destination; UINT32_MAX selects the
+// general mixed-source/chunk-boundary path. Epoch publishes the entire task.
+struct alignas(16) ForwardReturnTile {
+  std::uint64_t canonical_row;
+  std::uint64_t compact_row;
+  std::uint32_t local_context_mask;
+  std::uint32_t row_count;
+  std::uint32_t contiguous_source_rank;
+  std::uint32_t remote_context_mask;
+  std::uint64_t epoch;
+};
+static_assert(sizeof(ForwardReturnTile) == 48);
+
+// One concrete network operation, materialized only by its GIN owner.
+struct ForwardDirectReturnFragment {
   std::uint64_t canonical_row;
   std::uint64_t compact_row;
   std::uint32_t source_rank;
   std::uint32_t row_count;
   std::uint32_t context;
-  std::uint32_t reserved;
   std::uint64_t epoch;
 };
-static_assert(sizeof(ForwardDirectReturnFragment) == 48);
 
 // One immutable word lets an FC2 producer address both the proxy's chunk
 // scoreboard and the exact compact row in its registered Return window.  Main
@@ -1074,7 +1084,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         config.max_destination_rows_per_rank;
     layout.forward_direct_return_fragment = append(
         cursor, layout.forward_direct_return_fragment_capacity,
-        sizeof(ForwardDirectReturnFragment),
+        sizeof(ForwardReturnTile),
         "forward direct return fragment directory");
     layout.forward_scheduler =
         append(cursor, 4 + config.max_world_size * 32ULL, sizeof(std::uint64_t),

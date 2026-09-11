@@ -51,15 +51,15 @@
       0
     ],
     "relay_ctas": [
+      32,
       8,
       16,
       24,
-      32,
       40
     ],
     "dispatch_batch_rows": [
-      16,
-      32
+      32,
+      16
     ],
     "gin_max_inflight": [
       24

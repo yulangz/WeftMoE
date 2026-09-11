@@ -103,7 +103,6 @@ PARAMETER_MACROS = {
     "setup_nanosleep": "WEFTMOE_FWD_SETUP_NANOSLEEP",
     "completion_chunks_per_pass":
         "WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
-    "completion_marker_warps": "WEFTMOE_FWD_COMPLETION_MARKER_WARPS",
     "reduce_scheduler": "WEFTMOE_FWD_REDUCE_SCHEDULER",
     "reduce_warps": "WEFTMOE_FWD_REDUCE_WARPS",
     "reduce_tokens_per_claim": "WEFTMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
@@ -217,11 +216,16 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     if config["fc2_tma_store"]:
         _require(config["tile_m"] == 128,
                  "FC2 TMA store currently requires tile_m=128")
-        _require(config["fc1_stages"] == 4 and config["fc2_stages"] == 4,
-                 "FC2 TMA store currently requires the validated 4x4 stages")
+    _require((config["main_intermediate"] // config["tile_k"]) %
+             config["fc2_stages"] == 0,
+             "FC2 reduction iterations must be divisible by fc2_stages")
     if config["cluster_size"] == 2:
         _require(config["fc2_tma_store"],
                  "cluster_size=2 requires the paired FC2 TMA-store kernel")
+        _require((config["main_intermediate"] // config["fc1_tile_n"]) % 2 == 0
+                 and (config["main_hidden"] // config["fc2_tile_n"]) % 2 == 0,
+                 "cluster_size=2 requires even FC1 and FC2 N-tile counts; "
+                 "use cluster_size=1 for odd tile counts")
 
     # Two-host GIN owns eight physical contexts. One-node NVLink has no RDMA
     # owner and tunes Relay independently in small four-CTA increments.
@@ -266,7 +270,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "only the proven one-task work-queue claim is implemented")
 
     _require_choice(config, "completion_chunks_per_pass", (1, 2, 4))
-    _require_choice(config, "completion_marker_warps", (1, 2, 4))
     _require_choice(config, "reduce_warps", (4, 8, 12))
     _require(1 <= config["reduce_tokens_per_claim"] <= config["reduce_warps"],
              "reduce_tokens_per_claim must be in [1, reduce_warps]")

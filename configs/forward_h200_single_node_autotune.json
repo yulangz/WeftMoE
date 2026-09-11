@@ -7,7 +7,7 @@
       128
     ],
     "fc2_tile_n": [
-      128
+      256
     ],
     "tile_k": [
       64
@@ -51,9 +51,9 @@
       0
     ],
     "relay_ctas": [
+      24,
       8,
       16,
-      24,
       32,
       40
     ],
@@ -74,9 +74,11 @@
       4
     ],
     "dispatch_publish_batch_rows": [
+      128,
       32
     ],
     "return_chunk_rows": [
+      128,
       256
     ],
     "return_max_inflight": [
@@ -123,9 +125,6 @@
   },
   "4_completion_reduce": {
     "completion_chunks_per_pass": [
-      1
-    ],
-    "completion_marker_warps": [
       1
     ],
     "reduce_scheduler": [

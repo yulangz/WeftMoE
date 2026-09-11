@@ -215,9 +215,6 @@ def main():
         raise RuntimeError(
             f"Megatron world mismatch expected={2 * args.gpus_per_node} "
             f"actual={record.get('world')}")
-    if record.get("nccl_runtime_version") != "2.29.7":
-        raise RuntimeError(
-            f"unexpected NCCL runtime {record.get('nccl_runtime_version')}")
     record["network_backend"] = "nccl-socket"
     record["network_environment"] = {
         "NCCL_IB_DISABLE": "1",

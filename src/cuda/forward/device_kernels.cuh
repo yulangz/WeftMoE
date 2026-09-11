@@ -1,7 +1,9 @@
 #include "cuda/forward/kernels/primitives.cuh"
 template <bool StaticLocal,
           ForwardKernelRole KernelRole = ForwardKernelRole::Combined>
-__global__ __maxnreg__(160) void local_p2p_forward_megakernel(
+__global__ __maxnreg__(
+    StaticLocal && KernelRole == ForwardKernelRole::TransportOnly ? 128 : 160)
+void local_p2p_forward_megakernel(
     ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
@@ -401,7 +403,8 @@ __global__ __maxnreg__(160) void local_p2p_forward_megakernel(
         if (threadIdx.x == 0U)
           atomicMax(&status->return_complete_clock, device_globaltimer_ns());
         __syncthreads();
-        forward_reduce_detail::drain_reduce_queue(a);
+        if (blockIdx.x >= forward_relay_cta_begin)
+          forward_reduce_detail::drain_reduce_queue(a);
         forward_publish_progress(a, kForwardDispatchStored,
                                  a.dispatch.sizes.route_count);
         forward_publish_progress(a, kForwardDispatchObserved,

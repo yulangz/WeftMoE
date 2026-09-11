@@ -62,7 +62,7 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
     const ForwardKernelArgs &a, unsigned long long *scheduler,
     std::uint64_t canonical_row,
     std::uint32_t row_count, std::uint32_t context_mask,
-    std::uint32_t local_context_mask) {
+    std::uint32_t local_context_mask, bool contiguous = false) {
   if (row_count == 0U || forward_cancelled(a))
     return;
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
@@ -75,18 +75,23 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
     return;
   }
 
-  auto *fragments = peer_at<ForwardDirectReturnFragment>(
+  auto *fragments = peer_at<ForwardReturnTile>(
       a.local_base, a.forward_direct_return_fragment_offset);
   auto &fragment = fragments[slot];
   fragment.canonical_row = canonical_row;
   fragment.compact_row = 0ULL;
-  // Queue records are immutable M-block descriptors, not wire fragments.
-  // source_rank is otherwise unused until the RDMA owner materializes a local
-  // wire fragment, so reuse it for the node-local Return consumer mask.
-  fragment.source_rank = local_context_mask;
+  fragment.local_context_mask = local_context_mask;
   fragment.row_count = row_count;
-  fragment.context = UINT32_MAX;
-  fragment.reserved = context_mask;
+  fragment.contiguous_source_rank = UINT32_MAX;
+  if (contiguous) {
+    const auto *maps = peer_at<const unsigned long long>(
+        a.local_base, a.forward_output_ready_epoch_offset);
+    const auto *headers = peer_at<const LocalP2pRouteHeader>(
+        a.local_base, a.direct_headers_offset);
+    fragment.compact_row = return_mapping_compact_row(maps[canonical_row]);
+    fragment.contiguous_source_rank = headers[canonical_row].source_rank;
+  }
+  fragment.remote_context_mask = context_mask;
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
       fragment.epoch);
   published.store(a.epoch, ::cuda::memory_order_release);
@@ -100,9 +105,9 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
 #endif
 }
 
-// Called by lane 0 only after all FC2 N tiles have made canonical and registered
-// staging stores system-visible.  Publishing one record per M-block keeps the
-// row-map scan and fragment coalescing out of the WGMMA CTA altogether.
+// The last FC2 N tile publishes one task after all output stores are visible.
+// Its parallel routing check certifies common contiguous tiles; only boundary
+// tiles require the sender to coalesce individual rows.
 __device__ __noinline__ void issue_direct_full_mblock(
     const ForwardKernelArgs &a, unsigned long long *scheduler,
     std::uint64_t canonical_row, std::uint32_t valid_rows,
@@ -110,7 +115,9 @@ __device__ __noinline__ void issue_direct_full_mblock(
   enqueue_direct_full_mblock(
       a, scheduler, canonical_row, valid_rows,
       static_cast<std::uint32_t>(context_masks),
-      static_cast<std::uint32_t>(context_masks >> 32U));
+      static_cast<std::uint32_t>((context_masks >> 32U) & 0x7fffffffULL),
+      a.use_gin && (context_masks & 0x8000000000000000ULL) == 0ULL &&
+          static_cast<std::uint32_t>(context_masks) != 0U);
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
       direct_mblocks_complete(a, scheduler));
   const auto completed =
@@ -128,7 +135,7 @@ __device__ __noinline__ void issue_direct_full_mblock(
 // Separate work planes share immutable FC2 descriptors and explicit completion
 // counters. None of the local-copy/completion workers owns a GIN context.
 // FULL Return already lands in this rank's registered compact receive plane.
-// Once a chunk's ordered fragment markers are complete, publish only its
+// Once a chunk's payload-row counter is complete, publish only its
 // route-to-compact metadata and readiness.  Reduce then reads that registered
 // payload in place, eliminating the former 352 MiB receive->contribution copy
 // while preserving large contiguous network puts.
@@ -173,7 +180,6 @@ struct DirectFullCompletionState {
   std::uint32_t selected = 0U;
   std::uint32_t chunk_ready = 0U;
   std::uint32_t progressed = 0U;
-  unsigned long long marker_ready[persistent_v3::kWarpsPerCta]{};
 };
 
 __device__ __forceinline__ bool
@@ -241,30 +247,14 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   const auto *fragment_ready = reinterpret_cast<const unsigned long long *>(
       static_cast<const std::byte *>(a.gin_window_base) +
       a.gin_return_fragment_ready_offset);
-  constexpr auto kMarkerWarps = forward_tuning::kCompletionMarkerWarps;
-  if (threadIdx.x < kMarkerWarps * 32U) {
-    constexpr unsigned int kWarpMask = 0xffffffffU;
-    const auto warp = threadIdx.x / 32U;
-    const auto lane = threadIdx.x & 31U;
-    // GIN writes arrive through the async proxy.  One coherence handoff and one
-    // parallel marker pass are enough for this opportunistic probe.
-    asm volatile("fence.proxy.async.global;" : : : "memory");
-    unsigned long long ready_rows = 0ULL;
-    for (std::uint32_t row = warp * 32U + lane; row < state.selected_rows;
-         row += kMarkerWarps * 32U)
-      ready_rows += fragment_ready[row_begin + row];
-    for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U)
-      ready_rows += __shfl_down_sync(kWarpMask, ready_rows, offset);
-    if (lane == 0U)
-      state.marker_ready[warp] = ready_rows;
-  }
-  __syncthreads();
   if (threadIdx.x == 0U) {
-    unsigned long long ready_rows = 0ULL;
-#pragma unroll
-    for (std::uint32_t warp = 0U; warp < kMarkerWarps; ++warp)
-      ready_rows += state.marker_ready[warp];
-    state.chunk_ready = ready_rows >= state.selected_rows ? 1U : 0U;
+    // Every put contributes its row count to the destination chunk's counter.
+    // Fragments never cross a chunk boundary. Equality therefore certifies
+    // all payloads, independent of sender/QP completion order.
+    asm volatile("fence.proxy.async.global;" : : : "memory");
+    const auto ready_rows = *((volatile const unsigned long long *)
+        (fragment_ready + state.selected_chunk));
+    state.chunk_ready = ready_rows == state.selected_rows ? 1U : 0U;
   }
   __syncthreads();
   if (state.chunk_ready == 0U)
@@ -314,7 +304,7 @@ struct DirectLocalReturnState {
   std::uint32_t selected = 0U;
   std::uint32_t active = 0U;
   std::uint32_t copied_rows = 0U;
-  ForwardDirectReturnFragment batch[kMaxDirectLocalReturnBatch]{};
+  ForwardReturnTile batch[kMaxDirectLocalReturnBatch]{};
 };
 
 __device__ __forceinline__ bool
@@ -350,7 +340,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
     std::uint32_t preferred_context, unsigned long long *scheduler,
     DirectLocalReturnState &state, std::byte *tma_storage,
     DirectLocalReturnBarrier *tma_full) {
-  auto *fragments = peer_at<ForwardDirectReturnFragment>(
+  auto *fragments = peer_at<ForwardReturnTile>(
       a.local_base, a.forward_direct_return_fragment_offset);
   if (threadIdx.x == 0U) {
     state.selected = 0U;
@@ -385,7 +375,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       state.selected = count;
       for (unsigned int item = 0U; item < count; ++item) {
         state.batch[item] = fragments[stripe + (begin + item) * stripes];
-        if ((state.batch[item].source_rank & (1U << context)) != 0U)
+        if ((state.batch[item].local_context_mask & (1U << context)) != 0U)
           ++state.active;
       }
       break;
@@ -434,7 +424,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
         bool copied = false;
         for (std::uint32_t item = 0U; item < state.selected; ++item) {
           const auto fragment = state.batch[item];
-          if ((fragment.source_rank & (1U << context)) == 0U)
+          if ((fragment.local_context_mask & (1U << context)) == 0U)
             continue;
           for (std::uint32_t local_row = warp; local_row < fragment.row_count;
                local_row += tma_warps) {
@@ -465,13 +455,12 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
       const auto vector_count = a.hidden / 8ULL;
       const auto warp = threadIdx.x / 32U;
       const auto lane = threadIdx.x & 31U;
-      constexpr auto kWarps = persistent_v3::kWarpsPerCta;
-      // A warp owns one row. Twelve independent copy streams expose enough
-      // outstanding peer transactions to fill NVLink. Batching only changes
-      // the fence cadence; each row keeps the same warp ownership.
+      const auto kWarps = blockDim.x / 32U;
+      // A warp owns one row. Use every warp in either transport launch;
+      // batching changes the fence cadence without changing row ownership.
       for (std::uint32_t item = 0U; item < state.selected; ++item) {
         const auto fragment = state.batch[item];
-        if ((fragment.source_rank & (1U << context)) == 0U)
+        if ((fragment.local_context_mask & (1U << context)) == 0U)
           continue;
         for (std::uint32_t local_row = warp; local_row < fragment.row_count;
              local_row += kWarps) {
@@ -494,7 +483,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
     std::uint32_t published_rows = 0U;
     for (std::uint32_t item = 0U; item < state.selected; ++item) {
       const auto fragment = state.batch[item];
-      if ((fragment.source_rank & (1U << context)) == 0U)
+      if ((fragment.local_context_mask & (1U << context)) == 0U)
         continue;
       for (std::uint32_t local_row = threadIdx.x;
            local_row < fragment.row_count; local_row += blockDim.x) {
@@ -630,7 +619,8 @@ __device__ __forceinline__ void issue_direct_full_fragment_rdmacta(
       ncclGin_VASignalAdd{
           a.gin_window,
           a.gin_return_fragment_ready_offset +
-              static_cast<std::size_t>(fragment.compact_row) *
+              static_cast<std::size_t>(fragment.compact_row /
+                                           a.forward_return_chunk_rows) *
                   sizeof(std::uint64_t),
           static_cast<std::uint64_t>(fragment.row_count)},
       ncclGin_CounterInc{1},
@@ -674,7 +664,6 @@ __device__ __forceinline__ void flush_direct_full_run(
 }
 
 struct DirectFullRdmaState {
-  forward_reduce_detail::RdmaReduceMailbox *reduce_mailbox = nullptr;
   unsigned long long cursor = 0ULL;
   unsigned long long issued = 0ULL;
   unsigned long long completed = 0ULL;
@@ -703,7 +692,7 @@ __device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
     const ForwardKernelArgs &a,
     persistent_v3::ForwardPipelineControl &control, const ncclGin &gin,
     ncclTeam world, std::uint32_t context,
-    const ForwardDirectReturnFragment &mblock,
+    const ForwardReturnTile &mblock,
     transport_state::GenerationCompletionVector *completion,
     transport_state::ContextCompletionRecord *context_completion,
     DirectFullRdmaState &state) {
@@ -746,17 +735,18 @@ __device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
 #if WEFTMOE_DEBUG_VALIDATE
     atomicMax(&completion->fc1_scheduler_value, 4000ULL + canonical_row);
 #endif
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        published(mapping[canonical_row]);
-    const auto encoded = published.load(::cuda::memory_order_acquire);
+    // Dispatch released this immutable mapping before input readiness;
+    // the FC1 -> FC2 -> descriptor chain carries that dependency here.
+    const auto encoded = mapping[canonical_row];
 #if WEFTMOE_DEBUG_VALIDATE
     if (encoded == 0ULL)
       atomicMax(&completion->fc2_scheduler_value, 5000ULL + canonical_row);
 #endif
-    // The helper's per-context release certificate is acquired before this
-    // scan, so a zero mapping means that helper has not completed yet. Leave
-    // the row cursor in place and let Dispatch make progress before retrying.
-    if (encoded == 0ULL || cancelled(a, control))
+    if (encoded == 0ULL) {
+      persistent_v3::publish_error_once(control.generation, 312ULL);
+      return false;
+    }
+    if (cancelled(a, control))
       return false;
 #if WEFTMOE_DEBUG_VALIDATE
     atomicMax(&completion->fc2_scheduler_value, 6000ULL + canonical_row);
@@ -797,98 +787,6 @@ __device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
   return true;
 }
 
-// Once RDMA packing has drained, its ten data warps have no more useful work
-// while lane 0 remains the permanent GIN owner.  Use those otherwise-idle
-// warps to acquire-prefetch the eager reverse map.  Each warp owns a disjoint
-// subsequence of immutable M-block records; each RDMA CTA contributes only its
-// context bit.  This keeps system-scope polling and the first row scan out of
-// the scalar GIN issue loop without transferring a QP or adding a CTA-wide
-// rendezvous.
-__device__ __forceinline__ void direct_full_mapping_helper(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, std::uint32_t context,
-    unsigned long long *scheduler, std::uint32_t helper_warp,
-    std::uint32_t helper_warps) {
-  constexpr unsigned int kWarpMask = 0xffffffffU;
-  const auto lane = threadIdx.x & 31U;
-  const auto mblocks = scheduler[3];
-  if (mblocks > a.forward_direct_return_fragment_capacity) {
-    if (lane == 0U)
-      persistent_v3::publish_error_once(control.generation, 311ULL);
-    return;
-  }
-
-  auto *fragments = peer_at<ForwardDirectReturnFragment>(
-      a.local_base, a.forward_direct_return_fragment_offset);
-  const auto *headers = peer_at<const LocalP2pRouteHeader>(
-      a.local_base, a.direct_headers_offset);
-  auto *mapping = peer_at<unsigned long long>(
-      a.local_base, a.forward_output_ready_epoch_offset);
-
-  for (unsigned long long slot = helper_warp; slot < mblocks;
-       slot += helper_warps) {
-    auto &fragment = fragments[slot];
-    ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
-        fragment.epoch);
-    while (published.load(::cuda::memory_order_acquire) != a.epoch &&
-           !cancelled(a, control))
-      __nanosleep(forward_tuning::kReturnIdleNanosleep);
-    if (cancelled(a, control))
-      return;
-
-    const auto context_bit = 1U << context;
-    if ((fragment.reserved & context_bit) == 0U)
-      continue;
-
-    bool ready = false;
-    while (!ready && !cancelled(a, control)) {
-      bool missing = false;
-      for (std::uint32_t local_row = lane;
-           local_row < fragment.row_count; local_row += 32U) {
-        const auto canonical_row = fragment.canonical_row + local_row;
-        const auto source = headers[canonical_row].source_rank;
-        if (source >= a.world ||
-            source / a.local_world_size == a.node ||
-            source % a.local_world_size != context)
-          continue;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            row_mapping(mapping[canonical_row]);
-        missing = missing ||
-                  row_mapping.load(::cuda::memory_order_acquire) == 0ULL;
-      }
-      ready = __ballot_sync(kWarpMask, missing) == 0U;
-      if (!ready && lane == 0U)
-        __nanosleep(forward_tuning::kReturnIdleNanosleep);
-      __syncwarp(kWarpMask);
-    }
-    if (cancelled(a, control))
-      return;
-
-    if (lane == 0U) {
-      // compact_row is unused by an M-block queue record.  Reuse it as the
-      // per-context acquire certificate; emitted payload fragments are local
-      // temporaries and continue to carry their real compact row there.
-      ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device>
-          ready_mask(fragment.compact_row);
-      ready_mask.fetch_or(static_cast<std::uint64_t>(context_bit),
-                          ::cuda::memory_order_release);
-    }
-    __syncwarp(kWarpMask);
-  }
-}
-
-// FC2 can finish a complete M-block before Dispatch has drained.  The helper
-// warp's release proves that every mapping owned by this context was observed
-// non-zero.  The scalar owner then performs only the coalescing/issue scan.
-__device__ __forceinline__ bool direct_full_mblock_mapping_ready(
-    const ForwardKernelArgs &a, std::uint32_t context,
-    ForwardDirectReturnFragment &mblock) {
-  ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device>
-      ready_mask(mblock.compact_row);
-  return (ready_mask.load(::cuda::memory_order_acquire) & (1ULL << context)) !=
-         0ULL;
-}
-
 // Consume at most one coalesced run. Calling this once from each Dispatch
 // scheduler iteration gives Rail Dispatch priority while opportunistic FULL
 // puts fill otherwise idle network time. Every context remains the sole owner
@@ -905,7 +803,7 @@ __device__ __forceinline__ bool progress_direct_full_rdma_once(
   if (state.cursor >= tail.load(::cuda::memory_order_acquire))
     return false;
 
-  auto *fragments = peer_at<ForwardDirectReturnFragment>(
+  auto *fragments = peer_at<ForwardReturnTile>(
       a.local_base, a.forward_direct_return_fragment_offset);
   auto &fragment = fragments[state.cursor];
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
@@ -913,9 +811,23 @@ __device__ __forceinline__ bool progress_direct_full_rdma_once(
   if (published.load(::cuda::memory_order_acquire) != a.epoch)
     return false;
 
-  if ((fragment.reserved & (1U << context)) != 0U) {
-    if (!direct_full_mblock_mapping_ready(a, context, fragment))
-      return false;
+  if ((fragment.remote_context_mask & (1U << context)) != 0U) {
+    if (fragment.contiguous_source_rank != UINT32_MAX) {
+      if (!direct_full_return_has_credit(a, gin, state))
+        return false;
+      ForwardDirectReturnFragment wire{};
+      wire.canonical_row = fragment.canonical_row;
+      wire.compact_row = fragment.compact_row;
+      wire.row_count = fragment.row_count;
+      wire.source_rank = fragment.contiguous_source_rank;
+      wire.context = context;
+      wire.epoch = a.epoch;
+      issue_direct_full_fragment_rdmacta(a, gin, world, wire, completion,
+                                        context_completion, state.issued);
+      ++state.cursor;
+      return true;
+    }
+
     return progress_direct_full_mblock_rdmacta(
         a, control, gin, world, context, fragment, completion,
         context_completion, state);
@@ -954,8 +866,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
         state.cursor >= tail.load(::cuda::memory_order_acquire))
       break;
     if (!progressed)
-      if (!forward_reduce_detail::try_reduce_rdma_token(a, state.reduce_mailbox))
-        __nanosleep(forward_tuning::kReturnIdleNanosleep);
+      __nanosleep(forward_tuning::kReturnIdleNanosleep);
   }
 
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -963,8 +874,7 @@ __device__ __forceinline__ void direct_full_rdma_thread(
   issued_count.store(state.issued, ::cuda::memory_order_release);
   while (gin.readCounter(1, 56, ::cuda::memory_order_acquire) < state.issued &&
          !cancelled(a, control))
-    if (!forward_reduce_detail::try_reduce_rdma_token(a, state.reduce_mailbox))
-      __nanosleep(forward_tuning::kTransportIdleNanosleep);
+    __nanosleep(forward_tuning::kTransportIdleNanosleep);
 
   if (state.issued != 0ULL) {
     complete_completion_tasks(completion, transport_state::TaskClass::Return,

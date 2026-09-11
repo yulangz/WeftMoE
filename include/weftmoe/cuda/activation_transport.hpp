@@ -196,6 +196,7 @@ struct ForwardMegaKernelAudit {
   std::uint32_t requested_cluster_size = 1;
   std::uint32_t runtime_cluster_size = 1;
   std::uint64_t observed_cluster_rank_mask = 1;
+  // Zero when standalone cluster occupancy was not queried for this launch.
   std::uint32_t max_active_clusters = 0;
   std::uint64_t fc1_tasks = 0;
   std::uint64_t fc2_tasks = 0;

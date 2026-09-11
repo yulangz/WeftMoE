@@ -11,6 +11,22 @@
 
 namespace forward_compute_detail {
 
+// The transport grid launches with one CTA per cluster. Observe the
+// compute grid too so split-kernel diagnostics report its actual launch.
+__device__ __forceinline__ void observe_compute_cluster(
+    const ForwardKernelArgs &a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (threadIdx.x == 0U) {
+    const auto cluster = cooperative_groups::this_cluster();
+    const auto dimensions = cluster.dim_blocks();
+    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    atomicMax(&status->runtime_cluster_size,
+              dimensions.x * dimensions.y * dimensions.z);
+    atomicOr(&status->cluster_rank_mask, 1ULL << cluster.block_rank());
+  }
+#endif
+}
+
 constexpr std::uint32_t kThreads = forward_tuning::kComputeThreads;
 constexpr std::uint32_t kMathWarpGroups = forward_tuning::kMathWarpgroups;
 constexpr std::uint32_t kMathThreads = kMathWarpGroups * 128U;
@@ -1247,7 +1263,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
             cute::warpgroup_fence_operand(accum[index]);
-          // TMA remains four-stage asynchronous in the producer warpgroup.  The
+          // TMA remains asynchronous in the producer warpgroup.  The
           // math side completes one K=64 group before recycling that stage; the
           // previous wait<1> needed a second live accumulator generation and
           // made ptxas serialize every individual WGMMA instruction.
@@ -1424,6 +1440,26 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               local_context_bit = 1U << context;
           }
         }
+        // Certify a whole-tile wire range in parallel while these threads
+        // already inspect its routing headers. Bit 63 records any exception;
+        // mixed-source and chunk-boundary tiles retain the general run path.
+        bool split_return = false;
+        if constexpr (!StaticLocal) {
+          if (a.use_gin && threadIdx.x < valid_rows) {
+            const auto *maps = peer_at<const unsigned long long>(
+                a.local_base, a.forward_output_ready_epoch_offset);
+            const auto first_source = headers[row].source_rank;
+            const auto first = maps[row];
+            const auto entry = maps[row + threadIdx.x];
+            split_return = first_source / a.local_world_size == a.node ||
+                headers[row + threadIdx.x].source_rank != first_source ||
+                first == 0ULL || entry == 0ULL ||
+                return_mapping_chunk(first) != return_mapping_chunk(entry) ||
+                return_mapping_compact_row(entry) !=
+                    return_mapping_compact_row(first) + threadIdx.x;
+          }
+        }
+        const auto warp_split = __any_sync(0xffffffffU, split_return);
         const auto warp_remote =
             __reduce_or_sync(0xffffffffU, remote_context_bit);
         const auto warp_local =
@@ -1431,7 +1467,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         if ((threadIdx.x & 31U) == 0U)
           atomicOr(return_context_masks_shared,
                    static_cast<unsigned long long>(warp_remote) |
-                       (static_cast<unsigned long long>(warp_local) << 32U));
+                       (static_cast<unsigned long long>(warp_local) << 32U) |
+                       (static_cast<unsigned long long>(warp_split) << 63U));
         cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
 
         if (threadIdx.x == 0U) {
@@ -1513,7 +1550,8 @@ template <bool StaticLocal, bool M64 = false,
           std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
 __global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
 local_p2p_forward_compute_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ ForwardKernelArgs a,
+    const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map) {
@@ -1534,6 +1572,7 @@ local_p2p_forward_compute_kernel(
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
+  forward_compute_detail::observe_compute_cluster(a);
   static_assert(!(Fc1Only && Fc2Only),
                 "a Forward compute kernel cannot be both FC1-only and FC2-only");
   if constexpr (Fc1Only) {
@@ -1607,6 +1646,7 @@ __device__ __forceinline__ void local_p2p_forward_tma_store_role(
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
   __syncthreads();
+  forward_compute_detail::observe_compute_cluster(a);
   forward_compute_detail::persistent_role<
       StaticLocal, DoFc1, true, false, ForwardTaskPartition::All, true,
       StoreToStaging, Fc1StageCount, Fc2StageCount, Cluster2,
@@ -1636,7 +1676,8 @@ template <bool StaticLocal, bool DoFc1, bool StoreToStaging = false,
           std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
 __global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
 local_p2p_forward_tma_store_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ ForwardKernelArgs a,
+    const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map,
@@ -1673,7 +1714,8 @@ template <bool StaticLocal, bool StoreToStaging = false,
           std::uint32_t Fc2StageCount = forward_tuning::kFc2Stages>
 __global__ __launch_bounds__(forward_tuning::kComputeThreads, 1) void
 local_p2p_forward_training_tma_store_kernel(
-    ForwardKernelArgs a, const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ ForwardKernelArgs a,
+    const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map,
@@ -1704,9 +1746,8 @@ local_p2p_forward_training_tma_store_kernel(
 // fully overlapped with Return/RDMA, while keeping its route-wait and FP32
 // combine control flow out of the WGMMA entry's register allocation.
 template <bool StaticLocal>
-__global__
-__launch_bounds__(256,
-                  1) void local_p2p_forward_reduce_kernel(ForwardKernelArgs a) {
+__global__ __launch_bounds__(256, 1) void local_p2p_forward_reduce_kernel(
+    const __grid_constant__ ForwardKernelArgs a) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);

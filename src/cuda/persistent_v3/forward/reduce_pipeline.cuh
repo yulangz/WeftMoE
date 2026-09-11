@@ -174,36 +174,24 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           ::cuda::atomic_ref<unsigned long long,
                              ::cuda::thread_scope_device>
               head(control->reduce_ready_head.value);
-          auto candidate = head.load(::cuda::memory_order_relaxed);
+          // Compute has finished this CTA's GEMM work. Reserve a finite
+          // batch once, then acquire each queue entry before reading payload.
+          // Transport helpers still only claim already-published entries.
+          const auto candidate = head.fetch_add(
+              kTokensPerClaim, ::cuda::memory_order_relaxed);
           const auto token_count = static_cast<unsigned long long>(
               a.dispatch.identity.num_tokens);
           if (candidate >= token_count) {
-            // Every queue entry has an owner, including opportunistic
-            // transport consumers. Finalization separately waits for the
-            // completed-token counter before publishing terminal status.
+            // Ownership is not completion: finalization also waits for every
+            // claimed token's completed counter, including helper consumers.
             queue_done = 1U;
           } else {
-            ::cuda::atomic_ref<unsigned long long,
-                               ::cuda::thread_scope_system>
-                tail(control->reduce_ready_tail.value);
-            const auto published = tail.load(::cuda::memory_order_acquire);
-            const auto available =
-                published < token_count ? published : token_count;
-            if (candidate < available) {
-              const auto count = static_cast<unsigned int>(
-                  min(static_cast<unsigned long long>(kTokensPerClaim),
-                      available - candidate));
-              if (head.compare_exchange_strong(
-                      candidate, candidate + count,
-                      ::cuda::memory_order_acq_rel,
-                      ::cuda::memory_order_relaxed)) {
-                batch_begin = candidate;
-                batch_count = count;
-              }
-            } else {
-              __nanosleep(forward_tuning::kReduceQueueNanosleep);
-            }
+            batch_begin = candidate;
+            batch_count = static_cast<unsigned int>(min(
+                static_cast<unsigned long long>(kTokensPerClaim),
+                token_count - candidate));
           }
+
         }
       }
       __syncthreads();

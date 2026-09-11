@@ -61,11 +61,6 @@ def run(model: ModelSpec, *, phase: str = 'forward', tokens: int = 8192,
     plan['jit']['jobs'] = jobs
     candidates = module.expand_candidates(plan)
     candidate = candidates[0]
-    if not autotune and not explicit_config:
-        candidate['config']['relay_ctas'] = (
-            (24 if phase == 'forward' else 32) if nodes == 1
-            else (8 if phase == 'forward' else 16))
-        module.validate_tuning(candidate['config'])
     output = Path(output or settings.tune_directory(phase) /
                   f'run-{uuid.uuid4().hex}.json').resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

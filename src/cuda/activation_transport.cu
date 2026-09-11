@@ -4394,6 +4394,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 
   int cluster_supported = 0;
   int max_active_clusters = 0;
+  internal::throw_cuda(
+      "forward-run",
+      cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
+                             static_cast<int>(exec->device)),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaDevAttrClusterLaunch");
   int sms = 0;
     internal::throw_cuda(
         "forward-run",
@@ -4571,15 +4578,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       constexpr std::uint32_t forward_fc1_stages = forward_tuning::kFc1Stages;
       constexpr std::uint32_t forward_fc2_stages = forward_tuning::kFc2Stages;
       const bool supported_stage_pair =
-          (forward_fc1_stages == 2U && forward_fc2_stages == 4U) ||
-          (forward_fc1_stages == 3U && forward_fc2_stages == 3U) ||
-          (forward_fc1_stages == 3U && forward_fc2_stages == 4U) ||
-          (forward_fc1_stages == 4U && forward_fc2_stages == 4U);
+          forward_fc1_stages >= 2U && forward_fc1_stages <= 4U &&
+          forward_fc2_stages >= 2U && forward_fc2_stages <= 4U &&
+          (forward_tuning::kMainIntermediate / forward_tuning::kTileK) %
+                  forward_fc2_stages == 0U;
       if (!supported_stage_pair)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
             "Forward FC1/FC2 TMA stages", id.calling_rank,
-            "one of 2x4, 3x3, 3x4, or 4x4",
+            "2..4 stages with FC2 stages dividing the reduction iterations",
             std::to_string(forward_fc1_stages) + "x" +
                 std::to_string(forward_fc2_stages));
       if ((forward_fc1_stages != 3U || forward_fc2_stages != 4U) &&
@@ -4596,13 +4603,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             "WEFTMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
             "M128 without an M64 experiment",
             std::to_string(args.forward_fc1_locality_group));
-      if (forward_fc2_tma_store &&
-          (forward_m64 || forward_fc1_stages != 4U ||
-           forward_fc2_stages != 4U))
+      if (forward_fc2_tma_store && forward_m64)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
             "WEFTMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
-            "the production M128 4x4-stage scheduler",
+            "the production M128 scheduler",
             "an incompatible M tile or TMA stage configuration");
       if (forward_fc2_tma_store && args.use_gin &&
           !args.forward_registered_output)
@@ -4615,8 +4620,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         args.forward_mblock_rows = 64U;
       const auto forward_main_compute_ctas = args.forward_compute_cta_count;
       const bool forward_cluster2_pipeline_compatible =
-          forward_fc2_tma_store && !forward_m64 && forward_fc1_stages == 4U &&
-          forward_fc2_stages == 4U;
+          forward_fc2_tma_store && !forward_m64;
       if (forward_cluster2 && !forward_cluster2_pipeline_compatible)
         forward_cluster2 = false;
       const auto forward_fc1_ntiles =
@@ -4634,7 +4638,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           forward_main_compute_ctas / 2U <=
               persistent_v3::kForwardComputePairCapacity;
       if (forward_cluster2 && !forward_cluster2_extent_compatible)
-        forward_cluster2 = false;
+        transport_error(
+            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+            "Forward cluster extent", id.calling_rank,
+            "even compute CTA and FC1/FC2 N-tile counts within pair capacity",
+            "compile cluster_size=1 for this shape");
       // Expert storage remains padded to M=128. Repeated 32..512-row FULL
       // sweeps selected 256-row completion chunks: fewer marker scans and WQEs
       // with no measurable loss of FC2/Return overlap.
@@ -4750,8 +4758,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 
       cudaLaunchConfig_t transport_launch{};
       transport_launch.gridDim = dim3(kTransportBlocks, 1, 1);
-      transport_launch.blockDim =
-          dim3(forward_tuning::kComputeThreads, 1, 1);
+      transport_launch.blockDim = dim3(
+          split_local_roles ? forward_tuning::kLocalTransportThreads
+                            : forward_tuning::kComputeThreads,
+          1, 1);
       transport_launch.dynamicSmemBytes = forward_transport_smem;
       transport_launch.stream = slot.forward_transport_stream;
       launch_forward =
@@ -4934,13 +4944,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       launch.stream = exec->stream;
       launch.attrs = attributes;
       launch.numAttrs = 1;
-      internal::throw_cuda(
-          "forward-run",
-          cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
-                                 static_cast<int>(exec->device)),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "cudaDevAttrClusterLaunch");
+
       const auto *forward_kernel = reinterpret_cast<const void *>(
           local_p2p_forward_megakernel<false>);
       internal::throw_cuda("forward-run",
@@ -5319,7 +5323,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     result->audit.tma_multicast_loads =
         slot.host_forward_status->tma_multicast_loads;
     result->audit.runtime_cluster_supported = cluster_supported != 0;
-    result->audit.requested_cluster_size = 2;
+    result->audit.requested_cluster_size = forward_tuning::kClusterSize;
     result->audit.runtime_cluster_size =
         slot.host_forward_status->runtime_cluster_size;
     result->audit.observed_cluster_rank_mask =

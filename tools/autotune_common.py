@@ -305,9 +305,6 @@ def resolve_runtime_settings(*, model: Mapping[str, Any] | None,
     world = parallel["ep"]
     require(model["experts"] % world == 0 and model["top_k"] <= model["experts"],
              "experts must divide evenly across ranks and be >= top_k")
-    private_nccl = repo_root / "artifacts/gin_port_fix/build/lib"
-    if "nccl_lib_dir" not in topology and (private_nccl / "libnccl.so").exists():
-        topology["nccl_lib_dir"] = str(private_nccl)
     if "runtime_library_path" not in topology:
         paths = [Path("/usr/local/cuda/compat")]
         if topology.get("nccl_lib_dir"):

@@ -47,7 +47,31 @@ class RunWorkflowTest(unittest.TestCase):
         result = workflow.run(self.model, config=config, system=dict(nodes=1, gpus_per_node=2),
                               generate_only=True)
         self.assertEqual(result['topology']['ep'], 2)
-        self.assertEqual(result['candidates'][0]['config']['relay_ctas'], 8)
+        self.assertEqual(result['candidates'][0]['config']['relay_ctas'], 24)
+
+    def test_default_and_autotune_incumbent_agree(self):
+        for phase in ('forward', 'backward'):
+            for nodes in (1, 2):
+                system = dict(nodes=nodes, gpus_per_node=8)
+                if nodes > 1:
+                    system['remote'] = 'root@example'
+                plain = workflow.run(self.model, phase=phase, system=system,
+                                     generate_only=True)
+                tune = workflow.run(self.model, phase=phase, system=system,
+                                    autotune=True, generate_only=True)
+                self.assertEqual(plain['candidates'][0]['config'],
+                                 tune['candidates'][0]['config'])
+                self.assertLessEqual(len(tune['candidates']), 80)
+                gemm = plain['candidates'][0]['config']
+                if phase == 'forward':
+                    self.assertEqual((gemm['fc1_tile_n'], gemm['fc2_tile_n'],
+                                      gemm['fc1_stages'], gemm['fc2_stages']),
+                                     (128, 256, 4, 4))
+                else:
+                    self.assertEqual((gemm['dab_tile_n'], gemm['dx_tile_n'],
+                                      gemm['dw_tile_m'], gemm['dw_tile_n'],
+                                      gemm['dab_stages'], gemm['dw1_stages']),
+                                     (256, 256, 128, 256, 4, 3))
 
     def test_tuned_winner_benchmarks_requested_tokens(self):
         import autotune_forward as forward

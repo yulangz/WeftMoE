@@ -362,9 +362,6 @@ def main():
         raise RuntimeError(
             f"Megatron world mismatch expected={2 * args.gpus_per_node} "
             f"actual={record.get('world')}")
-    if record.get("nccl_runtime_version") != "2.29.7":
-        raise RuntimeError(
-            f"unexpected NCCL runtime {record.get('nccl_runtime_version')}")
     if args.dispatcher == "flex":
         record["network_backend"] = (
             "deepep-nvshmem-ibgda-hierarchical-rdma"

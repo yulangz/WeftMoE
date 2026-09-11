@@ -6,8 +6,8 @@ and parallel topology are supplied separately by the caller. Compiler, library,
 and network settings are not kernel hyperparameters.
 
 Each parameter contains a nonempty array of candidate values. The first values
-form the incumbent configuration; the Cartesian product defines the search
-space. A single value fixes a parameter for that search. Supported values and
+form the incumbent configuration and the defaults used when autotuning is
+disabled; the Cartesian product defines the search space. A single value fixes a parameter for that search. Supported values and
 parameter combinations are checked by the autotuner before benchmarking.
 
 FWD denotes forward execution; BWD denotes backward execution. A CTA is a CUDA
@@ -25,19 +25,19 @@ requirements and reduce scheduling flexibility.
 |---|---|---|
 | `tile_m` | FWD/BWD | Row dimension of activation GEMM tiles. Padding and the number of available row blocks affect utilization. Keep the default unless evaluating another supported tile shape. |
 | `tile_k` | FWD/BWD | Reduction-dimension step of the GEMM pipeline. The current implementation uses 64 to match its shared-memory layout. |
-| `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Wider tiles can improve reuse but increase register pressure and reduce the number of independently schedulable tasks. |
+| `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Start with FC1 N128 and FC2 N256 on Hopper. FC1 holds two projection accumulators, so increasing its N tile can be costly even when the shared-memory buffers fit. Keep FC2 N128 as an alternative for distributed tuning. |
 | `dab_tile_n`, `dx_tile_n` | BWD | Output-column dimensions of the activation-gradient and input-gradient GEMMs. Start with 256 for both; evaluate narrower tiles when dimensions or task parallelism warrant it. Narrower tiles do not necessarily reduce register usage. |
-| `dw_tile_m`, `dw_tile_n` | BWD | Output-tile dimensions of the weight-gradient GEMMs. Larger tiles reuse more input data but require more accumulator storage. |
-| `fc1_stages`, `fc2_stages` | FWD | Number of input-buffer stages for each forward GEMM. More stages can hide load latency at the cost of shared memory. Change only supported stage pairs. |
-| `dab_stages`, `dx_stages` | BWD | Input-buffer stages for activation-gradient and input-gradient GEMMs. These values must match in the current implementation. |
-| `dw1_stages`, `dw2_stages` | BWD | Input-buffer stages for the two weight-gradient GEMMs. These values must match in the current implementation. |
+| `dw_tile_m`, `dw_tile_n` | BWD | Output-tile dimensions of the weight-gradient GEMMs. Start with M128/N256. Larger tiles reuse more input data but require more accumulator storage. |
+| `fc1_stages`, `fc2_stages` | FWD | Number of input-buffer stages for each forward GEMM. Start with 4/4. Each GEMM supports 2–4 stages; FC2 stages must divide `intermediate / tile_k`. Reducing stages can admit wider tiles but may hurt load-latency hiding. The combined buffers must fit the device shared-memory limit. |
+| `dab_stages`, `dx_stages` | BWD | Input-buffer stages for activation-gradient and input-gradient GEMMs. These values must match in the current implementation. Start with 4. |
+| `dw1_stages`, `dw2_stages` | BWD | Input-buffer stages for the two weight-gradient GEMMs. These values must match in the current implementation. Start with 3. |
 | `compute_threads` | FWD/BWD | Threads per compute CTA. The current implementation requires 384. |
 | `math_warpgroups` | FWD/BWD | Warpgroups assigned to matrix computation. The current implementation requires two. |
 | `producer_warpgroups` | FWD/BWD | Warpgroups assigned to staging operands. The current implementation requires one. |
 | `math_registers`, `producer_registers` | FWD/BWD | Per-thread register budget requests for the corresponding roles. These are allocation requests, not measured register counts; inspect compiler resource usage when changing them. |
 | `wgmma_wait_group` | FWD | Number of outstanding WGMMA groups permitted at a wait point. Controls the balance between pipeline overlap and operand or accumulator dependencies. |
 | `fc2_store_atom_n` | FWD | Column width of the FC2 output TMA store atom. Determines the granularity of output stores. |
-| `cluster_size` | FWD | Number of CTAs in a compute cluster. Affects cooperative scheduling, TMA multicast, and residency constraints. |
+| `cluster_size` | FWD | Number of CTAs in a compute cluster. Affects cooperative scheduling, TMA multicast, and residency constraints. A two-CTA specialization requires even FC1 and FC2 N-tile counts; use one CTA for odd counts. |
 | `fc2_tma_store` | FWD | Enables FC2 output stores through shared-memory staging and TMA. Keep enabled as the starting point; its supported stage and cluster combinations are constrained. |
 
 ## Transport Parameters (`2_transport`)
@@ -54,10 +54,10 @@ for compute workers.
 | `rdma_control_warps` | FWD | Warps assigned to RDMA issue and completion control. The current protocol requires two. |
 | `local_dispatch_tma_warps` | FWD | Warps per relay CTA used for node-local dispatch copies. More copy streams increase concurrency but compete with progress and readiness publication work. |
 | `local_return_tma_warps` | FWD | Warps used for node-local return TMA copies. A value of 0 selects vector copies. Comparing 0 and 8 is a useful initial search; more TMA streams are not always faster end to end. |
-| `relay_scatter_warps` | FWD | Warps assigned to relay scatter copies. Controls parallelism within a scatter task. |
+| `relay_scatter_warps` | FWD | Warps assigned to relay scatter copies. Controls concurrent TMA copy streams within a received dispatch chunk. Multiple relay CTAs can consume the same channel concurrently. Shared-memory usage grows with the row width and stream count. |
 | `local_return_batch_mblocks` | FWD | Maximum M-blocks processed in one local return batch. Larger batches amortize scheduling overhead but can delay service of other ready work. |
 | `dispatch_publish_batch_rows` | FWD | Row granularity for publishing dispatch arrival progress. Smaller batches expose compute work sooner; larger batches reduce publication overhead. |
-| `return_chunk_rows` | FWD | Row granularity of inter-node return chunks. Controls transfer and completion-tracking granularity. Chunks must preserve the padded M-block layout. |
+| `return_chunk_rows` | FWD | Row granularity of inter-node return chunks. Controls transfer and completion-tracking granularity. Compare one and two M-tiles (128 and 256 rows with M128); smaller chunks expose completion sooner but require more completion processing. |
 | `return_max_inflight` | FWD | Limit on the return in-flight window. Larger windows allow more outstanding work but consume more tracking resources. A value of 0 disables this window limit. |
 | `registered_output` | FWD | Places FC2 output in the GIN-registered output region for direct transfer. Required by the GIN FC2 TMA store path. |
 | `relay_local_return` | FWD | Assigns local return processing to relay CTAs. Keep enabled; the current supported path requires it. |
@@ -99,7 +99,7 @@ In FWD, return processing makes each routed contribution available at its
 source token. Once all contributions for a token are ready, the token can enter
 the reduction queue. Idle CTAs may consume ready tokens and accumulate their
 contributions in a fixed top-k order. Inter-node return completion also checks
-fragment markers before publishing route readiness.
+one accumulated payload-row count per chunk before publishing route readiness.
 
 BWD uses a separate input-gradient reduction kernel after persistent transport
 completes. This reduction can overlap remaining weight-gradient computation.
@@ -108,7 +108,6 @@ Its thread-count setting does not change the main compute-worker allocation.
 | Parameter | Phase | Purpose and guidance |
 |---|---|---|
 | `completion_chunks_per_pass` | FWD | Return completion chunks considered in one progress pass. Larger values can accelerate completion discovery but reduce time available for other transport work. |
-| `completion_marker_warps` | FWD | Warps checking return-fragment completion markers. Increase only when marker scanning limits completion progress. |
 | `reduce_scheduler` | FWD | Selects how ready reduction work is discovered and scheduled. Use `queue` as the starting point. |
 | `reduce_warps` | FWD | Warps participating when a CTA executes reduction work. Controls parallelism within the reduction role. |
 | `reduce_tokens_per_claim` | FWD | Tokens claimed in one reduction queue operation. Must not exceed `reduce_warps`. Larger claims reduce queue overhead but can reduce load balance near completion. |

@@ -26,9 +26,7 @@ try_claim_reduce_token(const ForwardKernelArgs &a) {
   return ready;
 }
 
-// A compact payload view keeps ForwardKernelArgs in kernel parameter space.
-// In particular, the RDMA rendezvous must not take its address across a
-// non-inlined call: that materializes the entire kernel argument on the stack.
+// Shared payload view for the Compute and Relay Reduce helpers.
 struct ReduceTokenView {
   persistent_v3::ForwardPipelineControl *control;
   TransportDeviceStatus *status;
@@ -159,7 +157,7 @@ try_reduce_one_token(const ForwardKernelArgs &a) {
   return reduce_claimed_token<Warp>(a, encoded);
 }
 
-// Transport CTAs with no remaining primary work can consume ready tokens too.
+// Relay CTAs with no remaining primary work can consume ready tokens too.
 // Queue exhaustion is distinct from completion; finalization waits for both.
 __device__ __forceinline__ void drain_reduce_queue(const ForwardKernelArgs &a) {
   if (!a.forward_dynamic_reduce_queue || threadIdx.x >= 32U)
@@ -178,51 +176,6 @@ __device__ __forceinline__ void drain_reduce_queue(const ForwardKernelArgs &a) {
       break;
     if (!try_reduce_one_token<true>(a))
       __nanosleep(forward_tuning::kReduceQueueNanosleep);
-  }
-}
-
-// Lane 0 owns GIN; its warp peers join only a published Reduce task. A common
-// non-inlined entry supplies the same warp rendezvous from divergent callers.
-struct RdmaReduceMailbox {
-  ReduceTokenView view;
-  unsigned long long sequence;
-  unsigned long long token;
-};
-
-__device__ __noinline__ void
-rdma_reduce_claimed_token(const ReduceTokenView *view,
-                          unsigned long long encoded) {
-  reduce_token_payload<true>(*view, encoded);
-}
-
-__device__ __forceinline__ bool
-try_reduce_rdma_token(const ForwardKernelArgs &a, RdmaReduceMailbox *mailbox) {
-  const auto encoded = try_claim_reduce_token(a);
-  if (encoded == 0ULL)
-    return false;
-  mailbox->token = encoded;
-  const auto sequence = mailbox->sequence + 1ULL;
-  persistent_v3::store_release<::cuda::thread_scope_block>(mailbox->sequence,
-                                                           sequence);
-  rdma_reduce_claimed_token(&mailbox->view, encoded);
-  return true;
-}
-
-__device__ __forceinline__ void
-rdma_reduce_workers(RdmaReduceMailbox *mailbox) {
-  unsigned long long previous = 0ULL;
-  while (true) {
-    const auto sequence =
-        persistent_v3::load_acquire<::cuda::thread_scope_block>(
-            mailbox->sequence);
-    if (sequence == ~0ULL)
-      return;
-    if (sequence != previous) {
-      rdma_reduce_claimed_token(&mailbox->view, mailbox->token);
-      previous = sequence;
-    } else {
-      __nanosleep(forward_tuning::kTaskIdleNanosleep);
-    }
   }
 }
 
