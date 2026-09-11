@@ -58,13 +58,23 @@ def compile_source(source, command, cache):
             with tempfile.TemporaryDirectory(dir=cache) as temporary:
                 obj = Path(temporary) / 'object.o'
                 dep = Path(temporary) / 'object.d'
+                # Capture dependencies before compilation. Recording only their
+                # final mtimes can label an old object as fresh when an editor
+                # changes a header while nvcc is still compiling it.
+                def inputs():
+                    dependencies = shlex.split(dep.read_text().replace('\\\n', '').split(':', 1)[1])
+                    return {str(Path(p).resolve()): Path(p).stat().st_mtime_ns
+                            for p in dependencies + [command[0], __file__]}
+
+                run(command + ['-M', '-MF', str(dep), str(ROOT / source)])
+                before = inputs()
                 # -MD includes external CUDA, NCCL and CUTLASS headers too.
                 run(command + ['-MD', '-MF', str(dep), '-c', str(ROOT / source), '-o', str(obj)])
-                dependencies = shlex.split(dep.read_text().replace('\\\n', '').split(':', 1)[1])
-                inputs = {str(Path(p).resolve()): Path(p).stat().st_mtime_ns
-                          for p in dependencies + [command[0], __file__]}
+                after = inputs()
+                if before != after:
+                    raise RuntimeError(f'{source}: inputs changed during compilation; rerun the build')
                 stamp = Path(temporary) / 'signature.json'
-                stamp.write_text(json.dumps({'command': command, 'inputs': inputs}))
+                stamp.write_text(json.dumps({'command': command, 'inputs': after}))
                 obj.replace(output)
                 stamp.replace(signature)
     return output
