@@ -57,7 +57,7 @@ reduce_token_view(const ForwardKernelArgs &a) {
                              a.gin_return_receive_offset)
                        : nullptr;
   v.mapping = peer_at<const unsigned long long>(
-      a.local_base, a.forward_direct_source_compact_index_offset);
+      a.local_base, a.forward_source_route_to_return_row_offset);
   v.output = peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
   v.order = a.dispatch.combine_order;
   v.route_node = a.dispatch.route_dst_node;

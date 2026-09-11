@@ -3,8 +3,6 @@
 import importlib
 import json
 import sys
-import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,33 +33,6 @@ class RelayTuningTest(unittest.TestCase):
                         header = tune.generated_header("large_relay", config)
                         macro = tune.PARAMETER_MACROS["relay_ctas"]
                         self.assertIn(f"#define {macro} {relay}", header)
-
-    def test_return_cursors_cover_all_local_world_sizes(self):
-        compiler = shutil.which("c++")
-        if compiler is None:
-            self.skipTest("C++ compiler unavailable")
-        source = r'''#include "cuda/persistent_v3/forward/pipeline_state.cuh"
-using namespace weftmoe::cuda;
-constexpr bool cursors_fit() {
-  constexpr auto capacity = sizeof(persistent_v3::ForwardPipelineControl::local_return_head)
-      / sizeof(persistent_v3::PaddedCounter);
-  for (unsigned int world = 1; world <= persistent_v3::kRdmaCtaCount; ++world) {
-    const auto stripes = (forward_tuning::kRelayCtas + world - 1) / world;
-    if (world * stripes > capacity) return false;
-  }
-  return true;
-}
-static_assert(cursors_fit(), "Return cursor capacity must follow Relay count");
-'''
-        for relay in (40, 48, 96):
-            with self.subTest(relay=relay), tempfile.TemporaryDirectory() as tmp:
-                result = subprocess.run(
-                    [compiler, "-std=c++17", "-x", "c++", "-c", "-",
-                     "-I", str(ROOT / "src"), "-I", str(ROOT / "include"),
-                     f"-DWEFTMOE_FWD_RELAY_CTAS={relay}",
-                     "-o", str(Path(tmp) / "layout.o")],
-                    input=source, text=True, capture_output=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_topology_alignment_is_still_required(self):
         for phase, topology, relay in (

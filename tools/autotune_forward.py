@@ -82,11 +82,11 @@ PARAMETER_MACROS = {
     "relay_tma_warps": "WEFTMOE_FWD_RELAY_TMA_WARPS",
     "local_dispatch_tma_warps": "WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS",
     "relay_scatter_warps": "WEFTMOE_FWD_RELAY_SCATTER_WARPS",
-    "local_return_batch_mblocks":
-        "WEFTMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS",
+    "local_return_batch_rows":
+        "WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS",
     "dispatch_publish_batch_rows":
         "WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS",
-    "return_chunk_rows": "WEFTMOE_FWD_RETURN_CHUNK_ROWS",
+    "return_batch_rows": "WEFTMOE_FWD_RETURN_BATCH_ROWS",
     "return_max_inflight": "WEFTMOE_FWD_RETURN_MAX_INFLIGHT",
     "registered_output": "WEFTMOE_FWD_REGISTERED_OUTPUT",
     "relay_local_return": "WEFTMOE_FWD_RELAY_LOCAL_RETURN",
@@ -101,8 +101,8 @@ PARAMETER_MACROS = {
     "task_idle_nanosleep": "WEFTMOE_FWD_TASK_IDLE_NANOSLEEP",
     "transport_idle_nanosleep": "WEFTMOE_FWD_TRANSPORT_IDLE_NANOSLEEP",
     "setup_nanosleep": "WEFTMOE_FWD_SETUP_NANOSLEEP",
-    "completion_chunks_per_pass":
-        "WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS",
+    "completion_peer_probes":
+        "WEFTMOE_FWD_COMPLETION_PEER_PROBES",
     "reduce_scheduler": "WEFTMOE_FWD_REDUCE_SCHEDULER",
     "reduce_warps": "WEFTMOE_FWD_REDUCE_WARPS",
     "reduce_tokens_per_claim": "WEFTMOE_FWD_REDUCE_TOKENS_PER_CLAIM",
@@ -247,12 +247,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     _require_choice(config, "relay_tma_warps", (0, 4, 8, 12))
     _require_choice(config, "local_dispatch_tma_warps", (4, 8, 12))
     _require_choice(config, "relay_scatter_warps", (4, 8, 12))
-    _require_choice(config, "local_return_batch_mblocks", (1, 2, 4, 8))
+    _require_choice(config, "local_return_batch_rows", (32, 64, 128, 256, 512, 1024))
     _require_choice(config, "dispatch_publish_batch_rows",
                     (4, 8, 16, 32, 64, 128))
-    _require_choice(config, "return_chunk_rows", (128, 256, 512))
-    _require(config["return_chunk_rows"] % 128 == 0,
-             "return chunks must preserve the padded M128 contract")
+    _require_choice(config, "return_batch_rows", (32, 64, 128, 256, 512, 1024))
     _require_choice(config, "return_max_inflight", (0, 4, 8, 16, 32, 64))
     _require(not config["fc2_tma_store"] or config["registered_output"],
              "GIN FC2 TMA store requires registered_output=true")
@@ -269,7 +267,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     _require(config["task_claim_chunk"] == 1,
              "only the proven one-task work-queue claim is implemented")
 
-    _require_choice(config, "completion_chunks_per_pass", (1, 2, 4))
+    _require_choice(config, "completion_peer_probes", (1, 2, 4))
     _require_choice(config, "reduce_warps", (4, 8, 12))
     _require(1 <= config["reduce_tokens_per_claim"] <= config["reduce_warps"],
              "reduce_tokens_per_claim must be in [1, reduce_warps]")

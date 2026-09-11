@@ -55,10 +55,10 @@ for compute workers.
 | `local_dispatch_tma_warps` | FWD | Warps per relay CTA used for node-local dispatch copies. More copy streams increase concurrency but compete with progress and readiness publication work. |
 | `local_return_tma_warps` | FWD | Warps used for node-local return TMA copies. A value of 0 selects vector copies. Comparing 0 and 8 is a useful initial search; more TMA streams are not always faster end to end. |
 | `relay_scatter_warps` | FWD | Warps assigned to relay scatter copies. Controls concurrent TMA copy streams within a received dispatch chunk. Multiple relay CTAs can consume the same channel concurrently. Shared-memory usage grows with the row width and stream count. |
-| `local_return_batch_mblocks` | FWD | Maximum M-blocks processed in one local return batch. Larger batches amortize scheduling overhead but can delay service of other ready work. |
+| `local_return_batch_rows` | FWD | Maximum published rows claimed in one local return batch. Larger batches amortize scheduling overhead but can delay service of other ready work. |
 | `dispatch_publish_batch_rows` | FWD | Row granularity for publishing dispatch arrival progress. Smaller batches expose compute work sooner; larger batches reduce publication overhead. |
-| `return_chunk_rows` | FWD | Row granularity of inter-node return chunks. Controls transfer and completion-tracking granularity. Compare one and two M-tiles (128 and 256 rows with M128); smaller chunks expose completion sooner but require more completion processing. |
-| `return_max_inflight` | FWD | Limit on the return in-flight window. Larger windows allow more outstanding work but consume more tracking resources. A value of 0 disables this window limit. |
+| `return_batch_rows` | FWD | Maximum ready rows claimed per inter-node return batch. One notification confirms all preceding payload puts to the same peer. Start with 512 rows to amortize notification overhead; smaller batches can reduce completion latency. This does not change GEMM tiles or Backward chunk sizes. |
+| `return_max_inflight` | FWD | Maximum outstanding return payload puts per GIN context. Notification puts use a separate completion counter. Larger windows increase overlap. A value of 0 disables this window limit. |
 | `registered_output` | FWD | Places FC2 output in the GIN-registered output region for direct transfer. Required by the GIN FC2 TMA store path. |
 | `relay_local_return` | FWD | Assigns local return processing to relay CTAs. Keep enabled; the current supported path requires it. |
 | `dispatch_batch_rows` | BWD | Routed rows claimed in one relay dispatch batch. Start with 16 or 32 for node-local execution. Larger batches can reduce scheduling overhead, while smaller batches improve responsiveness to return work. |
@@ -98,8 +98,9 @@ transport concurrency and GEMM tile choices.
 In FWD, return processing makes each routed contribution available at its
 source token. Once all contributions for a token are ready, the token can enter
 the reduction queue. Idle CTAs may consume ready tokens and accumulate their
-contributions in a fixed top-k order. Inter-node return completion also checks
-one accumulated payload-row count per chunk before publishing route readiness.
+contributions in a fixed top-k order. Inter-node return uses one GIN strong
+signal per sender to publish arrived row notifications. Relay workers claim
+only these confirmed rows before publishing route readiness.
 
 BWD uses a separate input-gradient reduction kernel after persistent transport
 completes. This reduction can overlap remaining weight-gradient computation.
@@ -107,7 +108,7 @@ Its thread-count setting does not change the main compute-worker allocation.
 
 | Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `completion_chunks_per_pass` | FWD | Return completion chunks considered in one progress pass. Larger values can accelerate completion discovery but reduce time available for other transport work. |
+| `completion_peer_probes` | FWD | Sender queues probed for newly arrived return rows in one progress pass. Larger values discover arrivals sooner but reduce time available for other transport work. |
 | `reduce_scheduler` | FWD | Selects how ready reduction work is discovered and scheduled. Use `queue` as the starting point. |
 | `reduce_warps` | FWD | Warps participating when a CTA executes reduction work. Controls parallelism within the reduction role. |
 | `reduce_tokens_per_claim` | FWD | Tokens claimed in one reduction queue operation. Must not exceed `reduce_warps`. Larger claims reduce queue overhead but can reduce load balance near completion. |

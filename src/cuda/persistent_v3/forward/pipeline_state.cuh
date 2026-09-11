@@ -40,6 +40,27 @@ struct alignas(128) ForwardDispatchSequence {
   PaddedCounter inbound_claim;
 };
 
+// Each producer reserves, fills and confirms one interval before reserving
+// another. Consumers claim only confirmed entries. Storage is reset between
+// executions; no ring wrap, per-entry epoch or descriptor scan is required.
+struct alignas(128) ReturnRowQueue {
+  unsigned long long reserved = 0;
+  unsigned long long confirmed = 0;
+  unsigned long long head = 0;
+  unsigned long long begin = 0;
+  unsigned long long capacity = 0;
+};
+
+// Notify's count matrix fixes disjoint arrival intervals for each sender.
+// Only that sender writes the interval, and Relay workers share its head.
+struct alignas(64) ReturnPeerQueue {
+  unsigned long long receive_begin = 0;
+  unsigned long long receive_count = 0;
+  unsigned long long receive_head = 0;
+  unsigned long long send_begin = 0;
+  unsigned long long sent = 0;
+};
+
 struct alignas(128) ForwardPipelineControl {
   GenerationState generation;
   ForwardDispatchSequence dispatch[kRdmaCtaCount];
@@ -49,13 +70,10 @@ struct alignas(128) ForwardPipelineControl {
   PaddedCounter rdma_return_roles_complete;
   PaddedCounter return_receive_roles_complete;
   PaddedCounter source_ready_published;
-  // Shared destination/stripe cursors follow the compiled Relay count.
-  // local_world_size * ceil(relay_ctas / local_world_size) needs at most
-  // relay_ctas + local_world_size - 1 slots; a node has at most eight GPUs.
-  PaddedCounter local_return_head[forward_tuning::kRelayCtas +
-                                  kRdmaCtaCount - 1U];
-  PaddedCounter return_chunk_scan;
-  PaddedCounter return_chunks_complete;
+  // Queue 0 is local; queue 1+context belongs to its permanent GIN owner.
+  ReturnRowQueue return_rows[1U + kRdmaCtaCount];
+  PaddedCounter return_rows_complete;
+  PaddedCounter return_producers_complete;
   // A route publisher increments one source-token counter after making its
   // contribution visible.  The publisher that completes top-k appends that
   // token to the ready queue.  Compute CTAs consume the queue in small batches

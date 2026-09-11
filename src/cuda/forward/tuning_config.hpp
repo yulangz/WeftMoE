@@ -81,14 +81,14 @@
 #ifndef WEFTMOE_FWD_RELAY_SCATTER_WARPS
 #define WEFTMOE_FWD_RELAY_SCATTER_WARPS 12
 #endif
-#ifndef WEFTMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS
-#define WEFTMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS 4
+#ifndef WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS
+#define WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS 512
 #endif
 #ifndef WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS
 #define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 32
 #endif
-#ifndef WEFTMOE_FWD_RETURN_CHUNK_ROWS
-#define WEFTMOE_FWD_RETURN_CHUNK_ROWS 128
+#ifndef WEFTMOE_FWD_RETURN_BATCH_ROWS
+#define WEFTMOE_FWD_RETURN_BATCH_ROWS 512
 #endif
 #ifndef WEFTMOE_FWD_RETURN_MAX_INFLIGHT
 #define WEFTMOE_FWD_RETURN_MAX_INFLIGHT 16
@@ -114,8 +114,8 @@
 #ifndef WEFTMOE_FWD_TASK_CLAIM_CHUNK
 #define WEFTMOE_FWD_TASK_CLAIM_CHUNK 1
 #endif
-#ifndef WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS
-#define WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS 1
+#ifndef WEFTMOE_FWD_COMPLETION_PEER_PROBES
+#define WEFTMOE_FWD_COMPLETION_PEER_PROBES 1
 #endif
 #ifndef WEFTMOE_FWD_REDUCE_SCHEDULER
 // 0=ready queue, 1=dynamic scan, 2=static token stripes.
@@ -204,12 +204,12 @@ inline constexpr std::uint32_t kLocalDispatchTmaWarps =
     WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS;
 inline constexpr std::uint32_t kRelayScatterWarps =
     WEFTMOE_FWD_RELAY_SCATTER_WARPS;
-inline constexpr std::uint32_t kLocalReturnBatchMblocks =
-    WEFTMOE_FWD_LOCAL_RETURN_BATCH_MBLOCKS;
+inline constexpr std::uint32_t kLocalReturnBatchRows =
+    WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS;
 inline constexpr std::uint32_t kDispatchPublishBatchRows =
     WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS;
-inline constexpr std::uint32_t kReturnChunkRows =
-    WEFTMOE_FWD_RETURN_CHUNK_ROWS;
+inline constexpr std::uint32_t kReturnBatchRows =
+    WEFTMOE_FWD_RETURN_BATCH_ROWS;
 inline constexpr std::uint32_t kReturnMaxInflight =
     WEFTMOE_FWD_RETURN_MAX_INFLIGHT;
 inline constexpr std::uint32_t kLocalRouteBatchRows =
@@ -227,8 +227,8 @@ inline constexpr std::uint32_t kFc2PriorityBurst =
     WEFTMOE_FWD_FC2_PRIORITY_BURST;
 inline constexpr std::uint32_t kTaskClaimChunk =
     WEFTMOE_FWD_TASK_CLAIM_CHUNK;
-inline constexpr std::uint32_t kCompletionChunksPerPass =
-    WEFTMOE_FWD_COMPLETION_CHUNKS_PER_PASS;
+inline constexpr std::uint32_t kCompletionPeerProbes =
+    WEFTMOE_FWD_COMPLETION_PEER_PROBES;
 inline constexpr std::uint32_t kReduceScheduler =
     WEFTMOE_FWD_REDUCE_SCHEDULER;
 inline constexpr std::uint32_t kReduceWarps = WEFTMOE_FWD_REDUCE_WARPS;
@@ -333,15 +333,16 @@ static_assert(kLocalDispatchTmaWarps > 0U &&
               kLocalDispatchTmaWarps <= kComputeThreads / 32U);
 static_assert(kRelayScatterWarps > 0U &&
               kRelayScatterWarps <= kComputeThreads / 32U);
-static_assert(kLocalReturnBatchMblocks >= 1U &&
-              kLocalReturnBatchMblocks <= 8U);
-static_assert(kReturnChunkRows > 0U && kReturnMaxInflight <= 64U);
+static_assert(kLocalReturnBatchRows >= 32U &&
+              kLocalReturnBatchRows <= 1024U &&
+              kLocalReturnBatchRows % 32U == 0U);
+static_assert(kReturnBatchRows > 0U && kReturnMaxInflight <= 64U);
 static_assert(kLocalRouteBatchRows > 0U && kStartupMblocks > 0U);
 static_assert(kRelayLocalReturn, "local Return requires Relay ownership");
 static_assert(kTaskClaimChunk == 1U,
               "only the proven one-task queue claim is currently compiled");
-static_assert(kCompletionChunksPerPass > 0U &&
-              kCompletionChunksPerPass <= 4U);
+static_assert(kCompletionPeerProbes > 0U &&
+              kCompletionPeerProbes <= 4U);
 static_assert(kReduceScheduler <= 2U);
 static_assert(kReduceWarps > 0U &&
               kReduceWarps <= kComputeThreads / 32U);

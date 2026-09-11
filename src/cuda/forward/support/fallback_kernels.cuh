@@ -618,12 +618,12 @@ struct GinTransportSliceArgs {
 };
 
 __global__ void gin_signal_reset_kernel(ncclDevComm_t dev_comm,
-                                           std::uint32_t context_count) {
+                                           std::uint32_t context_count,
+                                           std::uint32_t signal_count = 3U) {
   if (blockIdx.x < context_count && threadIdx.x == 0) {
     const ncclGin gin(dev_comm, blockIdx.x);
-    gin.resetSignal(0);
-    gin.resetSignal(1);
-    gin.resetSignal(2);
+    for (std::uint32_t signal = 0U; signal < signal_count; ++signal)
+      gin.resetSignal(signal);
     gin.resetCounter(0);
     gin.resetCounter(1);
   }

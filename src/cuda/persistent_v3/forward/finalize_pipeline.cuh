@@ -95,7 +95,7 @@ __device__ __forceinline__ void split_transport_finalize(
     transport_state::GenerationCompletionVector *completion,
     unsigned long long *scheduler, TransportDeviceStatus *status) {
   // Receive-completion CTA 0 publishes the rank-wide terminal epoch after all
-  // Relay workers have finished the shared chunk pool. RDMA CTA 0 may still be
+  // Relay workers have finished the arrival queues. RDMA CTA 0 may still be
   // waiting for unrelated outbound put completion and must not lengthen the
   // per-token Reduce dependency.
   if (blockIdx.x == persistent_v3::kRdmaCtaCount) {

@@ -70,14 +70,14 @@
     "relay_scatter_warps": [
       12
     ],
-    "local_return_batch_mblocks": [
-      4
+    "local_return_batch_rows": [
+      512
     ],
     "dispatch_publish_batch_rows": [
       128,
       32
     ],
-    "return_chunk_rows": [
+    "return_batch_rows": [
       128,
       256
     ],
@@ -124,7 +124,7 @@
     ]
   },
   "4_completion_reduce": {
-    "completion_chunks_per_pass": [
+    "completion_peer_probes": [
       1
     ],
     "reduce_scheduler": [

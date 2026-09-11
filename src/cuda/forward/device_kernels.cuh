@@ -100,20 +100,10 @@ void local_p2p_forward_megakernel(
       a.local_base, a.forward_reduce_route_count_offset);
   auto *forward_reduce_ready_token = peer_at<unsigned long long>(
       a.local_base, a.forward_reduce_ready_token_offset);
-  auto *forward_output_ready_epoch = peer_at<unsigned long long>(
-      a.local_base, a.forward_output_ready_epoch_offset);
-  auto *forward_return_chunks = peer_at<ForwardReturnChunkRecord>(
-      a.local_base, a.forward_return_chunk_directory_offset);
-  auto *forward_return_chunk_state = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_chunk_state_offset);
-  auto *forward_return_chunk_ready_count = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_chunk_ready_count_offset);
-  auto *forward_return_fragment_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_fragment_index_offset);
-  auto *forward_return_source_compact_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_source_compact_index_offset);
-  auto *forward_return_source_route_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_source_route_index_offset);
+  auto *forward_return_row_map = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_row_map_offset);
+  auto *forward_return_row_to_source_route = peer_at<unsigned long long>(
+      a.local_base, a.forward_return_row_to_source_route_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
   auto *ab_cache =
       a.retain_backward_state
@@ -154,13 +144,6 @@ void local_p2p_forward_megakernel(
       scheduler[13U + 2ULL * a.world] = 0ULL; // Completed M-block queue head
       scheduler[14U + 2ULL * a.world] = 0ULL; // Directory fragments barrier
       scheduler[15U + 2ULL * a.world] = 0ULL; // Reserved directory scratch
-      auto *direct_issued =
-          forward_return_detail::direct_issued_counts(a, scheduler);
-      for (std::uint32_t context = 0; context < a.gin_context_count;
-           ++context)
-        direct_issued[context] = 0ULL;
-      forward_return_detail::direct_fragment_tail(a, scheduler) = 0ULL;
-      forward_return_detail::direct_mblocks_complete(a, scheduler) = 0ULL;
       if constexpr (!StaticLocal) {
         if (a.use_gin) {
           completion->generation = a.dispatch.identity.generation;
@@ -280,14 +263,14 @@ void local_p2p_forward_megakernel(
       forward_compute_pair_mailboxes[pair].tasks[1] = 0ULL;
       forward_compute_pair_mailboxes[pair].metadata = 0ULL;
     }
-    // The same allocation is a generation-local row->(proxy,chunk) map for
+    // The allocation is a generation-local canonical->compact row map for
     // remote Return. Clear only the actual canonical rows; peer proxies fill
     // remote-route entries after consuming the immutable Dispatch directory.
     for (std::uint64_t row =
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          row < dispatch_sizes(a.dispatch).incoming_row_count;
          row += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-      forward_output_ready_epoch[row] = 0ULL;
+      forward_return_row_map[row] = 0ULL;
     if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
       for (std::uint64_t token =
                static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -319,6 +302,16 @@ void local_p2p_forward_megakernel(
           gridDim.x);
     else
       grid.sync();
+    if (stream_remote_dispatch || stream_local_dispatch) {
+      forward_return_detail::initialize_queues(a, *forward_v3_control, scheduler);
+      if constexpr (KernelRole == ForwardKernelRole::TransportOnly)
+        forward_transport_cta_barrier(
+            forward_mixed_scheduler_word(a, scheduler,
+                                         kForwardTransportClearArrivals),
+            2ULL * gridDim.x);
+      else
+        grid.sync();
+    }
     forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
     const auto setup_fc1_ntiles =
@@ -1833,7 +1826,7 @@ void local_p2p_forward_megakernel(
         peer_at<unsigned long long>(a.local_base, a.outgoing_sequence_offset);
     const auto *direct_source_compact_index =
         peer_at<const unsigned long long>(
-            a.local_base, a.forward_direct_source_compact_index_offset);
+            a.local_base, a.forward_source_route_to_return_row_offset);
     const auto *direct_return_receive =
         a.use_gin
             ? reinterpret_cast<const transport::BFloat16 *>(

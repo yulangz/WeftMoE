@@ -297,7 +297,7 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
   const auto *direct_compact =
       a.use_gin
           ? peer_at<const unsigned long long>(
-                a.local_base, a.forward_direct_source_compact_index_offset)
+                a.local_base, a.forward_source_route_to_return_row_offset)
           : static_cast<const unsigned long long *>(nullptr);
 #endif
   auto *combined = peer_at<transport::BFloat16>(

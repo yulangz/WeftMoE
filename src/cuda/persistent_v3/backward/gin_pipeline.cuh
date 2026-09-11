@@ -102,8 +102,8 @@ __device__ __forceinline__ void initialize_relay_state(
                          context]
             .return_row_count;
     completion.chunk_count =
-        (completion.compact_rows + a.forward_return_chunk_rows - 1ULL) /
-        a.forward_return_chunk_rows;
+        (completion.compact_rows + a.backward_return_chunk_rows - 1ULL) /
+        a.backward_return_chunk_rows;
     completion.scan_cursor = context;
     completion.context = context;
     completion.expected =
@@ -274,7 +274,7 @@ __device__ __forceinline__ bool progress_source_completion_once(
     return false;
 
   auto *chunk_state = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_chunk_state_offset);
+      a.local_base, a.backward_return_chunk_state_offset);
   if (threadIdx.x == 0U) {
     for (unsigned long long attempt = 0ULL; attempt < state.expected;
          ++attempt) {
@@ -287,12 +287,12 @@ __device__ __forceinline__ bool progress_source_completion_once(
       if (done.load(::cuda::memory_order_acquire) == execution_epoch(a))
         continue;
       state.selected_chunk = chunk;
-      const auto row_begin = chunk * a.forward_return_chunk_rows;
+      const auto row_begin = chunk * a.backward_return_chunk_rows;
       const auto remaining = state.compact_rows - row_begin;
       state.selected_rows = static_cast<std::uint32_t>(
-          remaining < a.forward_return_chunk_rows
+          remaining < a.backward_return_chunk_rows
               ? remaining
-              : a.forward_return_chunk_rows);
+              : a.backward_return_chunk_rows);
       state.selected = 1U;
       break;
     }
@@ -302,7 +302,7 @@ __device__ __forceinline__ bool progress_source_completion_once(
     return false;
 
   const auto row_begin =
-      state.selected_chunk * a.forward_return_chunk_rows;
+      state.selected_chunk * a.backward_return_chunk_rows;
   const auto *markers = reinterpret_cast<const unsigned long long *>(
       static_cast<const std::byte *>(a.gin_window_base) +
       a.gin_return_fragment_ready_offset);
@@ -332,7 +332,7 @@ __device__ __forceinline__ bool progress_source_completion_once(
     return false;
 
   const auto *route_index = peer_at<const unsigned long long>(
-      a.local_base, a.forward_return_source_route_index_offset);
+      a.local_base, a.forward_return_row_to_source_route_offset);
   const auto *return_receive =
       static_cast<const std::byte *>(a.gin_window_base) +
       a.gin_return_receive_offset;
@@ -489,7 +489,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
       a.local_base, a.direct_headers_offset);
   auto *mapping = peer_at<unsigned long long>(
-      a.local_base, a.forward_output_ready_epoch_offset);
+      a.local_base, a.forward_return_row_map_offset);
   auto *return_staging = bytes + a.gin_return_staging_offset;
   const auto *context_masks = words + scheduler_layout.return_context_mask;
 
@@ -569,7 +569,8 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
             continue;
           }
           const auto compact = return_mapping_compact_row(encoded);
-          const auto chunk = return_mapping_chunk(encoded);
+          const auto chunk =
+              (return_mapping_compact_row(encoded) / a.backward_return_chunk_rows);
           if (state.run_rows == 0U) {
             state.run_canonical = static_cast<std::uint32_t>(canonical);
             state.run_compact = static_cast<std::uint32_t>(compact);
@@ -583,7 +584,8 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
               header.source_rank == state.run_source &&
               canonical == state.run_canonical + state.run_rows &&
               compact == state.run_compact + state.run_rows &&
-              chunk == return_mapping_chunk(first_mapping);
+              chunk == (return_mapping_compact_row(first_mapping) /
+                        a.backward_return_chunk_rows);
           if (!extends)
             break;
           ++state.run_rows;

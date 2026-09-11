@@ -92,7 +92,7 @@ EXPECTED_INVARIANTS = {
     "linear_dw_claim": True,
     "second_dx_probe": False,
     "cohort_count": 1,
-    "forward_return_chunk_rows": 256,
+    "backward_return_chunk_rows": 128,
 }
 
 

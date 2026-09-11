@@ -342,79 +342,18 @@ struct GinDispatchContextRecord {
 };
 static_assert(sizeof(GinDispatchContextRecord) == 40);
 
-// Forward Return uses immutable, generation-local compact chunks. A chunk owns a
-// contiguous range in both the registered staging window and the source
-// rank's return receive window.  Its rows are selected from the canonical
-// reverse descriptors; FC2 completion order never changes this identity.
-struct ForwardReturnChunkRecord {
-  std::uint64_t row_begin;
-  std::uint32_t row_count;
-  std::uint32_t source_node;
-  std::uint32_t context;
-  std::uint32_t expected_fragments;
-  std::uint64_t payload_bytes;
-};
-static_assert(sizeof(ForwardReturnChunkRecord) == 32);
-
-// An immutable compute-tile task shared by local copy and RDMA consumers.
-// A certified contiguous range has one destination; UINT32_MAX selects the
-// general mixed-source/chunk-boundary path. Epoch publishes the entire task.
-struct alignas(16) ForwardReturnTile {
-  std::uint64_t canonical_row;
-  std::uint64_t compact_row;
-  std::uint32_t local_context_mask;
-  std::uint32_t row_count;
-  std::uint32_t contiguous_source_rank;
-  std::uint32_t remote_context_mask;
-  std::uint64_t epoch;
-};
-static_assert(sizeof(ForwardReturnTile) == 48);
-
-// One concrete network operation, materialized only by its GIN owner.
-struct ForwardDirectReturnFragment {
-  std::uint64_t canonical_row;
-  std::uint64_t compact_row;
-  std::uint32_t source_rank;
-  std::uint32_t row_count;
-  std::uint32_t context;
-  std::uint64_t epoch;
-};
-
-// One immutable word lets an FC2 producer address both the proxy's chunk
-// scoreboard and the exact compact row in its registered Return window.  Main
-// shapes need only hundreds of chunks and tens of thousands of compact rows;
-// 24 bits for each preserves ample headroom while retaining a 16-bit rank.
-constexpr std::uint32_t kReturnMappingFieldBits = 24U;
-constexpr std::uint32_t kReturnMappingChunkShift = 24U;
-constexpr std::uint32_t kReturnMappingProxyShift = 48U;
-constexpr unsigned long long kReturnMappingFieldMask =
-    (1ULL << kReturnMappingFieldBits) - 1ULL;
-
+// Dispatch publishes the compact Return row plus one; zero means absent.
+// The source rank is already in the canonical header. Backward derives its
+// chunk from the row, so no rank/chunk bit fields or 24-bit row limit remain.
 __device__ __forceinline__ std::uint64_t
-encode_return_row_mapping(std::uint32_t proxy_rank, std::uint64_t chunk,
-                          std::uint64_t compact_row) {
-  return (static_cast<std::uint64_t>(proxy_rank + 1U)
-          << kReturnMappingProxyShift) |
-         ((chunk + 1ULL) << kReturnMappingChunkShift) | (compact_row + 1ULL);
-}
-
-__device__ __forceinline__ std::uint64_t
-return_mapping_chunk(std::uint64_t mapping) {
-  return ((mapping >> kReturnMappingChunkShift) & kReturnMappingFieldMask) -
-         1ULL;
+encode_return_row_mapping(std::uint64_t compact_row) {
+  return compact_row + 1ULL;
 }
 
 __device__ __forceinline__ std::uint64_t
 return_mapping_compact_row(std::uint64_t mapping) {
-  return (mapping & kReturnMappingFieldMask) - 1ULL;
+  return mapping - 1ULL;
 }
-
-[[maybe_unused]] constexpr std::uint32_t kForwardReturnCompletionBatch = 8U;
-[[maybe_unused]] constexpr unsigned long long kReturnChunkWaiting = 0ULL;
-[[maybe_unused]] constexpr unsigned long long kReturnChunkPacking = 1ULL;
-[[maybe_unused]] constexpr unsigned long long kReturnChunkReady = 2ULL;
-[[maybe_unused]] constexpr unsigned long long kReturnChunkInflight = 3ULL;
-[[maybe_unused]] constexpr unsigned long long kReturnChunkComplete = 4ULL;
 
 enum ForwardProgressWord : std::uint32_t {
   kForwardEntered = 0,
@@ -615,19 +554,14 @@ struct Layout {
   std::size_t forward_fc1_published = 0;
   std::size_t forward_compute_pair_mailboxes = 0;
   std::size_t forward_x_arrived_rows = 0;
-  std::size_t forward_output_ready_epoch = 0;
-  std::size_t forward_return_chunk_directory = 0;
-  std::size_t forward_return_chunk_state = 0;
-  std::size_t forward_return_chunk_ready_count = 0;
-  std::size_t forward_return_fragment_index = 0;
-  std::size_t forward_return_source_compact_index = 0;
-  std::size_t forward_return_source_route_index = 0;
-  std::size_t forward_direct_source_compact_index = 0;
+  std::size_t forward_return_row_map = 0;
+  std::size_t backward_return_chunk_state = 0;
+  std::size_t forward_return_row_to_source_route = 0;
+  std::size_t forward_source_route_to_return_row = 0;
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
-  std::size_t forward_direct_return_fragment = 0;
-  std::uint64_t forward_return_chunk_capacity = 0;
-  std::uint64_t forward_direct_return_fragment_capacity = 0;
+  std::size_t forward_return_rows = 0;
+  std::size_t forward_return_peers = 0;
   std::size_t forward_scheduler = 0;
   std::size_t forward_v3_control = 0;
   std::size_t forward_completion = 0;
@@ -650,7 +584,9 @@ struct GinWindowLayout {
   std::size_t receive_payload = 0;
   std::size_t return_staging = 0;
   std::size_t return_receive = 0;
-  std::size_t return_fragment_ready = 0;
+  std::size_t return_fragment_ready = 0; // Backward arrival counters.
+  std::size_t return_send_rows = 0;
+  std::size_t return_receive_rows = 0;
   // FWD addresses these planes densely as BF16.  BWD reuses their larger
   // allocation as aligned [dX BF16..., dGate FP32] row records so one FULL
   // put carries both gradients and the completion signal.
@@ -782,6 +718,11 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.return_fragment_ready =
       append(cursor, routes, sizeof(std::uint64_t),
              "GIN return fragment ready counters");
+  layout.return_send_rows = append(
+      cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
+      "GIN return send row notifications");
+  layout.return_receive_rows = append(
+      cursor, routes, sizeof(std::uint64_t), "GIN return receive row queue");
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
@@ -808,6 +749,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                     "compiled Forward hidden/intermediate dimensions",
                     std::to_string(config.max_hidden_size) + "x" +
                         std::to_string(config.max_intermediate_size));
+  if (config.max_intermediate_size != 0 &&
+      (config.max_destination_rows_per_rank > UINT32_MAX ||
+       checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                   "return route indices") > UINT32_MAX))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "transport-pool-create",
+                    "return row index", 0, "representable as uint32", "overflow");
   Layout layout;
   std::size_t cursor = 0;
   const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
@@ -1047,34 +994,17 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                checked_mul(max_mblocks, config.max_world_size,
                            "forward exact X M-tile rail counters"),
                sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
-    layout.forward_output_ready_epoch =
+    layout.forward_return_row_map =
         append(cursor, config.max_destination_rows_per_rank,
-               sizeof(std::uint64_t), "forward output row ready epochs");
-    // A discontinuity in the canonical reverse-row space may terminate a
-    // chunk.  The safe O(routes) bound is therefore one directory record per
-    // destination row rather than ceil(rows/chunk_rows).
-    layout.forward_return_chunk_capacity = config.max_destination_rows_per_rank;
-    layout.forward_return_chunk_directory = append(
-        cursor, layout.forward_return_chunk_capacity,
-        sizeof(ForwardReturnChunkRecord), "forward return chunk directory");
-    layout.forward_return_chunk_state =
-        append(cursor, layout.forward_return_chunk_capacity,
-               sizeof(std::uint64_t), "forward return chunk state");
-    layout.forward_return_chunk_ready_count = append(
-        cursor,
-        checked_mul(layout.forward_return_chunk_capacity, config.max_world_size,
-                    "forward return chunk producer rail counters"),
-        sizeof(std::uint64_t), "forward return chunk ready count");
-    layout.forward_return_fragment_index =
-        append(cursor, config.max_destination_rows_per_rank,
-               sizeof(std::uint64_t), "forward return compact fragment index");
-    layout.forward_return_source_compact_index =
-        append(cursor, routes, sizeof(std::uint64_t),
-               "forward source compact return index");
-    layout.forward_return_source_route_index =
+               sizeof(std::uint64_t), "forward canonical to compact Return row map");
+    // Backward still uses chunk counters; Forward receives row notifications.
+    if (config.enable_backward_state)
+      layout.backward_return_chunk_state = append(
+          cursor, routes, sizeof(std::uint64_t), "backward return chunk state");
+    layout.forward_return_row_to_source_route =
         append(cursor, routes, sizeof(std::uint64_t),
                "forward compact return source route index");
-    layout.forward_direct_source_compact_index =
+    layout.forward_source_route_to_return_row =
         append(cursor, routes, sizeof(std::uint64_t),
                "forward FULL source route compact index");
     layout.forward_reduce_route_count = append(
@@ -1083,12 +1013,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_reduce_ready_token = append(
         cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
         "forward reduce ready token queue");
-    layout.forward_direct_return_fragment_capacity =
-        config.max_destination_rows_per_rank;
-    layout.forward_direct_return_fragment = append(
-        cursor, layout.forward_direct_return_fragment_capacity,
-        sizeof(ForwardReturnTile),
-        "forward direct return fragment directory");
+    layout.forward_return_rows = append(
+        cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
+        "forward return row queues");
+    layout.forward_return_peers = append(
+        cursor, config.max_world_size, sizeof(persistent_v3::ReturnPeerQueue),
+        "forward return peer queues");
     layout.forward_scheduler =
         append(cursor, 4 + config.max_world_size * 32ULL, sizeof(std::uint64_t),
                "forward scheduler");

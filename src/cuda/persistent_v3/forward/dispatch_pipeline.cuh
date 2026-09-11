@@ -124,7 +124,7 @@ __device__ __forceinline__ void publish_local_batch(
     std::uint64_t route_end,
     transport_state::GenerationCompletionVector *completion,
     std::byte *tma_storage,
-    forward_return_detail::DirectLocalReturnBarrier *tma_full) {
+    forward_return_detail::ReturnCopyBarrier *tma_full) {
   const auto routes = route_end - route_begin;
   constexpr std::uint32_t kWarps =
       forward_tuning::kLocalDispatchTmaWarps;
@@ -351,12 +351,10 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
       bytes + a.gin_send_fanout_offset);
   auto *send_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.gin_send_payload_offset);
-  auto *source_compact_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_source_compact_index_offset);
   auto *source_route_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_source_route_index_offset);
+      a.local_base, a.forward_return_row_to_source_route_offset);
   auto *direct_source_compact_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_direct_source_compact_index_offset);
+      a.local_base, a.forward_source_route_to_return_row_offset);
   const auto wave_begin = a.dispatch_waves.offsets[wave];
   const auto wave_end = a.dispatch_waves.offsets[wave + 1ULL];
   const auto wave_packets = wave_end - wave_begin;
@@ -388,7 +386,6 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
         continue;
       const auto fanout = fanout_begin + fanout_slot;
       const auto target = a.dispatch.packet_fanout[fanout];
-      source_compact_index[fanout] = target.return_compact_row;
       const auto route =
           token * a.dispatch.identity.top_k + target.topk_slot;
       send_fanout[position * a.dispatch.identity.top_k + fanout_slot] =
@@ -527,7 +524,7 @@ __device__ __forceinline__ void relay_inbound_wave(
     transport_state::GenerationCompletionVector *completion,
     transport_state::ContextCompletionRecord *context_completion,
     std::byte *tma_storage,
-    forward_return_detail::DirectLocalReturnBarrier *tma_full) {
+    forward_return_detail::ReturnCopyBarrier *tma_full) {
   auto *bytes = static_cast<std::byte *>(a.gin_window_base);
   auto *receive_headers = reinterpret_cast<LocalP2pRouteHeader *>(
       bytes + a.gin_receive_header_offset);
@@ -535,8 +532,6 @@ __device__ __forceinline__ void relay_inbound_wave(
       bytes + a.gin_receive_fanout_offset);
   auto *receive_payload = reinterpret_cast<transport::BFloat16 *>(
       bytes + a.gin_receive_payload_offset);
-  auto *fragment_index = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_fragment_index_offset);
   const auto source_partition = static_cast<std::uint32_t>(task.expert);
   const auto partition_packet_base =
       static_cast<std::uint64_t>(source_partition) * a.max_tokens_per_rank;
@@ -656,16 +651,13 @@ __device__ __forceinline__ void relay_inbound_wave(
       auto *arrived = peer_at<unsigned long long>(a.peer_bases[destination],
                                                   a.x_arrived_rows_offset);
       const auto compact_row = target.return_compact_row;
-      const auto chunk = compact_row / a.forward_return_chunk_rows;
-      fragment_index[partition_fanout_base + compact_row] =
-          header.dst_row + fanout_slot;
       auto *peer_map = peer_at<unsigned long long>(
-          a.peer_bases[destination], a.forward_output_ready_epoch_offset);
+          a.peer_bases[destination], a.forward_return_row_map_offset);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
           published(peer_map[target.dst_row]);
-      published.store(encode_return_row_mapping(
-                          a.rank, chunk, partition_fanout_base + compact_row),
-                      ::cuda::memory_order_release);
+      published.store(
+          encode_return_row_mapping(partition_fanout_base + compact_row),
+          ::cuda::memory_order_release);
       // Input readiness also releases its immutable reverse map. FC2 and
       // Return consumers therefore never need a second mapping handshake.
       const auto rail = a.rank % a.local_world_size;
@@ -720,11 +712,11 @@ __device__ __forceinline__ void relay_role(
   __shared__ std::uint64_t relay_packet_cursor;
   __shared__ std::uint64_t relay_waves;
   __shared__ persistent_v3::PipelineTask inbound_task;
-  __shared__ forward_return_detail::DirectLocalReturnState local_return_state;
+  __shared__ forward_return_detail::LocalReturnState local_return_state;
 #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ forward_return_detail::DirectLocalReturnBarrier
+  __shared__ forward_return_detail::ReturnCopyBarrier
       local_return_tma_full[persistent_v3::kWarpsPerCta];
-  __shared__ forward_return_detail::DirectFullCompletionState
+  __shared__ forward_return_detail::ReturnReceiveState
       completion_state;
   __shared__ unsigned int inbound_directory_seen;
   __shared__ unsigned int inbound_ready;
@@ -737,9 +729,8 @@ __device__ __forceinline__ void relay_role(
     relay_waves = 0ULL;
     inbound_directory_seen = 0U;
     inbound_ready = 0U;
-    local_return_state = forward_return_detail::DirectLocalReturnState{};
-    local_return_state.preferred_stripe = relay_ordinal / a.local_world_size;
-    completion_state = forward_return_detail::DirectFullCompletionState{};
+    local_return_state = forward_return_detail::LocalReturnState{};
+    completion_state = forward_return_detail::ReturnReceiveState{};
     local_return_done = 0U;
     completion_done = 0U;
     for (std::uint32_t warp = 0U; warp < persistent_v3::kWarpsPerCta; ++warp)
@@ -863,19 +854,19 @@ __device__ __forceinline__ void relay_role(
     // Mirror the compute scheduler's FC2-first policy at the node-local
     // transport boundary.  Once an FC2 M-block is available, retire one
     // bounded Return batch before issuing another Dispatch batch.  Skipping
-    // Dispatch only in the iteration that actually consumed a descriptor
+    // Dispatch only in the iteration that actually consumed a row batch
     // prevents the TMA streams from competing for the same Relay CTA and
     // NVLink path while keeping the scheduler work-conserving.
     bool local_return_progressed = false;
     if (local_return_done == 0U) {
       local_return_progressed =
-          forward_return_detail::progress_direct_local_return_once(
+          forward_return_detail::progress_local_return(
               a, control, context, scheduler, local_return_state,
               reinterpret_cast<std::byte *>(storage),
               local_return_tma_full);
       progressed = local_return_progressed || progressed;
       if (threadIdx.x == 0U &&
-          forward_return_detail::direct_local_return_terminal(
+          forward_return_detail::local_return_terminal(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
         WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
@@ -941,13 +932,13 @@ __device__ __forceinline__ void relay_role(
     // without delaying already-computed FC2 rows until the complete Dispatch
     // or FC2 task spaces drain.
     if (local_return_done == 0U) {
-      progressed = forward_return_detail::progress_direct_local_return_once(
+      progressed = forward_return_detail::progress_local_return(
                        a, control, context, scheduler, local_return_state,
                        reinterpret_cast<std::byte *>(storage),
                        local_return_tma_full) ||
                    progressed;
       if (threadIdx.x == 0U &&
-          forward_return_detail::direct_local_return_terminal(
+          forward_return_detail::local_return_terminal(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
         WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
@@ -960,12 +951,12 @@ __device__ __forceinline__ void relay_role(
 
     if (completion_done == 0U) {
       for (std::uint32_t pass = 0U;
-           pass < forward_tuning::kCompletionChunksPerPass; ++pass) {
+           pass < forward_tuning::kCompletionPeerProbes; ++pass) {
         const auto completion_progressed =
-            forward_return_detail::progress_direct_full_completion_once(
+            forward_return_detail::progress_return_receive(
                 a, control, context, scheduler, completion_state);
         progressed = completion_progressed || progressed;
-        if (forward_return_detail::direct_full_completion_terminal(
+        if (forward_return_detail::return_receive_terminal(
                 completion_state))
           break;
       }
@@ -975,7 +966,7 @@ __device__ __forceinline__ void relay_role(
                                 execution_epoch(a));
         completion_timeline_started = true;
       }
-      if (forward_return_detail::direct_full_completion_terminal(
+      if (forward_return_detail::return_receive_terminal(
               completion_state)) {
         if (!completion_terminal_published) {
           WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay,
@@ -1415,9 +1406,9 @@ __device__ __forceinline__ void local_relay_role(
           : 1U;
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ forward_return_detail::DirectLocalReturnBarrier
+  __shared__ forward_return_detail::ReturnCopyBarrier
       copy_full[kPhysicalWarps];
-  __shared__ forward_return_detail::DirectLocalReturnState
+  __shared__ forward_return_detail::LocalReturnState
       local_return_state;
   __shared__ unsigned int local_return_done;
   if (warp < kCopyWarps && lane == 0U)
@@ -1582,13 +1573,12 @@ __device__ __forceinline__ void local_relay_role(
 
   // Once this CTA's finite Dispatch/publisher work is drained, reuse the
   // whole CTA and the same row-sized SMEM slots for Return. All Relay CTAs
-  // claim bounded batches from the shared M-block directory, independently of
-  // the source rank. Compute can publish later descriptors concurrently.
+  // claim confirmed row batches from the local queue, independently of the
+  // source rank. Compute can publish more rows concurrently.
   if (a.forward_relay_local_return) {
     const auto context = relay_ordinal % a.local_world_size;
     if (threadIdx.x == 0U) {
-      local_return_state = forward_return_detail::DirectLocalReturnState{};
-      local_return_state.preferred_stripe = relay_ordinal / a.local_world_size;
+      local_return_state = forward_return_detail::LocalReturnState{};
       local_return_done = 0U;
       for (std::uint32_t return_warp = 0U;
            return_warp < kPhysicalWarps; ++return_warp)
@@ -1598,13 +1588,13 @@ __device__ __forceinline__ void local_relay_role(
     __syncthreads();
     while (local_return_done == 0U && !cancelled(a, control)) {
       const bool progressed =
-          forward_return_detail::progress_direct_local_return_once(
+          forward_return_detail::progress_local_return(
               a, control, context, scheduler, local_return_state,
               reinterpret_cast<std::byte *>(storage), copy_full);
       if (!progressed && threadIdx.x < 32U)
         forward_reduce_detail::try_reduce_one_token<true>(a);
       if (threadIdx.x == 0U) {
-        if (forward_return_detail::direct_local_return_terminal(
+        if (forward_return_detail::local_return_terminal(
                 a, scheduler, local_return_state)) {
           local_return_done = 1U;
           WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
@@ -1631,8 +1621,8 @@ __device__ __forceinline__ void rdma_role(
     const ncclGin gin(a.gin_dev_comm, context);
     // Logical Return contexts own destination peers. Stagger their physical
     // GIN contexts across senders so fan-in does not concentrate the active
-    // QPs on one RoCE LAG port. Return uses VA signals, so peer ownership and
-    // completion addresses remain independent of this physical permutation.
+    // QPs on one RoCE LAG port. Receivers use this same permutation when
+    // reading the sender-specific native signal.
     const auto return_context = (context + a.rank) % a.gin_context_count;
     const ncclGin return_gin(a.gin_dev_comm,
                              return_context + a.gin_context_count);
@@ -1692,7 +1682,7 @@ __device__ __forceinline__ void rdma_role(
     GinDispatchContextRecord inbound_directory{};
     unsigned long long packet_cursor = 0ULL;
     unsigned long long waves_published = 0ULL;
-    forward_return_detail::DirectFullRdmaState direct_full_state{};
+    forward_return_detail::ReturnRdmaState direct_full_state{};
     while ((!outbound_terminal || !inbound_terminal) &&
            !cancelled(a, control)) {
       bool progressed = false;
@@ -1780,7 +1770,7 @@ __device__ __forceinline__ void rdma_role(
       }
 
       progressed =
-          forward_return_detail::progress_direct_full_rdma_once(
+          forward_return_detail::progress_return_send(
               a, control, return_gin, world, context, completion,
               context_completion, scheduler, direct_full_state) ||
           progressed;
@@ -1793,7 +1783,7 @@ __device__ __forceinline__ void rdma_role(
       while (gin.readCounter(0, 56, ::cuda::memory_order_acquire) <
                  issued_completions &&
              !cancelled(a, control)) {
-        if (!forward_return_detail::progress_direct_full_rdma_once(
+        if (!forward_return_detail::progress_return_send(
                 a, control, return_gin, world, context, completion,
                 context_completion, scheduler, direct_full_state))
           __nanosleep(forward_tuning::kTransportIdleNanosleep);
@@ -1829,7 +1819,7 @@ __device__ __forceinline__ void rdma_role(
     // publishing FC1 work without participating in either network loop.
     persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
         control.rdma_dispatch_roles_complete.value, 1ULL);
-    forward_return_detail::direct_full_rdma_thread(
+    forward_return_detail::drain_return_send(
         a, control, context, completion, context_completion, scheduler,
         return_gin, world, direct_full_state);
   } else if (threadIdx.x == 32U) {

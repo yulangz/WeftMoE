@@ -30,11 +30,13 @@ struct ForwardKernelArgs {
   std::size_t gin_receive_payload_offset = 0;
   std::size_t gin_return_staging_offset = 0;
   std::size_t gin_return_receive_offset = 0;
-  // One marker word per compact Return row.  A direct producer publishes the
-  // row count at the first row of its contiguous fragment after its payload
-  // WQE. A receiving completion CTA sums markers in a chunk before publishing
-  // its route metadata; it never copies the payload.
-  std::size_t gin_return_fragment_ready_offset = 0;
+  // Notification words carry compact row IDs and contiguous-copy hints.
+  // A per-sender GIN strong signal publishes their arrival after the payloads;
+  // Relay consumers claim ready rows without scanning compute tiles.
+  std::size_t gin_return_send_rows_offset = 0;
+  std::size_t gin_return_receive_rows_offset = 0;
+  std::size_t forward_return_rows_offset = 0;
+  std::size_t forward_return_peers_offset = 0;
   std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
@@ -81,27 +83,18 @@ struct ForwardKernelArgs {
   std::size_t gin_send_dispatch_directory_offset = 0;
   std::size_t gin_receive_dispatch_directory_offset = 0;
   std::size_t x_arrived_rows_offset = 0;
-  std::size_t forward_output_ready_epoch_offset = 0;
-  std::size_t forward_return_chunk_directory_offset = 0;
-  std::size_t forward_return_chunk_state_offset = 0;
-  std::size_t forward_return_chunk_ready_count_offset = 0;
-  std::size_t forward_return_fragment_index_offset = 0;
-  std::size_t forward_return_source_compact_index_offset = 0;
-  std::size_t forward_return_source_route_index_offset = 0;
+  std::size_t forward_return_row_map_offset = 0;
+  std::size_t forward_return_row_to_source_route_offset = 0;
   // FULL Return keeps payloads in the registered compact receive plane.
-  // Completion CTAs publish this source-route -> compact-row map together with
-  // the ordinary per-route ready epoch so Reduce can consume without a second
-  // NVLink payload scatter.
-  std::size_t forward_direct_source_compact_index_offset = 0;
+  // Dispatch records this source-route -> compact-row map before sending data.
+  // Reduce consumes it after Return readiness without a second NVLink scatter.
+  std::size_t forward_source_route_to_return_row_offset = 0;
   // Token-ready reduction queue.  Every route publication increments the
   // owning source token's counter; the top-k completion appends the token.
   // Queue slots encode token+1; generation setup clears the active token
   // range before producers are released, avoiding a second epoch array.
   std::size_t forward_reduce_route_count_offset = 0;
   std::size_t forward_reduce_ready_token_offset = 0;
-  std::size_t forward_direct_return_fragment_offset = 0;
-  std::uint64_t forward_return_chunk_capacity = 0;
-  std::uint64_t forward_direct_return_fragment_capacity = 0;
   // Forward Return has one cross-node transport policy: FULL GIN into the registered receive
   // plane, followed by per-route readiness publication.
   // Forward keeps one fixed owner per physical GIN context, while the Relay
@@ -128,7 +121,7 @@ struct ForwardKernelArgs {
   // Batch only descriptors that are already published. This amortizes the
   // issuing warp's system fence and route-ready publication without waiting
   // for a future FC2 M-block at the tail.
-  std::uint32_t forward_local_return_batch_mblocks = 4;
+  std::uint32_t forward_local_return_batch_rows = 512;
   // Publish Dispatch readiness after this many source packets. Relay keeps
   // copying the rest of the GIN wave while FC1 consumes an earlier microbatch.
   std::uint32_t forward_dispatch_publish_batch_rows = 32;
@@ -151,7 +144,7 @@ struct ForwardKernelArgs {
   // matching 64-row dispatch tile arrives. Physical storage remains padded to
   // the canonical 128-row quantum.
   std::uint32_t forward_mblock_rows = 128;
-  std::uint64_t forward_return_chunk_rows = 128;
+  std::uint32_t forward_return_batch_rows = 512;
   bool retain_backward_state = false;
   // Production ready-token scheduler: reduction consumes only tokens whose
   // complete top-k route set has arrived instead of waiting on a fixed token

@@ -3517,6 +3517,7 @@ struct DeviceDispatchConsumerLease::Impl {
     if (workspace_ref.plan.buffer_mode == BufferMode::Static)
       view.runtime = at<const DeviceDispatchRuntime>(base, dl.runtime);
     view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
+    view.expert_to_rank = at<const std::uint32_t>(base, dl.expert_to_rank);
     view.local_offset = at<const std::uint64_t>(base, dl.local_offset);
     view.route_dst_row = at<const std::uint64_t>(base, dl.route_dst_row);
     view.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);

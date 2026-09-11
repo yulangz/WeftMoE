@@ -77,6 +77,13 @@ __device__ __forceinline__ float gated_swiglu_fc2_input_from_bf16(
                                 bf16_bits_to_float(b_bits), gate);
 }
 
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+#if !defined(WEFTMOE_BUILD_TESTING)
+#error "WEFTMOE_BENCH_TRANSPORT_ONLY requires the cuda-test build target"
+#endif
+#include "forward_transport_benchmark.cuh"
+#endif
+
 template <typename TileMma, class Callback>
 __device__ __forceinline__ void visit_m128_accumulator(float *accum,
                                                         Callback callback) {
@@ -692,6 +699,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 unsigned int *return_mblock_shared,
                 unsigned int *pair_operand_shared = nullptr,
                 const CUtensorMap *output_store_map = nullptr) {
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+  transport_benchmark_role<StaticLocal>(a, storage);
+  return;
+#endif
   static_assert(!TmaFc2StoreToStaging || TmaFc2Store,
                 "staging specialization requires the TMA FC2 epilogue");
   static_assert(!Cluster2 || !M64,
@@ -743,9 +754,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           : static_cast<transport::BFloat16 *>(nullptr);
   auto *headers =
       peer_at<LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
-  auto *return_context_masks_shared = reinterpret_cast<unsigned long long *>(
-      storage + kConfiguredGemmStorageElements * sizeof(transport::BFloat16) +
-      (3U * Fc1StageCount + 2U * Fc2StageCount) * sizeof(std::uint64_t));
 
   transport_state::GenerationCompletionVector *completion = nullptr;
   if constexpr (!StaticLocal) {
@@ -1421,87 +1429,17 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         // Publish that transitive chain, plus this CTA's stores, to NVLink/GIN
         // once per M-block before any Return-ready counter becomes visible.
         __threadfence_system();
-        if (threadIdx.x == 0U)
-          *return_context_masks_shared = 0ULL;
-        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
-
-        // Exact masks prevent seven unrelated context owners from rescanning
-        // this M-block. Build them with one header load per row and one shared
-        // OR per warp instead of a 128-load scalar loop on the last FC2 tile.
-        std::uint32_t remote_context_bit = 0U;
-        std::uint32_t local_context_bit = 0U;
-        if (threadIdx.x < valid_rows) {
-          const auto source = headers[row + threadIdx.x].source_rank;
-          if (source < a.world) {
-            const auto context = source % a.local_world_size;
-            if (source / a.local_world_size != a.node)
-              remote_context_bit = 1U << context;
-            else if (a.forward_relay_local_return)
-              local_context_bit = 1U << context;
-          }
-        }
-        // Certify a whole-tile wire range in parallel while these threads
-        // already inspect its routing headers. Bit 63 records any exception;
-        // mixed-source and chunk-boundary tiles retain the general run path.
-        bool split_return = false;
-        if constexpr (!StaticLocal) {
-          if (a.use_gin && threadIdx.x < valid_rows) {
-            const auto *maps = peer_at<const unsigned long long>(
-                a.local_base, a.forward_output_ready_epoch_offset);
-            const auto first_source = headers[row].source_rank;
-            const auto first = maps[row];
-            const auto entry = maps[row + threadIdx.x];
-            split_return = first_source / a.local_world_size == a.node ||
-                headers[row + threadIdx.x].source_rank != first_source ||
-                first == 0ULL || entry == 0ULL ||
-                return_mapping_chunk(first) != return_mapping_chunk(entry) ||
-                return_mapping_compact_row(entry) !=
-                    return_mapping_compact_row(first) + threadIdx.x;
-          }
-        }
-        const auto warp_split = __any_sync(0xffffffffU, split_return);
-        const auto warp_remote =
-            __reduce_or_sync(0xffffffffU, remote_context_bit);
-        const auto warp_local =
-            __reduce_or_sync(0xffffffffU, local_context_bit);
-        if ((threadIdx.x & 31U) == 0U)
-          atomicOr(return_context_masks_shared,
-                   static_cast<unsigned long long>(warp_remote) |
-                       (static_cast<unsigned long long>(warp_local) << 32U) |
-                       (static_cast<unsigned long long>(warp_split) << 63U));
-        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
-
+        forward_return_detail::publish_rows<kMathThreads>(
+            a, scheduler, row, valid_rows,
+            reinterpret_cast<unsigned int *>(smem_a));
         if (threadIdx.x == 0U) {
-          const auto finished =
-              atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
+          const auto finished = atomicAdd(&scheduler[4U + a.world], 1ULL) + 1ULL;
           if (finished == forward_mblocks) {
             status->fc2_complete_clock = device_globaltimer_ns();
             forward_publish_progress(a, kForwardFc2Complete, fc2_tasks);
           }
-          if constexpr (!StaticLocal) {
-            if (a.use_gin || (a.forward_stream_local_dispatch &&
-                              a.forward_relay_local_return)) {
-              // Lane 0 publishes one maximal contiguous descriptor to the
-              // fixed FULL GIN owners. No context state or network register
-              // live range enters this WGMMA kernel.
-              forward_return_detail::issue_direct_full_mblock(
-                  a, scheduler, row, valid_rows,
-                  *return_context_masks_shared);
-              WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady, Compute,
-                                      0U, mblock, execution_epoch(a));
-            }
-          } else if (a.forward_stream_local_dispatch &&
-                     a.forward_relay_local_return) {
-            // One-node split Forward uses the identical immutable M-block
-            // directory, but only its node-local context mask is consumed.
-            // The compute CTA returns to the FC2-priority queue immediately;
-            // permanent Relay CTAs own all peer copies and readiness stores.
-            forward_return_detail::issue_direct_full_mblock(
-                a, scheduler, row, valid_rows,
-                *return_context_masks_shared);
-            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady, Compute,
-                                    0U, mblock, execution_epoch(a));
-          }
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady, Compute,
+                                  0U, mblock, execution_epoch(a));
         }
         cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
 

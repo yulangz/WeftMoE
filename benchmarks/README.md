@@ -18,4 +18,13 @@ launchers are maintained in [tests](../tests).
 - `notify_dispatch_bench.cpp` is built with
   `python3 build_native.py metadata-bench`.
 
+For a communication-only measurement of the production FWD protocol, build
+`cuda-test` with `-DWEFTMOE_BENCH_TRANSPORT_ONLY=1` in `NVCCFLAGS`, alongside
+the usual shape macros. Run the resulting binary with the existing FWD rank
+launchers. This test specialization waits for Dispatch, publishes prefilled
+Return rows, and runs the normal Return and Reduce workers. Output preparation
+is outside the CUDA-event interval; Notify is reported separately. GEMMs are
+skipped, so GEMM instruction counters and FLOPS derived from the model shape
+are not meaningful in this mode. The flag is rejected by package builds.
+
 Generated results belong in `results/`, which is ignored by Git.

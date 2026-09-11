@@ -1,903 +1,595 @@
 #pragma once
 
-// FULL Return keeps GIN ownership in the fixed RDMA CTAs and lands payloads
-// directly in the registered compact receive plane. All Relay CTAs share
-// local-copy batches and receive-completion chunks. Receive completion only
-// publishes token readiness; it never copies the registered Return payload.
-
+// FC2 publishes canonical row IDs. Relay consumes the local queue; each fixed
+// GIN owner consumes its remote queue. A separate arrival queue carries compact
+// row IDs back to the source. No worker searches compute tiles or chunk flags.
 #if __has_include(<nccl_device.h>)
-
 namespace forward_return_detail {
 
-using DirectLocalReturnBarrier =
-    ::cuda::barrier<::cuda::thread_scope_block>;
+using ReturnCopyBarrier = ::cuda::barrier<::cuda::thread_scope_block>;
+using RowQueue = persistent_v3::ReturnRowQueue;
+using PeerQueue = persistent_v3::ReturnPeerQueue;
 
-__device__ __forceinline__ bool cancelled(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control) {
+__device__ __forceinline__ bool
+cancelled(const ForwardKernelArgs &a,
+          persistent_v3::ForwardPipelineControl &control) {
   return forward_cancelled(a) ||
          persistent_v3::load_acquire<::cuda::thread_scope_device>(
              control.generation.control.error_code.value) != 0ULL;
 }
 
-__device__ __forceinline__ unsigned long long source_compact_rows(
-    const ForwardKernelArgs &a, const unsigned long long *,
-    std::uint32_t context = 0U) {
-  const auto *directories = reinterpret_cast<const GinDispatchContextRecord *>(
-      static_cast<const std::byte *>(a.gin_window_base) +
-      a.gin_send_dispatch_directory_offset);
-  return directories[context].return_row_count;
+__device__ __forceinline__ PeerQueue *peer_queues(const ForwardKernelArgs &a) {
+  return peer_at<PeerQueue>(a.local_base, a.forward_return_peers_offset);
 }
 
-// Scratch words after the parallel directory totals are reserved for the
-// direct-return producer/consumer handshake.  Compute CTAs append immutable
-// fragments and publish one terminal count per processed M-block.  The fixed
-// RDMA CTAs are the sole GIN context owners and record their issued counts here.
-__device__ __forceinline__ unsigned long long direct_scheduler_base(
-    const ForwardKernelArgs &a) {
-  const auto partitions = a.dispatch.identity.num_nodes - 1ULL;
-  // Eight words after the directory arrays belong to mixed scheduling and the
-  // transport-only startup rendezvous.  Start direct counters after that
-  // aligned block so neither state can alias Return ownership metadata.
-  return 16ULL + 2ULL * a.world +
-         2ULL * partitions * a.gin_context_count + 8ULL;
+__device__ __forceinline__ unsigned long long
+source_compact_rows(const ForwardKernelArgs &a, const unsigned long long *) {
+  const auto *peers = peer_queues(a);
+  unsigned long long rows = 0ULL;
+  for (unsigned int peer = 0U; peer < a.world; ++peer)
+    rows += peers[peer].receive_count;
+  return rows;
 }
 
-__device__ __forceinline__ unsigned long long *direct_issued_counts(
-    const ForwardKernelArgs &a, unsigned long long *scheduler) {
-  return scheduler + direct_scheduler_base(a);
+__device__ __forceinline__ unsigned int queue_index(const ForwardKernelArgs &a,
+                                                    unsigned int source) {
+  return source / a.local_world_size == a.node
+             ? 0U
+             : 1U + source % a.local_world_size;
 }
 
-__device__ __forceinline__ unsigned long long &direct_mblocks_complete(
-    const ForwardKernelArgs &a, unsigned long long *scheduler) {
-  return scheduler[direct_scheduler_base(a) + a.gin_context_count + 1ULL];
-}
-
-__device__ __forceinline__ unsigned long long &direct_fragment_tail(
-    const ForwardKernelArgs &a, unsigned long long *scheduler) {
-  return scheduler[direct_scheduler_base(a) + a.gin_context_count];
-}
-
-__device__ __noinline__ void enqueue_direct_full_mblock(
-    const ForwardKernelArgs &a, unsigned long long *scheduler,
-    std::uint64_t canonical_row,
-    std::uint32_t row_count, std::uint32_t context_mask,
-    std::uint32_t local_context_mask, bool contiguous = false) {
-  if (row_count == 0U || forward_cancelled(a))
-    return;
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      direct_fragment_tail(a, scheduler));
-  const auto slot = tail.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
-  if (slot >= a.forward_direct_return_fragment_capacity) {
-    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-        a.local_base, a.forward_v3_control_offset);
-    persistent_v3::publish_error_once(control->generation, 310ULL);
-    return;
-  }
-
-  auto *fragments = peer_at<ForwardReturnTile>(
-      a.local_base, a.forward_direct_return_fragment_offset);
-  auto &fragment = fragments[slot];
-  fragment.canonical_row = canonical_row;
-  fragment.compact_row = 0ULL;
-  fragment.local_context_mask = local_context_mask;
-  fragment.row_count = row_count;
-  fragment.contiguous_source_rank = UINT32_MAX;
-  if (contiguous) {
-    const auto *maps = peer_at<const unsigned long long>(
-        a.local_base, a.forward_output_ready_epoch_offset);
-    const auto *headers = peer_at<const LocalP2pRouteHeader>(
-        a.local_base, a.direct_headers_offset);
-    fragment.compact_row = return_mapping_compact_row(maps[canonical_row]);
-    fragment.contiguous_source_rank = headers[canonical_row].source_rank;
-  }
-  fragment.remote_context_mask = context_mask;
-  ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
-      fragment.epoch);
-  published.store(execution_epoch(a), ::cuda::memory_order_release);
-#if WEFTMOE_DEBUG_VALIDATE
-  if (a.use_gin) {
-    auto *completion =
-        static_cast<transport_state::GenerationCompletionVector *>(
-            a.peer_bases[a.world]);
-    atomicMax(&completion->bulk_local_ready, 1001ULL + slot);
-  }
-#endif
-}
-
-// The last FC2 N tile publishes one task after all output stores are visible.
-// Its parallel routing check certifies common contiguous tiles; only boundary
-// tiles require the sender to coalesce individual rows.
-__device__ __noinline__ void issue_direct_full_mblock(
-    const ForwardKernelArgs &a, unsigned long long *scheduler,
-    std::uint64_t canonical_row, std::uint32_t valid_rows,
-    std::uint64_t context_masks) {
-  enqueue_direct_full_mblock(
-      a, scheduler, canonical_row, valid_rows,
-      static_cast<std::uint32_t>(context_masks),
-      static_cast<std::uint32_t>((context_masks >> 32U) & 0x7fffffffULL),
-      a.use_gin && (context_masks & 0x8000000000000000ULL) == 0ULL &&
-          static_cast<std::uint32_t>(context_masks) != 0U);
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
-      direct_mblocks_complete(a, scheduler));
-  const auto completed =
-      done.fetch_add(1ULL, ::cuda::memory_order_release) + 1ULL;
-#if WEFTMOE_DEBUG_VALIDATE
-  if (a.use_gin) {
-    auto *completion =
-        static_cast<transport_state::GenerationCompletionVector *>(
-            a.peer_bases[a.world]);
-    atomicMax(&completion->progress_ctas_at_bulk_return, 1000ULL + completed);
-  }
-#endif
-}
-
-// Separate work planes share immutable FC2 descriptors and explicit completion
-// counters. None of the local-copy/completion workers owns a GIN context.
-// FULL Return already lands in this rank's registered compact receive plane.
-// Once a chunk's payload-row counter is complete, publish only its
-// route-to-compact metadata and readiness.  Reduce then reads that registered
-// payload in place, eliminating the former 352 MiB receive->contribution copy
-// while preserving large contiguous network puts.
+// Count-derived disjoint intervals fit exactly in incoming_rows and routes.
+// The mapping supports arbitrary expert placement and uneven route counts.
 __device__ __forceinline__ void
-publish_direct_full_source_chunk(const ForwardKernelArgs &a,
-                                 std::uint64_t row_begin,
-                                 std::uint32_t row_count) {
-  const auto *source_route_index = peer_at<const unsigned long long>(
-      a.local_base, a.forward_return_source_route_index_offset);
-  auto *route_ready =
-      peer_at<unsigned long long>(a.local_base, a.return_ready_epoch_offset);
-
-  // The marker is the completion action of the payload put.  Bring async-proxy
-  // writes into the generic proxy before publishing a CUDA-visible ready word.
-  asm volatile("fence.proxy.async.global;" : : : "memory");
-  // Dispatch already materialized route->compact.  This fence therefore only
-  // has to order the received payload before the route/queue release below.
-  __threadfence_system();
-  __syncthreads();
-  for (std::uint64_t local_row = threadIdx.x; local_row < row_count;
-       local_row += blockDim.x) {
-    const auto compact_row = row_begin + local_row;
-    const auto route = source_route_index[compact_row];
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-        route_ready[route]);
-    if (a.forward_dynamic_reduce_queue)
-      forward_reduce_detail::publish_ready_route(a, a.local_base, route, 1U);
-    else
-      ready.store(execution_epoch(a), ::cuda::memory_order_release);
+initialize_queues(const ForwardKernelArgs &a,
+                  persistent_v3::ForwardPipelineControl &control,
+                  unsigned long long *scheduler) {
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    unsigned long long begin = 0ULL;
+    for (unsigned int q = 0U; q <= a.gin_context_count; ++q) {
+      auto &queue = control.return_rows[q];
+      queue.begin = begin;
+      for (unsigned int source = 0U; source < a.world; ++source)
+        if (queue_index(a, source) == q)
+          queue.capacity += scheduler[4U + source] >> 32U;
+      begin += queue.capacity;
+    }
   }
-  __syncthreads();
+  auto *peers = peer_queues(a);
+  for (unsigned int peer = blockIdx.x * blockDim.x + threadIdx.x;
+       peer < a.world; peer += gridDim.x * blockDim.x) {
+    PeerQueue result{};
+    if (a.use_gin && peer / a.local_world_size != a.node) {
+      for (unsigned int expert = 0U; expert < a.dispatch.identity.num_experts;
+           ++expert) {
+        const auto owner = a.dispatch.expert_to_rank[expert];
+        const auto received =
+            a.dispatch
+                .source_expert_count[a.rank * a.dispatch.identity.num_experts +
+                                     expert];
+        if (owner / a.local_world_size != a.node && owner < peer)
+          result.receive_begin += received;
+        if (owner == peer)
+          result.receive_count += received;
+        if (owner / a.local_world_size != peer / a.local_world_size &&
+            owner < a.rank)
+          result.send_begin +=
+              a.dispatch
+                  .source_expert_count[peer * a.dispatch.identity.num_experts +
+                                       expert];
+      }
+    }
+    peers[peer] = result;
+  }
 }
 
-struct DirectFullCompletionState {
-  unsigned long long compact_rows = 0ULL;
-  unsigned long long chunk_count = 0ULL;
-  unsigned long long completed = 0ULL;
-  unsigned long long expected = 0ULL;
-  unsigned long long selected_chunk = 0ULL;
-  std::uint32_t selected_rows = 0U;
-  std::uint32_t initialized = 0U;
-  std::uint32_t selected = 0U;
-  std::uint32_t chunk_ready = 0U;
-  std::uint32_t progressed = 0U;
+__device__ __forceinline__ unsigned long long
+claim_rows(RowQueue &queue, unsigned int limit, unsigned int &count) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> published(
+      queue.confirmed),
+      head(queue.head);
+  const auto end = published.load(::cuda::memory_order_acquire);
+  auto begin = head.load(::cuda::memory_order_relaxed);
+  count = 0U;
+  if (begin >= end)
+    return begin;
+  const auto n = static_cast<unsigned int>(min(end - begin, 1ULL * limit));
+  if (head.compare_exchange_strong(begin, begin + n,
+                                   ::cuda::memory_order_relaxed))
+    count = n;
+  return begin;
+}
+
+// Called by all math threads after the last FC2 N-tile acquires every store.
+// The dead GEMM operand storage supplies a few prefix words. Reserve/fill/
+// confirm each queue before touching the next, so producers cannot form a
+// cyclic wait between queues. CAS confirms exactly this producer's interval.
+template <unsigned int MathThreads>
+__device__ __noinline__ void
+publish_rows(const ForwardKernelArgs &a, unsigned long long *,
+             unsigned long long row, unsigned int rows, unsigned int *scratch) {
+  constexpr auto warps = MathThreads / 32U;
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+      a.local_base, a.forward_v3_control_offset);
+  auto *entries =
+      peer_at<unsigned int>(a.local_base, a.forward_return_rows_offset);
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
+  const auto q = threadIdx.x < rows
+                     ? queue_index(a, headers[row + threadIdx.x].source_rank)
+                     : UINT32_MAX;
+  // A notification holds a full 32-bit compact row and a contiguous suffix
+  // length. The length is a transfer hint, never a task or readiness flag;
+  // consumers may split confirmed intervals at arbitrary row boundaries.
+  const auto *mapping = peer_at<const unsigned long long>(
+      a.local_base, a.forward_return_row_map_offset);
+  unsigned int compact = 0U;
+  bool run_end = false;
+  if (q != 0U && q != UINT32_MAX) {
+    compact = static_cast<unsigned int>(
+        return_mapping_compact_row(mapping[row + threadIdx.x]));
+    run_end = threadIdx.x + 1U == rows ||
+              headers[row + threadIdx.x + 1U].source_rank !=
+                  headers[row + threadIdx.x].source_rank ||
+              return_mapping_compact_row(mapping[row + threadIdx.x + 1U]) !=
+                  compact + 1ULL;
+  }
+  const auto ends = __ballot_sync(0xffffffffU, run_end);
+  if (lane == 0U)
+    scratch[32U + warp] = ends;
+  if (threadIdx.x == 0U)
+    scratch[warps] = 0U;
+  cutlass::arch::NamedBarrier::sync(MathThreads, 2U);
+  const auto active =
+      __reduce_or_sync(0xffffffffU, q != UINT32_MAX ? 1U << q : 0U);
+  if (lane == 0U)
+    atomicOr(scratch + warps, active);
+  cutlass::arch::NamedBarrier::sync(MathThreads, 3U);
+  const auto queues = scratch[warps];
+  auto *base = reinterpret_cast<unsigned long long *>(scratch + 16U);
+  for (unsigned int index = 0U; index <= a.gin_context_count; ++index) {
+    if ((queues & (1U << index)) == 0U)
+      continue;
+    const auto mask = __ballot_sync(0xffffffffU, q == index);
+    if (lane == 0U)
+      scratch[warp] = __popc(mask);
+    cutlass::arch::NamedBarrier::sync(MathThreads, 2U);
+    auto &queue = control->return_rows[index];
+    if (threadIdx.x == 0U) {
+      unsigned int count = 0U;
+      for (unsigned int w = 0U; w < warps; ++w) {
+        const auto n = scratch[w];
+        scratch[w] = count;
+        count += n;
+      }
+      scratch[warps + 1U] = count;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          reserve(queue.reserved);
+      *base = reserve.fetch_add(count, ::cuda::memory_order_relaxed);
+      if (*base + count > queue.capacity)
+        persistent_v3::publish_error_once(control->generation, 310ULL);
+      // Every math warp must leave through the same barrier boundary, even
+      // when host cancellation arrives while this interval is being reserved.
+      scratch[warps + 2U] = cancelled(a, *control);
+    }
+    cutlass::arch::NamedBarrier::sync(MathThreads, 3U);
+    if (scratch[warps + 2U] != 0U)
+      return;
+    if (q == index) {
+      const auto offset = scratch[warp] + __popc(mask & ((1U << lane) - 1U));
+      entries[queue.begin + *base + offset] =
+          static_cast<unsigned int>(row + threadIdx.x);
+      if (index != 0U) {
+        auto boundary = ends & (0xffffffffU << lane);
+        unsigned int next_warp = warp;
+        while (boundary == 0U)
+          boundary = scratch[32U + ++next_warp];
+        const auto length = next_warp * 32U + __ffs(boundary) - threadIdx.x;
+        auto *send_rows = reinterpret_cast<unsigned long long *>(
+            static_cast<std::byte *>(a.gin_window_base) +
+            a.gin_return_send_rows_offset);
+        send_rows[queue.begin + *base + offset] =
+            compact | (static_cast<unsigned long long>(length) << 32U);
+      }
+    }
+    __threadfence();
+    cutlass::arch::NamedBarrier::sync(MathThreads, 2U);
+    if (threadIdx.x == 0U) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          confirm(queue.confirmed);
+      auto expected = *base;
+      while (!confirm.compare_exchange_weak(
+          expected, *base + scratch[warps + 1U], ::cuda::memory_order_acq_rel,
+          ::cuda::memory_order_relaxed)) {
+        if (cancelled(a, *control))
+          break;
+        expected = *base;
+        __nanosleep(32U);
+      }
+    }
+    cutlass::arch::NamedBarrier::sync(MathThreads, 3U);
+  }
+  if (threadIdx.x == 0U)
+    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+        control->return_producers_complete.value, 1ULL);
+}
+
+struct LocalReturnState {
+  unsigned long long cursor = 0ULL;
+  unsigned int selected = 0U;
 };
 
 __device__ __forceinline__ bool
-direct_full_completion_terminal(const DirectFullCompletionState &state) {
-  return state.initialized != 0U && state.completed == state.expected;
+local_return_terminal(const ForwardKernelArgs &a, unsigned long long *scheduler,
+                      const LocalReturnState &) {
+  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+      a.local_base, a.forward_v3_control_offset);
+  return persistent_v3::load_acquire<::cuda::thread_scope_device>(
+             control->return_producers_complete.value) >= scheduler[3] &&
+         persistent_v3::load_acquire<::cuda::thread_scope_device>(
+             control->return_rows[0].head) == control->return_rows[0].capacity;
 }
 
-// Inspect at most one receive chunk and never wait on it.  The scan cursor
-// advances even on a miss, so a late fragment cannot head-of-line block later
-// chunks. The epoch-tagged chunk word records ownership; a separate completed
-// counter advances only after publication, so a claimed chunk is not confused
-// with a completed one. Neither a fixed helper nor a blocking wait is required.
-__device__ __forceinline__ bool progress_direct_full_completion_once(
+__device__ __forceinline__ bool progress_local_return(
     const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
-    std::uint32_t context, unsigned long long *scheduler,
-    DirectFullCompletionState &state) {
+    unsigned int context, unsigned long long *, LocalReturnState &state,
+    std::byte *tma_storage, ReturnCopyBarrier *tma_full) {
   if (threadIdx.x == 0U) {
-    state.progressed = 0U;
     state.selected = 0U;
-    state.chunk_ready = 0U;
-    if (state.initialized == 0U &&
-        persistent_v3::load_acquire<::cuda::thread_scope_device>(
-            control.dispatch[0].outbound_directory_ready.value) >=
-            execution_epoch(a)) {
-      state.compact_rows = source_compact_rows(a, scheduler);
-      state.chunk_count =
-          (state.compact_rows + a.forward_return_chunk_rows - 1ULL) /
-          a.forward_return_chunk_rows;
-      state.expected = state.chunk_count;
+    if (!cancelled(a, control))
+      state.cursor =
+          claim_rows(control.return_rows[0], a.forward_local_return_batch_rows,
+                     state.selected);
+  }
+  __syncthreads();
+  if (state.selected == 0U)
+    return false;
+  WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
+                          context, state.selected, execution_epoch(a));
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (threadIdx.x == 0U)
+    atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+  const auto *entries =
+      peer_at<const unsigned int>(a.local_base, a.forward_return_rows_offset) +
+      control.return_rows[0].begin;
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
+  const auto *output =
+      a.use_gin && a.forward_registered_output
+          ? reinterpret_cast<const transport::BFloat16 *>(
+                static_cast<const std::byte *>(a.gin_window_base) +
+                a.gin_return_staging_offset)
+          : peer_at<const transport::BFloat16>(a.local_base,
+                                               a.forward_output_rows_offset);
+  const auto copy_bytes = static_cast<unsigned int>(a.hidden * 2ULL);
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x & 31U;
+  const bool tma = a.forward_relay_tma_warps != 0U && copy_bytes <= 16384U &&
+                   (copy_bytes & 15U) == 0U;
+  const auto workers = tma ? a.forward_relay_tma_warps : blockDim.x / 32U;
+  bool copied = false;
+  for (unsigned int item = warp; warp < workers && item < state.selected;
+       item += workers) {
+    const auto row = entries[state.cursor + item];
+    const auto header = headers[row];
+    const auto *src = output + row * a.hidden;
+    auto *dst = peer_at<transport::BFloat16>(a.peer_bases[header.source_rank],
+                                             a.contribution_offset) +
+                header.route_index * a.hidden;
+    if (tma) {
+      if (lane == 0U) {
+        auto *storage = tma_storage + warp * copy_bytes;
+        auto &full = tma_full[warp];
+        ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+            storage, src, copy_bytes, full);
+        auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, copy_bytes);
+        full.wait(static_cast<decltype(ticket) &&>(ticket));
+        ::cuda::device::experimental::cp_async_bulk_shared_to_global(
+            dst, storage, copy_bytes);
+        ::cuda::device::experimental::cp_async_bulk_commit_group();
+        ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
+        copied = true;
+      }
+    } else {
+      for (unsigned long long v = lane; v < a.hidden / 8ULL; v += 32ULL)
+        reinterpret_cast<uint4 *>(dst)[v] =
+            reinterpret_cast<const uint4 *>(src)[v];
+    }
+  }
+  if (copied)
+    ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
+  __threadfence_system();
+  __syncthreads();
+  unsigned int peer_rows = 0U;
+  for (unsigned int item = threadIdx.x; item < state.selected;
+       item += blockDim.x) {
+    const auto header = headers[entries[state.cursor + item]];
+    auto *source_base = a.peer_bases[header.source_rank];
+    if (a.forward_dynamic_reduce_queue)
+      forward_reduce_detail::publish_ready_route(a, source_base,
+                                                 header.route_index, 2U);
+    else {
+      auto *ready =
+          peer_at<unsigned long long>(source_base, a.return_ready_epoch_offset);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+          ready[header.route_index])
+          .store(execution_epoch(a), ::cuda::memory_order_release);
+    }
+    peer_rows += header.source_rank != a.rank;
+  }
+  const auto copied_peer_rows = __reduce_add_sync(0xffffffffU, peer_rows);
+  if (lane == 0U && copied_peer_rows != 0U)
+    atomicAdd(&status->actual_return_peer_bytes,
+              copied_peer_rows * a.hidden * 2ULL);
+  __syncthreads();
+  WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
+                          context, state.selected, execution_epoch(a));
+  return true;
+}
+
+struct ReturnReceiveState {
+  unsigned long long expected = 0ULL;
+  unsigned long long completed = 0ULL;
+  unsigned long long begin = 0ULL;
+  unsigned int selected_rows = 0U;
+  unsigned int peer = 0U;
+  unsigned int initialized = 0U;
+};
+
+__device__ __forceinline__ bool
+return_receive_terminal(const ReturnReceiveState &state) {
+  return state.initialized && state.completed == state.expected;
+}
+
+__device__ __forceinline__ bool progress_return_receive(
+    const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+    unsigned int, unsigned long long *, ReturnReceiveState &state) {
+  auto *peers = peer_queues(a);
+  if (threadIdx.x == 0U) {
+    if (!state.initialized) {
+      for (unsigned int peer = 0U; peer < a.world; ++peer)
+        state.expected += peers[peer].receive_count;
+      state.peer = blockIdx.x % a.world;
       state.initialized = 1U;
     }
     state.completed = persistent_v3::load_acquire<::cuda::thread_scope_device>(
-        control.return_chunks_complete.value);
+        control.return_rows_complete.value);
+    state.selected_rows = 0U;
+    const auto sender = state.peer;
+    state.peer = (sender + 1U) % a.world;
+    auto &queue = peers[sender];
+    if (queue.receive_count != 0ULL && state.completed < state.expected) {
+      // Match the sender's physical-context permutation used for port balance.
+      const auto physical =
+          a.gin_context_count +
+          (a.rank % a.local_world_size + sender) % a.gin_context_count;
+      const ncclGin gin(a.gin_dev_comm, physical);
+      const auto ready =
+          gin.readSignal(3U + sender, 64, ::cuda::memory_order_acquire);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
+          queue.receive_head);
+      auto begin = head.load(::cuda::memory_order_relaxed);
+      if (ready > queue.receive_count)
+        persistent_v3::publish_error_once(control.generation, 313ULL);
+      else if (begin < ready) {
+        const auto n = min(ready - begin, 1ULL * a.forward_return_batch_rows);
+        if (head.compare_exchange_strong(begin, begin + n,
+                                         ::cuda::memory_order_relaxed)) {
+          state.begin = queue.receive_begin + begin;
+          state.selected_rows = static_cast<unsigned int>(n);
+        }
+      }
+    }
+    if (cancelled(a, control))
+      state.selected_rows = 0U;
   }
   __syncthreads();
-  if (state.initialized == 0U || state.completed == state.expected ||
-      cancelled(a, control))
+  if (!state.selected_rows)
     return false;
-
-  auto *chunk_state = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_chunk_state_offset);
-  if (threadIdx.x == 0U) {
-    // One bounded probe. Atomic scan distribution avoids a fixed scanner per
-    // rail; a slow/missing chunk is revisited without blocking later chunks.
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> scan(
-        control.return_chunk_scan.value);
-    const auto chunk =
-        scan.fetch_add(1ULL, ::cuda::memory_order_relaxed) % state.chunk_count;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
-        chunk_state[chunk]);
-    if (claimed.load(::cuda::memory_order_acquire) != execution_epoch(a)) {
-      state.selected_chunk = chunk;
-      const auto remaining =
-          state.compact_rows - chunk * a.forward_return_chunk_rows;
-      state.selected_rows = static_cast<std::uint32_t>(
-          min(remaining,
-              static_cast<unsigned long long>(a.forward_return_chunk_rows)));
-      state.selected = 1U;
+  asm volatile("fence.proxy.async.global;" : : : "memory");
+  const auto *entries = reinterpret_cast<const unsigned long long *>(
+      static_cast<const std::byte *>(a.gin_window_base) +
+      a.gin_return_receive_rows_offset);
+  const auto *routes = peer_at<const unsigned long long>(
+      a.local_base, a.forward_return_row_to_source_route_offset);
+  for (unsigned int item = threadIdx.x; item < state.selected_rows;
+       item += blockDim.x) {
+    const auto route = routes[entries[state.begin + item] & 0xffffffffULL];
+    if (a.forward_dynamic_reduce_queue)
+      forward_reduce_detail::publish_ready_route(a, a.local_base, route, 1U);
+    else {
+      auto *ready = peer_at<unsigned long long>(a.local_base,
+                                                a.return_ready_epoch_offset);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+          ready[route])
+          .store(execution_epoch(a), ::cuda::memory_order_release);
     }
   }
   __syncthreads();
-  if (state.selected == 0U)
-    return false;
-
-  const auto row_begin = state.selected_chunk * a.forward_return_chunk_rows;
-  const auto *fragment_ready = reinterpret_cast<const unsigned long long *>(
-      static_cast<const std::byte *>(a.gin_window_base) +
-      a.gin_return_fragment_ready_offset);
-  if (threadIdx.x == 0U) {
-    // Every put contributes its row count to the destination chunk's counter.
-    // Fragments never cross a chunk boundary. Equality therefore certifies
-    // all payloads, independent of sender/QP completion order.
-    asm volatile("fence.proxy.async.global;" : : : "memory");
-    const auto ready_rows = *((volatile const unsigned long long *)
-        (fragment_ready + state.selected_chunk));
-    state.chunk_ready = ready_rows == state.selected_rows ? 1U : 0U;
-  }
-  __syncthreads();
-  if (state.chunk_ready == 0U)
-    return false;
-
-  // Mark ownership only after observing every payload marker. Multiple CTAs
-  // may probe the same chunk, but exactly one publishes its route readiness.
-  if (threadIdx.x == 0U) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
-        chunk_state[state.selected_chunk]);
-    auto old = claimed.load(::cuda::memory_order_relaxed);
-    state.selected = old != execution_epoch(a) &&
-                     claimed.compare_exchange_strong(
-                         old, execution_epoch(a), ::cuda::memory_order_acq_rel,
-                         ::cuda::memory_order_relaxed);
-  }
-  __syncthreads();
-  if (state.selected == 0U)
-    return false;
-
-  WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
-                          context, state.selected_rows, execution_epoch(a));
   if (threadIdx.x == 0U) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-  }
-  publish_direct_full_source_chunk(a, row_begin, state.selected_rows);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
-                          context, state.selected_rows, execution_epoch(a));
-  if (threadIdx.x == 0U) {
     state.completed =
         persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
-            control.return_chunks_complete.value, 1ULL) +
-        1ULL;
-    state.progressed = 1U;
+            control.return_rows_complete.value, state.selected_rows) +
+        state.selected_rows;
   }
   __syncthreads();
-  return state.progressed != 0U;
+  return true;
 }
-inline constexpr std::uint32_t kMaxDirectLocalReturnBatch = 8U;
 
-struct DirectLocalReturnState {
+struct ReturnRdmaState {
   unsigned long long cursor = 0ULL;
-  unsigned int preferred_stripe = 0U;
-  std::uint32_t context = 0U;
-  std::uint32_t selected = 0U;
-  std::uint32_t active = 0U;
-  std::uint32_t copied_rows = 0U;
-  ForwardReturnTile batch[kMaxDirectLocalReturnBatch]{};
+  unsigned long long end = 0ULL;
+  unsigned long long issued = 0ULL;
+  unsigned long long completed = 0ULL;
+  unsigned long long notifications = 0ULL;
+  unsigned long long notify_begin = 0ULL;
+  unsigned int source = 0U;
 };
 
-__device__ __forceinline__ bool
-direct_local_return_terminal(const ForwardKernelArgs &a,
-                             unsigned long long *scheduler,
-                             const DirectLocalReturnState &) {
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> produced(
-      direct_mblocks_complete(a, scheduler));
-  if (produced.load(::cuda::memory_order_acquire) < scheduler[3])
-    return false;
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      direct_fragment_tail(a, scheduler));
-  const auto end = tail.load(::cuda::memory_order_acquire);
-  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-      a.local_base, a.forward_v3_control_offset);
-  const auto stripes = (a.forward_relay_cta_count + a.local_world_size - 1U) /
-      a.local_world_size;
-  for (unsigned int context = 0U; context < a.local_world_size; ++context)
-    for (unsigned int stripe = 0U; stripe < stripes; ++stripe) {
-      const auto count = persistent_v3::load_acquire<::cuda::thread_scope_device>(
-          control->local_return_head[context * stripes + stripe].value);
-      if (stripe + count * stripes < end)
-        return false;
-    }
-  return true;
-}
-
-// Shared destination/stripe cursors retain interleaved descriptor batches
-// without binding a CTA to a stripe. Prefer the home stripe and destination,
-// then steal another ready batch. Never claim unpublished descriptors.
-__device__ __forceinline__ bool progress_direct_local_return_once(
-    const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
-    std::uint32_t preferred_context, unsigned long long *scheduler,
-    DirectLocalReturnState &state, std::byte *tma_storage,
-    DirectLocalReturnBarrier *tma_full) {
-  auto *fragments = peer_at<ForwardReturnTile>(
-      a.local_base, a.forward_direct_return_fragment_offset);
-  if (threadIdx.x == 0U) {
-    state.selected = 0U;
-    state.active = 0U;
-    state.copied_rows = 0U;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-        direct_fragment_tail(a, scheduler));
-    const auto published_tail = tail.load(::cuda::memory_order_acquire);
-    const auto stripes = (a.forward_relay_cta_count + a.local_world_size - 1U) /
-        a.local_world_size;
-    for (unsigned int attempt = 0U; attempt < a.local_world_size * stripes; ++attempt) {
-      const auto context = (preferred_context + attempt / stripes) % a.local_world_size;
-      const auto stripe = (state.preferred_stripe + attempt % stripes) % stripes;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
-          control.local_return_head[context * stripes + stripe].value);
-      auto begin = head.load(::cuda::memory_order_relaxed);
-      unsigned int count = 0U;
-      while (count < a.forward_local_return_batch_mblocks &&
-             stripe + (begin + count) * stripes < published_tail) {
-        ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> ready(
-            fragments[stripe + (begin + count) * stripes].epoch);
-        if (ready.load(::cuda::memory_order_acquire) != execution_epoch(a))
-          break;
-        ++count;
-      }
-      if (!count || !head.compare_exchange_strong(begin, begin + count,
-                                                  ::cuda::memory_order_acq_rel,
-                                                  ::cuda::memory_order_relaxed))
-        continue;
-      state.cursor = stripe + begin * stripes;
-      state.context = context;
-      state.selected = count;
-      for (unsigned int item = 0U; item < count; ++item) {
-        state.batch[item] = fragments[stripe + (begin + item) * stripes];
-        if ((state.batch[item].local_context_mask & (1U << context)) != 0U)
-          ++state.active;
-      }
-      break;
-    }
-  }
-  __syncthreads();
-  if (state.selected == 0U || cancelled(a, control))
-    return false;
-
-  const auto context = state.context;
-  const auto local_source = a.node * a.local_world_size + context;
-  if (state.active != 0U) {
-    WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
-                            context, (state.cursor << 32U) | state.active,
-                            execution_epoch(a));
-    if (threadIdx.x == 0U) {
-      auto *status =
-          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-      atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-    }
-    const auto *headers = peer_at<const LocalP2pRouteHeader>(
-        a.local_base, a.direct_headers_offset);
-    const auto *forward_output =
-        a.use_gin && a.forward_registered_output
-            ? reinterpret_cast<const transport::BFloat16 *>(
-                  static_cast<const std::byte *>(a.gin_window_base) +
-                  a.gin_return_staging_offset)
-            : peer_at<const transport::BFloat16>(a.local_base,
-                                                 a.forward_output_rows_offset);
-    auto *source_contribution = peer_at<transport::BFloat16>(
-        a.peer_bases[local_source], a.contribution_offset);
-    const auto copy_bytes =
-        static_cast<std::uint32_t>(a.hidden * sizeof(transport::BFloat16));
-    const auto tma_warps = a.forward_relay_tma_warps;
-    const bool use_tma = tma_warps != 0U && copy_bytes != 0U &&
-                         copy_bytes <= 16384U && (copy_bytes & 15U) == 0U;
-    if (use_tma) {
-      const auto warp = threadIdx.x / 32U;
-      const auto lane = threadIdx.x & 31U;
-      // Each warp leader owns an independent mbarrier and 14-KiB SMEM row.
-      // This retains the twelve concurrent row streams of the vector path
-      // while replacing 448 lane-issued peer stores with one bulk store.
-      if (warp < tma_warps && lane == 0U) {
-        auto *warp_storage = tma_storage + warp * copy_bytes;
-        auto &warp_full = tma_full[warp];
-        bool copied = false;
-        for (std::uint32_t item = 0U; item < state.selected; ++item) {
-          const auto fragment = state.batch[item];
-          if ((fragment.local_context_mask & (1U << context)) == 0U)
-            continue;
-          for (std::uint32_t local_row = warp; local_row < fragment.row_count;
-               local_row += tma_warps) {
-            const auto canonical_row = fragment.canonical_row + local_row;
-            const auto header = headers[canonical_row];
-            if (header.source_rank != local_source)
-              continue;
-            const auto *source = forward_output + canonical_row * a.hidden;
-            auto *target = source_contribution + header.route_index * a.hidden;
-            ::cuda::device::experimental::cp_async_bulk_global_to_shared(
-                warp_storage, source, copy_bytes, warp_full);
-            auto token =
-                ::cuda::device::barrier_arrive_tx(warp_full, 1U, copy_bytes);
-            warp_full.wait(static_cast<decltype(token) &&>(token));
-            ::cuda::device::experimental::cp_async_bulk_shared_to_global(
-                target, warp_storage, copy_bytes);
-            ::cuda::device::experimental::cp_async_bulk_commit_group();
-            ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
-            copied = true;
-          }
-        }
-        if (copied) {
-          ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
-          __threadfence_system();
-        }
-      }
-    } else {
-      const auto vector_count = a.hidden / 8ULL;
-      const auto warp = threadIdx.x / 32U;
-      const auto lane = threadIdx.x & 31U;
-      const auto kWarps = blockDim.x / 32U;
-      // A warp owns one row. Use every warp in either transport launch;
-      // batching changes the fence cadence without changing row ownership.
-      for (std::uint32_t item = 0U; item < state.selected; ++item) {
-        const auto fragment = state.batch[item];
-        if ((fragment.local_context_mask & (1U << context)) == 0U)
-          continue;
-        for (std::uint32_t local_row = warp; local_row < fragment.row_count;
-             local_row += kWarps) {
-          const auto canonical_row = fragment.canonical_row + local_row;
-          const auto header = headers[canonical_row];
-          if (header.source_rank != local_source)
-            continue;
-          const auto *source128 = reinterpret_cast<const uint4 *>(
-              forward_output + canonical_row * a.hidden);
-          auto *target128 = reinterpret_cast<uint4 *>(
-              source_contribution + header.route_index * a.hidden);
-          for (std::uint64_t vector = lane; vector < vector_count;
-               vector += 32ULL)
-            target128[vector] = source128[vector];
-        }
-      }
-      __threadfence_system();
-    }
-    __syncthreads();
-    std::uint32_t published_rows = 0U;
-    for (std::uint32_t item = 0U; item < state.selected; ++item) {
-      const auto fragment = state.batch[item];
-      if ((fragment.local_context_mask & (1U << context)) == 0U)
-        continue;
-      for (std::uint32_t local_row = threadIdx.x;
-           local_row < fragment.row_count; local_row += blockDim.x) {
-        const auto canonical_row = fragment.canonical_row + local_row;
-        const auto header = headers[canonical_row];
-        if (header.source_rank != local_source)
-          continue;
-        auto *source_route_ready = peer_at<unsigned long long>(
-            a.peer_bases[local_source], a.return_ready_epoch_offset);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            ready(source_route_ready[header.route_index]);
-        if (a.forward_dynamic_reduce_queue)
-          forward_reduce_detail::publish_ready_route(
-              a, a.peer_bases[local_source], header.route_index, 2U);
-        else
-          ready.store(execution_epoch(a), ::cuda::memory_order_release);
-        ++published_rows;
-      }
-    }
-    constexpr unsigned int kWarpMask = 0xffffffffU;
-    const auto warp_rows = __reduce_add_sync(kWarpMask, published_rows);
-    if ((threadIdx.x & 31U) == 0U && warp_rows != 0U)
-      atomicAdd(&state.copied_rows, warp_rows);
-    __syncthreads();
-
-    if (threadIdx.x == 0U && state.copied_rows != 0U) {
-      if (a.forward_stream_local_dispatch && local_source != a.rank) {
-        auto *status =
-            peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-        atomicAdd(&status->actual_return_peer_bytes,
-                  static_cast<unsigned long long>(state.copied_rows) *
-                      a.hidden * sizeof(transport::BFloat16));
-      }
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          completed(scheduler[4U + local_source]);
-      const auto old =
-          completed.fetch_add(state.copied_rows, ::cuda::memory_order_acq_rel);
-      const auto expected = old >> 32U;
-      const auto actual = (old & 0xffffffffULL) + state.copied_rows;
-      if (actual == expected) {
-        auto *source_signal = peer_at<unsigned long long>(
-            a.peer_bases[local_source], a.outgoing_sequence_offset);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            ready(source_signal[a.rank * a.channels]);
-        ready.store(execution_epoch(a), ::cuda::memory_order_release);
-      }
-    }
-    __syncthreads();
-    WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
-                            context, (state.cursor << 32U) | state.copied_rows,
-                            execution_epoch(a));
-  }
-
-  return true;
-}
-// Only the permanent owner of `fragment.context` calls this function.  Keeping
-// both payload and marker on the same exclusive QP gives the receiver a cheap
-// per-fragment release flag without exposing GIN state to FC2 producers.
-__device__ __forceinline__ void issue_direct_full_fragment_rdmacta(
-    const ForwardKernelArgs &a, const ncclGin &gin, ncclTeam world,
-    const ForwardDirectReturnFragment &fragment,
-    transport_state::GenerationCompletionVector *completion,
-    transport_state::ContextCompletionRecord *context_completion,
-    unsigned long long &issued) {
-  const auto context = fragment.context;
-  const auto source_node = fragment.source_rank / a.local_world_size;
-  const auto source_partition =
-      source_node < a.node ? source_node : source_node - 1U;
-  const auto payload_bytes =
-      static_cast<std::uint64_t>(fragment.row_count) * a.hidden *
-      sizeof(transport::BFloat16);
-
-#if WEFTMOE_DEBUG_VALIDATE
-  // Preserve the exact first WQE owned by this CTA.  If a local completion
-  // stops advancing, the timeout dump then identifies the remote rank/context
-  // and both source and destination row intervals without perturbing the GIN
-  // polling loop itself.
-  const auto diagnostic_key =
-      static_cast<unsigned long long>(fragment.source_rank) *
-          a.gin_context_count +
-      context;
-  if (atomicCAS(&completion->first_waiting_tile, ~0ULL, diagnostic_key) ==
-      ~0ULL) {
-    completion->first_wait_expected = fragment.canonical_row;
-    completion->first_wait_arrived = fragment.compact_row;
-    completion->tile_waiter_count = fragment.row_count;
-  }
-#endif
-
-  const auto compact_capacity =
-      static_cast<std::uint64_t>(a.dispatch.identity.num_nodes - 1U) *
-      a.max_tokens_per_rank * a.dispatch.identity.top_k;
-  const bool valid =
-      fragment.source_rank < a.world && a.local_world_size != 0U &&
-      source_node < a.dispatch.identity.num_nodes && source_node != a.node &&
-      context < a.gin_context_count && fragment.row_count != 0U &&
-      fragment.canonical_row < a.max_destination_rows &&
-      fragment.row_count <=
-          a.max_destination_rows - fragment.canonical_row &&
-      fragment.compact_row < compact_capacity &&
-      fragment.row_count <= compact_capacity - fragment.compact_row;
-  if (!valid) {
-    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-        a.local_base, a.forward_v3_control_offset);
-    persistent_v3::publish_error_once(control->generation, 312ULL);
-    return;
-  }
-
-  auto &return_tasks =
-      completion_task(completion, transport_state::TaskClass::Return);
-  atomicAdd(&return_tasks.expected, 1ULL);
-  claim_completion_tasks(completion, transport_state::TaskClass::Return);
-  atomicAdd(&completion->return_local_completion_expected, 1ULL);
-  auto &record = context_completion[
-      static_cast<std::uint64_t>(source_partition) * a.gin_context_count +
-      context];
+// Each payload has its own local counter. Notification puts use counter 0,
+// leaving return_max_inflight expressed in payloads as before this refactor.
+__device__ __forceinline__ void
+record_return_operation(const ForwardKernelArgs &a, unsigned int source,
+                        unsigned int context,
+                        transport_state::GenerationCompletionVector *completion,
+                        transport_state::ContextCompletionRecord *contexts) {
+  const auto node = source / a.local_world_size;
+  const auto partition = node < a.node ? node : node - 1U;
+  auto &record = contexts[partition * a.gin_context_count + context];
   atomicAdd(&record.return_expected, 1ULL);
   atomicAdd(&record.return_claimed, 1ULL);
   atomicAdd(&record.inflight, 1ULL);
-
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn, context,
-                          payload_bytes, execution_epoch(a));
-  gin.put(
-      world, static_cast<int>(fragment.source_rank), a.gin_window,
-      a.gin_return_receive_offset +
-          static_cast<std::size_t>(fragment.compact_row) * a.hidden *
-              sizeof(transport::BFloat16),
-      a.gin_window,
-      a.gin_return_staging_offset +
-          static_cast<std::size_t>(fragment.canonical_row) * a.hidden *
-              sizeof(transport::BFloat16),
-      payload_bytes,
-      ncclGin_VASignalAdd{
-          a.gin_window,
-          a.gin_return_fragment_ready_offset +
-              static_cast<std::size_t>(fragment.compact_row /
-                                           a.forward_return_chunk_rows) *
-                  sizeof(std::uint64_t),
-          static_cast<std::uint64_t>(fragment.row_count)},
-      ncclGin_CounterInc{1},
-      ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_block,
-      ::cuda::thread_scope_device);
-  ++issued;
-
-  auto *status =
-      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  atomicAdd(&status->gin_return_put_count, 1ULL);
-  atomicAdd(&status->gin_signal_count, 1ULL);
-  atomicAdd(&status->gin_return_payload_bytes, payload_bytes);
+  atomicAdd(
+      &completion_task(completion, transport_state::TaskClass::Return).expected,
+      1ULL);
+  claim_completion_tasks(completion, transport_state::TaskClass::Return);
+  atomicAdd(&completion->return_local_completion_expected, 1ULL);
 }
 
-struct DirectFullPendingRun {
-  std::uint32_t source = 0U;
-  std::uint64_t canonical = 0ULL;
-  std::uint64_t compact = 0ULL;
-  std::uint64_t chunk = 0ULL;
-  std::uint32_t rows = 0U;
-};
-
-__device__ __forceinline__ void flush_direct_full_run(
-    const ForwardKernelArgs &a, const ncclGin &gin, ncclTeam world,
-    std::uint32_t context, DirectFullPendingRun &run,
+__device__ __forceinline__ bool progress_return_send(
+    const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+    const ncclGin &gin, ncclTeam world, unsigned int context,
     transport_state::GenerationCompletionVector *completion,
     transport_state::ContextCompletionRecord *context_completion,
-    unsigned long long &issued) {
-  if (run.rows == 0U)
-    return;
-  ForwardDirectReturnFragment fragment{};
-  fragment.canonical_row = run.canonical;
-  fragment.compact_row = run.compact;
-  fragment.source_rank = run.source;
-  fragment.row_count = run.rows;
-  fragment.context = context;
-  fragment.epoch = execution_epoch(a);
-  issue_direct_full_fragment_rdmacta(a, gin, world, fragment, completion,
-                                     context_completion, issued);
-  run.rows = 0U;
-}
-
-struct DirectFullRdmaState {
-  unsigned long long cursor = 0ULL;
-  unsigned long long issued = 0ULL;
-  unsigned long long completed = 0ULL;
-  std::uint32_t local_row = 0U;
-  DirectFullPendingRun run{};
-};
-
-__device__ __forceinline__ bool direct_full_return_has_credit(
-    const ForwardKernelArgs &a, const ncclGin &gin,
-    DirectFullRdmaState &state) {
-  const auto limit =
-      static_cast<unsigned long long>(a.forward_return_max_inflight);
-  if (limit == 0ULL || state.issued - state.completed < limit)
+    unsigned long long *, ReturnRdmaState &state) {
+  auto &queue = control.return_rows[1U + context];
+  const auto *entries =
+      peer_at<const unsigned int>(a.local_base, a.forward_return_rows_offset) +
+      queue.begin;
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
+  const auto *notifications =
+      reinterpret_cast<const unsigned long long *>(
+          static_cast<const std::byte *>(a.gin_window_base) +
+          a.gin_return_send_rows_offset) +
+      queue.begin;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  // One contiguous metadata put confirms several possibly discontiguous
+  // payload puts. Its strong action covers only this context and peer.
+  if (state.notify_begin < state.cursor &&
+      (state.cursor == state.end ||
+       headers[entries[state.cursor]].source_rank != state.source)) {
+    auto &peer = peer_queues(a)[state.source];
+    const auto rows = state.cursor - state.notify_begin;
+    gin.put(world, state.source, a.gin_window,
+            a.gin_return_receive_rows_offset +
+                (peer.send_begin + peer.sent) * sizeof(unsigned long long),
+            a.gin_window,
+            a.gin_return_send_rows_offset +
+                (queue.begin + state.notify_begin) * sizeof(unsigned long long),
+            rows * sizeof(unsigned long long),
+            ncclGin_StrongSignalAdd{3U + a.rank, rows}, ncclGin_CounterInc{0},
+            ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_block,
+            ::cuda::thread_scope_device);
+    peer.sent += rows;
+    ++state.notifications;
+    state.notify_begin = state.cursor;
+    record_return_operation(a, state.source, context, completion,
+                            context_completion);
+    atomicAdd(&status->gin_signal_count, 1ULL);
+    atomicAdd(&status->gin_metadata_bytes,
+              rows * sizeof(unsigned long long));
     return true;
-  const auto completed =
-      gin.readCounter(1, 56, ::cuda::memory_order_acquire);
-  state.completed = completed < state.issued ? completed : state.issued;
-  return state.issued - state.completed < limit;
-}
-
-// Scan one M-block incrementally and emit at most one coalesced run per call.
-// The row cursor and pending run make a full Return QP non-blocking: Dispatch
-// retains priority on the same RDMA CTA instead of waiting for queue credit or
-// issuing every run in a 128-row block as one unbounded burst.
-__device__ __forceinline__ bool progress_direct_full_mblock_rdmacta(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, const ncclGin &gin,
-    ncclTeam world, std::uint32_t context,
-    const ForwardReturnTile &mblock,
-    transport_state::GenerationCompletionVector *completion,
-    transport_state::ContextCompletionRecord *context_completion,
-    DirectFullRdmaState &state) {
-  auto *mapping = peer_at<unsigned long long>(
-      a.local_base, a.forward_output_ready_epoch_offset);
-  const auto *headers = peer_at<const LocalP2pRouteHeader>(
-      a.local_base, a.direct_headers_offset);
-
-  while (state.local_row < mblock.row_count) {
-    const auto canonical_row = mblock.canonical_row + state.local_row;
-    const auto source = headers[canonical_row].source_rank;
-    if (source / a.local_world_size == a.node) {
-      if (state.run.rows != 0U) {
-        if (!direct_full_return_has_credit(a, gin, state))
-          return false;
-        flush_direct_full_run(a, gin, world, context, state.run, completion,
-                              context_completion, state.issued);
-        return true;
-      }
-      ++state.local_row;
-      continue;
-    }
-    // The immutable canonical header already identifies the only FULL
-    // connection/context that can own this row.  Filter here, before touching
-    // the peer-published reverse mapping.  The previous order made all eight
-    // RDMA CTAs acquire-poll every remote row and discarded seven copies only
-    // after the expensive system-scope load completed.
-    const auto direct_context = source % a.local_world_size;
-    if (direct_context != context) {
-      if (state.run.rows != 0U) {
-        if (!direct_full_return_has_credit(a, gin, state))
-          return false;
-        flush_direct_full_run(a, gin, world, context, state.run, completion,
-                              context_completion, state.issued);
-        return true;
-      }
-      ++state.local_row;
-      continue;
-    }
-#if WEFTMOE_DEBUG_VALIDATE
-    atomicMax(&completion->fc1_scheduler_value, 4000ULL + canonical_row);
-#endif
-    // Dispatch released this immutable mapping before input readiness;
-    // the FC1 -> FC2 -> descriptor chain carries that dependency here.
-    const auto encoded = mapping[canonical_row];
-#if WEFTMOE_DEBUG_VALIDATE
-    if (encoded == 0ULL)
-      atomicMax(&completion->fc2_scheduler_value, 5000ULL + canonical_row);
-#endif
-    if (encoded == 0ULL) {
-      persistent_v3::publish_error_once(control.generation, 312ULL);
+  }
+  if (a.forward_return_max_inflight != 0U &&
+      state.issued - state.completed >= a.forward_return_max_inflight) {
+    state.completed = gin.readCounter(1, 56, ::cuda::memory_order_acquire);
+    if (state.issued - state.completed >= a.forward_return_max_inflight)
+      return false;
+  }
+  if (state.cursor == state.end) {
+    unsigned int count = 0U;
+    state.cursor = claim_rows(queue, a.forward_return_batch_rows, count);
+    state.end = state.cursor + count;
+    state.notify_begin = state.cursor;
+    if (!count)
+      return false;
+  }
+  const auto first = entries[state.cursor];
+  const auto source = headers[first].source_rank;
+  const auto compact = notifications[state.cursor] & 0xffffffffULL;
+  state.source = source;
+  unsigned int rows = 0U;
+  do {
+    const auto entry = notifications[state.cursor + rows];
+    const auto length = static_cast<unsigned int>(
+        min(state.end - state.cursor - rows, 1ULL * (entry >> 32U)));
+    if (length == 0U) {
+      persistent_v3::publish_error_once(control.generation, 314ULL);
       return false;
     }
-    if (cancelled(a, control))
-      return false;
-#if WEFTMOE_DEBUG_VALIDATE
-    atomicMax(&completion->fc2_scheduler_value, 6000ULL + canonical_row);
-#endif
-    const auto compact = return_mapping_compact_row(encoded);
-    const auto chunk = return_mapping_chunk(encoded);
-    const bool extends =
-        state.run.rows != 0U && source == state.run.source &&
-        chunk == state.run.chunk &&
-        compact == state.run.compact + state.run.rows &&
-        canonical_row == state.run.canonical + state.run.rows;
-    if (!extends) {
-      if (state.run.rows != 0U) {
-        if (!direct_full_return_has_credit(a, gin, state))
-          return false;
-        flush_direct_full_run(a, gin, world, context, state.run, completion,
-                              context_completion, state.issued);
-        return true;
-      }
-      state.run.source = source;
-      state.run.canonical = canonical_row;
-      state.run.compact = compact;
-      state.run.chunk = chunk;
-      state.run.rows = 1U;
-    } else {
-      ++state.run.rows;
-    }
-    ++state.local_row;
-  }
-  if (state.run.rows != 0U) {
-    if (!direct_full_return_has_credit(a, gin, state))
-      return false;
-    flush_direct_full_run(a, gin, world, context, state.run, completion,
-                          context_completion, state.issued);
-  }
-  state.local_row = 0U;
-  ++state.cursor;
-  return true;
-}
-
-// Consume at most one coalesced run. Calling this once from each Dispatch
-// scheduler iteration gives Rail Dispatch priority while opportunistic FULL
-// puts fill otherwise idle network time. Every context remains the sole owner
-// of its GIN QP.
-__device__ __forceinline__ bool progress_direct_full_rdma_once(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, const ncclGin &gin,
-    ncclTeam world, std::uint32_t context,
-    transport_state::GenerationCompletionVector *completion,
-    transport_state::ContextCompletionRecord *context_completion,
-    unsigned long long *scheduler, DirectFullRdmaState &state) {
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      direct_fragment_tail(a, scheduler));
-  if (state.cursor >= tail.load(::cuda::memory_order_acquire))
-    return false;
-
-  auto *fragments = peer_at<ForwardReturnTile>(
-      a.local_base, a.forward_direct_return_fragment_offset);
-  auto &fragment = fragments[state.cursor];
-  ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
-      fragment.epoch);
-  if (published.load(::cuda::memory_order_acquire) != execution_epoch(a))
-    return false;
-
-  if ((fragment.remote_context_mask & (1U << context)) != 0U) {
-    if (fragment.contiguous_source_rank != UINT32_MAX) {
-      if (!direct_full_return_has_credit(a, gin, state))
-        return false;
-      ForwardDirectReturnFragment wire{};
-      wire.canonical_row = fragment.canonical_row;
-      wire.compact_row = fragment.compact_row;
-      wire.row_count = fragment.row_count;
-      wire.source_rank = fragment.contiguous_source_rank;
-      wire.context = context;
-      wire.epoch = execution_epoch(a);
-      issue_direct_full_fragment_rdmacta(a, gin, world, wire, completion,
-                                        context_completion, state.issued);
-      ++state.cursor;
-      return true;
-    }
-
-    return progress_direct_full_mblock_rdmacta(
-        a, control, gin, world, context, fragment, completion,
-        context_completion, state);
-  }
-  state.local_row = 0U;
-  state.run.rows = 0U;
-  ++state.cursor;
-  return true;
-}
-
-__device__ __forceinline__ void direct_full_rdma_thread(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control, std::uint32_t context,
-    transport_state::GenerationCompletionVector *completion,
-    transport_state::ContextCompletionRecord *context_completion,
-    unsigned long long *scheduler, const ncclGin &gin, ncclTeam world,
-    DirectFullRdmaState &state) {
-  const auto mblocks = scheduler[3];
-  if (mblocks > a.forward_direct_return_fragment_capacity)
-    persistent_v3::publish_error_once(control.generation, 311ULL);
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      direct_fragment_tail(a, scheduler));
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-      producers_done(direct_mblocks_complete(a, scheduler));
-  while (!cancelled(a, control)) {
-    bool progressed = false;
-    while (progress_direct_full_rdma_once(
-        a, control, gin, world, context, completion, context_completion,
-        scheduler, state)) {
-      progressed = true;
-#if WEFTMOE_DEBUG_VALIDATE
-      atomicMax(&completion->bulk_pack_complete, 2000ULL + state.cursor);
-#endif
-    }
-    if (producers_done.load(::cuda::memory_order_acquire) >= mblocks &&
-        state.cursor >= tail.load(::cuda::memory_order_acquire))
+    rows += length;
+    if (state.cursor + rows == state.end)
       break;
-    if (!progressed)
-      __nanosleep(forward_tuning::kReturnIdleNanosleep);
-  }
+    const auto next = entries[state.cursor + rows];
+    if (next != first + rows || headers[next].source_rank != source ||
+        (notifications[state.cursor + rows] & 0xffffffffULL) != compact + rows)
+      break;
+  } while (true);
+  const auto bytes = rows * a.hidden * sizeof(transport::BFloat16);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn, context,
+                          bytes, execution_epoch(a));
+  gin.put(world, source, a.gin_window,
+          a.gin_return_receive_offset + compact * a.hidden * 2ULL, a.gin_window,
+          a.gin_return_staging_offset + first * a.hidden * 2ULL, bytes,
+          ncclGin_None{}, ncclGin_CounterInc{1}, ncclCoopThread{},
+          ncclGin_None{}, ::cuda::thread_scope_block,
+          ::cuda::thread_scope_device);
+  state.cursor += rows;
+  ++state.issued;
+  record_return_operation(a, source, context, completion, context_completion);
+  atomicAdd(&status->gin_return_put_count, 1ULL);
+  atomicAdd(&status->gin_return_payload_bytes, bytes);
+  return true;
+}
 
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-      issued_count(direct_issued_counts(a, scheduler)[context]);
-  issued_count.store(state.issued, ::cuda::memory_order_release);
+__device__ __forceinline__ void
+drain_return_send(const ForwardKernelArgs &a,
+                  persistent_v3::ForwardPipelineControl &control,
+                  unsigned int context,
+                  transport_state::GenerationCompletionVector *completion,
+                  transport_state::ContextCompletionRecord *context_completion,
+                  unsigned long long *scheduler, const ncclGin &gin,
+                  ncclTeam world, ReturnRdmaState &state) {
+  auto &queue = control.return_rows[1U + context];
+  while (!cancelled(a, control)) {
+    if (progress_return_send(a, control, gin, world, context, completion,
+                             context_completion, scheduler, state))
+      continue;
+    if (persistent_v3::load_acquire<::cuda::thread_scope_device>(
+            control.return_producers_complete.value) >= scheduler[3] &&
+        state.cursor == state.end && state.notify_begin == state.cursor &&
+        queue.head == queue.capacity)
+      break;
+    __nanosleep(forward_tuning::kReturnIdleNanosleep);
+  }
   while (gin.readCounter(1, 56, ::cuda::memory_order_acquire) < state.issued &&
          !cancelled(a, control))
     __nanosleep(forward_tuning::kTransportIdleNanosleep);
-
-  if (state.issued != 0ULL) {
-    complete_completion_tasks(completion, transport_state::TaskClass::Return,
-                              state.issued);
-    atomicAdd(&completion->return_local_completion_completed, state.issued);
-    const auto source_node = a.node == 0U ? 1U : 0U;
-    const auto source_partition =
-        source_node < a.node ? source_node : source_node - 1U;
-    auto &record = context_completion[
-        static_cast<std::uint64_t>(source_partition) * a.gin_context_count +
-        context];
-    atomicAdd(&record.return_completed, state.issued);
-    atomicAdd(&record.inflight, 0ULL - state.issued);
-    atomicAdd(&record.local_completion, state.issued);
-    record.last_progress_globaltimer = device_globaltimer_ns();
+  while (gin.readCounter(0, 56, ::cuda::memory_order_acquire) <
+             state.notifications &&
+         !cancelled(a, control))
+    __nanosleep(forward_tuning::kTransportIdleNanosleep);
+  const auto operations = state.issued + state.notifications;
+  complete_completion_tasks(completion, transport_state::TaskClass::Return,
+                            operations);
+  atomicAdd(&completion->return_local_completion_completed, operations);
+  for (unsigned int partition = 0U;
+       partition + 1U < a.dispatch.identity.num_nodes; ++partition) {
+    auto &record =
+        context_completion[partition * a.gin_context_count + context];
+    record.return_completed = record.return_expected;
+    record.local_completion = record.return_expected;
+    record.inflight = 0ULL;
   }
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn, context,
-                          state.issued, execution_epoch(a));
   persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
       control.rdma_return_roles_complete.value, 1ULL);
 }
 
 } // namespace forward_return_detail
-
-#endif // __has_include(<nccl_device.h>)
+#endif

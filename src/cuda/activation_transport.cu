@@ -59,6 +59,16 @@ namespace {
 
 #include "cuda/backward/device_kernels.cuh"
 
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+__global__ void fill_transport_benchmark_output(transport::BFloat16 *output,
+                                               unsigned long long count) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < count; i += gridDim.x * blockDim.x)
+    output[i] = transport::BFloat16{
+        static_cast<std::uint16_t>(0x3c00U + (i & 255U))};
+}
+#endif
+
 } // namespace
 
 struct ActivationTransportResourcePool::Impl {
@@ -483,9 +493,6 @@ struct DeviceForwardHandle::Impl {
   bool retained_backward_state = false;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
-  // Backward reuses Forward's immutable FULL-return row mapping, including
-  // the chunk boundaries encoded in each entry.
-  std::uint64_t forward_return_chunk_rows = 0;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;
@@ -1461,18 +1468,14 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   const auto allocated_context_count = 2U * kGinContextCount;
   requirements.ginContextCount = allocated_context_count;
   // One permanent RDMA CTA owns a same-rail Dispatch QP and an independent
-  // FULL Return QP. Compute CTAs publish byte-range descriptors and never
-  // touch a GIN context.
+  // FULL Return QP. Compute CTAs publish row IDs and never touch a GIN context.
   requirements.ginExclusiveContexts = true;
   requirements.ginQueueDepth = 64;
-  // 0=dispatch arrival, 1=return arrival.
-  // Signal 0/1 are the data-plane dispatch/return epochs. Signal 2 is the
-  // fixed terminal production-status epoch and is touched only once per
-  // generation, never on the per-task success path.
-  requirements.ginSignalCount = 3;
-  // Counter 0 belongs to Dispatch; direct/stream Return overlaps it and uses
-  // counter 1.  Request both explicitly (the previous count of one made every
-  // counter-1 access formally out of bounds).
+  // 0/1 are Dispatch/Backward signals, 2 is terminal status. Each Forward
+  // sender owns signal 3+rank for its row-notification queue.
+  requirements.ginSignalCount = 3U + nccl->world;
+  // Dispatch uses counter 0 on its own contexts. Return uses counter 1 for
+  // payloads and counter 0 for row notifications on the separate Return contexts.
   requirements.ginCounterCount = 2;
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
   internal::throw_nccl(
@@ -4222,6 +4225,22 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     consumer = dispatch.acquire_consumer(backend->execution, expectation);
     view = ActivationTransportBridge::view(consumer);
   }
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+  fill_transport_benchmark_output<<<4096, 256, 0, exec->stream>>>(
+      use_gin
+          ? at<transport::BFloat16>(slot.gin_window,
+                                    state->gin_layout.return_staging)
+          : at<transport::BFloat16>(slot.device,
+                                    config.retain_backward_state
+                                        ? layout.forward_training_output
+                                        : layout.canonical_rows),
+      state->config.max_destination_rows_per_rank *
+          state->config.max_hidden_size);
+  internal::throw_cuda(
+      "forward-transport-benchmark", cudaGetLastError(), id.calling_rank,
+      id.world_size, backend->session.session().identity(), id.generation,
+      ExchangeKind::ExpertCounts, "prefill Return output");
+#endif
   internal::throw_cuda(
       "forward-run",
       internal::record_observable_event(slot.forward_start, exec->stream,
@@ -4257,24 +4276,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         cudaMemsetAsync(gin_barrier, 0, sizeof(std::uint64_t), exec->stream),
         id.calling_rank, id.world_size, backend->session.session().identity(),
         id.generation, ExchangeKind::ExpertCounts, "reset Forward GIN barrier");
-    internal::throw_cuda(
-        "forward-run",
-        cudaMemsetAsync(
-            at<void>(slot.gin_window,
-                     state->gin_layout.return_fragment_ready),
-            0,
-            checked_size(checked_mul(state->config.max_tokens_per_rank,
-                                     state->config.max_top_k,
-                                     "Forward direct Return counters"),
-                         "Forward direct Return counter count") *
-                sizeof(std::uint64_t),
-            exec->stream),
-        id.calling_rank, id.world_size, backend->session.session().identity(),
-        id.generation, ExchangeKind::ExpertCounts,
-        "reset Forward direct Return fragment counters");
     gin_signal_reset_kernel<<<gin_backend->gin_allocated_context_count, 1, 0,
                               exec->stream>>>(
-        gin_backend->dev_comm, gin_backend->gin_allocated_context_count);
+        gin_backend->dev_comm, gin_backend->gin_allocated_context_count,
+        3U + id.world_size);
     internal::throw_cuda("forward-run", cudaGetLastError(), id.calling_rank,
                          id.world_size, backend->session.session().identity(),
                          id.generation, ExchangeKind::ExpertCounts,
@@ -4383,8 +4388,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.gin_receive_payload_offset = state->gin_layout.receive_payload;
     args.gin_return_staging_offset = state->gin_layout.return_staging;
     args.gin_return_receive_offset = state->gin_layout.return_receive;
-    args.gin_return_fragment_ready_offset =
-        state->gin_layout.return_fragment_ready;
+    args.gin_return_send_rows_offset = state->gin_layout.return_send_rows;
+    args.gin_return_receive_rows_offset = state->gin_layout.return_receive_rows;
     args.gin_production_error_records_offset =
         state->gin_layout.production_error_records;
     args.node = gin_backend->node;
@@ -4413,29 +4418,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_compute_pair_mailboxes_offset =
       layout.forward_compute_pair_mailboxes;
   args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
-  args.forward_output_ready_epoch_offset = layout.forward_output_ready_epoch;
-  args.forward_return_chunk_directory_offset =
-      layout.forward_return_chunk_directory;
-  args.forward_return_chunk_state_offset = layout.forward_return_chunk_state;
-  args.forward_return_chunk_ready_count_offset =
-      layout.forward_return_chunk_ready_count;
-  args.forward_return_fragment_index_offset =
-      layout.forward_return_fragment_index;
-  args.forward_return_source_compact_index_offset =
-      layout.forward_return_source_compact_index;
-  args.forward_return_source_route_index_offset =
-      layout.forward_return_source_route_index;
-  args.forward_direct_source_compact_index_offset =
-      layout.forward_direct_source_compact_index;
+  args.forward_return_row_map_offset = layout.forward_return_row_map;
+  args.forward_return_row_to_source_route_offset =
+      layout.forward_return_row_to_source_route;
+  args.forward_source_route_to_return_row_offset =
+      layout.forward_source_route_to_return_row;
   args.forward_reduce_route_count_offset =
       layout.forward_reduce_route_count;
   args.forward_reduce_ready_token_offset =
       layout.forward_reduce_ready_token;
-  args.forward_direct_return_fragment_offset =
-      layout.forward_direct_return_fragment;
-  args.forward_return_chunk_capacity = layout.forward_return_chunk_capacity;
-  args.forward_direct_return_fragment_capacity =
-      layout.forward_direct_return_fragment_capacity;
+  args.forward_return_rows_offset = layout.forward_return_rows;
+  args.forward_return_peers_offset = layout.forward_return_peers;
   // Cross-node Forward has a single Return transport: FULL GIN. Dispatch
   // intentionally remains same-rail, while the second physical context set
   // gives each permanent RDMA CTA an independent FULL Return QP.
@@ -4447,7 +4440,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
                     "FULL Return connections", id.calling_rank,
                     "NCCL_GIN_CONNECTION_FULL", "unavailable");
-  args.forward_return_chunk_rows = forward_tuning::kReturnChunkRows;
+  args.forward_return_batch_rows = forward_tuning::kReturnBatchRows;
   // Scheduler selection belongs to the generated tuning header. Runtime
   // environment overrides made one binary silently represent several kernels
   // and defeated the content-addressed JIT cache.
@@ -4565,17 +4558,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                         "WEFTMOE_FORWARD_RELAY_TMA_WARPS", id.calling_rank,
                         "one of 0, 4, 8, or 12",
                         std::to_string(args.forward_relay_tma_warps));
-      args.forward_local_return_batch_mblocks =
-          forward_tuning::kLocalReturnBatchMblocks;
-      if (args.forward_local_return_batch_mblocks != 1U &&
-          args.forward_local_return_batch_mblocks != 2U &&
-          args.forward_local_return_batch_mblocks != 4U &&
-          args.forward_local_return_batch_mblocks != 8U)
+      args.forward_local_return_batch_rows =
+          forward_tuning::kLocalReturnBatchRows;
+      if (args.forward_local_return_batch_rows < 32U ||
+          args.forward_local_return_batch_rows > 1024U ||
+          args.forward_local_return_batch_rows % 32U != 0U)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "WEFTMOE_FORWARD_LOCAL_RETURN_BATCH_MBLOCKS", id.calling_rank,
-            "one of 1, 2, 4, or 8",
-            std::to_string(args.forward_local_return_batch_mblocks));
+            "WEFTMOE_FORWARD_LOCAL_RETURN_BATCH_ROWS", id.calling_rank,
+            "multiple of 32 in [32, 1024]",
+            std::to_string(args.forward_local_return_batch_rows));
       args.forward_dispatch_publish_batch_rows =
           forward_tuning::kDispatchPublishBatchRows;
       if (args.forward_dispatch_publish_batch_rows != 4U &&
@@ -5220,7 +5212,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->retained_backward_state = config.retain_backward_state;
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
-  result->forward_return_chunk_rows = args.forward_return_chunk_rows;
   result->completion = std::make_unique<OperatorCompletion>();
   result->completion->finish = [backend, state, flight, lease = activation.slot,
       id, options, args, use_gin, use_socket, socket_dispatch_peer_bytes,
@@ -5899,7 +5890,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.gin_context_count =
       use_gin ? gin_backend->gin_context_count : 0U;
   args.max_tokens_per_rank = pool->config.max_tokens_per_rank;
-  args.forward_return_chunk_rows = retained.forward_return_chunk_rows;
+  args.backward_return_chunk_rows = backward_tuning::kTileM;
   args.use_gin = use_gin;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
@@ -5946,14 +5937,14 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.setup_epoch_offset = layout.backward_setup_epoch;
   args.dispatch_ready_offset = layout.backward_dispatch_ready;
   args.return_ready_offset = layout.backward_return_ready;
-  args.forward_output_ready_epoch_offset =
-      layout.forward_output_ready_epoch;
-  args.forward_return_chunk_state_offset =
-      layout.forward_return_chunk_state;
-  args.forward_return_source_route_index_offset =
-      layout.forward_return_source_route_index;
-  args.forward_direct_source_compact_index_offset =
-      layout.forward_direct_source_compact_index;
+  args.forward_return_row_map_offset =
+      layout.forward_return_row_map;
+  args.backward_return_chunk_state_offset =
+      layout.backward_return_chunk_state;
+  args.forward_return_row_to_source_route_offset =
+      layout.forward_return_row_to_source_route;
+  args.forward_source_route_to_return_row_offset =
+      layout.forward_source_route_to_return_row;
   args.scheduler_offset = layout.forward_task_claim;
   args.status_offset = layout.status;
   // Forward and Backward reuse wave markers. One monotonic slot sequence
@@ -5982,7 +5973,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 << at<void>(slot.gin_window, args.gin_return_fragment_ready_offset)
                 << " return_row_bytes=" << args.gin_return_row_bytes
                 << " source_route_index="
-                << at<void>(slot.device, args.forward_return_source_route_index_offset);
+                << at<void>(slot.device, args.forward_return_row_to_source_route_offset);
     std::cerr << std::endl;
   }
 

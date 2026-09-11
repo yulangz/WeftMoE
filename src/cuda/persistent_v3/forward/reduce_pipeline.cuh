@@ -126,7 +126,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
       a.local_base, a.return_ready_epoch_offset);
   const auto *direct_source_compact_index =
       peer_at<const unsigned long long>(
-          a.local_base, a.forward_direct_source_compact_index_offset);
+          a.local_base, a.forward_source_route_to_return_row_offset);
   const auto *direct_return_receive =
       a.use_gin
           ? reinterpret_cast<const transport::BFloat16 *>(

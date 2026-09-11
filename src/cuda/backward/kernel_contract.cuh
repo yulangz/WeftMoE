@@ -22,7 +22,7 @@ struct BackwardKernelArgs {
   std::uint32_t local_world_size = 0;
   std::uint32_t gin_context_count = 0;
   std::uint64_t max_tokens_per_rank = 0;
-  std::uint64_t forward_return_chunk_rows = 0;
+  std::uint64_t backward_return_chunk_rows = 0;
   bool use_gin = false;
   void *local_base = nullptr;
   void **peer_bases = nullptr;
@@ -62,10 +62,10 @@ struct BackwardKernelArgs {
   std::size_t setup_epoch_offset = 0;
   std::size_t dispatch_ready_offset = 0;
   std::size_t return_ready_offset = 0;
-  std::size_t forward_output_ready_epoch_offset = 0;
-  std::size_t forward_return_chunk_state_offset = 0;
-  std::size_t forward_return_source_route_index_offset = 0;
-  std::size_t forward_direct_source_compact_index_offset = 0;
+  std::size_t forward_return_row_map_offset = 0;
+  std::size_t backward_return_chunk_state_offset = 0;
+  std::size_t forward_return_row_to_source_route_offset = 0;
+  std::size_t forward_source_route_to_return_row_offset = 0;
   std::size_t scheduler_offset = 0;
   std::size_t status_offset = 0;
 };
