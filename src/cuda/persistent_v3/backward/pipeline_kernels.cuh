@@ -76,28 +76,26 @@ __device__ __forceinline__ TileDomain make_dw2_domain(
     const BackwardKernelArgs &a, unsigned long long *words,
     const weftmoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
         &layout) {
-  return TileDomain{
-      words + layout.dw2_ready,
-      words + layout.dw2_claim,
-      a.dispatch.sizes.owned_expert_count,
-      kDw2TilesPerExpert,
-      TaskKind::Dw2,
-      true,
-      backward_tuning::kDw2ClaimTiles};
+  return TileDomain{words + layout.dw2_ready,
+                    words + layout.dw2_claim,
+                    dispatch_sizes(a.dispatch).owned_expert_count,
+                    kDw2TilesPerExpert,
+                    TaskKind::Dw2,
+                    true,
+                    backward_tuning::kDw2ClaimTiles};
 }
 
 __device__ __forceinline__ TileDomain make_dw1_domain(
     const BackwardKernelArgs &a, unsigned long long *words,
     const weftmoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
         &layout) {
-  return TileDomain{
-      words + layout.dw1_ready,
-      words + layout.dw1_claim,
-      a.dispatch.sizes.owned_expert_count,
-      kDw1TilesPerExpert,
-      TaskKind::Dw1,
-      true,
-      backward_tuning::kDw1ClaimTiles};
+  return TileDomain{words + layout.dw1_ready,
+                    words + layout.dw1_claim,
+                    dispatch_sizes(a.dispatch).owned_expert_count,
+                    kDw1TilesPerExpert,
+                    TaskKind::Dw1,
+                    true,
+                    backward_tuning::kDw1ClaimTiles};
 }
 
 __device__ __forceinline__ WorkQueues make_work_queues(
@@ -169,9 +167,9 @@ __device__ __forceinline__ void publish_dispatch_if_ready(
 __device__ __forceinline__ std::uint64_t
 local_route_count(const BackwardKernelArgs &a) {
   if (!a.use_gin)
-    return a.dispatch.sizes.route_count;
+    return dispatch_sizes(a.dispatch).route_count;
   std::uint64_t begin = 0ULL;
-  auto end = a.dispatch.sizes.route_count;
+  auto end = dispatch_sizes(a.dispatch).route_count;
   while (begin < end) {
     const auto middle = begin + (end - begin) / 2ULL;
     const auto route = a.dispatch_waves.local_route_order[middle];
@@ -188,6 +186,9 @@ local_route_count(const BackwardKernelArgs &a) {
 #include "cuda/persistent_v3/backward/gin_pipeline.cuh"
 
 __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
+  if (threadIdx.x == 0U && a.runtime_epoch)
+    atomicAdd(a.runtime_epoch, 1ULL);
+  __syncthreads();
   backward_load_row_geometry(a);
   using namespace backward_pipeline_detail;
   if (blockIdx.x != 0U)
@@ -211,7 +212,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
       a.local_base, a.direct_headers_offset);
   for (std::uint32_t expert = threadIdx.x;
-       expert < a.dispatch.sizes.owned_expert_count;
+       expert < dispatch_sizes(a.dispatch).owned_expert_count;
        expert += blockDim.x) {
     const auto rows = a.dispatch.expert_row_count[expert];
     words[layout.dw_reduction_rows + expert] =
@@ -224,10 +225,10 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
     const auto padded_row =
         static_cast<std::uint64_t>(mblock) * backward_tuning::kTileM;
     std::uint32_t expert = 0U;
-    while (expert < a.dispatch.sizes.owned_expert_count &&
+    while (expert < dispatch_sizes(a.dispatch).owned_expert_count &&
            padded_row >= padded_offsets[expert + 1U])
       ++expert;
-    if (expert >= a.dispatch.sizes.owned_expert_count)
+    if (expert >= dispatch_sizes(a.dispatch).owned_expert_count)
       continue;
     const auto local_row = padded_row - padded_offsets[expert];
     const auto expert_rows = a.dispatch.expert_row_count[expert];
@@ -266,7 +267,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
                                                a.setup_epoch_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(setup[a.rank]);
-    published.store(a.epoch, ::cuda::memory_order_release);
+    published.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
   auto *local_setup = peer_at<unsigned long long>(a.local_base,
@@ -276,7 +277,7 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
     const auto peer = first_peer + local_peer;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(local_setup[peer]);
-    while (published.load(::cuda::memory_order_acquire) != a.epoch)
+    while (published.load(::cuda::memory_order_acquire) != execution_epoch(a))
       __nanosleep(backward_tuning::kSetupIdleNanosleep);
   }
 }
@@ -542,7 +543,7 @@ backward_local_transport_kernel(BackwardKernelArgs a) {
             a.peer_bases[header.source_rank], a.return_ready_offset);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
             marker(ready[header.route_index]);
-        marker.store(a.epoch, ::cuda::memory_order_release);
+        marker.store(execution_epoch(a), ::cuda::memory_order_release);
       }
       __syncthreads();
       if (threadIdx.x == 0U) {

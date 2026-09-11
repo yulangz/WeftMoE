@@ -84,6 +84,7 @@ struct SelectedActivationLease<transport::BFloat16>::Impl {
 struct BackwardGradientAllocation {
   void *data = nullptr;
   cudaEvent_t ready = nullptr;
+  unsigned long long ready_capture_id = 0;
   std::uint32_t device = 0;
   bool owns_data = true;
   std::shared_ptr<const void> external_owner;
@@ -384,6 +385,7 @@ struct ForwardAllocation {
   std::uint64_t bytes = 0;
   std::uint32_t device = 0;
   cudaEvent_t ready = nullptr;
+  unsigned long long ready_capture_id = 0;
   bool owns_w1 = true;
   bool owns_w2 = true;
   std::shared_ptr<const void> w1_owner;
@@ -784,11 +786,13 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
   internal::throw_cuda(
       "external-weight-publish",
-      cudaEventRecord(allocation->ready, state_->backend->stream),
-      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      internal::record_input_ready(allocation->ready, state_->backend->stream,
+                                   allocation->ready_capture_id),
+      state_->backend->context.calling_rank(),
+      state_->backend->context.session().world_size(),
       state_->backend->context.session().identity(),
-      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
-      "cudaEventRecord(weight ready)");
+      state_->backend->context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaEventRecord(weight ready)");
   auto impl = std::make_shared<ForwardWeightLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->w1 = w1;
@@ -1510,6 +1514,54 @@ std::shared_ptr<GinBackendState> create_gin_backend(
 #endif
 }
 
+ActivationTransportResourcePool prepare_activation_transport_pool(
+    const CollectiveSession &session, const CudaExecution &execution,
+    ActivationTransportPoolConfig config, const DeviceDispatchHandle &dispatch,
+    const ActivationTransportResourcePool &existing) {
+  if (config.buffer_mode == BufferMode::Dynamic) {
+    if (!dispatch || dispatch.identity().world_size != session.world_size() ||
+        ActivationTransportBridge::context(dispatch)
+                .session()
+                .stable_identity_bytes() != session.stable_identity_bytes())
+      transport_error(NotifyErrorCode::InvalidHandle, "transport-pool-prepare",
+                      "dispatch", 0, "Notify for the current EP group",
+                      "missing/mismatched");
+    config.max_tokens_per_rank =
+        std::max<std::uint64_t>(dispatch.capacity().tokens_per_rank, 1);
+    config.max_destination_rows_per_rank = std::max<std::uint64_t>(
+        dispatch.capacity().destination_rows_per_rank, 1);
+  } else {
+    config.max_destination_rows_per_rank = checked_mul(
+        checked_mul(config.max_tokens_per_rank, config.max_world_size,
+                    "static global token capacity"),
+        config.max_top_k, "static destination row capacity");
+  }
+  if (existing.impl_ && existing.impl_->state) {
+    const auto &state = *existing.impl_->state;
+    const auto &old = state.config;
+    if (state.session_identity == session.stable_identity_bytes() &&
+        state.device == execution.device_ordinal() &&
+        old.max_tokens_per_rank >= config.max_tokens_per_rank &&
+        old.max_destination_rows_per_rank >=
+            config.max_destination_rows_per_rank &&
+        old.max_hidden_size == config.max_hidden_size &&
+        old.max_intermediate_size == config.max_intermediate_size &&
+        old.max_top_k == config.max_top_k &&
+        old.max_world_size == config.max_world_size &&
+        old.max_nodes == config.max_nodes &&
+        old.max_owned_experts == config.max_owned_experts &&
+        old.channels == config.channels &&
+        old.ring_slots_per_source_channel ==
+            config.ring_slots_per_source_channel &&
+        old.max_inflight_generations == config.max_inflight_generations &&
+        old.enable_backward_state == config.enable_backward_state &&
+        old.enable_gin_rdma == config.enable_gin_rdma &&
+        old.enable_socket_fallback == config.enable_socket_fallback)
+      return existing;
+  }
+  return make_activation_transport_pool(session, execution, config);
+}
+
 ActivationTransportResourcePool make_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config) {
@@ -2120,9 +2172,11 @@ BFloat16OutputGradientLease BackwardValidationBridge::upload_for_testing(
   internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
   internal::throw_cuda(
       "output-gradient-test-upload",
-      cudaEventRecord(allocation->ready, exec->stream), context.calling_rank(),
-      identity.world_size(), identity.identity(), identity.generation(),
-      ExchangeKind::ExpertCounts, "cudaEventRecord(output gradient ready)");
+      internal::record_input_ready(allocation->ready, exec->stream,
+                                   allocation->ready_capture_id),
+      context.calling_rank(), identity.world_size(), identity.identity(),
+      identity.generation(), ExchangeKind::ExpertCounts,
+      "cudaEventRecord(output gradient ready)");
   auto impl = std::make_shared<BFloat16OutputGradientLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->pointer = static_cast<const transport::BFloat16 *>(impl->allocation->data);
@@ -2202,7 +2256,9 @@ BFloat16ActivationLease ActivationTransportBridge::upload_for_testing(
     internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice, bytes);
   }
   internal::throw_cuda(
-      "activation-test-upload", cudaEventRecord(slot.producer_ready, exec->stream),
+      "activation-test-upload",
+      internal::record_input_ready(slot.producer_ready, exec->stream,
+                                   slot.producer_capture_id),
       context.calling_rank(), context.session().world_size(),
       context.session().identity(), context.session().generation(),
       ExchangeKind::ExpertCounts, "cudaEventRecord(producer-ready)");
@@ -2282,11 +2338,13 @@ BFloat16ActivationLease ExternalCudaProducer::publish_activations(
   auto &slot = pool_state->slots[lease->index];
   internal::throw_cuda(
       "external-activation-publish",
-      cudaEventRecord(slot.producer_ready, state_->backend->stream),
-      state_->backend->context.calling_rank(), state_->backend->context.session().world_size(),
+      internal::record_input_ready(slot.producer_ready, state_->backend->stream,
+                                   slot.producer_capture_id),
+      state_->backend->context.calling_rank(),
+      state_->backend->context.session().world_size(),
       state_->backend->context.session().identity(),
-      state_->backend->context.session().generation(), ExchangeKind::ExpertCounts,
-      "cudaEventRecord(activation ready)");
+      state_->backend->context.session().generation(),
+      ExchangeKind::ExpertCounts, "cudaEventRecord(activation ready)");
   auto impl = std::make_shared<BFloat16ActivationLease::Impl>();
   impl->slot = std::move(lease);
   impl->pool = std::move(pool_state);
@@ -2335,13 +2393,13 @@ BFloat16OutputGradientLease ExternalCudaProducer::publish_output_gradients(
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
   internal::throw_cuda(
       "external-output-gradient-publish",
-      cudaEventRecord(allocation->ready, state_->backend->stream),
+      internal::record_input_ready(allocation->ready, state_->backend->stream,
+                                   allocation->ready_capture_id),
       state_->backend->context.calling_rank(),
       state_->backend->context.session().world_size(),
       state_->backend->context.session().identity(),
       state_->backend->context.session().generation(),
-      ExchangeKind::ExpertCounts,
-      "cudaEventRecord(output gradient ready)");
+      ExchangeKind::ExpertCounts, "cudaEventRecord(output gradient ready)");
   auto impl = std::make_shared<BFloat16OutputGradientLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->pointer = device_data;
@@ -2582,7 +2640,9 @@ DeviceActivationTransport::run_device_simulation_synthetic(
         ExchangeKind::ExpertCounts, name);
   };
   internal::throw_cuda(
-      "transport-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
+      "transport-run",
+      internal::wait_input_ready(exec->stream, slot.producer_ready,
+                                 slot.producer_capture_id),
       id.calling_rank, id.world_size, impl_->session.identity(), id.generation,
       ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(producer-ready)");
   zero_async(layout.ring_headers, ring_slots,
@@ -2670,11 +2730,11 @@ DeviceActivationTransport::run_device_simulation_synthetic(
       ExchangeKind::ExpertCounts, "D2H transport status");
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(TransportDeviceStatus));
-  internal::throw_cuda("transport-run", cudaEventRecord(slot.complete,
-                                                         exec->stream),
-                       id.calling_rank, id.world_size, impl_->session.identity(),
-                       id.generation, ExchangeKind::ExpertCounts,
-                       "cudaEventRecord(complete)");
+  internal::throw_cuda(
+      "transport-run",
+      internal::record_observable_event(slot.complete, exec->stream),
+      id.calling_rank, id.world_size, impl_->session.identity(), id.generation,
+      ExchangeKind::ExpertCounts, "cudaEventRecord(complete)");
   slot.completion_recorded = true;
   ActivationTransportBridge::submit(consumer);
   internal::throw_cuda("transport-run", cudaEventSynchronize(slot.complete),
@@ -2835,10 +2895,12 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
                             sizeof(std::uint64_t));
   internal::throw_cuda(
-      "local-p2p-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(producer-ready)");
+      "local-p2p-run",
+      internal::wait_input_ready(exec->stream, slot.producer_ready,
+                                 slot.producer_capture_id),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(producer-ready)");
   // The integrated timing starts after the router-owned input is ready and
   // includes every generation-specific transport initialization below.
   internal::throw_cuda(
@@ -3065,10 +3127,11 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(TransportDeviceStatus));
   internal::throw_cuda(
-      "local-p2p-run", cudaEventRecord(slot.complete, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(P2P complete)");
+      "local-p2p-run",
+      internal::record_observable_event(slot.complete, exec->stream),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(P2P complete)");
   slot.completion_recorded = true;
   ActivationTransportBridge::submit(consumer);
 
@@ -3329,7 +3392,9 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   const auto route_count = view.sizes.route_count;
 
   internal::throw_cuda(
-      "socket-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
+      "socket-run",
+      internal::wait_input_ready(exec->stream, slot.producer_ready,
+                                 slot.producer_capture_id),
       id.calling_rank, world, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaStreamWaitEvent(producer-ready)");
@@ -3602,7 +3667,8 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(*status));
   internal::throw_cuda(
-      "socket-run", cudaEventRecord(slot.complete, exec->stream),
+      "socket-run",
+      internal::record_observable_event(slot.complete, exec->stream),
       id.calling_rank, world, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaEventRecord(Socket complete)");
@@ -3767,10 +3833,12 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
   auto &slot = state->slots[activation.slot->index];
   const auto &layout = state->layout;
   internal::throw_cuda(
-      "gin-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(producer-ready)");
+      "gin-run",
+      internal::wait_input_ready(exec->stream, slot.producer_ready,
+                                 slot.producer_capture_id),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaStreamWaitEvent(producer-ready)");
   ActivationTransportBridge::wait_for_gates(dispatch, backend->execution);
   internal::throw_cuda(
       "gin-run", cudaEventRecord(slot.start, exec->stream), id.calling_rank,
@@ -3853,10 +3921,10 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(TransportDeviceStatus));
   internal::throw_cuda(
-      "gin-run", cudaEventRecord(slot.complete, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(GIN complete)");
+      "gin-run", internal::record_observable_event(slot.complete, exec->stream),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(GIN complete)");
   slot.completion_recorded = true;
   ActivationTransportBridge::submit(consumer);
   internal::throw_cuda(
@@ -4067,13 +4135,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   internal::record_cuda_api(internal::CudaApiAuditKind::HostToDevice,
                             sizeof(std::uint64_t));
   internal::throw_cuda(
-      "forward-run", cudaStreamWaitEvent(exec->stream, slot.producer_ready),
+      "forward-run",
+      internal::wait_input_ready(exec->stream, slot.producer_ready,
+                                 slot.producer_capture_id),
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaStreamWaitEvent(activation ready)");
   internal::throw_cuda(
       "forward-run",
-      cudaStreamWaitEvent(exec->stream, weight.allocation->ready),
+      internal::wait_input_ready(exec->stream, weight.allocation->ready,
+                                 weight.allocation->ready_capture_id),
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaStreamWaitEvent(weights ready)");
@@ -4082,9 +4153,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("stream_dependencies_enqueued");
 #endif
 
-  if (slot.transport_epoch >= (1ULL << 63U) - 1ULL)
+  if (slot.transport_epoch >= (1ULL << 32U) - 1ULL)
     transport_error(NotifyErrorCode::ArithmeticOverflow, "forward-run",
-                    "transport_epoch", id.calling_rank, "<2^63-1",
+                    "transport_epoch", id.calling_rank, "<2^32-1",
                     std::to_string(slot.transport_epoch));
   const auto generation_epoch = ++slot.transport_epoch;
   std::uint64_t socket_incoming = 0;
@@ -4152,10 +4223,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     view = ActivationTransportBridge::view(consumer);
   }
   internal::throw_cuda(
-      "forward-run", cudaEventRecord(slot.forward_start, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(forward start)");
+      "forward-run",
+      internal::record_observable_event(slot.forward_start, exec->stream,
+                                        &slot.forward_capture_id),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(forward start)");
   internal::throw_cuda(
       "forward-run",
       cudaMemsetAsync(at<void>(slot.device, layout.status), 0,
@@ -4229,7 +4302,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         id.generation, id.calling_rank, id.world_size, state->config.channels,
         generation_epoch,
         use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
-        use_gin ? gin_backend->local_world_size : id.world_size);
+        use_gin ? gin_backend->local_world_size : id.world_size,
+        view.runtime
+            ? at<unsigned long long>(slot.device, layout.execution_epoch)
+            : nullptr,
+        view.runtime);
   } else if (socket_incoming != 0) {
     socket_install_forward_headers_kernel<<<
         static_cast<unsigned int>((socket_incoming + 255ULL) / 256ULL), 256, 0,
@@ -4263,6 +4340,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.world = id.world_size;
   args.channels = state->config.channels;
   args.epoch = generation_epoch;
+  args.runtime_epoch =
+      view.runtime ? at<unsigned long long>(slot.device, layout.execution_epoch)
+                   : nullptr;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
@@ -5090,13 +5170,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         id.world_size, backend->session.session().identity(), id.generation,
         ExchangeKind::ExpertCounts, "Socket scatter/unweighted reduce");
   }
-  internal::throw_cuda(
-      "forward-run",
-      cudaEventRecord(slot.forward_output_ready, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts,
-      "cudaEventRecord(Forward output ready)");
+  internal::throw_cuda("forward-run",
+                       internal::record_observable_event(
+                           slot.forward_output_ready, exec->stream),
+                       id.calling_rank, id.world_size,
+                       backend->session.session().identity(), id.generation,
+                       ExchangeKind::ExpertCounts,
+                       "cudaEventRecord(Forward output ready)");
   // Local P2P relies on the peer-visible terminal epoch. GIN payload and
   // return consumers have already acquired their per-generation signals;
   // the next Notify/reset agreement is the registered-window reuse boundary.
@@ -5399,10 +5479,17 @@ void DeviceForwardHandle::wait() const {
 
 void DeviceForwardHandle::wait_on(CUstream_st *stream) const {
   (void)identity();
-  internal::throw_cuda("forward-wait-on", cudaStreamWaitEvent(stream,
-      impl_->pool->slots[impl_->slot->index].forward_output_ready),
-      impl_->identity.rank, impl_->identity.world, "forward", impl_->identity.generation,
-      ExchangeKind::ExpertCounts, "wait Forward output on caller stream");
+  const auto &slot = impl_->pool->slots[impl_->slot->index];
+  internal::throw_cuda(
+      "forward-wait-on",
+      internal::wait_output_ready(
+          stream,
+          internal::checked_execution_state(impl_->pool->execution)->stream,
+          slot.forward_output_ready, slot.forward_capture_id,
+          slot.forward_complete),
+      impl_->identity.rank, impl_->identity.world, "forward",
+      impl_->identity.generation, ExchangeKind::ExpertCounts,
+      "wait Forward output on caller stream");
 }
 
 const ActivationTransportExpectation &DeviceForwardHandle::identity() const {
@@ -5428,6 +5515,13 @@ const ForwardMegaKernelTimings &DeviceForwardHandle::timings() const {
   return impl_->timings;
 }
 
+const transport::BFloat16 *
+forward_output_device_pointer_for_testing(const DeviceForwardHandle &handle) {
+  const auto &impl = *handle.impl_;
+  return at<const transport::BFloat16>(
+      impl.pool->slots[impl.slot->index].device, impl.pool->layout.combined);
+}
+
 std::vector<transport::BFloat16> download_forward_output_for_validation(
     const DeviceForwardHandle &handle, const CudaExecution &execution) {
   if (!handle || !execution)
@@ -5437,6 +5531,13 @@ std::vector<transport::BFloat16> download_forward_output_for_validation(
   if (execution.device_ordinal() != impl.pool->device)
     transport_error(NotifyErrorCode::WorkspaceMismatch, "forward-download",
                     "device", impl.identity.rank, "handle device", "foreign");
+  internal::throw_cuda(
+      "forward-download",
+      cudaEventSynchronize(
+          impl.pool->slots[impl.slot->index].forward_output_ready),
+      impl.identity.rank, impl.identity.world, "forward-validation",
+      impl.identity.generation, ExchangeKind::ExpertCounts,
+      "wait Forward output");
   const auto elements = checked_mul(impl.identity.tokens,
                                     impl.identity.hidden,
                                     "forward download elements");
@@ -5855,13 +5956,17 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       layout.forward_direct_source_compact_index;
   args.scheduler_offset = layout.forward_task_claim;
   args.status_offset = layout.status;
-  auto backward_epoch = ++slot.backward_epoch;
-  if (backward_epoch == 0ULL)
-    backward_epoch = ++slot.backward_epoch;
-  // FWD's retained packet headers use the low epoch namespace.  The high bit
-  // prevents a first BWD launch from accepting an old FWD wave marker with the
-  // same numeric slot epoch.
-  args.epoch = backward_epoch | (1ULL << 63U);
+  // Forward and Backward reuse wave markers. One monotonic slot sequence
+  // prevents either phase from mistaking the previous phase's marker for a
+  // completion in the next replay.
+  if (slot.transport_epoch >= (1ULL << 32U) - 1ULL)
+    transport_error(NotifyErrorCode::ArithmeticOverflow, "backward-run",
+                    "transport_epoch", identity.rank, "<2^32-1", "exhausted");
+  const auto backward_epoch = ++slot.transport_epoch;
+  args.epoch = backward_epoch;
+  args.runtime_epoch =
+      view.runtime ? at<unsigned long long>(slot.device, layout.execution_epoch)
+                   : nullptr;
   if (std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr) {
     std::cerr << "BACKWARD_ADDR rank=" << identity.rank
               << " epoch=" << backward_epoch
@@ -5949,14 +6054,21 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
             identity.world, "backward", identity.generation,
             ExchangeKind::ExpertCounts, detail);
       };
+  // Respect all preceding caller-stream work, including captured consumers of
+  // the Forward output, before the transport stream reuses its output plane.
   internal::throw_cuda(
-      "backward-run", cudaStreamWaitEvent(transport_stream,
-                                           slot.forward_complete),
+      "backward-run", cudaEventRecord(slot.forward_roles_ready, exec->stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "wait retained Forward completion");
+      ExchangeKind::ExpertCounts, "record Backward caller-stream dependency");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(transport_stream, gradient.allocation->ready),
+      cudaStreamWaitEvent(transport_stream, slot.forward_roles_ready),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "wait Backward caller-stream dependency");
+  internal::throw_cuda(
+      "backward-run",
+      internal::wait_input_ready(transport_stream, gradient.allocation->ready,
+                                 gradient.allocation->ready_capture_id),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "wait dY producer");
   if (use_gin) {
@@ -5987,7 +6099,9 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       "backward", identity.generation, ExchangeKind::ExpertCounts,
       "initialize fixed Backward pipeline state");
   internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_start, transport_stream),
+      "backward-run",
+      internal::record_observable_event(slot.backward_start, transport_stream,
+                                        &slot.backward_capture_id),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward start");
   if (view.sizes.owned_expert_count != 0U) {
@@ -6003,11 +6117,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                                        transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "publish Backward launch prerequisites");
-  internal::throw_cuda(
-      "backward-run",
-      cudaEventRecord(slot.backward_compute_start, transport_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward compute start");
+  internal::throw_cuda("backward-run",
+                       internal::record_observable_event(
+                           slot.backward_compute_start, transport_stream),
+                       identity.rank, identity.world, "backward",
+                       identity.generation, ExchangeKind::ExpertCounts,
+                       "record Backward compute start");
   backward_local_transport_kernel<<<transport_ctas,
                                     backward_tuning::kComputeThreads,
                                     kPersistentSmem,
@@ -6016,11 +6131,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
       "backward", identity.generation, ExchangeKind::ExpertCounts,
       "persistent local Backward Relay launch");
-  internal::throw_cuda(
-      "backward-run",
-      cudaEventRecord(slot.backward_transport_done, transport_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward transport completion");
+  internal::throw_cuda("backward-run",
+                       internal::record_observable_event(
+                           slot.backward_transport_done, transport_stream),
+                       identity.rank, identity.world, "backward",
+                       identity.generation, ExchangeKind::ExpertCounts,
+                       "record Backward transport completion");
   internal::throw_cuda(
       "backward-run",
       cudaStreamWaitEvent(compute_stream, slot.forward_roles_ready),
@@ -6029,11 +6145,18 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   launch_compute_workers(
       static_cast<std::uint32_t>(sm_count) - transport_ctas, compute_stream,
       "persistent priority DAB/DX/dW TMA-WGMMA launch");
+  internal::throw_cuda("backward-run",
+                       internal::record_observable_event(
+                           slot.backward_compute_done, compute_stream),
+                       identity.rank, identity.world, "backward",
+                       identity.generation, ExchangeKind::ExpertCounts,
+                       "record Backward compute completion");
+
   internal::throw_cuda(
       "backward-run",
-      cudaEventRecord(slot.backward_compute_done, compute_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward compute completion");
+      cudaEventRecord(slot.forward_compute_done, compute_stream), identity.rank,
+      identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "publish Backward compute dependency");
 
   // Queue route reduction behind the persistent transport grid.  The compute
   // CTAs are already resident while transport is active, so reducers can use
@@ -6052,11 +6175,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
         "backward", identity.generation, ExchangeKind::ExpertCounts,
         "streaming Backward dX reduce launch");
   }
-  internal::throw_cuda(
-      "backward-run",
-      cudaEventRecord(slot.backward_reduce_done, transport_stream),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts, "record Backward reduction completion");
+  internal::throw_cuda("backward-run",
+                       internal::record_observable_event(
+                           slot.backward_reduce_done, transport_stream),
+                       identity.rank, identity.world, "backward",
+                       identity.generation, ExchangeKind::ExpertCounts,
+                       "record Backward reduction completion");
   // Once transport and reduction release their dedicated SMs, add an equal
   // number of workers to the same global queues for the remaining dW tail.
   // Sequencing this launch on the transport stream preserves initial role
@@ -6064,20 +6188,25 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   // communication CTAs needed to make activation progress.
   launch_compute_workers(transport_ctas, transport_stream,
                          "late Backward compute-worker launch");
+  internal::throw_cuda("backward-run",
+                       internal::record_observable_event(
+                           slot.backward_late_compute_done, transport_stream),
+                       identity.rank, identity.world, "backward",
+                       identity.generation, ExchangeKind::ExpertCounts,
+                       "record late Backward compute-worker completion");
   internal::throw_cuda(
       "backward-run",
-      cudaEventRecord(slot.backward_late_compute_done, transport_stream),
+      cudaEventRecord(slot.forward_transport_done, transport_stream),
       identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts,
-      "record late Backward compute-worker completion");
+      ExchangeKind::ExpertCounts, "publish Backward transport dependency");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(exec->stream, slot.backward_compute_done),
+      cudaStreamWaitEvent(exec->stream, slot.forward_compute_done),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "join Backward compute roles");
   internal::throw_cuda(
       "backward-run",
-      cudaStreamWaitEvent(exec->stream, slot.backward_late_compute_done),
+      cudaStreamWaitEvent(exec->stream, slot.forward_transport_done),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts,
       "join late Backward compute workers and reduction");
@@ -6092,11 +6221,13 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(TransportDeviceStatus));
   internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.backward_complete, exec->stream),
+      "backward-run",
+      internal::record_observable_event(slot.backward_complete, exec->stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward complete");
   internal::throw_cuda(
-      "backward-run", cudaEventRecord(slot.complete, exec->stream),
+      "backward-run",
+      internal::record_observable_event(slot.complete, exec->stream),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record pool slot complete");
   slot.completion_recorded = true;
@@ -6278,10 +6409,17 @@ void DeviceBackwardHandle::wait() const {
 
 void DeviceBackwardHandle::wait_on(CUstream_st *stream) const {
   (void)identity();
-  internal::throw_cuda("backward-wait-on", cudaStreamWaitEvent(stream,
-      impl_->pool->slots[impl_->slot->index].backward_complete),
-      impl_->identity.rank, impl_->identity.world, "backward", impl_->identity.generation,
-      ExchangeKind::ExpertCounts, "wait Backward output on caller stream");
+  const auto &slot = impl_->pool->slots[impl_->slot->index];
+  internal::throw_cuda(
+      "backward-wait-on",
+      internal::wait_output_ready(
+          stream,
+          internal::checked_execution_state(impl_->pool->execution)->stream,
+          slot.backward_complete, slot.backward_capture_id,
+          slot.forward_compute_done, slot.forward_transport_done),
+      impl_->identity.rank, impl_->identity.world, "backward",
+      impl_->identity.generation, ExchangeKind::ExpertCounts,
+      "wait Backward output on caller stream");
 }
 
 const ActivationTransportExpectation &DeviceBackwardHandle::identity() const {

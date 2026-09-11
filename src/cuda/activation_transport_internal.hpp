@@ -166,6 +166,8 @@ public:
   static void submit(DeviceDispatchConsumerLease &consumer);
   static const RankCollectiveContext &
   context(const DeviceDispatchConsumerLease &consumer);
+  static const RankCollectiveContext &
+  context(const DeviceDispatchHandle &dispatch);
   static BFloat16ActivationLease upload_for_testing(
       const std::vector<transport::BFloat16> &host,
       std::uint64_t num_tokens, std::uint64_t hidden,
@@ -181,6 +183,8 @@ public:
 
 std::vector<transport::BFloat16> download_forward_output_for_validation(
     const DeviceForwardHandle &, const CudaExecution &);
+const transport::BFloat16 *
+forward_output_device_pointer_for_testing(const DeviceForwardHandle &);
 struct ForwardBackwardStateValidationDownload {
   std::vector<transport::BFloat16> canonical_x;
   // Plane-major: all compact A rows followed by all compact B rows.

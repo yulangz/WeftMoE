@@ -550,6 +550,7 @@ void dump_generation_completion(std::ostream &output,
 #endif
 
 struct Layout {
+  std::size_t execution_epoch = 0;
   std::size_t input = 0;
   std::size_t ring_headers = 0;
   std::size_t ring_payload = 0;
@@ -819,6 +820,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                       "rank links");
   const auto ingress_slots = checked_mul(
       rank_links, config.ring_slots_per_source_channel, "ingress slots");
+  layout.execution_epoch =
+      append(cursor, 1, sizeof(std::uint64_t), "execution epoch");
   layout.input = append(cursor,
                         checked_mul(config.max_tokens_per_rank,
                                     config.max_hidden_size, "input elements"),
@@ -1128,8 +1131,11 @@ struct PoolSlot {
   std::uint64_t *host_socket_counts = nullptr;
   std::uint64_t *device_cancel_epoch = nullptr;
   cudaEvent_t producer_ready = nullptr;
+  unsigned long long producer_capture_id = 0;
   cudaEvent_t start = nullptr;
   cudaEvent_t forward_start = nullptr;
+  unsigned long long forward_capture_id = 0;
+  unsigned long long backward_capture_id = 0;
   cudaEvent_t forward_output_ready = nullptr;
   cudaEvent_t forward_complete = nullptr;
   // GIN Forward uses compile-time-isolated transport and compute kernels.
@@ -1152,7 +1158,6 @@ struct PoolSlot {
   SlotState state = SlotState::Available;
   std::uint64_t epoch = 0;
   std::uint64_t transport_epoch = 0;
-  std::uint64_t backward_epoch = 0;
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};

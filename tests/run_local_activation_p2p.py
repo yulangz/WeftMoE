@@ -266,6 +266,7 @@ def main():
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
+    parser.add_argument("--buffer-modes", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
     parser.add_argument("--backward-validation", action="store_true")
@@ -349,7 +350,9 @@ def main():
                "--print-limit=10", "--error-exitcode=1"))
     read_fd, write_fd = os.pipe()
     processes = []
-    if args.backward_benchmark:
+    if args.buffer_modes:
+        scenario = "buffer_modes"
+    elif args.backward_benchmark:
         scenario = "backward_bench"
     elif args.backward_validation:
         scenario = "backward_validate"
@@ -449,6 +452,9 @@ def main():
                     f"sanitizer={sanitizer} "
                     f"stdout_tail={stdout[-1000:]} stderr={stderr[-3000:]}"
                 )
+            if args.buffer_modes:
+                observed.append(parse_fields(stdout, "BUFFER_MODES "))
+                continue
             if args.forward_smoke:
                 item = parse_fields(stdout, "FORWARD_SMOKE ")
                 if (item.get("specialization") !=
@@ -485,6 +491,11 @@ def main():
                     item["_nccl_runtime"] = runtime["runtime"]
                     item["_nccl_library"] = runtime["library"]
                 observed.append(item)
+        if args.buffer_modes:
+            if len(observed) != args.world or any(item.get("graph_replays") != "6" for item in observed):
+                raise AssertionError("incomplete buffer mode checks")
+            print("BUFFER_MODES passed", flush=True)
+            return
         if args.forward_smoke:
             hashes = [item["output_hash"] for item in observed]
             if len(hashes) != args.world:

@@ -11,6 +11,7 @@ struct BackwardKernelArgs {
   std::uint64_t padded_rows = 0;
   std::uint64_t scheduler_words = 0;
   std::uint64_t epoch = 0;
+  unsigned long long *runtime_epoch = nullptr;
   std::uint32_t scheduler_mblock_capacity = 0;
   std::uint32_t scheduler_expert_capacity = 0;
   std::uint32_t mblocks = 0;
@@ -68,3 +69,8 @@ struct BackwardKernelArgs {
   std::size_t scheduler_offset = 0;
   std::size_t status_offset = 0;
 };
+
+__device__ __forceinline__ std::uint64_t
+execution_epoch(const BackwardKernelArgs &a) {
+  return a.runtime_epoch ? *a.runtime_epoch : a.epoch;
+}

@@ -15,6 +15,17 @@ WEFTMOE_PUBLIC_API_BEGIN
 
 namespace weftmoe::cuda {
 
+// Dynamic receives are sized after Notify. Static receives reserve the maximum
+// possible routing fan-in before capture; excess token shapes require a new
+// pool.
+enum class BufferMode : std::uint8_t { Dynamic, Static };
+
+// Common capacities derived from the current count exchange on every rank.
+struct DeviceDispatchCapacity {
+  std::uint64_t tokens_per_rank = 0;
+  std::uint64_t destination_rows_per_rank = 0;
+};
+
 class CudaExecution;
 class ExternalCudaProducer;
 class CudaLocalNotifyHandle;
@@ -25,6 +36,7 @@ using CudaRouteInput = SelectedExpertRouteLease<std::int32_t>;
 template <class T> class SelectedExpertGateLease;
 using CudaGateInput = SelectedExpertGateLease<float>;
 class DeviceDispatchConsumerLease;
+class NcclSession;
 
 // CUDA/NCCL native handles remain private to the implementation.
 class CudaExecution {
@@ -284,7 +296,14 @@ class DeviceDispatchHandle {
 public:
   DeviceDispatchHandle() = default;
   const DeviceDispatchIdentity &identity() const;
+  // Host snapshots from preparation. Static replay refreshes the corresponding
+  // device counts without a host readback; these snapshots remain unchanged.
   const DeviceDispatchSizes &sizes() const;
+  const DeviceDispatchCapacity &capacity() const;
+  // Enqueue a fresh Notify into static storage using the retained input
+  // tensors. Their values may change, their shape and addresses may not.
+  // The caller must finish the prior FWD/BWD before reusing this storage.
+  void enqueue_notify(const NcclSession &session) const;
   const DeviceMaterializationAudit &audit() const;
   DeviceDispatchConsumerLease acquire_consumer(
       const CudaExecution &execution,

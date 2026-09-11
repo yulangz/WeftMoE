@@ -1,5 +1,6 @@
-#include "cuda/testing/api.hpp"
+#include "cuda/cuda_internal.hpp"
 #include "cuda/forward/tuning_config.hpp"
+#include "cuda/testing/api.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1823,7 +1824,7 @@ void test_resource_pool_and_cuda_api_audit() {
       "pool-base", 1, 0, 6200, 0, bootstrap);
   auto pool = weftmoe::cuda::make_device_notify_resource_pool(
       base, execution,
-      {config, 10, 4096, 2});
+      {config, 10, 4096, 2, 4, weftmoe::cuda::BufferMode::Static});
   const auto initial_usage = pool.usage();
   require(initial_usage.slot_count == 2 && initial_usage.slots_in_use == 0 &&
               initial_usage.device_bytes != 0 &&
@@ -2317,6 +2318,217 @@ void test_resource_pool_and_cuda_api_audit() {
             << after.d2h_bytes - before.d2h_bytes << ", D2D_bytes="
             << after.d2d_bytes - before.d2d_bytes << '\n';
 }
+void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
+                            std::uint32_t world,
+                            const weftmoe::cuda::NcclSession &base,
+                            const weftmoe::cuda::CudaExecution &execution) {
+  using namespace weftmoe::cuda;
+  constexpr std::uint64_t tokens = 13, capacity = 64;
+  constexpr auto hidden = forward_tuning::kMainHidden;
+  constexpr auto intermediate = forward_tuning::kMainIntermediate;
+  const auto experts = std::max(16U, world * 2U);
+  auto config = make_config(nodes, world / nodes, experts, 2, 64);
+  for (std::uint32_t e = 0; e < experts; ++e)
+    config.topology.expert_to_rank[e] = e / (experts / world);
+  auto generation = make_nccl_generation(base, "buffer-modes", 710);
+  auto context = weftmoe::make_rank_collective_context(generation.session(),
+                                                       rank, execution.token());
+  auto exec = internal::checked_execution_state(execution);
+  const auto check = [](cudaError_t error) {
+    if (error != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(error));
+  };
+  auto route_memory = std::make_shared<internal::CudaAllocation>();
+  route_memory->device = execution.device_ordinal();
+  route_memory->device_bytes = tokens * 2 * sizeof(std::int32_t);
+  check(cudaMalloc(&route_memory->device_ptr, route_memory->device_bytes));
+  auto producer =
+      make_external_cuda_producer(context, execution.device_ordinal(),
+                                  exec->stream, exec, "buffer-mode-inputs");
+  std::vector<std::int32_t> selected(tokens * 2);
+  const auto set_routes = [&](unsigned int distribution) {
+    for (std::uint64_t t = 0; t < tokens; ++t) {
+      const auto first = distribution == 0 ? 0U
+                         : distribution == 2
+                             ? experts - 2U
+                             : static_cast<unsigned int>((rank * tokens + t) %
+                                                         (experts / 2U)) *
+                                   2U;
+      selected[t * 2] = static_cast<std::int32_t>(first);
+      selected[t * 2 + 1] = static_cast<std::int32_t>(first + 1U);
+    }
+    check(cudaMemcpy(route_memory->device_ptr, selected.data(),
+                     route_memory->device_bytes, cudaMemcpyHostToDevice));
+  };
+  set_routes(0);
+  auto external_routes = producer.publish_selected_experts(
+      static_cast<const std::int32_t *>(route_memory->device_ptr), tokens * 2,
+      tokens, 2, route_memory);
+  auto routes =
+      import_selected_expert_routes(external_routes, context, execution);
+  auto gates = testing::upload_fp32_gates_for_testing(
+      std::vector<float>(tokens * 2, 0.5F), routes, context, execution);
+  auto weights = testing::make_deterministic_forward_weights_for_testing(
+      experts / world, rank * (experts / world), hidden, intermediate,
+      generation.session(), execution);
+  std::vector<weftmoe::transport::BFloat16> input(tokens * hidden);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = weftmoe::transport::float_to_bfloat16(
+        static_cast<float>(static_cast<int>((i + rank) % 31) - 15) / 32.0F);
+  auto gradients = BackwardValidationBridge::upload_for_testing(
+      input, tokens, hidden, context, execution);
+  ActivationTransportPoolConfig storage;
+  storage.max_tokens_per_rank = capacity;
+  storage.max_hidden_size = hidden;
+  storage.max_intermediate_size = intermediate;
+  storage.max_top_k = 2;
+  storage.max_world_size = world;
+  storage.max_nodes = nodes;
+  storage.max_owned_experts = experts / world;
+  storage.ring_slots_per_source_channel = 1;
+  storage.max_inflight_generations = 1;
+  storage.enable_backward_state = true;
+  storage.enable_gin_rdma = nodes > 1;
+  auto dynamic_notify_pool = make_device_notify_resource_pool(
+      base, execution, {config, capacity, 8192, 2, 4, BufferMode::Dynamic});
+  std::array<std::uint64_t, 3> forward_hashes{}, backward_hashes{};
+  ActivationTransportResourcePool dynamic_pool;
+  DeviceBackwardHandle retained_backward;
+  BackwardMegaKernel backward_kernel;
+  for (unsigned int distribution : {1U, 0U, 2U}) {
+    set_routes(distribution);
+    CudaNotifyGenerationCoordinator notify_kernel(generation, execution,
+                                                  dynamic_notify_pool);
+    auto notify = notify_kernel.run_device({config, routes, gates, capacity});
+    require(notify.dispatch().capacity().tokens_per_rank == tokens,
+            "Notify did not recover the actual input length");
+    if (distribution != 1)
+      require(notify.dispatch().capacity().destination_rows_per_rank ==
+                  world * tokens * 2,
+              "Notify lost skewed expert rows");
+    const auto previous_bytes =
+        dynamic_pool ? dynamic_pool.usage().device_bytes : 0;
+    dynamic_pool = prepare_activation_transport_pool(
+        generation.session(), execution, storage, notify.dispatch(),
+        dynamic_pool);
+    auto pool = dynamic_pool;
+    if (world > 1 && distribution == 0)
+      require(pool.usage().device_bytes > previous_bytes,
+              "skewed routing did not grow the pool");
+    const auto before_reuse = testing::cuda_api_audit_snapshot();
+    auto reused = prepare_activation_transport_pool(
+        generation.session(), execution, storage, notify.dispatch(), pool);
+    require(reused.usage().device_bytes == pool.usage().device_bytes &&
+                testing::cuda_api_audit_snapshot().device_allocations ==
+                    before_reuse.device_allocations,
+            "compatible pool grew unexpectedly");
+    auto activation = testing::upload_bfloat16_activations_for_testing(
+        input, tokens, hidden, context, execution, pool);
+    DeviceForwardHandle forward;
+    if (nodes > 1) {
+      GinRdmaForwardMegaKernel kernel(generation, execution, pool);
+      forward = kernel.enqueue(notify.dispatch(), activation, weights,
+                               {hidden, intermediate, true});
+    } else {
+      LocalCudaP2pForwardMegaKernel kernel(generation, execution, pool);
+      forward = kernel.enqueue(notify.dispatch(), activation, weights,
+                               {hidden, intermediate, true});
+    }
+    forward.wait();
+    forward_hashes[distribution] = hash_bf16_indexed(
+        download_forward_output_for_validation(forward, execution));
+    auto backward =
+        backward_kernel.enqueue(forward, gradients, {hidden, intermediate});
+    auto result = BackwardValidationBridge::download(backward, execution);
+    backward_hashes[distribution] = hash_bf16_indexed(result.dx);
+    backward.wait();
+    if (world > 1 && distribution == 1)
+      retained_backward = backward;
+    else if (retained_backward)
+      require(hash_bf16_indexed(BackwardValidationBridge::download(
+                                    retained_backward, execution)
+                                    .dx) == backward_hashes[1],
+              "growing a pool changed a retained Backward result");
+  }
+  retained_backward = {};
+  dynamic_pool = {};
+  set_routes(0);
+  auto static_notify_pool = make_device_notify_resource_pool(
+      base, execution, {config, capacity, 8192, 1, 4, BufferMode::Static});
+  CudaNotifyGenerationCoordinator notify_kernel(generation, execution,
+                                                static_notify_pool);
+  auto notify = notify_kernel.run_device({config, routes, gates, capacity});
+  storage.buffer_mode = BufferMode::Static;
+  auto pool = prepare_activation_transport_pool(generation.session(), execution,
+                                                storage);
+  auto activation = testing::upload_bfloat16_activations_for_testing(
+      input, tokens, hidden, context, execution, pool);
+  std::unique_ptr<LocalCudaP2pForwardMegaKernel> local;
+  std::unique_ptr<GinRdmaForwardMegaKernel> remote;
+  if (nodes > 1)
+    remote =
+        std::make_unique<GinRdmaForwardMegaKernel>(generation, execution, pool);
+  else
+    local = std::make_unique<LocalCudaP2pForwardMegaKernel>(generation,
+                                                            execution, pool);
+  auto snapshot = std::make_shared<internal::CudaAllocation>();
+  snapshot->device = execution.device_ordinal();
+  snapshot->host_bytes = input.size() * sizeof(input[0]);
+  check(cudaMallocHost(&snapshot->host_ptr, snapshot->host_bytes));
+  cudaStream_t snapshot_stream = nullptr;
+  cudaEvent_t snapshot_done = nullptr;
+  check(cudaStreamCreateWithFlags(&snapshot_stream, cudaStreamNonBlocking));
+  check(cudaEventCreateWithFlags(&snapshot_done, cudaEventDisableTiming));
+  check(cudaStreamSynchronize(exec->stream));
+  check(cudaStreamBeginCapture(exec->stream, cudaStreamCaptureModeGlobal));
+  notify.dispatch().enqueue_notify(generation);
+  auto forward = remote ? remote->enqueue(notify.dispatch(), activation,
+                                          weights, {hidden, intermediate, true})
+                        : local->enqueue(notify.dispatch(), activation, weights,
+                                         {hidden, intermediate, true});
+  // Forward and dX deliberately share the final output plane. Capture the
+  // Forward result before Backward reuses it.
+  forward.wait_on(snapshot_stream);
+  check(cudaMemcpyAsync(
+      snapshot->host_ptr, forward_output_device_pointer_for_testing(forward),
+      snapshot->host_bytes, cudaMemcpyDeviceToHost, snapshot_stream));
+  check(cudaEventRecord(snapshot_done, snapshot_stream));
+  check(cudaStreamWaitEvent(exec->stream, snapshot_done));
+  auto backward =
+      backward_kernel.enqueue(forward, gradients, {hidden, intermediate});
+  backward.wait_on(snapshot_stream);
+  check(cudaEventRecord(snapshot_done, snapshot_stream));
+  check(cudaStreamWaitEvent(exec->stream, snapshot_done));
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  check(cudaStreamEndCapture(exec->stream, &graph));
+  check(cudaGraphInstantiate(&executable, graph, 0));
+  for (unsigned int repeat = 0; repeat < 6; ++repeat) {
+    const auto distribution = repeat % 3;
+    set_routes(distribution);
+    check(cudaGraphLaunch(executable, exec->stream));
+    check(cudaStreamSynchronize(exec->stream));
+    const auto *first =
+        static_cast<const weftmoe::transport::BFloat16 *>(snapshot->host_ptr);
+    const auto actual_forward =
+        hash_bf16_indexed({first, first + input.size()});
+    require(actual_forward == forward_hashes[distribution],
+            "Graph Forward mismatch at replay " + std::to_string(repeat) +
+                ": actual=" + std::to_string(actual_forward) +
+                ", expected=" + std::to_string(forward_hashes[distribution]) +
+                ", dx=" + std::to_string(backward_hashes[distribution]));
+    auto result = BackwardValidationBridge::download(backward, execution);
+    require(hash_bf16_indexed(result.dx) == backward_hashes[distribution],
+            "Graph Backward used stale routing or counts");
+  }
+  check(cudaGraphExecDestroy(executable));
+  check(cudaGraphDestroy(graph));
+  check(cudaEventDestroy(snapshot_done));
+  check(cudaStreamDestroy(snapshot_stream));
+  std::cout << "BUFFER_MODES rank=" << rank
+            << " dynamic=1 static=1 graph_replays=6 skew=1\n";
+}
+
 void run_cached_backward_rank(
     std::uint32_t rank, std::uint32_t nodes, std::uint32_t world,
     std::uint32_t experts, std::uint32_t top_k, std::uint64_t max_tokens,
@@ -2345,16 +2557,17 @@ void run_cached_backward_rank(
   auto gate_storage = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
       route_gates, route_storage, context, execution);
 
+  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+      generation, execution, notify_pool);
+  auto notify =
+      coordinator.run_device({config, route_storage, gate_storage, max_tokens});
+
   weftmoe::cuda::ActivationTransportPoolConfig pool_config;
   pool_config.max_tokens_per_rank = max_tokens;
   pool_config.max_hidden_size = hidden;
   pool_config.max_top_k = top_k;
   pool_config.max_world_size = world;
   pool_config.max_nodes = nodes;
-  pool_config.max_destination_rows_per_rank =
-      std::max<std::uint64_t>(
-          max_tokens * (top_k + 1ULL) * (world == 2U ? 2ULL : 1ULL),
-          static_cast<std::uint64_t>(world) * top_k);
   pool_config.channels = 1U;
   pool_config.ring_slots_per_source_channel = 1U;
   pool_config.max_inflight_generations = 1U;
@@ -2362,8 +2575,8 @@ void run_cached_backward_rank(
   pool_config.max_owned_experts = experts / world;
   pool_config.enable_backward_state = true;
   pool_config.enable_gin_rdma = nodes == 2U;
-  auto activation_pool = weftmoe::cuda::make_activation_transport_pool(
-      generation.session(), execution, pool_config);
+  auto activation_pool = weftmoe::cuda::prepare_activation_transport_pool(
+      generation.session(), execution, pool_config, notify.dispatch());
 
   std::vector<weftmoe::transport::BFloat16> activation_host(
       static_cast<std::size_t>(max_tokens * hidden));
@@ -2390,10 +2603,6 @@ void run_cached_backward_rank(
       weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
           experts / world, rank * (experts / world), hidden, intermediate,
           generation.session(), execution);
-  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-      generation, execution, notify_pool);
-  auto notify = coordinator.run_device(
-      {config, route_storage, gate_storage, max_tokens});
   const auto progress = [&](const char *phase) {
     if (std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr)
       std::cerr << "BACKWARD_PROGRESS rank=" << rank << " phase=" << phase
@@ -2802,6 +3011,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "multinode-exec-" + std::to_string(rank), local_rank);
   auto base = weftmoe::cuda::make_nccl_session(
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
+  if (scenario == "buffer_modes") {
+    test_buffer_modes_rank(rank, nodes, world, base, execution);
+    return;
+  }
   if (backward_validation || backward_benchmark) {
     run_cached_backward_rank(rank, nodes, world, experts, top_k, max_tokens,
                              common_config, common_routes, base, execution,
@@ -2958,12 +3171,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.max_top_k = top_k;
     transport_config.max_world_size = world;
     transport_config.max_nodes = nodes;
-    // The deterministic fixture is close to uniform but integer ownership
-    // boundaries can put slightly more than route_count/world rows on a rank.
-    transport_config.max_destination_rows_per_rank =
-        std::max<std::uint64_t>(
-            max_tokens * (top_k + 1U) * (world == 2U ? 2U : 1U),
-            static_cast<std::uint64_t>(world) * top_k);
     transport_config.channels = 1;
     transport_config.ring_slots_per_source_channel = 1;
     transport_config.max_inflight_generations = 1U;
@@ -2973,8 +3180,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.enable_gin_rdma = gin_forward_benchmark;
     transport_config.enable_socket_fallback = socket_forward_benchmark;
     const auto setup_start = Clock::now();
-    auto transport_pool = weftmoe::cuda::make_activation_transport_pool(
-        setup_generation.session(), execution, transport_config);
+    weftmoe::cuda::ActivationTransportResourcePool transport_pool;
+    {
+      weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          setup_generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, route_storage, gate_storage, max_tokens});
+      transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
+          setup_generation.session(), execution, transport_config,
+          notify.dispatch());
+    }
     std::vector<weftmoe::transport::BFloat16> activation_host(
         static_cast<std::size_t>(max_tokens * hidden));
     for (std::size_t index = 0; index < activation_host.size(); ++index)
@@ -3080,9 +3295,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> terminal_status_samples;
     weftmoe::cuda::ForwardMegaKernelAudit last_audit;
     weftmoe::cuda::DeviceForwardHandle last_output;
-    const auto forward_api_before =
-        weftmoe::cuda::testing::cuda_api_audit_snapshot();
+    auto forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
+      if (round == 10U)
+        forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_PROGRESS rank=" << rank << " round=" << round
                   << std::endl;

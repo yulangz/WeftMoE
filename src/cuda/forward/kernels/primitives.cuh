@@ -419,13 +419,13 @@ __device__ std::uint32_t forward_wavefront_mblock_expert(
     std::uint64_t &local_mblock) {
   std::uint64_t max_blocks = 0ULL;
   for (std::uint32_t expert = 0;
-       expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+       expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
     const auto blocks = forward_expert_mblock_count(a, expert);
     max_blocks = blocks > max_blocks ? blocks : max_blocks;
   }
   for (std::uint64_t tile = 0; tile < max_blocks; ++tile) {
     for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+         expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
       const auto blocks = forward_expert_mblock_count(a, expert);
       if (tile >= blocks)
         continue;
@@ -437,7 +437,7 @@ __device__ std::uint32_t forward_wavefront_mblock_expert(
     }
   }
   local_mblock = 0ULL;
-  return a.dispatch.sizes.owned_expert_count;
+  return dispatch_sizes(a.dispatch).owned_expert_count;
 }
 
 // The readiness queue, rather than this immutable lookup, now determines
@@ -454,7 +454,7 @@ __device__ std::uint32_t forward_locality_mblock_expert(
   constexpr std::uint64_t kStartupMblocks = 2ULL;
   for (std::uint64_t tile = 0; tile < kStartupMblocks; ++tile) {
     for (std::uint32_t expert = 0;
-         expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+         expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
       if (tile >= forward_expert_mblock_count(a, expert))
         continue;
       if (ordinal == 0ULL) {
@@ -465,7 +465,7 @@ __device__ std::uint32_t forward_locality_mblock_expert(
     }
   }
   for (std::uint32_t expert = 0;
-       expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+       expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
     const auto blocks = forward_expert_mblock_count(a, expert);
     for (std::uint64_t tile = kStartupMblocks; tile < blocks; ++tile) {
       if (ordinal == 0ULL) {
@@ -476,7 +476,7 @@ __device__ std::uint32_t forward_locality_mblock_expert(
     }
   }
   local_mblock = 0ULL;
-  return a.dispatch.sizes.owned_expert_count;
+  return dispatch_sizes(a.dispatch).owned_expert_count;
 }
 
 #endif
@@ -484,7 +484,7 @@ __device__ std::uint32_t forward_locality_mblock_expert(
 __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
   return a.cancel_epoch &&
          atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
-                          0ULL) == a.epoch;
+                          0ULL) == execution_epoch(a);
 }
 
 template <bool StaticLocal>

@@ -92,11 +92,12 @@ public:
     double prefix_planning_us = 0;
     double remaining_parallel_us = 0;
   };
-  static DeviceDispatchHandle materialize(
-      const CudaLocalNotifyHandle &local,
-      BackendCompletion expert_counts,
-      BackendCompletion packet_summary,
-      const CudaExecution &execution, Timings *timings = nullptr);
+  static DeviceDispatchHandle materialize(const CudaLocalNotifyHandle &local,
+                                          BackendCompletion expert_counts,
+                                          BackendCompletion packet_summary,
+                                          const CudaExecution &execution,
+                                          Timings *timings = nullptr,
+                                          bool enqueue_only = false);
 };
 
 CudaRouteInput upload_cuda_routes(const RankRoutingInput &routes,
@@ -154,9 +155,16 @@ public:
   static const float *device_pointer(const CudaGateInput &gates);
 };
 
+struct DeviceDispatchRuntime {
+  DeviceDispatchSizes sizes;
+  std::uint64_t wave_count = 0;
+  std::uint64_t error = 0;
+};
+
 struct DeviceDispatchKernelView {
   DeviceDispatchIdentity identity;
   DeviceDispatchSizes sizes;
+  const DeviceDispatchRuntime *runtime = nullptr;
   const std::uint32_t *expert_id = nullptr;
   const std::uint64_t *local_offset = nullptr;
   const std::uint64_t *route_dst_row = nullptr;
@@ -201,7 +209,23 @@ struct DispatchWaveKernelView {
   const std::uint32_t *route_dst_mtile = nullptr;
 };
 
+#if defined(__CUDACC__)
+// Returning a reference here makes mutable kernel arguments escape to local
+// memory. A value lets the compiler keep only the requested scalar fields.
+__device__ __forceinline__ DeviceDispatchSizes
+dispatch_sizes(const DeviceDispatchKernelView &view) {
+  return view.runtime ? view.runtime->sizes : view.sizes;
+}
+
+__device__ __forceinline__ std::uint64_t
+dispatch_wave_count(const DeviceDispatchKernelView &view,
+                    const DispatchWaveKernelView &waves) {
+  return view.runtime ? view.runtime->wave_count : waves.wave_count;
+}
+#endif
+
 struct CudaNotifyWorkspacePlan {
+  BufferMode buffer_mode = BufferMode::Static;
   std::uint32_t calling_rank = 0;
   std::uint64_t num_tokens = 0;
   std::uint64_t max_tokens_per_rank = 0;
@@ -220,7 +244,8 @@ struct CudaNotifyWorkspacePlan {
 
 CudaNotifyWorkspacePlan query_cuda_notify_workspace(
     const RuntimeConfig &config, std::uint32_t calling_rank,
-    std::uint64_t num_tokens, std::uint64_t max_tokens_per_rank);
+    std::uint64_t num_tokens, std::uint64_t max_tokens_per_rank,
+    BufferMode buffer_mode = BufferMode::Static);
 
 class CudaNotifyWorkspace {
 public:

@@ -94,7 +94,7 @@ __device__ __noinline__ void enqueue_direct_full_mblock(
   fragment.remote_context_mask = context_mask;
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
       fragment.epoch);
-  published.store(a.epoch, ::cuda::memory_order_release);
+  published.store(execution_epoch(a), ::cuda::memory_order_release);
 #if WEFTMOE_DEBUG_VALIDATE
   if (a.use_gin) {
     auto *completion =
@@ -164,7 +164,7 @@ publish_direct_full_source_chunk(const ForwardKernelArgs &a,
     if (a.forward_dynamic_reduce_queue)
       forward_reduce_detail::publish_ready_route(a, a.local_base, route, 1U);
     else
-      ready.store(a.epoch, ::cuda::memory_order_release);
+      ready.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
 }
@@ -202,7 +202,8 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
     state.chunk_ready = 0U;
     if (state.initialized == 0U &&
         persistent_v3::load_acquire<::cuda::thread_scope_device>(
-            control.dispatch[0].outbound_directory_ready.value) >= a.epoch) {
+            control.dispatch[0].outbound_directory_ready.value) >=
+            execution_epoch(a)) {
       state.compact_rows = source_compact_rows(a, scheduler);
       state.chunk_count =
           (state.compact_rows + a.forward_return_chunk_rows - 1ULL) /
@@ -229,7 +230,7 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
         scan.fetch_add(1ULL, ::cuda::memory_order_relaxed) % state.chunk_count;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
         chunk_state[chunk]);
-    if (claimed.load(::cuda::memory_order_acquire) != a.epoch) {
+    if (claimed.load(::cuda::memory_order_acquire) != execution_epoch(a)) {
       state.selected_chunk = chunk;
       const auto remaining =
           state.compact_rows - chunk * a.forward_return_chunk_rows;
@@ -266,17 +267,17 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claimed(
         chunk_state[state.selected_chunk]);
     auto old = claimed.load(::cuda::memory_order_relaxed);
-    state.selected =
-        old != a.epoch && claimed.compare_exchange_strong(
-                              old, a.epoch, ::cuda::memory_order_acq_rel,
-                              ::cuda::memory_order_relaxed);
+    state.selected = old != execution_epoch(a) &&
+                     claimed.compare_exchange_strong(
+                         old, execution_epoch(a), ::cuda::memory_order_acq_rel,
+                         ::cuda::memory_order_relaxed);
   }
   __syncthreads();
   if (state.selected == 0U)
     return false;
 
   WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkReady, SourceRelay,
-                          context, state.selected_rows, a.epoch);
+                          context, state.selected_rows, execution_epoch(a));
   if (threadIdx.x == 0U) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -284,7 +285,7 @@ __device__ __forceinline__ bool progress_direct_full_completion_once(
   }
   publish_direct_full_source_chunk(a, row_begin, state.selected_rows);
   WEFTMOE_TIMELINE_RECORD(a.timeline, FullReturnChunkPublished, SourceRelay,
-                          context, state.selected_rows, a.epoch);
+                          context, state.selected_rows, execution_epoch(a));
   if (threadIdx.x == 0U) {
     state.completed =
         persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -362,7 +363,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
              stripe + (begin + count) * stripes < published_tail) {
         ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> ready(
             fragments[stripe + (begin + count) * stripes].epoch);
-        if (ready.load(::cuda::memory_order_acquire) != a.epoch)
+        if (ready.load(::cuda::memory_order_acquire) != execution_epoch(a))
           break;
         ++count;
       }
@@ -390,7 +391,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
   if (state.active != 0U) {
     WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchStart, LocalReturn,
                             context, (state.cursor << 32U) | state.active,
-                            a.epoch);
+                            execution_epoch(a));
     if (threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -499,7 +500,7 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
           forward_reduce_detail::publish_ready_route(
               a, a.peer_bases[local_source], header.route_index, 2U);
         else
-          ready.store(a.epoch, ::cuda::memory_order_release);
+          ready.store(execution_epoch(a), ::cuda::memory_order_release);
         ++published_rows;
       }
     }
@@ -528,13 +529,13 @@ __device__ __forceinline__ bool progress_direct_local_return_once(
             a.peer_bases[local_source], a.outgoing_sequence_offset);
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
             ready(source_signal[a.rank * a.channels]);
-        ready.store(a.epoch, ::cuda::memory_order_release);
+        ready.store(execution_epoch(a), ::cuda::memory_order_release);
       }
     }
     __syncthreads();
     WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
                             context, (state.cursor << 32U) | state.copied_rows,
-                            a.epoch);
+                            execution_epoch(a));
   }
 
   return true;
@@ -605,7 +606,7 @@ __device__ __forceinline__ void issue_direct_full_fragment_rdmacta(
   atomicAdd(&record.inflight, 1ULL);
 
   WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn, context,
-                          payload_bytes, a.epoch);
+                          payload_bytes, execution_epoch(a));
   gin.put(
       world, static_cast<int>(fragment.source_rank), a.gin_window,
       a.gin_return_receive_offset +
@@ -657,7 +658,7 @@ __device__ __forceinline__ void flush_direct_full_run(
   fragment.source_rank = run.source;
   fragment.row_count = run.rows;
   fragment.context = context;
-  fragment.epoch = a.epoch;
+  fragment.epoch = execution_epoch(a);
   issue_direct_full_fragment_rdmacta(a, gin, world, fragment, completion,
                                      context_completion, issued);
   run.rows = 0U;
@@ -808,7 +809,7 @@ __device__ __forceinline__ bool progress_direct_full_rdma_once(
   auto &fragment = fragments[state.cursor];
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_device> published(
       fragment.epoch);
-  if (published.load(::cuda::memory_order_acquire) != a.epoch)
+  if (published.load(::cuda::memory_order_acquire) != execution_epoch(a))
     return false;
 
   if ((fragment.remote_context_mask & (1U << context)) != 0U) {
@@ -821,7 +822,7 @@ __device__ __forceinline__ bool progress_direct_full_rdma_once(
       wire.row_count = fragment.row_count;
       wire.source_rank = fragment.contiguous_source_rank;
       wire.context = context;
-      wire.epoch = a.epoch;
+      wire.epoch = execution_epoch(a);
       issue_direct_full_fragment_rdmacta(a, gin, world, wire, completion,
                                         context_completion, state.issued);
       ++state.cursor;
@@ -891,8 +892,8 @@ __device__ __forceinline__ void direct_full_rdma_thread(
     atomicAdd(&record.local_completion, state.issued);
     record.last_progress_globaltimer = device_globaltimer_ns();
   }
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn,
-                          context, state.issued, a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnLocalCompletion, GinReturn, context,
+                          state.issued, execution_epoch(a));
   persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
       control.rdma_return_roles_complete.value, 1ULL);
 }

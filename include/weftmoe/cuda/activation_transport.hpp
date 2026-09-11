@@ -81,6 +81,7 @@ struct ActivationTransportPoolConfig {
   // unchanged unless this is enabled explicitly. Kept last for aggregate
   // source compatibility with the pre-checkpoint configuration.
   bool enable_backward_state = false;
+  BufferMode buffer_mode = BufferMode::Dynamic;
 };
 
 struct ActivationTransportPoolUsage {
@@ -109,6 +110,10 @@ private:
   friend ActivationTransportResourcePool make_activation_transport_pool(
       const CollectiveSession &, const CudaExecution &,
       ActivationTransportPoolConfig);
+  friend ActivationTransportResourcePool prepare_activation_transport_pool(
+      const CollectiveSession &, const CudaExecution &,
+      ActivationTransportPoolConfig, const DeviceDispatchHandle &,
+      const ActivationTransportResourcePool &);
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
   friend class NcclSocketFallbackForwardMegaKernel;
@@ -118,6 +123,15 @@ private:
 ActivationTransportResourcePool make_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config);
+
+// Dynamic mode derives common capacities from Notify. Static mode derives a
+// route-independent upper bound from max_tokens_per_rank. Existing storage is
+// reused when compatible; live Forward/Backward handles retain older pools.
+ActivationTransportResourcePool prepare_activation_transport_pool(
+    const CollectiveSession &session, const CudaExecution &execution,
+    ActivationTransportPoolConfig config,
+    const DeviceDispatchHandle &dispatch = {},
+    const ActivationTransportResourcePool &existing = {});
 
 struct ActivationTransportExpectation {
   std::uint64_t generation = 0;

@@ -48,11 +48,11 @@ find_padded_expert(const BackwardKernelArgs &a, std::uint64_t row) {
   const auto *offsets = peer_at<const unsigned long long>(
       a.local_base, a.padded_expert_offsets_offset);
   for (std::uint32_t expert = 0U;
-       expert < a.dispatch.sizes.owned_expert_count; ++expert) {
+       expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
     if (row >= offsets[expert] && row < offsets[expert + 1U])
       return expert;
   }
-  return a.dispatch.sizes.owned_expert_count;
+  return dispatch_sizes(a.dispatch).owned_expert_count;
 }
 
 template <std::uint32_t TileN>
@@ -554,7 +554,7 @@ backward_du_wgmma_kernel(
   if (row >= a.padded_rows)
     return;
   const auto expert = backward_compute_detail::find_padded_expert(a, row);
-  if (expert >= a.dispatch.sizes.owned_expert_count)
+  if (expert >= dispatch_sizes(a.dispatch).owned_expert_count)
     return;
   const auto *padded_offsets = peer_at<const unsigned long long>(
       a.local_base, a.padded_expert_offsets_offset);
@@ -591,7 +591,7 @@ backward_dx_wgmma_kernel(
   if (row >= a.padded_rows)
     return;
   const auto expert = backward_compute_detail::find_padded_expert(a, row);
-  if (expert >= a.dispatch.sizes.owned_expert_count)
+  if (expert >= dispatch_sizes(a.dispatch).owned_expert_count)
     return;
   auto *dx = peer_at<transport::BFloat16>(a.local_base, a.dx_rows_offset);
   backward_compute_detail::run_k_mn_tile<TileN>(

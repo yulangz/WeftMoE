@@ -58,11 +58,11 @@ __device__ __forceinline__ bool context_wave_span(
     std::uint64_t &context_wave_end) {
   const auto remote = remote_node(a);
   node_wave_begin = 0ULL;
-  while (node_wave_begin < a.dispatch_waves.wave_count &&
+  while (node_wave_begin < dispatch_wave_count(a.dispatch, a.dispatch_waves) &&
          a.dispatch_waves.destination_node[node_wave_begin] < remote)
     ++node_wave_begin;
   auto node_wave_end = node_wave_begin;
-  while (node_wave_end < a.dispatch_waves.wave_count &&
+  while (node_wave_end < dispatch_wave_count(a.dispatch, a.dispatch_waves) &&
          a.dispatch_waves.destination_node[node_wave_end] == remote)
     ++node_wave_end;
   const auto node_waves = node_wave_end - node_wave_begin;
@@ -158,7 +158,7 @@ __device__ __forceinline__ bool progress_inbound_once(
       const auto packet = partition_packet_base + state.packet_cursor;
       ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> marker(
           headers[packet].source_epoch);
-      if (marker.load(::cuda::memory_order_acquire) == a.epoch) {
+      if (marker.load(::cuda::memory_order_acquire) == execution_epoch(a)) {
         asm volatile("fence.proxy.async.global;" : : : "memory");
         const auto wave_packets = headers[packet].topk_slot;
         if (wave_packets != 0U &&
@@ -284,7 +284,7 @@ __device__ __forceinline__ bool progress_source_completion_once(
         state.scan_cursor = state.context;
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
           chunk_state[chunk]);
-      if (done.load(::cuda::memory_order_acquire) == a.epoch)
+      if (done.load(::cuda::memory_order_acquire) == execution_epoch(a))
         continue;
       state.selected_chunk = chunk;
       const auto row_begin = chunk * a.forward_return_chunk_rows;
@@ -349,13 +349,13 @@ __device__ __forceinline__ bool progress_source_completion_once(
         a.hidden * sizeof(transport::BFloat16));
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
         route_ready[route]);
-    ready.store(a.epoch, ::cuda::memory_order_release);
+    ready.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
   if (threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
         chunk_state[state.selected_chunk]);
-    done.store(a.epoch, ::cuda::memory_order_release);
+    done.store(execution_epoch(a), ::cuda::memory_order_release);
     ++state.completed;
     state.progressed = 1U;
     auto *status =
@@ -437,7 +437,7 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
       const auto receive_packet =
           static_cast<std::uint64_t>(partition) * a.max_tokens_per_rank +
           wave_begin - node_packet_base;
-      send_headers[wave_begin].source_epoch = a.epoch;
+      send_headers[wave_begin].source_epoch = execution_epoch(a);
       __threadfence_system();
       const ncclGin gin(a.gin_dev_comm, context);
       const auto rail = ncclTeamRail(a.gin_dev_comm);

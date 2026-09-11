@@ -14,6 +14,7 @@ struct ForwardKernelArgs {
   std::uint32_t world;
   std::uint32_t channels;
   std::uint64_t epoch;
+  unsigned long long *runtime_epoch = nullptr;
   void *local_base;
   void **peer_bases;
 #if __has_include(<nccl_device.h>)
@@ -163,3 +164,8 @@ struct ForwardKernelArgs {
   // waits on incomplete fixed stripes.
   bool forward_dynamic_reduce_scan = false;
 };
+
+__device__ __forceinline__ std::uint64_t
+execution_epoch(const ForwardKernelArgs &a) {
+  return a.runtime_epoch ? *a.runtime_epoch : a.epoch;
+}

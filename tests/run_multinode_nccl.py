@@ -593,7 +593,7 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--scenario",
-        choices=("valid", "out_of_range", "duplicate", "max_mismatch",
+        choices=("buffer_modes", "valid", "out_of_range", "duplicate", "max_mismatch",
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
@@ -883,6 +883,11 @@ def main(argv=None):
         print(f"[PASS] same-rail GIN Forward persistent kernel world={world}")
         return
 
+    if args.scenario == "buffer_modes":
+        if sum(result.returncode == 0 and "BUFFER_MODES " in result.stdout for result in outputs) != world:
+            raise AssertionError("incomplete buffer mode checks")
+        print("BUFFER_MODES passed", flush=True)
+        return
     if args.scenario == "gin_forward_bench":
         failures = []
         evidence = []

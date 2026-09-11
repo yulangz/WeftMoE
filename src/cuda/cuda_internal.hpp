@@ -46,6 +46,84 @@ enum class CudaApiAuditKind {
 void record_cuda_api(CudaApiAuditKind kind,
                      std::uint64_t bytes = 0) noexcept;
 
+// Timing and host-visible completion need actual event nodes during capture.
+// Dependency-only events continue to use cudaEventRecord directly.
+inline cudaError_t
+record_observable_event(cudaEvent_t event, cudaStream_t stream,
+                        unsigned long long *recorded_capture = nullptr) {
+  cudaStreamCaptureStatus status;
+  unsigned long long capture_id = 0;
+  auto error = cudaStreamGetCaptureInfo(stream, &status, &capture_id);
+  if (error != cudaSuccess)
+    return error;
+  if (recorded_capture)
+    *recorded_capture =
+        status == cudaStreamCaptureStatusActive ? capture_id : 0;
+  return status == cudaStreamCaptureStatusActive
+             ? cudaEventRecordWithFlags(event, stream, cudaEventRecordExternal)
+             : cudaEventRecord(event, stream);
+}
+
+// Observable event nodes do not enroll a new stream into a capture. Use the
+// producer's dependency events within that capture, and its observable event
+// for consumers outside it (including another graph).
+inline cudaError_t
+wait_output_ready(cudaStream_t stream, cudaStream_t producer_stream,
+                  cudaEvent_t observable, unsigned long long recorded_capture,
+                  cudaEvent_t first, cudaEvent_t second = nullptr) {
+  cudaStreamCaptureStatus status;
+  unsigned long long capture_id = 0;
+  auto error = cudaStreamGetCaptureInfo(stream, &status, &capture_id);
+  if (error != cudaSuccess)
+    return error;
+  cudaStreamCaptureStatus producer_status;
+  unsigned long long producer_capture = 0;
+  error = cudaStreamGetCaptureInfo(producer_stream, &producer_status,
+                                   &producer_capture);
+  if (error != cudaSuccess)
+    return error;
+  if (producer_status == cudaStreamCaptureStatusActive &&
+      producer_capture == recorded_capture &&
+      (status == cudaStreamCaptureStatusNone ||
+       capture_id == recorded_capture)) {
+    error = cudaStreamWaitEvent(stream, first);
+    return error != cudaSuccess || !second
+               ? error
+               : cudaStreamWaitEvent(stream, second);
+  }
+  return cudaStreamWaitEvent(stream, observable,
+                             status == cudaStreamCaptureStatusActive
+                                 ? cudaEventWaitExternal
+                                 : cudaEventWaitDefault);
+}
+
+// Input events can precede capture or be produced inside the enclosing graph.
+// Keep internal graph edges when both ends were recorded in the same capture.
+inline cudaError_t record_input_ready(cudaEvent_t event, cudaStream_t stream,
+                                      unsigned long long &capture_id) {
+  cudaStreamCaptureStatus status;
+  auto error = cudaStreamGetCaptureInfo(stream, &status, &capture_id);
+  if (error != cudaSuccess)
+    return error;
+  if (status != cudaStreamCaptureStatusActive)
+    capture_id = 0;
+  return cudaEventRecord(event, stream);
+}
+
+inline cudaError_t wait_input_ready(cudaStream_t stream, cudaEvent_t event,
+                                    unsigned long long recorded_capture) {
+  cudaStreamCaptureStatus status;
+  unsigned long long capture_id = 0;
+  auto error = cudaStreamGetCaptureInfo(stream, &status, &capture_id);
+  if (error != cudaSuccess)
+    return error;
+  const auto flags =
+      status == cudaStreamCaptureStatusActive && capture_id != recorded_capture
+          ? cudaEventWaitExternal
+          : cudaEventWaitDefault;
+  return cudaStreamWaitEvent(stream, event, flags);
+}
+
 struct CudaExecutionState final : BackendExecutionState {
   std::uint32_t device = 0;
   cudaStream_t stream = nullptr;
@@ -109,6 +187,7 @@ struct CudaAllocation {
   cudaEvent_t planning_start = nullptr;
   cudaEvent_t planning_complete = nullptr;
   cudaEvent_t producer_ready = nullptr;
+  unsigned long long producer_capture_id = 0;
   cudaEvent_t completion = nullptr;
   std::vector<cudaEvent_t> consumer_events;
   mutable std::mutex consumer_mutex;

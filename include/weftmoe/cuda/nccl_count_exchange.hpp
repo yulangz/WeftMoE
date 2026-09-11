@@ -187,6 +187,7 @@ struct DeviceNotifyResourcePoolConfig {
   std::uint64_t max_config_wire_bytes = 0;
   std::uint32_t max_inflight_generations = 2;
   std::uint32_t max_inflight_consumers = 4;
+  BufferMode buffer_mode = BufferMode::Dynamic;
 };
 
 struct DeviceNotifyResourcePoolUsage {

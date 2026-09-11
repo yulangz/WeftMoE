@@ -1005,11 +1005,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #if WEFTMOE_DEVICE_TIMELINE
       if (threadIdx.x == 0U && !timeline_fc1_started) {
         WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
-                                a.epoch);
+                                execution_epoch(a));
         WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1First, Compute, 0U, task,
-                                a.epoch);
+                                execution_epoch(a));
         WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1ClaimStart, Compute, 0U, task,
-                                a.epoch);
+                                execution_epoch(a));
         timeline_fc1_started = true;
       }
 #endif
@@ -1181,8 +1181,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               atomicAdd(&scheduler[11ULL + 2ULL * a.world], 1ULL) + 1ULL;
           if (fc1_mblocks_complete == forward_mblocks) {
             status->fc1_complete_clock = device_globaltimer_ns();
-            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U,
-                                    fc1_tasks, a.epoch);
+            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1Last, Compute, 0U, fc1_tasks,
+                                    execution_epoch(a));
             forward_publish_progress(a, kForwardFc1Complete, fc1_tasks);
           }
           const auto queue_slot = atomicAdd(&scheduler[2], 1ULL);
@@ -1215,8 +1215,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         break;
 #if WEFTMOE_DEVICE_TIMELINE
       if (threadIdx.x == 0U && !timeline_fc2_started) {
-        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2First, Compute, 0U,
-                                *task_shared, a.epoch);
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2First, Compute, 0U, *task_shared,
+                                execution_epoch(a));
         timeline_fc2_started = true;
       }
 #endif
@@ -1414,7 +1414,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
       if (threadIdx.x == 0U)
         WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
-                                a.epoch);
+                                execution_epoch(a));
 
       if (*return_mblock_shared != 0U) {
         // Thread 0's acq_rel RMW above acquired every earlier N-tile release.
@@ -1487,8 +1487,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               forward_return_detail::issue_direct_full_mblock(
                   a, scheduler, row, valid_rows,
                   *return_context_masks_shared);
-              WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
-                                      Compute, 0U, mblock, a.epoch);
+              WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady, Compute,
+                                      0U, mblock, execution_epoch(a));
             }
           } else if (a.forward_stream_local_dispatch &&
                      a.forward_relay_local_return) {
@@ -1499,8 +1499,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             forward_return_detail::issue_direct_full_mblock(
                 a, scheduler, row, valid_rows,
                 *return_context_masks_shared);
-            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady,
-                                    Compute, 0U, mblock, a.epoch);
+            WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MblockReturnReady, Compute,
+                                    0U, mblock, execution_epoch(a));
           }
         }
         cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
@@ -1530,7 +1530,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #if WEFTMOE_DEVICE_TIMELINE
   if (threadIdx.x == 0U && timeline_fc2_started)
     WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2Last, Compute, 0U, fc2_tasks,
-                            a.epoch);
+                            execution_epoch(a));
 #endif
   if constexpr (Cluster2)
     cute::cluster_sync();
@@ -1557,7 +1557,8 @@ local_p2p_forward_compute_kernel(
     const __grid_constant__ CUtensorMap w2_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   if (threadIdx.x == 0U)
-    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
+                            execution_epoch(a));
   extern __shared__ __align__(1024) unsigned char storage[];
   __shared__ unsigned long long task_shared;
   __shared__ unsigned int task_kind_shared;
@@ -1567,7 +1568,8 @@ local_p2p_forward_compute_kernel(
   if (threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
-    while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+    while (setup_ready.load(::cuda::memory_order_acquire) <
+               execution_epoch(a) &&
            !forward_cancelled(a))
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
@@ -1610,7 +1612,8 @@ local_p2p_forward_compute_kernel(
     }
   }
   if (threadIdx.x == 0U)
-    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL,
+                            execution_epoch(a));
 #else
   (void)a;
   (void)x_map;
@@ -1635,13 +1638,15 @@ __device__ __forceinline__ void local_p2p_forward_tma_store_role(
     unsigned int *task_kind_shared, unsigned int *return_mblock_shared,
     unsigned int *pair_operand_shared) {
   if (threadIdx.x == 0U)
-    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,
+                            execution_epoch(a));
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
   if (threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
-    while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+    while (setup_ready.load(::cuda::memory_order_acquire) <
+               execution_epoch(a) &&
            !forward_cancelled(a))
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
@@ -1666,7 +1671,8 @@ __device__ __forceinline__ void local_p2p_forward_tma_store_role(
         a, reduce_role_index, reduce_role_count);
   }
   if (threadIdx.x == 0U)
-    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL,
+                            execution_epoch(a));
 }
 #endif
 
@@ -1754,7 +1760,8 @@ __global__ __launch_bounds__(256, 1) void local_p2p_forward_reduce_kernel(
   if (threadIdx.x == 0U) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
         setup_ready(scheduler[8ULL + 2ULL * a.world]);
-    while (setup_ready.load(::cuda::memory_order_acquire) < a.epoch &&
+    while (setup_ready.load(::cuda::memory_order_acquire) <
+               execution_epoch(a) &&
            !forward_cancelled(a))
       __nanosleep(forward_tuning::kSetupNanosleep);
   }

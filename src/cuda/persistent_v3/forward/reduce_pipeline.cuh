@@ -47,7 +47,7 @@ __device__ __forceinline__ void reduce_one_token(
     } else if (a.use_gin) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
           route_ready[lane_route]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+      while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
              !forward_cancelled(a))
         __nanosleep(forward_tuning::kTaskIdleNanosleep);
       if (a.dispatch.route_dst_node[lane_route] != a.node) {
@@ -58,7 +58,7 @@ __device__ __forceinline__ void reduce_one_token(
       const auto destination = a.dispatch.route_dst_rank[lane_route];
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
           source_ready[destination * a.channels]);
-      while (ready.load(::cuda::memory_order_acquire) < a.epoch &&
+      while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
              !forward_cancelled(a))
         __nanosleep(forward_tuning::kTaskIdleNanosleep);
     }
@@ -151,9 +151,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
   WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceReady, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
+                          a.dispatch.identity.num_tokens, execution_epoch(a));
   WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
+                          a.dispatch.identity.num_tokens, execution_epoch(a));
 
   if (a.forward_dynamic_reduce_queue) {
     __shared__ unsigned long long batch_begin;
@@ -219,7 +219,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
             token = (encoded & kTokenMask) - 1ULL;
             WEFTMOE_TIMELINE_RECORD_IF(
                 a.timeline, true, ReduceTokenReadyObserved, Reduce,
-                publisher_kind, token, a.epoch);
+                publisher_kind, token, execution_epoch(a));
 #else
             token = encoded - 1ULL;
 #endif
@@ -282,8 +282,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           const auto route = token * a.dispatch.identity.top_k + lane;
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
               published(route_ready[route]);
-          route_is_ready =
-              published.load(::cuda::memory_order_acquire) >= a.epoch;
+          route_is_ready = published.load(::cuda::memory_order_acquire) >=
+                           execution_epoch(a);
         }
         const auto ready_lanes = __ballot_sync(0xffffffffU, route_is_ready);
         const auto route_mask = (1U << a.dispatch.identity.top_k) - 1U;
@@ -333,7 +333,7 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
   if (lane == 0U)
     atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
   WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
-                          a.dispatch.identity.num_tokens, a.epoch);
+                          a.dispatch.identity.num_tokens, execution_epoch(a));
   __threadfence();
   __syncthreads();
   if (threadIdx.x == 0U) {

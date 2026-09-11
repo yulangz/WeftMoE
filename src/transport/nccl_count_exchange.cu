@@ -2023,8 +2023,8 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
   impl->execution = execution;
   impl->config = config;
   impl->max_plan = query_cuda_notify_workspace(
-      config.capacity_config, base_session.rank(),
-      config.max_tokens_per_rank, config.max_tokens_per_rank);
+      config.capacity_config, base_session.rank(), config.max_tokens_per_rank,
+      config.max_tokens_per_rank, config.buffer_mode);
   impl->slots.resize(config.max_inflight_generations);
   for (auto &slot : impl->slots) {
     slot.notify = DeviceNotifyPoolBridge::allocate(
@@ -2423,7 +2423,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       route_input_bytes = routes.device_bytes();
       auto plan = query_cuda_notify_workspace(
           request.config, impl_->session.rank(),
-          request.local_routes.num_tokens, request.max_tokens_per_rank);
+          request.local_routes.num_tokens, request.max_tokens_per_rank,
+          impl_->pool ? impl_->pool->config.buffer_mode : BufferMode::Static);
       notify_arena_bytes = plan.device_bytes;
       notify_pinned_bytes = plan.host_staging_bytes;
       auto workspace = pool_allocation

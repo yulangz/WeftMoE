@@ -83,8 +83,9 @@ __device__ __forceinline__ void local_split_transport_finalize(
 #endif
     status->complete_clock = device_globaltimer_ns();
   }
-  forward_publish_progress(a, kForwardTerminal, a.epoch);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+  forward_publish_progress(a, kForwardTerminal, execution_epoch(a));
+  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL,
+                          execution_epoch(a));
 }
 
 template <bool StaticLocal>
@@ -133,11 +134,11 @@ __device__ __forceinline__ void split_transport_finalize(
           ready(peer_at<unsigned long long>(a.local_base,
                                             a.outgoing_sequence_offset)
                     [destination * a.channels]);
-      ready.store(a.epoch, ::cuda::memory_order_release);
+      ready.store(execution_epoch(a), ::cuda::memory_order_release);
     }
     __syncthreads();
     WEFTMOE_TIMELINE_RECORD(a.timeline, SourceSignalObserved, SourceRelay, 0U,
-                            remote_fanout, a.epoch);
+                            remote_fanout, execution_epoch(a));
     if (threadIdx.x == 0U)
       persistent_v3::store_release<::cuda::thread_scope_device>(
           control.source_ready_published.value, 1ULL);
@@ -179,7 +180,8 @@ __device__ __forceinline__ void split_transport_finalize(
         completion_task(completion, transport_state::TaskClass::Reduce));
 #endif
     completion->ring_credit_restored = completion->ring_credit_expected;
-    publish_elected_terminal(completion, a.epoch, status->error != 0U);
+    publish_elected_terminal(completion, execution_epoch(a),
+                             status->error != 0U);
   }
   __syncthreads();
 
@@ -219,8 +221,9 @@ __device__ __forceinline__ void split_transport_finalize(
 #endif
     status->complete_clock = device_globaltimer_ns();
   }
-  forward_publish_progress(a, kForwardTerminal, a.epoch);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL, a.epoch);
+  forward_publish_progress(a, kForwardTerminal, execution_epoch(a));
+  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL,
+                          execution_epoch(a));
 }
 
 } // namespace forward_finalize_detail

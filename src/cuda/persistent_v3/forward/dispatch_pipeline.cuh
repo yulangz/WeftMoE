@@ -44,7 +44,7 @@ __device__ __forceinline__ bool cancelled(
 __device__ __forceinline__ std::uint64_t
 local_route_prefix(const ForwardKernelArgs &a) {
   std::uint64_t begin = 0ULL;
-  auto end = a.dispatch.sizes.route_count;
+  auto end = dispatch_sizes(a.dispatch).route_count;
   while (begin < end) {
     const auto middle = begin + (end - begin) / 2ULL;
     const auto route = a.dispatch_waves.local_route_order[middle];
@@ -68,7 +68,7 @@ __device__ __forceinline__ void wait_for_local_map_clear(
     __threadfence_system();
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
         control.generation.contexts[0].rx_published.value);
-    ready.store(a.epoch, ::cuda::memory_order_release);
+    ready.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
   if (threadIdx.x == 0U) {
@@ -79,7 +79,7 @@ __device__ __forceinline__ void wait_for_local_map_clear(
           a.peer_bases[peer], a.forward_v3_control_offset);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
           observed(peer_control->generation.contexts[0].rx_published.value);
-      while (observed.load(::cuda::memory_order_acquire) < a.epoch &&
+      while (observed.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
              !cancelled(a, control))
         __nanosleep(forward_tuning::kReduceQueueNanosleep);
     }
@@ -92,11 +92,11 @@ __device__ __forceinline__ bool context_wave_span(
     std::uint32_t remote_node, std::uint64_t &node_wave_begin,
     std::uint64_t &context_wave_begin, std::uint64_t &context_wave_end) {
   node_wave_begin = 0ULL;
-  while (node_wave_begin < a.dispatch_waves.wave_count &&
+  while (node_wave_begin < dispatch_wave_count(a.dispatch, a.dispatch_waves) &&
          a.dispatch_waves.destination_node[node_wave_begin] < remote_node)
     ++node_wave_begin;
   auto node_wave_end = node_wave_begin;
-  while (node_wave_end < a.dispatch_waves.wave_count &&
+  while (node_wave_end < dispatch_wave_count(a.dispatch, a.dispatch_waves) &&
          a.dispatch_waves.destination_node[node_wave_end] == remote_node)
     ++node_wave_end;
   if (node_wave_begin == node_wave_end) {
@@ -147,19 +147,19 @@ __device__ __forceinline__ void publish_local_batch(
       const auto gate = a.gates[route];
       auto *destination_headers = peer_at<LocalP2pRouteHeader>(
           a.peer_bases[destination], a.direct_headers_offset);
-      destination_headers[row] = LocalP2pRouteHeader{
-          transport::kActivationTransportSchemaVersion,
-          a.rank,
-          destination,
-          0U,
-          a.dispatch.identity.generation,
-          a.epoch,
-          route,
-          route,
-          token,
-          row,
-          expert,
-          topk_slot};
+      destination_headers[row] =
+          LocalP2pRouteHeader{transport::kActivationTransportSchemaVersion,
+                              a.rank,
+                              destination,
+                              0U,
+                              a.dispatch.identity.generation,
+                              execution_epoch(a),
+                              route,
+                              route,
+                              token,
+                              row,
+                              expert,
+                              topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
       destination_gates[row] = gate;
@@ -257,19 +257,19 @@ __device__ __forceinline__ void publish_local_batch(
       const auto gate = a.gates[route];
       auto *destination_headers = peer_at<LocalP2pRouteHeader>(
           a.peer_bases[destination], a.direct_headers_offset);
-      destination_headers[row] = LocalP2pRouteHeader{
-          transport::kActivationTransportSchemaVersion,
-          a.rank,
-          destination,
-          0U,
-          a.dispatch.identity.generation,
-          a.epoch,
-          route,
-          route,
-          token,
-          row,
-          expert,
-          topk_slot};
+      destination_headers[row] =
+          LocalP2pRouteHeader{transport::kActivationTransportSchemaVersion,
+                              a.rank,
+                              destination,
+                              0U,
+                              a.dispatch.identity.generation,
+                              execution_epoch(a),
+                              route,
+                              route,
+                              token,
+                              row,
+                              expert,
+                              topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
       destination_gates[row] = gate;
@@ -362,9 +362,9 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
   const auto wave_packets = wave_end - wave_begin;
   const auto vector_count = a.hidden / 8ULL;
 
-  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, pack_thread == 0U,
-                             DispatchPackStart, GinDispatch, context,
-                             wave_packets, a.epoch);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, pack_thread == 0U, DispatchPackStart,
+                             GinDispatch, context, wave_packets,
+                             execution_epoch(a));
 
   for (std::uint64_t packet_in_wave = pack_warp;
        packet_in_wave < wave_packets; packet_in_wave += kRdmaPackWarps) {
@@ -435,7 +435,8 @@ __device__ __forceinline__ void pack_outbound_wave_from_rdma(
   rdma_pack_group_sync();
   WEFTMOE_TIMELINE_RECORD_IF(
       a.timeline, pack_thread == 0U, DispatchPackEnd, GinDispatch, context,
-      wave_packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
+      wave_packets * a.hidden * sizeof(transport::BFloat16),
+      execution_epoch(a));
   if (pack_thread == 0U) {
     if (wave_packets > UINT16_MAX) {
       persistent_v3::publish_error_once(control.generation, 201ULL);
@@ -466,8 +467,8 @@ __device__ __forceinline__ void rdma_pack_outbound_context(
   const auto remote_node = a.node == 0U ? 1U : 0U;
   if (pack_thread == 0U) {
     while (persistent_v3::load_acquire<::cuda::thread_scope_device>(
-               control.generation.contexts[context]
-                   .tx_local_complete.value) < a.epoch &&
+               control.generation.contexts[context].tx_local_complete.value) <
+               execution_epoch(a) &&
            !cancelled(a, control))
       __nanosleep(forward_tuning::kTransportIdleNanosleep);
     pack_enabled = cancelled(a, control) ? 0U : 1U;
@@ -493,10 +494,10 @@ __device__ __forceinline__ void rdma_pack_outbound_context(
     const auto directory_index =
         remote_partition * persistent_v3::kRdmaCtaCount + context;
     const auto return_rows =
-        a.dispatch.sizes.route_count - local_route_prefix(a);
+        dispatch_sizes(a.dispatch).route_count - local_route_prefix(a);
     directories[directory_index] = GinDispatchContextRecord{
         a.dispatch.identity.generation,
-        a.epoch,
+        execution_epoch(a),
         packet_begin,
         static_cast<std::uint32_t>(packet_end - packet_begin),
         static_cast<std::uint32_t>(pack_wave_end - pack_wave_begin),
@@ -504,7 +505,7 @@ __device__ __forceinline__ void rdma_pack_outbound_context(
     __threadfence_system();
     persistent_v3::store_release<::cuda::thread_scope_device>(
         control.dispatch[context].outbound_directory_ready.value,
-        a.epoch);
+        execution_epoch(a));
   }
   rdma_pack_group_sync();
 
@@ -515,7 +516,8 @@ __device__ __forceinline__ void rdma_pack_outbound_context(
 
   if (pack_thread == 0U) {
     persistent_v3::store_release<::cuda::thread_scope_device>(
-        control.dispatch[context].outbound_pack_complete.value, a.epoch);
+        control.dispatch[context].outbound_pack_complete.value,
+        execution_epoch(a));
   }
   rdma_pack_group_sync();
 }
@@ -585,7 +587,7 @@ __device__ __forceinline__ void relay_inbound_wave(
                                   destination,
                                   header.channel,
                                   header.generation,
-                                  a.epoch,
+                                  execution_epoch(a),
                                   header.sequence,
                                   route,
                                   header.local_token_id,
@@ -765,7 +767,7 @@ __device__ __forceinline__ void relay_role(
   bool completion_timeline_started = false;
   bool completion_terminal_published = false;
   WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, context,
-                          0ULL, a.epoch);
+                          0ULL, execution_epoch(a));
   while ((!dispatch_terminal_published || local_return_done == 0U ||
           completion_done == 0U) &&
          !cancelled(a, control)) {
@@ -776,8 +778,8 @@ __device__ __forceinline__ void relay_role(
         inbound_ready = 0U;
         if (inbound_directory_seen == 0U &&
             persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                control.dispatch[context]
-                    .inbound_directory_ready.value) >= a.epoch) {
+                control.dispatch[context].inbound_directory_ready.value) >=
+                execution_epoch(a)) {
           // The GIN owner crossed the async-proxy boundary before releasing
           // this epoch.  Keep the fence here as well so this independent SM's
           // generic loads cannot observe an older receive-buffer image.
@@ -785,7 +787,7 @@ __device__ __forceinline__ void relay_role(
           const auto directory =
               receive_directories[receive_directory_index];
           if (directory.generation != a.dispatch.identity.generation ||
-              directory.epoch != a.epoch) {
+              directory.epoch != execution_epoch(a)) {
             persistent_v3::publish_error_once(control.generation, 203ULL);
           } else {
             inbound_directory = directory;
@@ -819,7 +821,7 @@ __device__ __forceinline__ void relay_role(
                 persistent_v3::publish_error_once(control.generation, 205ULL);
               } else {
                 inbound_task = persistent_v3::PipelineTask{};
-                inbound_task.epoch = a.epoch;
+                inbound_task.epoch = execution_epoch(a);
                 inbound_task.index = static_cast<std::uint32_t>(packet);
                 inbound_task.expert =
                     static_cast<std::uint16_t>(source_partition);
@@ -877,7 +879,8 @@ __device__ __forceinline__ void relay_role(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
         WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
-                                context, local_return_state.cursor, a.epoch);
+                                context, local_return_state.cursor,
+                                execution_epoch(a));
       }
       __syncthreads();
     }
@@ -891,8 +894,8 @@ __device__ __forceinline__ void relay_role(
                           local_return_tma_full);
       if (local_begin ==
           static_cast<std::uint64_t>(relay_ordinal) * kLocalRouteBatch)
-        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
-                                GinDispatch, context, local_begin, a.epoch);
+        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible, GinDispatch,
+                                context, local_begin, execution_epoch(a));
       local_begin += local_stride;
       progressed = true;
     }
@@ -904,8 +907,8 @@ __device__ __forceinline__ void relay_role(
       publish_local_batch(a, local_begin, local_end, completion);
       if (local_begin ==
           static_cast<std::uint64_t>(relay_ordinal) * kLocalRouteBatch)
-        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
-                                GinDispatch, context, local_begin, a.epoch);
+        WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible, GinDispatch,
+                                context, local_begin, execution_epoch(a));
       local_begin += local_stride;
       progressed = true;
     }
@@ -915,9 +918,9 @@ __device__ __forceinline__ void relay_role(
         inbound_terminal && local_begin >= local_routes;
     if (dispatch_terminal && !dispatch_terminal_published) {
       WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, context,
-                              local_routes, a.epoch);
+                              local_routes, execution_epoch(a));
       WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, context,
-                              local_routes, a.epoch);
+                              local_routes, execution_epoch(a));
       if (threadIdx.x == 0U) {
         const auto old =
             persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -948,7 +951,8 @@ __device__ __forceinline__ void relay_role(
               a, scheduler, local_return_state)) {
         local_return_done = 1U;
         WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
-                                context, local_return_state.cursor, a.epoch);
+                                context, local_return_state.cursor,
+                                execution_epoch(a));
       }
       __syncthreads();
     }
@@ -966,16 +970,17 @@ __device__ __forceinline__ void relay_role(
           break;
       }
       if (!completion_timeline_started && completion_state.initialized != 0U) {
-        WEFTMOE_TIMELINE_RECORD(
-            a.timeline, SourceRelayStart, SourceRelay, context,
-            completion_state.expected, a.epoch);
+        WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayStart, SourceRelay,
+                                context, completion_state.expected,
+                                execution_epoch(a));
         completion_timeline_started = true;
       }
       if (forward_return_detail::direct_full_completion_terminal(
               completion_state)) {
         if (!completion_terminal_published) {
           WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay,
-                                  context, completion_state.completed, a.epoch);
+                                  context, completion_state.completed,
+                                  execution_epoch(a));
           if (threadIdx.x == 0U) {
             persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
                 control.return_receive_roles_complete.value, 1ULL);
@@ -1022,9 +1027,9 @@ __device__ __forceinline__ void issue_outbound_task(
       static_cast<std::uint64_t>(source_partition) * a.max_tokens_per_rank +
       task.row_begin;
   const auto packets = static_cast<std::uint64_t>(task.row_count);
-  WEFTMOE_TIMELINE_RECORD(
-      a.timeline, GinPutIssue, GinDispatch, task.context,
-      packets * a.hidden * sizeof(transport::BFloat16), a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, GinPutIssue, GinDispatch, task.context,
+                          packets * a.hidden * sizeof(transport::BFloat16),
+                          execution_epoch(a));
   gin.put(rail, static_cast<int>(remote_node), a.gin_window,
           a.gin_receive_header_offset +
               receive_packet * sizeof(LocalP2pRouteHeader),
@@ -1064,8 +1069,8 @@ __device__ __forceinline__ void issue_outbound_task(
       a.gin_receive_header_offset +
           receive_packet * sizeof(LocalP2pRouteHeader) +
           offsetof(LocalP2pRouteHeader, source_epoch),
-      a.epoch, ncclGin_SignalInc{0}, ncclCoopThread{}, ncclGin_None{},
-      ::cuda::thread_scope_block, ::cuda::thread_scope_device);
+      execution_epoch(a), ncclGin_SignalInc{0}, ncclCoopThread{},
+      ncclGin_None{}, ::cuda::thread_scope_block, ::cuda::thread_scope_device);
 
   auto *status =
       peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -1110,7 +1115,7 @@ __device__ __forceinline__ bool publish_one_inbound_wave_sequence(
     directory = directories[
         source_partition * persistent_v3::kRdmaCtaCount + context];
     if (directory.generation != a.dispatch.identity.generation ||
-        directory.epoch != a.epoch)
+        directory.epoch != execution_epoch(a))
       return false;
     packet_cursor = directory.packet_begin;
     directory_seen = true;
@@ -1120,7 +1125,7 @@ __device__ __forceinline__ bool publish_one_inbound_wave_sequence(
     record.relay_expected = directory.packet_count;
     persistent_v3::store_release<::cuda::thread_scope_device>(
         control.dispatch[context].inbound_directory_ready.value,
-        a.epoch);
+        execution_epoch(a));
     return true;
   }
   if (waves_published >= directory.wave_count)
@@ -1131,7 +1136,7 @@ __device__ __forceinline__ bool publish_one_inbound_wave_sequence(
       packet_cursor;
   ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> marker(
       headers[packet].source_epoch);
-  if (marker.load(::cuda::memory_order_acquire) != a.epoch)
+  if (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
     return false;
   asm volatile("fence.proxy.async.global;" : : : "memory");
   const auto wave_packets = headers[packet].topk_slot;
@@ -1380,7 +1385,7 @@ __device__ __forceinline__ void local_relay_role(
     std::uint32_t relay_ordinal, unsigned long long *scheduler,
     unsigned char *storage) {
   WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay,
-                          relay_ordinal, 0ULL, a.epoch);
+                          relay_ordinal, 0ULL, execution_epoch(a));
   constexpr std::uint32_t kPhysicalWarps =
       forward_tuning::kLocalTransportThreads / 32U;
   constexpr std::uint32_t kPublisherWarp = kPhysicalWarps - 1U;
@@ -1397,7 +1402,7 @@ __device__ __forceinline__ void local_relay_role(
       forward_tuning::kDispatchPublishBatchRows;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
-  const auto route_count = a.dispatch.sizes.route_count;
+  const auto route_count = dispatch_sizes(a.dispatch).route_count;
   const auto copy_bytes = static_cast<std::uint32_t>(
       a.hidden * sizeof(transport::BFloat16));
   // Reuse the existing transport staging allocation. Wide rows or smaller
@@ -1459,14 +1464,14 @@ __device__ __forceinline__ void local_relay_role(
                   destination,
                   0U,
                   a.dispatch.identity.generation,
-                  a.epoch,
+                  execution_epoch(a),
                   route,
                   route,
                   token,
                   row,
                   a.dispatch.expert_id[route],
-                  static_cast<std::uint32_t>(
-                      route % a.dispatch.identity.top_k)};
+                  static_cast<std::uint32_t>(route %
+                                             a.dispatch.identity.top_k)};
 
               auto *destination_gates = peer_at<float>(
                   a.peer_bases[destination], a.canonical_gates_offset);
@@ -1544,7 +1549,7 @@ __device__ __forceinline__ void local_relay_role(
           peer_rows += rows;
         if (relay_ordinal == 0U && batch_begin == 0ULL && local == 0ULL)
           WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstLocalRowVisible,
-                                  GinDispatch, 0U, route, a.epoch);
+                                  GinDispatch, 0U, route, execution_epoch(a));
       }
       asm volatile("bar.sync 2, %0;" : : "n"(kCopyThreads) : "memory");
     }
@@ -1560,10 +1565,10 @@ __device__ __forceinline__ void local_relay_role(
               peer_rows * a.hidden * sizeof(transport::BFloat16));
   }
   __syncthreads();
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay,
-                          relay_ordinal, route_count, a.epoch);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay,
-                          relay_ordinal, route_count, a.epoch);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, relay_ordinal,
+                          route_count, execution_epoch(a));
+  WEFTMOE_TIMELINE_RECORD(a.timeline, XLastRelay, ProxyRelay, relay_ordinal,
+                          route_count, execution_epoch(a));
   if (threadIdx.x == 0U) {
     const auto old =
         persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -1602,9 +1607,9 @@ __device__ __forceinline__ void local_relay_role(
         if (forward_return_detail::direct_local_return_terminal(
                 a, scheduler, local_return_state)) {
           local_return_done = 1U;
-          WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal,
-                                  LocalReturn, context,
-                                  local_return_state.cursor, a.epoch);
+          WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnTerminal, LocalReturn,
+                                  context, local_return_state.cursor,
+                                  execution_epoch(a));
         } else if (!progressed) {
           __nanosleep(forward_tuning::kReturnIdleNanosleep);
         }
@@ -1653,7 +1658,7 @@ __device__ __forceinline__ void rdma_role(
             persistent_v3::kRdmaCtaCount +
         context;
     send_directory[send_directory_index] = GinDispatchContextRecord{
-        a.dispatch.identity.generation, a.epoch, 0ULL, 0U, 0U};
+        a.dispatch.identity.generation, execution_epoch(a), 0ULL, 0U, 0U};
     __threadfence_system();
     gin.put(rail, static_cast<int>(remote_node), a.gin_window,
             a.gin_receive_dispatch_directory_offset +
@@ -1669,7 +1674,7 @@ __device__ __forceinline__ void rdma_role(
     gin.waitSignal(ncclCoopThread{}, 2, 1ULL);
     persistent_v3::store_release<::cuda::thread_scope_device>(
         control.generation.contexts[context].tx_local_complete.value,
-        a.epoch);
+        execution_epoch(a));
 
     std::uint64_t outbound_node_wave_begin = 0ULL;
     std::uint64_t outbound_wave_begin = 0ULL;
@@ -1694,10 +1699,10 @@ __device__ __forceinline__ void rdma_role(
       if (!outbound_terminal) {
         if (!outbound_directory_issued &&
             persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                control.dispatch[context]
-                    .outbound_directory_ready.value) >= a.epoch) {
+                control.dispatch[context].outbound_directory_ready.value) >=
+                execution_epoch(a)) {
           persistent_v3::PipelineTask directory_task{};
-          directory_task.epoch = a.epoch;
+          directory_task.epoch = execution_epoch(a);
           directory_task.index =
               static_cast<std::uint32_t>(send_directory_index);
           directory_task.expert = static_cast<std::uint16_t>(remote_node);
@@ -1729,7 +1734,7 @@ __device__ __forceinline__ void rdma_role(
               persistent_v3::publish_error_once(control.generation, 206ULL);
             } else {
               persistent_v3::PipelineTask wave_task{};
-              wave_task.epoch = a.epoch;
+              wave_task.epoch = execution_epoch(a);
               wave_task.index = static_cast<std::uint32_t>(wave_begin);
               wave_task.expert = static_cast<std::uint16_t>(remote_node);
               wave_task.kind = static_cast<std::uint8_t>(
@@ -1747,11 +1752,10 @@ __device__ __forceinline__ void rdma_role(
           }
         }
 
-        if (outbound_directory_issued &&
-            outbound_wave == outbound_wave_end &&
+        if (outbound_directory_issued && outbound_wave == outbound_wave_end &&
             persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                control.dispatch[context]
-                    .outbound_pack_complete.value) >= a.epoch) {
+                control.dispatch[context].outbound_pack_complete.value) >=
+                execution_epoch(a)) {
           outbound_terminal = true;
           progressed = true;
         }
@@ -1767,12 +1771,10 @@ __device__ __forceinline__ void rdma_role(
             waves_published == inbound_directory.wave_count) {
           inbound_terminal = true;
           atomicAdd(&scheduler[5ULL + 2ULL * a.world], 1ULL);
-          WEFTMOE_TIMELINE_RECORD(
-              a.timeline, RemoteSignalObserved, GinDispatch, context,
-              waves_published, a.epoch);
-          WEFTMOE_TIMELINE_RECORD(
-              a.timeline, XFirstRemoteSignal, GinDispatch, context,
-              waves_published, a.epoch);
+          WEFTMOE_TIMELINE_RECORD(a.timeline, RemoteSignalObserved, GinDispatch,
+                                  context, waves_published, execution_epoch(a));
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstRemoteSignal, GinDispatch,
+                                  context, waves_published, execution_epoch(a));
           progressed = true;
         }
       }
@@ -1797,9 +1799,8 @@ __device__ __forceinline__ void rdma_role(
           __nanosleep(forward_tuning::kTransportIdleNanosleep);
       }
     }
-    WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion,
-                            GinDispatch, context, issued_completions,
-                            a.epoch);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchLocalCompletion, GinDispatch,
+                            context, issued_completions, execution_epoch(a));
 
     const auto directory = send_directory[send_directory_index];
     auto &record = context_completion[

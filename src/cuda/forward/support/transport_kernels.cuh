@@ -380,13 +380,22 @@ __global__ void initialize_forward_generation_signals_kernel(
     void *local_base, void **peer_bases, std::size_t ingress_published_offset,
     std::size_t outgoing_sequence_offset, std::size_t setup_epoch_offset,
     std::size_t gin_local_compute_ready_offset,
-    std::size_t forward_x_arrived_rows_offset,
-    std::uint64_t mtile_count, std::size_t forward_completion_offset,
+    std::size_t forward_x_arrived_rows_offset, std::uint64_t mtile_count,
+    std::size_t forward_completion_offset,
     std::size_t forward_context_completion_offset,
     std::uint32_t context_completion_capacity, std::uint64_t generation,
-    std::uint32_t rank,
-    std::uint32_t world, std::uint32_t channels, unsigned long long epoch,
-    std::uint32_t first_peer, std::uint32_t peer_count) {
+    std::uint32_t rank, std::uint32_t world, std::uint32_t channels,
+    unsigned long long epoch, std::uint32_t first_peer,
+    std::uint32_t peer_count, unsigned long long *runtime_epoch,
+    const DeviceDispatchRuntime *runtime) {
+  if (runtime_epoch) {
+    if (threadIdx.x == 0U)
+      atomicAdd(runtime_epoch, 1ULL);
+    __syncthreads();
+    epoch = *runtime_epoch;
+  }
+  if (runtime)
+    mtile_count = runtime->sizes.mtile_count;
   const auto index = static_cast<std::uint32_t>(threadIdx.x);
   auto *incoming = peer_at<unsigned long long>(local_base,
                                                 ingress_published_offset);
@@ -580,7 +589,8 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
   // sequence transition and no competing atomic-return order is observable.
   if (blockIdx.x == 0) {
     for (std::uint64_t packet = 0;
-         packet < a.dispatch.sizes.packet_count && !local_p2p_cancelled(a);
+         packet < dispatch_sizes(a.dispatch).packet_count &&
+         !local_p2p_cancelled(a);
          ++packet) {
       const auto packet_header = a.dispatch.packet_headers[packet];
       const auto link = static_cast<std::uint64_t>(packet_header.channel);
@@ -657,7 +667,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
         const auto route = packet_header.local_token_id *
                                a.dispatch.identity.top_k +
                            target.topk_slot;
-        if (route >= a.dispatch.sizes.route_count) {
+        if (route >= dispatch_sizes(a.dispatch).route_count) {
           if (lane == 0) {
             status->error_packet = static_cast<unsigned int>(packet);
             status->error_field = 21U;
@@ -778,8 +788,8 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
     if (lane == 0)
       shared_value = 0;
     __syncthreads();
-    for (std::uint64_t row = lane; row < a.dispatch.sizes.incoming_row_count;
-         row += blockDim.x)
+    for (std::uint64_t row = lane;
+         row < dispatch_sizes(a.dispatch).incoming_row_count; row += blockDim.x)
       if (a.dispatch.incoming_rows[row].source_rank == source)
         atomicAdd(&shared_value, 1ULL);
     __syncthreads();
@@ -812,15 +822,18 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
       const auto header = local_ingress_headers[physical];
       if (lane == 0)
         stage_clock = device_globaltimer_ns();
-      const auto incoming = header.dst_row < a.dispatch.sizes.incoming_row_count
-                                ? a.dispatch.incoming_rows[header.dst_row]
-                                : DeviceIncomingRowRecord{};
-      if (header.schema_version != transport::kActivationTransportSchemaVersion ||
+      const auto incoming =
+          header.dst_row < dispatch_sizes(a.dispatch).incoming_row_count
+              ? a.dispatch.incoming_rows[header.dst_row]
+              : DeviceIncomingRowRecord{};
+      if (header.schema_version !=
+              transport::kActivationTransportSchemaVersion ||
           header.source_rank != source || header.destination_rank != a.rank ||
           header.generation != a.dispatch.identity.generation ||
           header.sequence != sequence ||
-          header.dst_row >= a.dispatch.sizes.incoming_row_count ||
-          incoming.source_rank != source || incoming.expert_id != header.expert_id) {
+          header.dst_row >= dispatch_sizes(a.dispatch).incoming_row_count ||
+          incoming.source_rank != source ||
+          incoming.expert_id != header.expert_id) {
         if (lane == 0) {
           status->error_packet = static_cast<unsigned int>(sequence);
           status->error_field = 22U;
@@ -878,11 +891,11 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
 
   while (!local_p2p_cancelled(a) && atomicAdd(&status->error, 0U) == 0U &&
          (atomicAdd(&status->packets_done, 0ULL) <
-              a.dispatch.sizes.packet_count ||
+              dispatch_sizes(a.dispatch).packet_count ||
           atomicAdd(&status->incoming_done, 0ULL) <
-              a.dispatch.sizes.incoming_row_count ||
+              dispatch_sizes(a.dispatch).incoming_row_count ||
           atomicAdd_system(&status->combine_done, 0ULL) <
-              a.dispatch.sizes.route_count)) {
+              dispatch_sizes(a.dispatch).route_count)) {
   }
   if (local_p2p_cancelled(a) && lane == 0)
     atomicCAS(&status->error, 0U, 2U);
@@ -930,7 +943,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
 #if !WEFTMOE_DEBUG_VALIDATE
 __global__ void local_p2p_bulk_dispatch_kernel(LocalP2pKernelArgs a) {
   const auto route = static_cast<std::uint64_t>(blockIdx.x);
-  if (route >= a.dispatch.sizes.route_count)
+  if (route >= dispatch_sizes(a.dispatch).route_count)
     return;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (route == 0 && threadIdx.x == 0)
@@ -1000,13 +1013,13 @@ __global__ void local_p2p_publish_dispatch_kernel(LocalP2pKernelArgs a) {
     atomicExch_system(&signal[a.rank * a.channels], a.epoch);
   }
   if (threadIdx.x == 0) {
-    status->packets_done = a.dispatch.sizes.packet_count;
-    status->fanout_done = a.dispatch.sizes.route_count;
+    status->packets_done = dispatch_sizes(a.dispatch).packet_count;
+    status->fanout_done = dispatch_sizes(a.dispatch).route_count;
     status->raw_cross_node_payload_bytes =
-        a.dispatch.sizes.route_count * a.hidden *
+        dispatch_sizes(a.dispatch).route_count * a.hidden *
         sizeof(transport::BFloat16);
     status->deduplicated_cross_node_payload_bytes =
-        a.dispatch.sizes.packet_count * a.hidden *
+        dispatch_sizes(a.dispatch).packet_count * a.hidden *
         sizeof(transport::BFloat16);
     status->dispatch_put_ticks = device_globaltimer_ns() - status->start_clock;
   }
@@ -1033,7 +1046,7 @@ __global__ void local_p2p_wait_dispatch_kernel(LocalP2pKernelArgs a) {
 
 __global__ void local_p2p_bulk_return_kernel(LocalP2pKernelArgs a) {
   const auto row = static_cast<std::uint64_t>(blockIdx.x);
-  if (row >= a.dispatch.sizes.incoming_row_count)
+  if (row >= dispatch_sizes(a.dispatch).incoming_row_count)
     return;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (atomicAdd(&status->error, 0U) != 0U)
@@ -1066,7 +1079,7 @@ __global__ void local_p2p_publish_return_kernel(LocalP2pKernelArgs a) {
     atomicExch_system(&signal[a.rank * a.channels], a.epoch);
   }
   if (threadIdx.x == 0)
-    status->incoming_done = a.dispatch.sizes.incoming_row_count;
+    status->incoming_done = dispatch_sizes(a.dispatch).incoming_row_count;
 }
 
 __global__ void local_p2p_wait_return_kernel(LocalP2pKernelArgs a) {
@@ -1088,8 +1101,8 @@ __global__ void local_p2p_wait_return_kernel(LocalP2pKernelArgs a) {
     status->synthetic_ticks =
         device_globaltimer_ns() - status->dispatch_complete_clock;
     status->relay_ticks = status->synthetic_ticks;
-    status->synthetic_done = a.dispatch.sizes.route_count;
-    status->combine_done = a.dispatch.sizes.route_count;
+    status->synthetic_done = dispatch_sizes(a.dispatch).route_count;
+    status->combine_done = dispatch_sizes(a.dispatch).route_count;
   }
 }
 

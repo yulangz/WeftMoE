@@ -9,15 +9,17 @@ __global__ void backward_build_row_directory_kernel(BackwardKernelArgs a) {
   auto *mapping = peer_at<unsigned int>(a.local_base, a.compact_to_padded_offset);
   if (threadIdx.x == 0U) {
     unsigned long long cursor = 0ULL;
-    for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e) {
+    for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
+         ++e) {
       offsets[e] = cursor;
       rows[e] = ((a.dispatch.expert_row_count[e] + 127ULL) / 128ULL) * 128ULL;
       cursor += rows[e];
     }
-    offsets[a.dispatch.sizes.owned_expert_count] = cursor;
+    offsets[dispatch_sizes(a.dispatch).owned_expert_count] = cursor;
   }
   __syncthreads();
-  for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e)
+  for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
+       ++e)
     for (unsigned long long row = threadIdx.x; row < a.dispatch.expert_row_count[e]; row += blockDim.x)
       mapping[a.dispatch.expert_row_prefix[e] + row] =
           static_cast<unsigned int>(offsets[e] + row);
@@ -40,9 +42,10 @@ __device__ __forceinline__ void backward_load_row_geometry(BackwardKernelArgs &a
   __shared__ unsigned long long geometry[2];
   if (threadIdx.x == 0U) {
     const auto *offsets = peer_at<const unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
-    geometry[0] = offsets[a.dispatch.sizes.owned_expert_count];
+    geometry[0] = offsets[dispatch_sizes(a.dispatch).owned_expert_count];
     unsigned long long active = 0;
-    for (unsigned int e = 0; e < a.dispatch.sizes.owned_expert_count; ++e)
+    for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
+         ++e)
       active += a.dispatch.expert_row_count[e] != 0ULL;
     geometry[1] = active;
   }
@@ -61,7 +64,7 @@ __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
                                                a.setup_epoch_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(setup[a.rank]);
-    published.store(a.epoch, ::cuda::memory_order_release);
+    published.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
   auto *local_setup = peer_at<unsigned long long>(a.local_base,
@@ -70,14 +73,14 @@ __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
        peer += blockDim.x) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(local_setup[peer]);
-    while (published.load(::cuda::memory_order_acquire) != a.epoch)
+    while (published.load(::cuda::memory_order_acquire) != execution_epoch(a))
       __nanosleep(backward_tuning::kSetupIdleNanosleep);
   }
 }
 
 __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
   const auto route = static_cast<std::uint64_t>(blockIdx.x);
-  if (route >= a.dispatch.sizes.route_count)
+  if (route >= dispatch_sizes(a.dispatch).route_count)
     return;
   const auto destination = a.dispatch.route_dst_rank[route];
   const auto compact_destination_row = a.dispatch.route_dst_row[route];
@@ -99,7 +102,7 @@ __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
         a.peer_bases[destination], a.dispatch_ready_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[compact_destination_row]);
-    marker.store(a.epoch, ::cuda::memory_order_release);
+    marker.store(execution_epoch(a), ::cuda::memory_order_release);
   }
 }
 
@@ -115,8 +118,8 @@ __global__ void backward_wait_for_dispatch_rows_kernel(BackwardKernelArgs a,
   // Each fixed row has one producer.  This kernel is only the correctness
   // scaffold's launch boundary; the persistent implementation consumes the
   // same marker directly when it claims a ready tile.
-  while (marker.load(::cuda::memory_order_acquire) != a.epoch)
-    __nanosleep(backward_tuning::kReduceIdleNanosleep);
+    while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
+      __nanosleep(backward_tuning::kReduceIdleNanosleep);
 }
 
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
@@ -264,7 +267,7 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
         a.peer_bases[header.source_rank], a.return_ready_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[header.route_index]);
-    marker.store(a.epoch, ::cuda::memory_order_release);
+    marker.store(execution_epoch(a), ::cuda::memory_order_release);
   }
 }
 
@@ -315,7 +318,7 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
     source_rows[warp][position] = source;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);
-    while (marker.load(::cuda::memory_order_acquire) != a.epoch)
+    while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
       __nanosleep(backward_tuning::kReduceIdleNanosleep);
   }
   __syncwarp();

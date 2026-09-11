@@ -88,8 +88,8 @@ struct TransportKernelArgs {
 
 __global__ void activation_transport_persistent_kernel(TransportKernelArgs a) {
   const auto lane = static_cast<std::uint32_t>(threadIdx.x);
-  const auto route_count = a.dispatch.sizes.route_count;
-  const auto packet_count = a.dispatch.sizes.packet_count;
+  const auto route_count = dispatch_sizes(a.dispatch).route_count;
+  const auto packet_count = dispatch_sizes(a.dispatch).packet_count;
   __shared__ unsigned long long selected_packet;
   __shared__ unsigned long long selected_token;
   __shared__ unsigned long long packet_scan_cursor;
@@ -674,7 +674,7 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
   // Notify packets are already in deterministic (destination node, token)
   // order. One packet carries one token payload and all expert fan-out rows.
   for (std::uint64_t packet = 0;
-       packet < a.dispatch.sizes.packet_count; ++packet) {
+       packet < dispatch_sizes(a.dispatch).packet_count; ++packet) {
     const auto descriptor = a.dispatch.packet_headers[packet];
     const auto fanout_begin = a.dispatch.packet_fanout_offsets[packet];
     const auto fanout_end = a.dispatch.packet_fanout_offsets[packet + 1U];
@@ -767,7 +767,7 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
 
   if (lane == 0) {
     for (std::uint32_t index = 0;
-         index < a.dispatch.sizes.incoming_signal_count; ++index) {
+         index < dispatch_sizes(a.dispatch).incoming_signal_count; ++index) {
       const auto signal = a.dispatch.incoming_proxy_signals[index];
       if (signal.source_node != a.node)
         remote_incoming += signal.expected_packets;
@@ -779,7 +779,7 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
 
   unsigned long long return_count = 0;
   for (std::uint32_t signal_index = 0;
-       signal_index < a.dispatch.sizes.incoming_signal_count;
+       signal_index < dispatch_sizes(a.dispatch).incoming_signal_count;
        ++signal_index) {
     const auto signal = a.dispatch.incoming_proxy_signals[signal_index];
     if (signal.source_node == a.node)
@@ -839,7 +839,7 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
   // Map the packed return payload back to the original route slots using the
   // same deterministic outgoing packet/fan-out order which formed the put.
   for (std::uint64_t packet = 0;
-       packet < a.dispatch.sizes.packet_count; ++packet) {
+       packet < dispatch_sizes(a.dispatch).packet_count; ++packet) {
     const auto descriptor = a.dispatch.packet_headers[packet];
     if (descriptor.destination_node == a.node)
       continue;
@@ -875,11 +875,11 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
   }
   __syncthreads();
   if (lane == 0) {
-    status->packets_done = a.dispatch.sizes.packet_count;
-    status->fanout_done = a.dispatch.sizes.fanout_count;
-    status->synthetic_done = a.dispatch.sizes.incoming_row_count;
-    status->combine_done = a.dispatch.sizes.route_count;
-    status->incoming_done = a.dispatch.sizes.incoming_row_count;
+    status->packets_done = dispatch_sizes(a.dispatch).packet_count;
+    status->fanout_done = dispatch_sizes(a.dispatch).fanout_count;
+    status->synthetic_done = dispatch_sizes(a.dispatch).incoming_row_count;
+    status->combine_done = dispatch_sizes(a.dispatch).route_count;
+    status->incoming_done = dispatch_sizes(a.dispatch).incoming_row_count;
     status->reduced_tokens = a.dispatch.identity.num_tokens;
     status->raw_cross_node_payload_bytes =
         remote_routes * a.hidden * sizeof(transport::BFloat16);
