@@ -451,7 +451,7 @@ __device__ std::uint32_t forward_locality_mblock_expert(
   if (a.forward_fc1_locality_group <= 1U)
     return forward_wavefront_mblock_expert(a, ordinal, local_mblock);
 
-  constexpr std::uint64_t kStartupMblocks = 2ULL;
+  constexpr std::uint64_t kStartupMblocks = forward_tuning::kStartupMblocks;
   for (std::uint64_t tile = 0; tile < kStartupMblocks; ++tile) {
     for (std::uint32_t expert = 0;
          expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
@@ -681,9 +681,6 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
   return enabled;
 }
 
-#include "cuda/persistent_v3/forward/reduce_queue.cuh"
-#include "cuda/persistent_v3/forward/opportunistic_reduce.cuh"
-#include "cuda/persistent_v3/forward/return_pipeline.cuh"
 #include "cuda/persistent_v3/forward/dispatch_pipeline.cuh"
 #include "cuda/persistent_v3/forward/finalize_pipeline.cuh"
 

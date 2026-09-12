@@ -1,3 +1,5 @@
+#include "cuda/communication/chunk_ring.cuh"
+#include "cuda/communication/local_notification.cuh"
 #include "cuda/primitives/hopper.cuh"
 // Dedicated transport grid compilation; compute keeps its own register budget.
 #define WEFTMOE_FORWARD_TRANSPORT_TU 1

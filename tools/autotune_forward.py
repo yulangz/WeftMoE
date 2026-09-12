@@ -78,7 +78,6 @@ PARAMETER_MACROS = {
     "fc2_tma_store": "WEFTMOE_FWD_FC2_TMA_STORE",
     "rdma_ctas": "WEFTMOE_FWD_RDMA_CTAS",
     "relay_ctas": "WEFTMOE_FWD_RELAY_CTAS",
-    "rdma_control_warps": "WEFTMOE_FWD_RDMA_CONTROL_WARPS",
     "relay_tma_warps": "WEFTMOE_FWD_RELAY_TMA_WARPS",
     "local_dispatch_tma_warps": "WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS",
     "relay_scatter_warps": "WEFTMOE_FWD_RELAY_SCATTER_WARPS",
@@ -86,9 +85,6 @@ PARAMETER_MACROS = {
         "WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS",
     "dispatch_publish_batch_rows":
         "WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS",
-    "return_batch_rows": "WEFTMOE_FWD_RETURN_BATCH_ROWS",
-    "return_max_inflight": "WEFTMOE_FWD_RETURN_MAX_INFLIGHT",
-    "registered_output": "WEFTMOE_FWD_REGISTERED_OUTPUT",
     "relay_local_return": "WEFTMOE_FWD_RELAY_LOCAL_RETURN",
     "local_route_batch_rows": "WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS",
     "startup_mblocks": "WEFTMOE_FWD_STARTUP_MBLOCKS",
@@ -117,7 +113,6 @@ PARAMETER_ALIASES = {"local_return_tma_warps": "relay_tma_warps"}
 
 BOOLEAN_PARAMETERS = {
     "fc2_tma_store",
-    "registered_output",
     "relay_local_return",
 }
 
@@ -242,18 +237,12 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         _require(config["relay_ctas"] % config["rdma_ctas"] == 0,
                  "relay_ctas must be a multiple of rdma_ctas")
     _require(config["relay_local_return"], "local Return requires relay_local_return=true")
-    _require(config["rdma_control_warps"] == 2,
-             "the current RDMA protocol has exactly issue and completion warps")
     _require_choice(config, "relay_tma_warps", (0, 4, 8, 12))
     _require_choice(config, "local_dispatch_tma_warps", (4, 8, 12))
     _require_choice(config, "relay_scatter_warps", (4, 8, 12))
     _require_choice(config, "local_return_batch_rows", (32, 64, 128, 256, 512, 1024))
     _require_choice(config, "dispatch_publish_batch_rows",
                     (4, 8, 16, 32, 64, 128))
-    _require_choice(config, "return_batch_rows", (32, 64, 128, 256, 512, 1024))
-    _require_choice(config, "return_max_inflight", (0, 4, 8, 16, 32, 64))
-    _require(not config["fc2_tma_store"] or config["registered_output"],
-             "GIN FC2 TMA store requires registered_output=true")
 
     _require_choice(config, "local_route_batch_rows", (32, 64, 128, 256))
     _require_choice(config, "startup_mblocks", (1, 2, 4))

@@ -10,14 +10,12 @@
 namespace forward_compute_detail {
 
 template <bool StaticLocal>
-__device__ __forceinline__ void reduce_one_token(
-    const ForwardKernelArgs &a, std::uint64_t token,
-    TransportDeviceStatus *status, transport::BFloat16 *contribution,
-    unsigned long long *source_ready, unsigned long long *route_ready,
-    const unsigned long long *direct_source_compact_index,
-    const transport::BFloat16 *direct_return_receive,
-    transport::BFloat16 *combined,
-    transport_state::GenerationCompletionVector *completion) {
+__device__ __forceinline__ void
+reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
+                 TransportDeviceStatus *status,
+                 transport::BFloat16 *contribution,
+                 unsigned long long *route_ready, transport::BFloat16 *combined,
+                 transport_state::GenerationCompletionVector *completion) {
   const auto lane = threadIdx.x & 31U;
 #if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
@@ -30,34 +28,16 @@ __device__ __forceinline__ void reduce_one_token(
 
   unsigned long long lane_route = 0ULL;
   unsigned long long lane_row = 0ULL;
-  unsigned int lane_direct = 0U;
   if (lane < a.dispatch.identity.top_k) {
     const auto slot =
         a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
     lane_route = token * a.dispatch.identity.top_k + slot;
     lane_row = lane_route;
-    if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
-      // The queue-slot acquire already covers the release sequence of all
-      // top-k publishers, including payload and direct-map stores.
-      if (a.use_gin &&
-          a.dispatch.route_dst_node[lane_route] != a.node) {
-        lane_row = direct_source_compact_index[lane_route];
-        lane_direct = 1U;
-      }
-    } else if (a.use_gin) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
+    // Queue/scan consumers have already acquired every contribution. The
+    // static scheduler instead waits for each route's local arrival marker.
+    if (!a.forward_dynamic_reduce_queue && !a.forward_dynamic_reduce_scan) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
           route_ready[lane_route]);
-      while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
-             !forward_cancelled(a))
-        __nanosleep(forward_tuning::kTaskIdleNanosleep);
-      if (a.dispatch.route_dst_node[lane_route] != a.node) {
-        lane_row = direct_source_compact_index[lane_route];
-        lane_direct = 1U;
-      }
-    } else {
-      const auto destination = a.dispatch.route_dst_rank[lane_route];
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          source_ready[destination * a.channels]);
       while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
              !forward_cancelled(a))
         __nanosleep(forward_tuning::kTaskIdleNanosleep);
@@ -71,9 +51,7 @@ __device__ __forceinline__ void reduce_one_token(
     float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (std::uint32_t order = 0; order < a.dispatch.identity.top_k; ++order) {
       const auto row = __shfl_sync(0xffffffffU, lane_row, order);
-      const auto direct =
-          __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
-      const auto *source = direct ? direct_return_receive : contribution;
+      const auto *source = contribution;
       const auto packed =
           reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
@@ -120,21 +98,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *contribution =
       peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
-  auto *source_ready =
-      peer_at<unsigned long long>(a.local_base, a.outgoing_sequence_offset);
-  auto *route_ready = peer_at<unsigned long long>(
-      a.local_base, a.return_ready_epoch_offset);
-  const auto *direct_source_compact_index =
-      peer_at<const unsigned long long>(
-          a.local_base, a.forward_source_route_to_return_row_offset);
-  const auto *direct_return_receive =
-      a.use_gin
-          ? reinterpret_cast<const transport::BFloat16 *>(
-                static_cast<const std::byte *>(a.gin_window_base) +
-                a.gin_return_receive_offset)
-          : nullptr;
-  auto *combined =
-      peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
+  auto *route_ready =
+      peer_at<unsigned long long>(a.local_base, a.return_ready_epoch_offset);
+  auto *combined = a.output;
   transport_state::GenerationCompletionVector *completion = nullptr;
   if constexpr (!StaticLocal) {
     if (a.use_gin)
@@ -229,10 +195,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
         token = __shfl_sync(0xffffffffU, token, 0U);
         token_ready = __shfl_sync(0xffffffffU, token_ready, 0U);
         if (token_ready != 0U)
-          reduce_one_token<StaticLocal>(
-              a, token, status, contribution, source_ready, route_ready,
-              direct_source_compact_index, direct_return_receive, combined,
-              completion);
+          reduce_one_token<StaticLocal>(a, token, status, contribution,
+                                        route_ready, combined, completion);
       }
       __syncthreads();
     }
@@ -296,10 +260,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
         }
         owner = __shfl_sync(0xffffffffU, owner, 0U);
         if (owner != 0U) {
-          reduce_one_token<StaticLocal>(
-              a, token, status, contribution, source_ready, route_ready,
-              direct_source_compact_index, direct_return_receive, combined,
-              completion);
+          reduce_one_token<StaticLocal>(a, token, status, contribution,
+                                        route_ready, combined, completion);
           if (lane == 0U) {
             ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device>
                 state(token_state[token]);
@@ -322,10 +284,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                static_cast<std::uint64_t>(role_index) * kReduceWarps + warp;
            token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
            token += static_cast<std::uint64_t>(role_count) * kReduceWarps) {
-        reduce_one_token<StaticLocal>(
-            a, token, status, contribution, source_ready, route_ready,
-            direct_source_compact_index, direct_return_receive, combined,
-            completion);
+        reduce_one_token<StaticLocal>(a, token, status, contribution,
+                                      route_ready, combined, completion);
       }
     }
   }

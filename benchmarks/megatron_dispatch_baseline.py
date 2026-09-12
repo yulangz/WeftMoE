@@ -103,9 +103,14 @@ def measure_stage_pipeline(function, stage_names, warmups, iterations):
     cuda_samples = []
     wall_samples = []
     critical_rank_counts = [0] * dist.get_world_size()
+    events = [torch.cuda.Event(enable_timing=True)
+              for _ in range(len(stage_names) + 1)]
+    # CUDA events allocate lazily on their first record. Keep that setup out
+    # of the profiled pipeline, then reuse the events after each completion.
+    for event in events:
+        event.record()
+    events[-1].synchronize()
     for _ in range(iterations):
-        events = [torch.cuda.Event(enable_timing=True)
-                  for _ in range(len(stage_names) + 1)]
         dist.barrier()
         torch.cuda.synchronize()
         wall_begin = time.perf_counter_ns()
@@ -415,6 +420,8 @@ def main():
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--inference", action="store_true",
+                        help="disable autograd and retained backward state")
     parser.add_argument("--save-output-dir")
     parser.add_argument("--trace-dir")
     parser.add_argument(
@@ -433,6 +440,7 @@ def main():
         parser.error("--stage-profile requires --expert-body te-grouped-mlp")
     if args.stage_profile and args.dispatcher != "flex":
         parser.error("--stage-profile currently profiles Flex+DeepEP only")
+    torch.set_grad_enabled(not args.inference)
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -488,6 +496,8 @@ def main():
         experts_builder = layer_spec.submodules.mlp.submodules.experts
         experts_module = experts_builder(
             local_experts, config, pg_collection=get_default_pg_collection())
+        if args.inference:
+            experts_module.eval()
         actual_weight_parameters = initialize_weftmoe_forward_weights(
             experts_module, rank * local_experts, args.hidden,
             args.intermediate)
@@ -607,6 +617,32 @@ def main():
         returned = dispatcher.token_combine(combine_input)
         return dispatcher.combine_postprocess(returned)
 
+    def communication_roundtrip(events=None):
+        # Dispatch already produces an expert-major BF16 [rows, hidden]
+        # tensor. Return it directly, with no fake GEMM, cast, gate product,
+        # or payload initialization inside the communication measurement.
+        def mark(index):
+            if events is not None:
+                events[index].record()
+
+        mark(0)
+        local_hidden, local_probs = dispatcher.dispatch_preprocess(
+            hidden, routing, probabilities)
+        mark(1)
+        remote_hidden, remote_probs = dispatcher.token_dispatch(
+            local_hidden, local_probs)
+        mark(2)
+        expert_input, _, _ = dispatcher.dispatch_postprocess(
+            remote_hidden, remote_probs)
+        mark(3)
+        combine_input = dispatcher.combine_preprocess(expert_input)
+        mark(4)
+        returned = dispatcher.token_combine(combine_input)
+        mark(5)
+        output = dispatcher.combine_postprocess(returned)
+        mark(6)
+        return output
+
     stage_names = (
         "dispatch_preprocess",
         "deepep_dispatch",
@@ -721,6 +757,12 @@ def main():
             common = common + product
         return common.to(torch.bfloat16)
 
+    # In the Flex path the communication buffer is created lazily by the first
+    # dispatch. Measure that full call before any warmups or isolated stages.
+    # Subsequent calls still recompute routing and allocate dynamic tensors;
+    # the communication buffer and PyTorch allocator cache can be reused.
+    first_forward_e2e = (measure(full_forward_roundtrip, 0, 1)
+                         if experts_module is not None else None)
     measured_runs = []
     for run in range(args.runs):
         run_result = {
@@ -737,6 +779,8 @@ def main():
             })
         run_result["native_identity_e2e"] = measure(
             full_roundtrip, args.warmups, args.iterations)
+        run_result["communication_e2e"] = measure(
+            communication_roundtrip, args.warmups, args.iterations)
         if args.dispatcher == "alltoall":
             run_result["common_semantics_identity_e2e"] = measure(
                 common_semantics_roundtrip, args.warmups, args.iterations)
@@ -749,6 +793,7 @@ def main():
         measured_runs.append(run_result)
 
     stage_profile = None
+    communication_profile = None
     if args.stage_profile:
         reference = full_forward_roundtrip()
         staged = staged_forward_roundtrip(None)
@@ -774,6 +819,12 @@ def main():
         )
         stage_profile["output_byte_identical_to_module_forward"] = True
         stage_profile["output_max_abs_error"] = stage_max_abs.item()
+        communication_profile = measure_stage_pipeline(
+            communication_roundtrip,
+            stage_names[:3] + stage_names[7:],
+            args.warmups,
+            args.iterations,
+        )
 
     native_output = full_roundtrip()
     common_output = (common_semantics_roundtrip()
@@ -936,6 +987,15 @@ def main():
         "output_validation": output_validation,
         "runs": measured_runs,
         "measurement_scope": "full-forward",
+        "timing_scope": "routing-buffer-dispatch-experts-combine",
+        "autograd_enabled": torch.is_grad_enabled(),
+        "first_forward_e2e": first_forward_e2e,
+        "communication_reference": (
+            "fresh routing and buffer preparation; dispatch, local expert "
+            "permute/unpermute and native combine; no GEMM, activation, "
+            "gate product, or synthetic payload fill"
+        ),
+        "communication_profile": communication_profile,
     }
     if native_wall_means:
         output["native_identity_e2e_host_wall_cross_run"] = {

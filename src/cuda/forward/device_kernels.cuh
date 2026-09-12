@@ -59,7 +59,7 @@ void local_p2p_forward_megakernel(
   const bool stream_remote_dispatch =
       KernelRole == ForwardKernelRole::TransportOnly &&
       remote_backend_enabled<StaticLocal>(a.use_gin) &&
-      a.dispatch.identity.num_nodes == 2U &&
+      a.dispatch.identity.num_nodes >= 2U &&
       forward_rdma_ctas == persistent_v3::kRdmaCtaCount &&
       forward_relay_ctas == configured_relay_ctas &&
       forward_relay_ctas >= persistent_v3::kRdmaCtaCount &&
@@ -91,8 +91,6 @@ void local_p2p_forward_megakernel(
       peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
-  auto *fc1_published = peer_at<unsigned long long>(
-      a.local_base, a.forward_fc1_published_offset);
   auto *forward_compute_pair_mailboxes =
       peer_at<persistent_v3::ForwardComputePairMailbox>(
           a.local_base, a.forward_compute_pair_mailboxes_offset);
@@ -100,16 +98,10 @@ void local_p2p_forward_megakernel(
       a.local_base, a.forward_reduce_route_count_offset);
   auto *forward_reduce_ready_token = peer_at<unsigned long long>(
       a.local_base, a.forward_reduce_ready_token_offset);
-  auto *forward_return_row_map = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_row_map_offset);
-  auto *forward_return_row_to_source_route = peer_at<unsigned long long>(
-      a.local_base, a.forward_return_row_to_source_route_offset);
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
-  auto *ab_cache =
-      a.retain_backward_state
-          ? peer_at<transport::BFloat16>(a.local_base,
-                                         a.forward_ab_cache_offset)
-          : static_cast<transport::BFloat16 *>(nullptr);
+  auto *ab_cache = a.retain_backward_state
+                       ? a.saved_ab
+                       : static_cast<transport::BFloat16 *>(nullptr);
   const auto *canonical_gates =
       peer_at<const float>(a.local_base, a.canonical_gates_offset);
   if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
@@ -163,7 +155,7 @@ void local_p2p_forward_megakernel(
               (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
               forward_tuning::kFc2TileN;
           completion_task(completion, transport_state::TaskClass::DispatchWave)
-              .expected = dispatch_waves;
+              .expected = stream_remote_dispatch ? 0ULL : dispatch_waves;
           unsigned long long relay_packets = 0ULL;
           for (std::uint32_t index = 0;
                index < dispatch_sizes(a.dispatch).incoming_signal_count;
@@ -186,11 +178,14 @@ void local_p2p_forward_megakernel(
               .expected = 0ULL;
           completion->return_local_completion_expected = 0ULL;
           completion->directory_expected =
-              static_cast<unsigned long long>(a.dispatch.identity.num_nodes -
-                                              1U) *
-              a.gin_context_count;
+              stream_remote_dispatch ? 0ULL
+                                     : static_cast<unsigned long long>(
+                                           a.dispatch.identity.num_nodes - 1U) *
+                                           a.gin_context_count;
           completion->dispatch_local_completion_expected =
-              completion->directory_expected + dispatch_waves;
+              stream_remote_dispatch
+                  ? 0ULL
+                  : completion->directory_expected + dispatch_waves;
         }
       }
       // This release replaces the first transport-grid barrier.  No other CTA
@@ -252,7 +247,6 @@ void local_p2p_forward_megakernel(
          mtile < scheduler[3];
          mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
       fc1_done[mtile] = execution_epoch(a) << 32U;
-      fc1_published[mtile] = 0ULL;
     }
     for (std::uint64_t pair =
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -263,14 +257,6 @@ void local_p2p_forward_megakernel(
       forward_compute_pair_mailboxes[pair].tasks[1] = 0ULL;
       forward_compute_pair_mailboxes[pair].metadata = 0ULL;
     }
-    // The allocation is a generation-local canonical->compact row map for
-    // remote Return. Clear only the actual canonical rows; peer proxies fill
-    // remote-route entries after consuming the immutable Dispatch directory.
-    for (std::uint64_t row =
-             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         row < dispatch_sizes(a.dispatch).incoming_row_count;
-         row += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-      forward_return_row_map[row] = 0ULL;
     if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
       for (std::uint64_t token =
                static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -335,6 +321,11 @@ void local_p2p_forward_megakernel(
           forward_locality_mblock_expert(a, mblock, local_mblock);
       claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
                        static_cast<std::uint32_t>(local_mblock);
+#if __has_include(<nccl_device.h>)
+      if (stream_local_dispatch || stream_remote_dispatch)
+        forward_dispatch_detail::initialize_input_group(
+            a, mblock, expert, static_cast<std::uint32_t>(local_mblock));
+#endif
     }
     // FC1-ready tasks, then FC2 M-block descriptors and their private N-tile
     // ticket counters, live after the immutable M-block mapping.  The FC2
@@ -1457,8 +1448,7 @@ void local_p2p_forward_megakernel(
                     reinterpret_cast<std::uint32_t *>(
                         ab_cache)[output_index / 2ULL] = a_pair;
                     const auto b_index =
-                        a.max_destination_rows * a.intermediate +
-                        output_index;
+                        a.saved_rows * a.intermediate + output_index;
                     reinterpret_cast<std::uint32_t *>(
                         ab_cache)[b_index / 2ULL] = b_pair;
                   }
@@ -1486,8 +1476,7 @@ void local_p2p_forward_megakernel(
                       if (ab_cache != nullptr) {
                         ab_cache[output_index] =
                             transport::BFloat16{a_bits};
-                        ab_cache[a.max_destination_rows * a.intermediate +
-                                 output_index] =
+                        ab_cache[a.saved_rows * a.intermediate + output_index] =
                             transport::BFloat16{b_bits};
                       }
                       s[output_index] = transport::BFloat16{float_to_bf16_bits(
@@ -1824,17 +1813,7 @@ void local_p2p_forward_megakernel(
         peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
     auto *source_ready =
         peer_at<unsigned long long>(a.local_base, a.outgoing_sequence_offset);
-    const auto *direct_source_compact_index =
-        peer_at<const unsigned long long>(
-            a.local_base, a.forward_source_route_to_return_row_offset);
-    const auto *direct_return_receive =
-        a.use_gin
-            ? reinterpret_cast<const transport::BFloat16 *>(
-                  static_cast<const std::byte *>(a.gin_window_base) +
-                  a.gin_return_receive_offset)
-            : nullptr;
-    auto *combined =
-        peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
+    auto *combined = a.output;
     constexpr std::uint32_t kWarpsPerCta = 12U;
     constexpr std::uint32_t kWarpsPerToken = 1U;
     constexpr std::uint32_t kTokensPerCta = kWarpsPerCta / kWarpsPerToken;
@@ -1858,7 +1837,6 @@ void local_p2p_forward_megakernel(
         atomicMin(&status->reduced_tokens, device_globaltimer_ns());
       unsigned long long lane_route = 0ULL;
       unsigned long long lane_row = 0ULL;
-      unsigned int lane_direct = 0U;
       if (lane < a.dispatch.identity.top_k) {
         const auto slot =
             a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
@@ -1870,11 +1848,6 @@ void local_p2p_forward_megakernel(
         while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
                !forward_cancelled(a)) {
         }
-        if (a.use_gin &&
-            a.dispatch.route_dst_node[lane_route] != a.node) {
-          lane_row = direct_source_compact_index[lane_route];
-          lane_direct = 1U;
-        }
       }
       __syncwarp();
       auto *output8 = reinterpret_cast<uint4 *>(combined + token * a.hidden);
@@ -1884,9 +1857,7 @@ void local_p2p_forward_megakernel(
         for (std::uint32_t order = 0; order < a.dispatch.identity.top_k;
              ++order) {
           const auto row = __shfl_sync(0xffffffffU, lane_row, order);
-          const auto direct =
-              __shfl_sync(0xffffffffU, lane_direct, order) != 0U;
-          const auto *source = direct ? direct_return_receive : contribution;
+          const auto *source = contribution;
           const auto packed = reinterpret_cast<const uint4 *>(
               source + row * a.hidden)[vector];
           const unsigned int words[4] = {packed.x, packed.y, packed.z,

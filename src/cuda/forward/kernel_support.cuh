@@ -342,19 +342,6 @@ struct GinDispatchContextRecord {
 };
 static_assert(sizeof(GinDispatchContextRecord) == 40);
 
-// Dispatch publishes the compact Return row plus one; zero means absent.
-// The source rank is already in the canonical header. Backward derives its
-// chunk from the row, so no rank/chunk bit fields or 24-bit row limit remain.
-__device__ __forceinline__ std::uint64_t
-encode_return_row_mapping(std::uint64_t compact_row) {
-  return compact_row + 1ULL;
-}
-
-__device__ __forceinline__ std::uint64_t
-return_mapping_compact_row(std::uint64_t mapping) {
-  return mapping - 1ULL;
-}
-
 enum ForwardProgressWord : std::uint32_t {
   kForwardEntered = 0,
   kForwardSetupComplete = 1,
@@ -525,24 +512,21 @@ struct Layout {
   std::size_t socket_header_receive = 0;
   std::size_t socket_payload_receive = 0;
   std::size_t forward_s = 0;
-  // Optional training-only planes. A/B uses two plane-major BF16 matrices;
-  // Forward output is separate so canonical post-Dispatch X stays immutable.
-  std::size_t forward_ab_cache = 0;
+  // Training uses a separate FC2 scratch plane until canonical X has been
+  // saved to caller-owned storage. A/B and gradient outputs live outside this
+  // arena.
   std::size_t forward_training_output = 0;
-  // The immutable compact X/A/B checkpoint stays intact across repeated
-  // Backward executions. Its compute directory pads every expert independently
-  // to 128 rows, so mutable padded tensors use a capacity larger than compact
-  // Forward storage by at most 127 rows per owned expert. The dead compact
-  // Forward output plane is reused for dR. dX remains disjoint so its M-blocks
-  // may return while dW2 still consumes dR.
+  // Backward reads caller-owned X/A/B. Its scratch directory pads every expert
+  // independently to 128 rows, so mutable padded tensors use a capacity larger
+  // than compact Forward storage by at most 127 rows per owned expert. The dead
+  // compact Forward output plane is reused for dR. dX remains disjoint so its
+  // M-blocks may return while dW2 still consumes dR.
   std::uint64_t backward_padded_capacity_rows = 0;
   std::size_t backward_u = 0;
   std::size_t backward_dab_rows = 0;
   std::size_t backward_dx_rows = 0;
   std::size_t backward_dgate_rows = 0;
   std::size_t backward_dgate_output = 0;
-  std::size_t backward_dw1 = 0;
-  std::size_t backward_dw2 = 0;
   std::size_t backward_setup_epoch = 0;
   std::size_t backward_dispatch_ready = 0;
   std::size_t backward_return_ready = 0;
@@ -551,17 +535,15 @@ struct Layout {
   std::size_t backward_padded_expert_offsets = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
-  std::size_t forward_fc1_published = 0;
+  std::size_t forward_input_groups = 0;
   std::size_t forward_compute_pair_mailboxes = 0;
   std::size_t forward_x_arrived_rows = 0;
-  std::size_t forward_return_row_map = 0;
-  std::size_t backward_return_chunk_state = 0;
-  std::size_t forward_return_row_to_source_route = 0;
-  std::size_t forward_source_route_to_return_row = 0;
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
   std::size_t forward_return_rows = 0;
-  std::size_t forward_return_peers = 0;
+  std::size_t forward_return_queues = 0;
+  std::size_t local_notifications = 0;
+  unsigned local_notification_ctas = 0;
   std::size_t forward_scheduler = 0;
   std::size_t forward_v3_control = 0;
   std::size_t forward_completion = 0;
@@ -574,6 +556,7 @@ struct Layout {
 // weights, canonical rows, and local-P2P storage stay in ordinary CUDA
 // allocations so enabling the network backend does not change their allocator.
 struct GinWindowLayout {
+  communication::ChunkRingLayout rings;
   std::size_t send_dispatch_directory = 0;
   std::size_t receive_dispatch_directory = 0;
   std::size_t send_packet_headers = 0;
@@ -627,106 +610,140 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   if (!config.enable_gin_rdma)
     return layout;
   std::size_t cursor = 0;
-  const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
-                                  "GIN max routes");
-  const auto outgoing_packets =
-      checked_mul(config.max_nodes, config.max_tokens_per_rank,
-                  "GIN outgoing packet capacity");
-  const auto outgoing_fanout =
-      checked_mul(outgoing_packets, config.max_top_k,
-                  "GIN outgoing packet fanout capacity");
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
-  constexpr std::uint32_t kGinContextsPerRail = 8;
-  const auto directory_records = checked_mul(remote_nodes, kGinContextsPerRail,
-                                             "GIN dispatch directory records");
-  const auto incoming_packets = checked_mul(
-      remote_nodes, config.max_tokens_per_rank, "GIN incoming packet capacity");
-  const auto packet_payload = checked_mul(
-      outgoing_packets, config.max_hidden_size, "GIN send payload elements");
-  const auto incoming_payload = checked_mul(
-      incoming_packets, config.max_hidden_size, "GIN receive payload elements");
-  // FULL's send plane is indexed by canonical producer row and its receive
-  // plane by compact source row. Backward reuses the send plane for padded
-  // M128 dX rows, so reserve the largest index domain without a pre-put pack.
-  const auto backward_padded_rows =
-      config.enable_backward_state
-          ? checked_add(
-                config.max_destination_rows_per_rank,
-                checked_mul(config.max_owned_experts, 127ULL,
-                            "GIN Backward padded return rows"),
-                "GIN Backward padded return rows")
-          : 0ULL;
-  const auto direct_return_rows = std::max<std::uint64_t>(
-      std::max<std::uint64_t>(
-          checked_mul(remote_nodes, routes, "GIN compact return rows"),
-          config.max_destination_rows_per_rank),
-      backward_padded_rows);
-  const auto dense_return_row_bytes = checked_mul(
-      config.max_hidden_size, sizeof(transport::BFloat16),
-      "GIN return row bytes");
-  const auto backward_return_row_bytes =
-      config.enable_backward_state
-          ? (checked_add(dense_return_row_bytes, sizeof(float) + 15ULL,
-                         "GIN Backward return row bytes") &
-             ~15ULL)
-          : dense_return_row_bytes;
-  layout.backward_return_row_bytes = backward_return_row_bytes;
-  layout.send_dispatch_directory =
-      append(cursor, directory_records, sizeof(GinDispatchContextRecord),
-             "GIN send dispatch directory");
-  layout.receive_dispatch_directory =
-      append(cursor, directory_records, sizeof(GinDispatchContextRecord),
-             "GIN receive dispatch directory");
-  layout.send_packet_headers =
-      append(cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
-             "GIN send packet headers");
-  layout.receive_packet_headers =
-      append(cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
-             "GIN receive packet headers");
-  // Packet descriptors are materialized in transport order. A token can
-  // contribute one node-deduplicated packet to every node, so packet-position
-  // indexing requires nodes*tokens*top-k capacity even though the number of
-  // logical routes remains tokens*top-k. The previous route-sized allocation
-  // made the first remote-node packet range overrun the following planes.
-  layout.send_fanout = append(cursor, outgoing_fanout,
-                              sizeof(ForwardDispatchFanoutRecord),
-                              "GIN send Forward fanout");
-  layout.receive_fanout =
-      append(cursor,
-             checked_mul(incoming_packets, config.max_top_k,
-                         "GIN receive fanout capacity"),
-             sizeof(ForwardDispatchFanoutRecord),
-             "GIN receive Forward fanout");
-  layout.send_payload = append(cursor, packet_payload,
-                               sizeof(transport::BFloat16), "GIN send payload");
-  layout.receive_payload =
-      append(cursor, incoming_payload, sizeof(transport::BFloat16),
-             "GIN receive payload");
-  layout.return_staging = append(
-      cursor, direct_return_rows,
-      checked_size(backward_return_row_bytes,
-                   "GIN direct return staging row bytes"),
-      "GIN return staging");
-  layout.return_receive =
-      append(cursor, routes,
-             checked_size(backward_return_row_bytes,
-                          "GIN return receive row bytes"),
-             "GIN return receive");
-  // The worst legal fragmentation begins at every row, hence routes marker
-  // words are sufficient for every compact Return layout.  The main path
-  // normally emits one marker per M128 producer block.
-  layout.return_fragment_ready =
-      append(cursor, routes, sizeof(std::uint64_t),
-             "GIN return fragment ready counters");
-  layout.return_send_rows = append(
-      cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
-      "GIN return send row notifications");
-  layout.return_receive_rows = append(
-      cursor, routes, sizeof(std::uint64_t), "GIN return receive row queue");
+  const auto dense_return_row_bytes =
+      checked_mul(config.max_hidden_size, sizeof(transport::BFloat16),
+                  "GIN hidden row bytes");
+  layout.backward_return_row_bytes =
+      (dense_return_row_bytes + sizeof(float) + 15ULL) & ~15ULL;
+  // The standalone transport-slice diagnostic predates the MoE operator and
+  // has no compute arena. Keep its staging private to that explicit API.
+  if (config.max_intermediate_size == 0) {
+    const auto routes = checked_mul(config.max_tokens_per_rank,
+                                    config.max_top_k, "GIN max routes");
+    const auto outgoing_packets =
+        checked_mul(config.max_nodes, config.max_tokens_per_rank,
+                    "GIN outgoing packet capacity");
+    const auto outgoing_fanout =
+        checked_mul(outgoing_packets, config.max_top_k,
+                    "GIN outgoing packet fanout capacity");
+    constexpr std::uint32_t kGinContextsPerRail = 8;
+    const auto directory_records = checked_mul(
+        remote_nodes, kGinContextsPerRail, "GIN dispatch directory records");
+    const auto incoming_packets =
+        checked_mul(remote_nodes, config.max_tokens_per_rank,
+                    "GIN incoming packet capacity");
+    const auto packet_payload = checked_mul(
+        outgoing_packets, config.max_hidden_size, "GIN send payload elements");
+    const auto incoming_payload =
+        checked_mul(incoming_packets, config.max_hidden_size,
+                    "GIN receive payload elements");
+    // FULL's send plane is indexed by canonical producer row and its receive
+    // plane by compact source row. Backward reuses the send plane for padded
+    // M128 dX rows, so reserve the largest index domain without a pre-put pack.
+    const auto backward_padded_rows =
+        config.enable_backward_state
+            ? checked_add(config.max_destination_rows_per_rank,
+                          checked_mul(config.max_owned_experts, 127ULL,
+                                      "GIN Backward padded return rows"),
+                          "GIN Backward padded return rows")
+            : 0ULL;
+    const auto direct_return_rows = std::max<std::uint64_t>(
+        std::max<std::uint64_t>(
+            checked_mul(remote_nodes, routes, "GIN compact return rows"),
+            config.max_destination_rows_per_rank),
+        backward_padded_rows);
+    const auto backward_return_row_bytes =
+        config.enable_backward_state
+            ? (checked_add(dense_return_row_bytes, sizeof(float) + 15ULL,
+                           "GIN Backward return row bytes") &
+               ~15ULL)
+            : dense_return_row_bytes;
+    layout.backward_return_row_bytes = backward_return_row_bytes;
+    layout.send_dispatch_directory =
+        append(cursor, directory_records, sizeof(GinDispatchContextRecord),
+               "GIN send dispatch directory");
+    layout.receive_dispatch_directory =
+        append(cursor, directory_records, sizeof(GinDispatchContextRecord),
+               "GIN receive dispatch directory");
+    layout.send_packet_headers =
+        append(cursor, outgoing_packets, sizeof(LocalP2pRouteHeader),
+               "GIN send packet headers");
+    layout.receive_packet_headers =
+        append(cursor, incoming_packets, sizeof(LocalP2pRouteHeader),
+               "GIN receive packet headers");
+    // Packet descriptors are materialized in transport order. A token can
+    // contribute one node-deduplicated packet to every node, so packet-position
+    // indexing requires nodes*tokens*top-k capacity even though the number of
+    // logical routes remains tokens*top-k. The previous route-sized allocation
+    // made the first remote-node packet range overrun the following planes.
+    layout.send_fanout =
+        append(cursor, outgoing_fanout, sizeof(ForwardDispatchFanoutRecord),
+               "GIN send Forward fanout");
+    layout.receive_fanout = append(
+        cursor,
+        checked_mul(incoming_packets, config.max_top_k,
+                    "GIN receive fanout capacity"),
+        sizeof(ForwardDispatchFanoutRecord), "GIN receive Forward fanout");
+    layout.send_payload =
+        append(cursor, packet_payload, sizeof(transport::BFloat16),
+               "GIN send payload");
+    layout.receive_payload =
+        append(cursor, incoming_payload, sizeof(transport::BFloat16),
+               "GIN receive payload");
+    layout.return_staging =
+        append(cursor, direct_return_rows,
+               checked_size(backward_return_row_bytes,
+                            "GIN direct return staging row bytes"),
+               "GIN return staging");
+    layout.return_receive = append(
+        cursor, routes,
+        checked_size(backward_return_row_bytes, "GIN return receive row bytes"),
+        "GIN return receive");
+    // The worst legal fragmentation begins at every row, hence routes marker
+    // words are sufficient for every compact Return layout.  The main path
+    // normally emits one marker per M128 producer block.
+    layout.return_fragment_ready = append(cursor, routes, sizeof(std::uint64_t),
+                                          "GIN return fragment ready counters");
+    layout.return_send_rows =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(std::uint64_t), "GIN return send row notifications");
+    layout.return_receive_rows = append(cursor, routes, sizeof(std::uint64_t),
+                                        "GIN return receive row queue");
+  }
   layout.barrier = append(cursor, 1, sizeof(std::uint64_t), "GIN barrier");
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
              "GIN production error records");
+  auto &rings = layout.rings;
+  rings.dispatch_channels = remote_nodes * communication::kDispatchChannels;
+  rings.return_channels = remote_nodes *
+                          (config.max_world_size / config.max_nodes) *
+                          communication::kReturnPorts;
+  rings.dispatch_row_bytes =
+      sizeof(communication::DispatchRow) +
+      config.max_top_k * sizeof(ForwardDispatchFanoutRecord) +
+      dense_return_row_bytes;
+  rings.return_row_bytes =
+      sizeof(communication::ReturnRow) + dense_return_row_bytes;
+  rings.dispatch_stride = sizeof(communication::ChunkHeader) +
+                          communication::kChunkRows * rings.dispatch_row_bytes;
+  rings.return_stride = sizeof(communication::ChunkHeader) +
+                        communication::kChunkRows * rings.return_row_bytes;
+  rings.control =
+      append(cursor, rings.channels(), sizeof(communication::ChunkChannel),
+             "GIN ring controls");
+  const auto dispatch_slots =
+      rings.dispatch_channels * communication::kRingDepth;
+  const auto return_slots = rings.return_channels * communication::kRingDepth;
+  rings.dispatch_tx = append(cursor, dispatch_slots, rings.dispatch_stride,
+                             "GIN dispatch TX ring");
+  rings.dispatch_rx = append(cursor, dispatch_slots, rings.dispatch_stride,
+                             "GIN dispatch RX ring");
+  rings.return_tx =
+      append(cursor, return_slots, rings.return_stride, "GIN return TX ring");
+  rings.return_rx =
+      append(cursor, return_slots, rings.return_stride, "GIN return RX ring");
   layout.total = cursor;
   return layout;
 }
@@ -843,11 +860,14 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                sizeof(transport::BFloat16), "contribution");
   layout.combine_return = append(cursor, route_elements,
                                  sizeof(transport::BFloat16), "combine return");
-  layout.combined = append(
-      cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
-                          "combined elements"),
-      sizeof(transport::BFloat16), "combined");
-  if (config.enable_socket_fallback || config.enable_gin_rdma) {
+  if (config.max_intermediate_size == 0 || config.enable_socket_fallback)
+    layout.combined =
+        append(cursor,
+               checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
+                           "combined elements"),
+               sizeof(transport::BFloat16), "diagnostic combined output");
+  if (config.enable_socket_fallback ||
+      (config.enable_gin_rdma && config.max_intermediate_size == 0)) {
     layout.socket_count_matrix = append(
         cursor, checked_mul(config.max_world_size, config.max_world_size,
                             "Socket count matrix"),
@@ -870,10 +890,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_s = append(cursor, forward_elements,
                               sizeof(transport::BFloat16), "forward gated U");
     if (config.enable_backward_state) {
-      layout.forward_ab_cache = append(
-          cursor, checked_mul(forward_elements, 2ULL,
-                              "forward BF16 A/B checkpoint elements"),
-          sizeof(transport::BFloat16), "forward BF16 A/B checkpoints");
       layout.forward_training_output = append(
           cursor,
           checked_mul(config.max_destination_rows_per_rank,
@@ -909,20 +925,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           "backward canonical dGate rows");
       layout.backward_dgate_output = append(
           cursor, routes, sizeof(float), "backward source dGate");
-      if (config.max_owned_experts != 0) {
-        const auto weight_matrix_elements = checked_mul(
-            checked_mul(config.max_owned_experts,
-                        config.max_intermediate_size,
-                        "backward expert weight rows"),
-            config.max_hidden_size, "backward expert weight elements");
-        layout.backward_dw1 = append(
-            cursor, checked_mul(2ULL, weight_matrix_elements,
-                                "backward dW1 elements"),
-            sizeof(transport::BFloat16), "backward dW1");
-        layout.backward_dw2 = append(
-            cursor, weight_matrix_elements, sizeof(transport::BFloat16),
-            "backward dW2");
-      }
       layout.backward_setup_epoch = append(
           cursor, config.max_world_size, sizeof(std::uint64_t),
           "backward setup epochs");
@@ -976,9 +978,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_fc1_done = append(cursor, max_mblocks,
                                      sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
-    layout.forward_fc1_published = append(
-        cursor, max_mblocks, sizeof(std::uint64_t),
-        "forward FC1 readiness publication bitmap");
+    layout.forward_input_groups =
+        append(cursor, max_mblocks, sizeof(persistent_v3::ForwardInputGroup),
+               "forward destination-local input readiness groups");
     layout.forward_compute_pair_mailboxes = append(
         cursor, persistent_v3::kForwardComputePairCapacity,
         sizeof(persistent_v3::ForwardComputePairMailbox),
@@ -994,31 +996,27 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                checked_mul(max_mblocks, config.max_world_size,
                            "forward exact X M-tile rail counters"),
                sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
-    layout.forward_return_row_map =
-        append(cursor, config.max_destination_rows_per_rank,
-               sizeof(std::uint64_t), "forward canonical to compact Return row map");
-    // Backward still uses chunk counters; Forward receives row notifications.
-    if (config.enable_backward_state)
-      layout.backward_return_chunk_state = append(
-          cursor, routes, sizeof(std::uint64_t), "backward return chunk state");
-    layout.forward_return_row_to_source_route =
-        append(cursor, routes, sizeof(std::uint64_t),
-               "forward compact return source route index");
-    layout.forward_source_route_to_return_row =
-        append(cursor, routes, sizeof(std::uint64_t),
-               "forward FULL source route compact index");
-    layout.forward_reduce_route_count = append(
-        cursor, config.max_tokens_per_rank, sizeof(std::uint32_t),
-        "forward reduce ready route counts");
+    layout.forward_reduce_route_count =
+        append(cursor, config.max_tokens_per_rank, sizeof(std::uint32_t),
+               "forward reduce ready route counts");
     layout.forward_reduce_ready_token = append(
         cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
         "forward reduce ready token queue");
     layout.forward_return_rows = append(
         cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
         "forward return row queues");
-    layout.forward_return_peers = append(
-        cursor, config.max_world_size, sizeof(persistent_v3::ReturnPeerQueue),
-        "forward return peer queues");
+    layout.local_notification_ctas = std::max(
+        std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
+            persistent_v3::kRdmaCtaCount,
+        backward_tuning::kRelayCtas + backward_tuning::kRdmaCtas);
+    layout.local_notifications = append(
+        cursor,
+        1ULL * (config.max_world_size / config.max_nodes) *
+            layout.local_notification_ctas,
+        sizeof(communication::NotificationChannel), "local notification rings");
+    layout.forward_return_queues = append(cursor, 1ULL + config.max_world_size,
+                                          sizeof(persistent_v3::ReturnRowQueue),
+                                          "per-peer return queue controls");
     layout.forward_scheduler =
         append(cursor, 4 + config.max_world_size * 32ULL, sizeof(std::uint64_t),
                "forward scheduler");
@@ -1102,12 +1100,65 @@ struct PoolSlot {
   CUtensorMap backward_dr_mn_map{};
   CUtensorMap backward_u_mn_map{};
   CUtensorMap backward_dab_mn_map{};
-  CUtensorMap backward_x_mn_map{};
   CUtensorMap backward_u_store_map{};
   CUtensorMap backward_dx_store_map{};
-  CUtensorMap backward_dw2_store_map{};
-  CUtensorMap backward_dw1_store_map{};
   bool backward_maps_valid = false;
+};
+
+struct PeerMappings {
+  std::uint32_t device = 0;
+  std::shared_ptr<internal::NcclSessionState> nccl;
+  std::vector<void *> bases;
+  std::vector<std::uint8_t> owned;
+  ~PeerMappings() noexcept {
+    (void)cudaSetDevice(static_cast<int>(device));
+    for (std::size_t i = 0; i < bases.size(); ++i)
+      if (owned[i] && bases[i])
+        (void)cudaIpcCloseMemHandle(bases[i]);
+  }
+};
+
+// Communication storage outlives any one compute arena. A larger Notify
+// result may replace the arena while a saved Forward still owns the old one.
+// The window and device communicator belong here, never to an IPC mapping.
+struct GinResources {
+  std::uint32_t device = 0;
+  std::size_t bytes_per_slot = 0;
+  std::vector<void *> allocations;
+  std::shared_ptr<internal::NcclSessionState> nccl;
+  ncclDevComm_t dev_comm{};
+  std::vector<ncclWindow_t> windows;
+  bool dev_comm_created = false;
+  std::mutex mutex;
+  cudaEvent_t last_use = nullptr;
+  unsigned long long last_capture_id = 0;
+
+  ~GinResources() noexcept {
+    (void)cudaSetDevice(static_cast<int>(device));
+    if (last_use) {
+      (void)cudaEventSynchronize(last_use);
+      (void)cudaEventDestroy(last_use);
+    }
+    using Deregister = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+    using Destroy = ncclResult_t (*)(ncclComm_t, const ncclDevComm_t *);
+    using Free = ncclResult_t (*)(void *);
+    const auto deregister = reinterpret_cast<Deregister>(
+        dlsym(RTLD_DEFAULT, "ncclCommWindowDeregister"));
+    const auto destroy =
+        reinterpret_cast<Destroy>(dlsym(RTLD_DEFAULT, "ncclDevCommDestroy"));
+    const auto free_memory =
+        reinterpret_cast<Free>(dlsym(RTLD_DEFAULT, "ncclMemFree"));
+    if (nccl && deregister)
+      for (const auto window : windows)
+        if (window)
+          (void)deregister(nccl->comm, window);
+    if (nccl && dev_comm_created && destroy)
+      (void)destroy(nccl->comm, &dev_comm);
+    if (free_memory)
+      for (auto *allocation : allocations)
+        if (allocation)
+          (void)free_memory(allocation);
+  }
 };
 
 template <typename T>
@@ -1176,6 +1227,8 @@ struct ActivationPoolState {
   std::uint32_t device = 0;
   std::mutex mutex;
   std::weak_ptr<ActivationMegaKernelBackendState> gin_backend;
+  std::shared_ptr<GinResources> gin_resources;
+  std::shared_ptr<PeerMappings> peer_mappings;
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
@@ -1282,13 +1335,6 @@ struct ActivationPoolState {
       if (slot.forward_timeline)
         (void)cudaFree(slot.forward_timeline);
 #endif
-      if (slot.gin_window) {
-        using MemFreeFn = ncclResult_t (*)(void *);
-        const auto mem_free = reinterpret_cast<MemFreeFn>(
-            dlsym(RTLD_DEFAULT, "ncclMemFree"));
-        if (mem_free != nullptr)
-          (void)mem_free(slot.gin_window);
-      }
     }
     if (cancel_stream)
       (void)cudaStreamDestroy(cancel_stream);

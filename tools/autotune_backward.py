@@ -74,7 +74,6 @@ PARAMETER_MACROS = {
     "rdma_ctas": "WEFTMOE_BWD_RDMA_CTAS",
     "relay_ctas": "WEFTMOE_BWD_RELAY_CTAS",
     "dispatch_batch_rows": "WEFTMOE_BWD_DISPATCH_BATCH_ROWS",
-    "gin_max_inflight": "WEFTMOE_BWD_GIN_MAX_INFLIGHT",
     "setup_threads": "WEFTMOE_BWD_SETUP_THREADS",
     "setup_idle_nanosleep": "WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP",
     "queue_idle_nanosleep": "WEFTMOE_BWD_QUEUE_IDLE_NANOSLEEP",
@@ -174,7 +173,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require(config["relay_ctas"] >= 8 and config["relay_ctas"] % 4 == 0,
             "relay_ctas must be >=8 and a multiple of 4")
     require_choice(config, "dispatch_batch_rows", (12, 16, 32, 64, 128))
-    require_choice(config, "gin_max_inflight", (8, 16, 24, 32, 64))
     for key in ("setup_threads", "reduce_threads"):
         require_choice(config, key, (128, 256, 384, 512))
     require_choice(config, "ready_word_stagger", (0, 1))

@@ -723,8 +723,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               Fc2StageCount * kFc2BStageElements
           ? 2U * Fc1StageCount * kFc1BStageElements
           : Fc2StageCount * kFc2BStageElements;
-  constexpr auto kConfiguredGemmStorageElements =
-      kConfiguredAStorageElements + kConfiguredBStorageElements;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
@@ -735,23 +733,12 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   auto *s = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
   transport::BFloat16 *ab_cache = nullptr;
   if constexpr (RetainBackwardState)
-    ab_cache = peer_at<transport::BFloat16>(a.local_base,
-                                            a.forward_ab_cache_offset);
+    ab_cache = a.saved_ab;
   const auto *canonical_gates =
       peer_at<const float>(a.local_base, a.canonical_gates_offset);
   auto *forward_output =
-      a.use_gin && a.forward_registered_output
-          ? reinterpret_cast<transport::BFloat16 *>(
-                static_cast<std::byte *>(a.gin_window_base) +
-                a.gin_return_staging_offset)
-          : peer_at<transport::BFloat16>(a.local_base,
-                                         a.forward_output_rows_offset);
-  auto *direct_return_staging =
-      a.use_gin
-          ? reinterpret_cast<transport::BFloat16 *>(
-                static_cast<std::byte *>(a.gin_window_base) +
-                a.gin_return_staging_offset)
-          : static_cast<transport::BFloat16 *>(nullptr);
+      peer_at<transport::BFloat16>(a.local_base, a.forward_output_rows_offset);
+  auto *direct_return_staging = static_cast<transport::BFloat16 *>(nullptr);
   auto *headers =
       peer_at<LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
 
@@ -1134,7 +1121,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 reinterpret_cast<std::uint32_t *>(
                     ab_cache)[output_index / 2ULL] = a_pair;
                 const auto b_index =
-                    a.max_destination_rows * a.intermediate + output_index;
+                    a.saved_rows * a.intermediate + output_index;
                 reinterpret_cast<std::uint32_t *>(
                     ab_cache)[b_index / 2ULL] = b_pair;
               }
@@ -1157,8 +1144,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   if constexpr (RetainBackwardState) {
                     ab_cache[output_index] =
                         transport::BFloat16{a_bits};
-                    ab_cache[a.max_destination_rows * a.intermediate +
-                             output_index] = transport::BFloat16{b_bits};
+                    ab_cache[a.saved_rows * a.intermediate + output_index] =
+                        transport::BFloat16{b_bits};
                   }
                   s[output_index] = transport::BFloat16{
                       float_to_bf16_bits(gated_swiglu_fc2_input_from_bf16(

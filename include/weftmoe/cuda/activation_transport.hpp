@@ -9,6 +9,7 @@
 
 #include "weftmoe/cuda/device_notify.hpp"
 #include "weftmoe/cuda/nccl_count_exchange.hpp"
+#include "weftmoe/cuda/tensor_storage.hpp"
 #include "weftmoe/transport/activation_protocol.hpp"
 #include "weftmoe/version.hpp"
 
@@ -164,6 +165,7 @@ struct ForwardMegaKernelConfig {
   // consumed by Forward's SwiGLU. The pool must have been constructed with
   // enable_backward_state=true.
   bool retain_backward_state = false;
+  ForwardTensorStorage tensors{};
 };
 
 class ForwardWeightLease {
@@ -235,8 +237,10 @@ public:
   const ActivationTransportExpectation &identity() const;
   const ForwardMegaKernelAudit &audit() const;
   const ForwardMegaKernelTimings &timings() const;
-  // enqueue() returns before GPU completion. wait() collects diagnostics;
-  // wait_on() only inserts a GPU dependency on the caller's stream.
+  const ForwardTensorStorage &tensors() const;
+  // enqueue() returns before GPU completion. wait() collects diagnostics and
+  // releases the execution slot; saved tensors remain valid. Captured handles
+  // reserve their slot until destruction. wait_on() inserts only a dependency.
   void wait() const;
   void wait_on(CUstream_st *stream) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
@@ -275,11 +279,11 @@ public:
       const float *device_data, std::uint64_t capacity_elements,
       const CudaRouteInput &exact_routes,
       std::shared_ptr<const void> allocation_owner) const;
-  BFloat16ActivationLease publish_activations(
-      const transport::BFloat16 *device_data,
-      std::uint64_t capacity_elements, std::uint64_t num_tokens,
-      std::uint64_t hidden_size, const ActivationTransportResourcePool &pool,
-      std::shared_ptr<const void> allocation_owner) const;
+  BFloat16ActivationLease
+  publish_activations(const transport::BFloat16 *device_data,
+                      std::uint64_t capacity_elements, std::uint64_t num_tokens,
+                      std::uint64_t hidden_size,
+                      std::shared_ptr<const void> allocation_owner) const;
   // dY is caller-owned and does not reserve a second transport-pool slot.
   // The returned lease records producer-stream readiness and retains the
   // allocation until Backward has consumed it.

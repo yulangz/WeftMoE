@@ -596,6 +596,8 @@ def main():
                               "fc1", "fc2", "return", "reduce",
                               "fc1_fc2_overlap", "fc2_return_overlap",
                               "return_reduce_overlap")
+                if all("buffer_prepare" in item for item in observed):
+                    stage_keys += ("buffer_prepare",)
                 for rank, item in enumerate(observed):
                     if (item["specialization"] !=
                             f"sm90-wgmma-tma-{item['hidden']}x{item['intermediate']}" or
@@ -695,6 +697,21 @@ def main():
                         item["_nccl_library"] for item in observed],
                     **summary,
                 }
+                if all("first_use_wall_us" in item for item in observed):
+                    result["timing_scope"] = "notify-buffer-forward"
+                    result["first_use"] = {
+                        key: {
+                            "slowest_rank_us": max(float(item[key])
+                                                   for item in observed),
+                            "per_rank_us": [float(item[key])
+                                            for item in observed],
+                        }
+                        for key in ("first_use_wall_us",
+                                    "first_use_notify_pool_us",
+                                    "first_use_notify_us",
+                                    "first_use_buffer_prepare_us",
+                                    "first_use_forward_us")
+                    }
                 print("FORWARD_BENCH_JSON " +
                       json.dumps(result, sort_keys=True))
                 return

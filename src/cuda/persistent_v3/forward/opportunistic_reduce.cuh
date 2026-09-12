@@ -31,14 +31,10 @@ struct ReduceTokenView {
   persistent_v3::ForwardPipelineControl *control;
   TransportDeviceStatus *status;
   const transport::BFloat16 *local;
-  const transport::BFloat16 *remote;
-  const unsigned long long *mapping;
   transport::BFloat16 *output;
   const std::uint32_t *order;
-  const std::uint32_t *route_node;
   std::uint64_t hidden;
   std::uint32_t top_k;
-  std::uint32_t node;
 #if WEFTMOE_DEBUG_VALIDATE
   transport_state::GenerationCompletionVector *completion;
 #endif
@@ -52,18 +48,10 @@ reduce_token_view(const ForwardKernelArgs &a) {
   v.status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   v.local =
       peer_at<const transport::BFloat16>(a.local_base, a.contribution_offset);
-  v.remote = a.use_gin ? reinterpret_cast<const transport::BFloat16 *>(
-                             static_cast<const std::byte *>(a.gin_window_base) +
-                             a.gin_return_receive_offset)
-                       : nullptr;
-  v.mapping = peer_at<const unsigned long long>(
-      a.local_base, a.forward_source_route_to_return_row_offset);
-  v.output = peer_at<transport::BFloat16>(a.local_base, a.combined_offset);
+  v.output = a.output;
   v.order = a.dispatch.combine_order;
-  v.route_node = a.dispatch.route_dst_node;
   v.hidden = a.hidden;
   v.top_k = a.dispatch.identity.top_k;
-  v.node = a.node;
 #if WEFTMOE_DEBUG_VALIDATE
   v.completion =
       a.use_gin ? static_cast<transport_state::GenerationCompletionVector *>(
@@ -100,10 +88,7 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
     for (std::uint32_t order = 0U; order < v.top_k; ++order) {
       const auto slot = v.order[token * v.top_k + order];
       const auto route = token * v.top_k + slot;
-      const bool direct = v.remote != nullptr && v.route_node[route] != v.node;
-      const auto row = direct ? v.mapping[route] : route;
-      const auto *source =
-          (direct ? v.remote : v.local) + row * v.hidden + column;
+      const auto *source = v.local + route * v.hidden + column;
       const auto packed = *reinterpret_cast<const uint4 *>(source);
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll

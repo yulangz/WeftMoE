@@ -75,6 +75,8 @@ def aggregate_gin_benchmark(outputs):
         "wall", "notify", "forward", "dispatch", "fc1", "fc2", "return",
         "reduce", "fc1_fc2_overlap", "fc2_return_overlap",
         "return_reduce_overlap", "terminal_status_agreement")
+    if all("buffer_prepare" in item for item in records):
+        stage_keys += ("buffer_prepare",)
     measured = None
     for rank, record in enumerate(records):
         if record.get("backend") != "gin-rdma":
@@ -95,6 +97,17 @@ def aggregate_gin_benchmark(outputs):
         slowest = [max(record[key][iteration] for record in records)
                    for iteration in range(measured)]
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
+    if all("first_use_wall_us" in item for item in records):
+        summary["timing_scope"] = "notify-buffer-forward"
+        summary["first_use"] = {
+            key: {
+                "slowest_rank_us": max(float(item[key]) for item in records),
+                "per_rank_us": [float(item[key]) for item in records],
+            }
+            for key in ("first_use_wall_us", "first_use_notify_pool_us",
+                        "first_use_notify_us", "first_use_buffer_prepare_us",
+                        "first_use_forward_us")
+        }
 
     return {
         "schema": 1,
@@ -291,6 +304,7 @@ def environment_overrides(args):
         "WEFTMOE_FORWARD_PROGRESS",
         "WEFTMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
         "WEFTMOE_FORWARD_SMOKE_REPEATS",
+        "WEFTMOE_TEST_BUFFER_MODE_TOKENS",
         "WEFTMOE_BACKWARD_ROUNDS",
         "WEFTMOE_BACKWARD_WARMUPS",
         "WEFTMOE_BACKWARD_TOKENS",

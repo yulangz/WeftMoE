@@ -29,8 +29,8 @@ __global__ void backward_clear_inactive_gradients_kernel(BackwardKernelArgs a) {
   const auto expert = blockIdx.y;
   if (a.dispatch.expert_row_count[expert] != 0ULL) return;
   const auto elements = a.hidden * a.intermediate;
-  auto *dw1 = peer_at<transport::BFloat16>(a.local_base, a.dw1_offset) + expert * 2ULL * elements;
-  auto *dw2 = peer_at<transport::BFloat16>(a.local_base, a.dw2_offset) + expert * elements;
+  auto *dw1 = a.dw1 + expert * 2ULL * elements;
+  auto *dw2 = a.dw2 + expert * elements;
   for (auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < 2ULL * elements; i += gridDim.x * blockDim.x) {
     reinterpret_cast<unsigned short *>(dw1)[i] = 0;
@@ -127,13 +127,11 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
     std::uint64_t compact_row, bool row_is_valid, std::uint32_t lane) {
   auto *u = peer_at<transport::BFloat16>(a.local_base,
                                          a.recomputed_u_offset);
-  const auto *ab = peer_at<const transport::BFloat16>(
-      a.local_base, a.cached_ab_offset);
-  const auto *gates = peer_at<const float>(a.local_base,
-                                           a.canonical_gate_offset);
+  const auto *ab = a.saved_ab;
+  const auto *gates = a.saved_gates;
   auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
   auto *dgate = peer_at<float>(a.local_base, a.dgate_rows_offset);
-  const auto b_base = a.max_destination_rows * a.intermediate;
+  const auto b_base = a.saved_rows * a.intermediate;
   const auto output_base = padded_row * 2ULL * a.intermediate;
   if (!row_is_valid) {
     for (std::uint64_t column = 2ULL * lane; column < a.intermediate;
@@ -288,20 +286,7 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
       *source_rows[kWarpsPerCta][kMaxTopK];
   const auto *contribution = peer_at<const transport::BFloat16>(
       a.local_base, a.contribution_offset);
-#if __has_include(<nccl_device.h>)
-  const auto *direct_receive =
-      a.use_gin
-          ? static_cast<const std::byte *>(a.gin_window_base) +
-                a.gin_return_receive_offset
-          : static_cast<const std::byte *>(nullptr);
-  const auto *direct_compact =
-      a.use_gin
-          ? peer_at<const unsigned long long>(
-                a.local_base, a.forward_source_route_to_return_row_offset)
-          : static_cast<const unsigned long long *>(nullptr);
-#endif
-  auto *combined = peer_at<transport::BFloat16>(
-      a.local_base, a.combined_dx_offset);
+  auto *combined = a.dx;
   auto *ready = peer_at<unsigned long long>(a.local_base,
                                              a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
@@ -310,11 +295,6 @@ __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
     const auto slot = a.dispatch.combine_order[route_base + position];
     const auto route = route_base + slot;
     auto *source = contribution + route * a.hidden;
-#if __has_include(<nccl_device.h>)
-    if (a.use_gin && a.dispatch.route_dst_node[route] != a.node)
-      source = reinterpret_cast<const transport::BFloat16 *>(
-          direct_receive + direct_compact[route] * a.gin_return_row_bytes);
-#endif
     source_rows[warp][position] = source;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);

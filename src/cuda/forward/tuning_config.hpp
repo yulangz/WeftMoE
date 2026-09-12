@@ -69,9 +69,6 @@
 #ifndef WEFTMOE_FWD_RDMA_CTAS
 #define WEFTMOE_FWD_RDMA_CTAS 8
 #endif
-#ifndef WEFTMOE_FWD_RDMA_CONTROL_WARPS
-#define WEFTMOE_FWD_RDMA_CONTROL_WARPS 2
-#endif
 #ifndef WEFTMOE_FWD_RELAY_TMA_WARPS
 #define WEFTMOE_FWD_RELAY_TMA_WARPS 8
 #endif
@@ -86,12 +83,6 @@
 #endif
 #ifndef WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS
 #define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 32
-#endif
-#ifndef WEFTMOE_FWD_RETURN_BATCH_ROWS
-#define WEFTMOE_FWD_RETURN_BATCH_ROWS 512
-#endif
-#ifndef WEFTMOE_FWD_RETURN_MAX_INFLIGHT
-#define WEFTMOE_FWD_RETURN_MAX_INFLIGHT 16
 #endif
 #ifndef WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS
 #define WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS 128
@@ -148,9 +139,6 @@
 #ifndef WEFTMOE_FWD_FC2_TMA_STORE
 #define WEFTMOE_FWD_FC2_TMA_STORE 1
 #endif
-#ifndef WEFTMOE_FWD_REGISTERED_OUTPUT
-#define WEFTMOE_FWD_REGISTERED_OUTPUT 1
-#endif
 #ifndef WEFTMOE_FWD_RELAY_LOCAL_RETURN
 #define WEFTMOE_FWD_RELAY_LOCAL_RETURN 1
 #endif
@@ -196,10 +184,7 @@ inline constexpr std::uint32_t kFc2StoreAtomN =
 inline constexpr std::uint32_t kClusterSize = WEFTMOE_FWD_CLUSTER_SIZE;
 inline constexpr std::uint32_t kRdmaCtas = WEFTMOE_FWD_RDMA_CTAS;
 inline constexpr std::uint32_t kRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
-inline constexpr std::uint32_t kRdmaControlWarps =
-    WEFTMOE_FWD_RDMA_CONTROL_WARPS;
-inline constexpr std::uint32_t kRelayTmaWarps =
-    WEFTMOE_FWD_RELAY_TMA_WARPS;
+inline constexpr std::uint32_t kRelayTmaWarps = WEFTMOE_FWD_RELAY_TMA_WARPS;
 inline constexpr std::uint32_t kLocalDispatchTmaWarps =
     WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS;
 inline constexpr std::uint32_t kRelayScatterWarps =
@@ -208,10 +193,6 @@ inline constexpr std::uint32_t kLocalReturnBatchRows =
     WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS;
 inline constexpr std::uint32_t kDispatchPublishBatchRows =
     WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS;
-inline constexpr std::uint32_t kReturnBatchRows =
-    WEFTMOE_FWD_RETURN_BATCH_ROWS;
-inline constexpr std::uint32_t kReturnMaxInflight =
-    WEFTMOE_FWD_RETURN_MAX_INFLIGHT;
 inline constexpr std::uint32_t kLocalRouteBatchRows =
     WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS;
 inline constexpr std::uint32_t kStartupMblocks =
@@ -247,10 +228,7 @@ inline constexpr std::uint32_t kSetupNanosleep =
 inline constexpr std::uint32_t kFinalizeNanosleep =
     WEFTMOE_FWD_FINALIZE_NANOSLEEP;
 inline constexpr bool kFc2TmaStore = WEFTMOE_FWD_FC2_TMA_STORE != 0;
-inline constexpr bool kRegisteredOutput =
-    WEFTMOE_FWD_REGISTERED_OUTPUT != 0;
-inline constexpr bool kRelayLocalReturn =
-    WEFTMOE_FWD_RELAY_LOCAL_RETURN != 0;
+inline constexpr bool kRelayLocalReturn = WEFTMOE_FWD_RELAY_LOCAL_RETURN != 0;
 
 constexpr std::size_t max_size(std::size_t a, std::size_t b) {
   return a > b ? a : b;
@@ -326,8 +304,6 @@ static_assert(valid_transport_role_counts());
 static_assert(kRdmaCtas != 0U ||
               kLocalDispatchTmaWarps < kComputeThreads / 32U,
               "local split Relay reserves one warp for FC1-ready publication");
-static_assert(kRdmaControlWarps >= 2U &&
-              kRdmaControlWarps < kComputeThreads / 32U);
 static_assert(kRelayTmaWarps <= kComputeThreads / 32U);
 static_assert(kLocalDispatchTmaWarps > 0U &&
               kLocalDispatchTmaWarps <= kComputeThreads / 32U);
@@ -336,7 +312,6 @@ static_assert(kRelayScatterWarps > 0U &&
 static_assert(kLocalReturnBatchRows >= 32U &&
               kLocalReturnBatchRows <= 1024U &&
               kLocalReturnBatchRows % 32U == 0U);
-static_assert(kReturnBatchRows > 0U && kReturnMaxInflight <= 64U);
 static_assert(kLocalRouteBatchRows > 0U && kStartupMblocks > 0U);
 static_assert(kRelayLocalReturn, "local Return requires Relay ownership");
 static_assert(kTaskClaimChunk == 1U,

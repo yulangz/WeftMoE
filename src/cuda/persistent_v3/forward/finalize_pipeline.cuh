@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/persistent_v3/forward/return_pipeline.cuh"
+
 // Split Forward terminal protocol. Receive-completion CTAs publish remote
 // contribution readiness per chunk; RDMA local completion and the compute-grid
 // reduction counter are only terminal dependencies. Keeping those edges
@@ -187,9 +189,8 @@ __device__ __forceinline__ void split_transport_finalize(
 
   publish_production_terminal_status<StaticLocal>(
       a, status, ProductionStatusPhase::Forward,
-      a.production_error_records_offset,
-      a.gin_production_error_records_offset,
-      a.dispatch.identity.num_nodes - 1ULL);
+      a.production_error_records_offset, a.gin_production_error_records_offset,
+      0ULL);
   __syncthreads();
 
   if (threadIdx.x == 0U) {

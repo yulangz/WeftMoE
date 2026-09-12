@@ -17,9 +17,8 @@ enum class TaskKind : std::uint8_t {
 
 inline constexpr std::uint32_t kTaskKindCount = 4U;
 
-// A descriptor table is immutable for one retained Forward handle. Runtime
-// publication changes only an owner-ready summary and fixed per-owner claim
-// bits; there is no wrapping task ring and no enqueue payload traffic.
+// Activation owners are M-blocks and retain their locality-aware ready bitmap.
+// Weight-gradient owners are experts, published once after their inputs finish.
 struct TileTask {
   std::uint32_t owner = 0U;
   std::uint32_t tile = 0U;
@@ -33,17 +32,12 @@ struct TileDomain {
   std::uint32_t owner_count = 0U;
   std::uint32_t tiles_per_owner = 0U;
   TaskKind kind = TaskKind::None;
-  bool linear_claim = false;
-  std::uint32_t claim_granularity = 1U;
 
   WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
     return (owner_count + 63U) / 64U;
   }
 
-  WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t
-  claim_words_per_owner() const {
-    if (linear_claim)
-      return 1U;
+  WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t claim_words_per_owner() const {
     return (tiles_per_owner + 63U) / 64U;
   }
 
@@ -55,21 +49,83 @@ struct TileDomain {
   }
 };
 
+// An append-only queue for one backward execution. An entry publishes an
+// expert, while its private ticket counter distributes that expert's GEMM
+// tiles. Consumers never reserve work from an unpublished entry.
+struct ExpertTileQueue {
+  unsigned long long *ready_owners = nullptr;
+  unsigned long long *tile_claims = nullptr;
+  unsigned long long *reserved = nullptr;
+  unsigned long long *head = nullptr;
+  std::uint32_t owner_count = 0U;
+  std::uint32_t tiles_per_owner = 0U;
+  TaskKind kind = TaskKind::None;
+  std::uint32_t claim_granularity = 1U;
+};
+
 struct WorkQueues {
   TileDomain dx;
   TileDomain dab;
-  TileDomain dw2;
-  TileDomain dw1;
+  ExpertTileQueue dw2;
+  ExpertTileQueue dw1;
 };
 
 #if defined(__CUDACC__)
+WEFTMOE_V3_DEVICE inline void publish_owner(ExpertTileQueue queue,
+                                            std::uint32_t owner) {
+  if (owner >= queue.owner_count || queue.tiles_per_owner == 0U)
+    return;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> reserved(
+      *queue.reserved);
+  const auto slot = reserved.fetch_add(1ULL, ::cuda::memory_order_relaxed);
+  if (slot >= queue.owner_count)
+    __trap();
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> entry(
+      queue.ready_owners[slot]);
+  entry.store(owner + 1ULL, ::cuda::memory_order_release);
+}
+
+WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(ExpertTileQueue queue,
+                                                    TileTask &task) {
+  if (queue.owner_count == 0U || queue.tiles_per_owner == 0U)
+    return false;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
+      *queue.head);
+  while (true) {
+    auto slot = head.load(::cuda::memory_order_relaxed);
+    if (slot >= queue.owner_count)
+      return false;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> entry(
+        queue.ready_owners[slot]);
+    const auto encoded = entry.load(::cuda::memory_order_acquire);
+    if (encoded == 0ULL)
+      return false;
+    const auto owner = static_cast<std::uint32_t>(encoded - 1ULL);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
+        queue.tile_claims[owner]);
+    const auto tile =
+        claim.fetch_add(queue.claim_granularity, ::cuda::memory_order_relaxed);
+    if (tile + queue.claim_granularity >= queue.tiles_per_owner)
+      head.compare_exchange_strong(slot, slot + 1ULL,
+                                   ::cuda::memory_order_relaxed);
+    if (tile >= queue.tiles_per_owner)
+      continue;
+    const auto remaining =
+        queue.tiles_per_owner - static_cast<std::uint32_t>(tile);
+    task =
+        TileTask{owner, static_cast<std::uint32_t>(tile), queue.kind,
+                 remaining < queue.claim_granularity ? remaining
+                                                     : queue.claim_granularity};
+    return true;
+  }
+}
+
 WEFTMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
-                                             std::uint32_t owner) {
+                                            std::uint32_t owner) {
   if (owner >= domain.owner_count || domain.tiles_per_owner == 0U)
     return;
   const auto claim_word_begin = owner * domain.claim_words_per_owner();
-  for (std::uint32_t word = 0U; word < domain.claim_words_per_owner();
-       ++word) {
+  for (std::uint32_t word = 0U; word < domain.claim_words_per_owner(); ++word) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
         domain.claim_words[claim_word_begin + word]);
     claim.store(0ULL, ::cuda::memory_order_relaxed);
@@ -83,14 +139,14 @@ WEFTMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
 // Bits outside the prefix start in the claimed state, so the ordinary claim
 // path removes the owner-ready bit as soon as the exposed phase is drained.
 // A later phase can reset and republish the same immutable owner descriptor.
-WEFTMOE_V3_DEVICE inline void publish_owner_prefix(
-    TileDomain domain, std::uint32_t owner, std::uint32_t prefix_tiles) {
+WEFTMOE_V3_DEVICE inline void publish_owner_prefix(TileDomain domain,
+                                                   std::uint32_t owner,
+                                                   std::uint32_t prefix_tiles) {
   if (owner >= domain.owner_count || prefix_tiles == 0U ||
       prefix_tiles > domain.tiles_per_owner)
     return;
   const auto claim_word_begin = owner * domain.claim_words_per_owner();
-  for (std::uint32_t word = 0U; word < domain.claim_words_per_owner();
-       ++word) {
+  for (std::uint32_t word = 0U; word < domain.claim_words_per_owner(); ++word) {
     const auto begin = word * 64U;
     const auto remaining = prefix_tiles <= begin ? 0U : prefix_tiles - begin;
     const auto available = remaining < 64U ? remaining : 64U;
@@ -110,13 +166,7 @@ WEFTMOE_V3_DEVICE inline void publish_owner_prefix(
 }
 
 WEFTMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
-                                                   std::uint32_t owner) {
-  if (domain.linear_claim) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
-        domain.claim_words[owner]);
-    return claim.load(::cuda::memory_order_relaxed) >=
-           domain.tiles_per_owner;
-  }
+                                                  std::uint32_t owner) {
   const auto words = domain.claim_words_per_owner();
   const auto begin = owner * words;
   for (std::uint32_t word = 0U; word < words; ++word) {
@@ -147,24 +197,8 @@ WEFTMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
   }
 }
 
-WEFTMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
-                                                    std::uint32_t owner,
-                                                    TileTask &task) {
-  if (domain.linear_claim) {
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> claim(
-        domain.claim_words[owner]);
-    const auto tile = claim.fetch_add(domain.claim_granularity,
-                                      ::cuda::memory_order_relaxed);
-    if (tile >= domain.tiles_per_owner)
-      return false;
-    const auto remaining = domain.tiles_per_owner -
-                           static_cast<std::uint32_t>(tile);
-    task = TileTask{owner, static_cast<std::uint32_t>(tile), domain.kind,
-                    remaining < domain.claim_granularity
-                        ? remaining
-                        : domain.claim_granularity};
-    return true;
-  }
+WEFTMOE_V3_DEVICE inline bool
+try_claim_owner_tile(TileDomain domain, std::uint32_t owner, TileTask &task) {
   const auto words = domain.claim_words_per_owner();
   const auto begin = owner * words;
   for (std::uint32_t word = 0U; word < words; ++word) {
@@ -188,7 +222,7 @@ WEFTMOE_V3_DEVICE inline bool try_claim_owner_tile(TileDomain domain,
 }
 
 WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
-                                                     TileTask &task) {
+                                                    TileTask &task) {
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
     return false;
@@ -219,10 +253,9 @@ WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
           const auto rotation =
               static_cast<std::uint32_t>(blockIdx.x) & (kOwnerGroup - 1U);
           const auto after_rotation = group_bits & (~0ULL << rotation);
-          const auto selected = after_rotation != 0ULL ? after_rotation
-                                                        : group_bits;
-          bit = group_begin +
-                static_cast<std::uint32_t>(__ffsll(selected) - 1);
+          const auto selected =
+              after_rotation != 0ULL ? after_rotation : group_bits;
+          bit = group_begin + static_cast<std::uint32_t>(__ffsll(selected) - 1);
         }
       }
       const auto owner = word_index * 64U + bit;

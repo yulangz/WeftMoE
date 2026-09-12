@@ -51,18 +51,13 @@ for compute workers.
 |---|---|---|
 | `rdma_ctas` | FWD/BWD | Number of inter-node GIN communication CTAs. Single-node execution sets this to 0. The current GIN implementation uses 8; this is not the number of nodes or the EP size. |
 | `relay_ctas` | FWD/BWD | Number of CTAs assigned to node-local transport. For small hidden dimensions, include larger values such as 24, 32, and 40: transport progress can limit throughput even on one node. Stop increasing the count when reduced compute capacity outweighs faster transport. Counts remain subject to alignment and residency constraints. |
-| `rdma_control_warps` | FWD | Warps assigned to RDMA issue and completion control. The current protocol requires two. |
 | `local_dispatch_tma_warps` | FWD | Warps per relay CTA used for node-local dispatch copies. More copy streams increase concurrency but compete with progress and readiness publication work. |
 | `local_return_tma_warps` | FWD | Warps used for node-local return TMA copies. A value of 0 selects vector copies. Comparing 0 and 8 is a useful initial search; more TMA streams are not always faster end to end. |
 | `relay_scatter_warps` | FWD | Warps assigned to relay scatter copies. Controls concurrent TMA copy streams within a received dispatch chunk. Multiple relay CTAs can consume the same channel concurrently. Shared-memory usage grows with the row width and stream count. |
 | `local_return_batch_rows` | FWD | Maximum published rows claimed in one local return batch. Larger batches amortize scheduling overhead but can delay service of other ready work. |
 | `dispatch_publish_batch_rows` | FWD | Row granularity for publishing dispatch arrival progress. Smaller batches expose compute work sooner; larger batches reduce publication overhead. |
-| `return_batch_rows` | FWD | Maximum ready rows claimed per inter-node return batch. One notification confirms all preceding payload puts to the same peer. Start with 512 rows to amortize notification overhead; smaller batches can reduce completion latency. This does not change GEMM tiles or Backward chunk sizes. |
-| `return_max_inflight` | FWD | Maximum outstanding return payload puts per GIN context. Notification puts use a separate completion counter. Larger windows increase overlap. A value of 0 disables this window limit. |
-| `registered_output` | FWD | Places FC2 output in the GIN-registered output region for direct transfer. Required by the GIN FC2 TMA store path. |
 | `relay_local_return` | FWD | Assigns local return processing to relay CTAs. Keep enabled; the current supported path requires it. |
 | `dispatch_batch_rows` | BWD | Routed rows claimed in one relay dispatch batch. Start with 16 or 32 for node-local execution. Larger batches can reduce scheduling overhead, while smaller batches improve responsiveness to return work. |
-| `gin_max_inflight` | BWD | Maximum outstanding GIN requests. Relevant only to inter-node communication. Increase when insufficient outstanding work limits transfer throughput. |
 | `setup_threads` | BWD | Threads per setup CTA. Controls parallelism in pipeline initialization. |
 | `setup_idle_nanosleep` | BWD | Backoff hint while setup waits for progress. Keep the default unless initialization waiting is significant. |
 

@@ -300,6 +300,9 @@ public:
   // device counts without a host readback; these snapshots remain unchanged.
   const DeviceDispatchSizes &sizes() const;
   const DeviceDispatchCapacity &capacity() const;
+  // Required per-call receive storage: exact rows in dynamic mode, declared
+  // maximum fan-in in static mode, including future routing changes.
+  std::uint64_t received_row_capacity() const;
   // Enqueue a fresh Notify into static storage using the retained input
   // tensors. Their values may change, their shape and addresses may not.
   // The caller must finish the prior FWD/BWD before reusing this storage.

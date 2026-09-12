@@ -63,9 +63,6 @@
       64,
       32
     ],
-    "gin_max_inflight": [
-      24
-    ],
     "setup_threads": [
       256
     ],

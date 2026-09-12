@@ -22,6 +22,10 @@ struct ForwardKernelArgs {
   ncclWindow_t gin_window = nullptr;
 #endif
   void *gin_window_base = nullptr;
+  communication::ChunkRingLayout gin_rings;
+  std::size_t local_notification_offset = 0;
+  unsigned local_notification_ctas = 0;
+  std::size_t forward_return_queues_offset = 0;
   std::size_t gin_send_header_offset = 0;
   std::size_t gin_receive_header_offset = 0;
   std::size_t gin_send_fanout_offset = 0;
@@ -36,7 +40,6 @@ struct ForwardKernelArgs {
   std::size_t gin_return_send_rows_offset = 0;
   std::size_t gin_return_receive_rows_offset = 0;
   std::size_t forward_return_rows_offset = 0;
-  std::size_t forward_return_peers_offset = 0;
   std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
@@ -55,15 +58,16 @@ struct ForwardKernelArgs {
   std::size_t direct_headers_offset;
   std::size_t contribution_offset;
   std::size_t return_ready_epoch_offset;
-  std::size_t combined_offset;
+  transport::BFloat16 *output = nullptr;
   std::size_t ingress_published_offset;
   std::size_t outgoing_sequence_offset;
   std::size_t status_offset;
   std::size_t forward_s_offset;
-  std::size_t forward_ab_cache_offset;
+  transport::BFloat16 *saved_ab = nullptr;
+  std::uint64_t saved_rows = 0;
   std::size_t forward_task_claim_offset;
   std::size_t forward_fc1_done_offset;
-  std::size_t forward_fc1_published_offset;
+  std::size_t forward_input_groups_offset;
   std::size_t forward_compute_pair_mailboxes_offset;
   std::size_t forward_scheduler_offset;
   std::size_t forward_v3_control_offset;
@@ -83,12 +87,9 @@ struct ForwardKernelArgs {
   std::size_t gin_send_dispatch_directory_offset = 0;
   std::size_t gin_receive_dispatch_directory_offset = 0;
   std::size_t x_arrived_rows_offset = 0;
-  std::size_t forward_return_row_map_offset = 0;
-  std::size_t forward_return_row_to_source_route_offset = 0;
   // FULL Return keeps payloads in the registered compact receive plane.
   // Dispatch records this source-route -> compact-row map before sending data.
   // Reduce consumes it after Return readiness without a second NVLink scatter.
-  std::size_t forward_source_route_to_return_row_offset = 0;
   // Token-ready reduction queue.  Every route publication increments the
   // owning source token's counter; the top-k completion appends the token.
   // Queue slots encode token+1; generation setup clears the active token
@@ -130,13 +131,6 @@ struct ForwardKernelArgs {
   // compute CTAs can consequently reuse the same W1 tile through L2 without
   // delaying Dispatch itself or requiring a cluster-wide rendezvous.
   std::uint32_t forward_fc1_locality_group = 1;
-  // Bound outstanding FULL Return puts per physical GIN context. Zero keeps
-  // the legacy unbounded issue behavior for autotuner/regression A/B runs.
-  std::uint32_t forward_return_max_inflight = 16;
-  // When enabled, FC2 writes every canonical output row once into the GIN
-  // registered staging plane. Both local Relay TMA and remote FULL puts then
-  // consume that same allocation, eliminating the second remote-row store.
-  bool forward_registered_output = false;
   // When locality_group is two, this half-open window uses groups of four.
   std::uint8_t forward_fc1_locality_group4_begin = 4;
   std::uint8_t forward_fc1_locality_group4_end = 12;
@@ -144,7 +138,6 @@ struct ForwardKernelArgs {
   // matching 64-row dispatch tile arrives. Physical storage remains padded to
   // the canonical 128-row quantum.
   std::uint32_t forward_mblock_rows = 128;
-  std::uint32_t forward_return_batch_rows = 512;
   bool retain_backward_state = false;
   // Production ready-token scheduler: reduction consumes only tokens whose
   // complete top-k route set has arrived instead of waiting on a fixed token

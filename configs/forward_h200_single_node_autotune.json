@@ -57,9 +57,6 @@
       32,
       40
     ],
-    "rdma_control_warps": [
-      2
-    ],
     "local_return_tma_warps": [
       0,
       8
@@ -76,16 +73,6 @@
     "dispatch_publish_batch_rows": [
       128,
       32
-    ],
-    "return_batch_rows": [
-      128,
-      256
-    ],
-    "return_max_inflight": [
-      16
-    ],
-    "registered_output": [
-      true
     ],
     "relay_local_return": [
       true

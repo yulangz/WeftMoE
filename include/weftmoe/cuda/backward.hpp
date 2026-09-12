@@ -10,9 +10,8 @@ WEFTMOE_PUBLIC_API_BEGIN
 
 namespace weftmoe::cuda {
 
-// Readiness-bearing, caller-owned source-token dY. Unlike an activation
-// lease, this does not consume a transport-pool slot: retained Forward state
-// already owns the slot containing X, A/B, and the Backward workspace.
+// Readiness-bearing, caller-owned source-token dY. Like a Forward activation
+// lease, this never consumes an execution-workspace slot.
 class BFloat16OutputGradientLease {
 public:
   BFloat16OutputGradientLease() = default;
@@ -40,6 +39,7 @@ enum class BackwardKernelSpecialization : std::uint8_t {
 struct BackwardMegaKernelConfig {
   std::uint64_t hidden_size = 0;
   std::uint64_t intermediate_size = 0;
+  BackwardTensorStorage tensors{};
 };
 
 struct BackwardMegaKernelTimings {
@@ -75,6 +75,7 @@ public:
   const ActivationTransportExpectation &identity() const;
   const BackwardMegaKernelAudit &audit() const;
   const BackwardMegaKernelTimings &timings() const;
+  const BackwardTensorStorage &tensors() const;
   void wait() const;
   void wait_on(CUstream_st *stream) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }

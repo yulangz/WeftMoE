@@ -223,6 +223,8 @@ def main():
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
     parser.add_argument("--stage-profile", action="store_true")
+    parser.add_argument("--inference", action="store_true",
+                        help="run Forward without retained backward state")
     parser.add_argument("--save-output-dir",
                         help="shared directory for per-rank Forward tensors")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
@@ -233,6 +235,8 @@ def main():
         parser.error("--gpus-per-node must be positive")
     if args.stage_profile and args.workload != "forward":
         parser.error("--stage-profile currently profiles Forward only")
+    if args.inference and args.workload != "forward":
+        parser.error("--inference requires --workload forward")
     if args.ib_gid_index < 0:
         parser.error("--ib-gid-index must be non-negative")
     hcas = parse_hcas(args.ib_hca)

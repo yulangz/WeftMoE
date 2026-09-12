@@ -2323,7 +2323,12 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                             const weftmoe::cuda::NcclSession &base,
                             const weftmoe::cuda::CudaExecution &execution) {
   using namespace weftmoe::cuda;
-  constexpr std::uint64_t tokens = 13, capacity = 64;
+  const auto *configured_tokens =
+      std::getenv("WEFTMOE_TEST_BUFFER_MODE_TOKENS");
+  const std::uint64_t tokens =
+      configured_tokens ? std::stoull(configured_tokens) : 13;
+  require(tokens != 0, "buffer-mode token count must be positive");
+  const auto capacity = std::max<std::uint64_t>(tokens, 64);
   constexpr auto hidden = forward_tuning::kMainHidden;
   constexpr auto intermediate = forward_tuning::kMainIntermediate;
   const auto experts = std::max(16U, world * 2U);
@@ -2394,6 +2399,8 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   std::array<std::uint64_t, 3> forward_hashes{}, backward_hashes{};
   ActivationTransportResourcePool dynamic_pool;
   DeviceBackwardHandle retained_backward;
+  DeviceForwardHandle retained_forward;
+  std::uint64_t retained_dx_hash = 0;
   BackwardMegaKernel backward_kernel;
   for (unsigned int distribution : {1U, 0U, 2U}) {
     set_routes(distribution);
@@ -2406,12 +2413,17 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
       require(notify.dispatch().capacity().destination_rows_per_rank ==
                   world * tokens * 2,
               "Notify lost skewed expert rows");
+    const auto previous_registered =
+        dynamic_pool ? dynamic_pool.usage().gin_registered_bytes : 0;
     const auto previous_bytes =
         dynamic_pool ? dynamic_pool.usage().device_bytes : 0;
     dynamic_pool = prepare_activation_transport_pool(
         generation.session(), execution, storage, notify.dispatch(),
         dynamic_pool);
     auto pool = dynamic_pool;
+    if (nodes > 1 && previous_registered)
+      require(pool.usage().gin_registered_bytes == previous_registered,
+              "routing growth changed the fixed GIN ring capacity");
     if (world > 1 && distribution == 0)
       require(pool.usage().device_bytes > previous_bytes,
               "skewed routing did not grow the pool");
@@ -2424,24 +2436,75 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
             "compatible pool grew unexpectedly");
     auto activation = testing::upload_bfloat16_activations_for_testing(
         input, tokens, hidden, context, execution, pool);
+    ForwardMegaKernelConfig forward_config{hidden, intermediate, true};
+    const auto allocate = [&](std::uint64_t bytes) {
+      auto owner = std::make_shared<internal::CudaAllocation>();
+      owner->device = execution.device_ordinal();
+      owner->device_bytes = std::max<std::uint64_t>(bytes, 128);
+      check(cudaMalloc(&owner->device_ptr, owner->device_bytes));
+      return CudaTensorBuffer{owner->device_ptr, bytes, owner};
+    };
+    const auto received = notify.dispatch().sizes().incoming_row_count;
+    ForwardTensorBuffers bindings{allocate(tokens * hidden * 2),
+                                  allocate(received * hidden * 2),
+                                  allocate(received * intermediate * 4)};
+    if (distribution == 1) {
+      auto too_small = bindings;
+      too_small.output.bytes--;
+      bool rejected = false;
+      try {
+        (void)prepare_forward_tensors(notify.dispatch(), execution,
+                                      forward_config, too_small);
+      } catch (const std::exception &) {
+        rejected = true;
+      }
+      require(rejected, "undersized external output was accepted");
+    }
+    forward_config.tensors = prepare_forward_tensors(
+        notify.dispatch(), execution, forward_config, bindings, allocate);
+    bindings = {};
     DeviceForwardHandle forward;
     if (nodes > 1) {
       GinRdmaForwardMegaKernel kernel(generation, execution, pool);
       forward = kernel.enqueue(notify.dispatch(), activation, weights,
-                               {hidden, intermediate, true});
+                               forward_config);
     } else {
       LocalCudaP2pForwardMegaKernel kernel(generation, execution, pool);
       forward = kernel.enqueue(notify.dispatch(), activation, weights,
-                               {hidden, intermediate, true});
+                               forward_config);
     }
     forward.wait();
+    forward_config.tensors = {};
+    require(pool.usage().slots_in_use == 0,
+            "saved Forward tensors retained a completed execution slot");
     forward_hashes[distribution] = hash_bf16_indexed(
         download_forward_output_for_validation(forward, execution));
+    BackwardMegaKernelConfig backward_config{hidden, intermediate};
+    backward_config.tensors = prepare_backward_tensors(
+        notify.dispatch(), execution, backward_config, {}, allocate);
     auto backward =
-        backward_kernel.enqueue(forward, gradients, {hidden, intermediate});
+        backward_kernel.enqueue(forward, gradients, backward_config);
     auto result = BackwardValidationBridge::download(backward, execution);
     backward_hashes[distribution] = hash_bf16_indexed(result.dx);
     backward.wait();
+    require(pool.usage().slots_in_use == 0,
+            "Backward outputs retained a completed execution slot");
+    require(hash_bf16_indexed(download_forward_output_for_validation(
+                forward, execution)) == forward_hashes[distribution],
+            "Backward overwrote the independent Forward output");
+    if (distribution == 0) {
+      retained_forward = forward;
+      retained_dx_hash = backward_hashes[distribution];
+    } else if (distribution == 2) {
+      // This pool has just run another Forward and Backward. The old saved
+      // X/AB/routing must still drive Backward correctly after scratch reuse.
+      auto repeated = backward_kernel.run(retained_forward, gradients,
+                                          {hidden, intermediate});
+      require(hash_bf16_indexed(
+                  BackwardValidationBridge::download(repeated, execution).dx) ==
+                  retained_dx_hash,
+              "workspace reuse changed retained Forward state");
+    }
     if (world > 1 && distribution == 1)
       retained_backward = backward;
     else if (retained_backward)
@@ -2450,6 +2513,7 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                                     .dx) == backward_hashes[1],
               "growing a pool changed a retained Backward result");
   }
+  retained_forward = {};
   retained_backward = {};
   dynamic_pool = {};
   set_routes(0);
@@ -2480,22 +2544,26 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   check(cudaStreamCreateWithFlags(&snapshot_stream, cudaStreamNonBlocking));
   check(cudaEventCreateWithFlags(&snapshot_done, cudaEventDisableTiming));
   check(cudaStreamSynchronize(exec->stream));
+  ForwardMegaKernelConfig graph_forward{hidden, intermediate, true};
+  graph_forward.tensors =
+      prepare_forward_tensors(notify.dispatch(), execution, graph_forward);
+  BackwardMegaKernelConfig graph_backward{hidden, intermediate};
+  graph_backward.tensors =
+      prepare_backward_tensors(notify.dispatch(), execution, graph_backward);
   check(cudaStreamBeginCapture(exec->stream, cudaStreamCaptureModeGlobal));
   notify.dispatch().enqueue_notify(generation);
   auto forward = remote ? remote->enqueue(notify.dispatch(), activation,
-                                          weights, {hidden, intermediate, true})
+                                          weights, graph_forward)
                         : local->enqueue(notify.dispatch(), activation, weights,
-                                         {hidden, intermediate, true});
-  // Forward and dX deliberately share the final output plane. Capture the
-  // Forward result before Backward reuses it.
+                                         graph_forward);
+  // Consume the independently owned Forward output on a separate stream.
   forward.wait_on(snapshot_stream);
   check(cudaMemcpyAsync(
       snapshot->host_ptr, forward_output_device_pointer_for_testing(forward),
       snapshot->host_bytes, cudaMemcpyDeviceToHost, snapshot_stream));
   check(cudaEventRecord(snapshot_done, snapshot_stream));
   check(cudaStreamWaitEvent(exec->stream, snapshot_done));
-  auto backward =
-      backward_kernel.enqueue(forward, gradients, {hidden, intermediate});
+  auto backward = backward_kernel.enqueue(forward, gradients, graph_backward);
   backward.wait_on(snapshot_stream);
   check(cudaEventRecord(snapshot_done, snapshot_stream));
   check(cudaStreamWaitEvent(exec->stream, snapshot_done));
@@ -2517,6 +2585,9 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                 ": actual=" + std::to_string(actual_forward) +
                 ", expected=" + std::to_string(forward_hashes[distribution]) +
                 ", dx=" + std::to_string(backward_hashes[distribution]));
+    require(hash_bf16_indexed(download_forward_output_for_validation(
+                forward, execution)) == actual_forward,
+            "captured Backward aliased Forward output");
     auto result = BackwardValidationBridge::download(backward, execution);
     require(hash_bf16_indexed(result.dx) == backward_hashes[distribution],
             "Graph Backward used stale routing or counts");
@@ -2525,7 +2596,7 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   check(cudaGraphDestroy(graph));
   check(cudaEventDestroy(snapshot_done));
   check(cudaStreamDestroy(snapshot_stream));
-  std::cout << "BUFFER_MODES rank=" << rank
+  std::cout << "BUFFER_MODES rank=" << rank << " tokens=" << tokens
             << " dynamic=1 static=1 graph_replays=6 skew=1\n";
 }
 
@@ -2653,15 +2724,18 @@ void run_cached_backward_rank(
   std::vector<double> overlap_samples;
   weftmoe::cuda::DeviceBackwardHandle last;
   weftmoe::cuda::BackwardMegaKernel backward;
+  weftmoe::cuda::BackwardMegaKernelConfig backward_config{hidden, intermediate};
+  backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
+      notify.dispatch(), execution, backward_config);
   for (std::uint32_t round = 0; round < rounds; ++round) {
     progress("backward_enter");
     const auto begin = Clock::now();
-    auto output = backward.enqueue(
-        forward, output_gradients, {hidden, intermediate}, {});
+    auto output =
+        backward.enqueue(forward, output_gradients, backward_config, {});
     if (validation) {
       bool rejected = false;
       try {
-        (void)backward.enqueue(forward, output_gradients, {hidden, intermediate}, {});
+        (void)backward.enqueue(forward, output_gradients, backward_config, {});
       } catch (const weftmoe::NotifyDispatchError &error) {
         rejected = error.code() == weftmoe::NotifyErrorCode::ResourceExhausted;
       }
@@ -3141,10 +3215,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " slots=" << config.max_inflight_generations << std::endl;
     return;
   }
-  auto pool = weftmoe::cuda::make_device_notify_resource_pool(
-      base, execution,
-      {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
-       forward_smoke ? 3U : 2U});
+  weftmoe::cuda::DeviceNotifyResourcePool pool;
+  const auto prepare_notify_pool = [&] {
+    pool = weftmoe::cuda::make_device_notify_resource_pool(
+        base, execution,
+        {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
+         forward_smoke ? 3U : 2U});
+  };
+  if (!benchmark_forward)
+    prepare_notify_pool();
   if (benchmark_forward) {
     constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
     constexpr std::uint64_t intermediate = weftmoe::cuda::forward_tuning::kMainIntermediate;
@@ -3181,15 +3260,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.enable_socket_fallback = socket_forward_benchmark;
     const auto setup_start = Clock::now();
     weftmoe::cuda::ActivationTransportResourcePool transport_pool;
-    {
-      weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-          setup_generation, execution, pool);
-      auto notify = coordinator.run_device(
-          {common_config, route_storage, gate_storage, max_tokens});
-      transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
-          setup_generation.session(), execution, transport_config,
-          notify.dispatch());
-    }
     std::vector<weftmoe::transport::BFloat16> activation_host(
         static_cast<std::size_t>(max_tokens * hidden));
     for (std::size_t index = 0; index < activation_host.size(); ++index)
@@ -3198,10 +3268,26 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                  (index + fixture_token_offset * hidden +
                                   fixture_rank * 13U) % 127U) - 63) /
           64.0F);
+    // Caller-owned inputs and weights are prepared before timing. Transport
+    // storage is allocated after the first timed Notify, just as in dynamic
+    // execution, and checked for reuse after every subsequent Notify.
     auto activation_storage =
-        weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
-            activation_host, max_tokens, hidden, setup_context, execution,
-            transport_pool);
+        std::make_shared<weftmoe::cuda::internal::CudaAllocation>();
+    activation_storage->device = execution.device_ordinal();
+    activation_storage->device_bytes =
+        activation_host.size() * sizeof(activation_host.front());
+    const auto check_input_cuda = [](cudaError_t error) {
+      if (error != cudaSuccess)
+        throw std::runtime_error(std::string("forward benchmark input: ") +
+                                 cudaGetErrorString(error));
+    };
+    check_input_cuda(cudaMalloc(&activation_storage->device_ptr,
+                                activation_storage->device_bytes));
+    check_input_cuda(
+        cudaMemcpy(activation_storage->device_ptr, activation_host.data(),
+                   activation_storage->device_bytes, cudaMemcpyHostToDevice));
+    const auto execution_state =
+        weftmoe::cuda::internal::checked_execution_state(execution);
     const auto experts_per_rank = experts / world;
     const auto activation_hash = hash_bf16_indexed(activation_host);
     const auto route_hash = hash_i32(common_routes.selected_experts);
@@ -3234,18 +3320,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::unique_ptr<weftmoe::cuda::GinRdmaForwardMegaKernel> gin_forward;
     std::unique_ptr<weftmoe::cuda::NcclSocketFallbackForwardMegaKernel>
         socket_forward;
-    if (gin_forward_benchmark)
-      gin_forward =
-          std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
-              setup_generation, execution, transport_pool);
-    else if (socket_forward_benchmark)
-      socket_forward = std::make_unique<
-          weftmoe::cuda::NcclSocketFallbackForwardMegaKernel>(
-          setup_generation, execution, transport_pool);
-    else
-      local_forward =
-          std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
-              setup_generation, execution, transport_pool);
     const auto run_forward = [&](const auto &dispatch,
                                  const auto &activations,
                                  const auto &forward_weights,
@@ -3283,6 +3357,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             "forward benchmark generation range overflows");
     std::vector<double> wall_samples;
     std::vector<double> notify_samples;
+    std::vector<double> buffer_prepare_samples;
     std::vector<double> forward_samples;
     std::vector<double> dispatch_samples;
     std::vector<double> fc1_samples;
@@ -3295,6 +3370,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> terminal_status_samples;
     weftmoe::cuda::ForwardMegaKernelAudit last_audit;
     weftmoe::cuda::DeviceForwardHandle last_output;
+    weftmoe::cuda::BFloat16ActivationLease input_lease;
+    weftmoe::cuda::ForwardMegaKernelConfig forward_config{
+        hidden, intermediate, retain_backward_state};
+    double first_use_wall_us = 0;
+    double first_use_notify_pool_us = 0;
+    double first_use_notify_us = 0;
+    double first_use_buffer_prepare_us = 0;
+    double first_use_forward_us = 0;
     auto forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
       if (round == 10U)
@@ -3312,15 +3395,53 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       auto gates =
           weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
               gate_storage, routes, context, execution);
-      auto activations =
-          weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
-              activation_storage, context, execution);
+      // This benchmark explicitly reuses the same output tensor after its
+      // consumer has finished. Input storage and its readiness event also persist.
+      last_output = {};
       const auto wall_start = Clock::now();
+      if (round == 0U)
+        prepare_notify_pool();
+      const auto notify_start = Clock::now();
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           generation, execution, pool);
       auto notify = coordinator.run_device(
           {common_config, routes, gates, max_tokens});
       const auto notify_end = Clock::now();
+      transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
+          generation.session(), execution, transport_config, notify.dispatch(),
+          transport_pool);
+      // This benchmark repeats a fixed routing fixture, so the first pool
+      // remains sufficient. Backend construction includes peer mappings and
+      // GIN registration; keep it inside the first-use measurement.
+      if (round == 0U) {
+        if (gin_forward_benchmark)
+          gin_forward =
+              std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
+                  generation, execution, transport_pool);
+        else if (socket_forward_benchmark)
+          socket_forward = std::make_unique<
+              weftmoe::cuda::NcclSocketFallbackForwardMegaKernel>(
+              generation, execution, transport_pool);
+        else
+          local_forward =
+              std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
+                  generation, execution, transport_pool);
+      }
+      const auto producer = weftmoe::cuda::make_external_cuda_producer(
+          context, execution.device_ordinal(), execution_state->stream,
+          execution_state, "forward-benchmark-input");
+      if (!input_lease)
+        input_lease = producer.publish_activations(
+            static_cast<const weftmoe::transport::BFloat16 *>(
+                activation_storage->device_ptr),
+            activation_host.size(), max_tokens, hidden, activation_storage);
+      auto activations =
+          weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
+              input_lease, context, execution);
+      if (!forward_config.tensors)
+        forward_config.tensors = weftmoe::cuda::prepare_forward_tensors(
+            notify.dispatch(), execution, forward_config);
+      const auto buffer_prepare_end = Clock::now();
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
                   << " round=" << round << " phase=notify_done"
@@ -3341,9 +3462,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
                   << " round=" << round << " phase=forward_enter"
                   << std::endl;
-      auto output = run_forward(
-          notify.dispatch(), activations, weights,
-          {hidden, intermediate, retain_backward_state}, run_options);
+      auto output = run_forward(notify.dispatch(), activations, weights,
+                                forward_config, run_options);
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
                   << " round=" << round << " phase=forward_done"
@@ -3351,12 +3471,31 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto wall_end = Clock::now();
       last_audit = output.audit();
       last_output = output;
+      if (round == 0U) {
+        first_use_wall_us =
+            std::chrono::duration<double, std::micro>(wall_end - wall_start)
+                .count();
+        first_use_notify_pool_us =
+            std::chrono::duration<double, std::micro>(notify_start - wall_start)
+                .count();
+        first_use_notify_us =
+            std::chrono::duration<double, std::micro>(notify_end - notify_start)
+                .count();
+        first_use_buffer_prepare_us = std::chrono::duration<double, std::micro>(
+                                          buffer_prepare_end - notify_end)
+                                          .count();
+        first_use_forward_us = output.timings().total_us;
+      }
       if (round >= 10U) {
         wall_samples.push_back(
             std::chrono::duration<double, std::micro>(wall_end - wall_start)
                 .count());
         notify_samples.push_back(
-            std::chrono::duration<double, std::micro>(notify_end - wall_start)
+            std::chrono::duration<double, std::micro>(notify_end - notify_start)
+                .count());
+        buffer_prepare_samples.push_back(
+            std::chrono::duration<double, std::micro>(buffer_prepare_end -
+                                                      notify_end)
                 .count());
         forward_samples.push_back(output.timings().total_us);
         dispatch_samples.push_back(output.timings().dispatch_us);
@@ -3461,70 +3600,67 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             : (std::getenv("WEFTMOE_FORWARD_LEGACY_REDUCE") != nullptr
                    ? "legacy"
                    : "queue");
-    std::cout << "FORWARD_BENCH rank=" << rank
-              << " world=" << world
-              << " tokens=" << common_routes.num_tokens
-              << " experts=" << experts << " top_k=" << top_k
-              << " hidden=" << hidden << " intermediate=" << intermediate
-              << " backend="
-              << (gin_forward_benchmark
-                      ? "gin-rdma"
-                      : socket_forward_benchmark ? "nccl-socket-fallback"
-                                                 : "local-cuda-p2p")
-              << " specialization=sm90-wgmma-tma-" << hidden << "x" << intermediate
-              << " retained_backward_state=" << retain_backward_state
-              << " reduce_scheduler=" << reduce_scheduler
-              << " setup_us=" << one_time_setup_us
-              << " device_pool_bytes=" << usage.device_bytes
-              << " compute_pool_bytes=" << usage.compute_device_bytes
-              << " gin_registered_bytes=" << usage.gin_registered_bytes
-              << " pinned_pool_bytes=" << usage.pinned_bytes
-              << " pool_events=" << usage.event_count
-              << " weight_bytes=" << weights.device_bytes()
-              << " persistent_launches="
-              << last_audit.persistent_kernel_launches
-              << " wgmma=" << last_audit.wgmma_instructions
-              << " tma=" << last_audit.tma_loads
-              << " multicast=" << last_audit.tma_multicast_loads
-              << " dispatch_peer_bytes="
-              << last_audit.actual_dispatch_peer_bytes
-              << " return_peer_bytes="
-              << last_audit.actual_return_peer_bytes
-              << " gin_dispatch_puts="
-              << last_audit.gin_dispatch_put_count
-              << " raw_remote_route_bytes="
-              << last_audit.raw_cross_node_route_bytes
-              << " gin_dispatch_payload_bytes="
-              << last_audit.gin_dispatch_payload_bytes
-              << " gin_return_payload_bytes="
-              << last_audit.gin_return_payload_bytes
-              << " gin_return_puts=" << last_audit.gin_return_put_count
-              << " gin_signals=" << last_audit.gin_signal_count
-              << " gin_metadata_bytes=" << last_audit.gin_metadata_bytes
-              << " activation_hash=" << activation_hash
-              << " route_hash=" << route_hash
-              << " gate_hash=" << gate_hash
-              << " weight_generator_version=3"
-              << " weight_hash=" << weight_hash
-              << " actual_w1_hash_low=" << actual_weight_hashes.w1.low
-              << " actual_w1_hash_high=" << actual_weight_hashes.w1.high
-              << " actual_w2_hash_low=" << actual_weight_hashes.w2.low
-              << " actual_w2_hash_high=" << actual_weight_hashes.w2.high
-              << " first_token_output_unique_at_least="
-              << first_token_unique.size()
-              << " cluster_supported="
-              << static_cast<unsigned int>(
-                     last_audit.runtime_cluster_supported)
-              << " cluster_requested=" << last_audit.requested_cluster_size
-              << " cluster_actual=" << last_audit.runtime_cluster_size
-              << " cluster_rank_mask="
-              << last_audit.observed_cluster_rank_mask
-              << " max_active_clusters=" << last_audit.max_active_clusters
+    std::cout
+        << "FORWARD_BENCH rank=" << rank << " world=" << world
+        << " tokens=" << common_routes.num_tokens << " experts=" << experts
+        << " top_k=" << top_k << " hidden=" << hidden
+        << " intermediate=" << intermediate << " backend="
+        << (gin_forward_benchmark      ? "gin-rdma"
+            : socket_forward_benchmark ? "nccl-socket-fallback"
+                                       : "local-cuda-p2p")
+        << " specialization=sm90-wgmma-tma-" << hidden << "x" << intermediate
+        << " retained_backward_state=" << retain_backward_state
+        << " reduce_scheduler=" << reduce_scheduler
+        << " timing_scope=notify-buffer-forward"
+        << " setup_us=" << one_time_setup_us
+        << " first_use_wall_us=" << first_use_wall_us
+        << " first_use_notify_pool_us=" << first_use_notify_pool_us
+        << " first_use_notify_us=" << first_use_notify_us
+        << " first_use_buffer_prepare_us=" << first_use_buffer_prepare_us
+        << " first_use_forward_us=" << first_use_forward_us
+        << " device_pool_bytes=" << usage.device_bytes
+        << " compute_pool_bytes=" << usage.compute_device_bytes
+        << " gin_registered_bytes=" << usage.gin_registered_bytes
+        << " pinned_pool_bytes=" << usage.pinned_bytes
+        << " pool_events=" << usage.event_count
+        << " weight_bytes=" << weights.device_bytes()
+        << " persistent_launches=" << last_audit.persistent_kernel_launches
+        << " wgmma=" << last_audit.wgmma_instructions
+        << " tma=" << last_audit.tma_loads
+        << " multicast=" << last_audit.tma_multicast_loads
+        << " dispatch_peer_bytes=" << last_audit.actual_dispatch_peer_bytes
+        << " return_peer_bytes=" << last_audit.actual_return_peer_bytes
+        << " gin_dispatch_puts=" << last_audit.gin_dispatch_put_count
+        << " raw_remote_route_bytes=" << last_audit.raw_cross_node_route_bytes
+        << " gin_dispatch_payload_bytes="
+        << last_audit.gin_dispatch_payload_bytes
+        << " gin_return_payload_bytes=" << last_audit.gin_return_payload_bytes
+        << " gin_return_puts=" << last_audit.gin_return_put_count
+        << " gin_signals=" << last_audit.gin_signal_count
+        << " gin_metadata_bytes=" << last_audit.gin_metadata_bytes
+        << " activation_hash=" << activation_hash
+        << " route_hash=" << route_hash << " gate_hash=" << gate_hash
+        << " weight_generator_version=3"
+        << " weight_hash=" << weight_hash
+        << " actual_w1_hash_low=" << actual_weight_hashes.w1.low
+        << " actual_w1_hash_high=" << actual_weight_hashes.w1.high
+        << " actual_w2_hash_low=" << actual_weight_hashes.w2.low
+        << " actual_w2_hash_high=" << actual_weight_hashes.w2.high
+        << " first_token_output_unique_at_least=" << first_token_unique.size()
+        << " cluster_supported="
+        << static_cast<unsigned int>(last_audit.runtime_cluster_supported)
+        << " cluster_requested=" << last_audit.requested_cluster_size
+        << " cluster_actual=" << last_audit.runtime_cluster_size
+        << " cluster_rank_mask=" << last_audit.observed_cluster_rank_mask
+        << " max_active_clusters=" << last_audit.max_active_clusters
               << " steady_forbidden_cuda_api_calls=0"
-              << " output_hash=" << output_hash << " wall=";
+              << " tensor_bytes=" << forward_config.tensors.bytes()
+        << " output_hash=" << output_hash << " wall=";
     emit_values(wall_samples);
     std::cout << " notify=";
     emit_values(notify_samples);
+    std::cout << " buffer_prepare=";
+    emit_values(buffer_prepare_samples);
     std::cout << " forward=";
     emit_values(forward_samples);
     std::cout << " dispatch=";
@@ -3627,9 +3763,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     };
     weftmoe::cuda::ActivationTransportRunOptions run_options;
     run_options.deadline_after = std::chrono::seconds(120);
-    // Two physical transport slots and two live Forward handles must remain
-    // isolated. Drop the producer leases after submission so the handles are
-    // the final owners, then prove pool exhaustion and exact release.
+    // Saved outputs remain independent while completed executions release
+    // their workspace slots, even when the original input leases are gone.
     if (world == 1U) {
       auto second_input = input;
       for (auto &value : second_input)
@@ -3682,17 +3817,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       require(first_before == first_after && first_before != second_output,
               "two live generations aliased output storage");
       auto live_usage = transport_pool.usage();
-      require(live_usage.slots_in_use == 2 && live_usage.slots_available == 0,
-              "two live Forward handles did not retain both slots");
-      bool exhausted = false;
-      try {
-        (void)weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
-            input, max_tokens, hidden, context, execution, transport_pool);
-      } catch (const weftmoe::NotifyDispatchError &error) {
-        exhausted =
-            error.code() == weftmoe::NotifyErrorCode::ResourceExhausted;
-      }
-      require(exhausted, "pool=2 accepted a third live generation");
+      require(live_usage.slots_in_use == 0 && live_usage.slots_available == 2,
+              "completed Forward outputs retained execution slots");
       live_first = {};
       live_second = {};
       live_usage = transport_pool.usage();

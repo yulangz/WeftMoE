@@ -89,9 +89,6 @@
 #ifndef WEFTMOE_BWD_DW1_CLAIM_TILES
 #define WEFTMOE_BWD_DW1_CLAIM_TILES 4
 #endif
-#ifndef WEFTMOE_BWD_GIN_MAX_INFLIGHT
-#define WEFTMOE_BWD_GIN_MAX_INFLIGHT 24
-#endif
 #ifndef WEFTMOE_BWD_SETUP_THREADS
 #define WEFTMOE_BWD_SETUP_THREADS 256
 #endif
@@ -154,8 +151,6 @@ inline constexpr std::uint32_t kDw2ClaimTiles =
     WEFTMOE_BWD_DW2_CLAIM_TILES;
 inline constexpr std::uint32_t kDw1ClaimTiles =
     WEFTMOE_BWD_DW1_CLAIM_TILES;
-inline constexpr std::uint32_t kGinMaxInflight =
-    WEFTMOE_BWD_GIN_MAX_INFLIGHT;
 inline constexpr std::uint32_t kSetupThreads = WEFTMOE_BWD_SETUP_THREADS;
 inline constexpr std::uint32_t kSetupIdleNanosleep =
     WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP;
@@ -204,7 +199,6 @@ static_assert(kDw2ClaimTiles == 1U || kDw2ClaimTiles == 4U ||
               kDw2ClaimTiles == 8U || kDw2ClaimTiles == 16U);
 static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 4U ||
               kDw1ClaimTiles == 8U || kDw1ClaimTiles == 16U);
-static_assert(kGinMaxInflight >= 1U && kGinMaxInflight <= 64U);
 static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
               kSetupThreads % 32U == 0U);
 static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&

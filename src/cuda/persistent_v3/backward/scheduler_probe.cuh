@@ -14,8 +14,7 @@ inline constexpr std::uint32_t kSchedulerProbeMblocks =
 inline constexpr std::uint32_t kSchedulerProbeDabTiles = 5U;
 inline constexpr std::uint32_t kSchedulerProbeDxTiles = 3U;
 inline constexpr std::uint32_t kSchedulerProbeDw2Tiles = 7U;
-// Cross a 64-bit claim-word boundary so the probe exercises the same
-// multiword owner geometry used by production dW domains.
+// Exercise a non-power-of-two expert tile range, including its final tile.
 inline constexpr std::uint32_t kSchedulerProbeDw1Tiles = 67U;
 inline constexpr std::uint32_t kSchedulerProbeDabTasks =
     kSchedulerProbeMblocks * kSchedulerProbeDabTiles;
@@ -33,19 +32,21 @@ inline constexpr unsigned long long kSchedulerProbeEpoch = 23ULL;
 
 static_assert(kSchedulerProbeTotalTasks == 392U);
 
-// This workspace intentionally uses exactly the same summary/claim geometry
-// as production, only at a small scale. DAB owners are M-blocks; dW owners are
-// experts. Every payload descriptor remains implicit in (owner, tile).
+// Use the production bitmap for activation tasks and expert queues for dW.
 struct alignas(128) BackwardSchedulerProbeWorkspace {
   unsigned long long dx_ready[1];
   unsigned long long dab_ready[1];
-  unsigned long long dw2_ready[1];
-  unsigned long long dw1_ready[1];
+  unsigned long long dw2_ready[kSchedulerProbeExperts];
+  unsigned long long dw1_ready[kSchedulerProbeExperts];
 
   unsigned long long dx_claim[kSchedulerProbeMblocks];
   unsigned long long dab_claim[kSchedulerProbeMblocks];
   unsigned long long dw2_claim[kSchedulerProbeExperts];
-  unsigned long long dw1_claim[kSchedulerProbeExperts * 2U];
+  unsigned long long dw1_claim[kSchedulerProbeExperts];
+  PaddedCounter dw2_reserved;
+  PaddedCounter dw2_head;
+  PaddedCounter dw1_reserved;
+  PaddedCounter dw1_head;
 
   PaddedCounter dab_tiles_completed[kSchedulerProbeMblocks];
   PaddedCounter expert_dab_tiles_completed[kSchedulerProbeExperts];
@@ -63,6 +64,8 @@ struct alignas(128) BackwardSchedulerProbeWorkspace {
 
   unsigned long long priority_ready[kTaskKindCount];
   unsigned long long priority_claim[kTaskKindCount];
+  PaddedCounter priority_reserved[2];
+  PaddedCounter priority_head[2];
 };
 
 #if defined(__CUDACC__)
@@ -70,17 +73,15 @@ WEFTMOE_V3_DEVICE inline WorkQueues
 make_scheduler_probe_queues(BackwardSchedulerProbeWorkspace &work) {
   return WorkQueues{
       TileDomain{work.dx_ready, work.dx_claim, kSchedulerProbeMblocks,
-                 kSchedulerProbeDxTiles,
-                 TaskKind::Dx},
+                 kSchedulerProbeDxTiles, TaskKind::Dx},
       TileDomain{work.dab_ready, work.dab_claim, kSchedulerProbeMblocks,
-                 kSchedulerProbeDabTiles,
-                 TaskKind::Dab},
-      TileDomain{work.dw2_ready, work.dw2_claim, kSchedulerProbeExperts,
-                 kSchedulerProbeDw2Tiles,
-                 TaskKind::Dw2},
-      TileDomain{work.dw1_ready, work.dw1_claim, kSchedulerProbeExperts,
-                 kSchedulerProbeDw1Tiles,
-                 TaskKind::Dw1}};
+                 kSchedulerProbeDabTiles, TaskKind::Dab},
+      ExpertTileQueue{work.dw2_ready, work.dw2_claim, &work.dw2_reserved.value,
+                      &work.dw2_head.value, kSchedulerProbeExperts,
+                      kSchedulerProbeDw2Tiles, TaskKind::Dw2},
+      ExpertTileQueue{work.dw1_ready, work.dw1_claim, &work.dw1_reserved.value,
+                      &work.dw1_head.value, kSchedulerProbeExperts,
+                      kSchedulerProbeDw1Tiles, TaskKind::Dw1}};
 }
 
 WEFTMOE_V3_DEVICE inline WorkQueues
@@ -90,14 +91,16 @@ make_scheduler_priority_queues(BackwardSchedulerProbeWorkspace &work) {
                  TaskKind::Dx},
       TileDomain{&work.priority_ready[1], &work.priority_claim[1], 1U, 1U,
                  TaskKind::Dab},
-      TileDomain{&work.priority_ready[2], &work.priority_claim[2], 1U, 1U,
-                 TaskKind::Dw2},
-      TileDomain{&work.priority_ready[3], &work.priority_claim[3], 1U, 1U,
-                 TaskKind::Dw1}};
+      ExpertTileQueue{&work.priority_ready[2], &work.priority_claim[2],
+                      &work.priority_reserved[0].value,
+                      &work.priority_head[0].value, 1U, 1U, TaskKind::Dw2},
+      ExpertTileQueue{&work.priority_ready[3], &work.priority_claim[3],
+                      &work.priority_reserved[1].value,
+                      &work.priority_head[1].value, 1U, 1U, TaskKind::Dw1}};
 }
 
-WEFTMOE_V3_DEVICE inline void scheduler_probe_increment(
-    unsigned long long &word) {
+WEFTMOE_V3_DEVICE inline void
+scheduler_probe_increment(unsigned long long &word) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> value(
       word);
   value.fetch_add(1ULL, ::cuda::memory_order_relaxed);
