@@ -267,6 +267,7 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--integrated-benchmark", action="store_true")
     parser.add_argument("--buffer-modes", action="store_true")
+    parser.add_argument("--communication-benchmark", action="store_true")
     parser.add_argument("--forward-smoke", action="store_true")
     parser.add_argument("--forward-benchmark", action="store_true")
     parser.add_argument("--backward-validation", action="store_true")
@@ -284,14 +285,17 @@ def main():
     parser.add_argument("--compute-sanitizer-tool",
                         choices=("memcheck", "racecheck", "initcheck"))
     args = parser.parse_args()
-    if sum((args.benchmark, args.integrated_benchmark,
+    if sum((args.benchmark, args.integrated_benchmark, args.buffer_modes,
             args.forward_smoke, args.forward_benchmark,
-            args.backward_validation, args.backward_benchmark)) > 1:
+            args.backward_validation, args.backward_benchmark,
+            args.communication_benchmark)) > 1:
         parser.error("choose only one benchmark/smoke mode")
     benchmark_mode = (args.benchmark or args.integrated_benchmark or
-                      args.forward_benchmark or args.backward_benchmark)
+                      args.forward_benchmark or args.backward_benchmark or
+                      args.communication_benchmark)
     if args.rounds is None:
-        args.rounds = (30 if args.backward_benchmark else
+        args.rounds = (30 if args.backward_benchmark or
+                       args.communication_benchmark else
                        (2 if args.backward_validation else
                         (110 if benchmark_mode else 1)))
     if benchmark_mode and not args.backward_benchmark and args.rounds <= 10:
@@ -314,6 +318,8 @@ def main():
     if args.integrated_benchmark:
         environment["WEFTMOE_INTEGRATED_BENCH_ROUNDS"] = str(args.rounds)
         environment["WEFTMOE_INTEGRATED_TOP_K"] = str(args.top_k)
+    elif args.communication_benchmark:
+        environment["WEFTMOE_COMM_BENCH_ROUNDS"] = str(args.rounds)
     elif args.forward_benchmark:
         environment["WEFTMOE_FORWARD_BENCH_ROUNDS"] = str(args.rounds)
     elif args.backward_validation or args.backward_benchmark:
@@ -350,7 +356,9 @@ def main():
                "--print-limit=10", "--error-exitcode=1"))
     read_fd, write_fd = os.pipe()
     processes = []
-    if args.buffer_modes:
+    if args.communication_benchmark:
+        scenario = "communication_bench"
+    elif args.buffer_modes:
         scenario = "buffer_modes"
     elif args.backward_benchmark:
         scenario = "backward_bench"
@@ -452,6 +460,9 @@ def main():
                     f"sanitizer={sanitizer} "
                     f"stdout_tail={stdout[-1000:]} stderr={stderr[-3000:]}"
                 )
+            if args.communication_benchmark:
+                observed.append(parse_fields(stdout, "COMM_BENCH "))
+                continue
             if args.buffer_modes:
                 observed.append(parse_fields(stdout, "BUFFER_MODES "))
                 continue
@@ -491,6 +502,21 @@ def main():
                     item["_nccl_runtime"] = runtime["runtime"]
                     item["_nccl_library"] = runtime["library"]
                 observed.append(item)
+        if args.communication_benchmark:
+            for item in observed:
+                print("COMM_BENCH " + " ".join(
+                    f"{key}={value}" for key, value in item.items()), flush=True)
+            samples = [[float(value) for value in item["samples"].split(",")]
+                       for item in observed]
+            if len(samples) != args.world or any(len(row) != args.rounds - 10
+                                                for row in samples):
+                raise AssertionError("incomplete communication benchmark")
+            slowest = [max(row[i] for row in samples)
+                       for i in range(args.rounds - 10)]
+            print(f"COMM_RESULT world={args.world} "
+                  f"p50_us={statistics.median(slowest):.3f} "
+                  f"mean_us={statistics.mean(slowest):.3f}", flush=True)
+            return
         if args.buffer_modes:
             if len(observed) != args.world or any(item.get("graph_replays") != "6" for item in observed):
                 raise AssertionError("incomplete buffer mode checks")

@@ -72,15 +72,13 @@ struct ActivationTransportPoolConfig {
   // Reserves compact route/payload staging for the explicitly host-enqueued
   // NCCL Socket correctness backend. Disabled for the frozen local P2P path.
   bool enable_socket_fallback = false;
-  // Registers each preallocated slot as an NCCL window for the explicitly
-  // constructed GinRdma backend. It never enables or selects that backend by
-  // itself.
+  // Allocate fixed communication rings for the explicitly constructed GinRdma
+  // backend. Their windows survive compatible compute-arena growth. This flag
+  // never selects the backend by itself.
   bool enable_gin_rdma = false;
-  // Reserve generation-local state consumed by the cached-state Backward:
-  // immutable canonical X, BF16 FC1 A/B checkpoints, and a Forward output
-  // plane that does not alias X. The ordinary inference footprint is
-  // unchanged unless this is enabled explicitly. Kept last for aggregate
-  // source compatibility with the pre-checkpoint configuration.
+  // Reserve Backward scratch and a separate FC2 plane so canonical X survives
+  // until it is saved. Long-lived X/A/B checkpoints and final outputs belong
+  // to ForwardTensorStorage, independently of these reusable execution slots.
   bool enable_backward_state = false;
   BufferMode buffer_mode = BufferMode::Dynamic;
 };

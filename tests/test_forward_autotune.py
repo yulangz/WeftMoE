@@ -122,7 +122,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         duplicate["search_space"]["2_transport"]["relay_ctas"] = [16, 16]
         cases.append(duplicate)
         invalid = copy.deepcopy(source)
-        invalid["search_space"]["2_transport"]["local_dispatch_tma_warps"] = [4, 12]
+        invalid["search_space"]["2_transport"]["local_dispatch_tma_warps"] = [4, 16]
         cases.append(invalid)
         oversized = copy.deepcopy(source)
         oversized["max_candidates"] = 1

@@ -9,14 +9,14 @@
 
 namespace forward_compute_detail {
 
-template <bool StaticLocal>
-__device__ __forceinline__ void
-reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
-                 TransportDeviceStatus *status,
-                 transport::BFloat16 *contribution,
-                 unsigned long long *route_ready, transport::BFloat16 *combined,
-                 transport_state::GenerationCompletionVector *completion) {
+template <bool StaticLocal, bool SingleRoute>
+__device__ __forceinline__ void reduce_one_token_impl(
+    const ForwardKernelArgs &a, std::uint64_t token,
+    TransportDeviceStatus *status, transport::BFloat16 *contribution,
+    unsigned long long *route_ready, transport::BFloat16 *combined,
+    transport_state::GenerationCompletionVector *completion) {
   const auto lane = threadIdx.x & 31U;
+  const auto top_k = SingleRoute ? 1U : a.dispatch.identity.top_k;
 #if WEFTMOE_DEBUG_VALIDATE
   if constexpr (!StaticLocal) {
     if (a.use_gin && lane == 0U)
@@ -28,10 +28,10 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
 
   unsigned long long lane_route = 0ULL;
   unsigned long long lane_row = 0ULL;
-  if (lane < a.dispatch.identity.top_k) {
+  if (lane < top_k) {
     const auto slot =
-        a.dispatch.combine_order[token * a.dispatch.identity.top_k + lane];
-    lane_route = token * a.dispatch.identity.top_k + slot;
+        SingleRoute ? 0U : a.dispatch.combine_order[token * top_k + lane];
+    lane_route = token * top_k + slot;
     lane_row = lane_route;
     // Queue/scan consumers have already acquired every contribution. The
     // static scheduler instead waits for each route's local arrival marker.
@@ -46,11 +46,11 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
   __syncwarp();
 
   auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
-  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
-       vector += 32ULL) {
+  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL; vector += 32ULL) {
     float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-    for (std::uint32_t order = 0; order < a.dispatch.identity.top_k; ++order) {
-      const auto row = __shfl_sync(0xffffffffU, lane_row, order);
+    for (std::uint32_t order = 0; order < top_k; ++order) {
+      const auto row =
+          SingleRoute ? token : __shfl_sync(0xffffffffU, lane_row, order);
       const auto *source = contribution;
       const auto packed =
           reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];
@@ -61,9 +61,8 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
             sums[word * 2U],
             bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
         sums[word * 2U + 1U] = __fadd_rn(
-            sums[word * 2U + 1U], bf16_bits_to_float(
-                                      static_cast<std::uint16_t>(
-                                          words[word] >> 16U)));
+            sums[word * 2U + 1U],
+            bf16_bits_to_float(static_cast<std::uint16_t>(words[word] >> 16U)));
       }
     }
     unsigned int words[4];
@@ -71,8 +70,7 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
     for (std::uint32_t word = 0; word < 4U; ++word)
       words[word] =
           static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
-          (static_cast<unsigned int>(
-               float_to_bf16_bits(sums[word * 2U + 1U]))
+          (static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U + 1U]))
            << 16U);
     output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
   }
@@ -89,6 +87,21 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
       complete_completion_tasks(completion, transport_state::TaskClass::Reduce);
   }
 #endif
+}
+
+template <bool StaticLocal>
+__device__ __forceinline__ void
+reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
+                 TransportDeviceStatus *status,
+                 transport::BFloat16 *contribution,
+                 unsigned long long *route_ready, transport::BFloat16 *combined,
+                 transport_state::GenerationCompletionVector *completion) {
+  if (a.dispatch.identity.top_k == 1U)
+    reduce_one_token_impl<StaticLocal, true>(a, token, status, contribution,
+                                             route_ready, combined, completion);
+  else
+    reduce_one_token_impl<StaticLocal, false>(
+        a, token, status, contribution, route_ready, combined, completion);
 }
 
 template <bool StaticLocal>

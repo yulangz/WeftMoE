@@ -3,9 +3,9 @@
 // Test-only communication measurement. Keep Dispatch, Return and Reduce on
 // their production paths; replace GEMMs with producers waiting for completed
 // Dispatch. This measures sequential Dispatch then Return/Reduce, like a
-// communication API. The host prefills the output plane before the timed
-// interval. Every original compute CTA retains its reduction role and launch
-// resources.
+// communication API. With backward state disabled, the received canonical
+// rows stand in for FC2 output without adding another data copy. Every compute
+// CTA retains its production reduction role and launch resources.
 template <bool StaticLocal>
 __device__ void transport_benchmark_role(const ForwardKernelArgs &a,
                                          unsigned char *storage) {
@@ -41,9 +41,10 @@ __device__ void transport_benchmark_role(const ForwardKernelArgs &a,
     const auto local_row = forward_mblock_local_row(a, expert, local);
     const auto rows = forward_mblock_valid_rows(a, expert, local);
     const auto row = a.dispatch.expert_row_prefix[expert] + local_row;
-    // Other local GPUs may still be scattering into this rank after our own
-    // Dispatch workers finish. Preserve the production per-tile input wait.
-    if (threadIdx.x == 0U) {
+    // Local completion includes every destination-side FC1 publisher. It
+    // already acquires all input tiles; GIN's independent owner still needs
+    // the per-tile dependency check.
+    if (!a.forward_stream_local_dispatch && threadIdx.x == 0U) {
       while (
           !forward_mblock_rows_ready<StaticLocal>(a, expert, local_row, rows) &&
           !forward_cancelled(a))

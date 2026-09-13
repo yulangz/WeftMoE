@@ -58,20 +58,22 @@
       40
     ],
     "local_return_tma_warps": [
-      0,
-      8
+      12,
+      8,
+      0
     ],
     "local_dispatch_tma_warps": [
-      8
+      12
     ],
     "relay_scatter_warps": [
       12
     ],
     "local_return_batch_rows": [
+      256,
       512
     ],
     "dispatch_publish_batch_rows": [
-      128,
+      16,
       32
     ],
     "relay_local_return": [

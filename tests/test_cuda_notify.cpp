@@ -2887,6 +2887,165 @@ void run_cached_backward_rank(
   emit(overlap_samples);
   std::cout << std::endl;
 }
+
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+void run_communication_benchmark_rank(
+    std::uint32_t rank, std::uint32_t nodes, std::uint32_t world,
+    std::uint32_t experts, std::uint32_t top_k, std::uint64_t max_tokens,
+    const weftmoe::RuntimeConfig &config,
+    const weftmoe::RankRoutingInput &routes,
+    const weftmoe::cuda::NcclSession &base,
+    const weftmoe::cuda::CudaExecution &execution) {
+  constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
+  constexpr std::uint64_t intermediate =
+      weftmoe::cuda::forward_tuning::kMainIntermediate;
+  require((nodes == 1U && (world == 1U || world == 2U || world == 8U)) ||
+              (nodes > 1U && world == nodes * 8U),
+          "communication benchmark requires local 1/2/8 GPUs or GIN nodes of 8 "
+          "GPUs");
+  require(max_tokens != 0U && experts % world == 0U &&
+              routes.num_tokens == max_tokens,
+          "communication benchmark fixture shape is inconsistent");
+
+  auto generation = weftmoe::cuda::make_nccl_generation(
+      base, "cuda-communication-benchmark", 701U);
+  auto context = weftmoe::make_rank_collective_context(generation.session(),
+                                                       rank, execution.token());
+  auto notify_pool = weftmoe::cuda::make_device_notify_resource_pool(
+      base, execution, {config, max_tokens, 8192, 3U});
+  auto route_storage =
+      weftmoe::cuda::upload_cuda_routes(routes, top_k, context, execution);
+  const auto route_gates = fixed_random_selected_gates(max_tokens, top_k, rank,
+                                                       0x4d4547414d4f4547ULL);
+  auto gate_storage = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
+      route_gates, route_storage, context, execution);
+
+  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+      generation, execution, notify_pool);
+  auto notify =
+      coordinator.run_device({config, route_storage, gate_storage, max_tokens});
+
+  weftmoe::cuda::ActivationTransportPoolConfig pool_config;
+  pool_config.max_tokens_per_rank = max_tokens;
+  pool_config.max_hidden_size = hidden;
+  pool_config.max_top_k = top_k;
+  pool_config.max_world_size = world;
+  pool_config.max_nodes = nodes;
+  pool_config.channels = 1U;
+  pool_config.ring_slots_per_source_channel = 1U;
+  pool_config.max_inflight_generations = 1U;
+  pool_config.max_intermediate_size = intermediate;
+  pool_config.max_owned_experts = experts / world;
+  pool_config.enable_backward_state = false;
+  pool_config.enable_gin_rdma = nodes > 1U;
+  auto activation_pool = weftmoe::cuda::prepare_activation_transport_pool(
+      generation.session(), execution, pool_config, notify.dispatch());
+
+  std::vector<weftmoe::transport::BFloat16> activation_host(
+      static_cast<std::size_t>(max_tokens * hidden));
+  for (std::size_t index = 0; index < activation_host.size(); ++index) {
+    activation_host[index] = weftmoe::transport::float_to_bfloat16(
+        static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) - 63) /
+        64.0F);
+  }
+  auto activations =
+      weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
+          activation_host, max_tokens, hidden, context, execution,
+          activation_pool);
+  auto weights =
+      weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+          experts / world, rank * (experts / world), hidden, intermediate,
+          generation.session(), execution);
+
+  using namespace weftmoe::cuda;
+  auto exec = internal::checked_execution_state(execution);
+  auto nccl = internal::NcclSessionAccess::checked(generation);
+  auto check = [](cudaError_t e) {
+    if (e != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(e));
+  };
+  std::unique_ptr<LocalCudaP2pForwardMegaKernel> local;
+  std::unique_ptr<GinRdmaForwardMegaKernel> remote;
+  if (nodes > 1)
+    remote = std::make_unique<GinRdmaForwardMegaKernel>(generation, execution,
+                                                        activation_pool);
+  else
+    local = std::make_unique<LocalCudaP2pForwardMegaKernel>(
+        generation, execution, activation_pool);
+  ForwardMegaKernelConfig fc{hidden, intermediate, false};
+  fc.tensors = prepare_forward_tensors(notify.dispatch(), execution, fc);
+  auto enqueue = [&] {
+    return remote ? remote->enqueue(notify.dispatch(), activations, weights, fc)
+                  : local->enqueue(notify.dispatch(), activations, weights, fc);
+  };
+  for (int i = 0; i < 3; ++i)
+    enqueue().wait();
+  auto barrier = [&] {
+    // Each replay overwrites this output word; the rank barrier is untimed.
+    auto ptr = fc.tensors.buffers().output.data;
+    if (ncclAllReduce(ptr, ptr, 1, ncclUint32, ncclSum, nccl->comm,
+                      exec->stream) != ncclSuccess)
+      throw std::runtime_error("communication probe barrier failed");
+  };
+  check(cudaStreamSynchronize(exec->stream));
+  check(cudaStreamBeginCapture(exec->stream, cudaStreamCaptureModeGlobal));
+  auto output = enqueue();
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  check(cudaStreamEndCapture(exec->stream, &graph));
+  check(cudaGraphInstantiate(&executable, graph, 0));
+  cudaEvent_t start = nullptr, end = nullptr;
+  check(cudaEventCreate(&start));
+  check(cudaEventCreate(&end));
+  std::vector<float> samples;
+  const auto rounds = std::getenv("WEFTMOE_COMM_BENCH_ROUNDS")
+                          ? std::stoul(std::getenv("WEFTMOE_COMM_BENCH_ROUNDS"))
+                          : 30U;
+  require(rounds > 10U, "communication benchmark needs measured rounds");
+  // The graph includes Dispatch, FC2-ready publication, Return, Reduce and
+  // completion. Notify, allocation and context preparation are outside timing.
+  for (unsigned round = 0; round < rounds; ++round) {
+    barrier();
+    check(cudaEventRecord(start, exec->stream));
+    check(cudaGraphLaunch(executable, exec->stream));
+    check(cudaEventRecord(end, exec->stream));
+    check(cudaEventSynchronize(end));
+    float ms = 0;
+    check(cudaEventElapsedTime(&ms, start, end));
+    if (round >= 10)
+      samples.push_back(ms * 1000.0F);
+  }
+  output.wait();
+  const auto audit = output.audit();
+  const auto timing = output.timings();
+  if (top_k == 1U) {
+    const auto actual =
+        download_forward_output_for_validation(output, execution);
+    require(actual.size() == activation_host.size() &&
+                std::memcmp(actual.data(), activation_host.data(),
+                            actual.size() * sizeof(actual.front())) == 0,
+            "communication round trip changed a top-1 activation");
+  }
+  std::cout << "COMM_BENCH rank=" << rank << " world=" << world
+            << " tokens=" << max_tokens << " top_k=" << top_k
+            << " hidden=" << hidden << " experts=" << experts
+            << " dispatch_peer_bytes=" << audit.actual_dispatch_peer_bytes
+            << " return_peer_bytes=" << audit.actual_return_peer_bytes
+            << " gin_dispatch_bytes=" << audit.gin_dispatch_payload_bytes
+            << " gin_return_bytes=" << audit.gin_return_payload_bytes
+            << " dispatch_us=" << timing.dispatch_us
+            << " return_us=" << timing.combine_return_us
+            << " reduce_us=" << timing.reduce_us << " samples=";
+  for (std::size_t i = 0; i < samples.size(); ++i)
+    std::cout << (i ? "," : "") << samples[i];
+  std::cout << std::endl;
+  check(cudaGraphExecDestroy(executable));
+  check(cudaGraphDestroy(graph));
+  check(cudaEventDestroy(start));
+  check(cudaEventDestroy(end));
+}
+#endif
+
 void run_rank(std::uint32_t rank, std::uint32_t nodes,
               std::uint32_t gpus_per_node, std::uint32_t local_rank,
               std::uint64_t seed, int bootstrap_input_fd,
@@ -2913,8 +3072,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   const auto benchmark_forward =
       scenario == "forward_bench" || gin_forward_benchmark ||
       socket_forward_benchmark;
+  const bool benchmark_communication = scenario == "communication_bench";
   const auto benchmark_shape = benchmark_p2p || benchmark_integrated ||
-                               benchmark_forward || backward_benchmark;
+                               benchmark_forward || backward_benchmark ||
+                               benchmark_communication;
   auto experts = std::max<std::uint32_t>(16, world * 2);
   auto top_k = std::min<std::uint32_t>(6, experts);
   if (const auto *p2p_top_k = std::getenv("WEFTMOE_P2P_TOP_K"))
@@ -2929,16 +3090,19 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   std::uint64_t fixture_token_offset = 0;
   std::uint64_t fixture_tokens = 0;
   if (benchmark_shape) {
-    const auto cross_host_benchmark = gin_forward_benchmark ||
-                                      socket_forward_benchmark ||
-                                      gin_backward_benchmark;
+    const auto cross_host_benchmark =
+        gin_forward_benchmark || socket_forward_benchmark ||
+        gin_backward_benchmark || (benchmark_communication && nodes > 1U);
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
               ((benchmark_forward || backward_benchmark) &&
                (world == 1 || world == 8)) ||
+              (benchmark_communication &&
+               (world == 1 || world == 2 || world == 8)) ||
               (benchmark_integrated && (world == 2 || world == 8)))) ||
-                (cross_host_benchmark && nodes == 2 &&
-                 (world == 2 || world == 16)),
+                (cross_host_benchmark &&
+                 ((nodes == 2 && (world == 2 || world == 16)) ||
+                  (benchmark_communication && world == nodes * 8U))),
             "CUDA benchmark requires local 1/2/8 GPUs or GIN 2x1/2x8 GPUs");
     experts = std::getenv("WEFTMOE_BENCH_EXPERTS")
                   ? std::stoul(std::getenv("WEFTMOE_BENCH_EXPERTS")) : 384U;
@@ -2963,7 +3127,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       fixture_rank = rank / (world / 8U);
       fixture_token_offset = (rank % (world / 8U)) * max_tokens;
     }
-    common_config = make_config(nodes, gpus_per_node, experts, top_k, 64);
+    common_config = make_config(nodes, gpus_per_node, experts, top_k,
+                                benchmark_communication ? 128U : 64U);
     for (std::uint32_t expert = 0; expert < experts; ++expert)
       common_config.topology.expert_to_rank[expert] =
           expert / (experts / world);
@@ -3085,6 +3250,17 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       "multinode-exec-" + std::to_string(rank), local_rank);
   auto base = weftmoe::cuda::make_nccl_session(
       "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
+  if (benchmark_communication) {
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+    run_communication_benchmark_rank(rank, nodes, world, experts, top_k,
+                                     max_tokens, common_config, common_routes,
+                                     base, execution);
+    return;
+#else
+    throw std::runtime_error(
+        "communication_bench requires WEFTMOE_BENCH_TRANSPORT_ONLY=1");
+#endif
+  }
   if (scenario == "buffer_modes") {
     test_buffer_modes_rank(rank, nodes, world, base, execution);
     return;

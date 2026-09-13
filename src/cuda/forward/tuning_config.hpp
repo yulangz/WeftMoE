@@ -70,7 +70,11 @@
 #define WEFTMOE_FWD_RDMA_CTAS 8
 #endif
 #ifndef WEFTMOE_FWD_RELAY_TMA_WARPS
+#if WEFTMOE_FWD_RDMA_CTAS == 0
+#define WEFTMOE_FWD_RELAY_TMA_WARPS 12
+#else
 #define WEFTMOE_FWD_RELAY_TMA_WARPS 8
+#endif
 #endif
 #ifndef WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS
 #define WEFTMOE_FWD_LOCAL_DISPATCH_TMA_WARPS 12
@@ -79,10 +83,18 @@
 #define WEFTMOE_FWD_RELAY_SCATTER_WARPS 12
 #endif
 #ifndef WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS
+#if WEFTMOE_FWD_RDMA_CTAS == 0
+#define WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS 256
+#else
 #define WEFTMOE_FWD_LOCAL_RETURN_BATCH_ROWS 512
 #endif
+#endif
 #ifndef WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS
+#if WEFTMOE_FWD_RDMA_CTAS == 0
+#define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 16
+#else
 #define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 32
+#endif
 #endif
 #ifndef WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS
 #define WEFTMOE_FWD_LOCAL_ROUTE_BATCH_ROWS 128
@@ -302,7 +314,7 @@ constexpr bool valid_transport_role_counts() {
 }
 static_assert(valid_transport_role_counts());
 static_assert(kRdmaCtas != 0U ||
-              kLocalDispatchTmaWarps < kComputeThreads / 32U,
+              kLocalDispatchTmaWarps < kLocalTransportThreads / 32U,
               "local split Relay reserves one warp for FC1-ready publication");
 static_assert(kRelayTmaWarps <= kComputeThreads / 32U);
 static_assert(kLocalDispatchTmaWarps > 0U &&

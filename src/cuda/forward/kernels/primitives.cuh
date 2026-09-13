@@ -329,7 +329,8 @@ __device__ void visit_forward_accumulator_wide(float *accum,
 __device__ __forceinline__ std::uint64_t forward_expert_mblock_count(
     const ForwardKernelArgs &a, std::uint32_t expert) {
   const auto rows = a.dispatch.expert_row_count[expert];
-  return (rows + a.forward_mblock_rows - 1ULL) / a.forward_mblock_rows;
+  return a.forward_mblock_rows == 64U ? (rows + 63ULL) / 64ULL
+                                      : (rows + 127ULL) / 128ULL;
 }
 
 __device__ __forceinline__ std::uint64_t forward_mblock_local_row(
@@ -410,81 +411,72 @@ __device__ __forceinline__ void forward_transport_cta_barrier(
 }
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
-// Map the immutable M-block task space in the same wavefront order used by
-// Notify packet priorities: local M tile first, then expert.  This lets the
-// bounded compute scheduler consume the earliest completed tiles without a
-// global Dispatch barrier or an O(N-task) atomic scan.
-__device__ std::uint32_t forward_wavefront_mblock_expert(
-    const ForwardKernelArgs &a, std::uint64_t ordinal,
-    std::uint64_t &local_mblock) {
-  std::uint64_t max_blocks = 0ULL;
-  for (std::uint32_t expert = 0;
-       expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
+// Build the same startup-wave/expert-body order with one warp per expert.
+// Prefixes are reduced across lanes once instead of searching every preceding
+// tile independently for each output entry. No persistent scratch is needed.
+template <class Emit>
+__device__ __forceinline__ void
+forward_initialize_mblocks(const ForwardKernelArgs &a, Emit emit) {
+  constexpr unsigned startup = forward_tuning::kStartupMblocks;
+  const auto lane = threadIdx.x % 32U;
+  const auto experts = dispatch_sizes(a.dispatch).owned_expert_count;
+  auto sum = [](unsigned long long value) {
+    for (unsigned delta = 16U; delta; delta /= 2U)
+      value += __shfl_down_sync(0xffffffffU, value, delta);
+    return __shfl_sync(0xffffffffU, value, 0U);
+  };
+  for (unsigned expert = (blockIdx.x * blockDim.x + threadIdx.x) / 32U;
+       expert < experts; expert += gridDim.x * blockDim.x / 32U) {
     const auto blocks = forward_expert_mblock_count(a, expert);
-    max_blocks = blocks > max_blocks ? blocks : max_blocks;
-  }
-  for (std::uint64_t tile = 0; tile < max_blocks; ++tile) {
-    for (std::uint32_t expert = 0;
-         expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
-      const auto blocks = forward_expert_mblock_count(a, expert);
-      if (tile >= blocks)
-        continue;
-      if (ordinal == 0ULL) {
-        local_mblock = tile;
-        return expert;
+    if (blocks == 0ULL)
+      continue;
+    if (a.forward_fc1_locality_group > 1U) {
+      unsigned long long prefix[startup + 1U] = {};
+      for (unsigned other = lane; other < experts; other += 32U) {
+        const auto count = forward_expert_mblock_count(a, other);
+#pragma unroll
+        for (unsigned tile = 0; tile < startup; ++tile)
+          prefix[tile] +=
+              (count < tile ? count : tile) + (other < expert && count > tile);
+        prefix[startup] +=
+            (count < startup ? count : startup) +
+            (other < expert && count > startup ? count - startup : 0ULL);
       }
-      --ordinal;
+#pragma unroll
+      for (unsigned tile = 0; tile <= startup; ++tile)
+        prefix[tile] = sum(prefix[tile]);
+      for (unsigned long long tile = lane; tile < blocks; tile += 32U) {
+        auto ordinal = prefix[startup] + tile - startup;
+#pragma unroll
+        for (unsigned first = 0; first < startup; ++first)
+          if (tile == first)
+            ordinal = prefix[first];
+        emit(ordinal, expert, unsigned(tile));
+      }
+    } else {
+      for (unsigned tile = 0; tile < blocks; ++tile) {
+        unsigned long long ordinal = 0;
+        for (unsigned other = lane; other < experts; other += 32U) {
+          const auto count = forward_expert_mblock_count(a, other);
+          ordinal +=
+              (count < tile ? count : tile) + (other < expert && count > tile);
+        }
+        ordinal = sum(ordinal);
+        if (!lane)
+          emit(ordinal, expert, tile);
+      }
     }
   }
-  local_mblock = 0ULL;
-  return dispatch_sizes(a.dispatch).owned_expert_count;
-}
-
-// The readiness queue, rather than this immutable lookup, now determines
-// when a GIN FC1 task becomes runnable. Keep two tile-first waves for startup
-// latency, then place each expert's body M-blocks contiguously so a readiness
-// publisher can release small weight-local groups without changing the wire
-// order or waiting for all Dispatch traffic.
-__device__ std::uint32_t forward_locality_mblock_expert(
-    const ForwardKernelArgs &a, std::uint64_t ordinal,
-    std::uint64_t &local_mblock) {
-  if (a.forward_fc1_locality_group <= 1U)
-    return forward_wavefront_mblock_expert(a, ordinal, local_mblock);
-
-  constexpr std::uint64_t kStartupMblocks = forward_tuning::kStartupMblocks;
-  for (std::uint64_t tile = 0; tile < kStartupMblocks; ++tile) {
-    for (std::uint32_t expert = 0;
-         expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
-      if (tile >= forward_expert_mblock_count(a, expert))
-        continue;
-      if (ordinal == 0ULL) {
-        local_mblock = tile;
-        return expert;
-      }
-      --ordinal;
-    }
-  }
-  for (std::uint32_t expert = 0;
-       expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
-    const auto blocks = forward_expert_mblock_count(a, expert);
-    for (std::uint64_t tile = kStartupMblocks; tile < blocks; ++tile) {
-      if (ordinal == 0ULL) {
-        local_mblock = tile;
-        return expert;
-      }
-      --ordinal;
-    }
-  }
-  local_mblock = 0ULL;
-  return dispatch_sizes(a.dispatch).owned_expert_count;
 }
 
 #endif
 
+// The cancellation nonce belongs to the host invocation. CUDA Graph replay
+// advances queue epochs on device while retaining this captured nonce.
 __device__ bool forward_cancelled(const ForwardKernelArgs &a) {
   return a.cancel_epoch &&
          atomicAdd_system(const_cast<unsigned long long *>(a.cancel_epoch),
-                          0ULL) == execution_epoch(a);
+                          0ULL) == a.epoch;
 }
 
 template <bool StaticLocal>

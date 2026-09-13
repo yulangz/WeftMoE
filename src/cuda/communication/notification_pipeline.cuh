@@ -33,7 +33,9 @@ template <class Args> __global__ void reset(Args a) {
 
 // Each CTA consumes its matching incoming channels. Local CAS lets its copy
 // warp and independent receive warp cooperate without claiming an entry twice.
-template <class Args> __device__ __forceinline__ bool progress(const Args &a) {
+template <class Args>
+__device__ __forceinline__ bool progress(const Args &a,
+                                         unsigned peer = UINT32_MAX) {
   const auto mask = __activemask();
   const auto lane = threadIdx.x % 32;
   const auto leader = unsigned(__ffs(mask) - 1);
@@ -43,7 +45,9 @@ template <class Args> __device__ __forceinline__ bool progress(const Args &a) {
   unsigned selected = a.local_world_size;
   unsigned long long seq = 0;
   if (lane == leader) {
-    for (unsigned p = 0; p < a.local_world_size; ++p) {
+    const auto begin = peer == UINT32_MAX ? 0U : peer;
+    const auto end = peer == UINT32_MAX ? a.local_world_size : peer + 1U;
+    for (unsigned p = begin; p < end; ++p) {
       if (p == local)
         continue;
       auto &state = channel(a, a.local_base, p, blockIdx.x);
@@ -92,8 +96,9 @@ template <class Args> __device__ __forceinline__ bool progress(const Args &a) {
 }
 
 template <class Args>
-__device__ __forceinline__ void wait_credit(const Args &a, unsigned p,
-                                            unsigned long long seq) {
+__device__ __forceinline__ void
+wait_credit(const Args &a, unsigned p, unsigned long long seq,
+            unsigned incoming_peer = UINT32_MAX) {
   const auto mask = __activemask();
   const auto leader = unsigned(__ffs(mask) - 1);
   while (true) {
@@ -108,7 +113,7 @@ __device__ __forceinline__ void wait_credit(const Args &a, unsigned p,
     }
     if (__shfl_sync(mask, ready, leader))
       return;
-    if (!progress(a))
+    if (!progress(a, incoming_peer))
       __nanosleep(50);
   }
 }
@@ -224,18 +229,65 @@ __device__ __forceinline__ void publish_return(const Args &a, unsigned count,
   }
 }
 
+// A known destination avoids repartitioning the row IDs and probing unrelated
+// incoming channels. Payload completion precedes every notification release.
+template <class Args, class Fill>
+__device__ __forceinline__ void
+publish_peer_return(const Args &a, unsigned peer, unsigned count,
+                    unsigned threads, Fill fill, unsigned incoming_peer) {
+  __shared__ unsigned long long sequence;
+  const unsigned local = a.rank % a.local_world_size;
+  for (unsigned begin = 0; begin < count; begin += kRows) {
+    const auto rows = min(kRows, count - begin);
+    if (peer == local) {
+      for (unsigned i = threadIdx.x; i < rows; i += threads)
+        Receiver<Args>::apply(a, fill(begin + i).row);
+      sync(threads);
+      continue;
+    }
+    auto &outgoing = channel(a, a.local_base, peer, blockIdx.x);
+    if (!threadIdx.x)
+      sequence = outgoing.sent;
+    sync(threads);
+    if (threadIdx.x < 32U)
+      wait_credit(a, peer, sequence, incoming_peer);
+    sync(threads);
+    auto &slot = channel(a, a.peer_bases[peer], local, blockIdx.x)
+                     .slots[sequence % kDepth];
+    for (unsigned i = threadIdx.x; i < rows; i += threads)
+      slot.rows[i] = fill(begin + i).row;
+    __threadfence_system();
+    sync(threads);
+    if (!threadIdx.x) {
+      slot.count = rows;
+      slot.kind = Kind::Return;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+          slot.ready)
+          .store(sequence / kDepth + 1U, ::cuda::memory_order_release);
+      ++outgoing.sent;
+    }
+    sync(threads);
+  }
+}
+
 // A worker must keep receiving after its own finite copy work ends. Explicit
 // terminal chunks handle empty/skewed peers without predicting receive counts.
-template <class Args> __device__ __forceinline__ void drain(const Args &a) {
-  if (threadIdx.x >= 32)
+template <class Args>
+__device__ __forceinline__ void drain(const Args &a,
+                                      unsigned destination = UINT32_MAX,
+                                      unsigned source = UINT32_MAX) {
+  if (threadIdx.x >= 32U)
     return;
   const auto local = a.rank % a.local_world_size;
-  for (unsigned p = 0; p < a.local_world_size; ++p) {
+  const auto begin = destination == UINT32_MAX ? 0U : destination;
+  const auto end =
+      destination == UINT32_MAX ? a.local_world_size : destination + 1U;
+  for (unsigned p = begin; p < end; ++p) {
     if (p == local)
       continue;
     auto &state = channel(a, a.local_base, p, blockIdx.x);
     const auto seq = state.sent;
-    wait_credit(a, p, seq);
+    wait_credit(a, p, seq, source);
     auto &slot = channel(a, a.peer_bases[a.node * a.local_world_size + p],
                          local, blockIdx.x)
                      .slots[seq % kDepth];
@@ -244,41 +296,46 @@ template <class Args> __device__ __forceinline__ void drain(const Args &a) {
       slot.kind = Kind::End;
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
           slot.ready)
-          .store(seq / kDepth + 1, ::cuda::memory_order_release);
+          .store(seq / kDepth + 1U, ::cuda::memory_order_release);
       ++state.sent;
     }
     __syncwarp();
   }
   while (true) {
-    progress(a);
-    bool done = true;
-    for (unsigned p = 0; p < a.local_world_size; ++p) {
-      if (p == local)
-        continue;
-      auto &state = channel(a, a.local_base, p, blockIdx.x);
-      done &=
-          ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.ended)
-              .load(::cuda::memory_order_acquire) != 0;
-      const auto claimed =
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-              state.claimed)
-              .load(::cuda::memory_order_acquire);
-      for (unsigned s = 0; s < kDepth; ++s) {
-        done &=
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
-                state.slots[s].credit)
-                .load(::cuda::memory_order_acquire) >=
-            (state.sent + kDepth - 1 - s) / kDepth;
-        done &=
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-                state.slots[s].consumed)
-                .load(::cuda::memory_order_acquire) >=
-            (claimed + kDepth - 1 - s) / kDepth;
+    progress(a, source);
+    unsigned done = 1U;
+    if (!threadIdx.x) {
+      for (unsigned p = 0; p < a.local_world_size; ++p) {
+        if (p == local)
+          continue;
+        auto &state = channel(a, a.local_base, p, blockIdx.x);
+        if (source == UINT32_MAX || p == source) {
+          done &= ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+                      state.ended)
+                      .load(::cuda::memory_order_acquire) != 0U;
+          const auto claimed =
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_device>(state.claimed)
+                  .load(::cuda::memory_order_acquire);
+          for (unsigned i = 0; i < kDepth; ++i)
+            done &= ::cuda::atomic_ref<unsigned long long,
+                                       ::cuda::thread_scope_device>(
+                        state.slots[i].consumed)
+                        .load(::cuda::memory_order_acquire) >=
+                    (claimed + kDepth - 1U - i) / kDepth;
+        }
+        if (destination == UINT32_MAX || p == destination)
+          for (unsigned i = 0; i < kDepth; ++i)
+            done &= ::cuda::atomic_ref<unsigned long long,
+                                       ::cuda::thread_scope_system>(
+                        state.slots[i].credit)
+                        .load(::cuda::memory_order_acquire) >=
+                    (state.sent + kDepth - 1U - i) / kDepth;
       }
     }
-    if (__all_sync(0xffffffffU, done))
+    if (__shfl_sync(0xffffffffU, done, 0U))
       return;
-    __nanosleep(50);
+    __nanosleep(50U);
   }
 }
 

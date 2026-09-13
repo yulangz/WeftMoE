@@ -13,23 +13,48 @@ __device__ __forceinline__ unsigned index(const Args &a, unsigned source) {
   return source / a.local_world_size == a.node ? 0U : 1U + source;
 }
 
+__device__ __forceinline__ bool local_peer_queues(const ForwardKernelArgs &a) {
+  return a.forward_stream_local_dispatch &&
+         a.forward_relay_cta_count >= a.local_world_size;
+}
+
+__device__ __forceinline__ unsigned index(const ForwardKernelArgs &a,
+                                          unsigned source) {
+  return local_peer_queues(a)
+             ? 1U + source
+             : (source / a.local_world_size == a.node ? 0U : 1U + source);
+}
+
 template <class Args>
 __device__ __forceinline__ void initialize(const Args &a) {
-  if (blockIdx.x || threadIdx.x)
+  if (blockIdx.x)
     return;
   auto *q = queues(a);
-  for (unsigned i = 0; i <= a.world; ++i)
+  for (unsigned i = threadIdx.x; i <= a.world; i += blockDim.x)
     q[i] = Queue{};
-  for (unsigned source = 0; source < a.world; ++source)
-    for (unsigned e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count; ++e)
-      q[index(a, source)].capacity +=
+  __syncthreads();
+  const auto lane = threadIdx.x % 32U;
+  for (unsigned source = threadIdx.x / 32U; source < a.world;
+       source += blockDim.x / 32U) {
+    unsigned long long count = 0;
+    for (unsigned e = lane; e < dispatch_sizes(a.dispatch).owned_expert_count;
+         e += 32U)
+      count +=
           a.dispatch
               .source_expert_count[source * a.dispatch.identity.num_experts +
                                    a.dispatch.owned_expert_ids[e]];
-  unsigned long long begin = 0;
-  for (unsigned i = 0; i <= a.world; ++i) {
-    q[i].begin = begin;
-    begin += q[i].capacity;
+    for (unsigned delta = 16; delta; delta /= 2U)
+      count += __shfl_down_sync(0xffffffffU, count, delta);
+    if (!lane)
+      atomicAdd(&q[index(a, source)].capacity, count);
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    unsigned long long begin = 0;
+    for (unsigned i = 0; i <= a.world; ++i) {
+      q[i].begin = begin;
+      begin += q[i].capacity;
+    }
   }
 }
 

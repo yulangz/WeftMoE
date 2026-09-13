@@ -50,10 +50,12 @@ __device__ __forceinline__ void local_split_transport_finalize(
   }
   __syncthreads();
 
+  auto terminal_args = a;
+  terminal_args.epoch = execution_epoch(a);
   publish_production_terminal_status<true>(
-      a, status, ProductionStatusPhase::Forward,
-      a.production_error_records_offset,
-      a.gin_production_error_records_offset, 0ULL);
+      terminal_args, status, ProductionStatusPhase::Forward,
+      a.production_error_records_offset, a.gin_production_error_records_offset,
+      0ULL);
   __syncthreads();
 
   if (threadIdx.x == 0U) {
@@ -187,8 +189,10 @@ __device__ __forceinline__ void split_transport_finalize(
   }
   __syncthreads();
 
+  auto terminal_args = a;
+  terminal_args.epoch = execution_epoch(a);
   publish_production_terminal_status<StaticLocal>(
-      a, status, ProductionStatusPhase::Forward,
+      terminal_args, status, ProductionStatusPhase::Forward,
       a.production_error_records_offset, a.gin_production_error_records_offset,
       0ULL);
   __syncthreads();

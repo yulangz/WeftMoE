@@ -4307,10 +4307,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     "rows/routes", id.calling_rank, "within pool capacity",
                     "exceeded");
 
-  __atomic_store_n(slot.host_cancel_epoch,
-                   options.cancellation.cancellation_requested() ? id.generation
-                                                                 : 0ULL,
-                   __ATOMIC_RELEASE);
+  if (slot.transport_epoch >= (1ULL << 32U) - 1ULL)
+    transport_error(NotifyErrorCode::ArithmeticOverflow, "forward-run",
+                    "transport_epoch", id.calling_rank, "<2^32-1",
+                    std::to_string(slot.transport_epoch));
+  const auto generation_epoch = ++slot.transport_epoch;
+  __atomic_store_n(
+      slot.host_cancel_epoch,
+      options.cancellation.cancellation_requested() ? generation_epoch : 0ULL,
+      __ATOMIC_RELEASE);
   internal::throw_cuda(
       "forward-run",
       cudaMemcpyAsync(slot.device_cancel_epoch, slot.host_cancel_epoch,
@@ -4343,11 +4348,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("stream_dependencies_enqueued");
 #endif
 
-  if (slot.transport_epoch >= (1ULL << 32U) - 1ULL)
-    transport_error(NotifyErrorCode::ArithmeticOverflow, "forward-run",
-                    "transport_epoch", id.calling_rank, "<2^32-1",
-                    std::to_string(slot.transport_epoch));
-  const auto generation_epoch = ++slot.transport_epoch;
   std::uint64_t socket_incoming = 0;
   std::uint64_t socket_dispatch_peer_bytes = 0;
   std::uint64_t socket_return_peer_bytes = 0;
@@ -4486,9 +4486,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         generation_epoch,
         use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
         use_gin ? gin_backend->local_world_size : id.world_size,
-        view.runtime
-            ? at<unsigned long long>(slot.device, layout.execution_epoch)
-            : nullptr,
+        at<unsigned long long>(slot.device, layout.execution_epoch),
         view.runtime);
   } else if (socket_incoming != 0) {
     socket_install_forward_headers_kernel<<<
@@ -4524,8 +4522,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.channels = state->config.channels;
   args.epoch = generation_epoch;
   args.runtime_epoch =
-      view.runtime ? at<unsigned long long>(slot.device, layout.execution_epoch)
-                   : nullptr;
+      use_socket ? nullptr
+                 : at<unsigned long long>(slot.device, layout.execution_epoch);
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
@@ -5362,10 +5360,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(TransportDeviceStatus));
   internal::throw_cuda(
-      "forward-run", cudaEventRecord(slot.forward_complete, exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "cudaEventRecord(forward complete)");
+      "forward-run",
+      internal::record_observable_event(slot.forward_complete, exec->stream),
+      id.calling_rank, id.world_size, backend->session.session().identity(),
+      id.generation, ExchangeKind::ExpertCounts,
+      "cudaEventRecord(forward complete)");
   internal::throw_cuda(
       "forward-run",
       internal::record_observable_event(slot.complete, exec->stream),
@@ -6147,8 +6146,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto backward_epoch = ++slot.transport_epoch;
   args.epoch = backward_epoch;
   args.runtime_epoch =
-      view.runtime ? at<unsigned long long>(slot.device, layout.execution_epoch)
-                   : nullptr;
+      at<unsigned long long>(slot.device, layout.execution_epoch);
   if (std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr) {
     std::cerr << "BACKWARD_ADDR rank=" << identity.rank
               << " epoch=" << backward_epoch

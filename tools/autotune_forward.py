@@ -228,8 +228,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     if config["rdma_ctas"] == 0:
         _require(config["relay_ctas"] >= 4 and config["relay_ctas"] % 4 == 0,
                  "relay_ctas must be a positive multiple of 4")
-        _require(config["local_dispatch_tma_warps"] <
-                 config["compute_threads"] // 32,
+        _require(config["local_dispatch_tma_warps"] < 512 // 32,
                  "local split Relay reserves one FC1-ready publisher warp")
     else:
         _require(config["relay_ctas"] >= config["rdma_ctas"],

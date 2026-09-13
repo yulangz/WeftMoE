@@ -1616,7 +1616,9 @@ const DeviceMaterializationStatus *read_materialization_status(
         context.session().generation(), ExchangeKind::ExpertCounts, operation);
   };
   check(cudaGetLastError(), "publish materialization status");
-  check(cudaEventRecord(state->allocation->completion, stream),
+  check(internal::record_input_ready(
+            state->allocation->completion, stream,
+            state->allocation->completion_capture_id),
         "record materialization status");
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost,
                             sizeof(DeviceMaterializationStatus));
@@ -2920,7 +2922,9 @@ bool DeviceNotifyPoolBridge::drain(
     const auto exec = internal::checked_execution_state(execution);
     (void)cudaSetDevice(static_cast<int>(exec->device));
     if (allocation->workspace && allocation->workspace->completion) {
-      if (cudaEventRecord(allocation->workspace->completion, exec->stream) !=
+      if (internal::record_input_ready(
+              allocation->workspace->completion, exec->stream,
+              allocation->workspace->completion_capture_id) !=
           cudaSuccess)
         return false;
       if (cudaEventSynchronize(allocation->workspace->completion) !=
@@ -3244,7 +3248,9 @@ void enqueue_local_notify(const RuntimeConfig &config,
   };
   copy(hl.status, dl.status, sizeof(DeviceStatus), "D2H status");
   internal::throw_cuda("notify-start",
-                       cudaEventRecord(state->allocation->completion, exec->stream),
+                       internal::record_input_ready(
+                           state->allocation->completion, exec->stream,
+                           state->allocation->completion_capture_id),
                        rank, context.session().world_size(), context.session().identity(),
                        context.session().generation(), ExchangeKind::ExpertCounts,
                        "cudaEventRecord");
@@ -4097,8 +4103,10 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   if (enqueue_only) {
     internal::throw_cuda(
         "device-materialize",
-        cudaEventRecord(state->allocation->completion, exec->stream), rank,
-        plan.world_size, context.session().identity(),
+        internal::record_input_ready(
+            state->allocation->completion, exec->stream,
+            state->allocation->completion_capture_id),
+        rank, plan.world_size, context.session().identity(),
         context.session().generation(), ExchangeKind::ExpertCounts,
         "record enqueued Notify");
     return {};
@@ -4459,7 +4467,9 @@ DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
   try {
     internal::throw_cuda(
         "dispatch-consumer-acquire",
-        cudaStreamWaitEvent(exec->stream, workspace->allocation->completion),
+        internal::wait_input_ready(
+            exec->stream, workspace->allocation->completion,
+            workspace->allocation->completion_capture_id),
         id.calling_rank, id.world_size, impl_->context.session().identity(),
         id.generation, ExchangeKind::ExpertCounts,
         "cudaStreamWaitEvent(notify completion)");

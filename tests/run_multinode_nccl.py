@@ -294,6 +294,7 @@ def environment_overrides(args):
         "WEFTMOE_P2P_ROUNDS",
         "WEFTMOE_P2P_BENCH_ROUNDS",
         "WEFTMOE_P2P_BENCH_TOKENS",
+        "WEFTMOE_COMM_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
@@ -607,7 +608,8 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(
         "--scenario",
-        choices=("buffer_modes", "valid", "out_of_range", "duplicate", "max_mismatch",
+        choices=("communication_bench", "buffer_modes", "valid", "out_of_range",
+                 "duplicate", "max_mismatch",
                  "over_capacity", "generation_mismatch", "session_mismatch",
                  "mtile_mismatch", "topology_mismatch",
                  "expert_capacity_mismatch", "workspace_capacity_mismatch",
@@ -897,6 +899,15 @@ def main(argv=None):
         print(f"[PASS] same-rail GIN Forward persistent kernel world={world}")
         return
 
+    if args.scenario == "communication_bench":
+        if sum(result.returncode == 0 and "COMM_BENCH " in result.stdout
+               for result in outputs) != world:
+            raise AssertionError("incomplete communication benchmark")
+        for result in outputs:
+            print(next(line for line in result.stdout.splitlines()
+                       if line.startswith("COMM_BENCH ")), flush=True)
+        print("COMM_RESULT passed", flush=True)
+        return
     if args.scenario == "buffer_modes":
         if sum(result.returncode == 0 and "BUFFER_MODES " in result.stdout for result in outputs) != world:
             raise AssertionError("incomplete buffer mode checks")

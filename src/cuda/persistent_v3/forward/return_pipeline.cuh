@@ -76,20 +76,21 @@ publish_rows(const ForwardKernelArgs &a, unsigned long long *,
 }
 
 struct LocalReturnState {
+  unsigned queue_index = 0;
   unsigned long long cursor = 0ULL;
   unsigned int selected = 0U;
 };
 
 __device__ __forceinline__ bool
 local_return_terminal(const ForwardKernelArgs &a, unsigned long long *scheduler,
-                      const LocalReturnState &) {
+                      const LocalReturnState &state) {
   auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
       a.local_base, a.forward_v3_control_offset);
   return persistent_v3::load_acquire<::cuda::thread_scope_device>(
              control->return_producers_complete.value) >= scheduler[3] &&
          persistent_v3::load_acquire<::cuda::thread_scope_device>(
-             return_queue_detail::queues(a)[0].head) ==
-             return_queue_detail::queues(a)[0].capacity;
+             return_queue_detail::queues(a)[state.queue_index].head) ==
+             return_queue_detail::queues(a)[state.queue_index].capacity;
 }
 
 __device__ __forceinline__ void copy_sync(unsigned threads) {
@@ -108,7 +109,7 @@ progress_local_return(const ForwardKernelArgs &a,
     state.selected = 0U;
     if (!cancelled(a, control))
       state.cursor =
-          claim_rows(return_queue_detail::queues(a)[0],
+          claim_rows(return_queue_detail::queues(a)[state.queue_index],
                      a.forward_local_return_batch_rows, state.selected);
   }
   copy_sync(threads);
@@ -121,7 +122,7 @@ progress_local_return(const ForwardKernelArgs &a,
     atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
   const auto *entries =
       peer_at<const unsigned int>(a.local_base, a.forward_return_rows_offset) +
-      return_queue_detail::queues(a)[0].begin;
+      return_queue_detail::queues(a)[state.queue_index].begin;
   const auto *headers =
       peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const auto *output = peer_at<const transport::BFloat16>(
@@ -165,12 +166,19 @@ progress_local_return(const ForwardKernelArgs &a,
     ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
   __threadfence_system();
   copy_sync(threads);
-  local_notification_detail::publish_return(
-      a, state.selected, threads, [&](unsigned i) {
-        const auto header = headers[entries[state.cursor + i]];
-        return local_notification_detail::Entry{
-            header.source_rank % a.local_world_size, header.route_index};
-      });
+  auto fill = [&](unsigned i) {
+    const auto header = headers[entries[state.cursor + i]];
+    return local_notification_detail::Entry{
+        header.source_rank % a.local_world_size, header.route_index};
+  };
+  if (state.queue_index) {
+    const auto incoming =
+        (a.rank + a.local_world_size - blockIdx.x % a.local_world_size) %
+        a.local_world_size;
+    local_notification_detail::publish_peer_return(
+        a, state.queue_index - 1U, state.selected, threads, fill, incoming);
+  } else
+    local_notification_detail::publish_return(a, state.selected, threads, fill);
   unsigned int peer_rows = 0U;
   for (unsigned int item = threadIdx.x; item < state.selected; item += threads)
     peer_rows += headers[entries[state.cursor + item]].source_rank != a.rank;
@@ -179,8 +187,8 @@ progress_local_return(const ForwardKernelArgs &a,
     atomicAdd(&status->actual_return_peer_bytes,
               copied_peer_rows * a.hidden * 2ULL);
   copy_sync(threads);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn,
-                          context, state.selected, execution_epoch(a));
+  WEFTMOE_TIMELINE_RECORD(a.timeline, LocalReturnBatchEnd, LocalReturn, context,
+                          state.selected, execution_epoch(a));
   return true;
 }
 

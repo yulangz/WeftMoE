@@ -28,7 +28,9 @@ publish_ready_route(const ForwardKernelArgs &a, std::uint64_t route,
   // acq_rel RMWs form a release sequence for all route payload/map stores.
   // The final route publisher therefore acquires every earlier publisher
   // before releasing the token queue entry to Reduce.
-  const auto previous = count.fetch_add(1U, ::cuda::memory_order_acq_rel);
+  // A single route needs no fan-in counter; its queue release orders payload.
+  const auto previous =
+      top_k == 1U ? 0U : count.fetch_add(1U, ::cuda::memory_order_acq_rel);
   const auto lane = threadIdx.x % 32U;
   const auto completed = __ballot_sync(__activemask(), previous + 1U == top_k);
   if ((completed & (1U << lane)) == 0U)

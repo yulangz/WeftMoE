@@ -386,11 +386,11 @@ publish_ready_fc1_tasks(const ForwardKernelArgs &a, std::uint32_t context,
 // two roles do not rendezvous until both their complete finite workspaces have
 // drained, so incoming NVLink rows can release FC1 while this CTA is still
 // sending later rows to its peers.
-__device__ __forceinline__ void local_relay_role(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control,
-    std::uint32_t relay_ordinal, unsigned long long *scheduler,
-    unsigned char *storage) {
+__device__ __forceinline__ void
+local_relay_role(const ForwardKernelArgs &a,
+                 persistent_v3::ForwardPipelineControl &control,
+                 std::uint32_t relay_ordinal, unsigned long long *scheduler,
+                 unsigned char *storage) {
   wait_for_local_map_clear(a, control);
   WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay,
                           relay_ordinal, 0ULL, execution_epoch(a));
@@ -401,18 +401,16 @@ __device__ __forceinline__ void local_relay_role(
   // warp for rail-local Dispatch. A one-node launch has no RDMA owner, so it
   // must retain one publisher warp even when run without a world-8 generated
   // tuning header.
-  constexpr std::uint32_t kCopyWarps =
+  constexpr auto kCopyWarps =
       forward_tuning::kLocalDispatchTmaWarps < kPublisherWarp
           ? forward_tuning::kLocalDispatchTmaWarps
           : kPublisherWarp;
-  constexpr std::uint32_t kCopyThreads = kCopyWarps * 32U;
-  constexpr std::uint64_t kPublishBatchRows =
-      forward_tuning::kDispatchPublishBatchRows;
+  const std::uint64_t kPublishBatchRows = a.forward_dispatch_publish_batch_rows;
   const auto warp = threadIdx.x / 32U;
   const auto lane = threadIdx.x & 31U;
   const auto route_count = dispatch_sizes(a.dispatch).route_count;
-  const auto copy_bytes = static_cast<std::uint32_t>(
-      a.hidden * sizeof(transport::BFloat16));
+  const auto copy_bytes =
+      static_cast<std::uint32_t>(a.hidden * sizeof(transport::BFloat16));
   // Reuse the existing transport staging allocation. Wide rows or smaller
   // GEMM tiles retain one row per stream instead of growing shared memory.
   constexpr unsigned int kPrefetchRows = 2U;
@@ -423,10 +421,8 @@ __device__ __forceinline__ void local_relay_role(
           : 1U;
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ forward_return_detail::ReturnCopyBarrier
-      copy_full[kPhysicalWarps];
-  __shared__ forward_return_detail::LocalReturnState
-      local_return_state;
+  __shared__ forward_return_detail::ReturnCopyBarrier copy_full[kPhysicalWarps];
+  __shared__ forward_return_detail::LocalReturnState local_return_state;
   __shared__ unsigned int local_return_done;
   if (warp < kCopyWarps && lane == 0U)
     init(&copy_full[warp], 1U);
@@ -437,98 +433,87 @@ __device__ __forceinline__ void local_relay_role(
   unsigned long long peer_rows = 0ULL;
   if (warp < kCopyWarps) {
     const auto first_batch =
-        static_cast<std::uint64_t>(relay_ordinal) * kPublishBatchRows;
+        (static_cast<std::uint64_t>(relay_ordinal) * kCopyWarps + warp) *
+        kPublishBatchRows;
     const auto batch_stride =
-        static_cast<std::uint64_t>(a.forward_relay_cta_count) *
+        static_cast<std::uint64_t>(a.forward_relay_cta_count) * kCopyWarps *
         kPublishBatchRows;
     for (auto batch_begin = first_batch; batch_begin < route_count;
          batch_begin += batch_stride) {
       const auto batch_end = min(batch_begin + kPublishBatchRows, route_count);
-
-      // The ordering permutation is M-block major.  Give each TMA stream a
-      // few rows from one contiguous batch, then publish that whole batch;
-      // the former global warp-stride forced one system atomic per row and
-      // destroyed the useful M-block runs already prepared by Notify.
+      for (auto index = batch_begin + lane; index < batch_end; index += 32U) {
+        const auto route = a.dispatch_waves.local_route_order[index];
+        const auto destination = a.dispatch.route_dst_rank[route];
+        const auto row = a.dispatch.route_dst_row[route];
+        const auto token = route / a.dispatch.identity.top_k;
+        auto *headers = peer_at<LocalP2pRouteHeader>(a.peer_bases[destination],
+                                                     a.direct_headers_offset);
+        headers[row] = LocalP2pRouteHeader{
+            transport::kActivationTransportSchemaVersion,
+            a.rank,
+            destination,
+            0U,
+            a.dispatch.identity.generation,
+            execution_epoch(a),
+            route,
+            route,
+            token,
+            row,
+            a.dispatch.expert_id[route],
+            static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
+        peer_at<float>(a.peer_bases[destination],
+                       a.canonical_gates_offset)[row] = a.gates[route];
+        peer_rows += destination != a.rank;
+      }
+      __syncwarp();
       if (lane == 0U) {
         auto &full = copy_full[warp];
-        for (auto position = batch_begin + warp; position < batch_end;
-             position += rows_per_warp * kCopyWarps) {
+        for (auto position = batch_begin; position < batch_end;
+             position += rows_per_warp) {
           transport::BFloat16 *targets[kPrefetchRows] = {};
-          unsigned int bytes = 0U;
+          unsigned bytes = 0;
 #pragma unroll
-          for (unsigned int item = 0U; item < kPrefetchRows; ++item) {
-            const auto index = position + item * kCopyWarps;
+          for (unsigned item = 0; item < kPrefetchRows; ++item) {
+            const auto index = position + item;
             if (item < rows_per_warp && index < batch_end) {
               const auto route = a.dispatch_waves.local_route_order[index];
               const auto destination = a.dispatch.route_dst_rank[route];
               const auto row = a.dispatch.route_dst_row[route];
-              const auto token = route / a.dispatch.identity.top_k;
-              const auto gate = a.gates[route];
-              auto *destination_headers = peer_at<LocalP2pRouteHeader>(
-                  a.peer_bases[destination], a.direct_headers_offset);
-              destination_headers[row] = LocalP2pRouteHeader{
-                  transport::kActivationTransportSchemaVersion,
-                  a.rank,
-                  destination,
-                  0U,
-                  a.dispatch.identity.generation,
-                  execution_epoch(a),
-                  route,
-                  route,
-                  token,
-                  row,
-                  a.dispatch.expert_id[route],
-                  static_cast<std::uint32_t>(route %
-                                             a.dispatch.identity.top_k)};
-
-              auto *destination_gates = peer_at<float>(
-                  a.peer_bases[destination], a.canonical_gates_offset);
-              destination_gates[row] = gate;
-
-              auto *destination_rows = peer_at<transport::BFloat16>(
-                  a.peer_bases[destination], a.canonical_rows_offset);
-              targets[item] = destination_rows + row * a.hidden;
+              targets[item] =
+                  peer_at<transport::BFloat16>(a.peer_bases[destination],
+                                               a.canonical_rows_offset) +
+                  row * a.hidden;
               ::cuda::device::experimental::cp_async_bulk_global_to_shared(
                   storage + (warp * rows_per_warp + item) * copy_bytes,
-                  a.input + token * a.hidden, copy_bytes, full);
+                  a.input + (route / a.dispatch.identity.top_k) * a.hidden,
+                  copy_bytes, full);
               bytes += copy_bytes;
             }
           }
           auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, bytes);
           full.wait(static_cast<decltype(ticket) &&>(ticket));
 #pragma unroll
-          for (unsigned int item = 0U; item < kPrefetchRows; ++item)
+          for (unsigned item = 0; item < kPrefetchRows; ++item)
             if (targets[item])
               ::cuda::device::experimental::cp_async_bulk_shared_to_global(
                   targets[item],
                   storage + (warp * rows_per_warp + item) * copy_bytes,
                   copy_bytes);
           ::cuda::device::experimental::cp_async_bulk_commit_group();
-          // The next prefetch may overwrite staging after the async reader
-          // finishes; destination completion is only needed for publication.
           ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
         }
         ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
       }
-
-      // Named barrier 2 contains only the copy warps.  The publisher warp can
-      // keep polling ready M-blocks and appending FC1 tasks independently.
-      asm volatile("bar.sync 2, %0;" : : "n"(kCopyThreads) : "memory");
-
       __threadfence_system();
-      asm volatile("bar.sync 2, %0;" : : "n"(kCopyThreads) : "memory");
-      local_notification_detail::publish_dispatch(
-          a, unsigned(batch_end - batch_begin), kCopyThreads, [&](unsigned i) {
-            const auto route =
-                a.dispatch_waves.local_route_order[batch_begin + i];
-            return local_notification_detail::Entry{
-                a.dispatch.route_dst_rank[route] % a.local_world_size,
-                a.dispatch_waves.route_dst_mtile[route]};
-          });
-      for (auto i = batch_begin + threadIdx.x; i < batch_end; i += kCopyThreads)
-        peer_rows +=
-            a.dispatch.route_dst_rank[a.dispatch_waves.local_route_order[i]] !=
-            a.rank;
+      __syncwarp();
+      for (auto index = batch_begin + lane; index < batch_end; index += 32U) {
+        const auto route = a.dispatch_waves.local_route_order[index];
+        local_notification_detail::Receiver<ForwardKernelArgs>::
+            publish_dispatch(a, a.dispatch_waves.route_dst_mtile[route],
+                             a.dispatch.route_dst_rank[route] %
+                                 a.local_world_size);
+      }
+      __syncwarp();
     }
   } else if (warp == kPublisherWarp && lane == 0U) {
     publish_ready_fc1_tasks(a, relay_ordinal, a.forward_relay_cta_count,
@@ -559,15 +544,24 @@ __device__ __forceinline__ void local_relay_role(
 
   // Once this CTA's finite Dispatch/publisher work is drained, reuse the
   // copy warps and the same row-sized SMEM slots for Return. All Relay CTAs
-  // claim confirmed row batches from the local queue, independently of the
-  // source rank. Compute can publish more rows concurrently.
+  // consume confirmed rows while compute publishes subsequent M-blocks.
+  // Rank-pair queues keep each CTA on one NVLink peer throughout Return.
+  const bool peer_queues = return_queue_detail::local_peer_queues(a);
+  const auto return_peer =
+      peer_queues ? (a.rank + blockIdx.x) % a.local_world_size : UINT32_MAX;
+  const auto incoming_peer =
+      peer_queues
+          ? (a.rank + a.local_world_size - blockIdx.x % a.local_world_size) %
+                a.local_world_size
+          : UINT32_MAX;
   if (a.forward_relay_local_return) {
     const auto context = relay_ordinal % a.local_world_size;
     if (threadIdx.x == 0U) {
       local_return_state = forward_return_detail::LocalReturnState{};
+      local_return_state.queue_index = peer_queues ? 1U + return_peer : 0U;
       local_return_done = 0U;
-      for (std::uint32_t return_warp = 0U;
-           return_warp < kPhysicalWarps; ++return_warp)
+      for (std::uint32_t return_warp = 0U; return_warp < kPhysicalWarps;
+           ++return_warp)
         init(&copy_full[return_warp], 1U);
       ::cuda::device::experimental::fence_proxy_async_shared_cta();
     }
@@ -580,7 +574,7 @@ __device__ __forceinline__ void local_relay_role(
                  local_return_done)
                      .load(::cuda::memory_order_acquire) == 0U &&
              !cancelled(a, control))
-        if (!local_notification_detail::progress(a))
+        if (!local_notification_detail::progress(a, incoming_peer))
           __nanosleep(50);
     } else {
       while (local_return_done == 0U && !cancelled(a, control)) {
@@ -607,7 +601,7 @@ __device__ __forceinline__ void local_relay_role(
     }
     __syncthreads();
   }
-  local_notification_detail::drain(a);
+  local_notification_detail::drain(a, return_peer, incoming_peer);
   __syncthreads();
 }
 

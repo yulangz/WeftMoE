@@ -105,6 +105,15 @@ void local_p2p_forward_megakernel(
   const auto *canonical_gates =
       peer_at<const float>(a.local_base, a.canonical_gates_offset);
   if constexpr (KernelRole != ForwardKernelRole::ComputeOnly) {
+    unsigned long long total_mblocks = 0;
+    if (!blockIdx.x && threadIdx.x < 32U) {
+      for (unsigned expert = threadIdx.x;
+           expert < dispatch_sizes(a.dispatch).owned_expert_count;
+           expert += 32U)
+        total_mblocks += forward_expert_mblock_count(a, expert);
+      for (unsigned delta = 16U; delta; delta /= 2U)
+        total_mblocks += __shfl_down_sync(0xffffffffU, total_mblocks, delta);
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       status->start_clock = device_globaltimer_ns();
       // Transport-only counters are unused by Forward and serve as first-start
@@ -120,10 +129,7 @@ void local_p2p_forward_megakernel(
                                     kForwardTransportClearArrivals) = 0ULL;
       *forward_mixed_scheduler_word(a, scheduler,
                                     kForwardTransportMapArrivals) = 0ULL;
-      for (std::uint32_t expert = 0;
-           expert < dispatch_sizes(a.dispatch).owned_expert_count; ++expert) {
-        scheduler[3] += forward_expert_mblock_count(a, expert);
-      }
+      scheduler[3] = total_mblocks;
       scheduler[4U + a.world] = 0ULL;
       scheduler[5U + 2ULL * a.world] = 0ULL;  // GIN headers ready contexts
       scheduler[6U + 2ULL * a.world] = 0ULL;  // Return directory ready epoch
@@ -312,21 +318,16 @@ void local_p2p_forward_megakernel(
     // The first words are an immutable expert/local-M lookup in Notify's M-tile
     // wavefront order.  The following regions are generation-local,
     // readiness-ordered FC1 and FC2 task queues.
-    for (std::uint64_t mblock =
-             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         mblock < setup_mblocks;
-         mblock += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
-      std::uint64_t local_mblock = 0;
-      const auto expert =
-          forward_locality_mblock_expert(a, mblock, local_mblock);
-      claims[mblock] = (static_cast<unsigned long long>(expert) << 32U) |
-                       static_cast<std::uint32_t>(local_mblock);
+    forward_initialize_mblocks(a, [&](unsigned long long mblock,
+                                      unsigned expert, unsigned local_mblock) {
+      claims[mblock] =
+          (static_cast<unsigned long long>(expert) << 32U) | local_mblock;
 #if __has_include(<nccl_device.h>)
       if (stream_local_dispatch || stream_remote_dispatch)
-        forward_dispatch_detail::initialize_input_group(
-            a, mblock, expert, static_cast<std::uint32_t>(local_mblock));
+        forward_dispatch_detail::initialize_input_group(a, mblock, expert,
+                                                        local_mblock);
 #endif
-    }
+    });
     // FC1-ready tasks, then FC2 M-block descriptors and their private N-tile
     // ticket counters, live after the immutable M-block mapping.  The FC2
     // region retains fc2_ntiles words per M-block, so the two M-block-sized

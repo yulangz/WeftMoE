@@ -189,6 +189,7 @@ struct CudaAllocation {
   cudaEvent_t producer_ready = nullptr;
   unsigned long long producer_capture_id = 0;
   cudaEvent_t completion = nullptr;
+  unsigned long long completion_capture_id = 0;
   std::vector<cudaEvent_t> consumer_events;
   mutable std::mutex consumer_mutex;
   std::vector<ConsumerEventSlotState> consumer_event_states;
