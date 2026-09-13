@@ -24,15 +24,17 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "cuda/nccl_protocol_internal.hpp"
+#include "cuda/persistent_v3/backward/cluster_task.cuh"
+#include "cuda/persistent_v3/forward/pipeline_state.cuh"
+#include "metadata/notify_corruption_hook.hpp"
+#include "transport/activation_protocol_testing.hpp"
 #include "weftmoe/api/errors.hpp"
 #include "weftmoe/cuda/control_protocol.hpp"
 #include "weftmoe/kernels/persistent_contract.hpp"
 #include "weftmoe/metadata/serialize.hpp"
 #include "weftmoe/scoreboard/workspace_plan.hpp"
 #include "weftmoe/transport/count_exchange.hpp"
-#include "transport/activation_protocol_testing.hpp"
-#include "cuda/nccl_protocol_internal.hpp"
-#include "metadata/notify_corruption_hook.hpp"
 
 namespace {
 
@@ -1930,10 +1932,101 @@ void test_bootstrap_real_pipe_one_shot() {
   REQUIRE(::close(replacement[0]) == 0);
 }
 
+void test_precombine_canonical_groups() {
+  using weftmoe::cuda::persistent_v3::precombine_group;
+  const std::array<unsigned, 8> destinations{4, 1, 4, 7, 1, 4, 7, 0};
+  const std::array<unsigned long long, 8> rows{
+      900, 82, 100000, 12, 91, 8000000000ULL, 15, 3};
+  for (auto batch_offset : {0ULL, 123456ULL}) {
+    for (unsigned i = 0; i < rows.size(); ++i) {
+      const auto group = precombine_group(
+          rows.size(), destinations[i], rows[i] + batch_offset,
+          [&](unsigned j) { return destinations[j]; },
+          [&](unsigned j) { return rows[j] + batch_offset; });
+      std::vector<unsigned long long> expected;
+      for (unsigned j = 0; j < rows.size(); ++j)
+        if (destinations[j] == destinations[i])
+          expected.push_back(rows[j] + batch_offset);
+      REQUIRE(group.leader == expected.front());
+      REQUIRE(group.count == expected.size());
+      const auto at =
+          std::find(expected.begin(), expected.end(), rows[i] + batch_offset);
+      REQUIRE(group.next == (at + 1 == expected.end() ? ~0ULL : *(at + 1)));
+    }
+  }
+  const auto single = precombine_group(
+      1, 2, 99, [](unsigned) { return 2U; }, [](unsigned) { return 99ULL; });
+  REQUIRE(single.leader == 99ULL && single.next == ~0ULL && single.count == 1U);
+  // A GIN packet filters out other nodes without reordering its fanout. The
+  // group seen by the receiver must equal the source's complete route group.
+  const std::array<unsigned, 5> packet_indices{0, 2, 3, 5, 6};
+  for (unsigned i : packet_indices) {
+    const auto source = precombine_group(
+        8, destinations[i], rows[i],
+        [&](unsigned j) { return destinations[j]; },
+        [&](unsigned j) { return rows[j]; });
+    const auto received = precombine_group(
+        packet_indices.size(), destinations[i], rows[i],
+        [&](unsigned j) { return destinations[packet_indices[j]]; },
+        [&](unsigned j) { return rows[packet_indices[j]]; });
+    REQUIRE(source.leader == received.leader && source.next == received.next &&
+            source.count == received.count);
+  }
+}
+
+void test_forward_multicast_task_pairs() {
+  using weftmoe::cuda::persistent_v3::fc1_group_task;
+  for (unsigned mblocks = 1; mblocks <= 8; ++mblocks) {
+    for (unsigned ntiles : {2U, 6U, 8U, 12U}) {
+      std::set<std::pair<unsigned, unsigned>> tasks;
+      for (unsigned position = 0; position < mblocks * ntiles; position += 2U) {
+        const auto a = fc1_group_task(position, mblocks, ntiles);
+        const auto b = fc1_group_task(position + 1U, mblocks, ntiles);
+        REQUIRE(a.member == b.member || a.ntile == b.ntile);
+        REQUIRE(a.member < mblocks && b.member < mblocks);
+        REQUIRE(a.ntile < ntiles && b.ntile < ntiles);
+        REQUIRE(tasks.emplace(a.member, a.ntile).second);
+        REQUIRE(tasks.emplace(b.member, b.ntile).second);
+      }
+      REQUIRE(tasks.size() == mblocks * ntiles);
+    }
+  }
+}
+
+void test_backward_multicast_task_pairs() {
+  using weftmoe::cuda::persistent_v3::backward::cluster_tile;
+  for (unsigned mtiles = 1; mtiles <= 21; ++mtiles) {
+    for (unsigned ntiles = 1; ntiles <= 13; ++ntiles) {
+      for (bool share_a : {false, true}) {
+        std::set<std::pair<unsigned, unsigned>> tasks;
+        unsigned tails = 0;
+        for (unsigned pair = 0; pair < (mtiles * ntiles + 1U) / 2U; ++pair) {
+          const auto a = cluster_tile(pair, 0, mtiles, ntiles, share_a);
+          const auto b = cluster_tile(pair, 1, mtiles, ntiles, share_a);
+          REQUIRE(a.valid && a.share_a == b.share_a);
+          REQUIRE(a.share_a ? a.m == b.m : a.n == b.n);
+          for (const auto tile : {a, b}) {
+            REQUIRE(tile.m < mtiles && tile.n < ntiles);
+            if (tile.valid)
+              REQUIRE(tasks.emplace(tile.m, tile.n).second);
+            else
+              ++tails;
+          }
+        }
+        REQUIRE(tasks.size() == mtiles * ntiles);
+        REQUIRE(tails == (mtiles * ntiles) % 2U);
+      }
+    }
+  }
+}
+
 } // namespace
 
 int main() {
   const std::vector<std::pair<const char *, std::function<void()>>> tests{
+      {"precombine_canonical_groups", test_precombine_canonical_groups},
+      {"forward_multicast_task_pairs", test_forward_multicast_task_pairs},
+      {"backward_multicast_task_pairs", test_backward_multicast_task_pairs},
       {"rank_local_async_and_deterministic_mapping",
        test_rank_local_async_and_deterministic_mapping},
       {"existing_shapes_descriptors_and_repeatability",

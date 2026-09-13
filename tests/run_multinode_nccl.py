@@ -124,6 +124,11 @@ def aggregate_gin_benchmark(outputs):
             "top_k": int(records[0]["top_k"]),
         },
         "reduce_scheduler": records[0]["reduce_scheduler"],
+        "pre_combine": bool(int(records[0].get("pre_combine", "0"))),
+        "per_rank_cluster_actual": [int(row.get("cluster_actual", "0"))
+                                    for row in records],
+        "per_rank_cluster_rank_mask": [int(row.get("cluster_rank_mask", "0"))
+                                       for row in records],
         "per_rank_activation_hash": [int(item["activation_hash"])
                                      for item in records],
         "per_rank_route_hash": [int(item["route_hash"])
@@ -298,9 +303,13 @@ def environment_overrides(args):
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
+        "WEFTMOE_FORWARD_PRE_COMBINE",
+        "WEFTMOE_TEST_ROUTE_STRIDE",
+        "WEFTMOE_TEST_TOKEN_OFFSET",
         "WEFTMOE_FORWARD_REPARTITION_EP8",
         "WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE",
         "WEFTMOE_FORWARD_OUTPUT_DIR",
+        "WEFTMOE_FORWARD_DUMP_TOKENS",
         "WEFTMOE_FORWARD_DUMP_INPUTS",
         "WEFTMOE_FORWARD_PROGRESS",
         "WEFTMOE_FORWARD_PROGRESS_DEADLINE_SECONDS",
@@ -619,7 +628,6 @@ def parse_args(argv=None):
                  "gin_forward_bench",
                  "gin_backward_smoke",
                  "gin_backward_bench",
-                 "socket_forward_bench",
                  "activation_socket",
                  "activation_gin"),
         default="valid",
@@ -984,31 +992,6 @@ def main(argv=None):
         print(f"[PASS] GIN Backward benchmark world={world}")
         return
 
-    if args.scenario == "socket_forward_bench":
-        failures = []
-        evidence = []
-        for result in outputs:
-            lines = [line for line in result.stdout.splitlines()
-                     if line.startswith("FORWARD_BENCH ")]
-            if result.returncode != 0 or len(lines) != 1:
-                failures.append(
-                    f"rank={result.rank} exit={result.returncode}; "
-                    f"stdout={result.stdout[-5000:]}; "
-                    f"stderr={result.stderr[-5000:]}"
-                )
-            else:
-                evidence.append(lines[0])
-                if "backend=nccl-socket-fallback" not in lines[0]:
-                    failures.append(
-                        f"rank={result.rank} wrong Socket Forward backend: "
-                        f"{lines[0]}"
-                    )
-        if failures:
-            raise RuntimeError("distributed Socket Forward failed:\n" +
-                               "\n".join(failures))
-        print("\n".join(evidence))
-        print(f"[PASS] host-enqueued Socket full Forward world={world}")
-        return
 
     if args.scenario == "activation_socket":
         failures = []

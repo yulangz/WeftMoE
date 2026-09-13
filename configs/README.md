@@ -21,9 +21,16 @@ control how many input buffers can overlap data movement with computation.
 Larger tiles or deeper pipelines can improve reuse, but also increase resource
 requirements and reduce scheduling flexibility.
 
+Both phases require two-CTA compute clusters and use TMA multicast. Backward
+activation GEMMs split each ready M tile into two row halves and multicast
+the weights. Both halves complete before the original tile is published as
+finished. Weight-gradient GEMMs prefer sharing the larger input operand,
+changing pairing direction for odd tile counts; a singleton tail participates
+in the cluster pipeline but only its valid tile writes a result.
+
 | Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `tile_m` | FWD/BWD | Row dimension of activation GEMM tiles. Padding and the number of available row blocks affect utilization. Keep the default unless evaluating another supported tile shape. |
+| `tile_m` | FWD/BWD | Rows in a logical activation tile, currently fixed at 128. Each backward compute CTA handles half of those rows. Padding and the number of ready tiles affect utilization. |
 | `tile_k` | FWD/BWD | Reduction-dimension step of the GEMM pipeline. The current implementation uses 64 to match its shared-memory layout. |
 | `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Start with FC1 N128 and FC2 N256 on Hopper. FC1 holds two projection accumulators, so increasing its N tile can be costly even when the shared-memory buffers fit. Keep FC2 N128 as an alternative for distributed tuning. |
 | `dab_tile_n`, `dx_tile_n` | BWD | Output-column dimensions of the activation-gradient and input-gradient GEMMs. Start with 256 for both; evaluate narrower tiles when dimensions or task parallelism warrant it. Narrower tiles do not necessarily reduce register usage. |
@@ -37,8 +44,8 @@ requirements and reduce scheduling flexibility.
 | `math_registers`, `producer_registers` | FWD/BWD | Per-thread register budget requests for the corresponding roles. These are allocation requests, not measured register counts; inspect compiler resource usage when changing them. |
 | `wgmma_wait_group` | FWD | Number of outstanding WGMMA groups permitted at a wait point. Controls the balance between pipeline overlap and operand or accumulator dependencies. |
 | `fc2_store_atom_n` | FWD | Column width of the FC2 output TMA store atom. Determines the granularity of output stores. |
-| `cluster_size` | FWD | Number of CTAs in a compute cluster. Affects cooperative scheduling, TMA multicast, and residency constraints. A two-CTA specialization requires even FC1 and FC2 N-tile counts; use one CTA for odd counts. |
-| `fc2_tma_store` | FWD | Enables FC2 output stores through shared-memory staging and TMA. Keep enabled as the starting point; its supported stage and cluster combinations are constrained. |
+| `cluster_size` | FWD | Fixed at two CTAs per compute cluster. TMA multicast is required; select N tiles that give even FC1 and FC2 tile counts. |
+| `fc2_tma_store` | FWD | Required for the multicast compute path. Full tiles use shared-memory staging and TMA; partial expert tails use bounds-checked stores. |
 
 ## Transport Parameters (`2_transport`)
 
@@ -81,8 +88,8 @@ scheduling overhead while increasing the time other tasks spend waiting.
 | `queue_idle_nanosleep` | BWD | Backoff hint when no compute-ready task is available. |
 | `ready_word_stagger` | BWD | Starts different CTAs at different ready-bitmap words when enabled. Can reduce contention, but may weaken locality between related tasks. |
 | `activation_owner_group` | BWD | Group size for distributing activation-gradient task claims among neighboring ready M-block owners. These are compute-work owners, not communication ranks. Start with 4 to balance contention and weight reuse. |
-| `epilogue_rows_per_task` | BWD | Rows processed per activation epilogue task. Controls the granularity of non-GEMM activation-gradient work. |
-| `dw2_claim_tiles`, `dw1_claim_tiles` | BWD | Weight-gradient tile claim granularity. Larger claims amortize scheduling overhead but can delay other ready work. |
+| `epilogue_rows_per_task` | BWD | Rows processed per CTA in an activation epilogue task. A cluster processes two such batches. Controls the granularity of non-GEMM activation-gradient work. |
+| `dw2_claim_tiles`, `dw1_claim_tiles` | BWD | Weight-gradient tiles per CTA in a claimed range. A cluster claims this many tile pairs. Larger claims amortize scheduling overhead; while activation work can still arrive, claims are limited to one pair to preserve queue priority. |
 
 Nanosleep values are GPU backoff hints, not guaranteed delays. Lower values may
 improve responsiveness while increasing polling contention. Tune these after

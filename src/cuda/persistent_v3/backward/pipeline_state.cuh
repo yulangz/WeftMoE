@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "cuda/persistent_v3/backward/cluster_task.cuh"
 #include "cuda/persistent_v3/queues.cuh"
 
 namespace weftmoe::cuda::persistent_v3::backward {

@@ -213,7 +213,7 @@ try_claim_owner_tile(TileDomain domain, std::uint32_t owner, TileTask &task) {
       if (claim.compare_exchange_weak(observed, desired,
                                       ::cuda::memory_order_relaxed,
                                       ::cuda::memory_order_relaxed)) {
-        task = TileTask{owner, word * 64U + bit, domain.kind, 1U};
+        task = TileTask{owner, word * 64U + bit, domain.kind};
         return true;
       }
     }
@@ -221,8 +221,9 @@ try_claim_owner_tile(TileDomain domain, std::uint32_t owner, TileTask &task) {
   return false;
 }
 
-WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
-                                                    TileTask &task) {
+WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(
+    TileDomain domain, TileTask &task,
+    std::uint32_t worker = static_cast<std::uint32_t>(blockIdx.x)) {
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
     return false;
@@ -231,7 +232,7 @@ WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
   // still resident in L2; the complete bitmap is still visited on a miss.
   std::uint32_t first = 0U;
   if constexpr (backward_tuning::kReadyWordStagger != 0U)
-    first = static_cast<std::uint32_t>(blockIdx.x) % words;
+    first = worker % words;
   for (std::uint32_t offset = 0U; offset < words; ++offset) {
     const auto word_index = (first + offset) % words;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
@@ -250,8 +251,7 @@ WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(TileDomain domain,
           const auto group_begin = bit & ~(kOwnerGroup - 1U);
           const auto group_bits =
               (bits >> group_begin) & ((1ULL << kOwnerGroup) - 1ULL);
-          const auto rotation =
-              static_cast<std::uint32_t>(blockIdx.x) & (kOwnerGroup - 1U);
+          const auto rotation = worker & (kOwnerGroup - 1U);
           const auto after_rotation = group_bits & (~0ULL << rotation);
           const auto selected =
               after_rotation != 0ULL ? after_rotation : group_bits;

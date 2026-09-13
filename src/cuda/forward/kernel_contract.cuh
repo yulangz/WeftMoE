@@ -40,13 +40,15 @@ struct ForwardKernelArgs {
   std::size_t gin_return_send_rows_offset = 0;
   std::size_t gin_return_receive_rows_offset = 0;
   std::size_t forward_return_rows_offset = 0;
+  bool pre_combine = false;
+  std::size_t forward_precombine_groups_offset = 0;
+  std::size_t forward_precombine_arrived_offset = 0;
   std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;
   std::uint32_t gin_context_count = 1;
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
-  bool use_socket = false;
   // A one-node split launch streams CUDA-IPC/NVLink rows through dedicated
   // Relay CTAs.  Unlike the legacy StaticLocal path, compute must consume the
   // same per-M-block ready queue used by GIN instead of assuming that the
@@ -104,12 +106,7 @@ struct ForwardKernelArgs {
   // receive directories and FULL-completion markers.
   std::uint32_t forward_relay_cta_count = 8;
   std::uint32_t forward_compute_cta_count = 0;
-  std::uint32_t forward_fc1_cta_count = 0;
   std::uint32_t forward_reduce_cta_count = 0;
-  // Split compiler-specialized FC2 grids share one logical reduction grid.
-  // Each launch owns a disjoint [offset, offset + gridDim.x) slice so Reduce
-  // remains folded into the compute CTA lifecycle without duplicate tokens.
-  std::uint32_t forward_reduce_cta_offset = 0;
   // Split-GIN production normally delegates node-local Return copies to Relay
   // CTAs.  Keeping this explicit also gives the autotuner a controlled A/B
   // against the legacy compute-epilogue copy without changing wire semantics.
@@ -134,10 +131,6 @@ struct ForwardKernelArgs {
   // When locality_group is two, this half-open window uses groups of four.
   std::uint8_t forward_fc1_locality_group4_begin = 4;
   std::uint8_t forward_fc1_locality_group4_end = 12;
-  // Forward scheduling may release a 64-row compute tile as soon as Notify's
-  // matching 64-row dispatch tile arrives. Physical storage remains padded to
-  // the canonical 128-row quantum.
-  std::uint32_t forward_mblock_rows = 128;
   bool retain_backward_state = false;
   // Production ready-token scheduler: reduction consumes only tokens whose
   // complete top-k route set has arrived instead of waiting on a fixed token

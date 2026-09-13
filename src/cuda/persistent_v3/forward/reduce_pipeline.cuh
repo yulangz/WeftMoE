@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/persistent_v3/forward/precombine.cuh"
+
 // Token combine runs after the CTA's final FC2 tile. WGMMA/TMA live ranges have
 // ended at this point, so the caller redistributes their fixed register budget
 // uniformly across all three warpgroups. The former TMA producer contributes
@@ -9,7 +11,7 @@
 
 namespace forward_compute_detail {
 
-template <bool StaticLocal, bool SingleRoute>
+template <bool StaticLocal, bool SingleRoute, bool PreCombine = false>
 __device__ __forceinline__ void reduce_one_token_impl(
     const ForwardKernelArgs &a, std::uint64_t token,
     TransportDeviceStatus *status, transport::BFloat16 *contribution,
@@ -45,10 +47,17 @@ __device__ __forceinline__ void reduce_one_token_impl(
   }
   __syncwarp();
 
+  const auto leaders = PreCombine ? forward_precombine_detail::leader_mask(
+                                        a.dispatch.combine_order,
+                                        a.dispatch.route_dst_rank, token, top_k)
+                                  : ~0ULL;
   auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
   for (std::uint64_t vector = lane; vector < a.hidden / 8ULL; vector += 32ULL) {
     float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (std::uint32_t order = 0; order < top_k; ++order) {
+      if constexpr (PreCombine)
+        if ((leaders & (1ULL << order)) == 0ULL)
+          continue;
       const auto row =
           SingleRoute ? token : __shfl_sync(0xffffffffU, lane_row, order);
       const auto *source = contribution;
@@ -99,6 +108,9 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
   if (a.dispatch.identity.top_k == 1U)
     reduce_one_token_impl<StaticLocal, true>(a, token, status, contribution,
                                              route_ready, combined, completion);
+  else if (a.pre_combine)
+    reduce_one_token_impl<StaticLocal, false, true>(
+        a, token, status, contribution, route_ready, combined, completion);
   else
     reduce_one_token_impl<StaticLocal, false>(
         a, token, status, contribution, route_ready, combined, completion);

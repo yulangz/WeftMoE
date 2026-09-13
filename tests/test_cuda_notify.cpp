@@ -33,6 +33,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+bool test_pre_combine() {
+  const auto *value = std::getenv("WEFTMOE_FORWARD_PRE_COMBINE");
+  return value && std::string(value) == "1";
+}
+
 #if WEFTMOE_DEVICE_TIMELINE
 void write_device_timeline(
     const weftmoe::cuda::profiling::DeviceTimelineSnapshot &snapshot,
@@ -2437,6 +2442,7 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
     auto activation = testing::upload_bfloat16_activations_for_testing(
         input, tokens, hidden, context, execution, pool);
     ForwardMegaKernelConfig forward_config{hidden, intermediate, true};
+    forward_config.pre_combine = test_pre_combine();
     const auto allocate = [&](std::uint64_t bytes) {
       auto owner = std::make_shared<internal::CudaAllocation>();
       owner->device = execution.device_ordinal();
@@ -2545,6 +2551,7 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   check(cudaEventCreateWithFlags(&snapshot_done, cudaEventDisableTiming));
   check(cudaStreamSynchronize(exec->stream));
   ForwardMegaKernelConfig graph_forward{hidden, intermediate, true};
+  graph_forward.pre_combine = test_pre_combine();
   graph_forward.tensors =
       prepare_forward_tensors(notify.dispatch(), execution, graph_forward);
   BackwardMegaKernelConfig graph_backward{hidden, intermediate};
@@ -2682,20 +2689,22 @@ void run_cached_backward_rank(
   progress("notify_done");
   weftmoe::cuda::ActivationTransportRunOptions forward_options;
   forward_options.deadline_after = std::chrono::seconds(300);
+  weftmoe::cuda::ForwardMegaKernelConfig forward_config{hidden, intermediate,
+                                                        true};
+  forward_config.pre_combine = test_pre_combine();
   auto forward = [&] {
     if (nodes == 2U) {
       weftmoe::cuda::GinRdmaForwardMegaKernel forward_kernel(
           generation, execution, activation_pool);
       progress("forward_constructed");
-    return forward_kernel.enqueue(notify.dispatch(), activations, weights,
-                                {hidden, intermediate, true},
-                                forward_options);
+      return forward_kernel.enqueue(notify.dispatch(), activations, weights,
+                                    forward_config, forward_options);
     }
     weftmoe::cuda::LocalCudaP2pForwardMegaKernel forward_kernel(
         generation, execution, activation_pool);
     progress("forward_constructed");
     return forward_kernel.enqueue(notify.dispatch(), activations, weights,
-                              {hidden, intermediate, true}, forward_options);
+                                  forward_config, forward_options);
   }();
   progress("forward_done");
 
@@ -2841,13 +2850,13 @@ void run_cached_backward_rank(
   };
   const auto usage = activation_pool.usage();
   std::cout << "BACKWARD_RESULT rank=" << rank << " world=" << world
+            << " forward_pre_combine=" << forward_config.pre_combine
             << " mode=" << (validation ? "validation" : "benchmark")
             << " backend=" << (nodes == 2U ? "gin-rdma" : "local-p2p")
             << " tokens=" << max_tokens << " experts=" << experts
             << " top_k=" << top_k << " hidden=" << hidden
             << " intermediate=" << intermediate
-            << " incoming_rows="
-            << notify.dispatch().sizes().incoming_row_count
+            << " incoming_rows=" << notify.dispatch().sizes().incoming_row_count
             << " gemm_launches=" << last.audit().gemm_launches
             << " dispatch_peer_bytes="
             << last.audit().actual_dispatch_peer_bytes
@@ -2973,6 +2982,7 @@ void run_communication_benchmark_rank(
     local = std::make_unique<LocalCudaP2pForwardMegaKernel>(
         generation, execution, activation_pool);
   ForwardMegaKernelConfig fc{hidden, intermediate, false};
+  fc.pre_combine = test_pre_combine();
   fc.tensors = prepare_forward_tensors(notify.dispatch(), execution, fc);
   auto enqueue = [&] {
     return remote ? remote->enqueue(notify.dispatch(), activations, weights, fc)
@@ -3018,17 +3028,59 @@ void run_communication_benchmark_rank(
   output.wait();
   const auto audit = output.audit();
   const auto timing = output.timings();
-  if (top_k == 1U) {
+  if (top_k == 1U || (fc.pre_combine && max_tokens <= 128U)) {
     const auto actual =
         download_forward_output_for_validation(output, execution);
-    require(actual.size() == activation_host.size() &&
-                std::memcmp(actual.data(), activation_host.data(),
-                            actual.size() * sizeof(actual.front())) == 0,
-            "communication round trip changed a top-1 activation");
+    require(actual.size() == activation_host.size(),
+            "communication output size");
+    if (top_k == 1U)
+      require(std::memcmp(actual.data(), activation_host.data(),
+                          actual.size() * sizeof(actual.front())) == 0,
+              "communication round trip changed a top-1 activation");
+    else
+      for (unsigned long long token = 0; token < max_tokens; ++token) {
+        std::vector<unsigned> ordered(top_k);
+        for (unsigned slot = 0; slot < top_k; ++slot)
+          ordered[slot] = slot;
+        std::sort(ordered.begin(), ordered.end(), [&](unsigned x, unsigned y) {
+          return routes.selected_experts[token * top_k + x] <
+                 routes.selected_experts[token * top_k + y];
+        });
+        std::vector<std::pair<unsigned, unsigned>> groups;
+        for (unsigned slot : ordered) {
+          const auto destination =
+              config.topology.expert_to_rank
+                  [routes.selected_experts[token * top_k + slot]];
+          auto at = std::find_if(groups.begin(), groups.end(), [&](auto item) {
+            return item.first == destination;
+          });
+          if (at == groups.end())
+            groups.emplace_back(destination, 1U);
+          else
+            ++at->second;
+        }
+        for (unsigned h = 0; h < hidden; ++h) {
+          const auto x = weftmoe::transport::bfloat16_to_float(
+              activation_host[token * hidden + h]);
+          float sum = 0.0F;
+          for (auto group : groups) {
+            float partial = 0.0F;
+            for (unsigned i = 0; i < group.second; ++i)
+              partial += x;
+            sum += weftmoe::transport::bfloat16_to_float(
+                weftmoe::transport::float_to_bfloat16(partial));
+          }
+          require(
+              actual[token * hidden + h].bits ==
+                  weftmoe::transport::float_to_bfloat16(sum).bits,
+              "captured communication pre-combine disagrees with reference");
+        }
+      }
   }
   std::cout << "COMM_BENCH rank=" << rank << " world=" << world
-            << " tokens=" << max_tokens << " top_k=" << top_k
-            << " hidden=" << hidden << " experts=" << experts
+            << " pre_combine=" << fc.pre_combine << " tokens=" << max_tokens
+            << " top_k=" << top_k << " hidden=" << hidden
+            << " experts=" << experts
             << " dispatch_peer_bytes=" << audit.actual_dispatch_peer_bytes
             << " return_peer_bytes=" << audit.actual_return_peer_bytes
             << " gin_dispatch_bytes=" << audit.gin_dispatch_payload_bytes
@@ -3052,6 +3104,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               int bootstrap_output_fd,
               const std::string &scenario) {
   const auto world = nodes * gpus_per_node;
+  const auto route_stride =
+      std::getenv("WEFTMOE_TEST_ROUTE_STRIDE")
+          ? std::stoul(std::getenv("WEFTMOE_TEST_ROUTE_STRIDE"))
+          : 53U;
   constexpr std::array<std::uint32_t, 12> kCrossEpExperts{
       1U, 68U, 135U, 202U, 269U, 336U,
       145U, 289U, 10U, 90U, 230U, 350U};
@@ -3060,8 +3116,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       scenario == "activation_integrated_bench";
   const auto gin_forward_smoke = scenario == "gin_forward_smoke";
   const auto gin_forward_benchmark = scenario == "gin_forward_bench";
-  const auto socket_forward_benchmark =
-      scenario == "socket_forward_bench";
   const auto gin_backward_smoke = scenario == "gin_backward_smoke";
   const auto gin_backward_benchmark = scenario == "gin_backward_bench";
   const auto backward_validation =
@@ -3070,8 +3124,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       scenario == "backward_bench" || gin_backward_benchmark;
   const auto forward_smoke = scenario == "forward_smoke" || gin_forward_smoke;
   const auto benchmark_forward =
-      scenario == "forward_bench" || gin_forward_benchmark ||
-      socket_forward_benchmark;
+      scenario == "forward_bench" || gin_forward_benchmark;
   const bool benchmark_communication = scenario == "communication_bench";
   const auto benchmark_shape = benchmark_p2p || benchmark_integrated ||
                                benchmark_forward || backward_benchmark ||
@@ -3090,9 +3143,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   std::uint64_t fixture_token_offset = 0;
   std::uint64_t fixture_tokens = 0;
   if (benchmark_shape) {
-    const auto cross_host_benchmark =
-        gin_forward_benchmark || socket_forward_benchmark ||
-        gin_backward_benchmark || (benchmark_communication && nodes > 1U);
+    const auto cross_host_benchmark = gin_forward_benchmark ||
+                                      gin_backward_benchmark ||
+                                      (benchmark_communication && nodes > 1U);
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
               ((benchmark_forward || backward_benchmark) &&
@@ -3127,6 +3180,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       fixture_rank = rank / (world / 8U);
       fixture_token_offset = (rank % (world / 8U)) * max_tokens;
     }
+    if (const auto *offset = std::getenv("WEFTMOE_TEST_TOKEN_OFFSET")) {
+      fixture_token_offset += std::stoull(offset);
+      fixture_tokens += std::stoull(offset);
+    }
     common_config = make_config(nodes, gpus_per_node, experts, top_k,
                                 benchmark_communication ? 128U : 64U);
     for (std::uint32_t expert = 0; expert < experts; ++expert)
@@ -3140,8 +3197,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto base = static_cast<std::uint32_t>(
           ((token + fixture_token_offset) * 17U + fixture_rank * 31U) % experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
-        common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            (base + slot * 53U) % experts));
+        common_routes.selected_experts.push_back(
+            static_cast<std::int32_t>((base + slot * route_stride) % experts));
     }
     // Diagnostic only: hold per-expert row counts and GEMM dimensions fixed
     // while changing where tokens originate. This changes routing semantics
@@ -3224,8 +3281,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto base = static_cast<std::uint32_t>(
           (token * world + rank) % experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
-        common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            (base + slot * 53U) % experts));
+        common_routes.selected_experts.push_back(
+            static_cast<std::int32_t>((base + slot * route_stride) % experts));
     }
   }
   weftmoe::cuda::NcclBootstrapId bootstrap;
@@ -3433,7 +3490,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.max_owned_experts = experts / world;
     transport_config.enable_backward_state = retain_backward_state;
     transport_config.enable_gin_rdma = gin_forward_benchmark;
-    transport_config.enable_socket_fallback = socket_forward_benchmark;
     const auto setup_start = Clock::now();
     weftmoe::cuda::ActivationTransportResourcePool transport_pool;
     std::vector<weftmoe::transport::BFloat16> activation_host(
@@ -3494,8 +3550,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::unique_ptr<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>
         local_forward;
     std::unique_ptr<weftmoe::cuda::GinRdmaForwardMegaKernel> gin_forward;
-    std::unique_ptr<weftmoe::cuda::NcclSocketFallbackForwardMegaKernel>
-        socket_forward;
     const auto run_forward = [&](const auto &dispatch,
                                  const auto &activations,
                                  const auto &forward_weights,
@@ -3507,9 +3561,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       if (gin_forward)
         return gin_forward->run(dispatch, activations, forward_weights,
                                 forward_config, run_options);
-      if (socket_forward)
-        return socket_forward->run(dispatch, activations, forward_weights,
-                                   forward_config, run_options);
       return local_forward->run(dispatch, activations, forward_weights,
                                 forward_config, run_options);
     };
@@ -3549,6 +3600,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     weftmoe::cuda::BFloat16ActivationLease input_lease;
     weftmoe::cuda::ForwardMegaKernelConfig forward_config{
         hidden, intermediate, retain_backward_state};
+    forward_config.pre_combine = test_pre_combine();
     double first_use_wall_us = 0;
     double first_use_notify_pool_us = 0;
     double first_use_notify_us = 0;
@@ -3594,10 +3646,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           gin_forward =
               std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
                   generation, execution, transport_pool);
-        else if (socket_forward_benchmark)
-          socket_forward = std::make_unique<
-              weftmoe::cuda::NcclSocketFallbackForwardMegaKernel>(
-              generation, execution, transport_pool);
         else
           local_forward =
               std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
@@ -3749,9 +3797,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                         std::to_string(rank) + ".bf16";
       std::ofstream destination(path, std::ios::binary | std::ios::trunc);
       require(destination.good(), "failed to open forward output artifact");
+      auto output_elements =
+          static_cast<std::uint64_t>(downloaded_output.size());
+      if (const auto *limit = std::getenv("WEFTMOE_FORWARD_DUMP_TOKENS"))
+        output_elements =
+            std::min(output_elements,
+                     static_cast<std::uint64_t>(std::stoull(limit)) * hidden);
       destination.write(
           reinterpret_cast<const char *>(downloaded_output.data()),
-          static_cast<std::streamsize>(downloaded_output.size() *
+          static_cast<std::streamsize>(output_elements *
                                        sizeof(downloaded_output.front())));
       require(destination.good(), "failed to write forward output artifact");
       if (std::getenv("WEFTMOE_FORWARD_DUMP_INPUTS")) {
@@ -3767,6 +3821,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         dump(".input.bf16", activation_host);
         dump(".routes.i32", common_routes.selected_experts);
         dump(".gates.f32", route_gates);
+        if (!forward_config.pre_combine)
+          dump(".contributions.bf16",
+               weftmoe::cuda::download_forward_routes_for_validation(
+                   last_output, execution));
       }
     }
     const auto usage = transport_pool.usage();
@@ -3781,9 +3839,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         << " tokens=" << common_routes.num_tokens << " experts=" << experts
         << " top_k=" << top_k << " hidden=" << hidden
         << " intermediate=" << intermediate << " backend="
-        << (gin_forward_benchmark      ? "gin-rdma"
-            : socket_forward_benchmark ? "nccl-socket-fallback"
-                                       : "local-cuda-p2p")
+        << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
         << " specialization=sm90-wgmma-tma-" << hidden << "x" << intermediate
         << " retained_backward_state=" << retain_backward_state
         << " reduce_scheduler=" << reduce_scheduler
@@ -3826,11 +3882,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         << " cluster_supported="
         << static_cast<unsigned int>(last_audit.runtime_cluster_supported)
         << " cluster_requested=" << last_audit.requested_cluster_size
+        << " pre_combine=" << forward_config.pre_combine
         << " cluster_actual=" << last_audit.runtime_cluster_size
         << " cluster_rank_mask=" << last_audit.observed_cluster_rank_mask
         << " max_active_clusters=" << last_audit.max_active_clusters
-              << " steady_forbidden_cuda_api_calls=0"
-              << " tensor_bytes=" << forward_config.tensors.bytes()
+        << " steady_forbidden_cuda_api_calls=0"
+        << " tensor_bytes=" << forward_config.tensors.bytes()
         << " output_hash=" << output_hash << " wall=";
     emit_values(wall_samples);
     std::cout << " notify=";

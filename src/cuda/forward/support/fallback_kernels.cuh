@@ -399,41 +399,7 @@ __global__ void socket_relay_transport_kernel(
   }
 }
 
-__global__ void socket_install_forward_headers_kernel(
-    const SocketRouteHeader *compact_headers,
-    LocalP2pRouteHeader *canonical_headers, std::uint64_t incoming,
-    std::uint64_t generation, std::uint64_t epoch,
-    std::uint32_t destination_rank, std::uint64_t max_rows,
-    TransportDeviceStatus *status) {
-  const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
-                     threadIdx.x;
-  if (index >= incoming)
-    return;
-  auto header = compact_headers[index].route;
-  if (header.schema_version != transport::kActivationTransportSchemaVersion ||
-      header.generation != generation ||
-      header.destination_rank != destination_rank ||
-      header.dst_row >= max_rows) {
-    publish_local_structured_error(status, destination_rank, 41U, 1U,
-                                   max_rows, header.dst_row);
-    return;
-  }
-  header.source_epoch = epoch;
-  canonical_headers[header.dst_row] = header;
-}
 
-__global__ void socket_gather_forward_returns_kernel(
-    const SocketRouteHeader *headers,
-    const transport::BFloat16 *canonical_output,
-    transport::BFloat16 *compact, std::uint64_t incoming,
-    std::uint64_t hidden) {
-  const auto packed = static_cast<std::uint64_t>(blockIdx.x);
-  if (packed >= incoming)
-    return;
-  const auto row = headers[packed].route.dst_row;
-  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x)
-    compact[packed * hidden + h] = canonical_output[row * hidden + h];
-}
 
 __global__ void socket_scatter_returns_kernel(
     const SocketRouteHeader *headers,
@@ -469,29 +435,6 @@ __global__ void socket_gate_reduce_kernel(
   }
 }
 
-// Full Forward has already applied each route gate to the BF16 FC2 input.
-// Its Socket correctness fallback therefore combines returned route vectors
-// with the same fixed-order, unweighted FP32 sum as the split CUDA path.
-__global__ void socket_sum_forward_routes_kernel(
-    DeviceDispatchKernelView dispatch,
-    const transport::BFloat16 *by_route,
-    transport::BFloat16 *combined, std::uint64_t hidden) {
-  const auto token = static_cast<std::uint64_t>(blockIdx.x);
-  if (token >= dispatch.identity.num_tokens)
-    return;
-  for (std::uint64_t h = threadIdx.x; h < hidden; h += blockDim.x) {
-    float sum = 0.0F;
-    for (std::uint32_t order = 0; order < dispatch.identity.top_k; ++order) {
-      const auto slot = dispatch.combine_order[
-          token * dispatch.identity.top_k + order];
-      const auto route = token * dispatch.identity.top_k + slot;
-      sum = __fadd_rn(
-          sum, bf16_bits_to_float(by_route[route * hidden + h].bits));
-    }
-    combined[token * hidden + h] =
-        transport::BFloat16{float_to_bf16_bits(sum)};
-  }
-}
 
 __global__ void socket_finalize_status_kernel(TransportDeviceStatus *status,
                                               std::uint64_t routes,

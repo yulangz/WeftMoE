@@ -6,10 +6,8 @@
 
 namespace weftmoe::cuda::persistent_v3 {
 
-// Hopper exposes at most 132 SMs.  After the fixed RDMA/Relay reservation the
-// Forward compute grid contains at most 58 two-CTA clusters.  Keep a little
-// headroom so an experimental cluster scheduler can use one mailbox per pair
-// without coupling the arena size to a particular device's SM count.
+// One mailbox per two-CTA compute cluster. The launch validates this capacity
+// as well as the device's SM budget before enqueuing the persistent grids.
 inline constexpr std::uint32_t kForwardComputePairCapacity = 64U;
 
 // The leader assigns one same-kind task to each CTA.  Odd sequence values
@@ -25,6 +23,39 @@ struct alignas(32) ForwardComputePairMailbox {
 static_assert(sizeof(ForwardComputePairMailbox) == 32U);
 
 inline constexpr unsigned long long kNoInputGroup = ~0ULL;
+
+// Immutable links in canonical expert order, built during Dispatch. Counters
+// live separately and are cleared before any rank can publish Dispatch data.
+// In particular, a late leader row must never reset an already active counter.
+struct ForwardPrecombineGroup {
+  unsigned long long leader = ~0ULL;
+  unsigned long long next = ~0ULL;
+  std::uint32_t count = 0;
+};
+
+static_assert(sizeof(ForwardPrecombineGroup) == 24U);
+
+// Both the source route list and a GIN packet's fanout use canonical order.
+// Filtering either list by destination therefore constructs the same group.
+template <class Destination, class Row>
+WEFTMOE_V3_HOST_DEVICE constexpr ForwardPrecombineGroup
+precombine_group(std::uint32_t size, std::uint32_t destination,
+                 unsigned long long row, Destination destination_at,
+                 Row row_at) {
+  ForwardPrecombineGroup result;
+  bool after = false;
+  for (std::uint32_t i = 0; i < size; ++i) {
+    if (destination_at(i) != destination)
+      continue;
+    const auto member = row_at(i);
+    if (result.count++ == 0U)
+      result.leader = member;
+    if (after && result.next == ~0ULL)
+      result.next = member;
+    after |= member == row;
+  }
+  return result;
+}
 
 // Owned by one destination-local publisher for the entire execution. Advance
 // tile_cursor only after all rows of that Notify tile have arrived; completed
@@ -42,6 +73,23 @@ struct ForwardInputGroupSpan {
   std::uint32_t begin = 0;
   std::uint32_t count = 0;
 };
+
+struct ForwardFc1GroupTask {
+  std::uint32_t member;
+  std::uint32_t ntile;
+};
+
+// Even M pairs share weights. A final unpaired M block emits adjacent N pairs
+// sharing its input instead. Thus an odd group never creates two independent
+// tasks at an N boundary; every compute pair can multicast one operand.
+WEFTMOE_V3_HOST_DEVICE constexpr ForwardFc1GroupTask
+fc1_group_task(std::uint32_t position, std::uint32_t mblocks,
+               std::uint32_t ntiles) {
+  const auto paired = mblocks & ~1U;
+  if (position < paired * ntiles)
+    return {position % paired, position / paired};
+  return {mblocks - 1U, position - paired * ntiles};
+}
 
 // Keep startup blocks independent and clip groups at locality-window edges.
 WEFTMOE_V3_HOST_DEVICE constexpr ForwardInputGroupSpan

@@ -58,13 +58,14 @@ class ForwardAutotuneTest(unittest.TestCase):
         with self.assertRaisesRegex(tune.PlanError, "divisible"):
             tune.validate_tuning(config)
 
-    def test_odd_n_tile_count_requires_single_cta_specialization(self):
+    def test_multicast_requires_even_n_tile_counts(self):
         config = dict(self.candidates[0]["config"], main_intermediate=768,
                       fc1_tile_n=256, fc1_stages=2, cluster_size=2)
         with self.assertRaisesRegex(tune.PlanError, "even"):
             tune.validate_tuning(config)
         config["cluster_size"] = 1
-        tune.validate_tuning(config)
+        with self.assertRaisesRegex(tune.PlanError, "cluster_size=2"):
+            tune.validate_tuning(config)
 
     def test_local_runtime_library_path_precedes_inherited_libraries(self):
         benchmark = dict(self.plan["benchmark"], launcher="local", world=8,

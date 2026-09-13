@@ -29,7 +29,7 @@ def run(model: ModelSpec, *, phase: str = 'forward', tokens: int = 8192,
         autotune: bool = False, nodes: int | None = None, gpus_per_node: int | None = None,
         config: str | Path | None = None, system: dict | None = None,
         jobs: int = DEFAULT_COMPILE_JOBS, output: str | Path | None = None,
-        generate_only: bool = False) -> dict:
+        generate_only: bool = False, pre_combine: bool = False) -> dict:
     """Compile and benchmark one configuration, optionally selecting it by tuning.
 
     Tuning measures a bucket representative. The final benchmark always uses
@@ -38,6 +38,10 @@ def run(model: ModelSpec, *, phase: str = 'forward', tokens: int = 8192,
     """
     if phase not in ('forward', 'backward'):
         raise ValueError('phase must be forward or backward')
+    if type(pre_combine) is not bool:
+        raise ValueError('pre_combine must be boolean')
+    if phase == 'backward' and pre_combine:
+        raise ValueError('pre_combine is a forward option')
     if type(tokens) is not int or tokens <= 0:
         raise ValueError('tokens must be a positive integer')
     if type(jobs) is not int or not 1 <= jobs <= 32:
@@ -55,8 +59,13 @@ def run(model: ModelSpec, *, phase: str = 'forward', tokens: int = 8192,
     explicit_config = config or settings.autotune_config
     config_path = Path(explicit_config or ROOT / 'configs' /
                        f'{phase}_h200_{topology_name}_autotune.json').resolve()
+    workload = {'tokens_per_rank': tokens}
+    if phase == 'forward':
+        workload['pre_combine'] = pre_combine
     plan = module.load_plan(config_path, model=asdict(model), system=system,
-                            benchmark={'tokens_per_rank': tokens})
+                            benchmark=workload)
+    if phase == 'forward':
+        plan['benchmark']['pre_combine'] = pre_combine
     configure_preparation(plan, phase, exact_tokens=not autotune)
     plan['jit']['jobs'] = jobs
     candidates = module.expand_candidates(plan)
@@ -84,6 +93,8 @@ def run(model: ModelSpec, *, phase: str = 'forward', tokens: int = 8192,
                      '--output', str(tune_path), '--skip-final']
         for key, value in asdict(model).items():
             arguments += ['--' + key.replace('_', '-'), str(value)]
+        if phase == 'forward':
+            arguments.append('--pre-combine' if pre_combine else '--no-pre-combine')
         if module.main(arguments) != 0:
             raise RuntimeError(f'autotune failed; see {tune_path}')
         tuning = json.loads(tune_path.read_text())
@@ -127,6 +138,7 @@ def main():
         parser.add_argument('--' + name, type=int, required=True)
     parser.add_argument('--tokens', type=int, default=8192)
     parser.add_argument('--autotune', action='store_true')
+    parser.add_argument('--pre-combine', action='store_true')
     parser.add_argument('--nodes', type=int)
     parser.add_argument('--gpus-per-node', type=int)
     parser.add_argument('--config', type=Path)

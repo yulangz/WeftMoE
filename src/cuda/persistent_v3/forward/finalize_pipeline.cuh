@@ -108,8 +108,7 @@ __device__ __forceinline__ void split_transport_finalize(
                      a.forward_relay_cta_count);
     __syncthreads();
 
-    const auto remote_fanout =
-        forward_return_detail::source_compact_rows(a, scheduler);
+    const auto remote_fanout = forward_return_detail::source_compact_rows(a);
     if (threadIdx.x == 0U) {
       const auto arrivals = completion_task(
           completion, transport_state::TaskClass::SourceArrival).expected;

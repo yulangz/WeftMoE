@@ -212,11 +212,15 @@ __device__ __forceinline__ bool choose_return(const Args &a, unsigned context,
         !ring::can_send(gin, a.gin_window, a.gin_rings, channel, state.sent))
       continue;
     auto &queue = return_queue_detail::queues(a)[1U + peer(a, channel)];
+    // Acquire completion before reading confirmed: observing a final producer
+    // after an older confirmed value could otherwise send an early terminal.
+    const auto sealed = return_queue_detail::producers_complete(a);
     const auto ready =
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
             queue.confirmed)
             .load(::cuda::memory_order_acquire);
-    if (ready - queue.head < ring::kChunkRows && ready != queue.capacity)
+    if (ready - queue.head < ring::kChunkRows && ready != queue.capacity &&
+        !sealed)
       continue;
     const auto rows =
         unsigned(min(ready - queue.head, 1ULL * ring::kChunkRows));

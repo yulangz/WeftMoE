@@ -142,24 +142,6 @@ __device__ __forceinline__ void publish_production_terminal_status(
       status->error_actual,
       a.epoch};
 
-  // The Socket fallback deliberately has no CUDA-IPC/Gin peer window. Publish
-  // into owner-local storage and let the mandatory production NCCL status
-  // agreement carry the same record after the host-enqueued payload drain.
-  if (!StaticLocal && a.use_socket) {
-    if (threadIdx.x == 0U) {
-      auto *records = peer_at<ProductionStatusRecord>(
-          a.local_base, ordinary_record_offset);
-      auto record = local;
-      record.epoch = 0ULL;
-      records[a.rank] = record;
-      __threadfence_system();
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-          published(records[a.rank].epoch);
-      published.store(a.epoch, ::cuda::memory_order_release);
-    }
-    return;
-  }
-
   // Publish this rail's local record to every node-local peer. No record is
   // consumed until its epoch is observed with acquire ordering.
   for (std::uint32_t local_peer = threadIdx.x; local_peer < local_world;
@@ -1142,4 +1124,3 @@ __global__ void local_p2p_finish_kernel(LocalP2pKernelArgs a) {
   }
 }
 #endif
-

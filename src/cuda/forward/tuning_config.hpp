@@ -300,8 +300,10 @@ static_assert((kMathWarpgroups * kMathRegisters +
 static_assert(kComputeThreads * kReduceRegisters <= 65536U);
 static_assert(kWgmmaWaitGroup <= 1U);
 static_assert(kFc2StoreAtomN == 64U);
-static_assert(!kFc2TmaStore || kTileM == 128U);
-static_assert(kClusterSize == 1U || kClusterSize == 2U);
+static_assert(kFc2TmaStore && kTileM == 128U,
+              "Forward requires M128 with the TMA FC2 epilogue");
+static_assert(kClusterSize == 2U,
+              "Forward requires two-CTA TMA multicast clusters");
 // GIN owns eight physical contexts.  A one-node specialization has no RDMA
 // role at all and may tune Relay independently; multi-node keeps Relay in
 // whole context-sized groups.

@@ -38,7 +38,7 @@ __device__ void transport_benchmark_role(const ForwardKernelArgs &a,
     const auto map = claims[mblock];
     const auto expert = static_cast<unsigned int>(map >> 32U);
     const auto local = static_cast<unsigned int>(map);
-    const auto local_row = forward_mblock_local_row(a, expert, local);
+    const auto local_row = forward_mblock_local_row(local);
     const auto rows = forward_mblock_valid_rows(a, expert, local);
     const auto row = a.dispatch.expert_row_prefix[expert] + local_row;
     // Local completion includes every destination-side FC1 publisher. It
@@ -54,8 +54,7 @@ __device__ void transport_benchmark_role(const ForwardKernelArgs &a,
     __threadfence_system();
 
     if (threadIdx.x < kMathThreads)
-      forward_return_detail::publish_rows<kMathThreads>(a, scheduler, row, rows,
-                                                        ready);
+      forward_return_detail::publish_rows<kMathThreads>(a, row, rows, ready);
     __syncthreads();
     if (threadIdx.x == 0U)
       atomicAdd(&scheduler[4U + a.world], 1ULL);

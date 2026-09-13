@@ -2,6 +2,7 @@
 
 #include "cuda/communication/activation_ring.cuh"
 #include "cuda/persistent_v3/forward/opportunistic_reduce.cuh"
+#include "cuda/persistent_v3/forward/precombine.cuh"
 #include "cuda/persistent_v3/forward/return_pipeline.cuh"
 
 // Included by activation_transport.cu after the private Forward launch
@@ -119,6 +120,7 @@ __device__ __forceinline__ void publish_local_batch(
                               topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
+      forward_precombine_detail::describe_local(a, route);
       destination_gates[row] = gate;
       auto *destination_rows = peer_at<transport::BFloat16>(
           a.peer_bases[destination], a.canonical_rows_offset);
@@ -216,6 +218,7 @@ __device__ __forceinline__ void publish_local_batch(
                               topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
+      forward_precombine_detail::describe_local(a, route);
       destination_gates[row] = gate;
     }
     destination = __shfl_sync(0xffffffffU, destination, 0U);
@@ -273,8 +276,8 @@ initialize_input_group(const ForwardKernelArgs &a, unsigned long long mblock,
       a.forward_fc1_locality_group4_begin, a.forward_fc1_locality_group4_end);
   if (span.begin != local_mblock)
     return;
-  const auto row_begin = forward_mblock_local_row(a, expert, local_mblock);
-  const auto group_end = row_begin + 1ULL * span.count * a.forward_mblock_rows;
+  const auto row_begin = forward_mblock_local_row(local_mblock);
+  const auto group_end = row_begin + 1ULL * span.count * forward_tuning::kTileM;
   const auto expert_rows = a.dispatch.expert_row_count[expert];
   const auto row_end = group_end < expert_rows ? group_end : expert_rows;
   const auto first_tile = a.dispatch.mtile_row_offsets[expert];
@@ -355,13 +358,16 @@ publish_ready_fc1_tasks(const ForwardKernelArgs &a, std::uint32_t context,
         // queue's release stores pass payload visibility to the compute CTA.
         const auto begin = tail.fetch_add(1ULL * group.mblocks * ntiles,
                                           ::cuda::memory_order_relaxed);
-        for (std::uint32_t n = 0U; n < ntiles; ++n)
-          for (std::uint32_t member = 0U; member < group.mblocks; ++member) {
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                entry(ready_queue[begin + 1ULL * n * group.mblocks + member]);
-            entry.store(1ULL * (mblock + member) * ntiles + n + 1ULL,
-                        ::cuda::memory_order_release);
-          }
+        for (std::uint32_t position = 0; position < group.mblocks * ntiles;
+             ++position) {
+          const auto task =
+              persistent_v3::fc1_group_task(position, group.mblocks, ntiles);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              entry(ready_queue[begin + position]);
+          entry.store(1ULL * (mblock + task.member) * ntiles + task.ntile +
+                          1ULL,
+                      ::cuda::memory_order_release);
+        }
         --remaining;
         progressed = true;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -463,6 +469,7 @@ local_relay_role(const ForwardKernelArgs &a,
             static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
         peer_at<float>(a.peer_bases[destination],
                        a.canonical_gates_offset)[row] = a.gates[route];
+        forward_precombine_detail::describe_local(a, route);
         peer_rows += destination != a.rank;
       }
       __syncwarp();
@@ -582,7 +589,7 @@ local_relay_role(const ForwardKernelArgs &a,
             a, control, context, scheduler, local_return_state,
             reinterpret_cast<std::byte *>(storage), copy_full, kReturnThreads);
         if (!progressed && threadIdx.x < 32U)
-          forward_reduce_detail::try_reduce_one_token<true>(a);
+          forward_reduce_detail::try_reduce_one_token(a);
         if (threadIdx.x == 0U) {
           if (forward_return_detail::local_return_terminal(
                   a, scheduler, local_return_state)) {

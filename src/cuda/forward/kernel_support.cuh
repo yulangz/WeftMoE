@@ -146,11 +146,11 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
 }
 
 CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
-                                    std::uint64_t outer,
-                                    const char *field,
-                                    std::uint64_t row_stride_bytes = 0ULL) {
+                                    std::uint64_t outer, const char *field,
+                                    std::uint64_t row_stride_bytes = 0ULL,
+                                    std::uint32_t box_rows = 128U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
-      outer > UINT32_MAX)
+      outer > UINT32_MAX || (box_rows != 64U && box_rows != 128U))
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "forward-tma-store-map", field, 0,
                     "nonzero uint32 dimensions and valid base", "invalid");
@@ -166,7 +166,7 @@ CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
                     "16-byte-aligned stride covering one row",
                     std::to_string(row_stride_bytes));
   const cuuint64_t strides[1] = {row_stride_bytes};
-  const cuuint32_t box[2] = {64U, 128U};
+  const cuuint32_t box[2] = {64U, box_rows};
   const cuuint32_t element_strides[2] = {1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
       &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,
@@ -541,6 +541,8 @@ struct Layout {
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
   std::size_t forward_return_rows = 0;
+  std::size_t forward_precombine_groups = 0;
+  std::size_t forward_precombine_arrived = 0;
   std::size_t forward_return_queues = 0;
   std::size_t local_notifications = 0;
   unsigned local_notification_ctas = 0;
@@ -1005,6 +1007,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_return_rows = append(
         cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
         "forward return row queues");
+    layout.forward_precombine_groups =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(persistent_v3::ForwardPrecombineGroup),
+               "forward pre-combine groups");
+    layout.forward_precombine_arrived =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(std::uint32_t), "forward pre-combine completion counts");
     layout.local_notification_ctas = std::max(
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
             persistent_v3::kRdmaCtaCount,
@@ -1089,8 +1098,6 @@ struct PoolSlot {
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};
-  CUtensorMap forward_x_m64_map{};
-  CUtensorMap forward_s_m64_map{};
   CUtensorMap forward_output_store_map{};
   CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};

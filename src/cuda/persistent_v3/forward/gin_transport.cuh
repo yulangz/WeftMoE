@@ -30,8 +30,13 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
     auto *target = reinterpret_cast<uint4 *>(record + sizeof(ring::ReturnRow));
     const auto *source =
         reinterpret_cast<const uint4 *>(output + row * a.hidden);
-    for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
-      target[v] = source[v];
+    if (forward_precombine_detail::needs_reduce(a, row)) {
+      for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
+        target[v] = forward_precombine_detail::sum_vector(a, row, v * 8ULL);
+    } else {
+      for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
+        target[v] = source[v];
+    }
   }
   __threadfence_system();
   wire::transport_sync();
@@ -81,6 +86,11 @@ receive_dispatch(const ForwardKernelArgs &a, const wire::Transfer &task,
           target.topk_slot};
       peer_at<float>(base, a.canonical_gates_offset)[target.dst_row] =
           target.gate;
+      forward_precombine_detail::describe_remote(
+          a, base,
+          reinterpret_cast<const ForwardDispatchFanoutRecord *>(
+              record + sizeof(ring::DispatchRow)),
+          header.fanouts, index);
     }
     const auto *src = record + a.gin_rings.dispatch_row_bytes - bytes;
     auto *dst = peer_at<transport::BFloat16>(base, a.canonical_rows_offset) +
@@ -362,7 +372,7 @@ relay_role(const ForwardKernelArgs &a,
     if (done)
       break;
     if (!progressed && threadIdx.x < 32U)
-      forward_reduce_detail::try_reduce_one_token<true>(a);
+      forward_reduce_detail::try_reduce_one_token(a);
     if (!progressed && !threadIdx.x)
       __nanosleep(forward_tuning::kTransportIdleNanosleep);
     __syncthreads();

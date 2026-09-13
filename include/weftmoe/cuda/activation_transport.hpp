@@ -51,7 +51,6 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
-  friend class NcclSocketFallbackForwardMegaKernel;
   friend class ExternalCudaProducer;
   friend class BackwardMegaKernel;
   friend class BackwardValidationBridge;
@@ -115,7 +114,6 @@ private:
       const ActivationTransportResourcePool &);
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
-  friend class NcclSocketFallbackForwardMegaKernel;
   friend class ExternalCudaProducer;
 };
 
@@ -164,6 +162,10 @@ struct ForwardMegaKernelConfig {
   // enable_backward_state=true.
   bool retain_backward_state = false;
   ForwardTensorStorage tensors{};
+  // Sum a token's contributions on each compute GPU before Return. All EP
+  // ranks must agree. The expert order is fixed within an EP placement, but
+  // the extra BF16 rounding can change results when the placement changes.
+  bool pre_combine = false;
 };
 
 class ForwardWeightLease {
@@ -250,7 +252,6 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class LocalCudaP2pForwardMegaKernel;
   friend class GinRdmaForwardMegaKernel;
-  friend class NcclSocketFallbackForwardMegaKernel;
   friend class ExternalCudaProducer;
 };
 
@@ -336,14 +337,9 @@ private:
   LocalCudaP2pForwardMegaKernel(
       const NcclSession &, const CudaExecution &,
       const ActivationTransportResourcePool &, bool use_gin);
-  LocalCudaP2pForwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &, bool use_gin,
-      bool use_socket);
   struct Impl;
   std::shared_ptr<Impl> impl_;
   friend class GinRdmaForwardMegaKernel;
-  friend class NcclSocketFallbackForwardMegaKernel;
 };
 
 // Cross-node same-rail GIN Forward. It shares the frozen WGMMA/TMA compute
@@ -366,26 +362,6 @@ public:
 private:
   std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
 };
-
-// Host-enqueued NCCL Socket correctness fallback for the complete Forward
-// semantics. Dispatch and return have explicit host phase boundaries; the FC
-// body reuses the frozen WGMMA/TMA compute core, gate-before-FC2 semantics, and
-// deterministic unweighted reduce. This type never reports a GIN or
-// single-persistent audit label.
-class NcclSocketFallbackForwardMegaKernel {
-public:
-  NcclSocketFallbackForwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &);
-  DeviceForwardHandle run(
-      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
-      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
-      const ActivationTransportRunOptions & = {});
-
-private:
-  std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
-};
-
 
 struct ActivationTransportCapability {
   std::uint32_t compiled_nccl_version = 0;

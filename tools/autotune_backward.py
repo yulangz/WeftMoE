@@ -381,7 +381,7 @@ def dynamic_shared_memory(config: Mapping[str, Any]) -> int:
     storage_tile_n = max(config["dab_tile_n"], config["dx_tile_n"],
                          config["dw_tile_n"])
     activation_elements = (
-        config["tile_m"] + storage_tile_n
+        config["tile_m"] // 2 + storage_tile_n
     ) * config["tile_k"]
     dw_elements = (
         config["dw_tile_m"] + config["dw_tile_n"]

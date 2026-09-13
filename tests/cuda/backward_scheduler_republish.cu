@@ -1,6 +1,6 @@
-#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_runtime.h>
 
 #include "cuda/persistent_v3/backward/scheduler.cuh"
 
@@ -52,7 +52,8 @@ __global__ void check_republish(const Case *cases, State *states,
     unsigned count = 0;
     bwd::TileTask task;
     while (bwd::try_claim_domain_once(domain, task)) {
-      if (task.owner != c.owner || task.tile >= c.new_prefix || seen[task.tile]) {
+      if (task.owner != c.owner || task.tile >= c.new_prefix ||
+          task.tile_count != 1 || seen[task.tile]) {
         failures[blockIdx.x] |= 4;
         break;
       }
@@ -74,8 +75,8 @@ void check(cudaError_t status) {
 }
 
 int main() {
-  const Case cases[]{{3, 11, 30}, {8, 11, 0}, {12, 11, 63},
-                     {3, 11, 65}, {64, 128, 1}, {128, 3, 65}};
+  const Case cases[]{{3, 11, 30},  {8, 11, 0},   {12, 11, 63},  {3, 11, 65},
+                     {64, 128, 1}, {128, 3, 65}, {65, 127, 65}, {1, 1, 63}};
   constexpr unsigned count = sizeof(cases) / sizeof(cases[0]);
   Case *device_cases;
   State *states;

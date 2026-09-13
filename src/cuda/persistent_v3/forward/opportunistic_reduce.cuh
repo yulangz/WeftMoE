@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/persistent_v3/forward/precombine.cuh"
+
 namespace forward_reduce_detail {
 
 // Zero denotes no published work. The CAS never reserves an unpublished entry.
@@ -33,6 +35,8 @@ struct ReduceTokenView {
   const transport::BFloat16 *local;
   transport::BFloat16 *output;
   const std::uint32_t *order;
+  const std::uint32_t *destination;
+  bool pre_combine;
   std::uint64_t hidden;
   std::uint32_t top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -50,6 +54,8 @@ reduce_token_view(const ForwardKernelArgs &a) {
       peer_at<const transport::BFloat16>(a.local_base, a.contribution_offset);
   v.output = a.output;
   v.order = a.dispatch.combine_order;
+  v.destination = a.dispatch.route_dst_rank;
+  v.pre_combine = a.pre_combine;
   v.hidden = a.hidden;
   v.top_k = a.dispatch.identity.top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -62,20 +68,23 @@ reduce_token_view(const ForwardKernelArgs &a) {
 }
 
 // Caller owns this token. First-warp execution needs no CTA-wide barrier.
-template <bool Warp>
+template <bool PreCombine>
 __device__ __forceinline__ bool
-reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
+reduce_token_payload_impl(const ReduceTokenView &v,
+                          unsigned long long encoded) {
   if (encoded == 0ULL)
     return false;
-  const auto lane = Warp ? (threadIdx.x & 31U) : 0U;
+  const auto lane = threadIdx.x & 31U;
   // The queue acquire may have run on lane 0 only. A shuffle broadcasts the
   // token index but is not a memory fence; hand payload visibility to all lanes.
-  if constexpr (Warp)
-    __syncwarp();
+  __syncwarp();
 #if WEFTMOE_DEVICE_TIMELINE
   encoded &= (1ULL << 56U) - 1ULL;
 #endif
   const auto token = encoded - 1ULL;
+  const auto leaders = PreCombine ? forward_precombine_detail::leader_mask(
+                                        v.order, v.destination, token, v.top_k)
+                                  : ~0ULL;
 #if WEFTMOE_DEBUG_VALIDATE
   if (v.completion && lane == 0U)
     claim_completion_tasks(v.completion, transport_state::TaskClass::Reduce);
@@ -83,9 +92,12 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
   if (lane == 0U)
     atomicMin(&v.status->reduced_tokens, device_globaltimer_ns());
   for (std::uint64_t column = lane * 8ULL; column < v.hidden;
-       column += (Warp ? 32ULL : 1ULL) * 8ULL) {
+       column += 256ULL) {
     float sum[8] = {};
     for (std::uint32_t order = 0U; order < v.top_k; ++order) {
+      if constexpr (PreCombine)
+        if ((leaders & (1ULL << order)) == 0ULL)
+          continue;
       const auto slot = v.order[token * v.top_k + order];
       const auto route = token * v.top_k + slot;
       const auto *source = v.local + route * v.hidden + column;
@@ -111,8 +123,7 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
     *reinterpret_cast<uint4 *>(v.output + token * v.hidden + column) =
         make_uint4(words[0], words[1], words[2], words[3]);
   }
-  if constexpr (Warp)
-    __syncwarp();
+  __syncwarp();
   if (lane == 0U) {
 #if WEFTMOE_DEBUG_VALIDATE
     if (v.completion)
@@ -126,20 +137,25 @@ reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
   return true;
 }
 
-template <bool Warp = true>
+// Choose the arithmetic loop once per token. The disabled mode keeps the
+// original straight top-k loop with no per-contribution membership checks.
 __device__ __forceinline__ bool
-reduce_claimed_token(const ForwardKernelArgs &a, unsigned long long encoded) {
-  return reduce_token_payload<Warp>(reduce_token_view(a), encoded);
+reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
+  return v.pre_combine ? reduce_token_payload_impl<true>(v, encoded)
+                       : reduce_token_payload_impl<false>(v, encoded);
 }
 
-template <bool Warp = false>
+__device__ __forceinline__ bool
+reduce_claimed_token(const ForwardKernelArgs &a, unsigned long long encoded) {
+  return reduce_token_payload(reduce_token_view(a), encoded);
+}
+
 __device__ __forceinline__ bool
 try_reduce_one_token(const ForwardKernelArgs &a) {
-  const auto lane = Warp ? (threadIdx.x & 31U) : 0U;
+  const auto lane = threadIdx.x & 31U;
   auto encoded = lane == 0U ? try_claim_reduce_token(a) : 0ULL;
-  if constexpr (Warp)
-    encoded = __shfl_sync(0xffffffffU, encoded, 0);
-  return reduce_claimed_token<Warp>(a, encoded);
+  encoded = __shfl_sync(0xffffffffU, encoded, 0);
+  return reduce_claimed_token(a, encoded);
 }
 
 // Relay CTAs with no remaining primary work can consume ready tokens too.
@@ -159,7 +175,7 @@ __device__ __forceinline__ void drain_reduce_queue(const ForwardKernelArgs &a) {
     done = __shfl_sync(0xffffffffU, done, 0);
     if (done)
       break;
-    if (!try_reduce_one_token<true>(a))
+    if (!try_reduce_one_token(a))
       __nanosleep(forward_tuning::kReduceQueueNanosleep);
   }
 }

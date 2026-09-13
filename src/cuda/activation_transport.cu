@@ -544,7 +544,6 @@ struct DeviceBackwardHandle::Impl {
 
 struct LocalCudaP2pForwardMegaKernel::Impl {
   std::shared_ptr<ActivationMegaKernelBackendState> backend;
-  std::shared_ptr<NcclSocketFallbackActivationTransport> socket_transport;
 };
 
 #if WEFTMOE_DEVICE_TIMELINE
@@ -1708,26 +1707,6 @@ make_activation_pool_state(const CollectiveSession &session,
                        session.generation(), ExchangeKind::ExpertCounts,
                        "cudaSetDevice");
   if (config.enable_backward_state) {
-    internal::throw_cuda(
-        "transport-pool-create",
-        cudaFuncSetAttribute(
-            backward_du_wgmma_kernel<backward_tuning::kDabTileN>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(backward_compute_detail::dynamic_shared_bytes<
-                             backward_tuning::kDabTileN>())),
-        0, session.world_size(), session.identity(), session.generation(),
-        ExchangeKind::ExpertCounts,
-        "cudaFuncSetAttribute(Backward dU shared memory)");
-    internal::throw_cuda(
-        "transport-pool-create",
-        cudaFuncSetAttribute(
-            backward_dx_wgmma_kernel<backward_tuning::kDxTileN>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(backward_compute_detail::dynamic_shared_bytes<
-                             backward_tuning::kDxTileN>())),
-        0, session.world_size(), session.identity(), session.generation(),
-        ExchangeKind::ExpertCounts,
-        "cudaFuncSetAttribute(Backward dX shared memory)");
     throw_cublas("transport-pool-create",
                  cublasCreate(&state->backward_blas), 0,
                  "cublasCreate(Backward)");
@@ -1865,14 +1844,6 @@ make_activation_pool_state(const CollectiveSession &session,
             config.max_intermediate_size, config.max_destination_rows_per_rank,
             forward_tuning::kTileM, "gated SwiGLU U",
             forward_tuning::kTileK);
-        slot.forward_x_m64_map = make_bf16_tma_map(
-            at<void>(slot.device, state->layout.canonical_rows),
-            config.max_hidden_size, config.max_destination_rows_per_rank, 64,
-            "canonical X M64");
-        slot.forward_s_m64_map = make_bf16_tma_map(
-            at<void>(slot.device, state->layout.forward_s),
-            config.max_intermediate_size, config.max_destination_rows_per_rank,
-            64, "gated SwiGLU U M64");
         slot.forward_output_store_map = make_bf16_tma_store_map(
             at<void>(slot.device, state->layout.canonical_rows),
             config.max_hidden_size, config.max_destination_rows_per_rank,
@@ -1886,13 +1857,13 @@ make_activation_pool_state(const CollectiveSession &session,
           slot.backward_dr_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.forward_training_output),
               config.max_hidden_size, config.max_destination_rows_per_rank,
-              backward_tuning::kTileM, "Backward compact dR",
+              backward_tuning::kTileM / 2U, "Backward compact dR",
               backward_tuning::kTileK);
           slot.backward_dab_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dab_rows),
               2ULL * config.max_intermediate_size,
               state->layout.backward_padded_capacity_rows,
-              backward_tuning::kTileM, "Backward padded dAB",
+              backward_tuning::kTileM / 2U, "Backward padded dAB",
               backward_tuning::kTileK);
           slot.backward_dr_mn_map = make_bf16_tma_map_mn(
               at<void>(slot.device, state->layout.forward_training_output),
@@ -1912,13 +1883,13 @@ make_activation_pool_state(const CollectiveSession &session,
           slot.backward_u_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_u),
               config.max_intermediate_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dU output");
+              state->layout.backward_padded_capacity_rows, "Backward dU output",
+              0ULL, backward_tuning::kTileM / 2U);
           slot.backward_dx_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_dx_rows),
               config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dX output");
+              state->layout.backward_padded_capacity_rows, "Backward dX output",
+              0ULL, backward_tuning::kTileM / 2U);
 
           slot.backward_maps_valid = true;
         }
@@ -2663,39 +2634,16 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
 LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
     const NcclSession &session, const CudaExecution &execution,
     const ActivationTransportResourcePool &pool, bool use_gin) {
-  *this = LocalCudaP2pForwardMegaKernel(session, execution, pool, use_gin,
-                                        false);
-}
-
-LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
-    const NcclSession &session, const CudaExecution &execution,
-    const ActivationTransportResourcePool &pool, bool use_gin,
-    bool use_socket) {
   if (!pool.impl_ || !pool.impl_->state)
     transport_error(NotifyErrorCode::InvalidHandle, "forward-create", "pool",
                     0, "valid", "empty");
-  if (use_gin && use_socket)
-    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-create",
-                    "backend", session.rank(), "one backend",
-                    "GIN and Socket both requested");
   impl_ = std::make_shared<Impl>();
-  if (use_gin) {
+  if (use_gin)
     impl_->backend = std::static_pointer_cast<ActivationMegaKernelBackendState>(
         create_gin_backend(session, execution, pool.impl_->state));
-  } else if (use_socket) {
-    auto socket = std::make_shared<SocketBackendState>();
-    socket->pool = pool.impl_->state;
-    socket->nccl = internal::NcclSessionAccess::checked(session);
-    socket->session = session;
-    socket->execution = execution;
-    impl_->backend = socket;
-    impl_->socket_transport =
-        std::make_shared<NcclSocketFallbackActivationTransport>(
-            session, execution, pool);
-  } else {
+  else
     impl_->backend = std::static_pointer_cast<ActivationMegaKernelBackendState>(
         create_local_p2p_backend(session, execution, pool.impl_->state));
-  }
 }
 
 GinRdmaForwardMegaKernel::GinRdmaForwardMegaKernel(
@@ -2712,21 +2660,6 @@ DeviceForwardHandle GinRdmaForwardMegaKernel::enqueue(
 }
 
 DeviceForwardHandle GinRdmaForwardMegaKernel::run(
-    const DeviceDispatchHandle &dispatch,
-    const BFloat16ActivationLease &activations,
-    const ForwardWeightLease &weights, const ForwardMegaKernelConfig &config,
-    const ActivationTransportRunOptions &options) {
-  return delegate_->run(dispatch, activations, weights, config, options);
-}
-
-NcclSocketFallbackForwardMegaKernel::NcclSocketFallbackForwardMegaKernel(
-    const NcclSession &session, const CudaExecution &execution,
-    const ActivationTransportResourcePool &pool)
-    : delegate_(std::shared_ptr<LocalCudaP2pForwardMegaKernel>(
-          new LocalCudaP2pForwardMegaKernel(session, execution, pool, false,
-                                            true))) {}
-
-DeviceForwardHandle NcclSocketFallbackForwardMegaKernel::run(
     const DeviceDispatchHandle &dispatch,
     const BFloat16ActivationLease &activations,
     const ForwardWeightLease &weights, const ForwardMegaKernelConfig &config,
@@ -4172,29 +4105,28 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   const auto backend = impl_->backend;
   const auto gin_backend =
       std::dynamic_pointer_cast<GinBackendState>(backend);
-  const auto socket_backend =
-      std::dynamic_pointer_cast<SocketBackendState>(backend);
   const bool use_gin = static_cast<bool>(gin_backend);
-  const bool use_socket = static_cast<bool>(socket_backend);
   const auto state = backend->pool;
   const auto &id = dispatch.identity();
+  if (id.top_k > 32U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
+                    "top_k", id.calling_rank,
+                    "at most one route per warp lane (32)",
+                    std::to_string(id.top_k));
   const auto &activation = *activations.impl_;
   const auto &weight = *weights.impl_;
-  if ((!use_gin && !use_socket && id.num_nodes != 1) ||
+  if ((!use_gin && id.num_nodes != 1) ||
       (use_gin && id.num_nodes != gin_backend->num_nodes) ||
       id.world_size != backend->nccl->world ||
       id.calling_rank != backend->nccl->rank)
     throw NotifyDispatchError(
         NotifyErrorCode::BackendUnavailable,
         "phase=forward-run, field=topology, rank=" +
-            std::to_string(id.calling_rank) +
-            ", expected=" +
-            (use_gin ? "runtime GIN topology"
-                     : use_socket ? "runtime NCCL Socket topology"
-                                  : "one local node") +
+            std::to_string(id.calling_rank) + ", expected=" +
+            (use_gin ? "runtime GIN topology" : "one local node") +
             " and exact NCCL world/rank, actual=" +
-            std::to_string(id.num_nodes) + " nodes, world=" +
-            std::to_string(id.world_size));
+            std::to_string(id.num_nodes) +
+            " nodes, world=" + std::to_string(id.world_size));
   // The hot GIN fanout record keeps its established 32-byte width by storing
   // the node-local rank and global expert ID in 16 bits.  Reject wider
   // topologies before any device-side narrowing instead of silently wrapping.
@@ -4249,8 +4181,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   // Notify materializes the route permutation and destination M-tile map for
   // every topology.  The split one-node transport consumes the same metadata
   // as GIN Dispatch even though it has no RDMA waves of its own.
-  const bool split_local_metadata =
-      !use_gin && !use_socket && id.num_nodes == 1U;
+  const bool split_local_metadata = !use_gin && id.num_nodes == 1U;
   const auto dispatch_waves =
       use_gin || split_local_metadata
           ? ActivationTransportBridge::wave_view(consumer)
@@ -4348,77 +4279,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("stream_dependencies_enqueued");
 #endif
 
-  std::uint64_t socket_incoming = 0;
-  std::uint64_t socket_dispatch_peer_bytes = 0;
-  std::uint64_t socket_return_peer_bytes = 0;
-  std::uint64_t socket_raw_cross_node_route_bytes = 0;
-  if (use_socket) {
-    // The fallback transport and the fused Forward are sequential consumers
-    // of the same immutable Dispatch handle. Release the first token while
-    // the host-enqueued Socket slice owns it, then reacquire before launching
-    // the production Forward kernel; retaining both would exhaust the bounded
-    // consumer-event pool and stall before the first payload collective.
-    consumer = {};
-    transport::ActivationTransportConfig socket_config{};
-    socket_config.hidden_size = config.hidden_size;
-    socket_config.channels = state->config.channels;
-    socket_config.ring_slots_per_source_channel =
-        state->config.ring_slots_per_source_channel;
-    socket_config.max_inflight_generations =
-        state->config.max_inflight_generations;
-    socket_config.expert_transform =
-        transport::ActivationExpertTransform::Identity;
-    socket_config.gate_placement =
-        transport::ActivationGatePlacement::SourceAfter;
-    // The fallback transport borrows this execution slot; application input
-    // ownership remains independent of the diagnostic transport lease.
-    auto preload_input =
-        std::make_shared<BFloat16ActivationLease::Impl>(activation);
-    preload_input->slot = lease;
-    preload_input->pool = state;
-    const auto socket_preload = impl_->socket_transport->run_transport_slice(
-        dispatch, BFloat16ActivationLease(std::move(preload_input)),
-        socket_config, options);
-    socket_incoming = socket_preload.audit().fanout_count;
-    // Count the actual rank-to-rank NCCL payloads. The transport-only audit is
-    // intentionally cross-node centric, whereas this full fallback also sends
-    // aggregates between ranks on the same host. The preload performs an
-    // identity return which is real lower-bound traffic and must not be hidden.
-    const auto local_world_size = id.world_size / id.num_nodes;
-    for (std::uint32_t peer = 0; peer < id.world_size; ++peer) {
-      if (peer == id.calling_rank)
-        continue;
-      const auto outgoing_rows =
-          slot.host_socket_counts[static_cast<std::size_t>(id.calling_rank) *
-                                      id.world_size +
-                                  peer];
-      const auto incoming_rows =
-          slot.host_socket_counts[static_cast<std::size_t>(peer) *
-                                      id.world_size +
-                                  id.calling_rank];
-      const auto outgoing_bytes = checked_mul(
-          checked_mul(outgoing_rows, config.hidden_size,
-                      "Socket Forward preload outgoing elements"),
-          sizeof(transport::BFloat16),
-          "Socket Forward preload outgoing bytes");
-      socket_dispatch_peer_bytes = checked_add(
-          socket_dispatch_peer_bytes, outgoing_bytes,
-          "Socket Forward total dispatch peer bytes");
-      socket_return_peer_bytes = checked_add(
-          socket_return_peer_bytes,
-          checked_mul(checked_mul(incoming_rows, config.hidden_size,
-                                  "Socket Forward preload return elements"),
-                      sizeof(transport::BFloat16),
-                      "Socket Forward preload return bytes"),
-          "Socket Forward total preload return bytes");
-      if (peer / local_world_size != id.calling_rank / local_world_size)
-        socket_raw_cross_node_route_bytes = checked_add(
-            socket_raw_cross_node_route_bytes, outgoing_bytes,
-            "Socket Forward cross-node route bytes");
-    }
-    consumer = dispatch.acquire_consumer(backend->execution, expectation);
-    view = ActivationTransportBridge::view(consumer);
-  }
   internal::throw_cuda(
       "forward-run",
       internal::record_observable_event(slot.forward_start, exec->stream,
@@ -4474,30 +4334,21 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #endif
 #endif
   }
-  if (!use_socket) {
-    initialize_forward_generation_signals_kernel<<<1, 256, 0, exec->stream>>>(
-        slot.device, at<void *>(slot.device, layout.peer_bases),
-        layout.ingress_published_sequence, layout.outgoing_route_sequence,
-        layout.p2p_barrier_receive, layout.gin_local_compute_ready,
-        layout.forward_x_arrived_rows, view.sizes.mtile_count,
-        layout.forward_completion, layout.forward_context_completion,
-        static_cast<std::uint32_t>((state->config.max_nodes - 1U) * 8U),
-        id.generation, id.calling_rank, id.world_size, state->config.channels,
-        generation_epoch,
-        use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
-        use_gin ? gin_backend->local_world_size : id.world_size,
-        at<unsigned long long>(slot.device, layout.execution_epoch),
-        view.runtime);
-  } else if (socket_incoming != 0) {
-    socket_install_forward_headers_kernel<<<
-        static_cast<unsigned int>((socket_incoming + 255ULL) / 256ULL), 256, 0,
-        exec->stream>>>(
-        at<SocketRouteHeader>(slot.device, layout.socket_header_receive),
-        at<LocalP2pRouteHeader>(slot.device, layout.direct_route_headers),
-        socket_incoming, id.generation, generation_epoch, id.calling_rank,
-        state->config.max_destination_rows_per_rank,
-        at<TransportDeviceStatus>(slot.device, layout.status));
-  }
+
+  initialize_forward_generation_signals_kernel<<<1, 256, 0, exec->stream>>>(
+      slot.device, at<void *>(slot.device, layout.peer_bases),
+      layout.ingress_published_sequence, layout.outgoing_route_sequence,
+      layout.p2p_barrier_receive, layout.gin_local_compute_ready,
+      layout.forward_x_arrived_rows, view.sizes.mtile_count,
+      layout.forward_completion, layout.forward_context_completion,
+      static_cast<std::uint32_t>((state->config.max_nodes - 1U) * 8U),
+      id.generation, id.calling_rank, id.world_size, state->config.channels,
+      generation_epoch,
+      use_gin ? gin_backend->node * gin_backend->local_world_size : 0U,
+      use_gin ? gin_backend->local_world_size : id.world_size,
+      at<unsigned long long>(slot.device, layout.execution_epoch),
+      view.runtime);
+
   internal::throw_cuda(
       "forward-run", cudaGetLastError(), id.calling_rank, id.world_size,
       backend->session.session().identity(), id.generation,
@@ -4522,12 +4373,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.channels = state->config.channels;
   args.epoch = generation_epoch;
   args.runtime_epoch =
-      use_socket ? nullptr
-                 : at<unsigned long long>(slot.device, layout.execution_epoch);
+      at<unsigned long long>(slot.device, layout.execution_epoch);
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
-  args.use_socket = use_socket;
   args.local_world_size = id.world_size / id.num_nodes;
   args.node = id.calling_rank / args.local_world_size;
 #if WEFTMOE_DEVICE_TIMELINE
@@ -4604,6 +4453,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_reduce_ready_token_offset =
       layout.forward_reduce_ready_token;
   args.forward_return_rows_offset = layout.forward_return_rows;
+  args.pre_combine = config.pre_combine && id.top_k > 1U;
+  args.forward_precombine_groups_offset = layout.forward_precombine_groups;
+  args.forward_precombine_arrived_offset = layout.forward_precombine_arrived;
   args.forward_return_queues_offset = layout.forward_return_queues;
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;
@@ -4667,9 +4519,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const std::size_t forward_transport_smem =
         forward_tuning::transport_smem_bytes(
             static_cast<std::uint32_t>(args.hidden), id.world_size);
-    const std::size_t forward_smem =
-        std::max(forward_compute_smem, forward_transport_smem);
-    const bool remote_transport = use_gin || use_socket;
+    const bool remote_transport = use_gin;
     const bool split_gin_roles =
         use_gin && view.identity.num_nodes >= 2U &&
         args.gin_context_count == persistent_v3::kRdmaCtaCount &&
@@ -4788,85 +4638,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           static_cast<std::uint8_t>(locality_group4_begin);
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
-      constexpr bool forward_m64 = forward_tuning::kTileM == 64U;
-      constexpr bool forward_fc2_tma_store = forward_tuning::kFc2TmaStore;
-      bool forward_cluster2 = forward_tuning::kClusterSize == 2U;
-      // The retained checkpoint entry is deliberately compiled separately
-      // from inference. Keep its first implementation on the production M128
-      // mixed-scheduler/TMA path instead of silently falling back to a runtime
-      // branch in one of the obsolete experimental launch shapes.
-      if (config.retain_backward_state &&
-          (!forward_fc2_tma_store || forward_m64))
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "retained Forward specialization", id.calling_rank,
-            "M128 FC2-priority mixed scheduler with TMA FC2 store",
-            "incompatible experimental launch shape");
-      // The generated specialization selects the async TMA stage counts.
-      constexpr std::uint32_t forward_fc1_stages = forward_tuning::kFc1Stages;
-      constexpr std::uint32_t forward_fc2_stages = forward_tuning::kFc2Stages;
-      const bool supported_stage_pair =
-          forward_fc1_stages >= 2U && forward_fc1_stages <= 4U &&
-          forward_fc2_stages >= 2U && forward_fc2_stages <= 4U &&
-          (forward_tuning::kMainIntermediate / forward_tuning::kTileK) %
-                  forward_fc2_stages == 0U;
-      if (!supported_stage_pair)
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "Forward FC1/FC2 TMA stages", id.calling_rank,
-            "2..4 stages with FC2 stages dividing the reduction iterations",
-            std::to_string(forward_fc1_stages) + "x" +
-                std::to_string(forward_fc2_stages));
-      if ((forward_fc1_stages != 3U || forward_fc2_stages != 4U) &&
-          forward_m64)
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "Forward FC1/FC2 TMA stages", id.calling_rank,
-            "the production mixed M128 scheduler",
-            "combined with an obsolete M64/stage-split experiment");
-      if (args.forward_fc1_locality_group > 1U &&
-          forward_m64)
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "WEFTMOE_FORWARD_FC1_LOCALITY_GROUP", id.calling_rank,
-            "M128 without an M64 experiment",
-            std::to_string(args.forward_fc1_locality_group));
-      if (forward_fc2_tma_store && forward_m64)
-        transport_error(
-            NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
-            "WEFTMOE_FORWARD_FC2_TMA_STORE", id.calling_rank,
-            "the production M128 scheduler",
-            "an incompatible M tile or TMA stage configuration");
-      if (forward_m64)
-        args.forward_mblock_rows = 64U;
       const auto forward_main_compute_ctas = args.forward_compute_cta_count;
-      const bool forward_cluster2_pipeline_compatible =
-          forward_fc2_tma_store && !forward_m64;
-      if (forward_cluster2 && !forward_cluster2_pipeline_compatible)
-        forward_cluster2 = false;
-      const auto forward_fc1_ntiles =
-          static_cast<std::uint32_t>(
-              (args.intermediate + forward_tuning::kFc1TileN - 1ULL) /
-              forward_tuning::kFc1TileN);
-      const auto forward_fc2_ntiles =
-          static_cast<std::uint32_t>(
-              (args.hidden + forward_tuning::kFc2TileN - 1ULL) /
-              forward_tuning::kFc2TileN);
-      const bool forward_cluster2_extent_compatible =
-          (forward_main_compute_ctas & 1U) == 0U &&
-          (forward_fc1_ntiles & 1U) == 0U &&
-          (forward_fc2_ntiles & 1U) == 0U &&
-          forward_main_compute_ctas / 2U <=
-              persistent_v3::kForwardComputePairCapacity;
-      if (forward_cluster2 && !forward_cluster2_extent_compatible)
+      const auto fc1_ntiles = args.intermediate / forward_tuning::kFc1TileN;
+      const auto fc2_ntiles = args.hidden / forward_tuning::kFc2TileN;
+      if ((forward_main_compute_ctas & 1U) || (fc1_ntiles & 1U) ||
+          (fc2_ntiles & 1U) ||
+          forward_main_compute_ctas / 2U >
+              persistent_v3::kForwardComputePairCapacity)
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
             "Forward cluster extent", id.calling_rank,
             "even compute CTA and FC1/FC2 N-tile counts within pair capacity",
-            "compile cluster_size=1 for this shape");
-      // Every compute CTA enters one FC2-priority mixed scheduler; there is no
-      // fixed FC1/FC2 ownership split.
-      args.forward_fc1_cta_count = 0U;
+            "incompatible two-CTA multicast shape");
       // Every compute CTA participates in the terminal Reduce drain. Idle
       // transport CTAs also consume ready tokens; their completion is covered
       // by the shared completed-token counter, not this compute-role count.
@@ -4897,56 +4680,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                                              : inference_kernel);
           };
       cudaError_t compute_attribute = cudaSuccess;
-#if WEFTMOE_FWD_FC2_TMA_STORE
-#if WEFTMOE_FWD_CLUSTER_SIZE == 2
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         compute_attribute = set_tma_compute_attribute(
-            local_p2p_forward_tma_store_kernel<
-                true, true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+            local_p2p_forward_tma_store_kernel<true, forward_tuning::kFc1Stages,
+                                               forward_tuning::kFc2Stages>,
             local_p2p_forward_training_tma_store_kernel<
-                true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>);
+                true, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
       else
         compute_attribute = set_tma_compute_attribute(
             local_p2p_forward_tma_store_kernel<
-                false, true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+                false, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             local_p2p_forward_training_tma_store_kernel<
-                false, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>);
-#else
-      if constexpr (forward_tuning::kRdmaCtas == 0U)
-        compute_attribute = set_tma_compute_attribute(
-            local_p2p_forward_tma_store_kernel<
-                true, true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            local_p2p_forward_training_tma_store_kernel<
-                true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>);
-      else
-        compute_attribute = set_tma_compute_attribute(
-            local_p2p_forward_tma_store_kernel<
-                false, true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            local_p2p_forward_training_tma_store_kernel<
-                false, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>);
-#endif
-#else
-      if constexpr (forward_tuning::kRdmaCtas == 0U)
-        compute_attribute = set_compute_attribute(
-            local_p2p_forward_compute_kernel<
-                true, WEFTMOE_FWD_TILE_M == 64,
-                ForwardTaskPartition::All, true, false, false,
-                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
-      else
-        compute_attribute = set_compute_attribute(
-            local_p2p_forward_compute_kernel<
-                false, WEFTMOE_FWD_TILE_M == 64,
-                ForwardTaskPartition::All, true, false, false,
-                forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
-#endif
+                false, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>);
       internal::throw_cuda(
           "forward-run", compute_attribute,
           id.calling_rank, id.world_size, backend->session.session().identity(),
@@ -4994,14 +4739,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           1, 1);
       transport_launch.dynamicSmemBytes = forward_transport_smem;
       transport_launch.stream = slot.forward_transport_stream;
-      launch_forward =
-          split_local_roles
-              ? forward_transport_launch::launch_local(
-                    &transport_launch, &args, sizeof(args), slot.forward_x_map,
-                    slot.forward_s_map, weight.w1_map, weight.w2_map)
-              : forward_transport_launch::launch(
-                    &transport_launch, &args, sizeof(args), slot.forward_x_map,
-                    slot.forward_s_map, weight.w1_map, weight.w2_map);
+      launch_forward = split_local_roles
+                           ? forward_transport_launch::launch_local(
+                                 &transport_launch, &args, sizeof(args))
+                           : forward_transport_launch::launch(
+                                 &transport_launch, &args, sizeof(args));
       internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
                            id.world_size, backend->session.session().identity(),
                            id.generation, ExchangeKind::ExpertCounts,
@@ -5026,13 +4768,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       compute_launch.dynamicSmemBytes = forward_compute_smem;
       compute_launch.stream = slot.forward_compute_stream;
       cudaLaunchAttribute compute_cluster_attribute{};
-      if (forward_cluster2) {
-        compute_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-        compute_cluster_attribute.val.clusterDim = {
-            forward_tuning::kClusterSize, 1U, 1U};
-        compute_launch.attrs = &compute_cluster_attribute;
-        compute_launch.numAttrs = 1U;
-      }
+      compute_cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+      compute_cluster_attribute.val.clusterDim = {forward_tuning::kClusterSize,
+                                                  1U, 1U};
+      compute_launch.attrs = &compute_cluster_attribute;
+      compute_launch.numAttrs = 1U;
       const auto launch_tma_compute =
           [&](auto inference_kernel, auto training_kernel,
               const CUtensorMap &output_store_map) {
@@ -5044,86 +4784,21 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 slot.forward_s_map, weight.w1_map, weight.w2_map,
                 output_store_map);
           };
-#if WEFTMOE_FWD_FC2_TMA_STORE
       const auto &output_store_map = ordinary_output_store_map;
-#if WEFTMOE_FWD_CLUSTER_SIZE == 2
       if constexpr (forward_tuning::kRdmaCtas == 0U)
         launch_forward = launch_tma_compute(
-            local_p2p_forward_tma_store_kernel<
-                true, true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+            local_p2p_forward_tma_store_kernel<true, forward_tuning::kFc1Stages,
+                                               forward_tuning::kFc2Stages>,
             local_p2p_forward_training_tma_store_kernel<
-                true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+                true, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             output_store_map);
       else
         launch_forward = launch_tma_compute(
             local_p2p_forward_tma_store_kernel<
-                false, true, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+                false, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             local_p2p_forward_training_tma_store_kernel<
-                false, false, true, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
+                false, forward_tuning::kFc1Stages, forward_tuning::kFc2Stages>,
             output_store_map);
-#else
-      if constexpr (forward_tuning::kRdmaCtas == 0U)
-        launch_forward = launch_tma_compute(
-            local_p2p_forward_tma_store_kernel<
-                true, true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            local_p2p_forward_training_tma_store_kernel<
-                true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            output_store_map);
-      else
-        launch_forward = launch_tma_compute(
-            local_p2p_forward_tma_store_kernel<
-                false, true, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            local_p2p_forward_training_tma_store_kernel<
-                false, false, false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            output_store_map);
-#endif
-#elif WEFTMOE_FWD_TILE_M == 64
-      if constexpr (forward_tuning::kRdmaCtas == 0U)
-        launch_forward = cudaLaunchKernelEx(
-            &compute_launch,
-            local_p2p_forward_compute_kernel<
-                true, true, ForwardTaskPartition::All, true, false,
-                false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
-            weight.w1_map, weight.w2_map);
-      else
-        launch_forward = cudaLaunchKernelEx(
-            &compute_launch,
-            local_p2p_forward_compute_kernel<
-                false, true, ForwardTaskPartition::All, true, false,
-                false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            compute_args, slot.forward_x_m64_map, slot.forward_s_m64_map,
-            weight.w1_map, weight.w2_map);
-#else
-      if constexpr (forward_tuning::kRdmaCtas == 0U)
-        launch_forward = cudaLaunchKernelEx(
-            &compute_launch,
-            local_p2p_forward_compute_kernel<
-                true, false, ForwardTaskPartition::All, true, false,
-                false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-            weight.w2_map);
-      else
-        launch_forward = cudaLaunchKernelEx(
-            &compute_launch,
-            local_p2p_forward_compute_kernel<
-                false, false, ForwardTaskPartition::All, true, false,
-                false, forward_tuning::kFc1Stages,
-                forward_tuning::kFc2Stages>,
-            compute_args, slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-            weight.w2_map);
-#endif
       internal::throw_cuda("forward-run", launch_forward, id.calling_rank,
                            id.world_size, backend->session.session().identity(),
                            id.generation, ExchangeKind::ExpertCounts,
@@ -5149,42 +4824,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           id.generation, ExchangeKind::ExpertCounts,
           "cudaStreamWaitEvent(split Forward compute done)");
     } else {
-      if (!remote_transport)
-        transport_error(NotifyErrorCode::BackendUnavailable, "forward-run",
-                        "single-node kernel", id.calling_rank,
-                        "split transport/compute architecture", "disabled");
-      internal::throw_cuda(
-          "forward-run",
-          cudaFuncSetAttribute(local_p2p_forward_megakernel<false>,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(forward_smem)),
-          id.calling_rank, id.world_size, backend->session.session().identity(),
-          id.generation, ExchangeKind::ExpertCounts,
-          "cudaFuncSetAttribute(dynamic smem)");
-      cudaLaunchAttribute attributes[1]{};
-      attributes[0].id = cudaLaunchAttributeCooperative;
-      attributes[0].val.cooperative = 1;
-      cudaLaunchConfig_t launch{};
-      launch.gridDim = dim3(grid_blocks, 1, 1);
-      launch.blockDim = dim3(384, 1, 1);
-      launch.dynamicSmemBytes = forward_smem;
-      launch.stream = exec->stream;
-      launch.attrs = attributes;
-      launch.numAttrs = 1;
-
-      const auto *forward_kernel = reinterpret_cast<const void *>(
-          local_p2p_forward_megakernel<false>);
-      internal::throw_cuda("forward-run",
-                           cudaOccupancyMaxActiveClusters(
-                               &max_active_clusters, forward_kernel, &launch),
-                           id.calling_rank, id.world_size,
-                           backend->session.session().identity(), id.generation,
-                           ExchangeKind::ExpertCounts,
-                           "cudaOccupancyMaxActiveClusters");
-      launch_forward = cudaLaunchKernelEx(
-          &launch, local_p2p_forward_megakernel<false>, args,
-          slot.forward_x_map, slot.forward_s_map, weight.w1_map,
-          weight.w2_map);
+      transport_error(NotifyErrorCode::BackendUnavailable, "forward-run",
+                      "multicast transport", id.calling_rank,
+                      "single-node NVLink or multi-node GIN",
+                      "unsupported backend");
     }
 #if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("kernel_launch_returned");
@@ -5193,129 +4836,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                          id.world_size, backend->session.session().identity(),
                          id.generation, ExchangeKind::ExpertCounts,
                          "single persistent WGMMA/TMA forward launch");
-  if (use_socket) {
-    std::vector<std::uint64_t> send_prefix(
-        static_cast<std::size_t>(id.world_size) + 1U, 0);
-    std::vector<std::uint64_t> receive_prefix(
-        static_cast<std::size_t>(id.world_size) + 1U, 0);
-    for (std::uint32_t peer = 0; peer < id.world_size; ++peer) {
-      send_prefix[peer + 1U] =
-          send_prefix[peer] +
-          slot.host_socket_counts[static_cast<std::size_t>(id.calling_rank) *
-                                      id.world_size +
-                                  peer];
-      receive_prefix[peer + 1U] =
-          receive_prefix[peer] +
-          slot.host_socket_counts[static_cast<std::size_t>(peer) *
-                                      id.world_size +
-                                  id.calling_rank];
-    }
-    if (send_prefix[id.world_size] != view.sizes.route_count ||
-        receive_prefix[id.world_size] != socket_incoming)
-      transport_error(NotifyErrorCode::TransportProtocolFailure,
-                      "socket-forward-return", "route counts",
-                      id.calling_rank, "exact preload counts", "mismatch");
-    auto *send_headers = at<SocketRouteHeader>(
-        slot.device, layout.socket_header_send);
-    auto *receive_headers = at<SocketRouteHeader>(
-        slot.device, layout.socket_header_receive);
-    auto *send_payload = at<transport::BFloat16>(
-        slot.device, layout.contribution);
-    auto *receive_payload = at<transport::BFloat16>(
-        slot.device, layout.socket_payload_receive);
-    auto *forward_output = at<transport::BFloat16>(
-        slot.device, args.forward_output_rows_offset);
-    if (socket_incoming != 0)
-      socket_gather_forward_returns_kernel<<<
-          static_cast<unsigned int>(socket_incoming), 256, 0,
-          exec->stream>>>(receive_headers, forward_output, receive_payload,
-                          socket_incoming, config.hidden_size);
-    internal::throw_cuda(
-        "socket-forward-return", cudaGetLastError(), id.calling_rank,
-        id.world_size, backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "gather canonical FC2 rows");
-    internal::throw_nccl(
-        "socket-forward-return", ncclGroupStart(), id.calling_rank,
-        id.world_size, backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "ncclGroupStart(Socket FC return)");
-    for (std::uint32_t peer = 0; peer < id.world_size; ++peer) {
-      const auto send_rows = receive_prefix[peer + 1U] - receive_prefix[peer];
-      const auto receive_rows = send_prefix[peer + 1U] - send_prefix[peer];
-      if (peer == id.calling_rank) {
-        if (send_rows != receive_rows)
-          transport_error(NotifyErrorCode::TransportProtocolFailure,
-                          "socket-forward-return", "self rows",
-                          id.calling_rank, std::to_string(send_rows),
-                          std::to_string(receive_rows));
-        if (send_rows != 0)
-          internal::throw_cuda(
-              "socket-forward-return",
-              cudaMemcpyAsync(
-                  send_payload + send_prefix[peer] * config.hidden_size,
-                  receive_payload +
-                      receive_prefix[peer] * config.hidden_size,
-                  checked_size(send_rows * config.hidden_size *
-                                   sizeof(transport::BFloat16),
-                               "Socket Forward self return bytes"),
-                  cudaMemcpyDeviceToDevice, exec->stream),
-              id.calling_rank, id.world_size,
-              backend->session.session().identity(), id.generation,
-              ExchangeKind::ExpertCounts, "D2D Socket Forward self return");
-        continue;
-      }
-      socket_return_peer_bytes = checked_add(
-          socket_return_peer_bytes,
-          checked_mul(checked_mul(send_rows, config.hidden_size,
-                                  "Socket Forward remote return elements"),
-                      sizeof(transport::BFloat16),
-                      "Socket Forward remote return bytes"),
-          "Socket Forward total remote return bytes");
-      if (send_rows != 0)
-        internal::throw_nccl(
-            "socket-forward-return",
-            ncclSend(receive_payload +
-                         receive_prefix[peer] * config.hidden_size,
-                     send_rows * config.hidden_size *
-                         sizeof(transport::BFloat16),
-                     ncclUint8, static_cast<int>(peer), backend->nccl->comm,
-                     exec->stream),
-            id.calling_rank, id.world_size,
-            backend->session.session().identity(), id.generation,
-            ExchangeKind::ExpertCounts, "ncclSend(Socket Forward return)");
-      if (receive_rows != 0)
-        internal::throw_nccl(
-            "socket-forward-return",
-            ncclRecv(send_payload + send_prefix[peer] * config.hidden_size,
-                     receive_rows * config.hidden_size *
-                         sizeof(transport::BFloat16),
-                     ncclUint8, static_cast<int>(peer), backend->nccl->comm,
-                     exec->stream),
-            id.calling_rank, id.world_size,
-            backend->session.session().identity(), id.generation,
-            ExchangeKind::ExpertCounts, "ncclRecv(Socket Forward return)");
-    }
-    internal::throw_nccl(
-        "socket-forward-return", ncclGroupEnd(), id.calling_rank,
-        id.world_size, backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "ncclGroupEnd(Socket Forward return)");
-    if (view.sizes.route_count != 0)
-      socket_scatter_returns_kernel<<<
-          static_cast<unsigned int>(view.sizes.route_count), 256, 0,
-          exec->stream>>>(send_headers, send_payload,
-                          at<transport::BFloat16>(slot.device,
-                                                  layout.combine_return),
-                          view.sizes.route_count, config.hidden_size);
-    if (id.num_tokens != 0)
-      socket_sum_forward_routes_kernel<<<
-          static_cast<unsigned int>(id.num_tokens), 256, 0, exec->stream>>>(
-          view, at<transport::BFloat16>(slot.device, layout.combine_return),
-          static_cast<transport::BFloat16 *>(data.output->data),
-          config.hidden_size);
-    internal::throw_cuda(
-        "socket-forward-return", cudaGetLastError(), id.calling_rank,
-        id.world_size, backend->session.session().identity(), id.generation,
-        ExchangeKind::ExpertCounts, "Socket scatter/unweighted reduce");
-  }
+
   if (config.retain_backward_state) {
     const auto save =
         [&](const std::shared_ptr<tensor_storage_detail::Allocation> &target,
@@ -5399,8 +4920,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->completion = std::make_unique<OperatorCompletion>();
   result->completion
       ->finish = [backend, state, flight, lease, id, options, args, use_gin,
-                  use_socket, socket_dispatch_peer_bytes,
-                  socket_return_peer_bytes, socket_raw_cross_node_route_bytes,
                   cluster_supported, max_active_clusters, forward_stream_done,
                   result = result.get(),
                   consumer_owner =
@@ -5591,16 +5110,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     result->audit.fc1_tasks = slot.host_forward_status->fc1_tasks_done;
     result->audit.fc2_tasks = slot.host_forward_status->fc2_tasks_done;
     result->audit.actual_dispatch_peer_bytes =
-        use_socket ? socket_dispatch_peer_bytes
-                   : slot.host_forward_status->actual_dispatch_peer_bytes;
+        slot.host_forward_status->actual_dispatch_peer_bytes;
     result->audit.actual_return_peer_bytes =
-        use_socket ? socket_return_peer_bytes
-                   : slot.host_forward_status->actual_return_peer_bytes;
+        slot.host_forward_status->actual_return_peer_bytes;
     result->audit.gin_dispatch_put_count =
         slot.host_forward_status->gin_dispatch_put_count;
     result->audit.raw_cross_node_route_bytes =
-        use_socket ? socket_raw_cross_node_route_bytes
-                   : slot.host_forward_status->raw_cross_node_payload_bytes;
+        slot.host_forward_status->raw_cross_node_payload_bytes;
     result->audit.gin_dispatch_payload_bytes =
         slot.host_forward_status->deduplicated_cross_node_payload_bytes;
     result->audit.gin_return_payload_bytes =
@@ -5730,6 +5246,43 @@ std::vector<transport::BFloat16> download_forward_output_for_validation(
         impl.identity.rank, impl.identity.world, "forward-validation",
         impl.identity.generation, ExchangeKind::ExpertCounts,
         "cudaMemcpy(forward output)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
+  }
+  return output;
+}
+
+std::vector<transport::BFloat16>
+download_forward_routes_for_validation(const DeviceForwardHandle &handle,
+                                       const CudaExecution &execution) {
+  if (!handle || !execution)
+    transport_error(NotifyErrorCode::InvalidHandle, "forward-routes-download",
+                    "handle/execution", 0, "valid", "empty");
+  const auto &impl = *handle.impl_;
+  if (execution.device_ordinal() != impl.pool->device)
+    transport_error(NotifyErrorCode::WorkspaceMismatch,
+                    "forward-routes-download", "device", impl.identity.rank,
+                    "handle device", "foreign");
+  const auto check = [&](cudaError_t status) {
+    internal::throw_cuda("forward-routes-download", status, impl.identity.rank,
+                         impl.identity.world, "forward-validation",
+                         impl.identity.generation, ExchangeKind::ExpertCounts,
+                         "snapshot route contributions");
+  };
+  check(cudaEventSynchronize(impl.tensors.impl_->completion.ready));
+  const auto elements = checked_mul(
+      checked_mul(impl.identity.tokens, impl.dispatch.identity().top_k,
+                  "forward route count"),
+      impl.identity.hidden, "forward route elements");
+  std::vector<transport::BFloat16> output(
+      checked_size(elements, "route elements"));
+  if (!output.empty()) {
+    const auto bytes = checked_size(
+        checked_mul(elements, sizeof(output.front()), "forward route bytes"),
+        "route bytes");
+    check(cudaMemcpy(output.data(),
+                     at<void>(impl.pool->slots[impl.workspace_index].device,
+                              impl.pool->layout.contribution),
+                     bytes, cudaMemcpyDeviceToHost));
     internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
   }
   return output;
@@ -6224,23 +5777,48 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.dw2->data, config.intermediate_size,
       static_cast<std::uint64_t>(data.experts) * config.hidden_size,
       "caller dW2");
-  const auto launch_compute_workers = [&](std::uint32_t ctas,
-                                          cudaStream_t stream,
-                                          const char *detail) {
-    backward_local_compute_kernel<backward_tuning::kDabTileN,
-                                  backward_tuning::kDxTileN,
-                                  backward_tuning::kDwTileN>
-        <<<ctas, backward_tuning::kComputeThreads, kPersistentSmem, stream>>>(
-            args, slot.backward_dr_map, slot.backward_dab_map,
-            retained.weights.impl_->backward_w2_map,
-            retained.weights.impl_->backward_w1_map, slot.backward_dr_mn_map,
-            slot.backward_u_mn_map, slot.backward_dab_mn_map, x_map,
-            slot.backward_u_store_map, slot.backward_dx_store_map, dw2_map,
-            dw1_map);
-    internal::throw_cuda("backward-run", cudaGetLastError(), identity.rank,
-                         identity.world, "backward", identity.generation,
-                         ExchangeKind::ExpertCounts, detail);
-  };
+  const auto compute_ctas =
+      (static_cast<std::uint32_t>(sm_count) - transport_ctas) & ~1U;
+  int cluster_supported = 0;
+  internal::throw_cuda(
+      "backward-run",
+      cudaDeviceGetAttribute(&cluster_supported, cudaDevAttrClusterLaunch,
+                             static_cast<int>(exec->device)),
+      identity.rank, identity.world, "backward", identity.generation,
+      ExchangeKind::ExpertCounts, "query Backward cluster support");
+  if (!cluster_supported || compute_ctas < 2U)
+    transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
+                    "Backward cluster extent", identity.rank,
+                    "cluster launch support and at least two compute SMs",
+                    std::to_string(compute_ctas));
+  const auto launch_compute_workers =
+      [&](std::uint32_t ctas, cudaStream_t stream, const char *detail) {
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeClusterDimension;
+        attribute.val.clusterDim = {2U, 1U, 1U};
+        cudaLaunchConfig_t launch{};
+        launch.gridDim = dim3(ctas);
+        launch.blockDim = dim3(backward_tuning::kComputeThreads);
+        launch.dynamicSmemBytes = kPersistentSmem;
+        launch.stream = stream;
+        launch.attrs = &attribute;
+        launch.numAttrs = 1;
+        internal::throw_cuda(
+            "backward-run",
+            cudaLaunchKernelEx(
+                &launch,
+                backward_local_compute_kernel<backward_tuning::kDabTileN,
+                                              backward_tuning::kDxTileN,
+                                              backward_tuning::kDwTileN>,
+                args, slot.backward_dr_map, slot.backward_dab_map,
+                retained.weights.impl_->backward_w2_map,
+                retained.weights.impl_->backward_w1_map,
+                slot.backward_dr_mn_map, slot.backward_u_mn_map,
+                slot.backward_dab_mn_map, x_map, slot.backward_u_store_map,
+                slot.backward_dx_store_map, dw2_map, dw1_map),
+            identity.rank, identity.world, "backward", identity.generation,
+            ExchangeKind::ExpertCounts, detail);
+      };
   saved.completion.wait_on(exec->stream);
   if (retained.dispatch.received_row_capacity())
     internal::throw_cuda(
@@ -6335,9 +5913,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       cudaStreamWaitEvent(compute_stream, slot.forward_roles_ready),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "start Backward compute roles");
-  launch_compute_workers(
-      static_cast<std::uint32_t>(sm_count) - transport_ctas, compute_stream,
-      "persistent priority DAB/DX/dW TMA-WGMMA launch");
+  launch_compute_workers(compute_ctas, compute_stream,
+                         "persistent Backward cluster multicast launch");
   internal::throw_cuda("backward-run",
                        internal::record_observable_event(
                            slot.backward_compute_done, compute_stream),

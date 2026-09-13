@@ -7,17 +7,17 @@
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/forward/transport_launch.hpp"
 
+#include <cooperative_groups.h>
+#include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda/atomic>
 #include <cuda/barrier>
 #include <cuda/ptx>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cooperative_groups.h>
-#include <nccl.h>
+#include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
-#include <cute/arch/cluster_sm90.hpp>
+#include <nccl.h>
 #if __has_include(<nccl_device/core.h>)
 #include <nccl_device/core.h>
 #include <nccl_device/impl/comm__types.h>
@@ -39,8 +39,8 @@
 #include <string_view>
 #include <thread>
 
-#include "cuda/cuda_internal.hpp"
 #include "cuda/backward/tuning_config.hpp"
+#include "cuda/cuda_internal.hpp"
 #include "cuda/persistent_v3/backward/pipeline_state.cuh"
 #include "cuda/persistent_v3/backward/scheduler.cuh"
 #include "cuda/persistent_v3/contracts.hpp"
@@ -66,46 +66,39 @@ namespace {
 namespace forward_transport_launch {
 
 cudaError_t set_max_dynamic_shared_memory(int bytes) {
-  return cudaFuncSetAttribute(
-      local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  return cudaFuncSetAttribute(local_p2p_forward_transport_kernel<false>,
+                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              bytes);
 }
 
 cudaError_t set_local_max_dynamic_shared_memory(int bytes) {
-  return cudaFuncSetAttribute(
-      local_p2p_forward_megakernel<true, ForwardKernelRole::TransportOnly>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  return cudaFuncSetAttribute(local_p2p_forward_transport_kernel<true>,
+                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              bytes);
 }
 
-cudaError_t launch(const cudaLaunchConfig_t *config, const void *opaque_args,
-                   std::size_t args_bytes, const CUtensorMap &x_map,
-                   const CUtensorMap &s_map, const CUtensorMap &w1_map,
-                   const CUtensorMap &w2_map) {
+namespace {
+template <bool StaticLocal>
+cudaError_t launch_transport(const cudaLaunchConfig_t *config,
+                             const void *opaque_args, std::size_t args_bytes) {
   if (opaque_args == nullptr || args_bytes != sizeof(ForwardKernelArgs))
     return cudaErrorInvalidValue;
   static_assert(__is_trivially_copyable(ForwardKernelArgs));
   ForwardKernelArgs args{};
   std::memcpy(&args, opaque_args, sizeof(args));
   return cudaLaunchKernelEx(
-      config,
-      local_p2p_forward_megakernel<false, ForwardKernelRole::TransportOnly>,
-      args, x_map, s_map, w1_map, w2_map);
+      config, local_p2p_forward_transport_kernel<StaticLocal>, args);
+}
+} // namespace
+
+cudaError_t launch(const cudaLaunchConfig_t *config, const void *args,
+                   std::size_t args_bytes) {
+  return launch_transport<false>(config, args, args_bytes);
 }
 
-cudaError_t launch_local(const cudaLaunchConfig_t *config,
-                         const void *opaque_args, std::size_t args_bytes,
-                         const CUtensorMap &x_map, const CUtensorMap &s_map,
-                         const CUtensorMap &w1_map,
-                         const CUtensorMap &w2_map) {
-  if (opaque_args == nullptr || args_bytes != sizeof(ForwardKernelArgs))
-    return cudaErrorInvalidValue;
-  static_assert(__is_trivially_copyable(ForwardKernelArgs));
-  ForwardKernelArgs args{};
-  std::memcpy(&args, opaque_args, sizeof(args));
-  return cudaLaunchKernelEx(
-      config,
-      local_p2p_forward_megakernel<true, ForwardKernelRole::TransportOnly>,
-      args, x_map, s_map, w1_map, w2_map);
+cudaError_t launch_local(const cudaLaunchConfig_t *config, const void *args,
+                         std::size_t args_bytes) {
+  return launch_transport<true>(config, args, args_bytes);
 }
 
 } // namespace forward_transport_launch
