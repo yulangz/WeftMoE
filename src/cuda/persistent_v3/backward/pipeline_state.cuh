@@ -40,6 +40,11 @@ struct BackwardSchedulerLayout {
   std::uint64_t dw_reduction_rows = 0ULL;
   std::uint64_t dx_ready = 0ULL;
   std::uint64_t dab_ready = 0ULL;
+  std::uint64_t dx_ready_summary = 0ULL;
+  std::uint64_t dab_ready_summary = 0ULL;
+  std::uint64_t return_ready = 0ULL;
+  std::uint64_t return_claim = 0ULL;
+  std::uint64_t return_reserved = 0ULL;
   std::uint64_t dw2_ready = 0ULL;
   std::uint64_t dw1_ready = 0ULL;
   std::uint64_t dx_claim = 0ULL;
@@ -91,6 +96,14 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
   cursor += ready_words;
   layout.dab_ready = cursor;
   cursor += ready_words;
+  layout.dx_ready_summary = cursor;
+  cursor += (ready_words + 63ULL) / 64ULL;
+  layout.dab_ready_summary = cursor;
+  cursor += (ready_words + 63ULL) / 64ULL;
+  layout.return_ready = cursor;
+  cursor += mblocks;
+  layout.return_claim = cursor;
+  cursor += mblocks;
   layout.dw2_ready = cursor;
   cursor += experts;
   layout.dw1_ready = cursor;
@@ -114,6 +127,7 @@ make_backward_scheduler_layout(std::uint64_t mblocks,
   counter(layout.dw1_reserved);
   counter(layout.dw1_head);
   counter(layout.dispatch_scan);
+  counter(layout.return_reserved);
   counter(layout.dispatch_route_claim);
   counter(layout.dispatched_routes);
   counter(layout.return_scan);

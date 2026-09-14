@@ -651,7 +651,7 @@ class SpecializedJitCompiler:
         test_object = objects / _object_name(TEST_SOURCE)
         commands.append([
             str(self.nvcc), *self.cuda_flags, *specialization_flags,
-            "-c", TEST_SOURCE, "-o", str(test_object),
+            "-x", "cu", "-c", TEST_SOURCE, "-o", str(test_object),
         ])
         try:
             _run_parallel(

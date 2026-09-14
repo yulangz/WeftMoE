@@ -61,8 +61,9 @@ def measure(function, warmups, iterations):
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(warmups):
         dist.barrier()
-        function()
+        output = function()
         torch.cuda.synchronize()
+        del output
     cuda_samples = []
     wall_samples = []
     for _ in range(iterations):
@@ -70,10 +71,13 @@ def measure(function, warmups, iterations):
         torch.cuda.synchronize()
         wall_begin = time.perf_counter_ns()
         begin.record()
-        function()
+        output = function()
         end.record()
         end.synchronize()
         wall_ms = (time.perf_counter_ns() - wall_begin) / 1.0e6
+        # Keep the training graph/checkpoints alive through completion, as a
+        # caller preparing to run Backward would. Release outside measurement.
+        del output
         cuda_elapsed = torch.tensor(begin.elapsed_time(end),
                                     dtype=torch.float64, device="cuda")
         wall_elapsed = torch.tensor(wall_ms, dtype=torch.float64,
@@ -82,7 +86,8 @@ def measure(function, warmups, iterations):
         dist.all_reduce(wall_elapsed, op=dist.ReduceOp.MAX)
         cuda_samples.append(cuda_elapsed.item())
         wall_samples.append(wall_elapsed.item())
-    return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples)}
+    return {"cuda_event": stats(cuda_samples), "host_wall": stats(wall_samples),
+            "cuda_samples_ms": cuda_samples, "wall_samples_ms": wall_samples}
 
 
 def measure_stage_pipeline(function, stage_names, warmups, iterations):

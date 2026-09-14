@@ -25,6 +25,7 @@ from megatron_dispatch_baseline import (
     loaded_nccl_libraries,
     nccl_runtime_version,
     stats,
+    measure,
     validate_dispatcher_arguments,
     validate_dispatcher_runtime,
 )
@@ -58,7 +59,8 @@ def clear_gradients(hidden, selected_gates, parameters):
         parameter.grad = None
 
 
-def measure_backward(build_graph, output_gradient, clear, warmups, iterations):
+def measure_backward(build_graph, output_gradient, clear, warmups, iterations,
+                     allocate_tensors=False):
     begin = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     cuda_samples = []
@@ -73,7 +75,8 @@ def measure_backward(build_graph, output_gradient, clear, warmups, iterations):
 
         wall_begin = time.perf_counter_ns()
         begin.record()
-        torch.autograd.backward(output, output_gradient)
+        gradient = output_gradient.clone() if allocate_tensors else output_gradient
+        torch.autograd.backward(output, gradient)
         end.record()
         end.synchronize()
         wall_ms = (time.perf_counter_ns() - wall_begin) / 1.0e6
@@ -90,10 +93,13 @@ def measure_backward(build_graph, output_gradient, clear, warmups, iterations):
             cuda_samples.append(cuda_elapsed.item())
             wall_samples.append(wall_elapsed.item())
         del output
+        del gradient
 
     return {
         "cuda_event": stats(cuda_samples),
         "host_wall": stats(wall_samples),
+        "cuda_samples_ms": cuda_samples,
+        "wall_samples_ms": wall_samples,
     }
 
 
@@ -152,6 +158,12 @@ def main():
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--validation-repeats", type=int, default=2)
+    parser.add_argument("--allocate-tensors", action="store_true",
+                        help="include per-call input clone and output/gradient allocations")
+    parser.add_argument("--measure-forward", action="store_true",
+                        help="also time the training Forward with the same checkpoint contract")
+    parser.add_argument("--save-output-dir",
+                        help="dump one Forward and its input fixture after timing")
     parser.add_argument(
         "--gate-mode", choices=("fixed-random", "unit"),
         default="fixed-random"
@@ -253,12 +265,18 @@ def main():
     named_parameters = list(experts_module.named_parameters())
     parameters = [parameter for _, parameter in named_parameters]
 
-    def build_graph():
+    def build_graph(fresh_inputs=False):
+        call_hidden = hidden.detach().clone().requires_grad_(True) if fresh_inputs else hidden
+        call_selected = selected.clone() if fresh_inputs else selected
+        call_gates = selected_gates.detach().clone().requires_grad_(True) if fresh_inputs else selected_gates
+        call_routing = routing
+        if fresh_inputs:
+            call_routing = torch.zeros_like(routing).scatter_(1, call_selected, True)
         probabilities = torch.zeros(
             (args.tokens, args.experts), dtype=torch.float32, device="cuda"
-        ).scatter(1, selected, selected_gates)
+        ).scatter(1, call_selected, call_gates)
         local_hidden, local_probs = dispatcher.dispatch_preprocess(
-            hidden, routing, probabilities
+            call_hidden, call_routing, probabilities
         )
         remote_hidden, remote_probs = dispatcher.token_dispatch(
             local_hidden, local_probs
@@ -315,14 +333,30 @@ def main():
                 clear,
                 args.warmups,
                 args.iterations,
+                args.allocate_tensors,
             ),
         })
+        if args.measure_forward:
+            clear()
+            measured_runs[-1]["forward_e2e"] = measure(
+                lambda: build_graph(args.allocate_tensors), args.warmups, args.iterations)
 
     implementation = (
         "Megatron-Core MoEFlexTokenDispatcher + DeepEP + TEGroupedMLP"
         if args.dispatcher == "flex"
         else "Megatron-Core MoEAlltoAllTokenDispatcher + TEGroupedMLP"
     )
+    if args.save_output_dir:
+        clear()
+        saved_output = build_graph(args.allocate_tensors)
+        torch.cuda.synchronize()
+        os.makedirs(args.save_output_dir, mode=0o700, exist_ok=True)
+        torch.save({"native_forward": saved_output.detach().cpu(),
+                    "input": hidden.detach().cpu(),
+                    "selected": selected.detach().cpu(),
+                    "gates": selected_gates.detach().cpu()},
+                   os.path.join(args.save_output_dir, f"megatron-rank-{rank}.pt"))
+        del saved_output
     output = {
         "schema": 1,
         "implementation": implementation,
@@ -379,6 +413,10 @@ def main():
             "dGate, dW1, dW2, and dX combine"
         ),
         "forward_setup_in_timed_region": False,
+        "allocate_tensors": args.allocate_tensors,
+        "synchronize_ranks": True,
+        "input_initialization": "timed device-to-device clone" if args.allocate_tensors else "reused",
+        "allocator": "PyTorch caching allocator (warmed)",
         "validation": validation,
         "runs": measured_runs,
     }

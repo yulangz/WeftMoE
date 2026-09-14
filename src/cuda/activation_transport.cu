@@ -1857,13 +1857,13 @@ make_activation_pool_state(const CollectiveSession &session,
           slot.backward_dr_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.forward_training_output),
               config.max_hidden_size, config.max_destination_rows_per_rank,
-              backward_tuning::kTileM / 2U, "Backward compact dR",
+              backward_tuning::kActivationTileM, "Backward compact dR",
               backward_tuning::kTileK);
           slot.backward_dab_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.backward_dab_rows),
               2ULL * config.max_intermediate_size,
               state->layout.backward_padded_capacity_rows,
-              backward_tuning::kTileM / 2U, "Backward padded dAB",
+              backward_tuning::kActivationTileM, "Backward padded dAB",
               backward_tuning::kTileK);
           slot.backward_dr_mn_map = make_bf16_tma_map_mn(
               at<void>(slot.device, state->layout.forward_training_output),
@@ -1884,12 +1884,12 @@ make_activation_pool_state(const CollectiveSession &session,
               at<void>(slot.device, state->layout.backward_u),
               config.max_intermediate_size,
               state->layout.backward_padded_capacity_rows, "Backward dU output",
-              0ULL, backward_tuning::kTileM / 2U);
+              0ULL, backward_tuning::kActivationTileM);
           slot.backward_dx_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.backward_dx_rows),
               config.max_hidden_size,
               state->layout.backward_padded_capacity_rows, "Backward dX output",
-              0ULL, backward_tuning::kTileM / 2U);
+              0ULL, backward_tuning::kActivationTileM);
 
           slot.backward_maps_valid = true;
         }
@@ -5618,7 +5618,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       persistent_v3::backward::make_backward_scheduler_layout(
           scheduler_mblock_capacity,
           static_cast<std::uint32_t>(config.hidden_size /
-                                     backward_tuning::kDxTileN),
+                                     backward_tuning::kDxTileN /
+                                     backward_tuning::kActivationClusterN),
           pool->config.max_owned_experts);
   const auto scheduler_capacity_words =
       (layout.forward_fc1_done - layout.forward_task_claim) /

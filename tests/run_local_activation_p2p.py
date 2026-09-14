@@ -592,9 +592,14 @@ def main():
                 slowest = [max(item[key][iteration] for item in observed)
                            for iteration in range(measured)]
                 summary[key + "_slowest_rank_us"] = backward_stats(slowest)
+                summary[key + "_slowest_rank_samples_us"] = slowest
             result = {
                 "schema": 1,
                 "benchmark": "cached-x-ab-local-backward-pipeline",
+                "allocate_tensors": all(item.get("allocate_tensors") == "1" for item in observed),
+                "synchronize_ranks": all(item.get("synchronize_ranks") == "1" for item in observed),
+                "per_rank_tensor_allocation_requests": [int(item.get("tensor_allocation_requests", 0)) for item in observed],
+                "per_rank_checked_repetitions": [int(item.get("checked_repetitions", 0)) for item in observed],
                 "world": args.world,
                 "warmup": backward_warmups,
                 "measured": measured,
@@ -654,6 +659,7 @@ def main():
                                    for item in observed)
                                for iteration in range(args.rounds - 10)]
                     summary[key + "_slowest_rank_us"] = stats(slowest)
+                    summary[key + "_slowest_rank_samples_us"] = slowest
                 result = {
                     "schema": 1,
                     "benchmark": "single-persistent-forward-main-shape",
@@ -725,7 +731,14 @@ def main():
                     **summary,
                 }
                 if all("first_use_wall_us" in item for item in observed):
-                    result["timing_scope"] = "notify-buffer-forward"
+                    scopes = {item.get("timing_scope", "notify-buffer-forward") for item in observed}
+                    if len(scopes) != 1:
+                        raise RuntimeError("Forward ranks disagree on timing scope")
+                    result["timing_scope"] = scopes.pop()
+                    result["allocate_tensors"] = all(item.get("allocate_tensors") == "1" for item in observed)
+                    result["synchronize_ranks"] = all(item.get("synchronize_ranks") == "1" for item in observed)
+                    result["per_rank_tensor_allocation_requests"] = [int(item.get("tensor_allocation_requests", 0)) for item in observed]
+                    result["per_rank_checked_repetitions"] = [int(item.get("checked_repetitions", 0)) for item in observed]
                     result["first_use"] = {
                         key: {
                             "slowest_rank_us": max(float(item[key])

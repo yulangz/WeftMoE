@@ -4,6 +4,11 @@ Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).
 
+The completed EP8/EP16 comparison is in
+[the 2026-09-13 report](performance_20260913.md), with
+[statistics and raw timing samples](performance_20260913.json) and
+[exported FWD/BWD profiles](../configs/performance_20260913/profiles.json).
+
 - `megatron_dispatch_baseline.py` and `megatron_backward_baseline.py` measure
   Megatron/Flex FWD and cached-state BWD.
 - `run_multinode_megatron_rdma.py` launches the multi-node IB/RoCE baseline;
@@ -28,3 +33,56 @@ skipped, so GEMM instruction counters and FLOPS derived from the model shape
 are not meaningful in this mode. The flag is rejected by package builds.
 
 Generated results belong in `results/`, which is ignored by Git.
+
+`run_performance_matrix.py` builds and runs the Qwen3.5-35B-A3B and
+DeepSeek-V4-Flash BF16 routed-expert shapes at EP8/EP16 and 8K/64K tokens **per
+rank**. The matrix uses the ordinary SwiGLU expert body, without a router or
+shared expert. This is a layer benchmark, not a complete model benchmark.
+
+The allocation-inclusive mode requests fresh input, selected-route/gate,
+output, saved-state, and gradient tensor ownership on every applicable call.
+Input initialization uses timed device-to-device clones of identical fixtures.
+The native benchmark uses a caller-owned caching allocator; Flex uses the
+PyTorch caching allocator. Warmups populate both caches. Prior outputs are
+released outside timing, and new outputs/checkpoints stay alive until the call
+completes. Workspace, weights, peer mappings, GIN contexts, and DeepEP buffers
+are reused. Native cache misses after warmup fail the benchmark. The primary
+metric is host wall time, taking the maximum rank **for each iteration** before
+computing statistics. Native Forward's CUDA interval excludes Notify and is
+not directly comparable to Flex's complete Forward CUDA interval.
+Both implementations synchronize ranks with an untimed NCCL collective before
+each iteration. The matrix enables `WEFTMOE_BENCH_SYNC_RANKS=1` for native runs
+and rejects records without that synchronization scope.
+
+```sh
+python3 benchmarks/run_performance_matrix.py build --output results/candidate
+python3 benchmarks/run_performance_matrix.py weft --output results/candidate
+python3 benchmarks/run_performance_matrix.py flex --output results/flex
+```
+
+Use `--remote`, `--port`, and `--socket-ifname` for the test hosts. The matrix
+currently targets two nodes with eight Hopper GPUs each; the lower-level
+autotuners retain their general model and topology interfaces. Build-time
+`--override KEY=JSON` selects a candidate parameter. `--source` accepts a
+frozen tree for an independently runnable baseline. `build-pair` with
+`--forward-builds` and `--backward-builds` compiles both selected configurations
+into one binary and exports a combined `.tuning.hpp` file. The exported header
+also works with `NVCCFLAGS='-include /absolute/path/model.tuning.hpp'` when
+running `build_native.py`.
+
+`run_fair_comparison.py` interleaves frozen before/after binaries and a selected
+Flex SM configuration, then reverses the implementation and case order.
+It records raw samples, binary hashes, selected configurations, and execution
+order. Finish compilation and all correctness jobs before running it.
+`summarize_fair_comparison.py` pools every formal sample, preserves per-pass
+means and P50s, and reports P50/mean ratios alongside P95 and dispersion.
+
+Run correctness separately: `--check-repeats` compares every output bit,
+including every dW element, after each warmup/measured call. `--dump-output`
+writes the first `--dump-tokens` tokens and their inputs for
+`compare_forward_ep_outputs.py`. `forward_dump_reference.py` evaluates selected
+dump coordinates with NumPy FP64 dot products at arbitrary supported H/I/E
+shapes. `run_backward_validation.py` checks native repeat stability and then
+compares all gradients with PyTorch autograd, verifies retained X/A/B, and
+fails on nonfinite values or excessive relative L2 error. Checks and dump
+copies are outside the timed interval and are disabled in performance runs.

@@ -205,7 +205,8 @@ __device__ __forceinline__ void rdma_role(const BackwardKernelArgs &a) {
     auto *words = backward_pipeline_detail::scheduler_words(a);
     const auto layout = persistent_v3::backward::make_backward_scheduler_layout(
         a.scheduler_mblock_capacity,
-        unsigned(a.hidden / backward_tuning::kDxTileN),
+        unsigned(a.hidden / backward_tuning::kDxTileN /
+                 backward_tuning::kActivationClusterN),
         a.scheduler_expert_capacity);
     unsigned mblock = 0;
     while (mblock < a.mblocks) {

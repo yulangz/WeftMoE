@@ -125,6 +125,8 @@ def build(target='lib', output=None, jobs=None):
         command = list(device if source.endswith('.cu') or source == TEST_SOURCE else host)
         if source == 'src/cuda/forward_transport.cu':
             command += ['-diag-suppress=177']
+        if source == TEST_SOURCE:
+            command += ['-x', 'cu']
         return compile_source(source, command, cache)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         objects = list(pool.map(compile_one, sources))

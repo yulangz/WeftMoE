@@ -222,6 +222,8 @@ def main():
     parser.add_argument("--workload", choices=("forward", "backward"),
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
+    parser.add_argument("--allocate-tensors", action="store_true")
+    parser.add_argument("--measure-forward", action="store_true")
     parser.add_argument("--stage-profile", action="store_true")
     parser.add_argument("--inference", action="store_true",
                         help="run Forward without retained backward state")
@@ -235,6 +237,8 @@ def main():
         parser.error("--gpus-per-node must be positive")
     if args.stage_profile and args.workload != "forward":
         parser.error("--stage-profile currently profiles Forward only")
+    if (args.allocate_tensors or args.measure_forward) and args.workload != "backward":
+        parser.error("--allocate-tensors/--measure-forward require --workload backward")
     if args.inference and args.workload != "forward":
         parser.error("--inference requires --workload forward")
     if args.ib_gid_index < 0:

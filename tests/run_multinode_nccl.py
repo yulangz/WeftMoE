@@ -97,8 +97,16 @@ def aggregate_gin_benchmark(outputs):
         slowest = [max(record[key][iteration] for record in records)
                    for iteration in range(measured)]
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
+        summary[key + "_slowest_rank_samples_us"] = slowest
     if all("first_use_wall_us" in item for item in records):
-        summary["timing_scope"] = "notify-buffer-forward"
+        scopes = {item.get("timing_scope", "notify-buffer-forward") for item in records}
+        if len(scopes) != 1:
+            raise RuntimeError("Forward ranks disagree on timing scope")
+        summary["timing_scope"] = scopes.pop()
+        summary["allocate_tensors"] = all(item.get("allocate_tensors") == "1" for item in records)
+        summary["synchronize_ranks"] = all(item.get("synchronize_ranks") == "1" for item in records)
+        summary["per_rank_tensor_allocation_requests"] = [int(item.get("tensor_allocation_requests", 0)) for item in records]
+        summary["per_rank_checked_repetitions"] = [int(item.get("checked_repetitions", 0)) for item in records]
         summary["first_use"] = {
             key: {
                 "slowest_rank_us": max(float(item[key]) for item in records),
@@ -204,10 +212,15 @@ def aggregate_gin_backward(outputs):
         slowest = [max(record[key][iteration] for record in records)
                    for iteration in range(measured)]
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
+        summary[key + "_slowest_rank_samples_us"] = slowest
 
     return {
         "schema": 1,
         "benchmark": "multinode-gin-cached-state-backward",
+        "allocate_tensors": all(item.get("allocate_tensors") == "1" for item in records),
+        "synchronize_ranks": all(item.get("synchronize_ranks") == "1" for item in records),
+        "per_rank_tensor_allocation_requests": [int(item.get("tensor_allocation_requests", 0)) for item in records],
+        "per_rank_checked_repetitions": [int(item.get("checked_repetitions", 0)) for item in records],
         "backend": "gin-rdma-device-persistent",
         "world": len(records),
         "measured": measured,
@@ -303,6 +316,8 @@ def environment_overrides(args):
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
+        "WEFTMOE_BENCH_ALLOCATE_TENSORS",
+        "WEFTMOE_BENCH_CHECK_REPEAT",
         "WEFTMOE_FORWARD_PRE_COMBINE",
         "WEFTMOE_TEST_ROUTE_STRIDE",
         "WEFTMOE_TEST_TOKEN_OFFSET",
@@ -329,6 +344,7 @@ def environment_overrides(args):
         "WEFTMOE_PRODUCTION_STATUS_FAULT_PHASE",
         "WEFTMOE_P2P_TOP_K",
         "WEFTMOE_BENCH_EXPERTS",
+        "WEFTMOE_BENCH_SYNC_RANKS",
         "WEFTMOE_P2P_RING_SLOTS",
         "WEFTMOE_P2P_NO_WRAP",
         "WEFTMOE_GATE_MODE",

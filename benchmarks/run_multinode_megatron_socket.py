@@ -76,6 +76,11 @@ def benchmark_arguments(args):
         result.extend([
             "--validation-repeats", str(args.validation_repeats),
         ])
+        for option in ("allocate_tensors", "measure_forward"):
+            if getattr(args, option, False):
+                result.append("--" + option.replace("_", "-"))
+        if getattr(args, "save_output_dir", None):
+            result.extend(["--save-output-dir", args.save_output_dir])
     else:
         result.extend(["--expert-body", args.expert_body])
         if getattr(args, "inference", False):

@@ -380,9 +380,10 @@ def materialize_candidate(candidate: Mapping[str, Any],
 def dynamic_shared_memory(config: Mapping[str, Any]) -> int:
     storage_tile_n = max(config["dab_tile_n"], config["dx_tile_n"],
                          config["dw_tile_n"])
-    activation_elements = (
-        config["tile_m"] // 2 + storage_tile_n
-    ) * config["tile_k"]
+    pair_n = (config["main_intermediate"] % (2 * config["dab_tile_n"]) == 0
+              and config["main_hidden"] % (2 * config["dx_tile_n"]) == 0)
+    activation_m = config["tile_m"] if pair_n else config["tile_m"] // 2
+    activation_elements = (activation_m + storage_tile_n) * config["tile_k"]
     dw_elements = (
         config["dw_tile_m"] + config["dw_tile_n"]
     ) * config["tile_k"]

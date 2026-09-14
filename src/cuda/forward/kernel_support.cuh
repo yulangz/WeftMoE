@@ -969,7 +969,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
           persistent_v3::backward::make_backward_scheduler_layout(
               backward_mblocks,
               static_cast<std::uint32_t>(config.max_hidden_size /
-                                         backward_tuning::kDxTileN),
+                                         backward_tuning::kDxTileN /
+                                         backward_tuning::kActivationClusterN),
               config.max_owned_experts);
       if (backward_scheduler.total_words > task_claim_words)
         task_claim_words = backward_scheduler.total_words;

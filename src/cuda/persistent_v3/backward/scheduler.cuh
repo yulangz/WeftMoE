@@ -32,6 +32,7 @@ struct TileDomain {
   std::uint32_t owner_count = 0U;
   std::uint32_t tiles_per_owner = 0U;
   TaskKind kind = TaskKind::None;
+  unsigned long long *ready_summary = nullptr;
 
   WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
     return (owner_count + 63U) / 64U;
@@ -120,6 +121,32 @@ WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(ExpertTileQueue queue,
   }
 }
 
+WEFTMOE_V3_DEVICE inline void publish_ready_summary(TileDomain domain,
+                                                    std::uint32_t word) {
+  if (domain.ready_summary)
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+        domain.ready_summary[word / 64U])
+        .fetch_or(1ULL << (word % 64U), ::cuda::memory_order_release);
+}
+
+// A publisher can refill an empty word between its observation and removal
+// from the summary. Acquire the prior summary publication, clear, then repair
+// from the owner word. A later publisher sets the summary itself. This keeps
+// the same no-lost-wakeup guarantee as DAB's phase retirement below.
+WEFTMOE_V3_DEVICE inline void retire_ready_word(TileDomain domain,
+                                                std::uint32_t word) {
+  if (!domain.ready_summary)
+    return;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> summary(
+      domain.ready_summary[word / 64U]);
+  const auto mask = 1ULL << (word % 64U);
+  summary.fetch_and(~mask, ::cuda::memory_order_acq_rel);
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
+      domain.ready_words[word]);
+  if (ready.load(::cuda::memory_order_acquire) != 0ULL)
+    summary.fetch_or(mask, ::cuda::memory_order_release);
+}
+
 WEFTMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
                                             std::uint32_t owner) {
   if (owner >= domain.owner_count || domain.tiles_per_owner == 0U)
@@ -133,6 +160,7 @@ WEFTMOE_V3_DEVICE inline void publish_owner(TileDomain domain,
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
       domain.ready_words[owner / 64U]);
   ready.fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
+  publish_ready_summary(domain, owner / 64U);
 }
 
 // Publish only the leading tile prefix of an otherwise fixed-size domain.
@@ -163,6 +191,7 @@ WEFTMOE_V3_DEVICE inline void publish_owner_prefix(TileDomain domain,
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
       domain.ready_words[owner / 64U]);
   ready.fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
+  publish_ready_summary(domain, owner / 64U);
 }
 
 WEFTMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
@@ -183,6 +212,18 @@ WEFTMOE_V3_DEVICE inline bool owner_fully_claimed(TileDomain domain,
 // the old phase fully claimed, then retire its ready bit after another worker
 // has already published the next phase. Repair that stale retirement when the
 // new phase still has unclaimed work. Single-publication domains need no probe.
+WEFTMOE_V3_DEVICE inline void repair_retired_owner(TileDomain domain,
+                                                   std::uint32_t owner) {
+  if (!owner_fully_claimed(domain, owner)) {
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+        domain.ready_words[owner / 64U])
+        .fetch_or(1ULL << (owner % 64U), ::cuda::memory_order_release);
+    // Another consumer may have retired the empty word while this repair
+    // was pending. Restore both levels, exactly as a new publisher does.
+    publish_ready_summary(domain, owner / 64U);
+  }
+}
+
 WEFTMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
                                                    std::uint32_t owner) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
@@ -190,11 +231,12 @@ WEFTMOE_V3_DEVICE inline void retire_claimed_owner(TileDomain domain,
   const auto mask = 1ULL << (owner % 64U);
   if (domain.kind == TaskKind::Dab) {
     ready.fetch_and(~mask, ::cuda::memory_order_acq_rel);
-    if (!owner_fully_claimed(domain, owner))
-      ready.fetch_or(mask, ::cuda::memory_order_release);
+    repair_retired_owner(domain, owner);
   } else {
     ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
   }
+  if (ready.load(::cuda::memory_order_acquire) == 0ULL)
+    retire_ready_word(domain, owner / 64U);
 }
 
 WEFTMOE_V3_DEVICE inline bool
@@ -221,59 +263,91 @@ try_claim_owner_tile(TileDomain domain, std::uint32_t owner, TileTask &task) {
   return false;
 }
 
+WEFTMOE_V3_DEVICE inline bool try_claim_ready_word(TileDomain domain,
+                                                   TileTask &task,
+                                                   std::uint32_t word_index,
+                                                   std::uint32_t worker) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
+      domain.ready_words[word_index]);
+  auto bits = ready.load(::cuda::memory_order_acquire);
+  while (bits != 0ULL) {
+    // Spread CTAs over the first compact owner group without giving up the
+    // expert-major ready-word order.  Since each owner claims N tiles from
+    // zero upward, neighboring M-blocks then request the same W1/W2 tile
+    // close together and can reuse it from L2.
+    auto bit = static_cast<std::uint32_t>(__ffsll(bits) - 1);
+    if constexpr (backward_tuning::kActivationOwnerGroup > 1U) {
+      if (domain.kind == TaskKind::Dx || domain.kind == TaskKind::Dab) {
+        constexpr std::uint32_t kOwnerGroup =
+            backward_tuning::kActivationOwnerGroup;
+        const auto group_begin = bit & ~(kOwnerGroup - 1U);
+        const auto group_bits =
+            (bits >> group_begin) & ((1ULL << kOwnerGroup) - 1ULL);
+        const auto rotation = worker & (kOwnerGroup - 1U);
+        const auto after_rotation = group_bits & (~0ULL << rotation);
+        const auto selected =
+            after_rotation != 0ULL ? after_rotation : group_bits;
+        bit = group_begin + static_cast<std::uint32_t>(__ffsll(selected) - 1);
+      }
+    }
+    const auto owner = word_index * 64U + bit;
+    const auto mask = 1ULL << bit;
+    if (owner >= domain.owner_count) {
+      ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
+      bits &= ~mask;
+      continue;
+    }
+    if (try_claim_owner_tile(domain, owner, task)) {
+      if (owner_fully_claimed(domain, owner))
+        retire_claimed_owner(domain, owner);
+      return true;
+    }
+    if (owner_fully_claimed(domain, owner))
+      retire_claimed_owner(domain, owner);
+    bits &= ~mask;
+  }
+  if (ready.load(::cuda::memory_order_acquire) == 0ULL)
+    retire_ready_word(domain, word_index);
+  return false;
+}
+
 WEFTMOE_V3_DEVICE inline bool try_claim_domain_once(
     TileDomain domain, TileTask &task,
     std::uint32_t worker = static_cast<std::uint32_t>(blockIdx.x)) {
   const auto words = domain.word_count();
   if (words == 0U || domain.tiles_per_owner == 0U)
     return false;
-  // M-block owners are contiguous by expert. Starting from the same ready
-  // word lets CTAs consume neighboring M-blocks while their W1/W2 tiles are
-  // still resident in L2; the complete bitmap is still visited on a miss.
   std::uint32_t first = 0U;
   if constexpr (backward_tuning::kReadyWordStagger != 0U)
     first = worker % words;
-  for (std::uint32_t offset = 0U; offset < words; ++offset) {
-    const auto word_index = (first + offset) % words;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
-        domain.ready_words[word_index]);
-    auto bits = ready.load(::cuda::memory_order_acquire);
-    while (bits != 0ULL) {
-      // Spread CTAs over the first compact owner group without giving up the
-      // expert-major ready-word order.  Since each owner claims N tiles from
-      // zero upward, neighboring M-blocks then request the same W1/W2 tile
-      // close together and can reuse it from L2.
-      auto bit = static_cast<std::uint32_t>(__ffsll(bits) - 1);
-      if constexpr (backward_tuning::kActivationOwnerGroup > 1U) {
-        if (domain.kind == TaskKind::Dx || domain.kind == TaskKind::Dab) {
-          constexpr std::uint32_t kOwnerGroup =
-              backward_tuning::kActivationOwnerGroup;
-          const auto group_begin = bit & ~(kOwnerGroup - 1U);
-          const auto group_bits =
-              (bits >> group_begin) & ((1ULL << kOwnerGroup) - 1ULL);
-          const auto rotation = worker & (kOwnerGroup - 1U);
-          const auto after_rotation = group_bits & (~0ULL << rotation);
-          const auto selected =
-              after_rotation != 0ULL ? after_rotation : group_bits;
-          bit = group_begin + static_cast<std::uint32_t>(__ffsll(selected) - 1);
+  if (domain.ready_summary) {
+    // Preserve expert-major locality while skipping up to 64 empty owner
+    // words with one acquire. Large batches otherwise rescan their retired
+    // prefix on every dX/dU/epilogue task and every priority probe.
+    const auto summaries = (words + 63U) / 64U;
+    for (std::uint32_t offset = 0U; offset < summaries; ++offset) {
+      const auto summary_index = (first / 64U + offset) % summaries;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          summary(domain.ready_summary[summary_index]);
+      auto bits = summary.load(::cuda::memory_order_acquire);
+      while (bits) {
+        auto selected = bits;
+        if constexpr (backward_tuning::kReadyWordStagger != 0U) {
+          const auto after = bits & (~0ULL << (first % 64U));
+          if (offset == 0U && after)
+            selected = after;
         }
+        const auto bit = static_cast<std::uint32_t>(__ffsll(selected) - 1);
+        const auto word = summary_index * 64U + bit;
+        if (word < words && try_claim_ready_word(domain, task, word, worker))
+          return true;
+        bits &= ~(1ULL << bit);
       }
-      const auto owner = word_index * 64U + bit;
-      const auto mask = 1ULL << bit;
-      if (owner >= domain.owner_count) {
-        ready.fetch_and(~mask, ::cuda::memory_order_relaxed);
-        bits &= ~mask;
-        continue;
-      }
-      if (try_claim_owner_tile(domain, owner, task)) {
-        if (owner_fully_claimed(domain, owner))
-          retire_claimed_owner(domain, owner);
-        return true;
-      }
-      if (owner_fully_claimed(domain, owner))
-        retire_claimed_owner(domain, owner);
-      bits &= ~mask;
     }
+  } else {
+    for (std::uint32_t offset = 0U; offset < words; ++offset)
+      if (try_claim_ready_word(domain, task, (first + offset) % words, worker))
+        return true;
   }
   return false;
 }

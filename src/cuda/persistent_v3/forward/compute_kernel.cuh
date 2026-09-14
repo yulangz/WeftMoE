@@ -746,11 +746,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
         for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
           cute::warpgroup_fence_operand(accum_b[index]);
-        cute::warpgroup_wait<forward_tuning::kWgmmaWaitGroup>();
-
+        // FC1 commits two groups per K iteration. In the overlapped mode,
+        // retain the current iteration and recycle only the previous stage.
+        // A wait<1> followed by recycling the current stage races the up GEMM.
+        cute::warpgroup_wait<2U * forward_tuning::kWgmmaWaitGroup>();
         const auto lane = threadIdx.x & 31U;
-        if (lane < 2U)
-          fc1_empty[stage].arrive(lane);
+        if constexpr (forward_tuning::kWgmmaWaitGroup == 0U) {
+          if (lane < 2U)
+            fc1_empty[stage].arrive(lane);
+        } else if (iteration != 0U && lane < 2U) {
+          fc1_empty[(current - 1U) % Fc1StageCount].arrive(lane);
+        }
+      }
+      if constexpr (forward_tuning::kWgmmaWaitGroup != 0U) {
+        cute::warpgroup_wait<0>();
+        const auto lane = threadIdx.x & 31U;
+        if (iterations != 0U && lane < 2U)
+          fc1_empty[(fc1_pipeline + iterations - 1U) % Fc1StageCount].arrive(
+              lane);
       }
       fc1_pipeline += iterations;
 
@@ -898,16 +911,22 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
             cute::warpgroup_fence_operand(accum[index]);
-          // TMA remains asynchronous in the producer warpgroup.  The
-          // math side completes one K=64 group before recycling that stage; the
-          // previous wait<1> needed a second live accumulator generation and
-          // made ptxas serialize every individual WGMMA instruction.
           cute::warpgroup_wait<forward_tuning::kWgmmaWaitGroup>();
-
           const auto lane = threadIdx.x & 31U;
-          if (lane < 2U)
-            fc2_empty[stage].arrive(lane);
+          if constexpr (forward_tuning::kWgmmaWaitGroup == 0U) {
+            if (lane < 2U)
+              fc2_empty[stage].arrive(lane);
+          } else if ((wave != 0U || stage != 0U) && lane < 2U) {
+            fc2_empty[(stage + Fc2StageCount - 1U) % Fc2StageCount].arrive(
+                lane);
+          }
         }
+      }
+      if constexpr (forward_tuning::kWgmmaWaitGroup != 0U) {
+        cute::warpgroup_wait<0>();
+        const auto lane = threadIdx.x & 31U;
+        if (lane < 2U)
+          fc2_empty[Fc2StageCount - 1U].arrive(lane);
       }
       fc2_pipeline += kFc2Iterations;
 

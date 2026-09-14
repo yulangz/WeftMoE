@@ -22,15 +22,17 @@ Larger tiles or deeper pipelines can improve reuse, but also increase resource
 requirements and reduce scheduling flexibility.
 
 Both phases require two-CTA compute clusters and use TMA multicast. Backward
-activation GEMMs split each ready M tile into two row halves and multicast
-the weights. Both halves complete before the original tile is published as
-finished. Weight-gradient GEMMs prefer sharing the larger input operand,
+activation GEMMs pair two complete M128 tiles along N when both dU and dX
+have even N-tile counts. Both math warpgroups then run, and TMA multicasts
+the activation tile. Odd N-tile counts retain the two M64 row halves and
+multicast the weights. Both CTAs finish before their cluster task publishes
+completion. Weight-gradient GEMMs prefer sharing the larger input operand,
 changing pairing direction for odd tile counts; a singleton tail participates
 in the cluster pipeline but only its valid tile writes a result.
 
 | Parameter | Phase | Purpose and guidance |
 |---|---|---|
-| `tile_m` | FWD/BWD | Rows in a logical activation tile, currently fixed at 128. Each backward compute CTA handles half of those rows. Padding and the number of ready tiles affect utilization. |
+| `tile_m` | FWD/BWD | Rows in a logical activation tile, currently fixed at 128. Backward uses full M128 CTAs for even N extents and M64 halves otherwise. Padding and the number of ready tiles affect utilization. |
 | `tile_k` | FWD/BWD | Reduction-dimension step of the GEMM pipeline. The current implementation uses 64 to match its shared-memory layout. |
 | `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Start with FC1 N128 and FC2 N256 on Hopper. FC1 holds two projection accumulators, so increasing its N tile can be costly even when the shared-memory buffers fit. Keep FC2 N128 as an alternative for distributed tuning. |
 | `dab_tile_n`, `dx_tile_n` | BWD | Output-column dimensions of the activation-gradient and input-gradient GEMMs. Start with 256 for both; evaluate narrower tiles when dimensions or task parallelism warrant it. Narrower tiles do not necessarily reduce register usage. |
@@ -42,7 +44,7 @@ in the cluster pipeline but only its valid tile writes a result.
 | `math_warpgroups` | FWD/BWD | Warpgroups assigned to matrix computation. The current implementation requires two. |
 | `producer_warpgroups` | FWD/BWD | Warpgroups assigned to staging operands. The current implementation requires one. |
 | `math_registers`, `producer_registers` | FWD/BWD | Per-thread register budget requests for the corresponding roles. These are allocation requests, not measured register counts; inspect compiler resource usage when changing them. |
-| `wgmma_wait_group` | FWD | Number of outstanding WGMMA groups permitted at a wait point. Controls the balance between pipeline overlap and operand or accumulator dependencies. |
+| `wgmma_wait_group` | FWD | Number of K iterations allowed to remain outstanding: 0 or 1. FC1 commits two WGMMA groups per iteration and FC2 commits one. Mode 1 releases only the previous shared-memory stage and drains the final iteration before the epilogue. Start with 0; additional overlap is not always faster. |
 | `fc2_store_atom_n` | FWD | Column width of the FC2 output TMA store atom. Determines the granularity of output stores. |
 | `cluster_size` | FWD | Fixed at two CTAs per compute cluster. TMA multicast is required; select N tiles that give even FC1 and FC2 tile counts. |
 | `fc2_tma_store` | FWD | Required for the multicast compute path. Full tiles use shared-memory staging and TMA; partial expert tails use bounds-checked stores. |
@@ -73,6 +75,13 @@ for compute workers.
 Scheduler parameters balance queue contention, weight reuse, and how quickly
 newly ready work can execute. Larger batches or locality groups can reduce
 scheduling overhead while increasing the time other tasks spend waiting.
+
+Backward activation readiness has a second bitmap level, skipping 64 empty
+owner words per probe while preserving expert-major claim order. Retirement
+and DAB phase repair update both levels to avoid lost wakeups. Local dX Return
+uses the same append-only queue as dW scheduling, with one task per M-block;
+GIN retains its expert-major scan. Neither changes the arithmetic reduction
+order of dX, dGate, or the single-writer dW tiles.
 
 | Parameter | Phase | Purpose and guidance |
 |---|---|---|
@@ -120,3 +129,20 @@ Its thread-count setting does not change the main compute-worker allocation.
 | `finalize_nanosleep` | FWD | Backoff hint while waiting for final completion. |
 | `reduce_threads` | BWD | Threads per input-gradient reduction CTA. Each warp handles one token in the current implementation. Start with 256; larger CTAs may reduce scheduling flexibility for short reductions. |
 | `reduce_idle_nanosleep` | BWD | Backoff hint while waiting for input-gradient route contributions. |
+
+The measured Qwen3.5-35B-A3B and DeepSeek-V4-Flash profiles are in
+[`performance_20260913/profiles.json`](performance_20260913/profiles.json).
+Each referenced header contains both Forward and Backward settings. For example,
+build a production library from the repository root with:
+
+```sh
+NVCCFLAGS="-include $PWD/configs/performance_20260913/qwen_ep8.hpp" \
+  python3 build_native.py lib --output build/libweftmoe_qwen_ep8.so --jobs 16
+```
+
+The Qwen EP8 64K case uses `qwen_ep8_64k.hpp`; the other three model/topology
+combinations share one profile across 8K and 64K. Tokens are per rank. These
+profiles were selected with pre-combine disabled; the report measures the same
+profiles with it enabled as well. They do not change the model or topology
+interfaces. Retune other supported aligned dimensions and hardware with the
+existing autotuners instead of applying these model dimensions to other layers.

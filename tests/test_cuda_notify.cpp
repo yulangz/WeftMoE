@@ -22,12 +22,13 @@
 
 #include <cuda_runtime_api.h>
 
-#include "weftmoe/api/errors.hpp"
-#include "weftmoe/metadata/serialize.hpp"
+#include "benchmark_tensor_allocator.hpp"
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/nccl_protocol_internal.hpp"
 #include "cuda/testing/generation_scheduler.hpp"
+#include "weftmoe/api/errors.hpp"
+#include "weftmoe/metadata/serialize.hpp"
 
 namespace {
 
@@ -35,6 +36,16 @@ using Clock = std::chrono::steady_clock;
 
 bool test_pre_combine() {
   const auto *value = std::getenv("WEFTMOE_FORWARD_PRE_COMBINE");
+  return value && std::string(value) == "1";
+}
+
+bool benchmark_allocate_tensors() {
+  const auto *value = std::getenv("WEFTMOE_BENCH_ALLOCATE_TENSORS");
+  return value && std::string(value) == "1";
+}
+
+bool benchmark_synchronize_ranks() {
+  const auto *value = std::getenv("WEFTMOE_BENCH_SYNC_RANKS");
   return value && std::string(value) == "1";
 }
 
@@ -83,6 +94,29 @@ void write_device_timeline(
 void require(bool condition, const std::string &message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+weftmoe::cuda::CudaTensorBuffer prepare_benchmark_barrier(
+    BenchmarkTensorAllocator &allocator, cudaStream_t stream) {
+  if (!benchmark_synchronize_ranks())
+    return {};
+  auto scratch = allocator.allocate(sizeof(std::uint32_t));
+  require(cudaMemsetAsync(scratch.data, 0, scratch.bytes, stream) == cudaSuccess,
+          "initialize benchmark rank barrier");
+  return scratch;
+}
+
+void benchmark_rank_barrier(const weftmoe::cuda::CudaTensorBuffer &scratch,
+                            const weftmoe::cuda::NcclSession &session,
+                            cudaStream_t stream) {
+  if (!scratch.data)
+    return;
+  const auto nccl = weftmoe::cuda::internal::NcclSessionAccess::checked(session);
+  require(ncclAllReduce(scratch.data, scratch.data, 1, ncclUint32, ncclSum,
+                       nccl->comm, stream) == ncclSuccess,
+          "benchmark rank barrier");
+  require(cudaStreamSynchronize(stream) == cudaSuccess,
+          "complete benchmark rank barrier");
 }
 weftmoe::cuda::CudaGateInput make_unit_gates(
     const weftmoe::cuda::CudaRouteInput &routes,
@@ -939,7 +973,8 @@ void test_fault_injection() {
         weftmoe::cuda::download_device_metadata_for_validation(
             recovered.dispatch(), execution));
     const auto expected = weftmoe::build_notify_dispatch_for_testing(
-        config, {routes}, identity, generation);
+        config, std::vector<weftmoe::RankRoutingInput>{routes}, identity,
+        generation);
     require(actual == weftmoe::serialize_dispatch_metadata(expected.front()),
             "fault recovery produced incorrect dispatch metadata/hash");
   };
@@ -2402,10 +2437,20 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   auto dynamic_notify_pool = make_device_notify_resource_pool(
       base, execution, {config, capacity, 8192, 2, 4, BufferMode::Dynamic});
   std::array<std::uint64_t, 3> forward_hashes{}, backward_hashes{};
+  std::array<BackwardValidationDownload, 3> backward_expected;
+  const auto same_backward = [](const BackwardValidationDownload &left,
+                                const BackwardValidationDownload &right) {
+    const auto equal = [](const auto &a, const auto &b) {
+      return a.size() == b.size() &&
+             (a.empty() || std::memcmp(a.data(), b.data(),
+                                       a.size() * sizeof(a.front())) == 0);
+    };
+    return equal(left.dx, right.dx) && equal(left.dgate, right.dgate) &&
+           equal(left.dw1, right.dw1) && equal(left.dw2, right.dw2);
+  };
   ActivationTransportResourcePool dynamic_pool;
   DeviceBackwardHandle retained_backward;
   DeviceForwardHandle retained_forward;
-  std::uint64_t retained_dx_hash = 0;
   BackwardMegaKernel backward_kernel;
   for (unsigned int distribution : {1U, 0U, 2U}) {
     set_routes(distribution);
@@ -2492,6 +2537,7 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
         backward_kernel.enqueue(forward, gradients, backward_config);
     auto result = BackwardValidationBridge::download(backward, execution);
     backward_hashes[distribution] = hash_bf16_indexed(result.dx);
+    backward_expected[distribution] = std::move(result);
     backward.wait();
     require(pool.usage().slots_in_use == 0,
             "Backward outputs retained a completed execution slot");
@@ -2500,23 +2546,22 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
             "Backward overwrote the independent Forward output");
     if (distribution == 0) {
       retained_forward = forward;
-      retained_dx_hash = backward_hashes[distribution];
     } else if (distribution == 2) {
       // This pool has just run another Forward and Backward. The old saved
       // X/AB/routing must still drive Backward correctly after scratch reuse.
       auto repeated = backward_kernel.run(retained_forward, gradients,
                                           {hidden, intermediate});
-      require(hash_bf16_indexed(
-                  BackwardValidationBridge::download(repeated, execution).dx) ==
-                  retained_dx_hash,
-              "workspace reuse changed retained Forward state");
+      require(
+          same_backward(BackwardValidationBridge::download(repeated, execution),
+                        backward_expected[0]),
+          "workspace reuse changed retained Forward state");
     }
     if (world > 1 && distribution == 1)
       retained_backward = backward;
     else if (retained_backward)
-      require(hash_bf16_indexed(BackwardValidationBridge::download(
-                                    retained_backward, execution)
-                                    .dx) == backward_hashes[1],
+      require(same_backward(BackwardValidationBridge::download(
+                                retained_backward, execution),
+                            backward_expected[1]),
               "growing a pool changed a retained Backward result");
   }
   retained_forward = {};
@@ -2596,15 +2641,15 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                 forward, execution)) == actual_forward,
             "captured Backward aliased Forward output");
     auto result = BackwardValidationBridge::download(backward, execution);
-    require(hash_bf16_indexed(result.dx) == backward_hashes[distribution],
-            "Graph Backward used stale routing or counts");
+    require(same_backward(result, backward_expected[distribution]),
+            "Graph Backward gradients used stale routing or counts");
   }
   check(cudaGraphExecDestroy(executable));
   check(cudaGraphDestroy(graph));
   check(cudaEventDestroy(snapshot_done));
   check(cudaStreamDestroy(snapshot_stream));
   std::cout << "BUFFER_MODES rank=" << rank << " tokens=" << tokens
-            << " dynamic=1 static=1 graph_replays=6 skew=1\n";
+            << " dynamic=1 static=1 graph_replays=6 skew=1 gradient_bits=all\n";
 }
 
 void run_cached_backward_rank(
@@ -2734,11 +2779,55 @@ void run_cached_backward_rank(
   weftmoe::cuda::DeviceBackwardHandle last;
   weftmoe::cuda::BackwardMegaKernel backward;
   weftmoe::cuda::BackwardMegaKernelConfig backward_config{hidden, intermediate};
-  backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
-      notify.dispatch(), execution, backward_config);
+  const bool allocate_tensors = benchmark_allocate_tensors();
+  const bool check_repeats =
+      std::getenv("WEFTMOE_BENCH_CHECK_REPEAT") != nullptr;
+  BenchmarkRepeatCheck repeat_check;
+  BenchmarkTensorAllocator tensor_allocator;
+  const weftmoe::cuda::CudaTensorAllocator allocate = [&](std::uint64_t bytes) {
+    return tensor_allocator.allocate(bytes);
+  };
+  const auto execution_state =
+      weftmoe::cuda::internal::checked_execution_state(execution);
+  weftmoe::cuda::CudaTensorBuffer dy_fixture;
+  if (allocate_tensors) {
+    dy_fixture = allocate(dy_host.size() * sizeof(dy_host.front()));
+    require(cudaMemcpy(dy_fixture.data, dy_host.data(), dy_fixture.bytes,
+                       cudaMemcpyHostToDevice) == cudaSuccess,
+            "upload Backward allocation fixture");
+  } else {
+    backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
+        notify.dispatch(), execution, backward_config);
+  }
+  std::uint64_t warm_misses = 0;
+  const auto rank_barrier =
+      prepare_benchmark_barrier(tensor_allocator, execution_state->stream);
   for (std::uint32_t round = 0; round < rounds; ++round) {
+    if (round == warmups)
+      warm_misses = tensor_allocator.misses;
     progress("backward_enter");
+    if (allocate_tensors) {
+      last = {};
+      backward_config.tensors = {};
+      output_gradients = {};
+    }
+    benchmark_rank_barrier(rank_barrier, base, execution_state->stream);
     const auto begin = Clock::now();
+    if (allocate_tensors) {
+      const auto input = allocate(dy_fixture.bytes);
+      require(cudaMemcpyAsync(input.data, dy_fixture.data, input.bytes,
+                              cudaMemcpyDeviceToDevice,
+                              execution_state->stream) == cudaSuccess,
+              "copy Backward allocation fixture");
+      const auto producer = weftmoe::cuda::make_external_cuda_producer(
+          context, execution.device_ordinal(), execution_state->stream,
+          execution_state, "backward-benchmark-input");
+      output_gradients = producer.publish_output_gradients(
+          static_cast<const weftmoe::transport::BFloat16 *>(input.data),
+          dy_host.size(), max_tokens, hidden, input.owner);
+      backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
+          notify.dispatch(), execution, backward_config, {}, allocate);
+    }
     auto output =
         backward.enqueue(forward, output_gradients, backward_config, {});
     if (validation) {
@@ -2780,8 +2869,16 @@ void run_cached_backward_rank(
       overlap_samples.push_back(output.timings().dw_combine_overlap_us);
     }
     last = std::move(output);
+    if (check_repeats) {
+      const auto tensors = last.tensors().buffers();
+      repeat_check.check({tensors.dx, tensors.dgate, tensors.dw1, tensors.dw2},
+                         execution_state->stream);
+    }
     progress("backward_done");
   }
+  if (allocate_tensors && warmups)
+    require(tensor_allocator.misses == warm_misses,
+            "Backward tensor cache missed after warmup");
 
   bool repeat_equal = true;
   std::uint64_t dx_hash = 0ULL;
@@ -2850,6 +2947,10 @@ void run_cached_backward_rank(
   };
   const auto usage = activation_pool.usage();
   std::cout << "BACKWARD_RESULT rank=" << rank << " world=" << world
+            << " allocate_tensors=" << allocate_tensors
+            << " synchronize_ranks=" << benchmark_synchronize_ranks()
+            << " tensor_allocation_requests=" << tensor_allocator.requests
+            << " checked_repetitions=" << repeat_check.repetitions
             << " forward_pre_combine=" << forward_config.pre_combine
             << " mode=" << (validation ? "validation" : "benchmark")
             << " backend=" << (nodes == 2U ? "gin-rdma" : "local-p2p")
@@ -3264,7 +3365,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     // Keep at least the small topology already exercised by the Forward
     // scheduler; one-expert fixtures do not provide its split-role terminal
     // accounting with a representative task domain.
-    experts = std::max<std::uint32_t>(16U, world * 2U);
+    experts = std::getenv("WEFTMOE_BENCH_EXPERTS")
+                  ? std::stoul(std::getenv("WEFTMOE_BENCH_EXPERTS"))
+                  : std::max<std::uint32_t>(16U, world * 2U);
+    require(experts >= top_k && experts % world == 0U,
+            "Backward validation experts must cover top-k and divide EP");
     const auto *tokens_text = std::getenv("WEFTMOE_BACKWARD_TOKENS");
     max_tokens = tokens_text ? std::stoull(tokens_text) : 8ULL;
     // Forward publishes 64-row Dispatch arrival tiles. Backward later groups
@@ -3601,6 +3706,27 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     weftmoe::cuda::ForwardMegaKernelConfig forward_config{
         hidden, intermediate, retain_backward_state};
     forward_config.pre_combine = test_pre_combine();
+    const bool allocate_tensors = benchmark_allocate_tensors();
+    const bool check_repeats =
+        std::getenv("WEFTMOE_BENCH_CHECK_REPEAT") != nullptr;
+    BenchmarkRepeatCheck repeat_check;
+    BenchmarkTensorAllocator tensor_allocator;
+    const weftmoe::cuda::CudaTensorAllocator allocate =
+        [&](std::uint64_t bytes) { return tensor_allocator.allocate(bytes); };
+    weftmoe::cuda::CudaTensorBuffer route_fixture, gate_fixture;
+    if (allocate_tensors) {
+      route_fixture = allocate(common_routes.selected_experts.size() *
+                               sizeof(std::int32_t));
+      gate_fixture = allocate(route_gates.size() * sizeof(float));
+      check_input_cuda(cudaMemcpy(route_fixture.data,
+                                  common_routes.selected_experts.data(),
+                                  route_fixture.bytes, cudaMemcpyHostToDevice));
+      check_input_cuda(cudaMemcpy(gate_fixture.data, route_gates.data(),
+                                  gate_fixture.bytes, cudaMemcpyHostToDevice));
+    }
+    std::uint64_t warm_misses = 0;
+    const auto rank_barrier =
+        prepare_benchmark_barrier(tensor_allocator, execution_state->stream);
     double first_use_wall_us = 0;
     double first_use_notify_pool_us = 0;
     double first_use_notify_us = 0;
@@ -3608,8 +3734,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     double first_use_forward_us = 0;
     auto forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
-      if (round == 10U)
+      if (round == 10U) {
         forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
+        warm_misses = tensor_allocator.misses;
+      }
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_PROGRESS rank=" << rank << " round=" << round
                   << std::endl;
@@ -3617,16 +3745,49 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           base, "cuda-forward-bench", generation_base + round);
       auto context = weftmoe::make_rank_collective_context(
           generation.session(), rank, execution.token());
+      if (allocate_tensors) {
+        last_output = {};
+        forward_config.tensors = {};
+        input_lease = {};
+      }
+      benchmark_rank_barrier(rank_barrier, base, execution_state->stream);
+      const auto wall_start = Clock::now();
+      last_output = {};
+      weftmoe::cuda::CudaTensorBuffer fresh_input;
+      const auto producer = weftmoe::cuda::make_external_cuda_producer(
+          context, execution.device_ordinal(), execution_state->stream,
+          execution_state, "forward-benchmark-input");
       auto routes =
           weftmoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
               route_storage, context, execution);
       auto gates =
           weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
               gate_storage, routes, context, execution);
-      // This benchmark explicitly reuses the same output tensor after its
-      // consumer has finished. Input storage and its readiness event also persist.
-      last_output = {};
-      const auto wall_start = Clock::now();
+      if (allocate_tensors) {
+        fresh_input = allocate(activation_storage->device_bytes);
+        check_input_cuda(cudaMemcpyAsync(
+            fresh_input.data, activation_storage->device_ptr, fresh_input.bytes,
+            cudaMemcpyDeviceToDevice, execution_state->stream));
+        const auto fresh_routes = allocate(route_fixture.bytes);
+        const auto fresh_gates = allocate(gate_fixture.bytes);
+        check_input_cuda(cudaMemcpyAsync(
+            fresh_routes.data, route_fixture.data, fresh_routes.bytes,
+            cudaMemcpyDeviceToDevice, execution_state->stream));
+        check_input_cuda(cudaMemcpyAsync(
+            fresh_gates.data, gate_fixture.data, fresh_gates.bytes,
+            cudaMemcpyDeviceToDevice, execution_state->stream));
+        routes = producer.publish_selected_experts(
+            static_cast<const std::int32_t *>(fresh_routes.data),
+            common_routes.selected_experts.size(), max_tokens, top_k,
+            fresh_routes.owner);
+        gates = producer.publish_gates(
+            static_cast<const float *>(fresh_gates.data), route_gates.size(),
+            routes, fresh_gates.owner);
+        routes = weftmoe::cuda::import_selected_expert_routes(routes, context,
+                                                              execution);
+        gates = weftmoe::cuda::import_selected_expert_gates(gates, routes,
+                                                            context, execution);
+      }
       if (round == 0U)
         prepare_notify_pool();
       const auto notify_start = Clock::now();
@@ -3651,20 +3812,20 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
                   generation, execution, transport_pool);
       }
-      const auto producer = weftmoe::cuda::make_external_cuda_producer(
-          context, execution.device_ordinal(), execution_state->stream,
-          execution_state, "forward-benchmark-input");
       if (!input_lease)
         input_lease = producer.publish_activations(
             static_cast<const weftmoe::transport::BFloat16 *>(
-                activation_storage->device_ptr),
-            activation_host.size(), max_tokens, hidden, activation_storage);
+                allocate_tensors ? fresh_input.data
+                                 : activation_storage->device_ptr),
+            activation_host.size(), max_tokens, hidden,
+            allocate_tensors ? fresh_input.owner : activation_storage);
       auto activations =
           weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
               input_lease, context, execution);
       if (!forward_config.tensors)
         forward_config.tensors = weftmoe::cuda::prepare_forward_tensors(
-            notify.dispatch(), execution, forward_config);
+            notify.dispatch(), execution, forward_config, {},
+            allocate_tensors ? allocate : weftmoe::cuda::CudaTensorAllocator{});
       const auto buffer_prepare_end = Clock::now();
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
         std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
@@ -3695,6 +3856,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       const auto wall_end = Clock::now();
       last_audit = output.audit();
       last_output = output;
+      if (check_repeats)
+        repeat_check.check({forward_config.tensors.buffers().output},
+                           execution_state->stream);
       if (round == 0U) {
         first_use_wall_us =
             std::chrono::duration<double, std::micro>(wall_end - wall_start)
@@ -3739,6 +3903,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     }
     const auto forward_api_after =
         weftmoe::cuda::testing::cuda_api_audit_snapshot();
+    if (allocate_tensors)
+      require(tensor_allocator.misses == warm_misses,
+              "Forward tensor cache missed after warmup");
 #if WEFTMOE_DEVICE_TIMELINE
     if (std::getenv("WEFTMOE_DEVICE_TIMELINE_PREFIX") != nullptr) {
       const std::string prefix =
@@ -3749,21 +3916,20 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           prefix);
     }
 #endif
-    require(forward_api_after.device_allocations ==
-                    forward_api_before.device_allocations &&
-                forward_api_after.device_frees ==
-                    forward_api_before.device_frees &&
-                forward_api_after.pinned_allocations ==
-                    forward_api_before.pinned_allocations &&
-                forward_api_after.pinned_frees ==
-                    forward_api_before.pinned_frees &&
-                forward_api_after.event_creates ==
-                    forward_api_before.event_creates &&
-                forward_api_after.event_destroys ==
-                    forward_api_before.event_destroys &&
-                forward_api_after.device_synchronizes ==
-                    forward_api_before.device_synchronizes,
-            "Forward steady path allocated resources or device-synchronized");
+    require(
+        forward_api_after.device_allocations ==
+                forward_api_before.device_allocations &&
+            forward_api_after.device_frees == forward_api_before.device_frees &&
+            forward_api_after.pinned_allocations ==
+                forward_api_before.pinned_allocations &&
+            forward_api_after.pinned_frees == forward_api_before.pinned_frees &&
+            (allocate_tensors || (forward_api_after.event_creates ==
+                                      forward_api_before.event_creates &&
+                                  forward_api_after.event_destroys ==
+                                      forward_api_before.event_destroys)) &&
+            forward_api_after.device_synchronizes ==
+                forward_api_before.device_synchronizes,
+        "Forward steady path allocated resources or device-synchronized");
     const auto emit_values = [](const std::vector<double> &values) {
       for (std::size_t index = 0; index < values.size(); ++index) {
         if (index != 0)
@@ -3809,19 +3975,27 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                        sizeof(downloaded_output.front())));
       require(destination.good(), "failed to write forward output artifact");
       if (std::getenv("WEFTMOE_FORWARD_DUMP_INPUTS")) {
+        const bool prefix_inputs =
+            std::string(std::getenv("WEFTMOE_FORWARD_DUMP_INPUTS")) == "prefix";
         const auto prefix = std::string(output_dir) + "/weftmoe-rank-" +
                             std::to_string(rank);
         const auto dump = [&](const std::string &suffix, const auto &values) {
           std::ofstream file(prefix + suffix, std::ios::binary);
-          file.write(reinterpret_cast<const char *>(values.data()),
-                     static_cast<std::streamsize>(values.size() *
-                                                 sizeof(values.front())));
+          const auto width = suffix == ".input.bf16" ? hidden : top_k;
+          const auto count =
+              prefix_inputs
+                  ? std::min<std::uint64_t>(values.size(),
+                                            output_elements / hidden * width)
+                  : values.size();
+          file.write(
+              reinterpret_cast<const char *>(values.data()),
+              static_cast<std::streamsize>(count * sizeof(values.front())));
           require(file.good(), "failed to write Forward input artifact");
         };
         dump(".input.bf16", activation_host);
         dump(".routes.i32", common_routes.selected_experts);
         dump(".gates.f32", route_gates);
-        if (!forward_config.pre_combine)
+        if (!forward_config.pre_combine && !prefix_inputs)
           dump(".contributions.bf16",
                weftmoe::cuda::download_forward_routes_for_validation(
                    last_output, execution));
@@ -3842,8 +4016,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
         << " specialization=sm90-wgmma-tma-" << hidden << "x" << intermediate
         << " retained_backward_state=" << retain_backward_state
-        << " reduce_scheduler=" << reduce_scheduler
-        << " timing_scope=notify-buffer-forward"
+        << " allocate_tensors=" << allocate_tensors
+        << " synchronize_ranks=" << benchmark_synchronize_ranks()
+        << " tensor_allocation_requests=" << tensor_allocator.requests
+        << " checked_repetitions=" << repeat_check.repetitions
+        << " reduce_scheduler=" << reduce_scheduler << " timing_scope="
+        << (allocate_tensors ? "allocate-copy-notify-forward"
+                             : "notify-buffer-forward")
         << " setup_us=" << one_time_setup_us
         << " first_use_wall_us=" << first_use_wall_us
         << " first_use_notify_pool_us=" << first_use_notify_pool_us

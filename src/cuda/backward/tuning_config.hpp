@@ -8,6 +8,16 @@
 // of runtime environment switches.
 #if defined(WEFTMOE_BACKWARD_USE_GENERATED_TUNING)
 #include <weftmoe_backward_tuning_generated.hpp>
+#elif defined(WEFTMOE_FORWARD_USE_GENERATED_TUNING)
+// A combined specialization may put both phases in the Forward header.
+// Read it before any defaults, independently of translation-unit include order.
+#include <weftmoe_forward_tuning_generated.hpp>
+#ifndef WEFTMOE_BWD_MAIN_HIDDEN
+#define WEFTMOE_BWD_MAIN_HIDDEN WEFTMOE_FWD_MAIN_HIDDEN
+#endif
+#ifndef WEFTMOE_BWD_MAIN_INTERMEDIATE
+#define WEFTMOE_BWD_MAIN_INTERMEDIATE WEFTMOE_FWD_MAIN_INTERMEDIATE
+#endif
 #endif
 
 #ifndef WEFTMOE_BWD_MAIN_HIDDEN
@@ -118,6 +128,17 @@ inline constexpr std::uint32_t kMainIntermediate =
 inline constexpr std::uint32_t kTileM = WEFTMOE_BWD_TILE_M;
 inline constexpr std::uint32_t kDabTileN = WEFTMOE_BWD_DAB_TILE_N;
 inline constexpr std::uint32_t kDxTileN = WEFTMOE_BWD_DX_TILE_N;
+// Pair complete M128 activation tiles along N when both projections have an
+// even number of column tiles. Both math warpgroups then do useful work and
+// the cluster reuses A. Odd column extents keep the M64 split without padding
+// a redundant N tile. No task waits for a second M-block to become ready.
+inline constexpr std::uint32_t kActivationClusterN =
+    (kMainIntermediate % (2U * kDabTileN) == 0U &&
+     kMainHidden % (2U * kDxTileN) == 0U)
+        ? 2U
+        : 1U;
+inline constexpr std::uint32_t kActivationTileM =
+    kActivationClusterN == 2U ? kTileM : kTileM / 2U;
 inline constexpr std::uint32_t kDwTileM = WEFTMOE_BWD_DW_TILE_M;
 inline constexpr std::uint32_t kDwTileN = WEFTMOE_BWD_DW_TILE_N;
 inline constexpr std::uint32_t kTileK = WEFTMOE_BWD_TILE_K;

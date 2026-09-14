@@ -67,6 +67,8 @@ def deterministic_weight(expert, kind, rows, columns, device):
 
 
 def read_numpy(path, dtype, count=None):
+    if count is not None and Path(path).stat().st_size != count * np.dtype(dtype).itemsize:
+        raise RuntimeError(f"artifact size mismatch: {path}")
     result = np.fromfile(path, dtype=dtype, count=-1 if count is None else count)
     if count is not None and result.size != count:
         raise RuntimeError(f"short artifact {path}: {result.size} != {count}")
@@ -85,11 +87,14 @@ class ErrorSummary:
         self.squared_reference = 0.0
         self.max_abs = 0.0
         self.exact = True
+        self.finite = True
 
     def add(self, reference, observed):
         reference = reference.detach()
         observed = observed.detach()
         self.exact = self.exact and torch.equal(reference, observed)
+        self.finite = self.finite and bool(
+            torch.isfinite(reference).all() and torch.isfinite(observed).all())
         difference = reference.float() - observed.float()
         self.count += difference.numel()
         self.squared_error += difference.square().sum().item()
@@ -104,18 +109,21 @@ class ErrorSummary:
         )
         maximum = torch.tensor(self.max_abs, dtype=torch.float64, device=device)
         exact = torch.tensor(int(self.exact), dtype=torch.int32, device=device)
+        finite = torch.tensor(int(self.finite), dtype=torch.int32, device=device)
         dist.all_reduce(sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
         dist.all_reduce(exact, op=dist.ReduceOp.MIN)
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         count, squared_error, squared_reference = sums.tolist()
         return {
             "all_ranks_byte_identical": bool(exact.item()),
+            "finite": bool(finite.item()),
             "max_abs_error": maximum.item(),
             "rmse": (squared_error / max(count, 1.0)) ** 0.5,
             "relative_l2": (
                 (squared_error / squared_reference) ** 0.5
                 if squared_reference != 0.0
-                else 0.0
+                else (0.0 if squared_error == 0.0 else float("inf"))
             ),
             "elements": int(count),
         }
@@ -129,6 +137,7 @@ def main():
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int)
     parser.add_argument("--top-k", type=int, choices=(1, 6, 8), default=1)
+    parser.add_argument("--max-relative-l2", type=float, default=0.01)
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -197,6 +206,14 @@ def main():
         ),
         device,
     ).reshape(incoming_rows, args.hidden)
+    source_x = [read_numpy(root / f"rank-{source}-source-x.bf16", np.uint16,
+                           args.tokens * args.hidden).reshape(args.tokens, args.hidden)
+                for source in range(world)]
+    expected_x = (np.stack([source_x[source][token] for source, token, _ in row_records])
+                  if row_records else np.empty((0, args.hidden), dtype=np.uint16))
+    if not torch.equal(canonical_x, bf16_from_raw(expected_x, device)):
+        raise RuntimeError("retained canonical X disagrees with source routing")
+    del source_x, expected_x
     cached_ab = bf16_from_raw(
         read_numpy(
             prefix.with_name(prefix.name + "canonical-ab.bf16"),
@@ -205,9 +222,9 @@ def main():
         ),
         device,
     ).reshape(2, incoming_rows, args.intermediate)
-    canonical_dr = torch.stack(
+    canonical_dr = (torch.stack(
         [all_dy[source][token] for source, token, _route in row_records]
-    )
+    ) if row_records else torch.empty((0, args.hidden), dtype=torch.bfloat16, device=device))
     canonical_gate = torch.tensor(
         [all_gates[source][route] for source, _token, route in row_records],
         dtype=torch.float32,
@@ -265,6 +282,10 @@ def main():
         ).requires_grad_(True)
         x = canonical_x[row_begin:row_end].detach().requires_grad_(True)
         projection = x @ w1.T
+        # The binary-valued fixture products sum exactly in FP32 at these
+        # sizes, so the checkpoint cast must match without an error tolerance.
+        if not torch.equal(projection.detach(), torch.cat((a.detach(), b.detach()), dim=1)):
+            raise RuntimeError("retained FC1 A/B disagrees with rebuilt projection")
         torch.autograd.backward(projection, dab)
         dx_rows[row_begin:row_end] = x.grad
         summaries["dw1"].add(w1.grad, observed_w1)
@@ -305,6 +326,8 @@ def main():
     summaries["dx"].add(reference_dx, observed_dx)
     summaries["dgate"].add(reference_dgate, observed_dgate)
     result = {name: summary.reduce(device) for name, summary in summaries.items()}
+    passed = all(r["finite"] and r["relative_l2"] <= args.max_relative_l2
+                 for r in result.values())
     if rank == 0:
         print(
             "BACKWARD_REFERENCE_JSON "
@@ -321,12 +344,18 @@ def main():
                         "top_k": top_k,
                     },
                     "accuracy": result,
+                    "passed": passed,
+                    "max_relative_l2": args.max_relative_l2,
+                    "cached_x_matches_sources": True,
+                    "cached_ab_matches_projection": True,
                 },
                 sort_keys=True,
             ),
             flush=True,
         )
     dist.destroy_process_group()
+    if not passed:
+        raise RuntimeError("Backward reference accuracy or finiteness check failed")
 
 
 if __name__ == "__main__":

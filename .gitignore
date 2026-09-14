@@ -9,3 +9,4 @@ __pycache__/
 /*.egg-info/
 /weftmoe/lib/
 /weftmoe/include/
+results/

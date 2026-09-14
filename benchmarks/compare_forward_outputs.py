@@ -19,6 +19,8 @@ def main():
                         choices=("common_forward", "native_forward"))
     parser.add_argument("--max-abs-tolerance", type=float, default=0.02)
     parser.add_argument("--rmse-tolerance", type=float, default=0.008)
+    parser.add_argument("--max-relative-l2", type=float, default=0.01)
+    parser.add_argument("--check-inputs", action="store_true")
     parser.add_argument("--relative-denominator-floor", type=float,
                         default=1.0e-3)
     args = parser.parse_args()
@@ -44,12 +46,28 @@ def main():
         equal = torch.equal(mega_bits, reference_bits)
         mega = mega_bits.view(torch.bfloat16).float()
         expected = reference.float()
+        if not (torch.isfinite(mega).all() and torch.isfinite(expected).all()):
+            raise RuntimeError(f"rank={rank} nonfinite Forward output")
+        if args.check_inputs:
+            for key, suffix, dtype in (("input", ".input.bf16", torch.int16),
+                                       ("selected", ".routes.i32", torch.int32),
+                                       ("gates", ".gates.f32", torch.float32)):
+                saved = record[key].contiguous()
+                wanted = saved.view(torch.int16) if key == "input" else saved.to(dtype)
+                path = os.path.join(args.weftmoe_dir, f"weftmoe-rank-{rank}{suffix}")
+                if os.path.getsize(path) != wanted.numel() * wanted.element_size():
+                    raise RuntimeError(f"rank={rank} malformed {key} input")
+                observed = torch.from_file(path, dtype=dtype, size=wanted.numel())
+                if not torch.equal(observed, wanted.flatten()):
+                    raise RuntimeError(f"rank={rank} {key} fixtures differ")
         absolute = (mega - expected).abs()
         relative = absolute / expected.abs().clamp_min(
             args.relative_denominator_floor)
         rmse = torch.sqrt(torch.mean((mega - expected) ** 2)).item()
+        relative_l2 = (torch.linalg.vector_norm(mega - expected) /
+                       torch.linalg.vector_norm(expected).clamp_min(1e-30)).item()
         accepted = (absolute.max().item() <= args.max_abs_tolerance and
-                    rmse <= args.rmse_tolerance)
+                    rmse <= args.rmse_tolerance and relative_l2 <= args.max_relative_l2)
         ranks.append({
             "rank": rank,
             "byte_identical": equal,
@@ -58,6 +76,7 @@ def main():
             "max_abs_error": absolute.max().item(),
             "max_relative_error": relative.max().item(),
             "rmse": rmse,
+            "relative_l2": relative_l2,
             "within_tolerance": accepted,
         })
         within_tolerance = within_tolerance and accepted
@@ -68,10 +87,12 @@ def main():
               "tolerance": {
                   "max_abs": args.max_abs_tolerance,
                   "rmse": args.rmse_tolerance,
+                  "relative_l2": args.max_relative_l2,
                   "relative_denominator_floor":
                       args.relative_denominator_floor,
               },
               "ranks": ranks}
+    result["inputs_checked"] = args.check_inputs
     print("FORWARD_OUTPUT_COMPARISON_JSON " +
           json.dumps(result, sort_keys=True))
     if not within_tolerance:

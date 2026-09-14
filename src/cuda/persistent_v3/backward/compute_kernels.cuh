@@ -6,7 +6,8 @@ constexpr std::uint32_t kActivationStages = backward_tuning::kDabStages;
 constexpr std::uint32_t kDwStages = backward_tuning::kDw1Stages;
 constexpr std::uint32_t kMathWarpGroups = 2U;
 constexpr std::uint32_t kMathThreads = kMathWarpGroups * 128U;
-constexpr std::uint32_t kActivationMathThreads = 128U;
+constexpr std::uint32_t kActivationMathThreads =
+    backward_tuning::kActivationTileM == 128U ? kMathThreads : 128U;
 constexpr std::uint32_t kStageK = backward_tuning::kTileK;
 constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 constexpr std::uint32_t kStoreReadyBarrier = 0U;
@@ -14,7 +15,8 @@ constexpr std::uint32_t kStoreDoneBarrier = 1U;
 
 template <std::uint32_t TileN>
 constexpr std::uint32_t stage_storage_elements() {
-  constexpr auto activation_elements = (kStageM / 2U + TileN) * kStageK;
+  constexpr auto activation_elements =
+      (backward_tuning::kActivationTileM + TileN) * kStageK;
   constexpr auto dw_elements =
       (backward_tuning::kDwTileM + backward_tuning::kDwTileN) * kStageK;
   return activation_elements > dw_elements ? activation_elements : dw_elements;
@@ -161,15 +163,18 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
     std::uint32_t weight_reduction_start, std::uint32_t reduction,
     std::uint32_t output_row, std::uint32_t output_column,
     unsigned char *storage, std::uint32_t &pipeline) {
-  constexpr auto TileM = kStageM / 2U;
+  constexpr auto TileM = backward_tuning::kActivationTileM;
+  constexpr bool kPairN = backward_tuning::kActivationClusterN == 2U;
   constexpr auto MajorA = cute::SM90::GMMA::Major::K;
   constexpr auto MajorB = cute::SM90::GMMA::Major::MN;
   constexpr auto StageCount = kActivationStages;
-  static_assert(TileM == 64U);
-  // Both CTAs consume the same ready M-block and the same weight slice.
-  const auto row_half = cute::block_rank_in_cluster() * TileM;
+  static_assert(TileM == 64U || TileM == 128U);
+  const auto cluster_rank = cute::block_rank_in_cluster();
+  const auto row_half = kPairN ? 0U : cluster_rank * TileM;
   const auto a_m = activation_row + row_half;
   output_row += row_half;
+  if constexpr (kPairN)
+    output_column += cluster_rank * TileN;
   static_assert(TileN == 128U || TileN == 256U);
   using TileMma = typename hopper::BF16MMASelector<TileN, MajorA, MajorB>::type;
   constexpr std::uint32_t kAStageElements = TileM * kStageK;
@@ -199,10 +204,10 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
       auto *stage_b = stage_a + kAStageElements;
       const auto k = iteration * kStageK;
       hopper::tma_load<kStageK, TileM, 128, cutlass::bfloat16_t>(
-          &activation_map, &full[stage], stage_a, k, a_m);
+          &activation_map, &full[stage], stage_a, k, a_m, kPairN ? 2U : 1U);
       hopper::tma_load<TileN, kStageK, 128, cutlass::bfloat16_t>(
           &weight_mn_map, &full[stage], stage_b, output_column,
-          weight_reduction_start + k, 2U);
+          weight_reduction_start + k, kPairN ? 1U : 2U);
       full[stage].arrive_and_expect_tx((kAStageElements + kBStageElements) *
                                        sizeof(transport::BFloat16));
     }
@@ -216,7 +221,8 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
       accum[index] = 0.0F;
     auto a_desc = hopper::make_gmma_desc<MajorA, TileM, kStageK, 128,
                                          cutlass::bfloat16_t>(
-        reinterpret_cast<cutlass::bfloat16_t *>(smem), 0U, 0U);
+        reinterpret_cast<cutlass::bfloat16_t *>(smem),
+        (threadIdx.x / 128U) * TileMma::M, 0U);
     auto b_desc = hopper::make_gmma_desc<MajorB, TileN, kStageK, 128,
                                          cutlass::bfloat16_t>(
         reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements, 0U,
