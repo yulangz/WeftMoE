@@ -49,16 +49,6 @@ class RunWorkflowTest(unittest.TestCase):
         self.assertEqual(result['topology']['ep'], 2)
         self.assertEqual(result['candidates'][0]['config']['relay_ctas'], 24)
 
-    def test_pre_combine_is_a_workload_option(self):
-        plain = workflow.run(self.model, generate_only=True)
-        combined = workflow.run(self.model, pre_combine=True, generate_only=True)
-        self.assertFalse(plain['benchmark']['pre_combine'])
-        self.assertTrue(combined['benchmark']['pre_combine'])
-        self.assertEqual(plain['candidates'], combined['candidates'])
-        with self.assertRaisesRegex(ValueError, 'forward option'):
-            workflow.run(self.model, phase='backward', pre_combine=True,
-                         generate_only=True)
-
     def test_default_and_autotune_incumbent_agree(self):
         for phase in ('forward', 'backward'):
             for nodes in (1, 2):
@@ -89,14 +79,12 @@ class RunWorkflowTest(unittest.TestCase):
         candidate = generated['candidates'][-1]
         def tune(arguments):
             self.assertIn('--skip-final', arguments)
-            self.assertIn('--pre-combine', arguments)
             path = Path(arguments[arguments.index('--output') + 1])
             path.write_text(json.dumps({'selected': dict(candidate, binary='/tmp/test-binary')}))
             return 0
         with patch.object(forward, 'main', side_effect=tune), patch.object(
                 forward, 'benchmark_candidate', return_value=dict(returncode=0, record={'measured': 30})) as benchmark:
-            result = workflow.run(self.model, tokens=1000, autotune=True, pre_combine=True)
-        self.assertTrue(benchmark.call_args.args[2]['pre_combine'])
+            result = workflow.run(self.model, tokens=1000, autotune=True)
         self.assertEqual(benchmark.call_args.args[2]['tokens_per_rank'], 1000)
         self.assertEqual(benchmark.call_args.kwargs['rounds'], 40)
         self.assertEqual(result['config'], candidate['config'])

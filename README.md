@@ -73,10 +73,6 @@ Additional arguments configure the same workflow:
 - `system`: optional system settings, including `remote`, `port`,
   `nccl_lib_dir`, and `runtime_library_path` for multi-node execution.
 - `jobs`: global compilation concurrency budget, default 16.
-- `pre_combine=True`: forward only; reduce contributions on each compute GPU
-  before Return. The default is `False`. Reduction order is fixed for the same
-  EP expert placement, including across batch sizes. Changing EP placement can
-  change the result because each GPU's partial sum is rounded to BF16.
 - `output`: result JSON path; associated logs are stored alongside it.
 - `generate_only=True`: validate and inspect the configurations without
   compiling or running GPU work.

@@ -663,7 +663,6 @@ def main():
                 result = {
                     "schema": 1,
                     "benchmark": "single-persistent-forward-main-shape",
-                    "pre_combine": bool(int(observed[0].get("pre_combine", "0"))),
                     "world": args.world,
                     "warmup": 10,
                     "measured": args.rounds - 10,

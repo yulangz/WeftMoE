@@ -30,13 +30,8 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
     auto *target = reinterpret_cast<uint4 *>(record + sizeof(ring::ReturnRow));
     const auto *source =
         reinterpret_cast<const uint4 *>(output + row * a.hidden);
-    if (forward_precombine_detail::needs_reduce(a, row)) {
-      for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
-        target[v] = forward_precombine_detail::sum_vector(a, row, v * 8ULL);
-    } else {
-      for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
-        target[v] = source[v];
-    }
+    for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
+      target[v] = source[v];
   }
   __threadfence_system();
   wire::transport_sync();
@@ -86,11 +81,6 @@ receive_dispatch(const ForwardKernelArgs &a, const wire::Transfer &task,
           target.topk_slot};
       peer_at<float>(base, a.canonical_gates_offset)[target.dst_row] =
           target.gate;
-      forward_precombine_detail::describe_remote(
-          a, base,
-          reinterpret_cast<const ForwardDispatchFanoutRecord *>(
-              record + sizeof(ring::DispatchRow)),
-          header.fanouts, index);
     }
     const auto *src = record + a.gin_rings.dispatch_row_bytes - bytes;
     auto *dst = peer_at<transport::BFloat16>(base, a.canonical_rows_offset) +
@@ -298,7 +288,7 @@ relay_role(const ForwardKernelArgs &a,
            persistent_v3::ForwardPipelineControl &control, unsigned ordinal,
            transport_state::GenerationCompletionVector *completion,
            transport_state::ContextCompletionRecord *,
-           unsigned long long *scheduler, unsigned char *storage) {
+           unsigned char *storage) {
   namespace wire = activation_ring_detail;
   __shared__ wire::Transfer task;
   __shared__ forward_return_detail::LocalReturnState local_return;
@@ -322,7 +312,7 @@ relay_role(const ForwardKernelArgs &a,
       local_notification_detail::progress(a);
     __syncthreads();
     bool progressed = forward_return_detail::progress_local_return(
-        a, control, ordinal, scheduler, local_return,
+        a, control, ordinal, local_return,
         reinterpret_cast<std::byte *>(storage), full);
     if (!threadIdx.x)
       wire::claim_receive(a, rx_return, task, false);
@@ -365,8 +355,7 @@ relay_role(const ForwardKernelArgs &a,
       }
       done = cancelled(a, control) ||
              (dispatch_done && ring_detail::receive_complete(a, false) &&
-              forward_return_detail::local_return_terminal(a, scheduler,
-                                                           local_return));
+              forward_return_detail::local_return_terminal(a, local_return));
     }
     __syncthreads();
     if (done)

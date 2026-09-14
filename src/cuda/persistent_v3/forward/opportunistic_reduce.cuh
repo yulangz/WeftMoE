@@ -1,7 +1,5 @@
 #pragma once
 
-#include "cuda/persistent_v3/forward/precombine.cuh"
-
 namespace forward_reduce_detail {
 
 // Zero denotes no published work. The CAS never reserves an unpublished entry.
@@ -35,8 +33,6 @@ struct ReduceTokenView {
   const transport::BFloat16 *local;
   transport::BFloat16 *output;
   const std::uint32_t *order;
-  const std::uint32_t *destination;
-  bool pre_combine;
   std::uint64_t hidden;
   std::uint32_t top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -54,8 +50,6 @@ reduce_token_view(const ForwardKernelArgs &a) {
       peer_at<const transport::BFloat16>(a.local_base, a.contribution_offset);
   v.output = a.output;
   v.order = a.dispatch.combine_order;
-  v.destination = a.dispatch.route_dst_rank;
-  v.pre_combine = a.pre_combine;
   v.hidden = a.hidden;
   v.top_k = a.dispatch.identity.top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -68,10 +62,9 @@ reduce_token_view(const ForwardKernelArgs &a) {
 }
 
 // Caller owns this token. First-warp execution needs no CTA-wide barrier.
-template <bool PreCombine>
 __device__ __forceinline__ bool
-reduce_token_payload_impl(const ReduceTokenView &v,
-                          unsigned long long encoded) {
+reduce_token_payload(const ReduceTokenView &v,
+                     unsigned long long encoded) {
   if (encoded == 0ULL)
     return false;
   const auto lane = threadIdx.x & 31U;
@@ -82,9 +75,6 @@ reduce_token_payload_impl(const ReduceTokenView &v,
   encoded &= (1ULL << 56U) - 1ULL;
 #endif
   const auto token = encoded - 1ULL;
-  const auto leaders = PreCombine ? forward_precombine_detail::leader_mask(
-                                        v.order, v.destination, token, v.top_k)
-                                  : ~0ULL;
 #if WEFTMOE_DEBUG_VALIDATE
   if (v.completion && lane == 0U)
     claim_completion_tasks(v.completion, transport_state::TaskClass::Reduce);
@@ -95,9 +85,6 @@ reduce_token_payload_impl(const ReduceTokenView &v,
        column += 256ULL) {
     float sum[8] = {};
     for (std::uint32_t order = 0U; order < v.top_k; ++order) {
-      if constexpr (PreCombine)
-        if ((leaders & (1ULL << order)) == 0ULL)
-          continue;
       const auto slot = v.order[token * v.top_k + order];
       const auto route = token * v.top_k + slot;
       const auto *source = v.local + route * v.hidden + column;
@@ -135,14 +122,6 @@ reduce_token_payload_impl(const ReduceTokenView &v,
         v.control->reduce_tokens_complete.value, 1ULL);
   }
   return true;
-}
-
-// Choose the arithmetic loop once per token. The disabled mode keeps the
-// original straight top-k loop with no per-contribution membership checks.
-__device__ __forceinline__ bool
-reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded) {
-  return v.pre_combine ? reduce_token_payload_impl<true>(v, encoded)
-                       : reduce_token_payload_impl<false>(v, encoded);
 }
 
 __device__ __forceinline__ bool

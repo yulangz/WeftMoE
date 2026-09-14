@@ -4453,9 +4453,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_reduce_ready_token_offset =
       layout.forward_reduce_ready_token;
   args.forward_return_rows_offset = layout.forward_return_rows;
-  args.pre_combine = config.pre_combine && id.top_k > 1U;
-  args.forward_precombine_groups_offset = layout.forward_precombine_groups;
-  args.forward_precombine_arrived_offset = layout.forward_precombine_arrived;
   args.forward_return_queues_offset = layout.forward_return_queues;
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;

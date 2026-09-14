@@ -2,7 +2,6 @@
 
 #include "cuda/communication/activation_ring.cuh"
 #include "cuda/persistent_v3/forward/opportunistic_reduce.cuh"
-#include "cuda/persistent_v3/forward/precombine.cuh"
 #include "cuda/persistent_v3/forward/return_pipeline.cuh"
 
 // Included by activation_transport.cu after the private Forward launch
@@ -120,7 +119,6 @@ __device__ __forceinline__ void publish_local_batch(
                               topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
-      forward_precombine_detail::describe_local(a, route);
       destination_gates[row] = gate;
       auto *destination_rows = peer_at<transport::BFloat16>(
           a.peer_bases[destination], a.canonical_rows_offset);
@@ -218,7 +216,6 @@ __device__ __forceinline__ void publish_local_batch(
                               topk_slot};
       auto *destination_gates = peer_at<float>(
           a.peer_bases[destination], a.canonical_gates_offset);
-      forward_precombine_detail::describe_local(a, route);
       destination_gates[row] = gate;
     }
     destination = __shfl_sync(0xffffffffU, destination, 0U);
@@ -469,7 +466,6 @@ local_relay_role(const ForwardKernelArgs &a,
             static_cast<std::uint32_t>(route % a.dispatch.identity.top_k)};
         peer_at<float>(a.peer_bases[destination],
                        a.canonical_gates_offset)[row] = a.gates[route];
-        forward_precombine_detail::describe_local(a, route);
         peer_rows += destination != a.rank;
       }
       __syncwarp();
@@ -586,13 +582,13 @@ local_relay_role(const ForwardKernelArgs &a,
     } else {
       while (local_return_done == 0U && !cancelled(a, control)) {
         const bool progressed = forward_return_detail::progress_local_return(
-            a, control, context, scheduler, local_return_state,
+            a, control, context, local_return_state,
             reinterpret_cast<std::byte *>(storage), copy_full, kReturnThreads);
         if (!progressed && threadIdx.x < 32U)
           forward_reduce_detail::try_reduce_one_token(a);
         if (threadIdx.x == 0U) {
           if (forward_return_detail::local_return_terminal(
-                  a, scheduler, local_return_state)) {
+                  a, local_return_state)) {
             ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
                 local_return_done)
                 .store(1U, ::cuda::memory_order_release);
@@ -630,8 +626,7 @@ __device__ __forceinline__ void dispatch_role(
   }
   const auto relay =
       static_cast<std::uint32_t>(blockIdx.x - forward_relay_cta_begin);
-  relay_role(a, control, relay, completion, context_completion, scheduler,
-             storage);
+  relay_role(a, control, relay, completion, context_completion, storage);
 }
 
 } // namespace forward_dispatch_detail

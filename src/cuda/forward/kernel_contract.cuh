@@ -40,9 +40,6 @@ struct ForwardKernelArgs {
   std::size_t gin_return_send_rows_offset = 0;
   std::size_t gin_return_receive_rows_offset = 0;
   std::size_t forward_return_rows_offset = 0;
-  bool pre_combine = false;
-  std::size_t forward_precombine_groups_offset = 0;
-  std::size_t forward_precombine_arrived_offset = 0;
   std::size_t gin_production_error_records_offset = 0;
   std::uint32_t node = 0;
   std::uint32_t local_world_size = 0;

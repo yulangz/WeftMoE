@@ -1,46 +1,38 @@
 {
   "schema": 1,
   "scope": "BF16 routed-expert training on the recorded two-node SM90 platform; token counts are per rank",
-  "selection": "primary pre_combine=false Forward+Backward profile; retune other shapes/topologies with tools/run.py",
+  "selection": "Forward+Backward profile; retune other shapes/topologies with tools/run.py",
   "cases": {
     "qwen_ep8_t8192": {
       "profile": "qwen_ep8",
-      "pre_combine": false,
       "flex_sms": 80
     },
     "qwen_ep8_t65536": {
       "profile": "qwen_ep8_64k",
-      "pre_combine": false,
       "flex_sms": 80
     },
     "qwen_ep16_t8192": {
       "profile": "qwen_ep16",
-      "pre_combine": false,
       "flex_sms": 48
     },
     "qwen_ep16_t65536": {
       "profile": "qwen_ep16",
-      "pre_combine": false,
       "flex_sms": 48
     },
     "flash_ep8_t8192": {
       "profile": "flash_ep8",
-      "pre_combine": false,
       "flex_sms": 80
     },
     "flash_ep8_t65536": {
       "profile": "flash_ep8",
-      "pre_combine": false,
       "flex_sms": 80
     },
     "flash_ep16_t8192": {
       "profile": "flash_ep16",
-      "pre_combine": false,
       "flex_sms": 48
     },
     "flash_ep16_t65536": {
       "profile": "flash_ep16",
-      "pre_combine": false,
       "flex_sms": 48
     }
   },

@@ -58,32 +58,16 @@ __device__ __forceinline__ void initialize(const Args &a) {
   }
 }
 
-template <class Args>
-__device__ __forceinline__ bool producers_complete(const Args &) {
-  return false;
-}
-
-__device__ __forceinline__ bool producers_complete(const ForwardKernelArgs &a) {
-  if (!a.pre_combine)
-    return false;
-  const auto *scheduler = peer_at<const unsigned long long>(
-      a.local_base, a.forward_scheduler_offset);
-  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-      a.local_base, a.forward_v3_control_offset);
-  return persistent_v3::load_acquire<::cuda::thread_scope_device>(
-             control->return_producers_complete.value) >= scheduler[3];
-}
-
-template <unsigned Threads, class Args, class RowAt, class Cancelled>
-__device__ __noinline__ void publish_selected(const Args &a, unsigned rows,
-                                              unsigned *scratch, RowAt row_at,
-                                              Cancelled cancelled) {
+template <unsigned Threads, class Args, class Cancelled>
+__device__ __noinline__ void publish(const Args &a, unsigned long long first,
+                                     unsigned rows, unsigned *scratch,
+                                     Cancelled cancelled) {
   constexpr auto warps = Threads / 32U;
   const auto warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
   auto *entries = peer_at<unsigned>(a.local_base, a.forward_return_rows_offset);
   const auto *headers =
       peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
-  const auto row = threadIdx.x < rows ? row_at(threadIdx.x) : ~0ULL;
+  const auto row = threadIdx.x < rows ? first + threadIdx.x : ~0ULL;
   auto pending = row != ~0ULL ? index(a, headers[row].source_rank) : UINT32_MAX;
   auto *base = reinterpret_cast<unsigned long long *>(scratch + 16U);
   while (true) {
@@ -118,7 +102,7 @@ __device__ __noinline__ void publish_selected(const Args &a, unsigned rows,
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
               q.reserved)
               .fetch_add(count, ::cuda::memory_order_relaxed);
-      // Notify counted an upper bound on these rows; overflow is a protocol
+      // Notify counted these rows exactly; overflow is a protocol
       // error, never a reason to truncate a skewed batch.
       if (*base + count > q.capacity)
         asm volatile("trap;");
@@ -148,11 +132,4 @@ __device__ __noinline__ void publish_selected(const Args &a, unsigned rows,
   }
 }
 
-template <unsigned Threads, class Args, class Cancelled>
-__device__ __forceinline__ void publish(const Args &a, unsigned long long row,
-                                        unsigned rows, unsigned *scratch,
-                                        Cancelled cancelled) {
-  publish_selected<Threads>(
-      a, rows, scratch, [&](unsigned i) { return row + i; }, cancelled);
-}
 } // namespace return_queue_detail

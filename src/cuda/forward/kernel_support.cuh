@@ -541,8 +541,6 @@ struct Layout {
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
   std::size_t forward_return_rows = 0;
-  std::size_t forward_precombine_groups = 0;
-  std::size_t forward_precombine_arrived = 0;
   std::size_t forward_return_queues = 0;
   std::size_t local_notifications = 0;
   unsigned local_notification_ctas = 0;
@@ -1008,13 +1006,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_return_rows = append(
         cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
         "forward return row queues");
-    layout.forward_precombine_groups =
-        append(cursor, config.max_destination_rows_per_rank,
-               sizeof(persistent_v3::ForwardPrecombineGroup),
-               "forward pre-combine groups");
-    layout.forward_precombine_arrived =
-        append(cursor, config.max_destination_rows_per_rank,
-               sizeof(std::uint32_t), "forward pre-combine completion counts");
     layout.local_notification_ctas = std::max(
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
             persistent_v3::kRdmaCtaCount,

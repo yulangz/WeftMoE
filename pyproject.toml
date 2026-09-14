@@ -14,3 +14,6 @@ license-files = ["LICENSE"]
 [tool.setuptools]
 packages = ["weftmoe"]
 include-package-data = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

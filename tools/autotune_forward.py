@@ -330,7 +330,7 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
     flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
-        "tune_rounds", "final_rounds", "timeout_seconds", "result_dir", "pre_combine"}),
+        "tune_rounds", "final_rounds", "timeout_seconds", "result_dir"}),
         "benchmark contains model/system fields or unknown settings")
     count = 1
     for values in flat.values():
@@ -392,8 +392,6 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
              "benchmark must be an object")
     benchmark = document["benchmark"]
     launcher = benchmark.get("launcher", "multinode")
-    _require(type(benchmark.get("pre_combine", False)) is bool,
-             "benchmark.pre_combine must be boolean")
     _require(launcher in ("multinode", "local"),
              "benchmark.launcher must be multinode or local")
     common_benchmark_keys = (
@@ -711,8 +709,6 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
         int(benchmark["tokens_per_rank"]))
     run_environment["WEFTMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))
     run_environment["WEFTMOE_FORWARD_BENCH_ROUNDS"] = str(rounds)
-    run_environment["WEFTMOE_FORWARD_PRE_COMBINE"] = str(
-        int(benchmark.get("pre_combine", False)))
     run_environment["WEFTMOE_FORWARD_BENCH_GENERATION_BASE"] = str(
         int(benchmark["generation_base"]))
     if "experts" in benchmark:
@@ -808,8 +804,6 @@ def _configure_from_cli(plan: dict[str, Any], args: argparse.Namespace) -> None:
         benchmark["port"] = args.port
     if args.nccl_lib_dir is not None:
         benchmark["nccl_lib_dir"] = args.nccl_lib_dir
-    if args.pre_combine is not None:
-        benchmark["pre_combine"] = args.pre_combine
     if args.tune_rounds is not None:
         benchmark["tune_rounds"] = args.tune_rounds
     if args.final_rounds is not None:
@@ -835,8 +829,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--experts", type=int)
     parser.add_argument("--top-k", type=int)
-    parser.add_argument("--pre-combine", action=argparse.BooleanOptionalAction,
-                        default=None, help="sum per-GPU contributions before Return; changes cross-EP rounding")
     parser.add_argument("--tokens", type=int)
     parser.add_argument("--candidate", action="append", default=[],
                         help="run only this named candidate (repeatable)")

@@ -4,10 +4,13 @@ Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).
 
-The completed EP8/EP16 comparison is in
+The archived EP8/EP16 comparison is in
 [the 2026-09-13 report](performance_20260913.md), with
 [statistics and raw timing samples](performance_20260913.json) and
 [exported FWD/BWD profiles](../configs/performance_20260913/profiles.json).
+The report identifies its frozen source revision; use that revision's tools to
+reproduce its historical runs. Current comparison manifests use schema 2 and
+are measured independently of that archive.
 
 - `megatron_dispatch_baseline.py` and `megatron_backward_baseline.py` measure
   Megatron/Flex FWD and cached-state BWD.

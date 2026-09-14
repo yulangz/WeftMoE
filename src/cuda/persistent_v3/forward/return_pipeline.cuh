@@ -2,7 +2,6 @@
 
 #include "cuda/communication/notification_pipeline.cuh"
 #include "cuda/communication/return_queue.cuh"
-#include "cuda/persistent_v3/forward/precombine.cuh"
 
 // FC2 publishes canonical row IDs. Relay consumes the local queue; each fixed
 // GIN owner consumes its remote queue. A separate arrival queue carries compact
@@ -62,22 +61,8 @@ publish_rows(const ForwardKernelArgs &a, unsigned long long row,
              unsigned int rows, unsigned int *scratch) {
   auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
       a.local_base, a.forward_v3_control_offset);
-  if (a.pre_combine) {
-    // Queue prefix scratch occupies the first 18 words. The remaining dead
-    // operand storage holds one winner per completed row.
-    auto *leaders = reinterpret_cast<unsigned long long *>(scratch + 32U);
-    forward_precombine_detail::complete_groups<MathThreads>(a, row, rows,
-                                                            leaders);
-    return_queue_detail::publish_selected<MathThreads>(
-        a, rows, scratch, [&](unsigned i) { return leaders[i]; },
-        [&] { return cancelled(a, *control); });
-  } else {
-    return_queue_detail::publish<MathThreads>(
-        a, row, rows, scratch, [&] { return cancelled(a, *control); });
-  }
-  if (threadIdx.x == 0U)
-    persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
-        control->return_producers_complete.value, 1ULL);
+  return_queue_detail::publish<MathThreads>(
+      a, row, rows, scratch, [&] { return cancelled(a, *control); });
 }
 
 struct LocalReturnState {
@@ -87,19 +72,13 @@ struct LocalReturnState {
 };
 
 __device__ __forceinline__ bool
-local_return_terminal(const ForwardKernelArgs &a, unsigned long long *scheduler,
+local_return_terminal(const ForwardKernelArgs &a,
                       const LocalReturnState &state) {
-  auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-      a.local_base, a.forward_v3_control_offset);
+  auto &queue = return_queue_detail::queues(a)[state.queue_index];
+  // Notify supplies the exact row count. Every claim follows publication,
+  // so no separate producer-completion counter is needed for an empty queue.
   return persistent_v3::load_acquire<::cuda::thread_scope_device>(
-             control->return_producers_complete.value) >= scheduler[3] &&
-         persistent_v3::load_acquire<::cuda::thread_scope_device>(
-             return_queue_detail::queues(a)[state.queue_index].head) ==
-             (a.pre_combine
-                  ? persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                        return_queue_detail::queues(a)[state.queue_index]
-                            .confirmed)
-                  : return_queue_detail::queues(a)[state.queue_index].capacity);
+             queue.head) == queue.capacity;
 }
 
 __device__ __forceinline__ void copy_sync(unsigned threads) {
@@ -109,7 +88,7 @@ __device__ __forceinline__ void copy_sync(unsigned threads) {
 __device__ __forceinline__ bool
 progress_local_return(const ForwardKernelArgs &a,
                       persistent_v3::ForwardPipelineControl &control,
-                      unsigned int context, unsigned long long *,
+                      unsigned int context,
                       LocalReturnState &state, std::byte *tma_storage,
                       ReturnCopyBarrier *tma_full, unsigned threads = 0U) {
   if (!threads)
@@ -151,38 +130,20 @@ progress_local_return(const ForwardKernelArgs &a,
     auto *dst = peer_at<transport::BFloat16>(a.peer_bases[header.source_rank],
                                              a.contribution_offset) +
                 header.route_index * a.hidden;
-    const bool grouped = forward_precombine_detail::needs_reduce(a, row);
     if (tma) {
       auto *storage = tma_storage + warp * copy_bytes;
-      if (grouped) {
-        for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
-          reinterpret_cast<uint4 *>(storage)[v] =
-              forward_precombine_detail::sum_vector(a, row, v * 8ULL);
-        cute::tma_store_fence();
-        __syncwarp();
-      }
       if (lane == 0U) {
-        if (!grouped) {
-          auto &full = tma_full[warp];
-          ::cuda::device::experimental::cp_async_bulk_global_to_shared(
-              storage, src, copy_bytes, full);
-          auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, copy_bytes);
-          full.wait(static_cast<decltype(ticket) &&>(ticket));
-        }
+        auto &full = tma_full[warp];
+        ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+            storage, src, copy_bytes, full);
+        auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, copy_bytes);
+        full.wait(static_cast<decltype(ticket) &&>(ticket));
         ::cuda::device::experimental::cp_async_bulk_shared_to_global(
             dst, storage, copy_bytes);
         ::cuda::device::experimental::cp_async_bulk_commit_group();
         ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
         copied = true;
       }
-      // All lanes can write the next partial sum. Join the issuer's read wait
-      // before any lane reuses this row's shared storage.
-      if (a.pre_combine)
-        __syncwarp();
-    } else if (grouped) {
-      for (auto v = lane; v < a.hidden / 8ULL; v += 32U)
-        reinterpret_cast<uint4 *>(dst)[v] =
-            forward_precombine_detail::sum_vector(a, row, v * 8ULL);
     } else {
       for (unsigned long long v = lane; v < a.hidden / 8ULL; v += 32ULL)
         reinterpret_cast<uint4 *>(dst)[v] =

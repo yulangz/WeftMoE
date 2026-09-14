@@ -1932,48 +1932,6 @@ void test_bootstrap_real_pipe_one_shot() {
   REQUIRE(::close(replacement[0]) == 0);
 }
 
-void test_precombine_canonical_groups() {
-  using weftmoe::cuda::persistent_v3::precombine_group;
-  const std::array<unsigned, 8> destinations{4, 1, 4, 7, 1, 4, 7, 0};
-  const std::array<unsigned long long, 8> rows{
-      900, 82, 100000, 12, 91, 8000000000ULL, 15, 3};
-  for (auto batch_offset : {0ULL, 123456ULL}) {
-    for (unsigned i = 0; i < rows.size(); ++i) {
-      const auto group = precombine_group(
-          rows.size(), destinations[i], rows[i] + batch_offset,
-          [&](unsigned j) { return destinations[j]; },
-          [&](unsigned j) { return rows[j] + batch_offset; });
-      std::vector<unsigned long long> expected;
-      for (unsigned j = 0; j < rows.size(); ++j)
-        if (destinations[j] == destinations[i])
-          expected.push_back(rows[j] + batch_offset);
-      REQUIRE(group.leader == expected.front());
-      REQUIRE(group.count == expected.size());
-      const auto at =
-          std::find(expected.begin(), expected.end(), rows[i] + batch_offset);
-      REQUIRE(group.next == (at + 1 == expected.end() ? ~0ULL : *(at + 1)));
-    }
-  }
-  const auto single = precombine_group(
-      1, 2, 99, [](unsigned) { return 2U; }, [](unsigned) { return 99ULL; });
-  REQUIRE(single.leader == 99ULL && single.next == ~0ULL && single.count == 1U);
-  // A GIN packet filters out other nodes without reordering its fanout. The
-  // group seen by the receiver must equal the source's complete route group.
-  const std::array<unsigned, 5> packet_indices{0, 2, 3, 5, 6};
-  for (unsigned i : packet_indices) {
-    const auto source = precombine_group(
-        8, destinations[i], rows[i],
-        [&](unsigned j) { return destinations[j]; },
-        [&](unsigned j) { return rows[j]; });
-    const auto received = precombine_group(
-        packet_indices.size(), destinations[i], rows[i],
-        [&](unsigned j) { return destinations[packet_indices[j]]; },
-        [&](unsigned j) { return rows[packet_indices[j]]; });
-    REQUIRE(source.leader == received.leader && source.next == received.next &&
-            source.count == received.count);
-  }
-}
-
 void test_forward_multicast_task_pairs() {
   using weftmoe::cuda::persistent_v3::fc1_group_task;
   for (unsigned mblocks = 1; mblocks <= 8; ++mblocks) {
@@ -2024,7 +1982,6 @@ void test_backward_multicast_task_pairs() {
 
 int main() {
   const std::vector<std::pair<const char *, std::function<void()>>> tests{
-      {"precombine_canonical_groups", test_precombine_canonical_groups},
       {"forward_multicast_task_pairs", test_forward_multicast_task_pairs},
       {"backward_multicast_task_pairs", test_backward_multicast_task_pairs},
       {"rank_local_async_and_deterministic_mapping",

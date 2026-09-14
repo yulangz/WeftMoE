@@ -217,13 +217,6 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
     forward_compute_pair_mailboxes[pair].tasks[1] = 0ULL;
     forward_compute_pair_mailboxes[pair].metadata = 0ULL;
   }
-  if (a.pre_combine) {
-    auto *arrived =
-        peer_at<unsigned>(a.local_base, a.forward_precombine_arrived_offset);
-    for (auto row = 1ULL * blockIdx.x * blockDim.x + threadIdx.x;
-         row < a.max_destination_rows; row += 1ULL * gridDim.x * blockDim.x)
-      arrived[row] = 0U;
-  }
   if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
     for (std::uint64_t token =
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

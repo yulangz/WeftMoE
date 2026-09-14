@@ -132,7 +132,6 @@ def aggregate_gin_benchmark(outputs):
             "top_k": int(records[0]["top_k"]),
         },
         "reduce_scheduler": records[0]["reduce_scheduler"],
-        "pre_combine": bool(int(records[0].get("pre_combine", "0"))),
         "per_rank_cluster_actual": [int(row.get("cluster_actual", "0"))
                                     for row in records],
         "per_rank_cluster_rank_mask": [int(row.get("cluster_rank_mask", "0"))
@@ -318,7 +317,6 @@ def environment_overrides(args):
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
         "WEFTMOE_BENCH_ALLOCATE_TENSORS",
         "WEFTMOE_BENCH_CHECK_REPEAT",
-        "WEFTMOE_FORWARD_PRE_COMBINE",
         "WEFTMOE_TEST_ROUTE_STRIDE",
         "WEFTMOE_TEST_TOKEN_OFFSET",
         "WEFTMOE_FORWARD_REPARTITION_EP8",

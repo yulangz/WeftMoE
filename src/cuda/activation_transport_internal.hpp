@@ -183,8 +183,8 @@ public:
 
 std::vector<transport::BFloat16> download_forward_output_for_validation(
     const DeviceForwardHandle &, const CudaExecution &);
-// Snapshot before reusing the execution workspace. With pre-combine disabled,
-// this exposes each FC2 route separately for a deterministic combine oracle.
+// Snapshot each FC2 route before reusing the execution workspace, for a
+// deterministic combine oracle.
 std::vector<transport::BFloat16>
 download_forward_routes_for_validation(const DeviceForwardHandle &,
                                        const CudaExecution &);

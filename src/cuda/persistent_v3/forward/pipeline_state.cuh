@@ -24,39 +24,6 @@ static_assert(sizeof(ForwardComputePairMailbox) == 32U);
 
 inline constexpr unsigned long long kNoInputGroup = ~0ULL;
 
-// Immutable links in canonical expert order, built during Dispatch. Counters
-// live separately and are cleared before any rank can publish Dispatch data.
-// In particular, a late leader row must never reset an already active counter.
-struct ForwardPrecombineGroup {
-  unsigned long long leader = ~0ULL;
-  unsigned long long next = ~0ULL;
-  std::uint32_t count = 0;
-};
-
-static_assert(sizeof(ForwardPrecombineGroup) == 24U);
-
-// Both the source route list and a GIN packet's fanout use canonical order.
-// Filtering either list by destination therefore constructs the same group.
-template <class Destination, class Row>
-WEFTMOE_V3_HOST_DEVICE constexpr ForwardPrecombineGroup
-precombine_group(std::uint32_t size, std::uint32_t destination,
-                 unsigned long long row, Destination destination_at,
-                 Row row_at) {
-  ForwardPrecombineGroup result;
-  bool after = false;
-  for (std::uint32_t i = 0; i < size; ++i) {
-    if (destination_at(i) != destination)
-      continue;
-    const auto member = row_at(i);
-    if (result.count++ == 0U)
-      result.leader = member;
-    if (after && result.next == ~0ULL)
-      result.next = member;
-    after |= member == row;
-  }
-  return result;
-}
-
 // Owned by one destination-local publisher for the entire execution. Advance
 // tile_cursor only after all rows of that Notify tile have arrived; completed
 // dependencies never need to be checked again.
@@ -171,7 +138,6 @@ struct alignas(128) ForwardPipelineControl {
   PaddedCounter rdma_return_roles_complete;
   PaddedCounter return_receive_roles_complete;
   PaddedCounter source_ready_published;
-  PaddedCounter return_producers_complete;
   // A route publisher increments one source-token counter after making its
   // contribution visible.  The publisher that completes top-k appends that
   // token to the ready queue.  Compute CTAs consume the queue in small batches

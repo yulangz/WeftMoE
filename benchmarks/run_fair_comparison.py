@@ -3,8 +3,7 @@
 
 Two passes reverse implementation and case order. Each measurement has ten
 warmups and independent per-rank maximum wall-time samples. Both native phases
-use one combined binary. Pre-combine Forward receives an additional first-pass
-measurement for both before and after. Run only after all builds have finished.
+use one combined binary. Run only after all builds have finished.
 """
 from __future__ import annotations
 
@@ -55,14 +54,14 @@ def main():
                     binary = Path(record["build"]["binary"])
                     binaries[str(binary)] = hashlib.sha256(binary.read_bytes()).hexdigest()
                     shutil.copy2(path, destination / filename)
-    manifest = dict(schema=1, iterations=args.iterations, passes=args.passes,
+    manifest = dict(schema=2, iterations=args.iterations, passes=args.passes,
                     warmups=10, tokens="per rank", binary_sha256=binaries,
                     rank_synchronization="untimed NCCL collective before every native/Flex iteration",
                     flex_selection=selection, execution_order=[])
     manifest_path = args.output / "manifest.json"
     if manifest_path.exists():
         old = json.loads(manifest_path.read_text())
-        for key in ("binary_sha256", "flex_selection", "iterations", "passes", "rank_synchronization"):
+        for key in ("schema", "binary_sha256", "flex_selection", "iterations", "passes", "rank_synchronization"):
             if old.get(key) != manifest[key]:
                 raise ValueError(f"cannot resume with changed {key}")
         manifest = old
@@ -81,8 +80,8 @@ def main():
                     remote=args.remote, port=args.port, socket_ifname=args.socket_ifname,
                     models=[model], eps=[ep], tokens=[tokens],
                     phases=["forward", "backward"], iterations=args.iterations,
-                    label=f"pass{repetition + 1}_pc0", check_repeats=False,
-                    pre_combine=False, dump_output=None, dump_tokens=8192,
+                    label=f"pass{repetition + 1}", check_repeats=False,
+                    dump_output=None, dump_tokens=8192,
                     flex_sms=int(selection[case]),
                     validation_repeats=2 if repetition == 0 else 0)
                 entry = dict(case=case, implementation=implementation,
@@ -99,11 +98,6 @@ def main():
                     matrix.flex(call)
                 else:
                     matrix.weft(call)
-                    if repetition == 0:
-                        call.pre_combine = True
-                        call.phases = ["forward"]
-                        call.label = "pass1_pc1"
-                        matrix.weft(call)
                 entry["complete"] = datetime.now(timezone.utc).isoformat()
                 matrix.save(manifest_path, manifest)
     manifest["completed"] = True

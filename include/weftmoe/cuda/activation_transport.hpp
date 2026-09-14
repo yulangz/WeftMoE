@@ -162,10 +162,6 @@ struct ForwardMegaKernelConfig {
   // enable_backward_state=true.
   bool retain_backward_state = false;
   ForwardTensorStorage tensors{};
-  // Sum a token's contributions on each compute GPU before Return. All EP
-  // ranks must agree. The expert order is fixed within an EP placement, but
-  // the extra BF16 rounding can change results when the placement changes.
-  bool pre_combine = false;
 };
 
 class ForwardWeightLease {

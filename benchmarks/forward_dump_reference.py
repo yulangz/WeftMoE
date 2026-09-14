@@ -16,7 +16,7 @@ import numpy as np
 from forward_fp64_reference import bf16_bits_to_float64, quantize_bf16, weight
 
 
-def reference(x, routes, gates, columns, intermediate, experts, world, pre_combine):
+def reference(x, routes, gates, columns, intermediate):
     hidden = len(x)
     input_columns = np.arange(hidden, dtype=np.uint32)[None, :]
     output_columns = np.asarray(columns, dtype=np.uint32)[:, None]
@@ -34,16 +34,9 @@ def reference(x, routes, gates, columns, intermediate, experts, world, pre_combi
         sigmoid = np.float32(1) / (np.float32(1) + np.exp(-a))
         u = quantize_bf16(((a * sigmoid) * b) * np.float32(gates[slot]))
         y = quantize_bf16(weight(expert, 2, output_columns, k) @ u)
-        contributions.append((expert // (experts // world), y.astype(np.float32)))
-    if pre_combine:
-        groups = {}
-        for owner, y in contributions:
-            groups.setdefault(owner, np.zeros(len(columns), dtype=np.float32))
-            groups[owner] += y
-        contributions = [(owner, quantize_bf16(y).astype(np.float32))
-                         for owner, y in groups.items()]
+        contributions.append(y.astype(np.float32))
     total = np.zeros(len(columns), dtype=np.float32)
-    for _, y in contributions:
+    for y in contributions:
         total += y
     return quantize_bf16(total)
 
@@ -59,7 +52,6 @@ def main():
     parser.add_argument("--world", type=int, required=True)
     parser.add_argument("--ranks", type=int, nargs="+", default=[0, 7])
     parser.add_argument("--tokens", type=int, nargs="+", default=[0, 1, 127, 8191])
-    parser.add_argument("--pre-combine", action="store_true")
     parser.add_argument("--max-relative-l2", type=float, default=0.01)
     args = parser.parse_args()
     if min(args.hidden, args.intermediate, args.experts, args.world, args.top_k) <= 0:
@@ -88,8 +80,7 @@ def main():
             if not 0 <= token < len(x):
                 parser.error("sample token outside dump")
             ref = reference(bf16_bits_to_float64(x[token]), routes[token],
-                            gates[token], columns, args.intermediate,
-                            args.experts, args.world, args.pre_combine)
+                            gates[token], columns, args.intermediate)
             expected.extend(ref)
             observed.extend(bf16_bits_to_float64(y[token, columns]))
             coordinates.extend([[rank, token, column] for column in columns])
@@ -106,7 +97,7 @@ def main():
                   implementation="NumPy FP64 dot products with BF16 phase casts",
                   shape=dict(hidden=args.hidden, intermediate=args.intermediate,
                              experts=args.experts, top_k=args.top_k, world=args.world),
-                  pre_combine=args.pre_combine, directory=str(args.directory),
+                  directory=str(args.directory),
                   coordinates=coordinates, reference=expected, observed=observed,
                   relative_l2=relative_l2, max_abs=max_abs,
                   rmse=float(np.sqrt(np.mean(diff * diff))),

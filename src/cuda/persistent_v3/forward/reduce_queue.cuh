@@ -11,25 +11,12 @@ publish_ready_route(const ForwardKernelArgs &a, std::uint64_t route,
                     std::uint32_t publisher_kind) {
   const auto top_k = a.dispatch.identity.top_k;
   const auto token = route / top_k;
-  unsigned routes = 1U;
-  if (a.pre_combine) {
-    routes = 0U;
-    for (unsigned slot = 0; slot < top_k; ++slot)
-      routes += a.dispatch.route_dst_rank[token * top_k + slot] ==
-                a.dispatch.route_dst_rank[route];
-  }
   if (!a.forward_dynamic_reduce_queue) {
     auto *ready =
         peer_at<unsigned long long>(a.local_base, a.return_ready_epoch_offset);
-    for (unsigned slot = 0; slot < (a.pre_combine ? top_k : 1U); ++slot) {
-      const auto member = a.pre_combine ? token * top_k + slot : route;
-      if (a.pre_combine &&
-          a.dispatch.route_dst_rank[member] != a.dispatch.route_dst_rank[route])
-        continue;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-          ready[member])
-          .store(execution_epoch(a), ::cuda::memory_order_release);
-    }
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+        ready[route])
+        .store(execution_epoch(a), ::cuda::memory_order_release);
     return;
   }
 
@@ -43,10 +30,10 @@ publish_ready_route(const ForwardKernelArgs &a, std::uint64_t route,
   // before releasing the token queue entry to Reduce.
   // A single route needs no fan-in counter; its queue release orders payload.
   const auto previous =
-      top_k == 1U ? 0U : count.fetch_add(routes, ::cuda::memory_order_acq_rel);
+      top_k == 1U ? 0U : count.fetch_add(1U, ::cuda::memory_order_acq_rel);
   const auto lane = threadIdx.x % 32U;
   const auto completed =
-      __ballot_sync(__activemask(), previous + routes == top_k);
+      __ballot_sync(__activemask(), previous + 1U == top_k);
   if ((completed & (1U << lane)) == 0U)
     return;
 

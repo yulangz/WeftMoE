@@ -150,7 +150,7 @@ def weft(args):
                     built = json.loads((args.output / f"{key}.build.json").read_text())
                     module, config = plan(args, model, ep, phase)
                     benchmark = dict(config["benchmark"], tokens_per_rank=tokens,
-                                     timeout_seconds=600, pre_combine=args.pre_combine)
+                                     timeout_seconds=600)
                     name = f"{key}_t{tokens}_{args.label}"
                     path = args.output / f"{name}.json"
                     if path.exists():
@@ -161,7 +161,6 @@ def weft(args):
                                 raise RuntimeError(f"existing record has a different timing scope; use a new label/output: {path}")
                             continue
                     run_env = dict(env)
-                    run_env["WEFTMOE_FORWARD_PRE_COMBINE"] = str(int(args.pre_combine))
                     if args.dump_output and phase == "forward":
                         directory = args.dump_output.resolve() / name
                         directory.mkdir(parents=True, exist_ok=True)
@@ -261,7 +260,6 @@ def main():
     parser.add_argument("--flex-sms", type=int)
     parser.add_argument("--label", default="screen")
     parser.add_argument("--check-repeats", action="store_true")
-    parser.add_argument("--pre-combine", action="store_true")
     parser.add_argument("--repartition", action="store_true",
                         help="split each EP8 source shard into two EP16 shards (Forward validation)")
     parser.add_argument("--dump-output", type=Path)

@@ -41,7 +41,6 @@ def main():
     parser.add_argument("--experts", type=int,
                         help="global expert count; default is max(16, 2 * EP)")
     parser.add_argument("--top-k", type=int, choices=(1, 6, 8), required=True)
-    parser.add_argument("--pre-combine", action="store_true")
     parser.add_argument("--remote", default="root@10.10.19.233")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--socket-ifname", default="bond0")
@@ -65,8 +64,7 @@ def main():
                WEFTMOE_P2P_TOP_K=str(args.top_k),
                WEFTMOE_BACKWARD_TOKENS=str(args.tokens),
                WEFTMOE_BACKWARD_OUTPUT_DIR=str(artifact),
-               WEFTMOE_BENCH_CHECK_REPEAT="1",
-               WEFTMOE_FORWARD_PRE_COMBINE=str(int(args.pre_combine)))
+               WEFTMOE_BENCH_CHECK_REPEAT="1")
     if args.world < 16:
         env["NCCL_IB_DISABLE"] = "1"
         native = [sys.executable, str(ROOT / "tests/run_local_activation_p2p.py"),

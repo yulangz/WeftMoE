@@ -142,7 +142,6 @@ NVCCFLAGS="-include $PWD/configs/performance_20260913/qwen_ep8.hpp" \
 
 The Qwen EP8 64K case uses `qwen_ep8_64k.hpp`; the other three model/topology
 combinations share one profile across 8K and 64K. Tokens are per rank. These
-profiles were selected with pre-combine disabled; the report measures the same
-profiles with it enabled as well. They do not change the model or topology
-interfaces. Retune other supported aligned dimensions and hardware with the
+profiles do not change the model or topology interfaces. Retune other
+supported aligned dimensions and hardware with the
 existing autotuners instead of applying these model dimensions to other layers.
