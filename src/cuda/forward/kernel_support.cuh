@@ -536,7 +536,6 @@ struct Layout {
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
   std::size_t forward_input_groups = 0;
-  std::size_t forward_compute_pair_mailboxes = 0;
   std::size_t forward_x_arrived_rows = 0;
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
@@ -951,11 +950,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     const auto fc1_ntiles =
         (config.max_intermediate_size + forward_tuning::kFc1TileN - 1ULL) /
         forward_tuning::kFc1TileN;
-    const auto fc2_ntiles =
-        (config.max_hidden_size + forward_tuning::kFc2TileN - 1ULL) /
-        forward_tuning::kFc2TileN;
     const auto forward_claim_words = checked_mul(
-        max_mblocks, 2ULL + fc1_ntiles + fc2_ntiles,
+        max_mblocks, 2ULL + fc1_ntiles,
         "forward task claims");
     auto task_claim_words = forward_claim_words;
     if (config.enable_backward_state) {
@@ -982,10 +978,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_input_groups =
         append(cursor, max_mblocks, sizeof(persistent_v3::ForwardInputGroup),
                "forward destination-local input readiness groups");
-    layout.forward_compute_pair_mailboxes = append(
-        cursor, persistent_v3::kForwardComputePairCapacity,
-        sizeof(persistent_v3::ForwardComputePairMailbox),
-        "forward compute pair mailboxes");
     // A destination tile is produced concurrently by every node-local rail.
     // Keep one row counter per local-rank/rail instead of issuing contended
     // system-scope atomics from several GPUs into one peer word. The consumer

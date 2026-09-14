@@ -37,7 +37,8 @@ in the cluster pipeline but only its valid tile writes a result.
 | `fc1_tile_n`, `fc2_tile_n` | FWD | Output-column dimensions of the two forward GEMMs. Start with FC1 N128 and FC2 N256 on Hopper. FC1 holds two projection accumulators, so increasing its N tile can be costly even when the shared-memory buffers fit. Keep FC2 N128 as an alternative for distributed tuning. |
 | `dab_tile_n`, `dx_tile_n` | BWD | Output-column dimensions of the activation-gradient and input-gradient GEMMs. Start with 256 for both; evaluate narrower tiles when dimensions or task parallelism warrant it. Narrower tiles do not necessarily reduce register usage. |
 | `dw_tile_m`, `dw_tile_n` | BWD | Output-tile dimensions of the weight-gradient GEMMs. Start with M128/N256. Larger tiles reuse more input data but require more accumulator storage. |
-| `fc1_stages`, `fc2_stages` | FWD | Number of input-buffer stages for each forward GEMM. Start with 4/4. Each GEMM supports 2–4 stages; FC2 stages must divide `intermediate / tile_k`. Reducing stages can admit wider tiles but may hurt load-latency hiding. The combined buffers must fit the device shared-memory limit. |
+| `fc1_stages`, `fc2_stages` | FWD | Number of input-buffer stages for each forward GEMM. Start with 4/3. Each GEMM supports 2–4 stages, including partial stage cycles. The input and output buffers must fit the device shared-memory limit. |
+| `fc2_claim_tiles` | FWD | Ready N tiles processed per CTA before returning to the scheduler: 1, 2, 4 or 8. Start with 4. Larger claims overlap prefetch and output stores, with a separate output tile; claims stop at the current M-block boundary. |
 | `dab_stages`, `dx_stages` | BWD | Input-buffer stages for activation-gradient and input-gradient GEMMs. These values must match in the current implementation. Start with 4. |
 | `dw1_stages`, `dw2_stages` | BWD | Input-buffer stages for the two weight-gradient GEMMs. These values must match in the current implementation. Start with 3. |
 | `compute_threads` | FWD/BWD | Threads per compute CTA. The current implementation requires 384. |
@@ -130,13 +131,19 @@ Its thread-count setting does not change the main compute-worker allocation.
 | `reduce_threads` | BWD | Threads per input-gradient reduction CTA. Each warp handles one token in the current implementation. Start with 256; larger CTAs may reduce scheduling flexibility for short reductions. |
 | `reduce_idle_nanosleep` | BWD | Backoff hint while waiting for input-gradient route contributions. |
 
-The measured Qwen3.5-35B-A3B and DeepSeek-V4-Flash profiles are in
-[`performance_20260913/profiles.json`](performance_20260913/profiles.json).
+The current Qwen3.5-35B-A3B and DeepSeek-V4-Flash profiles are in
+[`performance_20260914/profiles.json`](performance_20260914/profiles.json).
+FC2 uses three input stages and `fc2_claim_tiles=4` on both models. This
+parameter accepts 1, 2, 4 or 8 tiles per CTA, clamped to the remaining N tiles
+of one ready M block. Values above one reserve a separate output tile so
+prefetch and output stores can overlap. The autotuner checks shared-memory
+capacity; four stages with N256 and a separate output tile do not fit Hopper.
+K iterations need not divide evenly into the stage count.
 Each referenced header contains both Forward and Backward settings. For example,
 build a production library from the repository root with:
 
 ```sh
-NVCCFLAGS="-include $PWD/configs/performance_20260913/qwen_ep8.hpp" \
+NVCCFLAGS="-include $PWD/configs/performance_20260914/qwen_ep8.hpp" \
   python3 build_native.py lib --output build/libweftmoe_qwen_ep8.so --jobs 16
 ```
 

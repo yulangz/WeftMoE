@@ -39,6 +39,9 @@
 #ifndef WEFTMOE_FWD_FC2_STAGES
 #define WEFTMOE_FWD_FC2_STAGES 4
 #endif
+#ifndef WEFTMOE_FWD_FC2_CLAIM_TILES
+#define WEFTMOE_FWD_FC2_CLAIM_TILES 1
+#endif
 #ifndef WEFTMOE_FWD_COMPUTE_THREADS
 #define WEFTMOE_FWD_COMPUTE_THREADS 384
 #endif
@@ -174,6 +177,7 @@ inline constexpr std::uint32_t kFc2TileN = WEFTMOE_FWD_FC2_TILE_N;
 inline constexpr std::uint32_t kTileK = WEFTMOE_FWD_TILE_K;
 inline constexpr std::uint32_t kFc1Stages = WEFTMOE_FWD_FC1_STAGES;
 inline constexpr std::uint32_t kFc2Stages = WEFTMOE_FWD_FC2_STAGES;
+inline constexpr std::uint32_t kFc2ClaimTiles = WEFTMOE_FWD_FC2_CLAIM_TILES;
 inline constexpr std::uint32_t kComputeThreads =
     WEFTMOE_FWD_COMPUTE_THREADS;
 // Local transport has no WGMMA register partition. Four warpgroups expose
@@ -258,7 +262,10 @@ inline constexpr std::size_t kBStorageElements = max_size(
     2U * kFc1Stages * kFc1BStageElements,
     kFc2Stages * kFc2BStageElements);
 inline constexpr std::size_t kGemmStorageBytes =
-    (kAStorageElements + kBStorageElements) * sizeof(std::uint16_t);
+    max_size(kAStorageElements + kBStorageElements,
+             kFc2Stages * (kAStageElements + kFc2BStageElements) +
+                 (kFc2ClaimTiles > 1U ? kTileM * kFc2TileN : 0U)) *
+    sizeof(std::uint16_t);
 inline constexpr std::size_t kBarrierCount =
     3U * kFc1Stages + 2U * kFc2Stages;
 
@@ -289,6 +296,10 @@ static_assert(kFc2TileN >= 64U && kFc2TileN <= 256U &&
 static_assert(kTileK == 64U);
 static_assert(kFc1Stages >= 2U && kFc1Stages <= 4U);
 static_assert(kFc2Stages >= 2U && kFc2Stages <= 4U);
+static_assert(kFc2ClaimTiles == 1U || kFc2ClaimTiles == 2U ||
+              kFc2ClaimTiles == 4U || kFc2ClaimTiles == 8U);
+static_assert(kGemmStorageBytes <= 227U * 1024U,
+              "FC2 input/output staging exceeds Hopper shared memory");
 static_assert(kComputeThreads == 384U);
 static_assert(kMathWarpgroups == 2U && kProducerWarpgroups == 1U);
 static_assert(kMathRegisters <= 255U && kProducerRegisters <= 255U &&

@@ -4446,8 +4446,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
   args.forward_input_groups_offset = layout.forward_input_groups;
-  args.forward_compute_pair_mailboxes_offset =
-      layout.forward_compute_pair_mailboxes;
   args.x_arrived_rows_offset = layout.forward_x_arrived_rows;
   args.forward_reduce_route_count_offset = layout.forward_reduce_route_count;
   args.forward_reduce_ready_token_offset =
@@ -4639,13 +4637,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       const auto fc1_ntiles = args.intermediate / forward_tuning::kFc1TileN;
       const auto fc2_ntiles = args.hidden / forward_tuning::kFc2TileN;
       if ((forward_main_compute_ctas & 1U) || (fc1_ntiles & 1U) ||
-          (fc2_ntiles & 1U) ||
-          forward_main_compute_ctas / 2U >
-              persistent_v3::kForwardComputePairCapacity)
+          (fc2_ntiles & 1U))
         transport_error(
             NotifyErrorCode::InvalidRuntimeConfig, "forward-run",
             "Forward cluster extent", id.calling_rank,
-            "even compute CTA and FC1/FC2 N-tile counts within pair capacity",
+            "even compute CTA and FC1/FC2 N-tile counts",
             "incompatible two-CTA multicast shape");
       // Every compute CTA participates in the terminal Reduce drain. Idle
       // transport CTAs also consume ready tokens; their completion is covered
@@ -4918,6 +4914,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->completion
       ->finish = [backend, state, flight, lease, id, options, args, use_gin,
                   cluster_supported, max_active_clusters, forward_stream_done,
+#if WEFTMOE_DEBUG_VALIDATE
+                  layout,
+#endif
                   result = result.get(),
                   consumer_owner =
                       std::make_shared<DeviceDispatchConsumerLease>(

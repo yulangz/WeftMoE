@@ -223,6 +223,7 @@ def main():
                         default="forward")
     parser.add_argument("--validation-repeats", type=int, default=0)
     parser.add_argument("--allocate-tensors", action="store_true")
+    parser.add_argument("--forward-diagnostics-dir")
     parser.add_argument("--measure-forward", action="store_true")
     parser.add_argument("--stage-profile", action="store_true")
     parser.add_argument("--inference", action="store_true",
@@ -239,6 +240,8 @@ def main():
         parser.error("--stage-profile currently profiles Forward only")
     if (args.allocate_tensors or args.measure_forward) and args.workload != "backward":
         parser.error("--allocate-tensors/--measure-forward require --workload backward")
+    if args.forward_diagnostics_dir and args.workload != "backward":
+        parser.error("--forward-diagnostics-dir requires --workload backward")
     if args.inference and args.workload != "forward":
         parser.error("--inference requires --workload forward")
     if args.ib_gid_index < 0:

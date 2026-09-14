@@ -9,14 +9,14 @@
 
 namespace weftmoe::cuda::profiling {
 
-inline constexpr std::uint32_t kTimelineSchemaVersion = 7;
+inline constexpr std::uint32_t kTimelineSchemaVersion = 9;
 // Main-shape compute CTAs can retire more than 256 FC tiles.  A truncated
 // suffix makes the apparent FC2/Return tail shorter than the real one, so the
 // profiling build deliberately spends a few extra MiB per GPU for a complete
 // trace.  This allocation is compiled out of production builds.
-// The top-1 / 49152-token diagnostic records many reduce-ready tokens;
-// 1024 entries truncated some CTA tails in that workload.
-inline constexpr std::uint32_t kEventsPerCta = 4096;
+// Per-task math, epilogue and scheduler boundaries need a larger capacity
+// than the earlier phase-only traces, especially at 64K tokens per rank.
+inline constexpr std::uint32_t kEventsPerCta = 16384;
 
 enum class TimelinePhase : std::uint16_t { Forward = 1 };
 
@@ -80,6 +80,16 @@ enum class TimelineEvent : std::uint16_t {
   FullReturnChunkReady = 77,
   FullReturnChunkPublished = 78,
   Fc2MblockReturnReady = 79,
+  ComputeSelectStart = 80,
+  ComputeSelectEnd = 81,
+  Fc1TileStart = 82,
+  Fc1MathEnd = 83,
+  Fc1TileEnd = 84,
+  Fc2TileStart = 85,
+  Fc2MathEnd = 86,
+  Fc2TileEnd = 87,
+  ComputePairJoinEnd = 88,
+  TransportRoleDone = 89,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

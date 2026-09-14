@@ -6,22 +6,6 @@
 
 namespace weftmoe::cuda::persistent_v3 {
 
-// One mailbox per two-CTA compute cluster. The launch validates this capacity
-// as well as the device's SM budget before enqueuing the persistent grids.
-inline constexpr std::uint32_t kForwardComputePairCapacity = 64U;
-
-// The leader assigns one same-kind task to each CTA.  Odd sequence values
-// publish a pair; the follower changes the value to the next even sequence
-// after finishing.  This thread-0 handshake avoids a full-cluster barrier at
-// every GEMM boundary while retaining the lockstep required by TMA multicast.
-struct alignas(32) ForwardComputePairMailbox {
-  unsigned long long sequence = 0;
-  unsigned long long tasks[2] = {0, 0};
-  unsigned long long metadata = 0;
-};
-
-static_assert(sizeof(ForwardComputePairMailbox) == 32U);
-
 inline constexpr unsigned long long kNoInputGroup = ~0ULL;
 
 // Owned by one destination-local publisher for the entire execution. Advance

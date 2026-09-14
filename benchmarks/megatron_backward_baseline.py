@@ -164,6 +164,8 @@ def main():
                         help="also time the training Forward with the same checkpoint contract")
     parser.add_argument("--save-output-dir",
                         help="dump one Forward and its input fixture after timing")
+    parser.add_argument("--forward-diagnostics-dir",
+                        help="write isolated compute, communication and Forward traces after timing")
     parser.add_argument(
         "--gate-mode", choices=("fixed-random", "unit"),
         default="fixed-random"
@@ -346,6 +348,10 @@ def main():
         if args.dispatcher == "flex"
         else "Megatron-Core MoEAlltoAllTokenDispatcher + TEGroupedMLP"
     )
+    if args.forward_diagnostics_dir:
+        from forward_diagnostics import diagnose_forward
+        diagnose_forward(args, dispatcher, experts_module, hidden, selected,
+                         selected_gates, routing, build_graph)
     if args.save_output_dir:
         clear()
         saved_output = build_graph(args.allocate_tensors)

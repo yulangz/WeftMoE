@@ -81,6 +81,8 @@ def benchmark_arguments(args):
                 result.append("--" + option.replace("_", "-"))
         if getattr(args, "save_output_dir", None):
             result.extend(["--save-output-dir", args.save_output_dir])
+        if getattr(args, "forward_diagnostics_dir", None):
+            result.extend(["--forward-diagnostics-dir", args.forward_diagnostics_dir])
     else:
         result.extend(["--expert-body", args.expert_body])
         if getattr(args, "inference", False):

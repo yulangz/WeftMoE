@@ -39,6 +39,9 @@ constexpr std::uint32_t kReduceRegisterReleaseBarrier = 4U;
 constexpr std::uint32_t kReduceRegisterAcquireBarrier = 5U;
 constexpr std::uint32_t kFc1Stages = forward_tuning::kFc1Stages;
 constexpr std::uint32_t kFc2Stages = forward_tuning::kFc2Stages;
+// The host validates these dimensions before admitting this specialization.
+constexpr std::uint64_t kHidden = forward_tuning::kMainHidden;
+constexpr std::uint64_t kIntermediate = forward_tuning::kMainIntermediate;
 constexpr std::uint32_t kFc2Iterations =
     forward_tuning::kMainIntermediate / forward_tuning::kTileK;
 constexpr std::uint32_t kAStageElements =
@@ -123,6 +126,27 @@ visit_m128_accumulator_pair(float *accum_a, float *accum_b, Callback callback) {
              accum_a[index * 4U + 3U], accum_b[index * 4U + 2U],
              accum_b[index * 4U + 3U]);
   }
+}
+
+// A 64-column atom uses the same 128-byte swizzle as the FC2 TMA epilogue.
+// STSM packs the WGMMA fragments; vector loads below recover contiguous rows.
+__device__ __forceinline__ void store_m128_fragment(transport::BFloat16 *tile,
+                                                    unsigned index,
+                                                    __nv_bfloat162 row0,
+                                                    __nv_bfloat162 row1) {
+  const auto warp = threadIdx.x / 32U;
+  const auto lane = threadIdx.x % 32U;
+  const auto atom = index / 8U;
+  const auto column = (index % 8U) ^ (lane % 8U);
+  auto *target = reinterpret_cast<unsigned char *>(tile) + warp * 16U * 128U +
+                 atom * 128U * 128U + lane * 128U + column * 16U;
+  hopper::StoreMatrixX2<__nv_bfloat162>::copy(row0, row1, target);
+}
+
+__device__ __forceinline__ unsigned
+m128_fragment_vector_offset(unsigned row, unsigned column) {
+  return (column / 64U) * 128U * 64U + row * 64U +
+         ((column % 64U) ^ ((row % 8U) * 8U));
 }
 
 // FC1/FC2 lends most of the CTA register file to the WGMMA warpgroups, with a
@@ -226,6 +250,19 @@ try_claim_fc1_task_pair(const ForwardKernelArgs &a,
   return true;
 }
 
+// Claim only ready N tiles of one M block. Larger claims use independent
+// input/output staging; no future M block is reserved.
+__device__ __forceinline__ std::uint32_t
+fc2_tiles_per_cta(unsigned long long task, std::uint32_t ntiles) {
+  if constexpr (forward_tuning::kFc2ClaimTiles == 1U)
+    return 1U;
+  const auto n = static_cast<std::uint32_t>(task % ntiles) & ~1U;
+  const auto remaining = (ntiles - n) / 2U;
+  return remaining < forward_tuning::kFc2ClaimTiles
+             ? remaining
+             : forward_tuning::kFc2ClaimTiles;
+}
+
 template <bool StaticLocal>
 __device__ __forceinline__ bool
 try_claim_fc2_task_pair(const ForwardKernelArgs &a,
@@ -236,58 +273,70 @@ try_claim_fc2_task_pair(const ForwardKernelArgs &a,
                         unsigned long long &task0, unsigned long long &task1,
                         std::uint32_t &pair_operand, bool &exhausted) {
   const auto forward_mblocks = scheduler[3];
-  auto *claim_word = &scheduler[1];
+  const auto all_tasks = forward_mblocks * fc2_ntiles;
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> cursor(
-      *claim_word);
-  while (true) {
-    auto slot = cursor.load(::cuda::memory_order_relaxed);
-    if (slot >= forward_mblocks) {
-      exhausted = true;
-      return false;
-    }
-    const auto queue_slot = slot;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        published(ready_queue[queue_slot]);
-    const auto encoded = published.load(::cuda::memory_order_acquire);
-    if (encoded == 0ULL) {
-      exhausted = false;
-      return false;
-    }
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        tile_cursor(ready_queue[forward_mblocks + queue_slot]);
-    const auto n_tile =
-        tile_cursor.fetch_add(2ULL, ::cuda::memory_order_relaxed);
-    if (n_tile + 1ULL >= fc2_ntiles) {
-      auto expected = slot;
-      cursor.compare_exchange_strong(expected, slot + 1ULL,
-                                     ::cuda::memory_order_relaxed,
-                                     ::cuda::memory_order_relaxed);
-      continue;
-    }
-    const auto mblock = encoded - 1ULL;
-    task0 = mblock * fc2_ntiles + n_tile;
-    task1 = task0 + 1ULL;
-    pair_operand = kComputePairShareA;
-    exhausted = false;
-#if WEFTMOE_DEBUG_VALIDATE
-    if constexpr (!StaticLocal) {
-      if (a.use_gin) {
-        claim_completion_tasks(completion, transport_state::TaskClass::Fc2);
-        claim_completion_tasks(completion, transport_state::TaskClass::Fc2);
-      }
-    }
-    if (a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas) {
-      completion->fc2_scheduler_value = slot * fc2_ntiles + n_tile + 1ULL;
-      const auto local_task =
-          cute::block_rank_in_cluster() == 0U ? task0 : task1;
-      completion->forward_fc2_cta_tiles_started[blockIdx.x] = local_task + 1ULL;
-      completion->forward_fc2_cta_last_task[blockIdx.x] = local_task;
-      completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] = 1ULL << 32U;
-    }
-#endif
-    (void)fc2_tasks;
-    return true;
+      scheduler[1]);
+  auto slot = cursor.load(::cuda::memory_order_relaxed);
+  if (slot >= all_tasks) {
+    exhausted = true;
+    return false;
   }
+  const auto queue_slot = slot / fc2_ntiles;
+  const auto n_tile = slot % fc2_ntiles;
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> published(
+      ready_queue[queue_slot]);
+  const auto encoded = published.load(::cuda::memory_order_acquire);
+  if (encoded == 0ULL ||
+      !cursor.compare_exchange_strong(
+          slot, slot + 2ULL * fc2_tiles_per_cta(slot, fc2_ntiles),
+          ::cuda::memory_order_relaxed, ::cuda::memory_order_relaxed)) {
+    exhausted = false;
+    return false;
+  }
+  const auto mblock = encoded - 1ULL;
+  task0 = mblock * fc2_ntiles + n_tile;
+  task1 = task0 + 1ULL;
+  pair_operand = kComputePairShareA;
+  exhausted = false;
+#if WEFTMOE_DEBUG_VALIDATE
+  if constexpr (!StaticLocal) {
+    if (a.use_gin) {
+      for (unsigned i = 0; i < 2U * fc2_tiles_per_cta(slot, fc2_ntiles); ++i)
+        claim_completion_tasks(completion, transport_state::TaskClass::Fc2);
+    }
+  }
+  if (a.use_gin && blockIdx.x < transport_state::kForwardDebugCtas) {
+    completion->fc2_scheduler_value = slot + 1ULL;
+    const auto local_task = cute::block_rank_in_cluster() == 0U ? task0 : task1;
+    completion->forward_fc2_cta_tiles_started[blockIdx.x] = local_task + 1ULL;
+    completion->forward_fc2_cta_last_task[blockIdx.x] = local_task;
+    completion->forward_fc2_cta_pipeline_iteration[blockIdx.x] = 1ULL << 32U;
+  }
+#endif
+  (void)fc2_tasks;
+  return true;
+}
+
+struct alignas(16) ComputePairState {
+  unsigned long long task;
+  unsigned int kind;
+  unsigned int operand;
+  std::uint64_t ready;
+  std::uint64_t joined;
+};
+
+__device__ __forceinline__ void pair_wait(std::uint64_t *barrier,
+                                          unsigned phase) {
+  while (!::cuda::ptx::mbarrier_try_wait_parity(::cuda::ptx::sem_acquire,
+                                                ::cuda::ptx::scope_cluster,
+                                                barrier, phase, 0x989680U)) {
+  }
+}
+
+__device__ __forceinline__ void pair_arrive(std::uint64_t *barrier) {
+  ::cuda::ptx::mbarrier_arrive(::cuda::ptx::sem_release,
+                               ::cuda::ptx::scope_cluster,
+                               ::cuda::ptx::space_cluster, barrier);
 }
 
 // A CTA never reserves an unpublished slot.  It first tries FC2, then FC1,
@@ -303,30 +352,24 @@ __device__ __forceinline__ void select_compute_task(
     transport_state::GenerationCompletionVector *completion,
     unsigned long long *task_shared, unsigned int *task_kind_shared,
     unsigned int *pair_operand_shared, unsigned long long &pair_round,
-    unsigned int &fc2_streak) {
+    unsigned int &fc2_streak, ComputePairState *pair) {
   if (threadIdx.x != 0U)
     return;
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ComputeSelectStart, Compute, 0U,
+                          pair_round, execution_epoch(a));
   const auto cluster_rank = cute::block_rank_in_cluster();
-  auto *mailboxes = peer_at<persistent_v3::ForwardComputePairMailbox>(
-      a.local_base, a.forward_compute_pair_mailboxes_offset);
-  auto &mailbox = mailboxes[static_cast<std::uint32_t>(blockIdx.x) / 2U];
-
-  // Acknowledge the previous pair before the leader overwrites its mailbox.
-  // Only one lane per CTA participates; the ordinary CTA named barrier below
-  // distributes the resulting local task to its producer and math warpgroups.
+  const auto cluster = cooperative_groups::this_cluster();
+  auto *leader_pair = cluster.map_shared_rank(pair, 0U);
+  auto *follower_pair = cluster.map_shared_rank(pair, 1U);
   if (pair_round != 0ULL) {
-    const auto complete_sequence = pair_round * 2ULL;
-    if (cluster_rank == 1U) {
-      persistent_v3::store_release<::cuda::thread_scope_device>(
-          mailbox.sequence, complete_sequence);
-    } else {
-      while (persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                 mailbox.sequence) != complete_sequence)
-        __nanosleep(forward_tuning::kTaskIdleNanosleep);
-    }
+    if (cluster_rank == 1U)
+      pair_arrive(&leader_pair->joined);
+    else
+      pair_wait(&pair->joined,
+                static_cast<unsigned>((pair_round - 1ULL) & 1ULL));
   }
-
-  const auto ready_sequence = pair_round * 2ULL + 1ULL;
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ComputePairJoinEnd, Compute, 0U,
+                          pair_round, execution_epoch(a));
   if (cluster_rank == 0U) {
     unsigned long long task0 = 0ULL;
     unsigned long long task1 = 0ULL;
@@ -375,25 +418,22 @@ __device__ __forceinline__ void select_compute_task(
         break;
       __nanosleep(forward_tuning::kTaskIdleNanosleep);
     }
-    mailbox.tasks[0] = task0;
-    mailbox.tasks[1] = task1;
-    mailbox.metadata = static_cast<unsigned long long>(task_kind) |
-                       (static_cast<unsigned long long>(pair_operand) << 32U);
-    persistent_v3::store_release<::cuda::thread_scope_device>(mailbox.sequence,
-                                                              ready_sequence);
+    pair->task = task1;
+    pair->kind = task_kind;
+    pair->operand = pair_operand;
+    pair_arrive(&follower_pair->ready);
     *task_shared = task0;
     *task_kind_shared = task_kind;
     *pair_operand_shared = pair_operand;
   } else {
-    while (persistent_v3::load_acquire<::cuda::thread_scope_device>(
-               mailbox.sequence) != ready_sequence)
-      __nanosleep(forward_tuning::kTaskIdleNanosleep);
-    const auto metadata = mailbox.metadata;
-    *task_shared = mailbox.tasks[1];
-    *task_kind_shared = static_cast<std::uint32_t>(metadata);
-    *pair_operand_shared = static_cast<std::uint32_t>(metadata >> 32U);
+    pair_wait(&pair->ready, static_cast<unsigned>(pair_round & 1ULL));
+    *task_shared = leader_pair->task;
+    *task_kind_shared = leader_pair->kind;
+    *pair_operand_shared = leader_pair->operand;
   }
   ++pair_round;
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ComputeSelectEnd, Compute,
+                          *task_kind_shared, *task_shared, execution_epoch(a));
 }
 
 template <bool StaticLocal, bool RetainBackwardState,
@@ -414,9 +454,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 "FC1 supports two to four TMA stages");
   static_assert(Fc2StageCount >= 2U && Fc2StageCount <= 4U,
                 "FC2 supports two to four TMA stages");
-  static_assert(kFc2Iterations % Fc2StageCount == 0U,
-                "the fixed FC2 reduction must divide evenly into stages");
-  constexpr auto kConfiguredFc2Waves = kFc2Iterations / Fc2StageCount;
+  constexpr bool kFc2Pipelined = forward_tuning::kFc2ClaimTiles > 1U;
+  constexpr auto kFc2OutputOffset =
+      Fc2StageCount * (kAStageElements + kFc2BStageElements);
   constexpr auto kConfiguredAStorageElements =
       (Fc1StageCount > Fc2StageCount ? Fc1StageCount : Fc2StageCount) *
       kAStageElements;
@@ -425,6 +465,14 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               Fc2StageCount * kFc2BStageElements
           ? 2U * Fc1StageCount * kFc1BStageElements
           : Fc2StageCount * kFc2BStageElements;
+  constexpr auto kFc2ArenaElements =
+      kFc2OutputOffset +
+      (kFc2Pipelined ? 128U * forward_tuning::kFc2TileN : 0U);
+  constexpr auto kConfiguredArenaElements =
+      kConfiguredAStorageElements + kConfiguredBStorageElements >
+              kFc2ArenaElements
+          ? kConfiguredAStorageElements + kConfiguredBStorageElements
+          : kFc2ArenaElements;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);
@@ -450,11 +498,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
   const auto forward_mblocks = scheduler[3];
   const auto fc1_ntiles = static_cast<std::uint32_t>(
-      (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
+      (kIntermediate + forward_tuning::kFc1TileN - 1ULL) /
       forward_tuning::kFc1TileN);
-  const auto fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + forward_tuning::kFc2TileN - 1ULL) /
-                                 forward_tuning::kFc2TileN);
+  const auto fc2_ntiles = static_cast<std::uint32_t>(
+      (kHidden + forward_tuning::kFc2TileN - 1ULL) / forward_tuning::kFc2TileN);
   const auto fc1_tasks = forward_mblocks * fc1_ntiles;
   const auto fc2_tasks = forward_mblocks * fc2_ntiles;
   auto *fc1_ready_queue = claims + forward_mblocks;
@@ -462,14 +509,21 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *smem_b = smem_a + kConfiguredAStorageElements;
+  auto *fc2_smem_b = smem_a + Fc2StageCount * kAStageElements;
   auto *fc1_b2 = smem_b + Fc1StageCount * kFc1BStageElements;
   auto *fc1_full =
-      reinterpret_cast<ForwardBarrier *>(smem_b + kConfiguredBStorageElements);
+      reinterpret_cast<ForwardBarrier *>(smem_a + kConfiguredArenaElements);
   auto *fc1_empty = fc1_full + Fc1StageCount;
   auto *fc2_full = fc1_empty + Fc1StageCount;
   auto *fc2_empty = fc2_full + Fc2StageCount;
   auto *fc1_b2_full = fc2_empty + Fc2StageCount;
 
+  __shared__ ComputePairState pair;
+  if (threadIdx.x == 0U) {
+    ::cuda::ptx::mbarrier_init(&pair.ready, 1U);
+    ::cuda::ptx::mbarrier_init(&pair.joined, 1U);
+    cutlass::arch::fence_barrier_init();
+  }
   if (threadIdx.x == kMathThreads) {
     for (std::uint32_t stage = 0; stage < Fc1StageCount; ++stage) {
       fc1_full[stage].init(1);
@@ -520,7 +574,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           // the first load for the claimed M block.
           asm volatile("fence.proxy.async.global;" : : : "memory");
           const auto iterations = static_cast<std::uint32_t>(
-              (a.hidden + forward_tuning::kTileK - 1ULL) /
+              (kHidden + forward_tuning::kTileK - 1ULL) /
               forward_tuning::kTileK);
           for (std::uint32_t iteration = 0; iteration < iterations;
                ++iteration) {
@@ -549,13 +603,13 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             hopper::tma_load<forward_tuning::kTileK, forward_tuning::kFc1TileN,
                              128, cutlass::bfloat16_t>(
                 &w1_map, &fc1_full[stage], stage_b1, k_base,
-                static_cast<std::uint32_t>(expert * 2ULL * a.intermediate + n),
+                static_cast<std::uint32_t>(expert * 2ULL * kIntermediate + n),
                 multicast_b);
             hopper::tma_load<forward_tuning::kTileK, forward_tuning::kFc1TileN,
                              128, cutlass::bfloat16_t>(
                 &w1_map, &fc1_b2_full[stage], stage_b2, k_base,
-                static_cast<std::uint32_t>(expert * 2ULL * a.intermediate +
-                                           a.intermediate + n),
+                static_cast<std::uint32_t>(expert * 2ULL * kIntermediate +
+                                           kIntermediate + n),
                 multicast_b);
             constexpr auto a_stage_elements = kAStageElements;
             fc1_full[stage].arrive_and_expect_tx(
@@ -573,53 +627,51 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         break;
 
       while (true) {
-        const auto task = *task_shared;
+        const auto first_task = *task_shared;
         if (*task_kind_shared != kComputeTaskFc2)
           break;
-        const auto mblock = task / fc2_ntiles;
-        const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
+        const auto tile_count = fc2_tiles_per_cta(first_task, fc2_ntiles);
+        const auto mblock = first_task / fc2_ntiles;
         const auto mapping = claims[mblock];
         const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
         const auto local_mblock = static_cast<std::uint32_t>(mapping);
         const auto row = a.dispatch.expert_row_prefix[expert] +
                          forward_mblock_local_row(local_mblock);
         if (threadIdx.x == kMathThreads) {
-          // Keep stage ordinals unrolled, but carry barrier parity between
-          // tasks when the reduction has an odd number of pipeline waves.
-          // Even-wave shapes keep the original compile-time phase expression.
-          for (std::uint32_t wave = 0; wave < kConfiguredFc2Waves; ++wave) {
+          asm volatile("fence.proxy.async.global;" : : : "memory");
+          for (std::uint32_t offset = 0; offset < tile_count; ++offset) {
+            const auto n = static_cast<std::uint32_t>(
+                               (first_task + 2ULL * offset) % fc2_ntiles) *
+                           forward_tuning::kFc2TileN;
 #pragma unroll
-            for (std::uint32_t stage = 0; stage < Fc2StageCount; ++stage) {
-              const auto phase = ((kConfiguredFc2Waves % 2U != 0U
-                                       ? fc2_pipeline / Fc2StageCount
-                                       : 0U) +
-                                  wave) &
-                                 1U;
+            for (std::uint32_t iteration = 0; iteration < kFc2Iterations;
+                 ++iteration) {
+              const auto current = fc2_pipeline + iteration;
+              const auto stage = current % Fc2StageCount;
+              const auto phase = (current / Fc2StageCount) & 1U;
               fc2_empty[stage].wait(phase ^ 1U);
               auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
                   smem_a + stage * kAStageElements);
               auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
-                  smem_b + stage * kFc2BStageElements);
-              const auto k_base =
-                  (wave * Fc2StageCount + stage) * forward_tuning::kTileK;
-              const auto n = n_tile * forward_tuning::kFc2TileN;
+                  fc2_smem_b + stage * kFc2BStageElements);
+              const auto k_base = iteration * forward_tuning::kTileK;
               hopper::tma_load<forward_tuning::kTileK, forward_tuning::kTileM,
                                128, cutlass::bfloat16_t>(
                   &s_map, &fc2_full[stage], stage_a, k_base,
                   static_cast<std::uint32_t>(row), 2U);
-
               hopper::tma_load<forward_tuning::kTileK,
                                forward_tuning::kFc2TileN, 128,
                                cutlass::bfloat16_t>(
                   &w2_map, &fc2_full[stage], stage_b, k_base,
-                  static_cast<std::uint32_t>(expert * a.hidden + n));
-              constexpr auto a_stage_elements = kAStageElements;
+                  static_cast<std::uint32_t>(expert * kHidden + n), 1U,
+                  static_cast<std::uint64_t>(
+                      cute::TMA::CacheHintSm90::EVICT_LAST));
               fc2_full[stage].arrive_and_expect_tx(
-                  (a_stage_elements + kFc2BStageElements) *
+                  (kAStageElements + kFc2BStageElements) *
                   sizeof(transport::BFloat16));
             }
+            fc2_pipeline += kFc2Iterations;
           }
-          fc2_pipeline += kFc2Iterations;
         }
         cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
       }
@@ -640,10 +692,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   bool timeline_fc1_started = false;
   bool timeline_fc2_started = false;
 #endif
-  select_compute_task<StaticLocal>(a, scheduler, claims, fc2_ready_queue,
-                                   fc1_tasks, fc2_tasks, fc1_ntiles, fc2_ntiles,
-                                   completion, task_shared, task_kind_shared,
-                                   pair_operand_shared, pair_round, fc2_streak);
+  select_compute_task<StaticLocal>(
+      a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks, fc1_ntiles,
+      fc2_ntiles, completion, task_shared, task_kind_shared,
+      pair_operand_shared, pair_round, fc2_streak, &pair);
   cutlass::arch::NamedBarrier::sync(kThreads, kTaskReadyBarrier);
   while (true) {
     if (*task_kind_shared == kComputeTaskReduce) {
@@ -653,7 +705,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       select_compute_task<StaticLocal>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-          pair_operand_shared, pair_round, fc2_streak);
+          pair_operand_shared, pair_round, fc2_streak, &pair);
       cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
       continue;
     }
@@ -662,6 +714,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       const auto task = *task_shared;
       if (*task_kind_shared != kComputeTaskFc1)
         break;
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileStart, Compute, 0U, task,
+                              execution_epoch(a));
 #if WEFTMOE_DEVICE_TIMELINE
       if (threadIdx.x == 0U && !timeline_fc1_started) {
         WEFTMOE_TIMELINE_RECORD(a.timeline, XFirstMtileReady, Compute, 0U, task,
@@ -694,7 +748,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         accum_b[index] = 0.0F;
       }
       const auto iterations = static_cast<std::uint32_t>(
-          (a.hidden + forward_tuning::kTileK - 1ULL) / forward_tuning::kTileK);
+          (kHidden + forward_tuning::kTileK - 1ULL) / forward_tuning::kTileK);
       for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
         const auto current = fc1_pipeline + iteration;
         const auto stage = current % Fc1StageCount;
@@ -766,17 +820,29 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               lane);
       }
       fc1_pipeline += iterations;
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MathEnd, Compute, 0U, task,
+                              execution_epoch(a));
 
+      // Both rows owned by a lane use the same gate for every N fragment.
+      // Load them before checkpoint stores, whose dynamic pool addresses may
+      // otherwise prevent the compiler from hoisting these invariant reads.
+      const auto gate_row =
+          (threadIdx.x / 32U) * 16U + (threadIdx.x % 32U) / 4U;
+      const float gate0 =
+          gate_row < valid_rows ? canonical_gates[row + gate_row] : 0.0F;
+      const float gate1 = gate_row + 8U < valid_rows
+                              ? canonical_gates[row + gate_row + 8U]
+                              : 0.0F;
       const auto store_fc1 = [&](std::uint32_t wg, std::uint32_t m,
                                  std::uint32_t column, float av0, float av1,
                                  float bv0, float bv1) {
         const auto block_m = wg * 64U + m;
         const auto output_column = static_cast<std::uint64_t>(n) + column;
-        if (block_m < valid_rows && output_column + 1ULL < a.intermediate &&
-            (a.intermediate & 1ULL) == 0ULL) {
+        if (block_m < valid_rows && output_column + 1ULL < kIntermediate &&
+            (kIntermediate & 1ULL) == 0ULL) {
           const auto output_index =
-              (row + block_m) * a.intermediate + output_column;
-          const auto gate = canonical_gates[row + block_m];
+              (row + block_m) * kIntermediate + output_column;
+          const auto gate = (m & 8U) == 0U ? gate0 : gate1;
           const auto a_pair = float2_to_bf16x2_bits(av0, av1);
           const auto b_pair = float2_to_bf16x2_bits(bv0, bv1);
           const auto a_values = bf16x2_bits_to_float2(a_pair);
@@ -784,7 +850,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           if constexpr (RetainBackwardState) {
             reinterpret_cast<std::uint32_t *>(ab_cache)[output_index / 2ULL] =
                 a_pair;
-            const auto b_index = a.saved_rows * a.intermediate + output_index;
+            const auto b_index = a.saved_rows * kIntermediate + output_index;
             reinterpret_cast<std::uint32_t *>(ab_cache)[b_index / 2ULL] =
                 b_pair;
           }
@@ -795,18 +861,18 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         } else if (block_m < valid_rows) {
           const float av[2] = {av0, av1};
           const float bv[2] = {bv0, bv1};
-          const auto gate = canonical_gates[row + block_m];
+          const auto gate = (m & 8U) == 0U ? gate0 : gate1;
 #pragma unroll
           for (std::uint32_t value = 0; value < 2U; ++value) {
             const auto tail_column = output_column + value;
-            if (tail_column < a.intermediate) {
+            if (tail_column < kIntermediate) {
               const auto output_index =
-                  (row + block_m) * a.intermediate + tail_column;
+                  (row + block_m) * kIntermediate + tail_column;
               const auto a_bits = float_to_bf16_bits(av[value]);
               const auto b_bits = float_to_bf16_bits(bv[value]);
               if constexpr (RetainBackwardState) {
                 ab_cache[output_index] = transport::BFloat16{a_bits};
-                ab_cache[a.saved_rows * a.intermediate + output_index] =
+                ab_cache[a.saved_rows * kIntermediate + output_index] =
                     transport::BFloat16{b_bits};
               }
               s[output_index] = transport::BFloat16{float_to_bf16_bits(
@@ -815,7 +881,69 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           }
         }
       };
-      visit_m128_accumulator_pair<Fc1TileMma>(accum_a, accum_b, store_fc1);
+      constexpr auto kFc1OutputElements = 128U * forward_tuning::kFc1TileN;
+      constexpr auto kFc1StagedOutputs = RetainBackwardState ? 3U : 1U;
+      constexpr bool kFc1StageFits =
+          kFc1StagedOutputs * kFc1OutputElements *
+              sizeof(transport::BFloat16) <=
+          (kConfiguredAStorageElements + kConfiguredBStorageElements) *
+              sizeof(transport::BFloat16);
+      const bool staged_fc1 = kFc1StageFits && valid_rows == 128U &&
+                              n + forward_tuning::kFc1TileN <= kIntermediate;
+      if (staged_fc1) {
+        // The checkpoint epilogue also reuses B storage. Both math
+        // warpgroups must retire their final reads before it is overwritten.
+        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
+        auto *staged_s = smem_a;
+        auto *staged_a = staged_s + kFc1OutputElements;
+        auto *staged_b = staged_a + kFc1OutputElements;
+#pragma unroll
+        for (unsigned index = 0; index < Fc1TileMma::kNumAccum / 4U; ++index) {
+          const auto av0 = __float22bfloat162_rn(
+              make_float2(accum_a[index * 4U], accum_a[index * 4U + 1U]));
+          const auto av1 = __float22bfloat162_rn(
+              make_float2(accum_a[index * 4U + 2U], accum_a[index * 4U + 3U]));
+          const auto bv0 = __float22bfloat162_rn(
+              make_float2(accum_b[index * 4U], accum_b[index * 4U + 1U]));
+          const auto bv1 = __float22bfloat162_rn(
+              make_float2(accum_b[index * 4U + 2U], accum_b[index * 4U + 3U]));
+          if constexpr (RetainBackwardState) {
+            store_m128_fragment(staged_a, index, av0, av1);
+            store_m128_fragment(staged_b, index, bv0, bv1);
+          }
+          const auto af0 = __bfloat1622float2(av0),
+                     af1 = __bfloat1622float2(av1);
+          const auto bf0 = __bfloat1622float2(bv0),
+                     bf1 = __bfloat1622float2(bv1);
+          store_m128_fragment(
+              staged_s, index,
+              __float22bfloat162_rn(
+                  make_float2(gated_swiglu_fc2_input(af0.x, bf0.x, gate0),
+                              gated_swiglu_fc2_input(af0.y, bf0.y, gate0))),
+              __float22bfloat162_rn(
+                  make_float2(gated_swiglu_fc2_input(af1.x, bf1.x, gate1),
+                              gated_swiglu_fc2_input(af1.y, bf1.y, gate1))));
+        }
+        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
+        for (unsigned v = threadIdx.x; v < kFc1OutputElements / 8U;
+             v += kMathThreads) {
+          const auto r = v / (forward_tuning::kFc1TileN / 8U);
+          const auto c = (v % (forward_tuning::kFc1TileN / 8U)) * 8U;
+          const auto offset = m128_fragment_vector_offset(r, c);
+          const auto output_index = (row + r) * kIntermediate + n + c;
+          *reinterpret_cast<uint4 *>(s + output_index) =
+              *reinterpret_cast<const uint4 *>(staged_s + offset);
+          if constexpr (RetainBackwardState) {
+            *reinterpret_cast<uint4 *>(ab_cache + output_index) =
+                *reinterpret_cast<const uint4 *>(staged_a + offset);
+            *reinterpret_cast<uint4 *>(ab_cache + a.saved_rows * kIntermediate +
+                                       output_index) =
+                *reinterpret_cast<const uint4 *>(staged_b + offset);
+          }
+        }
+      } else {
+        visit_m128_accumulator_pair<Fc1TileMma>(accum_a, accum_b, store_fc1);
+      }
       __threadfence();
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
       if (threadIdx.x == 0U) {
@@ -852,10 +980,12 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         }
       }
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileEnd, Compute, 0U, task,
+                              execution_epoch(a));
       select_compute_task<StaticLocal>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-          pair_operand_shared, pair_round, fc2_streak);
+          pair_operand_shared, pair_round, fc2_streak, &pair);
       cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
 
@@ -874,25 +1004,29 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #endif
       if (threadIdx.x == 0U)
         atomicMin(&status->dispatch_blocks_done, device_globaltimer_ns());
-      using Fc2TileMma = TunedForwardFc2Mma;
-      float accum[Fc2TileMma::kNumAccum];
+      const auto first_task = *task_shared;
+      const auto tile_count = fc2_tiles_per_cta(first_task, fc2_ntiles);
+      for (std::uint32_t tile_offset = 0; tile_offset < tile_count;
+           ++tile_offset) {
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileStart, Compute, 0U,
+                                first_task + 2ULL * tile_offset,
+                                execution_epoch(a));
+        using Fc2TileMma = TunedForwardFc2Mma;
+        float accum[Fc2TileMma::kNumAccum];
 #pragma unroll
-      for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
-        accum[index] = 0.0F;
-      for (std::uint32_t wave = 0; wave < kConfiguredFc2Waves; ++wave) {
+        for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
+          accum[index] = 0.0F;
 #pragma unroll
-        for (std::uint32_t stage = 0; stage < Fc2StageCount; ++stage) {
-          // Match the producer's persistent barrier phase across FC2 tasks.
-          const auto phase =
-              ((kConfiguredFc2Waves % 2U != 0U ? fc2_pipeline / Fc2StageCount
-                                               : 0U) +
-               wave) &
-              1U;
+        for (std::uint32_t iteration = 0; iteration < kFc2Iterations;
+             ++iteration) {
+          const auto current = fc2_pipeline + iteration;
+          const auto stage = current % Fc2StageCount;
+          const auto phase = (current / Fc2StageCount) & 1U;
           auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
               smem_a + stage * kAStageElements +
               warpgroup * 64U * forward_tuning::kTileK);
           auto *stage_b = reinterpret_cast<cutlass::bfloat16_t *>(
-              smem_b + stage * kFc2BStageElements);
+              fc2_smem_b + stage * kFc2BStageElements);
           fc2_full[stage].wait(phase);
 #pragma unroll
           for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
@@ -916,26 +1050,129 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           if constexpr (forward_tuning::kWgmmaWaitGroup == 0U) {
             if (lane < 2U)
               fc2_empty[stage].arrive(lane);
-          } else if ((wave != 0U || stage != 0U) && lane < 2U) {
+          } else if ((iteration != 0U) && lane < 2U) {
             fc2_empty[(stage + Fc2StageCount - 1U) % Fc2StageCount].arrive(
                 lane);
           }
         }
-      }
-      if constexpr (forward_tuning::kWgmmaWaitGroup != 0U) {
-        cute::warpgroup_wait<0>();
-        const auto lane = threadIdx.x & 31U;
-        if (lane < 2U)
-          fc2_empty[Fc2StageCount - 1U].arrive(lane);
-      }
-      fc2_pipeline += kFc2Iterations;
+        if constexpr (forward_tuning::kWgmmaWaitGroup != 0U) {
+          cute::warpgroup_wait<0>();
+          const auto lane = threadIdx.x & 31U;
+          if (lane < 2U)
+            fc2_empty[(fc2_pipeline + kFc2Iterations - 1U) % Fc2StageCount]
+                .arrive(lane);
+        }
+        fc2_pipeline += kFc2Iterations;
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MathEnd, Compute, 0U,
+                                first_task + 2ULL * tile_offset,
+                                execution_epoch(a));
 
-      // Reload immutable task metadata only after the WGMMA mainloop.  This is
-      // the register analogue of a role union: task/return bookkeeping reuses
-      // registers that the asynchronous accumulator pipeline no longer needs.
-      const auto task = *task_shared;
+        // Reload immutable task metadata only after the WGMMA mainloop.  This
+        // is the register analogue of a role union: task/return bookkeeping
+        // reuses registers that the asynchronous accumulator pipeline no longer
+        // needs.
+        const auto task = first_task + 2ULL * tile_offset;
+        const auto mblock = task / fc2_ntiles;
+        const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
+        const auto mapping = claims[mblock];
+        const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+        const auto local_mblock = static_cast<std::uint32_t>(mapping);
+        const auto row = a.dispatch.expert_row_prefix[expert] +
+                         forward_mblock_local_row(local_mblock);
+        const auto valid_rows =
+            forward_mblock_valid_rows(a, expert, local_mblock);
+        const auto n = n_tile * forward_tuning::kFc2TileN;
+
+        const bool full_tma_tile = valid_rows == forward_tuning::kTileM &&
+                                   n + forward_tuning::kFc2TileN <= kHidden;
+
+        if (full_tma_tile) {
+          // STSM writes a separate output tile while the producer prefetches
+          // the next N tile. A one-tile claim reuses the retired input arena.
+          // Compact expert tails need bounds-checked stores below.
+          // GEMM_DIAGNOSTIC_FC2_EPILOGUE_BEGIN
+          if constexpr (kFc2Pipelined) {
+            if (threadIdx.x < forward_tuning::kFc2TileN / 64U)
+              asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+          }
+          // All math readers retire before the union is reused on fallback.
+          cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
+          auto *output_tile = smem_a + (kFc2Pipelined ? kFc2OutputOffset : 0U);
+          const auto warp = __shfl_sync(0xffffffffU, threadIdx.x / 32U, 0);
+          const auto lane = threadIdx.x & 31U;
+#pragma unroll
+          for (std::uint32_t index = 0; index < Fc2TileMma::kNumAccum / 4U;
+               ++index) {
+            constexpr std::uint32_t kBankGroupBytes = 16U;
+            const auto atom = index / (64U / 8U);
+            const auto in_atom = index % (64U / 8U);
+            const auto swizzle_row = lane;
+            auto swizzle_column = in_atom;
+            swizzle_column ^= swizzle_row % (128U / kBankGroupBytes);
+            auto *smem_pointer = reinterpret_cast<std::uint8_t *>(output_tile) +
+                                 warp * 16U * 128U + atom * 128U * 128U +
+                                 swizzle_row * 128U +
+                                 swizzle_column * kBankGroupBytes;
+            hopper::StoreMatrixX2<__nv_bfloat162>::copy(
+                __float22bfloat162_rn(
+                    make_float2(accum[index * 4U], accum[index * 4U + 1U])),
+                __float22bfloat162_rn(make_float2(accum[index * 4U + 2U],
+                                                  accum[index * 4U + 3U])),
+                smem_pointer);
+          }
+          cute::tma_store_fence();
+          cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
+          if (threadIdx.x <
+              forward_tuning::kFc2TileN / forward_tuning::kFc2StoreAtomN) {
+            const auto atom = threadIdx.x;
+            cute::SM90_TMA_STORE_2D::copy(
+                output_store_map, output_tile + atom * 128U * 64U,
+                static_cast<std::uint32_t>(
+                    n + atom * forward_tuning::kFc2StoreAtomN),
+                static_cast<std::uint32_t>(row));
+            cute::tma_store_arrive();
+            if constexpr (!kFc2Pipelined)
+              asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+          }
+          if constexpr (kFc2Pipelined)
+            __syncwarp();
+          else
+            cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
+          // GEMM_DIAGNOSTIC_FC2_EPILOGUE_END
+        }
+
+        // Compact expert tails use bounds-checked stores to avoid overwriting
+        // the next expert; full tiles use the TMA epilogue above.
+        if (!full_tma_tile) {
+          const auto store_fc2 = [&](std::uint32_t wg, std::uint32_t m,
+                                     std::uint32_t column, float v0, float v1) {
+            const auto output_column = static_cast<std::uint64_t>(n) + column;
+            const auto block_m = wg * 64U + m;
+            const auto output_row = row + block_m;
+            if (block_m < valid_rows && output_column + 1ULL < kHidden) {
+              const auto packed = float2_to_bf16x2_bits(v0, v1);
+              reinterpret_cast<std::uint32_t *>(
+                  forward_output + output_row * kHidden + output_column)[0] =
+                  packed;
+
+            } else if (block_m < valid_rows && output_column < kHidden) {
+              const auto value = transport::BFloat16{float_to_bf16_bits(v0)};
+              forward_output[output_row * kHidden + output_column] = value;
+            }
+          };
+          visit_m128_accumulator<Fc2TileMma>(accum, store_fc2);
+        }
+        // TileEnd marks epilogue issue; TileReady below follows store drain.
+        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileEnd, Compute, 0U, task,
+                                execution_epoch(a));
+      } // tile_offset: prefetch and stores overlap within this range.
+      if constexpr (kFc2Pipelined) {
+        if (threadIdx.x < forward_tuning::kFc2TileN / 64U)
+          asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+      }
+      cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
+      const auto task = first_task;
       const auto mblock = task / fc2_ntiles;
-      const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
       const auto mapping = claims[mblock];
       const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
       const auto local_mblock = static_cast<std::uint32_t>(mapping);
@@ -943,81 +1180,6 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                        forward_mblock_local_row(local_mblock);
       const auto valid_rows =
           forward_mblock_valid_rows(a, expert, local_mblock);
-      const auto n = n_tile * forward_tuning::kFc2TileN;
-
-      const bool full_tma_tile = valid_rows == forward_tuning::kTileM &&
-                                 n + forward_tuning::kFc2TileN <= a.hidden;
-
-      if (full_tma_tile) {
-        // Reuse the 64 KiB FC2 input-stage union after its final consumer.
-        // STSM converts the accumulator fragments directly to the 128-byte
-        // swizzle expected by four 64x128 TMA stores.  Partial expert tails
-        // deliberately stay on the checked scalar path: expert prefixes are
-        // compact rather than padded, so a 128-row store there would clobber
-        // the following expert.
-        auto *output_tile = smem_a;
-        const auto warp = __shfl_sync(0xffffffffU, threadIdx.x / 32U, 0);
-        const auto lane = threadIdx.x & 31U;
-#pragma unroll
-        for (std::uint32_t index = 0; index < Fc2TileMma::kNumAccum / 4U;
-             ++index) {
-          constexpr std::uint32_t kBankGroupBytes = 16U;
-          const auto atom = index / (64U / 8U);
-          const auto in_atom = index % (64U / 8U);
-          const auto swizzle_row = lane;
-          auto swizzle_column = in_atom;
-          swizzle_column ^= swizzle_row % (128U / kBankGroupBytes);
-          auto *smem_pointer = reinterpret_cast<std::uint8_t *>(output_tile) +
-                               warp * 16U * 128U + atom * 128U * 128U +
-                               swizzle_row * 128U +
-                               swizzle_column * kBankGroupBytes;
-          hopper::StoreMatrixX2<__nv_bfloat162>::copy(
-              __float22bfloat162_rn(
-                  make_float2(accum[index * 4U], accum[index * 4U + 1U])),
-              __float22bfloat162_rn(
-                  make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])),
-              smem_pointer);
-        }
-        cute::tma_store_fence();
-        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathReadyBarrier);
-        if (threadIdx.x <
-            forward_tuning::kFc2TileN / forward_tuning::kFc2StoreAtomN) {
-          const auto atom = threadIdx.x;
-          cute::SM90_TMA_STORE_2D::copy(
-              output_store_map, output_tile + atom * 128U * 64U,
-              static_cast<std::uint32_t>(n +
-                                         atom * forward_tuning::kFc2StoreAtomN),
-              static_cast<std::uint32_t>(row));
-          cute::tma_store_arrive();
-          // The unqualified wait both protects the shared-memory union from
-          // the next task and completes the async-to-generic proxy handoff
-          // needed before FC2 publishes its completion counter.
-          asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
-        }
-        cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
-      }
-
-      // Compact expert tails use bounds-checked stores to avoid overwriting
-      // the next expert; full tiles use the TMA epilogue above.
-      if (!full_tma_tile) {
-        const auto store_fc2 = [&](std::uint32_t wg, std::uint32_t m,
-                                   std::uint32_t column, float v0, float v1) {
-          const auto output_column = static_cast<std::uint64_t>(n) + column;
-          const auto block_m = wg * 64U + m;
-          const auto output_row = row + block_m;
-          if (block_m < valid_rows && output_column + 1ULL < a.hidden) {
-            const auto packed = float2_to_bf16x2_bits(v0, v1);
-            reinterpret_cast<std::uint32_t *>(
-                forward_output + output_row * a.hidden + output_column)[0] =
-                packed;
-
-          } else if (block_m < valid_rows && output_column < a.hidden) {
-            const auto value = transport::BFloat16{float_to_bf16_bits(v0)};
-            forward_output[output_row * a.hidden + output_column] = value;
-          }
-        };
-        visit_m128_accumulator<Fc2TileMma>(accum, store_fc2);
-      }
       // N-tiles synchronize only through this GPU-local completion chain.
       // A device fence is sufficient here; the final N-tile acquires the
       // chain and performs one system fence for the whole M-block below.
@@ -1026,23 +1188,26 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       if (threadIdx.x == 0U) {
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             complete(fc1_done[mblock]);
-        const auto old =
-            complete.fetch_add(1ULL << 16U, ::cuda::memory_order_acq_rel);
+        const auto old = complete.fetch_add(
+            static_cast<unsigned long long>(tile_count) << 16U,
+            ::cuda::memory_order_acq_rel);
         *return_mblock_shared =
-            (((old >> 16U) & 0xffffULL) + 1ULL == fc2_ntiles) ? 1U : 0U;
+            (((old >> 16U) & 0xffffULL) + tile_count == fc2_ntiles) ? 1U : 0U;
 #if WEFTMOE_DEBUG_VALIDATE
         if constexpr (!StaticLocal) {
           if (a.use_gin)
-            complete_completion_tasks(completion,
-                                      transport_state::TaskClass::Fc2);
+            for (unsigned offset = 0; offset < tile_count; ++offset)
+              complete_completion_tasks(completion,
+                                        transport_state::TaskClass::Fc2);
         }
 #endif
       }
       cutlass::arch::NamedBarrier::sync(kMathThreads, kMathDoneBarrier);
 
       if (threadIdx.x == 0U)
-        WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U, task,
-                                execution_epoch(a));
+        for (unsigned offset = 0; offset < tile_count; ++offset)
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileReady, Compute, 0U,
+                                  task + 2ULL * offset, execution_epoch(a));
 
       if (*return_mblock_shared != 0U) {
         // Thread 0's acq_rel RMW above acquired every earlier N-tile release.
@@ -1077,7 +1242,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       select_compute_task<StaticLocal>(
           a, scheduler, claims, fc2_ready_queue, fc1_tasks, fc2_tasks,
           fc1_ntiles, fc2_ntiles, completion, task_shared, task_kind_shared,
-          pair_operand_shared, pair_round, fc2_streak);
+          pair_operand_shared, pair_round, fc2_streak, &pair);
       cutlass::arch::NamedBarrier::sync(kThreads, kTaskDoneBarrier);
     }
 

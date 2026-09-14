@@ -11,6 +11,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 #include <cuda_runtime_api.h>
+#include <cuda_profiler_api.h>
 
 #include "benchmark_tensor_allocator.hpp"
 #include "cuda/activation_transport_internal.hpp"
@@ -3261,13 +3263,16 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     // while changing where tokens originate. This changes routing semantics
     // and must not be used as an output-equivalence fixture.
     if (const char *scope = std::getenv("WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE")) {
-      require(gin_forward_benchmark && world == 16U && top_k == 1U &&
-                  max_tokens % experts == 0U,
-              "route-scope diagnostic requires EP16 top-1 and whole expert cycles");
+      require(benchmark_forward && (world == 8U || world == 16U) &&
+                  max_tokens % experts == 0U && std::gcd(17U, experts) == 1U,
+              "route-scope diagnostic requires EP8/EP16 and balanced whole expert cycles");
       const std::string mode(scope);
       require(mode == "self" || mode == "node" || mode == "remote",
               "diagnostic route scope must be self, node, or remote");
       const auto width = mode == "self" ? experts / world : experts / nodes;
+      require((mode != "remote" || nodes == 2U) &&
+                  top_k <= width / std::gcd(route_stride, width),
+              "route-scope diagnostic must preserve distinct selected experts");
       const auto owner = mode == "self" ? rank :
           (mode == "node" ? rank / gpus_per_node : 1U - rank / gpus_per_node);
       for (auto &expert : common_routes.selected_experts)
@@ -3687,6 +3692,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     double first_use_notify_us = 0;
     double first_use_buffer_prepare_us = 0;
     double first_use_forward_us = 0;
+    const bool profile_last_round =
+        std::getenv("WEFTMOE_PROFILE_LAST_ROUND") != nullptr;
     auto forward_api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
       if (round == 10U) {
@@ -3706,6 +3713,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         input_lease = {};
       }
       benchmark_rank_barrier(rank_barrier, base, execution_state->stream);
+      if (profile_last_round && round + 1U == rounds)
+        check_input_cuda(cudaProfilerStart());
       const auto wall_start = Clock::now();
       last_output = {};
       weftmoe::cuda::CudaTensorBuffer fresh_input;
@@ -3809,6 +3818,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                   << " round=" << round << " phase=forward_done"
                   << std::endl;
       const auto wall_end = Clock::now();
+      if (profile_last_round && round + 1U == rounds)
+        check_input_cuda(cudaProfilerStop());
       last_audit = output.audit();
       last_output = output;
       if (check_repeats)

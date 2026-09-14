@@ -74,6 +74,15 @@ struct LocalReturnState {
 __device__ __forceinline__ bool
 local_return_terminal(const ForwardKernelArgs &a,
                       const LocalReturnState &state) {
+  if (return_queue_detail::local_peer_queues(a)) {
+    for (unsigned peer = 0; peer < a.local_world_size; ++peer) {
+      auto &queue = return_queue_detail::queues(a)[1U + peer];
+      if (persistent_v3::load_acquire<::cuda::thread_scope_device>(
+              queue.head) != queue.capacity)
+        return false;
+    }
+    return true;
+  }
   auto &queue = return_queue_detail::queues(a)[state.queue_index];
   // Notify supplies the exact row count. Every claim follows publication,
   // so no separate producer-completion counter is needed for an empty queue.
@@ -95,10 +104,33 @@ progress_local_return(const ForwardKernelArgs &a,
     threads = blockDim.x;
   if (threadIdx.x == 0U) {
     state.selected = 0U;
-    if (!cancelled(a, control))
-      state.cursor =
-          claim_rows(return_queue_detail::queues(a)[state.queue_index],
-                     a.forward_local_return_batch_rows, state.selected);
+    if (!cancelled(a, control)) {
+      if (return_queue_detail::local_peer_queues(a)) {
+        const auto preferred = (a.rank + blockIdx.x) % a.local_world_size;
+        for (unsigned probe = 0; probe < a.local_world_size; ++probe) {
+          state.queue_index = 1U + (preferred + probe) % a.local_world_size;
+          state.cursor =
+              claim_rows(return_queue_detail::queues(a)[state.queue_index],
+                         a.forward_local_return_batch_rows, state.selected);
+          if (state.selected != 0U)
+            break;
+          // Keep each peer's usual workers while its finite queue is still
+          // producing. Once it drains, those workers may help any other peer.
+          // This avoids fragmenting normal Return batches during FC2 startup.
+          if (probe == 0U) {
+            auto &preferred_queue =
+                return_queue_detail::queues(a)[state.queue_index];
+            if (persistent_v3::load_acquire<::cuda::thread_scope_device>(
+                    preferred_queue.head) != preferred_queue.capacity)
+              break;
+          }
+        }
+      } else {
+        state.cursor =
+            claim_rows(return_queue_detail::queues(a)[state.queue_index],
+                       a.forward_local_return_batch_rows, state.selected);
+      }
+    }
   }
   copy_sync(threads);
   if (state.selected == 0U)
@@ -161,11 +193,8 @@ progress_local_return(const ForwardKernelArgs &a,
         header.source_rank % a.local_world_size, header.route_index};
   };
   if (state.queue_index) {
-    const auto incoming =
-        (a.rank + a.local_world_size - blockIdx.x % a.local_world_size) %
-        a.local_world_size;
     local_notification_detail::publish_peer_return(
-        a, state.queue_index - 1U, state.selected, threads, fill, incoming);
+        a, state.queue_index - 1U, state.selected, threads, fill, UINT32_MAX);
   } else
     local_notification_detail::publish_return(a, state.selected, threads, fill);
   unsigned int peer_rows = 0U;

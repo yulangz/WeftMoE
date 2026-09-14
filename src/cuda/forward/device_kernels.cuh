@@ -59,9 +59,6 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
       peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
-  auto *forward_compute_pair_mailboxes =
-      peer_at<persistent_v3::ForwardComputePairMailbox>(
-          a.local_base, a.forward_compute_pair_mailboxes_offset);
   auto *forward_reduce_route_count =
       peer_at<unsigned int>(a.local_base, a.forward_reduce_route_count_offset);
   auto *forward_reduce_ready_token = peer_at<unsigned long long>(
@@ -208,15 +205,6 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
        mtile += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
     fc1_done[mtile] = execution_epoch(a) << 32U;
   }
-  for (std::uint64_t pair =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       pair < persistent_v3::kForwardComputePairCapacity;
-       pair += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
-    forward_compute_pair_mailboxes[pair].sequence = 0ULL;
-    forward_compute_pair_mailboxes[pair].tasks[0] = 0ULL;
-    forward_compute_pair_mailboxes[pair].tasks[1] = 0ULL;
-    forward_compute_pair_mailboxes[pair].metadata = 0ULL;
-  }
   if (a.forward_dynamic_reduce_queue || a.forward_dynamic_reduce_scan) {
     for (std::uint64_t token =
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -255,9 +243,6 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
   const auto setup_fc1_ntiles = static_cast<std::uint32_t>(
       (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
       forward_tuning::kFc1TileN);
-  const auto setup_fc2_ntiles =
-      static_cast<std::uint32_t>((a.hidden + forward_tuning::kFc2TileN - 1ULL) /
-                                 forward_tuning::kFc2TileN);
   const auto setup_mblocks = scheduler[3];
   // The first words are an immutable expert/local-M lookup in Notify's M-tile
   // wavefront order.  The following regions are generation-local,
@@ -272,13 +257,9 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
                                                       local_mblock);
 #endif
   });
-  // FC1-ready tasks, then FC2 M-block descriptors and their private N-tile
-  // ticket counters, live after the immutable M-block mapping.  The FC2
-  // region retains fc2_ntiles words per M-block, so the two M-block-sized
-  // arrays fit without changing the pooled ABI. FULL Return has a separate
-  // append-only descriptor array.
-  const auto setup_task_count =
-      setup_mblocks * (setup_fc1_ntiles + setup_fc2_ntiles);
+  // FC2's shared ticket indexes N-pairs in a published M-block. Only its
+  // M-block descriptors follow the FC1-ready queue; no per-M ticket array.
+  const auto setup_task_count = setup_mblocks * (setup_fc1_ntiles + 1ULL);
   for (std::uint64_t task =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        task < setup_task_count;
@@ -1140,12 +1121,19 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
     status->dispatch_complete_clock = device_globaltimer_ns();
     status->fc1_start_clock = status->dispatch_complete_clock;
   }
-  WEFTMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
-                          dispatch_sizes(a.dispatch).mtile_count,
-                          execution_epoch(a));
-  WEFTMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
-                          dispatch_sizes(a.dispatch).mtile_count,
-                          execution_epoch(a));
+  // A streaming role returns here after both Dispatch and Return drain.
+  // Its Dispatch timestamp is published inside the relay pipeline instead.
+  if (stream_remote_dispatch || stream_local_dispatch) {
+    WEFTMOE_TIMELINE_RECORD(a.timeline, TransportRoleDone, Kernel, 0U, 0ULL,
+                            execution_epoch(a));
+  } else {
+    WEFTMOE_TIMELINE_RECORD(a.timeline, XTileReady, Compute, 0U,
+                            dispatch_sizes(a.dispatch).mtile_count,
+                            execution_epoch(a));
+    WEFTMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, Compute, 0U,
+                            dispatch_sizes(a.dispatch).mtile_count,
+                            execution_epoch(a));
+  }
 
   if (stream_local_dispatch)
     return;

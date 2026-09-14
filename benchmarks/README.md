@@ -4,6 +4,16 @@ Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).
 
+The current [1620 MHz GEMM report](gemm_optimization_20260914.md) records the
+FC2 optimization, cuBLAS comparisons for FWD and BWD, and allocation-inclusive
+FWD results against Flex. It includes [raw samples and validation records](gemm_optimization_20260914.json)
+and uses the [2026-09-14 profiles](../configs/performance_20260914/profiles.json).
+The earlier [Qwen diagnosis](qwen_forward_diagnosis_20260914.md) and
+[Forward optimization report](forward_optimization_20260914.md) describe the
+communication, scheduler, and epilogue work preceding that measurement. Their
+clock conditions differ; use the current report for the same-frequency cuBLAS
+comparison.
+
 The archived EP8/EP16 comparison is in
 [the 2026-09-13 report](performance_20260913.md), with
 [statistics and raw timing samples](performance_20260913.json) and
@@ -25,6 +35,19 @@ are measured independently of that archive.
   supplies routing gates for reference checks.
 - `notify_dispatch_bench.cpp` is built with
   `python3 build_native.py metadata-bench`.
+- `run_gemm_diagnostics.py` builds `pure_forward_gemm.cu` or
+  `pure_backward_gemm.cu` with an explicit tuning header. The forward benchmark
+  extracts production WGMMA math and the FC2 epilogue; the backward benchmark
+  calls the production GEMM routines. `gemm_benchmark.cuh` provides the shared
+  cuBLAS comparison, full-output checks, CUDA Graph timing, and NVML sampling.
+- `run_gemm_matrix.py` runs prebuilt diagnostics for the EP8/EP16 shapes. This
+  measures isolated GEMMs with preallocated tensors; it observes GPU clocks
+  and never changes them. `run_forward_gemm_diagnostics.py` retains the older
+  forward build entry point.
+- `forward_diagnostics.py` is enabled through the Flex baseline's
+  `--forward-diagnostics-dir` option. It records communication-only and isolated
+  expert measurements, stage events, HCA counters, and a Chrome trace after
+  the formal timing has finished.
 
 For a communication-only measurement of the production FWD protocol, build
 `cuda-test` with `-DWEFTMOE_BENCH_TRANSPORT_ONLY=1` in `NVCCFLAGS`, alongside

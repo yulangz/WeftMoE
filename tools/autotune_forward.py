@@ -67,6 +67,7 @@ PARAMETER_MACROS = {
     "tile_k": "WEFTMOE_FWD_TILE_K",
     "fc1_stages": "WEFTMOE_FWD_FC1_STAGES",
     "fc2_stages": "WEFTMOE_FWD_FC2_STAGES",
+    "fc2_claim_tiles": "WEFTMOE_FWD_FC2_CLAIM_TILES",
     "compute_threads": "WEFTMOE_FWD_COMPUTE_THREADS",
     "math_warpgroups": "WEFTMOE_FWD_MATH_WARPGROUPS",
     "producer_warpgroups": "WEFTMOE_FWD_PRODUCER_WARPGROUPS",
@@ -189,6 +190,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "the Hopper 128-byte-swizzle TMA descriptor requires tile_k=64")
     _require_choice(config, "fc1_stages", (2, 3, 4))
     _require_choice(config, "fc2_stages", (2, 3, 4))
+    _require_choice(config, "fc2_claim_tiles", (1, 2, 4, 8))
     _require(config["compute_threads"] == 384,
              "the current producer + two-math-WG kernel requires 384 threads")
     _require(config["math_warpgroups"] == 2,
@@ -212,9 +214,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "Forward requires cluster_size=2 for TMA multicast")
     _require(config["fc2_tma_store"],
              "Forward requires the FC2 TMA-store epilogue")
-    _require((config["main_intermediate"] // config["tile_k"]) %
-             config["fc2_stages"] == 0,
-             "FC2 reduction iterations must be divisible by fc2_stages")
+    _require(dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
+             "GEMM input/output staging exceeds Hopper shared memory")
     _require((config["main_intermediate"] // config["fc1_tile_n"]) % 2 == 0
              and (config["main_hidden"] // config["fc2_tile_n"]) % 2 == 0,
              "cluster multicast requires even FC1 and FC2 N-tile counts")
@@ -374,12 +375,15 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     _require(document.get("schema") in (2, 3), "plan schema must be 2 or 3")
     if document["schema"] == 2:
+        document.get("fixed", {}).get("1_gemm", {}).setdefault("fc2_claim_tiles", 1)
         # Historical frozen plans retain this removed tail-only parameter.
         # New pure hyperparameter files reject it as unknown.
         groups = [document.get("fixed", {})] + [c.get("override", {}) for c in document.get("candidates", [])]
         for group in groups:
             group.get("4_completion_reduce", {}).pop("reduce_cta_divisor", None)
     if document["schema"] == 3:
+        document.get("search_space", {}).get("1_gemm", {}).setdefault(
+            "fc2_claim_tiles", [1])
         expand_search_space(document)
     for section in ("jit", "benchmark", "selection", "fixed", "candidates"):
         _require(section in document, f"plan omits {section}")
@@ -530,10 +534,13 @@ def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, in
     b_storage = max(2 * config["fc1_stages"] * fc1_b_stage,
                     config["fc2_stages"] * fc2_b_stage)
     barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
-    gemm_bytes = 2 * (a_storage + b_storage)
+    fc2_storage = config["fc2_stages"] * (a_stage + fc2_b_stage)
+    if config["fc2_claim_tiles"] > 1:
+        fc2_storage += config["tile_m"] * config["fc2_tile_n"]
+    gemm_bytes = 2 * max(a_storage + b_storage, fc2_storage)
     control_bytes = barriers * 8 + world * 4
     row_streams = max(config["local_dispatch_tma_warps"],
-                      config["relay_tma_warps"])
+                      config["relay_tma_warps"], config["relay_scatter_warps"])
     transport_rows = row_streams * config["main_hidden"] * 2
     return {
         "compute_bytes": gemm_bytes + control_bytes,

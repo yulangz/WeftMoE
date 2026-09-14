@@ -17,7 +17,7 @@
       4
     ],
     "fc2_stages": [
-      4
+      3
     ],
     "compute_threads": [
       384
@@ -45,6 +45,11 @@
     ],
     "fc2_tma_store": [
       true
+    ],
+    "fc2_claim_tiles": [
+      4,
+      2,
+      1
     ]
   },
   "2_transport": {

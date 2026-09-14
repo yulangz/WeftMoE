@@ -42,6 +42,8 @@ receive_dispatch(const ForwardKernelArgs &a, const wire::Transfer &task,
                  transport_state::GenerationCompletionVector *completion,
                  std::byte *storage,
                  forward_return_detail::ReturnCopyBarrier *full) {
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayStart, ProxyRelay, task.channel,
+                          task.rows, execution_epoch(a));
   const auto *chunk = static_cast<const char *>(a.gin_window_base) +
                       a.gin_rings.payload(task.channel, task.sequence, true) +
                       sizeof(ring::ChunkHeader);
@@ -125,10 +127,14 @@ receive_dispatch(const ForwardKernelArgs &a, const wire::Transfer &task,
     wire::finish_receive(a, task);
   }
   __syncthreads();
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ProxyRelayEnd, ProxyRelay, task.channel,
+                          task.rows, execution_epoch(a));
 }
 
 __device__ __forceinline__ void receive_return(const ForwardKernelArgs &a,
                                                const wire::Transfer &task) {
+  WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayStart, SourceRelay, task.channel,
+                          task.rows, execution_epoch(a));
   const auto *chunk = static_cast<const char *>(a.gin_window_base) +
                       a.gin_rings.payload(task.channel, task.sequence, true) +
                       sizeof(ring::ChunkHeader);
@@ -155,6 +161,8 @@ __device__ __forceinline__ void receive_return(const ForwardKernelArgs &a,
   if (!threadIdx.x)
     wire::finish_receive(a, task);
   __syncthreads();
+  WEFTMOE_TIMELINE_RECORD(a.timeline, SourceRelayEnd, SourceRelay, task.channel,
+                          task.rows, execution_epoch(a));
 }
 
 __device__ __forceinline__ bool receive_complete(const ForwardKernelArgs &a,
@@ -212,12 +220,28 @@ __device__ __forceinline__ void rdma_role(
         break;
       if (task.channel != wire::kNoChannel) {
         const bool dispatch = task.channel < a.gin_rings.dispatch_channels;
-        if (dispatch)
+        if (dispatch) {
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPackStart, GinDispatch,
+                                  task.channel, task.rows, execution_epoch(a));
           wire::pack_dispatch(a, task, a.input, a.gates);
-        else
+          WEFTMOE_TIMELINE_RECORD(a.timeline, DispatchPackEnd, GinDispatch,
+                                  task.channel, task.rows, execution_epoch(a));
+        } else {
+          WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnPackStart, GinReturn,
+                                  task.channel, task.rows, execution_epoch(a));
           ring_detail::pack_return(a, task);
+          WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnPackEnd, GinReturn,
+                                  task.channel, task.rows, execution_epoch(a));
+        }
         if (!threadIdx.x) {
           wire::send(a, task);
+          if (dispatch) {
+            WEFTMOE_TIMELINE_RECORD(a.timeline, GinPutIssue, GinDispatch,
+                                    task.channel, task.rows, execution_epoch(a));
+          } else {
+            WEFTMOE_TIMELINE_RECORD(a.timeline, ReturnGinPutIssue, GinReturn,
+                                    task.channel, task.rows, execution_epoch(a));
+          }
           auto *status =
               peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
           const auto bytes = 1ULL * task.rows * a.hidden * 2ULL;
@@ -348,9 +372,12 @@ relay_role(const ForwardKernelArgs &a,
         const auto previous =
             persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
                 control.relay_dispatch_roles_complete.value, 1ULL);
-        if (previous + 1ULL == a.forward_relay_cta_count)
+        if (previous + 1ULL == a.forward_relay_cta_count) {
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
               ->dispatch_complete_clock = device_globaltimer_ns();
+          WEFTMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, ProxyRelay,
+                                  0U, local_end, execution_epoch(a));
+        }
         dispatch_done = true;
       }
       done = cancelled(a, control) ||

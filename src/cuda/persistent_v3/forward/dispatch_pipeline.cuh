@@ -542,13 +542,16 @@ local_relay_role(const ForwardKernelArgs &a,
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       status->dispatch_complete_clock = device_globaltimer_ns();
+      WEFTMOE_TIMELINE_RECORD(a.timeline, XDispatchComplete, ProxyRelay, 0U,
+                              route_count, execution_epoch(a));
     }
   }
 
   // Once this CTA's finite Dispatch/publisher work is drained, reuse the
   // copy warps and the same row-sized SMEM slots for Return. All Relay CTAs
   // consume confirmed rows while compute publishes subsequent M-blocks.
-  // Rank-pair queues keep each CTA on one NVLink peer throughout Return.
+  // Prefer the original NVLink peer, but let an idle CTA claim another
+  // ready queue. Every CTA must therefore receive/drain all incoming peers.
   const bool peer_queues = return_queue_detail::local_peer_queues(a);
   const auto return_peer =
       peer_queues ? (a.rank + blockIdx.x) % a.local_world_size : UINT32_MAX;
@@ -577,7 +580,8 @@ local_relay_role(const ForwardKernelArgs &a,
                  local_return_done)
                      .load(::cuda::memory_order_acquire) == 0U &&
              !cancelled(a, control))
-        if (!local_notification_detail::progress(a, incoming_peer))
+        if (!local_notification_detail::progress(a, incoming_peer) &&
+            !local_notification_detail::progress(a))
           __nanosleep(50);
     } else {
       while (local_return_done == 0U && !cancelled(a, control)) {
@@ -604,7 +608,7 @@ local_relay_role(const ForwardKernelArgs &a,
     }
     __syncthreads();
   }
-  local_notification_detail::drain(a, return_peer, incoming_peer);
+  local_notification_detail::drain(a);
   __syncthreads();
 }
 

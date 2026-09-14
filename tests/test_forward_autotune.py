@@ -49,13 +49,24 @@ class ForwardAutotuneTest(unittest.TestCase):
                               main_intermediate=768,
                               fc1_stages=fc1_stages,
                               fc2_stages=fc2_stages,
+                              fc2_claim_tiles=1,
                               fc2_tma_store=True, cluster_size=2)
                 tune.validate_tuning(config)
 
-    def test_fc2_stages_must_divide_reduction_iterations(self):
+    def test_fc2_pipeline_accepts_partial_stage_cycles(self):
         config = dict(self.candidates[0]["config"],
-                      main_intermediate=2048, fc2_stages=3)
-        with self.assertRaisesRegex(tune.PlanError, "divisible"):
+                      main_hidden=2560, main_intermediate=1280,
+                      fc2_stages=3, fc2_claim_tiles=4)
+        tune.validate_tuning(config)
+
+    def test_fc2_prefetch_reserves_output_storage(self):
+        config = dict(self.candidates[0]["config"],
+                      fc2_stages=3, fc2_claim_tiles=4)
+        tune.validate_tuning(config)
+        self.assertEqual(tune.dynamic_shared_memory(config, 16)["compute_bytes"],
+                         213200)
+        config["fc2_stages"] = 4
+        with self.assertRaisesRegex(tune.PlanError, "shared memory"):
             tune.validate_tuning(config)
 
     def test_multicast_requires_even_n_tile_counts(self):
@@ -398,8 +409,8 @@ class ForwardAutotuneTest(unittest.TestCase):
 
     def test_shared_memory_model_matches_current_m128_shape(self):
         memory = tune.dynamic_shared_memory(self.candidates[0]["config"], 16)
-        self.assertEqual(memory["compute_bytes"], 196832)
-        self.assertEqual(memory["transport_bytes"], 196832)
+        self.assertEqual(memory["compute_bytes"], 213200)
+        self.assertEqual(memory["transport_bytes"], 213200)
 
 
 if __name__ == "__main__":

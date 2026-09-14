@@ -63,6 +63,16 @@ EVENTS = {
     77: "full_return_chunk_ready",
     78: "full_return_chunk_published",
     79: "fc2_mblock_return_ready",
+    80: "compute_select_start",
+    81: "compute_select_end",
+    82: "fc1_tile_start",
+    83: "fc1_math_end",
+    84: "fc1_tile_end",
+    85: "fc2_tile_start",
+    86: "fc2_math_end",
+    87: "fc2_tile_end",
+    88: "compute_pair_join_end",
+    89: "transport_role_done",
 }
 
 PAIRS = {

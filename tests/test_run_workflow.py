@@ -61,13 +61,20 @@ class RunWorkflowTest(unittest.TestCase):
                                     autotune=True, generate_only=True)
                 self.assertEqual(plain['candidates'][0]['config'],
                                  tune['candidates'][0]['config'])
-                self.assertLessEqual(len(tune['candidates']), 80)
                 gemm = plain['candidates'][0]['config']
                 if phase == 'forward':
+                    # FC2's three claim sizes extend the existing bounded
+                    # transport search without changing its incumbent.
+                    self.assertLessEqual(len(tune['candidates']), 3 * 80)
+                    self.assertEqual(
+                        {candidate['config']['fc2_claim_tiles']
+                         for candidate in tune['candidates']}, {1, 2, 4})
                     self.assertEqual((gemm['fc1_tile_n'], gemm['fc2_tile_n'],
-                                      gemm['fc1_stages'], gemm['fc2_stages']),
-                                     (128, 256, 4, 4))
+                                      gemm['fc1_stages'], gemm['fc2_stages'],
+                                      gemm['fc2_claim_tiles']),
+                                     (128, 256, 4, 3, 4))
                 else:
+                    self.assertLessEqual(len(tune['candidates']), 80)
                     self.assertEqual((gemm['dab_tile_n'], gemm['dx_tile_n'],
                                       gemm['dw_tile_m'], gemm['dw_tile_n'],
                                       gemm['dab_stages'], gemm['dw1_stages']),

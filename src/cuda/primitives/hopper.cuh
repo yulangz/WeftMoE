@@ -87,10 +87,10 @@ template <uint32_t Inner, uint32_t Outer, uint32_t Swizzle, class T>
 CUTLASS_DEVICE void tma_load(
     void const* map, cutlass::arch::ClusterTransactionBarrier* barrier,
     T* shared, const uint32_t& inner, const uint32_t& outer,
-    const uint32_t& multicast = 1) {
+    const uint32_t& multicast = 1,
+    uint64_t hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
   static_assert(Swizzle == 128);
   constexpr auto atom = Swizzle / sizeof(T);
-  constexpr auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
   if (multicast == 1) {
 #pragma unroll
     for (uint32_t i = 0; i < Inner / atom; ++i)
