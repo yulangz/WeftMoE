@@ -8616,7 +8616,7 @@
         }
       ],
       "protocol": "Combine private two-slot Dispatch lane prefetch, local Dispatch quota4, remote FC1 priority, synchronized local Return deferral, and per-peer local Return queues. Every GIN Return receive is still serviced each loop. No payload format/volume or completion relaxation.",
-      "finding": "Qwen EP16 8K baseline Dispatch28.868/Return39.824GB/s;2-lane combined32.726/41.247;4-lane combined33.139/41.379. GPU4688.610->4485.340/4470.960us;allocation-inclusive wall6140.600->5950.605/5881.130us.128 sparse files exact over12 native repetitions. Two-lane variant selected for full confirmation because its FC1 pipeline retains4 stages versus3 in four-lane variant;full Qwen8K Forward5065.615->4985.500us (-1.58%),wall6531.240->6375.410us.192 full golden files exact over20 repetitions. BWD/Flash and full64K still unvalidated,not adopted. Pure Qwen64K: Dispatch34.086->40.220GB/s,Return45.699->46.126;GPU31265.250->29971.950us.64 prefix files exact with20 native repeated outputs;still below42GB/s Dispatch.",
+      "finding": "Qwen EP16 8K baseline Dispatch28.868/Return39.824GB/s;2-lane combined32.726/41.247;4-lane combined33.139/41.379. GPU4688.610->4485.340/4470.960us;allocation-inclusive wall6140.600->5950.605/5881.130us.128 sparse files exact over12 native repetitions. Two-lane variant selected for full confirmation because its FC1 pipeline retains4 stages versus3 in four-lane variant;full Qwen8K Forward5065.615->4985.500us (-1.58%),wall6531.240->6375.410us.192 full golden files exact over20 repetitions. Qwen EP16 BWD t129 E32 validation passed:160 golden files exact including dW1/dW2 with native repeats. Flash and full64K remain unvalidated,not adopted. Pure Qwen64K: Dispatch34.086->40.220GB/s,Return45.699->46.126;GPU31265.250->29971.950us.64 prefix files exact with20 native repeated outputs;still below42GB/s Dispatch.",
       "full_confirmation": {
         "raw_results": "results/communication_bottleneck_20260915/balanced_dispatch_lanes2_training",
         "cases": [
@@ -8780,6 +8780,25 @@
             "stderr": ""
           }
         ]
+      },
+      "backward_qwen_ep16": {
+        "all_byte_identical": true,
+        "files_compared": 160,
+        "includes": [
+          "dx",
+          "dw1",
+          "dw2",
+          "dgate"
+        ],
+        "world": 16,
+        "tokens": 129,
+        "experts": 32,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "native_repeat_enabled": true,
+        "golden": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/gemm_optimization_20260914/validation/backward/qwen_ep16/tensors",
+        "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.6cacfc5a0147be60a31070eb6abd14663e059078899ad8e730f52d05251548cc/test_cuda_notify"
       }
     },
     {
@@ -10027,6 +10046,55 @@
         "results/communication_bottleneck_20260915/existing_profile_setup_launch_gaps.json"
       ],
       "finding": "Reused existing Nsight captures; no new GPU run. Across local GPUs pure Qwen8K setup median30.848us and setup-to-unified gap1.280us (160 captured pairs);64K110.512us and1.744us (8pairs);full8K30.656us and1.392us (8pairs). Kernel intervals from CUPTI, same-GPU pairing. The notion that an unavoidable ~300us setup/launch floor explains8K throughput is unsupported; focus remains active transport service, ramp-up and tail. Setup/start timestamps remain included and unchanged."
+    },
+    {
+      "name": "Pipelined balanced pure Dispatch: remaining tail",
+      "source_commit": "5c45d42",
+      "raw_results": "results/communication_bottleneck_20260915/nsys_pure_balanced_dispatch_lanes2_qwen_ep16_8k_last",
+      "analysis": "results/communication_bottleneck_20260915/balanced_pure_dispatch_tail.json",
+      "figure": "results/communication_bottleneck_20260915/balanced_pure_metrics.png",
+      "profiled_case": {
+        "name": "balanced_dispatch_lanes2_pure_ep16_8192",
+        "returncode": 0,
+        "summary": {
+          "timing_us": {
+            "dispatch": 1019.86,
+            "fc2": 139.56799999999998,
+            "return": 3246.19,
+            "reduce": 2388.19,
+            "forward": 4472.014999999999,
+            "wall": 5870.765
+          },
+          "payload_GBps": {
+            "nv_dispatch": 230.3071245072853,
+            "nv_return": 36.17795384743346,
+            "rdma_dispatch": 32.90101778675505,
+            "rdma_return": 41.34623296849537
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        }
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "finding": "Qwen EP16 8K last steady iteration on8 local GPUs: PCIe TX first>=70% sample at176-242us after own setup origin; last high Dispatch sample at734-842us. Remaining time to own approximate Dispatch end185-288us,with NVLink TX28-48.5% of respective peak in tail samples. Bulk PCIe sustained~80%. Thresholds are not packet/completion timestamps and local Return traffic from faster ranks may overlap. Test dynamic local Dispatch work distribution to identify fixed-stripe stragglers. Profiled rates are diagnostic,not new goal performance;20 native checks passed,no kernel replay."
     }
   ]
 }
