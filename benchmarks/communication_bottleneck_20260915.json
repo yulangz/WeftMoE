@@ -8305,7 +8305,92 @@
         }
       ],
       "protocol": "Extend existing EP8 per-peer Return queues to GIN local peers behind an opt-in macro. Queue indices use global source rank; local consumers and notification destinations include node offset/modulo. Storage, payload, producer confirmation and notification ordering unchanged. Backward generic queue policy unchanged.",
-      "finding": "Qwen EP16 8K Return39.862->40.791GB/s (+2.33%),Dispatch28.820->28.323;GPU4686.225->4605.200us,allocation-inclusive wall6141.805->6001.315us. Synthetic FC2 interval565.824->132.672us supports reduced producer serialization but does not establish full GEMM behavior.64 sparse files exact over12 repetitions. Full Forward confirmation building; no adoption or broad correctness claim."
+      "finding": "Qwen EP16 8K Return39.862->40.791GB/s (+2.33%),Dispatch28.820->28.323;GPU4686.225->4605.200us,allocation-inclusive wall6141.805->6001.315us. Synthetic FC2 interval565.824->132.672us supports reduced producer serialization but does not establish full GEMM behavior.64 sparse files exact over12 repetitions. Full Qwen8K Forward5081.585->5047.820us (-0.66%),wall6559.535->6490.180us.192 full golden files exact at129/8K over20 native repetitions. One pair does not establish a full win;64K,Flash,BWD still unvalidated. Not adopted.",
+      "full_confirmation": {
+        "raw_results": "results/communication_bottleneck_20260915/gin_local_peer_queues_training",
+        "cases": [
+          {
+            "name": "targeted_flush_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1488.895,
+                "fc2": 2183.71,
+                "return": 4245.92,
+                "reduce": 2651.1549999999997,
+                "forward": 5081.584999999999,
+                "wall": 6559.535
+              },
+              "payload_GBps": {
+                "nv_dispatch": 157.75526413884123,
+                "nv_return": 27.65961487734107,
+                "rdma_dispatch": 22.536466305548746,
+                "rdma_return": 31.610988431246938
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "gin_local_peer_queues_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1497.23,
+                "fc2": 2183.2200000000003,
+                "return": 4207.219999999999,
+                "reduce": 2617.0249999999996,
+                "forward": 5047.82,
+                "wall": 6490.18
+              },
+              "payload_GBps": {
+                "nv_dispatch": 156.87704895039505,
+                "nv_return": 27.914041100774387,
+                "rdma_dispatch": 22.411006992913578,
+                "rdma_return": 31.90176125802787
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": [
+          {
+            "all_byte_identical": true,
+            "files_compared": 64,
+            "repetitions": 20
+          },
+          {
+            "all_byte_identical": true,
+            "files_compared": 128,
+            "repetitions": 20
+          }
+        ],
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          },
+          {
+            "node": "remote",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          }
+        ]
+      }
     }
   ],
   "diagnostics": [
