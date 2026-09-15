@@ -6348,6 +6348,78 @@
         "all_byte_identical": true,
         "repetitions": 20
       }
+    },
+    {
+      "name": "Cache received fanout UVA destinations in packet scratch",
+      "adopted": false,
+      "experimental_commit": "b8a88f1",
+      "raw_results": "results/communication_bottleneck_20260915/fanout_address_cache_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1160.91,
+              "fc2": 579.712,
+              "return": 3371.49,
+              "reduce": 2378.0950000000003,
+              "forward": 4706.6900000000005,
+              "wall": 6153.805
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.3249209671723,
+              "nv_return": 34.83341549285331,
+              "rdma_dispatch": 28.90356013816747,
+              "rdma_return": 39.80961770611807
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fanout_address_cache_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.479782385c171d8ffe7cb8ead97ebd500676f6a5607a18f2e490ccfc7cb1f5ba/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1159.31,
+              "fc2": 561.792,
+              "return": 3378.175,
+              "reduce": 2400.205,
+              "forward": 4701.745,
+              "wall": 6302.68
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.60415592033192,
+              "nv_return": 34.76448437395931,
+              "rdma_dispatch": 28.943450845761706,
+              "rdma_return": 39.730839284524926
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Receiver caches its computed payload destination in the ForwardDispatchFanoutRecord field initialized to zero by unified packing, then reads that address when retiring prefetched rows. Network format/bytes, shared-memory footprint, TMA completion, notification, and final credit ordering unchanged. Qwen EP16 8K Dispatch28.904->28.943GB/s; Return39.810->39.731. No meaningful gain, no adoption or broader full-model tests.64 sparse output/input/route/gate files exact over12 repetitions."
     }
   ],
   "diagnostics": [
