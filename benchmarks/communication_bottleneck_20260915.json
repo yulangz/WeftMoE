@@ -8027,7 +8027,199 @@
           "rc": 0
         }
       ],
-      "finding": "Qwen EP16 8K matched baseline Forward5080.945us vs combined5098.685us (+0.35%);wall6544.155->6520.380us. Dispatch1480.705->1270.435us,FC2 interval2193.505->1896.495us,Return4253.265->3733.345us. Combination removes most of the quota4 full regression;one pair does not establish a full Forward win.192 golden files exact at129/8K with20 repetitions. Pure confirmation building;BWD,Flash,EP8 and64K unvalidated;not adopted."
+      "finding": "Qwen EP16 8K matched baseline Forward5080.945us vs combined5098.685us (+0.35%);wall6544.155->6520.380us. Dispatch1480.705->1270.435us,FC2 interval2193.505->1896.495us,Return4253.265->3733.345us. Combination removes most of the quota4 full regression;one pair does not establish a full Forward win.192 golden files exact at129/8K with20 repetitions. Pure Qwen8K confirmation: Dispatch28.927->31.776GB/s,Return39.874->39.942;GPU4684.560->4614.960us,allocation-inclusive wall6084.130->6130.090us.64 sparse files exact over12 repetitions. BWD,Flash,EP8 and64K unvalidated;not adopted.",
+      "pure_confirmation": {
+        "cases": [
+          {
+            "name": "targeted_flush_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1159.9850000000001,
+                "fc2": 527.728,
+                "return": 3366.065,
+                "reduce": 2422.625,
+                "forward": 4684.5599999999995,
+                "wall": 6084.129999999999
+              },
+              "payload_GBps": {
+                "nv_dispatch": 202.48625973611726,
+                "nv_return": 34.88955560870036,
+                "rdma_dispatch": 28.926608533731034,
+                "rdma_return": 39.873777838514705
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "remote_fc1_priority_defer_q4_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1055.97,
+                "fc2": 571.6,
+                "return": 3360.285,
+                "reduce": 2504.06,
+                "forward": 4614.96,
+                "wall": 6130.09
+              },
+              "payload_GBps": {
+                "nv_dispatch": 222.431531198803,
+                "nv_return": 34.949568860974594,
+                "rdma_dispatch": 31.775933028400427,
+                "rdma_return": 39.94236441254239
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          },
+          {
+            "node": "remote",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          }
+        ]
+      }
+    },
+    {
+      "name": "Parallel Dispatch TMA issuers with independent staging",
+      "source": "/tmp/weftmoe-parallel-dispatch-issuers",
+      "source_commit": "dda056b",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/parallel_dispatch_issuers_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1166.8000000000002,
+              "fc2": 557.136,
+              "return": 3374.24,
+              "reduce": 2347.1400000000003,
+              "forward": 4685.725,
+              "wall": 6082.97
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.30358587589987,
+              "nv_return": 34.805026317037324,
+              "rdma_dispatch": 28.757655125128554,
+              "rdma_return": 39.77717293375694
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "parallel_dispatch_lanes4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1114.48,
+              "fc2": 579.024,
+              "return": 3377.005,
+              "reduce": 2373.715,
+              "forward": 4657.105,
+              "wall": 6074.745000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 210.75391572751417,
+              "nv_return": 34.77652890653108,
+              "rdma_dispatch": 30.10770224678774,
+              "rdma_return": 39.74460446460695
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "parallel_dispatch_lanes8_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1087.745,
+              "fc2": 575.904,
+              "return": 3382.96,
+              "reduce": 2436.32,
+              "forward": 4637.469999999999,
+              "wall": 6127.375
+            },
+            "payload_GBps": {
+              "nv_dispatch": 215.9339036263095,
+              "nv_return": 34.715312034431385,
+              "rdma_dispatch": 30.847700518044213,
+              "rdma_return": 39.67464232506444
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "Dispatch lane issuers4/8 each own staging and mbarrier; full TMA completion and readiness/credit order retained. Physical storage stride scales for every payload path.4 lanes use FC1/FC2 stages4/2;8 lanes3/2. Math register quota216 unchanged. No full Forward/BWD/64K validation.",
+      "finding": "Qwen EP16 8K Dispatch28.758 baseline ->30.108(4 lanes)/30.848(8 lanes)GB/s;Return39.777->39.745/39.675.128 sparse files exact over12 native repetitions. Improvement remains short of42GB/s; not adopted."
     }
   ],
   "diagnostics": [
