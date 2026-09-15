@@ -7353,6 +7353,336 @@
       ],
       "limitations": "Instrumented samples on warp0 of CTA32,64,96; wait measurements include timer and barrier polling costs. Read/load waits are nested inside payload_loop, not additive phases. Local full_store_wait excludes system fence (included in publication); received full_store_wait includes system fence. Publication includes warp/CTA synchronization before readiness and readiness stores, but excludes final credit bookkeeping. No cross-GPU timestamps compared. Not goal bandwidth.",
       "finding": "Current GIN local Dispatch uses segmented copy_row, not the opt-in row-prefetch path. Sampled local warp elapsed: metadata4.32%,payload79.16%,fullwait0.08%,publication16.44%; nested source-load wait13.25%,shared-read wait1.59%. Received fanout: metadata29.71%,payload42.04%,fullwait+fence5.84%,publication22.41%; nested source-load wait0.57%,shared-read wait0.05%. Payload loop has substantial address/issue work outside waits. Profiled total Dispatch1169.635us vs uninstrumented1163.535us (+0.52%) in this pair. These are elapsed sampled regions, not hardware stall counters; metadata and publication remain optimization candidates requiring causal tests.64 output/input/route/gate files matched over12 runs."
+    },
+    {
+      "name": "Nsight Systems GPU metrics without kernel replay",
+      "not_valid_goal_bandwidth": true,
+      "binary": "807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107",
+      "tools": "Bundled Nsight Systems2025.2.1; general gh100 metrics20kHz and compute-triage gh100-ct10kHz; CUDA trace,CPU sampling off.64K uses existing cudaProfilerStart/Stop last-round hook and10kHz all8 local GPUs.",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/nsys_qwen_ep16_8k",
+        "results/communication_bottleneck_20260915/nsys_ct_qwen_ep16_8k",
+        "results/communication_bottleneck_20260915/nsys_qwen_ep16_64k_last"
+      ],
+      "dispatch_gpu0_8k_general": {
+        "SM Issue [Throughput %]": {
+          "count": 175,
+          "mean": 3.24,
+          "median": 3,
+          "min": 3,
+          "max": 4,
+          "p90": 4,
+          "five_bins": [
+            3.081081081081081,
+            3.1818181818181817,
+            3.4571428571428573,
+            3.2,
+            3.2857142857142856
+          ]
+        },
+        "DRAM Read Bandwidth [Throughput %]": {
+          "count": 175,
+          "mean": 3.0228571428571427,
+          "median": 3,
+          "min": 1,
+          "max": 5,
+          "p90": 4,
+          "five_bins": [
+            2.2972972972972974,
+            4.121212121212121,
+            3.942857142857143,
+            3.142857142857143,
+            1.7142857142857142
+          ]
+        },
+        "DRAM Write Bandwidth [Throughput %]": {
+          "count": 175,
+          "mean": 7.291428571428572,
+          "median": 8,
+          "min": 1,
+          "max": 11,
+          "p90": 10,
+          "five_bins": [
+            8,
+            8.909090909090908,
+            8.085714285714285,
+            6.885714285714286,
+            4.628571428571429
+          ]
+        },
+        "NVLink TX Requests User Data [Throughput %]": {
+          "count": 175,
+          "mean": 53.31428571428572,
+          "median": 56,
+          "min": 6,
+          "max": 69,
+          "p90": 65,
+          "five_bins": [
+            45.24324324324324,
+            56.666666666666664,
+            62.25714285714286,
+            58.371428571428574,
+            44.68571428571428
+          ]
+        },
+        "PCIe RX Throughput [Throughput %]": {
+          "count": 175,
+          "mean": 69.62285714285714,
+          "median": 81,
+          "min": 1,
+          "max": 82,
+          "p90": 82,
+          "five_bins": [
+            71.32432432432432,
+            81.48484848484848,
+            81.42857142857143,
+            81.28571428571429,
+            33.17142857142857
+          ]
+        },
+        "PCIe TX Throughput [Throughput %]": {
+          "count": 175,
+          "mean": 68.10285714285715,
+          "median": 80,
+          "min": 1,
+          "max": 84,
+          "p90": 80,
+          "five_bins": [
+            73.27027027027027,
+            80.03030303030303,
+            79.97142857142858,
+            80,
+            27.62857142857143
+          ]
+        }
+      },
+      "dispatch_gpu0_8k_compute_triage": {
+        "SM Issue Active [Throughput %]": {
+          "count": 86,
+          "mean": 3.1511627906976742,
+          "median": 3.0,
+          "min": 3,
+          "max": 4,
+          "p90": 4,
+          "five_bins": [
+            3.0625,
+            3.2222222222222223,
+            3.2222222222222223,
+            3.1875,
+            3.0555555555555554
+          ]
+        },
+        "SM Warps Stalled on L1 Operation [Throughput %]": {
+          "count": 86,
+          "mean": 3,
+          "median": 3.0,
+          "min": 3,
+          "max": 3,
+          "p90": 3,
+          "five_bins": [
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        "SM Warps Stalled on MIO Operation [Throughput %]": {
+          "count": 86,
+          "mean": 1,
+          "median": 1.0,
+          "min": 1,
+          "max": 1,
+          "p90": 1,
+          "five_bins": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        "L2 Bandwidth [Throughput %]": {
+          "count": 86,
+          "mean": 5.3604651162790695,
+          "median": 6.0,
+          "min": 1,
+          "max": 7,
+          "p90": 7,
+          "five_bins": [
+            6.6875,
+            6.611111111111111,
+            5.833333333333333,
+            4.9375,
+            2.8333333333333335
+          ]
+        },
+        "Register Quanta Allocated by Active CS Warps [Throughput %]": {
+          "count": 86,
+          "mean": 98,
+          "median": 98.0,
+          "min": 98,
+          "max": 98,
+          "p90": 98,
+          "five_bins": [
+            98,
+            98,
+            98,
+            98,
+            98
+          ]
+        }
+      },
+      "dispatch_64k": {
+        "0": {
+          "reported_dispatch_us": 7752.58,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1564.706,
+          "nvlink_tx_user_five_bins": [
+            58.46666666666667,
+            59.57142857142857,
+            59.93333333333333,
+            60.06666666666667,
+            32.86666666666667
+          ],
+          "pcie_tx_five_bins": [
+            79.4,
+            80,
+            80,
+            80,
+            6.533333333333333
+          ]
+        },
+        "1": {
+          "reported_dispatch_us": 7811.04,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1676.281,
+          "nvlink_tx_user_five_bins": [
+            56.86666666666667,
+            59.8,
+            59.8,
+            59.8,
+            31.933333333333334
+          ],
+          "pcie_tx_five_bins": [
+            77,
+            80,
+            79.93333333333334,
+            80,
+            3.8666666666666667
+          ]
+        },
+        "2": {
+          "reported_dispatch_us": 7645.44,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1511.851,
+          "nvlink_tx_user_five_bins": [
+            55.4,
+            59.8,
+            59.714285714285715,
+            60.13333333333333,
+            37
+          ],
+          "pcie_tx_five_bins": [
+            76.8,
+            80,
+            80,
+            80,
+            9.266666666666667
+          ]
+        },
+        "3": {
+          "reported_dispatch_us": 7776.29,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1613.427,
+          "nvlink_tx_user_five_bins": [
+            56.333333333333336,
+            59.2,
+            60.2,
+            60.13333333333333,
+            31.866666666666667
+          ],
+          "pcie_tx_five_bins": [
+            77.66666666666667,
+            80,
+            80,
+            80,
+            3.066666666666667
+          ]
+        },
+        "4": {
+          "reported_dispatch_us": 7746.5,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1595.611,
+          "nvlink_tx_user_five_bins": [
+            57.46666666666667,
+            59.6,
+            59.6,
+            59.93333333333333,
+            33.42857142857143
+          ],
+          "pcie_tx_five_bins": [
+            77.26666666666667,
+            79.93333333333334,
+            80,
+            80,
+            3.7142857142857144
+          ]
+        },
+        "5": {
+          "reported_dispatch_us": 7726.4,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1592.965,
+          "nvlink_tx_user_five_bins": [
+            58.333333333333336,
+            59.733333333333334,
+            59.93333333333333,
+            59.666666666666664,
+            32.214285714285715
+          ],
+          "pcie_tx_five_bins": [
+            78,
+            80,
+            80,
+            80.06666666666666,
+            2.9285714285714284
+          ]
+        },
+        "6": {
+          "reported_dispatch_us": 7608.67,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1442.666,
+          "nvlink_tx_user_five_bins": [
+            58.4,
+            60.07142857142857,
+            59.93333333333333,
+            60.214285714285715,
+            37.2
+          ],
+          "pcie_tx_five_bins": [
+            78.33333333333333,
+            80,
+            80,
+            80,
+            13.066666666666666
+          ]
+        },
+        "7": {
+          "reported_dispatch_us": 7780.64,
+          "last_pcie_tx_ge70_to_approx_dispatch_end_us": 1611.834,
+          "nvlink_tx_user_five_bins": [
+            57.06666666666667,
+            57.86666666666667,
+            59.2,
+            59.666666666666664,
+            33.666666666666664
+          ],
+          "pcie_tx_five_bins": [
+            78.2,
+            80,
+            80,
+            80,
+            2.6666666666666665
+          ]
+        }
+      },
+      "figure": "results/communication_bottleneck_20260915/nsys_qwen_ep16_8k/last_iteration_metrics.png",
+      "validation": "All3 measured jobs completed with native20-repeat checks; clocks restored on both nodes. These are communication-only correctness checks, not full Forward/BWD validation.",
+      "limitations": "Percent metrics use their own peak-sustained denominators, not fractions of time spent in code. SM stall metrics cannot assign stalls to communication warps; front-end semaphore stall is not communication synchronization time. GPU0 8K summaries use interiors of last10 steady iterations.64K covers one last iteration on local ranks0-7,not remote node. Boundaries approximate each GPU setup CUPTI start plus its own duration; no cross-GPU timestamp subtraction. LastPCIe>=70 threshold is not NIC protocol completion. First general capture had CUDA event tracing enabled; compute-triage and64K explicitly disabled it.",
+      "finding": "Dispatch has low SM issue (~3.2%) and low DRAM/L2 throughput; no evidence of arithmetic-issue or HBM-bandwidth saturation. PCIe is near80% through the bulk portion, while NVLink TX user data is roughly60% in64K bulk. After the last >=70% PCIe TX sample, each local GPU still has1.44-1.68ms until its own approximate Dispatch boundary; NVLink traffic persists and falls during this tail. This motivates balancing local Dispatch versus received fanout service to reduce remaining NVLink work, while preserving Return service and publication granularity."
     }
   ]
 }
