@@ -6756,7 +6756,77 @@
         "repetitions": 12
       },
       "protocol": "Separate Dispatch and Return SPSC planes. Copy-domain full TMA completion precedes shared descriptor handoff. Dedicated Dispatch warp bins up to 128 IDs per batch, peer stores plus SYS ready release publish them, FC1/Return publisher consumes both planes and applies local SYS arrival counts. GIN receive credit returned after IDs are copied into bounded NVLink slots. Dispatch sends End after local data and descriptor queue drain; completion waits incoming End and outbound End credit. New blocking credit waits observe cancellation/error. Default Dispatch ring depth4; local payload batch32. Extra plane allocated once in reusable pool and reset per execution.",
-      "finding": "Qwen EP16 8K 1620MHz: production baseline Dispatch28.836 Return39.761GB/s; dedicated atomic publisher30.215/39.927; NVLink queue23.101/39.647. Correct sparse outputs but worse throughput. Not adopted; test larger independent Dispatch ring and local batch before abandoning batching direction. Full FWD/BWD and64K validation not claimed."
+      "finding": "Qwen EP16 8K 1620MHz: production baseline Dispatch28.836 Return39.761GB/s; dedicated atomic publisher30.215/39.927; NVLink queue23.101/39.647. Correct sparse outputs but worse throughput. Not adopted; test larger independent Dispatch ring and local batch before abandoning batching direction. Full FWD/BWD and64K validation not claimed.",
+      "larger_batch_and_ring": {
+        "source_commit": "b7d2747",
+        "raw_results": "results/communication_bottleneck_20260915/dispatch_nvqueue_batch_screen",
+        "dispatch_ring_depth": 16,
+        "local_dispatch_batch_rows": 128,
+        "cases": [
+          {
+            "name": "targeted_flush_ep16_8192",
+            "summary": {
+              "timing_us": {
+                "dispatch": 1156.995,
+                "fc2": 559.104,
+                "return": 3369.73,
+                "reduce": 2332.545,
+                "forward": 4685.745,
+                "wall": 6104.545
+              },
+              "payload_GBps": {
+                "nv_dispatch": 203.00954109568323,
+                "nv_return": 34.851608882610776,
+                "rdma_dispatch": 29.001363013669035,
+                "rdma_return": 39.830410151555164
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            },
+            "returncode": 0
+          },
+          {
+            "name": "dispatch_nvqueue_b128_ep16_8192",
+            "summary": {
+              "timing_us": {
+                "dispatch": 1373.1999999999998,
+                "fc2": 486.64,
+                "return": 3438.495,
+                "reduce": 2525.6800000000003,
+                "forward": 4864.93,
+                "wall": 6265.639999999999
+              },
+              "payload_GBps": {
+                "nv_dispatch": 171.04647829886397,
+                "nv_return": 34.1546263699671,
+                "rdma_dispatch": 24.435211185552,
+                "rdma_return": 39.03385870853382
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            },
+            "returncode": 0
+          }
+        ],
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "finding": "Qwen EP16 8K1620MHz baseline Dispatch29.001GB/s, Return39.830; candidate Dispatch24.435, Return39.034. Larger batching/depth only partially recovers the initial queue regression; reject both versions, no full-model sweep."
+      }
     }
   ],
   "diagnostics": [
