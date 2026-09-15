@@ -4999,6 +4999,23 @@
       ],
       "golden_files": 128,
       "finding": "Confirmation waiting decreases in the regressive combined variant; it does not explain the regression. Last-snapshot timelines show median last receive/NVLink-copy event to transport-worker-exit intervals616.656/551.056us. Test notification closure using final data tails instead of empty End packets. Trace timestamps are compared only within each GPU; instrumented latency is not production throughput. This interval can include outstanding outbound GIN completion/credits; it is not all attributable to notification End packets."
+    },
+    {
+      "name": "GIN drain reasons and final flush timing",
+      "experimental_commit": "b841167",
+      "raw_results": "results/communication_bottleneck_20260915/gin_drain_trace",
+      "golden_files": 64,
+      "zero_overflow": true,
+      "flush_us": {
+        "min": 46.59199999999964,
+        "median": 51.600000000000364,
+        "max": 65.40799999999945
+      },
+      "last_context_wait_reasons": {
+        "3": 8,
+        "4": 8
+      },
+      "finding": "Qwen EP16 8K pure communication profiling, RX32. Last context reason is remote credit8ranks or locally unsubmitted ACK8ranks. Per-rank maximum flush52.45-65.41us; all128context flush statistics above. baseline/candidate64prefix files exact,12repeats. Trace is diagnostic only; subsequent targeted peer flush retains all mapped peer queue completion. No attribution of the entire tail to flush or terminal packets."
     }
   ]
 }
