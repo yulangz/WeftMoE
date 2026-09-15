@@ -812,7 +812,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
               transport::kActivationTransportSchemaVersion ||
           header.source_rank != source || header.destination_rank != a.rank ||
           header.generation != a.dispatch.identity.generation ||
-          header.sequence != sequence ||
+          header.transport_index != sequence ||
           header.dst_row >= dispatch_sizes(a.dispatch).incoming_row_count ||
           incoming.source_rank != source ||
           incoming.expert_id != header.expert_id) {

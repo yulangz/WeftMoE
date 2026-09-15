@@ -295,7 +295,9 @@ struct LocalP2pRouteHeader {
   std::uint32_t channel;
   std::uint64_t generation;
   std::uint64_t source_epoch;
-  std::uint64_t sequence;
+  // Packet sequence in legacy transports; final contribution row in the
+  // unified node-local Forward path. Cross-node Return carries route IDs.
+  std::uint64_t transport_index;
   std::uint64_t route_index;
   std::uint64_t local_token_id;
   std::uint64_t dst_row;

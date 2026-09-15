@@ -47,6 +47,7 @@ struct ForwardKernelArgs {
   std::uint32_t gin_context_count = 1;
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
+  bool forward_compact_return = false;
   // A one-node split launch streams CUDA-IPC/NVLink rows through dedicated
   // Relay CTAs.  Unlike the legacy StaticLocal path, compute must consume the
   // same per-M-block ready queue used by GIN instead of assuming that the
@@ -86,9 +87,6 @@ struct ForwardKernelArgs {
   std::size_t gin_send_dispatch_directory_offset = 0;
   std::size_t gin_receive_dispatch_directory_offset = 0;
   std::size_t x_arrived_rows_offset = 0;
-  // FULL Return keeps payloads in the registered compact receive plane.
-  // Dispatch records this source-route -> compact-row map before sending data.
-  // Reduce consumes it after Return readiness without a second NVLink scatter.
   // Token-ready reduction queue.  Every route publication increments the
   // owning source token's counter; the top-k completion appends the token.
   // Queue slots encode token+1; generation setup clears the active token
@@ -144,4 +142,14 @@ struct ForwardKernelArgs {
 __device__ __forceinline__ std::uint64_t
 execution_epoch(const ForwardKernelArgs &a) {
   return a.runtime_epoch ? *a.runtime_epoch : a.epoch;
+}
+
+// Final Return storage is dense in (node, local rank, expert, source ordinal).
+// Readiness and accumulation order retain their original route identities.
+__device__ __forceinline__ std::uint64_t
+forward_contribution_row(const ForwardKernelArgs &a, std::uint64_t route) {
+  return a.forward_compact_return
+      ? a.dispatch.return_global_expert_base[a.dispatch.expert_id[route]] +
+            a.dispatch.local_offset[route]
+      : route;
 }

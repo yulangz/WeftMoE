@@ -246,6 +246,7 @@ struct Layout {
   std::size_t expert_total = 0;
   std::size_t expert_base = 0;
   std::size_t return_expert_base = 0;
+  std::size_t return_global_expert_base = 0;
   std::size_t expert_tile_base = 0;
   std::size_t expert_capacity = 0;
   std::size_t workspace_capacity = 0;
@@ -314,6 +315,8 @@ Layout make_device_layout(const CudaNotifyWorkspacePlan &plan) {
                                      sizeof(std::uint64_t), "expert_base");
   layout.return_expert_base = append_region(
       cursor, plan.num_experts, sizeof(std::uint64_t), "return_expert_base");
+  layout.return_global_expert_base = append_region(
+      cursor, plan.num_experts, sizeof(std::uint64_t), "return_global_expert_base");
   layout.expert_tile_base = append_region(
       cursor, plan.num_experts, sizeof(std::uint64_t), "expert_tile_base");
   layout.expert_capacity = append_region(cursor, plan.num_experts,
@@ -569,6 +572,7 @@ struct DeviceMaterializeArgs {
   std::uint64_t *expert_total;
   std::uint64_t *expert_base;
   std::uint64_t *return_expert_base;
+  std::uint64_t *return_global_expert_base;
   std::uint64_t *expert_tile_base;
   std::uint64_t *route_dst_row;
   std::uint32_t *route_dst_mtile;
@@ -1196,14 +1200,17 @@ materialize_return_expert_prefix_kernel(DeviceMaterializeArgs a) {
   const auto owner = a.expert_to_rank[expert];
   const auto node = a.rank_to_node[owner];
   const auto local = a.rank_to_local[owner];
-  std::uint64_t prefix = 0;
+  std::uint64_t prefix = 0, node_prefix = 0;
   for (std::uint32_t other = 0; other < a.experts; ++other) {
     const auto peer = a.expert_to_rank[other];
+    if (a.rank_to_node[peer] < node)
+      node_prefix += a.local_histogram[other];
     if (a.rank_to_node[peer] == node &&
         (a.rank_to_local[peer] < local || (peer == owner && other < expert)))
       prefix += a.local_histogram[other];
   }
   a.return_expert_base[expert] = prefix;
+  a.return_global_expert_base[expert] = node_prefix + prefix;
 }
 
 __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
@@ -3505,6 +3512,7 @@ struct DeviceDispatchConsumerLease::Impl {
     view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
     view.expert_to_rank = at<const std::uint32_t>(base, dl.expert_to_rank);
     view.local_offset = at<const std::uint64_t>(base, dl.local_offset);
+    view.return_global_expert_base = at<const std::uint64_t>(base, dl.return_global_expert_base);
     view.route_dst_row = at<const std::uint64_t>(base, dl.route_dst_row);
     view.route_dst_rank = at<const std::uint32_t>(base, dl.route_dst_rank);
     view.route_dst_node = at<const std::uint32_t>(base, dl.route_dst_node);
@@ -3789,6 +3797,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   args.expert_total = at<std::uint64_t>(base, dl.expert_total);
   args.expert_base = at<std::uint64_t>(base, dl.expert_base);
   args.return_expert_base = at<std::uint64_t>(base, dl.return_expert_base);
+  args.return_global_expert_base = at<std::uint64_t>(base, dl.return_global_expert_base);
   args.expert_tile_base = at<std::uint64_t>(base, dl.expert_tile_base);
   args.route_dst_row = at<std::uint64_t>(base, dl.route_dst_row);
   args.route_dst_mtile = at<std::uint32_t>(base, dl.route_dst_mtile);

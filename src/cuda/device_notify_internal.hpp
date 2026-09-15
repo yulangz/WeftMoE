@@ -168,6 +168,7 @@ struct DeviceDispatchKernelView {
   const std::uint32_t *expert_id = nullptr;
   const std::uint32_t *expert_to_rank = nullptr;
   const std::uint64_t *local_offset = nullptr;
+  const std::uint64_t *return_global_expert_base = nullptr;
   const std::uint64_t *route_dst_row = nullptr;
   const std::uint32_t *route_dst_rank = nullptr;
   const std::uint32_t *route_dst_node = nullptr;

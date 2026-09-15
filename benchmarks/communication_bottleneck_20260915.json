@@ -1070,6 +1070,233 @@
       "validation": "EP8 and EP16 retained-state t129, 20 repetitions; 96 prefix files byte-identical to golden.",
       "finding": "EP8 64K Return 330.24 GB/s vs baseline 102.64 GB/s; Dispatch 272.61 GB/s. EP16 Dispatch regresses to 27.33 GB/s; Return RDMA stays 45.46 GB/s. Experimental layout not yet adopted or broadly validated.",
       "next_change": "Cross-node Dispatch does not need to transmit a compact Return ordinal: its results return by GIN route IDs, and the source maps them locally. Remove that redundant metadata work and combine cooperative packing."
+    },
+    {
+      "name": "Dense final push Return layout; clean validated version",
+      "adopted": true,
+      "source_commit": "17c8449",
+      "patch": "results/communication_bottleneck_20260915/compact_clean.patch",
+      "raw_results": "results/communication_bottleneck_20260915/compact_clean_bandwidth",
+      "cases": [
+        {
+          "name": "clean_qwen_ep8_8192",
+          "ep": 8,
+          "tokens": 8192,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.19b666976404073bce2e1f4b26c809b90dc2060fa63241e8e323a1d767bf3dc4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 888.736,
+            "fc2": 252.528,
+            "return": 814.608,
+            "reduce": 424.432,
+            "forward": 1812.495,
+            "wall": 2699.865
+          },
+          "payload_GBps": {
+            "nv_dispatch": 264.28660929679904,
+            "nv_return": 288.3362598943296
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_qwen_ep8_65536",
+          "ep": 8,
+          "tokens": 65536,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.19b666976404073bce2e1f4b26c809b90dc2060fa63241e8e323a1d767bf3dc4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 6888.605,
+            "fc2": 2152.35,
+            "return": 5720.495,
+            "reduce": 4422.145,
+            "forward": 13442.3,
+            "wall": 14661.15
+          },
+          "payload_GBps": {
+            "nv_dispatch": 272.7763011524104,
+            "nv_return": 328.47650282012313
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_flash_ep8_8192",
+          "ep": 8,
+          "tokens": 8192,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fe73a577e42e02422f45030e045db00bb9b9c76e398e7657fb7a449861591008/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1212.69,
+            "fc2": 315.20000000000005,
+            "return": 1161.075,
+            "reduce": 817.472,
+            "forward": 2583.555,
+            "wall": 3448.255
+          },
+          "payload_GBps": {
+            "nv_dispatch": 290.528936496549,
+            "nv_return": 303.4442529552354
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 8192,
+            "top_k": 6
+          }
+        },
+        {
+          "name": "clean_flash_ep8_65536",
+          "ep": 8,
+          "tokens": 65536,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fe73a577e42e02422f45030e045db00bb9b9c76e398e7657fb7a449861591008/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 9188.56,
+            "fc2": 1794.62,
+            "return": 8506.59,
+            "reduce": 8348.685,
+            "forward": 19392.4,
+            "wall": 20716.45
+          },
+          "payload_GBps": {
+            "nv_dispatch": 306.74798749749687,
+            "nv_return": 331.3398539250158
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 65536,
+            "top_k": 6
+          }
+        },
+        {
+          "name": "clean_qwen_ep16_65536",
+          "ep": 16,
+          "tokens": 65536,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.19b666976404073bce2e1f4b26c809b90dc2060fa63241e8e323a1d767bf3dc4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8578.37,
+            "fc2": 2692.05,
+            "return": 23744.199999999997,
+            "reduce": 20956.5,
+            "forward": 31811.5,
+            "wall": 33607.399999999994
+          },
+          "payload_GBps": {
+            "nv_dispatch": 219.04489920579317,
+            "nv_return": 39.56857236714651,
+            "rdma_dispatch": 31.292128457970453,
+            "rdma_return": 45.22122556245316
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "forward_validation": {
+        "all_byte_identical": true,
+        "files_compared": 216,
+        "models": [
+          "qwen",
+          "flash"
+        ],
+        "ep": [
+          8,
+          16
+        ],
+        "tokens": 129,
+        "repetitions": 20
+      },
+      "backward_validation": [
+        {
+          "model": "qwen",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ef536eeb55183c3d48940151d9bb816e6f80858c7e33ddea22e92a841edc239b/test_cuda_notify"
+        },
+        {
+          "model": "qwen",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ef536eeb55183c3d48940151d9bb816e6f80858c7e33ddea22e92a841edc239b/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e80d58899c70ce369a7cd60e1dab24bcbfd86e3bc9fc09cbeef0ea5ffa8aa064/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e80d58899c70ce369a7cd60e1dab24bcbfd86e3bc9fc09cbeef0ea5ffa8aa064/test_cuda_notify"
+        }
+      ],
+      "cpu_validation": "90 passed, 126 subtests passed",
+      "invariants": "Same push payload bytes and full TMA completion protocol. Both reduction paths preserve route summation order. Validation exports preserve route-major contribution order."
+    },
+    {
+      "name": "EP16 local transport prefetch",
+      "adopted": false,
+      "reason": "Qwen EP16 64K Dispatch regresses from 31.29 to 30.08 GB/s",
+      "cases": [
+        {
+          "name": "prefetch_qwen_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8925.01,
+            "fc2": 4063.585,
+            "return": 23730.65,
+            "reduce": 19562.949999999997,
+            "forward": 32396.4,
+            "wall": 34353.95
+          },
+          "payload_GBps": {
+            "nv_dispatch": 210.53737665279925,
+            "nv_return": 39.591165686569894,
+            "rdma_dispatch": 30.076768093257037,
+            "rdma_return": 45.247046498937024
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ]
     }
   ],
   "diagnostics": [

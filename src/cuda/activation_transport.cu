@@ -571,6 +571,7 @@ struct DeviceForwardHandle::Impl {
   ForwardMegaKernelAudit audit;
   ForwardMegaKernelTimings timings;
   bool retained_backward_state = false;
+  bool compact_return = false;
   std::uint64_t incoming_rows = 0;
   std::uint64_t intermediate = 0;
   // Host-enqueued Socket transfers execute outside the persistent kernel.
@@ -4628,6 +4629,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             forward_tuning::unified_rdma_ctas(args.forward_compute_cta_count,
                                               args.use_gin);
       args.forward_stream_local_dispatch = split_local_roles;
+      args.forward_compact_return = forward_tuning::kUnifiedWorkers;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       // Eight independent row streams per CTA are the Hopper default.
       // Twelve streams slightly improve isolated NVLink
@@ -5058,6 +5060,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->identity = {id.generation, id.calling_rank, id.world_size,
                       id.num_tokens, config.hidden_size};
   result->retained_backward_state = config.retain_backward_state;
+  result->compact_return = args.forward_compact_return;
   result->incoming_rows = view.sizes.incoming_row_count;
   result->intermediate = config.intermediate_size;
   result->completion = std::make_unique<OperatorCompletion>();
@@ -5430,6 +5433,39 @@ download_forward_routes_for_validation(const DeviceForwardHandle &handle,
                               impl.pool->layout.contribution),
                      bytes, cudaMemcpyDeviceToHost));
     internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
+  }
+  if (impl.compact_return && !output.empty()) {
+    // Preserve the route-major validation contract independently of the
+    // production payload layout. Metadata and CPU gathering are debug-only.
+    const auto &id = impl.dispatch.identity();
+    const DeviceDispatchViewExpectation expected{
+        id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+        id.config_digest_word0, id.config_digest_word1};
+    auto consumer = impl.dispatch.acquire_consumer(execution, expected);
+    const auto view = ActivationTransportBridge::view(consumer);
+    const auto routes = impl.identity.tokens * id.top_k;
+    std::vector<std::uint32_t> experts(routes);
+    std::vector<std::uint64_t> offsets(routes), prefixes(id.num_experts);
+    const auto copy_metadata = [&](auto &destination, const auto *source) {
+      const auto bytes = destination.size() * sizeof(destination.front());
+      check(cudaMemcpy(destination.data(), source, bytes, cudaMemcpyDeviceToHost));
+      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
+    };
+    copy_metadata(experts, view.expert_id);
+    copy_metadata(offsets, view.local_offset);
+    copy_metadata(prefixes, view.return_global_expert_base);
+    consumer.finish();
+    std::vector<transport::BFloat16> ordered(output.size());
+    for (std::uint64_t route = 0; route < routes; ++route) {
+      if (experts[route] >= prefixes.size())
+        throw std::runtime_error("invalid compact Return expert in validation snapshot");
+      const auto row = prefixes[experts[route]] + offsets[route];
+      if (row >= routes)
+        throw std::runtime_error("invalid compact Return row in validation snapshot");
+      std::copy_n(output.data() + row * impl.identity.hidden, impl.identity.hidden,
+                  ordered.data() + route * impl.identity.hidden);
+    }
+    return ordered;
   }
   return output;
 }

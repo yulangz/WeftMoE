@@ -643,7 +643,7 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
           const auto wave_packets = wave_end - wave_begin;
           for (auto position = wave_begin + threadIdx.x; position < wave_end;
                position += blockDim.x) {
-            send_headers[position].sequence = position - node_packet_begin;
+            send_headers[position].transport_index = position - node_packet_begin;
             send_headers[position].dst_row =
                 (position - node_packet_begin) * a.dispatch.identity.top_k;
             send_headers[position].topk_slot = 0U;
@@ -960,7 +960,7 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
                 header.channel,
                 header.generation,
                 header.source_epoch,
-                header.sequence,
+                header.transport_index,
                 route,
                 header.local_token_id,
                 target.dst_row,

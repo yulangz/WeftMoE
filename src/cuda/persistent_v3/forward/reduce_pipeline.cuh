@@ -32,7 +32,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
     const auto slot =
         SingleRoute ? 0U : a.dispatch.combine_order[token * top_k + lane];
     lane_route = token * top_k + slot;
-    lane_row = lane_route;
+    lane_row = forward_contribution_row(a, lane_route);
     // Queue/scan consumers have already acquired every contribution. The
     // static scheduler instead waits for each route's local arrival marker.
     if (!a.forward_dynamic_reduce_queue && !a.forward_dynamic_reduce_scan) {
@@ -50,7 +50,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
     float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (std::uint32_t order = 0; order < top_k; ++order) {
       const auto row =
-          SingleRoute ? token : __shfl_sync(0xffffffffU, lane_row, order);
+          __shfl_sync(0xffffffffU, lane_row, order);
       const auto *source = contribution;
       const auto packed =
           reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];

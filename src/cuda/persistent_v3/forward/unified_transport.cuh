@@ -268,7 +268,7 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
           LocalP2pRouteHeader{
               transport::kActivationTransportSchemaVersion,
               a.rank, destination, 0U, a.dispatch.identity.generation,
-              execution_epoch(a), route, route, token, row,
+              execution_epoch(a), forward_contribution_row(a, route), route, token, row,
               a.dispatch.expert_id[route],
               static_cast<unsigned>(route % a.dispatch.identity.top_k)};
       peer_at<float>(base, a.canonical_gates_offset)[row] = a.gates[route];
@@ -499,7 +499,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
       auto *target = peer_at<transport::BFloat16>(
           a.peer_bases[header.source_rank], a.contribution_offset);
       row_pipeline.copy(output + row * a.hidden,
-                        target + header.route_index * a.hidden,
+                        target + header.transport_index * a.hidden,
                         unsigned(a.hidden * sizeof(transport::BFloat16)));
     }
     row_pipeline.drain();

@@ -585,7 +585,7 @@ __device__ __forceinline__ void receive_return(const ForwardKernelArgs &a,
       const auto route =
           reinterpret_cast<const ring::ReturnRow *>(record)->route;
       row_pipeline.copy(record + sizeof(ring::ReturnRow),
-               output + route * a.hidden, unsigned(a.hidden * 2ULL));
+               output + forward_contribution_row(a, route) * a.hidden, unsigned(a.hidden * 2ULL));
     }
     row_pipeline.drain();
     finish_copies();

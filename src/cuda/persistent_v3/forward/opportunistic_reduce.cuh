@@ -33,6 +33,9 @@ struct ReduceTokenView {
   const transport::BFloat16 *local;
   transport::BFloat16 *output;
   const std::uint32_t *order;
+  const std::uint64_t *return_base;
+  const std::uint32_t *route_expert;
+  const std::uint64_t *local_offset;
   std::uint64_t hidden;
   std::uint32_t top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -50,6 +53,9 @@ reduce_token_view(const ForwardKernelArgs &a) {
       peer_at<const transport::BFloat16>(a.local_base, a.contribution_offset);
   v.output = a.output;
   v.order = a.dispatch.combine_order;
+  v.return_base = a.forward_compact_return ? a.dispatch.return_global_expert_base : nullptr;
+  v.route_expert = a.dispatch.expert_id;
+  v.local_offset = a.dispatch.local_offset;
   v.hidden = a.hidden;
   v.top_k = a.dispatch.identity.top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -87,7 +93,9 @@ reduce_token_payload(const ReduceTokenView &v,
     for (std::uint32_t order = 0U; order < v.top_k; ++order) {
       const auto slot = v.order[token * v.top_k + order];
       const auto route = token * v.top_k + slot;
-      const auto *source = v.local + route * v.hidden + column;
+      const auto row = v.return_base
+          ? v.return_base[v.route_expert[route]] + v.local_offset[route] : route;
+      const auto *source = v.local + row * v.hidden + column;
       const auto packed = *reinterpret_cast<const uint4 *>(source);
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
