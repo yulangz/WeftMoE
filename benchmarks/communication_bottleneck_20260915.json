@@ -7026,6 +7026,169 @@
       },
       "protocol": "Touched local counters reset atomically before existing setup clear barrier; route-derived expected/remaining counts initialized after it, before existing setup completion barriers. Count storage is pooled once. Both passes remain within original timing interval. Copy-domain full TMA completion and system fences precede local acq_rel decrement; last source contribution publishes one SYS arrival add with its entire expected count. Source subsets across nodes/rails remain additive. No shape-specific expectation formula or extra grid barrier.",
       "finding": "Qwen EP16 8K1620MHz baseline28.769GB/s; token fanout28.953; token fanout plus tile aggregation29.429; canonical wave order plus aggregation28.632. No substantial throughput gain; neither candidate adopted.192 sparse files across3 candidates byte-identical,12 repetitions. No full FWD/BWD or64K validation claimed. Natural-route setup passes may incur avoidable local atomic traffic; an ordered setup pass would isolate that cost if this direction is revisited."
+    },
+    {
+      "name": "Balance local Dispatch batch service against received GIN fanout",
+      "adopted": false,
+      "source_commit": "6dc25ac",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/dispatch_service_ratio_screen",
+        "results/communication_bottleneck_20260915/dispatch_service_ratio_64k"
+      ],
+      "protocol": "Tunable quota of successful32-route local batches between received32-token fanout tasks. Initial receive eligible immediately; empty receive attempts remain eligible; local completion removes quota and drains receive tasks. Return receive/local Return progress on every loop and original full TMA fences/publication boundaries unchanged. No idle math assistance or shape branch. Quotas2/4 tested; incumbent equivalent quota1.",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.3449999999998,
+              "fc2": 553.9200000000001,
+              "return": 3375.09,
+              "reduce": 2459.215,
+              "forward": 4683.635,
+              "wall": 6052.094999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.90143422630436,
+              "nv_return": 34.79626084045166,
+              "rdma_dispatch": 28.843062032329193,
+              "rdma_return": 39.767155246230466
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_ratio_q2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1122.095,
+              "fc2": 585.5039999999999,
+              "return": 3391.2349999999997,
+              "reduce": 2485.745,
+              "forward": 4656.8150000000005,
+              "wall": 6085.385
+            },
+            "payload_GBps": {
+              "nv_dispatch": 209.3236526319073,
+              "nv_return": 34.630602715529896,
+              "rdma_dispatch": 29.903378947415323,
+              "rdma_return": 39.57783167489131
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_ratio_q4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1056.6599999999999,
+              "fc2": 584.752,
+              "return": 3360.915,
+              "reduce": 2384.525,
+              "forward": 4619.07,
+              "wall": 6086.325
+            },
+            "payload_GBps": {
+              "nv_dispatch": 222.28628319421577,
+              "nv_return": 34.943017600861666,
+              "rdma_dispatch": 31.755183313459394,
+              "rdma_return": 39.93487725812762
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "targeted_flush_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 7819.665,
+              "fc2": 3099.25,
+              "return": 23501.15,
+              "reduce": 20526.1,
+              "forward": 31292.300000000003,
+              "wall": 33144.55
+            },
+            "payload_GBps": {
+              "nv_dispatch": 240.29778666988932,
+              "nv_return": 39.977792405903536,
+              "rdma_dispatch": 34.32825523855562,
+              "rdma_return": 45.6889056067469
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_ratio_q4_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 7297.31,
+              "fc2": 3349.085,
+              "return": 23514.050000000003,
+              "reduce": 20193.75,
+              "forward": 30883.05,
+              "wall": 32720.35
+            },
+            "payload_GBps": {
+              "nv_dispatch": 257.49874844291935,
+              "nv_return": 39.95586026226872,
+              "rdma_dispatch": 36.78553549184562,
+              "rdma_return": 45.66384029973568
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": [
+        {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 65536,
+          "repetitions": 20
+        }
+      ],
+      "finding": "At1620MHz Qwen EP16 8K Dispatch28.843->29.903(q2)->31.755(q4),Return39.767->39.578->39.935GB/s.64K baseline Dispatch34.328->36.786(q4),Return45.689->45.664; pure GPU31292.3->30883.05us,wall33144.55->32720.35.128 sparse files exact acrossq2/q4;64K64 prefix files exact and20 repeated full outputs passed. Full Forward confirmation running; not yet adopted."
     }
   ],
   "diagnostics": [
