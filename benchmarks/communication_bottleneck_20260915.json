@@ -363,7 +363,713 @@
             }
           ]
         }
-      ]
+      ],
+      "repeat_audit": {
+        "raw_results": "results/communication_bottleneck_20260915/compact_repeat_audit",
+        "finding": "Retained-state EP8 t129 failure reproduced between first and second execution. Stable baseline and rejected address-gather candidate each passed 20 repetitions with the same settings.",
+        "control": "results/communication_bottleneck_20260915/repeat_control"
+      },
+      "root_cause_investigation": {
+        "raw_results": "results/communication_bottleneck_20260915/compact_state_screen",
+        "finding": "After kernel completion, contributions and saved X/AB are byte-identical between executions; occasional final tokens differ. The compute scheduler can run opportunistic Reduce while GEMM tasks remain; that helper still used route-major indexing. Candidate updated to map both Reduce implementations; revalidation pending.",
+        "fixed_patch": "results/communication_bottleneck_20260915/compact_push_fixed.patch"
+      }
+    },
+    {
+      "name": "Cooperative fanout metadata stores on receive Dispatch",
+      "adopted": false,
+      "patch": "results/communication_bottleneck_20260915/relay_metadata.patch",
+      "source": "/tmp/weftmoe-relay-meta-da55d82",
+      "raw_results": "results/communication_bottleneck_20260915/relay_metadata_screen",
+      "cases": [
+        {
+          "name": "relay_metadata_production_ep16_t129",
+          "ep": 16,
+          "tokens": 129,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4bd6cdc82fccd8d6431e392c45fdad092205713402af146468dc4ea3fe6ce5db/test_cuda_notify",
+          "source": "/tmp/weftmoe-relay-meta-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {
+            "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/relay_metadata_screen/ep16_prefix",
+            "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+            "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+          },
+          "started_unix": 1789484738.5513275,
+          "ended_unix": 1789484755.3048341,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 463.152,
+              "fc2": 99.52,
+              "return": 411.44,
+              "reduce": 75.072,
+              "forward": 1134.995,
+              "wall": 2244.8
+            },
+            "payload_GBps": {
+              "nv_dispatch": 7.985905275158047,
+              "nv_return": 4.49480847754229,
+              "rdma_dispatch": 1.1408436107368638,
+              "rdma_return": 5.136923974334046
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-relay-meta-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4bd6cdc82fccd8d6431e392c45fdad092205713402af146468dc4ea3fe6ce5db/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4bd6cdc82fccd8d6431e392c45fdad092205713402af146468dc4ea3fe6ce5db/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "150"
+          ]
+        },
+        {
+          "name": "relay_metadata_pure_ep16_t65536",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.20f1a40b57f98b3c0cab9c8db68b144d311810ecb273c95e012aed839a2290ae/test_cuda_notify",
+          "source": "/tmp/weftmoe-relay-meta-da55d82",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789484755.3138113,
+          "ended_unix": 1789484775.8977513,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 9037.630000000001,
+              "fc2": 5238.605,
+              "return": 23620.05,
+              "reduce": 18265.15,
+              "forward": 32329.4,
+              "wall": 34190.05
+            },
+            "payload_GBps": {
+              "nv_dispatch": 207.91382165457094,
+              "nv_return": 39.77654983795547,
+              "rdma_dispatch": 29.70197452208156,
+              "rdma_return": 45.45891410052053
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-relay-meta-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.20f1a40b57f98b3c0cab9c8db68b144d311810ecb273c95e012aed839a2290ae/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.20f1a40b57f98b3c0cab9c8db68b144d311810ecb273c95e012aed839a2290ae/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "150"
+          ]
+        }
+      ],
+      "validation": "EP16 t129 20 repeated outputs and 64 golden files exact.",
+      "finding": "No benefit: EP16 64K Dispatch 29.70 GB/s versus stable baseline 30.16 GB/s."
+    },
+    {
+      "name": "Bounded receive channel probes",
+      "adopted": false,
+      "patch": "results/communication_bottleneck_20260915/rx_budget.patch",
+      "cases": [
+        {
+          "name": "rx_budget_production_ep16_129",
+          "ep": 16,
+          "tokens": 129,
+          "rounds": 20,
+          "timeout": 180,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.30271420913de1d948e91d695a5fbcb92935ccff774dbdcc403f0b0391c6927c/test_cuda_notify",
+          "source": "/tmp/weftmoe-rx-budget-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {},
+          "started_unix": 1789485236.4352665,
+          "ended_unix": 1789485253.3314712,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 563.152,
+              "fc2": 102.944,
+              "return": 406.368,
+              "reduce": 73.52000000000001,
+              "forward": 1239.745,
+              "wall": 2350.3450000000003
+            },
+            "payload_GBps": {
+              "nv_dispatch": 6.567832485723215,
+              "nv_return": 4.550909520434679,
+              "rdma_dispatch": 0.938261783674745,
+              "rdma_return": 5.2010394519253484
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-rx-budget-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.30271420913de1d948e91d695a5fbcb92935ccff774dbdcc403f0b0391c6927c/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.30271420913de1d948e91d695a5fbcb92935ccff774dbdcc403f0b0391c6927c/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "180"
+          ]
+        },
+        {
+          "name": "rx_budget_pure_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 180,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.728db2c77bd2c231b3d741ed87723f0b40735dc11d2d9495c653ede7e30d04aa/test_cuda_notify",
+          "source": "/tmp/weftmoe-rx-budget-da55d82",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789485253.340175,
+          "ended_unix": 1789485273.9861188,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8942.0,
+              "fc2": 7022.0650000000005,
+              "return": 23544.85,
+              "reduce": 17084.550000000003,
+              "forward": 32350.35,
+              "wall": 34315.4
+            },
+            "payload_GBps": {
+              "nv_dispatch": 210.137350928204,
+              "nv_return": 39.90359233547888,
+              "rdma_dispatch": 30.019621561171995,
+              "rdma_return": 45.604105526261584
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-rx-budget-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.728db2c77bd2c231b3d741ed87723f0b40735dc11d2d9495c653ede7e30d04aa/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.728db2c77bd2c231b3d741ed87723f0b40735dc11d2d9495c653ede7e30d04aa/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "180"
+          ]
+        }
+      ],
+      "finding": "EP16 64K Dispatch remains 30.02 GB/s; no measured throughput gain. Small retained-state repeated FWD passed."
+    },
+    {
+      "name": "Chunk-wide cooperative Dispatch packing metadata",
+      "adopted": true,
+      "source_patch": "results/communication_bottleneck_20260915/pack_metadata.patch",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/pack_metadata_screen",
+        "results/communication_bottleneck_20260915/pack_selection"
+      ],
+      "cases": [
+        {
+          "name": "baseline_pure_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.01036f8372047ec6f0c8c920f720c3a5cea37efb7c5dc6f146370b787a8ea4af/test_cuda_notify",
+          "source": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789486246.6037874,
+          "ended_unix": 1789486267.7405748,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8935.505000000001,
+              "fc2": 5152.93,
+              "return": 23528.45,
+              "reduce": 18504.1,
+              "forward": 32335.300000000003,
+              "wall": 34308.600000000006
+            },
+            "payload_GBps": {
+              "nv_dispatch": 210.29009462811555,
+              "nv_return": 39.931406276231534,
+              "rdma_dispatch": 30.041442089730793,
+              "rdma_return": 45.635892887121756
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.01036f8372047ec6f0c8c920f720c3a5cea37efb7c5dc6f146370b787a8ea4af/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.01036f8372047ec6f0c8c920f720c3a5cea37efb7c5dc6f146370b787a8ea4af/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "150"
+          ]
+        },
+        {
+          "name": "pack_pure_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.0ead7039e06203749e88479892440579752c0e5bc8b71d6f70c1a617cb165663/test_cuda_notify",
+          "source": "/tmp/weftmoe-pack-meta-da55d82",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789486267.7506826,
+          "ended_unix": 1789486288.8288364,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8564.51,
+              "fc2": 5228.625,
+              "return": 23680.85,
+              "reduce": 18456.65,
+              "forward": 31894.15,
+              "wall": 33689.85
+            },
+            "payload_GBps": {
+              "nv_dispatch": 219.3993809336436,
+              "nv_return": 39.67442452445753,
+              "rdma_dispatch": 31.34276870480623,
+              "rdma_return": 45.34219945652289
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-pack-meta-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.0ead7039e06203749e88479892440579752c0e5bc8b71d6f70c1a617cb165663/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.0ead7039e06203749e88479892440579752c0e5bc8b71d6f70c1a617cb165663/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "150"
+          ]
+        },
+        {
+          "name": "pack_full_ep16_8k",
+          "ep": 16,
+          "tokens": 8192,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify",
+          "source": "/tmp/weftmoe-pack-meta-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {
+            "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/pack_selection/ep16_prefix",
+            "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+            "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+          },
+          "started_unix": 1789486288.8370833,
+          "ended_unix": 1789486305.902861,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1927.0749999999998,
+              "fc2": 2331.71,
+              "return": 4548.785,
+              "reduce": 2828.8,
+              "forward": 5357.795,
+              "wall": 6710.91
+            },
+            "payload_GBps": {
+              "nv_dispatch": 121.88473411776917,
+              "nv_return": 25.817995794481384,
+              "rdma_dispatch": 17.412104873967024,
+              "rdma_return": 29.506280907978727
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-pack-meta-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "150"
+          ]
+        },
+        {
+          "name": "pack_full_ep8_129",
+          "ep": 8,
+          "tokens": 129,
+          "rounds": 20,
+          "timeout": 150,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify",
+          "source": "/tmp/weftmoe-pack-meta-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {
+            "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/pack_selection/ep8_prefix",
+            "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+            "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+          },
+          "started_unix": 1789486305.9120898,
+          "ended_unix": 1789486316.0702102,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 64.72,
+              "fc2": 147.05599999999998,
+              "return": 187.856,
+              "reduce": 90.256,
+              "forward": 383.584,
+              "wall": 995.9555
+            },
+            "payload_GBps": {
+              "nv_dispatch": 57.14907292954264,
+              "nv_return": 19.688953240780176
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-pack-meta-da55d82/tests/run_local_activation_p2p.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify",
+            "--world",
+            "8",
+            "--top-k",
+            "8",
+            "--rounds",
+            "20",
+            "--timeout",
+            "150",
+            "--forward-benchmark"
+          ]
+        }
+      ],
+      "validation": {
+        "forward": "EP16 t129 and t8192 plus EP8 t129, 20 repetitions; 160 prefix files byte-identical to golden across the two validation runs.",
+        "backward": [
+          {
+            "model": "qwen",
+            "ep": 16,
+            "tokens": 129,
+            "experts": 32,
+            "all_byte_identical_to_golden": true,
+            "files_compared": 160,
+            "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c83dd8cf67f4569ed9d37cd94091ca64d36a5859798a0333e98a0cba242c67ce/test_cuda_notify"
+          }
+        ],
+        "cpu": "90 tests and 126 subtests passed (unified resource/tuning and Forward/Backward autotune)."
+      },
+      "finding": "Adjacent EP16 64K pure pair: Dispatch 30.04 -> 31.34 GB/s (+4.3%); total communication GPU 32.335 -> 31.894 ms; allocation-inclusive wall 34.309 -> 33.690 ms. Separate first screen 31.71 GB/s. EP16 8K full FWD GPU 5.358 ms, wall 6.711 ms; prior stable checkpoint 5.539 / 6.914 ms is historical, not an adjacent full pair. Goal not achieved."
+    },
+    {
+      "name": "Dense push Return with both Reduce paths mapped",
+      "adopted": false,
+      "experimental_commit": "39e070c",
+      "patch": "results/communication_bottleneck_20260915/compact_push_fixed.patch",
+      "raw_results": "results/communication_bottleneck_20260915/compact_fixed_screen",
+      "cases": [
+        {
+          "name": "compact_fixed_production_ep8_t129",
+          "ep": 8,
+          "tokens": 129,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.07156d6ae0f906fb806b420eb285f73b8307cd89cf5011262a66656e2556d66b/test_cuda_notify",
+          "source": "/tmp/weftmoe-compact-push-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {
+            "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/compact_fixed_screen/ep8_prefix",
+            "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+            "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+          },
+          "started_unix": 1789486328.106136,
+          "ended_unix": 1789486336.7313027,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 64.608,
+              "fc2": 146.704,
+              "return": 187.392,
+              "reduce": 100.208,
+              "forward": 385.72799999999995,
+              "wall": 944.233
+            },
+            "payload_GBps": {
+              "nv_dispatch": 57.248142644873695,
+              "nv_return": 19.73770491803279
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.07156d6ae0f906fb806b420eb285f73b8307cd89cf5011262a66656e2556d66b/test_cuda_notify",
+            "--world",
+            "8",
+            "--top-k",
+            "8",
+            "--rounds",
+            "20",
+            "--timeout",
+            "120",
+            "--forward-benchmark"
+          ]
+        },
+        {
+          "name": "compact_fixed_production_ep16_t129",
+          "ep": 16,
+          "tokens": 129,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.07156d6ae0f906fb806b420eb285f73b8307cd89cf5011262a66656e2556d66b/test_cuda_notify",
+          "source": "/tmp/weftmoe-compact-push-da55d82",
+          "retain": true,
+          "check": true,
+          "environment": {
+            "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/compact_fixed_screen/ep16_prefix",
+            "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+            "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+          },
+          "started_unix": 1789486336.7402246,
+          "ended_unix": 1789486354.092707,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 586.592,
+              "fc2": 96.864,
+              "return": 416.176,
+              "reduce": 74.256,
+              "forward": 1276.1,
+              "wall": 2367.49
+            },
+            "payload_GBps": {
+              "nv_dispatch": 6.305384321640936,
+              "nv_return": 4.4436584521933025,
+              "rdma_dispatch": 0.900769188805848,
+              "rdma_return": 5.078466802506632
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-compact-push-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.07156d6ae0f906fb806b420eb285f73b8307cd89cf5011262a66656e2556d66b/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.07156d6ae0f906fb806b420eb285f73b8307cd89cf5011262a66656e2556d66b/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "120"
+          ]
+        },
+        {
+          "name": "compact_fixed_pure_ep8_t65536",
+          "ep": 8,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48b680ed6ed0357f488ddf054b4201d792a6551dee3217309ba052fd4fbd7142/test_cuda_notify",
+          "source": "/tmp/weftmoe-compact-push-da55d82",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789486354.1006198,
+          "ended_unix": 1789486365.8585448,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 6892.6849999999995,
+              "fc2": 2120.145,
+              "return": 5689.92,
+              "reduce": 4415.549999999999,
+              "forward": 13397.7,
+              "wall": 14630.900000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 272.61483616326586,
+              "nv_return": 330.24158371295204
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48b680ed6ed0357f488ddf054b4201d792a6551dee3217309ba052fd4fbd7142/test_cuda_notify",
+            "--world",
+            "8",
+            "--top-k",
+            "8",
+            "--rounds",
+            "20",
+            "--timeout",
+            "120",
+            "--forward-benchmark"
+          ]
+        },
+        {
+          "name": "compact_fixed_pure_ep16_t65536",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48b680ed6ed0357f488ddf054b4201d792a6551dee3217309ba052fd4fbd7142/test_cuda_notify",
+          "source": "/tmp/weftmoe-compact-push-da55d82",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789486365.8661878,
+          "ended_unix": 1789486387.0816853,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 9822.619999999999,
+              "fc2": 3054.74,
+              "return": 23618.9,
+              "reduce": 20671.75,
+              "forward": 33249.25,
+              "wall": 35100.05
+            },
+            "payload_GBps": {
+              "nv_dispatch": 191.29806426391332,
+              "nv_return": 39.77848655102481,
+              "rdma_dispatch": 27.32829489484476,
+              "rdma_return": 45.4611274868855
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-compact-push-da55d82/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48b680ed6ed0357f488ddf054b4201d792a6551dee3217309ba052fd4fbd7142/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48b680ed6ed0357f488ddf054b4201d792a6551dee3217309ba052fd4fbd7142/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "120"
+          ]
+        }
+      ],
+      "validation": "EP8 and EP16 retained-state t129, 20 repetitions; 96 prefix files byte-identical to golden.",
+      "finding": "EP8 64K Return 330.24 GB/s vs baseline 102.64 GB/s; Dispatch 272.61 GB/s. EP16 Dispatch regresses to 27.33 GB/s; Return RDMA stays 45.46 GB/s. Experimental layout not yet adopted or broadly validated.",
+      "next_change": "Cross-node Dispatch does not need to transmit a compact Return ordinal: its results return by GIN route IDs, and the source maps them locally. Remove that redundant metadata work and combine cooperative packing."
     }
   ],
   "diagnostics": [
@@ -372,6 +1078,23 @@
       "result": "timeout; no report generated; excluded from evidence",
       "raw_results": "results/communication_bottleneck_20260915/pc_screen_rank1",
       "cleanup": "No GPU processes remained when rechecked before compact-layout experiments."
+    },
+    {
+      "name": "Baseline EP16 64K communication timeline",
+      "raw_results": "results/communication_bottleneck_20260915/next_probes",
+      "summary": "results/communication_bottleneck_20260915/next_probes/timeline_summary.json",
+      "rank0": {
+        "pack_last_end_us": 8362.432,
+        "dispatch_last_put_us": 8402.944,
+        "fanout_last_end_us": 8755.552,
+        "local_dispatch_last_end_us": 7674.752,
+        "pack_tasks": 520,
+        "pack_median_us": 210.688,
+        "pack_max_cta_busy_us": 6830.208,
+        "mean_pack_end_to_issue_us": 24.7187076923,
+        "peak_packed_backlog": 12
+      },
+      "finding": "Packing remains active until just before the final Dispatch submissions. Receiving fanout contributes about 353 us after the last submission on this rank. These are same-GPU timestamps, not cross-node wire latency."
     }
   ]
 }

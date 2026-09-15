@@ -390,36 +390,40 @@ __device__ __forceinline__ void pack_dispatch(const ForwardKernelArgs &a,
   if (tid == 0U)
     *reinterpret_cast<ring::ChunkHeader *>(chunk) =
         ring::ChunkHeader{task.rows, task.terminal, 0};
-  RowPrefetchPipeline<Storage> row_pipeline(s, warp);
-  for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
+  // Materialize a complete chunk cooperatively before entering the TMA row
+  // loop. Per-row warp reconvergence must not serialize metadata preparation
+  // behind the elected issuer's payload wait.
+  for (unsigned item = tid; item < task.rows; item += Storage::kCopyThreads) {
     const auto packet = a.dispatch_waves.packet_order[task.first + item];
     const auto token = a.dispatch.packet_headers[packet].local_token_id;
     const auto first = a.dispatch.packet_fanout_offsets[packet];
     const auto end = a.dispatch.packet_fanout_offsets[packet + 1ULL];
     auto *record = chunk + sizeof(ring::ChunkHeader) +
                    item * a.gin_rings.dispatch_row_bytes;
-    if (lane == 0U)
-      *reinterpret_cast<ring::DispatchRow *>(record) =
-          ring::DispatchRow{token, unsigned(end - first), 0};
+    *reinterpret_cast<ring::DispatchRow *>(record) =
+        ring::DispatchRow{token, unsigned(end - first), 0};
     auto *fanout = reinterpret_cast<ForwardDispatchFanoutRecord *>(
         record + sizeof(ring::DispatchRow));
-    for (auto index = first + lane; index < end; index += 32U) {
+    for (auto index = first; index < end; ++index) {
       const auto target = a.dispatch.packet_fanout[index];
       fanout[index - first] = ForwardDispatchFanoutRecord{
-          target.dst_row,
-          0,
-          target.topk_slot,
+          target.dst_row, 0, target.topk_slot,
           static_cast<std::uint16_t>(target.destination_local_rank),
-          static_cast<std::uint16_t>(target.expert_id),
-          target.reserved,
+          static_cast<std::uint16_t>(target.expert_id), target.reserved,
           a.gates[token * a.dispatch.identity.top_k + target.topk_slot]};
     }
-    if (lane == 0U)
-      row_pipeline.copy(a.input + token * a.hidden,
-               record + a.gin_rings.dispatch_row_bytes - a.hidden * 2ULL,
-               unsigned(a.hidden * 2ULL));
   }
+  copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   if (lane == 0U) {
+    RowPrefetchPipeline<Storage> row_pipeline(s, warp);
+    for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
+      auto *record = chunk + sizeof(ring::ChunkHeader) +
+                     item * a.gin_rings.dispatch_row_bytes;
+      const auto token = reinterpret_cast<const ring::DispatchRow *>(record)->token;
+      row_pipeline.copy(a.input + token * a.hidden,
+                        record + a.gin_rings.dispatch_row_bytes - a.hidden * 2ULL,
+                        unsigned(a.hidden * 2ULL));
+    }
     row_pipeline.drain();
     finish_copies<false>();
   }
