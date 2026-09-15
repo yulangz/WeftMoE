@@ -7520,7 +7520,97 @@
           }
         ]
       },
-      "finding": "Initial full8K candidate timed out. Code review found a nonuniform conditional-barrier hazard: leader may update shared dispatch_complete before slower copy warps decide whether to call progress_return. Fixed by capturing eligibility before the existing loop-start copy barrier. Fixed binary validation pending. No source adopted and no performance gain claimed."
+      "finding": "Initial80b56da full8K candidate timed out;d55636e captures eligibility before the existing copy-domain join and resolves the nonuniform conditional-barrier hazard. Fixed129/8K candidates pass20 native repetitions and192golden files are exact. Matched fullQwenEP168K pair: Dispatch1453.570->1255.535us, FC22184.800->2123.380us, Return4217.440->4139.215us, totalForward5017.410->5486.530us (+9.35%), allocation-inclusivewall6413.105->6877.030us. Deferral reduces interference with Dispatch but does not restore full pipeline latency;reject for production. Requestedclock1620MHz;Nsight found lowerGPCclock during tensor activity in separately profiled fullruns, so do not claim continuously observed1620MHz. No BWD/Flash/64K orpure validation of this deferral candidate.",
+      "fixed_result": {
+        "raw_results": "results/communication_bottleneck_20260915/dispatch_priority_return_fixed_q4_training",
+        "cases": [
+          {
+            "name": "targeted_flush_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1453.57,
+                "fc2": 2184.8,
+                "return": 4217.4400000000005,
+                "reduce": 2687.315,
+                "forward": 5017.41,
+                "wall": 6413.105
+              },
+              "payload_GBps": {
+                "nv_dispatch": 161.58906966984733,
+                "nv_return": 27.846397814788112,
+                "rdma_dispatch": 23.084152809978193,
+                "rdma_return": 31.82445464547213
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "dispatch_priority_return_fixed_q4_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1255.5349999999999,
+                "fc2": 2123.38,
+                "return": 4139.215,
+                "reduce": 2781.04,
+                "forward": 5486.53,
+                "wall": 6877.03
+              },
+              "payload_GBps": {
+                "nv_dispatch": 187.07644470285578,
+                "nv_return": 28.37265326879614,
+                "rdma_dispatch": 26.725206386122252,
+                "rdma_return": 32.42588945005273
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation_8k": {
+          "files_compared": 128,
+          "all_byte_identical": true,
+          "repetitions": 20
+        },
+        "phase_transition_validation": {
+          "tokens": 129,
+          "repetitions": 20,
+          "files_compared": 64,
+          "all_byte_identical": true
+        },
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0
+          },
+          {
+            "node": "remote",
+            "rc": 0
+          }
+        ],
+        "phase_transition_clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0
+          },
+          {
+            "node": "remote",
+            "rc": 0
+          }
+        ]
+      }
     }
   ],
   "diagnostics": [
