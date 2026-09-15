@@ -1297,6 +1297,229 @@
           }
         }
       ]
+    },
+    {
+      "name": "Split GIN receive and local transport warps",
+      "adopted": false,
+      "source_commit": "80f65a5",
+      "raw_results": "results/communication_bottleneck_20260915/split_receive_screen",
+      "cases": [
+        {
+          "name": "split_receive_ep16_129",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 186.49599999999998,
+            "fc2": 126.52799999999999,
+            "return": 418.86400000000003,
+            "reduce": 81.00800000000001,
+            "forward": 1413.47,
+            "wall": 2532.13
+          },
+          "payload_GBps": {
+            "nv_dispatch": 19.832532601235418,
+            "nv_return": 4.417586615225944,
+            "rdma_dispatch": 2.833218943033631,
+            "rdma_return": 5.042820581382023
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 129,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8578.785,
+            "fc2": 2893.9049999999997,
+            "return": 23823.7,
+            "reduce": 20587.6,
+            "forward": 31904.4,
+            "wall": 33688.55
+          },
+          "payload_GBps": {
+            "nv_dispatch": 219.03430287622314,
+            "nv_return": 39.436531521132316,
+            "rdma_dispatch": 31.29061469660331,
+            "rdma_return": 45.07032173843693
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "split_receive_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 9068.7,
+            "fc2": 2997.715,
+            "return": 23556.0,
+            "reduce": 20711.800000000003,
+            "forward": 32567.0,
+            "wall": 34410.399999999994
+          },
+          "payload_GBps": {
+            "nv_dispatch": 207.2014943707477,
+            "nv_return": 39.884704364068604,
+            "rdma_dispatch": 29.600213481535388,
+            "rdma_return": 45.58251927322126
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "validation": {
+        "tokens": 129,
+        "repetitions": 20,
+        "files_compared": 64,
+        "all_byte_identical": true
+      },
+      "finding": "Dispatch 31.29 -> 29.60 GB/s; Return 45.07 -> 45.58 GB/s. Retest split with local row prefetch before rejecting domain separation."
+    },
+    {
+      "name": "Split receive prefetch and GIN row alignment screens",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/next_transport_screen",
+      "cases": [
+        {
+          "name": "aligned_gin_ep16_129",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 462.608,
+            "fc2": 52.528,
+            "return": 375.728,
+            "reduce": 68.112,
+            "forward": 1003.935,
+            "wall": 2157.13
+          },
+          "payload_GBps": {
+            "nv_dispatch": 7.995296233528171,
+            "nv_return": 4.924754077417706,
+            "rdma_dispatch": 1.1421851762183102,
+            "rdma_return": 5.621768939232637
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 129,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "split_prefetch_ep16_129",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 180.224,
+            "fc2": 633.216,
+            "return": 425.504,
+            "reduce": 140.752,
+            "forward": 1310.915,
+            "wall": 2417.0649999999996
+          },
+          "payload_GBps": {
+            "nv_dispatch": 20.522727272727277,
+            "nv_return": 4.348650071444687,
+            "rdma_dispatch": 2.931818181818182,
+            "rdma_return": 4.9641272467473865
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 129,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8706.275,
+            "fc2": 2632.67,
+            "return": 23818.35,
+            "reduce": 20826.9,
+            "forward": 32027.45,
+            "wall": 33859.8
+          },
+          "payload_GBps": {
+            "nv_dispatch": 215.82688256458707,
+            "nv_return": 39.44538962606562,
+            "rdma_dispatch": 30.832411794941006,
+            "rdma_return": 45.08044528693214
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "aligned_gin_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8577.615,
+            "fc2": 2898.545,
+            "return": 23743.2,
+            "reduce": 20497.5,
+            "forward": 31931.6,
+            "wall": 33701.95
+          },
+          "payload_GBps": {
+            "nv_dispatch": 219.0641794951161,
+            "nv_return": 39.57023888945046,
+            "rdma_dispatch": 31.294882785016583,
+            "rdma_return": 45.22313015937195
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "split_prefetch_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 9535.075,
+            "fc2": 2667.44,
+            "return": 23582.75,
+            "reduce": 20887.75,
+            "forward": 32969.45,
+            "wall": 34837.350000000006
+          },
+          "payload_GBps": {
+            "nv_dispatch": 197.06695458609394,
+            "nv_return": 39.83946299731795,
+            "rdma_dispatch": 28.15242208372771,
+            "rdma_return": 45.53081485407766
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "finding": "Split+prefetch further regresses to 28.15 GB/s. Alignment gives 31.29 GB/s vs adjacent 30.83; insufficient benefit to adopt a wire-layout change without further evidence."
     }
   ],
   "diagnostics": [
@@ -1322,6 +1545,11 @@
         "peak_packed_backlog": 12
       },
       "finding": "Packing remains active until just before the final Dispatch submissions. Receiving fanout contributes about 353 us after the last submission on this rank. These are same-GPU timestamps, not cross-node wire latency."
+    },
+    {
+      "name": "Dispatch and Return RDMA issue overlap",
+      "raw_results": "results/communication_bottleneck_20260915/next_probes/overlap_summary.json",
+      "finding": "Zero Return payload submitted before final Dispatch submission on all 16 ranks. Pure benchmark intentionally sequences Dispatch and Return. No D/R NIC contention explains low Dispatch rate."
     }
   ]
 }
