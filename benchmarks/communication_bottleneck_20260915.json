@@ -8146,6 +8146,279 @@
       "validation": "All3 measured jobs completed with native20-repeat checks; clocks restored on both nodes. These are communication-only correctness checks, not full Forward/BWD validation.",
       "limitations": "Percent metrics use their own peak-sustained denominators, not fractions of time spent in code. SM stall metrics cannot assign stalls to communication warps; front-end semaphore stall is not communication synchronization time. GPU0 8K summaries use interiors of last10 steady iterations.64K covers one last iteration on local ranks0-7,not remote node. Boundaries approximate each GPU setup CUPTI start plus its own duration; no cross-GPU timestamp subtraction. LastPCIe>=70 threshold is not NIC protocol completion. First general capture had CUDA event tracing enabled; compute-triage and64K explicitly disabled it.",
       "finding": "Dispatch has low SM issue (~3.2%) and low DRAM/L2 throughput; no evidence of arithmetic-issue or HBM-bandwidth saturation. PCIe is near80% through the bulk portion, while NVLink TX user data is roughly60% in64K bulk. After the last >=70% PCIe TX sample, each local GPU still has1.44-1.68ms until its own approximate Dispatch boundary; NVLink traffic persists and falls during this tail. This motivates balancing local Dispatch versus received fanout service to reduce remaining NVLink work, while preserving Return service and publication granularity."
+    },
+    {
+      "name": "Full Forward service-ratio regression: Tensor and PCIe timeline",
+      "cases": [
+        {
+          "variant": "targeted_flush",
+          "raw_results": "results/communication_bottleneck_20260915/nsys_full_targeted_flush_qwen_ep16_8k_last",
+          "returncode": 0,
+          "profiled_run_summary": {
+            "timing_us": {
+              "dispatch": 1499.885,
+              "fc2": 2201.0550000000003,
+              "return": 4218.24,
+              "reduce": 2640.26,
+              "forward": 5072.255,
+              "wall": 6534.45
+            },
+            "payload_GBps": {
+              "nv_dispatch": 156.5993552839051,
+              "nv_return": 27.84111667425277,
+              "rdma_dispatch": 22.3713364691293,
+              "rdma_return": 31.81841905628888
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "clock_cleanup": [
+            {
+              "node": "local",
+              "rc": 0
+            },
+            {
+              "node": "remote",
+              "rc": 0
+            }
+          ],
+          "last_iteration_per_gpu": {
+            "0": {
+              "kernel_us": 4772.1,
+              "dispatch_us": 1354.66,
+              "last_tensor_to_kernel_end_us": 2308.13,
+              "last_pcie_ge70_to_kernel_end_us": 908.129
+            },
+            "1": {
+              "kernel_us": 4770.821,
+              "dispatch_us": 1513.22,
+              "last_tensor_to_kernel_end_us": 2315.49,
+              "last_pcie_ge70_to_kernel_end_us": 815.489
+            },
+            "2": {
+              "kernel_us": 4769.852,
+              "dispatch_us": 1374.94,
+              "last_tensor_to_kernel_end_us": 2341.662,
+              "last_pcie_ge70_to_kernel_end_us": 841.663
+            },
+            "3": {
+              "kernel_us": 4769.044,
+              "dispatch_us": 1450.02,
+              "last_tensor_to_kernel_end_us": 2328.762,
+              "last_pcie_ge70_to_kernel_end_us": 928.765
+            },
+            "4": {
+              "kernel_us": 4770.566,
+              "dispatch_us": 1341.73,
+              "last_tensor_to_kernel_end_us": 2319.651,
+              "last_pcie_ge70_to_kernel_end_us": 819.649
+            },
+            "5": {
+              "kernel_us": 4770.206,
+              "dispatch_us": 1385.25,
+              "last_tensor_to_kernel_end_us": 2251.487,
+              "last_pcie_ge70_to_kernel_end_us": 851.487
+            },
+            "6": {
+              "kernel_us": 4769.529,
+              "dispatch_us": 1384.1,
+              "last_tensor_to_kernel_end_us": 2304.956,
+              "last_pcie_ge70_to_kernel_end_us": 904.958
+            },
+            "7": {
+              "kernel_us": 4770.859,
+              "dispatch_us": 1369.73,
+              "last_tensor_to_kernel_end_us": 2254.87,
+              "last_pcie_ge70_to_kernel_end_us": 854.876
+            }
+          }
+        },
+        {
+          "variant": "dispatch_ratio_q4",
+          "raw_results": "results/communication_bottleneck_20260915/nsys_full_dispatch_ratio_q4_qwen_ep16_8k_last",
+          "returncode": 0,
+          "profiled_run_summary": {
+            "timing_us": {
+              "dispatch": 1429.65,
+              "fc2": 2161.92,
+              "return": 4988.4,
+              "reduce": 2816.66,
+              "forward": 5834.13,
+              "wall": 7287.24
+            },
+            "payload_GBps": {
+              "nv_dispatch": 164.29267582974853,
+              "nv_return": 23.542721513912277,
+              "rdma_dispatch": 23.470382261392647,
+              "rdma_return": 26.905967444471173
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "clock_cleanup": [
+            {
+              "node": "local",
+              "rc": 0
+            },
+            {
+              "node": "remote",
+              "rc": 0
+            }
+          ],
+          "last_iteration_per_gpu": {
+            "0": {
+              "kernel_us": 5496.764,
+              "dispatch_us": 1276.42,
+              "last_tensor_to_kernel_end_us": 3099.71,
+              "last_pcie_ge70_to_kernel_end_us": 1099.711
+            },
+            "1": {
+              "kernel_us": 5494.732,
+              "dispatch_us": 1369.73,
+              "last_tensor_to_kernel_end_us": 3091.558,
+              "last_pcie_ge70_to_kernel_end_us": 891.554
+            },
+            "2": {
+              "kernel_us": 5494.676,
+              "dispatch_us": 1397.25,
+              "last_tensor_to_kernel_end_us": 3074.521,
+              "last_pcie_ge70_to_kernel_end_us": 1074.526
+            },
+            "3": {
+              "kernel_us": 5494.891,
+              "dispatch_us": 1384.06,
+              "last_tensor_to_kernel_end_us": 3016.757,
+              "last_pcie_ge70_to_kernel_end_us": 1116.764
+            },
+            "4": {
+              "kernel_us": 5494.887,
+              "dispatch_us": 1336.22,
+              "last_tensor_to_kernel_end_us": 3022.372,
+              "last_pcie_ge70_to_kernel_end_us": 1022.369
+            },
+            "5": {
+              "kernel_us": 5495.774,
+              "dispatch_us": 1433.86,
+              "last_tensor_to_kernel_end_us": 3010.015,
+              "last_pcie_ge70_to_kernel_end_us": 1010.048
+            },
+            "6": {
+              "kernel_us": 5494.17,
+              "dispatch_us": 1332.93,
+              "last_tensor_to_kernel_end_us": 3055.709,
+              "last_pcie_ge70_to_kernel_end_us": 1155.711
+            },
+            "7": {
+              "kernel_us": 5494.917,
+              "dispatch_us": 1315.94,
+              "last_tensor_to_kernel_end_us": 3079.057,
+              "last_pcie_ge70_to_kernel_end_us": 1079.067
+            }
+          }
+        }
+      ],
+      "pcie_high_segment_gap": {
+        "method": "First PCIe TX >=70% segment followed by below-threshold samples until next >=70%;100us nominal sampling, all local GPUs, one last iteration. Threshold gap is not necessarily zero traffic or exact NIC idle time. Own GPU setup origins only.",
+        "variants": {
+          "targeted_flush": {
+            "0": {
+              "first_high_segment_end_us": 794.497,
+              "next_ge70_us": 1194.465,
+              "gap_us": 399.968
+            },
+            "1": {
+              "first_high_segment_end_us": 787.617,
+              "next_ge70_us": 1387.617,
+              "gap_us": 600.0
+            },
+            "2": {
+              "first_high_segment_end_us": 760.063,
+              "next_ge70_us": 1260.063,
+              "gap_us": 500.0
+            },
+            "3": {
+              "first_high_segment_end_us": 773.438,
+              "next_ge70_us": 1273.437,
+              "gap_us": 499.999
+            },
+            "4": {
+              "first_high_segment_end_us": 783.073,
+              "next_ge70_us": 1283.074,
+              "gap_us": 500.001
+            },
+            "5": {
+              "first_high_segment_end_us": 750.624,
+              "next_ge70_us": 1250.623,
+              "gap_us": 499.999
+            },
+            "6": {
+              "first_high_segment_end_us": 797.311,
+              "next_ge70_us": 1397.31,
+              "gap_us": 599.999
+            },
+            "7": {
+              "first_high_segment_end_us": 747.965,
+              "next_ge70_us": 1447.962,
+              "gap_us": 699.997
+            }
+          },
+          "dispatch_ratio_q4": {
+            "0": {
+              "first_high_segment_end_us": 727.263,
+              "next_ge70_us": 2027.263,
+              "gap_us": 1300.0
+            },
+            "1": {
+              "first_high_segment_end_us": 735.522,
+              "next_ge70_us": 2135.525,
+              "gap_us": 1400.003
+            },
+            "2": {
+              "first_high_segment_end_us": 752.702,
+              "next_ge70_us": 1852.7,
+              "gap_us": 1099.998
+            },
+            "3": {
+              "first_high_segment_end_us": 810.909,
+              "next_ge70_us": 1910.904,
+              "gap_us": 1099.995
+            },
+            "4": {
+              "first_high_segment_end_us": 805.057,
+              "next_ge70_us": 2105.059,
+              "gap_us": 1300.002
+            },
+            "5": {
+              "first_high_segment_end_us": 817.887,
+              "next_ge70_us": 2017.855,
+              "gap_us": 1199.968
+            },
+            "6": {
+              "first_high_segment_end_us": 771.007,
+              "next_ge70_us": 1971.006,
+              "gap_us": 1199.999
+            },
+            "7": {
+              "first_high_segment_end_us": 748.189,
+              "next_ge70_us": 2048.182,
+              "gap_us": 1299.993
+            }
+          }
+        }
+      },
+      "figure": "results/communication_bottleneck_20260915/full_dispatch_ratio_metrics.png",
+      "limitations": "10kHz Nsight Systems gh100 metrics,CUDA event tracing disabled,no replay,one final iteration on8 local GPUs. Full FWD phases overlap. Per-GPU setup origins and own Dispatch durations only. Threshold gaps are not exact NIC idle durations; high-flow return attribution is inferred from timing and identical workloads, not packet tracing. cudaProfilerStart caused a large last-iteration host Notify delay, so profiled wall time is not production timing. Both20-repeat native checks passed; existing unprofiled pair supplies regression evidence.",
+      "finding": "Profiled run medians reproduce total FWD5072.255->5834.130us while FC2 interval2201.055->2161.920us. On captured local GPUs, fused kernel4770us->5495us and lastTensor>=1% to kernel end2251-2342us->3010-3100us. First PCIeTX>=70% segment to next such segment gap400-700us->1100-1400us. GPU0 plot shows earlier NVLink Return activity and delayed sustained second PCIe flow. Evidence supports a scheduling/output-supply bubble rather than slower GEMM throughput alone. Next causal test defers local NVLink Return until Dispatch completion, while maintaining GIN Return receive service."
     }
   ]
 }
