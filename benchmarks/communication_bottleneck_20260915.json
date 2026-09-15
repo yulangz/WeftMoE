@@ -6659,6 +6659,104 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K pure Dispatch 28.874 to 30.077 GB/s; Return 39.793 to 39.782 GB/s. Similar to shared publisher queue; no evidence of a large gain from another warp alone. Uses 512 threads, two copy warps, dedicated Dispatch publisher and FC1/Return publisher; math 208, producer 32, control 64 registers, N256 atom128, FC2 stages3. Full Forward/BWD validation not yet performed; not adopted."
+    },
+    {
+      "name": "Push Dispatch readiness through independent NVLink notification queues",
+      "adopted": false,
+      "source_commit": "755bded",
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_nvqueue_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.63,
+              "fc2": 553.728,
+              "return": 3375.645,
+              "reduce": 2418.5299999999997,
+              "forward": 4694.32,
+              "wall": 6056.049999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.8519838780368,
+              "nv_return": 34.790539882007735,
+              "rdma_dispatch": 28.835997696862403,
+              "rdma_return": 39.76061700800884
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        },
+        {
+          "name": "dedicated_dispatch_pub_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1110.53,
+              "fc2": 539.9200000000001,
+              "return": 3361.57,
+              "reduce": 2509.2650000000003,
+              "forward": 4640.98,
+              "wall": 6032.78
+            },
+            "payload_GBps": {
+              "nv_dispatch": 211.50353795034806,
+              "nv_return": 34.93620897378308,
+              "rdma_dispatch": 30.214791135764003,
+              "rdma_return": 39.92709597003781
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        },
+        {
+          "name": "dispatch_nvqueue_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1452.51,
+              "fc2": 616.88,
+              "return": 3385.33,
+              "reduce": 2391.7,
+              "forward": 5046.545,
+              "wall": 6465.82
+            },
+            "payload_GBps": {
+              "nv_dispatch": 161.7069927229417,
+              "nv_return": 34.691008557511374,
+              "rdma_dispatch": 23.100998960420238,
+              "rdma_return": 39.646866922870146
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "protocol": "Separate Dispatch and Return SPSC planes. Copy-domain full TMA completion precedes shared descriptor handoff. Dedicated Dispatch warp bins up to 128 IDs per batch, peer stores plus SYS ready release publish them, FC1/Return publisher consumes both planes and applies local SYS arrival counts. GIN receive credit returned after IDs are copied into bounded NVLink slots. Dispatch sends End after local data and descriptor queue drain; completion waits incoming End and outbound End credit. New blocking credit waits observe cancellation/error. Default Dispatch ring depth4; local payload batch32. Extra plane allocated once in reusable pool and reset per execution.",
+      "finding": "Qwen EP16 8K 1620MHz: production baseline Dispatch28.836 Return39.761GB/s; dedicated atomic publisher30.215/39.927; NVLink queue23.101/39.647. Correct sparse outputs but worse throughput. Not adopted; test larger independent Dispatch ring and local batch before abandoning batching direction. Full FWD/BWD and64K validation not claimed."
     }
   ],
   "diagnostics": [
