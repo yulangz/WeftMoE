@@ -473,6 +473,83 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
                              task.channel, task.rows, execution_epoch(a));
 }
 
+// Bound local fanout work independently of the network packet size. Claim
+// metadata uses a short, nonblocking local lease; no payload copy holds it.
+#ifndef WEFTMOE_FWD_GIN_RECEIVE_ROWS
+#define WEFTMOE_FWD_GIN_RECEIVE_ROWS 128
+#endif
+static_assert(WEFTMOE_FWD_GIN_RECEIVE_ROWS > 0 &&
+              WEFTMOE_FWD_GIN_RECEIVE_ROWS <= ring::kChunkRows);
+
+__device__ __forceinline__ bool
+claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
+                       wire::Transfer &task) {
+  if constexpr (WEFTMOE_FWD_GIN_RECEIVE_ROWS == ring::kChunkRows)
+    return wire::claim_receive(a, cursor, task, true);
+  const ncclGin gin(a.gin_dev_comm, 0);
+  for (unsigned probe = 0; probe < a.gin_rings.dispatch_channels; ++probe) {
+    const unsigned channel = cursor++ % a.gin_rings.dispatch_channels;
+    auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.rx_terminal)
+            .load(::cuda::memory_order_acquire))
+      continue;
+    ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device> lock(
+        state.dispatch_claim_lock);
+    unsigned expected = 0U;
+    if (!lock.compare_exchange_strong(expected, 1U, ::cuda::memory_order_acquire,
+                                     ::cuda::memory_order_relaxed))
+      continue;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
+        state.claimed);
+    const auto sequence = head.load(::cuda::memory_order_relaxed);
+    const unsigned slot = sequence % ring::kRingDepth;
+    if (gin.readSignal(a.gin_window, a.gin_rings.slot_control(channel, slot) +
+                                      offsetof(ring::ChunkSlot, ready_signal)) <
+        sequence / ring::kRingDepth + 1ULL) {
+      lock.store(0U, ::cuda::memory_order_release);
+      continue;
+    }
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    const auto *header = reinterpret_cast<const ring::ChunkHeader *>(
+        static_cast<const char *>(a.gin_window_base) +
+        a.gin_rings.payload(channel, sequence, true));
+    const unsigned begin = state.dispatch_row_cursor;
+    constexpr unsigned batch = WEFTMOE_FWD_GIN_RECEIVE_ROWS;
+    if (begin == 0U)
+      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+          state.slots[slot].dispatch_parts_remaining)
+          .store(max(1U, (header->rows + batch - 1U) / batch),
+                 ::cuda::memory_order_relaxed);
+    const unsigned rows = min(batch, header->rows - begin);
+    task = wire::Transfer{channel, rows, header->terminal, sequence, begin};
+    if (begin + rows == header->rows) {
+      state.dispatch_row_cursor = 0U;
+      head.store(sequence + 1ULL, ::cuda::memory_order_relaxed);
+    } else {
+      state.dispatch_row_cursor = begin + rows;
+    }
+    lock.store(0U, ::cuda::memory_order_release);
+    return true;
+  }
+  task.channel = wire::kNoChannel;
+  return false;
+}
+
+__device__ __forceinline__ void
+finish_dispatch_receive(const ForwardKernelArgs &a, const wire::Transfer &task) {
+  if constexpr (WEFTMOE_FWD_GIN_RECEIVE_ROWS < ring::kChunkRows) {
+    auto &slot = ring::channels(a.gin_window_base, a.gin_rings)[task.channel]
+                     .slots[task.sequence % ring::kRingDepth];
+    // The last finisher acquires every prior completion before publishing
+    // credit. Neither the payload nor its metadata can be overwritten early.
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+            slot.dispatch_parts_remaining)
+            .fetch_sub(1U, ::cuda::memory_order_acq_rel) != 1U)
+      return;
+  }
+  wire::finish_receive(a, task);
+}
+
 template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                                                  Storage &s,
@@ -483,7 +560,8 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                              task.channel, task.rows, execution_epoch(a));
   const auto *chunk = static_cast<const char *>(a.gin_window_base) +
                       a.gin_rings.payload(task.channel, task.sequence, true) +
-                      sizeof(ring::ChunkHeader);
+                      sizeof(ring::ChunkHeader) +
+                      task.first * a.gin_rings.dispatch_row_bytes;
   const auto source = wire::peer(a, task.channel);
   const unsigned items = task.rows * a.dispatch.identity.top_k;
   if (lane == 0U) {
@@ -557,7 +635,7 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                            task.rows);
     complete_completion_tasks(completion, transport_state::TaskClass::RelayWave,
                               task.rows);
-    wire::finish_receive(a, task);
+    finish_dispatch_receive(a, task);
   }
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ProxyRelayEnd, ProxyRelay,
@@ -636,9 +714,12 @@ template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ bool progress_receive(const ForwardKernelArgs &a,
                                                  Storage &s, bool dispatch) {
   const unsigned tid = local_thread<BaseThread>();
-  if (tid == 0U)
-    wire::claim_receive(a, dispatch ? s.gin_rx_dispatch : s.gin_rx_return,
-                        s.gin_task, dispatch);
+  if (tid == 0U) {
+    if (dispatch)
+      claim_dispatch_receive(a, s.gin_rx_dispatch, s.gin_task);
+    else
+      wire::claim_receive(a, s.gin_rx_return, s.gin_task, false);
+  }
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   const bool received = s.gin_task.channel != wire::kNoChannel;
   // Every warp must capture an empty result before the leader can enter the

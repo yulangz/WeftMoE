@@ -20,6 +20,8 @@ struct alignas(64) ChunkSlot {
   std::uint64_t credit_signal;
   unsigned long long consumed;
   unsigned long long acknowledged;
+  // Forward sub-batches share one immutable received payload. Reuses padding.
+  unsigned dispatch_parts_remaining;
 };
 
 struct alignas(128) ChunkChannel {
@@ -33,9 +35,14 @@ struct alignas(128) ChunkChannel {
   // sequence counters, this bitmap survives operation prepare and Graph
   // replay. New windows are zeroed once; successful drain consumes every bit.
   unsigned long long consumed_slots;
+  unsigned dispatch_claim_lock;
+  unsigned dispatch_row_cursor;
   ChunkSlot slots[kRingDepth];
 };
 static_assert(kRingDepth <= 64U);
+static_assert(sizeof(ChunkSlot) == 64U);
+static_assert(offsetof(ChunkSlot, dispatch_parts_remaining) == 32U);
+static_assert(offsetof(ChunkChannel, dispatch_claim_lock) == 48U);
 static_assert(offsetof(ChunkChannel, consumed_slots) == 40U);
 static_assert(offsetof(ChunkChannel, slots) == 64U);
 static_assert(sizeof(ChunkChannel) == 128U + kRingDepth * sizeof(ChunkSlot));
