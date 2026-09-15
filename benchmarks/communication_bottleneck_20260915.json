@@ -6420,6 +6420,109 @@
         "repetitions": 12
       },
       "finding": "Receiver caches its computed payload destination in the ForwardDispatchFanoutRecord field initialized to zero by unified packing, then reads that address when retiring prefetched rows. Network format/bytes, shared-memory footprint, TMA completion, notification, and final credit ordering unchanged. Qwen EP16 8K Dispatch28.904->28.943GB/s; Return39.810->39.731. No meaningful gain, no adoption or broader full-model tests.64 sparse output/input/route/gate files exact over12 repetitions."
+    },
+    {
+      "name": "Decouple Dispatch readiness through per-CTA SPSC publication queues",
+      "adopted": false,
+      "experimental_commits": {
+        "receive_only": "0ef48bf",
+        "receive_and_local": "7f9be9a"
+      },
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_publication_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.39,
+              "fc2": 573.344,
+              "return": 3373.94,
+              "reduce": 2513.855,
+              "forward": 4683.425,
+              "wall": 6059.0650000000005
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.24130051059507,
+              "nv_return": 34.80812106913579,
+              "rdma_dispatch": 28.891614358656437,
+              "rdma_return": 39.78070979329804
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_pub_queue_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.88576367d84e81e610135703341acc1c014e0dd299ca44ae5d1c331b47464db2/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1130.26,
+              "fc2": 566.464,
+              "return": 3364.08,
+              "reduce": 2481.2,
+              "forward": 4674.16,
+              "wall": 6127.530000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 207.81149823934317,
+              "nv_return": 34.91014244607739,
+              "rdma_dispatch": 29.687356891334737,
+              "rdma_return": 39.89730565265987
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "all_dispatch_pub_queue_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.18d7c04790b8345a39ca609a10d26cf65c145b22c6339f18eb176ad2ef78d730/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1111.3600000000001,
+              "fc2": 551.84,
+              "return": 3369.795,
+              "reduce": 2347.855,
+              "forward": 4646.195,
+              "wall": 6092.895
+            },
+            "payload_GBps": {
+              "nv_dispatch": 211.3455801900374,
+              "nv_return": 34.85093662967628,
+              "rdma_dispatch": 30.192225741433916,
+              "rdma_return": 39.82964186248718
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "A4-entry shared queue hands fully completed copies to the publisher warp. Received descriptors retain GIN credits until publication finishes; Dispatch completion waits for queue drain. Copy backpressure checks cancellation and generation errors. Single-node queue polling compiled out. Qwen EP16 8K1620MHz baseline Dispatch28.892/Return39.781GB/s; received notifications queued29.687/39.897; received+local queued30.192/39.830.128 sparse files byte-identical across2 variants,12 repetitions. Queue implementation is experimental; full Forward and64K ring-wrap validation remain necessary. Optional split-local caller template was subsequently corrected in568028b/dc2909a without changing the tested GIN paths."
     }
   ],
   "diagnostics": [
