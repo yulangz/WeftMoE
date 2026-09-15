@@ -1550,6 +1550,53 @@
       "name": "Dispatch and Return RDMA issue overlap",
       "raw_results": "results/communication_bottleneck_20260915/next_probes/overlap_summary.json",
       "finding": "Zero Return payload submitted before final Dispatch submission on all 16 ranks. Pure benchmark intentionally sequences Dispatch and Return. No D/R NIC contention explains low Dispatch rate."
+    },
+    {
+      "name": "Dispatch payload ablation",
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_payload_ablation",
+      "not_valid_goal_bandwidth": true,
+      "cases": [
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8611.295,
+            "fc2": 2868.91,
+            "return": 23752.15,
+            "reduce": 20904.4,
+            "forward": 31900.6,
+            "wall": 34003.55
+          },
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.19b666976404073bce2e1f4b26c809b90dc2060fa63241e8e323a1d767bf3dc4/test_cuda_notify"
+        },
+        {
+          "name": "no_nv_payload_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 6486.305,
+            "fc2": 3354.48,
+            "return": 23534.35,
+            "reduce": 20120.5,
+            "forward": 30213.9,
+            "wall": 32059.300000000003
+          },
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.344fbfa537fecc99c8a9abe57406509a6cce1b858fe05789d4ede82e7bde9b05/test_cuda_notify"
+        },
+        {
+          "name": "no_pack_payload_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8539.185000000001,
+            "fc2": 3022.74,
+            "return": 23666.800000000003,
+            "reduce": 20832.15,
+            "forward": 31850.1,
+            "wall": 33701.0
+          },
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2f637db7f9183ffe5451949ee24e06553d1e5e3fc104dfb94cb92104d6127e9a/test_cuda_notify"
+        }
+      ],
+      "finding": "Baseline Dispatch 8611.295 us; omit local and relay NVLink payload 6486.305 us; omit GIN Dispatch packing payload 8539.185 us. Prioritize NVLink copy/relay path over sender packing. All protocol/metadata work retained; payload correctness intentionally absent in ablations."
     }
   ]
 }
