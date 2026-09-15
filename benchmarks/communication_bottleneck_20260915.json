@@ -8391,6 +8391,119 @@
           }
         ]
       }
+    },
+    {
+      "name": "Multiple Dispatch issuers with private two-slot prefetch",
+      "source": "/tmp/weftmoe-pipelined-dispatch-issuers",
+      "source_commit": "353c4e5",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/pipelined_dispatch_issuers_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1153.58,
+              "fc2": 572.864,
+              "return": 3375.92,
+              "reduce": 2378.4300000000003,
+              "forward": 4692.385,
+              "wall": 6109.355
+            },
+            "payload_GBps": {
+              "nv_dispatch": 203.6105202933477,
+              "nv_return": 34.78770586980734,
+              "rdma_dispatch": 29.087217184763954,
+              "rdma_return": 39.757378136922675
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "pipelined_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1081.36,
+              "fc2": 532.592,
+              "return": 3369.955,
+              "reduce": 2572.96,
+              "forward": 4630.08,
+              "wall": 6039.995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 217.20890730191613,
+              "nv_return": 34.84928196370575,
+              "rdma_dispatch": 31.029843900273733,
+              "rdma_return": 39.82775081566371
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "pipelined_dispatch_lanes4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1065.12,
+              "fc2": 558.944,
+              "return": 3369.39,
+              "reduce": 2406.16,
+              "forward": 4617.41,
+              "wall": 6100.975
+            },
+            "payload_GBps": {
+              "nv_dispatch": 220.52071503680338,
+              "nv_return": 34.85512570524635,
+              "rdma_dispatch": 31.502959290971916,
+              "rdma_return": 39.8344293774244
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "Reuse RowPrefetchPipeline and FanoutRowPrefetchPipeline through disjoint per-lane staging views.2/4 lane issuers each retain2 staging slots and own mbarriers. The caller drains all outstanding loads/stores before full global completion and SYS publication; RX credit stays after the copy-domain join.2 lanes FC1/FC2 stages4/2;4 lanes3/2;math registers216 unchanged.",
+      "finding": "Qwen EP16 8K Dispatch29.087 baseline->31.030(2x2)/31.503(4x2)GB/s;Return39.757->39.828/39.834.128 sparse files exact over12 repetitions. Better than prior4x1/8x1 at the same staging budgets, though those comparisons are separate runs. No full/BWD/64K tests; combine with balanced service and peer queues next."
     }
   ],
   "diagnostics": [
