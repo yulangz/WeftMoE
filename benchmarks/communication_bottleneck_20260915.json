@@ -6226,7 +6226,7 @@
           "seed": 914
         }
       },
-      "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.771 Return39.881GB/s. Omit unused legacy header fields29.247/39.647; exact64-bit reciprocal division28.894/39.723; cache addresses cooperatively during metadata preparation30.401/39.768. Header and arithmetic candidates not adopted; address cache (+5.7%Dispatch) requires64K and full Forward confirmation because total communication GPU4672.145->4679.710us is flat. Cache uses1KiB extra shared memory for2copywarps, fixed32-entry tiles handle arbitrary batch length. All payload, fullTMAcompletion, readiness and credit semantics preserved.128 original sparse comparison files +64 top_k6 +64 cache files exact. Requested top_k7 fixture was rejected by baseline harness (accepts1,6,8), so top_k6 verifies non-power-of-two instead. No full Forward/BWD correctness claimed for these candidates yet. Qwen64K Dispatch34.087->34.966GB/s (+2.58%), Return45.693->45.674. Full Qwen8K pair is next; this is not a production adoption.",
+      "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.771 Return39.881GB/s. Omit unused legacy header fields29.247/39.647; exact64-bit reciprocal division28.894/39.723; cache addresses cooperatively during metadata preparation30.401/39.768. Header and arithmetic candidates not adopted; address cache (+5.7%Dispatch) requires64K and full Forward confirmation because total communication GPU4672.145->4679.710us is flat. Cache uses1KiB extra shared memory for2copywarps, fixed32-entry tiles handle arbitrary batch length. All payload, fullTMAcompletion, readiness and credit semantics preserved.128 original sparse comparison files +64 top_k6 +64 cache files exact. Requested top_k7 fixture was rejected by baseline harness (accepts1,6,8), so top_k6 verifies non-power-of-two instead. No full Forward/BWD correctness claimed for these candidates yet. Qwen64K Dispatch34.087->34.966GB/s (+2.58%), Return45.693->45.674. Full Qwen8K pair is next; this is not a production adoption. Full retained Qwen EP16 8K: Dispatch1460.815->1420.495us, but total Forward5036.605->5217.315us (+3.59%) and allocation-inclusive wall6427.365->6573.150us (+2.27%).128 prefix output/input/route/gate files match golden with20 native repetitions. Reject address cache for production despite pure Dispatch gain; no broader full-model sweep is justified.",
       "cache_64k_cases": [
         {
           "name": "targeted_flush_ep16_65536",
@@ -6284,7 +6284,70 @@
             }
           }
         }
-      ]
+      ],
+      "cache_full_forward_cases": [
+        {
+          "name": "targeted_flush_production_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fb3b6280ca98142d8063e142cd17b2ea30b6d9d3c5dbc55cac0807a21128f7b3/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1460.815,
+              "fc2": 2189.395,
+              "return": 4205.3099999999995,
+              "reduce": 2654.37,
+              "forward": 5036.605,
+              "wall": 6427.365
+            },
+            "payload_GBps": {
+              "nv_dispatch": 160.78765894380876,
+              "nv_return": 27.92671931439062,
+              "rdma_dispatch": 22.96966556340125,
+              "rdma_return": 31.91625064501785
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_address_cache_production_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5c61625671396085167df16aa9656f9dec9cfea0b8c27876490e58e0ec860db7/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1420.495,
+              "fc2": 2215.825,
+              "return": 4393.3099999999995,
+              "reduce": 2681.805,
+              "forward": 5217.3150000000005,
+              "wall": 6573.15
+            },
+            "payload_GBps": {
+              "nv_dispatch": 165.35153168437765,
+              "nv_return": 26.73166974331427,
+              "rdma_dispatch": 23.621647383482518,
+              "rdma_return": 30.550479706644882
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "cache_full_forward_validation": {
+        "files_compared": 128,
+        "all_byte_identical": true,
+        "repetitions": 20
+      }
     }
   ],
   "diagnostics": [
