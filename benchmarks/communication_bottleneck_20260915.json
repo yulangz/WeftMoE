@@ -5706,6 +5706,188 @@
         "repetitions": 12
       },
       "finding": "Fixed controllers remove context lease CAS and consume packed tasks from independent copy workers. GPU sharing: Qwen EP16 8K Dispatch 28.861->28.579 GB/s, Return 39.862->39.949. Thread-exclusive sharing: Dispatch28.630, Return40.019. No useful Dispatch gain; Return change below0.4%. Keep experimental branch only; no full-model or broader sweep justified. Sparse257 stride1 with12 repetitions and128 exported files matched byte-for-byte. This does not establish full Forward or Backward correctness of the experiment."
+    },
+    {
+      "name": "Seven copy warps with proportionally larger work batches",
+      "adopted": false,
+      "source_commit": "3940b11",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/seven_copy_screen",
+        "results/communication_bottleneck_20260915/seven_copy_batch_screen"
+      ],
+      "resource_config": {
+        "threads": 640,
+        "comm_base": 384,
+        "comm_threads": 256,
+        "copy_warps": 7,
+        "math_registers": 176,
+        "producer_registers": 32,
+        "control_registers": 48,
+        "fc1_stages": 3,
+        "fc2_stages": 2,
+        "segment_bytes": 4096,
+        "copy_buffers": 2,
+        "wgmma_n256_atom_n": 128
+      },
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1154.6550000000002,
+              "fc2": 558.528,
+              "return": 3372.735,
+              "reduce": 2484.205,
+              "forward": 4703.23,
+              "wall": 6151.115
+            },
+            "payload_GBps": {
+              "nv_dispatch": 203.42095604314704,
+              "nv_return": 34.82055720357514,
+              "rdma_dispatch": 29.060136577592434,
+              "rdma_return": 39.79492251837159
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "seven_copy_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.a53ff1880dd67263f88c4fb8238d9853c6f066d7390fc02fec8b825e296ca11d/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1085.15,
+              "fc2": 632.4960000000001,
+              "return": 3304.545,
+              "reduce": 2508.91,
+              "forward": 4545.005,
+              "wall": 5941.095
+            },
+            "payload_GBps": {
+              "nv_dispatch": 216.45028244943094,
+              "nv_return": 35.53908692422103,
+              "rdma_dispatch": 30.921468921347277,
+              "rdma_return": 40.616099341966894
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1155.25,
+              "fc2": 575.824,
+              "return": 3371.425,
+              "reduce": 2400.3,
+              "forward": 4689.695,
+              "wall": 6145.365
+            },
+            "payload_GBps": {
+              "nv_dispatch": 203.31618610690327,
+              "nv_return": 34.83408707000749,
+              "rdma_dispatch": 29.04516944384332,
+              "rdma_return": 39.8103852228657
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "seven_copy_b64_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c3210195bb1b6056e6cc88f292a81f8d4380a1dbe94515850eae6029db8c958f/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1047.07,
+              "fc2": 686.528,
+              "return": 3271.81,
+              "reduce": 2468.8149999999996,
+              "forward": 4526.96,
+              "wall": 5944.24
+            },
+            "payload_GBps": {
+              "nv_dispatch": 224.32217903292045,
+              "nv_return": 35.894661364810304,
+              "rdma_dispatch": 32.04602557613149,
+              "rdma_return": 41.022470131211776
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "seven_copy_b128_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.f41be86fe585e41125bdd85369f0d071df73de5f033b4f4817cb74877b9d7fda/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1051.615,
+              "fc2": 694.656,
+              "return": 3266.67,
+              "reduce": 2472.355,
+              "forward": 4533.805,
+              "wall": 5951.715
+            },
+            "payload_GBps": {
+              "nv_dispatch": 223.35267564650562,
+              "nv_return": 35.951140458019935,
+              "rdma_dispatch": 31.907525092357943,
+              "rdma_return": 41.0870176663085
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": [
+        {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        }
+      ],
+      "finding": "At1620MHz, Qwen EP16 8K pure communication: 2copywarps RX32/local32 Dispatch29.060 Return39.795GB/s; 7copywarps samebatch Dispatch30.921 Return40.616. Separate adjacent baseline29.045/39.810; 7warps RX128/local64 32.046/41.022; RX128/local128 31.908/41.087. More copy warps and batch filling help modestly but do not reach42GB/s Dispatch. Full GEMM resources are reduced materially; no full-model speedup or BWD correctness claimed and no production adoption.192 sparse exported files across3 candidates matched,12 repetitions each."
     }
   ],
   "diagnostics": [
