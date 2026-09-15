@@ -4342,6 +4342,181 @@
         "repetitions": 12
       },
       "finding": "Return sub-batches improve Qwen EP16 8K Return39.37->40.00/40.04 GB/s at32/16 rows, below42. Retain as experimental pending larger completion-tail optimization."
+    },
+    {
+      "name": "Close notification channels with final data tails",
+      "adopted": false,
+      "experimental_commit": "dc457ea",
+      "raw_results": "results/communication_bottleneck_20260915/final_tail_screen",
+      "cases": [
+        {
+          "name": "rx_parts32_pure_ep8_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 889.232,
+              "fc2": 252.224,
+              "return": 816.512,
+              "reduce": 431.44,
+              "forward": 1802.4499999999998,
+              "wall": 2663.15
+            },
+            "payload_GBps": {
+              "nv_dispatch": 264.1391942710114,
+              "nv_return": 287.6638971625647
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "final_tail_pure_ep8_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 888.704,
+              "fc2": 240.03199999999998,
+              "return": 800.688,
+              "reduce": 432.75199999999995,
+              "forward": 1812.5900000000001,
+              "wall": 2739.935
+            },
+            "payload_GBps": {
+              "nv_dispatch": 264.2961255941236,
+              "nv_return": 293.3489998601203
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "rx_parts32_pure_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1155.345,
+              "fc2": 541.136,
+              "return": 3397.295,
+              "reduce": 2287.44,
+              "forward": 4718.1900000000005,
+              "wall": 6112.32
+            },
+            "payload_GBps": {
+              "nv_dispatch": 203.29946812423995,
+              "nv_return": 34.56882961297149,
+              "rdma_dispatch": 29.042781160605706,
+              "rdma_return": 39.507233843395994
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "final_tail_pure_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1166.7849999999999,
+              "fc2": 587.936,
+              "return": 3403.215,
+              "reduce": 2501.1850000000004,
+              "forward": 4733.04,
+              "wall": 6204.950000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.3061738023715,
+              "nv_return": 34.50869604183104,
+              "rdma_dispatch": 28.758024828910212,
+              "rdma_return": 39.43850976209261
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "rx_clean_production_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1465.9,
+              "fc2": 2180.9300000000003,
+              "return": 4248.78,
+              "reduce": 2606.9449999999997,
+              "forward": 5080.115,
+              "wall": 6486.87
+            },
+            "payload_GBps": {
+              "nv_dispatch": 160.22990927075517,
+              "nv_return": 27.64099623892035,
+              "rdma_dispatch": 22.88998703867931,
+              "rdma_return": 31.589709987337546
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "final_tail_production_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1478.685,
+              "fc2": 2189.71,
+              "return": 4271.5650000000005,
+              "reduce": 2592.335,
+              "forward": 5104.754999999999,
+              "wall": 6586.875
+            },
+            "payload_GBps": {
+              "nv_dispatch": 158.8445301061416,
+              "nv_return": 27.49355610882662,
+              "rdma_dispatch": 22.692075729448803,
+              "rdma_return": 31.42120698151614
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 192
+      },
+      "large_validation": {
+        "all_byte_identical": true,
+        "files_compared": 128
+      },
+      "finding": "EP8 8K Return287.66->293.35 GB/s, but EP16 Return39.51->39.44 and full5080.115->5104.755us. Empty End packet closure is not the dominant EP16 completion tail. Keep existing closure while investigating packing and GIN completion/credit delays."
     }
   ],
   "diagnostics": [
@@ -4478,7 +4653,7 @@
         }
       ],
       "golden_files": 128,
-      "finding": "Confirmation waiting decreases in the regressive combined variant; it does not explain the regression. Last-snapshot timelines show median payload-complete to transport-worker-exit intervals616.656/551.056us. Test notification closure using final data tails instead of empty End packets. Trace timestamps are compared only within each GPU; instrumented latency is not production throughput."
+      "finding": "Confirmation waiting decreases in the regressive combined variant; it does not explain the regression. Last-snapshot timelines show median last receive/NVLink-copy event to transport-worker-exit intervals616.656/551.056us. Test notification closure using final data tails instead of empty End packets. Trace timestamps are compared only within each GPU; instrumented latency is not production throughput. This interval can include outstanding outbound GIN completion/credits; it is not all attributable to notification End packets."
     }
   ]
 }
