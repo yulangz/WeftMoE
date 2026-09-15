@@ -6898,6 +6898,134 @@
       },
       "implementation": "GIN local Dispatch groups8 source tokens per CTA batch, each copy warp loads an input segment once and pushes it to all same-node routes; empty local fanouts skipped. Existing2 copywarps/shared storage/registers unchanged. Full TMA completion, SYS fences and original arrival counters retained. Canonical rows and route identities unchanged. EP8 and GIN receive fanout remain on original paths.",
       "finding": "Qwen EP16 8K1620MHz Dispatch28.891->29.144GB/s (+0.88%); Return39.795->39.737GB/s; pure GPU4691.185->4699.520us. Source reuse plus token-order traversal is not enough to materially improve throughput; not adopted and no full-model sweep. Token traversal also changes destination locality and readiness aggregation, so this is not an isolated measurement of input-load cost.64 sparse files byte-identical,12 repetitions. Next causal candidate: aggregate local token-order readiness across the complete source contribution to each canonical M-tile before issuing one remote arrival update; exact per-source expectations need derivation from route materialization."
+    },
+    {
+      "name": "Aggregate local Dispatch readiness per source and destination M-tile",
+      "adopted": false,
+      "experimental_commits": {
+        "token_order": "b38ec1d",
+        "canonical_wave_order": "4f59402"
+      },
+      "raw_results": "results/communication_bottleneck_20260915/local_tile_publication_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1166.355,
+              "fc2": 561.376,
+              "return": 3380.0299999999997,
+              "reduce": 2413.645,
+              "forward": 4674.13,
+              "wall": 6061.54
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.38038933257883,
+              "nv_return": 34.74540521829688,
+              "rdma_dispatch": 28.768627047511263,
+              "rdma_return": 39.70903453519644
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "local_token_fanout_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1158.945,
+              "fc2": 559.76,
+              "return": 3371.17,
+              "reduce": 2511.0249999999996,
+              "forward": 4684.43,
+              "wall": 6119.12
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.6679643986557,
+              "nv_return": 34.83672196893067,
+              "rdma_dispatch": 28.952566342665097,
+              "rdma_return": 39.813396535920766
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "local_tile_publication_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1140.1750000000002,
+              "fc2": 553.84,
+              "return": 3374.7,
+              "reduce": 2335.905,
+              "forward": 4679.25,
+              "wall": 6159.13
+            },
+            "payload_GBps": {
+              "nv_dispatch": 206.0043624882145,
+              "nv_return": 34.800282099149555,
+              "rdma_dispatch": 29.4291946411735,
+              "rdma_return": 39.77175097045663
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "ordered_tile_publication_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1171.92,
+              "fc2": 559.616,
+              "return": 3376.065,
+              "reduce": 2487.81,
+              "forward": 4676.895,
+              "wall": 6153.014999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.4241108608096,
+              "nv_return": 34.786211758363656,
+              "rdma_dispatch": 28.632015837258514,
+              "rdma_return": 39.75567058098703
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 192,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "protocol": "Touched local counters reset atomically before existing setup clear barrier; route-derived expected/remaining counts initialized after it, before existing setup completion barriers. Count storage is pooled once. Both passes remain within original timing interval. Copy-domain full TMA completion and system fences precede local acq_rel decrement; last source contribution publishes one SYS arrival add with its entire expected count. Source subsets across nodes/rails remain additive. No shape-specific expectation formula or extra grid barrier.",
+      "finding": "Qwen EP16 8K1620MHz baseline28.769GB/s; token fanout28.953; token fanout plus tile aggregation29.429; canonical wave order plus aggregation28.632. No substantial throughput gain; neither candidate adopted.192 sparse files across3 candidates byte-identical,12 repetitions. No full FWD/BWD or64K validation claimed. Natural-route setup passes may incur avoidable local atomic traffic; an ordered setup pass would isolate that cost if this direction is revisited."
     }
   ],
   "diagnostics": [
