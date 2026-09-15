@@ -1674,6 +1674,493 @@
         "reference": "pure transport baseline"
       },
       "finding": "50% local CTA share: Dispatch 31.49 -> 35.79 GB/s, Return 45.73 GB/s. 67% share: Dispatch 35.66 GB/s. Every physical CTA retains math workers; copy domains retain two warps per task."
+    },
+    {
+      "name": "Relay CTA ratio and prefetch follow-up",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/relay_partition_next_screen",
+      "cases": [
+        {
+          "name": "relay_partition33_ep16_129",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c45d0a9fc19a38cd871ef2af860e575cfa2e3b6bac4473578113ca13e6892af2/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 458.256,
+            "fc2": 52.192,
+            "return": 371.98400000000004,
+            "reduce": 72.32,
+            "forward": 1013.97,
+            "wall": 2240.4449999999997
+          },
+          "payload_GBps": {
+            "nv_dispatch": 8.071226563318321,
+            "nv_return": 4.974321476192523,
+            "rdma_dispatch": 1.1530323661883315,
+            "rdma_return": 5.678351757064819
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 129,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition50_prefetch_ep16_129",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.aa9828ec440f1f01c1248cc15e61f9317afa5ee76814a0f5d540c8c75cd7df44/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 458.736,
+            "fc2": 50.656000000000006,
+            "return": 537.7919999999999,
+            "reduce": 308.112,
+            "forward": 1162.595,
+            "wall": 2245.615
+          },
+          "payload_GBps": {
+            "nv_dispatch": 8.062781207491891,
+            "nv_return": 3.4406759490658105,
+            "rdma_dispatch": 1.1518258867845559,
+            "rdma_return": 3.927644888730216
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 129,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition50_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.f2f6951c3be4c5db328f233896ca3d2c1cbe1f038690252b70eb9292464a7dc6/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7452.545,
+            "fc2": 2810.815,
+            "return": 23460.05,
+            "reduce": 20502.45,
+            "forward": 30930.5,
+            "wall": 32752.45
+          },
+          "payload_GBps": {
+            "nv_dispatch": 252.13510176724864,
+            "nv_return": 40.0478300770885,
+            "rdma_dispatch": 36.01930025246409,
+            "rdma_return": 45.76894865952971
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition33_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c45d0a9fc19a38cd871ef2af860e575cfa2e3b6bac4473578113ca13e6892af2/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 9190.735,
+            "fc2": 2500.96,
+            "return": 23692.65,
+            "reduce": 20754.5,
+            "forward": 32487.800000000003,
+            "wall": 34262.3
+          },
+          "payload_GBps": {
+            "nv_dispatch": 204.45026344465376,
+            "nv_return": 39.654664885523566,
+            "rdma_dispatch": 29.207180492093393,
+            "rdma_return": 45.31961701202693
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition50_prefetch_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.aa9828ec440f1f01c1248cc15e61f9317afa5ee76814a0f5d540c8c75cd7df44/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7611.68,
+            "fc2": 3127.28,
+            "return": 23561.95,
+            "reduce": 20445.85,
+            "forward": 31079.85,
+            "wall": 32946.55
+          },
+          "payload_GBps": {
+            "nv_dispatch": 246.86379248733525,
+            "nv_return": 39.87463244765395,
+            "rdma_dispatch": 35.26625606961932,
+            "rdma_return": 45.57100851160452
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "finding": "50% local: 36.02 GB/s; 33% local: 29.21; 50% with local prefetch: 35.27. Keep 50% without local prefetch for subsequent experiments."
+    },
+    {
+      "name": "Clean static relay CTA partition across both models",
+      "adopted": false,
+      "source_commit": "35ea2ec",
+      "raw_results": "results/communication_bottleneck_20260915/relay_clean_bandwidth",
+      "cases": [
+        {
+          "name": "clean_qwen_ep8_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e306f075e618d5e52fab632b47d221301d10b5616c86f641f0178758fede99cd/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 889.136,
+            "fc2": 252.336,
+            "return": 815.92,
+            "reduce": 449.136,
+            "forward": 1811.6999999999998,
+            "wall": 2664.145
+          },
+          "payload_GBps": {
+            "nv_dispatch": 264.16771337568156,
+            "nv_return": 287.8726149622512
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_qwen_ep8_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e306f075e618d5e52fab632b47d221301d10b5616c86f641f0178758fede99cd/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 6882.115,
+            "fc2": 2135.68,
+            "return": 5706.93,
+            "reduce": 4459.07,
+            "forward": 13389.150000000001,
+            "wall": 14632.8
+          },
+          "payload_GBps": {
+            "nv_dispatch": 273.0335357662579,
+            "nv_return": 329.2572700208343
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_qwen_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e306f075e618d5e52fab632b47d221301d10b5616c86f641f0178758fede99cd/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1323.315,
+            "fc2": 535.312,
+            "return": 3345.4849999999997,
+            "reduce": 2472.6549999999997,
+            "forward": 4844.035,
+            "wall": 6250.04
+          },
+          "payload_GBps": {
+            "nv_dispatch": 177.49441667327883,
+            "nv_return": 35.10418130704517,
+            "rdma_dispatch": 25.356345239039833,
+            "rdma_return": 40.119064350908765
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_qwen_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e306f075e618d5e52fab632b47d221301d10b5616c86f641f0178758fede99cd/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7500.385,
+            "fc2": 2839.1549999999997,
+            "return": 23502.35,
+            "reduce": 20532.3,
+            "forward": 30982.1,
+            "wall": 32796.95
+          },
+          "payload_GBps": {
+            "nv_dispatch": 250.52689855254096,
+            "nv_return": 39.975751190838366,
+            "rdma_dispatch": 35.789556936077275,
+            "rdma_return": 45.68657278952956
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "clean_flash_ep8_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c80601c91386ba219f01df6a09acc04622e14719df12a2e723a789cdb4c26da4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1205.875,
+            "fc2": 319.616,
+            "return": 1159.6,
+            "reduce": 796.3679999999999,
+            "forward": 2576.3999999999996,
+            "wall": 3447.77
+          },
+          "payload_GBps": {
+            "nv_dispatch": 292.1708601637815,
+            "nv_return": 303.8302311141773
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 8192,
+            "top_k": 6
+          }
+        },
+        {
+          "name": "clean_flash_ep8_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c80601c91386ba219f01df6a09acc04622e14719df12a2e723a789cdb4c26da4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 9172.689999999999,
+            "fc2": 1790.915,
+            "return": 8593.375,
+            "reduce": 8303.36,
+            "forward": 19404.6,
+            "wall": 20726.25
+          },
+          "payload_GBps": {
+            "nv_dispatch": 307.2787031939377,
+            "nv_return": 327.9936332349048
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 65536,
+            "top_k": 6
+          }
+        },
+        {
+          "name": "clean_flash_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c80601c91386ba219f01df6a09acc04622e14719df12a2e723a789cdb4c26da4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2125.745,
+            "fc2": 755.728,
+            "return": 4851.38,
+            "reduce": 3615.36,
+            "forward": 7172.115,
+            "wall": 8558.445
+          },
+          "payload_GBps": {
+            "nv_dispatch": 165.74026329592687,
+            "nv_return": 36.31147590994727,
+            "rdma_dispatch": 31.569573961128924,
+            "rdma_return": 41.49882961136831
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 8192,
+            "top_k": 6
+          }
+        },
+        {
+          "name": "clean_flash_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c80601c91386ba219f01df6a09acc04622e14719df12a2e723a789cdb4c26da4/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 12425.349999999999,
+            "fc2": 3332.895,
+            "return": 34785.85,
+            "reduce": 32208.4,
+            "forward": 47281.05,
+            "wall": 49187.600000000006
+          },
+          "payload_GBps": {
+            "nv_dispatch": 226.84047435283514,
+            "nv_return": 40.51320131605237,
+            "rdma_dispatch": 43.207709400540026,
+            "rdma_return": 46.30080150405984
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 65536,
+            "top_k": 6
+          }
+        }
+      ],
+      "full_forward_8k": [
+        {
+          "name": "compact_clean_qwen_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ef536eeb55183c3d48940151d9bb816e6f80858c7e33ddea22e92a841edc239b/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1850.895,
+            "fc2": 2296.6549999999997,
+            "return": 4574.385,
+            "reduce": 2829.0550000000003,
+            "forward": 5416.735000000001,
+            "wall": 6869.014999999999
+          },
+          "payload_GBps": {
+            "nv_dispatch": 126.90132287352876,
+            "nv_return": 25.67350846070018,
+            "rdma_dispatch": 18.128760410504107,
+            "rdma_return": 29.34115252651449
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_clean_qwen_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.baf85d04f5cd8f038ae73ad56545d5b30a9ae9b737436b38204b5dccd04c33fe/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1723.52,
+            "fc2": 2254.1400000000003,
+            "return": 4911.795,
+            "reduce": 3083.085,
+            "forward": 5803.775,
+            "wall": 7250.35
+          },
+          "payload_GBps": {
+            "nv_dispatch": 136.27983661344226,
+            "nv_return": 23.9098968910551,
+            "rdma_dispatch": 19.46854808763461,
+            "rdma_return": 27.325596446920116
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_clean_flash_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ba0d9afb96e34a8ef92dd5b5b761d05daeaa46fba1b6867d495fe1c1a7865580/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2595.0699999999997,
+            "fc2": 6256.03,
+            "return": 8758.32,
+            "reduce": 4334.27,
+            "forward": 9961.060000000001,
+            "wall": 11446.95
+          },
+          "payload_GBps": {
+            "nv_dispatch": 135.7657157610392,
+            "nv_return": 20.113534102430602,
+            "rdma_dispatch": 25.86013633543604,
+            "rdma_return": 22.986896117063548
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 4096,
+            "intermediate": 2048,
+            "tokens_per_rank": 8192,
+            "top_k": 6
+          }
+        }
+      ],
+      "forward_validation": {
+        "all_byte_identical": true,
+        "files_compared": 192,
+        "models": [
+          "qwen",
+          "flash"
+        ],
+        "ep": [
+          8,
+          16
+        ],
+        "tokens": 129,
+        "repetitions": 20
+      },
+      "large_prefix_validation": {
+        "files_compared": 192,
+        "all_byte_identical": true,
+        "repetitions": 20,
+        "tokens": 8192,
+        "prefix_tokens": 129
+      },
+      "backward_validation": [
+        {
+          "model": "qwen",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.baf85d04f5cd8f038ae73ad56545d5b30a9ae9b737436b38204b5dccd04c33fe/test_cuda_notify"
+        },
+        {
+          "model": "qwen",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.baf85d04f5cd8f038ae73ad56545d5b30a9ae9b737436b38204b5dccd04c33fe/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ba0d9afb96e34a8ef92dd5b5b761d05daeaa46fba1b6867d495fe1c1a7865580/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ba0d9afb96e34a8ef92dd5b5b761d05daeaa46fba1b6867d495fe1c1a7865580/test_cuda_notify"
+        }
+      ],
+      "cpu_validation": "90 tests and 126 subtests passed",
+      "finding": "All tested numerical checks pass. Qwen EP16 8K full FWD regresses from 5416.735 to 5803.775 us despite faster Dispatch. Do not adopt static ownership: rejoin both Return workloads after each CTA finishes Dispatch. Flash EP16 64K pure Dispatch reaches 43.21 GB/s, but EP16 8K remains below goal in both directions."
     }
   ],
   "diagnostics": [
