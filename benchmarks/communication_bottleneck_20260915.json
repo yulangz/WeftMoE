@@ -7611,6 +7611,148 @@
           }
         ]
       }
+    },
+    {
+      "name": "Prioritize ready FC1 pairs with cross-node Return work",
+      "source": "/tmp/weftmoe-remote-fc1-priority",
+      "source_commit": "9933a65",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/remote_fc1_priority_training",
+      "protocol": "Two finite FC1 queue classes grow from opposite ends of the original task array. Ready group endpoint source ranks determine whether any rows are cross-node; canonical rows within each expert are source-rank ordered. Prefer remote pairs, immediately fall back to local pairs. Acquire both entries before class-head CAS; preserve the aggregate claim count and each multicast pair. Four padded counters added to reusable Forward control; no extra task capacity or payload copies. q1/q4 service ratios tested.",
+      "model_check": {
+        "seeds": 1000,
+        "fc1_ntiles": [
+          2,
+          4,
+          6,
+          8,
+          16
+        ],
+        "group_mblocks": "1..9",
+        "groups": "1..35",
+        "properties": [
+          "disjoint inward reservations",
+          "exact task coverage",
+          "multicast pair validity with delayed publication"
+        ],
+        "passed": true
+      },
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1475.565,
+              "fc2": 2193.9849999999997,
+              "return": 4238.785,
+              "reduce": 2679.2,
+              "forward": 5048.29,
+              "wall": 6459.469999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 159.18039801703077,
+              "nv_return": 27.70617334920266,
+              "rdma_dispatch": 22.740056859575823,
+              "rdma_return": 31.66419811337447
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "remote_fc1_priority_q1_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1579.345,
+              "fc2": 1951.5700000000002,
+              "return": 4177.52,
+              "reduce": 2665.855,
+              "forward": 4995.695,
+              "wall": 6414.325000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 148.7205290800933,
+              "nv_return": 28.112495451847025,
+              "rdma_dispatch": 21.24578986858476,
+              "rdma_return": 32.12856623068232
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "remote_fc1_priority_q4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1460.96,
+              "fc2": 1932.06,
+              "return": 4635.34,
+              "reduce": 2663.36,
+              "forward": 5487.805,
+              "wall": 6939.435
+            },
+            "payload_GBps": {
+              "nv_dispatch": 160.77170079947433,
+              "nv_return": 25.335900279159674,
+              "rdma_dispatch": 22.967385828496333,
+              "rdma_return": 28.955314604753912
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": [
+        {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "repetitions": 20
+        },
+        {
+          "all_byte_identical": true,
+          "files_compared": 192,
+          "repetitions": 20
+        }
+      ],
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "small_clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K matched baseline Forward5048.290us, remote FC1 priority q14995.695us (-1.04%), q45487.805us (+8.71%). FC2 intervals2193.985->1951.570/1932.060us, but q4 Return remains4635.340us vs4238.785us baseline.320 golden files exact across129/8K;20 native repetitions each. No BWD/Flash/64K/pure validation and no adoption. Next isolate combination with the synchronized local Return deferral; FC2 interval reduction is not a standalone GEMM throughput claim."
     }
   ],
   "diagnostics": [
