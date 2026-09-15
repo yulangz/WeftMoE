@@ -44,8 +44,6 @@ __device__ __forceinline__ void run_local_warps(
   } else if (warp < Storage::kCopyWarps) {
     const unsigned return_tid = local_thread<return_base>();
     while (true) {
-      if (return_tid < 32U)
-        local_notification_detail::progress(a);
       copy_sync<return_threads, 6U>();
       const bool progressed =
           progress_return<return_base, return_warps, dispatch_warps, 6U, true, true>(a, s);

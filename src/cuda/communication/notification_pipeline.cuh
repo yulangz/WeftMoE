@@ -31,12 +31,15 @@ template <class Args> __global__ void reset(Args a) {
     slot.ready = slot.credit = slot.consumed = 0;
 }
 
-// Each CTA consumes its matching incoming channels. Local CAS lets its copy
-// warp and independent receive warp cooperate without claiming an entry twice.
-template <class Args>
+// Each CTA consumes its matching incoming channels. The default permits
+// cooperating consumers via CAS. Exclusive ownership removes that arbitration;
+// callers must keep exactly one complete receive warp live until channels drain.
+// A transient activemask is not an ownership mask under independent thread
+// scheduling: subsets of the same warp would otherwise elect extra consumers.
+template <class Args, bool SingleConsumer = false>
 __device__ __forceinline__ bool progress(const Args &a,
                                          unsigned peer = UINT32_MAX) {
-  const auto mask = __activemask();
+  const auto mask = SingleConsumer ? 0xffffffffU : __activemask();
   const auto lane = threadIdx.x % 32;
   const auto leader = unsigned(__ffs(mask) - 1);
   const auto width = __popc(mask);
@@ -57,11 +60,17 @@ __device__ __forceinline__ bool progress(const Args &a,
       auto &slot = state.slots[seq % kDepth];
       if (::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
               slot.ready)
-                  .load(::cuda::memory_order_acquire) >= seq / kDepth + 1 &&
-          head.compare_exchange_strong(seq, seq + 1,
-                                       ::cuda::memory_order_relaxed)) {
-        selected = p;
-        break;
+                  .load(::cuda::memory_order_acquire) >= seq / kDepth + 1) {
+        bool claimed = true;
+        if constexpr (SingleConsumer)
+          head.store(seq + 1, ::cuda::memory_order_relaxed);
+        else
+          claimed = head.compare_exchange_strong(seq, seq + 1,
+                                                   ::cuda::memory_order_relaxed);
+        if (claimed) {
+          selected = p;
+          break;
+        }
       }
     }
   }
@@ -95,7 +104,7 @@ __device__ __forceinline__ bool progress(const Args &a,
   return true;
 }
 
-template <class Args>
+template <class Args, bool AssistReceive = true>
 __device__ __forceinline__ void
 wait_credit(const Args &a, unsigned p, unsigned long long seq,
             unsigned incoming_peer = UINT32_MAX) {
@@ -113,8 +122,12 @@ wait_credit(const Args &a, unsigned p, unsigned long long seq,
     }
     if (__shfl_sync(mask, ready, leader))
       return;
-    if (!progress(a, incoming_peer))
+    if constexpr (AssistReceive) {
+      if (!progress(a, incoming_peer))
+        __nanosleep(50);
+    } else {
       __nanosleep(50);
+    }
   }
 }
 

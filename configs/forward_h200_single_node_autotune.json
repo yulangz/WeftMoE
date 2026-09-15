@@ -106,6 +106,9 @@
     ],
     "gin_ring_depth": [
       8
+    ],
+    "unified_rdma_ctas": [
+      0
     ]
   },
   "2_transport": {

@@ -16,6 +16,23 @@ from run_performance_matrix import combined_generated_header
 
 
 class UnifiedDefaultMacroTest(unittest.TestCase):
+    def test_rdma_partition_keeps_a_relay_on_small_grids(self):
+        compiler = shutil.which("c++")
+        if not compiler:
+            self.skipTest("a host C++ compiler is required")
+        for requested in (0, 1, 3, 16, 2048):
+            source = f"#define WEFTMOE_FWD_UNIFIED_RDMA_CTAS {requested}\n"
+            source += '#include "cuda/forward/tuning_config.hpp"\n'
+            source += "using weftmoe::cuda::forward_tuning::unified_rdma_ctas;\n"
+            for total in (2, 8, 9, 16, 31, 132, 256):
+                source += f"static_assert(unified_rdma_ctas({total}, false) == 0);\n"
+                source += f"static_assert(unified_rdma_ctas({total}, true) == {min(requested, total - 1)});\n"
+            result = subprocess.run(
+                [compiler, "-std=c++17", "-fsyntax-only", "-x", "c++",
+                 "-I", str(ROOT / "src"), "-"], input=source, text=True,
+                capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def preprocess(self, defines="", *, generated=None, generated_defines=""):
         compiler = shutil.which("c++")
         if not compiler:

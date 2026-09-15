@@ -331,7 +331,8 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
 // This retains the existing bounded credit protocol and source-local reduce
 // publication instead of introducing remote floating-point atomics.
 template <unsigned BaseThread, unsigned CopyThreads = 0U,
-          unsigned BarrierId = 8U, class Storage, class Args, class Fill>
+          unsigned BarrierId = 8U, bool SingleConsumer = false,
+          class Storage, class Args, class Fill>
 __device__ __forceinline__ void publish_return(const Args &a, Storage &s,
                                                unsigned count, Fill fill,
                                                bool grouped = false) {
@@ -395,7 +396,8 @@ __device__ __forceinline__ void publish_return(const Args &a, Storage &s,
       }
       const auto sequence = s.notification_sequence;
       if (tid < 32U)
-        local_notification_detail::wait_credit(a, peer, sequence);
+        local_notification_detail::wait_credit<Args, !SingleConsumer>(
+            a, peer, sequence);
       copy_sync<threads, BarrierId>();
       auto &slot = local_notification_detail::channel(
                        a, a.peer_bases[a.node * a.local_world_size + peer],
@@ -504,7 +506,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
     finish_copies();
   }
   copy_sync<threads, BarrierId>();
-  publish_return<BaseThread, threads, BarrierId>(
+  publish_return<BaseThread, threads, BarrierId, true>(
       a, s, rows,
       [&](unsigned item) {
         const auto header = headers[entries[cursor + item]];
@@ -527,7 +529,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
 
 // Like the established local notification drain, but the warp may begin at a
 // nonzero thread offset. End chunks belong only to this CTA's outgoing stream.
-template <unsigned BaseThread, class Args, class Cancelled>
+template <unsigned BaseThread, bool AssistReceive = true, class Args, class Cancelled>
 __device__ __forceinline__ void drain_notifications(const Args &a,
                                                     Cancelled cancelled) {
   const unsigned lane = local_thread<BaseThread>() % 32U;
@@ -538,7 +540,7 @@ __device__ __forceinline__ void drain_notifications(const Args &a,
     auto &state =
         local_notification_detail::channel(a, a.local_base, peer, blockIdx.x);
     const auto sequence = state.sent;
-    local_notification_detail::wait_credit(a, peer, sequence);
+    local_notification_detail::wait_credit<Args, AssistReceive>(a, peer, sequence);
     if (lane == 0U) {
       auto &slot = local_notification_detail::channel(
                        a, a.peer_bases[a.node * a.local_world_size + peer],
@@ -560,7 +562,8 @@ __device__ __forceinline__ void drain_notifications(const Args &a,
     const unsigned stop = lane == 0U ? unsigned(cancelled()) : 0U;
     if (__shfl_sync(0xffffffffU, stop, 0U))
       break;
-    local_notification_detail::progress(a);
+    if constexpr (AssistReceive)
+      local_notification_detail::progress(a);
     unsigned done = 1U;
     if (lane == 0U) {
       for (unsigned peer = 0U; peer < a.local_world_size; ++peer) {
@@ -600,7 +603,7 @@ __device__ __forceinline__ void drain_notifications(const Args &a,
 template <unsigned BaseThread>
 __device__ __forceinline__ void
 drain_notifications(const ForwardKernelArgs &a) {
-  drain_notifications<BaseThread>(a, [&] { return forward_cancelled(a); });
+  drain_notifications<BaseThread, false>(a, [&] { return forward_cancelled(a); });
 }
 
 #include "cuda/persistent_v3/forward/unified_gin.cuh"
@@ -617,8 +620,7 @@ run_publisher(const ForwardKernelArgs &a,
   if (lane == 0U)
     forward_dispatch_detail::init_fc1_publisher(
         a, blockIdx.x - (gridDim.x - a.forward_relay_cta_count),
-        a.forward_relay_cta_count,
-                                               scheduler, publisher);
+        a.forward_relay_cta_count, scheduler, publisher);
   __syncwarp();
   while (true) {
     unsigned done = 0U, published = 0U;
@@ -631,7 +633,7 @@ run_publisher(const ForwardKernelArgs &a,
     }
     if (__shfl_sync(0xffffffffU, done, 0U))
       break;
-    const bool received = local_notification_detail::progress(a);
+    const bool received = local_notification_detail::progress<ForwardKernelArgs, true>(a);
     if (!__shfl_sync(0xffffffffU, published, 0U) && !received)
       __nanosleep(50U);
   }
@@ -738,8 +740,6 @@ run_impl(const ForwardKernelArgs &a,
     run_publisher(a, control, scheduler, s);
   } else {
     while (true) {
-      if (warp == 0U)
-        local_notification_detail::progress(a);
       copy_sync<Storage::kCopyThreads>();
       bool remote_progress = false;
       if constexpr (UseGin) {

@@ -110,6 +110,9 @@
       8,
       4,
       16
+    ],
+    "unified_rdma_ctas": [
+      0
     ]
   },
   "2_transport": {
