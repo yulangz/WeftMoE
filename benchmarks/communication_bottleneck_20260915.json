@@ -5598,6 +5598,114 @@
         }
       ],
       "finding": "Qwen EP16 8K Dispatch28.737->28.675 GB/s; Return39.813->39.902. No gain. Table uses retired staging, preserves payload order/reuse and emits exact aggregated counts;64 sparse golden files exact. Keep original warp aggregation."
+    },
+    {
+      "name": "Fixed GIN context controllers with independent packing consumers",
+      "adopted": false,
+      "experimental_commit": "113d717",
+      "raw_results": "results/communication_bottleneck_20260915/fixed_owners_screen",
+      "settings": {
+        "clock_mhz": 1620,
+        "power_w": 700,
+        "receive_partition_rows": 32,
+        "rdma_ctas": 16,
+        "network_rows": 128,
+        "ring_slots": 8
+      },
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1162.625,
+              "fc2": 561.3599999999999,
+              "return": 3367.1,
+              "reduce": 2523.1000000000004,
+              "forward": 4686.35,
+              "wall": 6072.275
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.02646941189118,
+              "nv_return": 34.878831041549105,
+              "rdma_dispatch": 28.86092420169874,
+              "rdma_return": 39.86152119034184
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fixed_owner_gpu_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.89433b48950b5cc086779e8289e8711d21ef876d2425d3ab1b8a62683f11ae44/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1174.0949999999998,
+              "fc2": 571.232,
+              "return": 3359.76,
+              "reduce": 2564.255,
+              "forward": 4690.24,
+              "wall": 6140.58
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.0528270710633,
+              "nv_return": 34.95503012119913,
+              "rdma_dispatch": 28.57897529586618,
+              "rdma_return": 39.94860585279901
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fixed_owner_thread_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4d839561914bc9319e6abf801d7728fce796788ad409c2c178532bc4af367fbb/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1172.0,
+              "fc2": 572.336,
+              "return": 3353.8100000000004,
+              "reduce": 2399.79,
+              "forward": 4672.64,
+              "wall": 6072.145
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.41043003412972,
+              "nv_return": 35.01704389932643,
+              "rdma_dispatch": 28.6300614334471,
+              "rdma_return": 40.01947874208735
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Fixed controllers remove context lease CAS and consume packed tasks from independent copy workers. GPU sharing: Qwen EP16 8K Dispatch 28.861->28.579 GB/s, Return 39.862->39.949. Thread-exclusive sharing: Dispatch28.630, Return40.019. No useful Dispatch gain; Return change below0.4%. Keep experimental branch only; no full-model or broader sweep justified. Sparse257 stride1 with12 repetitions and128 exported files matched byte-for-byte. This does not establish full Forward or Backward correctness of the experiment."
     }
   ],
   "diagnostics": [
