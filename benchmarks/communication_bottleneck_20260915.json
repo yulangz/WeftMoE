@@ -1,0 +1,377 @@
+{
+  "baseline_commit": "da55d82",
+  "goal": {
+    "ep8_payload_GBps": 240,
+    "ep16_rdma_payload_GBps": 42
+  },
+  "settings": {
+    "sm_clock_mhz": 1620,
+    "power_limit_w": 700,
+    "recurring_tensor_allocation_in_wall": true,
+    "reusable_buffer_context_allocation_excluded": true
+  },
+  "experiments": [
+    {
+      "name": "warp-cooperative Return address gather",
+      "adopted": false,
+      "patch": "results/communication_bottleneck_20260915/metadata_prefetch.patch",
+      "raw_results": "results/communication_bottleneck_20260915/metadata_screen",
+      "cases": [
+        {
+          "name": "copy_detail_ep8_t65536",
+          "ep": 8,
+          "tokens": 65536,
+          "rounds": 12,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.bde9e240d57a7e06e52a14ec50ea8efde22600a3a0105bce7aee4fb04d142fd8/test_cuda_notify",
+          "source": "/tmp/weftmoe-comm-diag-da55d82",
+          "retain": false,
+          "check": false,
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7006.5599999999995,
+            "fc2": 3781.87,
+            "return": 18535.8,
+            "reduce": 15834.85,
+            "forward": 26250.15,
+            "wall": 27704.85
+          }
+        },
+        {
+          "name": "metadata_pure_ep8_t65536",
+          "ep": 8,
+          "tokens": 65536,
+          "rounds": 20,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.495e1cb1dec553b61fcae0a77ada061cb997eef83a166c8a3eb2a56dcf76542c/test_cuda_notify",
+          "source": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE",
+          "retain": false,
+          "check": false,
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 6875.344999999999,
+            "fc2": 5171.215,
+            "return": 18259.9,
+            "reduce": 14361.4,
+            "forward": 26041.95,
+            "wall": 27262.7
+          }
+        },
+        {
+          "name": "metadata_pure_ep16_t65536",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.495e1cb1dec553b61fcae0a77ada061cb997eef83a166c8a3eb2a56dcf76542c/test_cuda_notify",
+          "source": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE",
+          "retain": false,
+          "check": false,
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8929.825,
+            "fc2": 7018.415,
+            "return": 23488.7,
+            "reduce": 17243.0,
+            "forward": 32307.5,
+            "wall": 34145.3
+          }
+        },
+        {
+          "name": "metadata_production_ep8_t129",
+          "ep": 8,
+          "tokens": 129,
+          "rounds": 12,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4463248a988b01116b45d632d194e513d1f88d78d9f1ee5c1863eec2217bb6e6/test_cuda_notify",
+          "source": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE",
+          "retain": true,
+          "check": true,
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 66.27199999999999,
+            "fc2": 149.664,
+            "return": 186.52800000000002,
+            "reduce": 98.976,
+            "forward": 384.656,
+            "wall": 979.257
+          }
+        },
+        {
+          "name": "metadata_production_ep16_t129",
+          "ep": 16,
+          "tokens": 129,
+          "rounds": 12,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4463248a988b01116b45d632d194e513d1f88d78d9f1ee5c1863eec2217bb6e6/test_cuda_notify",
+          "source": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE",
+          "retain": true,
+          "check": true,
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 572.992,
+            "fc2": 102.784,
+            "return": 415.52,
+            "reduce": 86.75200000000001,
+            "forward": 1258.43,
+            "wall": 2424.795
+          }
+        }
+      ],
+      "validation": "EP8/EP16 129-token full repeated FWD and all 96 prefix files byte-identical to historical goldens.",
+      "finding": "No measured throughput gain: EP8 Return remains about 103 GB/s. Instrumented address-read time attribution requires hardware sampling before concluding metadata is the bottleneck."
+    },
+    {
+      "name": "Dense final Return contribution layout, push only",
+      "adopted": false,
+      "patch": "results/communication_bottleneck_20260915/compact_push.patch",
+      "source": "/tmp/weftmoe-compact-push-da55d82",
+      "finding": "Initial EP8 t129 retained-state repeated-output check failed. Pure and non-retained production repeated-output checks passed. Final output dumps in both modes match golden; root cause of intermittent failure unresolved. Large performance screen deferred.",
+      "golden_files_compared": 64,
+      "runs": [
+        {
+          "raw_results": "results/communication_bottleneck_20260915/compact_screen",
+          "cases": [
+            {
+              "name": "compact_production_ep8_t129",
+              "ep": 8,
+              "tokens": 129,
+              "rounds": 12,
+              "timeout": 120,
+              "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+              "source": "/tmp/weftmoe-compact-push-da55d82",
+              "retain": true,
+              "check": true,
+              "environment": {
+                "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/compact_screen/ep8_prefix",
+                "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+                "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+              },
+              "started_unix": 1789484350.4722884,
+              "ended_unix": 1789484359.1278796,
+              "returncode": 1,
+              "summary": null,
+              "argv": [
+                "/opt/.venv/bin/python",
+                "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+                "--binary",
+                "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+                "--world",
+                "8",
+                "--top-k",
+                "8",
+                "--rounds",
+                "12",
+                "--timeout",
+                "120",
+                "--forward-benchmark"
+              ]
+            }
+          ]
+        },
+        {
+          "raw_results": "results/communication_bottleneck_20260915/compact_pure_check",
+          "cases": [
+            {
+              "name": "compact_pure_ep8_t129_repeat",
+              "ep": 8,
+              "tokens": 129,
+              "rounds": 12,
+              "timeout": 120,
+              "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.18497d2a0ee63536eea1807b0d63f05e92389e92702444bbed726e4dca494b71/test_cuda_notify",
+              "source": "/tmp/weftmoe-compact-push-da55d82",
+              "retain": false,
+              "check": true,
+              "environment": {},
+              "started_unix": 1789484433.766203,
+              "ended_unix": 1789484441.7802217,
+              "returncode": 0,
+              "summary": {
+                "timing_us": {
+                  "dispatch": 64.096,
+                  "fc2": 82.224,
+                  "return": 152.048,
+                  "reduce": 90.208,
+                  "forward": 264.75199999999995,
+                  "wall": 812.054
+                },
+                "payload_GBps": {
+                  "nv_dispatch": 57.70544183724413,
+                  "nv_return": 24.325791855203622
+                }
+              },
+              "argv": [
+                "/opt/.venv/bin/python",
+                "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+                "--binary",
+                "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.18497d2a0ee63536eea1807b0d63f05e92389e92702444bbed726e4dca494b71/test_cuda_notify",
+                "--world",
+                "8",
+                "--top-k",
+                "8",
+                "--rounds",
+                "12",
+                "--timeout",
+                "120",
+                "--forward-benchmark"
+              ]
+            }
+          ]
+        },
+        {
+          "raw_results": "results/communication_bottleneck_20260915/compact_followup",
+          "cases": [
+            {
+              "name": "compact_production_ep8_t129_no_retain",
+              "ep": 8,
+              "tokens": 129,
+              "rounds": 12,
+              "timeout": 120,
+              "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+              "source": "/tmp/weftmoe-compact-push-da55d82",
+              "retain": false,
+              "check": true,
+              "environment": {},
+              "started_unix": 1789484493.6119645,
+              "ended_unix": 1789484501.8740132,
+              "returncode": 0,
+              "summary": {
+                "timing_us": {
+                  "dispatch": 65.584,
+                  "fc2": 145.536,
+                  "return": 187.68,
+                  "reduce": 92.112,
+                  "forward": 370.11199999999997,
+                  "wall": 954.3675000000001
+                },
+                "payload_GBps": {
+                  "nv_dispatch": 56.39619419370578,
+                  "nv_return": 19.707416879795396
+                }
+              },
+              "argv": [
+                "/opt/.venv/bin/python",
+                "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+                "--binary",
+                "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+                "--world",
+                "8",
+                "--top-k",
+                "8",
+                "--rounds",
+                "12",
+                "--timeout",
+                "120",
+                "--forward-benchmark"
+              ]
+            }
+          ]
+        },
+        {
+          "raw_results": "results/communication_bottleneck_20260915/compact_dump",
+          "cases": [
+            {
+              "name": "compact_plain",
+              "ep": 8,
+              "tokens": 129,
+              "rounds": 12,
+              "timeout": 120,
+              "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+              "source": "/tmp/weftmoe-compact-push-da55d82",
+              "retain": false,
+              "check": false,
+              "environment": {
+                "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/compact_dump/plain",
+                "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+                "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+              },
+              "started_unix": 1789484534.3881757,
+              "ended_unix": 1789484544.050616,
+              "returncode": 0,
+              "summary": {
+                "timing_us": {
+                  "dispatch": 64.0,
+                  "fc2": 144.44799999999998,
+                  "return": 186.272,
+                  "reduce": 86.624,
+                  "forward": 377.248,
+                  "wall": 979.2114999999999
+                },
+                "payload_GBps": {
+                  "nv_dispatch": 57.792,
+                  "nv_return": 19.856382064937296
+                }
+              },
+              "argv": [
+                "/opt/.venv/bin/python",
+                "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+                "--binary",
+                "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+                "--world",
+                "8",
+                "--top-k",
+                "8",
+                "--rounds",
+                "12",
+                "--timeout",
+                "120",
+                "--forward-benchmark"
+              ]
+            },
+            {
+              "name": "compact_retain",
+              "ep": 8,
+              "tokens": 129,
+              "rounds": 12,
+              "timeout": 120,
+              "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+              "source": "/tmp/weftmoe-compact-push-da55d82",
+              "retain": true,
+              "check": false,
+              "environment": {
+                "WEFTMOE_FORWARD_OUTPUT_DIR": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/compact_dump/retain",
+                "WEFTMOE_FORWARD_DUMP_TOKENS": "129",
+                "WEFTMOE_FORWARD_DUMP_INPUTS": "prefix"
+              },
+              "started_unix": 1789484544.0597239,
+              "ended_unix": 1789484552.8289843,
+              "returncode": 0,
+              "summary": {
+                "timing_us": {
+                  "dispatch": 64.72,
+                  "fc2": 149.216,
+                  "return": 187.10399999999998,
+                  "reduce": 98.75200000000001,
+                  "forward": 383.84000000000003,
+                  "wall": 971.9594999999999
+                },
+                "payload_GBps": {
+                  "nv_dispatch": 57.14907292954264,
+                  "nv_return": 19.768086198050284
+                }
+              },
+              "argv": [
+                "/opt/.venv/bin/python",
+                "/tmp/weftmoe-compact-push-da55d82/tests/run_local_activation_p2p.py",
+                "--binary",
+                "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cda0e46d5976a48b5d05ea91cb7c88c70fe3fe8841cc8eab41451c795f64d63e/test_cuda_notify",
+                "--world",
+                "8",
+                "--top-k",
+                "8",
+                "--rounds",
+                "12",
+                "--timeout",
+                "120",
+                "--forward-benchmark"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "diagnostics": [
+    {
+      "name": "Nsight Compute single-rank PC sampling",
+      "result": "timeout; no report generated; excluded from evidence",
+      "raw_results": "results/communication_bottleneck_20260915/pc_screen_rank1",
+      "cleanup": "No GPU processes remained when rechecked before compact-layout experiments."
+    }
+  ]
+}
