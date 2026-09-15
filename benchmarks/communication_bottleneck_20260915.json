@@ -8867,6 +8867,92 @@
       ],
       "protocol": "Each copy warp owns a contiguous local route sub-batch. Lanes detect same-peer contiguous target runs bounded by private staging capacity, TMA-gather independent source rows into shared memory, then lane0 issues one contiguous S2G. Full global completion and all metadata SYS fences precede per-warp readiness; unconditional copy-domain joins protect cursor advancement. Wide rows reuse segmented copy_row. GIN receive stays on four-lane two-slot prefetch.",
       "finding": "Qwen EP16 8K Dispatch28.879 baseline->31.470GB/s,Return39.746->39.910. However parent four-lane prefetch already reached31.503GB/s in previous pair, so this adds no evidence of gain over prefetch.64 sparse files exact over12 repetitions. No full/64K/BWD tests or production adoption."
+    },
+    {
+      "name": "Cooperative received Dispatch metadata with pipelined issuers",
+      "source": "/tmp/weftmoe-cooperative-dispatch-rx-metadata",
+      "source_commit": "6fc495b",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/cooperative_rx_metadata_lanes4_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1160.705,
+              "fc2": 563.8240000000001,
+              "return": 3376.0,
+              "reduce": 2506.6850000000004,
+              "forward": 4672.335,
+              "wall": 6091.585
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.36065494677806,
+              "nv_return": 34.786881516587684,
+              "rdma_dispatch": 28.908664992396865,
+              "rdma_return": 39.75643601895735
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "cooperative_rx_metadata_lanes4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1072.6750000000002,
+              "fc2": 556.944,
+              "return": 3362.27,
+              "reduce": 2390.6549999999997,
+              "forward": 4587.135,
+              "wall": 5986.76
+            },
+            "payload_GBps": {
+              "nv_dispatch": 218.96755680891226,
+              "nv_return": 34.92893551083048,
+              "rdma_dispatch": 31.281079544130325,
+              "rdma_return": 39.91878344094912
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "All64 copy lanes write valid fanout headers and gates before the payload issuer section. Four issuers per warp retain independent two-slot prefetch. Each metadata writer issues SYS fence; issuing lanes wait for full TMA completion, then the original copy-domain barrier precedes readiness. Final RX credit ordering unchanged. No additional staging or barriers.",
+      "finding": "Qwen EP16 8K Dispatch28.909 baseline->31.281GB/s,Return39.756->39.919. Parent four-lane prefetch previously reached31.503, so cooperative metadata supplies no incremental gain.64 sparse golden files exact over12 native repetitions. No adoption or broader full/64K/BWD sweep."
     }
   ],
   "diagnostics": [
