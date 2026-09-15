@@ -4931,7 +4931,7 @@
           }
         }
       ],
-      "finding": "Qwen EP16 8K Return39.369->39.751 GB/s, phase3409.235->3376.435us. Sparse257Return512.704->476.656us. Full Forward validation pending; do not treat as42GB/s achievement. Full Qwen RX32 FWD5082.510->5017.120us; Flash default RX1289570.160->9605.970us (0.37% slower in this pair). All256full-prefix files exact. Do not claim universal speedup; currently kept experimental.",
+      "finding": "Qwen EP16 8K Return39.369->39.751 GB/s, phase3409.235->3376.435us. Sparse257Return512.704->476.656us. Full Forward validation pending; do not treat as42GB/s achievement. Full Qwen RX32 FWD5082.510->5017.120us; Flash default RX1289570.160->9605.970us (0.37% slower in this pair). All256full-prefix files exact. Do not claim universal speedup; currently kept experimental. BWD Qwen/Flash EP8/16 all480 files exact including dW. Flash full sample stdev136/142us exceeds35.81us median difference; one pair does not establish a regression or a gain.",
       "full_forward_checks": [
         {
           "raw_results": "results/communication_bottleneck_20260915/targeted_flush_training",
@@ -5060,6 +5060,44 @@
               }
             }
           ]
+        }
+      ],
+      "backward_validation": [
+        {
+          "model": "qwen",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fb3b6280ca98142d8063e142cd17b2ea30b6d9d3c5dbc55cac0807a21128f7b3/test_cuda_notify"
+        },
+        {
+          "model": "qwen",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fb3b6280ca98142d8063e142cd17b2ea30b6d9d3c5dbc55cac0807a21128f7b3/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 8,
+          "tokens": 129,
+          "experts": 16,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 80,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ba412d1423e840e58deb341f6ba70cb39f1b0f58d8df9db1f6bb83e46ef57072/test_cuda_notify"
+        },
+        {
+          "model": "flash",
+          "ep": 16,
+          "tokens": 129,
+          "experts": 32,
+          "all_byte_identical_to_golden": true,
+          "files_compared": 160,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ba412d1423e840e58deb341f6ba70cb39f1b0f58d8df9db1f6bb83e46ef57072/test_cuda_notify"
         }
       ]
     },
