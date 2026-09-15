@@ -188,6 +188,18 @@ inline constexpr std::uint32_t kRemoteRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
 #define WEFTMOE_FWD_UNIFIED_WORKERS 1
 #endif
 #endif
+// Communication ownership only; every physical CTA retains its GEMM roles.
+// Zero keeps the mixed worker layout for controlled comparisons.
+#ifndef WEFTMOE_FWD_UNIFIED_RDMA_CTAS
+#define WEFTMOE_FWD_UNIFIED_RDMA_CTAS 16
+#endif
+inline constexpr unsigned kUnifiedRdmaCtas = WEFTMOE_FWD_UNIFIED_RDMA_CTAS;
+static_assert(WEFTMOE_FWD_UNIFIED_RDMA_CTAS >= 0);
+inline constexpr unsigned unified_rdma_ctas(unsigned total, bool use_gin) {
+  return !use_gin || total < 2U ? 0U
+         : (kUnifiedRdmaCtas < total ? kUnifiedRdmaCtas : total - 1U);
+}
+
 inline constexpr unsigned kUnifiedGinPackSlots = WEFTMOE_UNIFIED_GIN_PACK_SLOTS;
 // A context has 40 bytes of queue/lease state and each packing slot has a
 // 40-byte handoff. Round the allocation to the device structure's alignment.

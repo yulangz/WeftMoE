@@ -45,6 +45,9 @@ struct alignas(128) Shared {
   unsigned dispatch_complete;
   unsigned stop;
   unsigned copies_done;
+  unsigned pack_mailbox; // 0: available, 1: immutable task ready, 2: stop.
+  unsigned pack_observed; // Copy-domain broadcast; never written by control.
+
   activation_ring_detail::Transfer gin_task;
   unsigned gin_context_cursor;
   unsigned gin_context;
@@ -100,8 +103,10 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
       init(&s.row_prefetch_full[warp * Storage::kBuffers + slot], 1U);
   }
   if (tid == 0U) {
-    s.dispatch_cursor =
-        1ULL * blockIdx.x * a.forward_dispatch_publish_batch_rows;
+    const unsigned rdma_ctas = gridDim.x - a.forward_relay_cta_count;
+    const unsigned relay = blockIdx.x >= rdma_ctas ? blockIdx.x - rdma_ctas : 0U;
+    s.dispatch_cursor = 1ULL * relay * a.forward_dispatch_publish_batch_rows;
+    s.pack_mailbox = s.pack_observed = 0U;
     // local_route_order places local routes before remote ones.
     s.dispatch_end = forward_dispatch_detail::local_route_prefix(a);
     s.return_queue = 0U;
@@ -313,7 +318,7 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
   copy_sync<threads, BarrierId>();
   if (tid == 0U)
     s.dispatch_cursor +=
-        1ULL * gridDim.x * a.forward_dispatch_publish_batch_rows;
+        1ULL * a.forward_relay_cta_count * a.forward_dispatch_publish_batch_rows;
   copy_sync<threads, BarrierId>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ProxyRelayEnd, ProxyRelay,
                              blockIdx.x, batch_end - batch_begin,
@@ -610,7 +615,9 @@ run_publisher(const ForwardKernelArgs &a,
   const unsigned lane = threadIdx.x % 32U;
   forward_dispatch_detail::Fc1PublisherState publisher;
   if (lane == 0U)
-    forward_dispatch_detail::init_fc1_publisher(a, blockIdx.x, gridDim.x,
+    forward_dispatch_detail::init_fc1_publisher(
+        a, blockIdx.x - (gridDim.x - a.forward_relay_cta_count),
+        a.forward_relay_cta_count,
                                                scheduler, publisher);
   __syncwarp();
   while (true) {
@@ -632,6 +639,86 @@ run_publisher(const ForwardKernelArgs &a,
     forward_dispatch_detail::finish_fc1_publisher(a, blockIdx.x);
 }
 
+// The controller never waits for TMA packing. It continues returning GIN
+// credits and submitting packed slots while the copy warps own the mailbox.
+// The mailbox release/acquire protects its descriptor independently of the
+// device-scoped pending-slot handoff consumed by any context controller.
+template <unsigned BaseThread, class Storage>
+__device__ __forceinline__ void
+run_rdma(const ForwardKernelArgs &a,
+         persistent_v3::ForwardPipelineControl &control, Storage &s) {
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned warp = tid / 32U, lane = tid % 32U;
+  if (warp == Storage::kCopyWarps) {
+    if (lane == 0U) {
+      unsigned cursor = blockIdx.x;
+      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> mailbox(s.pack_mailbox);
+      while (!cancelled(a, control)) {
+        const bool available = mailbox.load(::cuda::memory_order_acquire) == 0U;
+        activation_ring_detail::Transfer task;
+        unsigned context = 0U, slot = 0U;
+        const bool progressed =
+            gin_detail::progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
+                a, cursor, context, slot, task,
+                [&](const activation_ring_detail::Transfer &sent) {
+                  gin_detail::account_send(a, sent);
+                },
+                [&](unsigned index, GinContextState &state) {
+                  gin_detail::complete_context(a, control, index, state);
+                }, available);
+        if (task.channel != activation_ring_detail::kNoChannel) {
+          s.gin_task = task;
+          s.gin_context = context;
+          s.gin_task_slot = slot;
+          mailbox.store(1U, ::cuda::memory_order_release);
+        } else if (available &&
+                   persistent_v3::load_acquire<::cuda::thread_scope_device>(
+                       control.rdma_return_roles_complete.value) == a.gin_context_count) {
+          break;
+        }
+        if (!progressed)
+          __nanosleep(forward_tuning::kTransportIdleNanosleep);
+      }
+      // A cancelled copy may still finish its current finite TMA batch; its
+      // independent cancellation poll also observes shutdown after that batch.
+      mailbox.store(2U, ::cuda::memory_order_release);
+    }
+  } else {
+    while (true) {
+      if (tid == 0U)
+        s.pack_observed = cancelled(a, control) ? 2U :
+            ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.pack_mailbox)
+                .load(::cuda::memory_order_acquire);
+      copy_sync<Storage::kCopyThreads>();
+      const unsigned phase = s.pack_observed;
+      // Capture before the leader can overwrite the broadcast on an idle poll.
+      copy_sync<Storage::kCopyThreads>();
+      if (phase == 2U)
+        break;
+      if (phase == 0U) {
+        __nanosleep(forward_tuning::kTransportIdleNanosleep);
+        continue;
+      }
+      if (s.gin_task.channel < a.gin_rings.dispatch_channels)
+        gin_detail::pack_dispatch<BaseThread>(a, s, s.gin_task);
+      else
+        gin_detail::pack_return<BaseThread>(a, s, s.gin_task);
+      // Every copy warp has finished accessing the shared descriptor before
+      // returning it to the independent controller.
+      copy_sync<Storage::kCopyThreads>();
+      if (tid == 0U) {
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+            gin_detail::states(a)[s.gin_context].slots[s.gin_task_slot].pending)
+            .store(2U, ::cuda::memory_order_release);
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.pack_mailbox)
+            .store(0U, ::cuda::memory_order_release);
+      }
+      copy_sync<Storage::kCopyThreads>();
+    }
+  }
+  domain_sync<Storage::kThreads>();
+}
+
 template <bool UseGin, unsigned BaseThread, class Storage>
 __device__ __forceinline__ void
 run_impl(const ForwardKernelArgs &a,
@@ -640,6 +727,13 @@ run_impl(const ForwardKernelArgs &a,
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U;
   init<BaseThread>(a, control, s);
+  const unsigned rdma_ctas = gridDim.x - a.forward_relay_cta_count;
+  if constexpr (UseGin) {
+    if (blockIdx.x < rdma_ctas) {
+      run_rdma<BaseThread>(a, control, s);
+      return;
+    }
+  }
   if (warp == Storage::kCopyWarps) {
     run_publisher(a, control, scheduler, s);
   } else {
@@ -653,9 +747,9 @@ run_impl(const ForwardKernelArgs &a,
         remote_progress =
             gin_detail::progress_receive<BaseThread>(a, s, true) ||
             remote_progress;
-        remote_progress =
-            gin_detail::progress_send<BaseThread>(a, control, s) ||
-            remote_progress;
+        if (rdma_ctas == 0U)
+          remote_progress = gin_detail::progress_send<BaseThread>(a, control, s) ||
+                            remote_progress;
       }
       constexpr bool optimize_local =
           !UseGin || forward_tuning::kUnifiedOptimizeGinLocalTransport;
@@ -671,7 +765,7 @@ run_impl(const ForwardKernelArgs &a,
           const auto previous =
               persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
                   control.relay_dispatch_roles_complete.value, 1ULL);
-          if (previous + 1ULL == gridDim.x) {
+          if (previous + 1ULL == a.forward_relay_cta_count) {
             peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                 ->dispatch_complete_clock = device_globaltimer_ns();
             WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, XDispatchComplete,

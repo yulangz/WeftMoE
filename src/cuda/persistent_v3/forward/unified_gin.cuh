@@ -280,7 +280,7 @@ template <bool SameChannel = false, class Args, class OnSend, class OnComplete>
 __device__ __forceinline__ bool
 progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
                  unsigned &selected_slot, wire::Transfer &task, OnSend on_send,
-                 OnComplete on_complete) {
+                 OnComplete on_complete, bool reserve_pack = true) {
   task.channel = wire::kNoChannel;
   bool progressed = false;
   static_assert(WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES > 0);
@@ -337,7 +337,7 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.done)
             .store(1U, ::cuda::memory_order_release);
         progressed = true;
-      } else if (occupied < forward_tuning::kUnifiedGinPackSlots) {
+      } else if (reserve_pack && occupied < forward_tuning::kUnifiedGinPackSlots) {
         const bool dispatch_first = state.dispatch_first != 0U;
         bool selected =
             dispatch_first

@@ -10,6 +10,12 @@ from autotune_common import PlanError
 
 
 class UnifiedTuningTest(unittest.TestCase):
+    def test_rdma_role_count_is_shape_independent(self):
+        for count in (0, 1, 8, 16, 32, 256):
+            tune.validate(dict(tune.DEFAULTS, unified_rdma_ctas=count))
+        with self.assertRaisesRegex(PlanError, "RDMA CTA count"):
+            tune.validate(dict(tune.DEFAULTS, unified_rdma_ctas=-1))
+
     def test_register_pool_is_rounded_per_warp(self):
         # 65536 registers fit on the SM, but a 384-thread CTA initially gets
         # only 64512. Both math warpgroups requesting 224 would stall here.

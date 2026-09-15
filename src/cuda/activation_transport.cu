@@ -4624,7 +4624,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.forward_compute_cta_count = forward_tuning::kUnifiedWorkers
           ? (grid_blocks & ~1U) : grid_blocks - kTransportBlocks;
       if constexpr (forward_tuning::kUnifiedWorkers)
-        args.forward_relay_cta_count = args.forward_compute_cta_count;
+        args.forward_relay_cta_count = args.forward_compute_cta_count -
+            forward_tuning::unified_rdma_ctas(args.forward_compute_cta_count,
+                                              args.use_gin);
       args.forward_stream_local_dispatch = split_local_roles;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       // Eight independent row streams per CTA are the Hopper default.

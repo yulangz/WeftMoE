@@ -102,7 +102,12 @@ __device__ __forceinline__ void split_transport_finalize(
   // Relay workers have finished the arrival queues. RDMA CTA 0 may still be
   // waiting for unrelated outbound put completion and must not lengthen the
   // per-token Reduce dependency.
-  if (blockIdx.x == persistent_v3::kRdmaCtaCount) {
+  const unsigned receive_finalizer = forward_tuning::kUnifiedWorkers
+      ? forward_tuning::unified_rdma_ctas(a.forward_compute_cta_count, a.use_gin)
+      : persistent_v3::kRdmaCtaCount;
+  // Mixed unified workers retain a distinct receive finalizer too.
+  if (blockIdx.x == (receive_finalizer ? receive_finalizer
+                                      : persistent_v3::kRdmaCtaCount)) {
     if (threadIdx.x == 0U)
       wait_for_count(a, control.return_receive_roles_complete,
                      a.forward_relay_cta_count);

@@ -17,6 +17,7 @@ PARAMETER_MACROS = {
     "unified_optimize_gin_local_transport": "WEFTMOE_UNIFIED_OPTIMIZE_GIN_LOCAL_TRANSPORT",
     "unified_return_drain_rows": "WEFTMOE_UNIFIED_RETURN_DRAIN_ROWS",
     "unified_split_nvlink": "WEFTMOE_UNIFIED_SPLIT_NVLINK",
+    "unified_rdma_ctas": "WEFTMOE_UNIFIED_RDMA_CTAS",
     "unified_gin_context_probes": "WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES",
     "unified_gin_pack_slots": "WEFTMOE_UNIFIED_GIN_PACK_SLOTS",
     "wgmma_n256_atom_n": "WEFTMOE_WGMMA_N256_ATOM_N",
@@ -30,7 +31,7 @@ SHARED_PARAMETERS = frozenset({"gin_ring_depth", "unified_gin_context_probes",
 # local scheduling policy and does not consume these Forward-only controls.
 FORWARD_ONLY_PARAMETERS = frozenset({
     "unified_row_prefetch", "unified_optimize_gin_local_transport",
-    "unified_return_drain_rows", "unified_split_nvlink"})
+    "unified_return_drain_rows", "unified_split_nvlink", "unified_rdma_ctas"})
 
 
 def parameter_macros(phase):
@@ -59,7 +60,7 @@ DEFAULTS = dict(gin_ring_depth=4, unified_workers=0, unified_threads=384,
                 unified_segment_bytes=2048, unified_copy_buffers=1,
                 unified_row_prefetch=1, unified_optimize_gin_local_transport=0,
                 unified_return_drain_rows=128,
-                unified_split_nvlink=0,
+                unified_split_nvlink=0, unified_rdma_ctas=0,
                 unified_gin_context_probes=2,
                 unified_gin_pack_slots=1,
                 wgmma_n256_atom_n=256)
@@ -124,6 +125,8 @@ def validate(config):
     require_choice(config, "unified_workers", (0, 1))
     require_choice(config, "unified_threads", (384, 512, 640))
     require_choice(config, "unified_split_nvlink", (0, 1))
+    require(config["unified_rdma_ctas"] >= 0,
+            "unified RDMA CTA count must be nonnegative (zero selects mixed workers)")
     require_choice(config, "unified_row_prefetch", (0, 1))
     require_choice(config, "unified_optimize_gin_local_transport", (0, 1))
     require(32 <= config["unified_return_drain_rows"] <= 1024 and

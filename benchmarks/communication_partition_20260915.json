@@ -101,6 +101,76 @@
         }
       ],
       "conclusion": "No demonstrated speedup. This stage removes blocking FC1 publication before independent notification progress; EP16 short-screen GPU time regressed 1.4%. No BWD numerical changes or new BWD run in this stage."
+    },
+    {
+      "stage": "Forward RDMA and relay CTA partition with independent GIN controller",
+      "baseline_commit": "5ac416a",
+      "candidate": "source accompanying this record",
+      "source_diff_sha256": "7548d80b78c39ab37a6556e3d34549ea38a467547a94db7b15f839fffebd28a8",
+      "settings": {
+        "sm_clock_mhz": 1620,
+        "power_limit_w": 700,
+        "warmup_rounds": 10,
+        "measured_rounds": 10,
+        "statistics": "median of per-iteration slowest rank",
+        "recurring_tensor_allocation_in_wall": true,
+        "reusable_context_and_buffer_allocation_excluded": true,
+        "rdma_ctas": 16,
+        "relay_ctas": 116,
+        "total_compute_ctas": 132,
+        "ep8_rdma_ctas": 0
+      },
+      "raw_results": "results/communication_optimization_20260915/partition_step",
+      "validation": {
+        "files_compared": 96,
+        "all_byte_identical": true,
+        "ep": [
+          8,
+          16
+        ],
+        "tokens": 8192,
+        "repetitions": 20
+      },
+      "cpu_tests": "38 unified tests passed",
+      "cases": [
+        {
+          "name": "partition_step_ep8_8k",
+          "ep": 8,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.7d4a9cf50c9907bea33ef75e53e2ca4ab8e70b438334b6b1276165287dacac03/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1871.2,
+            "fc2": 2236.77,
+            "return": 2368.045,
+            "reduce": 744.656,
+            "forward": 2791.2799999999997,
+            "wall": 3671.715
+          }
+        },
+        {
+          "name": "partition_step_ep16_8k",
+          "ep": 16,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.7d4a9cf50c9907bea33ef75e53e2ca4ab8e70b438334b6b1276165287dacac03/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2132.5950000000003,
+            "fc2": 2333.215,
+            "return": 4708.6900000000005,
+            "reduce": 2931.23,
+            "forward": 5536.195,
+            "wall": 6920.21
+          }
+        }
+      ],
+      "conclusion": "Correctness checkpoint; no demonstrated speedup in 8K short screen. Notification consumers still share CAS. BWD role partition not changed. Legacy autotune plans default to mixed workers; explicit unified_rdma_ctas selects the new partition. Bare/header-absent default is 16, clamped to keep at least one relay CTA."
     }
   ]
 }
