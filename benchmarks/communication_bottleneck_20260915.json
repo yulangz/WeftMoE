@@ -5334,6 +5334,76 @@
         }
       ],
       "finding": "Qwen EP16 Dispatch8K28.834->29.591 GB/s,64K34.141->35.454. Return8K39.461->39.894,64K45.604->45.539. Only3-4% Dispatch gain despite50% more copy warps. Full GEMM resource tradeoff unvalidated; do not adopt. Investigate serial FC1 publisher next."
+    },
+    {
+      "name": "Warp-cooperative FC1 input-group publisher",
+      "adopted": false,
+      "experimental_commit": "45bec35",
+      "raw_results": "results/communication_bottleneck_20260915/coop_publisher_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1159.7150000000001,
+              "fc2": 546.272,
+              "return": 3406.4350000000004,
+              "reduce": 2484.88,
+              "forward": 4719.98,
+              "wall": 6140.285
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.53340174094495,
+              "nv_return": 34.476076014954046,
+              "rdma_dispatch": 28.93334310584928,
+              "rdma_return": 39.40122973137605
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "coop_publisher_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1156.4,
+              "fc2": 547.984,
+              "return": 3410.32,
+              "reduce": 2379.95,
+              "forward": 4717.855,
+              "wall": 6177.835
+            },
+            "payload_GBps": {
+              "nv_dispatch": 203.11399515738498,
+              "nv_return": 34.43680123859344,
+              "rdma_dispatch": 29.01628502248357,
+              "rdma_return": 39.35634427267822
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K pure Dispatch28.933->29.016 GB/s, Return39.401->39.356; no communication gain. The pure benchmark does not measure actual FC1 scheduling latency; full-model behavior not tested. Do not adopt for the communication goal. All rails are acquired cooperatively and joined before release task stores;64 sparse golden files exact."
     }
   ],
   "diagnostics": [
