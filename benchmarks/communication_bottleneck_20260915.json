@@ -6226,7 +6226,65 @@
           "seed": 914
         }
       },
-      "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.771 Return39.881GB/s. Omit unused legacy header fields29.247/39.647; exact64-bit reciprocal division28.894/39.723; cache addresses cooperatively during metadata preparation30.401/39.768. Header and arithmetic candidates not adopted; address cache (+5.7%Dispatch) requires64K and full Forward confirmation because total communication GPU4672.145->4679.710us is flat. Cache uses1KiB extra shared memory for2copywarps, fixed32-entry tiles handle arbitrary batch length. All payload, fullTMAcompletion, readiness and credit semantics preserved.128 original sparse comparison files +64 top_k6 +64 cache files exact. Requested top_k7 fixture was rejected by baseline harness (accepts1,6,8), so top_k6 verifies non-power-of-two instead. No full Forward/BWD correctness claimed for these candidates yet."
+      "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.771 Return39.881GB/s. Omit unused legacy header fields29.247/39.647; exact64-bit reciprocal division28.894/39.723; cache addresses cooperatively during metadata preparation30.401/39.768. Header and arithmetic candidates not adopted; address cache (+5.7%Dispatch) requires64K and full Forward confirmation because total communication GPU4672.145->4679.710us is flat. Cache uses1KiB extra shared memory for2copywarps, fixed32-entry tiles handle arbitrary batch length. All payload, fullTMAcompletion, readiness and credit semantics preserved.128 original sparse comparison files +64 top_k6 +64 cache files exact. Requested top_k7 fixture was rejected by baseline harness (accepts1,6,8), so top_k6 verifies non-power-of-two instead. No full Forward/BWD correctness claimed for these candidates yet. Qwen64K Dispatch34.087->34.966GB/s (+2.58%), Return45.693->45.674. Full Qwen8K pair is next; this is not a production adoption.",
+      "cache_64k_cases": [
+        {
+          "name": "targeted_flush_ep16_65536",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 7874.96,
+              "fc2": 2947.615,
+              "return": 23499.15,
+              "reduce": 20573.9,
+              "forward": 31284.699999999997,
+              "wall": 33118.350000000006
+            },
+            "payload_GBps": {
+              "nv_dispatch": 238.61050621209503,
+              "nv_return": 39.981194894283405,
+              "rdma_dispatch": 34.08721517315644,
+              "rdma_return": 45.69279416489532
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_address_cache_ep16_65536",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.1a2bad6c09a3f8913bb4b5d12ef6a320d5cfc51236c7b0abcfc8710d95bbce96/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 7677.135,
+              "fc2": 3518.6549999999997,
+              "return": 23508.85,
+              "reduce": 20408.35,
+              "forward": 31211.9,
+              "wall": 33218.9
+            },
+            "payload_GBps": {
+              "nv_dispatch": 244.7590399283066,
+              "nv_return": 39.96469823066633,
+              "rdma_dispatch": 34.96557713261522,
+              "rdma_return": 45.673940835047226
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        }
+      ]
     }
   ],
   "diagnostics": [
