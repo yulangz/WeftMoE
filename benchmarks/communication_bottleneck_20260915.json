@@ -7188,7 +7188,81 @@
           "repetitions": 20
         }
       ],
-      "finding": "At1620MHz Qwen EP16 8K Dispatch28.843->29.903(q2)->31.755(q4),Return39.767->39.578->39.935GB/s.64K baseline Dispatch34.328->36.786(q4),Return45.689->45.664; pure GPU31292.3->30883.05us,wall33144.55->32720.35.128 sparse files exact acrossq2/q4;64K64 prefix files exact and20 repeated full outputs passed. Full Forward confirmation running; not yet adopted."
+      "finding": "At1620MHz Qwen EP16 8K Dispatch28.843->29.903(q2)->31.755(q4),Return39.767->39.578->39.935GB/s.64K baseline Dispatch34.328->36.786(q4),Return45.689->45.664; pure GPU31292.3->30883.05us,wall33144.55->32720.35.128 sparse files exact acrossq2/q4;64K64 prefix files exact and20 repeated full outputs passed. Full retained Qwen EP16 8K confirmation: Dispatch1475.010->1450.945us, but total Forward5118.675->5834.850us (+13.99%), Return4278.835->5010.050us and allocation-inclusive wall6578.300->7249.170us. Both cases passed20 native repetitions and128 prefix golden files are byte-identical. Clocks restored on both nodes. Reject quota4 for production despite pure Dispatch gains; scheduling interaction with the full pipeline remains unresolved. No broader full-model sweep performed.",
+      "full_forward_confirmation": {
+        "raw_results": "results/communication_bottleneck_20260915/dispatch_ratio_q4_training",
+        "cases": [
+          {
+            "name": "targeted_flush_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1475.01,
+                "fc2": 2183.135,
+                "return": 4278.834999999999,
+                "reduce": 2654.465,
+                "forward": 5118.674999999999,
+                "wall": 6578.3
+              },
+              "payload_GBps": {
+                "nv_dispatch": 159.2402926081857,
+                "nv_return": 27.446842890646643,
+                "rdma_dispatch": 22.748613229740815,
+                "rdma_return": 31.367820446453305
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "dispatch_ratio_q4_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1450.9450000000002,
+                "fc2": 2170.785,
+                "return": 5010.05,
+                "reduce": 2900.465,
+                "forward": 5834.85,
+                "wall": 7249.17
+              },
+              "payload_GBps": {
+                "nv_dispatch": 161.88141108036484,
+                "nv_return": 23.440986018103608,
+                "rdma_dispatch": 23.12591586862355,
+                "rdma_return": 26.789698306404127
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": {
+          "files_compared": 128,
+          "all_byte_identical": true,
+          "repetitions": 20
+        },
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0
+          },
+          {
+            "node": "remote",
+            "rc": 0
+          }
+        ]
+      }
     }
   ],
   "diagnostics": [
