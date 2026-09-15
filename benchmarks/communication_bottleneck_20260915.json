@@ -8972,6 +8972,92 @@
       ],
       "protocol": "All64 copy lanes write valid fanout headers and gates before the payload issuer section. Four issuers per warp retain independent two-slot prefetch. Each metadata writer issues SYS fence; issuing lanes wait for full TMA completion, then the original copy-domain barrier precedes readiness. Final RX credit ordering unchanged. No additional staging or barriers.",
       "finding": "Qwen EP16 8K Dispatch28.909 baseline->31.281GB/s,Return39.756->39.919. Parent four-lane prefetch previously reached31.503, so cooperative metadata supplies no incremental gain.64 sparse golden files exact over12 native repetitions. No adoption or broader full/64K/BWD sweep."
+    },
+    {
+      "name": "Dynamic local Dispatch batch ownership",
+      "source": "/tmp/weftmoe-dynamic-local-dispatch",
+      "source_commit": "a784015",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/dynamic_local_dispatch_lanes2_screen",
+      "cases": [
+        {
+          "name": "balanced_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1024.095,
+              "fc2": 139.92000000000002,
+              "return": 3246.625,
+              "reduce": 2333.71,
+              "forward": 4481.8099999999995,
+              "wall": 5859.844999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.3547219740356,
+              "nv_return": 36.17310653370808,
+              "rdma_dispatch": 32.764960282005084,
+              "rdma_return": 41.340693181380665
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dynamic_local_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1101.33,
+              "fc2": 135.248,
+              "return": 3281.825,
+              "reduce": 2436.8149999999996,
+              "forward": 4521.585,
+              "wall": 5920.4349999999995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 213.2703404065993,
+              "nv_return": 35.78512321650302,
+              "rdma_dispatch": 30.467191486657043,
+              "rdma_return": 40.89728367600345
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "One device atomic cursor assigns32-route batches across relay CTAs. Each owns at most one batch; initial reservation follows setup clear and next reservation uses existing completion join. RDMA-only CTAs reserve none. No extra barriers, payload changes or task omission. Adds one128-byte padded counter to reusable Forward control.",
+      "finding": "Qwen EP16 8K incumbent Dispatch32.765->dynamic30.467GB/s,Return41.341->40.897. Regression; retain fixed stripes.64 sparse files exact over12 repetitions;no64K/full/BWD sweep. Dynamic ownership changes locality/order as well as load balance, so this does not prove tail stragglers absent."
     }
   ],
   "diagnostics": [
