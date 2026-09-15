@@ -2161,6 +2161,178 @@
       ],
       "cpu_validation": "90 tests and 126 subtests passed",
       "finding": "All tested numerical checks pass. Qwen EP16 8K full FWD regresses from 5416.735 to 5803.775 us despite faster Dispatch. Do not adopt static ownership: rejoin both Return workloads after each CTA finishes Dispatch. Flash EP16 64K pure Dispatch reaches 43.21 GB/s, but EP16 8K remains below goal in both directions."
+    },
+    {
+      "name": "Return handoff and dense GIN Dispatch packet columns",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/handoff_soa_screen",
+      "cases": [
+        {
+          "name": "compact_clean_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ef536eeb55183c3d48940151d9bb816e6f80858c7e33ddea22e92a841edc239b/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1861.68,
+            "fc2": 2268.48,
+            "return": 4521.055,
+            "reduce": 2795.3599999999997,
+            "forward": 5360.34,
+            "wall": 6848.105
+          },
+          "payload_GBps": {
+            "nv_dispatch": 126.16616389497658,
+            "nv_return": 25.97635109504308,
+            "rdma_dispatch": 18.023737699282368,
+            "rdma_return": 29.68725839433495
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_handoff_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.afca11b4177cb6106be6e4ae5ef441fb358a582d717a63748ca48281517505c5/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1747.725,
+            "fc2": 2286.2200000000003,
+            "return": 4864.72,
+            "reduce": 3095.695,
+            "forward": 5758.51,
+            "wall": 7198.4400000000005
+          },
+          "payload_GBps": {
+            "nv_dispatch": 134.39243816962053,
+            "nv_return": 24.14126856221941,
+            "rdma_dispatch": 19.198919738517215,
+            "rdma_return": 27.590021213965034
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_handoff_pure_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.d91730e1abf12003babf419531f8545796ef7f7592d84d2745d103b321aea90c/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1311.3600000000001,
+            "fc2": 569.936,
+            "return": 3394.78,
+            "reduce": 2341.84,
+            "forward": 4898.13,
+            "wall": 6417.405000000001
+          },
+          "payload_GBps": {
+            "nv_dispatch": 179.1125427037579,
+            "nv_return": 34.59443969859608,
+            "rdma_dispatch": 25.587506100536846,
+            "rdma_return": 39.53650251268123
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_handoff_pure_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.d91730e1abf12003babf419531f8545796ef7f7592d84d2745d103b321aea90c/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7519.264999999999,
+            "fc2": 3202.62,
+            "return": 23530.5,
+            "reduce": 20268.05,
+            "forward": 31024.7,
+            "wall": 32858.35
+          },
+          "payload_GBps": {
+            "nv_dispatch": 249.8978546440377,
+            "nv_return": 39.92792741335713,
+            "rdma_dispatch": 35.699693520576815,
+            "rdma_return": 45.63191704383672
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "gin_soa_pure_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ad3e53b12c65283c997986d047198d491ad7f5a7aa5a6be435d482657f68be26/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1317.6,
+            "fc2": 572.592,
+            "return": 3390.575,
+            "reduce": 2451.315,
+            "forward": 4902.6900000000005,
+            "wall": 6299.65
+          },
+          "payload_GBps": {
+            "nv_dispatch": 178.26428658166364,
+            "nv_return": 34.63734381336499,
+            "rdma_dispatch": 25.466326654523378,
+            "rdma_return": 39.58553578670285
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "gin_soa_pure_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ad3e53b12c65283c997986d047198d491ad7f5a7aa5a6be435d482657f68be26/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7520.255,
+            "fc2": 3179.475,
+            "return": 23499.35,
+            "reduce": 20398.9,
+            "forward": 31040.75,
+            "wall": 37854.65
+          },
+          "payload_GBps": {
+            "nv_dispatch": 249.86495697286858,
+            "nv_return": 39.980854619383095,
+            "rdma_dispatch": 35.69499385326694,
+            "rdma_return": 45.69240527929496
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "small_validation": {
+        "files_compared": 128,
+        "all_byte_identical": true
+      },
+      "large_validation": {
+        "files_compared": 128,
+        "all_byte_identical": true
+      },
+      "finding": "Handoff preserves 35.70 GB/s pure Dispatch, but full Qwen EP16 8K remains slower (5758.51 vs 5360.34 us). Dense packet columns alone give no bandwidth improvement. Inspect Return work during Dispatch and production register allocation next."
     }
   ],
   "diagnostics": [
@@ -2270,6 +2442,11 @@
         }
       ],
       "finding": "No local Dispatch payload: 6822.685 us. No received fanout payload: 6662.960 us. Complete baseline: 8471.105 us. Both NVLink workloads contribute to the throughput limit."
+    },
+    {
+      "name": "Static resource and local-memory instruction audit",
+      "raw_results": "results/communication_bottleneck_20260915/register_audit",
+      "finding": "Baseline and handoff EP16 retained Forward entries both report REG 168, STACK 656, LOCAL 0. After control register deallocation, static LDL/STL counts change from 2701/1396 to 2710/1401. These counts include stack/structure accesses and do not establish dynamic spill cost. Test the legal 72-register control quota and shared Return work during Dispatch."
     }
   ]
 }
