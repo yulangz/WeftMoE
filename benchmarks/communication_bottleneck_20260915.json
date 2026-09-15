@@ -5404,6 +5404,130 @@
         }
       ],
       "finding": "Qwen EP16 8K pure Dispatch28.933->29.016 GB/s, Return39.401->39.356; no communication gain. The pure benchmark does not measure actual FC1 scheduling latency; full-model behavior not tested. Do not adopt for the communication goal. All rails are acquired cooperatively and joined before release task stores;64 sparse golden files exact."
+    },
+    {
+      "name": "Fold GIN termination into final payload packets",
+      "adopted": false,
+      "experimental_commit": "aa8d73d",
+      "raw_results": "results/communication_bottleneck_20260915/terminal_payload_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 192,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1165.615,
+              "fc2": 559.136,
+              "return": 3378.88,
+              "reduce": 2442.815,
+              "forward": 4694.575,
+              "wall": 6126.969999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.50823728246462,
+              "nv_return": 34.757230798371054,
+              "rdma_dispatch": 28.78689104035209,
+              "rdma_return": 39.72254948385264
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "terminal_dispatch_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1160.96,
+              "fc2": 568.352,
+              "return": 3377.635,
+              "reduce": 2434.205,
+              "forward": 4686.02,
+              "wall": 6083.545
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.31620727673646,
+              "nv_return": 34.770042352119155,
+              "rdma_dispatch": 28.90231532524807,
+              "rdma_return": 39.73719125956475
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "terminal_both_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1168.13,
+              "fc2": 561.9680000000001,
+              "return": 3374.015,
+              "reduce": 2499.245,
+              "forward": 4684.225,
+              "wall": 6093.16
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.0743872685403,
+              "nv_return": 34.80734732951691,
+              "rdma_dispatch": 28.724912466934327,
+              "rdma_return": 39.7798255194479
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "terminal_striping_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1158.3049999999998,
+              "fc2": 550.1600000000001,
+              "return": 3367.1,
+              "reduce": 2389.425,
+              "forward": 4678.64,
+              "wall": 6120.505
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.77994483318298,
+              "nv_return": 34.878831041549105,
+              "rdma_dispatch": 28.968563547597572,
+              "rdma_return": 39.86152119034184
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K base targeted-flush Dispatch28.787/Return39.723 GB/s. Dispatch-only terminal fold28.902/39.737; foldboth plus fixed Return striping28.725/39.780; striping-only28.969/39.862. No clear gain; retain existing terminal packets. All192 sparse golden files exact. This tests GIN End packets separately from the previous NVLink notification End experiment."
     }
   ],
   "diagnostics": [
