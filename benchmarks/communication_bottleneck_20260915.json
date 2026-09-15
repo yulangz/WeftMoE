@@ -8617,6 +8617,92 @@
       ],
       "protocol": "Combine private two-slot Dispatch lane prefetch, local Dispatch quota4, remote FC1 priority, synchronized local Return deferral, and per-peer local Return queues. Every GIN Return receive is still serviced each loop. No payload format/volume or completion relaxation.",
       "finding": "Qwen EP16 8K baseline Dispatch28.868/Return39.824GB/s;2-lane combined32.726/41.247;4-lane combined33.139/41.379. GPU4688.610->4485.340/4470.960us;allocation-inclusive wall6140.600->5950.605/5881.130us.128 sparse files exact over12 native repetitions. Two-lane variant selected for full confirmation because its FC1 pipeline retains4 stages versus3 in four-lane variant;full confirmation building,not adopted."
+    },
+    {
+      "name": "Coalesce adjacent local Dispatch rows into TMA stores",
+      "source": "/tmp/weftmoe-coalesced-local-dispatch-stores",
+      "source_commit": "e0754a8",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/coalesced_local_dispatch_lanes4_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.905,
+              "fc2": 547.888,
+              "return": 3376.895,
+              "reduce": 2411.31,
+              "forward": 4689.855,
+              "wall": 6142.75
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.15165955908617,
+              "nv_return": 34.777661727711404,
+              "rdma_dispatch": 28.87880850844088,
+              "rdma_return": 39.74589911738446
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "coalesced_local_dispatch_lanes4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1066.2399999999998,
+              "fc2": 537.76,
+              "return": 3363.0249999999996,
+              "reduce": 2525.2799999999997,
+              "forward": 4592.605,
+              "wall": 5989.584999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 220.28907563025214,
+              "nv_return": 34.92109395559058,
+              "rdma_dispatch": 31.469867947178876,
+              "rdma_return": 39.90982166353209
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "Each copy warp owns a contiguous local route sub-batch. Lanes detect same-peer contiguous target runs bounded by private staging capacity, TMA-gather independent source rows into shared memory, then lane0 issues one contiguous S2G. Full global completion and all metadata SYS fences precede per-warp readiness; unconditional copy-domain joins protect cursor advancement. Wide rows reuse segmented copy_row. GIN receive stays on four-lane two-slot prefetch.",
+      "finding": "Qwen EP16 8K Dispatch28.879 baseline->31.470GB/s,Return39.746->39.910. However parent four-lane prefetch already reached31.503GB/s in previous pair, so this adds no evidence of gain over prefetch.64 sparse files exact over12 repetitions. No full/64K/BWD tests or production adoption."
     }
   ],
   "diagnostics": [
