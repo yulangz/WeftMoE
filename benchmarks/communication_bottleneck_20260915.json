@@ -5888,6 +5888,190 @@
         }
       ],
       "finding": "At1620MHz, Qwen EP16 8K pure communication: 2copywarps RX32/local32 Dispatch29.060 Return39.795GB/s; 7copywarps samebatch Dispatch30.921 Return40.616. Separate adjacent baseline29.045/39.810; 7warps RX128/local64 32.046/41.022; RX128/local128 31.908/41.087. More copy warps and batch filling help modestly but do not reach42GB/s Dispatch. Full GEMM resources are reduced materially; no full-model speedup or BWD correctness claimed and no production adoption.192 sparse exported files across3 candidates matched,12 repetitions each."
+    },
+    {
+      "name": "Canonical tile permutation communication locality probe",
+      "adopted": false,
+      "experimental_commit": "96ba166",
+      "raw_results": "results/communication_bottleneck_20260915/tile_rotate_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1159.52,
+              "fc2": 555.088,
+              "return": 3368.83,
+              "reduce": 2486.9300000000003,
+              "forward": 4686.88,
+              "wall": 6196.42
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.56746239823377,
+              "nv_return": 34.860919666471744,
+              "rdma_dispatch": 28.938208914033392,
+              "rdma_return": 39.84105104739628
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "tile_rotate_expert_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.71356e84f2878e11d1e6ae1fb394681c3a101f1c92816729ad8678d152a42b21/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1179.395,
+              "fc2": 581.9680000000001,
+              "return": 3395.505,
+              "reduce": 2611.0249999999996,
+              "forward": 4742.5599999999995,
+              "wall": 6130.41
+            },
+            "payload_GBps": {
+              "nv_dispatch": 199.15382378253256,
+              "nv_return": 34.587053177656934,
+              "rdma_dispatch": 28.45054625464751,
+              "rdma_return": 39.52806077446506
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "tile_rotate_half_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.d5b90b2828a14e8202aec02101a7d457013ca6509db3f5ff17fc8f58bbbcc772/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1166.355,
+              "fc2": 559.6320000000001,
+              "return": 3377.33,
+              "reduce": 2477.905,
+              "forward": 4699.235000000001,
+              "wall": 6103.74
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.38038933257883,
+              "nv_return": 34.773182365951804,
+              "rdma_dispatch": 28.768627047511263,
+              "rdma_return": 39.74077984680206
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "targeted_flush_ep16_65536",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 7836.02,
+              "fc2": 3075.455,
+              "return": 23501.75,
+              "reduce": 20544.65,
+              "forward": 31322.550000000003,
+              "wall": 33208.1
+            },
+            "payload_GBps": {
+              "nv_dispatch": 239.79624758487088,
+              "nv_return": 39.976771772314834,
+              "rdma_dispatch": 34.2566067978387,
+              "rdma_return": 45.687739168359805
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "tile_rotate_expert_ep16_65536",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.71356e84f2878e11d1e6ae1fb394681c3a101f1c92816729ad8678d152a42b21/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 8033.775,
+              "fc2": 2931.8050000000003,
+              "return": 23507.3,
+              "reduce": 20404.9,
+              "forward": 31566.0,
+              "wall": 33409.95
+            },
+            "payload_GBps": {
+              "nv_dispatch": 233.89355464896641,
+              "nv_return": 39.96733338154531,
+              "rdma_dispatch": 33.413364949852344,
+              "rdma_return": 45.676952436051785
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "tile_rotate_half_ep16_65536",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.d5b90b2828a14e8202aec02101a7d457013ca6509db3f5ff17fc8f58bbbcc772/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 7858.975,
+              "fc2": 3333.5699999999997,
+              "return": 23509.75,
+              "reduce": 20362.65,
+              "forward": 31336.2,
+              "wall": 33292.05
+            },
+            "payload_GBps": {
+              "nv_dispatch": 239.09583527113904,
+              "nv_return": 39.963168302512784,
+              "rdma_dispatch": 34.156547895877004,
+              "rdma_return": 45.6721923457289
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Communication-only bijective rotation of complete128-row canonical tiles; leftover capacity unchanged and Return source reads mapped consistently. No extra copy, allocation, payload bytes, notification, or weaker completion. Qwen EP16 8K Dispatch28.938 baseline ->28.451 expert-span rotation/28.769 half-width rotation;64K34.257->33.413/34.157. This address permutation supplies no evidence for a useful layout gain; do not implement production compute/BWD mapping for it.128 sparse exported files match byte-for-byte over12 repetitions. CPU enumerated13 ragged/aligned capacities with all legal shifts; permutation is bijective."
     }
   ],
   "diagnostics": [
