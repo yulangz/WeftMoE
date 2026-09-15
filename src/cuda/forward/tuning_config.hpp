@@ -48,6 +48,9 @@
 #ifndef WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS
 #define WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS 1
 #endif
+#ifndef WEFTMOE_FWD_GIN_RECEIVE_ROWS
+#define WEFTMOE_FWD_GIN_RECEIVE_ROWS 128
+#endif
 #ifndef WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT
 #define WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT 3
 #endif
@@ -219,6 +222,8 @@ inline constexpr unsigned kUnifiedControlRegisters = UnifiedResources::kUnifiedC
 inline constexpr unsigned kUnifiedProducerRegisters = UnifiedResources::kUnifiedProducerRegisters;
 inline constexpr unsigned kUnifiedSegmentBytes = UnifiedResources::kUnifiedSegmentBytes;
 inline constexpr unsigned kUnifiedCopyBuffers = UnifiedResources::kUnifiedCopyBuffers;
+inline constexpr unsigned kGinReceiveRows = WEFTMOE_FWD_GIN_RECEIVE_ROWS;
+static_assert(kGinReceiveRows >= 1U && kGinReceiveRows <= 128U);
 inline constexpr unsigned kGinChannelPackLimit =
     WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT;
 static_assert(kGinChannelPackLimit >= 1U && kGinChannelPackLimit <= 8U);

@@ -475,16 +475,12 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
 
 // Bound local fanout work independently of the network packet size. Claim
 // metadata uses a short, nonblocking local lease; no payload copy holds it.
-#ifndef WEFTMOE_FWD_GIN_RECEIVE_ROWS
-#define WEFTMOE_FWD_GIN_RECEIVE_ROWS 128
-#endif
-static_assert(WEFTMOE_FWD_GIN_RECEIVE_ROWS > 0 &&
-              WEFTMOE_FWD_GIN_RECEIVE_ROWS <= ring::kChunkRows);
+static_assert(forward_tuning::kGinReceiveRows <= ring::kChunkRows);
 
 __device__ __forceinline__ bool
 claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
                        wire::Transfer &task) {
-  if constexpr (WEFTMOE_FWD_GIN_RECEIVE_ROWS == ring::kChunkRows)
+  if constexpr (forward_tuning::kGinReceiveRows == ring::kChunkRows)
     return wire::claim_receive(a, cursor, task, true);
   const ncclGin gin(a.gin_dev_comm, 0);
   for (unsigned probe = 0; probe < a.gin_rings.dispatch_channels; ++probe) {
@@ -514,7 +510,7 @@ claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
         static_cast<const char *>(a.gin_window_base) +
         a.gin_rings.payload(channel, sequence, true));
     const unsigned begin = state.dispatch_row_cursor;
-    constexpr unsigned batch = WEFTMOE_FWD_GIN_RECEIVE_ROWS;
+    constexpr unsigned batch = forward_tuning::kGinReceiveRows;
     if (begin == 0U)
       ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
           state.slots[slot].dispatch_parts_remaining)
@@ -537,7 +533,7 @@ claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
 
 __device__ __forceinline__ void
 finish_dispatch_receive(const ForwardKernelArgs &a, const wire::Transfer &task) {
-  if constexpr (WEFTMOE_FWD_GIN_RECEIVE_ROWS < ring::kChunkRows) {
+  if constexpr (forward_tuning::kGinReceiveRows < ring::kChunkRows) {
     auto &slot = ring::channels(a.gin_window_base, a.gin_rings)[task.channel]
                      .slots[task.sequence % ring::kRingDepth];
     // The last finisher acquires every prior completion before publishing

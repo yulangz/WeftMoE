@@ -71,6 +71,7 @@ PARAMETER_MACROS = {
     "fc2_claim_tiles": "WEFTMOE_FWD_FC2_CLAIM_TILES",
     "opportunistic_reduce_warps": "WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS",
     "gin_channel_pack_limit": "WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT",
+    "gin_receive_rows": "WEFTMOE_FWD_GIN_RECEIVE_ROWS",
     "compute_threads": "WEFTMOE_FWD_COMPUTE_THREADS",
     "math_warpgroups": "WEFTMOE_FWD_MATH_WARPGROUPS",
     "producer_warpgroups": "WEFTMOE_FWD_PRODUCER_WARPGROUPS",
@@ -186,6 +187,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     unified_tuning.validate(config)
     _require(1 <= config["opportunistic_reduce_warps"] <= 8,
              "opportunistic_reduce_warps must be in [1, 8]")
+    _require(1 <= config["gin_receive_rows"] <= 128,
+             "gin_receive_rows must be in [1, 128]")
     _require(1 <= config["gin_channel_pack_limit"] <= 8,
              "gin_channel_pack_limit must be in [1, 8]")
     _require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
@@ -298,7 +301,8 @@ def expand_search_space(document: dict[str, Any]) -> None:
     space = copy.deepcopy(document["search_space"])
     unified_tuning.upgrade_legacy_groups(
         space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
-                                          "gin_channel_pack_limit": 3})
+                                          "gin_channel_pack_limit": 3,
+                                          "gin_receive_rows": 128})
     provided = flatten_groups(space, require_all=False)
     # Normalize without reordering axes so candidate names and overrides stay
     # identical when a configuration adopts the new public spelling.
@@ -350,7 +354,8 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
     space = constrain_transport_space(space, topology)
     unified_tuning.upgrade_legacy_groups(
         space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
-                                          "gin_channel_pack_limit": 3})
+                                          "gin_channel_pack_limit": 3,
+                                          "gin_receive_rows": 128})
     flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
@@ -401,7 +406,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
         unified_tuning.upgrade_legacy_groups(
             document.setdefault("fixed", {}),
             extra_defaults={"opportunistic_reduce_warps": 1,
-                            "gin_channel_pack_limit": 3})
+                            "gin_channel_pack_limit": 3,
+                                          "gin_receive_rows": 128})
         document.get("fixed", {}).get("1_gemm", {}).setdefault("fc2_claim_tiles", 1)
         # Historical frozen plans retain this removed tail-only parameter.
         # New pure hyperparameter files reject it as unknown.

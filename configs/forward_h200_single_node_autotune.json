@@ -109,6 +109,9 @@
     ],
     "unified_rdma_ctas": [
       0
+    ],
+    "gin_receive_rows": [
+      128
     ]
   },
   "2_transport": {
