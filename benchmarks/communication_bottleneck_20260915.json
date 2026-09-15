@@ -9933,6 +9933,14 @@
         }
       },
       "finding": "Requested1620MHz does not guarantee constant actual GPC clock. Pure64K sampled interiors remain1615.25-1620.57MHz across8localGPUs. Full FWD baseline andquota4 drop to about1470MHz during the tensor-active interval (all-GPU minima1452MHz), returning near1620 later; both show similar behavior. GPU maximum power limit is700W. Do not infer the active throttling mechanism from these counters alone, or label full FWD as continuously measured at1620MHz."
+    },
+    {
+      "name": "Existing profiles: setup kernel and launch gap",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/existing_profile_setup_durations.json",
+        "results/communication_bottleneck_20260915/existing_profile_setup_launch_gaps.json"
+      ],
+      "finding": "Reused existing Nsight captures; no new GPU run. Across local GPUs pure Qwen8K setup median30.848us and setup-to-unified gap1.280us (160 captured pairs);64K110.512us and1.744us (8pairs);full8K30.656us and1.392us (8pairs). Kernel intervals from CUPTI, same-GPU pairing. The notion that an unavoidable ~300us setup/launch floor explains8K throughput is unsupported; focus remains active transport service, ramp-up and tail. Setup/start timestamps remain included and unchanged."
     }
   ]
 }
