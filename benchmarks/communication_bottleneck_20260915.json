@@ -2656,6 +2656,184 @@
         "repetitions": 12
       },
       "finding": "On incumbent worker scheduling, coalesced dense packing at 128 rows does not improve Qwen EP16 8K Dispatch (23.36 vs 23.47 GB/s). 32/16-row messages with depth16 regress Dispatch and Return; original packet format at 32 rows also regresses. Reject these candidates; isolate ring depth at unchanged 128 rows next."
+    },
+    {
+      "name": "Ring depth and continuously staggered fanout",
+      "adopted": false,
+      "experimental_commit": "3535bc7",
+      "raw_results": "results/communication_bottleneck_20260915/ring_stream_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1436.9299999999998,
+              "fc2": 473.648,
+              "return": 3403.295,
+              "reduce": 2423.04,
+              "forward": 4913.98,
+              "wall": 6329.04
+            },
+            "payload_GBps": {
+              "nv_dispatch": 163.46031052312918,
+              "nv_return": 34.50788485864434,
+              "rdma_dispatch": 23.3514729318756,
+              "rdma_return": 39.437582695593534
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "ring16_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1433.715,
+              "fc2": 451.328,
+              "return": 3452.545,
+              "reduce": 2481.94,
+              "forward": 4955.055,
+              "wall": 6396.665000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 163.82685819706148,
+              "nv_return": 34.0156354225651,
+              "rdma_dispatch": 23.4038368852945,
+              "rdma_return": 38.875011911502966
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "stream_fanout_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1440.48,
+              "fc2": 438.11199999999997,
+              "return": 3426.675,
+              "reduce": 2545.94,
+              "forward": 4926.4349999999995,
+              "wall": 6329.1849999999995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 163.05746973231143,
+              "nv_return": 34.27243960982585,
+              "rdma_dispatch": 23.293924247473065,
+              "rdma_return": 39.16850241122955
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8601.965,
+              "fc2": 3188.67,
+              "return": 23789.449999999997,
+              "reduce": 20528.1,
+              "forward": 31902.75,
+              "wall": 33739.15
+            },
+            "payload_GBps": {
+              "nv_dispatch": 218.44406388540293,
+              "nv_return": 39.49330884068359,
+              "rdma_dispatch": 31.206294840771847,
+              "rdma_return": 45.135210103638386
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "ring16_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8669.42,
+              "fc2": 3028.115,
+              "return": 23776.4,
+              "reduce": 20711.85,
+              "forward": 32045.949999999997,
+              "wall": 33891.45
+            },
+            "payload_GBps": {
+              "nv_dispatch": 216.744394896083,
+              "nv_return": 39.514985279520864,
+              "rdma_dispatch": 30.963484985154714,
+              "rdma_return": 45.159983176595276
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "stream_fanout_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8657.36,
+              "fc2": 2718.21,
+              "return": 23813.85,
+              "reduce": 20761.1,
+              "forward": 31988.55,
+              "wall": 33905.600000000006
+            },
+            "payload_GBps": {
+              "nv_dispatch": 217.04632728684032,
+              "nv_return": 39.45284345034508,
+              "rdma_dispatch": 31.00661818383433,
+              "rdma_return": 45.088963943251514
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Neither ring depth16 at unchanged 128 rows nor continuous fanout prefetch improves Qwen EP16 8K/64K. 64K Dispatch baseline31.21, depth16 30.96, streaming31.01 GB/s. Keep depth8 and original fanout prefetch."
     }
   ],
   "diagnostics": [
