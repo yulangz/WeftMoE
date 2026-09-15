@@ -8616,7 +8616,7 @@
         }
       ],
       "protocol": "Combine private two-slot Dispatch lane prefetch, local Dispatch quota4, remote FC1 priority, synchronized local Return deferral, and per-peer local Return queues. Every GIN Return receive is still serviced each loop. No payload format/volume or completion relaxation.",
-      "finding": "Qwen EP16 8K baseline Dispatch28.868/Return39.824GB/s;2-lane combined32.726/41.247;4-lane combined33.139/41.379. GPU4688.610->4485.340/4470.960us;allocation-inclusive wall6140.600->5950.605/5881.130us.128 sparse files exact over12 native repetitions. Two-lane variant selected for full confirmation because its FC1 pipeline retains4 stages versus3 in four-lane variant;full Qwen8K Forward5065.615->4985.500us (-1.58%),wall6531.240->6375.410us.192 full golden files exact over20 repetitions. BWD/Flash/64K still unvalidated,not adopted.",
+      "finding": "Qwen EP16 8K baseline Dispatch28.868/Return39.824GB/s;2-lane combined32.726/41.247;4-lane combined33.139/41.379. GPU4688.610->4485.340/4470.960us;allocation-inclusive wall6140.600->5950.605/5881.130us.128 sparse files exact over12 native repetitions. Two-lane variant selected for full confirmation because its FC1 pipeline retains4 stages versus3 in four-lane variant;full Qwen8K Forward5065.615->4985.500us (-1.58%),wall6531.240->6375.410us.192 full golden files exact over20 repetitions. BWD/Flash and full64K still unvalidated,not adopted. Pure Qwen64K: Dispatch34.086->40.220GB/s,Return45.699->46.126;GPU31265.250->29971.950us.64 prefix files exact with20 native repeated outputs;still below42GB/s Dispatch.",
       "full_confirmation": {
         "raw_results": "results/communication_bottleneck_20260915/balanced_dispatch_lanes2_training",
         "cases": [
@@ -8687,6 +8687,85 @@
             "repetitions": 20
           }
         ],
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          },
+          {
+            "node": "remote",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          }
+        ]
+      },
+      "pure_64k_confirmation": {
+        "raw_results": "results/communication_bottleneck_20260915/balanced_dispatch_lanes2_64k",
+        "cases": [
+          {
+            "name": "targeted_flush_ep16_65536",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 7875.1849999999995,
+                "fc2": 2942.305,
+                "return": 23495.75,
+                "reduce": 20555.1,
+                "forward": 31265.25,
+                "wall": 33073.15
+              },
+              "payload_GBps": {
+                "nv_dispatch": 238.6036889292125,
+                "nv_return": 39.986980453911876,
+                "rdma_dispatch": 34.08624127560178,
+                "rdma_return": 45.69940623304215
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 65536,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "balanced_dispatch_lanes2_ep16_65536",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 6674.145,
+                "fc2": 2312.335,
+                "return": 23278.5,
+                "reduce": 20941.9,
+                "forward": 29971.95,
+                "wall": 31760.4
+              },
+              "payload_GBps": {
+                "nv_dispatch": 281.54140972364246,
+                "nv_return": 40.36016478725004,
+                "rdma_dispatch": 40.220201389091784,
+                "rdma_return": 46.12590261400004
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 65536,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 65536,
+          "repetitions": 20
+        },
         "clock_cleanup": [
           {
             "node": "local",
