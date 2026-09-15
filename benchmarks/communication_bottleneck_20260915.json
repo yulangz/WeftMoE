@@ -4738,6 +4738,130 @@
         }
       ],
       "finding": "Qwen EP16 8K Return baseline2ports39.434,1port33.536,4ports31.940 GB/s. Keep two Return contexts per peer. Wire payload rows128, ring depth8 and RX32 unchanged; context allocation and channel/credit mappings scale consistently. Both alternatives pass128 sparse golden files. No full-model sweep warranted."
+    },
+    {
+      "name": "Bounded destination-ordered Dispatch fanout",
+      "adopted": false,
+      "experimental_commit": "5691e73",
+      "raw_results": "results/communication_bottleneck_20260915/sorted_dispatch_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 192,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.66,
+              "fc2": 571.7919999999999,
+              "return": 3408.785,
+              "reduce": 2514.895,
+              "forward": 4737.375,
+              "wall": 6178.59
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.8467799872815,
+              "nv_return": 34.45230837380474,
+              "rdma_dispatch": 28.835254283897356,
+              "rdma_return": 39.37406671291971
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fanout_flat_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1185.6,
+              "fc2": 581.856,
+              "return": 3405.87,
+              "reduce": 2510.91,
+              "forward": 4754.72,
+              "wall": 6236.135
+            },
+            "payload_GBps": {
+              "nv_dispatch": 198.1115249662618,
+              "nv_return": 34.48179525348883,
+              "rdma_dispatch": 28.301646423751688,
+              "rdma_return": 39.407766003987234
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fanout_sort128_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1231.36,
+              "fc2": 596.0,
+              "return": 3447.985,
+              "reduce": 2400.99,
+              "forward": 4799.695,
+              "wall": 6189.23
+            },
+            "payload_GBps": {
+              "nv_dispatch": 190.74927234927236,
+              "nv_return": 34.06062149342297,
+              "rdma_dispatch": 27.24989604989605,
+              "rdma_return": 38.926424563911965
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fanout_sort256_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1274.45,
+              "fc2": 579.824,
+              "return": 3425.76,
+              "reduce": 2443.105,
+              "forward": 4860.88,
+              "wall": 6315.3
+            },
+            "payload_GBps": {
+              "nv_dispatch": 184.29991290360547,
+              "nv_return": 34.28159357339685,
+              "rdma_dispatch": 26.328558986229353,
+              "rdma_return": 39.178964083882114
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K Dispatch baseline28.835, flat per-target reload28.302, sort12827.250, sort25626.329 GB/s. Bounded sort reuses existing staging and unused wire metadata; no RDMA payload expansion. Existing receiver already combines same-target notifications within each active warp. Sorting cost and per-fanout source reloads outweigh any locality benefit at these tested windows. Reject these candidates; no large full-model sweep."
     }
   ],
   "diagnostics": [
