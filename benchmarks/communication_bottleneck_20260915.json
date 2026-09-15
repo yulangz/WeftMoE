@@ -6522,7 +6522,73 @@
         "route_stride": 1,
         "repetitions": 12
       },
-      "finding": "A4-entry shared queue hands fully completed copies to the publisher warp. Received descriptors retain GIN credits until publication finishes; Dispatch completion waits for queue drain. Copy backpressure checks cancellation and generation errors. Single-node queue polling compiled out. Qwen EP16 8K1620MHz baseline Dispatch28.892/Return39.781GB/s; received notifications queued29.687/39.897; received+local queued30.192/39.830.128 sparse files byte-identical across2 variants,12 repetitions. Queue implementation is experimental; full Forward and64K ring-wrap validation remain necessary. Optional split-local caller template was subsequently corrected in568028b/dc2909a without changing the tested GIN paths."
+      "finding": "A4-entry shared queue hands fully completed copies to the publisher warp. Received descriptors retain GIN credits until publication finishes; Dispatch completion waits for queue drain. Copy backpressure checks cancellation and generation errors. Single-node queue polling compiled out. Qwen EP16 8K1620MHz baseline Dispatch28.892/Return39.781GB/s; received notifications queued29.687/39.897; received+local queued30.192/39.830.128 sparse files byte-identical across2 variants,12 repetitions. Queue implementation is experimental; full Forward and64K ring-wrap validation remain necessary. Optional split-local caller template was subsequently corrected in568028b/dc2909a without changing the tested GIN paths.",
+      "full_forward_confirmation": {
+        "source_commit": "dc2909a",
+        "raw_results": "results/communication_bottleneck_20260915/all_dispatch_pub_queue_training",
+        "cases": [
+          {
+            "name": "targeted_flush_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1476.735,
+                "fc2": 2179.535,
+                "return": 4236.99,
+                "reduce": 2611.17,
+                "forward": 5079.665,
+                "wall": 6596.705
+              },
+              "payload_GBps": {
+                "nv_dispatch": 159.05428123529273,
+                "nv_return": 27.71791106422248,
+                "rdma_dispatch": 22.72204017647039,
+                "rdma_return": 31.67761264482569
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "all_dispatch_pub_queue_production_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1438.6750000000002,
+                "fc2": 2176.6899999999996,
+                "return": 4436.925,
+                "reduce": 2642.91,
+                "forward": 5264.385,
+                "wall": 6841.945
+              },
+              "payload_GBps": {
+                "nv_dispatch": 163.2620459798078,
+                "nv_return": 26.468897265561168,
+                "rdma_dispatch": 23.32314942568683,
+                "rdma_return": 30.25016830349848
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": {
+          "files_compared": 128,
+          "all_byte_identical": true,
+          "repetitions": 20
+        },
+        "finding": "Qwen EP16 8K retained full Forward regresses from 5079.665 to 5264.385 us (+3.64%); wall 6596.705 to 6841.945 us. Dispatch improves 1476.735 to 1438.675 us but Return grows 4236.990 to 4436.925 us. Reject shared-publisher version for production; test a dedicated Dispatch publisher separately. 128 prefix files byte-identical across baseline/candidate; 20 repeated runs passed."
+      }
     }
   ],
   "diagnostics": [
