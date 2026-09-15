@@ -8,7 +8,8 @@
     "sm_clock_mhz": 1620,
     "power_limit_w": 700,
     "recurring_tensor_allocation_in_wall": true,
-    "reusable_buffer_context_allocation_excluded": true
+    "reusable_buffer_context_allocation_excluded": true,
+    "sm_clock_mhz_is_requested_lock": true
   },
   "experiments": [
     {
@@ -7489,6 +7490,37 @@
         }
       ],
       "finding": "Neither local-only nor received-only independence materially improves Qwen EP16 8K pure Dispatch at1620MHz; both remain about28.5-28.9GB/s.128 sparse comparison files exact over12 repetitions. No full Forward/BWD or64K validation; retain baseline. Removing this cross-warp publication join alone does not close the bandwidth gap."
+    },
+    {
+      "name": "Defer local NVLink Return until Dispatch completion",
+      "adopted": false,
+      "source": "/tmp/weftmoe-dispatch-priority-local-return",
+      "initial_commit": "80b56da",
+      "fixed_commit": "d55636e",
+      "initial_raw_results": "results/communication_bottleneck_20260915/dispatch_priority_return_q4_training",
+      "initial_result": {
+        "cases": [
+          {
+            "name": "targeted_flush_production_ep16_8192",
+            "returncode": 0
+          },
+          {
+            "name": "dispatch_priority_return_q4_production_ep16_8192",
+            "returncode": 124
+          }
+        ],
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0
+          },
+          {
+            "node": "remote",
+            "rc": 0
+          }
+        ]
+      },
+      "finding": "Initial full8K candidate timed out. Code review found a nonuniform conditional-barrier hazard: leader may update shared dispatch_complete before slower copy warps decide whether to call progress_return. Fixed by capturing eligibility before the existing loop-start copy barrier. Fixed binary validation pending. No source adopted and no performance gain claimed."
     }
   ],
   "diagnostics": [
@@ -8419,6 +8451,142 @@
       "figure": "results/communication_bottleneck_20260915/full_dispatch_ratio_metrics.png",
       "limitations": "10kHz Nsight Systems gh100 metrics,CUDA event tracing disabled,no replay,one final iteration on8 local GPUs. Full FWD phases overlap. Per-GPU setup origins and own Dispatch durations only. Threshold gaps are not exact NIC idle durations; high-flow return attribution is inferred from timing and identical workloads, not packet tracing. cudaProfilerStart caused a large last-iteration host Notify delay, so profiled wall time is not production timing. Both20-repeat native checks passed; existing unprofiled pair supplies regression evidence.",
       "finding": "Profiled run medians reproduce total FWD5072.255->5834.130us while FC2 interval2201.055->2161.920us. On captured local GPUs, fused kernel4770us->5495us and lastTensor>=1% to kernel end2251-2342us->3010-3100us. First PCIeTX>=70% segment to next such segment gap400-700us->1100-1400us. GPU0 plot shows earlier NVLink Return activity and delayed sustained second PCIe flow. Evidence supports a scheduling/output-supply bubble rather than slower GEMM throughput alone. Next causal test defers local NVLink Return until Dispatch completion, while maintaining GIN Return receive service."
+    },
+    {
+      "name": "Requested GPU clock versus sampled clock during fused Forward",
+      "raw_results": "results/communication_bottleneck_20260915/sampled_gpc_clock.json",
+      "evidence": {
+        "scope": "Nsight Systems GPC clock metric gpc__cycles_elapsed.avg.per_second,converted from rawHz toMHz. Interior excludes200us at kernel ends. Locked setting1620MHz and700W; observed clock is not guaranteed by lock request. Counter minima do not establish which limiter was active. nvidia-smi reports700W as maximum on these GPUs.",
+        "variants": {
+          "targeted_flush": {
+            "0": {
+              "interior_min_mhz": 1468.805,
+              "interior_max_mhz": 1620.548576,
+              "fraction_below1600": 0.5
+            },
+            "1": {
+              "interior_min_mhz": 1453.25375,
+              "interior_max_mhz": 1620.05625,
+              "fraction_below1600": 0.5
+            },
+            "2": {
+              "interior_min_mhz": 1467.1025,
+              "interior_max_mhz": 1619.8775,
+              "fraction_below1600": 0.4772727272727273
+            },
+            "3": {
+              "interior_min_mhz": 1452.1775,
+              "interior_max_mhz": 1619.66625,
+              "fraction_below1600": 0.4772727272727273
+            },
+            "4": {
+              "interior_min_mhz": 1467.87,
+              "interior_max_mhz": 1620.01875,
+              "fraction_below1600": 0.4318181818181818
+            },
+            "5": {
+              "interior_min_mhz": 1467.36625,
+              "interior_max_mhz": 1619.94875,
+              "fraction_below1600": 0.4318181818181818
+            },
+            "6": {
+              "interior_min_mhz": 1453.10375,
+              "interior_max_mhz": 1620.0275,
+              "fraction_below1600": 0.4772727272727273
+            },
+            "7": {
+              "interior_min_mhz": 1468.25625,
+              "interior_max_mhz": 1620.02375,
+              "fraction_below1600": 0.5
+            }
+          },
+          "dispatch_ratio_q4": {
+            "0": {
+              "interior_min_mhz": 1468.0925,
+              "interior_max_mhz": 1620.03875,
+              "fraction_below1600": 0.4
+            },
+            "1": {
+              "interior_min_mhz": 1453.7625,
+              "interior_max_mhz": 1620.0525,
+              "fraction_below1600": 0.4117647058823529
+            },
+            "2": {
+              "interior_min_mhz": 1467.8725,
+              "interior_max_mhz": 1619.90625,
+              "fraction_below1600": 0.4117647058823529
+            },
+            "3": {
+              "interior_min_mhz": 1451.93875,
+              "interior_max_mhz": 1619.6325,
+              "fraction_below1600": 0.43137254901960786
+            },
+            "4": {
+              "interior_min_mhz": 1468.53625,
+              "interior_max_mhz": 1620.516065,
+              "fraction_below1600": 0.43137254901960786
+            },
+            "5": {
+              "interior_min_mhz": 1466.704405,
+              "interior_max_mhz": 1620.418534,
+              "fraction_below1600": 0.43137254901960786
+            },
+            "6": {
+              "interior_min_mhz": 1453.234965,
+              "interior_max_mhz": 1620.523568,
+              "fraction_below1600": 0.43137254901960786
+            },
+            "7": {
+              "interior_min_mhz": 1466.8075,
+              "interior_max_mhz": 1620.025,
+              "fraction_below1600": 0.4117647058823529
+            }
+          },
+          "pure_64k": {
+            "0": {
+              "interior_min_mhz": 1619.95375,
+              "interior_max_mhz": 1620.03375,
+              "fraction_below1600": 0.0
+            },
+            "1": {
+              "interior_min_mhz": 1619.286828,
+              "interior_max_mhz": 1620.492308,
+              "fraction_below1600": 0.0
+            },
+            "2": {
+              "interior_min_mhz": 1619.189359,
+              "interior_max_mhz": 1620.414783,
+              "fraction_below1600": 0.0
+            },
+            "3": {
+              "interior_min_mhz": 1615.2475,
+              "interior_max_mhz": 1619.51125,
+              "fraction_below1600": 0.0
+            },
+            "4": {
+              "interior_min_mhz": 1619.92875,
+              "interior_max_mhz": 1620.03875,
+              "fraction_below1600": 0.0
+            },
+            "5": {
+              "interior_min_mhz": 1619.180612,
+              "interior_max_mhz": 1620.477303,
+              "fraction_below1600": 0.0
+            },
+            "6": {
+              "interior_min_mhz": 1619.445527,
+              "interior_max_mhz": 1620.573584,
+              "fraction_below1600": 0.0
+            },
+            "7": {
+              "interior_min_mhz": 1619.96,
+              "interior_max_mhz": 1620.03625,
+              "fraction_below1600": 0.0
+            }
+          }
+        }
+      },
+      "finding": "Requested1620MHz does not guarantee constant actual GPC clock. Pure64K sampled interiors remain1615.25-1620.57MHz across8localGPUs. Full FWD baseline andquota4 drop to about1470MHz during the tensor-active interval (all-GPU minima1452MHz), returning near1620 later; both show similar behavior. GPU maximum power limit is700W. Do not infer the active throttling mechanism from these counters alone, or label full FWD as continuously measured at1620MHz."
     }
   ]
 }
