@@ -6827,6 +6827,77 @@
         },
         "finding": "Qwen EP16 8K1620MHz baseline Dispatch29.001GB/s, Return39.830; candidate Dispatch24.435, Return39.034. Larger batching/depth only partially recovers the initial queue regression; reject both versions, no full-model sweep."
       }
+    },
+    {
+      "name": "Reuse local Dispatch input once per token across same-node destinations",
+      "adopted": false,
+      "source_commit": "06c7719",
+      "raw_results": "results/communication_bottleneck_20260915/local_token_fanout_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.4099999999999,
+              "fc2": 549.648,
+              "return": 3372.765,
+              "reduce": 2513.94,
+              "forward": 4691.1849999999995,
+              "wall": 6108.575000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.2378178248853,
+              "nv_return": 34.82024748240687,
+              "rdma_dispatch": 28.89111683212647,
+              "rdma_return": 39.794568551322136
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        },
+        {
+          "name": "local_token_fanout_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1151.315,
+              "fc2": 571.28,
+              "return": 3377.615,
+              "reduce": 2319.33,
+              "forward": 4699.52,
+              "wall": 6182.26
+            },
+            "payload_GBps": {
+              "nv_dispatch": 204.0110864533164,
+              "nv_return": 34.7702482372917,
+              "rdma_dispatch": 29.144440921902344,
+              "rdma_return": 39.7374265569048
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "implementation": "GIN local Dispatch groups8 source tokens per CTA batch, each copy warp loads an input segment once and pushes it to all same-node routes; empty local fanouts skipped. Existing2 copywarps/shared storage/registers unchanged. Full TMA completion, SYS fences and original arrival counters retained. Canonical rows and route identities unchanged. EP8 and GIN receive fanout remain on original paths.",
+      "finding": "Qwen EP16 8K1620MHz Dispatch28.891->29.144GB/s (+0.88%); Return39.795->39.737GB/s; pure GPU4691.185->4699.520us. Source reuse plus token-order traversal is not enough to materially improve throughput; not adopted and no full-model sweep. Token traversal also changes destination locality and readiness aggregation, so this is not an isolated measurement of input-load cost.64 sparse files byte-identical,12 repetitions. Next causal candidate: aggregate local token-order readiness across the complete source contribution to each canonical M-tile before issuing one remote arrival update; exact per-source expectations need derivation from route materialization."
     }
   ],
   "diagnostics": [
