@@ -7753,6 +7753,281 @@
         }
       ],
       "finding": "Qwen EP16 8K matched baseline Forward5048.290us, remote FC1 priority q14995.695us (-1.04%), q45487.805us (+8.71%). FC2 intervals2193.985->1951.570/1932.060us, but q4 Return remains4635.340us vs4238.785us baseline.320 golden files exact across129/8K;20 native repetitions each. No BWD/Flash/64K/pure validation and no adoption. Next isolate combination with the synchronized local Return deferral; FC2 interval reduction is not a standalone GEMM throughput claim."
+    },
+    {
+      "name": "Cumulative GIN channel credits",
+      "source": "/tmp/weftmoe-gin-cumulative-credit",
+      "source_commit": "7b9ccb1",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/cumulative_credit_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1168.595,
+              "fc2": 573.04,
+              "return": 3373.2650000000003,
+              "reduce": 2482.1949999999997,
+              "forward": 4682.415,
+              "wall": 6110.71
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.99437700828773,
+              "nv_return": 34.815086273980846,
+              "rdma_dispatch": 28.71348242975539,
+              "rdma_return": 39.788670027406674
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "cumulative_credit_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.4099999999999,
+              "fc2": 545.488,
+              "return": 3360.0299999999997,
+              "reduce": 2394.96,
+              "forward": 4668.88,
+              "wall": 6050.610000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.2378178248853,
+              "nv_return": 34.95222125992923,
+              "rdma_dispatch": 28.89111683212647,
+              "rdma_return": 39.945395725633404
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K Dispatch28.713->28.891GB/s, Return39.789->39.945GB/s. Gains below1%; no adoption or full/BWD/64K sweep. One cumulative signal returns a consumed prefix, retaining out-of-order reader completion and per-slot local send completion.64 sparse files exact over12 native repetitions;1000 randomized protocol schedules passed."
+    },
+    {
+      "name": "Larger local Dispatch service quotas",
+      "source": "/tmp/weftmoe-dispatch-service-ratio",
+      "source_commit": "6dc25ac",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_service_ratio_larger_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.97,
+              "fc2": 537.2,
+              "return": 3379.395,
+              "reduce": 2449.89,
+              "forward": 4678.530000000001,
+              "wall": 6108.09
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.1403512999475,
+              "nv_return": 34.75193400002072,
+              "rdma_dispatch": 28.87719304284964,
+              "rdma_return": 39.716496000023675
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_ratio_q8_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1075.9850000000001,
+              "fc2": 572.576,
+              "return": 3362.1099999999997,
+              "reduce": 2350.5600000000004,
+              "forward": 4636.26,
+              "wall": 6085.174999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 218.29395762952083,
+              "nv_return": 34.93059774962747,
+              "rdma_dispatch": 31.18485108993155,
+              "rdma_return": 39.92068314243139
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_ratio_q16_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1070.4,
+              "fc2": 590.992,
+              "return": 3357.0550000000003,
+              "reduce": 2555.78,
+              "forward": 4620.05,
+              "wall": 6073.07
+            },
+            "payload_GBps": {
+              "nv_dispatch": 219.43294469357247,
+              "nv_return": 34.98319568788715,
+              "rdma_dispatch": 31.34756352765321,
+              "rdma_return": 39.98079507187103
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Quotas8/16 do not exceed the earlier quota4 result on8K. Exact measurements retained below;no full/64K sweep justified.128 sparse files exact over12 native repetitions;Return service stays on every loop."
+    },
+    {
+      "name": "Remote FC1 priority combined with local Return deferral",
+      "source": "/tmp/weftmoe-remote-fc1-priority-defer",
+      "source_commit": "005fd6a",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/remote_fc1_priority_defer_training",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1480.705,
+              "fc2": 2193.505,
+              "return": 4253.265,
+              "reduce": 2621.6800000000003,
+              "forward": 5080.945,
+              "wall": 6544.155
+            },
+            "payload_GBps": {
+              "nv_dispatch": 158.62783201245352,
+              "nv_return": 27.611849249929172,
+              "rdma_dispatch": 22.661118858921935,
+              "rdma_return": 31.556399142776193
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "remote_fc1_priority_defer_q4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1270.435,
+              "fc2": 1896.495,
+              "return": 3733.3450000000003,
+              "reduce": 2717.9399999999996,
+              "forward": 5098.6849999999995,
+              "wall": 6520.38
+            },
+            "payload_GBps": {
+              "nv_dispatch": 184.8823623404582,
+              "nv_return": 31.4571816963072,
+              "rdma_dispatch": 26.411766048636885,
+              "rdma_return": 35.95106479577965
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": [
+        {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "repetitions": 20
+        },
+        {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "repetitions": 20
+        }
+      ],
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K matched baseline Forward5080.945us vs combined5098.685us (+0.35%);wall6544.155->6520.380us. Dispatch1480.705->1270.435us,FC2 interval2193.505->1896.495us,Return4253.265->3733.345us. Combination removes most of the quota4 full regression;one pair does not establish a full Forward win.192 golden files exact at129/8K with20 repetitions. Pure confirmation building;BWD,Flash,EP8 and64K unvalidated;not adopted."
     }
   ],
   "diagnostics": [
