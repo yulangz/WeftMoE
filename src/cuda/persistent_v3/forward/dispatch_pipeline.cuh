@@ -315,73 +315,101 @@ advance_input_group(const ForwardKernelArgs &a,
 // its local queue; completed groups are removed and expanded into the shared,
 // device-local FC1 task queue. Copy workers only update the existing per-rail
 // arrival counters, without consulting or modifying either queue.
+struct Fc1PublisherState {
+  persistent_v3::ForwardInputPendingQueue pending;
+  unsigned long long remaining = 0ULL;
+};
+
 __device__ __forceinline__ void
-publish_ready_fc1_tasks(const ForwardKernelArgs &a, std::uint32_t context,
-                        std::uint32_t publisher_count,
-                        unsigned long long *scheduler) {
+init_fc1_publisher(const ForwardKernelArgs &a, std::uint32_t context,
+                   std::uint32_t publisher_count,
+                   unsigned long long *scheduler, Fc1PublisherState &state) {
   const auto forward_mblocks = scheduler[3];
+  auto *groups = peer_at<persistent_v3::ForwardInputGroup>(
+      a.local_base, a.forward_input_groups_offset);
+  state = Fc1PublisherState{};
+  for (unsigned long long mblock = context; mblock < forward_mblocks;
+       mblock += publisher_count) {
+    if (groups[mblock].mblocks == 0U)
+      continue;
+    state.pending.push(groups, mblock);
+    ++state.remaining;
+  }
+}
+
+// One finite group attempt never waits for missing input. The owner can
+// interleave this step with Return receives while preserving each group's
+// acquired tile cursor and its original task publication order.
+__device__ __forceinline__ bool
+progress_fc1_publisher(const ForwardKernelArgs &a,
+                       unsigned long long *scheduler, Fc1PublisherState &state) {
+  if (state.pending.empty())
+    return false;
   const auto ntiles = static_cast<std::uint32_t>(
       (a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
       forward_tuning::kFc1TileN);
   auto *groups = peer_at<persistent_v3::ForwardInputGroup>(
       a.local_base, a.forward_input_groups_offset);
-  auto *claims =
-      peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
-  auto *ready_queue = claims + forward_mblocks;
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-      scheduler[12ULL + 2ULL * a.world]);
-  persistent_v3::ForwardInputPendingQueue pending;
-  unsigned long long remaining = 0ULL;
-  for (unsigned long long mblock = context; mblock < forward_mblocks;
-       mblock += publisher_count) {
-    if (groups[mblock].mblocks == 0U)
-      continue;
-    pending.push(groups, mblock);
-    ++remaining;
+  const auto mblock = state.pending.head;
+  auto &group = groups[mblock];
+  const bool ready = advance_input_group(a, group);
+  if (ready) {
+    auto *claims =
+        peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
+    auto *ready_queue = claims + scheduler[3];
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
+        scheduler[12ULL + 2ULL * a.world]);
+    // Acquires for completed tiles survive queue rotations. The local
+    // queue's release stores pass payload visibility to the compute CTA.
+    const auto begin = tail.fetch_add(1ULL * group.mblocks * ntiles,
+                                      ::cuda::memory_order_relaxed);
+    for (std::uint32_t position = 0; position < group.mblocks * ntiles;
+         ++position) {
+      const auto task =
+          persistent_v3::fc1_group_task(position, group.mblocks, ntiles);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          entry(ready_queue[begin + position]);
+      entry.store(1ULL * (mblock + task.member) * ntiles + task.ntile + 1ULL,
+                  ::cuda::memory_order_release);
+    }
+    --state.remaining;
+#if WEFTMOE_DEBUG_VALIDATE
+    auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
+        a.peer_bases[a.world]);
+    atomicMax(&completion->bulk_pack_complete,
+              begin + 1ULL * group.mblocks * ntiles);
+#endif
   }
+  state.pending.advance(groups, ready);
+  return ready;
+}
+
+__device__ __forceinline__ void
+finish_fc1_publisher(const ForwardKernelArgs &a, std::uint32_t context) {
 #if WEFTMOE_DEBUG_VALIDATE
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
-#endif
-  while (!pending.empty() && !forward_cancelled(a)) {
-    bool progressed = false;
-    auto attempts = remaining;
-    while (attempts-- != 0ULL && !pending.empty()) {
-      const auto mblock = pending.head;
-      auto &group = groups[mblock];
-      const bool ready = advance_input_group(a, group);
-      if (ready) {
-        // Acquires for completed tiles survive queue rotations. The local
-        // queue's release stores pass payload visibility to the compute CTA.
-        const auto begin = tail.fetch_add(1ULL * group.mblocks * ntiles,
-                                          ::cuda::memory_order_relaxed);
-        for (std::uint32_t position = 0; position < group.mblocks * ntiles;
-             ++position) {
-          const auto task =
-              persistent_v3::fc1_group_task(position, group.mblocks, ntiles);
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-              entry(ready_queue[begin + position]);
-          entry.store(1ULL * (mblock + task.member) * ntiles + task.ntile +
-                          1ULL,
-                      ::cuda::memory_order_release);
-        }
-        --remaining;
-        progressed = true;
-#if WEFTMOE_DEBUG_VALIDATE
-        atomicMax(&completion->bulk_pack_complete,
-                  begin + 1ULL * group.mblocks * ntiles);
-#endif
-      }
-      pending.advance(groups, ready);
-    }
-    if (!progressed)
-      __nanosleep(forward_tuning::kSetupNanosleep);
-  }
-#if WEFTMOE_DEBUG_VALIDATE
   // This bitmap marks active publisher buckets; exact completion is carried
   // by the finite task queue, not by counting bits when publishers exceed 64.
   atomicOr(&completion->bulk_contexts_issuing, 1ULL << (context & 63U));
 #endif
+}
+
+__device__ __forceinline__ void
+publish_ready_fc1_tasks(const ForwardKernelArgs &a, std::uint32_t context,
+                        std::uint32_t publisher_count,
+                        unsigned long long *scheduler) {
+  Fc1PublisherState state;
+  init_fc1_publisher(a, context, publisher_count, scheduler, state);
+  while (!state.pending.empty() && !forward_cancelled(a)) {
+    bool progressed = false;
+    auto attempts = state.remaining;
+    while (attempts-- != 0ULL && !state.pending.empty())
+      progressed = progress_fc1_publisher(a, scheduler, state) || progressed;
+    if (!progressed)
+      __nanosleep(forward_tuning::kSetupNanosleep);
+  }
+  finish_fc1_publisher(a, context);
 }
 #if defined(WEFTMOE_FORWARD_TRANSPORT_TU)
 

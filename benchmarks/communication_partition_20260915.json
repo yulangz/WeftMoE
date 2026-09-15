@@ -1,0 +1,106 @@
+{
+  "stages": [
+    {
+      "stage": "bounded FC1 publisher and alternating Return notification receive",
+      "baseline_commit": "8ea9c0f",
+      "candidate": "source accompanying this record",
+      "source_diff_sha256": "b57cb710cd4d61223cf3ad4bd35cc07ea8a0e3b647767a40c63336264fc3ca20",
+      "settings": {
+        "sm_clock_mhz": 1620,
+        "power_limit_w": 700,
+        "warmup_rounds": 10,
+        "measured_rounds": 10,
+        "statistics": "median of per-iteration slowest rank",
+        "recurring_tensor_allocation_in_wall": true,
+        "reusable_context_and_buffer_allocation_excluded": true
+      },
+      "raw_results": "results/communication_optimization_20260915/publisher_step",
+      "validation": {
+        "files_compared": 96,
+        "all_byte_identical": true,
+        "ep": [
+          8,
+          16
+        ],
+        "tokens": 8192,
+        "repetitions": 20
+      },
+      "cpu_tests": "37 unified tests passed",
+      "cases": [
+        {
+          "name": "assist_cleanup_ep8_8k",
+          "ep": 8,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.186c5bc684527a2d0a8a8be0749ba86fedf2133d60d999ff63c15ff3be30423b/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2017.23,
+            "fc2": 2266.5950000000003,
+            "return": 2392.5950000000003,
+            "reduce": 754.144,
+            "forward": 2804.96,
+            "wall": 3670.535
+          }
+        },
+        {
+          "name": "assist_cleanup_ep16_8k",
+          "ep": 16,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.186c5bc684527a2d0a8a8be0749ba86fedf2133d60d999ff63c15ff3be30423b/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2185.135,
+            "fc2": 2304.56,
+            "return": 4697.345,
+            "reduce": 2759.06,
+            "forward": 5436.35,
+            "wall": 6794.1
+          }
+        },
+        {
+          "name": "publisher_step_ep8_8k",
+          "ep": 8,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.b37969db54f5bcdaca8443a4429d2ce0529f9afbb789bf270313c4e6ff98d3ae/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1898.77,
+            "fc2": 2245.535,
+            "return": 2378.545,
+            "reduce": 712.864,
+            "forward": 2785.985,
+            "wall": 3668.865
+          }
+        },
+        {
+          "name": "publisher_step_ep16_8k",
+          "ep": 16,
+          "tokens": 8192,
+          "rounds": 20,
+          "retain": true,
+          "check": true,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.b37969db54f5bcdaca8443a4429d2ce0529f9afbb789bf270313c4e6ff98d3ae/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 2100.4,
+            "fc2": 2306.9449999999997,
+            "return": 4750.86,
+            "reduce": 2740.5299999999997,
+            "forward": 5511.645,
+            "wall": 7017.205
+          }
+        }
+      ],
+      "conclusion": "No demonstrated speedup. This stage removes blocking FC1 publication before independent notification progress; EP16 short-screen GPU time regressed 1.4%. No BWD numerical changes or new BWD run in this stage."
+    }
+  ]
+}

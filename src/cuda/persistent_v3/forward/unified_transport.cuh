@@ -600,29 +600,36 @@ drain_notifications(const ForwardKernelArgs &a) {
 
 #include "cuda/persistent_v3/forward/unified_gin.cuh"
 
-// Publish input groups, then apply completed incoming Return notifications
-// until the copy workers finish draining their channels.
+// Alternate finite FC1 group attempts with Return receives. Missing Dispatch
+// input must never prevent this warp from returning notification credits.
 template <class Storage>
 __device__ __forceinline__ void
 run_publisher(const ForwardKernelArgs &a,
-               persistent_v3::ForwardPipelineControl &control,
-               unsigned long long *scheduler, Storage &s) {
+              persistent_v3::ForwardPipelineControl &control,
+              unsigned long long *scheduler, Storage &s) {
   const unsigned lane = threadIdx.x % 32U;
+  forward_dispatch_detail::Fc1PublisherState publisher;
   if (lane == 0U)
-    forward_dispatch_detail::publish_ready_fc1_tasks(a, blockIdx.x, gridDim.x,
-                                                     scheduler);
+    forward_dispatch_detail::init_fc1_publisher(a, blockIdx.x, gridDim.x,
+                                               scheduler, publisher);
   __syncwarp();
   while (true) {
-    unsigned done = 0U;
-    if (lane == 0U)
-      done = ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
-                 s.copies_done).load(::cuda::memory_order_acquire) != 0U ||
-             cancelled(a, control);
+    unsigned done = 0U, published = 0U;
+    if (lane == 0U) {
+      published = forward_dispatch_detail::progress_fc1_publisher(
+          a, scheduler, publisher);
+      done = (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
+                  s.copies_done).load(::cuda::memory_order_acquire) != 0U &&
+              publisher.pending.empty()) || cancelled(a, control);
+    }
     if (__shfl_sync(0xffffffffU, done, 0U))
       break;
-    if (!local_notification_detail::progress(a))
+    const bool received = local_notification_detail::progress(a);
+    if (!__shfl_sync(0xffffffffU, published, 0U) && !received)
       __nanosleep(50U);
   }
+  if (lane == 0U)
+    forward_dispatch_detail::finish_fc1_publisher(a, blockIdx.x);
 }
 
 template <bool UseGin, unsigned BaseThread, class Storage>
