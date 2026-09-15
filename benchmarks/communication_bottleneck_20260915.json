@@ -7376,6 +7376,119 @@
         }
       ],
       "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.579/Return39.772GB/s; ticket32 28.859/39.747; ticket48 28.549/39.859. About1% Dispatch gain at matched32 rows is insufficient to adopt the new protocol.128 sparse comparison files exact over12 native repetitions, including48-row partitions with a32-row final unit. No full Forward/BWD or64K validation; no claim of overall correctness or benefit. Lower priority for receive lease contention as the dominant bottleneck."
+    },
+    {
+      "name": "Independent Dispatch copy-warp publication without prefetch changes",
+      "adopted": false,
+      "source_commit": "fd0647c",
+      "source": "/tmp/weftmoe-dispatch-independent-copy-warps",
+      "raw_results": "results/communication_bottleneck_20260915/independent_dispatch_warps_screen",
+      "protocol": "Isolate local contiguous per-warp row partitions and received per-warp ready publication. Each issuer retains full global TMA completion and SYS fence, then a warp join precedes its own readiness. Received tasks still join all copy warps before returning NIC credit. No prefetch, Return path, resource allocation or service-ratio changes.",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.235,
+              "fc2": 558.0160000000001,
+              "return": 3373.965,
+              "reduce": 2508.16,
+              "forward": 4675.76,
+              "wall": 6090.280000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.9205268067072,
+              "nv_return": 34.80786315210739,
+              "rdma_dispatch": 28.84578954381531,
+              "rdma_return": 39.780415030979874
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "independent_local_dispatch_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1175.5700000000002,
+              "fc2": 584.1759999999999,
+              "return": 3381.6800000000003,
+              "reduce": 2543.745,
+              "forward": 4711.424999999999,
+              "wall": 6109.27
+            },
+            "payload_GBps": {
+              "nv_dispatch": 199.80181869220885,
+              "nv_return": 34.728452130302095,
+              "rdma_dispatch": 28.543116956029838,
+              "rdma_return": 39.68965957748811
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "independent_received_dispatch_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.9650000000001,
+              "fc2": 561.296,
+              "return": 3369.23,
+              "reduce": 2535.09,
+              "forward": 4664.995,
+              "wall": 6057.74
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.1412211211181,
+              "nv_return": 34.856780926205694,
+              "rdma_dispatch": 28.87731730301687,
+              "rdma_return": 39.836321058520795
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "finding": "Neither local-only nor received-only independence materially improves Qwen EP16 8K pure Dispatch at1620MHz; both remain about28.5-28.9GB/s.128 sparse comparison files exact over12 repetitions. No full Forward/BWD or64K validation; retain baseline. Removing this cross-warp publication join alone does not close the bandwidth gap."
     }
   ],
   "diagnostics": [
