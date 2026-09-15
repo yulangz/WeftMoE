@@ -3431,6 +3431,376 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K Dispatch23.59->31.26 GB/s for RX32/local64 and32.58 for RX16/local64;64K31.38->37.65 and37.19 respectively. Return remains39.4-39.6 GB/s at8K and45.6-45.7 at64K. Use RX32/local64 for next full Forward and Flash checks."
+    },
+    {
+      "name": "Combined Dispatch full Forward regression",
+      "adopted": false,
+      "experimental_commit": "736134b",
+      "raw_results": "results/communication_bottleneck_20260915/rx_combined_training",
+      "cases": [
+        {
+          "name": "compact_clean_production_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1909.6799999999998,
+              "fc2": 2284.145,
+              "return": 4533.3099999999995,
+              "reduce": 2778.575,
+              "forward": 5348.78,
+              "wall": 6767.355
+            },
+            "payload_GBps": {
+              "nv_dispatch": 122.9949646013992,
+              "nv_return": 25.90612863448562,
+              "rdma_dispatch": 17.570709228771314,
+              "rdma_return": 29.607004153697854
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "rx_peek32_b64_production_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1327.9850000000001,
+              "fc2": 2174.815,
+              "return": 4658.735000000001,
+              "reduce": 2863.3900000000003,
+              "forward": 5433.73,
+              "wall": 6877.135
+            },
+            "payload_GBps": {
+              "nv_dispatch": 176.87023874516655,
+              "nv_return": 25.208669735453935,
+              "rdma_dispatch": 25.26717696359522,
+              "rdma_return": 28.80990826909021
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "files_compared": 128,
+        "all_byte_identical": true,
+        "repetitions": 20
+      },
+      "finding": "Qwen EP16 8K full GPU5348.78->5433.73us; Return tail worsens despite faster Dispatch. Do not adopt local batch64 solely on pure throughput. Keep full-validated RX32/local32."
+    },
+    {
+      "name": "Larger independent Return messages",
+      "adopted": false,
+      "experimental_commit": "4263755",
+      "raw_results": "results/communication_bottleneck_20260915/return_chunks_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1431.245,
+              "fc2": 500.976,
+              "return": 3431.375,
+              "reduce": 2451.265,
+              "forward": 4961.745000000001,
+              "wall": 6414.764999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 164.1095857103431,
+              "nv_return": 34.225496193217005,
+              "rdma_dispatch": 23.444226530049015,
+              "rdma_return": 39.11485279224801
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return256_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1442.3200000000002,
+              "fc2": 467.96799999999996,
+              "return": 3582.225,
+              "reduce": 2335.5,
+              "forward": 5058.945,
+              "wall": 6462.514999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 162.84945365799544,
+              "nv_return": 32.784236612719745,
+              "rdma_dispatch": 23.264207665427918,
+              "rdma_return": 37.46769898596543
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return512_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1427.0700000000002,
+              "fc2": 486.288,
+              "return": 4041.87,
+              "reduce": 2267.62,
+              "forward": 5560.299999999999,
+              "wall": 7055.255
+            },
+            "payload_GBps": {
+              "nv_dispatch": 164.58970057530462,
+              "nv_return": 29.055984482430162,
+              "rdma_dispatch": 23.51281436790066,
+              "rdma_return": 33.20683940849162
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8599.52,
+              "fc2": 2856.045,
+              "return": 23782.15,
+              "reduce": 20867.7,
+              "forward": 31929.25,
+              "wall": 33751.65
+            },
+            "payload_GBps": {
+              "nv_dispatch": 218.5061715072469,
+              "nv_return": 39.50543142651106,
+              "rdma_dispatch": 31.215167358178128,
+              "rdma_return": 45.14906448744121
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return256_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8514.625,
+              "fc2": 2795.1,
+              "return": 23794.4,
+              "reduce": 20906.65,
+              "forward": 31955.1,
+              "wall": 33860.7
+            },
+            "payload_GBps": {
+              "nv_dispatch": 220.68478553077793,
+              "nv_return": 39.48509296305013,
+              "rdma_dispatch": 31.526397932968273,
+              "rdma_return": 45.12582052920014
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return512_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 8638.255000000001,
+              "fc2": 2774.095,
+              "return": 24248.25,
+              "reduce": 21323.5,
+              "forward": 32473.25,
+              "wall": 34276.35
+            },
+            "payload_GBps": {
+              "nv_dispatch": 217.52636290547105,
+              "nv_return": 38.74605779798542,
+              "rdma_dispatch": 31.075194700781577,
+              "rdma_return": 44.28120891198334
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 65536,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "128->256/512 Return rows regress Qwen EP16 8K Return39.11->37.47/33.21 GB/s;64K45.15->45.13/44.28. Reject larger Return messages."
+    },
+    {
+      "name": "Flash combined Dispatch communication check",
+      "adopted": false,
+      "experimental_commit": "736134b",
+      "raw_results": "results/communication_bottleneck_20260915/rx_combined_flash_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 2077.715,
+              "fc2": 905.392,
+              "return": 4866.125,
+              "reduce": 3896.6400000000003,
+              "forward": 7138.51,
+              "wall": 8554.189999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 169.57163807355676,
+              "nv_return": 36.201447352873174,
+              "rdma_dispatch": 32.29935963305843,
+              "rdma_return": 41.37308268899792
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 4096,
+              "intermediate": 2048,
+              "tokens_per_rank": 8192,
+              "top_k": 6
+            }
+          }
+        },
+        {
+          "name": "rx_peek32_b64_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1848.7350000000001,
+              "fc2": 855.9680000000001,
+              "return": 4896.32,
+              "reduce": 3632.05,
+              "forward": 6910.014999999999,
+              "wall": 8310.029999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 190.57438518770942,
+              "nv_return": 35.97819750343115,
+              "rdma_dispatch": 36.29988289289703,
+              "rdma_return": 41.11794000392131
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 4096,
+              "intermediate": 2048,
+              "tokens_per_rank": 8192,
+              "top_k": 6
+            }
+          }
+        },
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 12375.15,
+              "fc2": 4861.325,
+              "return": 34954.399999999994,
+              "reduce": 31283.35,
+              "forward": 47405.45,
+              "wall": 49325.75
+            },
+            "payload_GBps": {
+              "nv_dispatch": 227.7606564768912,
+              "nv_return": 40.31784679468108,
+              "rdma_dispatch": 43.382982186074514,
+              "rdma_return": 46.077539193921226
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 4096,
+              "intermediate": 2048,
+              "tokens_per_rank": 65536,
+              "top_k": 6
+            }
+          }
+        },
+        {
+          "name": "rx_peek32_b64_ep16_65536",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 12177.5,
+              "fc2": 4623.68,
+              "return": 34969.0,
+              "reduce": 31101.15,
+              "forward": 47221.75,
+              "wall": 49116.45
+            },
+            "payload_GBps": {
+              "nv_dispatch": 231.45738353520838,
+              "nv_return": 40.301013583459635,
+              "rdma_dispatch": 44.08712067337302,
+              "rdma_return": 46.05830123823958
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 4096,
+              "intermediate": 2048,
+              "tokens_per_rank": 65536,
+              "top_k": 6
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Flash EP16 Dispatch8K32.30->36.30 GB/s,64K43.38->44.09.8K Return remains41.12 GB/s, below42. Full Flash validation pending."
     }
   ],
   "diagnostics": [
