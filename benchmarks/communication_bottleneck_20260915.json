@@ -8220,6 +8220,92 @@
       ],
       "protocol": "Dispatch lane issuers4/8 each own staging and mbarrier; full TMA completion and readiness/credit order retained. Physical storage stride scales for every payload path.4 lanes use FC1/FC2 stages4/2;8 lanes3/2. Math register quota216 unchanged. No full Forward/BWD/64K validation.",
       "finding": "Qwen EP16 8K Dispatch28.758 baseline ->30.108(4 lanes)/30.848(8 lanes)GB/s;Return39.777->39.745/39.675.128 sparse files exact over12 native repetitions. Improvement remains short of42GB/s; not adopted."
+    },
+    {
+      "name": "Per-peer local Return queues in GIN Forward",
+      "source": "/tmp/weftmoe-gin-local-peer-return-queues",
+      "source_commit": "b5eb902",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/gin_local_peer_queues_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1164.27,
+              "fc2": 565.8240000000001,
+              "return": 3367.09,
+              "reduce": 2340.865,
+              "forward": 4686.225,
+              "wall": 6141.805
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.74102570709542,
+              "nv_return": 34.878934629011994,
+              "rdma_dispatch": 28.82014652958506,
+              "rdma_return": 39.86163957601371
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "gin_local_peer_queues_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1184.69,
+              "fc2": 132.672,
+              "return": 3290.385,
+              "reduce": 2456.5950000000003,
+              "forward": 4605.2,
+              "wall": 6001.3150000000005
+            },
+            "payload_GBps": {
+              "nv_dispatch": 198.26370105259605,
+              "nv_return": 35.69202752869345,
+              "rdma_dispatch": 28.323385864656576,
+              "rdma_return": 40.79088860422109
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "Extend existing EP8 per-peer Return queues to GIN local peers behind an opt-in macro. Queue indices use global source rank; local consumers and notification destinations include node offset/modulo. Storage, payload, producer confirmation and notification ordering unchanged. Backward generic queue policy unchanged.",
+      "finding": "Qwen EP16 8K Return39.862->40.791GB/s (+2.33%),Dispatch28.820->28.323;GPU4686.225->4605.200us,allocation-inclusive wall6141.805->6001.315us. Synthetic FC2 interval565.824->132.672us supports reduced producer serialization but does not establish full GEMM behavior.64 sparse files exact over12 repetitions. Full Forward confirmation building; no adoption or broad correctness claim."
     }
   ],
   "diagnostics": [
