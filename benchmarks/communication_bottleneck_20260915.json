@@ -4218,6 +4218,130 @@
         }
       ],
       "cpu_validation": "90 tests and126 subtests pass; default Forward grid preserves128 and explores32."
+    },
+    {
+      "name": "Partition Return receive tasks",
+      "adopted": false,
+      "experimental_commit": "a1d89bb",
+      "raw_results": "results/communication_bottleneck_20260915/return_rx_screen",
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.8899999999999,
+              "fc2": 559.84,
+              "return": 3409.215,
+              "reduce": 2444.385,
+              "forward": 4737.344999999999,
+              "wall": 6204.504999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.1542693370285,
+              "nv_return": 34.44796294748205,
+              "rdma_dispatch": 28.87918133386121,
+              "rdma_return": 39.36910051140805
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return_rx64_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1179.7150000000001,
+              "fc2": 593.9200000000001,
+              "return": 3372.45,
+              "reduce": 2386.88,
+              "forward": 4683.280000000001,
+              "wall": 6101.54
+            },
+            "payload_GBps": {
+              "nv_dispatch": 199.0998029185015,
+              "nv_return": 34.82349982950081,
+              "rdma_dispatch": 28.442828988357352,
+              "rdma_return": 39.7982855194295
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return_rx32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1169.17,
+              "fc2": 549.088,
+              "return": 3355.04,
+              "reduce": 2581.55,
+              "forward": 4653.139999999999,
+              "wall": 6059.555
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.89552759650007,
+              "nv_return": 35.00420620916591,
+              "rdma_dispatch": 28.699361085214296,
+              "rdma_return": 40.004807096189616
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return_rx16_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1168.755,
+              "fc2": 572.144,
+              "return": 3351.73,
+              "reduce": 2347.57,
+              "forward": 4655.280000000001,
+              "wall": 6075.305
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.96686131824032,
+              "nv_return": 35.03877460296623,
+              "rdma_dispatch": 28.709551616891478,
+              "rdma_return": 40.04431383196141
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 192,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Return sub-batches improve Qwen EP16 8K Return39.37->40.00/40.04 GB/s at32/16 rows, below42. Retain as experimental pending larger completion-tail optimization."
     }
   ],
   "diagnostics": [
@@ -4332,6 +4456,29 @@
       "name": "Static resource and local-memory instruction audit",
       "raw_results": "results/communication_bottleneck_20260915/register_audit",
       "finding": "Baseline and handoff EP16 retained Forward entries both report REG 168, STACK 656, LOCAL 0. After control register deallocation, static LDL/STL counts change from 2701/1396 to 2710/1401. These counts include stack/structure accesses and do not establish dynamic spill cost. Test the legal 72-register control quota and shared Return work during Dispatch."
+    },
+    {
+      "name": "Return queue confirmation and completion-tail timeline",
+      "experimental_commit": "1c9faaa",
+      "raw_results": "results/communication_bottleneck_20260915/return_confirm_trace",
+      "summary": [
+        {
+          "variant": "confirm_baseline",
+          "confirms": 8192,
+          "waited": 875,
+          "max_confirm_us": 51.68,
+          "max_rank_sum_us": 1810.72
+        },
+        {
+          "variant": "confirm_rx32_b64",
+          "confirms": 8192,
+          "waited": 710,
+          "max_confirm_us": 27.616,
+          "max_rank_sum_us": 1558.688
+        }
+      ],
+      "golden_files": 128,
+      "finding": "Confirmation waiting decreases in the regressive combined variant; it does not explain the regression. Last-snapshot timelines show median payload-complete to transport-worker-exit intervals616.656/551.056us. Test notification closure using final data tails instead of empty End packets. Trace timestamps are compared only within each GPU; instrumented latency is not production throughput."
     }
   ]
 }
