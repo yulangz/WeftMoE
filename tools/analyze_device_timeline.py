@@ -97,6 +97,14 @@ PAIRS = {
     "fc1_end_to_fc2_start": (10, 71),
     "local_return_batch": (74, 75),
     "full_return_chunk_publish": (77, 78),
+    "compute_select": (80, 81),
+    "compute_pair_join": (80, 88),
+    "fc1_tile": (82, 84),
+    "fc1_math": (82, 83),
+    "fc1_epilogue": (83, 84),
+    "fc2_tile": (85, 87),
+    "fc2_math": (85, 86),
+    "fc2_epilogue": (86, 87),
 }
 
 
@@ -112,17 +120,23 @@ def summarize(path: Path) -> tuple[dict[str, object], dict[str, list[float]]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     events = payload["events"]
     by_key: dict[tuple[int, int], dict[int, list[int]]] = {}
+    selection_by_cta: dict[int, dict[int, list[int]]] = {}
     event_extents: dict[int, list[int]] = {}
     for item in events:
         event = int(item["event"])
         timestamp = int(item["timestamp_ns"])
         key = (int(item["cta"]), int(item["channel"]))
         by_key.setdefault(key, {}).setdefault(event, []).append(timestamp)
+        if event in (80, 81):
+            # SelectEnd's channel records the selected task kind; SelectStart
+            # necessarily precedes that choice. Each CTA has one selector.
+            selection_by_cta.setdefault(key[0], {}).setdefault(event, []).append(timestamp)
         event_extents.setdefault(event, []).append(timestamp)
     durations: dict[str, list[float]] = {}
     for name, (begin_event, end_event) in PAIRS.items():
         samples: list[float] = []
-        for observed in by_key.values():
+        groups = selection_by_cta if name == "compute_select" else by_key
+        for observed in groups.values():
             begins = observed.get(begin_event, [])
             ends = observed.get(end_event, [])
             for begin, end in zip(begins, ends):

@@ -138,6 +138,60 @@ struct ActivationMegaKernelBackendState {
   std::shared_ptr<internal::NcclSessionState> nccl;
   NcclSession session;
   CudaExecution execution;
+
+  // A backend owns one device/context lifetime. Cache successful checks by
+  // entry pointer and phase quotas so local/GIN and retained-state variants
+  // are checked independently, without a CUDA query on every execution.
+  std::mutex unified_register_mutex;
+  struct UnifiedRegisterKey {
+    const void *kernel;
+    unsigned threads, math, producer, control;
+    bool operator==(const UnifiedRegisterKey &other) const {
+      return kernel == other.kernel && threads == other.threads &&
+             math == other.math && producer == other.producer &&
+             control == other.control;
+    }
+  };
+  std::vector<UnifiedRegisterKey> validated_unified_register_kernels;
+
+  template <class Resources>
+  cudaError_t validate_unified_register_pool(const void *kernel) {
+    const UnifiedRegisterKey key{
+        kernel, Resources::kUnifiedThreads, Resources::kUnifiedMathRegisters,
+        Resources::kUnifiedProducerRegisters, Resources::kUnifiedControlRegisters};
+    std::lock_guard<std::mutex> lock(unified_register_mutex);
+    if (std::find(validated_unified_register_kernels.begin(),
+                  validated_unified_register_kernels.end(), key) !=
+        validated_unified_register_kernels.end())
+      return cudaSuccess;
+    cudaFuncAttributes attributes{};
+    const auto error = cudaFuncGetAttributes(&attributes, kernel);
+    if (error != cudaSuccess)
+      return error;
+    if (attributes.numRegs <= 0 || attributes.numRegs > 256)
+      return cudaErrorLaunchOutOfResources;
+    // CUDA's Hopper occupancy calculation allocates 256 registers per warp:
+    // round the compiled count UP to eight registers per thread. The launch
+    // bound's theoretical maximum is not proof that ptxas used that pool.
+    const unsigned initial =
+        (static_cast<unsigned>(attributes.numRegs) + 7U) / 8U * 8U;
+    constexpr unsigned requested =
+        256U * Resources::kUnifiedMathRegisters +
+        128U * Resources::kUnifiedProducerRegisters +
+        (Resources::kUnifiedThreads - 384U) *
+            Resources::kUnifiedControlRegisters;
+    // PTX .inc/.dec must also respect the previous per-thread maximum.
+    // An insufficient CTA pool can stall .inc indefinitely even when the
+    // ordinary occupancy check says that the kernel can launch.
+    if (Resources::kUnifiedMathRegisters < initial ||
+        Resources::kUnifiedProducerRegisters > initial ||
+        Resources::kUnifiedControlRegisters > initial ||
+        requested > initial * Resources::kUnifiedThreads)
+      return cudaErrorLaunchOutOfResources;
+    validated_unified_register_kernels.push_back(key);
+    return cudaSuccess;
+  }
+
   virtual bool requires_collective_terminal_status() const noexcept = 0;
   virtual ~ActivationMegaKernelBackendState() noexcept = default;
 };
@@ -969,7 +1023,12 @@ testing::hash_forward_weight_storage_for_validation(
       impl.hidden, impl.intermediate, "sample W2 expert elements");
   std::array<std::uint32_t, 3> sampled_experts{
       0U, impl.owned_experts / 2U, impl.owned_experts - 1U};
-  for (const auto local_expert : sampled_experts) {
+  for (std::size_t index = 0; index < sampled_experts.size(); ++index) {
+    const auto local_expert = sampled_experts[index];
+    // With one or two owned experts, midpoint and endpoint repeat. Hash each
+    // expert once so the distinctness check compares different weight tensors.
+    if (index != 0 && local_expert == sampled_experts[index - 1])
+      continue;
     hashes.sampled_w1_experts.push_back(hash_one(
         impl.w1 + local_expert * w1_expert_elements, w1_expert_elements,
         "hash_forward_weight_chunks_kernel(W1 expert)"));
@@ -1535,9 +1594,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     // Return contexts. Balancing payload bytes across the pair avoids receive
     // port imbalance with one context per target on bonded links.
     requirements.ginContextCount = allocated_context_count;
-    // A permanent RDMA CTA owns all three exclusive contexts. Compute CTAs
-    // publish row IDs and never touch a GIN context.
-    requirements.ginExclusiveContexts = true;
+    // Legacy RDMA CTAs own exclusive contexts. Unified communication warps
+    // share contexts through short leases and perform payload packing outside
+    // the lease, so their contexts must support ownership transfer.
+    requirements.ginExclusiveContexts =
+        !(forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers);
     requirements.ginQueueDepth = 64;
     // Legacy transport diagnostics use signals 0/1; production terminal status
     // uses signal 2. Ring readiness and credits use window-addressed signals.
@@ -4468,6 +4529,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_dynamic_reduce_queue = forward_tuning::kReduceScheduler == 0U;
   args.forward_scheduler_offset = layout.forward_scheduler;
   args.forward_v3_control_offset = layout.forward_v3_control;
+  if constexpr (forward_tuning::kUnifiedWorkers)
+    args.forward_unified_gin_state = at<void>(slot.device, layout.forward_unified_gin_state);
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
   args.production_error_records_offset = layout.production_error_records;
@@ -4551,14 +4614,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       const unsigned int kTransportBlocks =
           (split_gin_roles ? persistent_v3::kRdmaCtaCount : 0U) +
           args.forward_relay_cta_count;
-      if (grid_blocks <= kTransportBlocks)
+      if (!forward_tuning::kUnifiedWorkers && grid_blocks <= kTransportBlocks)
         throw NotifyDispatchError(
             NotifyErrorCode::BackendUnavailable,
             "phase=forward-run, field=split role residency, rank=" +
                 std::to_string(id.calling_rank) + ", expected SMs>" +
                 std::to_string(kTransportBlocks) +
                 ", actual=" + std::to_string(grid_blocks));
-      args.forward_compute_cta_count = grid_blocks - kTransportBlocks;
+      args.forward_compute_cta_count = forward_tuning::kUnifiedWorkers
+          ? (grid_blocks & ~1U) : grid_blocks - kTransportBlocks;
+      if constexpr (forward_tuning::kUnifiedWorkers)
+        args.forward_relay_cta_count = args.forward_compute_cta_count;
       args.forward_stream_local_dispatch = split_local_roles;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       // Eight independent row streams per CTA are the Hopper default.
@@ -4647,6 +4713,87 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       // transport CTAs also consume ready tokens; their completion is covered
       // by the shared completed-token counter, not this compute-role count.
       args.forward_reduce_cta_count = forward_main_compute_ctas;
+      if constexpr (forward_tuning::kUnifiedWorkers) {
+        const auto launch_unified = [&](auto kernel) {
+#if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+          // The communication diagnostic entry has no setmaxnreg partition.
+          const auto register_error = backend->validate_unified_register_pool<forward_tuning::UnifiedResources>(
+              reinterpret_cast<const void *>(kernel));
+          if (register_error != cudaSuccess)
+            return register_error;
+#endif
+          auto error = internal::prepare_kernel_stack(
+              reinterpret_cast<const void *>(kernel));
+          if (error != cudaSuccess)
+            return error;
+          const auto smem = forward_unified_detail::shared_bytes(id.world_size);
+          error = cudaFuncSetAttribute(kernel,
+              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+          if (error != cudaSuccess)
+            return error;
+          local_notification_detail::reset<<<
+              (args.local_world_size * args.local_notification_ctas + 127U) / 128U,
+              128, 0, exec->stream>>>(args);
+          // Setup initializes the generation only; peer and payload progress
+          // belongs to the communication domain in every resident CTA.
+          if constexpr (forward_tuning::kRdmaCtas == 0U) {
+            local_p2p_forward_transport_kernel<true, true><<<
+                forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
+          } else {
+            if (!split_local_roles) {
+            error = cudaMemsetAsync(args.forward_unified_gin_state, 0,
+                args.gin_context_count * forward_tuning::kUnifiedGinStateBytes,
+                exec->stream);
+            if (error != cudaSuccess)
+              return error;
+            activation_ring_detail::prepare<<<
+                (args.gin_rings.channels() + 127U) / 128U, 128, 0,
+                exec->stream>>>(args);
+            }
+            if (split_local_roles)
+              local_p2p_forward_transport_kernel<true, true><<<
+                  forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
+            else
+              local_p2p_forward_transport_kernel<false, true><<<
+                  forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
+          }
+          error = cudaGetLastError();
+          if (error != cudaSuccess)
+            return error;
+          cudaLaunchConfig_t launch{};
+          launch.gridDim = dim3(forward_main_compute_ctas, 1, 1);
+          launch.blockDim = dim3(forward_tuning::kUnifiedThreads, 1, 1);
+          launch.dynamicSmemBytes = smem;
+          launch.stream = exec->stream;
+          cudaLaunchAttribute cluster{};
+          cluster.id = cudaLaunchAttributeClusterDimension;
+          cluster.val.clusterDim = {forward_tuning::kClusterSize, 1U, 1U};
+          launch.attrs = &cluster;
+          launch.numAttrs = 1U;
+          error = cudaOccupancyMaxActiveClusters(
+              &max_active_clusters, kernel, &launch);
+          if (error != cudaSuccess)
+            return error;
+          if (static_cast<unsigned>(max_active_clusters) *
+                  forward_tuning::kClusterSize < forward_main_compute_ctas)
+            return cudaErrorLaunchOutOfResources;
+          return cudaLaunchKernelEx(
+              &launch, kernel, args, slot.forward_x_map, slot.forward_s_map,
+              weight.w1_map, weight.w2_map, ordinary_output_store_map);
+        };
+        if constexpr (forward_tuning::kRdmaCtas == 0U)
+          launch_forward = config.retain_backward_state
+              ? launch_unified(unified_forward_entry<true, true>())
+              : launch_unified(unified_forward_entry<true, false>());
+        else if (split_local_roles)
+          launch_forward = config.retain_backward_state
+              ? launch_unified(unified_forward_entry<true, true>())
+              : launch_unified(unified_forward_entry<true, false>());
+        else
+          launch_forward = config.retain_backward_state
+              ? launch_unified(unified_forward_entry<false, true>())
+              : launch_unified(unified_forward_entry<false, false>());
+      } else {
       internal::throw_cuda(
           "forward-run",
           split_local_roles
@@ -4816,6 +4963,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           id.calling_rank, id.world_size, backend->session.session().identity(),
           id.generation, ExchangeKind::ExpertCounts,
           "cudaStreamWaitEvent(split Forward compute done)");
+      }
     } else {
       transport_error(NotifyErrorCode::BackendUnavailable, "forward-run",
                       "multicast transport", id.calling_rank,
@@ -5649,6 +5797,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.backward_return_chunk_rows = backward_tuning::kTileM;
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;
+  if constexpr (backward_tuning::kUnifiedWorkers)
+    args.forward_unified_gin_state = at<void>(slot.device, layout.forward_unified_gin_state);
   args.use_gin = use_gin;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
@@ -5726,7 +5876,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       (use_gin ? backward_tuning::kRemoteRelayCtas
                : backward_tuning::kRelayCtas) +
       (use_gin ? backward_tuning::kRdmaCtas : 0U);
-  if (sm_count <= static_cast<int>(transport_ctas))
+  if (!backward_tuning::kUnifiedWorkers && sm_count <= static_cast<int>(transport_ctas))
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                     "split Backward role residency", identity.rank,
                     "more SMs than dedicated transport CTAs",
@@ -5774,8 +5924,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.dw2->data, config.intermediate_size,
       static_cast<std::uint64_t>(data.experts) * config.hidden_size,
       "caller dW2");
-  const auto compute_ctas =
-      (static_cast<std::uint32_t>(sm_count) - transport_ctas) & ~1U;
+  const auto compute_ctas = backward_tuning::kUnifiedWorkers
+      ? (static_cast<std::uint32_t>(sm_count) & ~1U)
+      : ((static_cast<std::uint32_t>(sm_count) - transport_ctas) & ~1U);
+  if constexpr (backward_tuning::kUnifiedWorkers)
+    args.local_notification_ctas = compute_ctas;
   int cluster_supported = 0;
   internal::throw_cuda(
       "backward-run",
@@ -5834,6 +5987,13 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   // Respect all preceding caller-stream work, including captured consumers of
   // the Forward output, before the transport stream reuses its output plane.
   if (use_gin) {
+    if constexpr (backward_tuning::kUnifiedWorkers)
+      internal::throw_cuda("backward-run",
+          cudaMemsetAsync(args.forward_unified_gin_state, 0,
+                          args.gin_context_count * forward_tuning::kUnifiedGinStateBytes,
+                          exec->stream),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "initialize unified Backward GIN contexts");
     activation_ring_detail::prepare<<<(args.gin_rings.channels() + 127U) / 128U,
                                       128, 0, exec->stream>>>(args);
     internal::throw_cuda("backward-run", cudaGetLastError(), identity.rank,
@@ -5891,6 +6051,64 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                        identity.rank, identity.world, "backward",
                        identity.generation, ExchangeKind::ExpertCounts,
                        "record Backward compute start");
+  if constexpr (backward_tuning::kUnifiedWorkers) {
+    const auto kernel = [&] {
+      if constexpr (backward_tuning::kRdmaCtas == 0U)
+        return unified_backward_kernel<backward_tuning::kDabTileN,
+            backward_tuning::kDxTileN, backward_tuning::kDwTileN, false>;
+      else
+        return use_gin
+            ? unified_backward_kernel<backward_tuning::kDabTileN,
+                backward_tuning::kDxTileN, backward_tuning::kDwTileN, true>
+            : unified_backward_kernel<backward_tuning::kDabTileN,
+                backward_tuning::kDxTileN, backward_tuning::kDwTileN, false>;
+    }();
+    const auto smem = backward_unified_detail::shared_bytes();
+    internal::throw_cuda("backward-run",
+        retained.backend->validate_unified_register_pool<backward_tuning::UnifiedResources>(
+            reinterpret_cast<const void *>(kernel)),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "validate unified Backward register pool");
+    internal::throw_cuda("backward-run",
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "set unified Backward shared memory");
+    cudaLaunchAttribute cluster{};
+    cluster.id = cudaLaunchAttributeClusterDimension;
+    cluster.val.clusterDim = {2U, 1U, 1U};
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = dim3(compute_ctas);
+    launch.blockDim = dim3(backward_tuning::kUnifiedThreads);
+    launch.dynamicSmemBytes = smem;
+    launch.stream = transport_stream;
+    launch.attrs = &cluster;
+    launch.numAttrs = 1U;
+    int clusters = 0;
+    internal::throw_cuda("backward-run",
+        cudaOccupancyMaxActiveClusters(&clusters, kernel, &launch),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "query unified Backward residency");
+    if (2U * static_cast<unsigned>(clusters) < compute_ctas)
+      transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
+                      "unified Backward residency", identity.rank,
+                      "all worker CTAs resident", std::to_string(clusters));
+    internal::throw_cuda("backward-run",
+        cudaLaunchKernelEx(&launch, kernel, args,
+            slot.backward_dr_map, slot.backward_dab_map,
+            retained.weights.impl_->backward_w2_map,
+            retained.weights.impl_->backward_w1_map, slot.backward_dr_mn_map,
+            slot.backward_u_mn_map, slot.backward_dab_mn_map, x_map,
+            slot.backward_u_store_map, slot.backward_dx_store_map, dw2_map, dw1_map),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "launch unified Backward workers");
+    for (auto event : {slot.backward_transport_done, slot.backward_compute_done,
+                       slot.forward_compute_done})
+      internal::throw_cuda("backward-run",
+          internal::record_observable_event(event, transport_stream),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "record unified Backward completion");
+  } else {
   backward_local_transport_kernel<<<transport_ctas,
                                     backward_tuning::kComputeThreads,
                                     kPersistentSmem,
@@ -5925,42 +6143,42 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "publish Backward compute dependency");
 
-  // Queue route reduction behind the persistent transport grid.  The compute
-  // CTAs are already resident while transport is active, so reducers can use
-  // the SMs released by completed communication roles without delaying dW.
-  // Missing local-return markers are waited independently by each token
-  // warp; uint4 loads preserve the fixed route-order FP32 reduction while
-  // avoiding eight physical warps of scalar work per token.
-  if (identity.tokens != 0ULL) {
-    constexpr auto kReduceWarps = backward_tuning::kReduceThreads / 32U;
-    const auto reduce_ctas = static_cast<unsigned int>(
-        (identity.tokens + kReduceWarps - 1ULL) / kReduceWarps);
-    backward_reduce_dx_kernel<<<reduce_ctas, backward_tuning::kReduceThreads,
-                                0, transport_stream>>>(args);
-    internal::throw_cuda(
-        "backward-run", cudaGetLastError(), identity.rank, identity.world,
-        "backward", identity.generation, ExchangeKind::ExpertCounts,
-        "streaming Backward dX reduce launch");
   }
-  internal::throw_cuda("backward-run",
-                       internal::record_observable_event(
-                           slot.backward_reduce_done, transport_stream),
-                       identity.rank, identity.world, "backward",
-                       identity.generation, ExchangeKind::ExpertCounts,
-                       "record Backward reduction completion");
-  // Once transport and reduction release their dedicated SMs, add an equal
-  // number of workers to the same global queues for the remaining dW tail.
-  // Sequencing this launch on the transport stream preserves initial role
-  // residency; unlike an over-subscribed initial grid, it cannot starve the
-  // communication CTAs needed to make activation progress.
-  launch_compute_workers(transport_ctas, transport_stream,
-                         "late Backward compute-worker launch");
-  internal::throw_cuda("backward-run",
-                       internal::record_observable_event(
-                           slot.backward_late_compute_done, transport_stream),
-                       identity.rank, identity.world, "backward",
-                       identity.generation, ExchangeKind::ExpertCounts,
-                       "record late Backward compute-worker completion");
+
+  // Unified communication warps reduce dX before they retire. Legacy grids
+  // keep the standalone reducer on the transport stream to overlap dW.
+  if constexpr (!backward_tuning::kUnifiedWorkers) {
+    // Queue route reduction behind the persistent transport grid. The compute
+    // CTAs remain resident, while reducers use SMs released by communication.
+    // Each token warp waits independently and retains the fixed route order.
+    if (identity.tokens != 0ULL) {
+      constexpr auto kReduceWarps = backward_tuning::kReduceThreads / 32U;
+      const auto reduce_ctas = static_cast<unsigned int>(
+          (identity.tokens + kReduceWarps - 1ULL) / kReduceWarps);
+      backward_reduce_dx_kernel<<<reduce_ctas, backward_tuning::kReduceThreads,
+                                  0, transport_stream>>>(args);
+      internal::throw_cuda(
+          "backward-run", cudaGetLastError(), identity.rank, identity.world,
+          "backward", identity.generation, ExchangeKind::ExpertCounts,
+          "streaming Backward dX reduce launch");
+    }
+    internal::throw_cuda("backward-run",
+                         internal::record_observable_event(
+                             slot.backward_reduce_done, transport_stream),
+                         identity.rank, identity.world, "backward",
+                         identity.generation, ExchangeKind::ExpertCounts,
+                         "record Backward reduction completion");
+    // Add workers to the dW queues after transport and reduction release their
+    // SMs, preserving the initial residency needed for activation progress.
+    launch_compute_workers(transport_ctas, transport_stream,
+                           "late Backward compute-worker launch");
+    internal::throw_cuda("backward-run",
+                         internal::record_observable_event(
+                             slot.backward_late_compute_done, transport_stream),
+                         identity.rank, identity.world, "backward",
+                         identity.generation, ExchangeKind::ExpertCounts,
+                         "record late Backward compute-worker completion");
+  }
   internal::throw_cuda(
       "backward-run",
       cudaEventRecord(slot.forward_transport_done, transport_stream),
@@ -6133,13 +6351,22 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const auto primary_compute_us = backward_elapsed_us(
         slot.backward_compute_start, slot.backward_compute_done, identity,
         "Backward primary persistent compute elapsed");
-    const auto late_compute_us = backward_elapsed_us(
-        slot.backward_compute_start, slot.backward_late_compute_done, identity,
-        "Backward late compute elapsed");
-    result->timings.compute_us = std::max(primary_compute_us, late_compute_us);
-    result->timings.reduce_us = backward_elapsed_us(
-        slot.backward_transport_done, slot.backward_reduce_done, identity,
-        "Backward dX reduction elapsed");
+    if constexpr (backward_tuning::kUnifiedWorkers) {
+      result->timings.compute_us = primary_compute_us;
+      // The embedded reduction has device clocks; an adjacent host event
+      // would measure only the empty stream interval after the kernel.
+      result->timings.reduce_us = device_span_us(
+          slot.host_status->backward_reduce_start_clock,
+          slot.host_status->backward_reduce_complete_clock);
+    } else {
+      const auto late_compute_us = backward_elapsed_us(
+          slot.backward_compute_start, slot.backward_late_compute_done, identity,
+          "Backward late compute elapsed");
+      result->timings.compute_us = std::max(primary_compute_us, late_compute_us);
+      result->timings.reduce_us = backward_elapsed_us(
+          slot.backward_transport_done, slot.backward_reduce_done, identity,
+          "Backward dX reduction elapsed");
+    }
     result->timings.transport_us = backward_elapsed_us(
         slot.backward_compute_start, slot.backward_transport_done, identity,
         "Backward persistent transport elapsed");

@@ -1,0 +1,742 @@
+#pragma once
+
+#if __has_include(<nccl_device.h>)
+
+#include "cuda/communication/notification_pipeline.cuh"
+#include "cuda/communication/return_queue.cuh"
+#include "cuda/persistent_v3/forward/return_pipeline.cuh"
+
+// Included after the private Forward contract, peer helpers and input-group
+// publisher. Every CTA owns an independent communication domain; no helper in
+// this file waits for the math threads or reuses their operand storage.
+namespace forward_unified_transport {
+
+using CopyBarrier = ::cuda::barrier<::cuda::thread_scope_block>;
+
+#include "cuda/persistent_v3/forward/unified_gin_state.cuh"
+
+// Three warp domains are useful when sharing the existing producer warpgroup;
+// four or eight warps allow a separate communication warpgroup. The final warp
+// publishes input groups and then receives notifications while copies proceed.
+template <unsigned Threads, unsigned SegmentBytes = 2048U,
+          unsigned Buffers = 1U>
+struct alignas(128) Shared {
+  static_assert(Threads >= 64U && Threads % 32U == 0U);
+  static_assert(SegmentBytes >= 16U && SegmentBytes % 16U == 0U);
+  static_assert(Buffers == 1U || Buffers == 2U);
+  static constexpr unsigned kThreads = Threads;
+  static constexpr unsigned kCopyWarps = Threads / 32U - 1U;
+  static constexpr unsigned kCopyThreads = kCopyWarps * 32U;
+  static constexpr unsigned kCopyBarrier = 8U;
+  static constexpr unsigned kSegmentBytes = SegmentBytes;
+  static constexpr unsigned kBuffers = Buffers;
+
+  alignas(128) unsigned char staging[kCopyWarps * Buffers * SegmentBytes];
+  alignas(16) CopyBarrier full[kCopyWarps];
+  alignas(16) CopyBarrier row_prefetch_full[kCopyWarps * Buffers];
+  unsigned long long dispatch_cursor;
+  unsigned long long dispatch_end;
+  unsigned long long return_cursor;
+  unsigned long long notification_sequence;
+  unsigned return_queue;
+  unsigned return_rows;
+  unsigned return_uniform;
+  unsigned return_peer;
+  unsigned dispatch_complete;
+  unsigned stop;
+  unsigned copies_done;
+  activation_ring_detail::Transfer gin_task;
+  unsigned gin_context_cursor;
+  unsigned gin_context;
+  unsigned gin_task_slot;
+  unsigned gin_rx_dispatch;
+  unsigned gin_rx_return;
+  unsigned gin_progressed;
+};
+
+template <unsigned Threads, unsigned BarrierId = 8U>
+__device__ __forceinline__ void copy_sync() {
+  if constexpr (Threads == 32U)
+    __syncwarp();
+  else
+    asm volatile("bar.sync %0, %1;"
+                 :
+                 : "n"(BarrierId), "r"(Threads)
+                 : "memory");
+}
+
+template <unsigned Threads> __device__ __forceinline__ void domain_sync() {
+  asm volatile("bar.sync 9, %0;" : : "r"(Threads) : "memory");
+}
+
+template <unsigned BaseThread>
+__device__ __forceinline__ unsigned local_thread() {
+  return threadIdx.x - BaseThread;
+}
+
+__device__ __forceinline__ bool
+cancelled(const ForwardKernelArgs &a,
+          persistent_v3::ForwardPipelineControl &control) {
+  return forward_cancelled(a) ||
+         persistent_v3::load_acquire<::cuda::thread_scope_device>(
+             control.generation.control.error_code.value) != 0ULL;
+}
+
+// One elected CTA publishes the generation-local clear. Communication-only
+// barriers transfer its setup acquire to every copy warp without involving
+// any math thread. All peer reverse maps must be clear before Dispatch stores.
+template <unsigned BaseThread, class Storage>
+__device__ __forceinline__ void
+init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+     Storage &s) {
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned warp = tid / 32U, lane = tid % 32U;
+  if (warp < Storage::kCopyWarps && lane == 0U) {
+    init(&s.full[warp], 1U);
+    // Each slot keeps its own arrival phase across row batches. Initialize
+    // once; the existing proxy fence and domain join cover both arrays.
+#pragma unroll
+    for (unsigned slot = 0U; slot < Storage::kBuffers; ++slot)
+      init(&s.row_prefetch_full[warp * Storage::kBuffers + slot], 1U);
+  }
+  if (tid == 0U) {
+    s.dispatch_cursor =
+        1ULL * blockIdx.x * a.forward_dispatch_publish_batch_rows;
+    // local_route_order places local routes before remote ones.
+    s.dispatch_end = forward_dispatch_detail::local_route_prefix(a);
+    s.return_queue = 0U;
+    s.return_rows = 0U;
+    s.dispatch_complete = s.stop = s.copies_done = 0U;
+    s.gin_context_cursor = s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
+    s.gin_context = s.gin_progressed = 0U;
+    s.gin_task.channel = activation_ring_detail::kNoChannel;
+    if (blockIdx.x == 0U) {
+      __threadfence_system();
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+          control.generation.contexts[0].rx_published.value)
+          .store(execution_epoch(a), ::cuda::memory_order_release);
+    }
+  }
+  ::cuda::device::experimental::fence_proxy_async_shared_cta();
+  domain_sync<Storage::kThreads>();
+  if (tid == 0U) {
+    for (unsigned local = 0U; local < a.local_world_size; ++local) {
+      auto *peer_control = peer_at<persistent_v3::ForwardPipelineControl>(
+          a.peer_bases[a.node * a.local_world_size + local],
+          a.forward_v3_control_offset);
+      while (
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+              peer_control->generation.contexts[0].rx_published.value)
+                  .load(::cuda::memory_order_acquire) < execution_epoch(a) &&
+          !cancelled(a, control))
+        __nanosleep(forward_tuning::kSetupNanosleep);
+    }
+  }
+  domain_sync<Storage::kThreads>();
+}
+
+// A contiguous row is split into a bounded shared-memory footprint. All
+// payloads use bulk TMA, including wide rows. Ordinary instructions move only
+// metadata. The issuing lane drains global completion before its caller may
+// publish readiness; wait_group_read alone would only permit SMEM reuse.
+template <class Storage>
+__device__ __forceinline__ void copy_row(Storage &s, unsigned warp,
+                                         const void *source, void *target,
+                                         unsigned bytes) {
+  auto *buffer = s.staging + warp * Storage::kBuffers * Storage::kSegmentBytes;
+  auto &full = s.full[warp];
+  constexpr unsigned kStep = Storage::kBuffers * Storage::kSegmentBytes;
+  for (unsigned offset = 0U; offset < bytes; offset += kStep) {
+    const unsigned extent = min(kStep, bytes - offset);
+#pragma unroll
+    for (unsigned item = 0U; item < Storage::kBuffers; ++item) {
+      const unsigned begin = item * Storage::kSegmentBytes;
+      if (begin < extent)
+        ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+            buffer + begin, static_cast<const char *>(source) + offset + begin,
+            min(Storage::kSegmentBytes, extent - begin), full);
+    }
+    auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, extent);
+    full.wait(static_cast<decltype(ticket) &&>(ticket));
+#pragma unroll
+    for (unsigned item = 0U; item < Storage::kBuffers; ++item) {
+      const unsigned begin = item * Storage::kSegmentBytes;
+      if (begin < extent)
+        ::cuda::device::experimental::cp_async_bulk_shared_to_global(
+            static_cast<char *>(target) + offset + begin, buffer + begin,
+            min(Storage::kSegmentBytes, extent - begin));
+    }
+    ::cuda::device::experimental::cp_async_bulk_commit_group();
+    ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
+  }
+}
+
+// Dispatch fanouts share one immutable payload. Every store in a segment
+// joins before staging reuse; callers still wait for global completion before
+// publishing readiness or returning NIC credit.
+template <class Storage, class Destination>
+__device__ __forceinline__ void
+copy_row_fanout(Storage &s, unsigned warp, const void *source, unsigned bytes,
+                unsigned fanouts, Destination destination) {
+  if (fanouts == 0U)
+    return;
+  auto *buffer = s.staging + warp * Storage::kBuffers * Storage::kSegmentBytes;
+  auto &full = s.full[warp];
+  constexpr unsigned kStep = Storage::kBuffers * Storage::kSegmentBytes;
+  for (unsigned offset = 0U; offset < bytes; offset += kStep) {
+    const unsigned extent = min(kStep, bytes - offset);
+#pragma unroll
+    for (unsigned item = 0U; item < Storage::kBuffers; ++item) {
+      const unsigned begin = item * Storage::kSegmentBytes;
+      if (begin < extent)
+        ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+            buffer + begin, static_cast<const char *>(source) + offset + begin,
+            min(Storage::kSegmentBytes, extent - begin), full);
+    }
+    auto ticket = ::cuda::device::barrier_arrive_tx(full, 1U, extent);
+    full.wait(static_cast<decltype(ticket) &&>(ticket));
+    for (unsigned fanout = 0U; fanout < fanouts; ++fanout) {
+      auto *target = static_cast<char *>(destination(fanout));
+#pragma unroll
+      for (unsigned item = 0U; item < Storage::kBuffers; ++item) {
+        const unsigned begin = item * Storage::kSegmentBytes;
+        if (begin < extent)
+          ::cuda::device::experimental::cp_async_bulk_shared_to_global(
+              target + offset + begin, buffer + begin,
+              min(Storage::kSegmentBytes, extent - begin));
+      }
+    }
+    // All fanouts read the same immutable segment. One group joins every
+    // destination before any subsequent G2S may overwrite that segment.
+    ::cuda::device::experimental::cp_async_bulk_commit_group();
+    ::cuda::device::experimental::cp_async_bulk_wait_group_read<0>();
+  }
+}
+
+#include "cuda/persistent_v3/forward/row_prefetch_pipeline.cuh"
+
+template <bool Fence = true>
+__device__ __forceinline__ void finish_copies() {
+  ::cuda::ptx::cp_async_bulk_wait_group(::cuda::ptx::n32_t<0>{});
+  if constexpr (Fence)
+    __threadfence_system();
+}
+
+// Copy warps can publish disjoint contiguous input sub-batches independently.
+// The two final domain joins protect the shared cursor. GIN's conservative
+// policy retains the original interleaved rows and completion barrier.
+template <unsigned BaseThread, unsigned ActiveCopyWarps = 0U,
+          unsigned SlotOffset = 0U, unsigned BarrierId = 8U,
+          bool Optimize = true, class Storage>
+__device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
+                                                  Storage &s) {
+  constexpr auto warps =
+      ActiveCopyWarps ? ActiveCopyWarps : Storage::kCopyWarps;
+  constexpr auto threads = warps * 32U;
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned warp = tid / 32U, lane = tid % 32U;
+  const auto batch_begin = s.dispatch_cursor;
+  if (batch_begin >= s.dispatch_end)
+    return false;
+  const auto batch_end =
+      min(batch_begin + a.forward_dispatch_publish_batch_rows, s.dispatch_end);
+  const auto warp_rows =
+      (a.forward_dispatch_publish_batch_rows + warps - 1U) / warps;
+  const auto begin = Optimize
+                         ? min(batch_begin + warp * warp_rows, batch_end)
+                         : batch_begin;
+  const auto end = Optimize ? min(begin + warp_rows, batch_end) : batch_end;
+  const unsigned metadata_tid = Optimize ? lane : tid;
+  constexpr unsigned metadata_stride = Optimize ? 32U : threads;
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ProxyRelayStart, ProxyRelay,
+                             blockIdx.x, batch_end - batch_begin,
+                             execution_epoch(a));
+  unsigned peer_rows = 0U;
+  if (begin < end) {
+    for (auto item = begin + metadata_tid; item < end; item += metadata_stride) {
+      const auto route = a.dispatch_waves.local_route_order[item];
+      const auto destination = a.dispatch.route_dst_rank[route];
+      const auto row = a.dispatch.route_dst_row[route];
+      const auto token = route / a.dispatch.identity.top_k;
+      auto *base = a.peer_bases[destination];
+      peer_at<LocalP2pRouteHeader>(base, a.direct_headers_offset)[row] =
+          LocalP2pRouteHeader{
+              transport::kActivationTransportSchemaVersion,
+              a.rank, destination, 0U, a.dispatch.identity.generation,
+              execution_epoch(a), route, route, token, row,
+              a.dispatch.expert_id[route],
+              static_cast<unsigned>(route % a.dispatch.identity.top_k)};
+      peer_at<float>(base, a.canonical_gates_offset)[row] = a.gates[route];
+      peer_rows += destination != a.rank;
+    }
+    if constexpr (Optimize)
+      __syncwarp();
+    if (lane == 0U) {
+      RowPrefetchPipeline<Storage,
+                          Optimize && forward_tuning::kUnifiedRowPrefetch>
+          row_pipeline(s, warp + SlotOffset);
+      for (auto item = begin + (Optimize ? 0U : warp); item < end;
+           item += Optimize ? 1U : warps) {
+        const auto route = a.dispatch_waves.local_route_order[item];
+        const auto destination = a.dispatch.route_dst_rank[route];
+        auto *target = peer_at<transport::BFloat16>(a.peer_bases[destination],
+                                                    a.canonical_rows_offset);
+        row_pipeline.copy(
+            a.input + (route / a.dispatch.identity.top_k) * a.hidden,
+            target + a.dispatch.route_dst_row[route] * a.hidden,
+            unsigned(a.hidden * sizeof(transport::BFloat16)));
+      }
+      row_pipeline.drain();
+      // All metadata writers fence immediately below, including this lane.
+      finish_copies<false>();
+    }
+    __threadfence_system();
+    if constexpr (Optimize)
+      __syncwarp();
+    else
+      copy_sync<threads, BarrierId>();
+    for (auto item = begin + metadata_tid; item < end; item += metadata_stride) {
+      const auto route = a.dispatch_waves.local_route_order[item];
+      local_notification_detail::Receiver<ForwardKernelArgs>::publish_dispatch(
+          a, a.dispatch_waves.route_dst_mtile[route],
+          a.dispatch.route_dst_rank[route] % a.local_world_size);
+    }
+    const auto peers = __reduce_add_sync(0xffffffffU, peer_rows);
+    if (lane == 0U && peers)
+      atomicAdd(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                     ->actual_dispatch_peer_bytes,
+                peers * a.hidden * sizeof(transport::BFloat16));
+  }
+  // No warp may advance the shared cursor until every warp has captured its
+  // current sub-batch and published its completed copies. No Return channel
+  // is touched by these independently progressing Dispatch warps.
+  copy_sync<threads, BarrierId>();
+  if (tid == 0U)
+    s.dispatch_cursor +=
+        1ULL * gridDim.x * a.forward_dispatch_publish_batch_rows;
+  copy_sync<threads, BarrierId>();
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ProxyRelayEnd, ProxyRelay,
+                             blockIdx.x, batch_end - batch_begin,
+                             execution_epoch(a));
+  return true;
+}
+
+// Single notification owner per CTA; copy warps may finish rows in parallel,
+// and the independent publisher warp may concurrently consume incoming slots.
+// This retains the existing bounded credit protocol and source-local reduce
+// publication instead of introducing remote floating-point atomics.
+template <unsigned BaseThread, unsigned CopyThreads = 0U,
+          unsigned BarrierId = 8U, class Storage, class Args, class Fill>
+__device__ __forceinline__ void publish_return(const Args &a, Storage &s,
+                                               unsigned count, Fill fill,
+                                               bool grouped = false) {
+  constexpr auto threads = CopyThreads ? CopyThreads : Storage::kCopyThreads;
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned local = a.rank % a.local_world_size;
+  // Canonical M-blocks often contain rows for a single source peer, even
+  // when the queue also accepts other peers. Verify the actual immutable
+  // entries before using dense notification positions; arbitrary mixed rows
+  // keep the same complete partition below.
+  if (count == 0U)
+    return;
+  unsigned selected_peer = grouped ? s.return_queue - 1U : 0U;
+  if (!grouped) {
+    if (tid == 0U) {
+      s.return_uniform = 1U;
+      s.return_peer = fill(0U).peer;
+    }
+    copy_sync<threads, BarrierId>();
+    bool same_peer = true;
+    for (unsigned i = tid; i < count; i += threads)
+      same_peer = same_peer && fill(i).peer == s.return_peer;
+    const unsigned mismatch = __ballot_sync(0xffffffffU, !same_peer);
+    if ((tid & 31U) == 0U && mismatch)
+      atomicExch(&s.return_uniform, 0U);
+    copy_sync<threads, BarrierId>();
+    grouped = s.return_uniform != 0U;
+    selected_peer = s.return_peer;
+    // Backward marks remote-only entries outside the NVLink peer domain.
+    // Their GIN queue publication still runs after this helper returns.
+    if (grouped && selected_peer >= a.local_world_size)
+      return;
+  }
+  const unsigned first_peer = grouped ? selected_peer : 0U;
+  const unsigned end_peer = grouped ? first_peer + 1U : a.local_world_size;
+  for (unsigned peer = first_peer; peer < end_peer; ++peer) {
+    for (unsigned begin = 0U; begin < count;
+         begin += local_notification_detail::kRows) {
+      const auto end = min(begin + local_notification_detail::kRows, count);
+      if (tid == 0U) {
+        s.return_rows = grouped ? end - begin : 0U;
+        if (!grouped)
+          for (unsigned i = begin; i < end; ++i)
+            s.return_rows += fill(i).peer == peer;
+        if (peer != local)
+          s.notification_sequence = local_notification_detail::channel(
+                                        a, a.local_base, peer, blockIdx.x)
+                                        .sent;
+      }
+      copy_sync<threads, BarrierId>();
+      if (s.return_rows == 0U)
+        continue;
+      if (peer == local) {
+        for (unsigned i = begin + tid; i < end; i += threads) {
+          const auto entry = fill(i);
+          if (entry.peer == peer)
+            local_notification_detail::Receiver<Args>::apply(a, entry.row);
+        }
+        copy_sync<threads, BarrierId>();
+        continue;
+      }
+      const auto sequence = s.notification_sequence;
+      if (tid < 32U)
+        local_notification_detail::wait_credit(a, peer, sequence);
+      copy_sync<threads, BarrierId>();
+      auto &slot = local_notification_detail::channel(
+                       a, a.peer_bases[a.node * a.local_world_size + peer],
+                       local, blockIdx.x)
+                       .slots[sequence % local_notification_detail::kDepth];
+      // Peered queues have dense entries. For a mixed queue each lane counts
+      // its immutable prefix; this is metadata-only and bounded by kRows.
+      for (unsigned i = begin + tid; i < end; i += threads) {
+        const auto entry = fill(i);
+        if (entry.peer != peer)
+          continue;
+        unsigned position = grouped ? i - begin : 0U;
+        if (!grouped)
+          for (unsigned j = begin; j < i; ++j)
+            position += fill(j).peer == peer;
+        slot.rows[position] = entry.row;
+      }
+      __threadfence_system();
+      copy_sync<threads, BarrierId>();
+      if (tid == 0U) {
+        slot.count = s.return_rows;
+        slot.kind = local_notification_detail::Kind::Return;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+            slot.ready)
+            .store(sequence / local_notification_detail::kDepth + 1ULL,
+                   ::cuda::memory_order_release);
+        local_notification_detail::channel(a, a.local_base, peer, blockIdx.x)
+            .sent = sequence + 1ULL;
+      }
+      copy_sync<threads, BarrierId>();
+    }
+  }
+}
+
+template <unsigned BaseThread, unsigned ActiveCopyWarps = 0U,
+          unsigned SlotOffset = 0U, unsigned BarrierId = 8U,
+          bool Optimize = true, bool IndependentDispatch = false, class Storage>
+__device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
+                                                Storage &s) {
+  constexpr auto warps =
+      ActiveCopyWarps ? ActiveCopyWarps : Storage::kCopyWarps;
+  constexpr auto threads = warps * 32U;
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned warp = tid / 32U, lane = tid % 32U;
+  if (tid == 0U) {
+    // Independent direction domains never read each other's live cursor.
+    // A shared copy domain can enlarge Return only after its Dispatch ends.
+    unsigned claim_limit = a.forward_local_return_batch_rows;
+    if constexpr (Optimize && !IndependentDispatch)
+      if (s.dispatch_cursor >= s.dispatch_end)
+        claim_limit = max(claim_limit, forward_tuning::kUnifiedReturnDrainRows);
+    s.return_rows = 0U;
+    const bool peer_queues = return_queue_detail::local_peer_queues(a);
+    const auto first = peer_queues ? 1U : 0U;
+    const auto count = peer_queues ? a.local_world_size : 1U;
+    const auto preferred = (a.rank + blockIdx.x) % count;
+    for (unsigned probe = 0U; probe < count; ++probe) {
+      s.return_queue = first + (preferred + probe) % count;
+      s.return_cursor = forward_return_detail::claim_rows(
+          return_queue_detail::queues(a)[s.return_queue],
+          claim_limit, s.return_rows);
+      if (s.return_rows)
+        break;
+      // Match the established peer affinity: while the preferred finite
+      // queue is still producing, an empty poll or a lost CAS should not
+      // send every CTA into the other peers' queues. Once its exact capacity
+      // has been claimed, these workers may steal remaining peer work.
+      if (Optimize && peer_queues && probe == 0U &&
+          persistent_v3::load_acquire<::cuda::thread_scope_device>(
+              return_queue_detail::queues(a)[s.return_queue].head) !=
+              return_queue_detail::queues(a)[s.return_queue].capacity)
+        break;
+    }
+  }
+  copy_sync<threads, BarrierId>();
+  const unsigned rows = s.return_rows;
+  if (!rows)
+    return false;
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, LocalReturnBatchStart,
+                             LocalReturn, blockIdx.x, rows, execution_epoch(a));
+  const auto cursor = s.return_cursor;
+  const auto *entries =
+      peer_at<const unsigned>(a.local_base, a.forward_return_rows_offset) +
+      return_queue_detail::queues(a)[s.return_queue].begin;
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
+  const auto *output = peer_at<const transport::BFloat16>(
+      a.local_base, a.forward_output_rows_offset);
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (tid == 0U)
+    atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+  if (lane == 0U) {
+    RowPrefetchPipeline<Storage,
+                        Optimize && forward_tuning::kUnifiedRowPrefetch>
+        row_pipeline(s, warp + SlotOffset);
+    for (unsigned item = warp; item < rows; item += warps) {
+      const auto row = entries[cursor + item];
+      const auto header = headers[row];
+      auto *target = peer_at<transport::BFloat16>(
+          a.peer_bases[header.source_rank], a.contribution_offset);
+      row_pipeline.copy(output + row * a.hidden,
+                        target + header.route_index * a.hidden,
+                        unsigned(a.hidden * sizeof(transport::BFloat16)));
+    }
+    row_pipeline.drain();
+    finish_copies();
+  }
+  copy_sync<threads, BarrierId>();
+  publish_return<BaseThread, threads, BarrierId>(
+      a, s, rows,
+      [&](unsigned item) {
+        const auto header = headers[entries[cursor + item]];
+        return local_notification_detail::Entry{
+            header.source_rank % a.local_world_size, header.route_index};
+      },
+      return_queue_detail::local_peer_queues(a));
+  unsigned peer_rows = 0U;
+  for (unsigned item = tid; item < rows; item += threads)
+    peer_rows += headers[entries[cursor + item]].source_rank != a.rank;
+  const auto peers = __reduce_add_sync(0xffffffffU, peer_rows);
+  if (lane == 0U && peers)
+    atomicAdd(&status->actual_return_peer_bytes,
+              1ULL * peers * a.hidden * sizeof(transport::BFloat16));
+  copy_sync<threads, BarrierId>();
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, LocalReturnBatchEnd,
+                             LocalReturn, blockIdx.x, rows, execution_epoch(a));
+  return true;
+}
+
+// Like the established local notification drain, but the warp may begin at a
+// nonzero thread offset. End chunks belong only to this CTA's outgoing stream.
+template <unsigned BaseThread, class Args, class Cancelled>
+__device__ __forceinline__ void drain_notifications(const Args &a,
+                                                    Cancelled cancelled) {
+  const unsigned lane = local_thread<BaseThread>() % 32U;
+  const unsigned local = a.rank % a.local_world_size;
+  for (unsigned peer = 0U; peer < a.local_world_size; ++peer) {
+    if (peer == local)
+      continue;
+    auto &state =
+        local_notification_detail::channel(a, a.local_base, peer, blockIdx.x);
+    const auto sequence = state.sent;
+    local_notification_detail::wait_credit(a, peer, sequence);
+    if (lane == 0U) {
+      auto &slot = local_notification_detail::channel(
+                       a, a.peer_bases[a.node * a.local_world_size + peer],
+                       local, blockIdx.x)
+                       .slots[sequence % local_notification_detail::kDepth];
+      slot.count = 0U;
+      slot.kind = local_notification_detail::Kind::End;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
+          slot.ready)
+          .store(sequence / local_notification_detail::kDepth + 1ULL,
+                 ::cuda::memory_order_release);
+      state.sent = sequence + 1ULL;
+    }
+    __syncwarp();
+  }
+  while (true) {
+    // Cancellation may arrive between lane loads; leave the warp uniformly
+    // before entering progress and the full-mask completion shuffle below.
+    const unsigned stop = lane == 0U ? unsigned(cancelled()) : 0U;
+    if (__shfl_sync(0xffffffffU, stop, 0U))
+      break;
+    local_notification_detail::progress(a);
+    unsigned done = 1U;
+    if (lane == 0U) {
+      for (unsigned peer = 0U; peer < a.local_world_size; ++peer) {
+        if (peer == local)
+          continue;
+        auto &state = local_notification_detail::channel(a, a.local_base, peer,
+                                                         blockIdx.x);
+        done &= ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+                    state.ended)
+                    .load(::cuda::memory_order_acquire) != 0U;
+        const auto claimed =
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+                state.claimed)
+                .load(::cuda::memory_order_acquire);
+        for (unsigned slot = 0U; slot < local_notification_detail::kDepth;
+             ++slot) {
+          constexpr unsigned depth = local_notification_detail::kDepth;
+          done &= ::cuda::atomic_ref<unsigned long long,
+                                     ::cuda::thread_scope_device>(
+                      state.slots[slot].consumed)
+                      .load(::cuda::memory_order_acquire) >=
+                  (claimed + depth - 1U - slot) / depth;
+          done &= ::cuda::atomic_ref<unsigned long long,
+                                     ::cuda::thread_scope_system>(
+                      state.slots[slot].credit)
+                      .load(::cuda::memory_order_acquire) >=
+                  (state.sent + depth - 1U - slot) / depth;
+        }
+      }
+    }
+    if (__shfl_sync(0xffffffffU, done, 0U))
+      break;
+    __nanosleep(50U);
+  }
+}
+
+template <unsigned BaseThread>
+__device__ __forceinline__ void
+drain_notifications(const ForwardKernelArgs &a) {
+  drain_notifications<BaseThread>(a, [&] { return forward_cancelled(a); });
+}
+
+#include "cuda/persistent_v3/forward/unified_gin.cuh"
+
+// Publish input groups, then apply completed incoming Return notifications
+// until the copy workers finish draining their channels.
+template <class Storage>
+__device__ __forceinline__ void
+run_publisher(const ForwardKernelArgs &a,
+               persistent_v3::ForwardPipelineControl &control,
+               unsigned long long *scheduler, Storage &s) {
+  const unsigned lane = threadIdx.x % 32U;
+  if (lane == 0U)
+    forward_dispatch_detail::publish_ready_fc1_tasks(a, blockIdx.x, gridDim.x,
+                                                     scheduler);
+  __syncwarp();
+  while (true) {
+    unsigned done = 0U;
+    if (lane == 0U)
+      done = ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
+                 s.copies_done).load(::cuda::memory_order_acquire) != 0U ||
+             cancelled(a, control);
+    if (__shfl_sync(0xffffffffU, done, 0U))
+      break;
+    if (!local_notification_detail::progress(a))
+      __nanosleep(50U);
+  }
+}
+
+template <bool UseGin, unsigned BaseThread, class Storage>
+__device__ __forceinline__ void
+run_impl(const ForwardKernelArgs &a,
+         persistent_v3::ForwardPipelineControl &control,
+         unsigned long long *scheduler, Storage &s) {
+  const unsigned tid = local_thread<BaseThread>();
+  const unsigned warp = tid / 32U;
+  init<BaseThread>(a, control, s);
+  if (warp == Storage::kCopyWarps) {
+    run_publisher(a, control, scheduler, s);
+  } else {
+    while (true) {
+      if (warp == 0U)
+        local_notification_detail::progress(a);
+      copy_sync<Storage::kCopyThreads>();
+      bool remote_progress = false;
+      if constexpr (UseGin) {
+        remote_progress = gin_detail::progress_receive<BaseThread>(a, s, false);
+        remote_progress =
+            gin_detail::progress_receive<BaseThread>(a, s, true) ||
+            remote_progress;
+        remote_progress =
+            gin_detail::progress_send<BaseThread>(a, control, s) ||
+            remote_progress;
+      }
+      constexpr bool optimize_local =
+          !UseGin || forward_tuning::kUnifiedOptimizeGinLocalTransport;
+      const bool dispatched =
+          progress_dispatch<BaseThread, 0U, 0U, 8U, optimize_local>(a, s);
+      const bool returned =
+          progress_return<BaseThread, 0U, 0U, 8U, optimize_local>(a, s);
+      if (tid == 0U) {
+        if (!s.dispatch_complete && s.dispatch_cursor >= s.dispatch_end &&
+            (!UseGin ||
+             forward_dispatch_detail::ring_detail::receive_complete(a, true))) {
+          s.dispatch_complete = 1U;
+          const auto previous =
+              persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+                  control.relay_dispatch_roles_complete.value, 1ULL);
+          if (previous + 1ULL == gridDim.x) {
+            peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                ->dispatch_complete_clock = device_globaltimer_ns();
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, XDispatchComplete,
+                                       ProxyRelay, 0U, s.dispatch_end,
+                                       execution_epoch(a));
+          }
+        }
+        forward_return_detail::LocalReturnState state;
+        state.queue_index = s.return_queue;
+        s.stop = cancelled(a, control) ||
+                 (s.dispatch_complete &&
+                  forward_return_detail::local_return_terminal(a, state) &&
+                  (!UseGin ||
+                   (forward_dispatch_detail::ring_detail::receive_complete(
+                        a, false) &&
+                    persistent_v3::load_acquire<::cuda::thread_scope_device>(
+                        control.rdma_return_roles_complete.value) ==
+                        a.gin_context_count)));
+      }
+      copy_sync<Storage::kCopyThreads>();
+      if (s.stop)
+        break;
+      if (!dispatched && !returned && !remote_progress)
+        __nanosleep(forward_tuning::kTransportIdleNanosleep);
+    }
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, LocalReturnTerminal,
+                               LocalReturn, blockIdx.x, s.return_cursor,
+                               execution_epoch(a));
+    if (warp == 0U)
+      drain_notifications<BaseThread>(a);
+    copy_sync<Storage::kCopyThreads>();
+    if (tid == 0U) {
+      atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                     ->return_complete_clock,
+                device_globaltimer_ns());
+      if constexpr (!UseGin)
+        persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+            control.rdma_return_roles_complete.value, 1ULL);
+      persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+          control.return_receive_roles_complete.value, 1ULL);
+      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.copies_done)
+          .store(1U, ::cuda::memory_order_release);
+    }
+  }
+  domain_sync<Storage::kThreads>();
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, TransportRoleDone,
+                             LocalReturn, blockIdx.x, 0ULL, execution_epoch(a));
+}
+
+// Explicit thread-count spelling makes call sites auditable while preserving
+// arbitrary segment/buffer tuning in the independent shared allocation.
+template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
+          unsigned Buffers>
+__device__ __forceinline__ void
+run(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
+    unsigned long long *scheduler,
+    Shared<Threads, SegmentBytes, Buffers> &storage) {
+  run_impl<false, BaseThread>(a, control, scheduler, storage);
+}
+
+template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
+          unsigned Buffers>
+__device__ __forceinline__ void
+run_gin(const ForwardKernelArgs &a,
+        persistent_v3::ForwardPipelineControl &control,
+        unsigned long long *scheduler,
+        Shared<Threads, SegmentBytes, Buffers> &storage) {
+  run_impl<true, BaseThread>(a, control, scheduler, storage);
+}
+
+#include "cuda/persistent_v3/forward/unified_local_warps.cuh"
+
+} // namespace forward_unified_transport
+
+#endif // __has_include(<nccl_device.h>)

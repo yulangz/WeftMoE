@@ -24,6 +24,44 @@ def grid_count(topology):
 
 
 class ForwardAutotuneTest(unittest.TestCase):
+    def test_opportunistic_reduce_stays_within_math_warps(self):
+        for warps in (1, 8):
+            tune.validate_tuning(dict(self.candidates[0]["config"],
+                                      opportunistic_reduce_warps=warps))
+        for warps in (0, 9):
+            with self.subTest(warps=warps), self.assertRaisesRegex(
+                    tune.PlanError, "opportunistic_reduce_warps"):
+                tune.validate_tuning(dict(self.candidates[0]["config"],
+                                          opportunistic_reduce_warps=warps))
+
+    def test_resource_inspection_selects_active_kernel_family(self):
+        unified_symbols = [f"_unified_forward_kernel_local{local}_retain{retain}"
+                           for local in (0, 1) for retain in (0, 1)]
+        split_symbol = "_local_p2p_forward_tma_store_kernel"
+        for unified, symbols, expected in (
+            (1, unified_symbols + [split_symbol], 4),
+            (1, [split_symbol], 0),
+            (0, unified_symbols + [split_symbol], 1),
+            (0, unified_symbols, 0),
+        ):
+            fixture = "".join(
+                f" Function {symbol}:\n REG:168 STACK:120 SHARED:2048 LOCAL:0\n"
+                for symbol in symbols)
+            with self.subTest(unified=unified, symbols=symbols), \
+                    tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(tune.shutil, "which", return_value="cuobjdump"), \
+                    mock.patch.object(tune.subprocess, "run", return_value=mock.Mock(
+                        returncode=0, stdout=fixture)):
+                result = tune.inspect_forward_kernel(
+                    Path("binary"), Path(tmp) / "resources.log",
+                    dict(self.candidates[0]["config"], unified_workers=unified))
+            self.assertEqual(result["valid_compiled_kernel_set"], expected > 0)
+            self.assertEqual(len(result["kernels"]), expected)
+            self.assertEqual(result["compiled_unified_kernel_count"],
+                             expected if unified else 0)
+            self.assertTrue(all(("unified_forward_kernel" in kernel["mangled_name"])
+                                == bool(unified) for kernel in result["kernels"]))
+
     def test_runtime_does_not_select_checkout_nccl_artifacts(self):
         from autotune_common import resolve_runtime_settings
 
@@ -263,20 +301,32 @@ class ForwardAutotuneTest(unittest.TestCase):
     def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
+        shared = (ROOT / "src/cuda/unified_worker_tuning.hpp").read_text()
+        atom = (ROOT / "src/cuda/primitives/hopper.cuh").read_text()
+        ring = (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
+        common_macros = set(re.findall(
+            r"^#ifndef (WEFTMOE_UNIFIED_GIN_(?:CONTEXT_PROBES|PACK_SLOTS)|WEFTMOE_WGMMA_N256_ATOM_N|WEFTMOE_GIN_RING_DEPTH)$",
+            shared + "\n" + atom + "\n" + ring, flags=re.MULTILINE))
         cpp_macros = set(re.findall(
-            r"^#ifndef (WEFTMOE_FWD_[A-Z0-9_]+)$", header,
+            r"^#ifndef (WEFTMOE_FWD_[A-Z0-9_]+)$", header + shared,
             flags=re.MULTILINE))
-        self.assertEqual(cpp_macros, set(tune.PARAMETER_MACROS.values()))
+        self.assertEqual(cpp_macros | common_macros, set(tune.PARAMETER_MACROS.values()))
 
     def test_cpp_defaults_form_a_valid_tuning_point(self):
         header = (ROOT / "src" / "cuda" / "forward" /
                   "tuning_config.hpp").read_text(encoding="utf-8")
+        header += (ROOT / "src/cuda/primitives/hopper.cuh").read_text()
+        header += (ROOT / "src/cuda/unified_worker_tuning.hpp").read_text()
+        header += (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
         cpp_defaults = dict(re.findall(
-            r"^#define (WEFTMOE_FWD_[A-Z0-9_]+) ([0-9]+)$", header,
+            r"^#define (WEFTMOE_(?:FWD_[A-Z0-9_]+|UNIFIED_[A-Z0-9_]+|WGMMA_N256_ATOM_N|GIN_RING_DEPTH)) ([A-Za-z0-9_]+)$", header,
             flags=re.MULTILINE))
         config = {}
         for key, macro in tune.PARAMETER_MACROS.items():
-            value = int(cpp_defaults[macro])
+            value = cpp_defaults[macro]
+            while not value.isdecimal():
+                value = cpp_defaults[value]
+            value = int(value)
             if key in tune.BOOLEAN_PARAMETERS:
                 value = bool(value)
             elif key in tune.ENUM_PARAMETERS:

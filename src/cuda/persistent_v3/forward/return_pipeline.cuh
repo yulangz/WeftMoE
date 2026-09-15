@@ -3,6 +3,24 @@
 #include "cuda/communication/notification_pipeline.cuh"
 #include "cuda/communication/return_queue.cuh"
 
+namespace forward_return_detail {
+// The fixed count matrix supplies the accounting total; Return scheduling
+// itself consumes row queues and terminal chunks, without a compact directory.
+// This accounting helper is also parsed by the terminal protocol in builds
+// without the optional device NCCL headers.
+__device__ __forceinline__ unsigned long long
+source_compact_rows(const ForwardKernelArgs &a) {
+  unsigned long long rows = 0;
+  for (unsigned expert = 0; expert < a.dispatch.identity.num_experts; ++expert)
+    if (a.dispatch.expert_to_rank[expert] / a.local_world_size != a.node)
+      rows +=
+          a.dispatch
+              .source_expert_count[a.rank * a.dispatch.identity.num_experts +
+                                   expert];
+  return rows;
+}
+} // namespace forward_return_detail
+
 // FC2 publishes canonical row IDs. Relay consumes the local queue; each fixed
 // GIN owner consumes its remote queue. A separate arrival queue carries compact
 // row IDs back to the source. No worker searches compute tiles or chunk flags.
@@ -18,20 +36,6 @@ cancelled(const ForwardKernelArgs &a,
   return forward_cancelled(a) ||
          persistent_v3::load_acquire<::cuda::thread_scope_device>(
              control.generation.control.error_code.value) != 0ULL;
-}
-
-// The fixed count matrix supplies the accounting total; Return scheduling
-// itself consumes row queues and terminal chunks, without a compact directory.
-__device__ __forceinline__ unsigned long long
-source_compact_rows(const ForwardKernelArgs &a) {
-  unsigned long long rows = 0;
-  for (unsigned expert = 0; expert < a.dispatch.identity.num_experts; ++expert)
-    if (a.dispatch.expert_to_rank[expert] / a.local_world_size != a.node)
-      rows +=
-          a.dispatch
-              .source_expert_count[a.rank * a.dispatch.identity.num_experts +
-                                   expert];
-  return rows;
 }
 
 __device__ __forceinline__ unsigned long long

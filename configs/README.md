@@ -14,6 +14,65 @@ FWD denotes forward execution; BWD denotes backward execution. A CTA is a CUDA
 thread block. A warp contains 32 threads, and a warpgroup contains four warps.
 An M-block is a block of routed rows belonging to one expert.
 
+The public grids now select unified workers: every CTA contains math and
+communication roles. Single-node FWD has 8 candidates, multi-node FWD has 72,
+and BWD has 12 single-node or 36 multi-node resource-valid candidates.
+
+The FWD-only `gin_channel_pack_limit` axis is `[3, 1, 2]` for multi-node and
+`[3]` for single-node, default 3, with
+valid values 1–8. It limits simultaneous packing reservations for one channel.
+Value 1 selects the original single-reservation path at compile time; larger
+values remain bounded by context slots and ring credit. The default equal to
+the context slot count adds no per-channel counting. Communication workers use this policy; ordered submission and queue ownership
+stay unchanged. Old FWD plans missing this key upgrade to 3; BWD does not
+accept it. These GIN-only axes, context probes, context packing slots and
+GIN local-transport policy are singletons in the public single-node grid,
+whose `StaticLocal` specialization never executes GIN. Custom JSON plans
+retain the full parameter ranges; only the public search space is narrowed.
+See the
+[worker architecture](../docs/full_cta_all_worker.md) for phase resource
+parameters and the legacy-only transport settings fixed in these grids.
+
+`gin_ring_depth` controls the physical RDMA TX/RX ring slots **per channel**,
+independently of the context's `unified_gin_pack_slots` packing reservations.
+The public multi-node axis is `[8, 4, 16]`; single-node fixes it to `[8]` because
+local execution does not use GIN. It changes persistent device-memory storage,
+local-completion counters and credit windows, without adding shared memory or
+changing the payload chunk size. Forward and Backward must use the same value
+in a combined binary. Increasing depth enlarges the credit window and the
+final drain checks; normal ACK polling uses a dirty bitmap instead of scanning
+every physical slot. Retune rather than assuming a larger value always helps.
+
+Bare builds default to 8. New generated headers explicitly define
+`WEFTMOE_GIN_RING_DEPTH`. Old plans and build records missing the key, and old
+generated headers missing the macro, retain depth 4 when rebuilt. Headers
+passed through `-include` are recognized by their pre-existing Forward or
+Backward model-dimension macros; direct compiler dimension overrides without
+an explicit depth conservatively follow the same compatibility rule. To
+change an older profile, define `WEFTMOE_GIN_RING_DEPTH=8` or `16` explicitly.
+This is a compile-time wire-layout setting: every rank must use the same
+compiled depth, and an existing resource pool cannot change it at runtime.
+
+The selected all-CTA Qwen and Flash profiles with eight physical slots are in
+[`full_cta_all_worker_20260915`](full_cta_all_worker_20260915/README.md).
+They copy the actual final build headers and retain all other September 14
+kernel tuning values. The source now uses bitmap ACK without an optional scan
+branch. Their README distinguishes final native and EP16/E256/8K/64K FWD/BWD
+checks from earlier EP8 and Graph evidence, including identical final kernel
+machine code. Formal EP8 performance was not rerun. Full samples are in the
+[communication report](../benchmarks/ring_depth_20260915.md).
+The [September 14 all-CTA profiles](full_cta_all_worker_20260914/README.md)
+remain unchanged with their original four-slot wire layout.
+
+ACK uses a per-channel dirty bitmap to identify completed RX slot generations.
+Consumers publish a bit only after retiring the original payload work; the
+leased ACK owner acquires and clears the current mask, then returns one credit
+for each captured bit. Empty polls do not scan every physical slot. The bitmap
+occupies existing channel padding, so registered-window sizes and slot offsets
+remain unchanged. Final drain checks still verify the durable per-slot counts.
+This reduces control overhead without changing payload bytes or completion
+ordering. The independent publisher GIN service remains an isolated experiment.
+
 ## GEMM Parameters (`1_gemm`)
 
 Tile dimensions determine work granularity and data reuse. Pipeline stages
@@ -131,7 +190,7 @@ Its thread-count setting does not change the main compute-worker allocation.
 | `reduce_threads` | BWD | Threads per input-gradient reduction CTA. Each warp handles one token in the current implementation. Start with 256; larger CTAs may reduce scheduling flexibility for short reductions. |
 | `reduce_idle_nanosleep` | BWD | Backoff hint while waiting for input-gradient route contributions. |
 
-The current Qwen3.5-35B-A3B and DeepSeek-V4-Flash profiles are in
+Earlier Qwen3.5-35B-A3B and DeepSeek-V4-Flash GEMM optimization profiles are preserved in
 [`performance_20260914/profiles.json`](performance_20260914/profiles.json).
 FC2 uses three input stages and `fc2_claim_tiles=4` on both models. This
 parameter accepts 1, 2, 4 or 8 tiles per CTA, clamped to the remaining N tiles

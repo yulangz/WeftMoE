@@ -1,5 +1,5 @@
 #include "cuda/forward/kernels/primitives.cuh"
-template <bool StaticLocal>
+template <bool StaticLocal, bool SetupOnly = false>
 __global__
 __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
     ForwardKernelArgs a) {
@@ -35,9 +35,9 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
       remote_backend_enabled<StaticLocal>(a.use_gin) &&
       a.dispatch.identity.num_nodes >= 2U &&
       forward_rdma_ctas == persistent_v3::kRdmaCtaCount &&
-      forward_relay_ctas == configured_relay_ctas &&
+      (SetupOnly || (forward_relay_ctas == configured_relay_ctas &&
       forward_relay_ctas >= persistent_v3::kRdmaCtaCount &&
-      forward_relay_ctas % persistent_v3::kRdmaCtaCount == 0U;
+      forward_relay_ctas % persistent_v3::kRdmaCtaCount == 0U));
   const bool stream_local_dispatch = StaticLocal &&
                                      a.forward_stream_local_dispatch &&
                                      gridDim.x == a.forward_relay_cta_count;
@@ -276,6 +276,9 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
   forward_transport_wait_epoch(&scheduler[8ULL + 2ULL * a.world],
                                execution_epoch(a));
 #endif
+
+  if constexpr (SetupOnly)
+    return;
 
 #if __has_include(<nccl_device.h>)
   if (stream_local_dispatch) {

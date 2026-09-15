@@ -3,12 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda/atomic>
-#include <nccl_device.h>
+#include "cuda/communication/tuning_config.hpp"
+#include "cuda/communication/nccl_device_assert_trap.cuh"
 
 namespace weftmoe::cuda::communication {
 
 inline constexpr unsigned kChunkRows = 128;
-inline constexpr unsigned kRingDepth = 4;
+inline constexpr unsigned kRingDepth = WEFTMOE_GIN_RING_DEPTH;
 inline constexpr unsigned kDispatchChannels = 8;
 inline constexpr unsigned kReturnPorts = 2;
 
@@ -28,8 +29,16 @@ struct alignas(128) ChunkChannel {
   unsigned long long tx_end;
   unsigned int tx_terminal;
   unsigned int rx_terminal;
+  // Reuses header padding without changing slot/control offsets. Like the
+  // sequence counters, this bitmap survives operation prepare and Graph
+  // replay. New windows are zeroed once; successful drain consumes every bit.
+  unsigned long long consumed_slots;
   ChunkSlot slots[kRingDepth];
 };
+static_assert(kRingDepth <= 64U);
+static_assert(offsetof(ChunkChannel, consumed_slots) == 40U);
+static_assert(offsetof(ChunkChannel, slots) == 64U);
+static_assert(sizeof(ChunkChannel) == 128U + kRingDepth * sizeof(ChunkSlot));
 
 struct alignas(16) ChunkHeader {
   unsigned int rows;
@@ -150,28 +159,41 @@ __device__ __forceinline__ bool claim(const ncclGin &gin, ncclWindow_t window,
 __device__ __forceinline__ void consumed(void *base, ChunkRingLayout layout,
                                          unsigned channel,
                                          unsigned long long sequence) {
-  auto &slot = channels(base, layout)[channel].slots[sequence % kRingDepth];
+  auto &state = channels(base, layout)[channel];
+  auto &slot = state.slots[sequence % kRingDepth];
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
       slot.consumed)
       .store(sequence / kRingDepth + 1ULL, ::cuda::memory_order_release);
+  // Every RX/TMA reader has retired before this call. Publish its slot only
+  // after consumed; the ACK owner's acquire exchange imports that completion.
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+      state.consumed_slots)
+      .fetch_or(1ULL << (sequence % kRingDepth), ::cuda::memory_order_release);
 }
 
-// Called exclusively by this channel's GIN owner. Copy workers cannot return
-// credit until every TMA/NVLink reader of the RX slot has completed.
+// Called by the unique legacy GIN owner or under the unified context lease.
+// Copy workers cannot return credit until every TMA/NVLink reader has retired.
 __device__ __forceinline__ bool
 acknowledge(const ncclGin &gin, ncclWindow_t window, void *base,
             ChunkRingLayout layout, unsigned channel, unsigned remote_channel,
             unsigned peer) {
   auto &state = channels(base, layout)[channel];
   bool progressed = false;
-  for (unsigned i = 0; i < kRingDepth; ++i) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
+      state.consumed_slots);
+  // Empty polls are read-only. A completion racing this zero observation is
+  // retained in the bitmap and serviced on a later pass.
+  if (ready.load(::cuda::memory_order_relaxed) == 0ULL)
+    return false;
+  auto dirty = ready.exchange(0ULL, ::cuda::memory_order_acquire);
+  while (dirty != 0ULL) {
+    const unsigned i = unsigned(__ffsll(static_cast<long long>(dirty)) - 1);
+    dirty &= dirty - 1ULL;
     auto &slot = state.slots[i];
-    const auto done =
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-            slot.consumed)
-            .load(::cuda::memory_order_acquire);
-    if (done == slot.acknowledged)
-      continue;
+    // One bit represents one credit. Before this credit is issued, the
+    // sender cannot reuse this physical slot, so its next completion cannot
+    // coalesce into the captured bit. A completion after the exchange ORs
+    // into the next global mask, even while this ACK batch is still running.
     gin.signal(
         ncclTeamWorld(gin.comm), peer,
         ncclGin_StrongVASignalAdd{window,

@@ -44,6 +44,7 @@ from autotune_common import (
     weighted_metric,
     write_result as _common_write_result,
 )
+import unified_tuning
 from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
@@ -68,6 +69,8 @@ PARAMETER_MACROS = {
     "fc1_stages": "WEFTMOE_FWD_FC1_STAGES",
     "fc2_stages": "WEFTMOE_FWD_FC2_STAGES",
     "fc2_claim_tiles": "WEFTMOE_FWD_FC2_CLAIM_TILES",
+    "opportunistic_reduce_warps": "WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS",
+    "gin_channel_pack_limit": "WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT",
     "compute_threads": "WEFTMOE_FWD_COMPUTE_THREADS",
     "math_warpgroups": "WEFTMOE_FWD_MATH_WARPGROUPS",
     "producer_warpgroups": "WEFTMOE_FWD_PRODUCER_WARPGROUPS",
@@ -107,6 +110,8 @@ PARAMETER_MACROS = {
     "return_idle_nanosleep": "WEFTMOE_FWD_RETURN_IDLE_NANOSLEEP",
     "reduce_queue_nanosleep": "WEFTMOE_FWD_REDUCE_QUEUE_NANOSLEEP",
     "finalize_nanosleep": "WEFTMOE_FWD_FINALIZE_NANOSLEEP",
+    "unified_workers": "WEFTMOE_FWD_UNIFIED_WORKERS",
+    **unified_tuning.parameter_macros("forward"),
 }
 
 # Preserve internal keys/macros for running autotunes and cached candidates.
@@ -178,6 +183,11 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
             _require(type(value) is int, f"{key} must be an integer")
             _require(value >= 0, f"{key} must be non-negative")
 
+    unified_tuning.validate(config)
+    _require(1 <= config["opportunistic_reduce_warps"] <= 8,
+             "opportunistic_reduce_warps must be in [1, 8]")
+    _require(1 <= config["gin_channel_pack_limit"] <= 8,
+             "gin_channel_pack_limit must be in [1, 8]")
     _require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
              "main_hidden must be a positive multiple of 256")
     _require(config["main_intermediate"] > 0 and config["main_intermediate"] % 256 == 0,
@@ -216,6 +226,11 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "Forward requires the FC2 TMA-store epilogue")
     _require(dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
              "GEMM input/output staging exceeds Hopper shared memory")
+    if config["unified_workers"]:
+        unified_tuning.require_resources(unified_tuning.shared_memory_upper_bound(
+            config, dynamic_shared_memory(config, 16)["compute_bytes"],
+            phase="forward") <= 227 * 1024,
+            "unified compute and communication staging exceed Hopper shared memory")
     _require((config["main_intermediate"] // config["fc1_tile_n"]) % 2 == 0
              and (config["main_hidden"] // config["fc2_tile_n"]) % 2 == 0,
              "cluster multicast requires even FC1 and FC2 N-tile counts")
@@ -281,6 +296,9 @@ def expand_search_space(document: dict[str, Any]) -> None:
         _require(type(value) is int and value > 0 and value % 256 == 0,
                  f"model.{key} must be a positive multiple of 256")
     space = copy.deepcopy(document["search_space"])
+    unified_tuning.upgrade_legacy_groups(
+        space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
+                                          "gin_channel_pack_limit": 3})
     provided = flatten_groups(space, require_all=False)
     # Normalize without reordering axes so candidate names and overrides stay
     # identical when a configuration adopts the new public spelling.
@@ -319,6 +337,8 @@ def expand_search_space(document: dict[str, Any]) -> None:
                            "override": override})
     document["fixed"] = fixed
     document["candidates"] = candidates
+    unified_tuning.filter_generated_candidates(
+        document, flatten_groups, validate_tuning)
 
 
 def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
@@ -328,6 +348,9 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
     topology, jit_overrides = resolve_runtime_settings(
         model=model, system=system, repo_root=REPO_ROOT)
     space = constrain_transport_space(space, topology)
+    unified_tuning.upgrade_legacy_groups(
+        space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
+                                          "gin_channel_pack_limit": 3})
     flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
@@ -375,6 +398,10 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     _require(document.get("schema") in (2, 3), "plan schema must be 2 or 3")
     if document["schema"] == 2:
+        unified_tuning.upgrade_legacy_groups(
+            document.setdefault("fixed", {}),
+            extra_defaults={"opportunistic_reduce_warps": 1,
+                            "gin_channel_pack_limit": 3})
         document.get("fixed", {}).get("1_gemm", {}).setdefault("fc2_claim_tiles", 1)
         # Historical frozen plans retain this removed tail-only parameter.
         # New pure hyperparameter files reject it as unknown.
@@ -526,18 +553,22 @@ def materialize_candidate(candidate: Mapping[str, Any],
     }
 
 
-def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
+def gemm_storage_bytes(config: Mapping[str, Any]) -> int:
     a_stage = config["tile_m"] * config["tile_k"]
     fc1_b_stage = config["fc1_tile_n"] * config["tile_k"]
     fc2_b_stage = config["fc2_tile_n"] * config["tile_k"]
     a_storage = max(config["fc1_stages"], config["fc2_stages"]) * a_stage
     b_storage = max(2 * config["fc1_stages"] * fc1_b_stage,
                     config["fc2_stages"] * fc2_b_stage)
-    barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
     fc2_storage = config["fc2_stages"] * (a_stage + fc2_b_stage)
     if config["fc2_claim_tiles"] > 1:
         fc2_storage += config["tile_m"] * config["fc2_tile_n"]
-    gemm_bytes = 2 * max(a_storage + b_storage, fc2_storage)
+    return 2 * max(a_storage + b_storage, fc2_storage)
+
+
+def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
+    gemm_bytes = gemm_storage_bytes(config)
+    barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
     control_bytes = barriers * 8 + world * 4
     row_streams = max(config["local_dispatch_tma_warps"],
                       config["relay_tma_warps"], config["relay_scatter_warps"])
@@ -560,7 +591,8 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
     log_path.write_text(completed.stdout, encoding="utf-8")
     functions = []
     lines = completed.stdout.splitlines()
-    kernel_names = (
+    unified = bool(config["unified_workers"])
+    kernel_names = ("unified_forward_kernel",) if unified else (
         "local_p2p_forward_tma_store_kernel",
         "local_p2p_forward_compute_kernel",
     )
@@ -583,10 +615,21 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
     return {
         "available": completed.returncode == 0,
         "returncode": completed.returncode,
-        "single_compiled_split_kernel": len(functions) == 1,
-        "compiled_split_kernel_count": len(functions),
+        "layout": "unified" if unified else "split",
+        # Unified local/GIN and retained-state specializations share a layout;
+        # each instantiated entry must be inspected, rather than counted as a
+        # conflicting extra split kernel.
+        "valid_compiled_kernel_set": bool(functions) if unified else len(functions) == 1,
+        "single_compiled_split_kernel": not unified and len(functions) == 1,
+        "compiled_split_kernel_count": 0 if unified else len(functions),
+        "compiled_unified_kernel_count": len(functions) if unified else 0,
         "kernels": functions,
         "dynamic_shared_memory_world16": dynamic_shared_memory(config, 16),
+        "unified_total_shared_memory_upper_bound_world16": (
+            unified_tuning.shared_memory_upper_bound(
+                config, dynamic_shared_memory(config, 16)["compute_bytes"],
+                phase="forward")
+            if unified else None),
         "log": str(log_path),
     }
 
@@ -629,10 +672,11 @@ def compile_candidate(candidate: Mapping[str, Any],
             candidate["config"])
         result["resources"] = resources
         if (resources.get("available") and
-                not resources.get("single_compiled_split_kernel")):
+                not resources.get("valid_compiled_kernel_set")):
             result["returncode"] = 125
             result["resource_validation_error"] = (
-                "expected exactly one compiled split Forward kernel")
+                "expected unified Forward entries" if candidate["config"]["unified_workers"]
+                else "expected exactly one compiled split Forward kernel")
     return result
 
 

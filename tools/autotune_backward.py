@@ -39,6 +39,7 @@ from autotune_common import (
     weighted_metric,
     write_result,
 )
+import unified_tuning
 from forward_jit import BackwardJitCompiler, JitError, validate_jit_config
 
 
@@ -84,6 +85,8 @@ PARAMETER_MACROS = {
     "dw1_claim_tiles": "WEFTMOE_BWD_DW1_CLAIM_TILES",
     "reduce_threads": "WEFTMOE_BWD_REDUCE_THREADS",
     "reduce_idle_nanosleep": "WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP",
+    "unified_workers": "WEFTMOE_BWD_UNIFIED_WORKERS",
+    **unified_tuning.parameter_macros("backward"),
 }
 
 EXPECTED_INVARIANTS = {
@@ -128,6 +131,15 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         require(type(value) is int, f"{key} must be an integer")
         require(value >= 0, f"{key} must be non-negative")
 
+    unified_tuning.validate(config)
+    if config["unified_workers"]:
+        require(config["unified_producer_registers"] in
+                (0, config["unified_control_registers"]),
+                "Backward currently shares the producer and communication register quota")
+        warps = config["unified_comm_threads"] // 32
+        unified_tuning.require_resources(warps * 32 * 8 <= (warps - 1) * config["unified_segment_bytes"] *
+                config["unified_copy_buffers"],
+                "Backward retired communication staging must hold reduce pointer tables")
     require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
              "main_hidden must be a positive multiple of 256")
     require(config["main_intermediate"] > 0 and config["main_intermediate"] % 256 == 0,
@@ -168,6 +180,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require(registers <= 65536,
             f"compute register allocation {registers} exceeds 65536")
 
+    if config["unified_workers"]:
+        unified_tuning.require_resources(unified_tuning.shared_memory_upper_bound(
+            config, dynamic_shared_memory(config), phase="backward") <= 227 * 1024,
+            "unified compute and communication staging exceed Hopper shared memory")
     require(config["rdma_ctas"] in (0, 8),
             "RDMA CTAs must be zero for local or eight for GIN")
     require(config["relay_ctas"] >= 8 and config["relay_ctas"] % 4 == 0,
@@ -195,6 +211,7 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
     topology, jit_overrides = resolve_runtime_settings(
         model=model, system=system, repo_root=REPO_ROOT)
     space = constrain_transport_space(space, topology)
+    unified_tuning.upgrade_legacy_groups(space, search=True)
     flat = flatten_groups(space, require_all=False)
     require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
             "hyperparameters must cover every tuning parameter and exclude model dimensions")
@@ -219,7 +236,7 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
     require(not (set(workload) - {"tokens_per_rank", "seed", "tune_rounds", "final_rounds",
         "timeout_seconds", "result_dir", "preflight_world", "preflight_tokens"}),
         "benchmark contains model/system fields or unknown settings")
-    return dict(schema=1, max_candidates=4096, fixed=fixed, candidates=candidates,
+    document = dict(schema=1, max_candidates=4096, fixed=fixed, candidates=candidates,
         invariants=copy.deepcopy(EXPECTED_INVARIANTS),
         jit=dict(cache_root="artifacts/backward-jit", jobs=DEFAULT_COMPILE_JOBS, architecture="sm_90a",
                  timeout_seconds=1800) | jit_overrides,
@@ -230,6 +247,9 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
             preflight_world=8, preflight_tokens=8,
             selection_metric="total_slowest_rank_us.mean", result_dir="artifacts/backward-autotune")
             | topology | workload)
+    unified_tuning.filter_generated_candidates(
+        document, flatten_groups, validate_tuning)
+    return document
 
 
 def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
@@ -253,6 +273,7 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     if "schema" not in document:
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     require(document.get("schema") == 1, "Backward plan schema must be 1")
+    unified_tuning.upgrade_legacy_groups(document.setdefault("fixed", {}))
     required_sections = {
         "jit", "benchmark", "selection", "invariants", "fixed", "candidates"
     }
@@ -353,6 +374,8 @@ def generated_header(_name: str, config: Mapping[str, Any]) -> str:
         f"// config_sha256_prefix={digest}",
     ]
     for key, macro in PARAMETER_MACROS.items():
+        if key in unified_tuning.FORWARD_ONLY_PARAMETERS:
+            lines.append("// Compatibility field; only Forward consumes this policy.")
         lines.append(f"#define {macro} {config[key]}")
     lines.append("")
     return "\n".join(lines)
@@ -408,16 +431,20 @@ def inspect_backward_kernels(binary: Path, log_path: Path,
     log_path.write_text(completed.stdout, encoding="utf-8")
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
-    kernels: dict[str, list[dict[str, Any]]] = {
-        "compute": [], "transport": []
-    }
-    for index, line in enumerate(completed.stdout.splitlines()[:-1]):
-        kind = next((name for name in kernels
-                     if f"backward_local_{name}_kernel" in line), None)
+    unified = bool(config["unified_workers"])
+    kernel_names = ({"unified": "unified_backward_kernel"} if unified else {
+        "compute": "backward_local_compute_kernel",
+        "transport": "backward_local_transport_kernel",
+    })
+    kernels: dict[str, list[dict[str, Any]]] = {name: [] for name in kernel_names}
+    lines = completed.stdout.splitlines()
+    for index, line in enumerate(lines[:-1]):
+        kind = next((name for name, symbol in kernel_names.items()
+                     if symbol in line), None)
         if kind is None or not line.startswith(" Function "):
             continue
         resources = resource_pattern.search(
-            completed.stdout.splitlines()[index + 1])
+            lines[index + 1])
         if resources is None:
             continue
         kernels[kind].append({
@@ -430,10 +457,19 @@ def inspect_backward_kernels(binary: Path, log_path: Path,
     return {
         "available": completed.returncode == 0,
         "returncode": completed.returncode,
-        "single_compute_kernel": len(kernels["compute"]) == 1,
-        "single_transport_kernel": len(kernels["transport"]) == 1,
+        "layout": "unified" if unified else "split",
+        "valid_compiled_kernel_set": (
+            bool(kernels["unified"]) if unified else
+            len(kernels["compute"]) == 1 and len(kernels["transport"]) == 1),
+        "single_compute_kernel": len(kernels.get("compute", [])) == 1,
+        "single_transport_kernel": len(kernels.get("transport", [])) == 1,
+        "compiled_unified_kernel_count": len(kernels.get("unified", [])),
         "kernels": kernels,
         "dynamic_shared_memory_bytes": dynamic_shared_memory(config),
+        "unified_total_shared_memory_upper_bound": (
+            unified_tuning.shared_memory_upper_bound(
+                config, dynamic_shared_memory(config), phase="backward")
+            if unified else None),
         "log": str(log_path),
     }
 
@@ -471,11 +507,11 @@ def compile_candidate(candidate: Mapping[str, Any],
         )
         result["resources"] = resources
         if (resources.get("available") and
-                (not resources.get("single_compute_kernel") or
-                 not resources.get("single_transport_kernel"))):
+                not resources.get("valid_compiled_kernel_set")):
             result["returncode"] = 125
             result["resource_validation_error"] = (
-                "expected one Backward compute and one transport kernel"
+                "expected unified Backward entries" if candidate["config"]["unified_workers"]
+                else "expected one Backward compute and one transport kernel"
             )
     return result
 

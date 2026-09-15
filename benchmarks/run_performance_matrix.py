@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import autotune_forward as fw
 import autotune_backward as bw
+import unified_tuning
 
 MODELS = {
     "qwen": dict(hidden=2048, intermediate=512, experts=256, top_k=8),
@@ -89,6 +90,27 @@ def build(args):
         list(executor.map(one, tasks))
 
 
+def combined_generated_header(name, forward, backward):
+    """Join independent phase resources with one checked shared protocol."""
+    # Historical build records used four physical ring slots. Preserve that
+    # policy without mutating the records or overriding an explicit value.
+    compatibility_defaults = {
+        key: unified_tuning.DEFAULTS[key]
+        for key in ("gin_ring_depth",)}
+    forward = {**compatibility_defaults, **forward}
+    backward = {**compatibility_defaults, **backward}
+    for dimension in ("main_hidden", "main_intermediate"):
+        if forward[dimension] != backward[dimension]:
+            raise ValueError(f"{name}: Forward/Backward dimensions differ")
+    unified_tuning.validate_shared_parameters(forward, backward)
+    header = fw.generated_header(name, forward) + "\n" + bw.generated_header(name, backward)
+    for dimension in ("HIDDEN", "INTERMEDIATE"):
+        header = header.replace(
+            f"#define WEFTMOE_BWD_MAIN_{dimension} {backward['main_' + dimension.lower()]}",
+            f"#define WEFTMOE_BWD_MAIN_{dimension} WEFTMOE_FWD_MAIN_{dimension}")
+    return header
+
+
 def build_pair(args):
     """Compile both selected phases into one deployable specialization."""
     if not args.forward_builds or not args.backward_builds:
@@ -105,16 +127,7 @@ def build_pair(args):
             record = json.loads((directory / f"{key}_{phase}.build.json").read_text())
             candidates[phase] = record["candidate"]
         fc, bc = [candidates[p]["config"] for p in ("forward", "backward")]
-        for dimension in ("main_hidden", "main_intermediate"):
-            if fc[dimension] != bc[dimension]:
-                raise ValueError(f"{key}: Forward/Backward dimensions differ")
-        header = fw.generated_header(key, fc) + "\n" + bw.generated_header(key, bc)
-        # Backward's Forward-specialization fallback uses these same aliases.
-        # The complete header also works as a production NVCC -include file.
-        for dimension in ("HIDDEN", "INTERMEDIATE"):
-            header = header.replace(
-                f"#define WEFTMOE_BWD_MAIN_{dimension} {bc['main_' + dimension.lower()]}",
-                f"#define WEFTMOE_BWD_MAIN_{dimension} WEFTMOE_FWD_MAIN_{dimension}")
+        header = combined_generated_header(key, fc, bc)
         (args.output / f"{key}.tuning.hpp").write_text(header)
         _, config = plan(args, model, ep, "forward")
         compiler = fw.ForwardJitCompiler(args.source, config["jit"], environment(),

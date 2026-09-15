@@ -34,6 +34,7 @@ struct BackwardKernelArgs {
   communication::ChunkRingLayout gin_rings;
   std::size_t local_notification_offset = 0;
   unsigned local_notification_ctas = 0;
+  void *forward_unified_gin_state = nullptr;
   std::size_t forward_return_queues_offset = 0;
   std::size_t forward_return_rows_offset = 0;
 

@@ -9,10 +9,26 @@
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cutlass/arch/barrier.h>
 
+// This primitive header can precede either phase's tuning header in a TU.
+// Read the selected layout before instantiating its instruction adapters.
+#if defined(WEFTMOE_FORWARD_USE_GENERATED_TUNING)
+#include <weftmoe_forward_tuning_generated.hpp>
+#elif defined(WEFTMOE_BACKWARD_USE_GENERATED_TUNING)
+#include <weftmoe_backward_tuning_generated.hpp>
+#endif
+
+#ifndef WEFTMOE_WGMMA_N256_ATOM_N
+#define WEFTMOE_WGMMA_N256_ATOM_N 256
+#endif
+
 namespace weftmoe::cuda::hopper {
 using Major = cute::SM90::GMMA::Major;
 
-template <int Columns, Major MajorA = Major::K, Major MajorB = Major::K>
+static_assert(WEFTMOE_WGMMA_N256_ATOM_N == 128 ||
+              WEFTMOE_WGMMA_N256_ATOM_N == 256);
+
+template <int Columns, Major MajorA = Major::K, Major MajorB = Major::K,
+          uint32_t StageK = 64, uint32_t SwizzleBytes = 128>
 struct BF16Mma {
   static constexpr int M = 64, N = Columns, K = 16;
   static constexpr int kNumAccum = Columns / 2;
@@ -36,12 +52,31 @@ struct BF16Mma {
   }
   CUTLASS_DEVICE static void wgmma(uint64_t const& a, uint64_t const& b,
                                   float* d, bool accumulate) {
-    apply(a, b, d, accumulate, cute::make_index_sequence<kNumAccum>{});
+    if constexpr (Columns == 256 && WEFTMOE_WGMMA_N256_ATOM_N == 128) {
+      // CUDA 12.9 ptxas can reject a native N256 instruction at the static
+      // register limit of a 512/640-thread CTA despite setmaxnreg. Keep the
+      // N256 tile, all accumulators, and each output's K order; only split
+      // the instruction. Both supported B-major layouts place N128 at
+      // 128 * K64 BF16 elements with the existing 128-byte swizzle.
+      static_assert(StageK == 64 && SwizzleBytes == 128,
+                    "split N256 WGMMA requires K64 / 128-byte swizzle");
+      using Half = BF16Mma<128, MajorA, MajorB, StageK, SwizzleBytes>;
+      Half::wgmma(a, b, d, accumulate);
+      constexpr uint32_t kSecondBDescriptorOffset =
+          128U * StageK * sizeof(uint16_t) / 16U;
+      const uint64_t second_b = b + kSecondBDescriptorOffset;
+      Half::wgmma(a, second_b, d + Half::kNumAccum, accumulate);
+    } else {
+      apply(a, b, d, accumulate, cute::make_index_sequence<kNumAccum>{});
+    }
   }
 };
 
-template <int N, Major A = Major::K, Major B = Major::K>
-struct BF16MMASelector { using type = BF16Mma<N, A, B>; };
+template <int N, Major A = Major::K, Major B = Major::K,
+          uint32_t StageK = 64, uint32_t SwizzleBytes = 128>
+struct BF16MMASelector {
+  using type = BF16Mma<N, A, B, StageK, SwizzleBytes>;
+};
 
 template <class Pointer>
 CUTLASS_DEVICE cute::GmmaDescriptor make_smem_desc(

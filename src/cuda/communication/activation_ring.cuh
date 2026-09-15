@@ -131,12 +131,14 @@ __device__ __forceinline__ bool drained(const Args &a, unsigned context) {
 
 template <class Args>
 __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
-                                              Transfer &task, bool dispatch) {
+                                              Transfer &task, bool dispatch,
+                                              unsigned max_probes = 0U) {
   const auto first = dispatch ? 0U : a.gin_rings.dispatch_channels;
   const auto count =
       dispatch ? a.gin_rings.dispatch_channels : a.gin_rings.return_channels;
   const ncclGin gin(a.gin_dev_comm, 0);
-  for (unsigned probe = 0; probe < count; ++probe) {
+  const unsigned probes = max_probes == 0U ? count : min(count, max_probes);
+  for (unsigned probe = 0; probe < probes; ++probe) {
     const auto channel = first + (cursor++ % count);
     auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
     if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(

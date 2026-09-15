@@ -534,6 +534,11 @@ def main():
             if any(item["mode"] != "validation" or
                    item["repeat_equal"] != "1" for item in observed):
                 raise AssertionError("Backward repeat stability failed")
+            # Preserve each rank's actual shape so the outer validator can
+            # reject an old binary that ignores runtime dimension overrides.
+            for item in observed:
+                print("BACKWARD_RESULT " + " ".join(
+                    f"{key}={value}" for key, value in item.items()), flush=True)
             result = {
                 "schema": 1,
                 "benchmark": "cached-x-ab-local-backward-validation",

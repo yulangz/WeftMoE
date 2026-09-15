@@ -4,14 +4,21 @@ Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).
 
-The current [1620 MHz GEMM report](gemm_optimization_20260914.md) records the
+The [all-CTA worker report](full_cta_all_worker_20260914.md) records the unified
+compute/communication layout, final FWD/BWD matrix, register diagnosis and
+stability coverage. Its [machine record](full_cta_all_worker_20260914.json)
+contains all timing samples and source/configuration evidence. Main FWD controls
+are freshly paired; main BWD and Flex controls are explicitly historical.
+BWD improves across the tested cases, while FWD still has regressions.
+
+The preceding [1620 MHz GEMM report](gemm_optimization_20260914.md) records the
 FC2 optimization, cuBLAS comparisons for FWD and BWD, and allocation-inclusive
 FWD results against Flex. It includes [raw samples and validation records](gemm_optimization_20260914.json)
 and uses the [2026-09-14 profiles](../configs/performance_20260914/profiles.json).
 The earlier [Qwen diagnosis](qwen_forward_diagnosis_20260914.md) and
 [Forward optimization report](forward_optimization_20260914.md) describe the
 communication, scheduler, and epilogue work preceding that measurement. Their
-clock conditions differ; use the current report for the same-frequency cuBLAS
+clock conditions differ; use the GEMM report for the same-frequency cuBLAS
 comparison.
 
 The archived EP8/EP16 comparison is in

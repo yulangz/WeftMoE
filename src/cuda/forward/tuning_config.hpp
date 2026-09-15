@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "cuda/communication/tuning_config.hpp"
 
 // A generated autotune header defines the WEFTMOE_FWD_* macros before the
 // defaults below.  The header is selected by the build system, not through the
@@ -14,6 +15,8 @@
 #define WEFTMOE_FWD_MAIN_HIDDEN WEFTMOE_BWD_MAIN_HIDDEN
 #define WEFTMOE_FWD_MAIN_INTERMEDIATE WEFTMOE_BWD_MAIN_INTERMEDIATE
 #endif
+
+#include "cuda/unified_worker_tuning.hpp"
 
 #ifndef WEFTMOE_FWD_MAIN_HIDDEN
 #define WEFTMOE_FWD_MAIN_HIDDEN 7168
@@ -41,6 +44,12 @@
 #endif
 #ifndef WEFTMOE_FWD_FC2_CLAIM_TILES
 #define WEFTMOE_FWD_FC2_CLAIM_TILES 1
+#endif
+#ifndef WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS
+#define WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS 1
+#endif
+#ifndef WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT
+#define WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT 3
 #endif
 #ifndef WEFTMOE_FWD_COMPUTE_THREADS
 #define WEFTMOE_FWD_COMPUTE_THREADS 384
@@ -168,6 +177,53 @@ inline constexpr std::uint32_t kRemoteRelayCtas = 24;
 inline constexpr std::uint32_t kRemoteRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
 #endif
 
+// Unified workers are a compile-time layout choice shared by every shape.
+#ifndef WEFTMOE_FWD_UNIFIED_WORKERS
+// Bare builds use unified workers. Generated plans select each phase
+// explicitly; a missing phase switch preserves historical standalone builds.
+#if defined(WEFTMOE_FORWARD_USE_GENERATED_TUNING) || \
+    defined(WEFTMOE_BACKWARD_USE_GENERATED_TUNING)
+#define WEFTMOE_FWD_UNIFIED_WORKERS 0
+#else
+#define WEFTMOE_FWD_UNIFIED_WORKERS 1
+#endif
+#endif
+inline constexpr unsigned kUnifiedGinPackSlots = WEFTMOE_UNIFIED_GIN_PACK_SLOTS;
+// A context has 40 bytes of queue/lease state and each packing slot has a
+// 40-byte handoff. Round the allocation to the device structure's alignment.
+inline constexpr unsigned kUnifiedGinStateBytes =
+    ((40U + 40U * kUnifiedGinPackSlots + 127U) / 128U) * 128U;
+static_assert(kUnifiedGinPackSlots >= 1U && kUnifiedGinPackSlots <= 8U);
+using UnifiedResources = unified_worker_tuning::Resources<
+    WEFTMOE_FWD_UNIFIED_THREADS, WEFTMOE_FWD_UNIFIED_COMM_THREADS,
+    WEFTMOE_FWD_UNIFIED_COMM_BASE, WEFTMOE_FWD_UNIFIED_MATH_REGISTERS,
+    WEFTMOE_FWD_UNIFIED_CONTROL_REGISTERS, WEFTMOE_FWD_UNIFIED_PRODUCER_REGISTERS,
+    WEFTMOE_FWD_UNIFIED_SEGMENT_BYTES, WEFTMOE_FWD_UNIFIED_COPY_BUFFERS>;
+inline constexpr unsigned kUnifiedThreads = UnifiedResources::kUnifiedThreads;
+inline constexpr unsigned kUnifiedCommThreads = UnifiedResources::kUnifiedCommThreads;
+inline constexpr unsigned kUnifiedCommBase = UnifiedResources::kUnifiedCommBase;
+inline constexpr unsigned kUnifiedMathRegisters = UnifiedResources::kUnifiedMathRegisters;
+inline constexpr unsigned kUnifiedControlRegisters = UnifiedResources::kUnifiedControlRegisters;
+inline constexpr unsigned kUnifiedProducerRegisters = UnifiedResources::kUnifiedProducerRegisters;
+inline constexpr unsigned kUnifiedSegmentBytes = UnifiedResources::kUnifiedSegmentBytes;
+inline constexpr unsigned kUnifiedCopyBuffers = UnifiedResources::kUnifiedCopyBuffers;
+inline constexpr unsigned kGinChannelPackLimit =
+    WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT;
+static_assert(kGinChannelPackLimit >= 1U && kGinChannelPackLimit <= 8U);
+inline constexpr unsigned kUnifiedInitialRegisters = UnifiedResources::kUnifiedInitialRegisters;
+inline constexpr unsigned kUnifiedRegisterPool = UnifiedResources::kUnifiedRegisterPool;
+inline constexpr bool kUnifiedRowPrefetch = WEFTMOE_FWD_UNIFIED_ROW_PREFETCH != 0;
+// Local scheduling and cross-row prefetch remain independent of GIN packing.
+inline constexpr bool kUnifiedOptimizeGinLocalTransport =
+    WEFTMOE_FWD_UNIFIED_OPTIMIZE_GIN_LOCAL_TRANSPORT != 0;
+inline constexpr unsigned kUnifiedReturnDrainRows =
+    WEFTMOE_FWD_UNIFIED_RETURN_DRAIN_ROWS;
+static_assert(kUnifiedReturnDrainRows >= 32U &&
+              kUnifiedReturnDrainRows <= 1024U &&
+              kUnifiedReturnDrainRows % 32U == 0U);
+inline constexpr bool kUnifiedSplitNvlink = WEFTMOE_FWD_UNIFIED_SPLIT_NVLINK != 0;
+inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
+
 inline constexpr std::uint32_t kMainHidden = WEFTMOE_FWD_MAIN_HIDDEN;
 inline constexpr std::uint32_t kMainIntermediate =
     WEFTMOE_FWD_MAIN_INTERMEDIATE;
@@ -178,6 +234,10 @@ inline constexpr std::uint32_t kTileK = WEFTMOE_FWD_TILE_K;
 inline constexpr std::uint32_t kFc1Stages = WEFTMOE_FWD_FC1_STAGES;
 inline constexpr std::uint32_t kFc2Stages = WEFTMOE_FWD_FC2_STAGES;
 inline constexpr std::uint32_t kFc2ClaimTiles = WEFTMOE_FWD_FC2_CLAIM_TILES;
+inline constexpr std::uint32_t kOpportunisticReduceWarps =
+    WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS;
+static_assert(kOpportunisticReduceWarps >= 1U &&
+              kOpportunisticReduceWarps <= 8U);
 inline constexpr std::uint32_t kComputeThreads =
     WEFTMOE_FWD_COMPUTE_THREADS;
 // Local transport has no WGMMA register partition. Four warpgroups expose

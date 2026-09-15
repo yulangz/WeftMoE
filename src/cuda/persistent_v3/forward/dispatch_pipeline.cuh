@@ -378,7 +378,9 @@ publish_ready_fc1_tasks(const ForwardKernelArgs &a, std::uint32_t context,
       __nanosleep(forward_tuning::kSetupNanosleep);
   }
 #if WEFTMOE_DEBUG_VALIDATE
-  atomicOr(&completion->bulk_contexts_issuing, 1ULL << context);
+  // This bitmap marks active publisher buckets; exact completion is carried
+  // by the finite task queue, not by counting bits when publishers exceed 64.
+  atomicOr(&completion->bulk_contexts_issuing, 1ULL << (context & 63U));
 #endif
 }
 #if defined(WEFTMOE_FORWARD_TRANSPORT_TU)

@@ -252,6 +252,8 @@ struct TransportDeviceStatus {
   unsigned long long backward_dw2_complete_clock;
   unsigned long long backward_dw1_start_clock;
   unsigned long long backward_dw1_complete_clock;
+  unsigned long long backward_reduce_start_clock;
+  unsigned long long backward_reduce_complete_clock;
   unsigned long long wgmma_instructions;
   unsigned long long tma_loads;
   unsigned long long tma_multicast_loads;
@@ -545,6 +547,7 @@ struct Layout {
   unsigned local_notification_ctas = 0;
   std::size_t forward_scheduler = 0;
   std::size_t forward_v3_control = 0;
+  std::size_t forward_unified_gin_state = 0;
   std::size_t forward_completion = 0;
   std::size_t forward_context_completion = 0;
   std::size_t status = 0;
@@ -1002,6 +1005,19 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
             persistent_v3::kRdmaCtaCount,
         backward_tuning::kRelayCtas + backward_tuning::kRdmaCtas);
+    if constexpr (forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers) {
+      int device = 0, sms = 0;
+      if (cudaGetDevice(&device) != cudaSuccess ||
+          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        transport_error(NotifyErrorCode::BackendUnavailable,
+                        "transport-pool-query", "SM count", 0,
+                        "available CUDA device", "device query failed");
+      layout.local_notification_ctas = std::max(
+          layout.local_notification_ctas, static_cast<unsigned>(sms));
+      layout.forward_unified_gin_state = append(
+          cursor, persistent_v3::kRdmaCtaCount, forward_tuning::kUnifiedGinStateBytes,
+          "unified GIN context progress state");
+    }
     layout.local_notifications = append(
         cursor,
         1ULL * (config.max_world_size / config.max_nodes) *

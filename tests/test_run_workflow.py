@@ -62,19 +62,24 @@ class RunWorkflowTest(unittest.TestCase):
                 self.assertEqual(plain['candidates'][0]['config'],
                                  tune['candidates'][0]['config'])
                 gemm = plain['candidates'][0]['config']
+                self.assertEqual(gemm['gin_ring_depth'], 8)
+                self.assertEqual(
+                    {candidate['config']['gin_ring_depth']
+                     for candidate in tune['candidates']},
+                    {8} if nodes == 1 else {4, 8, 16})
                 if phase == 'forward':
-                    # FC2's three claim sizes extend the existing bounded
-                    # transport search without changing its incumbent.
-                    self.assertLessEqual(len(tune['candidates']), 3 * 80)
+                    # The all-CTA profile fixes FC2 claiming while the
+                    # multi-node grid also explores the physical ring window.
+                    self.assertEqual(len(tune['candidates']), 8 if nodes == 1 else 144)
                     self.assertEqual(
                         {candidate['config']['fc2_claim_tiles']
-                         for candidate in tune['candidates']}, {1, 2, 4})
+                         for candidate in tune['candidates']}, {2})
                     self.assertEqual((gemm['fc1_tile_n'], gemm['fc2_tile_n'],
                                       gemm['fc1_stages'], gemm['fc2_stages'],
                                       gemm['fc2_claim_tiles']),
-                                     (128, 256, 4, 3, 4))
+                                     (128, 256, 4, 3, 2))
                 else:
-                    self.assertLessEqual(len(tune['candidates']), 80)
+                    self.assertEqual(len(tune['candidates']), 12 if nodes == 1 else 36)
                     self.assertEqual((gemm['dab_tile_n'], gemm['dx_tile_n'],
                                       gemm['dw_tile_m'], gemm['dw_tile_n'],
                                       gemm['dab_stages'], gemm['dw1_stages']),

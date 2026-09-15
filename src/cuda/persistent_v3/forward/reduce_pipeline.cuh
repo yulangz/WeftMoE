@@ -104,7 +104,7 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
         a, token, status, contribution, route_ready, combined, completion);
 }
 
-template <bool StaticLocal>
+template <bool StaticLocal, unsigned Threads = kThreads>
 __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                                          std::uint32_t role_index,
                                          std::uint32_t role_count) {
@@ -121,10 +121,13 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           a.peer_bases[a.world]);
   }
 
-  constexpr std::uint32_t kPhysicalWarpsPerCta = kThreads / 32U;
-  constexpr std::uint32_t kReduceWarps = forward_tuning::kReduceWarps;
+  constexpr std::uint32_t kPhysicalWarpsPerCta = Threads / 32U;
+  constexpr std::uint32_t kReduceWarps =
+      forward_tuning::kReduceWarps < kPhysicalWarpsPerCta
+          ? forward_tuning::kReduceWarps : kPhysicalWarpsPerCta;
   constexpr std::uint32_t kTokensPerClaim =
-      forward_tuning::kReduceTokensPerClaim;
+      forward_tuning::kReduceTokensPerClaim < kReduceWarps
+          ? forward_tuning::kReduceTokensPerClaim : kReduceWarps;
   static_assert(kReduceWarps <= kPhysicalWarpsPerCta);
   static_assert(kTokensPerClaim <= kReduceWarps);
   const auto warp = threadIdx.x / 32U;
@@ -173,7 +176,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
 
         }
       }
-      __syncthreads();
+      cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
       if (queue_done != 0U)
         break;
 
@@ -211,7 +215,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           reduce_one_token<StaticLocal>(a, token, status, contribution,
                                         route_ready, combined, completion);
       }
-      __syncthreads();
+      cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
     }
   } else if (a.forward_dynamic_reduce_scan) {
     __shared__ unsigned long long batch_begin;
@@ -239,7 +244,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                                          ::cuda::memory_order_relaxed);
         }
       }
-      __syncthreads();
+      cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
       if (scan_done != 0U)
         break;
 
@@ -286,10 +292,12 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
           }
         }
       }
-      __syncthreads();
+      cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
       if (threadIdx.x == 0U && batch_progress == 0U)
         __nanosleep(forward_tuning::kSetupNanosleep);
-      __syncthreads();
+      cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
     }
   } else {
     if (warp < kReduceWarps) {
@@ -308,7 +316,8 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
   WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U,
                           a.dispatch.identity.num_tokens, execution_epoch(a));
   __threadfence();
-  __syncthreads();
+  cutlass::arch::NamedBarrier::sync(
+          Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
   if (threadIdx.x == 0U) {
     auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
         a.local_base, a.forward_v3_control_offset);

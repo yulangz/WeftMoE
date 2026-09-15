@@ -46,6 +46,21 @@ bool benchmark_synchronize_ranks() {
   return value && std::string(value) == "1";
 }
 
+std::uint64_t benchmark_dimension(const char *name, std::uint64_t fallback) {
+  const auto *configured = std::getenv(name);
+  if (!configured)
+    return fallback;
+  const std::string text(configured);
+  if (text.empty() ||
+      !std::all_of(text.begin(), text.end(),
+                   [](char value) { return value >= '0' && value <= '9'; }))
+    throw std::runtime_error(std::string(name) + " must be a positive integer");
+  const auto value = std::stoull(text);
+  if (value == 0ULL)
+    throw std::runtime_error(std::string(name) + " must be a positive integer");
+  return value;
+}
+
 #if WEFTMOE_DEVICE_TIMELINE
 void write_device_timeline(
     const weftmoe::cuda::profiling::DeviceTimelineSnapshot &snapshot,
@@ -2654,8 +2669,11 @@ void run_cached_backward_rank(
     const weftmoe::RankRoutingInput &routes,
     const weftmoe::cuda::NcclSession &base,
     const weftmoe::cuda::CudaExecution &execution, bool validation) {
-  constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
-  constexpr std::uint64_t intermediate = weftmoe::cuda::forward_tuning::kMainIntermediate;
+  const auto hidden = benchmark_dimension(
+      "WEFTMOE_BENCH_HIDDEN", weftmoe::cuda::forward_tuning::kMainHidden);
+  const auto intermediate = benchmark_dimension(
+      "WEFTMOE_BENCH_INTERMEDIATE",
+      weftmoe::cuda::forward_tuning::kMainIntermediate);
   require((nodes == 1U && (world == 1U || world == 2U || world == 8U)) ||
               (nodes == 2U && world == 16U),
           "cached Backward requires local 1/2/8 GPUs or GIN 2x8 GPUs");
@@ -3524,8 +3542,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   if (!benchmark_forward)
     prepare_notify_pool();
   if (benchmark_forward) {
-    constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
-    constexpr std::uint64_t intermediate = weftmoe::cuda::forward_tuning::kMainIntermediate;
+    const auto hidden = benchmark_dimension(
+        "WEFTMOE_BENCH_HIDDEN", weftmoe::cuda::forward_tuning::kMainHidden);
+    const auto intermediate = benchmark_dimension(
+        "WEFTMOE_BENCH_INTERMEDIATE",
+        weftmoe::cuda::forward_tuning::kMainIntermediate);
     const bool retain_backward_state =
         std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") != nullptr;
     auto setup_generation = weftmoe::cuda::make_nccl_generation(

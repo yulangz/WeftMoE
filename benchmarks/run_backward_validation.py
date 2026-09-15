@@ -30,6 +30,23 @@ def run(command, env, log, timeout=600):
         raise RuntimeError(f"validation failed: {log}")
 
 
+def validate_native_shape(log, *, world, tokens, hidden, intermediate,
+                          experts, top_k):
+    expected = dict(world=world, tokens=tokens, hidden=hidden,
+                    intermediate=intermediate, experts=experts, top_k=top_k)
+    records = [dict(item.split("=", 1) for item in line.split()[1:])
+               for line in log.read_text().splitlines()
+               if line.startswith("BACKWARD_RESULT ")]
+    if len(records) != world or {int(row["rank"]) for row in records} != set(range(world)):
+        raise RuntimeError(f"missing native rank shape evidence: {log}")
+    for row in records:
+        actual = {key: int(row[key]) for key in expected}
+        if actual != expected:
+            raise RuntimeError(
+                f"native shape mismatch at rank {row['rank']}: "
+                f"requested {expected}, observed {actual}; {log}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -45,14 +62,17 @@ def main():
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--socket-ifname", default="bond0")
     parser.add_argument("--master-port", type=int, default=29671)
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="native launcher watchdog in seconds")
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--native-only", action="store_true")
     args = parser.parse_args()
     if args.reference_only and args.native_only:
         parser.error("choose at most one partial validation mode")
     experts = args.experts if args.experts is not None else max(16, args.world * 2)
-    if experts < args.top_k or experts % args.world or args.tokens <= 0:
-        parser.error("invalid expert count, top-k, EP, or token count")
+    if (experts < args.top_k or experts % args.world or args.tokens <= 0 or
+            args.hidden <= 0 or args.intermediate <= 0 or args.timeout <= 0):
+        parser.error("invalid expert count, top-k, EP, token count, or dimensions")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     artifact = args.output / "tensors"
@@ -60,6 +80,8 @@ def main():
     binary = str(args.binary.resolve())
     env = environment()
     env.update(NCCL_SOCKET_IFNAME=args.socket_ifname,
+               WEFTMOE_BENCH_HIDDEN=str(args.hidden),
+               WEFTMOE_BENCH_INTERMEDIATE=str(args.intermediate),
                WEFTMOE_BENCH_EXPERTS=str(experts),
                WEFTMOE_P2P_TOP_K=str(args.top_k),
                WEFTMOE_BACKWARD_TOKENS=str(args.tokens),
@@ -71,7 +93,8 @@ def main():
                   "--binary", binary, "--world", str(args.world),
                   "--backward-validation", "--backward-tokens", str(args.tokens),
                   "--top-k", str(args.top_k), "--rounds", "3",
-                  "--backward-output-dir", str(artifact), "--timeout", "600"]
+                  "--backward-output-dir", str(artifact),
+                  "--timeout", str(args.timeout)]
     else:
         env.update(NCCL_IB_DISABLE="0", NCCL_IB_GID_INDEX="3",
                    NCCL_IB_HCA=",".join(f"mlx5_bond_{i}:1" for i in range(8)))
@@ -80,9 +103,15 @@ def main():
                   "--remote", args.remote, "--port", str(args.port),
                   "--gpus-per-node", "8", "--scenario", "gin_backward_smoke",
                   "--nccl-lib-dir", LIBPATH, "--socket-ifname", args.socket_ifname,
-                  "--enable-ib", "--timeout", "600"]
+                  "--enable-ib", "--timeout", str(args.timeout)]
     if not args.reference_only:
-        run(native, env, args.output / "native.log")
+        # Give the rank launcher time to kill its own local/remote children
+        # before the outer process watchdog interrupts that cleanup.
+        run(native, env, args.output / "native.log", timeout=args.timeout + 30)
+        validate_native_shape(
+            args.output / "native.log", world=args.world, tokens=args.tokens,
+            hidden=args.hidden, intermediate=args.intermediate, experts=experts,
+            top_k=args.top_k)
     if args.native_only:
         print(json.dumps(dict(native_passed=True, output=str(args.output))), flush=True)
         return

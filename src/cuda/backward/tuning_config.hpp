@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "cuda/communication/tuning_config.hpp"
 
 // Dynamic builds generate this header from an explicit JSON configuration.
 // The checked-in defaults are one auditable Hopper specialization, not a set
@@ -19,6 +20,8 @@
 #define WEFTMOE_BWD_MAIN_INTERMEDIATE WEFTMOE_FWD_MAIN_INTERMEDIATE
 #endif
 #endif
+
+#include "cuda/unified_worker_tuning.hpp"
 
 #ifndef WEFTMOE_BWD_MAIN_HIDDEN
 #define WEFTMOE_BWD_MAIN_HIDDEN 7168
@@ -111,8 +114,34 @@
 #ifndef WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP
 #define WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP 256
 #endif
+#ifndef WEFTMOE_BWD_UNIFIED_WORKERS
+// Bare builds use unified workers. Generated plans select each phase
+// explicitly; a missing phase switch preserves historical standalone builds.
+#if defined(WEFTMOE_FORWARD_USE_GENERATED_TUNING) || \
+    defined(WEFTMOE_BACKWARD_USE_GENERATED_TUNING)
+#define WEFTMOE_BWD_UNIFIED_WORKERS 0
+#else
+#define WEFTMOE_BWD_UNIFIED_WORKERS 1
+#endif
+#endif
 
 namespace weftmoe::cuda::backward_tuning {
+inline constexpr bool kUnifiedWorkers = WEFTMOE_BWD_UNIFIED_WORKERS != 0;
+using UnifiedResources = unified_worker_tuning::Resources<
+    WEFTMOE_BWD_UNIFIED_THREADS, WEFTMOE_BWD_UNIFIED_COMM_THREADS,
+    WEFTMOE_BWD_UNIFIED_COMM_BASE, WEFTMOE_BWD_UNIFIED_MATH_REGISTERS,
+    WEFTMOE_BWD_UNIFIED_CONTROL_REGISTERS, WEFTMOE_BWD_UNIFIED_PRODUCER_REGISTERS,
+    WEFTMOE_BWD_UNIFIED_SEGMENT_BYTES, WEFTMOE_BWD_UNIFIED_COPY_BUFFERS>;
+inline constexpr unsigned kUnifiedThreads = UnifiedResources::kUnifiedThreads;
+inline constexpr unsigned kUnifiedCommThreads = UnifiedResources::kUnifiedCommThreads;
+inline constexpr unsigned kUnifiedCommBase = UnifiedResources::kUnifiedCommBase;
+inline constexpr unsigned kUnifiedMathRegisters = UnifiedResources::kUnifiedMathRegisters;
+inline constexpr unsigned kUnifiedControlRegisters = UnifiedResources::kUnifiedControlRegisters;
+inline constexpr unsigned kUnifiedProducerRegisters = UnifiedResources::kUnifiedProducerRegisters;
+inline constexpr unsigned kUnifiedSegmentBytes = UnifiedResources::kUnifiedSegmentBytes;
+inline constexpr unsigned kUnifiedCopyBuffers = UnifiedResources::kUnifiedCopyBuffers;
+inline constexpr unsigned kUnifiedInitialRegisters = UnifiedResources::kUnifiedInitialRegisters;
+inline constexpr unsigned kUnifiedRegisterPool = UnifiedResources::kUnifiedRegisterPool;
 // Untuned single-node defaults favor enough transport workers for Ling-sized
 // workloads. Explicit tuning overrides apply to either topology unchanged.
 #ifndef WEFTMOE_BWD_RELAY_CTAS

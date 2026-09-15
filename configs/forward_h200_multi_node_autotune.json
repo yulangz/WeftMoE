@@ -47,9 +47,69 @@
       true
     ],
     "fc2_claim_tiles": [
-      4,
+      2
+    ],
+    "unified_workers": [
+      1
+    ],
+    "unified_threads": [
+      384
+    ],
+    "unified_comm_threads": [
+      96
+    ],
+    "unified_comm_base": [
+      288
+    ],
+    "unified_math_registers": [
+      216
+    ],
+    "unified_control_registers": [
+      64
+    ],
+    "unified_segment_bytes": [
+      4096
+    ],
+    "unified_copy_buffers": [
       2,
       1
+    ],
+    "unified_split_nvlink": [
+      0
+    ],
+    "wgmma_n256_atom_n": [
+      256
+    ],
+    "unified_gin_context_probes": [
+      2
+    ],
+    "unified_producer_registers": [
+      0
+    ],
+    "unified_gin_pack_slots": [
+      3
+    ],
+    "unified_row_prefetch": [
+      1
+    ],
+    "unified_optimize_gin_local_transport": [
+      0
+    ],
+    "unified_return_drain_rows": [
+      128
+    ],
+    "opportunistic_reduce_warps": [
+      8
+    ],
+    "gin_channel_pack_limit": [
+      3,
+      1,
+      2
+    ],
+    "gin_ring_depth": [
+      8,
+      4,
+      16
     ]
   },
   "2_transport": {
@@ -57,15 +117,10 @@
       8
     ],
     "relay_ctas": [
-      24,
-      8,
-      16,
-      32,
-      40
+      24
     ],
     "local_return_tma_warps": [
-      8,
-      0
+      8
     ],
     "local_dispatch_tma_warps": [
       12
@@ -74,11 +129,11 @@
       12
     ],
     "local_return_batch_rows": [
-      512
-    ],
-    "dispatch_publish_batch_rows": [
       32,
       128
+    ],
+    "dispatch_publish_batch_rows": [
+      32
     ],
     "relay_local_return": [
       true
@@ -124,10 +179,10 @@
       "queue"
     ],
     "reduce_warps": [
-      12
+      8
     ],
     "reduce_tokens_per_claim": [
-      12
+      8
     ],
     "reduce_registers": [
       168
