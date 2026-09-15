@@ -4641,6 +4641,103 @@
         }
       ],
       "finding": "Qwen EP16 8K Return baseline39.356, cooperative metadata39.450, dense columns39.593, contiguous bulk39.461 GB/s. All improve less than1%; do not adopt or expand full Forward sweeps. Clock restoration succeeded on both nodes."
+    },
+    {
+      "name": "Independent Return GIN port count",
+      "adopted": false,
+      "experimental_commit": "0600e59",
+      "raw_results": "results/communication_bottleneck_20260915/return_ports_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1162.1950000000002,
+              "fc2": 550.112,
+              "return": 3403.635,
+              "reduce": 2525.17,
+              "forward": 4718.46,
+              "wall": 6152.88
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.101217093517,
+              "nv_return": 34.50443775551726,
+              "rdma_dispatch": 28.871602441931,
+              "rdma_return": 39.433643149162585
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return_ports1_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1139.585,
+              "fc2": 551.088,
+              "return": 4002.255,
+              "reduce": 2829.825,
+              "forward": 5273.905000000001,
+              "wall": 6690.52
+            },
+            "payload_GBps": {
+              "nv_dispatch": 206.11101760728687,
+              "nv_return": 29.343585553644132,
+              "rdma_dispatch": 29.444431086755266,
+              "rdma_return": 33.535526347021865
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "return_ports4_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1230.4,
+              "fc2": 492.08000000000004,
+              "return": 4202.145,
+              "reduce": 3167.76,
+              "forward": 5583.04,
+              "wall": 6990.32
+            },
+            "payload_GBps": {
+              "nv_dispatch": 190.8981014304291,
+              "nv_return": 27.947753349777315,
+              "rdma_dispatch": 27.27115734720416,
+              "rdma_return": 31.940289542602645
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K Return baseline2ports39.434,1port33.536,4ports31.940 GB/s. Keep two Return contexts per peer. Wire payload rows128, ring depth8 and RX32 unchanged; context allocation and channel/credit mappings scale consistently. Both alternatives pass128 sparse golden files. No full-model sweep warranted."
     }
   ],
   "diagnostics": [
