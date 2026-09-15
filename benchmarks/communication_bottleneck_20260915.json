@@ -5528,6 +5528,76 @@
         }
       ],
       "finding": "Qwen EP16 8K base targeted-flush Dispatch28.787/Return39.723 GB/s. Dispatch-only terminal fold28.902/39.737; foldboth plus fixed Return striping28.725/39.780; striping-only28.969/39.862. No clear gain; retain existing terminal packets. All192 sparse golden files exact. This tests GIN End packets separately from the previous NVLink notification End experiment."
+    },
+    {
+      "name": "Aggregate received fanout readiness counts in shared scratch",
+      "adopted": false,
+      "experimental_commit": "96d57f4",
+      "raw_results": "results/communication_bottleneck_20260915/fanout_counts_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1167.63,
+              "fc2": 564.576,
+              "return": 3371.165,
+              "reduce": 2485.025,
+              "forward": 4693.805,
+              "wall": 6183.58
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.16049090893517,
+              "nv_return": 34.83677363760006,
+              "rdma_dispatch": 28.73721298699074,
+              "rdma_return": 39.81345558582864
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "fanout_counts_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1170.1750000000002,
+              "fc2": 544.272,
+              "return": 3363.7,
+              "reduce": 2482.0299999999997,
+              "forward": 4681.5,
+              "wall": 6094.32
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.72298929647272,
+              "nv_return": 34.91408627404347,
+              "rdma_dispatch": 28.67471275663896,
+              "rdma_return": 39.9018128846211
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K Dispatch28.737->28.675 GB/s; Return39.813->39.902. No gain. Table uses retired staging, preserves payload order/reuse and emits exact aggregated counts;64 sparse golden files exact. Keep original warp aggregation."
     }
   ],
   "diagnostics": [
