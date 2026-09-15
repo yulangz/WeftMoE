@@ -1520,6 +1520,160 @@
         }
       ],
       "finding": "Split+prefetch further regresses to 28.15 GB/s. Alignment gives 31.29 GB/s vs adjacent 30.83; insufficient benefit to adopt a wire-layout change without further evidence."
+    },
+    {
+      "name": "Two NVLink TMA issuers per warp",
+      "adopted": false,
+      "source_commit": "7eb36d5",
+      "raw_results": "results/communication_bottleneck_20260915/nv_issuers_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8471.105,
+            "fc2": 2786.125,
+            "return": 23774.65,
+            "reduce": 20794.45,
+            "forward": 31837.1,
+            "wall": 33603.8
+          },
+          "payload_GBps": {
+            "nv_dispatch": 221.8185457505249,
+            "nv_return": 39.51789389118242,
+            "rdma_dispatch": 31.68836367864641,
+            "rdma_return": 45.16330730420847
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "nv_issuers_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8557.695,
+            "fc2": 2948.08,
+            "return": 23847.85,
+            "reduce": 21024.15,
+            "forward": 31841.75,
+            "wall": 33721.7
+          },
+          "payload_GBps": {
+            "nv_dispatch": 219.57410167106914,
+            "nv_return": 39.396595332493284,
+            "rdma_dispatch": 31.367728810152734,
+            "rdma_return": 45.024680379992326
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "validation": {
+        "files_compared": 64,
+        "all_byte_identical": true,
+        "reference": "pure transport baseline"
+      },
+      "finding": "Same shared memory footprint and two issuers per warp instead of one pipelined issuer. Dispatch 31.69 -> 31.37 GB/s; no gain."
+    },
+    {
+      "name": "Partition relay CTAs between local and GIN receive copy domains",
+      "adopted": false,
+      "pending": "Production training validation and local ratio/prefetch screen",
+      "source_commit": "11adbf9",
+      "raw_results": "results/communication_bottleneck_20260915/relay_partition_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8524.435,
+            "fc2": 2911.15,
+            "return": 23720.05,
+            "reduce": 20524.45,
+            "forward": 31927.449999999997,
+            "wall": 33747.2
+          },
+          "payload_GBps": {
+            "nv_dispatch": 220.43081940328014,
+            "nv_return": 39.60885816007976,
+            "rdma_dispatch": 31.490117057611446,
+            "rdma_return": 45.267266468662584
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition50_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7501.215,
+            "fc2": 3057.745,
+            "return": 23478.199999999997,
+            "reduce": 20497.95,
+            "forward": 30926.95,
+            "wall": 32735.5
+          },
+          "payload_GBps": {
+            "nv_dispatch": 250.49917806648656,
+            "nv_return": 40.01687079929467,
+            "rdma_dispatch": 35.78559686664094,
+            "rdma_return": 45.733566627765335
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "relay_partition67_ep16_65536",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 7527.725,
+            "fc2": 3197.505,
+            "return": 23495.050000000003,
+            "reduce": 20261.7,
+            "forward": 31045.25,
+            "wall": 32881.45
+          },
+          "payload_GBps": {
+            "nv_dispatch": 249.61700806020409,
+            "nv_return": 39.988171806401766,
+            "rdma_dispatch": 35.659572580029156,
+            "rdma_return": 45.700767778744876
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "validation": {
+        "files_compared": 128,
+        "all_byte_identical": true,
+        "reference": "pure transport baseline"
+      },
+      "finding": "50% local CTA share: Dispatch 31.49 -> 35.79 GB/s, Return 45.73 GB/s. 67% share: Dispatch 35.66 GB/s. Every physical CTA retains math workers; copy domains retain two warps per task."
     }
   ],
   "diagnostics": [
@@ -1597,6 +1751,38 @@
         }
       ],
       "finding": "Baseline Dispatch 8611.295 us; omit local and relay NVLink payload 6486.305 us; omit GIN Dispatch packing payload 8539.185 us. Prioritize NVLink copy/relay path over sender packing. All protocol/metadata work retained; payload correctness intentionally absent in ablations."
+    },
+    {
+      "name": "Separate local Dispatch and received fanout payload ablations",
+      "not_valid_goal_bandwidth": true,
+      "raw_results": "results/communication_bottleneck_20260915/nv_issuers_screen/bandwidth",
+      "cases": [
+        {
+          "name": "no_local_payload_ep16_65536",
+          "timing_us": {
+            "dispatch": 6822.6849999999995,
+            "fc2": 3439.15,
+            "return": 23528.3,
+            "reduce": 20214.6,
+            "forward": 30488.5,
+            "wall": 32280.65
+          },
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.8aa5779ff11758eba453be2c9f06f1eee986e828381edeff958dcd942d31dd74/test_cuda_notify"
+        },
+        {
+          "name": "no_relay_payload_ep16_65536",
+          "timing_us": {
+            "dispatch": 6662.959999999999,
+            "fc2": 3440.9300000000003,
+            "return": 23521.75,
+            "reduce": 20274.5,
+            "forward": 30219.25,
+            "wall": 32046.45
+          },
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.0c9700fb02222d156904768328e31a9a6d8a59f3782e7f44829e46c78a8e6d6c/test_cuda_notify"
+        }
+      ],
+      "finding": "No local Dispatch payload: 6822.685 us. No received fanout payload: 6662.960 us. Complete baseline: 8471.105 us. Both NVLink workloads contribute to the throughput limit."
     }
   ]
 }
