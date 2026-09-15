@@ -6589,6 +6589,76 @@
         },
         "finding": "Qwen EP16 8K retained full Forward regresses from 5079.665 to 5264.385 us (+3.64%); wall 6596.705 to 6841.945 us. Dispatch improves 1476.735 to 1438.675 us but Return grows 4236.990 to 4436.925 us. Reject shared-publisher version for production; test a dedicated Dispatch publisher separately. 128 prefix files byte-identical across baseline/candidate; 20 repeated runs passed."
       }
+    },
+    {
+      "name": "Dedicated Dispatch publisher warp with two copy warps",
+      "adopted": false,
+      "source_commit": "fdbf63d",
+      "raw_results": "results/communication_bottleneck_20260915/dedicated_dispatch_pub_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1162.08,
+              "fc2": 554.48,
+              "return": 3372.88,
+              "reduce": 2573.9,
+              "forward": 4688.385,
+              "wall": 6172.59
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.1212171279086,
+              "nv_return": 34.81906026896895,
+              "rdma_dispatch": 28.874459589701225,
+              "rdma_return": 39.79321173596451
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        },
+        {
+          "name": "dedicated_dispatch_pub_ep16_8192",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1115.6,
+              "fc2": 522.1759999999999,
+              "return": 3373.825,
+              "reduce": 2335.09,
+              "forward": 4655.505,
+              "wall": 6061.535
+            },
+            "payload_GBps": {
+              "nv_dispatch": 210.5423305844389,
+              "nv_return": 34.80930753669796,
+              "rdma_dispatch": 30.077475797776984,
+              "rdma_return": 39.782065756226245
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "returncode": 0
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Qwen EP16 8K pure Dispatch 28.874 to 30.077 GB/s; Return 39.793 to 39.782 GB/s. Similar to shared publisher queue; no evidence of a large gain from another warp alone. Uses 512 threads, two copy warps, dedicated Dispatch publisher and FC1/Return publisher; math 208, producer 32, control 64 registers, N256 atom128, FC2 stages3. Full Forward/BWD validation not yet performed; not adopted."
     }
   ],
   "diagnostics": [
