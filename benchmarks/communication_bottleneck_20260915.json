@@ -2333,6 +2333,178 @@
         "all_byte_identical": true
       },
       "finding": "Handoff preserves 35.70 GB/s pure Dispatch, but full Qwen EP16 8K remains slower (5758.51 vs 5360.34 us). Dense packet columns alone give no bandwidth improvement. Inspect Return work during Dispatch and production register allocation next."
+    },
+    {
+      "name": "Control register quota and shared Return during Dispatch",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/return_resources_screen",
+      "cases": [
+        {
+          "name": "compact_clean_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ef536eeb55183c3d48940151d9bb816e6f80858c7e33ddea22e92a841edc239b/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1865.165,
+            "fc2": 2262.7200000000003,
+            "return": 4640.4,
+            "reduce": 2832.08,
+            "forward": 5445.565,
+            "wall": 7378.525
+          },
+          "payload_GBps": {
+            "nv_dispatch": 125.93042653062865,
+            "nv_return": 25.30827342470477,
+            "rdma_dispatch": 17.990060932946953,
+            "rdma_return": 28.92374105680545
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "baseline_r72_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2617f2e5fd4119a202af0ab3b649ecfdbe23c6e5ac8c3e3e3faf947d24916222/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1883.73,
+            "fc2": 2320.58,
+            "return": 4668.219999999999,
+            "reduce": 2826.64,
+            "forward": 5484.845,
+            "wall": 6903.175
+          },
+          "payload_GBps": {
+            "nv_dispatch": 124.68932596497375,
+            "nv_return": 25.15745016301717,
+            "rdma_dispatch": 17.812760852139107,
+            "rdma_return": 28.751371614876767
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "handoff_r72_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.c651db03456eb654b0de68c13c943137f04b0645b45adb0fd788b4509c824f5d/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1714.67,
+            "fc2": 2258.035,
+            "return": 4970.045,
+            "reduce": 3054.0950000000003,
+            "forward": 5857.52,
+            "wall": 7370.55
+          },
+          "payload_GBps": {
+            "nv_dispatch": 136.98322359404435,
+            "nv_return": 23.629667739426907,
+            "rdma_dispatch": 19.569031942006333,
+            "rdma_return": 27.005334559345037
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "shared_return_production_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.ddaf468dfe34a41a1b82dd2e240acf051843fa8a0d5c32f5ed5cc2f35e052346/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1770.1599999999999,
+            "fc2": 2311.585,
+            "return": 4935.325,
+            "reduce": 2879.935,
+            "forward": 5899.875,
+            "wall": 7415.5599999999995
+          },
+          "payload_GBps": {
+            "nv_dispatch": 132.6891490034799,
+            "nv_return": 23.795902397511817,
+            "rdma_dispatch": 18.955592714782846,
+            "rdma_return": 27.19531702572779
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "shared_return_pure_ep16_8192",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5b7c560586d75b2846e767adcb434dba686525b1598fb0d957d1ae97b6a5b0d7/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 1356.545,
+            "fc2": 566.496,
+            "return": 3389.425,
+            "reduce": 2373.615,
+            "forward": 4924.370000000001,
+            "wall": 6299.83
+          },
+          "payload_GBps": {
+            "nv_dispatch": 173.146503801938,
+            "nv_return": 34.649095938101595,
+            "rdma_dispatch": 24.735214828848285,
+            "rdma_return": 39.59896678640182
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        },
+        {
+          "name": "shared_return_pure_ep16_65536",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5b7c560586d75b2846e767adcb434dba686525b1598fb0d957d1ae97b6a5b0d7/test_cuda_notify",
+          "returncode": 0,
+          "timing_us": {
+            "dispatch": 8692.43,
+            "fc2": 3265.38,
+            "return": 23583.15,
+            "reduce": 20442.0,
+            "forward": 32242.5,
+            "wall": 34189.15
+          },
+          "payload_GBps": {
+            "nv_dispatch": 216.17064411217578,
+            "nv_return": 39.83878726972436,
+            "rdma_dispatch": 30.881520587453682,
+            "rdma_return": 45.53004259397069
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          }
+        }
+      ],
+      "small_validation": {
+        "all_byte_identical": true,
+        "files_compared": 192
+      },
+      "large_validation": {
+        "all_byte_identical": true,
+        "files_compared": 256
+      },
+      "finding": "Neither legal control quota 72 nor sharing Return throughout Dispatch removes full Forward regression. Retain incumbent worker scheduling; investigate message granularity and bulk payload packing."
     }
   ],
   "diagnostics": [
