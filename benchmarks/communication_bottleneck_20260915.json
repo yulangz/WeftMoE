@@ -4862,6 +4862,173 @@
         }
       ],
       "finding": "Qwen EP16 8K Dispatch baseline28.835, flat per-target reload28.302, sort12827.250, sort25626.329 GB/s. Bounded sort reuses existing staging and unused wire metadata; no RDMA payload expansion. Existing receiver already combines same-target notifications within each active warp. Sorting cost and per-fanout source reloads outweigh any locality benefit at these tested windows. Reject these candidates; no large full-model sweep."
+    },
+    {
+      "name": "Flush only the peer queues mapped to each GIN context",
+      "adopted": false,
+      "experimental_commit": "230f316",
+      "raw_results": "results/communication_bottleneck_20260915/targeted_flush_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.0749999999998,
+              "fc2": 548.816,
+              "return": 3409.2349999999997,
+              "reduce": 2520.095,
+              "forward": 4714.16,
+              "wall": 6111.475
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.94830427960366,
+              "nv_return": 34.4477608613076,
+              "rdma_dispatch": 28.849757754229095,
+              "rdma_return": 39.36886955578011
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1165.565,
+              "fc2": 562.432,
+              "return": 3376.435,
+              "reduce": 2377.1800000000003,
+              "forward": 4691.79,
+              "wall": 6111.12
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.51688151239955,
+              "nv_return": 34.782399779649246,
+              "rdma_dispatch": 28.788125930342794,
+              "rdma_return": 39.75131403388485
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K Return39.369->39.751 GB/s, phase3409.235->3376.435us. Sparse257Return512.704->476.656us. Full Forward validation pending; do not treat as42GB/s achievement."
+    },
+    {
+      "name": "Isolate GIN slot signals and local counters by cache line",
+      "adopted": false,
+      "experimental_commit": "d9861e8",
+      "raw_results": "results/communication_bottleneck_20260915/control_lines_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "rx_parts32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1157.6,
+              "fc2": 545.088,
+              "return": 3404.915,
+              "reduce": 2462.115,
+              "forward": 4738.88,
+              "wall": 6200.105
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.90344160331722,
+              "nv_return": 34.491466600487826,
+              "rdma_dispatch": 28.986205943331033,
+              "rdma_return": 39.418818971986084
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "control_pad128_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1168.03,
+              "fc2": 554.1600000000001,
+              "return": 3420.865,
+              "reduce": 2446.3999999999996,
+              "forward": 4729.68,
+              "wall": 6210.945
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.09160209926117,
+              "nv_return": 34.33064795015296,
+              "rdma_dispatch": 28.72737172846588,
+              "rdma_return": 39.235026228746236
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "control_split128_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1164.1750000000002,
+              "fc2": 571.6,
+              "return": 3416.415,
+              "reduce": 2522.945,
+              "forward": 4738.545,
+              "wall": 6156.5
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.75748835011916,
+              "nv_return": 34.375364819555,
+              "rdma_dispatch": 28.822498335731307,
+              "rdma_return": 39.28613122234857
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K Dispatch28.986baseline,28.727slot128,28.822split128; Return39.419,39.235,39.286 GB/s. No gain; retain compact control layout."
     }
   ],
   "diagnostics": [
