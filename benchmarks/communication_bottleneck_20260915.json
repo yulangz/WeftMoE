@@ -6072,6 +6072,161 @@
         "repetitions": 12
       },
       "finding": "Communication-only bijective rotation of complete128-row canonical tiles; leftover capacity unchanged and Return source reads mapped consistently. No extra copy, allocation, payload bytes, notification, or weaker completion. Qwen EP16 8K Dispatch28.938 baseline ->28.451 expert-span rotation/28.769 half-width rotation;64K34.257->33.413/34.157. This address permutation supplies no evidence for a useful layout gain; do not implement production compute/BWD mapping for it.128 sparse exported files match byte-for-byte over12 repetitions. CPU enumerated13 ragged/aligned capacities with all legal shifts; permutation is bijective."
+    },
+    {
+      "name": "Route arithmetic, cold header fields, and cooperative Dispatch address reuse",
+      "adopted": false,
+      "experimental_commits": {
+        "hot_header": "42d6f57",
+        "fast_division": "8f64950",
+        "address_cache": "ae1ebd7"
+      },
+      "raw_results": "results/communication_bottleneck_20260915/address_metadata_screen",
+      "cases": [
+        {
+          "name": "targeted_flush_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1166.24,
+              "fc2": 570.4639999999999,
+              "return": 3365.425,
+              "reduce": 2427.2,
+              "forward": 4672.145,
+              "wall": 6055.17
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.4002469474551,
+              "nv_return": 34.89619052571369,
+              "rdma_dispatch": 28.77146384963644,
+              "rdma_return": 39.88136060081564
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "hot_header_rx32_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.76dce82c98f0a7655bdc4f6ce2afc8781ec3c8e4ae26c9fb10d026823242238a/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1147.28,
+              "fc2": 564.4159999999999,
+              "return": 3385.2799999999997,
+              "reduce": 2543.245,
+              "forward": 4687.585,
+              "wall": 6082.780000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 204.7285963321944,
+              "nv_return": 34.691520937706784,
+              "rdma_dispatch": 29.24694233317063,
+              "rdma_return": 39.64745250023632
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "route_fastdiv_rx32_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.00333413adfb57c0cffd7e9cb0b808c3b3e48f56783da67783fb565dafd43c59/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1161.28,
+              "fc2": 580.624,
+              "return": 3378.815,
+              "reduce": 2377.55,
+              "forward": 4699.950000000001,
+              "wall": 6122.505
+            },
+            "payload_GBps": {
+              "nv_dispatch": 202.26045742628824,
+              "nv_return": 34.75789944107623,
+              "rdma_dispatch": 28.89435106089832,
+              "rdma_return": 39.72331364694427
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_address_cache_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.1a2bad6c09a3f8913bb4b5d12ef6a320d5cfc51236c7b0abcfc8710d95bbce96/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1103.745,
+              "fc2": 567.088,
+              "return": 3375.01,
+              "reduce": 2489.4049999999997,
+              "forward": 4679.709999999999,
+              "wall": 6204.745000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 212.80370375403743,
+              "nv_return": 34.797085638264775,
+              "rdma_dispatch": 30.40052910771963,
+              "rdma_return": 39.7680978723026
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "sparse": {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "nonpower": {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 257,
+          "top_k": 6,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "address_cache": {
+          "all_byte_identical": true,
+          "files_compared": 64,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "arithmetic": {
+          "exact_cases": 273480,
+          "divisors": 265,
+          "includes_uint64_max": true,
+          "seed": 914
+        }
+      },
+      "finding": "Qwen EP16 8K1620MHz baseline Dispatch28.771 Return39.881GB/s. Omit unused legacy header fields29.247/39.647; exact64-bit reciprocal division28.894/39.723; cache addresses cooperatively during metadata preparation30.401/39.768. Header and arithmetic candidates not adopted; address cache (+5.7%Dispatch) requires64K and full Forward confirmation because total communication GPU4672.145->4679.710us is flat. Cache uses1KiB extra shared memory for2copywarps, fixed32-entry tiles handle arbitrary batch length. All payload, fullTMAcompletion, readiness and credit semantics preserved.128 original sparse comparison files +64 top_k6 +64 cache files exact. Requested top_k7 fixture was rejected by baseline harness (accepts1,6,8), so top_k6 verifies non-power-of-two instead. No full Forward/BWD correctness claimed for these candidates yet."
     }
   ],
   "diagnostics": [
