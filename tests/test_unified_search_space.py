@@ -38,7 +38,7 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
         return plan
 
     def test_public_search_size_and_resource_profiles(self):
-        for phase, module, raw_count, accepted in (("forward", fw, 72, 72),
+        for phase, module, raw_count, accepted in (("forward", fw, 144, 144),
                                                    ("backward", bw, 48, 36)):
             for topology in ("single_node", "multi_node"):
                 with self.subTest(phase=phase, topology=topology):
@@ -139,7 +139,9 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
         source = self.source("forward")
         del source["1_gemm"]["gin_channel_pack_limit"]
         candidates = fw.expand_candidates(self.plan("forward", source))
-        self.assertEqual(len(candidates), 24)
+        self.assertEqual(len(candidates), 48)
+        self.assertEqual({c["config"]["gin_receive_rows"] for c in candidates},
+                         {32, 128})
         self.assertTrue(all(c["config"]["gin_channel_pack_limit"] == 3
                             for c in candidates))
 
