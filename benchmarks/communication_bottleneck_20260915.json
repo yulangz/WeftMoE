@@ -2505,6 +2505,157 @@
         "files_compared": 256
       },
       "finding": "Neither legal control quota 72 nor sharing Return throughout Dispatch removes full Forward regression. Retain incumbent worker scheduling; investigate message granularity and bulk payload packing."
+    },
+    {
+      "name": "Smaller GIN chunks and contiguous-token packing",
+      "adopted": false,
+      "experimental_commit": "7c59956",
+      "raw_results": "results/communication_bottleneck_20260915/gin_bulk_screen",
+      "cases": [
+        {
+          "name": "compact_clean_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1429.89,
+              "fc2": 476.11199999999997,
+              "return": 3415.215,
+              "reduce": 2413.6000000000004,
+              "forward": 4947.12,
+              "wall": 6414.645
+            },
+            "payload_GBps": {
+              "nv_dispatch": 164.26510011259606,
+              "nv_return": 34.38744325027854,
+              "rdma_dispatch": 23.46644287322801,
+              "rdma_return": 39.29993514317546
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "bulk128_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1436.435,
+              "fc2": 517.9359999999999,
+              "return": 3430.6549999999997,
+              "reduce": 2458.19,
+              "forward": 4972.895,
+              "wall": 6358.764999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 163.51663945810287,
+              "nv_return": 34.23267918225528,
+              "rdma_dispatch": 23.359519922586124,
+              "rdma_return": 39.12306192257747
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "bulk32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1741.1550000000002,
+              "fc2": 560.544,
+              "return": 6175.695,
+              "reduce": 4902.780000000001,
+              "forward": 8072.719999999999,
+              "wall": 9514.795
+            },
+            "payload_GBps": {
+              "nv_dispatch": 134.8995488626802,
+              "nv_return": 19.016566070701355,
+              "rdma_dispatch": 19.27136412324003,
+              "rdma_return": 21.733218366515835
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "bulk16_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 2899.3599999999997,
+              "fc2": 534.816,
+              "return": 11253.1,
+              "reduce": 9176.720000000001,
+              "forward": 14260.15,
+              "wall": 23327.95
+            },
+            "payload_GBps": {
+              "nv_dispatch": 81.01133491529167,
+              "nv_return": 10.436280847055478,
+              "rdma_dispatch": 11.573047845041664,
+              "rdma_return": 11.927178110920545
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "chunk32_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1686.19,
+              "fc2": 516.208,
+              "return": 6167.855,
+              "reduce": 4829.855,
+              "forward": 8001.47,
+              "wall": 9370.44
+            },
+            "payload_GBps": {
+              "nv_dispatch": 139.29689062323936,
+              "nv_return": 19.04073814964846,
+              "rdma_dispatch": 19.89955580331991,
+              "rdma_return": 21.76084359959824
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 256,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "On incumbent worker scheduling, coalesced dense packing at 128 rows does not improve Qwen EP16 8K Dispatch (23.36 vs 23.47 GB/s). 32/16-row messages with depth16 regress Dispatch and Return; original packet format at 32 rows also regresses. Reject these candidates; isolate ring depth at unchanged 128 rows next."
     }
   ],
   "diagnostics": [
