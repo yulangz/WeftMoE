@@ -71,7 +71,18 @@ for each captured bit. Empty polls do not scan every physical slot. The bitmap
 occupies existing channel padding, so registered-window sizes and slot offsets
 remain unchanged. Final drain checks still verify the durable per-slot counts.
 This reduces control overhead without changing payload bytes or completion
-ordering. The independent publisher GIN service remains an isolated experiment.
+ordering. Forward can now assign the final warp of RDMA CTAs to independent GIN control.
+
+`unified_rdma_ctas` selects Forward communication ownership, independently of
+model dimensions. Zero retains mixed workers; a positive value reserves that
+many CTA communication domains for RDMA packing/control, clamped to leave at
+least one relay CTA. All CTAs retain GEMM workers. Single-node execution always
+uses relay roles. Bare or macro-absent headers default to 16; legacy plans and
+the public grids explicitly retain 0 until the new path is tuned. Backward
+currently accepts the parameter for plan compatibility and does not consume it.
+Forward Return notifications use a dedicated full-warp single consumer in both
+layouts. The staged evidence is in
+[the communication partition record](../benchmarks/communication_partition_20260915.json).
 
 ## GEMM Parameters (`1_gemm`)
 

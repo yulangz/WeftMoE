@@ -14,10 +14,10 @@
 
 | CTA 线程 | warp | 工作 | 默认每线程寄存器配额 |
 | --- | --- | --- | ---: |
-| 0–255 | 0–7 | 两个 math warpgroup：WGMMA、activation/epilogue、FWD Reduce；GIN 空闲边界的有界通信协助 | 216 |
+| 0–255 | 0–7 | 两个 math warpgroup：WGMMA、activation/epilogue、FWD Reduce | 216 |
 | 256–287 | 8 | 计算 TMA producer、计算域任务/阶段协议 | 64 |
-| 288–351 | 9–10 | 两个通信 copy warp：本地 Dispatch/Return，GIN 路径中也参与远端进度与 packing | 64 |
-| 352–383 | 11 | 就绪任务发布、通知消费 | 64 |
+| 288–351 | 9–10 | 两个通信 copy warp：FWD 按 CTA 职责执行 RDMA packing 或 relay 搬运；BWD 保留混合循环 | 64 |
+| 352–383 | 11 | FWD RDMA CTA：GIN 控制；relay CTA：FC1 发布、通知消费；BWD：就绪任务发布、通知消费 | 64 |
 
 最后 128 个线程属于同一 warpgroup，必须先统一执行寄存器释放，再分成独立的 producer 和通信循环。寄存器额度只能按 warpgroup 设置；warp 8 不能单独拿到不同于 warp 9–11 的额度。
 
@@ -26,8 +26,8 @@ flowchart LR
   subgraph CTA[每个持久 CTA]
     P[warp 8：计算 TMA producer]
     M[warp 0–7：FC / dW / epilogue]
-    C[通信 copy warps：NVLink 与 GIN 进度]
-    N[最后一个通信 warp：发布与通知]
+    C[通信 copy warps：payload 搬运]
+    N[最后一个通信 warp：控制进度或发布与通知]
     P -->|独立计算 SMEM 与 mbarrier| M
     C -->|payload 完成后发布 ready| N
     N -->|就绪 tile| M
@@ -39,7 +39,11 @@ flowchart LR
 
 本地 payload 采用分段 TMA global→shared→global。计算 SMEM 与通信 staging 同时存在，通信不能借用仍被 WGMMA 消费的操作数区域。路由、计数、通知和归并仍包含标量/向量指令；TMA 只负责搬运，不能替代 activation、gate 乘法或 Reduce 加法。
 
-GIN 的 context、ring 和租约保持有限且共享。增加 CTA 或通信 warp 不会等比例增加 RDMA context；各 CTA 通过既有 claim/lease 协议协作推进同一组 context。默认 copy warp 在循环中推进 GIN 与本地搬运，并不是为 NVLink 和 RDMA 各固定划出一个 warpgroup。
+GIN 的 context、ring 和租约保持有限且共享。FWD 的 `unified_rdma_ctas` 将通信域划分为 RDMA 与 relay 两组，不减少任何 CTA 的计算 warp。正值指定 RDMA CTA 数，上限按实际 CTA 数截断，至少保留一个 relay；单机全部为 relay。宏缺省值为 16，旧 autotune 配置补 0 保留混合循环，公开网格也暂时固定 0，待性能筛选后再更新 incumbent。
+
+RDMA CTA 的 copy warps 只打包，最后一个 warp 独立处理 GIN 提交、ACK 和完成。一个 shared-memory mailbox 用 release/acquire 交接不可变任务描述符；copy warps 完成 TMA 与 metadata fence 后，通过原 device-scope pending slot 发布打包完成。控制 warp 在打包期间继续推进其他已就绪槽。relay CTA 负责本地 Dispatch/Return、GIN 接收和 NVLink fanout，并按 relay ordinal 独占 FC1 输入组。
+
+FWD relay 的最后一个 warp 交替进行有限 FC1 发布和 Return 通知接收。每 channel 只有一个通知消费者，入口固定完整 warp 和 lane 0，不以瞬时 activemask 重新选主。copy warps 等待 credit 时不再辅助接收；原 TMA 完整完成、发送线程同步、system-release ready、system-acquire 接收的顺序保留。BWD 暂时保留原混合 worker 与 CAS 通知接收协议；共同 helper 的默认参数保持该语义。本轮逐步提交、短测及失败候选记录见 [通信分区记录](../benchmarks/communication_partition_20260915.json)。
 
 每个 context 默认有 3 个 packing 槽。FWD 可为同一 channel 预留多个有界 packet，交给不同 CTA 在租约外打包；提交时仍要求 packet sequence 等于 channel 的下一待发送序号，不能按打包完成顺序发送。预留 terminal 后停止为该 channel 领取后续 packet，credit 检查覆盖预留序号。BWD 复用同一协议核心，但仍限制每个 channel 同时只有一个未提交 packet；其余槽可服务该 context 的其他 channel。
 

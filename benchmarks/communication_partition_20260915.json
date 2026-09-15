@@ -303,7 +303,8 @@
           "payload_GBps": {
             "nv_dispatch": 249.23179049680613,
             "nv_return": 103.47751484112561
-          }
+          },
+          "rdma_ctas": 0
         },
         {
           "name": "pure_baseline_ep16_64k",
@@ -327,7 +328,8 @@
             "nv_return": 39.785561366437,
             "rdma_dispatch": 31.417124987125824,
             "rdma_return": 45.46921299021373
-          }
+          },
+          "rdma_ctas": 0
         },
         {
           "name": "pure_spsc_ep8_64k",
@@ -349,7 +351,8 @@
           "payload_GBps": {
             "nv_dispatch": 273.78841055260426,
             "nv_return": 102.64377090104608
-          }
+          },
+          "rdma_ctas": 0
         },
         {
           "name": "pure_spsc_ep16_64k",
@@ -373,7 +376,8 @@
             "nv_return": 39.95297177423642,
             "rdma_dispatch": 30.161829426146987,
             "rdma_return": 45.6605391705559
-          }
+          },
+          "rdma_ctas": 16
         },
         {
           "name": "flash_ep16_correctness_8k",
@@ -400,6 +404,111 @@
         "reason": "Initial SPSC inherited transient activemask ownership and removed the copy-domain iteration join; EP8 repetition check failed. Corrected entry uses a fixed full-warp mask / lane 0 owner and retains the join. Failed timings excluded."
       },
       "conclusion": "EP8 64K pure Dispatch improved 249.23 to 273.79 GB/s; Return unchanged (~103 GB/s). EP16 pure Return RDMA payload is 45.66 GB/s; Dispatch and total are slightly slower. 8K full FWD shows no demonstrated speedup. BWD remains the original mixed-role implementation; full repeat output and all 400 tensor files (including dW1/dW2) match historical golden bytes. Small-grid finalizer and autotune macro/default compatibility covered."
+    },
+    {
+      "stage": "Bounded RDMA role-count and existing TMA-prefetch screen",
+      "source_commit": "43323a1",
+      "settings": {
+        "sm_clock_mhz": 1620,
+        "power_limit_w": 700,
+        "warmup_rounds": 10,
+        "measured_rounds": 10,
+        "statistics": "median of per-iteration slowest rank",
+        "recurring_tensor_allocation_in_wall": true,
+        "reusable_context_and_buffer_allocation_excluded": true
+      },
+      "raw_results": "results/communication_optimization_20260915/rdma_partition_screen/screen/runs.json",
+      "cases": [
+        {
+          "name": "rdma8_prefetch_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "retain": false,
+          "check": false,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.3fe6bd000c471d42b240e1365782f4be89a9d2cd5bdba418b2171104b4442fad/test_cuda_notify",
+          "returncode": 0,
+          "parameters": {
+            "unified_rdma_ctas": 8,
+            "unified_optimize_gin_local_transport": 1,
+            "local_return_batch_rows": 128
+          },
+          "timing_us": {
+            "dispatch": 15063.900000000001,
+            "fc2": 9461.634999999998,
+            "return": 27531.25,
+            "reduce": 18194.75,
+            "forward": 41984.05,
+            "wall": 43946.55
+          },
+          "payload_GBps": {
+            "nv_dispatch": 124.73849348442302,
+            "nv_return": 34.12573333938706,
+            "rdma_dispatch": 17.819784783489002,
+            "rdma_return": 39.000838102156635
+          }
+        },
+        {
+          "name": "rdma16_prefetch_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "retain": false,
+          "check": false,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.75fae724628c722f96b1a53a63d185488b43fac77489f46b263b1364bda9147d/test_cuda_notify",
+          "returncode": 0,
+          "parameters": {
+            "unified_rdma_ctas": 16,
+            "unified_optimize_gin_local_transport": 1,
+            "local_return_batch_rows": 128
+          },
+          "timing_us": {
+            "dispatch": 9127.25,
+            "fc2": 10065.05,
+            "return": 23574.6,
+            "reduce": 14271.6,
+            "forward": 32442.95,
+            "wall": 34330.0
+          },
+          "payload_GBps": {
+            "nv_dispatch": 205.8723264948369,
+            "nv_return": 39.85323594037651,
+            "rdma_dispatch": 29.41033235640527,
+            "rdma_return": 45.5465553604303
+          }
+        },
+        {
+          "name": "rdma32_prefetch_ep16_64k",
+          "ep": 16,
+          "tokens": 65536,
+          "rounds": 20,
+          "retain": false,
+          "check": false,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2604fa0cff7251af7f035de4f29426cb890de9da313ac79259b0890edc3e155d/test_cuda_notify",
+          "returncode": 0,
+          "parameters": {
+            "unified_rdma_ctas": 32,
+            "unified_optimize_gin_local_transport": 1,
+            "local_return_batch_rows": 128
+          },
+          "timing_us": {
+            "dispatch": 9252.4,
+            "fc2": 10009.55,
+            "return": 23715.25,
+            "reduce": 14431.8,
+            "forward": 32529.55,
+            "wall": 34520.75
+          },
+          "payload_GBps": {
+            "nv_dispatch": 203.0876520686525,
+            "nv_return": 39.616875048755546,
+            "rdma_dispatch": 29.01252172409321,
+            "rdma_return": 45.276428627149194
+          }
+        }
+      ],
+      "adopted": false,
+      "conclusion": "All three diagnostic-only candidates were slower than the 16-RDMA-CTA / existing batch-size candidate. No new production setting selected and no full end-to-end matrix run. Numerical validation was not repeated for these rejected tuning headers. Remaining work: improve Return payload throughput and full FWD performance before porting the role partition to BWD."
     }
   ]
 }
