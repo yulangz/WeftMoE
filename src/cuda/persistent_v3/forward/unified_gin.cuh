@@ -131,6 +131,35 @@ __device__ __forceinline__ void flush_context(const Args &a, unsigned context) {
         .flush(ncclCoopThread{});
 }
 
+// The Forward context mapping is immutable for the communicator: an ACK /
+// Dispatch context uses the same-number peer plus its owned Return peer on
+// each remote node; each Return data context uses only that owned Return peer.
+// Snapshot and wait for all of those queues, retaining completion semantics
+// without serially probing every unused local/world peer in each context.
+__device__ __forceinline__ void flush_peer(const ForwardKernelArgs &a,
+                                          unsigned context, unsigned peer) {
+  const ncclGin gin(a.gin_dev_comm, context);
+  ncclGinRequest_t request;
+  gin.flushAsync(ncclTeamWorld(gin.comm), peer, &request);
+  gin.wait(request);
+}
+
+__device__ __forceinline__ void flush_context(const ForwardKernelArgs &a,
+                                             unsigned context) {
+  constexpr unsigned width = 1U + ring::kReturnPorts;
+  for (unsigned node = 0U; node < a.dispatch.identity.num_nodes - 1U; ++node) {
+    const auto dispatch_channel = owned_channel(a, context, node * width);
+    const auto return_channel = owned_channel(a, context, node * width + 1U);
+    const auto dispatch_peer = wire::peer(a, dispatch_channel);
+    const auto return_peer = wire::peer(a, return_channel);
+    flush_peer(a, context, dispatch_peer);
+    if (return_peer != dispatch_peer)
+      flush_peer(a, context, return_peer);
+    for (unsigned port = 0U; port < ring::kReturnPorts; ++port)
+      flush_peer(a, wire::data_context(a, return_channel + port), return_peer);
+  }
+}
+
 __device__ __forceinline__ void
 complete_context(const ForwardKernelArgs &a,
                  persistent_v3::ForwardPipelineControl &control,
