@@ -6226,6 +6226,179 @@
         "4": 8
       },
       "finding": "Qwen EP16 8K pure communication profiling, RX32. Last context reason is remote credit8ranks or locally unsubmitted ACK8ranks. Per-rank maximum flush52.45-65.41us; all128context flush statistics above. baseline/candidate64prefix files exact,12repeats. Trace is diagnostic only; subsequent targeted peer flush retains all mapped peer queue completion. No attribution of the entire tail to flush or terminal packets."
+    },
+    {
+      "name": "Sample NVLink wait, metadata, and publication durations",
+      "experimental_commit": "05df93d",
+      "raw_results": "results/communication_bottleneck_20260915/nv_wait_trace_v2",
+      "initial_incomplete_local_wait_trace": "results/communication_bottleneck_20260915/nv_wait_trace",
+      "not_valid_goal_bandwidth": true,
+      "golden_files": 64,
+      "zero_overflow": true,
+      "aggregate": {
+        "local_dispatch": {
+          "shared_read_wait": {
+            "samples": 560,
+            "total_us": 451.168,
+            "count": 8960,
+            "mean_us_per_count": 0.05035357142857143,
+            "median_batch_us": 0.768,
+            "fraction_of_sampled_total": 0.01593955653234659
+          },
+          "source_load_wait": {
+            "samples": 560,
+            "total_us": 3751.616,
+            "count": 8960,
+            "mean_us_per_count": 0.41870714285714283,
+            "median_batch_us": 6.608,
+            "fraction_of_sampled_total": 0.13254285614151712
+          },
+          "metadata": {
+            "samples": 560,
+            "total_us": 1223.168,
+            "count": 8960,
+            "mean_us_per_count": 0.1365142857142857,
+            "median_batch_us": 2.112,
+            "fraction_of_sampled_total": 0.0432139590674811
+          },
+          "payload_loop": {
+            "samples": 560,
+            "total_us": 22406.848,
+            "count": 8960,
+            "mean_us_per_count": 2.5007642857142853,
+            "median_batch_us": 40.480000000000004,
+            "fraction_of_sampled_total": 0.7916235646315722
+          },
+          "full_store_wait": {
+            "samples": 560,
+            "total_us": 22.688,
+            "count": 8960,
+            "mean_us_per_count": 0.002532142857142857,
+            "median_batch_us": 0.032,
+            "fraction_of_sampled_total": 0.0008015565346076837
+          },
+          "publication": {
+            "samples": 560,
+            "total_us": 4652.224,
+            "count": 8960,
+            "mean_us_per_count": 0.5192214285714285,
+            "median_batch_us": 6.352,
+            "fraction_of_sampled_total": 0.1643609197663389
+          },
+          "sampled_warp_total_us": 28304.928000000004
+        },
+        "received_fanout": {
+          "shared_read_wait": {
+            "samples": 140,
+            "total_us": 7.872,
+            "count": 2240,
+            "mean_us_per_count": 0.003514285714285714,
+            "median_batch_us": 0.064,
+            "fraction_of_sampled_total": 0.0004585368945122826
+          },
+          "source_load_wait": {
+            "samples": 140,
+            "total_us": 97.344,
+            "count": 2240,
+            "mean_us_per_count": 0.043457142857142854,
+            "median_batch_us": 0.672,
+            "fraction_of_sampled_total": 0.005670200134578714
+          },
+          "metadata": {
+            "samples": 140,
+            "total_us": 5100.512,
+            "count": 2240,
+            "mean_us_per_count": 2.2770142857142854,
+            "median_batch_us": 37.120000000000005,
+            "fraction_of_sampled_total": 0.29710022013498877
+          },
+          "payload_loop": {
+            "samples": 140,
+            "total_us": 7218.112,
+            "count": 2240,
+            "mean_us_per_count": 3.2223714285714284,
+            "median_batch_us": 49.888000000000005,
+            "fraction_of_sampled_total": 0.4204485087299087
+          },
+          "full_store_wait": {
+            "samples": 140,
+            "total_us": 1002.464,
+            "count": 2240,
+            "mean_us_per_count": 0.4475285714285714,
+            "median_batch_us": 6.544,
+            "fraction_of_sampled_total": 0.0583926231479117
+          },
+          "publication": {
+            "samples": 140,
+            "total_us": 3846.56,
+            "count": 2240,
+            "mean_us_per_count": 1.7172142857142858,
+            "median_batch_us": 24.032,
+            "fraction_of_sampled_total": 0.22405864798719077
+          },
+          "sampled_warp_total_us": 17167.648
+        }
+      },
+      "cases": [
+        {
+          "name": "targeted_flush",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.807aea0964e8674fdf79b08ce276798b6078a54c732cf36817ef2a0bdbd54107/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1163.5349999999999,
+              "fc2": 550.944,
+              "return": 3361.9049999999997,
+              "reduce": 2289.73,
+              "forward": 4677.505,
+              "wall": 6066.72
+            },
+            "payload_GBps": {
+              "nv_dispatch": 201.86846463578667,
+              "nv_return": 34.93272772431107,
+              "rdma_dispatch": 28.838352090826664,
+              "rdma_return": 39.92311739921265
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "nv_wait_rx32",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4a3b9ae603e982df2e98f12f902429da43c2a7381d220a69fa37f3e7f580052e/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1169.635,
+              "fc2": 586.3199999999999,
+              "return": 3369.565,
+              "reduce": 2442.8450000000003,
+              "forward": 4709.615,
+              "wall": 6068.59
+            },
+            "payload_GBps": {
+              "nv_dispatch": 200.8156595861102,
+              "nv_return": 34.853315487310674,
+              "rdma_dispatch": 28.687951369444317,
+              "rdma_return": 39.83236055692648
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "limitations": "Instrumented samples on warp0 of CTA32,64,96; wait measurements include timer and barrier polling costs. Read/load waits are nested inside payload_loop, not additive phases. Local full_store_wait excludes system fence (included in publication); received full_store_wait includes system fence. Publication includes warp/CTA synchronization before readiness and readiness stores, but excludes final credit bookkeeping. No cross-GPU timestamps compared. Not goal bandwidth.",
+      "finding": "Current GIN local Dispatch uses segmented copy_row, not the opt-in row-prefetch path. Sampled local warp elapsed: metadata4.32%,payload79.16%,fullwait0.08%,publication16.44%; nested source-load wait13.25%,shared-read wait1.59%. Received fanout: metadata29.71%,payload42.04%,fullwait+fence5.84%,publication22.41%; nested source-load wait0.57%,shared-read wait0.05%. Payload loop has substantial address/issue work outside waits. Profiled total Dispatch1169.635us vs uninstrumented1163.535us (+0.52%) in this pair. These are elapsed sampled regions, not hardware stall counters; metadata and publication remain optimization candidates requiring causal tests.64 output/input/route/gate files matched over12 runs."
     }
   ]
 }
