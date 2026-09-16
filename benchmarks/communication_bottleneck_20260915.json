@@ -9417,6 +9417,21 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K incumbent D32.918/R42.231GB/s versus aligned D32.694/R42.149. GPU4391.490->4398.945us;wall5769.795->5778.495.64 sparse files exact with12 repeats. No gain;reject without full/64K/BWD sweep. Header72->80bytes;socket wrapper80->96, all sizes derived from sizeof. Payload wire bytes unchanged. Wider stores were a hypothesis;performance does not support adopting the ABI expansion."
+    },
+    {
+      "name": "Four single-buffer GIN issuers in the existing staging footprint",
+      "source": "/tmp/weftmoe-flexible-gin-lane-staging",
+      "source_commit": "9d5e763",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/flexible_gin_issuers4_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Qwen EP16 8K paired baseline2issuers x2slots D32.7201/R42.2680GB/s;candidate4issuers x1slot D32.7746/R42.2886, GPU4412.05->4397.36us,wall5900.48->5847.45. Less than0.2% phase bandwidth gain,insufficient to adopt;no full/64K/BWD sweep. Same SMEM,math stages,thread count,payload and completion protocol. RX Dispatch retains2x2 fanout staging.64 sparse files exact over12 repeats."
     }
   ],
   "diagnostics": [
