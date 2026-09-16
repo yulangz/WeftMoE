@@ -9699,6 +9699,112 @@
         }
       ],
       "finding": "Qwen EP16 8K baseline D32.9435/R42.2589GB/s,GPU4388.590us;early payload prefetch D32.8496/R42.2191,GPU4399.620. No gain;64 sparse files exact over12 repetitions. Reject without full/BWD/64K expansion. Only reorders payload enqueue before each source row fanout metadata loop;unchanged staging,threads,wire bytes,full completion and ready ordering."
+    },
+    {
+      "name": "Warp-cooperative address windows feeding existing Dispatch TMA issuers",
+      "source": "/tmp/weftmoe-cooperative-dispatch-addresses",
+      "source_commit": "f432f90",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/cooperative_dispatch_addresses_lanes2_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "index_enumeration": {
+        "cases": 44030,
+        "all_exact": true,
+        "comparison": "Exact per-issuer row sequence, contiguous and interleaved mapping",
+        "copy_warps": [
+          1,
+          2,
+          3,
+          4,
+          7
+        ],
+        "issuer_lanes": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ],
+        "row_counts": [
+          1,
+          259
+        ],
+        "begin": 7
+      },
+      "resource_audit": "results/communication_bottleneck_20260915/cooperative_dispatch_addresses_lanes2_qwen_pure/resource_usage.json",
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.7249999999999,
+              "fc2": 134.272,
+              "return": 3175.87,
+              "reduce": 2419.76,
+              "forward": 4400.08,
+              "wall": 5805.775
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.88673468888402,
+              "nv_return": 36.979004808131315,
+              "rdma_dispatch": 32.84096209841201,
+              "rdma_return": 42.261719780721506
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "cooperative_dispatch_addresses_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1019.2,
+              "fc2": 135.76,
+              "return": 3177.3450000000003,
+              "reduce": 2482.05,
+              "forward": 4398.335,
+              "wall": 5835.305
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.45626373626374,
+              "nv_return": 36.96183826433704,
+              "rdma_dispatch": 32.92232339089482,
+              "rdma_return": 42.24210087352805
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K baseline D32.8410/R42.2617GB/s,GPU4400.080us;cooperative addresses32.9223/42.2421,GPU4398.335.0.25% Dispatch gain and0.04% total GPU difference are insufficient to adopt.64 sparse files exact over12 repetitions. All lanes resolve up to32 source/target address pairs into registers,shuffle to existing two-lane TMA issuers;original per-issuer route order,staging and full completion retained. Arbitrary tails and both contiguous/interleaved transport mappings enumerated exactly in44030CPU cases. REG168 unchanged,stack104->112bytes;not a dynamic spill attribution. Initial contiguous-only build7db6888 had no EP16 path change and was not GPU-tested;v2f432f90 covers actual GIN interleaving. No full/BWD/64K expansion."
     }
   ],
   "diagnostics": [
