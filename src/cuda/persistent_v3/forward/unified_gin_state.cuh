@@ -14,6 +14,7 @@ struct alignas(128) GinSenderState {
   unsigned return_cursor;
   unsigned dispatch_first;
   unsigned slot_cursor;
+  unsigned terminal_puts; // Submitted terminal packets; fills former padding.
   unsigned long long dispatch_puts;
   unsigned long long return_puts;
   GinPendingSlot slots[forward_tuning::kUnifiedGinPackSlots];

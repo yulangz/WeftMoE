@@ -83,12 +83,6 @@ __device__ __forceinline__ void account_send(const ForwardKernelArgs &a,
   atomicAdd(&status->gin_signal_count, 1ULL);
 }
 
-template <class Args>
-__device__ __forceinline__ void flush_context(const Args &a, unsigned sender) {
-  // Every slot's local counter and remote credit were checked by drained().
-  wire::gin_for_cta(a, sender).flush(ncclCoopThread{});
-}
-
 __device__ __forceinline__ void
 complete_context(const ForwardKernelArgs &a,
                  persistent_v3::ForwardPipelineControl &control,
@@ -154,10 +148,12 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
   const unsigned probes = max_probes == 0U ? count : min(count, max_probes);
   for (unsigned probe = 0; probe < probes; ++probe) {
     const unsigned channel = start + (cursor++ % count) * stride;
+    auto &wire_state = channels[channel];
+    if (wire_state.tx_terminal)
+      continue;
     if constexpr (!SameChannel)
       if (channel_pending(state, channel))
         continue;
-    auto &wire_state = channels[channel];
     auto sequence = wire_state.sent;
     if constexpr (SameChannel) {
       bool terminal_reserved = false;
@@ -259,6 +255,7 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         if (may_submit) {
           send_packed(a, entry.task);
           on_send(entry.task);
+          state.terminal_puts += entry.task.terminal != 0U;
           if (entry.task.channel < a.gin_rings.dispatch_channels)
             ++state.dispatch_puts;
           else
@@ -269,7 +266,12 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         }
         occupied += phase != 0U;
       }
-      if (occupied == 0U && drained(a, context)) {
+      const unsigned owned_channels = context < a.gin_rings.channels()
+          ? 1U + (a.gin_rings.channels() - 1U - context) / a.gin_sender_count : 0U;
+      // Do not scan old Dispatch slots on every Return submission. A sender
+      // cannot drain before it has submitted the last packet of every channel.
+      if (occupied == 0U && state.terminal_puts == owned_channels &&
+          drained(a, context)) {
         // Per-slot local counters and remote credits already prove that every
         // payload put is complete. This submitter issues no standalone ACKs.
         on_complete(context, state);
@@ -587,7 +589,9 @@ progress_send(const ForwardKernelArgs &a,
               complete_context(a, control, context, state);
             });
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
-  if (s.gin_task.channel != wire::kNoChannel) {
+  const bool packed = s.gin_task.channel != wire::kNoChannel;
+  copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
+  if (packed) {
     if (s.gin_task.channel < a.gin_rings.dispatch_channels)
       pack_dispatch<BaseThread>(a, s, s.gin_task);
     else

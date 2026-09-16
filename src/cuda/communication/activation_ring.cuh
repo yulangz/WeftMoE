@@ -50,9 +50,9 @@ __device__ __forceinline__ unsigned context_for_cta(const Args &a, unsigned cta)
 
 template <class Args>
 __device__ __forceinline__ ncclGin gin_for_cta(const Args &a, unsigned cta) {
-  const auto sharing = unsigned(a.gin_dev_comm.ginContextCount) > a.gin_total_ctas
-      ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
-  return ncclGin(a.gin_dev_comm, context_for_cta(a, cta), sharing);
+  // GPU scope is valid for both private and shared contexts, and keeps the
+  // backend's large submission path to one compile-time sharing mode.
+  return ncclGin(a.gin_dev_comm, context_for_cta(a, cta), NCCL_GIN_RESOURCE_SHARING_GPU);
 }
 
 // Only receiver-owned channels issue standalone credits. Join their actual
@@ -197,7 +197,8 @@ __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
       if (!ring::reached(gin.readSignal(a.gin_window,
               a.gin_rings.slot_control(channel, slot) + offsetof(ring::ChunkSlot, ready_signal)),
               sequence / ring::kRingDepth + 1ULL, 64U)) continue;
-      state.claimed = sequence + 1ULL;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(state.claimed)
+          .store(sequence + 1ULL, ::cuda::memory_order_relaxed);
     } else if (!ring::claim(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel,
                            sequence)) continue;
     asm volatile("fence.proxy.async.global;" ::: "memory");

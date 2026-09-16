@@ -187,38 +187,6 @@ __device__ __forceinline__ void receive_return(const BackwardKernelArgs &a,
 }
 
 template <unsigned BaseThread, class Storage>
-__device__ __forceinline__ bool progress_send(const BackwardKernelArgs &a,
-                                              Storage &s) {
-  const unsigned tid = threadIdx.x - BaseThread;
-  if (tid == 0U)
-    s.gin_progressed = shared_gin::progress_context(
-        a, s.gin_context_cursor, s.gin_context, s.gin_task_slot, s.gin_task,
-        [&](const wire::Transfer &task) {
-          if (task.channel >= a.gin_rings.dispatch_channels) {
-            auto *status =
-                peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-            atomicAdd(&status->gin_return_put_count, 1ULL);
-            atomicAdd(&status->gin_return_payload_bytes,
-                      task.rows * (a.hidden * 2ULL + sizeof(float)));
-          }
-        },
-        [](unsigned, forward_unified_transport::GinSenderState &) {});
-  copy_sync<Storage::kCopyThreads>();
-  if (s.gin_task.channel != wire::kNoChannel) {
-    if (s.gin_task.channel < a.gin_rings.dispatch_channels)
-      pack_dispatch<BaseThread>(a, s, s.gin_task);
-    else
-      pack_return<BaseThread>(a, s, s.gin_task);
-    if (tid == 0U)
-      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-          shared_gin::states(a)[s.gin_context].slots[s.gin_task_slot].pending)
-          .store(2U, ::cuda::memory_order_release);
-    copy_sync<Storage::kCopyThreads>();
-  }
-  return s.gin_progressed != 0U;
-}
-
-template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ bool progress_receive(const BackwardKernelArgs &a,
                                                  Storage &s, bool dispatch) {
   const unsigned tid = threadIdx.x - BaseThread;

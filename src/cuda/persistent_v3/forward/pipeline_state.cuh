@@ -104,8 +104,8 @@ struct ForwardInputPendingQueue {
 };
 
 // Producers reserve disjoint positions and release-publish each row separately.
-// Unified consumers own disjoint fixed-size stripes. head only counts claimed
-// local rows; the legacy consumer uses it as a nonblocking reservation cursor.
+// Local work consumers claim ready prefixes with one nonblocking CAS. Remote
+// GIN channels own fixed stripes independently of this local work cursor.
 inline constexpr unsigned kReturnReadyBlockRows = 32U;
 struct alignas(128) ReturnRowQueue {
   unsigned long long reserved = 0;

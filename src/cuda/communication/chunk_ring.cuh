@@ -175,7 +175,7 @@ __device__ __forceinline__ void consumed(void *base, ChunkRingLayout layout,
       .fetch_or(1ULL << (sequence % kRingDepth), ::cuda::memory_order_release);
 }
 
-// Called by the unique legacy GIN owner or under the unified context lease.
+// Called only by the unique legacy GIN owner; unified receivers issue their own credits.
 // Copy workers cannot return credit until every TMA/NVLink reader has retired.
 __device__ __forceinline__ bool
 acknowledge(const ncclGin &gin, ncclWindow_t window, void *base,
@@ -228,9 +228,14 @@ __device__ __forceinline__ bool drained(const ncclGin &gin, ncclWindow_t window,
   for (unsigned i = 0; i < kRingDepth; ++i) {
     const auto sent = (state.sent + kRingDepth - 1U - i) / kRingDepth;
     const auto received = (claimed + kRingDepth - 1U - i) / kRingDepth;
-    if (gin.readSignal(window, layout.slot_control(channel, i) +
-                                   offsetof(ChunkSlot, credit_signal)) < sent ||
-        state.slots[i].acknowledged < received)
+    const auto acknowledged =
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+            const_cast<unsigned long long &>(state.slots[i].acknowledged))
+            .load(::cuda::memory_order_acquire);
+    if (!reached(gin.readSignal(window, layout.slot_control(channel, i) +
+                                   offsetof(ChunkSlot, credit_signal)), sent, 64U) ||
+        !reached(acknowledged, received, 64U) ||
+        !reached(gin.readCounter(counter(layout, channel, i)), state.slots[i].local_target))
       return false;
   }
   return true;
