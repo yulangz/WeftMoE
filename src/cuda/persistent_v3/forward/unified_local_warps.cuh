@@ -63,7 +63,9 @@ __device__ __forceinline__ void run_local_warps(
                                LocalReturnTerminal, LocalReturn, blockIdx.x,
                                s.return_cursor, execution_epoch(a));
     if (return_tid < 32U)
-      drain_notifications<return_base>(a);
+      // The live publisher owns this SPSC consumer through copies_done.
+      // A second drainer must not race its non-CAS head advancement.
+      drain_notifications<return_base, false>(a, [&] { return cancelled(a, control); });
     copy_sync<return_threads, 6U>();
     if (return_tid == 0U) {
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)

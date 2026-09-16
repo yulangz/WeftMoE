@@ -38,6 +38,10 @@ struct alignas(128) ChunkChannel {
   // sequence counters, this bitmap survives operation prepare and Graph
   // replay. New windows are zeroed once; successful drain consumes every bit.
   unsigned long long consumed_slots;
+  // Generation-local atomic subtask tickets; no packet-claim lock. These
+  // occupy existing header padding and do not change the physical wire slots.
+  unsigned long long dispatch_claimed_parts;
+  unsigned long long dispatch_receive_base;
   ChunkSlot slots[kRingDepth];
 };
 static_assert(kRingDepth <= 64U);

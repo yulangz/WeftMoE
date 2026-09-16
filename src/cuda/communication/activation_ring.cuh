@@ -102,8 +102,12 @@ template <class Args> __global__ void prepare(Args a) {
     return;
   auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
   const ncclGin gin(a.gin_dev_comm, data_context(a, channel));
-  for (unsigned slot = 0; slot < ring::kRingDepth; ++slot)
+  state.dispatch_claimed_parts = 0ULL;
+  state.dispatch_receive_base = state.claimed;
+  for (unsigned slot = 0; slot < ring::kRingDepth; ++slot) {
     state.slots[slot].local_target = gin.readCounter(ring::counter(a.gin_rings, channel, slot));
+    state.slots[slot].consumed = 0ULL;
+  }
   state.tx_terminal = state.rx_terminal = 0U;
   state.tx_cursor = state.tx_end = 0ULL;
   if (channel >= a.gin_rings.dispatch_channels) {

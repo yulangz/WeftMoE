@@ -227,17 +227,17 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
          word += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
       control_words[word] = 0ULL;
   }
+  // Control words, Return storage, input groups and task descriptors occupy
+  // disjoint allocations. Their initialization can overlap; the map-arrival
+  // rendezvous below publishes all of them before any worker starts.
+  if (stream_remote_dispatch || stream_local_dispatch)
+    return_queue_detail::initialize<true>(a);
+#if !defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   forward_transport_cta_barrier(
       forward_mixed_scheduler_word(a, scheduler,
                                    kForwardTransportClearArrivals),
       gridDim.x);
-  if (stream_remote_dispatch || stream_local_dispatch) {
-    return_queue_detail::initialize<true>(a);
-    forward_transport_cta_barrier(
-        forward_mixed_scheduler_word(a, scheduler,
-                                     kForwardTransportClearArrivals),
-        2ULL * gridDim.x);
-  }
+#endif
   forward_publish_progress(a, kForwardSetupComplete, scheduler[3]);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   const auto setup_fc1_ntiles = static_cast<std::uint32_t>(

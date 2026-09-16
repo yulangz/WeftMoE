@@ -1,0 +1,953 @@
+{
+  "baseline_commit": "04c88dc",
+  "branch": "communication_spsc",
+  "acceptance": {
+    "ep8_GBps": 240,
+    "ep16_GBps": 40,
+    "separate_phases": [
+      "dispatch",
+      "return"
+    ],
+    "allocation_included": false,
+    "phase_statistic": "median of slowest-rank samples",
+    "payload": "EP8 actual NVLink peer payload; EP16 deduplicated RDMA payload; exclude metadata and self copies",
+    "all_targets_achieved": false
+  },
+  "environment": {
+    "clock_MHz": 1620,
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "architecture": "sm_90a",
+    "cuda": "12.9",
+    "nccl": "2.31.2",
+    "rounds": 24,
+    "warmup": 10
+  },
+  "selected": "recovery_release_once",
+  "experiments": [
+    {
+      "name": "recovery_chunks128",
+      "build_key": "0d96604c60c67d88fa011bd9fc6e3af6fa75658257373d8b654e5f23a3ce1137",
+      "configuration": "results/communication_spsc_20260916/recovery_chunks128/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1059.615,
+            "fc2": 124.52799999999999,
+            "return": 3163.325,
+            "reduce": 2499.935,
+            "forward": 4413.295,
+            "wall": 5858.360000000001
+          },
+          "payload_GBps": {
+            "nv_dispatch": 221.6663826012278,
+            "nv_return": 37.125654809417306,
+            "rdma_dispatch": 31.666626085889686,
+            "rdma_return": 42.42931978219121
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t65536",
+          "payload_bytes_per_rank": 1342177280,
+          "timing_us": {
+            "dispatch": 6903.52,
+            "fc2": 2246.82,
+            "return": 23321.449999999997,
+            "reduce": 20878.6,
+            "forward": 30154.85,
+            "wall": 31954.35
+          },
+          "payload_GBps": {
+            "nv_dispatch": 272.18697012538524,
+            "nv_return": 40.28583540045752,
+            "rdma_dispatch": 38.88385287505504,
+            "rdma_return": 46.04095474338003
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_coop_fanout",
+      "build_key": "7609c44d4f05ff2a7b77c7d056188cf3b33e5d0df65f8c47d539cac63acf97ff",
+      "configuration": "results/communication_spsc_20260916/recovery_coop_fanout/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 985.6800000000001,
+            "fc2": 126.52799999999999,
+            "return": 3092.3500000000004,
+            "reduce": 2459.615,
+            "forward": 4286.5599999999995,
+            "wall": 5767.39
+          },
+          "payload_GBps": {
+            "nv_dispatch": 238.29338527716905,
+            "nv_return": 37.977755428719256,
+            "rdma_dispatch": 34.04191218245272,
+            "rdma_return": 43.403149061393435
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_credit_scalar",
+      "build_key": "392cf2cb1065445ad71c9bfa325c1a3dd367436f5dcac9eff018ee82bec54b35",
+      "configuration": "results/communication_spsc_20260916/recovery_credit_scalar/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1132.05,
+            "fc2": 124.608,
+            "return": 3160.91,
+            "reduce": 2442.88,
+            "forward": 4433.98,
+            "wall": 5850.535
+          },
+          "payload_GBps": {
+            "nv_dispatch": 207.4829062320569,
+            "nv_return": 37.154019570313615,
+            "rdma_dispatch": 29.64041517600813,
+            "rdma_return": 42.461736651786985
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_d16",
+      "build_key": "c2baaa629b69bb1d7c4678a5ad7f2a3f5326fed952f8b60447386bf261d9dcb4",
+      "configuration": "results/communication_spsc_20260916/recovery_d16/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1609.715,
+            "fc2": 125.184,
+            "return": 3200.08,
+            "reduce": 2446.48,
+            "forward": 4938.605,
+            "wall": 6363.719999999999
+          },
+          "payload_GBps": {
+            "nv_dispatch": 145.91466439711377,
+            "nv_return": 36.69924251893703,
+            "rdma_dispatch": 20.84495205673054,
+            "rdma_return": 41.94199145021375
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_d32",
+      "build_key": "70210edf09f437254d62e6661a289b90031971a3e448e18a74ea2d32e1169732",
+      "configuration": "results/communication_spsc_20260916/recovery_d32/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1175.41,
+            "fc2": 125.424,
+            "return": 3201.7749999999996,
+            "reduce": 2454.0299999999997,
+            "forward": 4524.99,
+            "wall": 5976.29
+          },
+          "payload_GBps": {
+            "nv_dispatch": 199.8290162581567,
+            "nv_return": 36.679814165580034,
+            "rdma_dispatch": 28.547002322593816,
+            "rdma_return": 41.91978761780575
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_dynamic_local",
+      "build_key": "9cde11caa25feecd3209e8aea46e4ba1aa6382be32dd1c14dceb2360d0e66aa6",
+      "configuration": "results/communication_spsc_20260916/recovery_dynamic_local/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1067.455,
+            "fc2": 127.2,
+            "return": 3115.505,
+            "reduce": 2460.975,
+            "forward": 4376.51,
+            "wall": 5882.92
+          },
+          "payload_GBps": {
+            "nv_dispatch": 220.03833791588406,
+            "nv_return": 37.69549784063899,
+            "rdma_dispatch": 31.43404827369772,
+            "rdma_return": 43.08056896073028
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_native_wait",
+      "build_key": "78b12a5fa2f17254eb86584411e43dd8571f59c1204ec3f9f8e65f16537b16a8",
+      "configuration": "results/communication_spsc_20260916/recovery_native_wait/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 992.912,
+            "fc2": 127.424,
+            "return": 3105.505,
+            "reduce": 2447.76,
+            "forward": 4306.625,
+            "wall": 5809.05
+          },
+          "payload_GBps": {
+            "nv_dispatch": 236.55774529867702,
+            "nv_return": 37.816880668361506,
+            "rdma_dispatch": 33.79396361409672,
+            "rdma_return": 43.21929219241315
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_owned_poll",
+      "build_key": "f0f1510b0697b144a557db2037ca01f74284b72baed974b44cfaf16cf08be60a",
+      "configuration": "results/communication_spsc_20260916/recovery_owned_poll/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1049.4899999999998,
+            "fc2": 127.344,
+            "return": 3115.34,
+            "reduce": 2523.01,
+            "forward": 4369.135,
+            "wall": 5842.05
+          },
+          "payload_GBps": {
+            "nv_dispatch": 223.80491857950057,
+            "nv_return": 37.69749433448676,
+            "rdma_dispatch": 31.972131225642936,
+            "rdma_return": 43.08285066798487
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_prefetch_32",
+      "build_key": "7da0e5ef1199b965f542dcc0490fa05b78323e1806d532725a9a33eb48d8d400",
+      "configuration": "results/communication_spsc_20260916/recovery_prefetch_32/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1094.2399999999998,
+            "fc2": 128.224,
+            "return": 3201.3100000000004,
+            "reduce": 2368.2250000000004,
+            "forward": 4401.455,
+            "wall": 5801.68
+          },
+          "payload_GBps": {
+            "nv_dispatch": 214.65220061412492,
+            "nv_return": 36.68514201998556,
+            "rdma_dispatch": 30.664600087732133,
+            "rdma_return": 41.92587659426922
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_prefetch_mailbox",
+      "build_key": "501c1bb457c3254e57c4de7ef1b8c41862561cdfdc06e212612c9552cce14ac6",
+      "configuration": "results/communication_spsc_20260916/recovery_prefetch_mailbox/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1052.625,
+            "fc2": 127.488,
+            "return": 3115.985,
+            "reduce": 2537.52,
+            "forward": 4354.495,
+            "wall": 5825.1849999999995
+          },
+          "payload_GBps": {
+            "nv_dispatch": 223.13836741479633,
+            "nv_return": 37.68969106077211,
+            "rdma_dispatch": 31.876909630685194,
+            "rdma_return": 43.07393264088241
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_release_once",
+      "build_key": "43527b9307b4b36f13d07e534677cf3dfbffd675dd8cf316980b12d6f1f32e8a",
+      "configuration": "results/communication_spsc_20260916/recovery_release_once/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 983.664,
+            "fc2": 128.01600000000002,
+            "return": 3103.535,
+            "reduce": 2428.24,
+            "forward": 4292.975,
+            "wall": 5691.555
+          },
+          "payload_GBps": {
+            "nv_dispatch": 238.78176287838124,
+            "nv_return": 37.8408853130382,
+            "rdma_dispatch": 34.11168041119732,
+            "rdma_return": 43.24672607204365
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t65536",
+          "payload_bytes_per_rank": 1342177280,
+          "timing_us": {
+            "dispatch": 6851.42,
+            "fc2": 2252.465,
+            "return": 23327.7,
+            "reduce": 20879.9,
+            "forward": 30146.1,
+            "wall": 31940.95
+          },
+          "payload_GBps": {
+            "nv_dispatch": 274.25675144714523,
+            "nv_return": 40.27504194584121,
+            "rdma_dispatch": 39.17953592102075,
+            "rdma_return": 46.02861936667566
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep8_t8192",
+          "payload_bytes_per_rank": 469762048,
+          "timing_us": {
+            "dispatch": 793.056,
+            "fc2": 83.648,
+            "return": 821.792,
+            "reduce": 435.456,
+            "forward": 1725.585,
+            "wall": 2598.31
+          },
+          "payload_GBps": {
+            "nv_dispatch": 296.17205342371784,
+            "nv_return": 285.81566138390247
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep8_t65536",
+          "payload_bytes_per_rank": 3758096384,
+          "timing_us": {
+            "dispatch": 5936.225,
+            "fc2": 1137.9850000000001,
+            "return": 5675.105,
+            "reduce": 5156.719999999999,
+            "forward": 12395.0,
+            "wall": 13518.8
+          },
+          "payload_GBps": {
+            "nv_dispatch": 316.5392470804257,
+            "nv_return": 331.1036874207614
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_rx16_local64",
+      "build_key": "4a59d1b9b0104b922355a81f4327a7ec8d482323c977a146a31bc98c85301adf",
+      "configuration": "results/communication_spsc_20260916/recovery_rx16_local64/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 996.192,
+            "fc2": 128.608,
+            "return": 3108.3050000000003,
+            "reduce": 2380.705,
+            "forward": 4303.775,
+            "wall": 5679.889999999999
+          },
+          "payload_GBps": {
+            "nv_dispatch": 235.77886993671902,
+            "nv_return": 37.78281474951782,
+            "rdma_dispatch": 33.68269570524558,
+            "rdma_return": 43.18035971373465
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_send_pipeline",
+      "build_key": "5cfb386330ebee7586dfc9d27e70aa35cbbf965fd072413df071a89202d14e9f",
+      "configuration": "results/communication_spsc_20260916/recovery_send_pipeline/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1056.72,
+            "fc2": 125.616,
+            "return": 3112.37,
+            "reduce": 2476.9449999999997,
+            "forward": 4362.53,
+            "wall": 5763.025
+          },
+          "payload_GBps": {
+            "nv_dispatch": 222.27366189719132,
+            "nv_return": 37.73346742193248,
+            "rdma_dispatch": 31.753380271027332,
+            "rdma_return": 43.12396276792283
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_senders32",
+      "build_key": "2376d6f58535f16630a305e8a6a4d1a9a56d1d0a07e949b5e4f55f9dc328fabc",
+      "configuration": "results/communication_spsc_20260916/recovery_senders32/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1146.37,
+            "fc2": 117.84,
+            "return": 3100.53,
+            "reduce": 2508.6049999999996,
+            "forward": 4436.6849999999995,
+            "wall": 5834.12
+          },
+          "payload_GBps": {
+            "nv_dispatch": 204.8911119446601,
+            "nv_return": 37.87756028807978,
+            "rdma_dispatch": 29.27015884923716,
+            "rdma_return": 43.288640329234035
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t65536",
+          "payload_bytes_per_rank": 1342177280,
+          "timing_us": {
+            "dispatch": 8193.215,
+            "fc2": 2110.145,
+            "return": 23121.949999999997,
+            "reduce": 20874.25,
+            "forward": 31464.35,
+            "wall": 33203.5
+          },
+          "payload_GBps": {
+            "nv_dispatch": 229.34198504494267,
+            "nv_return": 40.633428235940315,
+            "rdma_dispatch": 32.7631407207061,
+            "rdma_return": 46.4382036982175
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_senders8",
+      "build_key": "179a23b33485e1699d49c06a19a58aa59d615ab624b2c42c8508aaba12a7eceb",
+      "configuration": "results/communication_spsc_20260916/recovery_senders8/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1004.77,
+            "fc2": 132.64,
+            "return": 3165.585,
+            "reduce": 2445.535,
+            "forward": 4356.415,
+            "wall": 5851.959999999999
+          },
+          "payload_GBps": {
+            "nv_dispatch": 233.76596036903968,
+            "nv_return": 37.09914976220825,
+            "rdma_dispatch": 33.39513719557709,
+            "rdma_return": 42.39902829966657
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t65536",
+          "payload_bytes_per_rank": 1342177280,
+          "timing_us": {
+            "dispatch": 6870.705,
+            "fc2": 2313.855,
+            "return": 23321.550000000003,
+            "reduce": 20873.050000000003,
+            "forward": 30104.45,
+            "wall": 31875.1
+          },
+          "payload_GBps": {
+            "nv_dispatch": 273.4869554143279,
+            "nv_return": 40.285662659643116,
+            "rdma_dispatch": 39.069565059189706,
+            "rdma_return": 46.040757325306416
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 65536,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_split_four",
+      "build_key": "0e1c5c13d5a37af184e947e46e9735aee372372e5068a477d26bfe590d4eac39",
+      "configuration": "results/communication_spsc_20260916/recovery_split_four/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1167.97,
+            "fc2": 113.216,
+            "return": 3099.6949999999997,
+            "reduce": 2447.855,
+            "forward": 4487.68,
+            "wall": 6027.98
+          },
+          "payload_GBps": {
+            "nv_dispatch": 201.10193241264759,
+            "nv_return": 37.88776379611542,
+            "rdma_dispatch": 28.728847487521083,
+            "rdma_return": 43.30030148127477
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_split_gin",
+      "build_key": "6d28a9998090d800f152cef9e894b2d2e0ed9b0bf30107a3e6f315a2b118577b",
+      "configuration": "results/communication_spsc_20260916/recovery_split_gin/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1155.565,
+            "fc2": 114.256,
+            "return": 3055.9700000000003,
+            "reduce": 2452.545,
+            "forward": 4433.135,
+            "wall": 5926.49
+          },
+          "payload_GBps": {
+            "nv_dispatch": 203.26076334953032,
+            "nv_return": 38.42986416751473,
+            "rdma_dispatch": 29.03725190707576,
+            "rdma_return": 43.91984476287397
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_split_rx8",
+      "build_key": "9db9aed518125819435d6a4fb84af8026998cb23fe9c2708e87925501891af46",
+      "configuration": "results/communication_spsc_20260916/recovery_split_rx8/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1034.29,
+            "fc2": 130.43200000000002,
+            "return": 3141.95,
+            "reduce": 2452.58,
+            "forward": 4340.56,
+            "wall": 5735.91
+          },
+          "payload_GBps": {
+            "nv_dispatch": 227.09397171006196,
+            "nv_return": 37.37822435111953,
+            "rdma_dispatch": 32.441995958580286,
+            "rdma_return": 42.71797068699375
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_startup",
+      "build_key": "201e1e4a3138274aa8de4bbf00388db5d99494b86390ab7f47d8476c84bdc31d",
+      "configuration": "results/communication_spsc_20260916/recovery_startup/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 983.376,
+            "fc2": 125.26400000000001,
+            "return": 3117.36,
+            "reduce": 2488.255,
+            "forward": 4285.405,
+            "wall": 5671.55
+          },
+          "payload_GBps": {
+            "nv_dispatch": 238.85169457054067,
+            "nv_return": 37.67306695408936,
+            "rdma_dispatch": 34.12167065293438,
+            "rdma_return": 43.054933661816406
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep8_t8192",
+          "payload_bytes_per_rank": 469762048,
+          "timing_us": {
+            "dispatch": 799.52,
+            "fc2": 81.52,
+            "return": 813.632,
+            "reduce": 433.13599999999997,
+            "forward": 1737.76,
+            "wall": 2615.645
+          },
+          "payload_GBps": {
+            "nv_dispatch": 293.77754652791674,
+            "nv_return": 288.68213639581535
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_three_copy",
+      "build_key": "3da5e67732ec039657cdae3db6b0887169c2a85c1ac68e173ba67483ee6ea56c",
+      "configuration": "results/communication_spsc_20260916/recovery_three_copy/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 1041.855,
+            "fc2": 163.10399999999998,
+            "return": 3122.605,
+            "reduce": 2529.9700000000003,
+            "forward": 4355.295,
+            "wall": 5782.23
+          },
+          "payload_GBps": {
+            "nv_dispatch": 225.44502257991755,
+            "nv_return": 37.60978798150903,
+            "rdma_dispatch": 32.206431797131074,
+            "rdma_return": 42.98261483601032
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_two_data_contexts",
+      "build_key": "0b23af42842f430cc259959315900a1762475dc8d5cddf70110b29bc9f90af7c",
+      "configuration": "results/communication_spsc_20260916/recovery_two_data_contexts/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 981.84,
+            "fc2": 128.112,
+            "return": 3087.325,
+            "reduce": 2429.1549999999997,
+            "forward": 4270.735000000001,
+            "wall": 5665.9
+          },
+          "payload_GBps": {
+            "nv_dispatch": 239.22535647355983,
+            "nv_return": 38.03956888244678,
+            "rdma_dispatch": 34.17505092479426,
+            "rdma_return": 43.473793008510604
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "host_tests": 34,
+    "adversarial_ticket_cases": 1152,
+    "pure_repeat_checks": "24 rounds in each recorded screen",
+    "golden_8k_files": 96,
+    "golden_64k_files": 96,
+    "qwen": {
+      "build": "96f234df2f6137d6666cfa14fa135762e66f58c7be442da44751df04191987b0",
+      "forward": {
+        "cross_ep_byte_identical": true,
+        "batch_prefix_byte_identical": true,
+        "ranks": 8
+      },
+      "backward": {
+        "byte_identical": true,
+        "files": 160
+      },
+      "backward_native_repeats": 3
+    },
+    "flash": {
+      "build": "1c937e4ba3804ffaa0b07413086d157e2e755bb6cf12d2f5e2c77cceee956797",
+      "forward": {
+        "cross_ep_byte_identical": true,
+        "batch_prefix_byte_identical": true,
+        "ranks": 8
+      },
+      "backward": {
+        "byte_identical": true,
+        "files": 160
+      },
+      "backward_native_repeats": 3
+    },
+    "qwen_buffer_modes": "dynamic/static, skew and six FWD+BWD graph replays passed"
+  },
+  "diagnostics": [
+    {
+      "name": "sender and receive timeline",
+      "path": "results/communication_recovery_20260916/rx16_trace_analysis.json",
+      "finding": "Last PUT 735 -> 551 us, last local Dispatch completion 900 -> 680 us; final received fanout still ~980 us. Compare only same-GPU timestamps."
+    },
+    {
+      "name": "GIN context allocation",
+      "path": "results/communication_recovery_20260916/context_audit_info",
+      "finding": "NCCL INFO confirms requested 3 / actual 3 data-communicator contexts on 8 local ranks. Shared backend contexts pass repeat correctness; diagnostic timings excluded."
+    }
+  ],
+  "profiles": {
+    "qwen": "configs/communication_recovery_20260916/qwen.hpp",
+    "flash": "configs/communication_recovery_20260916/flash.hpp"
+  },
+  "notes": [
+    "The selected checkpoint improves communication but EP16 Dispatch remains below 40 GB/s at both lengths.",
+    "Small full-GEMM validation runs are correctness checks, not end-to-end performance evidence.",
+    "Native TMA waits, 128-row packets, 8/32 sender CTAs and coalesced startup readiness did not beat the selected configuration and were not retained."
+  ]
+}

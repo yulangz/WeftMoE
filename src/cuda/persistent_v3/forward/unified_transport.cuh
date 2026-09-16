@@ -744,26 +744,23 @@ run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
         const bool available = mailbox.load(::cuda::memory_order_acquire) == 0U;
         activation_ring_detail::Transfer task;
         unsigned slot = 0U;
-#if WEFTMOE_DEVICE_TIMELINE
-        const auto progress_start = profiling::read_globaltimer_ns();
-#endif
-        const bool progressed =
-            gin_detail::progress_sender<(forward_tuning::kGinChannelPackLimit > 1U)>(
-                a, s.gin_sender_state, slot, task,
-                on_send, on_complete, available);
-        if (task.channel != activation_ring_detail::kNoChannel) {
-#if WEFTMOE_DEVICE_TIMELINE
-          if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
-            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderProgress,
-                GinReturn, task.channel, profiling::read_globaltimer_ns() - progress_start,
-                task.rows);
-#endif
-          s.gin_task = task;
+        bool progressed = false;
+        // Publish the next immutable descriptor before calling GIN. Keeping
+        // this after progress_sender serialized every pack behind the prior PUT.
+        if (available && gin_detail::reserve_pack<
+                (forward_tuning::kGinChannelPackLimit > 1U)>(
+                    a, s.gin_sender_state, slot, task)) {
           s.gin_task_slot = slot;
           mailbox.store(1U, ::cuda::memory_order_release);
-        } else if (available && s.gin_sender_state.done) {
-          break;
+          progressed = true;
         }
+        activation_ring_detail::Transfer unused;
+        progressed = gin_detail::progress_sender<
+            (forward_tuning::kGinChannelPackLimit > 1U)>(
+                a, s.gin_sender_state, slot, unused,
+                on_send, on_complete, false) || progressed;
+        if (s.gin_sender_state.done)
+          break;
         if (!progressed)
           __nanosleep(forward_tuning::kTransportIdleNanosleep);
       }
@@ -787,20 +784,24 @@ run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
         __nanosleep(forward_tuning::kTransportIdleNanosleep);
         continue;
       }
-      if (s.gin_task.channel < a.gin_rings.dispatch_channels)
-        pack_dispatch(s.gin_task);
-      else
-        pack_return(s.gin_task);
-      // Every copy warp has finished accessing the shared descriptor before
-      // returning it to the independent controller.
+      // Capture the reserved slot while the mailbox still belongs to us.
+      // The descriptor itself lives in the pending-slot pool and remains
+      // immutable until every packer has published its completion below.
+      const unsigned slot = s.gin_task_slot;
       copy_sync<Storage::kCopyThreads>();
-      if (tid == 0U) {
-        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
-            s.gin_sender_state.slots[s.gin_task_slot].pending)
-            .store(2U, ::cuda::memory_order_release);
+      if (tid == 0U)
         ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.pack_mailbox)
             .store(0U, ::cuda::memory_order_release);
-      }
+      const auto &task = s.gin_sender_state.slots[slot].task;
+      if (task.channel < a.gin_rings.dispatch_channels)
+        pack_dispatch(task);
+      else
+        pack_return(task);
+      copy_sync<Storage::kCopyThreads>();
+      if (tid == 0U)
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
+            s.gin_sender_state.slots[slot].pending)
+            .store(2U, ::cuda::memory_order_release);
       copy_sync<Storage::kCopyThreads>();
     }
   }
@@ -857,8 +858,9 @@ run_impl(const ForwardKernelArgs &a,
         // share of the copy domain without enlarging local batches or delaying
         // Return service. Empty receives keep polling; once local work ends,
         // every iteration can drain received Dispatch again.
-        if (s.local_dispatch_since_receive >= kLocalBatchesPerGinDispatch ||
-            s.dispatch_cursor >= s.dispatch_end) {
+        if (!s.dispatch_complete &&
+            (s.local_dispatch_since_receive >= kLocalBatchesPerGinDispatch ||
+             s.dispatch_cursor >= s.dispatch_end)) {
           const bool received_dispatch = gin_detail::progress_receive<BaseThread>(a, s, true);
           if (received_dispatch && tid == 0U)
             s.local_dispatch_since_receive = 0U;
@@ -885,7 +887,7 @@ run_impl(const ForwardKernelArgs &a,
           ++s.local_dispatch_since_receive;
         if (!s.dispatch_complete && s.dispatch_cursor >= s.dispatch_end &&
             (!UseGin ||
-             activation_ring_detail::receive_complete(a, true))) {
+             gin_detail::dispatch_receive_complete(a))) {
           s.dispatch_complete = 1U;
           const auto previous =
               persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -920,11 +922,13 @@ run_impl(const ForwardKernelArgs &a,
                                LocalReturn, blockIdx.x, s.return_cursor,
                                execution_epoch(a));
     if (warp == 0U)
-      drain_notifications<BaseThread>(a);
+      // The live publisher owns this SPSC consumer through copies_done.
+      // A second drainer must not race its non-CAS head advancement.
+      drain_notifications<BaseThread, false>(a, [&] { return cancelled(a, control); });
     copy_sync<Storage::kCopyThreads>();
     if (tid == 0U) {
       if constexpr (UseGin)
-        activation_ring_detail::flush_receive(a);
+        gin_detail::flush_receive(a);
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                      ->return_complete_clock,
                 device_globaltimer_ns());

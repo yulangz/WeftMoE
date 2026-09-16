@@ -124,6 +124,7 @@ struct alignas(128) ForwardPipelineControl {
   PaddedCounter return_receive_roles_complete;
   PaddedCounter source_ready_published;
   PaddedCounter local_dispatch_head;
+  PaddedCounter gin_dispatch_channels_complete;
   // Two finite FC1 queues share the original task array, growing inward from
   // opposite ends. A group belongs to exactly one queue, so total capacity is
   // unchanged. Independent cursors preserve pair reservations in each class.

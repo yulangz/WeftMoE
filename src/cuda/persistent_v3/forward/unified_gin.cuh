@@ -33,7 +33,8 @@ __device__ __forceinline__ void send_packed(const Args &a,
   const auto gin = wire::gin_for_cta(a, blockIdx.x);
   const unsigned slot = task.sequence % ring::kRingDepth;
   // The CTA's packers completed all TMA stores and system fences before
-  // publishing this immutable task to their submitter.
+  // publishing this immutable task to their submitter. The acquire handoff
+  // imports those releases, so GIN need not repeat the system release.
   gin.put(
       ncclTeamWorld(gin.comm), wire::peer(a, task.channel), a.gin_window,
       a.gin_rings.payload(wire::remote_channel(a, task.channel), task.sequence,
@@ -47,7 +48,7 @@ __device__ __forceinline__ void send_packed(const Args &a,
               offsetof(ring::ChunkSlot, ready_signal),
           1},
       ncclGin_WeakCounterInc{ring::counter(a.gin_rings, task.channel, slot)},
-      ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_device,
+      ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_system,
       ::cuda::thread_scope_system);
   auto &channel = ring::channels(a.gin_window_base, a.gin_rings)[task.channel];
   ++channel.slots[slot].local_target;
@@ -219,6 +220,57 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned sender,
   return false;
 }
 
+// Reserve before submitting a previous packet, so the packer can execute
+// concurrently with the expensive GIN call. The single submitter owns all
+// descriptors; the mailbox release transfers their lifetime to the packer.
+template <bool SameChannel = false, class Args>
+__device__ __forceinline__ bool reserve_pack(const Args &a, GinSenderState &state,
+                                             unsigned &selected_slot,
+                                             wire::Transfer &task) {
+  task.channel = wire::kNoChannel;
+  if (state.done || blockIdx.x >= a.gin_sender_count)
+    return false;
+  unsigned free_slot = forward_tuning::kUnifiedGinPackSlots;
+#pragma unroll
+  for (unsigned probe = 0; probe < forward_tuning::kUnifiedGinPackSlots; ++probe) {
+    const unsigned slot = (state.slot_cursor + probe) % forward_tuning::kUnifiedGinPackSlots;
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(state.slots[slot].pending)
+            .load(::cuda::memory_order_relaxed) == 0U) {
+      free_slot = slot;
+      break;
+    }
+  }
+  if (free_slot == forward_tuning::kUnifiedGinPackSlots)
+    return false;
+#if WEFTMOE_DEVICE_TIMELINE
+  const auto select_start = profiling::read_globaltimer_ns();
+#endif
+  const bool dispatch_first = state.dispatch_first != 0U;
+  bool selected = dispatch_first
+      ? choose_unpacked<true, SameChannel>(a, blockIdx.x, state, task)
+      : choose_unpacked<false, SameChannel>(a, blockIdx.x, state, task);
+  if (!selected)
+    selected = dispatch_first
+        ? choose_unpacked<false, SameChannel>(a, blockIdx.x, state, task)
+        : choose_unpacked<true, SameChannel>(a, blockIdx.x, state, task);
+  if (!selected)
+    return false;
+#if WEFTMOE_DEVICE_TIMELINE
+  if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderSelect,
+        GinReturn, task.channel, profiling::read_globaltimer_ns() - select_start,
+        task.rows);
+#endif
+  state.dispatch_first = task.channel >= a.gin_rings.dispatch_channels;
+  selected_slot = free_slot;
+  state.slot_cursor = (free_slot + 1U) % forward_tuning::kUnifiedGinPackSlots;
+  auto &entry = state.slots[free_slot];
+  entry.task = task;
+  ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(entry.pending)
+      .store(1U, ::cuda::memory_order_relaxed);
+  return true;
+}
+
 // Only this CTA advances its sender state; packers publish pending with release.
 template <bool SameChannel = false, class Args, class OnSend, class OnComplete>
 __device__ __forceinline__ bool
@@ -286,43 +338,7 @@ progress_sender(const Args &a, GinSenderState &state, unsigned &selected_slot,
             .store(1U, ::cuda::memory_order_release);
         progressed = true;
       } else if (reserve_pack && occupied < forward_tuning::kUnifiedGinPackSlots) {
-#if WEFTMOE_DEVICE_TIMELINE
-        const auto select_start = profiling::read_globaltimer_ns();
-#endif
-        const bool dispatch_first = state.dispatch_first != 0U;
-        bool selected =
-            dispatch_first
-                ? choose_unpacked<true, SameChannel>(a, sender, state, task)
-                : choose_unpacked<false, SameChannel>(a, sender, state, task);
-        if (!selected)
-          selected =
-              dispatch_first
-                  ? choose_unpacked<false, SameChannel>(a, sender, state, task)
-                  : choose_unpacked<true, SameChannel>(a, sender, state, task);
-        if (selected) {
-#if WEFTMOE_DEVICE_TIMELINE
-          if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
-            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderSelect,
-                GinReturn, task.channel, profiling::read_globaltimer_ns() - select_start,
-                task.rows);
-#endif
-          state.dispatch_first = task.channel >= a.gin_rings.dispatch_channels;
-          for (unsigned probe_slot = 0;
-               probe_slot < forward_tuning::kUnifiedGinPackSlots;
-               ++probe_slot) {
-            const unsigned slot =
-                state.slot_cursor++ % forward_tuning::kUnifiedGinPackSlots;
-            auto &entry = state.slots[slot];
-            ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> pending(
-                entry.pending);
-            if (pending.load(::cuda::memory_order_relaxed) != 0U)
-              continue;
-            entry.task = task;
-            pending.store(1U, ::cuda::memory_order_relaxed);
-            selected_slot = slot;
-            break;
-          }
-        }
+        gin_detail::reserve_pack<SameChannel>(a, state, selected_slot, task);
       }
     }
     if (task.channel != wire::kNoChannel)
@@ -440,15 +456,106 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
                              task.channel, task.rows, execution_epoch(a));
 }
 
+inline constexpr unsigned kReceiveParts =
+    (ring::kChunkRows + forward_tuning::kGinReceiveRows - 1U) /
+    forward_tuning::kGinReceiveRows;
+inline constexpr bool kSplitReceive = kReceiveParts > 1U;
+
 __device__ __forceinline__ bool
 claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
                        wire::Transfer &task) {
-  return wire::claim_receive(a, cursor, task, true);
+  if constexpr (!kSplitReceive)
+    return wire::claim_receive(a, cursor, task, true);
+  const ncclGin gin(a.gin_dev_comm, 0);
+  const unsigned probes = min(a.gin_rings.dispatch_channels,
+                             unsigned(WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES));
+  for (unsigned probe = 0; probe < probes; ++probe) {
+    const unsigned channel = cursor++ % a.gin_rings.dispatch_channels;
+    auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.rx_terminal)
+            .load(::cuda::memory_order_acquire))
+      continue;
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
+        state.dispatch_claimed_parts);
+    auto ticket = head.load(::cuda::memory_order_relaxed);
+    const auto sequence = state.dispatch_receive_base + ticket / kReceiveParts;
+    const unsigned slot = sequence % ring::kRingDepth;
+    if (!ring::reached(gin.readSignal(a.gin_window,
+            a.gin_rings.slot_control(channel, slot) + offsetof(ring::ChunkSlot, ready_signal)),
+            sequence / ring::kRingDepth + 1ULL, 64U))
+      continue;
+    if (!head.compare_exchange_strong(ticket, ticket + 1ULL,
+                                     ::cuda::memory_order_relaxed))
+      continue;
+    const unsigned part = ticket % kReceiveParts;
+    if (part + 1U == kReceiveParts)
+      atomicMax(&state.claimed, sequence + 1ULL);
+    // Every packet has the same number of tickets, including short/empty
+    // tails. A successful ticket pins this physical slot until we finish.
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    const auto *header = reinterpret_cast<const ring::ChunkHeader *>(
+        static_cast<const char *>(a.gin_window_base) +
+        a.gin_rings.payload(channel, sequence, true));
+    const unsigned begin = min(part * forward_tuning::kGinReceiveRows, header->rows);
+    const unsigned rows = min(forward_tuning::kGinReceiveRows, header->rows - begin);
+    task = wire::Transfer{channel, rows, header->terminal, sequence, begin};
+    return true;
+  }
+  task.channel = wire::kNoChannel;
+  return false;
+}
+
+__device__ __forceinline__ bool dispatch_receive_complete(const ForwardKernelArgs &a) {
+  if constexpr (!kSplitReceive)
+    return wire::receive_complete(a, true);
+  auto &control = *peer_at<persistent_v3::ForwardPipelineControl>(
+      a.local_base, a.forward_v3_control_offset);
+  return persistent_v3::load_acquire<::cuda::thread_scope_device>(
+      control.gin_dispatch_channels_complete.value) == a.gin_rings.dispatch_channels;
 }
 
 __device__ __forceinline__ void
 finish_dispatch_receive(const ForwardKernelArgs &a, const wire::Transfer &task) {
+  if constexpr (kSplitReceive) {
+    auto &slot = ring::channels(a.gin_window_base, a.gin_rings)[task.channel]
+                     .slots[task.sequence % ring::kRingDepth];
+    const auto previous = ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+        slot.consumed).fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+    if (previous % kReceiveParts + 1ULL != kReceiveParts)
+      return;
+    // The final acquire imports every reader's full TMA completion. Return
+    // exactly one credit, only after all parts release this physical slot.
+  }
   wire::finish_receive(a, task);
+  if constexpr (kSplitReceive) {
+    if (task.terminal) {
+      auto &control = *peer_at<persistent_v3::ForwardPipelineControl>(
+          a.local_base, a.forward_v3_control_offset);
+      persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
+          control.gin_dispatch_channels_complete.value, 1ULL);
+    }
+  }
+}
+
+__device__ __forceinline__ void flush_receive(const ForwardKernelArgs &a) {
+  wire::flush_receive(a);
+  if constexpr (kSplitReceive) {
+    // A stealing worker may credit any remote node's same-rail peer. Flush
+    // only those extra connections, skipping the statically owned ones.
+    const auto gin = wire::gin_for_cta(a, blockIdx.x);
+    for (unsigned node = 0; node < a.dispatch.identity.num_nodes; ++node) {
+      if (node == a.node) continue;
+      const unsigned target = node * a.local_world_size + a.rank % a.local_world_size;
+      bool owned = false;
+      for (unsigned channel = blockIdx.x - a.gin_receiver_base;
+           channel < a.gin_rings.channels(); channel += a.gin_receiver_count)
+        owned |= wire::peer(a, channel) == target;
+      if (owned) continue;
+      ncclGinRequest_t request;
+      gin.flushAsync(ncclTeamWorld(gin.comm), target, &request);
+      gin.wait(request);
+    }
+  }
 }
 
 template <unsigned BaseThread, class Storage>
@@ -649,6 +756,17 @@ __device__ __forceinline__ void observe_return_ready(const ForwardKernelArgs &a)
 template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ bool progress_receive(const ForwardKernelArgs &a,
                                                  Storage &s, bool dispatch) {
+  // Ownership is uniform across this CTA. Workers without a channel in this
+  // direction need neither a shared descriptor nor copy-domain rendezvous.
+  if (a.gin_receiver_count && !(dispatch && kSplitReceive)) {
+    const unsigned first = dispatch ? 0U : a.gin_rings.dispatch_channels;
+    const unsigned count = dispatch ? a.gin_rings.dispatch_channels
+                                    : a.gin_rings.return_channels;
+    const unsigned offset = (blockIdx.x - a.gin_receiver_base +
+        a.gin_receiver_count - first % a.gin_receiver_count) % a.gin_receiver_count;
+    if (offset >= count)
+      return false;
+  }
   const unsigned tid = local_thread<BaseThread>();
   if (tid == 0U) {
     if (dispatch)
