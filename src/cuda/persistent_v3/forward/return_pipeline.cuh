@@ -39,18 +39,13 @@ cancelled(const ForwardKernelArgs &a,
 }
 
 __device__ __forceinline__ unsigned long long
-claim_rows(RowQueue &queue, unsigned int limit, unsigned int &count) {
-  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> published(
-      queue.confirmed),
-      head(queue.head);
-  const auto end = published.load(::cuda::memory_order_acquire);
+claim_rows(const ForwardKernelArgs &a, RowQueue &queue, unsigned int limit,
+           unsigned int &count) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(queue.head);
   auto begin = head.load(::cuda::memory_order_relaxed);
   count = 0U;
-  if (begin >= end)
-    return begin;
-  const auto n = static_cast<unsigned int>(min(end - begin, 1ULL * limit));
-  if (head.compare_exchange_strong(begin, begin + n,
-                                   ::cuda::memory_order_relaxed))
+  const auto n = return_queue_detail::ready_rows(a, queue, begin, limit);
+  if (n && head.compare_exchange_strong(begin, begin + n, ::cuda::memory_order_relaxed))
     count = n;
   return begin;
 }
@@ -116,7 +111,7 @@ progress_local_return(const ForwardKernelArgs &a,
           state.queue_index = 1U + a.node * a.local_world_size +
                               (preferred + probe) % a.local_world_size;
           state.cursor =
-              claim_rows(return_queue_detail::queues(a)[state.queue_index],
+              claim_rows(a, return_queue_detail::queues(a)[state.queue_index],
                          a.forward_local_return_batch_rows, state.selected);
           if (state.selected != 0U)
             break;
@@ -133,7 +128,7 @@ progress_local_return(const ForwardKernelArgs &a,
         }
       } else {
         state.cursor =
-            claim_rows(return_queue_detail::queues(a)[state.queue_index],
+            claim_rows(a, return_queue_detail::queues(a)[state.queue_index],
                        a.forward_local_return_batch_rows, state.selected);
       }
     }

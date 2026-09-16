@@ -544,6 +544,7 @@ struct Layout {
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
   std::size_t forward_return_rows = 0;
+  std::size_t forward_return_ready = 0;
   std::size_t forward_return_queues = 0;
   std::size_t local_notifications = 0;
   unsigned local_notification_ctas = 0;
@@ -1003,6 +1004,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_return_rows = append(
         cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
         "forward return row queues");
+    layout.forward_return_ready = append(
+        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
+        "independent Return entry readiness");
     layout.local_notification_ctas = std::max(
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
             persistent_v3::kRdmaCtaCount,
@@ -1014,10 +1018,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         transport_error(NotifyErrorCode::BackendUnavailable,
                         "transport-pool-query", "SM count", 0,
                         "available CUDA device", "device query failed");
-      layout.local_notification_ctas = std::max(
+      layout.forward_return_ready = append(
+        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
+        "independent Return entry readiness");
+    layout.local_notification_ctas = std::max(
           layout.local_notification_ctas, static_cast<unsigned>(sms));
       layout.forward_unified_gin_state = append(
-          cursor, persistent_v3::kRdmaCtaCount, forward_tuning::kUnifiedGinStateBytes,
+          cursor, layout.local_notification_ctas, forward_tuning::kUnifiedGinStateBytes,
           "unified GIN context progress state");
     }
     layout.local_notifications = append(

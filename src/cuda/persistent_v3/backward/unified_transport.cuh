@@ -267,9 +267,12 @@ run(const BackwardKernelArgs &a,
       forward_unified_transport::drain_notifications<BaseThread>(
           a, [] { return false; });
     forward_unified_transport::copy_sync<Storage::kCopyThreads>();
-    if (tid == 0U)
+    if (tid == 0U) {
+      if constexpr (UseGin)
+        activation_ring_detail::gin_for_cta(a, blockIdx.x).flush(ncclCoopThread{});
       ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.copies_done)
           .store(1U, ::cuda::memory_order_release);
+    }
   }
   forward_unified_transport::domain_sync<Storage::kThreads>();
 }

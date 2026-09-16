@@ -13,6 +13,26 @@ template <class Args> __device__ __forceinline__ Queue *queues(const Args &a) {
 }
 
 template <class Args>
+__device__ __forceinline__ unsigned long long *ready_entries(const Args &a) {
+  return peer_at<unsigned long long>(a.local_base, a.forward_return_ready_offset);
+}
+
+// Entries never wrap within an invocation. Producers do not wait for earlier
+// tickets: each entry release-publishes its own completed row independently.
+template <class Args>
+__device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
+                                              unsigned long long begin, unsigned limit) {
+  unsigned count = 0;
+  while (count < limit && begin + count < q.capacity) {
+    if (::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+            ready_entries(a)[q.begin + begin + count])
+            .load(::cuda::memory_order_acquire) != execution_epoch(a)) break;
+    ++count;
+  }
+  return count;
+}
+
+template <class Args>
 __device__ __forceinline__ unsigned index(const Args &a, unsigned source) {
   return source / a.local_world_size == a.node ? 0U : 1U + source;
 }
@@ -61,6 +81,11 @@ __device__ __forceinline__ void initialize(const Args &a) {
       begin += q[i].capacity;
     }
   }
+  __syncthreads();
+  const auto total = q[a.world].begin + q[a.world].capacity;
+  for (unsigned long long i = threadIdx.x; i < total; i += blockDim.x)
+    ready_entries(a)[i] = 0ULL;
+  __syncthreads();
 }
 
 template <unsigned Threads, class Args, class Cancelled>
@@ -116,22 +141,10 @@ __device__ __noinline__ void publish(const Args &a, unsigned long long first,
     if (pending == selected) {
       const auto offset = scratch[warp] + __popc(mask & ((1U << lane) - 1U));
       entries[q.begin + *base + offset] = static_cast<unsigned>(row);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+          ready_entries(a)[q.begin + *base + offset])
+          .store(execution_epoch(a), ::cuda::memory_order_release);
       pending = UINT32_MAX;
-    }
-    __threadfence();
-    cutlass::arch::NamedBarrier::sync(Threads, 2U);
-    if (!threadIdx.x) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          confirm(q.confirmed);
-      auto expected = *base;
-      while (!confirm.compare_exchange_weak(
-          expected, *base + scratch[warps + 1U], ::cuda::memory_order_acq_rel,
-          ::cuda::memory_order_relaxed)) {
-        if (cancelled())
-          break;
-        expected = *base;
-        __nanosleep(32U);
-      }
     }
     cutlass::arch::NamedBarrier::sync(Threads, 3U);
   }

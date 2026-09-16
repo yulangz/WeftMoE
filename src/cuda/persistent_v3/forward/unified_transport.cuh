@@ -517,7 +517,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
     for (unsigned probe = 0U; probe < count; ++probe) {
       s.return_queue = first + (preferred + probe) % count;
       s.return_cursor = forward_return_detail::claim_rows(
-          return_queue_detail::queues(a)[s.return_queue],
+          a, return_queue_detail::queues(a)[s.return_queue],
           claim_limit, s.return_rows);
       if (s.return_rows)
         break;
@@ -725,7 +725,7 @@ run_rdma(const ForwardKernelArgs &a,
                 [&](const activation_ring_detail::Transfer &sent) {
                   gin_detail::account_send(a, sent);
                 },
-                [&](unsigned index, GinContextState &state) {
+                [&](unsigned index, GinSenderState &state) {
                   gin_detail::complete_context(a, control, index, state);
                 }, available);
         if (task.channel != activation_ring_detail::kNoChannel) {
@@ -735,7 +735,7 @@ run_rdma(const ForwardKernelArgs &a,
           mailbox.store(1U, ::cuda::memory_order_release);
         } else if (available &&
                    persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                       control.rdma_return_roles_complete.value) == a.gin_context_count) {
+                       control.rdma_return_roles_complete.value) == a.gin_sender_count) {
           break;
         }
         if (!progressed)
@@ -865,7 +865,7 @@ run_impl(const ForwardKernelArgs &a,
                         a, false) &&
                     persistent_v3::load_acquire<::cuda::thread_scope_device>(
                         control.rdma_return_roles_complete.value) ==
-                        a.gin_context_count)));
+                        a.gin_sender_count)));
       }
       copy_sync<Storage::kCopyThreads>();
       if (s.stop)
@@ -880,6 +880,8 @@ run_impl(const ForwardKernelArgs &a,
       drain_notifications<BaseThread>(a);
     copy_sync<Storage::kCopyThreads>();
     if (tid == 0U) {
+      if constexpr (UseGin)
+        activation_ring_detail::gin_for_cta(a, blockIdx.x).flush(ncclCoopThread{});
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                      ->return_complete_clock,
                 device_globaltimer_ns());

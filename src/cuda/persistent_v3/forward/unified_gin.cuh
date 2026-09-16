@@ -7,52 +7,17 @@ namespace wire = activation_ring_detail;
 namespace ring = communication;
 
 template <class Args>
-__device__ __forceinline__ GinContextState *states(const Args &a) {
-  return static_cast<GinContextState *>(a.forward_unified_gin_state);
+__device__ __forceinline__ GinSenderState *states(const Args &a) {
+  return static_cast<GinSenderState *>(a.forward_unified_gin_state);
 }
 
-// Enumerate the three owned channels directly instead of repeatedly scanning
-// all ranks' channels in every CTA's progress loop. This remains valid with
-// more than one remote node and any fixed number of Return ports.
+// A sender owns every S-th channel, independently of context allocation.
 template <class Args>
-__device__ __forceinline__ unsigned
-owned_channel(const Args &a, unsigned context, unsigned index) {
-  constexpr unsigned width = 1U + ring::kReturnPorts;
-  const unsigned node = index / width;
-  const unsigned slot = index % width;
-  return slot == 0U
-             ? node * ring::kDispatchChannels + context
-             : a.gin_rings.dispatch_channels +
-                   (node * a.local_world_size + context) * ring::kReturnPorts +
-                   slot - 1U;
-}
-
-template <class Args>
-__device__ __forceinline__ bool acknowledge(const Args &a, unsigned context) {
-  const ncclGin gin(a.gin_dev_comm, context);
-  const unsigned count =
-      (a.dispatch.identity.num_nodes - 1U) * (1U + ring::kReturnPorts);
-  bool progressed = false;
-  for (unsigned index = 0U; index < count; ++index) {
-    const unsigned channel = owned_channel(a, context, index);
-    progressed =
-        ring::acknowledge(gin, a.gin_window, a.gin_window_base, a.gin_rings,
-                          channel, wire::remote_channel(a, channel),
-                          wire::peer(a, channel)) ||
-        progressed;
-  }
-  return progressed;
-}
-
-template <class Args>
-__device__ __forceinline__ bool drained(const Args &a, unsigned context) {
-  const unsigned count =
-      (a.dispatch.identity.num_nodes - 1U) * (1U + ring::kReturnPorts);
-  for (unsigned index = 0U; index < count; ++index) {
-    const unsigned channel = owned_channel(a, context, index);
-    const ncclGin gin(a.gin_dev_comm, wire::data_context(a, channel));
-    if (!ring::drained(gin, a.gin_window, a.gin_window_base, a.gin_rings,
-                       channel))
+__device__ __forceinline__ bool drained(const Args &a, unsigned sender) {
+  for (unsigned channel = sender; channel < a.gin_rings.channels();
+       channel += a.gin_sender_count) {
+    const auto gin = wire::gin_for_cta(a, sender);
+    if (!ring::drained(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel))
       return false;
   }
   return true;
@@ -65,7 +30,7 @@ __device__ __forceinline__ void send_packed(const Args &a,
   const auto bytes = sizeof(ring::ChunkHeader) +
                          task.rows * (dispatch ? a.gin_rings.dispatch_row_bytes
                                                : a.gin_rings.return_row_bytes);
-  const ncclGin gin(a.gin_dev_comm, wire::data_context(a, task.channel));
+  const auto gin = wire::gin_for_cta(a, blockIdx.x);
   const unsigned slot = task.sequence % ring::kRingDepth;
   // The packed release can originate from another CTA. All packer lanes have
   // completed TMA stores and system fences before the device release/acquire.
@@ -75,7 +40,7 @@ __device__ __forceinline__ void send_packed(const Args &a,
                           true),
       a.gin_window, a.gin_rings.payload(task.channel, task.sequence, false),
       bytes,
-      ncclGin_StrongVASignalAdd{
+      ncclGin_WeakVASignalAdd{
           a.gin_window,
           a.gin_rings.slot_control(wire::remote_channel(a, task.channel),
                                    slot) +
@@ -85,9 +50,9 @@ __device__ __forceinline__ void send_packed(const Args &a,
       ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_device,
       ::cuda::thread_scope_system);
   auto &channel = ring::channels(a.gin_window_base, a.gin_rings)[task.channel];
+  ++channel.slots[slot].local_target;
   ++channel.sent;
-  if (dispatch)
-    channel.tx_cursor += ring::kDispatchChannels * ring::kChunkRows;
+  channel.tx_cursor += (dispatch ? ring::kDispatchChannels : ring::kReturnPorts) * ring::kChunkRows;
   channel.tx_terminal = task.terminal;
 }
 
@@ -119,51 +84,15 @@ __device__ __forceinline__ void account_send(const ForwardKernelArgs &a,
 }
 
 template <class Args>
-__device__ __forceinline__ void flush_context(const Args &a, unsigned context) {
-  // drained() has already proved every data counter and returned credit.
-  // Flushing here only joins outstanding ACK submissions for this context.
-  ncclGin(a.gin_dev_comm, context).flush(ncclCoopThread{});
-  for (unsigned port = 0; port < ring::kReturnPorts; ++port)
-    ncclGin(a.gin_dev_comm, a.gin_context_count +
-                                ring::kReturnPorts *
-                                    ((context + a.rank) % a.gin_context_count) +
-                                port)
-        .flush(ncclCoopThread{});
-}
-
-// The Forward context mapping is immutable for the communicator: an ACK /
-// Dispatch context uses the same-number peer plus its owned Return peer on
-// each remote node; each Return data context uses only that owned Return peer.
-// Snapshot and wait for all of those queues, retaining completion semantics
-// without serially probing every unused local/world peer in each context.
-__device__ __forceinline__ void flush_peer(const ForwardKernelArgs &a,
-                                          unsigned context, unsigned peer) {
-  const ncclGin gin(a.gin_dev_comm, context);
-  ncclGinRequest_t request;
-  gin.flushAsync(ncclTeamWorld(gin.comm), peer, &request);
-  gin.wait(request);
-}
-
-__device__ __forceinline__ void flush_context(const ForwardKernelArgs &a,
-                                             unsigned context) {
-  constexpr unsigned width = 1U + ring::kReturnPorts;
-  for (unsigned node = 0U; node < a.dispatch.identity.num_nodes - 1U; ++node) {
-    const auto dispatch_channel = owned_channel(a, context, node * width);
-    const auto return_channel = owned_channel(a, context, node * width + 1U);
-    const auto dispatch_peer = wire::peer(a, dispatch_channel);
-    const auto return_peer = wire::peer(a, return_channel);
-    flush_peer(a, context, dispatch_peer);
-    if (return_peer != dispatch_peer)
-      flush_peer(a, context, return_peer);
-    for (unsigned port = 0U; port < ring::kReturnPorts; ++port)
-      flush_peer(a, wire::data_context(a, return_channel + port), return_peer);
-  }
+__device__ __forceinline__ void flush_context(const Args &a, unsigned sender) {
+  // Every slot's local counter and remote credit were checked by drained().
+  wire::gin_for_cta(a, sender).flush(ncclCoopThread{});
 }
 
 __device__ __forceinline__ void
 complete_context(const ForwardKernelArgs &a,
                  persistent_v3::ForwardPipelineControl &control,
-                 unsigned context, GinContextState &state) {
+                 unsigned context, GinSenderState &state) {
   (void)context;
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
@@ -198,7 +127,7 @@ complete_context(const ForwardKernelArgs &a,
 // Backward retains one unfinished pack per channel. Forward derives additional
 // reservations from immutable pending tasks within the bounded slot pool;
 // durable sent/tx_cursor still advance only during ordered submission.
-__device__ __forceinline__ bool channel_pending(GinContextState &state,
+__device__ __forceinline__ bool channel_pending(GinSenderState &state,
                                                 unsigned channel) {
 #pragma unroll
   for (unsigned slot = 0; slot < forward_tuning::kUnifiedGinPackSlots; ++slot)
@@ -212,23 +141,19 @@ __device__ __forceinline__ bool channel_pending(GinContextState &state,
 
 template <bool Dispatch, bool SameChannel = false, class Args>
 __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
-                                                GinContextState &state,
+                                                GinSenderState &state,
                                                 wire::Transfer &task,
                                                 unsigned max_probes = 0U) {
-  const auto nodes = a.dispatch.identity.num_nodes - 1U;
-  const unsigned count = nodes * (Dispatch ? 1U : ring::kReturnPorts);
+  const unsigned first = Dispatch ? 0U : a.gin_rings.dispatch_channels;
+  const unsigned end = Dispatch ? a.gin_rings.dispatch_channels : a.gin_rings.channels();
+  const unsigned stride = a.gin_sender_count;
+  const unsigned start = first + (context + stride - first % stride) % stride;
+  const unsigned count = start < end ? 1U + (end - 1U - start) / stride : 0U;
   auto &cursor = Dispatch ? state.dispatch_cursor : state.return_cursor;
   auto *channels = ring::channels(a.gin_window_base, a.gin_rings);
   const unsigned probes = max_probes == 0U ? count : min(count, max_probes);
   for (unsigned probe = 0; probe < probes; ++probe) {
-    const auto index = cursor++ % count;
-    const auto channel =
-        Dispatch
-            ? index * ring::kDispatchChannels + context
-            : a.gin_rings.dispatch_channels +
-                  (index / ring::kReturnPorts * a.local_world_size + context) *
-                      ring::kReturnPorts +
-                  index % ring::kReturnPorts;
+    const unsigned channel = start + (cursor++ % count) * stride;
     if constexpr (!SameChannel)
       if (channel_pending(state, channel))
         continue;
@@ -268,7 +193,7 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
     }
     const ncclGin gin(a.gin_dev_comm, wire::data_context(a, channel));
     if (wire_state.tx_terminal ||
-        !ring::can_send(gin, a.gin_window, a.gin_rings, channel, sequence))
+        !ring::can_send(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel, sequence))
       continue;
     if constexpr (Dispatch) {
       auto reserved_cursor = wire_state.tx_cursor;
@@ -283,28 +208,20 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
                             sequence, reserved_cursor};
     } else {
       auto &queue = return_queue_detail::queues(a)[1U + wire::peer(a, channel)];
-      const auto ready =
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-              queue.confirmed)
-              .load(::cuda::memory_order_acquire);
-      if (ready - queue.head < ring::kChunkRows && ready != queue.capacity)
+      const auto position = wire_state.tx_cursor +
+          (sequence - wire_state.sent) * (1ULL * ring::kReturnPorts * ring::kChunkRows);
+      const auto rows = position < queue.capacity
+          ? unsigned(min(queue.capacity - position, 1ULL * ring::kChunkRows)) : 0U;
+      if (return_queue_detail::ready_rows(a, queue, position, rows) != rows)
         continue;
-      const auto rows =
-          unsigned(min(ready - queue.head, 1ULL * ring::kChunkRows));
-      task = wire::Transfer{channel, rows, rows == 0U, sequence,
-                            queue.begin + queue.head};
-      // Both Return ports retain one common context lease. Their queue ranges
-      // are disjoint even when their payload packers run in different CTAs.
-      queue.head += rows;
+      task = wire::Transfer{channel, rows, rows == 0U, sequence, queue.begin + position};
     }
     return true;
   }
   return false;
 }
 
-// The context lease serializes only bounded metadata transitions and GIN
-// submission. Every reserved slot hands packing to a different CTA outside the
-// lease. The caller publishes completion to precisely that immutable slot.
+// Only this CTA advances its sender state; packers publish pending with release.
 template <bool SameChannel = false, class Args, class OnSend, class OnComplete>
 __device__ __forceinline__ bool
 progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
@@ -312,23 +229,13 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
                  OnComplete on_complete, bool reserve_pack = true) {
   task.channel = wire::kNoChannel;
   bool progressed = false;
-  static_assert(WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES > 0);
-  for (unsigned probe = 0;
-       probe <
-       min(a.gin_context_count, unsigned(WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES));
-       ++probe) {
-    const unsigned context = cursor++ % a.gin_context_count;
+  (void)cursor;
+  const unsigned context = blockIdx.x;
+  if (context >= a.gin_sender_count) return false;
+  {
     auto &state = states(a)[context];
-    ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device> lease(
-        state.lease);
-    unsigned expected = 0U;
-    if (!lease.compare_exchange_strong(expected, 1U,
-                                       ::cuda::memory_order_acquire,
-                                       ::cuda::memory_order_relaxed))
-      continue;
     if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.done)
             .load(::cuda::memory_order_relaxed) == 0U) {
-      progressed = acknowledge(a, context) || progressed;
       unsigned occupied = 0U;
       // Keep the large NCCL submission body out of an unrolled slot expansion.
 #pragma unroll 1
@@ -398,7 +305,6 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         }
       }
     }
-    lease.store(0U, ::cuda::memory_order_release);
     if (task.channel != wire::kNoChannel)
       return true;
   }
@@ -514,76 +420,14 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
                              task.channel, task.rows, execution_epoch(a));
 }
 
-// Bound local fanout work independently of the network packet size. Claim
-// metadata uses a short, nonblocking local lease; no payload copy holds it.
-static_assert(forward_tuning::kGinReceiveRows <= ring::kChunkRows);
-
 __device__ __forceinline__ bool
 claim_dispatch_receive(const ForwardKernelArgs &a, unsigned &cursor,
                        wire::Transfer &task) {
-  if constexpr (forward_tuning::kGinReceiveRows == ring::kChunkRows)
-    return wire::claim_receive(a, cursor, task, true);
-  const ncclGin gin(a.gin_dev_comm, 0);
-  for (unsigned probe = 0; probe < a.gin_rings.dispatch_channels; ++probe) {
-    const unsigned channel = cursor++ % a.gin_rings.dispatch_channels;
-    auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
-    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.rx_terminal)
-            .load(::cuda::memory_order_acquire))
-      continue;
-    ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device> lock(
-        state.dispatch_claim_lock);
-    unsigned expected = 0U;
-    if (!lock.compare_exchange_strong(expected, 1U, ::cuda::memory_order_acquire,
-                                     ::cuda::memory_order_relaxed))
-      continue;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(
-        state.claimed);
-    const auto sequence = head.load(::cuda::memory_order_relaxed);
-    const unsigned slot = sequence % ring::kRingDepth;
-    if (gin.readSignal(a.gin_window, a.gin_rings.slot_control(channel, slot) +
-                                      offsetof(ring::ChunkSlot, ready_signal)) <
-        sequence / ring::kRingDepth + 1ULL) {
-      lock.store(0U, ::cuda::memory_order_release);
-      continue;
-    }
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    const auto *header = reinterpret_cast<const ring::ChunkHeader *>(
-        static_cast<const char *>(a.gin_window_base) +
-        a.gin_rings.payload(channel, sequence, true));
-    const unsigned begin = state.dispatch_row_cursor;
-    constexpr unsigned batch = forward_tuning::kGinReceiveRows;
-    if (begin == 0U)
-      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-          state.slots[slot].dispatch_parts_remaining)
-          .store(max(1U, (header->rows + batch - 1U) / batch),
-                 ::cuda::memory_order_relaxed);
-    const unsigned rows = min(batch, header->rows - begin);
-    task = wire::Transfer{channel, rows, header->terminal, sequence, begin};
-    if (begin + rows == header->rows) {
-      state.dispatch_row_cursor = 0U;
-      head.store(sequence + 1ULL, ::cuda::memory_order_relaxed);
-    } else {
-      state.dispatch_row_cursor = begin + rows;
-    }
-    lock.store(0U, ::cuda::memory_order_release);
-    return true;
-  }
-  task.channel = wire::kNoChannel;
-  return false;
+  return wire::claim_receive(a, cursor, task, true);
 }
 
 __device__ __forceinline__ void
 finish_dispatch_receive(const ForwardKernelArgs &a, const wire::Transfer &task) {
-  if constexpr (forward_tuning::kGinReceiveRows < ring::kChunkRows) {
-    auto &slot = ring::channels(a.gin_window_base, a.gin_rings)[task.channel]
-                     .slots[task.sequence % ring::kRingDepth];
-    // The last finisher acquires every prior completion before publishing
-    // credit. Neither the payload nor its metadata can be overwritten early.
-    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-            slot.dispatch_parts_remaining)
-            .fetch_sub(1U, ::cuda::memory_order_acq_rel) != 1U)
-      return;
-  }
   wire::finish_receive(a, task);
 }
 
@@ -736,7 +580,7 @@ progress_send(const ForwardKernelArgs &a,
         progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
             a, s.gin_context_cursor, s.gin_context, s.gin_task_slot, s.gin_task,
             [&](const wire::Transfer &task) { account_send(a, task); },
-            [&](unsigned context, GinContextState &state) {
+            [&](unsigned context, GinSenderState &state) {
               complete_context(a, control, context, state);
             });
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();

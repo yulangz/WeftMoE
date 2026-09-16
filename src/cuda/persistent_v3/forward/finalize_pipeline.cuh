@@ -161,7 +161,7 @@ __device__ __forceinline__ void split_transport_finalize(
   // connects the independent transport and compute grids.
   if (threadIdx.x == 0U) {
     wait_for_count(a, control.rdma_return_roles_complete,
-                   persistent_v3::kRdmaCtaCount);
+                   a.gin_sender_count ? a.gin_sender_count : persistent_v3::kRdmaCtaCount);
     if (a.forward_dynamic_reduce_queue)
       wait_for_count(a, control.reduce_tokens_complete,
                      a.dispatch.identity.num_tokens);

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "cuda/communication/sequence.hpp"
 #include <cuda/atomic>
 #include "cuda/communication/tuning_config.hpp"
 #include "cuda/communication/nccl_device_assert_trap.cuh"
@@ -22,6 +23,7 @@ struct alignas(64) ChunkSlot {
   unsigned long long acknowledged;
   // Forward sub-batches share one immutable received payload. Reuses padding.
   unsigned dispatch_parts_remaining;
+  std::uint64_t local_target; // This slot only, on its current sender context.
 };
 
 struct alignas(128) ChunkChannel {
@@ -114,14 +116,14 @@ __device__ __forceinline__ unsigned counter(ChunkRingLayout layout,
 }
 
 __device__ __forceinline__ bool
-can_send(const ncclGin &gin, ncclWindow_t window, ChunkRingLayout layout,
+can_send(const ncclGin &gin, ncclWindow_t window, void *base, ChunkRingLayout layout,
          unsigned channel, unsigned long long sequence) {
   const auto slot = unsigned(sequence % kRingDepth);
   const auto previous = sequence / kRingDepth;
-  return gin.readSignal(window, layout.slot_control(channel, slot) +
-                                    offsetof(ChunkSlot, credit_signal)) >=
-             previous &&
-         gin.readCounter(counter(layout, channel, slot)) >= previous;
+  return reached(gin.readSignal(window, layout.slot_control(channel, slot) +
+                                    offsetof(ChunkSlot, credit_signal)), previous, 64U) &&
+         reached(gin.readCounter(counter(layout, channel, slot)),
+                 channels(base, layout)[channel].slots[slot].local_target);
 }
 
 __device__ __forceinline__ void send(const ncclGin &gin, ncclWindow_t window,
@@ -141,6 +143,7 @@ __device__ __forceinline__ void send(const ncclGin &gin, ncclWindow_t window,
           ncclGin_WeakCounterInc{counter(layout, channel, slot)},
           ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_block,
           ::cuda::thread_scope_system);
+  ++state.slots[slot].local_target;
   ++state.sent;
 }
 

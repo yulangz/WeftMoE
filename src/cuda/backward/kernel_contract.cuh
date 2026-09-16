@@ -35,6 +35,11 @@ struct BackwardKernelArgs {
   std::size_t local_notification_offset = 0;
   unsigned local_notification_ctas = 0;
   void *forward_unified_gin_state = nullptr;
+  unsigned gin_sender_count = 0;
+  unsigned gin_receiver_base = 0;
+  unsigned gin_receiver_count = 0;
+  unsigned gin_total_ctas = 0;
+  std::size_t forward_return_ready_offset = 0;
   std::size_t forward_return_queues_offset = 0;
   std::size_t forward_return_rows_offset = 0;
 

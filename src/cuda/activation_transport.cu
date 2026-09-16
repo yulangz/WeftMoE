@@ -1585,7 +1585,14 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   resources.nccl = nccl;
   backend->full_connections = true;
   constexpr std::uint32_t kGinContextCount = 8;
-  constexpr auto allocated_context_count = 3U * kGinContextCount;
+  int context_sms = 0;
+  internal::throw_cuda("gin-create", cudaDeviceGetAttribute(
+      &context_sms, cudaDevAttrMultiProcessorCount, pool->device), nccl->rank,
+      nccl->world, session.session().identity(), session.session().generation(),
+      ExchangeKind::ExpertCounts, "query GIN context participants");
+  unsigned allocated_context_count = std::max(3U * kGinContextCount,
+      (forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers)
+          ? 1U + unsigned(context_sms) : 0U);
   backend->gin_context_count = kGinContextCount;
   backend->gin_allocated_context_count = allocated_context_count;
   if (!resources.dev_comm_created) {
@@ -1600,7 +1607,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     // the lease, so their contexts must support ownership transfer.
     requirements.ginExclusiveContexts =
         !(forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers);
-    requirements.ginQueueDepth = 64;
+    requirements.ginQueueDepth = 1024;
     // Legacy transport diagnostics use signals 0/1; production terminal status
     // uses signal 2. Ring readiness and credits use window-addressed signals.
     requirements.ginSignalCount = 3U;
@@ -1617,6 +1624,12 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         session.session().generation(), ExchangeKind::ExpertCounts,
         "ncclDevCommCreate(activation GIN)");
     resources.dev_comm_created = true;
+    if (resources.dev_comm.ginContextCount < int(3U * kGinContextCount))
+      transport_error(NotifyErrorCode::BackendUnavailable, "gin-create",
+                      "actual GIN contexts", nccl->rank, "at least 24 for legacy control paths",
+                      std::to_string(resources.dev_comm.ginContextCount));
+    allocated_context_count = unsigned(resources.dev_comm.ginContextCount);
+    backend->gin_allocated_context_count = allocated_context_count;
     try {
       resources.windows.reserve(pool->slots.size());
       for (auto &slot : pool->slots) {
@@ -4513,6 +4526,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_reduce_ready_token_offset =
       layout.forward_reduce_ready_token;
   args.forward_return_rows_offset = layout.forward_return_rows;
+  args.forward_return_ready_offset = layout.forward_return_ready;
   args.forward_return_queues_offset = layout.forward_return_queues;
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;
@@ -4628,6 +4642,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         args.forward_relay_cta_count = args.forward_compute_cta_count -
             forward_tuning::unified_rdma_ctas(args.forward_compute_cta_count,
                                               args.use_gin);
+      if constexpr (forward_tuning::kUnifiedWorkers) {
+        if (use_gin) {
+          args.gin_total_ctas = args.forward_compute_cta_count;
+          args.gin_sender_count = args.forward_compute_cta_count - args.forward_relay_cta_count;
+          // A zero dedicated-send budget retains one static sender per CTA.
+          if (!args.gin_sender_count) args.gin_sender_count = args.gin_total_ctas;
+          args.gin_receiver_base = args.forward_compute_cta_count - args.forward_relay_cta_count;
+          args.gin_receiver_count = args.forward_relay_cta_count;
+        }
+      }
       args.forward_stream_local_dispatch = split_local_roles;
       args.forward_compact_return = forward_tuning::kUnifiedWorkers;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
@@ -4746,7 +4770,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           } else {
             if (!split_local_roles) {
             error = cudaMemsetAsync(args.forward_unified_gin_state, 0,
-                args.gin_context_count * forward_tuning::kUnifiedGinStateBytes,
+                args.gin_sender_count * forward_tuning::kUnifiedGinStateBytes,
                 exec->stream);
             if (error != cudaSuccess)
               return error;
@@ -5851,6 +5875,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
         lease->index * args.gin_rings.channels() * communication::kRingDepth;
     args.forward_return_queues_offset = layout.forward_return_queues;
     args.forward_return_rows_offset = layout.forward_return_rows;
+  args.forward_return_ready_offset = layout.forward_return_ready;
   }
   args.saved_gates = static_cast<const float *>(saved.gates->data);
   args.saved_ab = static_cast<const transport::BFloat16 *>(saved.ab->data);
@@ -5965,8 +5990,13 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto compute_ctas = backward_tuning::kUnifiedWorkers
       ? (static_cast<std::uint32_t>(sm_count) & ~1U)
       : ((static_cast<std::uint32_t>(sm_count) - transport_ctas) & ~1U);
-  if constexpr (backward_tuning::kUnifiedWorkers)
+  if constexpr (backward_tuning::kUnifiedWorkers) {
     args.local_notification_ctas = compute_ctas;
+    if (use_gin) {
+      args.gin_total_ctas = args.gin_sender_count = compute_ctas;
+      args.gin_receiver_count = compute_ctas;
+    }
+  }
   int cluster_supported = 0;
   internal::throw_cuda(
       "backward-run",
@@ -6028,7 +6058,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     if constexpr (backward_tuning::kUnifiedWorkers)
       internal::throw_cuda("backward-run",
           cudaMemsetAsync(args.forward_unified_gin_state, 0,
-                          args.gin_context_count * forward_tuning::kUnifiedGinStateBytes,
+                          args.gin_sender_count * forward_tuning::kUnifiedGinStateBytes,
                           exec->stream),
           identity.rank, identity.world, "backward", identity.generation,
           ExchangeKind::ExpertCounts, "initialize unified Backward GIN contexts");

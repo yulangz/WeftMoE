@@ -43,7 +43,21 @@ __device__ __forceinline__ unsigned remote_channel(const Args &a,
 }
 
 template <class Args>
+__device__ __forceinline__ unsigned context_for_cta(const Args &a, unsigned cta) {
+  const unsigned available = unsigned(a.gin_dev_comm.ginContextCount);
+  return available > 1U ? 1U + cta % (available - 1U) : 0U;
+}
+
+template <class Args>
+__device__ __forceinline__ ncclGin gin_for_cta(const Args &a, unsigned cta) {
+  const auto sharing = unsigned(a.gin_dev_comm.ginContextCount) > a.gin_total_ctas
+      ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
+  return ncclGin(a.gin_dev_comm, context_for_cta(a, cta), sharing);
+}
+
+template <class Args>
 __device__ __forceinline__ unsigned owner(const Args &a, unsigned channel) {
+  if (a.gin_sender_count) return channel % a.gin_sender_count;
   return channel < a.gin_rings.dispatch_channels
              ? channel % ring::kDispatchChannels
              : peer(a, channel) % a.local_world_size;
@@ -52,6 +66,7 @@ __device__ __forceinline__ unsigned owner(const Args &a, unsigned channel) {
 template <class Args>
 __device__ __forceinline__ unsigned data_context(const Args &a,
                                                  unsigned channel) {
+  if (a.gin_sender_count) return context_for_cta(a, owner(a, channel));
   if (channel < a.gin_rings.dispatch_channels)
     return channel % ring::kDispatchChannels;
   const auto logical =
@@ -67,10 +82,16 @@ template <class Args> __global__ void prepare(Args a) {
   if (channel >= a.gin_rings.channels())
     return;
   auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
+  const ncclGin gin(a.gin_dev_comm, data_context(a, channel));
+  for (unsigned slot = 0; slot < ring::kRingDepth; ++slot)
+    state.slots[slot].local_target = gin.readCounter(ring::counter(a.gin_rings, channel, slot));
   state.tx_terminal = state.rx_terminal = 0U;
   state.tx_cursor = state.tx_end = 0ULL;
-  if (channel >= a.gin_rings.dispatch_channels)
+  if (channel >= a.gin_rings.dispatch_channels) {
+    if (a.gin_sender_count)
+      state.tx_cursor = ((channel - a.gin_rings.dispatch_channels) % ring::kReturnPorts) * ring::kChunkRows;
     return;
+  }
   const auto target = peer(a, channel) / a.local_world_size;
   unsigned long long first = 0ULL,
                      end = dispatch_sizes(a.dispatch).packet_count;
@@ -137,18 +158,28 @@ __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
   const auto count =
       dispatch ? a.gin_rings.dispatch_channels : a.gin_rings.return_channels;
   const ncclGin gin(a.gin_dev_comm, 0);
-  const unsigned probes = max_probes == 0U ? count : min(count, max_probes);
+  const unsigned worker = blockIdx.x - a.gin_receiver_base;
+  const unsigned stride = a.gin_receiver_count ? a.gin_receiver_count : 1U;
+  const unsigned offset = a.gin_receiver_count ? worker : 0U;
+  const unsigned owned = offset < count ? 1U + (count - 1U - offset) / stride : 0U;
+  const unsigned probes = max_probes == 0U ? owned : min(owned, max_probes);
   for (unsigned probe = 0; probe < probes; ++probe) {
-    const auto channel = first + (cursor++ % count);
+    const auto channel = first + offset + (cursor++ % owned) * stride;
     auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
     if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
             state.rx_terminal)
             .load(::cuda::memory_order_acquire))
       continue;
     unsigned long long sequence;
-    if (!ring::claim(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel,
-                     sequence))
-      continue;
+    if (a.gin_receiver_count) {
+      sequence = state.claimed;
+      const auto slot = unsigned(sequence % ring::kRingDepth);
+      if (!ring::reached(gin.readSignal(a.gin_window,
+              a.gin_rings.slot_control(channel, slot) + offsetof(ring::ChunkSlot, ready_signal)),
+              sequence / ring::kRingDepth + 1ULL, 64U)) continue;
+      state.claimed = sequence + 1ULL;
+    } else if (!ring::claim(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel,
+                           sequence)) continue;
     asm volatile("fence.proxy.async.global;" ::: "memory");
     const auto *header = reinterpret_cast<const ring::ChunkHeader *>(
         static_cast<const char *>(a.gin_window_base) +
@@ -163,7 +194,21 @@ __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
 template <class Args>
 __device__ __forceinline__ void finish_receive(const Args &a,
                                                const Transfer &task) {
-  ring::consumed(a.gin_window_base, a.gin_rings, task.channel, task.sequence);
+  if (a.gin_receiver_count) {
+    const auto slot = unsigned(task.sequence % ring::kRingDepth);
+    const auto gin = gin_for_cta(a, blockIdx.x);
+    gin.signal(ncclTeamWorld(gin.comm), peer(a, task.channel),
+        ncclGin_StrongVASignalAdd{a.gin_window,
+            a.gin_rings.slot_control(remote_channel(a, task.channel), slot) +
+                offsetof(ring::ChunkSlot, credit_signal), 1},
+        ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_device,
+        ::cuda::thread_scope_system);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+        ring::channels(a.gin_window_base, a.gin_rings)[task.channel].slots[slot].acknowledged)
+        .store(task.sequence / ring::kRingDepth + 1ULL, ::cuda::memory_order_release);
+  } else {
+    ring::consumed(a.gin_window_base, a.gin_rings, task.channel, task.sequence);
+  }
   if (task.terminal)
     ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
         ring::channels(a.gin_window_base, a.gin_rings)[task.channel]
@@ -182,7 +227,7 @@ __device__ __forceinline__ bool choose_dispatch(const Args &a, unsigned context,
     auto &state = states[channel];
     const ncclGin gin(a.gin_dev_comm, context);
     if (state.tx_terminal ||
-        !ring::can_send(gin, a.gin_window, a.gin_rings, channel, state.sent))
+        !ring::can_send(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel, state.sent))
       continue;
     const auto count =
         state.tx_cursor < state.tx_end
@@ -211,17 +256,13 @@ __device__ __forceinline__ bool choose_return(const Args &a, unsigned context,
     auto &state = states[channel];
     const ncclGin gin(a.gin_dev_comm, data_context(a, channel));
     if (state.tx_terminal ||
-        !ring::can_send(gin, a.gin_window, a.gin_rings, channel, state.sent))
+        !ring::can_send(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel, state.sent))
       continue;
     auto &queue = return_queue_detail::queues(a)[1U + peer(a, channel)];
-    const auto ready =
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-            queue.confirmed)
-            .load(::cuda::memory_order_acquire);
-    if (ready - queue.head < ring::kChunkRows && ready != queue.capacity)
+    const auto remaining = queue.capacity - queue.head;
+    const auto rows = unsigned(min(remaining, 1ULL * ring::kChunkRows));
+    if (return_queue_detail::ready_rows(a, queue, queue.head, rows) != rows)
       continue;
-    const auto rows =
-        unsigned(min(ready - queue.head, 1ULL * ring::kChunkRows));
     task = Transfer{channel, rows, rows == 0U, state.sent,
                     queue.begin + queue.head};
     queue.head += rows; // One RDMA CTA owns both ports of this peer queue.

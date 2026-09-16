@@ -13,7 +13,7 @@ using forward_unified_transport::copy_sync;
 using forward_unified_transport::finish_copies;
 
 __device__ __forceinline__ bool terminal(const BackwardKernelArgs &a) {
-  for (unsigned context = 0U; context < a.gin_context_count; ++context)
+  for (unsigned context = 0U; context < a.gin_sender_count; ++context)
     if (!::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
              shared_gin::states(a)[context].done)
              .load(::cuda::memory_order_acquire))
@@ -202,7 +202,7 @@ __device__ __forceinline__ bool progress_send(const BackwardKernelArgs &a,
                       task.rows * (a.hidden * 2ULL + sizeof(float)));
           }
         },
-        [](unsigned, forward_unified_transport::GinContextState &) {});
+        [](unsigned, forward_unified_transport::GinSenderState &) {});
   copy_sync<Storage::kCopyThreads>();
   if (s.gin_task.channel != wire::kNoChannel) {
     if (s.gin_task.channel < a.gin_rings.dispatch_channels)
@@ -295,20 +295,10 @@ __device__ __forceinline__ void publish_return_rows(const BackwardKernelArgs &a,
         const auto offset =
             s.queue_scratch[warp] + __popc(mask & ((1U << lane) - 1U));
         entries[queue.begin + s.queue_base + offset] = row;
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+            return_queue_detail::ready_entries(a)[queue.begin + s.queue_base + offset])
+            .store(execution_epoch(a), ::cuda::memory_order_release);
         pending = UINT32_MAX;
-      }
-      __threadfence();
-      copy_sync<threads>();
-      if (tid == 0U) {
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            confirmed(queue.confirmed);
-        auto expected = s.queue_base;
-        while (!confirmed.compare_exchange_weak(
-            expected, s.queue_base + s.queue_rows, ::cuda::memory_order_acq_rel,
-            ::cuda::memory_order_relaxed)) {
-          expected = s.queue_base;
-          __nanosleep(32U);
-        }
       }
       copy_sync<threads>();
     }
