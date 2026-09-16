@@ -12248,6 +12248,148 @@
       },
       "records": 1856,
       "finding": "Qwen EP16 8K,current2x2 Dispatch lanes. Last completed nonempty RX task on16ranks:total84.608us,leader metadata30.000us,copy-loop39.728us,other loop0.544us,drain0.032us,full TMA wait0.032us,SYS fence1.840us,copy join0.032us,ready publication11.760us,completion accounting/credit2.704us medians. Individual medians need not sum exactly. Dispatch ends3.200us after credit endpoint. Per-CTA final snapshots,zero trace overflow,20 native repeated-output checks,clocks restored. Metadata/copy timings are elected first issuer only;copy loop includes internal source-load and staging-reuse waits,join includes other issuers. Diagnostic timers/status stores can perturb timing and throughput is excluded from goal. Native profiled GPU4402.880us,Dispatch1025.935us. This motivates testing notification empty-poll deferral and cooperative RX metadata on current2-lane config;previous cooperative metadata rejection was4-lane config."
+    },
+    {
+      "name": "Independent NIC-ready observation and packet RX claim spans",
+      "source_commit": "4f8691e",
+      "raw_results": "results/communication_bottleneck_20260915/rx_ready_claim_events_capture",
+      "analysis": "results/communication_bottleneck_20260915/rx_ready_claim_events_capture/ready_analysis.json",
+      "not_valid_goal_bandwidth": true,
+      "tail_summary": {
+        "observed_to_first_claim_us": {
+          "count": 4,
+          "median": 6.624,
+          "min": 1.344,
+          "max": 20.736
+        },
+        "observed_to_last_claim_us": {
+          "count": 13,
+          "median": 6.976,
+          "min": 0.096,
+          "max": 47.072
+        },
+        "claim_span_us": {
+          "count": 16,
+          "median": 9.472,
+          "min": 5.792,
+          "max": 45.184
+        },
+        "last_claim_to_finish_us": {
+          "count": 16,
+          "median": 79.184,
+          "min": 59.904,
+          "max": 98.56
+        },
+        "first_claim_to_finish_us": {
+          "count": 16,
+          "median": 92.19200000000001,
+          "min": 66.56,
+          "max": 113.568
+        },
+        "observed_us": {
+          "count": 16,
+          "median": 910.0799999999999,
+          "min": 888.672,
+          "max": 926.72
+        },
+        "first_claim_us": {
+          "count": 16,
+          "median": 911.7439999999999,
+          "min": 890.56,
+          "max": 927.744
+        },
+        "last_claim_us": {
+          "count": 16,
+          "median": 920.512,
+          "min": 906.016,
+          "max": 940.96
+        },
+        "last_finish_us": {
+          "count": 16,
+          "median": 1004.0160000000001,
+          "min": 977.504,
+          "max": 1020.0
+        }
+      },
+      "all_data_summary": {
+        "observed_to_first_claim_us": {
+          "count": 503,
+          "median": 12.256,
+          "min": 0.0,
+          "max": 117.76
+        },
+        "observed_to_last_claim_us": {
+          "count": 881,
+          "median": 27.712,
+          "min": 0.0,
+          "max": 199.136
+        },
+        "claim_span_us": {
+          "count": 1024,
+          "median": 16.64,
+          "min": 5.568,
+          "max": 162.08
+        },
+        "last_claim_to_finish_us": {
+          "count": 1024,
+          "median": 134.0,
+          "min": 58.976,
+          "max": 211.232
+        },
+        "first_claim_to_finish_us": {
+          "count": 1024,
+          "median": 160.656,
+          "min": 66.56,
+          "max": 319.744
+        },
+        "observed_us": {
+          "count": 1024,
+          "median": 588.64,
+          "min": 207.904,
+          "max": 927.616
+        },
+        "first_claim_us": {
+          "count": 1024,
+          "median": 600.944,
+          "min": 201.28,
+          "max": 927.744
+        },
+        "last_claim_us": {
+          "count": 1024,
+          "median": 659.232,
+          "min": 207.904,
+          "max": 940.96
+        },
+        "last_finish_us": {
+          "count": 1024,
+          "median": 795.8720000000001,
+          "min": 353.984,
+          "max": 1020.0
+        }
+      },
+      "submit_timing": {
+        "dispatch_submit_first": {
+          "median": 146.816,
+          "min": 143.36,
+          "max": 151.584
+        },
+        "dispatch_submit_end": {
+          "median": 668.24,
+          "min": 621.856,
+          "max": 706.24
+        },
+        "dispatch_terminal_submit": {
+          "median": 902.768,
+          "min": 780.768,
+          "max": 973.632
+        },
+        "dispatch_end": {
+          "median": 1008.864,
+          "min": 982.336,
+          "max": 1024.96
+        }
+      },
+      "finding": "Qwen EP16 8K all16ranks:1024data packet records plus128terminals;sum8192payload rows/rank,zero overflow,20native repeated-output checks,clock cleanup rc0. Tail-packet first-to-last claim span9.472us median,last-claim-to-finish79.184us. Independently observed ready-to-first claim only4/16tail packets valid (median6.624us),ready-to-last13/16valid(median6.976us);remaining observer records are late and cannot bound the pre-first-claim wait. Acrossall1024data packets,503observed-before-first,881before-last. Tail observed time910.080us,firstclaim911.744,lastclaim920.512,lastfinish1004.016us medians. Sender local first/last nonempty GIN submissions146.816/668.240us;timestamps relative to eachGPU own setup start,not cross-GPU latency measurements. Additional controller signal probes and trace stores perturb scheduling;diagnostic only. The measured intra-packet claiming span is much smaller than tail processing,while actual pre-first-claim NIC wait remains only partially observed."
     }
   ]
 }
