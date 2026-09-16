@@ -10206,6 +10206,110 @@
         }
       ],
       "finding": "Move up to2 receive probes to publisher each iteration and hand one prefetched task to copy domain through CTA acquire/release mailbox;original packet lifetime/full TMA completion retained,producer-closed handshake prevents early completion with prefetched work. Qwen EP16 8K candidate Dispatch31.5101/Return42.2477GB/s,GPU4445.215us:regresses Dispatch against paired baseline;reject without full/BWD/64K tests.64 sparse paired files exact over12 native repeated checks.1000 CPU random interleaving scenarios passed;pure registers168 unchanged,stack104->120bytes. Both nodes clocks restored."
+    },
+    {
+      "name": "GIN Dispatch-first reservation and local Dispatch audit accumulation",
+      "adopted": false,
+      "source_commits": [
+        "0dce672",
+        "fadf11a"
+      ],
+      "raw_results": "results/communication_bottleneck_20260915/gin_priority_audit_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "audit_validation": "results/communication_bottleneck_20260915/gin_priority_audit_screen/audit_validation.json",
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.715,
+              "fc2": 136.8,
+              "return": 3182.545,
+              "reduce": 2497.425,
+              "forward": 4392.6849999999995,
+              "wall": 5752.76
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.88898469729818,
+              "nv_return": 36.90144585543959,
+              "rdma_dispatch": 32.84128352818545,
+              "rdma_return": 42.17308097764525
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "gin_dispatch_pack_priority_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.6c321d006a6806bc01d69177818d1ed719e2528a66ae83d231ba118f5cf14bdd/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1029.9850000000001,
+              "fc2": 136.864,
+              "return": 3183.49,
+              "reduce": 2491.84,
+              "forward": 4404.21,
+              "wall": 5865.709999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 228.0431501429632,
+              "nv_return": 36.890491881551384,
+              "rdma_dispatch": 32.577592877566175,
+              "rdma_return": 42.16056215034443
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_audit_accumulation_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.e88e6c2c5102c6d9cfa4b638bcb0b721a361bab032b882c7e8233736cfcfe824/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.39,
+              "fc2": 134.592,
+              "return": 3180.88,
+              "reduce": 2390.54,
+              "forward": 4407.969999999999,
+              "wall": 5827.88
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.96213395470878,
+              "nv_return": 36.92076155026282,
+              "rdma_dispatch": 32.851733422101255,
+              "rdma_return": 42.19515605744322
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K at1620MHz:Dispatch-first pack reservation D32.5776/R42.1606GB/s,GPU4404.210us;per-copy-warp audit accumulation D32.8517/R42.1952,GPU4407.970. Neither improves against paired baseline sufficiently to adopt.128 sparse files exact over12 native checks;all8 exported traffic/packet counters match all16ranks for both257 and8192tokens. Audit total is flushed before Dispatch completion timestamp;no traffic or work omitted. Pure test waits for local Dispatch before synthetic Return production,so the priority screen primarily measures empty Return probing,not steady simultaneous Forward Dispatch/Return competition. No full/BWD/64K expansion;clocks restored."
     }
   ],
   "diagnostics": [
