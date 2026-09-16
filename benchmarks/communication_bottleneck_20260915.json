@@ -11646,6 +11646,66 @@
         "https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html",
         "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"
       ]
+    },
+    {
+      "name": "First completed GIN Dispatch pack metadata and payload phases",
+      "source": "/tmp/weftmoe-pack-phase-events",
+      "binary_source_commit": "642b194",
+      "launcher_source_commit": "dd57e26",
+      "raw_results": "results/communication_bottleneck_20260915/pack_phase_events_capture",
+      "analysis": "results/communication_bottleneck_20260915/pack_phase_events_capture/analysis.json",
+      "summary": {
+        "begin_us": {
+          "median": 67.696,
+          "min": 66.816,
+          "max": 69.408
+        },
+        "metadata_us": {
+          "median": 10.48,
+          "min": 9.664,
+          "max": 11.712
+        },
+        "issue_us": {
+          "median": 42.064,
+          "min": 38.624,
+          "max": 45.312
+        },
+        "leader_fullwait_us": {
+          "median": 0.064,
+          "min": 0.0,
+          "max": 0.288
+        },
+        "fence_join_us": {
+          "median": 1.44,
+          "min": 0.704,
+          "max": 2.24
+        },
+        "total_us": {
+          "median": 53.855999999999995,
+          "min": 50.496,
+          "max": 57.44
+        },
+        "end_us": {
+          "median": 122.176,
+          "min": 118.656,
+          "max": 126.112
+        }
+      },
+      "records": 256,
+      "native_repetitions": 20,
+      "returncode": 0,
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "initial_capture": "results/communication_bottleneck_20260915/pack_phase_events_initial_capture",
+      "finding": "Independent first-pack record per CTA,final iteration on all16ranks. First completed pack per GPU: start67.696us,metadata10.480us,payload issue-loop42.064us,leader final fullwait0.064us,fence/join1.440us,total53.856us medians. Issue loop includes G2S waits and staging read-completion waits;it is not pure instruction issue overhead. Metadata end follows all64copy threads;issued/completed timestamps cover leader issuer only,final join includes other issuers.256per-CTA records,zero overflow,20native repeated checks. Additional diagnostic status storage64KiB and timestamp stores may perturb timing;not goal throughput. Initial native capture passed but launcher filtered new phase tags;artifacts retained,export filter corrected andone8K capture repeated."
     }
   ]
 }
