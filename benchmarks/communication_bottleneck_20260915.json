@@ -10707,6 +10707,111 @@
         }
       ],
       "finding": "All16 ranks finish Dispatch2.816-3.104us after the final received payload completes fanout/readiness and local consumed publication. Last local Dispatch publication is19.584-147.648us earlier;last received terminal marker49.728-71.744us earlier. Thus remaining tail is actual received payload processing,not waiting for End markers or slow idle-CTA acknowledgement. First GIN Dispatch enqueue155.36-179.296us after setup start;do not equate this whole interval with packing. Return completes126.656-214.624us after final received Return payload. Initial instrumented pair Dispatch1022.415->1027.120us (+0.46%);64 sparse files exact. Initial launcher discarded child stderr; diagnostic launcher now forwards final snapshots,one8K capture added with20 native checks. No timer boundary changed and trace rates are not goal performance."
+    },
+    {
+      "name": "Final received Dispatch task paired start and end",
+      "source": "/tmp/weftmoe-dispatch-tail-task-duration",
+      "source_commit": "e28c530",
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_tail_task_duration_capture",
+      "analysis": "results/communication_bottleneck_20260915/dispatch_tail_task_duration_capture/tail_analysis.json",
+      "summary": {
+        "dispatch_end": {
+          "median": 1018.688,
+          "min": 992.448,
+          "max": 1030.368
+        },
+        "return_end": {
+          "median": 4268.768,
+          "min": 4254.08,
+          "max": 4281.664
+        },
+        "kernel_end": {
+          "median": 4392.6720000000005,
+          "min": 4389.44,
+          "max": 4396.896
+        },
+        "local_end": {
+          "median": 929.44,
+          "min": 872.16,
+          "max": 986.112
+        },
+        "dispatch_submit_end": {
+          "median": 713.8240000000001,
+          "min": 683.712,
+          "max": 807.552
+        },
+        "dispatch_terminal_submit": {
+          "median": 808.896,
+          "min": 707.328,
+          "max": 934.208
+        },
+        "dispatch_receive_end": {
+          "median": 1015.488,
+          "min": 989.28,
+          "max": 1027.232
+        },
+        "dispatch_terminal_receive": {
+          "median": 950.4480000000001,
+          "min": 932.928,
+          "max": 968.096
+        },
+        "dispatch_submit_first": {
+          "median": 167.47199999999998,
+          "min": 155.392,
+          "max": 178.432
+        },
+        "return_receive_end": {
+          "median": 4098.656,
+          "min": 4057.216,
+          "max": 4144.192
+        },
+        "gin_context_end": {
+          "median": 4181.168,
+          "min": 4135.872,
+          "max": 4212.224
+        },
+        "last_task_begin_us": {
+          "median": 933.0240000000001,
+          "min": 916.064,
+          "max": 957.024
+        },
+        "last_task_end_us": {
+          "median": 1015.5840000000001,
+          "min": 989.344,
+          "max": 1027.296
+        },
+        "last_task_duration_us": {
+          "median": 76.08000000000004,
+          "min": 62.591999999999985,
+          "max": 88.12800000000004
+        },
+        "dispatch_after_last_task_us": {
+          "median": 3.183999999999969,
+          "min": 3.0399999999999636,
+          "max": 3.296000000000049
+        },
+        "dispatch_after_local_us": {
+          "median": 84.99199999999999,
+          "min": 36.192,
+          "max": 147.84
+        },
+        "dispatch_after_receive_us": {
+          "median": 3.264,
+          "min": 3.104,
+          "max": 3.424
+        },
+        "dispatch_after_terminal_us": {
+          "median": 61.584,
+          "min": 51.808,
+          "max": 73.888
+        },
+        "return_after_receive_us": {
+          "median": 172.496,
+          "min": 122.656,
+          "max": 215.488
+        }
+      },
+      "finding": "Qwen EP16 8K balanced two-lane candidate, all16 final snapshots: final completed RX task starts916.064-957.024us after setup, lasts62.592-88.128us (median76.080), then Dispatch ends3.040-3.296us later. This is actual task service after claim, including payload/metadata/readiness/credit handoff; does not isolate TMA or prove why task was claimed late. Start/end encoded atomically in32ns ticks, no overflow;20 native repeated output checks passed. Diagnostic rates not used as goal throughput."
     }
   ]
 }
