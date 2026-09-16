@@ -113,7 +113,7 @@ cancelled(const ForwardKernelArgs &a,
 // One elected CTA publishes the generation-local clear. Communication-only
 // barriers transfer its setup acquire to every copy warp without involving
 // any math thread. All peer reverse maps must be clear before Dispatch stores.
-template <unsigned BaseThread, class Storage>
+template <unsigned BaseThread, bool DynamicDispatch = false, class Storage>
 __device__ __forceinline__ void
 init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
      Storage &s) {
@@ -135,6 +135,12 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.gin_sender_state = GinSenderState{};
     // local_route_order places local routes before remote ones.
     s.dispatch_end = forward_dispatch_detail::local_route_prefix(a);
+    if constexpr (DynamicDispatch)
+      s.dispatch_cursor = blockIdx.x >= rdma_ctas
+          ? ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+                control.local_dispatch_head.value)
+                .fetch_add(a.forward_dispatch_publish_batch_rows, ::cuda::memory_order_relaxed)
+          : s.dispatch_end;
     s.return_queue = 0U;
     s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
@@ -276,7 +282,7 @@ __device__ __forceinline__ void finish_copies() {
 // policy retains the original interleaved rows and completion barrier.
 template <unsigned BaseThread, unsigned ActiveCopyWarps = 0U,
           unsigned SlotOffset = 0U, unsigned BarrierId = 8U,
-          bool Optimize = true, class Storage>
+          bool Optimize = true, bool DynamicDispatch = false, class Storage>
 __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
                                                   Storage &s) {
   constexpr auto warps =
@@ -377,9 +383,18 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
   // current sub-batch and published its completed copies. No Return channel
   // is touched by these independently progressing Dispatch warps.
   copy_sync<threads, BarrierId>();
-  if (tid == 0U)
-    s.dispatch_cursor +=
-        1ULL * a.forward_relay_cta_count * a.forward_dispatch_publish_batch_rows;
+  if (tid == 0U) {
+    if constexpr (DynamicDispatch) {
+      auto &control = *peer_at<persistent_v3::ForwardPipelineControl>(
+          a.local_base, a.forward_v3_control_offset);
+      s.dispatch_cursor = ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+          control.local_dispatch_head.value)
+          .fetch_add(a.forward_dispatch_publish_batch_rows, ::cuda::memory_order_relaxed);
+    } else {
+      s.dispatch_cursor +=
+          1ULL * a.forward_relay_cta_count * a.forward_dispatch_publish_batch_rows;
+    }
+  }
   copy_sync<threads, BarrierId>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ProxyRelayEnd, ProxyRelay,
                              blockIdx.x, batch_end - batch_begin,
@@ -816,7 +831,7 @@ run_impl(const ForwardKernelArgs &a,
          unsigned long long *scheduler, Storage &s) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U;
-  init<BaseThread>(a, control, s);
+  init<BaseThread, UseGin>(a, control, s);
   const unsigned rdma_ctas = gridDim.x - a.forward_relay_cta_count;
   if constexpr (UseGin) {
     if (blockIdx.x < rdma_ctas) {
@@ -856,7 +871,7 @@ run_impl(const ForwardKernelArgs &a,
       constexpr bool optimize_local =
           !UseGin || forward_tuning::kUnifiedOptimizeGinLocalTransport;
       const bool dispatched =
-          progress_dispatch<BaseThread, 0U, 0U, 8U, optimize_local>(a, s);
+          progress_dispatch<BaseThread, 0U, 0U, 8U, optimize_local, UseGin>(a, s);
       // Local Return entries live in finite per-generation storage: compute
       // producers do not need these consumers to finish Dispatch. Keep GIN
       // Return receives above eligible on every iteration, including while
