@@ -10852,6 +10852,150 @@
         }
       },
       "finding": "Qwen EP16 8K balanced two-lane candidate, all16 final snapshots: final completed RX task starts916.064-957.024us after setup, lasts62.592-88.128us (median76.080), then Dispatch ends3.040-3.296us later. This is actual task service after claim, including payload/metadata/readiness/credit handoff; does not isolate TMA or prove why task was claimed late. Start/end encoded atomically in32ns ticks, no overflow;20 native repeated output checks passed. Diagnostic rates not used as goal throughput."
+    },
+    {
+      "name": "First GIN controller, completed packing, and submission timing",
+      "source": "/tmp/weftmoe-gin-startup-events",
+      "source_commit": "e53a1eb",
+      "raw_results": "results/communication_bottleneck_20260915/gin_startup_events_v2_capture",
+      "analysis": "results/communication_bottleneck_20260915/gin_startup_events_v2_capture/tail_analysis.json",
+      "summary": {
+        "dispatch_end": {
+          "median": 1002.192,
+          "min": 980.256,
+          "max": 1014.656
+        },
+        "return_end": {
+          "median": 4168.255999999999,
+          "min": 4157.664,
+          "max": 4175.776
+        },
+        "kernel_end": {
+          "median": 4296.016,
+          "min": 4288.256,
+          "max": 4305.056
+        },
+        "local_end": {
+          "median": 972.0319999999999,
+          "min": 891.264,
+          "max": 1005.28
+        },
+        "dispatch_submit_end": {
+          "median": 656.736,
+          "min": 594.176,
+          "max": 704.576
+        },
+        "dispatch_terminal_submit": {
+          "median": 844.0319999999999,
+          "min": 759.84,
+          "max": 935.264
+        },
+        "dispatch_receive_end": {
+          "median": 998.88,
+          "min": 977.024,
+          "max": 1011.36
+        },
+        "dispatch_terminal_receive": {
+          "median": 938.496,
+          "min": 912.64,
+          "max": 960.736
+        },
+        "dispatch_submit_first": {
+          "median": 141.42399999999998,
+          "min": 138.368,
+          "max": 145.92
+        },
+        "return_receive_end": {
+          "median": 4021.0240000000003,
+          "min": 3997.28,
+          "max": 4049.952
+        },
+        "gin_context_end": {
+          "median": 4074.928,
+          "min": 4066.944,
+          "max": 4113.056
+        },
+        "rdma_start": {
+          "median": 49.647999999999996,
+          "min": 48.544,
+          "max": 50.464
+        },
+        "last_task_begin_us": {
+          "median": 913.568,
+          "min": 896.8000000000001,
+          "max": 934.4
+        },
+        "last_task_end_us": {
+          "median": 998.96,
+          "min": 977.088,
+          "max": 1011.456
+        },
+        "last_task_duration_us": {
+          "median": 84.91199999999998,
+          "min": 67.55200000000002,
+          "max": 98.88
+        },
+        "dispatch_after_last_task_us": {
+          "median": 3.2159999999999513,
+          "min": 3.0399999999999636,
+          "max": 3.423999999999978
+        },
+        "first_pack_begin_us": {
+          "median": 66.976,
+          "min": 65.568,
+          "max": 67.616
+        },
+        "first_pack_end_us": {
+          "median": 120.656,
+          "min": 117.568,
+          "max": 122.36800000000001
+        },
+        "first_pack_duration_us": {
+          "median": 53.744,
+          "min": 51.232,
+          "max": 55.39200000000001
+        },
+        "first_put_after_pack_us": {
+          "median": 21.088,
+          "min": 18.367999999999995,
+          "max": 23.83999999999999
+        },
+        "first_pack_after_rdma_us": {
+          "median": 17.263999999999996,
+          "min": 16.928000000000004,
+          "max": 17.599999999999994
+        },
+        "dispatch_after_local_us": {
+          "median": 27.008,
+          "min": 4.928,
+          "max": 88.992
+        },
+        "dispatch_after_receive_us": {
+          "median": 3.296,
+          "min": 3.104,
+          "max": 3.52
+        },
+        "dispatch_after_terminal_us": {
+          "median": 63.424,
+          "min": 42.848,
+          "max": 76.8
+        },
+        "return_after_receive_us": {
+          "median": 146.62400000000002,
+          "min": 117.472,
+          "max": 166.688
+        }
+      },
+      "initial_capture": "results/communication_bottleneck_20260915/gin_startup_events_capture",
+      "initial_capture_limitation": "Initial guard task.sequence==0 omitted steady-iteration pack events because wire sequences persist across iterations;native20-repeat correctness and other fields valid. Fixed diagnostic to atomicMin all nonempty completed packs, kept initial artifacts, reran one8K capture.",
+      "finding": "Qwen EP16 8K parallel GIN candidate, all16ranks: RDMA controller start median49.648us;earliest completed pack starts66.976us,ends120.656us,duration53.744us;first local GIN submission completion141.424us. Controller-to-pack median17.264us;earliest-pack-end to first submission21.088us. These are within-GPU events;the latter gap includes handoff/poll/submission and may span different packets,not isolated GIN API time. Last completed RX task begins913.568us,service84.912us median;Dispatch ends3.216us after its end. No overflow,20 native output checks passed,clocks restored. Diagnostic rates excluded from throughput goal."
+    },
+    {
+      "name": "Installed NCCL public put cooperative group behavior",
+      "source": "/usr/include/nccl_device/impl/gin__funcs.h",
+      "sha256": "f8fb3bac8526d6727079f5fa79de2ebb1b64b3a63b7cc3f4c62eb8414c8763a3",
+      "lines": "550-629",
+      "finding": "ncclGin_BackendMask::put synchronizes the supplied cooperative group but performs submission only in thread_rank()==0;all backend Put calls receive ncclCoopThread(). Merely changing the caller argument from ncclCoopThread to ncclCoopWarp would not parallelize descriptor preparation in this installed implementation. No such source change or GPU experiment was made."
     }
   ]
 }
