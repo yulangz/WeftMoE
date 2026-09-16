@@ -9058,6 +9058,92 @@
       ],
       "protocol": "One device atomic cursor assigns32-route batches across relay CTAs. Each owns at most one batch; initial reservation follows setup clear and next reservation uses existing completion join. RDMA-only CTAs reserve none. No extra barriers, payload changes or task omission. Adds one128-byte padded counter to reusable Forward control.",
       "finding": "Qwen EP16 8K incumbent Dispatch32.765->dynamic30.467GB/s,Return41.341->40.897. Regression; retain fixed stripes.64 sparse files exact over12 repetitions;no64K/full/BWD sweep. Dynamic ownership changes locality/order as well as load balance, so this does not prove tail stragglers absent."
+    },
+    {
+      "name": "Cooperative Return channel readiness polling",
+      "source": "/tmp/weftmoe-cooperative-return-poll",
+      "source_commit": "ab47b61",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/cooperative_return_poll_lanes2_screen",
+      "cases": [
+        {
+          "name": "balanced_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1025.26,
+              "fc2": 139.136,
+              "return": 3260.0299999999997,
+              "reduce": 2479.665,
+              "forward": 4483.795,
+              "wall": 5922.965
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.09410686069876,
+              "nv_return": 36.02436541995012,
+              "rdma_dispatch": 32.72772955152839,
+              "rdma_return": 41.170703337085854
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "cooperative_return_poll_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1035.295,
+              "fc2": 150.128,
+              "return": 3262.495,
+              "reduce": 2364.0649999999996,
+              "forward": 4508.51,
+              "wall": 5910.889999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 226.87352300552013,
+              "nv_return": 35.99714696880762,
+              "rdma_dispatch": 32.41050328650288,
+              "rdma_return": 41.139596535780136
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "First copy warp checks up to32 channel heads/signals in parallel, in bounded groups for larger topologies. Lane0 rechecks and exclusively claims an elected channel using the original ring::claim; stale hints only cause retries. Original proxy fence, task publication barriers and credits unchanged.",
+      "finding": "Qwen EP16 8K Dispatch32.728->32.411GB/s,Return41.171->41.140. No gain;64 sparse files exact over12 repetitions. Do not adopt or expand full/64K/BWD tests."
     }
   ],
   "diagnostics": [
