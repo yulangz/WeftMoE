@@ -10268,6 +10268,197 @@
       ],
       "finding": "Qwen EP16 8K last steady iteration on8 local GPUs: PCIe TX first>=70% sample at176-242us after own setup origin; last high Dispatch sample at734-842us. Remaining time to own approximate Dispatch end185-288us,with NVLink TX28-48.5% of respective peak in tail samples. Bulk PCIe sustained~80%. Thresholds are not packet/completion timestamps and local Return traffic from faster ranks may overlap. Test dynamic local Dispatch work distribution to identify fixed-stripe stragglers. Profiled rates are diagnostic,not new goal performance;20 native checks passed,no kernel replay. Measured GPC clock inside all8 local kernels1619.26-1620.53MHz,consistent with1620MHz requested lock.",
       "sampled_clock_evidence": "results/communication_bottleneck_20260915/nsys_pure_balanced_dispatch_lanes2_qwen_ep16_8k_last/sampled_clocks.json"
+    },
+    {
+      "name": "Final Dispatch payload versus termination events",
+      "source": "/tmp/weftmoe-dispatch-tail-events",
+      "binary_source_commit": "522b26d",
+      "launcher_source_commit": "8911ff4",
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_tail_events_capture",
+      "initial_screen": "results/communication_bottleneck_20260915/dispatch_tail_events_lanes2_screen",
+      "analysis": "results/communication_bottleneck_20260915/dispatch_tail_events_capture/tail_analysis.json",
+      "summary": {
+        "dispatch_end": {
+          "median": 1015.088,
+          "min": 989.6,
+          "max": 1027.456
+        },
+        "return_end": {
+          "median": 4261.984,
+          "min": 4246.656,
+          "max": 4275.168
+        },
+        "kernel_end": {
+          "median": 4387.008,
+          "min": 4384.832,
+          "max": 4388.832
+        },
+        "local_end": {
+          "median": 936.0799999999999,
+          "min": 866.208,
+          "max": 1007.872
+        },
+        "dispatch_submit_end": {
+          "median": 721.7280000000001,
+          "min": 693.056,
+          "max": 797.376
+        },
+        "dispatch_terminal_submit": {
+          "median": 813.328,
+          "min": 722.528,
+          "max": 882.944
+        },
+        "dispatch_receive_end": {
+          "median": 1012.096,
+          "min": 986.624,
+          "max": 1024.608
+        },
+        "dispatch_terminal_receive": {
+          "median": 955.6320000000001,
+          "min": 931.168,
+          "max": 969.824
+        },
+        "dispatch_submit_first": {
+          "median": 168.528,
+          "min": 155.36,
+          "max": 179.296
+        },
+        "return_receive_end": {
+          "median": 4090.5919999999996,
+          "min": 4048.608,
+          "max": 4135.584
+        },
+        "gin_context_end": {
+          "median": 4181.904,
+          "min": 4163.904,
+          "max": 4207.68
+        },
+        "dispatch_after_local_us": {
+          "median": 81.696,
+          "min": 19.584,
+          "max": 147.648
+        },
+        "dispatch_after_receive_us": {
+          "median": 2.96,
+          "min": 2.816,
+          "max": 3.104
+        },
+        "dispatch_after_terminal_us": {
+          "median": 56.44799999999999,
+          "min": 49.728,
+          "max": 71.744
+        },
+        "return_after_receive_us": {
+          "median": 164.736,
+          "min": 126.656,
+          "max": 214.624
+        }
+      },
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "paired_cases": [
+        {
+          "name": "balanced_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1022.415,
+              "fc2": 139.68,
+              "return": 3249.49,
+              "reduce": 2349.135,
+              "forward": 4482.225,
+              "wall": 5875.47
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.73159040115806,
+              "nv_return": 36.14121354427926,
+              "rdma_dispatch": 32.818798628736864,
+              "rdma_return": 41.304244050604865
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_tail_events_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1027.12,
+              "fc2": 138.128,
+              "return": 3250.9449999999997,
+              "reduce": 2434.7200000000003,
+              "forward": 4488.21,
+              "wall": 5974.764999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 228.6792429316925,
+              "nv_return": 36.125038104305055,
+              "rdma_dispatch": 32.66846327595607,
+              "rdma_return": 41.285757833491495
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "capture_case": {
+        "name": "dispatch_tail_events_ep16_8192",
+        "returncode": 0,
+        "summary": {
+          "timing_us": {
+            "dispatch": 1023.73,
+            "fc2": 141.072,
+            "return": 3247.2799999999997,
+            "reduce": 2405.73,
+            "forward": 4483.665,
+            "wall": 6027.85
+          },
+          "payload_GBps": {
+            "nv_dispatch": 229.43649595108084,
+            "nv_return": 36.16581015496046,
+            "rdma_dispatch": 32.77664227872584,
+            "rdma_return": 41.332354462811956
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          }
+        }
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "finding": "All16 ranks finish Dispatch2.816-3.104us after the final received payload completes fanout/readiness and local consumed publication. Last local Dispatch publication is19.584-147.648us earlier;last received terminal marker49.728-71.744us earlier. Thus remaining tail is actual received payload processing,not waiting for End markers or slow idle-CTA acknowledgement. First GIN Dispatch enqueue155.36-179.296us after setup start;do not equate this whole interval with packing. Return completes126.656-214.624us after final received Return payload. Initial instrumented pair Dispatch1022.415->1027.120us (+0.46%);64 sparse files exact. Initial launcher discarded child stderr; diagnostic launcher now forwards final snapshots,one8K capture added with20 native checks. No timer boundary changed and trace rates are not goal performance."
     }
   ]
 }
