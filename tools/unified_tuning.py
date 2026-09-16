@@ -58,7 +58,7 @@ def validate_shared_parameters(forward, backward):
 
 # These are compatibility defaults for old plans. Current public search spaces
 # explicitly choose their incumbent, including eight physical GIN ring slots.
-DEFAULTS = dict(gin_dispatch_channels=64, gin_return_ports=8, gin_chunk_rows=128,
+DEFAULTS = dict(gin_dispatch_channels=64, gin_return_ports=2, gin_chunk_rows=64,
                 gin_context_count=0, gin_ring_depth=4, unified_workers=0, unified_threads=384,
                 unified_comm_threads=96, unified_comm_base=288,
                 unified_math_registers=232, unified_control_registers=40,

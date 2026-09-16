@@ -549,7 +549,7 @@ struct Layout {
   unsigned local_notification_ctas = 0;
   std::size_t forward_scheduler = 0;
   std::size_t forward_v3_control = 0;
-  std::size_t forward_unified_gin_state = 0;
+  std::size_t gin_sender_done = 0;
   std::size_t forward_completion = 0;
   std::size_t forward_context_completion = 0;
   std::size_t status = 0;
@@ -1020,9 +1020,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                         "available CUDA device", "device query failed");
       layout.local_notification_ctas = std::max(
           layout.local_notification_ctas, static_cast<unsigned>(sms));
-      layout.forward_unified_gin_state = append(
-          cursor, layout.local_notification_ctas, forward_tuning::kUnifiedGinStateBytes,
-          "unified GIN context progress state");
+      layout.gin_sender_done = append(
+          cursor, layout.local_notification_ctas, sizeof(unsigned),
+          "unified GIN sender completion flags");
     }
     layout.local_notifications = append(
         cursor,

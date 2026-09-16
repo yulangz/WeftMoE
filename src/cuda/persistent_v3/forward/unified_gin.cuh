@@ -7,11 +7,11 @@ namespace wire = activation_ring_detail;
 namespace ring = communication;
 
 template <class Args>
-__device__ __forceinline__ GinSenderState *states(const Args &a) {
-  return static_cast<GinSenderState *>(a.forward_unified_gin_state);
+__device__ __forceinline__ unsigned *sender_done(const Args &a) {
+  return static_cast<unsigned *>(a.gin_sender_done);
 }
 
-// A sender owns every S-th channel, independently of context allocation.
+// A sender owns every S-th channel, independently of sender allocation.
 template <class Args>
 __device__ __forceinline__ bool drained(const Args &a, unsigned sender) {
   for (unsigned channel = sender; channel < a.gin_rings.channels();
@@ -84,10 +84,10 @@ __device__ __forceinline__ void account_send(const ForwardKernelArgs &a,
 }
 
 __device__ __forceinline__ void
-complete_context(const ForwardKernelArgs &a,
-                 persistent_v3::ForwardPipelineControl &control,
-                 unsigned context, GinSenderState &state) {
-  (void)context;
+complete_sender(const ForwardKernelArgs &a,
+                persistent_v3::ForwardPipelineControl &control,
+                unsigned sender, GinSenderState &state) {
+  (void)sender;
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
   atomicAdd(
@@ -134,14 +134,14 @@ __device__ __forceinline__ bool channel_pending(GinSenderState &state,
 }
 
 template <bool Dispatch, bool SameChannel = false, class Args>
-__device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
+__device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned sender,
                                                 GinSenderState &state,
                                                 wire::Transfer &task,
                                                 unsigned max_probes = 0U) {
   const unsigned first = Dispatch ? 0U : a.gin_rings.dispatch_channels;
   const unsigned end = Dispatch ? a.gin_rings.dispatch_channels : a.gin_rings.channels();
   const unsigned stride = a.gin_sender_count;
-  const unsigned start = first + (context + stride - first % stride) % stride;
+  const unsigned start = first + (sender + stride - first % stride) % stride;
   const unsigned count = start < end ? 1U + (end - 1U - start) / stride : 0U;
   auto &cursor = Dispatch ? state.dispatch_cursor : state.return_cursor;
   auto *channels = ring::channels(a.gin_window_base, a.gin_rings);
@@ -222,14 +222,13 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
 // Only this CTA advances its sender state; packers publish pending with release.
 template <bool SameChannel = false, class Args, class OnSend, class OnComplete>
 __device__ __forceinline__ bool
-progress_context(const Args &a, GinSenderState &state, unsigned &cursor, unsigned &selected_context,
-                 unsigned &selected_slot, wire::Transfer &task, OnSend on_send,
-                 OnComplete on_complete, bool reserve_pack = true) {
+progress_sender(const Args &a, GinSenderState &state, unsigned &selected_slot,
+                wire::Transfer &task, OnSend on_send, OnComplete on_complete,
+                bool reserve_pack = true) {
   task.channel = wire::kNoChannel;
   bool progressed = false;
-  (void)cursor;
-  const unsigned context = blockIdx.x;
-  if (context >= a.gin_sender_count) return false;
+  const unsigned sender = blockIdx.x;
+  if (sender >= a.gin_sender_count) return false;
   {
     if (state.done == 0U) {
       unsigned occupied = 0U;
@@ -251,7 +250,16 @@ progress_context(const Args &a, GinSenderState &state, unsigned &cursor, unsigne
                                         a.gin_rings)[entry.task.channel].sent;
         }
         if (may_submit) {
+#if WEFTMOE_DEVICE_TIMELINE
+          const auto submit_start = profiling::read_globaltimer_ns();
+#endif
           send_packed(a, entry.task);
+#if WEFTMOE_DEVICE_TIMELINE
+          if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderSubmit,
+                GinReturn, entry.task.channel, profiling::read_globaltimer_ns() - submit_start,
+                entry.task.rows);
+#endif
           on_send(entry.task);
           state.terminal_puts += entry.task.terminal != 0U;
           if (entry.task.channel < a.gin_rings.dispatch_channels)
@@ -264,31 +272,40 @@ progress_context(const Args &a, GinSenderState &state, unsigned &cursor, unsigne
         }
         occupied += phase != 0U;
       }
-      const unsigned owned_channels = context < a.gin_rings.channels()
-          ? 1U + (a.gin_rings.channels() - 1U - context) / a.gin_sender_count : 0U;
+      const unsigned owned_channels = sender < a.gin_rings.channels()
+          ? 1U + (a.gin_rings.channels() - 1U - sender) / a.gin_sender_count : 0U;
       // Do not scan old Dispatch slots on every Return submission. A sender
       // cannot drain before it has submitted the last packet of every channel.
       if (occupied == 0U && state.terminal_puts == owned_channels &&
-          drained(a, context)) {
+          drained(a, sender)) {
         // Per-slot local counters and remote credits already prove that every
         // payload put is complete. This submitter issues no standalone ACKs.
-        on_complete(context, state);
+        on_complete(sender, state);
         state.done = 1U;
-        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(states(a)[context].done)
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(sender_done(a)[sender])
             .store(1U, ::cuda::memory_order_release);
         progressed = true;
       } else if (reserve_pack && occupied < forward_tuning::kUnifiedGinPackSlots) {
+#if WEFTMOE_DEVICE_TIMELINE
+        const auto select_start = profiling::read_globaltimer_ns();
+#endif
         const bool dispatch_first = state.dispatch_first != 0U;
         bool selected =
             dispatch_first
-                ? choose_unpacked<true, SameChannel>(a, context, state, task)
-                : choose_unpacked<false, SameChannel>(a, context, state, task);
+                ? choose_unpacked<true, SameChannel>(a, sender, state, task)
+                : choose_unpacked<false, SameChannel>(a, sender, state, task);
         if (!selected)
           selected =
               dispatch_first
-                  ? choose_unpacked<false, SameChannel>(a, context, state, task)
-                  : choose_unpacked<true, SameChannel>(a, context, state, task);
+                  ? choose_unpacked<false, SameChannel>(a, sender, state, task)
+                  : choose_unpacked<true, SameChannel>(a, sender, state, task);
         if (selected) {
+#if WEFTMOE_DEVICE_TIMELINE
+          if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderSelect,
+                GinReturn, task.channel, profiling::read_globaltimer_ns() - select_start,
+                task.rows);
+#endif
           state.dispatch_first = task.channel >= a.gin_rings.dispatch_channels;
           for (unsigned probe_slot = 0;
                probe_slot < forward_tuning::kUnifiedGinPackSlots;
@@ -302,7 +319,6 @@ progress_context(const Args &a, GinSenderState &state, unsigned &cursor, unsigne
               continue;
             entry.task = task;
             pending.store(1U, ::cuda::memory_order_relaxed);
-            selected_context = context;
             selected_slot = slot;
             break;
           }
@@ -581,11 +597,11 @@ progress_send(const ForwardKernelArgs &a,
   const unsigned tid = local_thread<BaseThread>();
   if (tid == 0U)
     s.gin_progressed =
-        progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
-            a, s.gin_sender_state, s.gin_context_cursor, s.gin_context, s.gin_task_slot, s.gin_task,
+        progress_sender<(forward_tuning::kGinChannelPackLimit > 1U)>(
+            a, s.gin_sender_state, s.gin_task_slot, s.gin_task,
             [&](const wire::Transfer &task) { account_send(a, task); },
-            [&](unsigned context, GinSenderState &state) {
-              complete_context(a, control, context, state);
+            [&](unsigned sender, GinSenderState &state) {
+              complete_sender(a, control, sender, state);
             });
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   const bool packed = s.gin_task.channel != wire::kNoChannel;
@@ -604,6 +620,32 @@ progress_send(const ForwardKernelArgs &a,
   return s.gin_progressed != 0U;
 }
 
+#if WEFTMOE_DEVICE_TIMELINE
+__device__ __forceinline__ void observe_return_ready(const ForwardKernelArgs &a) {
+  if (!a.use_gin || !a.gin_receiver_count || blockIdx.x < a.gin_receiver_base) return;
+  const unsigned first = a.gin_rings.dispatch_channels;
+  const unsigned worker = blockIdx.x - a.gin_receiver_base;
+  const unsigned stride = a.gin_receiver_count;
+  const unsigned begin = first + (worker + stride - first % stride) % stride;
+  const ncclGin gin(a.gin_dev_comm, 0U);
+  for (unsigned c = begin; c < a.gin_rings.channels(); c += stride) {
+    auto &state = ring::channels(a.gin_window_base, a.gin_rings)[c];
+    const auto seq = ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(state.claimed)
+        .load(::cuda::memory_order_relaxed);
+    const unsigned slot = seq % ring::kRingDepth;
+    const auto expected = seq / ring::kRingDepth + 1ULL;
+    if (state.slots[slot].observed_ready == expected) continue;
+    const auto ready = gin.readSignal(a.gin_window, a.gin_rings.slot_control(c, slot) +
+        offsetof(ring::ChunkSlot, ready_signal));
+    if (ring::reached(ready, expected, 64U)) {
+      state.slots[slot].observed_ready = expected;
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalReady,
+          SourceRelay, c, seq, 0ULL);
+    }
+  }
+}
+#endif
+
 template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ bool progress_receive(const ForwardKernelArgs &a,
                                                  Storage &s, bool dispatch) {
@@ -621,6 +663,9 @@ __device__ __forceinline__ bool progress_receive(const ForwardKernelArgs &a,
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   if (!received)
     return false;
+  if (!dispatch)
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, SourcePacketClaimed,
+        SourceRelay, s.gin_task.channel, s.gin_task.sequence, execution_epoch(a));
   if (dispatch)
     receive_dispatch<BaseThread>(a, s, s.gin_task);
   else

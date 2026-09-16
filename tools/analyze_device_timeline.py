@@ -73,6 +73,11 @@ EVENTS = {
     87: "fc2_tile_end",
     88: "compute_pair_join_end",
     89: "transport_role_done",
+    90: "gin_sender_select",
+    91: "gin_sender_submit",
+    92: "gin_sender_progress",
+    93: "source_signal_ready",
+    94: "source_packet_claimed",
 }
 
 PAIRS = {
@@ -143,6 +148,18 @@ def summarize(path: Path) -> tuple[dict[str, object], dict[str, list[float]]]:
                 if end >= begin:
                     samples.append((end - begin) / 1_000_000.0)
         durations[name] = samples
+    for event in (90, 91, 92):
+        durations[EVENTS[event]] = [int(item["arg0"]) / 1_000_000.0
+                                    for item in events if int(item["event"]) == event]
+    # The independent observer may miss a packet claimed between its polls.
+    # Match identities, not event positions; report only observed pairs.
+    ready = {(int(item["channel"]), int(item["arg0"])): int(item["timestamp_ns"])
+             for item in events if int(item["event"]) == 93}
+    durations["return_ready_to_claim"] = [
+        (int(item["timestamp_ns"]) - ready[key]) / 1_000_000.0
+        for item in events if int(item["event"]) == 94
+        if (key := (int(item["channel"]), int(item["arg0"]))) in ready
+        and int(item["timestamp_ns"]) >= ready[key]]
     rank_summary: dict[str, object] = {
         "path": str(path),
         "rank": payload["rank"],

@@ -169,6 +169,22 @@ __device__ __forceinline__ bool drained(const Args &a, unsigned context) {
   return true;
 }
 
+// With fixed receive ownership a CTA needs only its own channel terminals.
+// The existing CTA completion counters provide the global join.
+template <class Args>
+__device__ __forceinline__ bool receive_complete(const Args &a, bool dispatch) {
+  const unsigned first = dispatch ? 0U : a.gin_rings.dispatch_channels;
+  const unsigned end = dispatch ? a.gin_rings.dispatch_channels : a.gin_rings.channels();
+  const unsigned worker = blockIdx.x - a.gin_receiver_base;
+  const unsigned stride = a.gin_receiver_count;
+  const unsigned begin = first + (worker + stride - first % stride) % stride;
+  for (unsigned channel = begin; channel < end; channel += stride)
+    if (!::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+        ring::channels(a.gin_window_base, a.gin_rings)[channel].rx_terminal)
+        .load(::cuda::memory_order_acquire)) return false;
+  return true;
+}
+
 template <class Args>
 __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
                                               Transfer &task, bool dispatch,

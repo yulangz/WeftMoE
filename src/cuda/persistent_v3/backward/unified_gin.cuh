@@ -15,7 +15,7 @@ using forward_unified_transport::finish_copies;
 __device__ __forceinline__ bool terminal(const BackwardKernelArgs &a) {
   for (unsigned context = 0U; context < a.gin_sender_count; ++context)
     if (!::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-             shared_gin::states(a)[context].done)
+             shared_gin::sender_done(a)[context])
              .load(::cuda::memory_order_acquire))
       return false;
   return true;

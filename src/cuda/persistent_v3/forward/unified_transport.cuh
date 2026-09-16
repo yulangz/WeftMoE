@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 
 #if __has_include(<nccl_device.h>)
 
@@ -74,8 +75,6 @@ struct alignas(128) Shared {
 
   GinSenderState gin_sender_state;
   activation_ring_detail::Transfer gin_task;
-  unsigned gin_context_cursor;
-  unsigned gin_context;
   unsigned gin_task_slot;
   unsigned gin_rx_dispatch;
   unsigned gin_rx_return;
@@ -139,8 +138,8 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.return_queue = 0U;
     s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
-    s.gin_context_cursor = s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
-    s.gin_context = s.gin_progressed = 0U;
+    s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
+    s.gin_progressed = 0U;
     s.local_dispatch_since_receive = kLocalBatchesPerGinDispatch;
     s.gin_task.channel = activation_ring_detail::kNoChannel;
     if (blockIdx.x == 0U) {
@@ -694,6 +693,9 @@ run_publisher(const ForwardKernelArgs &a,
   while (true) {
     unsigned done = 0U, published = 0U;
     if (lane == 0U) {
+#if WEFTMOE_DEVICE_TIMELINE
+      gin_detail::observe_return_ready(a);
+#endif
       published = forward_dispatch_detail::progress_fc1_publisher(
           a, scheduler, publisher);
       done = (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
@@ -722,19 +724,26 @@ run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
   const unsigned warp = tid / 32U, lane = tid % 32U;
   if (warp == Storage::kCopyWarps) {
     if (lane == 0U) {
-      unsigned cursor = blockIdx.x;
       ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> mailbox(s.pack_mailbox);
       while (!is_cancelled()) {
         const bool available = mailbox.load(::cuda::memory_order_acquire) == 0U;
         activation_ring_detail::Transfer task;
-        unsigned context = 0U, slot = 0U;
+        unsigned slot = 0U;
+#if WEFTMOE_DEVICE_TIMELINE
+        const auto progress_start = profiling::read_globaltimer_ns();
+#endif
         const bool progressed =
-            gin_detail::progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
-                a, s.gin_sender_state, cursor, context, slot, task,
+            gin_detail::progress_sender<(forward_tuning::kGinChannelPackLimit > 1U)>(
+                a, s.gin_sender_state, slot, task,
                 on_send, on_complete, available);
         if (task.channel != activation_ring_detail::kNoChannel) {
+#if WEFTMOE_DEVICE_TIMELINE
+          if constexpr (::std::is_same_v<Args, ForwardKernelArgs>)
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, GinSenderProgress,
+                GinReturn, task.channel, profiling::read_globaltimer_ns() - progress_start,
+                task.rows);
+#endif
           s.gin_task = task;
-          s.gin_context = context;
           s.gin_task_slot = slot;
           mailbox.store(1U, ::cuda::memory_order_release);
         } else if (available && s.gin_sender_state.done) {
@@ -796,7 +805,7 @@ run_rdma(const ForwardKernelArgs &a,
       },
       [&](const activation_ring_detail::Transfer &task) { gin_detail::account_send(a, task); },
       [&](unsigned sender, GinSenderState &state) {
-        gin_detail::complete_context(a, control, sender, state);
+        gin_detail::complete_sender(a, control, sender, state);
       });
 }
 
@@ -861,7 +870,7 @@ run_impl(const ForwardKernelArgs &a,
           ++s.local_dispatch_since_receive;
         if (!s.dispatch_complete && s.dispatch_cursor >= s.dispatch_end &&
             (!UseGin ||
-             forward_dispatch_detail::ring_detail::receive_complete(a, true))) {
+             activation_ring_detail::receive_complete(a, true))) {
           s.dispatch_complete = 1U;
           const auto previous =
               persistent_v3::fetch_add_release<::cuda::thread_scope_device>(
@@ -880,7 +889,7 @@ run_impl(const ForwardKernelArgs &a,
                  (s.dispatch_complete &&
                   forward_return_detail::local_return_terminal(a, state) &&
                   (!UseGin ||
-                   (forward_dispatch_detail::ring_detail::receive_complete(
+                   (activation_ring_detail::receive_complete(
                         a, false) &&
                     persistent_v3::load_acquire<::cuda::thread_scope_device>(
                         control.rdma_return_roles_complete.value) ==

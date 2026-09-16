@@ -4545,7 +4545,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_scheduler_offset = layout.forward_scheduler;
   args.forward_v3_control_offset = layout.forward_v3_control;
   if constexpr (forward_tuning::kUnifiedWorkers)
-    args.forward_unified_gin_state = at<void>(slot.device, layout.forward_unified_gin_state);
+    args.gin_sender_done = at<void>(slot.device, layout.gin_sender_done);
   args.gin_local_compute_ready_offset = layout.gin_local_compute_ready;
   args.terminal_epoch_offset = layout.terminal_epoch;
   args.production_error_records_offset = layout.production_error_records;
@@ -4769,8 +4769,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
           } else {
             if (!split_local_roles) {
-            error = cudaMemsetAsync(args.forward_unified_gin_state, 0,
-                args.gin_sender_count * forward_tuning::kUnifiedGinStateBytes,
+            error = cudaMemsetAsync(args.gin_sender_done, 0,
+                args.gin_sender_count * sizeof(unsigned),
                 exec->stream);
             if (error != cudaSuccess)
               return error;
@@ -5860,7 +5860,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;
   if constexpr (backward_tuning::kUnifiedWorkers)
-    args.forward_unified_gin_state = at<void>(slot.device, layout.forward_unified_gin_state);
+    args.gin_sender_done = at<void>(slot.device, layout.gin_sender_done);
   args.use_gin = use_gin;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
@@ -6059,11 +6059,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   if (use_gin) {
     if constexpr (backward_tuning::kUnifiedWorkers)
       internal::throw_cuda("backward-run",
-          cudaMemsetAsync(args.forward_unified_gin_state, 0,
-                          args.gin_sender_count * forward_tuning::kUnifiedGinStateBytes,
+          cudaMemsetAsync(args.gin_sender_done, 0,
+                          args.gin_sender_count * sizeof(unsigned),
                           exec->stream),
           identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "initialize unified Backward GIN contexts");
+           ExchangeKind::ExpertCounts, "initialize unified Backward GIN sender completion");
     activation_ring_detail::prepare<<<(args.gin_rings.channels() + 127U) / 128U,
                                       128, 0, exec->stream>>>(args);
     internal::throw_cuda("backward-run", cudaGetLastError(), identity.rank,

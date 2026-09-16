@@ -90,6 +90,13 @@ enum class TimelineEvent : std::uint16_t {
   Fc2TileEnd = 87,
   ComputePairJoinEnd = 88,
   TransportRoleDone = 89,
+  // Sender samples: arg0 is elapsed ns, arg1 is rows. No event for idle polls.
+  GinSenderSelect = 90,
+  GinSenderSubmit = 91,
+  GinSenderProgress = 92,
+  SourceSignalReady = 93,
+  // Ready and Claimed identify the same packet by (channel, arg0=sequence).
+  SourcePacketClaimed = 94,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

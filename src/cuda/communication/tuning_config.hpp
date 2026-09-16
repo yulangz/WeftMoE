@@ -33,7 +33,7 @@ static_assert(WEFTMOE_GIN_DISPATCH_CHANNELS > 0,
               "GIN Dispatch channels must be positive");
 
 #ifndef WEFTMOE_GIN_CHUNK_ROWS
-#define WEFTMOE_GIN_CHUNK_ROWS 128
+#define WEFTMOE_GIN_CHUNK_ROWS 64
 #endif
 static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
               "GIN packets must contain 1 to 128 rows");
@@ -44,6 +44,6 @@ static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
 static_assert(WEFTMOE_GIN_CONTEXT_COUNT >= 0, "GIN context count must be nonnegative");
 
 #ifndef WEFTMOE_GIN_RETURN_PORTS
-#define WEFTMOE_GIN_RETURN_PORTS 8
+#define WEFTMOE_GIN_RETURN_PORTS 2
 #endif
 static_assert(WEFTMOE_GIN_RETURN_PORTS > 0, "GIN Return streams must be positive");

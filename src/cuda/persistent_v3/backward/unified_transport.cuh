@@ -37,7 +37,6 @@ __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
     s.return_queue = s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     if constexpr (UseGin) {
-      s.gin_context_cursor = (blockIdx.x + a.rank) % a.gin_context_count;
       s.gin_rx_dispatch = blockIdx.x % a.gin_rings.dispatch_channels;
       s.gin_rx_return = blockIdx.x % a.gin_rings.return_channels;
       s.gin_task.channel = activation_ring_detail::kNoChannel;

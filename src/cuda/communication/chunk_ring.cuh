@@ -22,6 +22,9 @@ struct alignas(64) ChunkSlot {
   unsigned long long consumed;
   unsigned long long acknowledged;
   std::uint64_t local_target; // This slot only, on its current sender context.
+#if WEFTMOE_DEVICE_TIMELINE
+  std::uint64_t observed_ready; // Sole publisher warp; diagnostic only.
+#endif
 };
 
 struct alignas(128) ChunkChannel {
