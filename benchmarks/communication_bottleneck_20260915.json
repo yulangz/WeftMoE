@@ -9473,6 +9473,24 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K paired D32.7925->33.2181GB/s (+1.30%),R42.3222->42.2967. GPU4392.785->4404.835us,wall5777.54->5937.615. Small Dispatch gain without overall gain;no full/BWD/64K expansion or adoption. Only source-dependent expert tie-breaker in existing locality/M-tile sort changed, both packed-key and fallback sorts agree. Canonical destinations and summation order untouched;no additional pass or payload traffic.64 sparse files exact over12 repetitions."
+    },
+    {
+      "name": "Pipeline full completion across two received Dispatch tasks",
+      "source": "/tmp/weftmoe-pipelined-dispatch-completion",
+      "source_commit": "a3076bc",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/pipelined_dispatch_completion_lanes2_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "resource_audit": "results/communication_bottleneck_20260915/pipelined_completion_resources/summary.json",
+      "synchronization": "Issue payload A and B, wait full destination completion of all groups preceding the at-most-min(B_groups,7) newest groups, SYS fence plus copy-domain join, publish A and release its receive part, then full wait0/SYS fence before publishing/releasing B. Count actual nonempty segmented row groups;all existing SMEM read-completion waits remain. No ring credit before its publications;dynamic local service quota tracks task count.",
+      "reference": "https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group",
+      "finding": "Qwen EP16 8K RX32 pair:baseline D32.7911/R42.2840GB/s,candidate31.7755/42.2272;GPU4412.465->4434.785us,wall5953.97->5852.27us.64 sparse files exact over12 repetitions,but sparse Dispatch254-ish->319.648us. No adoption or full/64K/BWD sweep. Resource audit bothREG168,stack104->120bytes;does not establish dynamic spill cost. Two RX32 tasks also double aggregate service size to64 rows and may reduce participating CTAs;next matched-granularity comparison uses RX16,base localquota2,paired versus unpaired."
     }
   ],
   "diagnostics": [
