@@ -4,11 +4,11 @@
 // Return domains use disjoint TMA slots and their own barriers. A ready Return
 // batch cannot delay subsequent inputs, regardless of the token distribution.
 template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
-          unsigned Buffers>
+          unsigned Buffers, unsigned DispatchLanes>
 __device__ __forceinline__ void run_local_warps(
     const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
-    unsigned long long *scheduler, Shared<Threads, SegmentBytes, Buffers> &s) {
-  using Storage = Shared<Threads, SegmentBytes, Buffers>;
+    unsigned long long *scheduler, Shared<Threads, SegmentBytes, Buffers, DispatchLanes> &s) {
+  using Storage = Shared<Threads, SegmentBytes, Buffers, DispatchLanes>;
   static_assert(
       Storage::kCopyWarps >= 2U,
       "Independent directions require two copy warps and a publisher");

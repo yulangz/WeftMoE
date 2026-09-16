@@ -357,12 +357,39 @@ progress_fc1_publisher(const ForwardKernelArgs &a,
     auto *claims =
         peer_at<unsigned long long>(a.local_base, a.forward_task_claim_offset);
     auto *ready_queue = claims + scheduler[3];
+    auto *tail_word = &scheduler[12ULL + 2ULL * a.world];
+    bool reverse = false;
+    if constexpr (WEFTMOE_FWD_REMOTE_FC1_PRIORITY) {
+      if (a.use_gin) {
+        const auto map = claims[mblock];
+        const auto expert = unsigned(map >> 32U);
+        const auto first = forward_mblock_local_row(unsigned(map));
+        const auto end = min(first + 1ULL * group.mblocks * forward_tuning::kTileM,
+                              1ULL * a.dispatch.expert_row_count[expert]);
+        const auto base = a.dispatch.expert_row_prefix[expert];
+        const auto *headers = peer_at<const LocalP2pRouteHeader>(
+            a.local_base, a.direct_headers_offset);
+        // Ready groups are inside one expert. Canonical rows are ordered by
+        // source rank, so their endpoints identify any cross-node rows even
+        // when the group spans multiple source ranks or a partial final tile.
+        const bool remote =
+            headers[base + first].source_rank / a.local_world_size != a.node ||
+            headers[base + end - 1ULL].source_rank / a.local_world_size != a.node;
+        auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+            a.local_base, a.forward_v3_control_offset);
+        tail_word = remote ? &control->fc1_remote_tail.value
+                           : &control->fc1_local_tail.value;
+        reverse = !remote;
+      }
+    }
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(
-        scheduler[12ULL + 2ULL * a.world]);
+        *tail_word);
     // Acquires for completed tiles survive queue rotations. The local
     // queue's release stores pass payload visibility to the compute CTA.
-    const auto begin = tail.fetch_add(1ULL * group.mblocks * ntiles,
-                                      ::cuda::memory_order_relaxed);
+    const auto extent = 1ULL * group.mblocks * ntiles;
+    const auto reserved = tail.fetch_add(extent, ::cuda::memory_order_relaxed);
+    const auto begin = reverse ? scheduler[3] * ntiles - reserved - extent
+                               : reserved;
     for (std::uint32_t position = 0; position < group.mblocks * ntiles;
          ++position) {
       const auto task =
@@ -594,7 +621,8 @@ local_relay_role(const ForwardKernelArgs &a,
     const auto context = relay_ordinal % a.local_world_size;
     if (threadIdx.x == 0U) {
       local_return_state = forward_return_detail::LocalReturnState{};
-      local_return_state.queue_index = peer_queues ? 1U + return_peer : 0U;
+      local_return_state.queue_index = peer_queues
+          ? 1U + a.node * a.local_world_size + return_peer : 0U;
       local_return_done = 0U;
       for (std::uint32_t return_warp = 0U; return_warp < kPhysicalWarps;
            ++return_warp)

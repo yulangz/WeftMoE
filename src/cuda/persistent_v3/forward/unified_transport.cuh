@@ -2,6 +2,10 @@
 
 #if __has_include(<nccl_device.h>)
 
+#ifndef WEFTMOE_FWD_DISPATCH_ISSUER_BUFFERS
+#define WEFTMOE_FWD_DISPATCH_ISSUER_BUFFERS 1
+#endif
+
 #include "cuda/communication/notification_pipeline.cuh"
 #include "cuda/communication/return_queue.cuh"
 #include "cuda/persistent_v3/forward/return_pipeline.cuh"
@@ -12,6 +16,17 @@
 namespace forward_unified_transport {
 
 using CopyBarrier = ::cuda::barrier<::cuda::thread_scope_block>;
+#ifndef WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH
+#define WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH 1
+#endif
+inline constexpr unsigned kLocalBatchesPerGinDispatch =
+    WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH;
+static_assert(kLocalBatchesPerGinDispatch > 0U);
+#ifndef WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH
+#define WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH 0
+#endif
+
+
 
 #include "cuda/persistent_v3/forward/unified_gin_state.cuh"
 
@@ -19,11 +34,20 @@ using CopyBarrier = ::cuda::barrier<::cuda::thread_scope_block>;
 // four or eight warps allow a separate communication warpgroup. The final warp
 // publishes input groups and then receives notifications while copies proceed.
 template <unsigned Threads, unsigned SegmentBytes = 2048U,
-          unsigned Buffers = 1U>
+          unsigned Buffers = 1U, unsigned DispatchLanes = 1U>
 struct alignas(128) Shared {
   static_assert(Threads >= 64U && Threads % 32U == 0U);
   static_assert(SegmentBytes >= 16U && SegmentBytes % 16U == 0U);
   static_assert(Buffers == 1U || Buffers == 2U);
+  static_assert(DispatchLanes >= 1U && DispatchLanes <= 32U &&
+                (DispatchLanes & (DispatchLanes - 1U)) == 0U);
+  static constexpr unsigned kDispatchLanes = DispatchLanes;
+  static constexpr unsigned kDispatchBuffers = DispatchLanes == 1U
+      ? Buffers : WEFTMOE_FWD_DISPATCH_ISSUER_BUFFERS;
+  static_assert(kDispatchBuffers == 1U || kDispatchBuffers == 2U);
+  static constexpr unsigned kStorageSlots =
+      Buffers > DispatchLanes * kDispatchBuffers
+          ? Buffers : DispatchLanes * kDispatchBuffers;
   static constexpr unsigned kThreads = Threads;
   static constexpr unsigned kCopyWarps = Threads / 32U - 1U;
   static constexpr unsigned kCopyThreads = kCopyWarps * 32U;
@@ -31,9 +55,9 @@ struct alignas(128) Shared {
   static constexpr unsigned kSegmentBytes = SegmentBytes;
   static constexpr unsigned kBuffers = Buffers;
 
-  alignas(128) unsigned char staging[kCopyWarps * Buffers * SegmentBytes];
+  alignas(128) unsigned char staging[kCopyWarps * kStorageSlots * SegmentBytes];
   alignas(16) CopyBarrier full[kCopyWarps];
-  alignas(16) CopyBarrier row_prefetch_full[kCopyWarps * Buffers];
+  alignas(16) CopyBarrier row_prefetch_full[kCopyWarps * kStorageSlots];
   unsigned long long dispatch_cursor;
   unsigned long long dispatch_end;
   unsigned long long return_cursor;
@@ -55,6 +79,7 @@ struct alignas(128) Shared {
   unsigned gin_rx_dispatch;
   unsigned gin_rx_return;
   unsigned gin_progressed;
+  unsigned local_dispatch_since_receive;
 };
 
 template <unsigned Threads, unsigned BarrierId = 8U>
@@ -99,8 +124,8 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     // Each slot keeps its own arrival phase across row batches. Initialize
     // once; the existing proxy fence and domain join cover both arrays.
 #pragma unroll
-    for (unsigned slot = 0U; slot < Storage::kBuffers; ++slot)
-      init(&s.row_prefetch_full[warp * Storage::kBuffers + slot], 1U);
+    for (unsigned slot = 0U; slot < Storage::kStorageSlots; ++slot)
+      init(&s.row_prefetch_full[warp * Storage::kStorageSlots + slot], 1U);
   }
   if (tid == 0U) {
     const unsigned rdma_ctas = gridDim.x - a.forward_relay_cta_count;
@@ -114,6 +139,7 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     s.gin_context_cursor = s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
     s.gin_context = s.gin_progressed = 0U;
+    s.local_dispatch_since_receive = kLocalBatchesPerGinDispatch;
     s.gin_task.channel = activation_ring_detail::kNoChannel;
     if (blockIdx.x == 0U) {
       __threadfence_system();
@@ -148,7 +174,7 @@ template <class Storage>
 __device__ __forceinline__ void copy_row(Storage &s, unsigned warp,
                                          const void *source, void *target,
                                          unsigned bytes) {
-  auto *buffer = s.staging + warp * Storage::kBuffers * Storage::kSegmentBytes;
+  auto *buffer = s.staging + warp * Storage::kStorageSlots * Storage::kSegmentBytes;
   auto &full = s.full[warp];
   constexpr unsigned kStep = Storage::kBuffers * Storage::kSegmentBytes;
   for (unsigned offset = 0U; offset < bytes; offset += kStep) {
@@ -185,7 +211,7 @@ copy_row_fanout(Storage &s, unsigned warp, const void *source, unsigned bytes,
                 unsigned fanouts, Destination destination) {
   if (fanouts == 0U)
     return;
-  auto *buffer = s.staging + warp * Storage::kBuffers * Storage::kSegmentBytes;
+  auto *buffer = s.staging + warp * Storage::kStorageSlots * Storage::kSegmentBytes;
   auto &full = s.full[warp];
   constexpr unsigned kStep = Storage::kBuffers * Storage::kSegmentBytes;
   for (unsigned offset = 0U; offset < bytes; offset += kStep) {
@@ -219,6 +245,23 @@ copy_row_fanout(Storage &s, unsigned warp, const void *source, unsigned bytes,
 }
 
 #include "cuda/persistent_v3/forward/row_prefetch_pipeline.cuh"
+
+// A lane owns a disjoint set of staging slots for the whole batch. The view
+// lets the existing prefetch pipelines retain per-lane descriptors and tickets.
+template <class Storage> struct LaneStagingView {
+  static constexpr unsigned kBuffers = Storage::kDispatchBuffers;
+  static constexpr unsigned kStorageSlots = kBuffers;
+  static constexpr unsigned kSegmentBytes = Storage::kSegmentBytes;
+  unsigned char *staging;
+  CopyBarrier *row_prefetch_full;
+
+  __device__ __forceinline__ LaneStagingView(Storage &s, unsigned warp,
+                                                unsigned lane)
+      : staging(s.staging + (warp * Storage::kStorageSlots + lane * kBuffers) *
+                                kSegmentBytes),
+        row_prefetch_full(s.row_prefetch_full + warp * Storage::kStorageSlots +
+                          lane * kBuffers) {}
+};
 
 template <bool Fence = true>
 __device__ __forceinline__ void finish_copies() {
@@ -276,23 +319,40 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
     }
     if constexpr (Optimize)
       __syncwarp();
-    if (lane == 0U) {
-      RowPrefetchPipeline<Storage,
-                          Optimize && forward_tuning::kUnifiedRowPrefetch>
-          row_pipeline(s, warp + SlotOffset);
-      for (auto item = begin + (Optimize ? 0U : warp); item < end;
-           item += Optimize ? 1U : warps) {
-        const auto route = a.dispatch_waves.local_route_order[item];
-        const auto destination = a.dispatch.route_dst_rank[route];
-        auto *target = peer_at<transport::BFloat16>(a.peer_bases[destination],
-                                                    a.canonical_rows_offset);
-        row_pipeline.copy(
-            a.input + (route / a.dispatch.identity.top_k) * a.hidden,
-            target + a.dispatch.route_dst_row[route] * a.hidden,
-            unsigned(a.hidden * sizeof(transport::BFloat16)));
+    if (lane < Storage::kDispatchLanes) {
+      if constexpr (Storage::kDispatchLanes == 1U) {
+        RowPrefetchPipeline<Storage,
+                            Optimize && forward_tuning::kUnifiedRowPrefetch>
+            row_pipeline(s, warp + SlotOffset);
+        for (auto item = begin + (Optimize ? 0U : warp); item < end;
+             item += Optimize ? 1U : warps) {
+          const auto route = a.dispatch_waves.local_route_order[item];
+          const auto destination = a.dispatch.route_dst_rank[route];
+          auto *target = peer_at<transport::BFloat16>(a.peer_bases[destination],
+                                                      a.canonical_rows_offset);
+          row_pipeline.copy(
+              a.input + (route / a.dispatch.identity.top_k) * a.hidden,
+              target + a.dispatch.route_dst_row[route] * a.hidden,
+              unsigned(a.hidden * sizeof(transport::BFloat16)));
+        }
+        row_pipeline.drain();
+      } else {
+        LaneStagingView<Storage> view(s, warp + SlotOffset, lane);
+        RowPrefetchPipeline<LaneStagingView<Storage>> row_pipeline(view, 0U);
+        for (auto item = begin + (Optimize ? lane : warp * Storage::kDispatchLanes + lane);
+             item < end; item += (Optimize ? 1U : warps) * Storage::kDispatchLanes) {
+          const auto route = a.dispatch_waves.local_route_order[item];
+          const auto destination = a.dispatch.route_dst_rank[route];
+          auto *target = peer_at<transport::BFloat16>(a.peer_bases[destination],
+                                                     a.canonical_rows_offset);
+          row_pipeline.copy(
+              a.input + (route / a.dispatch.identity.top_k) * a.hidden,
+              target + a.dispatch.route_dst_row[route] * a.hidden,
+              unsigned(a.hidden * sizeof(transport::BFloat16)));
+        }
+        row_pipeline.drain();
       }
-      row_pipeline.drain();
-      // All metadata writers fence immediately below, including this lane.
+      // Every participating issuer completes its writes before readiness.
       finish_copies<false>();
     }
     __threadfence_system();
@@ -345,7 +405,7 @@ __device__ __forceinline__ void publish_return(const Args &a, Storage &s,
   // keep the same complete partition below.
   if (count == 0U)
     return;
-  unsigned selected_peer = grouped ? s.return_queue - 1U : 0U;
+  unsigned selected_peer = grouped ? (s.return_queue - 1U) % a.local_world_size : 0U;
   if (!grouped) {
     if (tid == 0U) {
       s.return_uniform = 1U;
@@ -451,7 +511,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
         claim_limit = max(claim_limit, forward_tuning::kUnifiedReturnDrainRows);
     s.return_rows = 0U;
     const bool peer_queues = return_queue_detail::local_peer_queues(a);
-    const auto first = peer_queues ? 1U : 0U;
+    const auto first = peer_queues ? 1U + a.node * a.local_world_size : 0U;
     const auto count = peer_queues ? a.local_world_size : 1U;
     const auto preferred = (a.rank + blockIdx.x) % count;
     for (unsigned probe = 0U; probe < count; ++probe) {
@@ -740,13 +800,27 @@ run_impl(const ForwardKernelArgs &a,
     run_publisher(a, control, scheduler, s);
   } else {
     while (true) {
+      // Capture before the existing join: the leader must not update the
+      // phase at loop end while a slower warp is still deciding whether to
+      // enter the conditional Return helper's named barriers.
+      const bool local_return_eligible =
+          !UseGin || !WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH ||
+          s.dispatch_complete != 0U;
       copy_sync<Storage::kCopyThreads>();
       bool remote_progress = false;
       if constexpr (UseGin) {
         remote_progress = gin_detail::progress_receive<BaseThread>(a, s, false);
-        remote_progress =
-            gin_detail::progress_receive<BaseThread>(a, s, true) ||
-            remote_progress;
+        // A received token can fan out to several local routes. Bound its
+        // share of the copy domain without enlarging local batches or delaying
+        // Return service. Empty receives keep polling; once local work ends,
+        // every iteration can drain received Dispatch again.
+        if (s.local_dispatch_since_receive >= kLocalBatchesPerGinDispatch ||
+            s.dispatch_cursor >= s.dispatch_end) {
+          const bool received_dispatch = gin_detail::progress_receive<BaseThread>(a, s, true);
+          if (received_dispatch && tid == 0U)
+            s.local_dispatch_since_receive = 0U;
+          remote_progress = received_dispatch || remote_progress;
+        }
         if (rdma_ctas == 0U)
           remote_progress = gin_detail::progress_send<BaseThread>(a, control, s) ||
                             remote_progress;
@@ -755,9 +829,17 @@ run_impl(const ForwardKernelArgs &a,
           !UseGin || forward_tuning::kUnifiedOptimizeGinLocalTransport;
       const bool dispatched =
           progress_dispatch<BaseThread, 0U, 0U, 8U, optimize_local>(a, s);
+      // Local Return entries live in finite per-generation storage: compute
+      // producers do not need these consumers to finish Dispatch. Keep GIN
+      // Return receives above eligible on every iteration, including while
+      // received input fanout still has work to publish.
       const bool returned =
-          progress_return<BaseThread, 0U, 0U, 8U, optimize_local>(a, s);
+          local_return_eligible
+              ? progress_return<BaseThread, 0U, 0U, 8U, optimize_local>(a, s)
+              : false;
       if (tid == 0U) {
+        if (dispatched && s.local_dispatch_since_receive < kLocalBatchesPerGinDispatch)
+          ++s.local_dispatch_since_receive;
         if (!s.dispatch_complete && s.dispatch_cursor >= s.dispatch_end &&
             (!UseGin ||
              forward_dispatch_detail::ring_detail::receive_complete(a, true))) {
@@ -818,21 +900,21 @@ run_impl(const ForwardKernelArgs &a,
 // Explicit thread-count spelling makes call sites auditable while preserving
 // arbitrary segment/buffer tuning in the independent shared allocation.
 template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
-          unsigned Buffers>
+          unsigned Buffers, unsigned DispatchLanes>
 __device__ __forceinline__ void
 run(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     unsigned long long *scheduler,
-    Shared<Threads, SegmentBytes, Buffers> &storage) {
+    Shared<Threads, SegmentBytes, Buffers, DispatchLanes> &storage) {
   run_impl<false, BaseThread>(a, control, scheduler, storage);
 }
 
 template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
-          unsigned Buffers>
+          unsigned Buffers, unsigned DispatchLanes>
 __device__ __forceinline__ void
 run_gin(const ForwardKernelArgs &a,
         persistent_v3::ForwardPipelineControl &control,
         unsigned long long *scheduler,
-        Shared<Threads, SegmentBytes, Buffers> &storage) {
+        Shared<Threads, SegmentBytes, Buffers, DispatchLanes> &storage) {
   run_impl<true, BaseThread>(a, control, scheduler, storage);
 }
 

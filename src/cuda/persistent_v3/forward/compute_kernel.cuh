@@ -166,6 +166,36 @@ __device__ __forceinline__ void rebalance_registers_for_reduce() {
   cutlass::arch::NamedBarrier::sync(kThreads, kReduceRegisterAcquireBarrier);
 }
 
+// Claim a published pair from one side of the finite FC1 array. Reservation
+// tails may lead release stores, so both entries must be acquired before CAS.
+// A failed priority probe never blocks otherwise-ready local work.
+__device__ __forceinline__ bool
+claim_fc1_priority_pair(unsigned long long *queue, unsigned long long capacity,
+                        unsigned long long &head_word,
+                        unsigned long long &tail_word, bool reverse,
+                        unsigned long long &selected0,
+                        unsigned long long &selected1) {
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> head(head_word);
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> tail(tail_word);
+  auto cursor = head.load(::cuda::memory_order_relaxed);
+  if (cursor + 1ULL >= tail.load(::cuda::memory_order_relaxed))
+    return false;
+  const auto index = reverse ? capacity - cursor - 2ULL : cursor;
+  const auto encoded0 =
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(queue[index])
+          .load(::cuda::memory_order_acquire);
+  const auto encoded1 =
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(queue[index + 1ULL])
+          .load(::cuda::memory_order_acquire);
+  if (!encoded0 || !encoded1 ||
+      !head.compare_exchange_strong(cursor, cursor + 2ULL,
+                                    ::cuda::memory_order_relaxed))
+    return false;
+  selected0 = encoded0 - 1ULL;
+  selected1 = encoded1 - 1ULL;
+  return true;
+}
+
 // The locality publisher reserves even-sized queue regions. A cluster can
 // therefore claim two adjacent entries without crossing an independently
 // published group. Depending on the ordering, the pair shares either its A
@@ -198,27 +228,50 @@ try_claim_fc1_task_pair(const ForwardKernelArgs &a,
 
   auto selected0 = slot;
   auto selected1 = selected0 + 1ULL;
-  if (a.use_gin || a.forward_stream_local_dispatch) {
-    auto *ready_queue = claims + forward_mblocks;
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        published0(ready_queue[slot]);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-        published1(ready_queue[slot + 1ULL]);
-    const auto encoded0 = published0.load(::cuda::memory_order_acquire);
-    const auto encoded1 = published1.load(::cuda::memory_order_acquire);
-    if (encoded0 == 0ULL || encoded1 == 0ULL) {
+  bool priority_claimed = false;
+  if constexpr (WEFTMOE_FWD_REMOTE_FC1_PRIORITY) {
+    if (a.use_gin) {
+      auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
+          a.local_base, a.forward_v3_control_offset);
+      auto *queue = claims + forward_mblocks;
+      priority_claimed = claim_fc1_priority_pair(
+          queue, all_tasks, control->fc1_remote_head.value,
+          control->fc1_remote_tail.value, false, selected0, selected1) ||
+          claim_fc1_priority_pair(
+              queue, all_tasks, control->fc1_local_head.value,
+              control->fc1_local_tail.value, true, selected0, selected1);
+      if (!priority_claimed) {
+        exhausted = false;
+        return false;
+      }
+      // Preserve the established aggregate claim count and exhaustion check.
+      // The disjoint class cursor, not this count, owns the selected entries.
+      slot = cursor.fetch_add(2ULL, ::cuda::memory_order_relaxed);
+    }
+  }
+  if (!priority_claimed) {
+    if (a.use_gin || a.forward_stream_local_dispatch) {
+      auto *ready_queue = claims + forward_mblocks;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          published0(ready_queue[slot]);
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+          published1(ready_queue[slot + 1ULL]);
+      const auto encoded0 = published0.load(::cuda::memory_order_acquire);
+      const auto encoded1 = published1.load(::cuda::memory_order_acquire);
+      if (encoded0 == 0ULL || encoded1 == 0ULL) {
+        exhausted = false;
+        return false;
+      }
+      selected0 = encoded0 - 1ULL;
+      selected1 = encoded1 - 1ULL;
+    }
+
+    if (!cursor.compare_exchange_strong(slot, slot + 2ULL,
+                                        ::cuda::memory_order_acq_rel,
+                                        ::cuda::memory_order_relaxed)) {
       exhausted = false;
       return false;
     }
-    selected0 = encoded0 - 1ULL;
-    selected1 = encoded1 - 1ULL;
-  }
-
-  if (!cursor.compare_exchange_strong(slot, slot + 2ULL,
-                                      ::cuda::memory_order_acq_rel,
-                                      ::cuda::memory_order_relaxed)) {
-    exhausted = false;
-    return false;
   }
   task0 = selected0;
   task1 = selected1;

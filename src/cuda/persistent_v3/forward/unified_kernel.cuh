@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef WEFTMOE_FWD_DISPATCH_ISSUER_LANES
+#define WEFTMOE_FWD_DISPATCH_ISSUER_LANES 1
+#endif
+
 #include "cuda/persistent_v3/forward/unified_transport.cuh"
 
 namespace forward_unified_detail {
@@ -7,7 +11,8 @@ namespace forward_unified_detail {
 using CommunicationShared =
     forward_unified_transport::Shared<forward_tuning::kUnifiedCommThreads,
                                       forward_tuning::kUnifiedSegmentBytes,
-                                      forward_tuning::kUnifiedCopyBuffers>;
+                                      forward_tuning::kUnifiedCopyBuffers,
+                                      WEFTMOE_FWD_DISPATCH_ISSUER_LANES>;
 #endif
 
 inline constexpr std::size_t shared_bytes(unsigned world) {

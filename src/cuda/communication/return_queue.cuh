@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef WEFTMOE_FWD_GIN_LOCAL_PEER_QUEUES
+#define WEFTMOE_FWD_GIN_LOCAL_PEER_QUEUES 0
+#endif
+
 // Included after the private kernel contracts and peer-address helpers.
 namespace return_queue_detail {
 using Queue = persistent_v3::ReturnRowQueue;
@@ -14,7 +18,8 @@ __device__ __forceinline__ unsigned index(const Args &a, unsigned source) {
 }
 
 __device__ __forceinline__ bool local_peer_queues(const ForwardKernelArgs &a) {
-  return a.forward_stream_local_dispatch &&
+  return (a.forward_stream_local_dispatch ||
+          (WEFTMOE_FWD_GIN_LOCAL_PEER_QUEUES && a.use_gin)) &&
          a.forward_relay_cta_count >= a.local_world_size;
 }
 

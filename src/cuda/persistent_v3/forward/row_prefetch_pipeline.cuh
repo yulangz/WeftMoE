@@ -28,8 +28,8 @@ template <class Storage> class RowPrefetchPipeline<Storage, true> {
     // the initial fill there are no old groups, so these waits return at once.
     ::cuda::device::experimental::cp_async_bulk_wait_group_read<depth - 1U - Slot>();
     auto *buffer = storage_.staging +
-                   (warp_ * depth + Slot) * Storage::kSegmentBytes;
-    auto &full = storage_.row_prefetch_full[warp_ * depth + Slot];
+                   (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
+    auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
     ::cuda::device::experimental::cp_async_bulk_global_to_shared(
         buffer, source, bytes, full);
     tickets_[Slot] = ::cuda::device::barrier_arrive_tx(full, 1U, bytes);
@@ -40,10 +40,10 @@ template <class Storage> class RowPrefetchPipeline<Storage, true> {
   template <unsigned Slot>
   __device__ __forceinline__ void retire() {
     static_assert(Slot < depth);
-    auto &full = storage_.row_prefetch_full[warp_ * depth + Slot];
+    auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
     full.wait(static_cast<CopyBarrier::arrival_token &&>(tickets_[Slot]));
     const auto *buffer = storage_.staging +
-                         (warp_ * depth + Slot) * Storage::kSegmentBytes;
+                         (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
     ::cuda::device::experimental::cp_async_bulk_shared_to_global(
         targets_[Slot], buffer, extents_[Slot]);
     ::cuda::device::experimental::cp_async_bulk_commit_group();
@@ -140,8 +140,8 @@ class FanoutRowPrefetchPipeline {
     ::cuda::device::experimental::cp_async_bulk_wait_group_read<
         depth - 1U - Slot>();
     auto *buffer = storage_.staging +
-                   (warp_ * depth + Slot) * Storage::kSegmentBytes;
-    auto &full = storage_.row_prefetch_full[warp_ * depth + Slot];
+                   (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
+    auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
     ::cuda::device::experimental::cp_async_bulk_global_to_shared(
         buffer, source, bytes, full);
     tickets_[Slot] = ::cuda::device::barrier_arrive_tx(full, 1U, bytes);
@@ -154,10 +154,10 @@ class FanoutRowPrefetchPipeline {
   template <unsigned Slot>
   __device__ __forceinline__ void retire() {
     static_assert(Slot < depth);
-    auto &full = storage_.row_prefetch_full[warp_ * depth + Slot];
+    auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
     full.wait(static_cast<CopyBarrier::arrival_token &&>(tickets_[Slot]));
     const auto *buffer = storage_.staging +
-                         (warp_ * depth + Slot) * Storage::kSegmentBytes;
+                         (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
     for (unsigned fanout = 0U; fanout < fanouts_[Slot]; ++fanout) {
       auto *target = static_cast<char *>(
           destination_(descriptors_[Slot], fanout));

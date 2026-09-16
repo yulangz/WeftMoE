@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef WEFTMOE_FWD_REMOTE_FC1_PRIORITY
+#define WEFTMOE_FWD_REMOTE_FC1_PRIORITY 0
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include "cuda/communication/tuning_config.hpp"

@@ -405,12 +405,18 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
   return progressed;
 }
 
+#ifndef WEFTMOE_FWD_GIN_PAYLOAD_ISSUER_LANES
+#define WEFTMOE_FWD_GIN_PAYLOAD_ISSUER_LANES 1
+#endif
+
 template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ void pack_dispatch(const ForwardKernelArgs &a,
                                               Storage &s,
                                               const wire::Transfer &task) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U, lane = tid % 32U;
+  constexpr unsigned issuers = WEFTMOE_FWD_GIN_PAYLOAD_ISSUER_LANES;
+  static_assert(issuers >= 1U && issuers <= Storage::kDispatchLanes);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, DispatchPackStart,
                              GinDispatch, task.channel, task.rows,
                              execution_epoch(a));
@@ -443,9 +449,11 @@ __device__ __forceinline__ void pack_dispatch(const ForwardKernelArgs &a,
     }
   }
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
-  if (lane == 0U) {
-    RowPrefetchPipeline<Storage> row_pipeline(s, warp);
-    for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
+  if (lane < issuers) {
+    LaneStagingView<Storage> view(s, warp, lane);
+    RowPrefetchPipeline<LaneStagingView<Storage>> row_pipeline(view, 0U);
+    for (unsigned item = warp * issuers + lane; item < task.rows;
+         item += Storage::kCopyWarps * issuers) {
       auto *record = chunk + sizeof(ring::ChunkHeader) +
                      item * a.gin_rings.dispatch_row_bytes;
       const auto token = reinterpret_cast<const ring::DispatchRow *>(record)->token;
@@ -469,6 +477,8 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
                                             const wire::Transfer &task) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U, lane = tid % 32U;
+  constexpr unsigned issuers = WEFTMOE_FWD_GIN_PAYLOAD_ISSUER_LANES;
+  static_assert(issuers >= 1U && issuers <= Storage::kDispatchLanes);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ReturnPackStart, GinReturn,
                              task.channel, task.rows, execution_epoch(a));
   auto *chunk = static_cast<char *>(a.gin_window_base) +
@@ -482,9 +492,11 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
       peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const auto *output = peer_at<const transport::BFloat16>(
       a.local_base, a.forward_output_rows_offset);
-  if (lane == 0U) {
-    RowPrefetchPipeline<Storage> row_pipeline(s, warp);
-    for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
+  if (lane < issuers) {
+    LaneStagingView<Storage> view(s, warp, lane);
+    RowPrefetchPipeline<LaneStagingView<Storage>> row_pipeline(view, 0U);
+    for (unsigned item = warp * issuers + lane; item < task.rows;
+         item += Storage::kCopyWarps * issuers) {
       const unsigned row = entries[task.first + item];
       auto *record = chunk + sizeof(ring::ChunkHeader) +
                      item * a.gin_rings.return_row_bytes;
@@ -589,7 +601,7 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                       task.first * a.gin_rings.dispatch_row_bytes;
   const auto source = wire::peer(a, task.channel);
   const unsigned items = task.rows * a.dispatch.identity.top_k;
-  if (lane == 0U) {
+  if (lane < Storage::kDispatchLanes) {
     auto destination = [&a](const char *record, unsigned index) -> void * {
       const auto target =
           reinterpret_cast<const ForwardDispatchFanoutRecord *>(
@@ -599,9 +611,12 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
       return peer_at<transport::BFloat16>(base, a.canonical_rows_offset) +
              target.dst_row * a.hidden;
     };
-    FanoutRowPrefetchPipeline<Storage, const char *, decltype(destination)>
-        row_pipeline(s, warp, destination);
-    for (unsigned row = warp; row < task.rows; row += Storage::kCopyWarps) {
+    LaneStagingView<Storage> view(s, warp, lane);
+    FanoutRowPrefetchPipeline<LaneStagingView<Storage>, const char *,
+                             decltype(destination)>
+        row_pipeline(view, 0U, destination);
+    for (unsigned row = warp * Storage::kDispatchLanes + lane; row < task.rows;
+         row += Storage::kCopyWarps * Storage::kDispatchLanes) {
       const auto *record = chunk + row * a.gin_rings.dispatch_row_bytes;
       const auto header = *reinterpret_cast<const ring::DispatchRow *>(record);
       const unsigned fanouts =
@@ -673,6 +688,8 @@ __device__ __forceinline__ void receive_return(const ForwardKernelArgs &a,
                                                const wire::Transfer &task) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U, lane = tid % 32U;
+  constexpr unsigned issuers = WEFTMOE_FWD_GIN_PAYLOAD_ISSUER_LANES;
+  static_assert(issuers >= 1U && issuers <= Storage::kDispatchLanes);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, SourceRelayStart,
                              SourceRelay, task.channel, task.rows,
                              execution_epoch(a));
@@ -681,9 +698,11 @@ __device__ __forceinline__ void receive_return(const ForwardKernelArgs &a,
                       sizeof(ring::ChunkHeader);
   auto *output =
       peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
-  if (lane == 0U) {
-    RowPrefetchPipeline<Storage> row_pipeline(s, warp);
-    for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
+  if (lane < issuers) {
+    LaneStagingView<Storage> view(s, warp, lane);
+    RowPrefetchPipeline<LaneStagingView<Storage>> row_pipeline(view, 0U);
+    for (unsigned item = warp * issuers + lane; item < task.rows;
+         item += Storage::kCopyWarps * issuers) {
       const auto *record = chunk + item * a.gin_rings.return_row_bytes;
       const auto route =
           reinterpret_cast<const ring::ReturnRow *>(record)->route;

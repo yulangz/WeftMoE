@@ -122,6 +122,14 @@ struct alignas(128) ForwardPipelineControl {
   PaddedCounter rdma_return_roles_complete;
   PaddedCounter return_receive_roles_complete;
   PaddedCounter source_ready_published;
+  // Two finite FC1 queues share the original task array, growing inward from
+  // opposite ends. A group belongs to exactly one queue, so total capacity is
+  // unchanged. Independent cursors preserve pair reservations in each class.
+  PaddedCounter fc1_remote_tail;
+  PaddedCounter fc1_local_tail;
+  PaddedCounter fc1_remote_head;
+  PaddedCounter fc1_local_head;
+
   // A route publisher increments one source-token counter after making its
   // contribution visible.  The publisher that completes top-k appends that
   // token to the ready queue.  Compute CTAs consume the queue in small batches

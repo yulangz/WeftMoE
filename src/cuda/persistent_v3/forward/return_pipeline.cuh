@@ -80,7 +80,8 @@ local_return_terminal(const ForwardKernelArgs &a,
                       const LocalReturnState &state) {
   if (return_queue_detail::local_peer_queues(a)) {
     for (unsigned peer = 0; peer < a.local_world_size; ++peer) {
-      auto &queue = return_queue_detail::queues(a)[1U + peer];
+      auto &queue = return_queue_detail::queues(a)[
+          1U + a.node * a.local_world_size + peer];
       if (persistent_v3::load_acquire<::cuda::thread_scope_device>(
               queue.head) != queue.capacity)
         return false;
@@ -112,7 +113,8 @@ progress_local_return(const ForwardKernelArgs &a,
       if (return_queue_detail::local_peer_queues(a)) {
         const auto preferred = (a.rank + blockIdx.x) % a.local_world_size;
         for (unsigned probe = 0; probe < a.local_world_size; ++probe) {
-          state.queue_index = 1U + (preferred + probe) % a.local_world_size;
+          state.queue_index = 1U + a.node * a.local_world_size +
+                              (preferred + probe) % a.local_world_size;
           state.cursor =
               claim_rows(return_queue_detail::queues(a)[state.queue_index],
                          a.forward_local_return_batch_rows, state.selected);
@@ -198,7 +200,8 @@ progress_local_return(const ForwardKernelArgs &a,
   };
   if (state.queue_index) {
     local_notification_detail::publish_peer_return(
-        a, state.queue_index - 1U, state.selected, threads, fill, UINT32_MAX);
+        a, (state.queue_index - 1U) % a.local_world_size, state.selected, threads,
+        fill, UINT32_MAX);
   } else
     local_notification_detail::publish_return(a, state.selected, threads, fill);
   unsigned int peer_rows = 0U;
