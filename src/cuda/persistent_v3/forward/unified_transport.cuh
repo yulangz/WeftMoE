@@ -451,7 +451,9 @@ __device__ __forceinline__ void publish_return(const Args &a, Storage &s,
                                         .sent;
       }
       copy_sync<threads, BarrierId>();
-      if (s.return_rows == 0U)
+      const unsigned peer_rows = s.return_rows;
+      copy_sync<threads, BarrierId>();
+      if (peer_rows == 0U)
         continue;
       if (peer == local) {
         for (unsigned i = begin + tid; i < end; i += threads) {
@@ -545,6 +547,9 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
   }
   copy_sync<threads, BarrierId>();
   const unsigned rows = s.return_rows;
+  // Every copy warp must capture this result before an empty poll can return
+  // and let the leader overwrite the shared descriptor on its next poll.
+  copy_sync<threads, BarrierId>();
   if (!rows)
     return false;
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, LocalReturnBatchStart,

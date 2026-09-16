@@ -226,7 +226,9 @@ __device__ __forceinline__ bool progress_receive(const BackwardKernelArgs &a,
     wire::claim_receive(a, dispatch ? s.gin_rx_dispatch : s.gin_rx_return,
                         s.gin_task, dispatch);
   copy_sync<Storage::kCopyThreads>();
-  if (s.gin_task.channel == wire::kNoChannel)
+  const bool received = s.gin_task.channel != wire::kNoChannel;
+  copy_sync<Storage::kCopyThreads>();
+  if (!received)
     return false;
   if (dispatch)
     receive_dispatch<BaseThread>(a, s, s.gin_task);
