@@ -11,7 +11,9 @@
     "allocation_included": false,
     "phase_statistic": "median of slowest-rank samples",
     "payload": "EP8 actual NVLink peer payload; EP16 deduplicated RDMA payload; exclude metadata and self copies",
-    "all_targets_achieved": false
+    "all_targets_achieved": false,
+    "passed_phase_cases": 7,
+    "total_phase_cases": 8
   },
   "environment": {
     "clock_MHz": 1620,
@@ -1912,6 +1914,219 @@
           "repeat_check": true
         }
       ]
+    },
+    {
+      "name": "recovery_local_warp_groups",
+      "build_key": "a5dba1b9ee414d30c3076d54d58d3ad7b2d4980f31b7d497e99b2786843003f1",
+      "configuration": "results/communication_spsc_20260916/recovery_local_warp_groups/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 958.1600000000001,
+            "fc2": 182.99200000000002,
+            "return": 3089.665,
+            "reduce": 2486.05,
+            "forward": 4261.200000000001,
+            "wall": 5658.1900000000005
+          },
+          "payload_GBps": {
+            "nv_dispatch": 245.13758036236115,
+            "nv_return": 38.01075909524172,
+            "rdma_dispatch": 35.01965433748017,
+            "rdma_return": 43.44086753741911
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_gin_outlined",
+      "build_key": "bc72dcf0c082371129e1a95fd614cb0bfaf13f3df82dcde44a15743fc1d630aa",
+      "configuration": "results/communication_spsc_20260916/recovery_gin_outlined/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 964.56,
+            "fc2": 127.19999999999999,
+            "return": 3101.855,
+            "reduce": 2489.135,
+            "forward": 4292.045,
+            "wall": 5805.755
+          },
+          "payload_GBps": {
+            "nv_dispatch": 243.51105581819692,
+            "nv_return": 37.861380367554254,
+            "rdma_dispatch": 34.787293688313845,
+            "rdma_return": 43.27014899149058
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_four_copy_warps",
+      "build_key": "fe91f28954a6c904bbfc20bc796a40e686344c6ec739bafe21cb84340abacbfb",
+      "configuration": "results/communication_spsc_20260916/recovery_four_copy_warps/tuning.hpp",
+      "results": [
+        {
+          "name": "ep8_t8192",
+          "payload_bytes_per_rank": 469762048,
+          "timing_us": {
+            "dispatch": 781.84,
+            "fc2": 160.11200000000002,
+            "return": 818.2719999999999,
+            "reduce": 420.512,
+            "forward": 1734.365,
+            "wall": 2583.955
+          },
+          "payload_GBps": {
+            "nv_dispatch": 300.4208329069886,
+            "nv_return": 287.04516835477693
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 949.6320000000001,
+            "fc2": 166.192,
+            "return": 3094.9300000000003,
+            "reduce": 2531.52,
+            "forward": 4249.65,
+            "wall": 5665.725
+          },
+          "payload_GBps": {
+            "nv_dispatch": 247.3389944736487,
+            "nv_return": 37.94609635759128,
+            "rdma_dispatch": 35.334142067664104,
+            "rdma_return": 43.36696726581861
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_release_fence",
+      "build_key": "8ef5af1850233126c5cc3fdb27da8aec9cc06f9931427d7b4f4cf933544bffa4",
+      "configuration": "results/communication_spsc_20260916/recovery_release_fence/tuning.hpp",
+      "results": [
+        {
+          "name": "ep8_t8192",
+          "payload_bytes_per_rank": 469762048,
+          "timing_us": {
+            "dispatch": 785.008,
+            "fc2": 83.184,
+            "return": 816.5920000000001,
+            "reduce": 417.456,
+            "forward": 1719.585,
+            "wall": 2595.2650000000003
+          },
+          "payload_GBps": {
+            "nv_dispatch": 299.20844628334993,
+            "nv_return": 287.6357152653956
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        },
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 956.24,
+            "fc2": 126.576,
+            "return": 3095.955,
+            "reduce": 2485.295,
+            "forward": 4263.76,
+            "wall": 5724.709999999999
+          },
+          "payload_GBps": {
+            "nv_dispatch": 245.6297833179955,
+            "nv_return": 37.93353327163993,
+            "rdma_dispatch": 35.08996904542793,
+            "rdma_return": 43.352609453302776
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
+    },
+    {
+      "name": "recovery_availability",
+      "build_key": "263b01d0ab087027dd356f0e69f41d030e8b16a07dae76fd6938d54b3fa4a1e0",
+      "configuration": "results/communication_spsc_20260916/recovery_availability/tuning.hpp",
+      "results": [
+        {
+          "name": "ep16_t8192",
+          "payload_bytes_per_rank": 167772160,
+          "timing_us": {
+            "dispatch": 959.888,
+            "fc2": 125.47200000000001,
+            "return": 3099.62,
+            "reduce": 2500.43,
+            "forward": 4269.905,
+            "wall": 5682.3
+          },
+          "payload_GBps": {
+            "nv_dispatch": 244.6962812328105,
+            "nv_return": 37.88868054793814,
+            "rdma_dispatch": 34.95661160468721,
+            "rdma_return": 43.30134919764358
+          },
+          "shape": {
+            "experts": 256,
+            "hidden": 2048,
+            "intermediate": 512,
+            "tokens_per_rank": 8192,
+            "top_k": 8
+          },
+          "repeat_check": true
+        }
+      ]
     }
   ],
   "validation": {
@@ -1979,6 +2194,11 @@
       "name": "Strong versus weak credit signal",
       "path": "/usr/include/nccl_device/gin/gdaki/gin_gdaki.h",
       "finding": "Installed GDAKI ignores the strong/weak distinction in ncclGinApi_Put; switching credit action cannot remove a hidden flush here. No action-type change made."
+    },
+    {
+      "name": "Raw GIN with matching 64-row packet size",
+      "path": "results/communication_recovery_20260916/raw_matching64/analysis.json",
+      "finding": "279568-byte PUTs x 128: 8 contexts 775.872 us / 43.247 useful GB/s; 16 contexts 787.584 us / 42.604 useful GB/s. Excludes packing, receiver fanout and per-generation setup; diagnostic, not phase acceptance."
     }
   ],
   "profiles": {
@@ -1998,7 +2218,12 @@
     "recovery_overlap_rx32": "Larger received subtask regressed 8K; 64K unchanged.",
     "recovery_receive_prefetch": "Publisher preclaim mailbox regressed EP16 8K Dispatch from 963 to 1013 us; reverted.",
     "recovery_all_local_dynamic": "Dynamic local claims did not fix EP8 8K regression with 128-row batches (221 GB/s); reverted.",
-    "recovery_coop_prefetch_wide": "Doubling staging requires reducing FC1 stages and did not improve 8K Dispatch; not retained."
+    "recovery_coop_prefetch_wide": "Doubling staging requires reducing FC1 stages and did not improve 8K Dispatch; not retained.",
+    "recovery_local_warp_groups": "Independent local warp publication gained only 0.3% on 8K Dispatch; keep the tested common checkpoint.",
+    "recovery_gin_outlined": "Outlining GIN put and credit calls did not reduce Dispatch time (964.6 vs 961.3 us); reverted.",
+    "recovery_four_copy_warps": "Four copy warps gained 1.2% on EP16 8K but require 512 CTA threads and a reduced math-register quota; EP8 unchanged. Not selected without a compelling communication gain.",
+    "recovery_release_fence": "Release rather than seq_cst system fences gained only 0.5% on EP16 8K and did not improve EP8; retain the fully validated checkpoint.",
+    "recovery_availability": "Checking Return availability before NIC credits gained only 0.15% on Dispatch; no meaningful benefit, reverted."
   },
   "validation_checkpoints": {
     "recovery_release_once": {
@@ -2035,5 +2260,101 @@
       },
       "qwen_buffer_modes": "dynamic/static, skew and six FWD+BWD graph replays passed"
     }
-  }
+  },
+  "raw_gin_diagnostics": [
+    {
+      "name": "contexts8_bytes279568_totalputs128",
+      "contexts": 8,
+      "payload_bytes": 279568,
+      "total_puts": 8,
+      "backend_types": [
+        3
+      ],
+      "railed_backend_types": [
+        3
+      ],
+      "median_slowest_rank_us": 69.744,
+      "wire_GBps": 32.06790548290893,
+      "all_rank_payloads_match": true,
+      "useful_GBps": 30.069281945400324
+    },
+    {
+      "name": "contexts8_bytes279568_totalputs128",
+      "contexts": 8,
+      "payload_bytes": 279568,
+      "total_puts": 128,
+      "backend_types": [
+        3
+      ],
+      "railed_backend_types": [
+        3
+      ],
+      "median_slowest_rank_us": 775.872,
+      "wire_GBps": 46.12191701723996,
+      "all_rank_payloads_match": true,
+      "useful_GBps": 43.24738101130083
+    },
+    {
+      "name": "contexts16_bytes279568_totalputs128",
+      "contexts": 16,
+      "payload_bytes": 279568,
+      "total_puts": 16,
+      "backend_types": [
+        3
+      ],
+      "railed_backend_types": [
+        3
+      ],
+      "median_slowest_rank_us": 116.576,
+      "wire_GBps": 38.37057370299204,
+      "all_rank_payloads_match": true,
+      "useful_GBps": 35.97913807301674
+    },
+    {
+      "name": "contexts16_bytes279568_totalputs128",
+      "contexts": 16,
+      "payload_bytes": 279568,
+      "total_puts": 128,
+      "backend_types": [
+        3
+      ],
+      "railed_backend_types": [
+        3
+      ],
+      "median_slowest_rank_us": 787.584,
+      "wire_GBps": 45.43604745652527,
+      "all_rank_payloads_match": true,
+      "useful_GBps": 42.604258085486755
+    }
+  ],
+  "confirmations": [
+    {
+      "name": "ep16_t65536",
+      "payload_bytes_per_rank": 1342177280,
+      "timing_us": {
+        "dispatch": 6630.035,
+        "fc2": 2226.815,
+        "return": 23317.75,
+        "reduce": 21033.1,
+        "forward": 29902.0,
+        "wall": 31673.5
+      },
+      "payload_GBps": {
+        "nv_dispatch": 283.41452073782415,
+        "nv_return": 40.2922278521727,
+        "rdma_dispatch": 40.487788676832025,
+        "rdma_return": 46.04826040248309
+      },
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 65536,
+        "top_k": 8
+      },
+      "repeat_check": true,
+      "same_build_as": "recovery_dispatch_single_fence",
+      "golden_files_byte_identical": 64
+    }
+  ]
 }
