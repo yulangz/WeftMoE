@@ -10125,6 +10125,87 @@
         }
       ],
       "finding": "Qwen EP16 8K at requested1620MHz: baseline D32.9165/R42.3103GB/s,GPU4385.790us;controller affinity D32.6812/R42.2628,GPU4389.695;bootstrap32 D33.5212/R42.1909,GPU4382.940. Controller affinity has no gain. Bootstrap improves Dispatch1.84% but total GPU only0.065%;no adoption or full/BWD/64K sweep.128 sparse paired files exact over12 native repeated checks;8K20round performance cases checkFalse. CPU bootstrap cursor proof9234 scheduling cases retained separately. Both nodes clocks restored."
+    },
+    {
+      "name": "Publisher-prefetched Dispatch receive mailbox",
+      "adopted": false,
+      "source": "/tmp/weftmoe-dispatch-rx-mailbox",
+      "source_commit": "f55cc73",
+      "raw_results": "results/communication_bottleneck_20260915/dispatch_rx_mailbox_screen",
+      "protocol_review": "results/communication_bottleneck_20260915/dispatch_rx_mailbox_screen/protocol_review.json",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cpu_validation": {
+        "cases": 1000,
+        "all_tasks_consumed_once": true,
+        "terminal_observed_while_producer_busy": 6689,
+        "terminal_observed_with_queued_data": 147,
+        "scope": "Random interleavings of task claims, mailbox publication and delayed consumption. Does not model CUDA memory ordering or TMA completion."
+      },
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1024.32,
+              "fc2": 136.8,
+              "return": 3181.075,
+              "reduce": 2381.71,
+              "forward": 4406.975,
+              "wall": 5869.995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.3043423930022,
+              "nv_return": 36.91849830639014,
+              "rdma_dispatch": 32.757763199000316,
+              "rdma_return": 42.192569493017295
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "dispatch_rx_mailbox2_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.f906dc13e9e4286f4d97295d1b6f74ad9e29f1cb4788043225caac1a798f63e7/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1064.88,
+              "fc2": 142.208,
+              "return": 3176.925,
+              "reduce": 2463.745,
+              "forward": 4445.215,
+              "wall": 5839.555
+            },
+            "payload_GBps": {
+              "nv_dispatch": 220.57041544587182,
+              "nv_return": 36.96672474169204,
+              "rdma_dispatch": 31.51005934941026,
+              "rdma_return": 42.24768541907662
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Move up to2 receive probes to publisher each iteration and hand one prefetched task to copy domain through CTA acquire/release mailbox;original packet lifetime/full TMA completion retained,producer-closed handshake prevents early completion with prefetched work. Qwen EP16 8K candidate Dispatch31.5101/Return42.2477GB/s,GPU4445.215us:regresses Dispatch against paired baseline;reject without full/BWD/64K tests.64 sparse paired files exact over12 native repeated checks.1000 CPU random interleaving scenarios passed;pure registers168 unchanged,stack104->120bytes. Both nodes clocks restored."
     }
   ],
   "diagnostics": [
