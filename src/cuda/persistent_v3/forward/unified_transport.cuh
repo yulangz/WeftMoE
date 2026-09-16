@@ -905,7 +905,7 @@ run_impl(const ForwardKernelArgs &a,
     copy_sync<Storage::kCopyThreads>();
     if (tid == 0U) {
       if constexpr (UseGin)
-        activation_ring_detail::gin_for_cta(a, blockIdx.x).flush(ncclCoopThread{});
+        activation_ring_detail::flush_receive(a);
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                      ->return_complete_clock,
                 device_globaltimer_ns());

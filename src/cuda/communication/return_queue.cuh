@@ -37,6 +37,12 @@ __device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
 template <class Args>
 __device__ __forceinline__ bool ready_block(const Args &a, const Queue &q,
                                            unsigned long long begin, unsigned rows) {
+  if (rows && ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+          entries(a)[q.begin + begin]).load(::cuda::memory_order_relaxed) == UINT32_MAX)
+    return false;
+  if (rows > 1U && ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+          entries(a)[q.begin + begin + rows - 1U]).load(::cuda::memory_order_relaxed) == UINT32_MAX)
+    return false;
   bool ready = true;
 #pragma unroll 4
   for (unsigned i = 0; i < rows; ++i)

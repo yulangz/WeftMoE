@@ -55,6 +55,25 @@ __device__ __forceinline__ ncclGin gin_for_cta(const Args &a, unsigned cta) {
   return ncclGin(a.gin_dev_comm, context_for_cta(a, cta), sharing);
 }
 
+// Only receiver-owned channels issue standalone credits. Join their actual
+// peer queues once at shutdown; unused FULL connections need no flush.
+template <class Args>
+__device__ __forceinline__ void flush_receive(const Args &a) {
+  const auto gin = gin_for_cta(a, blockIdx.x);
+  const unsigned worker = blockIdx.x - a.gin_receiver_base;
+  for (unsigned channel = worker; channel < a.gin_rings.channels();
+       channel += a.gin_receiver_count) {
+    const auto target = peer(a, channel);
+    bool seen = false;
+    for (unsigned earlier = worker; earlier < channel; earlier += a.gin_receiver_count)
+      seen |= peer(a, earlier) == target;
+    if (seen) continue;
+    ncclGinRequest_t request;
+    gin.flushAsync(ncclTeamWorld(gin.comm), target, &request);
+    gin.wait(request);
+  }
+}
+
 template <class Args>
 __device__ __forceinline__ unsigned owner(const Args &a, unsigned channel) {
   if (a.gin_sender_count) return channel % a.gin_sender_count;

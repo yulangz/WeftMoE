@@ -290,7 +290,7 @@ run(const BackwardKernelArgs &a,
     forward_unified_transport::copy_sync<Storage::kCopyThreads>();
     if (tid == 0U) {
       if constexpr (UseGin)
-        activation_ring_detail::gin_for_cta(a, blockIdx.x).flush(ncclCoopThread{});
+        activation_ring_detail::flush_receive(a);
       ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.copies_done)
           .store(1U, ::cuda::memory_order_release);
     }

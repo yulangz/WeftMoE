@@ -270,7 +270,8 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         occupied += phase != 0U;
       }
       if (occupied == 0U && drained(a, context)) {
-        flush_context(a, context);
+        // Per-slot local counters and remote credits already prove that every
+        // payload put is complete. This submitter issues no standalone ACKs.
         on_complete(context, state);
         ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.done)
             .store(1U, ::cuda::memory_order_release);
