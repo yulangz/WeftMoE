@@ -302,6 +302,9 @@ __device__ __forceinline__ void publish_return_rows(const BackwardKernelArgs &a,
         pending = UINT32_MAX;
       }
       copy_sync<threads>();
+      if (tid == 0U)
+        return_queue_detail::publish_ready(a, queue, s.queue_base, s.queue_rows);
+      copy_sync<threads>();
     }
   }
 }

@@ -106,11 +106,13 @@ struct ForwardInputPendingQueue {
 // Producers reserve disjoint positions and release-publish each row separately.
 // Unified consumers own disjoint fixed-size stripes. head only counts claimed
 // local rows; the legacy consumer uses it as a nonblocking reservation cursor.
+inline constexpr unsigned kReturnReadyBlockRows = 32U;
 struct alignas(128) ReturnRowQueue {
   unsigned long long reserved = 0;
   unsigned long long head = 0;
   unsigned long long begin = 0;
   unsigned long long capacity = 0;
+  unsigned long long ready_begin = 0;
 };
 
 struct alignas(128) ForwardPipelineControl {

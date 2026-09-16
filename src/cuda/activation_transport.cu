@@ -1600,15 +1600,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   if (!resources.dev_comm_created) {
     ncclDevCommRequirements_t requirements =
         NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    // Each RDMA owner retains its Dispatch context and owns two adjacent
-    // Return contexts. Balancing payload bytes across the pair avoids receive
-    // port imbalance with one context per target on bonded links.
+    // Allocate a private pool for this devComm. Static CTA/channel ownership
+    // is independent of this host allocation policy; when the backend returns
+    // fewer contexts, device-side GPU sharing arbitrates concurrent issuers.
     requirements.ginContextCount = allocated_context_count;
-    // Legacy RDMA CTAs own exclusive contexts. Unified communication warps
-    // share contexts through short leases and perform payload packing outside
-    // the lease, so their contexts must support ownership transfer.
-    requirements.ginExclusiveContexts =
-        !(forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers);
+    requirements.ginExclusiveContexts = true;
     requirements.ginQueueDepth = 1024;
     // Legacy transport diagnostics use signals 0/1; production terminal status
     // uses signal 2. Ring readiness and credits use window-addressed signals.

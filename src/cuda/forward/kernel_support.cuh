@@ -1001,8 +1001,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
         "forward reduce ready token queue");
     layout.forward_return_rows = append(
-        cursor, config.max_destination_rows_per_rank, sizeof(std::uint32_t),
-        "forward return row queues");
+        cursor, checked_add(config.max_destination_rows_per_rank,
+            checked_add(config.max_destination_rows_per_rank /
+                            persistent_v3::kReturnReadyBlockRows,
+                        1ULL + config.max_world_size, "return ready blocks"),
+            "return rows and ready blocks"),
+        sizeof(std::uint32_t), "forward return row queues");
     layout.local_notification_ctas = std::max(
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
             persistent_v3::kRdmaCtaCount,

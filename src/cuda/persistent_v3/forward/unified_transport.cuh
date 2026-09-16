@@ -63,8 +63,6 @@ struct alignas(128) Shared {
   unsigned long long return_cursor;
   unsigned long long notification_sequence;
   unsigned return_queue;
-  unsigned return_peer_cursor;
-  unsigned long long return_positions[communication::kLocalPeers];
   unsigned return_rows;
   unsigned return_uniform;
   unsigned return_peer;
@@ -136,13 +134,7 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.pack_mailbox = s.pack_observed = 0U;
     // local_route_order places local routes before remote ones.
     s.dispatch_end = forward_dispatch_detail::local_route_prefix(a);
-    s.return_queue = s.return_peer_cursor = 0U;
-    const unsigned workers = a.forward_relay_cta_count;
-    const unsigned rotation = (workers + a.local_world_size - 1U) / a.local_world_size;
-    const unsigned stripe_rows = max(a.forward_local_return_batch_rows,
-                                     forward_tuning::kUnifiedReturnDrainRows);
-    for (unsigned peer = 0; peer < communication::kLocalPeers; ++peer)
-      s.return_positions[peer] = 1ULL * ((relay + peer * rotation) % workers) * stripe_rows;
+    s.return_queue = 0U;
     s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     s.gin_context_cursor = s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
@@ -513,36 +505,35 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U, lane = tid % 32U;
   if (tid == 0U) {
-    // Each CTA owns one stripe of every local peer queue. The queue head is
-    // only an aggregate consumed-row count, never a shared reservation cursor.
+    // A nonblocking work claim does not lock a GIN context or an NVLink
+    // channel. Wire queues retain their single producer and consumer.
+    // Independent direction domains never read each other's live cursor.
+    // A shared copy domain can enlarge Return only after its Dispatch ends.
+    unsigned claim_limit = a.forward_local_return_batch_rows;
+    if constexpr (Optimize && !IndependentDispatch)
+      if (s.dispatch_cursor >= s.dispatch_end)
+        claim_limit = max(claim_limit, forward_tuning::kUnifiedReturnDrainRows);
     s.return_rows = 0U;
     const bool peer_queues = return_queue_detail::local_peer_queues(a);
     const auto first = peer_queues ? 1U + a.node * a.local_world_size : 0U;
     const auto count = peer_queues ? a.local_world_size : 1U;
+    const auto preferred = (a.rank + blockIdx.x) % count;
     for (unsigned probe = 0U; probe < count; ++probe) {
-      const unsigned peer = s.return_peer_cursor++ % count;
-      auto &q = return_queue_detail::queues(a)[first + peer];
-      const auto position = s.return_positions[peer];
-      if (position >= q.capacity) continue;
-      const unsigned stripe_rows = max(a.forward_local_return_batch_rows,
-                                       forward_tuning::kUnifiedReturnDrainRows);
-      const auto extent = unsigned(min(q.capacity - position,
-                                       stripe_rows - position % stripe_rows));
-      unsigned rows = extent;
-      if (!return_queue_detail::ready_block(a, q, position, rows))
-        rows = return_queue_detail::ready_rows(a, q, position,
-                   min(extent, a.forward_local_return_batch_rows));
-      if (!rows) continue;
-      s.return_queue = first + peer;
-      s.return_cursor = position;
-      s.return_rows = rows;
-      auto next = position + rows;
-      if (next % stripe_rows == 0U)
-        next += 1ULL * (a.forward_relay_cta_count - 1U) * stripe_rows;
-      s.return_positions[peer] = next;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(q.head)
-          .fetch_add(rows, ::cuda::memory_order_release);
-      break;
+      s.return_queue = first + (preferred + probe) % count;
+      s.return_cursor = forward_return_detail::claim_rows(
+          a, return_queue_detail::queues(a)[s.return_queue],
+          claim_limit, s.return_rows);
+      if (s.return_rows)
+        break;
+      // Match the established peer affinity: while the preferred finite
+      // queue is still producing, an empty poll or a lost CAS should not
+      // send every CTA into the other peers' queues. Once its exact capacity
+      // has been claimed, these workers may steal remaining peer work.
+      if (Optimize && peer_queues && probe == 0U &&
+          persistent_v3::load_acquire<::cuda::thread_scope_device>(
+              return_queue_detail::queues(a)[s.return_queue].head) !=
+              return_queue_detail::queues(a)[s.return_queue].capacity)
+        break;
     }
   }
   copy_sync<threads, BarrierId>();
