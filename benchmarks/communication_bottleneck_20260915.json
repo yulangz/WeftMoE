@@ -10488,6 +10488,110 @@
         }
       ],
       "finding": "Qwen EP16 8K at requested1620MHz:baseline D32.7685/R42.2564GB/s,GPU4395.520us,wall5813.520;empty Return poll interval4 D33.2464/R42.4117,GPU4392.370,wall5850.000. Dispatch improves1.46% but whole GPU0.072% and wall regresses;retain experiment only,not adopted. Polls remain at most4 loop iterations apart during Dispatch,become eager on successful receive,and unconditional after own Dispatch completion. Existing NIC/TMA/ready/credit semantics unchanged.64 sparse paired files exact over12 native repetitions;no full/BWD/64K expansion. Both node clock cleanup rc0."
+    },
+    {
+      "name": "Reduce GEMM shared-memory reservation to enlarge L1 capacity",
+      "adopted": false,
+      "source_commit": "0fd0d45",
+      "raw_results": "results/communication_bottleneck_20260915/reduced_smem_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1022.37,
+              "fc2": 139.184,
+              "return": 3177.3900000000003,
+              "reduce": 2429.565,
+              "forward": 4405.04,
+              "wall": 5925.8099999999995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.74170212349736,
+              "nv_return": 36.96131478981176,
+              "rdma_dispatch": 32.82024316049962,
+              "rdma_return": 42.241502616927725
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "reduced_smem_fc1s3_claim2_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.48ab4e18eddfbb74eacc6c4cbf18cbed234849127557089db0a5f82636d6a334/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1023.8900000000001,
+              "fc2": 134.43200000000002,
+              "return": 3175.0550000000003,
+              "reduce": 2420.19,
+              "forward": 4401.84,
+              "wall": 5899.52
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.40064264715934,
+              "nv_return": 36.98849689217981,
+              "rdma_dispatch": 32.77152037816562,
+              "rdma_return": 42.27256787677693
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "reduced_smem_fc1s2_claim1_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.6d474dbf3e892c5365960ceab7bd6f04c6a49cd4fb5de956d7d7d7d0f7189cd6/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.36,
+              "fc2": 135.92000000000002,
+              "return": 3175.6949999999997,
+              "reduce": 2457.55,
+              "forward": 4391.425,
+              "wall": 5826.620000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.96888854076917,
+              "nv_return": 36.981042574932424,
+              "rdma_dispatch": 32.85269836296702,
+              "rdma_return": 42.26404865706562
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "carveout_profile": "results/communication_bottleneck_20260915/reduced_smem_carveout_profile/analysis.json",
+      "finding": "Qwen EP16 8K,current same2x2 communication lanes:FC1stages3/FC2claim2 D32.7715/R42.2726GB/s,GPU4401.840us;FC1stages2/FC2claim1 D32.8527/R42.2640,GPU4391.425. No useful throughput gain versus matched baseline.128 sparse files exact over12 repeats. Both useFC2stages2;only existing GEMM staging/claim hyperparameters differ,communication staging and132CTAs unchanged. Nsight Systems confirms lower variant actually executes with132KiB shared-memory carveout on all8localGPUs,versus228KiB in earlier balanced2x2 profile;it is not just a smaller unused reservation with unchanged partition. Profile lower variant has1024static+131584dynamic shared bytes,REG168,grid132,block384. Separate profile passed20native repeat checks,clock cleanup rc0;profiled rates excluded. No full/BWD/64K expansion since pure communication does not improve. Larger L1 alone does not resolve this bottleneck under these configurations.",
+      "references": [
+        "https://docs.nvidia.com/cuda/hopper-tuning-guide/"
+      ]
     }
   ],
   "diagnostics": [
