@@ -1,0 +1,382 @@
+{
+  "implementation_commit": "360a6dc",
+  "implementation_identical_to": "1af6b79",
+  "baseline_reference": "0fd0d45",
+  "baseline_adopted_commit": "284ac26",
+  "clock_mhz": 1620,
+  "pure_communication": [
+    {
+      "ep": 8,
+      "tokens_per_rank": 8192,
+      "baseline": {
+        "timing_us": {
+          "dispatch": 870.528,
+          "fc2": 254.192,
+          "return": 816.7840000000001,
+          "reduce": 429.23199999999997,
+          "forward": 1789.76,
+          "wall": 2678.815
+        },
+        "payload_GBps": {
+          "nv_dispatch": 269.81443905308043,
+          "nv_return": 287.56810123606726
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 8192,
+          "top_k": 8
+        }
+      },
+      "candidate": {
+        "timing_us": {
+          "dispatch": 896.784,
+          "fc2": 85.21600000000001,
+          "return": 820.384,
+          "reduce": 437.10400000000004,
+          "forward": 1821.245,
+          "wall": 2684.69
+        },
+        "payload_GBps": {
+          "nv_dispatch": 261.91482452853757,
+          "nv_return": 286.30619807309745
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 8192,
+          "top_k": 8
+        }
+      }
+    },
+    {
+      "ep": 8,
+      "tokens_per_rank": 65536,
+      "baseline": {
+        "timing_us": {
+          "dispatch": 6670.975,
+          "fc2": 2158.3999999999996,
+          "return": 5768.255,
+          "reduce": 4510.495,
+          "forward": 13230.8,
+          "wall": 14441.8
+        },
+        "payload_GBps": {
+          "nv_dispatch": 281.67519620445285,
+          "nv_return": 325.7567829438886
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 65536,
+          "top_k": 8
+        }
+      },
+      "candidate": {
+        "timing_us": {
+          "dispatch": 6909.295,
+          "fc2": 1152.925,
+          "return": 5770.8,
+          "reduce": 5212.495,
+          "forward": 13329.35,
+          "wall": 14589.55
+        },
+        "payload_GBps": {
+          "nv_dispatch": 271.959467934138,
+          "nv_return": 325.61311984473554
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 65536,
+          "top_k": 8
+        }
+      }
+    },
+    {
+      "ep": 16,
+      "tokens_per_rank": 8192,
+      "baseline": {
+        "timing_us": {
+          "dispatch": 1022.45,
+          "fc2": 137.2,
+          "return": 3170.7200000000003,
+          "reduce": 2522.9449999999997,
+          "forward": 4389.76,
+          "wall": 5794.215
+        },
+        "payload_GBps": {
+          "nv_dispatch": 229.72372634358646,
+          "nv_return": 37.03906746732603,
+          "rdma_dispatch": 32.81767519194092,
+          "rdma_return": 42.33036281980118
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 8192,
+          "top_k": 8
+        }
+      },
+      "candidate": {
+        "timing_us": {
+          "dispatch": 1141.245,
+          "fc2": 124.73599999999999,
+          "return": 3165.3599999999997,
+          "reduce": 2485.135,
+          "forward": 4430.255,
+          "wall": 5820.305
+        },
+        "payload_GBps": {
+          "nv_dispatch": 205.8112184500261,
+          "nv_return": 37.10178684257084,
+          "rdma_dispatch": 29.401602635718014,
+          "rdma_return": 42.40204210579524
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 8192,
+          "top_k": 8
+        }
+      }
+    },
+    {
+      "ep": 16,
+      "tokens_per_rank": 65536,
+      "baseline": {
+        "timing_us": {
+          "dispatch": 6676.335,
+          "fc2": 2368.755,
+          "return": 23241.05,
+          "reduce": 20636.05,
+          "forward": 29979.5,
+          "wall": 31854.0
+        },
+        "payload_GBps": {
+          "nv_dispatch": 281.449057304644,
+          "nv_return": 40.42520006626207,
+          "rdma_dispatch": 40.207008186377706,
+          "rdma_return": 46.20022864715665
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 65536,
+          "top_k": 8
+        }
+      },
+      "candidate": {
+        "timing_us": {
+          "dispatch": 7687.555,
+          "fc2": 2235.87,
+          "return": 23503.25,
+          "reduce": 20832.45,
+          "forward": 30983.949999999997,
+          "wall": 32836.3
+        },
+        "payload_GBps": {
+          "nv_dispatch": 244.42728435764036,
+          "nv_return": 39.9742204163254,
+          "rdma_dispatch": 34.918183479662915,
+          "rdma_return": 45.68482333294331
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 65536,
+          "top_k": 8
+        }
+      }
+    }
+  ],
+  "full_qwen_ep16_8192": {
+    "baseline": {
+      "timing_us": {
+        "dispatch": 1154.065,
+        "fc2": 1879.2350000000001,
+        "return": 3655.7799999999997,
+        "reduce": 2591.2,
+        "forward": 5035.135,
+        "wall": 6578.275
+      },
+      "payload_GBps": {
+        "nv_dispatch": 203.5249522340596,
+        "nv_return": 32.12461143723091,
+        "rdma_dispatch": 29.074993176294228,
+        "rdma_return": 36.71384164254961
+      },
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    },
+    "candidate": {
+      "timing_us": {
+        "dispatch": 1367.8400000000001,
+        "fc2": 2041.3449999999998,
+        "return": 4501.965,
+        "reduce": 2880.11,
+        "forward": 5372.16,
+        "wall": 6774.43
+      },
+      "payload_GBps": {
+        "nv_dispatch": 171.71673879985963,
+        "nv_return": 26.086500450358898,
+        "rdma_dispatch": 24.53096268569423,
+        "rdma_return": 29.81314337183874
+      },
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    }
+  },
+  "protocol": {
+    "dispatch_channels_per_remote_node": 64,
+    "return_streams_per_remote_peer": 2,
+    "chunk_rows": 64,
+    "ring_depth": 8,
+    "contexts": "request max(legacy floor, 1 + SM count); use actual returned count",
+    "sharing": "GPU"
+  },
+  "validation": {
+    "qwen": {
+      "backward": {
+        "byte_identical": true,
+        "files": 160
+      },
+      "forward_batch": {
+        "cross_ep_byte_identical": true,
+        "batch_prefix_byte_identical": true,
+        "ranks": 8
+      },
+      "buffer_modes": "dynamic/static, skew, 6 Graph replays; all gradients bitwise checked"
+    },
+    "flash": {
+      "backward": {
+        "byte_identical": true,
+        "files": 160
+      },
+      "forward_batch": {
+        "cross_ep_byte_identical": true,
+        "batch_prefix_byte_identical": true,
+        "ranks": 8
+      }
+    }
+  },
+  "builds": {
+    "spsc_qwen_final": {
+      "backend": "python-content-addressed-jit",
+      "cache_hit": false,
+      "binary_preexisted": false,
+      "host_cache_hit": false,
+      "cache_key": "02729452b3bb13f1d038a0008b07e58f3d3305bfe2cb32422b4e01e6866d03c0",
+      "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.02729452b3bb13f1d038a0008b07e58f3d3305bfe2cb32422b4e01e6866d03c0",
+      "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.02729452b3bb13f1d038a0008b07e58f3d3305bfe2cb32422b4e01e6866d03c0/test_cuda_notify",
+      "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.02729452b3bb13f1d038a0008b07e58f3d3305bfe2cb32422b4e01e6866d03c0/generated/weftmoe_forward_tuning_generated.hpp",
+      "elapsed_seconds": 117.83235262706876,
+      "returncode": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_spsc_20260916/spsc_qwen_final/build.log",
+      "toolchain": {
+        "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+        "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+        "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+        "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+        "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+        "architecture": "sm_90a"
+      }
+    },
+    "spsc_pure_final": {
+      "backend": "python-content-addressed-jit",
+      "cache_hit": false,
+      "binary_preexisted": false,
+      "host_cache_hit": true,
+      "cache_key": "5a53edfc798188c864ee447cc47490eddf030393269efb13cd529c0d052facb1",
+      "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5a53edfc798188c864ee447cc47490eddf030393269efb13cd529c0d052facb1",
+      "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5a53edfc798188c864ee447cc47490eddf030393269efb13cd529c0d052facb1/test_cuda_notify",
+      "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.5a53edfc798188c864ee447cc47490eddf030393269efb13cd529c0d052facb1/generated/weftmoe_forward_tuning_generated.hpp",
+      "elapsed_seconds": 94.9009948503226,
+      "returncode": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_spsc_20260916/spsc_pure_final/build.log",
+      "toolchain": {
+        "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+        "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+        "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+        "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+        "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+        "architecture": "sm_90a"
+      }
+    },
+    "spsc_flash_final": {
+      "backend": "python-content-addressed-jit",
+      "cache_hit": false,
+      "binary_preexisted": false,
+      "host_cache_hit": true,
+      "cache_key": "b25c71560d9f7f9da28e8ccb704123f045918d3a50811038e4672ba74d723b1b",
+      "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.b25c71560d9f7f9da28e8ccb704123f045918d3a50811038e4672ba74d723b1b",
+      "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.b25c71560d9f7f9da28e8ccb704123f045918d3a50811038e4672ba74d723b1b/test_cuda_notify",
+      "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.b25c71560d9f7f9da28e8ccb704123f045918d3a50811038e4672ba74d723b1b/generated/weftmoe_forward_tuning_generated.hpp",
+      "elapsed_seconds": 139.97435974143445,
+      "returncode": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_spsc_20260916/spsc_flash_final/build.log",
+      "toolchain": {
+        "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+        "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+        "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+        "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+        "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+        "architecture": "sm_90a"
+      }
+    }
+  },
+  "observed_busy_clock_samples": {
+    "spsc_pure_final/measurement/remote_clocks.csv": {
+      "1620": 14
+    },
+    "spsc_pure_final/measurement/local_clocks.csv": {
+      "1620": 8
+    },
+    "stable_final_check/measurement/remote_clocks.csv": {
+      "1620": 15
+    },
+    "stable_final_check/measurement/local_clocks.csv": {
+      "1620": 39
+    },
+    "spsc_bitmap_pure/measurement_64k/remote_clocks.csv": {
+      "1620": 17
+    },
+    "spsc_bitmap_pure/measurement_64k/local_clocks.csv": {
+      "1620": 40
+    },
+    "spsc_qwen_final/full_8k_measurement/remote_clocks.csv": {
+      "1620": 11
+    },
+    "spsc_qwen_final/full_8k_measurement/local_clocks.csv": {
+      "1620": 4
+    }
+  },
+  "artifacts": "results/communication_spsc_20260916",
+  "notes": [
+    "Kernel time excludes allocations; wall time includes fixed tensors, copies, notify and execution. One-time pools and GIN setup excluded.",
+    "Pure transport build uses WEFTMOE_BENCH_TRANSPORT_ONLY=1; this is not a full GEMM benchmark.",
+    "No new Flex benchmark in this change. EP32 GPU validation not run.",
+    "Bitmap experiment 235484c timed out in EP8/8K and was reverted in 360a6dc. Final results use the restored release-store publication, not the bitmap.",
+    "Extended EP8 8K stability: 128 repetitions with diagnostics and 128 with normal settings; EP8 64K 32 diagnostic + 14 normal, EP16 64K 24 diagnostic + 14 normal.",
+    "Native BWD reference uses E32 and 129 tokens/rank; Qwen H2048/I512/K8 and Flash H4096/I2048/K6."
+  ]
+}
