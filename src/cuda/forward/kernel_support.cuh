@@ -1018,10 +1018,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         transport_error(NotifyErrorCode::BackendUnavailable,
                         "transport-pool-query", "SM count", 0,
                         "available CUDA device", "device query failed");
-      layout.forward_return_ready = append(
-        cursor, config.max_destination_rows_per_rank, sizeof(std::uint64_t),
-        "independent Return entry readiness");
-    layout.local_notification_ctas = std::max(
+      layout.local_notification_ctas = std::max(
           layout.local_notification_ctas, static_cast<unsigned>(sms));
       layout.forward_unified_gin_state = append(
           cursor, layout.local_notification_ctas, forward_tuning::kUnifiedGinStateBytes,

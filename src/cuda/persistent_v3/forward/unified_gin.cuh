@@ -32,8 +32,8 @@ __device__ __forceinline__ void send_packed(const Args &a,
                                                : a.gin_rings.return_row_bytes);
   const auto gin = wire::gin_for_cta(a, blockIdx.x);
   const unsigned slot = task.sequence % ring::kRingDepth;
-  // The packed release can originate from another CTA. All packer lanes have
-  // completed TMA stores and system fences before the device release/acquire.
+  // The CTA's packers completed all TMA stores and system fences before
+  // publishing this immutable task to their submitter.
   gin.put(
       ncclTeamWorld(gin.comm), wire::peer(a, task.channel), a.gin_window,
       a.gin_rings.payload(wire::remote_channel(a, task.channel), task.sequence,
@@ -162,9 +162,8 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
     if constexpr (SameChannel) {
       bool terminal_reserved = false;
       unsigned channel_reservations = 0U;
-      // The context lease excludes reservation/submission mutations. Packers
-      // may change pending 1->2, but each nonempty task is immutable and stays
-      // occupied until this lease owner submits its exact sequence.
+      // The sole submitter owns reservations. Packers may publish pending
+      // 1->2, but descriptors stay immutable until their ordered submission.
 #pragma unroll
       for (unsigned slot = 0; slot < forward_tuning::kUnifiedGinPackSlots;
            ++slot) {
@@ -204,7 +203,8 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
                             ? min(1ULL * ring::kChunkRows,
                                   wire_state.tx_end - reserved_cursor)
                             : 0ULL;
-      task = wire::Transfer{channel, unsigned(rows), rows == 0ULL,
+      task = wire::Transfer{channel, unsigned(rows),
+                            reserved_cursor + 1ULL * ring::kDispatchChannels * ring::kChunkRows >= wire_state.tx_end,
                             sequence, reserved_cursor};
     } else {
       auto &queue = return_queue_detail::queues(a)[1U + wire::peer(a, channel)];
@@ -214,7 +214,9 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
           ? unsigned(min(queue.capacity - position, 1ULL * ring::kChunkRows)) : 0U;
       if (return_queue_detail::ready_rows(a, queue, position, rows) != rows)
         continue;
-      task = wire::Transfer{channel, rows, rows == 0U, sequence, queue.begin + position};
+      task = wire::Transfer{channel, rows,
+          position + 1ULL * ring::kReturnPorts * ring::kChunkRows >= queue.capacity,
+          sequence, queue.begin + position};
     }
     return true;
   }

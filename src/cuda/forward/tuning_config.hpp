@@ -208,7 +208,7 @@ inline constexpr unsigned unified_rdma_ctas(unsigned total, bool use_gin) {
 }
 
 inline constexpr unsigned kUnifiedGinPackSlots = WEFTMOE_UNIFIED_GIN_PACK_SLOTS;
-// A context has 40 bytes of queue/lease state and each packing slot has a
+// A sender has 40 bytes of private progress state and each packing slot has a
 // 40-byte handoff. Round the allocation to the device structure's alignment.
 inline constexpr unsigned kUnifiedGinStateBytes =
     ((40U + 40U * kUnifiedGinPackSlots + 127U) / 128U) * 128U;

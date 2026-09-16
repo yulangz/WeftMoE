@@ -59,7 +59,7 @@ template <class Args>
 __device__ __forceinline__ unsigned owner(const Args &a, unsigned channel) {
   if (a.gin_sender_count) return channel % a.gin_sender_count;
   return channel < a.gin_rings.dispatch_channels
-             ? channel % ring::kDispatchChannels
+             ? (channel % ring::kDispatchChannels) % a.gin_context_count
              : peer(a, channel) % a.local_world_size;
 }
 
@@ -68,7 +68,7 @@ __device__ __forceinline__ unsigned data_context(const Args &a,
                                                  unsigned channel) {
   if (a.gin_sender_count) return context_for_cta(a, owner(a, channel));
   if (channel < a.gin_rings.dispatch_channels)
-    return channel % ring::kDispatchChannels;
+    return (channel % ring::kDispatchChannels) % a.gin_context_count;
   const auto logical =
       (peer(a, channel) % a.local_world_size + a.rank) % a.gin_context_count;
   return a.gin_context_count + ring::kReturnPorts * logical +
@@ -222,8 +222,13 @@ __device__ __forceinline__ bool choose_dispatch(const Args &a, unsigned context,
                                                 Transfer &task) {
   const auto nodes = a.dispatch.identity.num_nodes - 1U;
   auto *states = ring::channels(a.gin_window_base, a.gin_rings);
-  for (unsigned probe = 0; probe < nodes; ++probe) {
-    const auto channel = (cursor++ % nodes) * ring::kDispatchChannels + context;
+  const unsigned per_node = context < ring::kDispatchChannels
+      ? 1U + (ring::kDispatchChannels - 1U - context) / a.gin_context_count : 0U;
+  const unsigned count = nodes * per_node;
+  for (unsigned probe = 0; probe < count; ++probe) {
+    const auto index = cursor++ % count;
+    const auto channel = (index / per_node) * ring::kDispatchChannels +
+                         context + (index % per_node) * a.gin_context_count;
     auto &state = states[channel];
     const ncclGin gin(a.gin_dev_comm, context);
     if (state.tx_terminal ||

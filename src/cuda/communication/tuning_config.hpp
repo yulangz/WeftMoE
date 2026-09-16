@@ -25,3 +25,9 @@
 static_assert(WEFTMOE_GIN_RING_DEPTH == 4 || WEFTMOE_GIN_RING_DEPTH == 8 ||
                   WEFTMOE_GIN_RING_DEPTH == 16,
               "GIN physical ring depth must be 4, 8 or 16");
+
+#ifndef WEFTMOE_GIN_DISPATCH_CHANNELS
+#define WEFTMOE_GIN_DISPATCH_CHANNELS 32
+#endif
+static_assert(WEFTMOE_GIN_DISPATCH_CHANNELS > 0,
+              "GIN Dispatch channels must be positive");

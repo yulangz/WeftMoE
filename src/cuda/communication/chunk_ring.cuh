@@ -11,7 +11,7 @@ namespace weftmoe::cuda::communication {
 
 inline constexpr unsigned kChunkRows = 128;
 inline constexpr unsigned kRingDepth = WEFTMOE_GIN_RING_DEPTH;
-inline constexpr unsigned kDispatchChannels = 8;
+inline constexpr unsigned kDispatchChannels = WEFTMOE_GIN_DISPATCH_CHANNELS;
 inline constexpr unsigned kReturnPorts = 2;
 
 // A credit releases exactly one slot. Independent consumers may finish in
@@ -21,8 +21,6 @@ struct alignas(64) ChunkSlot {
   std::uint64_t credit_signal;
   unsigned long long consumed;
   unsigned long long acknowledged;
-  // Forward sub-batches share one immutable received payload. Reuses padding.
-  unsigned dispatch_parts_remaining;
   std::uint64_t local_target; // This slot only, on its current sender context.
 };
 
@@ -37,14 +35,10 @@ struct alignas(128) ChunkChannel {
   // sequence counters, this bitmap survives operation prepare and Graph
   // replay. New windows are zeroed once; successful drain consumes every bit.
   unsigned long long consumed_slots;
-  unsigned dispatch_claim_lock;
-  unsigned dispatch_row_cursor;
   ChunkSlot slots[kRingDepth];
 };
 static_assert(kRingDepth <= 64U);
 static_assert(sizeof(ChunkSlot) == 64U);
-static_assert(offsetof(ChunkSlot, dispatch_parts_remaining) == 32U);
-static_assert(offsetof(ChunkChannel, dispatch_claim_lock) == 48U);
 static_assert(offsetof(ChunkChannel, consumed_slots) == 40U);
 static_assert(offsetof(ChunkChannel, slots) == 64U);
 static_assert(sizeof(ChunkChannel) == 128U + kRingDepth * sizeof(ChunkSlot));

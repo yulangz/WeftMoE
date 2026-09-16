@@ -9,7 +9,6 @@ struct GinPendingSlot {
 static_assert(sizeof(GinPendingSlot) == 40U);
 
 struct alignas(128) GinSenderState {
-  unsigned reserved;
   unsigned done;
   unsigned dispatch_cursor;
   unsigned return_cursor;
