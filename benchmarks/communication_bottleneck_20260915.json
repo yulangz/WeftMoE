@@ -9144,6 +9144,121 @@
       ],
       "protocol": "First copy warp checks up to32 channel heads/signals in parallel, in bounded groups for larger topologies. Lane0 rechecks and exclusively claims an elected channel using the original ring::claim; stale hints only cause retries. Original proxy fence, task publication barriers and credits unchanged.",
       "finding": "Qwen EP16 8K Dispatch32.728->32.411GB/s,Return41.171->41.140. No gain;64 sparse files exact over12 repetitions. Do not adopt or expand full/64K/BWD tests."
+    },
+    {
+      "name": "Smaller receive partitions and parallel GIN payload issuers",
+      "source": "/tmp/weftmoe-parallel-gin-payload-issuers",
+      "source_commit": "0fd0d45",
+      "receive16_source": "/tmp/weftmoe-pipelined-balanced-dispatch",
+      "receive16_source_commit": "5c45d42",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/gin_parallel_and_rx16_screen",
+      "cases": [
+        {
+          "name": "balanced_dispatch_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1023.005,
+              "fc2": 141.696,
+              "return": 3248.96,
+              "reduce": 2473.885,
+              "forward": 4477.585,
+              "wall": 5908.735000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.59909677860813,
+              "nv_return": 36.147109228799366,
+              "rdma_dispatch": 32.79987096837259,
+              "rdma_return": 41.31098197577071
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "balanced_receive16_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1010.62,
+              "fc2": 139.872,
+              "return": 3245.935,
+              "reduce": 2441.6,
+              "forward": 4483.280000000001,
+              "wall": 5951.43
+            },
+            "payload_GBps": {
+              "nv_dispatch": 232.41280006332744,
+              "nv_return": 36.18079598020293,
+              "rdma_dispatch": 33.20182858047536,
+              "rdma_return": 41.34948112023193
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.79,
+              "fc2": 135.264,
+              "return": 3180.48,
+              "reduce": 2425.12,
+              "forward": 4411.86,
+              "wall": 5908.6849999999995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.87211070767967,
+              "nv_return": 36.925404970318944,
+              "rdma_dispatch": 32.83887295823995,
+              "rdma_return": 42.20046282322165
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "clock_cleanup": [
+        {
+          "node": "local",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        },
+        {
+          "node": "remote",
+          "rc": 0,
+          "stdout": "All done.\n",
+          "stderr": ""
+        }
+      ],
+      "protocol": "RX16 case halves receive rows32->16 and local service quota4->2, preserving payload service ratio. Parallel GIN case uses two issuers per copy warp for Dispatch packing, Return packing and Return reception through existing disjoint two-slot lane views. No additional SMEM, threads, barriers, wire bytes or relaxed completion;rows/cursor ordering and all SYS fences retained.",
+      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Forward/Flash confirmation next,not adopted."
     }
   ],
   "diagnostics": [
