@@ -9258,7 +9258,7 @@
         }
       ],
       "protocol": "RX16 case halves receive rows32->16 and local service quota4->2, preserving payload service ratio. Parallel GIN case uses two issuers per copy warp for Dispatch packing, Return packing and Return reception through existing disjoint two-slot lane views. No additional SMEM, threads, barriers, wire bytes or relaxed completion;rows/cursor ordering and all SYS fences retained.",
-      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Qwen8K Forward5081.840->5034.910us (-0.92%),wall6561.755->6465.975us.192 golden files exact at129/8K with20 native repetitions. This does not prove incremental full improvement over the prior balanced candidate (~4985us in another pair). Flash pure screen next;BWD/new64K unvalidated,not adopted.",
+      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Qwen8K Forward5081.840->5034.910us (-0.92%),wall6561.755->6465.975us.192 golden files exact at129/8K with20 native repetitions. This does not prove incremental full improvement over the prior balanced candidate (~4985us in another pair). Flash pure screen next;BWD/new64K unvalidated,not adopted. Follow-up: parallel GIN Qwen EP16 t129 BWD passed with160 golden files exact including dW. Flash sparse128files exact;8K RX32/quota3 D36.971/R42.969GB/s, RX128/quota12 D34.007/R43.369. New64K and full Flash unvalidated;not adopted.",
       "full_confirmation": {
         "raw_results": "results/communication_bottleneck_20260915/parallel_gin_payload_lanes2_training",
         "cases": [
@@ -9343,6 +9343,39 @@
             "stderr": ""
           }
         ]
+      },
+      "backward_validation": {
+        "all_byte_identical": true,
+        "files_compared": 160,
+        "includes": [
+          "dx",
+          "dw1",
+          "dw2",
+          "dgate"
+        ],
+        "world": 16,
+        "tokens": 129,
+        "experts": 32,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "native_repeat_enabled": true,
+        "golden": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/gemm_optimization_20260914/validation/backward/qwen_ep16/tensors",
+        "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.fa9137fb16c17498b3b48a5abd73a2d400eb8eb15c7af31863f677b9f9b1b881/test_cuda_notify"
+      },
+      "flash_screen": {
+        "raw_results": "results/communication_bottleneck_20260915/parallel_gin_flash_screen",
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12,
+          "hidden": 4096,
+          "intermediate": 2048,
+          "top_k": 6
+        },
+        "finding": "Flash EP16 8K baseline D32.331/R41.547 GB/s; RX32/quota3 D36.971/R42.969, GPU7137.49->6668.80us and wall8617.72->8117.49us. RX128/quota12 D34.007/R43.369, GPU6828.14us. Pure only; not full GEMM results. All clocks restored. RX32/quota3 preferred for next Flash validation."
       }
     }
   ],
