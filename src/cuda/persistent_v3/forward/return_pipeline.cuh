@@ -52,8 +52,8 @@ claim_rows(const ForwardKernelArgs &a, RowQueue &queue, unsigned int limit,
 
 // Called by all math threads after the last FC2 N-tile acquires every store.
 // The dead GEMM operand storage supplies a few prefix words. Reserve/fill/
-// confirm each queue before touching the next, so producers cannot form a
-// cyclic wait between queues. CAS confirms exactly this producer's interval.
+// publish each entry independently. No producer waits for another producer's
+// earlier reservation, including when they publish to different queues.
 template <unsigned int MathThreads>
 __device__ __noinline__ void
 publish_rows(const ForwardKernelArgs &a, unsigned long long row,

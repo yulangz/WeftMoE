@@ -1593,6 +1593,8 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   unsigned allocated_context_count = std::max(3U * kGinContextCount,
       (forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers)
           ? 1U + unsigned(context_sms) : 0U);
+  if constexpr (WEFTMOE_GIN_CONTEXT_COUNT > 0)
+    allocated_context_count = WEFTMOE_GIN_CONTEXT_COUNT;
   backend->gin_context_count = kGinContextCount;
   backend->gin_allocated_context_count = allocated_context_count;
   if (!resources.dev_comm_created) {
@@ -1624,9 +1626,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         session.session().generation(), ExchangeKind::ExpertCounts,
         "ncclDevCommCreate(activation GIN)");
     resources.dev_comm_created = true;
-    if (resources.dev_comm.ginContextCount < int(3U * kGinContextCount))
+    if (resources.dev_comm.ginContextCount < 1 ||
+        (!(forward_tuning::kUnifiedWorkers && backward_tuning::kUnifiedWorkers) &&
+         resources.dev_comm.ginContextCount < int(3U * kGinContextCount)))
       transport_error(NotifyErrorCode::BackendUnavailable, "gin-create",
-                      "actual GIN contexts", nccl->rank, "at least 24 for legacy control paths",
+                      "actual GIN contexts", nccl->rank, "positive count; legacy worker layouts require at least 24",
                       std::to_string(resources.dev_comm.ginContextCount));
     allocated_context_count = unsigned(resources.dev_comm.ginContextCount);
     backend->gin_allocated_context_count = allocated_context_count;

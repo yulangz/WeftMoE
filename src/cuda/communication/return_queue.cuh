@@ -23,10 +23,11 @@ template <class Args>
 __device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
                                               unsigned long long begin, unsigned limit) {
   unsigned count = 0;
+  const auto epoch = execution_epoch(a);
   while (count < limit && begin + count < q.capacity) {
     if (::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
             ready_entries(a)[q.begin + begin + count])
-            .load(::cuda::memory_order_acquire) != execution_epoch(a)) break;
+            .load(::cuda::memory_order_acquire) != epoch) break;
     ++count;
   }
   return count;

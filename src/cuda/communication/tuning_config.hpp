@@ -37,3 +37,8 @@ static_assert(WEFTMOE_GIN_DISPATCH_CHANNELS > 0,
 #endif
 static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
               "GIN packets must contain 1 to 128 rows");
+
+#ifndef WEFTMOE_GIN_CONTEXT_COUNT
+#define WEFTMOE_GIN_CONTEXT_COUNT 0
+#endif
+static_assert(WEFTMOE_GIN_CONTEXT_COUNT >= 0, "GIN context count must be nonnegative");

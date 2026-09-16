@@ -103,12 +103,11 @@ struct ForwardInputPendingQueue {
   }
 };
 
-// Each producer reserves, fills and confirms one interval before reserving
-// another. Consumers claim only confirmed entries. Storage is reset between
-// executions; no ring wrap, per-entry epoch or descriptor scan is required.
+// Producers reserve disjoint positions and release-publish each row separately.
+// Unified consumers own disjoint fixed-size stripes. head only counts claimed
+// local rows; the legacy consumer uses it as a nonblocking reservation cursor.
 struct alignas(128) ReturnRowQueue {
   unsigned long long reserved = 0;
-  unsigned long long confirmed = 0;
   unsigned long long head = 0;
   unsigned long long begin = 0;
   unsigned long long capacity = 0;
