@@ -11112,6 +11112,20 @@
       "dropped_samples": 0,
       "kernel_samples": 4325442,
       "finding": "Continuous non-replay sampling completed and exported successfully after fixing example sampler host-buffer synchronization and buffer-identity tracking. Initial sample timed out during host shutdown with GPU idle; partial sample preserved separately. Complete file includes both Dispatch and Return, math polling/reduction and communication. Do not attribute whole-kernel stall percentages to communication or elapsed time. Lineinfo correlation is the next diagnostic; sampling performance is diagnostic only. No production code changed."
+    },
+    {
+      "name": "PC sampling source correlation using instruction-identical lineinfo rebuild",
+      "source_commit": "0fd0d45",
+      "build": "results/communication_bottleneck_20260915/pc_lineinfo_lanes2_qwen_pure/build.json",
+      "analysis": "results/communication_bottleneck_20260915/continuous_pc_sampling_v2/correlation.json",
+      "sass_instruction_count": 50992,
+      "sass_instruction_text_and_offsets_identical": true,
+      "profiling_rerun": false,
+      "finding": "Mapped 1,079,772 samples to the inlined communication call site; both phases/all invocations combined, not elapsed phase shares. Top sites include Return receive claim broadcast barrier (116766 samples), local notification head/ready polling (76694/75860), Dispatch receive claim broadcast barrier (28202) and terminal check (13630), local Dispatch pre-join system-SC fence (21560), received Dispatch release publication (9940). The large 0xb6cc0/0xb6d90/0xb6b10 loop maps to Reduce, and0x82510 to test synthetic producer barrier; exclude those from communication attribution. Original complete sampler has0dropped samples. Next causal screens: reuse signal acquisition across packet subparts; independently remove local Dispatch pre-join system-SC fence while preserving full TMA completion, producer join and system-release arrival RMW.",
+      "references": [
+        "https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html",
+        "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"
+      ]
     }
   ]
 }
