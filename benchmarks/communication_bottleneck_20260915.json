@@ -9258,7 +9258,92 @@
         }
       ],
       "protocol": "RX16 case halves receive rows32->16 and local service quota4->2, preserving payload service ratio. Parallel GIN case uses two issuers per copy warp for Dispatch packing, Return packing and Return reception through existing disjoint two-slot lane views. No additional SMEM, threads, barriers, wire bytes or relaxed completion;rows/cursor ordering and all SYS fences retained.",
-      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Forward/Flash confirmation next,not adopted."
+      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Qwen8K Forward5081.840->5034.910us (-0.92%),wall6561.755->6465.975us.192 golden files exact at129/8K with20 native repetitions. This does not prove incremental full improvement over the prior balanced candidate (~4985us in another pair). Flash pure screen next;BWD/new64K unvalidated,not adopted.",
+      "full_confirmation": {
+        "raw_results": "results/communication_bottleneck_20260915/parallel_gin_payload_lanes2_training",
+        "cases": [
+          {
+            "name": "targeted_flush_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1479.44,
+                "fc2": 2191.23,
+                "return": 4227.295,
+                "reduce": 2625.23,
+                "forward": 5081.84,
+                "wall": 6561.755
+              },
+              "payload_GBps": {
+                "nv_dispatch": 158.76346725788136,
+                "nv_return": 27.781480119083245,
+                "rdma_dispatch": 22.680495322554478,
+                "rdma_return": 31.750262993237993
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          },
+          {
+            "name": "parallel_gin_payload_lanes2_ep16_8192",
+            "returncode": 0,
+            "summary": {
+              "timing_us": {
+                "dispatch": 1109.0549999999998,
+                "fc2": 1911.0900000000001,
+                "return": 3729.295,
+                "reduce": 2538.96,
+                "forward": 5034.91,
+                "wall": 6465.975
+              },
+              "payload_GBps": {
+                "nv_dispatch": 211.7848294268544,
+                "nv_return": 31.49134407441621,
+                "rdma_dispatch": 30.254975632407774,
+                "rdma_return": 35.990107513618526
+              },
+              "shape": {
+                "experts": 256,
+                "hidden": 2048,
+                "intermediate": 512,
+                "tokens_per_rank": 8192,
+                "top_k": 8
+              }
+            }
+          }
+        ],
+        "validation": [
+          {
+            "all_byte_identical": true,
+            "files_compared": 64,
+            "repetitions": 20
+          },
+          {
+            "all_byte_identical": true,
+            "files_compared": 128,
+            "repetitions": 20
+          }
+        ],
+        "clock_cleanup": [
+          {
+            "node": "local",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          },
+          {
+            "node": "remote",
+            "rc": 0,
+            "stdout": "All done.\n",
+            "stderr": ""
+          }
+        ]
+      }
     }
   ],
   "diagnostics": [
