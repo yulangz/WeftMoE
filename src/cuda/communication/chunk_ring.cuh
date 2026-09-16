@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "cuda/communication/sequence.hpp"
+#include "cuda/communication/row_ready.hpp"
 #include <cuda/atomic>
 #include "cuda/communication/tuning_config.hpp"
 #include "cuda/communication/nccl_device_assert_trap.cuh"

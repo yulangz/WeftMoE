@@ -22,6 +22,7 @@ PARAMETER_MACROS = {
     "unified_return_drain_rows": "WEFTMOE_UNIFIED_RETURN_DRAIN_ROWS",
     "unified_split_nvlink": "WEFTMOE_UNIFIED_SPLIT_NVLINK",
     "unified_rdma_ctas": "WEFTMOE_UNIFIED_RDMA_CTAS",
+    # Accepted for old profiles; static channel ownership no longer probes leases.
     "unified_gin_context_probes": "WEFTMOE_UNIFIED_GIN_CONTEXT_PROBES",
     "unified_gin_pack_slots": "WEFTMOE_UNIFIED_GIN_PACK_SLOTS",
     "wgmma_n256_atom_n": "WEFTMOE_WGMMA_N256_ATOM_N",

@@ -15,10 +15,37 @@ class CompletionSequenceTest(unittest.TestCase):
             self.skipTest('C++ compiler unavailable')
         program = r'''
 #include "cuda/communication/sequence.hpp"
+#include "cuda/communication/row_ready.hpp"
 #include <cassert>
 #include <cstdint>
 using weftmoe::cuda::communication::reached;
+using weftmoe::cuda::communication::row_ready_mask;
+using weftmoe::cuda::communication::row_ready_prefix;
 int main() {
+  for (unsigned first = 0; first < 32; ++first)
+    for (unsigned count = 0; count <= 32 - first; ++count) {
+      std::uint32_t expected = 0;
+      for (unsigned i = first; i < first + count; ++i) expected |= 1U << i;
+      assert(row_ready_mask(first, count) == expected);
+    }
+  for (std::uint32_t bits = 0; bits < 65536; ++bits)
+    for (unsigned upper = 0; upper < 2; ++upper) {
+      auto word = bits | (upper ? 0xffff0000U : 0U);
+      for (unsigned first = 0; first < 32; ++first) {
+        unsigned expected = 0;
+        while (first + expected < 32 && (word & (1U << (first + expected))))
+          ++expected;
+        for (unsigned limit = 0; limit <= 32 - first; ++limit)
+          assert(row_ready_prefix(word, first, limit) ==
+                 (expected < limit ? expected : limit));
+      }
+    }
+  auto ready = row_ready_mask(12, 20); // C finishes first; A/B still missing.
+  assert(row_ready_prefix(ready, 0, 32) == 0);
+  ready |= row_ready_mask(0, 5);
+  assert(row_ready_prefix(ready, 0, 32) == 5);
+  ready |= row_ready_mask(5, 7);
+  assert(row_ready_prefix(ready, 0, 32) == 32);
   // Exhaust all representable values in a small ring, including the boundary.
   for (unsigned base = 0; base < 256; ++base) {
     for (unsigned n = 1; n < 128; ++n) {
