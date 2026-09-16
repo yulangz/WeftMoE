@@ -72,6 +72,7 @@ struct alignas(128) Shared {
   unsigned pack_mailbox; // 0: available, 1: immutable task ready, 2: stop.
   unsigned pack_observed; // Copy-domain broadcast; never written by control.
 
+  GinSenderState gin_sender_state;
   activation_ring_detail::Transfer gin_task;
   unsigned gin_context_cursor;
   unsigned gin_context;
@@ -132,6 +133,7 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     const unsigned relay = blockIdx.x >= rdma_ctas ? blockIdx.x - rdma_ctas : 0U;
     s.dispatch_cursor = 1ULL * relay * a.forward_dispatch_publish_batch_rows;
     s.pack_mailbox = s.pack_observed = 0U;
+    s.gin_sender_state = GinSenderState{};
     // local_route_order places local routes before remote ones.
     s.dispatch_end = forward_dispatch_detail::local_route_prefix(a);
     s.return_queue = 0U;
@@ -728,17 +730,14 @@ run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
         unsigned context = 0U, slot = 0U;
         const bool progressed =
             gin_detail::progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
-                a, cursor, context, slot, task,
+                a, s.gin_sender_state, cursor, context, slot, task,
                 on_send, on_complete, available);
         if (task.channel != activation_ring_detail::kNoChannel) {
           s.gin_task = task;
           s.gin_context = context;
           s.gin_task_slot = slot;
           mailbox.store(1U, ::cuda::memory_order_release);
-        } else if (available &&
-                   ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-                       gin_detail::states(a)[blockIdx.x].done)
-                       .load(::cuda::memory_order_acquire)) {
+        } else if (available && s.gin_sender_state.done) {
           break;
         }
         if (!progressed)
@@ -772,8 +771,8 @@ run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
       // returning it to the independent controller.
       copy_sync<Storage::kCopyThreads>();
       if (tid == 0U) {
-        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-            gin_detail::states(a)[s.gin_context].slots[s.gin_task_slot].pending)
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
+            s.gin_sender_state.slots[s.gin_task_slot].pending)
             .store(2U, ::cuda::memory_order_release);
         ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.pack_mailbox)
             .store(0U, ::cuda::memory_order_release);

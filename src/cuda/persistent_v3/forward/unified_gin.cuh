@@ -125,7 +125,7 @@ __device__ __forceinline__ bool channel_pending(GinSenderState &state,
                                                 unsigned channel) {
 #pragma unroll
   for (unsigned slot = 0; slot < forward_tuning::kUnifiedGinPackSlots; ++slot)
-    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
             state.slots[slot].pending)
                 .load(::cuda::memory_order_relaxed) != 0U &&
         state.slots[slot].task.channel == channel)
@@ -164,7 +164,7 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
       for (unsigned slot = 0; slot < forward_tuning::kUnifiedGinPackSlots;
            ++slot) {
         const auto &entry = state.slots[slot];
-        if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+        if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
                 state.slots[slot].pending)
                     .load(::cuda::memory_order_relaxed) != 0U &&
             entry.task.channel == channel) {
@@ -222,7 +222,7 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
 // Only this CTA advances its sender state; packers publish pending with release.
 template <bool SameChannel = false, class Args, class OnSend, class OnComplete>
 __device__ __forceinline__ bool
-progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
+progress_context(const Args &a, GinSenderState &state, unsigned &cursor, unsigned &selected_context,
                  unsigned &selected_slot, wire::Transfer &task, OnSend on_send,
                  OnComplete on_complete, bool reserve_pack = true) {
   task.channel = wire::kNoChannel;
@@ -231,16 +231,14 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
   const unsigned context = blockIdx.x;
   if (context >= a.gin_sender_count) return false;
   {
-    auto &state = states(a)[context];
-    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.done)
-            .load(::cuda::memory_order_relaxed) == 0U) {
+    if (state.done == 0U) {
       unsigned occupied = 0U;
       // Keep the large NCCL submission body out of an unrolled slot expansion.
 #pragma unroll 1
       for (unsigned slot = 0; slot < forward_tuning::kUnifiedGinPackSlots;
            ++slot) {
         auto &entry = state.slots[slot];
-        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device> pending(
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> pending(
             entry.pending);
         auto phase = pending.load(::cuda::memory_order_acquire);
         bool may_submit = phase == 2U;
@@ -275,7 +273,8 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
         // Per-slot local counters and remote credits already prove that every
         // payload put is complete. This submitter issues no standalone ACKs.
         on_complete(context, state);
-        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(state.done)
+        state.done = 1U;
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(states(a)[context].done)
             .store(1U, ::cuda::memory_order_release);
         progressed = true;
       } else if (reserve_pack && occupied < forward_tuning::kUnifiedGinPackSlots) {
@@ -297,7 +296,7 @@ progress_context(const Args &a, unsigned &cursor, unsigned &selected_context,
             const unsigned slot =
                 state.slot_cursor++ % forward_tuning::kUnifiedGinPackSlots;
             auto &entry = state.slots[slot];
-            ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device> pending(
+            ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> pending(
                 entry.pending);
             if (pending.load(::cuda::memory_order_relaxed) != 0U)
               continue;
@@ -583,7 +582,7 @@ progress_send(const ForwardKernelArgs &a,
   if (tid == 0U)
     s.gin_progressed =
         progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
-            a, s.gin_context_cursor, s.gin_context, s.gin_task_slot, s.gin_task,
+            a, s.gin_sender_state, s.gin_context_cursor, s.gin_context, s.gin_task_slot, s.gin_task,
             [&](const wire::Transfer &task) { account_send(a, task); },
             [&](unsigned context, GinSenderState &state) {
               complete_context(a, control, context, state);
@@ -597,8 +596,8 @@ progress_send(const ForwardKernelArgs &a,
     else
       pack_return<BaseThread>(a, s, s.gin_task);
     if (tid == 0U)
-      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-          states(a)[s.gin_context].slots[s.gin_task_slot].pending)
+      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(
+          s.gin_sender_state.slots[s.gin_task_slot].pending)
           .store(2U, ::cuda::memory_order_release);
     copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   }

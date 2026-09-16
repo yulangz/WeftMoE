@@ -31,6 +31,7 @@ __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
   if (tid == 0U) {
     s.dispatch_cursor = 1ULL * (blockIdx.x - (UseGin ? a.gin_receiver_base : 0U)) * backward_tuning::kDispatchBatchRows;
     s.pack_mailbox = s.pack_observed = 0U;
+    s.gin_sender_state = forward_unified_transport::GinSenderState{};
     s.dispatch_end = backward_pipeline_detail::local_route_count(a);
     s.return_cursor = ~0ULL;
     s.return_queue = s.return_rows = 0U;
