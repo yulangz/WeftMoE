@@ -9258,7 +9258,7 @@
         }
       ],
       "protocol": "RX16 case halves receive rows32->16 and local service quota4->2, preserving payload service ratio. Parallel GIN case uses two issuers per copy warp for Dispatch packing, Return packing and Return reception through existing disjoint two-slot lane views. No additional SMEM, threads, barriers, wire bytes or relaxed completion;rows/cursor ordering and all SYS fences retained.",
-      "finding": "Qwen EP16 8K incumbent Dispatch32.800/Return41.311GB/s;RX16 gives33.202/41.349 with total GPU4477.585->4483.280us,so no full sweep. Parallel GIN gives32.839/42.200 with GPU4411.860us andwall5908.685us (baseline5908.735). First Return sample above42GB/s;needs confirmation and other shapes.128 sparse files exact over12 repetitions. Full Qwen8K Forward5081.840->5034.910us (-0.92%),wall6561.755->6465.975us.192 golden files exact at129/8K with20 native repetitions. This does not prove incremental full improvement over the prior balanced candidate (~4985us in another pair). Flash pure screen next;BWD/new64K unvalidated,not adopted. Follow-up: parallel GIN Qwen EP16 t129 BWD passed with160 golden files exact including dW. Flash sparse128files exact;8K RX32/quota3 D36.971/R42.969GB/s, RX128/quota12 D34.007/R43.369. New64K and full Flash unvalidated;not adopted. Qwen64K follow-up D40.423/R46.225GB/s,20native checks and64prefix files exact;no regression versus balanced incumbent. Full Flash and EP8 for this combined candidate remain unvalidated.",
+      "finding": "Parallel GIN uses two independent issuers per copy warp with two slots each, retaining the balanced Dispatch service and local peer Return queues. Qwen EP16 pure8K D~32.8-32.9/R42.2-42.3GB/s across repeats;64K D40.423/R46.225 without regression. Full Qwen8K paired baseline5081.840->5034.910us,192golden files exact over20 native repeats;not a proved improvement over the earlier balanced candidate (~4985us in another pair). Qwen EP16 BWD t129 E32 passed160golden files includingdW. Flash EP16 pure8K RX32/quota3 D36.971/R42.969;RX128/quota12 D34.007/R43.369,128 sparse files exact. Qwen EP8 pure8K D269.621/R288.082,20 native repeats and32paired prefix files exact. Full Flash,combined-candidate fullEP8 and other matrix gates remain incomplete;not adopted. Dispatch EP16 remains below42GB/s.",
       "full_confirmation": {
         "raw_results": "results/communication_bottleneck_20260915/parallel_gin_payload_lanes2_training",
         "cases": [
@@ -9386,6 +9386,17 @@
           "repetitions": 20
         },
         "finding": "Balanced incumbent D40.2869/R46.1075GB/s versus parallel GIN D40.4231/R46.2255. GPU30015.05->29957.20us;wall31838.25->31801.95us.20 full-output native repeats and64prefix files exact. No64K regression;Dispatch still below42GB/s. Both nodes clock cleanup passed."
+      },
+      "ep8_qwen_8k": {
+        "raw_results": "results/communication_bottleneck_20260915/parallel_gin_candidate_ep8_qwen",
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 32,
+          "tokens": 8192,
+          "repetitions": 20,
+          "comparison": "paired pure communication baseline"
+        },
+        "finding": "Paired baseline D265.136/R287.371GB/s;candidate D269.621/R288.082, GPU1802.48->1778.77us,wall2678.315->2674.22us.20 native repeated output checks and32paired pure prefix files exact. Only Qwen EP8 8K pure tested here;not full-GEMM validation."
       }
     },
     {
@@ -9432,6 +9443,21 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K paired baseline2issuers x2slots D32.7201/R42.2680GB/s;candidate4issuers x1slot D32.7746/R42.2886, GPU4412.05->4397.36us,wall5900.48->5847.45. Less than0.2% phase bandwidth gain,insufficient to adopt;no full/64K/BWD sweep. Same SMEM,math stages,thread count,payload and completion protocol. RX Dispatch retains2x2 fanout staging.64 sparse files exact over12 repeats."
+    },
+    {
+      "name": "Partition Dispatch on the balanced multi-issuer candidate",
+      "source": "/tmp/weftmoe-partition-dispatch-balanced-stack",
+      "source_commit": "0a3c8df",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/partition_dispatch_stack_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Qwen EP16 8K baseline D32.9209/R42.1892GB/s;50percent local Dispatch CTAs28.3613/41.5372;67percent31.6427/42.0097. GPU4408.9->4553.325/4439.535us. Reject;no full/64K/BWD sweep. Local Dispatch stripes remain static;completed local domains join incoming Dispatch;GIN Return remains shared throughout and local Return/publisher ownership unchanged. All physical CTAs retain math.128 sparse files exact over12 repeats. Baseline sparse wall17050us was anomalous versus~2100us candidates;no sparse wall speedup claim.8K wall6319.71/5967.89/5927.825us retained,but GPU/phase regressions determine rejection."
     }
   ],
   "diagnostics": [
