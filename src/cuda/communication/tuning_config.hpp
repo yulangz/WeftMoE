@@ -42,3 +42,8 @@ static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
 #define WEFTMOE_GIN_CONTEXT_COUNT 0
 #endif
 static_assert(WEFTMOE_GIN_CONTEXT_COUNT >= 0, "GIN context count must be nonnegative");
+
+#ifndef WEFTMOE_GIN_RETURN_PORTS
+#define WEFTMOE_GIN_RETURN_PORTS 8
+#endif
+static_assert(WEFTMOE_GIN_RETURN_PORTS > 0, "GIN Return streams must be positive");

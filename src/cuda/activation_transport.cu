@@ -1590,7 +1590,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
       &context_sms, cudaDevAttrMultiProcessorCount, pool->device), nccl->rank,
       nccl->world, session.session().identity(), session.session().generation(),
       ExchangeKind::ExpertCounts, "query GIN context participants");
-  unsigned allocated_context_count = std::max(3U * kGinContextCount,
+  unsigned allocated_context_count = std::max((1U + communication::kReturnPorts) * kGinContextCount,
       (forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers)
           ? 1U + unsigned(context_sms) : 0U);
   if constexpr (WEFTMOE_GIN_CONTEXT_COUNT > 0)
@@ -1628,9 +1628,9 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     resources.dev_comm_created = true;
     if (resources.dev_comm.ginContextCount < 1 ||
         (!(forward_tuning::kUnifiedWorkers && backward_tuning::kUnifiedWorkers) &&
-         resources.dev_comm.ginContextCount < int(3U * kGinContextCount)))
+         resources.dev_comm.ginContextCount < int((1U + communication::kReturnPorts) * kGinContextCount)))
       transport_error(NotifyErrorCode::BackendUnavailable, "gin-create",
-                      "actual GIN contexts", nccl->rank, "positive count; legacy worker layouts require at least 24",
+                      "actual GIN contexts", nccl->rank, "positive count; enough contexts for every legacy Return stream",
                       std::to_string(resources.dev_comm.ginContextCount));
     allocated_context_count = unsigned(resources.dev_comm.ginContextCount);
     backend->gin_allocated_context_count = allocated_context_count;

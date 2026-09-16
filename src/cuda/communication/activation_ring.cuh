@@ -160,7 +160,8 @@ __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
   const ncclGin gin(a.gin_dev_comm, 0);
   const unsigned worker = blockIdx.x - a.gin_receiver_base;
   const unsigned stride = a.gin_receiver_count ? a.gin_receiver_count : 1U;
-  const unsigned offset = a.gin_receiver_count ? worker : 0U;
+  const unsigned offset = a.gin_receiver_count
+      ? (worker + stride - first % stride) % stride : 0U;
   const unsigned owned = offset < count ? 1U + (count - 1U - offset) / stride : 0U;
   const unsigned probes = max_probes == 0U ? owned : min(owned, max_probes);
   for (unsigned probe = 0; probe < probes; ++probe) {

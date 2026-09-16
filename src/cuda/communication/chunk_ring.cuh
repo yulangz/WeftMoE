@@ -12,7 +12,7 @@ namespace weftmoe::cuda::communication {
 inline constexpr unsigned kChunkRows = WEFTMOE_GIN_CHUNK_ROWS;
 inline constexpr unsigned kRingDepth = WEFTMOE_GIN_RING_DEPTH;
 inline constexpr unsigned kDispatchChannels = WEFTMOE_GIN_DISPATCH_CHANNELS;
-inline constexpr unsigned kReturnPorts = 2;
+inline constexpr unsigned kReturnPorts = WEFTMOE_GIN_RETURN_PORTS;
 
 // A credit releases exactly one slot. Independent consumers may finish in
 // any order: neither credit nor local completion is interpreted as a prefix.
