@@ -11,7 +11,7 @@ __device__ __forceinline__ unsigned *sender_done(const Args &a) {
   return static_cast<unsigned *>(a.gin_sender_done);
 }
 
-// A sender owns every S-th channel, independently of context allocation.
+// A sender owns every S-th channel, independently of sender allocation.
 template <class Args>
 __device__ __forceinline__ bool drained(const Args &a, unsigned sender) {
   for (unsigned channel = sender; channel < a.gin_rings.channels();

@@ -103,7 +103,7 @@ struct ForwardInputPendingQueue {
   }
 };
 
-// Producers reserve disjoint positions and release-publish their readiness bits.
+// Producers reserve disjoint positions and release-publish each row separately.
 // Local work consumers claim ready prefixes with one nonblocking CAS. Remote
 // GIN channels own fixed stripes independently of this local work cursor.
 inline constexpr unsigned kReturnReadyBlockRows = 32U;
