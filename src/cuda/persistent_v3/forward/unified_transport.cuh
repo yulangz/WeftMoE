@@ -701,41 +701,37 @@ run_publisher(const ForwardKernelArgs &a,
     forward_dispatch_detail::finish_fc1_publisher(a, blockIdx.x);
 }
 
-// The controller never waits for TMA packing. It continues returning GIN
-// credits and submitting packed slots while the copy warps own the mailbox.
-// The mailbox release/acquire protects its descriptor independently of the
-// device-scoped pending-slot handoff consumed by any context controller.
-template <unsigned BaseThread, class Storage>
+// A CTA-local mailbox lets packing overlap GIN submission. The submitter
+// is the sole owner of its channels and state; GIN arbitrates shared contexts.
+template <unsigned BaseThread, class Args, class Storage, class Cancelled,
+          class PackDispatch, class PackReturn, class OnSend, class OnComplete>
 __device__ __forceinline__ void
-run_rdma(const ForwardKernelArgs &a,
-         persistent_v3::ForwardPipelineControl &control, Storage &s) {
+run_sender(const Args &a, Storage &s, Cancelled is_cancelled,
+           PackDispatch pack_dispatch, PackReturn pack_return,
+           OnSend on_send, OnComplete on_complete) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U, lane = tid % 32U;
   if (warp == Storage::kCopyWarps) {
     if (lane == 0U) {
       unsigned cursor = blockIdx.x;
       ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block> mailbox(s.pack_mailbox);
-      while (!cancelled(a, control)) {
+      while (!is_cancelled()) {
         const bool available = mailbox.load(::cuda::memory_order_acquire) == 0U;
         activation_ring_detail::Transfer task;
         unsigned context = 0U, slot = 0U;
         const bool progressed =
             gin_detail::progress_context<(forward_tuning::kGinChannelPackLimit > 1U)>(
                 a, cursor, context, slot, task,
-                [&](const activation_ring_detail::Transfer &sent) {
-                  gin_detail::account_send(a, sent);
-                },
-                [&](unsigned index, GinSenderState &state) {
-                  gin_detail::complete_context(a, control, index, state);
-                }, available);
+                on_send, on_complete, available);
         if (task.channel != activation_ring_detail::kNoChannel) {
           s.gin_task = task;
           s.gin_context = context;
           s.gin_task_slot = slot;
           mailbox.store(1U, ::cuda::memory_order_release);
         } else if (available &&
-                   persistent_v3::load_acquire<::cuda::thread_scope_device>(
-                       control.rdma_return_roles_complete.value) == a.gin_sender_count) {
+                   ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+                       gin_detail::states(a)[blockIdx.x].done)
+                       .load(::cuda::memory_order_acquire)) {
           break;
         }
         if (!progressed)
@@ -748,7 +744,7 @@ run_rdma(const ForwardKernelArgs &a,
   } else {
     while (true) {
       if (tid == 0U)
-        s.pack_observed = cancelled(a, control) ? 2U :
+        s.pack_observed = is_cancelled() ? 2U :
             ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_block>(s.pack_mailbox)
                 .load(::cuda::memory_order_acquire);
       copy_sync<Storage::kCopyThreads>();
@@ -762,9 +758,9 @@ run_rdma(const ForwardKernelArgs &a,
         continue;
       }
       if (s.gin_task.channel < a.gin_rings.dispatch_channels)
-        gin_detail::pack_dispatch<BaseThread>(a, s, s.gin_task);
+        pack_dispatch(s.gin_task);
       else
-        gin_detail::pack_return<BaseThread>(a, s, s.gin_task);
+        pack_return(s.gin_task);
       // Every copy warp has finished accessing the shared descriptor before
       // returning it to the independent controller.
       copy_sync<Storage::kCopyThreads>();
@@ -779,6 +775,23 @@ run_rdma(const ForwardKernelArgs &a,
     }
   }
   domain_sync<Storage::kThreads>();
+}
+
+template <unsigned BaseThread, class Storage>
+__device__ __forceinline__ void
+run_rdma(const ForwardKernelArgs &a,
+         persistent_v3::ForwardPipelineControl &control, Storage &s) {
+  run_sender<BaseThread>(a, s, [&] { return cancelled(a, control); },
+      [&](const activation_ring_detail::Transfer &task) {
+        gin_detail::pack_dispatch<BaseThread>(a, s, task);
+      },
+      [&](const activation_ring_detail::Transfer &task) {
+        gin_detail::pack_return<BaseThread>(a, s, task);
+      },
+      [&](const activation_ring_detail::Transfer &task) { gin_detail::account_send(a, task); },
+      [&](unsigned sender, GinSenderState &state) {
+        gin_detail::complete_context(a, control, sender, state);
+      });
 }
 
 template <bool UseGin, unsigned BaseThread, class Storage>

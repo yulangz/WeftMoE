@@ -27,7 +27,13 @@ static_assert(WEFTMOE_GIN_RING_DEPTH == 4 || WEFTMOE_GIN_RING_DEPTH == 8 ||
               "GIN physical ring depth must be 4, 8 or 16");
 
 #ifndef WEFTMOE_GIN_DISPATCH_CHANNELS
-#define WEFTMOE_GIN_DISPATCH_CHANNELS 32
+#define WEFTMOE_GIN_DISPATCH_CHANNELS 64
 #endif
 static_assert(WEFTMOE_GIN_DISPATCH_CHANNELS > 0,
               "GIN Dispatch channels must be positive");
+
+#ifndef WEFTMOE_GIN_CHUNK_ROWS
+#define WEFTMOE_GIN_CHUNK_ROWS 64
+#endif
+static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
+              "GIN packets must contain 1 to 128 rows");

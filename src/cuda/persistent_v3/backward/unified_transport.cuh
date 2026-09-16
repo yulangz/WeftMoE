@@ -29,7 +29,8 @@ __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
   if (warp < Storage::kCopyWarps && lane == 0U)
     init(&s.full[warp], 1U);
   if (tid == 0U) {
-    s.dispatch_cursor = 1ULL * blockIdx.x * backward_tuning::kDispatchBatchRows;
+    s.dispatch_cursor = 1ULL * (blockIdx.x - (UseGin ? a.gin_receiver_base : 0U)) * backward_tuning::kDispatchBatchRows;
+    s.pack_mailbox = s.pack_observed = 0U;
     s.dispatch_end = backward_pipeline_detail::local_route_count(a);
     s.return_cursor = ~0ULL;
     s.return_queue = s.return_rows = 0U;
@@ -94,7 +95,7 @@ progress_dispatch(const BackwardKernelArgs &a, unsigned long long *words,
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                      ->dispatch_complete_clock,
                 device_globaltimer_ns());
-    s.dispatch_cursor += 1ULL * gridDim.x * backward_tuning::kDispatchBatchRows;
+    s.dispatch_cursor += 1ULL * (a.use_gin ? a.gin_receiver_count : gridDim.x) * backward_tuning::kDispatchBatchRows;
   }
   forward_unified_transport::copy_sync<threads>();
   return true;
@@ -199,15 +200,37 @@ run(const BackwardKernelArgs &a,
                backward_tuning::kActivationClusterN),
       a.scheduler_expert_capacity);
   init<UseGin, BaseThread>(a, s);
+  if constexpr (UseGin) {
+    if (blockIdx.x < a.gin_sender_count) {
+      forward_unified_transport::run_sender<BaseThread>(a, s, [] { return false; },
+          [&](const activation_ring_detail::Transfer &task) {
+            gin_detail::pack_dispatch<BaseThread>(a, s, task);
+          },
+          [&](const activation_ring_detail::Transfer &task) {
+            gin_detail::pack_return<BaseThread>(a, s, task);
+          },
+          [&](const activation_ring_detail::Transfer &task) {
+            if (task.channel >= a.gin_rings.dispatch_channels) {
+              auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+              atomicAdd(&status->gin_return_put_count, 1ULL);
+              atomicAdd(&status->gin_return_payload_bytes,
+                        task.rows * (a.hidden * 2ULL + sizeof(float)));
+            }
+          }, [](unsigned, forward_unified_transport::GinSenderState &) {});
+      return;
+    }
+  }
+  const unsigned publisher = blockIdx.x - (UseGin ? a.gin_receiver_base : 0U);
+  const unsigned publishers = UseGin ? a.gin_receiver_count : gridDim.x;
   if (warp == Storage::kCopyWarps) {
     // This warp never waits for a copy-domain barrier. It can publish dU work
     // and return NIC/NVLink notification credit while all copy warps are busy.
     // Partition retained M-blocks across CTA leaders instead of making every
     // CTA contend on one global scan counter. A descriptor has one publisher;
     // phase CAS and the original system-acquire readiness check are unchanged.
-    unsigned scan_cursor = blockIdx.x;
-    unsigned pending = blockIdx.x < geometry.mblocks
-                           ? 1U + (geometry.mblocks - 1U - blockIdx.x) / gridDim.x
+    unsigned scan_cursor = publisher;
+    unsigned pending = publisher < geometry.mblocks
+                           ? 1U + (geometry.mblocks - 1U - publisher) / publishers
                            : 0U;
     while (true) {
       // A publisher warp must enter/leave its full-mask collectives together.
@@ -222,9 +245,9 @@ run(const BackwardKernelArgs &a,
         if (backward_pipeline_detail::try_publish_dispatch_mblock(
                 a, words, layout, geometry.mblocks, scan_cursor))
           --pending;
-        scan_cursor += gridDim.x;
+        scan_cursor += publishers;
         if (scan_cursor >= geometry.mblocks)
-          scan_cursor = blockIdx.x;
+          scan_cursor = publisher;
       }
       __syncwarp();
       if (!progressed)
@@ -240,8 +263,6 @@ run(const BackwardKernelArgs &a,
         gin_progressed =
             gin_detail::progress_receive<BaseThread>(a, s, false) ||
             gin_progressed;
-        gin_progressed =
-            gin_detail::progress_send<BaseThread>(a, s) || gin_progressed;
       }
       const bool returned = progress_return<UseGin, BaseThread>(
           a, words, layout, geometry.mblocks, s);

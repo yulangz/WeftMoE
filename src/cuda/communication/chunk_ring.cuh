@@ -9,7 +9,7 @@
 
 namespace weftmoe::cuda::communication {
 
-inline constexpr unsigned kChunkRows = 128;
+inline constexpr unsigned kChunkRows = WEFTMOE_GIN_CHUNK_ROWS;
 inline constexpr unsigned kRingDepth = WEFTMOE_GIN_RING_DEPTH;
 inline constexpr unsigned kDispatchChannels = WEFTMOE_GIN_DISPATCH_CHANNELS;
 inline constexpr unsigned kReturnPorts = 2;

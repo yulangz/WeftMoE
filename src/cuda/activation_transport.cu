@@ -1665,6 +1665,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     }
   }
   backend->dev_comm = resources.dev_comm;
+  backend->gin_allocated_context_count = unsigned(resources.dev_comm.ginContextCount);
   backend->windows = resources.windows;
   {
     std::lock_guard<std::mutex> lock(pool->mutex);
@@ -5993,8 +5994,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   if constexpr (backward_tuning::kUnifiedWorkers) {
     args.local_notification_ctas = compute_ctas;
     if (use_gin) {
-      args.gin_total_ctas = args.gin_sender_count = compute_ctas;
-      args.gin_receiver_count = compute_ctas;
+      args.gin_total_ctas = compute_ctas;
+      args.gin_sender_count = forward_tuning::unified_rdma_ctas(compute_ctas, true);
+      if (!args.gin_sender_count) args.gin_sender_count = 1U;
+      args.gin_receiver_base = args.gin_sender_count;
+      args.gin_receiver_count = compute_ctas - args.gin_sender_count;
     }
   }
   int cluster_supported = 0;
