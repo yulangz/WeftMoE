@@ -5,6 +5,10 @@ from autotune_common import PlanError, require, require_choice
 
 PARAMETER_MACROS = {
     "gin_ring_depth": "WEFTMOE_GIN_RING_DEPTH",
+    "gin_dispatch_channels": "WEFTMOE_GIN_DISPATCH_CHANNELS",
+    "gin_return_ports": "WEFTMOE_GIN_RETURN_PORTS",
+    "gin_chunk_rows": "WEFTMOE_GIN_CHUNK_ROWS",
+    "gin_context_count": "WEFTMOE_GIN_CONTEXT_COUNT",
     "unified_threads": "WEFTMOE_UNIFIED_THREADS",
     "unified_comm_threads": "WEFTMOE_UNIFIED_COMM_THREADS",
     "unified_comm_base": "WEFTMOE_UNIFIED_COMM_BASE",
@@ -25,7 +29,8 @@ PARAMETER_MACROS = {
 
 # These affect shared protocol storage or common instruction adapters. A
 # combined binary must choose one value explicitly for both phases.
-SHARED_PARAMETERS = frozenset({"gin_ring_depth", "unified_gin_context_probes",
+SHARED_PARAMETERS = frozenset({"gin_ring_depth", "gin_dispatch_channels",
+                               "gin_return_ports", "gin_chunk_rows", "gin_context_count", "unified_gin_context_probes",
                                "unified_gin_pack_slots", "wgmma_n256_atom_n"})
 # Retained in Backward plans for compatibility. Backward has its own fixed
 # local scheduling policy and does not consume these Forward-only controls.
@@ -53,7 +58,8 @@ def validate_shared_parameters(forward, backward):
 
 # These are compatibility defaults for old plans. Current public search spaces
 # explicitly choose their incumbent, including eight physical GIN ring slots.
-DEFAULTS = dict(gin_ring_depth=4, unified_workers=0, unified_threads=384,
+DEFAULTS = dict(gin_dispatch_channels=64, gin_return_ports=8, gin_chunk_rows=128,
+                gin_context_count=0, gin_ring_depth=4, unified_workers=0, unified_threads=384,
                 unified_comm_threads=96, unified_comm_base=288,
                 unified_math_registers=232, unified_control_registers=40,
                 unified_producer_registers=0,
@@ -122,6 +128,13 @@ def filter_generated_candidates(document, flatten_groups, validate_tuning):
 
 def validate(config):
     require_choice(config, "gin_ring_depth", (4, 8, 16))
+    for name in ("gin_dispatch_channels", "gin_return_ports"):
+        require(type(config[name]) is int and config[name] > 0,
+                f"{name} must be a positive integer")
+    require(type(config["gin_chunk_rows"]) is int and 1 <= config["gin_chunk_rows"] <= 128,
+            "gin_chunk_rows must be an integer in [1, 128]")
+    require(type(config["gin_context_count"]) is int and config["gin_context_count"] >= 0,
+            "gin_context_count must be a nonnegative integer (0 selects one per CTA)")
     require_choice(config, "unified_workers", (0, 1))
     require_choice(config, "unified_threads", (384, 512, 640))
     require_choice(config, "unified_split_nvlink", (0, 1))

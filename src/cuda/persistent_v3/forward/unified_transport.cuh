@@ -139,9 +139,10 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.return_queue = s.return_peer_cursor = 0U;
     const unsigned workers = a.forward_relay_cta_count;
     const unsigned rotation = (workers + a.local_world_size - 1U) / a.local_world_size;
+    const unsigned stripe_rows = max(a.forward_local_return_batch_rows,
+                                     forward_tuning::kUnifiedReturnDrainRows);
     for (unsigned peer = 0; peer < communication::kLocalPeers; ++peer)
-      s.return_positions[peer] = 1ULL * ((relay + peer * rotation) % workers) *
-                                  a.forward_local_return_batch_rows;
+      s.return_positions[peer] = 1ULL * ((relay + peer * rotation) % workers) * stripe_rows;
     s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     s.gin_context_cursor = s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
@@ -521,14 +522,22 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
       auto &q = return_queue_detail::queues(a)[first + peer];
       const auto position = s.return_positions[peer];
       if (position >= q.capacity) continue;
-      const auto rows = unsigned(min(q.capacity - position,
-                                    1ULL * a.forward_local_return_batch_rows));
-      if (!return_queue_detail::ready_block(a, q, position, rows)) continue;
+      const unsigned stripe_rows = max(a.forward_local_return_batch_rows,
+                                       forward_tuning::kUnifiedReturnDrainRows);
+      const auto extent = unsigned(min(q.capacity - position,
+                                       stripe_rows - position % stripe_rows));
+      unsigned rows = extent;
+      if (!return_queue_detail::ready_block(a, q, position, rows))
+        rows = return_queue_detail::ready_rows(a, q, position,
+                   min(extent, a.forward_local_return_batch_rows));
+      if (!rows) continue;
       s.return_queue = first + peer;
       s.return_cursor = position;
       s.return_rows = rows;
-      s.return_positions[peer] += 1ULL * a.forward_relay_cta_count *
-                                 a.forward_local_return_batch_rows;
+      auto next = position + rows;
+      if (next % stripe_rows == 0U)
+        next += 1ULL * (a.forward_relay_cta_count - 1U) * stripe_rows;
+      s.return_positions[peer] = next;
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(q.head)
           .fetch_add(rows, ::cuda::memory_order_release);
       break;

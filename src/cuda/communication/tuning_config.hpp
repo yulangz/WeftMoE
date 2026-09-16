@@ -33,7 +33,7 @@ static_assert(WEFTMOE_GIN_DISPATCH_CHANNELS > 0,
               "GIN Dispatch channels must be positive");
 
 #ifndef WEFTMOE_GIN_CHUNK_ROWS
-#define WEFTMOE_GIN_CHUNK_ROWS 64
+#define WEFTMOE_GIN_CHUNK_ROWS 128
 #endif
 static_assert(WEFTMOE_GIN_CHUNK_ROWS > 0 && WEFTMOE_GIN_CHUNK_ROWS <= 128,
               "GIN packets must contain 1 to 128 rows");
