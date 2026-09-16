@@ -11374,7 +11374,8 @@
           "note": "Algebraic fit to only8K/64K measurements, not independent proof of fixed overhead or a universal bandwidth ceiling."
         }
       },
-      "finding": "Qwen EP16 at measured1620MHz:8K full Dispatch32.9183GB/s vs isolated35.6126 (recapture35.7163,full credit drain33.9071);64K full40.3993 vs isolated42.8009 (full credit drain42.4458). Removal saves77.117us at8K and372.835us at64K. Relay contributes but does not explain whole deficit;8K has substantial non-relay pipeline overhead. Current packet metadata gives optimistic46.885GB/s useful ceiling from2x200Gb/s.64K isolated reaches91.29% of this ceiling. Matching-packet raw GIN46.17GB/s message throughput (~43.30 useful) is a separate cached-source transport diagnostic excluding pack/allocation. Full production code unchanged; persistent42GB/s goal for complete Dispatch not achieved."
+      "finding": "Qwen EP16 at measured1620MHz:8K full Dispatch32.9183GB/s vs isolated35.6126 (recapture35.7163,full credit drain33.9071);64K full40.3993 vs isolated42.8009 (full credit drain42.4458). Removal saves77.117us at8K and372.835us at64K. Relay contributes but does not explain whole deficit;8K has substantial non-relay pipeline overhead. Current packet metadata gives optimistic46.885GB/s useful ceiling from2x200Gb/s.64K isolated reaches91.29% of this ceiling. Matching-packet raw GIN46.17GB/s message throughput (~43.30 useful) is a separate cached-source transport diagnostic excluding pack/allocation. Full production code unchanged; persistent42GB/s goal for complete Dispatch not achieved.",
+      "subsequent_review_correction": "Review found zero-capacity Return queues made16emptyReturnterminals/rank immediatelyeligible,includingstartup,andisolatedreceivers lackedbaselineidlebackoff. Matched8Kdiagnosticcorrection35.5588->36.5408GB/s,943.632->918.272us. Originalmeasurementsremainvalidfortheircode,but35.6isnotahardwareceilingand77.117usfull-vs-isolateddifferenceisnotexclusiveNVLinkcost.64Knotremeasuredwithcorrectedharness."
     },
     {
       "name": "Previously completed GIN local completion request screen, stopped before further tuning",
@@ -11438,6 +11439,333 @@
       ],
       "validation": "257 and8192 native runs;128 paired output artifacts exact. No full GEMM/BWD/64K expansion.",
       "finding": "Only~0.44% Dispatch improvement. User stopped peripheral optimization experiments; do not pursue or adopt. Explicit local completion request retained, not unsafe credit-only source reuse."
+    },
+    {
+      "name": "Code review of RDMA pipeline and isolated benchmark boundary correction",
+      "adopted": false,
+      "diagnostic_only": true,
+      "commit": "ce69347",
+      "branch": "experiment/rdma_isolation_review",
+      "source": "/tmp/weftmoe-rdma-isolation-review",
+      "artifacts": "results/communication_bottleneck_20260915/rdma_isolation_review",
+      "build": {
+        "source": "/tmp/weftmoe-rdma-isolation-review",
+        "build": {
+          "backend": "python-content-addressed-jit",
+          "cache_hit": false,
+          "binary_preexisted": false,
+          "host_cache_hit": false,
+          "cache_key": "cbc23c9e7528e2c53b4647a0e2e692d684be948da23339317164d6ba20857066",
+          "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cbc23c9e7528e2c53b4647a0e2e692d684be948da23339317164d6ba20857066",
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cbc23c9e7528e2c53b4647a0e2e692d684be948da23339317164d6ba20857066/test_cuda_notify",
+          "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.cbc23c9e7528e2c53b4647a0e2e692d684be948da23339317164d6ba20857066/generated/weftmoe_forward_tuning_generated.hpp",
+          "elapsed_seconds": 92.150942761451,
+          "returncode": 0,
+          "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/communication_bottleneck_20260915/rdma_isolation_review/build.log",
+          "toolchain": {
+            "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+            "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+            "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+            "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+            "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+            "architecture": "sm_90a"
+          }
+        }
+      },
+      "review": {
+        "scope": "Read-only review of baseline0fd0d45,diagnosticcaa4310 and installed NCCL2.31.2/GDAKI headers;existing profile captures are related versions,not fresh paired timing.",
+        "nsys_setup_analysis": [
+          {
+            "artifact": "results/communication_bottleneck_20260915/nsys_full_dispatch_ratio_q4_qwen_ep16_8k_last/profile.sqlite",
+            "samples": [
+              {
+                "device": 4,
+                "setup_us": 30.784,
+                "gap_us": 1.76
+              },
+              {
+                "device": 5,
+                "setup_us": 30.528,
+                "gap_us": 1.6
+              },
+              {
+                "device": 0,
+                "setup_us": 29.12,
+                "gap_us": 1.088
+              },
+              {
+                "device": 1,
+                "setup_us": 30.752,
+                "gap_us": 1.6
+              },
+              {
+                "device": 7,
+                "setup_us": 30.688,
+                "gap_us": 1.632
+              },
+              {
+                "device": 3,
+                "setup_us": 31.136,
+                "gap_us": 1.632
+              },
+              {
+                "device": 2,
+                "setup_us": 30.976,
+                "gap_us": 1.568
+              },
+              {
+                "device": 6,
+                "setup_us": 31.2,
+                "gap_us": 1.344
+              }
+            ],
+            "setup_median_us": 30.768,
+            "gap_median_us": 1.6
+          },
+          {
+            "artifact": "results/communication_bottleneck_20260915/nsys_full_targeted_flush_qwen_ep16_8k_last/profile.sqlite",
+            "samples": [
+              {
+                "device": 7,
+                "setup_us": 30.656,
+                "gap_us": 1.312
+              },
+              {
+                "device": 5,
+                "setup_us": 30.592,
+                "gap_us": 1.312
+              },
+              {
+                "device": 1,
+                "setup_us": 30.88,
+                "gap_us": 1.408
+              },
+              {
+                "device": 3,
+                "setup_us": 31.648,
+                "gap_us": 1.504
+              },
+              {
+                "device": 0,
+                "setup_us": 29.12,
+                "gap_us": 1.376
+              },
+              {
+                "device": 4,
+                "setup_us": 30.592,
+                "gap_us": 1.568
+              },
+              {
+                "device": 2,
+                "setup_us": 30.656,
+                "gap_us": 1.216
+              },
+              {
+                "device": 6,
+                "setup_us": 31.008,
+                "gap_us": 1.728
+              }
+            ],
+            "setup_median_us": 30.656,
+            "gap_median_us": 1.392
+          },
+          {
+            "artifact": "results/communication_bottleneck_20260915/nsys_qwen_ep16_64k_last/profile.sqlite",
+            "samples": [
+              {
+                "device": 0,
+                "setup_us": 109.12,
+                "gap_us": 1.536
+              },
+              {
+                "device": 2,
+                "setup_us": 110.368,
+                "gap_us": 1.952
+              },
+              {
+                "device": 7,
+                "setup_us": 110.88,
+                "gap_us": 1.472
+              },
+              {
+                "device": 1,
+                "setup_us": 110.944,
+                "gap_us": 2.144
+              },
+              {
+                "device": 4,
+                "setup_us": 109.92,
+                "gap_us": 2.016
+              },
+              {
+                "device": 6,
+                "setup_us": 109.823,
+                "gap_us": 1.12
+              },
+              {
+                "device": 3,
+                "setup_us": 110.656,
+                "gap_us": 1.952
+              },
+              {
+                "device": 5,
+                "setup_us": 111.872,
+                "gap_us": 1.28
+              }
+            ],
+            "setup_median_us": 110.512,
+            "gap_median_us": 1.744
+          },
+          {
+            "artifact": "results/communication_bottleneck_20260915/reduced_smem_carveout_profile/profile.sqlite",
+            "samples": [
+              {
+                "device": 5,
+                "setup_us": 29.824,
+                "gap_us": 1.952
+              },
+              {
+                "device": 4,
+                "setup_us": 30.208,
+                "gap_us": 1.024
+              },
+              {
+                "device": 1,
+                "setup_us": 30.016,
+                "gap_us": 1.152
+              },
+              {
+                "device": 3,
+                "setup_us": 30.08,
+                "gap_us": 2.272
+              },
+              {
+                "device": 0,
+                "setup_us": 29.568,
+                "gap_us": 1.312
+              },
+              {
+                "device": 2,
+                "setup_us": 30.112,
+                "gap_us": 1.152
+              },
+              {
+                "device": 7,
+                "setup_us": 29.696,
+                "gap_us": 1.28
+              },
+              {
+                "device": 6,
+                "setup_us": 29.984,
+                "gap_us": 1.376
+              }
+            ],
+            "setup_median_us": 30.0,
+            "gap_median_us": 1.296
+          }
+        ],
+        "findings": [
+          {
+            "name": "Startup gate",
+            "evidence": "Device clock starts in SetupOnly kernel. It clears compute queues,initializes Return queues and input groups,joins132CTAs before unified launch. Communication init waits8local peers even for RDMA packers. Older NSYS setup~30us8K,110us64K;launch gap~1-2us. Existing first-pack trace starts67.696us,takes53.856us;first-GIN submission timestamp~146.816us is recorded after gin.put in a separate capture.",
+            "limitation": "Do not subtract timestamps from different captures or attribute all setup-to-first-put time to packer/controller waits."
+          },
+          {
+            "name": "Packet and mailbox serial boundaries",
+            "evidence": "Metadata then64-thread join then payload copy through4issuer lanes. Per-issuer2-slot pipeline loads two segments then retires both before accepting next pair. Full TMA wait before pending2. One shared mailbox;controller only reserves a new task after mailbox0.16packers may overlap acrossCTAs,3pending slots/context do not make each packer mailbox a pipeline.",
+            "limitation": "Structure is definite;lost bandwidth from each boundary unmeasured. Earlier deeper/rolling prefetch and direct-packer-submit experiments did not materially improve full Dispatch."
+          },
+          {
+            "name": "Context critical section and slot-order revisit",
+            "evidence": "16controller threads probe2contexts per invocation and acquire shared context lease. ACK batch,send_packed,global audit atomics,slot reservation and terminal flush all execute under lease. Pending slots visited once in physical order;[N+1,N] skips first then sendsN without revisitingN+1 until next context service.",
+            "limitation": "This causes an avoidable additional scheduler visit,not a per-packet remote wait or quantified whole-kernel gain. Earlier fixed-owner/affinity screens did not improve Dispatch."
+          },
+          {
+            "name": "Empty receive polling",
+            "evidence": "116relay consumers contend for8Dispatch channel locks. claim_dispatch_receive acquires lock before readSignal;empty channel polling still CAS/releases. In baseline finite local/RXcopy work limits rate;old isolated probe removed that work and omittedidlebackoff.",
+            "limitation": "Contention is possible,not quantified from atomic instruction counts. One8K diagnostic correction pair tests delayedemptyReturn+idlebackoff together."
+          },
+          {
+            "name": "Credit coupling",
+            "evidence": "RX credit waitsall4sub-batches,NVLink TMA completion,metadata publication and completion accounting. Last finisher publishes bitmap;GIN controller enqueuescredit on context also used foroutgoingDispatch. Bitmap ACK does not scanall slots onempty polls. Qwen8K has8data packets/channel andring8,so no data-slot reusewithin generation;onlyextra terminalneedsreuse.",
+            "limitation": "Ring-related data starvation at8K cannot explain main gap;64Kcredit-stalltime needsmeasurement. Terminaldrain scansring;not steady-state scan."
+          },
+          {
+            "name": "GDAKI submission costs",
+            "evidence": "gin.put None does notexplicitlywaitremotecompletion. For559120B packet backend emitsmainQPwrite+readyatomic andcompanionQPCQwait+localcounteratomic. GPU submission reservesWQslots/checksCQcapacity,marksreadyandupdatesdoorbells;canblockifSQfull. RequestedGINqueueDepth64. finalflushwait isblockingandundercontextlease.",
+            "limitation": "No evidenceSQfullis dominant. The matching-packet rawFULLprobe already reaches46.17GB/s. Explicitlocalrequestreplacement earlier gave~0.44%only."
+          },
+          {
+            "name": "Relay tail",
+            "evidence": "Existinglast-tasktrace:metadata29.728us,copyloop32.112us,finalfullwait0.032us,systemfence1.648us,publication12.112us,total80.288us. Finalpayload-before-readyorderingcorrect. Scalar fanoutmetadata and payload prefetch use same issuer lanes.",
+            "limitation": "Subphase timings are instrumented leader measurements,not fullyadditive criticalpath or proofthat internalreusewaitsarecheap. Prior metadata/preload/prefetch changes failed to improve full Dispatch."
+          },
+          {
+            "name": "Isolation boundary correction",
+            "evidence": "OldprobeReturncapacity0,dispatch_firststatezero:Returnterminalbecomesimmediatelyeligible and can precedeDispatch.16Returnterminalputs/rankverifiedlogs. Receiverloopomitsidlebackoff. Probe stillretainslocalstartupagreement,legacy132CTAsetup,32rowclaimpartitions andemptyReturncleanup.",
+            "limitation": "35.6GB/s is measured latency-inclusive isolatedpipeline,not a hardwareRDMAceiling. DifferencefromfullDispatchisablationdifference,not exactexclusiveNVLinkcost."
+          }
+        ]
+      },
+      "results": [
+        {
+          "name": "rdma_isolation_review_validate",
+          "records": 192,
+          "validation_enabled": true,
+          "errors": 0,
+          "exact_received_rows": true,
+          "median_ns": {
+            "dispatch_ns": 1863008.0,
+            "drain_ns": 2023792.0
+          },
+          "payload_GBps": {
+            "dispatch_ns": 18.01088991566327,
+            "drain_ns": 16.57998055136101
+          }
+        },
+        {
+          "name": "rdma_dispatch_isolation_8k",
+          "records": 320,
+          "validation_enabled": false,
+          "errors": 0,
+          "exact_received_rows": true,
+          "median_ns": {
+            "dispatch_ns": 943632.0,
+            "drain_ns": 996224.0
+          },
+          "payload_GBps": {
+            "dispatch_ns": 35.5588110619394,
+            "drain_ns": 33.68161377360915
+          }
+        },
+        {
+          "name": "rdma_isolation_review_8k",
+          "records": 320,
+          "validation_enabled": false,
+          "errors": 0,
+          "exact_received_rows": true,
+          "median_ns": {
+            "dispatch_ns": 918272.0,
+            "drain_ns": 1079264.0
+          },
+          "payload_GBps": {
+            "dispatch_ns": 36.54084192918874,
+            "drain_ns": 31.090105849912533
+          }
+        }
+      ],
+      "resources": [
+        [
+          " Function _ZN7weftmoe4cuda56_GLOBAL__N__ee255406_23_activation_transport_cu_ecea9a9f38unified_communication_benchmark_kernelILb0ELb0EEEvNS1_17ForwardKernelArgsE14CUtensorMap_stS4_S4_S4_S4_:",
+          "  REG:168 STACK:128 SHARED:1024 LOCAL:0 CONSTANT[2]:16 CONSTANT[0]:2496 TEXTURE:0 SURFACE:0 SAMPLER:0"
+        ],
+        [
+          " Function _ZN7weftmoe4cuda56_GLOBAL__N__ee255406_23_activation_transport_cu_ecea9a9f38unified_communication_benchmark_kernelILb0ELb1EEEvNS1_17ForwardKernelArgsE14CUtensorMap_stS4_S4_S4_S4_:",
+          "  REG:168 STACK:128 SHARED:1024 LOCAL:0 CONSTANT[2]:16 CONSTANT[0]:2496 TEXTURE:0 SURFACE:0 SAMPLER:0"
+        ]
+      ],
+      "finding": "MeasuredallGPUs1620MHz. One8Kpair:oldisolation35.558811GB/s943.632us;deferemptyReturncleanupuntillocalDispatchcompleteandrestoreidle64nsbackoff36.540842GB/s918.272us,+2.76%bandwidth/-25.36us.192rank-generationsfullreceivedpayloadvalidationpassed,all832rank-generationrecordszerodataerrorsandexactrowcounts. Ring/ready/localcounter/credit/fullTMAcompletionretained;REG168stack128unchanged. FinaldrainnowincludesdeferredReturncleanup:1079.264vs996.224us,so thisisadiagnosticboundarycorrection,notanintegratedspeedup. No64KorfullMoE/BWDsweep;productionunchanged. The remaining143.28usrelative toearliermatching-packetrawGIN775usisconsistentwithstartup-scaleoverhead,butnotanexactcausaldecompositionacrossdifferentbenchmarks. Staticreviewidentifiesserialfirstpack,one-taskmailbox,contextleasearoundACK/send/stats/flush,pendingphysical-orderextra-revisit,lock-before-readyemptyRXpolling,sharedACK/dataQPandNVLink-before-creditdependencies. Onlythecombineddiagnosticcorrectionismeasured;donotclaimotherproposedchangesasspeedups.",
+      "initial_compile_failure": "Test-onlyForwardguardingenericchoose_unpackedinitiallyaffectedBackwardArgs;restrictedwithifconstexprtypecheckandrebuiltsuccessfully.NoGPUrunusedthefailedbuild."
     }
   ],
   "diagnostics": [
