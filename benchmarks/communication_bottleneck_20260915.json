@@ -10180,7 +10180,8 @@
           "stderr": ""
         }
       ],
-      "finding": "Qwen EP16 8K last steady iteration on8 local GPUs: PCIe TX first>=70% sample at176-242us after own setup origin; last high Dispatch sample at734-842us. Remaining time to own approximate Dispatch end185-288us,with NVLink TX28-48.5% of respective peak in tail samples. Bulk PCIe sustained~80%. Thresholds are not packet/completion timestamps and local Return traffic from faster ranks may overlap. Test dynamic local Dispatch work distribution to identify fixed-stripe stragglers. Profiled rates are diagnostic,not new goal performance;20 native checks passed,no kernel replay."
+      "finding": "Qwen EP16 8K last steady iteration on8 local GPUs: PCIe TX first>=70% sample at176-242us after own setup origin; last high Dispatch sample at734-842us. Remaining time to own approximate Dispatch end185-288us,with NVLink TX28-48.5% of respective peak in tail samples. Bulk PCIe sustained~80%. Thresholds are not packet/completion timestamps and local Return traffic from faster ranks may overlap. Test dynamic local Dispatch work distribution to identify fixed-stripe stragglers. Profiled rates are diagnostic,not new goal performance;20 native checks passed,no kernel replay. Measured GPC clock inside all8 local kernels1619.26-1620.53MHz,consistent with1620MHz requested lock.",
+      "sampled_clock_evidence": "results/communication_bottleneck_20260915/nsys_pure_balanced_dispatch_lanes2_qwen_ep16_8k_last/sampled_clocks.json"
     }
   ]
 }
