@@ -9805,6 +9805,114 @@
         }
       ],
       "finding": "Qwen EP16 8K baseline D32.8410/R42.2617GB/s,GPU4400.080us;cooperative addresses32.9223/42.2421,GPU4398.335.0.25% Dispatch gain and0.04% total GPU difference are insufficient to adopt.64 sparse files exact over12 repetitions. All lanes resolve up to32 source/target address pairs into registers,shuffle to existing two-lane TMA issuers;original per-issuer route order,staging and full completion retained. Arbitrary tails and both contiguous/interleaved transport mappings enumerated exactly in44030CPU cases. REG168 unchanged,stack104->112bytes;not a dynamic spill attribution. Initial contiguous-only build7db6888 had no EP16 path change and was not GPU-tested;v2f432f90 covers actual GIN interleaving. No full/BWD/64K expansion."
+    },
+    {
+      "name": "Larger local Dispatch batches with the same local-to-received service ratio",
+      "source": "/tmp/weftmoe-parallel-gin-payload-issuers",
+      "source_commit": "0fd0d45",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/balanced_local_batches_screen",
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.95,
+              "fc2": 134.912,
+              "return": 3173.76,
+              "reduce": 2437.79,
+              "forward": 4397.02,
+              "wall": 5816.459999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.836121140956,
+              "nv_return": 37.0035894333535,
+              "rdma_dispatch": 32.83373159156514,
+              "rdma_return": 42.28981649526114
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "balanced_local_batch64_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.52,
+              "fc2": 140.88,
+              "return": 3171.9849999999997,
+              "reduce": 2256.335,
+              "forward": 4419.8099999999995,
+              "wall": 5931.96
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.9328686663012,
+              "nv_return": 37.02429614263624,
+              "rdma_dispatch": 32.847552666614455,
+              "rdma_return": 42.313481305869985
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "balanced_local_batch128_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1028.0149999999999,
+              "fc2": 140.816,
+              "return": 3170.43,
+              "reduce": 2420.5950000000003,
+              "forward": 4400.719999999999,
+              "wall": 5802.085
+            },
+            "payload_GBps": {
+              "nv_dispatch": 228.48015252695734,
+              "nv_return": 37.04245543979839,
+              "rdma_dispatch": 32.64002178956533,
+              "rdma_return": 42.33423478834102
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K baseline local32/quota4 D32.8337/R42.2898GB/s,GPU4397.020us. local64/quota2 D32.8476/R42.3135,GPU4419.810;local128/quota1 D32.6400/R42.3342,GPU4400.720. Both retain128 local rows per32 received source rows and existing2x2 issuer pipeline. No gain from amortizing polls/batch joins this way;128 sparse files exact over12 repetitions. Reject without full/BWD/64K sweep."
     }
   ],
   "diagnostics": [
