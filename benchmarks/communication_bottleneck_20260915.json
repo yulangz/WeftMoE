@@ -9618,6 +9618,87 @@
         }
       ],
       "finding": "Qwen EP16 8K baseline D32.8851/R42.2832GB/s,GPU4392.080us. Packet acquire reuse D32.8307/R42.1520,GPU4404.140: no gain. Local Dispatch pre-join system-SC fence removal retains full TMA wait, producer memory-ordering join and system-release ready RMW; D33.2586/R42.3963,GPU4398.465:1.14% Dispatch gain but no whole-kernel improvement.128 sparse files exact across both candidates,12 repetitions. Neither adopted;no full/BWD/64K expansion. This does not establish that all fence or polling costs are unimportant."
+    },
+    {
+      "name": "Start received payload prefetch before scalar fanout metadata stores",
+      "source": "/tmp/weftmoe-rx-payload-before-metadata",
+      "source_commit": "52b6244",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/rx_payload_before_metadata_lanes2_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1018.545,
+              "fc2": 135.28,
+              "return": 3176.08,
+              "reduce": 2459.695,
+              "forward": 4388.59,
+              "wall": 5794.365
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.60446421120324,
+              "nv_return": 36.9765597843883,
+              "rdma_dispatch": 32.94349488731475,
+              "rdma_return": 42.258925467872345
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "rx_payload_before_metadata_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.4549999999999,
+              "fc2": 135.152,
+              "return": 3179.075,
+              "reduce": 2363.6800000000003,
+              "forward": 4399.62,
+              "wall": 5847.6849999999995
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.94750037936083,
+              "nv_return": 36.94172424368724,
+              "rdma_dispatch": 32.849642911337256,
+              "rdma_return": 42.219113421356845
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K baseline D32.9435/R42.2589GB/s,GPU4388.590us;early payload prefetch D32.8496/R42.2191,GPU4399.620. No gain;64 sparse files exact over12 repetitions. Reject without full/BWD/64K expansion. Only reorders payload enqueue before each source row fanout metadata loop;unchanged staging,threads,wire bytes,full completion and ready ordering."
     }
   ],
   "diagnostics": [
