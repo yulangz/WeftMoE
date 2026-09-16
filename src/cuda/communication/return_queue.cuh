@@ -12,25 +12,39 @@ template <class Args> __device__ __forceinline__ Queue *queues(const Args &a) {
   return peer_at<Queue>(a.local_base, a.forward_return_queues_offset);
 }
 
+// UINT32_MAX is not a valid compact row. Setup clears each finite queue only
+// after the previous invocation drained, before releasing any new producers.
 template <class Args>
-__device__ __forceinline__ unsigned long long *ready_entries(const Args &a) {
-  return peer_at<unsigned long long>(a.local_base, a.forward_return_ready_offset);
+__device__ __forceinline__ unsigned *entries(const Args &a) {
+  return peer_at<unsigned>(a.local_base, a.forward_return_rows_offset);
 }
 
-// Entries never wrap within an invocation. Producers do not wait for earlier
-// tickets: each entry release-publishes its own completed row independently.
 template <class Args>
 __device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
                                               unsigned long long begin, unsigned limit) {
   unsigned count = 0;
-  const auto epoch = execution_epoch(a);
   while (count < limit && begin + count < q.capacity) {
-    if (::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-            ready_entries(a)[q.begin + begin + count])
-            .load(::cuda::memory_order_acquire) != epoch) break;
+    if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+            entries(a)[q.begin + begin + count])
+            .load(::cuda::memory_order_acquire) == UINT32_MAX) break;
     ++count;
   }
   return count;
+}
+
+// Unified consumers own an entire stripe. Poll all its entries independently
+// then acquire their release publications together, without a serial prefix.
+template <class Args>
+__device__ __forceinline__ bool ready_block(const Args &a, const Queue &q,
+                                           unsigned long long begin, unsigned rows) {
+  bool ready = true;
+#pragma unroll 4
+  for (unsigned i = 0; i < rows; ++i)
+    ready &= ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+        entries(a)[q.begin + begin + i]).load(::cuda::memory_order_relaxed) != UINT32_MAX;
+  if (ready)
+    ::cuda::atomic_thread_fence(::cuda::memory_order_acquire, ::cuda::thread_scope_device);
+  return ready;
 }
 
 template <class Args>
@@ -85,7 +99,7 @@ __device__ __forceinline__ void initialize(const Args &a) {
   __syncthreads();
   const auto total = q[a.world].begin + q[a.world].capacity;
   for (unsigned long long i = threadIdx.x; i < total; i += blockDim.x)
-    ready_entries(a)[i] = 0ULL;
+    entries(a)[i] = UINT32_MAX;
   __syncthreads();
 }
 
@@ -141,10 +155,9 @@ __device__ __noinline__ void publish(const Args &a, unsigned long long first,
     cutlass::arch::NamedBarrier::sync(Threads, 3U);
     if (pending == selected) {
       const auto offset = scratch[warp] + __popc(mask & ((1U << lane) - 1U));
-      entries[q.begin + *base + offset] = static_cast<unsigned>(row);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-          ready_entries(a)[q.begin + *base + offset])
-          .store(execution_epoch(a), ::cuda::memory_order_release);
+      ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+          entries[q.begin + *base + offset])
+          .store(static_cast<unsigned>(row), ::cuda::memory_order_release);
       pending = UINT32_MAX;
     }
     cutlass::arch::NamedBarrier::sync(Threads, 3U);

@@ -4531,7 +4531,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_reduce_ready_token_offset =
       layout.forward_reduce_ready_token;
   args.forward_return_rows_offset = layout.forward_return_rows;
-  args.forward_return_ready_offset = layout.forward_return_ready;
   args.forward_return_queues_offset = layout.forward_return_queues;
   args.local_notification_offset = layout.local_notifications;
   args.local_notification_ctas = layout.local_notification_ctas;
@@ -5880,7 +5879,6 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
         lease->index * args.gin_rings.channels() * communication::kRingDepth;
     args.forward_return_queues_offset = layout.forward_return_queues;
     args.forward_return_rows_offset = layout.forward_return_rows;
-  args.forward_return_ready_offset = layout.forward_return_ready;
   }
   args.saved_gates = static_cast<const float *>(saved.gates->data);
   args.saved_ab = static_cast<const transport::BFloat16 *>(saved.ab->data);

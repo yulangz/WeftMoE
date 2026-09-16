@@ -294,10 +294,9 @@ __device__ __forceinline__ void publish_return_rows(const BackwardKernelArgs &a,
       if (pending == selected) {
         const auto offset =
             s.queue_scratch[warp] + __popc(mask & ((1U << lane) - 1U));
-        entries[queue.begin + s.queue_base + offset] = row;
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-            return_queue_detail::ready_entries(a)[queue.begin + s.queue_base + offset])
-            .store(execution_epoch(a), ::cuda::memory_order_release);
+        ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
+            entries[queue.begin + s.queue_base + offset])
+            .store(row, ::cuda::memory_order_release);
         pending = UINT32_MAX;
       }
       copy_sync<threads>();

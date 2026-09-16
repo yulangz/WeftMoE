@@ -212,7 +212,7 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned context,
           (sequence - wire_state.sent) * (1ULL * ring::kReturnPorts * ring::kChunkRows);
       const auto rows = position < queue.capacity
           ? unsigned(min(queue.capacity - position, 1ULL * ring::kChunkRows)) : 0U;
-      if (return_queue_detail::ready_rows(a, queue, position, rows) != rows)
+      if (!return_queue_detail::ready_block(a, queue, position, rows))
         continue;
       task = wire::Transfer{channel, rows,
           position + 1ULL * ring::kReturnPorts * ring::kChunkRows >= queue.capacity,

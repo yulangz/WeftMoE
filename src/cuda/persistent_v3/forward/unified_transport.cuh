@@ -523,7 +523,7 @@ __device__ __forceinline__ bool progress_return(const ForwardKernelArgs &a,
       if (position >= q.capacity) continue;
       const auto rows = unsigned(min(q.capacity - position,
                                     1ULL * a.forward_local_return_batch_rows));
-      if (return_queue_detail::ready_rows(a, q, position, rows) != rows) continue;
+      if (!return_queue_detail::ready_block(a, q, position, rows)) continue;
       s.return_queue = first + peer;
       s.return_cursor = position;
       s.return_rows = rows;
