@@ -187,6 +187,20 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
                 source["1_gemm"]["gin_channel_pack_limit"] = [value, 3]
                 self.plan("forward", source)
 
+    def test_fanout_lane_groups_are_tunable_and_legacy_defaults_are_explicit(self):
+        frozen = self.frozen("forward")
+        del frozen["fixed"]["1_gemm"]["gin_fanout_lanes"]
+        candidates = fw.expand_candidates(self.plan("forward", frozen))
+        self.assertEqual(candidates[0]["config"]["gin_fanout_lanes"], 1)
+        frozen["fixed"]["1_gemm"]["gin_fanout_lanes"] = 4
+        candidates = fw.expand_candidates(self.plan("forward", frozen))
+        self.assertEqual(candidates[0]["config"]["gin_fanout_lanes"], 4)
+        for value in (0, 3, 64):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    PlanError, "gin_fanout_lanes"):
+                frozen["fixed"]["1_gemm"]["gin_fanout_lanes"] = value
+                fw.expand_candidates(self.plan("forward", frozen))
+
 
     def test_legacy_grid_is_not_pruned(self):
         source = self.source("backward")

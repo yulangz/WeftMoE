@@ -15,10 +15,13 @@ class DispatchReceiveTicketsTest(unittest.TestCase):
             claimed = durable
             payload, readers, seen = {}, {}, {}
             pending, completed, acknowledgements = [], [0] * depth, set()
+            # Completion and credit delivery are independent. In particular,
+            # an idle consumer must not make its source slot reusable early.
+            credits = []
             for _step in range(100000):
                 if len(acknowledgements) == len(sizes):
                     break
-                operation = rng.randrange(3)
+                operation = rng.randrange(4)
                 if operation == 0 and sent < len(sizes):
                     sequence = durable + sent
                     slot = sequence % depth
@@ -45,8 +48,11 @@ class DispatchReceiveTicketsTest(unittest.TestCase):
                         readers[sequence, part] = (slot, begin, end)
                         if part + 1 == parts:
                             claimed = max(claimed, sequence + 1)
-                elif readers:
+                elif operation == 2 and readers:
                     key = rng.choice(list(readers))
+                    slot = readers[key][0]
+                    if completed[slot] % parts == parts - 1 and len(credits) == 4:
+                        continue
                     slot, begin, end = readers.pop(key)
                     sequence, _part = key
                     self.assertEqual(payload[slot][0], sequence,
@@ -58,14 +64,23 @@ class DispatchReceiveTicketsTest(unittest.TestCase):
                         rows = [row for part in range(parts)
                                 for row in range(*seen[sequence, part])]
                         self.assertEqual(rows, list(range(sizes[sequence - durable])))
-                        self.assertNotIn(sequence, acknowledgements)
-                        acknowledgements.add(sequence)
-                        del payload[slot]
+                        self.assertNotIn((sequence, slot), credits)
+                        credits.append((sequence, slot))
+                elif operation == 3 and credits:
+                    # Different contexts may deliver credits in any order.
+                    sequence, slot = credits.pop(rng.randrange(len(credits)))
+                    self.assertEqual(payload[slot][0], sequence)
+                    self.assertFalse(any(key[0] == sequence for key in readers))
+                    self.assertNotIn(sequence, acknowledgements)
+                    acknowledgements.add(sequence)
+                    del payload[slot]
             else:
                 self.fail("receive protocol failed to drain")
             self.assertEqual(ticket, len(sizes) * parts)
             self.assertEqual(claimed, durable + len(sizes))
             self.assertFalse(readers)
+            self.assertFalse(credits)
+            self.assertFalse(payload)
             durable = claimed
 
     def test_reuse_short_packets_empty_packets_and_delayed_claims(self):

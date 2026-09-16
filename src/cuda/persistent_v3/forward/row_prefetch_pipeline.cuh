@@ -113,12 +113,24 @@ public:
 
 // One received row can feed several local peers. Keep its immutable metadata
 // descriptor until the prefetched payload is ready, then issue every fanout
-// from the same staging slot. A group contains all stores from that slot, so
-// the same read-completion rule as the single-destination pipeline protects
-// reuse without serializing each row behind all of its peer writes.
-template <class Storage, class Descriptor, class Destination>
+// from the same staging slot. Cooperating lanes divide the fanouts and each
+// commit one bulk group per slot, including empty groups. Joining their read
+// completions protects reuse without waiting for each peer write to complete
+// globally. Global completion remains mandatory before readiness or credit.
+template <class Storage, class Descriptor, class Destination, unsigned GroupLanes = 1U>
 class FanoutRowPrefetchPipeline {
   static constexpr unsigned depth = Storage::kBuffers;
+  static_assert(GroupLanes >= 1U && GroupLanes <= 32U &&
+                !(GroupLanes & (GroupLanes - 1U)));
+  __device__ __forceinline__ unsigned member() const {
+    return threadIdx.x % GroupLanes;
+  }
+  __device__ __forceinline__ void group_sync() const {
+    if constexpr (GroupLanes > 1U) {
+      const unsigned first = (threadIdx.x % 32U) / GroupLanes * GroupLanes;
+      __syncwarp(unsigned((0xffffffffULL >> (32U - GroupLanes)) << first));
+    }
+  }
   static_assert(depth == 1U || depth == 2U);
 
   Storage &storage_;
@@ -142,9 +154,14 @@ class FanoutRowPrefetchPipeline {
     auto *buffer = storage_.staging +
                    (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
     auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
-    ::cuda::device::experimental::cp_async_bulk_global_to_shared(
-        buffer, source, bytes, full);
-    tickets_[Slot] = ::cuda::device::barrier_arrive_tx(full, 1U, bytes);
+    // Every fanout issuer must release its shared reads before the loader
+    // reuses this slot. Keep two independently committed groups per member.
+    group_sync();
+    if (member() == 0U) {
+      ::cuda::device::experimental::cp_async_bulk_global_to_shared(
+          buffer, source, bytes, full);
+      tickets_[Slot] = ::cuda::device::barrier_arrive_tx(full, 1U, bytes);
+    }
     descriptors_[Slot] = descriptor;
     offsets_[Slot] = offset;
     extents_[Slot] = bytes;
@@ -155,15 +172,19 @@ class FanoutRowPrefetchPipeline {
   __device__ __forceinline__ void retire() {
     static_assert(Slot < depth);
     auto &full = storage_.row_prefetch_full[warp_ * Storage::kStorageSlots + Slot];
-    full.wait(static_cast<CopyBarrier::arrival_token &&>(tickets_[Slot]));
+    if (member() == 0U)
+      full.wait(static_cast<CopyBarrier::arrival_token &&>(tickets_[Slot]));
+    group_sync();
     const auto *buffer = storage_.staging +
                          (warp_ * Storage::kStorageSlots + Slot) * Storage::kSegmentBytes;
-    for (unsigned fanout = 0U; fanout < fanouts_[Slot]; ++fanout) {
+    for (unsigned fanout = member(); fanout < fanouts_[Slot]; fanout += GroupLanes) {
       auto *target = static_cast<char *>(
           destination_(descriptors_[Slot], fanout));
       ::cuda::device::experimental::cp_async_bulk_shared_to_global(
           target + offsets_[Slot], buffer, extents_[Slot]);
     }
+    // Commit even for an empty fanout lane so slot/group ages stay equal
+    // across the group (PTX permits empty bulk async-groups).
     ::cuda::device::experimental::cp_async_bulk_commit_group();
   }
 

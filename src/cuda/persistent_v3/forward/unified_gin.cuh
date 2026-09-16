@@ -406,7 +406,12 @@ __device__ __forceinline__ void pack_dispatch(const ForwardKernelArgs &a,
     row_pipeline.drain();
     finish_copies<false>();
   }
-  __threadfence_system();
+  // Join every metadata writer and completed TMA issuer before importing
+  // their writes into one system-scope release. The pending-slot release /
+  // acquire then hands this visibility to the independent GIN submitter.
+  copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
+  if (tid == 0U)
+    __threadfence_system();
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, DispatchPackEnd,
                              GinDispatch, task.channel, task.rows,
@@ -450,7 +455,12 @@ __device__ __forceinline__ void pack_return(const ForwardKernelArgs &a,
     row_pipeline.drain();
     finish_copies<false>();
   }
-  __threadfence_system();
+  // Join every metadata writer and completed TMA issuer before importing
+  // their writes into one system-scope release. The pending-slot release /
+  // acquire then hands this visibility to the independent GIN submitter.
+  copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
+  if (tid == 0U)
+    __threadfence_system();
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, ReturnPackEnd, GinReturn,
                              task.channel, task.rows, execution_epoch(a));
@@ -558,6 +568,10 @@ __device__ __forceinline__ void flush_receive(const ForwardKernelArgs &a) {
   }
 }
 
+#ifndef WEFTMOE_FWD_GIN_FANOUT_LANES
+#define WEFTMOE_FWD_GIN_FANOUT_LANES 1
+#endif
+
 template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                                                  Storage &s,
@@ -572,7 +586,11 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
                       task.first * a.gin_rings.dispatch_row_bytes;
   const auto source = wire::peer(a, task.channel);
   const unsigned items = task.rows * a.dispatch.identity.top_k;
-  if (lane < Storage::kDispatchLanes) {
+  constexpr unsigned group_lanes =
+      Storage::kDispatchLanes * WEFTMOE_FWD_GIN_FANOUT_LANES <= 32U
+          ? WEFTMOE_FWD_GIN_FANOUT_LANES : 1U;
+  const unsigned group = lane / group_lanes, member = lane % group_lanes;
+  if (group < Storage::kDispatchLanes) {
     auto destination = [&a](const char *record, unsigned index) -> void * {
       const auto target =
           reinterpret_cast<const ForwardDispatchFanoutRecord *>(
@@ -582,18 +600,18 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
       return peer_at<transport::BFloat16>(base, a.canonical_rows_offset) +
              target.dst_row * a.hidden;
     };
-    LaneStagingView<Storage> view(s, warp, lane);
+    LaneStagingView<Storage> view(s, warp, group);
     FanoutRowPrefetchPipeline<LaneStagingView<Storage>, const char *,
-                             decltype(destination)>
+                             decltype(destination), group_lanes>
         row_pipeline(view, 0U, destination);
-    for (unsigned row = warp * Storage::kDispatchLanes + lane; row < task.rows;
+    for (unsigned row = warp * Storage::kDispatchLanes + group; row < task.rows;
          row += Storage::kCopyWarps * Storage::kDispatchLanes) {
       const auto *record = chunk + row * a.gin_rings.dispatch_row_bytes;
       const auto header = *reinterpret_cast<const ring::DispatchRow *>(record);
       const unsigned fanouts =
           min(header.fanouts, unsigned(a.dispatch.identity.top_k));
       // Write each fanout's metadata once, before readiness can be published.
-      for (unsigned index = 0U; index < fanouts; ++index) {
+      for (unsigned index = member; index < fanouts; index += group_lanes) {
         const auto target =
             reinterpret_cast<const ForwardDispatchFanoutRecord *>(
                 record + sizeof(ring::DispatchRow))[index];
@@ -623,8 +641,11 @@ __device__ __forceinline__ void receive_dispatch(const ForwardKernelArgs &a,
           unsigned(a.hidden * 2ULL), fanouts);
     }
     row_pipeline.drain();
-    finish_copies();
+    finish_copies<false>();
   }
+  copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
+  if (tid == 0U)
+    __threadfence_system();
   copy_sync<Storage::kCopyThreads, Storage::kCopyBarrier>();
   for (unsigned item = tid; item < items; item += Storage::kCopyThreads) {
     const auto *record = chunk + (item / a.dispatch.identity.top_k) *

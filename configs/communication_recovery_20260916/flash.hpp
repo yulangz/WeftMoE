@@ -1,6 +1,6 @@
 // Communication recovery checkpoint; retain the existing model GEMM resources.
 #define WEFTMOE_FWD_DISPATCH_PUBLISH_BATCH_ROWS 64
-#define WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH 1
+#define WEFTMOE_FWD_GIN_FANOUT_LANES 4
 #define WEFTMOE_FWD_GIN_RECEIVE_ROWS 16
 #define WEFTMOE_GIN_RETURN_PORTS 2
 #define WEFTMOE_GIN_RING_DEPTH 8

@@ -17,17 +17,9 @@
 namespace forward_unified_transport {
 
 using CopyBarrier = ::cuda::barrier<::cuda::thread_scope_block>;
-#ifndef WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH
-#define WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH 1
-#endif
-inline constexpr unsigned kLocalBatchesPerGinDispatch =
-    WEFTMOE_FWD_LOCAL_BATCHES_PER_GIN_DISPATCH;
-static_assert(kLocalBatchesPerGinDispatch > 0U);
 #ifndef WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH
 #define WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH 0
 #endif
-
-
 
 #include "cuda/persistent_v3/forward/unified_gin_state.cuh"
 
@@ -79,7 +71,6 @@ struct alignas(128) Shared {
   unsigned gin_rx_dispatch;
   unsigned gin_rx_return;
   unsigned gin_progressed;
-  unsigned local_dispatch_since_receive;
 };
 
 template <unsigned Threads, unsigned BarrierId = 8U>
@@ -146,7 +137,6 @@ init(const ForwardKernelArgs &a, persistent_v3::ForwardPipelineControl &control,
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     s.gin_rx_dispatch = s.gin_rx_return = blockIdx.x;
     s.gin_progressed = 0U;
-    s.local_dispatch_since_receive = kLocalBatchesPerGinDispatch;
     s.gin_task.channel = activation_ring_detail::kNoChannel;
     if (blockIdx.x == 0U) {
       __threadfence_system();
@@ -362,7 +352,15 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
       // Every participating issuer completes its writes before readiness.
       finish_copies<false>();
     }
-    __threadfence_system();
+    // Import all metadata stores and completed TMA stores before one
+    // system release per independent copy group. Publish only after that
+    // release has completed, even when another lane publishes readiness.
+    if constexpr (Optimize)
+      __syncwarp();
+    else
+      copy_sync<threads, BarrierId>();
+    if (metadata_tid == 0U)
+      __threadfence_system();
     if constexpr (Optimize)
       __syncwarp();
     else
@@ -851,19 +849,14 @@ run_impl(const ForwardKernelArgs &a,
           !UseGin || !WEFTMOE_FWD_DEFER_LOCAL_RETURN_DURING_DISPATCH ||
           s.dispatch_complete != 0U;
       copy_sync<Storage::kCopyThreads>();
-      bool remote_progress = false;
+      bool remote_progress = false, received_dispatch = false;
       if constexpr (UseGin) {
         remote_progress = gin_detail::progress_receive<BaseThread>(a, s, false);
-        // A received token can fan out to several local routes. Bound its
-        // share of the copy domain without enlarging local batches or delaying
-        // Return service. Empty receives keep polling; once local work ends,
-        // every iteration can drain received Dispatch again.
-        if (!s.dispatch_complete &&
-            (s.local_dispatch_since_receive >= kLocalBatchesPerGinDispatch ||
-             s.dispatch_cursor >= s.dispatch_end)) {
-          const bool received_dispatch = gin_detail::progress_receive<BaseThread>(a, s, true);
-          if (received_dispatch && tid == 0U)
-            s.local_dispatch_since_receive = 0U;
+        // Drain ready network work promptly; local work fills receive gaps.
+        // Both sources are finite, and neither sender depends on this local
+        // copy cursor, so this priority cannot create a circular wait.
+        if (!s.dispatch_complete) {
+          received_dispatch = gin_detail::progress_receive<BaseThread>(a, s, true);
           remote_progress = received_dispatch || remote_progress;
         }
         if (rdma_ctas == 0U)
@@ -872,7 +865,7 @@ run_impl(const ForwardKernelArgs &a,
       }
       constexpr bool optimize_local =
           !UseGin || forward_tuning::kUnifiedOptimizeGinLocalTransport;
-      const bool dispatched =
+      const bool dispatched = !received_dispatch &&
           progress_dispatch<BaseThread, 0U, 0U, 8U, optimize_local, UseGin>(a, s);
       // Local Return entries live in finite per-generation storage: compute
       // producers do not need these consumers to finish Dispatch. Keep GIN
@@ -883,8 +876,6 @@ run_impl(const ForwardKernelArgs &a,
               ? progress_return<BaseThread, 0U, 0U, 8U, optimize_local>(a, s)
               : false;
       if (tid == 0U) {
-        if (dispatched && s.local_dispatch_since_receive < kLocalBatchesPerGinDispatch)
-          ++s.local_dispatch_since_receive;
         if (!s.dispatch_complete && s.dispatch_cursor >= s.dispatch_end &&
             (!UseGin ||
              gin_detail::dispatch_receive_complete(a))) {
