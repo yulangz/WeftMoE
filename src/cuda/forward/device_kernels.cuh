@@ -232,7 +232,7 @@ __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
                                    kForwardTransportClearArrivals),
       gridDim.x);
   if (stream_remote_dispatch || stream_local_dispatch) {
-    return_queue_detail::initialize(a);
+    return_queue_detail::initialize<true>(a);
     forward_transport_cta_barrier(
         forward_mixed_scheduler_word(a, scheduler,
                                      kForwardTransportClearArrivals),

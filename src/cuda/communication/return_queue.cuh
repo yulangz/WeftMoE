@@ -96,8 +96,19 @@ __device__ __forceinline__ unsigned index(const ForwardKernelArgs &a,
              : (source / a.local_world_size == a.node ? 0U : 1U + source);
 }
 
-template <class Args>
+// Parallel callers must join the setup grid before releasing producers. Row
+// storage follows Notify's exact incoming count; per-queue rounding needs at
+// most one extra ready block per queue. Queue metadata still has one owner.
+template <bool ParallelClear = false, class Args>
 __device__ __forceinline__ void initialize(const Args &a) {
+  if constexpr (ParallelClear) {
+    const auto total = dispatch_sizes(a.dispatch).incoming_row_count;
+    const auto blocks = total / kReadyBlockRows + 1ULL + a.world;
+    const auto tid = 1ULL * blockIdx.x * blockDim.x + threadIdx.x;
+    const auto stride = 1ULL * gridDim.x * blockDim.x;
+    for (auto i = tid; i < total; i += stride) entries(a)[i] = UINT32_MAX;
+    for (auto i = tid; i < blocks; i += stride) entries(a)[total + i] = 0U;
+  }
   if (blockIdx.x)
     return;
   auto *q = queues(a);
@@ -130,6 +141,11 @@ __device__ __forceinline__ void initialize(const Args &a) {
     }
   }
   __syncthreads();
+  if constexpr (ParallelClear) {
+    if (q[a.world].begin + q[a.world].capacity != dispatch_sizes(a.dispatch).incoming_row_count)
+      asm volatile("trap;");
+    return;
+  }
   const auto total = q[a.world].begin + q[a.world].capacity;
   for (unsigned long long i = threadIdx.x; i < total; i += blockDim.x)
     entries(a)[i] = UINT32_MAX;
