@@ -9913,6 +9913,115 @@
         }
       ],
       "finding": "Qwen EP16 8K baseline local32/quota4 D32.8337/R42.2898GB/s,GPU4397.020us. local64/quota2 D32.8476/R42.3135,GPU4419.810;local128/quota1 D32.6400/R42.3342,GPU4400.720. Both retain128 local rows per32 received source rows and existing2x2 issuer pipeline. No gain from amortizing polls/batch joins this way;128 sparse files exact over12 repetitions. Reject without full/BWD/64K sweep."
+    },
+    {
+      "name": "Smaller received tasks only in each channel final packets",
+      "source": "/tmp/weftmoe-adaptive-rx-tail",
+      "source_commit": "3e15345",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/adaptive_rx_tail_screen",
+      "protocol_review": "results/communication_bottleneck_20260915/adaptive_rx_tail_screen/protocol_review.json",
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1024.495,
+              "fc2": 135.84,
+              "return": 3174.8,
+              "reduce": 2462.62,
+              "forward": 4395.6,
+              "wall": 5828.385
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.2651735733215,
+              "nv_return": 36.99146780899584,
+              "rdma_dispatch": 32.75216765333165,
+              "rdma_return": 42.27596321028096
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "adaptive_rx_tail16_packets2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1019.165,
+              "fc2": 133.44,
+              "return": 3177.0550000000003,
+              "reduce": 2443.075,
+              "forward": 4377.92,
+              "wall": 5757.73
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.46417802809165,
+              "nv_return": 36.96521212254745,
+              "rdma_dispatch": 32.92345400401309,
+              "rdma_return": 42.245956711482805
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "adaptive_rx_tail8_packets1_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1014.48,
+              "fc2": 132.64,
+              "return": 3177.955,
+              "reduce": 2526.3500000000004,
+              "forward": 4401.665,
+              "wall": 5816.889999999999
+            },
+            "payload_GBps": {
+              "nv_dispatch": 231.52849144389245,
+              "nv_return": 36.95474353790409,
+              "rdma_dispatch": 33.075498777698925,
+              "rdma_return": 42.233992614747535
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K baseline D32.7522/R42.2760GB/s,GPU4395.600us;last2packets RX16 D32.9235/R42.2460,GPU4377.920;last1packet RX8 D33.0755/R42.2340,GPU4401.665.0.52/0.99% Dispatch gains and inconsistent small total changes do not justify adoption/full expansion.128 sparse files exact over12 repetitions. Reserved ChunkHeader word contains remaining same-channel packets,accounting for8-channel interleaving;no wire-size increase. Runtime receive quantum is fixed by immutable packet metadata;part refcount and local service quota scale accordingly. All full TMA waits,signal acquire and credit ordering retained."
     }
   ],
   "diagnostics": [
