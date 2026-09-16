@@ -10592,6 +10592,148 @@
       "references": [
         "https://docs.nvidia.com/cuda/hopper-tuning-guide/"
       ]
+    },
+    {
+      "name": "Packer tries ordered GIN submission without controller handoff",
+      "adopted": false,
+      "experimental_commit": "9e3c5f5",
+      "source": "/tmp/weftmoe-gin-packer-submit",
+      "raw_results": "results/communication_bottleneck_20260915/gin_packer_submit_screen",
+      "implementation": "Copy leader tries the existing context lease once after full TMA completion and SYS fence/join. If acquired and exact next channel sequence, submits its own slot and accounts bytes;otherwise publishes normal pending2 handoff. No spinning, no premature source/credit reuse, no changed wire protocol or shape branch.",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_qwen_pure_ep16_8192",
+          "ep": 16,
+          "tokens": 8192,
+          "top_k": 8,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "source": "/tmp/weftmoe-parallel-gin-payload-issuers",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789531215.2863505,
+          "ended_unix": 1789531232.5258422,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.2,
+              "fc2": 135.152,
+              "return": 3173.135,
+              "reduce": 2380.51,
+              "forward": 4396.48,
+              "wall": 5790.1900000000005
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.00491970231099,
+              "nv_return": 37.01087788575021,
+              "rdma_dispatch": 32.85784567175871,
+              "rdma_return": 42.2981461551431
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-parallel-gin-payload-issuers/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "120"
+          ]
+        },
+        {
+          "name": "gin_packer_submit_ep16_8192",
+          "ep": 16,
+          "tokens": 8192,
+          "top_k": 8,
+          "rounds": 20,
+          "timeout": 120,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2abe7dec33a4b49a29ff7e8a1b96b64ae8c1caba4fb596593fd52a31f2f94bff/test_cuda_notify",
+          "source": "/tmp/weftmoe-gin-packer-submit",
+          "retain": false,
+          "check": false,
+          "environment": {},
+          "started_unix": 1789531233.1712565,
+          "ended_unix": 1789531251.1164374,
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1025.57,
+              "fc2": 136.608,
+              "return": 3179.6949999999997,
+              "reduce": 2407.165,
+              "forward": 4398.925,
+              "wall": 5788.115
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.02485837144224,
+              "nv_return": 36.93452107827952,
+              "rdma_dispatch": 32.71783691020603,
+              "rdma_return": 42.21088123231946
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          },
+          "argv": [
+            "/opt/.venv/bin/python",
+            "/tmp/weftmoe-gin-packer-submit/tests/run_multinode_nccl.py",
+            "--binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2abe7dec33a4b49a29ff7e8a1b96b64ae8c1caba4fb596593fd52a31f2f94bff/test_cuda_notify",
+            "--remote-binary",
+            "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.2abe7dec33a4b49a29ff7e8a1b96b64ae8c1caba4fb596593fd52a31f2f94bff/test_cuda_notify",
+            "--remote",
+            "root@10.10.19.233",
+            "--port",
+            "2222",
+            "--gpus-per-node",
+            "8",
+            "--scenario",
+            "gin_forward_bench",
+            "--nccl-lib-dir",
+            "/usr/local/cuda/compat:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64",
+            "--socket-ifname",
+            "bond0",
+            "--enable-ib",
+            "--timeout",
+            "120"
+          ]
+        }
+      ],
+      "finding": "QwenEP16 8K baseline D32.857846/R42.298146GB/s vs direct-packer D32.717837/R42.210881;GPU4396.480->4398.925us. Registers168/stack104 unchanged.64 sparse files exact over12 native repeats. No gain;do not adopt or expand full/BWD/64K. Both native sparse logs explicitly PASS. Clock cleanup succeeded."
     }
   ],
   "diagnostics": [
@@ -12494,6 +12636,136 @@
         }
       },
       "finding": "Qwen EP16 8K all16ranks:1024data packet records plus128terminals;sum8192payload rows/rank,zero overflow,20native repeated-output checks,clock cleanup rc0. Tail-packet first-to-last claim span9.472us median,last-claim-to-finish79.184us. Independently observed ready-to-first claim only4/16tail packets valid (median6.624us),ready-to-last13/16valid(median6.976us);remaining observer records are late and cannot bound the pre-first-claim wait. Acrossall1024data packets,503observed-before-first,881before-last. Tail observed time910.080us,firstclaim911.744,lastclaim920.512,lastfinish1004.016us medians. Sender local first/last nonempty GIN submissions146.816/668.240us;timestamps relative to eachGPU own setup start,not cross-GPU latency measurements. Additional controller signal probes and trace stores perturb scheduling;diagnostic only. The measured intra-packet claiming span is much smaller than tail processing,while actual pre-first-claim NIC wait remains only partially observed."
+    },
+    {
+      "name": "Raw GDAKI link throughput with matched total bytes and concurrent contexts",
+      "experimental_commit": "836cb98",
+      "source": "/tmp/weftmoe-gin-multicontext-probe",
+      "raw_results": "results/communication_bottleneck_20260915/gin_multicontext_probe",
+      "method": "1CTA,one warp leader per context;3*activeContexts allocated,nonexclusive,FULL,same remote-numbered GPU. Independent receive regions. All contexts finish local counter and remote indexed signal per sample.12 measured samples after4 warmups. Median iteration-slowest-rank,1620MHz/700W. Kernel interval excludes allocations/packing/NVLink,so diagnostic transport throughput only,not goal achievement.",
+      "cases": [
+        {
+          "name": "contexts1_bytes559120_totalputs64",
+          "contexts": 1,
+          "payload_bytes": 559120,
+          "total_puts": 1,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 46.704,
+          "wire_GBps": 11.97156560465913,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts1_bytes559120_totalputs64",
+          "contexts": 1,
+          "payload_bytes": 559120,
+          "total_puts": 64,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 1520.608,
+          "wire_GBps": 23.532481744144448,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts2_bytes559120_totalputs64",
+          "contexts": 2,
+          "payload_bytes": 559120,
+          "total_puts": 2,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 47.296,
+          "wire_GBps": 23.64343707713126,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts2_bytes559120_totalputs64",
+          "contexts": 2,
+          "payload_bytes": 559120,
+          "total_puts": 64,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 776.88,
+          "wire_GBps": 46.06075584388837,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts8_bytes559120_totalputs64",
+          "contexts": 8,
+          "payload_bytes": 559120,
+          "total_puts": 8,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 116.656,
+          "wire_GBps": 38.343162803456316,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts8_bytes559120_totalputs64",
+          "contexts": 8,
+          "payload_bytes": 559120,
+          "total_puts": 64,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 774.992,
+          "wire_GBps": 46.17296694675558,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts8_bytes4194304_totalputs64",
+          "contexts": 8,
+          "payload_bytes": 4194304,
+          "total_puts": 8,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 726.832,
+          "wire_GBps": 46.16532018403152,
+          "all_rank_payloads_match": true
+        },
+        {
+          "name": "contexts8_bytes4194304_totalputs64",
+          "contexts": 8,
+          "payload_bytes": 4194304,
+          "total_puts": 64,
+          "backend_types": [
+            3
+          ],
+          "railed_backend_types": [
+            3
+          ],
+          "median_slowest_rank_us": 5661.12,
+          "wire_GBps": 47.417376066926685,
+          "all_rank_payloads_match": true
+        }
+      ],
+      "finding": "Fixed64*559120 bytes:contexts1 23.5325,contexts2 46.0608,contexts8 46.1730GB/s.8contexts,64*4MiB47.4174GB/s. All16ranks backend type3 GDAKI;all independent context receive regions verified. Original single exclusive-context test~23.9GB/s was not a dual-port link ceiling. Clocks restored."
     }
   ]
 }
