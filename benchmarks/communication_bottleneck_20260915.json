@@ -10310,6 +10310,110 @@
         }
       ],
       "finding": "Qwen EP16 8K at1620MHz:Dispatch-first pack reservation D32.5776/R42.1606GB/s,GPU4404.210us;per-copy-warp audit accumulation D32.8517/R42.1952,GPU4407.970. Neither improves against paired baseline sufficiently to adopt.128 sparse files exact over12 native checks;all8 exported traffic/packet counters match all16ranks for both257 and8192tokens. Audit total is flushed before Dispatch completion timestamp;no traffic or work omitted. Pure test waits for local Dispatch before synthetic Return production,so the priority screen primarily measures empty Return probing,not steady simultaneous Forward Dispatch/Return competition. No full/BWD/64K expansion;clocks restored."
+    },
+    {
+      "name": "Current RX cooperative metadata and deferred local notification polling",
+      "adopted": false,
+      "source_commits": [
+        "e1f5c98",
+        "6157737"
+      ],
+      "raw_results": "results/communication_bottleneck_20260915/rx_metadata_notification_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "resource_audit": "results/communication_bottleneck_20260915/rx_metadata_notification_screen/resource_usage.json",
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1020.7049999999999,
+              "fc2": 135.024,
+              "return": 3176.065,
+              "reduce": 2475.17,
+              "forward": 4392.525,
+              "wall": 5862.88
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.11646264101773,
+              "nv_return": 36.976734418218776,
+              "rdma_dispatch": 32.87378037728825,
+              "rdma_return": 42.259125049392885
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "defer_dispatch_notification_polls_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.21432e372df26a917b67c500a7240ac836bbab4300148491ce039e21fe7fd788/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1021.97,
+              "fc2": 136.224,
+              "return": 3176.285,
+              "reduce": 2444.83,
+              "forward": 4394.77,
+              "wall": 5806.415
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.8316232374727,
+              "nv_return": 36.974173287346694,
+              "rdma_dispatch": 32.83308903392468,
+              "rdma_return": 42.256198042681945
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "cooperative_rx_metadata_current_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.f6c400c9d9ca617a5dd8df35f59e46bb598157562b912c1f56253d5e7846f590/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1023.855,
+              "fc2": 136.464,
+              "return": 3174.62,
+              "reduce": 2382.3999999999996,
+              "forward": 4391.469999999999,
+              "wall": 5845.915
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.4084845998701,
+              "nv_return": 36.99356521410437,
+              "rdma_dispatch": 32.7726406571243,
+              "rdma_return": 42.2783602446907
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K at1620MHz:baseline D32.8738/R42.2591GB/s,GPU4392.525us;deferred local Return notification polls D32.8331/R42.2562,GPU4394.770;cooperative RX metadata current2x2 lanes D32.7726/R42.2784,GPU4391.470. Neither improves normal8K throughput.128 sparse paired files exact over12 repetitions;cooperative metadata sparse Dispatch255.328->234.336us does not transfer to8K. Reject both without full/BWD/64K expansion. Deferred polls are conditional on GIN plus local-Return-send deferral,restore service on own Dispatch completion via CTA release/acquire flag;Dispatch progress cannot depend on local Return credits in that schedule. Cooperative metadata repeats earlier4-lane idea on current2-lane stack because current RX phase trace shows30us metadata;no incremental gain confirms rejection here too. Pure REG168 unchanged;baseline/cooperative stack104,deferred-poll120bytes. Both nodes clocks restored."
     }
   ],
   "diagnostics": [
