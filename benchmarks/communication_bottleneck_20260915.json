@@ -11066,6 +11066,52 @@
       "sha256": "f8fb3bac8526d6727079f5fa79de2ebb1b64b3a63b7cc3f4c62eb8414c8763a3",
       "lines": "550-629",
       "finding": "ncclGin_BackendMask::put synchronizes the supplied cooperative group but performs submission only in thread_rank()==0;all backend Put calls receive ncclCoopThread(). Merely changing the caller argument from ncclCoopThread to ncclCoopWarp would not parallelize descriptor preparation in this installed implementation. No such source change or GPU experiment was made."
+    },
+    {
+      "name": "Continuous CUPTI PC sampling with synchronized host export",
+      "raw_results": "results/communication_bottleneck_20260915/continuous_pc_sampling_v2",
+      "source": "/tmp/weftmoe-parallel-gin-payload-issuers",
+      "source_commit": "0fd0d45",
+      "rank": 0,
+      "case": {
+        "timing_us": {
+          "dispatch": 1021.9200000000001,
+          "fc2": 135.424,
+          "return": 3176.27,
+          "reduce": 2373.15,
+          "forward": 4397.2,
+          "wall": 5786.415
+        },
+        "payload_GBps": {
+          "nv_dispatch": 229.84286832628774,
+          "nv_return": 36.97434789863583,
+          "rdma_dispatch": 32.83469547518396,
+          "rdma_return": 42.25639759844094
+        },
+        "shape": {
+          "experts": 256,
+          "hidden": 2048,
+          "intermediate": 512,
+          "tokens_per_rank": 8192,
+          "top_k": 8
+        }
+      },
+      "native_repetitions": 20,
+      "returncode": 0,
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "buffers": 29,
+      "dropped_samples": 0,
+      "kernel_samples": 4325442,
+      "finding": "Continuous non-replay sampling completed and exported successfully after fixing example sampler host-buffer synchronization and buffer-identity tracking. Initial sample timed out during host shutdown with GPU idle; partial sample preserved separately. Complete file includes both Dispatch and Return, math polling/reduction and communication. Do not attribute whole-kernel stall percentages to communication or elapsed time. Lineinfo correlation is the next diagnostic; sampling performance is diagnostic only. No production code changed."
     }
   ]
 }
