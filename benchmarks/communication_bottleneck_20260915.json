@@ -9458,6 +9458,21 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K baseline D32.9209/R42.1892GB/s;50percent local Dispatch CTAs28.3613/41.5372;67percent31.6427/42.0097. GPU4408.9->4553.325/4439.535us. Reject;no full/64K/BWD sweep. Local Dispatch stripes remain static;completed local domains join incoming Dispatch;GIN Return remains shared throughout and local Return/publisher ownership unchanged. All physical CTAs retain math.128 sparse files exact over12 repeats. Baseline sparse wall17050us was anomalous versus~2100us candidates;no sparse wall speedup claim.8K wall6319.71/5967.89/5927.825us retained,but GPU/phase regressions determine rejection."
+    },
+    {
+      "name": "Source-rank rotation of the local Dispatch expert tie-breaker",
+      "source": "/tmp/weftmoe-source-rotated-local-dispatch",
+      "source_commit": "5252833",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/source_rotated_dispatch_lanes2_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Qwen EP16 8K paired D32.7925->33.2181GB/s (+1.30%),R42.3222->42.2967. GPU4392.785->4404.835us,wall5777.54->5937.615. Small Dispatch gain without overall gain;no full/BWD/64K expansion or adoption. Only source-dependent expert tie-breaker in existing locality/M-tile sort changed, both packed-key and fallback sorts agree. Canonical destinations and summation order untouched;no additional pass or payload traffic.64 sparse files exact over12 repetitions."
     }
   ],
   "diagnostics": [
