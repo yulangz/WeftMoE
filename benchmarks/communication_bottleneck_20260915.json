@@ -9392,6 +9392,21 @@
         "repetitions": 12
       },
       "finding": "Qwen EP16 8K paired pure screen: incumbent parallel GIN D32.8495/R42.2919 GB/s versus rolling fanout D32.7798/R42.2617. GPU4394.080->4393.245us, wall5820.795->5862.610. No measurable gain;reject and do not run full/64K/BWD for this variant. Same two slots, payload bytes, and global TMA completion ordering.64 sparse files exact over12 repetitions. Incumbent Return above42GB/s confirmed in another run."
+    },
+    {
+      "name": "Align local route metadata headers to sixteen bytes",
+      "source": "/tmp/weftmoe-aligned-local-route-header",
+      "source_commit": "16c41ea",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/aligned_local_header_lanes2_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 64,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "finding": "Qwen EP16 8K incumbent D32.918/R42.231GB/s versus aligned D32.694/R42.149. GPU4391.490->4398.945us;wall5769.795->5778.495.64 sparse files exact with12 repeats. No gain;reject without full/64K/BWD sweep. Header72->80bytes;socket wrapper80->96, all sizes derived from sizeof. Payload wire bytes unchanged. Wider stores were a hypothesis;performance does not support adopting the ABI expansion."
     }
   ],
   "diagnostics": [
