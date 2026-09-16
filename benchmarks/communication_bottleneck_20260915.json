@@ -9490,7 +9490,18 @@
       "resource_audit": "results/communication_bottleneck_20260915/pipelined_completion_resources/summary.json",
       "synchronization": "Issue payload A and B, wait full destination completion of all groups preceding the at-most-min(B_groups,7) newest groups, SYS fence plus copy-domain join, publish A and release its receive part, then full wait0/SYS fence before publishing/releasing B. Count actual nonempty segmented row groups;all existing SMEM read-completion waits remain. No ring credit before its publications;dynamic local service quota tracks task count.",
       "reference": "https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group",
-      "finding": "Qwen EP16 8K RX32 pair:baseline D32.7911/R42.2840GB/s,candidate31.7755/42.2272;GPU4412.465->4434.785us,wall5953.97->5852.27us.64 sparse files exact over12 repetitions,but sparse Dispatch254-ish->319.648us. No adoption or full/64K/BWD sweep. Resource audit bothREG168,stack104->120bytes;does not establish dynamic spill cost. Two RX32 tasks also double aggregate service size to64 rows and may reduce participating CTAs;next matched-granularity comparison uses RX16,base localquota2,paired versus unpaired."
+      "finding": "Qwen EP16 8K RX32 pair:baseline D32.7911/R42.2840GB/s,candidate31.7755/42.2272;GPU4412.465->4434.785us,wall5953.97->5852.27us.64 sparse files exact over12 repetitions,but sparse Dispatch254-ish->319.648us. No adoption or full/64K/BWD sweep. Resource audit bothREG168,stack104->120bytes;does not establish dynamic spill cost. Two RX32 tasks also double aggregate service size to64 rows and may reduce participating CTAs;next matched-granularity comparison uses RX16,base localquota2,paired versus unpaired. MatchedRX16/quotas2 follow-up also regresses versus unpairedRX16;both pairing configurations rejected.",
+      "matched_granularity": {
+        "raw_results": "results/communication_bottleneck_20260915/matched_dispatch_completion_screen",
+        "validation": {
+          "all_byte_identical": true,
+          "files_compared": 128,
+          "tokens": 257,
+          "route_stride": 1,
+          "repetitions": 12
+        },
+        "finding": "Qwen EP16 8K originalRX32 D32.7824/R42.2042GB/s;refactored unpairedRX16 quota2 D32.9207/R42.1979;pairedRX16 quota2 D32.3625/R42.2240. GPU4402.05/4398.21/4405.70us;wall5805.03/6053.91/5817.12. Pairing16-row tasks keeps combined32-row payload size but does not improve throughput.128 sparse files exact over12 repetitions. Reject completion-pair pipeline;no full/64K/BWD expansion. This is evidence against this batching scheme,not proof that fence/pipeline stalls are absent."
+      }
     }
   ],
   "diagnostics": [
