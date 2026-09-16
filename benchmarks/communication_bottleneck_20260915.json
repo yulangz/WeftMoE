@@ -10022,6 +10022,109 @@
         }
       ],
       "finding": "Qwen EP16 8K baseline D32.7522/R42.2760GB/s,GPU4395.600us;last2packets RX16 D32.9235/R42.2460,GPU4377.920;last1packet RX8 D33.0755/R42.2340,GPU4401.665.0.52/0.99% Dispatch gains and inconsistent small total changes do not justify adoption/full expansion.128 sparse files exact over12 repetitions. Reserved ChunkHeader word contains remaining same-channel packets,accounting for8-channel interleaving;no wire-size increase. Runtime receive quantum is fixed by immutable packet metadata;part refcount and local service quota scale accordingly. All full TMA waits,signal acquire and credit ordering retained."
+    },
+    {
+      "name": "GIN controller affinity and one short bootstrap Dispatch packet",
+      "adopted": false,
+      "source_commits": [
+        "e6579dc",
+        "81deb6f"
+      ],
+      "raw_results": "results/communication_bottleneck_20260915/gin_startup_screen",
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.62bb6bb42160eb469a7095f7515fc59bacadc147a829bb2eae1158c6248de284/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1019.38,
+              "fc2": 136.0,
+              "return": 3172.2250000000004,
+              "reduce": 2392.255,
+              "forward": 4385.79,
+              "wall": 5797.225
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.41557024858247,
+              "nv_return": 37.02149500744745,
+              "rdma_dispatch": 32.916510035511784,
+              "rdma_return": 42.31028000851137
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "gin_controller_affinity_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.3a3aec80e31aa1554a6b84f935df6db2e9d1af61a07fa96c171734c4aacb0178/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1026.72,
+              "fc2": 135.328,
+              "return": 3175.79,
+              "reduce": 2405.6800000000003,
+              "forward": 4389.695,
+              "wall": 5789.29
+            },
+            "payload_GBps": {
+              "nv_dispatch": 228.76833411251363,
+              "nv_return": 36.97993633080273,
+              "rdma_dispatch": 32.681190587501945,
+              "rdma_return": 42.26278437806026
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "bootstrap_dispatch32_lanes2_ep16_8192",
+          "returncode": 0,
+          "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/full_cta_all_worker/compile/cache/forward.4eb7e823ac538bae121b31d47857d8504c322ab8de509fcc020d75ce2f88c762/test_cuda_notify",
+          "summary": {
+            "timing_us": {
+              "dispatch": 1000.99,
+              "fc2": 141.584,
+              "return": 3181.2,
+              "reduce": 2499.9049999999997,
+              "forward": 4382.9400000000005,
+              "wall": 5754.3
+            },
+            "payload_GBps": {
+              "nv_dispatch": 234.64872176545222,
+              "nv_return": 36.91704765497296,
+              "rdma_dispatch": 33.521245966493176,
+              "rdma_return": 42.1909116056834
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "finding": "Qwen EP16 8K at requested1620MHz: baseline D32.9165/R42.3103GB/s,GPU4385.790us;controller affinity D32.6812/R42.2628,GPU4389.695;bootstrap32 D33.5212/R42.1909,GPU4382.940. Controller affinity has no gain. Bootstrap improves Dispatch1.84% but total GPU only0.065%;no adoption or full/BWD/64K sweep.128 sparse paired files exact over12 native repeated checks;8K20round performance cases checkFalse. CPU bootstrap cursor proof9234 scheduling cases retained separately. Both nodes clocks restored."
     }
   ],
   "diagnostics": [
