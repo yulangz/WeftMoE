@@ -9502,6 +9502,122 @@
         },
         "finding": "Qwen EP16 8K originalRX32 D32.7824/R42.2042GB/s;refactored unpairedRX16 quota2 D32.9207/R42.1979;pairedRX16 quota2 D32.3625/R42.2240. GPU4402.05/4398.21/4405.70us;wall5805.03/6053.91/5817.12. Pairing16-row tasks keeps combined32-row payload size but does not improve throughput.128 sparse files exact over12 repetitions. Reject completion-pair pipeline;no full/64K/BWD expansion. This is evidence against this batching scheme,not proof that fence/pipeline stalls are absent."
       }
+    },
+    {
+      "name": "PC-guided packet acquire reuse and local Dispatch release ordering",
+      "adopted": false,
+      "raw_results": "results/communication_bottleneck_20260915/pc_guided_acquire_release_screen",
+      "sources": [
+        {
+          "path": "/tmp/weftmoe-rx-packet-acquire-once",
+          "commit": "6a5fe7d"
+        },
+        {
+          "path": "/tmp/weftmoe-local-dispatch-release-order",
+          "commit": "fd74115"
+        }
+      ],
+      "cases": [
+        {
+          "name": "parallel_gin_payload_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1020.355,
+              "fc2": 135.024,
+              "return": 3174.255,
+              "reduce": 2433.09,
+              "forward": 4392.08,
+              "wall": 5797.0
+            },
+            "payload_GBps": {
+              "nv_dispatch": 230.1953967001681,
+              "nv_return": 36.99781901580056,
+              "rdma_dispatch": 32.88505667145259,
+              "rdma_return": 42.2832217323435
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "rx_packet_acquire_once_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1022.0450000000001,
+              "fc2": 134.784,
+              "return": 3184.1400000000003,
+              "reduce": 2502.7200000000003,
+              "forward": 4404.139999999999,
+              "wall": 5790.855
+            },
+            "payload_GBps": {
+              "nv_dispatch": 229.814757667226,
+              "nv_return": 36.88296117633018,
+              "rdma_dispatch": 32.83067966674657,
+              "rdma_return": 42.151955630091635
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        },
+        {
+          "name": "local_dispatch_release_order_lanes2_ep16_8192",
+          "returncode": 0,
+          "summary": {
+            "timing_us": {
+              "dispatch": 1008.895,
+              "fc2": 137.392,
+              "return": 3165.79,
+              "reduce": 2386.88,
+              "forward": 4398.465,
+              "wall": 5836.030000000001
+            },
+            "payload_GBps": {
+              "nv_dispatch": 232.81017747139197,
+              "nv_return": 37.096747415337084,
+              "rdma_dispatch": 33.258596781627425,
+              "rdma_return": 42.39628276038524
+            },
+            "shape": {
+              "experts": 256,
+              "hidden": 2048,
+              "intermediate": 512,
+              "tokens_per_rank": 8192,
+              "top_k": 8
+            }
+          }
+        }
+      ],
+      "validation": {
+        "all_byte_identical": true,
+        "files_compared": 128,
+        "tokens": 257,
+        "route_stride": 1,
+        "repetitions": 12
+      },
+      "cleanup": [
+        {
+          "node": "local",
+          "rc": 0
+        },
+        {
+          "node": "remote",
+          "rc": 0
+        }
+      ],
+      "finding": "Qwen EP16 8K baseline D32.8851/R42.2832GB/s,GPU4392.080us. Packet acquire reuse D32.8307/R42.1520,GPU4404.140: no gain. Local Dispatch pre-join system-SC fence removal retains full TMA wait, producer memory-ordering join and system-release ready RMW; D33.2586/R42.3963,GPU4398.465:1.14% Dispatch gain but no whole-kernel improvement.128 sparse files exact across both candidates,12 repetitions. Neither adopted;no full/BWD/64K expansion. This does not establish that all fence or polling costs are unimportant."
     }
   ],
   "diagnostics": [
