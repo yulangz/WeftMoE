@@ -11994,6 +11994,82 @@
       ],
       "initial_capture": "results/communication_bottleneck_20260915/pack_phase_events_initial_capture",
       "finding": "Independent first-pack record per CTA,final iteration on all16ranks. First completed pack per GPU: start67.696us,metadata10.480us,payload issue-loop42.064us,leader final fullwait0.064us,fence/join1.440us,total53.856us medians. Issue loop includes G2S waits and staging read-completion waits;it is not pure instruction issue overhead. Metadata end follows all64copy threads;issued/completed timestamps cover leader issuer only,final join includes other issuers.256per-CTA records,zero overflow,20native repeated checks. Additional diagnostic status storage64KiB and timestamp stores may perturb timing;not goal throughput. Initial native capture passed but launcher filtered new phase tags;artifacts retained,export filter corrected andone8K capture repeated."
+    },
+    {
+      "name": "Current two-issuer Dispatch receive phase decomposition",
+      "source_commit": "8a7af74",
+      "raw_results": "results/communication_bottleneck_20260915/rx_phase_events_capture",
+      "analysis": "results/communication_bottleneck_20260915/rx_phase_events_capture/analysis.json",
+      "not_valid_goal_bandwidth": true,
+      "summary": {
+        "begin_us": {
+          "median": 914.496,
+          "min": 896.288,
+          "max": 930.368
+        },
+        "metadata_us": {
+          "median": 30.0,
+          "min": 24.736,
+          "max": 36.32
+        },
+        "copy_loop_us": {
+          "median": 39.728,
+          "min": 25.216,
+          "max": 57.216
+        },
+        "loop_other_us": {
+          "median": 0.544,
+          "min": 0.48,
+          "max": 0.64
+        },
+        "drain_us": {
+          "median": 0.032,
+          "min": 0.032,
+          "max": 0.064
+        },
+        "fullwait_us": {
+          "median": 0.032,
+          "min": 0.0,
+          "max": 0.16
+        },
+        "fence_us": {
+          "median": 1.8399999999999999,
+          "min": 0.928,
+          "max": 3.264
+        },
+        "join_us": {
+          "median": 0.032,
+          "min": 0.032,
+          "max": 0.064
+        },
+        "publication_us": {
+          "median": 11.76,
+          "min": 9.76,
+          "max": 17.376
+        },
+        "credit_us": {
+          "median": 2.704,
+          "min": 2.528,
+          "max": 2.848
+        },
+        "total_us": {
+          "median": 84.608,
+          "min": 70.88,
+          "max": 103.968
+        },
+        "end_us": {
+          "median": 1001.024,
+          "min": 983.2,
+          "max": 1007.552
+        },
+        "dispatch_after_us": {
+          "median": 3.2,
+          "min": 3.072,
+          "max": 3.584
+        }
+      },
+      "records": 1856,
+      "finding": "Qwen EP16 8K,current2x2 Dispatch lanes. Last completed nonempty RX task on16ranks:total84.608us,leader metadata30.000us,copy-loop39.728us,other loop0.544us,drain0.032us,full TMA wait0.032us,SYS fence1.840us,copy join0.032us,ready publication11.760us,completion accounting/credit2.704us medians. Individual medians need not sum exactly. Dispatch ends3.200us after credit endpoint. Per-CTA final snapshots,zero trace overflow,20 native repeated-output checks,clocks restored. Metadata/copy timings are elected first issuer only;copy loop includes internal source-load and staging-reuse waits,join includes other issuers. Diagnostic timers/status stores can perturb timing and throughput is excluded from goal. Native profiled GPU4402.880us,Dispatch1025.935us. This motivates testing notification empty-poll deferral and cooperative RX metadata on current2-lane config;previous cooperative metadata rejection was4-lane config."
     }
   ]
 }
