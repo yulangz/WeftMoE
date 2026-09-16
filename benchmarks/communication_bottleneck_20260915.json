@@ -12766,6 +12766,90 @@
         }
       ],
       "finding": "Fixed64*559120 bytes:contexts1 23.5325,contexts2 46.0608,contexts8 46.1730GB/s.8contexts,64*4MiB47.4174GB/s. All16ranks backend type3 GDAKI;all independent context receive regions verified. Original single exclusive-context test~23.9GB/s was not a dual-port link ceiling. Clocks restored."
+    },
+    {
+      "name": "Physical dual-port counters and separate GIN context traffic audit",
+      "experimental_commit": "389e6db",
+      "source": "/tmp/weftmoe-gin-port-audit",
+      "raw_results": [
+        "results/communication_bottleneck_20260915/gin_port_balance",
+        "results/communication_bottleneck_20260915/gin_port_audit_capture"
+      ],
+      "settings": "QwenEP16 8K,1620MHz/700W,20native repetitions on all16ranks. Physical counters via read-only SIOCETHTOOL driver stats on each bond slave on both nodes. Primary physical baseline is uninstrumented62bb candidate,not trace kernel.",
+      "physical_baseline_port0_fraction": {
+        "tx_bytes_phy": {
+          "min_port0_fraction": 0.49917740777719133,
+          "max_port0_fraction": 0.5005586932416105
+        },
+        "rx_bytes_phy": {
+          "min_port0_fraction": 0.4995381766433684,
+          "max_port0_fraction": 0.5004453042331503
+        }
+      },
+      "physical_error_pause_discard_deltas": {
+        "rx_crc_errors_phy": 0,
+        "tx_errors_phy": 0,
+        "rx_prio1_pause": 0,
+        "tx_prio1_pause": 0,
+        "rx_prio1_buf_discard": 0,
+        "rx_prio3_buf_discard": 0,
+        "rx_discards_phy": 0,
+        "tx_discards_phy": 0
+      },
+      "context_audit": {
+        "dispatch": {
+          "payload_bytes_per_context": [
+            4194304
+          ],
+          "wire_bytes_per_context": [
+            4472976
+          ],
+          "first_submit_context_spread_us": {
+            "min": 15.96799999999999,
+            "median": 26.175999999999988,
+            "max": 45.184
+          },
+          "last_submit_context_spread_us": {
+            "min": 103.64799999999991,
+            "median": 151.64800000000005,
+            "max": 223.83999999999997
+          }
+        },
+        "return": {
+          "payload_bytes_per_context": [
+            7864320,
+            8388608,
+            8912896
+          ],
+          "wire_bytes_per_context": [
+            7895296,
+            8421648,
+            8948000
+          ],
+          "first_submit_context_spread_us": {
+            "min": 68.19200000000001,
+            "median": 110.32000000000005,
+            "max": 156.3520000000001
+          },
+          "last_submit_context_spread_us": {
+            "min": 142.4000000000001,
+            "median": 183.2639999999999,
+            "max": 289.1840000000002
+          }
+        },
+        "dispatch_receive_context_last_finish_spread_us": {
+          "min": 14.784000000000106,
+          "median": 22.927999999999997,
+          "max": 37.696000000000026
+        },
+        "actual_nccl_connection_ids": [
+          0
+        ]
+      },
+      "finding": "No aggregate physical-port traffic imbalance:baseline TX port0 fraction49.9177..50.0559%,RX49.9538..50.0445% across16bonds.8-context raw probe similarly~50:50;1-context raw probe sends almost all payload through one physical slave (~23.53GB/s vs~46.17). IMPORTANT actual ncclGin.connectionId is0 for all contexts;dual-port selection happens beneath NCCL connection abstraction in bonded QPs. Do not equate connectionId or unverified context parity with physical port. Actual Dispatch8 contexts each send4MiB payload and4472976wire bytes;logical Return port0 payload fraction49.609375..50%. Context last Dispatch enqueue spread151.648us median,while RX channel last-finish spread22.928us. Temporal scheduling/arrival imbalance persists despite balanced totals. Per-phase physical-port bytes and sub-ms physical utilization not directly measured. Native output repeats passed,all counters reconcile,zero trace overflow;clocks restored. Goal not achieved.",
+      "protocol": "Diagnostic counters/timestamps only;wire/TMA completion/ready/credit and math order unchanged. Initial analyzer incorrectly assumed two ncclGin connections;capture retained and parser corrected without rerunning GPU test.",
+      "source_reference": "https://github.com/NVIDIA/nccl/blob/v2.31.2-1/src/transport/net_ib/gdaki/gin_host_gdaki.cc",
+      "source_note": "Version-matched upstream source connects all main contexts to a given remote rank consecutively before companion QPs;physical runtime counter evidence is authoritative,not an assumed mapping from source alone."
     }
   ]
 }
