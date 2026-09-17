@@ -1,0 +1,1862 @@
+{
+  "revision": "944ae6d6c72c0f4b381ed765cf23752276f8fd8b",
+  "scope": "per-call fixed tensor allocation and input copy included; reusable buffers and RDMA setup excluded; slowest rank per iteration",
+  "warmups": 10,
+  "iterations": 14,
+  "frequency_target_MHz": 1620,
+  "power_limit_W": 700,
+  "flex_sms": {
+    "8": 80,
+    "16": 48
+  },
+  "gpu_timing_note": "Weft GPU timings cover its execution phases; Flex CUDA events cover the end-to-end timed call. Only host wall speedups are comparable.",
+  "rows": [
+    {
+      "model": "qwen",
+      "ep": 8,
+      "tokens_per_rank": 8192,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 3.429297142857143,
+          "p50": 3.39595,
+          "p95": 3.49465
+        },
+        "wall_samples_ms": [
+          3.39065,
+          3.46889,
+          3.39209,
+          3.4710799999999997,
+          3.3916,
+          3.47458,
+          3.46786,
+          3.39263,
+          3.36875,
+          3.38769,
+          3.42273,
+          3.39595,
+          3.49101,
+          3.49465
+        ],
+        "gpu_ms": {
+          "mean": 2.5743085714285714,
+          "p50": 2.57757,
+          "p95": 2.58752
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 4.803541857142856,
+          "p50": 4.69953,
+          "p95": 6.056625
+        },
+        "wall_samples_ms": [
+          4.678957,
+          4.723128,
+          6.056625,
+          4.706828,
+          4.732834,
+          4.694993,
+          4.69953,
+          4.719376,
+          4.647187,
+          4.878771,
+          4.668189,
+          4.677132,
+          4.703913,
+          4.662123
+        ],
+        "gpu_ms": {
+          "mean": 4.781439985547747,
+          "p50": 4.677248001098633,
+          "p95": 6.035488128662109
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.4007365524297355,
+          "p50": 1.3838631310826133,
+          "p95": 1.733113473452277
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep8_forward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep8_flex_t8192_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 8,
+      "tokens_per_rank": 8192,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 4.136531428571429,
+          "p50": 4.0055,
+          "p95": 5.7815
+        },
+        "wall_samples_ms": [
+          4.0061,
+          3.9659299999999997,
+          4.01337,
+          4.0055,
+          3.9905,
+          4.02388,
+          5.7815,
+          4.07735,
+          4.05258,
+          3.99967,
+          4.01733,
+          3.99997,
+          3.99488,
+          3.98288
+        ],
+        "gpu_ms": {
+          "mean": 3.895257142857143,
+          "p50": 3.89309,
+          "p95": 3.94598
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 5.908194285714286,
+          "p50": 5.879362,
+          "p95": 6.082222
+        },
+        "wall_samples_ms": [
+          5.903953,
+          5.879362,
+          5.849123,
+          5.867886,
+          5.869076,
+          5.896646,
+          5.876683,
+          5.908253,
+          5.991401,
+          5.881037,
+          6.082222,
+          5.872069,
+          5.878596,
+          5.958413
+        ],
+        "gpu_ms": {
+          "mean": 5.88523656981332,
+          "p50": 5.856480121612549,
+          "p95": 6.058879852294922
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.4282967234107804,
+          "p50": 1.467822244413931,
+          "p95": 1.0520145291014442
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep8_backward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep8_flex_t8192_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 8,
+      "tokens_per_rank": 65536,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 24.74495,
+          "p50": 20.7729,
+          "p95": 76.16080000000001
+        },
+        "wall_samples_ms": [
+          76.16080000000001,
+          20.968,
+          20.764200000000002,
+          20.742099999999997,
+          20.7763,
+          20.7272,
+          20.7729,
+          20.8281,
+          20.8382,
+          20.7943,
+          20.8354,
+          20.735,
+          20.7462,
+          20.740599999999997
+        ],
+        "gpu_ms": {
+          "mean": 19.5442,
+          "p50": 19.5379,
+          "p95": 19.5862
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 25.282254785714287,
+          "p50": 25.1891,
+          "p95": 25.929707
+        },
+        "wall_samples_ms": [
+          25.691716,
+          25.210219,
+          25.1891,
+          25.1807,
+          25.150167,
+          25.929707,
+          25.267723,
+          25.253545,
+          25.154938,
+          25.164874,
+          25.177641,
+          25.125686,
+          25.248349,
+          25.207202
+        ],
+        "gpu_ms": {
+          "mean": 25.25766399928502,
+          "p50": 25.162559509277344,
+          "p95": 25.90812873840332
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.0217137147464144,
+          "p50": 1.212594293526662,
+          "p95": 0.3404600135502778
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep8_forward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep8_flex_t65536_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 65536,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 8,
+      "tokens_per_rank": 65536,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 30.49937857142857,
+          "p50": 30.4177,
+          "p95": 30.819599999999998
+        },
+        "wall_samples_ms": [
+          30.598200000000002,
+          30.4177,
+          30.4429,
+          30.7254,
+          30.408099999999997,
+          30.6438,
+          30.5701,
+          30.3712,
+          30.819599999999998,
+          30.6037,
+          30.3002,
+          30.307599999999997,
+          30.3824,
+          30.4004
+        ],
+        "gpu_ms": {
+          "mean": 30.103407142857144,
+          "p50": 30.0334,
+          "p95": 30.4342
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 37.482330857142856,
+          "p50": 37.484218,
+          "p95": 37.650277
+        },
+        "wall_samples_ms": [
+          37.500528,
+          37.484218,
+          37.576215,
+          37.40172,
+          37.441798,
+          37.4134,
+          37.44824,
+          37.445275,
+          37.523891,
+          37.495064,
+          37.37901,
+          37.485964,
+          37.507032,
+          37.650277
+        ],
+        "gpu_ms": {
+          "mean": 37.45782879420689,
+          "p50": 37.457759857177734,
+          "p95": 37.62681579589844
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.2289539201384196,
+          "p50": 1.2323159870733158,
+          "p95": 1.2216341873353322
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep8_backward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep8_flex_t65536_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 65536,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 16,
+      "tokens_per_rank": 8192,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 6.364910714285715,
+          "p50": 6.24967,
+          "p95": 7.85038
+        },
+        "wall_samples_ms": [
+          6.16097,
+          6.2854399999999995,
+          6.26008,
+          6.13579,
+          6.18065,
+          6.30912,
+          6.28032,
+          6.24967,
+          7.85038,
+          6.41387,
+          6.358350000000001,
+          6.2018,
+          6.17462,
+          6.2476899999999995
+        ],
+        "gpu_ms": {
+          "mean": 4.830332142857142,
+          "p50": 4.82368,
+          "p95": 4.98003
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 5.868605428571429,
+          "p50": 5.383531,
+          "p95": 8.154067
+        },
+        "wall_samples_ms": [
+          5.383531,
+          5.345213,
+          8.154067,
+          7.08186,
+          5.757865,
+          5.400759,
+          5.249625,
+          5.315276,
+          5.376064,
+          6.37697,
+          5.412927,
+          5.372409,
+          5.351927,
+          6.581983
+        ],
+        "gpu_ms": {
+          "mean": 5.846301759992327,
+          "p50": 5.3579840660095215,
+          "p95": 8.132512092590332
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 0.9220247843225271,
+          "p50": 0.8614104424713624,
+          "p95": 1.03868436941906
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep16_forward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep16_flex_t8192_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 16,
+      "tokens_per_rank": 8192,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 4.600314285714286,
+          "p50": 4.58996,
+          "p95": 4.67399
+        },
+        "wall_samples_ms": [
+          4.5705100000000005,
+          4.584479999999999,
+          4.58996,
+          4.64009,
+          4.67399,
+          4.59487,
+          4.6347700000000005,
+          4.602390000000001,
+          4.57536,
+          4.57887,
+          4.59333,
+          4.58359,
+          4.60171,
+          4.58048
+        ],
+        "gpu_ms": {
+          "mean": 4.461508571428571,
+          "p50": 4.45312,
+          "p95": 4.5367
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 6.568936928571429,
+          "p50": 6.551994,
+          "p95": 6.745838
+        },
+        "wall_samples_ms": [
+          6.571484,
+          6.603357,
+          6.550004,
+          6.577734,
+          6.565162,
+          6.536762,
+          6.560147,
+          6.575065,
+          6.519105,
+          6.542687,
+          6.745838,
+          6.551994,
+          6.533643,
+          6.532135
+        ],
+        "gpu_ms": {
+          "mean": 6.545862810952323,
+          "p50": 6.529280185699463,
+          "p95": 6.723135948181152
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.4279322064952085,
+          "p50": 1.4274621129595901,
+          "p95": 1.4432718084548748
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep16_backward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep16_flex_t8192_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 8192,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 16,
+      "tokens_per_rank": 65536,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 37.177,
+          "p50": 37.155699999999996,
+          "p95": 37.294599999999996
+        },
+        "wall_samples_ms": [
+          37.127199999999995,
+          37.142300000000006,
+          37.1097,
+          37.1346,
+          37.123,
+          37.155699999999996,
+          37.294599999999996,
+          37.234300000000005,
+          37.1374,
+          37.1719,
+          37.197300000000006,
+          37.1855,
+          37.207800000000006,
+          37.256699999999995
+        ],
+        "gpu_ms": {
+          "mean": 35.37307142857143,
+          "p50": 35.3735,
+          "p95": 35.4343
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 31.574889928571427,
+          "p50": 31.285646,
+          "p95": 32.887499
+        },
+        "wall_samples_ms": [
+          32.002175,
+          31.077497,
+          31.285646,
+          31.29069,
+          32.887499,
+          31.216011,
+          31.085058,
+          32.683051,
+          31.296994,
+          30.985498,
+          32.455209,
+          31.186578,
+          31.209535,
+          31.387018
+        ],
+        "gpu_ms": {
+          "mean": 31.538719994681223,
+          "p50": 31.263904571533203,
+          "p95": 32.70374298095703
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 0.8493124762237789,
+          "p50": 0.8420147110672118,
+          "p95": 0.8818300504630697
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep16_forward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep16_flex_t65536_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 65536,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": 16,
+      "tokens_per_rank": 65536,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 32.67582857142857,
+          "p50": 32.6207,
+          "p95": 33.0274
+        },
+        "wall_samples_ms": [
+          32.6902,
+          32.6361,
+          32.593,
+          32.6464,
+          32.5736,
+          32.549099999999996,
+          32.793,
+          32.580400000000004,
+          32.5746,
+          32.771699999999996,
+          32.8189,
+          33.0274,
+          32.6207,
+          32.5865
+        ],
+        "gpu_ms": {
+          "mean": 32.19492857142857,
+          "p50": 32.1395,
+          "p95": 32.5479
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 43.91498814285715,
+          "p50": 43.866889,
+          "p95": 44.359632
+        },
+        "wall_samples_ms": [
+          43.943206,
+          43.866889,
+          43.98526,
+          43.688405,
+          43.888076,
+          43.850558,
+          43.835281,
+          43.996661,
+          43.805142,
+          43.649809,
+          43.875413,
+          43.734548,
+          44.359632,
+          44.330954
+        ],
+        "gpu_ms": {
+          "mean": 43.88949939182827,
+          "p50": 43.84163284301758,
+          "p95": 44.3342399597168
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.343959436158139,
+          "p50": 1.344756213079425,
+          "p95": 1.3431160793765176
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/qwen_ep16_backward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/qwen_ep16_flex_t65536_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "tokens_per_rank": 65536,
+        "top_k": 8
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 8,
+      "tokens_per_rank": 8192,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 8.069392142857144,
+          "p50": 8.07594,
+          "p95": 8.15014
+        },
+        "wall_samples_ms": [
+          8.0917,
+          8.07594,
+          7.964989999999999,
+          8.10731,
+          8.06574,
+          8.02665,
+          8.0357,
+          8.0383,
+          7.98933,
+          8.09681,
+          8.15014,
+          8.08161,
+          8.14114,
+          8.10613
+        ],
+        "gpu_ms": {
+          "mean": 7.179784285714285,
+          "p50": 7.1677100000000005,
+          "p95": 7.23789
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 9.061816928571428,
+          "p50": 8.91302,
+          "p95": 10.925829
+        },
+        "wall_samples_ms": [
+          8.983006,
+          8.938664,
+          8.922121,
+          8.923657,
+          8.858042,
+          8.879774,
+          8.891923,
+          8.903376,
+          8.881227,
+          8.91302,
+          8.883128,
+          9.00841,
+          8.95326,
+          10.925829
+        ],
+        "gpu_ms": {
+          "mean": 9.03268562044416,
+          "p50": 8.880864143371582,
+          "p95": 10.904191970825195
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.1229863127413826,
+          "p50": 1.1036510920091036,
+          "p95": 1.3405694871499139
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep8_forward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep8_flex_t8192_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 8192,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 8,
+      "tokens_per_rank": 8192,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 10.808071428571429,
+          "p50": 10.8131,
+          "p95": 10.846
+        },
+        "wall_samples_ms": [
+          10.8131,
+          10.7713,
+          10.846,
+          10.829600000000001,
+          10.7464,
+          10.8312,
+          10.8045,
+          10.8376,
+          10.8206,
+          10.7473,
+          10.777899999999999,
+          10.837299999999999,
+          10.8375,
+          10.812700000000001
+        ],
+        "gpu_ms": {
+          "mean": 10.690921428571428,
+          "p50": 10.6981,
+          "p95": 10.7296
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 14.521427857142857,
+          "p50": 14.516939,
+          "p95": 14.569928
+        },
+        "wall_samples_ms": [
+          14.516939,
+          14.481855,
+          14.561257,
+          14.556536,
+          14.569928,
+          14.512614,
+          14.504471,
+          14.523412,
+          14.496511,
+          14.545125,
+          14.526636,
+          14.483813,
+          14.48667,
+          14.534223
+        ],
+        "gpu_ms": {
+          "mean": 14.498278890337263,
+          "p50": 14.493120193481445,
+          "p95": 14.546815872192383
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.3435725284674813,
+          "p50": 1.342532576226984,
+          "p95": 1.3433457495851007
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep8_backward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep8_flex_t8192_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 8192,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 8,
+      "tokens_per_rank": 65536,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 56.18835,
+          "p50": 56.1579,
+          "p95": 56.349199999999996
+        },
+        "wall_samples_ms": [
+          56.1529,
+          56.2087,
+          56.255300000000005,
+          56.349199999999996,
+          56.206199999999995,
+          56.1579,
+          56.2921,
+          56.107099999999996,
+          56.058800000000005,
+          56.1412,
+          56.0984,
+          56.0544,
+          56.2532,
+          56.3015
+        ],
+        "gpu_ms": {
+          "mean": 54.87571428571428,
+          "p50": 54.8934,
+          "p95": 54.9985
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 60.836298,
+          "p50": 60.803041,
+          "p95": 61.090686
+        },
+        "wall_samples_ms": [
+          60.982421,
+          61.090686,
+          60.845533,
+          60.88684,
+          60.773821,
+          60.872921,
+          60.875523,
+          60.777686,
+          60.803041,
+          60.765926,
+          60.736415,
+          60.83096,
+          60.731481,
+          60.734918
+        ],
+        "gpu_ms": {
+          "mean": 60.81213297162737,
+          "p50": 60.77705764770508,
+          "p95": 61.065025329589844
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.0827208487168603,
+          "p50": 1.082715717646137,
+          "p95": 1.0841446906078525
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep8_forward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep8_flex_t65536_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 65536,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 8,
+      "tokens_per_rank": 65536,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 81.32697142857143,
+          "p50": 81.2368,
+          "p95": 82.17089999999999
+        },
+        "wall_samples_ms": [
+          80.87639999999999,
+          81.6696,
+          80.8947,
+          81.1164,
+          80.6286,
+          81.34389999999999,
+          82.17089999999999,
+          81.0283,
+          81.52380000000001,
+          81.0625,
+          81.27260000000001,
+          81.875,
+          81.8781,
+          81.2368
+        ],
+        "gpu_ms": {
+          "mean": 80.84819285714286,
+          "p50": 80.74860000000001,
+          "p95": 81.699
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 105.97173257142857,
+          "p50": 105.828507,
+          "p95": 106.968595
+        },
+        "wall_samples_ms": [
+          105.6733,
+          106.100615,
+          105.957537,
+          105.464948,
+          106.248714,
+          105.714623,
+          106.395817,
+          106.968595,
+          105.38567,
+          106.16091,
+          105.828507,
+          106.801398,
+          105.589492,
+          105.31413
+        ],
+        "gpu_ms": {
+          "mean": 105.9469381059919,
+          "p50": 105.80477142333984,
+          "p95": 106.94528198242188
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.3030330616024768,
+          "p50": 1.3027163428396982,
+          "p95": 1.3017819568728104
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep8_backward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep8_flex_t65536_sm80_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 65536,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 16,
+      "tokens_per_rank": 8192,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 13.309264285714287,
+          "p50": 11.1091,
+          "p95": 37.637800000000006
+        },
+        "wall_samples_ms": [
+          11.084700000000002,
+          10.908299999999999,
+          11.1091,
+          13.3264,
+          11.0099,
+          11.3207,
+          11.046100000000001,
+          11.0558,
+          11.0054,
+          11.2871,
+          12.9109,
+          37.637800000000006,
+          11.4599,
+          11.1676
+        ],
+        "gpu_ms": {
+          "mean": 9.857029285714287,
+          "p50": 9.727549999999999,
+          "p95": 10.7633
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 10.948880642857143,
+          "p50": 10.40133,
+          "p95": 16.0068
+        },
+        "wall_samples_ms": [
+          10.878531,
+          10.299669,
+          10.107185,
+          10.220855,
+          10.099824,
+          16.0068,
+          11.42225,
+          10.436486,
+          10.880201,
+          10.40133,
+          10.891186,
+          10.999258,
+          10.32293,
+          10.317824
+        ],
+        "gpu_ms": {
+          "mean": 10.923549720219203,
+          "p50": 10.379039764404297,
+          "p95": 15.976384162902832
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 0.822651080316235,
+          "p50": 0.9362891683394694,
+          "p95": 0.42528521858344526
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep16_forward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep16_flex_t8192_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 8192,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 16,
+      "tokens_per_rank": 8192,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 10.736057142857142,
+          "p50": 10.7333,
+          "p95": 10.813799999999999
+        },
+        "wall_samples_ms": [
+          10.7309,
+          10.7491,
+          10.7845,
+          10.7333,
+          10.665700000000001,
+          10.7516,
+          10.7218,
+          10.6924,
+          10.813799999999999,
+          10.741299999999999,
+          10.709100000000001,
+          10.6859,
+          10.7844,
+          10.741
+        ],
+        "gpu_ms": {
+          "mean": 10.593699999999998,
+          "p50": 10.590200000000001,
+          "p95": 10.6724
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 15.915746714285715,
+          "p50": 15.892582,
+          "p95": 16.17706
+        },
+        "wall_samples_ms": [
+          15.895309,
+          15.878673,
+          15.907801,
+          15.830691,
+          15.885306,
+          15.872289,
+          15.861349,
+          15.892582,
+          15.931597,
+          15.897036,
+          15.895365,
+          16.009888,
+          15.885508,
+          16.17706
+        ],
+        "gpu_ms": {
+          "mean": 15.89233364377703,
+          "p50": 15.869728088378906,
+          "p95": 16.153888702392578
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.4824573400184162,
+          "p50": 1.4806799399998138,
+          "p95": 1.4959644158390208
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep16_backward_t8192_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep16_flex_t8192_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 8192,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 16,
+      "tokens_per_rank": 65536,
+      "phase": "forward",
+      "weft": {
+        "wall_ms": {
+          "mean": 72.4767,
+          "p50": 72.6315,
+          "p95": 73.5924
+        },
+        "wall_samples_ms": [
+          72.74119999999999,
+          72.6315,
+          73.034,
+          72.8263,
+          73.0157,
+          71.8631,
+          71.10130000000001,
+          71.71130000000001,
+          73.095,
+          71.97930000000001,
+          72.7515,
+          72.33,
+          72.0012,
+          73.5924
+        ],
+        "gpu_ms": {
+          "mean": 70.5757,
+          "p50": 70.793,
+          "p95": 71.7123
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 70.2331932857143,
+          "p50": 70.213315,
+          "p95": 70.454566
+        },
+        "wall_samples_ms": [
+          70.181157,
+          70.153655,
+          70.157482,
+          70.183045,
+          70.160635,
+          70.246135,
+          70.0879,
+          70.289708,
+          70.454566,
+          70.285767,
+          70.213315,
+          70.394776,
+          70.234733,
+          70.221832
+        ],
+        "gpu_ms": {
+          "mean": 70.20591190883091,
+          "p50": 70.18793487548828,
+          "p95": 70.43257904052734
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 0.9690451315486811,
+          "p50": 0.9667061123617162,
+          "p95": 0.9573619830308565
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep16_forward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep16_flex_t65536_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 65536,
+        "top_k": 6
+      }
+    },
+    {
+      "model": "flash",
+      "ep": 16,
+      "tokens_per_rank": 65536,
+      "phase": "backward",
+      "weft": {
+        "wall_ms": {
+          "mean": 81.87321428571428,
+          "p50": 81.68730000000001,
+          "p95": 83.4111
+        },
+        "wall_samples_ms": [
+          83.4111,
+          81.34219999999999,
+          81.9201,
+          81.9122,
+          81.5711,
+          81.574,
+          81.7974,
+          82.2507,
+          81.5553,
+          81.9325,
+          81.341,
+          82.404,
+          81.5261,
+          81.68730000000001
+        ],
+        "gpu_ms": {
+          "mean": 81.32009285714287,
+          "p50": 81.11630000000001,
+          "p95": 82.86489999999999
+        }
+      },
+      "flex": {
+        "wall_ms": {
+          "mean": 116.50063128571428,
+          "p50": 116.352781,
+          "p95": 118.088164
+        },
+        "wall_samples_ms": [
+          118.088164,
+          115.65481,
+          117.006216,
+          116.95601,
+          115.922604,
+          116.800793,
+          116.638596,
+          115.679082,
+          116.339369,
+          116.352781,
+          116.065795,
+          116.067984,
+          116.40284,
+          117.033794
+        ],
+        "gpu_ms": {
+          "mean": 116.47283281598773,
+          "p50": 116.32208251953125,
+          "p95": 118.0600357055664
+        }
+      },
+      "speedup": {
+        "wall": {
+          "mean": 1.4229395083862242,
+          "p50": 1.4243680596616608,
+          "p95": 1.4157368024159853
+        }
+      },
+      "sources": {
+        "weft": "results/e2e_20260917/flash_ep16_backward_t65536_e2e1620.json",
+        "flex": "results/e2e_20260917/flash_ep16_flex_t65536_sm48_e2e1620.json"
+      },
+      "checked_repetitions": [
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24,
+        24
+      ],
+      "shape": {
+        "experts": 256,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "tokens_per_rank": 65536,
+        "top_k": 6
+      }
+    }
+  ],
+  "clocks": {
+    "local": {
+      "filter": "GPU utilization >= 50%",
+      "sample_count": 221,
+      "min": 1470,
+      "median": 1620,
+      "max": 1620,
+      "fraction_ge_1600": 0.9547511312217195
+    },
+    "remote": {
+      "filter": "GPU utilization >= 50%",
+      "sample_count": 122,
+      "min": 1545,
+      "median": 1620.0,
+      "max": 1620,
+      "fraction_ge_1600": 0.9836065573770492
+    }
+  },
+  "complete": true,
+  "builds": {
+    "qwen": {
+      "header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/configs/communication_recovery_20260916/qwen.hpp",
+      "header_sha256": "a31d1996ea6fd784e65023ad129dd407ec8a2da6f08649daafd103b7572d8fca",
+      "build": {
+        "backend": "python-content-addressed-jit",
+        "cache_hit": false,
+        "binary_preexisted": false,
+        "host_cache_hit": false,
+        "cache_key": "29d387848f1ef26ff68bca5369002b6cefeab3dc2177b86995d7da9d4466b4bd",
+        "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.29d387848f1ef26ff68bca5369002b6cefeab3dc2177b86995d7da9d4466b4bd",
+        "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.29d387848f1ef26ff68bca5369002b6cefeab3dc2177b86995d7da9d4466b4bd/test_cuda_notify",
+        "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.29d387848f1ef26ff68bca5369002b6cefeab3dc2177b86995d7da9d4466b4bd/generated/weftmoe_forward_tuning_generated.hpp",
+        "elapsed_seconds": 120.53515920974314,
+        "returncode": 0,
+        "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/qwen.build.log",
+        "toolchain": {
+          "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+          "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+          "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+          "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+          "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+          "architecture": "sm_90a"
+        }
+      }
+    },
+    "flash": {
+      "header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/configs/communication_recovery_20260916/flash.hpp",
+      "header_sha256": "e50d43edc66041b04b5fa2e19f0932b5cf3cdad27c6737182a67d4414e5598af",
+      "build": {
+        "backend": "python-content-addressed-jit",
+        "cache_hit": false,
+        "binary_preexisted": false,
+        "host_cache_hit": true,
+        "cache_key": "cf81bf6573a7ce50321dfaf724b377bc3d907b1a6e022138f6d30d163ab12d40",
+        "cache_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.cf81bf6573a7ce50321dfaf724b377bc3d907b1a6e022138f6d30d163ab12d40",
+        "binary": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.cf81bf6573a7ce50321dfaf724b377bc3d907b1a6e022138f6d30d163ab12d40/test_cuda_notify",
+        "generated_header": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/compile/cache/forward.cf81bf6573a7ce50321dfaf724b377bc3d907b1a6e022138f6d30d163ab12d40/generated/weftmoe_forward_tuning_generated.hpp",
+        "elapsed_seconds": 142.42075457051396,
+        "returncode": 0,
+        "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/e2e_20260917/flash.build.log",
+        "toolchain": {
+          "nvcc": "/usr/local/cuda-12.9/bin/nvcc",
+          "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_May_27_02:21:03_PDT_2025\nCuda compilation tools, release 12.9, V12.9.86\nBuild cuda_12.9.r12.9/compiler.36037853_0",
+          "cxx": "/usr/bin/x86_64-linux-gnu-g++-13",
+          "cxx_version": "x86_64-linux-gnu-g++-13 (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+          "archiver": "/usr/bin/x86_64-linux-gnu-ar",
+          "architecture": "sm_90a"
+        }
+      }
+    }
+  },
+  "clock_note": "Sampled across process lifetime, including initialization, warmup, repeat checks, and measurement; not restricted to timed GPU intervals.",
+  "run_clock_samples": [
+    {
+      "name": "qwen_ep8_t8192_weft",
+      "started_unix": 1789615406.9612746,
+      "ended_unix": 1789615425.530775,
+      "nodes": {}
+    },
+    {
+      "name": "qwen_ep8_t8192_flex",
+      "started_unix": 1789615425.5332687,
+      "ended_unix": 1789615458.0657246,
+      "nodes": {}
+    },
+    {
+      "name": "qwen_ep8_t65536_flex",
+      "started_unix": 1789615458.0741992,
+      "ended_unix": 1789615490.8768315,
+      "nodes": {
+        "local": {
+          "samples": 16,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "qwen_ep8_t65536_weft",
+      "started_unix": 1789615490.8840048,
+      "ended_unix": 1789615519.911374,
+      "nodes": {
+        "local": {
+          "samples": 3,
+          "min_MHz": 1620,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "qwen_ep16_t8192_weft",
+      "started_unix": 1789615519.9184833,
+      "ended_unix": 1789615589.5222328,
+      "nodes": {
+        "local": {
+          "samples": 11,
+          "min_MHz": 1620,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "qwen_ep16_t8192_flex",
+      "started_unix": 1789615589.5300245,
+      "ended_unix": 1789615623.9810426,
+      "nodes": {
+        "remote": {
+          "samples": 7,
+          "min_MHz": 1620,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "qwen_ep16_t65536_flex",
+      "started_unix": 1789615623.9895923,
+      "ended_unix": 1789615659.1772625,
+      "nodes": {
+        "local": {
+          "samples": 20,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        },
+        "remote": {
+          "samples": 16,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "qwen_ep16_t65536_weft",
+      "started_unix": 1789615659.1858938,
+      "ended_unix": 1789615741.204321,
+      "nodes": {
+        "local": {
+          "samples": 16,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        },
+        "remote": {
+          "samples": 16,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "flash_ep8_t8192_weft",
+      "started_unix": 1789615741.2130437,
+      "ended_unix": 1789615762.352962,
+      "nodes": {
+        "local": {
+          "samples": 8,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "flash_ep8_t8192_flex",
+      "started_unix": 1789615762.3624043,
+      "ended_unix": 1789615794.4782782,
+      "nodes": {}
+    },
+    {
+      "name": "flash_ep8_t65536_flex",
+      "started_unix": 1789615794.4860568,
+      "ended_unix": 1789615830.1340985,
+      "nodes": {
+        "local": {
+          "samples": 32,
+          "min_MHz": 1575,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 0.9375
+        }
+      }
+    },
+    {
+      "name": "flash_ep8_t65536_weft",
+      "started_unix": 1789615830.142658,
+      "ended_unix": 1789615869.09022,
+      "nodes": {
+        "local": {
+          "samples": 25,
+          "min_MHz": 1530,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 0.84
+        }
+      }
+    },
+    {
+      "name": "flash_ep16_t8192_weft",
+      "started_unix": 1789615869.097911,
+      "ended_unix": 1789615945.7611291,
+      "nodes": {
+        "local": {
+          "samples": 6,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        },
+        "remote": {
+          "samples": 2,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "flash_ep16_t8192_flex",
+      "started_unix": 1789615945.7680192,
+      "ended_unix": 1789615981.1258738,
+      "nodes": {
+        "local": {
+          "samples": 8,
+          "min_MHz": 1620,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        },
+        "remote": {
+          "samples": 5,
+          "min_MHz": 1620,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "flash_ep16_t65536_flex",
+      "started_unix": 1789615981.1345472,
+      "ended_unix": 1789616021.8235757,
+      "nodes": {
+        "local": {
+          "samples": 44,
+          "min_MHz": 1545,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 0.9318181818181818
+        },
+        "remote": {
+          "samples": 43,
+          "min_MHz": 1620,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 1.0
+        }
+      }
+    },
+    {
+      "name": "flash_ep16_t65536_weft",
+      "started_unix": 1789616021.831845,
+      "ended_unix": 1789616112.7797568,
+      "nodes": {
+        "local": {
+          "samples": 32,
+          "min_MHz": 1470,
+          "median_MHz": 1620.0,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 0.96875
+        },
+        "remote": {
+          "samples": 33,
+          "min_MHz": 1545,
+          "median_MHz": 1620,
+          "max_MHz": 1620,
+          "fraction_ge_1600": 0.9393939393939394
+        }
+      }
+    }
+  ],
+  "execution_log": "results/e2e_20260917/execution.json",
+  "validation": {
+    "host_tests_passed": 37,
+    "bitwise_repetitions_per_rank": 24,
+    "backward_outputs": [
+      "dX",
+      "dGate",
+      "dW1",
+      "dW2"
+    ],
+    "repeat_checks_outside_timing": true
+  },
+  "reproduction": {
+    "build": "/opt/.venv/bin/python benchmarks/run_performance_matrix.py build --output results/e2e_20260917 --tuning-headers configs/communication_recovery_20260916",
+    "driver": "results/e2e_20260917/run.py",
+    "summary": "results/e2e_20260917/summarize.py",
+    "raw_directory": "results/e2e_20260917",
+    "fixed_tensor_requests_included": true,
+    "one_time_buffers_and_rdma_initialization_excluded": true,
+    "gpu_runs_serial": true,
+    "compilation_completed_before_measurement": true
+  },
+  "observations": [
+    "EP8 Forward and all Backward cases outperform fresh Flex by both mean and p50 wall time; EP16 Forward trails Flex in all four cases.",
+    "Qwen EP8 64K Forward has a 76.1608 ms wall outlier. All samples are retained without trimming. Flash EP16 8K Forward also has substantial wall-time outliers; consult both mean and p50.",
+    "The 1620 MHz lock request did not prevent every frequency drop. Clock samples include setup and checks as well as timed execution."
+  ]
+}
