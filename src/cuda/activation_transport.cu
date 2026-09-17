@@ -3,6 +3,7 @@
 #include "cuda/communication/local_notification.cuh"
 #include "cuda/forward/transport_launch.hpp"
 #include "cuda/primitives/hopper.cuh"
+#include "cuda/primitives/programmatic_launch.cuh"
 
 #include <cuda.h>
 #include <cuda/atomic>
@@ -4796,8 +4797,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           cudaLaunchAttribute cluster{};
           cluster.id = cudaLaunchAttributeClusterDimension;
           cluster.val.clusterDim = {forward_tuning::kClusterSize, 1U, 1U};
-          launch.attrs = &cluster;
-          launch.numAttrs = 1U;
+          cudaLaunchAttribute attributes[] = {
+              cluster, programmatic_launch::attribute()};
+          launch.attrs = attributes;
+          launch.numAttrs = programmatic_launch::enabled() ? 2U : 1U;
           error = cudaOccupancyMaxActiveClusters(
               &max_active_clusters, kernel, &launch);
           if (error != cudaSuccess)

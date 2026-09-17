@@ -3,6 +3,8 @@ template <bool StaticLocal, bool SetupOnly = false>
 __global__
 __maxnreg__(StaticLocal ? 128 : 160) void local_p2p_forward_transport_kernel(
     ForwardKernelArgs a) {
+  if constexpr (SetupOnly)
+    programmatic_launch::release();
   namespace cg = cooperative_groups;
   auto grid = cg::this_grid();
   WEFTMOE_TIMELINE_RECORD(a.timeline, KernelEnter, Kernel, 0U, 0ULL,

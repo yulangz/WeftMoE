@@ -183,6 +183,7 @@ def build_pair(args):
 
 def weft(args):
     env = environment()
+    env["WEFTMOE_ENABLE_PDL"] = "1" if args.pdl else "0"
     if getattr(args, "repartition", False):
         env["WEFTMOE_FORWARD_REPARTITION_EP8"] = "1"
     if args.check_repeats:
@@ -201,6 +202,8 @@ def weft(args):
                     if path.exists():
                         old = json.loads(path.read_text())
                         if old.get("returncode") == 0 and old.get("record"):
+                            if old.get("programmatic_dependent_launch", False) != args.pdl:
+                                raise RuntimeError(f"existing record has a different PDL mode; use a new label/output: {path}")
                             if not (old["record"].get("allocate_tensors") and
                                     old["record"].get("synchronize_ranks")):
                                 raise RuntimeError(f"existing record has a different timing scope; use a new label/output: {path}")
@@ -216,6 +219,7 @@ def weft(args):
                         dict(built["candidate"], name=name), Path(built["build"]["binary"]),
                         benchmark, args.output, run_env, rounds=args.iterations + 10,
                         suffix="measure")
+                    result["programmatic_dependent_launch"] = args.pdl
                     save(path, result)
                     if result["returncode"] or result["record"] is None:
                         raise RuntimeError(f"benchmark failed: {path}")
@@ -307,6 +311,8 @@ def main():
     parser.add_argument("--flex-sms", type=int)
     parser.add_argument("--label", default="screen")
     parser.add_argument("--check-repeats", action="store_true")
+    parser.add_argument("--pdl", action="store_true",
+                        help="enable experimental SM90 programmatic dependent launches for weft")
     parser.add_argument("--repartition", action="store_true",
                         help="split each EP8 source shard into two EP16 shards (Forward validation)")
     parser.add_argument("--dump-output", type=Path)

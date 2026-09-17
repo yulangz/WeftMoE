@@ -1,4 +1,5 @@
 #include "cuda/device_notify_internal.hpp"
+#include "cuda/primitives/programmatic_launch.cuh"
 #include "cuda/activation_transport_internal.hpp"
 
 #include <cub/cub.cuh>
@@ -1120,6 +1121,7 @@ materialize_plan_finalize_kernel(DeviceMaterializeArgs a) {
 }
 
 __global__ void materialize_routes_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto route = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                      threadIdx.x;
   if (a.status->error != 0 || route >= a.routes)
@@ -1148,6 +1150,7 @@ __global__ void materialize_routes_kernel(DeviceMaterializeArgs a) {
 }
 
 __global__ void materialize_incoming_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto pair = static_cast<std::uint64_t>(blockIdx.x);
   const auto expert = static_cast<std::uint32_t>(pair / a.world);
   const auto source = static_cast<std::uint32_t>(pair % a.world);
@@ -1169,6 +1172,7 @@ __global__ void materialize_incoming_kernel(DeviceMaterializeArgs a) {
 }
 
 __global__ void materialize_mtiles_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto expert = static_cast<std::uint32_t>(blockIdx.x);
   if (a.status->error != 0 || expert >= a.experts ||
       a.expert_to_rank[expert] != a.rank)
@@ -1194,6 +1198,7 @@ __global__ void materialize_mtiles_kernel(DeviceMaterializeArgs a) {
 // canonical row), and avoids a route-sized sort and a second fanout pass.
 __global__ void
 materialize_return_expert_prefix_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto expert = blockIdx.x * blockDim.x + threadIdx.x;
   if (a.status->error != 0 || expert >= a.experts)
     return;
@@ -1214,6 +1219,7 @@ materialize_return_expert_prefix_kernel(DeviceMaterializeArgs a) {
 }
 
 __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto packet = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                       threadIdx.x;
   if (a.status->error != 0 || packet >= a.status->packet_count)
@@ -1242,6 +1248,7 @@ __global__ void materialize_fanout_kernel(DeviceMaterializeArgs a) {
 // Five stable radix passes implement that full runtime-width key without
 // packing unrelated runtime dimensions into a fixed-width integer.
 __global__ void materialize_packet_primary_kernel(DeviceMaterializeArgs a) {
+  programmatic_launch::begin();
   const auto packet = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                       threadIdx.x;
   if (a.status->error != 0 || packet >= a.routes)
@@ -3910,22 +3917,35 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
     args.mtile_rows = state->receive->tiles();
     args.incoming_rows = state->receive->rows();
   }
-  materialize_routes_kernel<<<blocks_for(plan.route_count, "route_grid"),
-                              threads, 0, exec->stream>>>(args);
-  materialize_incoming_kernel<<<static_cast<unsigned int>(
-                                    std::max<std::uint64_t>(incoming_pairs, 1)),
-                                threads, 0, exec->stream>>>(args);
-  materialize_mtiles_kernel<<<plan.num_experts, threads, 0, exec->stream>>>(
-      args);
-  materialize_return_expert_prefix_kernel<<<
-      blocks_for(plan.num_experts, "return_expert_prefix_grid"), threads, 0,
-      exec->stream>>>(args);
-  materialize_fanout_kernel<<<blocks_for(plan.route_count, "packet_grid"),
-                              threads, 0, exec->stream>>>(args);
+  const auto launch_materialization = [&](auto kernel, unsigned blocks,
+                                          const char *name) {
+    internal::throw_cuda(
+        "device-materialize",
+        programmatic_launch::launch(blocks, threads, 0, exec->stream, kernel,
+                                   args),
+        rank, plan.world_size, context.session().identity(),
+        context.session().generation(), ExchangeKind::ExpertCounts, name);
+  };
+  launch_materialization(materialize_routes_kernel,
+                         blocks_for(plan.route_count, "route_grid"),
+                         "materialize routes");
+  launch_materialization(
+      materialize_incoming_kernel,
+      static_cast<unsigned>(std::max<std::uint64_t>(incoming_pairs, 1)),
+      "materialize incoming rows");
+  launch_materialization(materialize_mtiles_kernel, plan.num_experts,
+                         "materialize M tiles");
+  launch_materialization(
+      materialize_return_expert_prefix_kernel,
+      blocks_for(plan.num_experts, "return_expert_prefix_grid"),
+      "materialize Return expert prefix");
+  launch_materialization(materialize_fanout_kernel,
+                         blocks_for(plan.route_count, "packet_grid"),
+                         "materialize fanout");
   if (plan.route_count != 0) {
-    materialize_packet_primary_kernel<<<
-        blocks_for(plan.route_count, "wave_primary_grid"), threads, 0,
-        exec->stream>>>(args);
+    launch_materialization(materialize_packet_primary_kernel,
+                           blocks_for(plan.route_count, "wave_primary_grid"),
+                           "materialize primary packet");
     const auto packed_wave_key_fits = [&] {
       if (plan.num_nodes == 0U || plan.world_size == 0U ||
           plan.max_tokens_per_rank == 0U)

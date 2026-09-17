@@ -84,13 +84,16 @@ __global__ __launch_bounds__(
   __shared__ unsigned long long task;
   __shared__ unsigned kind, return_mblock, pair_operand;
   __shared__ forward_compute_detail::ComputePairState pair;
-  forward_compute_detail::observe_compute_cluster(a);
   using forward_compute_detail::ComputeRole;
   forward_compute_detail::persistent_role<
       StaticLocal, RetainBackwardState, forward_tuning::kFc1Stages,
       forward_tuning::kFc2Stages, true, ComputeRole::Initialize>(
       a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
       &pair_operand, &output_store_map, pair);
+  // Shared barriers and cluster setup are independent of the preceding
+  // generation initialization. Every thread waits before reading its output.
+  programmatic_launch::wait();
+  forward_compute_detail::observe_compute_cluster(a);
   if (threadIdx.x >= forward_compute_detail::kMathThreads) {
     // Every lane of each control warpgroup releases registers before its
     // producer and communication warps enter independent progress loops.
