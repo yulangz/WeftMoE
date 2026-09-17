@@ -61,6 +61,8 @@ def plan(args, model, ep, phase):
 
 
 def build(args):
+    if args.tuning_headers:
+        return build_profiles(args)
     tasks = [(m, e, p) for m in args.models for e in args.eps for p in args.phases]
     workers = min(8, len(tasks))
 
@@ -88,6 +90,36 @@ def build(args):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         list(executor.map(one, tasks))
+
+
+def build_profiles(args):
+    """Build each checked-in combined profile once and reuse it across EP sizes."""
+    if args.override:
+        raise ValueError("--override cannot be combined with --tuning-headers")
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=args.source, text=True).strip()
+    for model in args.models:
+        profile = (args.tuning_headers / f"{model}.hpp").resolve()
+        header = profile.read_text()
+        digest = hashlib.sha256(header.encode()).hexdigest()
+        _, config = plan(args, model, args.eps[0], "forward")
+        compiler = fw.ForwardJitCompiler(
+            args.source, config["jit"], environment(),
+            nccl_lib_dir="/usr/lib/x86_64-linux-gnu")
+        built = compiler.build(
+            candidate_name=model, config_digest=digest, generated_header=header,
+            log_path=args.output / f"{model}.build.log", command_jobs=3)
+        for ep in args.eps:
+            for phase in args.phases:
+                key = f"{model}_ep{ep}_{phase}"
+                save(args.output / f"{key}.build.json", dict(
+                    model=model, ep=ep, phase=phase,
+                    candidate=dict(name=key, tuning_header=str(profile)),
+                    tuning_header_sha256=digest, source=str(args.source),
+                    source_revision=revision, build=built))
+        if built["returncode"]:
+            raise RuntimeError(f"profile build failed: {model}; {built}")
+        print(f"built profile {model}: {built['binary']}", flush=True)
 
 
 def combined_generated_header(name, forward, backward):
@@ -258,6 +290,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--tuning-headers", type=Path,
+                        help="build checked-in combined MODEL.hpp profiles from this directory")
     parser.add_argument("--forward-builds", type=Path)
     parser.add_argument("--backward-builds", type=Path)
     parser.add_argument("--override", action="append", default=[], metavar="KEY=JSON",
