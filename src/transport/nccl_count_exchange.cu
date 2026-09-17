@@ -1948,6 +1948,7 @@ struct DeviceNotifyResourcePool::Impl
   std::uint32_t in_use = 0;
   std::uint64_t epoch_high = 0;
   double setup_us = 0;
+  std::atomic<bool> single_notify_ready{false};
 
   std::shared_ptr<Lease> acquire(const NcclSession &generation) {
     if (!generation || !generation.shares_communicator_with(base_session))
@@ -2024,11 +2025,19 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
   impl->config = config;
   impl->max_plan = query_cuda_notify_workspace(
       config.capacity_config, base_session.rank(), config.max_tokens_per_rank,
-      config.max_tokens_per_rank, config.buffer_mode);
+      config.max_tokens_per_rank);
   impl->slots.resize(config.max_inflight_generations);
   for (auto &slot : impl->slots) {
     slot.notify = DeviceNotifyPoolBridge::allocate(
         impl->max_plan, execution, config.max_inflight_consumers);
+    // The pool has one execution stream. Its count exchange is serialized by
+    // device barriers, independent of which metadata slot each rank retains.
+    if (&slot == &impl->slots.front())
+      DeviceNotifyPoolBridge::configure_communication(slot.notify, base_session,
+                                                      execution);
+    else
+      DeviceNotifyPoolBridge::share_communication(slot.notify,
+                                                  impl->slots.front().notify);
     slot.backend = std::make_shared<NcclAllGatherCountExchange>(
         base_session, execution, config.capacity_config.num_experts,
         config.capacity_config.topology.num_nodes,
@@ -2124,6 +2133,8 @@ struct CudaNotifyGenerationCoordinator::Impl {
   std::shared_ptr<DeviceNotifyResourcePool::Impl> pool;
   GenerationSetupTimings setup;
   bool used = false;
+  bool single_notify = false;
+  CollectiveProtocolAudit single_audit;
   CudaRouteInput direct_routes;
   CudaGateInput direct_gates;
 };
@@ -2392,6 +2403,72 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
     use_fast_notify = false;
 #endif
 
+#if !WEFTMOE_DEBUG_VALIDATE
+  // The first invocation retains full control/config validation. Prepared
+  // steady-state device inputs use the single kernel; its exchange checks
+  // the config digest and route validity collectively before materialization.
+  if (direct_routes && impl_->pool && impl_->pool->single_notify_ready.load() &&
+      DeviceNotifyPoolBridge::has_communication(pool_allocation)
+#if WEFTMOE_BUILD_TESTING
+      && !identity_override &&
+      testing::g_config_corruption_offset == SIZE_MAX &&
+      testing::g_next_fault.load(std::memory_order_acquire) == 0
+#endif
+  ) {
+    // Every prepared device-input rank enters the same device exchange even
+    // when local preflight fails or one rank changes its config. Falling back
+    // to host NCCL on that rank would strand peers in the device barrier.
+    if (status.error != ControlLocalError::None || !direct_gates) {
+      DeviceNotifyPoolBridge::reject_single(impl_->context, impl_->execution,
+                                            pool_allocation);
+      invalid(
+          "phase=single-notify, field=collective-preflight, actual=rejected");
+    }
+    impl_->single_notify = true;
+    impl_->single_audit.fused_notify_starts = 1;
+    impl_->single_audit.config_cache_hits = 1;
+    auto result = std::make_shared<ValidatedCudaGeneration::Impl>();
+    result->dispatch = DeviceNotifyPoolBridge::run_single(
+        request.config, impl_->context, impl_->execution, *direct_routes,
+        *direct_gates, request.max_tokens_per_rank, pool_allocation,
+        pool_lease);
+    if (options.cancellation.cancellation_requested() ||
+        std::chrono::steady_clock::now() >= deadline)
+      throw NotifyDispatchError(
+          NotifyErrorCode::ControlProtocolFailure,
+          "phase=generation-cancel, field=cancel_or_deadline, actual=cancel "
+          "requested/deadline expired");
+    result->audit.fused_notify_starts = 1;
+    result->audit.config_cache_hits = 1;
+    result->setup = impl_->setup;
+    result->workspace = {};
+    for (const auto &slot : impl_->pool->slots) {
+      const auto backend = slot.backend->workspace_usage();
+      result->workspace.device_bytes +=
+          DeviceNotifyPoolBridge::device_bytes(slot.notify) +
+          backend.device_bytes;
+      result->workspace.pinned_host_bytes +=
+          DeviceNotifyPoolBridge::pinned_bytes(slot.notify) +
+          backend.pinned_host_bytes;
+      result->workspace.event_count +=
+          5U + DeviceNotifyPoolBridge::event_count(slot.notify);
+    }
+    result->workspace.route_input_device_bytes = direct_routes->num_tokens() *
+                                                 request.config.top_k *
+                                                 sizeof(std::int32_t);
+    result->workspace.device_bytes +=
+        result->workspace.route_input_device_bytes;
+    result->execution.coordinator_run_wall_us =
+        offset_us(std::chrono::steady_clock::now());
+    result->execution.steady_execution_us =
+        result->execution.coordinator_run_wall_us;
+    result->execution.notify_handle_ready_offset_us =
+        result->execution.coordinator_run_wall_us;
+    result->resource_lease = pool_lease;
+    testing::g_validated_publishes.fetch_add(1);
+    return ValidatedCudaGeneration(std::move(result));
+  }
+#endif
   CudaLocalNotifyHandle local;
   double local_mapping_us = 0;
   std::uint64_t route_input_bytes = 0;
@@ -2423,8 +2500,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       route_input_bytes = routes.device_bytes();
       auto plan = query_cuda_notify_workspace(
           request.config, impl_->session.rank(),
-          request.local_routes.num_tokens, request.max_tokens_per_rank,
-          impl_->pool ? impl_->pool->config.buffer_mode : BufferMode::Static);
+          request.local_routes.num_tokens, request.max_tokens_per_rank);
       notify_arena_bytes = plan.device_bytes;
       notify_pinned_bytes = plan.host_staging_bytes;
       auto workspace = pool_allocation
@@ -2750,6 +2826,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   result->resource_lease = pool_lease
                                ? std::static_pointer_cast<const void>(pool_lease)
                                : std::static_pointer_cast<const void>(impl_);
+  if (impl_->pool)
+    impl_->pool->single_notify_ready.store(true);
   testing::g_validated_publishes.fetch_add(1);
   return ValidatedCudaGeneration(std::move(result));
 }
@@ -2775,7 +2853,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run_device(
 CollectiveProtocolAudit CudaNotifyGenerationCoordinator::audit() const {
   if (!impl_)
     invalid("phase=generation-audit, field=coordinator, rank=n/a, expected=valid, actual=empty");
-  return impl_->backend->audit();
+  return impl_->single_notify ? impl_->single_audit : impl_->backend->audit();
 }
 
 NcclWorkspaceUsage CudaNotifyGenerationCoordinator::workspace_usage() const {

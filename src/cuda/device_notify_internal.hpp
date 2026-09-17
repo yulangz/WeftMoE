@@ -68,7 +68,6 @@ struct DeviceDispatchMetadata {
   DeviceBufferLease expert_row_prefix;
   DeviceBufferLease mtile_row_offsets;
   DeviceBufferLease mtile_expected_rows;
-  DeviceBufferLease incoming_rows;
   DeviceBufferLease reverse_routes;
   DeviceBufferLease packet_headers;
   DeviceBufferLease packet_fanout_offsets;
@@ -181,7 +180,6 @@ struct DeviceDispatchKernelView {
   const std::uint64_t *expert_row_prefix = nullptr;
   const std::uint64_t *mtile_row_offsets = nullptr;
   const std::uint32_t *mtile_expected_rows = nullptr;
-  const DeviceIncomingRowRecord *incoming_rows = nullptr;
   const DeviceReverseRouteRecord *reverse_routes = nullptr;
   const DevicePacketHeaderRecord *packet_headers = nullptr;
   const std::uint64_t *packet_fanout_offsets = nullptr;
@@ -216,18 +214,55 @@ struct DispatchWaveKernelView {
 // memory. A value lets the compiler keep only the requested scalar fields.
 __device__ __forceinline__ DeviceDispatchSizes
 dispatch_sizes(const DeviceDispatchKernelView &view) {
-  return view.runtime ? view.runtime->sizes : view.sizes;
+  if (!view.runtime)
+    return view.sizes;
+  // Notify publishes these fields before the consumer starts; they are
+  // immutable for the entire consumer kernel, including graph replay.
+  const auto &s = view.runtime->sizes;
+  return {__ldg(&s.route_count),          __ldg(&s.node_mask_words),
+          __ldg(&s.owned_expert_count),   __ldg(&s.incoming_row_count),
+          __ldg(&s.mtile_count),          __ldg(&s.packet_count),
+          __ldg(&s.fanout_count),         __ldg(&s.outgoing_signal_count),
+          __ldg(&s.incoming_signal_count)};
+}
+
+// Canonical rows are expert-major, then source-major. Their source identity
+// is fully determined by the compact count/prefix tables; no per-row table
+// needs to be allocated or materialized by Notify.
+__device__ __forceinline__ DeviceIncomingRowRecord
+incoming_row(const DeviceDispatchKernelView &view, std::uint64_t row) {
+  unsigned lo = 0, hi = dispatch_sizes(view).owned_expert_count;
+  while (lo < hi) {
+    const auto mid = (lo + hi) / 2;
+    if (view.expert_row_prefix[mid + 1] <= row)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo >= dispatch_sizes(view).owned_expert_count)
+    return {};
+  const auto expert = view.owned_expert_ids[lo];
+  auto offset = row - view.expert_row_prefix[lo];
+  for (unsigned source = 0; source < view.identity.world_size; ++source) {
+    const auto count = view.source_expert_count[std::uint64_t(source) *
+                                                    view.identity.num_experts +
+                                                expert];
+    if (offset < count)
+      return {offset, row, source, expert};
+    offset -= count;
+  }
+  return {};
 }
 
 __device__ __forceinline__ std::uint64_t
 dispatch_wave_count(const DeviceDispatchKernelView &view,
                     const DispatchWaveKernelView &waves) {
-  return view.runtime ? view.runtime->wave_count : waves.wave_count;
+  return view.runtime ? __ldg(&view.runtime->wave_count) : waves.wave_count;
 }
 #endif
 
 struct CudaNotifyWorkspacePlan {
-  BufferMode buffer_mode = BufferMode::Static;
+  std::uint32_t m_tile_rows = 0;
   std::uint32_t calling_rank = 0;
   std::uint64_t num_tokens = 0;
   std::uint64_t max_tokens_per_rank = 0;
@@ -240,14 +275,11 @@ struct CudaNotifyWorkspacePlan {
   std::uint64_t max_incoming_rows = 0;
   std::uint64_t device_bytes = 0;
   std::uint64_t host_staging_bytes = 0;
-  std::uint64_t sort_temp_bytes = 0;
-  std::uint64_t scan_temp_bytes = 0;
 };
 
 CudaNotifyWorkspacePlan query_cuda_notify_workspace(
     const RuntimeConfig &config, std::uint32_t calling_rank,
-    std::uint64_t num_tokens, std::uint64_t max_tokens_per_rank,
-    BufferMode buffer_mode = BufferMode::Static);
+    std::uint64_t num_tokens, std::uint64_t max_tokens_per_rank);
 
 class CudaNotifyWorkspace {
 public:
@@ -288,6 +320,23 @@ public:
       const CudaNotifyWorkspacePlan &max_plan,
       const CudaExecution &execution,
       std::uint32_t max_inflight_consumers = 4);
+  static void
+  configure_communication(const std::shared_ptr<CudaNotifyPoolAllocation> &,
+                          const NcclSession &, const CudaExecution &);
+  static void
+  share_communication(const std::shared_ptr<CudaNotifyPoolAllocation> &,
+                      const std::shared_ptr<CudaNotifyPoolAllocation> &);
+  static bool
+  has_communication(const std::shared_ptr<CudaNotifyPoolAllocation> &);
+  static void reject_single(const RankCollectiveContext &,
+                            const CudaExecution &,
+                            const std::shared_ptr<CudaNotifyPoolAllocation> &);
+  static DeviceDispatchHandle
+  run_single(const RuntimeConfig &, const RankCollectiveContext &,
+             const CudaExecution &, const CudaRouteInput &,
+             const CudaGateInput &, std::uint64_t,
+             const std::shared_ptr<CudaNotifyPoolAllocation> &,
+             std::shared_ptr<const void>);
   static CudaRouteInput upload(
       const RankRoutingInput &routes, std::uint32_t top_k,
       const RankCollectiveContext &context,

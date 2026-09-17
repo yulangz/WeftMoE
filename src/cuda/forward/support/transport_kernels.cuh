@@ -358,7 +358,7 @@ __device__ __forceinline__ void publish_production_terminal_status(
 // producers. Initialize only the local allocation, then publish setup-ready
 // to every peer. No peer may issue a put until every owner has published the
 // same epoch, which prevents initialization racing a remote release store.
-__global__ void initialize_forward_generation_signals_kernel(
+__device__ __forceinline__ void initialize_forward_generation_signals(
     void *local_base, void **peer_bases, std::size_t ingress_published_offset,
     std::size_t outgoing_sequence_offset, std::size_t setup_epoch_offset,
     std::size_t gin_local_compute_ready_offset,
@@ -464,6 +464,27 @@ __global__ void initialize_forward_generation_signals_kernel(
     while (peer_ack.load(::cuda::memory_order_acquire) < epoch) {
     }
   }
+}
+
+__global__ void initialize_forward_generation_signals_kernel(
+    void *local_base, void **peer_bases, std::size_t ingress_published_offset,
+    std::size_t outgoing_sequence_offset, std::size_t setup_epoch_offset,
+    std::size_t gin_local_compute_ready_offset,
+    std::size_t forward_x_arrived_rows_offset, std::uint64_t mtile_count,
+    std::size_t forward_completion_offset,
+    std::size_t forward_context_completion_offset,
+    std::uint32_t context_completion_capacity, std::uint64_t generation,
+    std::uint32_t rank, std::uint32_t world, std::uint32_t channels,
+    unsigned long long epoch, std::uint32_t first_peer,
+    std::uint32_t peer_count, unsigned long long *runtime_epoch,
+    const DeviceDispatchRuntime *runtime) {
+  initialize_forward_generation_signals(
+      local_base, peer_bases, ingress_published_offset,
+      outgoing_sequence_offset, setup_epoch_offset,
+      gin_local_compute_ready_offset, forward_x_arrived_rows_offset,
+      mtile_count, forward_completion_offset, forward_context_completion_offset,
+      context_completion_capacity, generation, rank, world, channels, epoch,
+      first_peer, peer_count, runtime_epoch, runtime);
 }
 
 struct LocalP2pKernelArgs {
@@ -770,10 +791,18 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
     if (lane == 0)
       shared_value = 0;
     __syncthreads();
-    for (std::uint64_t row = lane;
-         row < dispatch_sizes(a.dispatch).incoming_row_count; row += blockDim.x)
-      if (a.dispatch.incoming_rows[row].source_rank == source)
-        atomicAdd(&shared_value, 1ULL);
+    for (unsigned owned = lane;
+         owned < dispatch_sizes(a.dispatch).owned_expert_count;
+         owned += blockDim.x) {
+      const auto expert = a.dispatch.owned_expert_ids[owned];
+      atomicAdd(
+          &shared_value,
+          static_cast<unsigned long long>(
+              a.dispatch
+                  .source_expert_count[std::uint64_t(source) *
+                                           a.dispatch.identity.num_experts +
+                                       expert]));
+    }
     __syncthreads();
     expected = shared_value;
     const auto ingress_link = static_cast<std::uint64_t>(source) * a.channels;
@@ -806,7 +835,7 @@ local_p2p_persistent_kernel(LocalP2pKernelArgs a) {
         stage_clock = device_globaltimer_ns();
       const auto incoming =
           header.dst_row < dispatch_sizes(a.dispatch).incoming_row_count
-              ? a.dispatch.incoming_rows[header.dst_row]
+              ? incoming_row(a.dispatch, header.dst_row)
               : DeviceIncomingRowRecord{};
       if (header.schema_version !=
               transport::kActivationTransportSchemaVersion ||

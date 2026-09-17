@@ -385,14 +385,35 @@ struct ReusableRankResources {
   std::exception_ptr error;
 };
 
-std::vector<ReusableRankResources>
+// Device communicator/window teardown is collective. Fixtures that own
+// several ranks in one process must retire them concurrently, like creation.
+struct ReusableRankResourceGroup : std::vector<ReusableRankResources> {
+  using std::vector<ReusableRankResources>::vector;
+  ReusableRankResourceGroup(ReusableRankResourceGroup &&) = default;
+  ReusableRankResourceGroup(const ReusableRankResourceGroup &) = delete;
+  ~ReusableRankResourceGroup() {
+    std::vector<std::thread> threads;
+    for (auto &resource : *this) {
+      threads.emplace_back([entry = &resource] {
+        entry->device_gates = {};
+        entry->device_routes = {};
+        entry->pool = {};
+        entry->base_session = {};
+        entry->execution = {};
+      });
+    }
+    for (auto &thread : threads)
+      thread.join();
+  }
+};
+
+ReusableRankResourceGroup
 make_reusable_resources(const weftmoe::RuntimeConfig &config,
-                        const std::string &identity,
-                        std::uint64_t generation,
+                        const std::string &identity, std::uint64_t generation,
                         std::uint64_t max_tokens) {
   const auto world = config.topology.world_size;
   auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-  std::vector<ReusableRankResources> resources(world);
+  ReusableRankResourceGroup resources(world);
   std::vector<std::thread> threads;
   for (std::uint32_t rank = 0; rank < world; ++rank) {
     threads.emplace_back([&, rank] {
@@ -738,6 +759,107 @@ void test_device_capacity_failure_and_recovery() {
 }
 
 #if !WEFTMOE_DEBUG_VALIDATE
+void test_single_notify_collective_rejection() {
+  constexpr unsigned world = 2;
+  const auto config = make_config(1, world, 8, 3, 4);
+  const std::vector<weftmoe::RankRoutingInput> inputs(
+      world, weftmoe::RankRoutingInput{1, {0, 1, 2}});
+  const std::string identity = "single-notify-recovery";
+  auto resources = make_reusable_resources(config, identity, 6800, 10);
+  for (unsigned rank = 0; rank < world; ++rank) {
+    auto &r = resources[rank];
+    const auto context = weftmoe::make_rank_collective_context(
+        r.base_session.session(), rank, r.execution.token());
+    r.device_routes = weftmoe::cuda::upload_cuda_routes(
+        inputs[rank], config.top_k, context, r.execution);
+    r.device_gates = make_unit_gates(r.device_routes, context, r.execution);
+  }
+  // Retain only rank 0's first metadata slot. Later collectives must still
+  // agree even though different ranks acquire different local pool slots.
+  weftmoe::cuda::DeviceDispatchHandle retained;
+  std::array<std::exception_ptr, world> prime_errors{};
+  std::vector<std::thread> prime_threads;
+  for (unsigned rank = 0; rank < world; ++rank) {
+    prime_threads.emplace_back([&, rank] {
+      try {
+        auto &r = resources[rank];
+        weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+            r.base_session, r.execution, r.pool);
+        auto result = coordinator.run_device(
+            {config, r.device_routes, r.device_gates, 10});
+        if (!rank)
+          retained = result.dispatch();
+      } catch (...) {
+        prime_errors[rank] = std::current_exception();
+      }
+    });
+  }
+  for (auto &thread : prime_threads)
+    thread.join();
+  for (const auto &error : prime_errors)
+    if (error)
+      std::rethrow_exception(error);
+  std::cout << "[CHECK] single notify asymmetric retained slots" << std::endl;
+  for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    std::cout << "[CHECK] single notify rejection scenario=" << scenario
+              << std::endl;
+    std::array<bool, world> rejected{};
+    std::array<std::exception_ptr, world> unexpected{};
+    std::vector<std::thread> threads;
+    for (unsigned rank = 0; rank < world; ++rank) {
+      threads.emplace_back([&, rank] {
+        try {
+          auto &r = resources[rank];
+          auto session = weftmoe::cuda::make_nccl_generation(
+              r.base_session, identity, 6810 + 2 * scenario);
+          const auto context = weftmoe::make_rank_collective_context(
+              session.session(), rank, r.execution.token());
+          auto routes =
+              weftmoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+                  r.device_routes, context, r.execution);
+          auto gates =
+              weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+                  r.device_gates, routes, context, r.execution);
+          auto changed = config;
+          if (rank == 1) {
+            if (scenario == 0)
+              ++changed.m_tile_rows;
+            if (scenario == 1)
+              changed.num_experts = 0;
+            if (scenario == 2)
+              changed.capacity.expert_rows.assign(8, 0);
+          }
+          weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+              session, r.execution, r.pool);
+          try {
+            (void)coordinator.run_device({changed, routes, gates, 10});
+          } catch (const weftmoe::NotifyDispatchError &) {
+            rejected[rank] = true;
+          }
+        } catch (...) {
+          unexpected[rank] = std::current_exception();
+        }
+      });
+    }
+    for (auto &thread : threads)
+      thread.join();
+    for (unsigned rank = 0; rank < world; ++rank) {
+      if (unexpected[rank])
+        std::rethrow_exception(unexpected[rank]);
+      require(rejected[rank], "single notify did not reject every rank");
+    }
+    rethrow_errors(run_reused_fixture(config, inputs, resources, identity,
+                                      6811 + 2 * scenario, 10));
+  }
+  // Uniform configuration changes remain supported, including a smaller
+  // M tile that needs more entries in the reusable receive metadata arena.
+  auto smaller = config;
+  smaller.m_tile_rows = 1;
+  rethrow_errors(
+      run_reused_fixture(smaller, inputs, resources, identity, 6820, 10));
+  std::cout << "[PASS] single notify collective rejection and recovery\n";
+}
+
 void test_release_fused_status_and_config_fallback() {
   constexpr std::uint32_t world = 2;
   const auto config = make_config(1, world, 8, 3, 4);
@@ -1875,8 +1997,7 @@ void test_resource_pool_and_cuda_api_audit() {
   auto base = weftmoe::cuda::make_nccl_session(
       "pool-base", 1, 0, 6200, 0, bootstrap);
   auto pool = weftmoe::cuda::make_device_notify_resource_pool(
-      base, execution,
-      {config, 10, 4096, 2, 4, weftmoe::cuda::BufferMode::Static});
+      base, execution, {config, 10, 4096, 2, 4});
   const auto initial_usage = pool.usage();
   require(initial_usage.slot_count == 2 && initial_usage.slots_in_use == 0 &&
               initial_usage.device_bytes != 0 &&
@@ -2029,6 +2150,16 @@ void test_resource_pool_and_cuda_api_audit() {
   // A predictable route error does not change the cached static layout.  It
   // must therefore be dataized in the fixed-width fused record instead of
   // returning locally before the collective.
+  // The single-kernel device path validates the pool once and can use a
+  // metadata slot whose legacy host protocol has never been primed. Prime
+  // that diagnostic protocol explicitly before asserting its cached audit.
+  {
+    auto host_session =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6298);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator host_prime(host_session,
+                                                              execution, pool);
+    (void)host_prime.run({config, routes, 10});
+  }
   auto invalid_session = weftmoe::cuda::make_nccl_generation(
       base, "pool-base", 6299);
   weftmoe::cuda::CudaNotifyGenerationCoordinator invalid_coordinator(
@@ -2446,8 +2577,8 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   storage.max_inflight_generations = 1;
   storage.enable_backward_state = true;
   storage.enable_gin_rdma = nodes > 1;
-  auto dynamic_notify_pool = make_device_notify_resource_pool(
-      base, execution, {config, capacity, 8192, 2, 4, BufferMode::Dynamic});
+  auto eager_notify_pool = make_device_notify_resource_pool(
+      base, execution, {config, capacity, 8192, 2, 4});
   std::array<std::uint64_t, 3> forward_hashes{}, backward_hashes{};
   std::array<BackwardValidationDownload, 3> backward_expected;
   const auto same_backward = [](const BackwardValidationDownload &left,
@@ -2460,14 +2591,14 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
     return equal(left.dx, right.dx) && equal(left.dgate, right.dgate) &&
            equal(left.dw1, right.dw1) && equal(left.dw2, right.dw2);
   };
-  ActivationTransportResourcePool dynamic_pool;
+  ActivationTransportResourcePool eager_pool;
   DeviceBackwardHandle retained_backward;
   DeviceForwardHandle retained_forward;
   BackwardMegaKernel backward_kernel;
   for (unsigned int distribution : {1U, 0U, 2U}) {
     set_routes(distribution);
     CudaNotifyGenerationCoordinator notify_kernel(generation, execution,
-                                                  dynamic_notify_pool);
+                                                  eager_notify_pool);
     auto notify = notify_kernel.run_device({config, routes, gates, capacity});
     require(notify.dispatch().capacity().tokens_per_rank == tokens,
             "Notify did not recover the actual input length");
@@ -2476,13 +2607,13 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                   world * tokens * 2,
               "Notify lost skewed expert rows");
     const auto previous_registered =
-        dynamic_pool ? dynamic_pool.usage().gin_registered_bytes : 0;
+        eager_pool ? eager_pool.usage().gin_registered_bytes : 0;
     const auto previous_bytes =
-        dynamic_pool ? dynamic_pool.usage().device_bytes : 0;
-    dynamic_pool = prepare_activation_transport_pool(
+        eager_pool ? eager_pool.usage().device_bytes : 0;
+    eager_pool = prepare_activation_transport_pool(
         generation.session(), execution, storage, notify.dispatch(),
-        dynamic_pool);
-    auto pool = dynamic_pool;
+        eager_pool);
+    auto pool = eager_pool;
     if (nodes > 1 && previous_registered)
       require(pool.usage().gin_registered_bytes == previous_registered,
               "routing growth changed the fixed GIN ring capacity");
@@ -2577,14 +2708,15 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   }
   retained_forward = {};
   retained_backward = {};
-  dynamic_pool = {};
+  eager_pool = {};
   set_routes(0);
-  auto static_notify_pool = make_device_notify_resource_pool(
-      base, execution, {config, capacity, 8192, 1, 4, BufferMode::Static});
+  auto graph_notify_pool = make_device_notify_resource_pool(
+      base, execution, {config, capacity, 8192, 1, 4});
   CudaNotifyGenerationCoordinator notify_kernel(generation, execution,
-                                                static_notify_pool);
+                                                graph_notify_pool);
   auto notify = notify_kernel.run_device({config, routes, gates, capacity});
-  storage.buffer_mode = BufferMode::Static;
+  storage.max_destination_rows_per_rank = capacity * world * config.top_k;
+  storage.enable_backward_state = false;
   auto pool = prepare_activation_transport_pool(generation.session(), execution,
                                                 storage);
   auto activation = testing::upload_bfloat16_activations_for_testing(
@@ -2606,12 +2738,9 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   check(cudaStreamCreateWithFlags(&snapshot_stream, cudaStreamNonBlocking));
   check(cudaEventCreateWithFlags(&snapshot_done, cudaEventDisableTiming));
   check(cudaStreamSynchronize(exec->stream));
-  ForwardMegaKernelConfig graph_forward{hidden, intermediate, true};
+  ForwardMegaKernelConfig graph_forward{hidden, intermediate, false};
   graph_forward.tensors =
       prepare_forward_tensors(notify.dispatch(), execution, graph_forward);
-  BackwardMegaKernelConfig graph_backward{hidden, intermediate};
-  graph_backward.tensors =
-      prepare_backward_tensors(notify.dispatch(), execution, graph_backward);
   check(cudaStreamBeginCapture(exec->stream, cudaStreamCaptureModeGlobal));
   notify.dispatch().enqueue_notify(generation);
   auto forward = remote ? remote->enqueue(notify.dispatch(), activation,
@@ -2623,10 +2752,6 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
   check(cudaMemcpyAsync(
       snapshot->host_ptr, forward_output_device_pointer_for_testing(forward),
       snapshot->host_bytes, cudaMemcpyDeviceToHost, snapshot_stream));
-  check(cudaEventRecord(snapshot_done, snapshot_stream));
-  check(cudaStreamWaitEvent(exec->stream, snapshot_done));
-  auto backward = backward_kernel.enqueue(forward, gradients, graph_backward);
-  backward.wait_on(snapshot_stream);
   check(cudaEventRecord(snapshot_done, snapshot_stream));
   check(cudaStreamWaitEvent(exec->stream, snapshot_done));
   cudaGraph_t graph = nullptr;
@@ -2649,17 +2774,15 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                 ", dx=" + std::to_string(backward_hashes[distribution]));
     require(hash_bf16_indexed(download_forward_output_for_validation(
                 forward, execution)) == actual_forward,
-            "captured Backward aliased Forward output");
-    auto result = BackwardValidationBridge::download(backward, execution);
-    require(same_backward(result, backward_expected[distribution]),
-            "Graph Backward gradients used stale routing or counts");
+            "captured inference output differs from stream consumer");
   }
   check(cudaGraphExecDestroy(executable));
   check(cudaGraphDestroy(graph));
   check(cudaEventDestroy(snapshot_done));
   check(cudaStreamDestroy(snapshot_stream));
   std::cout << "BUFFER_MODES rank=" << rank << " tokens=" << tokens
-            << " dynamic=1 static=1 graph_replays=6 skew=1 gradient_bits=all\n";
+            << " retained_capacity=1 inference_graph_replays=6 skew=1 "
+               "gradient_bits=all\n";
 }
 
 void run_cached_backward_rank(
@@ -5663,6 +5786,12 @@ void test_randomized_generation_scheduler() {
 
 int main(int argc, char **argv) {
   try {
+#if !WEFTMOE_DEBUG_VALIDATE
+    if (argc == 2 && std::string(argv[1]) == "--single-notify-regressions") {
+      test_single_notify_collective_rejection();
+      return 0;
+    }
+#endif
     if (argc == 3 && std::string(argv[1]) == "--local") {
       const auto world = static_cast<std::uint32_t>(parse_u64(argv[2]));
       print_nccl_runtime_info();
@@ -5671,6 +5800,7 @@ int main(int argc, char **argv) {
         test_device_capacity_failure_and_recovery();
 #if !WEFTMOE_DEBUG_VALIDATE
         test_release_fused_status_and_config_fallback();
+        test_single_notify_collective_rejection();
 #endif
         test_protocol_failure_suite();
       }

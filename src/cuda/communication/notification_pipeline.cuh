@@ -19,8 +19,8 @@ __device__ __forceinline__ Channel &channel(const Args &a, void *base,
       a.local_notification_offset)[peer * a.local_notification_ctas + cta];
 }
 
-template <class Args> __global__ void reset(Args a) {
-  const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+template <class Args>
+__device__ __forceinline__ void reset_channel(const Args &a, unsigned index) {
   if (index >= a.local_world_size * a.local_notification_ctas)
     return;
   auto &state =
@@ -29,6 +29,10 @@ template <class Args> __global__ void reset(Args a) {
   state.ended = 0;
   for (auto &slot : state.slots)
     slot.ready = slot.credit = slot.consumed = 0;
+}
+
+template <class Args> __global__ void reset(Args a) {
+  reset_channel(a, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
 // Each CTA consumes its matching incoming channels. The default permits

@@ -96,8 +96,9 @@ __device__ __forceinline__ unsigned data_context(const Args &a,
 
 // Durable sequences and per-slot signals survive FWD, BWD, arena growth and
 // graph replay. Only the finite work interval changes at an operation boundary.
-template <class Args> __global__ void prepare(Args a) {
-  const auto channel = blockIdx.x * blockDim.x + threadIdx.x;
+template <class Args>
+__device__ __forceinline__ void prepare_channel(const Args &a,
+                                                unsigned channel) {
   if (channel >= a.gin_rings.channels())
     return;
   auto &state = ring::channels(a.gin_window_base, a.gin_rings)[channel];
@@ -137,6 +138,10 @@ template <class Args> __global__ void prepare(Args a) {
   state.tx_cursor =
       begin + (channel % ring::kDispatchChannels) * ring::kChunkRows;
   state.tx_end = end;
+}
+
+template <class Args> __global__ void prepare(Args a) {
+  prepare_channel(a, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
 struct Transfer {

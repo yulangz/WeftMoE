@@ -14,6 +14,8 @@ void unified_communication_benchmark_kernel(
     const __grid_constant__ CUtensorMap output_store_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   programmatic_launch::wait();
+  forward_initialize_generation<StaticLocal>(a);
+  forward_initialize_pipeline<StaticLocal, true>(a, !StaticLocal, StaticLocal);
   extern __shared__ __align__(1024) unsigned char storage[];
   auto *scheduler = peer_at<unsigned long long>(
       a.local_base, a.forward_scheduler_offset);

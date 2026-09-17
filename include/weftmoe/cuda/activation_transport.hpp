@@ -79,7 +79,6 @@ struct ActivationTransportPoolConfig {
   // until it is saved. Long-lived X/A/B checkpoints and final outputs belong
   // to ForwardTensorStorage, independently of these reusable execution slots.
   bool enable_backward_state = false;
-  BufferMode buffer_mode = BufferMode::Dynamic;
 };
 
 struct ActivationTransportPoolUsage {
@@ -121,9 +120,9 @@ ActivationTransportResourcePool make_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config);
 
-// Dynamic mode derives common capacities from Notify. Static mode derives a
-// route-independent upper bound from max_tokens_per_rank. Existing storage is
-// reused when compatible; live Forward/Backward handles retain older pools.
+// Combine explicit capacities with the current Notify requirements. Capture
+// preparation without Notify must provide a destination-row capacity. Reuse
+// compatible storage; live Forward/Backward handles retain older pools.
 ActivationTransportResourcePool prepare_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config,

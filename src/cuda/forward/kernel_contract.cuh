@@ -15,6 +15,11 @@ struct ForwardKernelArgs {
   std::uint32_t channels;
   std::uint64_t epoch;
   unsigned long long *runtime_epoch = nullptr;
+  std::size_t generation_setup_offset = 0;
+  std::size_t completion_offset = 0;
+  std::size_t context_completion_offset = 0;
+  unsigned context_completion_capacity = 0;
+  unsigned gin_allocated_context_count = 0;
   void *local_base;
   void **peer_bases;
 #if __has_include(<nccl_device.h>)

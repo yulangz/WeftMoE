@@ -1605,6 +1605,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     // is independent of this host allocation policy; when the backend returns
     // fewer contexts, device-side GPU sharing arbitrates concurrent issuers.
     requirements.ginContextCount = allocated_context_count;
+    requirements.barrierCount = 1;
     requirements.ginExclusiveContexts = true;
     requirements.ginQueueDepth = 1024;
     // Legacy transport diagnostics use signals 0/1; production terminal status
@@ -1687,24 +1688,30 @@ ActivationTransportResourcePool prepare_activation_transport_pool(
     const CollectiveSession &session, const CudaExecution &execution,
     ActivationTransportPoolConfig config, const DeviceDispatchHandle &dispatch,
     const ActivationTransportResourcePool &existing) {
-  if (config.buffer_mode == BufferMode::Dynamic) {
-    if (!dispatch || dispatch.identity().world_size != session.world_size() ||
+  // Explicit capacity permits capture preparation before Notify. Eager callers
+  // supply the current Notify and reuse/grow the same pool as needed.
+  if (dispatch) {
+    if (dispatch.identity().world_size != session.world_size() ||
         ActivationTransportBridge::context(dispatch)
                 .session()
                 .stable_identity_bytes() != session.stable_identity_bytes())
       transport_error(NotifyErrorCode::InvalidHandle, "transport-pool-prepare",
                       "dispatch", 0, "Notify for the current EP group",
-                      "missing/mismatched");
-    config.max_tokens_per_rank =
-        std::max<std::uint64_t>(dispatch.capacity().tokens_per_rank, 1);
-    config.max_destination_rows_per_rank = std::max<std::uint64_t>(
-        dispatch.capacity().destination_rows_per_rank, 1);
-  } else {
-    config.max_destination_rows_per_rank = checked_mul(
-        checked_mul(config.max_tokens_per_rank, config.max_world_size,
-                    "static global token capacity"),
-        config.max_top_k, "static destination row capacity");
+                      "mismatched");
+    config.max_tokens_per_rank = std::max<std::uint64_t>(
+        config.max_tokens_per_rank, dispatch.capacity().tokens_per_rank);
+    config.max_destination_rows_per_rank =
+        std::max<std::uint64_t>(config.max_destination_rows_per_rank,
+                                dispatch.capacity().destination_rows_per_rank);
+  } else if (!config.max_destination_rows_per_rank) {
+    transport_error(NotifyErrorCode::InvalidHandle, "transport-pool-prepare",
+                    "capacity", 0,
+                    "Notify or explicit destination row capacity", "missing");
   }
+  config.max_tokens_per_rank =
+      std::max<std::uint64_t>(config.max_tokens_per_rank, 1);
+  config.max_destination_rows_per_rank =
+      std::max<std::uint64_t>(config.max_destination_rows_per_rank, 1);
   std::shared_ptr<GinResources> resources;
   if (existing.impl_ && existing.impl_->state) {
     const auto &state = *existing.impl_->state;
@@ -4363,26 +4370,26 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       id.calling_rank, id.world_size, backend->session.session().identity(),
       id.generation, ExchangeKind::ExpertCounts,
       "cudaEventRecord(forward start)");
-  internal::throw_cuda(
-      "forward-run",
-      cudaMemsetAsync(at<void>(slot.device, layout.status), 0,
-                      sizeof(TransportDeviceStatus), exec->stream),
-      id.calling_rank, id.world_size,
-      backend->session.session().identity(), id.generation,
-      ExchangeKind::ExpertCounts, "clear forward status");
 #if WEFTMOE_DEVICE_TIMELINE
-  reset_timeline("forward-run", slot.forward_timeline,
-                 state->timeline_layout, state->timeline_max_ctas,
-                 exec->stream, id.calling_rank, id.world_size,
-                 id.generation, backend->session);
+  reset_timeline("forward-run", slot.forward_timeline, state->timeline_layout,
+                 state->timeline_max_ctas, exec->stream, id.calling_rank,
+                 id.world_size, id.generation, backend->session);
 #endif
+  if constexpr (!forward_tuning::kUnifiedWorkers) {
+    internal::throw_cuda(
+        "forward-run",
+        cudaMemsetAsync(at<void>(slot.device, layout.status), 0,
+                        sizeof(TransportDeviceStatus), exec->stream),
+        id.calling_rank, id.world_size, backend->session.session().identity(),
+        id.generation, ExchangeKind::ExpertCounts, "clear forward status");
 
-  // Notify has already completed the rank-wide generation agreement on this
-  // communicator.  The IPC team and per-slot peer mappings are session-static,
-  // while payload visibility is ordered by the device release/acquire signals
-  // below, so a second host-enqueued AllGather here only serialized E2E.
+    // Notify has already completed the rank-wide generation agreement on this
+    // communicator.  The IPC team and per-slot peer mappings are
+    // session-static, while payload visibility is ordered by the device
+    // release/acquire signals below, so a second host-enqueued AllGather here
+    // only serialized E2E.
 
-  if (use_gin) {
+    if (use_gin) {
 #if __has_include(<nccl_device.h>)
     auto *gin_barrier =
         at<std::uint64_t>(slot.gin_window, state->gin_layout.barrier);
@@ -4410,7 +4417,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     debug_forward_host_phase("gin_reset_enqueued");
 #endif
 #endif
-  }
+    }
 
   initialize_forward_generation_signals_kernel<<<1, 256, 0, exec->stream>>>(
       slot.device, at<void *>(slot.device, layout.peer_bases),
@@ -4431,6 +4438,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       backend->session.session().identity(), id.generation,
       ExchangeKind::ExpertCounts,
       "initialize owner completion signals and wait peer setup epoch");
+  }
 #if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("generation_init_enqueued");
 #endif
@@ -4451,6 +4459,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.epoch = generation_epoch;
   args.runtime_epoch =
       at<unsigned long long>(slot.device, layout.execution_epoch);
+  args.generation_setup_offset = layout.p2p_barrier_receive;
+  args.completion_offset = layout.forward_completion;
+  args.context_completion_offset = layout.forward_context_completion;
+  args.context_completion_capacity = (state->config.max_nodes - 1U) * 8U;
+  args.gin_allocated_context_count =
+      use_gin ? gin_backend->gin_allocated_context_count : 0;
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.use_gin = use_gin;
@@ -4760,35 +4774,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
           if (error != cudaSuccess)
             return error;
-          local_notification_detail::reset<<<
-              (args.local_world_size * args.local_notification_ctas + 127U) / 128U,
-              128, 0, exec->stream>>>(args);
-          // Setup initializes the generation only; peer and payload progress
-          // belongs to the communication domain in every resident CTA.
-          if constexpr (forward_tuning::kRdmaCtas == 0U) {
-            local_p2p_forward_transport_kernel<true, true><<<
-                forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
-          } else {
-            if (!split_local_roles) {
-            error = cudaMemsetAsync(args.gin_sender_done, 0,
-                args.gin_sender_count * sizeof(unsigned),
-                exec->stream);
-            if (error != cudaSuccess)
-              return error;
-            activation_ring_detail::prepare<<<
-                (args.gin_rings.channels() + 127U) / 128U, 128, 0,
-                exec->stream>>>(args);
-            }
-            if (split_local_roles)
-              local_p2p_forward_transport_kernel<true, true><<<
-                  forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
-            else
-              local_p2p_forward_transport_kernel<false, true><<<
-                  forward_main_compute_ctas, 128, 0, exec->stream>>>(args);
-          }
-          error = cudaGetLastError();
-          if (error != cudaSuccess)
-            return error;
           cudaLaunchConfig_t launch{};
           launch.gridDim = dim3(forward_main_compute_ctas, 1, 1);
           launch.blockDim = dim3(forward_tuning::kUnifiedThreads, 1, 1);
@@ -4797,10 +4782,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           cudaLaunchAttribute cluster{};
           cluster.id = cudaLaunchAttributeClusterDimension;
           cluster.val.clusterDim = {forward_tuning::kClusterSize, 1U, 1U};
-          cudaLaunchAttribute attributes[] = {
-              cluster, programmatic_launch::attribute()};
+          cudaLaunchAttribute cooperative{};
+          cooperative.id = cudaLaunchAttributeCooperative;
+          cooperative.val.cooperative = 1;
+          cudaLaunchAttribute attributes[] = {cluster, cooperative,
+                                              programmatic_launch::attribute()};
           launch.attrs = attributes;
-          launch.numAttrs = programmatic_launch::enabled() ? 2U : 1U;
+          launch.numAttrs = programmatic_launch::enabled() ? 3U : 2U;
           error = cudaOccupancyMaxActiveClusters(
               &max_active_clusters, kernel, &launch);
           if (error != cudaSuccess)

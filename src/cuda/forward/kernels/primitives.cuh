@@ -353,4 +353,5 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
 
+#include "cuda/forward/initialize_pipeline.cuh"
 #include "cuda/persistent_v3/forward/unified_kernel.cuh"

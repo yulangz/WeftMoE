@@ -15,11 +15,6 @@ WEFTMOE_PUBLIC_API_BEGIN
 
 namespace weftmoe::cuda {
 
-// Dynamic receives are sized after Notify. Static receives reserve the maximum
-// possible routing fan-in before capture; excess token shapes require a new
-// pool.
-enum class BufferMode : std::uint8_t { Dynamic, Static };
-
 // Common capacities derived from the current count exchange on every rank.
 struct DeviceDispatchCapacity {
   std::uint64_t tokens_per_rank = 0;
@@ -296,14 +291,14 @@ class DeviceDispatchHandle {
 public:
   DeviceDispatchHandle() = default;
   const DeviceDispatchIdentity &identity() const;
-  // Host snapshots from preparation. Static replay refreshes the corresponding
+  // Host snapshots from preparation. Graph replay refreshes the corresponding
   // device counts without a host readback; these snapshots remain unchanged.
   const DeviceDispatchSizes &sizes() const;
   const DeviceDispatchCapacity &capacity() const;
-  // Required per-call receive storage: exact rows in dynamic mode, declared
-  // maximum fan-in in static mode, including future routing changes.
+  // Exact rows observed by the last host-visible Notify. Graph preparation
+  // must supply a separate capacity that covers every intended replay.
   std::uint64_t received_row_capacity() const;
-  // Enqueue a fresh Notify into static storage using the retained input
+  // Enqueue a fresh Notify into prepared storage using the retained input
   // tensors. Their values may change, their shape and addresses may not.
   // The caller must finish the prior FWD/BWD before reusing this storage.
   void enqueue_notify(const NcclSession &session) const;

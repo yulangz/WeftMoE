@@ -93,6 +93,19 @@ __global__ __launch_bounds__(
   // Shared barriers and cluster setup are independent of the preceding
   // generation initialization. Every thread waits before reading its output.
   programmatic_launch::wait();
+  if (a.dispatch.runtime && a.dispatch.runtime->error) {
+    // Notify makes route/config rejection collective. Inference graph replay
+    // therefore exits on every rank without consuming stale queue metadata.
+    if (!blockIdx.x && !threadIdx.x) {
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      *status = {};
+      status->error = 1;
+    }
+    return;
+  }
+  forward_initialize_generation<StaticLocal>(a);
+  forward_initialize_pipeline<StaticLocal, true>(a, !StaticLocal, StaticLocal);
   forward_compute_detail::observe_compute_cluster(a);
   if (threadIdx.x >= forward_compute_detail::kMathThreads) {
     // Every lane of each control warpgroup releases registers before its
