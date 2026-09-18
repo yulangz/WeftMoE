@@ -1989,11 +1989,25 @@ make_activation_pool_state(const CollectiveSession &session,
       internal::throw_cuda(
           "transport-pool-create",
           cudaHostAlloc(reinterpret_cast<void **>(&slot.host_forward_status),
-                        sizeof(TransportDeviceStatus), cudaHostAllocPortable),
+                        sizeof(TransportDeviceStatus) + sizeof(std::uint32_t),
+                        cudaHostAllocPortable | cudaHostAllocMapped),
           0, session.world_size(), session.identity(), session.generation(),
           ExchangeKind::ExpertCounts,
           "cudaHostAlloc(forward status)");
       internal::record_cuda_api(internal::CudaApiAuditKind::PinnedAllocate);
+      slot.host_forward_done =
+          reinterpret_cast<std::uint32_t *>(slot.host_forward_status + 1);
+      *slot.host_forward_done = 0;
+      void *mapped_forward_status = nullptr;
+      internal::throw_cuda(
+          "transport-pool-create",
+          cudaHostGetDevicePointer(&mapped_forward_status,
+                                   slot.host_forward_status, 0),
+          0, session.world_size(), session.identity(), session.generation(),
+          ExchangeKind::ExpertCounts,
+          "cudaHostGetDevicePointer(Forward completion)");
+      slot.device_forward_done = at<std::uint32_t>(
+          mapped_forward_status, sizeof(TransportDeviceStatus));
       internal::throw_cuda(
           "transport-pool-create",
           cudaHostAlloc(
@@ -2226,7 +2240,7 @@ ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
                            : state->slots.front().forward_progress_words,
       sizeof(std::uint64_t), "pool mapped progress bytes");
   const auto pinned_per_slot = checked_add(
-      checked_add(2ULL * sizeof(TransportDeviceStatus),
+      checked_add(2ULL * sizeof(TransportDeviceStatus) + sizeof(std::uint32_t),
                   sizeof(std::uint64_t), "pool pinned status/cancel bytes"),
       progress_bytes, "pool pinned bytes per slot");
   const auto socket_count_bytes = state->config.enable_socket_fallback
@@ -4529,6 +4543,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.outgoing_sequence_offset = layout.outgoing_route_sequence;
   args.status_offset = layout.status;
   args.forward_s_offset = layout.forward_s;
+  args.saved_x = data.training
+                     ? static_cast<transport::BFloat16 *>(data.x->data)
+                     : nullptr;
+#if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+  if (data.training && data.rows)
+    args.saved_x_map = make_bf16_tma_store_map(
+        data.x->data, config.hidden_size, data.rows, "saved FC1 X");
+#endif
   args.saved_ab = data.training
                       ? static_cast<transport::BFloat16 *>(data.ab->data)
                       : nullptr;
@@ -5012,8 +5034,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               backend->session.session().identity(), id.generation,
               ExchangeKind::ExpertCounts, "save caller-owned Forward state");
         };
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+    // The communication probe skips FC1 and cannot checkpoint X in compute.
     save(data.x, layout.canonical_rows,
          config.hidden_size * sizeof(transport::BFloat16));
+#endif
     save(data.gates, layout.canonical_gates, sizeof(float));
     save(data.headers, layout.direct_route_headers,
          sizeof(LocalP2pRouteHeader));
@@ -5096,20 +5121,40 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #if WEFTMOE_DEBUG_VALIDATE
     const auto debug_forward_host_phase = [](const char *) {};
 #endif
-    internal::throw_cuda(
-        "forward-run",
-        cudaLaunchHostFunc(exec->stream, publish_stream_completion,
-                           forward_stream_done.get()),
-        id.calling_rank, id.world_size, backend->session.session().identity(),
-        id.generation, ExchangeKind::ExpertCounts,
-        "cudaLaunchHostFunc(Forward completion notification)");
+    // The slot lease keeps this mapped word unique until finish completes.
+    // Publish only after the status copies and CUDA completion events above.
+    // The default stream write includes a system-scope fence; it does not
+    // depend on scheduling a driver callback thread to wake the consumer.
+    __atomic_store_n(slot.host_forward_done, 0U, __ATOMIC_RELEASE);
+    const auto write_status = cuStreamWriteValue32(
+        exec->stream, reinterpret_cast<CUdeviceptr>(slot.device_forward_done),
+        1U, CU_STREAM_WRITE_VALUE_DEFAULT);
+    const bool mapped_completion = write_status == CUDA_SUCCESS;
+    if (!mapped_completion && write_status != CUDA_ERROR_NOT_SUPPORTED) {
+      const char *text = nullptr;
+      (void)cuGetErrorString(write_status, &text);
+      transport_error(NotifyErrorCode::CudaFailure, "forward-run",
+                      "stream completion write", id.calling_rank,
+                      "cuStreamWriteValue32 success",
+                      text ? text : "unknown CUDA driver error");
+    }
+    if (!mapped_completion)
+      internal::throw_cuda(
+          "forward-run",
+          cudaLaunchHostFunc(exec->stream, publish_stream_completion,
+                             forward_stream_done.get()),
+          id.calling_rank, id.world_size, backend->session.session().identity(),
+          id.generation, ExchangeKind::ExpertCounts,
+          "cudaLaunchHostFunc(Forward completion fallback)");
     const auto wait_start = std::chrono::steady_clock::now();
     bool cancelled = false;
 #if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
     unsigned int progress_dump_count = 0U;
 #endif
     while (true) {
-      if (forward_stream_done->load(std::memory_order_acquire))
+      if (mapped_completion
+              ? __atomic_load_n(slot.host_forward_done, __ATOMIC_ACQUIRE) != 0U
+              : forward_stream_done->load(std::memory_order_acquire))
         break;
       const auto expired =
           options.deadline_after.count() > 0 &&
@@ -5207,9 +5252,19 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       }
       // Do not call CUDA event-query APIs while the resident GIN kernel is
       // active. On the remote host that can hold a driver-side progress lock and
-      // form a liveness cycle with device GIN. The stream callback above is the
-      // completion notification; this sleep only bounds host polling overhead.
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      // form a liveness cycle with device GIN. The stream-ordered mapped word
+      // (or callback fallback) signals completion without querying that lock.
+      // Synchronous wait stays runnable: a nominal 50us nanosleep can delay
+      // completion by tens of milliseconds under host scheduling jitter.
+      // enqueue() remains asynchronous; only a caller waiting for its result
+      // occupies a host thread here. Cancellation/deadline checks stay above.
+#if defined(__x86_64__) || defined(__i386__)
+      asm volatile("pause");
+#elif defined(__aarch64__)
+      asm volatile("yield");
+#else
+      std::atomic_signal_fence(std::memory_order_acq_rel);
+#endif
     }
 #if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("stream_completion_observed");

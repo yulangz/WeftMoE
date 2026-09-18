@@ -115,7 +115,7 @@ __device__ __forceinline__ void initialize_compute(unsigned char *storage,
 }
 
 template <std::uint32_t DabTileN, std::uint32_t DxTileN, std::uint32_t DwTileN,
-          class Synchronization>
+          std::uint32_t DxClaimTiles = 1U, class Synchronization>
 __device__ __forceinline__ void
 run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
             const CUtensorMap &dab_map, const CUtensorMap &w2_map,
@@ -152,7 +152,9 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
   const auto layout =
       weftmoe::cuda::persistent_v3::backward::make_backward_scheduler_layout(
           a.scheduler_mblock_capacity, kDxTiles, a.scheduler_expert_capacity);
-  const auto queues = make_work_queues(a, words, layout, geometry.mblocks);
+  auto queues = make_work_queues(a, words, layout, geometry.mblocks);
+  queues.dx.claim_granularity = DxClaimTiles;
+  static_assert(DxClaimTiles == 1U || DxClaimTiles == 2U);
   const auto *descriptors = reinterpret_cast<const BackwardMblockDescriptor *>(
       words + layout.descriptors);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -349,16 +351,25 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       }
     } else if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx)) {
       const auto descriptor = descriptors[owner];
+      const auto dx_count = DxClaimTiles == 1U ? 1U : task_count_shared;
       if (Synchronization::kMathEnabled && threadIdx.x == 0U)
         atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-      backward_compute_detail::run_k_mn_tile_tma_store<DxTileN, kStorageTileN,
-                                                       Synchronization>(
-          dab_map, w1_map, dx_store_map, descriptor.padded_row,
-          descriptor.expert * static_cast<std::uint32_t>(2ULL * a.intermediate),
-          static_cast<std::uint32_t>(2ULL * a.intermediate),
-          descriptor.padded_row,
-          tile * backward_tuning::kActivationClusterN * DxTileN, storage,
-          activation_pipeline);
+      // All N tiles of this owner were published together. Each original
+      // GEMM still drains its store before the next one reuses the arena.
+      for (std::uint32_t offset = 0U; offset < dx_count; ++offset) {
+        // CTA 0 multicasts into the peer arena. Wait for both CTAs' previous
+        // stores before allowing either producer to reuse that arena.
+        if (offset != 0U)
+          synchronization.cluster_sync();
+        backward_compute_detail::run_k_mn_tile_tma_store<DxTileN, kStorageTileN,
+                                                         Synchronization>(
+            dab_map, w1_map, dx_store_map, descriptor.padded_row,
+            descriptor.expert * static_cast<std::uint32_t>(2ULL * a.intermediate),
+            static_cast<std::uint32_t>(2ULL * a.intermediate),
+            descriptor.padded_row,
+            (tile + offset) * backward_tuning::kActivationClusterN * DxTileN, storage,
+            activation_pipeline);
+      }
       if (a.use_gin)
         __threadfence_system();
       else
@@ -369,8 +380,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             owner_completed(words[layout.dx_completed + owner]);
         const auto owner_done =
-            owner_completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) +
-            1ULL;
+            owner_completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) +
+            dx_count;
         if (owner_done == kDxTiles) {
           owner_completed.store(
               weftmoe::cuda::persistent_v3::backward::backward_dx_ready_value(
@@ -385,7 +396,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
         ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
             completed(counter->value);
         const auto done =
-            completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) + 1ULL;
+            completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) + dx_count;
         if (done ==
             static_cast<unsigned long long>(geometry.mblocks) * kDxTiles)
           atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());

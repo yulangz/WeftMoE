@@ -168,7 +168,15 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
       const auto av = __uint_as_float((a_pair >> shift) << 16U);
       const auto bv = __uint_as_float((b_pair >> shift) << 16U);
       const auto duv = __uint_as_float((du_pair >> shift) << 16U);
-      const auto sigmoid = 1.0F / (1.0F + __expf(-av));
+      const float denominator = 1.0F + __expf(-av);
+      float sigmoid;
+      if (!(denominator < 0x1p126f)) {
+        sigmoid = 1.0F / denominator;
+      } else {
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sigmoid) : "f"(denominator));
+        sigmoid = __fmaf_rn(
+            sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
+      }
       const auto silu = av * sigmoid;
       const auto s = silu * bv;
       const auto ds = gate * duv;

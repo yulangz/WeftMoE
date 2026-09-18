@@ -882,6 +882,17 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             // own. Start the gate WGMMA group as soon as 32 KiB is ready so its
             // issue overlaps the tail of the independent 16 KiB up-weight TMA.
             fc1_full[stage].wait(phase);
+            if constexpr (RetainBackwardState) {
+              if (n_tile == 0U && valid_rows == forward_tuning::kTileM &&
+                  threadIdx.x == 0U) {
+                cute::tma_store_fence();
+                cute::SM90_TMA_STORE_2D::copy(
+                    &a.saved_x_map, smem_a + stage * kAStageElements,
+                    iteration * forward_tuning::kTileK,
+                    static_cast<std::uint32_t>(row));
+                cute::tma_store_arrive();
+              }
+            }
 #pragma unroll
             for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
               cute::warpgroup_fence_operand(accum_a[index]);
@@ -918,11 +929,43 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
             for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
               cute::warpgroup_fence_operand(accum_b[index]);
+            if constexpr (RetainBackwardState) {
+              // One N tile owns each compact X row. Reuse the ready A stage
+              // while WGMMA reads it; all reads finish before stage recycling.
+              // A full tensor store would cross compact expert boundaries on
+              // tails, possibly copying a neighboring expert before it is ready.
+              if (n_tile == 0U && valid_rows != forward_tuning::kTileM) {
+#pragma unroll
+                for (unsigned vector = threadIdx.x;
+                     vector < kAStageElements / 8U;
+                     vector += kMathThreads) {
+                  const auto m = vector / (forward_tuning::kTileK / 8U);
+                  const auto column =
+                      (vector % (forward_tuning::kTileK / 8U)) * 8U;
+                  const auto k = iteration * forward_tuning::kTileK + column;
+                  if (m < valid_rows && k + 8U <= kHidden) {
+                    const auto *source = smem_a + stage * kAStageElements +
+                        m128_fragment_vector_offset(m, column);
+                    auto *destination = a.saved_x + (row + m) * kHidden + k;
+                    *reinterpret_cast<uint4 *>(destination) =
+                        *reinterpret_cast<const uint4 *>(source);
+                  }
+                }
+              }
+            }
             // FC1 commits two groups per K iteration. In the overlapped mode,
             // retain the current iteration and recycle only the previous stage.
             // A wait<1> followed by recycling the current stage races the up
             // GEMM.
             cute::warpgroup_wait<2U * forward_tuning::kWgmmaWaitGroup>();
+            if constexpr (RetainBackwardState) {
+              if (n_tile == 0U && valid_rows == forward_tuning::kTileM &&
+                  threadIdx.x == 0U)
+                // The issuer contributes to both empty barriers below. Hold
+                // that arrival until TMA has stopped reading this shared stage
+                // and the caller-owned checkpoint is globally complete.
+                asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+            }
             const auto lane = threadIdx.x & 31U;
             if constexpr (forward_tuning::kWgmmaWaitGroup == 0U) {
               if (lane < 2U)

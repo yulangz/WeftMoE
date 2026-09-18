@@ -1,0 +1,2013 @@
+{
+  "status": "complete",
+  "adopted": "baseline",
+  "production_src_unchanged": true,
+  "acceptance": "Full Forward/Backward bitwise equality; no change to existing contract",
+  "numerical_comparisons": {
+    "compare_backward_baseline_qwen_ep8_t129_0__backward_runs_qwen_ep8_t129_0": {
+      "left": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_baseline_qwen_ep8_t129_0",
+      "right": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_runs_qwen_ep8_t129_0",
+      "per_file": [
+        {
+          "file": "rank-0-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 0
+        },
+        {
+          "file": "rank-0-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 0
+        },
+        {
+          "file": "rank-1-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-canonical-ab.bf16",
+          "elements": 1059840,
+          "different": 0
+        },
+        {
+          "file": "rank-2-canonical-x.bf16",
+          "elements": 2119680,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 0
+        },
+        {
+          "file": "rank-3-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 0
+        },
+        {
+          "file": "rank-4-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 0
+        },
+        {
+          "file": "rank-5-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-canonical-ab.bf16",
+          "elements": 1053696,
+          "different": 0
+        },
+        {
+          "file": "rank-6-canonical-x.bf16",
+          "elements": 2107392,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 0
+        },
+        {
+          "file": "rank-7-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dw1.bf16",
+          "elements": 4194304,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dw2.bf16",
+          "elements": 2097152,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        }
+      ],
+      "summary": {
+        "canonical-ab.bf16": {
+          "elements": 8454144,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "canonical-x.bf16": {
+          "elements": 16908288,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dgate.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dw1.bf16": {
+          "elements": 33554432,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dw2.bf16": {
+          "elements": 16777216,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dx.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "gates.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "routes.i32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-dy.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-x.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        }
+      }
+    },
+    "compare_backward_atomic_qwen_ep8_t129_0__backward_atomic_qwen_ep8_t129_1": {
+      "left": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_atomic_qwen_ep8_t129_0",
+      "right": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_atomic_qwen_ep8_t129_1",
+      "per_file": [
+        {
+          "file": "rank-0-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 554756,
+          "max_abs_difference": 0.79296875
+        },
+        {
+          "file": "rank-0-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-0-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dw1.bf16",
+          "elements": 4194304,
+          "different": 64,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-0-dw2.bf16",
+          "elements": 2097152,
+          "different": 109,
+          "max_abs_difference": 9.5367431640625e-07
+        },
+        {
+          "file": "rank-0-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 554634,
+          "max_abs_difference": 0.83203125
+        },
+        {
+          "file": "rank-1-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-1-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dw1.bf16",
+          "elements": 4194304,
+          "different": 128,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-1-dw2.bf16",
+          "elements": 2097152,
+          "different": 54,
+          "max_abs_difference": 3.814697265625e-06
+        },
+        {
+          "file": "rank-1-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-canonical-ab.bf16",
+          "elements": 1059840,
+          "different": 554713,
+          "max_abs_difference": 0.849609375
+        },
+        {
+          "file": "rank-2-canonical-x.bf16",
+          "elements": 2119680,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-2-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dw1.bf16",
+          "elements": 4194304,
+          "different": 81,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-2-dw2.bf16",
+          "elements": 2097152,
+          "different": 18,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-2-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 555011,
+          "max_abs_difference": 0.705078125
+        },
+        {
+          "file": "rank-3-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-3-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dw1.bf16",
+          "elements": 4194304,
+          "different": 113,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-3-dw2.bf16",
+          "elements": 2097152,
+          "different": 18,
+          "max_abs_difference": 3.814697265625e-06
+        },
+        {
+          "file": "rank-3-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 554636,
+          "max_abs_difference": 0.744140625
+        },
+        {
+          "file": "rank-4-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-4-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dw1.bf16",
+          "elements": 4194304,
+          "different": 80,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-4-dw2.bf16",
+          "elements": 2097152,
+          "different": 54,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-4-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 554685,
+          "max_abs_difference": 0.7421875
+        },
+        {
+          "file": "rank-5-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-5-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dw1.bf16",
+          "elements": 4194304,
+          "different": 146,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-5-dw2.bf16",
+          "elements": 2097152,
+          "different": 91,
+          "max_abs_difference": 1.9073486328125e-06
+        },
+        {
+          "file": "rank-5-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-canonical-ab.bf16",
+          "elements": 1053696,
+          "different": 554825,
+          "max_abs_difference": 0.7734375
+        },
+        {
+          "file": "rank-6-canonical-x.bf16",
+          "elements": 2107392,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-6-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dw1.bf16",
+          "elements": 4194304,
+          "different": 178,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-6-dw2.bf16",
+          "elements": 2097152,
+          "different": 90,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-6-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 554791,
+          "max_abs_difference": 0.751953125
+        },
+        {
+          "file": "rank-7-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 1114112,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-7-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dw1.bf16",
+          "elements": 4194304,
+          "different": 128,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-7-dw2.bf16",
+          "elements": 2097152,
+          "different": 54,
+          "max_abs_difference": 9.5367431640625e-07
+        },
+        {
+          "file": "rank-7-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        }
+      ],
+      "summary": {
+        "canonical-ab.bf16": {
+          "elements": 8454144,
+          "different": 4438051,
+          "max_abs_difference": 0.849609375
+        },
+        "canonical-x.bf16": {
+          "elements": 16908288,
+          "different": 8912896,
+          "max_abs_difference": 1.96875
+        },
+        "dgate.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dw1.bf16": {
+          "elements": 33554432,
+          "different": 918,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        "dw2.bf16": {
+          "elements": 16777216,
+          "different": 488,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        "dx.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "gates.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "routes.i32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-dy.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-x.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        }
+      }
+    },
+    "compare_backward_baseline_qwen_ep8_t129_0__backward_atomic_qwen_ep8_t129_0": {
+      "left": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_baseline_qwen_ep8_t129_0",
+      "right": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918/backward_atomic_qwen_ep8_t129_0",
+      "per_file": [
+        {
+          "file": "rank-0-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 1040492,
+          "max_abs_difference": 0.810546875
+        },
+        {
+          "file": "rank-0-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-0-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-dw1.bf16",
+          "elements": 4194304,
+          "different": 339,
+          "max_abs_difference": 6.103515625e-05
+        },
+        {
+          "file": "rank-0-dw2.bf16",
+          "elements": 2097152,
+          "different": 255,
+          "max_abs_difference": 7.62939453125e-06
+        },
+        {
+          "file": "rank-0-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-0-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 1040259,
+          "max_abs_difference": 0.880859375
+        },
+        {
+          "file": "rank-1-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-1-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-dw1.bf16",
+          "elements": 4194304,
+          "different": 421,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-1-dw2.bf16",
+          "elements": 2097152,
+          "different": 271,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-1-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-1-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-canonical-ab.bf16",
+          "elements": 1059840,
+          "different": 1040280,
+          "max_abs_difference": 0.857421875
+        },
+        {
+          "file": "rank-2-canonical-x.bf16",
+          "elements": 2119680,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-2-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-dw1.bf16",
+          "elements": 4194304,
+          "different": 321,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-2-dw2.bf16",
+          "elements": 2097152,
+          "different": 234,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-2-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-2-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 1040838,
+          "max_abs_difference": 0.720703125
+        },
+        {
+          "file": "rank-3-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-3-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-dw1.bf16",
+          "elements": 4194304,
+          "different": 419,
+          "max_abs_difference": 6.103515625e-05
+        },
+        {
+          "file": "rank-3-dw2.bf16",
+          "elements": 2097152,
+          "different": 234,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-3-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-3-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 1040471,
+          "max_abs_difference": 0.818359375
+        },
+        {
+          "file": "rank-4-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-4-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-dw1.bf16",
+          "elements": 4194304,
+          "different": 308,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-4-dw2.bf16",
+          "elements": 2097152,
+          "different": 180,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-4-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-4-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-canonical-ab.bf16",
+          "elements": 1057792,
+          "different": 1040612,
+          "max_abs_difference": 0.697265625
+        },
+        {
+          "file": "rank-5-canonical-x.bf16",
+          "elements": 2115584,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-5-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-dw1.bf16",
+          "elements": 4194304,
+          "different": 389,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-5-dw2.bf16",
+          "elements": 2097152,
+          "different": 183,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-5-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-5-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-canonical-ab.bf16",
+          "elements": 1053696,
+          "different": 1040391,
+          "max_abs_difference": 0.826171875
+        },
+        {
+          "file": "rank-6-canonical-x.bf16",
+          "elements": 2107392,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-6-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-dw1.bf16",
+          "elements": 4194304,
+          "different": 473,
+          "max_abs_difference": 6.103515625e-05
+        },
+        {
+          "file": "rank-6-dw2.bf16",
+          "elements": 2097152,
+          "different": 272,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        {
+          "file": "rank-6-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-6-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-canonical-ab.bf16",
+          "elements": 1055744,
+          "different": 1040500,
+          "max_abs_difference": 0.80078125
+        },
+        {
+          "file": "rank-7-canonical-x.bf16",
+          "elements": 2111488,
+          "different": 2084864,
+          "max_abs_difference": 1.96875
+        },
+        {
+          "file": "rank-7-dgate.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-dw1.bf16",
+          "elements": 4194304,
+          "different": 417,
+          "max_abs_difference": 1.52587890625e-05
+        },
+        {
+          "file": "rank-7-dw2.bf16",
+          "elements": 2097152,
+          "different": 126,
+          "max_abs_difference": 3.814697265625e-06
+        },
+        {
+          "file": "rank-7-dx.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-gates.f32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-routes.i32",
+          "elements": 1032,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-dy.bf16",
+          "elements": 264192,
+          "different": 0
+        },
+        {
+          "file": "rank-7-source-x.bf16",
+          "elements": 264192,
+          "different": 0
+        }
+      ],
+      "summary": {
+        "canonical-ab.bf16": {
+          "elements": 8454144,
+          "different": 8323843,
+          "max_abs_difference": 0.880859375
+        },
+        "canonical-x.bf16": {
+          "elements": 16908288,
+          "different": 16678912,
+          "max_abs_difference": 1.96875
+        },
+        "dgate.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "dw1.bf16": {
+          "elements": 33554432,
+          "different": 3087,
+          "max_abs_difference": 6.103515625e-05
+        },
+        "dw2.bf16": {
+          "elements": 16777216,
+          "different": 1755,
+          "max_abs_difference": 3.0517578125e-05
+        },
+        "dx.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "gates.f32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "routes.i32": {
+          "elements": 8256,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-dy.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        },
+        "source-x.bf16": {
+          "elements": 2113536,
+          "different": 0,
+          "max_abs_difference": 0
+        }
+      }
+    }
+  },
+  "forward_checks": {
+    "baseline": {
+      "per_rank_output_hash": [
+        "10843773427679081751",
+        "5690952036924416490",
+        "6949107376100593804",
+        "14257964753185484394",
+        "1372690566677896241",
+        "4284032998803196991",
+        "1256485221645999091",
+        "15134536447155521099"
+      ],
+      "per_rank_checked_repetitions": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20
+      ],
+      "per_rank_route_hash": [
+        4595442213441323907,
+        7532405872653616003,
+        15790123180641485699,
+        1489421519816622979,
+        16799105082995229571,
+        16612274865235182467,
+        15465703372974572419,
+        5498124182834955139
+      ],
+      "per_rank_gate_hash": [
+        2533646965927048248,
+        14889659337611144224,
+        1885921762837030278,
+        13031457892310627996,
+        3495614625142480915,
+        13663320048870614265,
+        10320913290917362925,
+        13489229337324107559
+      ],
+      "per_rank_activation_hash": [
+        4531537021038687568,
+        4531540677645172320,
+        4531544322708937876,
+        4531547948780902336,
+        4531551539016746464,
+        4531549328095545472,
+        4531545792312969944,
+        4531542281629093712
+      ],
+      "per_rank_actual_w1_device_hash": [
+        [
+          10859038828251380048,
+          16442131194753653433
+        ],
+        [
+          13490324047549650677,
+          10551338782534721331
+        ],
+        [
+          1523583204996924838,
+          7396437084790496312
+        ],
+        [
+          14202752280325517178,
+          7069877735016291564
+        ],
+        [
+          11143749989576260943,
+          10711789497604082305
+        ],
+        [
+          15373236374203514993,
+          11747601676479797665
+        ],
+        [
+          12756950591619209476,
+          16059579973269513226
+        ],
+        [
+          8444084312695986364,
+          2404330781154397705
+        ]
+      ],
+      "per_rank_actual_w2_device_hash": [
+        [
+          10426581982051364210,
+          11462917765497183337
+        ],
+        [
+          9864388787030353151,
+          5655801291444908208
+        ],
+        [
+          16920378329285556154,
+          4357260796332026100
+        ],
+        [
+          10987649904976861325,
+          14989261957126600953
+        ],
+        [
+          6639257194609382919,
+          5831943648165400512
+        ],
+        [
+          6949572988709887387,
+          4199912196243289791
+        ],
+        [
+          2345586710957233582,
+          13734397073630295586
+        ],
+        [
+          8300892234450954968,
+          2168216763842438674
+        ]
+      ]
+    },
+    "atomic": {
+      "per_rank_output_hash": [
+        "10843773427679081751",
+        "5690952036924416490",
+        "6949107376100593804",
+        "14257964753185484394",
+        "1372690566677896241",
+        "4284032998803196991",
+        "1256485221645999091",
+        "15134536447155521099"
+      ],
+      "per_rank_checked_repetitions": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20
+      ],
+      "per_rank_route_hash": [
+        4595442213441323907,
+        7532405872653616003,
+        15790123180641485699,
+        1489421519816622979,
+        16799105082995229571,
+        16612274865235182467,
+        15465703372974572419,
+        5498124182834955139
+      ],
+      "per_rank_gate_hash": [
+        2533646965927048248,
+        14889659337611144224,
+        1885921762837030278,
+        13031457892310627996,
+        3495614625142480915,
+        13663320048870614265,
+        10320913290917362925,
+        13489229337324107559
+      ],
+      "per_rank_activation_hash": [
+        4531537021038687568,
+        4531540677645172320,
+        4531544322708937876,
+        4531547948780902336,
+        4531551539016746464,
+        4531549328095545472,
+        4531545792312969944,
+        4531542281629093712
+      ],
+      "per_rank_actual_w1_device_hash": [
+        [
+          10859038828251380048,
+          16442131194753653433
+        ],
+        [
+          13490324047549650677,
+          10551338782534721331
+        ],
+        [
+          1523583204996924838,
+          7396437084790496312
+        ],
+        [
+          14202752280325517178,
+          7069877735016291564
+        ],
+        [
+          11143749989576260943,
+          10711789497604082305
+        ],
+        [
+          15373236374203514993,
+          11747601676479797665
+        ],
+        [
+          12756950591619209476,
+          16059579973269513226
+        ],
+        [
+          8444084312695986364,
+          2404330781154397705
+        ]
+      ],
+      "per_rank_actual_w2_device_hash": [
+        [
+          10426581982051364210,
+          11462917765497183337
+        ],
+        [
+          9864388787030353151,
+          5655801291444908208
+        ],
+        [
+          16920378329285556154,
+          4357260796332026100
+        ],
+        [
+          10987649904976861325,
+          14989261957126600953
+        ],
+        [
+          6639257194609382919,
+          5831943648165400512
+        ],
+        [
+          6949572988709887387,
+          4199912196243289791
+        ],
+        [
+          2345586710957233582,
+          13734397073630295586
+        ],
+        [
+          8300892234450954968,
+          2168216763842438674
+        ]
+      ]
+    },
+    "runs": {
+      "per_rank_output_hash": [
+        "10843773427679081751",
+        "5690952036924416490",
+        "6949107376100593804",
+        "14257964753185484394",
+        "1372690566677896241",
+        "4284032998803196991",
+        "1256485221645999091",
+        "15134536447155521099"
+      ],
+      "per_rank_checked_repetitions": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20
+      ],
+      "per_rank_route_hash": [
+        4595442213441323907,
+        7532405872653616003,
+        15790123180641485699,
+        1489421519816622979,
+        16799105082995229571,
+        16612274865235182467,
+        15465703372974572419,
+        5498124182834955139
+      ],
+      "per_rank_gate_hash": [
+        2533646965927048248,
+        14889659337611144224,
+        1885921762837030278,
+        13031457892310627996,
+        3495614625142480915,
+        13663320048870614265,
+        10320913290917362925,
+        13489229337324107559
+      ],
+      "per_rank_activation_hash": [
+        4531537021038687568,
+        4531540677645172320,
+        4531544322708937876,
+        4531547948780902336,
+        4531551539016746464,
+        4531549328095545472,
+        4531545792312969944,
+        4531542281629093712
+      ],
+      "per_rank_actual_w1_device_hash": [
+        [
+          10859038828251380048,
+          16442131194753653433
+        ],
+        [
+          13490324047549650677,
+          10551338782534721331
+        ],
+        [
+          1523583204996924838,
+          7396437084790496312
+        ],
+        [
+          14202752280325517178,
+          7069877735016291564
+        ],
+        [
+          11143749989576260943,
+          10711789497604082305
+        ],
+        [
+          15373236374203514993,
+          11747601676479797665
+        ],
+        [
+          12756950591619209476,
+          16059579973269513226
+        ],
+        [
+          8444084312695986364,
+          2404330781154397705
+        ]
+      ],
+      "per_rank_actual_w2_device_hash": [
+        [
+          10426581982051364210,
+          11462917765497183337
+        ],
+        [
+          9864388787030353151,
+          5655801291444908208
+        ],
+        [
+          16920378329285556154,
+          4357260796332026100
+        ],
+        [
+          10987649904976861325,
+          14989261957126600953
+        ],
+        [
+          6639257194609382919,
+          5831943648165400512
+        ],
+        [
+          6949572988709887387,
+          4199912196243289791
+        ],
+        [
+          2345586710957233582,
+          13734397073630295586
+        ],
+        [
+          8300892234450954968,
+          2168216763842438674
+        ]
+      ]
+    }
+  },
+  "performance": [
+    {
+      "model": "qwen",
+      "ep": "ep8",
+      "tokens": "t65536",
+      "variants": {
+        "atomic": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 19976.8,
+            "gain_pct": -0.3060376534267969,
+            "per_turn_p50_us": {
+              "0": 19980.4,
+              "1": 19974.050000000003
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 1023.375,
+            "gain_pct": -1.3202447427824677,
+            "per_turn_p50_us": {
+              "0": 1022.765,
+              "1": 1023.77
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 18903.4,
+            "gain_pct": -0.256429974993429,
+            "per_turn_p50_us": {
+              "0": 18907.2,
+              "1": 18894.15
+            }
+          }
+        },
+        "baseline": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 19915.85,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 19918.15,
+              "1": 19914.2
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 1010.04,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 1010.015,
+              "1": 1010.545
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 18855.050000000003,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 18862.050000000003,
+              "1": 18846.6
+            }
+          }
+        },
+        "runs": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 19907.7,
+            "gain_pct": 0.04092218007264474,
+            "per_turn_p50_us": {
+              "0": 19937.85,
+              "1": 19896.85
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 1003.9200000000001,
+            "gain_pct": 0.6059165973624699,
+            "per_turn_p50_us": {
+              "0": 1004.47,
+              "1": 1002.55
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 18847.1,
+            "gain_pct": 0.04216377044878886,
+            "per_turn_p50_us": {
+              "0": 18863.15,
+              "1": 18839.95
+            }
+          }
+        }
+      }
+    },
+    {
+      "model": "qwen",
+      "ep": "ep8",
+      "tokens": "t8192",
+      "variants": {
+        "atomic": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 2980.37,
+            "gain_pct": 0.2321490440380191,
+            "per_turn_p50_us": {
+              "0": 3024.08,
+              "1": 2972.945
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 442.16650000000004,
+            "gain_pct": 2.417458490622241,
+            "per_turn_p50_us": {
+              "0": 456.003,
+              "1": 440.0695
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 2497.62,
+            "gain_pct": -0.27239861331641213,
+            "per_turn_p50_us": {
+              "0": 2518.3500000000004,
+              "1": 2492.625
+            }
+          }
+        },
+        "baseline": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 2987.305,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 2983.705,
+              "1": 2988.615
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 453.1205,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 452.135,
+              "1": 454.115
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 2490.835,
+            "gain_pct": 0.0,
+            "per_turn_p50_us": {
+              "0": 2491.92,
+              "1": 2490.7349999999997
+            }
+          }
+        },
+        "runs": {
+          "wall": {
+            "samples": 60,
+            "p50_us": 2996.31,
+            "gain_pct": -0.30144226987201206,
+            "per_turn_p50_us": {
+              "0": 2987.54,
+              "1": 3014.0
+            }
+          },
+          "notify": {
+            "samples": 60,
+            "p50_us": 461.01599999999996,
+            "gain_pct": -1.7424724769680406,
+            "per_turn_p50_us": {
+              "0": 447.52,
+              "1": 466.9285
+            }
+          },
+          "forward": {
+            "samples": 60,
+            "p50_us": 2499.455,
+            "gain_pct": -0.3460686878095053,
+            "per_turn_p50_us": {
+              "0": 2498.88,
+              "1": 2500.7349999999997
+            }
+          }
+        }
+      }
+    }
+  ],
+  "formal_samples": 360,
+  "clock_protocol": "SM lock requested at 1620 MHz; before/after snapshots only; reset in finally",
+  "no_local_gpu_jobs": true,
+  "experiment_directory": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/results/notify_row_order_20260918",
+  "cleanup": {
+    "deleted_candidate_artifacts": [
+      "source_atomic",
+      "source_runs",
+      "atomic",
+      "runs",
+      "prepare_candidates.py"
+    ],
+    "retained": "Experiment measurements, numerical comparison outputs and baseline snapshot",
+    "time_utc": "2026-09-18T04:15:46.187838+00:00"
+  }
+}

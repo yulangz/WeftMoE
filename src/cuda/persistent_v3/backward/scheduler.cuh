@@ -33,6 +33,7 @@ struct TileDomain {
   std::uint32_t tiles_per_owner = 0U;
   TaskKind kind = TaskKind::None;
   unsigned long long *ready_summary = nullptr;
+  std::uint32_t claim_granularity = 1U;
 
   WEFTMOE_V3_HOST_DEVICE constexpr std::uint32_t word_count() const {
     return (owner_count + 63U) / 64U;
@@ -251,11 +252,18 @@ try_claim_owner_tile(TileDomain domain, std::uint32_t owner, TileTask &task) {
     while ((observed & valid) != valid) {
       const auto available = valid & ~observed;
       const auto bit = static_cast<std::uint32_t>(__ffsll(available) - 1);
-      const auto desired = observed | (1ULL << bit);
+      // Reserve a contiguous prefix without crossing this claim word or an
+      // already claimed tile. DAB keeps single-tile phase accounting.
+      std::uint32_t count = 1U;
+      while (count < domain.claim_granularity && bit + count < 64U &&
+             (available & (1ULL << (bit + count))) != 0ULL)
+        ++count;
+      const auto mask = count == 64U ? ~0ULL : ((1ULL << count) - 1ULL) << bit;
+      const auto desired = observed | mask;
       if (claim.compare_exchange_weak(observed, desired,
                                       ::cuda::memory_order_relaxed,
                                       ::cuda::memory_order_relaxed)) {
-        task = TileTask{owner, word * 64U + bit, domain.kind};
+        task = TileTask{owner, word * 64U + bit, domain.kind, count};
         return true;
       }
     }

@@ -98,6 +98,8 @@ def aggregate_gin_benchmark(outputs):
                    for iteration in range(measured)]
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
         summary[key + "_slowest_rank_samples_us"] = slowest
+        summary["per_rank_" + key + "_samples_us"] = [
+            record[key] for record in records]
     if all("first_use_wall_us" in item for item in records):
         scopes = {item.get("timing_scope", "notify-buffer-forward") for item in records}
         if len(scopes) != 1:
@@ -107,6 +109,11 @@ def aggregate_gin_benchmark(outputs):
         summary["synchronize_ranks"] = all(item.get("synchronize_ranks") == "1" for item in records)
         summary["per_rank_tensor_allocation_requests"] = [int(item.get("tensor_allocation_requests", 0)) for item in records]
         summary["per_rank_checked_repetitions"] = [int(item.get("checked_repetitions", 0)) for item in records]
+        summary["per_rank_retained_backward_state"] = [
+            int(item.get("retained_backward_state", -1)) for item in records]
+        for key in ("fc1_compare_mode", "fc1_compare_samples", "fc1_compare_wgmma"):
+            if all(key in item for item in records):
+                summary["per_rank_" + key] = [item[key] for item in records]
         summary["first_use"] = {
             key: {
                 "slowest_rank_us": max(float(item[key]) for item in records),
@@ -213,9 +220,30 @@ def aggregate_gin_backward(outputs):
         summary[key + "_slowest_rank_us"] = sample_stats(slowest)
         summary[key + "_slowest_rank_samples_us"] = slowest
 
+    summary["per_rank_benchmark_pause_us"] = [
+        int(item.get("benchmark_pause_us", 0)) for item in records]
+    if any(("sample_begin_unix_ns" in item) !=
+           ("sample_end_unix_ns" in item) for item in records):
+        raise RuntimeError("Backward timestamp window is incomplete")
+    for key in ("sample_begin_unix_ns", "sample_end_unix_ns"):
+        if any(key in item for item in records):
+            values = [[int(value) for value in item.get(key, "").split(",")]
+                      for item in records]
+            if any(len(row) != measured for row in values):
+                raise RuntimeError(f"Backward timestamp count mismatch: {key}")
+            summary["per_rank_" + key] = values
+    if "per_rank_sample_begin_unix_ns" in summary:
+        ends = summary["per_rank_sample_end_unix_ns"]
+        if any(end < begin for starts, stops in zip(
+                summary["per_rank_sample_begin_unix_ns"], ends)
+               for begin, end in zip(starts, stops)):
+            raise RuntimeError("Backward wall-clock timestamps moved backwards")
+
     return {
         "schema": 1,
         "benchmark": "multinode-gin-cached-state-backward",
+        **{"per_rank_" + key + "_samples_us": [record[key] for record in records]
+           for key in stage_keys},
         "allocate_tensors": all(item.get("allocate_tensors") == "1" for item in records),
         "synchronize_ranks": all(item.get("synchronize_ranks") == "1" for item in records),
         "per_rank_tensor_allocation_requests": [int(item.get("tensor_allocation_requests", 0)) for item in records],
@@ -308,6 +336,9 @@ def environment_overrides(args):
     # Forward them explicitly so local and remote ranks cannot silently run a
     # different generation count, shape, or gate mode.
     for key in (
+        "WEFTMOE_FC1_COMPARE_MODE",
+        "WEFTMOE_FC1_COMPARE_BLOCK",
+        "CUDA_MODULE_LOADING",
         "WEFTMOE_P2P_ROUNDS",
         "WEFTMOE_P2P_BENCH_ROUNDS",
         "WEFTMOE_P2P_BENCH_TOKENS",
@@ -331,6 +362,8 @@ def environment_overrides(args):
         "WEFTMOE_TEST_BUFFER_MODE_TOKENS",
         "WEFTMOE_BACKWARD_ROUNDS",
         "WEFTMOE_BACKWARD_WARMUPS",
+        "WEFTMOE_BACKWARD_BENCH_PAUSE_US",
+        "WEFTMOE_BACKWARD_BENCH_TIMESTAMPS",
         "WEFTMOE_BACKWARD_TOKENS",
         "WEFTMOE_BACKWARD_PROGRESS",
         "WEFTMOE_BACKWARD_OUTPUT_DIR",

@@ -217,6 +217,17 @@ def parse_result(stdout):
     return fields
 
 
+def validate_buffer_mode_results(observed, world):
+    required = {"inference_graph_replays": "6", "retained_capacity": "1",
+                "skew": "1", "gradient_bits": "all"}
+    if (len(observed) != world or
+            {item.get("rank") for item in observed} !=
+            {str(rank) for rank in range(world)} or
+            any(item.get(key) != value for item in observed
+                for key, value in required.items())):
+        raise AssertionError("incomplete buffer mode checks")
+
+
 def runner(binary, rank, world, seed, fd, output, scenario, prefix=()):
     return list(prefix) + [
         binary, "--rank-runner", "--rank", str(rank), "--nodes", "1",
@@ -518,8 +529,9 @@ def main():
                   f"mean_us={statistics.mean(slowest):.3f}", flush=True)
             return
         if args.buffer_modes:
-            if len(observed) != args.world or any(item.get("graph_replays") != "6" for item in observed):
-                raise AssertionError("incomplete buffer mode checks")
+            validate_buffer_mode_results(observed, args.world)
+            print("BUFFER_MODES_JSON " + json.dumps(
+                {"world": args.world, "ranks": observed}), flush=True)
             print("BUFFER_MODES passed", flush=True)
             return
         if args.forward_smoke:
@@ -598,6 +610,26 @@ def main():
                            for iteration in range(measured)]
                 summary[key + "_slowest_rank_us"] = backward_stats(slowest)
                 summary[key + "_slowest_rank_samples_us"] = slowest
+                summary["per_rank_" + key + "_samples_us"] = [
+                    item[key] for item in observed]
+            summary["per_rank_benchmark_pause_us"] = [
+                int(item.get("benchmark_pause_us", 0)) for item in observed]
+            if any(("sample_begin_unix_ns" in item) !=
+                   ("sample_end_unix_ns" in item) for item in observed):
+                raise RuntimeError("Backward timestamp window is incomplete")
+            for key in ("sample_begin_unix_ns", "sample_end_unix_ns"):
+                if any(key in item for item in observed):
+                    values = [[int(value) for value in item.get(key, "").split(",")]
+                              for item in observed]
+                    if any(len(row) != measured for row in values):
+                        raise RuntimeError(f"Backward timestamp count mismatch: {key}")
+                    summary["per_rank_" + key] = values
+            if "per_rank_sample_begin_unix_ns" in summary:
+                ends = summary["per_rank_sample_end_unix_ns"]
+                if any(end < begin for starts, stops in zip(
+                        summary["per_rank_sample_begin_unix_ns"], ends)
+                       for begin, end in zip(starts, stops)):
+                    raise RuntimeError("Backward wall-clock timestamps moved backwards")
             result = {
                 "schema": 1,
                 "benchmark": "cached-x-ab-local-backward-pipeline",
@@ -665,6 +697,8 @@ def main():
                                for iteration in range(args.rounds - 10)]
                     summary[key + "_slowest_rank_us"] = stats(slowest)
                     summary[key + "_slowest_rank_samples_us"] = slowest
+                    summary["per_rank_" + key + "_samples_us"] = [
+                        item[key] for item in observed]
                 result = {
                     "schema": 1,
                     "benchmark": "single-persistent-forward-main-shape",
@@ -743,6 +777,12 @@ def main():
                     result["synchronize_ranks"] = all(item.get("synchronize_ranks") == "1" for item in observed)
                     result["per_rank_tensor_allocation_requests"] = [int(item.get("tensor_allocation_requests", 0)) for item in observed]
                     result["per_rank_checked_repetitions"] = [int(item.get("checked_repetitions", 0)) for item in observed]
+                    result["per_rank_retained_backward_state"] = [
+                        int(item.get("retained_backward_state", -1))
+                        for item in observed]
+                    for key in ("fc1_compare_mode", "fc1_compare_samples", "fc1_compare_wgmma"):
+                        if all(key in item for item in observed):
+                            result["per_rank_" + key] = [item[key] for item in observed]
                     result["first_use"] = {
                         key: {
                             "slowest_rank_us": max(float(item[key])

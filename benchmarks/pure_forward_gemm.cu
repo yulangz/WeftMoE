@@ -3,6 +3,7 @@
 // FC1 stores A/B but excludes SwiGLU, routing, task queues and communication.
 // Run arguments: op M N K groups device compute_ctas reverse_order share_b.
 #include "tuning.hpp"
+#include "fc1_features.cuh"
 
 #include "cuda/forward/tuning_config.hpp"
 #include "cuda/primitives/hopper.cuh"
@@ -47,10 +48,18 @@ template <int N, class F> __device__ void visit(float *accum, F function) {
 }
 constexpr unsigned kMathThreads = 256, kMathReadyBarrier = 3,
                    kMathDoneBarrier = 4;
+// The standalone diagnostic has no unified-kernel role barrier offset.
+constexpr bool Unified = false;
+template <bool UnifiedRole>
+__device__ constexpr unsigned physical_barrier(unsigned barrier) {
+  static_assert(!UnifiedRole);
+  return barrier;
+}
 #include "epilogue_helpers.cuh"
 
 // Static work assignment removes route readiness and task-queue costs. The
-// math branches below are extracted verbatim from the current FWD kernel.
+// math branches below are extracted from the current FWD kernel, omitting
+// training-only X checkpoint copies.
 template <bool Fc1, bool ShareB = false>
 __global__ __launch_bounds__(384, 1) void forward_gemm(
     const __grid_constant__ CUtensorMap am,
@@ -68,11 +77,16 @@ __global__ __launch_bounds__(384, 1) void forward_gemm(
   constexpr auto Fc2StageCount = forward_tuning::kFc2Stages;
   constexpr auto kAStageElements = 128U * 64U;
   constexpr auto kFc1BStageElements = forward_tuning::kFc1TileN * 64U;
+  constexpr bool kPackedFc1 =
+      WEFTMOE_DIAGNOSTIC_PACKED_FC1 && forward_tuning::kFc1TileN == 128U;
+  constexpr auto kFc1BStride =
+      (kPackedFc1 ? 2U : 1U) * kFc1BStageElements;
   constexpr auto kFc2BStageElements = forward_tuning::kFc2TileN * 64U;
   constexpr auto stages = Fc1 ? Fc1StageCount : Fc2StageCount;
   constexpr auto tile_n =
       Fc1 ? forward_tuning::kFc1TileN : forward_tuning::kFc2TileN;
   constexpr auto b_elements = tile_n * 64U;
+  constexpr auto b_stride = Fc1 ? kFc1BStride : b_elements;
   constexpr bool kFc2Pipelined = forward_tuning::kFc2ClaimTiles > 1U;
   constexpr auto kFc2OutputOffset =
       Fc2StageCount * (kAStageElements + kFc2BStageElements);
@@ -80,7 +94,7 @@ __global__ __launch_bounds__(384, 1) void forward_gemm(
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(bytes);
   auto *smem_b = smem_a + stages * kAStageElements;
   auto *fc2_smem_b = smem_b;
-  auto *fc1_b2 = smem_b + stages * b_elements;
+  auto *fc1_b2 = smem_b + (kPackedFc1 ? 1U : stages) * b_elements;
   auto *full = reinterpret_cast<ForwardBarrier *>(
       smem_b + stages * b_elements * (Fc1 ? 2U : 1U) +
       (!Fc1 && kFc2Pipelined ? 128U * tile_n : 0U));
@@ -152,17 +166,20 @@ __global__ __launch_bounds__(384, 1) void forward_gemm(
               &am, &full[stage], smem_a + stage * kAStageElements,
               iteration * 64, expert * M + row, ShareB ? 1 : 2);
           hopper::tma_load<64, tile_n, 128, cutlass::bfloat16_t>(
-              &bm, &full[stage], smem_b + stage * b_elements, iteration * 64,
+              &bm, &full[stage], smem_b + stage * b_stride, iteration * 64,
               expert * N + col, ShareB ? 2 : 1,
               static_cast<uint64_t>(
                   Fc1 ? cute::TMA::CacheHintSm90::EVICT_NORMAL
                       : cute::TMA::CacheHintSm90::EVICT_LAST));
-          full[stage].arrive_and_expect_tx((kAStageElements + b_elements) * 2);
+          full[stage].arrive_and_expect_tx(
+              (kAStageElements + (Fc1 && kPackedFc1 ? 2U : 1U) * b_elements) * 2);
           if constexpr (Fc1) {
             hopper::tma_load<64, tile_n, 128, cutlass::bfloat16_t>(
-                &bm, &fc1_b2_full[stage], fc1_b2 + stage * b_elements,
+                &bm, kPackedFc1 ? &full[stage] : &fc1_b2_full[stage],
+                fc1_b2 + stage * b_stride,
                 iteration * 64, expert * N + N / 2 + col, ShareB ? 2 : 1);
-            fc1_b2_full[stage].arrive_and_expect_tx(b_elements * 2);
+            if constexpr (!kPackedFc1)
+              fc1_b2_full[stage].arrive_and_expect_tx(b_elements * 2);
           }
         }
         pipeline += K / 64;

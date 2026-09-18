@@ -93,7 +93,8 @@ __global__ __launch_bounds__(
     if (threadIdx.x < backward_unified_compute_detail::kComputeThreads) {
       backward_unified_compute_detail::UnifiedComputeSynchronization<false>
           sync{state};
-      backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN>(
+      backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
+                                                    UseGin ? 1U : 2U>(
           a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
           x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
           geometry, storage, state, sync);
@@ -139,7 +140,8 @@ __global__ __launch_bounds__(
   cutlass::arch::warpgroup_reg_alloc<backward_tuning::kUnifiedMathRegisters>();
   backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
       state};
-  backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN>(
+  backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
+                                                    UseGin ? 1U : 2U>(
       a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
       x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
       geometry, storage, state, sync);

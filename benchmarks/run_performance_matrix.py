@@ -181,6 +181,17 @@ def build_pair(args):
         list(executor.map(one, tasks))
 
 
+def validate_repeat_check_scope(record, ep, enabled, path):
+    # The native harness enables checks by environment-variable presence, so
+    # setting WEFTMOE_BENCH_CHECK_REPEAT=0 still enables them. Verify the actual
+    # per-rank counters, including when reusing a previously saved measurement.
+    counts = record.get("per_rank_checked_repetitions", [])
+    if len(counts) != ep or any((n > 0) != enabled or n < 0 for n in counts):
+        raise RuntimeError(
+            f"repeat-check scope mismatch (requested={enabled}, actual={counts}); "
+            f"use a new label/output: {path}")
+
+
 def weft(args):
     env = environment()
     env["WEFTMOE_ENABLE_PDL"] = "1" if args.pdl else "0"
@@ -202,6 +213,8 @@ def weft(args):
                     if path.exists():
                         old = json.loads(path.read_text())
                         if old.get("returncode") == 0 and old.get("record"):
+                            validate_repeat_check_scope(
+                                old["record"], ep, args.check_repeats, path)
                             if old.get("programmatic_dependent_launch", False) != args.pdl:
                                 raise RuntimeError(f"existing record has a different PDL mode; use a new label/output: {path}")
                             if not (old["record"].get("allocate_tensors") and
@@ -224,6 +237,8 @@ def weft(args):
                     if result["returncode"] or result["record"] is None:
                         raise RuntimeError(f"benchmark failed: {path}")
                     record = result["record"]
+                    validate_repeat_check_scope(
+                        record, ep, args.check_repeats, path)
                     if not record.get("allocate_tensors"):
                         raise RuntimeError(f"tensor allocation not included: {path}")
                     if not record.get("synchronize_ranks"):

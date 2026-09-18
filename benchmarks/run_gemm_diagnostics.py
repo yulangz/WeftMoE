@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -48,7 +49,8 @@ def main():
                "-o", str(directory / "pure_gemm")]
     with (directory / "build.log").open("w") as log:
         subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
-    dependencies = [source, benchmark, root / "benchmarks/gemm_benchmark.cuh",
+    dependencies = [source, benchmark, root / "benchmarks/run_gemm_diagnostics.py",
+                    root / "benchmarks/gemm_benchmark.cuh",
                     root / "src/cuda/primitives/hopper.cuh",
                     root / f"src/cuda/{args.phase}/tuning_config.hpp"]
     manifest = {"source": str(root), "phase": args.phase,
@@ -66,20 +68,50 @@ def main():
     print(directory / "pure_gemm")
 
 
+def omit_checkpoints(code):
+    """Remove checkpoint-only blocks from the pure FC1 math diagnostic."""
+    start = "if constexpr (RetainBackwardState) {"
+    # Ignore braces in comments and literals when matching a C++ block.
+    tokens = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', re.S)
+    while start in code:
+        begin = code.index(start)
+        opening = begin + len(start) - 1
+        depth = 0
+        for token in tokens.finditer(code, opening):
+            if token.group() == "{":
+                depth += 1
+            elif token.group() == "}":
+                depth -= 1
+                if depth == 0:
+                    code = code[:begin] + code[token.end():]
+                    break
+        else:
+            raise ValueError("Unterminated FC1 checkpoint block")
+    return code
+
+
 def extract_forward(code, directory):
+    # The diagnostic producer must use the same gate/up stage layout as the
+    # extracted consumer, including when comparing an older source snapshot.
+    packed = "constexpr bool kPackedFc1 =" in code
+    (directory / "fc1_features.cuh").write_text(
+        "#define WEFTMOE_DIAGNOSTIC_PACKED_FC1 " + str(int(packed)) + "\n")
     for name, start, end in (
         ("fc1", "using Fc1TileMma =", "fc1_pipeline += iterations;"),
         ("fc2", "using Fc2TileMma =", "fc2_pipeline += kFc2Iterations;"),
     ):
         begin = code.index(start)
         stop = code.index(end, begin) + len(end)
-        (directory / f"{name}_math.cuh").write_text(code[begin:stop] + "\n")
+        math = code[begin:stop]
+        if name == "fc1":
+            math = omit_checkpoints(math)
+        (directory / f"{name}_math.cuh").write_text(math + "\n")
     helper_begin = code.index("// A 64-column atom uses")
     helper_end = code.index("// FC1/FC2 lends", helper_begin)
     (directory / "epilogue_helpers.cuh").write_text(code[helper_begin:helper_end])
-    marker = "// GEMM_DIAGNOSTIC_FC2_EPILOGUE_BEGIN"
-    begin = code.index(marker) + len(marker)
-    stop = code.index("// GEMM_DIAGNOSTIC_FC2_EPILOGUE_END", begin)
+    marker = "GEMM_DIAGNOSTIC_FC2_EPILOGUE_BEGIN"
+    begin = code.index("\n", code.index(marker)) + 1
+    stop = code.rfind("\n", begin, code.index("GEMM_DIAGNOSTIC_FC2_EPILOGUE_END", begin))
     epilogue = code[begin:stop].replace(
         "static_cast<std::uint32_t>(row)",
         "static_cast<std::uint32_t>(expert * M + row)")

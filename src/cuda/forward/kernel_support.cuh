@@ -516,9 +516,8 @@ struct Layout {
   std::size_t socket_header_receive = 0;
   std::size_t socket_payload_receive = 0;
   std::size_t forward_s = 0;
-  // Training uses a separate FC2 scratch plane until canonical X has been
-  // saved to caller-owned storage. A/B and gradient outputs live outside this
-  // arena.
+  // Training shares the canonical FC2 plane after FC1 checkpoints X. Saved
+  // X/A/B and gradient outputs live outside this arena.
   std::size_t forward_training_output = 0;
   // Backward reads caller-owned X/A/B. Its scratch directory pads every expert
   // independently to 128 rows, so mutable padded tensors use a capacity larger
@@ -894,12 +893,20 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_s = append(cursor, forward_elements,
                               sizeof(transport::BFloat16), "forward gated U");
     if (config.enable_backward_state) {
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+      // Dispatch must not overwrite the diagnostic's prefilled Return fixture.
       layout.forward_training_output = append(
           cursor,
           checked_mul(config.max_destination_rows_per_rank,
                       config.max_hidden_size,
                       "forward training output elements"),
           sizeof(transport::BFloat16), "forward training output");
+#else
+      // FC2 becomes ready only after all FC1 N tiles of this M block retire.
+      // X is already saved to caller-owned storage, so training can reuse the
+      // same canonical plane as inference. Backward later reuses it for dR.
+      layout.forward_training_output = layout.canonical_rows;
+#endif
       layout.backward_padded_capacity_rows = checked_add(
           config.max_destination_rows_per_rank,
           checked_mul(config.max_owned_experts, 127ULL,
@@ -1064,6 +1071,8 @@ struct PoolSlot {
 #endif
   TransportDeviceStatus *host_status = nullptr;
   TransportDeviceStatus *host_forward_status = nullptr;
+  std::uint32_t *host_forward_done = nullptr;
+  std::uint32_t *device_forward_done = nullptr;
   ProductionStatusRecord *host_production_status = nullptr;
   std::uint64_t *host_forward_progress = nullptr;
   std::uint64_t *device_forward_progress = nullptr;

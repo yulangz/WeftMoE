@@ -2898,6 +2898,17 @@ void run_cached_backward_rank(
                                  std::stoul(warmups_text))
                            : (validation ? 0U : 10U);
   require(rounds > warmups, "Backward requires at least one measured round");
+  const auto pause_text = std::getenv("WEFTMOE_BACKWARD_BENCH_PAUSE_US");
+  const auto pause_us = pause_text ? std::stoull(pause_text) : 0ULL;
+  require(pause_us <= 1000000ULL, "Backward benchmark pause exceeds one second");
+  const bool record_windows =
+      std::getenv("WEFTMOE_BACKWARD_BENCH_TIMESTAMPS") != nullptr;
+  const auto unix_ns = [] {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+  };
+  std::vector<std::int64_t> sample_begin_unix_ns;
+  std::vector<std::int64_t> sample_end_unix_ns;
   std::vector<double> wall_samples;
   std::vector<double> total_samples;
   std::vector<double> prepare_samples;
@@ -2946,7 +2957,11 @@ void run_cached_backward_rank(
       backward_config.tensors = {};
       output_gradients = {};
     }
+    // Idle time and wall-clock correlation stay outside the measured call.
+    if (pause_us != 0ULL)
+      std::this_thread::sleep_for(std::chrono::microseconds(pause_us));
     benchmark_rank_barrier(rank_barrier, base, execution_state->stream);
+    const auto window_begin = record_windows ? unix_ns() : 0;
     const auto begin = Clock::now();
     if (allocate_tensors) {
       const auto input = allocate(dy_fixture.bytes);
@@ -2987,7 +3002,12 @@ void run_cached_backward_rank(
     output.wait();
     if (validation) output.wait();  // completion is idempotent
     const auto end = Clock::now();
+    const auto window_end = record_windows ? unix_ns() : 0;
     if (round >= warmups) {
+      if (record_windows) {
+        sample_begin_unix_ns.push_back(window_begin);
+        sample_end_unix_ns.push_back(window_end);
+      }
       wall_samples.push_back(
           std::chrono::duration<double, std::micro>(end - begin).count());
       total_samples.push_back(output.timings().total_us);
@@ -3129,6 +3149,19 @@ void run_cached_backward_rank(
   emit(combine_samples);
   std::cout << " dw_combine_overlap=";
   emit(overlap_samples);
+  std::cout << " benchmark_pause_us=" << pause_us;
+  if (record_windows) {
+    const auto emit_ns = [](const std::vector<std::int64_t> &values) {
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0U) std::cout << ',';
+        std::cout << values[index];
+      }
+    };
+    std::cout << " sample_begin_unix_ns=";
+    emit_ns(sample_begin_unix_ns);
+    std::cout << " sample_end_unix_ns=";
+    emit_ns(sample_end_unix_ns);
+  }
   std::cout << std::endl;
 }
 

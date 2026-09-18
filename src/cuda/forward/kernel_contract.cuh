@@ -73,6 +73,8 @@ struct ForwardKernelArgs {
   std::size_t outgoing_sequence_offset;
   std::size_t status_offset;
   std::size_t forward_s_offset;
+  transport::BFloat16 *saved_x = nullptr;
+  CUtensorMap saved_x_map{};
   transport::BFloat16 *saved_ab = nullptr;
   std::uint64_t saved_rows = 0;
   std::size_t forward_task_claim_offset;

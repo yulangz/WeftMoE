@@ -5,7 +5,10 @@ struct NotifySortStorage {
   using Sort = cub::BlockRadixSort<std::uint64_t, 256, 4, std::uint64_t>;
   union {
     typename Sort::TempStorage sort;
-    std::uint64_t digits[1024];
+    struct {
+      unsigned digits[1024];
+      unsigned starts[256];
+    } runs;
     typename cub::BlockScan<unsigned long long, 256>::TempStorage scan;
   } temp;
 };
@@ -78,24 +81,29 @@ __device__ void notify_radix_sort(std::uint64_t *keys, std::uint64_t *values,
       __syncthreads();
 #pragma unroll
       for (unsigned item = 0; item < 4; ++item)
-        shared.temp.digits[threadIdx.x * 4 + item] =
+        shared.temp.runs.digits[threadIdx.x * 4 + item] =
             (k[item] >> bit) & (bins - 1);
       __syncthreads();
 #pragma unroll
       for (unsigned item = 0; item < 4; ++item) {
-        const auto pos = chunk * 1024 + threadIdx.x * 4 + item;
+        const auto within = threadIdx.x * 4 + item;
+        const auto digit = shared.temp.runs.digits[within];
+        if (within == 0 || shared.temp.runs.digits[within - 1] != digit)
+          shared.temp.runs.starts[digit] = within;
+      }
+      __syncthreads();
+#pragma unroll
+      for (unsigned item = 0; item < 4; ++item) {
+        const auto within = threadIdx.x * 4 + item;
+        const auto pos = chunk * 1024 + within;
         if (pos < count) {
           scratch_keys[pos] = k[item];
           scratch_values[pos] = v[item];
-          const auto within = threadIdx.x * 4 + item;
-          const unsigned digit = unsigned((k[item] >> bit) & (bins - 1));
-          if (within == 0 || shared.temp.digits[within - 1] != digit) {
-            unsigned end = within + 1;
-            while (end < 1024 && chunk * 1024 + end < count &&
-                   shared.temp.digits[end] == digit)
-              ++end;
-            histogram[std::uint64_t(digit) * chunks + chunk] = end - within;
-          }
+          const auto digit = shared.temp.runs.digits[within];
+          if (within + 1 == 1024 || pos + 1 == count ||
+              shared.temp.runs.digits[within + 1] != digit)
+            histogram[std::uint64_t(digit) * chunks + chunk] =
+                within + 1 - shared.temp.runs.starts[digit];
         }
       }
       __syncthreads();
@@ -137,8 +145,17 @@ __device__ void notify_radix_sort(std::uint64_t *keys, std::uint64_t *values,
 #pragma unroll
       for (unsigned item = 0; item < 4; ++item) {
         const auto pos = chunk * 1024 + threadIdx.x * 4 + item;
-        shared.temp.digits[threadIdx.x * 4 + item] =
+        shared.temp.runs.digits[threadIdx.x * 4 + item] =
             pos < count ? ((scratch_keys[pos] >> bit) & (bins - 1)) : bins;
+      }
+      __syncthreads();
+#pragma unroll
+      for (unsigned item = 0; item < 4; ++item) {
+        const auto within = threadIdx.x * 4 + item;
+        const auto digit = shared.temp.runs.digits[within];
+        if (digit < bins &&
+            (within == 0 || shared.temp.runs.digits[within - 1] != digit))
+          shared.temp.runs.starts[digit] = within;
       }
       __syncthreads();
 #pragma unroll
@@ -146,17 +163,9 @@ __device__ void notify_radix_sort(std::uint64_t *keys, std::uint64_t *values,
         const auto within = threadIdx.x * 4 + item;
         const auto pos = chunk * 1024 + within;
         if (pos < count) {
-          const auto digit = shared.temp.digits[within];
-          unsigned lo = 0, hi = within;
-          while (lo < hi) {
-            const auto mid = (lo + hi) / 2;
-            if (shared.temp.digits[mid] < digit)
-              lo = mid + 1;
-            else
-              hi = mid;
-          }
+          const auto digit = shared.temp.runs.digits[within];
           const auto dst = bucket_base[digit] +
-                           histogram[digit * chunks + chunk] + within - lo;
+                           histogram[digit * chunks + chunk] + within - shared.temp.runs.starts[digit];
           keys[dst] = scratch_keys[pos];
           values[dst] = scratch_values[pos];
         }

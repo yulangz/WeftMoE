@@ -4,6 +4,101 @@ Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).
 
+The [1620 MHz saved-X report](saved_x_20260917.md) records FC1 checkpoint
+stores and training buffer reuse, with paired FWD/BWD measurements against the
+completion-latency checkpoint. It includes memory savings, batch/EP invariance,
+retained-state reuse, gradient comparisons, and device-memory sanitizer checks.
+All samples and validation evidence are in its
+[machine record](saved_x_20260917.json).
+
+The [1620 MHz combined FC1 experiment](fc1_combined_20260917.md) records exact
+BF16 activation lookup, packed gate/up WGMMA, and TMA checkpoint stores, with
+8,680 training/inference and supplemental samples and bitwise validation. The
+Qwen cross-node regression persists. Longer Flash sampling improved P95/P99,
+although the candidate maximum remained higher; this candidate is not enabled
+in the production source.
+
+The [1620 MHz FC1 layout controls](fc1_layout_controls_20260917.md) isolate
+pool allocation, unused activation-table initialization, and parameter layout.
+They include complete 128-bit machine-code comparisons, bitwise FWD/BWD
+references, reverse-order timing, and continuous frequency sampling.
+
+The [1620 MHz interleaved FC1 experiment](fc1_interleaved_20260917.md) compares
+independent baseline and candidate kernels in the same process and memory pool.
+It verifies each round's selected path, checks complete output equality across
+paths, and reports adjacent timing differences in both orders. The Qwen EP16
+64K regression remains visible with this control.
+
+The [FC1 lookup/cache controls](fc1_lookup_cache_20260917.md) use five-call
+blocks to separate switching effects from later calls. N256 alone is nearly
+flat at Qwen EP16/64K, while the tested `__ldcg` lookup implementation regresses
+on both topologies. Its exhaustive numerical checks passed, but it is rejected
+on performance grounds.
+
+The [BF16 activation reciprocal experiment](fc1_reciprocal_20260917.md) replaces
+the lookup with a corrected reciprocal and preserves the tested FP32 activation
+factor bits across all BF16 inputs on all 16 GPUs. Qwen 64K paired measurements
+show small gains in the diagnostic layout. The subsequent
+[full production-layout validation](fc1_reciprocal_full_20260917.md) passed its
+bitwise and lifecycle checks but found repeatable Flash and Qwen EP16/64K
+regressions, so the candidate is not adopted. Its 4,640 timing samples include
+960 continuous BWD samples retained as diagnostic data: Flash 64K process
+windows showed power throttling and cannot establish strict 1620 MHz timing.
+
+The [Backward clock audit](backward_clock_audit_20260918.md) correlates native
+call windows with NVML samples. A 500 ms idle interval passed one run, but
+longer intervals still had sporadic deviations; no fixed-spacing protocol is
+yet established as reliably sustaining 1620 MHz. The separate
+[BF16 derivative probe](bwd_reciprocal_probe_20260917.md) found exact sigmoid,
+SiLU, and derivative factors on all 16 GPUs; it is not evidence of an operator
+speedup.
+
+The [Backward reciprocal matrix](bwd_reciprocal_20260918.md) reports the
+arithmetic-only candidate across both models, EP8/EP16, and 8K/64K tokens.
+The candidate is adopted. It retains all 1,920 primary timing samples, separately identifies calls with
+complete 1620 MHz observations, and includes gradient and lifecycle checks.
+Flash improves about 0.8%; Qwen results are mixed. Actual frequency deviations,
+missing observations, and host-wall tails are disclosed in the report. A fixed
+800-call Qwen EP16/8K follow-up did not reproduce a candidate-specific tail
+regression; its roughly 0.08% median slowdown remains recorded.
+
+The [dX task-claim experiment](bwd_dx_claim_20260918.md) batches two adjacent
+tiles without changing GEMM arithmetic. Qwen EP8 improves 2.50% at 8K and
+2.06% at 64K, but EP16 regresses, so this version is not adopted as a uniform
+default. All 960 samples, frequency coverage, bitwise gradients, lifecycle
+checks, and concurrent scheduler tests are retained. The subsequent
+[local-only specialization](bwd_dx_local_20260918.md) is adopted: Qwen EP8
+improves 2.79% / 1.95% at 8K / 64K, and Flash EP8 improves 0.63% / 0.60%.
+GIN and Forward main-kernel machine code remain identical to the baseline.
+The report includes fresh 960-call timing, frequency-qualified comparisons,
+local and remote lifecycle checks, an odd tile-group tail, and memcheck.
+P95/P99 improve in all four local cases, while isolated 8K wall maxima increase.
+That optimization round ended at the user's request.
+
+The subsequent user-requested [Notify row-order experiment](notify_row_order_20260918.md)
+tests whether atomic expert-row allocation can replace stable local sorting.
+Qwen EP8 Forward, dX, and dgate remain bitwise equal in the tested cases, but
+independent Notify executions change dW1/dW2. A stable run-start scan also
+preserves all reference tensors. Neither candidate shows a consistent full-call
+speedup in the 360-sample comparison, so the production implementation is retained.
+
+The [1620 MHz FC1 N256 experiment](fc1_packed_20260917.md) records a separate
+gate/up packing candidate, 3,200 paired samples, and bitwise validation. Its
+small gains and remaining integration work are documented; it is not enabled
+in the production source.
+
+The [1620 MHz completion-latency report](completion_latency_20260917.md)
+records the stream-ordered mapped completion change, its CPU polling tradeoff,
+and a fresh eight-case matrix with repeat checks disabled. All raw samples,
+validation evidence, and source/binary hashes are in its
+[machine record](completion_latency_20260917.json).
+
+The [1620 MHz Notify radix report](notify_radix_20260917.md) records stable-sort
+optimization, two-order paired measurements, and batch/EP bitwise checks.
+These historical timings had repeat checks enabled outside timing and are
+diagnostic only; the report records that correction. All samples, including
+regressions, are in its [machine record](notify_radix_20260917.json).
+
 The [all-CTA worker report](full_cta_all_worker_20260914.md) records the unified
 compute/communication layout, final FWD/BWD matrix, register diagnosis and
 stability coverage. Its [machine record](full_cta_all_worker_20260914.json)
@@ -119,3 +214,6 @@ shapes. `run_backward_validation.py` checks native repeat stability and then
 compares all gradients with PyTorch autograd, verifies retained X/A/B, and
 fails on nonfinite values or excessive relative L2 error. Checks and dump
 copies are outside the timed interval and are disabled in performance runs.
+The native harness enables repeat checks whenever `WEFTMOE_BENCH_CHECK_REPEAT`
+is present, including a value of `0`; unset it to disable checks. The matrix
+runner verifies actual per-rank check counters for both new and reused records.
