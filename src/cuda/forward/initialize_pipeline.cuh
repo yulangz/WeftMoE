@@ -4,11 +4,16 @@
 // entry. Keep this cold control flow out of the compiled worker loops. The host validates full-grid residency before the unified launch.
 // No worker starts until the final release/acquire rendezvous has published
 // all queues, input groups and task descriptors.
-template <bool StaticLocal, bool Unified = false>
+template <bool StaticLocal, bool Unified = false, bool StaticSchedule = false>
 __device__ __noinline__ void
 forward_initialize_pipeline(const ForwardKernelArgs &a,
                             bool stream_remote_dispatch,
                             bool stream_local_dispatch) {
+  // StaticSchedule is intentionally an ABI discriminator. CUDA 12.9 changes
+  // the unified entry's pre-setmaxnreg allocation when this noinline helper is
+  // instantiated without the third template argument, even though V4 reuses
+  // the same initialization body as V3.
+  (void)StaticSchedule;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler =
       peer_at<unsigned long long>(a.local_base, a.forward_scheduler_offset);

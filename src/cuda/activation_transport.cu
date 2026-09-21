@@ -155,6 +155,26 @@ struct ActivationMegaKernelBackendState {
   };
   std::vector<UnifiedRegisterKey> validated_unified_register_kernels;
 
+  std::mutex unified_launch_mutex;
+  struct UnifiedLaunchKey {
+    const void *kernel;
+    std::size_t dynamic_smem;
+    unsigned grid_blocks, block_threads, cluster_size;
+    bool programmatic;
+    bool operator==(const UnifiedLaunchKey &other) const {
+      return kernel == other.kernel && dynamic_smem == other.dynamic_smem &&
+             grid_blocks == other.grid_blocks &&
+             block_threads == other.block_threads &&
+             cluster_size == other.cluster_size &&
+             programmatic == other.programmatic;
+    }
+  };
+  struct UnifiedLaunchPreparation {
+    UnifiedLaunchKey key;
+    int max_active_clusters;
+  };
+  std::vector<UnifiedLaunchPreparation> prepared_unified_launches;
+
   template <class Resources>
   cudaError_t validate_unified_register_pool(const void *kernel) {
     const UnifiedRegisterKey key{
@@ -190,6 +210,64 @@ struct ActivationMegaKernelBackendState {
         requested > initial * Resources::kUnifiedThreads)
       return cudaErrorLaunchOutOfResources;
     validated_unified_register_kernels.push_back(key);
+    return cudaSuccess;
+  }
+
+  // Function attributes, stack limits and cooperative-cluster occupancy are
+  // invariant for a backend's device/context and a fixed kernel geometry.
+  // Avoid repeating these driver queries after forward_start on every small
+  // Forward invocation.
+  template <class Resources>
+  cudaError_t prepare_unified_launch(const void *kernel,
+                                     std::size_t dynamic_smem,
+                                     unsigned grid_blocks,
+                                     unsigned block_threads,
+                                     unsigned cluster_size,
+                                     bool programmatic,
+                                     int *max_active_clusters) {
+    auto error = validate_unified_register_pool<Resources>(kernel);
+    if (error != cudaSuccess)
+      return error;
+    const UnifiedLaunchKey key{kernel, dynamic_smem, grid_blocks,
+                               block_threads, cluster_size, programmatic};
+    std::lock_guard<std::mutex> lock(unified_launch_mutex);
+    const auto found = std::find_if(
+        prepared_unified_launches.begin(), prepared_unified_launches.end(),
+        [&](const UnifiedLaunchPreparation &entry) {
+          return entry.key == key;
+        });
+    if (found != prepared_unified_launches.end()) {
+      *max_active_clusters = found->max_active_clusters;
+      return cudaSuccess;
+    }
+    error = internal::prepare_kernel_stack(kernel);
+    if (error != cudaSuccess)
+      return error;
+    error = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(dynamic_smem));
+    if (error != cudaSuccess)
+      return error;
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = dim3(grid_blocks, 1, 1);
+    launch.blockDim = dim3(block_threads, 1, 1);
+    launch.dynamicSmemBytes = dynamic_smem;
+    cudaLaunchAttribute cluster{};
+    cluster.id = cudaLaunchAttributeClusterDimension;
+    cluster.val.clusterDim = {cluster_size, 1U, 1U};
+    cudaLaunchAttribute cooperative{};
+    cooperative.id = cudaLaunchAttributeCooperative;
+    cooperative.val.cooperative = 1;
+    cudaLaunchAttribute attributes[] = {
+        cluster, cooperative, programmatic_launch::attribute()};
+    launch.attrs = attributes;
+    launch.numAttrs = programmatic ? 3U : 2U;
+    int clusters = 0;
+    error = cudaOccupancyMaxActiveClusters(&clusters, kernel, &launch);
+    if (error != cudaSuccess)
+      return error;
+    prepared_unified_launches.push_back({key, clusters});
+    *max_active_clusters = clusters;
     return cudaSuccess;
   }
 
@@ -4374,6 +4452,14 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                  state->timeline_max_ctas, exec->stream, id.calling_rank,
                  id.world_size, id.generation, backend->session);
 #endif
+  const bool static_v4_candidate =
+      forward_tuning::kUnifiedWorkers && !use_gin && id.num_nodes == 1U &&
+      !config.retain_backward_state &&
+      std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
+  // Unified V3/V4 initialize status, generation signals and peer epochs in
+  // forward_initialize_generation inside the resident grid.  Launching the
+  // legacy split-grid initializer for V4 duplicates that work and inserts an
+  // extra kernel between forward_start and the main kernel.
   if constexpr (!forward_tuning::kUnifiedWorkers) {
     internal::throw_cuda(
         "forward-run",
@@ -4622,6 +4708,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const bool split_local_roles =
         !remote_transport && view.identity.num_nodes == 1U;
     const bool split_forward_roles = split_gin_roles || split_local_roles;
+    const bool static_v4_single_node =
+        static_v4_candidate && split_local_roles;
+    if (static_v4_single_node &&
+        view.identity.num_tokens >= 64U) {
+      // Dense prefill uses immutable token stripes and per-route epochs.  For
+      // smaller batches the tuned ready-token queue has lower fixed cost and
+      // avoids static-owner head-of-line delay; FC1/FC2/Return remain static.
+      args.forward_dynamic_reduce_queue = false;
+      args.forward_dynamic_reduce_scan = false;
+    }
     cudaError_t launch_forward = cudaSuccess;
     if (split_forward_roles) {
       const auto &ordinary_output_store_map =
@@ -4759,26 +4855,99 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             "Forward cluster extent", id.calling_rank,
             "even compute CTA and FC1/FC2 N-tile counts",
             "incompatible two-CTA multicast shape");
-      // Every compute CTA participates in the terminal Reduce drain. Idle
-      // transport CTAs also consume ready tokens; their completion is covered
-      // by the shared completed-token counter, not this compute-role count.
+      if (static_v4_single_node) {
+        const auto clusters =
+            forward_main_compute_ctas / forward_tuning::kClusterSize;
+        const auto max_mblocks =
+            (state->config.max_destination_rows_per_rank +
+             forward_tuning::kTileM - 1ULL) /
+                forward_tuning::kTileM +
+            state->config.max_owned_experts;
+        const auto fc1_pairs = max_mblocks * fc1_ntiles / 2ULL;
+        const auto fc2_units_per_mblock =
+            (fc2_ntiles / 2U + forward_tuning::kFc2ClaimTiles - 1U) /
+            forward_tuning::kFc2ClaimTiles;
+        const auto fc2_units =
+            max_mblocks * fc2_units_per_mblock;
+        if (clusters == 0U ||
+            fc1_pairs > 65535ULL * clusters ||
+            fc2_units > 65535ULL * clusters)
+          transport_error(
+              NotifyErrorCode::WorkspaceCapacityExceeded, "forward-run",
+              "V4 per-cluster static task extent", id.calling_rank,
+              "at most 65535 FC1 pairs and FC2 units per cluster",
+              std::to_string(fc1_pairs) + "/" +
+                  std::to_string(fc2_units));
+      }
+      // Every homogeneous CTA contributes its eight math warps to terminal
+      // Reduce after its statically owned GEMM residues retire.
       args.forward_reduce_cta_count = forward_main_compute_ctas;
       if constexpr (forward_tuning::kUnifiedWorkers) {
+        if (static_v4_single_node) {
+          constexpr auto kStaticUnified =
+              unified_forward_entry<true, false, true>();
+          const auto smem =
+              forward_unified_detail::shared_bytes(id.world_size);
+          const bool pdl = programmatic_launch::enabled();
+          internal::throw_cuda(
+              "forward-run",
+              backend->prepare_unified_launch<
+                  forward_tuning::StaticV4Resources>(
+                  reinterpret_cast<const void *>(kStaticUnified), smem,
+                  forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
+                  forward_tuning::kClusterSize, pdl, &max_active_clusters),
+              id.calling_rank, id.world_size,
+              backend->session.session().identity(), id.generation,
+              ExchangeKind::ExpertCounts,
+              "prepare cached V4 unified launch");
+          cudaLaunchConfig_t launch{};
+          launch.gridDim = dim3(forward_main_compute_ctas, 1, 1);
+          launch.blockDim =
+              dim3(forward_tuning::kUnifiedThreads, 1, 1);
+          launch.dynamicSmemBytes = smem;
+          launch.stream = exec->stream;
+          cudaLaunchAttribute cluster{};
+          cluster.id = cudaLaunchAttributeClusterDimension;
+          cluster.val.clusterDim = {
+              forward_tuning::kClusterSize, 1U, 1U};
+          cudaLaunchAttribute cooperative{};
+          cooperative.id = cudaLaunchAttributeCooperative;
+          cooperative.val.cooperative = 1;
+          cudaLaunchAttribute attributes[] = {
+              cluster, cooperative, programmatic_launch::attribute()};
+          launch.attrs = attributes;
+          launch.numAttrs = pdl ? 3U : 2U;
+          if (static_cast<unsigned>(max_active_clusters) *
+                  forward_tuning::kClusterSize <
+              forward_main_compute_ctas)
+            transport_error(
+                NotifyErrorCode::BackendUnavailable, "forward-run",
+                "V4 unified resident grid", id.calling_rank,
+                std::to_string(forward_main_compute_ctas) + " resident CTAs",
+                std::to_string(max_active_clusters) + " resident clusters");
+          launch_forward = cudaLaunchKernelEx(
+              &launch, kStaticUnified, args, slot.forward_x_map,
+              slot.forward_s_map, weight.w1_map, weight.w2_map,
+              ordinary_output_store_map);
+        } else {
         const auto launch_unified = [&](auto kernel) {
+          const auto smem = forward_unified_detail::shared_bytes(id.world_size);
+          const bool pdl = programmatic_launch::enabled();
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+          auto error = backend->prepare_unified_launch<
+              forward_tuning::UnifiedResources>(
+              reinterpret_cast<const void *>(kernel), smem,
+              forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
+              forward_tuning::kClusterSize, pdl, &max_active_clusters);
+#else
           // The communication diagnostic entry has no setmaxnreg partition.
-          const auto register_error = backend->validate_unified_register_pool<forward_tuning::UnifiedResources>(
-              reinterpret_cast<const void *>(kernel));
-          if (register_error != cudaSuccess)
-            return register_error;
-#endif
           auto error = internal::prepare_kernel_stack(
               reinterpret_cast<const void *>(kernel));
-          if (error != cudaSuccess)
-            return error;
-          const auto smem = forward_unified_detail::shared_bytes(id.world_size);
-          error = cudaFuncSetAttribute(kernel,
-              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+          if (error == cudaSuccess)
+            error = cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+#endif
           if (error != cudaSuccess)
             return error;
           cudaLaunchConfig_t launch{};
@@ -4795,11 +4964,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           cudaLaunchAttribute attributes[] = {cluster, cooperative,
                                               programmatic_launch::attribute()};
           launch.attrs = attributes;
-          launch.numAttrs = programmatic_launch::enabled() ? 3U : 2U;
-          error = cudaOccupancyMaxActiveClusters(
-              &max_active_clusters, kernel, &launch);
+          launch.numAttrs = pdl ? 3U : 2U;
+#if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+          error = cudaOccupancyMaxActiveClusters(&max_active_clusters, kernel,
+                                                  &launch);
           if (error != cudaSuccess)
             return error;
+#endif
           if (static_cast<unsigned>(max_active_clusters) *
                   forward_tuning::kClusterSize < forward_main_compute_ctas)
             return cudaErrorLaunchOutOfResources;
@@ -4819,6 +4990,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           launch_forward = config.retain_backward_state
               ? launch_unified(unified_forward_entry<false, true>())
               : launch_unified(unified_forward_entry<false, false>());
+        }
       } else {
       internal::throw_cuda(
           "forward-run",

@@ -38,7 +38,7 @@ static_assert(!forward_tuning::kUnifiedWorkers ||
               "Hopper shared memory; reduce staging or the FC2 claim size");
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
-template <bool StaticLocal> struct Communication {
+template <bool StaticLocal, bool StaticSchedule> struct Communication {
   const ForwardKernelArgs &a;
   persistent_v3::ForwardPipelineControl &control;
   unsigned long long *scheduler;
@@ -51,7 +51,12 @@ template <bool StaticLocal> struct Communication {
         threadIdx.x < forward_tuning::kUnifiedCommBase +
                           forward_tuning::kUnifiedCommThreads) {
       if constexpr (StaticLocal) {
-        if constexpr (forward_tuning::kUnifiedSplitNvlink)
+        if constexpr (StaticSchedule)
+          forward_unified_transport::run_static_v4<
+              forward_tuning::kUnifiedCommThreads,
+              forward_tuning::kUnifiedCommBase>(a, control, scheduler,
+                                                 storage);
+        else if constexpr (forward_tuning::kUnifiedSplitNvlink)
           forward_unified_transport::run_local_warps<
               forward_tuning::kUnifiedCommThreads,
               forward_tuning::kUnifiedCommBase>(a, control, scheduler, storage);
@@ -69,7 +74,8 @@ template <bool StaticLocal> struct Communication {
 #endif
 } // namespace forward_unified_detail
 
-template <bool StaticLocal, bool RetainBackwardState>
+template <bool StaticLocal, bool RetainBackwardState,
+          bool StaticSchedule = false>
 __global__ __launch_bounds__(
     forward_tuning::kUnifiedThreads,
     1) void unified_forward_kernel(const __grid_constant__ ForwardKernelArgs a,
@@ -84,10 +90,13 @@ __global__ __launch_bounds__(
   __shared__ unsigned long long task;
   __shared__ unsigned kind, return_mblock, pair_operand;
   __shared__ forward_compute_detail::ComputePairState pair;
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, threadIdx.x == 0U, KernelEnter,
+                             Kernel, 0U, 0ULL, execution_epoch(a));
   using forward_compute_detail::ComputeRole;
   forward_compute_detail::persistent_role<
       StaticLocal, RetainBackwardState, forward_tuning::kFc1Stages,
-      forward_tuning::kFc2Stages, true, ComputeRole::Initialize>(
+      forward_tuning::kFc2Stages, true, ComputeRole::Initialize,
+      false>(
       a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
       &pair_operand, &output_store_map, pair);
   // Shared barriers and cluster setup are independent of the preceding
@@ -105,7 +114,14 @@ __global__ __launch_bounds__(
     return;
   }
   forward_initialize_generation<StaticLocal>(a);
-  forward_initialize_pipeline<StaticLocal, true>(a, !StaticLocal, StaticLocal);
+  // Keep one initialization ABI for V3 and V4.  Specializing away the unused
+  // dynamic queues makes CUDA 12.9 raise the entry's pre-setmaxnreg register
+  // requirement above the math quota, even though the worker loops need no
+  // extra registers.  V4 may harmlessly clear those queues and ignore them.
+  forward_initialize_pipeline<StaticLocal, true, false>(
+      a, !StaticLocal, StaticLocal);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, threadIdx.x == 0U, SetupDone, Kernel,
+                             0U, 0ULL, execution_epoch(a));
   forward_compute_detail::observe_compute_cluster(a);
   if (threadIdx.x >= forward_compute_detail::kMathThreads) {
     // Every lane of each control warpgroup releases registers before its
@@ -127,7 +143,8 @@ __global__ __launch_bounds__(
     if (threadIdx.x < 288U) {
       forward_compute_detail::persistent_role<
           StaticLocal, RetainBackwardState, forward_tuning::kFc1Stages,
-          forward_tuning::kFc2Stages, true, ComputeRole::Producer>(
+          forward_tuning::kFc2Stages, true, ComputeRole::Producer,
+          StaticSchedule>(
           a, x_map, s_map, w1_map, w2_map, storage, &task, &kind,
           &return_mblock, &pair_operand, &output_store_map, pair);
     } else {
@@ -139,21 +156,31 @@ __global__ __launch_bounds__(
           *reinterpret_cast<forward_unified_detail::CommunicationShared *>(
               storage +
               ((forward_tuning::compute_smem_bytes(a.world) + 127U) & ~127ULL));
-      forward_unified_detail::Communication<StaticLocal>{
+      forward_unified_detail::Communication<StaticLocal, StaticSchedule>{
           a, control, scheduler, comm}();
     }
   } else {
     forward_compute_detail::persistent_role<
         StaticLocal, RetainBackwardState, forward_tuning::kFc1Stages,
-        forward_tuning::kFc2Stages, true, ComputeRole::Math>(
+        forward_tuning::kFc2Stages, true, ComputeRole::Math,
+        StaticSchedule>(
         a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
         &pair_operand, &output_store_map, pair);
   }
   // Communication remains live while the math warpgroups drain fixed-order
   // token sums. Each domain owns its own barriers and storage until it exits.
-  if (threadIdx.x < forward_compute_detail::kMathThreads)
+  if (threadIdx.x < forward_compute_detail::kMathThreads) {
+    const auto reduce_roles = a.forward_reduce_cta_count;
+    // Static FC1/FC2 residues begin at low cluster IDs.  Rotate immutable
+    // token stripes onto the otherwise-idle half of the homogeneous grid so
+    // small and medium batches do not assign every Reduce token to the same
+    // CTAs carrying the GEMM wavefront.
+    const auto reduce_role = StaticSchedule && reduce_roles
+                                 ? (blockIdx.x + reduce_roles / 2U) % reduce_roles
+                                 : blockIdx.x;
     forward_compute_detail::reduce_role<StaticLocal, 256U>(
-        a, blockIdx.x, a.forward_reduce_cta_count);
+        a, reduce_role, reduce_roles);
+  }
   __syncthreads();
   // Every role is finished before either CTA can retire its DSM mailbox.
   cute::cluster_sync();
@@ -179,12 +206,14 @@ __global__ __launch_bounds__(
 #include "unified_communication_benchmark.cuh"
 #endif
 
-template <bool StaticLocal, bool RetainBackwardState>
+template <bool StaticLocal, bool RetainBackwardState,
+          bool StaticSchedule = false>
 constexpr auto unified_forward_entry() {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY) && __has_include(<nccl_device.h>)
   return unified_communication_benchmark_kernel<StaticLocal,
                                                 RetainBackwardState>;
 #else
-  return unified_forward_kernel<StaticLocal, RetainBackwardState>;
+  return unified_forward_kernel<StaticLocal, RetainBackwardState,
+                                StaticSchedule>;
 #endif
 }

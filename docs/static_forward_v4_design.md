@@ -1,6 +1,67 @@
 # WeftMoE Static Forward V4：单机与多机重构设计
 
-状态：设计草案，尚未实现
+## 0. 当前实现状态（2026-09-21）
+
+首个单机 inference-only 数据面已经落地，训练与多机仍保持 V3。当前是
+route-plan 尚未融合的过渡实现：
+
+- route plan 暂时继续使用独立的 single-node inference notify kernel；尚未把
+  count exchange/materialize 物理融合进 Forward kernel；
+- Forward 只 launch 一个覆盖 132 SM 的 homogeneous resident grid，每个 384-thread
+  CTA 都具有相同代码和资源合同：`0..255` 为两个 WGMMA math warpgroup，
+  `256..287` 为 TMA producer warp，`288..383` 为两个 copy warp 加一个 notification
+  receive warp。不存在 24 个特殊 transport CTA；
+- source-push Dispatch 按 CTA/route batch 固定条带分配；FC1 pair、FC2 unit、Return
+  row stripe 都有确定 owner；V4 路径不再使用 FC1/FC2/Return work-claim queue 或
+  CAS。Reduce 采用混合策略：每 rank 少于 64 token 时复用已调优的
+  ready-token queue，64 token 及以上改用 per-route epoch 和固定 token stripe；
+- FC2 tile completion 不能直接作为 NVLink Return 可见性信号。实现另有一个位于
+  `__threadfence_system()` 之后的 per-M-block epoch，静态 Return owner acquire 该
+  epoch 后才读取 payload；
+- 数值主体继续复用 V3 的 BF16/WGMMA micro-kernel，M/N/K tile、FC1 SwiGLU
+  epilogue、FC2 store 和 top-k FP32 固定 combine order 均未改变；
+- 当前数值 tile 为 M128、FC1 N128、FC2 N256、K64，cluster size 2。FC1 每个 math
+  thread 的 gate/up accumulator 各 64 个 FP32；FC2 每次只让单个 N256 tile 的 128 个
+  FP32 accumulator 存活，离开 epilogue 词法域后才进入 task/Return 控制逻辑；
+- `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1` 可回退到 V3，供正确性与性能 A/B；
+- 静态进度在每个 cluster 内用两个 16-bit 计数编码。host 按 pool 的最坏 M-block
+  容量做显式门禁，超界会在 launch 前报错，绝不截断或丢弃任务。
+
+已通过 EP8 的 8-token、64-token 平衡路由，以及 64-token 全部 route 集中到
+rank 0（其余七 rank 零 incoming rows）的训练参考、inference eager、双层 CUDA
+Graph replay 和 workspace 生命周期回归。一次 `(M-block, source-rank)` Return task
+实验在固定路由下可运行，但在 graph 多代、动态 route/bucket 切换时出现通知 credit
+等待环，已撤回。当前 Return 使用与 peer occupancy 无关的固定 row stripe，并在
+stripe 内做 mixed-peer publication。Return 拷贝粒度由冻结后的平均 M-block
+占用率决定：平均有效行数 `<=16` 时一个 M-block 一个 task，`17..64` 时
+分成 16 个 8-row stripe，`>64` 时分成 8 个 16-row stripe。这个选择不依赖
+source-rank 分布，因而 graph replay 换路由时 task 几何不会改变。
+
+Qwen EP8、64 experts、top-k 4 的最终定位发现：V4 曾被误放入 legacy split-grid
+host 初始化分支，每次 Forward 额外 launch 一次
+`initialize_forward_generation_signals_kernel`，随后 unified V4 主 kernel 内又做了同样的
+generation 初始化。device timeline 显示 V3/V4 从 `KernelEnter` 到 terminal 都约为
+265.5 us，原先的固定差距全部在 `KernelEnter` 之前。删除重复 kernel 后，再把
+register/stack/dynamic-smem/cluster occupancy 这些不随 invocation 变化的 launch 校验按
+backend 缓存。
+
+最终性能使用同一进程、同一权重与路由，逐 iteration 交错 V4/V3，并每轮反转
+先后顺序；每点 20 次 warmup、100 次测量，报告 rank-max median（单位为 us）：
+
+| token/rank | V4 total | V3 total | V4 - V3 | V4 Dispatch | V4 FC1 | V4 FC2 | V4 Return |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 207.216 | 221.392 | -14.176 | 42.768 | 34.016 | 32.880 | 55.648 |
+| 8 | 240.336 | 248.416 | -8.080 | 47.360 | 34.464 | 33.120 | 86.144 |
+| 64 | 267.120 | 270.320 | -3.200 | 48.384 | 37.824 | 34.864 | 106.672 |
+| 256 | 291.872 | 296.400 | -4.528 | 57.216 | 39.776 | 32.736 | 119.152 |
+
+`reduce_us` 在静态模式下包含最早 owner 等待 route epoch 到最后 owner 结束的时间，
+不是纯 Reduce 算力耗时，因此不放入表格做横向解读。V4 已在四个测试点
+稳定快于 V3；下一阶段的主要性能目标是减少 64-token 的 Return notification
+放大，同时完成 route-plan/Forward 物理融合，再接多机 V4。
+
+状态：设计文档；单机 inference-only V4 过渡实现已通过 EP8 门禁，多机与
+training 重构尚未实现
 
 日期：2026-09-21
 

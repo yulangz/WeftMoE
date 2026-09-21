@@ -34,6 +34,14 @@ def main():
     route = (
         torch.arange(world * tokens * top_k, device="cuda").reshape(-1, top_k) % experts
     ).int()
+    if os.environ.get("TEST_ROUTE_SKEW") == "1":
+        # Concentrate every route on the first rank while retaining distinct
+        # top-k experts.  This covers zero-incoming-row ranks, multi-M-block
+        # experts, and source-major Return intervals in the static inference
+        # scheduler.
+        route = torch.arange(top_k, device="cuda", dtype=torch.int32).expand(
+            world * tokens, top_k
+        ).contiguous()
     gate = torch.full(
         (world * tokens, top_k), 1 / top_k, device="cuda", requires_grad=True
     )

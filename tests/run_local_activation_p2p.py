@@ -286,7 +286,7 @@ def main():
     parser.add_argument("--backward-tokens", type=int)
     parser.add_argument("--backward-warmups", type=int)
     parser.add_argument("--backward-output-dir")
-    parser.add_argument("--top-k", type=int, choices=(1, 6, 8), default=6)
+    parser.add_argument("--top-k", type=int, choices=(1, 4, 6, 8), default=6)
     parser.add_argument("--gate-mode", choices=("fixed-random", "unit"),
                         default="fixed-random")
     parser.add_argument("--forward-output-dir")

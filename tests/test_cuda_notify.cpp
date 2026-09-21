@@ -3401,8 +3401,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     top_k = benchmark_top_k
                 ? static_cast<std::uint32_t>(std::stoul(benchmark_top_k))
                 : 6U;
-    require(top_k == 1 || top_k == 6 || top_k == 8,
-            "integrated benchmark top-k must be 1, 6, or 8");
+    require(top_k == 1 || top_k == 4 || top_k == 6 || top_k == 8,
+            "integrated benchmark top-k must be 1, 4, 6, or 8");
     const auto bench_tokens_text = std::getenv("WEFTMOE_P2P_BENCH_TOKENS");
     max_tokens = bench_tokens_text ? std::stoull(bench_tokens_text) : 8192U;
     fixture_tokens = max_tokens;

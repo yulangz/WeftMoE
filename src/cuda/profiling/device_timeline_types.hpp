@@ -9,7 +9,7 @@
 
 namespace weftmoe::cuda::profiling {
 
-inline constexpr std::uint32_t kTimelineSchemaVersion = 9;
+inline constexpr std::uint32_t kTimelineSchemaVersion = 10;
 // Main-shape compute CTAs can retire more than 256 FC tiles.  A truncated
 // suffix makes the apparent FC2/Return tail shorter than the real one, so the
 // profiling build deliberately spends a few extra MiB per GPU for a complete
@@ -97,6 +97,7 @@ enum class TimelineEvent : std::uint16_t {
   SourceSignalReady = 93,
   // Ready and Claimed identify the same packet by (channel, arg0=sequence).
   SourcePacketClaimed = 94,
+  SetupDone = 95,
 };
 
 // Fixed-width, pointer-free host/device trace record. Timestamps are only

@@ -245,6 +245,29 @@ static_assert(kUnifiedReturnDrainRows >= 32U &&
 inline constexpr bool kUnifiedSplitNvlink = WEFTMOE_FWD_UNIFIED_SPLIT_NVLINK != 0;
 inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 
+// V4 keeps a distinct resource type so later tuning cannot silently change
+// the static entry's register contract.  Cold scheduling and transport state
+// live in noinline device routines/shared memory. CUDA 12.9 requires the same
+// 216/64 entry split as V3 even though the static worker loops carry less
+// control state.
+#ifndef WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS
+#define WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS 216
+#endif
+#ifndef WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS
+#define WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS 64
+#endif
+inline constexpr unsigned kStaticV4MathRegisters =
+    WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS;
+inline constexpr unsigned kStaticV4ControlRegisters =
+    WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS;
+using StaticV4Resources = unified_worker_tuning::Resources<
+    WEFTMOE_FWD_UNIFIED_THREADS, WEFTMOE_FWD_UNIFIED_COMM_THREADS,
+    WEFTMOE_FWD_UNIFIED_COMM_BASE, WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS,
+    WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS,
+    WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS,
+    WEFTMOE_FWD_UNIFIED_SEGMENT_BYTES,
+    WEFTMOE_FWD_UNIFIED_COPY_BUFFERS>;
+
 inline constexpr std::uint32_t kMainHidden = WEFTMOE_FWD_MAIN_HIDDEN;
 inline constexpr std::uint32_t kMainIntermediate =
     WEFTMOE_FWD_MAIN_INTERMEDIATE;

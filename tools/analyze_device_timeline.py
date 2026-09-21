@@ -78,6 +78,7 @@ EVENTS = {
     92: "gin_sender_progress",
     93: "source_signal_ready",
     94: "source_packet_claimed",
+    95: "setup_done",
 }
 
 PAIRS = {
