@@ -1,5 +1,7 @@
 #pragma once
 
+#include "weftmoe/version.hpp"
+
 struct NotifyCommunicationView {
   ncclDevComm_t dev{};
   ncclWindow_t window = nullptr;
@@ -39,11 +41,14 @@ __device__ void notify_exchange(LocalNotifyArgs local, DeviceMaterializeArgs a,
     const auto world = ncclTeamWorld(c.dev);
     const auto lsa = ncclTeamLsa(c.dev);
     if (threadIdx.x < 32) {
+#if WEFTMOE_ENABLE_GIN_RDMA
       if (c.remote)
         ncclBarrier(ncclCoopWarp{}, ncclTeamTagWorld{},
                     ncclGin(c.dev, 0, NCCL_GIN_RESOURCE_SHARING_CTA), 0,
                     ::cuda::memory_order_acq_rel, ncclGinFenceLevel::None);
-      else {
+      else
+#endif
+      {
         ncclLsaBarrierSession bar(ncclCoopWarp{}, c.dev, ncclTeamTagLsa{}, 0);
         bar.sync(ncclCoopWarp{}, ::cuda::memory_order_acq_rel);
       }
@@ -66,7 +71,13 @@ __device__ void notify_exchange(LocalNotifyArgs local, DeviceMaterializeArgs a,
       c.base[i] = value;
     }
     __syncthreads();
-    __threadfence_system();
+    // Cross-node visibility needs system scope; the LSA-only (single-node)
+    // build exchanges through NVLink peer mappings and needs device scope.
+    if (WEFTMOE_ENABLE_GIN_RDMA) {
+      __threadfence_system();
+    } else {
+      __threadfence();
+    }
     const auto destination =
         std::size_t(1 + a.rank) * c.columns * sizeof(std::uint64_t);
     for (unsigned i = threadIdx.x; i < unsigned(lsa.nRanks) * c.columns;
@@ -79,7 +90,7 @@ __device__ void notify_exchange(LocalNotifyArgs local, DeviceMaterializeArgs a,
                                ncclGetLsaPointer(c.window, destination, peer));
       target[word] = c.base[word];
     }
-    if (c.remote) {
+    if (WEFTMOE_ENABLE_GIN_RDMA && c.remote) {
       const ncclGin gin(c.dev, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
       for (unsigned peer = threadIdx.x; peer < a.world; peer += blockDim.x) {
         const int local_peer = ncclTeamRankToLsa(c.dev, world, peer);
@@ -94,13 +105,20 @@ __device__ void notify_exchange(LocalNotifyArgs local, DeviceMaterializeArgs a,
       // warp. Its Put fence orders remote visibility; its trailing flush
       // covers local completion before the shared send record is reused.
     }
-    __threadfence_system();
+    if (WEFTMOE_ENABLE_GIN_RDMA) {
+      __threadfence_system();
+    } else {
+      __threadfence();
+    }
     __syncthreads();
     if (threadIdx.x < 32) {
+#if WEFTMOE_ENABLE_GIN_RDMA
       if (c.remote)
         ncclBarrier(ncclCoopWarp{}, ncclTeamTagWorld{},
                     ncclGin(c.dev, 0, NCCL_GIN_RESOURCE_SHARING_CTA), 0);
-      else {
+      else
+#endif
+      {
         ncclLsaBarrierSession bar(ncclCoopWarp{}, c.dev, ncclTeamTagLsa{}, 0);
         bar.sync(ncclCoopWarp{}, ::cuda::memory_order_acq_rel);
       }

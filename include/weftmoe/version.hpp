@@ -20,6 +20,16 @@ WEFTMOE_PUBLIC_API_BEGIN
 
 namespace weftmoe {
 
+// Build-time switch. Building with WEFTMOE_ENABLE_GIN_RDMA=0 produces a
+// single-node-only binary: the RDMA/GIN device-communicator requirements and
+// window allocations, the GinRdma forward kernel, and the GIN branches and
+// system-scope fences inside the notify exchange are all compiled out, and the
+// runtime rejects EP teams spanning more than one node. The default keeps the
+// full multi-node implementation.
+#ifndef WEFTMOE_ENABLE_GIN_RDMA
+#define WEFTMOE_ENABLE_GIN_RDMA 1
+#endif
+
 // Version 2 keeps repository-only diagnostics outside the installed API. It
 // is intentionally a
 // breaking boundary: this repository has no external compatibility contract.

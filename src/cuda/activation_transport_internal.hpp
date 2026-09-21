@@ -15,6 +15,8 @@ struct ExternalCudaProducerState;
 }
 
 struct ExternalCudaProducer::State {
+  // The token owns backend; backend must not own the token in return.
+  ExecutionToken execution;
   std::shared_ptr<const internal::ExternalCudaProducerState> backend;
 };
 

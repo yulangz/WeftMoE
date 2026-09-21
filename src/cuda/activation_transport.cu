@@ -560,7 +560,7 @@ struct OperatorCompletion {
 };
 
 struct DeviceForwardHandle::Impl {
-  std::shared_ptr<SlotLease> slot;
+  mutable std::shared_ptr<SlotLease> slot;
   std::shared_ptr<ActivationPoolState> pool;
   std::shared_ptr<ActivationMegaKernelBackendState> backend;
   DeviceDispatchHandle dispatch;
@@ -889,7 +889,7 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   impl->w1 = w1;
   impl->w2 = w2;
   impl->session_identity = state_->backend->context.session().stable_identity_bytes();
-  impl->execution = state_->backend->execution;
+  impl->execution = state_->execution;
   impl->owned_experts = owned_experts;
   impl->global_expert_begin = global_expert_begin;
   impl->hidden = hidden_size;
@@ -1048,7 +1048,7 @@ testing::hash_forward_weight_storage_for_validation(
 }
 
 constexpr std::uint64_t kLocalP2pBootstrapMagic = 0x31504350454f4d4dULL;
-constexpr std::uint64_t kLocalP2pBootstrapSchema = 1;
+constexpr std::uint64_t kLocalP2pBootstrapSchema = 2;
 constexpr std::size_t kLocalP2pBootstrapHeaderBytes = 96;
 
 void put_u64_le(std::vector<std::byte> &wire, std::size_t offset,
@@ -1102,19 +1102,17 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
     transport_error(NotifyErrorCode::WorkspaceMismatch, "local-p2p-create",
                     "provenance", session.rank(),
                     "same session/world/device", "mismatch");
-  int device_count = 0;
+  // Device ordinals are process-local: schedulers commonly expose only one
+  // GPU to each actor, making every actor's ordinal zero. CUDA IPC can still
+  // import peer allocations; identify the physical devices by UUID instead.
+  cudaDeviceProp device_properties{};
   internal::throw_cuda(
-      "local-p2p-create", cudaGetDeviceCount(&device_count), session.rank(),
+      "local-p2p-create",
+      cudaGetDeviceProperties(&device_properties, static_cast<int>(pool->device)),
+      session.rank(),
       nccl->world, session.session().identity(),
       session.session().generation(), ExchangeKind::ExpertCounts,
-      "cudaGetDeviceCount");
-  if (nccl->world > static_cast<std::uint32_t>(device_count))
-    throw NotifyDispatchError(
-        NotifyErrorCode::BackendUnavailable,
-        "phase=local-p2p-create, field=local_world, rank=" +
-            std::to_string(session.rank()) + ", expected<=device_count=" +
-            std::to_string(device_count) + ", actual=" +
-            std::to_string(nccl->world));
+      "cudaGetDeviceProperties(UUID)");
 
   std::lock_guard<std::mutex> mapping_lock(pool->mutex);
   auto backend = std::make_shared<LocalP2pBackendState>();
@@ -1145,7 +1143,7 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
   put_u64_le(local, 16, record_bytes);
   put_u64_le(local, 24, session.rank());
   put_u64_le(local, 32, nccl->world);
-  put_u64_le(local, 40, pool->device);
+  std::memcpy(local.data() + 40, device_properties.uuid.bytes, 8);
   put_u64_le(local, 48, slot_count);
   put_u64_le(local, 56, pool->layout.total);
   put_u64_le(local, 64, session.session().generation());
@@ -1153,7 +1151,7 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
       session_summary(session.session().stable_identity_bytes());
   put_u64_le(local, 72, identity_hash[0]);
   put_u64_le(local, 80, identity_hash[1]);
-  put_u64_le(local, 88, 0);
+  std::memcpy(local.data() + 88, device_properties.uuid.bytes + 8, 8);
   for (std::size_t slot = 0; slot < slot_count; ++slot) {
     cudaIpcMemHandle_t handle{};
     internal::throw_cuda(
@@ -1224,8 +1222,7 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
   backend->peer_slot_bases.assign(mapping_count, nullptr);
   backend->owns_mapping.assign(mapping_count, 0);
   try {
-    std::vector<std::uint8_t> seen_devices(
-        static_cast<std::size_t>(device_count), 0);
+    std::vector<std::array<std::byte, 16>> seen_devices;
     for (std::uint32_t rank = 0; rank < nccl->world; ++rank) {
       const auto *record = matrix.data() +
                            static_cast<std::size_t>(rank) * record_bytes;
@@ -1248,32 +1245,18 @@ std::shared_ptr<LocalP2pBackendState> create_local_p2p_backend(
       check(64, session.session().generation(), "generation");
       check(72, identity_hash[0], "session_digest0");
       check(80, identity_hash[1], "session_digest1");
-      check(88, 0, "reserved");
-      const auto peer_device = get_u64_le(record, record_bytes, 40,
-                                          session.rank(), "device");
-      if (peer_device >= static_cast<std::uint64_t>(device_count) ||
-          seen_devices[static_cast<std::size_t>(peer_device)] != 0)
+      std::array<std::byte, 16> peer_device{};
+      std::memcpy(peer_device.data(), record + 40, 8);
+      std::memcpy(peer_device.data() + 8, record + 88, 8);
+      if (std::find(seen_devices.begin(), seen_devices.end(), peer_device) !=
+          seen_devices.end())
         transport_error(NotifyErrorCode::TransportProtocolFailure,
-                        "local-p2p-bootstrap", "device", session.rank(),
-                        "unique local device ordinal",
-                        std::to_string(peer_device));
-      seen_devices[static_cast<std::size_t>(peer_device)] = 1;
-      int access = 0;
-      if (peer_device != pool->device) {
-        internal::throw_cuda(
-            "local-p2p-create",
-            cudaDeviceCanAccessPeer(&access, static_cast<int>(pool->device),
-                                    static_cast<int>(peer_device)),
-            session.rank(), nccl->world, session.session().identity(),
-            session.session().generation(), ExchangeKind::ExpertCounts,
-            "cudaDeviceCanAccessPeer");
-        if (access == 0)
-          throw NotifyDispatchError(
-              NotifyErrorCode::BackendUnavailable,
-              "phase=local-p2p-create, field=peer_access, rank=" +
-                  std::to_string(session.rank()) + ", expected=1, actual=0, "
-                  "peer_rank=" + std::to_string(rank));
-      }
+                        "local-p2p-bootstrap", "device UUID", session.rank(),
+                        "unique physical GPU", "duplicate at peer rank " +
+                            std::to_string(rank));
+      seen_devices.push_back(peer_device);
+      // The peer may be hidden by CUDA_VISIBLE_DEVICES. The IPC import below
+      // resolves its physical allocation and validates/enables peer access.
       for (std::size_t slot = 0; slot < slot_count; ++slot) {
         const auto index = slot * nccl->world + rank;
         if (rank == session.rank()) {
@@ -1418,12 +1401,14 @@ std::shared_ptr<GinBackendState> create_gin_backend(
   const auto local_rank = nccl->rank % local_world;
   if (rail.nRanks != static_cast<int>(num_nodes) ||
       lsa.nRanks != static_cast<int>(local_world) ||
-      pool->device != local_rank)
+      rail.rank != static_cast<int>(node) ||
+      lsa.rank != static_cast<int>(local_rank) || lsa.stride != 1 ||
+      rail.stride != static_cast<int>(local_world))
     throw NotifyDispatchError(
         NotifyErrorCode::BackendUnavailable,
         "phase=gin-create, field=topology, rank=" +
             std::to_string(session.rank()) +
-            ", expected=rail=nodes, lsa=local_world, device=local_rank, "
+            ", expected=contiguous LSA ranks and matching rail ranks, "
             "actual=world=" + std::to_string(nccl->world) + ", rail=" +
             std::to_string(rail.nRanks) + ", lsa=" +
             std::to_string(lsa.nRanks) + ", device=" +
@@ -2581,7 +2566,7 @@ BFloat16ActivationLease ExternalCudaProducer::publish_activations(
   impl->allocation = std::move(allocation);
   impl->pointer = device_data;
   impl->session_identity = producer.context.session().stable_identity_bytes();
-  impl->producer_execution = producer.execution;
+  impl->producer_execution = state_->execution;
   impl->generation = producer.context.session().generation();
   impl->tokens = num_tokens;
   impl->hidden = hidden_size;
@@ -2634,7 +2619,7 @@ BFloat16OutputGradientLease ExternalCudaProducer::publish_output_gradients(
   impl->pointer = device_data;
   impl->session_identity =
       state_->backend->context.session().stable_identity_bytes();
-  impl->producer_execution = state_->backend->execution;
+  impl->producer_execution = state_->execution;
   impl->generation = state_->backend->context.session().generation();
   impl->tokens = num_tokens;
   impl->hidden = hidden_size;
@@ -5402,6 +5387,24 @@ void DeviceForwardHandle::wait() const {
 void DeviceForwardHandle::wait_on(CUstream_st *stream) const {
   (void)identity();
   impl_->tensors.impl_->completion.wait_on(stream);
+}
+
+void DeviceForwardHandle::wait_workspace_on(CUstream_st *stream) const {
+  (void)identity();
+  const auto &slot = impl_->pool->slots[impl_->workspace_index];
+  internal::throw_cuda(
+      "forward-workspace-wait", cudaStreamWaitEvent(stream, slot.complete),
+      impl_->identity.rank, impl_->identity.world,
+      impl_->backend->session.session().identity(), impl_->identity.generation,
+      ExchangeKind::ExpertCounts, "cudaStreamWaitEvent(workspace complete)");
+}
+
+void DeviceForwardHandle::release_serialized_graph_workspace() const {
+  (void)identity();
+  if (impl_->retained_backward_state || !impl_->tensors.impl_->completion.capture)
+    throw std::runtime_error("serialized graph workspace release requires captured inference");
+  wait();
+  impl_->slot.reset();
 }
 
 const ActivationTransportExpectation &DeviceForwardHandle::identity() const {

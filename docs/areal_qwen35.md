@@ -1,0 +1,131 @@
+# Qwen3.5 接入 AReaL
+
+应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
+无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang
+环境，以及 AReaL 侧的接入改动。这是一个显式构建的开发适配层，只执行 `pip install .`
+不会构建 CPython tensor 扩展。
+
+## 构建
+
+在 WeftMoE 目录下、激活训练用 Python 环境后：
+
+```bash
+NVCCFLAGS="-include $PWD/configs/communication_spsc_20260916/qwen.hpp" \
+  python build_native.py lib --output build/libweftmoe_qwen.so --jobs 12
+python tools/build_tensor_runtime.py --library build/libweftmoe_qwen.so
+export WEFTMOE_SOURCE_ROOT="$PWD"
+export WEFTMOE_TENSOR_EXTENSION="$(realpath build/_runtime*.so)"
+```
+
+两个节点上 native 库和 tensor 扩展的路径必须一致。两边都要使用带 GIN 支持的
+NCCL 2.31.2 及以上版本。
+
+## 运行时归属
+
+- Megatron 保留自己的 router、shared experts、参数、优化器和 DDP 梯度钩子。
+  routed 路径调用融合的前向/反向算子并缓存 X 与 AB。专家参数复制进所有层共享的
+  一块固定 packed-weight 工作区；反向执行前恢复该层权重。每个训练驻留阶段内，
+  所有层共享一份传输工作区和 EP 组的一份通信 context。
+- SGLang 使用 TP=EP=4，把复制的 attention 输入按 EP rank 分片，并把路由输出还原
+  成 Qwen 外层 TP 归约所需的形式。它不保留 X/AB，也没有反向状态。
+- decode 为每一层、每个 token bucket 捕获一个子 CUDA graph，共享一份串行化的传输
+  工作区；回放前把内容拷进固定 bucket 输入。动态 prefill 复用同一套已准备好的
+  runtime，不为每个长度单独缓存。该共享工作区不支持不同 stream 并发使用。
+- AReaL 的 offload 钩子会先销毁推理图，再释放 native CUDA、IPC 和 GIN 分配；
+  resume 每个驻留阶段重建一次 context 并重新捕获图。训练侧 offload 拒绝存在存活
+  反向 tape 的情况。context 不会按层或按 token 重建。
+  WeftMoE 需要开启 NCCL cuMem，launcher 会把该设置显式传给两个角色。AWEX 插件和
+  v2 SGLang 入口都已接入。CUDA Graph 保持开启，但
+  `SGLANG_MEMORY_SAVER_CUDA_GRAPH=0` 关闭了 TMS 的图内存重映射：这些图是被显式
+  销毁再重建的，而 TMS 期望图分配一直存活。权重与 KV cache 的卸载仍走 TMS。
+  适配层在驻留切换前后保持自己的执行 stream 与 SGLang 的捕获 stream。SGLang 的
+  custom all-reduce 复用其已有的 staging buffer 路径，避免把已销毁图上的分配
+  永久注册为 IPC。这些选择可以避免按 stream 的工作区和旧图分配在多次 update 中
+  不断累积。
+- 外部 producer 的 execution token 通过 producer handle 持有后端，而不是在后端里
+  自引用。这个问题同时影响训练 tensor 和推理驻留：此前的所有权环会让输入 tensor
+  和 NCCL session 在 runtime 销毁后仍然存活。
+- 不同进程看到的 GPU 可见性可能不同。本地 IPC bootstrap 用 UUID 识别物理 GPU；
+  GIN 校验 NCCL team rank 而不是 CUDA device ordinal。这样 AReaL actor 即使各自
+  只能看到被分配的一张卡也能正常工作。Megatron 在初始化阶段就准备好 native
+  context，使拓扑错误在 rollout 之前暴露；随后的首次 offload 会正常释放它。
+
+## 实验启动器
+
+在打过补丁的 AReaL 仓库中使用
+`examples/cpu_staged_offload/run_qwen35_comparison.sh`，并通过环境变量提供模型与
+数据集路径、共享的 `AREAL_FILEROOT` 和 `WANDB_API_KEY`。`WANDB_BASE_URL` 默认是
+`http://8.150.1.98:8080`。环境中的 AWEX 必须注册
+`Qwen3_5MoeForConditionalGeneration`。该环境安装的 0.7.0 wheel 缺少对应 converter
+（AReaL 固定依赖 0.8.1），因此需要把 `AWEX_SOURCE_ROOT` 指向包含
+`awex/models/qwen3_5.py` 的共享 AWEX 仓库。launcher 会把该路径传给每个 worker，
+并在分配 GPU 之前检查注册情况。实验使用的是 revision
+`4e19c60fb2edf6df46aa4f2cecab9fd29a7e1b8d` 的 checkout。
+
+`NODES=1` 使用 actor d2t4e8；`NODES=2` 使用 actor d4t4e16 加 Ray 调度器。rollout
+分别使用 2 个或 4 个 TP4/EP4 引擎。设置 `BACKEND=baseline` 或
+`BACKEND=weftmoe`，后者还需要上面两个 WeftMoE 路径。rollout 的调度规格会继承
+actor 的接入变量。
+
+两机实验前先启动 Ray head 和 worker：把 `RAY_ADDRESS` 设为 head 地址，并为 RDMA
+网络设置 `NCCL_IB_HCA`、`NCCL_IB_GID_INDEX`，必要时设置 `NCCL_SOCKET_IFNAME`。
+baseline 与 WeftMoE 的两机实验使用相同 RDMA 设置。当前 native 多机反向要求每个
+节点 8 张卡、节点内 EP rank 连续，并且需要 8 条 rail。
+
+launcher 保持 `total_train_steps=null` 和完整的数据集/epoch horizon，由
+`AREAL_STOP_AFTER_STEPS=20` 独立于优化器初始化与 LR 日程限制训练循环。完成指
+20 次 update（global step 0 到 19），而不是把训练 horizon 设为 20。rollout 队列
+设为 128，因为原始示例的队列 32 在消费 batch 也是 32 时会停滞。数据集过滤使用
+16 个 CPU 进程，并保持原始顺序与内容。
+
+baseline 的选择性重算为 `[core_attn,moe_act,layernorm,shared_experts,mlp]`。
+WeftMoE 使用相同的周边模型重算策略，其 routed expert 反向保留 X/AB 并按仓库
+benchmark 配置重算激活。该环境安装的 MCore 没有为 Gated DeltaNet 实现
+`core_attn` 重算，因此 AReaL 对两个后端都在这类分支上施加 attention-only
+checkpoint，把 routed expert 的 X/AB 放在 checkpoint 之外。没有这个处理时，
+65,536 token 的 microbatch 会超出训练可用显存。CPU-staged 优化器步骤会在反向
+之后、梯度范数集合通信之前同步并释放 PyTorch 未使用的 allocator cache；否则
+NCCL 的惰性 communicator 分配会失败，即使被释放的激活显存仍然留在 PyTorch
+cache 中。
+
+## 验证
+
+设置 `WEFTMOE_TENSOR_EXTENSION` 后用 `torchrun` 运行 GPU 测试：
+
+- `tests/torchrun_tensor_runtime.py`：前向、输入/router/权重梯度、多层多 bucket
+  CUDA Graph，以及与 eager prefill 交替执行。
+- `tests/torchrun_megatron_adapter.py`：真实 Megatron MoE 模块、router 梯度与
+  适配层 offload。设置 `TEST_DDP=1 TEST_TP_SIZE=4` 可检查两个 microbatch 的 DDP
+  `main_grad` 累积、优化器更新，以及跨两个 step 的 runtime 重建。
+- `tests/torchrun_sglang_adapter.py`：真实 SGLang MoE 数值一致性、图回放与 runtime
+  释放/重建。
+- `tests/torchrun_gdn_recompute.py`：开启 attention checkpoint 后真实 TP Gated
+  DeltaNet 的输出与梯度一致性。
+- `tests/sglang_weft_offload_server.py` 与 `tests/check_sglang_offload.py`：整模型
+  AWEX 图/KV 驻留循环与 greedy token 一致性。用常规 SGLang 参数启动 server，在同
+  一主机上用 server URL 与 `--cycles 20` 运行检查脚本即可记录多次切换的显存。
+  在完整 Qwen3.5 模型、默认 52 个捕获 bucket 下，20 轮循环保持了 greedy token id
+  一致。预热后 GPU 0 恢复态稳定在 65,910 MiB，释放图/KV 后为 23,800 MiB；该测试
+  保留模型权重。
+
+Qwen 规模的 routing 需在 tensor 测试上设置 `TEST_EXPERTS=256 TEST_TOP_K=8`。
+若要复现 actor 的卡隔离，把 `CUDA_VISIBLE_DEVICES` 设为物理 GPU 列表，并在
+`torchrun` 命令中把 `tests/run_with_isolated_gpu.py` 插在测试路径之前，使每个子
+进程只看到一张卡且 ordinal 为 0。`TEST_TOKENS=16384` 还会覆盖长训练/eager-prefill
+路径；decode 图检查最多使用 128 个本地 row，对应 EP4 server 512 row 的捕获
+bucket。该长 token 测试在 EP8 上通过了前向与全部梯度，随后是两个 EP4 推理组的
+图回放与 offload。多机 tensor 测试在每个节点上运行 8 个进程。完整 20 step 的
+实验结果另行记录；算子测试本身不能证明端到端训练收敛性或性能。
+
+对 AReaL 两机拓扑需设置 `TEST_INFERENCE_EP_SIZE=4`：训练使用 EP16，而推理图使用
+4 个独立的 EP4 组。跨节点 EP16 推理图复用目前会以
+`GIN reuse wait: invalid argument` 失败，本适配层已测试的推理配置不支持这种用法。
+
+## 性能说明
+
+接入后 SGLang 解码路径明显慢于 baseline，原因是设备端 kernel 的固定开销，与
+tensor 申请、buffer/GIN context 重复创建无关。单层 MoE、EP4、CUDA Graph 回放
+下，baseline 为 0.035-0.216 ms，WeftMoE 为 0.458-0.693 ms，且几乎不随 token 数
+变化；其中 `single_notify_kernel` 约占 0.42 ms，`unified_forward_kernel` 约占
+0.35 ms。40 层叠加即每个 decode step 多出约 18 ms。详细测量、已排除项与优化
+方向见 `results/areal_qwen35_20260918/sglang_moe_perf_findings.md`。

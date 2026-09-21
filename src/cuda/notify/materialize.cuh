@@ -1,5 +1,14 @@
 #include "cuda/notify/radix.cuh"
 
+// Measurement-only switch. Negative (the default) keeps production behaviour:
+// the full exchange and materialization pipeline runs. 1 skips the cross-rank
+// count exchange, 2 skips the exchange and the whole materialization, so the
+// remaining time is the local routing pass alone. Results are meaningless in
+// these modes; they are used to attribute notify-kernel cost.
+#ifndef WEFTMOE_NOTIFY_TIMING_MODE
+#define WEFTMOE_NOTIFY_TIMING_MODE -1
+#endif
+
 __device__ void materialize_notify(DeviceMaterializeArgs a,
                                    std::uint64_t *sort_histogram,
                                    DeviceDispatchRuntime *runtime,
@@ -149,7 +158,16 @@ __global__ void __launch_bounds__(256) single_notify_kernel(NOTIFY_ENTRY_ARGS) {
   programmatic_launch::begin();
   local_notify(local);
   cooperative_groups::this_grid().sync();
+#if WEFTMOE_NOTIFY_TIMING_MODE == 2
+  return;
+#else
+#if WEFTMOE_NOTIFY_TIMING_MODE == 1
+  (void)comm;
+  (void)digest0;
+  (void)digest1;
+#else
   notify_exchange(local, a, comm, digest0, digest1);
+#endif
   if (local.status->out_of_range_packed != ~0ULL) {
     if (!blockIdx.x && !threadIdx.x) {
       *a.status = {};
@@ -168,5 +186,6 @@ __global__ void __launch_bounds__(256) single_notify_kernel(NOTIFY_ENTRY_ARGS) {
   }
   materialize_notify(a, histogram, runtime, status, ready, packed_wave,
                      packed_local);
+#endif
 }
 #undef NOTIFY_ENTRY_ARGS

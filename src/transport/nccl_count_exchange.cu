@@ -257,6 +257,12 @@ void throw_nccl(const char *phase, ncclResult_t error, std::uint32_t rank,
 
 } // namespace internal
 
+NcclBootstrapId NcclBootstrapId::from_bytes(std::vector<std::uint8_t> bytes) {
+  if (bytes.size() != sizeof(ncclUniqueId))
+    invalid("NCCL bootstrap ID has an invalid byte count");
+  return NcclBootstrapId(std::move(bytes));
+}
+
 NcclBootstrapId make_nccl_bootstrap_id() {
   static_assert(sizeof(ncclUniqueId) ==
                     NcclBootstrapInputChannel::kWireBytes,
@@ -1992,6 +1998,9 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
       config.max_inflight_consumers == 0)
     invalid("phase=device-pool-create, field=input, rank=n/a, "
             "expected=valid nonzero capacity, actual=invalid");
+  if (config.enable_unstable_inference_rows &&
+      config.capacity_config.topology.num_nodes != 1)
+    invalid("unstable inference row assignment is single-node only");
   validate_runtime_config(config.capacity_config);
   if (config.capacity_config.topology.world_size !=
           base_session.session().world_size() ||
@@ -2029,7 +2038,8 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
   impl->slots.resize(config.max_inflight_generations);
   for (auto &slot : impl->slots) {
     slot.notify = DeviceNotifyPoolBridge::allocate(
-        impl->max_plan, execution, config.max_inflight_consumers);
+        impl->max_plan, execution, config.max_inflight_consumers,
+        config.enable_unstable_inference_rows);
     // The pool has one execution stream. Its count exchange is serialized by
     // device barriers, independent of which metadata slot each rank retains.
     if (&slot == &impl->slots.front())

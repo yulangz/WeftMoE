@@ -22,6 +22,8 @@ class NcclBootstrapId {
 public:
   NcclBootstrapId() = default;
   explicit operator bool() const noexcept { return !bytes_.empty(); }
+  const std::vector<std::uint8_t> &bytes() const noexcept { return bytes_; }
+  static NcclBootstrapId from_bytes(std::vector<std::uint8_t> bytes);
 
 private:
   explicit NcclBootstrapId(std::vector<std::uint8_t> bytes)
@@ -187,6 +189,11 @@ struct DeviceNotifyResourcePoolConfig {
   std::uint64_t max_config_wire_bytes = 0;
   std::uint32_t max_inflight_generations = 2;
   std::uint32_t max_inflight_consumers = 4;
+  // Single-node inference fast path. Route rows are allocated atomically and
+  // are intentionally not stable across invocations. GEMM does not reduce in
+  // M and the fixed combine order is retained, so this does not affect FWD
+  // numerics. Training must leave this disabled because dW reduces over M.
+  bool enable_unstable_inference_rows = false;
 };
 
 struct DeviceNotifyResourcePoolUsage {

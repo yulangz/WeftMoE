@@ -97,6 +97,8 @@ def build(target='lib', output=None, jobs=None):
     common += [f'-DWEFTMOE_BUILD_TESTING={int(testing)}', '-DWEFTMOE_BUILD_SHARED=1']
     common += [f'-D{name}={os.environ.get(name, "0")}' for name in (
         'WEFTMOE_DEBUG_VALIDATE', 'WEFTMOE_DEVICE_TIMELINE', 'WEFTMOE_FORWARD_LIGHT_PROGRESS')]
+    common += ['-DWEFTMOE_ENABLE_GIN_RDMA=' + os.environ.get(
+        'WEFTMOE_ENABLE_GIN_RDMA', '1')]
     host = [cxx, *common, '-O2', '-g', '-std=c++17', '-pthread', '-Wall', '-Wextra',
             '-Wpedantic', '-Wconversion', '-Wshadow', '-fPIC', '-fvisibility=hidden',
             '-ffunction-sections', '-fdata-sections', *shlex.split(os.environ.get('CXXFLAGS', ''))]

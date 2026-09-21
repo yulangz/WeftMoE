@@ -98,7 +98,14 @@ __device__ void local_notify(LocalNotifyArgs a) {
     __syncthreads();
   }
   grid.sync();
-  for (unsigned expert = blockIdx.x; expert < a.experts; expert += gridDim.x) {
+  if (chunks == 1) {
+    // A one-element exclusive scan is zero. Decode buckets otherwise perform
+    // an entire 256-thread BlockScan for every expert to compute that zero.
+    for (unsigned expert = tid; expert < a.experts; expert += stride) {
+      a.histogram[expert] = a.chunk_counts[expert];
+      a.chunk_counts[expert] = 0;
+    }
+  } else for (unsigned expert = blockIdx.x; expert < a.experts; expert += gridDim.x) {
     unsigned long long carry = 0;
     for (std::uint64_t first = 0; first < chunks; first += 256) {
       const auto chunk = first + threadIdx.x;

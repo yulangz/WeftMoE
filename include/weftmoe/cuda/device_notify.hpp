@@ -13,6 +13,8 @@
 
 WEFTMOE_PUBLIC_API_BEGIN
 
+struct CUstream_st;
+
 namespace weftmoe::cuda {
 
 // Common capacities derived from the current count exchange on every rank.
@@ -52,6 +54,8 @@ private:
       : impl_(std::move(impl)) {}
   std::shared_ptr<const Impl> impl_;
   friend CudaExecution make_cuda_execution(std::string, std::uint32_t);
+  friend CudaExecution make_external_cuda_execution(
+      std::string, std::uint32_t, CUstream_st *, std::shared_ptr<const void>);
   friend class SelectedExpertRouteLease<std::int32_t>;
   friend class DeviceDispatchConsumerLease;
   friend class NcclAllGatherCountExchange;
@@ -59,6 +63,11 @@ private:
 
 CudaExecution make_cuda_execution(std::string identity,
                                   std::uint32_t device_ordinal);
+
+// Borrow an application stream. Its owner must outlive all submitted work.
+CudaExecution make_external_cuda_execution(
+    std::string identity, std::uint32_t device_ordinal, CUstream_st *stream,
+    std::shared_ptr<const void> stream_owner);
 
 // Production routing input. The selected-expert matrix stays in backend-owned
 // device storage; this handle adds immutable shape, capacity, execution and

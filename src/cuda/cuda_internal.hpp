@@ -127,12 +127,13 @@ inline cudaError_t wait_input_ready(cudaStream_t stream, cudaEvent_t event,
 struct CudaExecutionState final : BackendExecutionState {
   std::uint32_t device = 0;
   cudaStream_t stream = nullptr;
+  bool owns_stream = true;
+  std::shared_ptr<const void> stream_owner;
   ~CudaExecutionState() noexcept override;
 };
 
 struct ExternalCudaProducerState final : BackendExecutionState {
   RankCollectiveContext context;
-  ExecutionToken execution;
   std::shared_ptr<const void> stream_owner;
   cudaStream_t stream = nullptr;
   std::uint32_t device = 0;

@@ -3176,9 +3176,10 @@ void run_communication_benchmark_rank(
   constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
   constexpr std::uint64_t intermediate =
       weftmoe::cuda::forward_tuning::kMainIntermediate;
-  require((nodes == 1U && (world == 1U || world == 2U || world == 8U)) ||
+  require((nodes == 1U &&
+           (world == 1U || world == 2U || world == 4U || world == 8U)) ||
               (nodes > 1U && world == nodes * 8U),
-          "communication benchmark requires local 1/2/8 GPUs or GIN nodes of 8 "
+          "communication benchmark requires local 1/2/4/8 GPUs or GIN nodes of 8 "
           "GPUs");
   require(max_tokens != 0U && experts % world == 0U &&
               routes.num_tokens == max_tokens,
@@ -3382,14 +3383,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
               ((benchmark_forward || backward_benchmark) &&
-               (world == 1 || world == 8)) ||
+               (world == 1 || world == 4 || world == 8)) ||
               (benchmark_communication &&
-               (world == 1 || world == 2 || world == 8)) ||
+               (world == 1 || world == 2 || world == 4 || world == 8)) ||
               (benchmark_integrated && (world == 2 || world == 8)))) ||
                 (cross_host_benchmark &&
                  ((nodes == 2 && (world == 2 || world == 16)) ||
                   (benchmark_communication && world == nodes * 8U))),
-            "CUDA benchmark requires local 1/2/8 GPUs or GIN 2x1/2x8 GPUs");
+            "CUDA benchmark requires local 1/2/4/8 GPUs or GIN 2x1/2x8 GPUs");
     experts = std::getenv("WEFTMOE_BENCH_EXPERTS")
                   ? std::stoul(std::getenv("WEFTMOE_BENCH_EXPERTS")) : 384U;
     require(experts > 0 && experts % world == 0, "experts must divide EP");

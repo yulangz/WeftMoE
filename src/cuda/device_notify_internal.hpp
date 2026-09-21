@@ -319,7 +319,8 @@ public:
   static std::shared_ptr<CudaNotifyPoolAllocation> allocate(
       const CudaNotifyWorkspacePlan &max_plan,
       const CudaExecution &execution,
-      std::uint32_t max_inflight_consumers = 4);
+      std::uint32_t max_inflight_consumers = 4,
+      bool unstable_inference_rows = false);
   static void
   configure_communication(const std::shared_ptr<CudaNotifyPoolAllocation> &,
                           const NcclSession &, const CudaExecution &);

@@ -238,6 +238,15 @@ public:
   // reserve their slot until destruction. wait_on() inserts only a dependency.
   void wait() const;
   void wait_on(CUstream_st *stream) const;
+  // Serialize reuse of the persistent execution workspace on another stream.
+  // Unlike wait_on(), this also waits for status copies and the terminal
+  // workspace-complete event, but it never blocks the calling host thread.
+  void wait_workspace_on(CUstream_st *stream) const;
+  // After instantiating and executing an inference graph once, relinquish its
+  // workspace lease. The graph and this handle must remain alive. The caller
+  // MUST serialize every replay and every other use of this pool on one stream;
+  // concurrent replay is forbidden. Saved training state cannot use this mode.
+  void release_serialized_graph_workspace() const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:

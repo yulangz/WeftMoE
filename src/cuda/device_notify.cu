@@ -1271,7 +1271,16 @@ __device__ void materialize_signals_stage(DeviceMaterializeArgs a,
 }
 
 #include "cuda/notify/communication.cuh"
+
+// Number of experts each notify CTA is expected to process in the staged
+// materialization pipeline. Larger values keep the cooperative grid small
+// (cheaper grid barriers, more serialized per-expert work); smaller values
+// spread the per-expert stages over more CTAs.
+#ifndef WEFTMOE_NOTIFY_EXPERTS_PER_CTA
+#define WEFTMOE_NOTIFY_EXPERTS_PER_CTA 8
+#endif
 #include "cuda/notify/materialize.cuh"
+#include "cuda/notify/single_node_inference.cuh"
 
 __global__ void dispatch_consumer_probe_delay_kernel(
     const std::uint64_t *source, std::uint64_t delay_cycles) {
@@ -1337,6 +1346,7 @@ struct WorkspaceState {
   std::shared_ptr<NotifyCommunication> communication;
   LocalNotifyArgs local_args{};
   bool single_kernel = false;
+  bool unstable_inference_rows = false;
   // Host-visible Notify supplies an exact immutable snapshot. Enqueue-only
   // replay refreshes device counts without refreshing that host snapshot.
   bool replay_counts = false;
@@ -1399,6 +1409,7 @@ DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
 
 struct CudaNotifyPoolAllocation {
   CudaNotifyWorkspacePlan max_plan;
+  bool unstable_inference_rows = false;
   bool owns_communication = false;
   std::shared_ptr<NotifyCommunication> communication;
   std::shared_ptr<internal::CudaAllocation> route;
@@ -1446,7 +1457,7 @@ CudaDeviceLeaseAccess::checked(const DeviceBufferLease &lease,
 }
 
 CudaExecutionState::~CudaExecutionState() noexcept {
-  if (!stream)
+  if (!stream || !owns_stream)
     return;
   (void)cudaSetDevice(static_cast<int>(device));
   (void)cudaStreamSynchronize(stream);
@@ -1541,7 +1552,7 @@ CudaExecutionStateAccess::checked(const CudaExecution &execution) {
             "expected=valid, actual=empty");
   auto state = std::dynamic_pointer_cast<const CudaExecutionState>(
       backend_execution_state(execution.token()));
-  if (!state || !state->stream)
+  if (!state || (!state->stream && state->owns_stream))
     invalid("phase=cuda-context, field=execution_backend, rank=n/a, "
             "expected=live CUDA execution, actual=foreign/null");
   return state;
@@ -1579,6 +1590,32 @@ CudaExecution make_cuda_execution(std::string identity,
                                                  cudaStreamNonBlocking),
                        0, 1, identity, 1, ExchangeKind::ExpertCounts,
                        "cudaStreamCreateWithFlags");
+  auto impl = std::make_shared<CudaExecution::Impl>();
+  impl->state = state;
+  impl->token = make_execution_token(std::move(identity), state);
+  return CudaExecution(std::move(impl));
+}
+
+CudaExecution make_external_cuda_execution(
+    std::string identity, std::uint32_t device_ordinal, CUstream_st *stream,
+    std::shared_ptr<const void> stream_owner) {
+  if (!stream_owner)
+    invalid("external CUDA execution requires a stream owner");
+  int current_device = -1;
+  internal::throw_cuda("external-execution", cudaGetDevice(&current_device),
+                       0, 1, identity, 1, ExchangeKind::ExpertCounts,
+                       "cudaGetDevice");
+  if (current_device != static_cast<int>(device_ordinal))
+    invalid("external CUDA execution must use the current device");
+  unsigned flags = 0;
+  internal::throw_cuda("external-execution", cudaStreamGetFlags(stream, &flags),
+                       0, 1, identity, 1, ExchangeKind::ExpertCounts,
+                       "cudaStreamGetFlags");
+  auto state = std::make_shared<CudaExecutionState>();
+  state->device = device_ordinal;
+  state->stream = stream;
+  state->owns_stream = false;
+  state->stream_owner = std::move(stream_owner);
   auto impl = std::make_shared<CudaExecution::Impl>();
   impl->state = state;
   impl->token = make_execution_token(std::move(identity), state);
@@ -1634,7 +1671,7 @@ ExternalCudaProducer make_external_cuda_producer(
     RankCollectiveContext context, std::uint32_t device_ordinal,
     CUstream_st *producer_stream, std::shared_ptr<const void> stream_owner,
     std::string identity) {
-  if (!context || !producer_stream || !stream_owner || identity.empty())
+  if (!context || !stream_owner || identity.empty())
     invalid("phase=external-cuda-producer-create, field=context/stream/owner/identity, rank=n/a, expected=all valid, actual=empty");
   int device_count = 0;
   internal::throw_cuda("external-cuda-producer-create",
@@ -1653,8 +1690,8 @@ ExternalCudaProducer make_external_cuda_producer(
   backend->device = device_ordinal;
   backend->stream = reinterpret_cast<cudaStream_t>(producer_stream);
   backend->stream_owner = std::move(stream_owner);
-  backend->execution = make_execution_token(std::move(identity), backend);
   auto state = std::make_shared<ExternalCudaProducer::State>();
+  state->execution = make_execution_token(std::move(identity), backend);
   state->backend = std::move(backend);
   return ExternalCudaProducer(std::move(state));
 }
@@ -1724,8 +1761,8 @@ CudaRouteInput ExternalCudaProducer::publish_selected_experts(
   impl->allocation = std::move(allocation);
   impl->device_ptr = device_data;
   impl->producer_session = state_->backend->context.session();
-  impl->producer_execution = state_->backend->execution;
-  impl->consumer_execution = state_->backend->execution;
+  impl->producer_execution = state_->execution;
+  impl->consumer_execution = state_->execution;
   impl->device = state_->backend->device;
   impl->generation = state_->backend->context.session().generation();
   impl->ready_recorded = true;
@@ -1746,7 +1783,7 @@ CudaGateInput ExternalCudaProducer::publish_gates(
           state_->backend->context.session().stable_identity_bytes() ||
       route.generation != state_->backend->context.session().generation() ||
       route.device != state_->backend->device ||
-      !route.producer_execution.same_instance(state_->backend->execution))
+      !route.producer_execution.same_instance(state_->execution))
     invalid("phase=external-gate-publish, field=route_provenance, rank=" +
             std::to_string(state_->backend->context.calling_rank()) +
             ", expected=exact producer route lease, actual=mismatch");
@@ -1778,8 +1815,8 @@ CudaGateInput ExternalCudaProducer::publish_gates(
   impl->device_ptr = device_data;
   impl->bound_routes = exact_routes;
   impl->producer_session = state_->backend->context.session();
-  impl->producer_execution = state_->backend->execution;
-  impl->consumer_execution = state_->backend->execution;
+  impl->producer_execution = state_->execution;
+  impl->consumer_execution = state_->execution;
   impl->device = state_->backend->device;
   impl->generation = state_->backend->context.session().generation();
   impl->ready_recorded = true;
@@ -2437,13 +2474,15 @@ CudaNotifyWorkspace allocate_cuda_notify_workspace(
 std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
     const CudaNotifyWorkspacePlan &max_plan,
     const CudaExecution &execution,
-    std::uint32_t max_inflight_consumers) {
+    std::uint32_t max_inflight_consumers,
+    bool unstable_inference_rows) {
   if (!execution)
     invalid("phase=device-pool-allocate, field=execution, rank=n/a, "
             "expected=valid, actual=empty");
   const auto exec = internal::checked_execution_state(execution);
   auto result = std::make_shared<CudaNotifyPoolAllocation>();
   result->max_plan = max_plan;
+  result->unstable_inference_rows = unstable_inference_rows;
   result->route = std::make_shared<CudaAllocation>();
   result->workspace = std::make_shared<CudaAllocation>();
   result->receive = std::make_shared<ReceiveMetadata>();
@@ -2568,10 +2607,18 @@ void DeviceNotifyPoolBridge::configure_communication(
   properties.size = sizeof(properties);
   properties.magic = NCCL_API_MAGIC;
   properties.version = NCCL_VERSION_CODE;
+#if WEFTMOE_ENABLE_GIN_RDMA
   if (ncclCommQueryProperties(nccl->comm, &properties) != ncclSuccess ||
       (allocation->max_plan.num_nodes > 1 &&
        properties.railedGinType == NCCL_GIN_TYPE_NONE))
     return;
+#else
+  if (allocation->max_plan.num_nodes > 1)
+    invalid("this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and cannot exchange "
+            "expert counts across nodes");
+  if (ncclCommQueryProperties(nccl->comm, &properties) != ncclSuccess)
+    return;
+#endif
   auto resource = std::make_shared<NotifyCommunication>();
   resource->session = session;
   resource->device = execution.device_ordinal();
@@ -2585,6 +2632,7 @@ void DeviceNotifyPoolBridge::configure_communication(
                   sizeof(std::uint64_t), "notify exchange bytes"),
       "notify exchange bytes");
   ncclDevCommRequirements_t req = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+#if WEFTMOE_ENABLE_GIN_RDMA
   req.barrierCount = resource->view.remote ? 1 : 0;
   req.lsaBarrierCount = 1;
   req.ginContextCount = resource->view.remote ? 1 : 0;
@@ -2592,6 +2640,19 @@ void DeviceNotifyPoolBridge::configure_communication(
   req.ginQueueDepth = 1024;
   req.ginConnectionType = resource->view.remote ? NCCL_GIN_CONNECTION_FULL
                                                 : NCCL_GIN_CONNECTION_NONE;
+#else
+  // Single-node build: only the LSA (intra-node) exchange is compiled in, so
+  // no GIN context, queue, or connection is requested from the device
+  // communicator. The exchange window itself is still required by the LSA
+  // path below.
+  resource->view.remote = false;
+  req.barrierCount = 0;
+  req.lsaBarrierCount = 1;
+  req.ginContextCount = 0;
+  req.ginExclusiveContexts = false;
+  req.ginQueueDepth = 0;
+  req.ginConnectionType = NCCL_GIN_CONNECTION_NONE;
+#endif
   const auto check = [&](ncclResult_t result, const char *what) {
     internal::throw_nccl("notify-pool", result, session.rank(), nccl->world,
                          session.session().identity(),
@@ -2713,6 +2774,7 @@ CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
   state->allocation = allocation->workspace;
   state->receive = allocation->receive;
   state->communication = allocation->communication;
+  state->unstable_inference_rows = allocation->unstable_inference_rows;
   state->slot_lease = std::move(slot_lease);
   auto impl = std::make_shared<CudaNotifyWorkspace::Impl>();
   impl->state = std::move(state);
@@ -3635,6 +3697,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   const auto notify_digest = stable_session_id(notify_wire);
   const auto comm_view = state->communication ? state->communication->view
                                               : NotifyCommunicationView{};
+  const bool single_node_inference =
+      state->single_kernel && state->unstable_inference_rows;
   int sms = 0, resident = 0;
   internal::throw_cuda("device-materialize",
                        cudaDeviceGetAttribute(
@@ -3645,8 +3709,11 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   internal::throw_cuda("device-materialize",
                        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                            &resident,
-                           state->single_kernel ? single_notify_kernel
-                                                : materialize_notify_kernel,
+                           single_node_inference
+                               ? single_node_inference_notify_kernel
+                               : (state->single_kernel
+                                      ? single_notify_kernel
+                                      : materialize_notify_kernel),
                            256, 0),
                        rank, plan.world_size, context.session().identity(),
                        context.session().generation(),
@@ -3662,7 +3729,9 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   cooperative.val.cooperative = 1;
   cudaLaunchConfig_t launch{};
   const auto work_blocks = std::max<std::uint64_t>(
-      (plan.route_count + 1023) / 1024, (plan.num_experts + 7U) / 8U);
+      (plan.route_count + 1023) / 1024,
+      (plan.num_experts + WEFTMOE_NOTIFY_EXPERTS_PER_CTA - 1U) /
+          WEFTMOE_NOTIFY_EXPERTS_PER_CTA);
   // Cooperative synchronization requires the entire grid to remain resident.
   // Use the occupancy limit to hide memory latency on larger route tables.
   launch.gridDim = dim3(static_cast<unsigned>(std::max<std::uint64_t>(
@@ -3689,8 +3758,10 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   };
   internal::throw_cuda(
       "device-materialize",
-      state->single_kernel ? enqueue(single_notify_kernel)
-                           : enqueue(materialize_notify_kernel),
+      single_node_inference
+          ? enqueue(single_node_inference_notify_kernel)
+          : (state->single_kernel ? enqueue(single_notify_kernel)
+                                  : enqueue(materialize_notify_kernel)),
       rank, plan.world_size, context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
       "fused notify materialization");

@@ -53,10 +53,11 @@ print(result["benchmark"]["record"])
 ```
 
 This entry point executes generated benchmark inputs through the native rank
-launchers. It does not accept application tensors: direct tensor-based forward
-and backward bindings are not implemented yet. Python-driven runtime
-compilation and autotuning are supported; automatic tuning on a tensor
-operator's first call is not.
+launchers. Application tensors use the separate, explicitly prepared
+[`TensorRuntime`](weftmoe/runtime.py) API. The Qwen3.5 AReaL integration and its
+additional binding build are described in [the integration guide](docs/areal_qwen35.md).
+Python-driven benchmark compilation and autotuning are supported; automatic
+tuning on a tensor operator's first call is not.
 
 Without autotuning, the entry point compiles one configuration and runs 30
 measured iterations. The single-node defaults use 24 relay CTAs for forward

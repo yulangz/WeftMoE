@@ -4,9 +4,13 @@ __pycache__/
 *.pyc
 
 /benchmarks/results/
-/docs/
+/codex-exports/
+/docs/*
+!/docs/areal_qwen35.md
+!/docs/static_forward_v4_design.md
 /dist/
 /*.egg-info/
+/server_parity*.json
 /weftmoe/lib/
 /weftmoe/include/
 results/

@@ -271,7 +271,7 @@ def captured_text(capture):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--world", type=int, choices=(1, 2, 8), required=True)
+    parser.add_argument("--world", type=int, choices=(1, 2, 4, 8), required=True)
     parser.add_argument("--seed", type=int, default=0x5EED1234)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--rounds", type=int)
