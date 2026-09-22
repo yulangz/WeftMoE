@@ -2,7 +2,8 @@
 
 // Included inside forward_unified_transport. The three control warps of every
 // homogeneous CTA form one static destination-pull team. Their global-stride
-// row enumeration needs no work queue or special transport CTA.
+// row enumeration needs no work queue or special transport CTA. Network mode
+// pulls from node-local registered replicas after the GIN dispatch boundary.
 template <unsigned Threads, unsigned SegmentBytes>
 struct alignas(128) StaticV4Shared {
   static_assert(Threads % 32U == 0U);
@@ -15,13 +16,12 @@ struct alignas(128) StaticV4Shared {
 };
 
 template <class Storage>
-__device__ __forceinline__ void static_v4_copy_row(
-    Storage &s, unsigned warp, const void *source, void *target,
-    unsigned bytes) {
+__device__ __forceinline__ void
+static_v4_copy_row(Storage &s, unsigned warp, const void *source, void *target,
+                   unsigned bytes) {
   auto *buffer = s.staging + warp * Storage::kSegmentBytes;
   auto &full = s.row_prefetch_full[warp];
-  for (unsigned offset = 0U; offset < bytes;
-       offset += Storage::kSegmentBytes) {
+  for (unsigned offset = 0U; offset < bytes; offset += Storage::kSegmentBytes) {
     const auto extent = min(Storage::kSegmentBytes, bytes - offset);
     ::cuda::device::experimental::cp_async_bulk_global_to_shared(
         buffer, static_cast<const char *>(source) + offset, extent, full);
@@ -34,12 +34,11 @@ __device__ __forceinline__ void static_v4_copy_row(
   }
 }
 
-template <unsigned Threads, unsigned BaseThread, class Storage>
-__device__ __forceinline__ void static_v4_run_single_node(
-    const ForwardKernelArgs &a,
-    persistent_v3::ForwardPipelineControl &control,
-    unsigned long long *scheduler,
-    Storage &s) {
+template <unsigned Threads, unsigned BaseThread, bool Network, class Storage>
+__device__ __forceinline__ void
+static_v4_run_pull(const ForwardKernelArgs &a,
+                   persistent_v3::ForwardPipelineControl &control,
+                   unsigned long long *scheduler, Storage &s) {
   const unsigned tid = local_thread<BaseThread>();
   const unsigned warp = tid / 32U;
   const unsigned lane = tid % 32U;
@@ -55,12 +54,12 @@ __device__ __forceinline__ void static_v4_run_single_node(
   const auto *row_count = a.dispatch.expert_row_count;
   const auto *source_count = a.fused_local_expert_count;
   const auto *route_table = a.fused_source_routes;
-  auto *canonical = peer_at<transport::BFloat16>(
-      a.local_base, a.canonical_rows_offset);
+  auto *canonical =
+      peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *canonical_gates =
       peer_at<float>(a.local_base, a.canonical_gates_offset);
-  auto *headers = peer_at<static_v4::RouteHeader>(
-      a.local_base, a.direct_headers_offset);
+  auto *headers =
+      peer_at<static_v4::RouteHeader>(a.local_base, a.direct_headers_offset);
   const auto global_warp =
       static_cast<std::uint64_t>(blockIdx.x) * Storage::kWarps + warp;
   const auto global_warps =
@@ -80,51 +79,73 @@ __device__ __forceinline__ void static_v4_run_single_node(
     // deterministic pull order, this keeps neighboring pull warps from
     // converging on one NVLink peer.  All lanes participate in the small
     // rank reduction; lane zero remains the sole TMA issuer.
-    const auto source_rows = lane < a.world
-                                 ? static_cast<std::uint32_t>(source_count[
-                                       static_cast<std::uint64_t>(lane) * owned +
-                                       local_expert])
-                                 : 0U;
-    auto slot = static_cast<std::uint32_t>(expert_row);
     std::uint32_t source = 0U;
     std::uint32_t source_slot = 0U;
-    std::uint32_t peeled = 0U;
-    while (true) {
-      const auto remaining =
-          source_rows > peeled ? source_rows - peeled : 0U;
-      const auto active =
-          __reduce_add_sync(0xffffffffU, remaining != 0U);
-      const auto layer = __reduce_min_sync(
-          0xffffffffU, remaining ? remaining : 0xffffffffU);
-      const auto rectangle = active * layer;
-      if (slot < rectangle) {
-        const auto active_mask =
-            __ballot_sync(0xffffffffU, remaining != 0U);
-        source = __fns(active_mask, 0U, slot % active + 1U);
-        source_slot = peeled + slot / active;
-        break;
+    if constexpr (Network) {
+      static_v4::decode_source_row(a, local_expert, expert_row, source,
+                                   source_slot);
+    } else {
+      const auto source_rows =
+          lane < a.world
+              ? static_cast<std::uint32_t>(
+                    source_count[static_cast<std::uint64_t>(lane) * owned +
+                                 local_expert])
+              : 0U;
+      auto slot = static_cast<std::uint32_t>(expert_row);
+      std::uint32_t peeled = 0U;
+      while (true) {
+        const auto remaining = source_rows > peeled ? source_rows - peeled : 0U;
+        const auto active = __reduce_add_sync(0xffffffffU, remaining != 0U);
+        const auto layer =
+            __reduce_min_sync(0xffffffffU, remaining ? remaining : 0xffffffffU);
+        const auto rectangle = active * layer;
+        if (slot < rectangle) {
+          const auto active_mask = __ballot_sync(0xffffffffU, remaining != 0U);
+          source = __fns(active_mask, 0U, slot % active + 1U);
+          source_slot = peeled + slot / active;
+          break;
+        }
+        slot -= rectangle;
+        peeled += layer;
       }
-      slot -= rectangle;
-      peeled += layer;
     }
 
     if (lane == 0U) {
-      const auto route =
-          route_table[(static_cast<std::uint64_t>(local_expert) * a.world +
-                       source) *
-                          a.max_routes_per_rank +
-                      source_slot];
+      std::uint32_t route, return_row;
+      const transport::BFloat16 *source_input;
+      const float *source_gates;
+      if constexpr (Network) {
+        const auto expert = a.rank * owned + local_expert;
+        const auto *prefix = static_v4::source_prefix(a, source);
+        const auto index = prefix[expert] + source_slot;
+        route = static_v4::source_pointer<const std::uint32_t>(
+            a, source, a.static_network.routes)[index];
+        const auto experts_per_node =
+            a.dispatch.identity.num_experts / a.dispatch.identity.num_nodes;
+        return_row = source / a.local_world_size == a.node
+                         ? route
+                         : static_cast<std::uint32_t>(
+                               index - prefix[a.node * experts_per_node]);
+        source_input = static_v4::source_pointer<const transport::BFloat16>(
+            a, source, a.static_network.input);
+        source_gates = static_v4::source_pointer<const float>(
+            a, source, a.static_network.gates);
+      } else {
+        route = route_table[(std::uint64_t(local_expert) * a.world + source) *
+                                a.max_routes_per_rank +
+                            source_slot];
+        return_row = route;
+        source_input = peer_at<const transport::BFloat16>(
+            a.peer_bases[source], a.source_input_offset);
+        source_gates = peer_at<const float>(a.peer_bases[source],
+                                            a.fused_source_gates_offset);
+      }
       const auto token = route / a.dispatch.identity.top_k;
-      const auto *source_input = peer_at<const transport::BFloat16>(
-          a.peer_bases[source], a.source_input_offset);
-      const auto gate =
-          peer_at<const float>(a.peer_bases[source],
-                               a.fused_source_gates_offset)[route];
-      headers[row] = static_v4::RouteHeader{route, source};
+      const auto gate = source_gates[route];
+      headers[row] = static_v4::RouteHeader{return_row, source};
       canonical_gates[row] = gate;
       static_v4_copy_row(
-          s, warp, source_input + token * a.hidden,
-          canonical + row * a.hidden,
+          s, warp, source_input + token * a.hidden, canonical + row * a.hidden,
           static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
       // Destination-pull writes the canonical row into this GPU.  Waiting for
       // the bulk store and publishing a device-scope release is sufficient;
@@ -134,11 +155,10 @@ __device__ __forceinline__ void static_v4_run_single_node(
       __threadfence();
       const auto mtile = a.dispatch.mtile_row_offsets[local_expert] +
                          expert_row / forward_tuning::kTileM;
-      auto *arrived = peer_at<unsigned long long>(
-          a.local_base, a.x_arrived_rows_offset);
+      auto *arrived =
+          peer_at<unsigned long long>(a.local_base, a.x_arrived_rows_offset);
       static_v4::reduce_add_release_device(
-          arrived + mtile * a.local_world_size +
-              a.rank % a.local_world_size,
+          arrived + mtile * a.local_world_size + a.rank % a.local_world_size,
           1ULL);
       peer_rows += source != a.rank;
     }
@@ -161,7 +181,6 @@ __device__ __forceinline__ void static_v4_run_single_node(
   }
   domain_sync<Storage::kThreads>();
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, tid == 0U, TransportRoleDone,
-                             ProxyRelay, blockIdx.x, 0ULL,
-                             execution_epoch(a));
+                             ProxyRelay, blockIdx.x, 0ULL, execution_epoch(a));
   (void)scheduler;
 }

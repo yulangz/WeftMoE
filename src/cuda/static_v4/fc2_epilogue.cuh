@@ -2,8 +2,8 @@
 
 // Included inside forward_compute_detail after the fragment-layout and named
 // barrier helpers.  Keeping this specialization out of the generic epilogue
-// avoids carrying peer addressing through the training and multi-node paths.
-template <class TileMma>
+// avoids carrying inference-only peer addressing through the training path.
+template <class TileMma, bool Network = false>
 __device__ __forceinline__ void static_v4_push_fc2_tile(
     const ForwardKernelArgs &a, transport::BFloat16 *tile, float *accum,
     std::uint64_t canonical_row, std::uint32_t valid_rows,
@@ -29,9 +29,14 @@ __device__ __forceinline__ void static_v4_push_fc2_tile(
   for (auto row = threadIdx.x / kRowLanes; row < valid_rows;
        row += kMathThreads / kRowLanes) {
     const auto &header = static_v4::route_header(a, canonical_row + row);
-    auto *destination = peer_at<transport::BFloat16>(
-        a.peer_bases[header.source_rank], a.contribution_offset);
-    destination += header.contribution_row * a.hidden + column_base;
+    transport::BFloat16 *destination;
+    if constexpr (Network)
+      destination = static_v4::network_fc2_destination(a, header);
+    else
+      destination = peer_at<transport::BFloat16>(
+          a.peer_bases[header.source_rank], a.contribution_offset) +
+          std::uint64_t(header.contribution_row) * a.hidden;
+    destination += column_base;
     for (std::uint32_t column = column_lane * kElements;
          column < forward_tuning::kFc2TileN;
          column += kRowLanes * kElements) {

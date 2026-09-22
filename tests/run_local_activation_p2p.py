@@ -664,60 +664,11 @@ def main():
         if benchmark_mode:
             if args.forward_benchmark:
                 if os.getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"):
-                    samples = [
-                        [float(value) for value in item["samples"].split(",")]
-                        for item in observed]
-                    if len(samples) != args.world or any(
-                            len(row) != args.rounds - 10 for row in samples):
-                        raise AssertionError(
-                            "incomplete Forward graph benchmark")
-                    slowest = [max(row[i] for row in samples)
-                               for i in range(args.rounds - 10)]
-                    ordered = sorted(slowest)
-                    p50 = ordered[(len(ordered) - 1) // 2]
-                    result = {
-                        "schema": 1,
-                        "benchmark": "forward-graph-replay",
-                        "world": args.world,
-                        "warmup": 10,
-                        "measured": args.rounds - 10,
-                        "batch": int(observed[0]["batch"]),
-                        "per_rank_graph_nodes": [
-                            int(item["graph_nodes"]) for item in observed],
-                        "per_rank_graph_kernel_nodes": [
-                            int(item["graph_kernel_nodes"])
-                            for item in observed],
-                        "per_rank_graph_memcpy_nodes": [
-                            int(item["graph_memcpy_nodes"])
-                            for item in observed],
-                        "per_rank_graph_event_record_nodes": [
-                            int(item["graph_event_record_nodes"])
-                            for item in observed],
-                        "per_rank_graph_event_wait_nodes": [
-                            int(item["graph_event_wait_nodes"])
-                            for item in observed],
-                        "per_rank_device_kernel_us": [
-                            float(item["device_kernel_us"])
-                            for item in observed],
-                        "shape": {
-                            "tokens_per_rank": int(observed[0]["tokens"]),
-                            "hidden": int(observed[0]["hidden"]),
-                            "intermediate": int(
-                                observed[0]["intermediate"]),
-                            "experts": int(observed[0]["experts"]),
-                            "top_k": int(observed[0]["top_k"]),
-                        },
-                        "per_rank_output_hash": [
-                            item["output_hash"] for item in observed],
-                        "slowest_rank_us": {
-                            "mean": statistics.fmean(slowest),
-                            "p50": p50,
-                            "min": ordered[0],
-                            "max": ordered[-1],
-                        },
-                        "slowest_rank_samples_us": slowest,
-                        "per_rank_samples_us": samples,
-                    }
+                    from tools.forward_graph_benchmark import aggregate_forward_graph
+
+                    result = aggregate_forward_graph(observed)
+                    if result["world"] != args.world or result["measured"] != args.rounds - 10:
+                        raise AssertionError("incomplete Forward graph benchmark")
                     print("FORWARD_GRAPH_BENCH_JSON " +
                           json.dumps(result, sort_keys=True))
                     return

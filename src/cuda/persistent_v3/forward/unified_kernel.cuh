@@ -58,13 +58,13 @@ template <bool StaticLocal, bool StaticSchedule> struct Communication {
     if (threadIdx.x >= forward_tuning::kUnifiedCommBase &&
         threadIdx.x < forward_tuning::kUnifiedCommBase +
                           forward_tuning::kUnifiedCommThreads) {
-      if constexpr (StaticLocal) {
-        if constexpr (StaticSchedule)
-          forward_unified_transport::run_static_v4<
-              forward_tuning::kUnifiedCommThreads,
-              forward_tuning::kUnifiedCommBase>(a, control, scheduler,
-                                                 storage);
-        else if constexpr (forward_tuning::kUnifiedSplitNvlink)
+      if constexpr (StaticSchedule) {
+        forward_unified_transport::run_static_v4<
+            forward_tuning::kUnifiedCommThreads,
+            forward_tuning::kUnifiedCommBase, !StaticLocal>(
+            a, control, scheduler, storage);
+      } else if constexpr (StaticLocal) {
+        if constexpr (forward_tuning::kUnifiedSplitNvlink)
           forward_unified_transport::run_local_warps<
               forward_tuning::kUnifiedCommThreads,
               forward_tuning::kUnifiedCommBase>(a, control, scheduler, storage);
@@ -99,7 +99,7 @@ __global__ __launch_bounds__(
   __shared__ unsigned kind, return_mblock, pair_operand;
   __shared__ forward_compute_detail::ComputePairState pair;
   if constexpr (StaticSchedule) {
-    if (a.fused_single_node_routes && blockIdx.x == 0U && threadIdx.x == 0U) {
+    if (a.fused_inference_routes && blockIdx.x == 0U && threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       *status = {};
@@ -126,18 +126,21 @@ __global__ __launch_bounds__(
   // generation initialization. Every thread waits before reading its output.
   programmatic_launch::wait();
   if constexpr (StaticSchedule) {
-    if (a.fused_single_node_routes) {
+    if (a.fused_inference_routes) {
       if (blockIdx.x == 0U && threadIdx.x == 0U)
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
             ->route_exchange_start_clock = device_globaltimer_ns();
-      static_v4::route_exchange(a, storage);
+      if constexpr (StaticLocal)
+        static_v4::route_exchange(a, storage);
+      else
+        static_v4::network_route_exchange(a, storage);
       if (blockIdx.x == 0U && threadIdx.x == 0U)
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
             ->route_exchange_complete_clock = device_globaltimer_ns();
     }
   }
   if (a.dispatch.runtime && a.dispatch.runtime->error) {
-    if (a.fused_single_node_routes) {
+    if (a.fused_inference_routes) {
       // The fused failure path stays collectively live and is reported by the
       // normal terminal status agreement.  Returning one rank here could
       // strand a peer in Dispatch.
@@ -215,8 +218,12 @@ __global__ __launch_bounds__(
         &pair_operand, &output_store_map, pair);
   }
   if constexpr (StaticSchedule) {
-    if (threadIdx.x < forward_compute_detail::kMathThreads)
-      static_v4::before_combine(a);
+    if (threadIdx.x < forward_compute_detail::kMathThreads) {
+      if constexpr (StaticLocal)
+        static_v4::before_combine(a);
+      else
+        static_v4::network_before_combine(a);
+    }
     static_v4::collective_scope_sync<
         forward_tuning::kUnifiedThreads,
         static_v4::kCollectiveJoinBarrier>();
@@ -234,16 +241,25 @@ __global__ __launch_bounds__(
     const auto reduce_role = StaticSchedule && reduce_roles
                                  ? (blockIdx.x + reduce_roles / 2U) % reduce_roles
                                  : blockIdx.x;
-    if constexpr (StaticSchedule)
-      forward_compute_detail::reduce_role<StaticLocal, 256U, true>(
-          a, reduce_role, reduce_roles);
-    else
+    if constexpr (StaticSchedule) {
+      if (!peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->error)
+        forward_compute_detail::reduce_role<StaticLocal, 256U, true>(
+            a, reduce_role, reduce_roles);
+    } else
       forward_compute_detail::reduce_role<StaticLocal, 256U>(
           a, reduce_role, reduce_roles);
   }
   if constexpr (StaticSchedule) {
-    if (threadIdx.x >= forward_compute_detail::kMathThreads)
-      static_v4::after_combine(a);
+    if constexpr (!StaticLocal)
+      static_v4::collective_scope_sync<
+          forward_tuning::kUnifiedThreads,
+          static_v4::kCollectiveJoinBarrier>();
+    if (threadIdx.x >= forward_compute_detail::kMathThreads) {
+      if constexpr (StaticLocal)
+        static_v4::after_combine(a);
+      else
+        static_v4::network_after_combine(a);
+    }
   }
   else {
     __syncthreads();

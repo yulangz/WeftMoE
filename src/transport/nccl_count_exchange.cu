@@ -1998,9 +1998,6 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
       config.max_inflight_consumers == 0)
     invalid("phase=device-pool-create, field=input, rank=n/a, "
             "expected=valid nonzero capacity, actual=invalid");
-  if (config.enable_unstable_inference_rows &&
-      config.capacity_config.topology.num_nodes != 1)
-    invalid("unstable inference row assignment is single-node only");
   validate_runtime_config(config.capacity_config);
   if (config.capacity_config.topology.world_size !=
           base_session.session().world_size() ||
@@ -2352,7 +2349,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   bool fused_forward_only =
       direct_routes && direct_gates && impl_->pool &&
       impl_->pool->config.enable_unstable_inference_rows &&
-      request.config.topology.num_nodes == 1U &&
+      std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr &&
       request.config.num_experts % request.config.topology.world_size == 0U;
   const auto fused_owned =
       fused_forward_only

@@ -7,7 +7,10 @@
 
 单机 inference-only V4 已经完成一次按 MegaMOE 数据面重写。本节是当前实现
 的准绳；后文保留了最初的设计推演，其中 source-push 等已被实测否定的选择
-不再代表当前单机实现。训练和多机仍保持 V3。
+不再代表当前单机实现。多机 inference-only 已实现第 6.0 节的完整 invocation
+arena 协议；训练仍保持 V3。两机 EP8/EP16 的 1、64、8192、20480 token/rank
+均已通过 eager/graph PyTorch 数值校验；EP8 还通过空 rank、不等长输入、重复
+expert、热点路由、动态路由图回放及双层共享 workspace 校验。
 
 - route exchange、X/gate staging、destination pull、FC1/SwiGLU、FC2、Return/Combine 和
   终止清理已物理融合在一个 kernel 中。inference steady state 每层只有一个
@@ -44,8 +47,9 @@ MegaMOE 同 shape 的 graph kernel 是 62.6 us，但图外三份 input copy 是 
 CUDA Graph replay、graph 销毁/offload 与 workspace 生命周期回归。平衡微基准在
 多轮 graph replay 后的 8 个 rank output hash 也与固定期望值完全一致。
 
-状态：设计与实现记录；单机 inference-only V4 融合路径已通过 EP8 门禁，
-多机与 training 重构尚未实现
+状态：单机与多机 inference-only V4 已实现；多机性能记录见
+[`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
+training 重构尚未实现，不属于本次 inference-only 改造。
 
 日期：2026-09-22
 
@@ -389,7 +393,7 @@ TMA producer 区域和若干 communication warps，具体线程布局由 autotun
   是三种不同事件。weak signal 自身不能替代 flush/acquire，远端 credit 也不能
   代替本地 NIC completion 后才可复用 TX storage 的条件。
 
-首版多机 inference 将使用完整 invocation arena，取消 activation ring 的复用
+首版多机 inference 使用完整 invocation arena，取消 activation ring 的复用
 依赖。跨机数据按 source rail 推送一次到目标节点的注册 staging，目标节点再用
 现有静态 destination-pull 填充 canonical rows。这里的 pull 只发生在节点内部。
 每个 source 的 route list 按 expert 紧凑排列，附带 expert prefix/count；不发送
@@ -406,7 +410,17 @@ terminal packet 或 task claim。首先验证阶段间有明确边界的单 kern
 Dispatch/Return 与计算的重叠作为后续独立优化测量，不能宣称首版已经具备这种重叠。
 容量随节点数和公开的 token capacity 推导，循环与 offset 不假设恰好两机。
 不同 source 可有不同实际 token 数，传输长度必须取 source 发布的实际计数。
+pool 的容量、H/I、expert shard 和每节点 rank 数是整个 EP 组的对称合同；
+expert 必须均匀连续分片。实际接收行数由设备计数，超出调用者预留容量时
+集体报错，不要求调用者总是分配 `world * max_tokens * top_k` 行。
 目前硬件只能验证两机；三机以上需要后续实机门禁。
+
+实现模块：`static_v4/route_plan.cuh` 共享 combine order 和 M128 geometry，
+`destination_pull.cuh` 共享节点内 pull，`initialize.cuh`/`collective.cuh` 共享
+grid/节点内同步；`network_{layout,access,route_exchange,collective}` 只负责
+注册区地址、跨机发布与 GIN 阶段边界。FC1/FC2 静态 wave 和数值 micro-kernel
+仍是同一份实现。每个 GIN context 由唯一 CTA owner 使用，并分别执行 Put fence，
+之后节点内 rank barrier 才允许其他 GPU 消费该 rail 的数据。
 
 以下 6.1–6.3 保留为后续有界流式传输的设计候选，不作为首版 ring 协议已经完备
 的声明。

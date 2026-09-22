@@ -2303,7 +2303,7 @@ CudaGateInput DeviceGateProvenanceBridge::reissue_for_testing(
 
 const float *
 DeviceGateProvenanceBridge::device_pointer(const CudaGateInput &gates) {
-  if (!gates.impl_ || !gates.impl_->device_ptr)
+  if (!gates.impl_ || (gates.impl_->routes && !gates.impl_->device_ptr))
     invalid("phase=device-gate-view, field=gate, rank=n/a, expected=valid, actual=empty");
   return gates.impl_->device_ptr;
 }
@@ -3719,7 +3719,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   const auto comm_view = state->communication ? state->communication->view
                                               : NotifyCommunicationView{};
   const bool single_node_inference =
-      state->single_kernel && state->unstable_inference_rows;
+      state->single_kernel && state->unstable_inference_rows &&
+      config.topology.num_nodes == 1U;
   int sms = 0, resident = 0;
   internal::throw_cuda("device-materialize",
                        cudaDeviceGetAttribute(
@@ -4109,7 +4110,8 @@ DeviceDispatchHandle DeviceNotifyPoolBridge::run_single(
   state->single_kernel = true;
   const auto owned = config.num_experts / config.topology.world_size;
   bool fused_forward_notify =
-      state->unstable_inference_rows && config.topology.num_nodes == 1U &&
+      state->unstable_inference_rows &&
+      std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr &&
       owned * config.topology.world_size == config.num_experts;
   for (std::uint32_t expert = 0;
        fused_forward_notify && expert < config.num_experts; ++expert)
@@ -4212,12 +4214,16 @@ DeviceDispatchHandle DeviceNotifyPoolBridge::run_single(
   const auto config_identity = stable_session_id(wire);
   impl->identity.config_digest_word0 = config_identity.word0;
   impl->identity.config_digest_word1 = config_identity.word1;
-  impl->capacity = {plan.max_tokens_per_rank, plan.max_incoming_rows};
+  const auto row_capacity = config.capacity.workspace_rows_per_rank.empty()
+      ? plan.max_incoming_rows
+      : std::min(plan.max_incoming_rows,
+                 config.capacity.workspace_rows_per_rank[context.calling_rank()]);
+  impl->capacity = {plan.max_tokens_per_rank, row_capacity};
   impl->sizes.route_count = plan.route_count;
   impl->sizes.node_mask_words = plan.node_mask_words;
   impl->sizes.owned_expert_count = owned;
-  impl->sizes.incoming_row_count = plan.max_incoming_rows;
-  impl->sizes.mtile_count = plan.max_incoming_rows;
+  impl->sizes.incoming_row_count = row_capacity;
+  impl->sizes.mtile_count = row_capacity;
   impl->sizes.packet_count = plan.num_tokens;
   impl->sizes.fanout_count = plan.route_count;
   impl->sizes.outgoing_signal_count = 1U;
@@ -4463,7 +4469,7 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
   return view;
 }
 
-bool ActivationTransportBridge::fused_single_node_routes(
+bool ActivationTransportBridge::fused_inference_routes(
     const DeviceDispatchHandle &dispatch) {
   return dispatch.impl_ && dispatch.impl_->fused_forward_notify;
 }

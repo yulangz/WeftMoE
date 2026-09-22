@@ -429,7 +429,7 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
       const auto mapping = claims[mblock];
       const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
       const auto local_mblock = static_cast<std::uint32_t>(mapping);
-      if (forward_mblock_rows_ready<StaticLocal>(
+      if (forward_mblock_rows_ready<true>(
               a, expert, forward_mblock_local_row(local_mblock),
               forward_mblock_valid_rows(a, expert, local_mblock))) {
         task0 = candidate;
@@ -740,7 +740,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
         a.local_base, a.forward_output_rows_offset);
 
     transport_state::GenerationCompletionVector *completion = nullptr;
-    if constexpr (!StaticLocal) {
+    if constexpr (!StaticLocal && !StaticSchedule) {
       if (a.use_gin)
         completion = static_cast<transport_state::GenerationCompletionVector *>(
             a.peer_bases[a.world]);
@@ -1386,7 +1386,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             const auto old =
                 ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
 #if WEFTMOE_DEBUG_VALIDATE
-            if constexpr (!StaticLocal) {
+            if constexpr (!StaticLocal && !StaticSchedule) {
               if (a.use_gin)
                 complete_completion_tasks(completion,
                                           transport_state::TaskClass::Fc1);
@@ -1551,7 +1551,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               auto *output_tile =
                   smem_a + (kFc2Pipelined ? kFc2OutputOffset : 0U);
               if constexpr (StaticSchedule) {
-                static_v4_push_fc2_tile<Fc2TileMma>(
+                static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal>(
                     a, output_tile, accum, row, valid_rows, n);
               } else {
                 const auto warp =
@@ -1685,7 +1685,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 (((old >> 16U) & 0xffffULL) + tile_count == fc2_ntiles) ? 1U
                                                                         : 0U;
 #if WEFTMOE_DEBUG_VALIDATE
-            if constexpr (!StaticLocal) {
+            if constexpr (!StaticLocal && !StaticSchedule) {
               if (a.use_gin)
                 for (unsigned offset = 0; offset < tile_count; ++offset)
                   complete_completion_tasks(completion,

@@ -18,7 +18,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
   const auto lane = threadIdx.x & 31U;
   const auto top_k = SingleRoute ? 1U : a.dispatch.identity.top_k;
 #if WEFTMOE_DEBUG_VALIDATE
-  if constexpr (!StaticLocal) {
+  if constexpr (!StaticLocal && !BulkReady) {
     if (a.use_gin && lane == 0U)
       claim_completion_tasks(completion, transport_state::TaskClass::Reduce);
   }
@@ -28,11 +28,15 @@ __device__ __forceinline__ void reduce_one_token_impl(
 
   unsigned long long lane_route = 0ULL;
   unsigned long long lane_row = 0ULL;
+  unsigned long long lane_pointer = 0ULL;
   if (lane < top_k) {
     const auto slot =
         SingleRoute ? 0U : a.dispatch.combine_order[token * top_k + lane];
     lane_route = token * top_k + slot;
     lane_row = forward_contribution_row(a, lane_route);
+    if constexpr (!StaticLocal && BulkReady)
+      lane_pointer = reinterpret_cast<unsigned long long>(
+          static_v4::network_contribution(a, lane_route));
     // Queue/scan consumers have already acquired every contribution. The
     // static scheduler instead waits for each route's local arrival marker.
     if constexpr (!BulkReady) {
@@ -53,9 +57,11 @@ __device__ __forceinline__ void reduce_one_token_impl(
     for (std::uint32_t order = 0; order < top_k; ++order) {
       const auto row =
           __shfl_sync(0xffffffffU, lane_row, order);
-      const auto *source = contribution;
-      const auto packed =
-          reinterpret_cast<const uint4 *>(source + row * a.hidden)[vector];
+      const auto *source = contribution + row * a.hidden;
+      if constexpr (!StaticLocal && BulkReady)
+        source = reinterpret_cast<const transport::BFloat16 *>(
+            __shfl_sync(0xffffffffU, lane_pointer, order));
+      const auto packed = reinterpret_cast<const uint4 *>(source)[vector];
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
       for (std::uint32_t word = 0; word < 4U; ++word) {
@@ -84,7 +90,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
         control->reduce_tokens_complete.value, 1ULL);
   }
 #if WEFTMOE_DEBUG_VALIDATE
-  if constexpr (!StaticLocal) {
+  if constexpr (!StaticLocal && !BulkReady) {
     if (a.use_gin && lane == 0U)
       complete_completion_tasks(completion, transport_state::TaskClass::Reduce);
   }

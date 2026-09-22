@@ -189,7 +189,7 @@ struct DeviceNotifyResourcePoolConfig {
   std::uint64_t max_config_wire_bytes = 0;
   std::uint32_t max_inflight_generations = 2;
   std::uint32_t max_inflight_consumers = 4;
-  // Single-node inference fast path. Route rows are allocated atomically and
+  // Static inference fast path. Route rows are allocated atomically and
   // are intentionally not stable across invocations. GEMM does not reduce in
   // M and the fixed combine order is retained, so this does not affect FWD
   // numerics. Training must leave this disabled because dW reduces over M.

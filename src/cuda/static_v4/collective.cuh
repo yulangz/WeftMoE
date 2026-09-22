@@ -9,7 +9,7 @@ namespace static_v4 {
 // by a peer, and alternating the sign returns each signal to zero without a
 // separate clear kernel.
 template <unsigned BaseThread, unsigned Threads, bool ReleaseGrid = true,
-          bool EnterGrid = true>
+          bool EnterGrid = true, bool NodeLocal = false>
 __device__ __forceinline__ void rank_barrier(const ForwardKernelArgs &a) {
   // Static V4 kernels run a bounded graph invocation to completion. Keep the
   // cross-rank poll to the phase signal only; V3 retains cancellable waits.
@@ -25,9 +25,11 @@ __device__ __forceinline__ void rank_barrier(const ForwardKernelArgs &a) {
     const auto decrement = state >> 1U;
     auto *local_signal = reinterpret_cast<int *>(words + 4U + phase);
     const auto local_thread = threadIdx.x - BaseThread;
-    if (local_thread < a.world) {
+    const auto peers = NodeLocal ? a.local_world_size : a.world;
+    const auto peer_base = NodeLocal ? a.node * a.local_world_size : 0U;
+    if (local_thread < peers) {
       auto *remote_words = reinterpret_cast<unsigned int *>(
-          peer_at<unsigned long long>(a.peer_bases[local_thread],
+          peer_at<unsigned long long>(a.peer_bases[peer_base + local_thread],
                                       a.forward_scheduler_offset) +
           10ULL + 2ULL * a.world);
       auto *remote_signal =
@@ -38,7 +40,7 @@ __device__ __forceinline__ void rank_barrier(const ForwardKernelArgs &a) {
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     if (local_thread == 0U) {
       atomicAdd(words + 1U, 1U);
-      const auto target = decrement ? 0 : static_cast<int>(a.world);
+      const auto target = decrement ? 0 : static_cast<int>(peers);
       while (static_v4::load_acquire_system(local_signal) != target) {
       }
     }
@@ -87,7 +89,7 @@ clear_dispatch_counters(const ForwardKernelArgs &a) {
        index < count;
        index += static_cast<std::uint64_t>(gridDim.x) * workers)
     arrived[index] = 0ULL;
-  if (a.fused_single_node_routes) {
+  if (a.fused_inference_routes) {
     auto *local_counts = a.fused_local_expert_count;
     auto *send_counts =
         const_cast<std::uint64_t *>(a.dispatch.source_expert_count);
@@ -104,8 +106,8 @@ clear_dispatch_counters(const ForwardKernelArgs &a) {
   }
 }
 
-// Contributions are read remotely during Combine. Do not let a fast rank
-// recycle its slot while another rank still consumes the preceding epoch.
+// Do not let a fast rank recycle its slot while another rank still consumes
+// the preceding epoch's contributions or source staging.
 __device__ __forceinline__ void after_combine(const ForwardKernelArgs &a) {
   // The stream cannot launch the next generation until CTA 0 exits this
   // kernel. Other CTAs need only contribute their cleanup stores and may

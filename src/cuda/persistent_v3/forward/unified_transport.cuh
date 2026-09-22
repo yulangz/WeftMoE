@@ -698,7 +698,7 @@ drain_notifications(const ForwardKernelArgs &a) {
   drain_notifications<BaseThread, false>(a, [&] { return forward_cancelled(a); });
 }
 
-#include "cuda/static_v4/single_node_transport.cuh"
+#include "cuda/static_v4/destination_pull.cuh"
 
 #include "cuda/persistent_v3/forward/unified_gin.cuh"
 
@@ -971,8 +971,8 @@ run_gin(const ForwardKernelArgs &a,
   run_impl<true, BaseThread>(a, control, scheduler, storage);
 }
 
-template <unsigned Threads, unsigned BaseThread, unsigned SegmentBytes,
-          unsigned Buffers, unsigned DispatchLanes>
+template <unsigned Threads, unsigned BaseThread, bool Network = false,
+          unsigned SegmentBytes, unsigned Buffers, unsigned DispatchLanes>
 __device__ __forceinline__ void
 run_static_v4(const ForwardKernelArgs &a,
               persistent_v3::ForwardPipelineControl &control,
@@ -980,7 +980,7 @@ run_static_v4(const ForwardKernelArgs &a,
               Shared<Threads, SegmentBytes, Buffers, DispatchLanes> &storage) {
   using StaticStorage = StaticV4Shared<Threads, SegmentBytes>;
   static_assert(sizeof(StaticStorage) <= sizeof(storage));
-  static_v4_run_single_node<Threads, BaseThread>(
+  static_v4_run_pull<Threads, BaseThread, Network>(
       a, control, scheduler, *reinterpret_cast<StaticStorage *>(&storage));
 }
 

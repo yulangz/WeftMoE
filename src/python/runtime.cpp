@@ -90,13 +90,13 @@ class Runtime {
     for (unsigned e = 0; e < experts; ++e)
       config_.topology.expert_to_rank.push_back(e / (experts / world));
     config_.capacity.workspace_rows_per_rank.assign(world, max_rows);
-    single_node_inference_ =
-        !training && nodes == 1 &&
+    fused_inference_ =
+        !training &&
         std::getenv("WEFTMOE_DISABLE_SINGLE_NODE_INFERENCE") == nullptr;
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
         {config_, max_tokens, 8192, max_saved, 4,
-         single_node_inference_});
+         fused_inference_});
     if (!WEFTMOE_ENABLE_GIN_RDMA && nodes != 1)
       throw std::invalid_argument(
           "this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and supports a "
@@ -364,7 +364,7 @@ class Runtime {
     gates = import_selected_expert_gates(gates, routes, context, execution_);
     bucket->notify_pool = make_device_notify_resource_pool(
         base_, execution_,
-        {config_, tokens, 8192, 1, 4, single_node_inference_});
+        {config_, tokens, 8192, 1, 4, fused_inference_});
     CudaNotifyGenerationCoordinator coordinator(bucket->generation, execution_, bucket->notify_pool);
     bucket->dispatch = coordinator.run_device({config_, routes, gates, tokens}).dispatch();
     buckets_[tokens] = std::move(bucket);
@@ -434,7 +434,7 @@ class Runtime {
   }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
-  bool training_, single_node_inference_ = false;
+  bool training_, fused_inference_ = false;
   cudaStream_t stream_;
   cudaEvent_t input_ready_ = nullptr;
   RuntimeConfig config_;

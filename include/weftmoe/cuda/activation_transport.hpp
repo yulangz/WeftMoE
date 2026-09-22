@@ -167,8 +167,7 @@ struct ForwardMegaKernelConfig {
   // A serialized inference graph may bind its stable application route inputs
   // directly while reusing a shape-compatible Dispatch handle.  This avoids a
   // second set of route/gate staging copies in CUDA Graph replay.  Both buffers
-  // must be provided together; training and the split/multi-node paths reject
-  // them.
+  // must be provided together; training and the legacy split paths reject them.
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
 };

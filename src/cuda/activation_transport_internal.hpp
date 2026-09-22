@@ -162,7 +162,7 @@ public:
   view(DeviceDispatchConsumerLease &consumer);
   static DispatchWaveKernelView
   wave_view(DeviceDispatchConsumerLease &consumer);
-  static bool fused_single_node_routes(const DeviceDispatchHandle &dispatch);
+  static bool fused_inference_routes(const DeviceDispatchHandle &dispatch);
   static const std::int32_t *
   route_pointer(const DeviceDispatchHandle &dispatch);
   static const float *gate_pointer(const DeviceDispatchHandle &dispatch);

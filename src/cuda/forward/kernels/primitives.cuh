@@ -172,7 +172,7 @@ forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
   if ((!a.use_gin && !a.forward_stream_local_dispatch) || valid_rows == 0U)
     return true;
   if constexpr (StaticLocal) {
-    if (a.fused_single_node_routes) {
+    if (a.fused_inference_routes) {
       // Fused inference builds M128 geometry directly. Unlike V3 Notify's
       // smaller tiles, exactly one arrival counter covers this compute tile.
       const auto tile = a.dispatch.mtile_row_offsets[expert] +
@@ -371,11 +371,15 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/persistent_v3/forward/finalize_pipeline.cuh"
 
 #include "cuda/static_v4/contract.cuh"
+#include "cuda/static_v4/network_access.cuh"
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
 
 #include "cuda/forward/initialize_pipeline.cuh"
-#include "cuda/static_v4/single_node_initialize.cuh"
-#include "cuda/static_v4/single_node_collective.cuh"
+#include "cuda/static_v4/initialize.cuh"
+#include "cuda/static_v4/collective.cuh"
+#include "cuda/static_v4/route_plan.cuh"
+#include "cuda/static_v4/network_collective.cuh"
+#include "cuda/static_v4/network_route_exchange.cuh"
 #include "cuda/static_v4/single_node_route_exchange.cuh"
 #include "cuda/static_v4/single_node_finalize.cuh"
 #include "cuda/persistent_v3/forward/unified_kernel.cuh"

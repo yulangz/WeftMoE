@@ -50,7 +50,7 @@ __device__ __forceinline__ void grid_sync(const ForwardKernelArgs &a) {
 // preceding generation clears them before its terminal rank barrier. CTA 0
 // constructs the small expert map together with scalar state, so one grid join
 // publishes the complete generation. V3's rings, dynamic queues and completion
-// vectors do not exist.
+// vectors are not used by either V4 topology specialization.
 __device__ __noinline__ void initialize(const ForwardKernelArgs &a) {
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   auto *scheduler =
@@ -69,7 +69,7 @@ __device__ __noinline__ void initialize(const ForwardKernelArgs &a) {
         atomicAdd(a.runtime_epoch, 1ULL);
       __syncthreads();
     }
-    if (threadIdx.x == 0U && !a.fused_single_node_routes)
+    if (threadIdx.x == 0U && !a.fused_inference_routes)
       *status = {};
 
     if (threadIdx.x < 32U) {
@@ -83,7 +83,7 @@ __device__ __noinline__ void initialize(const ForwardKernelArgs &a) {
     }
 
     if (threadIdx.x == 0U) {
-      if (!a.fused_single_node_routes)
+      if (!a.fused_inference_routes)
         status->start_clock = device_globaltimer_ns();
       status->dispatch_blocks_done = ~0ULL;
       status->relay_blocks_done = ~0ULL;

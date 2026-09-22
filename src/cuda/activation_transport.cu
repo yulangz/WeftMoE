@@ -610,12 +610,18 @@ struct GinExecution {
   std::shared_ptr<GinResources> resources;
   std::unique_lock<std::mutex> lock;
   cudaStream_t stream;
+  bool serialized;
   explicit GinExecution(std::shared_ptr<GinResources> value,
-                        cudaStream_t target)
-      : resources(std::move(value)), stream(target) {
+                        cudaStream_t target, bool serialized_replay = false)
+      : resources(std::move(value)), stream(target),
+        serialized(serialized_replay) {
     if (!resources)
       return;
     lock = std::unique_lock<std::mutex>(resources->mutex);
+    // Serialized graph plans share one stream-owned workspace. The caller
+    // drains it before changing streams; no per-layer event belongs in capture.
+    if (serialized)
+      return;
     const auto error = internal::wait_input_ready(stream, resources->last_use,
                                                   resources->last_capture_id);
     if (error != cudaSuccess)
@@ -623,7 +629,7 @@ struct GinExecution {
                                cudaGetErrorString(error));
   }
   void record() {
-    if (!resources)
+    if (!resources || serialized)
       return;
     const auto error = internal::record_input_ready(resources->last_use, stream,
                                                     resources->last_capture_id);
@@ -4410,10 +4416,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       use_gin || split_local_metadata
           ? ActivationTransportBridge::wave_view(consumer)
           : DispatchWaveKernelView{};
-  const bool fused_single_node_routes =
-      !use_gin && ActivationTransportBridge::fused_single_node_routes(dispatch);
+  const bool fused_inference_routes =
+      ActivationTransportBridge::fused_inference_routes(dispatch);
   const bool static_v4_candidate =
-      forward_tuning::kUnifiedWorkers && !use_gin && id.num_nodes == 1U &&
+      forward_tuning::kUnifiedWorkers &&
+      (!use_gin || fused_inference_routes) &&
       !config.retain_backward_state &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
   const bool serialized_graph_replay =
@@ -4425,7 +4432,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         !config.inference_routes.data || !config.inference_gates.data)
       throw std::invalid_argument(
           "direct inference routes require both buffers and serialized "
-          "single-node inference");
+          "static inference");
     validate_external_cuda_range(
         config.inference_routes.data, view.sizes.route_count,
         config.inference_routes.bytes / sizeof(std::int32_t),
@@ -4468,7 +4475,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   SlotFailureGuard failure_guard{lease, false};
   auto exec = internal::checked_execution_state(backend->execution);
   auto &slot = state->slots[lease->index];
-  GinExecution communication(state->gin_resources, exec->stream);
+  GinExecution communication(state->gin_resources, exec->stream,
+                             serialized_graph_replay);
   const auto &layout = state->layout;
 #if WEFTMOE_DEBUG_VALIDATE
   const auto debug_forward_host_phase = [&](const char *phase) {
@@ -4630,7 +4638,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("generation_init_enqueued");
 #endif
   ForwardKernelArgs args{};
-  if (fused_single_node_routes) {
+  if (fused_inference_routes) {
     view.runtime = at<const DeviceDispatchRuntime>(
         slot.device, layout.fused_dispatch_runtime);
     view.expert_id =
@@ -4664,20 +4672,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   }
   args.dispatch = view;
   args.dispatch_waves = dispatch_waves;
-  args.fused_single_node_routes = fused_single_node_routes;
+  args.fused_inference_routes = fused_inference_routes;
   args.selected_experts =
-      fused_single_node_routes
+      fused_inference_routes
           ? (direct_inference_routes
                  ? static_cast<const std::int32_t *>(
                        config.inference_routes.data)
                  : ActivationTransportBridge::route_pointer(dispatch))
           : nullptr;
   args.fused_local_expert_count =
-      fused_single_node_routes
+      fused_inference_routes
           ? at<std::uint64_t>(slot.device, layout.fused_local_expert_count)
           : nullptr;
   args.fused_source_routes =
-      fused_single_node_routes
+      fused_inference_routes
           ? at<std::uint32_t>(slot.device, layout.fused_source_routes)
           : nullptr;
   args.max_routes_per_rank =
@@ -4735,6 +4743,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.gin_window = gin_backend->windows[lease->index];
 #endif
     args.gin_window_base = slot.gin_window;
+    args.static_network = state->gin_layout.static_forward;
     args.gin_rings = state->gin_layout.rings;
     args.gin_rings.counter_base +=
         lease->index * args.gin_rings.channels() * communication::kRingDepth;
@@ -4866,16 +4875,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const bool split_local_roles =
         !remote_transport && view.identity.num_nodes == 1U;
     const bool split_forward_roles = split_gin_roles || split_local_roles;
-    const bool static_v4_single_node =
-        static_v4_candidate && split_local_roles;
-    if (static_v4_single_node) {
+    const bool static_v4_enabled = static_v4_candidate;
+    if (static_v4_enabled) {
       // Direct FC2 push is made visible by one rank collective. Combine owns
       // immutable token stripes and does not consume V3 route-ready queues.
       args.forward_dynamic_reduce_queue = false;
       args.forward_dynamic_reduce_scan = false;
     }
     cudaError_t launch_forward = cudaSuccess;
-    if (split_forward_roles) {
+    if (split_forward_roles || static_v4_candidate) {
       const auto &ordinary_output_store_map =
           config.retain_backward_state
               ? slot.forward_training_output_store_map
@@ -4926,9 +4934,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           args.gin_receiver_count = args.forward_relay_cta_count;
         }
       }
-      args.forward_stream_local_dispatch = split_local_roles;
+      args.forward_stream_local_dispatch = split_local_roles || static_v4_candidate;
       args.forward_compact_return = forward_tuning::kUnifiedWorkers;
-      if (fused_single_node_routes)
+      if (fused_inference_routes)
         args.forward_compact_return = false;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       // Eight independent row streams per CTA are the Hopper default.
@@ -5013,7 +5021,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             "Forward cluster extent", id.calling_rank,
             "even compute CTA and FC1/FC2 N-tile counts",
             "incompatible two-CTA multicast shape");
-      if (static_v4_single_node) {
+      if (static_v4_enabled) {
         const auto clusters =
             forward_main_compute_ctas / forward_tuning::kClusterSize;
         const auto max_mblocks =
@@ -5041,9 +5049,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       // Reduce after its statically owned GEMM residues retire.
       args.forward_reduce_cta_count = forward_main_compute_ctas;
       if constexpr (forward_tuning::kUnifiedWorkers) {
-        if (static_v4_single_node) {
-          constexpr auto kStaticUnified =
-              unified_forward_entry<true, false, true>();
+        if (static_v4_enabled) {
+          const auto kStaticUnified = use_gin
+              ? unified_forward_entry<false, false, true>()
+              : unified_forward_entry<true, false, true>();
           const auto smem =
               forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();

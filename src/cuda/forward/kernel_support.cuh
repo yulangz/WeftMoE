@@ -1,3 +1,5 @@
+#include "cuda/static_v4/network_layout.hpp"
+
 constexpr std::size_t kAlign = 256;
 
 void CUDART_CB publish_stream_completion(void *opaque) {
@@ -584,6 +586,7 @@ struct Layout {
 // weights, canonical rows, and local-P2P storage stay in ordinary CUDA
 // allocations so enabling the network backend does not change their allocator.
 struct GinWindowLayout {
+  static_v4::NetworkLayout static_forward;
   communication::ChunkRingLayout rings;
   std::size_t send_dispatch_directory = 0;
   std::size_t receive_dispatch_directory = 0;
@@ -639,6 +642,33 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     return layout;
   std::size_t cursor = 0;
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
+  if (config.max_intermediate_size && !config.enable_backward_state) {
+    auto &network = layout.static_forward;
+    const auto experts = checked_mul(config.max_owned_experts,
+                                     config.max_world_size, "V4 experts");
+    const auto routes = checked_mul(config.max_tokens_per_rank,
+                                    config.max_top_k, "V4 source routes");
+    std::size_t source_bytes = 0;
+    append(source_bytes, experts + 2ULL, sizeof(std::uint64_t),
+           "V4 source expert prefixes and error");
+    network.routes = append(source_bytes, routes, sizeof(std::uint32_t),
+                            "V4 expert-ordered source routes");
+    network.gates = append(source_bytes, routes, sizeof(float), "V4 source gates");
+    network.input = append(source_bytes,
+                           checked_mul(config.max_tokens_per_rank,
+                                       config.max_hidden_size, "V4 source input"),
+                           sizeof(transport::BFloat16), "V4 source input");
+    network.source_stride = (source_bytes + kAlign - 1U) & ~(kAlign - 1U);
+    network.source = append(cursor, config.max_nodes, network.source_stride,
+                            "V4 source replicas");
+    network.return_stride = checked_mul(
+        checked_mul(routes, config.max_hidden_size, "V4 Return elements"),
+        sizeof(transport::BFloat16), "V4 Return bytes");
+    network.return_tx = append(cursor, config.max_nodes, network.return_stride,
+                               "V4 Return TX");
+    network.return_rx = append(cursor, config.max_nodes, network.return_stride,
+                               "V4 Return RX");
+  }
   const auto dense_return_row_bytes =
       checked_mul(config.max_hidden_size, sizeof(transport::BFloat16),
                   "GIN hidden row bytes");

@@ -344,6 +344,9 @@ def environment_overrides(args):
         "WEFTMOE_P2P_BENCH_TOKENS",
         "WEFTMOE_COMM_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
+        "WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY",
+        "WEFTMOE_FORWARD_GRAPH_BATCH",
+        "WEFTMOE_DISABLE_STATIC_FORWARD_V4",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
         "WEFTMOE_BENCH_ALLOCATE_TENSORS",
@@ -972,6 +975,22 @@ def main(argv=None):
         print("BUFFER_MODES passed", flush=True)
         return
     if args.scenario == "gin_forward_bench":
+        if os.environ.get("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"):
+            from tools.forward_graph_benchmark import aggregate_forward_graph
+
+            if any(result.returncode for result in outputs):
+                raise RuntimeError("GIN graph benchmark failed:\n" + "\n".join(
+                    f"rank={result.rank} exit={result.returncode}\n"
+                    f"{result.stdout[-3000:]}\n{result.stderr[-3000:]}"
+                    for result in outputs if result.returncode))
+            records = [parse_fields(item.stdout, "FORWARD_GRAPH_BENCH ")
+                       for item in outputs]
+            if len(records) != world or any(item["backend"] != "gin-rdma"
+                                             for item in records):
+                raise RuntimeError("incomplete GIN graph benchmark")
+            print("FORWARD_GRAPH_BENCH_JSON " + json.dumps(
+                aggregate_forward_graph(records), sort_keys=True))
+            return
         failures = []
         evidence = []
         for result in outputs:

@@ -12,7 +12,7 @@ struct ForwardKernelArgs {
   std::uint64_t max_routes_per_rank = 0;
   std::size_t source_input_offset = 0;
   std::size_t fused_source_gates_offset = 0;
-  bool fused_single_node_routes = false;
+  bool fused_inference_routes = false;
   const transport::BFloat16 *input;
   const float *gates;
   const transport::BFloat16 *w1;
@@ -38,6 +38,7 @@ struct ForwardKernelArgs {
 #endif
   void *gin_window_base = nullptr;
   communication::ChunkRingLayout gin_rings;
+  static_v4::NetworkLayout static_network;
   std::size_t local_notification_offset = 0;
   unsigned local_notification_ctas = 0;
   void *gin_sender_done = nullptr;

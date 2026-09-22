@@ -3388,7 +3388,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                (world == 1 || world == 2 || world == 4 || world == 8)) ||
               (benchmark_integrated && (world == 2 || world == 8)))) ||
                 (cross_host_benchmark &&
-                 ((nodes == 2 && (world == 2 || world == 16)) ||
+                 ((nodes >= 2 && world == nodes * gpus_per_node) ||
                   (benchmark_communication && world == nodes * 8U))),
             "CUDA benchmark requires local 1/2/4/8 GPUs or GIN 2x1/2x8 GPUs");
     experts = std::getenv("WEFTMOE_BENCH_EXPERTS")
@@ -3695,7 +3695,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         base, execution,
         {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
          forward_smoke ? 3U : 2U, 4U,
-         benchmark_forward && nodes == 1U &&
+         benchmark_forward &&
              std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr});
   };
   if (!benchmark_forward)
@@ -3872,9 +3872,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     const auto rank_barrier =
         prepare_benchmark_barrier(tensor_allocator, execution_state->stream);
     if (std::getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY") != nullptr) {
-      require(!gin_forward_benchmark && !retain_backward_state &&
+      require(!retain_backward_state &&
                   !allocate_tensors,
-              "Forward graph benchmark requires local inference with reused "
+              "Forward graph benchmark requires inference with reused "
               "tensors");
       forward_config.serialized_graph_replay = true;
       prepare_notify_pool();
@@ -3898,9 +3898,14 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
           generation.session(), execution, transport_config,
           notify.dispatch(), transport_pool);
-      local_forward =
-          std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
-              generation, execution, transport_pool);
+      if (gin_forward_benchmark)
+        gin_forward =
+            std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
+                generation, execution, transport_pool);
+      else
+        local_forward =
+            std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
+                generation, execution, transport_pool);
       input_lease = producer.publish_activations(
           static_cast<const weftmoe::transport::BFloat16 *>(
               activation_storage->device_ptr),
@@ -3915,8 +3920,11 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       check_input_cuda(cudaStreamBeginCapture(execution_state->stream,
                                                cudaStreamCaptureModeGlobal));
       notify.dispatch().enqueue_notify(generation);
-      auto output = local_forward->enqueue(notify.dispatch(), activations,
-                                           weights, forward_config);
+      auto output = gin_forward
+          ? gin_forward->enqueue(notify.dispatch(), activations, weights,
+                                  forward_config)
+          : local_forward->enqueue(notify.dispatch(), activations, weights,
+                                    forward_config);
       cudaGraph_t graph = nullptr;
       cudaGraphExec_t executable = nullptr;
       check_input_cuda(cudaStreamEndCapture(execution_state->stream, &graph));
@@ -3977,6 +3985,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             1099511628211ULL;
       }
       std::cout << "FORWARD_GRAPH_BENCH rank=" << rank
+                << " backend=" << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
                 << " world=" << world << " tokens=" << max_tokens
                 << " experts=" << experts << " top_k=" << top_k
                 << " hidden=" << hidden
