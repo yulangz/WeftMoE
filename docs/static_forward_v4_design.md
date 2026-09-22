@@ -9,8 +9,8 @@
 的准绳；后文保留了最初的设计推演，其中 source-push 等已被实测否定的选择
 不再代表当前单机实现。多机 inference-only 已实现第 6.0 节的完整 invocation
 arena 协议；训练仍保持 V3。两机 EP8/EP16 的 1、64、8192、20480 token/rank
-均已通过 eager/graph PyTorch 数值校验；EP8 还通过空 rank、不等长输入、重复
-expert、热点路由、动态路由图回放及双层共享 workspace 校验。
+均已通过 eager/graph PyTorch 数值校验；空 rank、不等长输入、重复 expert、热点
+路由、动态路由图回放及双层共享 workspace 也纳入同一实机门禁。
 
 - route exchange、X/gate staging、destination pull、FC1/SwiGLU、FC2、Return/Combine 和
   终止清理已物理融合在一个 kernel 中。inference steady state 每层只有一个
@@ -406,7 +406,9 @@ route plan 中的 compact index 直接读取返回值，保持现有 `(expert, t
 相同地址。
 
 所有 rank 经 GPU collective 确认阶段完成后才复用 arena，因此不需要 ring credit、
-terminal packet 或 task claim。首先验证阶段间有明确边界的单 kernel 协议；跨机
+terminal packet 或 task claim。最终版用下一轮 Dispatch barrier 保护 Return TX/RX
+复用，不再额外增加 Combine 后的跨机 barrier；详细复用证明见多机记录。
+首先验证阶段间有明确边界的单 kernel 协议；跨机
 Dispatch/Return 与计算的重叠作为后续独立优化测量，不能宣称首版已经具备这种重叠。
 容量随节点数和公开的 token capacity 推导，循环与 offset 不假设恰好两机。
 不同 source 可有不同实际 token 数，传输长度必须取 source 发布的实际计数。
@@ -596,16 +598,21 @@ arena 的 correctness capacity 遵守第 3.2 节，不能通过 drop 换取固�
 
 ## 10. Kernel specialization 与代码组织
 
-建议新增一条 V4 路径，不直接在 V3 文件中继续堆条件分支：
+当前 V4 控制面独立组织如下，数值主体复用既有模板：
 
 ```text
 src/cuda/static_v4/
   contract.cuh                    # route/header 合同
   memory_order.cuh                # 单向 release/acquire PTX primitives
-  single_node_initialize.cuh      # invocation/pool 初始化
+  initialize.cuh                  # 共享 invocation/pool 初始化
+  route_plan.cuh                  # 共享 combine order/M128 geometry
+  collective.cuh                  # grid/节点内 barrier 与 cleanup
   single_node_route_exchange.cuh  # fused count/table/X staging
-  single_node_transport.cuh       # homogeneous destination-pull
-  single_node_collective.cuh      # EP barrier/cleanup
+  destination_pull.cuh            # 两种拓扑共享的节点内 pull
+  network_layout.hpp              # 注册区布局与静态 context 上限
+  network_access.cuh              # source rail/紧凑 Return 地址
+  network_route_exchange.cuh      # expert 排序与跨机 Dispatch
+  network_collective.cuh          # context-owned GIN put/fence/Return
   fc2_epilogue.cuh                # FC2 contribution publication
   single_node_finalize.cuh        # reduce/finalize
 ```
@@ -613,14 +620,13 @@ src/cuda/static_v4/
 GEMM 与静态 FC1/FC2 task 枚举仍复用 `persistent_v3/forward` 中的数值主体，
 通过 `StaticSchedule` 编译期分支移除 V3 queue/cancellation hot path，不复制一份 GEMM。
 
-Host 侧引入 capacity-based `StaticForwardRuntime`/slot pool。现有 public API 可先由
-adapter 桥接，但 inference hot path 不再构造/消费 CPU-visible `DeviceDispatchHandle`。
-V3 保留为 correctness/performance fallback，直到 V4 完成门禁。
+Host 侧复用 capacity-based pool 和 `TensorRuntime`。`DeviceDispatchHandle` 在
+eager/graph preparation 期间提供容量和地址合同；graph replay 不构造 handle，
+也不执行 CPU Notify 或 `handle.wait()`。V3 保留为训练和显式 fallback。
 
-单机/多机分成不同 translation unit，避免 GIN 状态、分支和 register live range
-污染单机 WGMMA。training/inference 则使用诸如
-`RouteMode`、`RetainBackwardState` 的模板参数，共享相同 task geometry 和 math
-实现。
+单机/多机在同一聚合 translation unit 中实例化为不同 kernel，使用
+`StaticLocal`/`StaticSchedule` 在编译期消除无关 transport 分支；不是运行时
+切换同一 kernel 的 GIN 状态。`RetainBackwardState` 保持训练数值主体的复用。
 
 ## 11. 与 CUDA Graph、slot 和并发 invocation 的关系
 
@@ -629,8 +635,9 @@ V3 保留为 correctness/performance fallback，直到 V4 完成门禁。
 - Inference Graph replay 使用固定 slot 地址和递增/graph-local epoch；routes 和实际
   counts 可在 inference capacity 内变化。memory-tight training 不支持把
   plan/host-allocation/main 整体捕获进 CUDA Graph。
-- 若明确允许不同 stream 上两个 MoE invocation 并发，必须配置两个独立 slot；
-  不能让它们共享 SourceRoute、canonical arena 或 readiness counters。
+- 当前 V4 要求整个 EP 组以相同次序串行调用；两个 slot 不代表多 stream 并发
+  已经安全。未来并发不仅要隔离 SourceRoute/canonical/readiness，还必须隔离
+  GIN context/barrier 状态并证明跨 rank 的 launch 进度；不在本轮支持范围内。
 - inference slot 是 runtime 预分配的 invocation workspace；training tape 是 plan 后
   按实际尺寸分配的独立 lease。二者都不是 FC1/FC2 ring slot 或 SGLang request slot。
 - slot 复用通过 CUDA event/stream dependency 或 graph 固定依赖表达；host 仅在所有

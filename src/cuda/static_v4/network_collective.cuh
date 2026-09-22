@@ -8,7 +8,7 @@ namespace static_v4 {
 template <unsigned BaseThread, unsigned Threads>
 __device__ __forceinline__ void network_barrier(const ForwardKernelArgs &a) {
   grid_sync<BaseThread, Threads>(a);
-  if (blockIdx.x < kNetworkContexts && threadIdx.x == BaseThread) {
+  if (blockIdx.x < a.static_network.contexts && threadIdx.x == BaseThread) {
     const ncclGin gin(a.gin_dev_comm, blockIdx.x);
     ncclGinBarrier(ncclCoopThread{}, gin, ncclTeamTagRail{}, 0U,
                    ::cuda::memory_order_acq_rel, ncclGinFenceLevel::Put);
@@ -23,7 +23,7 @@ network_put(const ForwardKernelArgs &a, unsigned destination_node,
   const auto peer =
       destination_node * a.local_world_size + a.rank % a.local_world_size;
   for (std::size_t offset = blockIdx.x * kNetworkChunkBytes; offset < bytes;
-       offset += kNetworkContexts * kNetworkChunkBytes) {
+       offset += a.static_network.contexts * kNetworkChunkBytes) {
     const auto extent = min(kNetworkChunkBytes, bytes - offset);
     gin.put(ncclTeamWorld(gin.comm), peer, a.gin_window, destination + offset,
             a.gin_window, source + offset, extent, ncclGin_None{},
@@ -39,7 +39,7 @@ network_before_combine(const ForwardKernelArgs &a) {
     status->before_combine_start_clock = device_globaltimer_ns();
   // FC2 on every local GPU has finished writing the rail's TX arena.
   rank_barrier<0U, kThreads, true, true, true>(a);
-  if (blockIdx.x < kNetworkContexts && threadIdx.x == 0U) {
+  if (blockIdx.x < a.static_network.contexts && threadIdx.x == 0U) {
     const auto nodes = a.dispatch.identity.num_nodes;
     const auto experts_per_node = a.dispatch.identity.num_experts / nodes;
     for (unsigned node = 0; node < nodes; ++node) {
@@ -69,9 +69,12 @@ __device__ __forceinline__ void
 network_after_combine(const ForwardKernelArgs &a) {
   constexpr auto kBase = forward_tuning::kMathWarpgroups * 128U;
   constexpr auto kThreads = forward_tuning::kUnifiedThreads - kBase;
-  // The entry joins math readers before allowing another invocation to
-  // overwrite RX. Every context drains before its arena can be recycled.
-  network_barrier<kBase, kThreads>(a);
+  // The entry joins this CTA's readers; finish local cleanup before retiring.
+  // Next invocation's Dispatch writes only source replicas, disjoint from RX.
+  // Its network barrier cannot finish until every rank has completed this
+  // Combine. Only then may FC2 overwrite TX and Return overwrite RX. Thus that
+  // existing boundary protects reuse without a third network barrier here.
+  grid_sync<kBase, kThreads>(a);
 }
 
 } // namespace static_v4

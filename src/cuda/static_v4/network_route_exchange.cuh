@@ -82,7 +82,7 @@ __device__ __noinline__ void network_route_exchange(const ForwardKernelArgs &a,
                         kCollectiveJoinBarrier>();
   grid_sync<kMathThreads, kControlThreads>(a);
 
-  if (blockIdx.x < kNetworkContexts && control_thread == 0U) {
+  if (blockIdx.x < a.static_network.contexts && control_thread == 0U) {
     const auto base = source_offset(a, a.rank);
     for (unsigned node = 0; node < a.dispatch.identity.num_nodes; ++node) {
       if (node == a.node)

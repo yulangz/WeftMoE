@@ -6,6 +6,7 @@ namespace static_v4 {
 // separate: simultaneous bidirectional puts may otherwise overwrite a TX
 // range that the local NIC has not finished reading.
 struct NetworkLayout {
+  unsigned contexts = 0;
   std::size_t source = 0;
   std::size_t source_stride = 0;
   std::size_t routes = 0;

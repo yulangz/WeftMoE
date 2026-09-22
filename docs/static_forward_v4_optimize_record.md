@@ -2,8 +2,9 @@
 
 日期：2026-09-22
 
-状态：单机 inference-only 路径已完成主要重构；training 和多机仍使用
-V3。本文只记录 Qwen3.5 小 decode shape 的 Static Forward V4 优化，不替代
+状态：单机与多机 inference-only 路径已完成主要重构；training 仍使用 V3。
+多机实测见 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
+本文记录单机 Static Forward V4 优化，不替代
 `forward_optimization_history.md` 中大 token/多机历史。
 
 ## 2026-09-22 复审：decode 与 prefill
@@ -41,6 +42,12 @@ I=512、64 experts、top-k=4、EP8 fixture，CUDA Graph 每个 sample 回放 20 
 `WEFTMOE_P2P_BENCH_TOKENS=<上述规模>`、`WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY=1`、
 `WEFTMOE_FORWARD_GRAPH_BATCH=20`。保持原 N64/N128/K128、FC1/FC2 各 3 stages
 配置。原始本机日志为 `/tmp/weft-v4-audit-{baseline,coalesced,waves,direct-ready}-*.log`。
+
+多机接入后，共享了 stable insertion combine order、M128 geometry 和节点内
+pull 模块。最终构建的单机 EP8 回归为 **58.12/68.16/1480.64/4583.34 us**，
+四个规模所有 hash 仍与基线相同，没有单机性能回退。冻结构建参数与完整测量
+数据见 `configs/static_inference_20260922/` 和
+[`../benchmarks/static_inference_20260922.json`](../benchmarks/static_inference_20260922.json)。
 
 ## 1. 结论
 

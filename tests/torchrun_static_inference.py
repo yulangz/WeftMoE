@@ -75,11 +75,12 @@ def main():
     w2 = all_w2.chunk(world)[rank].contiguous()
     generator.manual_seed(900 + rank)
     max_tokens = max(*args.tokens, 257 if args.edge_cases else 1)
+    max_rows = max(2 * max_tokens * args.top_k + (args.experts // world) * 128,
+                   world * 257 * args.top_k)
     runtime = TensorRuntime(
         group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
         hidden=hidden, intermediate=intermediate, max_tokens=max_tokens,
-        max_rows=max(2 * max_tokens * args.top_k + (args.experts // world) * 128,
-                     world * 257 * args.top_k),
+        max_rows=max_rows,
         training=False,
     )
 
@@ -138,6 +139,17 @@ def main():
             expected_second = reference(first, routes, gates, all_w1, all_w2)
             check(second, expected_second, f"shared-workspace-{iteration}")
         del graph
+        if world * max_tokens * args.top_k > max_rows:
+            x, routes, gates = inputs(max_tokens, skew=True)
+            try:
+                runtime.inference_eager(x, routes, gates, w1, w2)
+            except RuntimeError as error:
+                assert "production-terminal-agreement" in str(error), str(error)
+            else:
+                raise AssertionError("overflow must reject collectively, not drop routes")
+            actual = runtime.inference_eager(x[:3], routes[:3], gates[:3], w1, w2)
+            check(actual, reference(x[:3], routes[:3], gates[:3], all_w1, all_w2),
+                  "capacity-rejection-recovery")
     runtime.close()
     dist.destroy_process_group()
 

@@ -1728,6 +1728,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
           ? 1U + unsigned(context_sms) : 0U);
   if constexpr (WEFTMOE_GIN_CONTEXT_COUNT > 0)
     allocated_context_count = WEFTMOE_GIN_CONTEXT_COUNT;
+  const bool static_inference_pool = forward_tuning::kUnifiedWorkers &&
+      pool->config.max_intermediate_size && !pool->config.enable_backward_state &&
+      std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
+  if (static_inference_pool)
+    allocated_context_count = pool->gin_layout.static_forward.contexts;
   backend->gin_context_count = kGinContextCount;
   backend->gin_allocated_context_count = allocated_context_count;
   if (!resources.dev_comm_created) {
@@ -1756,11 +1761,14 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         session.session().generation(), ExchangeKind::ExpertCounts,
         "ncclDevCommCreate(activation GIN)");
     resources.dev_comm_created = true;
-    if (resources.dev_comm.ginContextCount < 1 ||
-        (!(forward_tuning::kUnifiedWorkers && backward_tuning::kUnifiedWorkers) &&
+    if ((static_inference_pool &&
+         resources.dev_comm.ginContextCount < int(allocated_context_count)) ||
+        resources.dev_comm.ginContextCount < 1 ||
+        (!static_inference_pool &&
+         !(forward_tuning::kUnifiedWorkers && backward_tuning::kUnifiedWorkers) &&
          resources.dev_comm.ginContextCount < int((1U + communication::kReturnPorts) * kGinContextCount)))
       transport_error(NotifyErrorCode::BackendUnavailable, "gin-create",
-                      "actual GIN contexts", nccl->rank, "positive count; enough contexts for every legacy Return stream",
+                      "actual GIN contexts", nccl->rank, "enough contexts for static owners or legacy Return streams",
                       std::to_string(resources.dev_comm.ginContextCount));
     allocated_context_count = unsigned(resources.dev_comm.ginContextCount);
     backend->gin_allocated_context_count = allocated_context_count;

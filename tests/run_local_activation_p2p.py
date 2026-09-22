@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import json
 import os
+from pathlib import Path
 import select
 import statistics
 import struct
@@ -17,6 +18,8 @@ import subprocess
 import sys
 import threading
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 BOOTSTRAP_BYTES = 128
 

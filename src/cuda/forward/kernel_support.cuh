@@ -664,6 +664,10 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.return_stride = checked_mul(
         checked_mul(routes, config.max_hidden_size, "V4 Return elements"),
         sizeof(transport::BFloat16), "V4 Return bytes");
+    network.contexts = static_cast<unsigned>(std::min<std::size_t>(
+        static_v4::kNetworkContexts,
+        (network.return_stride + static_v4::kNetworkChunkBytes - 1U) /
+            static_v4::kNetworkChunkBytes));
     network.return_tx = append(cursor, config.max_nodes, network.return_stride,
                                "V4 Return TX");
     network.return_rx = append(cursor, config.max_nodes, network.return_stride,
