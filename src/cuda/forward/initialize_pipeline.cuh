@@ -8,7 +8,8 @@ template <bool StaticLocal, bool Unified = false, bool StaticSchedule = false>
 __device__ __noinline__ void
 forward_initialize_pipeline(const ForwardKernelArgs &a,
                             bool stream_remote_dispatch,
-                            bool stream_local_dispatch) {
+                            bool stream_local_dispatch,
+                            bool static_schedule = false) {
   // StaticSchedule is intentionally an ABI discriminator. CUDA 12.9 changes
   // the unified entry's pre-setmaxnreg allocation when this noinline helper is
   // instantiated without the third template argument, even though V4 reuses
@@ -29,21 +30,62 @@ forward_initialize_pipeline(const ForwardKernelArgs &a,
       a.local_base, a.forward_v3_control_offset);
   auto *completion = static_cast<transport_state::GenerationCompletionVector *>(
       a.peer_bases[a.world]);
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  if (static_schedule) {
+    auto grid = cooperative_groups::this_grid();
+    unsigned long long total_mblocks = 0ULL;
+    if (blockIdx.x == 0U && threadIdx.x < 32U) {
+      for (std::uint32_t expert = threadIdx.x;
+           expert < dispatch_sizes(a.dispatch).owned_expert_count;
+           expert += 32U)
+        total_mblocks += forward_expert_mblock_count(a, expert);
+      for (std::uint32_t delta = 16U; delta; delta >>= 1U)
+        total_mblocks +=
+            __shfl_down_sync(0xffffffffU, total_mblocks, delta);
+    }
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+      status->start_clock = device_globaltimer_ns();
+      status->dispatch_blocks_done = ~0ULL;
+      status->relay_blocks_done = ~0ULL;
+      status->reduced_tokens = ~0ULL;
+      status->fc1_start_clock = ~0ULL;
+      scheduler[0] = scheduler[1] = scheduler[2] = 0ULL;
+      scheduler[3] = total_mblocks;
+      scheduler[4] = 0ULL;
+      scheduler[4ULL + a.world] = 0ULL;
+      scheduler[11ULL + 2ULL * a.world] = 0ULL;
+      forward_v3_control->rdma_return_roles_complete.value = 0ULL;
+      forward_v3_control->compute_reduce_roles_complete.value = 0ULL;
+    }
+    grid.sync();
+    forward_initialize_mblocks(
+        a, [&](unsigned long long mblock, unsigned expert,
+               unsigned local_mblock) {
+          claims[mblock] =
+              (static_cast<unsigned long long>(expert) << 32U) | local_mblock;
+          fc1_done[mblock] = execution_epoch(a) << 32U;
+        });
+    grid.sync();
+    return;
+  }
+#endif
 #if __has_include(<nccl_device.h>)
   if constexpr (Unified) {
-    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned stride = gridDim.x * blockDim.x;
-    for (unsigned channel = index;
-         channel < a.local_world_size * a.local_notification_ctas;
-         channel += stride)
-      local_notification_detail::reset_channel(a, channel);
-    if constexpr (!StaticLocal) {
-      for (unsigned channel = index; channel < a.gin_rings.channels();
+    if (!static_schedule) {
+      const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+      const unsigned stride = gridDim.x * blockDim.x;
+      for (unsigned channel = index;
+           channel < a.local_world_size * a.local_notification_ctas;
            channel += stride)
-        activation_ring_detail::prepare_channel(a, channel);
-      for (unsigned sender = index; sender < a.gin_sender_count;
-           sender += stride)
-        static_cast<unsigned *>(a.gin_sender_done)[sender] = 0U;
+        local_notification_detail::reset_channel(a, channel);
+      if constexpr (!StaticLocal) {
+        for (unsigned channel = index; channel < a.gin_rings.channels();
+             channel += stride)
+          activation_ring_detail::prepare_channel(a, channel);
+        for (unsigned sender = index; sender < a.gin_sender_count;
+             sender += stride)
+          static_cast<unsigned *>(a.gin_sender_done)[sender] = 0U;
+      }
     }
   }
 #endif
@@ -156,7 +198,7 @@ forward_initialize_pipeline(const ForwardKernelArgs &a,
   // One completion word per destination->source rank replaces a system-scope
   // signal for every route.  The high word is immutable expected rows; return
   // CTAs add to the low word after their peer stores have been fenced.
-  if (blockIdx.x == 0 && threadIdx.x < a.world) {
+  if (!static_schedule && blockIdx.x == 0 && threadIdx.x < a.world) {
     unsigned long long expected = 0;
     for (std::uint32_t local_expert = 0;
          local_expert < dispatch_sizes(a.dispatch).owned_expert_count;
@@ -201,7 +243,8 @@ forward_initialize_pipeline(const ForwardKernelArgs &a,
   // Control words, Return storage, input groups and task descriptors occupy
   // disjoint allocations. Their initialization can overlap; the map-arrival
   // rendezvous below publishes all of them before any worker starts.
-  if (stream_remote_dispatch || stream_local_dispatch)
+  if (!static_schedule &&
+      (stream_remote_dispatch || stream_local_dispatch))
     return_queue_detail::initialize<true>(a);
 #if !defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   forward_transport_cta_barrier(
@@ -223,19 +266,22 @@ forward_initialize_pipeline(const ForwardKernelArgs &a,
     claims[mblock] =
         (static_cast<unsigned long long>(expert) << 32U) | local_mblock;
 #if __has_include(<nccl_device.h>)
-    if (stream_local_dispatch || stream_remote_dispatch)
+    if (!static_schedule &&
+        (stream_local_dispatch || stream_remote_dispatch))
       forward_dispatch_detail::initialize_input_group(a, mblock, expert,
                                                       local_mblock);
 #endif
   });
   // FC2's shared ticket indexes N-pairs in a published M-block. Only its
   // M-block descriptors follow the FC1-ready queue; no per-M ticket array.
-  const auto setup_task_count = setup_mblocks * (setup_fc1_ntiles + 1ULL);
-  for (std::uint64_t task =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       task < setup_task_count;
-       task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-    claims[setup_mblocks + task] = 0ULL;
+  if (!static_schedule) {
+    const auto setup_task_count = setup_mblocks * (setup_fc1_ntiles + 1ULL);
+    for (std::uint64_t task =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         task < setup_task_count;
+         task += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+      claims[setup_mblocks + task] = 0ULL;
+  }
   forward_transport_cta_barrier(
       forward_mixed_scheduler_word(a, scheduler, kForwardTransportMapArrivals),
       gridDim.x);

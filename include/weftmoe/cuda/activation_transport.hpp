@@ -161,6 +161,16 @@ struct ForwardMegaKernelConfig {
   // enable_backward_state=true.
   bool retain_backward_state = false;
   ForwardTensorStorage tensors{};
+  // The replay stream itself orders output consumers and serialized workspace
+  // reuse, so observable events can be recorded once during graph release.
+  bool serialized_graph_replay = false;
+  // A serialized inference graph may bind its stable application route inputs
+  // directly while reusing a shape-compatible Dispatch handle.  This avoids a
+  // second set of route/gate staging copies in CUDA Graph replay.  Both buffers
+  // must be provided together; training and the split/multi-node paths reject
+  // them.
+  CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
+  CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
 };
 
 class ForwardWeightLease {
@@ -184,11 +194,15 @@ private:
 
 
 struct ForwardMegaKernelTimings {
+  double device_kernel_us = 0;
+  double route_exchange_us = 0;
   double dispatch_us = 0;
   double fc1_swiglu_us = 0;
   double fc2_us = 0;
+  double before_combine_us = 0;
   double combine_return_us = 0;
   double reduce_us = 0;
+  double after_combine_us = 0;
   double fc1_fc2_overlap_us = 0;
   double fc2_return_overlap_us = 0;
   double return_reduce_overlap_us = 0;

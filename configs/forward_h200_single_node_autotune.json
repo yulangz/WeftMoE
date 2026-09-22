@@ -4,6 +4,8 @@
       128
     ],
     "fc1_tile_n": [
+      64,
+      256,
       128
     ],
     "fc2_tile_n": [
@@ -11,13 +13,23 @@
       128
     ],
     "tile_k": [
-      64
+      64,
+      128
     ],
     "fc1_stages": [
       4
     ],
     "fc2_stages": [
       3
+    ],
+    "static_v4_fc1_stages": [
+      4,
+      5,
+      3
+    ],
+    "static_v4_fc2_stages": [
+      3,
+      5
     ],
     "compute_threads": [
       384
@@ -47,7 +59,7 @@
       true
     ],
     "fc2_claim_tiles": [
-      2
+      1
     ],
     "unified_workers": [
       1

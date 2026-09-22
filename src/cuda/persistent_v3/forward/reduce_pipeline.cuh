@@ -9,7 +9,7 @@
 
 namespace forward_compute_detail {
 
-template <bool StaticLocal, bool SingleRoute>
+template <bool StaticLocal, bool SingleRoute, bool BulkReady = false>
 __device__ __forceinline__ void reduce_one_token_impl(
     const ForwardKernelArgs &a, std::uint64_t token,
     TransportDeviceStatus *status, transport::BFloat16 *contribution,
@@ -35,12 +35,14 @@ __device__ __forceinline__ void reduce_one_token_impl(
     lane_row = forward_contribution_row(a, lane_route);
     // Queue/scan consumers have already acquired every contribution. The
     // static scheduler instead waits for each route's local arrival marker.
-    if (!a.forward_dynamic_reduce_queue && !a.forward_dynamic_reduce_scan) {
+    if constexpr (!BulkReady) {
+      if (!a.forward_dynamic_reduce_queue && !a.forward_dynamic_reduce_scan) {
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> ready(
           route_ready[lane_route]);
       while (ready.load(::cuda::memory_order_acquire) < execution_epoch(a) &&
              !forward_cancelled(a))
         __nanosleep(forward_tuning::kTaskIdleNanosleep);
+      }
     }
   }
   __syncwarp();
@@ -89,7 +91,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
 #endif
 }
 
-template <bool StaticLocal>
+template <bool StaticLocal, bool BulkReady = false>
 __device__ __forceinline__ void
 reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
                  TransportDeviceStatus *status,
@@ -97,14 +99,15 @@ reduce_one_token(const ForwardKernelArgs &a, std::uint64_t token,
                  unsigned long long *route_ready, transport::BFloat16 *combined,
                  transport_state::GenerationCompletionVector *completion) {
   if (a.dispatch.identity.top_k == 1U)
-    reduce_one_token_impl<StaticLocal, true>(a, token, status, contribution,
-                                             route_ready, combined, completion);
+    reduce_one_token_impl<StaticLocal, true, BulkReady>(
+        a, token, status, contribution, route_ready, combined, completion);
   else
-    reduce_one_token_impl<StaticLocal, false>(
+    reduce_one_token_impl<StaticLocal, false, BulkReady>(
         a, token, status, contribution, route_ready, combined, completion);
 }
 
-template <bool StaticLocal, unsigned Threads = kThreads>
+template <bool StaticLocal, unsigned Threads = kThreads,
+          bool BulkReady = false>
 __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
                                          std::uint32_t role_index,
                                          std::uint32_t role_count) {
@@ -212,8 +215,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
         token = __shfl_sync(0xffffffffU, token, 0U);
         token_ready = __shfl_sync(0xffffffffU, token_ready, 0U);
         if (token_ready != 0U)
-          reduce_one_token<StaticLocal>(a, token, status, contribution,
-                                        route_ready, combined, completion);
+          reduce_one_token<StaticLocal, BulkReady>(
+              a, token, status, contribution, route_ready, combined,
+              completion);
       }
       cutlass::arch::NamedBarrier::sync(
           Threads, static_cast<cutlass::arch::ReservedNamedBarriers>(7U));
@@ -279,8 +283,9 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
         }
         owner = __shfl_sync(0xffffffffU, owner, 0U);
         if (owner != 0U) {
-          reduce_one_token<StaticLocal>(a, token, status, contribution,
-                                        route_ready, combined, completion);
+          reduce_one_token<StaticLocal, BulkReady>(
+              a, token, status, contribution, route_ready, combined,
+              completion);
           if (lane == 0U) {
             ::cuda::atomic_ref<unsigned int, ::cuda::thread_scope_device>
                 state(token_state[token]);
@@ -303,10 +308,14 @@ __device__ __noinline__ void reduce_role(const ForwardKernelArgs &a,
     if (warp < kReduceWarps) {
       for (std::uint64_t token =
                static_cast<std::uint64_t>(role_index) * kReduceWarps + warp;
-           token < a.dispatch.identity.num_tokens && !forward_cancelled(a);
+           token < a.dispatch.identity.num_tokens;
            token += static_cast<std::uint64_t>(role_count) * kReduceWarps) {
-        reduce_one_token<StaticLocal>(a, token, status, contribution,
-                                      route_ready, combined, completion);
+        if constexpr (!BulkReady)
+          if (forward_cancelled(a))
+            break;
+        reduce_one_token<StaticLocal, BulkReady>(
+            a, token, status, contribution, route_ready, combined,
+            completion);
       }
     }
   }

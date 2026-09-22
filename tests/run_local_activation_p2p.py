@@ -503,7 +503,10 @@ def main():
                         cancelled.get("quarantined") != "1":
                     raise AssertionError(f"rank={rank} bad cancellation audit")
             else:
-                marker = ("FORWARD_BENCH " if args.forward_benchmark else
+                marker = (("FORWARD_GRAPH_BENCH "
+                           if (args.forward_benchmark and
+                               os.getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"))
+                           else "FORWARD_BENCH ") if args.forward_benchmark else
                           ("INTEGRATED_BENCH "
                            if args.integrated_benchmark else "P2P_BENCH "))
                 item = (parse_fields(stdout, marker)
@@ -660,8 +663,68 @@ def main():
             return
         if benchmark_mode:
             if args.forward_benchmark:
-                stage_keys = ("wall", "notify", "forward", "dispatch",
-                              "fc1", "fc2", "return", "reduce",
+                if os.getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"):
+                    samples = [
+                        [float(value) for value in item["samples"].split(",")]
+                        for item in observed]
+                    if len(samples) != args.world or any(
+                            len(row) != args.rounds - 10 for row in samples):
+                        raise AssertionError(
+                            "incomplete Forward graph benchmark")
+                    slowest = [max(row[i] for row in samples)
+                               for i in range(args.rounds - 10)]
+                    ordered = sorted(slowest)
+                    p50 = ordered[(len(ordered) - 1) // 2]
+                    result = {
+                        "schema": 1,
+                        "benchmark": "forward-graph-replay",
+                        "world": args.world,
+                        "warmup": 10,
+                        "measured": args.rounds - 10,
+                        "batch": int(observed[0]["batch"]),
+                        "per_rank_graph_nodes": [
+                            int(item["graph_nodes"]) for item in observed],
+                        "per_rank_graph_kernel_nodes": [
+                            int(item["graph_kernel_nodes"])
+                            for item in observed],
+                        "per_rank_graph_memcpy_nodes": [
+                            int(item["graph_memcpy_nodes"])
+                            for item in observed],
+                        "per_rank_graph_event_record_nodes": [
+                            int(item["graph_event_record_nodes"])
+                            for item in observed],
+                        "per_rank_graph_event_wait_nodes": [
+                            int(item["graph_event_wait_nodes"])
+                            for item in observed],
+                        "per_rank_device_kernel_us": [
+                            float(item["device_kernel_us"])
+                            for item in observed],
+                        "shape": {
+                            "tokens_per_rank": int(observed[0]["tokens"]),
+                            "hidden": int(observed[0]["hidden"]),
+                            "intermediate": int(
+                                observed[0]["intermediate"]),
+                            "experts": int(observed[0]["experts"]),
+                            "top_k": int(observed[0]["top_k"]),
+                        },
+                        "per_rank_output_hash": [
+                            item["output_hash"] for item in observed],
+                        "slowest_rank_us": {
+                            "mean": statistics.fmean(slowest),
+                            "p50": p50,
+                            "min": ordered[0],
+                            "max": ordered[-1],
+                        },
+                        "slowest_rank_samples_us": slowest,
+                        "per_rank_samples_us": samples,
+                    }
+                    print("FORWARD_GRAPH_BENCH_JSON " +
+                          json.dumps(result, sort_keys=True))
+                    return
+                stage_keys = ("wall", "notify", "forward", "device_kernel",
+                              "route_exchange",
+                              "dispatch", "fc1", "fc2", "before_combine",
+                              "return", "reduce", "after_combine",
                               "fc1_fc2_overlap", "fc2_return_overlap",
                               "return_reduce_overlap")
                 if all("buffer_prepare" in item for item in observed):

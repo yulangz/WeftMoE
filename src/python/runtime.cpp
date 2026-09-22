@@ -46,8 +46,7 @@ struct InferenceBucket {
   DeviceNotifyResourcePool notify_pool;
   NcclSession generation;
   DeviceDispatchHandle dispatch;
-  BFloat16ActivationLease activation;
-  py::object x, routes, gates;
+  py::object routes, gates;
 };
 
 struct InferencePlan {
@@ -55,6 +54,8 @@ struct InferencePlan {
   cudaGraphExec_t executable = nullptr;
   DeviceForwardHandle forward;
   py::object output;
+  py::object x, routes, gates, w1_owner, w2_owner;
+  std::uintptr_t x_address = 0, routes_address = 0, gates_address = 0;
   std::uintptr_t w1 = 0, w2 = 0;
   ~InferencePlan() {
     if (executable) (void)cudaGraphExecDestroy(executable);
@@ -184,6 +185,7 @@ class Runtime {
     py::dict result;
     result["output"] = tape->output;
     result["total_us"] = timings.total_us;
+    result["route_exchange_us"] = timings.route_exchange_us;
     result["dispatch_us"] = timings.dispatch_us;
     result["fc1_swiglu_us"] = timings.fc1_swiglu_us;
     result["fc2_us"] = timings.fc2_us;
@@ -306,18 +308,20 @@ class Runtime {
       // All graph preparation is outside the application's capture and hot path.
       check_cuda(cudaDeviceSynchronize());
       if (buckets_.find(tokens) == buckets_.end()) prepare_bucket(tokens);
-      prepare_plan(key, w1, w2);
+      prepare_plan(key, x, routes, gates, w1, w2);
     }
     auto &plan = *plans_.at(key);
+    if (plan.x_address != reinterpret_cast<std::uintptr_t>(pointer(x)) ||
+        plan.routes_address !=
+            reinterpret_cast<std::uintptr_t>(pointer(routes)) ||
+        plan.gates_address !=
+            reinterpret_cast<std::uintptr_t>(pointer(gates)))
+      throw std::runtime_error(
+          "Inference input addresses changed: use stable CUDA Graph buffers "
+          "or invalidate the layer/token plan");
     if (plan.w1 != reinterpret_cast<std::uintptr_t>(pointer(w1)) ||
         plan.w2 != reinterpret_cast<std::uintptr_t>(pointer(w2)))
       throw std::runtime_error("Expert addresses changed: invalidate graphs before weight relocation");
-    auto &bucket = *buckets_.at(tokens);
-    // These copies use the application's current torch stream and are captured
-    // along with the child graph. They preserve the child graph's fixed addresses.
-    bucket.x.attr("copy_")(x);
-    bucket.routes.attr("copy_")(routes);
-    bucket.gates.attr("copy_")(gates);
     if (capture == cudaStreamCaptureStatusNone) {
       check_cuda(cudaGraphLaunch(plan.executable, caller));
     } else {
@@ -328,19 +332,18 @@ class Runtime {
       check_cuda(cudaStreamGetCaptureInfo_v2(caller, &capture, &capture_id, &parent,
                                              &dependencies, &count));
       cudaGraphNode_t child;
-      check_cuda(cudaGraphAddChildGraphNode(&child, parent, dependencies, count, plan.graph));
+      check_cuda(cudaGraphAddChildGraphNode(&child, parent, dependencies, count,
+                                            plan.graph));
       check_cuda(cudaStreamUpdateCaptureDependencies(caller, &child, 1,
                                                      cudaStreamSetCaptureDependencies));
     }
-    return plan.output.attr("clone")();
+    return plan.output;
   }
 
  private:
   void prepare_bucket(std::uint64_t tokens) {
     if (tokens > max_tokens_) throw std::invalid_argument("inference token capacity exceeded");
     auto bucket = std::make_unique<InferenceBucket>();
-    bucket->x = empty({tokens, hidden_}, "bfloat16");
-    bucket->x.attr("zero_")();
     bucket->routes = empty({tokens, config_.top_k}, "int32");
     auto ids = torch_.attr("arange")(config_.top_k, py::arg("device")=device_,
                                     py::arg("dtype")=torch_.attr("int32"));
@@ -351,7 +354,7 @@ class Runtime {
     bucket->generation = make_nccl_generation(base_, "weftmoe-torch", ++generation_);
     auto context = make_rank_collective_context(bucket->generation.session(), rank_, execution_.token());
     auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_,
-                                                owner(bucket->x), "inference-bucket");
+                                                owner(bucket->routes), "inference-bucket");
     auto routes = producer.publish_selected_experts(
         static_cast<const std::int32_t *>(pointer(bucket->routes)), elements(bucket->routes),
         tokens, config_.top_k, owner(bucket->routes));
@@ -364,17 +367,19 @@ class Runtime {
         {config_, tokens, 8192, 1, 4, single_node_inference_});
     CudaNotifyGenerationCoordinator coordinator(bucket->generation, execution_, bucket->notify_pool);
     bucket->dispatch = coordinator.run_device({config_, routes, gates, tokens}).dispatch();
-    bucket->activation = producer.publish_activations(
-        static_cast<const transport::BFloat16 *>(pointer(bucket->x)), elements(bucket->x),
-        tokens, hidden_, owner(bucket->x));
     buckets_[tokens] = std::move(bucket);
   }
 
-  void prepare_plan(std::pair<unsigned, std::uint64_t> key, py::object w1, py::object w2) {
+  void prepare_plan(std::pair<unsigned, std::uint64_t> key, py::object x,
+                    py::object routes, py::object gates, py::object w1,
+                    py::object w2) {
     auto &bucket = *buckets_.at(key.second);
     auto context = make_rank_collective_context(bucket.generation.session(), rank_, execution_.token());
     auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_,
-                                                owner(bucket.x), "inference-weights");
+                                                owner(x), "inference-plan");
+    auto activation = producer.publish_activations(
+        static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
+        key.second, hidden_, owner(x));
     auto weights = producer.publish_weights(
         static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
         static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
@@ -382,9 +387,20 @@ class Runtime {
         rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
     auto plan = std::make_unique<InferencePlan>();
     plan->output = empty({key.second, hidden_}, "bfloat16");
+    plan->x = x;
+    plan->routes = routes;
+    plan->gates = gates;
+    plan->w1_owner = w1;
+    plan->w2_owner = w2;
+    plan->x_address = reinterpret_cast<std::uintptr_t>(pointer(x));
+    plan->routes_address = reinterpret_cast<std::uintptr_t>(pointer(routes));
+    plan->gates_address = reinterpret_cast<std::uintptr_t>(pointer(gates));
     plan->w1 = reinterpret_cast<std::uintptr_t>(pointer(w1));
     plan->w2 = reinterpret_cast<std::uintptr_t>(pointer(w2));
     ForwardMegaKernelConfig fc{hidden_, intermediate_, false};
+    fc.serialized_graph_replay = true;
+    fc.inference_routes = binding(routes);
+    fc.inference_gates = binding(gates);
     ForwardTensorBuffers buffers;
     buffers.output = binding(plan->output);
     fc.tensors = prepare_forward_tensors(bucket.dispatch, execution_, fc, buffers, allocator());
@@ -392,14 +408,14 @@ class Runtime {
     check_cuda(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
     bucket.dispatch.enqueue_notify(bucket.generation);
 #if WEFTMOE_ENABLE_GIN_RDMA
-    plan->forward = gin_ ? gin_->enqueue(bucket.dispatch, bucket.activation, weights, fc)
-                         : local_->enqueue(bucket.dispatch, bucket.activation, weights, fc);
+    plan->forward = gin_ ? gin_->enqueue(bucket.dispatch, activation, weights, fc)
+                         : local_->enqueue(bucket.dispatch, activation, weights, fc);
 #else
 #if WEFTMOE_NOTIFY_TIMING_MODE >= 1
     // Measurement-only: capture the notify stage without the forward kernel.
     plan->forward = {};
 #else
-    plan->forward = local_->enqueue(bucket.dispatch, bucket.activation, weights, fc);
+    plan->forward = local_->enqueue(bucket.dispatch, activation, weights, fc);
 #endif
 #endif
     check_cuda(cudaStreamEndCapture(stream_, &plan->graph));

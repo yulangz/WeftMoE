@@ -1,4 +1,5 @@
 #include "cuda/forward/kernel_support.cuh"
+#include "cuda/static_v4/memory_order.cuh"
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
 // The paired Forward kernel gives FC1 and FC2 independent N shapes.
@@ -90,7 +91,7 @@ forward_transport_cta_barrier(unsigned long long *arrivals,
 // Build the same startup-wave/expert-body order with one warp per expert.
 // Prefixes are reduced across lanes once instead of searching every preceding
 // tile independently for each output entry. No persistent scratch is needed.
-template <class Emit>
+template <bool SingleCta = false, class Emit>
 __device__ __forceinline__ void
 forward_initialize_mblocks(const ForwardKernelArgs &a, Emit emit) {
   constexpr unsigned startup = forward_tuning::kStartupMblocks;
@@ -101,8 +102,13 @@ forward_initialize_mblocks(const ForwardKernelArgs &a, Emit emit) {
       value += __shfl_down_sync(0xffffffffU, value, delta);
     return __shfl_sync(0xffffffffU, value, 0U);
   };
-  for (unsigned expert = (blockIdx.x * blockDim.x + threadIdx.x) / 32U;
-       expert < experts; expert += gridDim.x * blockDim.x / 32U) {
+  const auto first_expert =
+      SingleCta ? threadIdx.x / 32U
+                : (blockIdx.x * blockDim.x + threadIdx.x) / 32U;
+  const auto expert_stride =
+      SingleCta ? blockDim.x / 32U : gridDim.x * blockDim.x / 32U;
+  for (unsigned expert = first_expert; expert < experts;
+       expert += expert_stride) {
     const auto blocks = forward_expert_mblock_count(a, expert);
     if (blocks == 0ULL)
       continue;
@@ -181,10 +187,27 @@ forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
     if (tile_row >= end_row)
       break;
     unsigned long long total = 0ULL;
-    for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> ready(
-          arrived[tile * a.local_world_size + rail]);
-      total += ready.load(::cuda::memory_order_acquire);
+    if constexpr (StaticLocal) {
+      if (a.fused_single_node_routes) {
+        // Static-V4 destination-pull materializes every row locally and
+        // publishes all arrivals on the local-rank rail.  Avoid eight
+        // system-scope peer-visible loads at every scheduler probe.
+        total = static_v4::load_acquire_device(
+            arrived + tile * a.local_world_size +
+            a.rank % a.local_world_size);
+      } else {
+        for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+              ready(arrived[tile * a.local_world_size + rail]);
+          total += ready.load(::cuda::memory_order_acquire);
+        }
+      }
+    } else {
+      for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+            ready(arrived[tile * a.local_world_size + rail]);
+        total += ready.load(::cuda::memory_order_acquire);
+      }
     }
     if (total < expected)
       return false;
@@ -351,7 +374,12 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/persistent_v3/forward/dispatch_pipeline.cuh"
 #include "cuda/persistent_v3/forward/finalize_pipeline.cuh"
 
+#include "cuda/static_v4/contract.cuh"
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
 
 #include "cuda/forward/initialize_pipeline.cuh"
+#include "cuda/static_v4/single_node_initialize.cuh"
+#include "cuda/static_v4/single_node_collective.cuh"
+#include "cuda/static_v4/single_node_route_exchange.cuh"
+#include "cuda/static_v4/single_node_finalize.cuh"
 #include "cuda/persistent_v3/forward/unified_kernel.cuh"

@@ -256,10 +256,21 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS
 #define WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS 64
 #endif
+#ifndef WEFTMOE_FWD_STATIC_V4_FC1_STAGES
+#define WEFTMOE_FWD_STATIC_V4_FC1_STAGES WEFTMOE_FWD_FC1_STAGES
+#endif
+#ifndef WEFTMOE_FWD_STATIC_V4_FC2_STAGES
+#define WEFTMOE_FWD_STATIC_V4_FC2_STAGES WEFTMOE_FWD_FC2_STAGES
+#endif
 inline constexpr unsigned kStaticV4MathRegisters =
     WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS;
 inline constexpr unsigned kStaticV4ControlRegisters =
     WEFTMOE_FWD_STATIC_V4_CONTROL_REGISTERS;
+inline constexpr unsigned kStaticV4TileK = WEFTMOE_FWD_TILE_K;
+inline constexpr unsigned kStaticV4Fc1Stages =
+    WEFTMOE_FWD_STATIC_V4_FC1_STAGES;
+inline constexpr unsigned kStaticV4Fc2Stages =
+    WEFTMOE_FWD_STATIC_V4_FC2_STAGES;
 using StaticV4Resources = unified_worker_tuning::Resources<
     WEFTMOE_FWD_UNIFIED_THREADS, WEFTMOE_FWD_UNIFIED_COMM_THREADS,
     WEFTMOE_FWD_UNIFIED_COMM_BASE, WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS,
@@ -274,7 +285,10 @@ inline constexpr std::uint32_t kMainIntermediate =
 inline constexpr std::uint32_t kTileM = WEFTMOE_FWD_TILE_M;
 inline constexpr std::uint32_t kFc1TileN = WEFTMOE_FWD_FC1_TILE_N;
 inline constexpr std::uint32_t kFc2TileN = WEFTMOE_FWD_FC2_TILE_N;
-inline constexpr std::uint32_t kTileK = WEFTMOE_FWD_TILE_K;
+// Training and the general multi-node path retain their proven K64 layout.
+// The public tile_k axis belongs to the V4 single-node inference entry, whose
+// packed W1 path can independently tune one or two K64 swizzle atoms/stage.
+inline constexpr std::uint32_t kTileK = 64U;
 inline constexpr std::uint32_t kFc1Stages = WEFTMOE_FWD_FC1_STAGES;
 inline constexpr std::uint32_t kFc2Stages = WEFTMOE_FWD_FC2_STAGES;
 inline constexpr std::uint32_t kFc2ClaimTiles = WEFTMOE_FWD_FC2_CLAIM_TILES;
@@ -373,8 +387,38 @@ inline constexpr std::size_t kGemmStorageBytes =
 inline constexpr std::size_t kBarrierCount =
     3U * kFc1Stages + 2U * kFc2Stages;
 
+inline constexpr std::size_t kStaticV4AStageElements =
+    static_cast<std::size_t>(kTileM) * kStaticV4TileK;
+inline constexpr std::size_t kStaticV4Fc1BStageElements =
+    static_cast<std::size_t>(kFc1TileN) * kStaticV4TileK;
+inline constexpr std::size_t kStaticV4Fc2BStageElements =
+    static_cast<std::size_t>(kFc2TileN) * kStaticV4TileK;
+inline constexpr std::size_t kStaticV4AStorageElements =
+    max_size(kStaticV4Fc1Stages, kStaticV4Fc2Stages) *
+    kStaticV4AStageElements;
+// Packed [gate8, up8] W1 needs one B arena; the general path needs two.
+inline constexpr std::size_t kStaticV4BStorageElements = max_size(
+    kStaticV4Fc1Stages * kStaticV4Fc1BStageElements,
+    kStaticV4Fc2Stages * kStaticV4Fc2BStageElements);
+inline constexpr std::size_t kStaticV4GemmStorageBytes =
+    max_size(kStaticV4AStorageElements + kStaticV4BStorageElements,
+             kStaticV4Fc2Stages *
+                     (kStaticV4AStageElements +
+                      kStaticV4Fc2BStageElements) +
+                 (kFc2ClaimTiles > 1U ? kTileM * kFc2TileN : 0U)) *
+    sizeof(std::uint16_t);
+inline constexpr std::size_t kStaticV4BarrierCount =
+    2U * kStaticV4Fc1Stages + 2U * kStaticV4Fc2Stages;
+
 inline constexpr std::size_t compute_smem_bytes(std::uint32_t world) {
   return kGemmStorageBytes + kBarrierCount * sizeof(std::uint64_t) +
+         static_cast<std::size_t>(world) * sizeof(std::uint32_t);
+}
+
+inline constexpr std::size_t
+static_v4_compute_smem_bytes(std::uint32_t world) {
+  return kStaticV4GemmStorageBytes +
+         kStaticV4BarrierCount * sizeof(std::uint64_t) +
          static_cast<std::size_t>(world) * sizeof(std::uint32_t);
 }
 
@@ -394,16 +438,18 @@ static_assert(kFc1TileN >= 64U && kFc1TileN <= 256U &&
               kFc1TileN % 64U == 0U);
 static_assert(kFc2TileN >= 64U && kFc2TileN <= 256U &&
               kFc2TileN % 64U == 0U);
-// The Hopper K-major 128-byte swizzle currently fixes one async stage at K64.
-// It remains an explicit singleton hyperparameter until another descriptor
-// layout is added and validated.
 static_assert(kTileK == 64U);
+static_assert(kStaticV4TileK == 64U || kStaticV4TileK == 128U);
 static_assert(kFc1Stages >= 2U && kFc1Stages <= 4U);
 static_assert(kFc2Stages >= 2U && kFc2Stages <= 4U);
+static_assert(kStaticV4Fc1Stages >= 2U && kStaticV4Fc1Stages <= 6U);
+static_assert(kStaticV4Fc2Stages >= 2U && kStaticV4Fc2Stages <= 6U);
 static_assert(kFc2ClaimTiles == 1U || kFc2ClaimTiles == 2U ||
               kFc2ClaimTiles == 4U || kFc2ClaimTiles == 8U);
 static_assert(kGemmStorageBytes <= 227U * 1024U,
               "FC2 input/output staging exceeds Hopper shared memory");
+static_assert(kStaticV4GemmStorageBytes <= 227U * 1024U,
+              "V4 inference staging exceeds Hopper shared memory");
 static_assert(kComputeThreads == 384U);
 static_assert(kMathWarpgroups == 2U && kProducerWarpgroups == 1U);
 static_assert(kMathRegisters <= 255U && kProducerRegisters <= 255U &&

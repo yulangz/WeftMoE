@@ -89,7 +89,8 @@ __global__ void finalize_forward_weight_hash_kernel(
 }
 
 __global__ void initialize_forward_weights_kernel(
-    transport::BFloat16 *w1, std::uint64_t w1_elements,
+    transport::BFloat16 *w1, transport::BFloat16 *w1_interleaved,
+    std::uint64_t w1_elements,
     transport::BFloat16 *w2, std::uint64_t w2_elements,
     std::uint32_t global_expert_begin, std::uint64_t hidden,
     std::uint64_t intermediate) {
@@ -101,8 +102,17 @@ __global__ void initialize_forward_weights_kernel(
     const auto expert = global_expert_begin +
                         static_cast<std::uint32_t>(index / expert_stride);
     const auto within = index % expert_stride;
-    w1[index].bits = forward_fixture_weight_bits(
-        expert, 1U, within / hidden, within % hidden);
+    const auto row = within / hidden;
+    const auto column = within % hidden;
+    const auto bits = forward_fixture_weight_bits(expert, 1U, row, column);
+    w1[index].bits = bits;
+    const auto projection = row / intermediate;
+    const auto channel = row % intermediate;
+    const auto packed_row =
+        (channel / 8ULL) * 16ULL + projection * 8ULL + channel % 8ULL;
+    w1_interleaved[(index / expert_stride) * expert_stride +
+                   packed_row * hidden + column]
+        .bits = bits;
   }
   for (std::uint64_t index =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -113,6 +123,27 @@ __global__ void initialize_forward_weights_kernel(
     const auto within = index % expert_stride;
     w2[index].bits = forward_fixture_weight_bits(
         expert, 2U, within / intermediate, within % intermediate);
+  }
+}
+
+__global__ void interleave_forward_w1_kernel(
+    const transport::BFloat16 *source, transport::BFloat16 *destination,
+    std::uint64_t elements, std::uint64_t hidden,
+    std::uint64_t intermediate) {
+  const auto stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  const auto expert_stride = 2ULL * intermediate * hidden;
+  for (std::uint64_t index =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += stride) {
+    const auto within = index % expert_stride;
+    const auto row = within / hidden;
+    const auto column = within % hidden;
+    const auto projection = row / intermediate;
+    const auto channel = row % intermediate;
+    const auto packed_row =
+        (channel / 8ULL) * 16ULL + projection * 8ULL + channel % 8ULL;
+    destination[(index / expert_stride) * expert_stride +
+                packed_row * hidden + column] = source[index];
   }
 }
 

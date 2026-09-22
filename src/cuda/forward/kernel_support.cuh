@@ -237,6 +237,12 @@ struct TransportDeviceStatus {
   unsigned long long gin_metadata_bytes;
   unsigned long long gin_return_payload_bytes;
   unsigned long long start_clock;
+  unsigned long long route_exchange_start_clock;
+  unsigned long long route_exchange_complete_clock;
+  unsigned long long before_combine_start_clock;
+  unsigned long long before_combine_complete_clock;
+  unsigned long long after_combine_start_clock;
+  unsigned long long after_combine_complete_clock;
   unsigned long long dispatch_complete_clock;
   unsigned long long complete_clock;
   unsigned long long dispatch_blocks_done;
@@ -540,6 +546,25 @@ struct Layout {
   std::size_t forward_fc1_done = 0;
   std::size_t forward_input_groups = 0;
   std::size_t forward_x_arrived_rows = 0;
+  // Single-node inference route exchange.  Unlike the generic Notify arena,
+  // this metadata is peer mapped with the Forward pool and is rebuilt by the
+  // resident kernel immediately before Dispatch.
+  std::size_t fused_route_expert = 0;
+  std::size_t fused_route_local_offset = 0;
+  std::size_t fused_route_dst_row = 0;
+  std::size_t fused_route_dst_rank = 0;
+  std::size_t fused_route_dst_mtile = 0;
+  std::size_t fused_combine_order = 0;
+  std::size_t fused_local_expert_count = 0;
+  std::size_t fused_source_expert_count = 0;
+  std::size_t fused_source_routes = 0;
+  std::size_t fused_source_gates = 0;
+  std::size_t fused_owned_expert_ids = 0;
+  std::size_t fused_expert_row_count = 0;
+  std::size_t fused_expert_row_prefix = 0;
+  std::size_t fused_mtile_offsets = 0;
+  std::size_t fused_mtile_rows = 0;
+  std::size_t fused_dispatch_runtime = 0;
   std::size_t forward_reduce_route_count = 0;
   std::size_t forward_reduce_ready_token = 0;
   std::size_t forward_return_rows = 0;
@@ -1001,6 +1026,55 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                checked_mul(max_mblocks, config.max_world_size,
                            "forward exact X M-tile rail counters"),
                sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
+    const auto fused_experts = checked_mul(
+        config.max_owned_experts, config.max_world_size,
+        "single-node inference experts");
+    layout.fused_route_expert =
+        append(cursor, routes, sizeof(std::uint32_t), "fused route experts");
+    layout.fused_route_local_offset = append(
+        cursor, routes, sizeof(std::uint64_t), "fused route local offsets");
+    layout.fused_route_dst_row =
+        append(cursor, routes, sizeof(std::uint64_t), "fused route rows");
+    layout.fused_route_dst_rank =
+        append(cursor, routes, sizeof(std::uint32_t), "fused route ranks");
+    layout.fused_route_dst_mtile =
+        append(cursor, routes, sizeof(std::uint32_t), "fused route M tiles");
+    layout.fused_combine_order =
+        append(cursor, routes, sizeof(std::uint32_t), "fused combine order");
+    layout.fused_local_expert_count = append(
+        cursor, fused_experts, sizeof(std::uint64_t),
+        "fused local expert counts");
+    layout.fused_source_expert_count = append(
+        cursor, fused_experts, sizeof(std::uint64_t),
+        "fused global expert totals");
+    layout.fused_source_routes = append(
+        cursor,
+        checked_mul(
+            checked_mul(config.max_owned_experts, config.max_world_size,
+                        "fused source route expert/rank planes"),
+            checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                        "fused source routes per rank"),
+            "fused source route table"),
+        sizeof(std::uint32_t), "fused source route table");
+    layout.fused_source_gates = append(
+        cursor, routes, sizeof(float), "fused source route gates");
+    layout.fused_owned_expert_ids = append(
+        cursor, config.max_owned_experts, sizeof(std::uint32_t),
+        "fused owned expert ids");
+    layout.fused_expert_row_count = append(
+        cursor, config.max_owned_experts, sizeof(std::uint64_t),
+        "fused owned expert row counts");
+    layout.fused_expert_row_prefix = append(
+        cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
+        sizeof(std::uint64_t), "fused owned expert row prefixes");
+    layout.fused_mtile_offsets = append(
+        cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
+        sizeof(std::uint64_t), "fused owned expert M-tile offsets");
+    layout.fused_mtile_rows = append(
+        cursor, max_mblocks, sizeof(std::uint32_t),
+        "fused expected M-tile rows");
+    layout.fused_dispatch_runtime = append(
+        cursor, 1, sizeof(DeviceDispatchRuntime), "fused dispatch runtime");
     layout.forward_reduce_route_count =
         append(cursor, config.max_tokens_per_rank, sizeof(std::uint32_t),
                "forward reduce ready route counts");
@@ -1082,6 +1156,7 @@ struct PoolSlot {
   std::uint64_t *host_cancel_epoch = nullptr;
   std::uint64_t *host_socket_counts = nullptr;
   std::uint64_t *device_cancel_epoch = nullptr;
+  bool cancel_epoch_dirty = false;
   cudaEvent_t producer_ready = nullptr;
   unsigned long long producer_capture_id = 0;
   cudaEvent_t start = nullptr;

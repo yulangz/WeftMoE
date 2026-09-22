@@ -153,11 +153,38 @@ def main():
             inference.inference(0, x[:3], ids[:3], g[:3], w1, w2)
             inference.inference_eager(x[:5], ids[:5], g[:5], w1, w2)
             expected_first = inference.inference(0, x, ids, g, w1, w2)
-            expected_second = inference.inference(1, expected_first, ids, g, w1, w2)
+            expected_second = inference.inference(
+                1, expected_first, ids, g, w1, w2
+            ).clone()
+            expected_first = expected_first.clone()
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(graph_first, expected_first, rtol=0, atol=0)
             torch.testing.assert_close(graph_second, expected_second, rtol=0, atol=0)
+        benchmark_replays = int(os.environ.get("TEST_GRAPH_BENCH_REPLAYS", "0"))
+        if benchmark_replays:
+            for _ in range(10):
+                graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier(group=inference_group)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(benchmark_replays):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            per_layer_us = start.elapsed_time(end) * 1000 / benchmark_replays / 2
+            timings = [None] * inference_world
+            dist.all_gather_object(timings, per_layer_us, group=inference_group)
+            if dist.get_rank(inference_group) == 0:
+                print(
+                    "TWO_LAYER_GRAPH_PER_LAYER_US",
+                    max(timings),
+                    "replays",
+                    benchmark_replays,
+                    flush=True,
+                )
         print(rank, "MULTILAYER_GRAPH_PASS", inference.native.usage(), flush=True)
         del graph
     inference.close()

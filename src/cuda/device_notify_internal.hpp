@@ -119,6 +119,7 @@ public:
   static void validate(const CudaRouteInput &routes,
                        const RankCollectiveContext &context,
                        const CudaExecution &execution);
+  static const std::int32_t *device_pointer(const CudaRouteInput &routes);
   // Private test/benchmark adapters. Immutable storage may be shared, but
   // every lease has exact generation provenance. These declarations are not
   // installed with the public API.

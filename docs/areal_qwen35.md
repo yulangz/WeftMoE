@@ -29,8 +29,11 @@ NCCL 2.31.2 及以上版本。
 - SGLang 使用 TP=EP=4，把复制的 attention 输入按 EP rank 分片，并把路由输出还原
   成 Qwen 外层 TP 归约所需的形式。它不保留 X/AB，也没有反向状态。
 - decode 为每一层、每个 token bucket 捕获一个子 CUDA graph，共享一份串行化的传输
-  工作区；回放前把内容拷进固定 bucket 输入。动态 prefill 复用同一套已准备好的
-  runtime，不为每个长度单独缓存。该共享工作区不支持不同 stream 并发使用。
+  工作区。graph plan 直接绑定稳定的 PyTorch X/routes/gates 地址和固定
+  output，replay 不再把内容 `copy_` 进另一份 bucket 输入，也不 clone output。
+  外层 graph 中每层是一个 child graph node，其内只有一个融合 route/communication/
+  compute 的 inference kernel。动态 prefill 复用同一套已准备好的 runtime，不为每个长度
+  单独缓存。该共享工作区不支持不同 stream 并发使用。
 - AReaL 的 offload 钩子会先销毁推理图，再释放 native CUDA、IPC 和 GIN 分配；
   resume 每个驻留阶段重建一次 context 并重新捕获图。训练侧 offload 拒绝存在存活
   反向 tape 的情况。context 不会按层或按 token 重建。

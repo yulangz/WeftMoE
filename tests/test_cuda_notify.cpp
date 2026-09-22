@@ -3694,7 +3694,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     pool = weftmoe::cuda::make_device_notify_resource_pool(
         base, execution,
         {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
-         forward_smoke ? 3U : 2U});
+         forward_smoke ? 3U : 2U, 4U,
+         benchmark_forward && nodes == 1U &&
+             std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr});
   };
   if (!benchmark_forward)
     prepare_notify_pool();
@@ -3830,11 +3832,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> notify_samples;
     std::vector<double> buffer_prepare_samples;
     std::vector<double> forward_samples;
+    std::vector<double> device_kernel_samples;
+    std::vector<double> route_exchange_samples;
     std::vector<double> dispatch_samples;
     std::vector<double> fc1_samples;
     std::vector<double> fc2_samples;
+    std::vector<double> before_combine_samples;
     std::vector<double> return_samples;
     std::vector<double> reduce_samples;
+    std::vector<double> after_combine_samples;
     std::vector<double> fc1_fc2_overlap_samples;
     std::vector<double> fc2_return_overlap_samples;
     std::vector<double> return_reduce_overlap_samples;
@@ -3865,6 +3871,132 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     std::uint64_t warm_misses = 0;
     const auto rank_barrier =
         prepare_benchmark_barrier(tensor_allocator, execution_state->stream);
+    if (std::getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY") != nullptr) {
+      require(!gin_forward_benchmark && !retain_backward_state &&
+                  !allocate_tensors,
+              "Forward graph benchmark requires local inference with reused "
+              "tensors");
+      forward_config.serialized_graph_replay = true;
+      prepare_notify_pool();
+      auto generation = weftmoe::cuda::make_nccl_generation(
+          base, "cuda-forward-bench", generation_base);
+      auto context = weftmoe::make_rank_collective_context(
+          generation.session(), rank, execution.token());
+      const auto producer = weftmoe::cuda::make_external_cuda_producer(
+          context, execution.device_ordinal(), execution_state->stream,
+          execution_state, "forward-graph-benchmark-input");
+      auto routes =
+          weftmoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
+              route_storage, context, execution);
+      auto gates =
+          weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
+              gate_storage, routes, context, execution);
+      weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
+          generation, execution, pool);
+      auto notify = coordinator.run_device(
+          {common_config, routes, gates, max_tokens});
+      transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
+          generation.session(), execution, transport_config,
+          notify.dispatch(), transport_pool);
+      local_forward =
+          std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
+              generation, execution, transport_pool);
+      input_lease = producer.publish_activations(
+          static_cast<const weftmoe::transport::BFloat16 *>(
+              activation_storage->device_ptr),
+          activation_host.size(), max_tokens, hidden, activation_storage);
+      auto activations =
+          weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
+              input_lease, context, execution);
+      forward_config.tensors = weftmoe::cuda::prepare_forward_tensors(
+          notify.dispatch(), execution, forward_config);
+      check_input_cuda(cudaStreamSynchronize(execution_state->stream));
+
+      check_input_cuda(cudaStreamBeginCapture(execution_state->stream,
+                                               cudaStreamCaptureModeGlobal));
+      notify.dispatch().enqueue_notify(generation);
+      auto output = local_forward->enqueue(notify.dispatch(), activations,
+                                           weights, forward_config);
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t executable = nullptr;
+      check_input_cuda(cudaStreamEndCapture(execution_state->stream, &graph));
+      std::size_t graph_node_count = 0;
+      check_input_cuda(cudaGraphGetNodes(graph, nullptr, &graph_node_count));
+      std::vector<cudaGraphNode_t> graph_nodes(graph_node_count);
+      if (graph_node_count)
+        check_input_cuda(
+            cudaGraphGetNodes(graph, graph_nodes.data(), &graph_node_count));
+      std::size_t graph_kernel_nodes = 0;
+      std::size_t graph_memcpy_nodes = 0;
+      std::size_t graph_event_record_nodes = 0;
+      std::size_t graph_event_wait_nodes = 0;
+      for (const auto node : graph_nodes) {
+        cudaGraphNodeType type{};
+        check_input_cuda(cudaGraphNodeGetType(node, &type));
+        graph_kernel_nodes += type == cudaGraphNodeTypeKernel;
+        graph_memcpy_nodes += type == cudaGraphNodeTypeMemcpy;
+        graph_event_record_nodes += type == cudaGraphNodeTypeEventRecord;
+        graph_event_wait_nodes += type == cudaGraphNodeTypeWaitEvent;
+      }
+      check_input_cuda(cudaGraphInstantiate(&executable, graph, 0));
+      cudaEvent_t start = nullptr, end = nullptr;
+      check_input_cuda(cudaEventCreate(&start));
+      check_input_cuda(cudaEventCreate(&end));
+      const auto batch_text = std::getenv("WEFTMOE_FORWARD_GRAPH_BATCH");
+      const auto batch = batch_text
+                             ? static_cast<unsigned>(std::stoul(batch_text))
+                             : 20U;
+      require(batch > 0U, "Forward graph batch must be positive");
+      std::vector<double> samples;
+      for (std::uint32_t round = 0; round < rounds; ++round) {
+        benchmark_rank_barrier(rank_barrier, base,
+                               execution_state->stream);
+        check_input_cuda(cudaEventRecord(start, execution_state->stream));
+        for (unsigned replay = 0; replay < batch; ++replay)
+          check_input_cuda(
+              cudaGraphLaunch(executable, execution_state->stream));
+        check_input_cuda(cudaEventRecord(end, execution_state->stream));
+        check_input_cuda(cudaEventSynchronize(end));
+        float elapsed_ms = 0.0F;
+        check_input_cuda(cudaEventElapsedTime(&elapsed_ms, start, end));
+        if (round >= 10U)
+          samples.push_back(elapsed_ms * 1000.0 / batch);
+      }
+      output.wait();
+      const auto graph_device_kernel_us = output.timings().device_kernel_us;
+      const auto graph_output =
+          weftmoe::cuda::download_forward_output_for_validation(output,
+                                                                 execution);
+      std::uint64_t output_hash = 1469598103934665603ULL;
+      for (const auto value : graph_output) {
+        output_hash =
+            (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
+            1099511628211ULL;
+        output_hash =
+            (output_hash ^ static_cast<std::uint8_t>(value.bits >> 8U)) *
+            1099511628211ULL;
+      }
+      std::cout << "FORWARD_GRAPH_BENCH rank=" << rank
+                << " world=" << world << " tokens=" << max_tokens
+                << " experts=" << experts << " top_k=" << top_k
+                << " hidden=" << hidden
+                << " intermediate=" << intermediate << " batch=" << batch
+                << " graph_nodes=" << graph_node_count
+                << " graph_kernel_nodes=" << graph_kernel_nodes
+                << " graph_memcpy_nodes=" << graph_memcpy_nodes
+                << " graph_event_record_nodes=" << graph_event_record_nodes
+                << " graph_event_wait_nodes=" << graph_event_wait_nodes
+                << " device_kernel_us=" << graph_device_kernel_us
+                << " output_hash=" << output_hash << " samples=";
+      for (std::size_t index = 0; index < samples.size(); ++index)
+        std::cout << (index ? "," : "") << samples[index];
+      std::cout << std::endl;
+      check_input_cuda(cudaEventDestroy(start));
+      check_input_cuda(cudaEventDestroy(end));
+      check_input_cuda(cudaGraphExecDestroy(executable));
+      check_input_cuda(cudaGraphDestroy(graph));
+      return;
+    }
     double first_use_wall_us = 0;
     double first_use_notify_pool_us = 0;
     double first_use_notify_us = 0;
@@ -4030,11 +4162,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                                                       notify_end)
                 .count());
         forward_samples.push_back(output.timings().total_us);
+        device_kernel_samples.push_back(output.timings().device_kernel_us);
+        route_exchange_samples.push_back(output.timings().route_exchange_us);
         dispatch_samples.push_back(output.timings().dispatch_us);
         fc1_samples.push_back(output.timings().fc1_swiglu_us);
         fc2_samples.push_back(output.timings().fc2_us);
+        before_combine_samples.push_back(output.timings().before_combine_us);
         return_samples.push_back(output.timings().combine_return_us);
         reduce_samples.push_back(output.timings().reduce_us);
+        after_combine_samples.push_back(output.timings().after_combine_us);
         fc1_fc2_overlap_samples.push_back(
             output.timings().fc1_fc2_overlap_us);
         fc2_return_overlap_samples.push_back(
@@ -4218,16 +4354,24 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     emit_values(buffer_prepare_samples);
     std::cout << " forward=";
     emit_values(forward_samples);
+    std::cout << " device_kernel=";
+    emit_values(device_kernel_samples);
+    std::cout << " route_exchange=";
+    emit_values(route_exchange_samples);
     std::cout << " dispatch=";
     emit_values(dispatch_samples);
     std::cout << " fc1=";
     emit_values(fc1_samples);
     std::cout << " fc2=";
     emit_values(fc2_samples);
+    std::cout << " before_combine=";
+    emit_values(before_combine_samples);
     std::cout << " return=";
     emit_values(return_samples);
     std::cout << " reduce=";
     emit_values(reduce_samples);
+    std::cout << " after_combine=";
+    emit_values(after_combine_samples);
     std::cout << " fc1_fc2_overlap=";
     emit_values(fc1_fc2_overlap_samples);
     std::cout << " fc2_return_overlap=";

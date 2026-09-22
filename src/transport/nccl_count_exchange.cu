@@ -2349,6 +2349,19 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   const auto *direct_gates = impl_->direct_gates
                                  ? &impl_->direct_gates
                                  : static_cast<const CudaGateInput *>(nullptr);
+  bool fused_forward_only =
+      direct_routes && direct_gates && impl_->pool &&
+      impl_->pool->config.enable_unstable_inference_rows &&
+      request.config.topology.num_nodes == 1U &&
+      request.config.num_experts % request.config.topology.world_size == 0U;
+  const auto fused_owned =
+      fused_forward_only
+          ? request.config.num_experts / request.config.topology.world_size
+          : 0U;
+  for (std::uint32_t expert = 0;
+       fused_forward_only && expert < request.config.num_experts; ++expert)
+    fused_forward_only = request.config.topology.expert_to_rank[expert] ==
+                         expert / fused_owned;
   auto status = host_preflight_status(request.config, request.local_routes,
                                       request.max_tokens_per_rank,
                                       direct_routes);
@@ -2487,6 +2500,14 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
   const auto local_histogram_begin = std::chrono::steady_clock::now();
   if (status.error == ControlLocalError::None) {
     try {
+      if (fused_forward_only) {
+        route_input_bytes = direct_routes->device_bytes();
+        const auto plan = query_cuda_notify_workspace(
+            request.config, impl_->session.rank(),
+            request.local_routes.num_tokens, request.max_tokens_per_rank);
+        notify_arena_bytes = plan.device_bytes;
+        notify_pinned_bytes = plan.host_staging_bytes;
+      } else {
       auto routes = direct_routes
                         ? *direct_routes
                         : pool_allocation
@@ -2527,6 +2548,7 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
       status = preflight.status();
       if (preflight.valid())
         local = preflight.local();
+      }
     } catch (const NotifyDispatchError &) {
       // Predictable input/config failures must still join fixed control. A
       // CUDA runtime/context failure is not predictable and remains fatal.
@@ -2589,6 +2611,53 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
         initial_total + impl_->setup.config_slot_allocation_us +
         impl_->setup.count_slot_allocation_us +
         impl_->setup.summary_slot_allocation_us;
+  }
+
+  if (fused_forward_only) {
+    if (status.error != ControlLocalError::None)
+      invalid("phase=fused-forward-prepare, field=preflight, rank=" +
+              std::to_string(impl_->session.rank()) +
+              ", expected=valid after agreement, actual=invalid");
+    auto result = std::make_shared<ValidatedCudaGeneration::Impl>();
+    result->dispatch = DeviceNotifyPoolBridge::run_single(
+        request.config, impl_->context, impl_->execution, *direct_routes,
+        *direct_gates, request.max_tokens_per_rank, pool_allocation,
+        pool_lease);
+    result->audit = impl_->backend->audit();
+    result->workspace = {};
+    for (const auto &slot : impl_->pool->slots) {
+      const auto backend_usage = slot.backend->workspace_usage();
+      result->workspace.device_bytes +=
+          DeviceNotifyPoolBridge::device_bytes(slot.notify) +
+          backend_usage.device_bytes;
+      result->workspace.pinned_host_bytes +=
+          DeviceNotifyPoolBridge::pinned_bytes(slot.notify) +
+          backend_usage.pinned_host_bytes;
+      result->workspace.event_count +=
+          5U + DeviceNotifyPoolBridge::event_count(slot.notify);
+    }
+    result->workspace.route_input_device_bytes = route_input_bytes;
+    result->workspace.device_notify_arena_bytes = notify_arena_bytes;
+    result->workspace.device_notify_pinned_staging_bytes =
+        notify_pinned_bytes;
+    result->workspace.final_device_metadata_arena_view_capacity_bytes =
+        notify_arena_bytes;
+    result->workspace.device_bytes += route_input_bytes;
+    result->setup = impl_->setup;
+    const auto run_end = std::chrono::steady_clock::now();
+    result->execution.coordinator_run_wall_us =
+        std::chrono::duration<double, std::micro>(run_end - run_start).count();
+    result->execution.steady_execution_us =
+        result->execution.coordinator_run_wall_us;
+    result->execution.control_config_us =
+        std::chrono::duration<double, std::micro>(control_config_end -
+                                                  control_config_start)
+            .count();
+    result->execution.notify_handle_ready_offset_us = offset_us(run_end);
+    result->resource_lease = pool_lease;
+    impl_->pool->single_notify_ready.store(true);
+    testing::g_validated_publishes.fetch_add(1);
+    return ValidatedCudaGeneration(std::move(result));
   }
 
   BackendCompletion count_done;

@@ -42,6 +42,7 @@ struct alignas(128) Shared {
       Buffers > DispatchLanes * kDispatchBuffers
           ? Buffers : DispatchLanes * kDispatchBuffers;
   static constexpr unsigned kThreads = Threads;
+  static constexpr unsigned kWarps = Threads / 32U;
   static constexpr unsigned kCopyWarps = Threads / 32U - 1U;
   static constexpr unsigned kCopyThreads = kCopyWarps * 32U;
   static constexpr unsigned kCopyBarrier = 8U;
@@ -272,7 +273,8 @@ __device__ __forceinline__ void finish_copies() {
 // policy retains the original interleaved rows and completion barrier.
 template <unsigned BaseThread, unsigned ActiveCopyWarps = 0U,
           unsigned SlotOffset = 0U, unsigned BarrierId = 8U,
-          bool Optimize = true, bool DynamicDispatch = false, class Storage>
+          bool Optimize = true, bool DynamicDispatch = false,
+          bool StaticV4 = false, class Storage>
 __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
                                                   Storage &s) {
   constexpr auto warps =
@@ -304,14 +306,22 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
       const auto row = a.dispatch.route_dst_row[route];
       const auto token = route / a.dispatch.identity.top_k;
       auto *base = a.peer_bases[destination];
-      peer_at<LocalP2pRouteHeader>(base, a.direct_headers_offset)[row] =
-          LocalP2pRouteHeader{
-              transport::kActivationTransportSchemaVersion,
-              a.rank, destination, 0U, a.dispatch.identity.generation,
-              execution_epoch(a), forward_contribution_row(a, route), route, token, row,
-              a.dispatch.expert_id[route],
-              static_cast<unsigned>(route % a.dispatch.identity.top_k)};
-      peer_at<float>(base, a.canonical_gates_offset)[row] = a.gates[route];
+      if constexpr (StaticV4) {
+        peer_at<static_v4::RouteHeader>(base, a.direct_headers_offset)[row] =
+            static_v4::RouteHeader{
+                static_cast<std::uint32_t>(forward_contribution_row(a, route)),
+                a.rank};
+        peer_at<float>(base, a.canonical_gates_offset)[row] = a.gates[route];
+      } else {
+        peer_at<LocalP2pRouteHeader>(base, a.direct_headers_offset)[row] =
+            LocalP2pRouteHeader{
+                transport::kActivationTransportSchemaVersion,
+                a.rank, destination, 0U, a.dispatch.identity.generation,
+                execution_epoch(a), forward_contribution_row(a, route), route,
+                token, row, a.dispatch.expert_id[route],
+                static_cast<unsigned>(route % a.dispatch.identity.top_k)};
+        peer_at<float>(base, a.canonical_gates_offset)[row] = a.gates[route];
+      }
       peer_rows += destination != a.rank;
     }
     if constexpr (Optimize)
@@ -365,7 +375,8 @@ __device__ __forceinline__ bool progress_dispatch(const ForwardKernelArgs &a,
       __syncwarp();
     else
       copy_sync<threads, BarrierId>();
-    for (auto item = begin + metadata_tid; item < end; item += metadata_stride) {
+    for (auto item = begin + metadata_tid; item < end;
+         item += metadata_stride) {
       const auto route = a.dispatch_waves.local_route_order[item];
       local_notification_detail::Receiver<ForwardKernelArgs>::publish_dispatch(
           a, a.dispatch_waves.route_dst_mtile[route],
@@ -967,8 +978,10 @@ run_static_v4(const ForwardKernelArgs &a,
               persistent_v3::ForwardPipelineControl &control,
               unsigned long long *scheduler,
               Shared<Threads, SegmentBytes, Buffers, DispatchLanes> &storage) {
-  static_v4_run_single_node<Threads, BaseThread>(a, control, scheduler,
-                                                 storage);
+  using StaticStorage = StaticV4Shared<Threads, SegmentBytes>;
+  static_assert(sizeof(StaticStorage) <= sizeof(storage));
+  static_v4_run_single_node<Threads, BaseThread>(
+      a, control, scheduler, *reinterpret_cast<StaticStorage *>(&storage));
 }
 
 #include "cuda/persistent_v3/forward/unified_local_warps.cuh"

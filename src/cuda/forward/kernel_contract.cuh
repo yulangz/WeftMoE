@@ -3,6 +3,16 @@
 // inlining and code generation while the Forward boundary remains explicit.
 struct ForwardKernelArgs {
   DeviceDispatchKernelView dispatch;
+  // Static-V4 inference can construct its compact routing metadata in this
+  // kernel.  The selected-expert tensor remains router-owned; every other
+  // pointer in dispatch targets the IPC-visible Forward pool.
+  const std::int32_t *selected_experts = nullptr;
+  std::uint64_t *fused_local_expert_count = nullptr;
+  std::uint32_t *fused_source_routes = nullptr;
+  std::uint64_t max_routes_per_rank = 0;
+  std::size_t source_input_offset = 0;
+  std::size_t fused_source_gates_offset = 0;
+  bool fused_single_node_routes = false;
   const transport::BFloat16 *input;
   const float *gates;
   const transport::BFloat16 *w1;

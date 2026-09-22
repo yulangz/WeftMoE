@@ -1,69 +1,53 @@
 # WeftMoE Static Forward V4：单机与多机重构设计
 
-## 0. 当前实现状态（2026-09-21）
+单机 inference-only 路径的逐项性能消融与失败实验见
+[`static_forward_v4_optimize_record.md`](static_forward_v4_optimize_record.md)。
 
-首个单机 inference-only 数据面已经落地，训练与多机仍保持 V3。当前是
-route-plan 尚未融合的过渡实现：
+## 0. 当前实现状态（2026-09-22）
 
-- route plan 暂时继续使用独立的 single-node inference notify kernel；尚未把
-  count exchange/materialize 物理融合进 Forward kernel；
-- Forward 只 launch 一个覆盖 132 SM 的 homogeneous resident grid，每个 384-thread
-  CTA 都具有相同代码和资源合同：`0..255` 为两个 WGMMA math warpgroup，
-  `256..287` 为 TMA producer warp，`288..383` 为两个 copy warp 加一个 notification
-  receive warp。不存在 24 个特殊 transport CTA；
-- source-push Dispatch 按 CTA/route batch 固定条带分配；FC1 pair、FC2 unit、Return
-  row stripe 都有确定 owner；V4 路径不再使用 FC1/FC2/Return work-claim queue 或
-  CAS。Reduce 采用混合策略：每 rank 少于 64 token 时复用已调优的
-  ready-token queue，64 token 及以上改用 per-route epoch 和固定 token stripe；
-- FC2 tile completion 不能直接作为 NVLink Return 可见性信号。实现另有一个位于
-  `__threadfence_system()` 之后的 per-M-block epoch，静态 Return owner acquire 该
-  epoch 后才读取 payload；
-- 数值主体继续复用 V3 的 BF16/WGMMA micro-kernel，M/N/K tile、FC1 SwiGLU
-  epilogue、FC2 store 和 top-k FP32 固定 combine order 均未改变；
-- 当前数值 tile 为 M128、FC1 N128、FC2 N256、K64，cluster size 2。FC1 每个 math
-  thread 的 gate/up accumulator 各 64 个 FP32；FC2 每次只让单个 N256 tile 的 128 个
-  FP32 accumulator 存活，离开 epilogue 词法域后才进入 task/Return 控制逻辑；
-- `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1` 可回退到 V3，供正确性与性能 A/B；
-- 静态进度在每个 cluster 内用两个 16-bit 计数编码。host 按 pool 的最坏 M-block
-  容量做显式门禁，超界会在 launch 前报错，绝不截断或丢弃任务。
+单机 inference-only V4 已经完成一次按 MegaMOE 数据面重写。本节是当前实现
+的准绳；后文保留了最初的设计推演，其中 source-push 等已被实测否定的选择
+不再代表当前单机实现。训练和多机仍保持 V3。
 
-已通过 EP8 的 8-token、64-token 平衡路由，以及 64-token 全部 route 集中到
-rank 0（其余七 rank 零 incoming rows）的训练参考、inference eager、双层 CUDA
-Graph replay 和 workspace 生命周期回归。一次 `(M-block, source-rank)` Return task
-实验在固定路由下可运行，但在 graph 多代、动态 route/bucket 切换时出现通知 credit
-等待环，已撤回。当前 Return 使用与 peer occupancy 无关的固定 row stripe，并在
-stripe 内做 mixed-peer publication。Return 拷贝粒度由冻结后的平均 M-block
-占用率决定：平均有效行数 `<=16` 时一个 M-block 一个 task，`17..64` 时
-分成 16 个 8-row stripe，`>64` 时分成 8 个 16-row stripe。这个选择不依赖
-source-rank 分布，因而 graph replay 换路由时 task 几何不会改变。
+- route exchange、X/gate staging、destination pull、FC1/SwiGLU、FC2、Return/Combine 和
+  终止清理已物理融合在一个 kernel 中。inference steady state 每层只有一个
+  fused kernel，没有独立 notify kernel，也没有 host `handle.wait()`；
+- kernel 使用 132 个 384-thread homogeneous CTA。所有 CTA 具有相同代码与资源
+  合同：`0..255` 是两个 math warpgroup，`256..287` 是 TMA producer warp，
+  `288..383` 是三个 pull/control warp。不存在专用 transport CTA；
+- 每个 source 把 route id 发布到 destination 上按 `(expert, source, slot)` 索引的
+  symmetric route table，并把 X/gates 一次 staging 到 source-local symmetric storage。各
+  destination 的 control warps 用确定性 source-round-robin row 顺序 pull payload。它没有
+  work queue、claim CAS 或特殊 CTA；
+- route exchange 结束后，FC1 pair 和 FC2 unit 通过
+  `cluster + round * cluster_count` 静态枚举。有限静态工作不再在每个 row/task/barrier
+  中轮询 system-scope cancellation word；V3/训练路径仍保留可取消逻辑；
+- 数值主体复用 BF16/WGMMA micro-kernel、FP32 accumulator、SwiGLU rounding 点和
+  top-k FP32 固定 combine order。当前 autotune 结果为 M128、FC1 N64、FC2 N128、
+  K128、FC1/FC2 各3 stages、cluster size 2。MegaMOE 形状的 N128/K64 候选在该
+  workload 上反而约为 81 us，因此 tile 由 autotune 选择，不为形式对齐强制写死；
+- CUDA Graph 计划直接绑定稳定的 PyTorch X/routes/gates 地址和固定 output，
+  replay 没有 input `copy_` 或 output clone。外层 graph 中每层是一个 child graph node，
+  child graph 内只有上述 fused kernel；
+- pool 按公开的最大 route 容量预留 route table/canonical row 空间。host 在 launch
+  前检查容量，合法 route 不使用 capacity factor，不截断、不取模覆盖、不丢 token。
 
-Qwen EP8、64 experts、top-k 4 的最终定位发现：V4 曾被误放入 legacy split-grid
-host 初始化分支，每次 Forward 额外 launch 一次
-`initialize_forward_generation_signals_kernel`，随后 unified V4 主 kernel 内又做了同样的
-generation 初始化。device timeline 显示 V3/V4 从 `KernelEnter` 到 terminal 都约为
-265.5 us，原先的固定差距全部在 `KernelEnter` 之前。删除重复 kernel 后，再把
-register/stack/dynamic-smem/cluster occupancy 这些不随 invocation 变化的 launch 校验按
-backend 缓存。
+严格 EP8 decode case（H=2048、I=512、64 experts、top-k=4、64 token/rank）的
+裸 fused CUDA Graph rank-max p50 为 **72.50 us**，已包含 X staging 且直接读取
+routes/gates。真实 tensor runtime 的双层 child graph 测得 **74.24 us/层**。
+MegaMOE 同 shape 的 graph kernel 是 62.6 us，但图外三份 input copy 是 11.5 us；
+公平口径为 74.1 us。因此裸 fused graph 快约 1.6 us（2.2%），而包含 child-graph
+调度的应用口径与之相差 0.14 us（0.2%）。WeftMoE 内部 clock
+与 MegaMOE CUDA-event kernel-only 不是同一计时口径，不将二者直接比较。
 
-最终性能使用同一进程、同一权重与路由，逐 iteration 交错 V4/V3，并每轮反转
-先后顺序；每点 20 次 warmup、100 次测量，报告 rank-max median（单位为 us）：
+已通过平衡路由和 64 token/rank 极端 skew 路由的 8-rank tensor parity、双层
+CUDA Graph replay、graph 销毁/offload 与 workspace 生命周期回归。平衡微基准在
+多轮 graph replay 后的 8 个 rank output hash 也与固定期望值完全一致。
 
-| token/rank | V4 total | V3 total | V4 - V3 | V4 Dispatch | V4 FC1 | V4 FC2 | V4 Return |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 207.216 | 221.392 | -14.176 | 42.768 | 34.016 | 32.880 | 55.648 |
-| 8 | 240.336 | 248.416 | -8.080 | 47.360 | 34.464 | 33.120 | 86.144 |
-| 64 | 267.120 | 270.320 | -3.200 | 48.384 | 37.824 | 34.864 | 106.672 |
-| 256 | 291.872 | 296.400 | -4.528 | 57.216 | 39.776 | 32.736 | 119.152 |
+状态：设计与实现记录；单机 inference-only V4 融合路径已通过 EP8 门禁，
+多机与 training 重构尚未实现
 
-`reduce_us` 在静态模式下包含最早 owner 等待 route epoch 到最后 owner 结束的时间，
-不是纯 Reduce 算力耗时，因此不放入表格做横向解读。V4 已在四个测试点
-稳定快于 V3；下一阶段的主要性能目标是减少 64-token 的 Return notification
-放大，同时完成 route-plan/Forward 物理融合，再接多机 V4。
-
-状态：设计文档；单机 inference-only V4 过渡实现已通过 EP8 门禁，多机与
-training 重构尚未实现
-
-日期：2026-09-21
+日期：2026-09-22
 
 范围：Hopper BF16 Forward；覆盖 inference，以及需要保存 Forward 中间激活的
 training Forward。Backward kernel 本身不在本轮重写范围内，但新 Forward tape
@@ -85,27 +69,28 @@ training Forward。Backward kernel 本身不在本轮重写范围内，但新 Fo
    task 集合被冻结；CTA/cluster/warp 通过 `worker + round * workers` 的闭式编号
    枚举自己的任务。原子计数仅用于 payload readiness、跨 GPU release/acquire、
    GIN ring credit 和错误发布，不再用于“谁来做这项工作”的分配。
-4. **单机和多机统一采用 source-push**。单机 source 直接从调用方 `x` 向本机
-   expert GPU 的 canonical row 做 NVLink/IPC push；多机 remote route 先做 GIN
-   push，再由目标 rail GPU 静态 relay。这样不需要 symmetric-input copy，也不把
-   单机实现绑定到 destination-pull 专用的 route table/barrier。
+4. **单机使用 destination-pull，多机保留 push/relay 方向**。单机 source 在
+   fused kernel 内把 X/gates staging 到 source-local symmetric storage，并向 expert owner
+   发布紧凑 route table；destination 的同构 control warp 静态 pull canonical row。
+   这条实测路径比 source-push 更接近 MegaMOE，也避免了 push 方构造最终 row
+   位置和频繁 remote readiness 原子操作。多机 remote route 仍必须使用 GIN push，
+   再由目标 rail GPU 静态 relay，不使用跨机 pull。
 5. **多机只使用跨机 push**。每个 GIN channel 有固定 owner，按静态 sequence
    顺序打包和发送；目标节点的 receive/relay channel 也有固定 owner，再通过
    NVLink/IPC relay 到 expert GPU。跨机 pull 不进入方案。
 6. **不尝试让 route exchange 与 GEMM 重叠**。先完成 route counting、count
    exchange 和 task geometry 冻结，再开始 payload Dispatch 与计算流水。Payload
    Dispatch、FC1、FC2、Return、Reduce 仍然互相重叠。
-7. **canonical expert row 采用 source-major 稳定布局**，而不是 MegaMOE 的
-   source-rank round-robin 物理行布局：
+7. **单机 inference canonical row 采用确定性 source-rank round-robin 布局**：
 
    ```text
-   row(e, source, slot)
-     = expert_base[e] + source_prefix[e, source] + slot
+   row(e, source, slot) = expert_base[e] + round_robin(source, slot)
    ```
 
-   source-major 让 push 方能 O(1) 算出目标地址、连续合并同一 source 的写入，并
-   给 training 一个清楚的 M/reduction 顺序。发送任务仍可按 source/channel
-   轮转，以获得链路负载均衡；任务顺序与物理行顺序不再耦合。
+   route table 仍按 `(expert, source, slot)` 存放，pull 时逐层轮转所有仍有行的
+   source。这使相邻 warp 分散到不同 NVLink peer，同时保持路由给定时 row
+   顺序唯一。training 未改用该 inference-only 布局；其 tape/dW 顺序仍由 V3
+   合同保证。
 8. **保留现有 GEMM 数值合同**：FC1/FC2 的 N tile、K tile、K 累加顺序、FP32
    accumulator、BF16 rounding 点、SwiGLU/gate 精度和最终 top-k reduction 顺序均
    不变。本轮只改任务如何枚举和数据何时 ready，不改一个输出元素内部的 reduction。
@@ -291,7 +276,7 @@ struct DispatchTask {
 | 阶段 | 静态 ownership |
 |---|---|
 | route chunks | `chunk = cta + round * num_ctas` |
-| local/source-push Dispatch | `task = comm_worker + round * num_comm_workers` |
+| local destination-pull Dispatch | `row = global_warp + round * global_warps` |
 | GIN send | `channel -> fixed GIN owner CTA`; owner 按 sequence 递增发送该 channel 的 task |
 | GIN receive | `channel -> fixed receive owner`; owner按预期 sequence 消费，不做全局 claim |
 | node-local relay | 一个 receive chunk 内 `row = relay_warp + round * relay_warps` |
@@ -366,32 +351,28 @@ TMA producer 区域和若干 communication warps，具体线程布局由 autotun
 
 ```text
 1. invocation epoch/setup
-2. local route count + source_slot
-3. LSA/NVLink count exchange
-4. node-wide CountsReady barrier
-5. destination prefix/mblock/wave + immutable DispatchTask materialization
-6. grid sync: route plan frozen
-7. static source-push Dispatch  ─┐
-8. static FC1 -> SwiGLU -> FC2  ├─ overlap by readiness counters
-9. static NVLink Return         ┤
-10. fixed-order token Reduce    ┘
-11. node-wide Drain/epoch barrier, publish output completion
+2. math lanes: X staging + combine order
+   control lanes: local route histogram + (expert, source, slot) table
+3. publish source counts/table, node-wide CountsReady barrier
+4. destination prefix/mblock geometry
+5. homogeneous control warps destination-pull canonical rows ─┐
+6. statically owned FC1 -> SwiGLU -> FC2                 ├─ readiness overlap
+7. Return contribution publication                         ┤
+8. node-wide BeforeCombine barrier + fixed-order Reduce    ┘
+9. clear reusable counters + node-wide AfterClean barrier
 ```
 
-选择 source-push 的原因：
+实测后选择 destination-pull 的原因：
 
-- 直接读取调用方 `x/routes/gates`，不需要先复制到 persistent symmetric input；
-- source 在 CountsReady 后可由 `source_slot + source_prefix` O(1) 算出 canonical
-  row，target 不需要动态分配 slot；
-- DispatchTask 在 plan 阶段一次冻结，communication warp 通过闭式编号静态分工，
-  不保留当前 WeftMoE 的 queue/claim 路径；
-- 单机 NVLink direct push 与多机 GIN push 共用 route/task/header/readiness 合同，
-  仅 transport primitive 不同；
-- 每个 task 只覆盖一个 destination mblock，完成整个 chunk 后一次 release-add 行数，
-  避免无条件逐 route readiness atomic。
-
-destination-pull 不进入 V4 首版范围。如果 source-push 静态化后仍显著落后 MegaMOE，
-再将 pull 作为独立 transport ablation，而不是让两种协议同时增加首轮重构复杂度。
+- destination 独占 canonical row 几何和 readiness publication，source 只发布紧凑
+  route id/count，不需要计算 remote row 或对 remote counter 做逐 route 原子更新；
+- row 按 source-rank round-robin 确定排列，相邻 pull warp 自然分散到不同 peer；
+- X 的 source-local symmetric staging 在同一 kernel 开头由原本空闲的 math lanes 完成，
+  替代 MegaMOE 在 graph 外的 input copy，routes/gates 直接从调用方稳定地址读取；
+- control warp 以 `global_warp + round * global_warps` 闭式枚举 row，不需要
+  DispatchTask materialization、queue、claim cursor 或专用 CTA；
+- pull payload 落在本 GPU 后只需 device-scope release/acquire，不再需每行的
+  system-scope payload publication。
 
 ## 6. 多机流程
 
@@ -570,16 +551,18 @@ arena 的 correctness capacity 遵守第 3.2 节，不能通过 drop 换取固�
 
 ```text
 src/cuda/static_v4/
-  route_plan.cuh              # fast/stable source_slot、count/prefix
-  task_geometry.cuh           # Dispatch/FC1/FC2/Return 隐式枚举
-  synchronization.cuh         # epoch、ready、错误、EP barrier
-  compute.cuh                 # 复用现有 TMA/WGMMA micro-kernel
-  single_node_transport.cuh   # source-push / NVLink Return
-  multi_node_transport.cuh    # fixed GIN owners / RX relay / Return
-  single_node_kernel.cuh
-  multi_node_kernel.cuh
-  launch.cu
+  contract.cuh                    # route/header 合同
+  memory_order.cuh                # 单向 release/acquire PTX primitives
+  single_node_initialize.cuh      # invocation/pool 初始化
+  single_node_route_exchange.cuh  # fused count/table/X staging
+  single_node_transport.cuh       # homogeneous destination-pull
+  single_node_collective.cuh      # EP barrier/cleanup
+  fc2_epilogue.cuh                # FC2 contribution publication
+  single_node_finalize.cuh        # reduce/finalize
 ```
+
+GEMM 与静态 FC1/FC2 task 枚举仍复用 `persistent_v3/forward` 中的数值主体，
+通过 `StaticSchedule` 编译期分支移除 V3 queue/cancellation hot path，不复制一份 GEMM。
 
 Host 侧引入 capacity-based `StaticForwardRuntime`/slot pool。现有 public API 可先由
 adapter 桥接，但 inference hot path 不再构造/消费 CPU-visible `DeviceDispatchHandle`。

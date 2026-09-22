@@ -68,6 +68,8 @@ PARAMETER_MACROS = {
     "tile_k": "WEFTMOE_FWD_TILE_K",
     "fc1_stages": "WEFTMOE_FWD_FC1_STAGES",
     "fc2_stages": "WEFTMOE_FWD_FC2_STAGES",
+    "static_v4_fc1_stages": "WEFTMOE_FWD_STATIC_V4_FC1_STAGES",
+    "static_v4_fc2_stages": "WEFTMOE_FWD_STATIC_V4_FC2_STAGES",
     "fc2_claim_tiles": "WEFTMOE_FWD_FC2_CLAIM_TILES",
     "opportunistic_reduce_warps": "WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS",
     "gin_channel_pack_limit": "WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT",
@@ -201,10 +203,11 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "cluster multicast requires tile_m=128")
     _require_choice(config, "fc1_tile_n", (64, 128, 256))
     _require_choice(config, "fc2_tile_n", (64, 128, 256))
-    _require(config["tile_k"] == 64,
-             "the Hopper 128-byte-swizzle TMA descriptor requires tile_k=64")
+    _require_choice(config, "tile_k", (64, 128))
     _require_choice(config, "fc1_stages", (2, 3, 4))
     _require_choice(config, "fc2_stages", (2, 3, 4))
+    _require_choice(config, "static_v4_fc1_stages", (2, 3, 4, 5, 6))
+    _require_choice(config, "static_v4_fc2_stages", (2, 3, 4, 5, 6))
     _require_choice(config, "fc2_claim_tiles", (1, 2, 4, 8))
     _require(config["compute_threads"] == 384,
              "the current producer + two-math-WG kernel requires 384 threads")
@@ -229,8 +232,9 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "Forward requires cluster_size=2 for TMA multicast")
     _require(config["fc2_tma_store"],
              "Forward requires the FC2 TMA-store epilogue")
-    _require(dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
-             "GEMM input/output staging exceeds Hopper shared memory")
+    unified_tuning.require_resources(
+        dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
+        "GEMM input/output staging exceeds Hopper shared memory")
     if config["unified_workers"]:
         unified_tuning.require_resources(unified_tuning.shared_memory_upper_bound(
             config, dynamic_shared_memory(config, 16)["compute_bytes"],
@@ -305,7 +309,9 @@ def expand_search_space(document: dict[str, Any]) -> None:
         space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
                                           "gin_channel_pack_limit": 3,
                                           "gin_receive_rows": 128,
-                                          "gin_fanout_lanes": 1})
+                                          "gin_fanout_lanes": 1,
+                                          "static_v4_fc1_stages": 4,
+                                          "static_v4_fc2_stages": 4})
     provided = flatten_groups(space, require_all=False)
     # Normalize without reordering axes so candidate names and overrides stay
     # identical when a configuration adopts the new public spelling.
@@ -359,7 +365,9 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
         space, search=True, extra_defaults={"opportunistic_reduce_warps": 1,
                                           "gin_channel_pack_limit": 3,
                                           "gin_receive_rows": 128,
-                                          "gin_fanout_lanes": 1})
+                                          "gin_fanout_lanes": 1,
+                                          "static_v4_fc1_stages": 4,
+                                          "static_v4_fc2_stages": 4})
     flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
@@ -412,7 +420,9 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
             extra_defaults={"opportunistic_reduce_warps": 1,
                             "gin_channel_pack_limit": 3,
                             "gin_receive_rows": 128,
-                            "gin_fanout_lanes": 1})
+                            "gin_fanout_lanes": 1,
+                            "static_v4_fc1_stages": 4,
+                            "static_v4_fc2_stages": 4})
         document.get("fixed", {}).get("1_gemm", {}).setdefault("fc2_claim_tiles", 1)
         # Historical frozen plans retain this removed tail-only parameter.
         # New pure hyperparameter files reject it as unknown.
@@ -473,8 +483,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     if launcher == "local":
         _require(benchmark["world"] in (1, 2, 8),
                  "local benchmark.world must be 1, 2, or 8")
-    _require(benchmark["top_k"] in (1, 6, 8),
-             "benchmark.top_k must be 1, 6, or 8")
+    _require(benchmark["top_k"] in (1, 4, 6, 8),
+             "benchmark.top_k must be 1, 4, 6, or 8")
     _require(benchmark["tune_rounds"] > 10 and
              benchmark["final_rounds"] > 10,
              "Forward benchmark rounds must be >10")
@@ -564,28 +574,40 @@ def materialize_candidate(candidate: Mapping[str, Any],
     }
 
 
-def gemm_storage_bytes(config: Mapping[str, Any]) -> int:
-    a_stage = config["tile_m"] * config["tile_k"]
-    fc1_b_stage = config["fc1_tile_n"] * config["tile_k"]
-    fc2_b_stage = config["fc2_tile_n"] * config["tile_k"]
-    a_storage = max(config["fc1_stages"], config["fc2_stages"]) * a_stage
-    b_storage = max(2 * config["fc1_stages"] * fc1_b_stage,
-                    config["fc2_stages"] * fc2_b_stage)
-    fc2_storage = config["fc2_stages"] * (a_stage + fc2_b_stage)
+def gemm_storage_bytes(config: Mapping[str, Any], *, static_v4: bool) -> int:
+    tile_k = config["tile_k"] if static_v4 else 64
+    fc1_stages = (config["static_v4_fc1_stages"] if static_v4
+                  else config["fc1_stages"])
+    fc2_stages = (config["static_v4_fc2_stages"] if static_v4
+                  else config["fc2_stages"])
+    a_stage = config["tile_m"] * tile_k
+    fc1_b_stage = config["fc1_tile_n"] * tile_k
+    fc2_b_stage = config["fc2_tile_n"] * tile_k
+    a_storage = max(fc1_stages, fc2_stages) * a_stage
+    b_storage = max((1 if static_v4 else 2) * fc1_stages * fc1_b_stage,
+                    fc2_stages * fc2_b_stage)
+    fc2_storage = fc2_stages * (a_stage + fc2_b_stage)
     if config["fc2_claim_tiles"] > 1:
         fc2_storage += config["tile_m"] * config["fc2_tile_n"]
     return 2 * max(a_storage + b_storage, fc2_storage)
 
 
 def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
-    gemm_bytes = gemm_storage_bytes(config)
+    gemm_bytes = gemm_storage_bytes(config, static_v4=False)
+    static_gemm_bytes = gemm_storage_bytes(config, static_v4=True)
     barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
+    static_barriers = (2 * config["static_v4_fc1_stages"] +
+                       2 * config["static_v4_fc2_stages"])
     control_bytes = barriers * 8 + world * 4
+    static_control_bytes = static_barriers * 8 + world * 4
     row_streams = max(config["local_dispatch_tma_warps"],
                       config["relay_tma_warps"], config["relay_scatter_warps"])
     transport_rows = row_streams * config["main_hidden"] * 2
     return {
-        "compute_bytes": gemm_bytes + control_bytes,
+        "compute_bytes": max(gemm_bytes + control_bytes,
+                             static_gemm_bytes + static_control_bytes),
+        "generic_compute_bytes": gemm_bytes + control_bytes,
+        "static_v4_compute_bytes": static_gemm_bytes + static_control_bytes,
         "transport_bytes": max(gemm_bytes, transport_rows) + control_bytes,
     }
 
