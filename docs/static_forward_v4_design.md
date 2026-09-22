@@ -376,6 +376,41 @@ TMA producer 区域和若干 communication warps，具体线程布局由 autotun
 
 ## 6. 多机流程
 
+### 6.0 复审：进度、容量与首版实现边界
+
+2026-09-22 复审发现，原先 6.1–6.3 的 channel ring 方案还缺少三项证明：
+
+- 固定 TX owner 阻塞等待 credit 时，必须有独立、始终 resident 的 RX owner
+  继续返回 credit；同一 owner 顺序处理 TX/RX/Return 会形成跨 rank 等待环。
+- `(destination, mblock)` bucket 数不能仅由每个 expert 的总 count 推出。
+  若沿用这种分包，必须交换各 channel 的精确 descriptor 数；不能把 route count
+  除以 chunk size 当作 terminal sequence。
+- NIC 完成读取 TX staging、远端 payload 可见、消费者结束读取 RX staging
+  是三种不同事件。weak signal 自身不能替代 flush/acquire，远端 credit 也不能
+  代替本地 NIC completion 后才可复用 TX storage 的条件。
+
+首版多机 inference 将使用完整 invocation arena，取消 activation ring 的复用
+依赖。跨机数据按 source rail 推送一次到目标节点的注册 staging，目标节点再用
+现有静态 destination-pull 填充 canonical rows。这里的 pull 只发生在节点内部。
+每个 source 的 route list 按 expert 紧凑排列，附带 expert prefix/count；不发送
+V3 的 packet/fanout/wave 描述，也不构造动态 work queue。
+
+Return 同样使用独立的 TX/RX arena。FC2 向 source 所在 rail 写紧凑 contribution，
+按目标节点的 expert 区间排布；GIN 只发送该区间的实际 route 数。source 用本次
+route plan 中的 compact index 直接读取返回值，保持现有 `(expert, top-k slot)`
+固定 FP32 combine 顺序。TX 与 RX 不得别名：双向传输可能在对端读完 TX 前覆盖
+相同地址。
+
+所有 rank 经 GPU collective 确认阶段完成后才复用 arena，因此不需要 ring credit、
+terminal packet 或 task claim。首先验证阶段间有明确边界的单 kernel 协议；跨机
+Dispatch/Return 与计算的重叠作为后续独立优化测量，不能宣称首版已经具备这种重叠。
+容量随节点数和公开的 token capacity 推导，循环与 offset 不假设恰好两机。
+不同 source 可有不同实际 token 数，传输长度必须取 source 发布的实际计数。
+目前硬件只能验证两机；三机以上需要后续实机门禁。
+
+以下 6.1–6.3 保留为后续有界流式传输的设计候选，不作为首版 ring 协议已经完备
+的声明。
+
 多机 kernel 与单机共享 route count/count exchange、canonical geometry 和 compute
 scheduler，但不执行单机 symmetric-input copy/route-table publication；remote route
 由 source-side push task 直接携带。transport specialization 如下：
