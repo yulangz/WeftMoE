@@ -171,6 +171,19 @@ forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
   }
   if ((!a.use_gin && !a.forward_stream_local_dispatch) || valid_rows == 0U)
     return true;
+  if constexpr (StaticLocal) {
+    if (a.fused_single_node_routes) {
+      // Fused inference builds M128 geometry directly. Unlike V3 Notify's
+      // smaller tiles, exactly one arrival counter covers this compute tile.
+      const auto tile = a.dispatch.mtile_row_offsets[expert] +
+                        local_row / forward_tuning::kTileM;
+      const auto *arrived = peer_at<unsigned long long>(
+          a.local_base, a.x_arrived_rows_offset);
+      return static_v4::load_acquire_device(
+                 arrived + tile * a.local_world_size +
+                     a.rank % a.local_world_size) >= valid_rows;
+    }
+  }
   const auto end_row = local_row + valid_rows;
   const auto tile_begin = a.dispatch.mtile_row_offsets[expert];
   const auto tile_end = a.dispatch.mtile_row_offsets[expert + 1ULL];
@@ -187,27 +200,10 @@ forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
     if (tile_row >= end_row)
       break;
     unsigned long long total = 0ULL;
-    if constexpr (StaticLocal) {
-      if (a.fused_single_node_routes) {
-        // Static-V4 destination-pull materializes every row locally and
-        // publishes all arrivals on the local-rank rail.  Avoid eight
-        // system-scope peer-visible loads at every scheduler probe.
-        total = static_v4::load_acquire_device(
-            arrived + tile * a.local_world_size +
-            a.rank % a.local_world_size);
-      } else {
-        for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-              ready(arrived[tile * a.local_world_size + rail]);
-          total += ready.load(::cuda::memory_order_acquire);
-        }
-      }
-    } else {
-      for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-            ready(arrived[tile * a.local_world_size + rail]);
-        total += ready.load(::cuda::memory_order_acquire);
-      }
+    for (std::uint32_t rail = 0; rail < a.local_world_size; ++rail) {
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
+          ready(arrived[tile * a.local_world_size + rail]);
+      total += ready.load(::cuda::memory_order_acquire);
     }
     if (total < expected)
       return false;

@@ -20,17 +20,21 @@ __device__ __forceinline__ void static_v4_push_fc2_tile(
   cutlass::arch::NamedBarrier::sync(
       kMathThreads, physical_barrier<true>(kMathReadyBarrier));
 
-  const auto row = threadIdx.x & 127U;
-  if (row < valid_rows) {
+  // Neighboring lanes write neighboring vectors of one contribution row.
+  // Assigning one lane per row scatters every warp across H-strided peer
+  // addresses and turns each 16-byte store into its own NVLink transaction.
+  constexpr auto kRowLanes = 8U;
+  constexpr auto kElements = sizeof(uint4) / sizeof(transport::BFloat16);
+  const auto column_lane = threadIdx.x % kRowLanes;
+  for (auto row = threadIdx.x / kRowLanes; row < valid_rows;
+       row += kMathThreads / kRowLanes) {
     const auto &header = static_v4::route_header(a, canonical_row + row);
     auto *destination = peer_at<transport::BFloat16>(
         a.peer_bases[header.source_rank], a.contribution_offset);
     destination += header.contribution_row * a.hidden + column_base;
-    const auto half = threadIdx.x >> 7U;
-    constexpr auto kElements = sizeof(uint4) / sizeof(transport::BFloat16);
-    const auto begin = half * (forward_tuning::kFc2TileN / 2U);
-    const auto end = begin + forward_tuning::kFc2TileN / 2U;
-    for (std::uint32_t column = begin; column < end; column += kElements) {
+    for (std::uint32_t column = column_lane * kElements;
+         column < forward_tuning::kFc2TileN;
+         column += kRowLanes * kElements) {
       if (column_base + column >= a.hidden)
         break;
       const auto remaining = a.hidden - column_base - column;

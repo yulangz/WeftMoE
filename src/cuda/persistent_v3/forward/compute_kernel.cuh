@@ -377,7 +377,7 @@ struct alignas(16) ComputePairState {
   std::uint64_t ready;
   std::uint64_t joined;
   unsigned long long static_round;
-  unsigned int static_progress;
+  unsigned long long static_progress;
 };
 
 __device__ __forceinline__ void pair_wait(std::uint64_t *barrier,
@@ -399,24 +399,32 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
     const ForwardKernelArgs &a, unsigned long long *scheduler,
     unsigned long long *claims, unsigned long long *fc1_done,
     unsigned long long fc1_tasks, std::uint32_t fc1_ntiles,
-    std::uint32_t fc2_ntiles, unsigned int &progress,
+    std::uint32_t fc2_ntiles, unsigned long long &progress,
     unsigned long long &task0, unsigned long long &task1) {
   const auto cluster_count = gridDim.x / forward_tuning::kClusterSize;
-  const auto fc1_pairs = fc1_tasks / 2ULL;
+  // Keep FC1 and FC2 on a bounded set of M blocks. Finishing every FC1
+  // residue before any FC2 residue makes the intermediate working set grow
+  // with the entire prefill and scatters the final Return stores across it.
+  constexpr auto kWaveMblocks = 32ULL;
   const auto fc2_pairs_per_mblock = fc2_ntiles / 2U;
   const auto fc2_units_per_mblock =
       (fc2_pairs_per_mblock + forward_tuning::kFc2ClaimTiles - 1U) /
       forward_tuning::kFc2ClaimTiles;
-  const auto fc2_units = scheduler[3] * fc2_units_per_mblock;
   // Static V4 enumerates a finite task set and is deliberately
   // non-preemptible. Polling the system-scope cancellation word at every
   // readiness probe serialized this inference-only hot path across GPUs.
   while (true) {
+    const auto wave_begin = (progress >> 32U) * kWaveMblocks;
+    if (wave_begin >= scheduler[3])
+      break;
+    const auto wave_mblocks = min(kWaveMblocks, scheduler[3] - wave_begin);
+    const auto fc1_pairs = wave_mblocks * fc1_ntiles / 2ULL;
+    const auto fc2_units = wave_mblocks * fc2_units_per_mblock;
     const auto cluster = static_cast<unsigned long long>(blockIdx.x) /
                          forward_tuning::kClusterSize;
     const auto fc1_pair = cluster + 1ULL * (progress & 0xffffU) * cluster_count;
     if (fc1_pair < fc1_pairs) {
-      const auto candidate = 2ULL * fc1_pair;
+      const auto candidate = wave_begin * fc1_ntiles + 2ULL * fc1_pair;
       const auto mblock = candidate / fc1_ntiles;
       const auto mapping = claims[mblock];
       const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
@@ -432,9 +440,10 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
       __nanosleep(forward_tuning::kTaskIdleNanosleep);
       continue;
     }
-    const auto fc2_unit = cluster + 1ULL * (progress >> 16U) * cluster_count;
+    const auto fc2_unit =
+        cluster + ((progress >> 16U) & 0xffffULL) * cluster_count;
     if (fc2_unit < fc2_units) {
-      const auto mblock = fc2_unit / fc2_units_per_mblock;
+      const auto mblock = wave_begin + fc2_unit / fc2_units_per_mblock;
       const auto unit = static_cast<std::uint32_t>(
           fc2_unit % fc2_units_per_mblock);
       ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -448,10 +457,13 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
         return kComputeTaskFc2;
       }
     }
-    if (fc1_pair >= fc1_pairs && fc2_unit >= fc2_units)
-      break;
+    if (fc1_pair >= fc1_pairs && fc2_unit >= fc2_units) {
+      progress = ((progress >> 32U) + 1ULL) << 32U;
+      continue;
+    }
     __nanosleep(forward_tuning::kTaskIdleNanosleep);
   }
+  (void)fc1_tasks;
   return kComputeTaskDone;
 }
 

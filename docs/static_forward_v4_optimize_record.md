@@ -6,6 +6,42 @@
 V3。本文只记录 Qwen3.5 小 decode shape 的 Static Forward V4 优化，不替代
 `forward_optimization_history.md` 中大 token/多机历史。
 
+## 2026-09-22 复审：decode 与 prefill
+
+基线提交 `8f3fa57` 保存复审前工作区里的完整实现。以下使用同一 H=2048、
+I=512、64 experts、top-k=4、EP8 fixture，CUDA Graph 每个 sample 回放 20 次，
+10 个 warmup sample + 20 个测量 sample；每个 sample 取 rank-max。
+8K/20K 分别明确为 **8192/20480 token per rank**。这是相邻构建消融（B），
+不是交错 A/B，微秒级差异仍需考虑测量噪声。
+
+| 改动 | 1 token | 64 tokens | 8192 tokens | 20480 tokens |
+|---|---:|---:|---:|---:|
+| 复审基线 | 59.79 | 72.60 | 1973.02 | 7161.11 |
+| FC2 相邻 8 lanes 合并写一个 contribution row | 58.64 | 68.92 | 1706.21 | 6412.08 |
+| 加入 32-Mblock 静态 FC1/FC2 wave | 59.08 | 69.67 | 1564.15 | 4869.70 |
+| M128 readiness 直接索引 | 58.45 | 69.33 | 1482.39 | 4580.19 |
+
+单位为 us，均为 graph rank-max p50。最终相对基线改善约
+2.2%/4.5%/24.9%/36.0%。四个规模的所有 rank output hash 均与基线一致。
+
+三个改动的依据：
+
+- FC2 原 epilogue 每 lane 写不同 token 行，H-strided 地址把 warp 的 16-byte
+  store 分散为大量 NVLink 事务；现在 8 lanes 写同一行相邻的 128 bytes。
+- 原静态 scheduler 对整个 invocation 先枚举 FC1，再枚举 FC2。现在每个
+  32-Mblock wave 使用同样的 cluster residue 枚举，完成本 worker 的 FC1 后
+  进入本 wave 的 FC2，再推进下一 wave。没有全局 phase barrier，也没有
+  queue/claim。较早 wave 的 FC2 不依赖较晚 wave，等待关系保持无环。
+- V4 已经直接生成 M128 几何，readiness 无需沿用 V3 小 Notify tile 的线性
+  扫描。由 `expert_tile_base + local_row / 128` 直接定位，避免扫描长度随
+  expert rows 增长。
+
+重现使用 `tests/run_local_activation_p2p.py --world 8 --top-k 4
+--forward-benchmark --rounds 30`，环境变量为 `WEFTMOE_BENCH_EXPERTS=64`、
+`WEFTMOE_P2P_BENCH_TOKENS=<上述规模>`、`WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY=1`、
+`WEFTMOE_FORWARD_GRAPH_BATCH=20`。保持原 N64/N128/K128、FC1/FC2 各 3 stages
+配置。原始本机日志为 `/tmp/weft-v4-audit-{baseline,coalesced,waves,direct-ready}-*.log`。
+
 ## 1. 结论
 
 主测试为 EP8、H=2048、I=512、64 experts、top-k=4、BF16、64 token/rank。
