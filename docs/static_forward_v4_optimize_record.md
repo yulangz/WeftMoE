@@ -2,6 +2,10 @@
 
 日期：2026-09-22；2026-09-23 补测单机 EP8 的 1620 MHz V3/V4 对照。
 
+后续的 prefill 双入口、FC1 epilogue、失败候选及 Return 流水分析，见
+[`static_forward_v4_prefill_record.md`](static_forward_v4_prefill_record.md)。
+本篇以下的冻结 V3/V4 对照保持原样，不混入后续构建。
+
 状态：单机与多机 inference-only 路径已完成主要重构；training 仍使用 V3。
 多机实测见 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
 本文记录单机 Static Forward V4 优化，不替代

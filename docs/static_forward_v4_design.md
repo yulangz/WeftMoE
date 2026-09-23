@@ -3,6 +3,12 @@
 单机 inference-only 路径的逐项性能消融与失败实验见
 [`static_forward_v4_optimize_record.md`](static_forward_v4_optimize_record.md)。
 
+2026-09-23 后续：prefill 的 GEMM 双入口和安全 epilogue staging 见
+[`static_forward_v4_prefill_record.md`](static_forward_v4_prefill_record.md)。
+当前节点内 Dispatch 是 destination-pull，FC2 Return 仍是 push；跨机 GIN
+Return 仍在 GEMM 完成后发送，尚未实现 Return/GEMM 流水。测试主矩阵为
+单机 EP8（1×8）、双机 EP16（2×8），不以 2×4 的 EP8 替代单机结果。
+
 ## 0. 当前实现状态（2026-09-22）
 
 单机 inference-only V4 已经完成一次按 MegaMOE 数据面重写。本节是当前实现

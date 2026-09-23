@@ -3,12 +3,15 @@
 日期：2026-09-22；2026-09-23 补充优化分步记录与 V3 对照。协议与首版边界见
 [`static_forward_v4_design.md`](static_forward_v4_design.md#60-复审进度容量与首版实现边界)。
 
+后续的 prefill 双入口、epilogue 消融及跨机 Return/GEMM 重叠分析，见
+[`static_forward_v4_prefill_record.md`](static_forward_v4_prefill_record.md)。
+
 拓扑更正：用户要求的主矩阵是 **单机 EP8（1×8）和双机 EP16（2×8）**。
 此前误将 EP8 测成两机 2×4；本篇保留该组数据作为额外实验，不代表单机 EP8。
 单机 EP8 的 1620 MHz 锁频补测见
 [`static_forward_v4_optimize_record.md`](static_forward_v4_optimize_record.md)。
 
-最新结论（两节点全部 GPU 核心锁频 1620 MHz）：对照当前 V3 inference fallback
+本篇冻结版本结论（两节点全部 GPU 核心锁频 1620 MHz）：对照 V3 inference fallback
 及已有多机调优参数，V4 在 1/64 tokens 加速 **3.86–4.35×**，但 8K/20K 延迟
 增加 **15.1–34.2%**。功能与数值门禁已通过，**多机 prefill 性能目标尚未达成**，
 不能称为全面优于 V3。完整锁频矩阵和比较边界见下文。
