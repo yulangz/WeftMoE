@@ -1573,6 +1573,13 @@ memcheck、racecheck（11 rounds）均 launcher exit 0、0 errors/0 hazards。
 1.5%/4.6%/1.6%/0.6%。EP8 与 EP16 合计 96 rank hashes 与冻结 V3 一致；
 长 EP16 仍比 V3 慢约 19.0%/32.5%，不宣称已达最终目标。
 
+随后在同一第二节点、1620 MHz、10/20/20 独立复测 B1024/D4：单机 EP8
+8K/20K 为 1353.54/2984.41 us，16 hashes 与上述 B512 及冻结 V3 一致。
+对应 device pool 为 813600192/990859456 bytes/rank，不能把扩大窗口的收益
+算成协议优化。8K 仍以 B512 较好；20K 的 B1024 比 V3 降低约 9.4%。
+测量节点无其他 CPU/GPU 工作，另一节点仅编译后续候选。日志
+`ring_admission_head_remote_ep8_b1024_t{8192,20480}_formal.log`。
+
 ### BC：将部分 local Return warp 分给 Pull（无收益，撤回）
 
 在 BB 基线上，单机把一半 warp1 改为 Pull，固定 workers 从 132→198、
@@ -1588,3 +1595,57 @@ STACK64/440、LOCAL0 均未变，不能凭退化推断 spill。已恢复 BB 的�
 冻结 `build/static_v4_ring_pull_share/`，native SHA256
 `a382221b3ba7fe950af27a651ee18cae0439b732854fb898f31aa5cc47be018c`；日志
 `ring_pull_share_ep{8,16}_t8192_quick.log`。
+
+### BD：Return ready 发布到发送 rail
+
+原 TX 为确定 C 是否 ready，持续跨 NVLink 读取 expert GPU 的 generation、
+fc2_done、fc2_target。现在复用固定 local Return warp 的 FC2 acquire/system
+fence，在普通 device pool 的 rail-local `[local_destination, C_slot]` 镜像
+发布 generation，TX 改为读取本 GPU 的镜像。逆向 route 表给出实际 interested
+rails，warp 去重后每 rail 发布一次；不广播未命中的 rail，不增加 expected count。
+镜像只在 pool 初始化清零，随原 C generation 跨 invocation 复用。
+
+remote-only block 不再跳过 local Return owner：网络 TX 必须先取得它的发布，
+所以不能在发布前退休 C。每个 rail 仅一次 store，最后一个 C reader 的行 credit
+保护当前代；publisher 发布完成后不再访问可复用 C。原 C→TX pack、full global
+wait、system C.returned、远端 consumed AND 本地 NIC completion 均不变。
+新增元数据为 local_world×depth×8；EP16/B512/K4 为 33280 bytes/rank，registered
+pool 仍为 38547712 bytes/rank。prefill local/network REG168、STACK64/440、
+LOCAL0 均未变。
+
+串行/warp 发布 8K 快筛分别 3806.82/3804.26 us，差别不足以单独宣称收益。
+串行候选完整 EP16 四规模+edges 416、B16/D1/K8 的 T1/64+edges 272 records
+通过。保留的 warp 版也通过这两组数值检查；rank1/9 同时插桩，B16/D1/T64/K8
+eager 11 rounds 的 memcheck/racecheck 均 launcher exit 0、0 errors/0 hazards。
+不声称 sanitizer 检查了所有 16 ranks。
+
+正式 EP16、1620 MHz、Q8/L32/B512/D4、10 warmup / 20 samples / batch20，
+两个节点无 CPU 编译或其他 GPU 测试：
+
+| tokens/rank | BB/us | BD/us | 相对 BB 延迟降低 | 冻结 V3/us |
+|---:|---:|---:|---:|---:|
+| 1 | 297.082 | 293.669 | 1.1% | 682.170 |
+| 64 | 374.875 | 378.358 | -0.9% | 824.659 |
+| 8192 | 3992.340 | 3798.200 | 4.9% | 3353.940 |
+| 20480 | 9406.510 | 8836.800 | 6.1% | 7099.530 |
+
+64 rank hashes 与 BB/冻结 V3 一致。BB/V3 是同日历史对照，尚未将 ABBA
+交错重测纳入此表。长 EP16 仍比 V3 慢 13.2%/24.5%，未达最终目标。
+冻结 `build/static_v4_ring_return_ready_warp/`，native SHA256
+`397119ee194a3cb57ad1bc97406832d1ae0a714a3a5438f76fb2d59c5622809e`，library
+`979daa1ad5c0587d94215c80b45b0acd41cb6b64a1ef54453faa07e944b64812`；
+日志 `ring_return_ready_warp_*`。串行候选归档 `static_v4_ring_return_ready/`，
+native `f4182c4dd19a3ae0124e0f44ceb66ac7ddcc2d011b3dccc4b8c1db3d8449a305`。
+
+单机 specialization 无新增通知逻辑。仍完成 EP8 四规模+edges 208 records 回归；
+第二节点单机 EP8 的 10/20/20、1620 MHz、B512/D4 正式结果为
+101.835/137.496/1286.880/3067.780 us，32 hashes 与 BB/V3 一致。第二节点
+测量时无其他 CPU/GPU 工作，第一节点独立跑 EP8 数值测试及编译下一候选。
+相对 BB 的差异很小，不给本次网络修改归因单机收益。
+
+顺带核实 rank1/9 实际 activation devComm 为 **1 connection / 96 contexts**，
+日志 `ring_return_ready_gin_gpulingjun*`。connection 与 context 不是同一层资源；
+本项未改变它们。NCCL 2.31.2 的
+[connection 构建代码](https://github.com/NVIDIA/nccl/blob/v2.31.2-1/src/gin/gin_host.cc)
+默认按本地 GIN device 数选 connection，再将请求的 contexts 分配到 connections。
+不把单 context link benchmark 的带宽直接当成整个融合 kernel 的硬上限。

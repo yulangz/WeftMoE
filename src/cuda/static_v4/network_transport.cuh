@@ -86,22 +86,22 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
             ring::source_metadata(a, plan.source, r.source.selected_experts);
         locations = ring::source_metadata(a, plan.source, r.locations);
         bool ready = true;
-        const static_forward::ComputeSlot *previous = nullptr;
+        const std::uint64_t *previous = nullptr;
         for (unsigned row = 0U; row < rows; ++row) {
           const auto route = routes[row];
           const auto &location = locations[route];
-          const auto *slot = &c_slot(
-              a, static_cast<unsigned>(experts[route]) / owned, location);
-          if (slot == previous)
+          const auto destination = static_cast<unsigned>(experts[route]) / owned;
+          const auto *published = r.return_ready +
+              std::uint64_t(destination % a.local_world_size) * r.depth +
+              location.row / forward_tuning::kTileM;
+          if (published == previous)
             continue;
-          if (ring::acquire<::cuda::thread_scope_system>(slot->generation) !=
-                  location.generation ||
-              ring::acquire<::cuda::thread_scope_system>(slot->fc2_done) <
-                  slot->fc2_target) {
+          if (ring::acquire<::cuda::thread_scope_system>(*published) !=
+              location.generation) {
             ready = false;
             break;
           }
-          previous = slot;
+          previous = published;
         }
         if (!ready)
           continue;

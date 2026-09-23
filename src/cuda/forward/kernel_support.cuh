@@ -950,6 +950,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                     sizeof(std::uint64_t), "source reservation heads");
     ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
                         "X/S/C slot controls");
+    if (config.max_nodes > 1U)
+      ring.return_ready = append(
+          cursor, std::uint64_t(config.max_world_size / config.max_nodes) * ring.depth,
+          sizeof(std::uint64_t), "rail-local C generations");
     ring.contributions = append(cursor, ring.contribution_depth,
                                  sizeof(static_forward::ContributionSlot),
                                  "contribution window controls");

@@ -121,17 +121,8 @@ __device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
   bool started = false;
   const auto blocks = r.window_prefix[r.state->windows];
   for (std::uint64_t block = worker; block < blocks; block += workers) {
-    if constexpr (Network) {
-      bool local = false;
-      for (unsigned m = lane; m < r.blocks[block].tile.rows; m += 32U)
-        local |= r.rows[block * forward_tuning::kTileM + m].source /
-                     a.local_world_size ==
-                 a.node;
-      // A remote-only block may already be retired by its network owners.
-      // We own no row in it and must not inspect its reusable C slot.
-      if (!__any_sync(0xffffffffU, local))
-        continue;
-    }
+    // Remote TX also waits for our publication, so even a remote-only block
+    // cannot retire before this owner has acquired its FC2 completion.
     auto &slot = ring::slot(a, block);
     if (lane == 0U) {
       while (!ring::admitted(a, block)) {
@@ -148,16 +139,20 @@ __device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
     }
     __syncwarp();
     const auto window = r.blocks[block].window;
+    const auto source_begin = r.source.shape.source_begin(window);
     const auto route_begin =
         r.source.shape.token_begin(window) * r.source.shape.top_k;
     unsigned retired = 0U;
+    unsigned remote_sources = 0U;
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, LocalReturnBatchStart,
                                LocalReturn, 0U, block, execution_epoch(a));
     for (unsigned m = lane; m < r.blocks[block].tile.rows; m += 32U) {
       const auto identity = r.rows[block * forward_tuning::kTileM + m];
       if constexpr (Network)
-        if (identity.source / a.local_world_size != a.node)
+        if (identity.source / a.local_world_size != a.node) {
+          remote_sources |= 1U << (identity.source - source_begin);
           continue;
+        }
       const auto &address = ring::window_source(a, window, identity.source);
       const auto row = address.row_base + identity.route - route_begin;
       ring::publish<::cuda::thread_scope_system>(
@@ -168,6 +163,25 @@ __device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
     }
     // Every ready publication must finish before admission can reuse C.
     __syncwarp();
+    if constexpr (Network) {
+      remote_sources = __reduce_or_sync(0xffffffffU, remote_sources);
+      if (lane < r.source.shape.sources && (remote_sources & (1U << lane))) {
+        bool first = true;
+        for (unsigned previous = lane % a.local_world_size; previous < lane;
+             previous += a.local_world_size)
+          first &= !(remote_sources & (1U << previous));
+        const auto index = std::uint64_t(a.rank % a.local_world_size) * r.depth +
+                           r.blocks[block].slot;
+        if (first) {
+          const auto rail = a.node * a.local_world_size +
+                            (source_begin + lane) % a.local_world_size;
+          // Exactly one lane publishes to each interested rail. Duplicate
+          // stores could outlive the final C credit and corrupt its next use.
+          ring::publish<::cuda::thread_scope_system>(
+              ring::peer(a, rail, r.return_ready)[index], r.blocks[block].generation);
+        }
+      }
+    }
     retired = __reduce_add_sync(0xffffffffU, retired);
     if (lane == 0U && retired) {
       if constexpr (Network)

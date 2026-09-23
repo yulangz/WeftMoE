@@ -121,6 +121,7 @@ struct ComputeRingView {
   ComputeSlot *slots = nullptr;
   ContributionSlot *contributions = nullptr;
   std::uint64_t *contribution_ready = nullptr;
+  std::uint64_t *return_ready = nullptr; // Rail-local [destination, C slot].
   std::uint64_t *window_prefix = nullptr;
   WindowSource *window_sources = nullptr; // [windows, bounded source group]
   std::uint64_t *expert_rows = nullptr;   // [windows, owned]
@@ -140,6 +141,7 @@ struct ComputeRingLayout {
   std::uint64_t max_windows = 0;
   std::uint64_t max_blocks = 0;
   std::size_t state = 0, slots = 0, contributions = 0, contribution_ready = 0;
+  std::size_t return_ready = 0;
   std::size_t source_epochs = 0;
   std::size_t source_reserved = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;

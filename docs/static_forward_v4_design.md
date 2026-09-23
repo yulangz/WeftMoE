@@ -522,8 +522,18 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 - 节点内 FC2 epilogue 直接写 source 的 contribution slot，不再经 C 二次搬运；
   X-ready 之前已获取 source reservation。固定 local Return warp 按 Mblock
   residue acquire 所有 FC2 N tiles 的完成链，system fence 后协作发布逐 route
-  ready，并按本地行数退休该 C slot。无本地行的 block 不读取 C 控制区，避免
-  网络 owner 先释放后的过期读取。contribution 仍等 Reduce 后才能复用。
+  ready，并按本地行数退休该 C slot。contribution 仍等 Reduce 后才能复用。
+- BD 给每个 rail 增加普通 device pool 中的
+  `return_ready[local_destination, physical_C_slot]` generation 镜像，跨调用保留。
+  上述 Return warp 也处理 remote-only block：取得 FC2 完成后，从 immutable
+  reverse routes 得到实际远端 source，按本地 rail 去重，warp 并行以 system
+  release 发布 generation。TX 只 acquire 本 rail 的对应镜像，不再反复读取
+  expert GPU 的 generation/fc2_done/target；C→TX 打包和逐行 C 退休不变。
+  每个 block/rail 只发布一次，避免重复旧代 store 晚于 C 回收。任意一个未完成的
+  TX reader 都持有其 C 行 credit，镜像不可能在该 reader 完成前进入下一代。
+  remote-only block 的 TX 必须先取得本次发布，故不会先于发布者退休 C；发布者
+  完成最后一次通知后不再访问可复用的 C 控制/载荷。source mask 仅覆盖有界 G，
+  不是节点数 mask；多 source node 映射到同 rail 时仍只发布一次。
 - receiver 的 immutable metadata replica 另有 `RouteLocation[route]`，由实际
   destination 写入 `{generation,logical_block,physical_row}`，经一次节点内
   PlanReady barrier 发布。Return rail 从该表找到 C；Dispatch pull 找到 X。

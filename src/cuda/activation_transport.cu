@@ -4840,8 +4840,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.expert_blocks = at<std::uint64_t>(slot.device, l.expert_blocks);
     r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);
     r.rows = at<static_forward::RingRow>(slot.device, l.rows);
-    if (use_gin)
+    if (use_gin) {
       r.pull_packets = at<static_forward::PullPacket>(slot.device, l.pull_packets);
+      r.return_ready = at<std::uint64_t>(slot.device, l.return_ready);
+    }
     const auto &m = l.source;
     auto *metadata = use_gin
         ? at<char>(slot.gin_window, args.static_network.source +
