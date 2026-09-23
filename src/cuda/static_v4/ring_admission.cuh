@@ -66,6 +66,8 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
               s.generation, r.blocks[block].generation);
         }
         __syncwarp();
+        if (lane == 0U)
+          publish(r.state->admitted_windows, window + 1U);
         ++window;
       }
     }

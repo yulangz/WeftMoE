@@ -53,6 +53,7 @@ struct RingState {
   std::uint64_t windows;
   std::uint64_t blocks;
   std::uint64_t rows;
+  std::uint64_t admitted_windows;
 };
 
 struct SourceEpoch {

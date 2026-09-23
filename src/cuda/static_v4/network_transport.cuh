@@ -338,65 +338,58 @@ pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
     __syncwarp();
     const auto *payload =
         static_cast<const transport::BFloat16 *>(desc.payload);
-    for (unsigned pass = 0U; pass < 2U; ++pass) {
-      // The warp reads peer metadata together; only lane zero issues TMA
-      // into the two private staging slots.
-      for (unsigned base = 0U; base < desc.token_count * shape.top_k;
-           base += 32U) {
-        const auto item = base + lane;
-        const auto token = item / shape.top_k;
-        bool consume = false;
-        static_forward::RouteLocation location{};
-        float gate = 0.0F;
-        if (token < desc.token_count) {
-          const auto route =
-              desc.tokens[token].token * shape.top_k + item % shape.top_k;
-          consume =
-              static_cast<unsigned>(desc.experts[route]) / owned == a.rank;
-          if (consume) {
-            location = desc.locations[route];
-            if (!pass)
-              gate = desc.gates[route];
-          }
-        }
-        if (!pass) {
-          auto mask = __ballot_sync(0xffffffffU, consume);
-          while (mask) {
-            const auto selected = __ffs(mask) - 1;
-            const auto block = __shfl_sync(
-                0xffffffffU, static_cast<unsigned long long>(location.block),
-                selected);
-            const auto row = __shfl_sync(0xffffffffU, location.row, selected);
-            const auto packet_row = __shfl_sync(0xffffffffU, token, selected);
-            const auto weight = __shfl_sync(0xffffffffU, gate, selected);
-            if (lane == 0U) {
-              while (!ring::admitted(a, block)) {
-              }
-              gates[row] = weight;
-              asm volatile("fence.proxy.async.global;" ::: "memory");
-              prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
-                            output + std::uint64_t(row) * a.hidden,
-                            static_cast<unsigned>(a.hidden *
-                                                  sizeof(transport::BFloat16)));
-            }
-            mask &= mask - 1U;
-          }
-        } else if (consume) {
-          const auto valid = r.blocks[location.block].tile.rows;
-          const auto m = location.row % forward_tuning::kTileM;
-          const auto credit =
-              m + 1U == valid ? forward_tuning::kTileM - valid + 1U : 1U;
-          static_v4::reduce_add_release_device(
-              reinterpret_cast<unsigned long long *>(
-                  &ring::slot(a, location.block).x_full),
-              credit);
+    // Keep each route's destination in its lane until this batch completes.
+    // Q8/top-k4 fits one batch; larger packets need no second metadata pass.
+    for (unsigned base = 0U; base < desc.token_count * shape.top_k;
+         base += 32U) {
+      const auto item = base + lane;
+      const auto token = item / shape.top_k;
+      bool consume = false;
+      static_forward::RouteLocation location{};
+      float gate = 0.0F;
+      if (token < desc.token_count) {
+        const auto route =
+            desc.tokens[token].token * shape.top_k + item % shape.top_k;
+        consume =
+            static_cast<unsigned>(desc.experts[route]) / owned == a.rank;
+        if (consume) {
+          location = desc.locations[route];
+          gate = desc.gates[route];
         }
       }
-      if (!pass && lane == 0U) {
+      auto mask = __ballot_sync(0xffffffffU, consume);
+      while (mask) {
+        const auto selected = __ffs(mask) - 1;
+        const auto row = __shfl_sync(0xffffffffU, location.row, selected);
+        const auto packet_row = __shfl_sync(0xffffffffU, token, selected);
+        const auto weight = __shfl_sync(0xffffffffU, gate, selected);
+        if (lane == 0U) {
+          gates[row] = weight;
+          asm volatile("fence.proxy.async.global;" ::: "memory");
+          prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
+                        output + std::uint64_t(row) * a.hidden,
+                        static_cast<unsigned>(a.hidden *
+                                              sizeof(transport::BFloat16)));
+        }
+        mask &= mask - 1U;
+      }
+      if (lane == 0U) {
         prefetch.drain();
         finish_copies<false>();
       }
-      // Full completion precedes every lane's X-ready release and RX credit.
+      // Full completion precedes X-ready. The packet's RX credit stays below
+      // the entire loop, after every batch has finished reading its payload.
+      __syncwarp();
+      if (consume) {
+        const auto valid = r.blocks[location.block].tile.rows;
+        const auto m = location.row % forward_tuning::kTileM;
+        const auto credit =
+            m + 1U == valid ? forward_tuning::kTileM - valid + 1U : 1U;
+        static_v4::reduce_add_release_device(
+            reinterpret_cast<unsigned long long *>(
+                &ring::slot(a, location.block).x_full),
+            credit);
+      }
       __syncwarp();
     }
     if (lane == 0U) {

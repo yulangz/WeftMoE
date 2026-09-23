@@ -28,6 +28,11 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
     const auto source_begin = shape.source_begin(window);
     const auto end = r.window_prefix[window + 1U] * TileM;
     unsigned reserved = 0U;
+    // The entire window is admitted together. Its required X slots cannot
+    // recycle before this owner copies its rows and releases their X-ready.
+    if (lane == 0U)
+      while (ring::acquire(r.state->admitted_windows) < window + 1U) {
+      }
     if (lane == 0U)
       for (auto base = r.window_prefix[window] * TileM + Batch * worker;
            base < end; base += Batch * workers) {
@@ -44,9 +49,6 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           if constexpr (Network)
             if (identity.source / a.local_world_size != a.node)
               continue;
-          if (!copied)
-            while (!ring::admitted(a, block)) {
-            }
           const auto source_index = identity.source - source_begin;
           const auto &address = sources[source_index];
           const auto source_bit = 1U << source_index;

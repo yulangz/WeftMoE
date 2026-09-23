@@ -1520,3 +1520,71 @@ library SHA256 `f0f576769af90267603b4b9a88cf6627decdd8954a72571ea05dd52c3dab5ebb
 AV 4332.55 → AZ 4062.22 → AZ 4059.43 → AV 4332.47 us，约 6.3% 收益稳定；
 日志 `ring_exclusive_gin_abba_{av1,az1,az2,av2}.log`。
 长 EP16 仍分别比 V3 慢 21.0%/33.3%，未达到最终性能目标。
+
+### BA：远端 Pull 单遍读取路由元数据
+
+在 AZ 基线上，把一次 packet 的两遍遍历改为每 32 个 route 一批：每个 lane
+保留自己的 RouteLocation，lane0 搬完本批、完整 global wait 后，warp 直接
+使用保留的地址发布 X-ready。整包所有批次完成后才累计 RX consumed，NIC
+ready acquire、slot generation 检查与原有 TMA staging 生命周期不变。
+Q8/K4 恰好一批，较大 K/Q 不再重复读取 metadata，但可能多一次批间 drain，
+不能仅凭少了读取就声称所有配置更快。
+
+Q8/L32/B512/D4、EP16/8K 快筛 4015.09 us，对照 AZ 4063.90 us，仅约 1.2%。
+完整四规模+edges 416 PyTorch records 与 B16/D1/K8 的 T1/64+edges 272
+records 通过。网络 prefill 入口两者均 REG168/STACK440/LOCAL0；这是静态
+resource usage，不把非零 stack 一概称为 spill。组合正式性能及 sanitizer 见 BB，
+不把 BB 的全部收益归给 BA。
+冻结 `build/static_v4_ring_pull_onepass/`：native SHA256
+`50f8ba8ab2267554a0a752e4b15ceeb68385f8dafc973ada72b6a359e818d2a5`，library
+`49a2305ff1b66d4e71305b9a00c9ec86caa59573d8195c43b62d3befd1c7e303`。
+日志 `ring_pull_onepass_ep16_t8192_quick.log`、
+`ring_pull_onepass_{full,tiny_k8}_torch_rank*.log`。
+
+### BB：Pull 复用整窗口准入
+
+在 BA 上增加 invocation-local `RingState.admitted_windows`。准入 warp 发布
+本窗口全部 ComputeSlot generation、经原有 warp join 后，由 lane0 release.device
+发布 window+1。Pull 每窗口 acquire 一次，节点内 batch 和远端逐 route 不再
+重复检查 generation；网络 warp 的其余 lanes 通过原有 syncwarp 导入完成链。
+该窗口在本 owner 的 X 行发布完成前不能复用所需物理 slot，因此可缓存首次
+确认。source reservation、数学任务的 generation/X/S 等待、Return 完成链和
+所有 NIC credit 条件不变。head 只在下一次 quiescent prepare 中清零。
+
+新增 8-byte 标量未改变实际 pool 大小：EP16/8K Q8/L32/B512/D4 的 compute
+仍 916410560、registered 38547712 bytes/rank。快筛 3996.43 us，对照 BA
+4015.09 us，只有约 0.5%；16 hashes 一致，不将其称为大幅网络加速。
+第二节点单机 EP8、B512/D4、1620 MHz、10/20/20 四规模为
+101.314/136.600/1286.800/3081.260 us；测量节点无其他 CPU/GPU 工作，另一
+节点同时做独立 EP8 数值测试，不是两节点 EP8。
+
+完整 EP8/EP16 四规模+edges 分别 208/416 records，通过热点、mixed profile、
+unequal/empty、变更输入 Graph 与共享 workspace；EP16 B16/D1/K8 的
+T1/64+edges 272 records 也通过。rank1/9 同时插桩的 B16/D1/T64/K8 eager
+memcheck、racecheck（11 rounds）均 launcher exit 0、0 errors/0 hazards。
+这组 sanitizer 验证包含 BA 的分批 X-ready 发布，不是只检查新增 head。
+
+冻结 `build/static_v4_ring_admission_head/`，native SHA256
+`dd9e65f9de563ba9703dd9162112046be1e296fd1786ca3f96405b3a4f6e630a`，library
+`a74b8fa368c04235707c29c9d8bce7c0cd6bda737eeacc0c3fb3a0ae8d55df12`。
+日志 `ring_admission_head_*`。EP16 同条件、1620 MHz、10/20/20 正式四规模为
+297.082/374.875/3992.340/9406.510 us，测量时无 CPU 编译或其他 GPU 工作。
+相对 AZ 的 301.467/393.101/4057.570/9462.100 us，BA+BB 的组合延迟降低
+1.5%/4.6%/1.6%/0.6%。EP8 与 EP16 合计 96 rank hashes 与冻结 V3 一致；
+长 EP16 仍比 V3 慢约 19.0%/32.5%，不宣称已达最终目标。
+
+### BC：将部分 local Return warp 分给 Pull（无收益，撤回）
+
+在 BB 基线上，单机把一半 warp1 改为 Pull，固定 workers 从 132→198、
+Return 132→66；双机保持 32 Dispatch TX/32 Return TX/32 RX scatter/
+32 NIC progress，剩余 local Return 一半转 Pull，Pull 100→134、Return
+68→34。两类 Pull 使用原有各 warp 的私有双 staging，无新增 SMEM、动态领用
+或新同步协议；保留独立驻留的 Return owner。
+
+Q8/L32/B512/D4、8K 快筛 EP8 1504.16 us（本机，BB 约 1287 us），
+EP16 4028.05 us（BB 3996.43 us），均无收益。仅声明性能候选，不声称完成
+这组角色划分的完整数值/sanitizer 验收。prefill REG168、local/network
+STACK64/440、LOCAL0 均未变，不能凭退化推断 spill。已恢复 BB 的角色配额。
+冻结 `build/static_v4_ring_pull_share/`，native SHA256
+`a382221b3ba7fe950af27a651ee18cae0439b732854fb898f31aa5cc47be018c`；日志
+`ring_pull_share_ep{8,16}_t8192_quick.log`。
