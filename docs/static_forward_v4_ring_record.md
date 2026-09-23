@@ -644,3 +644,38 @@ source Return scatter（含逐行发布）71.6 us。两条 Return lane 各有 25
 FC2 持续至约 68.21 ms。流水已重叠，问题主要是通信控制/搬运吞吐，不是仍有
 Dispatch→FC 的全节点 barrier。下一步单独消融重复 C-ready 检查、逐行 system
 退休与 scatter 发布，再考虑通信 worker 数，不能把这些代价归为 GEMM 效率。
+
+补验：单机 EP8 同一 library 完整四规模/edge cases exit 0。双机 B16/D1/T64
+graph 的 memcheck 改为同时 instrument rank 1、9，其余 rank 正常参与；两份
+报告均 `ERROR SUMMARY: 0 errors`，launcher exit 0。这覆盖两节点各一个 rank，
+不是全部 16 rank 的 sanitizer 验收；最初 rank 0 bootstrap 超时记录仍保留。
+
+### Q：Return 按连续 C slot 合并 readiness/退休（验证中）
+
+保持 packet、Q、lane、GIN completion 和 payload copy 不变。一个 packet 只含
+一个窗口，该窗口内每个逻辑 C block 的物理 slot 唯一；对连续属于相同 C slot
+的行，只检查一次 generation/FC2 done，复制完成后按该段完整行数更新一次
+returned。并未省掉不同 slot 的检查，也未把“发起读取”当作消费完成。预期减少
+重复 system 读取及 RMW，收益等待独立测量。
+
+初次仅合并连续 C slot 的 8K 快速筛选为 53685.1 us，16 hash 与首版一致，约
+下降 26.1%。它仍不是正式性能验收。同步复核随后发现首版 C.returned 的本地
+RMW/准入 load 为 device scope，而 rail 的 remote RMW 为 system scope；虽然
+现有数值测试通过，按 [CUDA 12.9.1 PTX 原子作用域合同](https://docs.nvidia.com/cuda/archive/12.9.1/parallel-thread-execution/index.html#memory-consistency-model-morally-strong)
+两边都必须覆盖对方线程。现统一多机 C.returned 的所有 RMW 和准入 load 为
+system scope；退休只需要 release-add，不消费旧值，因此使用单向 PTX reduction。
+单机保持 device scope。首版和初次 Q 测量带此合同缺口，不能作为最终交付的
+正确实现；修正版需重新做完整数值、复用及性能验证。
+
+修正版 binary `build/static_v4_ring_net_scope/test_cuda_notify` SHA256：
+`f8d3853a4e86dd87b40d6f215df5dcde8db226dab510b7b6c3e5cb6320aad17c`。
+同样 8K 快速筛选 53670.4 us，16 hash 一致；完整 EP16 PyTorch 四规模/edge
+cases 和 B16/D1 的 T1/64/edge cases 均 exit 0，包含 20K 热点及跨调用复用。
+同一修正版的双机 B16/D1/T64 racecheck（instrument rank 1、9）exit 0，两份
+报告均为 0 errors、0 warnings。正式 10/20/20 四规模与冻结 V3 的相邻对照另记，
+不将上述两样本快速筛选伪装成正式矩阵。
+
+本轮另在第二台机器独立重测单机 EP8 的冻结 V3（1620 MHz、10/20/20；
+`WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`，每 rank 图内 2 kernels）：1/64/8K/20K
+分别为 300.374/370.218/1489.09/3294.90 us。与前一节点的正式基线相符，
+日志为 `build/ring_v3_remote_ep8_t*.log`。该组是单机 EP8，不是两机 EP8。

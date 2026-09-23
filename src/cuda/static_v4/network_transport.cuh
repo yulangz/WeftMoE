@@ -30,15 +30,11 @@ __device__ __forceinline__ ChannelPlan channel_plan(const ForwardKernelArgs &a,
   return {source, offsets[index], offsets[index + 1U] - offsets[index]};
 }
 
-__device__ __forceinline__ bool
-c_ready(const ForwardKernelArgs &a, unsigned destination,
-        const static_forward::RouteLocation &location) {
-  const auto &slot = ring::peer(
-      a, destination, a.ring.slots)[location.row / forward_tuning::kTileM];
-  return ring::acquire<::cuda::thread_scope_system>(slot.generation) ==
-             location.generation &&
-         ring::acquire<::cuda::thread_scope_system>(slot.fc2_done) >=
-             slot.fc2_target;
+__device__ __forceinline__ static_forward::ComputeSlot &
+c_slot(const ForwardKernelArgs &a, unsigned destination,
+       const static_forward::RouteLocation &location) {
+  return ring::peer(a, destination,
+                    a.ring.slots)[location.row / forward_tuning::kTileM];
 }
 
 // Each worker multiplexes its fixed channel residue without waiting on a
@@ -92,13 +88,22 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
             ring::source_metadata(a, plan.source, r.source.selected_experts);
         locations = ring::source_metadata(a, plan.source, r.locations);
         bool ready = true;
+        const static_forward::ComputeSlot *previous = nullptr;
         for (unsigned row = 0U; row < rows; ++row) {
           const auto route = routes[row];
-          if (!c_ready(a, static_cast<unsigned>(experts[route]) / owned,
-                       locations[route])) {
+          const auto &location = locations[route];
+          const auto *slot = &c_slot(
+              a, static_cast<unsigned>(experts[route]) / owned, location);
+          if (slot == previous)
+            continue;
+          if (ring::acquire<::cuda::thread_scope_system>(slot->generation) !=
+                  location.generation ||
+              ring::acquire<::cuda::thread_scope_system>(slot->fc2_done) <
+                  slot->fc2_target) {
             ready = false;
             break;
           }
+          previous = slot;
         }
         if (!ready)
           continue;
@@ -151,15 +156,28 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchPackEnd,
                                    GinDispatch, channel, sequence, rows);
       if constexpr (Returning) {
+        // A packet is one admitted window: a physical C slot cannot alias
+        // another block in it. Collapse consecutive rows of that block into
+        // one retirement, after every payload copy has actually completed.
+        static_forward::ComputeSlot *previous = nullptr;
+        unsigned count = 0U;
         for (unsigned row = 0U; row < rows; ++row) {
           const auto route = routes[row];
           const auto destination =
               static_cast<unsigned>(experts[route]) / owned;
-          auto &slot = ring::peer(
-              a, destination,
-              r.slots)[locations[route].row / forward_tuning::kTileM];
-          ring::arrive<::cuda::thread_scope_system>(slot.returned, 1U);
+          auto *slot = &c_slot(a, destination, locations[route]);
+          if (previous != slot) {
+            if (count)
+              static_v4::reduce_add_release_system(
+                  reinterpret_cast<unsigned long long *>(&previous->returned),
+                  count);
+            previous = slot;
+            count = 0U;
+          }
+          ++count;
         }
+        static_v4::reduce_add_release_system(
+            reinterpret_cast<unsigned long long *>(&previous->returned), count);
       }
       auto &control = endpoint.slot(Returning, channel, sequence);
       control.retire_target += expected;

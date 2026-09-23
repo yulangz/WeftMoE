@@ -494,7 +494,7 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 禁止沿用“所有 Dispatch Put 后一次全节点 barrier，再开始 FC1”和“全部 FC2 后
 统一 Return”的主流程。终端 drain 不得提前放到每个 packet/window 的 hot path。
 
-### 6.6 M3b 首版具体布局与进度约束（实现中，尚未验收）
+### 6.6 M3b 首版具体布局与进度约束（数值通过，吞吐仍待优化）
 
 - 每 rail 使用 `(nodes-1)×2` 个 channel，Q=32 完整行，网络深度为 8；Dispatch
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
@@ -518,6 +518,9 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   不能把推导替代多机验收。
 - NIC `readSignal(acquire)` → system-release `visible_generation` → peer acquire
   → 全部 TMA 完成 → system 累计 consumed → ACK，逐包建立可见性及复用链。
+  多机 C.returned 同时接收本地 Return 与 peer rail 的更新，因此本地/远端
+  RMW 及准入方的 acquire 全部使用 system scope；仅远端使用 system 不充分。
+  同一 packet 内连续属于相同 C slot 的行可合并检查和退休，计数单位仍为行。
   所有 packet/reader/local completion drain 后才进行 invocation 结束 GIN barrier，
   防止快节点在慢节点仍读目录时开始覆盖下一次调用的 metadata。payload 中间无
   全节点 collective；跨调用仍保留这一边界。
@@ -735,20 +738,20 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 
 ### M3：多机 route-aware Dispatch 与节点内 pull/FC 重叠
 
-- [ ] 实现按目标节点去重的 packet，未命中节点不发送 X，支持参数化 peer 数。
-- [ ] 接入分离 TX/RX ring、固定 GIN owner、ready 可见性链、fanout 完成及双重 credit。
-- [ ] 实现分级窗口准入（source reservation、RX 暂存、destination 整窗 pull）；
+- [x] 实现按目标节点去重的 packet，未命中节点不发送 X，支持参数化 peer 数。
+- [x] 接入分离 TX/RX ring、固定 GIN owner、ready 可见性链、fanout 完成及双重 credit。
+- [x] 实现分级窗口准入（source reservation、RX 暂存、destination 整窗 pull）；
       RX/pull/credit 的进度不受阻塞 TX owner 影响。
-- [ ] 移除 data-plane Dispatch 全节点 barrier，验证 NIC 接收、节点内 pull、FC 时间线重叠。
-- [ ] EP16 四规模和边界路由通过；若过渡阶段仍保留完整 Return arena，明确标为
+- [x] 移除 data-plane Dispatch 全节点 barrier，验证 NIC 接收、节点内 pull、FC 时间线重叠。
+- [x] EP16 四规模和边界路由通过；若过渡阶段仍保留完整 Return arena，明确标为
       临时路径，不能在此宣称全部多机有界流水完成。
 
 ### M4：多机 Return/C 回收与端到端流水
 
-- [ ] 从静态 C/route 目录打包，按完整行退休 C；不引入 fragment 引用图或 append queue。
-- [ ] Return TX/RX 与 Dispatch 独立；source RX scatter 后归还 credit，Reduce 后释放窗口。
-- [ ] 移除节点级 FC2→Return barrier，确认 Return 与其他 Mblocks 的 FC1/FC2 重叠。
-- [ ] 完成所有 channel 的 terminal/drain、跨调用/Graph 状态复用。
+- [x] 从静态 C/route 目录打包，按完整行退休 C；不引入 fragment 引用图或 append queue。
+- [x] Return TX/RX 与 Dispatch 独立；source RX scatter 后归还 credit，Reduce 后释放窗口。
+- [x] 移除节点级 FC2→Return barrier，确认 Return 与其他 Mblocks 的 FC1/FC2 重叠。
+- [x] 完成所有 channel 的 terminal/drain、跨调用/Graph 状态复用。
 - [ ] EP8/EP16 全矩阵、热点与小深度 wrap 通过；记录 Dispatch 和 Return 各步收益及
       资源变化。协议支持任意有效节点拓扑，实机仍只声明两机验证。
 

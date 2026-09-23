@@ -121,8 +121,14 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
           ring::publish<::cuda::thread_scope_system>(
               ring::peer(a, identity.source, r.contribution_ready)[row],
               address.generation);
-          static_v4::reduce_add_release_device(
-              reinterpret_cast<unsigned long long *>(&slot.returned), 1U);
+          // Network Return may retire other rows of this same C slot from
+          // a peer GPU. Both RMW scopes must include all of those writers.
+          if constexpr (Network)
+            static_v4::reduce_add_release_system(
+                reinterpret_cast<unsigned long long *>(&slot.returned), 1U);
+          else
+            static_v4::reduce_add_release_device(
+                reinterpret_cast<unsigned long long *>(&slot.returned), 1U);
         } else {
           const auto valid = r.blocks[block].tile.rows;
           const auto credit = m + 1U == valid ? TileM - valid + 1U : 1U;

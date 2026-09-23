@@ -50,7 +50,8 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
         auto &s = slot(a, block);
         if (acquire(s.fc1_done) < s.fc1_target ||
             acquire(s.fc2_done) < s.fc2_target ||
-            acquire(s.returned) < s.return_target) {
+            acquire<Network ? ::cuda::thread_scope_system
+                            : ::cuda::thread_scope_device>(s.returned) < s.return_target) {
           free = false;
           break;
         }
