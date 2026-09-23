@@ -669,19 +669,29 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
   if (config.max_nodes > 1U) {
     const auto channels = config.max_nodes * packets.lanes;
     const auto local_world = config.max_world_size / config.max_nodes;
+    const auto peer_windows =
+        checked_mul(windows, config.max_nodes - 1U, "remote packet windows");
+    const auto dispatch_capacity = std::min(
+        routes, checked_mul(peer_windows, packets.packets(shape.tokens),
+                            "Dispatch packet capacity"));
+    const auto return_capacity = std::min(
+        routes, checked_mul(peer_windows,
+                            packets.packets(std::uint64_t(shape.tokens) *
+                                            config.max_top_k),
+                            "Return packet capacity"));
     m.selected = append(cursor, routes, sizeof(std::int32_t), "source selected experts");
     m.dispatch_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
                                  "Dispatch channel offsets");
-    m.dispatch_packets = append(cursor, routes, sizeof(static_forward::DispatchPacketPlan),
+    m.dispatch_packets = append(cursor, dispatch_capacity, sizeof(static_forward::DispatchPacketPlan),
                                  "Dispatch packet directory");
-    m.dispatch_consumers = append(cursor, checked_mul(routes, local_world, "packet consumers"),
+    m.dispatch_consumers = append(cursor, checked_mul(dispatch_capacity, local_world, "packet consumers"),
                                    sizeof(std::uint32_t), "Dispatch consumers");
     m.dispatch_routes = append(cursor, routes, sizeof(std::uint64_t),
                                 "Dispatch inverse route directory");
     m.return_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Return prefixes");
     m.return_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
                                "Return channel offsets");
-    m.return_packets = append(cursor, routes, sizeof(static_forward::ReturnPacketPlan),
+    m.return_packets = append(cursor, return_capacity, sizeof(static_forward::ReturnPacketPlan),
                                "Return packet directory");
     m.published_bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
     m.locations = append(cursor, routes, sizeof(static_forward::RouteLocation),

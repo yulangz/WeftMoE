@@ -841,8 +841,36 @@ Z 的 EP16/8K 快筛（1620 MHz、10/2/2、D4）：
 edge cases）两节点均 exit 0；host suite 18/18。两节点各 instrument rank 1/9
 的 B16/D1/T64 graph memcheck 均 0 errors，launcher exit 0。
 
+保持 L32 的窗口/depth 快筛：B1024/D4 4748.72 us、B2048/D4 4690.93 us、
+B512/D8 4781.50 us、B512/D16 4773.94 us、B1024/D8 4765.62 us。
+全部 80 rank/hash 一致，但相对 B512/D4 的 4766.67 us 没有实质改善；
+B1024/D4 与 B2048/D4 的总 pool 分别增至 1658820800、2934562240 bytes/rank。
+保留 B512/D4，不用大幅增容换取快筛中的微小差异。
+
 ### AA：控制/数学 warpgroup 寄存器配额（验证中）
 
 仅通过已有构建宏比较 math/control 216/64、216/72、208/88，均满足 384-thread
 CTA 的实际初始 register pool（168×384=64512），不把 SM 的 65536 全额当作
 该 CTA 可动态领用的配额。通信协议、packet/窗口、GEMM tile 均保持不变。
+
+8K 快筛：216/72 为 4711.65 us、208/88 为 4736.96 us，32 rank/hash 均一致。
+相比 216/64 的 4766.67 us 仅约 1%，暂不修改默认配额；这些不是独立 GEMM
+测量，不能据此判断 math/control 的最终最优配比。
+
+### AB：packet 目录容量使用包数上界（验证中）
+
+原 Dispatch/Return packet 目录各按最大 route 数分配，consumer count 还乘了
+local_world；PlanReady 交换连同这些大段空容量一起发送。现取两个合法上界的
+较小值：route 总数，或 `local_windows × (nodes−1) × 每节点每窗最大包数`。
+Dispatch 每节点每窗最多 `ceil(B/Q)` 包，Return 最多 `ceil(B×K/Q)` 包。
+覆盖 partial window、热点、重复 expert 和多节点稀疏分散，未假设均匀路由。
+源目录整体布局/Put 协议不变，仅缩小 allocation 与交换跨度；payload ring 不变。
+
+EP16/8K、L32/B512/D4 快筛 4713.58 us，16 rank/hash 一致，相对 Z 的
+4766.67 us 仅快约 1.1%，不算明确端到端收益。GIN 注册内存从 144189184
+降至 138977536 bytes/rank，减少 5211648 bytes。保留此容量清理。
+完整 EP16 PyTorch 四规模与 edge cases、B16/D1 的 T1/64 与 edge cases
+均两节点 exit 0。小 ring graph memcheck 同时覆盖 rank 1/9，均 0 errors，
+launcher exit 0；没有声称全部 16 ranks 都经过 sanitizer。
+日志 `build/ring_packet_capacity_*`，冻结 binary/lib/extension 位于
+`build/static_v4_ring_packet_capacity/`。
