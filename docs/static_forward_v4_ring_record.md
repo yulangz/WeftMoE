@@ -994,7 +994,60 @@ driver SMEM 1024 bytes、理论/实测 occupancy 18.75%/18.78%，SM throughput
 等待整个 CTA 的时间，不等同于 math warp 的 TMA stall；不能把它直接用于解释
 端到端流水瓶颈。其 profiler 运行的 event 时间不混入上表。
 
-### AG：四级 TMA row prefetch（验证中）
+AF 第二组：有效 S 宽度 N128、K128/stages2，packed 物理 N256，
+separated 两个 N128。其余合同相同；第二节点 GPU0，节点无其他 CPU/GPU
+任务，64 个完整输出/replay 检查通过，3840 对时钟均为 1620:1620。
+所有入口仍 REG168、STACK0、LOCAL0；结果位于
+`build/static_gemm_control_n128_s2_k128/`。
+
+| route world / distribution | tokens/rank | packed FC1/us | separated FC1/us | packed chain/us | separated chain/us |
+|---|---:|---:|---:|---:|---:|
+| 8 / balanced | 1 | 35.200 | 36.928 | 45.664 | 47.472 |
+| 8 / balanced | 64 | 39.104 | 40.368 | 52.464 | 53.824 |
+| 8 / balanced | 8192 | 271.184 | 285.312 | 429.952 | 437.952 |
+| 8 / balanced | 20480 | 664.416 | 702.432 | 1036.192 | 1073.584 |
+| 8 / hotspot | 1 | 37.728 | 39.424 | 47.584 | 49.264 |
+| 8 / hotspot | 64 | 38.448 | 40.128 | 50.400 | 52.160 |
+| 8 / hotspot | 8192 | 2046.416 | 2188.336 | 3236.496 | 3346.128 |
+| 8 / hotspot | 20480 | 5053.664 | 5404.368 | 7911.840 | 8182.784 |
+| 16 / balanced | 1 | 35.024 | 37.120 | 45.440 | 47.296 |
+| 16 / balanced | 64 | 37.936 | 39.680 | 48.928 | 50.784 |
+| 16 / balanced | 8192 | 268.208 | 285.328 | 426.208 | 439.472 |
+| 16 / balanced | 20480 | 662.512 | 699.088 | 1035.776 | 1072.592 |
+| 16 / hotspot | 1 | 37.680 | 39.232 | 47.728 | 49.664 |
+| 16 / hotspot | 64 | 38.944 | 41.024 | 62.288 | 64.144 |
+| 16 / hotspot | 8192 | 4106.800 | 4273.424 | 6345.856 | 6634.448 |
+| 16 / hotspot | 20480 | 10067.936 | 10656.800 | 15720.192 | 16305.345 |
+
+AF 参数消融：world8/balanced，列中依次为 T=1/64/8192/20480 的 p50/us。
+N 是有效 S 宽度。N32/stages3 只测 packed（其物理 N64；separated N32
+不支持当前 WGMMA atom）；N64/stages3 在第一节点，其余 K64/stages4 在
+第二节点。各节点测量期间无其他 CPU/GPU 任务；56 个用例全通过，
+3360 对时钟均为 1620:1620。原始目录为 `build/static_gemm_control_n*_s*_k*/`。
+
+| N / K / stages | layout | FC1/us（四规模） | chain/us（四规模） |
+|---|---|---|---|
+| 32 / 128 / 3 | packed | 17.952 / 19.952 / 408.896 / 989.344 | 28.496 / 34.256 / 563.808 / 1360.256 |
+| 64 / 128 / 3 | packed | 22.816 / 25.280 / 309.536 / 736.240 | 33.552 / 38.528 / 466.416 / 1106.336 |
+| 64 / 128 / 3 | separated | 27.232 / 29.632 / 383.312 / 917.856 | 37.936 / 43.040 / 538.880 / 1285.440 |
+| 64 / 64 / 4 | packed | 23.840 / 26.688 / 322.640 / 780.592 | 34.864 / 39.600 / 482.560 / 1152.176 |
+| 64 / 64 / 4 | separated | 30.048 / 32.288 / 423.312 / 1018.336 | 40.640 / 45.488 / 580.576 / 1391.008 |
+| 128 / 64 / 4 | packed | 35.312 / 39.184 / 271.328 / 665.136 | 45.840 / 52.304 / 429.328 / 1036.448 |
+| 128 / 64 / 4 | separated | 39.200 / 42.848 / 304.560 / 746.560 | 49.776 / 56.112 / 462.128 / 1108.736 |
+| 64 / 64 / 6 | packed | 23.920 / 26.448 / 322.592 / 774.224 | 34.704 / 39.760 / 482.624 / 1147.088 |
+| 64 / 64 / 6 | separated | 29.680 / 31.776 / 417.888 / 1004.768 | 40.416 / 45.360 / 575.696 / 1378.576 |
+| 32 / 128 / 4 | packed | 18.368 / 20.080 / 419.088 / 1008.864 | 29.232 / 33.120 / 576.128 / 1382.432 |
+
+后补 N64/K64/stages6 与 N32/K128/stages4 也在第二节点 GPU0 测量；
+24 个用例全通过，1440 对时钟均为 1620:1620。增加 stage 没有稳定改善。
+
+当前候选中，小 N32/stages3 的 packed 适合短序列；长序列 packed N128/
+K128/stages2 最好。增大 S 宽度后，两种布局差距明显缩小，但 separated
+没有反超；K64/stages4 也未带来收益。不同 N 的部分测量来自不同物理节点，
+最终选择仍需同卡复测及端到端确认。AC 已说明只增加 N 并不能消除通信等待，
+不把纯 GEMM 的改善直接填成 EP8/EP16 收益。
+
+### AG：四级 TMA row prefetch（无收益，撤回）
 
 只扩展已有 `RowPrefetchPipeline` 的 staging 深度，保留唯一 issuer；
 四个独立 slot/barrier 先发 G2S，再逐个退休 S2G，复用前等待相应 store group
@@ -1008,3 +1061,64 @@ ring 的 shared allocation 按实际 staging 大小计算，不把 4 份 buffer
 多机待测。独立 AD 窗口快筛 B256/512/1024/2048 为
 1672.98/1654.40/1770.38/2014.24 us（CPU 同时构建 AG），32 hashes 一致，
 不把 B512 约 1% 的差异当作明确收益；保留 B256。
+
+AG 的 EP16/8K L32/B512/D4 快筛 4832.83 us，16 hashes 一致，但没有改善。
+网络 ring entry 的 stack 从 480 增至 584 bytes，不能据此单独断言退化原因。
+已撤回四级预取、临时宏和 shared-budget 扩展，保持两级实现。
+
+### AH：expert 内改为 source-major 行序（无收益，撤回）
+
+原 source round-robin 让每个 Mblock 混合更多 source，Return 同一 source 的
+连续 routes 也映射为有间隔的 C 行。新候选采用 expert 内 source prefix +
+source ordinal，相同 source 连续；减少一个 block 的 X-ready 依赖方，并让
+Return 的源行按相邻地址排列。没有额外 padding、buffer 或动态任务分配，
+packet/fanout/retirement 计数不变。同步修改现有几何校验的独立 host 枚举，
+不增加新的单测入口。source 内 ordinal 暂仍是 inference 的一次性原子排布，
+不能把 source-major 本身称为 StableTape；训练仍需稳定化此 ordinal。
+
+EP8/8K B256/D4 快筛 1673.58 us，EP16/8K L32/B512/D4 4764.24 us；
+24 个输出 hash 与冻结 V3 一致。现有 GPU plan 检查 31 source/packet +
+6 destination cases（含 3 nodes）通过。没有端到端收益，已撤回布局改动；
+冻结 `build/static_v4_ring_source_major/` 保留，不作为生产 profile。
+
+### AI：节点内 Pull 的 warp 合并读写（退化，撤回）
+
+只替换 node-local X pull：整个 warp 以连续 uint4 读取源行、写入目标 X，
+warp join 后由 lane0 发布本行 X-ready。源 contribution reservation 与
+compute slot admission 不变；远端 RX pull、TX/RX packet copier 仍用原 TMA。
+不扩展 shared memory，不增加任务领取或运行时分支；用于判断本地两行一等的
+TMA staging 是否拖慢流水，尚无收益结论。
+
+EP8/8K B256/D4 快筛 3994.93 us，8 个 hash 一致，但相对 AD 1682.80 us
+退化约 2.37 倍。未继续双机或完整矩阵，已撤回向量搬运。这与此前 V/W 的
+网络向量复制实验一致：当前资源分配下，整 warp 的同步 vector loop 不适合
+替代通信角色的 TMA pipeline。冻结 `build/static_v4_ring_local_warp/`。
+
+### AJ：packed FC1 的 WGMMA group overlap（纯 GEMM 退化）
+
+packed FC1 补齐对现有 `kWgmmaWaitGroup` 的支持：wait1 时保留当前 stage，
+只回收已完成的前一个 stage；循环结束 wait0 后回收最后一个 stage。没有
+提前释放仍被 WGMMA 读取的 A/B。默认 wait0 不变，先在独立基准对照再决定
+是否改变生产 profile；FC2 与 separated 使用已有同类流水配置。
+
+第二节点单 GPU，world8/balanced、四规模、FC1/chain、两种布局共 32
+用例全部通过完整输出/replay 检查；1920 对时钟均为 1620:1620。N128/K128/
+stages2 的 packed FC1 从 35.200/39.104/271.184/664.416 us 退化至
+52.320/58.336/412.320/992.976 us，chain 从
+45.664/52.464/429.952/1036.192 退化至
+65.568/78.928/611.568/1463.824 us。
+N64/K128/stages3 的 packed FC1 为 23.280/27.328/333.120/792.912 us，
+chain 为 36.880/45.008/527.088/1259.584 us，同样无改善。
+separated 没有反超（完整样本位于 `build/static_gemm_wait1_n*/`）。
+
+资源仍 REG168、STACK0、LOCAL0，但 ptxas 新增 C7510：跨函数边界的
+WGMMA pipeline 序列化。因此这不是成功隐藏数学延迟的实现，不据此宣布
+异步 group overlap 本身无效；不进入端到端 profile，也不保留未获益的
+生产 FC1 分支。
+
+### AK：缩小 packet Q 提高 Dispatch lane 利用率（验证中）
+
+窗口内从 lane0 开始 stripe；实际去重 token 数少于 Q×lanes 时，部分
+Dispatch owner 始终无包。对照 Q16/Q8 与原 Q32，lanes32、B512/D4 不变。
+保持逐 slot generation、双 credit、精确 fanout 与 Return rows 合同；
+只改变静态 packet 几何和相应有界分配，检查并行收益与提交开销的权衡。

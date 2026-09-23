@@ -780,8 +780,13 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 - [x] 建立第 7.2 节纯 GEMM 基准，固定输入/权重/route 分布、时钟和数值参考。
       N64/K128/stages2 的 EP8/EP16、四规模、均衡/热点、FC1/chain 两布局共 64
       用例通过完整输出/replay 校验；更宽 tile、独立调优与 profiler 分析仍在进行。
-- [ ] 做等有效 S 宽度的 separated/interleaved 受控对照，核对逻辑 N tiles 及计数目标。
-- [ ] 分别调优两种布局的 N/K/stages/epilogue，保留失败候选和资源/误差原因。
+- [x] 做等有效 S 宽度的 separated/interleaved 受控对照，核对逻辑 N tiles 及计数目标。
+  AF 已完成 N64/N128、balanced/hotspot、四规模、world8/16 重放；两边共享
+  生产 SwiGLU/精度合同，完整输出与 replay 校验通过。
+- [x] 分别调优两种布局的 N/K/stages/epilogue，保留失败候选和资源/误差原因。
+  已测 N32/64/128、K64/128、stages2/3/4/6；N32 仅 packed 支持。
+  AF/AJ 记录资源、完整样本与失败的 group-overlap 候选。profile 选择与
+  端到端验证仍是下列独立待办，不把诊断基准结果当成融合算子性能。
 - [ ] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。
 - [ ] 在同一通信版本回测 EP8/EP16 四规模；把纯 GEMM 收益和端到端收益分别落表。
 

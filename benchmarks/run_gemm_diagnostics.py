@@ -27,7 +27,7 @@ def main():
                         default="forward")
     parser.add_argument("--logical-n", type=int, choices=(32, 64, 128), default=64,
                         help="Static FC1 SwiGLU output columns per task")
-    parser.add_argument("--stages", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--stages", type=int, choices=(2, 3, 4, 5, 6), default=2)
     parser.add_argument("--tile-k", type=int, choices=(64, 128), default=128)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=4)
