@@ -2,6 +2,7 @@
 
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/profiling/device_timeline_types.hpp"
+#include "cuda/static_v4/plan.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #define private public
 #include "weftmoe/cuda/activation_transport.hpp"

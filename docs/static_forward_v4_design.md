@@ -1,13 +1,15 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
-更新：2026-09-23。本版整理已确认的设计，作为后续实现依据；**除第 0 节外均为
-待实现或待消融的目标，不表示 ring、通信/计算流水或 training V4 已经落地。**
+更新：2026-09-23。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
+第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training
+V4 已经落地。**
 旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
 引用计数等选择，不再作为实现要求。历史实现和性能证据保留在：
 
 - [单机优化记录](static_forward_v4_optimize_record.md)
 - [多机优化记录](static_forward_v4_multinode_record.md)
 - [prefill GEMM/epilogue 优化记录](static_forward_v4_prefill_record.md)
+- [ring 实施与优化记录](static_forward_v4_ring_record.md)
 
 ## 0. 当前代码基线：已实现什么
 
@@ -658,6 +660,13 @@ M5 与协议实现正交，可在冻结基线后提前做，但不把两者收�
 
 ### M1：冻结可执行的 plan、布局与进度合同
 
+M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window planner，
+详见 ring 实施记录。规划器目前独立验证，尚未接入 Forward 的数据面；下面涉及
+destination、跨 rank 交换、消费者目录和准入的完整事项仍保持未完成。
+
+- [x] 窗口编号、完整 token 分包、任意节点数的 peer/lane 地址和逐 slot 累积退休合同。
+- [x] GPU source-window expert/node counts、去重 token 列表、source ordinal 与 channel
+      packet prefix；显式区分 masked route 和非法 expert id。
 - [ ] 定义窗口编号、实际窗口/expert counts、逻辑 Mblock、source contribution 映射，
       以及 packet-sequence 优先的接收侧静态任务目录。
 - [ ] 冻结 packet/token/fanout 及 Return 行枚举，生成精确 channel packet 数和
@@ -757,4 +766,4 @@ ring depth/窗口大小分别消融。多个改动一起启用只能报告组合
 重叠由 timeline 证明，不把并行 stage span 相加当成总延迟，也不拿旧的未完整赋值
 device-clock 字段当通信计时。
 
-本次只修订设计文档和待办，不执行上述实现或性能实验。
+实际实施、验证和测量以第 11 节及 ring 实施记录为准，未勾选项不能视为已实现。

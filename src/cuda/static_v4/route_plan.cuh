@@ -62,11 +62,10 @@ __device__ __forceinline__ void build_geometry(const ForwardKernelArgs &a) {
         prefix[local] = rows;
         offsets[local] = tiles;
         const auto extent =
-            (total + forward_tuning::kTileM - 1ULL) / forward_tuning::kTileM;
+            static_forward::ceil_div(total, forward_tuning::kTileM);
         for (std::uint64_t tile = 0; tile < extent; ++tile)
-          tile_rows[tiles + tile] =
-              static_cast<unsigned>(min(std::uint64_t(forward_tuning::kTileM),
-                                        total - tile * forward_tuning::kTileM));
+          tile_rows[tiles + tile] = static_forward::block_rows(
+              total, tile, forward_tuning::kTileM);
         rows += total;
         tiles += extent;
       }

@@ -10,6 +10,7 @@ __pycache__/
 !/docs/static_forward_v4_design.md
 !/docs/static_forward_v4_optimize_record.md
 !/docs/static_forward_v4_prefill_record.md
+!/docs/static_forward_v4_ring_record.md
 /dist/
 /*.egg-info/
 /server_parity*.json

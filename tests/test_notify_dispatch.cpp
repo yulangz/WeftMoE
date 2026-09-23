@@ -11,12 +11,14 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,6 +29,7 @@
 #include "cuda/nccl_protocol_internal.hpp"
 #include "cuda/persistent_v3/backward/cluster_task.cuh"
 #include "cuda/persistent_v3/forward/pipeline_state.cuh"
+#include "cuda/static_v4/ring_layout.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #include "weftmoe/api/errors.hpp"
@@ -1932,6 +1935,210 @@ void test_bootstrap_real_pipe_one_shot() {
   REQUIRE(::close(replacement[0]) == 0);
 }
 
+void test_static_forward_window_packets() {
+  namespace plan = weftmoe::cuda::static_forward;
+  // Include a partial source group and unequal/empty sources. This exercises
+  // three nodes without assuming the available two-node GPU test topology.
+  for (const unsigned world : {8U, 16U, 24U}) {
+    constexpr unsigned local_world = 8U, owned = 4U, top_k = 4U;
+    const plan::WindowShape shape{world, 16U, 8U, top_k, 8U};
+    const auto experts = world * owned;
+    const auto windows = shape.windows(42U);
+    using Key = std::tuple<std::uint64_t, unsigned, unsigned>;
+    using Token = std::pair<std::uint64_t, unsigned>;
+    std::map<Key, std::vector<Token>> packets;
+    std::vector<unsigned> counts(windows * experts, 0U);
+    std::uint64_t route_count = 0U, fanout_count = 0U;
+    for (unsigned source = 0; source < world; ++source) {
+      const auto tokens = (source * 17U) % 43U;
+      unsigned covered_tokens = 0U;
+      for (std::uint64_t w = 0; w < windows; ++w)
+        covered_tokens += shape.token_count(w, source, tokens);
+      REQUIRE(covered_tokens == tokens);
+      for (unsigned token = 0; token < tokens; ++token) {
+        const auto w = shape.window(source, token);
+        REQUIRE(w < windows);
+        REQUIRE(source >= shape.source_begin(w));
+        REQUIRE(source < shape.source_end(w));
+        REQUIRE(token >= shape.token_begin(w));
+        REQUIRE(token - shape.token_begin(w) <
+                shape.token_count(w, source, tokens));
+        std::array<plan::TokenRoute, top_k> routes{};
+        std::map<unsigned, unsigned> expected;
+        for (unsigned k = 0; k < top_k; ++k) {
+          const auto expert = token % 3U == 0U
+                                  ? experts - 1U
+                                  : (source * 13U + token * 7U + k / 2U) % experts;
+          routes[k] = {expert, !(k == 3U && token % 5U == 0U)};
+          if (routes[k].valid) {
+            ++expected[expert / (local_world * owned)];
+            ++counts[w * experts + expert];
+            ++route_count;
+          }
+        }
+        plan::for_each_token_node(
+            routes.data(), top_k, local_world * owned,
+            [&](unsigned node, unsigned fanouts) {
+              const auto found = expected.find(node);
+              REQUIRE(found != expected.end());
+              REQUIRE(found->second == fanouts);
+              packets[{w, source, node}].emplace_back(token, fanouts);
+              fanout_count += fanouts;
+              expected.erase(found);
+            });
+        REQUIRE(expected.empty());
+      }
+    }
+    REQUIRE(route_count == fanout_count);
+    for (std::uint64_t w = 0; w < windows; ++w) {
+      for (unsigned rank = 0; rank < world; ++rank) {
+        std::uint64_t blocks = 0;
+        for (unsigned e = rank * owned; e < (rank + 1U) * owned; ++e) {
+          const auto rows = counts[w * experts + e];
+          const auto n = plan::ceil_div(rows, shape.tile_m);
+          blocks += n;
+          unsigned covered = 0;
+          for (std::uint64_t b = 0; b < n; ++b)
+            covered += plan::block_rows(rows, b, shape.tile_m);
+          REQUIRE(covered == rows);
+        }
+        REQUIRE(blocks <= shape.max_mblocks(owned));
+      }
+    }
+    const plan::PacketPartition partition{3U, 2U};
+    std::uint64_t packed_fanouts = 0;
+    for (const auto &entry : packets) {
+      const auto &tokens = entry.second;
+      std::set<std::uint64_t> packed_tokens;
+      std::uint64_t packet_count = 0;
+      for (unsigned lane = 0; lane < partition.lanes; ++lane) {
+        const auto n = partition.lane_packets(tokens.size(), lane);
+        packet_count += n;
+        for (std::uint64_t sequence = 0; sequence < n; ++sequence) {
+          const auto begin = partition.token_begin(lane, sequence);
+          const auto rows = partition.token_count(tokens.size(), lane, sequence);
+          unsigned expected = 0;
+          for (unsigned i = 0; i < rows; ++i) {
+            REQUIRE(packed_tokens.insert(tokens[begin + i].first).second);
+            expected += tokens[begin + i].second;
+          }
+          REQUIRE(rows && expected >= rows && expected <= rows * top_k);
+          packed_fanouts += expected;
+        }
+      }
+      REQUIRE(packet_count == partition.packets(tokens.size()));
+      REQUIRE(packed_tokens.size() == tokens.size());
+    }
+    REQUIRE(packed_fanouts == route_count);
+  }
+}
+
+void test_static_forward_slot_lifetimes() {
+  namespace plan = weftmoe::cuda::static_forward;
+  using weftmoe::cuda::communication::reached;
+  std::array<plan::Retirement, 2> retirement{};
+  std::array<std::uint64_t, 2> done{}, credit{}, local_done{}, local_target{};
+  for (std::uint64_t batch = 0; batch < 17U; ++batch) {
+    std::array<std::uint64_t, 2> target{};
+    std::array<unsigned, 2> expected{};
+    for (unsigned i = 0; i < 2U; ++i) {
+      const plan::SlotSequence seq{batch * 2U + i, 2U};
+      REQUIRE(seq.slot() == i && seq.generation() == batch);
+      REQUIRE(seq.reusable(credit[i], local_done[i], local_target[i]));
+      expected[i] = static_cast<unsigned>((batch * 7U + i * 3U) % 13U + 1U);
+      target[i] = retirement[i].publish(expected[i]);
+      ++local_target[i];
+    }
+    // Slot 1 finishes first; neither its ACK nor its local completion retires 0.
+    for (const unsigned i : {1U, 0U}) {
+      const plan::SlotSequence next{(batch + 1U) * 2U + i, 2U};
+      REQUIRE(!next.reusable(credit[i], local_done[i], local_target[i]));
+      done[i] += expected[i] - 1U;
+      REQUIRE(!reached(done[i], target[i], 64U));
+      ++done[i];
+      REQUIRE(reached(done[i], target[i], 64U));
+      credit[i] = batch + 1U;
+      REQUIRE(!next.reusable(credit[i], local_done[i], local_target[i]));
+      ++local_done[i];
+      REQUIRE(next.reusable(credit[i], local_done[i], local_target[i]));
+      if (i == 1U)
+        REQUIRE(!reached(done[0], target[0], 64U));
+    }
+  }
+  // Row-based C retirement is invariant to Return fragmentation.
+  plan::Retirement c;
+  REQUIRE(c.publish(128U) == 128U);
+  std::uint64_t copied = 0;
+  for (unsigned rows : {40U, 56U}) {
+    copied += rows;
+    REQUIRE(!reached(copied, c.target, 64U));
+  }
+  copied += 32U;
+  REQUIRE(reached(copied, c.target, 64U));
+  REQUIRE(c.publish(3U) == 131U); // Next-generation tail; no reset.
+  std::array<plan::RingCapacity, 3> planes{{{6U, 4U, 8U},
+                                          {6U, 0U, 8U},
+                                          {6U, 3U, 8U}}};
+  REQUIRE(planes[0].fits(3U) && !planes[1].fits(3U) && planes[2].fits(3U));
+  // No partial reservation while S is full.
+  for (const auto &plane : planes)
+    REQUIRE(plane.head == 6U);
+  planes[1].tail = 1U;
+  for (auto &plane : planes) {
+    REQUIRE(plane.fits(3U));
+    plane.head += 3U;
+  }
+}
+
+void test_static_forward_network_layout() {
+  namespace plan = weftmoe::cuda::static_forward;
+  constexpr unsigned rows = 32U, top_k = 4U, hidden = 2048U;
+  const auto dispatch = plan::PacketLayout::dispatch(rows, rows * top_k, hidden);
+  const auto returning = plan::PacketLayout::returning(rows, hidden);
+  for (unsigned n = 1; n <= rows; ++n) {
+    const auto compact = plan::PacketLayout::dispatch(n, n * 2U, hidden);
+    REQUIRE(compact.payload % 128U == 0U);
+    REQUIRE(compact.bytes <= dispatch.bytes);
+    REQUIRE(compact.fanouts >= compact.records + n * sizeof(plan::TokenRecord));
+    REQUIRE(compact.payload >= compact.fanouts + n * 2U * sizeof(plan::FanoutRecord));
+  }
+  for (const unsigned nodes : {1U, 2U, 3U, 70U}) {
+    const plan::NetworkRings rings{nodes, 2U, 4U, dispatch.bytes, returning.bytes};
+    for (unsigned self = 0; self < nodes; ++self) {
+      std::set<std::uint64_t> channels;
+      std::vector<std::pair<std::size_t, std::size_t>> ranges;
+      for (unsigned peer = 0; peer < nodes; ++peer) {
+        if (peer == self)
+          continue;
+        for (unsigned lane = 0; lane < rings.lanes; ++lane) {
+          const auto channel = rings.channel(self, peer, lane);
+          REQUIRE(channels.insert(channel).second);
+          for (unsigned slot = 0; slot < rings.depth; ++slot) {
+            for (bool ret : {false, true}) {
+              const auto control = rings.control(ret, channel, slot);
+              ranges.emplace_back(control, control + sizeof(plan::NetworkSlot));
+              for (bool rx : {false, true}) {
+                const auto begin = rings.payload(ret, rx, channel, slot);
+                const auto bytes = ret ? returning.bytes : dispatch.bytes;
+                REQUIRE(begin % 128U == 0U);
+                REQUIRE(begin == rings.payload(ret, rx, channel, slot + rings.depth));
+                ranges.emplace_back(begin, begin + bytes);
+              }
+            }
+          }
+        }
+      }
+      REQUIRE(channels.size() == rings.channels());
+      std::sort(ranges.begin(), ranges.end());
+      for (std::size_t i = 0; i < ranges.size(); ++i) {
+        REQUIRE(ranges[i].second <= rings.bytes());
+        if (i)
+          REQUIRE(ranges[i - 1U].second <= ranges[i].first);
+      }
+    }
+  }
+}
+
 void test_forward_multicast_task_pairs() {
   using weftmoe::cuda::persistent_v3::fc1_group_task;
   for (unsigned mblocks = 1; mblocks <= 8; ++mblocks) {
@@ -1982,6 +2189,9 @@ void test_backward_multicast_task_pairs() {
 
 int main() {
   const std::vector<std::pair<const char *, std::function<void()>>> tests{
+      {"static_forward_window_packets", test_static_forward_window_packets},
+      {"static_forward_slot_lifetimes", test_static_forward_slot_lifetimes},
+      {"static_forward_network_layout", test_static_forward_network_layout},
       {"forward_multicast_task_pairs", test_forward_multicast_task_pairs},
       {"backward_multicast_task_pairs", test_backward_multicast_task_pairs},
       {"rank_local_async_and_deterministic_mapping",
