@@ -1569,7 +1569,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               if constexpr (StaticSchedule) {
                 static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal, Fc2TileN,
                                         RingSchedule>(
-                    a, output_tile, accum, row, valid_rows, n);
+                    a, output_tile, accum, row, valid_rows, n, mblock);
               } else {
                 const auto warp =
                     __shfl_sync(0xffffffffU, threadIdx.x / 32U, 0);

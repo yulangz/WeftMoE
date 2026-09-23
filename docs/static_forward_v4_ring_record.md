@@ -874,3 +874,52 @@ EP16/8K、L32/B512/D4 快筛 4713.58 us，16 rank/hash 一致，相对 Z 的
 launcher exit 0；没有声称全部 16 ranks 都经过 sanitizer。
 日志 `build/ring_packet_capacity_*`，冻结 binary/lib/extension 位于
 `build/static_v4_ring_packet_capacity/`。
+
+AB 正式矩阵（1620 MHz、10/20/20；EP8 第二节点独立测试，EP16 两节点均无
+编译/GPU 竞争任务）：
+
+| tokens/rank | V3 EP8/us | AB EP8/us | V3 EP16/us | AB EP16/us |
+|---:|---:|---:|---:|---:|
+| 1 | 300.374 | 108.637 | 682.170 | 303.306 |
+| 64 | 370.218 | 160.864 | 824.659 | 590.722 |
+| 8192 | 1489.09 | 2156.34 | 3353.94 | 4716.07 |
+| 20480 | 3294.90 | 5303.55 | 7099.53 | 11166.5 |
+
+全部 96 rank/hash 与相应 V3 一致。EP16 长序列相对 U 降低 56.0%/57.4%，
+但仍慢于 V3；EP8 未随网络目录优化改善。日志 `build/ring_packet_capacity_ep16_t*.log`
+及 `build/ring_packet_capacity_remote_ep8_t*.log`。EP8 时第一节点可有 CPU 编译，
+实际测试的第二节点无其他任务，不能把此拓扑称作双机 EP8。
+
+### AC：prefill FC1 N128→N256（无收益，撤回）
+
+仅放大 packed FC1 的 N，逻辑 SwiGLU 列宽从 64 变为 128；FC2、stages、
+权重排列、通信协议不变，共享内存上界仍由 FC2 决定。8K 快筛单机 EP8
+B256/D4 为 2178.82 us，双机 EP16 L32/B512/D4 为 4742.54 us，24 hashes
+与冻结 V3 一致。没有明确端到端收益，恢复 N128，不保留临时调参宏。
+这是融合路径的 tile 实验，不是纯 GEMM 或 gate/up 布局的独立消融。
+候选冻结在 `build/static_v4_ring_fc1n256/`。
+
+### AD：节点内 FC2 直接写 contribution ring（验证中）
+
+FC2 的节点内行直接写 source 已预留的 contribution slot，跳过 C→contribution
+的第二次 payload 搬运；跨节点行继续写 C，交给现有网络 Return。FC1 的
+X-ready 已包含 source reservation，不提前写未预留的 contribution。
+固定 Return warp 按 Mblock residue 等所有 FC2 N tiles；acquire 完成链、system
+fence、warp join 后协作发布逐 route ready，再按实际本地行数退休 C。零本地行
+的 block 只检查 immutable plan，不读取可能已被网络 owner 释放的 C slot。
+contribution 仍由 Reduce 退休；网络 packet/双重 credit 与 expected count 不变。
+
+8K 快筛 EP8 B256/D4 为 1687.55 us，相对 AB 2156.34 us 降低约 21.7%；
+EP16 L32/B512/D4 为 4757.62 us，与 AB 4716.07 us 相当。24 hashes 一致，
+没有把单机收益归给多机。完整 EP16 PyTorch 四规模/edge cases，以及 B16/D1
+T1/64/edge cases 均两节点 exit 0。两节点 rank 1/9 的小 ring graph
+racecheck 均 0 errors、0 warnings，launcher exit 0。单机 EP8 的四规模 PyTorch
+及全部 edge cases 也已 exit 0，包含 20K 热点后复用。正式性能矩阵待后续回测。
+
+### AE：在 Z 之后重测 warp 协作 packet 处理（验证中）
+
+恢复 V/W 中有局部收益的 TMA 版本，不恢复向量 copy 和试验宏。每包最多 32
+行，warp 协作读取描述符、检查 C-ready，lane0 保持唯一 TMA/GIN issuer；
+full completion 后 warp join，再按同 C slot 合并退休。RX scatter 复用同一个
+packet copier，并行发布逐 route ready，join 后才释放 RX。generation、credit
+等可能瞬时变化的分支由 lane0 判断并广播，避免 lane 分歧等待。
