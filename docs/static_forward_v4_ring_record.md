@@ -1787,3 +1787,218 @@ EP16/8K/B512/D4 快筛 3418.96 us，与未缓存的 3411.25 us 相当，未保�
 `build/static_v4_ring_math_admission/change.patch`，native SHA256
 `07fe35ace906d1c89dd470cd0d6725282fa01fcdff59a85edcdb0970844d1d09`；
 日志 `ring_math_admission_ep16_t8192_quick.log`。
+
+### BL：计算 GPU 直接跨机 Return（无收益，已撤回）
+
+候选协议见设计 6.8：Dispatch 不变；Return 按 source/compute-rank/lane 预规划，
+compute GPU 从自己的 C 打包并直接发送给源 GPU，移除 payload 的节点内 rail
+汇集。Return ready 缩为本地 C-slot generation，C 的 reader/retirement 全在本
+GPU，因此统一 device scope。Put/ACK 使用互逆的跨 local-rank channel 映射；
+RX scatter、逐 slot 累计 target 和远端 consumed AND 本地 completion 保留。
+每 remote node 的 Dispatch/Return channels 分别 32 与 8×4，不乘出 8×32。
+
+现有 host 检查 18/18（原 layout case 扩展非同 rail 的双向映射及不等 plane
+大小），GPU plan 31+6（逐 compute rank 的 Return、含三节点）通过，没有新增
+成批单测。D8/R16/L32/B512/D4 的 EP16/8K 首轮快筛 **4600.08 us**，16 hashes
+与 BH 一致；比 BH 更慢，尚未完成 PyTorch/sanitizer 门禁，不合入该版本。
+pool 933099456 bytes/rank，其中 registered 55232256；网络 prefill
+REG168/STACK456/LOCAL0。冻结 `build/static_v4_ring_direct_return/` 与
+`change.patch`，native SHA256
+`576db8866da630ffaeeb19949acfbc4fa277c0e03d8b7a289b50811699a9ee27`，library
+`c5fd3212b9a64256b4919337aa391fcbff155f5fdd6496c41649f5f9e1d63cbd`；
+日志 `ring_direct_return_ep16_t8192_quick.log`。
+
+代码审计发现这次拓扑调整使 TX 热循环的 source directory/RouteLocation 从
+owner-local 变为 peer 读取。它是后续预绑定的假设，不把单次计时当成因果证明。
+
+### BM：直接 Return 的本地 packet/逻辑行绑定（无收益，已撤回）
+
+在 BL 的既有 destination PlanReady 后，固定 CTA/warp 复制实际归本 GPU 的
+channel interval、packet descriptor 和逻辑 C 行号到普通 device pool；source
+目录只在这个 pass 读取。现有节点内 barrier 已发布 RouteLocation，新增一个
+grid join 让发送 owner 看见全部绑定，无第二次网络 metadata exchange。非法
+route 的 collective error 不读取尚未建立的 locations，仍由既有入口一致失败。
+TX 热循环只访问本地不可变绑定、block geometry、ready 和 C payload；没有新增
+runtime claim 或 expected count。绑定属于 invocation plan，不是 transient
+payload，内存随配置 route 上界增长，需单独计入资源成本。
+
+首轮 D8/R16/L32/B512/D4 的 EP16/8K 快筛 3506.54 us，16 hashes 与 BH 一致；
+比未绑定的 BL 低 23.8%，但仍比 BH 慢约 2.5%。pool 935726528 bytes/rank，
+比 BL 增加 2627072；registered 仍 55232256。网络 prefill
+REG168/STACK456/LOCAL0，kernel 参数区 3328 bytes。绑定支持“热循环 peer
+metadata 显著拖慢 BL”的解释，但未使新拓扑胜出，尚不合入；继续单独消融
+Return Q。冻结 `build/static_v4_ring_direct_return_bound/` 与 `change.patch`，
+native SHA256 `91a7cbb5ff03fefc42739e6e3197f28bc85275e6eb816b8c927fa1c8781bb3a4`，
+library `542019df39ce5eae64f6e82438b04c48b9e517c189d88587e34fb54f284a60b0`；
+日志 `ring_direct_return_bound_ep16_t8192_quick.log`。
+
+20K 快筛 8164.53 us（本机同时编译 Q32/Q64，非正式成绩），仍未好于 BH。
+保持 BM 其余逻辑，仅将 Return Q 改为 32/64；两个节点无其他编译/GPU 工作
+的 8K 快筛分别 **3650.88/3817.76 us**，32 hashes 与 BH 一致。registered
+bytes/rank 分别 88737536/155821824；冻结 `static_v4_ring_direct_return_r32/`
+及 `static_v4_ring_direct_return_r64/`，日志 `ring_direct_return_r*_ep16_t8192_quick.log`。
+不为这些失败候选继续跑完整 PyTorch/sanitizer。BL/BM 及其拓扑/绑定/地址表
+改动全部撤回，恢复 BH，避免保留比基线更慢的额外路径。
+
+### BN：64 lanes 与 CTA-residue 控制阶段（无收益，已撤回）
+
+独立回到 BH/D8/R16，不包含 BL/BM。B512 的均衡窗口有 64 个 Dispatch
+packet/source 和 64 个 Return packet/source/remote-node，L40 切分不均匀；
+L64 可以每 lane 一个。原 owner cap32 及“一 context 一 CTA”的控制阶段限制
+了这项实验。候选把 owner cap 提到 64，metadata Put 与 GIN fence 采用
+`context=blockIdx; context<contexts; context+=gridDim` 的固定 residue，仍逐
+context fence，不省略活跃或空 context。每个 CTA 的 context 顺序递增，
+不存在跨 CTA 的动态领用。
+
+132 CTA 下 W64 分配为 Pull68/local Return4/Reduce67，另有独立的 Dispatch
+TX64、Return TX64、Return scatter64、NIC progress64 与 admission1。
+192 contexts 不要求 192 个 CTA 同时执行控制阶段；host 仍要求至少 `2W+1`
+CTA，保留所有数据消费者的常驻进度。
+
+L64/D8/R16 的既有 GPU plan 31+6 cases 通过。EP16/8K/B512/D4 快筛
+**4011.28 us**，16 hashes 与 BH 一致，比 BH 更慢。pool 983659200
+bytes/rank、registered 105763072，几乎加倍的网络 ring 没有带来收益；网络
+prefill 仍 REG168/STACK440/LOCAL0。没有继续完整 PyTorch/sanitizer 门禁，
+已撤回 owner cap、host 条件和控制阶段 residue 三处改动，恢复 BH。
+归档 `build/static_v4_ring_lanes64/change.patch`，native SHA256
+`066504fbe55b61b39c220fb1ed524c46cc406a2d1ccf98d0ea3caa672ac63240`，library
+`20541fdf9f57c90040b00a88c2811b2f78641e40c40a15fa4ed160a5894dcea6`；日志
+`ring_lanes64_ep16_t8192_quick.log`。
+
+### BO：按节点划分 source group（首轮配置无效，修复后重测）
+
+独立回到 BH/D8/R16/L32。将 G 从 `min(world,16)` 改为
+`min(local_world,16)`；8-GPU 节点不再把本地和远端 source 混进同一 Mblock。
+先比较 G8/B1024 与 G16/B512：均衡时每目的窗口仍 16 Mblocks，最坏 X/S/C
+窗口容量相同，source contribution 的 B 增大则另计内存。也会测 G8/B512，
+不把 B 的影响混归因给 G。窗口编号、source 序号、packet 目录和 target 仍由
+现有 WindowShape 推导，没有增加通信 barrier 或动态任务分配。实验未完成。
+
+现有 GPU plan 调整 source-window 检查为 G8；destination 检查在两节点用 G8、
+三节点保留 partial G16，31+6 cases 通过，未增加用例数。但随后发现 launch
+仍将 `p.shape.sources` 覆盖为 `min(world,16)`，host 分配与运行时几何不一致。
+因此首轮 **不能作为 G8 的性能、正确性或内存收益证据**。首轮 EP16/8K：
+B1024 为 3548.18 us，pool 966713536、registered 55201536 bytes/rank；
+B512 为 3435.17 us，pool 631103424、registered 55226624。20K/B512
+为 7949.49 us，pool 976616640、registered 62306048。虽然这三轮共 48
+hashes 与 BH 一致，但不能排除跨窗口或其它拓扑的越界；没有继续完整数值门禁。
+这些值仅归档失效实验，不计入优化收益。修复 launch 继承 layout 的 sources
+上界后，以独立 build 和日志重新测量。
+冻结 `build/static_v4_ring_node_groups/` 与 `change.patch`，native SHA256
+`7bff3edf78129bbc8d13038358b2421beae5c676d386b94699c668bd885ec2ea`，library
+`c67f1bef65d3a62225b80ea8c455e214215ad7b90acb9a0baae4da46e3459c71`；日志
+`ring_node_groups_b*_ep16_t*_quick.log`。
+
+修复后的 native 单独冻结到 `build/static_v4_ring_node_groups_fixed/`，
+SHA256 `2557ec4da14e8158b3718451d1b31f966340e82aafce92c1469cab5abe3e9722`。
+首次实际 G8/B512 的 EP16/8K 快筛为 **3357.44 us**，16 hashes 与 BH
+一致；pool 631103424、registered 55226624 bytes/rank。该轮同时编译 BP，
+且仅两次 measured replay，因此仅作快筛，不作为正式收益结论。
+
+### BP：节点内窗口的八行 Pull batch（修复后无独立收益，已撤回）
+
+BO 正确配置时每个窗口仅包含一个节点的 source，因此 Pull 可按整窗选择 local 或 remote，
+不再扫描全窗后逐行跳过另一类身份；本地 batch 从 2 恢复为 8，remote packet
+helper 不变。G 进一步定义为 `local_world` 的不超过 16 的最大因子，使所有
+支持的拓扑都保持 group 不跨节点，而不是依赖测试机器恰好有 8 GPUs。
+单机原本就是八行 batch；所有复制仍在完整 global completion 后才发布聚合
+X credit，source reservation、whole-window admission 及逐 slot 生命周期不变。
+`build/static_v4_ring_node_pull_batch/` 已编译，但含 BO 的 launch 几何错误，
+**从未运行**，不作为实验结果。修复后仍须兼容大于实际 world 的 pool 容量：
+若 group 跨越实际节点边界，则保留逐行过滤并执行 local/remote 两类 Pull。
+实验尚未完成，不将 BO 的容量变化与本项潜在流水收益混为一项。
+
+修复后的 BO 快筛：B512 的 8K/20K 为 3357.44/7865.26 us；B1024 为
+3279.57/7635.92 us。BP 在相同几何下为 B512/8K 3360.43 us，B1024
+8K/20K 3300.90/7541.58 us，尚不能证明八行 batch 的稳定独立收益。
+继续扩大 BP 至 B2048 反而退化至 3694.85/8047.39 us，8K/20K pool
+1638179520/1983324352 bytes/rank，不继续扩大。均为两次样本快筛，部分
+轮次并发 CPU 编译；正式计时与完整数值验收待完成。
+
+BP 的 B1024/EP16/8K eager timeline，rank0 有 55205 events、overflow=0：
+Dispatch pack、Return pack、RX scatter 单包 p50 分别 7.648/26.176/25.792 us；
+FC1 math/epilogue 16.384/6.368 us，FC2 math/epilogue 6.880/6.528 us。
+这些并行跨度不可相加作为 kernel 时间。归档 `ring_node_pull_batch_fixed_*`；
+修复后的 native SHA256 `a77b7117fc881a0675378d8479a41eb6619fc6f31b503fbc73f506c59b8014d2`，
+library `a2e8f057ef5e5ec03278546374cfd4de685f1acb3e0e4041f91319fcfb980360`。
+
+### BQ：两窗内本节点优先的静态顺序（无收益，已撤回）
+
+在 BP 上，只重排 Pull 与 math 的窗口访问顺序，不改变任何任务的 owner residue、
+逻辑行号或 packet 顺序。将同一 source-token window 内相邻两个 source groups
+配为一对；若第二个 group 完全属于本节点，则本节点先计算它。其它 group
+顺序保持原样。这样可先消费本地已就绪 X，而不是先等待另一节点的 Dispatch。
+
+重排跨度限于相邻两窗，compute ring 仍能容纳这两窗的最坏容量；不得跨
+source-token window 边界，否则 contribution depth=1 时可能提前等待下一代，
+而上一代尚需当前未处理 group 的结果。节点数为奇数时，每轮末尾 group 不交换。
+admission 仍按原逻辑顺序发布，逐 slot 的 ready/FC1/FC2/returned 不变。
+GPU plan 31+6 cases 通过，EP16/B1024/8K、20K 快筛为 3292.14/7565.95 us，
+32 hashes 与 BP 一致，未改善 BP 的 3300.90/7541.58 us。没有继续完整数值与
+sanitizer 门禁，已撤回窗口重排及仅服务它的 plan 断言。归档
+`build/static_v4_ring_local_first/change.patch`，native SHA256
+`839805529d486af8c1fd9de874d8be50de14c2a0bd7e98e06e43a3c10f7680de`。
+
+### BR：节点对齐分组验收与八行 batch 取舍（已验证，保留 BO）
+
+BO 的两行网络 Pull 与 BP 的八行/整窗过滤正式对照，均 EP16/G8/B1024/D4、
+1620 MHz、10 warmup/20 samples/batch20，无并发 CPU 编译或其它 GPU 工作：
+
+| tokens/rank | BO/us | BP/us |
+|---:|---:|---:|
+| 8192 | 3282.20 | 3285.27 |
+| 20480 | 7630.13 | 7613.45 |
+
+差异不超过约 0.22%，不认定八行 batch 有独立收益。撤回 BP 的 batch 和
+整窗分类逻辑，只保留 BO 的 host/launch 分组一致性。最终清理构建还增加
+pool-query 的 `max_world >= max_nodes` 必要检查，避免无效容量让分组除零。
+
+BP 清理构建 `static_v4_ring_node_aligned/` 的正式四规模为
+291.635/400.416/3285.270/7613.450 us；native SHA256
+`599df7635cdf96578f52076a435196c52beefc1f58e6d58d43b332e69e1e3a23`，library
+`04ef18ffe3965b0ae5f9eae0663e9e78f8cbe56d5880d2dce47fa9bedac351f1`。
+此构建的 EP16 完整 416、小深度 B16/D1/K8 的 272 records 均通过；rank1/9
+eager 11 rounds 的 memcheck/racecheck 均 launcher exit0、0 errors/0 hazards。
+此前同 device 逻辑的 BP 构建另通过 EP8 的 208 records。host 18/18、GPU plan
+31+6 cases 通过，网络 prefill REG168/STACK440/LOCAL0。上述 BP 门禁作为已测
+但撤回候选归档，保留 BO 的最终构建及复测单独记录，不混用二者结果。
+
+最终冻结 `build/static_v4_ring_node_groups_final/`：native SHA256
+`0cd7ff8538d236c1a80d063760b7fca0958a91ab66e0ccc1eebc4a011016b6c2`，library
+`6a053869674fb390c8b892c6eda475f89e5e991e31e63b71437242a23468bfec`。此最终
+构建重新通过 EP16 四规模+edges 416、B16/D1/K8 的 272、单机 EP8 四规模
+208 records；rank1/9 的 B16/D1/T64/K8 eager 11 rounds memcheck/racecheck
+均 launcher exit0、0 errors/0 hazards。不声称 sanitizer 覆盖全部 ranks。
+GPU plan 仍为既有 31+6 cases，host 18/18；网络 prefill REG168/STACK440/LOCAL0。
+
+正式计时均核心 1620 MHz、10 warmup/20 samples/batch20、E64/K4/H2048/I512。
+单机 EP8 在第二节点，B512/D4；EP16 双机各八卡，B1024/D4、D8/R16/L32。
+计时节点无 CPU 编译或其它 GPU 工作；EP8 计时时第一节点独立做数值回归。
+
+| tokens/rank | EP8 V3/us（本轮） | EP8 G8/us | EP16 V3/us | EP16 G8/us |
+|---:|---:|---:|---:|---:|
+| 1 | 300.557 | 101.878 | 682.170（历史） | 291.851 |
+| 64 | 370.549 | 137.499 | 824.659（历史） | 401.750 |
+| 8192 | 1486.870 | 1287.060 | 3359.260（本轮 B1） | 3280.020 |
+| 20480 | 3299.890 | 3102.440 | 7099.960（本轮 B1） | 7627.350 |
+
+EP8 的 20K 另测 B1024/D4 为 **3007.09 us**，相对本轮 V3 降低约 8.9%；
+B512 的 8K/20K 分别降低约 13.4%/6.0%。B1024 增加 ring 容量，不把额外容量
+归因为无成本代码收益。EP16 两个长规模相对 BH 的历史 3420.79/7937.91 us
+降低约 4.1%/3.9%；仍未达到两项都显著优于 V3 的目标。
+
+EP16 的长序列逐规模抽取交错顺序 A1/B1/B2/A2（A=本版，B=冻结 V3；两规模
+交叉运行，每轮独立 warmup）如下，不使用历史 V3 推断这项收益：
+
+| tokens/rank | A1/us | B1/us | B2/us | A2/us |
+|---:|---:|---:|---:|---:|
+| 8192 | 3280.02 | 3359.26 | 3358.35 | 3278.73 |
+| 20480 | 7627.35 | 7099.96 | 7098.86 | 7625.32 |
+
+两次 p50 的均值相比，8K 快约 **2.4%**，20K 仍慢约 **7.4%**。EP8 的 32、
+EP16 首轮的 64 rank hashes 与各自 V3/BH 一致，长序列交错轮次的 hashes
+也全部一致。EP16/B1024 的 8K/20K pool 为 966713536/1311981248 bytes/rank，
+registered 为 55201536/62243072。B512 的已修复 BO 8K pool 为 631103424，
+比 BH/B512 的 933122752 少约 32.4%，但与 B1024 的性能/容量权衡须分开看。
+日志 `ring_node_groups_final_*`、`ring_node_groups_v3_*`；原 Q、GEMM profile、
+double-credit 与逐 slot 生命周期不变。最终提交不包含 BP/BQ 的数据面改动。

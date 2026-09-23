@@ -4854,7 +4854,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     auto &p = r.source;
     p.shape = l.shape;
     p.shape.world = id.world_size;
-    p.shape.sources = std::min(id.world_size, 16U);
+    p.shape.sources = std::min(id.world_size, l.shape.sources);
     p.shape.top_k = id.top_k;
     p.packets = l.packets;
     p.source_rank = id.calling_rank;

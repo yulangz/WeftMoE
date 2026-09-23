@@ -108,6 +108,14 @@ plan 给出 source ordinal、destination logical Mblock/row、source contributio
 不让 G 随节点数无限增长。起始候选是 G×B 不超过 2048 个 source token：
 EP8 可取 G=8/B=256，EP16 可取 G=16/B=128；这些是调优起点，不是性能结论。
 
+BO 后的实现将 G 选为 pool 的每节点 rank 容量中不超过 16 的最大因子，
+实际 world 与容量一致时 source group 不跨节点；8-GPU 节点的 EP8/EP16 都是 G8。
+launch 继承这个 G，不能重新按 world 计算。若 pool 容量大于实际拓扑、导致
+group 跨实际节点边界，原 Pull 的逐行 local/remote 过滤仍然适用。网络路径的
+本地 batch 保持两行，单机保持八行；BP 的整窗过滤与网络八行 batch 无独立
+收益，已撤回。完整 global completion 后发布 X credit 的合同不变。
+B512/B1024 等参数继续按拓扑和规模实测选择，不改变有界最坏容量公式。
+
 所有 rank 使用同一窗口编号与顺序；不等长/空 rank 由实际 token counts 决定空区间。
 窗口里的 route 按 expert 形成逻辑 Mblocks，不能把一个 Mblock 的未到齐行留给
 未准入的后续窗口。一个 packet 也不跨窗口。
@@ -582,9 +590,9 @@ RX 从“scatter 后可释放”改为“引用它的全部 Reduce route 消费�
 基线。AQ 的 8K 快筛没有收益，已撤回实现，未完成完整正确性验证；这里只
 保留协议分析供后续参考，当前仍使用 6.6 的 RX scatter。实测见 ring 记录 AQ。
 
-### 6.8 计算 GPU 直接跨机 Return（BL，待实现/验证候选）
+### 6.8 计算 GPU 直接跨机 Return（BL/BM，无收益，已撤回）
 
-6.6 是已验证基线。下一候选只改变 Return 拓扑：计算 GPU 从自己的 C 打包，
+6.6 是已验证基线。本项归档候选只改变 Return 拓扑：计算 GPU 从自己的 C 打包，
 经 GIN world peer 直接发给源 GPU，不再通过节点内 rail 汇集 C payload。
 Dispatch 仍按节点去重、同 rail 接收和 destination-pull；两者不必采用相同拓扑。
 V3 已使用跨节点任意 GPU peer 的 Return，硬件支持不等于新的静态协议已验证。
@@ -613,6 +621,11 @@ V3 已使用跨节点任意 GPU peer 的 Return，硬件支持不等于新的静
 逐 compute rank 的覆盖、tail 和 exact expected，包含三节点几何；两机实测完整
 四规模、热点/不等长、小深度 K8、多代 graph replay 及 rank1/9 sanitizer。
 若无端到端收益，归档候选并保持 6.6；不以代码简化代替性能与正确性验收。
+
+BL 的 8K 快筛退化至 4.60 ms；BM 在 PlanReady 后预绑定本地 packet/逻辑行，
+降至 3.51 ms，但仍未好于原协议 BH 的 3.42 ms。Return Q32/Q64 也未获益，
+因此两份实现均已撤回，完整训练/数值/sanitizer 门禁没有在失败候选上继续。
+保留构建、patch 与资源记录，不把上面的协议分析标成现版本实现。
 
 ## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
 

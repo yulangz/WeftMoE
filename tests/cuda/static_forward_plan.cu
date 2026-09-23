@@ -90,7 +90,7 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto experts = world * 4U;
   const auto source = world - 1U;
   const auto experts_per_node = experts / nodes;
-  const plan::WindowShape shape{world, 16U, 128U, top_k};
+  const plan::WindowShape shape{world, local_world, 128U, top_k};
   const auto partition = plan::kNetworkPackets;
   const auto return_partition = plan::kNetworkReturnPackets;
   const auto windows = plan::ceil_div(tokens, shape.tokens);
@@ -328,8 +328,8 @@ __global__ void build_geometry(plan::WindowGeometryView view,
 
 void run_geometry(unsigned nodes, bool hotspot) {
   constexpr unsigned owned = 4U;
-  const plan::WindowShape shape{nodes * 8U, 16U, 128U, 4U};
-  // Use the last source group: three nodes exercise a partial G-sized group.
+  const plan::WindowShape shape{nodes * 8U, nodes == 3U ? 16U : 8U, 128U, 4U};
+  // Two nodes use node-aligned groups; three retain a partial G-sized group.
   const auto window = shape.groups() - 1U;
   const auto first_source = shape.source_begin(window);
   const auto sources = shape.source_end(window) - first_source;

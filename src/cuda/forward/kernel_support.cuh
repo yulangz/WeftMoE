@@ -636,8 +636,14 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 }
 #endif
 
-static_forward::WindowShape static_ring_shape(const ActivationTransportPoolConfig &config) {
-  return {config.max_world_size, std::min(config.max_world_size, 16U),
+static_forward::WindowShape
+static_ring_shape(const ActivationTransportPoolConfig &config) {
+  const auto local_world = config.max_world_size / config.max_nodes;
+  // Bound the source mask to 16 bits without splitting a node's groups.
+  auto sources = std::min(local_world, 16U);
+  while (local_world % sources)
+    --sources;
+  return {config.max_world_size, sources,
           static_cast<unsigned>(std::min<std::uint64_t>(config.static_forward_window_tokens,
                                                        config.max_tokens_per_rank)),
           config.max_top_k};
@@ -930,6 +936,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       throw std::invalid_argument("static ring requires M128 and the 256/32/96 worker partition");
     if (config.static_forward_contribution_windows == 0U)
       throw std::invalid_argument("static ring requires contribution capacity");
+    if (config.max_world_size < config.max_nodes)
+      throw std::invalid_argument("static ring requires at least one rank per node");
     if (config.enable_backward_state || config.enable_socket_fallback ||
         (config.max_nodes > 1U && !config.enable_gin_rdma) ||
         config.max_intermediate_size == 0U)
