@@ -91,7 +91,7 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto source = world - 1U;
   const auto experts_per_node = experts / nodes;
   const plan::WindowShape shape{world, 16U, 128U, top_k};
-  const plan::PacketPartition partition{32U, 2U};
+  const auto partition = plan::kNetworkPackets;
   const auto windows = plan::ceil_div(tokens, shape.tokens);
   const auto capacity = windows * shape.tokens * top_k;
   std::vector<std::int32_t> selected(std::size_t(tokens) * top_k);

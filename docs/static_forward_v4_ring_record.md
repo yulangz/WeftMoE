@@ -1122,3 +1122,78 @@ WGMMA pipeline 序列化。因此这不是成功隐藏数学延迟的实现，�
 Dispatch owner 始终无包。对照 Q16/Q8 与原 Q32，lanes32、B512/D4 不变。
 保持逐 slot generation、双 credit、精确 fanout 与 Return rows 合同；
 只改变静态 packet 几何和相应有界分配，检查并行收益与提交开销的权衡。
+
+EP16/8K L32/B512/D4 快筛：Q16 4619.52 us，Q8 4394.67 us（对照 Q32
+AD 4757.62 us）；32 hashes 均与冻结 V3 一致。registered bytes/rank 分别
+71946496、38547712，对照 Q32 138977536。更小 Q 让目录变大，但 payload
+slot 缩小，净减少注册内存。候选目录 `build/static_v4_ring_q16/`、`..._q8/`。
+
+Q8 的 B256/1024/2048、D4 快筛分别 5066.99/4662.85/5321.04 us，均不如
+B512，暂不扩大窗口。这些是筛选而非正式矩阵，期间第一节点有 CPU 编译。
+
+### AL：在本地 direct Return 基线上重测宽 FC1（验证中）
+
+AD 已消除 local C 的二次搬运，因此重新检查 AC 的物理 FC1 N256 候选；
+除 FC1 N 外，通信、FC2、stages、数值合同均与 AD 相同。独立 AF 的
+packed S-N128 结果只作为候选依据，仍以融合路径实测决定取舍。
+
+第二节点 EP8/8K 正式 10/20/20，B256/512/1024/2048、D4 的 p50 为
+1828.55/1672.48/1775.38/1964.17 us；32 hashes 一致，该节点没有并行
+CPU/GPU 工作。加宽 N 在小窗口降低任务并行度，增大 B 也未优于 AD 的
+1682.80 us，暂不保留 N256。原始样本 `build/ring_direct_n256_remote_ep8_*.log`，
+候选 `build/static_v4_ring_direct_n256/`；生产 prefill 仍 N128。
+
+### AM：数据就绪后再查询 NIC credit（验证中）
+
+TX owner 先检查不可变 descriptor、source reservation 或 C-ready，只有
+payload 能立即打包时才执行 `can_send`。仍同时要求 remote consumed credit
+和本地 NIC completion，不提前访问或覆盖 TX payload；减少等待 FC 时的
+GIN counter/signal 查询。以 Q8/B512/D4 和原 Q8 单独比较。
+
+8K 快筛 4366.35 us，16 hashes 与 V3 相同；相对 Q8 原 4394.67 us 的
+差异不足 1%，暂不宣称独立性能收益。此变更不添加状态或分支，继续放入
+Q8 候选走正确性和后续正式 A/B；并未放松双 credit 条件。
+
+AK/AM 组合候选已通过 EP16 B512/D4 的 PyTorch 四规模及全部 edge cases，
+两节点共 416 pass records，包括 20K hotspot-no-drop eager/graph、mixed
+decode/prefill、unequal/empty、route-changing graph、共享 workspace 和
+post-hotspot 复用；B16/D1 的 T1/64 + edge cases 另有 272 records 通过。
+日志 `build/ring_q8_{full,tiny}_torch_rank{0,1}.log`。
+现有 GPU plan 测试改用同一个 `kNetworkPackets` 配置，以 Q8/L32 验证
+31 source/packet + 6 destination cases（含 1/2/3 nodes），不增加入口。
+EP16 B16/D1/T64 的 rank1、rank9 memcheck 均 0 errors；其他 rank 未插桩，
+不能称为全部 GPU 的 sanitizer 覆盖。正式性能矩阵待补。
+
+### AN：Reduce 每 token 缓存有序 contribution 地址（验证中）
+
+AD 的新增单机 eager timeline（非正式 graph 成绩）有 73637 events、无
+overflow。rank0 的两行 local Pull p50 6.848 us、Reduce/token p50
+16.896 us；按 132 CTA 平均的累计活跃时间分别 865.95、1044.84 us，
+FC1 math/epilogue 为 266.60/96.01 us，FC2 为 110.25/87.32 us。
+这些并发区间不能串行相加，但表明 Reduce payload 本身也值得优化。
+
+复用 `reduce_token_payload`，每 warp lane 预先计算一个有序 contribution
+地址，hidden 循环通过 shuffle 取地址，不再为每个向量重读 combine_order
+和 compact/dense 行映射。top_k<=32 已由现有 launch 边界保证；保持 FP32
+逐 route 累加顺序、原 BF16 conversion、ready acquire 和退休条件不变。
+不新增 Reduce 实现或单测入口；候选以原完整参考检查验证。
+
+首版 warp 分摊地址/shuffle 候选 EP8/8K 快筛 1792.37 us，8 hashes
+一致，慢于 AD 1682.80 us，已撤回。把查表换成每个向量的两条 32-bit
+shuffle 并没有改善该工作负载；不保留这份无收益的通用改动。
+
+### AO：窗口内固定 32-Mblock compute wave（验证中）
+
+在 AN 首版冻结基线上，仅把大窗口分成至多 32 Mblocks 的静态 compute
+wave；每个 wave 仍先本 owner 的 FC1，再 FC2，保持全局 residue，不能
+跨 admission window。避免大窗口中 FC2 等整个窗口的本 owner FC1。
+小窗口执行顺序不变，需在 B2048 等较大窗口单独对照 AN，不能直接和
+含不同 Reduce 的 AD 比较。候选 `build/static_v4_ring_compute_waves/`。
+
+### AP：top-k=4 Reduce 地址缓存与循环展开（验证中）
+
+同一个 `reduce_token_payload` 的模板内部，在 top-k=4 时一次缓存四个
+ordered contribution 指针，并展开四次 load/add；不再每个 hidden 向量
+广播指针。其余 top-k 保留原通用循环，不分配大指针数组。仍是同一份
+FP32 顺序累加与 BF16 conversion，未改变 payload/slot 协议。
+生产调度恢复到 AD 的整窗版本，单独比较 AP 的端到端收益。

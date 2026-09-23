@@ -68,8 +68,6 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       }
       done = false;
       const auto sequence = state.tx_cursor;
-      if (!endpoint.can_send(Returning, channel, sequence))
-        continue;
       const auto packet = plan.begin + sequence - state.tx_base;
       std::uint64_t window;
       unsigned rows, expected;
@@ -120,6 +118,10 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
                     .generation) != source_sequence / r.contribution_depth + 1U)
           continue;
       }
+      // Poll owner-local readiness before touching NIC counters/signals.
+      // Immutable plan/C readiness reads do not access reusable TX payload.
+      if (!endpoint.can_send(Returning, channel, sequence))
+        continue;
       const auto offset = endpoint.payload(Returning, false, channel, sequence);
       auto *payload = peer_at<char>(a.gin_window_base, offset + payload_offset);
       if constexpr (Returning)
