@@ -1190,6 +1190,11 @@ wave；每个 wave 仍先本 owner 的 FC1，再 FC2，保持全局 residue，�
 小窗口执行顺序不变，需在 B2048 等较大窗口单独对照 AN，不能直接和
 含不同 Reduce 的 AD 比较。候选 `build/static_v4_ring_compute_waves/`。
 
+第二节点 EP8/8K/D4 快筛，B1024/2048/4096 的 AN 对照为
+1899.47/2130.88/2837.10 us，AO 为 1889.74/2058.98/2559.28 us。
+较大窗口有改善，但仍不如 AD B256；不保留 compute-wave 改动。该结果
+不否认它对其他更大 GEMM shape 的潜在用途，仅说明当前主矩阵不采用。
+
 ### AP：top-k=4 Reduce 地址缓存与循环展开（验证中）
 
 同一个 `reduce_token_payload` 的模板内部，在 top-k=4 时一次缓存四个
@@ -1197,3 +1202,40 @@ ordered contribution 指针，并展开四次 load/add；不再每个 hidden 向
 广播指针。其余 top-k 保留原通用循环，不分配大指针数组。仍是同一份
 FP32 顺序累加与 BF16 conversion，未改变 payload/slot 协议。
 生产调度恢复到 AD 的整窗版本，单独比较 AP 的端到端收益。
+
+AP 正式矩阵：1620 MHz、10 warmup/20 samples、graph batch20，EP8 在
+第二节点单机、B256/D4；EP16 双机 B512/D4、Q8/L32。测量节点无 CPU
+编译或其他 GPU 任务，全部输出 hash 与冻结 V3 一致。这里 EP16 包含 AK/AM
+的网络改进，不能把其全部收益归因于 AP；AP 的隔离单机长文收益约 1%–1.5%。
+
+| T/rank | V3 EP8/us | AP EP8/us | V3 EP16/us | AP EP16/us |
+|---:|---:|---:|---:|---:|
+| 1 | 300.374 | 101.043 | 682.170 | 306.398 |
+| 64 | 370.218 | 149.442 | 824.659 | 397.850 |
+| 8192 | 1489.09 | 1659.53 | 3353.94 | 4405.93 |
+| 20480 | 3294.90 | 4005.92 | 7099.53 | 10226.1 |
+
+短序列领先，长序列仍未达标。原始样本 `build/ring_reduce_topk_{remote_ep8,ep16}_t*.log`；
+候选 `build/static_v4_ring_reduce_topk/`。EP16 四规模 + 全部 edge cases
+共 416 PyTorch pass records；EP8 B256/D4 四规模 + edges 共 208 records；
+EP8 B16/D1 的 top-k=8、T1/64 + edges 共 136 records，验证通用 fallback。
+三组均 exit0，无参考检查失败。未增加单测入口。
+
+### AQ：Reduce 直接读取 Return RX（实现候选，未验证）
+
+删除 RX→contribution scatter，以 source-local immutable `ReturnBinding`
+把每个 route 绑定到 contribution 或本地 Return RX 行、ready word、generation
+和可选的 RX consumed counter。Reduce acquire 对应 ready，保持原有 FP32
+combine 顺序，全部 payload loads 完成、warp join 后，每个 remote route
+退休一个 RX row；ACK 仍等待该 packet 的精确 desc.rows。payload 生命周期
+延长至 Reduce，而不再只到 scatter。原 scatter warps 改为额外静态 Reduce
+residues，source contribution 的窗口退休合同不变。
+
+为消除 token 等待尚未收到的其他 route 所造成的 RX 容量环，网络深度至少为
+`max(8, ceil(ceil(B*max_top_k/Q)/L))`，使每个 channel 都能放下一个完整
+source window 的最坏 Return packets；这只依赖固定 B/K/Q/L，不随 T 增长。
+同 channel 按 window 单调发送，后窗包不能占用尚未到达的前窗包位置；最老
+窗口全部 route 最终可到达，Reduce 释放它，进而释放 source contribution。
+Q8/L32/B512/K4 仍 depth8；大 B 或小 L 的注册内存会增大，须如实记录。
+plan/allocate 地址不跨调用保存，所有 reader/ACK/local completion drain 后
+仍做 invocation metadata barrier。TX 仍保留 remote credit AND local completion。

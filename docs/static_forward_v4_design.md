@@ -545,6 +545,24 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   防止快节点在慢节点仍读目录时开始覆盖下一次调用的 metadata。payload 中间无
   全节点 collective；跨调用仍保留这一边界。
 
+### 6.7 Return RX 直接 Reduce 候选（AQ，尚未验证）
+
+基于逐 slot 协议消融掉 RX→contribution 的额外复制。每个 source route 的
+不可变 `ReturnBinding` 保存 payload、ready word、generation、可选 consumed
+counter：本地 route 指向 contribution；远端 route 指向本 GPU 的 Return RX。
+Reduce acquire ready 后按同一固定顺序求和，所有 lanes 完成读取后，每个远端
+route 归还一个 RX row credit。ACK 的 expected 仍是现有 packet desc.rows，
+没有运行时推测 fragment/fanout 数量。
+
+RX 从“scatter 后可释放”改为“引用它的全部 Reduce route 消费后可释放”，
+因此须保证每 channel 可放下一个完整 source window 的最坏 Return packets：
+`depth >= ceil(ceil(B*max_top_k/Q)/L)`，同时保留最小 depth8。否则最老 token
+可能等尚未到达的 route，而 RX 被其他尚不能 Reduce 的行占满。整窗容量与
+每 channel 的 window 单调顺序共同保证最老窗口可接收完整，随后 Reduce/ACK
+释放容量。该容量上界随 B/K/Q/L，不随总 tokens 增长；较大 B 的内存代价要
+单独报告。只在完整正确性、wrap、热点与性能验证后，才替代 6.6 的已验证 scatter
+基线；当前进展见 ring 记录 AQ。
+
 ## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
 
 ### 7.1 两种 GM 布局和计算路径

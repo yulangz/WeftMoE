@@ -68,11 +68,11 @@ reduce_token_view(const ForwardKernelArgs &a) {
 }
 
 // Caller owns this token. First-warp execution needs no CTA-wide barrier.
-template <bool TrackCompletion = true>
+template <bool TrackCompletion, unsigned StaticTopK>
 __device__ __forceinline__ bool
-reduce_token_payload(const ReduceTokenView &v,
-                     unsigned long long encoded,
-                     std::uint64_t dense_row_base = ~std::uint64_t{0}) {
+reduce_token_payload_impl(const ReduceTokenView &v,
+                          unsigned long long encoded,
+                          std::uint64_t dense_row_base) {
   if (encoded == 0ULL)
     return false;
   const auto lane = threadIdx.x & 31U;
@@ -89,16 +89,30 @@ reduce_token_payload(const ReduceTokenView &v,
 #endif
   if (TrackCompletion && lane == 0U)
     atomicMin(&v.status->reduced_tokens, device_globaltimer_ns());
+  const auto top_k = StaticTopK ? StaticTopK : v.top_k;
+  const auto source_row = [&](unsigned order) {
+    const auto slot = v.order[token * top_k + order];
+    const auto route = token * v.top_k + slot;
+    const auto row = v.return_base
+        ? v.return_base[v.route_expert[route]] + v.local_offset[route]
+        : (dense_row_base == ~std::uint64_t{0} ? route : dense_row_base + slot);
+    return v.local + row * v.hidden;
+  };
+  // A small fixed top-k can keep all ordered addresses in registers. The
+  // general path retains its original loop without a large pointer array.
+  const transport::BFloat16 *rows[StaticTopK ? StaticTopK : 1U];
+  if constexpr (StaticTopK) {
+#pragma unroll
+    for (unsigned order = 0U; order < StaticTopK; ++order)
+      rows[order] = source_row(order);
+  }
   for (std::uint64_t column = lane * 8ULL; column < v.hidden;
        column += 256ULL) {
     float sum[8] = {};
-    for (std::uint32_t order = 0U; order < v.top_k; ++order) {
-      const auto slot = v.order[token * v.top_k + order];
-      const auto route = token * v.top_k + slot;
-      const auto row = v.return_base
-          ? v.return_base[v.route_expert[route]] + v.local_offset[route]
-          : (dense_row_base == ~std::uint64_t{0} ? route : dense_row_base + slot);
-      const auto *source = v.local + row * v.hidden + column;
+#pragma unroll
+    for (std::uint32_t order = 0U; order < top_k; ++order) {
+      const auto *source =
+          (StaticTopK ? rows[order] : source_row(order)) + column;
       const auto packed = *reinterpret_cast<const uint4 *>(source);
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
@@ -133,6 +147,16 @@ reduce_token_payload(const ReduceTokenView &v,
         v.control->reduce_tokens_complete.value, 1ULL);
   }
   return true;
+}
+
+template <bool TrackCompletion = true>
+__device__ __forceinline__ bool
+reduce_token_payload(const ReduceTokenView &v, unsigned long long encoded,
+                     std::uint64_t dense_row_base = ~std::uint64_t{0}) {
+  if (v.top_k == 4U)
+    return reduce_token_payload_impl<TrackCompletion, 4U>(v, encoded,
+                                                         dense_row_base);
+  return reduce_token_payload_impl<TrackCompletion, 0U>(v, encoded, dense_row_base);
 }
 
 __device__ __forceinline__ bool
