@@ -27,6 +27,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
     const auto *sources = r.window_sources + window * shape.sources;
     const auto source_begin = shape.source_begin(window);
     const auto end = r.window_prefix[window + 1U] * TileM;
+    unsigned reserved = 0U;
     if (lane == 0U)
       for (auto base = r.window_prefix[window] * TileM + Batch * worker;
            base < end; base += Batch * workers) {
@@ -43,12 +44,20 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           if constexpr (Network)
             if (identity.source / a.local_world_size != a.node)
               continue;
-          while (!ring::admitted(a, block)) {
-          }
-          const auto &address = sources[identity.source - source_begin];
-          while (ring::acquire<::cuda::thread_scope_system>(
-                     r.source_reserved[identity.source]) <
-                 address.sequence + 1U) {
+          if (!copied)
+            while (!ring::admitted(a, block)) {
+            }
+          const auto source_index = identity.source - source_begin;
+          const auto &address = sources[source_index];
+          const auto source_bit = 1U << source_index;
+          if (!(reserved & source_bit)) {
+            while (ring::acquire<::cuda::thread_scope_system>(
+                       r.source_reserved[identity.source]) <
+                   address.sequence + 1U) {
+            }
+            // This window cannot retire until our rows return and Reduce
+            // consumes them. Its acquired reservation remains valid here.
+            reserved |= source_bit;
           }
           const auto target_row = ring::row(a, block) + m;
           gates[target_row] = identity.gate;

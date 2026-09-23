@@ -1369,3 +1369,63 @@ Graph replay 与共享 workspace。未引入新测试入口。AT/AU 合并后的
 该测试既非完整算子，也非多 context 的带宽上限，不据此解释 V3/V4 的全部差距。
 原始日志 `build/ring_gin_link_bandwidth_audit.log`，其中历史字段名 `gbps`
 按 bytes/ns 计算，单位实际为 GB/s 而非 Gb/s。
+
+### AV：窗口内复用已确认的 source reservation（验证中）
+
+每个 Pull owner 用一个 32-bit mask 记录本窗口已 acquire 的 source reservation；
+source group 至多 16 个。只缓存成功的确认，不跨窗口保存。该窗口不能在本
+owner 的行完成 Return/Reduce 前退休，所以后续行可以复用该 acquire 链。
+同一个 batch 内的 Mblock admission 也只检查一次；整批的 X credit 尚未发布，
+其 X/S/C slot 不可能被复用。没有省掉第一次 acquire 或改变最终 release。
+
+第二节点 EP8/B512/D4、1620 MHz、10/20/20：8K/20K 为
+1293.96/3121.93 us，相对 AT 的 1454.03/3585.28 us 降低 11.0%/12.9%，
+相对冻结 V3 降低 13.1%/5.2%。16 hashes 一致，完整四规模+edges 208
+PyTorch records 与 B16/D1 的 T1/64+edges 136 records 通过。
+窗口复测 B256 为 1667.91/4052.52 us，B1024 为 1373.18/3029.93 us。
+8K 仍选择 B512；20K 的 B1024 比 V3 快约 8.0%，但必须另计其容量代价。
+冻结 `build/static_v4_ring_pull_reservation/`，日志
+`ring_pull_reservation_remote_ep8_b*_t*.log`。
+
+该候选曾同时把网络路径的本地 batch 也放大至八行，EP16/8K 快筛
+4454.77 us，无收益。两节点的 source round-robin 顺序为八个本地 source
+与八个远端 source；八行 residue、100 个 Pull owners 会让一半 owners 的
+本地部分持续为空，削弱并行度。因此网络恢复两行，保留 reservation 确认缓存。
+恢复后的网络候选在 AW/AX 继续验证，不把单机收益直接填为多机收益。
+最终清理构建 `build/static_v4_ring_reserved_heads/` 仅保留 reservation 缓存，
+网络 batch=2、本地 batch=8、原控制面 barrier 和原 W1 hint。完整 EP16
+B512/D4 四规模+edges 已通过 416 PyTorch records；正式四规模性能正在重测。
+native SHA256 `2620209cda0918a5068bc711e5317d3f15d521933f4498520ad913e52d450382`，
+library SHA256 `25bc578ae4615ae88272227736a41a9208d7678c781489bc3d2a150b6d85f5e8`。
+
+### AW：FC1 权重 EVICT_LAST（无收益，撤回）
+
+仅将静态 FC1 W1 TMA 的 L2 hint 从 EVICT_NORMAL 改为 EVICT_LAST；FC2
+本来就用 EVICT_LAST。M/N/K、寄存器、权重布局、通信与精度均不变。
+相同第二节点 EP8/B512/D4、10/20/20，8K/20K 为 1297.84/3116.38 us，
+相对 AV 没有稳定收益，恢复原 hint，不保留调参开关。
+冻结 `build/static_v4_ring_weight_cache/`。另外恢复网络两行 batch 的构建
+`static_v4_ring_weight_cache_net2`，EP16/8K 快筛 4328.70 us；此数包含网络
+batch 恢复，不作为 cache hint 的单独收益。
+
+已有单 rank NCU 临时 wrapper 成功以单次采集测到 AT EP8/8K 约
+1162174464 read bytes、375717376 write bytes；AW 为
+1190856704/377015040 bytes，未见预期的大幅流量下降。两者还含 AV 的
+reservation 改动，且 profiling 延迟使 peer 的同步时间失真；只保留计数诊断，
+不把 1.790/1.570 ms 的 profiler kernel duration 放入正式性能表。
+文件 `ring_{pull_batch,weight_cache}_ep8_ncu.csv`；没有新增项目单测。
+
+### AX：仅对活跃 GIN contexts 做控制面 fence（无明确收益，撤回）
+
+网络两行 batch、AV reservation 缓存，W1 hint 已恢复。保持所有逐 slot 双重
+credit、ready、ACK 和精确 terminal drain 不变。metadata Put 按 256-KiB
+chunks 分给 contexts；其后只 fence 实际分到 chunk 的 context，其他 context
+在本阶段没有 Put。invocation 收尾已经完成全部 payload/readers/local completion
+及 terminal credit，因此只需一个 rail rendezvous 再接节点内 join，保护下一次
+metadata 覆盖，不再对 96 个已 drain 的 data contexts 重复 Put fence。
+full-arena 路径仍 fence 原来的所有 contexts，未顺带改变其协议。
+候选 `build/static_v4_ring_context_fence/`。EP16/B512/D4 快筛 T64 为
+386.096 us，8K 为 4328.80 us；8K 与网络两行对照的 4328.70 us 无差别。
+没有足够收益支撑新增调用参数与 fence 分支，已完整撤回三个生产文件的改动。
+特别注意 `after_combine` 起点在 entry 的 CTA0、grid join 之前，span 含其他
+CTA 尚未结束的工作，不能把整个 span 都归因于 GIN barrier 本身。
