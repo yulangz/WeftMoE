@@ -496,3 +496,58 @@ workspace。B16/D1 下 T1/64 及现有 edge cases 同样 exit 0
 `--sanitizer-report-api-errors no`；它们是同步验证，不是 EP16 性能测试。
 host suite 18/18 通过。当前仍保留 contribution 默认深度 2，不由一次深度消融
 擅自改变默认容量；性能表中的 D4 已明确标注。
+
+第二节点单机 EP8 的独立容量消融（其 CPU/GPU 无其他任务；第一节点编译下一候选）：
+8K/D4/1620 MHz/10/20/20，B256/512/1024 分别为 2427.71/2368.64/2491.15 us。
+B512 仅较 B256 改善 2.43%，不将两节点间差异计作优化收益；暂无理由大幅增容。
+
+### M：top-k=4 dense Reduce 指针缓存（无收益，撤回）
+
+在 L 上为 dense top-k=4 增加编译期 specialization，跨列向量缓存四条 contribution
+指针，展开四项加载/相同顺序的 FP32 累加。其他 top-k 保持通用路径。
+候选 `build/static_v4_ring_reduce4/test_cuda_notify`，SHA256
+`a574ee7330509e55ab98f9171d65e749c049b0f7ebc75b98fea9816902ebf577`。
+第二节点上同条件、相邻执行 L/M，8K/B256/D4 为 2426.69/2428.19 us，hash 一致。
+没有端到端收益，撤回 specialization 和分支，不保留额外模板来增加维护成本。
+
+### N：完整 TMA wait 后直接 release publication（验证中）
+
+回到 L。保留 `cp.async.bulk.wait_group 0`（没有 `.read`），它等待读和写全部完成，
+将 async 写入导入 issuer 的 generic proxy；之后 X full 的 device release 和
+contribution ready 的 system release 分别向正确范围的读者发布数据。
+因此移除 ring 热路径中的额外 device/system SC fence，未缩短 TMA 完成条件，
+也未删除 ready/consumed 同步。同时为原有 PTX acquire/release helper 补齐
+compiler `memory` clobber，防止 C++ 内存访问越过这些同步点。
+
+依据：[PTX bulk wait 语义](https://docs.nvidia.com/cuda/archive/12.9.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group)、
+[async proxy 完成与隐式 fence](https://docs.nvidia.com/cuda/archive/12.9.1/parallel-thread-execution/index.html#async-proxy)。
+这是本地 TMA/peer 路径的消融，不删除未来 NIC 本地 completion credit。
+
+N binary SHA256：`a04b7f1eadbfe22d03768a6503c01bb7d05f289eb3c5680a9d36bb24b8bc0f09`。
+第二节点单机 EP8/B256/D4/1620 MHz/10/20/20，四规模 p50 为
+125.853/180.406/2199.95/5335.52 us，32 个 hash 与 L 一致。
+8K 相对同节点相邻 L 对照 2426.69 us 改善 9.34%；其他规模的 L 对照位于
+第一节点，暂不据此声称精确的逐步收益。N library 的四规模及全部 PyTorch
+edge cases exit 0（`torch_edges_d4.log`）；B16/D1/T64 memcheck/racecheck 均 exit 0。
+
+### O：单 owner warp 并行准入（验证中）
+
+N 上，将 CTA 0 的 admission 从单 lane 改为单个 owner warp。不同 lane 静态
+检查/发布不同 slot，用 warp vote 判断整个目的窗口是否可准入；source contribution
+的 target 仍由 lane 0 独占更新，随后经 warp 内同步并行发布各 destination 的
+reservation head。source 与 destination 仍是两个独立的非阻塞进度，不增加
+节点 collective、任务领取或第二个 cursor owner。
+
+O binary SHA256：`8886699454a0ed1412f7a0998393fdff8dd0efa0d0bb4b64ae71bdee90aaecdf`。
+同一第二节点、同样 EP8/B256/D4/1620 MHz/10/20/20：
+
+| tokens/rank | N/us | O/us | 延迟变化 |
+|---:|---:|---:|---:|
+| 1 | 125.853 | 110.208 | -12.43% |
+| 64 | 180.406 | 162.150 | -10.12% |
+| 8192 | 2199.95 | 2158.59 | -1.88% |
+| 20480 | 5335.52 | 5344.68 | +0.17% |
+
+32 个 hash 一致。收益主要在短序列，20K 无改善，不声称其解决长文吞吐。
+O library 的完整四规模/edge cases 和 B16/D1 的 T1/64/edge cases 均 exit 0。
+B16/D1/T64 的 memcheck/racecheck 也均 exit 0（API 报告选项同前）。

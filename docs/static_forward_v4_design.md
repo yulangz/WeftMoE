@@ -695,7 +695,8 @@ M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-w
 
 M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理 slot，
 保守地等待三者全退休才共同复用；尚未利用 X/S 早退休的容量。source contribution
-是独立的两窗口 ring。首版性能落后，不默认启用；已测固定 pool 的分配峰值，
+是独立的 ring，默认两窗口，可通过 pool 的 `static_forward_contribution_windows`
+配置并独立消融。首版性能落后，不默认启用；已测固定 pool 的分配峰值，
 尚未测应用整体显存峰值，性能与冗余 metadata 优化继续跟进。
 
 ### M3：多机 route-aware Dispatch 与节点内 pull/FC 重叠

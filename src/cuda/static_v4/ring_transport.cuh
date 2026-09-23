@@ -85,9 +85,10 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
         peer_rows += identity.source != a.rank;
       }
       prefetch.drain();
-      finish_copies<Return>();
-      if constexpr (!Return)
-        __threadfence();
+      // Full bulk completion (not wait_group.read) imports async writes into
+      // this issuer's generic proxy. The release publications below carry
+      // payload visibility to readers; no additional SC fence is needed.
+      finish_copies<false>();
       if (copied) {
         if constexpr (Return)
           WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, LocalReturnBatchEnd,
@@ -197,9 +198,8 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     ring_transfer<false>(a, s);
   else if (warp == 1U)
     ring_transfer<true>(a, s);
-  else if (blockIdx.x == 0U) {
-    if (lane == 0U)
-      static_v4::ring::admit(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);
-  } else
+  else if (blockIdx.x == 0U)
+    static_v4::ring::admit(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);
+  else
     ring_reduce(a);
 }

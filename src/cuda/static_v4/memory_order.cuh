@@ -10,14 +10,16 @@ __device__ __forceinline__ void reduce_add_release_device(
     unsigned long long *address, unsigned long long value) {
   asm volatile("red.release.gpu.global.add.u64 [%0], %1;"
                :
-               : "l"(address), "l"(value));
+               : "l"(address), "l"(value)
+               : "memory");
 }
 
 __device__ __forceinline__ void reduce_add_release_system(int *address,
                                                            int value) {
   asm volatile("red.release.sys.global.add.s32 [%0], %1;"
                :
-               : "l"(address), "r"(value));
+               : "l"(address), "r"(value)
+               : "memory");
 }
 
 __device__ __forceinline__ unsigned long long
@@ -25,7 +27,8 @@ load_acquire_device(const unsigned long long *address) {
   unsigned long long value;
   asm volatile("ld.acquire.gpu.global.u64 %0, [%1];"
                : "=l"(value)
-               : "l"(address));
+               : "l"(address)
+               : "memory");
   return value;
 }
 
@@ -33,7 +36,8 @@ __device__ __forceinline__ int load_acquire_system(const int *address) {
   int value;
   asm volatile("ld.acquire.sys.global.s32 %0, [%1];"
                : "=r"(value)
-               : "l"(address));
+               : "l"(address)
+               : "memory");
   return value;
 }
 

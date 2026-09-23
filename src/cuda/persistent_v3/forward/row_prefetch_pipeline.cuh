@@ -88,9 +88,9 @@ public:
         queued_ = 0U;
       }
     }
-    // Drain only retires pending loads into stores. The caller must preserve
-    // its subsequent finish_copies(): global wait0 + system fence is the
-    // separate payload-before-notification ordering, including an odd tail.
+    // Drain only retires pending loads into stores. Before notification the
+    // caller must also wait for global store completion, then publish with
+    // the required release scope (legacy paths add a conservative fence).
   }
 };
 
