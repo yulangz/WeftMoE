@@ -402,8 +402,9 @@ TMA producer 区域和若干 communication warps，具体线程布局由 autotun
   若沿用这种分包，必须交换各 channel 的精确 descriptor 数；不能把 route count
   除以 chunk size 当作 terminal sequence。
 - NIC 完成读取 TX staging、远端 payload 可见、消费者结束读取 RX staging
-  是三种不同事件。weak signal 自身不能替代 flush/acquire，远端 credit 也不能
-  代替本地 NIC completion 后才可复用 TX storage 的条件。
+  是三种不同事件；必须明确 ready/credit 的发布顺序及源缓冲区生命周期。
+  逐 slot 复用先保留远端消费 credit 与本地 completion 双重检查，理由与后续
+  简化方向见 6.4；不再无条件断言远端消费 credit 不能覆盖 TX 数据复用确认。
 
 首版多机 inference 使用完整 invocation arena，取消 activation ring 的复用
 依赖。跨机数据按 source rail 推送一次到目标节点的注册 staging，目标节点再用
@@ -466,7 +467,7 @@ fixed top-k Reduce
 count exchange 后，每个 channel 已知精确的 task 数和 terminal sequence。固定 owner
 按 sequence 顺序：
 
-1. 等待 TX ring slot credit；
+1. 等待该 slot 上一代的远端消费 credit 和本地 Put completion，再复用 TX；
 2. 将 descriptor、canonical row、source token/top-k、gate 和 X payload 打包；
 3. `gin.put` 到目标 rail GPU 的同一 channel/sequence；
 4. strong/weak signal 按 NCCL device contract 发布 ready；
@@ -495,6 +496,27 @@ Return 不再由 FC2 epilogue向 append-only queue 发布 descriptor。固定 Re
 - remote contribution 由固定 return channel owner 按 sequence 打包并 GIN push；
 - source RX 写 contribution 后 release-publish route epoch；
 - Reduce worker 等本 token 的有效 route epochs 后，按 top-k slot 固定顺序求和。
+
+### 6.4 逐 slot 复用决策（2026-09-23，待实现）
+
+Dispatch 与 Return 的有界 ring 首版均采用保守方案：覆盖 TX slot 之前，同时
+确认该 slot 上一代的远端消费 credit 和本地 Put completion。这里的“本地
+credit”使用 GIN 本地 completion counter，不增加一轮跨机 ACK；计数目标必须
+对应同一 slot 的上一代 Put，不能用其他 slot 的完成替代。
+
+远端先 acquire 该次 Put 绑定的 ready，待所有 RX 消费者的实际读取完成
+（包括异步 TMA/NVLink 读取）后，再回传对应代的 credit，不能在任务领用或
+读取提交时提前释放。
+
+保留的优化点：若一个 TX slot 只对应一次 Put 和一个 RX slot，远端完成消费
+后回传 credit 的因果链已包含该次 payload 的传输；这不等于本地 completion
+counter 必然已更新。先保留双重检查，不将其当作两项独立且必需的数据依赖。
+预计本地检查开销较低，但尚未做消融；后续核对所用 GIN 后端的源缓冲区生命周期
+契约，再测量是否值得去掉热路径本地检查。
+
+简化时仍需分别处理共享 TX 的多目标发送、TX/RX 解耦后的提前 TX 回收，以及
+通信收尾的请求资源 drain。这项决策针对未来 ring 路径，不表示当前完整
+invocation arena 已改为 ring。
 
 ## 7. Notify 与 main 的融合边界
 
