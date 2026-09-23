@@ -18,7 +18,9 @@ opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
 Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
 数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
-优化版。GEMM 独立消融和训练对接未完成，进展与测量见 ring 记录 M2/M3/S–U。
+优化版。纯 GEMM 基准已建立，完整布局/profile 消融和训练对接未完成，进展与
+测量见 ring 记录。节点内 FC2 已直接写预留的 contribution ring；跨节点结果仍
+写 C，由网络 Return pack。数据面协议不因这一节点内写回优化改变。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -509,6 +511,11 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，
   其他做 Reduce。math/producer 仍在全部 CTA 上静态分工。三类 GIN owner 分别
   使用独立的 W 个 context。TX 对 credit/C-ready 做非阻塞轮询，不阻塞其他 channel。
+- 节点内 FC2 epilogue 直接写 source 的 contribution slot，不再经 C 二次搬运；
+  X-ready 之前已获取 source reservation。固定 local Return warp 按 Mblock
+  residue acquire 所有 FC2 N tiles 的完成链，system fence 后协作发布逐 route
+  ready，并按本地行数退休该 C slot。无本地行的 block 不读取 C 控制区，避免
+  网络 owner 先释放后的过期读取。contribution 仍等 Reduce 后才能复用。
 - receiver 的 immutable metadata replica 另有 `RouteLocation[route]`，由实际
   destination 写入 `{generation,logical_block,physical_row}`，经一次节点内
   PlanReady barrier 发布。Return rail 从该表找到 C；Dispatch pull 找到 X。
@@ -770,7 +777,9 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 
 ### M5：长短序列 gate/up 与 GEMM 独立消融
 
-- [ ] 建立第 7.2 节纯 GEMM 基准，固定输入/权重/route 分布、时钟和数值参考。
+- [x] 建立第 7.2 节纯 GEMM 基准，固定输入/权重/route 分布、时钟和数值参考。
+      N64/K128/stages2 的 EP8/EP16、四规模、均衡/热点、FC1/chain 两布局共 64
+      用例通过完整输出/replay 校验；更宽 tile、独立调优与 profiler 分析仍在进行。
 - [ ] 做等有效 S 宽度的 separated/interleaved 受控对照，核对逻辑 N tiles 及计数目标。
 - [ ] 分别调优两种布局的 N/K/stages/epilogue，保留失败候选和资源/误差原因。
 - [ ] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。

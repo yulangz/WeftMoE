@@ -81,7 +81,8 @@ template <class Native, class Reference>
 void compare_gemms(Native native, Reference cublas, transport::BFloat16 *output,
                    transport::BFloat16 *sample, std::size_t no,
                    const std::string &op, int M, int N, int K, int groups,
-                   int ctas, int device, bool reverse, cudaStream_t stream) {
+                   int ctas, int device, bool reverse, cudaStream_t stream,
+                   double work_flops = 0.0) {
   CK(cudaDeviceSynchronize());
   native();
   cublas();
@@ -229,7 +230,7 @@ void compare_gemms(Native native, Reference cublas, transport::BFloat16 *output,
       std::accumulate(times[0].begin(), times[0].end(), 0.) / times[0].size();
   const double cu_ms =
       std::accumulate(times[1].begin(), times[1].end(), 0.) / times[1].size();
-  const double flops = 2. * groups * M * N * K;
+  const double flops = work_flops > 0.0 ? work_flops : 2. * groups * M * N * K;
   std::printf(
       "{\"op\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"groups\":%d,\"ctas\":%d,"
       "\"device\":%d,\"cuda_graph\":true,\"cooldown_ms\":%d,\"flops\":%.0f,"

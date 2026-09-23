@@ -916,6 +916,11 @@ T1/64/edge cases 均两节点 exit 0。两节点 rank 1/9 的小 ring graph
 racecheck 均 0 errors、0 warnings，launcher exit 0。单机 EP8 的四规模 PyTorch
 及全部 edge cases 也已 exit 0，包含 20K 热点后复用。正式性能矩阵待后续回测。
 
+随后第二节点单机 EP8 正式 1620 MHz、10/20/20 为
+105.128/154.624/1682.80/4051.05 us，32 hashes 与同节点 V3 一致。
+8K/20K 相对 AB 降低 22.0%/23.6%，仍慢于 V3；日志
+`build/ring_direct_return_remote_ep8_t*.log`。该节点没有其他 GPU/编译任务。
+
 ### AE：在 Z 之后重测 warp 协作 packet 处理（验证中）
 
 恢复 V/W 中有局部收益的 TMA 版本，不恢复向量 copy 和试验宏。每包最多 32
@@ -923,3 +928,83 @@ racecheck 均 0 errors、0 warnings，launcher exit 0。单机 EP8 的四规模 
 full completion 后 warp join，再按同 C slot 合并退休。RX scatter 复用同一个
 packet copier，并行发布逐 route ready，join 后才释放 RX。generation、credit
 等可能瞬时变化的分支由 lane0 判断并广播，避免 lane 分歧等待。
+
+EP16/8K L32/B512/D4 快筛 4682.67 us，16 hashes 与 V3 一致；对照 AD
+4757.62 us 仅降低 1.6%。仍未显示足以保留这份控制复杂度的收益，再次撤回
+协作 TX/RX 实现。冻结候选 `build/static_v4_ring_packet_warp/` 与日志保留。
+
+### AF：纯 GEMM gate/up 基准（验证中）
+
+扩展已有 `run_gemm_diagnostics.py --phase static-forward`，直接从生产源码提取
+packed/separated/FC2 的数学循环，复用生产 packed SwiGLU epilogue；separated
+fragment 以编译期寄存器排列接入相同 epilogue，从而匹配有效 S 列宽与写回。
+该 controlled 比较不是原封不动的 V3 全流程。两边 cluster2 共享 A、相同
+M128/K/stages/输出宽度与精度，FC2 固定 N256/K128/stages2；无通信、route
+planning 或队列。chain 用 FC1+SwiGLU、FC2 两个顺序 kernel，不模拟融合重叠。
+
+输入使用主矩阵 route 规则重放实际 expert 计数、尾块；balanced 测 rank0，
+hotspot 测最后一个 rank，包含重复 expert 的全部 route。比较完整输出与
+cuBLAS+同精度 SwiGLU，检查 replay 字节一致；packing/分配/descriptor 均在
+计时外，单独报告 packing 时间与额外副本大小。吞吐只按有效行的 GEMM FLOPs
+统计，不把 M128 padding 或 SwiGLU scalar FLOPs 计入有效 tensor throughput。
+
+第一版将 producer/math 放在同一角色函数，separated 被 ptxas 报告 WGMMA
+serialization、stack264，不能用该版本判断布局。已按生产模式分离角色代码；
+N64/stages2/K128 的三个入口均 REG168、STACK0、LOCAL0，相关编译警告消失。
+初步 T64/EP8 balanced 的 packed FC1、separated chain 完整输出校验通过，
+正式矩阵尚未完成，不填布局胜负。
+
+AF 的第一组受控结果如下。**单 GPU 重放 route world=8/16 的 expert 几何，不是
+EP 通信性能**；balanced 取 rank0，hotspot 取最后一个 rank。两边每任务均输出
+S 的 N64 列：packed 物理 N128，对照 separated 两个 N64 投影。K128、stages2、
+cluster2、math/control 216/64；chain 的 FC2 固定 N256/K128/stages2。以下是
+CUDA Graph 的 30 个 native event samples 的 p50；2 s 联合预热、5 个预热
+samples、交替 cuBLAS 对照，cooldown=0（所有 3840 对时钟采样均为 1620:1620）。
+
+| route world / distribution | tokens/rank | packed FC1/us | separated FC1/us | packed chain/us | separated chain/us |
+|---|---:|---:|---:|---:|---:|
+| 8 / balanced | 1 | 22.912 | 27.584 | 34.736 | 37.824 |
+| 8 / balanced | 64 | 26.832 | 29.776 | 41.424 | 43.776 |
+| 8 / balanced | 8192 | 329.152 | 386.400 | 483.920 | 539.504 |
+| 8 / balanced | 20480 | 782.112 | 925.792 | 1152.640 | 1294.720 |
+| 8 / hotspot | 1 | 23.776 | 28.576 | 33.856 | 38.592 |
+| 8 / hotspot | 64 | 25.408 | 29.872 | 37.536 | 42.032 |
+| 8 / hotspot | 8192 | 2440.144 | 2919.552 | 3590.624 | 4070.912 |
+| 8 / hotspot | 20480 | 6069.264 | 7256.784 | 8893.744 | 10114.064 |
+| 16 / balanced | 1 | 22.896 | 27.552 | 32.832 | 37.712 |
+| 16 / balanced | 64 | 24.544 | 28.832 | 35.472 | 39.552 |
+| 16 / balanced | 8192 | 326.336 | 383.456 | 486.208 | 539.504 |
+| 16 / balanced | 20480 | 785.792 | 922.128 | 1155.680 | 1298.368 |
+| 16 / hotspot | 1 | 23.936 | 28.576 | 34.448 | 38.784 |
+| 16 / hotspot | 64 | 44.672 | 53.680 | 70.944 | 77.632 |
+| 16 / hotspot | 8192 | 4858.896 | 5812.128 | 7127.664 | 8097.376 |
+| 16 / hotspot | 20480 | 12137.104 | 14534.496 | 17767.792 | 20240.416 |
+
+64 个用例全部通过完整输出、字节重复检查。两个布局的 T1024/world8/balanced
+chain 另在第二节点单 GPU 做 racecheck，均 0 errors、0 warnings；这是独立
+基准的同步验证，不是多机 sanitizer。正式样本在第一节点 GPU0，测量期间该
+节点无 CPU 编译或其他 GPU 任务。原始记录与 provenance 位于
+`build/static_gemm_control_n64_s2_k128/`；构建参数与 binary SHA 见其
+`provenance.json`。N128 输出宽度与各自调优仍待完成，不能据此直接定最终 profile。
+
+初次 Nsight Compute（packed FC1，8K/world8/balanced，clock-control=none、
+cache-control=none）显示 168 registers/thread、动态 SMEM 131120 bytes、
+driver SMEM 1024 bytes、理论/实测 occupancy 18.75%/18.78%，SM throughput
+53.68%、DRAM throughput 13.39%。CTA barrier stall 包含空闲 producer lanes
+等待整个 CTA 的时间，不等同于 math warp 的 TMA stall；不能把它直接用于解释
+端到端流水瓶颈。其 profiler 运行的 event 时间不混入上表。
+
+### AG：四级 TMA row prefetch（验证中）
+
+只扩展已有 `RowPrefetchPipeline` 的 staging 深度，保留唯一 issuer；
+四个独立 slot/barrier 先发 G2S，再逐个退休 S2G，复用前等待相应 store group
+的 shared read 完成；payload 发布仍使用 full completion。短 batch drain
+后也必须完成所有 store，才再次使用该 pipeline。通过
+`WEFTMOE_FWD_STATIC_V4_RING_COPY_STAGES=4` 试验，默认仍为 2。
+ring 的 shared allocation 按实际 staging 大小计算，不把 4 份 buffer
+放进原先 2 份容量；非 ring 路径预算不变，host 继续验证真实 entry 的 SMEM。
+
+单机 8K/B256/D4 快筛 1669.82 us、8 hashes 一致，与 AD 约 1.68 ms 基本相同；
+多机待测。独立 AD 窗口快筛 B256/512/1024/2048 为
+1672.98/1654.40/1770.38/2014.24 us（CPU 同时构建 AG），32 hashes 一致，
+不把 B512 约 1% 的差异当作明确收益；保留 B256。
