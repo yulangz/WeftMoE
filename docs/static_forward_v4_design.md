@@ -582,6 +582,38 @@ RX 从“scatter 后可释放”改为“引用它的全部 Reduce route 消费�
 基线。AQ 的 8K 快筛没有收益，已撤回实现，未完成完整正确性验证；这里只
 保留协议分析供后续参考，当前仍使用 6.6 的 RX scatter。实测见 ring 记录 AQ。
 
+### 6.8 计算 GPU 直接跨机 Return（BL，待实现/验证候选）
+
+6.6 是已验证基线。下一候选只改变 Return 拓扑：计算 GPU 从自己的 C 打包，
+经 GIN world peer 直接发给源 GPU，不再通过节点内 rail 汇集 C payload。
+Dispatch 仍按节点去重、同 rail 接收和 destination-pull；两者不必采用相同拓扑。
+V3 已使用跨节点任意 GPU peer 的 Return，硬件支持不等于新的静态协议已验证。
+
+- Return source plan 从 `[node,lane]` 改为 `[compute_rank,return_lane]`，每项
+  覆盖本 source/window 中该 compute rank 的 expert 区间，仍按 Q 切完整行。
+  前缀、packet 数与每包 expected rows 均在 source plan 阶段确定；同节点目录为空。
+  sender 从对应 source 的 replica 读取目录，receiver 使用自己的同一目录，
+  因此 wire 不增加逐行身份、不增加第二次网络目录交换。
+- Dispatch 和 Return 的 channel 数分别为 `(nodes-1)*L_d` 与
+  `(nodes-1)*local_world*L_r`。初始取 `L_r=ceil(L_d/local_world)`，单独分配
+  两个 plane 的 channel/control/payload，避免把每个 GPU peer 无条件乘以 L_d。
+  context 仍由静态 owner 独占；一个 owner 轮询其固定 channel residue。
+- Return TX channel 编码目标 source rank，RX channel 编码发送 compute rank。
+  Put 与 ACK 必须应用互逆的 channel 映射，不能继续假设两端 local rank 相同。
+  sequence、expected/consumed 与本地 NIC counter 仍是各自逐 slot 累计状态。
+- Return ready 只需本 compute GPU 的逐 C-slot generation；发布者 acquire
+  FC2 completion 后 release ready，TX acquire 后复制，全部异步读取完成才按行
+  退休 C。没有 peer C reader，C.returned 可统一使用 device scope。source
+  contribution 的远端可见性与 local Return 的 system publication 不变。
+- RX 仍复制到 source 已预留的 contribution，再发布 route ready、归还 RX
+  credit；TX 仍同时等待远端 consumed 和本地 NIC completion。不将这次拓扑
+  实验与去掉本地 completion、直接 RX Reduce 或新的 GEMM profile 混合。
+
+门禁：复用现有 host 地址检查验证非同 rail 的双向映射与无重叠；GPU plan 检查
+逐 compute rank 的覆盖、tail 和 exact expected，包含三节点几何；两机实测完整
+四规模、热点/不等长、小深度 K8、多代 graph replay 及 rank1/9 sanitizer。
+若无端到端收益，归档候选并保持 6.6；不以代码简化代替性能与正确性验收。
+
 ## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
 
 ### 7.1 两种 GM 布局和计算路径

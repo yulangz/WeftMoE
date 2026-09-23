@@ -126,7 +126,7 @@ __device__ inline void build_return_packet_prefix(const SourcePlanView &a,
     for (std::uint64_t w = 0; w < windows; ++w) {
       const auto *experts = a.expert_prefix + w * (a.experts + 1U);
       if (node != a.source_rank / (a.shape.world / a.nodes))
-        total += a.packets.lane_packets(
+        total += out.partition.lane_packets(
             experts[(node + 1U) * experts_per_node] -
                 experts[node * experts_per_node], lane);
       prefix[w + 1U] = total;
@@ -151,8 +151,8 @@ __device__ inline void build_return_packets(const SourcePlanView &a,
     out.packets[packet] = {
         a.shape.window(a.source_rank, location.window * a.shape.tokens),
         location.window * a.window_capacity() + first +
-            a.packets.token_begin(location.lane, location.sequence),
-        a.packets.token_count(routes, location.lane, location.sequence)};
+            out.partition.token_begin(location.lane, location.sequence),
+        out.partition.token_count(routes, location.lane, location.sequence)};
   }
 }
 

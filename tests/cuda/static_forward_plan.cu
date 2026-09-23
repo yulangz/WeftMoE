@@ -92,6 +92,7 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto experts_per_node = experts / nodes;
   const plan::WindowShape shape{world, 16U, 128U, top_k};
   const auto partition = plan::kNetworkPackets;
+  const auto return_partition = plan::kNetworkReturnPackets;
   const auto windows = plan::ceil_div(tokens, shape.tokens);
   const auto capacity = windows * shape.tokens * top_k;
   std::vector<std::int32_t> selected(std::size_t(tokens) * top_k);
@@ -230,7 +231,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
           unsigned contributions = 0U;
           for (auto token = begin; token < end; ++token)
             contributions += fanouts[(token - begin) * nodes + node];
-          const auto count = (contributions + partition.rows - 1U) / partition.rows;
+          const auto count = (contributions + return_partition.rows - 1U) /
+                             return_partition.rows;
           return_sequences[channel] += count > lane
               ? (count - lane + partition.lanes - 1U) / partition.lanes : 0U;
         }
@@ -294,7 +296,7 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
     for (auto packet = return_channels[channel];
          packet < return_channels[channel + 1U]; ++packet) {
       const auto &desc = return_plan[packet];
-      require(desc.rows > 0U && desc.rows <= partition.rows, "Return packet tail");
+      require(desc.rows > 0U && desc.rows <= return_partition.rows, "Return packet tail");
       for (unsigned row = 0U; row < desc.rows; ++row) {
         const auto route = order[desc.route_begin + row];
         require(valid[route] && unsigned(selected[route]) / experts_per_node == node,

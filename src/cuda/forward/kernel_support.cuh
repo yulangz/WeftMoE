@@ -676,8 +676,8 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
                             "Dispatch packet capacity"));
     const auto return_capacity = std::min(
         routes, checked_mul(peer_windows,
-                            packets.packets(std::uint64_t(shape.tokens) *
-                                            config.max_top_k),
+                            static_forward::kNetworkReturnPackets.packets(
+                                std::uint64_t(shape.tokens) * config.max_top_k),
                             "Return packet capacity"));
     m.selected = append(cursor, routes, sizeof(std::int32_t), "source selected experts");
     m.dispatch_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
@@ -716,7 +716,9 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.source_bytes = metadata.published_bytes;
     network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
     const auto packet = static_forward::PacketLayout::planned(packets.rows, config.max_hidden_size);
-    network.rings = {config.max_nodes, packets.lanes, 8U, packet.bytes, packet.bytes};
+    const auto returning = static_forward::PacketLayout::planned(
+        static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
+    network.rings = {config.max_nodes, packets.lanes, 8U, packet.bytes, returning.bytes};
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");

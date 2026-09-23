@@ -1691,3 +1691,99 @@ Q16 在两个节点无其他 CPU/GPU 工作、1620 MHz、10/20/20 的正式 EP16
 V3 一致。8K/20K 比 BD/Q8 降低 7.0%/7.4%，仍比 V3 慢 5.3%/15.2%。
 T64 反而比 Q8 慢约 14.3%，尚不作为全长度统一配置；也不把 Q16 的网络
 收益归给 GEMM profile。日志 `ring_return_ready_q16_*`。
+
+### BG：ACK 仅扫描 pending RX slots（无收益，撤回）
+
+在 BF/Q16 上给唯一 NIC progress owner 添加 32-bit pending mask（当前网络
+深度 8，字段放入 NetworkChannel 原有 padding）。import 成功后置位，逐 slot
+消费达到包头 target、ACK 提交后清位；不改变独立乱序退休或终端 drain。
+EP16/8K/B512/D4、1620 MHz 干净环境快筛 3573.22 us，16 hashes 与 BF 一致，
+未优于 BF 的约 3533 us。未开展完整数值/sanitizer 验收，已撤回新增状态与逻辑。
+归档 `build/static_v4_ring_pending_ack/change.patch`，native SHA256
+`676a3661e9f2e251352afcf854d975c8cdea579564543f0014bc1a289639d44c`；
+日志 `ring_pending_ack_ep16_t8192_quick.log`。
+
+### BH：Dispatch / Return 独立 Q 消融（保留 D8/R16）
+
+只拆分 Return 的 packet partition、目录容量和 TX/RX stride；固定 L32/B512/D4、
+BD 协议。EP16/8K、1620 MHz 快筛如下，均与 BF 的 16 rank hashes 一致：
+
+| Dispatch Q / Return Q | us | registered bytes/rank |
+|---:|---:|---:|
+| 8 / 32 | 3794.80 | 88731904 |
+| 16 / 32 | 3730.62 | 105451776 |
+| 16 / 8 | 3788.34 | 55267584 |
+| 32 / 8 | 3808.77 | 88793344 |
+| 8 / 16 | 3411.25 | 55226624 |
+
+前四项均未优于 BF 的 16/16，D8/R16 的 8K 有正向信号；20K 快筛 7900.77 us，
+hashes 一致（20K 快筛同时有本机 CPU 编译，非正式成绩）。现有 GPU plan 的
+D8/R32 配置通过 31 source/
+packet + 6 destination cases，含三节点；没有新增测试用例，未对这些较慢候选
+开展完整数值/sanitizer 验收。D8/R16 已完成下列门禁，保留拆分接口；默认
+Return Q 仍随 Dispatch Q，测试配置显式选择 8/16，不把它标为最终统一配置。
+归档 `build/static_v4_ring_d8_r32/change.patch`，日志 `ring_d*_r*_ep16_t8192_quick.log`。
+D16/R8、D32/R8 构建时曾临时放宽 owner 上限至 44，但两节点 L32 仍选择 32；
+不据此声明这些二进制与当前三节点配置一致。源码上限已恢复 32。
+
+D8/R16 精确配置另跑现有 GPU plan，通过 31+6 cases；EP16 四规模+edges
+416 records、B16/D1/K8 的 T1/64+edges 272 records、第二节点单机 EP8 四规模
++edges 208 records 均通过。rank1/9 的 B16/D1/T64/K8 eager 11 rounds
+memcheck/racecheck 均 launcher exit 0、0 errors/0 hazards，日志
+`ring_d8_r16_*check_gpulingjun*`。没有用较慢候选或缓存 admission 的 library
+替代此配置的验收。
+
+正式 EP16、1620 MHz、B512/D4、10 warmup / 20 samples / batch20：
+
+| tokens/rank | BF D16/R16 / us | BH D8/R16 / us | 冻结 V3 / us |
+|---:|---:|---:|---:|
+| 1 | 293.570 | 293.478 | 682.170 |
+| 64 | 432.442 | 409.821 | 824.659 |
+| 8192 | 3533.150 | 3420.790 | 3353.940 |
+| 20480 | 8181.340 | 7937.910 | 7099.530 |
+
+64 rank hashes 与 BF/V3 一致；8K/20K 比 BF 低 3.2%/3.0%，但比 V3 高
+2.0%/11.8%，未达最终目标。两节点测量期间无其他 CPU/GPU 工作；BF/V3
+仍是同日历史对照，不声称已完成 ABBA。registered bytes/rank 在 8K 从
+71946496 降至 55226624，20K 为 62306048。冻结
+`build/static_v4_ring_d8_r16/`，native SHA256
+`455ef8e06c3d53c2e89b216a6c77e6d9a7da1f45c6cfd859096483ed76debacb`，library
+`572bbb1640731a8ed94ae83a25c9b5165fd9fc36652a5fb5572334ffdf7272f9`；日志
+`ring_d8_r16_ep16_t*_formal.log`。
+
+同配置第二节点单机 EP8 的正式 10/20/20 为
+101.688/137.246/1292.810/3091.230 us，32 hashes 与 BD/V3 一致。该节点没有
+其他 CPU/GPU 工作；本机同时编译下一候选、运行独立的 plan 检查。单机代码
+不使用网络 Return Q，本轮只作回归，不将微小波动归因为网络配置收益。
+日志 `ring_d8_r16_remote_ep8_*`。
+
+### BI：40 个网络 owners（无收益，撤回）
+
+Q16/L40/B512/D4，通信 context 增至 120，Pull/local Return/Reduce 配额相应
+从 100/68/99 变为 92/52/91。EP16/8K 快筛 3591.02 us、16 hashes 一致，
+未优于 BF/L32，registered pool 增至 88774912 bytes/rank。恢复 32-owner 上限，
+未开展完整数值/sanitizer 验收。冻结 `build/static_v4_ring_lanes40/`，native
+SHA256 `b700ee49addde06bc496deb39fa3ac40bee461e825c84c3ede60709872e31e3e`；
+日志 `ring_lanes40_ep16_t8192_quick.log`。
+
+### BJ：窗口内交错 local Pull 与 remote packet（无收益，撤回）
+
+保持各自静态 residue，让每个 Pull owner 完成一个本地两行 batch 后消费一个
+远端 packet，再进入下一轮；每次仍完成全部异步复制后归还原 credit，不跨轮
+持有 RX。Q16/L32/B512/D4 的 EP16/8K 快筛 3754.37 us，16 hashes 一致，
+比 BF 更慢。该候选增加了 remote helper 的调用频率，没有保留。未开展完整
+数值/sanitizer 验收。归档 `build/static_v4_ring_pull_interleaved/change.patch`，
+native SHA256 `8b093a92c90e3f13ddd0ebdc3fe19b47244b427120153bc89ff733a52ca0dcce`；
+日志 `ring_pull_interleaved_ep16_t8192_quick.log`。
+
+### BK：计算 owner 缓存整窗准入（无收益，撤回）
+
+在 BH/D8/R16 上，math task selector 缓存成功 acquire 的 admitted_windows，
+省去逐任务的 slot generation 查询；X full/FC1 done 的 acquire 保留。尚未完成
+的 owned FC1/FC2 tile 持有该窗口 slot，缓存不跨 invocation。ComputePairState
+由 48 增至 64 bytes；网络 prefill 仍 REG168/STACK440/LOCAL0。
+EP16/8K/B512/D4 快筛 3418.96 us，与未缓存的 3411.25 us 相当，未保留额外
+状态，也未开展完整数值/sanitizer 验收。归档
+`build/static_v4_ring_math_admission/change.patch`，native SHA256
+`07fe35ace906d1c89dd470cd0d6725282fa01fcdff59a85edcdb0970844d1d09`；
+日志 `ring_math_admission_ep16_t8192_quick.log`。

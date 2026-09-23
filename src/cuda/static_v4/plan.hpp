@@ -150,6 +150,12 @@ struct PacketPartition {
 inline constexpr PacketPartition kNetworkPackets{
     WEFTMOE_FWD_STATIC_V4_PACKET_ROWS, WEFTMOE_FWD_STATIC_V4_NETWORK_LANES};
 static_assert(kNetworkPackets.rows > 0U && kNetworkPackets.lanes > 0U);
+#ifndef WEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS
+#define WEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS WEFTMOE_FWD_STATIC_V4_PACKET_ROWS
+#endif
+inline constexpr PacketPartition kNetworkReturnPackets{
+    WEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS, kNetworkPackets.lanes};
+static_assert(kNetworkReturnPackets.rows > 0U);
 
 struct PacketHeader {
   std::uint64_t sequence;
@@ -189,6 +195,7 @@ struct ReturnPlanView {
   std::uint64_t *packet_prefix;   // [nodes * lanes, local_windows + 1]
   std::uint64_t *channel_offsets; // [nodes * lanes + 1], self channels empty.
   ReturnPacketPlan *packets;
+  PacketPartition partition = kNetworkReturnPackets;
 };
 
 // Source-local immutable metadata. Activation payload is stored separately.
