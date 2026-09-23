@@ -35,7 +35,7 @@ arena 协议；训练仍保持 V3。两机 EP8/EP16 的 1、64、8192、20480 to
 - pool 按公开的最大 route 容量预留 route table/canonical row 空间。host 在 launch
   前检查容量，合法 route 不使用 capacity factor，不截断、不取模覆盖、不丢 token。
 
-严格 EP8 decode case（H=2048、I=512、64 experts、top-k=4、64 token/rank）的
+历史 EP8 decode case（H=2048、I=512、64 experts、top-k=4、64 token/rank）的
 裸 fused CUDA Graph rank-max p50 为 **72.50 us**，已包含 X staging 且直接读取
 routes/gates。真实 tensor runtime 的双层 child graph 测得 **74.24 us/层**。
 MegaMOE 同 shape 的 graph kernel 是 62.6 us，但图外三份 input copy 是 11.5 us；
@@ -49,9 +49,12 @@ CUDA Graph replay、graph 销毁/offload 与 workspace 生命周期回归。平�
 
 状态：单机与多机 inference-only V4 已实现；多机性能记录见
 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
-2026-09-23 的两机 1620 MHz 锁频对照表明：1/64 tokens 相对 V3 加速
-3.86–4.35×，但 8K/20K 延迟增加 15.1–34.2%；多机 prefill 性能目标尚未达成。
-这组结果使用各自公开参数，不是 scheduler 单变量消融，不能把差距全部归因于同步。
+2026-09-23 的 1620 MHz 锁频主矩阵为单机 EP8（1×8）和双机 EP16（2×8）：
+单机 EP8 在 1/64 tokens 相对 V3 加速 4.63–4.97×，8K/20K 分别慢 7.6%/44.9%；
+双机 EP16 在 1/64 tokens 加速 4.02–4.35×，8K/20K 分别慢 15.1%/34.2%。
+两者的 prefill 性能目标均尚未达成。此前两机 EP8（2×4）仅保留为额外实验，
+不能替代单机 EP8。这组结果使用各自公开参数，不是 scheduler 单变量消融，
+不能把差距全部归因于同步。详细数据分别见单机和多机优化记录。
 training 重构尚未实现，不属于本次 inference-only 改造。
 
 日期：2026-09-22

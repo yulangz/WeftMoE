@@ -1,11 +1,77 @@
 # Static Forward V4 优化记录
 
-日期：2026-09-22
+日期：2026-09-22；2026-09-23 补测单机 EP8 的 1620 MHz V3/V4 对照。
 
 状态：单机与多机 inference-only 路径已完成主要重构；training 仍使用 V3。
 多机实测见 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
 本文记录单机 Static Forward V4 优化，不替代
 `forward_optimization_history.md` 中大 token/多机历史。
+
+拓扑约定：用户要求的主矩阵为 **单机 EP8（1×8）和双机 EP16（2×8）**。
+此前多机记录中的 EP8（2×4）是误解需求后增加的实验，不是单机 EP8，不能替代本节补测。
+
+## 2026-09-23：单机 EP8，1620 MHz 锁频对照
+
+本次确实为一台机器上的 8 GPU，launcher 使用 `--nodes 1`，所有 rank 的
+backend 均为 `local-cuda-p2p`，没有跨机 GIN。H=2048、I=512、64 experts、
+top-k=4、BF16；token 数均为每 rank，8K=8192、20K=20480。
+
+使用与多机对照相同的两个冻结 binary，但执行其单机特化：V3 由
+`configs/static_inference_v3_20260923/` 构建，设置
+`WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`；V4 使用
+`configs/static_inference_20260922/`，unset disable 变量。
+V3 保留 N128/N256/K64、stages 4/2、claim=2；V4 保留 N64/N128/K128、
+stages 3/3、wave=32。V3 的 GIN sender 配置在单机不生效，没有为 RDMA 留出 CTA。
+这次没有针对单机各长度重新 autotune；结果比较的是这些公开配置，不是各自最优
+配置的穷举结果，也不是 scheduler 单变量消融。
+
+每个规模运行 V3 → V4 → V4 → V3 四个独立 session，每个 session 预热 10 个
+sample、测量 20 个 sample，每 sample 20 次 CUDA Graph replay；开启
+`WEFTMOE_BENCH_SYNC_RANKS=1`，rank 同步在 CUDA event 计时区间外。
+每个 sample 先取 rank-max，再合并同版本两个 session 的 40 个 sample，取排序
+后的第 20 个作为 p50。每个 case 的 pool 按自身 token capacity 独立创建。
+
+两者都测完整 graph：V3 为 Notify + Forward，共 11 nodes（2 kernel、3 memcpy、
+6 event-record、0 event-wait）；V4 为 1 kernel、0 memcpy/event。
+不把 V3 的 kernel 内计时或历史 eager 的 270-us 数字与 V4 graph 时间混比。
+
+| tokens/rank | V3 graph p50（us） | V4 graph p50（us） | V3/V4 加速比 | V4 延迟变化 |
+|---|---:|---:|---:|---:|
+| 1 | 299.78 | 64.76 | 4.63× | -78.4% |
+| 64 | 368.44 | 74.07 | 4.97× | -79.9% |
+| 8192 | 1487.58 | 1600.65 | 0.93× | +7.6% |
+| 20480 | 3289.72 | 4767.00 | 0.69× | +44.9% |
+
+结论：**单机 decode 加速 4.63–4.97×，但 8K/20K 分别慢 7.6%/44.9%。**
+前一轮单机 prefill 的 24.9%/36.0% 收益是相对旧 V4，不是相对 V3。
+单机大 token 也未达到优于 V3 的目标。单机没有跨机阶段，因此其回退不能归因于
+多机 Dispatch/Return barrier；应单独检查 GEMM tile、static wave、节点内搬运
+和 FC2/Combine 路径，尚未做消融，不能声称已定位根因。本次未修改生产调度。
+
+16 个 session 全部完成，128 次 rank/output hash 检查全部与已通过 PyTorch 参考
+的单机 V4 输出一致。04:15:13–04:18:11 UTC，200 ms 间隔采集的 7,096 条时钟
+记录全部为 SM=graphics=1620 MHz；每张 GPU 均有负载样本，负载下显存为 3201 MHz。
+测试期间没有并发编译或其他 GPU 测试，测试后保持锁频。
+
+完整 rank/sample、两次 session p50、输出 hash、图节点和 binary/config SHA256 见
+[`../benchmarks/static_inference_single_node_1620_20260923.json`](../benchmarks/static_inference_single_node_1620_20260923.json)。
+原始日志为 `/tmp/weft-single-1620-abba-20260923-t{1,64,8192,20480}-{trial}-{v3,v4}.log`，
+时钟日志为 `/tmp/weft-single-1620-clocks-20260923.csv`。
+双机 EP16（2×8）的锁频数据沿用多机记录；2×4 仅保留为额外实验。
+
+复现时，两种版本均设置 `LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64`、
+`WEFTMOE_BENCH_EXPERTS=64`、`WEFTMOE_P2P_BENCH_TOKENS=<对应长度>`、
+`WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY=1`、`WEFTMOE_FORWARD_GRAPH_BATCH=20` 和
+`WEFTMOE_BENCH_SYNC_RANKS=1`。本机环境为 `NCCL_IB_DISABLE=1`、
+`NCCL_SOCKET_IFNAME=eth0`、`NCCL_IB_GID_INDEX=3`。V3 示例（V4 替换 binary 并 unset disable）：
+
+```bash
+WEFTMOE_DISABLE_STATIC_FORWARD_V4=1 python3 tests/run_local_activation_p2p.py \
+  --binary "$PWD/build/static_inference_v3_20260923/test_cuda_notify" \
+  --world 8 --top-k 4 --forward-benchmark --rounds 30 --timeout 180
+```
+
+以下章节保留 2026-09-22 的历史记录，不与本节 1620 MHz 对照跨时钟计算收益。
 
 ## 2026-09-22 复审：decode 与 prefill
 
@@ -110,6 +176,7 @@ MegaMOE 的 62.6-us kernel-only 不能直接与 WeftMoE 的应用结果对比。
 确认 V3 仍在 270-us 量级。在当前 serialized graph replay harness 中
 禁用 V4 后没有产出 graph benchmark marker，因此暂时没有可靠的
 同 harness V3 graph 数字，也不用 eager 数字外推一个 graph 结果。
+这是当时的测量限制；2026-09-23 已用现有冻结 V3 参数补齐 graph 对照，见本文首节。
 
 日志里实际上存在两个容易混淆的“106 us”：
 
