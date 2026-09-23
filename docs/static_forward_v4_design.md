@@ -370,8 +370,9 @@ Return 和 Reduce 由固定角色推进，不等整个 invocation 的全部 GEMM
 - 全局 expert 总 count 不能推出每个窗口、channel、packet 的具体几何。
 - NIC 本地完成、远端 payload ready、所有 RX 读者完成要明确区分发布机制与生命周期。
 
-新方案用有界窗口和逐 slot full/empty 协议替代阶段级通信 barrier。以下各节是
-待实现方案；旧的完整 X 广播、BeforeCombine 网络阶段不自动继承到新路径。
+新方案用有界窗口和逐 slot full/empty 协议替代阶段级通信 barrier。以下各节定义
+协议，实际实现与验收状态见第 11 节；旧的完整 X 广播、BeforeCombine 网络阶段
+不继承到 ring 路径。
 
 ### 6.1 Route-aware Dispatch：每命中节点一份 X
 
@@ -501,9 +502,10 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 
 ### 6.6 M3b 首版具体布局与进度约束（数值通过，吞吐仍待优化）
 
-- 每 rail 使用 `(nodes-1)×L` 个 channel，Q=32 完整行，网络深度为 8；L 在
-  `kNetworkPackets` 集中配置，已分别实测 L=2/8/16/32，收益与内存增量见 ring
-  记录 U/X/Z，当前调优候选为 L32/B512；尚未改成默认发布配置。
+- 每 rail 使用 `(nodes-1)×L` 个 channel，网络深度为 8；Q/L 在
+  `kNetworkPackets` 集中配置，已分别实测 L=2/8/16/32、Q=8/16/32，收益与
+  内存增量见 ring 记录 U/X/Z/AK/AU。当前调优为 Q8/L32/B512/D4；编译默认
+  仍 Q32/L2，ring 仍 opt-in，尚未改成默认发布配置。
   Dispatch
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
   和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
@@ -513,6 +515,10 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，
   其他做 Reduce。math/producer 仍在全部 CTA 上静态分工。三类 GIN owner 分别
   使用独立的 W 个 context。TX 对 credit/C-ready 做非阻塞轮询，不阻塞其他 channel。
+  AZ 将 ring Endpoint 设为 `NCCL_GIN_RESOURCE_SHARING_THREAD`：每个 context
+  只有一个 lane-zero 提交者，host 已要求 exclusive contexts，控制面由原 barrier
+  与 data plane 隔离。它省去共享队列争用协议，不改变 payload release scope 或
+  双重 credit；若以后让多个线程共享提交，必须重新选择对应的 sharing mode。
 - 节点内 FC2 epilogue 直接写 source 的 contribution slot，不再经 C 二次搬运；
   X-ready 之前已获取 source reservation。固定 local Return warp 按 Mblock
   residue acquire 所有 FC2 N tiles 的完成链，system fence 后协作发布逐 route
@@ -744,23 +750,24 @@ M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window p
 M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-window 几何。
 M3a 补齐 Dispatch route→packet/token 反向索引和 Return 精确逐 channel 目录，
 并将 source epoch/gate/route/packet 元数据集中为不含 X 的独立区域。
-详见 ring 实施记录。规划器已接入单机 Forward，包括窗口几何、source contribution
-映射和整窗口准入；下面涉及网络目录交换、跨机准入的完整事项仍保持未完成。
+详见 ring 实施记录。规划器已接入单机及多机 Forward，包括窗口几何、source
+contribution 映射、网络目录交换和整窗口准入。这里的 source ordinal 是一次
+invocation 内冻结的顺序，不是 M6 尚待实现的确定性 StableTape 行号。
 
 - [x] 窗口编号、完整 token 分包、任意节点数的 peer/lane 地址和逐 slot 累积退休合同。
 - [x] GPU source-window expert/node counts、去重 token 列表、source ordinal 与 channel
       packet prefix；显式区分 masked route 和非法 expert id。
 - [x] 紧凑 channel packet 目录、各目标 GPU 的完整行消费数；destination-window
       counts→Mblocks/C expected 行数及 source round-robin ordinal 的逆映射。
-- [ ] 定义窗口编号、实际窗口/expert counts、逻辑 Mblock、source contribution 映射，
+- [x] 定义窗口编号、实际窗口/expert counts、逻辑 Mblock、source contribution 映射，
       以及 packet-sequence 优先的接收侧静态任务目录。
-- [ ] 冻结 packet/token/fanout 及 Return 行枚举，生成精确 channel packet 数和
+- [x] 冻结 packet/token/fanout 及 Return 行枚举，生成精确 channel packet 数和
       expected/retire targets；明确哪些目录存储、哪些闭式计算。
-- [ ] 定义各 plane 的 GM 地址、slot 控制字段、GIN VA signal/local counter 分工和初始化。
-- [ ] 实现准入/退休账本；画出最小等待依赖图，确认最老窗口的所有消费者可驻留推进。
-- [ ] 用少量 host/device 共用枚举检查证明覆盖、无重复、no-drop 与 tail 计数，
+- [x] 定义各 plane 的 GM 地址、slot 控制字段、GIN VA signal/local counter 分工和初始化。
+- [x] 实现准入/退休账本；画出最小等待依赖图，确认最老窗口的所有消费者可驻留推进。
+- [x] 用少量 host/device 共用枚举检查证明覆盖、无重复、no-drop 与 tail 计数，
       不为每个字段建立大量无意义单测。
-- [ ] 冻结 V3、当前 V4 构建/config/hash 和重测脚本，作为后续逐步对照。
+- [x] 冻结 V3、当前 V4 构建/config/hash 和重测脚本，作为后续逐步对照。
 
 ### M2：单机 X/S/C 与 contribution ring
 
@@ -793,8 +800,11 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 - [x] Return TX/RX 与 Dispatch 独立；source RX scatter 后归还 credit，Reduce 后释放窗口。
 - [x] 移除节点级 FC2→Return barrier，确认 Return 与其他 Mblocks 的 FC1/FC2 重叠。
 - [x] 完成所有 channel 的 terminal/drain、跨调用/Graph 状态复用。
-- [ ] EP8/EP16 全矩阵、热点与小深度 wrap 通过；记录 Dispatch 和 Return 各步收益及
+- [x] EP8/EP16 全矩阵、热点与小深度 wrap 通过；记录 Dispatch 和 Return 各步收益及
       资源变化。协议支持任意有效节点拓扑，实机仍只声明两机验证。
+
+M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 长序列仍落后 V3，
+后续优化和最终默认配置验收继续进行。AY 直写 Return TX 只是归档候选，未合入。
 
 ### M5：长短序列 gate/up 与 GEMM 独立消融
 

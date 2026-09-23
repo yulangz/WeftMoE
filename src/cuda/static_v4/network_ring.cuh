@@ -9,7 +9,8 @@ struct Endpoint {
   ncclGin gin;
 
   __device__ Endpoint(const ForwardKernelArgs &args, unsigned context)
-      : a(args), gin(args.gin_dev_comm, context) {}
+      : a(args), gin(args.gin_dev_comm, context,
+                     NCCL_GIN_RESOURCE_SHARING_THREAD) {}
 
   __device__ const static_forward::NetworkRings &layout() const {
     return a.static_network.rings;

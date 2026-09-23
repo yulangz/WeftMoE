@@ -1370,7 +1370,7 @@ Graph replay 与共享 workspace。未引入新测试入口。AT/AU 合并后的
 原始日志 `build/ring_gin_link_bandwidth_audit.log`，其中历史字段名 `gbps`
 按 bytes/ns 计算，单位实际为 GB/s 而非 Gb/s。
 
-### AV：窗口内复用已确认的 source reservation（验证中）
+### AV：窗口内复用已确认的 source reservation
 
 每个 Pull owner 用一个 32-bit mask 记录本窗口已 acquire 的 source reservation；
 source group 至多 16 个。只缓存成功的确认，不跨窗口保存。该窗口不能在本
@@ -1394,9 +1394,18 @@ PyTorch records 与 B16/D1 的 T1/64+edges 136 records 通过。
 恢复后的网络候选在 AW/AX 继续验证，不把单机收益直接填为多机收益。
 最终清理构建 `build/static_v4_ring_reserved_heads/` 仅保留 reservation 缓存，
 网络 batch=2、本地 batch=8、原控制面 barrier 和原 W1 hint。完整 EP16
-B512/D4 四规模+edges 已通过 416 PyTorch records；正式四规模性能正在重测。
+B512/D4 四规模+edges 已通过 416 PyTorch records；正式四规模结果如下。
 native SHA256 `2620209cda0918a5068bc711e5317d3f15d521933f4498520ad913e52d450382`，
 library SHA256 `25bc578ae4615ae88272227736a41a9208d7678c781489bc3d2a150b6d85f5e8`。
+
+随后 EP16/Q8/L32/B512/D4 的正式 1620 MHz、10/20/20 四规模为
+306.454/398.174/4329.17/10196.3 us，64 hashes 与冻结 V3 一致。
+测量时两个节点均无其他 CPU/GPU 工作。多机长序列仍未达目标；
+日志 `ring_reserved_heads_ep16_t*.log`，commit `3f07d96`。
+最终构建的第二节点单机 EP8/T1、T64 为 101.029/137.227 us，16 hashes
+与冻结 V3 一致；日志 `ring_reserved_heads_remote_ep8_t{1,64}.log`。
+上述 EP8 长序列使用 `pull_reservation` 构建，两者的单机 specialization 相同；
+它们的网络 batch 不同，不混用其 EP16 测量。
 
 ### AW：FC1 权重 EVICT_LAST（无收益，撤回）
 
@@ -1429,3 +1438,85 @@ full-arena 路径仍 fence 原来的所有 contexts，未顺带改变其协议�
 没有足够收益支撑新增调用参数与 fence 分支，已完整撤回三个生产文件的改动。
 特别注意 `after_combine` 起点在 entry 的 CTA0、grid join 之前，span 含其他
 CTA 尚未结束的工作，不能把整个 span 都归因于 GIN barrier 本身。
+
+### AY：FC2 直写预留 Return TX（候选归档，暂不合入）
+
+将 AD 的节点内直接写 contribution 扩展到远端：FC2 直接写本节点 rail 的
+Return TX，发送 owner acquire 原有 C/FC2 completion 后直接 Put，省去 C→TX
+打包。没有引入 fragment 引用图或 atomic expected count。每个 channel 新增
+owner 私有 reserve cursor 与 release.sys reservation head，仍在原 64-byte
+`NetworkChannel` 内；不可复用 slot 前仍检查远端 consumed AND 本地 NIC completion。
+整窗口 admission 用 source expert interval 的最后一个 lane packet 检查 reservation；
+TX owner 独立于 C-ready 提前预留最多 depth 个 packet，以免形成准入循环依赖。
+
+RingRow 预绑定本地 contribution/远端 TX 指针，16→24 bytes。网络 depth 为
+`max(8, ceil(ceil(B*capacity_top_k/Q)/L))`，确保最坏 source Return 窗口能整体
+预留；Q8/B512/K4 仍为 8，B1024 或 K8 会增加。source/peer/node 枚举沿用
+参数化拓扑，不限两节点。候选仍分配已不再使用的 C payload，尚未清理其 host
+descriptor；下面内存数字如实包含它，不能声称已完成资源优化。
+
+1620 MHz、Q8/L32/B512/D4 快筛：EP8/8K 1286.13 us，EP16/8K 4637.31 us，
+输出 hashes 与 AV 一致。后者比 AV 的 4329.17 us 慢，不能将少一次拷贝视为
+性能收益。EP16 全四规模+edges 416 records、小 B16/D1 的 T1/64+edges
+272 records、K8/B512/D4 的 T64/8K+edges 352 records 均通过，覆盖多代 wrap、
+变更输入 Graph、共享 workspace、热点 no-drop。尚未做此候选的 sanitizer。
+
+重新消融 packet/window：EP16/8K、B512/D4 的 Q16/Q32 快筛为
+4230.27/4312.26 us，注册区为 71946496/138977536 bytes/rank；Q8 为
+38547712 bytes/rank。Q16 的 B256/B1024 快筛为 4680.10/4163.68 us。
+Q16/B1024/D4 正式 10/20/20 的 8K/20K 为 4191.25/9425.64 us，32 hashes
+与冻结 V3 一致。相对 AV 最佳 Q8/B512 的组合收益为 3.2%/7.6%，仍落后于
+V3 的 3353.94/7099.53 us。8K compute pool 为 1591179456 bytes/rank，
+registered 为 71921408 bytes/rank；不把协议、Q、B 的组合收益分摊为单项收益。
+
+先恢复 AV 再独立检查 GIN owner 的资源共享模式，避免把后续更简单的优化混入
+本候选。代码归档 `build/static_v4_ring_direct_tx/change.patch`、`return_tx.cuh`，
+详细地址/进度推导 `build/direct_return_tx_plan.md`；生产源码当前不含此协议。
+冻结 native SHA256：Q8 `a23bab9c83e5f37d550bde55a91ca6757a35cf8573fbfe10df79f73fe4f67790`，
+Q16 `fffe9b62e0895424e96d823fb3c8b558ae2854d97c72541689d2afedfaeeb627`，
+Q32 `e34f2be383d4c1076e99e5f3e10a7a69205ad7754896b700ab5e21579679e679`。
+日志 `ring_direct_tx*_{quick,formal}.log` 与 `ring_direct_tx_*torch_rank*.log`。
+
+### AZ：静态 GIN owner 使用线程独占资源模式
+
+只将 ring `Endpoint` 的 GIN resource sharing 从默认 GPU 改为 THREAD。
+Dispatch TX、Return TX、RX/ACK 各 context 在 data plane 均只有唯一 lane-zero
+提交者；host 已要求 exclusive contexts，metadata 阶段与 data plane 由原有
+barrier 分隔。未修改 full-arena/V3、metadata barrier、ready/ACK、Put release
+scope、remote consumed AND local NIC completion 条件，也没有新增状态或容量。
+
+安装的 NCCL 2.31.2 GDAKI header 将 THREAD 映射到 DOCA EXCLUSIVE，允许
+owner 私有读写，省掉 GPU 共享模式的队列锁/原子更新。现有 `gin_link_bench`
+开启 verbose 后实际报告 `gin_type=3, railed_gin_type=3`，即 GDAKI；不再仅凭
+平台猜后端。日志 `build/ring_gin_backend_audit.log`。这不是改变 Put 内存序，
+也不是用户留待以后消融的本地 NIC credit 检查。
+
+Q8/L32/B512/D4 的 EP16/8K 快筛 4063.90 us，相对 AV 4329.17 us 约改善
+6.1%，输出 hashes 一致。完整四规模+edges 416 records、
+B16/D1 的 T1/64+edges 272 records 均通过。rank1/9 的 B16/D1/T64 eager
+memcheck 与 racecheck（11 rounds）均 launcher exit 0、0 errors/0 hazards。
+首次误设 rounds=2，在目标算子前被入口拒绝；其零错误日志不计入验证。
+日志 `ring_exclusive_gin_{memcheck,racecheck}_ep16_t64_r11.log` 与对应带 PID
+的 sanitizer 日志；不声称全部 16 ranks 的 sanitizer 覆盖。
+
+冻结 `build/static_v4_ring_exclusive_gin/`，native SHA256
+`3dbaa607c5c7d55ee20185c47fba47bc6ff93fac9f44f99b7e1ab93f64751c10`，
+library SHA256 `f0f576769af90267603b4b9a88cf6627decdd8954a72571ea05dd52c3dab5ebb`。
+
+正式 EP16、1620 MHz、10/20/20，Q8/L32/B512/D4 不变：
+
+| tokens/rank | AV/us | AZ/us | 相对 AV 延迟降低 | 冻结 V3/us |
+|---:|---:|---:|---:|---:|
+| 1 | 306.454 | 301.467 | 1.6% | 682.170 |
+| 64 | 398.174 | 393.101 | 1.3% | 824.659 |
+| 8192 | 4329.17 | 4057.57 | 6.3% | 3353.94 |
+| 20480 | 10196.3 | 9462.10 | 7.2% | 7099.53 |
+
+64 rank hashes 与冻结 V3 一致；单机 specialization 没有变化。两个节点测量时
+无 CPU 编译或其他 GPU 测试，SM 1620、活跃显存时钟 3201 MHz（远端空闲时
+会降到 2201）。AV/V3 是同日历史测量，AZ 日志
+`build/ring_exclusive_gin_ep16_t*_formal.log`。
+随后同条件 8K、10/20/20、无其他 CPU/GPU 工作的 ABBA 为
+AV 4332.55 → AZ 4062.22 → AZ 4059.43 → AV 4332.47 us，约 6.3% 收益稳定；
+日志 `ring_exclusive_gin_abba_{av1,az1,az2,av2}.log`。
+长 EP16 仍分别比 V3 慢 21.0%/33.3%，未达到最终性能目标。
