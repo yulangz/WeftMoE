@@ -49,6 +49,9 @@ CUDA Graph replay、graph 销毁/offload 与 workspace 生命周期回归。平�
 
 状态：单机与多机 inference-only V4 已实现；多机性能记录见
 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
+2026-09-23 的两机 1620 MHz 锁频对照表明：1/64 tokens 相对 V3 加速
+3.86–4.35×，但 8K/20K 延迟增加 15.1–34.2%；多机 prefill 性能目标尚未达成。
+这组结果使用各自公开参数，不是 scheduler 单变量消融，不能把差距全部归因于同步。
 training 重构尚未实现，不属于本次 inference-only 改造。
 
 日期：2026-09-22

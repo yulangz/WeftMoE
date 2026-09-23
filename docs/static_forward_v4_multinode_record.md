@@ -1,7 +1,38 @@
 # Static Forward V4 多机 inference 记录
 
-日期：2026-09-22。协议与首版边界见
+日期：2026-09-22；2026-09-23 补充优化分步记录与 V3 对照。协议与首版边界见
 [`static_forward_v4_design.md`](static_forward_v4_design.md#60-复审进度容量与首版实现边界)。
+
+最新结论（两节点全部 GPU 核心锁频 1620 MHz）：对照当前 V3 inference fallback
+及已有多机调优参数，V4 在 1/64 tokens 加速 **3.86–4.35×**，但 8K/20K 延迟
+增加 **15.1–34.2%**。功能与数值门禁已通过，**多机 prefill 性能目标尚未达成**，
+不能称为全面优于 V3。完整锁频矩阵和比较边界见下文。
+
+## 优化路径与逐步收益
+
+沿用单机记录的证据等级：A = 同条件反转顺序的交错 A/B，B = 相邻构建消融，
+C = 多项同时变化的里程碑 bundle。所有 token 数均为每 rank；延迟单位 us。
+未独立测量的改动不分摊收益，也不把单机收益搬到多机。
+
+| 步骤 / 提交 | 改动及解决的问题 | 多机收益与证据边界 |
+|---|---|---|
+| 0 / `b4538e0` | 复用单机的 FC2 连续 128-byte 写、32-Mblock 静态 wave、M128 readiness 直接索引 | 已包含在第一版多机中。单机 8K/20K 相对复审基线改善 24.9%/36.0%（B）；没有多机独立消融 |
+| 1 / `d69f6b6` | 放弃 bounded ring 协议，改用完整 invocation arena；区分 NIC 本地读完、远端可见、consumer 用完 | 设计修正，无独立性能数值。避免 TX 等 credit 时阻塞同 owner 的 RX 进度，以及错误复用 TX buffer |
+| 2 / `1154748` | 每个 rail 固定 CTA owner；原始 X 每远端节点一份，expert-sorted route/prefix 驱动节点内 pull；移除 V3 动态 claim/packet/fanout/credit 控制路径 | EP16/64 首个正式 graph 基线 **191.47**（C）。不是相对 V3 的加速比 |
+| 3 / `1154748` | FC2 直接写源 rail 的独立 Return TX；按目的节点 expert 区间紧凑回传，combine 直接读 RX；共享 route geometry、pull、stable combine order | 减少额外 scatter 与控制元数据，已包含在 191.47 中；没有单项计时 |
+| 4 / `1154748` | serialized graph 去掉 GIN reuse event，保留 eager 跨 stream 保护 | 原型 1 kernel + 1 event-wait 变为 **1 kernel、0 event/copy**。原型 EP16/1=168.90 仅 2 samples、batch=1，不与正式 batch=20 值计算收益 |
+| 5 / `c3610bb` | Combine 后跨机 barrier 改为本 GPU grid join；GIN contexts 由统一 capacity 确定，并缩小实际分配 | EP16/64 **191.47 → 173.31**，−18.16 / **−9.5%**（C，相邻构建）。两项同批变化，不分别归因 |
+
+步骤 2–4 属于一次多机大重构，没有保存每步独立可比较的 timing。
+容量检查改为真实用户 buffer 大小、允许空 rank 的空 gate，以及 collective 拒绝后
+恢复复用属于正确性修复，不计作性能优化。各规模最终数据见后文完整矩阵。
+
+与旧路径的关键区别不是简单减少几个 CTA：静态 residue 分配替代动态 GEMM 任务领取，
+full-invocation staging 替代依赖 credit 的逐包进度，返回数据直接落到 combine 可消费
+的位置。V3 SPSC 已经有固定 TX/RX channel owner，不能把“去掉 GIN context 锁”重复
+记成 V4 的新贡献；V4 进一步把通信收敛为 1–8 个 rail owner 的连续 Put 和阶段 fence。
+代价是更大容量预留，以及跨机 Dispatch/Return 仍为显式阶段，未与 GEMM 流水重叠。
+不能据此推断所有模型/路由都更快。
 
 ## 实现门禁
 
@@ -35,7 +66,9 @@ native library 构建的 `_runtime*.so`，本机 RDMA 配置使用
 8 rank 的 Forward/Backward parity、双层 graph、销毁/offload 均通过；训练仍走 V3。
 日志为 `/tmp/weft-v4-training-regression.log`。
 
-## 测量合同
+## 2026-09-22 历史测量合同与矩阵
+
+本节保留当日原始记录，不属于后文的 1620 MHz 锁频对照；不要跨表计算加速比。
 
 冻结的构建参数位于 `configs/static_inference_20260922/`，不依赖临时 JIT cache。
 在 repo 根目录构建（使用 CUDA 12.9、CUTLASS、NCCL 2.31.2）：
@@ -69,7 +102,7 @@ WEFTMOE_FORWARD_GRAPH_BATCH=20
 初版 EP16/64 的 p50=191.47 us；初测 EP8/20K=9206.34 us 只用了两个样本，
 不能作为正式矩阵值。
 
-最终构建的完整矩阵如下，单位 us，均为上述 graph rank-max p50：
+当日最终构建的历史完整矩阵如下，单位 us，均为上述 graph rank-max p50：
 
 | 拓扑 | 1 token | 64 tokens | 8192 tokens | 20480 tokens |
 |---|---:|---:|---:|---:|
@@ -80,11 +113,113 @@ WEFTMOE_FORWARD_GRAPH_BATCH=20
 8 个 case 的前 8 rank 哈希全部与对应单机基准完全一致，所有 rank 的图都只有
 1 kernel、0 memcpy、0 event。原始日志为
 `/tmp/weft-v4-network-final-gpus{4,8}-t{1,64,8192,20480}.log`。
-这些数值不是与旧 V3 多机路径的交错 A/B，不宣称未经测量的 V3 相对加速。
+这些 2026-09-22 数值不是与旧 V3 多机路径的交错 A/B。
 12 个 case 的完整 rank/sample、图节点数、输出 hash 及 native binary SHA256
 已保存到 [`../benchmarks/static_inference_20260922.json`](../benchmarks/static_inference_20260922.json)。
 
-## 首版后的同步精简
+## 2026-09-23：V3 / V4 同条件对照（核心锁频 1620 MHz）
+
+对照的是当前提交 `c3610bb` 的 V3 inference fallback，不是训练模式，也不是用
+此前其他 E/top-k 的历史时间作分母。V3 设置 `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`，
+使用仓库已有的 `communication_spsc_20260916/qwen.hpp` 多机参数；构建入口冻结在
+`configs/static_inference_v3_20260923/`。V4 沿用上述最终构建和参数。
+V3 参数曾在 H2048/I512 的多机路径验证，但这次没有针对 E64/K4 和四个长度重新
+autotune；因此结论适用于这组公开配置，不宣称战胜所有可能的 V3 调参结果。
+
+V3 的 FC1/FC2 N tile 为 128/256、K64、stages 4/2、FC2 claim=2，通信域为
+16 sender + 116 receiver/local；V4 为 N64/N128、K128、stages 3/3，静态 wave=32。
+二者均为 132 CTA、384 threads、cluster=2。比较保留各自参数，是实现与配置的
+整体对照，不是仅替换 scheduler 的单变量实验。
+
+每个 case 按 **V3 → V4 → V4 → V3** 启动四个独立 session，各自 10 个 warmup
+和 20 个 measured sample，每 sample 20 次 graph replay。打开
+`WEFTMOE_BENCH_SYNC_RANKS=1`，在每个 sample 的计时区间外同步所有 rank；
+先逐 sample 取 rank-max，再合并同一版本两个 session 的 40 个 sample 取 p50
+（排序后第 20 个）。这是独立进程的反序复测，不冒充同一进程逐 iteration 切换。
+正式计时不并发编译或其他 GPU 测试。按要求，两节点全部 16 GPU 使用
+`nvidia-smi -lgc 1620,1620` 锁定核心时钟，并设置 `-ac 3201,1620`；显存 application
+clock 保持 3201 MHz，未另行锁显存频率，driver=570.148.08。以 200 ms 间隔记录
+两节点各 GPU 的实际 SM/graphics 时钟及利用率，检查负载期间是否维持 1620 MHz，
+而非只检查 application-clock 配置。
+此前 application-clock=1980 MHz、未锁频的预跑不纳入本节结果，也不与本轮样本合并。
+前文 2026-09-22 的里程碑数字保留为历史记录，不拿它们与本轮锁频结果计算优化收益。
+
+V3 graph 包含 Notify + Forward，共 12 nodes：2 kernel、3 memcpy、6 event-record、
+1 event-wait。V4 将 route/notify 融入 Forward，为 1 kernel、0 memcpy/event。
+双方都测完整 graph，不人为从 V3 耗时中减去辅助节点；也不把 graph p50 与
+最后一次 replay 的 device-kernel span 混用。固定输入/路由/权重在所有 session
+中复用，输出以 2026-09-22 已通过 PyTorch 参考的 V4 全 rank 哈希为门禁。
+每个 case 独立建 pool，token capacity 按该 case 配置；不是让同一个 20K capacity
+pool 跑所有 decode 长度的测试。数值边界用例已验证，但本表不代表热点路由的性能。
+
+### 锁频结果
+
+单位 us；加速比 = V3/V4，延迟变化 = `(V4/V3 - 1) × 100%`，正数表示回退。
+
+| 拓扑 | tokens/rank | V3 p50 | V4 p50 | 加速比 | 延迟变化 |
+|---|---:|---:|---:|---:|---:|
+| EP8（2×4） | 1 | 621.90 | 160.96 | 3.86× | -74.1% |
+| EP8（2×4） | 64 | 793.43 | 199.48 | 3.98× | -74.9% |
+| EP8（2×4） | 8192 | 3359.00 | 3939.05 | 0.85× | +17.3% |
+| EP8（2×4） | 20480 | 7260.68 | 9614.13 | 0.76× | +32.4% |
+| EP16（2×8） | 1 | 680.49 | 169.23 | 4.02× | -75.1% |
+| EP16（2×8） | 64 | 824.51 | 189.52 | 4.35× | -77.0% |
+| EP16（2×8） | 8192 | 3355.23 | 3860.82 | 0.87× | +15.1% |
+| EP16（2×8） | 20480 | 7105.66 | 9537.37 | 0.75× | +34.2% |
+
+32 个 session 全部完成，384 次 rank/output hash 检查全部与已验证参考一致。
+03:56:26–04:08:06 UTC 的核心时钟采样共 55,928 条，全部为 SM=graphics=1620 MHz；
+每张 GPU 均有负载样本，负载样本的显存频率均为 3201 MHz。测试后两节点仍保持
+1620 MHz 锁频，没有恢复到 1980 MHz。
+
+完整的各 session p50、rank/sample、图节点数、hash、构建 SHA256，以及逐 GPU
+时钟核验汇总保存于
+[`../benchmarks/static_inference_compare_1620_20260923.json`](../benchmarks/static_inference_compare_1620_20260923.json)。
+原始日志为 `/tmp/weft-1620-abba-20260923-ep{8,16}-t{1,64,8192,20480}-{trial}-{v3,v4}.log`；
+时钟日志为 `/tmp/weft-1620-clocks-{local,remote}-20260923.csv`。
+该 JSON 另存了 2026-09-22 初版 EP16/64 的原始样本，明确放在不属于锁频对照的
+historical 字段下，以保留 191.47 → 173.31 的里程碑证据。
+
+### 结论与下一步
+
+- decode 的静态任务、fused Notify、graph 节点精简确实带来整体收益，但这不是
+  将整个 3.86–4.35× 分摊到单项优化的依据。
+- prefill 回退在反序复测和 1620 MHz 锁频下仍存在。代码可确认 V4 的跨机 Dispatch、
+  GEMM、Return 有阶段边界，而 V3 保留流式通信；同时两者 N tile、stages 和任务
+  粒度不同。**没有单变量消融，不能将回退完全归因于同步或缺少通信重叠。**
+- 后续应先比较 prefill 适用的 GEMM tile/wave 参数，再隔离测量跨机通信与 GEMM
+  重叠的收益；保持静态任务与 full-arena 的进度保证，不重新引入已经否决的
+  TX/RX 同 owner 等 credit 环。node-deduplicated X staging 仍是待实现项。
+- 本次只补测和记录，生产调度未改，也未增加按长度自动切换 V3/V4 的策略。
+  上述 prefill 回退仍未修复。
+
+### 复现
+
+V3 构建命令如下，V4 使用前文的构建命令：
+
+```bash
+NVCCFLAGS="-I$PWD/configs/static_inference_v3_20260923 -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1" \
+  python3 build_native.py cuda-test --jobs 8 \
+  --output build/static_inference_v3_20260923/test_cuda_notify
+```
+
+运行时使用前文六项 benchmark 环境变量，额外设置 `WEFTMOE_BENCH_SYNC_RANKS=1`。
+V3 设置 `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`；V4 **unset** 此变量。
+launcher 示例为 V3 / EP16；测试 V4 时替换 binary，EP8 则设置 `--gpus-per-node 4`：
+
+```bash
+test_binary="$PWD/build/static_inference_v3_20260923/test_cuda_notify"
+python3 tests/run_multinode_nccl.py \
+  --binary "$test_binary" --remote-binary "$test_binary" \
+  --remote root@10.10.19.233 --port 2222 --gpus-per-node 8 \
+  --scenario gin_forward_bench --socket-ifname eth0 --enable-ib --timeout 240
+```
+
+本机另需 `LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64` 和
+`NCCL_IB_GID_INDEX=3`。原 V4 冻结参数的 `WEFTMOE_FWD_RDMA_CTAS=0` 关闭了旧多机
+入口，不能只在那个 binary 上设置 disable 开关就当作有效的 V3 多机对照。
+
+## 首版后的同步精简（2026-09-22 历史证据）
 
 初版每轮有三次跨机 barrier：Dispatch 发布、Return 发布、Combine 后复用。
 最终版只保留前两次，末尾只做本 GPU grid join。其复用证明依赖不相交的 arena，
