@@ -700,7 +700,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
   if (config.static_forward_window_tokens) {
     auto &network = layout.static_forward;
-    const static_forward::PacketPartition packets{32U, 2U};
+    constexpr auto packets = static_forward::kNetworkPackets;
     const auto metadata = make_source_metadata_layout(config, static_ring_shape(config), packets);
     network.source_stride = metadata.bytes;
     network.source_bytes = metadata.published_bytes;

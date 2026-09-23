@@ -114,7 +114,7 @@ struct ComputeRingView {
 
 struct ComputeRingLayout {
   WindowShape shape{};
-  PacketPartition packets{32U, 2U};
+  PacketPartition packets = kNetworkPackets;
   SourceMetadataLayout source;
   std::size_t metadata = 0;
   std::uint32_t depth = 0;

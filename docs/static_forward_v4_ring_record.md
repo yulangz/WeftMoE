@@ -706,3 +706,47 @@ cases 和 B16/D1 的 T1/64/edge cases 均 exit 0，包含 20K 热点及跨调用
 端到端提升。16 ranks hash 一致；EP16 PyTorch 完整四规模及 edge cases、
 B16/D1 的 T1/64/edge cases 均通过，host suite 18/18。保留更准确的发布作用域
 与无用类型清理，但不将 R 计作性能收益。日志 `build/ring_net_rxgpu_*.log`。
+
+### S：按窗口内 packet ordinal 交错 source 的静态 pull 映射
+
+旧 `(packet + source) % workers` 对 channel-major 的小 packet 区间产生大量
+worker 碰撞；改为 `((packet_in_lane_window * lanes + lane) * source_group_size
++ source_in_group) % workers`。任务归属仍唯一且静态，source/lane/packet 的
+遍历顺序和逐 slot credit 均不改。没有增加 task claim 原子或内存。
+
+1620 MHz、EP16/8K/B256/D4、10 warmup/2 samples/batch2：53630.8 → 34369.7 us，
+下降 35.9%；全部 16 rank hash 一致。这是快速筛选，尚非正式矩阵/完整正确性验收。
+binary `build/static_v4_ring_net_spread/test_cuda_notify`，日志
+`build/ring_net_spread_ep16_t8192_smoke.log`。
+
+### T / U：warp 协同读取远端目录；独立增加网络 lane（验证中）
+
+T 保持 2 lanes：一个 warp 并行读取 packet 的 route/Location/gate，匹配目标
+rank 的行用 shuffle 交给唯一 TMA issuer；完成整包 copy 并 warp 同步后，参与
+lane 发布本地 X-ready，issuer 归还累计 RX credit。两级 staging 仍只有一个
+issuer，没有恢复失败实验 F 的多 issuer 复用。source/lane/packet 顺序不变，
+不新增全局目录或激活内存。
+
+U 在 T 上仅将 lane 从 2 增到 8，Q32/depth8 不变，GIN contexts 从 6 增至 24，
+Return TX/RX scatter owners 各从 2 增至 8。协议、GEMM profile 不变，但网络
+slot/payload 内存随 lane 增长；必须同时报告代价。配置集中到 `kNetworkPackets`，
+通过构建宏 `WEFTMOE_FWD_STATIC_V4_NETWORK_LANES` 消融，尚不改变默认值。
+
+EP16/8K/B256/D4 快速 graph 筛选（1620 MHz、10/2/2）：S 34369.7 us，T
+33783.8 us，U 10714.7 us。T 相比 S 下降约 1.7%，U 相比 T 下降约 68.3%，
+16 ranks hash 均一致。T/U 筛选时本节点同时有 CPU 编译，不作为正式性能验收；
+最终矩阵必须在无其他任务/编译负载下重测。U 每 rank 的 GIN 注册内存由
+18141184 增至 43350784 bytes，增量 25209600 bytes；该增量不随 tokens 增长。
+
+U binary `build/static_v4_ring_net_lanes8/test_cuda_notify` SHA256：
+`6ded3b4f111b3dc7b96af1bb2296830534e249f7c85ec31bd62dc3ac20ec44f1`。
+完整 EP16 PyTorch 四规模和 edge cases 两节点 exit 0，包含 20K 热点后复用。
+
+U 的 8K eager timeline rank0 overflow=0：每包 p50 Dispatch pack 23.184 us、
+提交 16.032 us；Return pack 49.392 us、退休/提交 41.952 us，RX scatter
+40.256 us。512 个 Return 包分给 8 个 owner；这些区间相互重叠，不能直接
+相加解释端到端延迟。元数据串行处理和少量 copy issuer 仍值得优化。
+
+U 的 B16/D1/T1/64 与小规模 edge cases 两节点 exit 0；B16/D1/T64 graph
+racecheck 同时 instrument rank 1、9，两份报告均 0 errors、0 warnings，
+launcher exit 0。这里仍只覆盖两节点各一个 rank，不是全部 rank 的 sanitizer。

@@ -141,6 +141,13 @@ struct PacketPartition {
   }
 };
 
+#ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_LANES
+#define WEFTMOE_FWD_STATIC_V4_NETWORK_LANES 2
+#endif
+inline constexpr PacketPartition kNetworkPackets{
+    32U, WEFTMOE_FWD_STATIC_V4_NETWORK_LANES};
+static_assert(kNetworkPackets.lanes > 0U);
+
 struct PacketHeader {
   std::uint64_t sequence;
   std::uint64_t window;

@@ -13,13 +13,14 @@ V4 已经落地。**
 
 ## 0. 当前代码基线：已实现什么
 
-当前 V4 是单机/多机 inference-only 的静态 full-arena 实现，training 仍走 V3。
-新增 opt-in 单机 ring 数据面（`WEFTMOE_STATIC_RING_TOKENS=B`）：已接通
-pull→X→FC1→S→FC2→C→Return→contribution→Reduce，默认仍保留原路径。
-首版正确性通过但长序列性能退化，不能当作最终优化版。多机 ring、GEMM 独立消融
-和训练对接仍待完成；详细测量见 ring 记录的 M2。
+默认 V4 仍保留单机/多机 inference-only 的静态 full-arena 实现，training 走 V3。
+opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
+Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
+去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
+数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
+优化版。GEMM 独立消融和训练对接未完成，进展与测量见 ring 记录 M2/M3/S–U。
 
-| 项目 | 当前行为 |
+| 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
 | 多机 Dispatch | source 将完整 X/routes/gates 发给每个远端节点的同 rail GPU，包括未命中的节点；完成阶段 barrier 后再机内 pull |
@@ -42,7 +43,7 @@ prefill 配置 `configs/static_inference_prefill_20260923/` 已有两个 GEMM en
 - epilogue 复用已退休的 CTA 私有 B staging，不复用可能被另一 CTA 提前 multicast
   覆盖的 A staging。
 
-最新已记录的 graph rank-max p50（us），核心 1620 MHz：
+full-arena 历史基线的 graph rank-max p50（us），核心 1620 MHz：
 
 | 拓扑 | tokens/rank | 冻结 V3 | prefill 配置 V4 |
 |---|---:|---:|---:|
@@ -496,7 +497,9 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 
 ### 6.6 M3b 首版具体布局与进度约束（数值通过，吞吐仍待优化）
 
-- 每 rail 使用 `(nodes-1)×2` 个 channel，Q=32 完整行，网络深度为 8；Dispatch
+- 每 rail 使用 `(nodes-1)×L` 个 channel，Q=32 完整行，网络深度为 8；L 在
+  `kNetworkPackets` 集中配置，已分别实测 L=2/8，收益与内存增量见 ring 记录 U。
+  Dispatch
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
   和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
   TX target/local completion、RX 已 ACK generation 均跨 invocation 保留。
@@ -516,6 +519,10 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   Return TX 只复制全包已 ready 的 C 行，scatter 的目的 contribution 已预留，
   Reduce 释放 source 窗口，随后准入后窗。这个等待关系仍需热点/小深度实测验证，
   不能把推导替代多机验收。
+- pull 的固定 worker 由窗口内 packet ordinal 与 source 交错映射，避免简单
+  `packet+source` 导致小区间集中到少数 CTA。warp 协同读取远端目录，唯一
+  TMA issuer 搬运；全局 copy 完成经 warp 同步传递后，各 lane 发布 X-ready，
+  再归还该包的本 rank fanout credit。没有动态领用或运行时计算 expected count。
 - NIC `readSignal(acquire)` → system-release `visible_generation` → peer acquire
   → 全部 TMA 完成 → system 累计 consumed → ACK，逐包建立可见性及复用链。
   多机 C.returned 同时接收本地 Return 与 peer rail 的更新，因此本地/远端
