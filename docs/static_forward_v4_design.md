@@ -397,7 +397,9 @@ packet 按 (window, destination node, lane) 的固定 token 顺序切分，每�
 首版一个 packet 对应一次 Put；若拆成多个 Put，必须先定义覆盖全部 pieces 的
 ready 聚合，不能用最后一个 weak signal 推断其他操作完成。不同 GIN context
 之间没有隐含的顺序。slot ready 使用绑定该 payload 的语义；不靠全网 flush
-建立每包可见性。
+建立每包可见性。AU 将单 Put 的 ready 改为 `WeakVASignalAdd`，只要求该 Put
+完成，不承担同 context 其他 packet 的完成通知；接收仍通过 `readSignal` 导入
+payload 可见性。远端 consumed credit 与本地 NIC completion 两项都保留。
 
 跨机走 source rank 对应的同 rail GPU，进入目标节点本地注册 RX。
 节点数循环、offset 和 terminal accounting 参数化；当前 expert 均匀连续分片、

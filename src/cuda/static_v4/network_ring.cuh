@@ -77,7 +77,9 @@ struct Endpoint {
     gin.put(ncclTeamWorld(gin.comm), peer(channel), a.gin_window,
             payload(returning, true, remote, sequence), a.gin_window,
             payload(returning, false, channel, sequence), bytes,
-            ncclGin_StrongVASignalAdd{
+            // Each slot imports its own bundled Put. No consumer relies on
+            // this signal to order other packets on the same context.
+            ncclGin_WeakVASignalAdd{
                 a.gin_window,
                 control(returning, remote, sequence) +
                     offsetof(static_forward::NetworkSlot, ready_signal),

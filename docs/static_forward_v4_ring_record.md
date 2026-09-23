@@ -1295,3 +1295,77 @@ Dispatch 32 MiB、Return 64 MiB；V3 Put 数为 128/256，AP Q8 为 1024/2048。
 V4 的 raw_remote_route_bytes、gin_metadata_bytes 目前未接 telemetry，日志中的
 零不表示没有这类流量。审计日志 `ring_{v3,reduce_topk}_ep16_t8192_eager_audit.log`；
 eager 含单次样本，仅用作计数审计，不替代 AP 的正式 Graph 性能表。
+
+### AT：本地 Pull 批量退休（验证中）
+
+保留单 issuer、两个 TMA staging slot，不增加共享内存；节点内 Pull 从每两行
+full store wait 改为同一 Mblock 内每八行 wait。中间通过现有双 staging 流水
+继续发射，完成整个 batch 后合并一次 X-full release credit。M128 能整除
+batch，不跨 Mblock 或窗口；有效尾行仍补齐 padding credit，网络路径暂保留
+两行 batch，也合并本 batch 的本地行 credit。删除发布阶段的重复元数据遍历。
+不提前复用 staging，不以 read-completion 代替全局 store-completion。
+
+第二节点单机 EP8、1620 MHz、10 warmup/20 samples/batch20、D4：
+
+| 版本 / B | T1/us | T64/us | T8192/us | T20480/us |
+|---|---:|---:|---:|---:|
+| 冻结 V3 | 300.374 | 370.218 | 1489.09 | 3294.90 |
+| AP / 256（原正式基线） | 101.043 | 149.442 | 1659.53 | 4005.92 |
+| AP / 512（同窗对照） | — | — | 1631.58 | 3968.52 |
+| 八行 / 512 | 101.122 | 139.627 | 1454.03 | 3585.28 |
+
+同 B512 的 8K/20K 分别降低 10.9%/9.7%，不能全部归因于放大窗口。
+8K 已略快于 V3，但 20K 仍慢 8.8%，**未达到全矩阵明显优于 V3 的目标**。
+四规模 32 hashes 与同节点冻结 V3 一致，测量节点无其他 workload/编译。
+八行的 B256/512/1024 8K p50 为 1640.07/1454.07/1571.82 us；因此后续
+单机候选采用 B512。所有值保留实际窗口配置，不把大 buffer 当零成本收益。
+
+继续尝试十六行没有改善：B512 的 8K/20K 为 1544.12/3697.64 us，
+B1024 为 1643.56/3628.85 us，故恢复八行。AP/八行/十六行的单机 prefill
+entry 均 REG168、STACK64、LOCAL0，未观察到资源计数变化；不能武断归因于 spill。
+冻结八行 `build/static_v4_ring_pull_batch/`，十六行 `build/static_v4_ring_pull_batch16/`。
+日志 `ring_{reduce_topk,pull_batch}_paired_remote_ep8_b512_t*.log`、
+`ring_pull_batch_remote_ep8_b*_t*.log`、`ring_pull_batch16_remote_ep8_b*_t*.log`。
+
+八行 B256/D4 和 B512/D4 的四规模+edges 各 208 PyTorch pass records；
+B16/D1 的 T1/64+edges 136 records，均 exit0。rank1 的 B16/D1/T64 Graph
+racecheck 为 0 errors/0 warnings，检查了更长 batch 内的双 staging 复用。
+网络两行 batch 的聚合 credit 与 AU 一同通过完整 EP16 四规模及 tiny ring
+验证（见 AU）；本地八行已分别通过 B256/B512 的完整单机验证。
+
+八行/B512 的 D8、D16 正式容量消融：8K 为 1456.71/1495.20 us，20K 为
+3509.29/3538.17 us。D8 对 20K 约降低 2.1%，8K 没有改善；D16 更慢。
+8K 的 device pool 分别为 511605440/578845888 bytes/rank，20K 为
+689079232/756319680 bytes/rank。暂保留 D4，不把这组额外容量收益混入 AT。
+
+### AU：每 packet 的 ready 语义与 Q8/L16 消融
+
+核对安装的 NCCL 2.31.2 `nccl_device/gin.h`：weak signal 保证绑定的 Put
+完成；strong 额外保证同 context/peer 先前所有 Put 完成。当前一个 packet
+就是一个 Put，header/payload 一起传输，每个物理 slot 有独立 ready/generation，
+后包 ready 不承担前包完成通知，因此只需 `WeakVASignalAdd`。保留接收端
+`readSignal` 可见性导入、ACK、远端 consumed credit AND 本地 NIC completion、
+terminal drain 与 metadata barrier。若未来拆包，必须重新定义跨 pieces 聚合，
+不可直接沿用最后一次 weak signal。
+
+同 Q8/L32/B512/D4 的 EP16/8K 快筛 strong/weak 为 4342.40/4342.82 us，
+**没有本机性能收益**；此项只收紧到实际所需的 packet 完成合同，不宣称加速。
+两个冻结候选分别为 `static_v4_ring_pull_batch16`、`static_v4_ring_packet_signal`；
+其网络 specialization 都是本地两行 batch，单机十六行候选不参与此性能结论。
+weak 的 EP16 四规模+edges 416 PyTorch records 均通过，包含热点后复用。
+B16/D1 的 T1/64+edges 另有 272 records 全通过，覆盖多代 wrap、变更输入的
+Graph replay 与共享 workspace。未引入新测试入口。AT/AU 合并后的源码保留
+单机八行、网络两行 batch；上述 weak library 的单机十六行是已排除的性能
+候选，不将它的 EP8 性能冒充为合并后的基线。
+
+将 Q8 的 lane 从 32 减至 16，固定 owner/context 数随之减少，注册内存从
+38547712 降至 21668096 bytes/rank，但 8K 退化至 7325.07 us，故不保留。
+该参数的已有 GPU plan 检查通过 31 source/packet + 6 destination cases，
+包含三节点几何；不把三节点 plan 通过声称为三机实测。
+冻结 `build/static_v4_ring_packet_signal_l16/`，生产调优继续 Q8/L32。
+
+辅助 GIN link benchmark 使用现有单 context 入口，4 MiB×32 的 rank-max
+平均有效吞吐 23.843 GB/s/rail，8 rails 总计 190.742 GB/s；小包发送明显更低。
+该测试既非完整算子，也非多 context 的带宽上限，不据此解释 V3/V4 的全部差距。
+原始日志 `build/ring_gin_link_bandwidth_audit.log`，其中历史字段名 `gbps`
+按 bytes/ns 计算，单位实际为 GB/s 而非 Gb/s。

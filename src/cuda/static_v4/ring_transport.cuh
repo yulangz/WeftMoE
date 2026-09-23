@@ -3,7 +3,7 @@
 #include "cuda/static_v4/network_transport.cuh"
 
 // Pull has one issuer and two private staging slots. A batch stays within
-// one admitted window and completes before publishing X readiness.
+// one Mblock and completes before publishing its aggregate X credit.
 template <bool Network, class Storage>
 __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
                                        unsigned worker, unsigned workers) {
@@ -21,16 +21,19 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
   RowPrefetchPipeline<Storage> prefetch(s, 0U);
   unsigned peer_rows = 0U;
   constexpr auto TileM = forward_tuning::kTileM;
+  constexpr auto Batch = Network ? 2U : 8U;
+  static_assert(TileM % Batch == 0U);
   for (std::uint64_t window = 0; window < r.state->windows; ++window) {
     const auto *sources = r.window_sources + window * shape.sources;
     const auto source_begin = shape.source_begin(window);
     const auto end = r.window_prefix[window + 1U] * TileM;
     if (lane == 0U)
-      for (auto base = r.window_prefix[window] * TileM + 2ULL * worker;
-           base < end; base += 2ULL * workers) {
+      for (auto base = r.window_prefix[window] * TileM + Batch * worker;
+           base < end; base += Batch * workers) {
         bool copied = false;
+        unsigned credit = 0U;
 #pragma unroll
-        for (unsigned item = 0; item < 2U; ++item) {
+        for (unsigned item = 0; item < Batch; ++item) {
           const auto index = base + item;
           const auto block = index / TileM;
           const auto m = static_cast<unsigned>(index % TileM);
@@ -64,25 +67,16 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
               source, local + target_row * a.hidden,
               static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
           peer_rows += identity.source != a.rank;
+          const auto valid = r.blocks[block].tile.rows;
+          credit += m + 1U == valid ? TileM - valid + 1U : 1U;
         }
         prefetch.drain();
         finish_copies<false>();
         if (copied)
           WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ProxyRelayEnd,
                                      ProxyRelay, 0U, base, execution_epoch(a));
-#pragma unroll
-        for (unsigned item = 0; item < 2U; ++item) {
-          const auto index = base + item;
-          const auto block = index / TileM;
-          const auto m = static_cast<unsigned>(index % TileM);
-          if (index >= end || m >= r.blocks[block].tile.rows)
-            continue;
-          if constexpr (Network)
-            if (r.rows[index].source / a.local_world_size != a.node)
-              continue;
-          auto &slot = ring::slot(a, block);
-          const auto valid = r.blocks[block].tile.rows;
-          const auto credit = m + 1U == valid ? TileM - valid + 1U : 1U;
+        if (credit) {
+          auto &slot = ring::slot(a, base / TileM);
           static_v4::reduce_add_release_device(
               reinterpret_cast<unsigned long long *>(&slot.x_full), credit);
         }
