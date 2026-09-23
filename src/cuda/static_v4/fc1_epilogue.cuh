@@ -26,11 +26,11 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
   const float gate0 = row0 < valid_rows ? gates[row + row0] : 0.0F;
   const float gate1 = row1 < valid_rows ? gates[row + row1] : 0.0F;
 
-  if (valid_rows == forward_tuning::kTileM) {
+  if (kOutputN >= 64U && valid_rows == forward_tuning::kTileM) {
     // Both math warpgroups must retire their TMA B reads before staging
     // into that CTA-private arena. A is multicast and must not be reused.
-    // N32 uses half of an N64 swizzle atom, not a different
-    // fragment layout; its vector gather below skips the unused columns.
+    // Stage complete N64 swizzle atoms. The narrow decode entry retains its
+    // original direct epilogue rather than staging a partial atom.
     cutlass::arch::NamedBarrier::sync(
         kMathThreads, physical_barrier<true>(kMathReadyBarrier));
 #pragma unroll
@@ -64,13 +64,21 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     const auto *u = g + 4U;
     const auto column = column_base + index * 8U + (lane % 4U) * 2U;
     if (row0 < valid_rows) {
-      const auto value = static_v4_swiglu_pair(g, u, gate0);
+      const auto value = make_float2(
+          gated_swiglu_fc2_input_from_bf16(
+              float_to_bf16_bits(g[0]), float_to_bf16_bits(u[0]), gate0),
+          gated_swiglu_fc2_input_from_bf16(
+              float_to_bf16_bits(g[1]), float_to_bf16_bits(u[1]), gate0));
       *reinterpret_cast<std::uint32_t *>(
           output + (row + row0) * a.intermediate + column) =
           float2_to_bf16x2_bits(value.x, value.y);
     }
     if (row1 < valid_rows) {
-      const auto value = static_v4_swiglu_pair(g + 2U, u + 2U, gate1);
+      const auto value = make_float2(
+          gated_swiglu_fc2_input_from_bf16(
+              float_to_bf16_bits(g[2]), float_to_bf16_bits(u[2]), gate1),
+          gated_swiglu_fc2_input_from_bf16(
+              float_to_bf16_bits(g[3]), float_to_bf16_bits(u[3]), gate1));
       *reinterpret_cast<std::uint32_t *>(
           output + (row + row1) * a.intermediate + column) =
           float2_to_bf16x2_bits(value.x, value.y);
