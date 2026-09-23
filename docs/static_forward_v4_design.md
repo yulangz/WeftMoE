@@ -1,793 +1,760 @@
-# WeftMoE Static Forward V4：单机与多机重构设计
+# WeftMoE Static Forward V4：静态任务与有界流水设计
 
-单机 inference-only 路径的逐项性能消融与失败实验见
-[`static_forward_v4_optimize_record.md`](static_forward_v4_optimize_record.md)。
+更新：2026-09-23。本版整理已确认的设计，作为后续实现依据；**除第 0 节外均为
+待实现或待消融的目标，不表示 ring、通信/计算流水或 training V4 已经落地。**
+旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
+引用计数等选择，不再作为实现要求。历史实现和性能证据保留在：
 
-2026-09-23 后续：prefill 的 GEMM 双入口和安全 epilogue staging 见
-[`static_forward_v4_prefill_record.md`](static_forward_v4_prefill_record.md)。
-当前节点内 Dispatch 是 destination-pull，FC2 Return 仍是 push；跨机 GIN
-Return 仍在 GEMM 完成后发送，尚未实现 Return/GEMM 流水。测试主矩阵为
-单机 EP8（1×8）、双机 EP16（2×8），不以 2×4 的 EP8 替代单机结果。
+- [单机优化记录](static_forward_v4_optimize_record.md)
+- [多机优化记录](static_forward_v4_multinode_record.md)
+- [prefill GEMM/epilogue 优化记录](static_forward_v4_prefill_record.md)
 
-## 0. 当前实现状态（2026-09-22）
+## 0. 当前代码基线：已实现什么
 
-单机 inference-only V4 已经完成一次按 MegaMOE 数据面重写。本节是当前实现
-的准绳；后文保留了最初的设计推演，其中 source-push 等已被实测否定的选择
-不再代表当前单机实现。多机 inference-only 已实现第 6.0 节的完整 invocation
-arena 协议；训练仍保持 V3。两机 EP8/EP16 的 1、64、8192、20480 token/rank
-均已通过 eager/graph PyTorch 数值校验；空 rank、不等长输入、重复 expert、热点
-路由、动态路由图回放及双层共享 workspace 也纳入同一实机门禁。
+当前 V4 是单机/多机 inference-only 的静态 full-arena 实现，training 仍走 V3。
 
-- route exchange、X/gate staging、destination pull、FC1/SwiGLU、FC2、Return/Combine 和
-  终止清理已物理融合在一个 kernel 中。inference steady state 每层只有一个
-  fused kernel，没有独立 notify kernel，也没有 host `handle.wait()`；
-- kernel 使用 132 个 384-thread homogeneous CTA。所有 CTA 具有相同代码与资源
-  合同：`0..255` 是两个 math warpgroup，`256..287` 是 TMA producer warp，
-  `288..383` 是三个 pull/control warp。不存在专用 transport CTA；
-- 每个 source 把 route id 发布到 destination 上按 `(expert, source, slot)` 索引的
-  symmetric route table，并把 X/gates 一次 staging 到 source-local symmetric storage。各
-  destination 的 control warps 用确定性 source-round-robin row 顺序 pull payload。它没有
-  work queue、claim CAS 或特殊 CTA；
-- route exchange 结束后，FC1 pair 和 FC2 unit 通过
-  `cluster + round * cluster_count` 静态枚举。有限静态工作不再在每个 row/task/barrier
-  中轮询 system-scope cancellation word；V3/训练路径仍保留可取消逻辑；
-- 数值主体复用 BF16/WGMMA micro-kernel、FP32 accumulator、SwiGLU rounding 点和
-  top-k FP32 固定 combine order。当前 autotune 结果为 M128、FC1 N64、FC2 N128、
-  K128、FC1/FC2 各3 stages、cluster size 2。MegaMOE 形状的 N128/K64 候选在该
-  workload 上反而约为 81 us，因此 tile 由 autotune 选择，不为形式对齐强制写死；
-- CUDA Graph 计划直接绑定稳定的 PyTorch X/routes/gates 地址和固定 output，
-  replay 没有 input `copy_` 或 output clone。外层 graph 中每层是一个 child graph node，
-  child graph 内只有上述 fused kernel；
-- pool 按公开的最大 route 容量预留 route table/canonical row 空间。host 在 launch
-  前检查容量，合法 route 不使用 capacity factor，不截断、不取模覆盖、不丢 token。
-
-历史 EP8 decode case（H=2048、I=512、64 experts、top-k=4、64 token/rank）的
-裸 fused CUDA Graph rank-max p50 为 **72.50 us**，已包含 X staging 且直接读取
-routes/gates。真实 tensor runtime 的双层 child graph 测得 **74.24 us/层**。
-MegaMOE 同 shape 的 graph kernel 是 62.6 us，但图外三份 input copy 是 11.5 us；
-公平口径为 74.1 us。因此裸 fused graph 快约 1.6 us（2.2%），而包含 child-graph
-调度的应用口径与之相差 0.14 us（0.2%）。WeftMoE 内部 clock
-与 MegaMOE CUDA-event kernel-only 不是同一计时口径，不将二者直接比较。
-
-已通过平衡路由和 64 token/rank 极端 skew 路由的 8-rank tensor parity、双层
-CUDA Graph replay、graph 销毁/offload 与 workspace 生命周期回归。平衡微基准在
-多轮 graph replay 后的 8 个 rank output hash 也与固定期望值完全一致。
-
-状态：单机与多机 inference-only V4 已实现；多机性能记录见
-[`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。
-2026-09-23 的 1620 MHz 锁频主矩阵为单机 EP8（1×8）和双机 EP16（2×8）：
-单机 EP8 在 1/64 tokens 相对 V3 加速 4.63–4.97×，8K/20K 分别慢 7.6%/44.9%；
-双机 EP16 在 1/64 tokens 加速 4.02–4.35×，8K/20K 分别慢 15.1%/34.2%。
-两者的 prefill 性能目标均尚未达成。此前两机 EP8（2×4）仅保留为额外实验，
-不能替代单机 EP8。这组结果使用各自公开参数，不是 scheduler 单变量消融，
-不能把差距全部归因于同步。详细数据分别见单机和多机优化记录。
-training 重构尚未实现，不属于本次 inference-only 改造。
-
-日期：2026-09-22
-
-范围：Hopper BF16 Forward；覆盖 inference，以及需要保存 Forward 中间激活的
-training Forward。Backward kernel 本身不在本轮重写范围内，但新 Forward tape
-必须能被现有/后续 Backward 消费。
-
-## 1. 结论先行
-
-本次重构采用以下明确方案：
-
-1. **单机和多机使用两个独立 kernel specialization**，共享路由布局、静态任务
-   枚举器、GEMM micro-kernel 和同步协议；不把 GIN/NCCL device 代码编入单机
-   kernel。拓扑差异值得专门化，inference/training 则只做模板级差异，不复制一套
-   scheduler。
-2. **Inference 的 Notify 与 main kernel 合并成一次 cooperative persistent
-   launch**。路由计数、count exchange、几何生成、Dispatch、FC1、SwiGLU、FC2、
-   Return 和 Reduce 均在一次 launch 内完成；hot path 不再生成一个需要 host
-   `wait()` 后才能启动 main 的 `DeviceDispatchHandle`。
-3. **取消运行时 work queue、全局 claim cursor 和 ready-task CAS**。路由完成后，
-   task 集合被冻结；CTA/cluster/warp 通过 `worker + round * workers` 的闭式编号
-   枚举自己的任务。原子计数仅用于 payload readiness、跨 GPU release/acquire、
-   GIN ring credit 和错误发布，不再用于“谁来做这项工作”的分配。
-4. **单机使用 destination-pull，多机保留 push/relay 方向**。单机 source 在
-   fused kernel 内把 X/gates staging 到 source-local symmetric storage，并向 expert owner
-   发布紧凑 route table；destination 的同构 control warp 静态 pull canonical row。
-   这条实测路径比 source-push 更接近 MegaMOE，也避免了 push 方构造最终 row
-   位置和频繁 remote readiness 原子操作。多机 remote route 仍必须使用 GIN push，
-   再由目标 rail GPU 静态 relay，不使用跨机 pull。
-5. **多机只使用跨机 push**。每个 GIN channel 有固定 owner，按静态 sequence
-   顺序打包和发送；目标节点的 receive/relay channel 也有固定 owner，再通过
-   NVLink/IPC relay 到 expert GPU。跨机 pull 不进入方案。
-6. **不尝试让 route exchange 与 GEMM 重叠**。先完成 route counting、count
-   exchange 和 task geometry 冻结，再开始 payload Dispatch 与计算流水。Payload
-   Dispatch、FC1、FC2、Return、Reduce 仍然互相重叠。
-7. **单机 inference canonical row 采用确定性 source-rank round-robin 布局**：
-
-   ```text
-   row(e, source, slot) = expert_base[e] + round_robin(source, slot)
-   ```
-
-   route table 仍按 `(expert, source, slot)` 存放，pull 时逐层轮转所有仍有行的
-   source。这使相邻 warp 分散到不同 NVLink peer，同时保持路由给定时 row
-   顺序唯一。training 未改用该 inference-only 布局；其 tape/dW 顺序仍由 V3
-   合同保证。
-8. **保留现有 GEMM 数值合同**：FC1/FC2 的 N tile、K tile、K 累加顺序、FP32
-   accumulator、BF16 rounding 点、SwiGLU/gate 精度和最终 top-k reduction 顺序均
-   不变。本轮只改任务如何枚举和数据何时 ready，不改一个输出元素内部的 reduction。
-9. **需要保存中间激活时固定采用 `plan kernel -> host allocate -> main_from_plan`
-   的 memory-tight 路径**。各 rank 的 token 数和 routing skew 不设静态最坏上界；
-   host 根据 plan 给出的本 rank 精确 `R/P` 分配 canonical/saved tensors。planning
-   结果由 main 直接复用，绝不重新 Notify。合法 route 不设 capacity factor、不
-   截断、不覆盖取模。PDL 不能解决“main launch 时输出指针尚不存在”这一依赖，
-   因此不用于这条动态分配路径。
-
-## 2. 当前实现中需要被替换的部分
-
-当前路径的数值 kernel 可以复用，但控制面过重：
-
-- `notify/local_notify.cuh` 为稳定 route ordinal 做 chunk radix/count/scan；
-  `notify/materialize.cuh` 随后物化 destination row、packet/fanout、wave 和多个排序
-  permutation。
-- `persistent_v3/forward/dispatch_pipeline.cuh` 由 publisher 等待 `x_arrived_rows`，
-  再把 FC1 task 写入共享 ready queue。
-- `persistent_v3/forward/compute_kernel.cuh` 用全局 cursor/CAS 领取 FC1 pair，FC1
-  epilogue 再发布 FC2 ready queue，compute scheduler 在 FC1/FC2/Reduce 之间动态
-  probe。
-- 单机 Relay、GIN Dispatch/Return 和 Reduce 还各有自己的 cursor、claim 或 ready
-  queue。即使某个 `StaticLocal` 分支跳过部分 queue read，也没有形成从 route 到
-  compute/return 的完整静态协议。
-- Dynamic training 在 Notify 后才知道实际 incoming rows，host 需要取得该值后再
-  准备保存 X/A/B/header 的 tensor。这是 allocation dependency，不是 GPU kernel
-  readiness dependency。
-
-V4 不在这些队列上继续打补丁，而是让 route plan 直接生成所有阶段共享的不可变
-几何，随后每个阶段从相同几何独立枚举任务。
-
-## 3. 共同的数据模型
-
-### 3.1 最小 route plan
-
-每个 source rank 对本地扁平 route `r = token * K + topk_slot` 只保存：
-
-```cpp
-struct SourceRoute {
-  uint32_t expert;       // invalid/masked route 使用单独 valid bit
-  uint32_t source_slot;  // 本 source、该 expert 内的 ordinal
-};
-```
-
-`token` 与 `topk_slot` 由 `r` 反解，无需重复保存。全 rank 交换的控制信息只包括：
-
-```text
-count[source_rank, global_expert]
-config/error digest
-```
-
-每个 destination rank 从 count matrix 本地得到：
-
-```text
-expert_rows[local_expert]
-expert_base[local_expert + 1]
-source_prefix[local_expert, world + 1]
-mblock_count[local_expert]
-mblock_prefix[local_expert + 1]
-```
-
-因此 source 在 count exchange 之后可以直接计算任意 route 的 destination row；
-destination 不再需要 Notify 预先生成 `route_dst_row`、`route_dst_rank`、
-`packet_fanout`、`combine_order` 和多轮 wave sort。
-
-Dispatch payload 在 canonical row 同时写入一个紧凑 header：
-
-```cpp
-struct CanonicalRouteHeader {
-  uint32_t source_rank;
-  uint32_t source_token;
-  uint16_t topk_slot;
-  uint16_t flags;
-  float gate;
-};
-```
-
-FC2/Return 用该 header 将结果写回 source 的固定 contribution slot
-`[source_token, topk_slot]`。最终 Reduce 始终按 `topk_slot = 0..K-1` 累加，因此
-不需要 Notify 构造额外 combine permutation。
-
-### 3.2 no-drop 容量合同
-
-“不丢 token”在实现中应精确定义为：每条未 masked 的合法 route 都必须执行 FC1、
-FC2、Return 并参与 source token 的固定顺序 Reduce。masked route 是调用方显式语义，
-不是容量丢弃。
-
-对一次实际 invocation，本 rank 需要保存的 route 行数由 plan 精确给出：
-
-```text
-R_actual[rank]
-  = sum_source sum_{expert owned by rank} count[source, expert]
-```
-
-若计算 arena 对每个 local expert 做 M-tile padding，plan 同时计算精确的：
-
-```text
-P_actual[rank]
-  = sum_{expert owned by rank} round_up(expert_rows[expert], TileM)
-```
-
-training 不再要求调用方给出所有 rank 的 `T_cap`，也不按
-`world*T_cap*K` 预分配。plan kernel 在 device 上完成 count exchange 和 prefix 后，
-只把本 rank 的 `R_actual/P_actual` 及 collective error 状态带回 host；host 按这两个
-精确值分配 main arena 和 tape，再启动 `main_from_plan`。极端 skew 只会让实际接收
-较多的 rank 分配更多显存，不会迫使所有 rank 为同一最坏值常驻预留。
-
-若 allocator 无法满足精确申请，整个 invocation 明确 OOM 并在任何 activation
-payload push 前终止；不能只保留前 N 行继续执行。由于这条路径包含 host allocation，
-training Forward 不承诺 CUDA Graph capture。Inference 不保存 tape，继续使用单次
-融合 kernel 和它自己的 capacity/graph 合同。
-
-### 3.3 source slot 的两种生成方式
-
-两种模式产生相同的下游布局和 scheduler：
-
-- `FastInference`：每条 route 对本地 expert counter 做 atomic reservation。
-  `source_slot -> route` 不承诺跨运行稳定，但每个 Forward row 的 K reduction 和
-  最终 top-k reduction 不受影响。
-- `StableTape`：用于 training/需要可复现 route plan 的路径。每个固定 route chunk
-  先写 `chunk_count[chunk, expert]`，按 chunk id 做 deterministic prefix；第二遍按
-  route 原始顺序用 warp `match/ballot` 和固定 warp-prefix 生成 chunk 内 ordinal。
-  它不需要对全部 route 做 radix sort，也不依赖 global atomic 的到达顺序。
-
-`StableTape` 的 canonical M 顺序固定为：
-
-```text
-local expert -> source rank -> source 原始 (token, topk_slot) 顺序
-```
-
-Forward tape 保存 count/prefix/header，Backward 必须消费这一次 Forward 的精确 plan，
-不能重新运行 atomic route reservation 来猜测行顺序。
-
-### 3.4 不变的数值合同
-
-重构不得改变以下内容：
-
-- `TileM/TileN/TileK` 及 cluster pairing；尤其 FC1/FC2 的 N、K tile 不变；
-- 每个输出元素沿 K 的 WGMMA stage 次序；
-- FC1 FP32 accumulate 后 A/B 各自 round 到 BF16；
-- SwiGLU 从这些 BF16 A/B 恢复到 FP32，乘 FP32 gate，再 round 一次到 BF16；
-- FC2 FP32 accumulate 与 BF16 输出；
-- source output 按固定 top-k slot/expert 顺序做 FP32 sum，最后 round BF16。
-
-M tile 之间的执行先后可以变化，因为 Forward 不跨 M row reduction。training 的
-dW 对 M 做 reduction，所以 `StableTape` 和 Backward 的固定 M traversal 仍然是
-training 合同的一部分。
-
-## 4. 静态 task 系统
-
-这里的“静态”不是 task 数在编译期固定，而是：count exchange 完成后，task 数和
-task 到数据的映射在该 invocation 内不可变，worker 不再竞争领取任务。
-
-### 4.1 Dispatch task 生成
-
-每个 source 根据最终 row/mblock，将本地 route 放入 bucket：
-
-```text
-bucket key = (destination rank, destination logical mblock, transport class)
-transport class = local-NVLink | remote-GIN-channel
-```
-
-一次 count/prefix/scatter 得到 `dispatch_route_order[T*K]`。bucket 内顺序不影响
-canonical row；training 稳定性来自 `source_slot`，所以这里可使用较便宜的 atomic
-scatter。每个非空 bucket 按 `DispatchChunkRows` 切成不可变 descriptor：
-
-```cpp
-struct DispatchTask {
-  uint32_t route_begin;
-  uint16_t route_count;
-  uint16_t channel;
-  uint32_t destination_rank;
-  uint32_t destination_mblock;
-};
-```
-
-这不是 ready queue。descriptor 在 main phase 开始前一次性完成，之后永不追加，
-也没有 head/tail/claim cursor。
-
-### 4.2 各阶段的固定 ownership
-
-| 阶段 | 静态 ownership |
+| 项目 | 当前行为 |
 |---|---|
-| route chunks | `chunk = cta + round * num_ctas` |
-| local destination-pull Dispatch | `row = global_warp + round * global_warps` |
-| GIN send | `channel -> fixed GIN owner CTA`; owner 按 sequence 递增发送该 channel 的 task |
-| GIN receive | `channel -> fixed receive owner`; owner按预期 sequence 消费，不做全局 claim |
-| node-local relay | 一个 receive chunk 内 `row = relay_warp + round * relay_warps` |
-| FC1 | cluster 拥有固定的 FC1 tile-pair residue class |
-| FC2 | cluster 拥有固定的 FC2 tile-pair residue class |
-| local/remote Return | 从 canonical mblock/header 静态枚举；固定 channel owner |
-| token Reduce | `token = reduce_worker + round * num_reduce_workers` |
+| 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
+| 多机 Dispatch | source 将完整 X/routes/gates 发给每个远端节点的同 rail GPU，包括未命中的节点；完成阶段 barrier 后再机内 pull |
+| GEMM | FC1/FC2 静态 residue 分配，无动态 task claim；节点内 pull 与计算可重叠 |
+| cluster TMA | 已使用 cluster size 2 的 multicast；V4 配对同 Mblock 的相邻 N tiles，共享 A |
+| FC2/Return | FC2 push contribution；多机等节点内全部 FC2 完成后发送 Return，再等待网络阶段结束后 Reduce |
+| 缓冲区 | canonical X/S 和通信区按完整 invocation 容量分配，没有应用层逐 slot 通信/计算 ring |
+| inference launch | route planning 与主流程融合；正式 graph 基线每 rank 一 kernel |
+| training | 保持 V3；新 tape/Backward 对接尚未实现 |
 
-为了避免总是让同一 cluster 承担 phase 尾部，FC1、FC2、不同 wave 可使用确定性的
-rotation offset；rotation 只改变 owner，不改变 tile 内数值顺序。
+当前通常使用 132 个 384-thread CTA：256 math、32 TMA producer、96 pull/control
+线程。此配置是基线，不是新流水必须保持的角色配额。
 
-### 4.3 FC1/FC2 pair 枚举
+prefill 配置 `configs/static_inference_prefill_20260923/` 已有两个 GEMM entry：
 
-保留当前 cluster-2 multicast 友好的 pair 规则：
+- 短序列：M128，FC1 N64 / FC2 N128，K128，stages 3/3。
+- 长序列：M128，FC1 N128 / FC2 N256，K128，stages 2/2。
+- 该配置以 8192 tokens/rank 为入口阈值；其他配置未统一启用，不把阈值当成最终结论。
+- FC1 宽入口已迁移合并写回；窄 N32 SwiGLU 输出保留直接写。
+- epilogue 复用已退休的 CTA 私有 B staging，不复用可能被另一 CTA 提前 multicast
+  覆盖的 A staging。
 
-- FC1 优先让两个 CTA 处理同一 expert/N tile 的相邻 M tile以共享 weight B；若该
-  expert 最后只有一个 M tile，则配对相邻 N tile以共享 activation A。
-- FC2 配对同一 M tile 的相邻 N tile，共享 SwiGLU activation A。
+最新已记录的 graph rank-max p50（us），核心 1620 MHz：
 
-每个 wave 先枚举该 wave 的所有 FC1 pair，再枚举同一 wave 的所有 FC2 pair：
+| 拓扑 | tokens/rank | 冻结 V3 | prefill 配置 V4 |
+|---|---:|---:|---:|
+| 单机 EP8（1×8） | 1 | 299.78 | 64.50 |
+| 单机 EP8（1×8） | 64 | 368.44 | 73.80 |
+| 单机 EP8（1×8） | 8192 | 1487.58 | 1504.50 |
+| 单机 EP8（1×8） | 20480 | 3289.72 | 4607.09 |
+| 双机 EP16（2×8） | 1 | 680.49 | 169.99 |
+| 双机 EP16（2×8） | 64 | 824.51 | 188.90 |
+| 双机 EP16（2×8） | 8192 | 3355.23 | 3725.31 |
+| 双机 EP16（2×8） | 20480 | 7105.66 | 9146.10 |
+
+V3 是同日冻结对照，不是最后一轮 prefill 改动的交错重测。长序列差距仍在；
+现有数据同时混合了布局、tile、调度和通信差异，不能证明 gate/up 的某种布局更优。
+此表不是新 ring 的性能结果；详细配置、误差和证据等级以各优化记录为准。
+
+## 1. 本轮确定的目标与边界
+
+1. 保留静态 task ownership，删除动态队列领用、全局 claim cursor、task CAS。
+   静态指本次 route plan 冻结后的映射，不是编译期固定 token 数。
+2. 使用逐 slot、带 generation 的 ring；借鉴 MegaMoE 的 full/empty 计数协议，
+   而不是移植其完整 scheduler。不能仅把完整 arena 地址取模就称为 ring。
+3. 单机仍使用 destination-pull；多机跨节点用 GIN push 到 rail RX，目标 expert GPU
+   再做节点内 pull。按实际 route 做节点级 X 去重，不命中某节点就不向它发送 X。
+4. 跨机 Dispatch、节点内转发、FC1/FC2 要流水重叠；Return 也随已完成 Mblock
+   推进，不等整个节点 FC2。数据面不使用每包、每窗口或每阶段的全节点 barrier。
+5. X/S/C、网络 TX/RX、source contribution 分别管理生命周期。释放某一缓冲区
+   不等待整条流水结束；后续需要的 metadata 必须仍有独立有效存储。
+6. 支持长上下文 prefill 与后续 training；不以 capacity factor 截断合法 route。
+   有界 transient buffer 满时背压，不丢 token。输入、输出、plan、training tape
+   仍需实际规模的内存；真正 OOM 明确失败，ring 不等于无限总显存。
+7. 单机/多机、decode/prefill 使用 specialization/profile，共享协议和数值模块，
+   不复制四套 scheduler。gate/up 布局通过第 7 节独立 GEMM 消融决定，先不选边。
+8. Dispatch/Return TX 复用先保留远端消费 credit 与本地 Put completion 双重检查；
+   简化检查列为后续优化，不阻塞首版。
+9. 协议参数化节点数，不硬编码两节点。当前实机主矩阵只有单机 EP8（1×8）和
+   双机 EP16（2×8），均测 1/64/8192/20480 tokens/rank、核心 1620 MHz。
+10. 本轮先完成 inference 流水；training 的保存、精确分配与 Backward 对接作为
+    独立 milestone，不能把 inference 正确当成训练支持完成。
+
+## 2. Route plan、窗口与静态任务
+
+### 2.1 不可变的路由身份
+
+每条有效 route 用 `(source_rank, token, topk_slot)` 唯一标识，另有 expert、
+router weight 和有效位。重复 expert 的不同 top-k slot 仍是两条 route；只有
+X 的网络传输可去重，不能去重掉 contribution。
+
+plan 给出 source ordinal、destination logical Mblock/row、source contribution
+位置及固定 combine order。canonical 行可沿用 source-rank round-robin；training
+必须固定该顺序并保存，不在 Backward 重做原子分配来猜行号。
+
+最终 FP32 combine 保持现有 `(expert, topk_slot)` 固定顺序，不改成到达顺序，
+也不能擅自换成单纯 top-k slot 顺序。router weight 在 SwiGLU 阶段使用。
+
+### 2.2 有界 source-token window
+
+同一 token 的全部 top-k route 进入同一个窗口。窗口最多包含 G 个 source rank，
+每 rank 最多 B 个 token；大 world 按固定 source-rank group 继续枚举窗口，
+不让 G 随节点数无限增长。起始候选是 G×B 不超过 2048 个 source token：
+EP8 可取 G=8/B=256，EP16 可取 G=16/B=128；这些是调优起点，不是性能结论。
+
+所有 rank 使用同一窗口编号与顺序；不等长/空 rank 由实际 token counts 决定空区间。
+窗口里的 route 按 expert 形成逻辑 Mblocks，不能把一个 Mblock 的未到齐行留给
+未准入的后续窗口。一个 packet 也不跨窗口。
+
+需要的几何是：
 
 ```text
-for wave:
-  for pair = rotated_cluster_id; pair < fc1_pairs(wave); pair += clusters:
-    wait x_ready(mblock)
-    run FC1 pair
-
-  for pair = rotated_cluster_id; pair < fc2_pairs(wave); pair += clusters:
-    wait s_ready(mblock)
-    run FC2 pair
+count[w, source, expert]           // 当前窗口内的实际有效 route 数
+R[w, expert] = sum_source count[w, source, expert]
+mblocks[w, expert] = ceil(R[w, expert] / M)
 ```
 
-没有全局 FC1->FC2 barrier。一个 cluster 做完自己的 FC1 residue 后可以进入 FC2；
-它只等待目标 mblock 的 `s_ready`。尚未结束 FC1 的 cluster 不依赖 FC2，因此不会
-形成环形等待。若静态 assignment 暴露明显 head-of-line stall，可在**同一个 worker
-自己的 residue list** 内加入小窗口 lowest-ready lookahead；仍不允许跨 worker steal
-或恢复全局 claim cursor。
+这些计数从实际 route 遍历/分桶产生；整个 invocation 的 expert 总数不能代替
+窗口计数。由 planning 阶段交换必要的窗口计数和紧凑目录，零项可以省略。
+避免强制物化规模为所有窗口 × 所有 rank × 所有 expert 的稠密表。
 
-### 4.4 readiness 仍需原子同步
+窗口划分、route 顺序与 packet 边界在 payload 阶段前确定。descriptor 可按闭式
+规则枚举，不要求全部物化；不能用运行时“当前 ready 多少就发多少”改变首版
+分包边界。每个 channel 的准确 packet 数由实际非空分组及分包规则得到，而不是
+仅用全局 route 总数除以 Q。
 
-删除 task queue 不等于删除同步：
+plan/紧凑目录还需让目标 GPU 枚举每个 (channel, sequence) 的实际 fanout 任务范围。
+不命中的 worker 不扫描可复用 RX header 来临时发现任务；否则这些未被 fanout
+计数覆盖的 metadata 读者也会影响 slot 释放。ACK owner 所需包头字段在返还 credit
+前读完，之后不再引用该代 payload。
+
+### 2.3 准入与无环背压
+
+source owner 先预留自己参与窗口的 contribution 容量；destination owner 一次检查
+并预留本 rank 该窗口全部 Mblocks 的 X/S/C，然后各自发布准入 credit。禁止在
+destination 内占住部分 X/S/C 后等待本窗口剩余 plane。发送方只等待该 packet
+实际涉及的目的 rank 准入和自己的 contribution reservation，不做分布式原子预留，
+也不做全节点窗口 barrier。
+
+容量推导（M=128，K=top-k，E_local 为本 rank expert 数）：
 
 ```text
-Dispatch payload/header store
-  -> system/device release
-  -> x_arrived[mblock, source_or_channel] += rows
-
-FC1/SwiGLU slice store
-  -> device release
-  -> s_ready[mblock] += 1
-
-FC2 tile store
-  -> device/system release
-  -> y_ready[mblock] += 1
-
-Return contribution store
-  -> system release
-  -> route_ready[token, topk_slot] = epoch
+R_window_total <= G * B * K
+mblocks_on_one_rank = sum_local_expert ceil(R[w,e] / M)
+                    <= ceil(G * B * K / M) + E_local
+D_window = ceil(G * B * K / M) + E_local
 ```
 
-消费者在 successful readiness test 后做 acquire，再读取 payload。GIN slot 的
-ready/consumed/credit generation 也保留。V4 删除的是 queue reservation、task CAS
-和动态 selector，不是 release/acquire 或 bounded-ring backpressure。
+每个 X/S/C ring 至少能容纳一个最坏窗口；同时完整准入两个最坏窗口的保守容量
+为各 2×D_window。实际准入使用真实 mblock 数。不同 plane 可独立退休，但不能
+因 X 提前空出就越过 S/C 的容量限制。source contribution slot 必须在发出该窗口
+Dispatch 前预留，否则 Return 可能反向等待仍未分配的目的地。
 
-## 5. 单机流程
+固定 owner 的 alloc/reclaim 序号只负责容量账本，不是动态 task queue。全局 head/tail
+不是 readiness 依据；若账本用连续退休前缀，只能越过所有相关 slot 均已退休的区间，
+不能把某个乱序完成 slot 当成之前所有 slot 都已完成。
 
-单机使用一个不含 NCCL device/GIN 代码的 cooperative persistent kernel。建议
-保持一个 CTA/SM、cluster size 2；CTA 内继续使用两个 WGMMA math warpgroups、一个
-TMA producer 区域和若干 communication warps，具体线程布局由 autotune 决定。
+同一窗口内可保留各 cluster 先 FC1、再 FC2 的静态枚举，但必须先保证整窗口
+S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 的 FC1 枚举结束。
+通信/计算只按已准入窗口的有序任务推进，后续窗口不能占住前一窗口释放所需的资源。
+具体角色配额、跨节点准入消息和等待图在实现 milestone 中验证，不能仅凭 ring
+容量公式宣称已证明整条网络流水无死锁。
 
-完整阶段如下：
+## 3. Buffer 布局与地址
+
+### 3.1 数据区
+
+以下是目标布局，不是当前 NetworkLayout 的现状；M=128，BF16 元素为 2 bytes。
+
+| 存储 | 逻辑布局 | 分配与释放 |
+|---|---|---|
+| 输入 X/routes/weights | 调用方实际输入及必要的 peer 可达 staging | 本次调用输入生命周期，不复制成每远端节点一份完整 X |
+| X ring | `[D_x, M, H]`，另有 gate/本代元数据 | 本 GPU，所有 FC1 读者退休后复用 |
+| S ring | `[D_s, M, I]` | 本 GPU，所有 FC2 读者退休后复用 |
+| C ring | `[D_c, M, H]` | 所有 Return 读者搬走完整行后复用 |
+| Dispatch TX / RX | 分离的 `[remote_node, lane, D_net, slot_bytes]` | 本 rail 的注册区，逐 slot credit |
+| Return TX / RX | 同样分离的 peer/channel ring | 不与 Dispatch 或对向 TX 别名 |
+| contribution | source 上 `[D_contrib, B, K, H]` 及 route-ready | 同一 token 的 Reduce 完成后释放相应窗口 |
+| immutable route plan | 实际路由/窗口几何及返回映射 | invocation；训练延长到 Backward |
+| training tape | 实际大小的 X/G/U 等 checkpoint | 不放在会覆盖的 transient ring 里 |
+
+每种 plane 有独立地址空间。逻辑 block b 映射到 `slot=b%D_plane`；读取/写入前
+同时核对本代描述和 full/empty 条件。单凭取模地址不授予访问权。
+
+通信 chunk 起始候选 Q=32/64 个 token 或完整 contribution 行，D_net=4，
+每 peer 2/4 lanes；不在实现前把这些值定成最优。Dispatch slot 最坏容纳
+Q 份 X 和 Q×K 个 fanout record，不随全调用 token 数扩大。
+
+### 3.2 Packet 与返回地址
+
+Dispatch packet 包含本代 header、去重 token records、fanout records 和 X payload：
 
 ```text
-1. invocation epoch/setup
-2. math lanes: X staging + combine order
-   control lanes: local route histogram + (expert, source, slot) table
-3. publish source counts/table, node-wide CountsReady barrier
-4. destination prefix/mblock geometry
-5. homogeneous control warps destination-pull canonical rows ─┐
-6. statically owned FC1 -> SwiGLU -> FC2                 ├─ readiness overlap
-7. Return contribution publication                         ┤
-8. node-wide BeforeCombine barrier + fixed-order Reduce    ┘
-9. clear reusable counters + node-wide AfterClean barrier
+header: sequence, window, token_count, fanout_count, retire_target
+token:  source token / X offset / fanout range
+fanout: destination rank / logical Mblock / row / topk slot / router weight
 ```
 
-实测后选择 destination-pull 的原因：
+source rank 可由 channel 得到，不必在每条 record 重复。fanout 与 X 属于同一次
+Put 的有序 payload；ready signal 是独立的 GIN 控制字段。control 与大 payload
+分离并按实际原子/NIC/TMA 要求对齐，padding 不承载额外协议。
 
-- destination 独占 canonical row 几何和 readiness publication，source 只发布紧凑
-  route id/count，不需要计算 remote row 或对 remote counter 做逐 route 原子更新；
-- row 按 source-rank round-robin 确定排列，相邻 pull warp 自然分散到不同 peer；
-- X 的 source-local symmetric staging 在同一 kernel 开头由原本空闲的 math lanes 完成，
-  替代 MegaMOE 在 graph 外的 input copy，routes/gates 直接从调用方稳定地址读取；
-- control warp 以 `global_warp + round * global_warps` 闭式枚举 row，不需要
-  DispatchTask materialization、queue、claim cursor 或专用 CTA；
-- pull payload 落在本 GPU 后只需 device-scope release/acquire，不再需每行的
-  system-scope payload publication。
+路径和实际地址是：
+
+```text
+source X
+  -> source rail Dispatch TX[peer,lane,slot]
+  -> target rail Dispatch RX[source_node,lane,slot]
+  -> target expert X[x_slot,row,:]
+  -> S[s_slot,row,:] -> C[c_slot,row,:]
+  -> compute node rail Return TX[source_node,lane,slot]
+  -> source rail Return RX[compute_node,lane,slot]
+  -> source contribution[window_slot,token_in_window,topk_slot,:]
+  -> source output[token,:]
+```
+
+same-node Dispatch 直接从源 peer 可达 X pull 到 expert X ring；same-node Return
+直接写 source contribution。返回标识必须能恢复 source window/token/top-k slot。
+
+不能把 Return 唯一的反向映射放在已释放的 X slot：优先从 immutable plan 查询；
+若把必要字段复制到 S/C/packet，它们必须在前一存储释放前完成复制。
+
+### 3.3 内存界限
+
+transient 数据容量由 D_x/D_s/D_c、G/B、channel 数、Q 和 ring depth 决定，
+不随总 token 数 T 增长；通信资源仍随实际 peer 数增长，不声称与节点数无关。
+plan、输入、输出以及训练 checkpoint 的总内存随实际 T/route 数增长。
+
+热点 expert 超出一窗口时分多个窗口完成，而不是要求整次调用的热点 route
+全驻留，也不以 overflow 后丢 token 换取固定容量。资源不足只能准入前报错/OOM
+或等待已有窗口退出，不在主流水里依赖 host 临时扩容。
+
+## 4. 逐 slot 协议与计数
+
+### 4.1 通用规则
+
+每个 slot 的 full/readiness 与 empty/consumed 是不同方向的状态，不能共用一个
+含糊的 done。ready 表示本代数据可读；empty 表示本代所有读者已退休。
+每个逻辑任务固定属于一个 worker，generation 标识代际，完成计数只负责同步，
+不负责分配任务。
+
+变长消费采用以下概念字段（不是已冻结的 C++ ABI）：
+
+```text
+slot persistent state:
+    done_total                    // uint64，消费者累计完成数
+    ready / empty generation      // 按 transport 选择发布机制
+
+generation descriptor:
+    expected_count                // 本代只读工作量，不做运行时原子增长
+    retire_target                 // 该物理 slot 上一代 target + expected_count
+```
+
+唯一发布 owner 维护上一代 target，新 target 与本代描述在 ready 之前发布。
+消费者先 acquire 本代 ready，完成全部异步读取，再 release-add 完成的单位数。
+唯一回收 owner acquire 看到目标达到才发布该代 empty/credit。不同 generation
+不能共享尚未结束的读取；即使 expected=0，也不能跳过本代 ready 判断。
+
+同一个 slot 连续两代 expected 为 7、3 时，done_total 从 0 到 7 再到 10，
+targets 为 7、10，不在换代时清零。跨调用可保持累积；重置只能发生在所有使用者
+及通信请求 drain 后的初始化/重建边界，不能在 graph replay 中与旧操作竞态。
+固定消费数 F 的情形可简化为第 g 代 target=(g+1)×F；不同 profile/F 混用时用累积
+target，不能继续盲用 g×F。
+
+一个 worker 可完成同一 (slot,generation) 的 n 项后只做一次 done+=n；
+同一批涉及多个 slot 时分别记账。只有一个消费 owner 的 slot 可直接发布 empty，
+不为了统一接口强行增加共享计数。跨 GPU 使用合适的 system-scope，同 GPU 用
+device-scope；TMA/网络操作先真正完成，再走对应的 release/acquire 可见性链。
+
+### 4.2 expected_count 的生成步骤
+
+不新增“fragment 引用图”，也不让接收方猜 expected。来源如下：
+
+| 被保护的数据 | expected 的单位与来源 | 谁生成 |
+|---|---|---|
+| Dispatch RX chunk | 本 chunk 所有 token 在目标节点上的有效 fanout 总数 | source 打包 owner |
+| C Mblock | 当前窗口内本 block 的有效 route 行数 | destination geometry owner |
+| Return RX chunk | packet 内完整 contribution 行数 | Return 打包 owner |
+
+Dispatch 在生成 fanout record 的同一遍循环中计数：
+
+```cpp
+expected = 0;
+for (token : packet_tokens) {
+    for (k = 0; k < top_k; ++k) {
+        if (valid(token, k) && node(expert(token, k)) == destination_node) {
+            emit_fanout(token, k);
+            ++expected;
+        }
+    }
+}
+```
+
+并行 packing 时各 warp 求局部数量，再由块内归约交给唯一 owner 写包头。
+已有 offsets 时，expected=Σ(offset[p+1]-offset[p])，p 仅取本 chunk 的 token
+records。三个 token 分别有 2/1/3 个 fanout 时，expected=6，不是 token_count=3。
+
+C block 的 expected 为 `min(M, R[w,e] - block_index*M)`，R 从第 2.2 节实际窗口
+route 列表长度或 prefix 差得到，包括本地和远端 Return 的行。Return packet
+每放入一条完整 contribution 就增加一，最终直接使用包头 rows。
+
+Return fragment 只是一次搬运的一组完整 H 维行，不是计数单位。128 行分成
+40/56/32 三次搬运，就上报 40/56/32；改变分包不改变 expected=128。
+首版不把同一行拆给多个独立列片段任务；若以后这么做，必须重新定义计数单位。
+
+packet fanout 与 fragment 个数在 route/分包规则固定后也能预计算，但 buffer 释放
+不依赖 fragment 个数。channel terminal packet 数仍必须精确计算；它与这里按行的
+retirement 计数是两个概念。所有批量记账都要求静态分区无重叠且完整覆盖。
+
+### 4.3 独立释放点
+
+- Dispatch RX：全部 fanout 的数据和后续所需 metadata 搬走后释放，不等 FC1。
+- X：所有 FC1 N tiles 及训练需要的 X checkpoint 读取结束后释放。
+- S：所有 FC2 N tiles 读取结束后释放。
+- C：所有有效行连同返回标识搬到独立 TX/源 contribution 后释放，不等网络发送。
+- Return RX：全部行 scatter 到 source contribution 并发布 readiness 后释放，不等 Reduce。
+- contribution：对应窗口所有 token 的固定顺序 Reduce 完成后释放。
+- TX：仍按第 6.4 节双重检查，不能把 C 的退休等同于 TX 可复用。
+
+任何阶段的完成都必须包括其异步 TMA/peer 读者；“提交读取”“领取任务”均不是消费结束。
+
+## 5. 单机 ring：pull 与 FC1/FC2 如何接力
+
+参考实现位于本地 DeepGEMM-bk 的
+`deep_gemm/include/deep_gemm/impls/sm90_bf16_mega_moe.cuh`：
+pull 等 l1_empty，TMA store 完成后发布 l1_full，FC1 epilogue 发布 l2_full 并归还
+l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftMoE full arena 误称为 ring。
+
+令一个 X 物理 slot 当前代为 g，完整 Mblock 为 M 行，本 profile 每个 Mblock
+有 F1 个 FC1 逻辑 N tiles、F2 个 FC2 N tiles：
+
+1. 窗口准入已预留 X/S/C。pull 先 acquire X slot 上一代 empty，才写本代行与 gate。
+2. 每个 pull worker 等待 TMA store 完成后 release-add 已落地行数到 X full。
+   尾块有效行 r<M，由唯一指定的尾行 publisher 多加 M-r，使本代仍贡献 M 个 credit。
+   padding credit 不代表执行了虚构 route；计算/epilogue 使用 valid_m。
+3. FC1 TMA producer acquire 等 X full 达 (g+1)×M，才发起该 block 的 GEMM load。
+4. 一个 FC1 N tile 的所有 math warpgroups 完成 S 写回后，发布 S 的该 N tile ready，
+   并向 X empty 累加一个完成单位。一个 task 覆盖多个有效 N tiles 时加实际数量。
+   两个 math warpgroups 合作处理一个 M128 tile，不是各自计一个完整 tile。
+5. X 的全部 F1 项完成后才能覆盖 X。S full 达到本代 F1 项后，FC2 可以读取 S。
+6. FC2 每个有效 N tile 完成后发布 C full、累计 S empty。F2 项完成后允许 Return
+   读取完整 H 维 C 行，同时允许复用 S。
+7. Return 按第 4 节有效行数退休 C；源端按窗口完成 Reduce 并归还 contribution 容量。
+
+这里的 full/empty 是 GM ring 状态，不能与 CTA 内 SMEM TMA stage 的 mbarrier
+混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
+
+training 模式优先让 pull 在发布 X full 前同时完成 saved-X checkpoint；
+FC1 在相应 S slice ready 前完成 saved-G/U 写回。若改成独立 checkpoint reader，
+必须把该读者纳入释放条件，不能仍仅凭 F1/F2 计数覆盖数据。
+
+各 cluster 在准入窗口内静态枚举自己的 FC1/FC2 residue，不引入全局 FC1→FC2
+barrier；某 block 的全部 S 就绪即可开始 FC2。窗口容量/进度约束见第 2.3 节。
+Return 和 Reduce 由固定角色推进，不等整个 invocation 的全部 GEMM。
 
 ## 6. 多机流程
 
 ### 6.0 复审：进度、容量与首版实现边界
 
-2026-09-22 复审发现，原先 6.1–6.3 的 channel ring 方案还缺少三项证明：
+历史第一版因 ring 进度证明不足而采用完整 invocation arena，属于第 0 节的基线，
+不是这次后续实现的目标。必须修正的三个问题仍是：
 
-- 固定 TX owner 阻塞等待 credit 时，必须有独立、始终 resident 的 RX owner
-  继续返回 credit；同一 owner 顺序处理 TX/RX/Return 会形成跨 rank 等待环。
-- `(destination, mblock)` bucket 数不能仅由每个 expert 的总 count 推出。
-  若沿用这种分包，必须交换各 channel 的精确 descriptor 数；不能把 route count
-  除以 chunk size 当作 terminal sequence。
-- NIC 完成读取 TX staging、远端 payload 可见、消费者结束读取 RX staging
-  是三种不同事件；必须明确 ready/credit 的发布顺序及源缓冲区生命周期。
-  逐 slot 复用先保留远端消费 credit 与本地 completion 双重检查，理由与后续
-  简化方向见 6.4；不再无条件断言远端消费 credit 不能覆盖 TX 数据复用确认。
+- TX 等 credit 时不能阻塞负责 RX 消费/返回 credit 的角色。
+- 全局 expert 总 count 不能推出每个窗口、channel、packet 的具体几何。
+- NIC 本地完成、远端 payload ready、所有 RX 读者完成要明确区分发布机制与生命周期。
 
-首版多机 inference 使用完整 invocation arena，取消 activation ring 的复用
-依赖。跨机数据按 source rail 推送一次到目标节点的注册 staging，目标节点再用
-现有静态 destination-pull 填充 canonical rows。这里的 pull 只发生在节点内部。
-每个 source 的 route list 按 expert 紧凑排列，附带 expert prefix/count；不发送
-V3 的 packet/fanout/wave 描述，也不构造动态 work queue。
+新方案用有界窗口和逐 slot full/empty 协议替代阶段级通信 barrier。以下各节是
+待实现方案；旧的完整 X 广播、BeforeCombine 网络阶段不自动继承到新路径。
 
-Return 同样使用独立的 TX/RX arena。FC2 向 source 所在 rail 写紧凑 contribution，
-按目标节点的 expert 区间排布；GIN 只发送该区间的实际 route 数。source 用本次
-route plan 中的 compact index 直接读取返回值，保持现有 `(expert, top-k slot)`
-固定 FP32 combine 顺序。TX 与 RX 不得别名：双向传输可能在对端读完 TX 前覆盖
-相同地址。
+### 6.1 Route-aware Dispatch：每命中节点一份 X
 
-所有 rank 经 GPU collective 确认阶段完成后才复用 arena，因此不需要 ring credit、
-terminal packet 或 task claim。最终版用下一轮 Dispatch barrier 保护 Return TX/RX
-复用，不再额外增加 Combine 后的跨机 barrier；详细复用证明见多机记录。
-首先验证阶段间有明确边界的单 kernel 协议；跨机
-Dispatch/Return 与计算的重叠作为后续独立优化测量，不能宣称首版已经具备这种重叠。
-容量随节点数和公开的 token capacity 推导，循环与 offset 不假设恰好两机。
-不同 source 可有不同实际 token 数，传输长度必须取 source 发布的实际计数。
-pool 的容量、H/I、expert shard 和每节点 rank 数是整个 EP 组的对称合同；
-expert 必须均匀连续分片。实际接收行数由设备计数，超出调用者预留容量时
-集体报错，不要求调用者总是分配 `world * max_tokens * top_k` 行。
-目前硬件只能验证两机；三机以上需要后续实机门禁。
+source 从 top-k routes 得到每个 token 的实际目标节点集合；同一目标节点只放一份 X，
+保留全部 fanout records。未命中的节点既不发 X，也不发无意义的空 data packet。
+节点集合可用不超过 K 项的去重列表，不用写死两节点或 64 节点的 mask。
 
-实现模块：`static_v4/route_plan.cuh` 共享 combine order 和 M128 geometry，
-`destination_pull.cuh` 共享节点内 pull，`initialize.cuh`/`collective.cuh` 共享
-grid/节点内同步；`network_{layout,access,route_exchange,collective}` 只负责
-注册区地址、跨机发布与 GIN 阶段边界。FC1/FC2 静态 wave 和数值 micro-kernel
-仍是同一份实现。每个 GIN context 由唯一 CTA owner 使用，并分别执行 Put fence，
-之后节点内 rank barrier 才允许其他 GPU 消费该 rail 的数据。
+packet 按 (window, destination node, lane) 的固定 token 顺序切分，每包最多 Q 个
+去重 token。一个 packet 可以 fanout 到同节点多个 GPU、expert 和 Mblock；
+不再强制一个 packet 只能覆盖一个 destination Mblock，否则破坏节点级 X 去重。
+这些目标必须属于同一个已准入窗口。
 
-以下 6.1–6.3 保留为后续有界流式传输的设计候选，不作为首版 ring 协议已经完备
-的声明。
+每个 rail/lane 的固定发送 owner：
 
-多机 kernel 与单机共享 route count/count exchange、canonical geometry 和 compute
-scheduler，但不执行单机 symmetric-input copy/route-table publication；remote route
-由 source-side push task 直接携带。transport specialization 如下：
+1. 等相关目的 rank 的窗口准入和 source contribution reservation。
+2. 等物理 TX slot 上一代的远端消费 credit 与本地 Put completion。
+3. 打包 X/route/header，生成 fanout_count 和该 RX slot 的 retire_target。
+4. 等所有 packer 实际写入完成并导入 system visibility，再发一次绑定 ready signal 的 Put。
+5. 按静态 sequence 前进；不使用 channel/task claim CAS。
+
+首版一个 packet 对应一次 Put；若拆成多个 Put，必须先定义覆盖全部 pieces 的
+ready 聚合，不能用最后一个 weak signal 推断其他操作完成。不同 GIN context
+之间没有隐含的顺序。slot ready 使用绑定该 payload 的语义；不靠全网 flush
+建立每包可见性。
+
+跨机走 source rank 对应的同 rail GPU，进入目标节点本地注册 RX。
+节点数循环、offset 和 terminal accounting 参数化；当前 expert 均匀连续分片、
+每节点 rank 数等拓扑约束由公共接口明确校验，不静默假设 world=16。
+
+### 6.2 目标节点 destination-pull
+
+目标 rail RX owner acquire GIN ready 后，向机内读者发布本代 packet 可见性。
+expert GPU 的固定 pull workers 按静态 fanout 分区处理自己拥有的 route：
 
 ```text
-source GPU
-  local route plan
-    ├─ same-node task -> NVLink direct push -> expert GPU canonical row
-    └─ remote task    -> fixed GIN channel pack/push
-                              |
-                              v
-target rail GPU fixed RX owner -> static intra-node relay -> expert GPU row
-                                                           |
-                                                           v
-                                                     FC1 / FC2
-                                                           |
-source contribution <- fixed GIN return channel <- static Return pack/relay
-        |
-        v
-fixed top-k Reduce
+目标 rail RX 的 X/token metadata
+  -> expert GPU X ring 的指定 logical Mblock/row
+  -> X full 行计数
 ```
 
-### 6.1 跨机 Dispatch
+同一 RX slot 可以由多个 GPU 消费，done_total 放在 rail 控制区，使用满足 peer
+访问语义的同步。每个 worker 在实际复制及需要的 metadata 读取结束后按完成
+fanout 数批量累计；ACK owner 等第 4.2 节的 retire_target 后返还该代 credit。
 
-count exchange 后，每个 channel 已知精确的 task 数和 terminal sequence。固定 owner
-按 sequence 顺序：
+不以“最后一个发起 pull 的 warp”代替全部读者完成；ready 的 NIC→rail→peer 可见性
+链必须在实现时明确导入，不能在其他 GPU 上随意读一个普通标志替代 GIN acquire。
 
-1. 等待该 slot 上一代的远端消费 credit 和本地 Put completion，再复用 TX；
-2. 将 descriptor、canonical row、source token/top-k、gate 和 X payload 打包；
-3. `gin.put` 到目标 rail GPU 的同一 channel/sequence；
-4. strong/weak signal 按 NCCL device contract 发布 ready；
-5. 前进到该 owner 的下一个静态 task。
+某个 Mblock 的全部有效行完成即可启动 FC1，不等当前 packet 的其他 fanout、
+本窗口其他 Mblocks，更不等所有远端 Dispatch。后续包可同时被 NIC 接收。
+RX packet 的尾部慢 reader 只背压对应物理 slot，不形成全局已完成前缀。
 
-不存在“哪个 CTA 抢到这个 channel/task”的 CAS，也不需要 End task；terminal
-sequence 已由 route plan 给出。
+多机 pull 的任务遍历以 channel 的 packet sequence 为外层，再静态划分该包的
+fanout；不能机械沿用 expert-major canonical row 的阻塞遍历。否则当前 RX slots
+可能全装着后面 expert 的数据，而所有 pull warps 都在等尚未发进来的前面 expert，
+即使 X/S/C 容量足够也会死锁。共享多个 channel 的 worker 必须继续服务能够释放
+前序 packet 的任务；详见第 6.5 节的独立进度约束。
 
-### 6.2 目标节点 relay
+### 6.3 Return 与 FC2 流水
 
-每个 RX channel 有固定 receive owner。它按 sequence 等 ready，chunk 内的 relay
-warps 按固定 row stripe 工作。由于一个 DispatchTask 只覆盖一个 destination rank
-和一个 destination mblock，relay 完成 chunk 后可用一次 release add 发布该 chunk
-的行数，而不是每行做一次全局 RMW。消费完毕后返回该物理 ring slot 的 credit。
+Return 不恢复 V3 的运行时 append/claim queue。固定 owner 从 immutable plan 的
+route/mblock 列表枚举，按 (window, source rank, lane) 分包；一个 packet 可跨多个
+已准入的 C Mblocks，但不跨窗口。它等待自己实际覆盖的完整 C 行就绪，不等节点
+内所有 FC2。首版每行等待其 Mblock 的全部 FC2 N tiles 完成，不做列片段 Return。
 
-same-node Dispatch 和 cross-node relay 都写同一 canonical row arena，并累加同一组
-`x_arrived[mblock, source/channel]`；compute 不需要知道一行来自 NVLink 还是 GIN。
+- same-node：静态 worker 将完整 C 行写入 source contribution 并发布 route-ready。
+- remote：worker 把完整行及返回标识复制到目标 source rail 的独立 Return TX；
+  pack 完成后按贡献的行数退休各 C slot。
+- TX owner 等本 packet 所有行可见后 GIN Put；math 继续处理其他 Mblocks。
+- source RX owner 收到 ready，按窗口/token/top-k slot scatter 到 contribution，
+  完成复制和 readiness publication 后返还 RX credit。
+- source Reduce 等该 token 的所有有效 contribution，按现有固定顺序求和。
+  contribution 窗口在全部 token Reduce 完成后才能复用。
 
-### 6.3 Return
-
-Return 不再由 FC2 epilogue向 append-only queue 发布 descriptor。固定 Return owner
-从 canonical header/mblock 枚举其任务，等待相应 `y_ready[mblock]`：
-
-- same-node contribution 直接 NVLink push 到 source 的
-  `[token, topk_slot]`；
-- remote contribution 由固定 return channel owner 按 sequence 打包并 GIN push；
-- source RX 写 contribution 后 release-publish route epoch；
-- Reduce worker 等本 token 的有效 route epochs 后，按 top-k slot 固定顺序求和。
+Return RX 不需要等 Reduce，Return TX 不需要持有 C 原址到网络完成。
+不能为了沿用“全 Return 到齐后 Reduce”而持有一个无限长调用的全部 contribution；
+在有界方案里至多按已预留的有限窗口批量 Reduce。Return/Reduce 的更细重叠可独立
+消融，但不能破坏窗口回收进度。
 
 ### 6.4 逐 slot 复用决策（2026-09-23，待实现）
 
-Dispatch 与 Return 的有界 ring 首版均采用保守方案：覆盖 TX slot 之前，同时
-确认该 slot 上一代的远端消费 credit 和本地 Put completion。这里的“本地
-credit”使用 GIN 本地 completion counter，不增加一轮跨机 ACK；计数目标必须
-对应同一 slot 的上一代 Put，不能用其他 slot 的完成替代。
-
-远端先 acquire 该次 Put 绑定的 ready，待所有 RX 消费者的实际读取完成
-（包括异步 TMA/NVLink 读取）后，再回传对应代的 credit，不能在任务领用或
-读取提交时提前释放。
-
-保留的优化点：若一个 TX slot 只对应一次 Put 和一个 RX slot，远端完成消费
-后回传 credit 的因果链已包含该次 payload 的传输；这不等于本地 completion
-counter 必然已更新。先保留双重检查，不将其当作两项独立且必需的数据依赖。
-预计本地检查开销较低，但尚未做消融；后续核对所用 GIN 后端的源缓冲区生命周期
-契约，再测量是否值得去掉热路径本地检查。
-
-简化时仍需分别处理共享 TX 的多目标发送、TX/RX 解耦后的提前 TX 回收，以及
-通信收尾的请求资源 drain。这项决策针对未来 ring 路径，不表示当前完整
-invocation arena 已改为 ring。
-
-## 7. Notify 与 main 的融合边界
-
-### 7.1 Inference
-
-只有一次 kernel launch。kernel 内部的 `grid.sync()` 和 EP/LSA/Gin barrier 表达：
+Dispatch/Return TX 覆盖前均保留：
 
 ```text
-RouteCountComplete
-  -> CountsReady（所有 rank 的 count matrix 可见）
-  -> PlanFrozen（本 rank prefix/task descriptors 完成）
-  -> Main phase
+上一代远端消费 credit 已返回
+AND
+本 slot 上一代 Put 的本地 completion 已达到
 ```
 
-`CountsReady` 是 invocation 内 GPU-side barrier，不是 CPU `handle.wait()`。main phase
-的 TMA/math warp 在此之前只可初始化 shared barrier/TMA descriptor 等不依赖 route
-的数据，不得读取未完成的 count/route plan。
+“本地 credit”指 GIN 本地 completion counter，不额外增加一轮跨机 ACK。
+completion 目标绑定本 slot 的实际 Put，不拿另一 slot 或另一个 context 的完成替代。
 
-hot path 不做 D2H status copy、不读取 incoming row 数、不申请显存。错误写入 device
-status，并以 collective-safe 的方式让所有 rank 进入相同 barrier/terminal 路径；
-同步 API 或 debug 模式再把错误带回 host。
+对于一份 TX、一次 Put、一份 RX，消费后返回 credit 的因果链已经包含该 payload
+的传输；但不代表本地 completion counter 此刻必然更新。先采用保守双检查，
+不把它描述为两个在数据依赖上必然独立的必要条件。
 
-需要保存中间激活的 training Forward 不走这条单-launch 路径，而是使用第 8 节的
-plan/allocate/main 边界。
+预计本地检查开销较低，尚未测量。后续核对具体 GIN 后端的源缓冲区生命周期契约，
+再独立消融是否值得删除热路径检查；共享 TX 的多目标发送、提前 TX 回收和通信
+资源 drain 需要另外处理。本轮不把这个优化作为 ring 实现的前置条件。
 
-### 7.2 PDL 的准确定位
+### 6.5 静态角色与 barrier 边界
 
-PDL 可以让 fused MoE kernel 在前驱 kernel 尚未完全结束时被调度，并先初始化与
-输入无关的 shared/barrier 状态；第一次读取 `routes/x/gates` 前仍必须执行
-`cudaGridDependencySynchronize()`。这只是 launch-overhead/前驱尾部优化，不能替代
-本 kernel 内的 CountsReady barrier。
+Dispatch TX、Dispatch RX/pull、Return packing/TX、Return RX/credit、Reduce、
+math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实测决定；
+不能在一个阻塞的串行函数中先做完全部 TX 才服务 RX/Return。
 
-Inference 中 Notify 已经融合，不再存在“用 PDL 让 main 提前越过 Notify”的需求。
-Training 的 main 又依赖 host 新分配的指针，因此也不能提前 launch。
+各个有依赖的消费者必须能常驻并推进。同一个 owner 管多个 channel 时，只能使用
+非阻塞 progress 或证明无环的固定处理顺序，不能等待一个后续 channel 而停止
+服务仍被前序窗口依赖的 channel。角色间不插入会把消费者一起挂住的全 CTA barrier。
 
-## 8. 保存中间激活时的内存策略
+保留的同步边界：
 
-### 8.1 唯一路径：memory-tight plan/allocate/main
+| 边界 | 粒度与触发 |
+|---|---|
+| PlanReady | 路由/窗口目录完成后的控制面 exchange；main 前发布 |
+| 窗口准入 | 相关 source/destination 的有限容量 credit，不是全节点 collective |
+| data ready / consumed | 每物理 slot、每代；Mblock full 或 packet credit |
+| SMEM stage | CTA/cluster 内 TMA/WGMMA 消费者的 barrier |
+| invocation 结束 | 所有静态 task/route 完成，GIN 请求及 credit drain，必要的终态一致性 |
+
+禁止沿用“所有 Dispatch Put 后一次全节点 barrier，再开始 FC1”和“全部 FC2 后
+统一 Return”的主流程。终端 drain 不得提前放到每个 packet/window 的 hot path。
+
+## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
+
+### 7.1 两种 GM 布局和计算路径
+
+每个 expert 原始 W1 为 BF16 `[2I,H]`，H 连续；逻辑计算是 X 乘 W1 的转置：
+
+```text
+G_i = BF16(dot(X, W_gate[i,:]))
+U_i = BF16(dot(X, W_up[i,:]))
+S_i = BF16(SiLU(float(G_i)) * float(U_i) * router_weight)
+```
+
+V3-style separated：GM 行顺序为全部 gate I 行，然后全部 up I 行。
+每个 FC1 任务覆盖 N_s 个 S 输出通道，共享 X，分别加载 gate/up B，
+用两组 accumulator；现有实现 gate WGMMA 可先于 up TMA 全部完成开始。
+
+V4-style interleaved：仍保持每个 H 维权重行连续，但行顺序为
+`G0..7,U0..7,G8..15,U8..15,...`。p=0 表示 gate，p=1 表示 up：
+
+```text
+separated_row = p*I + i
+packed_row    = (i/8)*16 + p*8 + i%8
+address       = W1_base + (expert*2I + row)*H + h
+```
+
+上述映射描述当前按 8 通道分组的支持形状；扩展不整除尾部时必须显式处理 padding。
+interleaved 一组 packed B/accumulator 计算两投影，物理 GEMM N 只产生 N/2 列 S。
+它不减少 FLOPs。separated 的 N128 与 packed 的 N128 不是同样的有效输出宽度：
+I512 时分别需要 4 与 8 个 FC1 N tiles；当前 packed N64 则需 16 个。
+
+S 统一存成标准 `[M,I]`，FC2 不感知 W1 布局。ring 的 F1/ready 目标从所选
+profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一长度，不能先断言
+“decode 用 packed、prefill 用 separated”。
+
+### 7.2 必做的独立实验
+
+把布局视为计算路径的独立变量，先隔离 GEMM，再验证端到端；不和 ring 改造捆绑
+归因。独立 benchmark 使用已在本 GPU 的 canonical X、同一组权重、router weight，
+相同 Mblock/valid_m 分布，无 Dispatch/GIN/Return：
+
+1. 分别重放 1/64 和 8192/20480 tokens/rank 所产生的 expert 行数/尾块分布，
+   包含 balanced 与热点样本；不能只跑大矩阵后推断 decode。
+2. 比较 separated 双投影和 interleaved 单 packed 投影，至少报告
+   FC1+SwiGLU，以及固定 FC2 下的 FC1+SwiGLU+FC2。
+3. 先做受控对照：相同 M/K、精度、K 累加次序、有效 S 输出宽度、cluster 策略，
+   尽可能匹配 stage/epilogue；记录布局必需的数据流、资源或指令形状差异。
+   不能仅把两个实现的 N 宏设成一样就称为等粒度比较。
+4. 再分别调 N/K/stages/有效 task 粒度，报告两种布局各自的最佳可行配置；
+   “布局本身的差异”和“布局加各自调优后的差异”分开记录。
+5. 核心固定 1620 MHz，检查实际时钟；记录延迟、register/spill、SMEM/occupancy、
+   TMA/WGMMA stall 和有效吞吐，不用操作数大小推测胜负。
+6. 权重 packing/descriptor 建立在计时前完成；另外报告转换耗时、额外权重副本内存、
+   生命周期和更新/失效成本，不把一次性 packing 混进 steady-state GEMM。
+7. 根据结果分别选择 decode/prefill profile。若选不同布局，明确同时持有两份
+   权重的内存代价，训练权重更新后不能使用旧 packed 副本。
+8. 在相同通信协议下回测 EP8/EP16 全矩阵，验证 profile 选择及阈值；真实 workload
+   边界样本用于校准，不盲用当前 8192 阈值。无新实测前不填优化收益。
+
+输入 token 数只是选 profile 的代理，expert 实际行数与 skew 也影响 GEMM。
+若使用设备 plan 的计数选 entry，选择必须在静态任务/计数目标发布前固定，
+不能让同一 block 的消费者对 F1/布局有不同理解，也不能增加 host 读回同步。
+
+### 7.3 数值和 TMA 约束
+
+- FP32 accumulator；G/U 各自先 BF16，再以 FP32 做 SiLU、乘 up 和 router weight，
+  然后 S round BF16；FC2 输出 BF16，source 固定顺序 FP32 combine 后 BF16。
+- router weight 不是 W_gate；不能把它移到 FC2 之后。
+- tile、stage、布局是待调参数，不再沿用“TileN/TileK 必须永远不变”的旧约束。
+  保持相同运算次序的受控比较检查 bitwise；若候选改变归约次序，明确标注并走
+  独立 PyTorch 误差门禁，不能把数值差异藏在性能结果里。
+- 当前 cluster multicast 分享 A，保持两 CTA 的 stage 读者生命周期。将来若消融
+  share-B pairing，单独证明 GM/SMEM ring 与 epilogue staging 的安全性。
+- 已迁移的 FC1/FC2 合并写回、CTA 私有 B staging 要在两种布局下复用/验证；
+  不恢复不安全的 multicast A arena epilogue 复用。
+
+## 8. Prefill/training 的保存与 no-drop 合同
+
+prefill inference 与 training Forward 共用有界流水，但训练保存实际规模的 tape，
+不是在 ring 中留住整次调用的激活。当前 training 仍走 V3；迁移计划如下：
 
 ```text
 route_plan_kernel
-  -> stable source_slot + count exchange
-  -> canonical prefix / exact R_actual / exact P_actual
-  -> immutable DispatchTask/compute geometry
-  -> 不发送 activation payload
+  -> stable route ordinal / 窗口计数 / count exchange / 精确 R_actual、P_actual
+  -> 冻结 main 与 Backward 共用的 plan；此时不发 activation payload
 
 host allocation boundary
-  -> 只读取本 rank R_actual/P_actual 和 collective status
-  -> framework allocator 分配 canonical arena 与 saved tensors
+  -> 取得本 rank 实际 tape 大小及 collective status
+  -> 分配 saved tensors / plan lease；失败则在 main 前一致报错
 
-main_from_plan_kernel
-  -> consume exact same plan; 不重复 route counting/exchange
-  -> source-push / FC1 / FC2 / Return / Reduce
-  -> 保存 X/A/B/gate/header/plan
+main_from_plan
+  -> 复用原 plan，不重复 route counting/exchange
+  -> bounded Dispatch / X / S / C / Return / contribution 流水
+  -> 保存独立的 X/G/U、gate 与返回映射
+
+Backward
+  -> 消费该 Forward 的精确 plan/tape
+  -> 固定逻辑行顺序和梯度归约合同
 ```
 
-这条路径保留 kernel 间 host allocation boundary，不能宣称为低延迟 fused path。
-它是所有 `retain_backward_state=true` 调用的固定语义，不是 overflow fallback，也不
-用于 SGLang inference。
+saved tensors 根据实际 R_actual 或所需的 padded P_actual 分配；transient X/S/C
+仍是固定深度 ring，不重新申请完整 training canonical arena。稀疏/极端路由
+不需要每个 rank 都预留 world×max_tokens×K 行激活。
 
-每个 live Forward tape 持有自己实际大小的 tensor allocation 和 immutable plan
-lease，直到 Backward 完成才释放。runtime 可以限制同时存活的 tape 数，但达到限制
-时只能等待或返回 `ResourceExhausted`，不能覆盖旧 tape。只有显式 allocator OOM
-可以使整个 invocation 失败；不存在“继续运行但少算一部分 route”的状态。
+tape 的永久逻辑行号与物理 ring slot 分开。若 tape 沿用全局 expert/source 顺序，
+而执行按 window 顺序，必须保存明确映射；不能把 window 内 padded row 当成现有
+Backward 的 canonical row。G/U 可保存标准逻辑布局，使 Backward 不依赖 FC1
+选择 separated 还是 packed。dW 跨 M 归约的确定性需要单独验证，Forward 数值
+一致并不自动保证梯度归约一致。
 
-plan scratch 只依赖本 rank 调用时已经知道的 `T_local*K`、固定 expert/world count
-matrix 和少量 prefix/task 上界；它不需要预知其它 rank 的最大 token 数。各 rank
-实际 token 数随 count exchange 一并成为本 invocation plan 的一部分。
+每个 live tape 持有独立 allocation/plan lease，直到 Backward 完成。资源不足可
+等待或显式失败，不能覆盖尚未消费的 tape。输入/输出/plan/tape 真正 OOM 时允许
+整个调用失败；“不丢 token”不是承诺任意总规模都可在有限显存内训练。
 
-### 8.2 为什么这条路径不使用 PDL
+需要 host 分配的 plan/allocate/main 不是单 kernel，也不承诺整体 CUDA Graph。
+PDL 不能替代动态地址的分配依赖，本轮不加入 pointer-mailbox 或运行中 host 扩容。
 
-main kernel 的 launch arguments 必须在 launch 时已有有效的 saved-buffer pointer。
-若先 launch 一个常驻 main kernel，再让它等待 host 分配并写入 device pointer slot：
+## 9. 模块划分与复用
 
-- host 仍需等待 planning 结果；
-- 等待中的 cooperative kernel 会占住 SM，容易阻塞负责发布依赖的工作；
-- launch 参数/graph node 不能在运行中安全改写；
-- allocator、stream ordering、失败传播和 graph capture 都更复杂。
+基于现有 `src/cuda/static_v4/` 演进，不新建一份 V3 GEMM。拟划分的职责如下，
+具体文件名以实施时最小改动为准；此表不是声称这些模块均已存在：
 
-除非未来引入预留稳定 VA、预先映射的 memory pool——本质上又回到最坏容量预分配——
-否则 PDL 对这个 allocation dependency 没有帮助。因此 V4 不实现半融合的
-pointer-mailbox 方案。
+| 职责 | 复用/修改方向 |
+|---|---|
+| route/窗口几何 | 扩展 route_plan；共用 source identity、logical row、combine order |
+| slot 协议 | 独立的小型 generation/full/empty helper，与 GIN 传输 API 分离 |
+| 节点内搬运 | destination_pull 与返回完整行复制共用 TMA/peer copy primitive |
+| 网络布局/访问 | network_layout/access：TX/RX 四区、控制字段、peer/lane offset |
+| 网络进度 | 独立的 Dispatch TX/RX、Return TX/RX 固定 owner，不夹带 math task claim |
+| 数值计算 | 现有 WGMMA/TMA/epilogue 参数化布局/profile，共享 BF16 合同 |
+| 生命周期 | initialize/finalize 管理 invocation 与 drain，不在逐行路径加入全局状态机 |
+| training | StableTape、实际分配及 Backward adapter，与 inference 快路径分开 |
 
-## 9. Buffer 与生命周期
+单机 specialization 不编入无用 GIN 路径；decode/prefill 分离配置和必要的编译期
+entry，但共享路由、ring 和 Return 协议。不能让 layout/profile 分支复制通信栈。
 
-V4 将长期资源分为：
+静态 worker 编号由 CTA/cluster/warp 及 round 推导；旋转 residue、owner 私有
+小窗口 lookahead 可后续独立消融，不恢复跨 worker steal。GIN context 有唯一
+提交 owner；按实际角色需要分配 context，不把整个 CTA 数无条件乘到所有资源上。
 
-| 资源 | 生命周期 | 是否对称/注册 |
-|---|---|---|
-| count exchange、epoch、readiness | runtime capacity 生命周期 | 单机 peer-mapped；多机控制区注册 |
-| SourceRoute、DispatchTask、prefix plan | Forward/Backward plan lease | 本地；按本次 local routes/geometry |
-| inference canonical X/S/output arena | inference invocation slot | peer 可达；遵守 inference capacity/graph 合同 |
-| training canonical X/S/output arena | Forward tape 生命周期 | plan 后按本 rank `P_actual` 精确分配并建立 peer mapping |
-| GIN TX/RX ring 与 credit | runtime capacity 生命周期 | NCCL registered |
-| contribution `[T_local,K,H]` 与 route epochs | invocation/tape | source peer/GIN 可达；local shape 已知 |
-| saved X/A/B/gate/header | Backward 完成前 | training-only；按 `R_actual/P_actual` |
+## 10. Invocation、Graph 与复用边界
 
-第一版静态 scheduler **继续使用完整 canonical X/S arena**：inference 使用其既有
-capacity slot，training 在 plan 后按实际几何申请。
-这样能先把 queue/claim/Notify 变量与 ring-reuse 变量分开，避免一次重构同时引入
-source-push 的 ring deadlock。待静态 full-arena 路径达到性能与正确性目标后，再做
-独立消融：
+“调用”指一次 MoE Forward invocation，例如模型中的一层或一次 graph replay 中
+的一次该层执行；不是一个 packet、window、CUDA CTA 或服务端 request。
+一次调用内部含许多 ring generations。
 
-- 单机 inference 把 X/S 换成 generation-tagged Mblock ring；
-- transport task 必须按 logical mblock generation 单调推进，并显式等待 empty credit；
-- training saved_x/saved_ab 仍是完整 tape，不随 transient ring 覆盖；
-- 多机只有在有完整的 channel/window backpressure 证明后才启用 canonical ring。
+- 同一 EP 组按相同次序调用，runtime workspace 依靠 stream/graph dependency 串行复用。
+  多 workspace 不自动意味着多 stream 的 GIN 并发安全；本轮不扩展该语义。
+- ring 的 g 是该物理 slot 的累积代号；逻辑分配序号跨调用保留或加正确的 base。
+  不能在每次调用把 block 序号重置为零，同时继续使用未归零的 full/empty targets。
+- invocation 完成前确认输入读者、所有 Return、Reduce 和 GIN 请求/credit 已 drain。
+  下一次调用不能覆盖仍被前次异步操作使用的 payload、metadata 或 control。
+- Graph 使用稳定地址，routes/gates 可在输入和 plan workspace 合同内改变；
+  transient ring 容量不要求容纳 graph 的全部 route。plan/control 本身仍需要
+  与 graph 输入规模匹配的容量，不能以 graph capture 为理由忽略元数据容量。
+- Eager prepare 或训练 plan 后可以分配实际输入/plan/tape；steady-state inference
+  main 内不 cudaMalloc，不 D2H 读 count，不让 host 参与逐窗口推进。
+- 只在完全 quiescent 的初始化/重建中 reset 累计状态；Graph、不同模型层共用
+  workspace、profile 切换必须沿用同一生命周期合同。
 
-因此“借鉴 MegaMOE 的 persistent buffer”在 V4.0 中体现为 inference 固定地址、
-epoch 复用和简单 full/ready counter；training 的 saved tensors 则明确保持动态
-实际尺寸。物理 Mblock ring 是后续正交优化，不与本次 scheduler 重构绑死。所有
-arena 的 correctness capacity 遵守第 3.2 节，不能通过 drop 换取固定显存。
+## 11. 实现待办与 commit 里程碑
 
-## 10. Kernel specialization 与代码组织
+每个 milestone 完成并验证后提交一次 commit，同时更新对应优化记录。只记录
+实际完成的代码和测量，未实现项保持未勾选。以下顺序不是要求 GEMM 消融等待网络：
+M5 与协议实现正交，可在冻结基线后提前做，但不把两者收益混为一项。
 
-当前 V4 控制面独立组织如下，数值主体复用既有模板：
+### M0：设计与基线整理（本次文档工作）
 
-```text
-src/cuda/static_v4/
-  contract.cuh                    # route/header 合同
-  memory_order.cuh                # 单向 release/acquire PTX primitives
-  initialize.cuh                  # 共享 invocation/pool 初始化
-  route_plan.cuh                  # 共享 combine order/M128 geometry
-  collective.cuh                  # grid/节点内 barrier 与 cleanup
-  single_node_route_exchange.cuh  # fused count/table/X staging
-  destination_pull.cuh            # 两种拓扑共享的节点内 pull
-  network_layout.hpp              # 注册区布局与静态 context 上限
-  network_access.cuh              # source rail/紧凑 Return 地址
-  network_route_exchange.cuh      # expert 排序与跨机 Dispatch
-  network_collective.cuh          # context-owned GIN put/fence/Return
-  fc2_epilogue.cuh                # FC2 contribution publication
-  single_node_finalize.cuh        # reduce/finalize
-```
+- [x] 区分已实现 full-arena 基线与待实现 ring，统一节点内 pull、节点去重及流水目标。
+- [x] 明确窗口准入、各 buffer 的独立生命周期、expected_count 来源及双 credit 决策。
+- [x] 列出 gate/up 独立消融、实现 milestones、1620 MHz EP8/EP16 测量要求。
+- [x] 保留历史实验记录，不把文档修改记为性能收益。
 
-GEMM 与静态 FC1/FC2 task 枚举仍复用 `persistent_v3/forward` 中的数值主体，
-通过 `StaticSchedule` 编译期分支移除 V3 queue/cancellation hot path，不复制一份 GEMM。
+### M1：冻结可执行的 plan、布局与进度合同
 
-Host 侧复用 capacity-based pool 和 `TensorRuntime`。`DeviceDispatchHandle` 在
-eager/graph preparation 期间提供容量和地址合同；graph replay 不构造 handle，
-也不执行 CPU Notify 或 `handle.wait()`。V3 保留为训练和显式 fallback。
+- [ ] 定义窗口编号、实际窗口/expert counts、逻辑 Mblock、source contribution 映射，
+      以及 packet-sequence 优先的接收侧静态任务目录。
+- [ ] 冻结 packet/token/fanout 及 Return 行枚举，生成精确 channel packet 数和
+      expected/retire targets；明确哪些目录存储、哪些闭式计算。
+- [ ] 定义各 plane 的 GM 地址、slot 控制字段、GIN VA signal/local counter 分工和初始化。
+- [ ] 实现准入/退休账本；画出最小等待依赖图，确认最老窗口的所有消费者可驻留推进。
+- [ ] 用少量 host/device 共用枚举检查证明覆盖、无重复、no-drop 与 tail 计数，
+      不为每个字段建立大量无意义单测。
+- [ ] 冻结 V3、当前 V4 构建/config/hash 和重测脚本，作为后续逐步对照。
 
-单机/多机在同一聚合 translation unit 中实例化为不同 kernel，使用
-`StaticLocal`/`StaticSchedule` 在编译期消除无关 transport 分支；不是运行时
-切换同一 kernel 的 GIN 状态。`RetainBackwardState` 保持训练数值主体的复用。
+### M2：单机 X/S/C 与 contribution ring
 
-## 11. 与 CUDA Graph、slot 和并发 invocation 的关系
+- [ ] 接入 destination-pull → X full、FC1 → S full/X empty、FC2 → C full/S empty。
+- [ ] 接入按完整行的 Return/C retirement 和窗口内 Reduce/contribution 释放。
+- [ ] 保持 reverse metadata 不依赖已释放 X；验证 multicast/epilogue stage 生命周期。
+- [ ] 用小 ring 深度、多代 wrap、热点 expert 和 tail 暴露错误的复用与容量依赖。
+- [ ] 单机 EP8 四规模 eager/graph 正确性与 1620 MHz 性能，记录 full arena→ring 的
+      独立变化及实际峰值显存；不以更多常驻显存伪装有界流水。
 
-- 同一 framework stream 上模型逐层执行时，一个 invocation slot 可依靠 stream
-  serialization 安全复用，不需要 CPU 等上一层 `handle.wait()`。
-- Inference Graph replay 使用固定 slot 地址和递增/graph-local epoch；routes 和实际
-  counts 可在 inference capacity 内变化。memory-tight training 不支持把
-  plan/host-allocation/main 整体捕获进 CUDA Graph。
-- 当前 V4 要求整个 EP 组以相同次序串行调用；两个 slot 不代表多 stream 并发
-  已经安全。未来并发不仅要隔离 SourceRoute/canonical/readiness，还必须隔离
-  GIN context/barrier 状态并证明跨 rank 的 launch 进度；不在本轮支持范围内。
-- inference slot 是 runtime 预分配的 invocation workspace；training tape 是 plan 后
-  按实际尺寸分配的独立 lease。二者都不是 FC1/FC2 ring slot 或 SGLang request slot。
-- slot 复用通过 CUDA event/stream dependency 或 graph 固定依赖表达；host 仅在所有
-  slot 都被真正并发占用时才需要等待，不在每层无条件同步。
+### M3：多机 route-aware Dispatch 与节点内 pull/FC 重叠
 
-## 12. 实施顺序
+- [ ] 实现按目标节点去重的 packet，未命中节点不发送 X，支持参数化 peer 数。
+- [ ] 接入分离 TX/RX ring、固定 GIN owner、ready 可见性链、fanout 完成及双重 credit。
+- [ ] 实现跨节点窗口准入；RX/pull/credit 的进度不受阻塞 TX owner 影响。
+- [ ] 移除 data-plane Dispatch 全节点 barrier，验证 NIC 接收、节点内 pull、FC 时间线重叠。
+- [ ] EP16 四规模和边界路由通过；若过渡阶段仍保留完整 Return arena，明确标为
+      临时路径，不能在此宣称全部多机有界流水完成。
 
-### Phase A：冻结合同和可观测性
+### M4：多机 Return/C 回收与端到端流水
 
-1. 给 V3 增加统一 stage timing/counter，保留当前结果作基线。
-2. 写 host/device 共用的 row/task 枚举器单元测试。
-3. 固定数值合同测试：N/K tile、rounding、top-k reduction、masked/duplicate route。
+- [ ] 从静态 C/route 目录打包，按完整行退休 C；不引入 fragment 引用图或 append queue。
+- [ ] Return TX/RX 与 Dispatch 独立；source RX scatter 后归还 credit，Reduce 后释放窗口。
+- [ ] 移除节点级 FC2→Return barrier，确认 Return 与其他 Mblocks 的 FC1/FC2 重叠。
+- [ ] 完成所有 channel 的 terminal/drain、跨调用/Graph 状态复用。
+- [ ] EP8/EP16 全矩阵、热点与小深度 wrap 通过；记录 Dispatch 和 Return 各步收益及
+      资源变化。协议支持任意有效节点拓扑，实机仍只声明两机验证。
 
-### Phase B：单机 inference V4
+### M5：长短序列 gate/up 与 GEMM 独立消融
 
-1. 独立验证简化 route plan 与 canonical row。
-2. 用完整 arena 实现 fused route/count/静态 source-push，不接 GEMM，验证每行/header。
-3. 接入静态 FC1/FC2 pair scheduler，先关闭 overlap，再逐个打开 Dispatch/FC1/FC2/
-   Return/Reduce overlap。
-4. 删除 V4 路径中的 FC1/FC2/Reduce queue 与 claim cursor。
-5. 对 DispatchChunkRows、comm warp 数、mblock readiness 批量粒度做 autotune。
+- [ ] 建立第 7.2 节纯 GEMM 基准，固定输入/权重/route 分布、时钟和数值参考。
+- [ ] 做等有效 S 宽度的 separated/interleaved 受控对照，核对逻辑 N tiles 及计数目标。
+- [ ] 分别调优两种布局的 N/K/stages/epilogue，保留失败候选和资源/误差原因。
+- [ ] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。
+- [ ] 在同一通信版本回测 EP8/EP16 四规模；把纯 GEMM 收益和端到端收益分别落表。
 
-### Phase C：多机 inference V4
+### M6：训练 Forward tape 与 Backward 对接
 
-1. 静态 GIN send channel ownership；
-2. 静态 RX/relay ownership 与精确 terminal sequence；
-3. 静态 Return；
-4. 加入 skew、慢 channel、ring wrap 和故障注入测试；
-5. 确认无跨机 pull fallback。
+- [ ] StableTape plan、按实际规模分配、main_from_plan 复用同一 plan。
+- [ ] checkpoint 写出纳入 slot 生命周期，Backward 不依赖已覆盖的 transient 数据。
+- [ ] 对齐 tape 行号、G/U 布局、固定 dW reduction 顺序；实现必要的 Backward adapter。
+- [ ] Forward/Backward 参考校验、热点长序列、多个 live tapes 生命周期及 OOM 一致失败。
+- [ ] 完成后再标注 training V4 支持；此前继续保留已验证的 V3 训练路径。
 
-### Phase D：training tape
+### 后续独立优化，不作为首版阻塞项
 
-1. `StableTape` source slot；
-2. 实现 `route_plan_kernel` 和精确 `R_actual/P_actual` host allocation；
-3. 实现 `main_from_plan`，证明不会重复 route counting/exchange；
-4. Backward 持有并消费精确 Forward plan/tensors。
+- [ ] 在后端契约确认后消融去掉 TX 热路径本地 completion 检查。
+- [ ] 非一一绑定 TX/RX 的提前 TX 回收，仅在收益值得额外状态时引入。
+- [ ] ring depth、Q、G/B、lane 数、comm warp 配额、owner 私有 lookahead。
+- [ ] Return/Reduce 更细粒度 overlap；不改变已有数值顺序或打破有界窗口回收。
 
-### Phase E：独立优化
+## 12. 验收与实验记录要求
 
-1. static-owner 小窗口 ready lookahead；
-2. single-node Mblock ring；
-3. specialized epilogue；
-4. task/channel/wave autotune。
+### 12.1 正确性与进度
 
-## 13. 测试与验收门禁
+复用已有测试入口和 PyTorch 数值参考，补充能暴露本次协议风险的少量场景：
 
-### 正确性
+- 主矩阵：EP8=单机 8 GPU，EP16=双机各 8 GPU；T=1/64/8192/20480 per rank。
+  2×4 EP8 只能作额外实验，不能替代单机 EP8。
+- balanced、全部合法 route 指向同一 expert/rank、重复 expert、masked route、
+  不等长/空 rank、tail Mblock、无远端命中、一个 token 在某节点命中多个 expert。
+  非法 expert id 与合法 masked route 区分，不能把错误输入静默当成 drop。
+- 小深度多次 ring wrap、变长 fanout、Return packet 跨 C slots、故意延迟某个
+  RX reader/Return owner，验证 slot 退休不误用全局完成前缀。
+- Graph routes/gates/inputs 变化、混合 profile、双层共享 workspace、连续 eager/graph
+  调用；当前空输入 graph 的 pool 限制需明确处理或报告，不能冒充已通过。
+- 每条有效 route 恰好执行/Return/combine 一次；独立于 packet 分片策略和 worker 数。
+  同步正确性不只看最终 hash，还检查 no-drop、各代 target 和 drain。
+- 任意节点数的枚举/offset 做小型模拟校验；三机以上性能和通信进度待实机验证。
+- 不将外部 NIC 故障等价为普通 backpressure；错误终止复用 runtime 的协同 abort
+  合同，不在每行 hot path 添加无依据的 system-scope 防御性轮询。
 
-- EP1/2/4/8 单机，至少 EP16 两机；
-- token `1/2/64/128/2048`，balanced、单 expert 极端 skew、空 expert；
-- duplicate expert、masked route、tail Mblock、不同 gate；
-- 所有 route 压到一个 rank/一个 expert 时不得 drop；容量不足只能触发 collective
-  grow fallback 或显式 OOM；
-- 与当前 WeftMoE reference 对齐；同一数值合同下检查 bitwise FWD，training 检查
-  tape/Backward row plan 和梯度；
-- generation wrap、slot reuse、GIN ring wrap、任意 rank error 均不得 deadlock；
-- compute/relay/GIN owner 数变化后每个 task 恰好执行一次。
+### 12.2 性能与归因
 
-### 热路径约束
+所有 GPU 核心固定 1620 MHz 并采样核实实际 SM/graphics 时钟，不使用无法维持的
+1980 MHz。固定/记录其他环境、显存时钟与工作负载，正式计时不并发运行编译或其他
+GPU 测试。沿用 graph CUDA-event rank-max p50，报告 warmup、sample 数和 replay batch。
 
-- inference 一次 forward 只 launch 一个主 kernel；允许框架自身的输入/output event，
-  不允许 Notify->main 的 host wait；
-- steady state 无 `cudaMalloc/cudaFree`、无 D2H count/status、无 CPU spin；
-- V4 kernel 中不存在 FC1/FC2/Return/Reduce work-claim atomic；
-- readiness atomic 数量按 mblock/chunk 计，而不是无条件按 row 计；
-- CUDA Graph 内 routes 可变但不越 capacity。
+每个性能 milestone 至少记录：
 
-### 性能消融
+- commit、binary/config hash、拓扑、H/I/E/K、实际输入与路由分布、时钟；
+- 修改前后交错 A/B（反转顺序），以及同条件 V3 对照；历史 V3 非本轮重测必须标明；
+- kernel 端到端、可解释的 stage/timeline、峰值显存与协议计数开销；
+- 已通过的数值门禁、失败候选、未测部分及是否为多项组合收益。
 
-必须分别报告 kernel 内 stage 和端到端，不只看总时间：
+gate/up、GEMM tile/epilogue、网络节点去重、Dispatch overlap、Return overlap、
+ring depth/窗口大小分别消融。多个改动一起启用只能报告组合收益，不凭直觉分摊。
+重叠由 timeline 证明，不把并行 stage span 相加当成总延迟，也不拿旧的未完整赋值
+device-clock 字段当通信计时。
 
-1. V3 dynamic queue vs V4 static owner；
-2. split Notify/main vs fused；
-3. stable route vs atomic inference route；
-4. source-push 的 route/task materialization、copy、readiness 分项；
-5. full arena vs后续 Mblock ring；
-6. baseline epilogue vs specialized epilogue；
-7. 单机 EP8 decode/prefill，以及两机 GIN 的 balanced/skew；
-8. WeftMoE V3、WeftMoE V4、MegaMOE、SGLang baseline 同条件三/四方表。
-
-只有在 Nsight/timeline 证明 static ownership 没有把 queue 开销换成明显 head-of-line
-空转后，V4 才成为默认路径。
-
-## 14. 已知风险与对应约束
-
-1. **静态 owner 的尾部不均衡**：用全局 flatten 后的 tile pair 做 residue 分配，必要
-   时只在 owner 私有列表内 lookahead；不恢复 steal/CAS。
-2. **融合 kernel register/SMEM 膨胀**：单机、多机拆 TU/entry；communication 与
-   math warp 做寄存器重分配，逐 specialization 检查 SASS、spill 和 occupancy。
-3. **cooperative grid deadlock**：launch 前验证所有 CTA/cluster 可同时 resident；
-   任意错误路径必须加入同样的 EP/grid barrier，不能提前 return。
-4. **多机 channel 顺序与 credit**：一个 channel 只有一个 submit owner；packer 可并行，
-   但提交严格按 sequence。terminal 数来自冻结 plan。
-5. **source-push 与未来 ring 的环形等待**：V4.0 使用 full arena；ring 只有在 transport
-   task generation 单调性和 empty-credit 证明完成后启用。
-6. **训练 allocation boundary**：明确保留 plan/main 两 kernel 和 host allocation，
-   不用 PDL 掩盖这一事实；allocator OOM 必须在 payload phase 前 collective fail。
-7. **极端 routing skew**：使用 plan 得到的逐 rank `R_actual/P_actual`，不按平均负载
-   分配；绝不让部分 rank 继续执行一个被截断的 plan。
-
-## 15. 最终目标状态
-
-重构完成后，Forward 的核心状态机应缩减为：
-
-```text
-Count routes
-  -> Exchange counts / freeze geometry
-  -> Static Dispatch owners publish mblock readiness
-  -> Static FC1 owners publish S readiness
-  -> Static FC2 owners publish output readiness
-  -> Static Return owners publish route readiness
-  -> Static Reduce owners produce output
-```
-
-每条边只有 generation-tagged release/acquire；每个 task 的 owner 可由编号直接计算。
-单机与多机只在 `Dispatch/Return` 的 transport primitive 上不同：单机为 NVLink/
-IPC direct source-push，多机为 GIN push 加目标节点 relay。GEMM、row layout、task
-geometry、precision、no-drop 和 tape contract 完全共享。这是本次重构要达到的
-“像 MegaMOE 一样简单”的实质，而不是机械复制它的 pull 协议。
+本次只修订设计文档和待办，不执行上述实现或性能实验。
