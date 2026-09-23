@@ -679,3 +679,30 @@ cases 和 B16/D1 的 T1/64/edge cases 均 exit 0，包含 20K 热点及跨调用
 `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`，每 rank 图内 2 kernels）：1/64/8K/20K
 分别为 300.374/370.218/1489.09/3294.90 us。与前一节点的正式基线相符，
 日志为 `build/ring_v3_remote_ep8_t*.log`。该组是单机 EP8，不是两机 EP8。
+
+正式 EP16 对照（两节点无其他 GPU 任务/编译负载，1620 MHz，10/20/20，逐规模
+先冻结 V3、后修正 Q；相邻对照，不是交错反转顺序 A/B）：
+
+| tokens/rank | 冻结 V3/us | Q + scope 修正/us |
+|---:|---:|---:|
+| 1 | 682.170 | 289.083 |
+| 64 | 824.659 | 1504.43 |
+| 8192 | 3353.94 | 54062.1 |
+| 20480 | 7099.53 | 92113.8 |
+
+全部 64 个 rank/hash 与 V3 一致。除 T1 外性能仍未达标，不作为最终版本。
+日志：`build/ring_v3_ep16_t*.log`、`build/ring_net_scope_ep16_t*.log`。
+
+### R：Return RX 的本 GPU ready 发布（验证中）
+
+只将 Return RX scatter 后的逐 route ready store 从 system 改为 device release；
+相应 Reduce 读者都在本 GPU。NIC ready 的 acquire、跨 GPU 的 C retirement、
+跨 GPU local Return 的 contribution ready、TX 双重 credit 均不改变。
+不同代写者受原有 contribution 生命周期约束，不能并发覆盖同一 route slot。
+同时删除未使用的旧 TokenRecord/FanoutRecord/ReturnRecord 和旧 wire-layout
+构造函数，保留实际 header+payload 布局，复用原地址覆盖测试；不把清理记作收益。
+
+8K 快速筛选 53630.8 us，相对 Q 的 53670.4 us 仅约 0.07%，没有可辨认的
+端到端提升。16 ranks hash 一致；EP16 PyTorch 完整四规模及 edge cases、
+B16/D1 的 T1/64/edge cases 均通过，host suite 18/18。保留更准确的发布作用域
+与无用类型清理，但不将 R 计作性能收益。日志 `build/ring_net_rxgpu_*.log`。

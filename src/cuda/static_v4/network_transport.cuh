@@ -295,8 +295,11 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
                       row_bytes);
       prefetch.drain();
       finish_copies<false>();
+      // NIC visibility has already been imported and the scatter is complete.
+      // Only this GPU's Reduce reads these rows; peer Return writers publish
+      // different route slots, so this publication needs device scope only.
       for (unsigned row = 0U; row < desc.rows; ++row)
-        ring::publish<::cuda::thread_scope_system>(
+        ring::publish(
             r.contribution_ready[address.row_base + routes[row] - route_begin],
             address.generation);
       ring::arrive(control.consumed_total, desc.rows);

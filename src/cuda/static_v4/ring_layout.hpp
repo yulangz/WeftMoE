@@ -18,8 +18,6 @@ WEFTMOE_STATIC_RING_HD constexpr std::size_t align_payload(std::size_t bytes) {
 }
 
 struct PacketLayout {
-  std::size_t records;
-  std::size_t fanouts;
   std::size_t payload;
   std::size_t bytes;
 
@@ -28,27 +26,7 @@ struct PacketLayout {
   WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
   planned(std::uint32_t rows, std::uint32_t hidden) {
     const auto payload = align_payload(sizeof(PacketHeader));
-    return {0U, 0U, payload,
-            align_payload(payload + std::size_t(rows) * hidden * 2U)};
-  }
-
-  WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
-  dispatch(std::uint32_t tokens, std::uint32_t fanout_count,
-           std::uint32_t hidden) {
-    const auto records = sizeof(PacketHeader);
-    const auto fanouts = records + std::size_t(tokens) * sizeof(TokenRecord);
-    const auto payload = align_payload(
-        fanouts + std::size_t(fanout_count) * sizeof(FanoutRecord));
-    return {records, fanouts, payload,
-            align_payload(payload + std::size_t(tokens) * hidden * 2U)};
-  }
-
-  WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
-  returning(std::uint32_t rows, std::uint32_t hidden) {
-    const auto records = sizeof(PacketHeader);
-    const auto payload =
-        align_payload(records + std::size_t(rows) * sizeof(ReturnRecord));
-    return {records, 0U, payload,
+    return {payload,
             align_payload(payload + std::size_t(rows) * hidden * 2U)};
   }
 };

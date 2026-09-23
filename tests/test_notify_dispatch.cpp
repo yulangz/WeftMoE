@@ -2092,18 +2092,17 @@ void test_static_forward_slot_lifetimes() {
 
 void test_static_forward_network_layout() {
   namespace plan = weftmoe::cuda::static_forward;
-  constexpr unsigned rows = 32U, top_k = 4U, hidden = 2048U;
-  const auto dispatch = plan::PacketLayout::dispatch(rows, rows * top_k, hidden);
-  const auto returning = plan::PacketLayout::returning(rows, hidden);
-  const auto planned = plan::PacketLayout::planned(rows, hidden);
-  REQUIRE(planned.payload % 128U == 0U);
-  REQUIRE(planned.bytes == planned.payload + rows * hidden * 2U);
+  constexpr unsigned rows = 32U, hidden = 2048U;
+  const auto dispatch = plan::PacketLayout::planned(rows, hidden);
+  const auto returning = plan::PacketLayout::planned(rows / 2U, hidden);
+  REQUIRE(dispatch.payload % 128U == 0U);
+  REQUIRE(dispatch.bytes == dispatch.payload + rows * hidden * 2U);
   for (unsigned n = 1; n <= rows; ++n) {
-    const auto compact = plan::PacketLayout::dispatch(n, n * 2U, hidden);
+    const auto compact = plan::PacketLayout::planned(n, hidden);
     REQUIRE(compact.payload % 128U == 0U);
     REQUIRE(compact.bytes <= dispatch.bytes);
-    REQUIRE(compact.fanouts >= compact.records + n * sizeof(plan::TokenRecord));
-    REQUIRE(compact.payload >= compact.fanouts + n * 2U * sizeof(plan::FanoutRecord));
+    REQUIRE(compact.payload >= sizeof(plan::PacketHeader));
+    REQUIRE(compact.bytes == compact.payload + n * hidden * 2U);
   }
   for (const unsigned nodes : {1U, 2U, 3U, 70U}) {
     const plan::NetworkRings rings{nodes, 2U, 4U, dispatch.bytes, returning.bytes};

@@ -141,31 +141,12 @@ struct PacketPartition {
   }
 };
 
-struct TokenRecord {
-  std::uint64_t token;
-  std::uint32_t fanout_begin;
-  std::uint32_t fanout_count;
-};
-
-struct FanoutRecord {
-  std::uint64_t logical_mblock;
-  std::uint64_t source_route;
-  std::uint32_t token_index;
-  std::uint32_t destination_rank;
-  std::uint32_t row;
-  float gate;
-};
-
 struct PacketHeader {
   std::uint64_t sequence;
   std::uint64_t window;
   std::uint64_t retire_target;
   std::uint32_t rows;
   std::uint32_t fanouts; // Dispatch only; Return retires exactly rows units.
-};
-
-struct ReturnRecord {
-  std::uint64_t source_route;
 };
 
 struct NodeToken {
@@ -235,10 +216,7 @@ struct WindowMblock {
   std::uint32_t rows;
 };
 
-static_assert(sizeof(TokenRecord) == 16U);
-static_assert(sizeof(FanoutRecord) == 32U);
 static_assert(sizeof(PacketHeader) == 32U);
-static_assert(sizeof(ReturnRecord) == 8U);
 
 } // namespace weftmoe::cuda::static_forward
 
