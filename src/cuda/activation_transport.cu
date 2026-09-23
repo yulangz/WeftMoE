@@ -4819,6 +4819,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.contribution_depth = l.contribution_depth;
     r.contribution_stride = std::uint64_t(l.shape.tokens) * state->config.max_top_k;
     r.state = at<static_forward::RingState>(slot.device, l.state);
+    r.source_epochs = at<static_forward::SourceEpoch>(slot.device, l.source_epochs);
     r.slots = at<static_forward::ComputeSlot>(slot.device, l.slots);
     r.contributions = at<static_forward::ContributionSlot>(slot.device, l.contributions);
     r.contribution_ready = at<std::uint64_t>(slot.device, l.contribution_ready);

@@ -32,6 +32,7 @@ struct RingBlock {
 struct RingRow {
   std::uint64_t route;
   std::uint32_t source;
+  float gate;
 };
 
 struct RingState {
@@ -44,12 +45,18 @@ struct RingState {
   unsigned error;
 };
 
+struct SourceEpoch {
+  std::uint64_t tokens;
+  std::uint64_t base;
+};
+
 struct ComputeRingView {
   SourcePlanView source;
   std::uint32_t depth = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t contribution_stride = 0;
   RingState *state = nullptr;
+  SourceEpoch *source_epochs = nullptr;
   ComputeSlot *slots = nullptr;
   ContributionSlot *contributions = nullptr;
   std::uint64_t *contribution_ready = nullptr;
@@ -67,6 +74,7 @@ struct ComputeRingLayout {
   std::uint64_t max_windows = 0;
   std::uint64_t max_blocks = 0;
   std::size_t state = 0, slots = 0, contributions = 0, contribution_ready = 0;
+  std::size_t source_epochs = 0;
   std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
   std::size_t source_slot = 0, node_tokens = 0, packet_prefix = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;

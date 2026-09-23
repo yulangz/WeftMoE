@@ -427,7 +427,17 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
     const auto fc2_units = wave_mblocks * fc2_units_per_mblock;
     const auto cluster = static_cast<unsigned long long>(blockIdx.x) /
                          forward_tuning::kClusterSize;
-    const auto fc1_pair = cluster + 1ULL * (progress & 0xffffU) * cluster_count;
+    // Preserve the global task residue across window boundaries. Restarting
+    // at cluster zero leaves the same SMs idle in every small window.
+    const auto fc1_owner = RingSchedule
+        ? (cluster + cluster_count - (wave_begin * fc1_ntiles / 2U) % cluster_count) %
+              cluster_count
+        : cluster;
+    const auto fc2_owner = RingSchedule
+        ? (cluster + cluster_count - (wave_begin * fc2_units_per_mblock) % cluster_count) %
+              cluster_count
+        : cluster;
+    const auto fc1_pair = fc1_owner + 1ULL * (progress & 0xffffU) * cluster_count;
     if (fc1_pair < fc1_pairs) {
       const auto candidate = wave_begin * fc1_ntiles + 2ULL * fc1_pair;
       const auto mblock = candidate / fc1_ntiles;
@@ -455,7 +465,7 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
       continue;
     }
     const auto fc2_unit =
-        cluster + ((progress >> 16U) & 0xffffULL) * cluster_count;
+        fc2_owner + ((progress >> 16U) & 0xffffULL) * cluster_count;
     if (fc2_unit < fc2_units) {
       const auto mblock = wave_begin + fc2_unit / fc2_units_per_mblock;
       const auto unit = static_cast<std::uint32_t>(

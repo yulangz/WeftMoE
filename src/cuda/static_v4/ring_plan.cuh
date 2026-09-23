@@ -38,19 +38,31 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
   collective_scope_sync<384U, kCollectiveJoinBarrier>();
   rank_barrier<Math, Control>(a);
 
-  if (blockIdx.x == 0U && tid == 0U) {
-    std::uint64_t tokens = 0U;
+  if (blockIdx.x == 0U) {
     unsigned error = 0U;
-    for (unsigned source = 0; source < a.world; ++source) {
+    for (unsigned source = tid; source < a.world; source += Control) {
       const auto *state = peer(a, source, r.state);
-      tokens = tokens > state->tokens ? tokens : state->tokens;
+      r.source_epochs[source] = {state->tokens, state->source_base};
       error |= state->error;
     }
-    r.state->windows = error ? 0U : p.shape.windows(tokens);
-    auto *runtime = const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime);
-    runtime->error = error;
-    peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->error =
-        error;
+    error = __reduce_or_sync(0xffffffffU, error);
+    if (tid % 32U == 0U)
+      counts[tid / 32U] = error;
+    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    if (tid == 0U) {
+      std::uint64_t tokens = 0U;
+      for (unsigned source = 0; source < a.world; ++source)
+        tokens = tokens > r.source_epochs[source].tokens
+                     ? tokens
+                     : r.source_epochs[source].tokens;
+      for (unsigned warp = 0; warp < Control / 32U; ++warp)
+        error |= counts[warp];
+      r.state->windows = error ? 0U : p.shape.windows(tokens);
+      auto *runtime = const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime);
+      runtime->error = error;
+      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->error =
+          error;
+    }
   }
   grid_sync<Math, Control>(a);
 
@@ -110,17 +122,58 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
         status->fc1_start_clock = ~0ULL;
   }
   grid_sync<Math, Control>(a);
-  for (auto w = std::uint64_t(blockIdx.x); w < r.state->windows;
-       w += gridDim.x) {
+  for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
+       task += gridDim.x) {
+    const auto w = task / owned;
+    const auto expert = static_cast<unsigned>(task % owned);
     const auto *prefix = r.expert_blocks + w * (owned + 1U);
-    for (unsigned expert = 0; expert < owned; ++expert)
-      for (auto b = std::uint64_t(tid);
-           b < prefix[expert + 1U] - prefix[expert]; b += Control)
-        r.blocks[r.window_prefix[w] + prefix[expert] + b] = {
-            {expert, static_cast<unsigned>(b * p.shape.tile_m),
-             static_forward::block_rows(r.expert_rows[w * owned + expert], b,
-                                        p.shape.tile_m)},
-            static_cast<unsigned>(w)};
+    const auto first = p.shape.source_begin(w);
+    const auto local_window = w / p.shape.groups();
+    for (unsigned index = tid; index < p.shape.sources; index += Control) {
+      const auto source = first + index;
+      counts[index] =
+          source < p.shape.source_end(w)
+              ? static_cast<unsigned>(source_count(a, source, local_window,
+                                                   a.rank * owned + expert))
+              : 0U;
+    }
+    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    const static_forward::WindowGeometryView geometry{
+        p.shape,
+        w,
+        1U,
+        counts,
+        r.expert_rows + w * owned + expert,
+        r.expert_blocks + w * (owned + 1U) + expert,
+        nullptr};
+    for (auto b = std::uint64_t(tid); b < prefix[expert + 1U] - prefix[expert];
+         b += Control)
+      r.blocks[r.window_prefix[w] + prefix[expert] + b] = {
+          {expert, static_cast<unsigned>(b * p.shape.tile_m),
+           static_forward::block_rows(r.expert_rows[w * owned + expert], b,
+                                      p.shape.tile_m)},
+          static_cast<unsigned>(w)};
+    // Freeze reverse identity and gate before payload starts. Each warp reads
+    // a contiguous source-expert route list; pull does no peer count/ordinal
+    // search, and Return never depends on the lifetime of an X slot.
+    for (auto source = first + tid / 32U; source < p.shape.source_end(w);
+         source += Control / 32U) {
+      const auto count = counts[source - first];
+      const auto *source_prefix =
+          peer(a, source, p.expert_prefix) + local_window * (p.experts + 1U);
+      const auto *order =
+          peer(a, source, p.route_order) + local_window * p.window_capacity();
+      const auto *gates = peer_at<const float>(a.peer_bases[source],
+                                               a.fused_source_gates_offset);
+      for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
+        const auto row = geometry.expert_row(0U, source, ordinal);
+        const auto route =
+            order[source_prefix[a.rank * owned + expert] + ordinal];
+        r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
+            route, source, gates[route]};
+      }
+    }
+    collective_scope_sync<Control, kCollectiveScopeBarrier>();
   }
   grid_sync<Math, Control>(a);
   collective_scope_sync<384U, kCollectiveJoinBarrier>();

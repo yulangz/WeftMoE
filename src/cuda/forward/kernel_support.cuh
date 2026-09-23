@@ -858,6 +858,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       throw std::invalid_argument("static ring window exceeds device indices");
     ring.depth = static_cast<unsigned>(2U * window_blocks);
     ring.state = append(cursor, 1, sizeof(static_forward::RingState), "ring state");
+    ring.source_epochs = append(cursor, config.max_world_size,
+                                  sizeof(static_forward::SourceEpoch), "source epochs");
     ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
                         "X/S/C slot controls");
     ring.contributions = append(cursor, ring.contribution_depth,

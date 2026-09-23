@@ -134,6 +134,8 @@ destination 全局映射、真正的整窗口准入及进度闭环；M2–M6 保
 
 ## M2：单机有界数据面首版（正确性里程碑，非性能结论）
 
+Commit：`cb14266`。
+
 ### 实现及生命周期
 
 - `compute_ring.hpp` / `ring_access.cuh`：X/S/C slot 的 generation、累积
@@ -236,3 +238,112 @@ H2048/I512/K4、B256 下 X/S/C+contribution 数据区合计固定 170 MiB；总 
 新增 stage span 仅用于定位：20K ring 的 plan 约 184 us，FC1/FC2 span 均约
 12.75 ms；8K 分别约 89 us 和 5.08 ms。它们重叠且包含等待，不能相加，也不是
 纯 GEMM 时间。长文主要退化不能归因于百微秒级 plan 本身，继续消融数据面。
+
+## M2 优化实验（进行中）
+
+### A：窗口间旋转静态 residue
+
+保持全局 task 编号对 cluster 数取余，不再每个窗口都从 cluster 0 开始。
+FC1/FC2 分别按各自的实际 tile/unit prefix 计算首个 residue；没有共享 cursor、
+steal 或 CAS。除此之外与 M2 收尾代码相同。
+
+候选 binary `build/static_v4_ring_rotate/test_cuda_notify`，SHA256
+`683a39308aa1dc1af38d75b97579087de755178ff89b31317c6f035922f62b22`。
+EP8、B256、1620 MHz、10/20/20，四规模 32 个 hash 与 M2 一致。
+
+| tokens/rank | M2 收尾/us | 旋转 residue/us | 延迟变化 |
+|---:|---:|---:|---:|
+| 1 | 115.403 | 115.906 | +0.44% |
+| 64 | 264.506 | 266.864 | +0.89% |
+| 8192 | 5269.15 | 5217.41 | -0.98% |
+| 20480 | 13061.1 | 12929.4 | -1.01% |
+
+目前只是约 1% 的小变化，未反向交错确认，不作为显著优化收益。
+均衡窗口中的 compute 覆盖虽更均匀，但数据面吞吐仍待定位。
+
+### B：本地 immutable row 描述替代逐行远端 metadata 查询
+
+在 A 上，将 source round-robin 映射、route 和 gate 一次性冻结到本地 `RingRow`，
+pull 只读本地行描述并搬运 X。gate 使用原有结构 padding，描述仍为 16 bytes，
+不增加 row directory 容量。Return 也只读该 immutable metadata。
+
+候选 `build/static_v4_ring_planrows/test_cuda_notify`，SHA256
+`06bd28f82a7bb78b5a026837b2947faf0f62ce8322254aa8101933b1e6e98f00`。
+同样 EP8/B256/1620 MHz/10/20/20，四规模 hash 全部保持一致。
+
+| tokens/rank | A/us | B/us | 延迟变化 | B plan span/us |
+|---:|---:|---:|---:|---:|
+| 1 | 115.906 | 123.939 | +6.93% | 48.32 |
+| 64 | 266.864 | 242.914 | -8.97% | 92.58 |
+| 8192 | 5217.41 | 3421.16 | -34.43% | 154.30 |
+| 20480 | 12929.4 | 8330.07 | -35.57% | 252.80 |
+
+这组改动减少数据面的串行 peer 读取，但提高了 planning 开销，短序列 1 token
+反而更慢。B 的 metadata pass 仍每窗口只用一个 CTA，下一步单独改为固定
+`(window,expert)` CTA 分区，避免短序列串行遍历全部 expert。本表尚未反向复测，
+不作为最终性能验收；距 V3 长序列仍有明显差距。
+
+### C：并行构建 `(window,expert)` 行描述
+
+在 B 上只修改 metadata pass 的静态 CTA 分区，不改变 payload 遍历或 ring 同步。
+候选 `build/static_v4_ring_planparallel/test_cuda_notify`，SHA256
+`e8211207d261b1439a9edcdbc360ec9b91ac979a3e9f8b7c52f4c7b9d849fb72`。
+同条件四规模 hash 全部一致。
+
+| tokens/rank | B/us | C/us | 延迟变化 | C plan span/us |
+|---:|---:|---:|---:|---:|
+| 1 | 123.939 | 114.920 | -7.28% | 39.10 |
+| 64 | 242.914 | 200.846 | -17.32% | 49.34 |
+| 8192 | 3421.16 | 3377.29 | -1.28% | 109.54 |
+| 20480 | 8330.07 | 8315.80 | -0.17% | 239.94 |
+
+短序列改善来自 metadata pass 并行度提高；20K 总耗时变化极小，继续处理数据面。
+接下来的候选将 source epoch 缓存在本地 plan，并把 source contribution reservation
+的检查从每行 pull 提升到 destination 的整窗口准入；仅检查该窗口实际命中的 sources。
+准入 owner 仍非阻塞地同时推进 source 与 destination，不变成 rank collective。
+
+### D：整窗口导入 contribution credit（失败，已撤回）
+
+候选同时缓存 source token/base epoch，并由 admission owner 检查本窗口实际命中
+sources 的 contribution generation，随后发布 destination admission；pull 不再
+逐行检查 contribution reservation。slot 计数协议未删除，但准入耦合更强。
+
+`build/static_v4_ring_admit/test_cuda_notify`，SHA256
+`37f5fe96653ae452139413a576e32ff7f0591b3eee6513e16cb223b39fca2a56`。
+四规模 hash 一致，但同条件 p50 分别为 139.362/217.690/3729.83/9195.75 us，
+相对 C 慢 21.27%/8.39%/10.44%/10.58%。plan span 也增加约 10–13 us：
+source base 的额外 peer 读取被放进了 CTA 0 的串行扫描。
+
+这一组合不保留。恢复逐行 reservation 检查；后续只保留 source epoch 本地
+snapshot，并让 control lanes 并行读取 peer state，单独测量。不能把 D 的退化
+全归因于 credit 粒度，因为它同时改变了 epoch 获取方式。
+
+### E：并行 snapshot source epoch（保留逐行 credit）
+
+回到 C 的逐行 reservation 等待。PlanReady 后由 control lanes 并行 snapshot
+source tokens/base，错误码做 warp/block OR；CTA 0 只扫描本地 snapshot 计算窗口数。
+几何规划、pull/Return 使用本地 epoch，不再逐行读取 peer 的 invocation state。
+
+候选 `build/static_v4_ring_epochs/test_cuda_notify`，SHA256
+`10726595c71ba44db943351893afba98434732c273a7c1a8ef18582634a308fb`。
+四规模 hash 一致，同条件 p50=112.614/195.434/3312.25/8139.85 us；相对 C 改善
+2.01%/2.69%/1.93%/2.12%。这只是小幅收益，待组合版本反向复测。
+
+另外用已有 `WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE=self` 将 route 改成只命中
+source 自己的 GPU，保留每个 expert 的行数和 GEMM 形状，8K/20K 为
+2817.51/6916.74 us。**该诊断改变路由语义，不是等输出性能对照，也不是用户主矩阵。**
+它仍保留约 85% 的延迟，说明不能把剩余差距全部归因于 NVLink；后续用 compute
+timeline 区分 GEMM 活跃区间和等待供给的空隙，并继续消融 copy issue 粒度。
+
+E 的 library 已通过 PyTorch 四规模及全部现有 edge cases（含 max-token 热点不丢
+token、graph 输入变化和 post-hotspot 复用），日志
+`build/static_v4_ring_epochs/torch_edges.log`。B16/T64/EP8 的 memcheck 与 racecheck
+均 exit 0；沿用 `--sanitizer-report-api-errors no` 排除 NCCL 初始化架构探测错误，
+设备内存及同步检查仍开启。
+
+额外编译 timeline 版本，以 eager 8K/EP8/B256 运行（不混入正式 graph 成绩）。
+rank 0 的 23973 个事件无溢出：按 132 个 CTA 平均，compute selection 等待总量
+2493.14 us；FC1 math/epilogue 分别 267.86/106.45 us，FC2 分别
+114.38/55.18 us。这些是 CTA 活跃时间的平均，不是可串行相加的关键路径分解；
+但足以确认主要空隙在任务供给，而非 GEMM 指令执行本身。该版本 Return 起点
+telemetry 尚未接入，日志中的 Return span/FC2-Return overlap 无效，明确排除。

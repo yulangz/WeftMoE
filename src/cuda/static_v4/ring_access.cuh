@@ -56,8 +56,7 @@ __device__ __forceinline__ bool admitted(const ForwardKernelArgs &a,
 __device__ __forceinline__ std::uint64_t
 source_sequence(const ForwardKernelArgs &a, unsigned source,
                 std::uint64_t token) {
-  return peer(a, source, a.ring.state)->source_base +
-         token / a.ring.source.shape.tokens;
+  return a.ring.source_epochs[source].base + token / a.ring.source.shape.tokens;
 }
 
 __device__ __forceinline__ std::uint64_t
@@ -74,7 +73,7 @@ __device__ __forceinline__ std::uint64_t
 source_count(const ForwardKernelArgs &a, unsigned source,
              std::uint64_t local_window, unsigned expert) {
   const auto &plan = a.ring.source;
-  if (local_window * plan.shape.tokens >= peer(a, source, a.ring.state)->tokens)
+  if (local_window * plan.shape.tokens >= a.ring.source_epochs[source].tokens)
     return 0U;
   const auto *prefix =
       peer(a, source, plan.expert_prefix) + local_window * (plan.experts + 1U);

@@ -5,10 +5,10 @@
 template <class Storage>
 __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s) {
   namespace ring = static_v4::ring;
-  const auto lane = threadIdx.x & 31U;
+  if ((threadIdx.x & 31U) != 0U)
+    return;
   const auto &r = a.ring;
   const auto &p = r.source;
-  const auto owned = a.dispatch.sizes.owned_expert_count;
   auto *x = peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   for (auto index = std::uint64_t(blockIdx.x);
@@ -18,71 +18,38 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s) {
     const auto &desc = r.blocks[block];
     if (m >= desc.tile.rows)
       continue;
-    if (lane == 0U)
-      while (!ring::admitted(a, block)) {
-      }
-    __syncwarp();
-    const auto first_source = p.shape.source_begin(desc.window);
-    const auto source_rank = first_source + lane;
-    const auto local_window = desc.window / p.shape.groups();
-    const auto expert = a.rank * owned + desc.tile.expert;
-    const auto count = source_rank < p.shape.source_end(desc.window)
-                           ? static_cast<unsigned>(ring::source_count(
-                                 a, source_rank, local_window, expert))
-                           : 0U;
-    auto ordinal = desc.tile.expert_row + m;
-    unsigned peeled = 0U, source = 0U, source_slot = 0U;
-    while (true) {
-      const auto remaining = count > peeled ? count - peeled : 0U;
-      const auto active = __reduce_add_sync(0xffffffffU, remaining != 0U);
-      const auto layer =
-          __reduce_min_sync(0xffffffffU, remaining ? remaining : ~0U);
-      if (ordinal < active * layer) {
-        const auto mask = __ballot_sync(0xffffffffU, remaining != 0U);
-        source = first_source + __fns(mask, 0U, ordinal % active + 1U);
-        source_slot = peeled + ordinal / active;
-        break;
-      }
-      ordinal -= active * layer;
-      peeled += layer;
+    while (!ring::admitted(a, block)) {
     }
-    if (lane == 0U) {
-      const auto *prefix = ring::peer(a, source, p.expert_prefix) +
-                           local_window * (p.experts + 1U);
-      const auto route = ring::peer(
-          a, source, p.route_order)[local_window * p.window_capacity() +
-                                    prefix[expert] + source_slot];
-      const auto token = route / p.shape.top_k;
-      const auto seq = ring::source_sequence(a, source, token);
-      const auto *contribution =
-          ring::peer(a, source, r.contributions) + seq % r.contribution_depth;
-      while (ring::acquire<::cuda::thread_scope_system>(
-                 contribution->generation) != seq / r.contribution_depth + 1U) {
-      }
-      const auto target_row = ring::row(a, block) + m;
-      gates[target_row] = peer_at<const float>(
-          a.peer_bases[source], a.fused_source_gates_offset)[route];
-      r.rows[index] = {route, source};
-      const auto *input = peer_at<const transport::BFloat16>(
-                              a.peer_bases[source], a.source_input_offset) +
-                          token * a.hidden;
-      asm volatile("fence.proxy.async.global;" ::: "memory");
-      static_v4_copy_row(
-          s, 0U, input, x + target_row * a.hidden,
-          static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
-      finish_copies<false>();
-      __threadfence();
-      const auto credit =
-          m + 1U == desc.tile.rows ? p.shape.tile_m - desc.tile.rows + 1U : 1U;
-      static_v4::reduce_add_release_device(
-          reinterpret_cast<unsigned long long *>(&ring::slot(a, block).x_full),
-          credit);
+    const auto identity = r.rows[index];
+    const auto source = identity.source;
+    const auto route = identity.route;
+    const auto token = route / p.shape.top_k;
+    const auto seq = ring::source_sequence(a, source, token);
+    const auto *contribution =
+        ring::peer(a, source, r.contributions) + seq % r.contribution_depth;
+    while (ring::acquire<::cuda::thread_scope_system>(
+               contribution->generation) != seq / r.contribution_depth + 1U) {
     }
+    const auto target_row = ring::row(a, block) + m;
+    gates[target_row] = identity.gate;
+    const auto *input = peer_at<const transport::BFloat16>(
+                            a.peer_bases[source], a.source_input_offset) +
+                        token * a.hidden;
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    static_v4_copy_row(
+        s, 0U, input, x + target_row * a.hidden,
+        static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
+    finish_copies<false>();
+    __threadfence();
+    const auto credit =
+        m + 1U == desc.tile.rows ? p.shape.tile_m - desc.tile.rows + 1U : 1U;
+    static_v4::reduce_add_release_device(
+        reinterpret_cast<unsigned long long *>(&ring::slot(a, block).x_full),
+        credit);
   }
-  if (lane == 0U)
-    atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
-                   ->dispatch_complete_clock,
-              device_globaltimer_ns());
+  atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                 ->dispatch_complete_clock,
+            device_globaltimer_ns());
 }
 
 template <class Storage>
