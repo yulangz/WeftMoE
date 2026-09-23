@@ -660,13 +660,16 @@ M5 与协议实现正交，可在冻结基线后提前做，但不把两者收�
 
 ### M1：冻结可执行的 plan、布局与进度合同
 
-M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window planner，
+M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window planner；
+M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-window 几何。
 详见 ring 实施记录。规划器目前独立验证，尚未接入 Forward 的数据面；下面涉及
-destination、跨 rank 交换、消费者目录和准入的完整事项仍保持未完成。
+跨 rank 交换、全局映射和准入的完整事项仍保持未完成。
 
 - [x] 窗口编号、完整 token 分包、任意节点数的 peer/lane 地址和逐 slot 累积退休合同。
 - [x] GPU source-window expert/node counts、去重 token 列表、source ordinal 与 channel
       packet prefix；显式区分 masked route 和非法 expert id。
+- [x] 紧凑 channel packet 目录、各目标 GPU 的完整行消费数；destination-window
+      counts→Mblocks/C expected 行数及 source round-robin ordinal 的逆映射。
 - [ ] 定义窗口编号、实际窗口/expert counts、逻辑 Mblock、source contribution 映射，
       以及 packet-sequence 优先的接收侧静态任务目录。
 - [ ] 冻结 packet/token/fanout 及 Return 行枚举，生成精确 channel packet 数和

@@ -1,4 +1,5 @@
-#include "cuda/static_v4/source_plan.cuh"
+#include "cuda/static_v4/packet_plan.cuh"
+#include "cuda/static_v4/window_geometry.cuh"
 
 #include <algorithm>
 #include <array>
@@ -30,9 +31,11 @@ public:
                      std::max(size, std::size_t{1}) * sizeof(T)));
     check(cudaMemset(data_, 0, std::max(size, std::size_t{1}) * sizeof(T)));
   }
-  explicit DeviceArray(const std::vector<T> &values) : DeviceArray(values.size()) {
+  explicit DeviceArray(const std::vector<T> &values)
+      : DeviceArray(values.size()) {
     if (size_)
-      check(cudaMemcpy(data_, values.data(), size_ * sizeof(T), cudaMemcpyHostToDevice));
+      check(cudaMemcpy(data_, values.data(), size_ * sizeof(T),
+                       cudaMemcpyHostToDevice));
   }
   ~DeviceArray() { cudaFree(data_); }
   DeviceArray(const DeviceArray &) = delete;
@@ -41,7 +44,8 @@ public:
   std::vector<T> read() const {
     std::vector<T> values(size_);
     if (size_)
-      check(cudaMemcpy(values.data(), data_, size_ * sizeof(T), cudaMemcpyDeviceToHost));
+      check(cudaMemcpy(values.data(), data_, size_ * sizeof(T),
+                       cudaMemcpyDeviceToHost));
     return values;
   }
 
@@ -52,13 +56,22 @@ private:
 
 __global__ void build_windows(plan::SourcePlanView view) {
   extern __shared__ unsigned scratch[];
-  for (auto w = std::uint64_t(blockIdx.x); w < view.local_windows(); w += gridDim.x)
+  for (auto w = std::uint64_t(blockIdx.x); w < view.local_windows();
+       w += gridDim.x)
     plan::build_source_window<128U>(view, w, scratch);
 }
 
 __global__ void build_packets(plan::SourcePlanView view) {
   plan::build_source_packet_prefix(view, blockIdx.x * blockDim.x + threadIdx.x,
-                                  gridDim.x * blockDim.x);
+                                   gridDim.x * blockDim.x);
+}
+
+__global__ void build_directory(plan::SourcePlanView view,
+                                plan::DispatchPlanView output) {
+  if (threadIdx.x == 0U)
+    plan::build_dispatch_channel_offsets(view, output);
+  __syncthreads();
+  plan::build_dispatch_packets(view, output, threadIdx.x, blockDim.x);
 }
 
 void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
@@ -77,7 +90,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
     for (unsigned k = 0; k < top_k; ++k) {
       selected[std::size_t(token) * top_k + k] = static_cast<std::int32_t>(
           hotspot ? 0U : (token * 17U + source * 13U + k / 2U) % experts);
-      valid[std::size_t(token) * top_k + k] = !(k == 3U && token % 7U == 0U);
+      valid[std::size_t(token) * top_k + k] =
+          hotspot || !(k == 3U && token % 7U == 0U);
     }
   }
   if (invalid)
@@ -89,16 +103,38 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   DeviceArray<std::uint64_t> route_order(capacity);
   DeviceArray<std::uint32_t> source_slot(selected.size());
   DeviceArray<plan::NodeToken> node_tokens(capacity);
-  DeviceArray<std::uint64_t> packet_prefix(nodes * partition.lanes * (windows + 1U));
+  DeviceArray<std::uint64_t> packet_prefix(nodes * partition.lanes *
+                                           (windows + 1U));
+  DeviceArray<std::uint64_t> channel_offsets(nodes * partition.lanes + 1U);
+  // Every nonempty packet has at least one node-deduplicated token and hence
+  // one valid route. This bounds compact directory capacity without per-peer
+  // worst-case replication.
+  DeviceArray<plan::DispatchPacketPlan> packets(selected.size());
+  DeviceArray<std::uint32_t> consumers(selected.size() * local_world);
+  const plan::DispatchPlanView directory{channel_offsets.data(), packets.data(),
+                                         consumers.data()};
   DeviceArray<unsigned> error(1U);
-  const plan::SourcePlanView view{
-      shape, partition, source, experts, nodes, tokens, d_selected.data(),
-      d_valid.data(), expert_prefix.data(), node_prefix.data(), route_order.data(),
-      source_slot.data(), node_tokens.data(), packet_prefix.data(), error.data()};
+  const plan::SourcePlanView view{shape,
+                                  partition,
+                                  source,
+                                  experts,
+                                  nodes,
+                                  tokens,
+                                  d_selected.data(),
+                                  hotspot ? nullptr : d_valid.data(),
+                                  expert_prefix.data(),
+                                  node_prefix.data(),
+                                  route_order.data(),
+                                  source_slot.data(),
+                                  node_tokens.data(),
+                                  packet_prefix.data(),
+                                  error.data()};
 
   build_windows<<<7U, 128U, view.scratch_words() * sizeof(unsigned)>>>(view);
   check(cudaGetLastError());
   build_packets<<<1U, 128U>>>(view);
+  check(cudaGetLastError());
+  build_directory<<<1U, 128U>>>(view, directory);
   check(cudaGetLastError());
   check(cudaDeviceSynchronize());
   require(error.read()[0] == unsigned(invalid), "invalid route status");
@@ -111,6 +147,9 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto ordinal = source_slot.read();
   const auto nt = node_tokens.read();
   const auto pp = packet_prefix.read();
+  const auto channels = channel_offsets.read();
+  const auto packet_plan = packets.read();
+  const auto consumer_rows = consumers.read();
   std::vector<std::uint64_t> sequences(nodes * partition.lanes, 0U);
   for (std::uint64_t w = 0; w < windows; ++w) {
     const auto begin = w * shape.tokens;
@@ -138,7 +177,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
       require(last - first == expected_routes[e].size(), "expert count");
       for (auto index = first; index < last; ++index) {
         const auto route = order[w * view.window_capacity() + index];
-        require(expected_routes[e].erase(route) == 1U, "route coverage/uniqueness");
+        require(expected_routes[e].erase(route) == 1U,
+                "route coverage/uniqueness");
         require(ordinal[route] == index - first, "source ordinal inverse");
       }
     }
@@ -148,8 +188,10 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
       require(last - first == expected_tokens[node].size(), "node dedup count");
       for (auto index = first; index < last; ++index) {
         const auto record = nt[w * view.window_capacity() + index];
-        require(expected_tokens[node].erase(record.token) == 1U, "token coverage/uniqueness");
-        require(record.fanouts == fanouts[(record.token - begin) * nodes + node],
+        require(expected_tokens[node].erase(record.token) == 1U,
+                "token coverage/uniqueness");
+        require(record.fanouts ==
+                    fanouts[(record.token - begin) * nodes + node],
                 "packet expected fanout count");
       }
       for (unsigned lane = 0; lane < partition.lanes; ++lane) {
@@ -158,13 +200,131 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
         require(pp[base + w] == sequences[channel], "packet start sequence");
         if (node != source / local_world)
           sequences[channel] += partition.lane_packets(last - first, lane);
-        require(pp[base + w + 1U] == sequences[channel], "packet terminal sequence");
+        require(pp[base + w + 1U] == sequences[channel],
+                "packet terminal sequence");
       }
     }
   }
   if (tokens == 0U)
     for (auto value : pp)
       require(value == 0U, "empty source channel");
+
+  std::vector<std::set<std::uint64_t>> delivered(nodes);
+  for (unsigned channel = 0; channel < nodes * partition.lanes; ++channel) {
+    const auto node = channel / partition.lanes;
+    require(channels[channel + 1U] - channels[channel] == sequences[channel],
+            "compact channel directory extent");
+    for (auto packet = channels[channel]; packet < channels[channel + 1U];
+         ++packet) {
+      const auto &desc = packet_plan[packet];
+      require(desc.tokens > 0U && desc.tokens <= partition.rows,
+              "packet tail size");
+      std::array<unsigned, local_world> expected{};
+      unsigned fanouts = 0U;
+      for (unsigned row = 0; row < desc.tokens; ++row) {
+        const auto token = nt[desc.token_begin + row].token;
+        require(delivered[node].insert(token).second,
+                "packet token uniqueness");
+        require(desc.window == shape.window(source, token),
+                "packet global window");
+        for (unsigned k = 0; k < top_k; ++k) {
+          const auto route = token * top_k + k;
+          const auto expert = unsigned(selected[route]);
+          if (valid[route] && expert / experts_per_node == node) {
+            ++expected[(expert / (experts / world)) % local_world];
+            ++fanouts;
+          }
+        }
+      }
+      require(fanouts == desc.fanouts, "packet retirement units");
+      for (unsigned local = 0; local < local_world; ++local)
+        require(consumer_rows[packet * local_world + local] == expected[local],
+                "immutable packet consumer directory");
+    }
+  }
+  for (unsigned token = 0; token < tokens; ++token)
+    for (unsigned k = 0; k < top_k; ++k) {
+      const auto route = std::size_t(token) * top_k + k;
+      const auto node = unsigned(selected[route]) / experts_per_node;
+      if (valid[route] && node != source / local_world)
+        require(delivered[node].count(token) == 1U, "packet no-drop coverage");
+    }
+}
+
+struct SourceOrdinal {
+  unsigned expert, source, ordinal;
+};
+
+__global__ void build_geometry(plan::WindowGeometryView view,
+                               const SourceOrdinal *routes, unsigned count,
+                               std::uint64_t *rows) {
+  plan::build_window_geometry<128U>(view);
+  for (unsigned r = threadIdx.x; r < count; r += blockDim.x)
+    rows[r] =
+        view.expert_row(routes[r].expert, routes[r].source, routes[r].ordinal);
+}
+
+void run_geometry(unsigned nodes, bool hotspot) {
+  constexpr unsigned owned = 4U;
+  const plan::WindowShape shape{nodes * 8U, 16U, 128U, 4U};
+  // Use the last source group: three nodes exercise a partial G-sized group.
+  const auto window = shape.groups() - 1U;
+  const auto first_source = shape.source_begin(window);
+  const auto sources = shape.source_end(window) - first_source;
+  std::vector<std::uint32_t> counts(owned * shape.sources, 0U);
+  for (unsigned source = 0; source < sources; ++source) {
+    const auto tokens = source == 0U ? 0U : shape.tokens - source;
+    for (unsigned token = 0; token < tokens; ++token)
+      for (unsigned k = 0; k < shape.top_k; ++k)
+        ++counts[(hotspot ? 0U : (source + token + k / 2U) % owned) *
+                     shape.sources +
+                 source];
+  }
+  // Independent round-robin oracle, including unequal/empty source columns.
+  std::vector<SourceOrdinal> routes;
+  std::vector<std::uint64_t> expected;
+  std::array<unsigned, owned> totals{};
+  for (unsigned expert = 0; expert < owned; ++expert) {
+    for (unsigned ordinal = 0; ordinal < shape.tokens * shape.top_k; ++ordinal)
+      for (unsigned source = 0; source < sources; ++source)
+        if (ordinal < counts[expert * shape.sources + source]) {
+          routes.push_back({expert, first_source + source, ordinal});
+          expected.push_back(totals[expert]++);
+        }
+  }
+  DeviceArray<std::uint32_t> d_counts(counts);
+  DeviceArray<std::uint64_t> expert_rows(owned), prefix(owned + 1U);
+  DeviceArray<plan::WindowMblock> blocks(shape.max_mblocks(owned));
+  DeviceArray<SourceOrdinal> d_routes(routes);
+  DeviceArray<std::uint64_t> assigned(routes.size());
+  const plan::WindowGeometryView view{
+      shape,         window,       owned, d_counts.data(), expert_rows.data(),
+      prefix.data(), blocks.data()};
+  build_geometry<<<1U, 128U>>>(view, d_routes.data(), unsigned(routes.size()),
+                               assigned.data());
+  check(cudaGetLastError());
+  check(cudaDeviceSynchronize());
+  require(assigned.read() == expected, "round-robin source ordinal inverse");
+  const auto actual_rows = expert_rows.read();
+  const auto actual_prefix = prefix.read();
+  const auto actual_blocks = blocks.read();
+  std::uint64_t next_block = 0U;
+  for (unsigned expert = 0; expert < owned; ++expert) {
+    require(actual_rows[expert] == totals[expert], "destination window counts");
+    require(actual_prefix[expert] == next_block, "window mblock prefix");
+    unsigned retired = 0U;
+    while (retired < totals[expert]) {
+      const auto &block = actual_blocks[next_block++];
+      const auto rows = std::min(shape.tile_m, totals[expert] - retired);
+      require(block.expert == expert && block.expert_row == retired &&
+                  block.rows == rows,
+              "window block and C retirement rows");
+      retired += rows;
+    }
+  }
+  require(actual_prefix[owned] == next_block &&
+              next_block <= actual_blocks.size(),
+          "window no-drop capacity bound");
 }
 
 } // namespace
@@ -178,7 +338,12 @@ int main() {
       }
     }
     run(3U, 64U, false, true);
-    std::cout << "static V4 GPU source plan: 31 cases passed\n";
+    for (unsigned nodes : {1U, 2U, 3U}) {
+      run_geometry(nodes, false);
+      run_geometry(nodes, true);
+    }
+    std::cout << "static V4 GPU plan: 31 source/packet + 6 destination cases "
+                 "passed\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
