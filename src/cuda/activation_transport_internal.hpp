@@ -4,8 +4,9 @@
 #include "cuda/profiling/device_timeline_types.hpp"
 #include "cuda/static_v4/plan.hpp"
 #include "cuda/static_v4/compute_ring.hpp"
+#include "cuda/static_v4/ring_layout.hpp"
 #if defined(__CUDACC__)
-#include "cuda/static_v4/source_plan.cuh"
+#include "cuda/static_v4/packet_plan.cuh"
 #include "cuda/static_v4/window_geometry.cuh"
 #endif
 #include "transport/activation_protocol_testing.hpp"

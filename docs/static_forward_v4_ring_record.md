@@ -567,7 +567,7 @@ generic stores 额外经过 async-proxy fence，再发布 X full 供 FC1 TMA 读
 但延迟超过现有 TMA 方案三倍。撤回整个候选，不保留向量搬运分支或未使用
 staging 的实验代码；不继续为明显失败的候选追加完整测试。TMA 仍是主路径。
 
-## M3a：双向 packet 目录与独立 source metadata（验证中）
+## M3a：双向 packet 目录与独立 source metadata（已验证）
 
 - Dispatch 在冻结 consumer counts 的同一遍遍历中建立 remote route→packet/token
   row 反向索引。它只覆盖实际 remote valid routes，不将重复 expert slot 合并。
@@ -599,3 +599,48 @@ GPU planner binary SHA256：
 host suite 18/18 通过。B16/D1 的 T1/64 及全部现有 edge cases exit 0；
 第二节点单机 B16/D1/T64 memcheck/racecheck 均 exit 0（同前述 API 报告选项）。
 多机 ring 仍未启用。
+
+## M3b/M4：双向网络 ring 首版（数值通过，性能未达标）
+
+已接线的候选使用分离四区 TX/RX、固定 channel owner、逐 slot NIC ready/消费
+credit 与本地 completion；Return rail 根据 immutable RouteLocation pull C，
+source RX scatter 后即可归还网络 credit，Reduce 后释放 contribution。网络 payload
+不再广播整个 X，只发送实际命中节点的去重 token；计划元数据仍在调用前交换。
+
+相对原提案的具体收敛见设计第 6.6 节：RX 可有界预取，X 写入前做 destination
+整窗准入，省掉跨 NIC 窗口准入消息；已有 immutable 目录，不再在 packet 重复
+携带 token/fanout/Return records。Return rail 自己 pull 已 ready C，避免额外
+packer publication。末尾保留调用级 GIN barrier 保护 metadata 复用，不将其搬到
+逐 packet/window 热路径。此处只记录实现边界，不提前声明正确性或性能收益。
+
+验证结果：host suite 18/18；单机 EP8/T64 graph 冒烟通过；双机 EP16 的现有
+PyTorch 四规模/edge cases 全部通过，另跑 B16/D1 的 T1/64 与全部小规模 edge
+cases 通过，两节点进程均 exit 0。包含混合 decode/prefill、空 source、重复
+expert、共享 workspace 多层 graph、变动输入/路由、20K 全热点不丢 token及
+热点后复用。没有新增测试入口。双机 sanitizer 首次尝试在 rank 0 bootstrap
+前超过 launcher 的 60 秒限制，没有进入数据面，**不算 memcheck 通过或内核失败**。
+
+冻结 binary `build/static_v4_ring_network/test_cuda_notify` SHA256：
+`ded7fb2a29f2b10f01564e80e9e2802f048b00ca166d263e32a52301e7b23492`。
+1620 MHz 快速 graph 筛选（10 warmup、2 samples、batch=2，非正式 10/20/20）：
+
+| EP16 tokens/rank | B / contribution depth | rank-max p50/us |
+|---:|---:|---:|
+| 1 | 256 / 4 | 289.888 |
+| 64 | 16 / 1，复用压力测试 | 2562.85 |
+| 8192 | 256 / 4 | 72605.2 |
+| 20480 | 256 / 4 | 175901.0 |
+
+这不是性能完成版本；8K/20K 远慢于 V3。T64 小窗口结果不与常规 B256 性能比较。
+T64/8K/20K 前八个 rank hash 与单机同 fixture 一致；独立 PyTorch 参考覆盖全部
+16 ranks。日志见 `build/ring_network_{ep16_*,torch_ep16_*}.log`。
+
+首个 profile，EP16/8K/B256/D4，rank 0 的每 packet p50：Dispatch pack 21.2 us，
+pack end→Put 16.8 us；Return pack 51.0 us，pack end→C 退休及 Put 102.8 us；
+source Return scatter（含逐行发布）71.6 us。两条 Return lane 各有 256 包，
+每 lane 累积 pack 12.5 ms、退休/提交 25.8 ms，scatter owner 累积约 18.3 ms。
+这些区间并行，不可直接相加为端到端延迟。trace overflow=0。
+首个 FC1 在约 2.85 ms，最后 Dispatch Put 约 64.85 ms；Return 从约 3.57 ms 开始，
+FC2 持续至约 68.21 ms。流水已重叠，问题主要是通信控制/搬运吞吐，不是仍有
+Dispatch→FC 的全节点 barrier。下一步单独消融重复 C-ready 检查、逐行 system
+退休与 scatter 发布，再考虑通信 worker 数，不能把这些代价归为 GEMM 效率。

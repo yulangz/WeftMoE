@@ -2095,6 +2095,9 @@ void test_static_forward_network_layout() {
   constexpr unsigned rows = 32U, top_k = 4U, hidden = 2048U;
   const auto dispatch = plan::PacketLayout::dispatch(rows, rows * top_k, hidden);
   const auto returning = plan::PacketLayout::returning(rows, hidden);
+  const auto planned = plan::PacketLayout::planned(rows, hidden);
+  REQUIRE(planned.payload % 128U == 0U);
+  REQUIRE(planned.bytes == planned.payload + rows * hidden * 2U);
   for (unsigned n = 1; n <= rows; ++n) {
     const auto compact = plan::PacketLayout::dispatch(n, n * 2U, hidden);
     REQUIRE(compact.payload % 128U == 0U);
@@ -2113,6 +2116,11 @@ void test_static_forward_network_layout() {
         for (unsigned lane = 0; lane < rings.lanes; ++lane) {
           const auto channel = rings.channel(self, peer, lane);
           REQUIRE(channels.insert(channel).second);
+          REQUIRE(rings.peer(self, channel) == peer);
+          for (bool ret : {false, true}) {
+            const auto state = rings.state(ret, channel);
+            ranges.emplace_back(state, state + sizeof(plan::NetworkChannel));
+          }
           for (unsigned slot = 0; slot < rings.depth; ++slot) {
             for (bool ret : {false, true}) {
               const auto control = rings.control(ret, channel, slot);

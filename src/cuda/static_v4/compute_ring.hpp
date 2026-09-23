@@ -65,6 +65,14 @@ struct SourceHeader {
   unsigned error;
 };
 
+// Written once by the destination GPU after window geometry. A rail's Return
+// owner can locate C without retaining X or scanning remote expert prefixes.
+struct RouteLocation {
+  std::uint64_t generation;
+  std::uint64_t block;
+  std::uint32_t row; // Physical X/S/C row on the destination GPU.
+};
+
 // Offsets from one source's immutable metadata region. The same layout is
 // locally allocated on one node, and replicated in registered rail memory
 // for network planning. X is deliberately absent from this region.
@@ -75,6 +83,8 @@ struct SourceMetadataLayout {
   std::size_t dispatch_offsets = 0, dispatch_packets = 0;
   std::size_t dispatch_consumers = 0, dispatch_routes = 0;
   std::size_t return_prefix = 0, return_offsets = 0, return_packets = 0;
+  std::size_t locations = 0;
+  std::size_t published_bytes = 0;
   std::size_t bytes = 0;
 };
 
@@ -84,6 +94,7 @@ struct ComputeRingView {
   float *source_gates = nullptr;
   DispatchPlanView dispatch{};
   ReturnPlanView returning{};
+  RouteLocation *locations = nullptr;
   std::uint32_t depth = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t contribution_stride = 0;

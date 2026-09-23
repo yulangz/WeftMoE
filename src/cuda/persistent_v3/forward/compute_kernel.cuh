@@ -1693,7 +1693,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               auto &slot = static_v4::ring::slot(a, mblock);
               const auto target = slot.fc2_target;
               *return_mblock_shared =
-                  static_v4::ring::arrive(slot.fc2_done, tile_count) + tile_count == target;
+                  static_v4::ring::arrive<StaticLocal ? ::cuda::thread_scope_device
+                                                     : ::cuda::thread_scope_system>(
+                      slot.fc2_done, tile_count) + tile_count == target;
             } else {
               ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
                   complete(fc1_done[mblock]);

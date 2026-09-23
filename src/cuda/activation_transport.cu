@@ -1768,9 +1768,10 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     requirements.ginSignalCount = 3U;
     // Every wire slot has its own local-completion counter. Counters 0/1 are
     // reserved for bootstrap and terminal-status collectives.
-    requirements.ginCounterCount = 2U + pool->gin_layout.rings.channels() *
-                                            communication::kRingDepth *
-                                            pool->slots.size();
+    const auto wire_counters = pool->gin_layout.static_forward.rings.depth
+        ? 2U * pool->gin_layout.static_forward.rings.slots()
+        : pool->gin_layout.rings.channels() * communication::kRingDepth;
+    requirements.ginCounterCount = 2U + wire_counters * pool->slots.size();
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     internal::throw_nccl(
         "gin-create",
@@ -1806,14 +1807,19 @@ std::shared_ptr<GinBackendState> create_gin_backend(
             session.session().generation(), ExchangeKind::ExpertCounts,
             "ncclCommWindowRegister(activation pool slot)");
         resources.windows.push_back(window);
-        auto ring_layout = pool->gin_layout.rings;
-        ring_layout.counter_base += (&slot - pool->slots.data()) *
-                                    ring_layout.channels() *
-                                    communication::kRingDepth;
-        communication::initialize<<<
-            allocated_context_count, 1, 0,
-            internal::checked_execution_state(execution)->stream>>>(
-            resources.dev_comm, window, ring_layout, allocated_context_count);
+        const auto stream = internal::checked_execution_state(execution)->stream;
+        if (pool->gin_layout.static_forward.rings.depth) {
+          auto network = pool->gin_layout.static_forward;
+          network.counter_base += (&slot - pool->slots.data()) * 2U * network.rings.slots();
+          static_v4::netring::initialize<<<allocated_context_count, 1, 0, stream>>>(
+              resources.dev_comm, window, network);
+        } else {
+          auto ring_layout = pool->gin_layout.rings;
+          ring_layout.counter_base += (&slot - pool->slots.data()) *
+                                      ring_layout.channels() * communication::kRingDepth;
+          communication::initialize<<<allocated_context_count, 1, 0, stream>>>(
+              resources.dev_comm, window, ring_layout, allocated_context_count);
+        }
         internal::throw_cuda(
             "gin-create", cudaGetLastError(), nccl->rank, nccl->world,
             session.session().identity(), session.session().generation(),
@@ -4466,8 +4472,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       !config.retain_backward_state &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
   if (state->layout.static_ring.depth &&
-      (!static_v4_candidate || !fused_inference_routes || use_gin))
-    throw std::invalid_argument("ring workspace requires fused local static inference");
+      (!static_v4_candidate || !fused_inference_routes))
+    throw std::invalid_argument("ring workspace requires fused static inference");
   const bool serialized_graph_replay =
       static_v4_candidate && config.serialized_graph_replay;
   const bool direct_inference_routes = config.inference_routes.data != nullptr ||
@@ -4789,6 +4795,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #endif
     args.gin_window_base = slot.gin_window;
     args.static_network = state->gin_layout.static_forward;
+    args.static_network.counter_base +=
+        lease->index * 2U * args.static_network.rings.slots();
     args.gin_rings = state->gin_layout.rings;
     args.gin_rings.counter_base +=
         lease->index * args.gin_rings.channels() * communication::kRingDepth;
@@ -4833,7 +4841,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);
     r.rows = at<static_forward::RingRow>(slot.device, l.rows);
     const auto &m = l.source;
-    auto *metadata = at<char>(slot.device, l.metadata);
+    auto *metadata = use_gin
+        ? at<char>(slot.gin_window, args.static_network.source +
+                                     args.node * args.static_network.source_stride)
+        : at<char>(slot.device, l.metadata);
     r.source_header = at<static_forward::SourceHeader>(metadata, m.header);
     r.source_gates = at<float>(metadata, m.gates);
     auto &p = r.source;
@@ -4856,6 +4867,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     p.packet_prefix = at<std::uint64_t>(metadata, m.packet_prefix);
     p.error = &r.source_header->error;
     if (id.num_nodes > 1U) {
+      p.selected_experts = at<std::int32_t>(metadata, m.selected);
+      r.locations = at<static_forward::RouteLocation>(metadata, m.locations);
       r.dispatch = {at<std::uint64_t>(metadata, m.dispatch_offsets),
                     at<static_forward::DispatchPacketPlan>(metadata, m.dispatch_packets),
                     at<std::uint32_t>(metadata, m.dispatch_consumers),
@@ -5109,6 +5122,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
       const auto forward_main_compute_ctas = args.forward_compute_cta_count;
+      if (args.ring.depth && use_gin &&
+          forward_main_compute_ctas < std::max(args.static_network.contexts,
+                                              2U * args.static_network.ring_workers + 1U))
+        throw std::invalid_argument("static network ring requires CTAs for copy and compute progress");
       const bool prefill = static_v4_enabled &&
                            forward_tuning::kStaticV4PrefillMinTokens &&
                            id.num_tokens >=
@@ -5161,11 +5178,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               ? unified_forward_entry<false, false, true>()
               : unified_forward_entry<true, false, true>();
           if (args.ring.depth)
-            kStaticUnified = unified_forward_entry<true, false, true, false, true>();
+            kStaticUnified = use_gin
+                ? unified_forward_entry<false, false, true, false, true>()
+                : unified_forward_entry<true, false, true, false, true>();
           if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
             if (prefill) {
               if (args.ring.depth)
-                kStaticUnified = unified_forward_entry<true, false, true, true, true>();
+                kStaticUnified = use_gin
+                    ? unified_forward_entry<false, false, true, true, true>()
+                    : unified_forward_entry<true, false, true, true, true>();
               else
                 kStaticUnified = use_gin
                     ? unified_forward_entry<false, false, true, true>()

@@ -6,6 +6,7 @@ namespace static_v4::ring {
 // It services source and destination capacity independently; reserving a
 // source window never depends on the destination's available X/S/C space.
 // Lanes own disjoint slot checks/publications, not independent task cursors.
+template <bool Network>
 __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
                                    unsigned fc2) {
   const auto &r = a.ring;
@@ -32,7 +33,9 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
         // probes its own GPU, not the source GPU once for every activation row.
         // A head may advance past a reader's window, but that window cannot
         // retire until this reader's route has returned and been reduced.
-        for (unsigned destination = lane; destination < a.world;
+        const auto first = Network ? a.node * a.local_world_size : 0U;
+        const auto peers = Network ? a.local_world_size : a.world;
+        for (unsigned destination = first + lane; destination < first + peers;
              destination += 32U)
           publish<::cuda::thread_scope_system>(
               peer(a, destination, r.source_reserved)[a.rank], seq + 1U);
@@ -58,7 +61,8 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
           s.fc1_target += fc1;
           s.fc2_target += fc2;
           s.return_target += r.blocks[block].tile.rows;
-          publish(s.generation, r.blocks[block].generation);
+          publish<Network ? ::cuda::thread_scope_system : ::cuda::thread_scope_device>(
+              s.generation, r.blocks[block].generation);
         }
         __syncwarp();
         ++window;

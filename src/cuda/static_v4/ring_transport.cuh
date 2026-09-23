@@ -1,13 +1,16 @@
 #pragma once
 
+#include "cuda/static_v4/network_transport.cuh"
+
 // Included in forward_unified_transport. Pull and Return each have one issuer
 // and two private staging slots, using the common row-prefetch pipeline.
 // A batch stays within a fully admitted window and drains before publishing
 // readiness/retirement; it cannot hold an earlier window across a capacity
 // wait.
-template <bool Return, class Storage>
+template <bool Return, bool Network, class Storage>
 __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
-                                           Storage &s) {
+                                           Storage &s, unsigned worker,
+                                           unsigned workers) {
   namespace ring = static_v4::ring;
   if ((threadIdx.x & 31U) != 0U)
     return;
@@ -27,8 +30,8 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
     const auto *sources = r.window_sources + window * shape.sources;
     const auto source_begin = shape.source_begin(window);
     const auto end = r.window_prefix[window + 1U] * TileM;
-    for (auto base = r.window_prefix[window] * TileM + 2ULL * blockIdx.x;
-         base < end; base += 2ULL * gridDim.x) {
+    for (auto base = r.window_prefix[window] * TileM + 2ULL * worker;
+         base < end; base += 2ULL * workers) {
       bool copied = false;
 #pragma unroll
       for (unsigned item = 0; item < 2U; ++item) {
@@ -37,9 +40,12 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
         const auto m = static_cast<unsigned>(index % TileM);
         if (index >= end || m >= r.blocks[block].tile.rows)
           continue;
+        const auto identity = r.rows[index];
+        if constexpr (Network)
+          if (identity.source / a.local_world_size != a.node)
+            continue;
         while (!ring::admitted(a, block)) {
         }
-        const auto identity = r.rows[index];
         const auto &address = sources[identity.source - source_begin];
         const void *source;
         void *destination;
@@ -104,9 +110,12 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
         const auto m = static_cast<unsigned>(index % TileM);
         if (index >= end || m >= r.blocks[block].tile.rows)
           continue;
+        const auto identity = r.rows[index];
+        if constexpr (Network)
+          if (identity.source / a.local_world_size != a.node)
+            continue;
         auto &slot = ring::slot(a, block);
         if constexpr (Return) {
-          const auto identity = r.rows[index];
           const auto &address = sources[identity.source - source_begin];
           const auto row = address.row_base + identity.route - route_begin;
           ring::publish<::cuda::thread_scope_system>(
@@ -122,6 +131,8 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
         }
       }
     }
+    if constexpr (Network && !Return)
+      network_ring_transport::pull_window(a, s, worker, workers, window, peer_rows);
   }
   if (peer_rows)
     atomicAdd(Return ? &status->actual_return_peer_bytes
@@ -133,7 +144,8 @@ __device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
             device_globaltimer_ns());
 }
 
-__device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a) {
+__device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a,
+                                         unsigned worker, unsigned workers) {
   namespace ring = static_v4::ring;
   const auto &r = a.ring;
   const auto lane = threadIdx.x & 31U;
@@ -147,8 +159,7 @@ __device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a) {
     const auto end = begin + static_forward::block_rows(
                                  r.source.tokens, window, shape.tokens);
     unsigned completed = 0U;
-    for (auto token = begin + blockIdx.x - 1U; token < end;
-         token += gridDim.x - 1U) {
+    for (auto token = begin + worker; token < end; token += workers) {
       const auto first_row = address.row_base + (token - begin) * shape.top_k;
       if (lane == 0U)
         for (unsigned k = 0; k < shape.top_k; ++k)
@@ -180,7 +191,7 @@ struct RingStaging
   static constexpr unsigned kBuffers = 2U, kStorageSlots = 2U;
 };
 
-template <unsigned Fc1N, unsigned Fc2N, class Storage>
+template <unsigned Fc1N, unsigned Fc2N, bool Network, class Storage>
 __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
                                          Storage &storage) {
   auto &s = *reinterpret_cast<RingStaging *>(&storage);
@@ -194,12 +205,38 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
   domain_sync<96U>();
   if (a.dispatch.runtime->error)
     return;
+  if constexpr (Network) {
+    const auto network_workers = a.static_network.ring_workers;
+    if (warp == 0U) {
+      if (blockIdx.x < network_workers)
+        network_ring_transport::transmit<false>(a, s, blockIdx.x);
+      else
+        ring_transfer<false, true>(a, s, blockIdx.x - network_workers,
+                                   gridDim.x - network_workers);
+    } else if (warp == 1U) {
+      if (blockIdx.x < network_workers)
+        network_ring_transport::transmit<true>(a, s, blockIdx.x);
+      else if (blockIdx.x < 2U * network_workers)
+        network_ring_transport::receive_return(a, s, blockIdx.x - network_workers);
+      else
+        ring_transfer<true, true>(a, s, blockIdx.x - 2U * network_workers,
+                                  gridDim.x - 2U * network_workers);
+    } else if (blockIdx.x == 0U) {
+      static_v4::ring::admit<true>(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);
+    } else if (blockIdx.x <= network_workers) {
+      network_ring_transport::receive_progress(a, blockIdx.x - 1U);
+    } else {
+      ring_reduce(a, blockIdx.x - network_workers - 1U,
+                   gridDim.x - network_workers - 1U);
+    }
+    return;
+  }
   if (warp == 0U)
-    ring_transfer<false>(a, s);
+    ring_transfer<false, false>(a, s, blockIdx.x, gridDim.x);
   else if (warp == 1U)
-    ring_transfer<true>(a, s);
+    ring_transfer<true, false>(a, s, blockIdx.x, gridDim.x);
   else if (blockIdx.x == 0U)
-    static_v4::ring::admit(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);
+    static_v4::ring::admit<false>(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);
   else
-    ring_reduce(a);
+    ring_reduce(a, blockIdx.x - 1U, gridDim.x - 1U);
 }

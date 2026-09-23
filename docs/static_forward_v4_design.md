@@ -135,9 +135,10 @@ plan/紧凑目录还需让目标 GPU 枚举每个 (channel, sequence) 的实际 
 
 source owner 先预留自己参与窗口的 contribution 容量；destination owner 一次检查
 并预留本 rank 该窗口全部 Mblocks 的 X/S/C，然后各自发布准入 credit。禁止在
-destination 内占住部分 X/S/C 后等待本窗口剩余 plane。发送方只等待该 packet
-实际涉及的目的 rank 准入和自己的 contribution reservation，不做分布式原子预留，
-也不做全节点窗口 barrier。
+destination 内占住部分 X/S/C 后等待本窗口剩余 plane。M3b 采用分级准入：发送方
+等待自己的 contribution reservation 与 TX 双重 credit；有界 RX 可以预取尚未
+获准计算的窗口，真正 pull 到 X 前才等待本 destination 的整窗口准入。因此无需
+额外跨 NIC 交换每个 destination 的窗口 credit，也不做全节点窗口 barrier。
 
 容量推导（M=128，K=top-k，E_local 为本 rank expert 数）：
 
@@ -160,7 +161,7 @@ Dispatch 前预留，否则 Return 可能反向等待仍未分配的目的地。
 同一窗口内可保留各 cluster 先 FC1、再 FC2 的静态枚举，但必须先保证整窗口
 S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 的 FC1 枚举结束。
 通信/计算只按已准入窗口的有序任务推进，后续窗口不能占住前一窗口释放所需的资源。
-具体角色配额、跨节点准入消息和等待图在实现 milestone 中验证，不能仅凭 ring
+具体角色配额、分级准入和等待图在实现 milestone 中验证，不能仅凭 ring
 容量公式宣称已证明整条网络流水无死锁。
 
 ## 3. Buffer 布局与地址
@@ -378,13 +379,15 @@ source 从 top-k routes 得到每个 token 的实际目标节点集合；同一�
 packet 按 (window, destination node, lane) 的固定 token 顺序切分，每包最多 Q 个
 去重 token。一个 packet 可以 fanout 到同节点多个 GPU、expert 和 Mblock；
 不再强制一个 packet 只能覆盖一个 destination Mblock，否则破坏节点级 X 去重。
-这些目标必须属于同一个已准入窗口。
+这些目标必须属于同一个窗口；RX 可提前暂存，写 X 则必须已准入。
 
 每个 rail/lane 的固定发送 owner：
 
-1. 等相关目的 rank 的窗口准入和 source contribution reservation。
+1. 等 source contribution reservation；目的整窗口准入由 RX→X 的 pull 检查。
 2. 等物理 TX slot 上一代的远端消费 credit 与本地 Put completion。
-3. 打包 X/route/header，生成 fanout_count 和该 RX slot 的 retire_target。
+3. 按 immutable packet 目录打包 X/header，使用计划中的 fanout_count 累加该 RX
+   slot 的 retire_target。M3b 已交换 route/token/consumer 目录，wire 不再重复携带
+   TokenRecord/FanoutRecord；数据布局为 128-byte 对齐 header 加实际完整 X 行。
 4. 等所有 packer 实际写入完成并导入 system visibility，再发一次绑定 ready signal 的 Put。
 5. 按静态 sequence 前进；不使用 channel/task claim CAS。
 
@@ -433,9 +436,10 @@ route/mblock 列表枚举，按 (window, source rank, lane) 分包；一个 pack
 内所有 FC2。首版每行等待其 Mblock 的全部 FC2 N tiles 完成，不做列片段 Return。
 
 - same-node：静态 worker 将完整 C 行写入 source contribution 并发布 route-ready。
-- remote：worker 把完整行及返回标识复制到目标 source rail 的独立 Return TX；
-  pack 完成后按贡献的行数退休各 C slot。
-- TX owner 等本 packet 所有行可见后 GIN Put；math 继续处理其他 Mblocks。
+- remote：M3b 的 rail TX owner 先非阻塞检查 packet 的全部 C 行，再从本节点各
+  expert GPU pull 到独立 Return TX；不引入额外 packer→TX ready 计数。全部复制
+  完成后按完整行退休 C，再 GIN Put；math 继续处理其他 Mblocks。返回标识来自
+  immutable Return 目录，wire 同样只有 header 和 payload。
 - source RX owner 收到 ready，按窗口/token/top-k slot scatter 到 contribution，
   完成复制和 readiness publication 后返还 RX credit。
 - source Reduce 等该 token 的所有有效 contribution，按现有固定顺序求和。
@@ -489,6 +493,34 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 
 禁止沿用“所有 Dispatch Put 后一次全节点 barrier，再开始 FC1”和“全部 FC2 后
 统一 Return”的主流程。终端 drain 不得提前放到每个 packet/window 的 hot path。
+
+### 6.6 M3b 首版具体布局与进度约束（实现中，尚未验收）
+
+- 每 rail 使用 `(nodes-1)×2` 个 channel，Q=32 完整行，网络深度为 8；Dispatch
+  TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
+  和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
+  TX target/local completion、RX 已 ACK generation 均跨 invocation 保留。
+- `W=min(channel_count,8)`。通信 warp 0 的前 W 个 CTA 做 Dispatch TX，其他做
+  local/remote pull；warp 1 前 W 个做 Return TX、接下来 W 个做 Return RX scatter，
+  其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，
+  其他做 Reduce。math/producer 仍在全部 CTA 上静态分工。三类 GIN owner 分别
+  使用独立的 W 个 context。TX 对 credit/C-ready 做非阻塞轮询，不阻塞其他 channel。
+- receiver 的 immutable metadata replica 另有 `RouteLocation[route]`，由实际
+  destination 写入 `{generation,logical_block,physical_row}`，经一次节点内
+  PlanReady barrier 发布。Return rail 从该表找到 C；Dispatch pull 找到 X。
+  此表属于 invocation metadata，不随 RX slot 复用；不跨 NIC 交换此本地地址表。
+- 最老未完成窗口已有 source contribution 容量；destination 可完整预留该窗口，
+  不等待 NIC credit。每 channel 的 TX 只按递增 window/packet 前进；pull 同样先
+  window，再 source/lane/packet，静态 residue 不重叠。后窗 packet 即使提前占用
+  部分 RX，也不能越过同 channel 的前窗 packet，且独立 RX/ACK 能继续回收前窗。
+  Return TX 只复制全包已 ready 的 C 行，scatter 的目的 contribution 已预留，
+  Reduce 释放 source 窗口，随后准入后窗。这个等待关系仍需热点/小深度实测验证，
+  不能把推导替代多机验收。
+- NIC `readSignal(acquire)` → system-release `visible_generation` → peer acquire
+  → 全部 TMA 完成 → system 累计 consumed → ACK，逐包建立可见性及复用链。
+  所有 packet/reader/local completion drain 后才进行 invocation 结束 GIN barrier，
+  防止快节点在慢节点仍读目录时开始覆盖下一次调用的 metadata。payload 中间无
+  全节点 collective；跨调用仍保留这一边界。
 
 ## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
 
@@ -705,7 +737,8 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 
 - [ ] 实现按目标节点去重的 packet，未命中节点不发送 X，支持参数化 peer 数。
 - [ ] 接入分离 TX/RX ring、固定 GIN owner、ready 可见性链、fanout 完成及双重 credit。
-- [ ] 实现跨节点窗口准入；RX/pull/credit 的进度不受阻塞 TX owner 影响。
+- [ ] 实现分级窗口准入（source reservation、RX 暂存、destination 整窗 pull）；
+      RX/pull/credit 的进度不受阻塞 TX owner 影响。
 - [ ] 移除 data-plane Dispatch 全节点 barrier，验证 NIC 接收、节点内 pull、FC 时间线重叠。
 - [ ] EP16 四规模和边界路由通过；若过渡阶段仍保留完整 Return arena，明确标为
       临时路径，不能在此宣称全部多机有界流水完成。

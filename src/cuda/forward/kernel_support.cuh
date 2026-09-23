@@ -636,6 +636,13 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 }
 #endif
 
+static_forward::WindowShape static_ring_shape(const ActivationTransportPoolConfig &config) {
+  return {config.max_world_size, std::min(config.max_world_size, 16U),
+          static_cast<unsigned>(std::min<std::uint64_t>(config.static_forward_window_tokens,
+                                                       config.max_tokens_per_rank)),
+          config.max_top_k};
+}
+
 static_forward::SourceMetadataLayout make_source_metadata_layout(
     const ActivationTransportPoolConfig &config, static_forward::WindowShape shape,
     static_forward::PacketPartition packets) {
@@ -676,6 +683,9 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
                                "Return channel offsets");
     m.return_packets = append(cursor, routes, sizeof(static_forward::ReturnPacketPlan),
                                "Return packet directory");
+    m.published_bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
+    m.locations = append(cursor, routes, sizeof(static_forward::RouteLocation),
+                          "destination route locations");
   }
   m.bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
   return m;
@@ -688,7 +698,19 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     return layout;
   std::size_t cursor = 0;
   const auto remote_nodes = config.max_nodes > 0 ? config.max_nodes - 1U : 0U;
-  if (config.max_intermediate_size && !config.enable_backward_state) {
+  if (config.static_forward_window_tokens) {
+    auto &network = layout.static_forward;
+    const static_forward::PacketPartition packets{32U, 2U};
+    const auto metadata = make_source_metadata_layout(config, static_ring_shape(config), packets);
+    network.source_stride = metadata.bytes;
+    network.source_bytes = metadata.published_bytes;
+    network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
+    const auto packet = static_forward::PacketLayout::planned(packets.rows, config.max_hidden_size);
+    network.rings = {config.max_nodes, packets.lanes, 8U, packet.bytes, packet.bytes};
+    network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 8U));
+    network.contexts = 3U * network.ring_workers;
+    network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
+  } else if (config.max_intermediate_size && !config.enable_backward_state) {
     auto &network = layout.static_forward;
     const auto experts = checked_mul(config.max_owned_experts,
                                      config.max_world_size, "V4 experts");
@@ -823,6 +845,10 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
              "GIN production error records");
+  if (config.static_forward_window_tokens) {
+    layout.total = cursor;
+    return layout;
+  }
   auto &rings = layout.rings;
   rings.dispatch_channels = remote_nodes * communication::kDispatchChannels;
   rings.return_channels = remote_nodes *
@@ -893,15 +919,11 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     if (config.static_forward_contribution_windows == 0U)
       throw std::invalid_argument("static ring requires contribution capacity");
     if (config.enable_backward_state || config.enable_socket_fallback ||
-        config.max_nodes != 1U || config.max_intermediate_size == 0U)
+        (config.max_nodes > 1U && !config.enable_gin_rdma) ||
+        config.max_intermediate_size == 0U)
       throw std::invalid_argument(
-          "static ring currently requires single-node inference Forward");
-    ring.shape = {config.max_world_size,
-                  std::min(config.max_world_size, 16U),
-                  static_cast<unsigned>(std::min<std::uint64_t>(
-                      config.static_forward_window_tokens,
-                      config.max_tokens_per_rank)),
-                  config.max_top_k};
+          "static ring requires inference Forward and GIN for remote nodes");
+    ring.shape = static_ring_shape(config);
     const auto window_blocks = ring.shape.max_mblocks(config.max_owned_experts);
     ring.max_windows = ring.shape.windows(config.max_tokens_per_rank);
     ring.max_blocks = checked_mul(ring.max_windows, window_blocks,
@@ -926,7 +948,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                     config.max_top_k, sizeof(std::uint64_t),
         "contribution route generations");
     ring.source = make_source_metadata_layout(config, ring.shape, ring.packets);
-    ring.metadata = append(cursor, 1U, ring.source.bytes, "source metadata");
+    if (config.max_nodes == 1U)
+      ring.metadata = append(cursor, 1U, ring.source.bytes, "source metadata");
     ring.window_prefix = append(cursor, ring.max_windows + 1U,
                                  sizeof(std::uint64_t), "window block prefixes");
     ring.window_sources = append(cursor, ring.max_windows * ring.shape.sources,
@@ -1205,7 +1228,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
             "fused source route table"),
         sizeof(std::uint32_t), "fused source route table");
     layout.fused_source_gates = ring.depth
-        ? ring.metadata + ring.source.gates
+        ? (config.max_nodes == 1U ? ring.metadata + ring.source.gates : 0U)
         : append(cursor, routes, sizeof(float), "fused source route gates");
     layout.fused_owned_expert_ids = append(
         cursor, config.max_owned_experts, sizeof(std::uint32_t),

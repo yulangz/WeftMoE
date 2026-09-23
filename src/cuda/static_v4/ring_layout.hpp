@@ -23,6 +23,15 @@ struct PacketLayout {
   std::size_t payload;
   std::size_t bytes;
 
+  // Frozen directories already identify every token/route. The wire packet
+  // only needs its generation/retirement header and the actual activation rows.
+  WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
+  planned(std::uint32_t rows, std::uint32_t hidden) {
+    const auto payload = align_payload(sizeof(PacketHeader));
+    return {0U, 0U, payload,
+            align_payload(payload + std::size_t(rows) * hidden * 2U)};
+  }
+
   WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
   dispatch(std::uint32_t tokens, std::uint32_t fanout_count,
            std::uint32_t hidden) {
@@ -57,6 +66,16 @@ struct alignas(64) NetworkSlot {
   std::uint64_t acknowledged_generation = 0;
 };
 static_assert(sizeof(NetworkSlot) == 64U);
+
+// Bases are immutable during one invocation. Separate fixed owners advance
+// TX, NIC-import and Return-scatter cursors; only terminal drain advances bases.
+struct alignas(64) NetworkChannel {
+  std::uint64_t tx_base;
+  std::uint64_t rx_base;
+  std::uint64_t tx_cursor;
+  std::uint64_t rx_cursor;
+  std::uint64_t consume_cursor;
+};
 
 struct SlotSequence {
   std::uint64_t sequence;
@@ -125,14 +144,25 @@ struct NetworkRings {
     const auto compact_peer = peer - (peer > self ? 1U : 0U);
     return std::uint64_t(compact_peer) * lanes + lane;
   }
+  WEFTMOE_STATIC_RING_HD constexpr std::uint32_t
+  peer(std::uint32_t self, std::uint64_t channel_id) const {
+    const auto compact = static_cast<std::uint32_t>(channel_id / lanes);
+    return compact + (compact >= self);
+  }
+  WEFTMOE_STATIC_RING_HD constexpr std::size_t
+  state(bool returning, std::uint64_t channel_id) const {
+    return ((returning ? channels() : 0U) + channel_id) * sizeof(NetworkChannel);
+  }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t
   control(bool returning, std::uint64_t channel_id,
           std::uint64_t sequence) const {
-    return ((returning ? slots() : 0U) + channel_id * depth +
+    return 2U * channels() * sizeof(NetworkChannel) +
+           ((returning ? slots() : 0U) + channel_id * depth +
             sequence % depth) * sizeof(NetworkSlot);
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t data_begin() const {
-    return align_payload(2U * slots() * sizeof(NetworkSlot));
+    return align_payload(2U * channels() * sizeof(NetworkChannel) +
+                         2U * slots() * sizeof(NetworkSlot));
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t
   payload(bool returning, bool receive, std::uint64_t channel_id,

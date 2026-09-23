@@ -2,8 +2,32 @@
 
 namespace static_v4::ring {
 
-__device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
-                                           unsigned char *scratch) {
+__device__ __forceinline__ void finish_network(const ForwardKernelArgs &a) {
+  constexpr unsigned Base = 256U, Threads = 128U;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  if (blockIdx.x == 0U && threadIdx.x == Base)
+    status->after_combine_start_clock = device_globaltimer_ns();
+  // All static owners have retired their packets, readers and local NIC
+  // completions. Protect invocation metadata before a peer stages its next plan.
+  network_barrier<Base, Threads>(a);
+  if (blockIdx.x == 0U) {
+    const auto &network = a.static_network;
+    for (unsigned index = threadIdx.x - Base; index < 2U * network.rings.channels();
+         index += Threads) {
+      auto &channel = *peer_at<static_forward::NetworkChannel>(
+          a.gin_window_base, network.ring_region +
+              index * sizeof(static_forward::NetworkChannel));
+      channel.tx_base = channel.tx_cursor;
+      channel.rx_base = channel.rx_cursor;
+    }
+    if (threadIdx.x == Base)
+      status->after_combine_complete_clock = device_globaltimer_ns();
+  }
+}
+
+template <bool Network>
+__device__ __noinline__ void prepare(const ForwardKernelArgs &a,
+                                     unsigned char *scratch) {
   constexpr unsigned Math = 256U, Control = 128U;
   const auto &r = a.ring;
   const auto &p = r.source;
@@ -21,21 +45,64 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
     auto *input = peer_at<uint4>(a.local_base, a.source_input_offset);
     for (auto v = tid; v < p.tokens * a.hidden / 8U; v += stride)
       input[v] = reinterpret_cast<const uint4 *>(a.input)[v];
-    for (auto route = tid; route < p.tokens * p.shape.top_k; route += stride)
+    for (auto route = tid; route < p.tokens * p.shape.top_k; route += stride) {
       r.source_gates[route] = a.gates[route];
+      if constexpr (Network)
+        const_cast<std::int32_t *>(p.selected_experts)[route] = a.selected_experts[route];
+    }
     build_combine_order(a, tid, stride);
     collective_scope_sync<384U, kCollectiveJoinBarrier>();
     collective_scope_sync<384U, kCollectiveJoinBarrier>();
     return;
   }
   const auto tid = threadIdx.x - Math;
+  const auto worker = std::uint64_t(blockIdx.x) * Control + tid;
+  const auto workers = std::uint64_t(gridDim.x) * Control;
   auto *counts = reinterpret_cast<unsigned *>(scratch);
+  auto planner = p;
+  if constexpr (Network) {
+    // Planning reads the caller's routes while math stages the immutable copy.
+    planner.selected_experts = a.selected_experts;
+    const auto &network = a.static_network;
+    for (auto index = worker; index < 2U * network.rings.channels(); index += workers) {
+      auto &channel = *peer_at<static_forward::NetworkChannel>(
+          a.gin_window_base, network.ring_region +
+              index * sizeof(static_forward::NetworkChannel));
+      channel.tx_cursor = channel.tx_base;
+      channel.rx_cursor = channel.consume_cursor = channel.rx_base;
+    }
+  }
   for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
        w += gridDim.x)
     static_forward::build_source_window<Control, Math, kCollectiveScopeBarrier>(
-        p, w, counts);
+        planner, w, counts);
   collective_scope_sync<384U, kCollectiveJoinBarrier>();
-  rank_barrier<Math, Control>(a);
+  if constexpr (Network) {
+    grid_sync<Math, Control>(a);
+    static_forward::build_source_packet_prefix(p, worker, workers);
+    static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
+    grid_sync<Math, Control>(a);
+    if (worker == 0U) {
+      static_forward::build_channel_offsets(p.packet_prefix, p.nodes * p.packets.lanes,
+                                            p.local_windows(), r.dispatch.channel_offsets);
+      static_forward::build_channel_offsets(r.returning.packet_prefix,
+                                            p.nodes * p.packets.lanes,
+                                            p.local_windows(), r.returning.channel_offsets);
+    }
+    grid_sync<Math, Control>(a);
+    static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
+    static_forward::build_return_packets(p, r.returning, worker, workers);
+    grid_sync<Math, Control>(a);
+    if (blockIdx.x < a.static_network.contexts && tid == 0U) {
+      const auto base = source_offset(a, a.rank);
+      for (unsigned node = 0U; node < p.nodes; ++node)
+        if (node != a.node)
+          network_put(a, node, base, base, a.static_network.source_bytes);
+    }
+    network_barrier<Math, Control>(a);
+  } else {
+    rank_barrier<Math, Control>(a);
+  }
 
   if (blockIdx.x == 0U) {
     unsigned error = 0U;
@@ -160,6 +227,8 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
           static_cast<unsigned>(w), static_cast<unsigned>(seq % r.depth),
           seq / r.depth + 1U};
     }
+    if constexpr (Network)
+      collective_scope_sync<Control, kCollectiveScopeBarrier>();
     // Freeze reverse identity and gate before payload starts. Each warp reads
     // a contiguous source-expert route list; pull does no peer count/ordinal
     // search, and Return never depends on the lifetime of an X slot.
@@ -180,11 +249,21 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
             static_cast<unsigned>(route), source, gates[route],
             static_cast<unsigned>(route / p.shape.top_k)};
+        if constexpr (Network) {
+          const auto block = r.window_prefix[w] + prefix[expert] + row / forward_tuning::kTileM;
+          const auto &desc = r.blocks[block];
+          source_metadata(a, source, r.locations)[route] = {
+              desc.generation, block,
+              desc.slot * forward_tuning::kTileM +
+                  static_cast<unsigned>(row % forward_tuning::kTileM)};
+        }
       }
     }
     collective_scope_sync<Control, kCollectiveScopeBarrier>();
   }
   grid_sync<Math, Control>(a);
+  if constexpr (Network)
+    rank_barrier<Math, Control, true, false, true>(a);
   collective_scope_sync<384U, kCollectiveJoinBarrier>();
 }
 

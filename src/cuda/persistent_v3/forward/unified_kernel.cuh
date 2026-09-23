@@ -138,7 +138,7 @@ __global__ __launch_bounds__(
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
             ->route_exchange_start_clock = device_globaltimer_ns();
       if constexpr (RingSchedule)
-        static_v4::ring::prepare_local(a, storage);
+        static_v4::ring::prepare<!StaticLocal>(a, storage);
       else if constexpr (StaticLocal)
         static_v4::route_exchange(a, storage);
       else
@@ -218,7 +218,7 @@ __global__ __launch_bounds__(
                 127U) &
                ~127ULL));
       if constexpr (RingSchedule)
-        forward_unified_transport::ring_run<kFc1N, kFc2N>(a, comm);
+        forward_unified_transport::ring_run<kFc1N, kFc2N, !StaticLocal>(a, comm);
       else
         forward_unified_detail::Communication<StaticLocal, StaticSchedule>{
             a, control, scheduler, comm}();
@@ -231,10 +231,14 @@ __global__ __launch_bounds__(
       &pair_operand, &output_store_map, pair);
   }
   if constexpr (RingSchedule) {
-    static_assert(StaticSchedule && StaticLocal && !RetainBackwardState);
+    static_assert(StaticSchedule && !RetainBackwardState);
     static_v4::collective_scope_sync<384U, static_v4::kCollectiveJoinBarrier>();
-    if (threadIdx.x >= 256U)
-      static_v4::after_combine(a);
+    if (threadIdx.x >= 256U) {
+      if constexpr (StaticLocal)
+        static_v4::after_combine(a);
+      else
+        static_v4::ring::finish_network(a);
+    }
     if (blockIdx.x == 0U && threadIdx.x == 256U && !a.dispatch.runtime->error) {
       a.ring.state->block_base += a.ring.state->blocks;
       a.ring.state->source_base += a.ring.source.local_windows();
