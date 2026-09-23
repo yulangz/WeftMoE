@@ -1649,3 +1649,45 @@ native `f4182c4dd19a3ae0124e0f44ceb66ac7ddcc2d011b3dccc4b8c1db3d8449a305`。
 [connection 构建代码](https://github.com/NVIDIA/nccl/blob/v2.31.2-1/src/gin/gin_host.cc)
 默认按本地 GIN device 数选 connection，再将请求的 contexts 分配到 connections。
 不把单 context link benchmark 的带宽直接当成整个融合 kernel 的硬上限。
+
+### BE：GIN connection 数及 Return packet 起点消融（无收益）
+
+在 BD/Q8/L32/B512/D4 上，仅用启动 wrapper 设置
+`NCCL_GIN_NCONNECTIONS=2/4`。8K 快筛 3819.62/3810.27 us，与默认 1
+connection 的约 3804 us 相当；32 hashes 一致。rank1 的 NCCL 日志确认实际
+activation devComm 分别为 2×48、4×24 contexts，非未生效的参数。没有更改
+生产默认值，也不把此项称为增加物理 NIC 带宽。日志
+`ring_return_ready_connections{2,4}_*`。
+
+另在 packet plan 中，将一个 source/window/remote node 的 Return packet
+ordinal 循环移动 `floor(packet_count * source_local_rank / local_world)`。
+整个 packet 仍连续、仍在同一完整准入窗口内；各 channel 的 packet 数、credit
+单位与静态 ownership 不变，目标是错开不同 rail 的首批 C 读取 GPU。
+现有 GPU plan 31 source/packet + 6 destination cases（含三节点）通过，
+EP16/8K 快筛 3811.12 us，16 hashes 一致，未显示收益，已撤回。没有额外
+开展这份无收益候选的完整数值/sanitizer 验收。
+归档 `build/static_v4_ring_return_rotate/change.patch` 和 native，SHA256
+`9d8e10076d88aff7e06dd6058ad416fab72ec3ab3307bbe5afa383959bbc240b`；日志
+`ring_return_rotate_ep16_t8192_quick.log`。上述快筛期间本机有 CPU 编译，因此
+只用于筛选，不代替正式干净环境测量。
+
+### BF：BD 后重新选择 packet Q
+
+保持 BD 协议、L32/B512/D4，只更改编译期 Q（Dispatch 和 Return 同时改变）。
+8K 快筛 Q16/Q32 分别 3526.05/3726.38 us；Q16 的 B1024 为 3569.17 us，
+未好于 B512。48 hashes 一致。Q16/Q32 的 registered pool 分别
+71946496/138977536 bytes/rank，对照 Q8 的 38547712；不是免费减少消息数。
+
+Q16 完整 EP16 四规模+edges 416 records、B16/D1/K8 的 T1/64+edges 272
+records 通过。rank1/9 的 B16/D1/T64/K8 eager 11 rounds memcheck/racecheck
+均 launcher exit 0、0 errors/0 hazards。Q32 只完成性能快筛及 native hashes，
+没有完成同样的全面验证。冻结 Q16 `build/static_v4_ring_return_ready_q16/`，
+native SHA256 `8c4674cb8097f0a9d6db06f9306e76da8ce9b010dc8e0c431eb335d032807587`，
+library `cea02ff33bb189f1e6fa768481630cfcf487931e82851b94444a09a03063e4ff`。
+Q32 native SHA256 `e64464861eb2391e789e0990117c42178f050ef644a2c5baeb86060aa4b1b86c`。
+
+Q16 在两个节点无其他 CPU/GPU 工作、1620 MHz、10/20/20 的正式 EP16
+四规模为 **293.570/432.442/3533.150/8181.340 us**，64 rank hashes 与 Q8/冻结
+V3 一致。8K/20K 比 BD/Q8 降低 7.0%/7.4%，仍比 V3 慢 5.3%/15.2%。
+T64 反而比 Q8 慢约 14.3%，尚不作为全长度统一配置；也不把 Q16 的网络
+收益归给 GEMM profile。日志 `ring_return_ready_q16_*`。
