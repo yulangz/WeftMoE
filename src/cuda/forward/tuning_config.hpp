@@ -262,6 +262,11 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_STATIC_V4_FC2_STAGES
 #define WEFTMOE_FWD_STATIC_V4_FC2_STAGES WEFTMOE_FWD_FC2_STAGES
 #endif
+#ifndef WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS
+#define WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS 0
+#endif
+inline constexpr unsigned kStaticV4PrefillMinTokens =
+    WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS;
 inline constexpr unsigned kStaticV4MathRegisters =
     WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS;
 inline constexpr unsigned kStaticV4ControlRegisters =
@@ -421,6 +426,22 @@ static_v4_compute_smem_bytes(std::uint32_t world) {
          kStaticV4BarrierCount * sizeof(std::uint64_t) +
          static_cast<std::size_t>(world) * sizeof(std::uint32_t);
 }
+
+// Optional prefill companion to the measured narrow-N decode profile. Both
+// entries need 192 KiB of operands; the wider entry has fewer barriers, so the
+// same allocation is a valid upper bound. Descriptors share the weight data.
+template <bool Prefill> struct StaticV4Gemm {
+  static constexpr unsigned kFc1N = Prefill ? 128U : kFc1TileN;
+  static constexpr unsigned kFc2N = Prefill ? 256U : kFc2TileN;
+  static constexpr unsigned kFc1Stages = Prefill ? 2U : kStaticV4Fc1Stages;
+  static constexpr unsigned kFc2Stages = Prefill ? 2U : kStaticV4Fc2Stages;
+};
+static_assert(!kStaticV4PrefillMinTokens ||
+                  (kTileM == 128U && kFc1TileN == 64U && kFc2TileN == 128U &&
+                   kStaticV4TileK == 128U && kStaticV4Fc1Stages == 3U &&
+                   kStaticV4Fc2Stages == 3U && kFc2ClaimTiles == 1U),
+              "Wide prefill companion requires the N64/N128 K128 3/3-stage "
+              "claim1 decode profile");
 
 inline constexpr std::size_t transport_smem_bytes(std::uint32_t hidden,
                                                    std::uint32_t world) {

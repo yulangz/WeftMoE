@@ -70,6 +70,7 @@ PARAMETER_MACROS = {
     "fc2_stages": "WEFTMOE_FWD_FC2_STAGES",
     "static_v4_fc1_stages": "WEFTMOE_FWD_STATIC_V4_FC1_STAGES",
     "static_v4_fc2_stages": "WEFTMOE_FWD_STATIC_V4_FC2_STAGES",
+    "static_v4_prefill_min_tokens": "WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS",
     "fc2_claim_tiles": "WEFTMOE_FWD_FC2_CLAIM_TILES",
     "opportunistic_reduce_warps": "WEFTMOE_FWD_OPPORTUNISTIC_REDUCE_WARPS",
     "gin_channel_pack_limit": "WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT",
@@ -209,6 +210,13 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     _require_choice(config, "static_v4_fc1_stages", (2, 3, 4, 5, 6))
     _require_choice(config, "static_v4_fc2_stages", (2, 3, 4, 5, 6))
     _require_choice(config, "fc2_claim_tiles", (1, 2, 4, 8))
+    _require(config["static_v4_prefill_min_tokens"] >= 0,
+             "static_v4_prefill_min_tokens must be nonnegative")
+    if config["static_v4_prefill_min_tokens"]:
+        _require(tuple(config[k] for k in (
+            "fc1_tile_n", "fc2_tile_n", "tile_k", "static_v4_fc1_stages",
+            "static_v4_fc2_stages", "fc2_claim_tiles")) == (64, 128, 128, 3, 3, 1),
+            "wide prefill requires N64/N128 K128 3/3-stage claim1 decode profile")
     _require(config["compute_threads"] == 384,
              "the current producer + two-math-WG kernel requires 384 threads")
     _require(config["math_warpgroups"] == 2,
@@ -311,7 +319,8 @@ def expand_search_space(document: dict[str, Any]) -> None:
                                           "gin_receive_rows": 128,
                                           "gin_fanout_lanes": 1,
                                           "static_v4_fc1_stages": 4,
-                                          "static_v4_fc2_stages": 4})
+                                          "static_v4_fc2_stages": 4,
+                                          "static_v4_prefill_min_tokens": 0})
     provided = flatten_groups(space, require_all=False)
     # Normalize without reordering axes so candidate names and overrides stay
     # identical when a configuration adopts the new public spelling.
@@ -367,7 +376,8 @@ def make_runtime_plan(space: dict[str, Any], *, model: Mapping[str, Any] | None,
                                           "gin_receive_rows": 128,
                                           "gin_fanout_lanes": 1,
                                           "static_v4_fc1_stages": 4,
-                                          "static_v4_fc2_stages": 4})
+                                          "static_v4_fc2_stages": 4,
+                                          "static_v4_prefill_min_tokens": 0})
     flat = flatten_groups(space, require_all=False)
     workload = dict(benchmark or {})
     _require(not (set(workload) - {"tokens_per_rank", "seed", "generation_base",
@@ -422,7 +432,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
                             "gin_receive_rows": 128,
                             "gin_fanout_lanes": 1,
                             "static_v4_fc1_stages": 4,
-                            "static_v4_fc2_stages": 4})
+                            "static_v4_fc2_stages": 4,
+                            "static_v4_prefill_min_tokens": 0})
         document.get("fixed", {}).get("1_gemm", {}).setdefault("fc2_claim_tiles", 1)
         # Historical frozen plans retain this removed tail-only parameter.
         # New pure hyperparameter files reject it as unknown.

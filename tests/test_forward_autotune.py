@@ -91,6 +91,19 @@ class ForwardAutotuneTest(unittest.TestCase):
                               fc2_tma_store=True, cluster_size=2)
                 tune.validate_tuning(config)
 
+    def test_prefill_companion_requires_matching_decode_geometry(self):
+        config = dict(self.candidates[0]["config"],
+                      fc1_tile_n=64, fc2_tile_n=128, tile_k=128,
+                      static_v4_fc1_stages=3, static_v4_fc2_stages=3,
+                      fc2_claim_tiles=1, static_v4_prefill_min_tokens=8192)
+        tune.validate_tuning(config)
+        config["fc2_tile_n"] = 256
+        with self.assertRaisesRegex(tune.PlanError, "wide prefill"):
+            tune.validate_tuning(config)
+        config["static_v4_prefill_min_tokens"] = 0
+        config["tile_k"] = 64
+        tune.validate_tuning(config)
+
     def test_fc2_pipeline_accepts_partial_stage_cycles(self):
         config = dict(self.candidates[0]["config"],
                       main_hidden=2560, main_intermediate=1280,

@@ -3,7 +3,8 @@
 // Included inside forward_compute_detail after the fragment-layout and named
 // barrier helpers.  Keeping this specialization out of the generic epilogue
 // avoids carrying inference-only peer addressing through the training path.
-template <class TileMma, bool Network = false>
+template <class TileMma, bool Network = false,
+          unsigned TileN = forward_tuning::kFc2TileN>
 __device__ __forceinline__ void static_v4_push_fc2_tile(
     const ForwardKernelArgs &a, transport::BFloat16 *tile, float *accum,
     std::uint64_t canonical_row, std::uint32_t valid_rows,
@@ -38,7 +39,7 @@ __device__ __forceinline__ void static_v4_push_fc2_tile(
           std::uint64_t(header.contribution_row) * a.hidden;
     destination += column_base;
     for (std::uint32_t column = column_lane * kElements;
-         column < forward_tuning::kFc2TileN;
+         column < TileN;
          column += kRowLanes * kElements) {
       if (column_base + column >= a.hidden)
         break;

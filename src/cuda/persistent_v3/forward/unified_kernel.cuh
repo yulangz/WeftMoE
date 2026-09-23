@@ -83,7 +83,7 @@ template <bool StaticLocal, bool StaticSchedule> struct Communication {
 } // namespace forward_unified_detail
 
 template <bool StaticLocal, bool RetainBackwardState,
-          bool StaticSchedule = false>
+          bool StaticSchedule = false, bool Prefill = false>
 __global__ __launch_bounds__(
     forward_tuning::kUnifiedThreads,
     1) void unified_forward_kernel(const __grid_constant__ ForwardKernelArgs a,
@@ -109,17 +109,23 @@ __global__ __launch_bounds__(
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, threadIdx.x == 0U, KernelEnter,
                              Kernel, 0U, 0ULL, execution_epoch(a));
   using forward_compute_detail::ComputeRole;
+  using StaticGemm = forward_tuning::StaticV4Gemm<Prefill>;
+  static_assert(!Prefill || StaticSchedule);
+  constexpr auto kFc1N = StaticSchedule ? StaticGemm::kFc1N
+                                       : forward_tuning::kFc1TileN;
+  constexpr auto kFc2N = StaticSchedule ? StaticGemm::kFc2N
+                                       : forward_tuning::kFc2TileN;
   constexpr auto kFc1Stages =
-      StaticSchedule ? forward_tuning::kStaticV4Fc1Stages
+      StaticSchedule ? StaticGemm::kFc1Stages
                      : forward_tuning::kFc1Stages;
   constexpr auto kFc2Stages =
-      StaticSchedule ? forward_tuning::kStaticV4Fc2Stages
+      StaticSchedule ? StaticGemm::kFc2Stages
                      : forward_tuning::kFc2Stages;
   constexpr auto kTileK = StaticSchedule ? forward_tuning::kStaticV4TileK
                                          : forward_tuning::kTileK;
   forward_compute_detail::persistent_role<
       StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK, true,
-      ComputeRole::Initialize, StaticSchedule>(
+      ComputeRole::Initialize, StaticSchedule, kFc1N, kFc2N>(
       a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
       &pair_operand, &output_store_map, pair);
   // Shared barriers and cluster setup are independent of the preceding
@@ -191,7 +197,7 @@ __global__ __launch_bounds__(
     if (threadIdx.x < 288U) {
       forward_compute_detail::persistent_role<
           StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK,
-          true, ComputeRole::Producer, StaticSchedule>(
+          true, ComputeRole::Producer, StaticSchedule, kFc1N, kFc2N>(
           a, x_map, s_map, w1_map, w2_map, storage, &task, &kind,
           &return_mblock, &pair_operand, &output_store_map, pair);
     } else {
@@ -213,7 +219,7 @@ __global__ __launch_bounds__(
   } else {
     forward_compute_detail::persistent_role<
         StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK, true,
-        ComputeRole::Math, StaticSchedule>(
+        ComputeRole::Math, StaticSchedule, kFc1N, kFc2N>(
         a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
         &pair_operand, &output_store_map, pair);
   }
@@ -271,7 +277,7 @@ __global__ __launch_bounds__(
       a.local_base, a.forward_v3_control_offset);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if constexpr (StaticSchedule)
-    static_v4::finalize(a);
+    static_v4::finalize<kFc1N, kFc2N>(a);
   else if constexpr (StaticLocal)
     forward_finalize_detail::local_split_transport_finalize(a, control,
                                                             scheduler, status);
@@ -290,13 +296,13 @@ __global__ __launch_bounds__(
 #endif
 
 template <bool StaticLocal, bool RetainBackwardState,
-          bool StaticSchedule = false>
+          bool StaticSchedule = false, bool Prefill = false>
 constexpr auto unified_forward_entry() {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY) && __has_include(<nccl_device.h>)
   return unified_communication_benchmark_kernel<StaticLocal,
                                                 RetainBackwardState>;
 #else
   return unified_forward_kernel<StaticLocal, RetainBackwardState,
-                                StaticSchedule>;
+                                StaticSchedule, Prefill>;
 #endif
 }

@@ -573,8 +573,24 @@ struct ForwardWeightLease::Impl {
   CUtensorMap w1_map{};
   CUtensorMap w1_interleaved_map{};
   CUtensorMap w2_map{};
+  CUtensorMap prefill_w1_map{};
+  CUtensorMap prefill_w2_map{};
   CUtensorMap backward_w1_map{};
   CUtensorMap backward_w2_map{};
+
+  void initialize_prefill_maps() {
+    if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
+      using Gemm = forward_tuning::StaticV4Gemm<true>;
+      prefill_w1_map = make_bf16_tma_map(
+          const_cast<transport::BFloat16 *>(w1_interleaved), hidden,
+          owned_experts * 2ULL * intermediate, Gemm::kFc1N,
+          "prefill interleaved W1", forward_tuning::kTileK);
+      prefill_w2_map = make_bf16_tma_map(
+          const_cast<transport::BFloat16 *>(w2), intermediate,
+          owned_experts * hidden, Gemm::kFc2N, "prefill W2",
+          forward_tuning::kTileK);
+    }
+  }
 };
 
 struct ForwardWeightStorageHashAccess {
@@ -935,6 +951,7 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
+    impl->initialize_prefill_maps();
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
@@ -1051,6 +1068,7 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
+    impl->initialize_prefill_maps();
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
@@ -5020,8 +5038,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
       const auto forward_main_compute_ctas = args.forward_compute_cta_count;
-      const auto fc1_ntiles = args.intermediate / forward_tuning::kFc1TileN;
-      const auto fc2_ntiles = args.hidden / forward_tuning::kFc2TileN;
+      const bool prefill = static_v4_enabled &&
+                           forward_tuning::kStaticV4PrefillMinTokens &&
+                           id.num_tokens >=
+                               forward_tuning::kStaticV4PrefillMinTokens;
+      using PrefillGemm = forward_tuning::StaticV4Gemm<true>;
+      const auto fc1_n = prefill ? PrefillGemm::kFc1N
+                                 : forward_tuning::kFc1TileN;
+      const auto fc2_n = prefill ? PrefillGemm::kFc2N
+                                 : forward_tuning::kFc2TileN;
+      const auto fc1_ntiles =
+          (static_v4_enabled ? 2ULL : 1ULL) * args.intermediate / fc1_n;
+      const auto fc2_ntiles = args.hidden / fc2_n;
       if ((forward_main_compute_ctas & 1U) || (fc1_ntiles & 1U) ||
           (fc2_ntiles & 1U))
         transport_error(
@@ -5058,9 +5086,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.forward_reduce_cta_count = forward_main_compute_ctas;
       if constexpr (forward_tuning::kUnifiedWorkers) {
         if (static_v4_enabled) {
-          const auto kStaticUnified = use_gin
+          auto kStaticUnified = use_gin
               ? unified_forward_entry<false, false, true>()
               : unified_forward_entry<true, false, true>();
+          if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
+            if (prefill)
+              kStaticUnified = use_gin
+                  ? unified_forward_entry<false, false, true, true>()
+                  : unified_forward_entry<true, false, true, true>();
+          }
           const auto smem =
               forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();
@@ -5103,7 +5137,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 std::to_string(max_active_clusters) + " resident clusters");
           launch_forward = cudaLaunchKernelEx(
               &launch, kStaticUnified, args, slot.forward_x_map,
-              slot.forward_s_map, weight.w1_interleaved_map, weight.w2_map,
+              slot.forward_s_map,
+              prefill ? weight.prefill_w1_map : weight.w1_interleaved_map,
+              prefill ? weight.prefill_w2_map : weight.w2_map,
               ordinary_output_store_map);
         } else {
         const auto launch_unified = [&](auto kernel) {

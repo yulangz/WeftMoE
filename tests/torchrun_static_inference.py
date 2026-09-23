@@ -106,6 +106,15 @@ def main():
         check(actual, expected, "balanced-graph")
 
     if args.edge_cases:
+        if max_tokens >= 8192:
+            # Different ranks may select different GEMM entries while sharing
+            # the same invocation. Empty sources are covered by eager below.
+            x, routes, gates = inputs(8192 if rank % 2 else 64)
+            expected = reference(x, routes, gates, all_w1, all_w2)
+            check(runtime.inference_eager(x, routes, gates, w1, w2), expected,
+                  "mixed-prefill-eager")
+            check(runtime.inference(3, x, routes, gates, w1, w2), expected,
+                  "mixed-prefill-graph")
         # Different actual lengths, including a source with no routes. Pool
         # capacity stays collective and every rank still participates.
         x, routes, gates = inputs(0 if rank == 0 else 17 + rank, skew=True)
@@ -141,12 +150,20 @@ def main():
         del graph
         if world * max_tokens * args.top_k > max_rows:
             x, routes, gates = inputs(max_tokens, skew=True)
+            rejected = 0
             try:
                 runtime.inference_eager(x, routes, gates, w1, w2)
             except RuntimeError as error:
                 assert "production-terminal-agreement" in str(error), str(error)
-            else:
-                raise AssertionError("overflow must reject collectively, not drop routes")
+                rejected = 1
+            # GIN agrees terminal status across ranks; local P2P reports the
+            # overflowing destination's status only. Join before workspace
+            # reuse so the local test follows that API's failure contract too.
+            failures = torch.tensor(rejected, device="cuda")
+            dist.all_reduce(failures)
+            network = world > int(os.environ["LOCAL_WORLD_SIZE"])
+            assert failures.item() == (world if network else 1), \
+                "overflow must be reported, not silently drop routes"
             actual = runtime.inference_eager(x[:3], routes[:3], gates[:3], w1, w2)
             check(actual, reference(x[:3], routes[:3], gates[:3], all_w1, all_w2),
                   "capacity-rejection-recovery")

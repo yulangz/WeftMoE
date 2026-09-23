@@ -564,7 +564,7 @@ __device__ __forceinline__ void select_compute_task(
                           *task_kind_shared, *task_shared, execution_epoch(a));
 }
 
-template <bool StaticLocal>
+template <bool StaticLocal, unsigned Fc1TileN, unsigned Fc2TileN>
 __device__ __forceinline__ void select_static_compute_task(
     const ForwardKernelArgs &a,
     unsigned long long *task_shared, unsigned int *task_kind_shared,
@@ -581,11 +581,11 @@ __device__ __forceinline__ void select_static_compute_task(
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
   const auto fc1_ntiles = static_cast<std::uint32_t>(
-      (2ULL * a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
-      forward_tuning::kFc1TileN);
+      (2ULL * a.intermediate + Fc1TileN - 1ULL) /
+      Fc1TileN);
   const auto fc2_ntiles = static_cast<std::uint32_t>(
-      (a.hidden + forward_tuning::kFc2TileN - 1ULL) /
-      forward_tuning::kFc2TileN);
+      (a.hidden + Fc2TileN - 1ULL) /
+      Fc2TileN);
   unsigned long long task0 = 0ULL;
   unsigned long long task1 = 0ULL;
   const auto kind = select_static_owned_task<StaticLocal>(
@@ -619,6 +619,7 @@ __device__ __forceinline__ auto physical_barrier(unsigned id) {
       Unified ? (id == kTaskReadyBarrier ? 4U : id) : id + 8U);
 }
 
+#include "cuda/static_v4/fc1_epilogue.cuh"
 #include "cuda/static_v4/fc2_epilogue.cuh"
 
 // TMA lays a K128 stage out as two independent 128-byte-swizzled K64 atoms.
@@ -637,7 +638,9 @@ template <bool StaticLocal, bool RetainBackwardState,
           std::uint32_t Fc1StageCount, std::uint32_t Fc2StageCount,
           std::uint32_t TileK,
           bool Unified = false, ComputeRole Role = ComputeRole::Combined,
-          bool StaticSchedule = false>
+          bool StaticSchedule = false,
+          unsigned Fc1TileN = forward_tuning::kFc1TileN,
+          unsigned Fc2TileN = forward_tuning::kFc2TileN>
 __device__ __forceinline__ void
 persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 const CUtensorMap &s_map, const CUtensorMap &w1_map,
@@ -658,8 +661,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
   static_assert(TileK == 64U || (StaticSchedule && TileK == 128U));
   constexpr bool kFc2Pipelined = forward_tuning::kFc2ClaimTiles > 1U;
   constexpr auto kAStageElements = forward_tuning::kTileM * TileK;
-  constexpr auto kFc1BStageElements = forward_tuning::kFc1TileN * TileK;
-  constexpr auto kFc2BStageElements = forward_tuning::kFc2TileN * TileK;
+  constexpr auto kFc1BStageElements = Fc1TileN * TileK;
+  constexpr auto kFc2BStageElements = Fc2TileN * TileK;
   constexpr auto kFc2Iterations =
       forward_tuning::kMainIntermediate / TileK;
   constexpr auto kFc2OutputOffset =
@@ -675,7 +678,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           : Fc2StageCount * kFc2BStageElements;
   constexpr auto kFc2ArenaElements =
       kFc2OutputOffset +
-      (kFc2Pipelined ? 128U * forward_tuning::kFc2TileN : 0U);
+      (kFc2Pipelined ? 128U * Fc2TileN : 0U);
   constexpr auto kConfiguredArenaElements =
       kConfiguredAStorageElements + kConfiguredBStorageElements >
               kFc2ArenaElements
@@ -749,11 +752,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
     const auto forward_mblocks = scheduler[3];
     const auto fc1_ntiles = static_cast<std::uint32_t>(
         ((StaticSchedule ? 2ULL : 1ULL) * kIntermediate +
-         forward_tuning::kFc1TileN - 1ULL) /
-        forward_tuning::kFc1TileN);
+         Fc1TileN - 1ULL) /
+        Fc1TileN);
     const auto fc2_ntiles = static_cast<std::uint32_t>(
-        (kHidden + forward_tuning::kFc2TileN - 1ULL) /
-        forward_tuning::kFc2TileN);
+        (kHidden + Fc2TileN - 1ULL) /
+        Fc2TileN);
     const auto fc1_tasks = forward_mblocks * fc1_ntiles;
     const auto fc2_tasks = forward_mblocks * fc2_ntiles;
     auto *fc1_ready_queue = claims + forward_mblocks;
@@ -814,7 +817,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 auto *stage_b2 = reinterpret_cast<cutlass::bfloat16_t *>(
                     fc1_b2 + stage * kFc1BStageElements);
                 const auto k_base = iteration * TileK;
-                const auto n = n_tile * forward_tuning::kFc1TileN;
+                const auto n = n_tile * Fc1TileN;
                 const auto multicast_a =
                     *pair_operand_shared == kComputePairShareA ? 2U : 1U;
                 const auto multicast_b =
@@ -826,7 +829,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                     static_cast<std::uint32_t>(row), multicast_a);
 
                 hopper::tma_load<TileK,
-                                 forward_tuning::kFc1TileN, 128,
+                                 Fc1TileN, 128,
                                  cutlass::bfloat16_t>(
                     &w1_map, &fc1_full[stage], stage_b1, k_base,
                     static_cast<std::uint32_t>(expert * 2ULL * kIntermediate +
@@ -838,7 +841,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                     sizeof(transport::BFloat16));
                 if constexpr (!StaticSchedule) {
                   hopper::tma_load<TileK,
-                                   forward_tuning::kFc1TileN, 128,
+                                   Fc1TileN, 128,
                                    cutlass::bfloat16_t>(
                       &w1_map, &fc1_b2_full[stage], stage_b2, k_base,
                       static_cast<std::uint32_t>(
@@ -873,7 +876,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               for (std::uint32_t offset = 0; offset < tile_count; ++offset) {
                 const auto n = static_cast<std::uint32_t>(
                                    (first_task + 2ULL * offset) % fc2_ntiles) *
-                               forward_tuning::kFc2TileN;
+                               Fc2TileN;
 #pragma unroll
                 for (std::uint32_t iteration = 0; iteration < kFc2Iterations;
                      ++iteration) {
@@ -892,7 +895,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                       &s_map, &fc2_full[stage], stage_a, k_base,
                       static_cast<std::uint32_t>(row), 2U);
                   hopper::tma_load<TileK,
-                                   forward_tuning::kFc2TileN, 128,
+                                   Fc2TileN, 128,
                                    cutlass::bfloat16_t>(
                       &w2_map, &fc2_full[stage], stage_b, k_base,
                       static_cast<std::uint32_t>(expert * kHidden + n), 1U,
@@ -931,7 +934,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       bool timeline_fc2_started = false;
 #endif
       if constexpr (StaticSchedule)
-        select_static_compute_task<StaticLocal>(
+        select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
             a, task_shared, task_kind_shared, pair_operand_shared, &pair);
       else
         select_compute_task<StaticLocal>(
@@ -967,7 +970,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           cutlass::arch::NamedBarrier::sync(
               kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(
@@ -1009,9 +1012,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                            forward_mblock_local_row(local_mblock);
           const auto valid_rows =
               forward_mblock_valid_rows(a, expert, local_mblock);
-          const auto n = n_tile * forward_tuning::kFc1TileN;
+          const auto n = n_tile * Fc1TileN;
           if constexpr (StaticSchedule) {
-            using Fc1TileMma = TunedForwardFc1Mma;
+            using Fc1TileMma = typename hopper::BF16MMASelector<Fc1TileN>::type;
             float accum[Fc1TileMma::kNumAccum];
 #pragma unroll
             for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
@@ -1041,7 +1044,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                         1);
                 const auto desc_b =
                     hopper::make_smem_desc(
-                        k64_swizzle_address<forward_tuning::kFc1TileN>(
+                        k64_swizzle_address<Fc1TileN>(
                             stage_b, k),
                         1);
                 Fc1TileMma::wgmma(desc_a, desc_b, accum, 1);
@@ -1059,57 +1062,15 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MathEnd, Compute, 0U, task,
                                     execution_epoch(a));
 
-            // Static inference stores W1 once in [gate8, up8] order. Each
-            // adjacent pair of N8 accumulator groups can therefore execute
-            // SwiGLU directly in registers; the cluster peers own adjacent
-            // packed N tiles and only share the multicast X tile.
-            const auto thread_in_wg = threadIdx.x % 128U;
-            const auto warp_in_wg = thread_in_wg / 32U;
-            const auto lane = thread_in_wg % 32U;
-            const auto row0 = (threadIdx.x / 128U) * 64U +
-                              warp_in_wg * 16U + lane / 4U;
-            const auto row1 = row0 + 8U;
-            const auto output_base = n / 2U;
-#pragma unroll
-            for (unsigned pair_index = 0U;
-                 pair_index < forward_tuning::kFc1TileN / 16U;
-                 ++pair_index) {
-              const auto gate_group = pair_index * 8U;
-              const auto up_group = gate_group + 4U;
-              const auto column = output_base + pair_index * 8U +
-                                  (lane % 4U) * 2U;
-              if (row0 < valid_rows) {
-                const auto route_gate = canonical_gates[row + row0];
-                const auto value0 = gated_swiglu_fc2_input_from_bf16(
-                    float_to_bf16_bits(accum[gate_group]),
-                    float_to_bf16_bits(accum[up_group]), route_gate);
-                const auto value1 = gated_swiglu_fc2_input_from_bf16(
-                    float_to_bf16_bits(accum[gate_group + 1U]),
-                    float_to_bf16_bits(accum[up_group + 1U]), route_gate);
-                reinterpret_cast<std::uint32_t *>(
-                    s + (row + row0) * kIntermediate + column)[0] =
-                    float2_to_bf16x2_bits(value0, value1);
-              }
-              if (row1 < valid_rows) {
-                const auto route_gate = canonical_gates[row + row1];
-                const auto value0 = gated_swiglu_fc2_input_from_bf16(
-                    float_to_bf16_bits(accum[gate_group + 2U]),
-                    float_to_bf16_bits(accum[up_group + 2U]), route_gate);
-                const auto value1 = gated_swiglu_fc2_input_from_bf16(
-                    float_to_bf16_bits(accum[gate_group + 3U]),
-                    float_to_bf16_bits(accum[up_group + 3U]), route_gate);
-                reinterpret_cast<std::uint32_t *>(
-                    s + (row + row1) * kIntermediate + column)[0] =
-                    float2_to_bf16x2_bits(value0, value1);
-              }
-            }
+            static_v4_store_fc1_tile<Fc1TileN>(
+                a, smem_b, accum, s, canonical_gates, row, valid_rows, n / 2U);
           } else {
             // Keep the two FC1 accumulator fragments in a lexical region
             // that ends before completion publication and the next-task
             // controller rendezvous.  In particular, the static scheduler's
             // extra handoff barrier must not extend either FP32 fragment's
             // live range.
-            using Fc1TileMma = TunedForwardFc1Mma;
+            using Fc1TileMma = typename hopper::BF16MMASelector<Fc1TileN>::type;
             float accum_a[Fc1TileMma::kNumAccum];
             float accum_b[Fc1TileMma::kNumAccum];
 #pragma unroll
@@ -1158,7 +1119,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                       1);
               const auto desc_b1 =
                   hopper::make_smem_desc(
-                      k64_swizzle_address<forward_tuning::kFc1TileN>(
+                      k64_swizzle_address<Fc1TileN>(
                           stage_b1, k),
                       1);
               Fc1TileMma::wgmma(desc_a, desc_b1, accum_a, 1);
@@ -1182,7 +1143,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                       1);
               const auto desc_b2 =
                   hopper::make_smem_desc(
-                      k64_swizzle_address<forward_tuning::kFc1TileN>(
+                      k64_swizzle_address<Fc1TileN>(
                           stage_b2, k),
                       1);
               Fc1TileMma::wgmma(desc_a, desc_b2, accum_b, 1);
@@ -1307,7 +1268,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               }
             }
           };
-          constexpr auto kFc1OutputElements = 128U * forward_tuning::kFc1TileN;
+          constexpr auto kFc1OutputElements = 128U * Fc1TileN;
           constexpr auto kFc1StagedOutputs = RetainBackwardState ? 3U : 1U;
           constexpr bool kFc1StageFits =
               kFc1StagedOutputs * kFc1OutputElements *
@@ -1316,7 +1277,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   sizeof(transport::BFloat16);
           const bool staged_fc1 =
               kFc1StageFits && valid_rows == 128U &&
-              n + forward_tuning::kFc1TileN <= kIntermediate;
+              n + Fc1TileN <= kIntermediate;
           if (staged_fc1) {
             // The checkpoint epilogue also reuses B storage. Both math
             // warpgroups must retire their final reads before it is
@@ -1358,8 +1319,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
             for (unsigned v = threadIdx.x; v < kFc1OutputElements / 8U;
                  v += kMathThreads) {
-              const auto r = v / (forward_tuning::kFc1TileN / 8U);
-              const auto c = (v % (forward_tuning::kFc1TileN / 8U)) * 8U;
+              const auto r = v / (Fc1TileN / 8U);
+              const auto c = (v % (Fc1TileN / 8U)) * 8U;
               const auto offset = m128_fragment_vector_offset(r, c);
               const auto output_index = (row + r) * kIntermediate + n + c;
               *reinterpret_cast<uint4 *>(s + output_index) =
@@ -1422,7 +1383,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileEnd, Compute, 0U, task,
                                   execution_epoch(a));
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(
@@ -1457,7 +1418,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileStart, Compute, 0U,
                                     first_task + 2ULL * tile_offset,
                                     execution_epoch(a));
-            using Fc2TileMma = TunedForwardFc2Mma;
+            using Fc2TileMma = typename hopper::BF16MMASelector<Fc2TileN>::type;
             float accum[Fc2TileMma::kNumAccum];
 #pragma unroll
             for (int index = 0; index < Fc2TileMma::kNumAccum; ++index)
@@ -1486,7 +1447,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                         1);
                 const auto desc_b =
                     hopper::make_smem_desc(
-                        k64_swizzle_address<forward_tuning::kFc2TileN>(
+                        k64_swizzle_address<Fc2TileN>(
                             stage_b, k),
                         1);
                 Fc2TileMma::wgmma(desc_a, desc_b, accum, 1);
@@ -1531,10 +1492,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                              forward_mblock_local_row(local_mblock);
             const auto valid_rows =
                 forward_mblock_valid_rows(a, expert, local_mblock);
-            const auto n = n_tile * forward_tuning::kFc2TileN;
+            const auto n = n_tile * Fc2TileN;
 
             const bool full_tma_tile = valid_rows == forward_tuning::kTileM &&
-                                       n + forward_tuning::kFc2TileN <= kHidden;
+                                       n + Fc2TileN <= kHidden;
 
             if (full_tma_tile || StaticSchedule) {
               // STSM writes a separate output tile while the producer
@@ -1542,16 +1503,19 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               // input arena. Compact expert tails need bounds-checked stores
               // below. GEMM_DIAGNOSTIC_FC2_EPILOGUE_BEGIN
               if constexpr (kFc2Pipelined && !StaticSchedule) {
-                if (threadIdx.x < forward_tuning::kFc2TileN / 64U)
+                if (threadIdx.x < Fc2TileN / 64U)
                   asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
               }
               // All math readers retire before the union is reused on fallback.
               cutlass::arch::NamedBarrier::sync(
                   kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
-              auto *output_tile =
-                  smem_a + (kFc2Pipelined ? kFc2OutputOffset : 0U);
+              // A is multicast: a faster static peer may already load its
+              // next task. Only this CTA's producer writes the retired B arena.
+              auto *output_tile = kFc2Pipelined
+                                      ? smem_a + kFc2OutputOffset
+                                      : (StaticSchedule ? fc2_smem_b : smem_a);
               if constexpr (StaticSchedule) {
-                static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal>(
+                static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal, Fc2TileN>(
                     a, output_tile, accum, row, valid_rows, n);
               } else {
                 const auto warp =
@@ -1581,7 +1545,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 cutlass::arch::NamedBarrier::sync(
                     kMathThreads,
                     physical_barrier<Unified>(kMathReadyBarrier));
-                if (threadIdx.x < forward_tuning::kFc2TileN /
+                if (threadIdx.x < Fc2TileN /
                                       forward_tuning::kFc2StoreAtomN) {
                   const auto atom = threadIdx.x;
                   cute::SM90_TMA_STORE_2D::copy(
@@ -1655,7 +1619,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                                     execution_epoch(a));
           } // tile_offset: prefetch and stores overlap within this range.
           if constexpr (kFc2Pipelined && !StaticSchedule) {
-            if (threadIdx.x < forward_tuning::kFc2TileN / 64U)
+            if (threadIdx.x < Fc2TileN / 64U)
               asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
           }
           cutlass::arch::NamedBarrier::sync(
@@ -1736,7 +1700,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           }
 #endif
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(

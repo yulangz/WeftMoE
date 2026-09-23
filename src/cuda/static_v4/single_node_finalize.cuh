@@ -2,6 +2,7 @@
 
 namespace static_v4 {
 
+template <unsigned Fc1TileN, unsigned Fc2TileN>
 __device__ __forceinline__ void finalize(const ForwardKernelArgs &a) {
   constexpr auto kLeader = forward_tuning::kMathWarpgroups * 128U;
   if (blockIdx.x != 0U || threadIdx.x != kLeader)
@@ -14,11 +15,9 @@ __device__ __forceinline__ void finalize(const ForwardKernelArgs &a) {
       a.local_base, a.forward_scheduler_offset);
   const auto mblocks = scheduler[3];
   status->fc1_tasks_done =
-      mblocks * ((2ULL * a.intermediate + forward_tuning::kFc1TileN - 1ULL) /
-                 forward_tuning::kFc1TileN);
+      mblocks * ((2ULL * a.intermediate + Fc1TileN - 1ULL) / Fc1TileN);
   status->fc2_tasks_done =
-      mblocks * ((a.hidden + forward_tuning::kFc2TileN - 1ULL) /
-                 forward_tuning::kFc2TileN);
+      mblocks * ((a.hidden + Fc2TileN - 1ULL) / Fc2TileN);
   status->complete_clock = device_globaltimer_ns();
   WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0ULL,
                           execution_epoch(a));
