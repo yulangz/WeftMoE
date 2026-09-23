@@ -551,3 +551,51 @@ O binary SHA256：`8886699454a0ed1412f7a0998393fdff8dd0efa0d0bb4b64ae71bdee90aae
 32 个 hash 一致。收益主要在短序列，20K 无改善，不声称其解决长文吞吐。
 O library 的完整四规模/edge cases 和 B16/D1 的 T1/64/edge cases 均 exit 0。
 B16/D1/T64 的 memcheck/racecheck 也均 exit 0（API 报告选项同前）。
+
+### P：warp 合并向量搬运（失败，撤回）
+
+O 上将每方向的 single-issuer TMA 改为一个 warp 共同搬一整行，lane 处理连续
+uint4，四次循环展开。lane 0 acquire readiness，warp 同步导入该可见性；所有
+payload 访问完成并再次 warp 同步后，lane 0 才发布 ready/retirement。pull 的
+generic stores 额外经过 async-proxy fence，再发布 X full 供 FC1 TMA 读取。
+
+第一轮保持相同 shared-memory launch 预算、window 和 contribution 深度；暂时
+保留未使用的 staging 分配以隔离 copy 方式的变化。若有效再删除该实验冗余。
+不改 FP32 Reduce 或 FC1/FC2 tile。
+
+第一节点 EP8/8K/B256/D4/1620 MHz/10/20/20 为 6636.13 us，8 个 hash 一致，
+但延迟超过现有 TMA 方案三倍。撤回整个候选，不保留向量搬运分支或未使用
+staging 的实验代码；不继续为明显失败的候选追加完整测试。TMA 仍是主路径。
+
+## M3a：双向 packet 目录与独立 source metadata（验证中）
+
+- Dispatch 在冻结 consumer counts 的同一遍遍历中建立 remote route→packet/token
+  row 反向索引。它只覆盖实际 remote valid routes，不将重复 expert slot 合并。
+- Return 使用 source 的窗口/node/expert 连续 route 区间生成 channel prefix 和
+  packet 目录；`rows` 就是完整 contribution 的退休数量，空 channel 不生成包。
+  不依赖物理 C slot，也没有运行时 fragment append/claim。
+- 两个目录复用 channel prefix 压缩和 packet 定位 helper，record/view 定义移到
+  host/device 共用的 `plan.hpp`，供注册区布局直接使用。
+- Source epoch/error、gate、window prefixes、route/node-token 数据集中到独立
+  metadata region。单机已使用该区域；网络专用目录不占单机容量。X 不在 region
+  中，后续 rail metadata 复制不会隐式广播完整 X。原 fused gate allocation 复用
+  region 中的 gates，不保留第二份 gate buffer。
+- pool 明确验证当前 M128、256 math / 32 producer / 96 communication 的布局
+  前提，避免使用其他编译期 worker 划分时执行固定布局。
+
+复用原 GPU planner 检查的 31 个 source/packet 和 6 个 destination cases，增加
+Dispatch 反向位置、Return prefix/尾包/唯一覆盖检查，未新增测试入口。
+1/2/3 节点规划、空 source、masked/duplicate route、20K 热点和非法 id 均通过；
+同一测试 memcheck 为 0 errors，racecheck 为 0 errors / 0 warnings。
+**此处的多节点检查仍是单 GPU 规划，不是多机 GIN 数据面验收。**
+
+GPU planner binary SHA256：
+`3a6da25db100f9cad0a67a170ced3ad0ee99eeafc1842fe60ba76ec9ab4f9b58`。
+主路径 `build/static_v4_ring_metadata/test_cuda_notify` SHA256：
+`e893d52544b19b3b3a20224ed4d4839c1419714fa69d62ac82af5166d10a9983`。
+第二节点 EP8/B256/D4/1620 MHz/10/20/20 四规模为
+110.080/162.856/2128.24/5250.85 us，32 个 hash 与 O 一致；约 1% 的长文变化
+不归因为本次布局整理的优化收益。完整 PyTorch 四规模及 edge cases exit 0，
+host suite 18/18 通过。B16/D1 的 T1/64 及全部现有 edge cases exit 0；
+第二节点单机 B16/D1/T64 memcheck/racecheck 均 exit 0（同前述 API 报告选项）。
+多机 ring 仍未启用。

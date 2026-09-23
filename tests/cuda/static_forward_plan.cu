@@ -61,17 +61,27 @@ __global__ void build_windows(plan::SourcePlanView view) {
     plan::build_source_window<128U>(view, w, scratch);
 }
 
-__global__ void build_packets(plan::SourcePlanView view) {
-  plan::build_source_packet_prefix(view, blockIdx.x * blockDim.x + threadIdx.x,
-                                   gridDim.x * blockDim.x);
+__global__ void build_packets(plan::SourcePlanView view,
+                              plan::ReturnPlanView returning) {
+  const auto worker = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto workers = gridDim.x * blockDim.x;
+  plan::build_source_packet_prefix(view, worker, workers);
+  plan::build_return_packet_prefix(view, returning, worker, workers);
 }
 
 __global__ void build_directory(plan::SourcePlanView view,
-                                plan::DispatchPlanView output) {
-  if (threadIdx.x == 0U)
-    plan::build_dispatch_channel_offsets(view, output);
+                                plan::DispatchPlanView output,
+                                plan::ReturnPlanView returning) {
+  if (threadIdx.x == 0U) {
+    plan::build_channel_offsets(view.packet_prefix, view.nodes * view.packets.lanes,
+                                view.local_windows(), output.channel_offsets);
+    plan::build_channel_offsets(returning.packet_prefix,
+                                view.nodes * view.packets.lanes,
+                                view.local_windows(), returning.channel_offsets);
+  }
   __syncthreads();
   plan::build_dispatch_packets(view, output, threadIdx.x, blockDim.x);
+  plan::build_return_packets(view, returning, threadIdx.x, blockDim.x);
 }
 
 void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
@@ -111,8 +121,15 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   // worst-case replication.
   DeviceArray<plan::DispatchPacketPlan> packets(selected.size());
   DeviceArray<std::uint32_t> consumers(selected.size() * local_world);
+  DeviceArray<std::uint64_t> route_packets(selected.size());
   const plan::DispatchPlanView directory{channel_offsets.data(), packets.data(),
-                                         consumers.data()};
+                                         consumers.data(), route_packets.data()};
+  DeviceArray<std::uint64_t> return_prefix(nodes * partition.lanes *
+                                           (windows + 1U));
+  DeviceArray<std::uint64_t> return_offsets(nodes * partition.lanes + 1U);
+  DeviceArray<plan::ReturnPacketPlan> return_packets(selected.size());
+  const plan::ReturnPlanView returning{return_prefix.data(), return_offsets.data(),
+                                       return_packets.data()};
   DeviceArray<unsigned> error(1U);
   const plan::SourcePlanView view{shape,
                                   partition,
@@ -132,9 +149,9 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
 
   build_windows<<<7U, 128U, view.scratch_words() * sizeof(unsigned)>>>(view);
   check(cudaGetLastError());
-  build_packets<<<1U, 128U>>>(view);
+  build_packets<<<1U, 128U>>>(view, returning);
   check(cudaGetLastError());
-  build_directory<<<1U, 128U>>>(view, directory);
+  build_directory<<<1U, 128U>>>(view, directory, returning);
   check(cudaGetLastError());
   check(cudaDeviceSynchronize());
   require(error.read()[0] == unsigned(invalid), "invalid route status");
@@ -150,7 +167,12 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto channels = channel_offsets.read();
   const auto packet_plan = packets.read();
   const auto consumer_rows = consumers.read();
+  const auto route_locations = route_packets.read();
+  const auto rp = return_prefix.read();
+  const auto return_channels = return_offsets.read();
+  const auto return_plan = return_packets.read();
   std::vector<std::uint64_t> sequences(nodes * partition.lanes, 0U);
+  std::vector<std::uint64_t> return_sequences(nodes * partition.lanes, 0U);
   for (std::uint64_t w = 0; w < windows; ++w) {
     const auto begin = w * shape.tokens;
     const auto end = std::min<std::uint64_t>(begin + shape.tokens, tokens);
@@ -202,6 +224,18 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
           sequences[channel] += partition.lane_packets(last - first, lane);
         require(pp[base + w + 1U] == sequences[channel],
                 "packet terminal sequence");
+        require(rp[base + w] == return_sequences[channel],
+                "Return packet start sequence");
+        if (node != source / local_world) {
+          unsigned contributions = 0U;
+          for (auto token = begin; token < end; ++token)
+            contributions += fanouts[(token - begin) * nodes + node];
+          const auto count = (contributions + partition.rows - 1U) / partition.rows;
+          return_sequences[channel] += count > lane
+              ? (count - lane + partition.lanes - 1U) / partition.lanes : 0U;
+        }
+        require(rp[base + w + 1U] == return_sequences[channel],
+                "Return packet terminal sequence");
       }
     }
   }
@@ -233,6 +267,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
           if (valid[route] && expert / experts_per_node == node) {
             ++expected[(expert / (experts / world)) % local_world];
             ++fanouts;
+            require(route_locations[route] == packet * partition.rows + row,
+                    "Dispatch inverse packet/token row");
           }
         }
       }
@@ -249,6 +285,30 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
       if (valid[route] && node != source / local_world)
         require(delivered[node].count(token) == 1U, "packet no-drop coverage");
     }
+
+  std::vector<unsigned> returned(selected.size(), 0U);
+  for (unsigned channel = 0; channel < nodes * partition.lanes; ++channel) {
+    const auto node = channel / partition.lanes;
+    require(return_channels[channel + 1U] - return_channels[channel] ==
+                return_sequences[channel], "Return channel extent");
+    for (auto packet = return_channels[channel];
+         packet < return_channels[channel + 1U]; ++packet) {
+      const auto &desc = return_plan[packet];
+      require(desc.rows > 0U && desc.rows <= partition.rows, "Return packet tail");
+      for (unsigned row = 0U; row < desc.rows; ++row) {
+        const auto route = order[desc.route_begin + row];
+        require(valid[route] && unsigned(selected[route]) / experts_per_node == node,
+                "Return packet node/validity");
+        require(desc.window == shape.window(source, route / top_k),
+                "Return packet window");
+        require(++returned[route] == 1U, "Return route uniqueness");
+      }
+    }
+  }
+  for (std::size_t route = 0U; route < selected.size(); ++route)
+    require(returned[route] == unsigned(valid[route] &&
+                unsigned(selected[route]) / experts_per_node != source / local_world),
+            "Return route no-drop coverage");
 }
 
 struct SourceOrdinal {

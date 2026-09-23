@@ -173,6 +173,33 @@ struct NodeToken {
   std::uint32_t fanouts;
 };
 
+// Immutable directories, separate from reusable network packet storage.
+struct DispatchPacketPlan {
+  std::uint64_t window;
+  std::uint64_t token_begin; // Index into the source's frozen NodeToken array.
+  std::uint32_t tokens;
+  std::uint32_t fanouts;
+};
+
+struct DispatchPlanView {
+  std::uint64_t *channel_offsets; // [nodes * lanes + 1], self channels empty.
+  DispatchPacketPlan *packets;    // [sum(channel terminal sequences)]
+  std::uint32_t *consumer_rows;   // [packets, local_world]
+  std::uint64_t *route_packets;   // Remote valid route -> packet * Q + token row.
+};
+
+struct ReturnPacketPlan {
+  std::uint64_t window;
+  std::uint64_t route_begin; // Contiguous interval in source route_order.
+  std::uint32_t rows;       // Complete H-dimensional contributions, not fragments.
+};
+
+struct ReturnPlanView {
+  std::uint64_t *packet_prefix;   // [nodes * lanes, local_windows + 1]
+  std::uint64_t *channel_offsets; // [nodes * lanes + 1], self channels empty.
+  ReturnPacketPlan *packets;
+};
+
 // Source-local immutable metadata. Activation payload is stored separately.
 struct SourcePlanView {
   WindowShape shape;

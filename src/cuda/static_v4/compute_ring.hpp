@@ -50,11 +50,9 @@ struct WindowSource {
 struct RingState {
   std::uint64_t block_base;
   std::uint64_t source_base;
-  std::uint64_t tokens;
   std::uint64_t windows;
   std::uint64_t blocks;
   std::uint64_t rows;
-  unsigned error;
 };
 
 struct SourceEpoch {
@@ -62,8 +60,30 @@ struct SourceEpoch {
   std::uint64_t base;
 };
 
+struct SourceHeader {
+  SourceEpoch epoch;
+  unsigned error;
+};
+
+// Offsets from one source's immutable metadata region. The same layout is
+// locally allocated on one node, and replicated in registered rail memory
+// for network planning. X is deliberately absent from this region.
+struct SourceMetadataLayout {
+  std::size_t header = 0, selected = 0, gates = 0;
+  std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
+  std::size_t source_slot = 0, node_tokens = 0, packet_prefix = 0;
+  std::size_t dispatch_offsets = 0, dispatch_packets = 0;
+  std::size_t dispatch_consumers = 0, dispatch_routes = 0;
+  std::size_t return_prefix = 0, return_offsets = 0, return_packets = 0;
+  std::size_t bytes = 0;
+};
+
 struct ComputeRingView {
   SourcePlanView source;
+  SourceHeader *source_header = nullptr;
+  float *source_gates = nullptr;
+  DispatchPlanView dispatch{};
+  ReturnPlanView returning{};
   std::uint32_t depth = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t contribution_stride = 0;
@@ -83,6 +103,9 @@ struct ComputeRingView {
 
 struct ComputeRingLayout {
   WindowShape shape{};
+  PacketPartition packets{32U, 2U};
+  SourceMetadataLayout source;
+  std::size_t metadata = 0;
   std::uint32_t depth = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t max_windows = 0;
@@ -90,8 +113,6 @@ struct ComputeRingLayout {
   std::size_t state = 0, slots = 0, contributions = 0, contribution_ready = 0;
   std::size_t source_epochs = 0;
   std::size_t source_reserved = 0;
-  std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
-  std::size_t source_slot = 0, node_tokens = 0, packet_prefix = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
   std::size_t window_sources = 0;
   std::size_t blocks = 0, rows = 0, output = 0;

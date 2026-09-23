@@ -4832,25 +4832,38 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.expert_blocks = at<std::uint64_t>(slot.device, l.expert_blocks);
     r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);
     r.rows = at<static_forward::RingRow>(slot.device, l.rows);
+    const auto &m = l.source;
+    auto *metadata = at<char>(slot.device, l.metadata);
+    r.source_header = at<static_forward::SourceHeader>(metadata, m.header);
+    r.source_gates = at<float>(metadata, m.gates);
     auto &p = r.source;
     p.shape = l.shape;
     p.shape.world = id.world_size;
     p.shape.sources = std::min(id.world_size, 16U);
     p.shape.top_k = id.top_k;
-    p.packets = {32U, 2U};
+    p.packets = l.packets;
     p.source_rank = id.calling_rank;
     p.experts = id.num_experts;
     p.nodes = id.num_nodes;
     p.tokens = id.num_tokens;
     p.selected_experts = args.selected_experts;
     p.valid = nullptr;
-    p.expert_prefix = at<std::uint64_t>(slot.device, l.expert_prefix);
-    p.node_prefix = at<std::uint64_t>(slot.device, l.node_prefix);
-    p.route_order = at<std::uint64_t>(slot.device, l.route_order);
-    p.source_slot = at<std::uint32_t>(slot.device, l.source_slot);
-    p.node_tokens = at<static_forward::NodeToken>(slot.device, l.node_tokens);
-    p.packet_prefix = at<std::uint64_t>(slot.device, l.packet_prefix);
-    p.error = &r.state->error;
+    p.expert_prefix = at<std::uint64_t>(metadata, m.expert_prefix);
+    p.node_prefix = at<std::uint64_t>(metadata, m.node_prefix);
+    p.route_order = at<std::uint64_t>(metadata, m.route_order);
+    p.source_slot = at<std::uint32_t>(metadata, m.source_slot);
+    p.node_tokens = at<static_forward::NodeToken>(metadata, m.node_tokens);
+    p.packet_prefix = at<std::uint64_t>(metadata, m.packet_prefix);
+    p.error = &r.source_header->error;
+    if (id.num_nodes > 1U) {
+      r.dispatch = {at<std::uint64_t>(metadata, m.dispatch_offsets),
+                    at<static_forward::DispatchPacketPlan>(metadata, m.dispatch_packets),
+                    at<std::uint32_t>(metadata, m.dispatch_consumers),
+                    at<std::uint64_t>(metadata, m.dispatch_routes)};
+      r.returning = {at<std::uint64_t>(metadata, m.return_prefix),
+                     at<std::uint64_t>(metadata, m.return_offsets),
+                     at<static_forward::ReturnPacketPlan>(metadata, m.return_packets)};
+    }
   }
   args.canonical_gates_offset = layout.canonical_gates;
   args.forward_output_rows_offset = config.retain_backward_state

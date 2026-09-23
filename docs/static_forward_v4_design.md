@@ -666,6 +666,8 @@ M5 与协议实现正交，可在冻结基线后提前做，但不把两者收�
 
 M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window planner；
 M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-window 几何。
+M3a 补齐 Dispatch route→packet/token 反向索引和 Return 精确逐 channel 目录，
+并将 source epoch/gate/route/packet 元数据集中为不含 X 的独立区域。
 详见 ring 实施记录。规划器已接入单机 Forward，包括窗口几何、source contribution
 映射和整窗口准入；下面涉及网络目录交换、跨机准入的完整事项仍保持未完成。
 

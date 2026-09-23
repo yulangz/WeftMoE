@@ -32,6 +32,19 @@ __device__ __forceinline__ T *peer(const ForwardKernelArgs &a, unsigned rank,
                                offset);
 }
 
+// Only immutable source metadata uses rail replicas. Payload and slot control
+// addresses retain their own transport-specific visibility/lifetime contracts.
+template <class T>
+__device__ __forceinline__ T *source_metadata(const ForwardKernelArgs &a,
+                                              unsigned rank, T *local_pointer) {
+  if (a.use_gin) {
+    const auto offset = reinterpret_cast<const char *>(local_pointer) -
+                        reinterpret_cast<const char *>(a.ring.source_header);
+    return static_v4::source_pointer<T>(a, rank, offset);
+  }
+  return peer(a, rank, local_pointer);
+}
+
 __device__ __forceinline__ static_forward::ComputeSlot &
 slot(const ForwardKernelArgs &a, std::uint64_t block) {
   return a.ring.slots[a.ring.blocks[block].slot];
@@ -62,7 +75,8 @@ source_count(const ForwardKernelArgs &a, unsigned source,
   if (local_window * plan.shape.tokens >= a.ring.source_epochs[source].tokens)
     return 0U;
   const auto *prefix =
-      peer(a, source, plan.expert_prefix) + local_window * (plan.experts + 1U);
+      source_metadata(a, source, plan.expert_prefix) +
+      local_window * (plan.experts + 1U);
   return prefix[expert + 1U] - prefix[expert];
 }
 

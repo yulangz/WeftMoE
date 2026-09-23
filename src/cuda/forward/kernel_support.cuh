@@ -636,6 +636,51 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 }
 #endif
 
+static_forward::SourceMetadataLayout make_source_metadata_layout(
+    const ActivationTransportPoolConfig &config, static_forward::WindowShape shape,
+    static_forward::PacketPartition packets) {
+  static_forward::SourceMetadataLayout m;
+  std::size_t cursor = 0;
+  const auto windows = static_forward::ceil_div(config.max_tokens_per_rank, shape.tokens);
+  const auto experts = std::uint64_t(config.max_world_size) * config.max_owned_experts;
+  const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                                  "source metadata routes");
+  const auto entries = checked_mul(windows, std::uint64_t(shape.tokens) * config.max_top_k,
+                                   "source window entries");
+  const auto prefixes = std::uint64_t(config.max_nodes) * packets.lanes * (windows + 1U);
+  m.header = append(cursor, 1U, sizeof(static_forward::SourceHeader), "source header");
+  m.gates = append(cursor, routes, sizeof(float), "source gates");
+  m.expert_prefix = append(cursor, windows * (experts + 1U),
+                           sizeof(std::uint64_t), "source window experts");
+  m.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
+                         sizeof(std::uint64_t), "source window nodes");
+  m.route_order = append(cursor, entries, sizeof(std::uint64_t), "window routes");
+  m.source_slot = append(cursor, entries, sizeof(std::uint32_t), "source ordinals");
+  m.node_tokens = append(cursor, entries, sizeof(static_forward::NodeToken),
+                         "node-deduplicated tokens");
+  m.packet_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Dispatch prefixes");
+  if (config.max_nodes > 1U) {
+    const auto channels = config.max_nodes * packets.lanes;
+    const auto local_world = config.max_world_size / config.max_nodes;
+    m.selected = append(cursor, routes, sizeof(std::int32_t), "source selected experts");
+    m.dispatch_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
+                                 "Dispatch channel offsets");
+    m.dispatch_packets = append(cursor, routes, sizeof(static_forward::DispatchPacketPlan),
+                                 "Dispatch packet directory");
+    m.dispatch_consumers = append(cursor, checked_mul(routes, local_world, "packet consumers"),
+                                   sizeof(std::uint32_t), "Dispatch consumers");
+    m.dispatch_routes = append(cursor, routes, sizeof(std::uint64_t),
+                                "Dispatch inverse route directory");
+    m.return_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Return prefixes");
+    m.return_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
+                               "Return channel offsets");
+    m.return_packets = append(cursor, routes, sizeof(static_forward::ReturnPacketPlan),
+                               "Return packet directory");
+  }
+  m.bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
+  return m;
+}
+
 GinWindowLayout
 make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   GinWindowLayout layout;
@@ -839,6 +884,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   std::size_t cursor = 0;
   auto &ring = layout.static_ring;
   if (config.static_forward_window_tokens) {
+    if constexpr (forward_tuning::kTileM != 128U ||
+                  forward_tuning::kUnifiedThreads != 384U ||
+                  forward_tuning::kMathWarpgroups != 2U ||
+                  forward_tuning::kUnifiedCommBase != 288U ||
+                  forward_tuning::kUnifiedCommThreads != 96U)
+      throw std::invalid_argument("static ring requires M128 and the 256/32/96 worker partition");
     if (config.static_forward_contribution_windows == 0U)
       throw std::invalid_argument("static ring requires contribution capacity");
     if (config.enable_backward_state || config.enable_socket_fallback ||
@@ -874,21 +925,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         cursor, std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
                     config.max_top_k, sizeof(std::uint64_t),
         "contribution route generations");
-    const auto windows = static_forward::ceil_div(config.max_tokens_per_rank,
-                                                   ring.shape.tokens);
-    const auto experts = std::uint64_t(config.max_world_size) * config.max_owned_experts;
-    const auto entries = checked_mul(windows,
-        std::uint64_t(ring.shape.tokens) * config.max_top_k, "source plan entries");
-    ring.expert_prefix = append(cursor, windows * (experts + 1U),
-                                 sizeof(std::uint64_t), "source window experts");
-    ring.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
-                               sizeof(std::uint64_t), "source window nodes");
-    ring.route_order = append(cursor, entries, sizeof(std::uint64_t), "window routes");
-    ring.source_slot = append(cursor, entries, sizeof(std::uint32_t), "source ordinals");
-    ring.node_tokens = append(cursor, entries, sizeof(static_forward::NodeToken),
-                               "node-deduplicated tokens");
-    ring.packet_prefix = append(cursor, config.max_nodes * 2U * (windows + 1U),
-                                 sizeof(std::uint64_t), "channel packet prefixes");
+    ring.source = make_source_metadata_layout(config, ring.shape, ring.packets);
+    ring.metadata = append(cursor, 1U, ring.source.bytes, "source metadata");
     ring.window_prefix = append(cursor, ring.max_windows + 1U,
                                  sizeof(std::uint64_t), "window block prefixes");
     ring.window_sources = append(cursor, ring.max_windows * ring.shape.sources,
@@ -1166,8 +1204,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                         "fused source routes per rank"),
             "fused source route table"),
         sizeof(std::uint32_t), "fused source route table");
-    layout.fused_source_gates = append(
-        cursor, routes, sizeof(float), "fused source route gates");
+    layout.fused_source_gates = ring.depth
+        ? ring.metadata + ring.source.gates
+        : append(cursor, routes, sizeof(float), "fused source route gates");
     layout.fused_owned_expert_ids = append(
         cursor, config.max_owned_experts, sizeof(std::uint32_t),
         "fused owned expert ids");

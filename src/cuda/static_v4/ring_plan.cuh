@@ -9,8 +9,8 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
-    r.state->tokens = p.tokens;
-    r.state->error = 0U;
+    r.source_header->epoch = {p.tokens, r.state->source_base};
+    r.source_header->error = 0U;
     if (a.runtime_epoch)
       ++*a.runtime_epoch;
   }
@@ -21,9 +21,8 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
     auto *input = peer_at<uint4>(a.local_base, a.source_input_offset);
     for (auto v = tid; v < p.tokens * a.hidden / 8U; v += stride)
       input[v] = reinterpret_cast<const uint4 *>(a.input)[v];
-    auto *gates = peer_at<float>(a.local_base, a.fused_source_gates_offset);
     for (auto route = tid; route < p.tokens * p.shape.top_k; route += stride)
-      gates[route] = a.gates[route];
+      r.source_gates[route] = a.gates[route];
     build_combine_order(a, tid, stride);
     collective_scope_sync<384U, kCollectiveJoinBarrier>();
     collective_scope_sync<384U, kCollectiveJoinBarrier>();
@@ -41,9 +40,9 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
   if (blockIdx.x == 0U) {
     unsigned error = 0U;
     for (unsigned source = tid; source < a.world; source += Control) {
-      const auto *state = peer(a, source, r.state);
-      r.source_epochs[source] = {state->tokens, state->source_base};
-      error |= state->error;
+      const auto *header = source_metadata(a, source, r.source_header);
+      r.source_epochs[source] = header->epoch;
+      error |= header->error;
     }
     error = __reduce_or_sync(0xffffffffU, error);
     if (tid % 32U == 0U)
@@ -168,11 +167,12 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
          source += Control / 32U) {
       const auto count = counts[source - first];
       const auto *source_prefix =
-          peer(a, source, p.expert_prefix) + local_window * (p.experts + 1U);
+          source_metadata(a, source, p.expert_prefix) +
+          local_window * (p.experts + 1U);
       const auto *order =
-          peer(a, source, p.route_order) + local_window * p.window_capacity();
-      const auto *gates = peer_at<const float>(a.peer_bases[source],
-                                               a.fused_source_gates_offset);
+          source_metadata(a, source, p.route_order) +
+          local_window * p.window_capacity();
+      const auto *gates = source_metadata(a, source, r.source_gates);
       for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
         const auto row = geometry.expert_row(0U, source, ordinal);
         const auto route =
