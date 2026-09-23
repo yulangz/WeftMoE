@@ -168,6 +168,46 @@ struct ReturnRecord {
   std::uint64_t source_route;
 };
 
+struct NodeToken {
+  std::uint64_t token;
+  std::uint32_t fanouts;
+};
+
+// Source-local immutable metadata. Activation payload is stored separately.
+struct SourcePlanView {
+  WindowShape shape;
+  PacketPartition packets;
+  std::uint32_t source_rank;
+  std::uint32_t experts;
+  std::uint32_t nodes;
+  std::uint64_t tokens;
+  const std::int32_t *selected_experts;
+  const std::uint8_t *valid;
+  std::uint64_t *expert_prefix; // [local_windows, experts+1]
+  std::uint64_t *node_prefix;   // [local_windows, nodes+1]
+  std::uint64_t *route_order;   // [local_windows, B*K]
+  std::uint32_t *source_slot;   // [tokens*K], window/expert-local ordinal
+  NodeToken *node_tokens;      // [local_windows, B*K]
+  std::uint64_t *packet_prefix; // [nodes, lanes, local_windows+1]
+  unsigned *error;
+
+  WEFTMOE_STATIC_PLAN_HD std::uint64_t local_windows() const {
+    return ceil_div(tokens, shape.tokens);
+  }
+  WEFTMOE_STATIC_PLAN_HD std::uint64_t window_capacity() const {
+    return std::uint64_t(shape.tokens) * shape.top_k;
+  }
+  WEFTMOE_STATIC_PLAN_HD unsigned scratch_words() const {
+    return experts + nodes;
+  }
+};
+
+struct WindowMblock {
+  std::uint32_t expert;
+  std::uint32_t expert_row;
+  std::uint32_t rows;
+};
+
 static_assert(sizeof(TokenRecord) == 16U);
 static_assert(sizeof(FanoutRecord) == 32U);
 static_assert(sizeof(PacketHeader) == 32U);

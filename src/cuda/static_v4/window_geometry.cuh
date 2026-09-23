@@ -4,12 +4,6 @@
 
 namespace weftmoe::cuda::static_forward {
 
-struct WindowMblock {
-  std::uint32_t expert;     // Rank-local expert index.
-  std::uint32_t expert_row; // Logical row, never a physical ring address.
-  std::uint32_t rows;       // Exact C retirement units; X pads readiness to M.
-};
-
 struct WindowGeometryView {
   WindowShape shape;
   std::uint64_t window;
@@ -40,7 +34,7 @@ struct WindowGeometryView {
 // admission will reserve mblock_prefix[owned_experts] slots on every plane
 // before this directory can be consumed by pull or compute.
 template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U>
-__device__ void build_window_geometry(const WindowGeometryView &a) {
+__device__ void build_window_counts(const WindowGeometryView &a) {
   const auto tid = threadIdx.x - BaseThread;
   const auto sources =
       a.shape.source_end(a.window) - a.shape.source_begin(a.window);
@@ -60,6 +54,12 @@ __device__ void build_window_geometry(const WindowGeometryView &a) {
     a.mblock_prefix[a.owned_experts] = blocks;
   }
   source_plan_sync<Threads, Barrier>();
+}
+
+template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U>
+__device__ void build_window_geometry(const WindowGeometryView &a) {
+  build_window_counts<Threads, BaseThread, Barrier>(a);
+  const auto tid = threadIdx.x - BaseThread;
   for (unsigned expert = 0; expert < a.owned_experts; ++expert) {
     const auto blocks = a.mblock_prefix[expert + 1U] - a.mblock_prefix[expert];
     for (auto block = std::uint64_t(tid); block < blocks; block += Threads)

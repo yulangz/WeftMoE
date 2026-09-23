@@ -83,7 +83,8 @@ template <bool StaticLocal, bool StaticSchedule> struct Communication {
 } // namespace forward_unified_detail
 
 template <bool StaticLocal, bool RetainBackwardState,
-          bool StaticSchedule = false, bool Prefill = false>
+          bool StaticSchedule = false, bool Prefill = false,
+          bool RingSchedule = false>
 __global__ __launch_bounds__(
     forward_tuning::kUnifiedThreads,
     1) void unified_forward_kernel(const __grid_constant__ ForwardKernelArgs a,
@@ -125,9 +126,9 @@ __global__ __launch_bounds__(
                                          : forward_tuning::kTileK;
   forward_compute_detail::persistent_role<
       StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK, true,
-      ComputeRole::Initialize, StaticSchedule, kFc1N, kFc2N>(
+      ComputeRole::Initialize, StaticSchedule, kFc1N, kFc2N, RingSchedule>(
       a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
-      &pair_operand, &output_store_map, pair);
+        &pair_operand, &output_store_map, pair);
   // Shared barriers and cluster setup are independent of the preceding
   // generation initialization. Every thread waits before reading its output.
   programmatic_launch::wait();
@@ -136,7 +137,9 @@ __global__ __launch_bounds__(
       if (blockIdx.x == 0U && threadIdx.x == 0U)
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
             ->route_exchange_start_clock = device_globaltimer_ns();
-      if constexpr (StaticLocal)
+      if constexpr (RingSchedule)
+        static_v4::ring::prepare_local(a, storage);
+      else if constexpr (StaticLocal)
         static_v4::route_exchange(a, storage);
       else
         static_v4::network_route_exchange(a, storage);
@@ -165,7 +168,8 @@ __global__ __launch_bounds__(
     }
   }
   if constexpr (StaticSchedule) {
-    static_v4::initialize(a);
+    if constexpr (!RingSchedule)
+      static_v4::initialize(a);
   } else {
     forward_initialize_generation<StaticLocal>(a);
     forward_initialize_pipeline<StaticLocal, true, false>(
@@ -197,7 +201,7 @@ __global__ __launch_bounds__(
     if (threadIdx.x < 288U) {
       forward_compute_detail::persistent_role<
           StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK,
-          true, ComputeRole::Producer, StaticSchedule, kFc1N, kFc2N>(
+          true, ComputeRole::Producer, StaticSchedule, kFc1N, kFc2N, RingSchedule>(
           a, x_map, s_map, w1_map, w2_map, storage, &task, &kind,
           &return_mblock, &pair_operand, &output_store_map, pair);
     } else {
@@ -213,15 +217,30 @@ __global__ __launch_bounds__(
                      : forward_tuning::compute_smem_bytes(a.world)) +
                 127U) &
                ~127ULL));
-      forward_unified_detail::Communication<StaticLocal, StaticSchedule>{
-          a, control, scheduler, comm}();
+      if constexpr (RingSchedule)
+        forward_unified_transport::ring_run<kFc1N, kFc2N>(a, comm);
+      else
+        forward_unified_detail::Communication<StaticLocal, StaticSchedule>{
+            a, control, scheduler, comm}();
     }
   } else {
     forward_compute_detail::persistent_role<
         StaticLocal, RetainBackwardState, kFc1Stages, kFc2Stages, kTileK, true,
-        ComputeRole::Math, StaticSchedule, kFc1N, kFc2N>(
+        ComputeRole::Math, StaticSchedule, kFc1N, kFc2N, RingSchedule>(
         a, x_map, s_map, w1_map, w2_map, storage, &task, &kind, &return_mblock,
-        &pair_operand, &output_store_map, pair);
+      &pair_operand, &output_store_map, pair);
+  }
+  if constexpr (RingSchedule) {
+    static_assert(StaticSchedule && StaticLocal && !RetainBackwardState);
+    static_v4::collective_scope_sync<384U, static_v4::kCollectiveJoinBarrier>();
+    if (threadIdx.x >= 256U)
+      static_v4::after_combine(a);
+    if (blockIdx.x == 0U && threadIdx.x == 256U && !a.dispatch.runtime->error) {
+      a.ring.state->block_base += a.ring.state->blocks;
+      a.ring.state->source_base += a.ring.source.local_windows();
+    }
+    static_v4::finalize<kFc1N, kFc2N>(a);
+    return;
   }
   if constexpr (StaticSchedule) {
     if (threadIdx.x < forward_compute_detail::kMathThreads) {
@@ -296,13 +315,14 @@ __global__ __launch_bounds__(
 #endif
 
 template <bool StaticLocal, bool RetainBackwardState,
-          bool StaticSchedule = false, bool Prefill = false>
+          bool StaticSchedule = false, bool Prefill = false,
+          bool RingSchedule = false>
 constexpr auto unified_forward_entry() {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY) && __has_include(<nccl_device.h>)
   return unified_communication_benchmark_kernel<StaticLocal,
                                                 RetainBackwardState>;
 #else
   return unified_forward_kernel<StaticLocal, RetainBackwardState,
-                                StaticSchedule, Prefill>;
+                                StaticSchedule, Prefill, RingSchedule>;
 #endif
 }

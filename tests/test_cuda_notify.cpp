@@ -3736,6 +3736,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.max_owned_experts = experts / world;
     transport_config.enable_backward_state = retain_backward_state;
     transport_config.enable_gin_rdma = gin_forward_benchmark;
+    if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
+      transport_config.static_forward_window_tokens = std::stoul(window);
     const auto setup_start = Clock::now();
     weftmoe::cuda::ActivationTransportResourcePool transport_pool;
     std::vector<weftmoe::transport::BFloat16> activation_host(
@@ -3972,6 +3974,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       }
       output.wait();
       const auto graph_device_kernel_us = output.timings().device_kernel_us;
+      const auto graph_timings = output.timings();
       const auto graph_output =
           weftmoe::cuda::download_forward_output_for_validation(output,
                                                                  execution);
@@ -3995,7 +3998,17 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 << " graph_memcpy_nodes=" << graph_memcpy_nodes
                 << " graph_event_record_nodes=" << graph_event_record_nodes
                 << " graph_event_wait_nodes=" << graph_event_wait_nodes
+                << " static_schedule="
+                << (std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr)
+                << " ring_window_tokens=" << transport_config.static_forward_window_tokens
+                << " device_bytes=" << transport_pool.usage().device_bytes
+                << " compute_device_bytes=" << transport_pool.usage().compute_device_bytes
+                << " gin_registered_bytes=" << transport_pool.usage().gin_registered_bytes
                 << " device_kernel_us=" << graph_device_kernel_us
+                << " route_exchange_us=" << graph_timings.route_exchange_us
+                << " fc1_swiglu_us=" << graph_timings.fc1_swiglu_us
+                << " fc2_us=" << graph_timings.fc2_us
+                << " after_combine_us=" << graph_timings.after_combine_us
                 << " output_hash=" << output_hash << " samples=";
       for (std::size_t index = 0; index < samples.size(); ++index)
         std::cout << (index ? "," : "") << samples[index];

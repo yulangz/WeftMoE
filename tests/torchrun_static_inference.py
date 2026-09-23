@@ -150,23 +150,30 @@ def main():
         del graph
         if world * max_tokens * args.top_k > max_rows:
             x, routes, gates = inputs(max_tokens, skew=True)
-            rejected = 0
-            try:
-                runtime.inference_eager(x, routes, gates, w1, w2)
-            except RuntimeError as error:
-                assert "production-terminal-agreement" in str(error), str(error)
-                rejected = 1
-            # GIN agrees terminal status across ranks; local P2P reports the
-            # overflowing destination's status only. Join before workspace
-            # reuse so the local test follows that API's failure contract too.
-            failures = torch.tensor(rejected, device="cuda")
-            dist.all_reduce(failures)
-            network = world > int(os.environ["LOCAL_WORLD_SIZE"])
-            assert failures.item() == (world if network else 1), \
-                "overflow must be reported, not silently drop routes"
+            ring = int(os.getenv("WEFTMOE_STATIC_RING_TOKENS", "0")) != 0
+            if ring:
+                expected = reference(x, routes, gates, all_w1, all_w2)
+                check(runtime.inference_eager(x, routes, gates, w1, w2), expected,
+                      "hotspot-no-drop-eager")
+                check(runtime.inference(4, x, routes, gates, w1, w2), expected,
+                      "hotspot-no-drop-graph")
+            else:
+                rejected = 0
+                try:
+                    runtime.inference_eager(x, routes, gates, w1, w2)
+                except RuntimeError as error:
+                    assert "production-terminal-agreement" in str(error), str(error)
+                    rejected = 1
+                # The old arena rejects overflow collectively (GIN) or on the
+                # overflowing destination (local). Ring must instead finish.
+                failures = torch.tensor(rejected, device="cuda")
+                dist.all_reduce(failures)
+                network = world > int(os.environ["LOCAL_WORLD_SIZE"])
+                assert failures.item() == (world if network else 1), \
+                    "overflow must be reported, not silently drop routes"
             actual = runtime.inference_eager(x[:3], routes[:3], gates[:3], w1, w2)
             check(actual, reference(x[:3], routes[:3], gates[:3], all_w1, all_w2),
-                  "capacity-rejection-recovery")
+                  "post-hotspot-reuse" if ring else "capacity-rejection-recovery")
     runtime.close()
     dist.destroy_process_group()
 

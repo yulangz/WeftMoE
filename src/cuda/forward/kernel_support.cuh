@@ -488,6 +488,7 @@ void dump_generation_completion(std::ostream &output,
 #endif
 
 struct Layout {
+  static_forward::ComputeRingLayout static_ring;
   std::size_t execution_epoch = 0;
   std::size_t input = 0;
   std::size_t ring_headers = 0;
@@ -836,6 +837,69 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                     "return row index", 0, "representable as uint32", "overflow");
   Layout layout;
   std::size_t cursor = 0;
+  auto &ring = layout.static_ring;
+  if (config.static_forward_window_tokens) {
+    if (config.enable_backward_state || config.enable_socket_fallback ||
+        config.max_nodes != 1U || config.max_intermediate_size == 0U)
+      throw std::invalid_argument(
+          "static ring currently requires single-node inference Forward");
+    ring.shape = {config.max_world_size,
+                  std::min(config.max_world_size, 16U),
+                  static_cast<unsigned>(std::min<std::uint64_t>(
+                      config.static_forward_window_tokens,
+                      config.max_tokens_per_rank)),
+                  config.max_top_k};
+    const auto window_blocks = ring.shape.max_mblocks(config.max_owned_experts);
+    ring.max_windows = ring.shape.windows(config.max_tokens_per_rank);
+    ring.max_blocks = checked_mul(ring.max_windows, window_blocks,
+                                  "static ring plan blocks");
+    if (ring.max_windows > UINT32_MAX ||
+        window_blocks > UINT32_MAX / (2ULL * ring.shape.tile_m))
+      throw std::invalid_argument("static ring window exceeds device indices");
+    ring.depth = static_cast<unsigned>(2U * window_blocks);
+    ring.state = append(cursor, 1, sizeof(static_forward::RingState), "ring state");
+    ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
+                        "X/S/C slot controls");
+    ring.contributions = append(cursor, ring.contribution_depth,
+                                 sizeof(static_forward::ContributionSlot),
+                                 "contribution window controls");
+    ring.contribution_ready = append(
+        cursor, std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
+                    config.max_top_k, sizeof(std::uint64_t),
+        "contribution route generations");
+    const auto windows = static_forward::ceil_div(config.max_tokens_per_rank,
+                                                   ring.shape.tokens);
+    const auto experts = std::uint64_t(config.max_world_size) * config.max_owned_experts;
+    const auto entries = checked_mul(windows,
+        std::uint64_t(ring.shape.tokens) * config.max_top_k, "source plan entries");
+    ring.expert_prefix = append(cursor, windows * (experts + 1U),
+                                 sizeof(std::uint64_t), "source window experts");
+    ring.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
+                               sizeof(std::uint64_t), "source window nodes");
+    ring.route_order = append(cursor, entries, sizeof(std::uint64_t), "window routes");
+    ring.source_slot = append(cursor, entries, sizeof(std::uint32_t), "source ordinals");
+    ring.node_tokens = append(cursor, entries, sizeof(static_forward::NodeToken),
+                               "node-deduplicated tokens");
+    ring.packet_prefix = append(cursor, config.max_nodes * 2U * (windows + 1U),
+                                 sizeof(std::uint64_t), "channel packet prefixes");
+    ring.window_prefix = append(cursor, ring.max_windows + 1U,
+                                 sizeof(std::uint64_t), "window block prefixes");
+    ring.expert_rows = append(cursor, ring.max_windows * config.max_owned_experts,
+                               sizeof(std::uint64_t), "window expert rows");
+    ring.expert_blocks = append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
+                                 sizeof(std::uint64_t), "window expert blocks");
+    ring.blocks = append(cursor, ring.max_blocks, sizeof(static_forward::RingBlock),
+                          "immutable compute blocks");
+    ring.rows = append(cursor, checked_mul(ring.max_blocks, ring.shape.tile_m,
+                                           "ring reverse rows"),
+                        sizeof(static_forward::RingRow), "immutable reverse routes");
+    ring.output = append(cursor,
+        std::uint64_t(ring.depth) * ring.shape.tile_m * config.max_hidden_size,
+        sizeof(transport::BFloat16), "C ring");
+  }
+  const auto activation_rows = ring.depth
+      ? std::uint64_t(ring.depth) * ring.shape.tile_m
+      : config.max_destination_rows_per_rank;
   const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
                                   "max routes");
   const auto links = checked_mul(config.max_nodes, config.channels, "links");
@@ -910,18 +974,20 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   layout.packet_claim = append(cursor, routes, sizeof(std::uint32_t),
                                "packet claim bitmap");
   layout.canonical_rows = append(
-      cursor, checked_mul(config.max_destination_rows_per_rank,
+      cursor, checked_mul(activation_rows,
                           config.max_hidden_size, "canonical rows"),
       sizeof(transport::BFloat16), "canonical rows");
   layout.canonical_gates =
-      append(cursor, config.max_destination_rows_per_rank, sizeof(float),
+      append(cursor, activation_rows, sizeof(float),
              "canonical route gates");
   const auto route_elements =
-      checked_mul(routes, config.max_hidden_size, "route elements");
+      checked_mul(ring.depth ? std::uint64_t(ring.contribution_depth) *
+                                  ring.shape.tokens * config.max_top_k : routes,
+                  config.max_hidden_size, "route elements");
   layout.contribution = append(cursor, route_elements,
                                sizeof(transport::BFloat16), "contribution");
-  layout.combine_return = append(cursor, route_elements,
-                                 sizeof(transport::BFloat16), "combine return");
+  layout.combine_return = ring.depth ? layout.contribution :
+      append(cursor, route_elements, sizeof(transport::BFloat16), "combine return");
   if (config.max_intermediate_size == 0 || config.enable_socket_fallback)
     layout.combined =
         append(cursor,
@@ -947,7 +1013,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   }
   if (config.max_intermediate_size != 0) {
     const auto forward_elements = checked_mul(
-        config.max_destination_rows_per_rank,
+        activation_rows,
         config.max_intermediate_size, "forward gated U elements");
     layout.forward_s = append(cursor, forward_elements,
                               sizeof(transport::BFloat16), "forward gated U");

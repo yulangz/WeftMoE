@@ -14,6 +14,10 @@ V4 已经落地。**
 ## 0. 当前代码基线：已实现什么
 
 当前 V4 是单机/多机 inference-only 的静态 full-arena 实现，training 仍走 V3。
+新增 opt-in 单机 ring 数据面（`WEFTMOE_STATIC_RING_TOKENS=B`）：已接通
+pull→X→FC1→S→FC2→C→Return→contribution→Reduce，默认仍保留原路径。
+首版正确性通过但长序列性能退化，不能当作最终优化版。多机 ring、GEMM 独立消融
+和训练对接仍待完成；详细测量见 ring 记录的 M2。
 
 | 项目 | 当前行为 |
 |---|---|
@@ -662,8 +666,8 @@ M5 与协议实现正交，可在冻结基线后提前做，但不把两者收�
 
 M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window planner；
 M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-window 几何。
-详见 ring 实施记录。规划器目前独立验证，尚未接入 Forward 的数据面；下面涉及
-跨 rank 交换、全局映射和准入的完整事项仍保持未完成。
+详见 ring 实施记录。规划器已接入单机 Forward，包括窗口几何、source contribution
+映射和整窗口准入；下面涉及网络目录交换、跨机准入的完整事项仍保持未完成。
 
 - [x] 窗口编号、完整 token 分包、任意节点数的 peer/lane 地址和逐 slot 累积退休合同。
 - [x] GPU source-window expert/node counts、去重 token 列表、source ordinal 与 channel
@@ -682,12 +686,17 @@ M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-w
 
 ### M2：单机 X/S/C 与 contribution ring
 
-- [ ] 接入 destination-pull → X full、FC1 → S full/X empty、FC2 → C full/S empty。
-- [ ] 接入按完整行的 Return/C retirement 和窗口内 Reduce/contribution 释放。
-- [ ] 保持 reverse metadata 不依赖已释放 X；验证 multicast/epilogue stage 生命周期。
-- [ ] 用小 ring 深度、多代 wrap、热点 expert 和 tail 暴露错误的复用与容量依赖。
-- [ ] 单机 EP8 四规模 eager/graph 正确性与 1620 MHz 性能，记录 full arena→ring 的
+- [x] 接入 destination-pull → X full、FC1 → S full/X empty、FC2 → C full/S empty。
+- [x] 接入按完整行的 Return/C retirement 和窗口内 Reduce/contribution 释放。
+- [x] 保持 reverse metadata 不依赖已释放 X；验证 multicast/epilogue stage 生命周期。
+- [x] 用小 ring 深度、多代 wrap、热点 expert 和 tail 暴露错误的复用与容量依赖。
+- [x] 单机 EP8 四规模 eager/graph 正确性与 1620 MHz 性能，记录 full arena→ring 的
       独立变化及实际峰值显存；不以更多常驻显存伪装有界流水。
+
+M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理 slot，
+保守地等待三者全退休才共同复用；尚未利用 X/S 早退休的容量。source contribution
+是独立的两窗口 ring。首版性能落后，不默认启用；已测固定 pool 的分配峰值，
+尚未测应用整体显存峰值，性能与冗余 metadata 优化继续跟进。
 
 ### M3：多机 route-aware Dispatch 与节点内 pull/FC 重叠
 

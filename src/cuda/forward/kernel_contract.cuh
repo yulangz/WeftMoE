@@ -2,6 +2,7 @@
 // Kept in this header so the aggregation translation unit preserves device
 // inlining and code generation while the Forward boundary remains explicit.
 struct ForwardKernelArgs {
+  static_forward::ComputeRingView ring;
   DeviceDispatchKernelView dispatch;
   // Static-V4 inference can construct its compact routing metadata in this
   // kernel.  The selected-expert tensor remains router-owned; every other

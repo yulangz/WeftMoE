@@ -79,6 +79,9 @@ struct ActivationTransportPoolConfig {
   // until it is saved. Long-lived X/A/B checkpoints and final outputs belong
   // to ForwardTensorStorage, independently of these reusable execution slots.
   bool enable_backward_state = false;
+  // Opt-in bounded static Forward workspace. Zero retains the arena path;
+  // otherwise this is the source-token window size (inference only for now).
+  std::uint32_t static_forward_window_tokens = 0;
 };
 
 struct ActivationTransportPoolUsage {

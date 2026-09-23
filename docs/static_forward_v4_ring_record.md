@@ -131,3 +131,108 @@ python3 tests/run_multinode_nccl.py --binary "$ring_binary" \
 此阶段仍未改 Forward 的数据流。M1 尚缺跨 rank count/目录交换、source 与
 destination 全局映射、真正的整窗口准入及进度闭环；M2–M6 保持未完成。
 没有新增性能数据，不能将协议模块的独立通过等同于 ring Forward 已验证。
+
+## M2：单机有界数据面首版（正确性里程碑，非性能结论）
+
+### 实现及生命周期
+
+- `compute_ring.hpp` / `ring_access.cuh`：X/S/C slot 的 generation、累积
+  X-full/FC1-done/FC2-done/returned 与本代 targets；source contribution 独立两窗口。
+  不在 graph replay 中清零；结束后推进 block/source sequence base，profile 切换时
+  FC1/FC2 expected 取本次配置，不用不适用的固定 generation×F 公式。
+- `ring_plan.cuh`：固定 CTA 构建 source window；PlanReady 后读取实际 peer counts，
+  生成窗口内 expert/Mblock 几何。热点不使用旧 `max_destination_rows` 截断。
+  逻辑 reverse route metadata 独立于会覆盖的 X，输入仍有 invocation staging。
+- `ring_admission.cuh`：CTA 0 的独立控制 warp 非阻塞推进 source 与 destination
+  两本容量账。整窗口检查全部所需 X/S/C 后发布准入，无动态任务领取或 CAS。
+- `ring_transport.cuh`：每 CTA 的三个通信 warp 分别 pull、Return、Reduce；
+  CTA 0 的第三 warp 改为准入。pull 复制完成后累加 X-full；FC1/FC2 复用现有
+  multicast TMA/WGMMA/epilogue，按窗口静态 residue 枚举。Return 随完整 C 行
+  就绪而复制并发布 route-ready；Reduce 仍按 `(expert,slot)` 固定 FP32 顺序。
+- 只保留控制面 PlanReady 和 invocation 末尾 rank barrier；不在每个窗口加 barrier。
+  C 在完整行已复制后退休，contribution 在该窗口全部 token 已 Reduce 后退休。
+- 首版三个计算 plane 等深、同 slot 映射，容量复用保守地等待 X/S/C 三者全退休。
+  它们的计数独立，但尚未实现早释放 plane 的独立分配收益。source contribution
+  与它们独立，准入角色不被 Return/pull 的阻塞等待占住。
+
+开关为 `ActivationTransportPoolConfig::static_forward_window_tokens`，原生与 Python
+实验读取 `WEFTMOE_STATIC_RING_TOKENS`。0 保持原路径；当前 ring 明确只支持单机
+inference，不默默在多机/训练上退回旧协议。完整 contribution snapshot 的诊断
+接口不适用于 transient ring，明确拒绝；最终输出下载不受影响。
+
+### 正确性与检查
+
+- 主矩阵 EP8 T=1/64/8192/20480，32 个 rank/shape hash 与冻结 V4 全部一致；
+  每 rank graph 仍为一个 kernel，无 host 逐窗口操作。
+- 现有 `torchrun_static_inference.py --tokens 1 64 8192 20480 --edge-cases` 通过：
+  eager/graph、混合 64/8192 profile、不等长/空 source、重复 route、双层共享
+  workspace、改变输入/routes/gates 的 graph replay、交错 eager/graph，以及
+  maxT 全路由到同一 expert 的 eager/graph 和其后 workspace 复用。
+  ring 模式将原来预期 overflow 的测试改成必须输出全部 token，并与 PyTorch 对照。
+- 现有 host 检查 18/18；GPU plan 检查 31 source/packet + 6 destination 通过。
+- B=16、T=64、EP8，11 轮（10 warmup + 1 measured）、batch=1 的生产 graph
+  分别通过 memcheck 和 racecheck。NCCL init 的架构探测会产生
+  `cudaErrorNoKernelImageForDevice` API 报告，故明确使用
+  `--sanitizer-report-api-errors no`，仍开启设备内存/共享内存竞争检查。
+  未关闭 API 报告的首轮 exit=1，不记为检查通过；检查不证明跨 GPU 协议自动正确。
+
+首版性能/正确性 binary SHA256：
+`5be1fa5c02e4bfb7c08b97ce5e11265a6a83751277caa09ea0e35cb8f1994c6f`，
+位于 `build/static_v4_ring_m2/test_cuda_notify`；配置仍为 prefill 配置，B=256
+（实际 pool maxT 小于 B 时取 maxT），X/S/C 各 `2*D_window`，contribution 深度 2。
+PyTorch 对照的 library SHA256：
+`f3f61914e78e21dde3c162e946f12c9b644788abf9ded9323e9a2ee76916a1af`。
+
+### 首轮性能：退化需要继续优化
+
+全部核心实测 1620 MHz、显存 3201 MHz；warmup=10、measured=20、batch=20，
+graph CUDA-event rank-max p50，单位 us。计时不并发编译。
+
+| 单机 EP8 tokens/rank | 重测 V3 | 重测冻结 V4 | ring 首版 |
+|---:|---:|---:|---:|
+| 1 | 300.384 | 63.9728 | 116.155 |
+| 64 | 367.747 | 73.9040 | 267.486 |
+| 8192 | 1488.19 | 1503.53 | 5265.20 |
+| 20480 | 3288.22 | 4575.22 | 13042.8 |
+
+V3 必须显式设置 `WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`；冻结 V3 **配置 binary**
+本身也包含 V4 entry，只换 binary 而不设开关的测量不是 V3。本轮先识别并排除了
+这类测量，重新单独跑动态 V3，graph 为 2 kernel/rank。旧 V4 与 ring 按每个 T
+依次测量，尚未反向复测；此表是首版诊断，不是最终统计验收。
+
+原始输出：`build/static_v4_ring_m2/ep8_v3_dynamic_t*.log`、
+`ep8_static_v4_prefill_safe_t*.log`、`ep8_static_v4_ring_m2_t*.log`。
+V3 T=1 的 setup 与独立 planner 检查短暂相邻，后续反向复测应独占 GPU 重验。
+
+相对旧 V4，首版多了完整 C 的本地落地/读回、细粒度 Return/ready，减少了可同时
+执行 pull 的 warp；另有按窗口重复的 peer metadata 读取和固定从 cluster 0 开始
+的 residue。它们是待消融因素，不能凭此表分摊原因。目前不能宣称 ring 带来性能
+收益或全面优于 V3，保持 opt-in。下一步分别测 immutable metadata 本地化、
+静态 residue 旋转、等待策略与窗口大小，再接入多机和独立 GEMM 消融。
+
+### M2 收尾复测与 workspace
+
+加入 pool 字节数/所选路径及有效阶段 span 的 benchmark 输出，删除重复的 Return
+system fence，并禁止用 transient ring 调用完整 arena snapshot/独立 transport
+诊断接口。收尾 binary：`build/static_v4_ring_m2_checked/test_cuda_notify`，SHA256
+`00175769123d06a790d5a116970e80b6a1eacd50dddf4e3f77db70cf5f099050`。
+以 T=20480→8192→64→1、每个 T 先 ring 后 arena 的反向顺序复测，同样 10/20/20。
+四规模全部输出 hash 再次与冻结 V4 一致。
+
+| tokens/rank | 同 binary arena p50/us | ring p50/us | arena pool/MiB | ring pool/MiB |
+|---:|---:|---:|---:|---:|
+| 1 | 64.0896 | 115.403 | 5.00 | 25.12 |
+| 64 | 73.8992 | 264.506 | 17.64 | 61.72 |
+| 8192 | 1506.20 | 5269.15 | 1649.42 | 287.95 |
+| 20480 | 4604.35 | 13061.1 | 4116.36 | 457.53 |
+
+内存列为实际 `transport_pool.usage().compute_device_bytes`，每 rank 一 workspace
+slot；该 pool 不在 main 内分配，因此也是该固定 pool 的分配峰值。它**不是整个
+进程/模型的峰值**，不包含权重、外部输入输出、Notify 与 PyTorch reference。
+H2048/I512/K4、B256 下 X/S/C+contribution 数据区合计固定 170 MiB；总 pool 仍
+随输入、immutable plan 和尚未删除的旧 metadata 增长。短序列 pool 的两最坏窗口
+及独立 C 区预留反而较大；不能声称所有长度都减少显存。
+
+新增 stage span 仅用于定位：20K ring 的 plan 约 184 us，FC1/FC2 span 均约
+12.75 ms；8K 分别约 89 us 和 5.08 ms。它们重叠且包含等待，不能相加，也不是
+纯 GEMM 时间。长文主要退化不能归因于百微秒级 plan 本身，继续消融数据面。

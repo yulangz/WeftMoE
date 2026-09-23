@@ -298,6 +298,9 @@ def main():
     parser.add_argument("--ring-slots", type=int, choices=(1, 2))
     parser.add_argument("--compute-sanitizer-tool",
                         choices=("memcheck", "racecheck", "initcheck"))
+    parser.add_argument("--sanitizer-report-api-errors", default="explicit",
+                        choices=("all", "explicit", "no"),
+                        help="NCCL probes unsupported kernels; 'no' still checks device memory")
     args = parser.parse_args()
     if sum((args.benchmark, args.integrated_benchmark, args.buffer_modes,
             args.forward_smoke, args.forward_benchmark,
@@ -367,7 +370,8 @@ def main():
         environment["WEFTMOE_P2P_RING_SLOTS"] = str(args.ring_slots)
     prefix = (() if args.compute_sanitizer_tool is None else
               ("compute-sanitizer", "--tool", args.compute_sanitizer_tool,
-               "--print-limit=10", "--error-exitcode=1"))
+               "--print-limit=10", "--error-exitcode=1",
+               "--report-api-errors", args.sanitizer_report_api_errors))
     read_fd, write_fd = os.pipe()
     processes = []
     if args.communication_benchmark:

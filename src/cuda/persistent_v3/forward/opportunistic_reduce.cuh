@@ -70,7 +70,8 @@ reduce_token_view(const ForwardKernelArgs &a) {
 // Caller owns this token. First-warp execution needs no CTA-wide barrier.
 __device__ __forceinline__ bool
 reduce_token_payload(const ReduceTokenView &v,
-                     unsigned long long encoded) {
+                     unsigned long long encoded,
+                     std::uint64_t dense_row_base = ~std::uint64_t{0}) {
   if (encoded == 0ULL)
     return false;
   const auto lane = threadIdx.x & 31U;
@@ -94,7 +95,8 @@ reduce_token_payload(const ReduceTokenView &v,
       const auto slot = v.order[token * v.top_k + order];
       const auto route = token * v.top_k + slot;
       const auto row = v.return_base
-          ? v.return_base[v.route_expert[route]] + v.local_offset[route] : route;
+          ? v.return_base[v.route_expert[route]] + v.local_offset[route]
+          : (dense_row_base == ~std::uint64_t{0} ? route : dense_row_base + slot);
       const auto *source = v.local + row * v.hidden + column;
       const auto packed = *reinterpret_cast<const uint4 *>(source);
       const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};

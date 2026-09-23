@@ -394,7 +394,7 @@ __device__ __forceinline__ void pair_arrive(std::uint64_t *barrier) {
                                ::cuda::ptx::space_cluster, barrier);
 }
 
-template <bool StaticLocal>
+template <bool StaticLocal, bool RingSchedule = false>
 __device__ __noinline__ std::uint32_t select_static_owned_task(
     const ForwardKernelArgs &a, unsigned long long *scheduler,
     unsigned long long *claims, unsigned long long *fc1_done,
@@ -414,10 +414,15 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
   // non-preemptible. Polling the system-scope cancellation word at every
   // readiness probe serialized this inference-only hot path across GPUs.
   while (true) {
-    const auto wave_begin = (progress >> 32U) * kWaveMblocks;
-    if (wave_begin >= scheduler[3])
+    const auto wave = progress >> 32U;
+    if (RingSchedule ? wave >= a.ring.state->windows
+                     : wave * kWaveMblocks >= scheduler[3])
       break;
-    const auto wave_mblocks = min(kWaveMblocks, scheduler[3] - wave_begin);
+    const auto wave_begin = RingSchedule ? a.ring.window_prefix[wave]
+                                         : wave * kWaveMblocks;
+    const auto wave_mblocks = RingSchedule
+        ? a.ring.window_prefix[wave + 1U] - wave_begin
+        : min(kWaveMblocks, scheduler[3] - wave_begin);
     const auto fc1_pairs = wave_mblocks * fc1_ntiles / 2ULL;
     const auto fc2_units = wave_mblocks * fc2_units_per_mblock;
     const auto cluster = static_cast<unsigned long long>(blockIdx.x) /
@@ -426,12 +431,21 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
     if (fc1_pair < fc1_pairs) {
       const auto candidate = wave_begin * fc1_ntiles + 2ULL * fc1_pair;
       const auto mblock = candidate / fc1_ntiles;
-      const auto mapping = claims[mblock];
-      const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-      const auto local_mblock = static_cast<std::uint32_t>(mapping);
-      if (forward_mblock_rows_ready<true>(
-              a, expert, forward_mblock_local_row(local_mblock),
-              forward_mblock_valid_rows(a, expert, local_mblock))) {
+      bool ready;
+      if constexpr (RingSchedule) {
+        ready = static_v4::ring::admitted(a, mblock) &&
+            static_v4::ring::acquire(static_v4::ring::slot(a, mblock).x_full) >=
+                (static_v4::ring::sequence(a, mblock) / a.ring.depth + 1U) *
+                    forward_tuning::kTileM;
+      } else {
+        const auto mapping = claims[mblock];
+        const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
+        const auto local_mblock = static_cast<std::uint32_t>(mapping);
+        ready = forward_mblock_rows_ready<true>(
+            a, expert, forward_mblock_local_row(local_mblock),
+            forward_mblock_valid_rows(a, expert, local_mblock));
+      }
+      if (ready) {
         task0 = candidate;
         task1 = candidate + 1ULL;
         ++progress;
@@ -446,10 +460,17 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
       const auto mblock = wave_begin + fc2_unit / fc2_units_per_mblock;
       const auto unit = static_cast<std::uint32_t>(
           fc2_unit % fc2_units_per_mblock);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-          ready(fc1_done[mblock]);
-      if ((ready.load(::cuda::memory_order_acquire) & 0xffffULL) ==
-          fc1_ntiles) {
+      bool ready;
+      if constexpr (RingSchedule) {
+        auto &slot = static_v4::ring::slot(a, mblock);
+        ready = static_v4::ring::admitted(a, mblock) &&
+                static_v4::ring::acquire(slot.fc1_done) >= slot.fc1_target;
+      } else {
+        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+            complete(fc1_done[mblock]);
+        ready = (complete.load(::cuda::memory_order_acquire) & 0xffffULL) == fc1_ntiles;
+      }
+      if (ready) {
         task0 = mblock * fc2_ntiles +
                 2ULL * unit * forward_tuning::kFc2ClaimTiles;
         task1 = task0 + 1ULL;
@@ -564,7 +585,8 @@ __device__ __forceinline__ void select_compute_task(
                           *task_kind_shared, *task_shared, execution_epoch(a));
 }
 
-template <bool StaticLocal, unsigned Fc1TileN, unsigned Fc2TileN>
+template <bool StaticLocal, unsigned Fc1TileN, unsigned Fc2TileN,
+          bool RingSchedule = false>
 __device__ __forceinline__ void select_static_compute_task(
     const ForwardKernelArgs &a,
     unsigned long long *task_shared, unsigned int *task_kind_shared,
@@ -588,7 +610,7 @@ __device__ __forceinline__ void select_static_compute_task(
       Fc2TileN);
   unsigned long long task0 = 0ULL;
   unsigned long long task1 = 0ULL;
-  const auto kind = select_static_owned_task<StaticLocal>(
+  const auto kind = select_static_owned_task<StaticLocal, RingSchedule>(
       a, scheduler, claims, fc1_done, scheduler[3] * fc1_ntiles, fc1_ntiles,
       fc2_ntiles, pair->static_progress, task0, task1);
   *task_shared = cluster_rank == 0U ? task0 : task1;
@@ -606,6 +628,29 @@ template <> struct TaskSelectionState<false> {
 };
 
 enum class ComputeRole { Combined, Initialize, Math, Producer };
+
+struct MblockInfo {
+  unsigned expert;
+  std::uint64_t row;
+  unsigned valid_rows;
+};
+
+template <bool RingSchedule>
+__device__ __forceinline__ MblockInfo mblock_info(
+    const ForwardKernelArgs &a, const unsigned long long *claims,
+    std::uint64_t block) {
+  if constexpr (RingSchedule) {
+    const auto &tile = a.ring.blocks[block].tile;
+    return {tile.expert, static_v4::ring::row(a, block), tile.rows};
+  } else {
+    const auto mapping = claims[block];
+    const auto expert = static_cast<unsigned>(mapping >> 32U);
+    const auto local = static_cast<unsigned>(mapping);
+    return {expert, a.dispatch.expert_row_prefix[expert] +
+                        forward_mblock_local_row(local),
+            forward_mblock_valid_rows(a, expert, local)};
+  }
+}
 
 // The integer CUTLASS overload adds eight to a barrier ID. Unified compute
 // uses physical 1..4 for its task/math joins and 7 for token reduction.
@@ -640,7 +685,8 @@ template <bool StaticLocal, bool RetainBackwardState,
           bool Unified = false, ComputeRole Role = ComputeRole::Combined,
           bool StaticSchedule = false,
           unsigned Fc1TileN = forward_tuning::kFc1TileN,
-          unsigned Fc2TileN = forward_tuning::kFc2TileN>
+          unsigned Fc2TileN = forward_tuning::kFc2TileN,
+          bool RingSchedule = false>
 __device__ __forceinline__ void
 persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                 const CUtensorMap &s_map, const CUtensorMap &w1_map,
@@ -791,11 +837,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               break;
             const auto mblock = task / fc1_ntiles;
             const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
-            const auto mapping = claims[mblock];
-            const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-            const auto local_mblock = static_cast<std::uint32_t>(mapping);
-            const auto row = a.dispatch.expert_row_prefix[expert] +
-                             forward_mblock_local_row(local_mblock);
+            const auto info = mblock_info<RingSchedule>(a, claims, mblock);
+            const auto expert = info.expert;
+            const auto row = info.row;
             if (threadIdx.x == kMathThreads) {
               // The readiness acquire is performed by the scalar scheduler lane
               // and handed to this producer through the CTA named barrier. Make
@@ -866,11 +910,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               break;
             const auto tile_count = fc2_tiles_per_cta(first_task, fc2_ntiles);
             const auto mblock = first_task / fc2_ntiles;
-            const auto mapping = claims[mblock];
-            const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-            const auto local_mblock = static_cast<std::uint32_t>(mapping);
-            const auto row = a.dispatch.expert_row_prefix[expert] +
-                             forward_mblock_local_row(local_mblock);
+            const auto info = mblock_info<RingSchedule>(a, claims, mblock);
+            const auto expert = info.expert;
+            const auto row = info.row;
             if (threadIdx.x == kMathThreads) {
               asm volatile("fence.proxy.async.global;" : : : "memory");
               for (std::uint32_t offset = 0; offset < tile_count; ++offset) {
@@ -934,7 +976,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       bool timeline_fc2_started = false;
 #endif
       if constexpr (StaticSchedule)
-        select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
+        select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN, RingSchedule>(
             a, task_shared, task_kind_shared, pair_operand_shared, &pair);
       else
         select_compute_task<StaticLocal>(
@@ -970,7 +1012,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           cutlass::arch::NamedBarrier::sync(
               kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN, RingSchedule>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(
@@ -1005,13 +1047,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             atomicMin(&status->fc1_start_clock, device_globaltimer_ns());
           const auto mblock = task / fc1_ntiles;
           const auto n_tile = static_cast<std::uint32_t>(task % fc1_ntiles);
-          const auto mapping = claims[mblock];
-          const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-          const auto local_mblock = static_cast<std::uint32_t>(mapping);
-          const auto row = a.dispatch.expert_row_prefix[expert] +
-                           forward_mblock_local_row(local_mblock);
-          const auto valid_rows =
-              forward_mblock_valid_rows(a, expert, local_mblock);
+          const auto info = mblock_info<RingSchedule>(a, claims, mblock);
+          const auto expert = info.expert;
+          const auto row = info.row;
+          const auto valid_rows = info.valid_rows;
           const auto n = n_tile * Fc1TileN;
           if constexpr (StaticSchedule) {
             using Fc1TileMma = typename hopper::BF16MMASelector<Fc1TileN>::type;
@@ -1342,10 +1381,17 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           cutlass::arch::NamedBarrier::sync(
               kMathThreads, physical_barrier<Unified>(kMathReadyBarrier));
           if (threadIdx.x == 0U) {
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                ready(fc1_done[mblock]);
-            const auto old =
-                ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+            bool last;
+            if constexpr (RingSchedule) {
+              auto &slot = static_v4::ring::slot(a, mblock);
+              const auto target = slot.fc1_target;
+              last = static_v4::ring::arrive(slot.fc1_done, 1U) + 1U == target;
+            } else {
+              ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                  ready(fc1_done[mblock]);
+              const auto old = ready.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+              last = (old & 0xffffULL) + 1ULL == fc1_ntiles;
+            }
 #if WEFTMOE_DEBUG_VALIDATE
             if constexpr (!StaticLocal && !StaticSchedule) {
               if (a.use_gin)
@@ -1353,7 +1399,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                                           transport_state::TaskClass::Fc1);
             }
 #endif
-            if ((old & 0xffffULL) + 1ULL == fc1_ntiles) {
+            if (last) {
               const auto fc1_mblocks_complete =
                   atomicAdd(&scheduler[11ULL + 2ULL * a.world], 1ULL) + 1ULL;
               if (fc1_mblocks_complete == forward_mblocks) {
@@ -1383,7 +1429,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileEnd, Compute, 0U, task,
                                   execution_epoch(a));
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN, RingSchedule>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(
@@ -1485,13 +1531,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             const auto task = first_task + 2ULL * tile_offset;
             const auto mblock = task / fc2_ntiles;
             const auto n_tile = static_cast<std::uint32_t>(task % fc2_ntiles);
-            const auto mapping = claims[mblock];
-            const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-            const auto local_mblock = static_cast<std::uint32_t>(mapping);
-            const auto row = a.dispatch.expert_row_prefix[expert] +
-                             forward_mblock_local_row(local_mblock);
-            const auto valid_rows =
-                forward_mblock_valid_rows(a, expert, local_mblock);
+            const auto info = mblock_info<RingSchedule>(a, claims, mblock);
+            const auto row = info.row;
+            const auto valid_rows = info.valid_rows;
             const auto n = n_tile * Fc2TileN;
 
             const bool full_tma_tile = valid_rows == forward_tuning::kTileM &&
@@ -1515,7 +1557,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                                       ? smem_a + kFc2OutputOffset
                                       : (StaticSchedule ? fc2_smem_b : smem_a);
               if constexpr (StaticSchedule) {
-                static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal, Fc2TileN>(
+                static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal, Fc2TileN,
+                                        RingSchedule>(
                     a, output_tile, accum, row, valid_rows, n);
               } else {
                 const auto warp =
@@ -1626,13 +1669,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
           const auto task = first_task;
           const auto mblock = task / fc2_ntiles;
-          const auto mapping = claims[mblock];
-          const auto expert = static_cast<std::uint32_t>(mapping >> 32U);
-          const auto local_mblock = static_cast<std::uint32_t>(mapping);
-          const auto row = a.dispatch.expert_row_prefix[expert] +
-                           forward_mblock_local_row(local_mblock);
-          const auto valid_rows =
-              forward_mblock_valid_rows(a, expert, local_mblock);
+          const auto info = mblock_info<RingSchedule>(a, claims, mblock);
+          const auto row = info.row;
+          const auto valid_rows = info.valid_rows;
           // N-tiles synchronize only through this GPU-local completion chain.
           // A device fence is sufficient here; the final N-tile acquires the
           // chain and performs one system fence for the whole M-block below.
@@ -1640,14 +1679,20 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           cutlass::arch::NamedBarrier::sync(
               kMathThreads, physical_barrier<Unified>(kMathReadyBarrier));
           if (threadIdx.x == 0U) {
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                complete(fc1_done[mblock]);
-            const auto old = complete.fetch_add(
-                static_cast<unsigned long long>(tile_count) << 16U,
-                ::cuda::memory_order_acq_rel);
-            *return_mblock_shared =
-                (((old >> 16U) & 0xffffULL) + tile_count == fc2_ntiles) ? 1U
-                                                                        : 0U;
+            if constexpr (RingSchedule) {
+              auto &slot = static_v4::ring::slot(a, mblock);
+              const auto target = slot.fc2_target;
+              *return_mblock_shared =
+                  static_v4::ring::arrive(slot.fc2_done, tile_count) + tile_count == target;
+            } else {
+              ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                  complete(fc1_done[mblock]);
+              const auto old = complete.fetch_add(
+                  static_cast<unsigned long long>(tile_count) << 16U,
+                  ::cuda::memory_order_acq_rel);
+              *return_mblock_shared =
+                  (((old >> 16U) & 0xffffULL) + tile_count == fc2_ntiles) ? 1U : 0U;
+            }
 #if WEFTMOE_DEBUG_VALIDATE
             if constexpr (!StaticLocal && !StaticSchedule) {
               if (a.use_gin)
@@ -1700,7 +1745,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           }
 #endif
           if constexpr (StaticSchedule)
-            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN>(
+            select_static_compute_task<StaticLocal, Fc1TileN, Fc2TileN, RingSchedule>(
                 a, task_shared, task_kind_shared, pair_operand_shared, &pair);
           else
             select_compute_task<StaticLocal>(

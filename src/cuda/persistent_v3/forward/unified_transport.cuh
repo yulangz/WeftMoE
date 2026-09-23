@@ -985,6 +985,7 @@ run_static_v4(const ForwardKernelArgs &a,
 }
 
 #include "cuda/persistent_v3/forward/unified_local_warps.cuh"
+#include "cuda/static_v4/ring_transport.cuh"
 
 } // namespace forward_unified_transport
 

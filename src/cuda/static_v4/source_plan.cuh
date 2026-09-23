@@ -5,42 +5,6 @@
 
 namespace weftmoe::cuda::static_forward {
 
-// Source-local planning storage. A local token window reserves B*K entries,
-// which bounds both its expert-sorted routes and node-deduplicated tokens.
-// Only metadata scales with invocation length; no activation payload lives here.
-struct NodeToken {
-  std::uint64_t token;
-  std::uint32_t fanouts;
-};
-
-struct SourcePlanView {
-  WindowShape shape;
-  PacketPartition packets;
-  std::uint32_t source_rank;
-  std::uint32_t experts;
-  std::uint32_t nodes;
-  std::uint64_t tokens;
-  const std::int32_t *selected_experts;
-  const std::uint8_t *valid; // Optional explicit mask, never inferred from id.
-  std::uint64_t *expert_prefix; // [local_windows, experts+1]
-  std::uint64_t *node_prefix;   // [local_windows, nodes+1]
-  std::uint64_t *route_order;   // [local_windows, B*K]
-  std::uint32_t *source_slot;   // [tokens*K], window/expert-local ordinal
-  NodeToken *node_tokens;      // [local_windows, B*K]
-  std::uint64_t *packet_prefix; // [nodes, lanes, local_windows+1]
-  unsigned *error;             // Zeroed before the planning phase.
-
-  __host__ __device__ std::uint64_t local_windows() const {
-    return ceil_div(tokens, shape.tokens);
-  }
-  __host__ __device__ std::uint64_t window_capacity() const {
-    return std::uint64_t(shape.tokens) * shape.top_k;
-  }
-  __host__ __device__ unsigned scratch_words() const {
-    return experts + nodes;
-  }
-};
-
 template <unsigned Threads, unsigned Barrier>
 __device__ __forceinline__ void source_plan_sync() {
   asm volatile("bar.sync %0, %1;" ::"n"(Barrier), "n"(Threads) : "memory");

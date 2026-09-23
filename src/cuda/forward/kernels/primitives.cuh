@@ -372,6 +372,7 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 
 #include "cuda/static_v4/contract.cuh"
 #include "cuda/static_v4/network_access.cuh"
+#include "cuda/static_v4/ring_access.cuh"
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
 
 #include "cuda/forward/initialize_pipeline.cuh"
@@ -382,4 +383,6 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/static_v4/network_route_exchange.cuh"
 #include "cuda/static_v4/single_node_route_exchange.cuh"
 #include "cuda/static_v4/single_node_finalize.cuh"
+#include "cuda/static_v4/ring_plan.cuh"
+#include "cuda/static_v4/ring_admission.cuh"
 #include "cuda/persistent_v3/forward/unified_kernel.cuh"

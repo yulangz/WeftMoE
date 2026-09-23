@@ -1888,6 +1888,7 @@ ActivationTransportResourcePool prepare_activation_transport_pool(
             config.ring_slots_per_source_channel &&
         old.max_inflight_generations == config.max_inflight_generations &&
         old.enable_backward_state == config.enable_backward_state &&
+        old.static_forward_window_tokens == config.static_forward_window_tokens &&
         old.enable_gin_rdma == config.enable_gin_rdma &&
         old.enable_socket_fallback == config.enable_socket_fallback;
     if (compatible) {
@@ -2077,18 +2078,23 @@ make_activation_pool_state(const CollectiveSession &session,
       if (config.max_intermediate_size != 0 &&
           config.max_hidden_size == forward_tuning::kMainHidden &&
           config.max_intermediate_size == forward_tuning::kMainIntermediate) {
+        const auto activation_rows = state->layout.static_ring.depth
+            ? std::uint64_t(state->layout.static_ring.depth) * forward_tuning::kTileM
+            : config.max_destination_rows_per_rank;
         slot.forward_x_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.canonical_rows),
-            config.max_hidden_size, config.max_destination_rows_per_rank,
+            config.max_hidden_size, activation_rows,
             forward_tuning::kTileM, "canonical X", forward_tuning::kTileK);
         slot.forward_s_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
-            config.max_intermediate_size, config.max_destination_rows_per_rank,
+            config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U",
             forward_tuning::kTileK);
         slot.forward_output_store_map = make_bf16_tma_store_map(
-            at<void>(slot.device, state->layout.canonical_rows),
-            config.max_hidden_size, config.max_destination_rows_per_rank,
+            at<void>(slot.device, state->layout.static_ring.depth
+                                     ? state->layout.static_ring.output
+                                     : state->layout.canonical_rows),
+            config.max_hidden_size, activation_rows,
             "Forward canonical output");
         if (config.enable_backward_state)
           slot.forward_training_output_store_map = make_bf16_tma_store_map(
@@ -2933,6 +2939,8 @@ DeviceActivationTransport::run_device_simulation_synthetic(
                     "transport/dispatch/activation", 0, "valid", "empty");
   const auto &id = dispatch.identity();
   auto state = impl_->pool.impl_->state;
+  if (state->config.static_forward_window_tokens)
+    throw std::invalid_argument("static ring workspace supports Forward only");
   const auto &activation = *activations.impl_;
   if (activation.pool.get() != state.get() ||
       activation.generation != id.generation ||
@@ -3151,6 +3159,8 @@ DeviceActivationTransportHandle LocalCudaP2pActivationTransport::run_transport_s
   const auto &id = dispatch.identity();
   auto state = backend->pool;
   const auto &activation = *activations.impl_;
+  if (state->config.static_forward_window_tokens)
+    throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes != 1 || id.world_size != backend->nccl->world ||
       id.calling_rank != backend->nccl->rank)
     throw NotifyDispatchError(
@@ -3669,6 +3679,8 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   const auto &id = dispatch.identity();
   auto state = backend->pool;
   const auto &activation = *activations.impl_;
+  if (state->config.static_forward_window_tokens)
+    throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes < 2 || id.world_size != backend->nccl->world ||
       id.calling_rank != backend->nccl->rank)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "socket-run",
@@ -4119,6 +4131,8 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
   const auto state = backend->pool;
   const auto &id = dispatch.identity();
   const auto &activation = *activations.impl_;
+  if (state->config.static_forward_window_tokens)
+    throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes != backend->num_nodes ||
       id.world_size != backend->nccl->world ||
       id.calling_rank != backend->nccl->rank)
@@ -4449,6 +4463,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       (!use_gin || fused_inference_routes) &&
       !config.retain_backward_state &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
+  if (state->layout.static_ring.depth &&
+      (!static_v4_candidate || !fused_inference_routes || use_gin))
+    throw std::invalid_argument("ring workspace requires fused local static inference");
   const bool serialized_graph_replay =
       static_v4_candidate && config.serialized_graph_replay;
   const bool direct_inference_routes = config.inference_routes.data != nullptr ||
@@ -4795,10 +4812,46 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   }
   args.canonical_rows_offset = layout.canonical_rows;
+  if (layout.static_ring.depth) {
+    const auto &l = layout.static_ring;
+    auto &r = args.ring;
+    r.depth = l.depth;
+    r.contribution_depth = l.contribution_depth;
+    r.contribution_stride = std::uint64_t(l.shape.tokens) * state->config.max_top_k;
+    r.state = at<static_forward::RingState>(slot.device, l.state);
+    r.slots = at<static_forward::ComputeSlot>(slot.device, l.slots);
+    r.contributions = at<static_forward::ContributionSlot>(slot.device, l.contributions);
+    r.contribution_ready = at<std::uint64_t>(slot.device, l.contribution_ready);
+    r.window_prefix = at<std::uint64_t>(slot.device, l.window_prefix);
+    r.expert_rows = at<std::uint64_t>(slot.device, l.expert_rows);
+    r.expert_blocks = at<std::uint64_t>(slot.device, l.expert_blocks);
+    r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);
+    r.rows = at<static_forward::RingRow>(slot.device, l.rows);
+    auto &p = r.source;
+    p.shape = l.shape;
+    p.shape.world = id.world_size;
+    p.shape.sources = std::min(id.world_size, 16U);
+    p.shape.top_k = id.top_k;
+    p.packets = {32U, 2U};
+    p.source_rank = id.calling_rank;
+    p.experts = id.num_experts;
+    p.nodes = id.num_nodes;
+    p.tokens = id.num_tokens;
+    p.selected_experts = args.selected_experts;
+    p.valid = nullptr;
+    p.expert_prefix = at<std::uint64_t>(slot.device, l.expert_prefix);
+    p.node_prefix = at<std::uint64_t>(slot.device, l.node_prefix);
+    p.route_order = at<std::uint64_t>(slot.device, l.route_order);
+    p.source_slot = at<std::uint32_t>(slot.device, l.source_slot);
+    p.node_tokens = at<static_forward::NodeToken>(slot.device, l.node_tokens);
+    p.packet_prefix = at<std::uint64_t>(slot.device, l.packet_prefix);
+    p.error = &r.state->error;
+  }
   args.canonical_gates_offset = layout.canonical_gates;
   args.forward_output_rows_offset = config.retain_backward_state
                                         ? layout.forward_training_output
-                                        : layout.canonical_rows;
+                                        : (layout.static_ring.depth ? layout.static_ring.output
+                                                                    : layout.canonical_rows);
   args.direct_headers_offset = layout.direct_route_headers;
   args.contribution_offset = layout.contribution;
   args.return_ready_epoch_offset = layout.return_ready_epoch;
@@ -5089,11 +5142,17 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           auto kStaticUnified = use_gin
               ? unified_forward_entry<false, false, true>()
               : unified_forward_entry<true, false, true>();
+          if (args.ring.depth)
+            kStaticUnified = unified_forward_entry<true, false, true, false, true>();
           if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
-            if (prefill)
-              kStaticUnified = use_gin
-                  ? unified_forward_entry<false, false, true, true>()
-                  : unified_forward_entry<true, false, true, true>();
+            if (prefill) {
+              if (args.ring.depth)
+                kStaticUnified = unified_forward_entry<true, false, true, true, true>();
+              else
+                kStaticUnified = use_gin
+                    ? unified_forward_entry<false, false, true, true>()
+                    : unified_forward_entry<true, false, true, true>();
+            }
           }
           const auto smem =
               forward_unified_detail::shared_bytes<true>(id.world_size);
@@ -5916,6 +5975,9 @@ download_forward_routes_for_validation(const DeviceForwardHandle &handle,
     transport_error(NotifyErrorCode::InvalidHandle, "forward-routes-download",
                     "handle/execution", 0, "valid", "empty");
   const auto &impl = *handle.impl_;
+  if (impl.pool->layout.static_ring.depth)
+    throw std::invalid_argument(
+        "static ring Forward does not retain a full route contribution snapshot");
   if (execution.device_ordinal() != impl.pool->device)
     transport_error(NotifyErrorCode::WorkspaceMismatch,
                     "forward-routes-download", "device", impl.identity.rank,
