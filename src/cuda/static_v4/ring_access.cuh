@@ -32,41 +32,27 @@ __device__ __forceinline__ T *peer(const ForwardKernelArgs &a, unsigned rank,
                                offset);
 }
 
-__device__ __forceinline__ std::uint64_t sequence(const ForwardKernelArgs &a,
-                                                  std::uint64_t block) {
-  return a.ring.state->block_base + block;
-}
-
 __device__ __forceinline__ static_forward::ComputeSlot &
 slot(const ForwardKernelArgs &a, std::uint64_t block) {
-  return a.ring.slots[sequence(a, block) % a.ring.depth];
+  return a.ring.slots[a.ring.blocks[block].slot];
 }
 
 __device__ __forceinline__ std::uint64_t row(const ForwardKernelArgs &a,
                                              std::uint64_t block) {
-  return sequence(a, block) % a.ring.depth * forward_tuning::kTileM;
+  return std::uint64_t(a.ring.blocks[block].slot) * forward_tuning::kTileM;
 }
 
 __device__ __forceinline__ bool admitted(const ForwardKernelArgs &a,
                                          std::uint64_t block) {
   return acquire(slot(a, block).generation) ==
-         sequence(a, block) / a.ring.depth + 1U;
+         a.ring.blocks[block].generation;
 }
 
-__device__ __forceinline__ std::uint64_t
-source_sequence(const ForwardKernelArgs &a, unsigned source,
-                std::uint64_t token) {
-  return a.ring.source_epochs[source].base + token / a.ring.source.shape.tokens;
-}
-
-__device__ __forceinline__ std::uint64_t
-contribution_row(const ForwardKernelArgs &a, unsigned source,
-                 std::uint64_t route) {
+__device__ __forceinline__ const static_forward::WindowSource &
+window_source(const ForwardKernelArgs &a, std::uint64_t window, unsigned source) {
   const auto &shape = a.ring.source.shape;
-  const auto token = route / shape.top_k;
-  return source_sequence(a, source, token) % a.ring.contribution_depth *
-             a.ring.contribution_stride +
-         (token % shape.tokens) * shape.top_k + route % shape.top_k;
+  return a.ring.window_sources[window * shape.sources + source -
+                               shape.source_begin(window)];
 }
 
 __device__ __forceinline__ std::uint64_t

@@ -347,3 +347,152 @@ rank 0 的 23973 个事件无溢出：按 132 个 CTA 平均，compute selection
 114.38/55.18 us。这些是 CTA 活跃时间的平均，不是可串行相加的关键路径分解；
 但足以确认主要空隙在任务供给，而非 GEMM 指令执行本身。该版本 Return 起点
 telemetry 尚未接入，日志中的 Return span/FC2-Return overlap 无效，明确排除。
+
+### F：两个 copy issuer 与容量消融（双 issuer 已撤回）
+
+先在 E binary 上单独改变 B，8K/EP8/1620 MHz/10/20/20：
+B128/256/512/1024 分别 5601.93/3312.25/2886.87/3273.16 us。
+更大窗口不是单调改善；B128 还会提高 M128 padding 比例。
+
+随后保持 B256 和两窗口 contribution，每个 pull/Return warp 改为两条 issuer
+lane，各自占有一个 TMA staging/barrier，共四份 staging，放入已有 communication
+SMEM，不增加 kernel 的共享内存预算。两 lane 按窗口内行号静态划分，并在窗口末
+`syncwarp(3)`，避免一条 lane 等未来窗口容量而阻止另一条释放前序窗口。
+同时补齐 Return 起点和实际 peer-byte telemetry（每 worker 收尾汇总一次）。
+
+`build/static_v4_ring_copy2/test_cuda_notify`，SHA256
+`b319dd38fbc8d444330a4665a90cf6f77ae91352b01104713059f920723a4247`。
+四规模 hash 与 E 一致，同条件 p50=116.181/170.034/3115.03/7702.32 us，
+相对 E 为 +3.17%/-13.00%/-5.95%/-5.38%。长文改善有限，继续独立测试
+contribution 窗口容量，不能把额外 buffer 容量带来的效果归给 copy issuer。
+
+F 的 memcheck exit 0，但 racecheck 在 pull/Return 的 TMA G2S 指令处报告 WAW
+hazards；**尚未通过验证，不接受为最终优化**。正在用细粒度 hazard 报告及 build
+目录内的最小双 issuer 复制复现区分 staging 复用问题与发射方式问题，测试代码
+不加入项目单测套件。正式性能表不能采用未通过门禁的 F 成绩作为最终结果。
+
+### G：单 issuer 双 staging
+
+双 lane 最小复制程序可复现同一 WAW，逐行 syncwarp 和显式 lane 发射分支均未
+消除；不据此宣称工具误报，F 实现撤回。改由每 warp 的单 lane 使用现有
+`RowPrefetchPipeline` 同时预取两行。批次不跨窗口，所有 store 完成后才发布这
+两行的 ready/retirement，奇数尾部显式 drain。pull/Return 合并为一个编译期方向
+specialization，避免维护两份相同搬运循环。
+
+新增 source contribution 窗口容量参数，与 destination X/S/C 容量独立。
+`WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS` 仅供 runtime/benchmark 配置这个容量，
+默认仍为 2；pool 兼容检查纳入它。不是动态任务队列或不受约束的 full arena。
+G 的 B16/T64/EP8 多次 graph 复用，memcheck/racecheck 均 exit 0（同前述 API
+报告选项）。后续对不同容量逐一记录性能和 pool bytes。
+
+G binary SHA256：`a79113bbf3d39a6604aa8cf012520af635885da95b2560cf99d53115ca665a9a`。
+8K、B256、EP8、1620 MHz、10/20/20 的 contribution 深度消融如下；首个 D2
+运行与 tensor extension 编译有短暂重叠，标为暂测，正式验收必须复测。
+
+| contribution 窗口数 | p50/us | pool MiB |
+|---:|---:|---:|
+| 1 | 5761.24 | 283.94 |
+| 2（暂测） | 3457.63 | 287.95 |
+| 4 | 3091.32 | 295.96 |
+| 8 | 3059.86 | 311.99 |
+| 16 | 3067.23 | 344.06 |
+
+所有 hash 与 E 一致。G/D4 library 的 PyTorch 四规模及全部 edge cases exit 0，
+host 18/18 通过。D4→D8 的收益约 1%，尚不值得据此固定为更大容量。
+
+### H：relaxed poll + 成功后 acquire + nanosleep（失败，撤回）
+
+仅改变 transport 的 generation/ready 等待：失败时 relaxed load + 64 ns
+nanosleep，命中目标后 acquire fence；compute/admission 不变。8K/B256 的
+D4/D2 变为 3502.52/3880.89 us，相对 G 均退化约 12%–13%。组合效果不保留，
+不能将退化单独归于 relaxed load 或 sleep。后续回到 G 的等待方式。
+
+### I：将大部分 Reduce warps 分给搬运（失败，撤回）
+
+回到 G 后，把 Reduce 固定为 32 个 warp，剩余第三个 comm warp 静态分配给
+pull/Return。132 CTA 下分别有 182/181 个复制 issuer；6 个 staging 比原方案
+多约 8 KiB/CTA，host launch 按 ring specialization 正确增加动态 SMEM。
+
+同样 EP8/B256/D4/1620 MHz/10/20/20，四规模全部 hash 一致，但 p50 为
+129.478/198.486/5613.32/14801.3 us，8K 比 G/D4 慢 81.6%。撤回角色和额外
+SMEM 改动。结果说明不能假定现有 Reduce 用少数 warp 就足够；继续检查其
+实际 payload/记账开销，而不是继续减少 Reduce workers。
+
+### J：静态 Reduce 不再逐 token 维护动态完成计数
+
+恢复 G 的全部 131 个 Reduce warp。数值 helper 增加编译期 `TrackCompletion`，
+原调用者默认保持不变；ring 不消费动态 token completion counter，省去每 token
+的该计数及全局时间戳 min/max，仅由每个固定 worker 在首/尾记录时间戳。
+contribution 的 consumed 仍按 token 发布，不改变容量协议和 FP32 固定归约顺序。
+
+binary `build/static_v4_ring_reduce/test_cuda_notify` SHA256
+`73bd0a2ba0dba21d00b21bbf2451ce181b36c469c2b21f899786248696a95af9`。
+EP8/B256/D4/1620 MHz/10/20/20，四规模 hash 一致，p50 为
+128.869/205.992/3088.12/7550.21 us。8K 与 G/D4 的 3091.32 us 基本相同，
+**不能声称性能改善**。保留它作为静态路径记账清理，继续用细化 timeline 分析
+搬运批次与 Reduce payload，不再从 span 直接猜测耗时来源。
+
+J 的 B16/T64/EP8 memcheck/racecheck 均 exit 0。细化的 eager timeline（8K/D4，
+非正式性能分数）rank 0 共 105893 个事件，无溢出：每两行 pull 批次 p50 9.15 us，
+Return 批次 9.12 us，单 token Reduce payload p50 14.69 us。按 worker 平均的
+对应活跃时间为 1203.90/1150.17/910.10 us；compute selection 等待仍约
+2422.48 us/CTA。这些区间并发，不能相加当成关键路径。Reduce 数值搬运本身
+并不便宜，后续考虑地址复用/加载并行度，并继续检查每行远端 reservation 读取。
+
+### K：source reservation credit 导入到 destination 本地（进行中）
+
+source owner 预留 contribution 窗口后，将累计的 exclusive reservation head
+发布到各节点内 destination 的独立本地 word。pull 只 acquire 本 GPU 的缓存，
+不再为每行读取远端 contribution generation。每 source/每窗口一次 credit
+publication 替代每 route 的 peer control load；不增加窗口 collective，不把
+source 与 destination 准入耦合成 D 的整窗口检查。
+
+head 跨调用累计，源 contribution slot 的 generation/retire target 仍是容量真值。
+缓存可以比 reader 的窗口更靠前：若该 reader 的 route 尚未 pull/Return，所属
+窗口不可能已经完成 Reduce 并退休，所以 `head >= sequence+1` 不会允许覆盖
+仍在用的 contribution。这是现阶段单机 credit 导入，不能用普通 peer store
+代替未来跨 NIC 的 GIN 可见性/准入协议。
+
+候选 `build/static_v4_ring_credit/test_cuda_notify`，SHA256
+`513bd080ea3921cf06f9bb38b1ebd7fe928bc95d7189682add61fb0f98d12686`。
+8K/EP8/B256/D4/1620 MHz/10/20/20 为 3056.75 us，8 个 hash 与 J 一致。
+相对 J 的 3088.12 us 仅约 1.02% 改善；尚未反向复测，不能视为显著收益。
+J library 的四规模及全部 PyTorch edge cases 已通过（`torch_edges_d4.log`）。
+
+### L：冻结物理 slot 与窗口源地址（验证中）
+
+J 的逐窗口 timeline 中，稳定期约每 100 us 推进一个 B256 窗口；每 worker
+实际 copy 批次的时间不足以解释全部间隔。审查热路径发现每行反复做 runtime
+64-bit 除法/取余来计算 block、slot、generation 和 source contribution 地址。
+
+在 K 上，plan 为每个 Mblock 冻结物理 slot/generation，为每个 `(window,source)`
+冻结 contribution sequence/generation/row base/slot；`RingRow` 在相同 16 bytes
+中保存 uint32 route 和预计算 token（已有 pool 边界要求 route count <= UINT32）。
+搬运热循环使用编译期 M128，避免 runtime 行号除法。Reduce 同样复用窗口地址，
+按窗口内 token residue 静态划分 worker，并在每 worker 的窗口末汇总 consumed。
+窗口只有全部 token 完成才可释放，汇总不会让未消费 token 被覆盖，也不改变固定
+数值归约顺序。地址表是调用内 immutable metadata，不增加 payload ring 容量。
+
+候选 `build/static_v4_ring_address/test_cuda_notify`，SHA256
+`d1bdebae28d29bcf9e77c4e0b818a6824d4bd1ec366bc634314ecd725c789400`。
+EP8/B256/D4/1620 MHz/10/20/20，正式四规模测试时无并行编译/GPU 任务，
+32 个 hash 全部与 J 相同。另一个与 tensor extension 编译短暂重叠的 8K 初测
+2436.81 us 不纳入下表；独立复测为 2437.51 us。
+
+| tokens/rank | J/us | L/us | 相对 J 延迟变化 | L pool MiB |
+|---:|---:|---:|---:|---:|
+| 1 | 128.869 | 125.904 | -2.30% | 25.15 |
+| 64 | 205.992 | 186.222 | -9.60% | 63.73 |
+| 8192 | 3088.12 | 2437.51 | -21.07% | 296.01 |
+| 20480 | 7550.21 | 5931.10 | -21.44% | 465.65 |
+
+L 相对 K 的 8K 3056.75 us 改善 20.26%；相对冻结 V3 的 1488.19 us 仍慢
+63.79%，20K 相对 V3 3288.22 us 仍慢 80.37%。**尚未达到最终长文性能目标。**
+L library 的四规模及全部 PyTorch edge cases exit 0（`torch_edges_d4.log`），
+包括 20K 热点不丢 token、mixed decode/prefill、空 source、改变图输入和跨层共享
+workspace。B16/D1 下 T1/64 及现有 edge cases 同样 exit 0
+（`torch_edges_b16_d1.log`），覆盖小容量频繁 wrap。
+第二节点独立运行单机 EP8 的 B16/D1/T64 memcheck/racecheck 均 exit 0，沿用
+`--sanitizer-report-api-errors no`；它们是同步验证，不是 EP16 性能测试。
+host suite 18/18 通过。当前仍保留 contribution 默认深度 2，不由一次深度消融
+擅自改变默认容量；性能表中的 D4 已明确标注。

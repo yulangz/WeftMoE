@@ -114,9 +114,12 @@ class Runtime {
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
     capacity.enable_backward_state = training;
-    if (!training)
+    if (!training) {
       if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
         capacity.static_forward_window_tokens = std::stoul(window);
+      if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+        capacity.static_forward_contribution_windows = std::stoul(depth);
+    }
     capacity.enable_gin_rdma =
         WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
     pool_ = prepare_activation_transport_pool(base_.session(), execution_, capacity);

@@ -1889,6 +1889,8 @@ ActivationTransportResourcePool prepare_activation_transport_pool(
         old.max_inflight_generations == config.max_inflight_generations &&
         old.enable_backward_state == config.enable_backward_state &&
         old.static_forward_window_tokens == config.static_forward_window_tokens &&
+        old.static_forward_contribution_windows ==
+            config.static_forward_contribution_windows &&
         old.enable_gin_rdma == config.enable_gin_rdma &&
         old.enable_socket_fallback == config.enable_socket_fallback;
     if (compatible) {
@@ -4820,10 +4822,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.contribution_stride = std::uint64_t(l.shape.tokens) * state->config.max_top_k;
     r.state = at<static_forward::RingState>(slot.device, l.state);
     r.source_epochs = at<static_forward::SourceEpoch>(slot.device, l.source_epochs);
+    r.source_reserved = at<std::uint64_t>(slot.device, l.source_reserved);
     r.slots = at<static_forward::ComputeSlot>(slot.device, l.slots);
     r.contributions = at<static_forward::ContributionSlot>(slot.device, l.contributions);
     r.contribution_ready = at<std::uint64_t>(slot.device, l.contribution_ready);
     r.window_prefix = at<std::uint64_t>(slot.device, l.window_prefix);
+    r.window_sources = at<static_forward::WindowSource>(slot.device, l.window_sources);
     r.expert_rows = at<std::uint64_t>(slot.device, l.expert_rows);
     r.expert_blocks = at<std::uint64_t>(slot.device, l.expert_blocks);
     r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);

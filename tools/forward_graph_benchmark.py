@@ -41,7 +41,7 @@ def aggregate_forward_graph(records):
     for name in ("device_bytes", "compute_device_bytes", "gin_registered_bytes"):
         if all(name in item for item in records):
             result["per_rank_" + name] = [int(item[name]) for item in records]
-    for name in ("static_schedule", "ring_window_tokens"):
+    for name in ("static_schedule", "ring_window_tokens", "ring_contribution_windows"):
         if name in records[0]:
             result[name] = int(records[0][name])
     for name in ("route_exchange_us", "fc1_swiglu_us", "fc2_us", "after_combine_us"):

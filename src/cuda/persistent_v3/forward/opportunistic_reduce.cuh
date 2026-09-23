@@ -68,6 +68,7 @@ reduce_token_view(const ForwardKernelArgs &a) {
 }
 
 // Caller owns this token. First-warp execution needs no CTA-wide barrier.
+template <bool TrackCompletion = true>
 __device__ __forceinline__ bool
 reduce_token_payload(const ReduceTokenView &v,
                      unsigned long long encoded,
@@ -83,10 +84,10 @@ reduce_token_payload(const ReduceTokenView &v,
 #endif
   const auto token = encoded - 1ULL;
 #if WEFTMOE_DEBUG_VALIDATE
-  if (v.completion && lane == 0U)
+  if (TrackCompletion && v.completion && lane == 0U)
     claim_completion_tasks(v.completion, transport_state::TaskClass::Reduce);
 #endif
-  if (lane == 0U)
+  if (TrackCompletion && lane == 0U)
     atomicMin(&v.status->reduced_tokens, device_globaltimer_ns());
   for (std::uint64_t column = lane * 8ULL; column < v.hidden;
        column += 256ULL) {
@@ -121,7 +122,7 @@ reduce_token_payload(const ReduceTokenView &v,
         make_uint4(words[0], words[1], words[2], words[3]);
   }
   __syncwarp();
-  if (lane == 0U) {
+  if (TrackCompletion && lane == 0U) {
 #if WEFTMOE_DEBUG_VALIDATE
     if (v.completion)
       complete_completion_tasks(v.completion,

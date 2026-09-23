@@ -70,6 +70,13 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
        w += gridDim.x) {
     const auto first = p.shape.source_begin(w);
     const auto local_window = w / p.shape.groups();
+    if (tid < p.shape.source_end(w) - first) {
+      const auto seq = r.source_epochs[first + tid].base + local_window;
+      const auto slot = static_cast<unsigned>(seq % r.contribution_depth);
+      r.window_sources[w * p.shape.sources + tid] = {
+          seq, seq / r.contribution_depth + 1U,
+          std::uint64_t(slot) * r.contribution_stride, slot};
+    }
     for (unsigned index = tid; index < owned * p.shape.sources;
          index += Control) {
       const auto expert = index / p.shape.sources;
@@ -113,13 +120,10 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
     scheduler[0] = scheduler[1] = scheduler[2] = 0U;
     scheduler[3] = blocks;
     scheduler[4U + a.world] = scheduler[11U + 2U * a.world] = 0U;
-    auto *control = peer_at<persistent_v3::ForwardPipelineControl>(
-        a.local_base, a.forward_v3_control_offset);
-    control->reduce_tokens_complete.value = 0U;
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     status->dispatch_blocks_done = status->reduced_tokens =
-        status->fc1_start_clock = ~0ULL;
+        status->fc1_start_clock = status->relay_blocks_done = ~0ULL;
   }
   grid_sync<Math, Control>(a);
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
@@ -147,12 +151,16 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
         r.expert_blocks + w * (owned + 1U) + expert,
         nullptr};
     for (auto b = std::uint64_t(tid); b < prefix[expert + 1U] - prefix[expert];
-         b += Control)
-      r.blocks[r.window_prefix[w] + prefix[expert] + b] = {
+         b += Control) {
+      const auto block = r.window_prefix[w] + prefix[expert] + b;
+      const auto seq = r.state->block_base + block;
+      r.blocks[block] = {
           {expert, static_cast<unsigned>(b * p.shape.tile_m),
            static_forward::block_rows(r.expert_rows[w * owned + expert], b,
                                       p.shape.tile_m)},
-          static_cast<unsigned>(w)};
+          static_cast<unsigned>(w), static_cast<unsigned>(seq % r.depth),
+          seq / r.depth + 1U};
+    }
     // Freeze reverse identity and gate before payload starts. Each warp reads
     // a contiguous source-expert route list; pull does no peer count/ordinal
     // search, and Return never depends on the lifetime of an X slot.
@@ -170,7 +178,8 @@ __device__ __noinline__ void prepare_local(const ForwardKernelArgs &a,
         const auto route =
             order[source_prefix[a.rank * owned + expert] + ordinal];
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
-            route, source, gates[route]};
+            static_cast<unsigned>(route), source, gates[route],
+            static_cast<unsigned>(route / p.shape.top_k)};
       }
     }
     collective_scope_sync<Control, kCollectiveScopeBarrier>();

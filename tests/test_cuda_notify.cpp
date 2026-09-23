@@ -3738,6 +3738,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     transport_config.enable_gin_rdma = gin_forward_benchmark;
     if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
       transport_config.static_forward_window_tokens = std::stoul(window);
+    if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+      transport_config.static_forward_contribution_windows = std::stoul(depth);
     const auto setup_start = Clock::now();
     weftmoe::cuda::ActivationTransportResourcePool transport_pool;
     std::vector<weftmoe::transport::BFloat16> activation_host(
@@ -4001,6 +4003,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 << " static_schedule="
                 << (std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr)
                 << " ring_window_tokens=" << transport_config.static_forward_window_tokens
+                << " ring_contribution_windows=" << transport_config.static_forward_contribution_windows
                 << " device_bytes=" << transport_pool.usage().device_bytes
                 << " compute_device_bytes=" << transport_pool.usage().compute_device_bytes
                 << " gin_registered_bytes=" << transport_pool.usage().gin_registered_bytes

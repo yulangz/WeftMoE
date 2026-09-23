@@ -19,6 +19,13 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
             r.source.tokens, source_window, r.source.shape.tokens);
         publish<::cuda::thread_scope_system>(s.generation,
                                              seq / r.contribution_depth + 1U);
+        // Import a monotone reservation head at each local destination. Pull
+        // probes its own GPU, not the source GPU once for every activation row.
+        // A head may advance past a reader's window, but that window cannot
+        // retire until this reader's route has returned and been reduced.
+        for (unsigned destination = 0; destination < a.world; ++destination)
+          publish<::cuda::thread_scope_system>(
+              peer(a, destination, r.source_reserved)[a.rank], seq + 1U);
         ++source_window;
       }
     }
@@ -41,7 +48,7 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
           s.fc1_target += fc1;
           s.fc2_target += fc2;
           s.return_target += r.blocks[block].tile.rows;
-          publish(s.generation, sequence(a, block) / r.depth + 1U);
+          publish(s.generation, r.blocks[block].generation);
         }
         ++window;
       }

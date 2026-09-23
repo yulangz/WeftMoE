@@ -445,7 +445,7 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
       if constexpr (RingSchedule) {
         ready = static_v4::ring::admitted(a, mblock) &&
             static_v4::ring::acquire(static_v4::ring::slot(a, mblock).x_full) >=
-                (static_v4::ring::sequence(a, mblock) / a.ring.depth + 1U) *
+                a.ring.blocks[mblock].generation *
                     forward_tuning::kTileM;
       } else {
         const auto mapping = claims[mblock];

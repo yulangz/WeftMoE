@@ -1,100 +1,134 @@
 #pragma once
 
-// Included in forward_unified_transport. One warp per CTA owns each data
-// direction. The third warp reduces, except CTA 0 which owns admission.
-template <class Storage>
-__device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s) {
+// Included in forward_unified_transport. Pull and Return each have one issuer
+// and two private staging slots, using the common row-prefetch pipeline.
+// A batch stays within a fully admitted window and drains before publishing
+// readiness/retirement; it cannot hold an earlier window across a capacity
+// wait.
+template <bool Return, class Storage>
+__device__ __noinline__ void ring_transfer(const ForwardKernelArgs &a,
+                                           Storage &s) {
   namespace ring = static_v4::ring;
   if ((threadIdx.x & 31U) != 0U)
     return;
   const auto &r = a.ring;
-  const auto &p = r.source;
-  auto *x = peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
+  const auto &shape = r.source.shape;
+  auto *local = peer_at<transport::BFloat16>(
+      a.local_base,
+      Return ? a.forward_output_rows_offset : a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
-  for (auto index = std::uint64_t(blockIdx.x);
-       index < r.state->blocks * p.shape.tile_m; index += gridDim.x) {
-    const auto block = index / p.shape.tile_m;
-    const auto m = static_cast<unsigned>(index % p.shape.tile_m);
-    const auto &desc = r.blocks[block];
-    if (m >= desc.tile.rows)
-      continue;
-    while (!ring::admitted(a, block)) {
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  RowPrefetchPipeline<Storage> prefetch(s, Return ? 1U : 0U);
+  unsigned peer_rows = 0U;
+  bool started = false;
+  constexpr auto TileM = forward_tuning::kTileM;
+  for (std::uint64_t window = 0; window < r.state->windows; ++window) {
+    const auto route_begin = shape.token_begin(window) * shape.top_k;
+    const auto *sources = r.window_sources + window * shape.sources;
+    const auto source_begin = shape.source_begin(window);
+    const auto end = r.window_prefix[window + 1U] * TileM;
+    for (auto base = r.window_prefix[window] * TileM + 2ULL * blockIdx.x;
+         base < end; base += 2ULL * gridDim.x) {
+      bool copied = false;
+#pragma unroll
+      for (unsigned item = 0; item < 2U; ++item) {
+        const auto index = base + item;
+        const auto block = index / TileM;
+        const auto m = static_cast<unsigned>(index % TileM);
+        if (index >= end || m >= r.blocks[block].tile.rows)
+          continue;
+        while (!ring::admitted(a, block)) {
+        }
+        const auto identity = r.rows[index];
+        const auto &address = sources[identity.source - source_begin];
+        const void *source;
+        void *destination;
+        if constexpr (Return) {
+          auto &slot = ring::slot(a, block);
+          const auto target = slot.fc2_target;
+          while (ring::acquire(slot.fc2_done) < target) {
+          }
+          if (!started) {
+            atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+            started = true;
+          }
+          source = local + (ring::row(a, block) + m) * a.hidden;
+          destination =
+              peer_at<transport::BFloat16>(a.peer_bases[identity.source],
+                                           a.contribution_offset) +
+              (address.row_base + identity.route - route_begin) *
+                  a.hidden;
+        } else {
+          while (ring::acquire<::cuda::thread_scope_system>(
+                     r.source_reserved[identity.source]) < address.sequence + 1U) {
+          }
+          const auto target_row = ring::row(a, block) + m;
+          gates[target_row] = identity.gate;
+          source = peer_at<const transport::BFloat16>(
+                       a.peer_bases[identity.source], a.source_input_offset) +
+                   std::uint64_t(identity.token) * a.hidden;
+          destination = local + target_row * a.hidden;
+        }
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        if (!copied) {
+          if constexpr (Return)
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, LocalReturnBatchStart,
+                                      LocalReturn, 0U, base, execution_epoch(a));
+          else
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ProxyRelayStart,
+                                      ProxyRelay, 0U, base, execution_epoch(a));
+          copied = true;
+        }
+        prefetch.copy(
+            source, destination,
+            static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
+        peer_rows += identity.source != a.rank;
+      }
+      prefetch.drain();
+      finish_copies<Return>();
+      if constexpr (!Return)
+        __threadfence();
+      if (copied) {
+        if constexpr (Return)
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, LocalReturnBatchEnd,
+                                    LocalReturn, 0U, base, execution_epoch(a));
+        else
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ProxyRelayEnd,
+                                    ProxyRelay, 0U, base, execution_epoch(a));
+      }
+#pragma unroll
+      for (unsigned item = 0; item < 2U; ++item) {
+        const auto index = base + item;
+        const auto block = index / TileM;
+        const auto m = static_cast<unsigned>(index % TileM);
+        if (index >= end || m >= r.blocks[block].tile.rows)
+          continue;
+        auto &slot = ring::slot(a, block);
+        if constexpr (Return) {
+          const auto identity = r.rows[index];
+          const auto &address = sources[identity.source - source_begin];
+          const auto row = address.row_base + identity.route - route_begin;
+          ring::publish<::cuda::thread_scope_system>(
+              ring::peer(a, identity.source, r.contribution_ready)[row],
+              address.generation);
+          static_v4::reduce_add_release_device(
+              reinterpret_cast<unsigned long long *>(&slot.returned), 1U);
+        } else {
+          const auto valid = r.blocks[block].tile.rows;
+          const auto credit = m + 1U == valid ? TileM - valid + 1U : 1U;
+          static_v4::reduce_add_release_device(
+              reinterpret_cast<unsigned long long *>(&slot.x_full), credit);
+        }
+      }
     }
-    const auto identity = r.rows[index];
-    const auto source = identity.source;
-    const auto route = identity.route;
-    const auto token = route / p.shape.top_k;
-    const auto seq = ring::source_sequence(a, source, token);
-    const auto *contribution =
-        ring::peer(a, source, r.contributions) + seq % r.contribution_depth;
-    while (ring::acquire<::cuda::thread_scope_system>(
-               contribution->generation) != seq / r.contribution_depth + 1U) {
-    }
-    const auto target_row = ring::row(a, block) + m;
-    gates[target_row] = identity.gate;
-    const auto *input = peer_at<const transport::BFloat16>(
-                            a.peer_bases[source], a.source_input_offset) +
-                        token * a.hidden;
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    static_v4_copy_row(
-        s, 0U, input, x + target_row * a.hidden,
-        static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
-    finish_copies<false>();
-    __threadfence();
-    const auto credit =
-        m + 1U == desc.tile.rows ? p.shape.tile_m - desc.tile.rows + 1U : 1U;
-    static_v4::reduce_add_release_device(
-        reinterpret_cast<unsigned long long *>(&ring::slot(a, block).x_full),
-        credit);
   }
-  atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
-                 ->dispatch_complete_clock,
-            device_globaltimer_ns());
-}
-
-template <class Storage>
-__device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
-                                         Storage &s) {
-  namespace ring = static_v4::ring;
-  if ((threadIdx.x & 31U) != 0U)
-    return;
-  const auto &r = a.ring;
-  const auto *c = peer_at<const transport::BFloat16>(
-      a.local_base, a.forward_output_rows_offset);
-  for (auto index = std::uint64_t(blockIdx.x);
-       index < r.state->blocks * r.source.shape.tile_m; index += gridDim.x) {
-    const auto block = index / r.source.shape.tile_m;
-    const auto m = index % r.source.shape.tile_m;
-    if (m >= r.blocks[block].tile.rows)
-      continue;
-    while (!ring::admitted(a, block)) {
-    }
-    auto &slot = ring::slot(a, block);
-    const auto target = slot.fc2_target;
-    while (ring::acquire(slot.fc2_done) < target) {
-    }
-    const auto identity = r.rows[index];
-    const auto token = identity.route / r.source.shape.top_k;
-    const auto seq = ring::source_sequence(a, identity.source, token);
-    const auto dest_row =
-        ring::contribution_row(a, identity.source, identity.route);
-    auto *destination =
-        peer_at<transport::BFloat16>(a.peer_bases[identity.source],
-                                     a.contribution_offset) +
-        dest_row * a.hidden;
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    static_v4_copy_row(
-        s, 1U, c + (ring::row(a, block) + m) * a.hidden, destination,
-        static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
-    finish_copies<true>();
-    ring::publish<::cuda::thread_scope_system>(
-        ring::peer(a, identity.source, r.contribution_ready)[dest_row],
-        seq / r.contribution_depth + 1U);
-    static_v4::reduce_add_release_device(
-        reinterpret_cast<unsigned long long *>(&slot.returned), 1U);
-  }
-  atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
-                 ->return_complete_clock,
+  if (peer_rows)
+    atomicAdd(Return ? &status->actual_return_peer_bytes
+                     : &status->actual_dispatch_peer_bytes,
+              std::uint64_t(peer_rows) * a.hidden *
+                  sizeof(transport::BFloat16));
+  atomicMax(Return ? &status->return_complete_clock
+                   : &status->dispatch_complete_clock,
             device_globaltimer_ns());
 }
 
@@ -103,42 +137,66 @@ __device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a) {
   const auto &r = a.ring;
   const auto lane = threadIdx.x & 31U;
   auto view = forward_reduce_detail::reduce_token_view(a);
-  for (auto token = std::uint64_t(blockIdx.x - 1U); token < r.source.tokens;
-       token += gridDim.x - 1U) {
-    const auto seq = ring::source_sequence(a, a.rank, token);
-    const auto first_row =
-        ring::contribution_row(a, a.rank, token * r.source.shape.top_k);
-    if (lane == 0U)
-      for (unsigned k = 0; k < r.source.shape.top_k; ++k)
-        while (ring::acquire<::cuda::thread_scope_system>(
-                   r.contribution_ready[first_row + k]) !=
-               seq / r.contribution_depth + 1U) {
-        }
-    __syncwarp();
-    forward_reduce_detail::reduce_token_payload(view, token + 1U, first_row);
-    if (lane == 0U)
-      ring::arrive(r.contributions[seq % r.contribution_depth].consumed, 1U);
+  bool started = false;
+  const auto &shape = r.source.shape;
+  for (std::uint64_t window = 0; window < r.source.local_windows(); ++window) {
+    const auto &address = ring::window_source(
+        a, window * shape.groups() + a.rank / shape.sources, a.rank);
+    const auto begin = window * shape.tokens;
+    const auto end = begin + static_forward::block_rows(
+                                 r.source.tokens, window, shape.tokens);
+    unsigned completed = 0U;
+    for (auto token = begin + blockIdx.x - 1U; token < end;
+         token += gridDim.x - 1U) {
+      const auto first_row = address.row_base + (token - begin) * shape.top_k;
+      if (lane == 0U)
+        for (unsigned k = 0; k < shape.top_k; ++k)
+          while (ring::acquire<::cuda::thread_scope_system>(
+                     r.contribution_ready[first_row + k]) != address.generation) {
+          }
+      __syncwarp();
+      if (!started && lane == 0U) {
+        atomicMin(&view.status->reduced_tokens, device_globaltimer_ns());
+        started = true;
+      }
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, ReduceStart,
+                                Reduce, 0U, token, execution_epoch(a));
+      forward_reduce_detail::reduce_token_payload<false>(view, token + 1U,
+                                                         first_row);
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, ReduceEnd,
+                                Reduce, 0U, token, execution_epoch(a));
+      ++completed;
+    }
+    if (lane == 0U && completed)
+      ring::arrive(r.contributions[address.slot].consumed, completed);
   }
+  if (started && lane == 0U)
+    atomicMax(&view.status->reduce_blocks_done, device_globaltimer_ns());
 }
+
+struct RingStaging
+    : StaticV4Shared<128U, forward_tuning::kUnifiedSegmentBytes> {
+  static constexpr unsigned kBuffers = 2U, kStorageSlots = 2U;
+};
 
 template <unsigned Fc1N, unsigned Fc2N, class Storage>
 __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
                                          Storage &storage) {
-  using RingStorage = StaticV4Shared<96U, forward_tuning::kUnifiedSegmentBytes>;
-  auto &s = *reinterpret_cast<RingStorage *>(&storage);
+  auto &s = *reinterpret_cast<RingStaging *>(&storage);
   static_assert(sizeof(s) <= sizeof(storage));
   const auto warp = (threadIdx.x - 288U) / 32U;
   const auto lane = threadIdx.x & 31U;
-  if (lane == 0U)
-    init(&s.row_prefetch_full[warp], 1U);
+  if (warp < 2U && lane == 0U)
+    for (unsigned slot = 0; slot < 2U; ++slot)
+      init(&s.row_prefetch_full[2U * warp + slot], 1U);
   ::cuda::device::experimental::fence_proxy_async_shared_cta();
   domain_sync<96U>();
   if (a.dispatch.runtime->error)
     return;
   if (warp == 0U)
-    ring_pull(a, s);
+    ring_transfer<false>(a, s);
   else if (warp == 1U)
-    ring_return(a, s);
+    ring_transfer<true>(a, s);
   else if (blockIdx.x == 0U) {
     if (lane == 0U)
       static_v4::ring::admit(a, 2U * a.intermediate / Fc1N, a.hidden / Fc2N);

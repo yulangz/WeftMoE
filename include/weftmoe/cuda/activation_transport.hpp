@@ -82,6 +82,8 @@ struct ActivationTransportPoolConfig {
   // Opt-in bounded static Forward workspace. Zero retains the arena path;
   // otherwise this is the source-token window size (inference only for now).
   std::uint32_t static_forward_window_tokens = 0;
+  // Source-side Return/Reduce capacity, independent of destination X/S/C.
+  std::uint32_t static_forward_contribution_windows = 2;
 };
 
 struct ActivationTransportPoolUsage {

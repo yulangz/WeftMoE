@@ -27,12 +27,24 @@ struct alignas(64) ContributionSlot {
 struct RingBlock {
   WindowMblock tile;
   std::uint32_t window;
+  std::uint32_t slot;
+  std::uint64_t generation;
 };
 
 struct RingRow {
-  std::uint64_t route;
+  std::uint32_t route;
   std::uint32_t source;
   float gate;
+  std::uint32_t token;
+};
+
+// The source address is constant for all routes in a (window, source) pair.
+// Freeze division/modulo here, rather than repeating them in every row copy.
+struct WindowSource {
+  std::uint64_t sequence;
+  std::uint64_t generation;
+  std::uint64_t row_base;
+  std::uint32_t slot;
 };
 
 struct RingState {
@@ -57,10 +69,12 @@ struct ComputeRingView {
   std::uint64_t contribution_stride = 0;
   RingState *state = nullptr;
   SourceEpoch *source_epochs = nullptr;
+  std::uint64_t *source_reserved = nullptr; // Imported exclusive source head.
   ComputeSlot *slots = nullptr;
   ContributionSlot *contributions = nullptr;
   std::uint64_t *contribution_ready = nullptr;
   std::uint64_t *window_prefix = nullptr;
+  WindowSource *window_sources = nullptr; // [windows, bounded source group]
   std::uint64_t *expert_rows = nullptr;   // [windows, owned]
   std::uint64_t *expert_blocks = nullptr; // [windows, owned+1]
   RingBlock *blocks = nullptr;
@@ -75,9 +89,11 @@ struct ComputeRingLayout {
   std::uint64_t max_blocks = 0;
   std::size_t state = 0, slots = 0, contributions = 0, contribution_ready = 0;
   std::size_t source_epochs = 0;
+  std::size_t source_reserved = 0;
   std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
   std::size_t source_slot = 0, node_tokens = 0, packet_prefix = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
+  std::size_t window_sources = 0;
   std::size_t blocks = 0, rows = 0, output = 0;
 };
 

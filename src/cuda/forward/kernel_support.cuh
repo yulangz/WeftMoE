@@ -839,6 +839,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   std::size_t cursor = 0;
   auto &ring = layout.static_ring;
   if (config.static_forward_window_tokens) {
+    if (config.static_forward_contribution_windows == 0U)
+      throw std::invalid_argument("static ring requires contribution capacity");
     if (config.enable_backward_state || config.enable_socket_fallback ||
         config.max_nodes != 1U || config.max_intermediate_size == 0U)
       throw std::invalid_argument(
@@ -857,9 +859,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         window_blocks > UINT32_MAX / (2ULL * ring.shape.tile_m))
       throw std::invalid_argument("static ring window exceeds device indices");
     ring.depth = static_cast<unsigned>(2U * window_blocks);
+    ring.contribution_depth = config.static_forward_contribution_windows;
     ring.state = append(cursor, 1, sizeof(static_forward::RingState), "ring state");
     ring.source_epochs = append(cursor, config.max_world_size,
                                   sizeof(static_forward::SourceEpoch), "source epochs");
+    ring.source_reserved = append(cursor, config.max_world_size,
+                                    sizeof(std::uint64_t), "source reservation heads");
     ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
                         "X/S/C slot controls");
     ring.contributions = append(cursor, ring.contribution_depth,
@@ -886,6 +891,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                  sizeof(std::uint64_t), "channel packet prefixes");
     ring.window_prefix = append(cursor, ring.max_windows + 1U,
                                  sizeof(std::uint64_t), "window block prefixes");
+    ring.window_sources = append(cursor, ring.max_windows * ring.shape.sources,
+                                   sizeof(static_forward::WindowSource),
+                                   "window source addresses");
     ring.expert_rows = append(cursor, ring.max_windows * config.max_owned_experts,
                                sizeof(std::uint64_t), "window expert rows");
     ring.expert_blocks = append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
