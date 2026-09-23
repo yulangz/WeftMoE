@@ -73,6 +73,22 @@ struct RouteLocation {
   std::uint32_t row; // Physical X/S/C row on the destination GPU.
 };
 
+// One fixed (window, packet ordinal, source) entry on the consuming GPU.
+// Empty entries have rows == 0 and never inspect reusable RX storage.
+struct PullPacket {
+  const NodeToken *tokens;
+  const std::int32_t *experts;
+  const float *gates;
+  const RouteLocation *locations;
+  const void *payload;
+  const std::uint64_t *visible_generation;
+  std::uint64_t *consumed_total;
+  std::uint64_t generation;
+  std::uint32_t token_count;
+  std::uint32_t rows;
+  std::uint32_t peer_rows;
+};
+
 // Offsets from one source's immutable metadata region. The same layout is
 // locally allocated on one node, and replicated in registered rail memory
 // for network planning. X is deliberately absent from this region.
@@ -110,6 +126,7 @@ struct ComputeRingView {
   std::uint64_t *expert_blocks = nullptr; // [windows, owned+1]
   RingBlock *blocks = nullptr;
   RingRow *rows = nullptr; // Immutable reverse metadata, not stored in X.
+  PullPacket *pull_packets = nullptr;
 };
 
 struct ComputeRingLayout {
@@ -127,6 +144,7 @@ struct ComputeRingLayout {
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
   std::size_t window_sources = 0;
   std::size_t blocks = 0, rows = 0, output = 0;
+  std::size_t pull_packets = 0;
 };
 
 } // namespace weftmoe::cuda::static_forward

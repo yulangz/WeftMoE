@@ -750,3 +750,99 @@ U 的 8K eager timeline rank0 overflow=0：每包 p50 Dispatch pack 23.184 us、
 U 的 B16/D1/T1/64 与小规模 edge cases 两节点 exit 0；B16/D1/T64 graph
 racecheck 同时 instrument rank 1、9，两份报告均 0 errors、0 warnings，
 launcher exit 0。这里仍只覆盖两节点各一个 rank，不是全部 rank 的 sanitizer。
+
+U 的正式 EP16 矩阵（两节点无其他 GPU/编译任务，1620 MHz，10/20/20）：
+
+| tokens/rank | 冻结 V3/us（Q 时重测） | U/us |
+|---:|---:|---:|
+| 1 | 682.170 | 336.082 |
+| 64 | 824.659 | 641.600 |
+| 8192 | 3353.94 | 10726.3 |
+| 20480 | 7099.53 | 26205.8 |
+
+全部 64 rank/hash 与 V3 一致。短序列优于 V3，长序列仍未达标；L8 比 L2
+增加调用固定开销，T1 退化也如实保留。测试中两节点所有 SM 均为 1620 MHz，
+内存 3201 MHz。日志 `build/ring_net_lanes8_ep16_t*.log`。
+
+同一 U binary 的**单机 EP8** 正式回归在第二节点独立运行（1620 MHz、10/20/20，
+该节点没有其他 GPU/编译任务；第一节点的 CPU 构建不参与此测量）：
+T1/64/8K/20K 为 108.451/161.398/2142.31/5283.96 us，32 个 hash 与同节点
+冻结 V3 一致。与前一单机 ring 候选基本相当，长序列仍落后 V3；多机 lane
+改动没有解决单机瓶颈。日志 `build/ring_net_lanes8_remote_ep8_t*.log`。
+
+### V / W：warp 协作 TX 与 RX，以及 packet 搬运方式（验证中）
+
+V 在 U 上将每包 TX 描述符读取、C-ready 检查分给 warp，保留每 channel 唯一
+GIN 调用者；复制后 `match_any` 合并同 C slot 的退休，不再串行重读 route/Location。
+本地 generation/credit 的控制分支由 lane0 读取并广播，防止不同 lane 观察
+不同状态而分叉等待。分别构建 TMA 单 issuer（warptx）与 warp `uint4` 搬运
+（vectx），RX scatter 暂不改，独立测量搬运方式。
+
+W 再将 RX 的地址计算/ready 发布也分给 warp，与 TX 复用 `copy_packet_rows`。
+同样保留 TMA/向量两个构建（warprx/vecrx）对照。TMA 用 full wait；向量用 warp
+同步传递全部普通 GM 写，GIN 仍使用 givenRelease=block / requiredRelease=system
+完成 NIC 可见性发布，没有移除所需的 system release。双重 TX credit 不变。
+
+V 的 EP16/8K 快速筛选（同 10/2/2，CPU 同时编译 W）：warptx 10637.2 us，
+vectx 21880.6 us，全部 16 ranks hash 与 U 一致。TMA 协作版与 U 10714.7 us
+接近，向量搬运明显退化，不采用向量路径；W 尚待测量，不提前保留无收益的复杂度。
+
+W 快速筛选 warprx 10630.2 us、vecrx 21905.9 us，16 hash 均一致。W 的
+eager timeline overflow=0，Return pack/退休提交/scatter p50 为
+44.064/19.280/28.960 us；虽局部区间缩短，端到端未获明确收益。V/W 的
+协作 TX/RX、共享 packet copier 和向量宏已全部撤回，避免积累无收益的复杂度；
+冻结 binary/日志仍在 build 下作为失败实验记录。
+
+### X / Y：网络 owner 数与单机 copy batch（验证中）
+
+X 把 worker 上限从 8 放到 32，分别构建 L16/L32；Q32、depth8、GEMM 不变。
+8-lane 的既有路径不受上限变化影响。Y 单独将单机 copy batch 从 2 行改成 8 行，
+仍只用一个 issuer、两个 staging slots，在整批 full completion 后才发布；批次
+不跨整窗准入边界。多机 local copy 仍为 2 行，不混入 X 的性能归因。
+
+X 的 8K 快筛：L16/B256 14365.4 us，L16/B512 9878.74 us，L32/B256
+19224.0 us，L32/B512 11790.3 us（D4、1620 MHz、10/2/2）。更多 lane 没有
+自动带来收益：原 pull 热路径每个 worker 每窗扫描全部 source×lane，即便没有
+自己的包，仍读 peer prefix/offset/state。这个代价随 lane 增加，下一项将独立移出。
+
+Y 的远端单机 EP8 正式 10/20/20 为 112.552/188.981/2879.54/7085.94 us；
+32 hash 均与 V3 一致，但四规模均退化，8K/20K 约慢 34%。已删除 Y 的宏与
+实现变化，恢复 batch2，不保留此无收益调参分支。X 的四组 8K/16 rank hash
+也均一致；X 的 owner 上限需与下一项共同验证，而非直接采用 L32。
+
+### Z：预绑定本 GPU 的静态 PullPacket 表（验证中）
+
+每窗口预留 `source_group_size * ceil(B/Q)` 个固定 entry，索引为
+`packet_ordinal * source_group_size + source_in_group`，延续 S 的 ownership。
+source-local、无命中、尾部空 entry 只标记 rows=0，运行时不读取 RX。
+计划阶段复用窗口 CTA，将 RX payload/control 指针、目标 generation、source
+目录指针和已有 consumer count 绑定到普通本 GPU metadata；不增加 GIN 元数据
+交换，不新增全局 barrier，不重算 expected count。runtime 仅访问
+`worker, worker+workers, ...` 的本地 entry，不再全量扫描远端 channel。
+
+每 entry 80 bytes；EP16/B256/20K 上界为 819200 bytes/rank，仅 metadata，
+TX/RX/X/S/C payload 容量不变。完整 plan 和跨调用物理地址仍逐调用冻结，不能
+把上一调用的 RX generation/address 表直接沿用。源码替换删掉了 hot path
+中的 source/lane/prefix 遍历；仍保留单 issuer TMA 和逐 packet fanout retirement。
+
+Z 的 EP16/8K 快筛（1620 MHz、10/2/2、D4）：
+
+| lanes / B | 原遍历/us | 预绑定/us |
+|---|---:|---:|
+| 8 / 256 | 10714.7（U） | 9684.38 |
+| 8 / 512 | 未独立测量 | 9883.71 |
+| 32 / 256 | 19224.0（X） | 7325.20 |
+| 32 / 512 | 11790.3（X） | 4766.67 |
+
+64 个 hash 全部一致。L32/B512 相同参数下下降 59.6%，但仍慢于 V3，不能
+声称完成性能目标。Z32 binary SHA256：
+`7050c1e95e0ec194b87d304ac0b0de6fee128ceeb11d75eff6d410a6428038ff`。
+完整 EP16 PyTorch 四规模/edge cases（B512/D4）与 tiny ring（B16/D1、T1/64/
+edge cases）两节点均 exit 0；host suite 18/18。两节点各 instrument rank 1/9
+的 B16/D1/T64 graph memcheck 均 0 errors，launcher exit 0。
+
+### AA：控制/数学 warpgroup 寄存器配额（验证中）
+
+仅通过已有构建宏比较 math/control 216/64、216/72、208/88，均满足 384-thread
+CTA 的实际初始 register pool（168×384=64512），不把 SM 的 65536 全额当作
+该 CTA 可动态领用的配额。通信协议、packet/窗口、GEMM tile 均保持不变。

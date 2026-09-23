@@ -498,12 +498,13 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
 ### 6.6 M3b 首版具体布局与进度约束（数值通过，吞吐仍待优化）
 
 - 每 rail 使用 `(nodes-1)×L` 个 channel，Q=32 完整行，网络深度为 8；L 在
-  `kNetworkPackets` 集中配置，已分别实测 L=2/8，收益与内存增量见 ring 记录 U。
+  `kNetworkPackets` 集中配置，已分别实测 L=2/8/16/32，收益与内存增量见 ring
+  记录 U/X/Z，当前调优候选为 L32/B512；尚未改成默认发布配置。
   Dispatch
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
   和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
   TX target/local completion、RX 已 ACK generation 均跨 invocation 保留。
-- `W=min(channel_count,8)`。通信 warp 0 的前 W 个 CTA 做 Dispatch TX，其他做
+- `W=min(channel_count,32)`。通信 warp 0 的前 W 个 CTA 做 Dispatch TX，其他做
   local/remote pull；warp 1 前 W 个做 Return TX、接下来 W 个做 Return RX scatter，
   其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，
   其他做 Reduce。math/producer 仍在全部 CTA 上静态分工。三类 GIN owner 分别
@@ -523,6 +524,11 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   `packet+source` 导致小区间集中到少数 CTA。warp 协同读取远端目录，唯一
   TMA issuer 搬运；全局 copy 完成经 warp 同步传递后，各 lane 发布 X-ready，
   再归还该包的本 rank fanout credit。没有动态领用或运行时计算 expected count。
+- source PlanReady 后，在已有窗口规划 pass 中预绑定普通本 GPU 的 `PullPacket`
+  表：每窗 `G×ceil(B/Q)` 个 entry，固定索引延续上述 ownership。记录 RX
+  payload/control 地址、generation、source 目录指针及已有本 rank fanout 数。
+  空 entry 只设 rows=0；runtime 仅走自己的 residue，跳过空项不读 RX。此表
+  不跨 NIC 交换，也不新增 barrier；保存的是当前调用的物理绑定，下一调用重建。
 - NIC `readSignal(acquire)` → system-release `visible_generation` → peer acquire
   → 全部 TMA 完成 → system 累计 consumed → ACK，逐包建立可见性及复用链。
   多机 C.returned 同时接收本地 Return 与 peer rail 的更新，因此本地/远端

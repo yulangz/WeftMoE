@@ -310,162 +310,97 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
   } while (!done);
 }
 
-// Packet residues are immutable. Non-consumers skip without touching RX;
-// consumers traverse source/lane/sequence order and retire the whole local
-// fanout.
+// Plan entries are source-interleaved packet ordinals. Each worker touches
+// only its immutable residue; non-consumers never inspect reusable RX storage.
 template <class Storage>
 __device__ __noinline__ void
 pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
             unsigned workers, std::uint64_t window, unsigned &peer_rows) {
   const auto &r = a.ring;
   const auto &shape = r.source.shape;
-  const auto &network = a.static_network;
+  const auto stride = shape.sources * r.source.packets.packets(shape.tokens);
   RowPrefetchPipeline<Storage> prefetch(storage, 0U);
   auto *output =
       peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto rail = a.rank % a.local_world_size;
-  const auto warp_lane = threadIdx.x & 31U;
-  const auto payload_offset =
-      static_forward::PacketLayout::planned(0U, a.hidden).payload;
-  for (auto source = shape.source_begin(window);
-       source < shape.source_end(window); ++source) {
-    if (source / a.local_world_size == a.node)
+  const auto lane = threadIdx.x & 31U;
+  for (auto task = std::uint64_t(worker); task < stride; task += workers) {
+    const auto &desc = r.pull_packets[window * stride + task];
+    if (!desc.rows)
       continue;
-    const auto source_windows =
-        static_forward::ceil_div(r.source_epochs[source].tokens, shape.tokens);
-    const auto local_window = window / shape.groups();
-    if (local_window >= source_windows)
-      continue;
-    const auto *prefixes =
-        ring::source_metadata(a, source, r.source.packet_prefix);
-    const auto *offsets =
-        ring::source_metadata(a, source, r.dispatch.channel_offsets);
-    const auto *packets = ring::source_metadata(a, source, r.dispatch.packets);
-    const auto *consumers =
-        ring::source_metadata(a, source, r.dispatch.consumer_rows);
-    const auto *tokens = ring::source_metadata(a, source, r.source.node_tokens);
-    const auto *experts =
-        ring::source_metadata(a, source, r.source.selected_experts);
-    const auto *source_gates = ring::source_metadata(a, source, r.source_gates);
-    const auto *locations = ring::source_metadata(a, source, r.locations);
-    for (unsigned lane = 0U; lane < network.rings.lanes; ++lane) {
-      const auto directory = a.node * network.rings.lanes + lane;
-      const auto channel =
-          network.rings.channel(a.node, source / a.local_world_size, lane);
-      const auto *state =
-          static_cast<const static_forward::NetworkChannel *>(ncclGetLsaPointer(
-              a.gin_window,
-              network.ring_region + network.rings.state(false, channel),
-              source % a.local_world_size));
-      const auto *prefix = prefixes + directory * (source_windows + 1U);
-      const auto begin = offsets[directory] + prefix[local_window];
-      const auto end = offsets[directory] + prefix[local_window + 1U];
-      for (auto packet = begin; packet < end; ++packet) {
-        // Interleave sources within each window-local packet ordinal. Adding
-        // source to a channel-major packet index concentrates all small
-        // source ranges on the same few workers.
-        const auto ordinal = (packet - begin) * network.rings.lanes + lane;
-        const auto task =
-            ordinal * shape.sources + source - shape.source_begin(window);
-        if (task % workers != worker)
-          continue;
-        const auto count = consumers[packet * a.local_world_size + rail];
-        if (!count)
-          continue;
-        const auto sequence = state->rx_base + packet - offsets[directory];
-        auto &control =
-            *static_cast<static_forward::NetworkSlot *>(ncclGetLsaPointer(
-                a.gin_window,
-                network.ring_region +
-                    network.rings.control(false, channel, sequence),
-                source % a.local_world_size));
-        if (warp_lane == 0U)
-          while (ring::acquire<::cuda::thread_scope_system>(
-                     control.visible_generation) !=
-                 sequence / network.rings.depth + 1U) {
+    if (lane == 0U)
+      while (ring::acquire<::cuda::thread_scope_system>(
+                 *desc.visible_generation) != desc.generation) {
+      }
+    __syncwarp();
+    const auto *payload =
+        static_cast<const transport::BFloat16 *>(desc.payload);
+    for (unsigned pass = 0U; pass < 2U; ++pass) {
+      // The warp reads peer metadata together; only lane zero issues TMA
+      // into the two private staging slots.
+      for (unsigned base = 0U; base < desc.token_count * shape.top_k;
+           base += 32U) {
+        const auto item = base + lane;
+        const auto token = item / shape.top_k;
+        bool consume = false;
+        static_forward::RouteLocation location{};
+        float gate = 0.0F;
+        if (token < desc.token_count) {
+          const auto route =
+              desc.tokens[token].token * shape.top_k + item % shape.top_k;
+          consume =
+              static_cast<unsigned>(desc.experts[route]) / owned == a.rank;
+          if (consume) {
+            location = desc.locations[route];
+            if (!pass)
+              gate = desc.gates[route];
           }
-        __syncwarp();
-        const auto desc = packets[packet];
-        const auto *payload =
-            static_cast<const transport::BFloat16 *>(ncclGetLsaPointer(
-                a.gin_window,
-                network.ring_region +
-                    network.rings.payload(false, true, channel, sequence) +
-                    payload_offset,
-                source % a.local_world_size));
-        for (unsigned pass = 0U; pass < 2U; ++pass) {
-          // Coalesce peer metadata reads across the warp. Only lane zero
-          // issues TMA into its two private staging slots; the other lanes
-          // supply immutable row descriptors and publish completed X rows.
-          for (unsigned base = 0U; base < desc.tokens * shape.top_k;
-               base += 32U) {
-            const auto item = base + warp_lane;
-            const auto token = item / shape.top_k;
-            bool consume = false;
-            static_forward::RouteLocation location{};
-            float gate = 0.0F;
-            if (token < desc.tokens) {
-              const auto route =
-                  tokens[desc.token_begin + token].token * shape.top_k +
-                  item % shape.top_k;
-              consume = static_cast<unsigned>(experts[route]) / owned == a.rank;
-              if (consume) {
-                location = locations[route];
-                if (!pass)
-                  gate = source_gates[route];
-              }
-            }
-            if (!pass) {
-              auto mask = __ballot_sync(0xffffffffU, consume);
-              while (mask) {
-                const auto selected = __ffs(mask) - 1;
-                const auto block = __shfl_sync(
-                    0xffffffffU,
-                    static_cast<unsigned long long>(location.block), selected);
-                const auto row =
-                    __shfl_sync(0xffffffffU, location.row, selected);
-                const auto packet_row =
-                    __shfl_sync(0xffffffffU, token, selected);
-                const auto weight = __shfl_sync(0xffffffffU, gate, selected);
-                if (warp_lane == 0U) {
-                  while (!ring::admitted(a, block)) {
-                  }
-                  gates[row] = weight;
-                  asm volatile("fence.proxy.async.global;" ::: "memory");
-                  prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
-                                output + std::uint64_t(row) * a.hidden,
-                                static_cast<unsigned>(
-                                    a.hidden * sizeof(transport::BFloat16)));
-                }
-                mask &= mask - 1U;
-              }
-            } else if (consume) {
-              const auto valid = r.blocks[location.block].tile.rows;
-              const auto m = location.row % forward_tuning::kTileM;
-              const auto credit =
-                  m + 1U == valid ? forward_tuning::kTileM - valid + 1U : 1U;
-              static_v4::reduce_add_release_device(
-                  reinterpret_cast<unsigned long long *>(
-                      &ring::slot(a, location.block).x_full),
-                  credit);
-            }
-          }
-          if (!pass && warp_lane == 0U) {
-            prefetch.drain();
-            finish_copies<false>();
-          }
-          // Full copy completion by the issuer happens before every lane's
-          // X-ready release, and before the issuer returns RX credit.
-          __syncwarp();
         }
-        if (warp_lane == 0U) {
-          ring::arrive<::cuda::thread_scope_system>(control.consumed_total,
-                                                    count);
-          peer_rows += source % a.local_world_size != rail ? count : 0U;
+        if (!pass) {
+          auto mask = __ballot_sync(0xffffffffU, consume);
+          while (mask) {
+            const auto selected = __ffs(mask) - 1;
+            const auto block = __shfl_sync(
+                0xffffffffU, static_cast<unsigned long long>(location.block),
+                selected);
+            const auto row = __shfl_sync(0xffffffffU, location.row, selected);
+            const auto packet_row = __shfl_sync(0xffffffffU, token, selected);
+            const auto weight = __shfl_sync(0xffffffffU, gate, selected);
+            if (lane == 0U) {
+              while (!ring::admitted(a, block)) {
+              }
+              gates[row] = weight;
+              asm volatile("fence.proxy.async.global;" ::: "memory");
+              prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
+                            output + std::uint64_t(row) * a.hidden,
+                            static_cast<unsigned>(a.hidden *
+                                                  sizeof(transport::BFloat16)));
+            }
+            mask &= mask - 1U;
+          }
+        } else if (consume) {
+          const auto valid = r.blocks[location.block].tile.rows;
+          const auto m = location.row % forward_tuning::kTileM;
+          const auto credit =
+              m + 1U == valid ? forward_tuning::kTileM - valid + 1U : 1U;
+          static_v4::reduce_add_release_device(
+              reinterpret_cast<unsigned long long *>(
+                  &ring::slot(a, location.block).x_full),
+              credit);
         }
       }
+      if (!pass && lane == 0U) {
+        prefetch.drain();
+        finish_copies<false>();
+      }
+      // Full completion precedes every lane's X-ready release and RX credit.
+      __syncwarp();
+    }
+    if (lane == 0U) {
+      ring::arrive<::cuda::thread_scope_system>(*desc.consumed_total,
+                                                desc.rows);
+      peer_rows += desc.peer_rows;
     }
   }
 }

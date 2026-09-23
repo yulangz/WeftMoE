@@ -707,7 +707,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
     const auto packet = static_forward::PacketLayout::planned(packets.rows, config.max_hidden_size);
     network.rings = {config.max_nodes, packets.lanes, 8U, packet.bytes, packet.bytes};
-    network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 8U));
+    network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
   } else if (config.max_intermediate_size && !config.enable_backward_state) {
@@ -964,6 +964,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     ring.rows = append(cursor, checked_mul(ring.max_blocks, ring.shape.tile_m,
                                            "ring reverse rows"),
                         sizeof(static_forward::RingRow), "immutable reverse routes");
+    if (config.max_nodes > 1U)
+      ring.pull_packets = append(
+          cursor, ring.max_windows * ring.shape.sources * ring.packets.packets(ring.shape.tokens),
+          sizeof(static_forward::PullPacket), "immutable remote pull packets");
     ring.output = append(cursor,
         std::uint64_t(ring.depth) * ring.shape.tile_m * config.max_hidden_size,
         sizeof(transport::BFloat16), "C ring");

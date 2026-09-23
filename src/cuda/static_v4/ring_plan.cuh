@@ -8,20 +8,93 @@ __device__ __forceinline__ void finish_network(const ForwardKernelArgs &a) {
   if (blockIdx.x == 0U && threadIdx.x == Base)
     status->after_combine_start_clock = device_globaltimer_ns();
   // All static owners have retired their packets, readers and local NIC
-  // completions. Protect invocation metadata before a peer stages its next plan.
+  // completions. Protect invocation metadata before a peer stages its next
+  // plan.
   network_barrier<Base, Threads>(a);
   if (blockIdx.x == 0U) {
     const auto &network = a.static_network;
-    for (unsigned index = threadIdx.x - Base; index < 2U * network.rings.channels();
-         index += Threads) {
+    for (unsigned index = threadIdx.x - Base;
+         index < 2U * network.rings.channels(); index += Threads) {
       auto &channel = *peer_at<static_forward::NetworkChannel>(
-          a.gin_window_base, network.ring_region +
-              index * sizeof(static_forward::NetworkChannel));
+          a.gin_window_base,
+          network.ring_region + index * sizeof(static_forward::NetworkChannel));
       channel.tx_base = channel.tx_cursor;
       channel.rx_base = channel.rx_cursor;
     }
     if (threadIdx.x == Base)
       status->after_combine_complete_clock = device_globaltimer_ns();
+  }
+}
+
+// Freeze RX addressing and source directory pointers once. Runtime workers
+// visit only their packet residue, not every source/channel prefix per window.
+__device__ __forceinline__ void build_pull_packets(const ForwardKernelArgs &a,
+                                                   std::uint64_t window,
+                                                   unsigned tid,
+                                                   unsigned threads) {
+  const auto &r = a.ring;
+  const auto &p = r.source;
+  const auto &network = a.static_network;
+  const auto stride = p.shape.sources * p.packets.packets(p.shape.tokens);
+  const auto local_window = window / p.shape.groups();
+  const auto rail = a.rank % a.local_world_size;
+  for (auto index = std::uint64_t(tid); index < stride; index += threads) {
+    auto &out = r.pull_packets[window * stride + index];
+    out.rows = 0U;
+    const auto source = p.shape.source_begin(window) + index % p.shape.sources;
+    if (source >= p.shape.source_end(window) ||
+        source / a.local_world_size == a.node)
+      continue;
+    const auto source_windows = static_forward::ceil_div(
+        r.source_epochs[source].tokens, p.shape.tokens);
+    if (local_window >= source_windows)
+      continue;
+    const auto ordinal = index / p.shape.sources;
+    const auto lane = ordinal % p.packets.lanes;
+    const auto directory = a.node * p.packets.lanes + lane;
+    const auto *offsets =
+        source_metadata(a, source, r.dispatch.channel_offsets);
+    const auto *prefix = source_metadata(a, source, p.packet_prefix) +
+                         directory * (source_windows + 1U);
+    const auto packet =
+        offsets[directory] + prefix[local_window] + ordinal / p.packets.lanes;
+    if (packet >= offsets[directory] + prefix[local_window + 1U])
+      continue;
+    const auto count = source_metadata(
+        a, source,
+        r.dispatch.consumer_rows)[packet * a.local_world_size + rail];
+    if (!count)
+      continue;
+    const auto channel =
+        network.rings.channel(a.node, source / a.local_world_size, lane);
+    const auto *state =
+        static_cast<const static_forward::NetworkChannel *>(ncclGetLsaPointer(
+            a.gin_window,
+            network.ring_region + network.rings.state(false, channel),
+            source % a.local_world_size));
+    const auto sequence = state->rx_base + packet - offsets[directory];
+    auto *control = static_cast<static_forward::NetworkSlot *>(
+        ncclGetLsaPointer(a.gin_window,
+                          network.ring_region +
+                              network.rings.control(false, channel, sequence),
+                          source % a.local_world_size));
+    const auto desc = source_metadata(a, source, r.dispatch.packets)[packet];
+    out = {source_metadata(a, source, p.node_tokens) + desc.token_begin,
+           source_metadata(a, source, p.selected_experts),
+           source_metadata(a, source, r.source_gates),
+           source_metadata(a, source, r.locations),
+           ncclGetLsaPointer(
+               a.gin_window,
+               network.ring_region +
+                   network.rings.payload(false, true, channel, sequence) +
+                   static_forward::PacketLayout::planned(0U, a.hidden).payload,
+               source % a.local_world_size),
+           &control->visible_generation,
+           &control->consumed_total,
+           sequence / network.rings.depth + 1U,
+           desc.tokens,
+           count,
+           source % a.local_world_size != rail ? count : 0U};
   }
 }
 
@@ -48,7 +121,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     for (auto route = tid; route < p.tokens * p.shape.top_k; route += stride) {
       r.source_gates[route] = a.gates[route];
       if constexpr (Network)
-        const_cast<std::int32_t *>(p.selected_experts)[route] = a.selected_experts[route];
+        const_cast<std::int32_t *>(p.selected_experts)[route] =
+            a.selected_experts[route];
     }
     build_combine_order(a, tid, stride);
     collective_scope_sync<384U, kCollectiveJoinBarrier>();
@@ -64,10 +138,11 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     // Planning reads the caller's routes while math stages the immutable copy.
     planner.selected_experts = a.selected_experts;
     const auto &network = a.static_network;
-    for (auto index = worker; index < 2U * network.rings.channels(); index += workers) {
+    for (auto index = worker; index < 2U * network.rings.channels();
+         index += workers) {
       auto &channel = *peer_at<static_forward::NetworkChannel>(
-          a.gin_window_base, network.ring_region +
-              index * sizeof(static_forward::NetworkChannel));
+          a.gin_window_base,
+          network.ring_region + index * sizeof(static_forward::NetworkChannel));
       channel.tx_cursor = channel.tx_base;
       channel.rx_cursor = channel.consume_cursor = channel.rx_base;
     }
@@ -83,11 +158,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
     grid_sync<Math, Control>(a);
     if (worker == 0U) {
-      static_forward::build_channel_offsets(p.packet_prefix, p.nodes * p.packets.lanes,
-                                            p.local_windows(), r.dispatch.channel_offsets);
-      static_forward::build_channel_offsets(r.returning.packet_prefix,
-                                            p.nodes * p.packets.lanes,
-                                            p.local_windows(), r.returning.channel_offsets);
+      static_forward::build_channel_offsets(
+          p.packet_prefix, p.nodes * p.packets.lanes, p.local_windows(),
+          r.dispatch.channel_offsets);
+      static_forward::build_channel_offsets(
+          r.returning.packet_prefix, p.nodes * p.packets.lanes,
+          p.local_windows(), r.returning.channel_offsets);
     }
     grid_sync<Math, Control>(a);
     static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
@@ -143,6 +219,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           seq, seq / r.contribution_depth + 1U,
           std::uint64_t(slot) * r.contribution_stride, slot};
     }
+    if constexpr (Network)
+      build_pull_packets(a, w, tid, Control);
     for (unsigned index = tid; index < owned * p.shape.sources;
          index += Control) {
       const auto expert = index / p.shape.sources;
@@ -224,7 +302,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           {expert, static_cast<unsigned>(b * p.shape.tile_m),
            static_forward::block_rows(r.expert_rows[w * owned + expert], b,
                                       p.shape.tile_m)},
-          static_cast<unsigned>(w), static_cast<unsigned>(seq % r.depth),
+          static_cast<unsigned>(w),
+          static_cast<unsigned>(seq % r.depth),
           seq / r.depth + 1U};
     }
     if constexpr (Network)
@@ -235,12 +314,10 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     for (auto source = first + tid / 32U; source < p.shape.source_end(w);
          source += Control / 32U) {
       const auto count = counts[source - first];
-      const auto *source_prefix =
-          source_metadata(a, source, p.expert_prefix) +
-          local_window * (p.experts + 1U);
-      const auto *order =
-          source_metadata(a, source, p.route_order) +
-          local_window * p.window_capacity();
+      const auto *source_prefix = source_metadata(a, source, p.expert_prefix) +
+                                  local_window * (p.experts + 1U);
+      const auto *order = source_metadata(a, source, p.route_order) +
+                          local_window * p.window_capacity();
       const auto *gates = source_metadata(a, source, r.source_gates);
       for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
         const auto row = geometry.expert_row(0U, source, ordinal);
@@ -250,7 +327,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             static_cast<unsigned>(route), source, gates[route],
             static_cast<unsigned>(route / p.shape.top_k)};
         if constexpr (Network) {
-          const auto block = r.window_prefix[w] + prefix[expert] + row / forward_tuning::kTileM;
+          const auto block = r.window_prefix[w] + prefix[expert] +
+                             row / forward_tuning::kTileM;
           const auto &desc = r.blocks[block];
           source_metadata(a, source, r.locations)[route] = {
               desc.generation, block,
