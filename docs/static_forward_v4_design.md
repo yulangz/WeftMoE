@@ -545,7 +545,7 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   防止快节点在慢节点仍读目录时开始覆盖下一次调用的 metadata。payload 中间无
   全节点 collective；跨调用仍保留这一边界。
 
-### 6.7 Return RX 直接 Reduce 候选（AQ，尚未验证）
+### 6.7 Return RX 直接 Reduce 消融（AQ，未获益，已撤回）
 
 基于逐 slot 协议消融掉 RX→contribution 的额外复制。每个 source route 的
 不可变 `ReturnBinding` 保存 payload、ready word、generation、可选 consumed
@@ -561,7 +561,8 @@ RX 从“scatter 后可释放”改为“引用它的全部 Reduce route 消费�
 每 channel 的 window 单调顺序共同保证最老窗口可接收完整，随后 Reduce/ACK
 释放容量。该容量上界随 B/K/Q/L，不随总 tokens 增长；较大 B 的内存代价要
 单独报告。只在完整正确性、wrap、热点与性能验证后，才替代 6.6 的已验证 scatter
-基线；当前进展见 ring 记录 AQ。
+基线。AQ 的 8K 快筛没有收益，已撤回实现，未完成完整正确性验证；这里只
+保留协议分析供后续参考，当前仍使用 6.6 的 RX scatter。实测见 ring 记录 AQ。
 
 ## 7. Gate/up：独立 GEMM 消融，不预选 decode/prefill 布局
 
@@ -800,7 +801,8 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
       用例通过完整输出/replay 校验；更宽 tile、独立调优与 profiler 分析仍在进行。
 - [x] 做等有效 S 宽度的 separated/interleaved 受控对照，核对逻辑 N tiles 及计数目标。
   AF 已完成 N64/N128、balanced/hotspot、四规模、world8/16 重放；两边共享
-  生产 SwiGLU/精度合同，完整输出与 replay 校验通过。
+  生产 SwiGLU/精度合同，完整输出与 replay 校验通过。AS 更正 balanced 的
+  主矩阵路由公式并重测 T1；T64/8K/20K 逐专家 counts 相同，原结果有效。
 - [x] 分别调优两种布局的 N/K/stages/epilogue，保留失败候选和资源/误差原因。
   已测 N32/64/128、K64/128、stages2/3/4/6；N32 仅 packed 支持。
   AF/AJ 记录资源、完整样本与失败的 group-overlap 候选。profile 选择与

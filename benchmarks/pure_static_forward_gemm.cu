@@ -255,7 +255,7 @@ int main(int argc, char **argv) try {
         const auto expert =
             distribution == "hotspot"
                 ? experts - 1U
-                : (token * top_k + slot + source * 7U) % experts;
+                : (token * 17U + source * 31U + slot * 53U) % experts;
         if (expert / owned == rank)
           ++counts[expert % owned];
       }

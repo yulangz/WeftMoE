@@ -942,11 +942,17 @@ fragment 以编译期寄存器排列接入相同 epilogue，从而匹配有效 S
 M128/K/stages/输出宽度与精度，FC2 固定 N256/K128/stages2；无通信、route
 planning 或队列。chain 用 FC1+SwiGLU、FC2 两个顺序 kernel，不模拟融合重叠。
 
-输入使用主矩阵 route 规则重放实际 expert 计数、尾块；balanced 测 rank0，
+输入按 route 计数重放 expert 几何、尾块；balanced 测 rank0，
 hotspot 测最后一个 rank，包含重复 expert 的全部 route。比较完整输出与
 cuBLAS+同精度 SwiGLU，检查 replay 字节一致；packing/分配/descriptor 均在
 计时外，单独报告 packing 时间与额外副本大小。吞吐只按有效行的 GEMM FLOPs
 统计，不把 M128 padding 或 SwiGLU scalar FLOPs 计入有效 tensor throughput。
+
+**夹具更正（AS）**：本节首次测试的 balanced 公式为
+`(token*4 + slot + source*7)%64`，并非主性能测试的
+`(token*17 + source*31 + slot*53)%64`。逐专家计数核对表明 world8/16 的
+T64/8192/20480 完全相同，热点也不受影响；原 T1 数据仅作为旧合成夹具的
+受控比较保留，不再称为主矩阵尾块。AS 修正实现并列出主矩阵 T1 重测。
 
 第一版将 producer/math 放在同一角色函数，separated 被 ptxas 报告 WGMMA
 serialization、stack264，不能用该版本判断布局。已按生产模式分离角色代码；
@@ -1221,7 +1227,7 @@ AP 正式矩阵：1620 MHz、10 warmup/20 samples、graph batch20，EP8 在
 EP8 B16/D1 的 top-k=8、T1/64 + edges 共 136 records，验证通用 fallback。
 三组均 exit0，无参考检查失败。未增加单测入口。
 
-### AQ：Reduce 直接读取 Return RX（实现候选，未验证）
+### AQ：Reduce 直接读取 Return RX（快筛无收益，撤回）
 
 删除 RX→contribution scatter，以 source-local immutable `ReturnBinding`
 把每个 route 绑定到 contribution 或本地 Return RX 行、ready word、generation
@@ -1239,3 +1245,53 @@ source window 的最坏 Return packets；这只依赖固定 B/K/Q/L，不随 T �
 Q8/L32/B512/K4 仍 depth8；大 B 或小 L 的注册内存会增大，须如实记录。
 plan/allocate 地址不跨调用保存，所有 reader/ACK/local completion drain 后
 仍做 invocation metadata barrier。TX 仍保留 remote credit AND local completion。
+
+Q8/L32/B512/D4 快筛 T64=407.296 us、T8192=4490.78 us，32 hashes 与
+冻结 V3 一致；8K 不如 AP 正式 4405.93 us。移除 scatter 没有带来收益，
+同时增加 immutable binding 表和 RX 生命周期约束，已撤回全部生产改动，
+未投入完整矩阵/热点/sanitizer 验证，不将候选推导称为完整正确性证明。
+恢复原 RX scatter、channel consume_cursor 和 depth8。冻结 native/lib/extension
+与补丁位于 `build/static_v4_ring_direct_rx/`（`change.patch`），可复现实验。
+
+### AR：增加静态 Reduce warp 配额（无收益，撤回）
+
+AD 后本地 Return 只发布 ready，因此尝试将其限制为 32 个 warp，其余原
+Return warp 静态划给 Reduce。单机 Reduce workers 从 131 增至 231；
+Q8/L32 双机从 99 增至 135。所有任务仍按固定 residue 覆盖，无动态领用，
+不增加 buffer、counter 或 barrier。8K 快筛 EP8/B256/D4 为 1657.23 us，
+EP16/B512/D4 为 4425.20 us，未优于 AP 的 1659.53/4405.93 us。
+故撤回生产改动，不为无收益候选增加完整验证负担。
+候选 native/lib/extension：`build/static_v4_ring_reduce_roles/`。
+
+### AS：纯 GEMM route 夹具与通信字节审计更正
+
+修正独立 GEMM 的 balanced 公式，与 native 默认 stride53 的主矩阵一致。
+T1 的 owned expert counts：world8 从 `[1,1,1,1,0,0,0,1]` 改为
+`[1,0,0,1,0,1,0,1]`，world16 从 `[2,2,2,1]` 改为 `[1,1,0,1]`。
+T64/8192/20480 逐专家 counts 完全一致，因此此前这些规模的测量不作废。
+修正后的 T1 balanced p50/us（N 为有效 S 宽度，K128/stages2）：
+
+| N | world | packed FC1 | separated FC1 | packed chain | separated chain |
+|---|---:|---:|---:|---:|---:|
+| 64 | 8 | 22.720 | 27.424 | 32.784 | 37.408 |
+| 64 | 16 | 22.640 | 27.264 | 32.608 | 37.760 |
+| 128 | 8 | 35.248 | 36.928 | 45.456 | 47.360 |
+| 128 | 16 | 35.040 | 36.832 | 45.312 | 47.056 |
+
+N64 在第一节点 GPU0，N128 在第二节点 GPU0；各节点无其他 GPU workload。
+16 用例完整输出/replay 校验通过，960 对采样时钟全部 1620:1620。
+日志、构建命令与 hash 位于 `build/static_gemm_native_route_n{64,128}_s2_k128/`。
+该更正不改变当前 packed 优于同宽 separated 的结论；未声称融合路径获得收益。
+
+另在第二节点 GPU0 补测 decode 候选 packed N32/K128/stages3 的主矩阵 T1：
+world8 FC1/chain 为 18.048/28.544 us，world16 为 17.888/27.968 us。
+四用例完整输出及 replay 校验通过，240 对时钟均 1620:1620，仍支持窄 N
+作为 decode 候选。记录于 `build/static_gemm_native_route_n32_s3_k128/`。
+
+另外以 eager audit 核对 EP16/T8192 的实际 payload：V3 与 AP 都是每 rank
+Dispatch 32 MiB、Return 64 MiB；V3 Put 数为 128/256，AP Q8 为 1024/2048。
+因此 V4 并非通过少传数据获得短序列收益，长序列也不能仅凭 sysfs 的单设备
+200 Gb/s 标称速率断言已经线速：V3 传相同字节却更快，仍须分析有效通信吞吐。
+V4 的 raw_remote_route_bytes、gin_metadata_bytes 目前未接 telemetry，日志中的
+零不表示没有这类流量。审计日志 `ring_{v3,reduce_topk}_ep16_t8192_eager_audit.log`；
+eager 含单次样本，仅用作计数审计，不替代 AP 的正式 Graph 性能表。
