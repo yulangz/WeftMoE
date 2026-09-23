@@ -182,7 +182,6 @@ struct DispatchPlanView {
   std::uint64_t *channel_offsets; // [nodes * lanes + 1], self channels empty.
   DispatchPacketPlan *packets;    // [sum(channel terminal sequences)]
   std::uint32_t *consumer_rows;   // [packets, local_world]
-  std::uint64_t *route_packets;   // Remote valid route -> packet * Q + token row.
 };
 
 struct ReturnPacketPlan {
@@ -211,7 +210,6 @@ struct SourcePlanView {
   std::uint64_t *expert_prefix; // [local_windows, experts+1]
   std::uint64_t *node_prefix;   // [local_windows, nodes+1]
   std::uint64_t *route_order;   // [local_windows, B*K]
-  std::uint32_t *source_slot;   // [tokens*K], window/expert-local ordinal
   NodeToken *node_tokens;      // [local_windows, B*K]
   std::uint64_t *packet_prefix; // [nodes, lanes, local_windows+1]
   unsigned *error;

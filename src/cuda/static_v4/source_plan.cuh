@@ -36,7 +36,6 @@ __device__ void build_source_window(const SourcePlanView &a,
 
   for (auto index = tid; index < routes; index += Threads) {
     const auto route = route_begin + index;
-    a.source_slot[route] = UINT32_MAX;
     if (a.valid && !a.valid[route])
       continue;
     const auto expert = a.selected_experts[route];
@@ -101,7 +100,6 @@ __device__ void build_source_window(const SourcePlanView &a,
       continue;
     const auto position = atomicAdd(scratch + expert, 1U);
     route_order[position] = route;
-    a.source_slot[route] = static_cast<unsigned>(position - expert_prefix[expert]);
   }
   for (auto token = tid; token < tokens; token += Threads) {
     const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;

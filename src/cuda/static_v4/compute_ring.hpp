@@ -96,9 +96,9 @@ struct PullPacket {
 struct SourceMetadataLayout {
   std::size_t header = 0, selected = 0, gates = 0;
   std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
-  std::size_t source_slot = 0, node_tokens = 0, packet_prefix = 0;
+  std::size_t node_tokens = 0, packet_prefix = 0;
   std::size_t dispatch_offsets = 0, dispatch_packets = 0;
-  std::size_t dispatch_consumers = 0, dispatch_routes = 0;
+  std::size_t dispatch_consumers = 0;
   std::size_t return_prefix = 0, return_offsets = 0, return_packets = 0;
   std::size_t locations = 0;
   std::size_t published_bytes = 0;

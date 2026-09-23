@@ -97,7 +97,6 @@ __device__ inline void build_dispatch_packets(const SourcePlanView &a,
         if (rank / local_world == node) {
           ++consumers[rank % local_world];
           ++fanouts;
-          out.route_packets[route_begin + k] = packet * a.packets.rows + row;
         }
       }
     }

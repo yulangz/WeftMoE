@@ -668,7 +668,6 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
   m.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
                          sizeof(std::uint64_t), "source window nodes");
   m.route_order = append(cursor, entries, sizeof(std::uint64_t), "window routes");
-  m.source_slot = append(cursor, entries, sizeof(std::uint32_t), "source ordinals");
   m.node_tokens = append(cursor, entries, sizeof(static_forward::NodeToken),
                          "node-deduplicated tokens");
   m.packet_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Dispatch prefixes");
@@ -692,8 +691,6 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
                                  "Dispatch packet directory");
     m.dispatch_consumers = append(cursor, checked_mul(dispatch_capacity, local_world, "packet consumers"),
                                    sizeof(std::uint32_t), "Dispatch consumers");
-    m.dispatch_routes = append(cursor, routes, sizeof(std::uint64_t),
-                                "Dispatch inverse route directory");
     m.return_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Return prefixes");
     m.return_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
                                "Return channel offsets");

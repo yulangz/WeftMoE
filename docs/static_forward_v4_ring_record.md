@@ -2002,3 +2002,204 @@ registered 为 55201536/62243072。B512 的已修复 BO 8K pool 为 631103424，
 比 BH/B512 的 933122752 少约 32.4%，但与 B1024 的性能/容量权衡须分开看。
 日志 `ring_node_groups_final_*`、`ring_node_groups_v3_*`；原 Q、GEMM profile、
 double-credit 与逐 slot 生命周期不变。最终提交不包含 BP/BQ 的数据面改动。
+
+### BS：规则跨行 Return TMA gather（无端到端收益，已撤回）
+
+在 BR 上保持 packet、slot credit、数值和求和顺序不变，仅替换符合规则步长
+的 C→TX 复制：同一 destination、完整 16 行片段、每行 physical C 地址增量
+恰为 G。其它包仍用旧的逐行复制；不读取未参与当前包的 C 行。资格判断暂时
+合并在已有的 C-ready 扫描中，未来是否预计算由测量决定。
+
+每个 pool slot 在 ordinary device pool 保存 local_world 个 C TensorMap 和
+一个 TX TensorMap；host 副本由 slot 持有，异步上传生命周期与 pool 一致。
+C 是 `[H*G, ceil(C_rows/G)]` 的 2D 视图，TX 是带 packet stride 的 3D 视图。
+无 swizzle，box 为 256×16 BF16（H 不整除 256 时使用 128 列）。返回 owner
+每 CTA 一次 system-scope tensor-map proxy acquire，不能以 stream ordering
+代替；参考 [CUDA 12.9.1 的 global TensorMap 用法](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-c-programming-guide/index.html)。
+
+网络 Return 私有 SMEM 从两个 4-KiB row buffers 增至两个 8-KiB tiles，
+Dispatch staging 和单机路径容量不变。两个 TMA load 先发出，再等待/存储；
+仍完整等待 global store 后才发 C reader credit 和 GIN Put，不使用 GEMM 的
+multicast A。EP16 pool 增加 1280 bytes/rank，registered bytes 不变。
+
+首轮 EP16/B1024/8K 快筛 **3333.82 us**，16 hashes 与 BR 一致，暂未好于
+BR 的 3280.02 us。此轮同时编译 Python extension，后续完整数值/sanitizer
+尚未开始；不能视为已获益优化。native SHA256
+`c7b7628d66fbad7eed1b35fb8f26f06bf6b70761b50a444e03ee858cc8ca2ead`，library
+`b0c05d1fc85ba737c3aa9c224c25817994314f0060ff2ad6edeeea8d25163677`，归档
+`build/static_v4_ring_return_gather/change.patch`（含新 helper）。网络 prefill
+REG168/STACK456/LOCAL0，较 BR 多 16 bytes stack。若保留，sanitizer 除 B16
+fallback 外还必须覆盖 B256/D1、足以形成完整 affine packet 的 workload。
+
+BS 的 20K 快筛为 **7668.61 us**，16 hashes 与 BR 一致；此轮并行编译
+timeline 版本，仍不是正式性能验收。8K eager timeline 的 rank0 有 69541
+events、overflow0，1024 个 Return 包全部进入 gather：Return pack p50
+13.888 us，其中 gather 12.160 us；Dispatch pack 7.776 us，RX scatter
+26.656 us。此前 BP 同配置 Return pack/RX scatter 为 26.176/25.792 us。
+这说明局部 pack span 确实缩短约一半，但不能把并发 span 相加，也不能据此
+认定端到端已获益。日志 `ring_return_gather_b1024_ep16_t*_quick.log` 与
+`ring_return_gather_b1024_ep16_t8192_timeline*`。
+
+### BT：Return 首末位置推导与逐 slot 检查（无明确收益，已撤回）
+
+Return 包在 source expert order 内连续。同一专家的相邻 source ordinal
+在目的布局中最多前进 G 行；首末 generation 相同排除 physical ring wrap，
+若首末距离恰为 `(rows-1)*G`，即可证明中间每一步都是 G，无需逐行重复加载
+expert/location 元数据。不同专家或非规则片段仍走旧扫描。
+
+规则 span 仍 acquire 每个实际涉及的 C slot 的 exact generation；复制全部
+完成后，按该 span 在每个 slot 的实际行数归还 reader credit。G 不大于16、
+M128，故首末之间不存在完全未参与包的 slot。它独立于 TMA 的16行整除要求，
+因此单独消融“span+TMA”和“span+旧逐行复制”，不把收益混在一起。
+
+span+TMA 的 EP16/B1024 8K/20K 快筛为 **3274.51/7615.58 us**，全部32
+hashes 与 BR 一致；相对 BR 仅约0.2%，不足以支持保留额外的描述符、SMEM
+和分支。“span+旧逐行复制”的8K/20K为 **3301.44/7705.42 us**，32 hashes
+一致，亦未改善。上述快筛
+均存在并发 CPU 编译，不替代正式验收；未继续 PyTorch/sanitizer 门禁。
+已撤回 BS/BT 全部源码，归档保留两种候选，不给生产路径增加调参开关。
+
+`static_v4_ring_return_span/` native SHA256
+`9883ae35acfe83a3cf31b48cccf64de2ef320319b790517dc7fe98c70368522e`，library
+`43ccd348fda90c14b9d262402aaecedd93ce7134a93dc383a83b4fd888a0589a`；资源
+REG168/STACK456/LOCAL0。“span+旧复制”归档 `static_v4_ring_return_span_rows/`，
+native `47aa31a8f6491e570ee461064ddadfbf78ebd85f40d8891eb2892fad7b9ee9d9`。
+两个 change.patch 都包含当时的新增 helper，不依赖已撤回的工作区文件。
+
+### BU：Return RX warp 协作 scatter（退化，已撤回）
+
+从 BR 单独替换 RX→contribution 的本地复制，32 lanes 按 H 的连续16B向量
+协作。lane0 acquire RX generation 后经 warp memory barrier 传递可见性；
+所有向量写完，经 warp join 再发布逐行 contribution-ready；第二次 join 后
+lane0 才归还 RX consumed credit。网络 import/ACK 仍由原固定 owner 独占。
+没有更改 Return pack、packet 目录、GEMM、求和顺序、ring 大小或双重 TX credit。
+
+最初基于 BS/BT 的 CPU 编译中途取消，未执行 GPU；检查发现其还缺少 acquire
+之后的 warp memory barrier。该目录 `static_v4_ring_return_warp_scatter/`
+已标 INVALID；独立修正版本为 `static_v4_ring_return_warp_scatter_base/`，
+不混用二者测试结果。
+
+独立修正版本 EP16/B1024 的8K/20K快筛为 **3530.72/7953.65 us**，32 hashes
+与 BR 一致；8K同时编译 extension，20K同时准备下一候选的 CPU 编译。
+没有继续完整数值/sanitizer，全部数据面改动已撤回。native SHA256
+`e657e2b135ddd580e153303f2e56ec3ff20d1fda75b8ea25caf18289d268ffa7`，library
+`e8ba44723a87a223b523fd712f4134dccbada2498fb082d30f4d6aeea6bce80f`；资源
+REG168/STACK440/LOCAL0。`static_v4_ring_return_warp_scatter_base/change.patch`
+保留独立候选。普通 warp vector copy 不适合据此替代这里的 bulk async copy。
+
+### BV：Return RX 连续多行加载、分行 scatter（无明确收益，已撤回）
+
+仍从 BR 起步。RX payload 本身连续，不依赖 route_order 的 token 连续性。
+最初两个16-KiB staging 的4行方案超过当前 GEMM profile 的 SMEM预算，被
+编译期227-KiB检查拒绝，未运行GPU，保留 `build_static_v4_ring_return_batch_scatter*`
+编译日志。改为两个8-KiB私有 staging，主测 H2048 下一次加载2行；发出两批 G2S 后分别
+等待，将每批的行写到原 contribution 目的地并作为一个 store group commit。
+覆盖 staging 前等该 slot 的 shared-read completion；发布 ready 和 RX credit
+之前仍完整等待 global stores。最后不完整批按真实字节数处理；单行比 staging
+大的其它 H 走原分段 copier，不越界也不静默截断。
+
+只增网络通信 SMEM，Dispatch仍8 KiB、Return由8增至16 KiB，总计24 KiB；
+单机与非 ring 的分配不变。没有新增 TensorMap、GM pool、registered bytes
+或网络 metadata。独立 helper 为 `return_scatter.cuh`，不修改通用/V3 copier。
+
+2行版8K快筛 **3295.65 us**，16 hashes 与 BR 一致，暂未改善；同轮编译
+extension，后段另启动下一候选编译。native SHA256
+`e4d92d5143625dd6b3a4a8017c772222d2db8086caf6bf5bf55e161cd61857e2`，library
+`94d5eed8e2675db391a4f3ececeb408dc44523fc3895a6286068b2055c3167e6`；资源
+REG168/STACK456/LOCAL0。`static_v4_ring_return_batch_scatter2/change.patch`
+包含新 helper；完整数值/sanitizer 未开始。
+
+20K快筛为 **7605.26 us**，16 hashes 与 BR 一致，同时进行下一候选 CPU
+编译。不到0.3%的长规模差异、8K略退化，不足以保留新增 helper/分支及SMEM；
+已撤回全部数据面改动。未声称 sanitizer 或非主测 H 的 fallback 已验证。
+
+### BW：移除无读者的 route 反向目录（已验收，保留）
+
+代码检索确认现有 ring 数据面只从 route_order 顺向枚举，从 immutable
+PullPacket 定位 RX；不读取 `source_slot[route]` 与 `route_packets[route]`。
+删除这两份早期方案的反向索引、生成时的全局写入、pool 与 GIN replica 分配。
+不改变 source ordinal 的定义/枚举，只不再冗余存储其逆映射；将来 StableTape
+按其真实需要设计保存映射，不让 inference 提前支付未使用目录的开销。
+
+每个 source metadata 减少约 `4*window_capacity + 8*max_routes` bytes；
+单机减少前一项，多机也减少每份副本及跨机发布量。既有 GPU plan cases 保留
+route 覆盖/唯一性、mask/非法 expert、节点去重、consumer rows 和退休计数，
+仅删除针对已移除数组的断言与分配。数据面、SMEM、GEMM 与 packet 顺序不改。
+
+host 18/18、GPU plan 原31+6 cases 通过。EP16/B1024/8K 初筛 **3267.38 us**，
+16 hashes 与 BR 一致，pool/registered 分别965927104/54415104 bytes/rank，
+两者均比 BR 少786432 bytes。此轮同时编译 extension，尚非正式验收。
+native SHA256 `5e9b839861f13a71232a01b18c9b2676daba18d7b0f2310c4a1146775ba8933d`，
+library `9117db0d7e95c5caefbc1c9599203010f685a3bdb923726b1bc5340053c93075`；
+REG168/STACK440/LOCAL0，归档 `static_v4_ring_compact_plan/change.patch`。
+
+20K初筛7627.10 us，与BR持平，16 hashes一致；pool/registered降为
+1310015168/60276992 bytes/rank，减少1966080 bytes。EP16完整四规模+edges
+416、小深度B16/D1/K8的272条PyTorch检查均通过；rank1/9 eager 11 rounds
+memcheck launcher exit0、0 errors，日志 `ring_compact_plan_*`。
+
+rank1/9 的同配置 racecheck 也 launcher exit0、0 hazards；不声称覆盖所有 ranks。
+memcheck进程local380594/remote123609，racecheck local381660/remote123885。
+单机EP8完整四规模+edges的208条PyTorch检查通过。第二节点的单机正式计时
+（1620MHz、10 warmup/20 samples/batch20，无该节点CPU编译或其它GPU任务；
+第一节点独立数值检查）B512的四规模为101.198/137.301/1274.200/3080.790 us，
+20K另测B1024为2974.260 us。不能将不同B的容量取舍隐藏在单一性能数字中。
+
+双机EP16正式计时为B1024/D4、D8/R16/L32，核心1620MHz、10 warmup/
+20 samples/batch20，两个节点无并发CPU编译或其它GPU任务：
+
+| tokens/rank | BW/us | ordinary+registered bytes/rank | registered bytes/rank |
+|---:|---:|---:|---:|
+|1|292.093|67473856|50514688|
+|64|399.363|108771776|50541312|
+|8192|3255.970|965927104|54415104|
+|20480|7605.830|1310015168|60276992|
+
+EP16的64、EP8/B512的32个rank hashes与BR一致。相比BR历史同配置，长规模
+降低约0.73%/0.28%，不声称是显著突破；本次收益确定的部分是移除无读者数组、
+写入和传输，以及上述容量下降。对照BR轮次冻结V3的3359.26/7099.96 us，
+BW的8K快约3.1%，20K仍慢约7.1%，端到端目标尚未实现。完整日志
+`ring_compact_plan_*`，不混用后续BX/BY/BZ候选。
+
+### BX：按 Mblock 合并两份静态任务序列（候选测试中）
+
+在 BW 上，保留 FC1/FC2 的全局 residue 与 owner，只调整同一 owner 内的次序：
+取两份静态序列较小的 Mblock，同 Mblock 先 FC1 后 FC2。不是“谁 ready 先做谁”；
+cluster 内两个 CTA 的选择始终一致，ready 只控制等待，否则独立观察可能选择
+不同算子、破坏 multicast 配对。依赖按 Mblock 单调推进，任何等待 FC2(b) 的
+owner 都先完成自己的 FC1(<=b)，不会挡住更早的 FC1 依赖。
+
+主测 B1024 均衡窗口中多数 owner 只有一个 FC1/FC2 pair，预期差别不大；主要
+验证较大窗口是否能提前产生 Return，避免先耗尽整窗 FC1 才做 FC2。独立 BR
+B1536/D4/20K 的初筛7747.70 us、pool1649117376 bytes/rank（CPU编译并行），
+本身不如 B1024。不把较大容量的潜在收益误标为调度优化。
+
+冻结 `static_v4_ring_mblock_merge/`，native SHA256
+`e0f36b77ec7e1423c573247df57e8d5c5b7f5a7ac86fdce77b579fef10814f69`，library
+`ce54a1f606ee083289ea8e211075c6882db28213a76362960e178d44b6dcac40`。仅编译
+完成，尚未GPU验收；当前源码先恢复BW，以独立测试另一通信组合。
+
+### BY：大 Return packet + 规则 TMA gather（候选测试中）
+
+在BW上恢复BS/BT的组合，仅编译期Return Q改为32/64，Dispatch Q8、L32不变。
+此前Q16时局部pack缩短不转化为端到端收益；本项检验更快的pack是否使更大
+packet及更少GIN提交获益。新增 maps、SMEM、endpoint span 与旧扫描fallback
+均按BS/BT合同，不混入BV scatter或BX调度。仍只是组合消融，不默认合入。
+
+R32 native SHA256 `cf56d1d49df6c938f2b25254c6b010852dcf210049c4c02122712e2fd4cebc84`，
+R64 `2b9182d2f99e7b4898d92c099267cd61af630822c8ef5dabe7b6ee4b96aa8129`。
+归档 `static_v4_ring_return_tma_r{32,64}/change.patch` 是相对BW的增量，
+包含两个helper；本轮尚未GPU验收，也未构建library。工作区已恢复BW再开展独立候选。
+
+### BZ：多机 prefill 通信专用 CTA（候选测试中）
+
+在BW上，不混入BX/BY。多机prefill可以预留前32/64个CTA，只运行原静态通信
+角色；这些CTA的math/producer跳过主计算，但仍参加初始化、route plan和终端
+collective。其余完整双CTA cluster承担全部FC1/FC2，owner residue按剩余
+cluster数计算。两CTA同进退，multicast不会跨到无计算的CTA；F1/F2和C读者
+计数不变。Host既有task-count容量检查使用剩余cluster数，并拒绝没有计算
+cluster的配置。不是另起并发kernel，不引入“通信kernel必须先调度”的驻留风险。
+
+本项用于检验共享SM上的计算/通信竞争，代价是更少math CTA；可能吞吐反而
+降低。只在网络prefill启用，短序列与单机begin=0。编译开关暂默认0，实验
+若不获益则移除，不为每个失败候选长期保留分支。

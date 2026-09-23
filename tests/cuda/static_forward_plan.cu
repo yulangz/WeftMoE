@@ -112,7 +112,6 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   DeviceArray<std::uint64_t> expert_prefix(windows * (experts + 1U));
   DeviceArray<std::uint64_t> node_prefix(windows * (nodes + 1U));
   DeviceArray<std::uint64_t> route_order(capacity);
-  DeviceArray<std::uint32_t> source_slot(selected.size());
   DeviceArray<plan::NodeToken> node_tokens(capacity);
   DeviceArray<std::uint64_t> packet_prefix(nodes * partition.lanes *
                                            (windows + 1U));
@@ -122,9 +121,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   // worst-case replication.
   DeviceArray<plan::DispatchPacketPlan> packets(selected.size());
   DeviceArray<std::uint32_t> consumers(selected.size() * local_world);
-  DeviceArray<std::uint64_t> route_packets(selected.size());
   const plan::DispatchPlanView directory{channel_offsets.data(), packets.data(),
-                                         consumers.data(), route_packets.data()};
+                                         consumers.data()};
   DeviceArray<std::uint64_t> return_prefix(nodes * partition.lanes *
                                            (windows + 1U));
   DeviceArray<std::uint64_t> return_offsets(nodes * partition.lanes + 1U);
@@ -143,7 +141,6 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
                                   expert_prefix.data(),
                                   node_prefix.data(),
                                   route_order.data(),
-                                  source_slot.data(),
                                   node_tokens.data(),
                                   packet_prefix.data(),
                                   error.data()};
@@ -162,13 +159,11 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto ep = expert_prefix.read();
   const auto np = node_prefix.read();
   const auto order = route_order.read();
-  const auto ordinal = source_slot.read();
   const auto nt = node_tokens.read();
   const auto pp = packet_prefix.read();
   const auto channels = channel_offsets.read();
   const auto packet_plan = packets.read();
   const auto consumer_rows = consumers.read();
-  const auto route_locations = route_packets.read();
   const auto rp = return_prefix.read();
   const auto return_channels = return_offsets.read();
   const auto return_plan = return_packets.read();
@@ -183,10 +178,8 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
     for (auto token = begin; token < end; ++token) {
       for (unsigned k = 0; k < top_k; ++k) {
         const auto route = token * top_k + k;
-        if (!valid[route]) {
-          require(ordinal[route] == UINT32_MAX, "masked route ordinal");
+        if (!valid[route])
           continue;
-        }
         const auto expert = unsigned(selected[route]);
         const auto node = expert / experts_per_node;
         expected_routes[expert].insert(route);
@@ -202,7 +195,6 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
         const auto route = order[w * view.window_capacity() + index];
         require(expected_routes[e].erase(route) == 1U,
                 "route coverage/uniqueness");
-        require(ordinal[route] == index - first, "source ordinal inverse");
       }
     }
     for (unsigned node = 0; node < nodes; ++node) {
@@ -269,8 +261,6 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
           if (valid[route] && expert / experts_per_node == node) {
             ++expected[(expert / (experts / world)) % local_world];
             ++fanouts;
-            require(route_locations[route] == packet * partition.rows + row,
-                    "Dispatch inverse packet/token row");
           }
         }
       }

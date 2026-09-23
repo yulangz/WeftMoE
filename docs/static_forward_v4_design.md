@@ -805,6 +805,8 @@ M1a 已实现 host/device 共用窗口/packet/slot 合同与 GPU source-window p
 M1b 增加独立于 RX 生命周期的 packet→consumer 目录及 destination-window 几何。
 M3a 补齐 Dispatch route→packet/token 反向索引和 Return 精确逐 channel 目录，
 并将 source epoch/gate/route/packet 元数据集中为不含 X 的独立区域。
+后续 BW 移除了数据面不再读取的 source ordinal 逆表与 route→Dispatch packet
+逆表；保留 route_order 顺向目录和 PullPacket 绑定，source ordinal 的定义不变。
 详见 ring 实施记录。规划器已接入单机及多机 Forward，包括窗口几何、source
 contribution 映射、网络目录交换和整窗口准入。这里的 source ordinal 是一次
 invocation 内冻结的顺序，不是 M6 尚待实现的确定性 StableTape 行号。

@@ -4866,7 +4866,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     p.expert_prefix = at<std::uint64_t>(metadata, m.expert_prefix);
     p.node_prefix = at<std::uint64_t>(metadata, m.node_prefix);
     p.route_order = at<std::uint64_t>(metadata, m.route_order);
-    p.source_slot = at<std::uint32_t>(metadata, m.source_slot);
     p.node_tokens = at<static_forward::NodeToken>(metadata, m.node_tokens);
     p.packet_prefix = at<std::uint64_t>(metadata, m.packet_prefix);
     p.error = &r.source_header->error;
@@ -4875,8 +4874,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       r.locations = at<static_forward::RouteLocation>(metadata, m.locations);
       r.dispatch = {at<std::uint64_t>(metadata, m.dispatch_offsets),
                     at<static_forward::DispatchPacketPlan>(metadata, m.dispatch_packets),
-                    at<std::uint32_t>(metadata, m.dispatch_consumers),
-                    at<std::uint64_t>(metadata, m.dispatch_routes)};
+                    at<std::uint32_t>(metadata, m.dispatch_consumers)};
       r.returning = {at<std::uint64_t>(metadata, m.return_prefix),
                      at<std::uint64_t>(metadata, m.return_offsets),
                      at<static_forward::ReturnPacketPlan>(metadata, m.return_packets)};
