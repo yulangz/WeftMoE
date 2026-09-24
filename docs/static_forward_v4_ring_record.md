@@ -3848,3 +3848,33 @@ REG168/STACK448/464/SHARED2048/LOCAL0，额外warp协作未提供净收益。
 `build/static_v4_ack_warp_ei/`，native SHA256
 `b1688739bb5d982ed62b8020249ce734e454ec58c0621d1736537393b489fa3d`；
 日志`ack_warp_ei_ep16_t20480_quick.log`。
+
+### EJ：计算owner的两窗口ready lookahead（无收益，撤回）
+
+保持FC1/FC2全局residue及静态ownership，只在网络prefill上更改owner内部顺序：
+优先探测当前窗口，自己的FC1未ready时允许执行已经ready的自有FC2；当前窗口
+无可执行任务才探测下一窗口。两个私有progress保存各自FC1/FC2进度，旧窗口
+耗尽后滑动；不抢他人任务，不增加全局claim/CAS，也不等待未准入的未来窗口。
+不同于DP合并wave后固定先做两窗FC1，这里未来窗口只是非阻塞探测。
+
+原静态路径的两个CTA独立选择相同固定序列，不能各自按ready跳过任务，否则
+会破坏multicast配对。EJ由cluster leader统一决策，复用已有DSM ready/joined
+barrier发布给另一CTA。新增64-bit进度使ComputePairState由48变64 bytes；
+network prefill main为REG168/STACK440/SHARED2048/LOCAL0，相比基线stack增加8。
+buffer容量、packet分区、全部ready/credit及数值顺序不变。
+
+基于M6f、带独立M6g Backward配置的冻结native
+`build/static_v4_compute_lookahead_ej/test_cuda_notify`，SHA256
+`bedc5ef20399b8e1a4b874901b1a719cebdc249f7058a34f642b7a9de558b6d8`。
+1620MHz、B512/D8、10warmup/2samples/batch2、无并发CPU构建/GPU任务：
+
+|T/rank|EP16 rank-max p50/us|样本范围/us|M6f正式参考/us|
+|---:|---:|---:|---:|
+|8192|2961.620|2961.620–2963.180|2953.070|
+|20480|7008.940|7008.940–7064.660|6991.990|
+
+32个输出hash及全部pool bytes与M6f相同；未见性能收益，已撤回全部计算
+lookahead源代码。没有继续library、完整Torch或sanitizer，不将快筛当作完整
+正确性验收。冻结目录保留patch/resource报告，日志
+`compute_lookahead_ej_ep16_t{8192,20480}_quick.log`。这只否定此两窗探测方案，
+不能单凭一次端到端实验断言所有计算等待都无优化空间。
