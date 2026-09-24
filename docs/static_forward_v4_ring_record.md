@@ -3680,3 +3680,41 @@ CONSTANT3264，total/compute/registered pool bytes与DS不变。
 sanitizer门禁，也不把hash相同称为完整正确性证明。纯链路少context优势不能
 直接推广到带copy/readiness/credit的混合算子。日志
 `ring_asymmetric_dispatch_dy{,16}_ep16_t20480_quick.log`。
+
+### DZ/EA：Return依赖预计算及独立发送配额（无收益，已撤回）
+
+基于M6e `a9364f6`，inference数据面仍为DS。重测DG类假设在Return已直写
+source contribution后的收益：目的GPU发布RouteLocation并完成node join后，
+每warp规划一个Return包，将连续同C slot的行压成32B描述项
+`{ready地址, returned地址, generation, rows}`，运行时两轮仅遍历描述项。
+按remote source node分配目录，每包一个count，最坏Q项；Q>32按warp batch
+处理，跨batch可重复同slot，rows仍精确相加。新增一次plan末尾grid join；
+不增加数据面barrier，不改变双credit、payload、Reduce顺序或expected定义。
+与DG相比是当前DS数据面、独立packet count/stride目录及连续分段实现，不是
+此前从未测试过的优化方向。
+
+DZ冻结`build/static_v4_return_dependencies_dz/`，native SHA256
+`3cc1d570d07fa678137e96d390dd4b574ad419598b8720e4be3f8ab41e34616c`。
+EA在DZ基础上只把Return发送owner改为8，Dispatch/RX仍32，contexts96→72；
+Return本地发布warp随之增加24，未增加独立prepared队列或动态领取。
+EA冻结`build/static_v4_return_dependencies_ea8/`，native SHA256
+`ded0efce21f248b0f809273fa4e63152494729b36ccf40ee3962bea9c0f76779`。
+两者保存完整source patch及资源报告，network inference均为
+REG168/STACK416/SHARED2048/LOCAL0/CONSTANT3264。
+
+两机1620MHz，EP16 T20480，B512/D8，计时无并发CPU构建或其它GPU工作：
+
+|候选|采样（warmup/samples/batch）|p50/us|min–max/us|plan rank-max/us|
+|---|---|---:|---:|---:|
+|DZ|10/2/2|7016.590|7016.590–7096.020|430.368|
+|DZ|10/20/20|7150.980|7112.710–7195.290|433.056|
+|相邻M6e基线|10/20/20|6991.460|6961.910–7034.520|421.952|
+|EA8|10/2/2|7134.980|7134.980–7154.660|432.768|
+
+四份结果各16个输出hash均与DS/M6e一致，不等于完整数值/sanitizer通过。
+DZ正式比相邻基线慢2.28%；候选pool从880745920增加到883377600bytes/rank，
+其中新增2631680bytes全为compute metadata，注册区仍127194880bytes/rank。
+EA没有逆转退化，不继续16-owner组合或四规模完整门禁。全部八个既有文件
+改动及新helper已撤回，可由冻结patch恢复；没有把失败候选留成生产分支。
+日志`return_dependencies_{dz,ea8}_ep16_t20480_*`及
+`return_dependencies_dz_baseline_ep16_t20480_formal.log`。
