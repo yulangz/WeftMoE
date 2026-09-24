@@ -579,7 +579,7 @@ struct ForwardWeightLease::Impl {
   CUtensorMap backward_w2_map{};
 
   void initialize_prefill_maps() {
-    if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
+    if constexpr (forward_tuning::kStaticV4PrefillEnabled) {
       using Gemm = forward_tuning::StaticV4Gemm<true>;
       prefill_w1_map = make_bf16_tma_map(
           const_cast<transport::BFloat16 *>(w1_interleaved), hidden,
@@ -5129,10 +5129,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           forward_main_compute_ctas < std::max(args.static_network.contexts,
                                               2U * args.static_network.ring_workers + 1U))
         throw std::invalid_argument("static network ring requires CTAs for copy and compute progress");
-      const bool prefill = static_v4_enabled &&
-                           forward_tuning::kStaticV4PrefillMinTokens &&
-                           id.num_tokens >=
-                               forward_tuning::kStaticV4PrefillMinTokens;
+      const auto prefill_min = use_gin
+          ? forward_tuning::kStaticV4NetworkPrefillMinTokens
+          : forward_tuning::kStaticV4PrefillMinTokens;
+      const bool prefill = static_v4_enabled && prefill_min &&
+                           id.num_tokens >= prefill_min;
       using PrefillGemm = forward_tuning::StaticV4Gemm<true>;
       const auto fc1_n = prefill ? PrefillGemm::kFc1N
                                  : forward_tuning::kFc1TileN;
@@ -5184,7 +5185,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             kStaticUnified = use_gin
                 ? unified_forward_entry<false, false, true, false, true>()
                 : unified_forward_entry<true, false, true, false, true>();
-          if constexpr (forward_tuning::kStaticV4PrefillMinTokens) {
+          if constexpr (forward_tuning::kStaticV4PrefillEnabled) {
             if (prefill) {
               if (args.ring.depth)
                 kStaticUnified = use_gin

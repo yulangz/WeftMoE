@@ -265,8 +265,16 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS
 #define WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS 0
 #endif
+#ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS
+#define WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS \
+  WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS
+#endif
 inline constexpr unsigned kStaticV4PrefillMinTokens =
     WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS;
+inline constexpr unsigned kStaticV4NetworkPrefillMinTokens =
+    WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS;
+inline constexpr bool kStaticV4PrefillEnabled =
+    kStaticV4PrefillMinTokens || kStaticV4NetworkPrefillMinTokens;
 inline constexpr unsigned kStaticV4MathRegisters =
     WEFTMOE_FWD_STATIC_V4_MATH_REGISTERS;
 inline constexpr unsigned kStaticV4ControlRegisters =
@@ -436,7 +444,7 @@ template <bool Prefill> struct StaticV4Gemm {
   static constexpr unsigned kFc1Stages = Prefill ? 2U : kStaticV4Fc1Stages;
   static constexpr unsigned kFc2Stages = Prefill ? 2U : kStaticV4Fc2Stages;
 };
-static_assert(!kStaticV4PrefillMinTokens ||
+static_assert(!kStaticV4PrefillEnabled ||
                   (kTileM == 128U && kFc1TileN == 64U && kFc2TileN == 128U &&
                    kStaticV4TileK == 128U && kStaticV4Fc1Stages == 3U &&
                    kStaticV4Fc2Stages == 3U && kFc2ClaimTiles == 1U),

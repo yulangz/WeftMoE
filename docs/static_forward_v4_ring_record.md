@@ -2925,8 +2925,189 @@ Put提交13.184/16.704 us；scatter为51.712/61.632 us。上述本GPU匹配样�
 发布结束→全包ready观察为19.840/29.632 us，发布结束→Put为59.264/71.104 us。
 不同样本集合的分位数不可相加解释端到端；插桩时延也不替代CW正式7018.410 us。
 
-本机NCCL proxy Put会构造/提交描述符，可能等待queue credit，所以不能将
-Put返回后的时间点全部归因于C-ready轮询。下一步分别考察重复route/location
-查询与RX scatter；不改变双credit、release范围或数值顺序。
+Put返回后的时间点不能全部归因于C-ready轮询。此处曾依据RMA_IB_PROXY日志
+解释为GIN proxy描述符/队列开销，但这是错误的后端归因，见下方实际devComm
+核验；时间线数值不变。后续分别考察重复route/location查询与RX scatter，
+不改变双credit、release范围或数值顺序。
 原始日志/JSON为 `ring_{adaptive_return,return_control}_b512_d8_ep16_t20480_timeline*`，
 包级同GPU匹配脚本和结果另归档于build目录；通用分析器已识别新增事件。
+
+### CZ：RouteLocation 预绑定 destination（无收益，已撤回）
+
+在CY/CW上，利用RouteLocation原有4-byte padding保存destination rank，
+结构仍24 bytes。原有destination planner写入，Return ready/retirement
+直接读取，不再额外gather selected_experts并除以owned_experts。
+不改变Pull的过滤策略、分包/分组、原子次数、静态owner或发布范围；没有
+新增buffer/barrier，也不混入已撤回的CX warp方案。依据CY的控制面诊断进行
+小改动消融，正在编译；收益与完整融合kernel门禁尚未确认。
+
+CZ native SHA256 `3007cb027b4063ce219f3735157e0328ea8032cecffa03a0062acfede270bb2f`，
+REG168/STACK432/LOCAL0，冻结 `static_v4_ring_return_location_destination/`。
+无并发构建四规模快筛278.576/334.528/3009.100/7000.930 us，64 hashes和
+所有pool bytes与CW一致。初测基本持平，不能把少一次gather或stack少8 bytes
+当成已证实的加速；尚未继续library/完整门禁。
+
+CZb仅再将ready地址中的`destination%local_world`换成
+`destination-node*local_world`。Return packet已限定本compute node，目的GPU
+必在本节点区间，故不需逐行除法取模；没有新增前提、检查或协议字段。
+独立构建 `static_v4_ring_return_location_relative/`，待性能筛选。
+
+CZb native SHA256 `11008fc1c6504eee830148d5e25b31e94a137541201a215e48f5492c75231034`，
+REG168/STACK432/LOCAL0。无并发构建四规模快筛为
+280.128/336.048/3001.680/7028.080 us，64 hashes与全部pool bytes与CW一致。
+CZ/CZb均未见稳定收益，三个源文件的候选改动已撤回，保留冻结patch/二进制；
+没有继续library、完整PyTorch或sanitizer门禁。
+
+补充CW的单机profile边界正式基线（第二节点、无并发任务、1620MHz、10/20/20）：
+T256/512/1024的decode为176.498/245.642/328.502 us，日志
+`ring_adaptive_return_profile_decode_remote_ep8_*`。同通信版本的强制prefill
+对照尚待完成；不直接用早先CF数据宣布最终阈值。
+
+同一第二节点再测冻结V3四规模正式为300.432/370.392/1488.160/3299.860 us，
+32 hashes与CW一致。相对本节CW的EP8正式，V4分别降低66.47%/63.44%/15.09%/
+10.34%。日志 `ring_adaptive_return_adjacent_v3_remote_ep8_*`；此轮只更新单机
+对照，不冒充双机V3新测量。计时节点无并发CPU构建或其它GPU任务。
+
+### DA：Return ready 扫描缓存退休组（无收益，已撤回）
+
+基于CY/CW，不含CZ/CZb或CX。仍由单lane owner扫描全包ready；成功acquire一个
+新的连续C slot组时，将slot指针与行数缓存在其闲置的Return TX row-copy SMEM。
+只有整个packet均ready后才按缓存退休，未ready重试不产生任何退休；不再第二次
+gather routes/selected_experts/locations。组数至多Q，复用原两个staging segment，
+不新增SMEM/GM分配或同步；静态owner、双credit、GIN提交及release范围均不变。
+正在构建验证，尚无数值或性能结论。
+
+DA native SHA256 `342055207d9415277ea37d716f8e2b4f409ef5e2f35f30e1984d9b7b848c2405`，
+REG168/STACK432/LOCAL0，冻结 `static_v4_ring_cached_return_retirement/`。
+无并发构建的四规模快筛278.304/335.392/3021.520/7037.980 us，未见端到端收益，
+已撤回源代码，仅保留patch/二进制记录。未继续library、完整PyTorch或sanitizer。
+
+### 当前通信版本的 profile 边界对照（M5，待双机及交错复测）
+
+冻结CW/CY数据面，仅把prefill阈值强制为1；未混入DB候选。native SHA256
+`476a8788e3ed058a2257a2ad5dee520d4348f9bac19f3b4625c5025d112c8334`，
+config SHA256 `9ad387de8bb8c96a8f20f3faebd0cc3fdd13679793768d2d39bfc644c3371f70`，
+目录 `static_v4_profile_current_prefill/`。第二节点单机EP8，1620MHz、B512/D8、
+10 warmup/20 samples/batch20；计时节点无其它GPU工作或CPU构建。
+
+| T/rank | decode/us | 强制prefill/us |
+|---:|---:|---:|
+|256|176.498|188.832|
+|512|245.642|241.261|
+|1024|328.502|322.075|
+|2048|490.650|456.186|
+|4096|806.250|723.029|
+
+40 hashes全同。单机候选阈值512，尚待反向交错复测；双机独立阈值还未确认，
+未修改默认。日志 `ring_{adaptive_return_profile_decode,current_profile_prefill}_remote_ep8_*`。
+
+### DB：直接 RX Reduce + packet 聚合回收（无收益，已撤回）
+
+基于CW/CY，不含CZ/DA。移除RX→contribution scatter，Reduce从预绑定的本地
+contribution或Return RX读取，复用相同数值循环/顺序，仅以模板替换行地址选择。
+每token的所有warp lanes读取完成后release发布有界`token_done[D_contrib,B]`。
+原scatter owner保留静态channel/consume_cursor，warp检查packet涉及的全部token，
+lane0一次归还desc.rows；GIN import/ACK仍归原owner，双TX credit不变。
+token_done用`>=generation`，允许contribution先复用、旧packet后回收。
+
+与CM不同，不新增逐route大表：用24-byte RouteAddress union复用原RouteLocation
+区域。远端source副本仅写compute成员给Pull/TX；source自身副本仅写returning
+成员给Reduce。节点内Pull只读RingRow，删除其没有读者的location写入，避免
+不同成员并发写。local routes与remote packet绑定集合互斥，沿用现有plan末尾
+barrier，不额外加一轮grid同步。元数据区不属于published_bytes，不增跨机流量。
+仅网络模式新增D×B×8 bytes的token_done，主配置32KiB/rank；编译/正确性/性能待验证。
+
+DB native SHA256 `775a28c0e2bb5c29a14403dce25a148e57f7d5a8c73fb269dc052805ccb1a389`，
+REG168/STACK456/LOCAL0，冻结 `static_v4_ring_direct_rx_packet_ack/`。
+host18/18通过；无并发构建的四规模快筛281.920/348.992/3082.020/7087.680 us，
+64 hashes与CW一致。pool增量为256/4096/32768/32768 bytes/rank，registered不变。
+长短均未获益，已撤回全部七处源文件改动，不保留union、额外状态和地址accessor；
+没有继续library、完整PyTorch或sanitizer门禁。原始patch及二进制留档。
+
+单机profile反向交错补测（prefill→decode）：T512为241.466/245.411 us，
+T1024为322.469/328.950 us，与首轮选择一致；日志
+`ring_current_profile_reverse_*_remote_ep8_*`。仍未启用最终默认配置。
+
+### GIN 实际后端核验与 CY 归因纠正
+
+旧日志的`RMA/Plugin: Assigned plugin RMA_IB_PROXY`属于RMA，不能用作GIN的
+后端证据；AZ的link benchmark实际报告GDAKI。现用临时host-only hook读取
+冻结CW二进制每次成功ncclDevCommCreate返回的ginNetDeviceTypes，不改配置、
+同步或payload。16个rank的activation对象均为contexts96/connections1/types3，
+即GDAKI；Notify对象为contexts1/connections1/types3。
+日志 `ring_current_actual_gin_rank*.log`，launcher
+`ring_current_actual_gin_backend_retry.log` 正常退出，T1的16 hashes与CW一致。
+第一次hook写stderr被成功路径launcher过滤，没有留下类型证据；第二次独立
+保存逐rank stderr。hook脚本/源码仅build归档，不加入生产代码，其计时不用于性能。
+
+因此CY中关于CPU proxy队列/GFD的归因撤回。安装的GDAKI Put调用DOCA GPU
+verbs，而且当前该路径不使用传入的descriptor SMEM；不会基于proxy实现继续
+做共享内存描述符实验。已有THREAD sharing和双credit保留，未改release范围。
+
+### DC：按拓扑选择 decode/prefill 切换阈值（M5，门禁中）
+
+同CW通信、1620MHz、B512/D8、10/20/20正式双机对照；括号为反向交错复测。
+计时期间两节点无CPU构建或其它GPU任务，临时后端hook未用于以下测量。
+
+| T/rank | decode/us | 强制prefill/us |
+|---:|---:|---:|
+|512|606.181|610.050|
+|1024|756.120|753.054|
+|2048|1057.820（1057.490）|1050.750（1049.290）|
+|4096|1712.500（1712.910）|1682.990（1683.160）|
+
+首轮64及反向64 hashes相同。2048虽只降低约0.7%，但两轮均可重复，故将最初
+候选4096提前为2048；1024约0.4%的单轮差异尚不足以提前。结合上方EP8两轮，
+新配置 `configs/static_inference_ring_20260924/` 选择单机512/多机2048。
+两者仍packed gate8/up8；decode物理FC1 N64/FC2 N128/K128/stages3/3，
+prefill物理FC1 N128/FC2 N256/K128/stages2/2。没有复制通信/调度实现或权重副本。
+
+新增网络阈值宏默认继承原阈值，旧生成配置行为不变；任一入口启用prefill才
+构建相应TMA maps与kernel分支。这里只冻结已测H2048/I512配置，不将跨机2K
+阈值称为所有模型/节点数的最优值。完整数值、四规模性能及最终验收待完成。
+
+DC冻结 `build/static_v4_profiles_20260924/`，config SHA256
+`10ac19f097a5c37c4315629cfe44971a235ded1b7df15fa6a4e75908ecf0131b`，native
+`4e7d10ba7f9d66726b5f2907fe668b280204836ad45bb5d45f323a80e6d8d1a5`，library
+`5b464a5afa574534344ef0f9518053d8a9b53926a97ab3ad07ea97e3b8d488a6`。
+网络prefill REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264。
+host18/18；完整Torch的T1/64/512/2048/8192/20480与edges：EP8共288、EP16共576项
+通过，三端launcher均exit0。未改数据面协议，不把CW的小深度sanitizer冒充DC重跑。
+
+第二节点单机EP8正式四规模为100.717/135.424/1258.980/2949.830 us；
+阈值两侧T512/2048为241.928/456.106 us。同轮后续冻结V3为
+300.467/369.942/1488.860/3297.280 us。双机正式数据仍在测量。
+日志 `ring_profiles_final_{remote_ep8,adjacent_v3_remote_ep8}_t*_formal.log`、
+`ring_profiles_final_torch_ep{8,16*}.log`。
+
+DC最终双机正式计时及相邻冻结V3如下，均1620MHz、10 warmup/20 samples/batch20，
+测量时两节点无其它GPU任务或CPU构建。05:06 UTC复核全部16卡实际及应用时钟
+1620/3201MHz。DC与CW的64 hashes、全部pool/registered bytes一致，graph仍一kernel；
+与本轮V3的64 hashes也一致。单机与CW/V3的各32 hashes一致。
+
+| T/rank | 单机EP8 V3/us | 单机EP8 DC/us | 延迟降低 | 双机EP16 V3/us | 双机EP16 DC/us | 延迟降低 |
+|---:|---:|---:|---:|---:|---:|---:|
+|1|300.467|100.717|66.48%|685.624|275.669|59.79%|
+|64|369.942|135.424|63.39%|823.624|333.766|59.48%|
+|8192|1488.860|1258.980|15.44%|3357.020|3006.200|10.45%|
+|20480|3297.280|2949.830|10.54%|7096.930|7011.600|1.20%|
+
+EP16/20K total/compute/registered为913972672/820332216/93640448 bytes/rank，
+未因profile选择增加内存。两轮四规模launcher均exit0；日志
+`ring_profiles_final_{ep16,adjacent_v3_ep16}_t*_formal.log`。这些端到端数字同时
+包含已合入的ring优化，不能全部归因于DC的阈值；四个指定规模的入口本来就未变。
+M5的布局/profile选择及当前通信版本验收完成，但双机20K仅降低1.20%，整体目标
+仍未达成，ring仍opt-in、M6仍未实现。继续通信优化，不把本表作为最终交付。
+
+### DD：静态 owner 的 GDAKI 后端特化（编译失败，已撤回）
+
+尝试在每个Dispatch/Return/RX owner进入时一次判断实际GIN backend集合，
+全部GDAKI时实例化 `ncclGin_BackendOne<NCCL_NET_DEVICE_GIN_GDAKI>`，其它后端
+保留通用实现。没有修改packet、scope、counter或双TX credit。当前安装的
+NCCL2.31.2中BackendMask的put/signal调用了仅接受通用`ncclGin const&`的
+signal descriptor/counter helper，Mask8无法转换，故native编译失败。
+
+不修改系统NCCL头文件，也不为尚无性能证据的实验引入项目兼容层；已撤回三个
+源文件修改。归档 `build/static_v4_ring_gdaki_owner/from_profiles.patch` 与
+`build/build_ring_gdaki_owner_native.log`。没有可运行二进制、数值或性能结论；
+这不是GDAKI本身性能差的证据，生产路径本来已使用GDAKI。

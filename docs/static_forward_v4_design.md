@@ -18,8 +18,8 @@ opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
 Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
 数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
-优化版。纯 GEMM 基准已建立，完整布局/profile 消融和训练对接未完成，进展与
-测量见 ring 记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
+优化版。纯 GEMM 布局/profile 消融与当前通信版本的入口选择已完成，训练对接
+未完成，进展与测量见 ring 记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
 须先取得双 credit 并发布 reservation，destination 才可准入相应整窗口。
 
@@ -45,6 +45,12 @@ prefill 配置 `configs/static_inference_prefill_20260923/` 已有两个 GEMM en
 - FC1 宽入口已迁移合并写回；窄 N32 SwiGLU 输出保留直接写。
 - epilogue 复用已退休的 CTA 私有 B staging，不复用可能被另一 CTA 提前 multicast
   覆盖的 A staging。
+
+ring 验收配置 `configs/static_inference_ring_20260924/` 沿用上述两组 GEMM，
+都用 packed gate8/up8，依据当前通信版本的正反向对照将入口阈值调整为单机
+512、多机2048 tokens/rank。单机/双机在六个规模及edges的完整数值检查通过，
+四个指定规模已正式计时；阈值并非任意模型或三机以上的最优值。ring仍显式
+启用，未替换训练路径。见ring记录DC，不能将profile选择与通信改造的收益合并归因。
 
 full-arena 历史基线的 graph rank-max p50（us），核心 1620 MHz：
 
@@ -942,10 +948,14 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
   已测 N32/64/128、K64/128、stages2/3/4/6；N32 仅 packed 支持。
   AF/AJ 记录资源、完整样本与失败的 group-overlap 候选。profile 选择与
   端到端验证仍是下列独立待办，不把诊断基准结果当成融合算子性能。
-- [ ] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。
+- [x] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。
   权重更新合同及显式layer失效接口已实现，EP8/EP16的原地更新与全部token桶
-  重建通过；profile自动阈值和最终默认配置仍待完成。
-- [ ] 在同一通信版本回测 EP8/EP16 四规模；把纯 GEMM 收益和端到端收益分别落表。
+  重建通过；DC冻结packed decode/prefill及单机512/多机2048阈值，旧配置默认
+  继承原阈值。该配置仍opt-in，未宣称所有形状或所有节点数最优。
+- [x] 在同一通信版本回测 EP8/EP16 四规模；把纯 GEMM 收益和端到端收益分别落表。
+  AF/AS为纯GEMM，DC为当前CW数据面的阈值交错实验和最终四规模回归；六个
+  token桶含阈值两侧的EP8/EP16数值检查共288/576项通过。双机长序列的最终
+  性能目标仍未达成，不因M5勾选而结束后续优化。
 
 ### M6：训练 Forward tape 与 Backward 对接
 
