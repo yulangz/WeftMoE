@@ -873,3 +873,43 @@ EP8为第二节点独立测量，第一节点运行native正确性；EP16两节�
 其它GPU工作。M6h参照来自本日EM相邻EP8及M6h正式EP16，不冒充本轮交错复测。
 两拓扑均退化，三个源文件全部撤回，不继续library/完整Torch/sanitizer。
 日志`training_dual_lane_checkpoint_eo_{native_ep8,remote_ep8,ep16}_*`。
+两拓扑的48个Forward输出hash也逐字与各自M6h参照一致；EP16从原始rank记录
+提取字符串核对，没有使用JSON中已丢精度的64-bit数值。
+
+## EP：FC1大尾块复用合并写回（仅单机K1小收益，暂不采用）
+
+在M6h上将现有staging条件从完整M128放宽到至少64行，vector store只枚举
+有效行；较小尾块及窄decode保持direct。不改变G/U布局、scratch大小、barrier
+个数或数值合同。冻结目录`build/static_v4_fc1_large_tail_staging_ep/`。
+
+主矩阵E64/K4/G8/B512的均匀路由按64周期整齐分布，每窗口每expert为256行，
+因此8K/20K没有该类尾块，此项不能解释或恢复主矩阵长文差距。独立用既有K1
+基准产生每expert每窗64行，保持T/B不变做尾块消融；不拿K1时延代替K4主矩阵。
+最初K3诊断调用被既有launcher拒绝（exit2，未测量），未修改其支持合同。
+
+native SHA256 `2cbe82b693136d650e9e587e8eb0897ed2c7b7c9a7f9c149bc0b6f300b82f5e7`。
+prefill训练/推理的local/network资源与M6h相同。EP8 T512/E64/K1/B512/D8
+恰好覆盖M64尾块，两次Backward稳定，32个原始梯度hash逐字等于相邻M6h。
+第二节点独立EP8、1620MHz、10warmup/20samples的K1训练对照：
+
+|T/rank|M6h main/us|EP main/us|M6h wall/us|EP wall/us|
+|---:|---:|---:|---:|---:|
+|8192|837.664|833.952|1391.920|1388.350|
+|20480|2004.220|1990.780|2569.840|2550.300|
+|20480（反向）|2005.380|1989.540|2566.560|2552.200|
+
+四个候选/基线对照共32个输出hash一致。20K主kernel约改善0.7%–0.8%，是
+K1尾块诊断的小收益；第一节点同时有候选CPU构建，计时节点无其它任务。
+没有据此合入，源码已恢复M6h以隔离下一项配额实验；双机及完整门禁待执行。
+日志`fc1_large_tail_staging_{m6h,ep}_{native_ep8,remote_ep8}_*`。
+
+EP16同K1/B512/D8、1620MHz、10/20、无并发构建或其它GPU任务的相邻对照：
+
+|T/rank|M6h main/us|EP main/us|M6h wall/us|EP wall/us|
+|---:|---:|---:|---:|---:|
+|8192|1658.400|1649.410|2552.850|2529.620|
+|20480|3866.020|3863.420|4738.720|4737.630|
+
+32个原始字符串hash逐字一致，20K基本持平。此项未改善K4主矩阵，仅有单机K1
+约0.7%的小收益，不优先保留或新增拓扑分支。源改动已撤回，保留冻结候选和
+原始测量，未继续library/完整Torch/sanitizer。日志后缀`ep16_k1_t*_training_forward.log`。

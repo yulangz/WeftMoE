@@ -3978,3 +3978,71 @@ EN为2981.140/6928.830us；全部64个hash与M6h相同，pool容量不变。
 参照先前M6h正式2956.020/6985.870us，这些不足1%的差异不构成相邻正式收益，
 且EP8均未优于基线。未继续完整Torch/sanitizer或采用网络专属调度分支；
 两个源文件的全部候选改动已撤回。日志`{em,en}_ep16_t*_inference_quick.log`。
+
+### EQ：当前数据面的math/control寄存器配额（未获益，不采用）
+
+在M6h基线上仅通过既有编译宏将216/64改为192/120，不含EM/EN/EO/EP。
+总配额`192×256+120×128=64512`不超过实际初始`168×384`，不增加SM资源、
+改变tile/owner数或同步协议。早期AA只测到208/88且数据面尚未直写Return；
+本项检验当前GIN角色增加寄存器是否有端到端收益，不能先把stack大小等同于
+动态spill流量。冻结`build/static_v4_control_registers_eq/`及provenance，
+未改变生产默认配置，正确性/性能尚待测量。
+
+native SHA256 `fc548fb12e4be92eeae4f42021aa5fb9e94cfb464f7600131c7db47831ca83ef`。
+inference prefill local/network的STACK64/432降为16/160，REG168/SHARED2048/
+LOCAL0不变。1620MHz、B512/D8、10warmup/2samples/batch2的EP16四规模快筛：
+
+|T/rank|p50/us|min–max/us|
+|---:|---:|---:|
+|1|272.960|272.960–277.920|
+|64|333.008|333.008–333.744|
+|8192|2946.820|2946.820–3009.540|
+|20480|7051.440|7051.440–7142.990|
+
+64个输出hash与M6h逐字一致，pool不变。计时无并发构建/其它GPU工作。
+短规模接近M6h，20K未超过其6985.870us正式参考，stack下降不是端到端收益。
+不采用192/120配额，未继续library/完整数值/sanitizer；生产仍216/64。
+日志`control_registers_eq_ep16_t*_inference_quick.log`。
+
+### ER：网络消费者等待中的轮询间隔（无收益，撤回）
+
+独立于EQ/EP，基于M6h原216/64配额。在network Pull等准入/source reservation/
+RX ready、local Return等FC2、Reduce等route-ready的未满足循环中，复用既有
+64ns transport nanosleep。只有等待失败才延后下一次acquire；成功路径、每代
+目标、ready发布和credit作用域均不变。不修改GIN TX/RX/ACK owner循环，也不
+影响单机specialization。用来检验阻塞消费者的紧密轮询是否拖慢共享L2/控制流，
+不预先认定这是瓶颈。等待现有双机测量完成才构建，避免CPU竞争。
+
+native SHA256 `9b75ed5e9d85575d458ee2f76144670241663173c8fef34cc7d6ddcb795bdb80`，
+冻结`build/static_v4_network_consumer_backoff_er/`。1620MHz、B512/D8、
+10warmup/2samples/batch2、无并发构建/其它GPU任务：四规模分别为
+280.448/336.080/2966.160/7082.000us，64个hash与M6h一致，pool不变。
+没有端到端收益，两个源文件的候选改动已撤回；未继续library/完整数值/
+sanitizer。日志`network_consumer_backoff_er_ep16_t*_inference_quick.log`。
+
+### ES：以批量flush完成序号代替逐包本地counter通知（构建中）
+
+基于M6h原配额/原调度，不含ER轮询改动。保留逐slot远端consumed credit，
+本地credit改为唯一TX owner维护的channel级`tx_completed_head`，复用
+NetworkChannel原64-byte结构的末尾padding，不增payload/control容量。
+
+Put仍携带自己的weak ready signal，但localAction改为None。首次将要复用
+某TX slot时，若其上一代sequence尚不小于completed_head，则通过GIN
+`flushAsync(peer)`、`wait(request)`确认该context对该peer的已发Put本地完成，
+再将head推进到当前tx_cursor。成功之后才发放TX reservation/覆盖Dispatch TX。
+Return reservation从不超过`tx_cursor+depth`，所以被复用的上一代一定已经
+发出；flush不等待未发出的未来FC2或对方软件消费。其它TX/RX/ACK owner独立
+推进，不在等待中持有共享软件锁。terminal同样flush全部已发包，并等逐slot
+远端credit；下一调用只有完全drain后才用tx_base初始化completed_head。
+
+一个context在多节点或更多channel时可以覆盖多条channel的Put，但本候选只
+推进被检查channel的head，保守地允许额外flush，不错误推断别的owner已完成。
+这保留了远端与本地两项条件，并非仅凭远端ACK删除本地completion；也不使用
+skip-credit-check、aggregate-doorbell等后端可选优化。
+
+依据已安装头文件及[NCCL 2.31.2 GDAKI实现](https://github.com/NVIDIA/nccl/blob/v2.31.2-1/src/include/nccl_device/gin/gdaki/gin_gdaki.h)：
+逐包counter涉及companion QP，而无Get的flush记录已发SQ位置、wait确认相应完成。
+源缓冲区复用仍依赖显式本地完成，见[GIN合同](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/api/device_gin.html)。
+这只是成本假设，flush等待也可能降低并发度。首轮为隔离协议比较，保留尚未使用
+的counter编号预留/reset及slot local_target字段；只有性能与协议门禁获益后才
+清理这些冗余，不把候选当最终代码。正确性、性能、资源及小ring反复复用待验证。
