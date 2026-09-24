@@ -3128,6 +3128,10 @@ REG168/STACK440/LOCAL0；无并发构建的四规模快筛为
 未获得明确端到端收益，不采用Q64，不继续library、完整Torch或sanitizer。
 源码没有增加Q64分支，默认仍Q32；归档provenance及四规模日志。
 
+归档更正（后续DU实验）：本目录名被误复用，DE原native及四份快筛日志被覆盖，
+原始产物尚未恢复。原provenance、source commit a0fd05f、构建日志与上表汇总仍在；
+DU新产物已移至带编号的独立目录，不能拿它重算或验证DE。此处明确保留证据缺口。
+
 ### DF：Return 复用已完成的 system release（正式无收益，已撤回）
 
 独立基于DC/Q32，不混入DE/Q64。FC2普通peer stores→device fc2_done release
@@ -3539,3 +3543,25 @@ DS按完整数值/复用/内存门禁保留，主要记内存和复制简化收�
 78,953,408/108,686,528/545,865,920/895,741,376bytes/rank。较大Dispatch包
 没有提高当前端到端吞吐，且增加有界payload；长序列明显回退，不继续正式计时
 或完整数值门禁，不改变当前Q8。日志`ring_direct_return_dispatch16_ep16_t*_quick.log`。
+
+### DU：DS直写contribution后Return Q64（无稳定收益，不采用）
+
+仅将DS的Return Qmax32编译为64，Dispatch Q8/L32/B512/D8不变；与DE区别是
+本版本已无Return RX payload和scatter。训练host准备模块同时在源码中，但native
+inference benchmark不创建/调用它，不改变本实验GPU数据面。
+
+冻结`build/static_v4_ring_ds_return_q64_du/`，native SHA256
+`8c803f715409d879e19dd0d0728cdda59d7962dba2fcb76ad4afac7fd674d988`。
+1620MHz、10warmup/2samples/batch2、无并发构建/GPU任务，四规模如下：
+
+| T/rank | p50/us | measured min–max/us | total bytes/rank |
+|---:|---:|---:|---:|
+|1|279.040|279.040–289.840|95,730,624|
+|64|338.336|338.336–586.416|125,468,864|
+|8192|3015.620|3015.620–3018.990|563,331,264|
+|20480|6966.300|6966.300–7033.020|914,238,912|
+
+全部64hashes与DS一致。T64有明显离群，20K两样本相差67us，不能以较小样本
+的约20us优势判定收益；8K回退约2%，20K注册区增加33,492,992bytes/rank。
+不继续正式门禁，不改变Q32。日志`ring_ds_return_q64_du_ep16_t*_quick.log`。
+本轮发现并纠正了上述DE目录重名，不将已被覆盖的历史日志声称为仍可复核。
