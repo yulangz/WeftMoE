@@ -3565,3 +3565,31 @@ inference benchmark不创建/调用它，不改变本实验GPU数据面。
 的约20us优势判定收益；8K回退约2%，20K注册区增加33,492,992bytes/rank。
 不继续正式门禁，不改变Q32。日志`ring_ds_return_q64_du_ep16_t*_quick.log`。
 本轮发现并纠正了上述DE目录重名，不将已被覆盖的历史日志声称为仍可复核。
+
+### DV：DS Return ready 由整 warp 并行发布（无明确收益，已撤回）
+
+基于`652b9f5`，inference数据面仍为DS。lane0 acquire packet的visible generation
+后，通过warp join将可见性传给其余lane；按lane residue发布各route ready，再
+warp join，由lane0提交全部rows的consumed credit并推进唯一cursor。没有改变
+Put、双credit、source contribution窗口的Reduce回收或求和顺序，内存容量不变。
+这是DS RX端的纯ready发布，不是CX的TX端ready/retirement元数据协作读取。
+
+冻结`build/static_v4_ring_ds_return_ready_warp_dv/`，native SHA256
+`f01def1c3ed4166e2c23384668f5bdaee59b432db1b55219c04ef3092355c1f5`，保存patch及
+provenance。network prefill/decode仍REG168、STACK432/440、SHARED2048、LOCAL0、
+CONSTANT3264。1620MHz、Q8/Q32/L32/B512/D8，无并发CPU构建或其它GPU任务：
+
+| T/rank | quick p50/us | quick min–max/us |
+|---:|---:|---:|
+|1|277.824|277.824–281.552|
+|64|332.816|332.816–336.848|
+|8192|2971.420|2971.420–2989.760|
+|20480|6954.140|6954.140–6966.180|
+
+快筛均为10warmup/2samples/batch2，64个hash与DS一致。随后20K相邻DS→DV正式
+对照使用10warmup/20samples/batch20：DS p50 **7009.690us**（6982.130–7042.930），
+DV **6982.520us**（6956.530–7023.530），仅降低0.39%，区间明显重叠。8K快筛也
+不优于DS历史正式2955.570us，不能宣称局部并行化带来明确端到端改善。本轮没有
+反序正式复测，也未继续library/Torch/sanitizer门禁；选择保留简单的原lane0发布，
+所有CUDA改动撤回。日志`ring_ds_return_ready_warp_dv_ep16_t*_quick.log`和
+`ring_ds_return_ready_warp_dv_{ds,dv}_ep16_t20480_formal.log`。
