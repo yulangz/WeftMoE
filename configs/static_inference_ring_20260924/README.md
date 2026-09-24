@@ -7,7 +7,7 @@ EP16 从 2048 tokens/rank 切换至宽 tile；均采用 packed gate8/up8。
 构建时选择本目录，并保持所有翻译单元使用相同的 packet 配置：
 
 ```sh
-export NVCCFLAGS="-I$PWD/configs/static_inference_ring_20260924 -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -DWEFTMOE_FWD_STATIC_V4_NETWORK_LANES=32 -DWEFTMOE_FWD_STATIC_V4_PACKET_ROWS=8 -DWEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS=32"
+export NVCCFLAGS="-I$PWD/configs/static_inference_ring_20260924 -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -DWEFTMOE_FWD_STATIC_V4_NETWORK_LANES=32 -DWEFTMOE_FWD_STATIC_V4_PACKET_ROWS=8 -DWEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS=16"
 python3 build_native.py lib --jobs 8 --output build/static_v4_profiles_20260924/libweftmoe.so
 ```
 
@@ -21,6 +21,8 @@ export WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS=8
 
 详细消融、数值验收与未完成项见
 [ring 记录](../../docs/static_forward_v4_ring_record.md) 的 DC 节及后续验收。
+Return Qmax16见ET：在ES完成机制上，双机8K约快1.2%、20K约快0.4%–0.5%，
+pool少约16.7 MB/rank；训练Forward对照持平，单机计算代码不变。
 训练对接、实际容量分配和性能限制见
 [训练记录](../../docs/static_forward_v4_training_record.md) 的 M6d–M6h。
 权重原地更新前须调用 `invalidate_inference_layer` 并重建相应 graphs；

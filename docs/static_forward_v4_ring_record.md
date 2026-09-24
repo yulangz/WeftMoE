@@ -4146,7 +4146,7 @@ ES两轮、相邻M6h及V3长文输出hash逐字相同；ES pool与M6h不变。�
 完整门禁只针对冻结ES artifact；EU的Return区间候选未编译、不包含在本次提交。
 此milestone不是整体任务完成：EP16长文显著领先和训练Forward性能仍待优化。
 
-### ET：ES完成机制下重测较小Return包（待测）
+### ET：ES完成机制下重测较小Return包（已验收，采用profile Q16）
 
 只将Return Qmax32降为16，基线为清理后的ES，Dispatch Q8/L32/B512/D8、
 216/64寄存器与静态owner不变。此前CN的Q16早于DS直写contribution和ES去除
@@ -4154,3 +4154,92 @@ ES两轮、相邻M6h及V3长文输出hash逐字相同；ES pool与M6h不变。�
 假定小包更快。冻结`build/static_v4_return_q16_et/`，native SHA256
 `511b129cb107c04406546a14cc773c571ded5bfcb630e4461472c4c366451e5d`。
 仅使用既有编译参数，不改变生产默认Q32；测量会等ES门禁及所有构建结束。
+
+1620MHz、B512/D8、无并发构建/其它GPU任务。10warmup/2samples/batch2的
+EP16快筛：1/64/8192/20480为267.584/320.272/2923.460/6911.570us，全部64
+输出hash与ES相同。随后ET→ES正式10/20/batch20：
+
+|T/rank|Q16 ET p50/us|min–max/us|Q32 ES p50/us|min–max/us|
+|---:|---:|---:|---:|---:|
+|8192|2905.630|2898.260–2915.430|2940.800|2931.750–2944.730|
+|20480|6899.340|6887.840–6914.270|6928.370|6913.100–6947.730|
+
+8K约改善1.20%、20K约0.42%，仍是小收益，不取代最终V3性能目标。
+四规模ET pool为45,398,976/75,137,216/513,073,344/864,091,584 bytes/rank，
+比ES少约16.7MB；增加Return目录容量的代价已包含，不能只计TX减少的部分。
+prefill inference/training资源与ES相同（REG168/STACK392或408/SHARED2048/LOCAL0）。
+ET未包含EU的运行时Return区间搜索，library/完整数值/sanitizer及训练对照待完成。
+日志`batched_local_completion_return_q16_et_ep16_t*_quick.log`及
+`return_q16_compare_{return_q16_et,es_final}_ep16_t*_{quick,formal}.log`。
+
+ET单机EP8隔离正式10/20/batch20为100.658/135.410/1276.780/2960.300us，
+全部32个输出hash及pool与ES一致。第一节点同期有CPU library构建/native数值
+检查，测量节点无其它任务。单机prefill的16921行Function+instruction与ES
+完全相同（SHA256 `bd47119262cbb9a142a0ed189f0b7ee38bce236c4d48206cfaba2da45727feb1`），
+不把长序列的小幅计时变化归给Q16。native EP8 T512/E16/K6/B512/D8及
+EP16 T64/E32/K6/B16/D1两次Backward稳定，96个原始梯度hash等于ES/M6h。
+日志`return_q16_et_{remote_ep8,native_ep8,native_ep16}_*`；完整Torch/sanitizer尚待完成。
+
+ET完整EP16 Torch训练1/64/8192均衡、20480热点均通过；1/64各含32次分配失败、
+16次重试、48次live-tape/payload复用。专用inference完整矩阵480条PASS，
+B16/D1/K8短序列与edges304条PASS。T64热点/B16/D1的rank0/15 memcheck
+各0 errors，限定planner及Forward的racecheck各0 hazards/0 errors/0 warnings，
+两种sanitizer运行的应用检查均完成。Backward racecheck仍沿用已记录的工具限制，
+不将Forward过滤结果称为全Backward clean。
+library SHA256 `5f41c286aa0db5a179ec163f905ac060d528f450b126f4955d7bcdee64cc5345`；
+extension SHA256 `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+ET library在ES干净源码上构建，未包含EU；EP8计算指令与ES相同，未重复整个
+EP8 Torch矩阵，复用ES该部分验收，并新增上述ET单机native及四档正式检查。
+日志`return_q16_et_torch_ep16_*`；memcheck日志PID445858/308702，
+Forward racecheck日志PID446543/309076。16:21两节点全部SM/graphics仍为1620MHz，
+开始EU独立快筛及ET短序列、20K反向和训练Forward对照；正式计时不并行构建。
+
+ET短序列正式1/64为268.322/317.466us。20K反向ES→ET正式为
+6924.510→6890.090us，ET范围6880.240–6906.940us、ES范围6914.470–6937.960us，
+再改善0.50%，与首轮方向一致；全部64个输出hash仍等于ES。基于ES本轮冻结V3
+7108.080us，ET20K约快3.07%，不是新的同轮V3复测。日志
+`return_followup_{es,et}_ep16_t*_{formal,training_forward}.log`；训练对照继续执行。
+
+训练Forward对照完成，10warmup/20samples、eager保留tape，B512/D8：
+
+|T/rank|ES main/us|ET main/us|ES wall/us|ET wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3461.790|3445.340|4282.190|4250.800|
+|20480|8299.040|8300.320|9271.490|9263.080|
+
+四份原始rank日志共64个输出hash一致；20K仅0.015%差异，8K样本范围重叠，
+按训练持平处理，不声称训练性能恢复。wall含Notify→buffer→Forward，与main
+及inference graph分别报告。全部计时结束前未启动EV构建。
+采用ET作为本目录的推荐编译配置，只改既有Return Q参数，通用默认宏仍不变；
+不新增Q16专用运行时路径。当前EP8正式四档100.658/135.410/1276.780/2960.300us，
+EP16四档268.322/317.466/2905.630/6890.090us；8K使用首轮ET正式，其余为
+后续正式轮次，不伪称同一轮交错矩阵。完整数值范围及单机复用证据见上文。
+
+### EU：运行时跳过Return连续块内部的路由读取（未获一致收益，撤回）
+
+独立基于ES、Return Q32，不含ET。Return packet是单窗口expert-major路由
+数组的连续区间，同一expert的source ordinal映射到严格递增逻辑行。因此
+`(expert, logical Mblock)`形成连续run：先探测末行，必要时二分首个不同项。
+ready检查和退休分别走run，returned仍按精确行数累加，不增加plan pass、
+buffer、barrier或运行时依赖记录。expert必须参与比较，不能仅比较会复用的
+物理slot。原线性实现已合并ready/acquire及retirement RMW，本候选只减少
+run内部的不可变route/location读取，不将其误记为再次减少RMW。
+
+冻结`build/static_v4_return_run_search_eu/`，native SHA256
+`7a8e492f54e38fdebc795dfa0cab35174cae64606209fbadafae012724ceca63`，
+网络prefill资源与ES相同（REG168/STACK392或408/SHARED2048/LOCAL0）。
+1620MHz、无并发构建/GPU任务，10warmup/2samples/batch2：
+8K为2914.990us（2914.990–2932.900），20K为6980.060us
+（6980.060–7028.270）；32个hash及pool与ES一致。8K有改善迹象，但20K
+未优于ES约6925us的正式对照，不能从减少读取推导端到端收益。未继续完整
+数值/sanitizer，已撤回唯一源文件改动，不保留额外搜索逻辑。日志
+`return_followup_eu_ep16_t*_quick.log`。
+
+### EV：将网络packet ring最小深度从8降到4（候选，尚未测量）
+
+基于ES源码及ET的Q16配置，只修改host布局的最小depth。仍取
+`max(4, ceil(B*K/(ReturnQ*lanes)))`，不减少最坏整窗口Return reservation，
+所有逐slot远端credit及显式本地完成条件不变。source contribution深度D仍8，
+底层NIC queue仍1024；三种深度不可混同。此改动同时减少Dispatch缓冲容量，
+可能影响重叠，因此先独立测量，不预先宣称收益。冻结草稿位于
+`build/static_v4_network_depth4_ev/`，不包含EU。

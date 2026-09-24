@@ -45,6 +45,9 @@ ES将网络Forward逐包本地completion通知改为owner私有的已完成发�
 仍保留远端逐slot credit和GIN显式本地完成。数值/复用/sanitizer门禁通过，
 20K inference相邻对照再改善约0.6%–0.7%，训练Forward在反向对照中持平；
 双机20K相对V3仍只快约2.5%，整体性能目标尚未关闭。具体合同见6.4。
+ET随后将验收profile的Return Qmax32改为16，完整双机门禁通过，8K相邻对照
+约改善1.2%、20K正反向约改善0.4%–0.5%，并少约16.7 MB/rank。训练Forward
+持平；双机20K相对上述V3参考约快3.1%，仍未关闭整体长文性能目标。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -669,7 +672,7 @@ TX owner acquire 全包实际引用的 blocks 后直接 Put，不再复制 C→T
 按行退休的 returned 仍防止 descriptor/ready 镜像提前换代；它不授予 TX
 复用权。TX 从预留、FC2 写入、发送直至双 credit 返回始终归本代所有。
 CO 删除已无读者的 C 数据区和 ring output-store TensorMap，非 ring 路径不变。
-当前调优候选为 Dispatch Q8 / Return Qmax32 / L32 / B512 / contribution D8；
+当前验收profile为 Dispatch Q8 / Return Qmax16 / L32 / B512 / contribution D8；
 编译默认和最终 profile 尚未切换，正式数值与性能见 ring 记录。
 
 CV 将准入warp的检查按source rail分摊，再检查各source实际覆盖的packet lanes；
@@ -677,7 +680,7 @@ CV 将准入warp的检查按source rail分摊，再检查各source实际覆盖�
 `ReturnQ=min(Qmax, pow2ceil(ceil(min(source_tokens,B)*K/lanes)))`，最小1。
 source planner及所有destination使用同一公式，不使用各自的token数；物理
 TX/RX slot stride仍按Qmax。实际B被pool裁到max_tokens时也使用此公式。
-主测T1/T64分别为Q1/Q8，长窗口仍Q32；两节点不等长和混合profile已验证。
+主测T1/T64分别为Q1/Q8，长窗口Q16；两节点不等长和混合profile已验证。
 Q小于Qmax时每window至多一个packet/lane，故原depth仍足够；目录每peer/window
 容量上界改为`max(lanes, ceil(B*capacity_top_k/Qmax))`并受总routes上界限制。
 CV/CW完整门禁与正式结果见ring记录；明确收益在短序列，长序列未明显改善。

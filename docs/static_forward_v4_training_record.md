@@ -939,3 +939,22 @@ shared-atomic racecheck工具限制；附带graph检查是inference，不是训�
 日志`batched_local_completion_{m6h,es_final}_ep16_t*_training_forward*.log`。
 采用ES的理由是保持双credit合同并简化实现、改善inference，不是恢复了训练
 Forward相对V3的差距；该项性能目标仍未完成。
+
+### ET：Return Q16对训练Forward的回归
+
+在已验收ES上仅将profile Return Qmax32降至16，保持Dispatch Q8/L32/B512/D8。
+EP16四档训练与20K热点通过，短序列包含分配失败/重试及三份live tapes复用；
+rank0/15热点B16/D1的memcheck为0，限定Forward/planner的racecheck为0。
+没有重测或声称完整Backward racecheck clean。native EP8/EP16两次Backward
+共96个梯度hash等于ES；EP8计算指令完全不变，复用ES完整Torch矩阵。
+
+1620MHz、无并发构建/GPU任务、10warmup/20samples的eager retained-tape对照：
+
+|T/rank|ES main/us|ET main/us|ES wall/us|ET wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3461.790|3445.340|4282.190|4250.800|
+|20480|8299.040|8300.320|9271.490|9263.080|
+
+64个原始output_hash字符串一致。训练持平，不把小幅差异报告为收益；采用Q16
+是因inference稳定小幅改善及缓冲区减少。主计算、含Notify/buffer的wall和
+inference graph口径不同。日志`return_followup_{es,et}_ep16_t*_training_forward.log`。
