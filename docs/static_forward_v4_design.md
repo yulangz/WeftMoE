@@ -18,8 +18,8 @@ opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
 Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
 数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
-优化版。纯 GEMM 布局/profile 消融与当前通信版本的入口选择已完成，训练对接
-未完成，进展与测量见 ring 记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
+优化版。纯 GEMM 布局/profile 消融与当前通信版本的入口选择已完成；训练对接
+已接通，完整门禁仍未完成，见下方M6及训练记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
 须先取得双 credit 并发布 reservation，destination 才可准入相应整窗口。
 DS进一步让远端Return直写source注册区中的expert-major contribution窗口，
@@ -38,6 +38,9 @@ M6g补齐ring训练的unified Backward配置，并让Backward独立选择sender�
 不再误读静态Forward的零legacy-sender配置。EP8/EP16数值、小ring热点、
 memcheck及inference正式矩阵回归通过；20K Backward从原split的5707/14571us
 恢复到4917/6874us，接近冻结V3。训练Forward长文性能门禁仍未关闭，详见训练记录。
+M6h复用已退休的FC1 B staging合并G/U checkpoint写回，不增加共享内存或barrier；
+20K训练main单机约改善1.5%、双机约0.7%。数值、热点复用、memcheck、Forward
+racecheck及inference正式矩阵通过，不能据此关闭上述整体性能门禁。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -66,7 +69,7 @@ ring 验收配置 `configs/static_inference_ring_20260924/` 沿用上述两组 G
 都用 packed gate8/up8，依据当前通信版本的正反向对照将入口阈值调整为单机
 512、多机2048 tokens/rank。单机/双机在六个规模及edges的完整数值检查通过，
 四个指定规模已正式计时；阈值并非任意模型或三机以上的最优值。ring仍显式
-启用，未替换训练路径。见ring记录DC，不能将profile选择与通信改造的收益合并归因。
+启用，未改变默认非ring训练路径。见ring记录DC，不能将profile选择与通信改造的收益合并归因。
 
 full-arena 历史基线的 graph rank-max p50（us），核心 1620 MHz：
 
@@ -1054,6 +1057,9 @@ materialized Notify随已有status下载保存逐专家M128取整后的总行数
 - [x] 训练profile解耦（M6g）：unified Backward及独立sender配额，旧计划0取
   Backward默认16；数值、热点/多tape、memcheck和正式性能回归通过。Backward
   恢复到冻结V3附近，未宣称训练Forward或完整训练性能门禁完成。
+- [x] 合并训练G/U checkpoint写回（M6h）：复用退休B arena及已有barrier，
+  单/双机数值与Forward专项sanitizer通过，长文main有小幅收益；修复纯GEMM
+  诊断helper接口并通过packed/separated回归，不作为重新选择layout的证据。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 

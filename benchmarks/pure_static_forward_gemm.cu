@@ -68,6 +68,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
   constexpr unsigned kHidden = Hidden;
   constexpr unsigned kAStageElements = 128U * TileK;
   constexpr unsigned kFc1BStageElements = Fc1TileN * TileK;
+  constexpr unsigned kFc1BStorageElements =
+      (Packed ? 1U : 2U) * Fc1StageCount * kFc1BStageElements;
   constexpr unsigned kFc2BStageElements = Fc2TileN * TileK;
   constexpr unsigned kFc2Iterations = Intermediate / TileK;
   constexpr unsigned TileN = Fc1 ? Fc1TileN : Fc2TileN;
@@ -90,7 +92,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
   const ForwardKernelArgs a{Hidden, Intermediate};
   for (unsigned work = blockIdx.x / 2U; work < block_count * (Ntiles / 2U);
        work += gridDim.x / 2U) {
-    const auto block = blocks[work / (Ntiles / 2U)];
+    const auto mblock = work / (Ntiles / 2U);
+    const auto block = blocks[mblock];
     const auto row = block.row, valid_rows = block.rows;
     const auto n_tile = 2U * (work % (Ntiles / 2U)) + (blockIdx.x & 1U);
     const auto n = n_tile * TileN;
@@ -123,8 +126,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
     } else {
       if constexpr (Fc1 && Packed) {
 #include "fc1_packed_math.cuh"
-        static_v4_store_fc1_tile<Fc1TileN>(a, smem_b, accum, output, gates, row,
-                                           valid_rows, n / 2U);
+        static_v4_store_fc1_tile<Fc1TileN, kFc1BStorageElements>(
+            a, smem_b, accum, output, gates, row, valid_rows, n / 2U, mblock);
       } else if constexpr (Fc1) {
 #include "fc1_separated_math.cuh"
         // Present the two fragments to the same production SwiGLU epilogue.
@@ -137,8 +140,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
             packed[8U * index + value] = accum_a[4U * index + value];
             packed[8U * index + 4U + value] = accum_b[4U * index + value];
           }
-        static_v4_store_fc1_tile<2U * Fc1TileN>(a, smem_b, packed, output,
-                                                gates, row, valid_rows, n);
+        static_v4_store_fc1_tile<2U * Fc1TileN, kFc1BStorageElements>(
+            a, smem_b, packed, output, gates, row, valid_rows, n, mblock);
       } else {
 #include "fc2_math.cuh"
         // Both readers finish before reusing CTA-private B, never multicast A.

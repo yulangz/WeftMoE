@@ -1110,7 +1110,8 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MathEnd, Compute, 0U, task,
                                     execution_epoch(a));
 
-            static_v4_store_fc1_tile<Fc1TileN, RetainBackwardState>(
+            static_v4_store_fc1_tile<Fc1TileN, kConfiguredBStorageElements,
+                                     RetainBackwardState>(
                 a, smem_b, accum, s, canonical_gates, row, valid_rows, n / 2U,
                 mblock);
           } else {

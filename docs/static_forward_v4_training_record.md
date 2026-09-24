@@ -748,3 +748,95 @@ EP16四形状共256个梯度hash逐字等于同期冻结V3。20K相对M6f split�
 无稳定inference改变；日志`training_backward_senders_m6g2_inference_*_formal.log`。
 本里程碑采用Backward profile/sender解耦修正，不关闭训练Forward长文退化、旧
 Backward racecheck未决报告或EP16长序列inference显著领先V3的剩余目标。
+
+## M6h：复用FC1 epilogue staging合并训练checkpoint写回（已验证）
+
+宽入口的完整M128 tile原已在退休的CTA私有B staging中重排S。本轮同时暂存
+BF16 G/U，复用相同的两次math CTA barrier，再以16B vector写回canonical
+checkpoint行；替代原按accumulator fragment分散的4B stores。G/U仍是分离的
+canonical平面，保留原BF16舍入，不改Backward布局、ring credit或saved X。
+不复用cluster multicast A。只有三个输出平面能放入实际B arena时启用；
+窄decode、尾块及scratch不足的配置继续direct checkpoint/epilogue。
+
+共享helper接收调用方实际scratch容量，并推导Args类型；这也修复纯GEMM工具
+在M6d接口演进后缺mblock实参、精简Args被强制要求训练字段的编译问题。
+诊断工具仍调用生产epilogue，未复制一套实现或添加假的checkpoint字段。
+N64/stages2/K128的packed及separated、T1/8192完整chain均精确等于cuBLAS且
+repeat逐字相同；N32/stages3/K128 packed T1也通过。N32 separated是工具
+既有不支持组合，尝试运行返回unsupported，未计作通过项，也不放宽其合同。
+这些是工具接口/计算回归，不能作为本轮checkpoint收益或重新选布局的证据。
+
+最终冻结`build/static_v4_training_staged_checkpoint_m6h_final/`：
+
+- native `5b3e9264afc3cdff75678b45c6ab304b80033f06744421f53ae86091ecc3ee62`
+- lib `16e81efa4a96757e77f7f55f697a2a3c0361f05a1ea6d6b96bced0decffc3073`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+训练prefill local/network仍REG168、STACK72/448、SHARED2048、LOCAL0；
+dynamic SMEM及pool容量不增加。首版候选`static_v4_training_staged_checkpoint_m6h/`
+仅供初筛，正式对照使用上述修复诊断接口后的最终构建。
+
+1620MHz、EP8（第二节点独立测量）、E64/K4/H2048/I512、B512/D8、保留tape，
+10warmup/20samples，与已提交M6g2按G/H/H/G顺序交错。第一节点同时做EP8
+正确性检查/纯GEMM CPU构建，测量节点无其它GPU任务或CPU构建。
+
+|T/rank|M6g2 main/us，两轮|M6h main/us，两轮|M6g2 wall/us，两轮|M6h wall/us，两轮|
+|---:|---:|---:|---:|---:|
+|8192|1518.820 / 1529.380|1511.010 / 1512.930|2021.520 / 2040.070|2017.200 / 2011.230|
+|20480|3698.270 / 3693.220|3638.850 / 3638.020|4305.780 / 4276.040|4220.910 / 4217.040|
+
+20K main约降低1.5%–1.6%，8K约0.4%–1.2%，小幅收益，不足以恢复长文相对V3
+的训练Forward差距。wall包含Notify/host准备/Forward，不与V3的不同阶段span
+混比；更不把独立Forward/Backward中位数相加当作整步训练实测。
+日志`training_perf_{m6g2,m6h,m6h_repeat,m6g2_repeat}_adjacent_remote_ep8_t*_forward.log`。
+
+最终native EP8 T512/E16/K6/B512/D8两次Backward稳定，32个原始梯度hash逐字
+等于M6g2，覆盖完整M128 staging。Torch EP8 T8192均匀、T20480全热点五项
+数值及独立inference graph/offload通过。EP8 T512全热点B16/D1完整脚本
+通过（OOM/retry/三个live tapes），rank0/7 all-weftmoe memcheck 0errors，
+PID362837/362854。
+
+EP16 T1/64/8192均匀、T20480全热点，五项数值及独立inference graph/offload
+均通过；T64完整检查含32failure/16retry/48live-tape标记。EP16 T2048全热点
+B16/D1也通过完整脚本；rank0/15 all-weftmoe memcheck 0errors（PID367822/
+277218），独立Forward planner/main racecheck 0hazards（PID369184/277605）。
+全部launcher exit0，不将Forward专项结果外推到旧Backward racecheck。
+日志前缀`training_staged_checkpoint_m6h_torch_`及`..._{memcheck,racecheck}_`。
+EP16训练Forward同配置、10/20、无并发构建/其它GPU任务的相邻对照如下。
+两规模共32个Forward输出hash从原始rank记录按字符串逐字核对，相等；不能
+用JavaScript浮点解析后的64-bit hash做精确一致性证据。
+
+|T/rank|M6g2 main/us|M6h main/us|M6g2 wall/us|M6h wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3518.050|3488.960|4319.950|4296.780|
+|20480|8373.980|8318.430|9327.650|9281.240|
+
+双机main约降低0.8%/0.7%，不夸大为显著端到端收益。GIN launcher中的
+`forward_slowest_rank_us`在本ring构建对应main，native记录的`device_kernel`
+与`forward`逐样本相同；wall仍按Notify→buffer→Forward完整范围报告。
+日志`training_perf_{m6g2,m6h}_ep16_t*_forward.log`。
+EP8 T1/64也完成Torch完整数值/graph/offload，T64含16failure/8retry/24live-tape
+标记。EP8 T512全热点B16/D1的Forward racecheck rank0/7均0hazards，
+PID377953/377968，完整脚本及launcher exit0。
+
+最终1620MHz、10/20/batch20的inference正式回归：
+
+|T/rank|单机EP8/us|双机EP16/us|
+|---:|---:|---:|
+|1|100.725|277.926|
+|64|135.403|333.410|
+|8192|1271.100|2956.020|
+|20480|2964.940|6985.870|
+
+96个输出hash逐字等于M6g2。EP8在第二节点独立测量，第一节点有候选CPU构建/
+EP8正确性工作；EP16测量无并发构建/GPU任务。日志
+`training_staged_checkpoint_m6h_inference_{remote_ep8,ep16}_t*_formal.log`。
+本项是小幅训练checkpoint优化，不将这些inference波动归为收益；20K相对V3
+显著领先的目标、训练Forward长文差距及旧Backward racecheck未决项仍未关闭。
+
+随后EP8反向复测M6g2：8K/20K为1262.080/2953.510us，16个hash与M6h一致，
+仍有约0.7%/0.4%进程间差异。核对最终native中的local/network两个inference
+prefill kernel，SASS逐字相同（56282行、确认包含两个function），共同SHA256
+`af9efeb01afc1e754002d74ea42f7e57a4e653563541d16eb49e782630df4c70`；dump含
+函数名及指令，不含不同路径/调试行号。故不归因为本次训练epilogue修改，也不
+选择较快一轮替换正式矩阵。日志后缀`m6g2_inference_remote_ep8_t*_reverse_formal.log`。

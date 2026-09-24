@@ -13,9 +13,10 @@ static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
                     gated_swiglu_fc2_input(g.y, u.y, route_weight));
 }
 
-template <unsigned Fc1TileN, bool RetainBackwardState = false>
+template <unsigned Fc1TileN, unsigned ScratchElements,
+          bool RetainBackwardState = false, class Args>
 __device__ __forceinline__ void static_v4_store_fc1_tile(
-    const ForwardKernelArgs &a, transport::BFloat16 *tile, const float *accum,
+    const Args &a, transport::BFloat16 *tile, const float *accum,
     transport::BFloat16 *output, const float *gates, std::uint64_t row,
     std::uint32_t valid_rows, std::uint32_t column_base, std::uint64_t mblock) {
   constexpr auto kOutputN = Fc1TileN / 2U;
@@ -25,6 +26,61 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
   // Keep the two invariant gate loads outside the fragment-store loop.
   const float gate0 = row0 < valid_rows ? gates[row + row0] : 0.0F;
   const float gate1 = row1 < valid_rows ? gates[row + row1] : 0.0F;
+
+  constexpr auto kOutputElements = forward_tuning::kTileM * kOutputN;
+  constexpr auto kPlanes = RetainBackwardState ? 3U : 1U;
+  if (kOutputN >= 64U && kPlanes * kOutputElements <= ScratchElements &&
+      valid_rows == forward_tuning::kTileM) {
+    // Both math warpgroups must retire their TMA B reads before staging
+    // into that CTA-private arena. A is multicast and must not be reused.
+    // Stage complete N64 swizzle atoms. The narrow decode entry retains its
+    // original direct epilogue rather than staging a partial atom.
+    // Training packs G/U into two additional retired B planes, allowing
+    // canonical checkpoint rows to use the same vectorized writeback as S.
+    cutlass::arch::NamedBarrier::sync(
+        kMathThreads, physical_barrier<true>(kMathReadyBarrier));
+#pragma unroll
+    for (unsigned index = 0; index < kOutputN / 8U; ++index) {
+      const auto *g = accum + index * 8U;
+      const auto *u = g + 4U;
+      store_m128_fragment(
+          tile, index,
+          __float22bfloat162_rn(static_v4_swiglu_pair(g, u, gate0)),
+          __float22bfloat162_rn(static_v4_swiglu_pair(g + 2U, u + 2U, gate1)));
+      if constexpr (RetainBackwardState) {
+        store_m128_fragment(
+            tile + kOutputElements, index,
+            __float22bfloat162_rn(make_float2(g[0], g[1])),
+            __float22bfloat162_rn(make_float2(g[2], g[3])));
+        store_m128_fragment(
+            tile + 2U * kOutputElements, index,
+            __float22bfloat162_rn(make_float2(u[0], u[1])),
+            __float22bfloat162_rn(make_float2(u[2], u[3])));
+      }
+    }
+    cutlass::arch::NamedBarrier::sync(
+        kMathThreads, physical_barrier<true>(kMathDoneBarrier));
+    for (unsigned vector = threadIdx.x;
+         vector < forward_tuning::kTileM * kOutputN / 8U;
+         vector += kMathThreads) {
+      const auto m = vector / (kOutputN / 8U);
+      const auto n = (vector % (kOutputN / 8U)) * 8U;
+      const auto offset = m128_fragment_vector_offset(m, n);
+      *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate +
+                                 column_base + n) =
+          *reinterpret_cast<const uint4 *>(tile + offset);
+      if constexpr (RetainBackwardState) {
+        const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
+        auto *gate = a.saved_ab + saved * a.intermediate + column_base + n;
+        auto *up = gate + a.saved_rows * a.intermediate;
+        *reinterpret_cast<uint4 *>(gate) =
+            *reinterpret_cast<const uint4 *>(tile + kOutputElements + offset);
+        *reinterpret_cast<uint4 *>(up) =
+            *reinterpret_cast<const uint4 *>(tile + 2U * kOutputElements + offset);
+      }
+    }
+    return;
+  }
 
   if constexpr (RetainBackwardState) {
     // Ring order is physical only. Save rounded gate/up projections in the
@@ -47,37 +103,6 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
             __float22bfloat162_rn(make_float2(u[0], u[1]));
       }
     }
-  }
-
-  if (kOutputN >= 64U && valid_rows == forward_tuning::kTileM) {
-    // Both math warpgroups must retire their TMA B reads before staging
-    // into that CTA-private arena. A is multicast and must not be reused.
-    // Stage complete N64 swizzle atoms. The narrow decode entry retains its
-    // original direct epilogue rather than staging a partial atom.
-    cutlass::arch::NamedBarrier::sync(
-        kMathThreads, physical_barrier<true>(kMathReadyBarrier));
-#pragma unroll
-    for (unsigned index = 0; index < kOutputN / 8U; ++index) {
-      const auto *g = accum + index * 8U;
-      const auto *u = g + 4U;
-      store_m128_fragment(
-          tile, index,
-          __float22bfloat162_rn(static_v4_swiglu_pair(g, u, gate0)),
-          __float22bfloat162_rn(static_v4_swiglu_pair(g + 2U, u + 2U, gate1)));
-    }
-    cutlass::arch::NamedBarrier::sync(
-        kMathThreads, physical_barrier<true>(kMathDoneBarrier));
-    for (unsigned vector = threadIdx.x;
-         vector < forward_tuning::kTileM * kOutputN / 8U;
-         vector += kMathThreads) {
-      const auto m = vector / (kOutputN / 8U);
-      const auto n = (vector % (kOutputN / 8U)) * 8U;
-      *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate +
-                                 column_base + n) =
-          *reinterpret_cast<const uint4 *>(
-              tile + m128_fragment_vector_offset(m, n));
-    }
-    return;
   }
 
   // Decode and compact expert tails avoid staging and its extra CTA barriers.
