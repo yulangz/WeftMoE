@@ -3294,3 +3294,48 @@ NCCL内部QP资源，不能声称降低queue depth后NIC资源用量不变。
 `ring_gin_qdepth64_{q64,dc}_ep16_t20480_formal.log`。
 两个候选及编译期knob均撤回，默认queue1024保持；没有继续完整Torch或sanitizer。
 DH的并发context现象成立，但减少生产owner或queue depth都未改善当前算子。
+
+### DM/DN：32 owners 不变，每类角色共享8/16 contexts（小幅长序列收益，暂不采用）
+
+与DI/DJ不同，本候选保留32个静态TX/RX owner以及原Pull/local Return/Reduce
+warp分工，只让同类角色的owner按固定余数映射到8或16个GIN contexts，共
+24或48个。共享context必须使用NCCL的GPU sharing，不能沿用线程独占模式。
+默认quota32仍一owner一context、THREAD sharing，编译期消掉共享映射。
+
+软件packet队列、counter编号、slot容量和remote consumed AND local completion
+检查不变；只有GIN提交使用库的共享机制，不增加动态任务领用。metadata阶段
+仍一context一CTA，和数据面之间沿用原join。queue depth1024不变。本实验需
+同时计入共享锁成本，AZ曾证明在独占context下GPU sharing更慢，因此不预设收益。
+
+两候选native已构建，冻结在 `build/static_v4_ring_shared_contexts{8,16}/`，
+各有change.patch；先快筛，未通过完整门禁前不调整默认配置。
+
+native SHA256：8contexts/role为
+`0a7eaa67149cbb0ea8d4c0b014fa47b0729471ac45536aa399d601c42dbec67c`，16为
+`9db727216ca848ab76f077fae0854c5a2d52609db33acff5560b9a36fc0ac475`。
+两者网络prefill均REG168/STACK416/SHARED2048/LOCAL0/CONSTANT3264。
+无并发构建、1620MHz，10warmup/2measured/batch2快筛（us）：
+
+|contexts/role|T1|T64|T8192|T20480|
+|---:|---:|---:|---:|---:|
+|8|283.008|340.592|3029.520|6983.740|
+|16|282.736|354.112|3020.780|6969.060|
+
+首轮16→DC的20K正式10/20/20为6958.730/7049.640us（约1.3%）；正在做
+反向对照及8K正式复核，尚不能认定稳定收益。短序列有代价，不能只选20K报告。
+日志 `ring_shared_contexts{8,16}_ep16_t*_quick.log`、
+`ring_shared_contexts16_{c16,dc}_ep16_t20480_formal.log`。
+
+反向DC→16复核：8K为3007.210→3004.440us（基本持平），20K为
+7009.880→6952.720us（改善0.815%）。20K两轮16-context内部样本范围约
+6945–6970us，而基线跨进程的中位数漂移约40us，故只据反向也成立的小幅收益
+继续门禁，不报告为确定的1.3%普适收益。全部quick的128个rank输出hash、
+device/compute/registered bytes与DC一致。
+
+短序列DC→16正式对照：T1为275.779→279.648us，T64为333.810→337.800us，
+分别回退1.40%和1.20%。日志
+`ring_shared_contexts16_short_{dc,c16}_ep16_t{1,64}_formal.log`。
+20K小幅收益不足以解决相对V3优势偏小的问题，且需要维护共享映射及同步策略；
+本轮不采用，不继续完整Torch/sanitizer，源patch和native保留供后续独立复核。
+已撤回实验knob与共享代码，默认仍96个线程独占contexts。并非断言共享context
+没有优化价值，只是目前端到端收益不足以优先保留这项复杂性。
