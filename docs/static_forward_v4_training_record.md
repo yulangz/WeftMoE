@@ -583,3 +583,51 @@ M6e基线1267.940us（1264.370–1273.980），M6f复测1261.500us
 8K相邻对照为`training_exact_padding_m6f_inference_ep8_t8192_{baseline,repeat}.log`。
 本里程碑完成精确私有容量分配及回归，不等于完整训练性能/racecheck验收完成。
 EP16 20K仍仅比历史冻结V3的7096.930us快约1.48%，显著领先的性能目标未达成。
+
+## M6性能基线与Backward profile审计（进行中，2026-09-24）
+
+使用既有native benchmark，无新测试入口。Forward设置
+`WEFTMOE_FORWARD_BENCH_RETAIN_STATE=1`并取消graph replay，固定路由及已准备
+tensor复用；wall范围为Notify→buffer preparation→Forward完成，包含训练ring的
+独立plan、实际行数下载及准备阶段。`device_kernel_us`仅为main kernel，不包括
+这些主机边界；V4的`forward/total_us`当前等于main，不能将其直接当成与V3
+event区间相同的训练E2E。此处分别列wall/main，不相加或混用span。
+
+1620MHz、H2048/I512/E64/K4、10warmup/20samples、同步rank后每调用单独计时。
+每个形状的两版本在同一节点相邻运行：T1/64在第一节点，8K/20K在第二节点。
+测量节点无CPU构建或其它GPU任务；部分第二节点轮次与第一节点CPU构建或独立
+EP8任务并行，不把它们描述成双机EP16。ring为已提交M6f、B512/D8，参考为冻结
+`static_inference_v3_20260923`，非当前源码重编译的“V3”。
+
+|T/rank|M6f wall/us|冻结V3 wall/us|M6f main/us|冻结V3 main/us|
+|---:|---:|---:|---:|---:|
+|1|404.456|472.547|74.112|198.336|
+|64|469.037|551.276|107.040|264.416|
+|8192|2017.380|1726.450|1522.820|1335.870|
+|20480|4289.020|3577.480|3683.360|3137.500|
+
+32个输出hash两版本完全一致。短序列wall更快，但长序列训练Forward仍退化，
+不能以inference的改善代替训练性能门禁。20K pool分别408121664与1820708544
+bytes/rank；这不是总训练显存，另有独立tape、Backward tensors等，不能据此
+声称总内存减少同样比例。日志`training_perf_{m6f,v3}_{remote_,}ep8_t*_forward.log`。
+
+复用固定tape的Backward（相同形状、1620MHz、10/20、第二节点EP8）device total：
+
+|T/rank|M6f ring profile/us|冻结V3 profile/us|
+|---:|---:|---:|
+|8192|2387.810|2064.700|
+|20480|5706.530|4979.970|
+
+审计预处理宏发现，inference专用ring配置没有显式选择Backward：生成Forward
+配置下默认`WEFTMOE_BWD_UNIFIED_WORKERS=0`、`BWD_RELAY_CTAS=32`；冻结V3配置
+则为1/16。两者核心GEMM tile/stages相同，但执行路径不同，不能把上述退化
+归因于精确分配或checkpoint。M6f同源码的冻结V3-profile构建
+`static_v4_training_exact_padding_m6f_v3`，不用ring的20K Backward为4920.540us
+（4885.570–4957.470），已接近冻结V3；仍需只切换ring配置的独立验证。
+Backward benchmark的`gemm_launches=2`为既有固定audit值，不能据此判定split/
+unified入口。已有数值通过不证明两配置性能相同。
+
+日志`training_perf_{m6f,v3}_remote_ep8_t{8192,20480}_backward.log`及
+`training_perf_m6f_v3profile_remote_ep8_t20480_backward.log`。计划显式复用
+V3 unified Backward并完成矩阵、热点/多tape和sanitizer回归；当前尚未改默认配置，
+双机训练性能矩阵也未完成。不将这份基线记录标成M6性能验收完成。

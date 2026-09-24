@@ -3831,3 +3831,20 @@ ready发布owner；仅RX import/ACK从32减至8个独占owner，每人处理固�
 冻结`build/static_v4_receive_owners8_eh/`，native SHA256
 `e176a0dd746efb105760d0134f3b8e2cb09ae26f6b8d95aee476c53cfc628210`；
 日志`receive_owners8_eh_ep16_t20480_quick.log`。
+
+### EI：warp并行检查ACK消费状态（未获益，撤回）
+
+M6f/DS上保持全部32路TX/RX owner和96 contexts。RX import仍由lane0执行，
+warp同步后各lane读取一个物理slot的generation/consumed/target，以ballot得到
+可退休集合；再经warp join传递acquire链，lane0逐项发送原GIN credit。GIN context
+仍线程独占，expected/packet顺序及逐slot双credit不变，深度超过32分批处理。
+没有修改payload、buffer容量或其他通信角色。
+
+1620MHz、EP16/B512/D8/T20480、10warmup/2samples/batch2，无并发构建/GPU任务：
+p50 **7053.760us**（7053.760–7093.550），plan rank-max424.160us，16 hashes和
+pool bytes与M6f一致，没有改善当前6991.990us正式参考。网络prefill/decode
+REG168/STACK448/464/SHARED2048/LOCAL0，额外warp协作未提供净收益。
+两文件改动已撤回，不继续完整数值/sanitizer或正式矩阵。冻结
+`build/static_v4_ack_warp_ei/`，native SHA256
+`b1688739bb5d982ed62b8020249ce734e454ec58c0621d1736537393b489fa3d`；
+日志`ack_warp_ei_ep16_t20480_quick.log`。
