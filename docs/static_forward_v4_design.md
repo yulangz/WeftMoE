@@ -48,6 +48,11 @@ ES将网络Forward逐包本地completion通知改为owner私有的已完成发�
 ET随后将验收profile的Return Qmax32改为16，完整双机门禁通过，8K相邻对照
 约改善1.2%、20K正反向约改善0.4%–0.5%，并少约16.7 MB/rank。训练Forward
 持平；双机20K相对上述V3参考约快3.1%，仍未关闭整体长文性能目标。
+FJ2将prefill FC1改为三级、FC2仍两级，复用192KiB arena；GEMM切换时用已有
+empty barrier退休两CTA旧操作数，FC2 scratch避开两种A extent。完整EP8/EP16
+数值、复用、Forward sanitizer门禁通过，单机8K相邻改善约0.8%，双机及20K
+新增收益很小。训练20K main约回退0.3%–0.7%；单独恢复训练两级FC1未消除
+回退，未保留额外分支。详见7.3及ring记录FJ/FJ2/FJ3，整体性能目标仍开放。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -66,7 +71,7 @@ ET随后将验收profile的Return Qmax32改为16，完整双机门禁通过，8K
 prefill 配置 `configs/static_inference_prefill_20260923/` 已有两个 GEMM entry：
 
 - 短序列：M128，FC1 N64 / FC2 N128，K128，stages 3/3。
-- 长序列：M128，FC1 N128 / FC2 N256，K128，stages 2/2。
+- 长序列：M128，FC1 N128 / FC2 N256，K128，stages 3/2（FJ2；历史测量为2/2）。
 - 该配置以 8192 tokens/rank 为入口阈值；其他配置未统一启用，不把阈值当成最终结论。
 - FC1 宽入口已迁移合并写回；窄 N32 SwiGLU 输出保留直接写。
 - epilogue 复用已退休的 CTA 私有 B staging，不复用可能被另一 CTA 提前 multicast

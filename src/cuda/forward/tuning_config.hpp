@@ -436,12 +436,12 @@ static_v4_compute_smem_bytes(std::uint32_t world) {
 }
 
 // Optional prefill companion to the measured narrow-N decode profile. Both
-// entries need 192 KiB of operands; the wider entry has fewer barriers, so the
+// entries need 192 KiB of operands; the prefill entry has fewer barriers, so the
 // same allocation is a valid upper bound. Descriptors share the weight data.
 template <bool Prefill> struct StaticV4Gemm {
   static constexpr unsigned kFc1N = Prefill ? 128U : kFc1TileN;
   static constexpr unsigned kFc2N = Prefill ? 256U : kFc2TileN;
-  static constexpr unsigned kFc1Stages = Prefill ? 2U : kStaticV4Fc1Stages;
+  static constexpr unsigned kFc1Stages = Prefill ? 3U : kStaticV4Fc1Stages;
   static constexpr unsigned kFc2Stages = Prefill ? 2U : kStaticV4Fc2Stages;
 };
 static_assert(!kStaticV4PrefillEnabled ||

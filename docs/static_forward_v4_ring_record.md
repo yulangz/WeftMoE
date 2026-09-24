@@ -4735,3 +4735,25 @@ uint64 hash按字符串比较一致；不以JSON浮点解析比较64位整数。
 FJ2完整数值门禁通过，但暂不整体采用：下一步FJ3保留同步/scratch修正，
 训练prefill的FC1恢复两级，inference保留三级，独立确认上述训练回退来自
 stage参数还是同步修正。tile/weight布局、内存分配及decode不变。
+
+### FJ3：训练FC1单独恢复两级（无收益，撤回；采用FJ2）
+
+冻结`build/static_v4_prefill_training_stage2_fj3/`，native SHA256
+`b512a33513a63fd0423227ac8b62a70bff8a5ac0788bdf24178b9602a94f8614`。
+仅prefill retained-tape使用两级FC1，保留FJ2同步及scratch边界，inference
+不变。1620MHz、EP16独占、无构建/其它GPU任务、10warmup/20samples：
+
+|T/rank|ET main/us|FJ3 main/us|ET wall/us|FJ3 wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3454.110|3453.410|4266.660|4252.770|
+|20480|8319.460|8358.400|9279.800|9316.950|
+
+各组32个原始hash字符串一致。20K仍回退0.47%，没有恢复此前差距，不保留
+独立训练stage分支。FJ3未做library/full-gradient/sanitizer门禁，不称其已验收。
+日志`prefill_training_stage2_{et,fj3}_ep16_t*_training_forward.log`。
+
+最终恢复并采用已通过完整门禁的FJ2，恢复后源码patch与冻结FJ2逐字节一致。
+采用理由是补全跨CTA multicast与私有scratch的生命周期证明，并取得单机8K
+的小幅改善；不声称训练优化。训练20K观测到约0.3%–0.7%的main代价，继续作为
+未解决性能项记录。没有以性能理由撤掉必要同步，也没有增加无收益的训练专用
+调参分支。核心目标仍未完成：EP16 20K相对V3仅快约3.1%，训练Forward仍落后。

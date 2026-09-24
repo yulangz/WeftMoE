@@ -688,6 +688,19 @@ k64_swizzle_address(T *stage, std::uint32_t k,
          (k % kAtom);
 }
 
+template <unsigned Stages>
+__device__ __forceinline__ void retire_multicast_operands(
+    ForwardBarrier *empty, std::uint32_t next) {
+  // Empty arrivals include both CTAs' math readers. A different GEMM uses
+  // different barriers over the same multicast A storage, so its first TMA
+  // must not overtake the peer's final reads of the previous GEMM.
+#pragma unroll
+  for (unsigned offset = 0U; offset < Stages; ++offset) {
+    const auto current = next + offset;
+    empty[current % Stages].wait(((current / Stages) & 1U) ^ 1U);
+  }
+}
+
 template <bool StaticLocal, bool RetainBackwardState,
           std::uint32_t Fc1StageCount, std::uint32_t Fc2StageCount,
           std::uint32_t TileK,
@@ -726,19 +739,24 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
       (Fc1StageCount > Fc2StageCount ? Fc1StageCount : Fc2StageCount) *
       kAStageElements;
   constexpr auto kConfiguredBStorageElements =
-      (StaticSchedule ? 1U : 2U) * Fc1StageCount * kFc1BStageElements >
-              Fc2StageCount * kFc2BStageElements
-          ? (StaticSchedule ? 1U : 2U) * Fc1StageCount *
-                kFc1BStageElements
-          : Fc2StageCount * kFc2BStageElements;
+      StaticSchedule ? Fc1StageCount * kFc1BStageElements
+                     : (2U * Fc1StageCount * kFc1BStageElements >
+                                Fc2StageCount * kFc2BStageElements
+                            ? 2U * Fc1StageCount * kFc1BStageElements
+                            : Fc2StageCount * kFc2BStageElements);
   constexpr auto kFc2ArenaElements =
       kFc2OutputOffset +
       (kFc2Pipelined ? 128U * Fc2TileN : 0U);
+  // Static FC2 has its own B offset. Reserve the larger phase, not FC1's
+  // A extent plus FC2's B extent, which need not coexist.
   constexpr auto kConfiguredArenaElements =
       kConfiguredAStorageElements + kConfiguredBStorageElements >
               kFc2ArenaElements
           ? kConfiguredAStorageElements + kConfiguredBStorageElements
           : kFc2ArenaElements;
+  static_assert(!StaticSchedule || kFc2Pipelined ||
+                kConfiguredArenaElements - kConfiguredAStorageElements >=
+                    forward_tuning::kTileM * Fc2TileN);
   auto *smem_a = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *smem_b = smem_a + kConfiguredAStorageElements;
   auto *fc2_smem_b = smem_a + Fc2StageCount * kAStageElements;
@@ -913,6 +931,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           if (*task_kind_shared == kComputeTaskDone)
             break;
 
+          if constexpr (StaticSchedule)
+            if (threadIdx.x == kMathThreads)
+              retire_multicast_operands<Fc1StageCount>(fc1_empty, fc1_pipeline);
+
           while (true) {
             const auto first_task = *task_shared;
             if (*task_kind_shared != kComputeTaskFc2)
@@ -965,6 +987,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 
           if (*task_kind_shared == kComputeTaskDone)
             break;
+          if constexpr (StaticSchedule)
+            if (threadIdx.x == kMathThreads)
+              retire_multicast_operands<Fc2StageCount>(fc2_empty, fc2_pipeline);
         }
         if constexpr (!Unified)
           cute::cluster_sync();
@@ -1110,8 +1135,10 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MathEnd, Compute, 0U, task,
                                     execution_epoch(a));
 
-            static_v4_store_fc1_tile<Fc1TileN, kConfiguredBStorageElements,
-                                     RetainBackwardState>(
+            static_v4_store_fc1_tile<
+                Fc1TileN,
+                kConfiguredArenaElements - kConfiguredAStorageElements,
+                RetainBackwardState>(
                 a, smem_b, accum, s, canonical_gates, row, valid_rows, n / 2U,
                 mblock);
           } else {
@@ -1562,11 +1589,12 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               // All math readers retire before the union is reused on fallback.
               cutlass::arch::NamedBarrier::sync(
                   kMathThreads, physical_barrier<Unified>(kMathDoneBarrier));
-              // A is multicast: a faster static peer may already load its
-              // next task. Only this CTA's producer writes the retired B arena.
+              // A is multicast: a faster peer may already load the other
+              // GEMM. Keep scratch beyond BOTH A extents, not merely FC2's.
+              // Only this CTA's producer writes the retired B arena.
               auto *output_tile = kFc2Pipelined
                                       ? smem_a + kFc2OutputOffset
-                                      : (StaticSchedule ? fc2_smem_b : smem_a);
+                                      : (StaticSchedule ? smem_b : smem_a);
               if constexpr (StaticSchedule) {
                 static_v4_push_fc2_tile<Fc2TileMma, !StaticLocal, Fc2TileN,
                                         RingSchedule>(

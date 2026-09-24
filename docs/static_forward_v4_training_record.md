@@ -1012,3 +1012,11 @@ wall也均回退（0.96%/0.87%），不能把这次stage调整当作训练优化
 暂不整体采用FJ2；FJ3将训练prefill FC1恢复两级，保留跨GEMM同步修正，
 与inference三级配置独立消融。日志
 `prefill_fc1_stage3_v2_{final,reverse}_{et,fj2}_ep16_t*_training_forward.log`。
+
+FJ3只恢复训练prefill两级FC1，8K main ET3454.110/FJ33453.410us，20K
+ET8319.460/FJ38358.400us；wall分别4266.660/4252.770及9279.800/9316.950us。
+仍为1620MHz、独占10/20，各组32原始hash相同。20K仍慢0.47%，不保留这个
+未带来收益的额外训练配置；未对FJ3执行完整梯度/sanitizer验收。
+最终采用完整验收的FJ2同步/scratch修正及统一prefill三级FC1。此里程碑补全
+跨CTA内存复用安全性，不是训练性能里程碑；约0.3%–0.7%的20K main回退及
+训练Forward相对V3的总体差距均保持开放，不能被inference改善抵销。
