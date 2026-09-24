@@ -3525,3 +3525,17 @@ DS最终正式四规模（1620MHz、10warmup/20samples/batch20、无并发编译
 DS按完整数值/复用/内存门禁保留，主要记内存和复制简化收益；不恢复已失败的
 直接RX Reduce、context共享或发包owner拆分。最终仅做缩进/换行和注释整理，
 冻结二进制对应的功能patch已留档。日志`ring_return_contribution_trimmed_*_formal.log`。
+
+### DT：DS直写Return后重测Dispatch Q16（无收益，不采用）
+
+仅将Dispatch Q8编译为Q16，Return Qmax32/L32/B512/D8和DS协议不变。
+这是新数据面下的独立复核，不复用早期仍有C→TX/RX→contribution复制版本的结论。
+冻结`build/static_v4_ring_direct_return_dispatch16/test_cuda_notify`，SHA256
+`8fc7bb796da47648cd0223ebba9a549d7554f6ee84bfb45efa3d5bd79d25ac4e`；源代码
+为fd23867，仅构建参数`WEFTMOE_FWD_STATIC_V4_PACKET_ROWS=16`不同。
+
+1620MHz、10warmup/2samples/batch2、无并发构建/GPU任务，T1/64/8192/20480
+快筛277.712/344.736/3155.860/7667.140us，64hashes与DS一致。四规模pool分别
+78,953,408/108,686,528/545,865,920/895,741,376bytes/rank。较大Dispatch包
+没有提高当前端到端吞吐，且增加有界payload；长序列明显回退，不继续正式计时
+或完整数值门禁，不改变当前Q8。日志`ring_direct_return_dispatch16_ep16_t*_quick.log`。
