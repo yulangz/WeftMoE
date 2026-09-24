@@ -95,30 +95,30 @@ struct Endpoint {
   // generation to ordinary GPU/peer readers. A generic load is not a
   // substitute.
   __device__ bool import_ready(bool returning, unsigned channel,
-                               std::uint64_t sequence) {
+                               std::uint64_t sequence,
+                               const std::uint32_t &expected) {
     const auto generation = sequence / layout().depth + 1U;
     if (gin.readSignal(a.gin_window, control(returning, channel, sequence) +
                                          offsetof(static_forward::NetworkSlot,
                                                   ready_signal)) < generation)
       return false;
-    ring::publish<::cuda::thread_scope_system>(
-        slot(returning, channel, sequence).visible_generation, generation);
+    auto &s = slot(returning, channel, sequence);
+    s.retire_target += expected;
+    ring::publish<::cuda::thread_scope_system>(s.visible_generation, generation);
     return true;
   }
 
   // Each physical RX slot retires independently, even when later slots finish
-  // first. The target travels with that packet, never with a global done
-  // prefix.
+  // first. Its target comes from the incoming packet plan, never from the
+  // opposite-direction TX or a global done prefix.
   __device__ void acknowledge(bool returning, unsigned channel) {
     for (unsigned index = 0U; index < layout().depth; ++index) {
       auto &s = slot(returning, channel, index);
       const auto generation = s.visible_generation;
       if (generation == s.acknowledged_generation)
         continue;
-      const auto *header = peer_at<const static_forward::PacketHeader>(
-          a.gin_window_base, payload(returning, true, channel, index));
       if (ring::acquire<::cuda::thread_scope_system>(s.consumed_total) <
-          header->retire_target)
+          s.retire_target)
         continue;
       gin.signal(ncclTeamWorld(gin.comm), peer(channel),
                  ncclGin_StrongVASignalAdd{

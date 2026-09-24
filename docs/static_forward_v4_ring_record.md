@@ -2489,3 +2489,99 @@ EP16 8K较V3 3359.26 us快约6.9%，20K仍比7099.96 us慢约3.0%，
 用固定32桶×warp数的计数生成有序前缀，取消scatter的原子预约顺序。
 保留现有64-bit目录及全部slot/credit合同。已有GPU plan测试增加按expert/node
 的ID单调性检查，31+6通过；端到端尚待验证，不等同M6 StableTape已实现。
+
+### CK：固定大小 scratch 的稳定 source 枚举（无收益，已撤回）
+
+基于CH，仅替换source_window planner；不包含已撤回的CJ目录压缩。每warp
+拥有连续的route/token区间，每次处理32个expert/node桶，先统计warp私有计数，
+再按bucket/warp顺序前缀，最后按lane顺序scatter。expert散布阶段不再原子
+预约位置；node列表仍按实际route去重并保留精确fanouts。scratch固定为
+Threads个unsigned（当前128 threads即512B），不随T/E/node增长；expert/node
+超过32以分批处理，不引入专家数或节点数的新容量上限。最终每expert内route
+和每node内token严格递增；这只是确定性局部ordinal，不是完整训练tape。
+
+GPU plan31+6及其racecheck通过，0 hazards。native SHA256
+`debc0b3514dc8a7d5a402fb4cdc2baf681f35bfc58f585e3a7be74295e4cd9f9`，library
+`26e609438081611df6f679e942ea88ddc5566e7a1bac0debf3a7aabc2885f81c`，
+REG168/STACK440/LOCAL0，与CH相同。归档 `static_v4_ring_stable_source/`，
+完整端到端与性能待验证。
+
+Profile补充：同CF版本第二节点独立EP8、1620MHz、B512/D8的正式
+10 warmup/20 samples/batch20，T256/512/1024的decode→prefill分别为
+179.189→191.246、252.442→244.376、337.126→323.002 us，48 hashes一致。
+当前证据支持单机在512附近切换；仍不据此设置多机相同阈值。
+
+CK的EP16/B512/D8快筛8K/20K为3164.880/7443.540 us，32 hashes与BW一致；
+规划status最大值约292/527 us，并未减少整体规划成本。双机四规模+edges的
+416条PyTorch检查通过，两个launcher均exit0。但端到端比CH慢约1.2%/1.8%，
+没有继续完整sanitizer或正式性能门禁，三处source/test改动已撤回。保留归档供
+后续训练确定性规划参考，不给inference引入无收益的排序代价。
+
+### CL：RX 从 immutable plan 维护逐 slot 退休目标（保留）
+
+基于CH，不包含CK/CJ。Dispatch/Return的身份与精确expected本已存在双方
+immutable目录，wire header唯一数据面读者只是ACK的retire_target。改由唯一
+RX import owner在GIN readSignal确认本代ready后，从incoming packet目录取
+fanouts/rows，累加该物理slot.retire_target，再发布visible_generation。
+只有成功import才前进rx_cursor，故每代恰累加一次；ACK检查同一RX owner维护的
+target，不读相反方向TX的描述。计数跨调用累积，仍无reset或运行时原子expected。
+
+删除32-byte PacketHeader及其128-byte padding，移除冗余PacketLayout结构，
+wire仅完整BF16行；GIN仍一次Put绑定逐slot ready，TX复用仍要求远端consumed
+与本地NIC completion。source/Return计划、分包、GEMM及reduce顺序均不变。
+减少不必要GM读写及协议字段，不预先声称性能收益。完整编译/门禁进行中。
+
+CL冻结 `static_v4_ring_rx_targets/`，native SHA256
+`d1bb89a1d31b18f75880b7f438c7c67dd98a76c78d06adb0e0de1c0eafe1be21`，library
+`db5cec042b8f1c392dfbfd22266b8eee4c8f0e78622a2f4b5c1d14d8856281f7`；
+REG168/STACK432/LOCAL0，stack较CH少8B。B512/D8快筛8K/20K为
+3081.540/7125.570 us，32 hashes与BW一致；相对CH正式约快1.5%/2.5%，
+尚需正式对照，不把快筛作为最终收益。
+host18/18、GPU plan31+6、EP16完整416、小深度B16/D1/K8的272均通过。
+rank1/9 eager B16/D1/K8/T64、11 rounds的memcheck/racecheck launcher
+均exit0，0 errors/0 hazards；memcheck local449718/remote151295，
+racecheck local450651/remote151554。日志 `ring_rx_targets_*`。
+
+### CM：在当前通信配置下重测 Return RX 直接 Reduce（无收益，已撤回）
+
+基于CL，重做AQ的独立消融；不是恢复AQ当时Q8/共享GIN资源的旧版本。
+source-local ReturnBinding保存payload/ready/consumed/generation，plan阶段
+只从immutable目录生成。Reduce保持原FP32顺序，读本地contribution或Return RX；
+全部lane完成payload读取后，每条remote route归还一个RX row credit，K>32也
+按lane stride覆盖。删除receive_return scatter及其consume_cursor，原scatter
+warp转为静态Reduce residue，GIN仍由原固定RX owner独占。
+
+RX容量必须至少容纳一个source window的最坏Return包数，深度为
+`max(8, ReturnPartition.lane_packets(B*capacity_top_k, 0))`，使用Return Q，
+不是Dispatch Q；同channel保持window单调顺序。无新原子expected或动态领用。
+B512/K4/R16/L32的depth仍8；binding增加32*capacity_routes bytes/rank，
+不声称省掉scatter就必然获益。需要重新验证长序列、热点和wrap。
+
+CM冻结 `static_v4_ring_direct_rx_retry/`（含相对CL的单独patch），native SHA256
+`110d9193c2b602794634600c33c1c5b27a33815c73a1aa0b02f5b2d61bec4e4c`，library
+`7d0370194ad494883df7465a4d0da8fe4129d7239b8cdeb9d99e8c429195a94c`，
+REG168/STACK448/LOCAL0。host18/18通过，端到端筛选进行中。
+
+CM的8K/20K快筛为3125.920/7209.940 us，32 hashes与BW一致；均比CL的
+3081.540/7125.570 us略慢，不保留额外绑定表与RX生命周期约束。没有继续完整
+PyTorch/sanitizer门禁，八处CUDA源文件改动已撤回，恢复CL的RX scatter。
+
+### CL 里程碑验收（2026-09-24）
+
+除上面的host/GPU plan/EP16/sanitizer外，EP8四规模+edges208条检查也通过。
+1620MHz、B512/D8、10 warmup/20 samples/batch20，正式计时节点无CPU编译
+或其它GPU任务；EP8在第二节点计时，本节点独立跑数值检查及编译下一候选。
+
+| T/rank | 单机EP8/us | 双机EP16/us |
+|---:|---:|---:|
+|1|101.757|280.597|
+|64|138.259|377.998|
+|8192|1254.380|3072.620|
+|20480|2951.290|7149.840|
+
+96 hashes均与BW一致。日志 `ring_rx_targets_{remote_ep8,b512_d8_ep16}_t*_formal.log`。
+较CH同配置，EP8持平，EP16长序列分别快1.75%/2.19%，短序列约0.4–0.6%
+的反向波动。EP16较冻结V3的3359.26/7099.96 us，8K快约8.53%，20K仍慢
+约0.70%，所以最终“明显优于V3”目标尚未达成。每rank注册区减少131072 bytes
+（两方向TX/RX共1024个slot各去掉128B），数据面实际wire也少每包128B；
+没有新增分配或改变ring深度。Ring仍为opt-in，不把后续候选当成当前实现。

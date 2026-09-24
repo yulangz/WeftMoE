@@ -87,8 +87,7 @@ __device__ __forceinline__ void build_pull_packets(const ForwardKernelArgs &a,
            ncclGetLsaPointer(
                a.gin_window,
                network.ring_region +
-                   network.rings.payload(false, true, channel, sequence) +
-                   static_forward::PacketLayout::planned(0U, a.hidden).payload,
+                   network.rings.payload(false, true, channel, sequence),
                source % a.local_world_size),
            &control->visible_generation,
            &control->consumed_total,

@@ -718,10 +718,10 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.source_stride = metadata.bytes;
     network.source_bytes = metadata.published_bytes;
     network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
-    const auto packet = static_forward::PacketLayout::planned(packets.rows, config.max_hidden_size);
-    const auto returning = static_forward::PacketLayout::planned(
+    const auto packet = static_forward::packet_bytes(packets.rows, config.max_hidden_size);
+    const auto returning = static_forward::packet_bytes(
         static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
-    network.rings = {config.max_nodes, packets.lanes, 8U, packet.bytes, returning.bytes};
+    network.rings = {config.max_nodes, packets.lanes, 8U, packet, returning};
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");

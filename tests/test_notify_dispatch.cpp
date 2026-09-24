@@ -2093,19 +2093,17 @@ void test_static_forward_slot_lifetimes() {
 void test_static_forward_network_layout() {
   namespace plan = weftmoe::cuda::static_forward;
   constexpr unsigned rows = 32U, hidden = 2048U;
-  const auto dispatch = plan::PacketLayout::planned(rows, hidden);
-  const auto returning = plan::PacketLayout::planned(rows / 2U, hidden);
-  REQUIRE(dispatch.payload % 128U == 0U);
-  REQUIRE(dispatch.bytes == dispatch.payload + rows * hidden * 2U);
+  const auto dispatch = plan::packet_bytes(rows, hidden);
+  const auto returning = plan::packet_bytes(rows / 2U, hidden);
+  REQUIRE(dispatch == rows * hidden * 2U);
   for (unsigned n = 1; n <= rows; ++n) {
-    const auto compact = plan::PacketLayout::planned(n, hidden);
-    REQUIRE(compact.payload % 128U == 0U);
-    REQUIRE(compact.bytes <= dispatch.bytes);
-    REQUIRE(compact.payload >= sizeof(plan::PacketHeader));
-    REQUIRE(compact.bytes == compact.payload + n * hidden * 2U);
+    const auto compact = plan::packet_bytes(n, hidden);
+    REQUIRE(compact % 128U == 0U);
+    REQUIRE(compact <= dispatch);
+    REQUIRE(compact == n * hidden * 2U);
   }
   for (const unsigned nodes : {1U, 2U, 3U, 70U}) {
-    const plan::NetworkRings rings{nodes, 2U, 4U, dispatch.bytes, returning.bytes};
+    const plan::NetworkRings rings{nodes, 2U, 4U, dispatch, returning};
     for (unsigned self = 0; self < nodes; ++self) {
       std::set<std::uint64_t> channels;
       std::vector<std::pair<std::size_t, std::size_t>> ranges;
@@ -2126,7 +2124,7 @@ void test_static_forward_network_layout() {
               ranges.emplace_back(control, control + sizeof(plan::NetworkSlot));
               for (bool rx : {false, true}) {
                 const auto begin = rings.payload(ret, rx, channel, slot);
-                const auto bytes = ret ? returning.bytes : dispatch.bytes;
+                const auto bytes = ret ? returning : dispatch;
                 REQUIRE(begin % 128U == 0U);
                 REQUIRE(begin == rings.payload(ret, rx, channel, slot + rings.depth));
                 ranges.emplace_back(begin, begin + bytes);

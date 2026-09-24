@@ -17,23 +17,17 @@ WEFTMOE_STATIC_RING_HD constexpr std::size_t align_payload(std::size_t bytes) {
   return (bytes + 127U) & ~std::size_t{127U};
 }
 
-struct PacketLayout {
-  std::size_t payload;
-  std::size_t bytes;
-
-  // Frozen directories already identify every token/route. The wire packet
-  // only needs its generation/retirement header and the actual activation rows.
-  WEFTMOE_STATIC_RING_HD static constexpr PacketLayout
-  planned(std::uint32_t rows, std::uint32_t hidden) {
-    const auto payload = align_payload(sizeof(PacketHeader));
-    return {payload,
-            align_payload(payload + std::size_t(rows) * hidden * 2U)};
-  }
-};
+// The immutable incoming directory supplies identities and exact reader
+// counts; GIN supplies readiness. Only complete activation rows cross the wire.
+WEFTMOE_STATIC_RING_HD constexpr std::size_t
+packet_bytes(std::uint32_t rows, std::uint32_t hidden) {
+  return align_payload(std::size_t(rows) * hidden * 2U);
+}
 
 // GIN signals are accessed through GIN only. visible_generation imports NIC
 // readiness for node-local consumers; their release RMWs target consumed_total.
-// Submit/ACK owners keep their own targets here, outside the wire payload.
+// The RX owner accumulates retire_target before publishing each generation;
+// the TX owner tracks its independent local NIC completion in local_target.
 struct alignas(64) NetworkSlot {
   std::uint64_t ready_signal = 0;
   std::uint64_t credit_signal = 0;
@@ -78,7 +72,8 @@ struct SlotSequence {
 
 // Private to the unique publisher of this physical slot. No atomic expected
 // count, no reset on wrap, and no assumption that successive packets have the
-// same number of readers. The returned target travels with the new generation.
+// same number of readers. The owner accumulates the immutable plan's count for
+// each new generation before publishing it.
 struct Retirement {
   std::uint64_t target = 0;
 

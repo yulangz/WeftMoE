@@ -157,14 +157,6 @@ inline constexpr PacketPartition kNetworkReturnPackets{
     WEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS, kNetworkPackets.lanes};
 static_assert(kNetworkReturnPackets.rows > 0U);
 
-struct PacketHeader {
-  std::uint64_t sequence;
-  std::uint64_t window;
-  std::uint64_t retire_target;
-  std::uint32_t rows;
-  std::uint32_t fanouts; // Dispatch only; Return retires exactly rows units.
-};
-
 struct NodeToken {
   std::uint64_t token;
   std::uint32_t fanouts;
@@ -230,8 +222,6 @@ struct WindowMblock {
   std::uint32_t expert_row;
   std::uint32_t rows;
 };
-
-static_assert(sizeof(PacketHeader) == 32U);
 
 } // namespace weftmoe::cuda::static_forward
 

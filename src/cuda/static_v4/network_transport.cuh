@@ -48,8 +48,6 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
   const auto workers = a.static_network.ring_workers;
   Endpoint endpoint(a, (Returning ? workers : 0U) + worker);
   RowPrefetchPipeline<Storage> prefetch(storage, Returning ? 1U : 0U);
-  const auto payload_offset =
-      static_forward::PacketLayout::planned(0U, a.hidden).payload;
   const auto row_bytes =
       static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16));
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -69,8 +67,7 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       done = false;
       const auto sequence = state.tx_cursor;
       const auto packet = plan.begin + sequence - state.tx_base;
-      std::uint64_t window;
-      unsigned rows, expected;
+      unsigned rows;
       const std::uint64_t *routes = nullptr;
       const static_forward::NodeToken *tokens = nullptr;
       const std::int32_t *experts = nullptr;
@@ -78,8 +75,7 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       if constexpr (Returning) {
         const auto desc =
             ring::source_metadata(a, plan.source, r.returning.packets)[packet];
-        window = desc.window;
-        rows = expected = desc.rows;
+        rows = desc.rows;
         routes = ring::source_metadata(a, plan.source, r.source.route_order) +
                  desc.route_begin;
         experts =
@@ -107,12 +103,10 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
           continue;
       } else {
         const auto desc = r.dispatch.packets[packet];
-        window = desc.window;
         rows = desc.tokens;
-        expected = desc.fanouts;
         tokens = r.source.node_tokens + desc.token_begin;
         const auto source_sequence =
-            r.state->source_base + window / r.source.shape.groups();
+            r.state->source_base + desc.window / r.source.shape.groups();
         if (ring::acquire(
                 r.contributions[source_sequence % r.contribution_depth]
                     .generation) != source_sequence / r.contribution_depth + 1U)
@@ -123,7 +117,7 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       if (!endpoint.can_send(Returning, channel, sequence))
         continue;
       const auto offset = endpoint.payload(Returning, false, channel, sequence);
-      auto *payload = peer_at<char>(a.gin_window_base, offset + payload_offset);
+      auto *payload = peer_at<char>(a.gin_window_base, offset);
       if constexpr (Returning)
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPackStart, GinReturn,
                                    channel, sequence, rows);
@@ -181,13 +175,8 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
         static_v4::reduce_add_release_system(
             reinterpret_cast<unsigned long long *>(&previous->returned), count);
       }
-      auto &control = endpoint.slot(Returning, channel, sequence);
-      control.retire_target += expected;
-      *peer_at<static_forward::PacketHeader>(a.gin_window_base, offset) = {
-          sequence, window, control.retire_target, rows,
-          Returning ? 0U : expected};
       endpoint.send(Returning, channel, sequence,
-                    payload_offset + std::uint64_t(rows) * row_bytes);
+                    std::uint64_t(rows) * row_bytes);
       if constexpr (Returning)
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnGinPutIssue,
                                    GinReturn, channel, sequence, rows);
@@ -227,16 +216,24 @@ __device__ __noinline__ void receive_progress(const ForwardKernelArgs &a,
         const auto plan = returning ? channel_plan<true, true>(a, channel)
                                     : channel_plan<false, true>(a, channel);
         const auto terminal = state.rx_base + plan.count;
-        if (state.rx_cursor < terminal &&
-            endpoint.import_ready(returning, channel, state.rx_cursor)) {
-          if (returning)
-            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalObserved,
-                                       GinReturn, channel, state.rx_cursor, 0U);
-          else
-            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, RemoteSignalObserved,
-                                       GinDispatch, channel, state.rx_cursor,
-                                       0U);
-          ++state.rx_cursor;
+        if (state.rx_cursor < terminal) {
+          const auto packet = plan.begin + state.rx_cursor - state.rx_base;
+          const auto *expected = returning
+              ? &ring::source_metadata(a, plan.source,
+                                       a.ring.returning.packets)[packet].rows
+              : &ring::source_metadata(a, plan.source,
+                                       a.ring.dispatch.packets)[packet].fanouts;
+          if (endpoint.import_ready(returning, channel, state.rx_cursor,
+                                     *expected)) {
+            if (returning)
+              WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalObserved,
+                                         GinReturn, channel, state.rx_cursor, 0U);
+            else
+              WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, RemoteSignalObserved,
+                                         GinDispatch, channel, state.rx_cursor,
+                                         0U);
+            ++state.rx_cursor;
+          }
         }
         endpoint.acknowledge(returning, channel);
         done &= state.rx_cursor == terminal &&
@@ -257,8 +254,6 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
   // receive_progress.
   Endpoint endpoint(a, 0U);
   RowPrefetchPipeline<Storage> prefetch(storage, 1U);
-  const auto payload_offset =
-      static_forward::PacketLayout::planned(0U, a.hidden).payload;
   auto *output =
       peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
   const auto row_bytes =
@@ -286,7 +281,7 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
       const auto *routes = r.source.route_order + desc.route_begin;
       const auto *payload = peer_at<const char>(
           a.gin_window_base,
-          endpoint.payload(true, true, channel, sequence) + payload_offset);
+          endpoint.payload(true, true, channel, sequence));
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceRelayStart,
                                  SourceRelay, channel, sequence, desc.rows);
       asm volatile("fence.proxy.async.global;" ::: "memory");

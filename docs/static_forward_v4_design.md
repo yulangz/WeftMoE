@@ -198,21 +198,25 @@ S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 
 
 通信 chunk 起始候选 Q=32/64 个 token 或完整 contribution 行，D_net=4，
 每 peer 2/4 lanes；不在实现前把这些值定成最优。Dispatch slot 最坏容纳
-Q 份 X 和 Q×K 个 fanout record，不随全调用 token 数扩大。
+Q份X；Q×K个fanout的身份和计数来自独立plan，不再重复放进数据包。
 
 ### 3.2 Packet 与返回地址
 
-Dispatch packet 包含本代 header、去重 token records、fanout records 和 X payload：
+逻辑Dispatch packet的元数据如下。M3b以后这些身份、地址和消费数已冻结在
+独立source/consumer目录，不要求在每次payload Put中重复传输：
 
 ```text
-header: sequence, window, token_count, fanout_count, retire_target
+plan: window, token_count, fanout_count
 token:  source token / X offset / fanout range
 fanout: destination rank / logical Mblock / row / topk slot / router weight
+slot control: ready / credit generation, consumed_total, retire_target
 ```
 
-source rank 可由 channel 得到，不必在每条 record 重复。fanout 与 X 属于同一次
-Put 的有序 payload；ready signal 是独立的 GIN 控制字段。control 与大 payload
-分离并按实际原子/NIC/TMA 要求对齐，padding 不承载额外协议。
+source rank可由channel得到。CH保留128-byte对齐header和完整X行；CL
+进一步只发送完整X行，RX owner从已发布的incoming plan取expected，在导入
+GIN ready后累加本地slot.retire_target，然后发布visible_generation。
+generation由逐slot的GIN signal给出。CL已通过完整数值、wrap及sanitizer门禁，
+见ring记录；control与大payload分离并按实际原子/NIC/TMA要求对齐。
 
 路径和实际地址是：
 
@@ -287,37 +291,37 @@ device-scope；TMA/网络操作先真正完成，再走对应的 release/acquire
 
 | 被保护的数据 | expected 的单位与来源 | 谁生成 |
 |---|---|---|
-| Dispatch RX chunk | 本 chunk 所有 token 在目标节点上的有效 fanout 总数 | source 打包 owner |
+| Dispatch RX chunk | 本 chunk 所有 token 在目标节点上的有效 fanout 总数 | source packet planner |
 | C Mblock | 当前窗口内本 block 的有效 route 行数 | destination geometry owner |
-| Return RX chunk | packet 内完整 contribution 行数 | Return 打包 owner |
+| Return RX chunk | packet 内完整 contribution 行数 | source Return packet planner |
 
-Dispatch 在生成 fanout record 的同一遍循环中计数：
+Dispatch在数据面开始前，从实际route及固定分包规则计算每packet计数：
 
 ```cpp
 expected = 0;
 for (token : packet_tokens) {
     for (k = 0; k < top_k; ++k) {
         if (valid(token, k) && node(expert(token, k)) == destination_node) {
-            emit_fanout(token, k);
             ++expected;
         }
     }
 }
 ```
 
-并行 packing 时各 warp 求局部数量，再由块内归约交给唯一 owner 写包头。
+CH实现为每warp静态拥有一个packet，按目的GPU聚合consumer_rows并归约fanouts；
+写入immutable DispatchPacketPlan，不在pack阶段重新推测或原子增长expected。
 已有 offsets 时，expected=Σ(offset[p+1]-offset[p])，p 仅取本 chunk 的 token
 records。三个 token 分别有 2/1/3 个 fanout 时，expected=6，不是 token_count=3。
 
 C block 的 expected 为 `min(M, R[w,e] - block_index*M)`，R 从第 2.2 节实际窗口
 route 列表长度或 prefix 差得到，包括本地和远端 Return 的行。Return packet
-每放入一条完整 contribution 就增加一，最终直接使用包头 rows。
+按节点expert route interval及固定Q/lane规则枚举，直接使用ReturnPacketPlan.rows。
 
 Return fragment 只是一次搬运的一组完整 H 维行，不是计数单位。128 行分成
 40/56/32 三次搬运，就上报 40/56/32；改变分包不改变 expected=128。
 首版不把同一行拆给多个独立列片段任务；若以后这么做，必须重新定义计数单位。
 
-packet fanout 与 fragment 个数在 route/分包规则固定后也能预计算，但 buffer 释放
+packet fanout已按route/分包规则预计算；fragment个数也可预计算，但buffer释放
 不依赖 fragment 个数。channel terminal packet 数仍必须精确计算；它与这里按行的
 retirement 计数是两个概念。所有批量记账都要求静态分区无重叠且完整覆盖。
 
@@ -397,9 +401,10 @@ packet 按 (window, destination node, lane) 的固定 token 顺序切分，每�
 
 1. 等 source contribution reservation；目的整窗口准入由 RX→X 的 pull 检查。
 2. 等物理 TX slot 上一代的远端消费 credit 与本地 Put completion。
-3. 按 immutable packet 目录打包 X/header，使用计划中的 fanout_count 累加该 RX
-   slot 的 retire_target。M3b 已交换 route/token/consumer 目录，wire 不再重复携带
-   TokenRecord/FanoutRecord；数据布局为 128-byte 对齐 header 加实际完整 X 行。
+3. 按immutable packet目录打包完整X行。M3b已交换route/token/consumer目录；
+   CL进一步移除wire header。RX owner成功导入本代GIN ready后，从incoming
+   DispatchPacketPlan.fanouts累加本地slot.retire_target，再发布visible_generation；
+   不得取相反方向TX目录，也不在未成功import的轮询中重复累加。
 4. 等所有 packer 实际写入完成并导入 system visibility，再发一次绑定 ready signal 的 Put。
 5. 按静态 sequence 前进；不使用 channel/task claim CAS。
 
@@ -453,7 +458,8 @@ route/mblock 列表枚举，按 (window, source rank, lane) 分包；一个 pack
 - remote：M3b 的 rail TX owner 先非阻塞检查 packet 的全部 C 行，再从本节点各
   expert GPU pull 到独立 Return TX；不引入额外 packer→TX ready 计数。全部复制
   完成后按完整行退休 C，再 GIN Put；math 继续处理其他 Mblocks。返回标识来自
-  immutable Return 目录，wire 同样只有 header 和 payload。
+  immutable Return目录，CL的wire同样只有完整行payload；RX从incoming
+  ReturnPacketPlan.rows累加本代退休目标。
 - source RX owner 收到 ready，按窗口/token/top-k slot scatter 到 contribution，
   完成复制和 readiness publication 后返还 RX credit。
 - source Reduce 等该 token 的所有有效 contribution，按现有固定顺序求和。
