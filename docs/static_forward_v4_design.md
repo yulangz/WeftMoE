@@ -58,6 +58,9 @@ FM随后把SavedX复制从Pull第二次S2G移至FC1 Ntile0的ready A stage，沿
 完整数值/复用及Forward专项sanitizer通过；20K训练main单机改善约2.8%、
 双机约3.1%–3.6%，但单机相对V3仍慢约12%–13%。这是训练checkpoint优化，
 不把inference的持平回归算作收益。当前SavedX生命周期见第5节及训练记录FM。
+FO进一步将每task不变的SavedX目的指针移出K循环，沿用同一复制及释放链；
+完整EP8/EP16门禁通过，单机20K训练main正反向约快2.8%–3.0%，双机收益更小
+且有波动。Inference SASS不变；窗口容量独立消融见训练记录FP，未改默认配置。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -412,6 +415,8 @@ FM由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX；
 每个math warp先完成其uint4读取/写出及WGMMA wait0，再向两个CTA的stage
 empty到达，不能提前覆盖该共享stage。SavedX写入也先于本tile的FC1完成发布，
 因此已有F1释放链已包含checkpoint owner，不需要增加独立读者计数。
+FO在Ntile0进入K循环前缓存线程私有的目的指针，canonical行映射在整个task
+内不可变；无新增共享状态，valid-row及hidden-tail边界检查保持不变。
 FC1在相应S slice ready前完成saved-G/U写回。SavedX/G/U属于独立tape，不随
 ring slot回收；Backward在Forward完成后才读取。若以后引入独立checkpoint
 reader或异步store，必须重新纳入相应stage/slot释放条件。

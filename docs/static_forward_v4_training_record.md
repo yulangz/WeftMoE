@@ -1156,3 +1156,144 @@ p95=8104.800us；wall p50=9006.470us，16个原始hash与首轮相同。没有�
 优化的是训练SavedX复制的执行位置，没有inference新增收益；正式inference
 四档回归及对应V3数据见ring记录FM。后续将地址计算移出K循环的FO是独立候选，
 不计入本里程碑，完整训练性能及Backward专项工具限制仍保持开放。
+
+### FO：FC1 SavedX目的地址移出K循环（已采用）
+
+独立基于FM。检查FM的local training prefill SASS发现，FC1每个K迭代重复
+读取8个checkpoint row及计算64位目的地址。将其改为Ntile0每task准备一次
+线程私有目的指针，仍从相同ready A stage保存相同uint4；固定vector数并
+显式约束math thread索引。保留valid-row/hidden-tail检查，所有同步、行序、
+布局与复制字节数不变。Inference的未使用对象应由编译器消除，待检查资源及
+生成指令。冻结`build/static_v4_checkpoint_address_fo/`，尚未报告收益。
+
+native SHA256 `fe87231b00287792081fa38a457048fb9e99a4350bc2333cb564b620e1d52795`。
+EP8 T512/K6/B512/D8及EP16 T64/K6/B16/D1重复Backward共96梯度hash与FM相同。
+network prefill training STACK416→408，local training72、inference local64/
+network392不变，REG168/SHARED2048/LOCAL0不变；未新增Forward WGMMA序列化
+警告。SASS确认K循环内不再加载checkpoint rows及计算row-stride乘积，8个
+目的指针在寄存器而非local数组中；仍保留原thread-index的单次stack reload。
+
+全部构建结束后独占计时、1620MHz、B512/D8、retained-tape 10/20，FM→FO：
+
+|拓扑/T/rank|FM main/us|FO main/us|FM wall/us|FO wall/us|
+|---|---:|---:|---:|---:|
+|EP8/8192|1499.360|1432.100|2008.280|1932.100|
+|EP8/20480|3546.400|3446.400|4125.110|4022.110|
+|EP16/8192|3370.500|3319.740|4180.620|4114.800|
+|EP16/20480|8046.530|7934.210|9026.540|8888.460|
+
+EP8 main改善4.49%/2.82%，EP16改善1.51%/1.40%；wall也改善。EP8的32个字符串
+hash、EP16的64个原始uint64 hash字符串一致，pool不变。尚需反向复测及完整
+Torch/sanitizer门禁，不提前采用。日志
+`checkpoint_address_{fm,fo}_{remote_ep8,ep16}_t*_training_forward.log`。
+
+后续正反向、完整Torch/Forward专项sanitizer及四档inference回归已通过，
+采用这项不增加内存/协议状态的改动。细节和后续FP容量实验交叉对照见下文。
+收益不是所有规模固定百分比：双机20K反向仅0.47%、wall持平，保留该结果。
+未改变默认B/D或加入训练自动阈值；inference SASS与FM相同。
+
+### FP：训练窗口容量独立调节（验证中，不改变inference配置）
+
+用冻结FM，无源码修改。第二节点单机EP8独占，T20K、1620MHz、retained-tape
+10/20；第一节点同时构建FO，没有计时节点CPU构建。按下表顺序测试：
+
+|B/D|main p50/us|wall p50/us|device pool bytes/rank|
+|---|---:|---:|---:|
+|512/8|3550.530|4152.580|408121664|
+|1024/4|3381.500|3984.130|575356480|
+|2048/2|3850.980|4495.860|910853696|
+|512/8复测|3557.150|4153.520|408121664|
+
+32个Forward hash字符串一致，actual shape及retained flags已核实。B×D相同
+不代表总pool相同：更大的整窗口需要更多compute payload容量。B1024/D4
+main首轮约改善4.76%，但多167234816 bytes/rank；B2048退化8.46%。仍需
+补测8K、分离B/D影响及双机，不先保留训练专用配置，也不把容量调节收益算作
+FO地址计算优化。日志`training_window_fp_remote_ep8_b*_d*_r*.log`。
+
+同一remote独占/本地FO编译条件下，补测8K并分离20K的B/D影响，按表中顺序：
+
+|T/rank，B/D|main p50/us|wall p50/us|device pool bytes/rank|
+|---|---:|---:|---:|
+|8192，1024/4|1453.020|2002.630|481305408|
+|8192，512/8|1502.980|1999.050|313659456|
+|20480，1024/8|3392.900|3992.890|642596672|
+|20480，512/4|3602.690|4190.660|374501440|
+|20480，1024/4复测|3383.870|3981.300|575356480|
+
+40个字符串hash与FM对应规模相同。8K main约快3.32%，但wall持平，不称端到端
+改善；20K B1024/D4复测与首轮方向一致，增加D8无额外收益。B512/D4反而慢于
+B512/D8，不能把B和D视作可互换的相同容量。尚未对B1024训练做完整Torch或
+双机性能门禁，不改变验收profile；所有计时来自冻结FM，与FO代码实验独立。
+日志`training_window_fp_followup_remote_ep8_t*_b*_d*.log`。
+
+随后两节点独占、无构建/GPU并发，1620MHz同样10/20；每个规模先测FO B512/D8
+作反向对照，再测FM B512/D8及FM B1024/D4：
+
+|T/rank，版本/B/D|main p50/us|wall p50/us|device pool bytes/rank|
+|---|---:|---:|---:|
+|8192，FO/512/8|3290.110|4116.140|702615744|
+|8192，FM/512/8|3374.500|4189.520|702615744|
+|8192，FM/1024/4|3034.530|3872.850|870256832|
+|20480，FO/512/8|7966.910|8948.170|819971520|
+|20480，FM/512/8|8004.640|8958.050|819971520|
+|20480，FM/1024/4|7451.260|8437.640|987170496|
+
+各规模48个原始hash相同。FO反向main改善2.50%/0.47%，20K比首轮1.40%的
+改善小，wall几乎持平，保留波动而不只选最好轮次。FM的窗口调节main改善
+10.07%/6.91%，wall约7.56%/5.81%，但每rank额外约168/167 MB；仍需完整
+B1024训练正确性，不能视为免费优化。日志
+`checkpoint_address_reverse_fo_ep16_t*_training_forward.log`及
+`training_window_fp_ep16_t*_b*_d*.log`。
+
+FO进入library构建时，在另一节点独占补测组合及反向（无计时节点CPU构建）：
+
+|单机T/rank，B/D|FO main/us|FM main/us|FO wall/us|FM wall/us|
+|---|---:|---:|---:|---:|
+|8192，1024/4|1440.510|1451.620|1976.270|1985.590|
+|20480，1024/4|3346.850|3378.300|3945.400|3975.050|
+|20480，512/8|3439.900|3546.850|4017.810|4127.270|
+
+48个字符串hash相同，pool与对应FM几何一致。相同B1024时FO仅额外改善
+0.77%/0.93%；B512/20K反向仍改善3.02%。不能把FO与FP首轮收益相加。单机
+8K的FO B512（上一组1432.100/1932.100us）已经优于较大窗口，20K则B1024
+更快；不据两个离散规模引入未经测试的自动阈值。日志
+`checkpoint_window_{fo,fm}_remote_ep8_t*_b*_d*.log`。
+
+FO与FM的local/network inference prefill完整SASS dump逐字节相同，未使用的
+checkpoint对象已消除。该检查在第一节点进行，第二节点独占计时；仍执行
+inference数值与正式矩阵回归，不将FO训练收益误记为inference改善。
+
+FO单机正式inference回归（1620MHz、graph 10 warmup/20 samples/batch20）：
+T1/64/8192/20480分别100.970/135.322/1249.680/2962.120us；同批冻结V3
+长文1487.020/3299.810us。32个FO hash与FM一致。第二节点独占计时，第一
+节点构建FO library；无计时节点CPU构建。日志
+`checkpoint_address_final_{v3,fo}_remote_ep8_t*_formal.log`。Inference代码
+相同，数据仅作回归，不归因于FO。
+
+FO的EP8完整Torch检查已通过：T1/64的OOM/retry及三个live tapes、8K均匀/
+20K热点的训练数值、inference四规模与tiny-ring/非ring回归；另外B1024/D4
+的8K均匀/20K热点训练也通过。随后EP16相同训练四档、inference四档及tiny
+ring全部通过；B1024/D4的8K均匀/20K热点训练亦通过。rank0/15的T64小ring
+memcheck（134575/373948）和T2048热点训练memcheck（136819/374903）均为
+0 errors；Forward专项racecheck（135213/374328、138431/375278）均为
+0 hazards/0 warnings。不称完整Backward racecheck clean。
+
+Library SHA256 `b36ee66e81ab7515c3d13573ae4df9a7162596d9e728af6a0bd2978b4b2f0cdb`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+20:54负载下16张GPU均SM/graphics1620MHz、memory3201MHz（memory仅观测）。
+正式双机性能回归及B1024组合复测随后单独进行。
+
+FP再以FO固定源码扫20K的中间窗口，按下表顺序，第二节点单机独占，第一
+节点同时执行FO Torch正确性（无CPU构建）；同为1620MHz、retained-tape10/20：
+
+|B/D|main p50/us|wall p50/us|device pool bytes/rank|
+|---|---:|---:|---:|
+|1024/4|3344.380|3967.880|575356480|
+|768/5|3354.020|3941.740|487722560|
+|1280/3|3383.260|3990.030|654976832|
+|1536/3|3405.440|4030.660|752630848|
+|1024/4复测|3348.290|3964.540|575356480|
+
+40个hash一致。B768近似持平且少87.6MB，继续增大到B1280/1536无收益；
+B×D并不全部相同，不称等容量对照。B768尚无完整Torch门禁，不据此自动选
+配置。日志`training_window_fp_fo_sweep_remote_ep8_b*_d*_r*.log`。

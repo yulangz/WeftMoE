@@ -4849,3 +4849,30 @@ Inference相对FJ2持平，不把上述相对V3的既有收益归因于checkpoin
 后者反向中间有一个FN批次。FN仅将SavedX store换成.cs，没有稳定额外收益，
 已撤回；所有证据及训练相对V3仍落后的结果见训练记录。EP16 20K inference
 仍只领先V3约3%，不关闭“明显领先”及整体训练性能目标。
+
+### FO：训练checkpoint目的地址外提，inference回归
+
+仅将FC1 Ntile0的SavedX目的指针准备移出K循环，不改协议、buffer或物理行序。
+完整EP8/EP16训练、热点/复用、inference及Forward专项sanitizer已通过；
+local/network inference prefill的完整SASS与FM逐字节相同。训练细节、正反向
+对照及窗口调节的独立代价见[训练记录FO/FP](static_forward_v4_training_record.md)。
+
+同一1620MHz、B512/D8、Q8/Q16/L32、10/20/batch20的正式回归（us）：
+
+|拓扑|T/rank|FO|同期冻结V3|
+|---|---:|---:|---:|
+|单机EP8|1|100.970|未重测|
+|单机EP8|64|135.322|未重测|
+|单机EP8|8192|1249.680|1487.020|
+|单机EP8|20480|2962.120|3299.810|
+|双机EP16|1|268.645|未重测|
+|双机EP16|64|317.162|未重测|
+|双机EP16|8192|2907.930|3356.220|
+|双机EP16|20480|6892.530|7098.590|
+
+EP8第二节点独占计时，第一节点构建FO library；EP16两节点独占且无构建。
+实际shape、10warmup/20samples/batch20已核对；96个hash与FM逐rank相同，
+pool/注册bytes未变。V3仍是两kernel graph，ring一kernel，非纯GEMM对照。
+日志`checkpoint_address_final_{v3,fo}_{remote_ep8,ep16}_t*_formal.log`。
+性能与FM持平，不将相对V3的既有优势记为FO新增收益；双机20K仅快约2.9%，
+整体性能目标仍未关闭。
