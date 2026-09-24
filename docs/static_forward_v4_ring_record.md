@@ -3339,3 +3339,41 @@ device/compute/registered bytes与DC一致。
 本轮不采用，不继续完整Torch/sanitizer，源patch和native保留供后续独立复核。
 已撤回实验knob与共享代码，默认仍96个线程独占contexts。并非断言共享context
 没有优化价值，只是目前端到端收益不足以优先保留这项复杂性。
+
+### DO：计算 slot 准入与 Return TX 准入分离（无收益，已撤回）
+
+独立基于DC，不含DM/DN。原`admit`在整窗X/S/C已空之后仍要等待所有Return TX
+预约，因而延迟Pull/FC1；实际上只有FC2会写TX。保留计算slot三类旧代完成检查，
+提前发布原`generation/admitted_windows`，由同一固定admission warp独立检查
+Return TX并发布新`output_reserved_windows`。只有网络FC2增加该head的acquire；
+单机任务选择不增加检查。每次plan在既有grid join之前重置新head。
+
+这是准入条件拆分，不是提前复用TX。TX owner仍逐slot等待remote consumed AND
+local NIC completion；TX head单调FIFO，已预约packet在本窗FC2完成前不能发送，
+也不能再次预约。X/S/C仍须上一代FC1、FC2及Return全部退休后才能改目标计数。
+后窗Pull/FC1不占用前窗Return/RX owner，source contribution准入独立推进；
+没有新增动态领用或阻塞式跨owner调用。计算cluster仍按原window/residue顺序，
+不能把本改动描述为任意深度跨窗计算lookahead。
+
+新增一个uint64窗口head，不新增payload或packet目录；需实测确认资源、收益，
+收益成立后才跑完整数值、tiny wrap和sanitizer。host现有18/18通过。
+
+冻结 `build/static_v4_ring_split_admission/`，含change.patch，native SHA256
+`2e328d184347a6e8e98b0929c6198b935daa79a537af0f9b4ec6e2c56f9479bf`。
+REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264，与DC相同。1620MHz、无并行
+CPU构建，10 warmup/2measured/batch2：B512的T1/T64/T20K为
+277.728/339.744/7012.880us；四轮8K为3015.970/2995.070/3005.630/2996.510us。
+初次四规模命令误用未被fixture读取的token变量，实际均为默认8192，已经按
+JSON真实shape重命名为`t8192_probe{0,1,2,3}`；不作为四规模结果。
+
+由于准入变更可能改变大窗口的取舍，进一步复测20K，仍D8：
+
+|B|DO/us|相邻DC/us|device bytes/rank（两者相同）|
+|---:|---:|---:|---:|
+|1024|7442.860|7366.670|1148575680|
+|1536|7423.250|7288.960|1385550272|
+
+共176个rank输出hash与DC对应shape一致，B512全部pool/registered bytes不变。
+没有足够收益，不继续完整Torch/sanitizer；已撤回新head与准入拆分，保留冻结
+候选供复核。日志 `ring_split_admission_*`。该实验只说明这项拆分未改善当前
+实现，不证明Return等待与所有计算完全折叠，也不排除其它静态计算流水改进。
