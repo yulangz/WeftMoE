@@ -86,3 +86,85 @@ M6a数值与memcheck已验证，racecheck存在上述冻结基线也能复现的
 peer workspace 描述符、compact dR 等通信平面的实际分配、Backward 有界 GIN
 窗口、collective OOM，以及训练长文/热点/多个 live tapes 的完整门禁。
 M6a 即使通过，也不满足上述全部目标。
+
+## 训练 racecheck 定位（进行中）
+
+现有工具为Compute Sanitizer2025.2.1.0/build35969825。NVIDIA后续
+[发布说明](https://docs.nvidia.com/compute-sanitizer/ReleaseNotes/index.html)
+记录2025.4修复了多项mbarrier相关racecheck误报；这只是对照工具版本的理由，
+不是将本项目未决hazards定性为误报的依据。
+
+从官方CUDA13.1.0 redistrib清单下载独立sanitizer13.1.75归档，SHA256为
+`98326d9dd647977956ce1f4898dcaca8db549fe9657e1d7a4cd4343990a17887`，解压到
+`build/toolchains/sanitizer_13_1/`，工具版本2025.4.0.0/build36782660。没有
+修改系统CUDA、NCCL或驱动。尝试对同一个M6a冻结native、同一个EP16 T64夹具
+插桩rank1/9，两端在启动时均报unsupported driver，要求580+；当前570.148.08。
+该轮未进入kernel，不能算racecheck通过/失败的算子证据。launcher已主动中断
+并清理本轮进程，两节点GPU确认无残留任务，不升级系统驱动。
+
+日志 `training_private_workspace_backward_ep16_t64_racecheck_2025_4.log`、
+`training_private_racecheck_2025_4_{hostname}_{pid}.log`。继续用已安装的2025.2.1
+与独立`-lineinfo`诊断构建定位来源，不关闭hazard/DSM检查或添加suppression。
+
+### 聚焦 Backward 与独立同步复现
+
+同M6a代码/冻结V3配置增加`-lineinfo`，native SHA256
+`c3947d8ff9a7c60c2d4b0fcf57be2b72ac0c4ec7b5792d0be3cdd4f0499bc11e`。
+仅过滤`unified_backward_kernel`且`--launch-count 1`时，rank1/9均0errors，
+16 ranks重复输出及64个梯度hash仍与冻结V3一致。**这只插桩第一次Backward，
+不能作为重复调用的门禁。** 去掉launch-count后，两次Backward都插桩，lineinfo
+版报告21,732/19,060 errors，原M6a版为21,762/19,916 errors，均未通过。
+日志`training_{lineinfo,original}_backward_all_ep16_t64_racecheck.log`及对应
+hostname/PID报告。lineinfo版资源仍REG168/STACK208/SHARED2048/LOCAL0。
+
+已显示的一类RAW/WAR落在同CTA共享内存`cuda::atomic_ref<unsigned>`的
+`ld.acquire.cta.b32`与`st.release.cta.b32`本身。构造不含NCCL、GEMM、ring的
+双warp最小握手：producer等phase0、写payload、release phase1；consumer
+acquire phase1、核验payload、release phase0；32轮、两次kernel。工具2025.2.1
+同样在原子phase上报告1,512 errors，payload核验0错误。这确认了**共享原子
+读写这一特定误报类别**，不能据此排除生产kernel其它payload或DSM hazards。
+临时源码/日志`build/racecheck_shared_atomic_repro{.cu,.log,_output.log}`，没有
+为此增加永久测试套件或关闭检查。
+
+另一个独立双CTA cluster复现只保留计算warp的两阶段mbarrier mailbox握手，
+其它warp提前退出。32轮读写、两次launch：payload核验0错误，但工具报告64个
+DSM early-exit errors。相同计算加入全CTA汇合及完整cluster退出同步后，工具
+0errors/0warnings，payload仍0错误。源码`build/racecheck_cluster_mailbox_repro.cu`，
+通过`-DFULL_CLUSTER_EXIT`选择对照；日志`racecheck_cluster_mailbox_{repro,full_exit}`
+及`_output.log`。这定位了工具可识别的生命周期边界；数据值正确本身不证明
+原生产kernel的所有DSM生命周期正确。后续候选只在Backward收尾增加完整cluster
+退出边界，逐任务同步仍限于计算域，再验证资源、数值与sanitizer，未提前合入。
+
+### Backward 完整 cluster 退出边界
+
+计算与通信域各自结束persistent loop后，全CTA汇合，再做一次完整cluster同步。
+两个CTA都不允许某个warp提前退出；每任务的mailbox/TMA握手仍不包含通信warp，
+没有将通信数据依赖变成逐任务全CTA barrier。两个寄存器域仍分别执行完整循环。
+
+冻结`build/static_v4_training_cluster_exit/`，native SHA256
+`75825b4f45bbe7e18a7be7bb6331fc5c457dc6a6bc1cb253e0822e5eef0aae36`，library
+`18464d8225081b41324b26ec22bb8c00b5706d078bbe8b43507b7001e897f178`。
+GIN/local Backward资源分别REG168/STACK208、REG168/STACK40；两者SHARED2048、
+LOCAL0、CONSTANT3200，与M6a相同。只改变训练Backward入口，不改变inference。
+
+EP16 native T64/E32/K6双次运行通过，16 ranks的64个梯度hash全部等于冻结V3。
+PyTorch完整数值/graph/offload回归通过EP8 T512/E64/K4/max_rows16384热点和
+EP16 T64/E64/K4/max_rows4096热点，分别8/16 ranks三类PASS齐全。日志
+`training_cluster_exit_backward_ep16_t64.log`、
+`training_cluster_exit_torch_ep8_t512_hotspot.log`、
+`training_cluster_exit_torch_ep16_t64_hotspot_{0,1}.log`。
+
+只插桩两次unified Backward、rank1/9的首轮报告为1,852/1,904 errors。随后提高
+print-limit至100000完整展开，分别1,864/1,948 hazards（显示数等于总数）；合计
+3,812条的7,624个读写侧**全部**为libcu++共享32-bit atomic load/store，包含
+acquire与relaxed读取、release写入。普通payload及DSM early-exit报告均为0。
+这些共享原子报告符合上述独立复现的工具误报类别，但工具原始退出码仍为1；
+不写成原始racecheck 0errors，也不扩展结论到未插桩的14 ranks或训练Forward。
+日志`training_cluster_exit_backward_full_ep16_t64_racecheck.log`及
+`training_cluster_exit_backward_full_racecheck_{hostname}_{pid}.log`。后续工具升级后
+仍需重跑无过滤的完整训练路径，目前未添加suppression。
+
+同EP16双次运行另做rank1/9 memcheck，两份原始报告均0errors、launcher exit0，
+16 ranks重复校验通过；日志`training_cluster_exit_backward_ep16_t64_memcheck.log`。
+保留此生命周期边界，作为M6训练衔接的同步基础修正提交，不宣称训练迁移完成或
+inference性能改善。没有为工具误报替换正确的acquire/release，也没有新增单测套件。

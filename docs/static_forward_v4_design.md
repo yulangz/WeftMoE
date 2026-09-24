@@ -968,8 +968,10 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
 
 M6a已将rank-private Backward U/dAB/dX/dGate从固定pool移到调用级存储，按
 实际R加有界expert padding分配；EP8/EP16均匀/热点数值及memcheck通过。
-训练仍走V3，ring plan/checkpoint及peer arena迁移尚未完成。冻结V3和M6a均
-存在待查的racecheck共享内存/DSM报告，不能声称训练sanitizer全部通过。
+训练仍走V3，ring plan/checkpoint及peer arena迁移尚未完成。随后为Backward
+增加完整cluster退出边界，逐任务同步粒度不变；重复调用的rank1/9完整报告中
+DSM/payload hazards已消失，剩余共享原子报告由独立合法握手复现为工具误报。
+训练Forward及其它rank仍未完成全量sanitizer门禁，不能声称训练sanitizer全部通过。
 详见 [训练对接记录](static_forward_v4_training_record.md)。
 
 - [ ] StableTape plan、按实际规模分配、main_from_plan 复用同一 plan。

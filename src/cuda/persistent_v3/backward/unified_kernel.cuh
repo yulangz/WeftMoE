@@ -135,20 +135,21 @@ __global__ __launch_bounds__(
       if (first_token < a.dispatch.identity.num_tokens && lane == 0U)
         atomicMax(&status->backward_reduce_complete_clock, device_globaltimer_ns());
     }
-    return;
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<backward_tuning::kUnifiedMathRegisters>();
+    backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
+        state};
+    backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
+                                                      UseGin ? 1U : 2U>(
+        a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
+        x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
+        geometry, storage, state, sync);
   }
-  cutlass::arch::warpgroup_reg_alloc<backward_tuning::kUnifiedMathRegisters>();
-  backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
-      state};
-  backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
-                                                    UseGin ? 1U : 2U>(
-      a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
-      x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
-      geometry, storage, state, sync);
-  // Compute's terminal DSM handshake has joined both CTAs and drained every
-  // TMA store. Transport uses no DSM and independently drains payloads and all
-  // notification credits before returning, so no whole-CTA terminal join is
-  // needed to keep either mailbox alive.
+  // No role exits while a peer can still access this CTA's DSM mailbox. This
+  // full-cluster lifetime boundary runs only after compute and transport drain;
+  // per-task joins remain confined to the compute domain.
+  __syncthreads();
+  cute::cluster_sync();
 
 #endif
 }
