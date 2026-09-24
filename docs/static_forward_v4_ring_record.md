@@ -4558,3 +4558,96 @@ native SHA256 `2ca7c6e8a50a4eaced7c0b56c06cc6bb2ba9d02f478825ee9f893f2157138ecf`
 32个hash与ET一致。对照紧邻FH末轮ET的2908.390/6902.070us，8K持平、20K
 略慢，未证明单独共享ACK QP有益。四文件已撤回，未继续短规模/完整数值/
 sanitizer；保持所有contexts独占。日志`shared_ack_contexts_fi_ep16_t*_formal.log`。
+
+### FJ：在原共享内存预算内增加prefill FC1 TMA stage（候选）
+
+独立基于ET，FI/FH均撤回。FC1物理N128、FC2 N256、K128、cluster2及通信
+全部不变，只把prefill stages2/2改为3/2；decode仍3/3，不新增运行时参数。
+AF曾独立测过有效S-N64/K128/stages3的纯GEMM，但那不代表本次融合实现
+或当前数据面的端到端收益。本项在当前融合路径独立验证。
+
+旧compute helper将max(A stages)与max(B extents)相加；但FC2 B实际已使用
+自身A extent作为偏移。3/2下旧公式是A96+Bmax128=224KiB，而实际FC1
+A96+B96、FC2 A64+B128的上界都是192KiB。仅StaticSchedule按FC1自身B
+extent计算该相加项，再与原FC2 arena取max；V3动态分支表达式保持原值。
+packed FC1 epilogue接收实际可用scratch=arena-A，而不是FC1操作数B的大小，
+保留decode的96KiB、原2/2prefill的128KiB可用scratch；3/2时为96KiB，
+仍容纳M6h所需的48KiB S/G/U三平面。没有为了3-stage增加物理SMEM预算。
+
+原host allocation覆盖192KiB operand和12个barrier；3/2需要192KiB和10个。
+FC1/FC2切换仍经过原producer/math及cluster join，不在FC1第三A stage尚有
+读者时将其交给FC2 B。K累加次序、舍入、TensorMap形状和completion targets
+不变。候选只改两文件，冻结`build/static_v4_prefill_fc1_stage3_fj/`；先构建
+native并比较单/双机长文。decode机器码、训练checkpoint及完整数值/sanitizer
+仍需验证，不因空间算式成立就宣称stage复用已经通过验收。
+
+native构建完成，SHA256 `fd6102c393ad4ffbc7116b303b31816ad47ba3d0d1095a4cd6ba7b8eabd130f0`。
+四个prefill inference/training入口的REG/STACK/SHARED/LOCAL与ET相同。
+decode的Function/指令行逐条一致：单机14273行SHA256
+`c89c32287e283744b15580bb7f702db5eac307fcb2c92fc7f76f999ecccf27b4`，
+多机41097行`b8f39bea98b1d9877e208ad21f48cc5ee77fe1ae233a9c4836d8d119ee30dbb9`。
+构建结束、无并发GPU任务/编译，第二节点单机EP8，1620MHz、B512/D8、正式
+10warmup/20samples/batch20，相邻ET→FJ的8K为1273.660→1247.510us，
+20K为2959.860→2954.060us。32hashes与ET一致；8K约2.05%改善、20K基本持平，
+仍待反向和EP16对照，不提前采用。日志
+`prefill_fc1_stage3_{et,fj}_remote_ep8_t*_formal.log`。
+
+随后EP16同规格ET→FJ：8K 2907.700→2897.600us，20K
+6895.990→6873.880us，64个hash与已验收版本一致。反向单机FJ→ET：
+8K 1248.530→1269.210us，20K 2950.260→2968.430us，32个hash一致。
+单机8K两轮改善约1.6%–2.1%，20K接近持平至小幅改善；双机仍待反向确认。
+反向单机测量期间只在第一节点编译库/做native数值检查，第二节点独占计时。
+
+native EP8 T512/E16/K6/B512/D8覆盖新prefill路径：8个rank的重复Backward
+均一致，32个dX/dGate/dW1/dW2 hash与ES/M6h完全一致。库SHA256
+`ee1c9dbaeca45164505d474eacdbdfdfa183aec9d7bba56859378abb4ad2d498`，
+extension为`725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+完整Torch及prefill sanitizer仍待验收；尚未采用。
+
+EP16反向8K为FJ2904.730→ET2912.170us。第二组反向脚本曾误写未识别的
+`WEFTMOE_BENCH_TOKENS`；核对结果JSON的shape发现文件名中的20K实际仍是
+默认8K。这两份`reverse_{fj,et}_ep16_t20480_formal.log`不作为20K证据；
+保留原日志，用正确的`WEFTMOE_P2P_BENCH_TOKENS`另跑`reverse_verified_*`。
+首轮EP16及两轮EP8的JSON shape已复核正确。
+
+修正后EP16反向20K为FJ6868.650→ET6903.970us，范围
+6859.730–6875.390/6890.140–6914.090us，32个hash一致；两轮分别改善
+0.32%/0.51%。测量结束时两节点全部GPU的SM/graphics为1620MHz、memory为
+3201MHz。正式测量无并发构建/其它GPU任务。进入完整验收，未提前关闭目标。
+
+**验收失败，暂不采用：** EP16 T2048/B512/D8 prefill memcheck的rank0/15
+均0 errors，全部304条数值检查通过；但相同用例在Forward racecheck下，
+balanced-eager通过后balanced-graph出现64/256个元素的局部错误，最大绝对
+误差约0.10。rank15工具虽报告0 hazards，不能当作数值通过；rank0因其它
+rank异常退出而等不到通信，已终止本次测试进程。1-token训练及native两组
+重复Backward通过，不足以替代此失败。当前不发布FJ为可用优化。
+
+代码审查发现遗漏：静态调度没有逐task的cluster rendezvous，较快CTA可能
+进入下一FC1，multicast A第三stage写入64–96KiB；较慢CTA的FC2 B和epilogue
+仍从64KiB开始。此前“两阶段各自占192KiB”的空间论证没有覆盖跨CTA的
+阶段偏斜，是不充分的。正在以ET同用例复测，并检查跨阶段operand/scratch
+边界；仅改epilogue偏移尚不足以证明尚存的FC2 B读者安全。收益暂不计入验收结果。
+
+ET使用原冻结库复跑完全相同的T2048/B512/D8 Forward racecheck：304条数值
+检查通过，rank0/15均0 hazards。日志`prefill_stage_audit_et_*`。FJ的T64及
+8K训练随后也完成parity/graph/offload，但不能抵销上述失败；后续性能和完整
+验收任务已暂停。没有修改容差、忽略局部错误或将0 hazards替代数值检查。
+
+### FJ2：跨GEMM的multicast operand退休与scratch边界（修正候选）
+
+保留三级FC1和192KiB预算，FC2非pipelined epilogue改从max(A extents)开始，
+即96KiB，64KiB输出tile至160KiB结束，静态断言其落在arena内。不再使用
+FC2操作数B的64KiB起点作为epilogue scratch。
+
+producer从FC1切到FC2、或反向切换时，复用旧阶段每个empty barrier，按下一次
+发射的phase^1等待全部退休。原empty arrival包含两个CTA各8个math warp，
+且在WGMMA wait0之后发布；所以新的multicast不会覆盖peer仍在读取的旧A/B。
+没有增加计数器、cluster barrier或数据面全局同步。math仍可独立完成私有
+epilogue，较快peer可在其后继续multicast，但两个epilogue的scratch都避开
+两种A extent。当前CTA自己的producer仍受原task barrier约束，不能提前
+覆写自己的B/scratch。这补全了原FJ仅按阶段算空间所遗漏的跨CTA生命周期。
+
+该修正适用于静态decode/prefill及ring/nonring，V3动态分支不变，因此FJ的
+decode指令不变结论不再适用于FJ2。冻结
+`build/static_v4_prefill_fc1_stage3_fj2/`，先复验失败用例，再做完整数值与
+四规模性能；未经复测不沿用FJ原有收益。
