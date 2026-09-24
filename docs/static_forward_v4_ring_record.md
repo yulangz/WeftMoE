@@ -3593,3 +3593,25 @@ DV **6982.520us**（6956.530–7023.530），仅降低0.39%，区间明显重叠
 反序正式复测，也未继续library/Torch/sanitizer门禁；选择保留简单的原lane0发布，
 所有CUDA改动撤回。日志`ring_ds_return_ready_warp_dv_ep16_t*_quick.log`和
 `ring_ds_return_ready_warp_dv_{ds,dv}_ep16_t20480_formal.log`。
+
+### DW：网络 slot 隔离 NIC signal 与 GPU 状态（无收益，已撤回）
+
+基于`e051282`的DS数据面，不含DV。仅将NetworkSlot中的NIC ready/credit
+signal与GPU visible/consumed/target状态分到不同128-byte区间，slot由64B变
+256B；所有访问仍用同一布局及offsetof。没有改packet、scope、同步或计数。
+EP16增加98,304bytes/rank控制区，检验原布局的共享缓存行是否影响性能。
+
+冻结`build/static_v4_ring_split_slot_state_dw/`，native SHA256
+`8c2e4ab7ae51c28396054149258678814939ffe1af3afab48e2b1537dbadd54e`及原始patch。
+host18/18通过；network prefill/decode REG168、STACK440/448、SHARED2048、
+LOCAL0、CONSTANT3264（相较DS，STACK均增加8B）。1620MHz、Q8/Q32/L32/B512/D8，
+无并发构建/GPU任务，10warmup/2samples/batch2：
+
+| T/rank | p50/us | min–max/us | total bytes/rank |
+|---:|---:|---:|---:|
+|8192|2961.070|2961.070–2965.780|529,899,712|
+|20480|7019.920|7019.920–7041.060|880,844,224|
+
+32个hash与DS一致。长序列未显示改善，不继续短规模、正式计时及完整数值/
+sanitizer门禁，slot恢复64B。此结果不能证明硬件上不存在缓存行竞争，只说明
+这项隔离没有得到可用的端到端收益。日志`ring_split_slot_state_dw_ep16_t*_quick.log`。
