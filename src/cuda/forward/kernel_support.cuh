@@ -712,7 +712,8 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   if (config.static_forward_window_tokens) {
     auto &network = layout.static_forward;
     constexpr auto packets = static_forward::kNetworkPackets;
-    const auto metadata = make_source_metadata_layout(config, static_ring_shape(config), packets);
+    const auto shape = static_ring_shape(config);
+    const auto metadata = make_source_metadata_layout(config, shape, packets);
     network.source_stride = metadata.bytes;
     network.source_bytes = metadata.published_bytes;
     network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
@@ -728,6 +729,14 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
+    const auto contribution_rows = checked_mul(
+        checked_mul(config.static_forward_contribution_windows,
+                    shape.tokens, "contribution windows"),
+        config.max_top_k, "contribution rows");
+    network.contribution = append(
+        cursor, checked_mul(contribution_rows, config.max_hidden_size,
+                            "registered contribution elements"),
+        sizeof(transport::BFloat16), "registered contribution ring");
   } else if (config.max_intermediate_size && !config.enable_backward_state) {
     auto &network = layout.static_forward;
     const auto experts = checked_mul(config.max_owned_experts,
@@ -971,6 +980,11 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         cursor, std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
                     config.max_top_k, sizeof(std::uint64_t),
         "contribution route generations");
+    if (config.max_nodes > 1U)
+      ring.contribution_rows = append(
+          cursor, checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                              "contribution permutation routes"),
+          sizeof(std::uint32_t), "source contribution row permutation");
     ring.source = make_source_metadata_layout(config, ring.shape, ring.packets);
     if (config.max_nodes == 1U)
       ring.metadata = append(cursor, 1U, ring.source.bytes, "source metadata");
@@ -1080,8 +1094,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       checked_mul(ring.depth ? std::uint64_t(ring.contribution_depth) *
                                   ring.shape.tokens * config.max_top_k : routes,
                   config.max_hidden_size, "route elements");
-  layout.contribution = append(cursor, route_elements,
-                               sizeof(transport::BFloat16), "contribution");
+  if (!ring.depth || !config.enable_gin_rdma)
+    layout.contribution = append(cursor, route_elements,
+                                 sizeof(transport::BFloat16), "contribution");
   layout.combine_return = ring.depth ? layout.contribution :
       append(cursor, route_elements, sizeof(transport::BFloat16), "combine return");
   if (config.max_intermediate_size == 0 || config.enable_socket_fallback)

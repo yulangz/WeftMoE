@@ -15,6 +15,7 @@ struct NetworkLayout {
   std::size_t return_tx = 0;
   std::size_t return_rx = 0;
   std::size_t return_stride = 0;
+  std::size_t contribution = 0; // Source-owned, expert-ordered window ring.
   static_forward::NetworkRings rings{};
   std::size_t ring_region = 0;
   std::size_t source_bytes = 0; // Immutable sender metadata, excluding RX geometry.

@@ -205,12 +205,18 @@ __device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
   }
 }
 
+template <bool Network>
 __device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a,
                                          unsigned worker, unsigned workers) {
   namespace ring = static_v4::ring;
   const auto &r = a.ring;
   const auto lane = threadIdx.x & 31U;
   auto view = forward_reduce_detail::reduce_token_view(a);
+  if constexpr (Network) {
+    view.local = peer_at<const transport::BFloat16>(
+        a.gin_window_base, a.static_network.contribution);
+    view.ring_rows = r.contribution_rows;
+  }
   bool started = false;
   const auto &shape = r.source.shape;
   for (std::uint64_t window = 0; window < r.source.local_windows(); ++window) {
@@ -236,7 +242,7 @@ __device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a,
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, ReduceStart, Reduce,
                                  0U, token, execution_epoch(a));
       forward_reduce_detail::reduce_token_payload<false>(view, token + 1U,
-                                                         first_row);
+          Network ? address.row_base : first_row);
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, ReduceEnd, Reduce, 0U,
                                  token, execution_epoch(a));
       ++completed;
@@ -279,7 +285,7 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
       if (blockIdx.x < network_workers)
         network_ring_transport::transmit<true>(a, s, blockIdx.x);
       else if (blockIdx.x < 2U * network_workers)
-        network_ring_transport::receive_return(a, s,
+        network_ring_transport::receive_return(a,
                                                blockIdx.x - network_workers);
       else
         ring_return<true>(a, blockIdx.x - 2U * network_workers,
@@ -290,8 +296,8 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     } else if (blockIdx.x <= network_workers) {
       network_ring_transport::receive_progress(a, blockIdx.x - 1U);
     } else {
-      ring_reduce(a, blockIdx.x - network_workers - 1U,
-                  gridDim.x - network_workers - 1U);
+      ring_reduce<true>(a, blockIdx.x - network_workers - 1U,
+                        gridDim.x - network_workers - 1U);
     }
     return;
   }
@@ -303,5 +309,5 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     static_v4::ring::admit<false>(a, 2U * a.intermediate / Fc1N,
                                   a.hidden / Fc2N);
   else
-    ring_reduce(a, blockIdx.x - 1U, gridDim.x - 1U);
+    ring_reduce<false>(a, blockIdx.x - 1U, gridDim.x - 1U);
 }

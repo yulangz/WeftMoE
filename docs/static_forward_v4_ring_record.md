@@ -3434,3 +3434,94 @@ DQ为8个发包owner/方向，共48 contexts；DR为16个/方向，共64 context
 REG168/STACK424/SHARED2048/LOCAL0/CONSTANT3264；栈减少也没有转化为加速。
 DR长序列只接近DC、短序列退化，未继续正式计时、library、Torch或sanitizer。
 全部拆分代码已撤回；后续实验不含prepared head/额外发包角色。
+
+### DS：Return 直写 source contribution 窗口（保留，性能目标未完成）
+
+回到DC数据面，不含DQ/DR。将多机source contribution按每个source window内
+既有expert-major route_order存放，搬到本rail注册window。source新增每route
+4-byte窗口内行号，Reduce仍按原`combine_order`做相同FP32加法/BF16舍入。
+本机FC2预绑定该注册区的peer地址；远端Return packet恰是expert-major连续
+区间，GIN直接写入同一contribution窗口，不再先写RX payload再逐行scatter。
+接收角色只在GIN导入可见性后发布原有逐route ready，随后释放packet控制slot。
+
+这里有两种不同的复用边界，不能合并：
+
+- Return TX仍由远端packet credit及本地NIC completion双检查保护。
+- contribution payload由source窗口的全部token Reduce credit保护。
+  下一代窗口只有在旧代所有token完成读取后才能准入。远端FC2须先收到该窗口X，
+  而Dispatch发X之前必须看到source contribution reservation；本节点Pull同样
+  先取得source reservation。因此下一代本地FC2/跨机Return都不能提前覆盖旧代。
+
+这不同于CM/AQ让Reduce持续占有network RX slot：Reduce不访问可回收的packet
+控制状态，packet在发布route ready后即可退休，payload一直保留在独立的source
+窗口中。没有按token最坏接收R分配激活，也没有全节点数据面barrier或丢token。
+行号逆映射在已有source-plan grid join之后生成，不新增规划barrier。
+
+初版候选删除了原compute arena的contribution plane，但暂保留未使用的Return
+RX payload预留以分离地址迁移验证；若有收益，验收前应删除该冗余预留。不能把
+当前候选显存记成已经省掉RX，不能将实现本身视为收益。冻结目录
+`build/static_v4_ring_return_contribution/`，编译与数值快筛进行中。
+
+DS初版native SHA256 `82e8b7d12f270d0722a88a14b187301b21537a22def05d729da250981f7e66da`，
+REG168/SHARED2048/LOCAL0/CONSTANT3264，多机prefill/decode栈为432/440bytes。
+host18/18通过，无并发构建/其它GPU工作、1620MHz的T64/20K快筛分别
+333.952/6944.340us；32 hashes与DC一致。只是初步结果，未做相邻正式对照。
+20K pool为914,300,352、compute753,551,032、registered160,749,312bytes/rank，
+相对DC净增加327,680bytes的行号表；保留的RX预留尚未删除。T64初版还错误地
+按配置B512而非有效B64申请contribution，虽不影响结果但浪费容量，下一构建修正。
+
+DS整理版删除Return RX payload预留，NetworkRings只保留Dispatch TX/RX和
+Return TX三种地址；用具名dispatch_payload/return_payload消除不存在的Return RX
+地址组合，同步更新已有布局范围/不重叠检查，没有新建测试套件。contribution
+分配改用与compute ring一致的有效B。整理版冻结目录
+`build/static_v4_ring_return_contribution_trimmed/`，待数值/复用/性能门禁。
+
+整理版native SHA256 `523d35b301e8edd46bc8802074d5f1c36ba3daef14ba0da2f31c5b59d61e83f5`，
+host18/18，REG168/SHARED2048/LOCAL0/CONSTANT3264，多机prefill/decode栈432/440。
+1620MHz、B512/D8、无并发构建/GPU任务的10warmup/2samples/batch2快筛如下，
+64个输出hash与DC一致；这是快筛，不作为正式性能结论。
+
+| T/rank | latency/us | total bytes/rank | compute bytes/rank | registered bytes/rank |
+|---:|---:|---:|---:|---:|
+|1|277.632|62,176,192|11,661,496|50,514,688|
+|64|335.424|91,914,432|33,115,064|58,799,360|
+|8192|2953.970|529,801,408|408,432,568|121,368,832|
+|20480|6948.720|880,745,920|753,551,032|127,194,880|
+
+20K总pool相对DC的913,972,672减少33,226,752bytes/rank：删除33,554,432bytes
+Return RX，增加327,680bytes逆行号表。registered变大来自contribution迁移，
+不代表总pool增加；短序列也按有效B分配。日志`ring_return_contribution_trimmed_ep16_t*_quick.log`。
+
+20K正式相邻DS→DC（1620MHz、10warmup/20samples/batch20、无并发构建/GPU工作）
+为6986.620/7008.140us，p50降低0.307%；样本范围分别6967.520–7034.950和
+6989.860–7030.720us，16hashes一致。收益很小，不能称为显著加速；候选的主要
+价值是消除scatter及减少有界缓冲区。日志
+`ring_return_contribution_trimmed_{ds,dc}_ep16_t20480_formal.log`。
+
+整理版rank1/9 eager B16/D1/K8/T64、11rounds的memcheck与racecheck均launcher
+exit0：两份memcheck各0errors，两份racecheck各0hazards。memcheck local160013/
+remote224506，racecheck local161229/remote224786；只覆盖这两个受检查rank，
+不声称所有rank完成sanitizer。完整Torch及其余正式计时尚待完成。
+
+完整Torch现已完成：EP8的T1/64/512/2048/8192/20480+edges共288项、EP16共576项，
+另EP16 B16/D1/K8的T1/64+edges共304项，全部launcher exit0。包括不等长/空source、
+热点重复expert、长热点后短调用、共享workspace的graph链及输入/route变化。
+library SHA256 `1d5f5905975cb0a45928f500321419cde5b19e4cf08ef4c6932035033fd551ec`。
+日志`ring_return_contribution_trimmed_{tiny_,}torch_ep*`；未新增数值测试套件。
+
+DS最终正式四规模（1620MHz、10warmup/20samples/batch20、无并发编译/GPU任务）：
+
+| T/rank | 单机EP8/us | 双机EP16/us | 相对DC正式参考：EP8 | 相对DC正式参考：EP16 |
+|---:|---:|---:|---:|---:|
+|1|100.547|278.366|基本不变|+0.98%|
+|64|135.494|333.082|基本不变|−0.20%|
+|8192|1257.680|2955.570|基本不变|−1.69%|
+|20480|2954.830|6986.620|+0.17%|−0.36%|
+
+表中DC参考是此前DC正式矩阵，不是四规模逐一相邻重测；20K另有上述真正相邻
+对照（−0.307%）。单机在第二节点独立8卡上测量，共享Reduce helper没有观察到
+明显退化；全部32个hash与此前DC一致。相对同日冻结V3正式参考，双机20K仍只
+快约1.55%，远未达到“明显优于”的目标，不能以省内存替代性能验收。
+DS按完整数值/复用/内存门禁保留，主要记内存和复制简化收益；不恢复已失败的
+直接RX Reduce、context共享或发包owner拆分。最终仅做缩进/换行和注释整理，
+冻结二进制对应的功能patch已留档。日志`ring_return_contribution_trimmed_*_formal.log`。

@@ -40,7 +40,7 @@ struct alignas(64) NetworkSlot {
 static_assert(sizeof(NetworkSlot) == 64U);
 
 // Bases are immutable during one invocation. Separate fixed owners advance
-// TX, NIC-import and Return-scatter cursors; only terminal drain advances bases.
+// TX, NIC-import and Return-publication cursors; terminal drain advances bases.
 struct alignas(64) NetworkChannel {
   std::uint64_t tx_base;
   std::uint64_t rx_base;
@@ -140,16 +140,18 @@ struct NetworkRings {
                          2U * slots() * sizeof(NetworkSlot));
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t
-  payload(bool returning, bool receive, std::uint64_t channel_id,
-          std::uint64_t sequence) const {
-    const auto stride = returning ? return_stride : dispatch_stride;
-    const auto base = data_begin() +
-                      (returning ? 2U * slots() * dispatch_stride : 0U) +
-                      (receive ? slots() * stride : 0U);
-    return base + (channel_id * depth + sequence % depth) * stride;
+  dispatch_payload(bool receive, std::uint64_t channel_id,
+                   std::uint64_t sequence) const {
+    return data_begin() + (receive ? slots() * dispatch_stride : 0U) +
+           (channel_id * depth + sequence % depth) * dispatch_stride;
+  }
+  WEFTMOE_STATIC_RING_HD constexpr std::size_t
+  return_payload(std::uint64_t channel_id, std::uint64_t sequence) const {
+    return data_begin() + 2U * slots() * dispatch_stride +
+           (channel_id * depth + sequence % depth) * return_stride;
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t bytes() const {
-    return data_begin() + 2U * slots() * (dispatch_stride + return_stride);
+    return data_begin() + slots() * (2U * dispatch_stride + return_stride);
   }
 };
 

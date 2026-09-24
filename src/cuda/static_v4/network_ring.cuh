@@ -35,10 +35,11 @@ struct Endpoint {
         a.static_network.ring_region + layout().state(returning, channel));
   }
 
-  __device__ std::size_t payload(bool returning, bool receive, unsigned channel,
-                                 std::uint64_t sequence) const {
+  __device__ std::size_t tx_payload(bool returning, unsigned channel,
+                                    std::uint64_t sequence) const {
     return a.static_network.ring_region +
-           layout().payload(returning, receive, channel, sequence);
+           (returning ? layout().return_payload(channel, sequence)
+                      : layout().dispatch_payload(false, channel, sequence));
   }
 
   __device__ unsigned counter(bool returning, unsigned channel,
@@ -75,9 +76,23 @@ struct Endpoint {
   __device__ void send(bool returning, unsigned channel, std::uint64_t sequence,
                        std::size_t bytes) {
     const auto remote = remote_channel(channel);
-    gin.put(ncclTeamWorld(gin.comm), peer(channel), a.gin_window,
-            payload(returning, true, remote, sequence), a.gin_window,
-            payload(returning, false, channel, sequence), bytes,
+    std::size_t destination;
+    if (returning) {
+      const auto source = peer(channel);
+      const auto directory = a.node * layout().lanes + channel % layout().lanes;
+      const auto begin = ring::source_metadata(
+          a, source, a.ring.returning.channel_offsets)[directory];
+      const auto &packet =
+          ring::source_metadata(a, source, a.ring.returning.packets)[
+              begin + sequence - state(true, channel).tx_base];
+      destination = return_tx::destination(a, source, packet);
+    } else {
+      destination = a.static_network.ring_region +
+                    layout().dispatch_payload(true, remote, sequence);
+    }
+    gin.put(ncclTeamWorld(gin.comm), peer(channel), a.gin_window, destination,
+            a.gin_window,
+            tx_payload(returning, channel, sequence), bytes,
             // Each slot imports its own bundled Put. No consumer relies on
             // this signal to order other packets on the same context.
             ncclGin_WeakVASignalAdd{

@@ -2,6 +2,22 @@
 
 namespace static_v4::return_tx {
 
+// Return packets are contiguous intervals of the source's expert-major order.
+// Dispatch of this source window implies its contribution slot is reserved.
+// The slot remains live until every token is reduced, independently of the
+// packet control-slot credits used by the remote TX owner.
+__device__ __forceinline__ std::size_t destination(
+    const ForwardKernelArgs &a, unsigned source,
+    const static_forward::ReturnPacketPlan &packet) {
+  const auto &r = a.ring;
+  const auto window = packet.window / r.source.shape.groups();
+  const auto sequence = r.source_epochs[source].base + window;
+  const auto row = (sequence % r.contribution_depth) * r.contribution_stride +
+                   packet.route_begin - window * r.source.window_capacity();
+  return a.static_network.contribution +
+         row * a.hidden * sizeof(transport::BFloat16);
+}
+
 __device__ __forceinline__ unsigned channel(const ForwardKernelArgs &a,
                                             unsigned source, unsigned lane) {
   return a.static_network.rings.channel(a.node, source / a.local_world_size,
@@ -42,8 +58,8 @@ __device__ __forceinline__ void *row_output(
   const auto lane = static_cast<unsigned>(packet % packets.lanes);
   const auto &network = a.static_network;
   const auto offset = network.ring_region +
-      network.rings.payload(true, false, channel(a, source, lane),
-                            sequence(a, source, local_window, packet)) +
+      network.rings.return_payload(channel(a, source, lane),
+                                   sequence(a, source, local_window, packet)) +
       (node_row % packets.rows) * a.hidden * sizeof(transport::BFloat16);
   return ncclGetLsaPointer(a.gin_window, offset, source % a.local_world_size);
 }

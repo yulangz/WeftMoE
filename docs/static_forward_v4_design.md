@@ -22,6 +22,9 @@ Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多�
 未完成，进展与测量见 ring 记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
 须先取得双 credit 并发布 reservation，destination 才可准入相应整窗口。
+DS进一步让远端Return直写source注册区中的expert-major contribution窗口，
+删除Return RX payload及scatter。packet控制slot在ready发布后退休，payload仍
+由全部token的Reduce credit保护；两种复用边界不能混同，详见6.6的DS说明。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -196,7 +199,7 @@ S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 
 | C / FC2 输出 | 首版 `[D_c, M, H]`；CN/CO 后不分配 payload | 保留逐 slot 的 FC2/returned 账本，输出直接写已预留的 contribution/TX |
 | Dispatch TX / RX | 分离的 `[remote_node, lane, D_net, slot_bytes]` | 本 rail 的注册区，逐 slot credit |
 | Return TX / RX | 同样分离的 peer/channel ring | 不与 Dispatch 或对向 TX 别名 |
-| contribution | source 上 `[D_contrib, B, K, H]` 及 route-ready | 同一 token 的 Reduce 完成后释放相应窗口 |
+| contribution | source 上至多 `D_contrib×B×K×H` 及 route-ready；多机每窗expert-major，单机token-major | 窗口全部 token 的 Reduce 完成后释放 |
 | immutable route plan | 实际路由/窗口几何及返回映射 | invocation；训练延长到 Backward |
 | training tape | 实际大小的 X/G/U 等 checkpoint | 不放在会覆盖的 transient ring 里 |
 
@@ -234,14 +237,13 @@ source X
   -> target expert X[x_slot,row,:]
   -> S[s_slot,row,:]
   -> FC2 直接写 compute node rail Return TX[source_node,lane,slot]
-  -> source rail Return RX[compute_node,lane,slot]
-  -> source contribution[window_slot,token_in_window,topk_slot,:]
+  -> GIN 直接写 source registered contribution[window_slot,expert_ordered_row,:]
   -> source output[token,:]
 ```
 
 same-node Dispatch 直接从源 peer 可达 X pull 到 expert X ring；same-node Return
 直接写 source contribution。返回标识必须能恢复 source window/token/top-k slot。
-以上地址为 CN/CO 后的实现；首版曾经由 C 再搬到 TX。不可变 RingRow 中预绑定
+以上地址为 DS 后的实现；首版曾经由 C 再搬到 TX，及 RX 再scatter。不可变 RingRow 中预绑定
 FC2 output 地址，不把可复用 TX payload 当成路由目录。
 
 不能把 Return 唯一的反向映射放在已释放的 X slot：优先从 immutable plan 查询；
@@ -302,7 +304,7 @@ device-scope；TMA/网络操作先真正完成，再走对应的 release/acquire
 |---|---|---|
 | Dispatch RX chunk | 本 chunk 所有 token 在目标节点上的有效 fanout 总数 | source packet planner |
 | C Mblock | 当前窗口内本 block 的有效 route 行数 | destination geometry owner |
-| Return RX chunk | packet 内完整 contribution 行数 | source Return packet planner |
+| Return 接收控制slot | packet 内完整 contribution 行数；DS在这些行ready发布后退休 | source Return packet planner |
 
 Dispatch在数据面开始前，从实际route及固定分包规则计算每packet计数：
 
@@ -340,7 +342,7 @@ retirement 计数是两个概念。所有批量记账都要求静态分区无重
 - X：所有 FC1 N tiles 及训练需要的 X checkpoint 读取结束后释放。
 - S：所有 FC2 N tiles 读取结束后释放。
 - C：所有有效行连同返回标识搬到独立 TX/源 contribution 后释放，不等网络发送。
-- Return RX：全部行 scatter 到 source contribution 并发布 readiness 后释放，不等 Reduce。
+- Return 接收控制slot：全部行发布 readiness 后释放，不等 Reduce。DS无独立RX payload。
 - contribution：对应窗口所有 token 的固定顺序 Reduce 完成后释放。
 - TX：仍按第 6.4 节双重检查，不能把 C 的退休等同于 TX 可复用。
 
@@ -457,6 +459,9 @@ fanout；不能机械沿用 expert-major canonical row 的阻塞遍历。否则�
 前序 packet 的任务；详见第 6.5 节的独立进度约束。
 
 ### 6.3 Return 与 FC2 流水
+
+本节保留首版C→TX→RX→scatter的演进描述；当前CN/CO及DS分别消除了两次复制，
+具体地址与生命周期以6.6补充说明为准，不能将旧RX credit当成contribution复用权。
 
 Return 不恢复 V3 的运行时 append/claim queue。固定 owner 从 immutable plan 的
 route/mblock 列表枚举，按 (window, source rank, lane) 分包；一个 packet 可跨多个
@@ -638,6 +643,32 @@ Q小于Qmax时每window至多一个packet/lane，故原depth仍足够；目录�
 容量上界改为`max(lanes, ceil(B*capacity_top_k/Qmax))`并受总routes上界限制。
 CV/CW完整门禁与正式结果见ring记录；明确收益在短序列，长序列未明显改善。
 
+#### DS：Return 直写 source contribution，删除 RX scatter
+
+多机contribution迁至各source rail的注册window，物理容量仍为`D×B×K`行。
+每个窗口内部沿用既有expert-major `route_order`，Return packet是其中连续区间，
+因此GIN一次Put可直写最终contribution地址。节点内FC2同样预绑定该区的LSA地址；
+source私有`uint32[route]`逆表把原route映射到窗口内行号。Reduce仍按原expert/slot
+顺序逐项FP32相加再BF16舍入，ready数组仍采用原token-major索引。单机布局不改。
+
+Return TX仍先取得远端packet credit和本地NIC completion，FC2-ready后才能Put。
+source NIC import owner用GIN readSignal导入payload可见性，release发布packet
+generation；固定接收角色acquire后发布各route ready，再累加既有`desc.rows`退休
+packet控制slot。它不再复制payload，也不将可复用控制slot的指针交给Reduce。
+
+payload有独立且更长的寿命：source全部token完成Reduce，才能给下一代窗口credit。
+Dispatch发出该窗口X前已取得source contribution reservation；同节点Pull也有
+同样依赖。因此下一代FC2/远端Return不可能先于该reservation写入contribution。
+packet ACK只允许TX/control复用，不允许提前覆盖source payload；保守本地NIC
+credit保留。两个ready/credit链共同成立，不能只凭远端ACK推出payload安全。
+
+注册网络ring仅保留Dispatch TX/RX和Return TX三种payload plane。每channel/slot
+Return控制仍在，既有expected rows、terminal drain及跨调用metadata会合不变。
+逆行号在已有规划join后生成，无新barrier或运行时expected推测。
+DS完整EP8/EP16及B16/D1/K8数值通过，rank1/9重复调用memcheck/racecheck均0；
+20K相邻正式对照仅降低约0.3%，主要收益是少33,226,752bytes/rank缓冲区，不将其
+称为显著提速或整体性能目标已完成。完整测量/冻结构建见ring记录DS。
+
 ### 6.7 Return RX 直接 Reduce 消融（AQ，未获益，已撤回）
 
 基于逐 slot 协议消融掉 RX→contribution 的额外复制。每个 source route 的
@@ -655,7 +686,8 @@ RX 从“scatter 后可释放”改为“引用它的全部 Reduce route 消费�
 释放容量。该容量上界随 B/K/Q/L，不随总 tokens 增长；较大 B 的内存代价要
 单独报告。只在完整正确性、wrap、热点与性能验证后，才替代 6.6 的已验证 scatter
 基线。AQ 的 8K 快筛没有收益，已撤回实现，未完成完整正确性验证；这里只
-保留协议分析供后续参考，当前仍使用 6.6 的 RX scatter。实测见 ring 记录 AQ。
+保留协议分析供后续参考。后续DS也消除了scatter，但Reduce持有的是独立source
+窗口，不是AQ的可复用network RX slot，不能将二者视为同一协议。实测见ring记录。
 
 ### 6.8 计算 GPU 直接跨机 Return（BL/BM，无收益，已撤回）
 
@@ -933,7 +965,7 @@ M2 首版 X/S/C 有独立 completion/target，但三个 plane 使用相同物理
 ### M4：多机 Return/C 回收与端到端流水
 
 - [x] 从静态 C/route 目录打包，按完整行退休 C；不引入 fragment 引用图或 append queue。
-- [x] Return TX/RX 与 Dispatch 独立；source RX scatter 后归还 credit，Reduce 后释放窗口。
+- [x] Return 与 Dispatch 独立；DS直写contribution，ready发布后归还packet credit，Reduce后释放payload窗口。
 - [x] 移除节点级 FC2→Return barrier，确认 Return 与其他 Mblocks 的 FC1/FC2 重叠。
 - [x] 完成所有 channel 的 terminal/drain、跨调用/Graph 状态复用。
 - [x] EP8/EP16 全矩阵、热点与小深度 wrap 通过；记录 Dispatch 和 Return 各步收益及

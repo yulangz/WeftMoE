@@ -36,6 +36,7 @@ struct ReduceTokenView {
   const std::uint64_t *return_base;
   const std::uint32_t *route_expert;
   const std::uint64_t *local_offset;
+  const std::uint32_t *ring_rows;
   std::uint64_t hidden;
   std::uint32_t top_k;
 #if WEFTMOE_DEBUG_VALIDATE
@@ -93,9 +94,11 @@ reduce_token_payload_impl(const ReduceTokenView &v,
   const auto source_row = [&](unsigned order) {
     const auto slot = v.order[token * top_k + order];
     const auto route = token * v.top_k + slot;
-    const auto row = v.return_base
-        ? v.return_base[v.route_expert[route]] + v.local_offset[route]
-        : (dense_row_base == ~std::uint64_t{0} ? route : dense_row_base + slot);
+    const auto row = v.ring_rows
+        ? dense_row_base + v.ring_rows[route]
+        : v.return_base
+            ? v.return_base[v.route_expert[route]] + v.local_offset[route]
+            : (dense_row_base == ~std::uint64_t{0} ? route : dense_row_base + slot);
     return v.local + row * v.hidden;
   };
   // A small fixed top-k can keep all ordered addresses in registers. The

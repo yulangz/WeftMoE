@@ -132,7 +132,7 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       if constexpr (!Returning)
         if (!endpoint.can_send(false, channel, sequence))
           continue;
-      const auto offset = endpoint.payload(Returning, false, channel, sequence);
+      const auto offset = endpoint.tx_payload(Returning, channel, sequence);
       auto *payload = peer_at<char>(a.gin_window_base, offset);
       if constexpr (!Returning) {
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchPackStart,
@@ -245,9 +245,8 @@ __device__ __noinline__ void receive_progress(const ForwardKernelArgs &a,
   } while (!done);
 }
 
-template <class Storage>
 __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
-                                            Storage &storage, unsigned worker) {
+                                            unsigned worker) {
   if ((threadIdx.x & 31U) != 0U)
     return;
   const auto &r = a.ring;
@@ -255,11 +254,6 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
   // This role only computes addresses; all GIN calls remain with
   // receive_progress.
   Endpoint endpoint(a, 0U);
-  RowPrefetchPipeline<Storage> prefetch(storage, 1U);
-  auto *output =
-      peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
-  const auto row_bytes =
-      static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16));
   bool done;
   do {
     done = true;
@@ -281,22 +275,12 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
       const auto route_begin =
           r.source.shape.token_begin(desc.window) * r.source.shape.top_k;
       const auto *routes = r.source.route_order + desc.route_begin;
-      const auto *payload = peer_at<const char>(
-          a.gin_window_base,
-          endpoint.payload(true, true, channel, sequence));
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceRelayStart,
                                  SourceRelay, channel, sequence, desc.rows);
-      asm volatile("fence.proxy.async.global;" ::: "memory");
-      for (unsigned row = 0U; row < desc.rows; ++row)
-        prefetch.copy(payload + std::uint64_t(row) * row_bytes,
-                      output + (address.row_base + routes[row] - route_begin) *
-                                   a.hidden,
-                      row_bytes);
-      prefetch.drain();
-      finish_copies<false>();
-      // NIC visibility has already been imported and the scatter is complete.
-      // Only this GPU's Reduce reads these rows; peer Return writers publish
-      // different route slots, so this publication needs device scope only.
+      // GIN imported writes directly into the source contribution window.
+      // Retire only the packet notification here; payload reuse is controlled
+      // by the source window's all-token Reduce credit, acquired before X can
+      // be dispatched again. No reader depends on this network control slot.
       for (unsigned row = 0U; row < desc.rows; ++row)
         ring::publish(
             r.contribution_ready[address.row_base + routes[row] - route_begin],

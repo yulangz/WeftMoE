@@ -87,7 +87,7 @@ __device__ __forceinline__ void build_pull_packets(const ForwardKernelArgs &a,
            ncclGetLsaPointer(
                a.gin_window,
                network.ring_region +
-                   network.rings.payload(false, true, channel, sequence),
+                   network.rings.dispatch_payload(true, channel, sequence),
                source % a.local_world_size),
            &control->visible_generation,
            &control->consumed_total,
@@ -161,6 +161,13 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
                                Kernel, 0U, 0U, 0U);
+    for (auto index = worker; index < p.local_windows() * p.window_capacity();
+         index += workers) {
+      const auto window = index / p.window_capacity();
+      const auto ordinal = index % p.window_capacity();
+      if (ordinal < p.expert_prefix[window * (p.experts + 1U) + p.experts])
+        r.contribution_rows[p.route_order[index]] = static_cast<unsigned>(ordinal);
+    }
     static_forward::build_source_packet_prefix(p, worker, workers);
     static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
     grid_sync<0U, Threads>(a);
@@ -344,10 +351,19 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         void *output;
         if (!Network || source / a.local_world_size == a.node) {
           const auto &address = window_source(a, w, source);
-          const auto route_begin = p.shape.token_begin(w) * p.shape.top_k;
-          output = peer_at<transport::BFloat16>(a.peer_bases[source],
-                                                a.contribution_offset) +
-                   (address.row_base + route - route_begin) * a.hidden;
+          if constexpr (Network) {
+            const auto output_row = address.row_base +
+                source_prefix[a.rank * owned + expert] + ordinal;
+            output = ncclGetLsaPointer(
+                a.gin_window, a.static_network.contribution +
+                                  output_row * a.hidden * sizeof(transport::BFloat16),
+                source % a.local_world_size);
+          } else {
+            const auto route_begin = p.shape.token_begin(w) * p.shape.top_k;
+            output = peer_at<transport::BFloat16>(a.peer_bases[source],
+                                                  a.contribution_offset) +
+                     (address.row_base + route - route_begin) * a.hidden;
+          }
         } else {
           const auto node_expert = a.node * a.local_world_size * owned;
           const auto node_row = source_prefix[a.rank * owned + expert] +
