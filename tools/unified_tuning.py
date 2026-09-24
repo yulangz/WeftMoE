@@ -36,7 +36,7 @@ SHARED_PARAMETERS = frozenset({"gin_ring_depth", "gin_dispatch_channels",
 # local scheduling policy and does not consume these Forward-only controls.
 FORWARD_ONLY_PARAMETERS = frozenset({
     "unified_row_prefetch", "unified_optimize_gin_local_transport",
-    "unified_return_drain_rows", "unified_split_nvlink", "unified_rdma_ctas"})
+    "unified_return_drain_rows", "unified_split_nvlink"})
 
 
 def parameter_macros(phase):
@@ -139,7 +139,7 @@ def validate(config):
     require_choice(config, "unified_threads", (384, 512, 640))
     require_choice(config, "unified_split_nvlink", (0, 1))
     require(config["unified_rdma_ctas"] >= 0,
-            "unified RDMA CTA count must be nonnegative (zero selects mixed workers)")
+            "unified RDMA CTA count must be nonnegative (zero selects the phase default)")
     require_choice(config, "unified_row_prefetch", (0, 1))
     require_choice(config, "unified_optimize_gin_local_transport", (0, 1))
     require(32 <= config["unified_return_drain_rows"] <= 1024 and

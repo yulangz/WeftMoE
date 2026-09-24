@@ -6,3 +6,9 @@
 #include "../static_inference_20260922/weftmoe_forward_tuning_generated.hpp"
 #define WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS 512
 #define WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS 2048
+
+// Ring training retains the validated V3 unified Backward. A generated
+// Forward-only profile otherwise selects the standalone Backward defaults.
+#define WEFTMOE_BWD_UNIFIED_WORKERS 1
+#define WEFTMOE_BWD_RELAY_CTAS 16
+#define WEFTMOE_BWD_UNIFIED_RDMA_CTAS 16

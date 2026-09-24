@@ -79,7 +79,10 @@ many CTA communication domains for RDMA packing/control, clamped to leave at
 least one relay CTA. All CTAs retain GEMM workers. Single-node execution always
 uses relay roles. Bare or macro-absent headers default to 16; legacy plans and
 the public grids explicitly retain 0 until the new path is tuned. Backward
-currently accepts the parameter for plan compatibility and does not consume it.
+uses its own phase-specific sender quota: a positive value selects that count,
+also leaving at least one receiver CTA; 0 in historical plans selects 16.
+Backward no longer borrows Forward's quota, so disabling legacy Forward senders
+for static inference does not collapse training to a single network sender.
 Forward Return notifications use a dedicated full-warp single consumer in both
 layouts. The staged evidence is in
 [the communication partition record](../benchmarks/communication_partition_20260915.json).

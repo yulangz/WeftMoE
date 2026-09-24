@@ -6664,8 +6664,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     args.local_notification_ctas = compute_ctas;
     if (use_gin) {
       args.gin_total_ctas = compute_ctas;
-      args.gin_sender_count = forward_tuning::unified_rdma_ctas(compute_ctas, true);
-      if (!args.gin_sender_count) args.gin_sender_count = 1U;
+      args.gin_sender_count =
+          std::min(backward_tuning::kUnifiedRdmaCtas, compute_ctas - 1U);
       args.gin_receiver_base = args.gin_sender_count;
       args.gin_receiver_count = compute_ctas - args.gin_sender_count;
     }

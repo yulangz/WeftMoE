@@ -34,6 +34,11 @@ inference正式回归通过且性能持平。M6f随后接通Notify精确P_actual
 回退通过；完整训练sanitizer/性能门禁仍未完成，长序列inference显著领先目标
 也尚未满足。
 
+M6g补齐ring训练的unified Backward配置，并让Backward独立选择sender配额，
+不再误读静态Forward的零legacy-sender配置。EP8/EP16数值、小ring热点、
+memcheck及inference正式矩阵回归通过；20K Backward从原split的5707/14571us
+恢复到4917/6874us，接近冻结V3。训练Forward长文性能门禁仍未关闭，详见训练记录。
+
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
@@ -1046,6 +1051,9 @@ materialized Notify随已有status下载保存逐专家M128取整后的总行数
 - [x] 多机checkpoint及Backward有界GIN window adapter；通用节点索引/分区，EP16验证。
 - [x] 精确P_actual分配（M6f）；EP8/EP16数值、零行rank、热点迁移、OOM重试、
   memcheck及非ring回退通过，inference四规模正式回归无稳定退化。
+- [x] 训练profile解耦（M6g）：unified Backward及独立sender配额，旧计划0取
+  Backward默认16；数值、热点/多tape、memcheck和正式性能回归通过。Backward
+  恢复到冻结V3附近，未宣称训练Forward或完整训练性能门禁完成。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 

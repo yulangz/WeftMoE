@@ -86,7 +86,7 @@
 #ifndef WEFTMOE_FWD_UNIFIED_SPLIT_NVLINK
 #define WEFTMOE_FWD_UNIFIED_SPLIT_NVLINK WEFTMOE_UNIFIED_SPLIT_NVLINK
 #endif
-// Reserved plan compatibility until Backward adopts role partitioning.
+// Zero keeps the default Backward sender quota; it does not inherit Forward's.
 #ifndef WEFTMOE_BWD_UNIFIED_RDMA_CTAS
 #define WEFTMOE_BWD_UNIFIED_RDMA_CTAS 0
 #endif

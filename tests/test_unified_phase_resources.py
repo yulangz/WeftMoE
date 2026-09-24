@@ -16,6 +16,24 @@ from run_performance_matrix import combined_generated_header
 
 
 class UnifiedDefaultMacroTest(unittest.TestCase):
+    def test_backward_sender_quota_is_independent_of_forward(self):
+        compiler = shutil.which("c++")
+        if not compiler:
+            self.skipTest("a host C++ compiler is required")
+        for requested in (None, 0, 1, 16, 32):
+            source = "#define WEFTMOE_FWD_UNIFIED_RDMA_CTAS 0\n"
+            if requested is not None:
+                source += f"#define WEFTMOE_BWD_UNIFIED_RDMA_CTAS {requested}\n"
+            source += '#include "cuda/forward/tuning_config.hpp"\n'
+            source += '#include "cuda/backward/tuning_config.hpp"\n'
+            source += ("static_assert(weftmoe::cuda::backward_tuning::"
+                       f"kUnifiedRdmaCtas == {requested or 16});\n")
+            result = subprocess.run(
+                [compiler, "-std=c++17", "-fsyntax-only", "-x", "c++",
+                 "-I", str(ROOT / "src"), "-"], input=source, text=True,
+                capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rdma_partition_keeps_a_relay_on_small_grids(self):
         compiler = shutil.which("c++")
         if not compiler:

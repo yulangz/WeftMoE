@@ -127,6 +127,12 @@
 
 namespace weftmoe::cuda::backward_tuning {
 inline constexpr bool kUnifiedWorkers = WEFTMOE_BWD_UNIFIED_WORKERS != 0;
+// Backward owns its sender quota independently of Forward's execution mode.
+// Static Forward has no legacy senders, but unified Backward still needs them.
+// Historical plans wrote zero to this previously unused field.
+inline constexpr unsigned kUnifiedRdmaCtas =
+    WEFTMOE_BWD_UNIFIED_RDMA_CTAS ? WEFTMOE_BWD_UNIFIED_RDMA_CTAS : 16U;
+static_assert(WEFTMOE_BWD_UNIFIED_RDMA_CTAS >= 0);
 using UnifiedResources = unified_worker_tuning::Resources<
     WEFTMOE_BWD_UNIFIED_THREADS, WEFTMOE_BWD_UNIFIED_COMM_THREADS,
     WEFTMOE_BWD_UNIFIED_COMM_BASE, WEFTMOE_BWD_UNIFIED_MATH_REGISTERS,

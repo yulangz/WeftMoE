@@ -669,4 +669,82 @@ EP8 inference正式10/20/batch20为100.795/135.640/1266.920/2955.740us，
 32个输出hash和全部pool bytes等于M6f；计时节点独立，另一节点仅跑EP8正确性。
 这些结果只是该候选的回归，不是inference优化。日志前缀
 `training_unified_backward_m6g_`、`training_perf_m6g_`、`training_perf_m6f_ep16_`。
-双机inference回归及冻结V3 Backward完整对照正在运行，尚未提交配置变更。
+双机inference正式回归随后完成，为278.469/332.790/2954.220/6990.330us，
+64个hash与pool容量均等于M6f，未见稳定改变。同期冻结V3的EP16 Backward
+device total为339.008/701.024/2757.600/6862.430us；T1有一次1641.440us
+离群值，p95为347.200us，表述中不隐藏这一波动。原unified候选因sender耦合
+未采用，尚未提交配置变更。
+
+### M6g第二轮：接通Backward独立sender配额（已验证）
+
+直接复用已有但此前未使用的`BWD_UNIFIED_RDMA_CTAS`，host按Backward配额划分
+sender/receiver，clamp后至少保留一个receiver；所有CTA仍保留GEMM角色。
+旧生成计划里的0解释为Backward默认16，不再受Forward的0/mixed/静态模式影响。
+ring配置明确选择unified及16个sender。sender completion数组原已按SM数分配，
+无需加buffer、改变GIN counter区间或修改设备内核。
+
+首个显式16配置构建`static_v4_training_backward_senders_m6g2/`：native
+`20e7a637461320eb381680d301686512963a928ebe35ebcb16531d8060b9cfb1`，
+lib`193441a907de044549e2d5ce4f736541c10cd33cbc2e0fee48c135669eabe954`。
+EP16 20K诊断测量10/20为6886.300us（6836.060–6995.330），64个梯度hash
+逐字等于同期冻结V3；恢复到V3附近，明显优于原split。该轮启动期间还运行了
+host配置语法检查，不作为最终无并发构建的正式验收结果。
+
+审计发现通用资源头早已将此兼容字段定义为0，所以不能仅在Backward头加
+`#ifndef ... 16`。最终改为显式解释旧值0，并同步调优工具的phase-owned说明。
+在现有资源测试中只增加一个针对Forward=0串用及Backward缺省/0/显式值的检查；
+修改前确实失败，兼容处理后phase资源15/15、参数验证10/10通过。
+较大的搜索空间测试有4 failures/2 errors；换回HEAD的原`unified_tuning.py`
+仍产生相同失败，全部是Forward候选规模/旧staging容量断言，本轮未扩大范围
+修改这些既有问题。日志`training_backward_senders_m6g2_{macro_before,
+phase_resources,tuning_tests,search_space_head}.log`。
+
+最终冻结`build/static_v4_training_backward_senders_m6g2_final/`：
+
+- native `cc30bf44040fa48efed7bab0a9545bb14525474e538f47b4bb0b1e4f7e77b683`
+- lib `ade15d7cdf2d1ee7a2ad9a9b5f83d5148f087678a9ca9f7595b5e752bf07c73d`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+两个unified Backward kernel的SASS与第一轮M6g完全相同，组合dump共82689行，
+确认包含local/network两个function而不是空dump，SHA256均为
+`a8a044ff6c43deaaacfacb23672ad23856c879c474659becafe256b5085eb51c`。
+这支持收益来自host角色配额修正，不是GEMM或数值优化；不能代替运行时验收。
+EP8/EP16 native T64/K6/B16/D1已通过，两次Backward稳定，96个梯度hash等于M6g/M6f。
+EP8四规模inference正式回归为100.688/135.434/1266.750/2950.030us，32hash与
+全部pool bytes等于M6f。
+
+EP16 Torch T1/64/8192均匀及T20480全热点，五项数值及后续独立inference
+graph/offload全部通过；T64有32 failure、16 retry、48 live-tape标记。
+EP16 T2048、EP8 T512全热点B16/D1完整脚本通过，all-weftmoe memcheck的
+rank0/last均0errors：EP16 PID350801/270961，EP8 PID352107/352117。
+EP8主矩阵此前第一轮M6g已完整验证，本轮本地Backward设备代码不变，另用
+native重复调用、小ring热点/迁移/重试及下面的正式矩阵回归。
+
+最终1620MHz、cached-tape Backward、10warmup/20samples的device total如下；
+EP8在第二节点独立测量，部分轮次与第一节点构建/EP8正确性并行；测量节点无
+CPU构建或其它GPU任务。EP16计时期间两节点均无并行构建/其它GPU任务。
+
+|T/rank|EP8修正后/us|EP8冻结V3/us|EP16修正后/us|EP16冻结V3/us|
+|---:|---:|---:|---:|---:|
+|1|234.656|233.056|343.648|339.008|
+|64|369.184|370.752|696.640|701.024|
+|8192|2063.870|2064.700|2771.040|2757.600|
+|20480|4917.220|4979.970|6873.570|6862.430|
+
+EP16四形状共256个梯度hash逐字等于同期冻结V3。20K相对M6f split的EP8
+5706.530us、EP16 14571.300us分别减少约13.8%/52.8%；主要是恢复应有profile，
+不能宣称新Backward算法显著领先V3，也不能将独立Forward/Backward中位数相加
+冒充实测整步训练时间。日志`training_perf_m6g2_{remote_ep8,ep16}_t*_backward.log`。
+
+最终inference正式10/20/batch20如下，96个hash及全部pool bytes等于M6f：
+
+|T/rank|单机EP8/us|双机EP16/us|
+|---:|---:|---:|
+|1|100.688|277.781|
+|64|135.434|333.541|
+|8192|1266.750|2956.430|
+|20480|2950.030|6996.060|
+
+无稳定inference改变；日志`training_backward_senders_m6g2_inference_*_formal.log`。
+本里程碑采用Backward profile/sender解耦修正，不关闭训练Forward长文退化、旧
+Backward racecheck未决报告或EP16长序列inference显著领先V3的剩余目标。
