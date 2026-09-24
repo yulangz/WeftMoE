@@ -46,10 +46,10 @@ struct BackwardKernelArgs {
   const transport::BFloat16 *saved_ab = nullptr;
   std::uint64_t saved_rows = 0;
   std::size_t compact_dr_offset = 0;
-  std::size_t recomputed_u_offset = 0;
-  std::size_t dab_offset = 0;
-  std::size_t dx_rows_offset = 0;
-  std::size_t dgate_rows_offset = 0;
+  transport::BFloat16 *recomputed_u = nullptr;
+  transport::BFloat16 *dab = nullptr;
+  transport::BFloat16 *dx_rows = nullptr;
+  float *dgate_rows = nullptr;
   std::size_t dgate_output_offset = 0;
   transport::BFloat16 *dw1 = nullptr;
   transport::BFloat16 *dw2 = nullptr;

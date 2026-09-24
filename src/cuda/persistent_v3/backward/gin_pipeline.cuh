@@ -178,9 +178,8 @@ __device__ __forceinline__ void pack_return(const BackwardKernelArgs &a,
       peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const auto *mapping =
       peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
-  const auto *dx =
-      peer_at<const transport::BFloat16>(a.local_base, a.dx_rows_offset);
-  const auto *gates = peer_at<const float>(a.local_base, a.dgate_rows_offset);
+  const auto *dx = a.dx_rows;
+  const auto *gates = a.dgate_rows;
   const auto warp = wire::transport_thread() / 32U, lane = threadIdx.x % 32U;
   for (unsigned i = warp; i < task.rows; i += blockDim.x / 32U - 1U) {
     const auto row = entries[task.first + i], padded = mapping[row];

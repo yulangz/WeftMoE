@@ -542,10 +542,8 @@ __global__ __launch_bounds__(
       const auto descriptor = descriptors[return_mblock_shared];
       const auto *headers = peer_at<const LocalP2pRouteHeader>(
           a.local_base, a.direct_headers_offset);
-      const auto *dx =
-          peer_at<const transport::BFloat16>(a.local_base, a.dx_rows_offset);
-      const auto *dgate =
-          peer_at<const float>(a.local_base, a.dgate_rows_offset);
+      const auto *dx = a.dx_rows;
+      const auto *dgate = a.dgate_rows;
       const auto warp = threadIdx.x / 32U;
       const auto lane = threadIdx.x & 31U;
       for (std::uint32_t local_row = warp; local_row < descriptor.valid_rows;

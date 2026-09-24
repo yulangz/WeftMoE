@@ -966,6 +966,12 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
 
 ### M6：训练 Forward tape 与 Backward 对接
 
+M6a已将rank-private Backward U/dAB/dX/dGate从固定pool移到调用级存储，按
+实际R加有界expert padding分配；EP8/EP16均匀/热点数值及memcheck通过。
+训练仍走V3，ring plan/checkpoint及peer arena迁移尚未完成。冻结V3和M6a均
+存在待查的racecheck共享内存/DSM报告，不能声称训练sanitizer全部通过。
+详见 [训练对接记录](static_forward_v4_training_record.md)。
+
 - [ ] StableTape plan、按实际规模分配、main_from_plan 复用同一 plan。
 - [ ] checkpoint 写出纳入 slot 生命周期，Backward 不依赖已覆盖的 transient 数据。
 - [ ] 对齐 tape 行号、G/U 布局、固定 dW reduction 顺序；实现必要的 Backward adapter。

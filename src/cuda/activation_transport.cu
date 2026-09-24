@@ -2116,38 +2116,10 @@ make_activation_pool_state(const CollectiveSession &session,
               config.max_hidden_size, config.max_destination_rows_per_rank,
               backward_tuning::kActivationTileM, "Backward compact dR",
               backward_tuning::kTileK);
-          slot.backward_dab_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.backward_dab_rows),
-              2ULL * config.max_intermediate_size,
-              state->layout.backward_padded_capacity_rows,
-              backward_tuning::kActivationTileM, "Backward padded dAB",
-              backward_tuning::kTileK);
           slot.backward_dr_mn_map = make_bf16_tma_map_mn(
               at<void>(slot.device, state->layout.forward_training_output),
               config.max_hidden_size, config.max_destination_rows_per_rank,
               "Backward compact dW2 dR MN-major");
-          slot.backward_u_mn_map = make_bf16_tma_map_mn(
-              at<void>(slot.device, state->layout.backward_u),
-              config.max_intermediate_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dW2 U MN-major");
-          slot.backward_dab_mn_map = make_bf16_tma_map_mn(
-              at<void>(slot.device, state->layout.backward_dab_rows),
-              2ULL * config.max_intermediate_size,
-              state->layout.backward_padded_capacity_rows,
-              "Backward dW1 dAB MN-major");
-
-          slot.backward_u_store_map = make_bf16_tma_store_map(
-              at<void>(slot.device, state->layout.backward_u),
-              config.max_intermediate_size,
-              state->layout.backward_padded_capacity_rows, "Backward dU output",
-              0ULL, backward_tuning::kActivationTileM);
-          slot.backward_dx_store_map = make_bf16_tma_store_map(
-              at<void>(slot.device, state->layout.backward_dx_rows),
-              config.max_hidden_size,
-              state->layout.backward_padded_capacity_rows, "Backward dX output",
-              0ULL, backward_tuning::kActivationTileM);
-
           slot.backward_maps_valid = true;
         }
         slot.forward_maps_valid = true;
@@ -6344,8 +6316,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   auto lease = retained.slot
                    ? retained.slot
                    : acquire_slot(pool, identity.generation, identity.rank);
-  if (!pool->config.enable_backward_state || layout.backward_dab_rows == 0 ||
-      layout.backward_dx_rows == 0 ||
+  if (!pool->config.enable_backward_state ||
       !pool->slots[lease->index].backward_maps_valid)
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "backward-run", "Backward workspace", identity.rank,
@@ -6383,10 +6354,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.intermediate != config.intermediate_size ||
       data.top_k != dispatch_id.top_k ||
       data.experts != view.sizes.owned_expert_count ||
+      data.rows < view.sizes.incoming_row_count ||
       data.completion.device != pool->device)
     throw std::runtime_error(
         "Backward tensor storage does not match this invocation");
-  const auto writes = {data.dx, data.dgate, data.dw1, data.dw2};
+  const auto writes = {data.dx, data.dgate, data.dw1, data.dw2, data.workspace};
   for (const auto &input :
        {saved.output, saved.x, saved.ab, saved.gates, saved.headers})
     tensor_storage_detail::validate_input_disjoint(writes, input->data,
@@ -6432,7 +6404,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.hidden = config.hidden_size;
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = pool->config.max_destination_rows_per_rank;
-  args.padded_capacity_rows = layout.backward_padded_capacity_rows;
+  args.padded_capacity_rows = data.padded_rows;
   // Actual padded rows and active experts are loaded from the device directory.
   args.scheduler_words = scheduler_layout.total_words;
   args.scheduler_mblock_capacity =
@@ -6472,10 +6444,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   // FC2 output is dead after Forward reduction. Reuse its compact plane for
   // the reverse dY dispatch instead of allocating and filling padded dR.
   args.compact_dr_offset = layout.forward_training_output;
-  args.recomputed_u_offset = layout.backward_u;
-  args.dab_offset = layout.backward_dab_rows;
-  args.dx_rows_offset = layout.backward_dx_rows;
-  args.dgate_rows_offset = layout.backward_dgate_rows;
+  args.recomputed_u =
+      at<transport::BFloat16>(data.workspace->data, data.u_offset);
+  args.dab = at<transport::BFloat16>(data.workspace->data, data.dab_offset);
+  args.dx_rows =
+      at<transport::BFloat16>(data.workspace->data, data.dx_rows_offset);
+  args.dgate_rows = at<float>(data.workspace->data, data.dgate_rows_offset);
   args.dgate_output_offset = layout.backward_dgate_output;
   args.dw1 = static_cast<transport::BFloat16 *>(data.dw1->data);
   args.dw2 = static_cast<transport::BFloat16 *>(data.dw2->data);
@@ -6620,12 +6594,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 backward_local_compute_kernel<backward_tuning::kDabTileN,
                                               backward_tuning::kDxTileN,
                                               backward_tuning::kDwTileN>,
-                args, slot.backward_dr_map, slot.backward_dab_map,
+                args, slot.backward_dr_map, data.dab_map,
                 retained.weights.impl_->backward_w2_map,
                 retained.weights.impl_->backward_w1_map,
-                slot.backward_dr_mn_map, slot.backward_u_mn_map,
-                slot.backward_dab_mn_map, x_map, slot.backward_u_store_map,
-                slot.backward_dx_store_map, dw2_map, dw1_map),
+                slot.backward_dr_mn_map, data.u_mn_map,
+                data.dab_mn_map, x_map, data.u_store_map,
+                data.dx_store_map, dw2_map, dw1_map),
             identity.rank, identity.world, "backward", identity.generation,
             ExchangeKind::ExpertCounts, detail);
       };
@@ -6755,11 +6729,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                       "all worker CTAs resident", std::to_string(clusters));
     internal::throw_cuda("backward-run",
         cudaLaunchKernelEx(&launch, kernel, args,
-            slot.backward_dr_map, slot.backward_dab_map,
+            slot.backward_dr_map, data.dab_map,
             retained.weights.impl_->backward_w2_map,
             retained.weights.impl_->backward_w1_map, slot.backward_dr_mn_map,
-            slot.backward_u_mn_map, slot.backward_dab_mn_map, x_map,
-            slot.backward_u_store_map, slot.backward_dx_store_map, dw2_map, dw1_map),
+            data.u_mn_map, data.dab_mn_map, x_map,
+            data.u_store_map, data.dx_store_map, dw2_map, dw1_map),
         identity.rank, identity.world, "backward", identity.generation,
         ExchangeKind::ExpertCounts, "launch unified Backward workers");
     for (auto event : {slot.backward_transport_done, slot.backward_compute_done,

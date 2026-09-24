@@ -17,6 +17,9 @@ def main():
     experts = int(os.environ.get("TEST_EXPERTS", max(16, world * 2)))
     tokens = int(os.environ.get("TEST_TOKENS", 8))
     top_k = int(os.environ.get("TEST_TOP_K", 4))
+    max_rows = int(os.environ.get(
+        "TEST_MAX_ROWS", max(2048, 2 * tokens * top_k + (experts // world) * 128)
+    ))
     hidden, intermediate = 2048, 512
     generator = torch.Generator(device="cuda").manual_seed(123)
 
@@ -57,7 +60,7 @@ def main():
         hidden=hidden,
         intermediate=intermediate,
         max_tokens=tokens,
-        max_rows=max(2048, 2 * tokens * top_k + (experts // world) * 128),
+        max_rows=max_rows,
         training=True,
         max_saved=4,
     )
@@ -117,7 +120,7 @@ def main():
         hidden=hidden,
         intermediate=intermediate,
         max_tokens=tokens,
-        max_rows=max(2048, 2 * tokens * top_k + (experts // inference_world) * 128),
+        max_rows=max(max_rows, 2 * tokens * top_k + (experts // inference_world) * 128),
         training=False,
     )
     ids = route.chunk(world)[rank].contiguous()

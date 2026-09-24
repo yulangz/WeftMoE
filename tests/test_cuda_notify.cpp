@@ -3120,6 +3120,7 @@ void run_cached_backward_rank(
             << " gin_return_payload_bytes="
             << last.audit().gin_return_payload_bytes
             << " workspace_bytes=" << last.audit().workspace_bytes
+            << " tensor_bytes=" << last.tensors().bytes()
             << " pool_bytes=" << usage.device_bytes
             << " repeat_equal=" << repeat_equal << " dx_hash=" << dx_hash
             << " dgate_hash=" << dgate_hash << " dw1_hash=" << dw1_hash

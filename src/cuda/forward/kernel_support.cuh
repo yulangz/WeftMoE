@@ -534,10 +534,6 @@ struct Layout {
   // compact Forward output plane is reused for dR. dX remains disjoint so its
   // M-blocks may return while dW2 still consumes dR.
   std::uint64_t backward_padded_capacity_rows = 0;
-  std::size_t backward_u = 0;
-  std::size_t backward_dab_rows = 0;
-  std::size_t backward_dx_rows = 0;
-  std::size_t backward_dgate_rows = 0;
   std::size_t backward_dgate_output = 0;
   std::size_t backward_setup_epoch = 0;
   std::size_t backward_dispatch_ready = 0;
@@ -1141,24 +1137,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                         "transport-pool-query", "Backward padded directory", 0,
                         "uint32 row indices", std::to_string(layout.backward_padded_capacity_rows));
-      const auto backward_padded_elements = checked_mul(
-          layout.backward_padded_capacity_rows,
-          config.max_intermediate_size, "backward padded elements");
-      layout.backward_u = append(
-          cursor, backward_padded_elements, sizeof(transport::BFloat16),
-          "backward padded U");
-      layout.backward_dab_rows = append(
-          cursor, checked_mul(backward_padded_elements, 2ULL,
-                              "backward interleaved dAB elements"),
-          sizeof(transport::BFloat16), "backward interleaved dAB");
-      layout.backward_dx_rows = append(
-          cursor,
-          checked_mul(layout.backward_padded_capacity_rows,
-                      config.max_hidden_size, "backward dX rows"),
-          sizeof(transport::BFloat16), "backward dX rows");
-      layout.backward_dgate_rows = append(
-          cursor, layout.backward_padded_capacity_rows, sizeof(float),
-          "backward canonical dGate rows");
       layout.backward_dgate_output = append(
           cursor, routes, sizeof(float), "backward source dGate");
       layout.backward_setup_epoch = append(
@@ -1394,12 +1372,7 @@ struct PoolSlot {
   CUtensorMap forward_staging_store_map{};
   bool forward_maps_valid = false;
   CUtensorMap backward_dr_map{};
-  CUtensorMap backward_dab_map{};
   CUtensorMap backward_dr_mn_map{};
-  CUtensorMap backward_u_mn_map{};
-  CUtensorMap backward_dab_mn_map{};
-  CUtensorMap backward_u_store_map{};
-  CUtensorMap backward_dx_store_map{};
   bool backward_maps_valid = false;
 };
 

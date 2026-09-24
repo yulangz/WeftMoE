@@ -49,8 +49,9 @@ struct BackwardTensorBuffers {
   CudaTensorBuffer dw2;   // BF16 [local_experts, hidden, intermediate]
 };
 
-// These objects own per-call tensors and their completion event. They never
-// register an NCCL window or lease a communication/compute workspace. Prepare
+// These objects own per-call tensors, rank-private Backward intermediates,
+// and their completion event. They never register an NCCL window or lease a
+// shared transport workspace. Prepare
 // them before capture; a captured execution reuses its explicitly bound
 // tensors.
 class ForwardTensorStorage {

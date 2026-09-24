@@ -83,9 +83,8 @@ __device__ __forceinline__ void pack_return(const BackwardKernelArgs &a,
       peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const auto *mapping =
       peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
-  const auto *dx =
-      peer_at<const transport::BFloat16>(a.local_base, a.dx_rows_offset);
-  const auto *dgate = peer_at<const float>(a.local_base, a.dgate_rows_offset);
+  const auto *dx = a.dx_rows;
+  const auto *dgate = a.dgate_rows;
   if (lane == 0U) {
     for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
       const auto compact_row = entries[task.first + item];

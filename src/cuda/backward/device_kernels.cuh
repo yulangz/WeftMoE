@@ -125,12 +125,11 @@ __global__ void backward_wait_for_dispatch_rows_kernel(BackwardKernelArgs a,
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
     const BackwardKernelArgs &a, std::uint64_t padded_row,
     std::uint64_t compact_row, bool row_is_valid, std::uint32_t lane) {
-  auto *u = peer_at<transport::BFloat16>(a.local_base,
-                                         a.recomputed_u_offset);
+  auto *u = a.recomputed_u;
   const auto *ab = a.saved_ab;
   const auto *gates = a.saved_gates;
-  auto *dab = peer_at<transport::BFloat16>(a.local_base, a.dab_offset);
-  auto *dgate = peer_at<float>(a.local_base, a.dgate_rows_offset);
+  auto *dab = a.dab;
+  auto *dgate = a.dgate_rows;
   const auto b_base = a.saved_rows * a.intermediate;
   const auto output_base = padded_row * 2ULL * a.intermediate;
   if (!row_is_valid) {
@@ -250,10 +249,8 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
   const auto *headers = peer_at<const LocalP2pRouteHeader>(
       a.local_base, a.direct_headers_offset);
   const auto header = headers[compact_row];
-  const auto *dx = peer_at<const transport::BFloat16>(
-      a.local_base, a.dx_rows_offset);
-  const auto *dgate = peer_at<const float>(a.local_base,
-                                           a.dgate_rows_offset);
+  const auto *dx = a.dx_rows;
+  const auto *dgate = a.dgate_rows;
   auto *source_contribution = peer_at<transport::BFloat16>(
       a.peer_bases[header.source_rank], a.contribution_offset);
   const auto *source = reinterpret_cast<const uint4 *>(

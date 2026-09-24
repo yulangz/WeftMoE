@@ -150,9 +150,12 @@ struct ForwardTensorStorage::Impl {
 };
 
 struct BackwardTensorStorage::Impl {
-  std::shared_ptr<tensor_storage_detail::Allocation> dx, dgate, dw1, dw2;
+  std::shared_ptr<tensor_storage_detail::Allocation> dx, dgate, dw1, dw2,
+      workspace;
   tensor_storage_detail::Completion completion;
-  std::uint64_t tokens, hidden, intermediate;
+  std::uint64_t tokens, hidden, intermediate, rows, padded_rows;
+  std::size_t u_offset, dab_offset, dx_rows_offset, dgate_rows_offset;
+  CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{}, u_store_map{}, dx_store_map{};
   std::uint32_t top_k, experts;
   explicit Impl(const CudaExecution &execution) : completion(execution) {}
 };
@@ -252,7 +255,49 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
       bindings.dgate);
   state->dw1 = make(checked_mul(weight, 4ULL, "dW1 bytes"), bindings.dw1);
   state->dw2 = make(checked_mul(weight, 2ULL, "dW2 bytes"), bindings.dw2);
-  validate_disjoint({state->dx, state->dgate, state->dw1, state->dw2});
+  // Only the compact dR and transport directories are peer-visible. These
+  // padded activation planes are rank-private and follow this invocation's
+  // actual Notify rows, not the transport pool's receive capacity. Padding
+  // slack is bounded by one partial tile per owned expert; no count download
+  // or second route plan is needed at this allocation boundary.
+  state->rows = dispatch.received_row_capacity();
+  state->padded_rows = checked_add(
+      state->rows,
+      checked_mul(state->experts, backward_tuning::kTileM - 1ULL,
+                  "Backward expert padding"),
+      "Backward workspace rows");
+  std::size_t cursor = 0;
+  const auto intermediate_elements = checked_mul(
+      state->padded_rows, state->intermediate, "Backward workspace elements");
+  state->u_offset = append(cursor, intermediate_elements, 2U, "Backward U");
+  state->dab_offset = append(cursor, intermediate_elements, 4U, "Backward dAB");
+  state->dx_rows_offset = append(
+      cursor, checked_mul(state->padded_rows, state->hidden, "Backward dX rows"),
+      2U, "Backward dX");
+  state->dgate_rows_offset =
+      append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
+  state->workspace = make(cursor);
+#if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
+  auto *base = state->workspace->data;
+  state->dab_map = make_bf16_tma_map(
+      at<void>(base, state->dab_offset), 2ULL * state->intermediate,
+      state->padded_rows, backward_tuning::kActivationTileM,
+      "Backward padded dAB", backward_tuning::kTileK);
+  state->u_mn_map = make_bf16_tma_map_mn(
+      at<void>(base, state->u_offset), state->intermediate, state->padded_rows,
+      "Backward dW2 U MN-major");
+  state->dab_mn_map = make_bf16_tma_map_mn(
+      at<void>(base, state->dab_offset), 2ULL * state->intermediate,
+      state->padded_rows, "Backward dW1 dAB MN-major");
+  state->u_store_map = make_bf16_tma_store_map(
+      at<void>(base, state->u_offset), state->intermediate, state->padded_rows,
+      "Backward dU output", 0ULL, backward_tuning::kActivationTileM);
+  state->dx_store_map = make_bf16_tma_store_map(
+      at<void>(base, state->dx_rows_offset), state->hidden, state->padded_rows,
+      "Backward dX output", 0ULL, backward_tuning::kActivationTileM);
+#endif
+  validate_disjoint(
+      {state->dx, state->dgate, state->dw1, state->dw2, state->workspace});
   result.impl_ = std::move(state);
   return result;
 }
@@ -274,7 +319,7 @@ std::uint64_t BackwardTensorStorage::bytes() const {
   if (!impl_)
     return 0;
   return impl_->dx->bytes + impl_->dgate->bytes + impl_->dw1->bytes +
-         impl_->dw2->bytes;
+         impl_->dw2->bytes + impl_->workspace->bytes;
 }
 
 ForwardTensorBuffers ForwardTensorStorage::buffers() const {
