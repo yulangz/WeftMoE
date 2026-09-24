@@ -799,6 +799,11 @@ entry，但共享路由、ring 和 Return 协议。不能让 layout/profile 分�
 - Graph 使用稳定地址，routes/gates 可在输入和 plan workspace 合同内改变；
   transient ring 容量不要求容纳 graph 的全部 route。plan/control 本身仍需要
   与 graph 输入规模匹配的容量，不能以 graph capture 为理由忽略元数据容量。
+- Graph plan的权重不可变，包括原地修改。W1 packed副本在prepare/publish时生成，
+  指针相同不会自动刷新内容。更新一层权重前，各EP rank先丢弃引用该层的外层
+  graphs，再在capture外调用`TensorRuntime.invalidate_inference_layer(layer)`；
+  它等待已发出工作并释放该层全部token桶的plans。随后更新权重，重新warm及
+  capture。共享权重的其它层也要失效；不在replay热路径做版本或内容hash检查。
 - Eager prepare 或训练 plan 后可以分配实际输入/plan/tape；steady-state inference
   main 内不 cudaMalloc，不 D2H 读 count，不让 host 参与逐窗口推进。
 - 只在完全 quiescent 的初始化/重建中 reset 累计状态；Graph、不同模型层共用
@@ -895,6 +900,8 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
   AF/AJ 记录资源、完整样本与失败的 group-overlap 候选。profile 选择与
   端到端验证仍是下列独立待办，不把诊断基准结果当成融合算子性能。
 - [ ] 分别选择 decode/prefill layout/profile，明确切换阈值及权重副本更新合同。
+  权重更新合同及显式layer失效接口已实现，EP8/EP16的原地更新与全部token桶
+  重建通过；profile自动阈值和最终默认配置仍待完成。
 - [ ] 在同一通信版本回测 EP8/EP16 四规模；把纯 GEMM 收益和端到端收益分别落表。
 
 ### M6：训练 Forward tape 与 Backward 对接

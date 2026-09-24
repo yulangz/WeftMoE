@@ -2585,3 +2585,47 @@ PyTorch/sanitizer门禁，八处CUDA源文件改动已撤回，恢复CL的RX sca
 约0.70%，所以最终“明显优于V3”目标尚未达成。每rank注册区减少131072 bytes
 （两方向TX/RX共1024个slot各去掉128B），数据面实际wire也少每包128B；
 没有新增分配或改变ring深度。Ring仍为opt-in，不把后续候选当成当前实现。
+
+### CN：当前协议下重测 FC2 直写预留 Return TX（候选）
+
+基于CL，不含CM。复用AY的地址/准入思想，但已采用当前THREAD独占GIN资源、
+node-aligned group、rail-local C-ready以及独立Dispatch Q8/Return Q16协议。
+Return TX owner在等待FC2前非阻塞地预留整个可用depth，can_send仍检查远端
+consumed AND本地NIC completion；每channel发布单调reserved_head。
+destination整窗准入同时检查所有实际涉及Return packets已预留，FC2才可直写TX。
+source expert interval给出该window/rank的首末packet，每lane只检查最后一个。
+Return包ready仍通过原FC2 completion→system fence→rail-local ready链，不
+新增逐fragment完成图。发送owner不再复制C→TX，但保留C bookkeeping退休。
+
+RingRow预绑定output指针，由16B增至24B，本地仍写source contribution；
+remote写同节点rail的Return TX。网络depth至少容纳一个最坏Return source窗口，
+计算使用`returning.partition`，不能误用Dispatch的Q8。D8/R16/B512/K4仍depth8。
+暂保留C payload分配及原map，不将尚未实施的内存清理算作收益。
+
+冻结 `static_v4_ring_direct_tx_retry/`（含相对CL的patch及return_tx helper），
+native SHA256 `0af2dfcac3295f13dce304a6dc0d85ca698c7cee58b62e61d0241f66b68d1014`，
+library `b06a14e9302baf990b2b4fc4a79df3d4a1f6786e2a610967905bd176f3e43f22`，
+REG168/STACK440/LOCAL0。另编译Return Q32独立候选；尚未验收。
+
+### 权重更新合同补齐（M5 子项，已验证）
+
+Graph的W1 packed副本在prepare时生成，原先仅检查源权重地址；同地址原地更新
+不会刷新它。新增显式`invalidate_inference_layer(layer)`：要求丢弃引用该层的
+外层graphs，在capture外等待已发出工作完成，再释放该层全部token-bucket plans。
+之后更新权重并重新warm/capture，重新publish权重产生新packed副本。
+不在replay热路径查询版本或hash，也不声称pointer相同代表内容没变。
+原有复用测试增加一次原地修改W1/W2后的全部token桶参考检查，没有新建测试套件。
+为隔离通信候选，独立extension链接冻结CL library，目录`static_v4_weight_refresh/`。
+
+该extension SHA256 `277fef7af8f36798877bd41256bdb63ae5a0768c666b25a1aa0486c5710aa488`，
+底层library仍为CL的`db5cec...`，没有修改CUDA kernel。EP16完整四规模+edges
+共480条检查、EP8共240条检查通过，所有launcher均exit0；分别含64/32条
+`weight-refresh-graph`结果。W1/W2源地址保持不变，原地乘以0.75/0.875后，
+全部四个token桶重新准备并与PyTorch参考比对。日志 `ring_weight_refresh_*`。
+此项修正生命周期/API缺口，不记录为性能收益，也不标记整个M5已完成。
+
+CN补充：Q16快筛8K/20K为3170.700/7221.650 us，Q32为3049.200/7089.870 us，
+全部64 hashes与BW一致。Q16未优于CL；Q32略快，但20K仅贴近历史V3，仍需
+正式对照、窗口联合消融和完整正确性门禁。Q32 native SHA256
+`01a3b2d4395e25070022c7a3c660a077dfc3a05fcbb1873bd9766f98dee37d80`；
+首轮Q16快筛存在本节点并行CPU编译，Q32快筛无并行CPU/GPU任务。

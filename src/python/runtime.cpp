@@ -324,10 +324,12 @@ class Runtime {
             reinterpret_cast<std::uintptr_t>(pointer(gates)))
       throw std::runtime_error(
           "Inference input addresses changed: use stable CUDA Graph buffers "
-          "or invalidate the layer/token plan");
+          "or call invalidate_inference_layer(layer) before re-preparation");
     if (plan.w1 != reinterpret_cast<std::uintptr_t>(pointer(w1)) ||
         plan.w2 != reinterpret_cast<std::uintptr_t>(pointer(w2)))
-      throw std::runtime_error("Expert addresses changed: invalidate graphs before weight relocation");
+      throw std::runtime_error(
+          "Expert addresses changed: discard outer graphs and call "
+          "invalidate_inference_layer(layer) before re-preparation");
     if (capture == cudaStreamCaptureStatusNone) {
       check_cuda(cudaGraphLaunch(plan.executable, caller));
     } else {
@@ -344,6 +346,25 @@ class Runtime {
                                                      cudaStreamSetCaptureDependencies));
     }
     return plan.output;
+  }
+
+  void invalidate_inference_layer(unsigned layer, std::uintptr_t caller_stream) {
+    if (training_)
+      throw std::invalid_argument("inference plans are unavailable in training mode");
+    cudaStreamCaptureStatus capture;
+    check_cuda(cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(caller_stream),
+                                     &capture));
+    if (capture != cudaStreamCaptureStatusNone)
+      throw std::runtime_error("invalidate inference plans outside CUDA Graph capture");
+    drain_eager_inference();
+    // Explicit model-update boundary, never a replay-path version check. The
+    // caller must first discard outer graphs that reference this layer's plans.
+    check_cuda(cudaDeviceSynchronize());
+    auto first = plans_.lower_bound({layer, 0U});
+    auto last = first;
+    while (last != plans_.end() && last->first.first == layer)
+      ++last;
+    plans_.erase(first, last);
   }
 
  private:
@@ -475,6 +496,7 @@ PYBIND11_MODULE(_runtime, m) {
       .def("forward", &Runtime::forward)
       .def("backward", &Runtime::backward)
       .def("graph_forward", &Runtime::graph_forward)
+      .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)
       .def("eager_inference", &Runtime::eager_inference)
       .def("eager_inference_async", &Runtime::eager_inference_async)
       .def("profile_inference", &Runtime::profile_inference)

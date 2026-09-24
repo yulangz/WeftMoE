@@ -145,6 +145,19 @@ class TensorRuntime:
             x, routes, gates, w1, w2, torch.cuda.current_stream().cuda_stream
         )
 
+    def invalidate_inference_layer(self, layer):
+        """Release all token-bucket plans before replacing a layer's weights.
+
+        Call on every EP rank outside capture, after discarding any outer CUDA
+        graphs containing this layer. This waits for in-flight device work.
+        Then update weights, warm the layer again, and recapture outer graphs.
+        Graph weights are immutable between these boundaries, including in-place
+        updates: pointer equality does not refresh the packed FC1 weight copy.
+        """
+        self.native.invalidate_inference_layer(
+            layer, torch.cuda.current_stream().cuda_stream
+        )
+
     def inference_eager_async(self, x, routes, gates, w1, w2):
         """Enqueue inference and defer host completion until the next call."""
         self._check(x, routes, gates, w1, w2)

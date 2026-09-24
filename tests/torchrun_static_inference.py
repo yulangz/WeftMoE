@@ -148,6 +148,17 @@ def main():
             expected_second = reference(first, routes, gates, all_w1, all_w2)
             check(second, expected_second, f"shared-workspace-{iteration}")
         del graph
+        # Every warmed bucket of the updated layer must release its packed W1.
+        # All four layers share these weights; their outer graph is gone above.
+        for layer in range(4):
+            runtime.invalidate_inference_layer(layer)
+        all_w1.mul_(0.75)
+        all_w2.mul_(0.875)
+        for tokens in args.tokens:
+            x, routes, gates = inputs(tokens)
+            check(runtime.inference(0, x, routes, gates, w1, w2),
+                  reference(x, routes, gates, all_w1, all_w2),
+                  "weight-refresh-graph")
         if world * max_tokens * args.top_k > max_rows:
             x, routes, gates = inputs(max_tokens, skew=True)
             ring = int(os.getenv("WEFTMOE_STATIC_RING_TOKENS", "0")) != 0
