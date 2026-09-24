@@ -3779,3 +3779,38 @@ EC host 18/18、ED GPU plan 37个source/packet及6个destination case通过；
 
 日志`prefill_return_{q128_ec,segments_ed,warp_ee}_ep16_t20480_quick.log`；
 ED planner日志`prefill_return_segments_ed_plan.log`。
+
+### EF：本地/远端Pull独立静态owner集合（退化，撤回）
+
+回到M6f/DS，不含EC–EE。将100个Pull warp固定分成50个本地、50个远端owner，
+各自重编号residue并独立推进窗口；本地不等待远端packet，远端不扫描本地行。
+仍沿用whole-window admission、逐行身份过滤（兼容group跨实际节点的容量配置）
+和原有copy/credit边界。不增buffer、共享计数、动态claim或额外通信barrier。
+与BQ的两窗顺序交换不同，本项改变两类owner的分工与并行推进。
+
+1620MHz、EP16/B512/D8、10warmup/2samples/batch2、无并发构建或GPU任务：
+8K p50 **3330.880us**（3330.880–3343.730），20K **7825.730us**
+（7825.730–9080.910）。32个hash与M6f一致、pool不变，均不如当前正式
+2953.070/6991.990us。该划分削减远端Pull并行度，没有提供端到端收益；
+不能仅凭这轮实验排除固定owner内部packet等待顺序的其它优化。
+已撤回唯一源码改动，未继续正式计时、完整数值或sanitizer。
+冻结`build/static_v4_pull_partition_ef/`（含patch/resource report），native
+SHA256 `31b84f195fc0a5cc2c7e60699ce0dfaa0d99accbca16301dd99a380530e14dca`；
+日志`pull_partition_ef_ep16_t{8192,20480}_quick.log`，以JSON shape为准。
+
+### EG：Pull owner私有ready-packet lookahead（无稳定收益，撤回）
+
+独立回到M6f/DS，保留全部100个Pull warp及其residue。每owner将自己固定负责的
+packet分成最多32项的批次，用寄存器位图记录尚未完成项；轮询跳过未ready包，
+已复制的包不再访问。空项不读RX，lane0的system acquire经warp同步后才读payload，
+仍在完整复制、X-ready发布后按desc.rows退休。窗口间顺序不变，immutable plan不改，
+没有共享claim、动态expected、跨窗持有RX或新增buffer。现有逐slot ACK允许乱序退休。
+
+1620MHz、EP16/B512/D8、10warmup/2samples/batch2，无并发构建或其它GPU任务：
+8K p50 **2966.860us**（2966.860–2995.220），20K **6961.680us**
+（6961.680–7088.080）。32 hashes及pool bytes与M6f相同；8K未改善，20K
+波动跨过基线，不能认定稳定收益。网络prefill/decode REG168、STACK448/456、
+SHARED2048、LOCAL0，相比基线各增加16B stack。撤回唯一源码改动，不继续完整
+数值/sanitizer或正式计时。冻结`build/static_v4_pull_lookahead_eg/`与patch/resources，
+native SHA256 `51623c0c4eeeed78274a9b1b0a6755ee79331ecaa92055dc3455cd0ed3bac142`；
+日志`pull_lookahead_eg_ep16_t{8192,20480}_quick.log`。

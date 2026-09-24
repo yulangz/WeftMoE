@@ -2,7 +2,7 @@
 
 对应设计文档 M6。默认训练仍执行 V3；M6d 接通 opt-in 单机 ring Forward，
 Backward 仍复用既有调度/GEMM；M6e进一步接通多机checkpoint和有界Backward
-GIN adapter。精确P_actual、完整训练sanitizer/性能门禁尚未完成，不能将
+GIN adapter，M6f已完成精确P_actual分配。完整训练sanitizer/性能门禁尚未完成，不能将
 inference或新Forward的门禁视为整个训练工程完成。
 
 ## M6a：按实际接收量分配 rank-private Backward 中间区
