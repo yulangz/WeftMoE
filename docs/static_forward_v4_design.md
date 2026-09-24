@@ -803,6 +803,13 @@ Backward 的 canonical row。G/U 可保存标准逻辑布局，使 Backward 不�
 选择 separated 还是 packed。dW 跨 M 归约的确定性需要单独验证，Forward 数值
 一致并不自动保证梯度归约一致。
 
+M6对接优先复用materialized Notify已有的`route_dst_row`：它由expert base、
+前序source计数与stable local_offset构成，可直接作为compact tape行号。
+训练plan冻结并传递此映射，物理ring的route_order仍可采用现有枚举顺序；
+保存时映射到canonical row，Backward按原canonical顺序归约。无需仅为tape
+确定性再实现一套物理行排序。Notify及ring窗口规划均属于main之前的plan阶段，
+不能在main里再次执行。此项是已检查接口后的实施选择，尚未实现或验证。
+
 每个 live tape 持有独立 allocation/plan lease，直到 Backward 完成。资源不足可
 等待或显式失败，不能覆盖尚未消费的 tape。输入/输出/plan/tape 真正 OOM 时允许
 整个调用失败；“不丢 token”不是承诺任意总规模都可在有限显存内训练。

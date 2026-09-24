@@ -3111,3 +3111,71 @@ signal descriptor/counter helper，Mask8无法转换，故native编译失败。
 源文件修改。归档 `build/static_v4_ring_gdaki_owner/from_profiles.patch` 与
 `build/build_ring_gdaki_owner_native.log`。没有可运行二进制、数值或性能结论；
 这不是GDAKI本身性能差的证据，生产路径本来已使用GDAKI。
+
+### DE：直写 TX 后的 Return Q64（无收益，不采用）
+
+只将DC构建的Return Qmax从32调整为64，Dispatch Q8/L32/B512/D8及数据面不变。
+短source仍自适应Q1/Q8，主形状长序列用Q64；每source/window的远端packet
+由32变16，但活跃lanes也减半，单packet等待范围及物理TX/RX注册区变大。
+此前Q64候选包含C→TX拷贝，故在当前FC2直写版本重新独立筛选，未修改默认配置。
+冻结 `build/static_v4_ring_direct_return_q64/`，完整数值/性能结论待测试。
+
+native SHA256 `999e3af42b6f3277a815ef3df8121b2101e97aa34f0a7275b313eda49c6295e1`，
+REG168/STACK440/LOCAL0；无并发构建的四规模快筛为
+280.224/333.904/3094.640/7022.930 us，64 hashes与DC一致。
+20K total/registered为981020096/160687872 bytes/rank，相对DC分别增加
+67047424/67047424 bytes；短序列即使自适应小Q，物理slot也多占67108864 bytes。
+未获得明确端到端收益，不采用Q64，不继续library、完整Torch或sanitizer。
+源码没有增加Q64分支，默认仍Q32；归档provenance及四规模日志。
+
+### DF：Return 复用已完成的 system release（正式无收益，已撤回）
+
+独立基于DC/Q32，不混入DE/Q64。FC2普通peer stores→device fc2_done release
+链→local Return acquire全部N tiles→既有system fence→warp join→rail-ready
+system release→TX owner逐packet acquire全部ready，已把该包payload发布到
+system范围。TX owner随后只退休C账本，不再写TX payload。因此只对Return
+将GIN givenRelease设为system，requiredRelease仍system；Dispatch保留block→
+system，ACK/双TX credit/终端drain均不变。不是删除生产者的system fence。
+
+本机头文件及同版本[NCCL GDAKI实现](https://raw.githubusercontent.com/NVIDIA/nccl/v2.31.2-1/src/include/nccl_device/gin/gdaki/gin_gdaki.h)
+在required=system而given范围不足时补fence；V3 send_packed在packer发布链后
+也传system/system。上述候选依赖本项目已存在的完整发布链，这是源代码推导，
+不是通过数值测试证明memory model。尚无性能结论，获益后才继续完整门禁。
+
+DF native SHA256 `a8ce13fd3505602c4e5d512f5733a6c871d3c57eabce4483eeba10c6a8445d8f`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_return_given_release/` 与change.patch。
+无并发构建的四规模快筛280.192/335.216/2996.460/6966.320 us；8K/20K正式
+交错复测中，尚未完成完整Torch/sanitizer。源码已暂恢复保守fence，供DG独立实验。
+
+正式DF→DC交错复测（两节点无其它CPU/GPU任务，10/20/20）：8K为
+3006.590/3008.890 us，20K为7011.260/7015.670 us；小于0.1%的差异不作为
+收益，初筛约0.6%的改善未复现。32 hashes与全部pool bytes相同，四规模初筛
+64 hashes也与DC一致。没有继续完整Torch/sanitizer，保留原block→system
+调用，不引入候选分支。日志 `ring_return_given_release_{df,dc}_ep16_t*_formal.log`。
+
+### DG：plan 阶段预合并 Return 的 C-slot 段（无收益，已撤回）
+
+基于DC/Q32，**不含DF**。现有RouteLocation跨GPU发布join后，warp按静态packet
+residue读取route/Location；以ComputeSlot指针match_any，将每个warp batch内
+属于同slot的行合并成32B的`{ready指针, slot指针, generation, rows}`。Q超过32时可
+保留跨batch重复段，returned仍按完整rows相加，不按段个数计数。packet不跨
+整窗，整窗准入保证同包中的不同live blocks不会物理slot别名。
+
+每包复用自身route_begin及rows区间作为段目录容量，实际段紧凑写在区间前部，
+TX累加segment.rows到desc.rows为止；没有新增packet prefix/count表，也没有
+动态fragment append、expected原子或引用图。发送阶段的ready与退休两轮都
+只读段目录，删除逐行expert/Location重解析。两类credit和所有scope不变。
+
+目录只在本rail普通device pool，按其它节点数×source padded route capacity
+预留，最坏每route一段；不注册、不跨机传输。增加一次plan末尾grid join发布
+段目录，不增加数据面barrier。需同时衡量此规划成本及额外metadata，不能只
+报告退休跨度缩短。正在检查/构建，尚无正确性或性能结论。
+
+native SHA256 `92e265dc23578b5b558582bd5db7f761e61e8c1cdd595330762fd97fd6903515`，
+REG168/STACK432/LOCAL0，host18/18通过。无并发构建的四规模快筛为
+282.656/332.160/3008.380/7068.320 us，64 hashes与DC相同；全部registered
+bytes不变，device pool分别增加256/8192/1048576/2621440 bytes/rank。
+20K没有改善，故已撤回六个既有源文件改动，并删除候选helper；完整patch和
+native保留在 `build/static_v4_ring_return_segments/`，可恢复该实验。
+没有继续library、完整Torch或sanitizer。移除两轮逐行解析未转化为整体收益，
+不能仅从CY的局部跨度判定它是关键路径，下一步需补多context有效链路吞吐诊断。
