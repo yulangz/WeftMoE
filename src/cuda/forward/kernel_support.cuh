@@ -658,6 +658,9 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
   const auto prefixes = std::uint64_t(config.max_nodes) * packets.lanes * (windows + 1U);
   m.header = append(cursor, 1U, sizeof(static_forward::SourceHeader), "source header");
   m.gates = append(cursor, routes, sizeof(float), "source gates");
+  if (config.enable_backward_state)
+    m.tape_rows = append(cursor, routes, sizeof(std::uint64_t),
+                         "canonical tape row per source route");
   m.expert_prefix = append(cursor, windows * (experts + 1U),
                            sizeof(std::uint64_t), "source window experts");
   m.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
@@ -946,11 +949,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       throw std::invalid_argument("static ring requires contribution capacity");
     if (config.max_world_size < config.max_nodes)
       throw std::invalid_argument("static ring requires at least one rank per node");
-    if (config.enable_backward_state || config.enable_socket_fallback ||
+    if (config.enable_socket_fallback ||
         (config.max_nodes > 1U && !config.enable_gin_rdma) ||
         config.max_intermediate_size == 0U)
       throw std::invalid_argument(
-          "static ring requires inference Forward and GIN for remote nodes");
+          "static ring requires Forward and GIN for remote nodes");
+    if (config.enable_backward_state && config.max_nodes > 1U)
+      throw std::invalid_argument("training ring requires the node-local backend");
     ring.shape = static_ring_shape(config);
     const auto window_blocks = ring.shape.max_mblocks(config.max_owned_experts);
     ring.max_windows = ring.shape.windows(config.max_tokens_per_rank);
@@ -1001,6 +1006,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     ring.rows = append(cursor, checked_mul(ring.max_blocks, ring.shape.tile_m,
                                            "ring reverse rows"),
                         sizeof(static_forward::RingRow), "immutable reverse routes");
+    if (config.enable_backward_state)
+      ring.tape_rows = append(cursor, ring.max_blocks * ring.shape.tile_m,
+                              sizeof(std::uint64_t), "canonical tape rows");
     if (config.max_nodes > 1U)
       ring.pull_packets = append(
           cursor, ring.max_windows * ring.shape.sources * ring.packets.packets(ring.shape.tokens),
@@ -1512,6 +1520,7 @@ struct ActivationPoolState {
   std::weak_ptr<ActivationMegaKernelBackendState> gin_backend;
   std::shared_ptr<GinResources> gin_resources;
   std::shared_ptr<PeerMappings> peer_mappings;
+  std::unique_ptr<CollectiveTensorPreparation> forward_tensor_preparation;
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;

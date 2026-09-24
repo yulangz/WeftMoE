@@ -11,8 +11,8 @@ __device__ __forceinline__ void source_plan_sync() {
 }
 
 // Called by a fixed CTA/control group for each of its source token windows.
-// The reservation order is inference-only; the completed directory is immutable
-// before packet enumeration. StableTape must use stable source ordinals instead.
+// Physical reservation order is immutable before packet enumeration, not
+// deterministic. Training carries Notify's canonical row mapping separately.
 template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U>
 __device__ void build_source_window(const SourcePlanView &a,
                                     std::uint64_t local_window,

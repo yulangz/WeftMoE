@@ -80,4 +80,18 @@ source_count(const ForwardKernelArgs &a, unsigned source,
   return prefix[expert + 1U] - prefix[expert];
 }
 
+__device__ __forceinline__ void save_identity(const ForwardKernelArgs &a,
+                                              std::uint64_t index) {
+  const auto &identity = a.ring.rows[index];
+  const auto tape_row = a.checkpoint.rows[index];
+  const auto expert = a.rank * a.dispatch.sizes.owned_expert_count +
+                      a.ring.blocks[index / forward_tuning::kTileM].tile.expert;
+  a.checkpoint.gates[tape_row] = identity.gate;
+  a.checkpoint.headers[tape_row] = {
+      transport::kActivationTransportSchemaVersion, identity.source, a.rank, 0U,
+      a.dispatch.identity.generation, execution_epoch(a), identity.route,
+      identity.route, identity.token, tape_row, expert,
+      identity.route % a.ring.source.shape.top_k};
+}
+
 } // namespace static_v4::ring

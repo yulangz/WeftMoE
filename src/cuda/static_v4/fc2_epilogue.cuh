@@ -2,7 +2,7 @@
 
 // Included inside forward_compute_detail after the fragment-layout and named
 // barrier helpers.  Keeping this specialization out of the generic epilogue
-// avoids carrying inference-only peer addressing through the training path.
+// avoids carrying static peer addressing through the dynamic V3 epilogue.
 template <class TileMma, bool Network = false,
           unsigned TileN = forward_tuning::kFc2TileN, bool RingSchedule = false>
 __device__ __forceinline__ void

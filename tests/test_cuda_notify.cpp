@@ -2834,6 +2834,10 @@ void run_cached_backward_rank(
   pool_config.max_owned_experts = experts / world;
   pool_config.enable_backward_state = true;
   pool_config.enable_gin_rdma = nodes == 2U;
+  if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
+    pool_config.static_forward_window_tokens = std::stoul(window);
+  if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+    pool_config.static_forward_contribution_windows = std::stoul(depth);
   auto activation_pool = weftmoe::cuda::prepare_activation_transport_pool(
       generation.session(), execution, pool_config, notify.dispatch());
 

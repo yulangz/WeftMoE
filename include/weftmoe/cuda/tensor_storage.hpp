@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 
 #include "weftmoe/version.hpp"
 
@@ -36,6 +37,13 @@ struct CudaTensorBuffer {
 // metadata. Allocation is performed during preparation, outside kernel timing.
 using CudaTensorAllocator =
     std::function<CudaTensorBuffer(std::uint64_t bytes)>;
+
+// A completed collective rejected preparation; no main kernel was entered.
+// CUDA/NCCL failures of the agreement itself do not use this exception type.
+class TensorPreparationFailure : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 // Collective host-allocation boundary, outside CUDA Graph capture. Construct
 // before allocating per-call tensors; every rank then calls run in the same

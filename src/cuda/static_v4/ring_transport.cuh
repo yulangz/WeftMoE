@@ -2,9 +2,48 @@
 
 #include "cuda/static_v4/network_transport.cuh"
 
+struct RingCheckpointDestination {
+  const ForwardKernelArgs &a;
+  __device__ __forceinline__ void *operator()(std::uint64_t index,
+                                              unsigned checkpoint) const {
+    if (checkpoint)
+      return a.saved_x + a.checkpoint.rows[index] * a.hidden;
+    const auto row = static_v4::ring::row(a, index / forward_tuning::kTileM) +
+                     index % forward_tuning::kTileM;
+    return peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset) +
+           row * a.hidden;
+  }
+};
+
+template <class Storage, bool Training> class RingPullCopy {
+  using Pipeline = std::conditional_t<
+      Training, FanoutRowPrefetchPipeline<Storage, std::uint64_t,
+                                          RingCheckpointDestination>,
+      RowPrefetchPipeline<Storage>>;
+  Pipeline pipeline_;
+  __device__ static Pipeline make(const ForwardKernelArgs &a, Storage &s) {
+    if constexpr (Training)
+      return Pipeline(s, 0U, RingCheckpointDestination{a});
+    else
+      return Pipeline(s, 0U);
+  }
+
+public:
+  __device__ RingPullCopy(const ForwardKernelArgs &a, Storage &s)
+      : pipeline_(make(a, s)) {}
+  __device__ __forceinline__ void copy(const void *source, void *target,
+                                       unsigned bytes, std::uint64_t index) {
+    if constexpr (Training)
+      pipeline_.copy(source, index, bytes, 2U);
+    else
+      pipeline_.copy(source, target, bytes);
+  }
+  __device__ __forceinline__ void drain() { pipeline_.drain(); }
+};
+
 // Pull has one issuer and two private staging slots. A batch stays within
 // one Mblock and completes before publishing its aggregate X credit.
-template <bool Network, class Storage>
+template <bool Network, bool Training, class Storage>
 __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
                                        unsigned worker, unsigned workers) {
   namespace ring = static_v4::ring;
@@ -18,7 +57,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
       peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  RowPrefetchPipeline<Storage> prefetch(s, 0U);
+  RingPullCopy<Storage, Training> prefetch(a, s);
   unsigned peer_rows = 0U;
   constexpr auto TileM = forward_tuning::kTileM;
   constexpr auto Batch = Network ? 2U : 8U;
@@ -63,6 +102,8 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           }
           const auto target_row = ring::row(a, block) + m;
           gates[target_row] = identity.gate;
+          if constexpr (Training)
+            ring::save_identity(a, index);
           const auto *source =
               peer_at<const transport::BFloat16>(a.peer_bases[identity.source],
                                                  a.source_input_offset) +
@@ -76,7 +117,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           }
           prefetch.copy(
               source, local + target_row * a.hidden,
-              static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
+              static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)), index);
           peer_rows += identity.source != a.rank;
           const auto valid = r.blocks[block].tile.rows;
           credit += m + 1U == valid ? TileM - valid + 1U : 1U;
@@ -259,7 +300,7 @@ struct RingStaging
   static constexpr unsigned kBuffers = 2U, kStorageSlots = 2U;
 };
 
-template <unsigned Fc1N, unsigned Fc2N, bool Network, class Storage>
+template <unsigned Fc1N, unsigned Fc2N, bool Network, bool Training, class Storage>
 __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
                                          Storage &storage) {
   auto &s = *reinterpret_cast<RingStaging *>(&storage);
@@ -279,7 +320,7 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
       if (blockIdx.x < network_workers)
         network_ring_transport::transmit<false>(a, s, blockIdx.x);
       else
-        ring_pull<true>(a, s, blockIdx.x - network_workers,
+        ring_pull<true, Training>(a, s, blockIdx.x - network_workers,
                         gridDim.x - network_workers);
     } else if (warp == 1U) {
       if (blockIdx.x < network_workers)
@@ -302,7 +343,7 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     return;
   }
   if (warp == 0U)
-    ring_pull<false>(a, s, blockIdx.x, gridDim.x);
+    ring_pull<false, Training>(a, s, blockIdx.x, gridDim.x);
   else if (warp == 1U)
     ring_return<false>(a, blockIdx.x, gridDim.x);
   else if (blockIdx.x == 0U)

@@ -13,11 +13,11 @@ static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
                     gated_swiglu_fc2_input(g.y, u.y, route_weight));
 }
 
-template <unsigned Fc1TileN>
+template <unsigned Fc1TileN, bool RetainBackwardState = false>
 __device__ __forceinline__ void static_v4_store_fc1_tile(
     const ForwardKernelArgs &a, transport::BFloat16 *tile, const float *accum,
     transport::BFloat16 *output, const float *gates, std::uint64_t row,
-    std::uint32_t valid_rows, std::uint32_t column_base) {
+    std::uint32_t valid_rows, std::uint32_t column_base, std::uint64_t mblock) {
   constexpr auto kOutputN = Fc1TileN / 2U;
   const auto lane = threadIdx.x % 32U;
   const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
@@ -25,6 +25,29 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
   // Keep the two invariant gate loads outside the fragment-store loop.
   const float gate0 = row0 < valid_rows ? gates[row + row0] : 0.0F;
   const float gate1 = row1 < valid_rows ? gates[row + row1] : 0.0F;
+
+  if constexpr (RetainBackwardState) {
+    // Ring order is physical only. Save rounded gate/up projections in the
+    // canonical separated planes consumed by the unchanged Backward GEMMs.
+    for (unsigned item = 0U; item < 2U; ++item) {
+      const auto m = item ? row1 : row0;
+      if (m >= valid_rows)
+        continue;
+      const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
+#pragma unroll
+      for (unsigned index = 0U; index < kOutputN / 8U; ++index) {
+        const auto *g = accum + index * 8U + item * 2U;
+        const auto *u = g + 4U;
+        const auto column = column_base + index * 8U + (lane % 4U) * 2U;
+        auto *gate = a.saved_ab + saved * a.intermediate + column;
+        auto *up = gate + a.saved_rows * a.intermediate;
+        *reinterpret_cast<__nv_bfloat162 *>(gate) =
+            __float22bfloat162_rn(make_float2(g[0], g[1]));
+        *reinterpret_cast<__nv_bfloat162 *>(up) =
+            __float22bfloat162_rn(make_float2(u[0], u[1]));
+      }
+    }
+  }
 
   if (kOutputN >= 64U && valid_rows == forward_tuning::kTileM) {
     // Both math warpgroups must retire their TMA B reads before staging

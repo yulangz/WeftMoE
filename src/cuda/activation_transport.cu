@@ -2110,7 +2110,7 @@ make_activation_pool_state(const CollectiveSession &session,
               at<void>(slot.device, state->layout.canonical_rows),
               config.max_hidden_size, activation_rows,
               "Forward canonical output");
-        if (config.enable_backward_state)
+        if (config.enable_backward_state && !state->layout.static_ring.depth)
           slot.forward_training_output_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.forward_training_output),
               config.max_hidden_size, config.max_destination_rows_per_rank,
@@ -2886,6 +2886,10 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
     impl_->backend = std::static_pointer_cast<ActivationMegaKernelBackendState>(
         create_local_p2p_backend(session, execution, pool.impl_->state));
   const auto &capacity = pool.impl_->state->config;
+  if (capacity.enable_backward_state && capacity.static_forward_window_tokens &&
+      !pool.impl_->state->forward_tensor_preparation)
+    pool.impl_->state->forward_tensor_preparation =
+        std::make_unique<CollectiveTensorPreparation>(session, execution);
   const auto local_world = use_gin
       ? std::static_pointer_cast<GinBackendState>(impl_->backend)->local_world_size
       : impl_->backend->nccl->world;
@@ -4446,14 +4450,29 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           : DispatchWaveKernelView{};
   const bool fused_inference_routes =
       ActivationTransportBridge::fused_inference_routes(dispatch);
+  const bool training_ring = state->layout.static_ring.depth &&
+                             config.retain_backward_state;
   const bool static_v4_candidate =
       forward_tuning::kUnifiedWorkers &&
       (!use_gin || fused_inference_routes) &&
-      !config.retain_backward_state &&
+      (!config.retain_backward_state || training_ring) &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
   if (state->layout.static_ring.depth &&
-      (!static_v4_candidate || !fused_inference_routes))
-    throw std::invalid_argument("ring workspace requires fused static inference");
+      (!static_v4_candidate || (!fused_inference_routes && !training_ring)))
+    throw std::invalid_argument("ring workspace requires static Forward");
+  if (config.prepare_tensors && (!training_ring || config.tensors))
+    throw std::invalid_argument("deferred tape allocation requires training ring without bound tensors");
+  if (training_ring) {
+    if (fused_inference_routes || view.runtime)
+      throw std::invalid_argument(
+          "training ring requires immutable materialized Notify");
+    cudaStreamCaptureStatus capture;
+    const auto error = cudaStreamIsCapturing(
+        internal::checked_execution_state(backend->execution)->stream, &capture);
+    if (error != cudaSuccess || capture != cudaStreamCaptureStatusNone ||
+        config.serialized_graph_replay)
+      throw std::invalid_argument("training ring plan/allocation requires eager execution");
+  }
   const bool serialized_graph_replay =
       static_v4_candidate && config.serialized_graph_replay;
   const bool direct_inference_routes = config.inference_routes.data != nullptr ||
@@ -4479,28 +4498,35 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     "owned_experts", id.calling_rank,
                     std::to_string(view.sizes.owned_expert_count),
                     std::to_string(weight.owned_experts));
-  auto tensors =
-      config.tensors
-          ? config.tensors
-          : prepare_forward_tensors(dispatch, backend->execution, config);
-  const auto &data = *tensors.impl_;
-  if (data.tokens != id.num_tokens || data.hidden != config.hidden_size ||
-      data.intermediate != config.intermediate_size ||
-      data.rows < dispatch.received_row_capacity() ||
-      data.training != config.retain_backward_state ||
-      data.completion.device != backend->execution.device_ordinal())
-    throw std::runtime_error(
-        "Forward tensor storage does not match this invocation");
-  const auto writes = {data.output, data.x, data.ab};
-  tensor_storage_detail::validate_input_disjoint(
-      writes, activation.pointer,
-      id.num_tokens * config.hidden_size * sizeof(transport::BFloat16));
-  const auto w2_bytes = static_cast<std::uint64_t>(weight.owned_experts) *
-                        config.hidden_size * config.intermediate_size *
-                        sizeof(transport::BFloat16);
-  tensor_storage_detail::validate_input_disjoint(writes, weight.w1,
-                                                 2 * w2_bytes);
-  tensor_storage_detail::validate_input_disjoint(writes, weight.w2, w2_bytes);
+  ForwardTensorStorage tensors;
+  const auto prepare_storage = [&] {
+    if (config.tensors)
+      tensors = config.tensors;
+    else if (config.prepare_tensors)
+      tensors = config.prepare_tensors();
+    else
+      tensors = prepare_forward_tensors(dispatch, backend->execution, config);
+    if (!tensors)
+      throw std::invalid_argument("Forward tensor preparation returned empty storage");
+    const auto &data = *tensors.impl_;
+    if (data.tokens != id.num_tokens || data.hidden != config.hidden_size ||
+        data.intermediate != config.intermediate_size ||
+        data.rows < dispatch.received_row_capacity() ||
+        data.training != config.retain_backward_state ||
+        data.completion.device != backend->execution.device_ordinal())
+      throw std::runtime_error("Forward tensor storage does not match this invocation");
+    const auto writes = {data.output, data.x, data.ab};
+    tensor_storage_detail::validate_input_disjoint(
+        writes, activation.pointer,
+        id.num_tokens * config.hidden_size * sizeof(transport::BFloat16));
+    const auto w2_bytes = static_cast<std::uint64_t>(weight.owned_experts) *
+                          config.hidden_size * config.intermediate_size *
+                          sizeof(transport::BFloat16);
+    tensor_storage_detail::validate_input_disjoint(writes, weight.w1, 2 * w2_bytes);
+    tensor_storage_detail::validate_input_disjoint(writes, weight.w2, w2_bytes);
+  };
+  if (!training_ring)
+    prepare_storage();
 
   auto flight = std::make_shared<OperatorFlight>(lease, false);
   SlotFailureGuard failure_guard{lease, false};
@@ -4702,10 +4728,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         at<const std::uint32_t>(slot.device, layout.fused_route_dst_mtile);
   }
   args.dispatch = view;
+  if (training_ring)
+    args.dispatch.runtime = at<DeviceDispatchRuntime>(slot.device,
+                                                       layout.fused_dispatch_runtime);
   args.dispatch_waves = dispatch_waves;
   args.fused_inference_routes = fused_inference_routes;
   args.selected_experts =
-      fused_inference_routes
+      fused_inference_routes || training_ring
           ? (direct_inference_routes
                  ? static_cast<const std::int32_t *>(
                        config.inference_routes.data)
@@ -4820,6 +4849,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.expert_blocks = at<std::uint64_t>(slot.device, l.expert_blocks);
     r.blocks = at<static_forward::RingBlock>(slot.device, l.blocks);
     r.rows = at<static_forward::RingRow>(slot.device, l.rows);
+    if (training_ring)
+      args.checkpoint.rows = at<std::uint64_t>(slot.device, l.tape_rows);
     if (use_gin) {
       r.contribution_rows = at<std::uint32_t>(slot.device, l.contribution_rows);
       r.pull_packets = at<static_forward::PullPacket>(slot.device, l.pull_packets);
@@ -4832,6 +4863,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         : at<char>(slot.device, l.metadata);
     r.source_header = at<static_forward::SourceHeader>(metadata, m.header);
     r.source_gates = at<float>(metadata, m.gates);
+    if (training_ring)
+      args.checkpoint.source_rows = at<std::uint64_t>(metadata, m.tape_rows);
     auto &p = r.source;
     p.shape = l.shape;
     p.shape.world = id.world_size;
@@ -4869,23 +4902,28 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.direct_headers_offset = layout.direct_route_headers;
   args.contribution_offset = layout.contribution;
   args.return_ready_epoch_offset = layout.return_ready_epoch;
-  args.output = static_cast<transport::BFloat16 *>(data.output->data);
   args.ingress_published_offset = layout.ingress_published_sequence;
   args.outgoing_sequence_offset = layout.outgoing_route_sequence;
   args.status_offset = layout.status;
   args.forward_s_offset = layout.forward_s;
-  args.saved_x = data.training
-                     ? static_cast<transport::BFloat16 *>(data.x->data)
-                     : nullptr;
+  const auto bind_storage = [&] {
+    const auto &data = *tensors.impl_;
+    args.output = static_cast<transport::BFloat16 *>(data.output->data);
+    if (!data.training)
+      return;
+    args.saved_x = static_cast<transport::BFloat16 *>(data.x->data);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
-  if (data.training && data.rows)
-    args.saved_x_map = make_bf16_tma_store_map(
-        data.x->data, config.hidden_size, data.rows, "saved FC1 X");
+    if (!training_ring && data.rows)
+      args.saved_x_map = make_bf16_tma_store_map(
+          data.x->data, config.hidden_size, data.rows, "saved FC1 X");
 #endif
-  args.saved_ab = data.training
-                      ? static_cast<transport::BFloat16 *>(data.ab->data)
-                      : nullptr;
-  args.saved_rows = data.rows;
+    args.saved_ab = static_cast<transport::BFloat16 *>(data.ab->data);
+    args.checkpoint.gates = static_cast<float *>(data.gates->data);
+    args.checkpoint.headers = static_cast<LocalP2pRouteHeader *>(data.headers->data);
+    args.saved_rows = data.rows;
+  };
+  if (!training_ring)
+    bind_storage();
   args.retain_backward_state = config.retain_backward_state;
   args.forward_task_claim_offset = layout.forward_task_claim;
   args.forward_fc1_done_offset = layout.forward_fc1_done;
@@ -5029,7 +5067,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       }
       args.forward_stream_local_dispatch = split_local_roles || static_v4_candidate;
       args.forward_compact_return = forward_tuning::kUnifiedWorkers;
-      if (fused_inference_routes)
+      if (fused_inference_routes || training_ring)
         args.forward_compact_return = false;
       args.forward_relay_local_return = forward_tuning::kRelayLocalReturn;
       // Eight independent row streams per CTA are the Hopper default.
@@ -5165,6 +5203,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             kStaticUnified = use_gin
                 ? unified_forward_entry<false, false, true, false, true>()
                 : unified_forward_entry<true, false, true, false, true>();
+          if (training_ring)
+            kStaticUnified = unified_forward_entry<true, true, true, false, true>();
           if constexpr (forward_tuning::kStaticV4PrefillEnabled) {
             if (prefill) {
               if (args.ring.depth)
@@ -5175,6 +5215,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 kStaticUnified = use_gin
                     ? unified_forward_entry<false, false, true, true>()
                     : unified_forward_entry<true, false, true, true>();
+              if (training_ring)
+                kStaticUnified = unified_forward_entry<true, true, true, true, true>();
             }
           }
           const auto smem =
@@ -5217,6 +5259,53 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 "V4 unified resident grid", id.calling_rank,
                 std::to_string(forward_main_compute_ctas) + " resident CTAs",
                 std::to_string(max_active_clusters) + " resident clusters");
+          if (training_ring) {
+            cudaLaunchAttribute cooperative{};
+            cooperative.id = cudaLaunchAttributeCooperative;
+            cooperative.val.cooperative = 1;
+            cudaLaunchConfig_t plan_launch{};
+            plan_launch.gridDim = launch.gridDim;
+            plan_launch.blockDim = launch.blockDim;
+            plan_launch.stream = exec->stream;
+            plan_launch.attrs = &cooperative;
+            plan_launch.numAttrs = 1;
+            plan_launch.dynamicSmemBytes = sizeof(unsigned) *
+                std::max({args.ring.source.scratch_words(),
+                          view.sizes.owned_expert_count * args.ring.source.shape.sources,
+                          12U});
+            internal::throw_cuda("forward-plan",
+                internal::prepare_kernel_stack(
+                    reinterpret_cast<const void *>(static_ring_plan_kernel<false>)),
+                id.calling_rank, id.world_size, backend->session.session().identity(),
+                id.generation, ExchangeKind::ExpertCounts, "prepare ring planner stack");
+            internal::throw_cuda("forward-plan",
+                cudaLaunchKernelEx(&plan_launch, static_ring_plan_kernel<false>, args),
+                id.calling_rank, id.world_size, backend->session.session().identity(),
+                id.generation, ExchangeKind::ExpertCounts, "freeze training ring plan");
+            DeviceDispatchRuntime planned{};
+            internal::throw_cuda("forward-plan",
+                cudaMemcpyAsync(&planned, args.dispatch.runtime, sizeof(planned),
+                                cudaMemcpyDeviceToHost, exec->stream),
+                id.calling_rank, id.world_size, backend->session.session().identity(),
+                id.generation, ExchangeKind::ExpertCounts, "read actual ring rows");
+            internal::throw_cuda("forward-plan", cudaStreamSynchronize(exec->stream),
+                id.calling_rank, id.world_size, backend->session.session().identity(),
+                id.generation, ExchangeKind::ExpertCounts, "complete ring plan");
+            try {
+              state->forward_tensor_preparation->run([&] {
+                if (planned.error || planned.sizes.incoming_row_count !=
+                                         view.sizes.incoming_row_count)
+                  throw std::runtime_error("ring plan disagrees with canonical Notify rows");
+                prepare_storage();
+                bind_storage();
+              });
+            } catch (const TensorPreparationFailure &) {
+              // Plan has joined and no payload/slot was admitted. Its frozen
+              // metadata may be rebuilt for a retry without advancing bases.
+              failure_guard.committed = true;
+              throw;
+            }
+          }
           launch_forward = cudaLaunchKernelEx(
               &launch, kStaticUnified, args, slot.forward_x_map,
               slot.forward_s_map,
@@ -5471,7 +5560,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                          id.generation, ExchangeKind::ExpertCounts,
                          "single persistent WGMMA/TMA forward launch");
 
-  if (config.retain_backward_state) {
+  const auto &data = *tensors.impl_;
+  if (config.retain_backward_state && !training_ring) {
     const auto save =
         [&](const std::shared_ptr<tensor_storage_detail::Allocation> &target,
             std::size_t offset, std::uint64_t row_bytes) {

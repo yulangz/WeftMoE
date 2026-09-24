@@ -132,6 +132,17 @@ __global__ __launch_bounds__(
   // Shared barriers and cluster setup are independent of the preceding
   // generation initialization. Every thread waits before reading its output.
   programmatic_launch::wait();
+  if constexpr (RingSchedule && RetainBackwardState) {
+    if (blockIdx.x == 0U && threadIdx.x == 0U)
+      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->start_clock =
+          device_globaltimer_ns();
+    // The plan and tape allocations are already frozen. Only stage X here;
+    // the node join publishes it to pull owners, without recounting routes.
+    static_v4::ring::stage_input(a,
+        std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x,
+        std::uint64_t(gridDim.x) * blockDim.x);
+    static_v4::rank_barrier<0U, 384U>(a);
+  }
   if constexpr (StaticSchedule) {
     if (a.fused_inference_routes) {
       if (blockIdx.x == 0U && threadIdx.x == 0U)
@@ -218,7 +229,8 @@ __global__ __launch_bounds__(
                 127U) &
                ~127ULL));
       if constexpr (RingSchedule)
-        forward_unified_transport::ring_run<kFc1N, kFc2N, !StaticLocal>(a, comm);
+        forward_unified_transport::ring_run<kFc1N, kFc2N, !StaticLocal,
+                                             RetainBackwardState>(a, comm);
       else
         forward_unified_detail::Communication<StaticLocal, StaticSchedule>{
             a, control, scheduler, comm}();
@@ -231,7 +243,7 @@ __global__ __launch_bounds__(
       &pair_operand, &output_store_map, pair);
   }
   if constexpr (RingSchedule) {
-    static_assert(StaticSchedule && !RetainBackwardState);
+    static_assert(StaticSchedule);
     static_v4::collective_scope_sync<384U, static_v4::kCollectiveJoinBarrier>();
     if (threadIdx.x >= 256U) {
       if constexpr (StaticLocal)

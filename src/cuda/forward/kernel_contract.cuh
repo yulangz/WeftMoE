@@ -1,6 +1,13 @@
 // Internal, pointer-bearing launch contract. Never include from public API.
 // Kept in this header so the aggregation translation unit preserves device
 // inlining and code generation while the Forward boundary remains explicit.
+struct RingCheckpointView {
+  std::uint64_t *source_rows = nullptr; // Notify route_dst_row per source route.
+  std::uint64_t *rows = nullptr; // Physical-plan row -> canonical tape row.
+  float *gates = nullptr;
+  LocalP2pRouteHeader *headers = nullptr;
+};
+
 struct ForwardKernelArgs {
   static_forward::ComputeRingView ring;
   DeviceDispatchKernelView dispatch;
@@ -160,6 +167,7 @@ struct ForwardKernelArgs {
   // removes cross-peer counter RMWs from FC2 while still avoiding head-of-line
   // waits on incomplete fixed stripes.
   bool forward_dynamic_reduce_scan = false;
+  RingCheckpointView checkpoint;
 };
 
 __device__ __forceinline__ std::uint64_t

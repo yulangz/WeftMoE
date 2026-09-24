@@ -72,8 +72,18 @@ class Runtime {
           unsigned max_saved)
       : rank_(rank), hidden_(hidden), intermediate_(intermediate),
         max_tokens_(max_tokens), training_(training), stream_(reinterpret_cast<cudaStream_t>(stream)) {
-    if (!world || !nodes || world % nodes || experts % world || !max_saved)
+    if (!world || !nodes || world % nodes || experts % world || !top_k || !max_saved)
       throw std::invalid_argument("invalid EP topology or saved-tensor capacity");
+    const auto *ring_setting = std::getenv("WEFTMOE_STATIC_RING_TOKENS");
+    const auto ring_tokens = ring_setting ? std::stoul(ring_setting) : 0U;
+    training_ring_ = training && ring_tokens;
+    if (training_ring_) {
+      // Only canonical routing/scheduler metadata uses this worst-case
+      // capacity. X/S stay bounded; saved tensors and Backward payload use R.
+      if (max_tokens > UINT32_MAX / top_k / world)
+        throw std::invalid_argument("training ring metadata exceeds uint32 row indices");
+      max_rows = std::max(max_rows, max_tokens * top_k * world);
+    }
     std::string bytes = bootstrap;
     auto id = NcclBootstrapId::from_bytes({bytes.begin(), bytes.end()});
     execution_ = make_external_cuda_execution("torch", device, stream_, owner(stream_owner));
@@ -114,12 +124,9 @@ class Runtime {
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
     capacity.enable_backward_state = training;
-    if (!training) {
-      if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
-        capacity.static_forward_window_tokens = std::stoul(window);
-      if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
-        capacity.static_forward_contribution_windows = std::stoul(depth);
-    }
+    capacity.static_forward_window_tokens = ring_tokens;
+    if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+      capacity.static_forward_contribution_windows = std::stoul(depth);
     capacity.enable_gin_rdma =
         WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
     pool_ = prepare_activation_transport_pool(base_.session(), execution_, capacity);
@@ -239,6 +246,12 @@ class Runtime {
     BFloat16ActivationLease input;
     ForwardWeightLease weights;
     ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
+    const auto allocate_outputs = [&] {
+      tape->output = empty({tokens, hidden_}, "bfloat16");
+      ForwardTensorBuffers buffers;
+      buffers.output = binding(tape->output);
+      return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers, allocator());
+    };
     prepare_tensors([&] {
       input = producer.publish_activations(
           static_cast<const transport::BFloat16 *>(pointer(x)),
@@ -248,11 +261,11 @@ class Runtime {
           static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
           config_.num_experts / config_.topology.world_size,
           rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
-      tape->output = empty({tokens, hidden_}, "bfloat16");
-      ForwardTensorBuffers buffers;
-      buffers.output = binding(tape->output);
-      fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc, buffers, allocator());
+      if (!training_ring_)
+        fc.tensors = allocate_outputs();
     });
+    if (training_ring_)
+      fc.prepare_tensors = allocate_outputs;
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
@@ -478,7 +491,7 @@ class Runtime {
   }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
-  bool training_, fused_inference_ = false;
+  bool training_, fused_inference_ = false, training_ring_ = false;
   cudaStream_t stream_;
   cudaEvent_t input_ready_ = nullptr;
   RuntimeConfig config_;

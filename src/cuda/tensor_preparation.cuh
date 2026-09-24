@@ -75,7 +75,7 @@ void CollectiveTensorPreparation::run(
   const auto origin = state.agree(static_cast<bool>(failure));
   if (origin == state.nccl->world)
     return;
-  const auto error = std::runtime_error(
+  const auto error = TensorPreparationFailure(
       "tensor preparation failed on rank " + std::to_string(origin) +
       " before execution");
   if (failure) {

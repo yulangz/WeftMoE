@@ -75,12 +75,13 @@ struct ActivationTransportPoolConfig {
   // backend. Their windows survive compatible compute-arena growth. This flag
   // never selects the backend by itself.
   bool enable_gin_rdma = false;
-  // Reserve Backward scratch and a separate FC2 plane so canonical X survives
-  // until it is saved. Long-lived X/A/B checkpoints and final outputs belong
-  // to ForwardTensorStorage, independently of these reusable execution slots.
+  // Enable reusable Backward metadata and actual-sized peer workspaces.
+  // Long-lived X/A/B checkpoints and final outputs belong to
+  // ForwardTensorStorage, independently of these execution slots.
   bool enable_backward_state = false;
   // Opt-in bounded static Forward workspace. Zero retains the arena path;
-  // otherwise this is the source-token window size (inference only for now).
+  // otherwise this is the source-token window size. Training currently
+  // supports the node-local backend and an eager plan/allocation boundary.
   std::uint32_t static_forward_window_tokens = 0;
   // Source-side Return/Reduce capacity, independent of destination X/S/C.
   std::uint32_t static_forward_contribution_windows = 2;
@@ -175,6 +176,10 @@ struct ForwardMegaKernelConfig {
   // must be provided together; training and the legacy split paths reject them.
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
+  // Training ring: allocate the tape after the frozen route plan, before
+  // activation traffic. The callback is rank-local; the backend agrees on
+  // allocation failure collectively. Mutually exclusive with tensors.
+  std::function<ForwardTensorStorage()> prepare_tensors;
 };
 
 class ForwardWeightLease {

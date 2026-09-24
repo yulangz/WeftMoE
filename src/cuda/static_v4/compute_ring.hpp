@@ -96,6 +96,7 @@ struct PullPacket {
 // for network planning. X is deliberately absent from this region.
 struct SourceMetadataLayout {
   std::size_t header = 0, selected = 0, gates = 0;
+  std::size_t tape_rows = 0;
   std::size_t expert_prefix = 0, node_prefix = 0, route_order = 0;
   std::size_t node_tokens = 0, packet_prefix = 0;
   std::size_t dispatch_offsets = 0, dispatch_packets = 0;
@@ -150,6 +151,7 @@ struct ComputeRingLayout {
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
   std::size_t window_sources = 0;
   std::size_t blocks = 0, rows = 0;
+  std::size_t tape_rows = 0;
   std::size_t pull_packets = 0;
 };
 

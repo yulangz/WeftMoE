@@ -1,7 +1,8 @@
 # V4 ring 训练对接记录
 
-对应设计文档 M6。当前训练仍执行 V3，不能将 inference 的正确性和性能门禁
-视为训练对接完成。所有未验证改动保持候选状态。
+对应设计文档 M6。默认训练仍执行 V3；M6d 接通 opt-in 单机 ring Forward，
+Backward 仍复用既有调度/GEMM。多机训练 ring 尚未接通，不能将 inference 的
+正确性和性能门禁视为完整训练对接完成。所有未验证改动保持候选状态。
 
 ## M6a：按实际接收量分配 rank-private Backward 中间区
 
@@ -297,3 +298,143 @@ plane；原生EP16均匀fixture的总pool由360,114,880升至363,262,272 bytes/r
 `torch_ep16_t64_reuse_{0,1}.log`；冻结目录含source patch与sanitizer wrapper。
 M6的StableTape/window plan、checkpoint生命周期及Backward GIN window adapter
 仍未完成，训练继续走V3。
+
+## M6d：单机训练 ring、canonical tape 与 plan/allocate/main 边界
+
+本步接通单机 opt-in training Forward，不是多机训练完成。未设置
+`WEFTMOE_STATIC_RING_TOKENS` 时保留 V3；设置后单机使用静态 ring，当前多机
+training pool 显式拒绝，等待 Backward GIN window adapter，不静默退回 V3。
+
+### 执行和生命周期
+
+- 先 materialized Notify，保留其 canonical `route_dst_row`、原 combine order
+  及 Backward metadata。独立 `static_ring_plan_kernel` 再冻结窗口/物理行映射；
+  它只发布 routes/gates/行号，不搬 X。两层规划都在 main 前，**不是一遍 planner**。
+  训练入口拒绝 fused inference / replay-counts Notify，避免复用的可变路由元数据
+  破坏 live tape 的 canonical 行号合同。
+- 训练专属 source `uint64[route]` 和 physical-plan `uint64[row]` 记录 tape 行号。
+  不改变 inference 的24B RingRow，不把 atomic 物理枚举当作稳定逻辑顺序；
+  ring 使用自己的 DeviceDispatchRuntime，不改 retained Notify 的 M64 geometry。
+- host 读取实际行数，与 Notify 核对后分配独立 saved-X/G/U/gates/headers及输出。
+  新的 rank-local `ForwardMegaKernelConfig::prepare_tensors` 回调在此执行，backend
+  用预分配的 CollectiveTensorPreparation 一致失败。原生未绑定 tensors 的路径
+  也在此分配；显式绑定的 caller-owned storage 仍可复用。没有 main 内扩容。
+- 已完成协议的分配失败用 `TensorPreparationFailure` 区分于 CUDA/NCCL 控制面故障。
+  前者可释放 slot 并重试：plan 已 join，尚未准入 payload，source/block bases
+  未推进。没有“恢复失效 context/comm”或首次 pool OOM 恢复的承诺。
+- main 只 stage X、发布 node-local ready，并消费冻结 plan，不重数或重交换。
+  Pull 复用既有 FanoutRowPrefetchPipeline：一次 G2S，向物理 X 和 saved-X 各写一次；
+  **两次 S2G 全部完成才发布 X full**。gate/header 同时按 canonical 行保存。
+- FC1 packed gate/up accumulator按同一 BF16 rounding 写入标准分离的 G/U tape；
+  S 仍在物理 ring。FC2/Return/Reduce 沿用静态 inference 数据面，Backward 使用
+  原 canonical 顺序及固定 dW reduction，不再访问被覆盖的 X/S slot。
+- live tape 持有独立 Notify lease 和 tensors；物理 plan/ring 在 Forward 完成后
+  即可被后续调用重用。训练 plan/allocation 入口明确拒绝 capture；后续测试中的
+  graph/offload 是**独立 inference 阶段**，不是训练/Backward Graph 支持。
+
+### 容量
+
+Python training ring 将 Notify/调度**元数据**容量至少扩到 `world*max_tokens*K`，
+旧的较小 `max_rows` 不再截断合法热点。原生接口仍须给 materialized Notify 足够
+的元数据容量。完整 Forward X/S 被固定深度物理 ring 替代；tape、compact dR
+按本 rank 实际 R，source Backward contribution按本地 T*K 分配。
+private Backward workspace仍为 `R+owned_experts*127`，不是精确 P_actual。
+
+20K、EP8/E64/K4全命中rank0时，实际R655,360：完成Backward后的 pool
+`compute_bytes` 为rank0 **3,586,689,528**、其余rank **902,339,064**；Notify
+另为89,877,032bytes/rank，无GIN注册区。两者差2,684,350,464B正是实际dR和
+空rank最小dR的差异。**这些数不含 caller-owned tape、Backward tensors和PyTorch
+参考，不是总显存或峰值。** 该热点仅saved-X/G/U/gates/72B headers就需
+4,076,339,200B，加output83,886,080B；长文训练的持久数据不会因ring消失。
+本步未做匹配配置的训练E2E性能对照，不报告训练加速百分比。
+
+### 验证与冻结
+
+初版`build/static_v4_training_ring_local_m6d/` library SHA256
+`946d93e2c81ee486d6e4aa4106fd5a7716bbd428ff446937515a6d9a889e66fc`：
+host18/18；EP8 T64均匀、T512热点，B16/D1、完整分配失败/retry/三个live tapes/
+后续inference graph/offload通过。随后补上no-drop元数据容量、capture拒绝和
+main计时边界（不把host分配停顿计入device_kernel_us），冻结checked版：
+
+`build/static_v4_training_ring_local_m6d_checked/`
+
+- native `fe85a17acc79b7ed841834f48f9440827ad613202bd848a3db1e9e37093d2cdb`
+- library `841af316674ff19df33fb3ee589d4ab0ecc14797d76febe0e5d074031230b4ee`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+planner REG80/STACK0/SHARED1024/LOCAL0；训练 main prefill/decode均REG168、
+SHARED2048/LOCAL0，STACK72/96。EP16 inference REG168/STACK432/440未变。
+
+checked版已有门禁：
+
+| case（全部单机EP8） | 结果 |
+|---|---|
+| native T64/E16/K6、B16/D1 | 8 ranks两次Backward repeat_equal=1；32个梯度hash逐字与冻结M6c V3训练路径一致 |
+| Torch T64/E64/K4热点、max_rows64、B16/D1 | 五类数值、16个failure、8个retry、24个live-tape复用、8个graph及8个offload标记全部通过 |
+| Torch T512热点、max_rows64、B16/D1 | 实际R16384，完整上述检查；rank0/7全部weftmoe kernel的memcheck均0，launcher0 |
+| 同一T512，单独Forward racecheck | rank0/7 planner及unified Forward均0 hazards，launcher0；不包含旧Backward racecheck未决项 |
+| Torch T1、T8192均匀，max_rows64、B512/D8 | 各8 ranks五类数值及后续inference graph/offload通过 |
+| Torch T20480全热点，max_rows64、B512/D8 | R655360，8 ranks五类数值及后续inference graph/offload通过 |
+
+Torch数值沿用现有脚本rtol0.02/atol0.00002；没有新增测试套件。短/长训练正确性
+可与CPU构建或另一台机器的独立EP8正确性任务并行，不取其耗时作性能证据。
+memcheck报告PID224875/224884，racecheck226064/226073；前缀
+`training_ring_local_m6d_*`。Backward全量racecheck的历史工具原子报告仍保留，
+不因新Forward通过而称整个训练sanitizer全通过。
+
+### Inference 回归与参数布局消融
+
+固定1620MHz、B512/D8、10 warmup / 20 samples / graph batch20，checked版
+正式回归如下（us，slowest-rank p50；每个shape输出hash与冻结DS一致）：
+
+| T/rank | EP8 checked | EP16 checked |
+|---:|---:|---:|
+| 1 | 101.122 | 279.278 |
+| 64 | 134.638 | 334.571 |
+| 8192 | 1261.710 | 2949.040 |
+| 20480 | 2954.080 | 7024.960 |
+
+checked新增的训练指针最初插在 ComputeRingView / ForwardKernelArgs 中间。
+EP16 T20480相邻对照为 checked **7024.960** → DS **6991.060** → checked
+**7029.450**，约0.5%回退。将四个训练指针集中到参数尾部的 RingCheckpointView，
+保持既有 inference 字段偏移后，isolated版为 **6988.290**，随后DS反测
+**6995.330**；范围分别6967.370–7025.190、6958.740–7020.000，视为持平，
+**不报告加速**。这是参数布局A/B，不改变训练或inference的数据面协议。
+REG/STACK未变，尚不能据此把回退归因到某一条SASS指令。
+
+isolated native位于`build/static_v4_training_ring_local_m6d_isolated/`，SHA256
+`f0595ea54e6a4f5c2d2190ae45fb4c465e51897cbb38969b9f97438d0c80c0ad`。
+两个相邻正式20K日志为`training_ring_local_m6d_isolated_inference_ep16_t20480_formal.log`
+及`training_ring_local_m6d_isolated_inference_ds_ep16_t20480_reverse_formal.log`。
+所有正式性能轮次均无CPU构建或其他GPU任务并行；早期EP8的`quick`文件实际为
+10 warmup/100 samples/batch2（launcher默认rounds110），不混入上述正式表。
+
+最终版在isolated基础上增加上述immutable Notify入口检查，冻结于
+`build/static_v4_training_ring_local_m6d_final/`（目录内`change.patch`）：
+
+- native `1001c146a6145e9718a45b1c78354ac5db0e751c65dd73be493888ac35a450f1`
+- library `5e0f53f0b64b15816202c404be154411322bd8eeb0e319deef3d731183a77218`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+最终版host18/18；native T64两次Backward重复一致、32梯度hash逐字等于M6c。
+重新完成EP8 Torch T1/64/8192/20480（64和20480热点、max_rows64）；T64与
+T512/B16/D1再跑完整OOM/retry/三个live tapes。T512 rank0/7 memcheck零错误
+（PID241301/241315）；同case独立Forward planner/main racecheck零hazards
+（PID242632/242653）。全部launcher退出0，五类数值、graph/offload标记齐全。
+最终native的cuobjdump资源报告与isolated逐字一致。日志前缀
+`training_ring_local_m6d_final_`；此处单机测试可在两台机器上分别独立运行，
+**不是双机EP8**。
+
+最终版同样在1620MHz、B512/D8、10/20/batch20重新完成正式inference矩阵：
+
+| T/rank | 单机EP8 / us | 双机EP16 / us |
+|---:|---:|---:|
+| 1 | 101.008 | 277.709 |
+| 64 | 134.936 | 333.302 |
+| 8192 | 1259.570 | 2953.690 |
+| 20480 | 2959.400 | 6985.580 |
+
+八个case全部退出0，hash与DS一致，compute/registered/total pool bytes不变。
+日志`training_ring_local_m6d_final_inference_ep{8,16}_t{1,64,8192,20480}_formal.log`。
+这是训练功能合入的inference回归，不是新的通信性能收益；EP16 20K相对历史
+冻结V3仍只有小幅优势，远未满足长序列显著领先的优化目标。
