@@ -132,26 +132,47 @@ __device__ void build_source_window(const SourcePlanView &a,
 
 // All source windows must be published before this pass (a grid join in the
 // fused entry, a kernel boundary in the isolated planning test). One fixed
-// worker owns each node/lane; the prefix supplies exact terminal sequences and
+// warp owns each node/lane; the prefix supplies exact terminal sequences and
 // lets RX enumerate packets in network order instead of expert-major order.
+__device__ inline void build_packet_prefix(
+    const SourcePlanView &a, PacketPartition packets,
+    const std::uint64_t *row_prefix, unsigned row_stride, unsigned node_stride,
+    std::uint64_t *output, unsigned worker, unsigned workers) {
+  const auto windows = a.local_windows();
+  const auto lane = worker % 32U;
+  for (auto channel = worker / 32U; channel < a.nodes * packets.lanes;
+       channel += workers / 32U) {
+    const auto node = channel / packets.lanes;
+    const auto packet_lane = channel % packets.lanes;
+    auto *prefix = output + channel * (windows + 1U);
+    std::uint64_t carry = 0U;
+    if (lane == 0U)
+      prefix[0] = 0U;
+    for (std::uint64_t base = 0; base < windows; base += 32U) {
+      const auto w = base + lane;
+      std::uint64_t count = 0U;
+      if (w < windows && node != a.source_rank / (a.shape.world / a.nodes)) {
+        const auto *rows = row_prefix + w * row_stride + node * node_stride;
+        count = packets.lane_packets(rows[node_stride] - rows[0], packet_lane);
+      }
+#pragma unroll
+      for (unsigned delta = 1U; delta < 32U; delta *= 2U) {
+        const auto previous = __shfl_up_sync(0xffffffffU, count, delta);
+        if (lane >= delta)
+          count += previous;
+      }
+      if (w < windows)
+        prefix[w + 1U] = carry + count;
+      carry += __shfl_sync(0xffffffffU, count, 31U);
+    }
+  }
+}
+
 __device__ inline void build_source_packet_prefix(const SourcePlanView &a,
                                                   unsigned worker,
                                                   unsigned workers) {
-  const auto windows = a.local_windows();
-  for (auto channel = worker; channel < a.nodes * a.packets.lanes;
-       channel += workers) {
-    const auto node = channel / a.packets.lanes;
-    const auto lane = channel % a.packets.lanes;
-    auto *prefix = a.packet_prefix + channel * (windows + 1U);
-    std::uint64_t total = 0;
-    prefix[0] = 0U;
-    for (std::uint64_t w = 0; w < windows; ++w) {
-      const auto *nodes = a.node_prefix + w * (a.nodes + 1U);
-      if (node != a.source_rank / (a.shape.world / a.nodes))
-        total += a.packets.lane_packets(nodes[node + 1U] - nodes[node], lane);
-      prefix[w + 1U] = total;
-    }
-  }
+  build_packet_prefix(a, a.packets, a.node_prefix, a.nodes + 1U, 1U,
+                       a.packet_prefix, worker, workers);
 }
 
 } // namespace weftmoe::cuda::static_forward

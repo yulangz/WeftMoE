@@ -2683,3 +2683,79 @@ EP16从1008139712降至913972672 bytes。EP16 compute/registered分别为
 Q32也比CL的Q16多占注册内存；不能只报告删除的C而隐藏这些成本。
 相对同Q32的CN，CO精确删除138412032 bytes（132MiB）C payload/rank。
 ring仍为opt-in，未将本项标成M5最终profile或训练支持完成。
+
+### CP：输入 staging 后复用全部 CTA 线程规划（候选）
+
+基于CO。输入X/gates staging与128-thread source counting保持重叠；原有CTA
+join之后，原来等待到PlanReady的256个math线程也参与packet prefix、目录、
+窗口几何、PullPacket和route地址绑定。所有后续grid/rank/GIN控制面barrier的
+参与者统一改为整个384-thread CTA，最后不再需要唤醒闲置math的第二次join。
+source ordinal、分包和静态GEMM任务不变，没有增加plan/通信buffer或计数器。
+数学warpgroup的动态寄存器配额调整仍在prepare之后，规划时没有live GEMM。
+本项编译/性能筛选中；尚未替代CO，不能将其归入上述验收结果。
+
+CP native SHA256 `042816f5a7b2c341cb48fcf2cd6e3bd9e10e944d681efa0e01bd84ff2f74fa6a`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_plan_all_threads/`。无并发构建的
+四规模快筛296.208/412.416/3036.750/7036.980 us，64 hashes与CO一致。
+8K/20K planning status最大值261.504/481.184 us，CO快筛为292.640/528.224 us。
+局部规划约省31/47 us，端到端只小幅改善；尚未完成正式与完整数值门禁。
+
+### CQ：共用 warp packet-prefix scan（候选）
+
+基于CP。原先每thread串行遍历一个channel的全部windows，现为每warp静态
+拥有一个channel，按32个windows一批做inclusive scan并保留64-bit carry。
+Dispatch的node-token prefix与Return的node-expert prefix使用同一helper；
+不改变packet顺序、目录布局或expected，不增加scratch/原子/barrier。
+无效tail lane以0参与scan，空channel和0-window仍写prefix[0]。
+现有GPU plan矩阵加4097 tokens，覆盖33-window的最后一批仅一有效lane，
+其它验收仍沿用原入口。候选编译中，不预先声称收益。
+
+CQ native SHA256 `04df01211b31a1e25078e62b3e0e5a68a69cad8a81bcdeffbf0780a6f8e1375b`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_warp_prefix/`。GPU plan37+6通过，
+isolated plan racecheck为0 hazards。无并发编译的四规模快筛为
+295.184/410.496/2990.780/7004.610 us，64 hashes与CP/CO一致；planning
+status最大值8K/20K为242.624/419.200 us。相对CP省约19/62 us规划，
+端到端省约46/32 us；正式及完整融合kernel门禁进行中，不据此标记目标完成。
+
+CQ library SHA256 `326eaeb91348c612b2bb33646b7c8937fd8f01489105c4583fa208a84ff0f4d7`。
+完整EP16四规模+edges480检查通过。第二节点无并发CPU/GPU任务的EP8正式
+10/20/20为100.659/135.357/1270.060/2956.290 us，32 hashes与CO一致；
+本节点独立编译library。单机基本持平，不将20K的不足0.1%变化视为收益。
+
+### CR：静态 ring CTA 数量消融（无收益，已撤回）
+
+基于CQ，临时host配置`WEFTMOE_STATIC_RING_CTAS`限制实际launch CTA数，
+不修改kernel task ownership或角色公式。值仍受已有双CTA cluster与网络进度
+所需context数量校验，非ring不受影响。launcher显式向两节点转发该值。
+用于比较132/128等CTA数与窗口大小的组合，检验静态residue相位及角色配额；
+没有运行时领用或work stealing。此配置尚未决定保留，编译/实测中。
+
+CR native SHA256 `c465d15a6edde8e763bc1dc2147c2f883c664fa5416e8b3281085d0801b8b279`，
+冻结 `static_v4_ring_cta_cap/`。EP16/B512/D8/20K、无并发编译的快筛，
+CTA128/120/112/132分别为7064.270/7147.500/7950.720/7015.200 us，64 hashes
+均与CQ一致。减少CTA没有收益，原132 CTA胜出；没有继续完整数值/sanitizer。
+已撤回host配置入口及launcher转发，不保留无收益的调参分支。
+
+### CP/CQ 里程碑验收（2026-09-24）
+
+完整EP8四规模+edges240、EP16的480、B16/D1/K8的304条检查通过；GPU plan
+37+6及isolated plan racecheck均通过。rank1/9 eager B16/D1/K8/T64、
+11 rounds融合kernel的memcheck/racecheck均exit0，0 errors/0 hazards；
+memcheck local487563/remote165082，racecheck local488186/remote165350。
+原host布局/容量代码未改变，沿用CO已验证的18/18。所有执行launcher exit0。
+
+正式1620MHz、B512/D8、10 warmup/20 samples/batch20，计时节点无并发构建
+或其它GPU工作，EP8在第二节点运行：
+
+| T/rank | 单机EP8/us | 双机EP16/us |
+|---:|---:|---:|
+|1|100.659|290.987|
+|64|135.357|414.488|
+|8192|1270.060|3007.870|
+|20480|2956.290|6989.360|
+
+96 hashes与CO一致。EP8基本持平，EP16长序列较CO正式快约1.75%/1.55%。
+相对前一CO对照轮次V3的3363.990/7106.450 us，8K/20K快约10.59%/1.65%；
+20K仍未达到最终“明显优于”的要求。不能把规划局部省下的全部时间当成总时延收益。
+内存布局、stage资源和数值顺序不变，REG168/STACK440/LOCAL0，仍一kernel graph。
+日志 `ring_warp_prefix_*`；不含CR或后续Pull合并完成候选。

@@ -591,6 +591,13 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   这些规划优化的数值/资源及性能取舍见 ring 实施记录；20K 的最终性能验收未完成。
   CJ 的 uint32 source 目录压缩在8K有收益，但20K相邻轮次确认退化，已撤回，
   不能把该候选的目录宽度写成当前布局。
+- CP 在输入 staging/source counting 的原 CTA join 后，让全部384线程参与
+  后续目录、几何和地址规划，相关控制面 collective 使用同一完整线程组。
+  source counting 仍由原128线程完成，与输入复制重叠；数据面角色不变。
+  CQ 将逐channel的窗口packet prefix改为warp分批scan，Dispatch/Return
+  共用同一实现，保留64-bit carry和精确terminal；无新增buffer或同步计数。
+  两项合并通过完整门禁，正式结果见ring记录。减少CTA数量的CR没有获益，
+  已撤回，不作为当前配置。
 
 #### CN/CO：FC2 直写 Return TX 后的差异
 

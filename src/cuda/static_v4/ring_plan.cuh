@@ -101,7 +101,7 @@ __device__ __forceinline__ void build_pull_packets(const ForwardKernelArgs &a,
 template <bool Network>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
-  constexpr unsigned Math = 256U, Control = 128U;
+  constexpr unsigned Math = 256U, SourceThreads = 128U, Threads = 384U;
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -113,6 +113,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       ++*a.runtime_epoch;
   }
   grid_sync(a);
+  const auto tid = threadIdx.x;
+  const auto worker = std::uint64_t(blockIdx.x) * Threads + tid;
+  const auto workers = std::uint64_t(gridDim.x) * Threads;
+  auto *counts = reinterpret_cast<unsigned *>(scratch);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanBegin,
+                             Kernel, 0U, 0U, 0U);
   if (threadIdx.x < Math) {
     const auto tid = std::uint64_t(blockIdx.x) * Math + threadIdx.x;
     const auto stride = std::uint64_t(gridDim.x) * Math;
@@ -126,20 +132,20 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             a.selected_experts[route];
     }
     build_combine_order(a, tid, stride);
-    collective_scope_sync<384U, kCollectiveJoinBarrier>();
-    collective_scope_sync<384U, kCollectiveJoinBarrier>();
-    return;
+  } else {
+    auto planner = p;
+    if constexpr (Network)
+      planner.selected_experts = a.selected_experts;
+    for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
+         w += gridDim.x)
+      static_forward::build_source_window<SourceThreads, Math,
+                                          kCollectiveScopeBarrier>(planner, w,
+                                                                    counts);
   }
-  const auto tid = threadIdx.x - Math;
-  const auto worker = std::uint64_t(blockIdx.x) * Control + tid;
-  const auto workers = std::uint64_t(gridDim.x) * Control;
-  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanBegin,
-                             Kernel, 0U, 0U, 0U);
-  auto *counts = reinterpret_cast<unsigned *>(scratch);
-  auto planner = p;
+  // Input staging and source counting overlap. Once both finish, all CTA
+  // threads can build the immutable plan; math has no live GEMM state yet.
+  collective_scope_sync<Threads, kCollectiveJoinBarrier>();
   if constexpr (Network) {
-    // Planning reads the caller's routes while math stages the immutable copy.
-    planner.selected_experts = a.selected_experts;
     const auto &network = a.static_network;
     for (auto index = worker; index < 2U * network.rings.channels();
          index += workers) {
@@ -151,18 +157,13 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       channel.rx_cursor = channel.consume_cursor = channel.rx_base;
     }
   }
-  for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
-       w += gridDim.x)
-    static_forward::build_source_window<Control, Math, kCollectiveScopeBarrier>(
-        planner, w, counts);
-  collective_scope_sync<384U, kCollectiveJoinBarrier>();
   if constexpr (Network) {
-    grid_sync<Math, Control>(a);
+    grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
                                Kernel, 0U, 0U, 0U);
     static_forward::build_source_packet_prefix(p, worker, workers);
     static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
-    grid_sync<Math, Control>(a);
+    grid_sync<0U, Threads>(a);
     if (worker == 0U) {
       static_forward::build_channel_offsets(
           p.packet_prefix, p.nodes * p.packets.lanes, p.local_windows(),
@@ -171,10 +172,10 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           r.returning.packet_prefix, p.nodes * p.packets.lanes,
           p.local_windows(), r.returning.channel_offsets);
     }
-    grid_sync<Math, Control>(a);
+    grid_sync<0U, Threads>(a);
     static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
     static_forward::build_return_packets(p, r.returning, worker, workers);
-    grid_sync<Math, Control>(a);
+    grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanPacketsReady,
                                Kernel, 0U, 0U, 0U);
     if (blockIdx.x < a.static_network.contexts && tid == 0U) {
@@ -187,17 +188,17 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     // every owner with a Put, but do not signal on the unused contexts.
     const auto chunks = static_forward::ceil_div(a.static_network.source_bytes,
                                                  kNetworkChunkBytes);
-    network_barrier<Math, Control>(
+    network_barrier<0U, Threads>(
         a, static_cast<unsigned>(min(chunks, std::uint64_t(a.static_network.contexts))));
   } else {
-    rank_barrier<Math, Control>(a);
+    rank_barrier<0U, Threads>(a);
   }
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanExchangeReady,
                              Kernel, 0U, 0U, 0U);
 
   if (blockIdx.x == 0U) {
     unsigned error = 0U;
-    for (unsigned source = tid; source < a.world; source += Control) {
+    for (unsigned source = tid; source < a.world; source += Threads) {
       const auto *header = source_metadata(a, source, r.source_header);
       r.source_epochs[source] = header->epoch;
       error |= header->error;
@@ -205,14 +206,14 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     error = __reduce_or_sync(0xffffffffU, error);
     if (tid % 32U == 0U)
       counts[tid / 32U] = error;
-    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     if (tid == 0U) {
       std::uint64_t tokens = 0U;
       for (unsigned source = 0; source < a.world; ++source)
         tokens = tokens > r.source_epochs[source].tokens
                      ? tokens
                      : r.source_epochs[source].tokens;
-      for (unsigned warp = 0; warp < Control / 32U; ++warp)
+      for (unsigned warp = 0; warp < Threads / 32U; ++warp)
         error |= counts[warp];
       r.state->windows = error ? 0U : p.shape.windows(tokens);
       auto *runtime = const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime);
@@ -221,7 +222,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           error;
     }
   }
-  grid_sync<Math, Control>(a);
+  grid_sync<0U, Threads>(a);
 
   for (auto w = std::uint64_t(blockIdx.x); w < r.state->windows;
        w += gridDim.x) {
@@ -235,9 +236,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           std::uint64_t(slot) * r.contribution_stride, slot};
     }
     if constexpr (Network)
-      build_pull_packets(a, w, tid, Control);
+      build_pull_packets(a, w, tid, Threads);
     for (unsigned index = tid; index < owned * p.shape.sources;
-         index += Control) {
+         index += Threads) {
       const auto expert = index / p.shape.sources;
       const auto source = first + index % p.shape.sources;
       counts[index] =
@@ -246,7 +247,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                                    a.rank * owned + expert))
               : 0U;
     }
-    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     static_forward::WindowGeometryView geometry{p.shape,
                                                 w,
                                                 owned,
@@ -255,10 +256,10 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                                 r.expert_blocks +
                                                     w * (owned + 1U),
                                                 nullptr};
-    static_forward::build_window_counts<Control, Math, kCollectiveScopeBarrier>(
+    static_forward::build_window_counts<Threads, 0U, kCollectiveScopeBarrier>(
         geometry);
   }
-  grid_sync<Math, Control>(a);
+  grid_sync<0U, Threads>(a);
   if (blockIdx.x == 0U && tid == 0U) {
     std::uint64_t blocks = 0U, rows = 0U;
     for (std::uint64_t w = 0; w < r.state->windows; ++w) {
@@ -284,7 +285,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     status->dispatch_blocks_done = status->reduced_tokens =
         status->fc1_start_clock = status->relay_blocks_done = ~0ULL;
   }
-  grid_sync<Math, Control>(a);
+  grid_sync<0U, Threads>(a);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanGeometryReady,
                              Kernel, 0U, 0U, 0U);
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
@@ -294,7 +295,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     const auto *prefix = r.expert_blocks + w * (owned + 1U);
     const auto first = p.shape.source_begin(w);
     const auto local_window = w / p.shape.groups();
-    for (unsigned index = tid; index < p.shape.sources; index += Control) {
+    for (unsigned index = tid; index < p.shape.sources; index += Threads) {
       const auto source = first + index;
       counts[index] =
           source < p.shape.source_end(w)
@@ -302,7 +303,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                                    a.rank * owned + expert))
               : 0U;
     }
-    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     const static_forward::WindowGeometryView geometry{
         p.shape,
         w,
@@ -312,7 +313,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         r.expert_blocks + w * (owned + 1U) + expert,
         nullptr};
     for (auto b = std::uint64_t(tid); b < prefix[expert + 1U] - prefix[expert];
-         b += Control) {
+         b += Threads) {
       const auto block = r.window_prefix[w] + prefix[expert] + b;
       const auto seq = r.state->block_base + block;
       r.blocks[block] = {
@@ -324,12 +325,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           seq / r.depth + 1U};
     }
     if constexpr (Network)
-      collective_scope_sync<Control, kCollectiveScopeBarrier>();
+      collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     // Freeze reverse identity and gate before payload starts. Each warp reads
     // a contiguous source-expert route list; pull does no peer count/ordinal
     // search, and Return never depends on the lifetime of an X slot.
     for (auto source = first + tid / 32U; source < p.shape.source_end(w);
-         source += Control / 32U) {
+         source += Threads / 32U) {
       const auto count = counts[source - first];
       const auto *source_prefix = source_metadata(a, source, p.expert_prefix) +
                                   local_window * (p.experts + 1U);
@@ -367,14 +368,13 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         }
       }
     }
-    collective_scope_sync<Control, kCollectiveScopeBarrier>();
+    collective_scope_sync<Threads, kCollectiveScopeBarrier>();
   }
-  grid_sync<Math, Control>(a);
+  grid_sync<0U, Threads>(a);
   if constexpr (Network)
-    rank_barrier<Math, Control, true, false, true>(a);
+    rank_barrier<0U, Threads, true, false, true>(a);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanReady,
                              Kernel, 0U, 0U, 0U);
-  collective_scope_sync<384U, kCollectiveJoinBarrier>();
 }
 
 } // namespace static_v4::ring

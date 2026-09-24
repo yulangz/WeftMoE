@@ -384,7 +384,7 @@ void run_geometry(unsigned nodes, bool hotspot) {
 int main() {
   try {
     for (unsigned nodes : {1U, 2U, 3U}) {
-      for (unsigned tokens : {0U, 1U, 64U, 8192U, 20480U}) {
+      for (unsigned tokens : {0U, 1U, 64U, 4097U, 8192U, 20480U}) {
         run(nodes, tokens, false);
         run(nodes, tokens, true);
       }
@@ -394,7 +394,7 @@ int main() {
       run_geometry(nodes, false);
       run_geometry(nodes, true);
     }
-    std::cout << "static V4 GPU plan: 31 source/packet + 6 destination cases "
+    std::cout << "static V4 GPU plan: 37 source/packet + 6 destination cases "
                  "passed\n";
     return 0;
   } catch (const std::exception &error) {
