@@ -4419,7 +4419,7 @@ source和三节点partial group；同程序racecheck0 hazards/0 errors/0 warning
 geometry与测试参考均撤回，继续共享原round-robin布局。日志
 `source_major_{et,fb}_ep16_t*_training_forward.log`。FD构建在本组计时结束后才开始。
 
-### FD：Return整包同Mblock时跳过内部重复读取（候选，未构建）
+### FD：Return整包同Mblock时跳过内部重复读取（无稳定收益，撤回）
 
 EU在Q32使用通用run二分搜索，未改善20K；本项独立基于已验收ET/Q16及原
 round-robin，只处理整包同一block的情况，不含FB/FC或此前候选。先acquire
@@ -4429,3 +4429,47 @@ round-robin，只处理整包同一block的情况，不含FB/FC或此前候选�
 仍是原coalesced线性扫描。没有依赖目录、二分搜索、额外生命周期状态或barrier。
 比较expert+logical block，不仅比较可能回卷的物理slot。冻结
 `build/static_v4_return_single_block_fd/`；尚无性能/完整数值结论。
+
+native SHA256 `fc7d5fbf7e4d22fc4d931a7a0e9de2023088889cc498de72cec67335b81dad54`。
+网络prefill inference STACK384（ET392），training仍408，其余资源相同。
+1620MHz、无并发构建/GPU任务，10/2/batch2的EP16快筛：
+1/64/8K/20K为266.896/318.224/2927.360/6892.420us，范围分别
+266.896–656.272、318.224–321.872、2927.360–2928.000、6892.420–6921.490us。
+64个hash等于ET/ES。相邻ET的20K两样本6859.420–6940.370us，均值6899.895；
+FD均值6906.955，没有稳定改善。两样本p50实际取较小值，不当作正式收益。
+未继续完整数值/sanitizer，两处捷径已撤回。日志
+`return_single_block_{et,fd}_ep16_t*_quick.log`。
+
+### FE/FF：仅减少Return TX的静态owner（明显退化，撤回）
+
+独立基于ET，保持Dispatch、RX/ACK、Return RX、local Return、Pull、Reduce的
+owner数量及residue不变，仅将Return TX从32减到16/8；空出的warp不重分配。
+每个context仍THREAD独占，不使用EZ/FA的GPU sharing或DQ/DR的额外准备队列。
+contexts分别80/72，原96；每channel的双credit、完成prefix及整窗预留不变。
+同一owner的flush可能覆盖其多个channel，但只保守推进当前channel的已完成头。
+源代码五文件同一份、编译配额不同；不含FD捷径，初始化仍覆盖全部channel。
+冻结`build/static_v4_return_owners16_fe/`与`build/static_v4_return_owners8_ff/`。
+native SHA256分别`8790e852d2081237492702481c0bbe6d7de25c61413d871846ee2e3b95ae398d`、
+`0237be8bc21955b0e74b91a5a0ad5799a37e097857d4a45bb678dd556571e9f0`。
+构建全部结束后串行计时。长文明显退化，源改动已撤回；短规模仍用冻结binary补测。
+
+1620MHz、无并发构建/GPU任务、10/2/batch2的完整四档快筛：
+
+|T/rank|FE16 owners p50/us|min–max/us|FF8 owners p50/us|min–max/us|
+|---:|---:|---:|---:|---:|
+|1|282.560|282.560–298.560|325.488|325.488–333.056|
+|64|334.704|334.704–339.472|389.440|389.440–391.936|
+|8192|3927.540|3927.540–3951.570|7080.110|7080.110–7085.200|
+|20480|9775.220|9775.220–9791.810|18477.800|18477.800–18498.200|
+
+128个hash与ET/ES一致、pool不变；不因减少GIN资源而保留明显慢的配置。
+保留原32Return owners及96个独占contexts，没有进行候选完整数值/sanitizer。
+日志`return_owners_{fe,ff}_ep16_t*_quick.log`。这组对照不证明API提交、元数据
+扫描和reservation各自的成本比例，仅证明当前实现不能无代价地减少Return owner。
+
+### FG：单独将prefill FC2 N256改为N128（候选，未构建）
+
+独立基于ET，FC1 N128、K128、stages2/2、math/control配额、通信布局和全部
+静态owner不变；仅FC2列tile变窄。相比此前扩大FC1的EM，本项测试更早完成
+单个FC2 tile与增加任务/同步次数之间的权衡。共享GEMM模板、描述符和epilogue，
+不新增协议或运行时开关；decode不变。计时仍等待FE/FF串行快筛结束再构建。
