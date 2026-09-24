@@ -3615,3 +3615,39 @@ LOCAL0、CONSTANT3264（相较DS，STACK均增加8B）。1620MHz、Q8/Q32/L32/B5
 32个hash与DS一致。长序列未显示改善，不继续短规模、正式计时及完整数值/
 sanitizer门禁，slot恢复64B。此结果不能证明硬件上不存在缓存行竞争，只说明
 这项隔离没有得到可用的端到端收益。日志`ring_split_slot_state_dw_ep16_t*_quick.log`。
+
+### DX：连续 token 的 Dispatch 直接读取 source X（退化，已撤回）
+
+基于`487209b`的DS。对整个source window都命中的节点，以token次序直接写
+NodeToken表，省去该节点的压缩计数atomic；稀疏节点仍用原压缩路径。packet plan
+逐项确认token连续后记录起始token，否则保留原gather。将已有source X从compute
+区迁到GIN注册区，让连续packet直接从X发Put，省去X→Dispatch TX复制；不额外
+分配完整X。原有逐slot RX释放、本地NIC完成双credit及调用终止drain均保留。
+未修改route_order、Return布局或求和顺序；不把此枚举称为StableTape。
+
+冻结`build/static_v4_ring_direct_input_dx/`（32 owners/role、96 contexts）及
+`build/static_v4_ring_direct_input_dx8/`（8 owners/role、24 contexts），各存patch
+及provenance。native SHA256分别为
+`0a2537b7015eb52b72b6afc18e37807770c9d6d9aee80eb75c2808a681f35e75`、
+`ffb26d632cc4f0de9718762eb00b4e7fdf36ba204e80c7397d15b4ed395e8b6d`。
+两者network prefill/decode均REG168、STACK432、SHARED2048、LOCAL0、CONSTANT3264。
+DX32 host18/18、现有GPU plan 37个source/packet及6个geometry case通过，plan
+memcheck/racecheck均0；不等同于端到端通信sanitizer或完整数值门禁。
+
+1620MHz、EP16、E64/K4/H2048/I512、T20480、Q8/Q32/L32/B512/D8，10warmup/
+2samples/batch2，无并发CPU构建/GPU任务：
+
+| 版本 | p50/us | min–max/us | total bytes/rank |
+|---|---:|---:|---:|
+| DX32 | 7344.900 | 7344.900–7369.650 | 880,786,880 |
+| DX8 | 12481.000 | 12481.000–12521.700 | 880,786,880 |
+
+各16个hash均与DS一致。compute669,664,952、registered211,121,920bytes/rank；
+总量仅因packet descriptor多40,960B，但注册区增加83,927,040B。主benchmark的
+确定性路由使每个token都命中两节点，适于此连续快路径，不能推广为任意稀疏
+路由的命中率。即便如此，DX32较DS约7.0ms的参考明显更慢；DX8还同时改变
+Pull/local Return/Reduce的owner分配，不能将退化全部归因于NIC并发。
+
+不再继续四规模/正式计时/library/Torch/端到端sanitizer门禁，全部源码改动撤回。
+这里只否定这个组合，不单独归因于source地址、排序或复制消除；将来若重试须
+独立消融。日志`ring_direct_input_dx{,8}_ep16_t20480_quick.log`。
