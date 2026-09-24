@@ -3651,3 +3651,32 @@ Pull/local Return/Reduce的owner分配，不能将退化全部归因于NIC并发
 不再继续四规模/正式计时/library/Torch/端到端sanitizer门禁，全部源码改动撤回。
 这里只否定这个组合，不单独归因于source地址、排序或复制消除；将来若重试须
 独立消融。日志`ring_direct_input_dx{,8}_ep16_t20480_quick.log`。
+
+### DY：仅减少 Dispatch 静态 owner（无收益，已撤回）
+
+基于M6d `4c22ddc`，inference仍是DS数据面。Return发送、RX进口及Return发布
+保持32 owners；只将Dispatch由32降至8/16，总独占contexts由96降至72/80。
+空出的warp0参加Pull，其owner从100升至124/116；其他warp分工不变。因此也
+不是纯NIC context数量消融。固定pool生命周期内的channel/context归属，保留
+逐slot远端credit和本地NIC完成检查，无动态任务领用。Q8/Q32/L32/B512/D8不变。
+
+冻结`build/static_v4_ring_asymmetric_dispatch_dy{,16}/`，各有patch/provenance；
+native SHA256分别为
+`40616cf7e6b4374177396ebfb4ca4a8daaf856fece832c1c73b156435a8065db`、
+`c79f0bb05738449ad9b9ffc1aefdf2823bc1ae1de5ee8fa37f7eccbd65012b34`。
+两者network prefill/decode均REG168、STACK432/440、SHARED2048、LOCAL0、
+CONSTANT3264，total/compute/registered pool bytes与DS不变。
+
+1620MHz、EP16 T20480/E64/K4/H2048/I512，10warmup/2samples/batch2；无并发
+构建或其他GPU任务：
+
+| Dispatch owners | contexts | p50/us | min–max/us | route exchange rank-max/us |
+|---:|---:|---:|---:|---:|
+| 8 | 72 | 8605.680 | 8605.680–8621.600 | 422.688 |
+| 16 | 80 | 7300.270 | 7300.270–7532.820 | 422.400 |
+
+32个输出hash与冻结DS/M6d final一致；其相邻正式20K参考为6985.580us。
+两候选都没有收益，全部源码改动撤回，不继续四规模、正式计时或完整数值/
+sanitizer门禁，也不把hash相同称为完整正确性证明。纯链路少context优势不能
+直接推广到带copy/readiness/credit的混合算子。日志
+`ring_asymmetric_dispatch_dy{,16}_ep16_t20480_quick.log`。

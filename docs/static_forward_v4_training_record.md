@@ -438,3 +438,8 @@ T512/B16/D1再跑完整OOM/retry/三个live tapes。T512 rank0/7 memcheck零错�
 日志`training_ring_local_m6d_final_inference_ep{8,16}_t{1,64,8192,20480}_formal.log`。
 这是训练功能合入的inference回归，不是新的通信性能收益；EP16 20K相对历史
 冻结V3仍只有小幅优势，远未满足长序列显著领先的优化目标。
+
+M6d提交`4c22ddc`后，冻结final native又通过EP8 T64调用方allocator的12轮
+Backward（warmup10）：8 ranks均checked_repetitions12，warmup后无cache miss，
+32梯度hash仍与M6c逐字一致。日志`training_ring_local_m6d_final_backward_ep8_t64_allocator.log`。
+该正确性检查与下一候选CPU构建并行，不作性能比较。
