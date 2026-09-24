@@ -7412,7 +7412,8 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
     const NcclSession &session, const CudaExecution &execution,
     GinConnectionMode mode, std::uint32_t target_shift,
     const std::vector<std::uint64_t> &payload_bytes, std::uint32_t warmup,
-    std::uint32_t measured, std::uint32_t throughput_puts_per_sample) {
+    std::uint32_t measured, std::uint32_t throughput_puts_per_sample,
+    std::uint32_t contexts) {
 #if !__has_include(<nccl_device.h>)
   (void)session;
   (void)execution;
@@ -7422,6 +7423,7 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
   (void)warmup;
   (void)measured;
   (void)throughput_puts_per_sample;
+  (void)contexts;
   throw NotifyDispatchError(
       NotifyErrorCode::BackendUnavailable,
       "phase=gin-link-benchmark, field=headers, rank=0, "
@@ -7435,10 +7437,11 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
                     std::to_string(nccl->device),
                     std::to_string(exec->device));
   if (payload_bytes.empty() || measured == 0U ||
-      throughput_puts_per_sample == 0U)
+      throughput_puts_per_sample == 0U || contexts == 0U ||
+      contexts > static_cast<unsigned>(std::numeric_limits<int>::max()))
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "gin-link-benchmark", "benchmark shape", nccl->rank,
-                    "non-empty payloads and positive samples/puts", "invalid");
+                    "non-empty payloads and positive samples/puts/contexts", "invalid");
   const auto maximum_payload =
       *std::max_element(payload_bytes.begin(), payload_bytes.end());
   if (maximum_payload == 0ULL)
@@ -7536,8 +7539,8 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
   };
   const auto receive_offset = align_4k(maximum_payload, "GIN receive offset");
   const auto barrier_offset = align_4k(
-      checked_add(receive_offset, maximum_payload,
-                  "GIN benchmark receive extent"),
+      checked_mul(receive_offset, std::uint64_t(contexts) + 1U,
+                  "GIN benchmark context extents"),
       "GIN benchmark barrier offset");
   const auto allocation_bytes = checked_size(
       checked_add(barrier_offset, 4096ULL, "GIN benchmark window bytes"),
@@ -7549,11 +7552,11 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
 
   ncclDevCommRequirements_t requirements =
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  requirements.ginContextCount = 1;
+  requirements.ginContextCount = static_cast<int>(contexts);
   requirements.ginExclusiveContexts = true;
   requirements.ginQueueDepth = 64;
-  requirements.ginSignalCount = 1;
-  requirements.ginCounterCount = 1;
+  requirements.ginSignalCount = contexts;
+  requirements.ginCounterCount = contexts;
   requirements.ginConnectionType =
       mode == GinConnectionMode::Rail ? NCCL_GIN_CONNECTION_RAIL
                                       : NCCL_GIN_CONNECTION_FULL;
@@ -7641,6 +7644,7 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
     benchmark.world = nccl->world;
     benchmark.local_rank = static_cast<std::uint32_t>(lsa.rank);
     benchmark.local_world = static_cast<std::uint32_t>(lsa.nRanks);
+    benchmark.contexts = contexts;
     benchmark.gin_type = static_cast<std::uint32_t>(properties.ginType);
     benchmark.railed_gin_type =
         static_cast<std::uint32_t>(properties.railedGinType);
@@ -7652,7 +7656,7 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
         static_cast<std::byte *>(allocation) + barrier_offset);
     for (const auto bytes : payload_bytes) {
       for (const auto puts : batches) {
-        gin_probe_reset_kernel<<<1, 1, 0, exec->stream>>>(dev_comm);
+        gin_probe_reset_kernel<<<contexts, 1, 0, exec->stream>>>(dev_comm);
         internal::throw_cuda(
             "gin-link-benchmark",
             cudaMemsetAsync(device_error, 0, sizeof(*device_error),
@@ -7667,14 +7671,24 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
             nccl->rank, nccl->world, session.session().identity(),
             session.session().generation(), ExchangeKind::ExpertCounts,
             "ncclAllReduce(after GIN benchmark reset)");
-        gin_link_benchmark_kernel<<<1, 1, 0, exec->stream>>>(
+        cudaLaunchAttribute cooperative{};
+        cooperative.id = cudaLaunchAttributeCooperative;
+        cooperative.val.cooperative = 1;
+        cudaLaunchConfig_t launch{};
+        launch.gridDim = dim3(contexts);
+        launch.blockDim = dim3(1U);
+        launch.stream = exec->stream;
+        launch.attrs = &cooperative;
+        launch.numAttrs = 1U;
+        const auto launch_error = cudaLaunchKernelEx(
+            &launch, gin_link_benchmark_kernel,
             dev_comm, window, mode == GinConnectionMode::Full, fanout_full,
             destination, lsa.nRanks,
             checked_size(bytes, "GIN benchmark payload"),
             checked_size(receive_offset, "GIN benchmark receive offset"),
             warmup, measured, puts, device_duration, device_error);
         internal::throw_cuda(
-            "gin-link-benchmark", cudaGetLastError(), nccl->rank, nccl->world,
+            "gin-link-benchmark", launch_error, nccl->rank, nccl->world,
             session.session().identity(), session.session().generation(),
             ExchangeKind::ExpertCounts, "GIN benchmark kernel launch");
         internal::throw_cuda(
@@ -7710,14 +7724,6 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
     }
 
     std::vector<std::uint8_t> received(send.size());
-    internal::throw_cuda(
-        "gin-link-benchmark",
-        cudaMemcpy(received.data(),
-                   static_cast<std::byte *>(allocation) + receive_offset,
-                   received.size(), cudaMemcpyDeviceToHost),
-        nccl->rank, nccl->world, session.session().identity(),
-        session.session().generation(), ExchangeKind::ExpertCounts,
-        "cudaMemcpy(GIN benchmark received payload)");
     const auto source_node =
         (rail.rank + rail.nRanks - 1) % rail.nRanks;
     const auto source_local =
@@ -7739,13 +7745,25 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
         value = (value ^ byte) * 1099511628211ULL;
       return value;
     };
-    benchmark.received_hash = hash(received);
     benchmark.expected_hash = hash(expected);
-    if (received != expected)
-      transport_error(NotifyErrorCode::NcclFailure,
-                      "gin-link-benchmark", "received payload hash",
-                      nccl->rank, std::to_string(benchmark.expected_hash),
-                      std::to_string(benchmark.received_hash));
+    for (unsigned context = 0U; context < contexts; ++context) {
+      internal::throw_cuda(
+          "gin-link-benchmark",
+          cudaMemcpy(received.data(),
+                     static_cast<std::byte *>(allocation) +
+                         (context + 1ULL) * receive_offset,
+                     received.size(), cudaMemcpyDeviceToHost),
+          nccl->rank, nccl->world, session.session().identity(),
+          session.session().generation(), ExchangeKind::ExpertCounts,
+          "cudaMemcpy(GIN benchmark received payload)");
+      benchmark.received_hash = hash(received);
+      if (received != expected)
+        transport_error(NotifyErrorCode::NcclFailure,
+                        "gin-link-benchmark", "received context payload",
+                        nccl->rank, std::to_string(benchmark.expected_hash),
+                        "context=" + std::to_string(context) + ",hash=" +
+                            std::to_string(benchmark.received_hash));
+    }
     cleanup();
     return benchmark;
   } catch (...) {

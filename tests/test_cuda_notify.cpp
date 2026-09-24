@@ -3620,10 +3620,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     const auto batch = batch_text == nullptr
                            ? 32U
                            : static_cast<std::uint32_t>(std::stoul(batch_text));
+    const auto *contexts_text = std::getenv("WEFTMOE_GIN_BENCH_CONTEXTS");
+    const auto contexts = contexts_text == nullptr
+        ? 1U : static_cast<std::uint32_t>(std::stoul(contexts_text));
     const std::vector<std::uint64_t> payloads{
         1ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
         2ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
+        32ULL * 1024ULL,
         64ULL * 1024ULL,
+        128ULL * 1024ULL,
         64ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
         128ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
         4ULL * 1024ULL * 1024ULL};
@@ -3632,13 +3637,15 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             base, execution,
             full ? weftmoe::cuda::testing::GinConnectionMode::Full
                  : weftmoe::cuda::testing::GinConnectionMode::Rail,
-            shift, payloads, warmup, measured, batch);
+            shift, payloads, warmup, measured, batch, contexts);
     for (const auto &sample : benchmark.cases) {
       std::cout << "GIN_LINK_BENCH rank=" << rank
                 << " mode=" << (full ? "full" : "rail")
                 << " shift=" << benchmark.target_shift
                 << " local_rank=" << benchmark.local_rank
                 << " local_world=" << benchmark.local_world
+                << " contexts=" << benchmark.contexts
+                << " completion=weak-thread-grid"
                 << " gin_type=" << benchmark.gin_type
                 << " railed_gin_type=" << benchmark.railed_gin_type
                 << " payload=" << sample.payload_bytes

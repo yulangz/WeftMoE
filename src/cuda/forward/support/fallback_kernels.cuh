@@ -453,10 +453,10 @@ __global__ void socket_finalize_status_kernel(TransportDeviceStatus *status,
 
 #if __has_include(<nccl_device.h>)
 __global__ void gin_probe_reset_kernel(ncclDevComm_t dev_comm) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const ncclGin gin(dev_comm, 0);
-    gin.resetSignal(0);
-    gin.resetCounter(0);
+  if (threadIdx.x == 0) {
+    const ncclGin gin(dev_comm, blockIdx.x);
+    gin.resetSignal(blockIdx.x);
+    gin.resetCounter(blockIdx.x);
   }
 }
 
@@ -489,9 +489,11 @@ __global__ void gin_link_benchmark_kernel(
     std::uint32_t warmup, std::uint32_t measured,
     std::uint32_t puts_per_sample, unsigned long long *duration_ns,
     unsigned int *device_error) {
-  if (blockIdx.x != 0 || threadIdx.x != 0)
+  if (threadIdx.x != 0)
     return;
-  const ncclGin gin(dev_comm, 0);
+  const auto context = blockIdx.x;
+  const ncclGin gin(dev_comm, context, NCCL_GIN_RESOURCE_SHARING_THREAD);
+  const auto grid = cooperative_groups::this_grid();
   const ncclTeam team = full_connection ? ncclTeamWorld(dev_comm)
                                         : ncclTeamRail(dev_comm);
   if (destination < 0 || destination >= team.nRanks || measured == 0U ||
@@ -503,6 +505,8 @@ __global__ void gin_link_benchmark_kernel(
   unsigned long long expected = 0ULL;
   const auto samples = static_cast<unsigned long long>(warmup) + measured;
   for (unsigned long long sample = 0ULL; sample < samples; ++sample) {
+    if (gridDim.x > 1U)
+      grid.sync();
     const auto begin = device_globaltimer_ns();
     for (std::uint32_t put = 0; put < puts_per_sample; ++put) {
       auto put_destination = destination;
@@ -512,22 +516,27 @@ __global__ void gin_link_benchmark_kernel(
         put_destination =
             node * local_world + (local + static_cast<int>(put)) % local_world;
       }
-      gin.put(team, put_destination, window, receive_offset, window, 0,
-              payload_bytes, ncclGin_SignalInc{0}, ncclGin_CounterInc{0},
+      // Each context has disjoint RX storage and its own completion pair.
+      // All contexts may read the immutable source concurrently.
+      gin.put(team, put_destination, window, (context + 1U) * receive_offset,
+              window, 0, payload_bytes, ncclGin_WeakSignalInc{context},
+              ncclGin_WeakCounterInc{context},
               ncclCoopThread{}, ncclGin_None{},
               ::cuda::thread_scope_system, ::cuda::thread_scope_system);
     }
     expected += puts_per_sample;
-    gin.waitCounter(ncclCoopThread{}, 0, expected, 64,
+    gin.waitCounter(ncclCoopThread{}, context, expected, 64,
                     ::cuda::memory_order_acquire);
+    if (gridDim.x > 1U)
+      grid.sync();
     const auto end = device_globaltimer_ns();
-    if (sample >= warmup)
+    if (context == 0U && sample >= warmup)
       duration_ns[sample - warmup] = end - begin;
   }
   // Every rank has exactly one inverse sender.  Waiting for the matching
   // remote signal makes the final payload validation independent of whether
   // local completion happens a little earlier than the receive-side action.
-  gin.waitSignal(ncclCoopThread{}, 0, expected, 64,
+  gin.waitSignal(ncclCoopThread{}, context, expected, 64,
                  ::cuda::memory_order_acquire);
 }
 
@@ -836,4 +845,3 @@ __global__ void gin_transport_slice_kernel(GinTransportSliceArgs a) {
   }
 }
 #endif
-

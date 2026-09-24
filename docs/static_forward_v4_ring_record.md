@@ -3179,3 +3179,56 @@ bytes不变，device pool分别增加256/8192/1048576/2621440 bytes/rank。
 native保留在 `build/static_v4_ring_return_segments/`，可恢复该实验。
 没有继续library、完整Torch或sanitizer。移除两轮逐行解析未转化为整体收益，
 不能仅从CY的局部跨度判定它是关键路径，下一步需补多context有效链路吞吐诊断。
+
+### DH：多 context 链路吞吐诊断（构建中）
+
+扩展既有`gin_link_bench`，新增`WEFTMOE_GIN_BENCH_CONTEXTS`（默认1），不新增
+生产分支或独立测试套件。一个CTA/线程独占一个GIN context，使用THREAD sharing、
+weak bundled signal和独立counter，所有context并行发送；cooperative grid在
+每个sample开始/结束join，记录包含最慢context完成的GPU时间。多context结果
+包括这两次grid同步成本，并非纯NIC线速，也不是完整MoE性能。
+
+immutable TX可共同读取，RX按context分隔，每个context的最大payload都做完整
+数据比较；reset各context的独立signal/counter后，沿用已有跨rankallreduce再
+开始测量，避免reset覆盖早到的signal。新增32KiB/128KiB，对应主形状Dispatch
+Q8/ReturnQ32；其余旧payload保留。汇总按payload×每context puts×contexts
+计算有效字节，并将原有误导性的`gbps`字段改为`GBps`，单位明确为GB/s。
+
+新协议标记`completion=weak-thread-grid`，不能将其与旧AZ单context/GPU sharing/
+legacy strong信号的差异全归因于context数量；必须用此同一二进制的1/32/64等
+对照。仍有NIC本地completion，但没有生产者计算、RX消费credit或混合包流。
+当前尚无实测结论，后续据此决定通信优化方向，而不是宣称长序列已接近线速。
+
+DH native SHA256 `cc19c4ea9addd2aa25279b9925ac1c0210c8273cdd229364990f198aed19074b`，
+冻结 `build/static_v4_multicontext_link/` 与change.patch；launcher现有13项安全
+回归及Python语法检查通过。基准queue depth仍64（生产为1024），不增加调参
+分支；本轮先测Full connections、shift0、1/8/32/64 contexts的同版本对照。
+
+首轮全部4×16ranks×16cases通过，每个rank/context的最大payload完整比较成功，
+launcher exit0。无并发CPU构建/其它GPU任务；Full/shift0、10 warmup/20 samples、
+每context32 puts。表为rank-max样本mean对应的有效GB/s/rail（不是p50延迟比）：
+
+| contexts | 32KiB | 128KiB | 4MiB |
+|---:|---:|---:|---:|
+|1|7.693|20.338|23.863|
+|8|41.449|45.950|47.615|
+|32|35.929|36.341|37.815|
+|64|31.829|30.689|30.243|
+
+日志 `multicontext_link_full_c{1,8,32,64}.log`，保存每rank样本及hash校验。
+生产网络prefill仍REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264。
+8→32→64并发下吞吐下降，提示owner/context数量可能是当前版本的调优方向；
+这是诊断假设，不据此直接宣布算子瓶颈或收益。反向32→8复测后，将保持逻辑
+L32、Q与容量不变，独立消融更少owner复用固定channel residue；旧减lane实验
+同时改变分包/容量，不能替代该实验。
+
+反向32→8复测也全部通过：32contexts的32KiB/128KiB/4MiB为
+35.745/36.263/37.717 GB/s，8contexts为42.007/45.910/47.635 GB/s。
+日志 `multicontext_link_reverse_full_c{32,8}.log`；两轮无并发构建/其它GPU任务，
+全部核心1620MHz，活跃显存3201MHz（远端启动前idle2201MHz不当作负载时钟）。
+后续owner配额还会改变空出的Pull/local Return/Reduce warp分工及metadata
+使用的context数量，需分别报告端到端和plan时间，不能只归因为NIC/QP数量。
+
+共用reset helper的旧`gin_put_probe`也在EP16通过16个rank的Put/signal/local
+completion及payload校验，launcher exit0，日志`multicontext_link_put_probe.log`。
+DH只增加诊断能力，不将其作为生产算子性能优化提交。

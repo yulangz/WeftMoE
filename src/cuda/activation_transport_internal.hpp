@@ -271,6 +271,7 @@ struct GinLinkBenchmarkResult {
   std::uint32_t world = 0;
   std::uint32_t local_rank = 0;
   std::uint32_t local_world = 0;
+  std::uint32_t contexts = 1;
   std::uint32_t gin_type = 0;
   std::uint32_t railed_gin_type = 0;
   std::uint64_t received_hash = 0;
@@ -282,7 +283,7 @@ GinLinkBenchmarkResult run_distributed_gin_link_benchmark(
     const NcclSession &, const CudaExecution &, GinConnectionMode,
     std::uint32_t target_shift, const std::vector<std::uint64_t> &payload_bytes,
     std::uint32_t warmup = 4, std::uint32_t measured = 20,
-    std::uint32_t throughput_puts_per_sample = 32);
+    std::uint32_t throughput_puts_per_sample = 32, std::uint32_t contexts = 1);
 BFloat16ActivationLease upload_bfloat16_activations_for_testing(
     const std::vector<transport::BFloat16> &, std::uint64_t, std::uint64_t,
     const RankCollectiveContext &, const CudaExecution &,

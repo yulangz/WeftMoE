@@ -378,6 +378,7 @@ def environment_overrides(args):
         "WEFTMOE_GIN_BENCH_WARMUP",
         "WEFTMOE_GIN_BENCH_MEASURED",
         "WEFTMOE_GIN_BENCH_BATCH",
+        "WEFTMOE_GIN_BENCH_CONTEXTS",
         "WEFTMOE_PRODUCTION_STATUS_FAULT_PHASE",
         "WEFTMOE_P2P_TOP_K",
         "WEFTMOE_BENCH_HIDDEN",
@@ -879,6 +880,7 @@ def main(argv=None):
                         )
                     }
                     key = (fields["mode"], int(fields["shift"]),
+                           int(fields.get("contexts", "1")),
                            int(fields["payload"]), int(fields["puts"]))
                     durations = [int(value) for value in
                                  fields["durations_ns"].split(",")]
@@ -888,7 +890,7 @@ def main(argv=None):
                                "\n".join(failures))
         if os.environ.get("WEFTMOE_GIN_BENCH_VERBOSE") == "1":
             print("\n".join(evidence))
-        for (mode, shift, payload, puts), rank_samples in sorted(
+        for (mode, shift, contexts, payload, puts), rank_samples in sorted(
                 samples.items()):
             if len(rank_samples) != world:
                 raise RuntimeError(
@@ -908,15 +910,15 @@ def main(argv=None):
                 for index in range(next(iter(sample_counts)))
             ]
             stats = sample_stats(critical_ns)
-            gbps = payload * puts / stats["mean"]
+            gb_per_s = payload * puts * contexts / stats["mean"]
             print(
                 f"GIN_LINK_SUMMARY mode={mode} shift={shift} "
-                f"payload={payload} puts={puts} "
+                f"contexts={contexts} payload={payload} puts={puts} "
                 f"mean_us={stats['mean'] / 1.0e3:.3f} "
                 f"p50_us={stats['p50'] / 1.0e3:.3f} "
                 f"p95_us={stats['p95'] / 1.0e3:.3f} "
-                f"critical_gbps={gbps:.3f} "
-                f"aggregate_gbps={gbps * args.gpus_per_node:.3f}")
+                f"critical_GBps={gb_per_s:.3f} "
+                f"aggregate_GBps={gb_per_s * args.gpus_per_node:.3f}")
         print(f"[PASS] GIN link benchmark world={world}")
         return
 
