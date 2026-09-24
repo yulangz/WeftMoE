@@ -2161,7 +2161,7 @@ EP16的64、EP8/B512的32个rank hashes与BR一致。相比BR历史同配置，�
 BW的8K快约3.1%，20K仍慢约7.1%，端到端目标尚未实现。完整日志
 `ring_compact_plan_*`，不混用后续BX/BY/BZ候选。
 
-### BX：按 Mblock 合并两份静态任务序列（候选测试中）
+### BX：按 Mblock 合并两份静态任务序列（无明确收益，未保留）
 
 在 BW 上，保留 FC1/FC2 的全局 residue 与 owner，只调整同一 owner 内的次序：
 取两份静态序列较小的 Mblock，同 Mblock 先 FC1 后 FC2。不是“谁 ready 先做谁”；
@@ -2179,7 +2179,12 @@ B1536/D4/20K 的初筛7747.70 us、pool1649117376 bytes/rank（CPU编译并行�
 `ce54a1f606ee083289ea8e211075c6882db28213a76362960e178d44b6dcac40`。仅编译
 完成，尚未GPU验收；当前源码先恢复BW，以独立测试另一通信组合。
 
-### BY：大 Return packet + 规则 TMA gather（候选测试中）
+随后EP16/B2048/D4/20K快筛为8115.50 us，同容量BW对照8129.89 us，差异
+不足0.2%；二者均明显不如BW/B1024的7605.83 us。没有继续完整数值或sanitizer，
+工作区已撤回，不把 larger B 的容量与调度本身混为一种收益。
+两份构建的16 hashes均与BW/B1024一致；pool均1981358272 bytes/rank。
+
+### BY：大 Return packet + 规则 TMA gather（未获益，未保留）
 
 在BW上恢复BS/BT的组合，仅编译期Return Q改为32/64，Dispatch Q8、L32不变。
 此前Q16时局部pack缩短不转化为端到端收益；本项检验更快的pack是否使更大
@@ -2191,7 +2196,12 @@ R64 `2b9182d2f99e7b4898d92c099267cd61af630822c8ef5dabe7b6ee4b96aa8129`。
 归档 `static_v4_ring_return_tma_r{32,64}/change.patch` 是相对BW的增量，
 包含两个helper；本轮尚未GPU验收，也未构建library。工作区已恢复BW再开展独立候选。
 
-### BZ：多机 prefill 通信专用 CTA（候选测试中）
+随后EP16/B1024/8K快筛R32/R64分别3342.13/3332.82 us，均未改善BW的
+3255.97 us；本轮有并发CPU编译。不继续完整数值/sanitizer，也不保留描述符、
+SMEM或endpoint span分支。Q与copy方式共同消融仍未提供端到端正向证据。
+R32/R64的32 hashes与BW一致，pool分别999433664/1066517952 bytes/rank。
+
+### BZ：多机 prefill 通信专用 CTA（无明确收益，已撤回）
 
 在BW上，不混入BX/BY。多机prefill可以预留前32/64个CTA，只运行原静态通信
 角色；这些CTA的math/producer跳过主计算，但仍参加初始化、route plan和终端
@@ -2203,3 +2213,279 @@ cluster的配置。不是另起并发kernel，不引入“通信kernel必须先�
 本项用于检验共享SM上的计算/通信竞争，代价是更少math CTA；可能吞吐反而
 降低。只在网络prefill启用，短序列与单机begin=0。编译开关暂默认0，实验
 若不获益则移除，不为每个失败候选长期保留分支。
+
+已冻结 `static_v4_ring_comm_only{32,64}/` native，32版SHA256
+`4849fc5965852111e964033353048781ea278d4d4535451bb221cb5138150308`，64版
+`151412f9a7c5b1613acf2d4b1200291eb43ab7d1e3f5b56222bba5de3b6d1347`；64版
+REG168/STACK440/LOCAL0。当前工作区恢复BW后继续独立的索引候选。
+
+EP16/B1024/D4的8K快筛，预留32/64 CTA分别3244.02/3319.31 us；32 CTA
+的20K为7659.84 us，另测B768为7674.58 us（pool1142634432 bytes/rank）。
+32 CTA的8K小幅改善没有延续至20K，64 CTA计算吞吐损失更大；未继续完整
+数值/sanitizer，已撤回宏、host参数、role分支与residue变化。32/64初筛hash
+正确，但这不替代完整门禁。日志 `ring_comm_only*`；部分轮次并行CPU编译。
+
+### CA：任务索引保留编译期 GEMM 常量（候选测试中）
+
+`select_static_owned_task` 原先通过noinline参数接收FC1/FC2 N tile数，丢失了
+主形状H/I与profile tile宽度的常量信息。将已有的Fc1TileN/Fc2TileN作为模板
+实参传递，在函数内据编译形状计算ntiles，消除相关运行时整数除法；删除未使用
+的fc1_tasks参数。保持noinline边界、静态residue、FC1/FC2次序和全部ready检查。
+只有已建立对应主形状TMA maps的专用入口调用此函数，不把任意运行时H/I偷偷
+替换成固定数。此候选不含BX/BY/BZ，待单机与双机验证。
+
+冻结 `static_v4_ring_const_task/`，native SHA256
+`30706e0bc7687cee06c015b4bee96fd96a2783b5753aac208cbcad6e3dc15faa`，library
+`d7a91243ac5da58635cfdf1c0b511bdf5aa5800a7af8acefd2292c455a04ff40`；
+REG168/STACK440/LOCAL0，与BW相同。
+
+CA 的 EP16/B1024/D4 快筛8K/20K为3259.74/7590.24 us，32 hashes与BW一致。
+端到端差异在噪声范围；尚无完整数值/sanitizer，不将常量传播称为显著收益。
+
+### CB：Return 顺序 ACK head（无明确收益，已撤回）
+
+在CA上为Return的每个channel增加credit_cursor，按严格RX消费序列检查head，
+避免反复扫8个slot；Dispatch仍允许乱序退休并保留逐slot检查。每个ACK仍核对
+当前generation及收到的retire_target；TX的双credit不变。cursor复用原64B
+channel padding，未增加pool。REG168/STACK424/LOCAL0。
+
+冻结 `static_v4_ring_return_ack_head/`，native SHA256
+`ed57165b57d9f2a06f05b31a2224d403396632cf0f641ae0efccd3921a0399da`，library
+`fc1477d5c554d08ee42b34bbe1aa4dc18b0a7d227b96e06144cee65791c46781`。
+B512/D8/20K快筛7286.46 us，和BW同配置7290.27 us持平；B1024/D4的
+8K/20K为3244.66/7644.94 us，20K反而退化。三轮48 hashes均与BW一致，
+未继续完整数值/sanitizer，已撤回，不保留额外cursor及方向分支。
+
+### CC：窗口与 contribution 深度联合消融（参数候选）
+
+只使用已验收BW二进制，网络Dispatch Q8/Return Q16/L32不变。下面D指source
+contribution窗口深度，不是网络packet ring深度；所有初筛hash均与BW一致。
+
+| B | contribution D | 8K quick/us | 20K quick/us | 20K pool bytes/rank |
+|---:|---:|---:|---:|---:|
+|1024|8|3280.05|7338.58|1377255360|
+|1024|16|未测|7317.36|1511735744|
+|512|8|3152.21|7290.27|1008270784|
+|512|16|未测|7302.78|1075511232|
+|256|8|未测|7696.34|824391872|
+|256|16|未测|7714.70|858012352|
+
+选择B512/D8继续验收：D16没有足够收益抵消额外容量，B256则窗口开销过大。
+1620MHz、10 warmup/20 samples/batch20、无并发CPU编译或GPU任务的正式结果
+为8K **3146.080 us**、20K **7312.640 us**。相对BW/B1024/D4降低3.38%/3.85%，
+pool由965927104/1310015168降为663937216/1008270784 bytes/rank。
+对照BR轮次冻结V3，8K快6.35%，20K仍慢3.00%，不宣称达到最终性能目标。
+日志 `ring_compact_plan_b*_d*_ep16_*`；B512/D8完整PyTorch门禁正在进行。
+
+随后B512/D8双机完整四规模+edges共416条PyTorch检查通过（208/node，两个
+launcher均exit0）。T1/64的同20样本计时为291.490/401.341 us，但本节点同时
+编译CE，不能标为无干扰正式复测；长规模上述正式两轮没有这个并发。
+
+### CD：预绑定不可变 channel plan（无明确收益，已撤回）
+
+在CA上把TX/RX source/begin/count预计算至每个NetworkChannel的独立只读
+cacheline，规划完成后发布；不改任何payload或credit。channel由64B变128B，
+EP16增加4096 bytes/rank。原运行时地址算法移至ring_access复用。
+
+冻结 `static_v4_ring_channel_bind/`，native SHA256
+`6335e8f483bd2583731c058f47df9a6d4511aa32691abafcf7c6dace85dcc7a8`，library
+`1ac1d8b644f733c7e37f0952576765375faab2236625a6be0d92fb868d472fde`；
+REG168/STACK456/LOCAL0。B512/D8快筛8K/20K为3156.62/7288.24 us，
+32 hashes与BW一致，与未预绑定版本无明确差异。没有继续完整数值/sanitizer，
+已撤回四处源文件改动；不因局部省了寻址就保留额外布局和初始化。
+
+### CE：已 drain 的 ring 使用单 context 终端会合（候选）
+
+在CA上仅改变ring的结束会合。所有TX owner退出前已核对每个slot的远端
+consumed credit及本地NIC completion；RX owner已消费并发出ACK，所有本地
+消费者和计算角色已join。此时单context rail barrier + 原node-local barrier
+足以确保所有节点都停止使用本次metadata，随后才能开始下一调用。
+没有用context0去替代仍有未完成Put的其它context fence：规划阶段仍原样
+逐context fence，数据面双credit及terminal检查也完全保留。
+
+ACK的发送者可能先进入会合，但其接收者只有观察到ACK才能完成自己的TX drain
+并进入会合，因此会合完成时全部ACK也已被观察。任意有效节点数仍采用原rail
+team与node-local同步，未引入双机专用路径。冻结构建与性能门禁进行中。
+
+冻结 `static_v4_ring_drained_barrier/`，native SHA256
+`28e2832122c3954dfb915e72a96ff829bb76b038e056063a958ccf7072f2e84e`，library
+`08b09f6d94cccdbca7e9866476ef41250fef0c237e9994879952433c06edc529`；
+REG168/STACK440/LOCAL0。B512/D8四规模快筛288.864/395.056/3158.640/
+7334.590 us，长序列无明确改善。结束阶段status包含等待其它rank进入会合的
+偏斜，不能把整个0.3 ms都当作GIN barrier自身开销。完整数值门禁进行中。
+
+### CF：规划阶段仅 fence 实际 Put 的 context（候选）
+
+在CE上，network_put的分片及其owner不变；有效owner数为
+`min(contexts, ceil(source_bytes/256KiB))`。其它context在本阶段没有Put，
+不必参与GIN fence；保留原grid/node-local同步，所有实际Put仍由自己的QP
+signal导入可见性，不用单QP signal替代其它QP的未完成写入。非ring旧入口
+仍显式使用全context，ring结束继续用CE的单context会合。没有改payload
+阶段的32个Dispatch/32个Return/32个RX owner，也没有减少双credit。
+本候选编译及快筛中；只有端到端受益且门禁通过才保留接口变化。
+
+CF native SHA256 `a1e31d56913818c2e7dfa676b5112e2ab4cfff98ed040f8af958e14ad3258c00`，
+library `bead827f71f1341f32ba8fd6568d6acf828c7228a83ccd1d95cb81efe7ccd9cb`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_control_contexts/`。B512/D8四规模
+快筛281.936/391.840/3148.820/7304.820 us；64 hashes与BW一致，双机完整
+四规模+edges的416条PyTorch检查通过。CE的同套416条检查也通过。
+短规模初筛改善约3%，长规模持平；sanitizer和无并发正式复测尚未完成。
+
+CF上增加仅profiling构建启用的六个规划时间点（schema11）：source、packet
+目录、metadata交换、窗口几何、地址绑定，各阶段只在rank本地CTA0取时间差。
+`static_v4_ring_plan_timeline/test_cuda_notify` SHA256
+`675118760f66a495f294e65f69b9885205decea8bbd972651bba80fe0e07df9c`。
+20K/B512/D8 trace每rank166955 events、全部0 overflow；各rank阶段耗时的
+中位数111.216/134.736/91.376/113.568/80.832 us。不是只有跨机交换昂贵，
+也不能把这五段解读成互不重叠的纯算术/纯网络时间：段内包括相关grid等待。
+日志 `ring_plan_b512_d8_ep16_t20480_timeline*`，profiler时延不替代正式性能。
+
+### CG：完整远端 FC2 tile 写 C 复用已有 TMA map（候选）
+
+在CF上，针对整个source group都位于当前节点之外的窗口，所有FC2行均写本地
+连续C。当M/N完整时，使用既有C output_store_map和已退休的CTA私有B arena
+进行TMA store；不新增map、SMEM或buffer。本地分散contribution、混合节点
+窗口以及tail仍走原向量写回。判定检查source区间与本node区间不相交，不假设
+任意运行时拓扑必定是双机或G8。两math WG stage后proxy fence和join，完整
+`cp.async.bulk.wait_group 0`及join之后才允许既有FC2完成链发布，未提前释放C。
+候选编译中，不把使用TMA本身视为性能收益。
+
+CG冻结 `static_v4_ring_remote_fc2_tma/`，native SHA256
+`9f24de8e77fea7ae71285339eacd4b1df03158d2b3d6ef16746b87221f1786a9`，library
+`c8c14883b71f8d5e99d230c74877f21d304355bdb79702fd3e580db0ad571154`；
+REG168/STACK440/LOCAL0。B512/D8快筛8K/20K为3151.44/7274.58 us，
+32 hashes与BW一致，8K持平、20K仅约0.4%改善，不足以确认端到端收益。
+没有完整数值/sanitizer门禁，两个源文件的CG改动已从工作区撤回；CF和CA保留
+待判定。不要把本次C写回TMA与BS/BY的Return打包TMA混为一项。
+
+### CH：warp 协作生成 Dispatch consumer counts（保留）
+
+基于CF，不包含CG。原来每thread逐token/route串行统计一个packet；现在每warp
+静态拥有一个packet，route按lane展开，同目的GPU的lane使用match掩码聚合，
+每组唯一lane更新该packet私有consumer计数。每批之间warp join，防止下一批
+由不同lane更新同一项时缺少可见性；masked/非法/本节点以外route都不计数。
+tail的无效lane仍参加match/reduce/join。packet布局、所有owner目录和精确
+expected_count定义不变，不新增原子或分片引用图。调用者均为完整warp组。
+
+复用GPU plan的31 source/packet+6 destination cases通过，包含mask、重复
+expert、空节点、tail和三节点几何。编译及端到端门禁进行中，日志
+`test_warp_packet_plan.log`、`ring_warp_packet_plan_*`。
+
+CH native SHA256 `0903de0816a528faacd892d6c6b5f24523b9f253c11526d49da0926f9361fe37`，
+library `8b5369a854a0d1b1d052fac951f10a8f41420d2766b82028c65800652ac7eab5`，
+REG168/STACK440/LOCAL0。B512/D8快筛8K/20K为3124.190/7245.500 us，
+32 hashes与BW一致；route planning status最大值287.328/522.752 us（CF
+约310/537 us）。双机完整四规模+edges共416条PyTorch检查通过，两个launcher
+均exit0。部分快筛有CPU编译；正式及sanitizer门禁仍待完成。
+
+### CI：并行规划窗口几何与 RX 绑定（候选）
+
+在CH上，网络窗口的control warp0计算source地址及expert/Mblock counts，
+其余三个warp构建PullPacket。前者只用counts scratch，后者只读不可变source
+packet目录，互不依赖；不同窗口的输出也不重叠。最终沿用原grid join发布两者。
+warp0内部用warp同步，不能复用其它warp正在等候的128-thread named barrier。
+共用source_plan_sync对Threads=32使用__syncwarp，其它线程数组仍原bar.sync。
+单机仍128-thread原规划。没有新counter/barrier或额外metadata，编译/验证中。
+
+CI native SHA256 `3afb28d1a5622fd879ec1f325a99cad79e5ce07f4be283963d7b500aeab6930a`，
+library `beae1a2c543db500041d676672c176367c7b0dce2d5ea808aa822a53d3fa18ae`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_parallel_geometry/`。8K/20K
+快筛3154.770/7286.980 us，32 hashes与BW一致；规划status反升至约299/538 us。
+将RX绑定降为三个warp的代价超过重叠收益，未继续完整数值或sanitizer，已撤回
+两处源文件改动，包括Threads32同步分支；不保留失败候选的复杂度。
+
+### CJ：source token/route 目录统一现有 32-bit 索引合同（20K 退化，已撤回）
+
+在CH上，不含CI或CG。Forward pool已有`max_tokens*top_k <= UINT32_MAX`
+的边界检查，RingRow也保存uint32 route/token，但source目录仍用64-bit token
+和route。将route_order改uint32，NodeToken从16B改8B；分配、绑定、生成和
+读者类型统一。prefix、sequence、generation及跨窗口逻辑计数仍64-bit，不新增
+更严格容量上限或运行时防御分支。已有GPU plan测试只修改对应数组元素类型。
+
+每份source metadata节省`12*window_capacity*window_count` bytes，EP16两份
+replica在20K/B512时合计节省1966080 bytes/rank，并同步减少source目录发布
+量及读取带宽。此为容量推导，性能和完整门禁尚在进行；归档
+`static_v4_ring_compact_ids/`。
+
+CJ native SHA256 `ad8c9507bcdbbba3125aa0d92b582d1acf247d51432f4bd391634db626abd77a`，
+library `36385b6075a5a5958f4dd1003e164d70e2ef69bfd83a32986d679b54d55b855a`，
+REG168/STACK440/LOCAL0。host18/18、GPU plan31+6、EP16四规模+edges416、
+B16/D1/K8小深度272均通过。1620MHz、10 warmup/20 samples/batch20、
+两个节点无CPU编译/其它GPU任务的首轮正式四规模为
+278.227/372.406/3074.870/7376.110 us，64 hashes与BW一致。
+8K收益明显，但20K比BW/B512/D8的7312.640 us慢约0.87%，并未延续快筛趋势。
+20K规划status约498us、低于BW约542us，主流水却变慢；下一步相邻轮次对照
+和slot复用sanitizer，不能仅凭目录变小认定长序列端到端获益。
+
+rank1/9 eager B16/D1/K8/T64、11 rounds的memcheck和racecheck两个launcher
+均exit0，日志0 errors/0 hazards。memcheck进程local430043/remote143691，
+racecheck local430684/remote143955；不声称覆盖所有16个rank。
+
+EP8完整四规模+edges的208条PyTorch检查通过。同时间第二节点独立EP8正式
+计时（无该节点CPU编译/其它GPU任务，1620MHz、10 warmup/20 samples/batch20），
+统一B512/D8四规模101.472/137.682/1252.320/2957.200 us；注意此前BW/EP8
+常用的是D4，不能把本轮差异全部归于目录压缩。日志 `ring_compact_ids_*`。
+
+随后无并发编译/GPU任务的20K交替正式对照为CH/CJ/CH/CJ：
+7315.140/7400.990/7309.750/7385.050 us。确认压缩目录虽然降低规划耗时，
+端到端仍慢约1.0–1.2%，不是单次快筛波动。其节省仅约0.2%总pool，当前不以
+这个容量收益交换长序列退化；六处源文件/测试类型改动已撤回，保留完整构建、
+patch和正确性记录。8K与EP8的上述CJ数字不能作为撤回后的CH最终性能。
+原子预约决定的source token顺序可能影响X-ready/主流水，但目前只是待验证
+的假设，不能当作已确定原因；后续稳定枚举同时服务训练tape的确定性目标。
+
+### Profile 切换区间初筛（同CF通信版本，尚未修改阈值）
+
+强制prefill的独立native SHA256
+`e8f0d0b73d7dcdb6430723e1d255a666e2706796fb9229a189ec343c7b8a2472`，归档
+`static_v4_profile_prefill/`，临时config仅将原MIN_TOKENS覆盖为1。对照CF自动
+入口在这些规模均为decode；两种profile都用packed gate/up，不重新打包权重。
+第二节点独立EP8、1620MHz、B512/D8，10 warmup/2 samples/batch2：
+
+| T/rank | decode/us | prefill/us |
+|---:|---:|---:|
+|128|150.064|161.408|
+|256|182.224|193.152|
+|512|252.720|245.872|
+|1024|336.464|324.720|
+|2048|496.464|461.392|
+|4096|817.408|721.136|
+
+所有96 hashes两profile一致。本节点在CPU编译，不占用第二节点CPU/GPU；
+以上仍为两样本快筛而非正式阈值验收。EP16/B512/D8的T512快筛decode/prefill
+644.048/649.904 us，尚不支持照搬单机T512阈值。日志 `ring_profile_*`。
+
+补齐同版本EP16快筛：T1024为809.856/810.048 us，T2048为
+1140.750/1135.220 us，T4096为1796.320/1770.290 us；四规模全部64
+hashes两profile一致。仍需正式阈值验收，当前未改自动切换点。
+
+### CH 里程碑验收（2026-09-24，CA/CE/CF/CH 合并提交）
+
+源文件与冻结CH构建一致，不包含CB/CD/CG/CI/CJ。host18/18、GPU plan31+6、
+EP16四规模+edges416、小深度B16/D1/K8的272、EP8四规模+edges208均通过。
+rank1/9 eager B16/D1/K8/T64、11 rounds的memcheck与racecheck launcher
+均exit0，分别0 errors/0 hazards；memcheck进程local434976/remote146341，
+racecheck local435482/remote146618，不声称其余14 ranks受sanitizer检查。
+
+固定1620MHz，B512/D8，10 warmup/20 samples/batch20，正式计时节点无
+CPU编译或其它GPU任务。下列96 hashes全部与BW对应矩阵一致：
+
+| T/rank | 单机EP8/us | 双机EP16/us |
+|---:|---:|---:|
+|1|101.763|278.987|
+|64|138.230|376.650|
+|8192|1253.880|3127.420|
+|20480|2952.100|7309.750|
+
+日志 `ring_warp_packet_plan_{remote_ep8,ep16}_t*_formal.log`；20K EP16取
+前述相邻轮次CH2，另一次CH1为7315.140 us。EP8较冻结V3
+300.557/370.549/1486.870/3299.890 us分别快66.1%/62.7%/15.7%/10.5%。
+EP16 8K较V3 3359.26 us快约6.9%，20K仍比7099.96 us慢约3.0%，
+因此只提交已验证的规划/collective范围优化，不标记最终性能目标完成。
+与同B512/D8的BW正式3146.080/7312.640 us相比，长序列只是小幅/持平；
+不能把之前B1024/D4切换带来的收益全归于这次代码修改。Ring仍保持opt-in。
+
+下一候选CK只修改source窗口内的稳定枚举：warp拥有连续route/token区间，
+用固定32桶×warp数的计数生成有序前缀，取消scatter的原子预约顺序。
+保留现有64-bit目录及全部slot/credit合同。已有GPU plan测试增加按expert/node
+的ID单调性检查，31+6通过；端到端尚待验证，不等同M6 StableTape已实现。

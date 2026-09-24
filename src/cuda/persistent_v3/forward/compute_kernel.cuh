@@ -394,13 +394,19 @@ __device__ __forceinline__ void pair_arrive(std::uint64_t *barrier) {
                                ::cuda::ptx::space_cluster, barrier);
 }
 
-template <bool StaticLocal, bool RingSchedule = false>
+template <bool StaticLocal, unsigned Fc1TileN, unsigned Fc2TileN,
+          bool RingSchedule = false>
 __device__ __noinline__ std::uint32_t select_static_owned_task(
     const ForwardKernelArgs &a, unsigned long long *scheduler,
     unsigned long long *claims, unsigned long long *fc1_done,
-    unsigned long long fc1_tasks, std::uint32_t fc1_ntiles,
-    std::uint32_t fc2_ntiles, unsigned long long &progress,
+    unsigned long long &progress,
     unsigned long long &task0, unsigned long long &task1) {
+  // This entry already specializes H/I and both GEMM tile widths. Preserve
+  // them across the noinline boundary so task indexing uses constant divisors.
+  constexpr std::uint32_t fc1_ntiles =
+      (2ULL * kIntermediate + Fc1TileN - 1ULL) / Fc1TileN;
+  constexpr std::uint32_t fc2_ntiles =
+      (kHidden + Fc2TileN - 1ULL) / Fc2TileN;
   const auto cluster_count = gridDim.x / forward_tuning::kClusterSize;
   // Keep FC1 and FC2 on a bounded set of M blocks. Finishing every FC1
   // residue before any FC2 residue makes the intermediate working set grow
@@ -494,7 +500,6 @@ __device__ __noinline__ std::uint32_t select_static_owned_task(
     }
     __nanosleep(forward_tuning::kTaskIdleNanosleep);
   }
-  (void)fc1_tasks;
   return kComputeTaskDone;
 }
 
@@ -612,17 +617,11 @@ __device__ __forceinline__ void select_static_compute_task(
       a.local_base, a.forward_task_claim_offset);
   auto *fc1_done =
       peer_at<unsigned long long>(a.local_base, a.forward_fc1_done_offset);
-  const auto fc1_ntiles = static_cast<std::uint32_t>(
-      (2ULL * a.intermediate + Fc1TileN - 1ULL) /
-      Fc1TileN);
-  const auto fc2_ntiles = static_cast<std::uint32_t>(
-      (a.hidden + Fc2TileN - 1ULL) /
-      Fc2TileN);
   unsigned long long task0 = 0ULL;
   unsigned long long task1 = 0ULL;
-  const auto kind = select_static_owned_task<StaticLocal, RingSchedule>(
-      a, scheduler, claims, fc1_done, scheduler[3] * fc1_ntiles, fc1_ntiles,
-      fc2_ntiles, pair->static_progress, task0, task1);
+  const auto kind =
+      select_static_owned_task<StaticLocal, Fc1TileN, Fc2TileN, RingSchedule>(
+          a, scheduler, claims, fc1_done, pair->static_progress, task0, task1);
   *task_shared = cluster_rank == 0U ? task0 : task1;
   *task_kind_shared = kind;
   *pair_operand_shared = kComputePairShareA;

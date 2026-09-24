@@ -9,8 +9,9 @@ __device__ __forceinline__ void finish_network(const ForwardKernelArgs &a) {
     status->after_combine_start_clock = device_globaltimer_ns();
   // All static owners have retired their packets, readers and local NIC
   // completions. Protect invocation metadata before a peer stages its next
-  // plan.
-  network_barrier<Base, Threads>(a);
+  // plan. No data-plane Put remains to fence: one context suffices for this
+  // collective rendezvous, after the complete grid has joined.
+  network_barrier<Base, Threads>(a, 1U);
   if (blockIdx.x == 0U) {
     const auto &network = a.static_network;
     for (unsigned index = threadIdx.x - Base;
@@ -133,6 +134,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   const auto tid = threadIdx.x - Math;
   const auto worker = std::uint64_t(blockIdx.x) * Control + tid;
   const auto workers = std::uint64_t(gridDim.x) * Control;
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanBegin,
+                             Kernel, 0U, 0U, 0U);
   auto *counts = reinterpret_cast<unsigned *>(scratch);
   auto planner = p;
   if constexpr (Network) {
@@ -155,6 +158,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   collective_scope_sync<384U, kCollectiveJoinBarrier>();
   if constexpr (Network) {
     grid_sync<Math, Control>(a);
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
+                               Kernel, 0U, 0U, 0U);
     static_forward::build_source_packet_prefix(p, worker, workers);
     static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
     grid_sync<Math, Control>(a);
@@ -170,16 +175,25 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
     static_forward::build_return_packets(p, r.returning, worker, workers);
     grid_sync<Math, Control>(a);
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanPacketsReady,
+                               Kernel, 0U, 0U, 0U);
     if (blockIdx.x < a.static_network.contexts && tid == 0U) {
       const auto base = source_offset(a, a.rank);
       for (unsigned node = 0U; node < p.nodes; ++node)
         if (node != a.node)
           network_put(a, node, base, base, a.static_network.source_bytes);
     }
-    network_barrier<Math, Control>(a);
+    // network_put assigns contiguous chunks to contexts from zero. Fence
+    // every owner with a Put, but do not signal on the unused contexts.
+    const auto chunks = static_forward::ceil_div(a.static_network.source_bytes,
+                                                 kNetworkChunkBytes);
+    network_barrier<Math, Control>(
+        a, static_cast<unsigned>(min(chunks, std::uint64_t(a.static_network.contexts))));
   } else {
     rank_barrier<Math, Control>(a);
   }
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanExchangeReady,
+                             Kernel, 0U, 0U, 0U);
 
   if (blockIdx.x == 0U) {
     unsigned error = 0U;
@@ -271,6 +285,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         status->fc1_start_clock = status->relay_blocks_done = ~0ULL;
   }
   grid_sync<Math, Control>(a);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanGeometryReady,
+                             Kernel, 0U, 0U, 0U);
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
        task += gridDim.x) {
     const auto w = task / owned;
@@ -343,6 +359,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   grid_sync<Math, Control>(a);
   if constexpr (Network)
     rank_barrier<Math, Control, true, false, true>(a);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanReady,
+                             Kernel, 0U, 0U, 0U);
   collective_scope_sync<384U, kCollectiveJoinBarrier>();
 }
 

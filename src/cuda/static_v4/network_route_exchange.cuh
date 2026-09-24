@@ -100,7 +100,7 @@ __device__ __noinline__ void network_route_exchange(const ForwardKernelArgs &a,
                       sizeof(transport::BFloat16));
     }
   }
-  network_barrier<kMathThreads, kControlThreads>(a);
+  network_barrier<kMathThreads, kControlThreads>(a, a.static_network.contexts);
 
   for (auto index = tid; index < std::uint64_t(a.world) * owned;
        index += stride) {

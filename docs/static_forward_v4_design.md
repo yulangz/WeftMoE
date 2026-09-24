@@ -570,6 +570,18 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   所有 packet/reader/local completion drain 后才进行 invocation 结束 GIN barrier，
   防止快节点在慢节点仍读目录时开始覆盖下一次调用的 metadata。payload 中间无
   全节点 collective；跨调用仍保留这一边界。
+- 后续 CF 将规划阶段的 GIN fence 限定为实际拥有 metadata chunk 的 context；
+  仍由每个活跃 QP 分别发布，不能用 context0 的 signal 导入其它未完成 Put。
+  终端所有 TX 已取得远端 consumed 与本地 NIC completion、全部本地角色 join
+  后，只用一个 context 做 rail 会合，再经原节点内 barrier 保护 metadata。
+  发出最后 ACK 的节点可以先到达，但收到该 ACK 的节点只有观察它才能结束 TX
+  drain 并到达；故会合完成时全部 ACK 也已被观察。并未删去逐 slot 双 credit。
+- CH 的 Dispatch packet 目录改由静态 warp 协作生成：按 route 展开 lane，合并
+  相同目标 GPU 的计数后由唯一 lane 更新 packet 私有项，每批之间 warp 同步。
+  expected_count 仍精确来自 route plan，不在数据面推测 fanout 或动态领用任务。
+  这些规划优化的数值/资源及性能取舍见 ring 实施记录；20K 的最终性能验收未完成。
+  CJ 的 uint32 source 目录压缩在8K有收益，但20K相邻轮次确认退化，已撤回，
+  不能把该候选的目录宽度写成当前布局。
 
 ### 6.7 Return RX 直接 Reduce 消融（AQ，未获益，已撤回）
 

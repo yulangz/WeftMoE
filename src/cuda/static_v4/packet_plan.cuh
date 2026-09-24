@@ -57,9 +57,9 @@ __device__ inline PacketLocation locate_packet(
           sequence - prefix[window]};
 }
 
-// A statically strided thread owns each packet directory entry. Q is small;
-// the owner computes exact per-rank fanouts without an atomic counter or a
-// fanout-fragment reference graph. Future packing reuses this token ordering.
+// One statically strided warp owns each packet. Matching destination lanes
+// combine their route counts before writing its private consumer directory.
+// No atomic counter or runtime fanout-fragment reference graph is needed.
 __device__ inline void build_dispatch_packets(const SourcePlanView &a,
                                               DispatchPlanView out,
                                               std::uint64_t worker,
@@ -67,8 +67,9 @@ __device__ inline void build_dispatch_packets(const SourcePlanView &a,
   const auto channels = a.nodes * a.packets.lanes;
   const auto local_world = a.shape.world / a.nodes;
   const auto owned = a.experts / a.shape.world;
-  for (auto packet = worker; packet < out.channel_offsets[channels];
-       packet += workers) {
+  const auto lane = static_cast<unsigned>(worker % 32U);
+  for (auto packet = worker / 32U; packet < out.channel_offsets[channels];
+       packet += workers / 32U) {
     const auto location =
         locate_packet(a, out.channel_offsets, a.packet_prefix, packet);
     const auto node = location.node;
@@ -81,28 +82,38 @@ __device__ inline void build_dispatch_packets(const SourcePlanView &a,
     const auto rows = a.packets.token_count(tokens, location.lane,
                                            location.sequence);
     auto *consumers = out.consumer_rows + packet * local_world;
-    for (unsigned local = 0; local < local_world; ++local)
+    for (unsigned local = lane; local < local_world; local += 32U)
       consumers[local] = 0U;
+    __syncwarp();
     unsigned fanouts = 0U;
-    for (unsigned row = 0; row < rows; ++row) {
-      const auto token = a.node_tokens[begin + row].token;
-      const auto route_begin = token * a.shape.top_k;
-      for (unsigned k = 0; k < a.shape.top_k; ++k) {
-        if (a.valid && !a.valid[route_begin + k])
-          continue;
-        const auto expert = a.selected_experts[route_begin + k];
-        if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
-          continue; // The source planning error rejects the invocation.
-        const auto rank = static_cast<unsigned>(expert) / owned;
-        if (rank / local_world == node) {
-          ++consumers[rank % local_world];
-          ++fanouts;
+    for (unsigned base = 0U; base < rows * a.shape.top_k; base += 32U) {
+      const auto index = base + lane;
+      unsigned destination = ~0U;
+      if (index < rows * a.shape.top_k) {
+        const auto token = a.node_tokens[begin + index / a.shape.top_k].token;
+        const auto route = token * a.shape.top_k + index % a.shape.top_k;
+        const auto expert = a.selected_experts[route];
+        if ((!a.valid || a.valid[route]) && expert >= 0 &&
+            static_cast<unsigned>(expert) < a.experts) {
+          const auto rank = static_cast<unsigned>(expert) / owned;
+          if (rank / local_world == node)
+            destination = rank % local_world;
         }
       }
+      const auto matching = __match_any_sync(0xffffffffU, destination);
+      if (destination != ~0U) {
+        ++fanouts;
+        if (lane == static_cast<unsigned>(__ffs(matching) - 1))
+          consumers[destination] += __popc(matching);
+      }
+      // A later batch may elect a different lane for the same destination.
+      __syncwarp();
     }
-    out.packets[packet] = {
-        a.shape.window(a.source_rank, window * a.shape.tokens), begin, rows,
-        fanouts};
+    fanouts = __reduce_add_sync(0xffffffffU, fanouts);
+    if (lane == 0U)
+      out.packets[packet] = {
+          a.shape.window(a.source_rank, window * a.shape.tokens), begin, rows,
+          fanouts};
   }
 }
 

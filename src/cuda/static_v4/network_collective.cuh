@@ -6,9 +6,10 @@ namespace static_v4 {
 // its own Put fence: a signal on context zero cannot order another QP's puts.
 // The node-local barrier then imports visibility from every receiving rail.
 template <unsigned BaseThread, unsigned Threads>
-__device__ __forceinline__ void network_barrier(const ForwardKernelArgs &a) {
+__device__ __forceinline__ void network_barrier(const ForwardKernelArgs &a,
+                                                unsigned contexts) {
   grid_sync<BaseThread, Threads>(a);
-  if (blockIdx.x < a.static_network.contexts && threadIdx.x == BaseThread) {
+  if (blockIdx.x < contexts && threadIdx.x == BaseThread) {
     const ncclGin gin(a.gin_dev_comm, blockIdx.x);
     ncclGinBarrier(ncclCoopThread{}, gin, ncclTeamTagRail{}, 0U,
                    ::cuda::memory_order_acq_rel, ncclGinFenceLevel::Put);
@@ -57,7 +58,7 @@ network_before_combine(const ForwardKernelArgs &a) {
           rows * a.hidden * sizeof(transport::BFloat16));
     }
   }
-  network_barrier<0U, kThreads>(a);
+  network_barrier<0U, kThreads>(a, a.static_network.contexts);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     const auto now = device_globaltimer_ns();
     status->before_combine_complete_clock = now;

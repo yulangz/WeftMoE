@@ -79,9 +79,20 @@ EVENTS = {
     93: "source_signal_ready",
     94: "source_packet_claimed",
     95: "setup_done",
+    96: "ring_plan_begin",
+    97: "ring_plan_source_ready",
+    98: "ring_plan_packets_ready",
+    99: "ring_plan_exchange_ready",
+    100: "ring_plan_geometry_ready",
+    101: "ring_plan_ready",
 }
 
 PAIRS = {
+    "ring_plan_source": (96, 97),
+    "ring_plan_packets": (97, 98),
+    "ring_plan_exchange": (98, 99),
+    "ring_plan_geometry": (99, 100),
+    "ring_plan_bind": (100, 101),
     "kernel": (1, 22),
     "dispatch_issue_to_completion": (3, 4),
     "dispatch_signal_to_relay": (5, 6),
