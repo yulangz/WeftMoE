@@ -1,6 +1,7 @@
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/primitives/programmatic_launch.cuh"
 #include "cuda/activation_transport_internal.hpp"
+#include "cuda/persistent_v3/contracts.hpp"
 
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
@@ -228,6 +229,7 @@ struct DeviceMaterializationStatus {
   unsigned long long wave_count;
   unsigned long long max_destination_rows;
   unsigned long long max_source_tokens;
+  unsigned long long padded_compute_rows;
 };
 
 struct Layout {
@@ -865,6 +867,7 @@ materialize_plan_finalize_stage(DeviceMaterializeArgs a, unsigned block) {
   unsigned long long owned_partial = 0;
   unsigned long long incoming_partial = 0;
   unsigned long long tiles_partial = 0;
+  unsigned long long padded_partial = 0;
   for (std::uint32_t expert = threadIdx.x; expert < a.experts;
        expert += kThreads) {
     if (a.expert_to_rank[expert] != a.rank)
@@ -873,6 +876,7 @@ materialize_plan_finalize_stage(DeviceMaterializeArgs a, unsigned block) {
     incoming_partial += a.expert_total[expert];
     const auto count = a.expert_total[expert];
     tiles_partial += count / a.m_tile + (count % a.m_tile != 0);
+    padded_partial += persistent_v3::padded_expert_rows(count);
   }
   unsigned long long packets_partial = 0;
   for (std::uint32_t node = threadIdx.x; node < a.nodes;
@@ -893,6 +897,8 @@ materialize_plan_finalize_stage(DeviceMaterializeArgs a, unsigned block) {
   __syncthreads();
   const auto tiles = BlockReduce(reduce_storage).Sum(tiles_partial);
   __syncthreads();
+  const auto padded = BlockReduce(reduce_storage).Sum(padded_partial);
+  __syncthreads();
   const auto packets = BlockReduce(reduce_storage).Sum(packets_partial);
   __syncthreads();
   if (threadIdx.x == 0 && a.status->error == 0) {
@@ -907,6 +913,7 @@ materialize_plan_finalize_stage(DeviceMaterializeArgs a, unsigned block) {
     a.status->owned_experts = owned;
     a.status->incoming_rows = incoming;
     a.status->mtile_count = tiles;
+    a.status->padded_compute_rows = padded;
     a.status->packet_count = packets;
     a.status->fanout_count = a.routes;
   }
@@ -3315,6 +3322,7 @@ struct DeviceDispatchHandle::Impl {
   DeviceDispatchCapacity capacity;
   CudaLocalNotifyHandle local_notify;
   std::uint64_t dispatch_wave_count = 0;
+  std::uint64_t padded_compute_rows = 0;
   DeviceMaterializationAudit audit;
   CudaRouteInput source_routes;
   CudaGateInput source_gates;
@@ -3944,6 +3952,7 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
   impl->sizes.owned_expert_count =
       static_cast<std::uint32_t>(status->owned_experts);
   impl->sizes.incoming_row_count = status->incoming_rows;
+  impl->padded_compute_rows = status->padded_compute_rows;
   impl->sizes.mtile_count = status->mtile_count;
   impl->sizes.packet_count = status->packet_count;
   impl->sizes.fanout_count = status->fanout_count;
@@ -4472,6 +4481,14 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
 bool ActivationTransportBridge::fused_inference_routes(
     const DeviceDispatchHandle &dispatch) {
   return dispatch.impl_ && dispatch.impl_->fused_forward_notify;
+}
+
+std::uint64_t ActivationTransportBridge::padded_received_rows(
+    const DeviceDispatchHandle &dispatch) {
+  if (!dispatch.impl_ || dispatch.impl_->fused_forward_notify ||
+      dispatch.impl_->workspace->replay_counts)
+    invalid("training row allocation requires immutable materialized Notify");
+  return dispatch.impl_->padded_compute_rows;
 }
 
 const std::int32_t *ActivationTransportBridge::route_pointer(

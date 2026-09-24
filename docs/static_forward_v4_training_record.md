@@ -514,3 +514,72 @@ T512全热点、B16/D1的完整OOM/retry/live-tape/graph/offload。并发时仅�
 性能与原inference数据面持平，不把训练功能接入宣称为inference加速。
 EP16 20K相对冻结V3仍仅小幅领先，长序列显著提速目标未完成。日志
 `training_ring_network_m6e_inference_ep{8,16}_t{1,64,8192,20480}_formal.log`。
+
+## M6f：按精确P分配Backward私有workspace（已验证）
+
+在materialized Notify已有的逐专家计数归约中，同时求
+`P=sum_e ceil(rows_e/128)*128`，随原有status一次下载保存到不可变handle；
+不下载expert count数组，不增加host同步或二次路由规划。复用现有M128
+canonical block定义，Notify自身M64 tile目录不变。
+
+Backward U/dAB/dX/dGate私有存储由`R+owned_experts*127`改为精确P；
+P=0时只保留一行供合法TMA描述符使用，设备端实际mblocks仍为0，不生成假任务。
+caller提供已准备tensor storage时同时检查padded容量，不能仅凭R相同接受
+专家分布不同的较小workspace。fused或replayed Notify没有不可变host P，
+在训练tensor准备边界显式拒绝，未新增training Graph支持。
+
+仅四个源文件改动，无Backward GEMM、ring协议、公共API或新增测试套件。
+冻结`build/static_v4_training_exact_padding_m6f/`，保存change.patch和resources：
+
+- native `042c09481f82c23ce17ed1b7cb7a1ea15b7f35b102ad32961d14262eb16de41c`
+- lib `b69a6f47910a51837b1ce9b586019f54179e87a65996b54826ab7514f2ab7b5e`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+host18/18通过。Native EP8/EP16 T64/E16或E32/K6/B16/D1各两次Backward通过，
+共96个梯度hash逐字等于M6e，每rank repeat_equal=1。这个case每rank R384、
+实际P512，旧容量638行；Backward tensor bytes由17422328降到16518656，
+减少903672bytes/rank（workspace减少126×7172bytes）。输出/权重梯度等其它
+tensor容量不变；这是私有workspace节省，不是总训练显存或性能加速。
+
+日志`training_exact_padding_m6f_backward_ep{8,16}_t64.log`。caller allocator的
+EP8 T64另做12次Backward/warmup10，8个rank checked_repetitions=12、repeat_equal=1。
+
+Torch EP8/EP16 T1/64/8192 balanced和T20480全热点均通过5项数值参考及后续
+inference graph/offload；每case分别8/16个完整pass标记。20K热点仍覆盖
+EP8 R655360、EP16 R1310720，未因收紧private workspace丢token。
+EP16 T2048/B16/D1、EP8 T512/B16/D1的完整热点迁移脚本也通过：每rank两次
+tensor preparation失败注入、Backward tape重试、三个live tapes及后续inference
+graph/offload。memcheck覆盖所有weftmoe kernel，EP16 rank0/15为0错误
+（PID283822/250241），EP8 rank0/7为0错误（PID290949/290963）。
+没有以这些memcheck结果覆盖此前完整Backward racecheck未决报告；本轮未重新
+声称训练Graph可用，graph/offload仍是脚本中独立的inference阶段。
+
+日志`training_exact_padding_m6f_torch_ep{8,16}_t*`、
+`training_exact_padding_m6f_mem_ep{8_t512,16_t2048_*}.log`以及对应memcheck报告。
+非ring回退另用冻结V3生成profile构建，同一源代码的native SHA256
+`8a946910f335a4d6a5a39aa13cdde169662c428692548fd9404444042fe72ef3`，冻结于
+`build/static_v4_training_exact_padding_m6f_v3/`。取消ring环境变量后EP8/EP16
+T64各两次Backward通过，96个hash与M6f ring/M6e完全一致；不是将inference
+profile的RDMA_CTAS=0当作原多机训练入口。
+
+1620MHz下inference四规模正式回归（10warmup/20samples/batch20）如下；
+没有并发CPU构建或其它GPU任务，各case hash及device/registered容量均与M6e一致。
+
+|T/rank|单机EP8/us|双机EP16/us|
+|---:|---:|---:|
+|1|100.819|278.118|
+|64|134.979|333.563|
+|8192|1268.100|2953.070|
+|20480|2960.200|6991.990|
+
+EP8 8K比M6e前次1253.330us高约1%，进一步作同机相邻正式对照：
+M6e基线1267.940us（1264.370–1273.980），M6f复测1261.500us
+（1256.920–1267.270），16个hash及pool容量一致，未见稳定退化，也不宣称加速。
+两artifact的本地prefill main SASS完整输出相同（各33916行，含匹配function与
+指令，非空dump），SHA256均为
+`27131fb300a98572742dc766b0ef1936b0c7c56abbab6f25bb1c035be6838478`。
+这支持GPU入口没有改变，但不能单凭机器码相同排除运行环境/地址分配的影响。
+日志`training_exact_padding_m6f_inference_ep{8,16}_t*_formal.log`。
+8K相邻对照为`training_exact_padding_m6f_inference_ep8_t8192_{baseline,repeat}.log`。
+本里程碑完成精确私有容量分配及回归，不等于完整训练性能/racecheck验收完成。
+EP16 20K仍仅比历史冻结V3的7096.930us快约1.48%，显著领先的性能目标未达成。

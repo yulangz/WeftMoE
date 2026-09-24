@@ -29,8 +29,10 @@ M6d/M6e已接通opt-in **单机/多机训练ring Forward**：独立plan→实际
 canonical checkpoint接既有Backward；多机复用有界Backward GIN ring，保留独立
 控制状态/counter区间。EP8/EP16长文热点、live tapes、OOM重试已验证，network
 decode/prefill的rank0/15 memcheck及Forward racecheck均0。M6e的EP8/EP16四规模
-inference正式回归通过且性能持平；精确P_actual、完整训练sanitizer/性能门禁
-仍未完成，长序列inference显著领先目标也尚未满足。
+inference正式回归通过且性能持平。M6f随后接通Notify精确P_actual及Backward
+私有workspace分配，EP8/EP16主矩阵、热点迁移、OOM重试、memcheck及非ring
+回退通过；完整训练sanitizer/性能门禁仍未完成，长序列inference显著领先目标
+也尚未满足。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -1033,13 +1035,17 @@ wire控制区、NIC counter编号独立持久化，仅在执行完成后复用co
 20K及20K热点R1310720通过，T512/T2048分别覆盖decode/prefill的rank0/15
 memcheck0和Forward racecheck0。没有恢复完整Forward X/S，也没有双机专用索引。
 Python入口只为Notify/调度元数据预留最坏route容量，X/S保持有界，tape/dR按
-实际R分配；Backward private padding仍为R+expert slack，未实现精确P_actual。
+实际R分配。M6f将Backward private padding从R+expert slack改为精确P_actual：
+materialized Notify随已有status下载保存逐专家M128取整后的总行数，不增加host
+同步或计数下载；空rank仅一行用于合法TMA描述符，实际计算任务仍为0。caller
+复用tensor storage同时检查P容量，fused/replayed Notify不作为训练精确分配依据。
 详见 [训练对接记录](static_forward_v4_training_record.md)。
 
 - [x] 单机canonical tape、plan/实际分配/main复用、checkpoint纳入slot生命周期。
 - [x] 单机Forward/Backward参考、长文热点、多个live tapes、OOM一致失败与重试。
 - [x] 多机checkpoint及Backward有界GIN window adapter；通用节点索引/分区，EP16验证。
-- [ ] 精确P_actual分配；当前Backward为实际R加expert padding上界。
+- [x] 精确P_actual分配（M6f）；EP8/EP16数值、零行rank、热点迁移、OOM重试、
+  memcheck及非ring回退通过，inference四规模正式回归无稳定退化。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 

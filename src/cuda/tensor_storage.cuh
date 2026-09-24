@@ -231,6 +231,12 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
   state->experts = dispatch.sizes().owned_expert_count;
   state->hidden = config.hidden_size;
   state->intermediate = config.intermediate_size;
+  state->rows = dispatch.received_row_capacity();
+  // Zero-row ranks still need valid TMA descriptors, but no compute task can
+  // touch the single placeholder row. Every nonempty rank allocates exact P.
+  static_assert(backward_tuning::kTileM == persistent_v3::kMBlockRows);
+  state->padded_rows = std::max<std::uint64_t>(
+      1U, ActivationTransportBridge::padded_received_rows(dispatch));
   const auto device = execution.device_ordinal();
   const auto make = [&](std::uint64_t bytes,
                         const CudaTensorBuffer &binding = CudaTensorBuffer{}) {
@@ -255,17 +261,9 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
       bindings.dgate);
   state->dw1 = make(checked_mul(weight, 4ULL, "dW1 bytes"), bindings.dw1);
   state->dw2 = make(checked_mul(weight, 2ULL, "dW2 bytes"), bindings.dw2);
-  // Only the compact dR and transport directories are peer-visible. These
-  // padded activation planes are rank-private and follow this invocation's
-  // actual Notify rows, not the transport pool's receive capacity. Padding
-  // slack is bounded by one partial tile per owned expert; no count download
-  // or second route plan is needed at this allocation boundary.
-  state->rows = dispatch.received_row_capacity();
-  state->padded_rows = checked_add(
-      state->rows,
-      checked_mul(state->experts, backward_tuning::kTileM - 1ULL,
-                  "Backward expert padding"),
-      "Backward workspace rows");
+  // Only compact dR and transport directories are peer-visible. Notify's
+  // existing status download also carries this private workspace's exact P;
+  // allocation needs no extra count transfer or second route plan.
   std::size_t cursor = 0;
   const auto intermediate_elements = checked_mul(
       state->padded_rows, state->intermediate, "Backward workspace elements");

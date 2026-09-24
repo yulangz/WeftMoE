@@ -6461,6 +6461,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.top_k != dispatch_id.top_k ||
       data.experts != view.sizes.owned_expert_count ||
       data.rows < view.sizes.incoming_row_count ||
+      data.padded_rows < ActivationTransportBridge::padded_received_rows(retained.dispatch) ||
       data.completion.device != pool->device)
     throw std::runtime_error(
         "Backward tensor storage does not match this invocation");
