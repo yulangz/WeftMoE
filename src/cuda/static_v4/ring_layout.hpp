@@ -47,6 +47,8 @@ struct alignas(64) NetworkChannel {
   std::uint64_t tx_cursor;
   std::uint64_t rx_cursor;
   std::uint64_t consume_cursor;
+  std::uint64_t tx_reserve_cursor;
+  std::uint64_t tx_reserved_head;
 };
 
 struct SlotSequence {

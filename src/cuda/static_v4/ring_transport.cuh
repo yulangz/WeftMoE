@@ -109,7 +109,8 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
 
 // FC2 writes node-local contributions directly into their reserved source
 // slots. This static owner publishes whole rows only after acquiring all N
-// tiles; remote rows remain in C for the network Return owner to pack.
+// tiles; remote rows are already in reserved Return TX. The network owner
+// sends them and retires their C bookkeeping independently of NIC completion.
 template <bool Network>
 __device__ __noinline__ void ring_return(const ForwardKernelArgs &a,
                                          unsigned worker, unsigned workers) {

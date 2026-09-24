@@ -60,6 +60,17 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       auto &state = endpoint.state(Returning, channel);
       const auto plan = channel_plan<Returning, false>(a, channel);
       const auto terminal = state.tx_base + plan.count;
+      if constexpr (Returning) {
+        // Reserve independently of FC2 readiness, up to the complete ring
+        // depth. Whole-window admission must not depend on the next Put alone.
+        const auto end = min(terminal, state.tx_cursor + endpoint.layout().depth);
+        while (state.tx_reserve_cursor < end &&
+               endpoint.can_send(true, channel, state.tx_reserve_cursor)) {
+          ++state.tx_reserve_cursor;
+          ring::publish<::cuda::thread_scope_system>(state.tx_reserved_head,
+                                                     state.tx_reserve_cursor);
+        }
+      }
       if (state.tx_cursor == terminal) {
         done &= endpoint.drained(Returning, false, channel, terminal);
         continue;
@@ -73,6 +84,8 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       const std::int32_t *experts = nullptr;
       const static_forward::RouteLocation *locations = nullptr;
       if constexpr (Returning) {
+        if (sequence >= state.tx_reserve_cursor)
+          continue;
         const auto desc =
             ring::source_metadata(a, plan.source, r.returning.packets)[packet];
         rows = desc.rows;
@@ -114,47 +127,31 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
       }
       // Poll owner-local readiness before touching NIC counters/signals.
       // Immutable plan/C readiness reads do not access reusable TX payload.
-      if (!endpoint.can_send(Returning, channel, sequence))
-        continue;
+      if constexpr (!Returning)
+        if (!endpoint.can_send(false, channel, sequence))
+          continue;
       const auto offset = endpoint.payload(Returning, false, channel, sequence);
       auto *payload = peer_at<char>(a.gin_window_base, offset);
-      if constexpr (Returning)
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPackStart, GinReturn,
-                                   channel, sequence, rows);
-      else
+      if constexpr (!Returning) {
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchPackStart,
                                    GinDispatch, channel, sequence, rows);
-      asm volatile("fence.proxy.async.global;" ::: "memory");
-      for (unsigned row = 0U; row < rows; ++row) {
-        const transport::BFloat16 *source;
-        if constexpr (Returning) {
-          const auto route = routes[row];
-          const auto destination =
-              static_cast<unsigned>(experts[route]) / owned;
-          source =
-              peer_at<const transport::BFloat16>(a.peer_bases[destination],
-                                                 a.forward_output_rows_offset) +
-              std::uint64_t(locations[route].row) * a.hidden;
-        } else {
-          source = peer_at<const transport::BFloat16>(a.local_base,
-                                                      a.source_input_offset) +
-                   tokens[row].token * a.hidden;
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        for (unsigned row = 0U; row < rows; ++row) {
+          const auto *source = peer_at<const transport::BFloat16>(
+                                   a.local_base, a.source_input_offset) +
+                               tokens[row].token * a.hidden;
+          prefetch.copy(source, payload + std::uint64_t(row) * row_bytes,
+                        row_bytes);
         }
-        prefetch.copy(source, payload + std::uint64_t(row) * row_bytes,
-                      row_bytes);
-      }
-      prefetch.drain();
-      finish_copies<false>();
-      if constexpr (Returning)
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPackEnd, GinReturn,
-                                   channel, sequence, rows);
-      else
+        prefetch.drain();
+        finish_copies<false>();
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchPackEnd,
                                    GinDispatch, channel, sequence, rows);
+      }
       if constexpr (Returning) {
         // A packet is one admitted window: a physical C slot cannot alias
         // another block in it. Collapse consecutive rows of that block into
-        // one retirement, after every payload copy has actually completed.
+        // one retirement, after acquiring every FC2 direct-store completion.
         static_forward::ComputeSlot *previous = nullptr;
         unsigned count = 0U;
         for (unsigned row = 0U; row < rows; ++row) {

@@ -721,7 +721,12 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     const auto packet = static_forward::packet_bytes(packets.rows, config.max_hidden_size);
     const auto returning = static_forward::packet_bytes(
         static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
-    network.rings = {config.max_nodes, packets.lanes, 8U, packet, returning};
+    // Each channel reserves a whole worst-case Return window before FC2 can
+    // write TX. This capacity depends on B/K/Q/L, not the total token count.
+    const auto window_packets = static_forward::kNetworkReturnPackets.lane_packets(
+        std::uint64_t(config.static_forward_window_tokens) * config.max_top_k, 0U);
+    const auto depth = static_cast<unsigned>(std::max<std::uint64_t>(8U, window_packets));
+    network.rings = {config.max_nodes, packets.lanes, depth, packet, returning};
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
@@ -989,9 +994,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       ring.pull_packets = append(
           cursor, ring.max_windows * ring.shape.sources * ring.packets.packets(ring.shape.tokens),
           sizeof(static_forward::PullPacket), "immutable remote pull packets");
-    ring.output = append(cursor,
-        std::uint64_t(ring.depth) * ring.shape.tile_m * config.max_hidden_size,
-        sizeof(transport::BFloat16), "C ring");
   }
   const auto activation_rows = ring.depth
       ? std::uint64_t(ring.depth) * ring.shape.tile_m

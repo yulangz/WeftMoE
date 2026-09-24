@@ -147,6 +147,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           a.gin_window_base,
           network.ring_region + index * sizeof(static_forward::NetworkChannel));
       channel.tx_cursor = channel.tx_base;
+      channel.tx_reserve_cursor = channel.tx_reserved_head = channel.tx_base;
       channel.rx_cursor = channel.consume_cursor = channel.rx_base;
     }
   }
@@ -339,9 +340,22 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         const auto row = geometry.expert_row(0U, source, ordinal);
         const auto route =
             order[source_prefix[a.rank * owned + expert] + ordinal];
+        void *output;
+        if (!Network || source / a.local_world_size == a.node) {
+          const auto &address = window_source(a, w, source);
+          const auto route_begin = p.shape.token_begin(w) * p.shape.top_k;
+          output = peer_at<transport::BFloat16>(a.peer_bases[source],
+                                                a.contribution_offset) +
+                   (address.row_base + route - route_begin) * a.hidden;
+        } else {
+          const auto node_expert = a.node * a.local_world_size * owned;
+          const auto node_row = source_prefix[a.rank * owned + expert] +
+                                ordinal - source_prefix[node_expert];
+          output = return_tx::row_output(a, source, local_window, node_row);
+        }
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
             static_cast<unsigned>(route), source, gates[route],
-            static_cast<unsigned>(route / p.shape.top_k)};
+            static_cast<unsigned>(route / p.shape.top_k), output};
         if constexpr (Network) {
           const auto block = r.window_prefix[w] + prefix[expert] +
                              row / forward_tuning::kTileM;

@@ -56,6 +56,9 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
           break;
         }
       }
+      if constexpr (Network)
+        if (__all_sync(0xffffffffU, free))
+          free = return_tx::reserved(a, window, lane, 32U);
       if (__all_sync(0xffffffffU, free)) {
         for (auto block = begin + lane; block < end; block += 32U) {
           auto &s = slot(a, block);

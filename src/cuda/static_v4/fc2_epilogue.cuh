@@ -32,21 +32,7 @@ static_v4_push_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
     transport::BFloat16 *destination;
     if constexpr (RingSchedule) {
       const auto identity = a.ring.rows[mblock * forward_tuning::kTileM + row];
-      if (!Network || identity.source / a.local_world_size == a.node) {
-        const auto window = a.ring.blocks[mblock].window;
-        const auto &address =
-            static_v4::ring::window_source(a, window, identity.source);
-        const auto route_begin =
-            a.ring.source.shape.token_begin(window) * a.ring.source.shape.top_k;
-        destination =
-            peer_at<transport::BFloat16>(a.peer_bases[identity.source],
-                                         a.contribution_offset) +
-            (address.row_base + identity.route - route_begin) * a.hidden;
-      } else {
-        destination = peer_at<transport::BFloat16>(
-                          a.local_base, a.forward_output_rows_offset) +
-                      (canonical_row + row) * a.hidden;
-      }
+      destination = static_cast<transport::BFloat16 *>(identity.output);
     } else {
       const auto &header = static_v4::route_header(a, canonical_row + row);
       if constexpr (Network)

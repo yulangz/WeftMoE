@@ -1,6 +1,6 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
-更新：2026-09-23。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
+更新：2026-09-24。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
 第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training
 V4 已经落地。**
 旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
@@ -19,8 +19,9 @@ Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多�
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
 数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
 优化版。纯 GEMM 基准已建立，完整布局/profile 消融和训练对接未完成，进展与
-测量见 ring 记录。节点内 FC2 已直接写预留的 contribution ring；跨节点结果仍
-写 C，由网络 Return pack。数据面协议不因这一节点内写回优化改变。
+测量见 ring 记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
+TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
+须先取得双 credit 并发布 reservation，destination 才可准入相应整窗口。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -186,7 +187,7 @@ S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 
 | 输入 X/routes/weights | 调用方实际输入及必要的 peer 可达 staging | 本次调用输入生命周期，不复制成每远端节点一份完整 X |
 | X ring | `[D_x, M, H]`，另有 gate/本代元数据 | 本 GPU，所有 FC1 读者退休后复用 |
 | S ring | `[D_s, M, I]` | 本 GPU，所有 FC2 读者退休后复用 |
-| C ring | `[D_c, M, H]` | 所有 Return 读者搬走完整行后复用 |
+| C / FC2 输出 | 首版 `[D_c, M, H]`；CN/CO 后不分配 payload | 保留逐 slot 的 FC2/returned 账本，输出直接写已预留的 contribution/TX |
 | Dispatch TX / RX | 分离的 `[remote_node, lane, D_net, slot_bytes]` | 本 rail 的注册区，逐 slot credit |
 | Return TX / RX | 同样分离的 peer/channel ring | 不与 Dispatch 或对向 TX 别名 |
 | contribution | source 上 `[D_contrib, B, K, H]` 及 route-ready | 同一 token 的 Reduce 完成后释放相应窗口 |
@@ -225,8 +226,8 @@ source X
   -> source rail Dispatch TX[peer,lane,slot]
   -> target rail Dispatch RX[source_node,lane,slot]
   -> target expert X[x_slot,row,:]
-  -> S[s_slot,row,:] -> C[c_slot,row,:]
-  -> compute node rail Return TX[source_node,lane,slot]
+  -> S[s_slot,row,:]
+  -> FC2 直接写 compute node rail Return TX[source_node,lane,slot]
   -> source rail Return RX[compute_node,lane,slot]
   -> source contribution[window_slot,token_in_window,topk_slot,:]
   -> source output[token,:]
@@ -234,6 +235,8 @@ source X
 
 same-node Dispatch 直接从源 peer 可达 X pull 到 expert X ring；same-node Return
 直接写 source contribution。返回标识必须能恢复 source window/token/top-k slot。
+以上地址为 CN/CO 后的实现；首版曾经由 C 再搬到 TX。不可变 RingRow 中预绑定
+FC2 output 地址，不把可复用 TX payload 当成路由目录。
 
 不能把 Return 唯一的反向映射放在已释放的 X slot：优先从 immutable plan 查询；
 若把必要字段复制到 S/C/packet，它们必须在前一存储释放前完成复制。
@@ -470,7 +473,7 @@ Return RX 不需要等 Reduce，Return TX 不需要持有 C 原址到网络完�
 在有界方案里至多按已预留的有限窗口批量 Reduce。Return/Reduce 的更细重叠可独立
 消融，但不能破坏窗口回收进度。
 
-### 6.4 逐 slot 复用决策（2026-09-23，待实现）
+### 6.4 逐 slot 复用决策（已实现，保留双检查）
 
 Dispatch/Return TX 覆盖前均保留：
 
@@ -588,6 +591,29 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   这些规划优化的数值/资源及性能取舍见 ring 实施记录；20K 的最终性能验收未完成。
   CJ 的 uint32 source 目录压缩在8K有收益，但20K相邻轮次确认退化，已撤回，
   不能把该候选的目录宽度写成当前布局。
+
+#### CN/CO：FC2 直写 Return TX 后的差异
+
+6.3 和上面 M3b 的 C→TX 描述是初始实现。当前 Return owner 先用同一
+`can_send` 双检查，按 FIFO 非阻塞预留最多一个 ring depth 的 TX slots，再以
+system release 发布每 channel 的 `tx_reserved_head`；预留不依赖 FC2-ready。
+destination 准入整窗时，除 X/S/returned 账本外，还检查该窗口实际涉及的所有
+远端 Return packets 均已预留。source 的 node-expert 区间连续，每 lane 检查
+该区间最后一个 packet 即可，不能跳过区间中的旧 slot。
+
+网络深度为 `max(8, ceil(ceil(B*capacity_top_k/ReturnQ)/lanes))`，保证最坏
+一个 source window 可完整预留；此处使用独立的 Return Q，不是 Dispatch Q。
+深度随固定 B/K/Q/L，而非总 tokens 增长。固定 TX owner 的预留进度不等待
+本次 FC2，独立 RX/ACK 释放上一代，避免“计算等 TX、TX 等本次计算”的闭环。
+
+FC2 按不可变 `RingRow.output` 直接写 contribution 或同节点 rail TX。
+原 FC2 completion→system fence→rail-local `return_ready` 的发布链不变；
+TX owner acquire 全包实际引用的 blocks 后直接 Put，不再复制 C→TX。
+按行退休的 returned 仍防止 descriptor/ready 镜像提前换代；它不授予 TX
+复用权。TX 从预留、FC2 写入、发送直至双 credit 返回始终归本代所有。
+CO 删除已无读者的 C 数据区和 ring output-store TensorMap，非 ring 路径不变。
+当前调优候选为 Dispatch Q8 / Return Q32 / L32 / B512 / contribution D8；
+编译默认和最终 profile 尚未切换，正式数值与性能见 ring 记录。
 
 ### 6.7 Return RX 直接 Reduce 消融（AQ，未获益，已撤回）
 

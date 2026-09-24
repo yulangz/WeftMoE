@@ -2098,12 +2098,13 @@ make_activation_pool_state(const CollectiveSession &session,
             config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U",
             forward_tuning::kTileK);
-        slot.forward_output_store_map = make_bf16_tma_store_map(
-            at<void>(slot.device, state->layout.static_ring.depth
-                                     ? state->layout.static_ring.output
-                                     : state->layout.canonical_rows),
-            config.max_hidden_size, activation_rows,
-            "Forward canonical output");
+        // Ring FC2 stores directly to reserved contribution/Return TX rows.
+        // It has neither a canonical C allocation nor a TMA store descriptor.
+        if (!state->layout.static_ring.depth)
+          slot.forward_output_store_map = make_bf16_tma_store_map(
+              at<void>(slot.device, state->layout.canonical_rows),
+              config.max_hidden_size, activation_rows,
+              "Forward canonical output");
         if (config.enable_backward_state)
           slot.forward_training_output_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.forward_training_output),
@@ -4883,8 +4884,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.canonical_gates_offset = layout.canonical_gates;
   args.forward_output_rows_offset = config.retain_backward_state
                                         ? layout.forward_training_output
-                                        : (layout.static_ring.depth ? layout.static_ring.output
-                                                                    : layout.canonical_rows);
+                                        : layout.canonical_rows;
   args.direct_headers_offset = layout.direct_route_headers;
   args.contribution_offset = layout.contribution;
   args.return_ready_epoch_offset = layout.return_ready_epoch;

@@ -36,6 +36,7 @@ struct RingRow {
   std::uint32_t source;
   float gate;
   std::uint32_t token;
+  void *output; // Reserved source contribution or rail Return TX row.
 };
 
 // The source address is constant for all routes in a (window, source) pair.
@@ -146,7 +147,7 @@ struct ComputeRingLayout {
   std::size_t source_reserved = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
   std::size_t window_sources = 0;
-  std::size_t blocks = 0, rows = 0, output = 0;
+  std::size_t blocks = 0, rows = 0;
   std::size_t pull_packets = 0;
 };
 

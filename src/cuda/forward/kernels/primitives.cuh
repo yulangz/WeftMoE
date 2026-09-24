@@ -373,6 +373,7 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/static_v4/contract.cuh"
 #include "cuda/static_v4/network_access.cuh"
 #include "cuda/static_v4/ring_access.cuh"
+#include "cuda/static_v4/return_tx.cuh"
 #include "cuda/static_v4/network_ring.cuh"
 #include "cuda/persistent_v3/forward/compute_kernel.cuh"
 

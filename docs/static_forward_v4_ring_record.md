@@ -2629,3 +2629,57 @@ CN补充：Q16快筛8K/20K为3170.700/7221.650 us，Q32为3049.200/7089.870 us�
 正式对照、窗口联合消融和完整正确性门禁。Q32 native SHA256
 `01a3b2d4395e25070022c7a3c660a077dfc3a05fcbb1873bd9766f98dee37d80`；
 首轮Q16快筛存在本节点并行CPU编译，Q32快筛无并行CPU/GPU任务。
+
+CN/Q32的20K窗口联合快筛，B256/1024/1536、contribution D8分别为
+7630.660/7447.780/7404.620 us，仍不如B512。此轮有CPU构建，不作为正式
+性能结论；三组48 hashes另核对。Q32 library SHA256
+`228bfbe1aff7638e6bbc9b667c7ab2e8a3376cc39739348d244d6aae7abe594f`。
+第二节点无其它CPU/GPU任务的EP8正式10/20/20、B512/D8为
+101.034/137.973/1256.340/2964.990 us，单机与CL基本持平，不认定为收益。
+
+### CO：删除直写 TX 路径已无读者的 C payload（与 CN/Q32 一同保留）
+
+基于CN/Q32，FC2已经只写预绑定的source contribution或Return TX地址，
+所以删除ComputeRingLayout.output及相应C数据分配；ring不再生成未使用的
+output-store TensorMap。非ring的V3/full-arena与training map不变。
+X/S slot中的FC2/returned计数仍作为计算与Return发布的生命周期账本，不能
+因为数据C消失就删掉这些同步。容量节省与端到端收益分开记录，编译/验证中。
+
+### CN/CO 里程碑验收（2026-09-24）
+
+CN/Q32完整EP16四规模+edges480、小深度B16/D1/K8的304条检查通过。
+CO进一步完整验证host18/18、GPU plan31+6、EP16四规模+edges480、EP8的240、
+B16/D1/K8的304，以及B2048/D1/K8的304条检查；后者触发网络depth16，验证
+整窗TX预留不依赖固定depth8。所有launcher exit0。沿用现有测试入口，无新增套件。
+rank1/9 eager B16/D1/K8/T64、11 rounds的memcheck和racecheck均exit0，
+0 errors/0 hazards；memcheck local470300/remote158747，racecheck
+local470926/remote159026。不是对全部16个rank同时插桩。
+
+CO冻结 `static_v4_ring_direct_tx_no_c/`，native SHA256
+`c8b6c34dc92960509ebcd68295875ac17f2ab32dc15996494d5ae974b4e75a83`，library
+`c414ff6636905b70f765e540f620e30e99ffb4ba72832c015cfacb39626c8e70`；
+REG168/STACK440/LOCAL0，无spill。相对CL的完整source patch含新增return_tx helper。
+
+1620MHz、B512/D8、10 warmup/20 samples/batch20，正式测量节点无CPU编译或
+其它GPU任务，单机EP8在第二节点运行。下表不是后续规划线程候选的结果：
+
+| T/rank | 单机EP8/us | 双机EP16/us |
+|---:|---:|---:|
+|1|100.995|291.643|
+|64|138.315|420.726|
+|8192|1262.370|3061.540|
+|20480|2957.200|7099.110|
+
+EP8与CL基本持平；EP16长序列较CL约快0.36%/0.71%，短规模反而慢3.94%/11.30%。
+Q32与直写TX作为组合保留，不能将全部变化归因于删C，后续仍须优化短序列分包。
+相邻冻结V3的8K/20K为3363.990/7106.450 us；CO的20K再测7102.090 us。
+所以8K快约8.99%，20K只是持平，最终“明显优于V3”的目标仍未达成。
+EP8/EP16四规模96 hashes与CL一致，另32 hashes与相邻V3一致。
+日志 `ring_direct_tx_no_c_*`，formal与quick严格区分。
+
+以20K/rank为例，EP8 device pool从CL的688751552降至551715776 bytes；
+EP16从1008139712降至913972672 bytes。EP16 compute/registered分别为
+820332216/93640448 bytes，CL为947930808/60208896 bytes：直写地址表有增量，
+Q32也比CL的Q16多占注册内存；不能只报告删除的C而隐藏这些成本。
+相对同Q32的CN，CO精确删除138412032 bytes（132MiB）C payload/rank。
+ring仍为opt-in，未将本项标成M5最终profile或训练支持完成。
