@@ -69,6 +69,12 @@ FO的round-robin物理行序和向量写回。单机训练main相对FO改善4.72
 inference性能回归持平。当前checkpoint合同见第5节，实验分项及撤回理由见
 训练记录FQ–FR3；训练端到端与双机20K inference显著领先目标仍未完成。
 
+FS2保留两种GPU planner，调整为Notify→实际tape分配/全rank失败确认→
+物理ring plan→main；删除不参与分配的ring runtime D2H与host同步。GPU指令
+与FR3逐字节相同；单/双机完整数值、OOM重试及Forward专项sanitizer通过，
+单机长文wall正反向均有约1%–2%的收益，双机长文正反向差异约±1%，记为持平。第8节
+按这一已验证的准备边界列出流程；不将被撤回的FS整合planner方案混入当前实现。
+
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
@@ -899,16 +905,20 @@ profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一�
 prefill inference 与 training Forward 共用有界流水，但训练保存实际规模的 tape，
 不是在 ring 中留住整次调用的激活。M6d/M6e已接通单机及多机版本，非ring训练
 仍用V3及相应编译profile；Backward保留原GEMM/调度，多机继承8-GPU/node的
-rail合同，节点数按runtime映射，当前仅有2机硬件验证。目标流程如下：
+rail合同，节点数按runtime映射，当前仅有2机硬件验证。FS2的准备顺序如下：
 
 ```text
-route_plan_kernel
-  -> stable route ordinal / 窗口计数 / count exchange / 精确 R_actual、P_actual
-  -> 冻结 main 与 Backward 共用的 plan；此时不发 activation payload
+materialized Notify
+  -> stable route ordinal / canonical count exchange / 精确 R_actual、P_actual
+  -> 冻结 canonical plan；此时不发 activation payload
 
 host allocation boundary
   -> 取得本 rank 实际 tape 大小及 collective status
-  -> 分配 saved tensors / plan lease；失败则在 main 前一致报错
+  -> 分配 saved tensors / plan lease；失败则在物理规划前一致报错
+
+static_ring_plan_kernel
+  -> 窗口计数 / packet metadata exchange / physical row 与 canonical row 映射
+  -> 冻结 main 的物理执行计划；同 stream 衔接 main，无中间 D2H 或 host 等待
 
 main_from_plan
   -> 复用原 plan，不重复 route counting/exchange
@@ -939,6 +949,12 @@ M6对接优先复用materialized Notify已有的`route_dst_row`：它由expert b
 物理枚举。Notify及ring窗口规划均属于main之前的plan阶段，
 不能在main里再次执行。M6d/M6e已在单机及多机实现并验证该映射及两层plan边界，
 不能将两层规划称为一遍planner。训练入口拒绝可变fused/replay-counts Notify。
+
+FS2的tape分配只依赖Notify已经给出的实际R/P，不依赖物理planner回传的行数。
+全rank准备成功之前，不执行物理planner、不推进设备ring epoch/base，也不准入
+payload；分配失败确认后可释放lease并重试。这不保证host调用编号不增加，也
+不承诺从CUDA/NCCL控制面失效中恢复。两层GPU规划仍各执行一次，main不重做
+窗口规划；FS将物理规划合入main的实验在单机20K出现小幅回退，已撤回。
 
 每个 live tape 持有独立 allocation/plan lease，直到 Backward 完成。资源不足可
 等待或显式失败，不能覆盖尚未消费的 tape。输入/输出/plan/tape 真正 OOM 时允许
@@ -1147,8 +1163,10 @@ materialized Notify随已有status下载保存逐专家M128取整后的总行数
 - [x] SavedX地址外提（FO）及单机stable-source/M32 TMA（FR3）：保持网络原布局，
   FR3相对FO单机8K/20K训练main再改善4.72%/6.06%，wall改善3.61%/5.19%；
   单/双机集成门禁通过，专项sanitizer复用逐字节相同组件的已有证据。
-- [ ] 独立消融训练物理规划合入main：保留Notify、实际tape分配与全rank失败
-  一致性边界；以wall衡量收益，说明main计时范围变化。
+- [x] 独立消融训练物理规划合入main（FS）：8K wall有小幅收益，但单机20K
+  正反向均退化约0.3%–0.5%，已撤回；不以改变main计时范围掩盖结果。
+- [x] FS2保留独立物理planner，仅移除冗余D2H/host同步：单/双机数值与
+  Forward专项sanitizer已通过，单机长文wall正反向改善，双机长文持平。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 

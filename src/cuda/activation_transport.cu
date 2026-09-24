@@ -5262,6 +5262,20 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 std::to_string(forward_main_compute_ctas) + " resident CTAs",
                 std::to_string(max_active_clusters) + " resident clusters");
           if (training_ring) {
+            try {
+              state->forward_tensor_preparation->run([&] {
+                // Materialized Notify already supplies exact canonical R/P.
+                // No physical ring plan or payload starts before all ranks
+                // have prepared their independent tape.
+                prepare_storage();
+                bind_storage();
+              });
+            } catch (const TensorPreparationFailure &) {
+              // Allocation agreement joined every rank without advancing
+              // device ring epochs or bases. Preserve this lease for retry.
+              failure_guard.committed = true;
+              throw;
+            }
             const auto planner = use_gin ? static_ring_plan_kernel<true>
                                          : static_ring_plan_kernel<false>;
             cudaLaunchAttribute cooperative{};
@@ -5286,29 +5300,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 cudaLaunchKernelEx(&plan_launch, planner, args),
                 id.calling_rank, id.world_size, backend->session.session().identity(),
                 id.generation, ExchangeKind::ExpertCounts, "freeze training ring plan");
-            DeviceDispatchRuntime planned{};
-            internal::throw_cuda("forward-plan",
-                cudaMemcpyAsync(&planned, args.dispatch.runtime, sizeof(planned),
-                                cudaMemcpyDeviceToHost, exec->stream),
-                id.calling_rank, id.world_size, backend->session.session().identity(),
-                id.generation, ExchangeKind::ExpertCounts, "read actual ring rows");
-            internal::throw_cuda("forward-plan", cudaStreamSynchronize(exec->stream),
-                id.calling_rank, id.world_size, backend->session.session().identity(),
-                id.generation, ExchangeKind::ExpertCounts, "complete ring plan");
-            try {
-              state->forward_tensor_preparation->run([&] {
-                if (planned.error || planned.sizes.incoming_row_count !=
-                                         view.sizes.incoming_row_count)
-                  throw std::runtime_error("ring plan disagrees with canonical Notify rows");
-                prepare_storage();
-                bind_storage();
-              });
-            } catch (const TensorPreparationFailure &) {
-              // Plan has joined and no payload/slot was admitted. Its frozen
-              // metadata may be rebuilt for a retry without advancing bases.
-              failure_guard.committed = true;
-              throw;
-            }
+            // The same-stream main consumes the completed physical plan;
+            // no device result is needed to size or bind the tape on host.
           }
           launch_forward = cudaLaunchKernelEx(
               &launch, kStaticUnified, args, slot.forward_x_map,

@@ -1638,3 +1638,166 @@ retained及同容量pool均已核对。网络结果持平，不将不足0.4%的�
 Inference仍持平，不记为本次新增收益；双机20K相对V3仅降低3.15%，不能关闭
 明显领先目标。采用FR3，拒绝通用FR及FR2；训练端到端仍落后V3，下一步独立
 检查规划launch、D2H和host同步，不把main计时范围变化误报为计算加速。
+
+### FS：将训练物理窗口规划合入驻留main（不采用）
+
+基线FR3 `06f6095`。materialized Notify已提供精确R/P，原先ring plan回传的R
+只用于重复校验，不用于tape分配。候选保留Notify及collective tape准备边界，
+在全部rank分配成功之后由main调用同一个ring planner，同时stage input；删除
+独立planner entry、runtime D2H和一次host stream同步。发生分配失败时尚未
+改变设备ring epoch/base，也未准入payload；保留全rank失败一致性及retry。
+不改变独立tape所有权、canonical映射、GEMM、通信协议或training graph限制。
+
+planner借用GEMM operand arena，校验scratch不会覆盖已初始化的barrier；没有
+新GM allocation或双份planner。main开始时间现在覆盖物理规划，不能与FR3
+不含规划的main数值直接比较，验收以含Notify、准备及Forward的wall为准。
+冻结`build/static_v4_fused_training_plan_fs/`；22:42开始native构建，本节尚无
+数值、性能或sanitizer结论，不将FR3检查重标为FS。
+
+FS native SHA256 `c8e7ec2410fc5a39675b6ae86711fa1b7b864226ee922b72340793f0be00a52b`。
+EP8 T512/E16/K6与EP16 T64/E32/K6两次Backward的96个梯度hash等于FR3；
+四种inference完整SASS逐字节相同。训练decode/prefill的local/network STACK
+均为64/392，REG168/SHARED2048/LOCAL0；栈减小本身不等于性能改善。
+
+第二节点独占EP8，第一节点构建FS库；1620MHz、B512/D8、retained10/20，
+FR3→FS，单位us。旧main不含物理规划，FS main包含，不能直接比较其百分比。
+
+|T/rank|FR3 wall|FS wall|FR3 main|FS main|FR3 plan|FS plan|
+|---|---:|---:|---:|---:|---:|---:|
+|1|408.015|409.613|77.568|115.968|41.824|46.848|
+|64|463.371|434.412|107.040|149.088|43.840|53.920|
+|8192|1861.490|1830.280|1361.120|1433.570|89.728|116.032|
+|20480|3809.090|3821.730|3233.410|3386.850|137.440|212.800|
+
+64个hash及同shape pool相同。反向FS→FR3的8K wall1823.610/1864.500、
+20K3834.430/3814.970us；main1430.270/1362.180、3396.100/3232.960us，
+32个hash一致。8K wall两次改善1.68%/2.19%，20K两次反而慢0.33%/0.51%，
+融合后的规划阶段也更长，不将其笼统称为训练加速。日志
+`fused_training_plan_{fr3,fs}_remote_ep8_t*_training_forward.log`及
+`fused_training_plan_reverse_{fs,fr3}_remote_ep8_t*_training_forward.log`。
+待双机同容量对照后决定，不增加长度阈值掩盖20K结果。
+
+最终双机独占且无构建，1620MHz、retained10/20、FR3→FS，同容量对照：
+
+|T/rank|B/D|FR3 wall/us|FS wall/us|FR3 main/us|FS main/us|
+|---|---|---:|---:|---:|---:|
+|8192|512/8|4109.490|4059.780|3314.750|3482.560|
+|8192|1024/4|3822.250|3807.110|2984.190|3247.230|
+|20480|512/8|8961.390|8933.330|7991.360|8345.570|
+|20480|1024/4|8295.470|8180.320|7341.220|7589.660|
+
+实际shape/world/10/20/retained已核实，128个原始hash字符串及各容量pool与FR3
+相同。网络wall下降0.31%–1.39%，但单机20K正反向均小幅变慢，因此不采用
+全拓扑规划融合，也不为这组微小差异引入长度开关。所有FS代码已撤回，冻结
+patch保留。FS library已构建（SHA256
+`57b4a805acc5f3c3a0bb888a5afccb467804d3b8bf436a10c21ee967c5b263e4`），
+但**没有执行FS Torch/sanitizer完整门禁**，准备了脚本不等于验收。没有FS
+inference正式性能数据；只有SASS相同证据及native训练hash检查。日志
+`fused_training_plan_{fr3,fs}_ep16_t*_b*_d*_training_forward.log`。
+
+### FS2：保留独立GPU规划，只消除host结果回传（采用）
+
+直接基于FR3，不含FS融合。先按Notify实际R/P完成全rank tape准备，再在同一
+stream顺序launch原来的独立planner和main，删除中间runtime D2H及host同步。
+保留原384线程输入staging及全部GPU算法；仅移动host准备边界，避免将规划
+资源/访存变化混进host同步实验。失败时仍无设备epoch/base/payload推进。
+main计时口径与FR3相同，但收益仍以wall为主。没有新的buffer、runtime knob
+或测试套件。冻结`build/static_v4_async_training_plan_fs2/`，22:55在上述双机
+计时全部结束后才开始native构建；尚无FS2正确性或性能结论。
+
+FS2 native SHA256 `20d4c0b80df703b7c917a7a1e06d845995f0863d85f5c1fc014829653d547705`。
+EP8 T512/E16/K6与EP16 T64/E32/K6各两次Backward，96个梯度hash与FR3逐rank
+一致。8种decode/prefill×local/network×inference/training main及2个独立
+planner的完整SASS均逐字节等于FR3，dump均非空。Prefill训练STACK80/408、
+REG168/SHARED2048/LOCAL0，与FR3相同。不是引用源码相似性来推断算法不变。
+随后构建集成库，并在第二节点独占测量四档EP8；计时节点无CPU构建。
+
+EP8首轮FR3→FS2，B512/D8、retained10/20、1620MHz；单位us：
+
+|T/rank|FR3 wall|FS2 wall|FR3 main|FS2 main|pool bytes/rank|
+|---|---:|---:|---:|---:|---:|
+|1|407.037|378.599|78.272|71.232|17022528|
+|64|463.149|435.704|105.984|100.672|45442880|
+|8192|1855.280|1836.860|1358.300|1354.050|313659456|
+|20480|3864.220|3794.070|3235.390|3229.890|408121664|
+
+64个hash及pool一致，实际shape/world/10/20/retained核实。四档wall下降
+6.99%/5.93%/0.99%/1.82%；main口径与FR3一致，但不把微小变化称为GEMM
+代码优化。pool不含独立tape。日志
+`async_training_plan_{fr3,fs2}_remote_ep8_t*_training_forward.log`。
+尚需反向及双机对照和集成门禁，本表不是最终采用结论。
+
+同样1620MHz/B512D8/10/20的反向FS2→FR3：8K wall1838.540/1859.180us，
+20K3791.440/3847.430us，分别降低1.11%/1.46%；main1350.460/1359.490、
+3226.530/3232.320us。32个hash和pool相同，未出现FS的20K回退。第一节点
+先构建库、后执行Torch，第二节点独占计时。日志
+`async_training_plan_reverse_{fs2,fr3}_remote_ep8_t*_training_forward.log`。
+
+FS2 library SHA256 `4c07a0cb83da6596698064b9a7eba376d902a8979cb161765c3914ae2e962e84`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+23:06 EP8完整九项检查exit0：四档训练、20K hotspot、短档OOM/retry/三个live
+tapes，inference full240/tiny152/nonring32，另有B1024/D4的8K/20K训练。
+各文件rank级PASS数量逐项核实。随后开始双机十二项完整检查，不能提前称为
+双机或sanitizer通过；现有graph检查不代表训练Backward graph支持。
+
+同阶段正式EP8 inference graph10/20/batch20：FS2四档
+101.083/135.254/1256.700/2949.580us，同期V3长文1487.820/3298.570us。
+48个hash与FR3/同期V3相同，实际shape/计数及FS2 pool不变；这是inference
+回归，代码相同、性能持平，不能记为host训练优化新增收益。日志
+`async_training_plan_final_{v3,fs2}_remote_ep8_t*_formal.log`。
+
+23:19双机十二项完整检查exit0，24份node日志的rank级PASS数量全部核实：
+四档训练、20K热点、短档OOM/retry/三个live tapes、inference full480/tiny304，
+以及B1024/D4的8K/20K训练均通过。T64/B16/D1和T2048/B512/D8热点训练的
+rank0/15 memcheck均0 errors；Forward planner/main过滤的racecheck两档均
+0 hazards/0 errors/0 warnings。memcheck PID258203/415143、260883/416092，
+racecheck259443/415524、261942/416467。不宣称完整Backward racecheck clean。
+这轮是FS2 artifact的新检查，不是复用FR3日志。部分正确性检查与FT独立候选
+的CPU预编译并行，不使用这些检查的时间值作性能数据。所有CPU构建及GPU
+检查结束后，23:20才开始FS2两机独占的最终训练/正式inference对照。
+
+双机独占、无CPU构建，1620MHz、retained10/20；每规模按表序，单位us：
+
+|T/rank|版本/B/D|main|wall|pool bytes/rank|
+|---|---|---:|---:|---:|
+|1|FR3/512/8|172.608|630.524|390711488|
+|1|FS2/512/8|168.416|626.920|390711488|
+|64|FR3/512/8|226.752|708.788|419244736|
+|64|FS2/512/8|215.360|689.455|419244736|
+|8192|V3|2922.300|3428.790|1079452608|
+|8192|FR3/512/8|3307.840|4109.420|702615744|
+|8192|FS2/512/8|3316.770|4128.670|702615744|
+|8192|FR3/1024/4|2994.370|3822.300|870256832|
+|8192|FS2/1024/4|2979.070|3814.420|870256832|
+|20480|V3|6658.910|7181.200|2167634880|
+|20480|FR3/512/8|7989.570|8938.050|819971520|
+|20480|FS2/512/8|7965.410|8926.920|819971520|
+|20480|FR3/1024/4|7345.700|8328.090|987170496|
+|20480|FS2/1024/4|7352.830|8299.000|987170496|
+
+224个原始hash字符串逐rank一致，长文与本次V3相同；实际shape/world/10/20/
+retained及同B/D pool均核实。短档wall约持平/改善2.73%，长文多数差异小于
+0.5%；8K B512的FS2 wall反而慢0.47%。不能将单机收益直接推广到网络，
+仍需默认窗口的反向对照；不丢弃不利样本。pool不含独立tape。日志
+`async_training_plan_{v3,fr3,fs2}_ep16_t*_b*_d*_training_forward.log`。
+
+同阶段正式EP16 inference graph10/20/batch20：FS2四档268.682/317.037/
+2899.510/6871.030us，同期V3长文3359.200/7103.860us。96个hash与FR3及
+同期V3相同，实际shape/计数及FS2 pool不变。与FR3持平，不记为新增收益；
+20K相对V3仍只降低3.28%，不能关闭整体性能目标。日志
+`async_training_plan_final_{v3,fs2}_ep16_t*_formal.log`。
+
+默认B512/D8的双机反向FS2→FR3，仍为两节点独占、无CPU构建、1620MHz及
+retained10/20：8K wall4093.790/4127.520us，main3302.180/3330.140us；
+20K wall8990.520/8941.950us，main8047.300/7981.920us。64个原始hash与
+本次V3逐rank一致，实际shape/计数及pool核实。8K反向改善0.82%、20K反向
+退化0.54%，与首轮的小幅变化方向相反；差值处于相互重叠的样本范围内。
+因此将网络长文结果记为持平，不认定为稳定收益，也不引入长度分支。日志
+`async_training_plan_reverse_{fs2,fr3}_ep16_t*_training_forward.log`。
+
+采用FS2：单机wall正反向均改善，移除了一次不参与分配的设备结果回传与host
+等待，且所有GPU入口指令、容量和通信协议保持不变。双机收益不作保证。
+native retained benchmark复用已经准备的tensors，不把它描述为每轮包含实际
+malloc；Torch检查另外覆盖真实tape准备、失败一致性和retry。主机generation
+仍可能增加，分配失败不推进的是设备ring epoch/base及payload，而非所有状态。
+完整Forward专项sanitizer通过不改变旧Backward racecheck的未决限制。

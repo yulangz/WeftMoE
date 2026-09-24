@@ -81,7 +81,7 @@ struct ActivationTransportPoolConfig {
   bool enable_backward_state = false;
   // Opt-in bounded static Forward workspace. Zero retains the arena path;
   // otherwise this is the source-token window size. Training uses an eager
-  // plan/allocation boundary and independent canonical checkpoint storage.
+  // Notify/allocation boundary and independent canonical checkpoint storage.
   std::uint32_t static_forward_window_tokens = 0;
   // Source-side Return/Reduce capacity, independent of destination X/S/C.
   std::uint32_t static_forward_contribution_windows = 2;
@@ -176,9 +176,9 @@ struct ForwardMegaKernelConfig {
   // must be provided together; training and the legacy split paths reject them.
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
-  // Training ring: allocate the tape after the frozen route plan, before
-  // activation traffic. The callback is rank-local; the backend agrees on
-  // allocation failure collectively. Mutually exclusive with tensors.
+  // Training ring: allocate from materialized Notify's actual rows, before
+  // physical ring planning or activation traffic. The callback is rank-local;
+  // allocation failure is agreed collectively. Mutually exclusive with tensors.
   std::function<ForwardTensorStorage()> prepare_tensors;
 };
 

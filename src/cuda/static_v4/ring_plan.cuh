@@ -154,7 +154,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           planner, w, counts, a.dispatch.route_dst_row);
   }
   // Inference overlaps input staging and counting. Training publishes only
-  // metadata here, before tape allocation. Math has no live GEMM state yet.
+  // metadata here, after tape allocation. Math has no live GEMM state yet.
   collective_scope_sync<Threads, kCollectiveJoinBarrier>();
   if constexpr (Network) {
     const auto &network = a.static_network;

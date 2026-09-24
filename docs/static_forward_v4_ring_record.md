@@ -4911,3 +4911,34 @@ EP8第二节点独占计时，第一节点构建FR3 library；EP16两节点独�
 `local_tma_x_checkpoint_final_{v3,fr3}_{remote_ep8,ep16}_t*_formal.log`。
 Inference与FO持平，不记为FR3新增收益；双机20K耗时仅比V3低3.15%，
 显著领先目标及整体训练性能目标均仍开放。
+
+### FS2：训练准备边界简化，inference回归
+
+Notify已提供实际canonical R/P；先完成全rank tape准备，再同stream执行独立
+ring planner和main，移除中间runtime D2H及host等待。无新buffer或通信机制。
+8种main及2个planner完整SASS均逐字节等于FR3。单/双机完整集成、OOM/retry/
+live tapes、热点、B1024长文、Forward专项memcheck/racecheck均通过；本轮
+是FS2 artifact的新检查，不沿用FR3日志，也不代表完整Backward racecheck。
+FS融合规划候选因单机20K小幅回退已撤回。详细证据见
+[训练记录FS/FS2](static_forward_v4_training_record.md)。
+
+1620MHz、B512/D8、Q8/Q16/L32、graph10/20/batch20，rank-max p50（us）：
+
+|拓扑|T/rank|FS2|同期冻结V3|
+|---|---:|---:|---:|
+|单机EP8|1|101.083|未重测|
+|单机EP8|64|135.254|未重测|
+|单机EP8|8192|1256.700|1487.820|
+|单机EP8|20480|2949.580|3298.570|
+|双机EP16|1|268.682|未重测|
+|双机EP16|64|317.037|未重测|
+|双机EP16|8192|2899.510|3359.200|
+|双机EP16|20480|6871.030|7103.860|
+
+EP8第二节点独占，第一节点构建FS2库/执行Torch正确性；计时节点无CPU构建。
+EP16两节点独占，全部CPU构建及GPU正确性结束后才计时。各JSON实际shape、
+计数及pool核实，所有hash与FR3一致，长文与同期V3一致。日志
+`async_training_plan_final_{v3,fs2}_{remote_ep8,ep16}_t*_formal.log`。
+Inference持平，不记为FS2新增收益；训练单机长文wall正反向改善约1%–2%，
+双机差值方向不稳定且约±1%，记为持平。双机20K inference仅比V3低3.28%，
+整体性能目标仍未完成。
