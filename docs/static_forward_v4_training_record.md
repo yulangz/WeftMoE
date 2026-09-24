@@ -1297,3 +1297,344 @@ FP再以FO固定源码扫20K的中间窗口，按下表顺序，第二节点单�
 40个hash一致。B768近似持平且少87.6MB，继续增大到B1280/1536无收益；
 B×D并不全部相同，不称等容量对照。B768尚无完整Torch门禁，不据此自动选
 配置。日志`training_window_fp_fo_sweep_remote_ep8_b*_d*_r*.log`。
+
+FO完整双机门禁之后，两节点独占且无构建，1620MHz、retained-tape10/20，
+每规模按V3→FM→FO补测组合。FM/FO均B1024/D4：
+
+|T/rank|V3 main/us|FM main/us|FO main/us|V3 wall/us|FM wall/us|FO wall/us|
+|---|---:|---:|---:|---:|---:|---:|
+|8192|2916.670|3027.490|2980.130|3435.810|3850.650|3806.700|
+|20480|6635.900|7459.300|7348.100|7155.280|8428.500|8313.000|
+
+96个原始uint64 hash字符串相同，各版本shape/retained/10warmup/20samples
+已核对。相同窗口下FO main额外改善1.56%/1.49%，FM/FO pool完全相同；该窗口
+的容量代价仍是上文每rank约168/167MB，不能忽略。组合FO相对V3 main仍慢
+2.18%/10.73%、wall慢10.79%/16.18%。不据此关闭训练性能目标，也不更改
+inference默认B512/D8或引入训练自动阈值。日志
+`checkpoint_window_final_{v3,fm,fo}_ep16_t*_training_forward.log`。
+
+FO代码里程碑提交`dd7d817`；完整inference正式矩阵另见ring记录FO，性能与
+FM持平。FP是独立、显式的运行时容量选择，不是新增代码优化。
+
+### FQ：训练稳定物理行序（验证中，TMA前置消融）
+
+仅训练planner复用Notify的canonical `route_dst_row`。每个source window
+在共享scratch中对各expert取最小行号，以`canonical-min`代替atomic reservation
+得到稳定序号；同expert的连续token窗口在Notify稳定序列中是连续子段，重复
+expert slots也保持不同序号。生产训练不含masked routes，generic/inference
+planner保持原有行为。Destination物理行按source-rank拼接，canonical tape
+布局、Backward顺序和固定combine顺序不变。
+
+不增加GM metadata、交换量或pool；E64训练plan仅多约512B共享scratch及对齐，
+main共享内存不变。先冻结仍采用FO uint4复制的版本，隔离行序影响，再测试
+成块TMA checkpoint；此前FB仅source-major但source内部仍atomic乱序，两者
+不是同一实验。不预设收益。冻结目录
+`build/static_v4_canonical_training_plan_fq/`，native构建开始21:03。
+
+Native SHA256 `29f6138208e763156f9d1b06e6faaf0224db3145537ce8eaa31a3df6a98e7276`。
+EP8 T512/K6/B512/D8、EP16 T64/K6/B16/D1双次Backward的96个梯度hash与FO
+相同。local planner REG80→86，network planner REG107/STACK72不变；main
+训练/推理资源不变。local/network inference prefill完整SASS逐字节等于FO。
+
+两节点独占、无构建，1620MHz、B512/D8、retained-tape10/20，FO→FQ：
+
+|T/rank|FO main/us|FQ main/us|FO wall/us|FQ wall/us|
+|---|---:|---:|---:|---:|
+|8192|3324.540|3337.020|4150.280|4156.780|
+|20480|7995.620|7987.520|8987.140|9005.200|
+
+64个原始hash字符串与pool一致。单独稳定行序没有明显双机收益，保留为下一项
+TMA复制的隔离对照，不独立采用。日志
+`canonical_training_plan_{fo,fq}_ep16_t*_training_forward.log`。
+
+随后第一节点编译FR，第二节点独占补测EP8（计时节点无CPU构建），同样
+B512/D8、1620MHz、retained-tape10/20、FO→FQ：
+
+|T/rank|FO main/us|FQ main/us|FO wall/us|FQ wall/us|
+|---|---:|---:|---:|---:|
+|8192|1427.680|1376.060|1926.140|1873.990|
+|20480|3449.790|3303.490|4036.300|3884.300|
+
+32个字符串hash及pool相同。单机main改善3.62%/4.24%，wall也改善，说明
+稳定物理行序本身有可测单机收益，不能把未来组合收益全算给TMA。仍未完成
+FQ完整Torch/sanitizer，不提前采用；FR若不划算，再考虑独立验证FQ。
+日志`canonical_training_plan_{fo,fq}_remote_ep8_t*_training_forward.log`。
+
+### FR：M32连续SavedX的TMA写回（单机改善，全拓扑方案未采用）
+
+在FQ上识别物理Mblock内完整、对齐的32行段：canonical行严格递增，因此首尾
+差31即证明整段连续。复用现有`saved_x_map`为ring编码64列×32行的BF16 box，
+非ring仍用原M128 map；不新增map数组、GM段表或payload。连续段由FC1 Ntile0
+的thread0从ready A stage发TMA，每个N64 swizzle atom分别复制；其余行沿用
+FO uint4 scatter，二者不重叠。`tma_mask`在task开始计算，不在K循环扫描行号。
+
+每K迭代提交一个bulk group，WGMMA wait0后thread0等完整global completion，
+再通过首warp的`__syncwarp`交接给lane0/1的两CTA empty到达。没有新增全局/
+cluster barrier或计数器；不能只等WGMMA或TMA的SMEM read completion。当前
+ShareA由CTA0发全部A multicast，并非两CTA各发一半；warp join是显式完成交接，
+不是在原版中复现了race的结论。SavedX仍先于FC1完成发布，tape生命周期不变。
+
+CUDA12.9的[Tensor Map约束](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html)
+允许该box；[PTX swizzle布局](https://docs.nvidia.com/cuda/archive/12.8.0/parallel-thread-execution/index.html#tensor-swizzling-modes)
+的128B模式以1024B重复，M32/N64 atom偏移4096/16384B保持原有对齐。这是布局
+推导，仍须数值及sanitizer实测。先只实现M32单map以隔离效果，不预设收益；
+可能受额外寄存器、issuer开销和小TMA写回延迟影响。
+冻结`build/static_v4_tma_x_checkpoint_fr/`，21:12开始native构建；第一节点
+编译时，第二节点独占补测FQ单机性能，不在计时节点编译。
+
+Native SHA256 `816f36b325e4224b2b56e37e62c7fa2b6104c0340dd7407d56d6d95aacdcba15`。
+EP8 T512/K6/B512/D8、EP16 T64/K6/B16/D1重复Backward共96个梯度hash与FQ
+相同。local prefill training STACK72→80，network仍408；REG168/SHARED2048/
+LOCAL0不变，未新增Forward WGMMA序列化警告。两个inference prefill完整SASS
+仍与FO/FQ逐字节相同。训练SASS确认SavedX K循环有8处UTMASTG.2D及完成等待，
+随后开始独占性能对照；还没有完整Torch/sanitizer门禁，不提前采用。
+
+两节点独占、无构建、1620MHz、B512/D8、retained-tape10/20，FQ→FR：
+
+|T/rank|FQ main/us|FR main/us|FQ wall/us|FR wall/us|
+|---|---:|---:|---:|---:|
+|8192|3319.780|3321.280|4138.790|4121.440|
+|20480|8106.270|8010.780|9058.420|8982.970|
+
+64个原始hash字符串及pool相同。8K持平，20K本轮main快1.18%；但FQ20K的
+前轮为7987.520us，本轮baseline有所波动，不能只看这一轮百分比就采用。
+日志`tma_x_checkpoint_{fq,fr}_ep16_t*_training_forward.log`。
+
+本机编译FR2时，第二节点独占补测单机EP8（无计时节点CPU构建），同样
+1620MHz、B512/D8、retained-tape10/20、FQ→FR：
+
+|T/rank|FQ main/us|FR main/us|FQ wall/us|FR wall/us|
+|---|---:|---:|---:|---:|
+|8192|1377.950|1360.740|1882.920|1857.840|
+|20480|3299.680|3235.840|3891.510|3848.890|
+
+32个字符串hash及pool相同。单机main额外改善1.25%/1.93%，不能将FQ已有的
+3.6%–4.2%行序收益再记一次。日志
+`tma_x_checkpoint_{fq,fr}_remote_ep8_t*_training_forward.log`。
+
+### FR2：区分SMEM读者退休与tape写回完成（无稳定额外收益，撤回）
+
+基于冻结FR，仅分开两个完成条件。每stage用`wait_group.read 0`确认TMA不再
+读取SMEM，经同一warp join交给两CTA empty；task结束仍由issuer执行完整
+`wait_group 0`，位置在FC1 epilogue之后、现有threadfence/math join及fc1_done
+发布之前。SavedX与S/G/U独立，允许其写回与epilogue重叠；没有去掉最终全局
+完成检查，也不依赖kernel退出替代它。
+
+[PTX等待语义](https://docs.nvidia.com/cuda/archive/12.8.0/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group)
+明确区分source读取完成和destination写入可见。FR2利用该区别缩短stage的
+保守等待，仍须验证完整slot/tape生命周期，不以hash相同代替同步证明。
+源码冻结于`build/static_v4_tma_x_checkpoint_fr2/`；21:19本机开始构建，另一
+节点独占测试冻结FQ/FR单机性能。未增加buffer/map/metadata/counter。
+
+Native SHA256 `5fa5395390eef54caf8e919b07fa8c4ccbf2a13a3811585d9d566199f0ab46df`。
+EP8/EP16相同native夹具的96个梯度hash与FR/FQ一致。local training STACK80
+不变，network408→416；REG168/SHARED2048/LOCAL0不变，两种inference prefill
+SASS仍逐字节相同。SASS确认K循环的等待后不再每次CCTL.IVALL，task末尾仍有
+完整等待及invalidation。是否抵消新增live-range/stack代价，由独占对照决定。
+
+两节点独占、无构建，1620MHz、B512/D8、retained-tape10/20，FR→FR2：
+
+|T/rank|FR main/us|FR2 main/us|FR wall/us|FR2 wall/us|
+|---|---:|---:|---:|---:|
+|8192|3326.370|3318.050|4139.030|4118.160|
+|20480|8097.860|8048.770|9057.820|8995.540|
+
+64个原始hash字符串与pool相同。额外main改善0.25%/0.61%，幅度较小，尚需
+反向对照与完整门禁，不先采用。日志
+`tma_x_checkpoint_fr2{,_baseline_fr}_ep16_t*_training_forward.log`。
+
+单机EP8首轮（第二节点独占，本机并行构建FR2 library；无计时节点CPU构建），
+同样1620MHz、B512/D8、retained-tape10/20，FR→FR2：
+
+|T/rank|FR main/us|FR2 main/us|FR wall/us|FR2 wall/us|
+|---|---:|---:|---:|---:|
+|8192|1355.550|1364.700|1852.500|1861.310|
+|20480|3245.760|3229.630|3834.900|3805.120|
+
+8K main回退0.68%，20K改善0.50%，方向不一致，立即按FR2→FR反向复测。
+还不能确认分离等待比FR更好，不先采用。日志
+`tma_x_checkpoint_fr2{,_baseline_fr}_remote_ep8_t*_training_forward.log`。
+
+同一remote独占/本机FR2 library构建条件下，反向FR2→FR：
+
+|T/rank|FR2 main/us|FR main/us|FR2 wall/us|FR wall/us|
+|---|---:|---:|---:|---:|
+|8192|1354.180|1355.550|1852.290|1855.910|
+|20480|3229.700|3232.380|3811.470|3810.140|
+
+32个字符串hash及pool相同。反向8K/20K main仅差0.10%/0.08%，未证明分离
+等待有稳定额外收益；结合双机微小差异，不保留额外生命周期分支。已撤回FR2，
+恢复FR逐stage完整global wait及warp join，源码patch与冻结FR逐字节相同。
+FR2仅完成native及性能快筛，library虽已构建但没有运行完整Torch/sanitizer，
+不称其已通过完整门禁。FR2库SHA256
+`4937560a97806ccd087aeb081bc40191c608714bcf708d76ff680b6612e10c57`；相关源码/
+binary/log均保留。反向日志
+`tma_x_checkpoint_fr2_reverse_{fr2,fr}_remote_ep8_t*_training_forward.log`。
+
+### FR：完整验收与全拓扑取舍
+
+后续选择FQ+FR组合进行完整验证，尚未采用；FR library于21:33重新构建，
+另一节点独占补测FO/FR及V3训练、B512/D8与B1024/D4容量组合。
+
+完整候选库构建期间，第二节点独占、无计时节点CPU构建，1620MHz、retained-
+tape10/20；每规模按表序V3→FO512→FR512→FO1024→FR1024：
+
+|T/rank|版本/B/D|main/us|wall/us|pool bytes/rank|
+|---|---|---:|---:|---:|
+|8192|V3|1334.690|1741.160|735672000|
+|8192|FO/512/8|1435.840|1933.240|313659456|
+|8192|FR/512/8|1357.820|1856.730|313659456|
+|8192|FO/1024/4|1433.380|1957.240|481305408|
+|8192|FR/1024/4|1415.300|1974.470|481305408|
+|20480|V3|3131.620|3567.740|1820708544|
+|20480|FO/512/8|3445.310|4023.140|408121664|
+|20480|FR/512/8|3247.200|3828.970|408121664|
+|20480|FO/1024/4|3349.500|3966.290|575356480|
+|20480|FR/1024/4|3254.210|3856.210|575356480|
+
+80个字符串hash一致，actual shapes及10/20已核对。FR包含FQ行序和TMA两项，
+B512相对FO的main改善5.43%/5.75%，不能再叠加FQ/FR分项收益。FR B512仍比
+V3 main慢1.73%/3.69%，wall仍落后；B1024在当前FR单机没有额外收益且更占
+pool，维持默认B512/D8，不自动扩大窗口。这里pool不含独立tape，不将差额
+等同于全部训练内存节省。日志
+`tma_x_checkpoint_final_{v3,fo,fr}_remote_ep8_t*_b*_d*_training_forward.log`。
+
+随后第一节点执行FR完整Torch，第二节点独占反向FR→FO，B512/D8、同样1620MHz
+及10/20：8K main1357.340/1430.820、wall1854.080/1935.590us；20K main
+3230.750/3441.150、wall3816.590/4019.520us。32个hash及pool相同，反向main
+改善5.14%/6.11%，与正向方向一致。日志
+`tma_x_checkpoint_reverse_{fr,fo}_remote_ep8_t*_training_forward.log`。
+
+FR library SHA256 `936622e8b32bbbdba0f722c0947c4a35999a437525d611982e573629c1b536cc`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+源码与冻结native patch一致。EP8完整Torch九项已通过：四档训练、20K热点、
+短档OOM/retry及三个live tapes，inference完整240/tiny152/非ring32条检查，
+另外B1024/D4的8K均匀/20K热点训练各通过。双机完整检查随后启动，尚未采用。
+
+正式EP8 inference graph 10warmup/20samples/batch20、1620MHz：FR四档为
+101.000/135.282/1247.670/2953.140us，同期V3长文1488.050/3299.380us。
+32个FR hash与FO相同，shape/10/20/batch20已核实；第二节点独占计时，第一
+节点先构建库、再执行Torch正确性。Inference SASS相同，仅作回归，不记为
+新增inference收益。日志`tma_x_checkpoint_final_{v3,fr}_remote_ep8_t*_formal.log`。
+
+21:55双机完整十二项检查exit0，24份node日志的rank级PASS数量全部核对：
+四档训练及20K热点、短档OOM/retry/三个live tapes、inference完整480/tiny304，
+另有B1024/D4的8K均衡/20K热点训练。T64/B16/D1与T2048/B512/D8热点训练的
+rank0/15 memcheck各0 errors；同两档限定planner/main的Forward racecheck
+各0 hazards/0 errors/0 warnings，应用数值/graph/offload也均完成。这里graph
+是既有inference graph复用检查，不代表训练Backward支持graph或racecheck全净。
+内存日志PID181548/391066、185605/392009；race日志183553/391440、188122/392389。
+21:52负载下16张卡SM/graphics均1620MHz、memory观测3201MHz，后者未锁定。
+源码patch再次与冻结native逐字节核对一致。全部检查后才开始两机独占的正式
+inference及V3/FO/FR训练对照，不并行CPU构建或其它GPU工作。
+
+最终双机独占、无构建，1620MHz、retained-tape10/20；每规模按表序
+V3→FR512→FO512→FR1024→FO1024，刻意反向candidate→baseline：
+
+|T/rank|版本/B/D|main/us|wall/us|pool bytes/rank|
+|---|---|---:|---:|---:|
+|8192|V3|2901.150|3410.570|1079452608|
+|8192|FR/512/8|3329.310|4132.630|702615744|
+|8192|FO/512/8|3313.500|4108.800|702615744|
+|8192|FR/1024/4|3075.300|3911.600|870256832|
+|8192|FO/1024/4|2963.100|3795.660|870256832|
+|20480|V3|6660.160|7192.790|2167634880|
+|20480|FR/512/8|8059.070|9019.420|819971520|
+|20480|FO/512/8|7982.430|8930.300|819971520|
+|20480|FR/1024/4|7239.900|8201.960|987170496|
+|20480|FO/1024/4|7351.300|8327.940|987170496|
+
+160个原始hash字符串与同期V3逐rank相同，实际shape/world/10/20/retained
+均核实，FO/FR相同B/D的pool相等。B512 main反向慢0.48%/0.96%，没有稳定
+网络收益；B1024的8K慢3.79%，FR范围3028.640–3152.860us、FO范围
+2931.620–2996.060us不重叠，wall同样变慢。20K B1024则快1.52%，不能用它
+掩盖8K回退，也不据此增加长度阈值。**不采用全拓扑FQ+FR组合**，后续只在
+有稳定收益的单机specialization保留canonical/TMA，网络恢复FO。
+日志`tma_x_checkpoint_final_{v3,fo,fr}_ep16_t*_b*_d*_training_forward.log`。
+
+同一独占阶段的inference graph正式10/20/batch20：FR四档
+268.560/317.882/2899.910/6890.180us；同期V3长文3348.090/7107.340us。
+64个FR hash与FO相同，pool不变；shape及计数核实。这是未采用全拓扑FR的
+inference回归证据，不能重标为后续FR3实测。日志
+`tma_x_checkpoint_final_{v3,fr}_ep16_t*_formal.log`。
+
+### FR3：只保留单机canonical/TMA checkpoint（采用）
+
+已有`StaticLocal/Network`编译期分支选择：单机训练保持FQ稳定source顺序、
+source-major物理行及FR M32 TMA；网络恢复FO的atomic source顺序、round-robin
+物理行和uint4 SavedX。checkpoint helper的非contiguous特化不做TMA探测、
+空指针过滤或wait/warp join；网络也不创建无用的SavedX tensor map。没有新增
+运行时阈值/调参开关或另一套通信协议，pool和canonical tape布局不变。
+须验证单机计算指令等于FR、网络计算/规划等于FO，不能凭源码直觉复用结论。
+冻结`build/static_v4_local_tma_x_checkpoint_fr3/`；22:07在双机计时全部结束后
+开始native构建；后续验收结果如下。
+
+独立的FS规划融合已写出草案，但在FR网络回退确认后先完整撤回，保留unbuilt
+patch；没有FS构建、性能或验收结果。待FR3稳定后再单独实施，避免混合归因。
+
+FR3 native SHA256 `0761d1333ee43167a526af99ce1e8ec7998140bb1488770c544f0552c45c437b`。
+EP8 T512/E16/K6/B512/D8与EP16 T64/E32/K6/B16/D1各重复Backward两次，
+96个梯度hash与FR/FO逐rank相同。完整symbol SASS比较覆盖decode/prefill
+各四个local/network×inference/training entry，以及两种training planner：
+local training/plan逐字节等于FR，network training/plan逐字节等于FO，四种
+inference entry等于FO。比较文件均含实际函数指令，不以空dump作证据。
+Prefill local training STACK80、network408，inference64/392，REG168/
+SHARED2048/LOCAL0不变。
+
+本轮复用这些**完全相同代码**在FR/FO已有的专项sanitizer证据，不将旧日志重标为
+FR3新跑；另做FR3 artifact的native、EP8完整Torch及EP16四档训练、OOM/retry/
+live tapes、inference full/tiny与B1024长文集成回归。library构建与第二节点
+独占EP8正式计时并行，计时节点没有CPU构建；双机计时仍等所有构建/检查结束。
+
+FR3 library SHA256 `f0c4253e547c8a8cf78d0d4c6d9c1ade4f0ab7a2fe6295eae65bc78a92b06a7a`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+22:19 EP8完整九项Torch通过，包含四档训练、20K热点、短档OOM/retry/三个
+live tapes、inference full240/tiny152/nonring32，以及B1024的8K/20K训练。
+随后启动双机八项组件集成回归；本轮不重复字节相同kernel的sanitizer。
+
+第二节点独占计时，第一节点构建FR3 library；1620MHz、B512/D8、retained-
+tape10/20，FO→FR3：
+
+|T/rank|FO main/us|FR3 main/us|FO wall/us|FR3 wall/us|
+|---|---:|---:|---:|---:|
+|8192|1423.390|1356.190|1922.000|1852.570|
+|20480|3442.880|3234.370|4023.450|3814.580|
+
+32个字符串hash及pool完全相同；main降低4.72%/6.06%，wall降低3.61%/5.19%。
+FO8K有一个1850.110us高值，完整20samples保留，未删除该点；上述均为p50。
+pool仍313659456/408121664 bytes/rank，不含独立tape。日志
+`local_tma_x_checkpoint_{fo,fr3}_remote_ep8_t*_training_forward.log`。
+同阶段正式inference10/20/batch20：FR3四档101.075/135.166/1251.630/
+2957.950us，同期V3长文1489.390/3300.590us；48个hash及实际shape/计数
+已核对，inference持平，不算新增收益。日志
+`local_tma_x_checkpoint_final_{v3,fr3}_remote_ep8_t*_formal.log`。
+
+22:27 FR3双机八项组件集成检查exit0，16份node日志的rank级PASS数量核实：
+四档训练、20K热点、短档OOM/retry/三个live tapes、inference full480/tiny304，
+以及B1024的8K/20K训练均通过。未运行FR3新sanitizer，复用前述字节相同
+local FR/network FO代码的检查；不宣称完整Backward racecheck clean。
+全部库构建、Torch检查结束且两机GPU空闲后，才启动FO→FR3双机同容量性能
+对照及FR3正式inference回归；无并发CPU构建或其它GPU任务。
+
+双机最终同容量对照，1620MHz、retained-tape10/20，每规模依次FO512→FR3512→
+FO1024→FR31024，单位us：
+
+|T/rank|B/D|FO main|FR3 main|FO wall|FR3 wall|pool bytes/rank|
+|---|---|---:|---:|---:|---:|---:|
+|8192|512/8|3316.610|3327.460|4110.980|4122.670|702615744|
+|8192|1024/4|2991.840|2988.420|3824.130|3816.030|870256832|
+|20480|512/8|8009.280|7979.550|8972.530|8963.560|819971520|
+|20480|1024/4|7348.030|7345.540|8315.100|8320.020|987170496|
+
+128个原始hash字符串与本轮FR阶段的同期V3逐rank一致，实际shape/world/10/20/
+retained及同容量pool均已核对。网络结果持平，不将不足0.4%的差异算作收益；
+全拓扑FR在B1024/8K的3.79%回退已消除。pool不含独立tape。日志
+`local_tma_x_checkpoint_{fo,fr3}_ep16_t*_b*_d*_training_forward.log`。
+
+同阶段正式EP16 inference graph 10/20/batch20：FR3四档269.571/317.544/
+2897.900/6878.520us，同期V3长文3353.190/7102.160us。64个FR3 hash与FR
+逐rank相同，长文同时与本次V3相同；pool/注册bytes、实际shape及计数已核实。
+日志`local_tma_x_checkpoint_final_{v3,fr3}_ep16_t*_formal.log`。
+Inference仍持平，不记为本次新增收益；双机20K相对V3仅降低3.15%，不能关闭
+明显领先目标。采用FR3，拒绝通用FR及FR2；训练端到端仍落后V3，下一步独立
+检查规划launch、D2H和host同步，不把main计时范围变化误报为计算加速。

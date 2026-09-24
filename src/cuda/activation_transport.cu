@@ -4909,9 +4909,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       return;
     args.saved_x = static_cast<transport::BFloat16 *>(data.x->data);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
-    if (!training_ring && data.rows)
+    if ((!training_ring || !use_gin) && data.rows)
       args.saved_x_map = make_bf16_tma_store_map(
-          data.x->data, config.hidden_size, data.rows, "saved FC1 X");
+          data.x->data, config.hidden_size, data.rows, "saved FC1 X", 0U,
+          training_ring ? 32U : 128U);
 #endif
     args.saved_ab = static_cast<transport::BFloat16 *>(data.ab->data);
     args.checkpoint.gates = static_cast<float *>(data.gates->data);
@@ -5273,7 +5274,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             plan_launch.attrs = &cooperative;
             plan_launch.numAttrs = 1;
             plan_launch.dynamicSmemBytes = sizeof(unsigned) *
-                std::max({args.ring.source.scratch_words(),
+                std::max({args.ring.source.scratch_words(!use_gin),
                           view.sizes.owned_expert_count * args.ring.source.shape.sources,
                           12U});
             internal::throw_cuda("forward-plan",

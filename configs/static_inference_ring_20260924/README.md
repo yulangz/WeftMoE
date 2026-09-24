@@ -24,9 +24,11 @@ export WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS=8
 Return Qmax16见ET：在ES完成机制上，双机8K约快1.2%、20K约快0.4%–0.5%，
 pool少约16.7 MB/rank；训练Forward对照持平，单机计算代码不变。
 训练对接、实际容量分配和性能限制见
-[训练记录](../../docs/static_forward_v4_training_record.md) 的 M6d–M6h、FM/FO/FP。
+[训练记录](../../docs/static_forward_v4_training_record.md) 的 M6d–M6h、FM–FR3。
 FM由FC1保存SavedX，移除Pull的第二次写回；长文训练Forward有所改善，
 FO将其不变目的地址移出K循环；均不改变inference计算代码。训练专用窗口
-容量消融单独记录于FP，尚不引入自动切换；仍未达到全面领先V3的性能目标。
+容量消融单独记录于FP，尚不引入自动切换。FR3仅单机训练采用stable-source
+物理行与M32 SavedX TMA，相对FO长文main再改善约5%–6%；网络保留原布局，
+完整回归持平。仍未达到全面领先V3的性能目标。
 权重原地更新前须调用 `invalidate_inference_layer` 并重建相应 graphs；
 完整合同见[设计第 10 节](../../docs/static_forward_v4_design.md)。

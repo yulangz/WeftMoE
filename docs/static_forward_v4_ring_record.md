@@ -4876,3 +4876,38 @@ pool/注册bytes未变。V3仍是两kernel graph，ring一kernel，非纯GEMM对
 日志`checkpoint_address_final_{v3,fo}_{remote_ep8,ep16}_t*_formal.log`。
 性能与FM持平，不将相对V3的既有优势记为FO新增收益；双机20K仅快约2.9%，
 整体性能目标仍未关闭。
+
+### FR3：单机训练稳定行序与M32 checkpoint TMA
+
+只在local training复用Notify稳定ordinal生成source-major物理行，连续对齐
+M32 SavedX用TMA，其余用FO向量写回。网络保持FO原布局及向量路径，避免全
+拓扑FR的B1024/8K回退。已有stage empty和FC1完成链保护生命周期，没有新增
+GM metadata、buffer或barrier。单机相对FO训练main改善4.72%/6.06%，wall改善
+3.61%/5.19%；网络两种窗口均持平。完整实验、失败候选及验收见
+[训练记录FQ–FR3](static_forward_v4_training_record.md)。
+
+FR3的EP8/EP16主矩阵、热点、短档OOM/retry/live tapes、inference full/tiny
+及B1024长文训练集成通过；96个native梯度hash与FR/FO一致。所有decode/prefill
+计算入口及训练planner的完整SASS分别逐字节等于已验收FR或FO，专项sanitizer
+复用对应旧证据，**本轮没有新跑FR3 sanitizer**，不宣称完整Backward racecheck
+clean。冻结`build/static_v4_local_tma_x_checkpoint_fr3/`，hash见训练记录。
+
+1620MHz、B512/D8、Q8/Q16/L32、graph10/20/batch20，rank-max p50（us）：
+
+|拓扑|T/rank|FR3|同期冻结V3|
+|---|---:|---:|---:|
+|单机EP8|1|101.075|未重测|
+|单机EP8|64|135.166|未重测|
+|单机EP8|8192|1251.630|1489.390|
+|单机EP8|20480|2957.950|3300.590|
+|双机EP16|1|269.571|未重测|
+|双机EP16|64|317.544|未重测|
+|双机EP16|8192|2897.900|3353.190|
+|双机EP16|20480|6878.520|7102.160|
+
+EP8第二节点独占计时，第一节点构建FR3 library；EP16两节点独占且无CPU构建。
+全部实际shape、world及计数核实，96个FR3 hash与FR相同，长文同时与同期V3
+相同；pool/注册容量不变。日志
+`local_tma_x_checkpoint_final_{v3,fr3}_{remote_ep8,ep16}_t*_formal.log`。
+Inference与FO持平，不记为FR3新增收益；双机20K耗时仅比V3低3.15%，
+显著领先目标及整体训练性能目标均仍开放。

@@ -229,8 +229,9 @@ struct SourcePlanView {
   WEFTMOE_STATIC_PLAN_HD std::uint64_t window_capacity() const {
     return std::uint64_t(shape.tokens) * shape.top_k;
   }
-  WEFTMOE_STATIC_PLAN_HD unsigned scratch_words() const {
-    return experts + nodes;
+  WEFTMOE_STATIC_PLAN_HD unsigned scratch_words(bool canonical = false) const {
+    const auto counts = experts + nodes;
+    return canonical ? ((counts + 1U) & ~1U) + 2U * experts : counts;
   }
 };
 

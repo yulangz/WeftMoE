@@ -110,6 +110,7 @@ template <bool Network, bool Training = false>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
   constexpr unsigned Math = 256U, SourceThreads = 128U, Threads = 384U;
+  constexpr bool Canonical = Training && !Network;
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -149,8 +150,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
          w += gridDim.x)
       static_forward::build_source_window<SourceThreads, Math,
-                                          kCollectiveScopeBarrier>(planner, w,
-                                                                    counts);
+                                          kCollectiveScopeBarrier, Canonical>(
+          planner, w, counts, a.dispatch.route_dst_row);
   }
   // Inference overlaps input staging and counting. Training publishes only
   // metadata here, before tape allocation. Math has no live GEMM state yet.
@@ -356,7 +357,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                           local_window * p.window_capacity();
       const auto *gates = source_metadata(a, source, r.source_gates);
       for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
-        const auto row = geometry.expert_row(0U, source, ordinal);
+        const auto row = geometry.expert_row<Canonical>(0U, source, ordinal);
         const auto route =
             order[source_prefix[a.rank * owned + expert] + ordinal];
         void *output;

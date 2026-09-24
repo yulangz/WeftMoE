@@ -11,12 +11,15 @@ __device__ __forceinline__ void source_plan_sync() {
 }
 
 // Called by a fixed CTA/control group for each of its source token windows.
-// Physical reservation order is immutable before packet enumeration, not
-// deterministic. Training carries Notify's canonical row mapping separately.
-template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U>
+// The default freezes atomic reservation order. The canonical specialization
+// reuses Notify's stable expert/source ordinals: a contiguous token window
+// selects a contiguous subsequence of each expert, with no masked rows.
+template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U,
+          bool Canonical = false>
 __device__ void build_source_window(const SourcePlanView &a,
                                     std::uint64_t local_window,
-                                    unsigned *scratch) {
+                                    unsigned *scratch,
+                                    const std::uint64_t *canonical_rows = nullptr) {
   const auto tid = threadIdx.x - BaseThread;
   const auto begin = local_window * a.shape.tokens;
   const auto remaining = a.tokens - begin;
@@ -32,6 +35,13 @@ __device__ void build_source_window(const SourcePlanView &a,
 
   for (auto index = tid; index < a.scratch_words(); index += Threads)
     scratch[index] = 0U;
+  unsigned long long *canonical_begin = nullptr;
+  if constexpr (Canonical) {
+    canonical_begin = reinterpret_cast<unsigned long long *>(
+        scratch + ((a.scratch_words() + 1U) & ~1U));
+    for (auto expert = tid; expert < a.experts; expert += Threads)
+      canonical_begin[expert] = ~0ULL;
+  }
   source_plan_sync<Threads, Barrier>();
 
   for (auto index = tid; index < routes; index += Threads) {
@@ -44,6 +54,9 @@ __device__ void build_source_window(const SourcePlanView &a,
       continue;
     }
     atomicAdd(scratch + expert, 1U);
+    if constexpr (Canonical)
+      atomicMin(canonical_begin + expert,
+                static_cast<unsigned long long>(canonical_rows[route]));
   }
 
   // Each token is owned by one lane. Count one X record for each actually hit
@@ -98,7 +111,12 @@ __device__ void build_source_window(const SourcePlanView &a,
     const auto expert = a.selected_experts[route];
     if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
       continue;
-    const auto position = atomicAdd(scratch + expert, 1U);
+    std::uint64_t position;
+    if constexpr (Canonical)
+      position = expert_prefix[expert] + canonical_rows[route] -
+                 canonical_begin[expert];
+    else
+      position = atomicAdd(scratch + expert, 1U);
     route_order[position] = route;
   }
   for (auto token = tid; token < tokens; token += Threads) {

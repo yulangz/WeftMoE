@@ -14,13 +14,21 @@ struct WindowGeometryView {
   std::uint64_t *mblock_prefix; // [owned_experts + 1]
   WindowMblock *mblocks;        // [shape.max_mblocks(owned_experts)]
 
-  // Inverse of source-rank round-robin enumeration. At layer ordinal, all
-  // sources with that many rows have one entry, ordered by source rank.
+  // Canonical training concatenates stable source spans for checkpoint runs.
+  // The default keeps source-rank round-robin: at layer ordinal, each source
+  // with that many rows has one entry, ordered by source rank.
+  template <bool Canonical = false>
   __device__ std::uint64_t expert_row(unsigned expert, unsigned source,
                                       unsigned ordinal) const {
     const auto sources = shape.source_end(window) - shape.source_begin(window);
     const auto local_source = source - shape.source_begin(window);
     const auto *counts = source_counts + std::uint64_t(expert) * shape.sources;
+    if constexpr (Canonical) {
+      std::uint64_t row = ordinal;
+      for (unsigned s = 0U; s < local_source; ++s)
+        row += counts[s];
+      return row;
+    }
     std::uint64_t row = 0U;
     for (unsigned s = 0; s < sources; ++s) {
       row += counts[s] < ordinal ? counts[s] : ordinal;

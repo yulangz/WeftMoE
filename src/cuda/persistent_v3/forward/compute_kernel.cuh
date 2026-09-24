@@ -1089,7 +1089,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           const auto n = n_tile * Fc1TileN;
           if constexpr (StaticSchedule) {
             using Fc1TileMma = typename hopper::BF16MMASelector<Fc1TileN>::type;
-            StaticV4XCheckpoint<TileK> x_checkpoint;
+            StaticV4XCheckpoint<TileK, StaticLocal> x_checkpoint;
             if constexpr (RetainBackwardState && RingSchedule)
               if (n_tile == 0U)
                 x_checkpoint.prepare(a, mblock, valid_rows);
@@ -1134,8 +1134,12 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               if constexpr (RetainBackwardState && RingSchedule)
                 if (n_tile == 0U)
                   x_checkpoint.save(smem_a + stage * kAStageElements,
-                                    valid_rows, iteration * TileK, a.hidden);
+                                    valid_rows, iteration * TileK, a.hidden,
+                                    a.saved_x_map);
               cute::warpgroup_wait<0>();
+              if constexpr (RetainBackwardState && RingSchedule)
+                if (n_tile == 0U)
+                  x_checkpoint.finish();
               const auto lane = threadIdx.x & 31U;
               if (lane < 2U)
                 fc1_empty[stage].arrive(lane);

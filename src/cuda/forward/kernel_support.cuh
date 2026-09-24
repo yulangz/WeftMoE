@@ -152,7 +152,8 @@ CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
                                     std::uint64_t row_stride_bytes = 0ULL,
                                     std::uint32_t box_rows = 128U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
-      outer > UINT32_MAX || (box_rows != 64U && box_rows != 128U))
+      outer > UINT32_MAX ||
+      (box_rows != 32U && box_rows != 64U && box_rows != 128U))
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "forward-tma-store-map", field, 0,
                     "nonzero uint32 dimensions and valid base", "invalid");

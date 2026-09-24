@@ -61,6 +61,13 @@ FM随后把SavedX复制从Pull第二次S2G移至FC1 Ntile0的ready A stage，沿
 FO进一步将每task不变的SavedX目的指针移出K循环，沿用同一复制及释放链；
 完整EP8/EP16门禁通过，单机20K训练main正反向约快2.8%–3.0%，双机收益更小
 且有波动。Inference SASS不变；窗口容量独立消融见训练记录FP，未改默认配置。
+FR3进一步仅对**单机训练**采用稳定source行序及M32 SavedX TMA；网络保留
+FO的round-robin物理行序和向量写回。单机训练main相对FO改善4.72%/6.06%
+（8K/20K），pool不变；全拓扑FQ+FR曾使双机B1024/8K退化3.79%，因此没有
+保留网络分支。FR3单/双机集成门禁通过，decode/prefill全部入口及planner均与
+对应已验证组件逐字节相同，专项sanitizer明确复用旧证据；双机最终训练及
+inference性能回归持平。当前checkpoint合同见第5节，实验分项及撤回理由见
+训练记录FQ–FR3；训练端到端与双机20K inference显著领先目标仍未完成。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -140,9 +147,11 @@ V3 是同日冻结对照，不是最后一轮 prefill 改动的交错重测。�
 router weight 和有效位。重复 expert 的不同 top-k slot 仍是两条 route；只有
 X 的网络传输可去重，不能去重掉 contribution。
 
-plan 给出 source ordinal、destination logical Mblock/row、source contribution
-位置及固定 combine order。canonical 行可沿用 source-rank round-robin；training
-必须固定该顺序并保存，不在 Backward 重做原子分配来猜行号。
+plan 给出 source ordinal、destination physical Mblock/row、source contribution
+位置及固定 combine order。物理行序与训练tape的canonical行号分开：inference
+及network training保持source-rank round-robin；local training可使用稳定的
+source-major物理行以改善checkpoint写回。tape仍沿用Notify冻结的expert/source
+逻辑行号，不在Backward重做原子分配来猜行号。
 
 最终 FP32 combine 保持现有 `(expert, topk_slot)` 固定顺序，不改成到达顺序，
 也不能擅自换成单纯 top-k slot 顺序。router weight 在 SwiGLU 阶段使用。
@@ -411,15 +420,28 @@ l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftM
 混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
 
 当前training的Pull只完成物理X写入及canonical identity/gate保存后发布X full。
-FM由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX；
-每个math warp先完成其uint4读取/写出及WGMMA wait0，再向两个CTA的stage
-empty到达，不能提前覆盖该共享stage。SavedX写入也先于本tile的FC1完成发布，
-因此已有F1释放链已包含checkpoint owner，不需要增加独立读者计数。
-FO在Ntile0进入K循环前缓存线程私有的目的指针，canonical行映射在整个task
-内不可变；无新增共享状态，valid-row及hidden-tail边界检查保持不变。
+FM由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX。
+Network沿用FO：进入K循环前缓存目的指针，math warp先完成uint4复制及WGMMA
+wait0，再向两个CTA的stage empty到达；不会在仍有stage读者时覆盖它。
+
+FR3的local training物理Mblock属于单个expert，且canonical行严格递增。
+对齐的M32 chunk若完全有效，且末行等于首行+31，就能证明整个chunk连续。
+使用现有`SavedX`描述符的`{64,32}` box写这些chunk，其余行仍由FO的uint4
+路径写入；两种写入互斥。K128 stage中的两个N64 swizzle atoms按M128分隔，
+第`chunk`段、第`atom`块的BF16元素偏移为`atom*128*64 + chunk*32*64`，
+不能把它误当成普通row-major K128。无需额外tensor-map数组、GM目录或计数。
+
+TMA在A-ready acquire及WGMMA commit后发出，每stage提交一个bulk group。
+WGMMA wait0退休矩阵读者；TMA issuer再等待**完整global completion**，随后
+第一warp执行join，才让lane0/1分别向两个CTA的empty到达。当前A由CTA0
+multicast；该显式join不依赖隐式warp收敛，也没有新增跨CTA barrier对象。
+不采用仅`.read`等待或将完整完成推迟到task末尾的FR2候选。
+SavedX完成仍先于本tile的FC1发布，因此已有F1释放链涵盖checkpoint owner，
+不需要独立读者计数。映射在整个task内不可变，valid-row及hidden-tail检查保留。
+
 FC1在相应S slice ready前完成saved-G/U写回。SavedX/G/U属于独立tape，不随
 ring slot回收；Backward在Forward完成后才读取。若以后引入独立checkpoint
-reader或异步store，必须重新纳入相应stage/slot释放条件。
+reader或其它异步store，必须重新纳入相应stage/slot释放条件。
 
 各 cluster 在准入窗口内静态枚举自己的 FC1/FC2 residue，不引入全局 FC1→FC2
 barrier；某 block 的全部 S 就绪即可开始 FC2。窗口容量/进度约束见第 2.3 节。
@@ -910,9 +932,11 @@ Backward 的 canonical row。G/U 可保存标准逻辑布局，使 Backward 不�
 
 M6对接优先复用materialized Notify已有的`route_dst_row`：它由expert base、
 前序source计数与stable local_offset构成，可直接作为compact tape行号。
-训练plan冻结并传递此映射，物理ring的route_order仍可采用现有枚举顺序；
-保存时映射到canonical row，Backward按原canonical顺序归约。无需仅为tape
-确定性再实现一套物理行排序。Notify及ring窗口规划均属于main之前的plan阶段，
+训练plan冻结并传递此映射，保存时映射到canonical row，Backward按原canonical
+顺序归约。FR3的local training复用Notify的stable ordinal，在连续token window
+内减去该expert最小ordinal形成连续source序列，再按source rank拼接物理行；
+目的是使SavedX能成块写回，不是Backward确定性的必要条件。Network继续原有
+物理枚举。Notify及ring窗口规划均属于main之前的plan阶段，
 不能在main里再次执行。M6d/M6e已在单机及多机实现并验证该映射及两层plan边界，
 不能将两层规划称为一遍planner。训练入口拒绝可变fused/replay-counts Notify。
 
@@ -1120,6 +1144,11 @@ materialized Notify随已有status下载保存逐专家M128取整后的总行数
 - [x] SavedX复用FC1已就绪A stage（FM）：移除Pull第二次S2G，不改变canonical
   tape及Backward；单/双机数值、热点复用和Forward专项sanitizer通过，20K
   训练main改善约2.8%/3.1%–3.6%，整体训练性能目标仍未关闭。
+- [x] SavedX地址外提（FO）及单机stable-source/M32 TMA（FR3）：保持网络原布局，
+  FR3相对FO单机8K/20K训练main再改善4.72%/6.06%，wall改善3.61%/5.19%；
+  单/双机集成门禁通过，专项sanitizer复用逐字节相同组件的已有证据。
+- [ ] 独立消融训练物理规划合入main：保留Notify、实际tape分配与全rank失败
+  一致性边界；以wall衡量收益，说明main计时范围变化。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 
