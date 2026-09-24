@@ -3814,3 +3814,20 @@ SHARED2048、LOCAL0，相比基线各增加16B stack。撤回唯一源码改动�
 数值/sanitizer或正式计时。冻结`build/static_v4_pull_lookahead_eg/`与patch/resources，
 native SHA256 `51623c0c4eeeed78274a9b1b0a6755ee79331ecaa92055dc3455cd0ed3bac142`；
 日志`pull_lookahead_eg_ep16_t{8192,20480}_quick.log`。
+
+### EH：仅缩减RX/ACK owner至8（显著退化，撤回）
+
+M6f/DS上保持Dispatch/Return各32个发送owner、100个Pull warp及32个Return
+ready发布owner；仅RX import/ACK从32减至8个独占owner，每人处理固定channel
+余数，释放的24个warp转给Reduce。contexts96→72，metadata阶段随之采用72个
+可用context。逐slot ready/consumed/ACK、本地NIC completion及所有payload
+容量不变；未引入共享context锁，也不同于DI/DJ同时减少所有角色的实验。
+
+1620MHz、EP16/B512/D8/T20480、10warmup/2samples/batch2，无并发构建或GPU
+任务，p50 **11608.500us**（11608.500–11615.000），plan rank-max428.896us。
+16 hashes和全部pool bytes与M6f一致，但端到端严重退化；该角色配额不采用，
+未继续四规模/正式计时/完整数值/sanitizer。全部四文件改动已撤回。
+网络prefill/decode REG168/STACK440/448/SHARED2048/LOCAL0。
+冻结`build/static_v4_receive_owners8_eh/`，native SHA256
+`e176a0dd746efb105760d0134f3b8e2cb09ae26f6b8d95aee476c53cfc628210`；
+日志`receive_owners8_eh_ep16_t20480_quick.log`。
