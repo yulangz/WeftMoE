@@ -215,3 +215,85 @@ output/dX/dgate/dW1/dW2沿用原PyTorch参考校验。超出可寻址容量的�
 `collective_tensor_preparation_repro.log`。原生诊断源码仅build归档，不建立额外
 常驻测试套件。门禁证明此分配边界及当前Runtime可恢复，不代表M6训练ring完成，
 也未覆盖首次pool创建OOM或每一种NCCL/driver错误。
+
+## M6c：按实际行数分配 Backward peer payload
+
+Backward的compact dR、source contribution、source dGate不再引用Forward完整
+arena中的三个固定offset，改为execution slot拥有的独立peer workspace。
+每rank的payload按本次实际接收R及本地T×K分配：dR为`max(R,1)×H×BF16`，
+contribution为`T×K×H×BF16`，dGate为`T×K×FP32`，另有128-byte对齐及本地
+peer地址表。零接收rank只为有效TMA descriptor保留一行dR。scheduler、ready
+flags、compact→padded等小型metadata仍保持共同容量/offset，没有将其错误地
+改成各rank不同的scheduler几何。M6a的私有padded planes保持不变。
+
+IPC payload用独立native CUDA allocation，不导出Torch allocator子分配。每rank
+交换handle及两个plane offset，只导入实际同节点peers；设备表保存本进程导入
+地址，不能直接使用对方进程的原始CUDA指针。GIN仍经原有有界ChunkRing搬运，
+不把完整dR/Return payload注册成额外跨机arena。
+
+同一immutable Notify generation重复Backward直接复用已准备的workspace。
+新generation即使本地shape相同也交换descriptor，因为peer可能换buffer；只有
+实际R及T×K相同才复用本地allocation，不按历史最大R缓存。换buffer的顺序为：
+
+1. M6b一致失败边界内分配candidate，所有rank成功后交换descriptor。
+2. 关闭变更peer的旧mapping，再打开新mapping；对import结果做一致检查。
+3. 所有rank成功意味着旧mapping已关闭，此时才释放旧exported buffer，发布
+   本地设备地址表，然后同stream进入Backward。
+4. import失败时全部rank关闭所有mapping，再汇合后释放candidate/旧buffer；
+   不保留能被下一次调用误认为有效的generation缓存。
+
+这是host preparation，不是每packet数据面barrier。发生resize时会短暂同时持有
+旧buffer和candidate；不是只有新shape大小的峰值承诺。当前测试没有注入IPC
+import故障，已有OOM注入仍针对Runtime tensor preparation；不声称任意IPC/NCCL
+错误可恢复。训练CUDA Graph不是本次验收范围，记录中的graph门禁是inference。
+
+冻结`build/static_v4_training_peer_payload_m6c/`，沿用冻结V3生成profile及
+`-lineinfo`。native SHA256
+`a39dd60d8fae0e6111c4c5adb8182fc4132783f326fe7ed4eca451186812d903`，library
+`099fc7e504a670f894cfb6f6e4ed142ee85564dee5dc0366414305917738bd5d`，extension
+`910296a012e59ac88e8b1dfa4e72a19fbe6a38d4fef7e9f6bd2b822f6a6e0cdf`。
+最终只有删除一处未验收graph描述的comment改动。Backward GIN/local资源保持
+REG168、STACK208/40、SHARED2048、LOCAL0、CONSTANT3200，没有改变GEMM流程。
+
+- host原18/18通过；单机EP8 T64/E16/K6原生两次输出一致。
+- EP16 T64/E32/K6两次重复输出通过，64个梯度hash与cluster-exit冻结基线一致
+  （该基线已与冻结V3逐位核对，本次没有重跑V3）。调用方allocator另跑12轮、
+  warmup10轮，12次重复校验及缓存warmup后无新tensor allocation检查通过。
+- EP8、EP16 Torch T64/E64/K4/max_rows4096分别通过8/16 ranks的输出、dX、
+  dgate、dW1、dW2参考校验、单rank OOM一致失败及tape重试、inference graph/offload。
+- 原Torch入口增加可选`TEST_PEER_PAYLOAD_REUSE=1`，复用同一参考计算函数，
+  不新建测试套件。保留三个tape后按顺序反传：T64热点首rank→T16热点末rank→
+  T64热点首rank。全部五项数值、Notify lease逐个释放、第三次pool用量等于
+  第一次通过；EP8/EP16分别24/48个reuse标记。
+- 原生EP16全流程memcheck只插桩rank1/9，两份报告均0errors，launcher0。
+- Torch热点迁移另对rank0/15的`unified_backward_kernel`做memcheck，两份报告
+  均0errors、两端launcher0；48个reuse标记及后续inference graph/offload全部
+  通过。此项检查实际覆盖resize后的大R热点，不只是原生fixture的固定shape。
+
+附加Torch memcheck首轮在训练结束后停顿：native栈显示非插桩rank正在
+`ncclCommFinalize`，插桩rank已进入下一个Runtime的PyTorch `all_gather_object`。
+该轮被显式终止，没有最终sanitizer summary，不计通过。测试原先仅`del runtime`，
+现在在训练→inference阶段边界使用已有collective `runtime.close()`，不依赖
+各rank恰好同时触发Python/C++析构；未修改算子数据面。相同条件重跑正常结束，
+报告local195972/remote231758。保留首轮日志、rank0/1 native stack及重跑的
+`torch_ep16_t64_close_memcheck_{0,1}.log`，不将停顿归因为已证实的工具误报。
+
+EP16热点迁移的`compute_bytes`实测如下（含固定Forward arena，不含GIN及tape）：
+
+|rank|T64热点rank0|T16热点rank15|T64热点rank0|
+|---|---:|---:|---:|
+|0|47,556,152|29,995,832|47,556,152|
+|15|30,783,032|34,186,040|30,783,032|
+
+**这一步不是总显存优化完成。** V3 Forward仍使用并保留原完整X/S/output及
+contribution。当前实际-sized Backward payload与之并存，只删除了原pool dGate
+plane；原生EP16均匀fixture的总pool由360,114,880升至363,262,272 bytes/rank。
+`pool.usage()`计入新增payload和descriptor exchange；CLI旧`workspace_bytes`仍
+仅表示固定compute arena，不能单独用于比较总空间。下一步training ring接通后
+才能删除不再需要的Forward完整payload。本次不报告inference加速或训练性能收益。
+
+日志统一前缀`training_peer_payload_m6c_`：`backward_ep8_t64.log`、
+`backward_ep16_t64{,_allocator,_memcheck}.log`、`torch_ep8_t64_reuse.log`、
+`torch_ep16_t64_reuse_{0,1}.log`；冻结目录含source patch与sanitizer wrapper。
+M6的StableTape/window plan、checkpoint生命周期及Backward GIN window adapter
+仍未完成，训练继续走V3。

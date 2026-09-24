@@ -530,11 +530,10 @@ struct Layout {
   std::size_t forward_training_output = 0;
   // Backward reads caller-owned X/A/B. Its scratch directory pads every expert
   // independently to 128 rows, so mutable padded tensors use a capacity larger
-  // than compact Forward storage by at most 127 rows per owned expert. The dead
-  // compact Forward output plane is reused for dR. dX remains disjoint so its
-  // M-blocks may return while dW2 still consumes dR.
+  // than compact Forward storage by at most 127 rows per owned expert. Compact
+  // dR and source Return payloads have independent rank-local allocations.
+  // dX remains disjoint so its M-blocks may return while dW2 still consumes dR.
   std::uint64_t backward_padded_capacity_rows = 0;
-  std::size_t backward_dgate_output = 0;
   std::size_t backward_setup_epoch = 0;
   std::size_t backward_dispatch_ready = 0;
   std::size_t backward_return_ready = 0;
@@ -1152,8 +1151,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                         "transport-pool-query", "Backward padded directory", 0,
                         "uint32 row indices", std::to_string(layout.backward_padded_capacity_rows));
-      layout.backward_dgate_output = append(
-          cursor, routes, sizeof(float), "backward source dGate");
       layout.backward_setup_epoch = append(
           cursor, config.max_world_size, sizeof(std::uint64_t),
           "backward setup epochs");
@@ -1331,6 +1328,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
 
 enum class SlotState : std::uint8_t { Available, InUse, Quarantined };
 
+struct BackwardPeerWorkspace;
+
 struct PoolSlot {
   void *device = nullptr;
   void *gin_window = nullptr;
@@ -1386,9 +1385,7 @@ struct PoolSlot {
   CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};
   bool forward_maps_valid = false;
-  CUtensorMap backward_dr_map{};
-  CUtensorMap backward_dr_mn_map{};
-  bool backward_maps_valid = false;
+  std::shared_ptr<BackwardPeerWorkspace> backward_peer_workspace;
 };
 
 struct PeerMappings {

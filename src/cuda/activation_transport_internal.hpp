@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda/device_notify_internal.hpp"
+#include "cuda/backward/peer_payload.hpp"
 #include "cuda/profiling/device_timeline_types.hpp"
 #include "cuda/static_v4/plan.hpp"
 #include "cuda/static_v4/compute_ring.hpp"

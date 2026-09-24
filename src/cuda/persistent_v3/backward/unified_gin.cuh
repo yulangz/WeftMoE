@@ -125,9 +125,9 @@ __device__ __forceinline__ void receive_dispatch(const BackwardKernelArgs &a,
             const auto target =
                 reinterpret_cast<const ForwardDispatchFanoutRecord *>(
                     record + sizeof(ring::DispatchRow))[index];
-            auto *base = a.peer_bases[a.node * a.local_world_size +
-                                      target.destination_local_rank];
-            return peer_at<transport::BFloat16>(base, a.compact_dr_offset) +
+            const auto destination = a.node * a.local_world_size +
+                                     target.destination_local_rank;
+            return a.peer_payloads[destination].dr +
                    target.dst_row * a.hidden;
           });
     }
@@ -160,9 +160,8 @@ __device__ __forceinline__ void receive_return(const BackwardKernelArgs &a,
   const auto *chunk = static_cast<const char *>(a.gin_window_base) +
                       a.gin_rings.payload(task.channel, task.sequence, true) +
                       sizeof(ring::ChunkHeader);
-  auto *output =
-      peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
-  auto *dgate = peer_at<float>(a.local_base, a.dgate_output_offset);
+  auto *output = a.peer_payloads[a.rank].contribution;
+  auto *dgate = a.peer_payloads[a.rank].dgate;
   if (lane == 0U) {
     for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
       const auto *record = chunk + item * a.gin_rings.return_row_bytes;

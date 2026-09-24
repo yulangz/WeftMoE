@@ -75,10 +75,9 @@ progress_inbound_once(const BackwardKernelArgs &a, RelayInboundState &state,
       continue;
     const auto target = reinterpret_cast<const ForwardDispatchFanoutRecord *>(
         record + sizeof(ring::DispatchRow))[index];
-    auto *base = a.peer_bases[a.node * a.local_world_size +
-                              target.destination_local_rank];
-    auto *dst = peer_at<transport::BFloat16>(base, a.compact_dr_offset) +
-                target.dst_row * a.hidden;
+    const auto destination = a.node * a.local_world_size +
+                             target.destination_local_rank;
+    auto *dst = a.peer_payloads[destination].dr + target.dst_row * a.hidden;
     const auto *src = record + a.gin_rings.dispatch_row_bytes - bytes;
     if (!lane) {
       auto *smem = storage + warp * bytes;
@@ -132,9 +131,8 @@ progress_source_completion_once(const BackwardKernelArgs &a,
   const auto *chunk = static_cast<const char *>(a.gin_window_base) +
                       a.gin_rings.payload(task.channel, task.sequence, true) +
                       sizeof(ring::ChunkHeader);
-  auto *output =
-      peer_at<transport::BFloat16>(a.local_base, a.contribution_offset);
-  auto *gates = peer_at<float>(a.local_base, a.dgate_output_offset);
+  auto *output = a.peer_payloads[a.rank].contribution;
+  auto *gates = a.peer_payloads[a.rank].dgate;
   const auto warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
   for (unsigned i = warp; i < task.rows; i += blockDim.x / 32U) {
     const auto *record = chunk + i * a.gin_rings.return_row_bytes;

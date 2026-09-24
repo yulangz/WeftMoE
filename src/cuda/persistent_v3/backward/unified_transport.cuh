@@ -66,8 +66,7 @@ progress_dispatch(const BackwardKernelArgs &a, unsigned long long *words,
       const auto route = a.dispatch_waves.local_route_order[begin + item];
       const auto destination = a.dispatch.route_dst_rank[route];
       const auto token = route / a.dispatch.identity.top_k;
-      auto *target = peer_at<transport::BFloat16>(a.peer_bases[destination],
-                                                  a.compact_dr_offset);
+      auto *target = a.peer_payloads[destination].dr;
       forward_unified_transport::copy_row(
           s, warp, a.dy + token * a.hidden,
           target + a.dispatch.route_dst_row[route] * a.hidden,
@@ -144,14 +143,12 @@ progress_return(const BackwardKernelArgs &a, unsigned long long *words,
       if constexpr (UseGin)
         if (header.source_rank / a.local_world_size != a.node)
           continue;
-      auto *target = peer_at<transport::BFloat16>(
-          a.peer_bases[header.source_rank], a.contribution_offset);
+      auto *target = a.peer_payloads[header.source_rank].contribution;
       forward_unified_transport::copy_row(
           s, warp, dx + (1ULL * descriptor.padded_row + row) * a.hidden,
           target + header.route_index * a.hidden,
           unsigned(a.hidden * sizeof(transport::BFloat16)));
-      peer_at<float>(a.peer_bases[header.source_rank],
-                     a.dgate_output_offset)[header.route_index] =
+      a.peer_payloads[header.source_rank].dgate[header.route_index] =
           dgate[descriptor.padded_row + row];
     }
     forward_unified_transport::finish_copies();

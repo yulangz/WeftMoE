@@ -1008,6 +1008,11 @@ M6b补充了训练Runtime每调用tensor preparation的一致失败边界：预�
 小控制区，Forward/Backward的本地分配回调结束后只在全部rank成功时进入执行。
 EP8/EP16单rank OOM注入、partial allocation释放和Backward tape重试数值通过；
 这不是首次pool创建/失效context恢复，也没有启用training ring或完成StableTape。
+M6c进一步将Backward peer dR/contribution/dGate改为execution slot拥有的实际R、
+本地T×K sized allocation，用CUDA IPC descriptor表访问同节点peer；换buffer时
+先确认所有旧mapping已关闭，再释放旧export。三个live tapes及热点迁移的
+EP8/EP16数值和显存回缩检查通过。当前仍保留V3 Forward完整arena，新payload
+与之并存，尚不是总训练显存节省，也没有启用training ring。
 详见 [训练对接记录](static_forward_v4_training_record.md)。
 
 - [ ] StableTape plan、按实际规模分配、main_from_plan 复用同一 plan。

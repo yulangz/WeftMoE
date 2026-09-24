@@ -429,8 +429,7 @@ __global__ __launch_bounds__(
           const auto destination = a.dispatch.route_dst_rank[route];
           const auto compact_destination_row = a.dispatch.route_dst_row[route];
           const auto token = route / a.dispatch.identity.top_k;
-          auto *destination_dr = peer_at<transport::BFloat16>(
-              a.peer_bases[destination], a.compact_dr_offset);
+          auto *destination_dr = a.peer_payloads[destination].dr;
           auto *warp_storage = reinterpret_cast<std::byte *>(reservation) +
                                static_cast<std::size_t>(warp) * copy_bytes;
           auto &full = dispatch_full[warp];
@@ -555,16 +554,14 @@ __global__ __launch_bounds__(
           continue;
         const auto *source = reinterpret_cast<const uint4 *>(
             dx + static_cast<std::uint64_t>(padded_row) * a.hidden);
-        auto *destination = peer_at<transport::BFloat16>(
-            a.peer_bases[header.source_rank], a.contribution_offset);
+        auto *destination = a.peer_payloads[header.source_rank].contribution;
         auto *target = reinterpret_cast<uint4 *>(destination +
                                                  header.route_index * a.hidden);
         for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
              vector += 32ULL)
           target[vector] = source[vector];
         if (lane == 0U) {
-          auto *destination_dgate = peer_at<float>(
-              a.peer_bases[header.source_rank], a.dgate_output_offset);
+          auto *destination_dgate = a.peer_payloads[header.source_rank].dgate;
           destination_dgate[header.route_index] = dgate[padded_row];
         }
       }

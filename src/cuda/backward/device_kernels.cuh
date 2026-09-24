@@ -85,8 +85,7 @@ __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
   const auto destination = a.dispatch.route_dst_rank[route];
   const auto compact_destination_row = a.dispatch.route_dst_row[route];
   const auto token = route / a.dispatch.identity.top_k;
-  auto *destination_dr = peer_at<transport::BFloat16>(
-      a.peer_bases[destination], a.compact_dr_offset);
+  auto *destination_dr = a.peer_payloads[destination].dr;
   const auto *source = reinterpret_cast<const uint4 *>(
       a.dy + token * a.hidden);
   auto *target = reinterpret_cast<uint4 *>(
@@ -251,8 +250,7 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
   const auto header = headers[compact_row];
   const auto *dx = a.dx_rows;
   const auto *dgate = a.dgate_rows;
-  auto *source_contribution = peer_at<transport::BFloat16>(
-      a.peer_bases[header.source_rank], a.contribution_offset);
+  auto *source_contribution = a.peer_payloads[header.source_rank].contribution;
   const auto *source = reinterpret_cast<const uint4 *>(
       dx + row * a.hidden);
   auto *target = reinterpret_cast<uint4 *>(
@@ -262,8 +260,7 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
        vector += blockDim.x)
     target[vector] = source[vector];
   if (threadIdx.x == 0U) {
-    auto *source_dgate = peer_at<float>(
-        a.peer_bases[header.source_rank], a.dgate_output_offset);
+    auto *source_dgate = a.peer_payloads[header.source_rank].dgate;
     source_dgate[header.route_index] = dgate[row];
   }
   __syncthreads();
@@ -289,8 +286,7 @@ __device__ __forceinline__ void backward_reduce_dx_token(
   const auto lane = threadIdx.x & 31U;
   if (token >= a.dispatch.identity.num_tokens)
     return;
-  const auto *contribution = peer_at<const transport::BFloat16>(
-      a.local_base, a.contribution_offset);
+  const auto *contribution = a.peer_payloads[a.rank].contribution;
   auto *combined = a.dx;
   auto *ready = peer_at<unsigned long long>(a.local_base,
                                              a.return_ready_offset);

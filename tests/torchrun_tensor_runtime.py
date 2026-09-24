@@ -10,6 +10,19 @@ import torch.distributed as dist
 from weftmoe.runtime import TensorRuntime, moe
 
 
+def reference_moe(x, route, gate, w1, w2):
+    output = torch.zeros_like(x)
+    for expert in range(w1.shape[0]):
+        rows, slots = torch.where(route == expert)
+        ab = x[rows] @ w1[expert].T
+        a, b = ab.chunk(2, dim=-1)
+        u = (
+            torch.nn.functional.silu(a.float()) * b.float() * gate[rows, slots, None]
+        ).to(torch.bfloat16)
+        output.index_add_(0, rows, u @ w2[expert].T)
+    return output
+
+
 def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -115,16 +128,7 @@ def main():
         del tape
     output = moe(runtime, x, route.chunk(world)[rank].contiguous(), g, w1, w2)
     (output.float() * dy.chunk(world)[rank].float()).sum().backward()
-    reference = torch.zeros_like(all_x)
-    for e in range(experts):
-        rows, slots = torch.where(route == e)
-        ab = all_x[rows] @ all_w1[e].T
-        a, b = ab.chunk(2, dim=-1)
-        u = (
-            torch.nn.functional.silu(a.float()) * b.float() * gate[rows, slots, None]
-        ).to(torch.bfloat16)
-        y = u @ all_w2[e].T
-        reference.index_add_(0, rows, y)
+    reference = reference_moe(all_x, route, gate, all_w1, all_w2)
     (reference.float() * dy.float()).sum().backward()
     checks = dict(
         output=(output, reference.chunk(world)[rank]),
@@ -153,6 +157,45 @@ def main():
             actual.float(), expected.float(), rtol=0.02, atol=0.00002
         )
     print(rank, "TENSOR_PARITY_PASS", runtime.native.usage(), flush=True)
+    if os.environ.get("TEST_PEER_PAYLOAD_REUSE") == "1":
+        # Retain three independent tapes while the execution-slot payload grows,
+        # shrinks and changes owner. The middle invocation also has fewer source
+        # rows; empty destinations must not retain a previous hotspot's capacity.
+        tapes = []
+        cases = ((tokens, 0), (max(1, tokens // 4), experts - top_k), (tokens, 0))
+        for count, first_expert in cases:
+            case_x = all_x[:world * count]
+            case_g = gate[:world * count]
+            ids = (torch.arange(top_k, device="cuda", dtype=torch.int32)
+                   + first_expert).expand(world * count, top_k).contiguous()
+            tapes.append(runtime.forward(
+                case_x.chunk(world)[rank].contiguous(),
+                ids.chunk(world)[rank].contiguous(),
+                case_g.chunk(world)[rank].contiguous(), w1, w2))
+        assert runtime.native.usage()["notify_slots_in_use"] == len(cases)
+        for index, ((count, first_expert), tape) in enumerate(zip(cases, tapes)):
+            case_x = all_x[:world * count]
+            case_g = gate[:world * count]
+            case_dy = dy[:world * count]
+            ids = (torch.arange(top_k, device="cuda", dtype=torch.int32)
+                   + first_expert).expand(world * count, top_k).contiguous()
+            expected = reference_moe(case_x, ids, case_g, all_w1, all_w2)
+            gradients = torch.autograd.grad(
+                expected, (case_x, case_g, all_w1, all_w2), case_dy)
+            actual = (tape.output, *runtime.backward(
+                tape, case_dy.chunk(world)[rank].contiguous()))
+            for value, target in zip(actual, (expected, *gradients)):
+                torch.testing.assert_close(value.float(), target.chunk(world)[rank].float(),
+                                           rtol=0.02, atol=0.00002)
+            usage = runtime.native.usage()
+            assert usage["notify_slots_in_use"] == len(cases) - index - 1
+            if index == 0:
+                first_compute_bytes = usage["compute_bytes"]
+            elif index == 2:
+                assert usage["compute_bytes"] == first_compute_bytes
+            print(rank, "PEER_PAYLOAD_REUSE_PASS", index, usage, flush=True)
+        del tapes, tape
+    runtime.close()
     del output, runtime
     # AReaL trains across EP16 but serves with independent node-local EP4
     # engines. Allow the test to exercise those distinct process groups.
