@@ -842,6 +842,15 @@ profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一�
   share-B pairing，单独证明 GM/SMEM ring 与 epilogue staging 的安全性。
 - 已迁移的 FC1/FC2 合并写回、CTA 私有 B staging 要在两种布局下复用/验证；
   不恢复不安全的 multicast A arena epilogue 复用。
+- FC1/FC2使用不同的stage barrier，但复用同一SMEM。静态配对的两个CTA可有
+  阶段偏斜，不能只按各GEMM独立的最大容量证明安全。切换前须确认旧阶段两个
+  CTA的操作数读者都已退休；FJ2复用已有empty barrier完成这一边界，不恢复
+  动态task claim或逐tile的pair任务握手。
+- epilogue的“私有B区”必须位于**两种GEMM的最大A extent之后**。例如FC1
+  stages3、FC2 stages2时，FC2 B从64KiB开始，但FC1 multicast A可写到96KiB；
+  64KiB不能作为安全scratch起点。FJ2将scratch放在96KiB以后，允许peer在旧
+  私有epilogue执行期间进入新GEMM。原FJ失败及修正验证见ring记录，最终采用
+  仍以完整数值和端到端性能验收为准。
 
 ## 8. Prefill/training 的保存与 no-drop 合同
 

@@ -974,3 +974,41 @@ inference graph口径不同。日志`return_followup_{es,et}_ep16_t*_training_fo
 只完成GPU几何检查/racecheck和上述Forward检查，没有继续完整tape/Backward
 门禁，不能据此声明该候选的梯度已经验收。改动与测试参考已撤回，复用ET布局。
 artifact与inference消融见[ring记录FB/FC](static_forward_v4_ring_record.md)。
+
+### FJ2：三级FC1及跨GEMM共享内存退休（验证中）
+
+原FJ的空间复用漏掉cluster两CTA阶段偏斜，prefill graph在racecheck下出现
+数值错误，未采用。FJ2把FC2 scratch移到两种A extent之后，并在GEMM切换时
+用已有empty barrier等待两个CTA的旧操作数读完；不增加SMEM或计数器。
+原失败用例已通过，完整验证及机制见[ring记录FJ/FJ2](static_forward_v4_ring_record.md)。
+
+EP8和EP16 native重复Backward的96个梯度hash与ES/M6h一致；两种拓扑的
+1/64/8K/20K Torch训练矩阵已通过，20K为hotspot，短档含OOM/retry/live tapes。
+FJ2双机decode热点、prefill热点训练memcheck均0，Forward专项racecheck两轮
+通过，非ring长文也已回归；双机性能仍在测量，不声称完整Backward racecheck clean。
+
+1620MHz、10warmup/20samples、eager retained-tape，第二节点单机EP8，
+第一节点同时做Torch数值检查，计时节点独占且无编译：
+
+|T/rank|ET main/us|FJ2 main/us|ET wall/us|FJ2 wall/us|
+|---:|---:|---:|---:|---:|
+|8192|1508.160|1502.460|2006.450|1999.240|
+|20480|3635.360|3641.820|4217.450|4237.720|
+
+32个字符串Forward output hash一致。两档差异小且方向不一，只判断训练
+持平，不把inference的收益算到训练。日志
+`prefill_fc1_stage3_v2_final_{et,fj2}_remote_ep8_t*_training_forward.log`。
+
+双机独占、同频、无并发构建，正式对照补齐：
+
+|T/rank/顺序|ET main/us|FJ2 main/us|ET wall/us|FJ2 wall/us|
+|---|---:|---:|---:|---:|
+|8192，ET→FJ2|3451.040|3452.350|4259.480|4262.680|
+|20480，ET→FJ2|8282.620|8341.660|9226.900|9315.530|
+|20480，FJ2→ET|8316.960|8340.100|9263.080|9343.920|
+
+三组各32个原始hash字符串一致。8K持平，20K main两轮均回退（0.71%/0.28%），
+wall也均回退（0.96%/0.87%），不能把这次stage调整当作训练优化。
+暂不整体采用FJ2；FJ3将训练prefill FC1恢复两级，保留跨GEMM同步修正，
+与inference三级配置独立消融。日志
+`prefill_fc1_stage3_v2_{final,reverse}_{et,fj2}_ep16_t*_training_forward.log`。

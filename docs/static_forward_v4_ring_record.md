@@ -4651,3 +4651,87 @@ epilogue，较快peer可在其后继续multicast，但两个epilogue的scratch�
 decode指令不变结论不再适用于FJ2。冻结
 `build/static_v4_prefill_fc1_stage3_fj2/`，先复验失败用例，再做完整数值与
 四规模性能；未经复测不沿用FJ原有收益。
+
+FJ2库SHA256 `b9ae71fa6a7ef4d3ef873550011e0ddbddd7f4881eb0b6eab4b49ba83f4c92a1`，
+extension仍为`725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`；
+prefill四入口的REG/STACK/SHARED/LOCAL与ET相同。原失败的EP16 T2048/B512/D8
+Forward racecheck复验已通过304条数值检查，rank0/15均0 hazards，覆盖原先
+balanced-graph失败点及后续热点、复用。日志`prefill_fc1_stage3_fj2_prefill_audit_retry_*`。
+首次启动因临时脚本库路径拼接为`fj22`而在import阶段失败，没有执行算子；
+保留无retry日志，不将其计入数值测试。复验时本机同时进行native CPU编译，
+仅作正确性检查，不用于性能结论。完整矩阵和性能仍待完成。
+
+FJ2 native SHA256 `abd3ca7108283733de56b9e1d094b63d9db30dca874d8b1341ab5707e09fdb8e`。
+单机EP8 Torch训练四档通过：短档每档8 parity、16 preparation-failure、8 retry、
+24 live-tape reuse、8 graph、8 offload；8K balanced及20K hotspot每档8 parity/
+graph/offload。Inference四规模+edges 240条、tiny B16/D1 K8 152条、非ring
+8K/20K 32条检查通过。全部复用既有测试入口，没有增加单测。
+
+1620MHz、正式10warmup/20samples/batch20，第二节点独占测EP8；第一节点
+同时做Torch数值检查，无并发CPU构建。输出hash与已验收版本一致：
+
+|T/rank|FJ2/us|本轮相邻V3/us|相对V3降低|
+|---:|---:|---:|---:|
+|1|101.050|未重测|—|
+|64|135.368|未重测|—|
+|8192|1250.880|1487.410|15.90%|
+|20480|2953.440|3293.330|10.32%|
+
+日志`prefill_fc1_stage3_v2_final_{v3,fj2}_remote_ep8_t*_formal.log`。
+保留tape的EP8 eager Forward 10warmup/20samples相邻ET→FJ2：8K main
+1508.160→1502.460us、wall2006.450→1999.240us；20K main3635.360→3641.820us、
+wall4217.450→4237.720us。32个字符串output hash一致，差异小且方向不一，
+只判断训练持平，不声称训练加速。双机完整矩阵、正式性能及ET inference
+相邻对照仍待完成。
+
+随后EP8反向FJ2→ET相邻正式对照：8K 1254.230→1264.640us，改善0.82%；
+20K 2952.550→2951.360us，持平。32hashes一致。不能用修正前FJ的1.6%–2.1%
+替代修正后收益；目前FJ2单机8K有较小改善，20K无新增收益。
+日志`prefill_fc1_stage3_v2_adjacent_{fj2,et}_remote_ep8_t*_formal.log`。
+FJ2 native EP8 T512/K6/B512/D8两次Backward也通过，32梯度hash等于ES/M6h。
+
+双机native T64/K6/B16/D1两次Backward通过，64梯度hash等于ES，合计96个。
+EP16训练四档完整parity/graph/offload通过，短档每档32次预期preparation失败、
+16 retry及48 live-tape reuse；20K为热点。Inference四档+edges 480条、
+tiny B16/D1 K8 304条通过。额外T2048 prefill memcheck/racecheck分别304条
+数值检查通过，原失败用例共完成两轮Forward racecheck复验。
+
+rank0/15的sanitizer摘要：decode热点训练memcheck（PID28050/342037）、
+prefill inference memcheck（30999/343002）、prefill热点训练memcheck
+（32580/343744）均0 errors；decode热点Forward racecheck（28992/342425）、
+prefill inference第二轮racecheck（31551/343275）均0 hazards。
+racecheck仅过滤planner/Forward，不将既有Backward原子报告的未关闭事项
+说成clean。日志`prefill_fc1_stage3_fj2_torch_ep16_*`及同前缀sanitizer日志。
+
+EP16非ring 8K/20K的64条数值检查通过，整套launcher退出0。四档EP8 pool
+bytes与ET逐rank完全相同，新增同步没有增加payload或控制状态分配。
+FJ2双机正式四档及相邻ET/训练对照正在进行，未以修正前结果替代。
+
+双机正式矩阵完成，仍为1620MHz、10warmup/20samples/batch20；两节点独占，
+无并发构建或其它GPU任务。长文V3为同轮相邻重测：
+
+|T/rank|FJ2/us|本轮相邻V3/us|相对V3降低|
+|---:|---:|---:|---:|
+|1|269.517|未重测|—|
+|64|317.286|未重测|—|
+|8192|2905.500|3356.450|13.43%|
+|20480|6875.650|7098.190|3.14%|
+
+日志`prefill_fc1_stage3_v2_final_{v3,fj2}_ep16_t*_formal.log`。
+相邻ET→FJ2 inference对照：8K 2911.820→2898.280us，20K
+6893.770→6882.280us，分别改善0.47%/0.17%，不是显著新增收益。
+这四份日志的32个output hash逐rank一致，pool及注册bytes完全不变，JSON
+shape已核实。日志`prefill_fc1_stage3_v2_adjacent_{et,fj2}_ep16_t*_formal.log`。
+V3 graph包含两个kernel，ring主路径一个，以上比较是端到端，不是纯GEMM。
+
+训练8K main3451.040→3452.350us、wall4259.480→4262.680us，持平。
+20K顺序ET→FJ2 main8282.620→8341.660us、wall9226.900→9315.530us；
+反向FJ2→ET main8340.100→8316.960us、wall9343.920→9263.080us。
+两轮main均回退约0.71%/0.28%，wall回退约0.96%/0.87%。三组共96个原始
+uint64 hash按字符串比较一致；不以JSON浮点解析比较64位整数。
+保留所有结果，不用反向复测掩盖首轮。日志
+`prefill_fc1_stage3_v2_{final,reverse}_{et,fj2}_ep16_t*_training_forward.log`。
+
+FJ2完整数值门禁通过，但暂不整体采用：下一步FJ3保留同步/scratch修正，
+训练prefill的FC1恢复两级，inference保留三级，独立确认上述训练回退来自
+stage参数还是同步修正。tile/weight布局、内存分配及decode不变。
