@@ -3878,3 +3878,53 @@ lookahead源代码。没有继续library、完整Torch或sanitizer，不将快�
 正确性验收。冻结目录保留patch/resource报告，日志
 `compute_lookahead_ej_ep16_t{8192,20480}_quick.log`。这只否定此两窗探测方案，
 不能单凭一次端到端实验断言所有计算等待都无优化空间。
+
+### EK：有界在途packet下跳过底层NIC队列检查（无稳定收益，撤回）
+
+基于M6h冻结构建，仅在depth<=8、每owner/peer最多一个channel、单Put<=1MiB
+时给GIN Put传`ncclGinOptFlagsMaySkipCreditCheck`；其它情况及ACK保持原样。
+上层remote consumed、本地NIC completion、ready/acquire、payload发布均未删除。
+这是尝试减少底层SQ/CQ重复检查，不是把远端credit当成本地completion。
+安装的NCCL2.31.2 GDAKI头将该flag映射为DOCA availability-check跳过；相同映射
+可见[NVIDIA源码](https://github.com/NVIDIA/nccl/blob/v2.31.2-1/src/include/nccl_device/gin/gdaki/gin_gdaki.h)。
+跨backend的队列容量单位、CQ软件进度仍需独立证明，浅payload ring本身不是
+通用后端的完整安全证明；本轮没有把这个条件分支采用到生产。
+
+native `856f50c16a5b8060a4d1847916305d5b780989b4571c0b64b19b26f1ebacd63b`，
+冻结`build/static_v4_bounded_nic_credit_ek/`，含独立patch及M6h基线patch。
+1620MHz、EP16、B512/D8、10warmup/2samples/batch2、无并发构建/GPU任务，
+按EK→M6h→EK顺序相邻测量：
+
+|T/rank|EK首轮/us|M6h对照/us|EK复测/us|
+|---:|---:|---:|---:|
+|8192|2930.060|2945.380|2947.950|
+|20480|6958.860|6923.840|6978.220|
+
+96个输出hash均等于M6h正式矩阵。20K未获益，8K差异不稳定；全部源码已撤回，
+不增加后端特例或额外控制状态。没有继续library、完整Torch/sanitizer。
+日志`ring_bounded_nic_credit_{ek,m6h,ek_repeat}_ep16_t*_quick.log`。
+
+### EL：Return静态owner在CTA内共享context（退化，撤回）
+
+保持32个Return channel owner与原packet/slot/counter分区，每4个owner放到同一
+CTA的相邻lane，使用NCCL CTA sharing，共8个Return contexts。Dispatch/RX各32
+个线程独占contexts不变，总计72；空出的24个Return warp暂不改派角色。
+Return已由FC2直写TX，没有pack scratch供多个lane争用；预留、ready、returned
+和Put仍由各自唯一owner推进。不把旧DM/DN的跨CTA GPU sharing或DQ/DR的
+准备/发送交接开销混入这次消融。没有改上层双credit。
+
+native `6d90db1d11b16bea587652a5141943da9c8106f762fd2d18b2b5a6a7cdeaa39e`，
+冻结`build/static_v4_return_cta_contexts_el/`。网络inference prefill仍REG168/
+SHARED2048/LOCAL0，STACK从432增为472。1620MHz、EP16、B512/D8、
+10warmup/2samples/batch2、无并发构建或GPU任务：
+
+|T/rank|p50/us|样本范围/us|M6h正式参考/us|
+|---:|---:|---:|---:|
+|1|294.000|294.000–659.296|277.926|
+|64|364.768|364.768–369.232|333.410|
+|8192|4087.330|4087.330–4098.610|2956.020|
+|20480|10382.200|10382.200–10422.600|6985.870|
+
+64个输出hash与M6h一致；长序列明显退化，T1还有一次大离群值。全部五个源文件
+改动已撤回，不保留共享映射、额外分支或新常量；未继续library/完整数值/
+sanitizer门禁。日志`ring_return_cta_contexts_el_ep16_t*_quick.log`。
