@@ -958,3 +958,19 @@ rank0/15热点B16/D1的memcheck为0，限定Forward/planner的racecheck为0。
 64个原始output_hash字符串一致。训练持平，不把小幅差异报告为收益；采用Q16
 是因inference稳定小幅改善及缓冲区减少。主计算、含Notify/buffer的wall和
 inference graph口径不同。日志`return_followup_{es,et}_ep16_t*_training_forward.log`。
+
+### FB：source-major物理Mblock行序（无收益，撤回）
+
+在ET上重测expert内source连续排布；canonical Notify行号和保存接口不变，
+无额外padding。除inference快筛外，因checkpoint写回局部性可能变化，单独
+测了保留tape的训练Forward。1620MHz、无并发构建/GPU任务、10/20：
+
+|T/rank|ET main/us|FB main/us|ET wall/us|FB wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3465.760|3474.590|4258.360|4275.310|
+|20480|8328.380|8442.340|9296.990|9414.720|
+
+64个Forward原始hash相同；20K main约退化1.37%，不采用训练专用行序。
+只完成GPU几何检查/racecheck和上述Forward检查，没有继续完整tape/Backward
+门禁，不能据此声明该候选的梯度已经验收。改动与测试参考已撤回，复用ET布局。
+artifact与inference消融见[ring记录FB/FC](static_forward_v4_ring_record.md)。

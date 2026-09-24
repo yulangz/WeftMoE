@@ -4311,7 +4311,7 @@ native SHA256 `ac8200959287737967b9d0665e2b2938ce4872841ed86aa8fefc5d667ccc4457`
 保留未证明端到端收益的分支。日志`empty_channel_ex_ep16_t*_quick.log`。
 16:43负载下两机全部GPU SM/graphics1620MHz、显存3201MHz。
 
-### EY：RX先导入有界ready前缀，再扫描ACK（候选，构建中）
+### EY：RX先导入有界ready前缀，再扫描ACK（未获稳定收益，撤回）
 
 独立基于ET，网络depth8，不含EX。原receive_progress每方向每轮最多导入
 一个包，随后扫描全部slot的ACK；现每轮最多导入8个立即ready的连续包，
@@ -4325,3 +4325,107 @@ native SHA256 `ac8200959287737967b9d0665e2b2938ce4872841ed86aa8fefc5d667ccc4457`
 补充源码审查：当前NCCL2.31.2的GDAKI Put/standalone signal实现不读取
 `signal.isStrong`来区分发送路径；不对仅替换ACK Strong/Weak名称做无依据的
 性能实验。保留原strong ACK及全部system release/acquire。
+
+EY native SHA256 `7bd4f0fcc6c1b371483ee51ec23fa330c7139df9c87a39df4dd0af8c7491431b`；
+网络prefill inference STACK392不变，training STACK408→416，REG168/SHARED2048/
+LOCAL0不变。1620MHz、无并发构建/GPU任务，10/2/batch2快筛：
+1/64/8K/20K为267.408/317.376/2898.000/6904.620us，范围分别
+267.408–275.408、317.376–322.800、2898.000–2906.610、6904.620–6925.700us。
+64个hash及pool等于ET。8K略快但仍落在ET正式样本范围内，20K未改善，
+没有稳定端到端收益证据；未继续完整数值/sanitizer，源改动撤回。日志
+`rx_import_batch_ey_ep16_t*_quick.log`。
+
+### EZ/FA：在ES/ET上重测每角色共享16/8个GIN contexts（无稳定收益，撤回）
+
+复用DM/DN的固定映射，保留每角色32个静态owner，使用GPU sharing提交；
+任务不动态领取，packet/slot/双credit及contribution D8不变。新基线已删除
+每Put的本地completion通知和companion-QP提交，与旧DM/DN成本不同；但批量
+flush可能等待其它owner已预约的发送，也可能抵消收益。每channel完成prefix
+仍只由自己的owner推进，不读取或推进其它owner的cursor。
+
+EZ/FA分别使用48/24个物理contexts，普通编译默认32/role仍走THREAD独占。
+初始化显式按`channel % physical_contexts`分配VA reset，避免24contexts少于
+32workers时漏掉部分channel；Backward独立counter/slot协议不变。
+transport pool大小不变，不据此断言NCCL内部context资源没有变化。
+已有DH的64KiB链路对照（8→32及反向）是44.426/44.166 versus34.875/34.878GB/s；
+这是不含计算/消费credit、仍有逐Put counter的微基准，仅作为重测动机。
+两个候选源代码相同、编译quota不同，均不包含EY/EX/EV/EW；冻结
+`build/static_v4_shared_contexts16_ez/`和`build/static_v4_shared_contexts8_fa/`。
+两构建同时进行，结束后才串行计时，不把编译干扰带入性能数字。
+
+native SHA256：EZ `24ec00c52e2cff1d9595eb0d30a515d73a271751079b5fc009395f3f40be410a`，
+FA `8632abbcd8efcda7aee9ebe1ace6e69cee906f33931e5f3ddd65ad67d6d9a27c`。
+两者网络prefill inference/training STACK376/392（ET392/408），其余
+REG168/SHARED2048/LOCAL0不变。1620MHz、无并发构建/GPU任务，10/2/batch2：
+
+|T/rank|16ctx/role EZ p50/us|min–max/us|8ctx/role FA p50/us|min–max/us|
+|---:|---:|---:|---:|---:|
+|1|270.160|270.160–271.488|265.712|265.712–278.064|
+|64|324.288|324.288–324.880|321.936|321.936–324.128|
+|8192|2917.140|2917.140–2917.310|2900.860|2900.860–2929.020|
+|20480|6923.740|6923.740–6940.050|6926.980|6926.980–6951.860|
+
+128个输出hash与ET/ES一致，transport pool不变。仍没有优于ET的稳定端到端
+收益；微基准的context优势不能直接外推。三文件改动及临时quota宏全部撤回，
+保持96个THREAD独占contexts，不继续完整数值/sanitizer。两个artifact保留
+source patch及初始化修正，供以后有新证据时复核。日志`shared_contexts_{ez,fa}_ep16_t*_quick.log`。
+
+### FB/FC：直写Return之后重测source-major Mblock行序（无收益，撤回）
+
+早期AH在不同数据面上没有获益。当前FC2直接写Return TX后，同source的连续
+Return routes仍因source round-robin跨多个Mblock，包ready需同时等它们。
+重测`expert_row = prefix(previous sources) + source ordinal`，让同source行
+连续，期望减少每包producer依赖及每Mblock的X来源；也可能造成新的就绪偏斜，
+不预先假定改善。无额外padding、payload、plan pass、barrier或owner。
+
+只改window geometry及既有GPU几何校验的独立参考枚举。当前planner统一由
+该inverse绑定RingRow、gate、output、RouteLocation，运行时消费者不重建旧
+round-robin行号。训练checkpoint仍依据Notify canonical row，未改变Backward
+dW归约顺序，也不把不稳定的inference source ordinal称为StableTape。
+FB编译Q16（对照ET），FC编译Q32（对照ES），其余L32/B512/D8、网络depth8和
+96个独占contexts相同；同一source变更并行构建。冻结
+`build/static_v4_source_major_q16_fb/`、`build/static_v4_source_major_q32_fc/`。
+
+FB native SHA256 `17fa1fb2ef476551406e33e952f444c0931381a8fdf7c1db31fe95ee32d99e28`；
+FC native SHA256 `07e7b062c60b54709a7301190a5b0f8dec5cadae19b00bb2a80f247d192d76ab`。
+已有GPU plan检查37个source/packet+6个destination cases通过，包含不等长/空
+source和三节点partial group；同程序racecheck0 hazards/0 errors/0 warnings。
+网络prefill inference/training资源与ET/ES相同。两构建全部结束后，1620MHz、
+无并发构建/GPU任务，10/2/batch2的EP16快筛：
+
+|T/rank|FB Q16 p50/us|min–max/us|FC Q32 p50/us|min–max/us|
+|---:|---:|---:|---:|---:|
+|1|276.384|276.384–567.040|267.456|267.456–273.344|
+|64|320.560|320.560–321.568|325.072|325.072–326.912|
+|8192|2971.500|2971.500–2981.380|2988.900|2988.900–3034.960|
+|20480|7011.700|7011.700–7041.310|7010.180|7010.180–7077.060|
+
+128个输出hash与ET/ES相同；各自pool等于对应Q的round-robin基线。两个Q均未
+改善inference，不采用该inference行序。完整训练checkpoint写回的局部性可能
+不同，另做FB vs ET的8K/20K eager retained-tape对照后再决定是否保留训练用途。
+源geometry和参考枚举已恢复，测量只用冻结FB/FC binary；后续FD草稿不包含它们。
+日志`source_major_{fb,fc}_ep16_t*_quick.log`，规划器日志`source_major_fb_plan*.log`。
+
+训练Forward正式10warmup/20samples、eager保留tape、B512/D8、1620MHz，
+无并发构建/GPU任务的相邻ET→FB对照：
+
+|T/rank|ET main/us|source-major FB main/us|ET wall/us|FB wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3465.760|3474.590|4258.360|4275.310|
+|20480|8328.380|8442.340|9296.990|9414.720|
+
+64个原始Forward output_hash字符串一致。8K无收益，20K main慢约1.37%，
+不为训练保留额外行序；没有声称训练tape/Backward已完成该候选的完整验证。
+geometry与测试参考均撤回，继续共享原round-robin布局。日志
+`source_major_{et,fb}_ep16_t*_training_forward.log`。FD构建在本组计时结束后才开始。
+
+### FD：Return整包同Mblock时跳过内部重复读取（候选，未构建）
+
+EU在Q32使用通用run二分搜索，未改善20K；本项独立基于已验收ET/Q16及原
+round-robin，只处理整包同一block的情况，不含FB/FC或此前候选。先acquire
+首行的FC2完成，再比较包首尾expert及逻辑block；expert-major区间内同expert
+的逻辑block单调，首尾相同即证明所有行属于该block。未ready的首行不额外
+探测末行。若证明成立，两处原扫描的步长改为rows，退休计数也加rows；否则
+仍是原coalesced线性扫描。没有依赖目录、二分搜索、额外生命周期状态或barrier。
+比较expert+logical block，不仅比较可能回卷的物理slot。冻结
+`build/static_v4_return_single_block_fd/`；尚无性能/完整数值结论。
