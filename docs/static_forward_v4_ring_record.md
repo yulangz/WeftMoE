@@ -3928,3 +3928,53 @@ SHARED2048/LOCAL0，STACK从432增为472。1620MHz、EP16、B512/D8、
 64个输出hash与M6h一致；长序列明显退化，T1还有一次大离群值。全部五个源文件
 改动已撤回，不保留共享映射、额外分支或新常量；未继续library/完整数值/
 sanitizer门禁。日志`ring_return_cta_contexts_el_ep16_t*_quick.log`。
+
+### EM/EN：当前数据面下的宽FC1与静态ready lookahead（未证明收益，撤回）
+
+EM只把prefill FC1物理N128加宽到N256，S逻辑列宽64→128；FC2、K128、2/2
+stages、packed gate8/up8、窗口/通信及M6h checkpoint写回均不变。不是新的
+gate/up布局对照。相比早期AC/AL，这次基线已包含DS直写Return及训练适配。
+native `cb214ce085a0e0802a1ed1afc7033dc6a7fdc1b6b11f6dfaae7f1218f0a58c33`，
+冻结`build/static_v4_prefill_fc1n256_em/`；prefill inference local/network仍
+REG168、STACK64/432、SHARED2048、LOCAL0；训练为STACK72/448，arena不扩大。
+
+1620MHz，第二节点独立EP8、B512/D8、10warmup/20samples；第一节点有CPU
+构建/native正确性工作，测量节点无其它任务。inference为batch20 graph，
+training为保留tape的eager Notify→buffer→Forward，不能混为同一计时范围。
+
+|T/rank|同期M6h训练main/us|EM训练main/us|同期M6h训练wall/us|EM训练wall/us|EM inference/us|
+|---:|---:|---:|---:|---:|---:|
+|8192|1501.920|1563.840|2022.320|2089.400|1545.390|
+|20480|3629.250|3736.060|4205.590|4308.880|3486.730|
+
+同期冻结V3训练main为1337.980/3129.790us、wall为1748.060/3579.720us。
+EM训练及inference各16个输出hash与M6h相同；native EP8 T512/E16/K6/B512/D8
+两次Backward稳定，32个原始梯度hash逐字相同。仅加宽tile使训练和inference
+均退化，不采用。日志`prefill_fc1n256_{v3,m6h,em}_remote_ep8_*`及
+`prefill_fc1n256_em_native_ep8_t512.log`。尚无EM双机性能/完整数值验收。
+
+EN在EM上复用已归档EJ的两窗口非阻塞ready探测，但用于N256的单机/网络prefill。
+宽N会减少每窗口FC1 cluster数，此处检验相邻已ready窗口能否补足并行度。
+leader统一选择，仍固定全局residue，不抢他人任务、不等待未来窗口credit；
+对比EM可区分tile和调度收益。native
+`14aa253ffefb4130eb86fdf5aa46d18aed37e40f7bf91724f97b5d032a2885f6`，
+冻结`build/static_v4_prefill_n256_lookahead_en/`。同EP8计时合同下：
+
+|T/rank|EN训练main/us|EN训练wall/us|EN inference/us|
+|---:|---:|---:|---:|
+|8192|1540.770|2037.010|1323.760|
+|20480|3672.540|4248.380|3018.820|
+
+相比EM恢复了一部分并行度，但仍未优于M6h，不能仅据相对EM的改善采用。
+两种模式各16个输出hash与M6h一致。EP8 T512/E16/K6的B512/D8及B16/D1
+两次Backward稳定，各32个原始梯度hash与M6h逐字一致；后者实际进入N256
+prefill，验证lookahead不会等待D1尚不可准入的未来窗口。该native稳定检查
+不代替完整Torch/sanitizer。两候选源码均已撤回，冻结binary的双机快筛待执行。
+日志`prefill_n256_lookahead_en_{remote_ep8,native_ep8}_*`。
+
+随后两候选完成EP16 inference快筛：1620MHz、B512/D8、10warmup/2samples、
+batch2，无并发CPU构建或其它GPU工作。EM的8K/20K为2948.850/6946.830us，
+EN为2981.140/6928.830us；全部64个hash与M6h相同，pool容量不变。
+参照先前M6h正式2956.020/6985.870us，这些不足1%的差异不构成相邻正式收益，
+且EP8均未优于基线。未继续完整Torch/sanitizer或采用网络专属调度分支；
+两个源文件的全部候选改动已撤回。日志`{em,en}_ep16_t*_inference_quick.log`。

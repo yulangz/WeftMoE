@@ -840,3 +840,36 @@ prefill kernel，SASS逐字相同（56282行、确认包含两个function），�
 `af9efeb01afc1e754002d74ea42f7e57a4e653563541d16eb49e782630df4c70`；dump含
 函数名及指令，不含不同路径/调试行号。故不归因为本次训练epilogue修改，也不
 选择较快一轮替换正式矩阵。日志后缀`m6g2_inference_remote_ep8_t*_reverse_formal.log`。
+
+## EO：训练X/SavedX双lane写回（退化，撤回）
+
+在已提交M6h的N128及原调度上，复用既有
+`FanoutRowPrefetchPipeline<GroupLanes=2>`，每个Pull warp仍只发一次G2S，
+lane0写ring X、lane1写SavedX。共享两个staging slot及一个loader，复用现有
+subgroup read-completion join；不增加staging内存或新的计数协议。
+
+本地Pull的两个lane执行相同不可变行枚举，gate/identity及X credit只由lane0
+写；两lane各自full completion后再join，才发布X-ready。远端Pull同样使用
+两lane copy/drain，再经过原full-warp join发布X-ready和RX consumed。inference
+仍编译为单lane。没有改checkpoint布局、route expected、slot generation或
+双NIC credit。这是提交开销消融，尚无正确性/性能结论；不混入EM/EN的N256/
+lookahead变化。冻结目录`build/static_v4_training_dual_lane_checkpoint_eo/`。
+
+native SHA256 `1ce55d2019cf9a777104a5ed48ecfc54530b406e97c8d8cf3cc7b969e3ef09fa`。
+训练prefill local/network为REG168、STACK80/456（均比M6h增加8bytes）、
+SHARED2048、LOCAL0。EP8 T512/E16/K6的B512/D8和B16/D1各两次Backward稳定，
+共64个原始梯度hash逐字等于M6h；小ring覆盖多次复用，不代替完整数值/sanitizer。
+
+1620MHz、B512/D8、10warmup/20samples，保留tape的训练Forward如下：
+
+|拓扑|T/rank|EO main/us|M6h main/us|EO wall/us|M6h wall/us|
+|---|---:|---:|---:|---:|---:|
+|单机EP8|8192|1559.650|1501.920|2055.920|2022.320|
+|单机EP8|20480|3772.450|3629.250|4354.150|4205.590|
+|双机EP16|8192|3671.780|3488.960|4489.430|4296.780|
+|双机EP16|20480|8842.560|8318.430|9809.580|9281.240|
+
+EP8为第二节点独立测量，第一节点运行native正确性；EP16两节点无并发构建/
+其它GPU工作。M6h参照来自本日EM相邻EP8及M6h正式EP16，不冒充本轮交错复测。
+两拓扑均退化，三个源文件全部撤回，不继续library/完整Torch/sanitizer。
+日志`training_dual_lane_checkpoint_eo_{native_ep8,remote_ep8,ep16}_*`。
