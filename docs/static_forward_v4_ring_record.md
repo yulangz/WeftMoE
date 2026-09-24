@@ -3739,3 +3739,43 @@ SHA256 `9be39627bfc8c40862300a5eae71d7eed3234db38ad6b23b14e06ccab8b480f2`，
 B512/D8/Q32正式6991.460us，且增大有界buffer；不采用，也不将2样本局部
 差异当成正式性能提升。没有继续四规模、library或完整数值/sanitizer门禁。
 日志`ds_return_q{32,128}_eb_b1024_ep16_t20480_quick.log`。
+
+### EC–EE：B512实际Q128、紧凑依赖与warp发布（未证明收益，撤回）
+
+基于M6f `35d7201`，保持Dispatch Q8/L32/B512/D8/32 owners。EC将长source
+（实际tokens≥2048）的Return分包改为直接采用Qmax128，短source仍用原自适应
+规则；因此这次B512下实际为Q128，不是EB中被裁成Q64的配置。各peer仍从同一
+source epoch计算分包，不按接收端自己的token数决定。没有改变双credit。
+
+ED在EC上复用DG的紧凑依赖思想：plan末尾按Return原始route区间存放32B
+`{ready地址, C slot地址, generation, rows}`，warp内按slot分组；运行时累计rows
+到packet.rows确定结束，不新增packet count目录。跨warp batch可重复同slot，
+但逻辑行数仍精确相加。view附加于ForwardKernelArgs尾部，不改变既有字段偏移；
+增加一次plan末尾grid join，数据面无新barrier。EE再将Return RX的ready发布
+分给整warp，lane0 acquire后warp join，全部lane发布后再join并退休控制slot。
+
+1620MHz、EP16 T20480、10warmup/2samples/batch2，无并发构建或GPU任务：
+
+|候选|p50/us|min–max/us|pool bytes/rank|
+|---|---:|---:|---:|
+|EC：实际Q128|9657.420|9657.420–9889.500|981347776|
+|ED：增加紧凑依赖|6942.350|6942.350–6945.140|983969216|
+|EE：再增加warp ready发布|6952.530|6952.530–6965.200|983969216|
+
+三轮各16个输出hash均与M6f一致。ED/EE恢复了EC的严重退化，但相对M6f正式
+6991.990us的不足1%快筛差异，不能认定稳定收益。相对M6f pool 880745920，
+候选注册区增加100601856 bytes/rank，ED/EE另增加2621440 bytes普通metadata。
+为这样的小幅且未证实差异保留额外协议目录/内存不值得，全部源码撤回。
+EC host 18/18、ED GPU plan 37个source/packet及6个destination case通过；
+没有继续四规模正式计时、完整数值或sanitizer，不把hash一致称为完整验收。
+
+冻结目录分别为`build/static_v4_prefill_return_q128_ec/`、
+`build/static_v4_prefill_return_segments_ed/`、`build/static_v4_prefill_return_warp_ee/`，
+各含完整patch及资源报告。native SHA256依次为：
+
+- `d682ebba908573978f66c0eecaa6a3b266c6fa006e19276c63ad3e7a9e18c5b8`
+- `1ab1d366195ef53830367dddfeb2a06122bdad7ccef37926a76e6892ec514279`
+- `bdd878fd77085cd094610c5c5fffe194f9e35bb72c4a659456d05e8972d8219f`
+
+日志`prefill_return_{q128_ec,segments_ed,warp_ee}_ep16_t20480_quick.log`；
+ED planner日志`prefill_return_segments_ed_plan.log`。
