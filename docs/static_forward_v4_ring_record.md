@@ -4530,3 +4530,31 @@ native SHA256 `83d5896a27ef29225caee5de8474edb49212a1dca9ef0ac7bf7a0e4946cd58b3`
 数值/sanitizer；保留这一简化协议的证明与patch，若未来重用仍需完整验证。
 日志`early_c_retire_fh_ep16_t*_quick.log`及
 `early_c_retire_formal_{0..7}_{et,fh}_ep16_t*.log`。
+
+### FI：只共享RX/ACK contexts，保留全部静态owner（无收益，撤回）
+
+独立基于ET；FH及此前候选均撤回。每4个RX/ACK owner固定共享一个GPU-sharing
+context，Dispatch/Return的32+32数据contexts仍THREAD独占，全部角色的数量
+和channel residue不变。W32时总contexts96→72（32+32+8），pool布局/容量不变。
+区别于EZ/FA的所有角色共享、EH的减少RX owner：本项不让data Put/flush共享QP，
+也不减少RX轮询和ACK生成的并行owner，只检验ACK QP资源与提交串行化的取舍。
+
+每个slot的exact expected、consumed、ready、ACK generation仍只有其原owner
+推进；共享的是GIN内部提交资源，不是channel状态或动态任务。GPU sharing提供
+跨CTA的WQE预约/发布顺序；ACK仍逐slot独立发送，没有合并credit。终端会合
+需要对端TX观察全部ACK才能到达，未省略原drain。初始化仍按channel%W：
+物理contexts始终至少2W，覆盖所有reset owner。metadata按实际contexts分片，
+Backward的独立counter和contexts合同不变。适用于原固定channel residue遍历
+多个远端peer的方式，不硬编码双机。
+
+实现四文件、无新运行时开关/测试/状态字段，冻结
+`build/static_v4_shared_ack_contexts_fi/`。先构建native、长文相邻对照；有明确收益
+后再做四规模完整数值/训练/sanitizer。尚无测量或完整正确性结论。
+
+native SHA256 `2ca7c6e8a50a4eaced7c0b56c06cc6bb2ba9d02f478825ee9f893f2157138ecf`；
+网络prefill inference/training STACK400/416（ET392/408），其它资源不变。
+1620MHz、无并发构建/GPU任务、10warmup/20samples/batch20，EP16 8K/20K
+正式p50为2906.740/6919.990us，范围2900.620–2910.730/6907.370–6942.350us。
+32个hash与ET一致。对照紧邻FH末轮ET的2908.390/6902.070us，8K持平、20K
+略慢，未证明单独共享ACK QP有益。四文件已撤回，未继续短规模/完整数值/
+sanitizer；保持所有contexts独占。日志`shared_ack_contexts_fi_ep16_t*_formal.log`。
