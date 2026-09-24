@@ -4757,3 +4757,51 @@ stage参数还是同步修正。tile/weight布局、内存分配及decode不变�
 的小幅改善；不声称训练优化。训练20K观测到约0.3%–0.7%的main代价，继续作为
 未解决性能项记录。没有以性能理由撤掉必要同步，也没有增加无收益的训练专用
 调参分支。核心目标仍未完成：EP16 20K相对V3仅快约3.1%，训练Forward仍落后。
+
+### FK/FL：保留全部Return owners，分离CTA排布与context共享（无收益，撤回）
+
+在FJ2上对DH观察到的NIC context数量敏感性继续作独立验证。此前FE/FF减少
+Return owners、EZ/FA跨CTA GPU共享、EL同一warp内多lane发送均未获益；这里
+保持P个Return owners，用三个**独立warp**集中在ceil(P/3)个CTA上。
+FK只改排布，仍保留3P个THREAD-exclusive contexts；FL才把Return改为
+ceil(P/3)个CTA-sharing contexts，Dispatch/ACK各P个不变。未实测前不称收益。
+
+固定C个CTA、P个network workers（当前132/32）：Return TX有P个warp；
+剩余CTA的物理warp0/1承载C个copy owners，前P个Dispatch、其余C-P个pull。
+只有这些角色读写私有双slot staging。所有剩余warp（含Return尾CTA的空位）
+按稠密ordinal依次分给admission1、ACK P、Return RX P、local Return C-2P、
+Reduce C-P-1。各角色数量和channel/block/token residues与FJ2相同，无动态领用。
+copy pipeline改用实际warp0/1索引，删除Return路径无用途的prefetch对象。
+
+FL共享仅发生在同一物理CTA，context数量由96降至75（32+11+32）。检查了
+已安装NCCL的CTA SQ reservation、ready-prefix及doorbell实现。每个发送者
+在进入GIN前完成软件ready/credit判断，GIN内不等待FC或ring软件依赖；共享
+flush可以覆盖其它warp已预留工作，但只推进本channel的tx_completed_head
+到自己的tx_cursor，仍同时要求远端consumed credit。metadata初始化/复制
+仍在原阶段barrier之前，不与数据面共享context的调用并发。
+
+冻结候选为`build/static_v4_return_cta_packing_fk/`和
+`build/static_v4_return_cta_shared_fl/`；先快筛相邻FJ2/FK/FL，再决定是否
+值得完整门禁。没有增加长期调参开关或专用单测。
+
+native SHA256：FK
+`74eae4c152d612986a72529752184693c7cb1cabd53f87e65631fdea69139400`，FL
+`002aac16623fcccf001235b179ae4334e72aecf1091835e8728698e14009031f`。
+network prefill inference STACK为FK400/FL408（FJ2392），training均416
+（FJ2408）；REG168/SHARED2048/LOCAL0未变。两版EP16 T64/K6/B16/D1各两次
+Backward通过，各64个梯度hash与FJ2完全一致。FK数值测试与FL CPU编译并发，
+仅作正确性检查；以下计时在全部构建结束后，两节点独占、无其它GPU任务。
+
+1620MHz，10warmup/2samples/batch2快筛，单位us，括号为min–max：
+
+|T/rank|FJ2|FK：仅排布|FL：再共享Return contexts|
+|---:|---:|---:|---:|
+|8192|2889.010（2889.010–2897.460）|2897.570（2897.570–2908.500）|2914.640（2914.640–2977.330）|
+|20480|6885.470（6885.470–6914.450）|6878.430（6878.430–6919.060）|6921.150（6921.150–6940.500）|
+
+96个Forward hash逐rank相同，JSON实际shape已核实。FK20K仅0.1%的差异且范围
+重叠，不认为改善；FL没有收益。未继续正式四档或library/Torch/sanitizer完整
+门禁，不把native hash一致称为完整验收。撤回全部五个source文件改动，回到
+FJ2；保留artifact和`return_cta_grouping_{fj2,fk,fl}_ep16_t*_quick.log`。
+这次结果不支持仅改变Return CTA/context排布；未测的三类角色全CTA共享也
+不能据此称为优化。后续先转向训练checkpoint复制，而不是继续叠加排布复杂度。
