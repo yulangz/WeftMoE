@@ -4467,9 +4467,66 @@ native SHA256分别`8790e852d2081237492702481c0bbe6d7de25c61413d871846ee2e3b95ae
 日志`return_owners_{fe,ff}_ep16_t*_quick.log`。这组对照不证明API提交、元数据
 扫描和reservation各自的成本比例，仅证明当前实现不能无代价地减少Return owner。
 
-### FG：单独将prefill FC2 N256改为N128（候选，未构建）
+### FG：单独将prefill FC2 N256改为N128（退化，撤回）
 
 独立基于ET，FC1 N128、K128、stages2/2、math/control配额、通信布局和全部
 静态owner不变；仅FC2列tile变窄。相比此前扩大FC1的EM，本项测试更早完成
 单个FC2 tile与增加任务/同步次数之间的权衡。共享GEMM模板、描述符和epilogue，
 不新增协议或运行时开关；decode不变。计时仍等待FE/FF串行快筛结束再构建。
+
+冻结`build/static_v4_prefill_fc2_n128_fg/`，native SHA256
+`864e9a5515716a5a76bccd4a5717c618fa700ba609346ec6aad29ca8f409ce03`。
+1620MHz、B512/D8、10/2/batch2长文快筛：
+
+|拓扑|T/rank|p50/us|min–max/us|
+|---|---:|---:|---:|
+|单机EP8|8192|1466.910|1466.910–1473.600|
+|单机EP8|20480|3451.180|3451.180–3466.880|
+|双机EP16|8192|2985.390|2985.390–3005.570|
+|双机EP16|20480|7100.080|7100.080–7117.380|
+
+48个hash与ET一致。双机计时无并发编译/GPU任务；单机在第二节点独占运行，
+第一节点在其20K结束后开始FH CPU构建，不使用第二节点CPU/GPU。两种拓扑
+均比ET慢，不继续短规模/完整数值/sanitizer，源码已恢复prefill FC2 N256。
+该对照不能证明其它H/I或训练形状也应选择N256。日志
+`prefill_fc2_n128_fg_{ep16,remote_ep8}_t*_quick.log`。
+
+### FH：FC2发布完成后提前退休C控制，不再等Return扫描（正式无收益，撤回）
+
+独立基于ET，非BL/BM的直接跨机拓扑；FC2 N256、全部peer/owner、包划分和
+buffer容量不变。CN/CO之后FC2已直写预留TX，Return TX及NIC不再读C数据，
+但仍通过逐包returned RMW保护rail-local完成镜像的等值读取。本项把镜像定义
+为累计完成generation，TX以`published >= requested`确认此前FC2已完成。
+同一物理slot的generation随窗口/调用单调增加；未命中某rail的代不写它，
+不影响旧代完成证明。packet不跨窗口，原相邻同slot检查合并仍不会混合两代。
+
+local Return owner acquire所有FC2 N-tile完成、执行原system fence、发布本地
+route ready和每个相关rail恰好一次完成镜像，**全部lane join之后**归还该block
+完整rows的C credit。准入只能在此release之后换代，旧镜像store不能晚于新代。
+首轮保持原system-scope C退休/准入，不同时消融scope。删除TX的第二遍逐行
+C退休扫描及已无调用者的c_slot helper，净减代码，无新增计数器/缓冲区/barrier数。
+单机return的join位置在编译后逻辑不变。
+
+C提前回收不授予TX复用：整窗TX预留仍是FC2前提，TX仍等远端consumed和
+显式本地GIN completion。RouteLocation/RingRow是整次调用不可变目录，不随
+C物理slot回卷；source contribution仍等该窗口全部token Reduce后才复用。
+证明归档`build/static_v4_early_c_retire_fh/provenance.md`；首轮只构建native，
+有收益后才继续完整数值/小ring wrap/训练/sanitizer，尚未声称候选正确性已验收。
+
+native SHA256 `83d5896a27ef29225caee5de8474edb49212a1dca9ef0ac7bf7a0e4946cd58b3`；
+网络prefill inference/training REG168、STACK392/408、SHARED2048、LOCAL0，与ET
+相同。单机prefill16921条Function/指令行SHA256仍为
+`bd47119262cbb9a142a0ed189f0b7ee38bce236c4d48206cfaba2da45727feb1`。
+1620MHz、无并发构建/GPU任务，快筛8K/20K为2911.420/6944.210us，32hashes
+及pool等于ET。随后正式10warmup/20samples/batch20按每档ET→FH→FH→ET：
+
+|T/rank|首轮ET/us|首轮FH/us|反向FH/us|反向ET/us|
+|---:|---:|---:|---:|---:|
+|8192|2907.550|2911.740|2922.430|2908.390|
+|20480|6955.740|6897.260|6901.690|6902.070|
+
+128个正式hash一致。20K首轮约0.84%的差距未在反向复现，8K反而略慢，不能
+把更早C回收或更少RMW直接宣称为端到端优化。源码三文件已撤回，不继续完整
+数值/sanitizer；保留这一简化协议的证明与patch，若未来重用仍需完整验证。
+日志`early_c_retire_fh_ep16_t*_quick.log`及
+`early_c_retire_formal_{0..7}_{et,fh}_ep16_t*.log`。
