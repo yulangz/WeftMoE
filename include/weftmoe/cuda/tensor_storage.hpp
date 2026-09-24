@@ -10,6 +10,7 @@
 WEFTMOE_PUBLIC_API_BEGIN
 namespace weftmoe::cuda {
 class CudaExecution;
+class NcclSession;
 class DeviceDispatchHandle;
 class LocalCudaP2pForwardMegaKernel;
 class BackwardMegaKernel;
@@ -35,6 +36,24 @@ struct CudaTensorBuffer {
 // metadata. Allocation is performed during preparation, outside kernel timing.
 using CudaTensorAllocator =
     std::function<CudaTensorBuffer(std::uint64_t bytes)>;
+
+// Collective host-allocation boundary, outside CUDA Graph capture. Construct
+// before allocating per-call tensors; every rank then calls run in the same
+// order. The callback performs rank-local preparation, not collectives. No
+// rank may enter execution when any rank's preparation throws.
+// The small status buffer and NCCL collective are prepared once, before an
+// allocation failure could prevent creating the agreement's own resources.
+// Calls on one instance must be serialized. This does not recover a failed
+// CUDA context or a broken communicator.
+class CollectiveTensorPreparation {
+public:
+  CollectiveTensorPreparation(const NcclSession &, const CudaExecution &);
+  void run(const std::function<void()> &prepare) const;
+
+private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;
+};
 
 struct ForwardTensorBuffers {
   CudaTensorBuffer output;     // BF16 [tokens, hidden]

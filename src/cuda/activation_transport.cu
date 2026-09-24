@@ -75,6 +75,7 @@ __global__ void fill_transport_benchmark_output(transport::BFloat16 *output,
 } // namespace
 
 #include "cuda/tensor_storage.cuh"
+#include "cuda/tensor_preparation.cuh"
 
 struct ActivationTransportResourcePool::Impl {
   std::shared_ptr<ActivationPoolState> state;

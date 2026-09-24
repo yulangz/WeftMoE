@@ -168,3 +168,50 @@ acquire与relaxed读取、release写入。普通payload及DSM early-exit报告�
 16 ranks重复校验通过；日志`training_cluster_exit_backward_ep16_t64_memcheck.log`。
 保留此生命周期边界，作为M6训练衔接的同步基础修正提交，不宣称训练迁移完成或
 inference性能改善。没有为工具误报替换正确的acquire/release，也没有新增单测套件。
+
+## M6b：每调用 tensor preparation 的一致失败边界（已验证，训练ring未完成）
+
+新增独立host侧`CollectiveTensorPreparation`，在训练Runtime初始化时预分配
+两个uint32的device/host状态并预热NCCL控制collective（native device申请最小
+128bytes，pinned申请8bytes）。每次Forward/Backward的分配回调先在本rank运行，
+捕获异常后用同一个预分配状态做rank-min AllReduce。只有全部rank成功才进入
+执行；失败时所有rank在main前抛错并报告首个失败rank，发生异常的rank保留
+nested原始异常。部分完成的临时tensor沿既有RAII释放，不覆盖仍存活的tape。
+
+Forward边界覆盖输入/权重lease及packed权重准备、输出、X/G/U及路由保存；
+Backward覆盖四个输出和M6a私有中间workspace。调用者提供的tensor allocator
+也位于回调内。模块不依赖ring/Notify内部布局，后续native训练plan/实际payload
+分配可复用相同边界；现有低层`prepare_*_tensors`仍是local API，不能据此声称
+所有native调用者自动获得一致失败。Runtime的inference路径不创建或使用此模块。
+
+这是eager allocation boundary：需要host同步，不能用于CUDA Graph capture，
+也不是数据面新barrier。未处理Runtime/通信资源本身首次创建失败、失效CUDA
+context或损坏communicator；不能称为任意错误恢复。M6 StableTape/window plan、
+rank-local peer arena以及training ring仍待实现。
+
+在现有`torchrun_tensor_runtime.py`加入显式可选的
+`TEST_TENSOR_PREPARATION_FAILURE=1`：仅最后rank在Forward第三次tensor分配、
+Backward第五次分配（私有workspace）注入OOM异常；后者先由`cudaMalloc(2^63)`
+返回真实`cudaErrorMemoryAllocation`，不实际占用整机显存。检查全部rank得到错误、
+Forward失败不遗留Notify lease、Backward失败仍持有一份可重试tape；重试的
+output/dX/dgate/dW1/dW2沿用原PyTorch参考校验。超出可寻址容量的申请被拒绝，
+不等于把机器填满后的allocator碎片/压力实测；两者不混称。
+
+冻结`build/static_v4_training_tensor_preparation/`，library SHA256
+`31984df9d12257e0bf06deef968a507e85c36107bd1cd315dadf24a1cf8fdf0b`，extension
+`910296a012e59ac88e8b1dfa4e72a19fbe6a38d4fef7e9f6bd2b822f6a6e0cdf`。
+使用冻结V3生成profile、`-lineinfo`，未改训练GEMM或数据面同步。
+
+- EP8 T64/E64/K4/max_rows4096均匀：16个失败通知、8个重试数值标记、原有
+  parity/graph/offload各8项，launcher0。
+- EP16相同shape、hotspot集中到rank0（含零接收rank），错误注入rank15：
+  32个失败通知、16个重试数值标记、原有parity/graph/offload各16项，两端launcher0。
+- 原生两rank独立诊断不经PyTorch：rank1直接cudaMalloc失败，确认其last-error
+  仍为2再抛`std::bad_alloc`；两rank同报origin1，随后再次run成功，均exit0。
+  未添加全局“清除任意CUDA错误”逻辑，现用NCCL路径能够完成这项恢复。
+
+日志`training_tensor_preparation_torch_ep8_t64_failure.log`、
+`training_tensor_preparation_torch_ep16_t64_hotspot_failure_{0,1}.log`、
+`collective_tensor_preparation_repro.log`。原生诊断源码仅build归档，不建立额外
+常驻测试套件。门禁证明此分配边界及当前Runtime可恢复，不代表M6训练ring完成，
+也未覆盖首次pool创建OOM或每一种NCCL/driver错误。

@@ -133,6 +133,9 @@ class Runtime {
 #endif
     torch_ = py::module_::import("torch");
     device_ = "cuda:" + std::to_string(device);
+    if (training_)
+      tensor_preparation_ =
+          std::make_unique<CollectiveTensorPreparation>(base_, execution_);
     check_cuda(cudaEventCreateWithFlags(&input_ready_, cudaEventDisableTiming));
   }
 
@@ -233,18 +236,23 @@ class Runtime {
     g = import_selected_expert_gates(g, r, context, execution_);
     CudaNotifyGenerationCoordinator coordinator(tape->generation, execution_, notify_pool_);
     tape->dispatch = coordinator.run_device({config_, r, g, max_tokens_}).dispatch();
-    auto input = producer.publish_activations(static_cast<const transport::BFloat16 *>(pointer(x)),
-                                              elements(x), tokens, hidden_, owner(x));
-    auto weights = producer.publish_weights(
-        static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-        static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
-        config_.num_experts / config_.topology.world_size,
-        rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
-    tape->output = empty({tokens, hidden_}, "bfloat16");
+    BFloat16ActivationLease input;
+    ForwardWeightLease weights;
     ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
-    ForwardTensorBuffers buffers;
-    buffers.output = binding(tape->output);
-    fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc, buffers, allocator());
+    prepare_tensors([&] {
+      input = producer.publish_activations(
+          static_cast<const transport::BFloat16 *>(pointer(x)),
+          elements(x), tokens, hidden_, owner(x));
+      weights = producer.publish_weights(
+          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
+          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+          config_.num_experts / config_.topology.world_size,
+          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
+      tape->output = empty({tokens, hidden_}, "bfloat16");
+      ForwardTensorBuffers buffers;
+      buffers.output = binding(tape->output);
+      fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc, buffers, allocator());
+    });
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
@@ -269,13 +277,16 @@ class Runtime {
     auto input = producer.publish_output_gradients(static_cast<const transport::BFloat16 *>(pointer(dy)),
                                                    elements(dy), tokens, hidden_, owner(dy));
     auto local_experts = config_.num_experts / config_.topology.world_size;
-    auto dx = empty({tokens, hidden_}, "bfloat16");
-    auto dg = empty({tokens, config_.top_k}, "float32");
-    auto dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
-    auto dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
+    py::object dx, dg, dw1, dw2;
     BackwardMegaKernelConfig bc{hidden_, intermediate_};
-    bc.tensors = prepare_backward_tensors(tape->dispatch, execution_, bc,
-                                          {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
+    prepare_tensors([&] {
+      dx = empty({tokens, hidden_}, "bfloat16");
+      dg = empty({tokens, config_.top_k}, "float32");
+      dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
+      dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
+      bc.tensors = prepare_backward_tensors(tape->dispatch, execution_, bc,
+          {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
+    });
     BackwardMegaKernel().run(tape->forward, input, bc);
     tape->forward = {};
     tape->dispatch = {};
@@ -459,6 +470,12 @@ class Runtime {
   CudaTensorAllocator allocator() {
     return [this](std::uint64_t bytes) { return binding(empty({bytes}, "uint8")); };
   }
+  void prepare_tensors(const std::function<void()> &prepare) {
+    if (tensor_preparation_)
+      tensor_preparation_->run(prepare);
+    else
+      prepare();
+  }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
   bool training_, fused_inference_ = false;
@@ -469,6 +486,7 @@ class Runtime {
   NcclSession base_;
   DeviceNotifyResourcePool notify_pool_;
   ActivationTransportResourcePool pool_;
+  std::unique_ptr<CollectiveTensorPreparation> tensor_preparation_;
   std::unique_ptr<LocalCudaP2pForwardMegaKernel> local_;
 #if WEFTMOE_ENABLE_GIN_RDMA
   std::unique_ptr<GinRdmaForwardMegaKernel> gin_;

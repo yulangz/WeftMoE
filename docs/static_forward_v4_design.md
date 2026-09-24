@@ -1004,6 +1004,10 @@ M6a已将rank-private Backward U/dAB/dX/dGate从固定pool移到调用级存储�
 增加完整cluster退出边界，逐任务同步粒度不变；重复调用的rank1/9完整报告中
 DSM/payload hazards已消失，剩余共享原子报告由独立合法握手复现为工具误报。
 训练Forward及其它rank仍未完成全量sanitizer门禁，不能声称训练sanitizer全部通过。
+M6b补充了训练Runtime每调用tensor preparation的一致失败边界：预分配并预热
+小控制区，Forward/Backward的本地分配回调结束后只在全部rank成功时进入执行。
+EP8/EP16单rank OOM注入、partial allocation释放和Backward tape重试数值通过；
+这不是首次pool创建/失效context恢复，也没有启用training ring或完成StableTape。
 详见 [训练对接记录](static_forward_v4_training_record.md)。
 
 - [ ] StableTape plan、按实际规模分配、main_from_plan 复用同一 plan。

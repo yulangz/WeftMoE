@@ -64,6 +64,55 @@ def main():
         training=True,
         max_saved=4,
     )
+    retry_checks = {}
+    if os.environ.get("TEST_TENSOR_PREPARATION_FAILURE") == "1":
+        import ctypes
+
+        cuda = ctypes.CDLL("libcudart.so")
+        cuda.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        # Fail after partial allocation on one rank, without exhausting the
+        # machine. Peers must throw before main; the retained Backward tape
+        # must remain usable after its workspace allocation fails.
+        def fail_allocation(call, ordinal):
+            original = torch.empty
+            calls = 0
+
+            def allocate(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if rank == world - 1 and calls == ordinal:
+                    if ordinal == 5:
+                        # An impossible allocation returns a real recoverable
+                        # CUDA OOM, including its thread-local last-error state.
+                        address = ctypes.c_void_p()
+                        assert cuda.cudaMalloc(ctypes.byref(address), 1 << 63) == 2
+                    raise torch.cuda.OutOfMemoryError("injected tensor allocation failure")
+                return original(*args, **kwargs)
+
+            torch.empty = allocate
+            try:
+                try:
+                    call()
+                except RuntimeError as error:
+                    assert f"tensor preparation failed on rank {world - 1}" in str(error)
+                else:
+                    raise AssertionError("preparation failure did not reach every rank")
+            finally:
+                torch.empty = original
+            print(rank, "TENSOR_PREPARATION_FAILURE_PASS", ordinal, flush=True)
+
+        local_routes = route.chunk(world)[rank].contiguous()
+        local_dy = dy.chunk(world)[rank].contiguous()
+        fail_allocation(lambda: runtime.forward(x, local_routes, g, w1, w2), 3)
+        assert runtime.native.usage()["notify_slots_in_use"] == 0
+        tape = runtime.forward(x, local_routes, g, w1, w2)
+        retry_checks["output"] = tape.output
+        fail_allocation(lambda: runtime.backward(tape, local_dy), 5)
+        assert runtime.native.usage()["notify_slots_in_use"] == 1
+        retry_checks.update(zip(("dx", "dgate", "dw1", "dw2"),
+                                runtime.backward(tape, local_dy)))
+        assert runtime.native.usage()["notify_slots_in_use"] == 0
+        del tape
     output = moe(runtime, x, route.chunk(world)[rank].contiguous(), g, w1, w2)
     (output.float() * dy.chunk(world)[rank].float()).sum().backward()
     reference = torch.zeros_like(all_x)
@@ -84,6 +133,11 @@ def main():
         dw1=(w1.grad, all_w1.grad.chunk(world)[rank]),
         dw2=(w2.grad, all_w2.grad.chunk(world)[rank]),
     )
+    for name, actual in retry_checks.items():
+        torch.testing.assert_close(actual.float(), checks[name][1].float(),
+                                   rtol=0.02, atol=0.00002)
+    if retry_checks:
+        print(rank, "TENSOR_PREPARATION_RETRY_PASS", flush=True)
     for name, (actual, expected) in checks.items():
         delta = (actual.float() - expected.float()).abs()
         print(
