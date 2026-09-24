@@ -3718,3 +3718,24 @@ EA没有逆转退化，不继续16-owner组合或四规模完整门禁。全部�
 改动及新helper已撤回，可由冻结patch恢复；没有把失败候选留成生产分支。
 日志`return_dependencies_{dz,ea8}_ep16_t20480_*`及
 `return_dependencies_dz_baseline_ep16_t20480_formal.log`。
+
+### EB：B1024下Return Q128（局部改善，但不如当前配置，不采用）
+
+DS/M6e数据面不变，仅编译Return Qmax128，L32/Dispatch Q8不变。注意
+`return_partition`在B512/K4时会将其裁到Q64，不能称为实际Q128实验；本轮
+选B1024/D4，在同窗口下成对测冻结M6e Q32与Q128，并对照已选B512/D8/Q32。
+没有修改自适应分包策略。冻结`build/static_v4_ds_return_q128_eb/`，native
+SHA256 `9be39627bfc8c40862300a5eae71d7eed3234db38ad6b23b14e06ccab8b480f2`，
+源码`c9d0040`，prefill/decode REG168/STACK432/440/SHARED2048/LOCAL0。
+
+1620MHz、EP16 T20480、10warmup/2samples/batch2、无并发CPU构建或GPU任务：
+
+|B/D/Qmax|实际Q|p50/us|min–max/us|pool bytes/rank|
+|---|---:|---:|---:|---:|
+|1024/4/32|32|7820.260|7820.260–7921.440|1048108736|
+|1024/4/128|128|7363.330|7363.330–7628.530|1148679872|
+
+32个hash均与M6e一致。较大包在B1024下有局部收益，但两者仍明显慢于相邻
+B512/D8/Q32正式6991.460us，且增大有界buffer；不采用，也不将2样本局部
+差异当成正式性能提升。没有继续四规模、library或完整数值/sanitizer门禁。
+日志`ds_return_q{32,128}_eb_b1024_ep16_t20480_quick.log`。
