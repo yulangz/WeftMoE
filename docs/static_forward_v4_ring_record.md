@@ -3377,3 +3377,29 @@ JSON真实shape重命名为`t8192_probe{0,1,2,3}`；不作为四规模结果。
 没有足够收益，不继续完整Torch/sanitizer；已撤回新head与准入拆分，保留冻结
 候选供复核。日志 `ring_split_admission_*`。该实验只说明这项拆分未改善当前
 实现，不证明Return等待与所有计算完全折叠，也不排除其它静态计算流水改进。
+
+### DP：相邻两 source-group 窗口合为一个静态计算 wave（无收益，已撤回）
+
+独立基于DC，不含DO准入拆分。只改变网络ring的计算wave范围：同一个source
+token window内最多合并相邻两个source groups，奇数组的最后一组独立处理。
+每cluster先做两个窗口中归自己的FC1，再做FC2；全局task residue和原有slot
+ready条件不变，Pull/Return/Reduce和packet目录不改。两CTA选择顺序依然完全
+确定，不引入根据ready抢选stage的分支或额外DSM任务发布。单机保持原wave。
+
+计算ring已分配两窗最坏容量，因此扩大wave不增加buffer。不能合并跨token
+window的两个group，否则D1时下一代source reservation可能等待当前代FC2，
+形成循环等待。本候选严格在epoch边界截断；两组包含不同source，同一个epoch
+不会争用同一source的Return TX packet。更大wave可能改善GEMM利用率，也可能
+延迟本来已ready的FC2；先实测，不预设正收益。冻结候选目录
+`build/static_v4_ring_paired_waves/`。
+
+DP native SHA256 `c39c2e31838a02fc6d9992f45f28156c1b1f925620149754d4a60f07a0855882`，
+REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264，patch已归档。相同1620MHz快筛
+口径四规模为280.112/338.656/3013.970/6996.060us；64 hashes和全部pool bytes
+与DC一致。短序列没有改善，长序列也没有明显收益；再做20K正式相邻对照。
+日志 `ring_paired_waves_ep16_t*_quick.log`。
+
+20K正式10/20/20相邻DP→DC为7009.270/6996.910us；DP样本6988.120–7045.590，
+DC为6985.950–7028.110us，未见收益。日志
+`ring_paired_waves_{dp,dc}_ep16_t20480_formal.log`。已撤回计算wave合并；没有
+继续library、完整Torch和sanitizer，不把快筛中的6996.060us认定为优化收益。
