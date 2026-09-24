@@ -53,6 +53,11 @@ empty barrier退休两CTA旧操作数，FC2 scratch避开两种A extent。完整
 数值、复用、Forward sanitizer门禁通过，单机8K相邻改善约0.8%，双机及20K
 新增收益很小。训练20K main约回退0.3%–0.7%；单独恢复训练两级FC1未消除
 回退，未保留额外分支。详见7.3及ring记录FJ/FJ2/FJ3，整体性能目标仍开放。
+FM随后把SavedX复制从Pull第二次S2G移至FC1 Ntile0的ready A stage，沿用
+已有empty/FC1完成链保护读者，不增加barrier、buffer或metadata。EP8/EP16
+完整数值/复用及Forward专项sanitizer通过；20K训练main单机改善约2.8%、
+双机约3.1%–3.6%，但单机相对V3仍慢约12%–13%。这是训练checkpoint优化，
+不把inference的持平回归算作收益。当前SavedX生命周期见第5节及训练记录FM。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -402,9 +407,14 @@ l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftM
 这里的 full/empty 是 GM ring 状态，不能与 CTA 内 SMEM TMA stage 的 mbarrier
 混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
 
-training 模式优先让 pull 在发布 X full 前同时完成 saved-X checkpoint；
-FC1 在相应 S slice ready 前完成 saved-G/U 写回。若改成独立 checkpoint reader，
-必须把该读者纳入释放条件，不能仍仅凭 F1/F2 计数覆盖数据。
+当前training的Pull只完成物理X写入及canonical identity/gate保存后发布X full。
+FM由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX；
+每个math warp先完成其uint4读取/写出及WGMMA wait0，再向两个CTA的stage
+empty到达，不能提前覆盖该共享stage。SavedX写入也先于本tile的FC1完成发布，
+因此已有F1释放链已包含checkpoint owner，不需要增加独立读者计数。
+FC1在相应S slice ready前完成saved-G/U写回。SavedX/G/U属于独立tape，不随
+ring slot回收；Backward在Forward完成后才读取。若以后引入独立checkpoint
+reader或异步store，必须重新纳入相应stage/slot释放条件。
 
 各 cluster 在准入窗口内静态枚举自己的 FC1/FC2 residue，不引入全局 FC1→FC2
 barrier；某 block 的全部 S 就绪即可开始 FC2。窗口容量/进度约束见第 2.3 节。
@@ -1082,6 +1092,8 @@ wire控制区、NIC counter编号独立持久化，仅在执行完成后复用co
 都完成才发布X-ready及RX consumed，expected仍是逻辑route数。EP16 T1/64/8K/
 20K及20K热点R1310720通过，T512/T2048分别覆盖decode/prefill的rank0/15
 memcheck0和Forward racecheck0。没有恢复完整Forward X/S，也没有双机专用索引。
+以上双S2G是M6d/M6e的历史实现；FM已将SavedX移至唯一FC1 Ntile0的ready A
+stage，Pull只写物理X，当前生命周期以第5节为准，expected仍未改变。
 Python入口只为Notify/调度元数据预留最坏route容量，X/S保持有界，tape/dR按
 实际R分配。M6f将Backward private padding从R+expert slack改为精确P_actual：
 materialized Notify随已有status下载保存逐专家M128取整后的总行数，不增加host
@@ -1100,6 +1112,9 @@ materialized Notify随已有status下载保存逐专家M128取整后的总行数
 - [x] 合并训练G/U checkpoint写回（M6h）：复用退休B arena及已有barrier，
   单/双机数值与Forward专项sanitizer通过，长文main有小幅收益；修复纯GEMM
   诊断helper接口并通过packed/separated回归，不作为重新选择layout的证据。
+- [x] SavedX复用FC1已就绪A stage（FM）：移除Pull第二次S2G，不改变canonical
+  tape及Backward；单/双机数值、热点复用和Forward专项sanitizer通过，20K
+  训练main改善约2.8%/3.1%–3.6%，整体训练性能目标仍未关闭。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。
 

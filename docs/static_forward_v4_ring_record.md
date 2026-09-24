@@ -4805,3 +4805,47 @@ Backward通过，各64个梯度hash与FJ2完全一致。FK数值测试与FL CPU�
 FJ2；保留artifact和`return_cta_grouping_{fj2,fk,fl}_ep16_t*_quick.log`。
 这次结果不支持仅改变Return CTA/context排布；未测的三类角色全CTA共享也
 不能据此称为优化。后续先转向训练checkpoint复制，而不是继续叠加排布复杂度。
+
+### FM：SavedX改由FC1保存（训练改善，inference持平）
+
+基于已验收FJ2，Pull只向物理X写一次，每个Mblock唯一的FC1 Ntile0复用
+ready A stage向canonical SavedX做uint4 scatter。已有WGMMA wait0及两个
+CTA的empty arrivals保护共享stage，既有FC1完成链涵盖checkpoint owner。
+删除Pull训练fanout wrapper，不增加buffer、barrier、metadata或调参分支；
+G/U、Backward及数值顺序不变。不是将SavedX改成ring，也不是TMA checkpoint。
+
+EP8/EP16完整训练四档、20K hotspot、短档OOM/retry/live tapes、inference
+四档及edges/tiny ring均通过；96个native梯度hash等于FJ2。rank0/15的
+T64小ring及T2048 prefill热点训练memcheck均0 errors，Forward专项racecheck
+均0 hazards/0 warnings。详见[训练记录FM](static_forward_v4_training_record.md)。
+不将Forward过滤的racecheck称为完整Backward clean。
+
+冻结`build/static_v4_math_x_checkpoint_fm/`，native SHA256
+`482f535e85ea00ad89cb859b47345f092f9582309d34bd74331fc2d1b8816120`，library
+`44820160cb808ed7aaff376b244214ea989f48ab91438444a7784b842450892a`。
+1620MHz、B512/D8、Qdispatch8/Qreturn16/L32、10warmup/20samples/batch20，
+正式inference graph rank-max p50（us）：
+
+|拓扑|T/rank|FM|同期冻结V3|相对V3降低|
+|---|---:|---:|---:|---:|
+|单机EP8|1|100.962|未重测|—|
+|单机EP8|64|135.310|未重测|—|
+|单机EP8|8192|1253.600|1488.020|15.75%|
+|单机EP8|20480|2945.430|3300.250|10.75%|
+|双机EP16|1|268.531|未重测|—|
+|双机EP16|64|317.726|未重测|—|
+|双机EP16|8192|2899.290|3360.410|13.72%|
+|双机EP16|20480|6882.180|7098.420|3.05%|
+
+EP8在第二节点独占计时，第一节点同时构建FM库/运行Torch正确性；计时节点
+没有CPU构建。EP16在全部门禁结束后两节点独占计时，无并发构建/GPU任务。
+20:17负载下两节点全部GPU SM/graphics1620MHz、memory3201MHz；memory只作
+观测，不声称锁定。八档JSON实际shape均核实，96个Forward hash逐rank等于
+FJ2，pool/注册bytes完全不变。V3 graph两个kernel、ring一个，此表是端到端，
+不是纯GEMM。日志`math_x_checkpoint_final_{v3,fm}_{remote_ep8,ep16}_t*_formal.log`。
+
+Inference相对FJ2持平，不把上述相对V3的既有收益归因于checkpoint迁移。
+20K训练main相邻/反向对照：EP8改善2.80%/2.88%，EP16改善3.59%/3.13%；
+后者反向中间有一个FN批次。FN仅将SavedX store换成.cs，没有稳定额外收益，
+已撤回；所有证据及训练相对V3仍落后的结果见训练记录。EP16 20K inference
+仍只领先V3约3%，不关闭“明显领先”及整体训练性能目标。

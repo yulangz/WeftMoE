@@ -1,6 +1,5 @@
 #pragma once
 
-#include "cuda/static_v4/checkpoint_copy.cuh"
 #include "cuda/static_v4/network_transport.cuh"
 
 // Pull has one issuer and two private staging slots. A batch stays within
@@ -19,7 +18,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
       peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  RingPullCopy<Storage, Training> prefetch(a, s);
+  RowPrefetchPipeline<Storage> prefetch(s, 0U);
   unsigned peer_rows = 0U;
   constexpr auto TileM = forward_tuning::kTileM;
   constexpr auto Batch = Network ? 2U : 8U;
@@ -79,7 +78,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           }
           prefetch.copy(
               source, local + target_row * a.hidden,
-              static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)), index);
+              static_cast<unsigned>(a.hidden * sizeof(transport::BFloat16)));
           peer_rows += identity.source != a.rank;
           const auto valid = r.blocks[block].tile.rows;
           credit += m + 1U == valid ? TileM - valid + 1U : 1U;

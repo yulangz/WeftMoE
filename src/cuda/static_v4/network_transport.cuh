@@ -302,7 +302,7 @@ pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
   const auto &r = a.ring;
   const auto &shape = r.source.shape;
   const auto stride = shape.sources * r.source.packets.packets(shape.tokens);
-  RingPullCopy<Storage, Training> prefetch(a, storage);
+  RowPrefetchPipeline<Storage> prefetch(storage, 0U);
   auto *output =
       peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
@@ -358,7 +358,7 @@ pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
           prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
                         output + std::uint64_t(row) * a.hidden,
                         static_cast<unsigned>(a.hidden *
-                                              sizeof(transport::BFloat16)), index);
+                                              sizeof(transport::BFloat16)));
         }
         mask &= mask - 1U;
       }

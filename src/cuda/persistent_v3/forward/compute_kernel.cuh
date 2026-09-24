@@ -673,6 +673,7 @@ __device__ __forceinline__ auto physical_barrier(unsigned id) {
       Unified ? (id == kTaskReadyBarrier ? 4U : id) : id + 8U);
 }
 
+#include "cuda/static_v4/checkpoint_copy.cuh"
 #include "cuda/static_v4/fc1_epilogue.cuh"
 #include "cuda/static_v4/fc2_epilogue.cuh"
 
@@ -1126,6 +1127,11 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
 #pragma unroll
               for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
                 cute::warpgroup_fence_operand(accum[index]);
+              if constexpr (RetainBackwardState && RingSchedule)
+                if (n_tile == 0U)
+                  static_v4_save_x_stage<TileK>(
+                      a, smem_a + stage * kAStageElements, mblock, valid_rows,
+                      iteration * TileK);
               cute::warpgroup_wait<0>();
               const auto lane = threadIdx.x & 31U;
               if (lane < 2U)

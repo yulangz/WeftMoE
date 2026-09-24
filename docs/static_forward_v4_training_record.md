@@ -975,7 +975,7 @@ inference graph口径不同。日志`return_followup_{es,et}_ep16_t*_training_fo
 门禁，不能据此声明该候选的梯度已经验收。改动与测试参考已撤回，复用ET布局。
 artifact与inference消融见[ring记录FB/FC](static_forward_v4_ring_record.md)。
 
-### FJ2：三级FC1及跨GEMM共享内存退休（验证中）
+### FJ2：三级FC1及跨GEMM共享内存退休（已验证，训练无收益）
 
 原FJ的空间复用漏掉cluster两CTA阶段偏斜，prefill graph在racecheck下出现
 数值错误，未采用。FJ2把FC2 scratch移到两种A extent之后，并在GEMM切换时
@@ -1020,3 +1020,139 @@ ET8319.460/FJ38358.400us；wall分别4266.660/4252.770及9279.800/9316.950us。
 最终采用完整验收的FJ2同步/scratch修正及统一prefill三级FC1。此里程碑补全
 跨CTA内存复用安全性，不是训练性能里程碑；约0.3%–0.7%的20K main回退及
 训练Forward相对V3的总体差距均保持开放，不能被inference改善抵销。
+
+### FM：从FC1的A stage保存X checkpoint（已验证，采用）
+
+FJ2为基线。Pull不再向SavedX做第二次S2G，只写物理X及便宜的canonical
+identity/gates。每个Mblock的FC1 Ntile0，从已ready的A stage以uint4 vector
+scatter写canonical SavedX；复用原checkpoint.rows，不改物理行序、Notify、
+G/U保存、tape格式或Backward。写入位于WGMMA commit之后、wait0和empty
+arrival之前，沿用V3尾块的读者退休顺序。SavedX不复用ring payload，Forward
+完成才允许Backward消费。不增加分配、barrier或计数器，复制总字节数不变。
+
+checkpoint_copy模块改为计算侧stage helper；Pull复用已有普通row pipeline，
+删除训练fanout wrapper。这个候选是vector scatter，不是V3完整tile的TMA
+store，也不预设它一定快于通信warp逐行复制。
+
+冻结`build/static_v4_math_x_checkpoint_fm/`，native SHA256
+`482f535e85ea00ad89cb859b47345f092f9582309d34bd74331fc2d1b8816120`。
+EP8 T512/K6/B512/D8与EP16 T64/K6/B16/D1重复Backward通过，共96个梯度
+hash与FJ2完全相同。network prefill training STACK416（FJ2408），其它
+prefill入口的REG/STACK/SHARED/LOCAL未变。尚未做完整Torch/sanitizer门禁。
+
+全部构建结束后，第二节点独占EP8，1620MHz、eager retained-tape、10warmup/
+20samples。首轮相邻对照如下，双机与反向复测仍待完成：
+
+|T/rank|FJ2 main/us|FM main/us|FJ2 wall/us|FM wall/us|
+|---:|---:|---:|---:|---:|
+|8192|1505.120|1504.190|2012.400|2014.050|
+|20480|3650.270|3547.900|4234.980|4120.930|
+
+8K持平，20K main首轮改善2.80%、wall2.69%，仍不能凭单轮关闭训练性能目标。
+日志`math_x_checkpoint_{fj2,fm}_remote_ep8_t*_training_forward.log`。
+
+首轮EP8共32个字符串Forward hash一致。随后双机独占、无CPU构建/GPU任务
+并发、同样1620MHz和10/20，完成相邻对照：
+
+|T/rank|FJ2 main/us|FM main/us|FJ2 wall/us|FM wall/us|
+|---:|---:|---:|---:|---:|
+|8192|3457.920|3361.410|4254.760|4170.490|
+|20480|8351.970|8051.840|9340.540|9031.110|
+
+main分别改善2.79%/3.59%，wall1.98%/3.31%，64个原始Forward hash字符串
+相同。日志`math_x_checkpoint_{fj2,fm}_ep16_t*_training_forward.log`。
+尚需反向复测及完整训练门禁。FN会仅对SavedX尝试streaming store缓存提示，
+保持所有地址、所有权、复制字节数及同步不变，独立比较，不预先认定收益。
+
+单机20K反向FM→FJ2：main3547.650→3652.830us，wall4130.860→4244.480us，
+对应改善2.88%/2.68%，16个字符串Forward hash一致，与首轮方向一致。
+第二节点独占计时，第一节点同时编译FN，没有计时节点CPU构建；日志
+`math_x_checkpoint_reverse_{fm,fj2}_remote_ep8_t20480_training_forward.log`。
+
+### FN：SavedX streaming store（额外收益不稳定，撤回）
+
+在FM上仅将SavedX vector store换成`st.global.cs.v4.u32`，尝试减少checkpoint
+写流对活跃权重的缓存干扰。它只是eviction hint，不改变可见性或退休协议。
+参见[NVIDIA PTX cache operators](https://docs.nvidia.com/cuda/archive/12.8.0/parallel-thread-execution/index.html#cache-operators)。
+G/U、S、metadata、权重TMA及行序均不改。冻结
+`build/static_v4_streaming_x_checkpoint_fn/`，native SHA256
+`caf9083a0f867e417aa84d3fa9765ffa9ff910563d6b03a52844ba25517164d8`。
+EP8/EP16重复Backward共96梯度hash与FJ2相同，四个prefill入口资源与FM相同。
+
+1620MHz、无并发构建/GPU任务、eager retained-tape 10/20，相邻FM→FN：
+
+|拓扑/T/rank|FM main/us|FN main/us|FM wall/us|FN wall/us|
+|---|---:|---:|---:|---:|
+|EP8/8192|1501.920|1503.330|1996.440|2006.580|
+|EP8/20480|3546.780|3542.980|4129.840|4124.360|
+|EP16/8192|3383.010|3351.140|4188.540|4156.910|
+|EP16/20480|8064.060|8080.000|9007.420|9058.950|
+
+EP8共32个字符串hash、EP16共64个原始uint64 hash字符串相同。单机基本持平，
+双机8K首轮约改善0.94%，20K却回退约0.20%，不保留缺乏稳定额外收益的
+特殊PTX store。FN未进行library/Torch/sanitizer完整门禁。源码恢复普通store的
+FM后，patch与冻结FM逐字节相同；FM进入完整门禁，尚未提前提交为验收优化。
+日志`streaming_x_checkpoint_{fm,fn}_{remote_ep8,ep16}_t*_training_forward.log`。
+
+双机20K在FM→FN之后又测FJ2（间隔一个FN批次，不称FM/FJ2严格相邻）：
+FJ2 main8324.990us、wall9299.890us，对照FM8064.060/9007.420us，改善
+3.13%/3.14%。32个原始hash相同，与前一轮FJ2→FM的3.59% main改善方向一致。
+日志`streaming_x_checkpoint_fj2_ep16_t20480_training_forward.log`。
+
+### FM最终验收与同期V3对照
+
+FM library SHA256 `44820160cb808ed7aaff376b244214ea989f48ab91438444a7784b842450892a`，
+extension仍为`725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+单机完整训练四档通过：1/64每档8 parity、16 preparation-failure、8 retry、
+24 live-tape reuse、8 inference graph及8 offload；8K balanced/20K hotspot
+每档8 parity/graph/offload。Inference四档+edges 240条、tiny B16/D1 K8 152条、
+非ring8K/20K 32条检查通过。双机完整门禁仍在进行，未提前声称验收。
+
+同轮补测冻结V3，1620MHz、remote单机EP8独占、eager retained-tape 10/20：
+
+|T/rank|V3 main/us|FM main/us|V3 wall/us|FM wall/us|
+|---:|---:|---:|---:|---:|
+|8192|1334.270|1497.950|1732.580|1995.680|
+|20480|3138.820|3537.540|3578.370|4118.170|
+
+32个Forward hash一致。FM相对V3 main仍慢12.27%/12.70%，wall慢15.19%/15.09%；
+checkpoint迁移只缩小差距，不代表恢复了训练性能。计时节点独占，另一节点
+同时构建FM库；没有计时节点CPU构建。日志
+`math_x_checkpoint_final_{v3,fm}_remote_ep8_t*_training_forward.log`。
+
+双机完整门禁于20:13 UTC完成，launcher退出0。训练1/64每档16 parity、
+32 preparation-failure、16 retry、48 live-tape reuse、16 inference graph及
+16 offload；8K balanced/20K hotspot每档16 parity/graph/offload。
+Inference四档+edges共480条，tiny B16/D1 K8共304条通过。复用现有测试，
+没有为本次地址迁移增加测试脚本。
+
+rank0/15小ring T64热点训练memcheck（PID87941/359880）、T2048 prefill热点
+训练memcheck（92771/360845）均0 errors；对应Forward racecheck
+（90281/360269及94753/361236）均0 hazards/0 warnings，应用parity/graph/
+offload检查全部完成。racecheck只过滤planner/Forward，不宣称完整Backward
+raceclean。日志`math_x_checkpoint_fm_torch_ep16_*`及同前缀sanitizer日志。
+双机正式性能矩阵在完整门禁结束、两节点GPU空闲后启动，无并发构建。
+
+双机同轮冻结V3对照完成，1620MHz、独占、eager retained-tape 10/20：
+
+|T/rank|V3 main/us|FM main/us|V3 wall/us|FM wall/us|
+|---:|---:|---:|---:|---:|
+|8192|2912.740|3366.690|3423.030|4175.610|
+|20480|6648.130|8063.940|7177.980|9033.290|
+
+64个原始uint64 Forward hash字符串一致，实际shape及16个rank的retained
+标志均核实。FM相对V3 main仍慢15.58%/21.30%，wall慢21.99%/25.85%，不因
+相对FJ2的小幅改善关闭训练性能目标。日志
+`math_x_checkpoint_final_{v3,fm}_ep16_t*_training_forward.log`。
+20K FM这一轮main范围7999.840–43197.100us，p95为8148.160us，mean9821.516us；
+有一个43ms长尾，未删除样本、未只报告较好轮次。另行重测FM确认稳定值。
+
+随后的同条件FM独占重测，20K main p50=8023.330us，范围7967.300–8118.820us，
+p95=8104.800us；wall p50=9006.470us，16个原始hash与首轮相同。没有再次出现
+43ms长尾，但无法仅凭复测确定其原因，首轮及全部样本继续保留；不以这轮较小
+数值替换上表。日志`math_x_checkpoint_repeat_fm_ep16_t20480_training_forward.log`。
+
+最终采用通过完整门禁的普通store版FM，源码patch与冻结artifact逐字节一致。
+优化的是训练SavedX复制的执行位置，没有inference新增收益；正式inference
+四档回归及对应V3数据见ring记录FM。后续将地址计算移出K循环的FO是独立候选，
+不计入本里程碑，完整训练性能及Backward专项工具限制仍保持开放。
