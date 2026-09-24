@@ -3180,7 +3180,7 @@ native保留在 `build/static_v4_ring_return_segments/`，可恢复该实验。
 没有继续library、完整Torch或sanitizer。移除两轮逐行解析未转化为整体收益，
 不能仅从CY的局部跨度判定它是关键路径，下一步需补多context有效链路吞吐诊断。
 
-### DH：多 context 链路吞吐诊断（构建中）
+### DH：多 context 链路吞吐诊断（已验证，`1729a2f`）
 
 扩展既有`gin_link_bench`，新增`WEFTMOE_GIN_BENCH_CONTEXTS`（默认1），不新增
 生产分支或独立测试套件。一个CTA/线程独占一个GIN context，使用THREAD sharing、
@@ -3232,3 +3232,65 @@ L32、Q与容量不变，独立消融更少owner复用固定channel residue；�
 共用reset helper的旧`gin_put_probe`也在EP16通过16个rank的Put/signal/local
 completion及payload校验，launcher exit0，日志`multicontext_link_put_probe.log`。
 DH只增加诊断能力，不将其作为生产算子性能优化提交。
+
+### DI/DJ：L32 不变，静态 network owners 改为16/8（无收益，已撤回）
+
+基于DC数据面加DH诊断后的代码，不含DE/DF/DG。增加与packet lanes独立的编译期
+owner配额，默认仍32；本轮分别构建16和8，actual workers取quota与channel总数
+的较小值，GIN contexts仍为三类owner总数（48/24）。每owner继续复用现有固定
+channel residue，无动态领用，无新增counter或特殊双机映射。
+
+L32、DispatchQ8、ReturnQ32及双credit、每slot容量不变。原kernel按worker数
+分配的Pull/local Return/Reduce warp配额随之变化，metadata可用contexts也
+改变，因此端到端改善若存在，不能只归因为NIC。先做冻结native快筛，只有
+稳定获益后才更新配置并进行完整数值、wrap与sanitizer门禁。
+
+两候选native分别冻结在 `build/static_v4_ring_owners16/` 和
+`build/static_v4_ring_owners8/`，均有源patch；SHA256分别为
+`22b67e28a0f68c27cccce8254858fcf6fcc433164f9d02322bcbf73c5a951dd2`、
+`33bcd2a73afecda6e5ec9f3a7cf8c53d6fe7d3273d76634b6756f43656d69278`。
+两者prefill均REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264。
+1620MHz、无并发构建，10 warmup/2 measured、batch2快筛如下（us）：
+
+|owners|T1|T64|T8192|T20480|
+|---:|---:|---:|---:|---:|
+|16|359.968|423.568|3130.000|7180.930|
+|8|545.744|619.488|5323.070|12486.200|
+
+两套共128个rank输出hash与DC相同，所有device/compute/registered bytes不变。
+16-owner的route_exchange rank-max为100.384/109.056/242.624/421.632us，
+8-owner为100.704/109.568/243.904/417.664us；DC正式数据为
+102.240/116.768/242.912/420.416us。回退并非来自plan大幅变慢，但尚未用
+timeline区分channel轮询、TX scalar解析及其它静态角色分工的贡献。
+不能据DH推导减少owner必然改善算子：更少线程也要推进相同数量的packet。
+已撤回编译期owner配额，恢复固定上限32；未继续完整Torch和sanitizer。
+日志 `ring_owners{16,8}_ep16_t*_quick.log`，相邻DC复核另记。
+
+相邻DC快筛T1/20K为279.632/7001.580us，确认不是基线整体漂移导致上述回退。
+日志 `ring_owners_adjacent_dc_ep16_t{1,20480}_quick.log`；32-owner上限保持不变。
+
+### DK/DL：保持32 owners，仅消融 GIN queue depth64/256（无收益，已撤回）
+
+DH用queue64而生产用1024，是独立于owner数量的另一差异。只在静态inference
+activation devComm创建时选择编译期queue depth，默认1024不变；Notify及V3/
+training的queue不变。不改L32/Q8/Q32、slot depth或双credit，不能将NIC队列
+深度与软件ring容量混为一谈。先快筛，不预设减少NIC资源一定产生收益。
+
+native冻结 `build/static_v4_ring_gin_qdepth{64,256}/`，含change.patch。
+SHA256分别为`6606cded714e99a416873e4482395785786a07b5898be231abde777fb0d4ab64`、
+`c4f6b5194359ac582277a0405ec465f2a2ba20493efbf7b3ef2712215134b930`。
+同DI/DJ的1620MHz快筛口径、无并发构建：
+
+|queue depth|T1|T64|T8192|T20480|
+|---:|---:|---:|---:|---:|
+|64|282.256|338.000|3013.660|6987.410|
+|256|281.488|334.608|3019.520|6989.280|
+
+128个rank输出hash及所有device/compute/registered bytes与DC一致；此处不包含
+NCCL内部QP资源，不能声称降低queue depth后NIC资源用量不变。
+进一步64→DC的20K正式对照（10warmup/20measured/batch20）为
+7008.940/7006.840us，没有收益。日志
+`ring_gin_qdepth{64,256}_ep16_t*_quick.log`、
+`ring_gin_qdepth64_{q64,dc}_ep16_t20480_formal.log`。
+两个候选及编译期knob均撤回，默认queue1024保持；没有继续完整Torch或sanitizer。
+DH的并发context现象成立，但减少生产owner或queue depth都未改善当前算子。
