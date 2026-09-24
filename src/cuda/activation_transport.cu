@@ -4878,7 +4878,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     at<std::uint32_t>(metadata, m.dispatch_consumers)};
       r.returning = {at<std::uint64_t>(metadata, m.return_prefix),
                      at<std::uint64_t>(metadata, m.return_offsets),
-                     at<static_forward::ReturnPacketPlan>(metadata, m.return_packets)};
+                     at<static_forward::ReturnPacketPlan>(metadata, m.return_packets),
+                     static_forward::return_partition(p.shape, p.tokens)};
     }
   }
   args.canonical_gates_offset = layout.canonical_gates;

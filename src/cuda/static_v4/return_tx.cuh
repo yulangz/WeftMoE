@@ -36,7 +36,8 @@ __device__ __forceinline__ std::uint64_t sequence(
 __device__ __forceinline__ void *row_output(
     const ForwardKernelArgs &a, unsigned source, std::uint64_t local_window,
     std::uint64_t node_row) {
-  const auto &packets = a.ring.returning.partition;
+  const auto packets = static_forward::return_partition(
+      a.ring.source.shape, a.ring.source_epochs[source].tokens);
   const auto packet = node_row / packets.rows;
   const auto lane = static_cast<unsigned>(packet % packets.lanes);
   const auto &network = a.static_network;
@@ -55,34 +56,39 @@ __device__ __forceinline__ bool reserved(const ForwardKernelArgs &a,
                                          unsigned workers) {
   const auto &r = a.ring;
   const auto &p = r.source;
-  const auto &packets = r.returning.partition;
   const auto local_window = window / p.shape.groups();
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto node_expert = a.node * a.local_world_size * owned;
-  for (auto source = p.shape.source_begin(window);
-       source < p.shape.source_end(window); ++source) {
-    if (source / a.local_world_size == a.node ||
-        local_window * p.shape.tokens >= r.source_epochs[source].tokens)
-      continue;
-    const auto *prefix = ring::source_metadata(a, source, p.expert_prefix) +
-                         local_window * (p.experts + 1U);
-    const auto begin = prefix[a.rank * owned] - prefix[node_expert];
-    const auto end = prefix[(a.rank + 1U) * owned] - prefix[node_expert];
-    if (begin == end)
-      continue;
-    const auto first = begin / packets.rows;
-    const auto last = (end - 1U) / packets.rows;
-    for (unsigned lane = worker; lane < packets.lanes; lane += workers) {
-      if (last < lane)
-        continue;
-      const auto packet = (last - lane) / packets.lanes * packets.lanes + lane;
-      if (packet < first)
-        continue;
-      const auto target = sequence(a, source, local_window, packet) + 1U;
-      if (ring::acquire<::cuda::thread_scope_system>(
-              state(a, source, lane).tx_reserved_head) < target)
-        return false;
-    }
+  // G <= 16 and admission owns a full warp. Probe different source rails
+  // concurrently, assigning each source its own disjoint lane residue.
+  // The per-source worker count also handles G that does not divide 32.
+  const auto source_begin = p.shape.source_begin(window);
+  const auto sources = p.shape.source_end(window) - source_begin;
+  const auto source_index = worker % sources;
+  const auto source = source_begin + source_index;
+  const auto source_workers = (workers - 1U - source_index) / sources + 1U;
+  if (source / a.local_world_size == a.node ||
+      local_window * p.shape.tokens >= r.source_epochs[source].tokens)
+    return true;
+  const auto packets = static_forward::return_partition(
+      p.shape, r.source_epochs[source].tokens);
+  const auto *prefix = ring::source_metadata(a, source, p.expert_prefix) +
+                       local_window * (p.experts + 1U);
+  const auto begin = prefix[a.rank * owned] - prefix[node_expert];
+  const auto end = prefix[(a.rank + 1U) * owned] - prefix[node_expert];
+  if (begin == end)
+    return true;
+  const auto first = begin / packets.rows;
+  const auto last = (end - 1U) / packets.rows;
+  const auto lanes = min(last - first + 1U, std::uint64_t(packets.lanes));
+  for (std::uint64_t index = worker / sources; index < lanes;
+       index += source_workers) {
+    const auto lane = static_cast<unsigned>((first + index) % packets.lanes);
+    const auto packet = (last - lane) / packets.lanes * packets.lanes + lane;
+    const auto target = sequence(a, source, local_window, packet) + 1U;
+    if (ring::acquire<::cuda::thread_scope_system>(
+            state(a, source, lane).tx_reserved_head) < target)
+      return false;
   }
   return true;
 }

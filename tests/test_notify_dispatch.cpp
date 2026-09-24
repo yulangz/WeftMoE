@@ -1937,6 +1937,13 @@ void test_bootstrap_real_pipe_one_shot() {
 
 void test_static_forward_window_packets() {
   namespace plan = weftmoe::cuda::static_forward;
+  for (unsigned tokens : {1U, 64U}) {
+    const plan::WindowShape roomy{16U, 8U, 128U, 4U};
+    auto clipped = roomy;
+    clipped.tokens = tokens;
+    REQUIRE(plan::return_partition(roomy, tokens).rows ==
+            plan::return_partition(clipped, tokens).rows);
+  }
   // Include a partial source group and unequal/empty sources. This exercises
   // three nodes without assuming the available two-node GPU test topology.
   for (const unsigned world : {8U, 16U, 24U}) {

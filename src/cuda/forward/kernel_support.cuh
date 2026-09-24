@@ -681,8 +681,10 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
                             "Dispatch packet capacity"));
     const auto return_capacity = std::min(
         routes, checked_mul(peer_windows,
-                            static_forward::kNetworkReturnPackets.packets(
-                                std::uint64_t(shape.tokens) * config.max_top_k),
+                            std::max<std::uint64_t>(
+                                static_forward::kNetworkReturnPackets.lanes,
+                                static_forward::kNetworkReturnPackets.packets(
+                                    std::uint64_t(shape.tokens) * config.max_top_k)),
                             "Return packet capacity"));
     m.selected = append(cursor, routes, sizeof(std::int32_t), "source selected experts");
     m.dispatch_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),

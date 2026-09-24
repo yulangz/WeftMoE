@@ -157,6 +157,23 @@ inline constexpr PacketPartition kNetworkReturnPackets{
     WEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS, kNetworkPackets.lanes};
 static_assert(kNetworkReturnPackets.rows > 0U);
 
+// Short sources need enough packets to use the fixed network lanes. All
+// peers derive this partition from the immutable source epoch, not their own
+// token count. Base the choice on actual window work even when the pool has
+// clipped B to max_tokens; large windows retain the configured throughput Q.
+WEFTMOE_STATIC_PLAN_HD constexpr PacketPartition
+return_partition(WindowShape shape, std::uint64_t tokens) {
+  auto result = kNetworkReturnPackets;
+  const auto window_tokens = tokens < shape.tokens ? tokens : shape.tokens;
+  const auto needed = ceil_div(window_tokens * shape.top_k, result.lanes);
+  std::uint64_t rows = 1U;
+  while (rows < needed && rows < result.rows)
+    rows *= 2U;
+  if (rows < result.rows)
+    result.rows = static_cast<std::uint32_t>(rows);
+  return result;
+}
+
 struct NodeToken {
   std::uint64_t token;
   std::uint32_t fanouts;

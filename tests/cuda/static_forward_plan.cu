@@ -90,9 +90,14 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   const auto experts = world * 4U;
   const auto source = world - 1U;
   const auto experts_per_node = experts / nodes;
-  const plan::WindowShape shape{world, local_world, 128U, top_k};
+  // Mirror native pools, which clip B to capacity for nonempty short shapes.
+  const auto window_tokens = tokens ? std::min(tokens, 128U) : 128U;
+  const plan::WindowShape shape{world, local_world, window_tokens, top_k};
   const auto partition = plan::kNetworkPackets;
-  const auto return_partition = plan::kNetworkReturnPackets;
+  const auto return_partition = plan::return_partition(shape, tokens);
+  if (nodes == 2U && !hotspot && !invalid && (tokens == 1U || tokens == 64U))
+    std::cout << "Return partition: T=" << tokens << " B=" << shape.tokens
+              << " Q=" << return_partition.rows << '\n';
   const auto windows = plan::ceil_div(tokens, shape.tokens);
   const auto capacity = windows * shape.tokens * top_k;
   std::vector<std::int32_t> selected(std::size_t(tokens) * top_k);
@@ -128,7 +133,7 @@ void run(unsigned nodes, unsigned tokens, bool hotspot, bool invalid = false) {
   DeviceArray<std::uint64_t> return_offsets(nodes * partition.lanes + 1U);
   DeviceArray<plan::ReturnPacketPlan> return_packets(selected.size());
   const plan::ReturnPlanView returning{return_prefix.data(), return_offsets.data(),
-                                       return_packets.data()};
+                                       return_packets.data(), return_partition};
   DeviceArray<unsigned> error(1U);
   const plan::SourcePlanView view{shape,
                                   partition,

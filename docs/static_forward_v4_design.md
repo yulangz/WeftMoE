@@ -608,7 +608,7 @@ destination 准入整窗时，除 X/S/returned 账本外，还检查该窗口实
 远端 Return packets 均已预留。source 的 node-expert 区间连续，每 lane 检查
 该区间最后一个 packet 即可，不能跳过区间中的旧 slot。
 
-网络深度为 `max(8, ceil(ceil(B*capacity_top_k/ReturnQ)/lanes))`，保证最坏
+网络深度为 `max(8, ceil(ceil(B*capacity_top_k/ReturnQmax)/lanes))`，保证最坏
 一个 source window 可完整预留；此处使用独立的 Return Q，不是 Dispatch Q。
 深度随固定 B/K/Q/L，而非总 tokens 增长。固定 TX owner 的预留进度不等待
 本次 FC2，独立 RX/ACK 释放上一代，避免“计算等 TX、TX 等本次计算”的闭环。
@@ -619,8 +619,18 @@ TX owner acquire 全包实际引用的 blocks 后直接 Put，不再复制 C→T
 按行退休的 returned 仍防止 descriptor/ready 镜像提前换代；它不授予 TX
 复用权。TX 从预留、FC2 写入、发送直至双 credit 返回始终归本代所有。
 CO 删除已无读者的 C 数据区和 ring output-store TensorMap，非 ring 路径不变。
-当前调优候选为 Dispatch Q8 / Return Q32 / L32 / B512 / contribution D8；
+当前调优候选为 Dispatch Q8 / Return Qmax32 / L32 / B512 / contribution D8；
 编译默认和最终 profile 尚未切换，正式数值与性能见 ring 记录。
+
+CV 将准入warp的检查按source rail分摊，再检查各source实际覆盖的packet lanes；
+最终仍整warp一致决定整窗准入，不改变预留条件。CW按source epoch选择
+`ReturnQ=min(Qmax, pow2ceil(ceil(min(source_tokens,B)*K/lanes)))`，最小1。
+source planner及所有destination使用同一公式，不使用各自的token数；物理
+TX/RX slot stride仍按Qmax。实际B被pool裁到max_tokens时也使用此公式。
+主测T1/T64分别为Q1/Q8，长窗口仍Q32；两节点不等长和混合profile已验证。
+Q小于Qmax时每window至多一个packet/lane，故原depth仍足够；目录每peer/window
+容量上界改为`max(lanes, ceil(B*capacity_top_k/Qmax))`并受总routes上界限制。
+CV/CW完整门禁与正式结果见ring记录；明确收益在短序列，长序列未明显改善。
 
 ### 6.7 Return RX 直接 Reduce 消融（AQ，未获益，已撤回）
 

@@ -2759,3 +2759,135 @@ memcheck local487563/remote165082，racecheck local488186/remote165350。
 20K仍未达到最终“明显优于”的要求。不能把规划局部省下的全部时间当成总时延收益。
 内存布局、stage资源和数值顺序不变，REG168/STACK440/LOCAL0，仍一kernel graph。
 日志 `ring_warp_prefix_*`；不含CR或后续Pull合并完成候选。
+
+### CS：两个 remote Pull 批次共用 full completion（无收益，已撤回）
+
+基于CQ，不含CR。保留原packet/worker residue和双buffer row prefetch，只让
+最多两个32-route warp批次共用一次prefetch drain/global store completion。
+每lane暂存前一批的X-full地址与credit，不增加GM/SMEM；完整packet的RX lease
+最多延迟到这次flush。所有TMA完成后才发布两批X-ready，再归还已完整消费的RX。
+
+进入下一个packet时先非阻塞检查ready；若它未ready，必须先flush/归还旧包，
+再等待新包。窗口结束也强制flush，不能持有旧RX credit等待下一窗口准入。
+较大Q/K仍按32-route批次前进，只在整个packet的最后一批完成后归还该包credit。
+Expected仍是immutable desc.rows，返回计数不改变；只改remote Pull，不混入
+本地Pull batch或Return warp重写。候选编译/验证中。
+
+CS native SHA256 `79713f5627c5dbae87aceeeecbeeb63cc397ad448c90d78c0019e1577e70b306`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_pull_batch_pair/`。无并发构建的
+四规模快筛293.360/422.960/3002.000/7224.260 us，64 hashes与CQ一致；
+20K较CQ明显退化，未继续完整数值或sanitizer。已撤回network_transport改动，
+恢复逐批完成后立即发布X-ready/归还RX。不能因减少drain次数就认定更快。
+
+### CT：短 source 按实际长度选择 Return Q（短规模夹具未生效，已撤回待修正）
+
+基于CQ，不含CR/CS。source实际tokens<B时，令
+`Q=min(configured_Q, pow2ceil(ceil(tokens*K/lanes)))`，至少1；完整窗口仍用
+configured_Q。source planner和所有destination从同一source epoch推导Q，
+不使用destination自己的token数，因此不等长rank可以使用不同Q而正确互通。
+main形状下T1/T64分别为Q1/Q8，8K/20K仍Q32。TX/RX物理slot stride仍按最大Q
+分配，wire仅desc.rows个完整行，不增加payload容量或新协议字段。
+
+若Q小于配置上限，整source至多lanes个packet/目标node；否则沿用原最坏
+窗口包数。因此每peer/window的目录容量上界为`max(lanes, ceil(B*K/Qmax))`，
+再受总routes上界限制；网络depth原有`max(8, ceil(ceil(B*K/Qmax)/lanes))`
+仍足够整窗预留。只调整小B的必要目录上界，不按最大T增加data-plane buffer。
+现有GPU plan参考按所选partition枚举，端到端必须覆盖不等长、空source和复用。
+候选编译/门禁中，不把预期短序列收益写成已测结果。
+
+CT native SHA256 `a8145faea3621ade135539ae61727dc292515af33e3f57019b5bff0291b1e6aa`，
+library `297d08ab0fa8846c478ba6450282eba32892a7a2729d074a94d8e311736f8177`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_short_return_packets/`。
+GPU plan37+6与isolated racecheck通过；rank1/9 eager B512/D1/K8/T64、
+11 rounds的memcheck/racecheck exit0，0 errors/0 hazards；当时误判实际Return Q16，
+但后续确认此夹具仍Q32，不能作为自适应Q16的门禁；
+memcheck local499364/remote169072，racecheck local499774/remote169342。
+无并发构建的四规模快筛294.800/410.592/3002.780/6976.700 us，64 hashes与CQ
+一致。此短序列性能结论无效，原因见下面更正；长序列差异不足以认定收益。
+未继续完整PyTorch门禁，已撤回全部五处source/test改动，保持统一Q32及原目录容量公式。
+
+**夹具更正**：`static_ring_shape`令实际B为`min(configured_B,max_tokens)`。
+native benchmark每个T单独建pool，所以T1/T64时tokens恰等于实际B，CT的
+`tokens>=B`分支直接返回Q32。上述无收益不能否定短包策略，sanitizer也没有走
+所宣称的Q16。应按`min(tokens,B)*K`选Q，不以“是否完整窗口”跳过；这样实际
+工作量相同而pool容量不同也得到相同Q。修正版须重做性能与融合kernel门禁。
+
+### CU：warp 协作读取 Return 控制元数据（代码归档，尚未编译）
+
+候选令整warp读取packet的route/location，按ComputeSlot地址match合并ready
+检查与逐行retirement；GIN reserve/readSignal/readCounter/Put仍只有lane0提交。
+可变sequence、reserved和drained由lane0广播，所有lane选择相同channel/packet。
+保存于 `static_v4_ring_return_warp_control/from_short_packets.patch`；没有
+编译、数值或性能结果。该增量只改network_transport，已从工作区撤回，先独立
+验证下面更小的准入检查改动。不能将未构建候选称为优化收益。
+
+### CV：整窗 TX reservation 并行检查多个 source rail（候选）
+
+基于CQ，不含CT/CU。原warp按source串行循环，每次仅该destination实际涉及
+的几个packet lanes工作；改为`source_index=worker%G`，每source获得自己的
+worker residue，直接枚举首末packet区间实际覆盖的lane，检查其最后packet。
+每source的worker数为`floor((31-source_index)/G)+1`，不假设G整除32。
+G至多16、准入固定一个warp，故所有source都有worker；本地、空source直接满足。
+条件仍是原预留head与target，最终仍__all_sync整窗准入；没有新buffer、字段、
+counter或动态任务领用。临时枚举验证不同G、L与区间的精确覆盖/无重复，
+源代码编译与端到端筛选中。
+
+CV native SHA256 `5b23945548cdef2beac2d69a74d5f9952e52050f9b3ea9d848548a240b49ff5c`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_parallel_tx_reservation/`。
+6048组G/L/区间枚举与原条件精确一致、无重复。无并发构建的EP16四规模
+快筛281.472/397.504/3004.690/7007.380 us；64 hashes与CQ一致。
+短序列有初步改善，长序列未见明确收益；尚未做完整数值与正式门禁。
+
+### CW：修正 pool 裁剪后的短窗口 Return Q（候选）
+
+基于CV，不含CU。修正CT的完整窗口早退，始终按
+`Q=min(configured_Q, pow2ceil(ceil(min(tokens,B)*K/lanes)))`选择，最小1。
+同样实际窗口负载不再因pool容量不同而得到不同Q；sender规划与destination
+直写/准入均从source epoch推导，physical slot stride仍按最大Q。
+每peer/window目录容量取`max(lanes, ceil(B*K/Qmax))`并受总routes上界限制；
+若Q变小，每window至多一个packet/lane，原网络depth约束仍足够。
+GPU plan原矩阵的短形状改为与native一致的B裁剪，37+6通过，明确输出
+T1/B1/Q1、T64/B64/Q8。融合算子编译/门禁中；不能沿用CT未激活Q的测试结论。
+
+CW native SHA256 `24e7a59a495ec60778d0f37e8f7a6ad3f926955b3b430d468b57a7d440075ebf`，
+REG168/STACK440/LOCAL0，冻结 `static_v4_ring_adaptive_return_packets/`。
+host18/18、GPU plan37+6、isolated plan racecheck0 hazards通过。
+无并发构建的EP16四规模快筛280.224/335.456/3003.180/6978.110 us，64 hashes
+与CV/CQ一致。Q8的T64较CV快约15.6%，其余规模未见明显独立收益；正式与
+完整PyTorch门禁待完成。T64目录容量增加1024 bytes/rank，其余主规模容量不变。
+
+rank1/9 eager B16/D1/K8/T64、11 rounds（实际Q4）的融合kernel memcheck与
+racecheck均launcher exit0、0 errors/0 hazards。memcheck local512405/
+remote173153，racecheck local512932/remote173422。不声称所有16 ranks均被
+instrument。与CT不同，这次确实覆盖了自适应Q及小窗口反复wrap。
+
+CW library SHA256 `e0a6944f1b500a75e2ef749a2ff74f01d2909cf0244435ed0716cdff803abc76`。
+现有host测试补上相同实际T在B裁剪前后Q不变的断言，18/18仍通过；不增加
+独立测试入口。完整EP8四规模+edges240检查通过。
+第二节点1620MHz、B512/D8、10/20/20正式EP8为
+100.739/135.402/1263.650/2958.490 us，32 hashes与CQ一致；计时节点无并发
+CPU构建/GPU工作，第一节点独立构建library。单机基本持平，收益待EP16正式确认。
+
+完整EP16四规模+edges480、B16/D1/K8的304检查也通过，两端launcher均exit0。
+前者包含混合64/8192、空/不等长source、热点重放和权重失效更新；小窗口
+测试确实使用自适应Q，不沿用旧统一Q32门禁。EP16正式复测待完成。
+
+### CV/CW 里程碑验收（2026-09-24）
+
+上述host、GPU plan、EP8/EP16完整与tiny数值、rank1/9融合sanitizer均通过。
+1620MHz、B512/D8、10 warmup/20 samples/batch20正式矩阵如下；计时节点
+无并发CPU构建/GPU工作，EP8在第二节点执行：
+
+| T/rank | 单机EP8/us | 双机EP16/us |
+|---:|---:|---:|
+|1|100.739|276.125|
+|64|135.402|333.984|
+|8192|1263.650|3008.180|
+|20480|2958.490|7018.410|
+
+96 hashes与CQ一致，仍为一kernel graph。EP16的1/64较CQ正式分别下降
+5.11%/19.42%；8K持平，20K反向波动约0.42%，不声称长序列收益。
+REG168/STACK440/LOCAL0；仅T64的Return目录增加1024 bytes/rank，主测其它
+规模内存不变。日志 `ring_adaptive_return_*`；不包含后续warp Return候选。
+保留CV/CW以恢复并改善短序列，ring仍opt-in。参考前一CO对照轮次V3的20K
+7106.450 us，本轮只快约1.24%，不是新的相邻V3测量，也不是最终性能达标。
