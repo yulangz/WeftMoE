@@ -1771,10 +1771,9 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     // Legacy transport diagnostics use signals 0/1; production terminal status
     // uses signal 2. Ring readiness and credits use window-addressed signals.
     requirements.ginSignalCount = 3U;
-    // Every wire slot has its own local-completion counter. Counters 0/1 are
-    // reserved for bootstrap and terminal-status collectives.
+    // Legacy wire slots retain per-slot completion counters. Static Forward
+    // uses an owner-private flushed prefix; 0/1 serve bootstrap/terminal status.
     const auto wire_counters =
-        2U * pool->gin_layout.static_forward.rings.slots() +
         pool->gin_layout.rings.channels() * communication::kRingDepth;
     requirements.ginCounterCount = 2U + wire_counters * pool->slots.size();
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -1814,10 +1813,8 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         resources.windows.push_back(window);
         const auto stream = internal::checked_execution_state(execution)->stream;
         if (pool->gin_layout.static_forward.rings.depth) {
-          auto network = pool->gin_layout.static_forward;
-          network.counter_base += (&slot - pool->slots.data()) * 2U * network.rings.slots();
           static_v4::netring::initialize<<<allocated_context_count, 1, 0, stream>>>(
-              resources.dev_comm, window, network);
+              resources.dev_comm, window, pool->gin_layout.static_forward);
         }
         if (pool->gin_layout.rings.channels()) {
           auto ring_layout = pool->gin_layout.rings;
@@ -4805,8 +4802,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #endif
     args.gin_window_base = slot.gin_window;
     args.static_network = state->gin_layout.static_forward;
-    args.static_network.counter_base +=
-        lease->index * 2U * args.static_network.rings.slots();
     args.gin_rings = state->gin_layout.rings;
     args.gin_rings.counter_base +=
         lease->index * args.gin_rings.channels() * communication::kRingDepth;

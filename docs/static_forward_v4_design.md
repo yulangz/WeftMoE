@@ -41,6 +41,10 @@ memcheck及inference正式矩阵回归通过；20K Backward从原split的5707/14
 M6h复用已退休的FC1 B staging合并G/U checkpoint写回，不增加共享内存或barrier；
 20K训练main单机约改善1.5%、双机约0.7%。数值、热点复用、memcheck、Forward
 racecheck及inference正式矩阵通过，不能据此关闭上述整体性能门禁。
+ES将网络Forward逐包本地completion通知改为owner私有的已完成发送prefix，
+仍保留远端逐slot credit和GIN显式本地完成。数值/复用/sanitizer门禁通过，
+20K inference相邻对照再改善约0.6%–0.7%，训练Forward在反向对照中持平；
+双机20K相对V3仍只快约2.5%，整体性能目标尚未关闭。具体合同见6.4。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -500,7 +504,7 @@ Return RX 不需要等 Reduce，Return TX 不需要持有 C 原址到网络完�
 在有界方案里至多按已预留的有限窗口批量 Reduce。Return/Reduce 的更细重叠可独立
 消融，但不能破坏窗口回收进度。
 
-### 6.4 逐 slot 复用决策（已实现，保留双检查）
+### 6.4 逐 slot 复用决策（ES 已验收，保留双检查）
 
 Dispatch/Return TX 覆盖前均保留：
 
@@ -510,16 +514,34 @@ AND
 本 slot 上一代 Put 的本地 completion 已达到
 ```
 
-“本地 credit”指 GIN 本地 completion counter，不额外增加一轮跨机 ACK。
-completion 目标绑定本 slot 的实际 Put，不拿另一 slot 或另一个 context 的完成替代。
+首版“本地 credit”使用GIN逐slot completion counter，不额外增加跨机ACK。
+ES将它改为唯一TX owner维护的channel级`tx_completed_head`，但没有删除
+本地完成条件：sequence `s`复用前，远端credit须达到`s/depth`，并且首次使用
+或`s-depth < tx_completed_head`。head表示本channel已确认本地完成的连续发送
+prefix，不是reserve cursor，也不拿另一context的完成替代。
 
 对于一份 TX、一次 Put、一份 RX，消费后返回 credit 的因果链已经包含该 payload
-的传输；但不代表本地 completion counter 此刻必然更新。先采用保守双检查，
+的传输；但不代表GIN的本地完成通知此刻必然更新。仍采用保守双检查，
 不把它描述为两个在数据依赖上必然独立的必要条件。
 
-预计本地检查开销较低，尚未测量。后续核对具体 GIN 后端的源缓冲区生命周期契约，
-再独立消融是否值得删除热路径检查；共享 TX 的多目标发送、提前 TX 回收和通信
-资源 drain 需要另外处理。本轮不把这个优化作为 ring 实现的前置条件。
+ES的具体推进方式：
+
+- Put只携带自己的remote ready signal，不再申请逐包local counter通知。
+- 若远端credit已到、上一代不在已完成prefix内，执行当前owner/context到该peer
+  的`flushAsync`及`wait`，然后head推进至**已发出的**`tx_cursor`。
+- Return reservation上界为`tx_cursor+depth`，因此待复用的上一代一定已发出。
+  flush只等已发NIC请求，不等未来FC2/软件读者或其它channel的准入；没有持有
+  共享软件锁，RX/ACK角色继续独立推进。多channel共享同一owner/context时，
+  即使flush顺带完成同peer其它channel，也只保守推进当前channel的head。
+- terminal确认剩余已发prefix完成，并逐slot等远端credit；完全drain后才开始
+  下一调用，以tx_base初始化completed_head。不在有请求/读者在途时重置。
+- NetworkChannel仍64B，head占原末尾padding；已删除Forward无用途的counter
+  分配/reset、counter_base和slot.local_target。Backward保留自己的逐slot counter。
+
+这遵循GIN显式本地完成合同，不是“收到ACK便假定API completion”。初版ES的
+20K相邻/反向正式对照改善0.9%–1.1%，8K持平；清理版完整门禁已通过，20K
+改善0.6%–0.7%，训练Forward反向对照未见稳定变化，详见ring及训练记录。
+共享TX多目标发送或进一步合并完成范围仍须独立证明和消融。
 
 ### 6.5 静态角色与 barrier 边界
 
@@ -553,7 +575,8 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   Dispatch
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
   和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
-  TX target/local completion、RX 已 ACK generation 均跨 invocation 保留。
+  RX已ACK generation均跨invocation保留。首版TX target/local completion是
+  逐slot counter；ES改为上节的channel completed prefix，远端slot credit不变。
 - `W=min(channel_count,32)`。通信 warp 0 的前 W 个 CTA 做 Dispatch TX，其他做
   local/remote pull；warp 1 前 W 个做 Return TX、接下来 W 个做 Return RX scatter，
   其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，

@@ -42,14 +42,6 @@ struct Endpoint {
                       : layout().dispatch_payload(false, channel, sequence));
   }
 
-  __device__ unsigned counter(bool returning, unsigned channel,
-                              std::uint64_t sequence) const {
-    return a.static_network.counter_base +
-           static_cast<unsigned>((returning ? layout().slots() : 0U) +
-                                 channel * layout().depth +
-                                 sequence % layout().depth);
-  }
-
   __device__ unsigned peer(unsigned channel) const {
     return layout().peer(a.node, channel) * a.local_world_size +
            a.rank % a.local_world_size;
@@ -60,19 +52,36 @@ struct Endpoint {
         layout().peer(a.node, channel), a.node, channel % layout().lanes));
   }
 
+  // Only this owner issues on this context. A flush to the peer covers every
+  // already-issued packet of this channel; other channel heads may lag safely.
+  __device__ void complete_sends(bool returning, unsigned channel) const {
+    auto &s = state(returning, channel);
+    if (s.tx_completed_head == s.tx_cursor)
+      return;
+    ncclGinRequest_t request;
+    gin.flushAsync(ncclTeamWorld(gin.comm), peer(channel), &request);
+    gin.wait(request);
+    s.tx_completed_head = s.tx_cursor;
+  }
+
   __device__ bool can_send(bool returning, unsigned channel,
                            std::uint64_t sequence) const {
-    const auto &s = slot(returning, channel, sequence);
     const auto credit = gin.readSignal(
         a.gin_window, control(returning, channel, sequence) +
                           offsetof(static_forward::NetworkSlot, credit_signal));
-    const auto local = gin.readCounter(counter(returning, channel, sequence));
+    if (!communication::reached(credit, sequence / layout().depth, 64U))
+      return false;
+    if (sequence >= layout().depth &&
+        sequence - layout().depth >= state(returning, channel).tx_completed_head)
+      complete_sends(returning, channel);
+    // Reservation never runs beyond tx_cursor + depth: a previous occupant
+    // is already issued and the completed head now covers its local read.
     return static_forward::SlotSequence{sequence, layout().depth}.reusable(
-        credit, local, s.local_target);
+        credit, state(returning, channel).tx_completed_head);
   }
 
   // The caller has completed its TX writes, including all asynchronous copies.
-  // Keep the remote consumed credit AND this context's local NIC completion.
+  // Reuse waits for remote consumed credit AND an explicit local flush.
   __device__ void send(bool returning, unsigned channel, std::uint64_t sequence,
                        std::size_t bytes) {
     const auto remote = remote_channel(channel);
@@ -100,10 +109,9 @@ struct Endpoint {
                 control(returning, remote, sequence) +
                     offsetof(static_forward::NetworkSlot, ready_signal),
                 1U},
-            ncclGin_WeakCounterInc{counter(returning, channel, sequence)},
+            ncclGin_None{},
             ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_block,
             ::cuda::thread_scope_system);
-    ++slot(returning, channel, sequence).local_target;
   }
 
   // readSignal acquires NIC payload visibility before the rail publishes the
@@ -149,6 +157,8 @@ struct Endpoint {
 
   __device__ bool drained(bool returning, bool receive, unsigned channel,
                           std::uint64_t terminal) const {
+    if (!receive)
+      complete_sends(returning, channel);
     for (unsigned index = 0U; index < layout().depth; ++index) {
       const auto target =
           terminal > index
@@ -163,10 +173,7 @@ struct Endpoint {
                                     control(returning, channel, index) +
                                         offsetof(static_forward::NetworkSlot,
                                                  credit_signal)),
-                     target, 64U) ||
-                 !communication::reached(
-                     gin.readCounter(counter(returning, channel, index)),
-                     s.local_target)) {
+                     target, 64U)) {
         return false;
       }
     }
@@ -174,7 +181,7 @@ struct Endpoint {
   }
 };
 
-// Pool construction only. All generations and completion counters persist
+// Pool construction only. All generations and retirement counters persist
 // through graph replay; no reset occurs while a packet or reader is in flight.
 static __global__ void initialize(ncclDevComm_t dev, ncclWindow_t window,
                                   NetworkLayout layout) {
@@ -184,9 +191,6 @@ static __global__ void initialize(ncclDevComm_t dev, ncclWindow_t window,
     for (unsigned index = 0U; index < r.depth; ++index) {
       for (unsigned direction = 0U; direction < 2U; ++direction) {
         const bool returning = direction != 0U;
-        gin.resetCounter(layout.counter_base +
-                         static_cast<unsigned>((returning ? r.slots() : 0U) +
-                                               channel * r.depth + index));
         if (channel % layout.ring_workers == blockIdx.x) {
           const auto offset =
               layout.ring_region + r.control(returning, channel, index);

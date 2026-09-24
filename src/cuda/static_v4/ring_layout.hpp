@@ -27,14 +27,13 @@ packet_bytes(std::uint32_t rows, std::uint32_t hidden) {
 // GIN signals are accessed through GIN only. visible_generation imports NIC
 // readiness for node-local consumers; their release RMWs target consumed_total.
 // The RX owner accumulates retire_target before publishing each generation;
-// the TX owner tracks its independent local NIC completion in local_target.
+// Local NIC completion belongs to the TX owner's channel prefix, not the RX.
 struct alignas(64) NetworkSlot {
   std::uint64_t ready_signal = 0;
   std::uint64_t credit_signal = 0;
   std::uint64_t visible_generation = 0;
   std::uint64_t consumed_total = 0;
   std::uint64_t retire_target = 0;
-  std::uint64_t local_target = 0;
   std::uint64_t acknowledged_generation = 0;
 };
 static_assert(sizeof(NetworkSlot) == 64U);
@@ -49,7 +48,9 @@ struct alignas(64) NetworkChannel {
   std::uint64_t consume_cursor;
   std::uint64_t tx_reserve_cursor;
   std::uint64_t tx_reserved_head;
+  std::uint64_t tx_completed_head;
 };
+static_assert(sizeof(NetworkChannel) == 64U);
 
 struct SlotSequence {
   std::uint64_t sequence;
@@ -65,10 +66,9 @@ struct SlotSequence {
     return generation() + 1U;
   }
   WEFTMOE_STATIC_RING_HD constexpr bool
-  reusable(std::uint64_t credit, std::uint64_t local_done,
-           std::uint64_t local_target) const {
+  reusable(std::uint64_t credit, std::uint64_t completed_head) const {
     return communication::reached(credit, generation(), 64U) &&
-           communication::reached(local_done, local_target);
+           (sequence < depth || sequence - depth < completed_head);
   }
 };
 

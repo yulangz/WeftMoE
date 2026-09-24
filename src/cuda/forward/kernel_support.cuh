@@ -880,9 +880,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   }
   auto &rings = layout.rings;
   // A retained tape does not own either wire ring. Both sets of controls and
-  // NIC completion counters survive alternating Forward/Backward executions.
-  rings.counter_base += static_cast<unsigned>(
-      2U * layout.static_forward.rings.slots() * config.max_inflight_generations);
+  // completion state survives alternating Forward/Backward executions.
   rings.dispatch_channels = remote_nodes * communication::kDispatchChannels;
   rings.return_channels = remote_nodes *
                           (config.max_world_size / config.max_nodes) *

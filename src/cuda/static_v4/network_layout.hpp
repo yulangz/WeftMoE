@@ -20,7 +20,6 @@ struct NetworkLayout {
   std::size_t ring_region = 0;
   std::size_t source_bytes = 0; // Immutable sender metadata, excluding RX geometry.
   unsigned ring_workers = 0;
-  unsigned counter_base = 2U;
 };
 
 inline constexpr unsigned kNetworkContexts = 8U;

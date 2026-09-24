@@ -913,3 +913,29 @@ EP16同K1/B512/D8、1620MHz、10/20、无并发构建或其它GPU任务的相邻
 32个原始字符串hash逐字一致，20K基本持平。此项未改善K4主矩阵，仅有单机K1
 约0.7%的小收益，不优先保留或新增拓扑分支。源改动已撤回，保留冻结候选和
 原始测量，未继续library/完整Torch/sanitizer。日志后缀`ep16_k1_t*_training_forward.log`。
+
+## ES：训练共享网络本地完成prefix（数值通过，性能持平）
+
+Forward的逐slot远端credit不变，本地完成改为唯一TX owner执行GIN flush并推进
+channel已完成prefix。删除Forward未再使用的counter编号/分配/reset，Backward
+仍有独立逐slot counter，不因多个live tapes而共用控制状态。完整协议、artifact
+SHA及inference收益见[ring记录ES](static_forward_v4_ring_record.md)。
+
+EP8/EP16 Torch四规模（20K热点）、1/64 OOM与重试、三份live tape/payload复用
+通过；native EP8/EP16共96个梯度hash等于M6h/M6g2。EP16热点B16/D1的rank0/15
+memcheck及Forward-filtered racecheck均0。未修改或宣称解决前文Backward
+shared-atomic racecheck工具限制；附带graph检查是inference，不是训练graph。
+
+1620MHz、B512/D8、10warmup/20samples，EP16保留tape的Forward：
+
+|T/rank/顺序|M6h main/us|ES main/us|M6h wall/us|ES wall/us|
+|---|---:|---:|---:|---:|
+|8192，相邻|3480.990|3467.460|4283.240|4263.740|
+|20480，相邻|8251.330|8306.850|9221.820|9268.270|
+|20480，反向|8318.400|8272.610|9280.920|9222.650|
+
+20K差异方向反转，属于本次测量波动，不报告训练收益。main与wall保持独立口径；
+六份原始rank记录共96个Forward hash一致。计时节点无并发构建/GPU任务。
+日志`batched_local_completion_{m6h,es_final}_ep16_t*_training_forward*.log`。
+采用ES的理由是保持双credit合同并简化实现、改善inference，不是恢复了训练
+Forward相对V3的差距；该项性能目标仍未完成。

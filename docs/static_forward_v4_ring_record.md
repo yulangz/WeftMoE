@@ -4020,7 +4020,7 @@ native SHA256 `9b75ed5e9d85575d458ee2f76144670241663173c8fef34cc7d6ddcb795bdb80`
 没有端到端收益，两个源文件的候选改动已撤回；未继续library/完整数值/
 sanitizer。日志`network_consumer_backoff_er_ep16_t*_inference_quick.log`。
 
-### ES：以批量flush完成序号代替逐包本地counter通知（构建中）
+### ES：以批量flush完成序号代替逐包本地counter通知（已验收，采用）
 
 基于M6h原配额/原调度，不含ER轮询改动。保留逐slot远端consumed credit，
 本地credit改为唯一TX owner维护的channel级`tx_completed_head`，复用
@@ -4046,3 +4046,111 @@ skip-credit-check、aggregate-doorbell等后端可选优化。
 这只是成本假设，flush等待也可能降低并发度。首轮为隔离协议比较，保留尚未使用
 的counter编号预留/reset及slot local_target字段；只有性能与协议门禁获益后才
 清理这些冗余，不把候选当最终代码。正确性、性能、资源及小ring反复复用待验证。
+
+native SHA256 `3d04a541f052c686bb90763049e9ba5153a3ac9183950dfc86039eb10a872e99`，
+冻结`build/static_v4_batched_local_completion_es/`。网络prefill inference/
+training STACK400/424（M6h432/448），REG168/SHARED2048/LOCAL0；单机资源不变。
+1620MHz、B512/D8、10warmup/2samples/batch2、无并发构建/其它GPU任务的
+EP16四规模快筛为274.560/325.840/2931.330/6910.100us，64个hash与M6h一致，
+全部pool容量不变。20K范围6910.100–6959.220us，初步差异仍小，正式相邻/
+反向对照进行中，不预先宣布收益。
+
+另EP16 T64/E64/K4/B16/D1 graph快筛通过（743.072us，不与B512计时混比），
+16个hash相同；EP16 T64/E32/K6/B16/D1两次Backward稳定，64个原始梯度hash
+与M6g2/M6h合同逐字一致。尚无完整Torch/sanitizer结论。
+日志`batched_local_completion_es_{ep16,native_ep16}_*`。
+
+随后EP16正式10warmup/20samples/batch20，按M6h→ES→ES→M6h顺序，
+每轮先8K再20K，1620MHz、B512/D8，无并发CPU构建或其它GPU任务：
+
+|T/rank|M6h相邻/us|ES相邻/us|ES反向/us|M6h反向/us|
+|---:|---:|---:|---:|---:|
+|8192|2956.620|2944.660|2953.630|2952.450|
+|20480|6985.980|6922.910|6934.970|7012.400|
+
+20K两组改善0.90%/1.10%，8K改善0.40%/退化0.04%，只能认为20K有小幅一致
+收益，不能称为显著超越V3。128个输出hash与M6h相同，pool容量未变。日志
+`batched_local_completion_{m6h,es}_ep16_t*_{adjacent,reverse}_formal.log`。
+据此清理无用途的Forward counter编号/分配/reset及NetworkSlot.local_target；
+保留Backward独立counter，将已有slot生命周期测试改为本地完成prefix加逐slot
+远端credit，不另增单测框架。清理版冻结于
+`build/static_v4_batched_local_completion_es_final/`，完整数值/sanitizer及
+清理后的正式性能仍待验收，不以第一版结果替代最终artifact门禁。
+
+清理版native SHA256
+`3207471e9e80d6d293f109242864305bcb803c098120417d83428ae264117bf2`，
+library `d9992af1336b35dbd8fc298f7a1951f01c8bbcd3976566d194a9d53cc3365098`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+网络prefill inference/training STACK392/408，REG168/SHARED2048/LOCAL0。
+host原18项通过，包含逐slot生命周期和1/2/3/70节点布局；未新增单测框架。
+native EP8 T512/E16/K6/B512/D8及EP16 T64/E32/K6/B16/D1均两次Backward稳定，
+32+64个原始梯度hash与M6h/M6g2逐字一致。
+
+清理版单机EP8在第二节点隔离测量，1620MHz、10/20/batch20：
+T1/64/8192/20480分别100.883/135.429/1253.830/2948.240us，32个输出hash与
+M6h一致，pool不变。第一节点同期有CPU构建/native正确性任务，不在测量节点。
+单机prefill Function+instruction共16921行与M6h逐字相同，SHA256
+`bd47119262cbb9a142a0ed189f0b7ee38bce236c4d48206cfaba2da45727feb1`，不能将
+上述计时浮动归因于本次网络改动。
+
+EP8/EP16 Torch训练矩阵1/64/8192均衡、20480热点全部通过；1/64均包含每rank
+两次分配失败一致性、一次重试、三次peer payload/tape复用。附带graph与offload
+是独立inference检查，不声称Backward支持graph。EP16专用inference
+`--tokens 1 64 8192 20480 --edge-cases`有480条PASS；B16/D1/K8的1/64+edges
+有304条PASS，覆盖unequal/empty、mixed profile、重复expert热点、跨代修改route、
+多layer共享workspace和weight refresh。sanitizer与清理版EP16正式计时继续执行。
+日志`batched_local_completion_es_final_{native,torch,remote_ep8}_*`。
+
+EP16 T64热点/B16/D1、rank0/15的全weftmoe memcheck均0 errors；限定
+`static_ring_plan_kernel`与`unified_forward_kernel`的Forward racecheck均
+0 hazards/0 errors/0 warnings。两种运行均完成16 rank的数值、32次分配失败、
+16次重试、48次live-tape/payload复用及inference graph/offload检查。
+没有压制旧Backward shared-atomic工具报告，也不据Forward过滤声称整个
+Backward racecheck clean；工具范围及已知限制沿用训练记录。
+sanitizer原始日志前缀`batched_local_completion_es_final_{memcheck,racecheck}_`。
+15:53两节点全部GPU graphics/SM均1620MHz，正式计时开始；没有并发CPU构建或
+其它GPU任务，待结果确认后才提交该milestone。
+
+清理版EP16 inference正式10warmup/20samples/batch20，B512/D8：
+
+|T/rank|ES首轮/us|相邻M6h/us|ES反向/us|本轮冻结V3/us|
+|---:|---:|---:|---:|---:|
+|1|269.920|277.926（此前正式）|—|685.624（此前正式）|
+|64|320.746|333.410（此前正式）|—|823.624（此前正式）|
+|8192|2951.610|2956.270|2937.560|3360.000|
+|20480|6931.390|6976.040|6924.360|7108.080|
+
+20K比M6h降低0.64%/0.74%，延续首版ES的小幅一致收益；8K仍只能判断持平。
+相比本轮V3，8K快12.15%–12.57%、20K快2.49%–2.58%，不能称为全部长文目标
+达标。V3明确关闭V4且不启用ring，使用冻结V3 binary，不误测其自带V4入口。
+ES两轮、相邻M6h及V3长文输出hash逐字相同；ES pool与M6h不变。计时节点无
+并发CPU构建/GPU任务；新EU源码未参与这些冻结binary的计时。
+日志`batched_local_completion_es_final_ep16_t*_{formal,reverse_formal}.log`及
+`batched_local_completion_{m6h,v3}_ep16_t*_cleaned_adjacent_formal.log`。
+
+训练Forward正式10warmup/20samples（eager，保留tape）另做相邻/反向：
+
+|T/rank/顺序|M6h main/us|ES main/us|M6h wall/us|ES wall/us|
+|---|---:|---:|---:|---:|
+|8192，相邻|3480.990|3467.460|4283.240|4263.740|
+|20480，相邻|8251.330|8306.850|9221.820|9268.270|
+|20480，反向|8318.400|8272.610|9280.920|9222.650|
+
+20K先慢0.67%、反序又快0.55%，两轮差异方向反转，不报告训练收益或稳定回退。
+六份rank结果共96个输出hash与各自基线逐字一致，使用原始output_hash字符串，
+不比较丢精度的JSON数值。wall含Notify→buffer→Forward，不能与inference graph
+或main kernel混比。日志`batched_local_completion_{m6h,es_final}_ep16_t*_training_forward*.log`。
+
+采用清理后的ES：保留全部保守复用条件，删除无用途的counter代码，网络inference
+小幅改善，训练反向复测持平。未新增运行时开关/另一套训练Forward协议。
+完整门禁只针对冻结ES artifact；EU的Return区间候选未编译、不包含在本次提交。
+此milestone不是整体任务完成：EP16长文显著领先和训练Forward性能仍待优化。
+
+### ET：ES完成机制下重测较小Return包（待测）
+
+只将Return Qmax32降为16，基线为清理后的ES，Dispatch Q8/L32/B512/D8、
+216/64寄存器与静态owner不变。此前CN的Q16早于DS直写contribution和ES去除
+逐包completion通知；本项检验较小包提前ready是否能抵消较多WQE，而非预先
+假定小包更快。冻结`build/static_v4_return_q16_et/`，native SHA256
+`511b129cb107c04406546a14cc773c571ded5bfcb630e4461472c4c366451e5d`。
+仅使用既有编译参数，不改变生产默认Q32；测量会等ES门禁及所有构建结束。
