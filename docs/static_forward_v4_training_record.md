@@ -631,3 +631,42 @@ unified入口。已有数值通过不证明两配置性能相同。
 `training_perf_m6f_v3profile_remote_ep8_t20480_backward.log`。计划显式复用
 V3 unified Backward并完成矩阵、热点/多tape和sanitizer回归；当前尚未改默认配置，
 双机训练性能矩阵也未完成。不将这份基线记录标成M6性能验收完成。
+
+### M6g第一轮：unified开关恢复，但发现sender配额串用了Forward（未采用）
+
+仅在ring生成配置显式设置`BWD_UNIFIED_WORKERS=1`、`BWD_RELAY_CTAS=16`，
+没有改内核或生命周期。冻结`build/static_v4_training_unified_backward_m6g/`：
+
+- native `533ede29925c9f1592c6c0d171fbc33540f7f5e59ffdcb7e980e9912c3574ca5`
+- lib `2fff031c5a8a8d8d0928533b302bcdd93b3961ab2de5f025f3d281a1c4a09c9e`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+1620MHz、既有cached-tape Backward benchmark、H2048/I512/E64/K4、10/20，
+单机在第二节点，双机1×8+1×8；测量节点无CPU构建/其它GPU任务：
+
+|T/rank|EP8 M6f split/us|EP8 M6g unified/us|EP8冻结V3/us|EP16 M6f split/us|EP16 M6g unified/us|
+|---:|---:|---:|---:|---:|---:|
+|1|344.640|236.256|233.056|1355.550|2455.740|
+|64|408.064|368.736|370.752|1392.160|2599.040|
+|8192|2387.810|2064.830|2064.700|6661.090|24830.600|
+|20480|5706.530|4910.780|4979.970|14571.300|60507.400|
+
+列为device total的rank-max p50，不是Forward+Backward合并训练时间。EP8恢复
+V3附近，但不能仅凭单机结果采用：EP16明显退化。进一步查到host launch仍用
+`forward_tuning::unified_rdma_ctas`设置Backward sender数；ring Forward配置的
+`FWD_UNIFIED_RDMA_CTAS=0`使Backward回退为**1个sender**，而原V3 Forward配额
+默认为16。这是第二处执行profile耦合，不是unified算法本身已被证明不适合多机。
+下一轮将Backward sender配额独立出来，再与冻结V3和原split路径比较。
+
+第一轮正确性已通过host18/18、native EP8/EP16 T64/E16或E32/K6/B16/D1各两次
+Backward，共96个梯度hash逐字等于M6f。Torch EP8/EP16 T1/64/8192均匀、T20480
+全热点全部五项数值及脚本中的独立inference graph/offload通过；T64各完整
+OOM/retry/三个live-tape检查通过。EP8 T512及EP16 T2048全热点B16/D1也通过
+完整脚本，all-weftmoe memcheck rank0/last均0errors：EP8 PID329079/329089，
+EP16 PID330657/263385。仍不覆盖旧Backward racecheck共享原子未决报告。
+
+EP8 inference正式10/20/batch20为100.795/135.640/1266.920/2955.740us，
+32个输出hash和全部pool bytes等于M6f；计时节点独立，另一节点仅跑EP8正确性。
+这些结果只是该候选的回归，不是inference优化。日志前缀
+`training_unified_backward_m6g_`、`training_perf_m6g_`、`training_perf_m6f_ep16_`。
+双机inference回归及冻结V3 Backward完整对照正在运行，尚未提交配置变更。
