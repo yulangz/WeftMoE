@@ -673,7 +673,7 @@ TX owner acquire 全包实际引用的 blocks 后直接 Put，不再复制 C→T
 复用权。TX 从预留、FC2 写入、发送直至双 credit 返回始终归本代所有。
 CO 删除已无读者的 C 数据区和 ring output-store TensorMap，非 ring 路径不变。
 当前验收profile为 Dispatch Q8 / Return Qmax16 / L32 / B512 / contribution D8；
-编译默认和最终 profile 尚未切换，正式数值与性能见 ring 记录。
+通用编译默认未切换；本profile的数值与性能验收见ring记录ET。
 
 CV 将准入warp的检查按source rail分摊，再检查各source实际覆盖的packet lanes；
 最终仍整warp一致决定整窗准入，不改变预留条件。CW按source epoch选择

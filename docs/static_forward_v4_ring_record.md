@@ -4215,6 +4215,13 @@ ET短序列正式1/64为268.322/317.466us。20K反向ES→ET正式为
 EP16四档268.322/317.466/2905.630/6890.090us；8K使用首轮ET正式，其余为
 后续正式轮次，不伪称同一轮交错矩阵。完整数值范围及单机复用证据见上文。
 
+再做单机EP8长文同节点相邻V3→ET正式对照，1620MHz、10/20/batch20：
+8K为1489.380→1268.040us（降低14.86%），20K为3295.890→2967.860us
+（降低9.95%）。32个hash与已验收ET一致；V3明确关闭V4/ring。第一节点同期
+构建EV，第二测量节点没有其它CPU构建/GPU任务；不是双机EP8。日志
+`return_final_{v3,et}_remote_ep8_t*_formal.log`。不把这次同源EP8计时变化
+归给仅改变网络包的ET。
+
 ### EU：运行时跳过Return连续块内部的路由读取（未获一致收益，撤回）
 
 独立基于ES、Return Q32，不含ET。Return packet是单窗口expert-major路由
@@ -4235,7 +4242,7 @@ run内部的不可变route/location读取，不将其误记为再次减少RMW。
 数值/sanitizer，已撤回唯一源文件改动，不保留额外搜索逻辑。日志
 `return_followup_eu_ep16_t*_quick.log`。
 
-### EV：将网络packet ring最小深度从8降到4（候选，尚未测量）
+### EV：将网络packet ring最小深度从8降到4（长文退化，不采用固定4）
 
 基于ES源码及ET的Q16配置，只修改host布局的最小depth。仍取
 `max(4, ceil(B*K/(ReturnQ*lanes)))`，不减少最坏整窗口Return reservation，
@@ -4243,3 +4250,78 @@ run内部的不可变route/location读取，不将其误记为再次减少RMW。
 底层NIC queue仍1024；三种深度不可混同。此改动同时减少Dispatch缓冲容量，
 可能影响重叠，因此先独立测量，不预先宣称收益。冻结草稿位于
 `build/static_v4_network_depth4_ev/`，不包含EU。
+
+native SHA256 `86fa71fcadcdd1996e3ceb3a6b45b39cdb14f30b6d0ca5a676ef589c6d5258c9`；
+网络prefill资源仍REG168/STACK392或408/SHARED2048/LOCAL0。1620MHz、
+无并发构建/其它GPU任务、10warmup/2samples/batch2四档快筛：
+
+|T/rank|EV p50/us|min–max/us|pool bytes/rank|
+|---:|---:|---:|---:|
+|1|252.848|252.848–253.360|28,605,376|
+|64|300.768|300.768–301.504|58,343,616|
+|8192|3437.500|3437.500–3472.450|496,279,744|
+|20480|8076.500|8076.500–8104.670|847,297,984|
+
+64个输出hash等于ET/ES。虽然少16,793,600 bytes/rank且短序列有改善迹象，
+8K/20K显著退化，不采用固定4；未继续完整数值/sanitizer，原patch独立归档。
+容量足以避免死锁，不意味着足以隐藏通信往返。这里同时减少Dispatch/Return
+在途容量，不能直接把回退归因于其中一项。日志`network_depth4_ev_ep16_t*_quick.log`。
+
+### EW：将网络packet ring最小深度从8增至16（无收益，撤回）
+
+同ES+ET/Q16，反向验证EV暴露的在途容量敏感性。较小Return包在同一物理
+深度下能容纳的窗口更少；测试多一些slot是否提升流水重叠，不预设结论。
+仍只改变host最小depth，所有复用、整窗预留、contribution D8和NIC queue1024
+不变；Dispatch容量也增加，必须同时报告总pool代价。冻结
+`build/static_v4_network_depth16_ew/`。不包含EU或固定4，不新增运行时开关。
+
+native SHA256 `f34e1602405c5325883c401a5008dd125b1a4e1f4d6ba2f42d7fca5dfc3209a6`；
+网络prefill资源与ET相同。1620MHz、无并发构建/GPU任务、10/2/batch2快筛：
+
+|T/rank|EW p50/us|min–max/us|pool bytes/rank|
+|---:|---:|---:|---:|
+|1|294.224|294.224–338.480|78,986,176|
+|64|352.624|352.624–354.096|108,724,416|
+|8192|2948.860|2948.860–2967.360|546,660,544|
+|20480|6903.010|6903.010–6969.940|897,678,784|
+
+64个hash等于ET/ES。长文没有明确收益，短序列退化，增加33,587,200 bytes/rank
+也不划算；不采用、不继续完整门禁，源码已恢复最小depth8。日志
+`network_depth16_ew_ep16_t*_quick.log`。EV/EW只能支持当前Q16配置下8优于
+固定4/16，不能证明任意H/I/K/节点数的最优网络深度恒为8。
+
+### EX：跳过本调用无包channel方向的slot扫描（无明确收益，撤回）
+
+每个调用结束时，TX已确认本地完成及远端consumed credit，RX已发完ACK，
+所有读者join后才会合并推进base。若新不可变plan中该方向count=0，双方均无
+新payload/credit，不需要重新扫描上一代slot。TX与receive_progress在取可变
+state前跳过count=0；非空方向沿用完整保守drain，反方向有独立plan与slot。
+不保存额外done位，不新增状态、barrier或格式。active→empty→active的graph
+复用须继续用既有路由修改/热点迁移门禁验证。
+
+独立基于已验收ET及网络depth8，不包含EU/EV/EW；源改动仅两处提前continue，
+冻结`build/static_v4_empty_channel_ex/`。尚未完成构建或测量，不报告收益。
+
+native SHA256 `ac8200959287737967b9d0665e2b2938ce4872841ed86aa8fefc5d667ccc4457`。
+1620MHz、无并发构建/GPU任务，10/2/batch2的1/64/8K/20K快筛为
+263.008/318.288/2933.760/6921.630us，范围分别263.008–271.328、
+318.288–496.336、2933.760–2949.090、6921.630–6930.370us。64 hashes及pool
+等于ET；只有T1有小幅改善迹象，T64波动较大，长文未优于ET正式参考。
+两处提前continue已撤回，未继续完整数值/sanitizer；不因逻辑上少做扫描就
+保留未证明端到端收益的分支。日志`empty_channel_ex_ep16_t*_quick.log`。
+16:43负载下两机全部GPU SM/graphics1620MHz、显存3201MHz。
+
+### EY：RX先导入有界ready前缀，再扫描ACK（候选，构建中）
+
+独立基于ET，网络depth8，不含EX。原receive_progress每方向每轮最多导入
+一个包，随后扫描全部slot的ACK；现每轮最多导入8个立即ready的连续包，
+遇首个未ready/terminal即停止，然后执行原ACK扫描。每包仍由GIN读取ready、
+累加自身exact expected、发布自身generation，不合并不同slot的生命周期。
+无凑批等待，无额外字段/内存/barrier/开关，也不改变GIN doorbell或signal强度。
+固定批量上限保证其它方向/peer获得推进机会；回卷包在旧ACK未发出时不可能
+被TX重用并到达，因此不会凭空导入下一代。减少重复扫描只是待验证假设；
+额外ready探测和延迟ACK也可能抵消收益。冻结`build/static_v4_rx_import_batch_ey/`。
+
+补充源码审查：当前NCCL2.31.2的GDAKI Put/standalone signal实现不读取
+`signal.isStrong`来区分发送路径；不对仅替换ACK Strong/Weak名称做无依据的
+性能实验。保留原strong ACK及全部system release/acquire。
