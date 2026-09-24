@@ -1,8 +1,9 @@
 # V4 ring 训练对接记录
 
 对应设计文档 M6。默认训练仍执行 V3；M6d 接通 opt-in 单机 ring Forward，
-Backward 仍复用既有调度/GEMM。多机训练 ring 尚未接通，不能将 inference 的
-正确性和性能门禁视为完整训练对接完成。所有未验证改动保持候选状态。
+Backward 仍复用既有调度/GEMM；M6e进一步接通多机checkpoint和有界Backward
+GIN adapter。精确P_actual、完整训练sanitizer/性能门禁尚未完成，不能将
+inference或新Forward的门禁视为整个训练工程完成。
 
 ## M6a：按实际接收量分配 rank-private Backward 中间区
 
@@ -443,3 +444,73 @@ M6d提交`4c22ddc`后，冻结final native又通过EP8 T64调用方allocator的1
 Backward（warmup10）：8 ranks均checked_repetitions12，warmup后无cache miss，
 32梯度hash仍与M6c逐字一致。日志`training_ring_local_m6d_final_backward_ep8_t64_allocator.log`。
 该正确性检查与下一候选CPU构建并行，不作性能比较。
+
+## M6e：多机训练 ring 的 checkpoint / Backward GIN adapter
+
+基于`07856f7`，以下长文正确性及inference回归已完成，不标注完整M6完成。
+复用M6d canonical Notify、独立planner、实际tape分配边界及FC1 epilogue；
+新增network planner/main实例，main只对节点内发布已stage的X。远端Pull复用
+抽出的`checkpoint_copy.cuh`，以RouteLocation的逻辑block/行映射saved-X与
+gate/header；一次G2S、两次S2G全部完成，才发布X-full并计入RX consumed。
+expected/consumed仍是逻辑route数，不随物理写入次数翻倍。
+
+GIN注册区追加既有有界Backward ChunkRing，不恢复旧完整Forward payload。
+首版两套payload不别名，控制状态和NIC counters必须分别持久化；执行slot在
+Forward/Backward完成间交替复用，不由live tape占有。counter0/1继续保留：
+若每slot静态ring占F个counter、Backward占B个、共有S个slot，则静态slot i用
+`[2+i*F, 2+(i+1)*F)`，Backward用`[2+S*F+i*B, 2+S*F+(i+1)*B)`。
+两套初始化均执行，之后不在每调用重置。logical GIN contexts仍8；当前训练
+devComm申请133个context（实际以backend返回为准），覆盖Forward静态96及既有
+Backward需求，操作完成后才复用。
+所有channel/peer映射沿用runtime节点数，不加双机专用数据面分支；硬件验证仅2机。
+
+冻结`build/static_v4_training_ring_network_m6e/`，内含change.patch：
+
+- native `3727e90ed001f46a0224b796069a22d6284ac8c21c3592f5e7ecdf650595fb2e`
+- library `9cbbe860142249d289b71f3d4cedac1f2fea5ae008be9eb5b393f6ae2bdc6b62`
+- extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`
+
+network训练planner REG107/STACK72/SHARED1024；训练prefill/decode main均
+REG168/STACK448/SHARED2048/LOCAL0；inference仍REG168/STACK432/440。
+已通过host18/18；EP16 native T64/E32/K6、B16/D1两次Backward重复一致，64个
+梯度hash逐字与M6c训练参考相同。EP16 Torch T64/E64/K4、max_rows64、B16/D1：
+五类数值、32个failure、16个retry、48个live-tape复用、16个graph及16个offload
+标记齐全，两节点launcher均0。日志前缀`training_ring_network_m6e_`。
+
+EP16 T512全热点、max_rows64、B16/D1也完成完整上述检查，rank0实际R32768。
+rank0/15所有weftmoe kernel memcheck均0errors（PID257087/243508），两个
+launcher均0；日志`training_ring_network_m6e_torch_ep16_t512_memcheck_{0,1}.log`。
+同case的独立Forward racecheck也通过，rank0/15 planner及unified Forward均
+0hazards（PID258162/243897），完整脚本及两launcher均0；不包含旧Backward
+racecheck原子报告未决项。日志后缀`t512_racecheck_{0,1}.log`。
+
+EP16 T1/8192均匀及T20480全热点、max_rows64、B512/D8均完成五类数值及后续
+inference graph/offload（每case各16 ranks、两个launcher均0）。20K热点rank0
+接收R1,310,720，完成Backward后pool compute_bytes为 **6,485,332,024**，其他
+rank **1,116,627,000**；差额5,368,705,024B等于实际dR减空rank最小4KiB。
+GIN为473,820,928B/rank、Notify为90,379,952B/rank。仍不含独立tape、Backward
+tensors及PyTorch参考，不是总显存或峰值；该热点saved-X/G/U/gates/headers本身
+即需8,152,678,400B。没有以减少pool统计冒充总显存收益。
+
+T512网络入口是decode profile；另补T2048/B16/D1全热点的memcheck及Forward
+racecheck，以覆盖prefill宽tile、完整M128的staged epilogue和热点迁移时profile
+切换。两次完整脚本均通过：memcheck rank0/15零错误（PID261957/245557），
+Forward racecheck零hazards（PID262632/245927）；各有16数值、32failure、
+16retry、48live-tape、16graph、16offload标记，两节点launcher均0。
+
+单机兼容另通过native EP8 T64两次Backward（32hash逐字等于M6c）及Torch EP8
+T512全热点、B16/D1的完整OOM/retry/live-tape/graph/offload。并发时仅在另一台
+机器跑独立EP8正确性，不将这两种单机case写成双机EP8。
+正式inference回归也完成：1620MHz、B512/D8、10warmup/20samples/batch20，
+测试期间无并发CPU构建/GPU任务；各case输出hash及pool bytes与M6d/DS一致。
+
+| T/rank | 单机EP8 / us | 双机EP16 / us |
+|---:|---:|---:|
+| 1 | 100.973 | 278.344 |
+| 64 | 134.939 | 333.205 |
+| 8192 | 1253.330 | 2957.980 |
+| 20480 | 2960.660 | 6994.480 |
+
+性能与原inference数据面持平，不把训练功能接入宣称为inference加速。
+EP16 20K相对冻结V3仍仅小幅领先，长序列显著提速目标未完成。日志
+`training_ring_network_m6e_inference_ep{8,16}_t{1,64,8192,20480}_formal.log`。

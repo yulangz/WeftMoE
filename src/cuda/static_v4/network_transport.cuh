@@ -295,14 +295,14 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
 
 // Plan entries are source-interleaved packet ordinals. Each worker touches
 // only its immutable residue; non-consumers never inspect reusable RX storage.
-template <class Storage>
+template <bool Training, class Storage>
 __device__ __noinline__ void
 pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
             unsigned workers, std::uint64_t window, unsigned &peer_rows) {
   const auto &r = a.ring;
   const auto &shape = r.source.shape;
   const auto stride = shape.sources * r.source.packets.packets(shape.tokens);
-  RowPrefetchPipeline<Storage> prefetch(storage, 0U);
+  RingPullCopy<Storage, Training> prefetch(a, storage);
   auto *output =
       peer_at<transport::BFloat16>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
@@ -344,13 +344,21 @@ pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
         const auto row = __shfl_sync(0xffffffffU, location.row, selected);
         const auto packet_row = __shfl_sync(0xffffffffU, token, selected);
         const auto weight = __shfl_sync(0xffffffffU, gate, selected);
+        std::uint64_t index = 0U;
+        if constexpr (Training) {
+          const auto block = __shfl_sync(
+              0xffffffffU, static_cast<unsigned long long>(location.block), selected);
+          index = block * forward_tuning::kTileM + row % forward_tuning::kTileM;
+        }
         if (lane == 0U) {
           gates[row] = weight;
+          if constexpr (Training)
+            ring::save_identity(a, index);
           asm volatile("fence.proxy.async.global;" ::: "memory");
           prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
                         output + std::uint64_t(row) * a.hidden,
                         static_cast<unsigned>(a.hidden *
-                                              sizeof(transport::BFloat16)));
+                                              sizeof(transport::BFloat16)), index);
         }
         mask &= mask - 1U;
       }

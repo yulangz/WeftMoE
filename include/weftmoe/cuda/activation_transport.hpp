@@ -80,8 +80,8 @@ struct ActivationTransportPoolConfig {
   // ForwardTensorStorage, independently of these execution slots.
   bool enable_backward_state = false;
   // Opt-in bounded static Forward workspace. Zero retains the arena path;
-  // otherwise this is the source-token window size. Training currently
-  // supports the node-local backend and an eager plan/allocation boundary.
+  // otherwise this is the source-token window size. Training uses an eager
+  // plan/allocation boundary and independent canonical checkpoint storage.
   std::uint32_t static_forward_window_tokens = 0;
   // Source-side Return/Reduce capacity, independent of destination X/S/C.
   std::uint32_t static_forward_contribution_windows = 2;

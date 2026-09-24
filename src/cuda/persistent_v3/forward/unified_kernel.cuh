@@ -141,7 +141,7 @@ __global__ __launch_bounds__(
     static_v4::ring::stage_input(a,
         std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x,
         std::uint64_t(gridDim.x) * blockDim.x);
-    static_v4::rank_barrier<0U, 384U>(a);
+    static_v4::rank_barrier<0U, 384U, true, true, true>(a);
   }
   if constexpr (StaticSchedule) {
     if (a.fused_inference_routes) {

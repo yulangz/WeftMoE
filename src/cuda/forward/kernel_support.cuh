@@ -874,11 +874,15 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
   layout.production_error_records =
       append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
              "GIN production error records");
-  if (config.static_forward_window_tokens) {
+  if (config.static_forward_window_tokens && !config.enable_backward_state) {
     layout.total = cursor;
     return layout;
   }
   auto &rings = layout.rings;
+  // A retained tape does not own either wire ring. Both sets of controls and
+  // NIC completion counters survive alternating Forward/Backward executions.
+  rings.counter_base += static_cast<unsigned>(
+      2U * layout.static_forward.rings.slots() * config.max_inflight_generations);
   rings.dispatch_channels = remote_nodes * communication::kDispatchChannels;
   rings.return_channels = remote_nodes *
                           (config.max_world_size / config.max_nodes) *
@@ -954,8 +958,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         config.max_intermediate_size == 0U)
       throw std::invalid_argument(
           "static ring requires Forward and GIN for remote nodes");
-    if (config.enable_backward_state && config.max_nodes > 1U)
-      throw std::invalid_argument("training ring requires the node-local backend");
     ring.shape = static_ring_shape(config);
     const auto window_blocks = ring.shape.max_mblocks(config.max_owned_experts);
     ring.max_windows = ring.shape.windows(config.max_tokens_per_rank);

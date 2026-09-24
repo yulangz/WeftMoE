@@ -25,9 +25,12 @@ TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本
 DS进一步让远端Return直写source注册区中的expert-major contribution窗口，
 删除Return RX payload及scatter。packet控制slot在ready发布后退休，payload仍
 由全部token的Reduce credit保护；两种复用边界不能混同，详见6.6的DS说明。
-M6d已接通opt-in **单机训练ring Forward**：独立plan→实际tape分配→main，
-canonical checkpoint接既有Backward。单机长文热点、live tapes、OOM重试与
-新Forward sanitizer已验证；多机训练ring仍显式拒绝，Backward GIN adapter待实现。
+M6d/M6e已接通opt-in **单机/多机训练ring Forward**：独立plan→实际tape分配→main，
+canonical checkpoint接既有Backward；多机复用有界Backward GIN ring，保留独立
+控制状态/counter区间。EP8/EP16长文热点、live tapes、OOM重试已验证，network
+decode/prefill的rank0/15 memcheck及Forward racecheck均0。M6e的EP8/EP16四规模
+inference正式回归通过且性能持平；精确P_actual、完整训练sanitizer/性能门禁
+仍未完成，长序列inference显著领先目标也尚未满足。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -38,7 +41,7 @@ canonical checkpoint接既有Backward。单机长文热点、live tapes、OOM重
 | FC2/Return | FC2 push contribution；多机等节点内全部 FC2 完成后发送 Return，再等待网络阶段结束后 Reduce |
 | 缓冲区 | canonical X/S 和通信区按完整 invocation 容量分配，没有应用层逐 slot 通信/计算 ring |
 | inference launch | route planning 与主流程融合；正式 graph 基线每 rank 一 kernel |
-| training | 非ring保持V3；opt-in单机训练ring见M6d |
+| training | 非ring保持V3（须对应编译profile）；opt-in训练ring见M6d/M6e |
 
 当前通常使用 132 个 384-thread CTA：256 math、32 TMA producer、96 pull/control
 线程。此配置是基线，不是新流水必须保持的角色配额。
@@ -807,8 +810,9 @@ profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一�
 ## 8. Prefill/training 的保存与 no-drop 合同
 
 prefill inference 与 training Forward 共用有界流水，但训练保存实际规模的 tape，
-不是在 ring 中留住整次调用的激活。M6d已接通单机版本，默认及多机训练仍为V3；
-多机ring适配未完成前，显式请求该模式会拒绝。目标流程如下：
+不是在 ring 中留住整次调用的激活。M6d/M6e已接通单机及多机版本，非ring训练
+仍用V3及相应编译profile；Backward保留原GEMM/调度，多机继承8-GPU/node的
+rail合同，节点数按runtime映射，当前仅有2机硬件验证。目标流程如下：
 
 ```text
 route_plan_kernel
@@ -844,8 +848,8 @@ M6对接优先复用materialized Notify已有的`route_dst_row`：它由expert b
 训练plan冻结并传递此映射，物理ring的route_order仍可采用现有枚举顺序；
 保存时映射到canonical row，Backward按原canonical顺序归约。无需仅为tape
 确定性再实现一套物理行排序。Notify及ring窗口规划均属于main之前的plan阶段，
-不能在main里再次执行。M6d已在单机实现并验证该映射及两层plan边界；
-多机仍待接入，不能将两层规划称为一遍planner。
+不能在main里再次执行。M6d/M6e已在单机及多机实现并验证该映射及两层plan边界，
+不能将两层规划称为一遍planner。训练入口拒绝可变fused/replay-counts Notify。
 
 每个 live tape 持有独立 allocation/plan lease，直到 Backward 完成。资源不足可
 等待或显式失败，不能覆盖尚未消费的 tape。输入/输出/plan/tape 真正 OOM 时允许
@@ -1022,14 +1026,19 @@ M6d随后接通单机training ring：冻结canonical Notify和物理window plan�
 用collective准备边界分配实际R的tape；Pull双写X/checkpoint后才发布ready，
 FC1按canonical行保存BF16 G/U，Backward不持有物理ring。EP8的T1/64/512/8192/
 20480数值、20K全热点R655360、三个live tapes及OOM重试通过；T512小ring的
-rank0/7 memcheck0、Forward planner/main racecheck0。多机training ring尚未接通。
+rank0/7 memcheck0、Forward planner/main racecheck0。
+M6e增加network checkpoint和有界Backward GIN window adapter；两个方向的
+wire控制区、NIC counter编号独立持久化，仅在执行完成后复用context。两次S2G
+都完成才发布X-ready及RX consumed，expected仍是逻辑route数。EP16 T1/64/8K/
+20K及20K热点R1310720通过，T512/T2048分别覆盖decode/prefill的rank0/15
+memcheck0和Forward racecheck0。没有恢复完整Forward X/S，也没有双机专用索引。
 Python入口只为Notify/调度元数据预留最坏route容量，X/S保持有界，tape/dR按
 实际R分配；Backward private padding仍为R+expert slack，未实现精确P_actual。
 详见 [训练对接记录](static_forward_v4_training_record.md)。
 
 - [x] 单机canonical tape、plan/实际分配/main复用、checkpoint纳入slot生命周期。
 - [x] 单机Forward/Backward参考、长文热点、多个live tapes、OOM一致失败与重试。
-- [ ] 多机checkpoint及Backward有界GIN window adapter，验证至少EP16及任意节点布局。
+- [x] 多机checkpoint及Backward有界GIN window adapter；通用节点索引/分区，EP16验证。
 - [ ] 精确P_actual分配；当前Backward为实际R加expert padding上界。
 - [ ] 完整训练sanitizer与性能门禁；不以新Forward通过覆盖旧Backward未决报告。
 - [ ] 多机完成后才标注完整training V4支持；保留已验证的V3回退入口。

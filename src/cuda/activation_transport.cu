@@ -1773,9 +1773,9 @@ std::shared_ptr<GinBackendState> create_gin_backend(
     requirements.ginSignalCount = 3U;
     // Every wire slot has its own local-completion counter. Counters 0/1 are
     // reserved for bootstrap and terminal-status collectives.
-    const auto wire_counters = pool->gin_layout.static_forward.rings.depth
-        ? 2U * pool->gin_layout.static_forward.rings.slots()
-        : pool->gin_layout.rings.channels() * communication::kRingDepth;
+    const auto wire_counters =
+        2U * pool->gin_layout.static_forward.rings.slots() +
+        pool->gin_layout.rings.channels() * communication::kRingDepth;
     requirements.ginCounterCount = 2U + wire_counters * pool->slots.size();
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     internal::throw_nccl(
@@ -1818,7 +1818,8 @@ std::shared_ptr<GinBackendState> create_gin_backend(
           network.counter_base += (&slot - pool->slots.data()) * 2U * network.rings.slots();
           static_v4::netring::initialize<<<allocated_context_count, 1, 0, stream>>>(
               resources.dev_comm, window, network);
-        } else {
+        }
+        if (pool->gin_layout.rings.channels()) {
           auto ring_layout = pool->gin_layout.rings;
           ring_layout.counter_base += (&slot - pool->slots.data()) *
                                       ring_layout.channels() * communication::kRingDepth;
@@ -4454,7 +4455,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                              config.retain_backward_state;
   const bool static_v4_candidate =
       forward_tuning::kUnifiedWorkers &&
-      (!use_gin || fused_inference_routes) &&
+      (!use_gin || fused_inference_routes || training_ring) &&
       (!config.retain_backward_state || training_ring) &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
   if (state->layout.static_ring.depth &&
@@ -5008,8 +5009,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const bool split_forward_roles = split_gin_roles || split_local_roles;
     const bool static_v4_enabled = static_v4_candidate;
     if (static_v4_enabled) {
-      // Direct FC2 push is made visible by one rank collective. Combine owns
-      // immutable token stripes and does not consume V3 route-ready queues.
+      // Static Combine owns immutable token stripes. Ring entries consume
+      // per-route generations; arena entries join before Combine. Neither
+      // consumes V3's dynamic route-ready queues.
       args.forward_dynamic_reduce_queue = false;
       args.forward_dynamic_reduce_scan = false;
     }
@@ -5204,7 +5206,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 ? unified_forward_entry<false, false, true, false, true>()
                 : unified_forward_entry<true, false, true, false, true>();
           if (training_ring)
-            kStaticUnified = unified_forward_entry<true, true, true, false, true>();
+            kStaticUnified = use_gin
+                ? unified_forward_entry<false, true, true, false, true>()
+                : unified_forward_entry<true, true, true, false, true>();
           if constexpr (forward_tuning::kStaticV4PrefillEnabled) {
             if (prefill) {
               if (args.ring.depth)
@@ -5216,7 +5220,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     ? unified_forward_entry<false, false, true, true>()
                     : unified_forward_entry<true, false, true, true>();
               if (training_ring)
-                kStaticUnified = unified_forward_entry<true, true, true, true, true>();
+                kStaticUnified = use_gin
+                    ? unified_forward_entry<false, true, true, true, true>()
+                    : unified_forward_entry<true, true, true, true, true>();
             }
           }
           const auto smem =
@@ -5260,6 +5266,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 std::to_string(forward_main_compute_ctas) + " resident CTAs",
                 std::to_string(max_active_clusters) + " resident clusters");
           if (training_ring) {
+            const auto planner = use_gin ? static_ring_plan_kernel<true>
+                                         : static_ring_plan_kernel<false>;
             cudaLaunchAttribute cooperative{};
             cooperative.id = cudaLaunchAttributeCooperative;
             cooperative.val.cooperative = 1;
@@ -5275,11 +5283,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                           12U});
             internal::throw_cuda("forward-plan",
                 internal::prepare_kernel_stack(
-                    reinterpret_cast<const void *>(static_ring_plan_kernel<false>)),
+                    reinterpret_cast<const void *>(planner)),
                 id.calling_rank, id.world_size, backend->session.session().identity(),
                 id.generation, ExchangeKind::ExpertCounts, "prepare ring planner stack");
             internal::throw_cuda("forward-plan",
-                cudaLaunchKernelEx(&plan_launch, static_ring_plan_kernel<false>, args),
+                cudaLaunchKernelEx(&plan_launch, planner, args),
                 id.calling_rank, id.world_size, backend->session.session().identity(),
                 id.generation, ExchangeKind::ExpertCounts, "freeze training ring plan");
             DeviceDispatchRuntime planned{};
