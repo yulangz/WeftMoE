@@ -3403,3 +3403,34 @@ REG168/STACK440/SHARED2048/LOCAL0/CONSTANT3264，patch已归档。相同1620MHz�
 DC为6985.950–7028.110us，未见收益。日志
 `ring_paired_waves_{dp,dc}_ep16_t20480_formal.log`。已撤回计算wave合并；没有
 继续library、完整Torch和sanitizer，不把快筛中的6996.060us认定为优化收益。
+
+### DQ/DR：保留32路准备，分离8/16个独占发包owner（无收益，已撤回）
+
+DC上将Dispatch pack/Return ready与退休检查保留为32路准备角色；另设每方向
+8或16个固定GIN owner，循环处理固定channel余数，不做动态领取或context锁竞争。
+准备角色只在取得`tx_reserved_head`后访问TX；复制/FC2完成后release发布
+`tx_prepared_head`，GIN owner acquire后Put。预留仍检查远端credit和本地NIC
+completion。新head填入NetworkChannel的原padding，结构仍64B，不增加payload；
+借用第三warp的部分Reduce角色，32路RX import及scatter保持不变。
+
+DQ为8个发包owner/方向，共48 contexts；DR为16个/方向，共64 contexts。
+准备warp数不减，区别于DI/DJ减少全部owner，以及DM/DN共享context。这是检查
+独立链路少context收益能否覆盖新增交接/轮询成本，不预设收益。
+
+1620MHz、B512/D8、10 warmup/2 samples/batch2，测量无并发CPU构建或GPU任务：
+
+| T/rank | DQ：8 owners/us | DR：16 owners/us | 当前DC正式参考/us |
+|---:|---:|---:|---:|
+|1|412.880|317.040|275.669|
+|64|471.920|363.040|333.766|
+|8192|3494.260|3057.440|3006.200|
+|20480|8044.240|7015.340|7011.600|
+
+128个输出hash及全部pool bytes与DC一致。DQ host18/18通过；两构建原始日志
+`ring_posting{8,16}_ep16_t*_quick.log`。DQ/DR native SHA256分别
+`f73437fa3548c467ee66272686036ebd68bcf1713cb983e1bb76e74f542d2c95`、
+`427a084bade3a6f3a473af6cc0768c1235c32f80f335133df2524d79271a4565`，
+冻结于`static_v4_ring_posting{8,16}/`并保存独立patch。DQ多机ring kernel资源
+REG168/STACK424/SHARED2048/LOCAL0/CONSTANT3264；栈减少也没有转化为加速。
+DR长序列只接近DC、短序列退化，未继续正式计时、library、Torch或sanitizer。
+全部拆分代码已撤回；后续实验不含prepared head/额外发包角色。
