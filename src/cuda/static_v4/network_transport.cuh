@@ -114,6 +114,8 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
         }
         if (!ready)
           continue;
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPacketReady,
+                                   GinReturn, channel, sequence, rows);
       } else {
         const auto desc = r.dispatch.packets[packet];
         rows = desc.tokens;
@@ -172,6 +174,9 @@ __device__ __noinline__ void transmit(const ForwardKernelArgs &a,
         static_v4::reduce_add_release_system(
             reinterpret_cast<unsigned long long *>(&previous->returned), count);
       }
+      if constexpr (Returning)
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
+                                   GinReturn, channel, sequence, rows);
       endpoint.send(Returning, channel, sequence,
                     std::uint64_t(rows) * row_bytes);
       if constexpr (Returning)

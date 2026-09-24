@@ -85,6 +85,8 @@ EVENTS = {
     99: "ring_plan_exchange_ready",
     100: "ring_plan_geometry_ready",
     101: "ring_plan_ready",
+    102: "return_packet_ready",
+    103: "return_put_start",
 }
 
 PAIRS = {
@@ -100,6 +102,8 @@ PAIRS = {
     "fc1": (9, 10),
     "return_pack": (12, 13),
     "return_issue_to_completion": (14, 15),
+    "return_retirement": (102, 103),
+    "return_put_submit": (103, 14),
     "source_relay": (17, 18),
     "reduce": (20, 21),
     "x_first_local_to_first_mtile": (42, 45),

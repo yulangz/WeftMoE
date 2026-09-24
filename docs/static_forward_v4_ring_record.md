@@ -2891,3 +2891,42 @@ REG168/STACK440/LOCAL0；仅T64的Return目录增加1024 bytes/rank，主测其�
 规模内存不变。日志 `ring_adaptive_return_*`；不包含后续warp Return候选。
 保留CV/CW以恢复并改善短序列，ring仍opt-in。参考前一CO对照轮次V3的20K
 7106.450 us，本轮只快约1.24%，不是新的相邻V3测量，也不是最终性能达标。
+
+### CX：Return warp 控制元数据协作读取（无收益，已撤回）
+
+在CW上实际构建CU归档方案：warp并行读取route/location，以ComputeSlot地址
+match合并ready检查和returned计数；GIN reserve/counter/signal/Put仍仅lane0。
+sequence/reserved/drained由lane0广播，ready acquire之后warp join再提交Put，
+retirement结束join后才推进cursor。没有新buffer、目录或expected计数。
+冻结 `static_v4_ring_return_warp_control_retry/`，native SHA256
+`4efafa95f260f63e0a9115ec31e5d4b41d3ed74208d0863578bb4c01425833a6`，
+REG168/STACK440/LOCAL0。无并发构建的四规模快筛为
+279.056/328.032/3054.350/7136.160 us，64 hashes与CW一致。
+T64只有小幅初步改善，长序列反而退化，不保留整warp控制分支和helper；
+network_transport改动已撤回，增量patch/二进制归档。没有继续library、完整
+PyTorch或sanitizer门禁，不把并行元数据读取本身当成已证实的收益。
+
+### CY：当前 Return 控制阶段的时间线诊断
+
+CW原schema11构建 `static_v4_ring_adaptive_return_timeline/`，native SHA256
+`6c342453112b92dfc3ef85e2ad15cb95db34fd3146aae67f2bc82f22c3dbc4d9`。
+EP16/B512/D8/20K eager11 rounds，每rank156715 events，全部overflow0。
+只在同GPU、该rail本身拥有的四个expert上，以本地Return发布结束对应packet
+Put事件，2560个匹配样本间隔p50为57.280 us；不能跨rank比较globaltimer。
+RX观察到ready→scatter开始p50为2.496 us，scatter本身51.680 us。
+
+进一步增加只在profiling构建生效的ReturnPacketReady、ReturnPutStart两个
+时间点（schema12），区分退休元数据循环与GIN调用本身；普通构建无新事件/同步。
+`static_v4_ring_return_control_timeline/` native SHA256
+`6501776856b730ec0e3bdf74f40534b3729d4218f490ae39bf407d7e77e87fad`。
+同配置每rank159275 events、全部overflow0，两轮32 hashes与CW的20K结果一致。
+20480个packet样本中，ready后退休阶段p50/p95为26.336/31.136 us，
+Put提交13.184/16.704 us；scatter为51.712/61.632 us。上述本GPU匹配样本
+发布结束→全包ready观察为19.840/29.632 us，发布结束→Put为59.264/71.104 us。
+不同样本集合的分位数不可相加解释端到端；插桩时延也不替代CW正式7018.410 us。
+
+本机NCCL proxy Put会构造/提交描述符，可能等待queue credit，所以不能将
+Put返回后的时间点全部归因于C-ready轮询。下一步分别考察重复route/location
+查询与RX scatter；不改变双credit、release范围或数值顺序。
+原始日志/JSON为 `ring_{adaptive_return,return_control}_b512_d8_ep16_t20480_timeline*`，
+包级同GPU匹配脚本和结果另归档于build目录；通用分析器已识别新增事件。
