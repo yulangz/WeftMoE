@@ -5247,3 +5247,305 @@ FX native三项全部exit0：EP8 T512/E16/K6、EP16 T64/E32/K6与T2048/E32/K6，
 全部四个源文件改动，不保留descriptor、额外分支或试验开关。没有反向计时、
 FX library、完整Torch或sanitizer；不可达窄tile告警也未单独清理重编译。
 冻结native/patch保留，日志`gu_tma_{ft_clean,fx}_ep8_t*_training_formal.log`。
+
+### FY/FZ：SavedX静态负载均衡与双CTA分担（候选）
+
+独立基于FT（HEAD `22a0703`仅增加了撤回实验记录），不混入FV/FW/FX。
+当前66个cluster，prefill每Mblock有4对FC1任务；固定Ntile0的checkpoint
+owner落在`(4*mblock)%66`，只覆盖33个cluster。decode的8对也有同样的公因数2。
+FY令保存者为`2*(mblock%pairs)`，仍由一个偶数Ntile保存完整X；不改变任务
+residue、X/S/Return顺序、复制量或checkpoint地址。主机枚举2112个Mblock时，
+两种tile宽度均由33个cluster各64次变成66个cluster各32次。这是分配事实，
+不是性能测量。已有stage empty与all-Ntile fc1_done仍覆盖唯一保存者，未增加
+claim、metadata、counter、map、buffer或barrier。非ring V3不变。
+
+FY冻结`build/static_v4_rotate_x_checkpoint_fy/`，native SHA256
+`567d7c21889b8a3ba9533f009e1df78a259fb859c0663bcac2d57008dbc4b6f9`。
+所有入口资源与FT相同，四个inference完整SASS逐字节等于FT。EP8 T512/E16/K6、
+EP16 T64/E32/K6及T2048/E32/K6各两次Backward，共160个梯度hash与FT逐rank
+相同、repeat_equal均1，三个launcher exit0。尚无性能或完整Torch/sanitizer结论。
+诊断提取器删除checkpoint_owner声明，并同时识别旧n_tile0与新owner条件。
+
+FZ是在FY上的独立下一步：同一选中pair的偶数/奇数Ntile分别保存M[0,64)/
+[64,128)，尾块按两半的实际valid rows限制。每thread目的指针由8减为4，
+两CTA总复制量不变；两者本来就是multicast A的读者，各自完成复制后再提交
+原empty credit，all-Ntile fc1_done覆盖两半。没有增加同步或GM状态。
+helper复制Rows=64，但**共享源的K64 atom跨度仍为M128*64**：只给stage源
+指针加row_begin*64，不能误改为M64 stride；canonical行基址另加row_begin。
+单机M32 TMA及完整bulk wait保持不变，奇数CTA的空尾块不写任何checkpoint。
+
+FZ冻结目录`build/static_v4_pair_x_checkpoint_fz/`，01:09在FY数值检查期间
+开始native CPU编译，尚无FZ数值或性能结果。当前工作树为FZ，不将其结果
+写作FY；准备完成后统一比较FT/FY/FZ及同期V3的retained main/wall，不并行计时
+与构建。两候选均未构建library或完成完整集成、memcheck、racecheck。
+
+FZ native SHA256 `dfc8b42ecf4ba476c713f74e25e1bbecc491cada198f2815ca7568a1b7754ae5`。
+四个inference完整SASS逐字节等于FT；prefill training STACK80/408→72/400，
+decode资源不变，REG168/SHARED2048/LOCAL0/CONSTANT3264不变。EP8 T512/E16/K6、
+EP16 T64/E32/K6与T2048/E32/K6各两次Backward，共160个梯度hash与FT逐rank
+相同，repeat_equal均1，三个launcher exit0。T64的小ring也覆盖了奇数CTA没有
+有效checkpoint行的尾块；这仍不能替代完整热点及sanitizer门禁。
+
+新提取器构建的pure_gemm SHA256
+`5f44bd10712a510d4a167f7a9770961b58e07430c4a3a70cd192d7ef9a983d5f`，packed/
+separated chain8192/world16均full_output=1、repeat_byte_identical=1、max_abs=0。
+它不保留checkpoint，仅验证提取器/GEMM数值，不把它的延迟当作FY/FZ收益。
+日志`pair_x_checkpoint_fz_{native_ep*_t*,pure_*_chain}.log`。
+
+01:15全部构建及数值检查结束，核实两节点所有SM/graphics1620MHz（显存频率
+未锁定），开始FT/FY/FZ及同期V3的22组retained eager正式对照。EP8长文B512/D8，
+EP16长文B512/D8及B1024/D4，10warmup/20samples，测试期间两节点独占且无CPU
+构建或其它GPU工作。尚无性能结论，不提前采用。
+
+22组正式对照全部exit0，288个输出hash逐rank与同期V3相同；world、shape、
+retained=1及10/20核实，FT/FY/FZ在相同B/D下pool完全一致。EP8的main取
+device_kernel_slowest_rank_us，不能用V3含前后独立阶段的forward字段替代。
+
+|EP|T/rank|B/D|版本|main p50/us|wall p50/us|
+|---|---:|---|---|---:|---:|
+|8|8192|nonring|v3|1325.12|1716.72|
+|8|8192|512/8|ft_clean|1349.70|1838.43|
+|8|8192|512/8|fy|1348.10|1839.91|
+|8|8192|512/8|fz|1334.62|1848.53|
+|8|20480|nonring|v3|3131.94|3574.43|
+|8|20480|512/8|ft_clean|3225.06|3815.56|
+|8|20480|512/8|fy|3228.67|3804.34|
+|8|20480|512/8|fz|3201.50|3775.58|
+|16|8192|nonring|v3|2919.36|3428.15|
+|16|8192|512/8|ft_clean|3273.89|4078.95|
+|16|8192|512/8|fy|3301.15|4092.48|
+|16|8192|512/8|fz|3292.10|4076.31|
+|16|8192|1024/4|ft_clean|2982.82|3802.74|
+|16|8192|1024/4|fy|2969.09|3806.34|
+|16|8192|1024/4|fz|2943.26|3761.89|
+|16|20480|nonring|v3|6648.29|7187.30|
+|16|20480|512/8|ft_clean|8007.01|8943.78|
+|16|20480|512/8|fy|7946.08|8900.25|
+|16|20480|512/8|fz|7945.60|8898.76|
+|16|20480|1024/4|ft_clean|7236.32|8192.84|
+|16|20480|1024/4|fy|7282.91|8246.78|
+|16|20480|1024/4|fz|7264.74|8229.78|
+
+FY单机基本持平；FZ单机main改善1.12%/0.73%，但8K wall略慢且有2400.77us
+离群点，20K wall改善1.05%。EP16 B1024的8K main/wall改善1.33%/1.07%，
+20K反而慢0.39%/0.45%；B512的8K main慢0.56%、wall持平，20K改善约0.77%/
+0.50%。各组main范围重叠，FY B512/20K有19542.3us离群点，不能只报最优p50。
+尚不采用FY/FZ；继续反向顺序复测FZ。日志
+`x_checkpoint_balance_{v3,ft_clean,fy,fz}_ep*_t*_b*_d*_training_formal.log`。
+
+反向单机FZ→FT，第二节点独占，第一节点同时构建下述GA；计时节点无构建。
+8K main1334.50/1349.25、wall1823.65/1846.04us；20K main3215.10/3217.63、
+wall3779.01/3782.81us。32个hash与同期V3相同，pool/shape/retained/10/20核实。
+8K main两次约改善1.1%，20K第二次仅0.08%，wall仍受host波动影响。
+代码暂时停放并还原FT，冻结FZ二进制继续双机反向检查，不与新通信候选叠加。
+
+双机反向FZ→FT八组全部exit0，128个hash相同，pool/shape/retained/10/20核实。
+两节点独占且无CPU构建；1620MHz，单位us：
+
+|T/rank|B/D|FZ main|FT main|FZ wall|FT wall|
+|---|---|---:|---:|---:|---:|
+|8192|512/8|3295.65|3301.63|4090.49|4092.22|
+|8192|1024/4|2951.97|2976.00|3772.66|3795.74|
+|20480|512/8|7953.22|8017.54|8910.03|8980.83|
+|20480|1024/4|7253.82|7309.86|8218.30|8279.49|
+
+B512的20K main两次改善0.77%/0.80%，B1024的8K改善1.33%/0.81%；B512/8K
+与B1024/20K没有一致方向，区间也重叠，不宣称全面加速。结合单机8K约1.1%
+改善，FZ值得进入完整Torch及新Forward sanitizer门禁；此时仍未采用、尚未
+构建library。FY没有单独稳定收益，不继续单独验收；FZ仍使用其pair轮换。
+日志`x_checkpoint_balance_reverse_{fz,ft_clean}_ep16_t*_b*_d*_training_formal.log`。
+
+### GA：连续已退休slot的ACK合并（候选）
+
+独立基于FT，不含FV/FY/FZ。每slot仍保留ready/visible generation、consumed
+total及精确retire_target；RX唯一owner逐一acquire检查head到rx_cursor之间的
+连续已退休slot，将新增前缀以一次GIN signal-add返还。TX原本严格顺序推进，
+不能跨过未获credit的head发后续包，因此这里没有新增发送队头阻塞。与旧CB
+“按head扫描但仍逐包ACK”不同，本项减少实际NIC signal提交次数。
+
+TX复用必须同时满足remote consumed prefix和原本的local NIC completed head；
+显式flush仍保留，不能由远端credit推断本地完成。无全局barrier、动态claim或
+expected原子。channel64→128 bytes，双机L32多4096 bytes/rank；slot仍64 bytes，
+删除未用的逐slot credit/ack字段。跨调用GIN计数持续累计，owner head只从完全
+drained的rx_base开始；初始化仅发生在pool构建。顺序扫描最多触及depth个slot。
+复用已有slot生命周期单测，改为验证乱序消费/连续credit与NIC双条件，未新增
+测试套件。冻结`build/static_v4_credit_prefix_ga/`，01:30开始native构建；
+尚无正确性或性能结论。FZ单机反向在第二节点独占，GA只占第一节点CPU。
+
+GA host18/18通过，包含既有window packets、slot lifetimes和network layout。
+native SHA256 `4246ee039710c895763cbc5d028c2f08d0e76cddbb185b0d2922d53998f8c552`。
+local资源与FT一致；network inference STACK392不变、training STACK408→416，
+REG168/SHARED2048/LOCAL0/CONSTANT3264不变。开始三项native正确性对照。
+
+GA2是在GA上的第二步：每轮最多导入8个连续ready包，首个未ready即停止，再
+合并consumed ACK。这与旧EY相同的有界导入预算，但EY仍逐slot发送ACK且没有
+稳定收益；不能把组合候选的收益提前归因给导入批处理。每包GIN acquire、
+expected target及visible发布保持独立，双credit不变，没有额外state或barrier。
+冻结`build/static_v4_credit_prefix_batch_ga2/`，01:34在GA native检查时开始CPU
+构建；这些检查不用于计时。完整正式对照将等待所有CPU/GPU检查结束。
+
+GA三项native全部exit0，160个梯度hash逐rank等于FT，repeat_equal均1。
+四个local（decode/prefill×inference/training）完整main SASS逐字节等于FT。
+GA2 native SHA256 `4e091b3b87f95f9a32bde9189ca586364218f0cd61e53b36bc8971c49c306ca9`。
+local资源与FT相同；network inference STACK400（FT392）、training decode408/
+prefill416（FT均408），REG168/SHARED2048/LOCAL0/CONSTANT3264不变。
+01:37全部CPU构建结束，核实两节点SM/graphics1620MHz，显存频率未锁定。
+GA2正执行相同三项native检查；两版均未构建library或做完整Torch/sanitizer。
+
+GA2三项native全部exit0，160个梯度hash与FT逐rank相同、repeat_equal均1；
+四个local完整SASS也逐字节等于FT。01:39全部CPU与GPU检查结束，开始双机
+FT→GA→GA2的8K/20K正式graph10/20/batch20对照；随后串行FZ→FT双机retained
+反向复测。期间两节点独占，不运行编译或其它GPU任务。
+
+首轮六组graph全部exit0，96个hash逐rank与同期V3相同，world/shape/10/20/
+batch20核实；GA/GA2 pool均仅比FT增加4096 bytes/rank，符合channel布局变化。
+1620MHz、B512/D8、Q8/Q16/L32，rank-max p50（us）：
+
+|T/rank|FT|GA|GA2|
+|---|---:|---:|---:|
+|8192|2895.14|2891.11|2886.89|
+|20480|6947.78|6859.26|6866.42|
+
+8K差异不足0.3%；20K候选改善1.27%/1.17%，但FT本轮区间6925.14–6981.67us
+高于之前约6890us的相邻基线，需要反向复测而非直接采用。未测实际ACK批长，
+不能将候选总变化全部归因于NIC消息数下降。日志
+`credit_prefix_{ft_clean,ga,ga2}_ep16_t*_formal.log`。无library/完整Torch/sanitizer。
+
+01:45 GA/GA2源码暂时撤回到FT，冻结patch/binary保留，反向复测继续使用这些
+已冻结产物。当前工作树准备独立GB（完整FC1 TMA写回的重复device fence），
+尚未编译或测量；本轮性能不包含GB，不在计时期间编译。
+
+反向GA2→GA→FT六组全部exit0，96个hash及各版本pool与首轮完全相同，shape/
+world/10/20/batch20再次核实。1620MHz，双机独占且无构建，us：
+
+|T/rank|GA2|GA|FT|
+|---|---:|---:|---:|
+|8192|2886.51|2886.76|2893.79|
+|20480|6925.33|6860.29|6888.60|
+
+GA的8K正反向仅改善0.14%/0.24%；20K反向改善0.41%，GA范围6842.72–6867.98、
+FT6870.98–6900.26us。本项收益应以约0.4%的保守反向值描述，不采用首轮1.27%
+作为稳定增益。GA2反向20K慢0.53%，没有超越GA的稳定收益，**撤回GA2额外导入
+循环**。GA仍须完整集成/sanitizer/训练性能验证，不提前称为已验收。
+日志`credit_prefix_reverse_{ga2,ga,ft_clean}_ep16_t*_formal.log`。
+
+### GA + FZ：组合集成门禁（进行中）
+
+01:52源码组合GA与FZ，冻结`build/static_v4_checkpoint_credit_gafz/`。
+不含GA2、GB、FV、FX或FW；GB两文件试验已停放到其冻结patch，未编译。
+组合只额外整理GA初始化缩进，并在已有slot单测补一条“本地已完成但远端
+prefix未推进时仍不可复用”的断言。开始native/library/extension及host构建，
+无性能测试并发。随后复用已有完整EP8/EP16、短ring、多live tape、OOM/retry、
+热点及Forward memcheck/racecheck脚本，不新增测试套件。FZ单独library/gates
+从未执行，不把组合检查重标为单独FZ；两项独立微小收益也不能简单相加。
+
+组合native SHA256 `24de16c025aafbc70987214640b321c66fb63fc0d45a443e58eb18ddde69ab1b`，
+library `fcc970fb7d3f7972579807ae33ae60b71b7a547a1e44a89fab14540940321a80`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+两产物的REG168/SHARED2048/LOCAL0/CONSTANT3264相同；inference STACK local
+decode80/prefill64、network均392；training local均72、network decode416/
+prefill408。四个native inference完整SASS逐字节等于GA；并未声称training
+组合机器码等于任一单独候选。host18/18通过。
+
+三组组合native全部exit0，160个梯度hash与FT逐rank相同、repeat_equal均1。
+01:57在所有构建/native检查结束并再次核实两节点SM/graphics1620MHz后，开始
+第一节点EP8完整九项Torch门禁；第二节点独占20组单机EP8正式对照（四档
+inference对同期V3、四档retained training对同期V3/FT）。计时节点无构建或
+其它GPU工作，第一节点仅正确性检查；此时尚无完整Torch/sanitizer/组合性能结论。
+
+02:01 EP8九项全部exit0，逐rank PASS数量与FT门禁完全相符：四档训练及20K
+hotspot、短档各16次准备失败/8次retry/24个live-tape复用，inference full240/
+tiny152/nonring32，以及B1024/D4长文两项。20组单机正式对照全部exit0，160个
+输出hash逐rank等于同期V3，shape/world/warmup/样本数及retained核实，训练
+pool与FT一致。图重放10/20/batch20、retained eager10/20；1620MHz，rank-max
+p50（us），第二节点独占计时，第一节点仅Torch正确性：
+
+|T/rank|V3 inference graph|GA+FZ inference graph|V3 training main/wall|FT training main/wall|GA+FZ training main/wall|
+|---|---:|---:|---|---|---|
+|1|300.277|100.910|197.760 / 471.682|71.584 / 384.761|69.856 / 383.170|
+|64|370.696|135.406|264.320 / 554.903|100.416 / 436.316|97.152 / 430.782|
+|8192|1489.090|1246.600|1330.340 / 1733.020|1349.660 / 1839.310|1335.140 / 1825.620|
+|20480|3295.760|2937.720|3132.420 / 3588.340|3215.710 / 3816.910|3208.860 / 3780.860|
+
+单机inference代码与FT一致，不把这组微小变化归因于GA/FZ。训练main相邻
+改善2.41%/3.25%/1.08%/0.21%；长文wall改善0.74%/0.94%，但相对V3仍慢
+5.34%/5.37%。短档改善仅首轮相邻结果，不能替代反向稳定性验证。
+日志`checkpoint_credit_gafz_final_{v3,ft_clean,gafz}_remote_ep8_t*_{formal,training_formal}.log`。
+02:02确认单机计时及检查均结束后，启动EP16十二项完整门禁，尚无双机验收结论。
+
+首轮前八项已完成；第九项prefill memcheck的node0 launcher在绑定29988时
+报EADDRINUSE，尚未启动算子。保留两端`*_port_failure.log`，只终止本次等待
+rendezvous的远端torchrun，不处理占用端口的其它进程。02:13换30120–30123
+补跑；恢复脚本的T匹配也包含20480，因而额外重跑了第4–8项，不将重复检查
+算作新增覆盖。最终验收须核实补跑两端exit及完整PASS/sanitizer数量。
+
+02:23补跑exit0，24份最终node日志的rank级PASS数量与FT完整门禁逐项一致，
+无launcher/数值错误；四档训练、20K热点、短档OOM/retry/live tapes，inference
+full480/tiny304和B1024/D4两档长文全部通过。最终T64/B16/D1 memcheck
+PID405965/466579、Forward racecheck408166/466970；T2048/B512/D8热点的
+memcheck410363/467553、Forward racecheck411602/467936，分别为rank0/15，
+均0 errors，racecheck额外0 hazards/0 warnings。不宣称完整Backward racecheck
+clean。末段正确性与GB候选的本机CPU构建并行，不使用这些时间作性能结果。
+
+GB已冻结后撤回，七个实现/测试文件的diff逐字节恢复组合change.patch。
+02:23再次核实全部16卡SM/graphics1620MHz；memory clocks仅观测、没有锁定。
+全部CPU构建及GPU检查结束后，开始28组双机独占正式对照：四档graph的
+V3→FT→GA+FZ，四档retained B512/D8的V3→FT→GA+FZ，以及长文B1024/D4
+的FT→GA+FZ。期间不运行其它GPU任务或CPU构建，结果尚待核实。
+
+02:30双机inference十二组完成，192个hash逐rank等于同期V3，shape/world/
+10warmup/20samples/batch20核实；GA+FZ每rank pool恰比FT增加4096 bytes。
+rank-max p50（us）：
+
+|T/rank|V3|FT|GA+FZ|较FT下降|较V3下降|
+|---:|---:|---:|---:|---:|---:|
+|1|682.034|268.651|236.034|12.14%|65.39%|
+|64|824.120|317.395|286.896|9.61%|65.19%|
+|8192|3355.780|2912.800|2893.170|0.67%|13.79%|
+|20480|7102.290|6877.890|6863.170|0.21%|3.37%|
+
+短档此前没有独立GA正式数据，本轮首次观察到约30–33us改善，仍需反向确认。
+GA不再逐slot扫描terminal远端credit，是待验证的成本解释；没有测ACK batch
+长度或单独计时drain，不能把全部改善量归到某条指令。长文新增收益仍小，
+20K仅领先V3 3.37%，整体目标继续开放。FZ的inference机器码与GA相同，不
+把该表归为checkpoint优化。日志
+`checkpoint_credit_gafz_final_{v3,ft_clean,gafz}_ep16_t*_formal.log`。
+retained训练十六组仍在运行。
+
+02:39全部28组exit0；retained十六组256个原始uint64 hash以字符串比较，逐rank
+等于同期V3，实际shape/world/10/20/retained=1及pool核实。连同graph共448个
+hash一致。训练rank-max p50/us；pool为bytes/rank，不含独立tape：
+
+|T/rank|版本/B/D|main|wall|pool|
+|---:|---|---:|---:|---:|
+|1|V3|442.208|734.747|354118336|
+|1|FT/512/8|168.704|626.280|390711488|
+|1|GA+FZ/512/8|133.920|594.082|390715584|
+|64|V3|600.640|901.641|359665344|
+|64|FT/512/8|216.640|696.511|419244736|
+|64|GA+FZ/512/8|186.400|662.490|419248832|
+|8192|V3|2927.170|3438.270|1079452608|
+|8192|FT/512/8|3289.280|4092.800|702615744|
+|8192|GA+FZ/512/8|3267.970|4058.140|702619840|
+|8192|FT/1024/4|2975.490|3792.770|870256832|
+|8192|GA+FZ/1024/4|2930.590|3767.730|870260928|
+|20480|V3|6658.500|7181.430|2167634880|
+|20480|FT/512/8|7978.240|8929.010|819971520|
+|20480|GA+FZ/512/8|7934.240|8911.160|819975616|
+|20480|FT/1024/4|7332.220|8287.570|987170496|
+|20480|GA+FZ/1024/4|7238.080|8216.610|987174592|
+
+长文同容量main改善：B512为0.65%/0.55%，B1024为1.51%/1.28%；wall改善
+分别0.85%/0.20%、0.66%/0.86%。B1024的8K main接近V3，但wall仍慢9.58%；
+20K wall仍慢14.41%，不把短档或主核改善等同于训练端到端达标。GA/FZ组合
+不能精确拆分归因，独立候选的数据仍单列。日志
+`checkpoint_credit_gafz_final_{v3,ft_clean,gafz}_ep16_t*_b*_d*_training_formal.log`。
+02:40开始短档反向GA+FZ→FT，仍两节点独占且无CPU构建，未先称稳定通过。
+
+短档反向四组全部exit0，64个输出hash逐rank等于同期V3；shape/world/10/20/
+batch20及pool与首轮一致。T1的GA+FZ/FT为236.074/268.810us，下降12.18%；
+T64为286.930/317.522us，下降9.64%，与首轮12.14%/9.61%一致。
+日志`checkpoint_credit_gafz_reverse_{gafz,ft_clean}_ep16_t{1,64}_formal.log`。
+据完整门禁及正反向结果采用GA+FZ；没有增加新测试套件。FZ独立训练收益和
+GA短档通信收益分别保留证据，不把组合收益做线性拆分。当前长文inference、
+训练wall及完整Backward racecheck目标仍开放，未将这一里程碑标为全项目完成。

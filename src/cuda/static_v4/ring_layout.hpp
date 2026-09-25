@@ -30,11 +30,9 @@ packet_bytes(std::uint32_t rows, std::uint32_t hidden) {
 // Local NIC completion belongs to the TX owner's channel prefix, not the RX.
 struct alignas(64) NetworkSlot {
   std::uint64_t ready_signal = 0;
-  std::uint64_t credit_signal = 0;
   std::uint64_t visible_generation = 0;
   std::uint64_t consumed_total = 0;
   std::uint64_t retire_target = 0;
-  std::uint64_t acknowledged_generation = 0;
 };
 static_assert(sizeof(NetworkSlot) == 64U);
 
@@ -49,8 +47,10 @@ struct alignas(64) NetworkChannel {
   std::uint64_t tx_reserve_cursor;
   std::uint64_t tx_reserved_head;
   std::uint64_t tx_completed_head;
+  std::uint64_t acknowledged_head;
+  std::uint64_t credit_signal;
 };
-static_assert(sizeof(NetworkChannel) == 64U);
+static_assert(sizeof(NetworkChannel) == 128U);
 
 struct SlotSequence {
   std::uint64_t sequence;
@@ -66,9 +66,10 @@ struct SlotSequence {
     return generation() + 1U;
   }
   WEFTMOE_STATIC_RING_HD constexpr bool
-  reusable(std::uint64_t credit, std::uint64_t completed_head) const {
-    return communication::reached(credit, generation(), 64U) &&
-           (sequence < depth || sequence - depth < completed_head);
+  reusable(std::uint64_t consumed_head, std::uint64_t completed_head) const {
+    return sequence < depth ||
+           (communication::reached(consumed_head, sequence - depth + 1U, 64U) &&
+            sequence - depth < completed_head);
   }
 };
 

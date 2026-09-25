@@ -1088,11 +1088,20 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
           const auto valid_rows = info.valid_rows;
           const auto n = n_tile * Fc1TileN;
           if constexpr (StaticSchedule) {
+            constexpr auto kCheckpointRows = forward_tuning::kTileM / 2U;
+            const auto checkpoint_begin = (n_tile & 1U) * kCheckpointRows;
+            const auto checkpoint_rows = valid_rows > checkpoint_begin
+                ? min(valid_rows - checkpoint_begin, kCheckpointRows) : 0U;
             using Fc1TileMma = typename hopper::BF16MMASelector<Fc1TileN>::type;
-            StaticV4XCheckpoint<TileK, StaticLocal> x_checkpoint;
+            // Rotate the checkpoint pair across static residues. With 66
+            // clusters, fixed Ntile0 otherwise loads only half the clusters.
+            const bool checkpoint_owner =
+                n_tile / 2U == mblock % (fc1_ntiles / 2U);
+            StaticV4XCheckpoint<TileK, StaticLocal, kCheckpointRows> x_checkpoint;
             if constexpr (RetainBackwardState && RingSchedule)
-              if (n_tile == 0U)
-                x_checkpoint.prepare(a, mblock, valid_rows);
+              if (checkpoint_owner)
+                x_checkpoint.prepare(a, mblock, checkpoint_rows,
+                                     checkpoint_begin);
             float accum[Fc1TileMma::kNumAccum];
 #pragma unroll
             for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
@@ -1132,13 +1141,14 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               for (int index = 0; index < Fc1TileMma::kNumAccum; ++index)
                 cute::warpgroup_fence_operand(accum[index]);
               if constexpr (RetainBackwardState && RingSchedule)
-                if (n_tile == 0U)
-                  x_checkpoint.save(smem_a + stage * kAStageElements,
-                                    valid_rows, iteration * TileK, a.hidden,
+                if (checkpoint_owner)
+                  x_checkpoint.save(smem_a + stage * kAStageElements +
+                                        checkpoint_begin * 64U,
+                                    checkpoint_rows, iteration * TileK, a.hidden,
                                     a.saved_x_map);
               cute::warpgroup_wait<0>();
               if constexpr (RetainBackwardState && RingSchedule)
-                if (n_tile == 0U)
+                if (checkpoint_owner)
                   x_checkpoint.finish();
               const auto lane = threadIdx.x & 31U;
               if (lane < 2U)

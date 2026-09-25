@@ -167,6 +167,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       channel.tx_reserve_cursor = channel.tx_reserved_head = channel.tx_base;
       channel.tx_completed_head = channel.tx_base;
       channel.rx_cursor = channel.consume_cursor = channel.rx_base;
+      channel.acknowledged_head = channel.rx_base;
     }
   }
   if constexpr (Network) {

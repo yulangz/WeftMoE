@@ -82,6 +82,13 @@ B staging；decode/尾块/nonring保持原路径，训练G/U仍按canonical行�
 相邻正反向约改善0.3%–0.5%，双机及训练持平。详细证据与候选消融见ring记录FT–FV，
 不据此关闭双机20K显著领先目标。
 
+GA/FZ组合进一步将逐slot退休确认合并为channel consumed-prefix ACK，并将
+SavedX交给轮转的FC1 pair、每CTA复制半个M。没有删除远端消费或本地NIC完成
+条件，也不增加checkpoint读者/barrier。单/双机完整数值、复用及Forward专项
+sanitizer通过，组合正式矩阵及短档反向复测完成并采用。EP16短档相对FT下降
+约12.2%/9.6%，长文仅小幅改善，尚未据此关闭整体性能目标。当前布局和
+同步合同见第5节及6.4，独立消融/组合证据见ring记录GA/FZ。
+
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
@@ -255,7 +262,7 @@ S 容量；不能在过大的 wave 里让 FC1 等 S 空位、FC2 又等该 wave 
 | X ring | `[D_x, M, H]`，另有 gate/本代元数据 | 本 GPU，所有 FC1 读者退休后复用 |
 | S ring | `[D_s, M, I]` | 本 GPU，所有 FC2 读者退休后复用 |
 | C / FC2 输出 | 首版 `[D_c, M, H]`；CN/CO 后不分配 payload | 保留逐 slot 的 FC2/returned 账本，输出直接写已预留的 contribution/TX |
-| Dispatch TX / RX | 分离的 `[remote_node, lane, D_net, slot_bytes]` | 本 rail 的注册区，逐 slot credit |
+| Dispatch TX / RX | 分离的 `[remote_node, lane, D_net, slot_bytes]` | 本 rail 的注册区，逐slot退休、channel consumed-prefix credit |
 | Return TX / RX | 同样分离的 peer/channel ring | 不与 Dispatch 或对向 TX 别名 |
 | contribution | source 上至多 `D_contrib×B×K×H` 及 route-ready；多机每窗expert-major，单机token-major | 窗口全部 token 的 Reduce 完成后释放 |
 | immutable route plan | 实际路由/窗口几何及返回映射 | invocation；训练延长到 Backward |
@@ -433,7 +440,11 @@ l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftM
 混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
 
 当前training的Pull只完成物理X写入及canonical identity/gate保存后发布X full。
-FM由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX。
+FM最初由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX。
+当前FZ改为唯一静态pair：`n_tile/2 == mblock % (fc1_ntiles/2)`，避免固定
+Ntile0在66个cluster/偶数pair步长下只给半数cluster分配checkpoint工作。
+pair的偶/奇CTA分别保存M的前/后64行；尾块只复制各自有效行，空半块不写。
+两个CTA本来就是multicast A的读者，总SavedX字节数不变，不新增读者或计数。
 Network沿用FO：进入K循环前缓存目的指针，math warp先完成uint4复制及WGMMA
 wait0，再向两个CTA的stage empty到达；不会在仍有stage读者时覆盖它。
 
@@ -443,13 +454,16 @@ FR3的local training物理Mblock属于单个expert，且canonical行严格递增
 路径写入；两种写入互斥。K128 stage中的两个N64 swizzle atoms按M128分隔，
 第`chunk`段、第`atom`块的BF16元素偏移为`atom*128*64 + chunk*32*64`，
 不能把它误当成普通row-major K128。无需额外tensor-map数组、GM目录或计数。
+FZ的每CTA view先偏移`row_begin*64`，canonical映射也偏移row_begin；即使
+view只有M64，K64 atom间距仍是`128*64`，不能缩成`64*64`。每CTA只保存
+两个M32 chunk的状态及四个K128向量目的指针，原连续性判断不变。
 
 TMA在A-ready acquire及WGMMA commit后发出，每stage提交一个bulk group。
 WGMMA wait0退休矩阵读者；TMA issuer再等待**完整global completion**，随后
 第一warp执行join，才让lane0/1分别向两个CTA的empty到达。当前A由CTA0
 multicast；该显式join不依赖隐式warp收敛，也没有新增跨CTA barrier对象。
 不采用仅`.read`等待或将完整完成推迟到task末尾的FR2候选。
-SavedX完成仍先于本tile的FC1发布，因此已有F1释放链涵盖checkpoint owner，
+SavedX完成仍先于各自tile的FC1发布，因此已有F1释放链涵盖两个checkpoint owner，
 不需要独立读者计数。映射在整个task内不可变，valid-row及hidden-tail检查保留。
 
 FC1在相应S slice ready前完成saved-G/U写回。SavedX/G/U属于独立tape，不随
@@ -528,7 +542,8 @@ fanout 数批量累计；ACK owner 等第 4.2 节的 retire_target 后返还该�
 
 某个 Mblock 的全部有效行完成即可启动 FC1，不等当前 packet 的其他 fanout、
 本窗口其他 Mblocks，更不等所有远端 Dispatch。后续包可同时被 NIC 接收。
-RX packet 的尾部慢 reader 只背压对应物理 slot，不形成全局已完成前缀。
+RX packet的尾部慢reader背压其channel的静态发送序；GA只合并同channel中
+已经逐slot确认退休的连续prefix，不形成跨channel、节点或窗口的全局前缀。
 
 多机 pull 的任务遍历以 channel 的 packet sequence 为外层，再静态划分该包的
 fanout；不能机械沿用 expert-major canonical row 的阻塞遍历。否则当前 RX slots
@@ -562,7 +577,7 @@ Return RX 不需要等 Reduce，Return TX 不需要持有 C 原址到网络完�
 在有界方案里至多按已预留的有限窗口批量 Reduce。Return/Reduce 的更细重叠可独立
 消融，但不能破坏窗口回收进度。
 
-### 6.4 逐 slot 复用决策（ES 已验收，保留双检查）
+### 6.4 逐 slot 复用决策（ES 本地完成 + GA 消费前缀，保留双检查）
 
 Dispatch/Return TX 覆盖前均保留：
 
@@ -573,10 +588,12 @@ AND
 ```
 
 首版“本地 credit”使用GIN逐slot completion counter，不额外增加跨机ACK。
-ES将它改为唯一TX owner维护的channel级`tx_completed_head`，但没有删除
-本地完成条件：sequence `s`复用前，远端credit须达到`s/depth`，并且首次使用
-或`s-depth < tx_completed_head`。head表示本channel已确认本地完成的连续发送
-prefix，不是reserve cursor，也不拿另一context的完成替代。
+ES将它改为唯一TX owner维护的channel级`tx_completed_head`，没有删除
+本地完成条件。GA再把原逐slot远端credit汇总为channel的`credit_signal`，
+表示远端已消费的连续packet数。sequence `s`首次使用（`s<depth`）直接满足；
+复用时须同时满足`credit_signal >= s-depth+1`和`tx_completed_head >= s-depth+1`。
+两个head分别证明远端软件消费和显式本地完成，均不是reserve cursor，
+也不拿另一context的完成替代。
 
 对于一份 TX、一次 Put、一份 RX，消费后返回 credit 的因果链已经包含该 payload
 的传输；但不代表GIN的本地完成通知此刻必然更新。仍采用保守双检查，
@@ -591,10 +608,37 @@ ES的具体推进方式：
   flush只等已发NIC请求，不等未来FC2/软件读者或其它channel的准入；没有持有
   共享软件锁，RX/ACK角色继续独立推进。多channel共享同一owner/context时，
   即使flush顺带完成同peer其它channel，也只保守推进当前channel的head。
-- terminal确认剩余已发prefix完成，并逐slot等远端credit；完全drain后才开始
-  下一调用，以tx_base初始化completed_head。不在有请求/读者在途时重置。
-- NetworkChannel仍64B，head占原末尾padding；已删除Forward无用途的counter
-  分配/reset、counter_base和slot.local_target。Backward保留自己的逐slot counter。
+- terminal确认剩余已发prefix完成，并等远端consumed head达到terminal；完全
+  drain后才开始下一调用，以tx_base初始化completed_head、rx_base初始化
+  acknowledged_head。GIN signal贯穿调用/graph replay累积，只在pool构造时reset。
+- ES当时NetworkChannel仍64B；GA增加两个head/signal字段后为128B，见下文。
+  已删除Forward无用途的counter分配/reset、counter_base和slot.local_target。
+  Backward保留自己的逐slot counter。
+
+GA仍逐slot确认退休，只合并已确认的ACK：
+
+1. RX import取得本包ready后，将immutable incoming plan的fanouts或rows累加到
+   此物理slot的retire_target，再发布visible_generation。各reader完成后按原合同
+   release累加consumed_total，expected不做运行时竞争更新。
+2. 唯一RX owner从acknowledged_head扫描到rx_cursor，逐slot system-acquire
+   检查`consumed_total >= retire_target`；遇到首个未退休slot即停，不因其它
+   slot ready而推断它已消费。扫描不会越过实际导入的包，最多覆盖ring depth。
+3. 若head推进，用一次GIN signal-add向对端credit_signal累加推进量，然后更新
+   owner私有acknowledged_head；不等待凑满batch。TX及reservation原本就按
+   sequence顺序推进，晚slot提前返回credit也不能越过队首，所以没有新增可用
+   发送顺序的限制。不同channel仍独立推进。
+
+物理布局（均为uint64，GIN signal仅通过GIN访问）：
+
+|对象|有效字段及byte offset|对齐/大小|
+|---|---|---|
+|NetworkSlot|ready_signal 0，visible_generation 8，consumed_total 16，retire_target 24|64B / 64B|
+|NetworkChannel|原tx/rx base、cursor、reservation、tx_completed_head占0–63；acknowledged_head 64，credit_signal 72|64B / 128B|
+
+Dispatch/Return分别拥有上述状态，控制slot仍逐物理slot保存。GA不增加payload
+容量，2节点/32 lanes仅增加4096 bytes/rank，通常为`4096*(nodes-1)`。不能把
+remote consumed-prefix当成local NIC completion，也不能把Return控制slot退休
+当成source contribution窗口已被Reduce消费。
 
 这遵循GIN显式本地完成合同，不是“收到ACK便假定API completion”。初版ES的
 20K相邻/反向正式对照改善0.9%–1.1%，8K持平；清理版完整门禁已通过，20K
@@ -634,7 +678,8 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   TX/RX、Return TX/RX 四区不别名。每 channel 有只在终端更新的 `tx_base/rx_base`
   和各 owner 私有 cursor；每物理 slot 的信号、可见 generation、累计消费数、
   RX已ACK generation均跨invocation保留。首版TX target/local completion是
-  逐slot counter；ES改为上节的channel completed prefix，远端slot credit不变。
+  逐slot counter；ES改为上节的channel completed prefix，GA随后合并远端
+  consumed-prefix ACK。两者均保留逐slot复用所需的两项证明。
 - `W=min(channel_count,32)`。通信 warp 0 的前 W 个 CTA 做 Dispatch TX，其他做
   local/remote pull；warp 1 前 W 个做 Return TX、接下来 W 个做 Return RX scatter，
   其他做 local Return；warp 2 的 CTA 0 做准入、接下来 W 个做 NIC import/ACK，
@@ -692,7 +737,7 @@ math/TMA 都有固定职责。需要哪些独立 warp/CTA 由 occupancy 和实�
   终端所有 TX 已取得远端 consumed 与本地 NIC completion、全部本地角色 join
   后，只用一个 context 做 rail 会合，再经原节点内 barrier 保护 metadata。
   发出最后 ACK 的节点可以先到达，但收到该 ACK 的节点只有观察它才能结束 TX
-  drain 并到达；故会合完成时全部 ACK 也已被观察。并未删去逐 slot 双 credit。
+  drain 并到达；故会合完成时全部 ACK 也已被观察。并未删去逐slot复用的双条件。
 - CH 的 Dispatch packet 目录改由静态 warp 协作生成：按 route 展开 lane，合并
   相同目标 GPU 的计数后由唯一 lane 更新 packet 私有项，每批之间 warp 同步。
   expected_count 仍精确来自 route plan，不在数据面推测 fanout 或动态领用任务。
@@ -1145,7 +1190,8 @@ wire控制区、NIC counter编号独立持久化，仅在执行完成后复用co
 20K及20K热点R1310720通过，T512/T2048分别覆盖decode/prefill的rank0/15
 memcheck0和Forward racecheck0。没有恢复完整Forward X/S，也没有双机专用索引。
 以上双S2G是M6d/M6e的历史实现；FM已将SavedX移至唯一FC1 Ntile0的ready A
-stage，Pull只写物理X，当前生命周期以第5节为准，expected仍未改变。
+stage，FZ再将此工作分到轮转pair的两个半M view；Pull只写物理X，当前生命周期
+以第5节为准，expected仍未改变。
 Python入口只为Notify/调度元数据预留最坏route容量，X/S保持有界，tape/dR按
 实际R分配。M6f将Backward private padding从R+expert slack改为精确P_actual：
 materialized Notify随已有status下载保存逐专家M128取整后的总行数，不增加host

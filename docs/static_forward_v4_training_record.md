@@ -1801,3 +1801,70 @@ native retained benchmark复用已经准备的tensors，不把它描述为每轮
 malloc；Torch检查另外覆盖真实tape准备、失败一致性和retry。主机generation
 仍可能增加，分配失败不推进的是设备ring epoch/base及payload，而非所有状态。
 完整Forward专项sanitizer通过不改变旧Backward racecheck的未决限制。
+
+## FT之后：SavedX静态pair与消费前缀（GA + FZ，已采用，2026-09-25）
+
+FT将完整M128的ring S写回改为TMA，训练仍保存canonical G/U；完整门禁通过，
+训练性能持平。后续G/U M32 TMA候选FX没有稳定收益，已撤回。详细数据及
+资源/产物哈希见[ring记录](static_forward_v4_ring_record.md)的FT、FX章节。
+
+FZ保持canonical tape、Forward/Backward数值顺序、窗口容量不变：SavedX的
+唯一owner由固定Ntile0改为轮转FC1 pair，两个CTA各复制64行。复用已就绪的
+multicast A，复制字节数不变；每个CTA的目的指针状态减半，stage full wait、
+两个CTA的empty到达、FC1发布前的device fence全部保留。没有新增checkpoint
+缓冲区、映射或barrier。仅轮转而不分半的FY没有稳定收益，不单独采用。
+
+FZ独立正反向对照中，单机8K main约改善1.1%；20K效果较小且有波动。网络
+20K/B512 main约改善0.8%，8K/B1024约改善0.8%–1.33%；其它网络组合未形成
+一致优势。不能将某一档收益推广为全部训练规模。各轮完整表和不利样本保留
+在ring记录FY/FZ，不挑选较快的一轮代替相邻基线。
+
+GA单独优化网络consumed credit：逐slot确认全部实际读者退休后，把连续
+consumed prefix通过一次ACK返回；TX仍同时检查远端消费及显式本地NIC完成。
+channel元数据增加4096 bytes/rank（2节点/32 lanes），payload容量不变。
+不改变training checkpoint或Backward GIN协议。组合采用GA+FZ，不含额外
+RX导入batch的GA2、G/U TMA的FX、FC2权重multicast或尚未实测的fence候选。
+
+组合三项native检查160个梯度hash与FT逐rank一致，repeat_equal均1；单机9项、
+双机12项完整Torch检查通过，包括四档、热点、多个live tapes、OOM/retry、
+非ring回退及B1024/D4长文。双机T64/B16/D1和T2048/B512/D8的rank0/15
+memcheck为0 errors，Forward planner/main过滤的racecheck为0 hazards/errors/
+warnings。双机prefill检查首次因端口占用在launcher启动阶段失败，换端口后
+补齐，保留失败日志；不是算子运行错误。详见ring记录组合验收的PID及覆盖数。
+
+组合单机正式对照（1620MHz，retained 10warmup/20samples，rank-max p50/us）：
+
+|T/rank|V3 main / wall|FT main / wall|GA+FZ main / wall|
+|---:|---|---|---|
+|1|197.760 / 471.682|71.584 / 384.761|69.856 / 383.170|
+|64|264.320 / 554.903|100.416 / 436.316|97.152 / 430.782|
+|8192|1330.340 / 1733.020|1349.660 / 1839.310|1335.140 / 1825.620|
+|20480|3132.420 / 3588.340|3215.710 / 3816.910|3208.860 / 3780.860|
+
+长文wall较FT改善0.74%/0.94%，但相对V3仍慢5.34%/5.37%；整体训练性能目标
+未关闭。短档仅本轮相邻证据，不称反向验证过的稳定收益。local main使用
+device_kernel_slowest_rank_us，不能误用V3包含其它阶段的forward字段。
+计时在第二节点独占执行，第一节点同期仅做Torch正确性，没有CPU构建。
+native retained测量复用已准备tensors，不包含每轮实际malloc；真实tape生命周期
+另由Torch检查覆盖。日志及160个输出hash/shape/pool核验见ring记录组合EP8表。
+双机28组最终对照正在运行，尚无组合网络训练性能结论。
+
+02:39双机正式对照全部完成，1620MHz、两节点独占、无CPU构建，retained
+10/20；各规模顺序为V3→FT→GA+FZ，长文再测FT→GA+FZ的B1024/D4。
+256个原始输出hash逐rank等于同期V3，shape/world/计数/retained及pool核实：
+
+|T/rank|B/D|V3 main / wall|FT main / wall|GA+FZ main / wall|
+|---:|---|---|---|---|
+|1|512/8|442.208 / 734.747|168.704 / 626.280|133.920 / 594.082|
+|64|512/8|600.640 / 901.641|216.640 / 696.511|186.400 / 662.490|
+|8192|512/8|2927.170 / 3438.270|3289.280 / 4092.800|3267.970 / 4058.140|
+|8192|1024/4|同上|2975.490 / 3792.770|2930.590 / 3767.730|
+|20480|512/8|6658.500 / 7181.430|7978.240 / 8929.010|7934.240 / 8911.160|
+|20480|1024/4|同上|7332.220 / 8287.570|7238.080 / 8216.610|
+
+长文同容量main改善0.55%–1.51%，wall改善0.20%–0.86%，小于短序列。
+B1024的8K main接近V3，wall仍慢9.58%；20K wall仍慢14.41%。每rank元数据
+仅较FT增加4096 bytes，但B1024本身比B512多约167–168 MB，不能称等容量
+优化或直接翻转默认值。训练吞吐目标仍开放，继续独立消融物理行局部性。
+本节不替代独立FZ的反向证据，也不将组合收益机械拆给两个改动。完整pool、
+日志名称、graph回归及短档反向检查见ring记录GA+FZ最终矩阵。

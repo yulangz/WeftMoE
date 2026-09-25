@@ -47,6 +47,11 @@ struct Endpoint {
            a.rank % a.local_world_size;
   }
 
+  __device__ std::size_t credit(bool returning, unsigned channel) const {
+    return a.static_network.ring_region + layout().state(returning, channel) +
+           offsetof(static_forward::NetworkChannel, credit_signal);
+  }
+
   __device__ unsigned remote_channel(unsigned channel) const {
     return static_cast<unsigned>(layout().channel(
         layout().peer(a.node, channel), a.node, channel % layout().lanes));
@@ -66,10 +71,9 @@ struct Endpoint {
 
   __device__ bool can_send(bool returning, unsigned channel,
                            std::uint64_t sequence) const {
-    const auto credit = gin.readSignal(
-        a.gin_window, control(returning, channel, sequence) +
-                          offsetof(static_forward::NetworkSlot, credit_signal));
-    if (!communication::reached(credit, sequence / layout().depth, 64U))
+    const auto consumed = gin.readSignal(a.gin_window, credit(returning, channel));
+    if (sequence >= layout().depth &&
+        !communication::reached(consumed, sequence - layout().depth + 1U, 64U))
       return false;
     if (sequence >= layout().depth &&
         sequence - layout().depth >= state(returning, channel).tx_completed_head)
@@ -77,7 +81,7 @@ struct Endpoint {
     // Reservation never runs beyond tx_cursor + depth: a previous occupant
     // is already issued and the completed head now covers its local read.
     return static_forward::SlotSequence{sequence, layout().depth}.reusable(
-        credit, state(returning, channel).tx_completed_head);
+        consumed, state(returning, channel).tx_completed_head);
   }
 
   // The caller has completed its TX writes, including all asynchronous copies.
@@ -131,53 +135,39 @@ struct Endpoint {
     return true;
   }
 
-  // Each physical RX slot retires independently, even when later slots finish
-  // first. Its target comes from the incoming packet plan, never from the
-  // opposite-direction TX or a global done prefix.
+  // Check retirement per slot, then coalesce the contiguous consumed prefix
+  // into one ACK. TX issues in sequence, so an out-of-order credit cannot
+  // unblock it before its head slot retires. Never infer another slot's
+  // retirement from a ready signal or from the opposite-direction TX.
   __device__ void acknowledge(bool returning, unsigned channel) {
-    for (unsigned index = 0U; index < layout().depth; ++index) {
-      auto &s = slot(returning, channel, index);
-      const auto generation = s.visible_generation;
-      if (generation == s.acknowledged_generation)
-        continue;
+    auto &c = state(returning, channel);
+    auto head = c.acknowledged_head;
+    while (head < c.rx_cursor) {
+      const auto &s = slot(returning, channel, head);
       if (ring::acquire<::cuda::thread_scope_system>(s.consumed_total) <
           s.retire_target)
-        continue;
+        break;
+      ++head;
+    }
+    if (head != c.acknowledged_head) {
       gin.signal(ncclTeamWorld(gin.comm), peer(channel),
                  ncclGin_StrongVASignalAdd{
                      a.gin_window,
-                     control(returning, remote_channel(channel), index) +
-                         offsetof(static_forward::NetworkSlot, credit_signal),
-                     1U},
+                     credit(returning, remote_channel(channel)),
+                     head - c.acknowledged_head},
                  ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_thread,
                  ::cuda::thread_scope_system);
-      s.acknowledged_generation = generation;
+      c.acknowledged_head = head;
     }
   }
 
   __device__ bool drained(bool returning, bool receive, unsigned channel,
                           std::uint64_t terminal) const {
-    if (!receive)
-      complete_sends(returning, channel);
-    for (unsigned index = 0U; index < layout().depth; ++index) {
-      const auto target =
-          terminal > index
-              ? static_forward::ceil_div(terminal - index, layout().depth)
-              : 0U;
-      const auto &s = slot(returning, channel, index);
-      if (receive) {
-        if (s.acknowledged_generation < target)
-          return false;
-      } else if (!communication::reached(
-                     gin.readSignal(a.gin_window,
-                                    control(returning, channel, index) +
-                                        offsetof(static_forward::NetworkSlot,
-                                                 credit_signal)),
-                     target, 64U)) {
-        return false;
-      }
-    }
-    return true;
+    if (receive)
+      return state(returning, channel).acknowledged_head == terminal;
+    complete_sends(returning, channel);
+    return communication::reached(
+        gin.readSignal(a.gin_window, credit(returning, channel)), terminal, 64U);
   }
 };
 
@@ -196,8 +186,11 @@ static __global__ void initialize(ncclDevComm_t dev, ncclWindow_t window,
               layout.ring_region + r.control(returning, channel, index);
           gin.resetSignal(window, offset + offsetof(static_forward::NetworkSlot,
                                                     ready_signal));
-          gin.resetSignal(window, offset + offsetof(static_forward::NetworkSlot,
-                                                    credit_signal));
+          if (index == 0U)
+            gin.resetSignal(
+                window, layout.ring_region + r.state(returning, channel) +
+                            offsetof(static_forward::NetworkChannel,
+                                     credit_signal));
         }
       }
     }

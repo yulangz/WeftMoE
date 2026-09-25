@@ -2044,34 +2044,37 @@ void test_static_forward_slot_lifetimes() {
   namespace plan = weftmoe::cuda::static_forward;
   using weftmoe::cuda::communication::reached;
   std::array<plan::Retirement, 2> retirement{};
-  std::array<std::uint64_t, 2> done{}, credit{};
-  std::uint64_t completed_head = 0;
+  std::array<std::uint64_t, 2> done{};
+  std::uint64_t consumed_head = 0, completed_head = 0;
   for (std::uint64_t batch = 0; batch < 17U; ++batch) {
     std::array<std::uint64_t, 2> target{};
     std::array<unsigned, 2> expected{};
     for (unsigned i = 0; i < 2U; ++i) {
       const plan::SlotSequence seq{batch * 2U + i, 2U};
       REQUIRE(seq.slot() == i && seq.generation() == batch);
-      REQUIRE(seq.reusable(credit[i], completed_head));
+      REQUIRE(seq.reusable(consumed_head, completed_head));
       expected[i] = static_cast<unsigned>((batch * 7U + i * 3U) % 13U + 1U);
       target[i] = retirement[i].publish(expected[i]);
     }
-    // Slot 1 retires first. A local flush covers both slots, but cannot replace
-    // the independent remote-consumed credit for slot 0.
+    // Slot 1 retires first, but the ordered sender still needs slot 0. Keep
+    // per-slot retirement and coalesce both credits only after slot 0 retires.
     for (const unsigned i : {1U, 0U}) {
       const plan::SlotSequence next{(batch + 1U) * 2U + i, 2U};
-      REQUIRE(!next.reusable(credit[i], completed_head));
+      REQUIRE(!next.reusable(consumed_head, completed_head));
       done[i] += expected[i] - 1U;
       REQUIRE(!reached(done[i], target[i], 64U));
       ++done[i];
       REQUIRE(reached(done[i], target[i], 64U));
-      credit[i] = batch + 1U;
       if (i == 1U) {
-        REQUIRE(!next.reusable(credit[i], completed_head));
-        completed_head = (batch + 1U) * 2U;
         REQUIRE(!reached(done[0], target[0], 64U));
+        REQUIRE(!next.reusable(consumed_head, completed_head));
+        REQUIRE(!next.reusable(consumed_head, (batch + 1U) * 2U));
+      } else {
+        consumed_head = (batch + 1U) * 2U;
+        REQUIRE(!next.reusable(consumed_head, completed_head));
+        completed_head = consumed_head;
+        REQUIRE(next.reusable(consumed_head, completed_head));
       }
-      REQUIRE(next.reusable(credit[i], completed_head));
     }
   }
   // Row-based C retirement is invariant to Return fragmentation.

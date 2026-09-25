@@ -1,24 +1,29 @@
 #pragma once
 
-// Included inside forward_compute_detail. FC1's first N tile owns each X
-// checkpoint. Single-node training orders canonical rows within each block:
+// Included inside forward_compute_detail. One static FC1 pair owns each X
+// checkpoint, with each CTA copying half of M from its ready multicast A.
+// Single-node training orders canonical rows within each block:
 // store contiguous M32 runs with TMA and scatter only the remainder. Network
 // training retains round-robin geometry and vector copies.
 // Both readers must retire before either CTA can recycle its ready A stage.
-template <unsigned TileK, bool Contiguous> struct StaticV4XCheckpoint {
+template <unsigned TileK, bool Contiguous,
+          unsigned Rows = forward_tuning::kTileM>
+struct StaticV4XCheckpoint {
   static constexpr auto kChunkRows = 32U;
-  static constexpr auto kChunks = forward_tuning::kTileM / kChunkRows;
+  static constexpr auto kChunks = Rows / kChunkRows;
   static constexpr auto kVectors =
-      forward_tuning::kTileM * TileK / (8U * kMathThreads);
+      Rows * TileK / (8U * kMathThreads);
   unsigned canonical_begin[kChunks];
   unsigned tma_mask;
   transport::BFloat16 *destinations[kVectors];
 
   template <class Args>
   __device__ __forceinline__ void prepare(const Args &a, std::uint64_t mblock,
-                                          unsigned valid_rows) {
+                                          unsigned valid_rows,
+                                          unsigned row_begin = 0U) {
     const auto tid = threadIdx.x % kMathThreads;
-    const auto *rows = a.checkpoint.rows + mblock * forward_tuning::kTileM;
+    const auto *rows =
+        a.checkpoint.rows + mblock * forward_tuning::kTileM + row_begin;
     if constexpr (Contiguous) {
       tma_mask = 0U;
 #pragma unroll
