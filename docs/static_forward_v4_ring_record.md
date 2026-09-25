@@ -3,6 +3,26 @@
 日期：2026-09-23。设计依据：[有界流水设计](static_forward_v4_design.md)。
 本记录区分代码落地、独立协议验证和端到端启用，不把准备工作记为性能收益。
 
+## 当前已采用版本（2026-09-25）
+
+生产里程碑为`33d99a5`（GA + FZ），后续候选未计入下面数据。Ring仍显式启用，
+不改变默认full-arena/V3训练回退。以下是该版本完整验收后的正式graph矩阵：
+1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
+EP8是单机8卡，EP16是双机各8卡；显存时钟仅观测，没有锁定。
+
+|T/rank|EP8 V3|EP8 GA+FZ|EP16 V3|EP16 GA+FZ|
+|---:|---:|---:|---:|---:|
+|1|300.277|100.910|682.034|236.034|
+|64|370.696|135.406|824.120|286.896|
+|8192|1489.090|1246.600|3355.780|2893.170|
+|20480|3295.760|2937.720|7102.290|6863.170|
+
+双机20K仅比V3快3.37%，仍未关闭显著领先目标。训练长文Forward wall也仍落后
+V3：单机B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益
+代替训练达标。完整hash、容量、测试范围及原始日志见文末GA+FZ验收和
+[训练记录](static_forward_v4_training_record.md)。后续各候选按时间顺序追加；
+“数值通过”“纯GEMM通过”和“已采用”是不同状态。
+
 ## 冻结基线
 
 设计基线 commit：`f2acb2c`。以下文件保留，不覆盖：
@@ -5692,3 +5712,90 @@ GH的8K回退再次为1.87%；20K从首轮快0.74%变成慢0.25%。GE的8K只快
 读取consumed credit，不引入额外批处理分支或缓存状态。没有为这两个已否决
 候选继续做library、完整Torch或sanitizer验收。反向日志
 `network_submit_ghe_reverse_{gh,ge,gafz}_ep16_t*_formal.log`。
+
+### GF/GI：网络slot寻址、同CTA双TX context（独立候选，2026-09-25）
+
+均基于GA+FZ，不含彼此或GH/GE。GF用NetworkRings原有4-byte padding保存
+depth_shift，2的幂次depth使用64-bit mask/shift，其它depth保留精确除法/取模；
+sequence不截断，NetworkRings仍32 bytes，不强制容量取2的幂次。control、两种
+payload地址和三处generation统一复用helper；compute/contribution rings不变。
+现有host layout测试补充depth1/3/8/17及大于2^32、接近uint64上界序列，18/18
+通过。native三组160个梯度hash等于GA+FZ；另以EP16 T2048/E32/K6/B768/D4
+得到network depth9，GF/GA+FZ共128个梯度hash相同，repeat_equal均1、同配置
+pool973324096 bytes/rank一致。不增加另一个测试套件或容量调节参数。
+
+GI保持全部owner数量、channel residue和warp位置；现有同CTA的DispatchTX
+warp0/ReturnTX warp1共享该CTA的GIN context，使用公开CTA-sharing模式。
+RX/ACK仍独占THREAD context，active contexts由96降至64；inference分配64，
+training因Backward仍保留133。两TX只共享NCCL提交资源，不共享软件cursor；
+flush覆盖已预约前缀但仅推进发起者的completed_head，远端消费和本地完成双
+credit不变。metadata也使用较少contexts，不能把全部时间差归因于NIC。区别于
+EL的同warp四lane发送与FK/FL的Return搬迁，本项没有移动或减少Return owners。
+三组native检查exit0，160个梯度hash等于GA+FZ，repeat_equal均1、pool相同；
+所报pool不包含NCCL内部QP资源，不能据此断言总通信内存不变。
+
+冻结`build/static_v4_network_index_gf/`与`static_v4_tx_cta_context_gi/`；
+native SHA256分别
+`25a15251c7506d008ebc06a83b8022962979d7d8be159e358d27f34290a30d38`、
+`4665d60211ecd39496f58e555486d46d10386082d5edaeb648cc47952d72be5f`。
+两者四local main完整SASS逐字节等于GA+FZ，八入口均REG168/SHARED2048/
+LOCAL0/CONST3264。GF network inference STACK392/392→384/384；GI变为
+400/408；training和local stack不变。没有library/full Torch/fresh sanitizer。
+
+03:49–03:56十二组正式EP16 graph、1620MHz、B512/D8、10/20/batch20，
+两节点独占且无CPU构建；192个hash等于GA+FZ最终矩阵的同期V3参考，实际
+shape/world/计数及pool核实。p50/us：
+
+|T/rank|GA+FZ|GF|GI|
+|---:|---:|---:|---:|
+|1|235.418|236.722|238.682|
+|64|287.078|287.859|289.683|
+|8192|2905.520|2888.730|2891.000|
+|20480|6870.760|6861.320|6874.860|
+
+两项短档略慢，8K相邻分别快0.58%/0.50%，20K仅快0.14%/慢0.06%；8K基线
+又高于先前约2888us，需反向核实，不按单次微小变化采用。两候选源代码已撤回，
+继续冻结artifact反向测试。日志`network_address_context_gfi_{gafz,gf,gi}_ep16_t*_formal.log`。
+
+04:03–04:06长文反向GI→GF→GA+FZ六组exit0，96个hash及同一门禁字段核实。
+8K为2908.130/2885.500/2887.170us，20K为6872.450/6862.520/6880.120us。
+GI的8K从快0.50%变为慢0.73%，20K从慢0.06%变为快0.11%，没有稳定收益。
+GF的8K优势缩至0.06%；20K两轮方向一致，但仅0.14%/0.26%，且短档略慢，
+不足以支持为通用layout保留额外状态和寻址分支。本轮两者均不合入，生产保持
+GA+FZ；不将GF的微小正差值夸大为显著长文优化。没有继续library/full Torch/
+sanitizer验收。日志`network_address_context_gfi_reverse_{gi,gf,gafz}_ep16_t*_formal.log`。
+
+### GK：两个K stage合并WGMMA group（纯GEMM回退，不进入生产，2026-09-25）
+
+只在现有pure-static-forward诊断的packed FC1数学循环中试验：连续两个K128
+stage的MMA保持原K次序，合成一次commit，完整wait0后才归还两个empty；
+三个TMA stage、逻辑S-N64、M128、cluster2和FC2都不变。与AJ跨迭代保留
+pending group的wait1不同，本项每个外层迭代和epilogue前均完全drain。
+没有修改生产GEMM或增加公开benchmark开关。训练checkpoint/通信不在测量内。
+
+冻结`build/static_gemm_two_k_gk/{base,candidate}/`，生成include来自FZ/GAFZ
+数学循环，除候选packed循环外相同（只规整文件末尾空行）；复用当前生产epilogue。
+base/candidate binary SHA256分别
+`9763a22a3c29d16de534a1f8861b58b56ee47fc1b741ec6ac46548efd45b561c`、
+`9033d51fa6a65e9f7f629a08da625c10d355e1edb3cf3307b1d317223cf12197`。
+两者三个entry均REG168/STACK0/SHARED1024/LOCAL0/CONST864；动态SMEM不变。
+两者均有kernel-wrapper边界的C7510，不将该警告误报成候选独有或性能回退证明。
+
+03:57–04:00第二节点单GPU独占，重放world8/balanced专家几何，不是完整EP8。
+第一节点同期先编译GJ、后做local正确性，计时节点无CPU构建或其它GPU任务。
+四档packed FC1/chain共16个运行全部full-output/replay通过、max_abs=0；
+960对逐sample时钟均1620:1620。每运行30个native event样本，p50/us如下
+（JSON的ms字段是mean，此处从SAMPLES 0计算p50，不混淆两种统计）：
+
+|T/rank|base FC1|GK FC1|base chain|GK chain|
+|---:|---:|---:|---:|---:|
+|1|24.992|24.048|33.968|34.496|
+|64|26.992|28.416|40.592|42.944|
+|8192|317.760|342.256|474.944|502.816|
+|20480|753.472|816.768|1131.504|1193.344|
+
+长文FC1慢7.71%/8.40%，chain慢5.87%/5.47%，不进入完整算子；短档也不据
+T1 FC1一次小幅改善更改decode，因为本诊断仍是prefill逻辑N64而非decode N32。
+未运行GK完整算子训练或sanitizer，不宣称纯GEMM数值通过等于融合实现验收。
+原始样本/时钟及命令在候选目录，`remote_ep8_t*_{fc1,chain}.log`名称中的EP8
+仅表示所重放的route world。没有需要撤回的生产GEMM改动。

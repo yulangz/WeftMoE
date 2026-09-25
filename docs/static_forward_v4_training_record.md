@@ -5,6 +5,12 @@ Backward 仍复用既有调度/GEMM；M6e进一步接通多机checkpoint和有�
 GIN adapter，M6f已完成精确P_actual分配。完整训练sanitizer/性能门禁尚未完成，不能将
 inference或新Forward的门禁视为整个训练工程完成。
 
+当前已采用里程碑为`33d99a5`（GA + FZ），最新完整矩阵见本文末尾同名章节。
+长文Forward wall尚未超过V3：EP8约慢5.3%，EP16的B1024/D4仍慢9.6%/14.4%。
+完整数值/生命周期检查和Forward专项sanitizer已通过；旧Backward racecheck的
+libcu++共享atomic报告及工具版本限制仍保留，不能称完整训练sanitizer clean。
+后续GC/GD未采用，其它通信/纯GEMM候选见ring记录，不混入已采用版本性能。
+
 ## M6a：按实际接收量分配 rank-private Backward 中间区
 
 先解开 Backward 对 transport pool 全容量激活区的依赖。U/dAB/dX/dGate
