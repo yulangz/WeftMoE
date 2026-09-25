@@ -5191,3 +5191,59 @@ B512/D8，全部八个launcher exit0，rank-max p50（us）：
 或新sanitizer结果，不能声称新共享内存复用方案已完成竞态验收。冻结artifact、
 patch和日志`fc2_weight_boundary_{ft_clean,fw2}_ep{8,16}_t*_inference_formal.log`
 保留；这次消融表明理论TMA字节减少并不足以提升本算子的性能。
+
+### FX：单机G/U checkpoint的M32 TMA（无收益，撤回）
+
+独立基于已采用FT，FW/FW2已撤回，未混入FV。新增一个SavedAB tensor-map参数，
+在实际local training ring tape绑定时编码为[2R,I]、box[32,64]；pool不增加payload。
+FC1完整M128已将S/G/U暂存在CTA私有B，连续canonical M32片段由每chunk一个
+issuer将G/U两平面TMA写回，向量路径跳过恰好这些片段。利用FR3单机canonical
+严格递增性以端点证明连续；不适用于network round-robin，网络保持向量路径。
+没有改SavedX、checkpoint布局、舍入或Backward合同；decode/尾块仍走原epilogue。
+
+所有writer保留async-proxy fence与现有join，所有S/G/U issuer执行完整bulk
+wait0，再经原有caller threadfence/math join/fc1_done保护发布及B复用；没有
+新增共享控制量或barrier。向量worker重复读取不可变chunk端点以避免引入新的
+shared mask同步。新增descriptor会增大kernel参数，不能假设其它入口机器码不变。
+冻结目录`build/static_v4_local_gu_tma_fx/`，00:54开始native构建。只在第二节点
+独占补测同期V3/FT训练基线，第一节点CPU构建，不在计时节点构建。尚无FX数值
+或性能结论；窄tile不可达TMA atom循环的编译告警已观察到，采用前须清理并验证。
+
+同期单机训练参考八项全部exit0。第二节点独占计时，第一节点仅构建FX；
+1620MHz、retained eager 10/20，FT使用B512/D8，main/wall rank-max p50（us）：
+
+|T/rank|冻结V3 main|FT main|冻结V3 wall|FT wall|
+|---|---:|---:|---:|---:|
+|1|198.528|71.392|472.495|389.570|
+|64|263.968|100.704|551.509|455.952|
+|8192|1332.320|1348.830|1730.910|1841.100|
+|20480|3131.390|3221.090|3577.280|3793.680|
+
+64个输出hash逐rank相同，world、E/K/H/I/T、retained=1及10/20核实。不同版本
+pool不强制相同；这是训练main/wall，不与inference graph时间混为一谈。
+FT短档显著领先；长文main仍慢1.24%/2.86%，wall慢6.36%/6.05%，目标未关闭。
+日志`gu_tma_reference_{v3,ft}_remote_ep8_t*_training_formal.log`。
+
+FX native构建完成，SHA256
+`7bb90f5436f7bedaefeceb020f6630fa380c9d269e2c6f65a1d006b74d14aeb7`。
+所有ring入口REG168/SHARED2048/LOCAL0及STACK均与FT一致，CONSTANT[0]
+3264→3392 bytes，符合新增一个128-byte descriptor；未把参数空间算作pool。
+00:58在全部远端计时及CPU编译结束后开始native对照；尚无library或完整门禁。
+
+FX native三项全部exit0：EP8 T512/E16/K6、EP16 T64/E32/K6与T2048/E32/K6，
+每项两次Backward，160个梯度hash逐rank等于FT，repeat_equal均1。00:59开始
+单机长文retained训练FT→FX正式对照，GPU独占且无CPU构建；不把native重复
+稳定性当作Torch完整数值或新TMA路径的sanitizer验收。
+
+正式单机retained eager 10/20、1620MHz、B512/D8，两版本相邻FT→FX，us：
+
+|T/rank|FT main|FX main|FT wall|FX wall|
+|---|---:|---:|---:|---:|
+|8192|1343.36|1349.38|1840.83|1840.88|
+|20480|3225.41|3219.97|3792.93|3814.72|
+
+32个hash/pool相同，实际world、shape、retained及10/20核实；main差约+0.45%/
+-0.17%，wall持平/慢0.57%，区间重叠。没有稳定收益，**不采用FX**，已撤回
+全部四个源文件改动，不保留descriptor、额外分支或试验开关。没有反向计时、
+FX library、完整Torch或sanitizer；不可达窄tile告警也未单独清理重编译。
+冻结native/patch保留，日志`gu_tma_{ft_clean,fx}_ep8_t*_training_formal.log`。
