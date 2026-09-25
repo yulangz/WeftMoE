@@ -5581,3 +5581,61 @@ world核实；96个输出hash逐rank等于GA+FZ正式矩阵的V3参考。rank-ma
 方向翻转为GB快0.69%，本轮GA+FZ也明显高于此前约6860us。保留全部样本，
 不挑选有利对照；8K稳定退化而20K不稳定，最终不采用GB。
 反向日志`fc1_fence_gb_reverse_{gb,gafz}_ep16_t{8192,20480}_formal.log`。
+
+### GC/GD：网络训练的块内source分组与M16 SavedX TMA（候选，2026-09-25）
+
+GC基于GA+FZ，训练source planner复用Notify的stable ordinal，并相应增加其
+已有shared scratch请求；单机FR3不变。网络仍按source round-robin分Mblock，
+仅在所有source均有行且M能整除G的完整regular块内，转置为source连续小段。
+固定ordinal下block ID/valid_rows不变，不新增GM目录、payload或barrier。
+但atomic→stable source order本身会改变route所属块和就绪时序，不能声称
+与GA+FZ的全部分块相同。partial/不等长尾部仍用原round-robin映射。
+
+GD在GC上单独加入network SavedX M16 TMA；网络候选run逐行通过warp vote
+核验连续性，不能用两个端点证明非单调序列连续。local仍为M32单调端点检查；
+不连续段仍vector写回。TMA map允许M16，shared的K64 atom stride仍为M128，
+完整bulk wait0、stage-empty及checkpoint发布fence不变。
+
+冻结`build/static_v4_block_source_gc/`及`static_v4_block_source_tma_gd/`，含patch。
+native SHA256分别
+`dd3f9d65ab308dbc245cff56ea945c26ab9f207762e1ffe8a50eee48078f9123`、
+`09a3734ba2d9e1de7e1c60841aeb66ff2a72a20b199a716de75f81bbd20f1e88`。
+GC八个Forward main完整SASS逐字节等于GA+FZ；GD四inference和两local training
+相同，只有network training改变。GD各型REG168/SHARED2048/LOCAL0/CONST3264，
+network training decode STACK416→408，prefill仍408，其余资源不变。
+GC既有GPU规划测试增加一个块内source-sort独立oracle，37 source/packet+
+7 geometry通过，racecheck0 errors/0 hazards/0 warnings。GC/GD各自三组
+native（EP8 T512、EP16 T64/B16/D1及T2048/B512/D8）均exit0，各160个梯度
+hash与GA+FZ一致，repeat_equal均1、pool不变。没有候选library、完整Torch
+或主路径fresh sanitizer结果；规划racecheck不替代这些门禁。
+
+03:03训练正式脚本误把B/D环境字符串当成launcher参数，argparse在启动算子前
+退出，原日志保存为`block_source_gcd_gafz_ep16_t8192_b512_launcher_failure.log`。
+修正后03:03–03:11十二组全部exit0，192个原始uint64输出hash以字符串比较，
+逐rank等于GA+FZ最终矩阵中的V3参考；shape/world/10warmup/20samples/retained
+及pool逐项核实。全部16卡SM/graphics1620MHz，memory仅观测未锁；两节点独占，
+无CPU构建/其它GPU工作。rank-max p50/us，main / 完整wall：
+
+|T/rank|B/D|GA+FZ|GC|GD|
+|---:|---|---|---|---|
+|8192|512/8|3248.320 / 4050.140|3315.740 / 4112.670|3330.690 / 4119.230|
+|8192|1024/4|2934.110 / 3772.410|2968.770 / 3804.680|2998.400 / 3822.220|
+|20480|512/8|7940.380 / 8888.100|7990.080 / 8946.850|7958.140 / 8916.080|
+|20480|1024/4|7243.810 / 8196.220|7152.100 / 8146.590|7141.600 / 8115.310|
+
+GC前三组main慢2.08%/1.18%/0.63%，20K/B1024快1.27%；GD相对GC的M16
+TMA并非一致受益，8K两组再慢0.45%/1.00%，20K两组快0.40%/0.15%。组合GD
+只在20K/B1024比GA+FZ快1.41% main、0.99% wall，不能据此改变通用路径或
+为单个夹具硬编码阈值。暂不采用，代码已撤回；20K/B1024继续反向验证。
+日志`block_source_gcd_{gafz,gc,gd}_ep16_t*_b*_training_formal.log`。
+
+03:22–03:24反向GD→GC→GA+FZ的20K/B1024三组exit0，48个hash及相同门禁字段
+核实。main/wall分别为7142.500/8088.130、7132.030/8097.090、7237.600/8199.170us。
+GC相对基线main快1.46%（首轮1.27%），GD快1.31%（首轮1.41%）；但GD相对GC
+的main从快0.15%翻为慢0.15%，M16 TMA没有独立稳定收益。此反向只复测
+20K/B1024，不将其推广为其它形状稳定性证据。
+
+保留GC的大窗20K收益，但不据单个形状为通用训练路径硬编码切换阈值：8K两档
+及默认B512仍无收益。因此本轮GC/GD均不合入，source恢复原GA+FZ；候选补充的
+测试/encoder选项也不留在生产代码，不增加维护分支或宣称完成训练性能目标。
+反向日志`block_source_gcd_reverse_{gd,gc,gafz}_ep16_t20480_b1024_training_formal.log`。

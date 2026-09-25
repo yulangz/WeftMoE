@@ -1868,3 +1868,18 @@ B1024的8K main接近V3，wall仍慢9.58%；20K wall仍慢14.41%。每rank元数
 优化或直接翻转默认值。训练吞吐目标仍开放，继续独立消融物理行局部性。
 本节不替代独立FZ的反向证据，也不将组合收益机械拆给两个改动。完整pool、
 日志名称、graph回归及短档反向检查见ring记录GA+FZ最终矩阵。
+
+## GC/GD：网络块内source分组及M16 SavedX（未采用，2026-09-25）
+
+GC只在完整regular Mblock内按source分组，并将网络source ordinal改为Notify
+稳定顺序；GD再对逐行验证连续的M16区间做TMA。均不增payload/目录容量，不
+改变完整wait及slot释放条件。两候选各160个native梯度hash与GA+FZ一致；
+GC规划检查及racecheck通过，未构建library或执行完整Torch/主路径sanitizer。
+
+1620MHz，双机EP16独占，T8192/20480、B512/D8及B1024/D4的12组正式相邻
+对照有192个输出hash一致。GC的8K两档main慢2.08%/1.18%、20K/B512慢0.63%；
+只有20K/B1024快1.27%，反向再快1.46%。GD没有在GC上带来一致增益，尤其
+20K/B1024的独立main变化仅±0.15%、方向翻转。故保留大窗长文的实验发现，
+不为单个形状硬编码阈值，不采用GC/GD，也没有留下候选测试或TMA map选项。
+全部main/wall、相同pool、反向48个hash及launcher参数误用记录，见
+[ring优化记录](static_forward_v4_ring_record.md)的GC/GD小节；训练端到端目标仍开放。
