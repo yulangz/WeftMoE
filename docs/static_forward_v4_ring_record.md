@@ -5110,3 +5110,84 @@ FT引入的窄tile unsigned<0告警消失，原有device_kernels告警没有顺�
 因此沿用原FT的完整正确性/sanitizer和性能证据，**没有另跑清理版本sanitizer**。
 采用FT作为小里程碑：单机20K正反向约0.3%–0.5%，双机/训练持平，pool不变；
 FU不采用，FV仍为冻结候选，二者源码均不在本次提交中。整体性能目标仍开放。
+
+### FW/FW2：FC2跨M块共享权重（回退，已撤回）
+
+基于FT提交`b31a2c4`，不含FU/FV。仅static ring、单tile claim、N>M且私有A
+能容纳输出tile的入口，按同window的相邻M块、同N列配对。expert相同则multicast
+B，跨expert则A/B均private；奇数尾块仍配相邻N但两个操作数均private。因此
+所有FC2 A都可用作私有scratch，容量按FC2Stages*M*K而非FC1的最大A预留计算。
+task-unit总数与全局residue不变，ready检查两个M块。未增加GM metadata、buffer、
+runtime knob或cluster barrier；主机枚举129种M数量×5种N宽度确认task覆盖为双射，
+不是设备正确性证据，也未添加独立单测文件。
+
+FC1 B epilogue可能与下一FC2 multicast B重叠，FC2 A epilogue可能与下一FC1
+multicast A重叠。候选将两阶段最后一次K-stage empty推迟到epilogue全部scratch
+读者退出之后，让已有跨GEMM all-stage drain覆盖这段生命周期。producer已发完
+最后stage并等待TaskDone，不依赖这笔最后credit推进当前epilogue；同GEMM内不
+改变multicast操作数。这个证明仍须新sanitizer验证，不能复用FT的racecheck。
+
+每对CTA理想TMA载入量由A+2B=160KiB降为2A+B=128KiB，不等于HBM节省20%，
+因为B可能已命中L2。新的双M ready、expert边界及延迟credit也可能抵消收益。
+冻结`build/static_v4_fc2_weight_multicast_fw/`，native SHA256
+`8e1d906124aad1f8c258426393c7dc2fa3731423ab09b53ec48d0c2809c4a3a4`。
+所有入口REG168/SHARED2048/LOCAL0；prefill inference STACK64/392→72/400，
+training80/408→80/416。decode资源不变，但完整SASS比较不相同：调度函数新增
+operand输出影响了调用及shared临时变量布局，不能宣称decode机器码原样不动。
+正在执行native数值对照，尚未构建library或做完整Torch/sanitizer/性能验收。
+
+FW native三项全部exit0：EP8 T512/E16/K6、EP16 T64/E32/K6及T2048/E32/K6，
+每项两次Backward，共160个梯度hash逐rank等于FT，repeat_equal均1。特意增加
+网络prefill（T2048）对照，避免只测decode而漏掉新的共享权重路径；FT clean
+该项基线在FW CPU编译期间生成，不以其时长计性能。00:40全部编译及数值检查
+结束后开始两节点独占长文正式inference对照，10/20/batch20，无其它GPU工作
+或CPU构建。native通过仍不替代新内存竞态检查，尚无FW性能结论。
+
+FW正式长文对照全部exit0，1620MHz、B512/D8、graph10/20/batch20，us：
+
+|拓扑|T/rank|FT clean|FW|FW耗时变化|
+|---|---:|---:|---:|---:|
+|单机EP8|8192|1248.54|1316.98|+5.48%|
+|单机EP8|20480|2951.15|2998.68|+1.61%|
+|双机EP16|8192|2901.21|2957.74|+1.95%|
+|双机EP16|20480|6876.45|6971.42|+1.38%|
+
+96个hash及pool相同，world/shape/计数核实；四组区间均不重叠。首版FW不采用，
+没有构建library或执行完整Torch/sanitizer，冻结native/patch保留。日志
+`fc2_weight_multicast_{ft_clean,fw}_ep{8,16}_t*_inference_formal.log`。
+这否定了当前完整候选的端到端收益，不能单独归因于共享B，因为同时改变了配对、
+scratch位置及每tile的最后credit时点。
+
+FW2保留配对，将延迟credit限定到每cluster在window内最后一个FC1/FC2 task；
+其它task恢复原来的操作数读完释放点。同GEMM后继仍只可能写multicast操作数，
+不会碰peer的私有epilogue；跨GEMM已有all-stage drain仍覆盖最后task的epilogue，
+空phase/window不会新增未保护的切换。利用selector已经计算的unit/pair总数判定
+边界，operand/boundary标志编码在已有scalar返回值及pair_operand中，去掉FW
+新增输出参数，不增字段或GM控制量。这同时简化ABI和边界频率，不将收益独归其一。
+
+冻结`build/static_v4_fc2_weight_boundary_fw2/`，native SHA256
+`4bb5510f51fb975346400705777c75e0315901889063c4fbdae344ea8eb9b0f6`。
+REG168/SHARED2048/LOCAL0；prefill inference STACK64/392、training72/408，
+decode资源与FT相同。00:47开始FW2 native三个规模对照；尚未完成正确性或性能
+验收，不把FW数值结果移植到FW2。
+
+FW2四个decode入口完整SASS均逐字节等于FT（非空dump行数28876/32124/
+82524/84492），额外输出参数移除后恢复了原代码生成。仍须独立检查新prefill。
+
+FW2 native三项全部exit0，共160个梯度hash逐rank等于FT，repeat_equal均1。
+随后两节点独占正式graph10/20/batch20，无CPU构建/其它GPU工作，1620MHz、
+B512/D8，全部八个launcher exit0，rank-max p50（us）：
+
+|拓扑|T/rank|FT clean|FW2|FW2耗时变化|
+|---|---:|---:|---:|---:|
+|单机EP8|8192|1249.44|1304.78|+4.43%|
+|单机EP8|20480|2949.92|3005.19|+1.87%|
+|双机EP16|8192|2900.30|2957.40|+1.97%|
+|双机EP16|20480|6897.80|7015.85|+1.71%|
+
+96个hash/pool相同，实际world、E/K/H/I/T、窗口及计数核实。四组区间均不重叠；
+边界credit及ABI收紧仍未消除回退，**FW/FW2均不采用**。全部计算源码已恢复FT，
+不保留选择开关或额外private/retirement标志。两版均没有library、完整Torch
+或新sanitizer结果，不能声称新共享内存复用方案已完成竞态验收。冻结artifact、
+patch和日志`fc2_weight_boundary_{ft_clean,fw2}_ep{8,16}_t*_inference_formal.log`
+保留；这次消融表明理论TMA字节减少并不足以提升本算子的性能。
