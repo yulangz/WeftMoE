@@ -5799,3 +5799,61 @@ T1 FC1一次小幅改善更改decode，因为本诊断仍是prefill逻辑N64而�
 未运行GK完整算子训练或sanitizer，不宣称纯GEMM数值通过等于融合实现验收。
 原始样本/时钟及命令在候选目录，`remote_ep8_t*_{fc1,chain}.log`名称中的EP8
 仅表示所重放的route world。没有需要撤回的生产GEMM改动。
+
+### GJ：GDAKI专用编译诊断（尚未采用，2026-09-25）
+
+DD曾因NCCL2.31.2 helper只接受generic ncclGin类型而编译失败。本项不修改NCCL
+头文件，也不添加兼容wrapper；通过已安装头文件的ENABLE宏让generic alias
+本身成为GDAKI-only：GDAKI_ENABLE=1，PROXY/GPI/EFA_GDA_ENABLE=0。
+这是整份GIN代码的后端特化，连setup/Backward也受影响，不是V4协议独有的改进。
+候选host guard在activation GIN启动前确认FULL property及每个实际devComm
+connection都是GDAKI。只作为当前硬件诊断，不默默删除生产的其它NIC后端支持。
+
+首轮未显式打开GDAKI，host pass的默认值为0，造成空dispatch的auto类型推导
+失败；修正四个宏后构建通过。保留`build_gdaki_build_gj_hostmask_failure.log`。
+冻结`build/static_v4_gdaki_build_gj/`，native SHA256
+`198a25e816698e7f218281f8da7320e52f63a9ff52006af2a3af175b9d8f5ee7`。
+四local完整main指令与GA+FZ一致：cuobjdump首轮仅因其它module的compressed
+元数据行差异中断，精确去掉该行后重跑八个非空dump完成，不过滤任何指令。
+八entry仍REG168/SHARED2048/LOCAL0/CONST3264；network inference STACK
+392/392→96/80，training416/408→144/144，local不变。三组native检查exit0，
+160个梯度hash等于GA+FZ，repeat_equal均1、pool相同。尚无library/full Torch/
+fresh sanitizer；后端host guard在全部网络检查rank上通过。
+
+04:06–04:11两节点独占、无CPU构建，1620MHz、B512/D8、graph10/20/batch20，
+八组正式对照exit0，128个输出hash等于GA+FZ矩阵的V3参考，shape/计数/pool核实：
+
+|T/rank|GA+FZ/us|GJ/us|
+|---:|---:|---:|
+|1|235.834|231.030|
+|64|287.165|281.805|
+|8192|2892.210|2876.800|
+|20480|6863.500|6860.570|
+
+短档约快2.04%/1.87%，8K快0.53%，20K仅0.04%，未解决长文目标；继续反向和
+retained训练对照，不提前采用。源码guard已撤回，计时继续使用冻结binary。
+日志`gdaki_build_{gafz,gj}_ep16_t*_formal.log`。
+
+04:11–04:16反向GJ→GA+FZ四档八组exit0，128个hash及同一门禁字段核实。
+T1为231.174/235.202us，T64为281.755/287.117us，8K为2880.620/2898.980us，
+20K为6858.100/6868.330us；改善约1.71%/1.87%/0.63%/0.15%。短档方向一致，
+长文尤其20K仍很小。继续独立训练对照，尚未采用；反向日志
+`gdaki_build_reverse_{gj,gafz}_ep16_t*_formal.log`。
+
+04:16–04:20 retained训练Forward四形状、GA+FZ→GJ八组exit0，128个原始uint64
+hash按字符串逐rank比较，与GA+FZ/V3参考相同；shape/world/10/20/retained及
+同容量pool核实。仍两节点独占、无CPU构建，单位us：
+
+|T/rank|B/D|GA+FZ main / wall|GJ main / wall|
+|---:|---:|---|---|
+|8192|512/8|3265.660 / 4052.530|3283.300 / 4072.590|
+|8192|1024/4|2938.500 / 3770.430|2928.960 / 3758.440|
+|20480|512/8|7922.500 / 8899.150|7941.570 / 8873.250|
+|20480|1024/4|7258.880 / 8251.140|7245.020 / 8199.900|
+
+Main变化为慢0.54%、快0.32%、慢0.24%、快0.19%，不构成一致的训练长文收益。
+20K/B1024 wall本轮快0.62%，尚未反向确认，不据此改变通用backend合同。
+本轮不采用GJ：短档约2%的改善不足以支持永久移除其它后端，长文总体持平。
+这是当前硬件专用构建的取舍，不否认独立specialized library未来可能有用途。
+保留完整构建/失败记录及候选guard，生产无新增backend限制；不继续library/
+Torch/sanitizer验收。日志`gdaki_build_{gafz,gj}_ep16_t*_b*_training_formal.log`。
