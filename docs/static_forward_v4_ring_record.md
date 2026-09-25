@@ -4942,3 +4942,171 @@ EP16两节点独占，全部CPU构建及GPU正确性结束后才计时。各JSON
 Inference持平，不记为FS2新增收益；训练单机长文wall正反向改善约1%–2%，
 双机差值方向不稳定且约±1%，记为持平。双机20K inference仅比V3低3.28%，
 整体性能目标仍未完成。
+
+### FT：完整M128的FC1 S采用TMA写回（已采用）
+
+基于FS2 `c2aceb1`。复用ring FC2不再使用的output store descriptor描述ring S，
+不增加kernel参数或buffer。完整M128且N64 atom的FC1 epilogue仍使用已退休的
+CTA私有B staging；所有writer先做async-proxy fence并join，再由每atom一个
+issuer提交TMA。训练G/U仍按canonical row向量写回。每个issuer执行完整bulk
+wait0，随后仍有原来的threadfence、math join及fc1_done，确保S发布与B复用
+晚于TMA目的写入完成。不使用只保证source读取完成的.read等待。decode、尾块
+及nonring不变。尚不删除现有caller fence，以单独观察搬运方式的影响。
+
+冻结`build/static_v4_fc1_s_tma_ft/`，native SHA256
+`1041d6e8e1884ff0785d6fbb1288ccbebfefc8d266c2f7ae1b29a847096b98ec`。
+四个decode完整SASS等于FS2；prefill资源保持REG168/SHARED2048/LOCAL0，
+inference STACK64/392、training80/408。EP8 T512/E16/K6及EP16 T64/E32/K6
+两次Backward的96个梯度hash与FS2相同。独立packed/separated chain诊断完整
+输出max_abs0、repeat_byte_identical1；该诊断保留vector S路径，只证明适配器
+及GEMM数值，不作为TMA性能证据。诊断提取器补上FM/FR3 checkpoint helper的
+删除规则，初次编译失败及修正日志保留，不改变生产GEMM。
+
+双机1620MHz、B512/D8、graph10 warmup/2 samples/batch2快筛：FS2→FT，
+8K2885.940→2903.700us，20K6884.880→6846.940us，64个hash及pool相同。
+样本少、方向不一致，不能据此采用或声称收益。日志
+`fc1_s_tma_{fs2,ft}_ep16_t*_quick.log`。下一步做单机长文inference/训练对照，
+并构建library；完整Torch/sanitizer和正式双机验收尚未执行。
+
+第二节点独占EP8、1620MHz、B512/D8、10/20；第一节点同时构建FT库。inference
+是batch20 graph，training是retained eager，单位us，FS2→FT：
+
+|T/rank|FS2 inference|FT inference|FS2 training main|FT training main|FS2 training wall|FT training wall|
+|---|---:|---:|---:|---:|---:|---:|
+|8192|1256.170|1243.820|1349.090|1350.240|1841.260|1837.740|
+|20480|2956.380|2942.870|3234.340|3230.050|3805.560|3824.760|
+
+64个hash逐rank相同，实际shape/world/计数、retained及pool均核实。反向FT→FS2
+inference为8K1248.910/1249.260、20K2944.950/2954.650us，另32个hash/pool
+相同。首轮改善0.98%/0.46%，反向缩为0.03%/0.33%，不声称稳定1%收益。
+训练main持平，20K wall略有波动；尚无FT双机训练结论。日志
+`fc1_s_tma_{fs2,ft}_remote_ep8_t*_{inference,training}_formal.log`及
+`fc1_s_tma_reverse_{ft,fs2}_remote_ep8_t*_inference_formal.log`。
+
+FT library SHA256 `6786ae6d8ef1b714a677e2c80a49c137cab38474802b7a8e03f089ac9823d645`，
+extension `725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+23:48开始现有EP8集成门禁，同时只在第一节点预编译独立FU候选，不将正确性
+耗时当性能。九项检查23:51全部exit0，各rank PASS数量核实：四档训练、20K
+热点，T1/64各16failure/8retry/24live-tape，inference full240/tiny152/nonring32，
+以及B1024/D4的8K/20K训练。
+
+第二节点同期独占正式graph10/20/batch20回归：FT四档100.965/135.256/
+1248.800/2939.470us，**本轮新测V3四档**300.240/370.411/1487.820/3299.380us；
+64个hash逐rank相同，shape/计数及FT pool核实。没有将相对V3既有优势全部
+归于FT。日志`fc1_s_tma_final_{v3,ft}_remote_ep8_t*_formal.log`。
+
+23:56开始FT双机完整门禁与专项sanitizer，使用冻结FT库，不能混入FU或FV。
+四档训练及inference full480/tiny304通过，短档OOM/retry/live tapes数量核实。
+T64/B16/D1热点的rank0/15 memcheck为0 errors（PID303540/431426），Forward
+planner/main过滤的racecheck为0 hazards/0 errors/0 warnings（305030/431801）。
+00:10双机十二项检查全部exit0，24份node日志的rank级PASS数量全部核实。
+Prefill T2048/B512/D8热点的rank0/15 memcheck均0 errors（306769/432374），
+Forward racecheck均0 hazards/0 errors/0 warnings（308080/432748）；B1024/D4
+的8K/20K训练也通过。这里没有宣称完整Backward racecheck clean。部分正确性
+检查与FV CPU预编译并行，不以其时长计性能。正式双机性能仍待测量，不提前采用。
+
+### FU：每个静态CTA只发布一次FC1/FC2开始时间（候选）
+
+独立基于冻结FT，将每tile的global atomicMin缩为每CTA/FC阶段首次一次，复用
+timeline first标志；同CTA后续tile时间必晚于第一次，不改变min语义。无任务
+重排、completion计数或数学变化，动态V3保留原更新方式。候选只有计算文件一处
+逻辑改动；两个长生命周期flag是否影响寄存器及性能需实测。冻结
+`build/static_v4_first_tile_clock_fu/`，23:48开始构建，尚无GPU检查或收益结论。
+
+FU native SHA256 `18b67502835f57ddfdb7496b69ef29addf4483a721a28915df37fee933a072f3`。
+所有prefill入口REG168、SHARED2048、LOCAL0，STACK仍为inference64/392、
+training80/408；与FT不变。EP8 T512/E16/K6及EP16 T64/E32/K6重复Backward
+96个梯度hash逐rank等于FT。23:53在全部编译、FT单机检查及远端计时结束后，
+开始FT→FU双机长文快筛，两节点独占。还没有FU library或完整集成检查。
+
+FU双机快筛FT→FU，1620MHz、B512/D8、graph10/2/batch2：8K2896.260→
+2889.420us，20K6917.380→6892.900us；64个hash/pool一致，shape及计数核实。
+改善仅0.24%/0.35%，还没有正式复测，不能据此采用。日志
+`first_tile_clock_{ft,fu}_ep16_t*_quick.log`。FU源码暂时移出工作树以隔离下一
+训练候选，冻结patch/native保留；这是实验隔离，不是已证实无收益。
+
+### FV：SavedX向量写回复用每行目的地址（候选）
+
+独立基于FT，不含FU时间戳修改。将原先K128的16 lanes/row改为8 lanes/row，
+每lane在同一行复制两个64列段中的uint4；目的指针由每thread8个减为4个。
+总uint4数量和字节不变，每8 lane仍覆盖连续128 bytes。K64自然只有一段，
+K256则四段。保持canonical行映射、尾行/尾列范围、local M32 TMA以及所有
+stage empty/FC1完成链，不增加buffer或同步。收益假设是减少地址准备与活跃
+指针，不是减少checkpoint容量或数据量。
+
+唯一源码改动在`checkpoint_copy.cuh`；冻结
+`build/static_v4_checkpoint_row_lanes_fv/`，23:57在FT双机正确性检查期间
+开始native编译，此时没有性能计时。尚无FV正确性或性能结论；若有收益再做
+完整验收，不将FT/FU日志重标为FV。
+
+FV native SHA256 `625c68f793a37aa9c447d4d762eb27f552df4e6622ccb768f7d7fd9010101cf2`。
+四个inference入口完整SASS逐字节等于FT（非空dump）；首次比较脚本只裁剪了
+候选文件头导致格式不一致，统一dump格式后全部相同，没有据此修改源码。
+Prefill training的local STACK80→72、network408不变，REG168/SHARED2048/
+LOCAL0不变；栈减小不是性能结论。FT双机检查结束后才运行FV native：EP8
+T512/E16/K6及EP16 T64/E32/K6各两次Backward，共96个梯度hash逐rank等于FT，
+两个launcher均exit0。尚无FV library或完整Torch/sanitizer检查。
+
+00:12所有构建及数值检查结束后，开始两机独占的正式inference与retained训练
+对照。inference包含本轮V3四档及FS2/FT/FU相邻长文，training比较FS2/FT/FV
+的B512/D8与B1024/D4；两种时间范围分开报告，不并行任何CPU构建或GPU工作。
+
+双机正式inference十二项完成，1620MHz、B512/D8、graph10/20/batch20，us：
+
+|T/rank|本轮冻结V3|FS2|FT|FU|
+|---|---:|---:|---:|---:|
+|1|682.150|未重测|269.069|未测|
+|64|824.430|未重测|317.821|未测|
+|8192|3354.450|2902.320|2901.010|2904.380|
+|20480|7098.990|6892.580|6891.860|6879.930|
+
+本轮192个hash逐rank等于对应同期V3；实际world/shape/10/20/batch20核实，
+三种V4长文pool相同，8K513073344、20K864091584 bytes/rank。FT相对FS2
+双机持平；FU相对FT在8K慢0.12%、20K快0.17%，区间重叠，快筛收益未在
+正式测试中稳定保持。FT的20K比V3低2.92%，不能称为显著领先。日志
+`fc1_s_tma_final_{v3,fs2,ft,fu}_ep16_t*_formal.log`。FU单机尚待对照。
+
+随后双机retained eager训练十二项全部exit0，两节点独占、无CPU构建，
+1620MHz、10warmup/20samples。表中均为main/wall rank-max p50（us）：
+
+|T/rank|窗口|FS2|FT|FV|
+|---|---|---:|---:|---:|
+|8192|B512/D8|3304.96 / 4093.37|3290.24 / 4097.59|3291.14 / 4091.64|
+|8192|B1024/D4|2982.56 / 3799.86|2972.45 / 3796.11|2981.92 / 3796.72|
+|20480|B512/D8|7999.84 / 8955.46|7986.11 / 8938.83|7987.81 / 8960.43|
+|20480|B1024/D4|7344.16 / 8307.39|7328.61 / 8313.59|7348.29 / 8343.09|
+
+192个原始uint64 hash按字符串逐rank比较，全部等于同期V3 inference；world/
+shape/计数、retained=1、pool/注册容量核实。FT相对FS2、FV相对FT均记为持平，
+不将不足0.5%且样本区间重叠的差异算作训练收益。日志
+`checkpoint_row_lanes_{fs2,ft,fv}_ep16_t*_b*_d*_training_forward.log`。
+00:27全部双机工作结束后，第二节点独占FU/FV单机正式补测；第一节点仅重编译
+FT告警清理版本，不在计时节点构建。FV源码暂移出工作树以隔离该构建，冻结
+patch/native保留。FT只给两个不可达的窄tile TMA issuer/wait增加编译期宽度
+条件，尚待全入口机器码等价验证，不能直接把新artifact算作已验收版本。
+
+第二节点独占EP8补测，1620MHz、B512/D8、10/20（inference graph batch20）：
+FT→FU inference为8K1249.02→1247.74、20K2946.45→2944.02us，差约0.1%，
+区间重叠；结合双机正式结果，**不采用FU**，不增加两个长生命周期flag。
+其native梯度已通过，但没有FU library、完整Torch或sanitizer验收，不把FT
+证据移植给FU。FT→FV训练main为1354.21→1340.45、3233.79→3229.28us，
+wall为1840.71→1826.72、3800.92→3799.43us。64个hash/pool相同，world、
+shape及计数核实。FV单机8K约1%改善而20K持平，正在反向复测，尚未采用。
+日志`epilogue_followup_{ft,fu,fv}_remote_ep8_t*_{inference,training}_formal.log`。
+
+FV→FT反向单机训练，8K main1343.46/1348.48、wall1828.69/1846.12us；
+20K main3225.12/3224.10、wall3792.98/3790.95us。32个hash及pool相同。
+8K main改善缩为0.37%（wall约0.94%），20K持平。FV仍是待完整验收候选，
+没有将这次native性能对照当作Torch/sanitizer门禁。反向日志
+`epilogue_followup_reverse_{fv,ft}_remote_ep8_t*_training_formal.log`。
+
+FT告警清理版本冻结于`build/static_v4_fc1_s_tma_ft_clean/`：native SHA256
+`460e07ef654e81c93f75aa5e1b2766834af05509c7853a76b781ce48782668c6`，library
+`7bbd4ec444b741ae2b1ebf799d81f5e1b5ad46207da34a6facf07d49732b086e`，extension
+仍为`725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+native及library各8个ring计算入口的完整SASS均逐字节等于原FT（32份非空dump，
+`check_sass.sh` exit0）；仅两处constexpr条件改变，没有host或其它helper改动。
+FT引入的窄tile unsigned<0告警消失，原有device_kernels告警没有顺带修改。
+因此沿用原FT的完整正确性/sanitizer和性能证据，**没有另跑清理版本sanitizer**。
+采用FT作为小里程碑：单机20K正反向约0.3%–0.5%，双机/训练持平，pool不变；
+FU不采用，FV仍为冻结候选，二者源码均不在本次提交中。整体性能目标仍开放。

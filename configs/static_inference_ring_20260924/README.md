@@ -31,6 +31,8 @@ FO将其不变目的地址移出K循环；均不改变inference计算代码。�
 物理行与M32 SavedX TMA，相对FO长文main再改善约5%–6%；网络保留原布局，
 完整回归持平。FS2将tape准备放到物理规划之前，移除冗余runtime回传和host
 等待；单机训练长文wall改善约1%–2%，双机持平，GPU计算代码不变。
+FT将完整M128的FC1 S改为TMA写回，沿用B scratch与完成链；单机20K约快
+0.3%–0.5%，双机及训练持平，没有改窗口、packet或GEMM超参。
 仍未达到全面领先V3的性能目标。
 权重原地更新前须调用 `invalidate_inference_layer` 并重建相应 graphs；
 完整合同见[设计第 10 节](../../docs/static_forward_v4_design.md)。

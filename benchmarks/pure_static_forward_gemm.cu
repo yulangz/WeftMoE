@@ -127,7 +127,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
       if constexpr (Fc1 && Packed) {
 #include "fc1_packed_math.cuh"
         static_v4_store_fc1_tile<Fc1TileN, kFc1BStorageElements>(
-            a, smem_b, accum, output, gates, row, valid_rows, n / 2U, mblock);
+            a, smem_b, accum, output, gates, row, valid_rows, n / 2U, mblock,
+            nullptr);
       } else if constexpr (Fc1) {
 #include "fc1_separated_math.cuh"
         // Present the two fragments to the same production SwiGLU epilogue.
@@ -141,7 +142,8 @@ gemm_role(const CUtensorMap &am, const CUtensorMap &bm, const Mblock *blocks,
             packed[8U * index + 4U + value] = accum_b[4U * index + value];
           }
         static_v4_store_fc1_tile<2U * Fc1TileN, kFc1BStorageElements>(
-            a, smem_b, packed, output, gates, row, valid_rows, n, mblock);
+            a, smem_b, packed, output, gates, row, valid_rows, n, mblock,
+            nullptr);
       } else {
 #include "fc2_math.cuh"
         // Both readers finish before reusing CTA-private B, never multicast A.

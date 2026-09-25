@@ -1151,9 +1151,9 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
             static_v4_store_fc1_tile<
                 Fc1TileN,
                 kConfiguredArenaElements - kConfiguredAStorageElements,
-                RetainBackwardState>(
+                RetainBackwardState, RingSchedule>(
                 a, smem_b, accum, s, canonical_gates, row, valid_rows, n / 2U,
-                mblock);
+                mblock, output_store_map);
           } else {
             // Keep the two FC1 accumulator fragments in a lexical region
             // that ends before completion publication and the next-task

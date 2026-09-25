@@ -1,6 +1,6 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
-更新：2026-09-24。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
+更新：2026-09-25。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
 第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training
 V4 已经落地。**
 旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
@@ -74,6 +74,13 @@ FS2保留两种GPU planner，调整为Notify→实际tape分配/全rank失败确
 与FR3逐字节相同；单/双机完整数值、OOM重试及Forward专项sanitizer通过，
 单机长文wall正反向均有约1%–2%的收益，双机长文正反向差异约±1%，记为持平。第8节
 按这一已验证的准备边界列出流程；不将被撤回的FS整合planner方案混入当前实现。
+
+FT把ring完整M128的FC1 S写回改为TMA，复用原有output descriptor及CTA私有
+B staging；decode/尾块/nonring保持原路径，训练G/U仍按canonical行写回。
+所有issuer执行完整bulk wait0而非.read，再经原有math join/fc1_done发布，
+不提前释放B。单/双机完整数值、复用及Forward专项sanitizer通过；单机20K
+相邻正反向约改善0.3%–0.5%，双机及训练持平。详细证据与候选消融见ring记录FT–FV，
+不据此关闭双机20K显著领先目标。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|

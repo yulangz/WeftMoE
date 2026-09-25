@@ -99,6 +99,11 @@ def main():
 
 def omit_checkpoints(code):
     """Remove checkpoint-only blocks from the pure FC1 math diagnostic."""
+    code = re.sub(r"\s*StaticV4XCheckpoint<[^;]+>\s+x_checkpoint;", "", code)
+    code = re.sub(
+        r"\s*if constexpr \(RetainBackwardState && RingSchedule\)"
+        r"\s*if \(n_tile == 0U\)"
+        r"\s*x_checkpoint\.(?:prepare|save|finish)\([^;]*\);", "", code)
     start = "if constexpr (RetainBackwardState) {"
     # Ignore braces in comments and literals when matching a C++ block.
     tokens = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', re.S)

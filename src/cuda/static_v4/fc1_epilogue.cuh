@@ -14,11 +14,12 @@ static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
 }
 
 template <unsigned Fc1TileN, unsigned ScratchElements,
-          bool RetainBackwardState = false, class Args>
+          bool RetainBackwardState = false, bool TmaStore = false, class Args>
 __device__ __forceinline__ void static_v4_store_fc1_tile(
     const Args &a, transport::BFloat16 *tile, const float *accum,
     transport::BFloat16 *output, const float *gates, std::uint64_t row,
-    std::uint32_t valid_rows, std::uint32_t column_base, std::uint64_t mblock) {
+    std::uint32_t valid_rows, std::uint32_t column_base, std::uint64_t mblock,
+    const CUtensorMap *store_map) {
   constexpr auto kOutputN = Fc1TileN / 2U;
   const auto lane = threadIdx.x % 32U;
   const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
@@ -31,12 +32,12 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
   constexpr auto kPlanes = RetainBackwardState ? 3U : 1U;
   if (kOutputN >= 64U && kPlanes * kOutputElements <= ScratchElements &&
       valid_rows == forward_tuning::kTileM) {
-    // Both math warpgroups must retire their TMA B reads before staging
+    // Both math warpgroups must retire their WGMMA B reads before staging
     // into that CTA-private arena. A is multicast and must not be reused.
     // Stage complete N64 swizzle atoms. The narrow decode entry retains its
     // original direct epilogue rather than staging a partial atom.
-    // Training packs G/U into two additional retired B planes, allowing
-    // canonical checkpoint rows to use the same vectorized writeback as S.
+    // Training packs G/U into two additional retired B planes for vector
+    // checkpoint writeback in canonical row order.
     cutlass::arch::NamedBarrier::sync(
         kMathThreads, physical_barrier<true>(kMathReadyBarrier));
 #pragma unroll
@@ -58,27 +59,47 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
             __float22bfloat162_rn(make_float2(u[2], u[3])));
       }
     }
+    if constexpr (TmaStore)
+      cute::tma_store_fence();
     cutlass::arch::NamedBarrier::sync(
         kMathThreads, physical_barrier<true>(kMathDoneBarrier));
-    for (unsigned vector = threadIdx.x;
-         vector < forward_tuning::kTileM * kOutputN / 8U;
-         vector += kMathThreads) {
-      const auto m = vector / (kOutputN / 8U);
-      const auto n = (vector % (kOutputN / 8U)) * 8U;
-      const auto offset = m128_fragment_vector_offset(m, n);
-      *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate +
-                                 column_base + n) =
-          *reinterpret_cast<const uint4 *>(tile + offset);
-      if constexpr (RetainBackwardState) {
-        const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
-        auto *gate = a.saved_ab + saved * a.intermediate + column_base + n;
-        auto *up = gate + a.saved_rows * a.intermediate;
-        *reinterpret_cast<uint4 *>(gate) =
-            *reinterpret_cast<const uint4 *>(tile + kOutputElements + offset);
-        *reinterpret_cast<uint4 *>(up) =
-            *reinterpret_cast<const uint4 *>(tile + 2U * kOutputElements + offset);
+    if constexpr (TmaStore && kOutputN >= 64U) {
+      if (threadIdx.x < kOutputN / 64U) {
+        const auto atom = threadIdx.x;
+        cute::SM90_TMA_STORE_2D::copy(
+            store_map, tile + atom * forward_tuning::kTileM * 64U,
+            column_base + atom * 64U, static_cast<std::uint32_t>(row));
+        cute::tma_store_arrive();
       }
     }
+    if constexpr (RetainBackwardState || !TmaStore) {
+      for (unsigned vector = threadIdx.x;
+           vector < forward_tuning::kTileM * kOutputN / 8U;
+           vector += kMathThreads) {
+        const auto m = vector / (kOutputN / 8U);
+        const auto n = (vector % (kOutputN / 8U)) * 8U;
+        const auto offset = m128_fragment_vector_offset(m, n);
+        if constexpr (!TmaStore)
+          *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate +
+                                     column_base + n) =
+              *reinterpret_cast<const uint4 *>(tile + offset);
+        if constexpr (RetainBackwardState) {
+          const auto saved =
+              a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
+          auto *gate = a.saved_ab + saved * a.intermediate + column_base + n;
+          auto *up = gate + a.saved_rows * a.intermediate;
+          *reinterpret_cast<uint4 *>(gate) =
+              *reinterpret_cast<const uint4 *>(tile + kOutputElements + offset);
+          *reinterpret_cast<uint4 *>(up) =
+              *reinterpret_cast<const uint4 *>(tile + 2U * kOutputElements + offset);
+        }
+      }
+    }
+    // The caller's math join includes every issuer before fc1_done and B
+    // reuse. Read-only completion is insufficient for publishing ring S.
+    if constexpr (TmaStore && kOutputN >= 64U)
+      if (threadIdx.x < kOutputN / 64U)
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
     return;
   }
 

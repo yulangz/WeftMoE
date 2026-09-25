@@ -2101,13 +2101,15 @@ make_activation_pool_state(const CollectiveSession &session,
             config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U",
             forward_tuning::kTileK);
-        // Ring FC2 stores directly to reserved contribution/Return TX rows.
-        // It has neither a canonical C allocation nor a TMA store descriptor.
-        if (!state->layout.static_ring.depth)
-          slot.forward_output_store_map = make_bf16_tma_store_map(
-              at<void>(slot.device, state->layout.canonical_rows),
-              config.max_hidden_size, activation_rows,
-              "Forward canonical output");
+        // Ring FC2 writes contribution/Return TX directly. Reuse its unused
+        // epilogue descriptor for FC1 S; arena entries still describe C.
+        const bool ring = state->layout.static_ring.depth != 0U;
+        slot.forward_output_store_map = make_bf16_tma_store_map(
+            at<void>(slot.device, ring ? state->layout.forward_s
+                                      : state->layout.canonical_rows),
+            ring ? config.max_intermediate_size : config.max_hidden_size,
+            activation_rows, ring ? "Forward ring SwiGLU"
+                                  : "Forward canonical output");
         if (config.enable_backward_state && !state->layout.static_ring.depth)
           slot.forward_training_output_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.forward_training_output),
@@ -5014,7 +5016,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     cudaError_t launch_forward = cudaSuccess;
     if (split_forward_roles || static_v4_candidate) {
       const auto &ordinary_output_store_map =
-          config.retain_backward_state
+          config.retain_backward_state && !args.ring.depth
               ? slot.forward_training_output_store_map
               : slot.forward_output_store_map;
       args.forward_relay_cta_count = split_local_roles
