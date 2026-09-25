@@ -5639,3 +5639,56 @@ GC相对基线main快1.46%（首轮1.27%），GD快1.31%（首轮1.41%）；但G
 及默认B512仍无收益。因此本轮GC/GD均不合入，source恢复原GA+FZ；候选补充的
 测试/encoder选项也不留在生产代码，不增加维护分支或宣称完成训练性能目标。
 反向日志`block_source_gcd_reverse_{gd,gc,gafz}_ep16_t20480_b1024_training_formal.log`。
+
+### GH/GE：Return两包提交、消费credit缓存（独立候选，2026-09-25）
+
+两项分别基于GA+FZ，不含GC/GD或彼此。GH只对同一channel已经预留且全部
+FC2-ready的最多两包Return合并GIN doorbell：先acquire整个有限ready前缀，
+第一包用公开`ncclGinOptFlagsAggregateRequests`，最后一包正常提交后才能离开。
+批内不等待新的FC2、软件credit或terminal flush；保留全部ready信号、C退休和
+双credit。为保证一批最多四个GDAKI WQE、能装入现有queue1024，仅最大计划
+packet不超过1GiB时尝试两包，更大包走原单包，不截断payload。
+GDAKI的flushAsync只捕获已预留SQ头，不替代最后一个doorbell；EFA内部达到
+max_batch时会强制ring，Proxy忽略该flag，GPI只使用未启用的skip-credit flag。
+这是已安装NCCL2.31.2头文件审计，本机只验证GDAKI，不宣称其它NIC实测通过。
+
+GE在既有128-byte NetworkChannel padding内增加TX私有`tx_consumed_head`
+（offset80，credit_signal仍72），初始为上一调用已drain的tx_base。只有缓存
+下界不覆盖目标时才GIN readSignal，首代不读旧credit；terminal drain也可用
+已取得的前缀。不能凭NIC完成推断远端消费，显式本地flush完全保留。不新增
+payload/目录容量、同步原子、动态领用或调参开关。
+
+冻结`build/static_v4_return_put_batch_gh/`、`static_v4_credit_cache_ge/`。
+native SHA256分别
+`0671a81ec860b1d96b5b606798add6c137167e72f57c3afdbe136f5b9a2ced30`、
+`a74e7bd4dfb4af5abcdd9f8578ff5fce3622a60829c7b45103baa52fdb2a50b5`。
+两者四local main完整SASS逐字节等于GA+FZ，均REG168/SHARED2048/LOCAL0/
+CONST3264；GH network inference STACK392→416，training decode416→424/
+prefill408→424；GE全部八个资源配置不变。GE既有host18/18通过；两候选各
+三组native检查exit0，各160个梯度hash等于GA+FZ，repeat_equal均1、pool相同。
+未构建library、没有完整Torch或fresh Forward sanitizer结果。
+
+03:24–03:30十二组双机EP16 graph正式对照exit0；1620MHz、B512/D8、
+10warmup/20samples/batch20，期间两节点无CPU构建或其它GPU工作。192个
+输出hash逐rank等于GA+FZ正式矩阵的V3参考，实际shape/world/样本/pool核实：
+
+|T/rank|GA+FZ/us|GH/us|GE/us|
+|---:|---:|---:|---:|
+|1|235.670|237.434|235.181|
+|64|286.648|291.368|287.450|
+|8192|2890.220|2942.600|2887.230|
+|20480|6925.440|6874.460|6867.330|
+
+GH前三档慢0.75%/1.65%/1.81%，GE前三档均小于0.3%的变化。20K相邻分别
+快0.74%/0.84%，但本次GA+FZ基线高于此前约6860us，不能直接宣布稳定收益；
+暂不采用，源代码均已撤回，继续长文反向核实。日志
+`network_submit_ghe_{gafz,gh,ge}_ep16_t*_formal.log`。
+
+03:46–03:49长文反向GH→GE→GA+FZ六组exit0，96个hash及相同门禁字段核实；
+两节点仍独占、无CPU构建，16卡SM/graphics1620MHz，memory仅观测未锁定。
+8K为2942.390/2887.810/2888.320us，20K为6888.100/6887.280/6871.050us。
+GH的8K回退再次为1.87%；20K从首轮快0.74%变成慢0.25%。GE的8K只快0.02%，
+20K从快0.84%变为慢0.24%。两项均无稳定收益，不采用；保留原单包提交和直接
+读取consumed credit，不引入额外批处理分支或缓存状态。没有为这两个已否决
+候选继续做library、完整Torch或sanitizer验收。反向日志
+`network_submit_ghe_reverse_{gh,ge,gafz}_ep16_t*_formal.log`。
