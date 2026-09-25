@@ -5857,3 +5857,95 @@ Main变化为慢0.54%、快0.32%、慢0.24%、快0.19%，不构成一致的训�
 这是当前硬件专用构建的取舍，不否认独立specialized library未来可能有用途。
 保留完整构建/失败记录及候选guard，生产无新增backend限制；不继续library/
 Torch/sanitizer验收。日志`gdaki_build_{gafz,gj}_ep16_t*_b*_training_formal.log`。
+
+### GG：单消费者Return退休由RMW改为store（不采用，2026-09-25）
+
+DS之后每个Return channel只有一个receive_return消费者，它acquire本代
+visible_generation后发布包内全部行ready。用release store精确retire_target
+代替fetch_add(rows)：target由RX在generation发布前累加，且在本次退休被ACK、
+TX再复用之前不能换代。没有省掉任何读者；Dispatch仍是多fanout RMW，源
+contribution仍由全窗口Reduce保护。代码只改这一处和证明注释，不新增状态、
+barrier或测试套件，双TX credit和GA连续ACK均不变。
+
+冻结`build/static_v4_return_retire_gg/`，native SHA256
+`72892dc7a330d6fced550de80880d89e38d4f43957632d4ea305e01aac0d56e6`。
+三组native检查exit0，160个梯度hash等于GA+FZ、repeat_equal均1、pool相同。
+四local完整main SASS与GA+FZ相同，八入口全部资源配置相同；尚无library/
+full Torch/fresh sanitizer。正式计时进行中，不因去掉RMW就提前宣称收益。
+
+04:31–04:35两节点独占、无CPU构建，1620MHz、B512/D8、graph10/20/batch20，
+四规模八组exit0。128个输出hash与GA+FZ/V3参考一致，shape/world/计数/pool核实：
+
+|T/rank|GA+FZ/us|GG/us|
+|---:|---:|---:|
+|1|235.698|235.456|
+|64|287.410|288.216|
+|8192|2887.180|2888.360|
+|20480|6871.500|6909.170|
+
+前三档约持平，20K本轮慢0.55%，未证明性能收益；暂不采用，继续20K反向核实。
+日志`return_retire_{gafz,gg}_ep16_t*_formal.log`。
+
+04:40–04:41反向20K（GG→GA+FZ）exit0，32个hash与参考一致，pool/shape/
+graph计数核实；同样独占两节点、无CPU构建。GG 6912.070us，GA+FZ 6864.650us，
+慢0.69%，与首轮方向一致。因此不采用，恢复原RMW；没有为这项负收益增加
+library/Torch/sanitizer轮次。反向日志`return_retire_reverse_{gg,gafz}_ep16_t20480_formal.log`。
+
+### GL：无损Return编码的独立可行性诊断（未接入生产，2026-09-25）
+
+前述小改动没有解决双机20K差距，因此先检查能否在不改动任何BF16位值的前提
+下减少Return流量；不是FP8/量化或节点内提前舍入归约。当前夹具Return约占
+Dispatch+Return payload的2/3，但不能由此直接断言NIC是唯一瓶颈。
+
+先在已有纯GEMM诊断中读取FC2实际输出，排除padding、每16行统计指数跨度；
+这是纯GEMM合成输入，不是分布式native算子的实际payload分布。指数0单独占
+code0，其它指数若覆盖至多31个连续值可用5-bit差值+1，sign/mantissa原8bits
+不变；不符合条件就原样传BF16。4-bit只有15个非零指数位置。
+8K/20K的2048/5120个有效包均符合5-bit条件，计入128B包头的估算从
+134217728/335544320降至109314048/273285120bytes，即减少18.55%；4-bit仅
+11/15包适用，计入包头反而不划算。这不是通信性能收益。
+
+`build/static_v4_lossless_return_gl/probe` SHA256
+`d119376183808737eb8abd310f3301842045fb0e5ef63b21111e4bb5bf346cd4`仅作统计。
+随后`codec/`独立原型以32个单warp CTA固定划分包；13次ballot编码32个BF16，
+13次shuffle解码，使用独立固定stride的实验缓冲区。生产没有增加buffer、
+wire schema或任务分支。原型首轮因局部变量名与既有CK宏冲突编译失败，修正
+并保留`codec/build_macro_name_failure.log`，不混入正确性/性能数据。
+codec binary SHA256
+`3929e98c5332aa3392a42c71ab8d1944244475e7fc212b680a46940d4599bebc`。
+
+两档完整输出逐位比较、重复、全部65536种BF16位型及其它可编码/原样回退模式、
+同slot input→patterns→input复用均通过；含signed zero/subnormal/Inf/NaN位型。
+既有GEMM完整校验也通过。第二节点单GPU独占，无并发CPU构建或其它GPU任务；
+codec10warmup/20samples的120对时钟和纯GEMM120对时钟均1620:1620。
+每phase单独kernel计时，编码/解码不与计算或GIN重叠；p50/us：
+
+|重放T/rank|编码|解码|串行编码+解码|
+|---:|---:|---:|---:|
+|8192|19512.961|27432.641|46942.434|
+|20480|48882.781|68584.414|117465.500|
+
+按原始字节计，编码约6.9GB/s、解码约4.9GB/s，首版明显不具备进入通信路径
+的条件。已另写向量加载/预取更多数据的独立候选，尚未构建；不能从可压缩比例
+直接推断收益。完整协议若继续，还必须计入编码TX/RX、有界解码、丢失DS直写
+优势、额外访存和融合资源竞争；任意位型的raw回退不能丢token。原始记录在
+`codec/routeworld16_t*_balanced.log`，world16仅指单GPU重放的专家几何。
+
+04:38–04:40向量bitplane版已构建并完成两档独立测试。`codec_vector/probe`
+SHA256 `465e562940f2b529d78ef09329bc7f70c9c36a3c47ce3fd0a08ba96bb1882ae6`。
+每lane一次uint4读取/写回8个BF16，统计也向量化；编码仍为104次ballot/256值，
+解码预取8组plane后执行104次shuffle。全128B header初始化。实验wire顺序与
+scalar不同，不混用两种格式。REG encode64/decode48，STACK0/SHARED1024/LOCAL0，
+完整指定kernel名的非空SASS确认LDG.E.128/STG.E.128；首次按子串选函数得到的
+空dump不作为证据。launch_bounds限制单warp寄存器，未验证融合GIN的实际资源。
+
+两档全位型、重复、raw/compact复用、GEMM校验均通过，120对codec时钟及120对
+GEMM时钟全1620:1620，独占第二节点单GPU、无并行构建或其它GPU工作。p50/us：
+
+|重放T/rank|编码|解码|串行编码+解码|
+|---:|---:|---:|---:|
+|8192|16142.496|8427.040|24539.184|
+|20480|40431.375|21098.736|61500.430|
+
+编码约8.3GB/s、解码15.9GB/s，仍不适合直接接入。继续独立试验连续13-bit
+打包，减少逐bit warp操作；不会把这两轮微基准改善记成MoE性能收益。
