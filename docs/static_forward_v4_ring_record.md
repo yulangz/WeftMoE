@@ -5549,3 +5549,35 @@ T64为286.930/317.522us，下降9.64%，与首轮12.14%/9.61%一致。
 据完整门禁及正反向结果采用GA+FZ；没有增加新测试套件。FZ独立训练收益和
 GA短档通信收益分别保留证据，不把组合收益做线性拆分。当前长文inference、
 训练wall及完整Backward racecheck目标仍开放，未将这一里程碑标为全项目完成。
+
+### GB：仅对FC1 generic写回保留device fence（候选，2026-09-25）
+
+在GA+FZ上单独让FC1 epilogue返回是否执行generic stores；完整M128 inference
+TMA路径在完整bulk wait0后跳过旧device fence，仍经math join发布fc1_done。
+vector尾块及所有训练generic写回保留原fence，未用.read替换完整wait。
+PTX8.8的bulk wait与async-proxy完成规则支持这一排序，不能据此假定有性能收益。
+候选二进制见`build/static_v4_fc1_fence_gb`；native SHA256
+`2892bbd92252dcc4ce778dfefea7fd37b57833cde47003b757e7efbc1eb76fa4`。
+八个资源配置与GA+FZ相同；四training及两decode inference完整SASS逐字节相同，
+仅两个prefill inference改变。没有library、完整门禁或fresh sanitizer结果；
+pure extractor还需处理helper返回值赋值，尚未验证，不将既有证据移记给GB。
+
+02:47–02:50八组正式graph对照，先第二节点独占单机EP8，再两节点独占EP16，
+期间无CPU构建/其它GPU任务。1620MHz、B512/D8、10/20/batch20，实际shape和
+world核实；96个输出hash逐rank等于GA+FZ正式矩阵的V3参考。rank-max p50/us：
+
+|EP|T/rank|GA+FZ|GB|变化|
+|---:|---:|---:|---:|---|
+|8|8192|1248.850|1250.350|慢0.12%|
+|8|20480|2939.220|2930.260|快0.30%|
+|16|8192|2889.980|2903.560|慢0.47%|
+|16|20480|6863.120|6904.700|慢0.61%|
+
+首轮无整体收益，代码仍保持撤回；待反向确认双机退化。
+日志`fc1_fence_gb_{gafz,gb}_{remote_ep8,ep16}_t{8192,20480}_formal.log`。
+
+03:00–03:03反向GB→GA+FZ四组exit0，64个输出hash/shape/样本/pool核实。
+8K为2900.030/2886.010us，GB再次慢0.49%；20K为6882.180/6929.680us，
+方向翻转为GB快0.69%，本轮GA+FZ也明显高于此前约6860us。保留全部样本，
+不挑选有利对照；8K稳定退化而20K不稳定，最终不采用GB。
+反向日志`fc1_fence_gb_reverse_{gb,gafz}_ep16_t{8192,20480}_formal.log`。
