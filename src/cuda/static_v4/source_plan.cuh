@@ -42,6 +42,32 @@ prefix_source_counts(unsigned *counts, unsigned size, std::uint64_t *prefix) {
     prefix[size] = carry;
 }
 
+// Share route validation between grouped directories and direct publication.
+// A second pass need not report an invalid id again after the counting pass.
+template <unsigned Threads, unsigned BaseThread = 0U, bool ReportError = true,
+          class Emit>
+__device__ __forceinline__ void for_each_source_route(
+    const SourcePlanView &a, std::uint64_t local_window, Emit emit) {
+  const auto begin = local_window * a.shape.tokens;
+  const auto remaining = a.tokens - begin;
+  const auto tokens = static_cast<unsigned>(
+      remaining < a.shape.tokens ? remaining : a.shape.tokens);
+  const auto route_begin = begin * a.shape.top_k;
+  for (auto index = threadIdx.x - BaseThread;
+       index < tokens * a.shape.top_k; index += Threads) {
+    const auto route = route_begin + index;
+    if (a.valid && !a.valid[route])
+      continue;
+    const auto expert = a.selected_experts[route];
+    if (expert < 0 || static_cast<unsigned>(expert) >= a.experts) {
+      if constexpr (ReportError)
+        atomicExch(a.error, 1U);
+      continue;
+    }
+    emit(route, static_cast<unsigned>(expert));
+  }
+}
+
 // Called by a fixed CTA/control group for each of its source token windows.
 // The default freezes atomic reservation order. The canonical specialization
 // reuses Notify's stable expert/source ordinals: a contiguous token window
@@ -59,7 +85,6 @@ __device__ void build_source_window(const SourcePlanView &a,
   const auto tokens = static_cast<unsigned>(
       remaining < a.shape.tokens ? remaining : a.shape.tokens);
   const auto route_begin = begin * a.shape.top_k;
-  const auto routes = tokens * a.shape.top_k;
   const auto experts_per_node = a.experts / a.nodes;
   auto *expert_prefix = a.expert_prefix + local_window * (a.experts + 1U);
   auto *node_prefix = a.node_prefix + local_window * (a.nodes + 1U);
@@ -77,20 +102,13 @@ __device__ void build_source_window(const SourcePlanView &a,
   }
   source_plan_sync<Threads, Barrier>();
 
-  for (auto index = tid; index < routes; index += Threads) {
-    const auto route = route_begin + index;
-    if (a.valid && !a.valid[route])
-      continue;
-    const auto expert = a.selected_experts[route];
-    if (expert < 0 || static_cast<unsigned>(expert) >= a.experts) {
-      atomicExch(a.error, 1U);
-      continue;
-    }
-    atomicAdd(scratch + expert, 1U);
-    if constexpr (Canonical)
-      atomicMin(canonical_begin + expert,
-                static_cast<unsigned long long>(canonical_rows[route]));
-  }
+  for_each_source_route<Threads, BaseThread>(
+      a, local_window, [&](std::uint64_t route, unsigned expert) {
+        atomicAdd(scratch + expert, 1U);
+        if constexpr (Canonical)
+          atomicMin(canonical_begin + expert,
+                    static_cast<unsigned long long>(canonical_rows[route]));
+      });
 
   // Each token is owned by one lane. Count one X record for each actually hit
   // node, while retaining all valid route slots, including duplicate experts.
@@ -126,21 +144,16 @@ __device__ void build_source_window(const SourcePlanView &a,
   }
   source_plan_sync<Threads, Barrier>();
 
-  for (auto index = tid; index < routes; index += Threads) {
-    const auto route = route_begin + index;
-    if (a.valid && !a.valid[route])
-      continue;
-    const auto expert = a.selected_experts[route];
-    if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
-      continue;
-    std::uint64_t position;
-    if constexpr (Canonical)
-      position = expert_prefix[expert] + canonical_rows[route] -
-                 canonical_begin[expert];
-    else
-      position = atomicAdd(scratch + expert, 1U);
-    route_order[position] = route;
-  }
+  for_each_source_route<Threads, BaseThread, false>(
+      a, local_window, [&](std::uint64_t route, unsigned expert) {
+        std::uint64_t position;
+        if constexpr (Canonical)
+          position = expert_prefix[expert] + canonical_rows[route] -
+                     canonical_begin[expert];
+        else
+          position = atomicAdd(scratch + expert, 1U);
+        route_order[position] = route;
+      });
   if constexpr (NodeDirectory) {
     for (auto token = tid; token < tokens; token += Threads) {
       const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;

@@ -106,23 +106,28 @@ __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
     input[v] = reinterpret_cast<const uint4 *>(a.input)[v];
 }
 
-// One capacity window has one source directory. Push its compact metadata
-// into the existing destination tables before the source-ready rank barrier.
-// Empty sources still overwrite their counts; no cleanup or new epoch is needed.
-__device__ __forceinline__ void publish_single_window(
-    const ForwardKernelArgs &a, unsigned tid, unsigned threads) {
+// One capacity window needs only the destination directory. Shared counters
+// assign source-expert ordinals directly, without a grouped source copy.
+// Empty sources still overwrite every count before the source-ready barrier.
+template <unsigned Threads, unsigned BaseThread>
+__device__ __forceinline__ void build_single_window(
+    const ForwardKernelArgs &a, unsigned *counts) {
   const auto &p = a.ring.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  for (unsigned expert = tid; expert < p.experts; expert += threads)
+  const auto tid = threadIdx.x - BaseThread;
+  for (unsigned expert = tid; expert < p.experts; expert += Threads)
+    counts[expert] = 0U;
+  collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+  static_forward::for_each_source_route<Threads, BaseThread>(
+      p, 0U, [&](std::uint64_t route, unsigned expert) {
+        const auto ordinal = atomicAdd(counts + expert, 1U);
+        static_v4::source_routes(a, expert / owned, a.rank, expert % owned)
+            [ordinal] = static_cast<unsigned>(route);
+      });
+  collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+  for (unsigned expert = tid; expert < p.experts; expert += Threads)
     static_v4::source_counts(a, expert / owned, a.rank)[expert % owned] =
-        p.tokens ? p.expert_prefix[expert + 1U] - p.expert_prefix[expert] : 0U;
-  const auto routes = p.tokens ? p.expert_prefix[p.experts] : 0U;
-  for (auto ordinal = std::uint64_t(tid); ordinal < routes; ordinal += threads) {
-    const auto route = p.route_order[ordinal];
-    const auto expert = static_cast<unsigned>(p.selected_experts[route]);
-    static_v4::source_routes(a, expert / owned, a.rank, expert % owned)
-        [ordinal - p.expert_prefix[expert]] = static_cast<unsigned>(route);
-  }
+        counts[expert];
 }
 
 __device__ __forceinline__ void *local_row_output(const ForwardKernelArgs &a,
@@ -234,17 +239,20 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     if constexpr (!Training)
       build_combine_order(a, tid, stride);
   } else {
-    auto planner = p;
-    if constexpr (Network)
-      planner.selected_experts = a.selected_experts;
-    for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
-         w += gridDim.x)
-      static_forward::build_source_window<SourceThreads, Math,
-                                          kCollectiveScopeBarrier, Canonical,
-                                          Network || Training>(
-          planner, w, counts, a.dispatch.route_dst_row);
-    if (single_window && blockIdx.x == 0U)
-      publish_single_window(a, threadIdx.x - Math, SourceThreads);
+    if (single_window) {
+      if (blockIdx.x == 0U)
+        build_single_window<SourceThreads, Math>(a, counts);
+    } else {
+      auto planner = p;
+      if constexpr (Network)
+        planner.selected_experts = a.selected_experts;
+      for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
+           w += gridDim.x)
+        static_forward::build_source_window<SourceThreads, Math,
+                                            kCollectiveScopeBarrier, Canonical,
+                                            Network || Training>(
+            planner, w, counts, a.dispatch.route_dst_row);
+    }
   }
   // Inference overlaps input staging and counting. Training publishes only
   // metadata here, after tape allocation. Math has no live GEMM state yet.

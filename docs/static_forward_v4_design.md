@@ -108,6 +108,9 @@ GZ仅对单机inference省去无读者的node目录生成，保留expert计数/r
 当前同输入ring仍慢于MegaMoE约50%/58%，详见ring记录。
 后续HA提前单窗口admission没有实质净收益，HB集中source staging到CTA0虽省去
 一次grid arrival却使T64慢约31%，两项均已撤回；不属于现行同步方案。
+HC进一步在单容量窗口直接构建destination counts/routes，复用通用route
+遍历/校验，省去中间source目录及转存；T64再快约0.8%，T1持平。全部门禁
+通过后采用，最新同输入ring仍慢于MegaMoE约51%/57%，短文目标未关闭。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -484,12 +487,22 @@ source ordinal解码，FC1/FC2/Return的读取合同不变。空/错误窗口、
 barrier之后，未删除或分叉跨rank同步。
 
 GZ在`build_source_window`复用一个编译期`NodeDirectory`选择；ring caller传
-`Network || Training`。单机inference只需expert_prefix/route_order，因此
+`Network || Training`。分组规划器在单机inference只需expert_prefix/route_order，因此
 不再生成node histogram、node_prefix和带fanout的node_tokens。已核查这些
 node字段的生产端读者仅在network packet规划和transport中。此项也适用于
 多窗口及大pool里的短调用，不受GV/GY单容量窗口条件限制；保留全部expert
 计数、masked/非法route处理、route预留及CTA/grid/rank同步。没有减少有效route，
 也没有取消跨机按节点去重；网络和训练均保留完整目录。pool布局与分配未改。
+
+HC在单机inference、capacity windows=1时进一步替换这个分组步骤：CTA0
+的source组清零共享expert计数，复用`for_each_source_route`遍历有效route，
+一次shared atomic给每条route分配source-expert ordinal，直接写入既有
+destination route表；组内join后发布全部count，包括零。无需生成或转存
+source expert_prefix/route_order，因为后续cached source_count和两种reverse
+分支均读destination目录。空source仍发布零计数，非法expert和masked route
+复用同一个校验入口；训练、多窗口及network继续生成原分组目录。输入/gate/
+combine准备仍分布在所有math CTAs，原grid/rank发布边界和逐slot合同均不变。
+既有目录allocation保留供其它路径使用，没有增加新状态或运行时参数。
 
 GU仅在单机inference的实际全局窗口数为1、该destination有效行数不超过
 `2 * gridDim.x`时选择Batch1，判定不依赖本rank的输入T或pool最大容量。

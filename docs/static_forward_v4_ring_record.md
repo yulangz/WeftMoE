@@ -7,7 +7,7 @@
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
 planner、GU短文pull分工、GV metadata发布、GW destination scan、GY紧凑reverse
-规划及GZ单机source目录精简。GX延后到pull、HA提前admission及HB集中source
+规划、GZ单机source目录精简及HC单容量窗口直接发布目录。GX延后到pull、HA提前admission及HB集中source
 staging的候选均已撤回。下面仍是GA+FZ冻结数据，
 不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
@@ -45,6 +45,9 @@ GW再改善约1%，GY合并紧凑reverse规划再改善约4%；最新GY同输入
 GZ仅省去单机inference中无读者的node目录，短档再快约8%；最新同输入复测
 ring为80.71/100.19us，Mega含copy为53.85/63.43us，仍慢约50%/58%。长文、
 双机和补测训练未见明显退化，短文目标仍开放，详见文末GZ节。
+HC再省去单容量窗口的中间source目录，T64相邻三轮稳定快约0.8%，T1持平。
+最新同输入复测ring为80.07/99.54us，Mega含copy为53.16/63.33us，仍慢约
+51%/57%，不能收尾。完整门禁、无效时钟样本排除及复测见文末HC节。
 
 ## 冻结基线
 
@@ -6845,3 +6848,103 @@ tokens容量，不触发HB的小容量分支，不能声称其空source/graph复
 `build/static_v4_compact_source_hb/`；native SHA256为
 `2dbc9be546be4278368422732d26f159d371df5392230a1e421b30256f3e9195`。
 生产源码仍是GZ；HA/HB均没有改变最新MegaMoE对照及未达短文收尾条件的结论。
+
+### HC：单容量窗口直接构建 destination 目录（2026-09-29，已采用）
+
+完全撤回HA/HB后，基于GZ源码（`9fe0dda`，文档HEAD为`c9ac7ca`）。GV之后，
+单机inference且capacity仅一个窗口时，destination计数和两个reverse分支
+均已读取destination counts/routes。原source `expert_prefix/route_order`
+只剩`publish_single_window`转存时读取；网络packet/Return仍需要这些目录，
+但不在这条单机分支中，训练和多窗口也保留原目录。
+
+将这条路径改为共享内存expert计数器一次枚举route，直接为每个expert分配
+source-local ordinal并写入既有destination route表，随后发布全部count，
+包括零。省去中间分组目录、prefix scan、第二次route枚举及转存读回。通用
+`for_each_source_route`复用masked/非法expert处理；原grouped planner的计数
+与散射也复用该遍历，第二遍不重复报错。没有另写一套route校验算法。
+
+条件仍是collective capacity windows=1（包括source group约束），不依赖
+各rank的实际T。空source也执行清零/发布，错误处理仍通过原集体路径。
+inference物理ordinal允许变化，但每个合法route保留一次，重复slot不合并，
+combine仍按既有expert/slot顺序。X、gate及combine order仍由全网格并行准备；
+所有grid/rank joins、admission、逐slot generation/credit及payload布局不变。
+没有新buffer、counter、参数或永久测试，未采用HA/HB的改动。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮GZ→HC；
+反向T64→T1、每档HC→GZ，表中统一按GZ/HC列出：
+
+|T/rank|首轮GZ|首轮HC|反向GZ|反向HC|
+|---:|---:|---:|---:|---:|
+|1|78.523|78.557|78.554|78.464|
+|64|98.981|98.096|98.978|98.189|
+
+T1视为持平，T64快0.80%–0.89%；32个hash、pool、graph结构/协议一致，
+128个SM读数均1620MHz。计时节点无CPU构建或其它GPU任务；反向时仅另一节点
+构建应用库。EP8全四档正式graph矩阵，相邻GZ→HC：
+
+|T/rank|GZ/us|HC/us|
+|---:|---:|---:|
+|1|78.573|78.466|
+|64|98.826|98.018|
+|8192|1239.530|1243.070|
+|20480|2922.740|2919.630|
+
+32个hash、pool、graph/协议及全部时钟一致，长档变化不足0.3%，不报告长文
+收益。八种main的资源全部与GZ一致；不据此宣称SASS相同。
+
+复用原native eager训练入口：retain_state=1、10warmup/20samples、B512/D8，
+8K为GZ→HC，20K为HC→GZ。以下统一按GZ/HC列rank-max p50/us：
+
+|T/rank|GZ main|HC main|GZ wall|HC wall|
+|---:|---:|---:|---:|---:|
+|8192|1328.320|1327.970|1841.200|1818.990|
+|20480|3195.940|3195.330|3763.280|3758.570|
+
+训练main持平；wall的单轮变化不作为稳定训练收益。8K首轮GZ结束后的GPU5
+SM读数为0MHz，整对日志另存`*_training_clock0_pair.log`并排除性能结论；
+上表8K来自独立重测，GZ/HC前后各16个SM读数均为1620MHz。所有有效训练
+输出/输入/权重hash及pool/协议与GZ一致。这里是eager训练，不混入inference
+graph计时；没有改变已验收的GA+FZ长文配置。
+
+已完成GPU planner的37 source/packet+7 destination及racecheck（0 hazards），
+host18/18、native EP8/T512和EP16/T64/T2048共160个梯度hash/尺寸完全等于GZ，
+Torch EP8四档240、单容量T1/T64/T512+edges 200、tiny B16/D1/K8 152项通过。
+短容量rank0/7 memcheck各0 errors、Forward racecheck各0 hazards，各200项
+应用检查通过；EP16四档+edges 480项通过。覆盖空/不等长source、重复route、
+graph路由变化、共享workspace/权重复用、多窗口和热点无丢失。没有新增永久
+测试，也仍不声明完整Backward racecheck关闭。
+
+EP16正式graph按20K→8K→64→1、每档HC→GZ，同口径1620MHz，表中按GZ/HC：
+
+|T/rank|GZ/us|HC/us|
+|---:|---:|---:|
+|1|233.502|233.866|
+|64|286.582|286.368|
+|8192|2882.000|2882.200|
+|20480|6848.110|6845.290|
+
+64个output hash、pool/registered bytes、graph/协议一致；双机前后SM全部
+1620MHz。差异不足0.2%，不报告新增多机收益。
+
+同输入MegaMoE应用graph首轮T64→T1，括号为独立进程T1→T64复测。四case
+交错、10warmup/20samples/batch20，rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega含3份copy|HC ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.342（49.296）|53.180（53.156）|79.864（80.070）|60.590（60.989）|
+|64|58.672（57.377）|64.558（63.333）|100.355（99.543）|77.347（76.230）|
+
+reference通过，四case各8rank的SHA256逐项等于GZ；2560组前后SM读数全部
+1620MHz。Mega输入copy与kernel在同一graph内计时，未锁显存时钟、未测Mega
+双机。各轮绝对数值存在波动，不把跨轮差异当成HC的独立收益；相邻native
+三轮T64改善约0.8%，T1保持中性。最新公平含copy口径仍慢约51%/57%，短文
+收尾条件未达成；没有把已有非ring代替ring结果。
+
+正式计时节点无并发CPU构建或其它GPU任务。短档反向及首轮单机完整/训练
+矩阵期间仅另一节点构建应用库，其余门禁和计时均在构建完成后运行。复核
+脚本`build/static_v4_direct_source_hc/verify_results.py`全部通过；目录保留
+proposal、冻结patch、全部samples/hash/clock、sanitizer和被排除的时钟异常
+原始日志，源码与冻结patch一致。native SHA256为
+`e4b5f1890cbb08e97953ee7b966d21bc4977a2296cdeccc8d13e00850da328d4`；
+library为`e91ae296d2e7faa011313810457ddf90ff2f04e8124aacb6b8b2b3560342cbb4`；
+extension仍为`725bf863...825c3`。
