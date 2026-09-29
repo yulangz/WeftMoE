@@ -74,9 +74,32 @@ WeftMoE 从 proxy ready 到首次暂停采样约 821 s，慢于 baseline 的约 
 不修改 Megatron 实现、全局 batch、采样长度或优化器，不能与 64K 结果混算。
 两节点交换实验角色，重新锁定 1620 MHz，仍各自为单机 8 GPU、20 updates。
 原始数据目录为 `results/areal_sglang_v4_20260929_mb32`，入口日志为
-`build/local_decode_hg/mb32/rl_{baseline,weftmoe}.log`。该轮尚在运行，AWEX
-权重更新和稳态性能仍待验证。OOM 后本机进程清理曾触发短暂 NVRM 超时，随后
+`build/local_decode_hg/mb32/rl_{baseline,weftmoe}.log`。OOM 后本机进程清理曾触发短暂 NVRM 超时，随后
 自行恢复；确认显存归零、全部 8 卡 CUDA 分配/同步通过后才重新启动，未重置驱动。
+
+32K 两组均已完成第 1 次 update，并恢复下一轮生成；WeftMoE 的 AWEX v1
+权重传输、推理恢复及图回放通过。首步学习率为 0，这不代替非零学习率的后续
+更新或稳态验证。以下仅是首步记录，不是 20 updates 的最终对照：
+
+|指标|baseline|WeftMoE|
+|---|---:|---:|
+|rollout（s）|675.38|806.99|
+|train（s）|224.02|209.52|
+|权重更新（s）|19.487|21.186|
+|平均序列长度|10,130|10,275|
+|task reward|0.85938|0.84180|
+
+首轮 rollout 慢约 19.5%，当前没有端到端加速的证据。actor 实现相同，表中的
+训练耗时也不能解读为 WeftMoE 训练收益。两个 20-update 作业仍在运行。
+
+用户随后提供 W&B 凭据；为避免重启正在运行的对照，用
+`benchmarks/publish_areal_logs.py` 将完整 console metric table 旁路同步至
+[W&B 项目](http://8.150.1.98:8080/sct-test/areal-qwen35)，group 为
+`qwen35-sglang-hg-mb32-20260929`。baseline/WeftMoE 的首个点已从服务端读回
+核验，后续每个完整 update 自动同步，结束于第 20 次更新。训练进程本身仍为
+`wandb.mode=disabled`；上传指标保留日志打印精度，并在 run config 中标明
+`metric_source=completed_console_tables`，不是原进程的全精度原生 W&B history。
+凭据通过无回显输入只提供给上传进程，没有写入源码或实验配置。
 
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang
