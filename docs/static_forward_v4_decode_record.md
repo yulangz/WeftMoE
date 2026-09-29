@@ -609,3 +609,18 @@ E64/K4/EP8 的 T1/T64 为 36.956/59.360 µs，同轮 MegaMoE kernel 为
 
 冻结 library 为 `build/local_decode_hh_twobarrier/libweftmoe.so`，SHA256
 `962daf6fa6486f7afc930934ce636d2a7053e6227742e09356101ab6f3adf421`。
+
+### 物理块优先的 FC1/FC2 顺序消融（不采用）
+
+`local_decode_hh_blockorder` 将静态序列改为每个物理块先 8 个 FC1 tile、
+再 16 个 FC2 tile，使较早完成的块可以提前进入 FC2，仍由相同的 grid-stride
+owner 执行。相应地，phase 计时改为 CTA 私有 extrema，最终聚合一次；
+以下是这个组合的结果，不把计时改动的影响单独归因于任务顺序。
+
+EP4 的 124 个 native 和 9 个 SGLang bucket 数值检查通过，全部时钟采样
+1620 MHz。T1/16/32/48/64/96/128/256 的 p50 为
+48.584/116.645/140.277/166.622/169.528/176.422/182.185/192.582 µs，
+相对 HHE 的 T32/T64 回退约 13.6%/13.9%。该顺序降低了初始可执行 FC1
+的 CTA 比例；没有观察到提早安排 FC2 的净收益。编译资源为 M16 80 registers /
+16-byte stack，M64 128 registers / 32-byte stack。未进一步做全 EP 或
+sanitizer，代码已恢复 HHE，不替换 RL。原始日志为 `blockorder_*`。
