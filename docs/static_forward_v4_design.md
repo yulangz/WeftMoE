@@ -111,6 +111,11 @@ GZ仅对单机inference省去无读者的node目录生成，保留expert计数/r
 HC进一步在单容量窗口直接构建destination counts/routes，复用通用route
 遍历/校验，省去中间source目录及转存；T64再快约0.8%，T1持平。全部门禁
 通过后采用，最新同输入ring仍慢于MegaMoE约51%/57%，短文目标未关闭。
+HE进一步把单容量窗口的route/gate合并发布到destination，省去reverse中的
+peer gate读取；完整单/双机、训练与复用门禁通过后采用。native短档改善约
+1.6%–2.4%，最新同输入ring仍慢于MegaMoE约49%/52%。用户要求下一里程碑独立
+实现单机decode的通信/计算/同步工作流，参考MegaMoE并验证batch invariance；
+先解决宏观流程，不以MNK参数扫描代替该重构，prefill和多机维持已验收路径。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -140,6 +145,15 @@ ring 验收配置 `configs/static_inference_ring_20260924/` 沿用上述两组 G
 512、多机2048 tokens/rank。单机/双机在六个规模及edges的完整数值检查通过，
 四个指定规模已正式计时；阈值并非任意模型或三机以上的最优值。ring仍显式
 启用，未改变默认非ring训练路径。见ring记录DC，不能将profile选择与通信改造的收益合并归因。
+
+这里的decode/prefill是`unified_forward_kernel<..., Prefill, ...>`分别编译的
+CUDA入口，不是同一个kernel内运行时修改GEMM参数，也不是两份复制的实现。
+host在launch前选择入口及对应tile尺寸的TMA descriptor；两个入口共享同一份
+packed gate8/up8权重和ring协议/调度模块。窄入口FC1输出N32，采用直接写回；
+宽入口输出N64，完整M128块可复用已退休的B staging做合并/TMA写回，尾块保留
+直接写。每次inference选择一个融合Forward main，不是先后启动decode和
+prefill两个kernel。`RetainBackwardState`是另一个独立编译维度；训练ring
+额外有planner/tape准备，Backward仍复用已验证的V3实现。
 
 full-arena 历史基线的 graph rank-max p50（us），核心 1620 MHz：
 

@@ -4,12 +4,13 @@ namespace static_v4 {
 
 // The source owns one disjoint directory plane on each destination. These
 // tables describe the invocation, not the lifetime of a reusable payload slot.
-__device__ __forceinline__ std::uint32_t *
+template <class Route = std::uint32_t>
+__device__ __forceinline__ Route *
 source_routes(const ForwardKernelArgs &a, unsigned destination,
                unsigned source, unsigned expert) {
   const auto offset = reinterpret_cast<const char *>(a.fused_source_routes) -
                       reinterpret_cast<const char *>(a.local_base);
-  return peer_at<std::uint32_t>(a.peer_bases[destination], offset) +
+  return peer_at<Route>(a.peer_bases[destination], offset) +
          (std::uint64_t(expert) * a.world + source) * a.max_routes_per_rank;
 }
 

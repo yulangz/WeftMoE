@@ -48,6 +48,10 @@ ring为80.71/100.19us，Mega含copy为53.85/63.43us，仍慢约50%/58%。长文�
 HC再省去单容量窗口的中间source目录，T64相邻三轮稳定快约0.8%，T1持平。
 最新同输入复测ring为80.07/99.54us，Mega含copy为53.16/63.33us，仍慢约
 51%/57%，不能收尾。完整门禁、无效时钟样本排除及复测见文末HC节。
+随后HD同步候选已撤回；HE将短容量route/gate合并发布，native单机短档改善
+约1.6%–2.4%。恢复执行环境后完整门禁通过，已采用；最新同输入ring为
+78.83/97.12us，Mega含copy为53.02/63.97us，仍慢约49%/52%。用户要求下一步
+独立实现单机decode工作流，保护prefill；HE验收范围及中断经过见文末。
 
 ## 冻结基线
 
@@ -6948,3 +6952,131 @@ proposal、冻结patch、全部samples/hash/clock、sanitizer和被排除的时�
 `e4b5f1890cbb08e97953ee7b966d21bc4977a2296cdeccc8d13e00850da328d4`；
 library为`e91ae296d2e7faa011313810457ddf90ff2f04e8124aacb6b8b2b3560342cbb4`；
 extension仍为`725bf863...825c3`。
+
+### HD：单生产者 geometry 发布（2026-09-29，未采用）
+
+基于HC（`a357d26`）。单机inference、单capacity窗口的geometry仅由CTA0
+生成，尝试用release/acquire广播替换紧随其后的计数式grid汇合。增加一个
+持久化`geometry_ready`代号，每个CTA leader在已有source-ready entry grid
+之前读取旧代号+1，利用该grid保证所有snapshot先于CTA0的新发布。保留两个
+CTA join、全部source-ready grid/rank同步以及密集窗口的后续reverse grid。
+新字段将RingState从48扩为56字节，均落在原256字节对齐空间内；实测pool
+字节数和其它布局/协议指标不变。没有改X staging、admission或逐slot credit。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮HC→HD，
+反向T64→T1、每档HD→HC，统一按HC/HD列出：
+
+|T/rank|首轮HC|首轮HD|反向HC|反向HD|
+|---:|---:|---:|---:|---:|
+|1|78.451|78.178|78.490|78.270|
+|64|98.050|98.438|98.146|98.469|
+
+T1仅快0.28%–0.35%，T64回退0.33%–0.40%，不足以保留额外同步状态，已撤回
+两个源码文件的全部改动。两轮32个output hash、pool、graph/协议一致，128个
+SM读数全部1620MHz，八种main资源与HC一致。计时没有并发CPU构建或其它GPU
+工作。旧grid的跨度包含等待CTA0生产结果，不能把它全算作可消除的同步开销。
+
+没有构建应用库或运行完整门禁/MegaMoE，未将候选同步协议标为完整验证。
+patch、两轮samples/hash/clock及资源保存在`build/static_v4_geometry_publish_hd/`；
+native SHA256为`90ed092fb65b871dd6915c34f9699074b57046127ee243b799434d3c160f2080`。
+生产源码仍是HC，不保留`geometry_ready`字段。
+
+### HE：单容量窗口合并发布 route/gate（2026-09-29，已采用）
+
+基于HC（`a357d26`），已完全撤回HD。单机inference的单capacity窗口路径
+将destination目录项从`uint32_t route`改为8字节`SourceRoute{route, gate}`。
+source枚举route时一并读取gate并写到destination；紧凑和普通reverse两个
+消费者均从本地目录取gate，省去原来的peer gate读取。旧source gate staging
+暂时保留，避免把另一项优化混入本次消融。没有改变同步、逐slot credit、
+generation、expected count或数值运算顺序；多窗口、网络和训练仍走原目录。
+
+布局按pool的token容量是否落在一个窗口内分配8字节记录，不按pool的最大
+source-group数量判断：实际world可能小于pool容量，仍可能选择单窗口分支。
+因此短容量网络/训练pool也预留扩大的本地表；长容量及非ring表不变，GIN
+registered bytes不变。本次E64/K4、一个inflight时，T1/T64分别增加1KiB/
+64KiB每rank，准确体现在device及compute device两项；8K/20K增量为零。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮HC→HE，
+反向T64→T1、每档HE→HC，完整四档为HC→HE；表中统一按HC/HE列出：
+
+|T/rank|首轮HC|首轮HE|反向HC|反向HE|完整矩阵HC|完整矩阵HE|
+|---:|---:|---:|---:|---:|---:|---:|
+|1|78.5984|77.1408|78.4176|77.1808|78.5296|77.0848|
+|64|98.1504|95.7616|98.0416|95.7808|98.2016|95.8032|
+|8192|—|—|—|—|1241.8000|1242.8100|
+|20480|—|—|—|—|2927.1000|2931.8900|
+
+T1快1.58%–1.85%，T64快2.31%–2.44%；长档慢0.08%/0.16%，视为持平，
+不报告长文收益。64个output hash对比一致，graph节点/协议/形状一致，256个
+SM读数均1620MHz。内存检查逐项验证上述增量，而非忽略bytes差异。八种main
+资源与HC一致，host18/18通过；native/library/extension构建完成。计时节点
+没有并发CPU构建或其它GPU任务；反向短档和完整矩阵期间仅另一节点CPU构建。
+
+截至08:26 UTC，已有日志离线复核通过，源码与冻结patch完全一致；HC原完整
+验收脚本也重新复核通过。HE尚无训练8K/20K、native梯度、Torch edges/复用、
+memcheck/racecheck、EP16四档或MegaMoE对照的完成日志，不能声称这些门禁
+已通过，也不能将native的77/96us直接与另一夹具的Mega数据比较。
+
+本轮环境切换后`nvidia-smi`无法连接驱动，原任务session句柄均已不可用，
+进程查询也失败；不据此推断后台任务已结束。网络受限、`.git`只读，因此
+没有重启GPU/双机任务或提交commit。HE保留为未采用候选，最后完整验收提交
+仍是HC。恢复环境后先确认没有遗留任务，再完成上述门禁和两种顺序的Mega
+同输入复测，最后决定采用或撤回；不继续叠加新优化。
+
+证据位于`build/static_v4_route_gate_he/`，含冻结patch、构建/host日志、三组
+native samples/hash/clock及后续验证脚本。native SHA256为
+`67e4d97182467d9f781a60b750c0ba4452a1ca992987b68b6e4262c0e110e036`；
+library为`91bf653a86af51c8083e019418e373afa6a35315ad7a4120f3d1c7c8079deac5`；
+extension为`725bf863a6f3fc19a618f5afb739a957df2fa3ae2d7105e930869b5ee8b825c3`。
+
+09:00 UTC补记：用户重启CLI后GPU、双机连接和git写权限恢复；确认没有本轮
+遗留构建/测试后，使用上述冻结二进制完成所有待验项目。以下计时无并发CPU
+构建或其它GPU工作，SM全部1620MHz，显存时钟只观测，Mega仅测单机EP8。
+
+Torch EP8四档240、短容量T1/64/512+edges 200、tiny B16/D1/K8 152通过；
+rank0/7 memcheck各0 errors、Forward racecheck各0 hazards，各200项应用检查
+通过；EP16四档+edges共480通过。覆盖空/不等长source、重复slot、热点无丢失、
+gate/route graph变更、权重更新和workspace复用。EP8/T512及EP16/T64/T2048的
+160个梯度hash完全等于HC。EP8/T512/E16/K6的pool_bytes与workspace_bytes
+均增加196608字节；后者在Backward audit中实际报告`pool->layout.total`，
+不是独立的梯度临时空间。修正了验证脚本先前误认为此项不变的预期；tensor
+bytes不变，EP16两档各项bytes不变，未放宽hash或其它内存检查。
+
+host18/18、八种main资源一致已在前段验证。GPU planner本身未修改，复用HC
+37 source/packet+7 destination及racecheck证据，没有宣称HE重新执行该oracle，
+也仍不声明完整Backward racecheck关闭。
+
+训练eager retain_state=1、10warmup/20samples、B512/D8，8K按HC→HE，20K
+按HE→HC，统一列HC/HE rank-max p50/us：
+
+|T/rank|HC main|HE main|HC wall|HE wall|
+|---:|---:|---:|---:|---:|
+|8192|1327.33|1325.76|1840.48|1842.88|
+|20480|3188.67|3190.08|3755.54|3763.80|
+
+输入/权重/输出hash及全部bytes一致；main变化不足0.12%，不报告训练收益。
+
+EP16正式graph按20K→8K→64→1、每档HE→HC，统一列HC/HE：
+
+|T/rank|HC/us|HE/us|
+|---:|---:|---:|
+|1|233.730|233.432|
+|64|286.336|287.253|
+|8192|2883.600|2897.650|
+|20480|6846.490|6874.920|
+
+全部hash/graph/协议一致；短容量device/compute各增1KiB/64KiB，registered
+bytes和长容量各项不变。差异均不足0.5%，不报告新增多机收益。
+
+同输入Mega应用graph首轮T64→T1，括号为独立进程T1→T64复测；交错四case，
+10warmup/20samples/batch20，rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega含3份copy|HE ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.268（49.193）|53.140（53.021）|78.793（78.834）|60.738（60.660）|
+|64|57.490（57.562）|63.455（63.968）|97.294（97.116）|75.963（76.062）|
+
+reference通过，四case各8rank的SHA256完全等于HC；2560组前后SM读数全部
+1620MHz。最新公平含copy口径仍慢约49%/52%，短文目标未完成。完整复核脚本
+`build/static_v4_route_gate_he/verify_results.py`通过，输出存`verification.log`。
+源码与冻结patch一致，采用HE；后续单机decode是独立里程碑，不混入本次收益。

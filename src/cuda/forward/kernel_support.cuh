@@ -1254,7 +1254,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
             checked_mul(config.max_tokens_per_rank, config.max_top_k,
                         "fused source routes per rank"),
             "fused source route table"),
-        sizeof(std::uint32_t), "fused source route table");
+        // Active worlds may be smaller than the pool capacity. Provision a
+        // route+gate record whenever one token window could use the local
+        // fast path, independently of the capacity's source-group count.
+        ring.depth && config.max_tokens_per_rank <= ring.shape.tokens
+            ? sizeof(static_forward::SourceRoute) : sizeof(std::uint32_t),
+        "fused source route table");
     layout.fused_source_gates = ring.depth
         ? (config.max_nodes == 1U ? ring.metadata + ring.source.gates : 0U)
         : append(cursor, routes, sizeof(float), "fused source route gates");

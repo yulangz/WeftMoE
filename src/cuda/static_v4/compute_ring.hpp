@@ -31,6 +31,13 @@ struct RingBlock {
   std::uint64_t generation;
 };
 
+// Single-window source metadata is pushed together, avoiding a peer gate
+// read while the destination constructs its immutable reverse rows.
+struct alignas(8) SourceRoute {
+  std::uint32_t route;
+  float gate;
+};
+
 struct RingRow {
   std::uint32_t route;
   std::uint32_t source;

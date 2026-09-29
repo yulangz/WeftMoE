@@ -121,8 +121,9 @@ __device__ __forceinline__ void build_single_window(
   static_forward::for_each_source_route<Threads, BaseThread>(
       p, 0U, [&](std::uint64_t route, unsigned expert) {
         const auto ordinal = atomicAdd(counts + expert, 1U);
-        static_v4::source_routes(a, expert / owned, a.rank, expert % owned)
-            [ordinal] = static_cast<unsigned>(route);
+        static_v4::source_routes<static_forward::SourceRoute>(
+            a, expert / owned, a.rank, expert % owned)[ordinal] = {
+                static_cast<unsigned>(route), a.gates[route]};
       });
   collective_scope_sync<Threads, kCollectiveScopeBarrier>();
   for (unsigned expert = tid; expert < p.experts; expert += Threads)
@@ -178,13 +179,14 @@ __device__ __forceinline__ void build_small_window_rows(
     const auto expert = pair / a.world;
     const auto source = pair % a.world;
     const auto count = counts[std::uint64_t(expert) * shape.sources + source];
-    const auto *routes = static_v4::source_routes(a, a.rank, source, expert);
-    const auto *gates = source_metadata(a, source, r.source_gates);
+    const auto *routes = static_v4::source_routes<static_forward::SourceRoute>(
+        a, a.rank, source, expert);
     for (unsigned ordinal = tid % Group; ordinal < count; ordinal += Group) {
       const auto row = geometry.expert_row(expert, source, ordinal);
-      const auto route = routes[ordinal];
+      const auto identity = routes[ordinal];
+      const auto route = identity.route;
       r.rows[r.expert_blocks[expert] * shape.tile_m + row] = {
-          route, source, gates[route], route / shape.top_k,
+          route, source, identity.gate, route / shape.top_k,
           local_row_output(a, 0U, source, route)};
     }
   }
@@ -474,9 +476,18 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       const auto *gates = source_metadata(a, source, r.source_gates);
       for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
         const auto row = geometry.expert_row<Canonical>(0U, source, ordinal);
-        const auto route = single_window
-            ? static_v4::source_routes(a, a.rank, source, expert)[ordinal]
-            : order[source_prefix[a.rank * owned + expert] + ordinal];
+        std::uint64_t route;
+        float gate;
+        if (single_window) {
+          const auto identity =
+              static_v4::source_routes<static_forward::SourceRoute>(
+                  a, a.rank, source, expert)[ordinal];
+          route = identity.route;
+          gate = identity.gate;
+        } else {
+          route = order[source_prefix[a.rank * owned + expert] + ordinal];
+          gate = gates[route];
+        }
         void *output;
         if (!Network || source / a.local_world_size == a.node) {
           const auto &address = window_source(a, w, source);
@@ -497,7 +508,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           output = return_tx::row_output(a, source, local_window, node_row);
         }
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
-            static_cast<unsigned>(route), source, gates[route],
+            static_cast<unsigned>(route), source, gate,
             static_cast<unsigned>(route / p.shape.top_k), output};
         if constexpr (Training)
           a.checkpoint.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] =
