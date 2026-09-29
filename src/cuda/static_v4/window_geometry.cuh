@@ -43,6 +43,7 @@ struct WindowGeometryView {
 // before this directory can be consumed by pull or compute.
 template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U>
 __device__ void build_window_counts(const WindowGeometryView &a) {
+  static_assert(Threads % 32U == 0U && BaseThread % 32U == 0U);
   const auto tid = threadIdx.x - BaseThread;
   const auto sources =
       a.shape.source_end(a.window) - a.shape.source_begin(a.window);
@@ -53,13 +54,19 @@ __device__ void build_window_counts(const WindowGeometryView &a) {
     a.expert_rows[expert] = rows;
   }
   source_plan_sync<Threads, Barrier>();
-  if (tid == 0U) {
-    std::uint64_t blocks = 0U;
-    for (unsigned expert = 0; expert < a.owned_experts; ++expert) {
-      a.mblock_prefix[expert] = blocks;
-      blocks += ceil_div(a.expert_rows[expert], a.shape.tile_m);
+  if (tid < 32U) {
+    std::uint64_t carry = 0U;
+    for (unsigned base = 0U; base < a.owned_experts; base += 32U) {
+      const auto expert = base + tid;
+      const auto count = expert < a.owned_experts
+          ? ceil_div(a.expert_rows[expert], a.shape.tile_m) : 0U;
+      const auto sum = warp_inclusive_sum(count);
+      if (expert < a.owned_experts)
+        a.mblock_prefix[expert] = carry + sum - count;
+      carry += __shfl_sync(0xffffffffU, sum, 31U);
     }
-    a.mblock_prefix[a.owned_experts] = blocks;
+    if (tid == 0U)
+      a.mblock_prefix[a.owned_experts] = carry;
   }
   source_plan_sync<Threads, Barrier>();
 }

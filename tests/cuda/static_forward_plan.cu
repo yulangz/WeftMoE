@@ -321,8 +321,7 @@ __global__ void build_geometry(plan::WindowGeometryView view,
         view.expert_row(routes[r].expert, routes[r].source, routes[r].ordinal);
 }
 
-void run_geometry(unsigned nodes, bool hotspot) {
-  constexpr unsigned owned = 4U;
+void run_geometry(unsigned nodes, bool hotspot, unsigned owned = 4U) {
   const plan::WindowShape shape{nodes * 8U, nodes == 3U ? 16U : 8U, 128U, 4U};
   // Two nodes use node-aligned groups; three retain a partial G-sized group.
   const auto window = shape.groups() - 1U;
@@ -340,7 +339,7 @@ void run_geometry(unsigned nodes, bool hotspot) {
   // Independent round-robin oracle, including unequal/empty source columns.
   std::vector<SourceOrdinal> routes;
   std::vector<std::uint64_t> expected;
-  std::array<unsigned, owned> totals{};
+  std::vector<unsigned> totals(owned, 0U);
   for (unsigned expert = 0; expert < owned; ++expert) {
     for (unsigned ordinal = 0; ordinal < shape.tokens * shape.top_k; ++ordinal)
       for (unsigned source = 0; source < sources; ++source)
@@ -399,7 +398,8 @@ int main() {
       run_geometry(nodes, false);
       run_geometry(nodes, true);
     }
-    std::cout << "static V4 GPU plan: 37 source/packet + 6 destination cases "
+    run_geometry(3U, false, 37U); // Prefix carry across a full warp and a tail.
+    std::cout << "static V4 GPU plan: 37 source/packet + 7 destination cases "
                  "passed\n";
     return 0;
   } catch (const std::exception &error) {

@@ -10,6 +10,18 @@ __device__ __forceinline__ void source_plan_sync() {
   asm volatile("bar.sync %0, %1;" ::"n"(Barrier), "n"(Threads) : "memory");
 }
 
+// All lanes participate, including zero-padded lanes in the final chunk.
+__device__ __forceinline__ std::uint64_t warp_inclusive_sum(std::uint64_t value) {
+  const auto lane = threadIdx.x % 32U;
+#pragma unroll
+  for (unsigned delta = 1U; delta < 32U; delta *= 2U) {
+    const auto previous = __shfl_up_sync(0xffffffffU, value, delta);
+    if (lane >= delta)
+      value += previous;
+  }
+  return value;
+}
+
 // One warp publishes an exclusive directory and turns histogram entries into
 // reservation cursors. Carry across warp-sized chunks without extra scratch.
 __device__ __forceinline__ void
@@ -19,13 +31,7 @@ prefix_source_counts(unsigned *counts, unsigned size, std::uint64_t *prefix) {
   for (unsigned base = 0U; base < size; base += 32U) {
     const auto index = base + lane;
     const std::uint64_t count = index < size ? counts[index] : 0U;
-    auto sum = count;
-#pragma unroll
-    for (unsigned delta = 1U; delta < 32U; delta *= 2U) {
-      const auto previous = __shfl_up_sync(0xffffffffU, sum, delta);
-      if (lane >= delta)
-        sum += previous;
-    }
+    const auto sum = warp_inclusive_sum(count);
     if (index < size) {
       prefix[index] = carry + sum - count;
       counts[index] = static_cast<unsigned>(carry + sum - count);

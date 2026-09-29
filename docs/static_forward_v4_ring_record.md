@@ -6525,3 +6525,68 @@ source计算。这些带插桩的单次span不是正式graph p50，也不用于�
 下一步可独立消融目标端串行前缀或reverse metadata阶段，尚未实施。
 诊断目录`build/static_v4_decode_metadata_gv_timeline/`，native SHA256
 `af439953c59af60a2c5d6d495f197ab557c5772e1f6468437f31455365731011`。
+
+### GW：destination Mblock 前缀的 warp scan（2026-09-29，已采用）
+
+基于GV（`5618261`）。抽出source已有的uint64 inclusive scan，destination的
+每expert `ceil_div(rows, tile_m)`及exclusive prefix由一个完整warp分批计算。
+跨32项保存carry，尾部补零；没有增加scratch、barrier或计数器，原CTA同步及
+运行时tile_m保留。本次未混入常量tile_m特化或reverse metadata重排。
+已有GPU planner oracle增加唯一一个37 owned experts边界用例，覆盖跨warp
+carry和尾部；不是新增独立测试框架。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，相邻GV→GW的native EP8
+完整矩阵，rank-max p50/us：
+
+|T/rank|GV|GW|
+|---:|---:|---:|
+|1|89.749|88.773|
+|64|113.397|112.621|
+|8192|1242.010|1247.420|
+|20480|2930.010|2921.950|
+
+初轮短档89.870→88.896、113.661→112.794us；反向T64→T1、每档GW→GV
+复测按T1/T64为89.824→88.917、113.672→112.654us，分别快1.01%/0.90%。
+三轮共64个output hash、pool、graph结构和测量协议逐项一致，前后时钟均1620。
+长档差异不足0.5%，不宣称稳定收益。所有正式计时节点无CPU构建/其它GPU任务。
+
+同输入MegaMoE应用graph，首轮T64→T1，括号为独立进程T1→T64复测，四case
+在进程内交错，同为10/20/batch20、rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GW ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.329（49.263）|53.174（53.167）|90.645（90.797）|61.087（61.042）|
+|64|57.482（57.464）|63.305（63.288）|113.472（113.569）|76.653（76.624）|
+
+完整reference检查通过，四case各8rank输出SHA256与GV复测相同；两轮2560组
+SM前后读数全部1620MHz，显存时钟未锁定。copy与Mega kernel在同一graph内
+计时，没有相加独立median。公平含copy口径仍慢约71%/79%，**尚不满足短文
+收尾条件**。没有用非ring替代ring，没有测MegaMoE双机；GA+FZ长文验收不重开。
+
+门禁：host18/18；GPU planner 37 source/packet+7 destination全部通过，
+planner racecheck零问题。native EP8/T512、EP16/T64/T2048共160个梯度hash、
+repeat_equal与pool完全等于GV。Torch EP8全四档240条PASS，短容量
+T1/T64/T512及edges 200条PASS，tiny B16/D1/K8 152条PASS；包含空source、
+不等长、重复route、改变路由的graph、workspace/权重复用、多窗口和热点无丢失。
+短容量专项rank0/7 memcheck各0 errors、Forward racecheck各0 hazards，
+两项各200条PASS；仍不声明完整Backward racecheck关闭。EP16全四档和edges
+480条PASS。八种main的REG/SHARED/LOCAL/CONST/STACK均与GV一致。
+
+EP16正式回归按20K→8K→64→1、每档GW→GV，同一1620MHz计时协议：
+
+|T/rank|GV/us|GW/us|
+|---:|---:|---:|
+|1|233.992|233.819|
+|64|285.766|286.048|
+|8192|2881.800|2877.830|
+|20480|6844.950|6856.340|
+
+64个output hash、pool/registered bytes和graph结构一致，前后双机时钟全部
+1620MHz，变化不足0.2%，不报告新网络收益。
+
+冻结目录`build/static_v4_destination_scan_gw/`保存proposal、patch、构建、
+原始samples/hash/clock、sanitizer和复现脚本；`verify_results.py`核对性能日志。
+native SHA256 `8dff711832dd5475a35d6b0083c8888fab89dc800fee8d26014a77a9c678eeea`；
+library `9537ae184df234dc04164bc529bf4bd1e251d36523b23efdb0f0ebb8eea28df6`；
+extension仍`725bf863...825c3`。下一项独立消融为小窗口reverse metadata并入
+pull；本次未实施，不提前宣称收益。

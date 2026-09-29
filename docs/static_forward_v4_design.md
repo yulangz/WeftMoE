@@ -98,6 +98,8 @@ GU再按实际destination工作量选择单行交错pull，改善短文静态iss
 GV再复用已有destination表发布单容量窗口的source counts/route IDs，减少
 目标端串行peer读取；单机短档相邻正反向再快约1%–1.7%。X仍destination-pull，
 不改变有界payload及逐slot协议，也尚未满足MegaMoE短文收尾条件。
+GW复用source的uint64 warp scan计算destination Mblock前缀，消除thread0逐expert
+串行除法/累加；保留原CTA同步与运行时tile_m，短档再快约1%，详见ring记录。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
