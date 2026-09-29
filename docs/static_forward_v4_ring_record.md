@@ -7,7 +7,8 @@
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
 planner、GU短文pull分工、GV metadata发布、GW destination scan、GY紧凑reverse
-规划及GZ单机source目录精简。GX延后到pull的候选已撤回。下面仍是GA+FZ冻结数据，
+规划及GZ单机source目录精简。GX延后到pull、HA提前admission及HB集中source
+staging的候选均已撤回。下面仍是GA+FZ冻结数据，
 不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
@@ -6786,3 +6787,61 @@ samples/hash/clock、sanitizer及复现脚本；源码与冻结patch一致。
 native SHA256 `b3452bef3c57c7ff63391c49c1183af3777cea25de8e77cd088c2535f5f0fbd7`；
 library `548c4aeb895f1e2f707e388c62f2a91f04a052a19cc5d32e05c650127fa58426`；
 extension仍`725bf863...825c3`。后续可独立检查单容量窗口的准入时机，本次未改。
+
+### HA：提前单窗口 admission（2026-09-29，未采用）
+
+基于GZ（`9fe0dda`）。仅单机inference、capacity与实际均一个窗口时，尝试在
+规划末尾的CTA0首warp调用原`admit<false>`，通信角色跳过重复调用。保留所有
+credit acquire、target累加和generation/head发布；decode/prefill显式传入各自
+FC1/FC2计数。没有新增buffer、counter或运行时开关，多窗口、训练及网络不变。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮GZ→HA，
+反向轮T64→T1、每档HA→GZ，表中统一按GZ/HA列出：
+
+|T/rank|首轮GZ|首轮HA|反向GZ|反向HA|
+|---:|---:|---:|---:|---:|
+|1|78.632|78.453|78.485|78.386|
+|64|98.800|99.302|98.936|99.133|
+
+32个output hash、pool、graph结构与协议一致，128个前后SM读数全部1620MHz。
+计时节点无CPU构建或其它GPU任务。T1仅改善0.13%–0.23%，T64回退0.20%–0.51%，
+不足以保留新增分支和profile耦合；已撤回全部5个源码文件改动。没有构建应用库、
+跑完整门禁或测试MegaMoE，不把它记为已验证的生产版本。
+
+八种main的REG168/SHARED2048/LOCAL0/CONST3264不变；两种本地training入口
+STACK由72变64，其余六种资源相同。资源相同不代表SASS相同。由于PlanReady被
+移动到admission之后，不能拿route阶段时间直接解释端到端收益。
+候选patch、两轮samples/hash/clock及资源保存在
+`build/static_v4_early_admission_ha/`，native SHA256为
+`d359b1bb1d0593c663cc5483895a9f977ad99331201d571c9523a72e5b2536d9`。
+
+### HB：短容量 source staging 集中到 CTA0（2026-09-29，未采用）
+
+完全撤回HA后重新基于GZ。仅单机inference、一个capacity window且
+`max_tokens_per_rank * top_k <= 256`时，把X/gates/combine order的准备交给
+CTA0的256个math lanes；source header、expert目录及GV metadata原本已由
+CTA0生成。已有384-thread CTA join即可覆盖全部source-ready写入，故这条
+路径使用`rank_barrier<0,384,false,false>`，省去入口的grid arrival。
+保留system release/acquire、CTA joins及后续geometry的完整grid发布。
+条件依据collective容量，不依据各rank的实际长度；没有增加buffer/counter。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮GZ→HB，
+反向T64→T1、每档HB→GZ，表中统一按GZ/HB列出：
+
+|T/rank|首轮GZ|首轮HB|反向GZ|反向HB|
+|---:|---:|---:|---:|---:|
+|1|78.466|77.587|78.571|77.464|
+|64|98.843|129.906|99.078|129.925|
+
+T1改善1.12%–1.41%，但T64回退31.13%–31.43%，因此完全撤回，不为T1另加
+一个特例。这个实验同时改变staging并行度与barrier，结果仅能归因于该组合：
+不能把少一次barrier直接算作净收益，也没有单独测出纯copy增加了多少时间。
+两轮32个output hash、pool、graph结构/协议一致，128个SM读数全部1620MHz；
+八种main的资源全部等于GZ。正式计时没有并发CPU构建或其它GPU工作。
+
+没有构建应用库或跑完整门禁/MegaMoE。尤其现有`--edge-cases`至少分配257
+tokens容量，不触发HB的小容量分支，不能声称其空source/graph复用/sanitizer
+已验证。候选patch、两轮完整日志及资源保留在
+`build/static_v4_compact_source_hb/`；native SHA256为
+`2dbc9be546be4278368422732d26f159d371df5392230a1e421b30256f3e9195`。
+生产源码仍是GZ；HA/HB均没有改变最新MegaMoE对照及未达短文收尾条件的结论。

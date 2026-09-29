@@ -106,6 +106,8 @@ grid join发布blocks和rows，短档正反向约再快3.8%–4.0%。pull及逐s
 GZ仅对单机inference省去无读者的node目录生成，保留expert计数/route列表和
 原同步点；短档相邻正反向再快约8%。多机节点去重/fanout和training目录不变，
 当前同输入ring仍慢于MegaMoE约50%/58%，详见ring记录。
+后续HA提前单窗口admission没有实质净收益，HB集中source staging到CTA0虽省去
+一次grid arrival却使T64慢约31%，两项均已撤回；不属于现行同步方案。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
