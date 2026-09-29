@@ -4,7 +4,7 @@ namespace local_decode {
 
 constexpr unsigned kM = 128U, kN = 128U, kK = 64U, kStages = 5U;
 constexpr unsigned kThreads = 384U, kMathThreads = 256U;
-constexpr unsigned kMaxExperts = 256U, kMaxOwned = 32U;
+constexpr unsigned kMaxExperts = 256U;
 constexpr unsigned kFc1Tiles = 2U * forward_tuning::kMainIntermediate / kN;
 constexpr unsigned kFc2Tiles = forward_tuning::kMainHidden / kN;
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -23,7 +23,6 @@ inline bool eligible(const ActivationTransportPoolConfig &config,
          config.max_nodes == 1U && !config.enable_backward_state &&
          config.max_tokens_per_rank <= 64U && ring.depth &&
          ring.max_windows == 1U && config.max_world_size <= 32U &&
-         config.max_owned_experts <= kMaxOwned &&
          config.max_owned_experts * config.max_world_size <= kMaxExperts;
 }
 
@@ -36,8 +35,12 @@ struct BlockState {
 static_assert(sizeof(BlockState) <= sizeof(static_forward::RingBlock));
 
 struct Shared {
-  unsigned counts[kMaxExperts];
-  unsigned rows[kMaxOwned], blocks[kMaxOwned + 1U];
+  // Source planning retires before geometry; reuse its scratch for local rows.
+  union {
+    unsigned counts[kMaxExperts];
+    unsigned rows[kMaxExperts];
+  };
+  unsigned blocks[kMaxExperts + 1U];
   alignas(1024) transport::BFloat16 a[kStages][kM * kK];
   alignas(1024) transport::BFloat16 b[kStages][kN * kK];
   alignas(1024) transport::BFloat16 output[kM * kN];

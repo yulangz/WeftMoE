@@ -16,20 +16,24 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a, Shared &s) 
   if (lane < a.world)
     error = static_v4::ring::peer(a, lane, a.ring.source_header)->error != 0U;
   error = __any_sync(0xffffffffU, error);
-  unsigned rows = 0U;
-  if (lane < owned && !error)
-    for (unsigned source = 0U; source < a.world; ++source)
-      rows += a.fused_local_expert_count[std::uint64_t(source) * owned + lane];
-  const auto blocks = (rows + kM - 1U) / kM;
-  const auto prefix = static_forward::warp_inclusive_sum(blocks);
-  const auto total_rows = __reduce_add_sync(0xffffffffU, rows);
-  const auto total_blocks = __shfl_sync(0xffffffffU, prefix, 31U);
-  if (lane < owned) {
-    s.rows[lane] = rows;
-    s.blocks[lane] = prefix - blocks;
+  unsigned total_rows = 0U, total_blocks = 0U;
+  for (unsigned base = 0U; base < owned; base += 32U) {
+    const auto expert = base + lane;
+    unsigned rows = 0U;
+    if (expert < owned && !error)
+      for (unsigned source = 0U; source < a.world; ++source)
+        rows += a.fused_local_expert_count[std::uint64_t(source) * owned + expert];
+    const auto blocks = (rows + kM - 1U) / kM;
+    const auto prefix = static_forward::warp_inclusive_sum(blocks);
+    if (expert < owned) {
+      s.rows[expert] = rows;
+      s.blocks[expert] = total_blocks + prefix - blocks;
+    }
+    total_rows += __reduce_add_sync(0xffffffffU, rows);
+    total_blocks += __shfl_sync(0xffffffffU, prefix, 31U);
   }
   if (lane == 31U)
-    s.blocks[owned] = prefix;
+    s.blocks[owned] = total_blocks;
   if (blockIdx.x == 0U && lane == 0U) {
     auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     status->error = error;

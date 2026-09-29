@@ -21,6 +21,9 @@ Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多�
 数据面。完整 EP8/EP16 数值测试已通过；2026-09-29用户已确认GA+FZ的8K/20K
 inference领先V3符合预期。单机EP8/T1/T64接近或领先MegaMoE的收尾条件已由
 HF专属decode实现满足（仅单机对照，见decode记录）。正式矩阵和后续消融见ring记录，
+HG随后将专家前缀和改为分段warp扫描，验证Qwen E256/K8的单机EP1/EP2/EP4/EP8；
+SGLang用独立短容量池承接decode图、保留prefill大池，并按层共享各bucket的packed W1。
+算子、图/卸载与完整服务检查见decode记录及AReaL接入文档；RL端到端对照尚未完成。
 下文按实施顺序保留各阶段当时的结果。纯GEMM布局/profile及入口选择已完成；训练对接
 已接通，完整门禁仍未完成，见下方M6及训练记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX

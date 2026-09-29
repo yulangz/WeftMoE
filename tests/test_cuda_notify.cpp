@@ -3388,7 +3388,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require((!cross_host_benchmark && nodes == 1 &&
              ((benchmark_p2p && world == 8) ||
               ((benchmark_forward || backward_benchmark) &&
-               (world == 1 || world == 4 || world == 8)) ||
+               (world == 1 || world == 2 || world == 4 || world == 8)) ||
               (benchmark_communication &&
                (world == 1 || world == 2 || world == 4 || world == 8)) ||
               (benchmark_integrated && (world == 2 || world == 8)))) ||

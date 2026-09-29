@@ -11,6 +11,7 @@ import torch.distributed as dist
 from .runtime import TensorRuntime
 
 _runtime = None
+_decode_runtime = None
 _recapture = False
 _stream = None
 _dp_layout_patched = False
@@ -21,6 +22,23 @@ _rows_are_dp_sharded = False
 _layout_active = False
 _eager_pending = False
 _graph_inputs = {}
+
+
+def _prepare_runtime(layer, group, top_k, max_tokens):
+    global _stream
+    if _stream is None:
+        _stream = torch.cuda.Stream()
+    return TensorRuntime(
+        group=group,
+        experts=layer.num_experts,
+        top_k=top_k,
+        hidden=layer.hidden_size,
+        intermediate=layer.w2_weight.shape[-1],
+        max_tokens=max_tokens,
+        max_rows=max_tokens * top_k * 2 + layer.num_local_experts * 128,
+        training=False,
+        stream=_stream,
+    )
 
 
 def participate_idle_layers(model):
@@ -147,7 +165,7 @@ def install():
         from sglang.srt.server_args import get_global_server_args
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        global _runtime, _stream, _eager_pending
+        global _runtime, _decode_runtime, _eager_pending
         if os.environ.get("WEFTMOE_NULL_MOE") == "1":
             # Diagnostic: keep the layout conversion but remove the transport
             # entirely, so a crash can be attributed to one of the two.
@@ -182,26 +200,18 @@ def install():
         tokens, hidden = hidden_states.shape
         if tokens == 0:
             return torch.empty_like(hidden_states)
+        args = get_global_server_args()
+        rows_are_dp_sharded = _rows_are_dp_sharded and args.enable_dp_attention
         if _runtime is None:
-            if _stream is None:
-                _stream = torch.cuda.Stream()
-            args = get_global_server_args()
-            max_tokens = (
-                max(args.chunked_prefill_size or 8192, args.max_prefill_tokens or 16384)
-                // world
-                + 1
+            max_tokens = max(
+                args.chunked_prefill_size or 8192,
+                args.max_prefill_tokens or 16384,
+                args.cuda_graph_max_bs or 1,
             )
-            _runtime = TensorRuntime(
-                group=group,
-                experts=layer.num_experts,
-                top_k=topk_output.topk_ids.shape[-1],
-                hidden=hidden,
-                intermediate=layer.w2_weight.shape[-1],
-                max_tokens=max_tokens,
-                max_rows=max_tokens * topk_output.topk_ids.shape[-1] * 2
-                + layer.num_local_experts * 128,
-                training=False,
-                stream=_stream,
+            if not rows_are_dp_sharded:
+                max_tokens = (max_tokens + world - 1) // world
+            _runtime = _prepare_runtime(
+                layer, group, topk_output.topk_ids.shape[-1], max_tokens
             )
         rank = dist.get_rank(group)
         # Two layouts reach this point:
@@ -211,10 +221,6 @@ def install():
         #  * DP-sharded tokens: these rows already belong to this rank alone,
         #    the transport returns their complete expert results, and
         #    patch_dp_attention_layout() removed the redundant collectives.
-        rows_are_dp_sharded = (
-            _rows_are_dp_sharded
-            and get_global_server_args().enable_dp_attention
-        )
         sharded_rows = not rows_are_dp_sharded
         if sharded_rows:
             local_tokens = (tokens + world - 1) // world
@@ -277,6 +283,14 @@ def install():
             if _eager_pending:
                 _runtime.native.drain_eager_inference()
                 _eager_pending = False
+            runtime = _runtime
+            # SGLang captures collective, equally padded decode buckets. Eager
+            # DP sources may have unequal lengths and must all use the general
+            # pool, never choose a transport independently from their row count.
+            if local_tokens <= 64:
+                if _decode_runtime is None:
+                    _decode_runtime = _prepare_runtime(layer, group, k, 64)
+                runtime = _decode_runtime
             # Warmup and outer capture allocate different intermediate tensors.
             # Native child graphs bind addresses at warmup, so stage into one
             # stable input set per bucket, shared by serialized layers. Copies
@@ -288,7 +302,7 @@ def install():
             for target, source in zip(staged, inputs[:3]):
                 target.copy_(source)
             inputs = (*staged, *inputs[3:])
-            output = _runtime.inference(layer.layer_id, *inputs)
+            output = runtime.inference(layer.layer_id, *inputs)
         elif _SYNC_EAGER:
             output = _runtime.inference_eager(*inputs)
         else:
@@ -475,7 +489,7 @@ def patch_dp_attention_layout():
 
 def suspend(model_runner):
     """Discard outer graphs before releasing any of their native addresses."""
-    global _runtime, _recapture, _eager_pending
+    global _runtime, _decode_runtime, _recapture, _eager_pending
     if _runtime is None:
         return
     torch.cuda.synchronize()
@@ -484,6 +498,9 @@ def suspend(model_runner):
         runner.graphs.clear()
         runner.output_buffers.clear()
         _recapture = True
+    if _decode_runtime is not None:
+        _decode_runtime.close()
+        _decode_runtime = None
     _runtime.close()
     _runtime = None
     _eager_pending = False

@@ -2,7 +2,8 @@
 
 ## 当前 V4 接入检查（2026-09-29）
 
-当前算子版本为 HF（`7569ae0`）。下面的旧 RL 性能数字来自历史实现，不能用作
+本轮基线为 HF（`7569ae0`），后续 HG 的 EP 通用化验收见
+[decode 记录第 6 节](static_forward_v4_decode_record.md)。下面的旧 RL 性能数字来自历史实现，不能用作
 当前 V4 的端到端结论；当前版本尚未完成新的 RL baseline 对照。
 
 本轮仅替换 SGLang rollout，Megatron actor 保持 baseline。使用
@@ -10,15 +11,20 @@
 `dapo-math_grpo_qwen3_5_cpu_staged.yaml`。已有比较脚本的 `BACKEND=weftmoe`
 会同时启用 actor，因此必须保持 actor 的 `AREAL_USE_WEFTMOE=0`，并用独立的
 `rollout.scheduling_spec` 设置 rollout 的 `AREAL_USE_WEFTMOE=1`、
-`NCCL_CUMEM_ENABLE=1`、tensor extension 和 `WEFTMOE_STATIC_RING_TOKENS=256`。
+`NCCL_CUMEM_ENABLE=1`、tensor extension 和 `WEFTMOE_STATIC_RING_TOKENS=512`。
 不能在原本继承 actor 的 scheduling spec 下只改嵌套环境变量。
 
 旧配方的 rollout 是两个独立 TP4/EP4 引擎，默认没有启用 DP attention。
-Qwen 的 256 个专家在 EP4 下每卡 64 个：当前通用 V4 支持，但 HF decode 的
-单 warp 专家前缀和与索引数组仅支持每卡 32 个。此外，旧 SGLang 适配层统一使用
-prefill 大容量池，不能选中要求容量不超过 64 token/rank 的 HF。要测 HF，仍需
-补齐每卡 64 专家的 geometry，并为 decode 准备独立的小容量池；不能将通用 V4
-的结果标为 HF decode。
+Qwen 的 256 个专家在 EP4 下每卡 64 个：HF 的单轮 warp scan 仅支持每卡 32 个，
+HG 已改为分段 scan，验证了 EP1/EP2/EP4/EP8。旧适配层统一使用 prefill 大池，
+也选不中 decode 专属入口；现在为等长补齐的 decode capture bucket 准备容量
+64 token/rank 的独立小池，较大 bucket 与 eager/prefill 使用通用 V4。
+
+`benchmarks/run_areal_sglang.py --areal-root <AReaL> --backend baseline|weftmoe`
+复用原比较脚本，仅用已有配置覆盖隔离 rollout 开关，不修改 AReaL 的调度逻辑。
+`--dry-run` 可查看覆盖参数，模型、数据、AWEX 和实验目录仍由原环境变量指定；
+两组默认只记录本地指标（W&B disabled），保持原 20 updates/完整训练 horizon。
+配置解析已验证 actor 始终为 baseline，只有实验组 rollout 开启 WeftMoE。
 
 本轮最小测试发现旧适配层 warmup 与 outer capture 的中间 tensor 地址不同，
 触发当前 native runtime 的稳定地址检查。适配层现为每个 token bucket 保存
@@ -28,6 +34,22 @@ staging。原先“不复制输入”的描述只适用于调用者能提供稳�
 不再适用于这一 SGLang 适配路径。EP4 的 E16/K4/T17 与 E256/K8/T17、T257
 真实 SGLang 单层测试已通过 eager 数值对齐、变更输入/路由后的图回放和 runtime 释放/重建；
 这不是整模型或 RL 验证。
+
+整模型首次捕获发现每个 bucket 都重复分配全部 40 层的 packed W1：每增加一个
+bucket 消耗约 10 GiB/rank，最终在第 8 个 bucket OOM。native graph preparation
+现按 layer 缓存 session-scoped 的只读 weight lease，同一个 runtime 的全部
+bucket 共用；`invalidate_inference_layer()` 同时销毁该层所有 plan 和 weight
+lease。两套 runtime 各保留一份，eager 和训练的权重发布方式不变。
+
+修复后完整 Qwen3.5、TP4/EP4、context 32768、mem fraction 0.4、graph max bs 512
+成功捕获全部 46 个实际 bucket（SGLang 按 request 容量将最大值裁至 408）。
+连续 3 轮图/KV 卸载、恢复、重新捕获的 greedy token 完全一致；恢复态约
+85,600–86,300 MiB/card，不再按 bucket 累积 packed W1。该检查未卸载模型权重，
+不能替代 RL 的 AWEX 权重更新验证。缓存改动后另有 EP4/E256/K8 的 124 项 native
+检查通过，包含跨 bucket 复用、权重失效/刷新和 batch-invariance。
+日志为 `build/local_decode_hg/sglang_full_server_shared_weights.log` 和
+`sglang_offload_cycles.log`；最终 tensor extension SHA256 为
+`f894dae763a4b95df6c9a662278c862a980502b9a8a551db449e20a03e6e33db`。
 
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang

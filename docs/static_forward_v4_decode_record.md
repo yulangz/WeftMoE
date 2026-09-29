@@ -6,6 +6,8 @@ GA+FZ 的既有收益算成 decode 优化。本轮先对齐 MegaMoE 的通信、
 工作流，没有进行 MNK 搜索。HF 已完成验收并采用：短文两轮对照均领先
 MegaMoE，单机长文和多机回归持平。
 
+2026-09-29 后续 HG：为 SGLang/Qwen 接入补齐单机 EP1/EP2/EP4/EP8，见第 6 节。
+
 ## 1. 入口和适用范围
 
 新增 `src/cuda/local_decode/`，而不是继续给通用 ring worker 叠加短文分支：
@@ -166,3 +168,74 @@ library `f52be6dc2c945685d417ab01b48d3309b84957e23d098da29bd128b3ef20d005`。
 结论：HE 验证已补齐；HF 单机 decode 专属工作流、batch-invariance、达到
 MegaMoE 性能以及不干扰长文路径的本次目标完成。没有额外 MNK 扫参或动态
 工作队列，也未将该实现扩大到训练或多机。
+
+## 6. HG：单机 EP 通用化与 SGLang 双池接入
+
+HF 将每卡专家数限制为 32：geometry 用一个 warp 的每个 lane 对应一个专家，
+本地 rows/blocks 数组也是固定 32。Qwen E256 在 EP8 下满足条件，EP4/EP2/EP1
+分别需要 64/128/256 个本地专家，原先只能回退到通用 V4。这不是通信或 GEMM
+的限制，不能仅扩大数组而保留原来的一轮 warp scan。
+
+HG 改为每轮 32 个专家，warp scan 的最后一项作为下一轮的 block 基址。
+所有轮次累积实际 row/block 总数；任务编号、GEMM、gate/up packing、归约顺序
+及通信协议不变。source counts 在 BeforePull 前已完成发布，因此它与 geometry
+的 rows 共用一块 SMEM scratch。当前仍保留总专家数不超过 256、单节点和原
+短容量/profile 条件，不再额外限制每卡专家数。该路径覆盖 EP1/EP2/EP4/EP8；
+experts 必须能被 EP 均分。
+
+编译资源保持 112 registers、0 spill；动态 SMEM 由 207 KiB 增至 208 KiB，
+GM workspace 分配不变。8 个原有通用 V4 主 kernel 的资源元组和 SASS 指令
+逐 entry 完全一致，未改动 prefill、训练或多机的计算实现。
+
+SGLang 为图捕获时的 `local_tokens <= 64` 准备独立容量 64 的 runtime，
+其余 bucket 和 eager/prefill 继续使用大池。capture bucket 在各 rank 等长
+补齐，故选择一致；不能在不等长 eager DP 输入上按各自 token 数选择不同池。
+大池容量也按实际布局计算：复制布局按 EP 分片，DP-local 布局不再除以 EP。
+两套 runtime 使用同一执行 stream，offload 先销毁外层图，再释放两个池及
+输入 staging；更新权重后重新捕获，避免保留旧 packed W1。
+
+### 验证
+
+- E256/K8，EP1/EP2/EP4/EP8：现有 static inference 测试共 **465** 个 rank/case
+  通过，含严格逐位 batch 1/7/32/64、置换、不等长/空 source、重复热点、图输入
+  变更、权重刷新，以及专属 decode 与通用 V4 的逐位对齐。
+- 真实 SGLang FusedMoE：四种 EP 分别测试全局 `64*EP` 和 `64*EP+1` 个复制
+  token，覆盖小池边界两侧；**30** 个 rank/case 通过数值、图回放、双池释放、
+  权重变更后重新捕获。单层结果不等于整模型/RL 验证。
+- EP1 的 rank0、EP2 的 rank0/1：decode memcheck 均 0 errors，racecheck 均
+  0 hazards；两类工具下合计 **186** 个应用检查通过。
+- 原 E64/K4 单机 EP8 长文回归：**240** 项通过，包括 8K/20K、热点不丢 token
+  与复用；没有以短文测试代替长文验证。
+
+### 性能（1620 MHz，单位 μs）
+
+同一台 8×L20X，相邻独立进程 HF/HG，10 warmup、20 samples、graph batch20，
+最慢 rank p50。正式计时无其他 GPU workload 或并行编译。
+
+|Qwen E256/K8|T/rank|HF|HG|
+|---|---:|---:|---:|
+|EP1|1|105.893|69.390|
+|EP1|64|971.586|716.998|
+|EP2|1|—|61.349|
+|EP2|64|—|341.038|
+|EP4|1|105.470|53.968|
+|EP4|64|336.587|177.136|
+|EP8|1|52.718|52.768|
+|EP8|64|108.061|108.370|
+
+EP1/EP4 的 HF 数字是其原有通用 V4 回退；HG 是新启用的专属 decode。
+EP4 延迟降低约 49%/47%，EP8 持平。冻结 HF 的 native benchmark 入口拒绝 EP2，
+因此未填造 EP2 对照；本轮只补齐现有测试入口的 EP2 选项。以上不是与 SGLang
+baseline 的性能对比，也不是相同全局 batch 下跨 EP 的扩展性比较。
+
+原 E64/K4、EP8 的 HF/HG：T1 为 47.350/47.032，T64 为 55.280/55.558；
+8K 为 1240.140/1236.390，20K 为 2918.800/2925.890，均记为持平。
+全部可比较 case 的输出 hash、GM 分配字节和 graph 拓扑相同，计时前后全部卡
+SM 时钟为 1620 MHz。
+
+原始日志、复现脚本和完整检查位于 `build/local_decode_hg/`，
+`verify_results.py` 已通过。library SHA256：
+`d9f8a90e712b638bd9ac591ea0f801914f0ea49189190233dcd31cecbaa2860d`；
+native SHA256：`88d10041e07f128a10e69f9a6b09de1dd2b970a3e4019dfbf4002b486601a572`。
+完整 SGLang 服务及 inference-only RL 对照继续记录在
+[AReaL 接入文档](areal_qwen35.md)，不把本节算子通过视为 RL 已完成。

@@ -29,8 +29,8 @@ def main():
         ep_size=world,
         moe_runner_backend="triton",
         moe_a2a_backend="none",
-        chunked_prefill_size=max(128, tokens),
-        max_prefill_tokens=max(128, tokens),
+        chunked_prefill_size=max(512 * world, tokens),
+        max_prefill_tokens=max(512 * world, tokens),
     )
     set_global_server_args_for_scheduler(args)
     initialize_moe_config(args)
@@ -56,17 +56,25 @@ def main():
     ).int()
     gates = torch.full((tokens, top_k), 1 / top_k, device="cuda")
     topk = StandardTopKOutput(gates, ids, torch.empty(tokens, experts, device="cuda"))
-    expected = layer(x, topk)
+    baseline = layer.forward
+    expected = baseline(x, topk)
     dist.all_reduce(expected)
     adapter.install()
     actual = layer(x, topk)
     dist.all_reduce(actual)
     torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
-    with model_capture_mode():
-        layer(x, topk)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = layer(x, topk)
+    def capture():
+        with model_capture_mode():
+            layer(x, topk)
+            assert adapter._runtime.max_tokens > 64
+            if (tokens + world - 1) // world <= 64:
+                assert adapter._decode_runtime.max_tokens == 64
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = layer(x, topk)
+        return graph, captured
+
+    graph, captured = capture()
     for _ in range(3):
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
@@ -75,12 +83,24 @@ def main():
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, eager, rtol=0.02, atol=0.00002)
-    del graph
+    del graph, captured
     adapter.suspend(SimpleNamespace(graph_runner=None))
     assert adapter._runtime is None
+    assert adapter._decode_runtime is None
     assert not adapter._graph_inputs
+    layer.w13_weight.mul_(0.75)
+    layer.w2_weight.mul_(0.875)
+    expected = baseline(x, topk)
+    dist.all_reduce(expected)
     restored = layer(x, topk)
-    torch.testing.assert_close(restored, eager, rtol=0, atol=0)
+    actual = restored.clone()
+    dist.all_reduce(actual)
+    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
+    graph, captured = capture()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, restored, rtol=0, atol=0)
+    del graph, captured
     adapter.suspend(SimpleNamespace(graph_runner=None))
     print(rank, "SGLANG_PARITY_GRAPH_RESTART_PASS", flush=True)
     dist.destroy_process_group()

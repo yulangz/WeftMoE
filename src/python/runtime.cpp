@@ -49,6 +49,11 @@ struct InferenceBucket {
   py::object routes, gates;
 };
 
+struct InferenceWeights {
+  ForwardWeightLease lease;
+  std::uintptr_t w1, w2;
+};
+
 struct InferencePlan {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t executable = nullptr;
@@ -389,6 +394,7 @@ class Runtime {
     while (last != plans_.end() && last->first.first == layer)
       ++last;
     plans_.erase(first, last);
+    inference_weights_.erase(layer);
   }
 
  private:
@@ -431,11 +437,26 @@ class Runtime {
     auto activation = producer.publish_activations(
         static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
         key.second, hidden_, owner(x));
-    auto weights = producer.publish_weights(
-        static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-        static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
-        config_.num_experts / config_.topology.world_size,
-        rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
+    const auto w1_address = reinterpret_cast<std::uintptr_t>(pointer(w1));
+    const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
+    auto weight_entry = inference_weights_.find(key.first);
+    if (weight_entry == inference_weights_.end()) {
+      // Packed W1 is immutable for the layer's residency, not specific to a
+      // token bucket. Its lease is session-scoped and can serve all buckets.
+      auto weights = producer.publish_weights(
+          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
+          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+          config_.num_experts / config_.topology.world_size,
+          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
+      weight_entry = inference_weights_.emplace(
+          key.first, InferenceWeights{std::move(weights), w1_address, w2_address}).first;
+    } else if (weight_entry->second.w1 != w1_address ||
+               weight_entry->second.w2 != w2_address) {
+      throw std::runtime_error(
+          "Expert addresses changed: discard outer graphs and call "
+          "invalidate_inference_layer(layer) before re-preparation");
+    }
+    const auto &weights = weight_entry->second.lease;
     auto plan = std::make_unique<InferencePlan>();
     plan->output = empty({key.second, hidden_}, "bfloat16");
     plan->x = x;
@@ -506,7 +527,8 @@ class Runtime {
 #endif
   py::object torch_;
   std::string device_;
-  // Destroy graph executables before the metadata and shared workspace they use.
+  // Destroy graph executables before their metadata, packed weights and workspace.
+  std::map<unsigned, InferenceWeights> inference_weights_;
   std::map<std::uint64_t, std::unique_ptr<InferenceBucket>> buckets_;
   std::map<std::pair<unsigned, std::uint64_t>, std::unique_ptr<InferencePlan>> plans_;
   // One-generation pipeline for eager inference.  The pool intentionally has
