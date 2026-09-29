@@ -53,8 +53,13 @@ def main():
     parser.add_argument("--project", required=True)
     parser.add_argument("--group", required=True)
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument(
+        "--finished", action="append", default=[], metavar="NAME=REASON",
+        help="Finish an intentionally stopped run after uploading its completed updates",
+    )
     parser.add_argument("--dir", type=Path, required=True)
     args = parser.parse_args()
+    finished = dict(spec.split("=", 1) for spec in args.finished)
     key = os.environ.get("WANDB_API_KEY") or getpass.getpass("W&B API key: ")
     metadata = json.loads(args.config.read_text())
     args.dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +108,9 @@ def main():
                 run.summary["completed_updates"] = step + 1
                 state[2] = last = step
                 print(f"WANDB_UPLOADED {name} update={step + 1}", flush=True)
-            if failed or last + 1 >= args.steps:
+            if name in finished:
+                run.summary["termination_reason"] = finished[name]
+            if failed or last + 1 >= args.steps or name in finished:
                 run.finish(exit_code=int(failed))
                 del active[name]
         if active:

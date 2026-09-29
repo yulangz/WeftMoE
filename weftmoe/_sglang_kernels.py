@@ -34,9 +34,12 @@ def stage_inputs(
     )
     tl.store(staged_x + row * hidden + col, values, col < hidden)
     slot = tl.arange(0, route_block)
+    # Empty source rows carry zero X/gates. Reuse a real row's expert IDs so
+    # padding does not introduce unrelated experts and extra GEMM work.
+    source_row = tl.where(row < valid_rows, start + row, 0)
     expert = tl.load(
-        ids + (start + row) * id_row_stride + slot * id_col_stride,
-        (row < valid_rows) & (slot < top_k),
+        ids + source_row * id_row_stride + slot * id_col_stride,
+        slot < top_k,
         other=-1,
     )
     weight = tl.load(

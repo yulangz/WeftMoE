@@ -126,6 +126,9 @@ E256/K8/H2048/I512、复制输入 TP4/EP4、包含模型外层 TP all-reduce、�
 `wandb.mode=disabled`；上传指标保留日志打印精度，并在 run config 中标明
 `metric_source=completed_console_tables`，不是原进程的全精度原生 W&B history。
 凭据通过无回显输入只提供给上传进程，没有写入源码或实验配置。
+HG WeftMoE 停止后用 `--finished weftmoe=<reason>` 上传完 3 个完整 update 并
+结束该 W&B run，summary 保留停止原因；不是训练异常，也不上传未完成 step。
+baseline 的旁路同步继续，优化版使用新 run，不覆盖 HG 历史。
 
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang

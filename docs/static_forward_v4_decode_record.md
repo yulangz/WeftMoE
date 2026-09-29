@@ -349,4 +349,65 @@ replay 才成功；不把这个 profiling 失败记成应用 kernel 失败。
 
 稀疏版本已补齐 EP1/2/4/8 共 465 个 native 和 30 个 SGLang rank/case，全部
 通过；包含逐位 batch-invariance、热点跨 M-block 和通用 V4 对齐。带首尾统计
-的最终候选正在做 sanitizer；RL 尚未重跑。
+版本的 EP1 memcheck 31 项应用检查通过、0 errors；racecheck 停在首个 case
+后超过 9 分钟没有进展，已主动停止，不能记为通过。RL 尚未重跑。
+
+### M64 紧凑 CTA 消融（尚未采用）
+
+`local_decode_hh_compact` 保持 M128 的 GM 目录与物理行，只把 math 改为一个
+warpgroup、M64 slice，N128/K64、3-stage、256 threads。超过 64 行的热点块
+依次计算两片，不截断。FC2 等待该物理块的全部 FC1 slice，数值累加顺序不变。
+动态 SMEM 从约 208 KiB 降至约 104 KiB，120 registers、0 spill；本地实际
+token 数至少 4 时尝试双 CTA/SM，仍由现有 occupancy 门禁保证 grid 全驻留。
+
+同机同配方 EP4，全部 NVML 样本 1620 MHz，单位 µs：
+
+|全局 T|baseline|首尾统计版|M64/3-stage/双驻留|
+|---:|---:|---:|---:|
+|1|29.998|62.769|68.690|
+|16|85.002|115.542|124.260|
+|32|106.587|130.742|135.605|
+|48|130.984|151.056|144.098|
+|64|150.035|159.502|151.018|
+|96|179.678|166.642|160.092|
+|128|185.802|171.863|164.084|
+|256|198.185|180.692|172.994|
+|512|211.736|373.585|373.994|
+
+紧凑版改善 48–256，但 1–32 退步，尚不足以解决 RL 常见 bucket 的差距。
+这是 M、流水级数、线程数和驻留同时改变的组合消融，不能把结果只归因于
+双驻留。EP1/2/4/8 的 465 个 native 和 30 个 SGLang rank/case 全部通过；
+8 个通用 V4 ring entry 的 SASS 逐指令不变。EP1 memcheck/racecheck 各 31 个
+应用检查通过，分别 0 errors / 0 hazards；EP2 两种 sanitizer 各 62 个应用
+检查也已通过，两 rank 均为 0 errors / 0 hazards。
+原始日志为 `build/local_decode_hh/compact_*`。下一项单独记录 N64/5-stage
+和有效行直接 FC1 写回的结果，不覆盖本项数据。
+
+`local_decode_hh_n64` 使用 M64/N64/K64、5-stage、双驻留和有效行直接 FC1
+写回（保留同一 BF16 舍入 helper）。68 registers、0 spill。EP4 的 124 项
+native 检查及 9 个 SGLang bucket 数值对照通过，全部 SM 样本 1620 MHz。
+T1/16/32/48/64/96/128/256/512 的 p50 依次为
+66.041/120.018/133.853/153.115/160.273/168.439/173.874/186.471/373.886 µs。
+该组合未改善主流 bucket，暂不采用；尚未做全 EP 与 sanitizer 验收。
+
+`local_decode_hh_n64x3` 将上一项改成 3-stage、三 CTA 驻留，T16–256 依次为
+119.249/133.203/158.203/161.901/174.042/177.764/188.700 µs，未改善主要差距，
+不采用。EP4 的 124 个 native 和 9 个 SGLang bucket 数值对照通过，全部
+SM 样本 1620 MHz；不是完整验收。该轮已包含下面的补齐修复，T1 的改善
+不能归因于三 CTA（T1 未触发增大 grid）。
+
+### 补齐 token 不再引入额外专家
+
+SGLang 复制输入按 rank 等长切片。T 小于 EP 时，空 source 原先以零 X/gate
+搭配专家 0–7，仍会生成这些专家的 GEMM task。现在 graph staging 的补齐行
+复用全局首个真实 token 的专家 ID，只改变无效行的 route，X/gate 仍为零。
+所有真实 token 的 route、计算与输出不变；全局空输入仍由适配层原入口返回。
+masked 真实 route 仍使用原清洗规则。
+
+在同一个 M64/N128/3-stage 二进制上单独对照，EP4 全局 T1 从 68.690 降至
+53.812 µs（baseline 29.858）；T16/32/48/64 分别为
+124.281/135.577/144.101/150.932，与修复前持平，全部 SM 样本 1620 MHz。
+另有 EP4/T1 的 4 个 SGLang rank/case 通过数值对照、masked route、图回放及
+权重更新后重建。原始数据为 `compact_padded_sglang.log` 与
+`padded_sglang_ep4_t1.log`。此项采用，但 T1 仍落后 baseline，不能据此宣称
+端到端回退已经解决。
