@@ -4,7 +4,8 @@
 
 // Pull has one issuer and two private staging slots. A batch stays within
 // one Mblock and completes before publishing its aggregate X credit.
-template <bool Network, bool Training, class Storage>
+template <bool Network, bool Training, unsigned Batch = Network ? 2U : 8U,
+          class Storage>
 __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
                                        unsigned worker, unsigned workers) {
   namespace ring = static_v4::ring;
@@ -21,11 +22,11 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
   RowPrefetchPipeline<Storage> prefetch(s, 0U);
   unsigned peer_rows = 0U;
   constexpr auto TileM = forward_tuning::kTileM;
-  constexpr auto Batch = Network ? 2U : 8U;
   static_assert(TileM % Batch == 0U);
   for (std::uint64_t window = 0; window < r.state->windows; ++window) {
     const auto *sources = r.window_sources + window * shape.sources;
     const auto source_begin = shape.source_begin(window);
+    const auto begin = r.window_prefix[window] * TileM;
     const auto end = r.window_prefix[window + 1U] * TileM;
     unsigned reserved = 0U;
     // The entire window is admitted together. Its required X slots cannot
@@ -34,8 +35,16 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
       while (ring::acquire(r.state->admitted_windows) < window + 1U) {
       }
     if (lane == 0U)
-      for (auto base = r.window_prefix[window] * TileM + Batch * worker;
-           base < end; base += Batch * workers) {
+      for (auto linear = begin + Batch * worker; linear < end;
+           linear += Batch * workers) {
+        auto base = linear;
+        if constexpr (Batch == 1U) {
+          // Interleave Mblocks so their padding does not concentrate the
+          // useful rows on a small subset of the static issuer residues.
+          const auto blocks = static_cast<unsigned>((end - begin) / TileM);
+          const auto ordinal = static_cast<unsigned>(linear - begin);
+          base = begin + (ordinal % blocks) * TileM + ordinal / blocks;
+        }
         bool copied = false;
         unsigned credit = 0U;
 #pragma unroll
@@ -303,9 +312,18 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     }
     return;
   }
-  if (warp == 0U)
+  if (warp == 0U) {
+    // Spread small windows over issuers instead of serializing each expert's
+    // few valid rows in one eight-row batch. Keep batching for throughput work.
+    if constexpr (!Training) {
+      if (a.ring.state->windows == 1U &&
+          a.ring.state->rows <= 2U * gridDim.x) {
+        ring_pull<false, false, 1U>(a, s, blockIdx.x, gridDim.x);
+        return;
+      }
+    }
     ring_pull<false, Training>(a, s, blockIdx.x, gridDim.x);
-  else if (warp == 1U)
+  } else if (warp == 1U)
     ring_return<false>(a, blockIdx.x, gridDim.x);
   else if (blockIdx.x == 0U)
     static_v4::ring::admit<false>(a, 2U * a.intermediate / Fc1N,

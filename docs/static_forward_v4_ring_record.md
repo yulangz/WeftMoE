@@ -6,7 +6,7 @@
 ## 当前已采用版本（2026-09-29更新验收范围）
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
-planner优化。下面仍是GA+FZ冻结数据，不混入后续测量。Ring仍显式启用，
+planner及GU短文pull分工优化。下面仍是GA+FZ冻结数据，不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
 EP8是单机8卡，EP16是双机各8卡；显存时钟仅观测，没有锁定。
@@ -32,6 +32,8 @@ B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益代替
 尚不满足用户提出的短文“接近或领先”收尾条件，详见文末同名对照节。
 随后GR/GS将ring短档降至97.18/130.69us；同轮Mega含copy为53.18/63.37us，
 结论不变。两步优化的独立收益、容量适用范围和回归门禁见文末GR/GS节。
+GU随后将同输入ring短档降至93.68/115.82us，Mega含copy为53.27/63.24us，
+仍慢约76%/83%；未满足收尾条件。GU收益、失败的GT消融及门禁见文末。
 
 ## 冻结基线
 
@@ -6341,3 +6343,94 @@ route span约10.5–11.3/12.9–14.3us；GS ring则约31.2–31.8/39.6–41.4us�
 prefix、route_order和gate；另外非ring三条comm warp按单row并行pull，ring
 一条warp按8row batch pull。值得独立消融短档metadata访问和copy粒度，但
 本次没有把这些尚未实验的方向写成已实现优化。
+
+### GT/GU：少量工作窗口的静态 pull 分工（2026-09-29，采用GU）
+
+基于GR/GS（`c58bc0b`），只改`static_v4/ring_transport.cuh`的本地inference
+pull枚举；没有更改GA+FZ的GEMM、Return/Reduce或网络协议。
+新分支使用planner已发布的实际几何：`windows == 1 && rows <= 2 * gridDim.x`。
+这里windows按全局source token counts生成，rows是本destination的有效route
+总数；不是按本rank输入T判断，也不是只给T1/T64写特例。大容量pool中的实际
+短调用同样可选此分支；多窗口/较大工作量和training仍Batch8，network仍Batch2。
+
+GT先只把短分支的Batch8改为Batch1，保留原padded行编号。1620MHz、
+10warmup/20samples/batch20、相邻GS→GT的native EP8结果：T1从95.834降到
+92.107us，但T64从129.715退化到134.363us，故不单独采用GT。16个output hash
+及pool一致，八种main资源与GS一致。GT没有单独通过应用/sanitizer采用门禁。
+
+静态枚举揭示了原因之一：主夹具T64每个destination恰有8个Mblock、各32个
+有效行。132个issuer对padded M128编号取residue时，Batch8使用32个issuer、
+每个最多8行；Batch1虽使用60个issuer，最忙者仍搬8行，并且失去了批内双槽
+prefetch机会。GT的FC1首尾span增大也包含ready/任务错位，不能称为纯GEMM变慢。
+
+GU在Batch1分支增加Mblock交错：窗口内ordinal q映射到`block=q%n, row=q/n`，
+n是Mblock数。原valid_m判断仍在；这是所有padded行的一一置换，无重复或遗漏。
+T64因此使用全部132个issuer，每个最多2行；T1 rank3的4个两行块由4个issuer
+各2行变为8个issuer各1行。这是确定的任务分布，不把它当作独占延迟分解。
+窗口内ordinal的uint32转换受现有`window_blocks <= UINT32_MAX/(2*TileM)`
+约束，跨窗口base仍uint64。每条有效行仍先取得source reservation、完成TMA
+store，再发布X credit；唯一尾行补M-r，整个block仍恰好128 credit。
+admission、generation、full/empty、terminal和两份staging不变，没有新增分配、
+运行时参数、队列或永久测试。
+
+相邻GS→GU native EP8正式矩阵，1620MHz、B512/D8、10/20/batch20，rank-max
+p50/us；计时节点无CPU构建或其它GPU任务，32个output hash及pool逐项一致，
+各rank仍一个graph kernel node，前后全部时钟读数1620MHz：
+
+|T/rank|GS|GU|
+|---:|---:|---:|
+|1|95.710|91.218|
+|64|129.486|114.931|
+|8192|1246.400|1239.920|
+|20480|2952.230|2929.880|
+
+短档分别快4.69%/11.24%。反向T64→T1、每档GU→GS复测：按T1/T64列出，
+GS为95.632/129.578us，GU为91.405/114.782us，分别快4.42%/11.42%；
+16个hash/pool一致。长档不触发新分支，不把不足0.8%的单轮差异宣称为稳定收益。
+
+沿用已提交的同输入MegaMoE应用graph基准，首轮T64→T1，括号为独立进程
+按T1→T64复测；各进程内部交错四个case，仍10/20/batch20、rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GU ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.322（49.337）|53.274（53.272）|93.054（93.684）|60.785（60.653）|
+|64|57.831（57.449）|63.554（63.235）|116.282（115.818）|76.549（76.384）|
+
+完整reference检查通过，四case各自的8rank输出SHA256跨两轮及GS复测均相同；
+2560组SM前后读数全部1620MHz，未锁显存时钟。首轮仅另一节点跑独立正确性，
+复测两节点均无其它GPU任务，所有测量无并发CPU构建。Mega所需3份copy和
+kernel在同一个graph内测量，不相加独立median；native与此表不是同一数值夹具。
+按复测公平含copy口径，GU ring仍慢75.86%/83.15%，**不能关闭短文目标**。
+未使用非ring结果替换ring，也没有新增自动回退；MegaMoE仅测单机EP8。
+
+GU的已有host18/18通过；native EP8/T512、EP16/T64/T2048共160个梯度hash、
+repeat_equal及pool与GS逐项一致。应用EP8大容量全四档240条PASS，短容量257
+B512/D8及tiny B16/D1/K8分别152条PASS；覆盖实际短分支、大pool短调用、空
+destination、不等长source、重复route、多窗口、热点、改变route的graph、共享
+workspace及权重刷新。EP16全四档及edges共480条PASS，含20K热点不丢token。
+另在短容量B512/D8覆盖新分支，rank0/7 memcheck各0 errors、Forward racecheck
+各0 hazards/0 errors/0 warnings；不据此声称完整Backward racecheck关闭。
+
+EP16正式回归按20K→8K→64→1、每档GU→GS，同为1620MHz、10/20/batch20：
+
+|T/rank|GS/us|GU/us|
+|---:|---:|---:|
+|1|234.210|233.992|
+|64|285.971|286.494|
+|8192|2888.390|2895.180|
+|20480|6894.380|6853.720|
+
+64个output hash及pool/registered bytes一致，前后双机所有时钟读数1620MHz。
+差异均不足0.6%，没有新网络性能收益声明，未见明显回退。
+八种main仍REG168/SHARED2048/LOCAL0/CONST3264；本地inference decode/prefill
+STACK分别80→88/64→72，其余六种main资源与GS相同。不声称未走分支的SASS相同。
+
+冻结目录`build/static_v4_decode_pull_gt/`及`build/static_v4_decode_pull_interleaved_gu/`，
+保存proposal、patch、构建、正式samples/hash/clock及复现脚本和sanitizer日志。
+GT native SHA256 `bc0c9ebcafb08bf087c5109f6c386ff34333c978f28929d3a0c3ab1ca8b9e0b1`；
+GU native `3a512d73b3870b86a107b41e8cdf13e3530b7ab460723889fff0f5e105b6e9c3`，
+library `88b9398370a2ab5e7eeef1007012ce56a89e2a9e6884367ee6af1cc2f35979c7`；
+extension仍为`725bf863...825c3`，无adapter变更。
+下一处待独立消融的是短档metadata访问：GU反向复测最后一次replay的route span
+仍约30.7–31.8/39.9–41.4us；这次没有修改planner，不把该span当作可全部移除
+或可与其它阶段p50相加的开销。GA+FZ已验收的长文收益不重新设为本轮未完成项。

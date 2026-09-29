@@ -1,6 +1,6 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
-更新：2026-09-25。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
+更新：2026-09-29。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
 第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training
 V4 已经落地。**
 旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
@@ -17,8 +17,10 @@ V4 已经落地。**
 opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
 Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
-数据面。完整 EP8/EP16 数值测试已通过，但长序列性能仍未达标，不能当作最终
-优化版。纯 GEMM 布局/profile 消融与当前通信版本的入口选择已完成；训练对接
+数据面。完整 EP8/EP16 数值测试已通过；2026-09-29用户已确认GA+FZ的8K/20K
+inference领先V3符合预期。当前收尾条件是单机EP8/T1/T64接近或领先MegaMoE，
+不要求MegaMoE双机对照；该短文条件尚未满足。正式矩阵和后续消融见ring记录，
+下文按实施顺序保留各阶段当时的结果。纯GEMM布局/profile及入口选择已完成；训练对接
 已接通，完整门禁仍未完成，见下方M6及训练记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
 须先取得双 credit 并发布 reservation，destination 才可准入相应整窗口。
@@ -86,8 +88,13 @@ GA/FZ组合进一步将逐slot退休确认合并为channel consumed-prefix ACK�
 SavedX交给轮转的FC1 pair、每CTA复制半个M。没有删除远端消费或本地NIC完成
 条件，也不增加checkpoint读者/barrier。单/双机完整数值、复用及Forward专项
 sanitizer通过，组合正式矩阵及短档反向复测完成并采用。EP16短档相对FT下降
-约12.2%/9.6%，长文仅小幅改善，尚未据此关闭整体性能目标。当前布局和
-同步合同见第5节及6.4，独立消融/组合证据见ring记录GA/FZ。
+约12.2%/9.6%，长文仅小幅改善；GA+FZ长文在09-29已获用户确认，短文MegaMoE
+对照仍待达标。当前布局和同步合同见第5节及6.4，独立消融/组合证据见ring记录GA/FZ。
+随后GR/GS减少单机单容量窗口的planner grid join，并将source expert/node前缀
+改为warp scan；没有更改逐slot同步合同。详细适用范围、收益及回归见ring记录。
+GU再按实际destination工作量选择单行交错pull，改善短文静态issuer分布；
+单机1/64 token相邻正反向约快4%–5%/11%，但同输入ring仍明显慢于MegaMoE。
+这不是新增动态任务领取或非ring自动回退，具体分工见第5节。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -187,7 +194,8 @@ BO 后的实现将 G 选为 pool 的每节点 rank 容量中不超过 16 的最�
 实际 world 与容量一致时 source group 不跨节点；8-GPU 节点的 EP8/EP16 都是 G8。
 launch 继承这个 G，不能重新按 world 计算。若 pool 容量大于实际拓扑、导致
 group 跨实际节点边界，原 Pull 的逐行 local/remote 过滤仍然适用。网络路径的
-本地 batch 保持两行，单机保持八行；BP 的整窗过滤与网络八行 batch 无独立
+本地 batch 保持两行，单机默认八行；GU为少量工作的一窗口inference采用单行
+交错分工，见第5节。BP 的整窗过滤与网络八行 batch 无独立
 收益，已撤回。完整 global completion 后发布 X credit 的合同不变。
 B512/B1024 等参数继续按拓扑和规模实测选择，不改变有界最坏容量公式。
 
@@ -438,6 +446,15 @@ l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftM
 
 这里的 full/empty 是 GM ring 状态，不能与 CTA 内 SMEM TMA stage 的 mbarrier
 混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
+
+GU仅在单机inference的实际全局窗口数为1、该destination有效行数不超过
+`2 * gridDim.x`时选择Batch1，判定不依赖本rank的输入T或pool最大容量。
+令窗口有n个Mblock，固定issuer以`q = worker + iteration * workers`枚举，
+映射为`block = q % n, row = q / n`，再用原有valid_m过滤padding。
+这只是窗口内padded行的一一置换：每条有效route仍恰好复制一次，唯一尾行
+仍补齐M-r个credit，完整bulk store完成后才发布X full。空窗口不执行映射。
+多窗口/较大工作量、本地training和network保留原batch及分工；没有新队列、
+计数器、buffer或协议旁路。区别于GR的容量条件，大pool中的实际短调用也可选GU。
 
 当前training的Pull只完成物理X写入及canonical identity/gate保存后发布X full。
 FM最初由每个Mblock唯一的FC1 Ntile0，从ready A stage保存canonical SavedX。
