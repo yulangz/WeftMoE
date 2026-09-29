@@ -20,6 +20,7 @@ _dp_layout_patched = False
 _rows_are_dp_sharded = False
 _layout_active = False
 _eager_pending = False
+_graph_inputs = {}
 
 
 def participate_idle_layers(model):
@@ -276,6 +277,17 @@ def install():
             if _eager_pending:
                 _runtime.native.drain_eager_inference()
                 _eager_pending = False
+            # Warmup and outer capture allocate different intermediate tensors.
+            # Native child graphs bind addresses at warmup, so stage into one
+            # stable input set per bucket, shared by serialized layers. Copies
+            # become outer graph nodes; eager prefill consumes inputs directly.
+            key = local_tokens
+            if key not in _graph_inputs:
+                _graph_inputs[key] = tuple(torch.empty_like(t) for t in inputs[:3])
+            staged = _graph_inputs[key]
+            for target, source in zip(staged, inputs[:3]):
+                target.copy_(source)
+            inputs = (*staged, *inputs[3:])
             output = _runtime.inference(layer.layer_id, *inputs)
         elif _SYNC_EAGER:
             output = _runtime.inference_eager(*inputs)
@@ -475,6 +487,7 @@ def suspend(model_runner):
     _runtime.close()
     _runtime = None
     _eager_pending = False
+    _graph_inputs.clear()
     torch.cuda.empty_cache()
 
 

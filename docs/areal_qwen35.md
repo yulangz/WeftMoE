@@ -1,5 +1,34 @@
 # Qwen3.5 接入 AReaL
 
+## 当前 V4 接入检查（2026-09-29）
+
+当前算子版本为 HF（`7569ae0`）。下面的旧 RL 性能数字来自历史实现，不能用作
+当前 V4 的端到端结论；当前版本尚未完成新的 RL baseline 对照。
+
+本轮仅替换 SGLang rollout，Megatron actor 保持 baseline。使用
+`ops/AReaL/examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py` 和同目录的
+`dapo-math_grpo_qwen3_5_cpu_staged.yaml`。已有比较脚本的 `BACKEND=weftmoe`
+会同时启用 actor，因此必须保持 actor 的 `AREAL_USE_WEFTMOE=0`，并用独立的
+`rollout.scheduling_spec` 设置 rollout 的 `AREAL_USE_WEFTMOE=1`、
+`NCCL_CUMEM_ENABLE=1`、tensor extension 和 `WEFTMOE_STATIC_RING_TOKENS=256`。
+不能在原本继承 actor 的 scheduling spec 下只改嵌套环境变量。
+
+旧配方的 rollout 是两个独立 TP4/EP4 引擎，默认没有启用 DP attention。
+Qwen 的 256 个专家在 EP4 下每卡 64 个：当前通用 V4 支持，但 HF decode 的
+单 warp 专家前缀和与索引数组仅支持每卡 32 个。此外，旧 SGLang 适配层统一使用
+prefill 大容量池，不能选中要求容量不超过 64 token/rank 的 HF。要测 HF，仍需
+补齐每卡 64 专家的 geometry，并为 decode 准备独立的小容量池；不能将通用 V4
+的结果标为 HF decode。
+
+本轮最小测试发现旧适配层 warmup 与 outer capture 的中间 tensor 地址不同，
+触发当前 native runtime 的稳定地址检查。适配层现为每个 token bucket 保存
+一份 X/routes/gates staging，所有串行层共享；拷贝进入 outer graph，子图绑定
+固定地址。eager prefill 不增加此拷贝，suspend 销毁图和 native runtime 后清理
+staging。原先“不复制输入”的描述只适用于调用者能提供稳定地址的 native API，
+不再适用于这一 SGLang 适配路径。EP4 的 E16/K4/T17 与 E256/K8/T17、T257
+真实 SGLang 单层测试已通过 eager 数值对齐、变更输入/路由后的图回放和 runtime 释放/重建；
+这不是整模型或 RL 验证。
+
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang
 环境，以及 AReaL 侧的接入改动。这是一个显式构建的开发适配层，只执行 `pip install .`
@@ -29,9 +58,9 @@ NCCL 2.31.2 及以上版本。
 - SGLang 使用 TP=EP=4，把复制的 attention 输入按 EP rank 分片，并把路由输出还原
   成 Qwen 外层 TP 归约所需的形式。它不保留 X/AB，也没有反向状态。
 - decode 为每一层、每个 token bucket 捕获一个子 CUDA graph，共享一份串行化的传输
-  工作区。graph plan 直接绑定稳定的 PyTorch X/routes/gates 地址和固定
-  output，replay 不再把内容 `copy_` 进另一份 bucket 输入，也不 clone output。
-  外层 graph 中每层是一个 child graph node，其内只有一个融合 route/communication/
+  工作区。graph plan 绑定固定的 X/routes/gates staging 地址和 output；SGLang
+  的外层图先复制当前层输入到 staging，不 clone output。
+  外层 graph 中每层有一个 child graph node，其内只有一个融合 route/communication/
   compute 的 inference kernel。动态 prefill 复用同一套已准备好的 runtime，不为每个长度
   单独缓存。该共享工作区不支持不同 stream 并发使用。
 - AReaL 的 offload 钩子会先销毁推理图，再释放 native CUDA、IPC 和 GIN 分配；
