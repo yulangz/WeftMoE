@@ -135,8 +135,11 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
     output[v] = __float22bfloat162_rn(sum);
   }
   static_v4::collective_scope_sync<kMathThreads, 7U>();
-  if (threadIdx.x == 0U && active)
-    atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());
+  if (threadIdx.x == 0U && active) {
+    const auto now = device_globaltimer_ns();
+    atomicMax(&status->reduce_blocks_done, now);
+    atomicMax(&status->complete_clock, now);
+  }
 }
 
 #endif
@@ -212,7 +215,9 @@ __global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
     if (!status->error)
       combine(a);
   } else {
-    static_v4::after_combine<kMathThreads, kThreads - kMathThreads>(a);
+    // No terminal cleanup: BeforeCombine retired every source/route reader.
+    // The next invocation's BeforePull waits for all peers to finish this
+    // kernel before any FC2 writer can reuse their contribution storage.
     if (blockIdx.x == 0U && threadIdx.x == kMathThreads) {
       const auto blocks = s.blocks[a.dispatch.sizes.owned_expert_count];
       status->fc1_tasks_done = blocks * kFc1Tiles;
@@ -227,7 +232,7 @@ __global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
       }
       if (a.injected_status_error_rank == static_cast<int>(a.rank))
         publish_local_structured_error(status, a.rank, 120U, 1U, 0ULL, 1ULL);
-      status->complete_clock = device_globaltimer_ns();
+      atomicMax(&status->complete_clock, device_globaltimer_ns());
     }
   }
 #endif

@@ -538,3 +538,74 @@ M64 以及 8 个通用 V4 ring entry 均与该已验收双形状二进制逐指�
 最终仍只在单机短容量 inference pool 内选 M16/M64；prefill、training 和
 跨节点协议未改。小 batch 对 SGLang baseline 的剩余差距不能隐去，实际 RL
 收益另以相同步数和接受的生成 token 吞吐复测。
+
+### 单 pull warp 消融（不采用）
+
+`local_decode_hh_onepull` 仅将 M16 的三个 pull warp 减为一个，CTA 从 256
+降为 192 threads，释放 8 KiB SMEM；M64 不变。E256/EP4 的 124 个 native
+rank/case 和 9 个 SGLang bucket 检查通过。为避免节点差异，同时在本机
+重测冻结的 HHD；全部 SM 采样为 1620 MHz，无其它 GPU workload 或并行编译。
+
+|全局 T|HHD 本机复测（µs）|单 pull warp（µs）|
+|---:|---:|---:|
+|1|49.334|49.078|
+|16|107.242|107.198|
+|32|125.215|125.009|
+|48|144.577|145.595|
+|64|150.227|150.833|
+|96|159.561|160.030|
+|128|164.915|165.444|
+|256|174.983|173.366|
+
+主流小 batch 没有稳定改善，不采用，代码已恢复。日志为
+`build/local_decode_hh/{onepull_local_sglang,release_local_control}.log`；
+没有将本项扩展到全 EP/sanitizer 验收，也没有替换正在运行的 HHD RL。
+
+### HHE：单窗口 decode 省去末尾 rank barrier
+
+`local_decode_hh_twobarrier` 保留原 M16/M64、三条 pull warp 和静态任务分配，
+仅从专属 decode 移除 AfterClean。适用前提是同一 pool 的调用按 stream
+串行、全部 payload 在一个容量窗口内，且末尾没有通用 ring 的计数器清理。
+
+复用边界如下，不能把这一证明推广到需要在线复用的长文/网络 ring：
+
+1. BeforeCombine 收齐所有 rank 的 FC2 写回，此时上一调用的 source X、route
+   目录、canonical X/S 均已没有读者；下一调用可提前重写这些区域。
+2. Reduce 只读取本 rank 的 contribution，不再读取 peer 的 source/目录。
+   下一调用可以先规划，但任何新 FC2 写入都必须经过下一次 BeforePull。
+3. 每个 rank 只有上一 kernel 完整退出后才能进入下一次 BeforePull，因此该
+   barrier 同时确认所有旧 Reduce 已结束，新 FC2 不会覆盖尚在读取的贡献。
+   保留双 phase add/sub rank 信号；快速 rank 不能越过下一次 BeforePull。
+
+末尾只更新状态，`complete_clock` 同时覆盖活动 Reduce CTA 的完成时间；
+不存在的 AfterClean 计时为零。不改变一般 V4 的 `after_combine` helper。
+
+同机首轮全部 NVML 样本 1620 MHz，无并行编译/其它 GPU workload。全局
+T1/16/32/48/64/96/128/256 的 p50 为
+47.826/105.456/123.518/143.290/148.871/158.046/163.250/174.328 µs；
+相邻 HHD 控制组为
+49.334/107.242/125.215/144.577/150.227/159.561/164.915/174.983 µs。
+T512 的通用路径为 372.822 µs，控制组 372.808 µs。主要 bucket 改善
+约 1–2 µs，不夸大为大幅收益。
+
+首轮 E256/EP4 的 124 个 native rank/case、9 个 SGLang bucket 通过；8 个
+通用 V4 ring entry 的 SASS 与 HHD 逐指令一致。完整 EP1/2/4/8、sanitizer、
+E64/EP8 与再次复测的结果如下；未替换正在运行的 HHD RL 二进制。
+
+EP1/2/4/8 共 465 个 native、30 个 SGLang rank/case 通过。E64/K8 的
+EP1/EP2 memcheck、racecheck 分别覆盖 M16/M64 及跨形状输入，两种工具
+各 31/62 个应用检查通过，全部工具进程 0 errors / 0 hazards。
+另在 EP4 的既有图复用检查中为末 rank 加入图内延迟，两个相依调用之间
+其它 rank 可先进入下一轮；124 个 native rank/case 全部通过，未新增永久
+测试入口。日志为 `twobarrier_skew_ep4.log`，诊断 shim 为 `skew_check.py`。
+
+正式计时复测 T1/16/32/48/64/96/128/256 为
+47.816/105.681/123.524/143.055/148.877/158.131/163.208/174.596 µs，
+重现约 1–2 µs 的收益；T512 为 372.620 µs。全部 NVML 样本 1620 MHz。
+E64/K4/EP8 的 T1/T64 为 36.956/59.360 µs，同轮 MegaMoE kernel 为
+49.587/59.998 µs，含输入 staging 为 53.062/65.876 µs；全部数值检查和
+1620 MHz 时钟检查通过。T64 仍只可称接近 MegaMoE kernel，不把约 1%
+差距称为显著领先，也不把不同物理节点测量的细小变化归因于 barrier。
+
+冻结 library 为 `build/local_decode_hh_twobarrier/libweftmoe.so`，SHA256
+`962daf6fa6486f7afc930934ce636d2a7053e6227742e09356101ab6f3adf421`。

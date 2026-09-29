@@ -29,8 +29,9 @@ inline bool eligible(const ActivationTransportPoolConfig &config,
 }
 
 // Alias only the invocation-private block directory, not cumulative ring
-// credits. All payload fits one generation; the terminal collective protects
-// reuse. There is no online admission or within-invocation slot overwrite.
+// credits. All payload fits one generation. BeforeCombine retires source reads;
+// the next BeforePull protects contribution reuse until all local combines end.
+// There is no online admission or within-invocation slot overwrite.
 struct BlockState {
   unsigned long long x_ready, s_ready;
 };

@@ -131,6 +131,20 @@ BeforePull/BeforeCombine/AfterClean边界及SMEM full/empty流水，沿用Weft
 低约2.9%–4.0%；EP8/EP16四规模回归通过，长文及多机差异均小于0.5%。
 完整布局、同步证明、收益及使用边界见[decode记录](static_forward_v4_decode_record.md)。
 
+HH 根据真实 SGLang TP4/EP4 的回退进一步调整专属 decode：融合 graph 输入
+staging/输出回填，补齐行复用真实 route，稀疏输入用 M16 warp MMA，密集输入
+用 M64 WGMMA。两种算术片共用静态调度、三条 pull warp、一个 TMA warp 和
+128 个 math threads；均使用 CTA-local A/B TMA full/empty credits，不做
+decode cluster multicast。物理块仍为 M128，热点遍历全部 slice，不截断行。
+采用的 HHD（`5d4c374`）已完成 EP1/2/4/8、batch invariance、sanitizer 及
+单机 MegaMoE 对照；通用 V4 的 8 个 ring kernel 机器码不变。
+RL 回退及相同步数复测另见 [AReaL 记录](areal_qwen35.md)，不把算子提速当作
+端到端结论。HHD 保留上述三次 rank collective；随后 HHE 仅在单窗口 decode
+省去无清理工作的 AfterClean：BeforeCombine 退休旧 source 读者，下一次
+BeforePull 在新 FC2 写入前确认所有旧 Reduce 结束。EP1/2/4/8、sanitizer
+及人为 rank 延迟复用检查通过；通用 ring 不变。独立消融及证明见 decode
+记录，正在运行的 HHD RL 二进制不包含这项后续收益。
+
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |

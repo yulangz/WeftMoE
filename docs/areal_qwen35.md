@@ -4,8 +4,9 @@
 
 本轮基线为 HF（`7569ae0`），后续 HG 的 EP 通用化验收见
 [decode 记录第 6 节](static_forward_v4_decode_record.md)。下面的旧 RL 性能数字来自历史实现，不能用作
-当前 V4 的端到端结论；当前 HG 的新 RL 对照已完成双方各 3 次 update，
-确认 rollout 回退，正在优化，尚未完成 20 updates。
+当前 V4 的端到端结论。HG 的新 RL 对照确认 rollout 回退；HH 优化后已重跑
+3 次 update，回退明显缩小但未追平 baseline，详见下方相同步数对照。
+本轮尚未完成 20 updates，不能据此给出训练收敛结论。
 
 本轮仅替换 SGLang rollout，Megatron actor 保持 baseline。使用
 `ops/AReaL/examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py` 和同目录的
@@ -129,6 +130,67 @@ E256/K8/H2048/I512、复制输入 TP4/EP4、包含模型外层 TP all-reduce、�
 HG WeftMoE 停止后用 `--finished weftmoe=<reason>` 上传完 3 个完整 update 并
 结束该 W&B run，summary 保留停止原因；不是训练异常，也不上传未完成 step。
 baseline 的旁路同步继续，优化版使用新 run，不覆盖 HG 历史。
+
+### HH 优化版复测（2026-09-29）
+
+HH 的逐项消融和负结果见 [decode 记录第 7 节](static_forward_v4_decode_record.md)。
+采用 commit `5d4c374`：融合 graph staging/输出回填、避免 padding 激活无关
+专家，稀疏 decode 用 M16 MMA/TMA，较密输入用共享调度的 M64 WGMMA，并
+按专家任务量限制静态 grid。prefill、training 和多机 kernel 没有改动。
+E256/EP4 的全局 T32/T64 单层图从 HG 的 160.969/192.961 降至
+125.245/150.888 µs，但 T1–48 仍慢于 SGLang baseline，不把这些算子收益
+直接写成端到端收益。
+
+14:32 UTC 在 `10.10.19.233` 启动新 trial
+`qwen35-sglang-weftmoe-hhd-mb32-8gpu-20260929`。冻结 library 为
+`build/local_decode_hh_release/libweftmoe.so`，SHA256
+`b7ea21bdf989b30b5cda1cbe7d813ad2de70bc3cae4ec087375511c3a7c5d7be`。
+解析后的完整 YAML 与原 baseline 对照，差异仅为 trial/目录/W&B 名称以及
+rollout 的 WeftMoE 环境；actor 后端、采样、数据、seed 和 32K microbatch 一致。
+实际后端字段仍为 actor `megatron:(attn:d2p1t4c1|ffn:d1e8)`、rollout
+`sglang:d2t4p1`，两个 TP4/EP4 引擎。YAML 中未使用的旧 `allocation_mode`
+字符串在两组都保留 TP2，不能据此误判实际并行配置。
+
+日志为 `build/local_decode_hh/hhd-mb32/rl_weftmoe.log`，独立
+[W&B run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-sglang-hhd-mb32-20260929-weftmoe)
+已在线，仍由同一个 console-table 旁路上传器记录完整 update。
+此轮至少观察 3 个完整 update，以同样的前 3 步对照、剔除第 1 步 warm-up，
+并同时报告接受的生成 token 吞吐。
+按日志的 `ppo_actor/update/n_valid_tokens / timeperf/rollout` 聚合，第 2–3 步
+baseline 为 9006.6 tokens/s，旧 HG 为 7496.0 tokens/s（−16.8%）。这是接受的
+训练样本的生成 token 吞吐，不是包括预取/丢弃请求的服务端总吞吐；序列长度
+和实际采样结果并非严格固定，不能只比较 rollout 秒数。
+
+15:04 UTC 已完成 2 个 update。首步 rollout 739.40 s、接受的生成 token
+5,367,800，相对 baseline 首步 675.38 s / 5,106,800，归一化吞吐仍慢约 4%。
+第 2 步为 496.66 s / 4,556,900，baseline 同步为 498.25 s / 4,658,900：
+rollout 时间已接近，接受的生成 token 吞吐仍慢 1.9%，尚不作为稳态最终结论。
+第 2 次非零学习率训练、AWEX 权重更新及恢复生成均完成，没有训练异常。
+
+14:55 UTC baseline 已主动停止，保留 16 个完整 update（丢弃未完成的
+第 17 步），W&B run 正常结束并记录停止原因；释放本机用于独立 decode
+消融，没有干扰另一节点的 HHD RL。停止后短暂 NVRM 回收超时已自行恢复，
+确认 8 卡空闲、全部 1620 MHz 后才运行测试，没有重置 GPU 或驱动。
+
+15:17:45 UTC，HHD 已完成第 3 次 update；第 3 步 rollout 为 595.67 s，
+接受的生成 token 为 4,698,300。使用双方**同样的第 2–3 步**（非 baseline
+全部 16 步）比较，原始汇总为 `build/local_decode_hh/hhd-mb32/rl_first3_comparison.json`：
+
+|指标|baseline|原 HG|HHD（`5d4c374`）|
+|---|---:|---:|---:|
+|rollout 中位数（s）|527.720|627.605|546.165|
+|接受的生成 token/s|9006.6|7496.0|8472.9|
+|update 完成间隔中位数（s）|732.200|834.458|740.386|
+
+HHD 相对 HG 的 rollout 时间减少 13.0%，接受的生成吞吐提高 13.0%；
+相对 baseline 仍慢 3.5%（时间）/5.9%（吞吐），不能写成已经追平。
+两步采样长度、预取和尾部请求都不同，这不是固定输出 token 集的纯 decode
+计时；单层对照中 T1–48 的剩余差距也仍存在。三轮均完成训练/权重更新，
+第 4 步继续，W&B 保留完整记录。时钟固定目标仍为 1620 MHz；截至 15:20
+的 4,600 个 GPU 样本中有 4 个低于目标（1605×1、1590×2、1575×1），
+原始采样未过滤。独立算子正式计时的全部采样均为 1620 MHz。
+
+HHE 的末尾 barrier 消融不包含在上表 HHD 的 RL 收益中，见 decode 记录。
 
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang
