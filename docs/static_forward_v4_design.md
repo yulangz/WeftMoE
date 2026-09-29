@@ -95,6 +95,9 @@ sanitizer通过，组合正式矩阵及短档反向复测完成并采用。EP16�
 GU再按实际destination工作量选择单行交错pull，改善短文静态issuer分布；
 单机1/64 token相邻正反向约快4%–5%/11%，但同输入ring仍明显慢于MegaMoE。
 这不是新增动态任务领取或非ring自动回退，具体分工见第5节。
+GV再复用已有destination表发布单容量窗口的source counts/route IDs，减少
+目标端串行peer读取；单机短档相邻正反向再快约1%–1.7%。X仍destination-pull，
+不改变有界payload及逐slot协议，也尚未满足MegaMoE短文收尾条件。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -446,6 +449,17 @@ l1_empty。这里借鉴的是逐物理 slot 的代际协议，不把当前 WeftM
 
 这里的 full/empty 是 GM ring 状态，不能与 CTA 内 SMEM TMA stage 的 mbarrier
 混为一谈。cluster multicast 的 shared stage 仍要等两个 CTA 的相应读者退休。
+
+GV仅对单机inference、公共容量至多一个窗口的规划，复用已有
+`fused_local_expert_count`和`fused_source_routes`：source CTA0完成本地目录后，
+把counts与route IDs写到destination上自己独占的source plane，再经过原有
+source-ready rank barrier。每次覆盖全部expert计数，包括空source的零计数；
+route列表只读取本代count内的部分，故不需要新增清理阶段。destination从本地
+表取counts/route IDs，epoch、gate仍从source取，物理行序与几何计算不变。
+每expert/source的route extent不超过已有`max_tokens_per_rank * max_top_k`步长。
+没有调用full-arena的容量拒绝逻辑；单窗口热点超过max_rows仍由ring完成。
+这是metadata发布方向优化，不是把X从pull改成push；大容量、多机及training
+保留原目录访问方式。跨调用terminal仍保护这些invocation级目录。
 
 GU仅在单机inference的实际全局窗口数为1、该destination有效行数不超过
 `2 * gridDim.x`时选择Batch1，判定不依赖本rank的输入T或pool最大容量。

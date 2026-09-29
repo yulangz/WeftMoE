@@ -2,6 +2,27 @@
 
 namespace static_v4 {
 
+// The source owns one disjoint directory plane on each destination. These
+// tables describe the invocation, not the lifetime of a reusable payload slot.
+__device__ __forceinline__ std::uint32_t *
+source_routes(const ForwardKernelArgs &a, unsigned destination,
+               unsigned source, unsigned expert) {
+  const auto offset = reinterpret_cast<const char *>(a.fused_source_routes) -
+                      reinterpret_cast<const char *>(a.local_base);
+  return peer_at<std::uint32_t>(a.peer_bases[destination], offset) +
+         (std::uint64_t(expert) * a.world + source) * a.max_routes_per_rank;
+}
+
+__device__ __forceinline__ std::uint64_t *
+source_counts(const ForwardKernelArgs &a, unsigned destination,
+               unsigned source) {
+  const auto offset =
+      reinterpret_cast<const char *>(a.fused_local_expert_count) -
+      reinterpret_cast<const char *>(a.local_base);
+  return peer_at<std::uint64_t>(a.peer_bases[destination], offset) +
+         std::uint64_t(source) * a.dispatch.sizes.owned_expert_count;
+}
+
 __device__ __forceinline__ void build_combine_order(const ForwardKernelArgs &a,
                                                     std::uint64_t tid,
                                                     std::uint64_t stride) {

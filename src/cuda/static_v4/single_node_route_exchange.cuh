@@ -16,7 +16,6 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   const auto routes = a.dispatch.sizes.route_count;
   const auto experts = a.dispatch.identity.num_experts;
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  auto *local_counts = a.fused_local_expert_count;
   auto *send_counts =
       const_cast<std::uint64_t *>(a.dispatch.source_expert_count);
   auto *runtime = const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime);
@@ -94,9 +93,6 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   }
   collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
 
-  const auto table_offset =
-      reinterpret_cast<const char *>(a.fused_source_routes) -
-      reinterpret_cast<const char *>(a.local_base);
   for (auto route = tid; route < routes; route += stride) {
     const auto raw = a.selected_experts[route];
     const auto expert =
@@ -106,13 +102,8 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
     const auto source_slot = atomicAdd(cta_expert_count + expert, 1U);
     const auto destination = expert / owned;
     const auto local_expert = expert % owned;
-    auto *table =
-        peer_at<std::uint32_t>(a.peer_bases[destination], table_offset);
-    const auto index =
-        (static_cast<std::uint64_t>(local_expert) * a.world + a.rank) *
-            a.max_routes_per_rank +
-        source_slot;
-    table[index] = static_cast<std::uint32_t>(route);
+    source_routes(a, destination, a.rank, local_expert)[source_slot] =
+        static_cast<std::uint32_t>(route);
   }
 
   collective_scope_sync<forward_tuning::kUnifiedThreads,
@@ -124,16 +115,11 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   // release/acquire boundary makes both remote payloads visible together.
   grid_sync<kMathThreads, kControlThreads>(a);
   if (blockIdx.x == 0U) {
-    const auto count_offset =
-        reinterpret_cast<const char *>(local_counts) -
-        reinterpret_cast<const char *>(a.local_base);
     for (auto expert = static_cast<std::uint64_t>(control_thread);
          expert < experts; expert += kControlThreads) {
       const auto destination = static_cast<std::uint32_t>(expert / owned);
       const auto local = static_cast<std::uint32_t>(expert % owned);
-      peer_at<std::uint64_t>(a.peer_bases[destination], count_offset)
-          [static_cast<std::uint64_t>(a.rank) * owned + local] =
-              send_counts[expert];
+      source_counts(a, destination, a.rank)[local] = send_counts[expert];
     }
   }
   rank_barrier<kMathThreads, kControlThreads, false, false>(a);

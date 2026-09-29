@@ -6,7 +6,8 @@
 ## 当前已采用版本（2026-09-29更新验收范围）
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
-planner及GU短文pull分工优化。下面仍是GA+FZ冻结数据，不混入后续测量。Ring仍显式启用，
+planner、GU短文pull分工及GV单窗口metadata发布优化。下面仍是GA+FZ冻结数据，
+不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
 EP8是单机8卡，EP16是双机各8卡；显存时钟仅观测，没有锁定。
@@ -34,6 +35,8 @@ B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益代替
 结论不变。两步优化的独立收益、容量适用范围和回归门禁见文末GR/GS节。
 GU随后将同输入ring短档降至93.68/115.82us，Mega含copy为53.27/63.24us，
 仍慢约76%/83%；未满足收尾条件。GU收益、失败的GT消融及门禁见文末。
+GV相邻对照再改善约1%–1.7%；同输入复测ring为92.71/114.48us，Mega含copy
+为53.89/63.29us，仍慢约72%/81%。未关闭短文目标，详见文末GV节。
 
 ## 冻结基线
 
@@ -6434,3 +6437,91 @@ extension仍为`725bf863...825c3`，无adapter变更。
 下一处待独立消融的是短档metadata访问：GU反向复测最后一次replay的route span
 仍约30.7–31.8/39.9–41.4us；这次没有修改planner，不把该span当作可全部移除
 或可与其它阶段p50相加的开销。GA+FZ已验收的长文收益不重新设为本轮未完成项。
+
+### GV：单容量窗口的 metadata 目的端发布（2026-09-29，已采用）
+
+基于GU（`67508df`）。单机inference且公共容量至多一个window时，source
+CTA0完成原source plan后，把所有expert计数与有效route IDs写入destination
+已有的`fused_local_expert_count`和`fused_source_routes`。每个source独占一个
+表平面，每次包含零计数；空source不读取未初始化的prefix。原source-ready
+rank barrier仍等待X staging和这些metadata stores，随后destination只需从
+本地表读取counts/route IDs；gate与epoch仍从source读取。两种publisher复用
+同一地址helper，不复制full-arena planner，也不引入其max_rows容量拒绝逻辑。
+source_count helper改为接收local expert并选择目录，物理行序、expected_count
+和返回地址不变。未增加分配、barrier、counter、清理阶段或永久测试。
+
+这是metadata发布方向变化，**X仍destination-pull**。一source window的每
+expert route数受已有max_tokens×max_top_k步长保护，terminal仍保护跨调用复用。
+容量条件与GR相同，不按本rank实际T猜测全局长度：大pool中的1/64 token不走
+GV，仍可走GU。多机、training和多窗口保留原目录；GEMM、payload ring及
+Return/Reduce均未修改。本轮也未混入删除local node目录计算等其它候选。
+
+首次native短档相邻GU→GV（1620MHz、10/20/batch20）为91.288→89.749us、
+114.861→113.658us（T1/T64），分别快1.69%/1.05%。16个hash/pool一致。
+第二轮完整EP8同口径正式矩阵，rank-max p50/us：
+
+|T/rank|GU|GV|
+|---:|---:|---:|
+|1|91.195|89.856|
+|64|114.781|113.570|
+|8192|1245.120|1240.000|
+|20480|2937.530|2926.150|
+
+反向T64→T1、每档GV→GU复测，按T1/T64列出GU为91.339/114.862us，
+GV为89.794/113.702us，分别快1.69%/1.01%。完整矩阵及反向32/16个output
+hash、pool、形状和测量协议逐项一致；前后SM读数全部1620MHz。长档不触发
+GV，不将不到0.5%的波动当作稳定收益。所有正式测量节点无CPU构建/其它GPU
+任务；第二轮单机测量时另一节点独立进行诊断构建、正确性和时间线采集。
+
+同输入MegaMoE应用graph对照，首轮T64→T1，括号为独立进程T1→T64复测，
+四case在进程内交错，10/20/batch20、rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GV ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.318（49.994）|53.173（53.890）|92.027（92.713）|61.128（61.590）|
+|64|58.098（57.470）|63.794（63.286）|115.321（114.475）|77.263（76.824）|
+
+reference全部通过，四case各自的8rank输出SHA256与GU复测逐项一致；两轮
+2560组时钟前后读数全部1620MHz，显存时钟未锁定。复测无其它GPU/CPU构建。
+Mega的3份copy与kernel在同一graph内测量，没有相加独立median；按复测值
+ring仍慢约72%/81%，不能称为接近或领先，也没有用非ring结果代替ring。
+MegaMoE只测单机EP8。
+
+门禁：host18/18；native EP8/T512、EP16/T64/T2048共160个梯度hash、
+repeat_equal与pool完全等于GU；Torch EP8全四档240条PASS、单容量窗口
+T1/T64/T512及edges共200条PASS、tiny B16/D1/K8共152条PASS。512容量用例
+覆盖GV的decode/prefill、空source、变更路由的graph、权重更新，以及热点行数
+超过arena max_rows时仍无丢token。rank0/7 memcheck各0 errors、Forward
+racecheck各0 hazards/0 errors/0 warnings，均跑同一组200条检查。EP16全四档
+及edges共480条PASS。仍不声明完整Backward racecheck关闭。
+
+EP16正式回归按20K→8K→64→1、每档GV→GU，1620MHz、10/20/batch20：
+
+|T/rank|GU/us|GV/us|
+|---:|---:|---:|
+|1|233.754|234.320|
+|64|285.406|285.910|
+|8192|2876.720|2891.400|
+|20480|6873.120|6850.230|
+
+64个output hash及pool/registered bytes一致，前后双机SM读数全部1620MHz，
+变化均不足0.6%，未见明显回退，不报告新增多机收益。第一次Torch双机启动的
+端口29988被占用，rank0在worker启动前报EADDRINUSE；仅停止本次等待中的远端
+launcher，保留`torch_ep16_port_conflict_node{0,1}.log`，改用检查空闲的29862后
+通过。失败不是Weft kernel执行错误，也没有终止占用端口的其它服务。
+
+八种main资源与GU逐项一致。冻结目录`build/static_v4_decode_metadata_gv/`：
+native SHA256 `c6c03caff0459f681c8940dc89a60c11310b86b52fd9c375cca8ff8146fef8d5`；
+library `dab59b5055854a7fd47bba92e7f3e93d81a22c14685c35fd5799ff3c9f513abd`；
+extension仍`725bf863...825c3`。源码与冻结patch一致；目录包含全部构建、
+samples/hash/clock、sanitizer及复现脚本，端口重试入口为`run_remainder.sh`。
+
+另用现有timeline宏构建诊断版，在第二节点EP8/T1/T64各跑12轮eager，16份
+rank trace均无overflow。CTA0的ExchangeReady→GeometryReady为9.312–9.440/
+12.896–13.888us，GeometryReady→PlanReady为6.496–6.656/8.352–9.152us。
+前者包含header、计数/前缀及grid同步，后者包含reverse metadata及grid同步，
+均非纯算术耗时。source/交换段明显包含eager各rank到达等待，不能全部归因于
+source计算。这些带插桩的单次span不是正式graph p50，也不用于相加推导收益。
+下一步可独立消融目标端串行前缀或reverse metadata阶段，尚未实施。
+诊断目录`build/static_v4_decode_metadata_gv_timeline/`，native SHA256
+`af439953c59af60a2c5d6d495f197ab557c5772e1f6468437f31455365731011`。

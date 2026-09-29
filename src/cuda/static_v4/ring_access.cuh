@@ -70,14 +70,18 @@ window_source(const ForwardKernelArgs &a, std::uint64_t window, unsigned source)
 
 __device__ __forceinline__ std::uint64_t
 source_count(const ForwardKernelArgs &a, unsigned source,
-             std::uint64_t local_window, unsigned expert) {
+             std::uint64_t local_window, unsigned expert, bool destination_table) {
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  if (destination_table)
+    return a.fused_local_expert_count[std::uint64_t(source) * owned + expert];
   const auto &plan = a.ring.source;
   if (local_window * plan.shape.tokens >= a.ring.source_epochs[source].tokens)
     return 0U;
   const auto *prefix =
       source_metadata(a, source, plan.expert_prefix) +
       local_window * (plan.experts + 1U);
-  return prefix[expert + 1U] - prefix[expert];
+  const auto global_expert = a.rank * owned + expert;
+  return prefix[global_expert + 1U] - prefix[global_expert];
 }
 
 __device__ __forceinline__ void save_identity(const ForwardKernelArgs &a,

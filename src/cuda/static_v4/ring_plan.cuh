@@ -106,6 +106,25 @@ __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
     input[v] = reinterpret_cast<const uint4 *>(a.input)[v];
 }
 
+// One capacity window has one source directory. Push its compact metadata
+// into the existing destination tables before the source-ready rank barrier.
+// Empty sources still overwrite their counts; no cleanup or new epoch is needed.
+__device__ __forceinline__ void publish_single_window(
+    const ForwardKernelArgs &a, unsigned tid, unsigned threads) {
+  const auto &p = a.ring.source;
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  for (unsigned expert = tid; expert < p.experts; expert += threads)
+    static_v4::source_counts(a, expert / owned, a.rank)[expert % owned] =
+        p.tokens ? p.expert_prefix[expert + 1U] - p.expert_prefix[expert] : 0U;
+  const auto routes = p.tokens ? p.expert_prefix[p.experts] : 0U;
+  for (auto ordinal = std::uint64_t(tid); ordinal < routes; ordinal += threads) {
+    const auto route = p.route_order[ordinal];
+    const auto expert = static_cast<unsigned>(p.selected_experts[route]);
+    static_v4::source_routes(a, expert / owned, a.rank, expert % owned)
+        [ordinal - p.expert_prefix[expert]] = static_cast<unsigned>(route);
+  }
+}
+
 template <bool Network, bool Training = false>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
@@ -163,6 +182,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       static_forward::build_source_window<SourceThreads, Math,
                                           kCollectiveScopeBarrier, Canonical>(
           planner, w, counts, a.dispatch.route_dst_row);
+    if (single_window && blockIdx.x == 0U)
+      publish_single_window(a, threadIdx.x - Math, SourceThreads);
   }
   // Inference overlaps input staging and counting. Training publishes only
   // metadata here, after tape allocation. Math has no live GEMM state yet.
@@ -284,7 +305,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       counts[index] =
           source < p.shape.source_end(w)
               ? static_cast<unsigned>(source_count(a, source, local_window,
-                                                   a.rank * owned + expert))
+                                                   expert, single_window))
               : 0U;
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
@@ -341,7 +362,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       counts[index] =
           source < p.shape.source_end(w)
               ? static_cast<unsigned>(source_count(a, source, local_window,
-                                                   a.rank * owned + expert))
+                                                   expert, single_window))
               : 0U;
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
@@ -380,8 +401,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       const auto *gates = source_metadata(a, source, r.source_gates);
       for (auto ordinal = tid % 32U; ordinal < count; ordinal += 32U) {
         const auto row = geometry.expert_row<Canonical>(0U, source, ordinal);
-        const auto route =
-            order[source_prefix[a.rank * owned + expert] + ordinal];
+        const auto route = single_window
+            ? static_v4::source_routes(a, a.rank, source, expert)[ordinal]
+            : order[source_prefix[a.rank * owned + expert] + ordinal];
         void *output;
         if (!Network || source / a.local_world_size == a.node) {
           const auto &address = window_source(a, w, source);
