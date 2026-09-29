@@ -51,6 +51,33 @@ lease。两套 runtime 各保留一份，eager 和训练的权重发布方式不
 `sglang_offload_cycles.log`；最终 tensor extension SHA256 为
 `f894dae763a4b95df6c9a662278c862a980502b9a8a551db449e20a03e6e33db`。
 
+### 本轮 RL 实测进度
+
+2026-09-29 首轮沿用训练 microbatch 65,536 tokens。两组均为单机 8 GPU、
+两个 TP4/EP4 rollout 引擎，分别运行在同型号节点；不是一次双机 EP8 实验。
+模型、数据、全局 batch 32、每题 16 samples、20K 生成上限和 actor 实现相同。
+baseline 完成了第 1 次 update（rollout 687.62 s、train 162.50 s、权重更新
+16.981 s），但 WeftMoE 在第 1 次训练的 `finalize_model_grads` →
+`reduce_scatter_tensor_coalesced` 处失败：NCCL 懒分配 536,870,912 bytes 时 OOM。
+这是梯度同步阶段，早于现有 `optimizer_step()` 的清缓存，并非已定位为推理
+kernel 错误。卸载推理、恢复 actor 后总显存为 baseline 21.89 GiB、WeftMoE
+21.38 GiB，现有记录不支持推理双池未释放的判断。
+
+这轮 **不构成完成的 RL 性能对照**。首轮 SGLang 实际 decode 计数均约 625 万，
+WeftMoE 从 proxy ready 到首次暂停采样约 821 s，慢于 baseline 的约 688 s；
+不能用单算子提速宣称 RL 已加速，也不能用未完成的更新推断稳态或训练收敛。
+旧作业已停止，日志、5 秒 GPU 采样及 HTTP 指标保存在
+`build/local_decode_hg/rl_{baseline,weftmoe}*`。时钟目标为 1620 MHz，但存在少量
+降频样本：baseline 2/2376 GPU-samples，WeftMoE 6/2344，原始记录未过滤。
+
+后续重跑仅将两组 `actor.mb_spec.max_tokens_per_mb` 统一降至 32,768；
+不修改 Megatron 实现、全局 batch、采样长度或优化器，不能与 64K 结果混算。
+两节点交换实验角色，重新锁定 1620 MHz，仍各自为单机 8 GPU、20 updates。
+原始数据目录为 `results/areal_sglang_v4_20260929_mb32`，入口日志为
+`build/local_decode_hg/mb32/rl_{baseline,weftmoe}.log`。该轮尚在运行，AWEX
+权重更新和稳态性能仍待验证。OOM 后本机进程清理曾触发短暂 NVRM 超时，随后
+自行恢复；确认显存归零、全部 8 卡 CUDA 分配/同步通过后才重新启动，未重置驱动。
+
 应用侧 tensor 绑定支持 BF16 的 Qwen3.5-35B-A3B routed experts：H=2048、I=512、
 无 bias 的 SwiGLU、ETP=1。它需要 PyTorch、已安装的 Megatron Core/Bridge 与 SGLang
 环境，以及 AReaL 侧的接入改动。这是一个显式构建的开发适配层，只执行 `pip install .`
