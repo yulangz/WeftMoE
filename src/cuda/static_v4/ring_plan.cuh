@@ -114,6 +114,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
+  // With one capacity window, CTA 0 owns both source counting and destination
+  // geometry. Keep their intermediate publications CTA-local until other CTAs
+  // need the finished prefix. Use capacity, not this rank's actual token count:
+  // unequal peer lengths must never select different planning dependencies.
+  const bool single_window = !Network && !Training &&
+      p.shape.windows(a.max_tokens_per_rank) == 1U;
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     r.source_header->epoch = {p.tokens, r.state->source_base};
     r.source_header->error = 0U;
@@ -121,7 +127,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     if (a.runtime_epoch)
       ++*a.runtime_epoch;
   }
-  grid_sync(a);
+  if (single_window) {
+    if (blockIdx.x == 0U)
+      collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+  } else {
+    grid_sync(a);
+  }
   const auto tid = threadIdx.x;
   const auto worker = std::uint64_t(blockIdx.x) * Threads + tid;
   const auto workers = std::uint64_t(gridDim.x) * Threads;
@@ -211,7 +222,10 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     network_barrier<0U, Threads>(
         a, static_cast<unsigned>(min(chunks, std::uint64_t(a.static_network.contexts))));
   } else {
-    rank_barrier<0U, Threads>(a);
+    if (single_window)
+      rank_barrier<0U, Threads, false>(a);
+    else
+      rank_barrier<0U, Threads>(a);
   }
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanExchangeReady,
                              Kernel, 0U, 0U, 0U);
@@ -242,9 +256,15 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           error;
     }
   }
-  grid_sync<0U, Threads>(a);
+  if (single_window) {
+    if (blockIdx.x == 0U)
+      collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+  } else {
+    grid_sync<0U, Threads>(a);
+  }
 
-  for (auto w = std::uint64_t(blockIdx.x); w < r.state->windows;
+  for (auto w = std::uint64_t(blockIdx.x);
+       (!single_window || blockIdx.x == 0U) && w < r.state->windows;
        w += gridDim.x) {
     const auto first = p.shape.source_begin(w);
     const auto local_window = w / p.shape.groups();
@@ -279,7 +299,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     static_forward::build_window_counts<Threads, 0U, kCollectiveScopeBarrier>(
         geometry);
   }
-  grid_sync<0U, Threads>(a);
+  if (!single_window)
+    grid_sync<0U, Threads>(a);
   if (blockIdx.x == 0U && tid == 0U) {
     std::uint64_t blocks = 0U, rows = 0U;
     for (std::uint64_t w = 0; w < r.state->windows; ++w) {

@@ -10,6 +10,32 @@ __device__ __forceinline__ void source_plan_sync() {
   asm volatile("bar.sync %0, %1;" ::"n"(Barrier), "n"(Threads) : "memory");
 }
 
+// One warp publishes an exclusive directory and turns histogram entries into
+// reservation cursors. Carry across warp-sized chunks without extra scratch.
+__device__ __forceinline__ void
+prefix_source_counts(unsigned *counts, unsigned size, std::uint64_t *prefix) {
+  const auto lane = threadIdx.x % 32U;
+  std::uint64_t carry = 0U;
+  for (unsigned base = 0U; base < size; base += 32U) {
+    const auto index = base + lane;
+    const std::uint64_t count = index < size ? counts[index] : 0U;
+    auto sum = count;
+#pragma unroll
+    for (unsigned delta = 1U; delta < 32U; delta *= 2U) {
+      const auto previous = __shfl_up_sync(0xffffffffU, sum, delta);
+      if (lane >= delta)
+        sum += previous;
+    }
+    if (index < size) {
+      prefix[index] = carry + sum - count;
+      counts[index] = static_cast<unsigned>(carry + sum - count);
+    }
+    carry += __shfl_sync(0xffffffffU, sum, 31U);
+  }
+  if (lane == 0U)
+    prefix[size] = carry;
+}
+
 // Called by a fixed CTA/control group for each of its source token windows.
 // The default freezes atomic reservation order. The canonical specialization
 // reuses Notify's stable expert/source ordinals: a contiguous token window
@@ -84,23 +110,9 @@ __device__ void build_source_window(const SourcePlanView &a,
   }
   source_plan_sync<Threads, Barrier>();
 
-  if (tid == 0U) {
-    std::uint64_t prefix = 0U;
-    for (unsigned expert = 0; expert < a.experts; ++expert) {
-      expert_prefix[expert] = prefix;
-      const auto count = scratch[expert];
-      scratch[expert] = static_cast<unsigned>(prefix);
-      prefix += count;
-    }
-    expert_prefix[a.experts] = prefix;
-    prefix = 0U;
-    for (unsigned node = 0; node < a.nodes; ++node) {
-      node_prefix[node] = prefix;
-      const auto count = scratch[a.experts + node];
-      scratch[a.experts + node] = static_cast<unsigned>(prefix);
-      prefix += count;
-    }
-    node_prefix[a.nodes] = prefix;
+  if (tid < 32U) {
+    prefix_source_counts(scratch, a.experts, expert_prefix);
+    prefix_source_counts(scratch + a.experts, a.nodes, node_prefix);
   }
   source_plan_sync<Threads, Barrier>();
 

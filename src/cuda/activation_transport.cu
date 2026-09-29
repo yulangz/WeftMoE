@@ -4752,6 +4752,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       checked_mul(state->config.max_tokens_per_rank,
                   state->config.max_top_k,
                   "single-node source route capacity");
+  args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   args.source_input_offset = layout.input;
   args.fused_source_gates_offset = layout.fused_source_gates;
   args.input = activation.pointer;
@@ -4826,7 +4827,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.node = gin_backend->node;
     args.local_world_size = gin_backend->local_world_size;
     args.gin_context_count = gin_backend->gin_context_count;
-    args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   }
   args.canonical_rows_offset = layout.canonical_rows;
   if (layout.static_ring.depth) {

@@ -5,8 +5,9 @@
 
 ## 当前已采用版本（2026-09-29更新验收范围）
 
-生产里程碑为`33d99a5`（GA + FZ），后续候选未计入下面数据。Ring仍显式启用，
-不改变默认full-arena/V3训练回退。以下是该版本完整验收后的正式graph矩阵：
+核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
+planner优化。下面仍是GA+FZ冻结数据，不混入后续测量。Ring仍显式启用，
+不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
 EP8是单机8卡，EP16是双机各8卡；显存时钟仅观测，没有锁定。
 
@@ -29,6 +30,8 @@ B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益代替
 的graph口径下，GA+FZ ring512/D8的T1/T64约103.0/137.3us，MegaMoE约53.1/
 63.5us；GA+FZ已有非ring decode为60.7/76.5us，仍慢14%/21%。独立复测一致，
 尚不满足用户提出的短文“接近或领先”收尾条件，详见文末同名对照节。
+随后GR/GS将ring短档降至97.18/130.69us；同轮Mega含copy为53.18/63.37us，
+结论不变。两步优化的独立收益、容量适用范围和回归门禁见文末GR/GS节。
 
 ## 冻结基线
 
@@ -6245,3 +6248,96 @@ torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_megamoe_decode.py \
 
 完整环境、两轮原始samples/hash/clock和脚本保留于
 `build/static_v4_megamoe_decode_20260929/`；日志 `ep8_t{1,64}{,_repeat}.log`。
+
+### GR/GS：单窗口 planner 同步与 warp 前缀扫描（2026-09-29，已采用）
+
+短文差距不是多次CUDA launch造成的：native inference graph在8个rank上均
+只有一个kernel node，route规划已经融合在main内。GA+FZ的最后一次replay
+route-exchange span约37/47us（T1/T64）；这些device span不是独立阶段的
+p50，不能与其它span相加冒充总延迟分解。
+
+GR只在**单机inference、公共容量至多一个window**时启用：CTA0独占source
+计数和destination计数/前缀，因此reset和header发布用CTA join，省去rank
+barrier的release-grid及counts到prefix的grid join，共减少4次grid join。
+最终prefix仍广播给整个grid，再并行构造各expert的reverse metadata并join。
+source发布前仍完成所有X staging；跨rank acquire、slot admission/credit、
+generation和终止rank barrier不变。不按本rank实际T推断远端T，不为此新增
+分配或运行时参数；host将已有max_tokens_per_rank字段也绑定到本地入口。
+容量大于一个window时，即使实际只传1/64 token也不走GR；不能宣称任意大
+prefill pool里的decode都获得同样收益。
+
+GS在GR上将source expert/node前缀的单线程循环改为warp exclusive scan，
+每32项一组、uint64 carry，复用原histogram/reservation scratch与CTA barrier。
+它适用于全部source window，包括network/training；未改变路由计数、canonical
+tape顺序、packet fanout、权重布局或GEMM参数，没有新增永久测试。
+
+两次独立相邻native正式对照，1620MHz、B512/D8、10/20/batch20，rank-max
+p50/us；计时节点没有CPU构建或其它GPU任务。每一对内32个output hash和pool
+bytes一致，第二轮GR也重复了第一轮短文收益：
+
+|T/rank|第一轮 GA+FZ|第一轮 GR|第二轮 GR|第二轮 GR+GS|
+|---:|---:|---:|---:|---:|
+|1|101.288|97.035|96.952|95.715|
+|64|135.104|130.512|130.494|129.568|
+|8192|1253.330|1251.010|1251.640|1247.270|
+|20480|2941.740|2951.660|2944.480|2946.360|
+
+GR的T1/T64收益为4.20%/3.40%，GS在GR上再快1.28%/0.71%。长档没有超过
+0.4%的稳定改善或回退证据，不据此宣称新的prefill加速。
+按T64→T1、每档GS→GR反向复测，GR为96.960/130.478us，GS为95.637/129.579us
+（这里按T1/T64列出），GS分别快1.36%/0.69%；16个hash与pool一致。
+
+沿用上节同输入、同进程、交错顺序的MegaMoE应用graph对照，括号为独立进程
+按相反T顺序的复测：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GR+GS ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.408（49.234）|53.630（53.178）|97.265（97.178）|61.447（61.006）|
+|64|57.590（57.486）|63.357（63.368）|130.822（130.690）|76.726（77.110）|
+
+两轮2560组SM前后读数全部1620MHz；测量节点没有并发GPU任务/CPU构建，首轮
+另一节点独立跑正确性回归，复测期间两节点都没有其它GPU任务。所有reference
+检查通过，四个case各自的8rank输出SHA256跨两轮及上节GA+FZ复测均一致。
+按复测值，ring仍慢约83%/106%，不能宣布短文接近MegaMoE，
+也没有把非ring路径替换为ring结果或新增自动切换。
+
+当前门禁：已有host18/18；GPU planner 37 source/packet + 6 destination用例
+及其racecheck零报告；native EP8/T512、EP16/T64/T2048共160个梯度hash与GA+FZ
+逐项一致且repeat_equal=1；Torch EP8/EP16全四规模及edges共240/480条PASS，
+含混合64/8192、不等长/空source、重复route、20K热点不丢token、graph变更路由、
+共享workspace和权重刷新。另以容量257/B512覆盖GR分支，rank0/7 memcheck
+各0 errors、Forward racecheck各0 hazards/0 errors/0 warnings；这不是完整
+Backward racecheck关闭声明。初次EP16应用启动因两端NCCL_IB_DISABLE不一致，
+在TensorRuntime构造的all_gather_object失败，尚未执行Weft kernel；统一为0后
+重跑通过，失败日志仍保留。
+
+EP16按20K→8K→64→1、每档先GS后GA+FZ正式复核，同为1620MHz、10/20/batch20：
+
+|T/rank|GA+FZ/us|GR+GS/us|
+|---:|---:|---:|
+|1|235.346|234.672|
+|64|286.898|286.046|
+|8192|2890.720|2887.210|
+|20480|6864.210|6872.660|
+
+每档16个output hash、pool/registered bytes一致，前后双机时钟均1620MHz。
+四档差异分别为快0.29%/0.30%/0.12%、慢0.12%，没有可据以宣称的多机性能提升，
+也未见明显回退。GA+FZ已验收的长文优势不因这组小幅波动改变。
+
+八种main保持REG168/SHARED2048/LOCAL0/CONST3264；GS local training prefill
+STACK72→64，其余与GA+FZ相同。不以资源相同声称完整SASS相同。
+冻结目录`build/static_v4_single_window_gr/`与`build/static_v4_source_scan_gs/`：
+GR native SHA256 `2d0028bdb6cefd6e5970765e5d872f389aacc1024a81cab628f09fa1a2d22ca8`；
+GS native `bc15fbfd9091d24268de44aab7c59a126da9e0d2c82156fda1abdfe1aa2ddfaf`；
+GS library `ff9fc73de3379ef13954e34305c1bd86095ddacd063937602c83d8a39bd3d0e0`，
+extension与GA+FZ的`725bf863...825c3`完全相同。构建后仅整理了scan helper声明
+的换行，不含功能变更。脚本、patch、原始samples/clock/hash和sanitizer日志均
+在对应目录；MegaMoE只测了单机EP8。
+
+后续诊断：同一native夹具的非ring T1/T64 graph为63.814/75.773us，最后一次
+route span约10.5–11.3/12.9–14.3us；GS ring则约31.2–31.8/39.6–41.4us。
+它只定位了规划之外仍有差距，不把span差当作可相加的精确归因。源码可见，
+非ring把route ID和counts推送到destination，而ring仍分阶段读取peer header、
+prefix、route_order和gate；另外非ring三条comm warp按单row并行pull，ring
+一条warp按8row batch pull。值得独立消融短档metadata访问和copy粒度，但
+本次没有把这些尚未实验的方向写成已实现优化。
