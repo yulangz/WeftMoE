@@ -25,6 +25,11 @@ B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益代替
 [训练记录](static_forward_v4_training_record.md)。后续各候选按时间顺序追加；
 “数值通过”“纯GEMM通过”和“已采用”是不同状态。
 
+09-29新增单机MegaMoE短文对照：同进程同输入、1620MHz、包含必需input copies
+的graph口径下，GA+FZ ring512/D8的T1/T64约103.0/137.3us，MegaMoE约53.1/
+63.5us；GA+FZ已有非ring decode为60.7/76.5us，仍慢14%/21%。独立复测一致，
+尚不满足用户提出的短文“接近或领先”收尾条件，详见文末同名对照节。
+
 ## 冻结基线
 
 设计基线 commit：`f2acb2c`。以下文件保留，不覆盖：
@@ -6180,3 +6185,63 @@ GP长档仍明显退化，不能靠隔离GEMM恢复codec收益。GO长档仅约0
 源码和已有host测试扩展全部撤回，生产仍为GA+FZ；候选patch/helper和二进制
 已冻结。GQ modulo-exponent只准备了build目录中的独立源码，未编译/运行，
 无性能或正确性结论。日志 `comm_codec_{gafz,go,gp}_ep16_t*_formal.log`。
+
+### GA+FZ 单机 decode 与 MegaMoE 对照（2026-09-29）
+
+用户已确认GA+FZ的8K/20K相对V3收益符合预期，要求核实T1/T64；并明确
+MegaMoE不用测双机。因此本轮仅单机EP8，没有修改或替换GA+FZ实现。
+
+口径：同一8进程内共享X、routes、gates和W，H2048/I512/E64/K4/BF16，
+无activation clamp。route几何与native相同：`(token*17+rank*31+slot*53)%64`；
+权重/输入使用固定种子的小幅随机值，gates归一化。它不是旧native的数值夹具，
+不能把hash或应用graph结果与旧native结果冒充同一个数据集。
+
+两边权重转换/JIT/内存准备均在计时外，Weft保留完整Notify+Forward child graph；
+MegaMoE分别捕获kernel-only及`X/routes/gates三份copy+kernel`。公平列使用后者
+直接实测，**不是把两份独立p50相加**。routes提前准备为各API要求的int32/int64，
+不计跨API转换。每个sample取8rank最大值，10warmup/20samples/batch20，每轮
+反转四个case顺序；第二轮独立进程按T64→T1复测。没有并发GPU任务或CPU构建，
+JIT仅发生在准备阶段；两轮2560组SM前后时钟采样全部1620MHz，显存时钟不锁定。
+
+GA+FZ使用已验收的冻结extension，源commit `33d99a5`。另行报告已有非ring
+full-arena decode（`WEFTMOE_STATIC_RING_TOKENS=0`），不是将它冒充ring性能；
+短档按全路由最坏情况加M128 padding预留容量。本轮没有新增自动切换策略。
+长上下文仍依赖ring，非ring短档结果不能替代长上下文容量承诺。
+
+参考仓库DeepGEMM-bk的in-tree扩展与当前Torch2.9.1 ABI不兼容，直接import失败；
+没有改动其已有的两个dirty数值语义patch。采用已有兼容冻结package
+`build/deepgemm_sglang_torch291/lib.linux-x86_64-cpython-312`，主SM90 kernel
+SHA256 `fb636714d7e7703b9a480fa7a9b57dec29b79d833c9b55dd3140a7c859082a77`
+与该仓库HEAD `1fdc170`完全一致，不含Weft数值patch。扩展SHA256
+`100a06dd12331d178a8c8590da4703008598dcb9625bf7769fa69863029394ed`。
+Mega使用默认N128等配置、132SM及fast_math=True；这不是Weft严格数值合同。
+双方都通过既有BF16参考检查，最大绝对误差不超过3.815e-6；Weft ring/arena
+逐bit一致，T1两实现也逐bit一致，T64有少量不同。各自输出hash跨两轮一致。
+
+rank-max graph p50/us（括号内为独立复测）：
+
+|T/rank|MegaMoE kernel-only|MegaMoE 含3份copy|GA+FZ ring512/D8|GA+FZ 非ring|
+|---:|---:|---:|---:|---:|
+|1|49.340（49.286）|53.142（53.086）|102.998（102.982）|60.775（60.704）|
+|64|57.419（57.644）|63.318（63.450）|137.134（137.257）|76.342（76.513）|
+
+结论：按公平含copy口径，ring分别慢约94%/116%；已有非ring短档仍慢14.35%/
+20.59%，绝对差7.62/13.06us。不能宣布“接近或领先”，也不能沿用旧文档中的
+74.1us历史相加口径来关闭本轮条件。ring与非ring的直接A/B揭示了短档路径差距，
+但尚没有分项profile将它全部归因于planner、barrier或GEMM；本轮是对照测量，
+未实施新的decode优化。
+
+复现工具：[torchrun_megamoe_decode.py](../benchmarks/torchrun_megamoe_decode.py)，
+示例（`ROOT`指仓库根目录；需先锁定8卡SM至1620MHz）：
+
+```sh
+PYTHONPATH="$ROOT" \
+WEFTMOE_TENSOR_EXTENSION="$ROOT/build/static_v4_checkpoint_credit_gafz/_runtime.cpython-312-x86_64-linux-gnu.so" \
+DG_JIT_CACHE_DIR="$ROOT/build/static_v4_megamoe_decode_20260929/jit" \
+torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_megamoe_decode.py \
+  --tokens 64 \
+  --deepgemm-package "$ROOT/build/deepgemm_sglang_torch291/lib.linux-x86_64-cpython-312"
+```
+
+完整环境、两轮原始samples/hash/clock和脚本保留于
+`build/static_v4_megamoe_decode_20260929/`；日志 `ep8_t{1,64}{,_repeat}.log`。
