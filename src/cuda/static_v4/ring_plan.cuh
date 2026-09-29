@@ -125,6 +125,66 @@ __device__ __forceinline__ void publish_single_window(
   }
 }
 
+__device__ __forceinline__ void *local_row_output(const ForwardKernelArgs &a,
+                                                   std::uint64_t window,
+                                                   unsigned source,
+                                                   std::uint64_t route) {
+  const auto &address = window_source(a, window, source);
+  const auto &shape = a.ring.source.shape;
+  return peer_at<transport::BFloat16>(a.peer_bases[source],
+                                       a.contribution_offset) +
+         (address.row_base + route - shape.token_begin(window) * shape.top_k) *
+             a.hidden;
+}
+
+__device__ __forceinline__ void build_blocks(const ForwardKernelArgs &a,
+                                              std::uint64_t window,
+                                              unsigned expert, unsigned tid,
+                                              unsigned threads) {
+  const auto &r = a.ring;
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  const auto *prefix = r.expert_blocks + window * (owned + 1U);
+  for (auto b = std::uint64_t(tid); b < prefix[expert + 1U] - prefix[expert];
+       b += threads) {
+    const auto block = r.window_prefix[window] + prefix[expert] + b;
+    const auto seq = r.state->block_base + block;
+    r.blocks[block] = {
+        {expert, static_cast<unsigned>(b * r.source.shape.tile_m),
+         static_forward::block_rows(r.expert_rows[window * owned + expert], b,
+                                    r.source.shape.tile_m)},
+        static_cast<unsigned>(window), static_cast<unsigned>(seq % r.depth),
+        seq / r.depth + 1U};
+  }
+}
+
+// CTA 0 still owns the count table. Four lanes stripe each source/expert
+// list, keeping sparse lists from consuming an entire warp or separate CTA.
+template <unsigned Threads>
+__device__ __forceinline__ void build_small_window_rows(
+    const ForwardKernelArgs &a, const unsigned *counts, unsigned tid) {
+  constexpr unsigned Group = 4U;
+  const auto &r = a.ring;
+  const auto &shape = r.source.shape;
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  const static_forward::WindowGeometryView geometry{
+      shape, 0U, owned, counts, r.expert_rows, r.expert_blocks, nullptr};
+  for (unsigned pair = tid / Group; pair < owned * a.world;
+       pair += Threads / Group) {
+    const auto expert = pair / a.world;
+    const auto source = pair % a.world;
+    const auto count = counts[std::uint64_t(expert) * shape.sources + source];
+    const auto *routes = static_v4::source_routes(a, a.rank, source, expert);
+    const auto *gates = source_metadata(a, source, r.source_gates);
+    for (unsigned ordinal = tid % Group; ordinal < count; ordinal += Group) {
+      const auto row = geometry.expert_row(expert, source, ordinal);
+      const auto route = routes[ordinal];
+      r.rows[r.expert_blocks[expert] * shape.tile_m + row] = {
+          route, source, gates[route], route / shape.top_k,
+          local_row_output(a, 0U, source, route)};
+    }
+  }
+}
+
 template <bool Network, bool Training = false>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
@@ -347,9 +407,24 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     status->dispatch_blocks_done = status->reduced_tokens =
         status->fc1_start_clock = status->relay_blocks_done = ~0ULL;
   }
+  if (single_window && blockIdx.x == 0U) {
+    collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+    if (r.state->windows == 1U && r.state->rows <= 2U * gridDim.x) {
+      for (unsigned expert = tid; expert < owned; expert += Threads)
+        build_blocks(a, 0U, expert, 0U, 1U);
+      build_small_window_rows<Threads>(a, counts, tid);
+    }
+  }
   grid_sync<0U, Threads>(a);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanGeometryReady,
                              Kernel, 0U, 0U, 0U);
+  if (single_window && r.state->windows == 1U &&
+      r.state->rows <= 2U * gridDim.x) {
+    // The existing geometry join also publishes the complete reverse table.
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanReady,
+                               Kernel, 0U, 0U, 0U);
+    return;
+  }
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
        task += gridDim.x) {
     const auto w = task / owned;
@@ -374,18 +449,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         r.expert_rows + w * owned + expert,
         r.expert_blocks + w * (owned + 1U) + expert,
         nullptr};
-    for (auto b = std::uint64_t(tid); b < prefix[expert + 1U] - prefix[expert];
-         b += Threads) {
-      const auto block = r.window_prefix[w] + prefix[expert] + b;
-      const auto seq = r.state->block_base + block;
-      r.blocks[block] = {
-          {expert, static_cast<unsigned>(b * p.shape.tile_m),
-           static_forward::block_rows(r.expert_rows[w * owned + expert], b,
-                                      p.shape.tile_m)},
-          static_cast<unsigned>(w),
-          static_cast<unsigned>(seq % r.depth),
-          seq / r.depth + 1U};
-    }
+    build_blocks(a, w, expert, tid, Threads);
     if constexpr (Network)
       collective_scope_sync<Threads, kCollectiveScopeBarrier>();
     // Freeze reverse identity and gate before payload starts. Each warp reads
@@ -415,10 +479,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                   output_row * a.hidden * sizeof(transport::BFloat16),
                 source % a.local_world_size);
           } else {
-            const auto route_begin = p.shape.token_begin(w) * p.shape.top_k;
-            output = peer_at<transport::BFloat16>(a.peer_bases[source],
-                                                  a.contribution_offset) +
-                     (address.row_base + route - route_begin) * a.hidden;
+            output = local_row_output(a, w, source, route);
           }
         } else {
           const auto node_expert = a.node * a.local_world_size * owned;

@@ -100,6 +100,9 @@ GV再复用已有destination表发布单容量窗口的source counts/route IDs�
 不改变有界payload及逐slot协议，也尚未满足MegaMoE短文收尾条件。
 GW复用source的uint64 warp scan计算destination Mblock前缀，消除thread0逐expert
 串行除法/累加；保留原CTA同步与运行时tile_m，短档再快约1%，详见ring记录。
+GY再将少量工作、单容量窗口的reverse metadata并入CTA0几何规划，同一个
+grid join发布blocks和rows，短档正反向约再快3.8%–4.0%。pull及逐slot合同不变；
+把reverse metadata延后到pull的GX候选反而退化，已撤回，未混入当前实现。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -462,6 +465,18 @@ route列表只读取本代count内的部分，故不需要新增清理阶段。d
 没有调用full-arena的容量拒绝逻辑；单窗口热点超过max_rows仍由ring完成。
 这是metadata发布方向优化，不是把X从pull改成push；大容量、多机及training
 保留原目录访问方式。跨调用terminal仍保护这些invocation级目录。
+
+GY对上述单容量窗口进一步限定：实际windows=1且本destination有效行数
+不超过`2 * gridDim.x`。CTA0保留刚生成的source/expert计数表，四个lane静态
+分担一个source/expert列表的ordinal，复用`WindowGeometryView::expert_row`
+生成原round-robin物理行号。block descriptor与local Return地址计算与通用
+planner复用；完整blocks/反向rows经原geometry grid join一起发布，省去单独
+reverse pass和其grid join。没有新增分配、计数器、工作队列或额外scratch。
+这不是GX的延后生成方案：**PlanReady仍表示所有反向rows已就绪**，pull不做
+source ordinal解码，FC1/FC2/Return的读取合同不变。空/错误窗口、较多行、
+大pool中的短调用、多窗口、training和network仍使用原分布式reverse pass。
+不同destination可选择不同本地规划分支，但均在同一个source-ready rank
+barrier之后，未删除或分叉跨rank同步。
 
 GU仅在单机inference的实际全局窗口数为1、该destination有效行数不超过
 `2 * gridDim.x`时选择Batch1，判定不依赖本rank的输入T或pool最大容量。

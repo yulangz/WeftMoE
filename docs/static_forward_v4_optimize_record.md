@@ -5,6 +5,8 @@
 后续的 prefill 双入口、FC1 epilogue、失败候选及 Return 流水分析，见
 [`static_forward_v4_prefill_record.md`](static_forward_v4_prefill_record.md)。
 本篇以下的冻结 V3/V4 对照保持原样，不混入后续构建。
+后续有界ring、GA+FZ及2026-09-29单机MegaMoE短档对照和优化，见
+[`static_forward_v4_ring_record.md`](static_forward_v4_ring_record.md)。
 
 状态：单机与多机 inference-only 路径已完成主要重构；training 仍使用 V3。
 多机实测见 [`static_forward_v4_multinode_record.md`](static_forward_v4_multinode_record.md)。

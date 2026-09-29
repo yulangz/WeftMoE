@@ -6,7 +6,8 @@
 ## 当前已采用版本（2026-09-29更新验收范围）
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
-planner、GU短文pull分工及GV单窗口metadata发布优化。下面仍是GA+FZ冻结数据，
+planner、GU短文pull分工、GV metadata发布、GW destination scan及GY紧凑reverse
+规划优化。GX延后到pull的候选已撤回。下面仍是GA+FZ冻结数据，
 不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
@@ -37,6 +38,9 @@ GU随后将同输入ring短档降至93.68/115.82us，Mega含copy为53.27/63.24us
 仍慢约76%/83%；未满足收尾条件。GU收益、失败的GT消融及门禁见文末。
 GV相邻对照再改善约1%–1.7%；同输入复测ring为92.71/114.48us，Mega含copy
 为53.89/63.29us，仍慢约72%/81%。未关闭短文目标，详见文末GV节。
+GW再改善约1%，GY合并紧凑reverse规划再改善约4%；最新GY同输入复测ring为
+87.78/108.83us，Mega含copy为53.19/63.38us，仍慢约65%/72%。没有用非ring
+替代ring结果，未满足收尾条件。详细门禁、原始日志及失败的GX见文末。
 
 ## 冻结基线
 
@@ -6590,3 +6594,105 @@ native SHA256 `8dff711832dd5475a35d6b0083c8888fab89dc800fee8d26014a77a9c678eeea`
 library `9537ae184df234dc04164bc529bf4bd1e251d36523b23efdb0f0ebb8eea28df6`；
 extension仍`725bf863...825c3`。下一项独立消融为小窗口reverse metadata并入
 pull；本次未实施，不提前宣称收益。
+
+### GX：小窗口 reverse metadata 延后到 pull（2026-09-29，不采用）
+
+基于GW（`92a6c42`），限定单机inference、单容量窗口、实际windows=1且
+destination rows≤2×gridDim。CTA0先发布block descriptors，跳过独立reverse
+pass及其grid join；pull整warp复用source-row decoder，lane0在原X full前写
+invocation级RingRow。未改X/S/C admission、source reservation和逐slot credit。
+这是一次候选实验，**代码已撤回**，当前实现仍提前生成全部reverse metadata。
+
+1620MHz、10/20/batch20 native EP8，rank-max p50/us：
+
+|T/rank|正向GW→GX|反向GX→GW（表内仍按GW→GX）|
+|---:|---:|---:|
+|1|88.757→89.245|88.933→89.157|
+|64|112.446→114.304|112.990→114.266|
+
+两轮32个output hash、pool、graph结构和协议一致，前后时钟均1620MHz；
+无并发CPU构建/其它GPU任务。最后一次replay的route span约缩短4–6us，但
+端到端反而慢约0.3%–1.7%，不能把阶段span缩短等同于性能收益。新增在线
+解码、分散metadata访问及生成代码变化未做进一步分离归因。八种main中本地
+inference decode/prefill的stack分别88→104/72→88，其余六种资源一致，
+REG/SHARED/LOCAL不变。因两种顺序均退化，没有构建应用库或运行采用门禁，
+不声称完整应用/数值/sanitizer验证。也不继续为GX测MegaMoE或长文。
+
+目录`build/static_v4_decode_reverse_gx/`保存proposal、已撤回patch、原始日志
+及构建/短档正反向脚本；native SHA256
+`84ff82a7e00a90b70664c462c2265ef83bec77bdea4b60b04fd12f05707ab9d5`。
+后续独立实验改为在CTA0合并稀疏reverse规划，保持pull和原metadata就绪合同。
+
+### GY：小窗口紧凑 reverse 规划（2026-09-29，已采用）
+
+重新基于GW（`92a6c42`），不包含GX代码。仅改`ring_plan.cuh`：单机inference、
+单容量窗口、实际windows=1且destination rows≤2×gridDim时，CTA0利用已有的
+shared counts，四个lane分担一个source/expert路由列表，调用原expert_row生成
+round-robin物理行号。blocks和全部reverse rows由原geometry grid join一起
+发布，跳过单独reverse pass及其grid join。block初始化与local Return地址计算
+抽为共用helper，其余模式保留原分布式规划。未新增buffer、counter、runtime
+开关或永久测试；pull代码与GW完全相同，PlanReady仍保证所有反向身份就绪。
+
+条件基于公共容量及本destination几何，不把本rank的T当作全局长度；空/error
+窗口、大pool短调用、较多行/热点destination、多窗口、training和network不走
+紧凑分支。不同destination的选择只影响source-ready rank barrier之后的本地
+grid工作，不改变跨rank同步序列、X/S/C admission和source reservation。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮相邻
+GW→GY的T1/T64为88.826→85.581、112.440→108.090us；反向T64→T1、每档
+GY→GW，按GW→GY列出为88.910→85.506、112.578→108.054us，分别快3.83%/
+4.02%。两轮32个output hash、pool、graph结构及协议一致，时钟前后均1620。
+反向测试期间仅另一节点做CPU library构建，正式计时节点无构建/其它GPU任务。
+
+全部构建结束后的EP8完整正式矩阵，同口径、相邻GW→GY：
+
+|T/rank|GW/us|GY/us|
+|---:|---:|---:|
+|1|88.976|85.771|
+|64|112.515|107.944|
+|8192|1246.950|1241.820|
+|20480|2926.640|2926.610|
+
+32个output hash、pool及graph/协议完全一致，全部时钟1620MHz。长档不触发
+新分支，不把不足0.5%的差异记为稳定收益；未改GA+FZ计算或网络配置。
+
+同输入MegaMoE应用graph，首轮T64→T1，括号为独立进程T1→T64复测，四case
+在进程内交错，同为10/20/batch20、rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GY ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.315（49.275）|53.196（53.194）|87.779（87.778）|60.840（60.682）|
+|64|57.412（57.522）|63.379（63.385）|108.894（108.834）|76.642（76.394）|
+
+reference通过，四case各8rank输出SHA256与GW复测逐项一致；2560组前后时钟
+读数全部1620MHz，显存时钟未锁。copy与Mega kernel在同一graph内计时。
+公平含copy口径仍慢约65%/72%，**短文尚不能收尾**。首轮只有另一节点跑独立
+正确性，复测两节点均无其它GPU任务，所有Mega测量无CPU构建。未测Mega双机。
+
+门禁：host18/18；native EP8/T512、EP16/T64/T2048共160个梯度hash、
+repeat_equal及pool完全等于GW。Torch EP8全四档240条PASS、单容量
+T1/T64/T512+edges 200条PASS、tiny B16/D1/K8 152条PASS；包含不等长/空source、
+重复route、graph路由变化、权重更新、workspace复用、多窗口和热点无丢失。
+短容量专项rank0/7 memcheck各0 errors、Forward racecheck各0 hazards，
+各200条PASS。EP16全四档及edges 480条PASS，仍不声明完整Backward
+racecheck关闭。八种main的REG/SHARED/LOCAL/CONST/STACK均与GW一致。
+
+EP16正式回归按20K→8K→64→1、每档GY→GW，同口径1620MHz：
+
+|T/rank|GW/us|GY/us|
+|---:|---:|---:|
+|1|233.651|233.894|
+|64|286.240|286.014|
+|8192|2877.780|2884.190|
+|20480|6841.930|6839.710|
+
+64个output hash、pool/registered bytes及graph/协议一致，双机前后时钟全部
+1620MHz，变化不足0.3%，不报告新增多机收益。上述正式计时节点无其它GPU
+任务/CPU构建。数值和性能复核脚本为本次目录中的`verify_results.py`。
+
+冻结目录`build/static_v4_compact_reverse_gy/`包含proposal、patch、构建、全部
+samples/hash/clock、sanitizer及复现脚本；源码与冻结patch一致。
+native SHA256 `95306ad0581c7b8f0091bf86eac304b30398ab091df4aca8517042c107f23c5e`；
+library `36ac7963eaf5b31c53872dbfb848a66a7f8c66fdd2c39da085075703f443ea81`；
+extension仍`725bf863...825c3`。下一步继续单独核查短档planner/admission工作，
+不重开已验收的长文目标，不提前计入任何未实现方向的收益。
