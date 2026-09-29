@@ -75,9 +75,11 @@ def main():
         return graph, captured
 
     graph, captured = capture()
-    for _ in range(3):
+    for iteration in range(3):
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
+        if iteration == 2:
+            ids[-1, -1] = -1  # SGLang's masked route must stage as zero gate.
         gates.mul_(0.95)
         eager = layer(x, topk)
         graph.replay()
@@ -88,6 +90,9 @@ def main():
     assert adapter._runtime is None
     assert adapter._decode_runtime is None
     assert not adapter._graph_inputs
+    # Baseline parity below uses valid routes; the masked-ID check above uses
+    # the adapter's existing eager sanitization as its reference.
+    ids.add_(1).remainder_(experts)
     layer.w13_weight.mul_(0.75)
     layer.w2_weight.mul_(0.875)
     expected = baseline(x, topk)

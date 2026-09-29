@@ -4,7 +4,8 @@
 
 本轮基线为 HF（`7569ae0`），后续 HG 的 EP 通用化验收见
 [decode 记录第 6 节](static_forward_v4_decode_record.md)。下面的旧 RL 性能数字来自历史实现，不能用作
-当前 V4 的端到端结论；当前版本尚未完成新的 RL baseline 对照。
+当前 V4 的端到端结论；当前 HG 的新 RL 对照已完成双方各 3 次 update，
+确认 rollout 回退，正在优化，尚未完成 20 updates。
 
 本轮仅替换 SGLang rollout，Megatron actor 保持 baseline。使用
 `ops/AReaL/examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py` 和同目录的
@@ -90,7 +91,32 @@ WeftMoE 从 proxy ready 到首次暂停采样约 821 s，慢于 baseline 的约 
 |task reward|0.85938|0.84180|
 
 首轮 rollout 慢约 19.5%，当前没有端到端加速的证据。actor 实现相同，表中的
-训练耗时也不能解读为 WeftMoE 训练收益。两个 20-update 作业仍在运行。
+训练耗时也不能解读为 WeftMoE 训练收益。
+
+截至 12:11 UTC，双方各完成 3 次 update；去掉首步后的两步中位数如下：
+
+|指标|baseline|HG WeftMoE|
+|---|---:|---:|
+|rollout（s）|527.72|627.605（+18.93%）|
+|train（s）|182.935|169.745|
+|权重更新（s）|14.754|12.7355|
+|平均序列长度|9432.35|9338.25|
+|update 完成间隔（s）|732.20|834.4575（+13.96%）|
+
+这足以触发性能诊断，但不是最终 20-step 结果或收敛结论。WeftMoE 的序列略短，
+不能以生成长度解释慢约 19%。已验证非零学习率下的 AWEX 更新和图重建。
+HTTP 采样中的活跃 batch 中位数为 baseline 40、WeftMoE 42，没有超过 256 的样本，
+不支持“大 batch 进入通用 V4”是主要原因。该时点的 5 秒采样中，baseline
+5064 个 GPU 样本均为 1620 MHz；WeftMoE 5136 个样本有 2 个低于目标频率，未过滤。
+12:12 UTC 停止 WeftMoE 组（保留 3 个完整 update，丢弃第 4 个未完成 update），
+释放该节点做同机诊断；baseline 继续。原始日志、JSON 和 W&B 历史不覆盖。
+
+最小复现入口为 `benchmarks/torchrun_sglang_decode.py`：真实 SGLang BF16
+E256/K8/H2048/I512、复制输入 TP4/EP4、包含模型外层 TP all-reduce、随机 top-k，
+同机交替 CUDA Graph 回放取 rank-max。HG 在全局 T32/T64 的单层延迟分别是
+160.969/192.961 µs，baseline 为 105.789/150.416 µs。trace 确认存在适配层
+多节点输入整理/回填开销，且 native decode 本身也偏慢。优化必须分别消融，
+不能把单层结果直接当作端到端收益。
 
 用户随后提供 W&B 凭据；为避免重启正在运行的对照，用
 `benchmarks/publish_areal_logs.py` 将完整 console metric table 旁路同步至

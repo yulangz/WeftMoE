@@ -7,7 +7,9 @@ import functools
 
 import torch
 import torch.distributed as dist
+import triton
 
+from ._sglang_kernels import scatter_output, stage_inputs
 from .runtime import TensorRuntime
 
 _runtime = None
@@ -201,6 +203,7 @@ def install():
         if tokens == 0:
             return torch.empty_like(hidden_states)
         args = get_global_server_args()
+        capturing = get_is_capture_mode()
         rows_are_dp_sharded = _rows_are_dp_sharded and args.enable_dp_attention
         if _runtime is None:
             max_tokens = max(
@@ -226,7 +229,7 @@ def install():
             local_tokens = (tokens + world - 1) // world
             start = rank * local_tokens
             valid_tokens = max(0, min(local_tokens, tokens - start))
-            if valid_tokens == local_tokens:
+            if capturing or valid_tokens == local_tokens:
                 x = hidden_states[start : start + local_tokens]
             else:
                 x = hidden_states.new_zeros((local_tokens, hidden))
@@ -239,6 +242,23 @@ def install():
         k = topk_output.topk_ids.shape[-1]
         ids = topk_output.topk_ids[start : start + valid_tokens]
         weights = topk_output.topk_weights[start : start + valid_tokens]
+        if capturing:
+            # The child graph binds stable addresses. Fuse padding, invalid-ID
+            # sanitization and the three staging copies into one outer node.
+            if local_tokens not in _graph_inputs:
+                _graph_inputs[local_tokens] = (
+                    hidden_states.new_empty((local_tokens, hidden)),
+                    torch.empty((local_tokens, k), dtype=torch.int32, device=x.device),
+                    torch.empty((local_tokens, k), dtype=torch.float32, device=x.device),
+                )
+            x, routes, gates = _graph_inputs[local_tokens]
+            stage_inputs[(local_tokens,)](
+                hidden_states, topk_output.topk_ids, topk_output.topk_weights,
+                x, routes, gates, *hidden_states.stride(),
+                *topk_output.topk_ids.stride(), *topk_output.topk_weights.stride(),
+                start, valid_tokens, hidden, k,
+                triton.next_power_of_2(hidden), triton.next_power_of_2(k),
+            )
         # In the DP-sharded layout every row is a real SGLang row and the
         # standard top-k path already returns exactly the int32/float32,
         # contiguous tensors consumed by TensorRuntime.  Rebuilding them used
@@ -247,7 +267,7 @@ def install():
         # those kernels sat outside the warmed child graph.  Keep the padded
         # construction only for the replicated-input compatibility layout,
         # where this rank may own fewer than ``local_tokens`` real rows.
-        if (
+        elif (
             not sharded_rows
             and os.environ.get("WEFTMOE_SGLANG_FORCE_ROUTE_COPY") != "1"
             and valid_tokens == local_tokens
@@ -279,7 +299,7 @@ def install():
             layer.w13_weight,
             layer.w2_weight,
         )
-        if get_is_capture_mode():
+        if capturing:
             if _eager_pending:
                 _runtime.native.drain_eager_inference()
                 _eager_pending = False
@@ -291,17 +311,6 @@ def install():
                 if _decode_runtime is None:
                     _decode_runtime = _prepare_runtime(layer, group, k, 64)
                 runtime = _decode_runtime
-            # Warmup and outer capture allocate different intermediate tensors.
-            # Native child graphs bind addresses at warmup, so stage into one
-            # stable input set per bucket, shared by serialized layers. Copies
-            # become outer graph nodes; eager prefill consumes inputs directly.
-            key = local_tokens
-            if key not in _graph_inputs:
-                _graph_inputs[key] = tuple(torch.empty_like(t) for t in inputs[:3])
-            staged = _graph_inputs[key]
-            for target, source in zip(staged, inputs[:3]):
-                target.copy_(source)
-            inputs = (*staged, *inputs[3:])
             output = runtime.inference(layer.layer_id, *inputs)
         elif _SYNC_EAGER:
             output = _runtime.inference_eager(*inputs)
@@ -328,6 +337,12 @@ def install():
         # expert contributions. Contribute each routed row from its owner and
         # let that existing reduction reconstruct it, avoiding all-gather/divide.
         if not layer.reduce_results:
+            if capturing:
+                result = hidden_states.new_empty((tokens, hidden))
+                scatter_output[(triton.cdiv(tokens * hidden, 4096),)](
+                    output, result, start, valid_tokens, hidden, tokens * hidden, 4096,
+                )
+                return result
             result = hidden_states.new_zeros((tokens, hidden))
             result[start : start + valid_tokens].copy_(output[:valid_tokens])
             return result

@@ -239,3 +239,41 @@ SM 时钟为 1620 MHz。
 native SHA256：`88d10041e07f128a10e69f9a6b09de1dd2b970a3e4019dfbf4002b486601a572`。
 完整 SGLang 服务及 inference-only RL 对照继续记录在
 [AReaL 接入文档](areal_qwen35.md)，不把本节算子通过视为 RL 已完成。
+
+## 7. HH：SGLang rollout 回退诊断与优化（进行中）
+
+HG 的 RL 对照双方各完成 3 次 update 后，后两步 rollout 中位数慢 18.93%，
+见接入文档。实际活跃 batch 主要为全局 32–64，而旧 native 表是每 rank 1/64；
+E256/K8 的专家覆盖率也远高于最初对照 MegaMoE 的 E64/K4，不能沿用旧结论。
+
+### HH1：融合图内 staging 和结果回填
+
+保持 HG native 二进制不变，graph capture 路径把 X 分片/补齐、负 expert ID
+清洗、route/gate 转换与稳定地址 staging 合并为一个 Triton kernel；Qwen 的
+稀疏输出补零/回填合并为另一个。child graph 地址合同、外层 TP all-reduce、
+eager/prefill 路径不变。新 helper 位于 `weftmoe/_sglang_kernels.py`。
+
+`benchmarks/torchrun_sglang_decode.py` 测真实 SGLang EP4，E256/K8、随机 top-k，
+同输入、同机交替 outer graph，5 warmup/20 samples、每次 50 replay，rank-max p50。
+以下 T 是**全局复制 token 数**，单位 µs，非每 rank token 数：
+
+|T|SGLang baseline|HG 原适配层|HG + HH1 staging|
+|---:|---:|---:|---:|
+|1|29.828|—|66.138|
+|16|84.828|—|128.158|
+|32|106.518|160.969|146.748|
+|48|131.090|—|170.068|
+|64|150.023|192.961|178.628|
+|96|179.786|—|187.100|
+|128|185.618|—|191.627|
+|256|197.775|—|196.536|
+|512|211.939|—|373.559|
+
+baseline 列来自 HH1 同进程交替对照；HG 原适配层另一次同机运行的 baseline
+T32/T64 为 105.789/150.416。HH1 省约 14 µs/层，尚未解决 native 部分回退。
+T512 超过小池阈值，走通用 V4；当前 RL 的 HTTP 样本未达到此规模。
+HH1 全部计时的 NVML 样本均为 1620 MHz，没有并行编译或其他 GPU workload。
+
+上述 9 个 bucket 均通过 baseline 数值对照；另用现有 SGLang adapter 测试在
+EP4/T17 覆盖尾部补齐、masked route 与 eager 清洗一致、变更输入的图回放、
+权重更新后释放/重建，4 rank 通过。原始日志与 trace 在 `build/local_decode_hh/`。
