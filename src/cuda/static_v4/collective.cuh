@@ -56,8 +56,9 @@ __device__ __forceinline__ void rank_barrier(const ForwardKernelArgs &a) {
   }
 }
 
+template <unsigned MathThreads = forward_tuning::kMathWarpgroups * 128U>
 __device__ __forceinline__ void before_combine(const ForwardKernelArgs &a) {
-  constexpr auto kThreads = forward_tuning::kMathWarpgroups * 128U;
+  constexpr auto kThreads = MathThreads;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (blockIdx.x == 0U && threadIdx.x == 0U)
     status->before_combine_start_clock = device_globaltimer_ns();
@@ -108,13 +109,15 @@ clear_dispatch_counters(const ForwardKernelArgs &a) {
 
 // Do not let a fast rank recycle its slot while another rank still consumes
 // the preceding epoch's contributions or source staging.
+template <unsigned MathThreads = forward_tuning::kMathWarpgroups * 128U,
+          unsigned ControlThreads = forward_tuning::kUnifiedThreads - MathThreads>
 __device__ __forceinline__ void after_combine(const ForwardKernelArgs &a) {
   // The stream cannot launch the next generation until CTA 0 exits this
   // kernel. Other CTAs need only contribute their cleanup stores and may
   // retire after the local grid arrival, matching MegaMOE's AfterClean
   // barrier without a redundant grid-wide epilogue.
-  constexpr auto kBase = forward_tuning::kMathWarpgroups * 128U;
-  constexpr auto kThreads = forward_tuning::kUnifiedThreads - kBase;
+  constexpr auto kBase = MathThreads;
+  constexpr auto kThreads = ControlThreads;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (blockIdx.x == 0U && threadIdx.x == kBase)
     status->after_combine_start_clock = device_globaltimer_ns();

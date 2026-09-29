@@ -7,6 +7,8 @@ GA+FZ 的既有收益算成 decode 优化。本轮先对齐 MegaMoE 的通信、
 MegaMoE，单机长文和多机回归持平。
 
 2026-09-29 后续 HG：为 SGLang/Qwen 接入补齐单机 EP1/EP2/EP4/EP8，见第 6 节。
+后续 HH 的 RL 回退定位与消融见第 7 节；第 1–5 节描述历史 HF，不能把其
+M128/双 warpgroup 配置当作 HH 候选的当前实现。
 
 ## 1. 入口和适用范围
 
@@ -411,3 +413,128 @@ masked 真实 route 仍使用原清洗规则。
 权重更新后重建。原始数据为 `compact_padded_sglang.log` 与
 `padded_sglang_ep4_t1.log`。此项采用，但 T1 仍落后 baseline，不能据此宣称
 端到端回退已经解决。
+
+### 寄存器 A 的 WGMMA 消融（不采用）
+
+`local_decode_hh_rs2` 为 M64/N64/K64、5-stage、双 CTA，权重 TMA 提前推进，
+math acquire 行 ready 后直接读取有效 A 行到寄存器。寄存器 A 使用独立的
+K16 fragments，先 fence，再发指令，等待该组完成后才重用寄存器；不能照搬
+SS 版只退休旧 SMEM stage 的规则。参考
+[PTX 的 WGMMA 同步合同](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-wait-group)。
+
+82 registers、0 spill；三 CTA 尝试被启动前 occupancy 检查拒绝，重新构建
+双 CTA 后 EP4 124 个 native 和 9 个 SGLang bucket 数值对照通过，全部时钟
+采样 1620 MHz。T1/16/32/48/64/96/128/256/512 依次为
+59.315/148.292/166.925/199.323/206.488/219.724/229.348/254.091/373.955 µs。
+显著退步，不采用；没有完整 sanitizer 验收。不以此推断所有 RS 设计都慢，
+这里只测试了逐 K64 退休寄存器片段的实现。
+
+后续 M16 候选先做最小累加对照：K512/K2048、输入幅度 0.03/1/20 的六组
+FP32 GEMM 输出与原 WGMMA 逐位相等，见 `build/local_decode_hh/mma_probe.log`。
+这只是数值可行性检查，不是完整 MoE 验收或性能结论。
+
+### M16 warp-level MMA（继续消融）
+
+`local_decode_hh_m16b3` 保留 M128 物理 block，按 M16/N128/K64 分片，四个
+math warp 分别承担 N32。权重通过 3-stage TMA 装载，A 从有效行读取寄存器；
+FC1 直接写有效 S 行，FC2 复用通用的 coalesced peer writeback。热点块依次
+完成全部 M16 slice，ready target 包含每片，不截断 token。原三次 rank
+collective、K16 累加顺序、激活和 combine 数值合同不变。
+
+初版 109 registers；三 CTA 编译预算下为 80 registers、0 stack/local spill。
+host 将请求 grid 限制在实际 occupancy 范围内。EP4 124 项 native（包含
+逐位 batch-invariance、通用 V4 对齐）和 9 个 SGLang bucket 数值对照通过；
+8 个通用 V4 ring entry 的 SASS 仍逐指令不变。
+
+全部 SM 样本 1620 MHz，T1/16/32/48/64/96/128/256/512 的 p50 为
+60.053/106.988/124.614/151.223/157.253/168.949/174.363/188.940/373.681 µs。
+T32 比前面的 M64 紧凑版改善，但 48–256 没有整体胜出；尚不能作为最终版本。
+原始日志 `build/local_decode_hh/m16b3_*`。下一项再测试 A 的 TMA 装载与
+`ldmatrix`，不将两者的组合收益拆成未经独立测量的单项收益。
+
+### M16 + A/B TMA + ldmatrix（端到端复测候选）
+
+`local_decode_hh_m16tma` 保留上项 M16/N128/K64、3-stage、256 threads，
+改为 X/S 和 W 均通过 TMA 装载，math 用 `ldmatrix` 读取 fragment。每个 stage
+先发 W，首次 X/S 装载前 acquire 等待物理 block ready，随后 full barrier
+发布 A/B；四个 math warp 读完后共同归还一个 CTA-local empty credit。
+不再使用 decode 的 cluster multicast；通用 V4 的 multicast 不变。
+80 registers、0 spill，实际驻留能力约束请求 grid。权重 map 与通用 N128
+profile 相同，最终整理版复用已有 map，不保留实验中重复的 descriptor。
+
+同机同输入 EP4，全部 NVML 样本 1620 MHz，单位 µs：
+
+|全局 T|baseline|M16 + TMA|相对 baseline|
+|---:|---:|---:|---:|
+|1|29.884|49.579|+65.9%|
+|16|85.085|107.595|+26.5%|
+|32|106.546|125.066|+17.4%|
+|48|130.747|144.377|+10.4%|
+|64|150.110|151.068|+0.6%|
+|96|179.667|159.549|−11.2%|
+|128|185.608|164.698|−11.3%|
+|256|197.817|175.034|−11.5%|
+|512|211.630|374.116|+76.8%（通用路径未改）|
+
+相对最初 HG 的真实适配层，T32 从 160.969 降至 125.066 µs（−22.3%），
+T64 从 192.961 降至 151.068 µs（−21.7%）。这是多项优化的累计收益，
+不是 M16 单项收益；小 batch 仍未全面追平 baseline。
+
+EP1/2/4/8 共 465 个 native 和 30 个 SGLang rank/case 全部通过，包括热点
+跨块、逐位 batch-invariance、通用 V4 对齐、masked route 与权重更新。
+EP1/EP2 的 memcheck、racecheck 各 31/62 个应用检查通过，全部工具进程
+为 0 errors / 0 hazards。日志 `build/local_decode_hh/m16tma_*`。
+尚待最终整理版、原 E64/EP8 性能及同配方 RL 验收；不将微基准改善当作
+端到端回退已解决。
+
+E64/K4/EP8 复查使用相同输入与原 MegaMoE 对照脚本，T 为每 rank token 数。
+M16 的 T1 为 39.563 µs，MegaMoE kernel 为 49.666 µs；T64 则为 67.774 µs，
+落后 MegaMoE 的 58.962 µs。全部时钟样本 1620 MHz，所有数值检查通过。
+说明按较稀疏 E256 调出的 M16 不能直接全量替代：T64 的平均每专家行数
+达到 32，M16 重复遍历权重的代价增大。原始日志 `m16tma_mega_ep8_t*.log`。
+
+第一次整理构建 `local_decode_hh_final` 曾错误地以 prefill FC2 N256 descriptor
+检查 decode N128 兼容性，使 decode 入口始终不可选；对应 `final_mega_*` 测到
+的是通用路径，已排除，不作为 M16 或最终性能。修正为原短文 W2 N128 map。
+
+后续 `local_decode_hh_dual` 复用同一 geometry、pull、producer、epilogue 与
+rank 同步，只模板化 M16 warp MMA / M64 WGMMA 的算术片和 SMEM 布局。
+按 `local_tokens * world * top_k >= experts * 16` 选择 M64，其余使用 M16；
+这是静态形状的密度估计，不是丢弃热点或动态任务领用。各 rank 可以使用
+不同算术形状，但物理 M128 block 与跨 rank 协议完全相同，必须验证跨形状
+逐位一致与不等长 source。此候选尚在构建验收，未运行 RL。
+
+双形状首轮 E64/EP8 T1/T64 为 39.494/61.530 µs，MegaMoE kernel 为
+49.500/59.082 µs，含输入 staging 为 53.094/64.948 µs；全部时钟 1620 MHz。
+E256/EP4 的全局 T1/16/32/48/64/96/128/256/512 为
+49.654/107.436/125.260/144.681/150.803/159.290/164.907/174.934/373.451 µs，
+保持 M16 原收益，9 bucket 数值对照通过。8 个通用 V4 ring entry 的 SASS
+仍逐指令不变，日志 `dual_*`。
+
+随后 `local_decode_hh_release` 只调整静态 grid 上限：以每专家一个物理块的
+tile 数估计可用任务量，将请求驻留倍数限制为
+`clamp(owned_experts * (FC1_tiles + FC2_tiles) / SMs, 1, shape_limit)`。
+M16/M64 的 shape limit 为 3/2，且仍受实际 occupancy 上限约束；实际热点
+始终 grid-stride 遍历所有块。E64/EP8 因专家少改回一 CTA/SM，E256/EP4 不变。
+这项尚待单独计时，不把资源估计当作已取得的收益。
+
+最终 grid 轮 E64/EP8 T1/T64 为 **39.473/59.223 µs**，同轮 MegaMoE kernel
+为 **49.418/59.917 µs**，含 staging 为 **52.954/65.697 µs**。T64 相对双驻留
+轮省 2.307 µs；最终与 MegaMoE 的 kernel 接近，不能把约 1% 的领先夸大为
+显著收益。E256/EP4 的 T1/16/32/48/64/96/128/256/512 依次为
+49.628/107.740/125.245/145.242/150.888/159.698/164.889/175.076/373.556 µs。
+正式计时没有并行编译或其它 GPU workload，全部 NVML 样本 1620 MHz。
+
+双形状已通过 EP1/2/4/8 的 465 个 native 和 30 个 SGLang rank/case；另以
+E64/K8 的 EP1/EP2 覆盖稠密 M64、跨形状切换，两种 sanitizer 各 31/62 项
+应用检查通过，全部进程为 0 errors / 0 hazards。最终 grid 二进制的 M16、
+M64 以及 8 个通用 V4 ring entry 均与该已验收双形状二进制逐指令一致；
+改变的是 host grid 选择，不是设备端同步协议。最终二进制额外通过 E64/EP8
+短文 248 项、1/64/8K/20K 长容量及热点复用 240 项，以及 E256/EP4 的
+124 项 native 和 9 个 SGLang bucket 对照。日志为 `dual_dense_*` 和 `release_*`。
+
+冻结 native library：`build/local_decode_hh_release/libweftmoe.so`，SHA256
+`b7ea21bdf989b30b5cda1cbe7d813ad2de70bc3cae4ec087375511c3a7c5d7be`。
+最终仍只在单机短容量 inference pool 内选 M16/M64；prefill、training 和
+跨节点协议未改。小 batch 对 SGLang baseline 的剩余差距不能隐去，实际 RL
+收益另以相同步数和接受的生成 token 吞吐复测。

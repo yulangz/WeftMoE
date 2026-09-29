@@ -130,7 +130,8 @@ visit_m128_accumulator_pair(float *accum_a, float *accum_b, Callback callback) {
 
 // A 64-column atom uses the same 128-byte swizzle as the FC2 TMA epilogue.
 // STSM packs the WGMMA fragments; vector loads below recover contiguous rows.
-__device__ __forceinline__ void store_m128_fragment(transport::BFloat16 *tile,
+template <unsigned Rows = 128U>
+__device__ __forceinline__ void store_m_fragment(transport::BFloat16 *tile,
                                                     unsigned index,
                                                     __nv_bfloat162 row0,
                                                     __nv_bfloat162 row1) {
@@ -139,13 +140,14 @@ __device__ __forceinline__ void store_m128_fragment(transport::BFloat16 *tile,
   const auto atom = index / 8U;
   const auto column = (index % 8U) ^ (lane % 8U);
   auto *target = reinterpret_cast<unsigned char *>(tile) + warp * 16U * 128U +
-                 atom * 128U * 128U + lane * 128U + column * 16U;
+                 atom * Rows * 128U + lane * 128U + column * 16U;
   hopper::StoreMatrixX2<__nv_bfloat162>::copy(row0, row1, target);
 }
 
+template <unsigned Rows = 128U>
 __device__ __forceinline__ unsigned
-m128_fragment_vector_offset(unsigned row, unsigned column) {
-  return (column / 64U) * 128U * 64U + row * 64U +
+m_fragment_vector_offset(unsigned row, unsigned column) {
+  return (column / 64U) * Rows * 64U + row * 64U +
          ((column % 64U) ^ ((row % 8U) * 8U));
 }
 
@@ -1268,7 +1270,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                   const auto k = iteration * TileK + column;
                   if (m < valid_rows && k + 8U <= kHidden) {
                     const auto *source = smem_a + stage * kAStageElements +
-                        m128_fragment_vector_offset(m, column);
+                        m_fragment_vector_offset(m, column);
                     auto *destination = a.saved_x + (row + m) * kHidden + k;
                     *reinterpret_cast<uint4 *>(destination) =
                         *reinterpret_cast<const uint4 *>(source);
@@ -1399,14 +1401,14 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
               const auto bv1 = __float22bfloat162_rn(make_float2(
                   accum_b[index * 4U + 2U], accum_b[index * 4U + 3U]));
               if constexpr (RetainBackwardState) {
-                store_m128_fragment(staged_a, index, av0, av1);
-                store_m128_fragment(staged_b, index, bv0, bv1);
+                store_m_fragment(staged_a, index, av0, av1);
+                store_m_fragment(staged_b, index, bv0, bv1);
               }
               const auto af0 = __bfloat1622float2(av0),
                          af1 = __bfloat1622float2(av1);
               const auto bf0 = __bfloat1622float2(bv0),
                          bf1 = __bfloat1622float2(bv1);
-              store_m128_fragment(
+              store_m_fragment(
                   staged_s, index,
                   __float22bfloat162_rn(
                       make_float2(gated_swiglu_fc2_input(af0.x, bf0.x, gate0),
@@ -1421,7 +1423,7 @@ persistent_role(const ForwardKernelArgs &a, const CUtensorMap &x_map,
                  v += kMathThreads) {
               const auto r = v / (Fc1TileN / 8U);
               const auto c = (v % (Fc1TileN / 8U)) * 8U;
-              const auto offset = m128_fragment_vector_offset(r, c);
+              const auto offset = m_fragment_vector_offset(r, c);
               const auto output_index = (row + r) * kIntermediate + n + c;
               *reinterpret_cast<uint4 *>(s + output_index) =
                   *reinterpret_cast<const uint4 *>(staged_s + offset);

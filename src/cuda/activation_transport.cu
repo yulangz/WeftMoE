@@ -2106,27 +2106,29 @@ make_activation_pool_state(const CollectiveSession &session,
         slot.forward_s_map = make_bf16_tma_map(
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, activation_rows,
-            forward_tuning::kTileM, "gated SwiGLU U",
-            forward_tuning::kTileK);
+            forward_tuning::kTileM, "gated SwiGLU U", forward_tuning::kTileK);
         if (local_decode::eligible(config, state->layout.static_ring)) {
-          slot.decode_x_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.canonical_rows),
-              config.max_hidden_size, activation_rows,
-              local_decode::kSparseRows, "decode sparse X", local_decode::kK);
-          slot.decode_s_map = make_bf16_tma_map(
-              at<void>(slot.device, state->layout.forward_s),
-              config.max_intermediate_size, activation_rows,
-              local_decode::kSparseRows, "decode sparse S", local_decode::kK);
+          for (unsigned variant = 0U; variant < 2U; ++variant) {
+            const auto rows = variant ? 64U : local_decode::kM;
+            slot.decode_x_map[variant] = make_bf16_tma_map(
+                at<void>(slot.device, state->layout.canonical_rows),
+                config.max_hidden_size, activation_rows, rows, "decode X",
+                local_decode::kK);
+            slot.decode_s_map[variant] = make_bf16_tma_map(
+                at<void>(slot.device, state->layout.forward_s),
+                config.max_intermediate_size, activation_rows, rows, "decode S",
+                local_decode::kK);
+          }
         }
         // Ring FC2 writes contribution/Return TX directly. Reuse its unused
         // epilogue descriptor for FC1 S; arena entries still describe C.
         const bool ring = state->layout.static_ring.depth != 0U;
         slot.forward_output_store_map = make_bf16_tma_store_map(
             at<void>(slot.device, ring ? state->layout.forward_s
-                                      : state->layout.canonical_rows),
+                                       : state->layout.canonical_rows),
             ring ? config.max_intermediate_size : config.max_hidden_size,
-            activation_rows, ring ? "Forward ring SwiGLU"
-                                  : "Forward canonical output");
+            activation_rows,
+            ring ? "Forward ring SwiGLU" : "Forward canonical output");
         if (config.enable_backward_state && !state->layout.static_ring.depth)
           slot.forward_training_output_store_map = make_bf16_tma_store_map(
               at<void>(slot.device, state->layout.forward_training_output),
@@ -5159,7 +5161,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           static_cast<std::uint8_t>(locality_group4_begin);
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
-      const auto forward_main_compute_ctas = args.forward_compute_cta_count;
+      auto forward_main_compute_ctas = args.forward_compute_cta_count;
       if (args.ring.depth && use_gin &&
           forward_main_compute_ctas < std::max(args.static_network.contexts,
                                               2U * args.static_network.ring_workers + 1U))
@@ -5242,36 +5244,65 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           const bool decode = args.fused_inference_routes &&
               local_decode::eligible(state->config, layout.static_ring);
-          const auto smem = decode ? sizeof(local_decode::Shared)
-              : forward_unified_detail::shared_bytes<true>(id.world_size);
+          // Arithmetic variants share the same physical blocks and rank
+          // protocol, so unequal sources can select different M shapes.
+          const bool wide_decode =
+              decode && id.num_tokens * id.world_size * id.top_k >=
+                            id.num_experts * 16ULL;
+          const auto decode_kernel = wide_decode ? local_decode::kernel<64U>
+                                                 : local_decode::kernel<16U>;
+          const auto threads =
+              decode ? local_decode::kThreads : forward_tuning::kUnifiedThreads;
+          if (decode && id.num_tokens >= 4U) {
+            // More residency helps many-expert decode, but a small expert
+            // set should not pay the grid collective cost of mostly idle CTAs.
+            const auto expert_tiles = view.sizes.owned_expert_count *
+                (local_decode::kFc1Tiles + local_decode::kFc2Tiles);
+            forward_main_compute_ctas *= std::clamp(
+                expert_tiles / forward_main_compute_ctas, 1U,
+                wide_decode ? 2U : 3U);
+            args.forward_compute_cta_count = forward_main_compute_ctas;
+            args.forward_reduce_cta_count = forward_main_compute_ctas;
+          }
+          const auto smem =
+              decode
+                  ? (wide_decode ? sizeof(local_decode::Shared<64U>)
+                                 : sizeof(local_decode::Shared<16U>))
+                  : forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();
-          const auto error = decode
-              ? backend->prepare_unified_launch<>(
-                  reinterpret_cast<const void *>(local_decode::kernel), smem,
-                  forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
-                  forward_tuning::kClusterSize, pdl, false,
-                  &max_active_clusters)
-              : backend->prepare_unified_launch<forward_tuning::StaticV4Resources>(
-                  reinterpret_cast<const void *>(kStaticUnified), smem,
-                  forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
-                  forward_tuning::kClusterSize, pdl, false,
-                  &max_active_clusters);
+          const auto error =
+              decode ? backend->prepare_unified_launch<>(
+                           reinterpret_cast<const void *>(decode_kernel), smem,
+                           forward_main_compute_ctas, threads,
+                           forward_tuning::kClusterSize, pdl, false,
+                           &max_active_clusters)
+                     : backend->prepare_unified_launch<
+                           forward_tuning::StaticV4Resources>(
+                           reinterpret_cast<const void *>(kStaticUnified), smem,
+                           forward_main_compute_ctas,
+                           forward_tuning::kUnifiedThreads,
+                           forward_tuning::kClusterSize, pdl, false,
+                           &max_active_clusters);
           internal::throw_cuda(
-              "forward-run", error,
-              id.calling_rank, id.world_size,
+              "forward-run", error, id.calling_rank, id.world_size,
               backend->session.session().identity(), id.generation,
-              ExchangeKind::ExpertCounts,
-              "prepare cached V4 unified launch");
+              ExchangeKind::ExpertCounts, "prepare cached V4 unified launch");
+          if (decode) {
+            forward_main_compute_ctas =
+                std::min(forward_main_compute_ctas,
+                         static_cast<unsigned>(max_active_clusters) *
+                             forward_tuning::kClusterSize);
+            args.forward_compute_cta_count = forward_main_compute_ctas;
+            args.forward_reduce_cta_count = forward_main_compute_ctas;
+          }
           cudaLaunchConfig_t launch{};
           launch.gridDim = dim3(forward_main_compute_ctas, 1, 1);
-          launch.blockDim =
-              dim3(forward_tuning::kUnifiedThreads, 1, 1);
+          launch.blockDim = dim3(threads, 1, 1);
           launch.dynamicSmemBytes = smem;
           launch.stream = exec->stream;
           cudaLaunchAttribute cluster{};
           cluster.id = cudaLaunchAttributeClusterDimension;
-          cluster.val.clusterDim = {
-              forward_tuning::kClusterSize, 1U, 1U};
+          cluster.val.clusterDim = {forward_tuning::kClusterSize, 1U, 1U};
           cudaLaunchAttribute attributes[2]{};
           unsigned attribute_count = 0U;
           attributes[attribute_count++] = cluster;
@@ -5331,16 +5362,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           if (decode)
             launch_forward = cudaLaunchKernelEx(
-                &launch, local_decode::kernel, args, slot.forward_x_map,
-                slot.forward_s_map, weight.prefill_w1_map, weight.w2_map,
-                ordinary_output_store_map, slot.decode_x_map, slot.decode_s_map);
+                &launch, decode_kernel, args, slot.decode_x_map[wide_decode],
+                slot.decode_s_map[wide_decode], weight.prefill_w1_map,
+                weight.w2_map);
           else
             launch_forward = cudaLaunchKernelEx(
-              &launch, kStaticUnified, args, slot.forward_x_map,
-              slot.forward_s_map,
-              prefill ? weight.prefill_w1_map : weight.w1_interleaved_map,
-              prefill ? weight.prefill_w2_map : weight.w2_map,
-              ordinary_output_store_map);
+                &launch, kStaticUnified, args, slot.forward_x_map,
+                slot.forward_s_map,
+                prefill ? weight.prefill_w1_map : weight.w1_interleaved_map,
+                prefill ? weight.prefill_w2_map : weight.w2_map,
+                ordinary_output_store_map);
         } else {
         const auto launch_unified = [&](auto kernel) {
           const auto smem = forward_unified_detail::shared_bytes(id.world_size);

@@ -3,13 +3,14 @@
 // Single-node decode follows MegaMoE's fixed pull/TMA/math dataflow, using the
 // existing Weft numerical primitives and IPC allocation. Long-context and
 // network scheduling remain in static_v4; no dynamic task queue is shared.
-#include "cuda/local_decode/schedule.cuh"
 #include "cuda/local_decode/compute.cuh"
 
 namespace local_decode {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
 
-__device__ __forceinline__ void geometry(const ForwardKernelArgs &a, Shared &s) {
+template <unsigned M>
+__device__ __forceinline__ void geometry(const ForwardKernelArgs &a,
+                                         Shared<M> &s) {
   const auto lane = threadIdx.x % 32U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   bool error = false;
@@ -22,8 +23,9 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a, Shared &s) 
     unsigned rows = 0U;
     if (expert < owned && !error)
       for (unsigned source = 0U; source < a.world; ++source)
-        rows += a.fused_local_expert_count[std::uint64_t(source) * owned + expert];
-    const auto blocks = (rows + kM - 1U) / kM;
+        rows +=
+            a.fused_local_expert_count[std::uint64_t(source) * owned + expert];
+    const auto blocks = (rows + kBlockM - 1U) / kBlockM;
     const auto prefix = static_forward::warp_inclusive_sum(blocks);
     if (expert < owned) {
       s.rows[expert] = rows;
@@ -35,7 +37,8 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a, Shared &s) 
   if (lane == 31U)
     s.blocks[owned] = total_blocks;
   if (blockIdx.x == 0U && lane == 0U) {
-    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    auto *status =
+        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     status->error = error;
     status->route_exchange_complete_clock = device_globaltimer_ns();
     status->dispatch_complete_clock = status->route_exchange_complete_clock;
@@ -47,8 +50,9 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a, Shared &s) 
   }
 }
 
-__device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
-  const auto warp = (threadIdx.x - 288U) / 32U;
+template <unsigned M>
+__device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared<M> &s) {
+  const auto warp = (threadIdx.x - kMathThreads - 32U) / 32U;
   const auto lane = threadIdx.x % 32U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned expert = 0U, begin = 0U, phase = 0U, peer_rows = 0U, pulled = 0U;
@@ -60,25 +64,27 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
     unsigned source, ordinal;
     static_v4::decode_source_row(a, expert, linear - begin, source, ordinal);
     if (lane == 0U) {
-      const auto identity = static_v4::source_routes<static_forward::SourceRoute>(
-          a, a.rank, source, expert)[ordinal];
-      const auto row = s.blocks[expert] * kM + linear - begin;
+      const auto identity =
+          static_v4::source_routes<static_forward::SourceRoute>(
+              a, a.rank, source, expert)[ordinal];
+      const auto row = s.blocks[expert] * kBlockM + linear - begin;
       const auto token = identity.route / a.dispatch.identity.top_k;
-      const auto *input = peer_at<const char>(a.peer_bases[source],
-                                              a.source_input_offset) +
-                          std::uint64_t(token) * a.hidden * 2U;
+      const auto *input =
+          peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
+          std::uint64_t(token) * a.hidden * 2U;
       auto *output = peer_at<char>(a.local_base, a.canonical_rows_offset) +
                      std::uint64_t(row) * a.hidden * 2U;
-      a.ring.rows[row] = {
-          identity.route, source, identity.gate, token,
-          peer_at<transport::BFloat16>(a.peer_bases[source],
-                                       a.contribution_offset) +
-              std::uint64_t(identity.route) * a.hidden};
+      a.ring.rows[row] = {identity.route, source, identity.gate, token,
+                          peer_at<transport::BFloat16>(a.peer_bases[source],
+                                                       a.contribution_offset) +
+                              std::uint64_t(identity.route) * a.hidden};
       for (unsigned offset = 0U; offset < a.hidden * 2U; offset += 4096U) {
-        const auto bytes = min(4096U, static_cast<unsigned>(a.hidden * 2U) - offset);
-        cute::SM90_BULK_COPY_G2S::copy(input + offset,
-            reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]),
-            s.pull[warp], bytes);
+        const auto bytes =
+            min(4096U, static_cast<unsigned>(a.hidden * 2U) - offset);
+        cute::SM90_BULK_COPY_G2S::copy(
+            input + offset,
+            reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]), s.pull[warp],
+            bytes);
         s.pull_full[warp].arrive_and_expect_tx(bytes);
         s.pull_full[warp].wait(phase);
         phase ^= 1U;
@@ -86,14 +92,16 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
         cute::tma_store_arrive();
         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
       }
-      static_v4::reduce_add_release_device(&states(a)[row / kM].x_ready, 1ULL);
+      static_v4::reduce_add_release_device(&states(a)[row / kBlockM].x_ready,
+                                           1ULL);
       peer_rows += source != a.rank;
       ++pulled;
     }
     __syncwarp();
   }
   if (lane == 0U && pulled) {
-    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    auto *status =
+        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicMax(&status->dispatch_complete_clock, device_globaltimer_ns());
     if (peer_rows)
       atomicAdd(&status->actual_dispatch_peer_bytes,
@@ -102,8 +110,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
 }
 
 __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
-  const auto *input = peer_at<const __nv_bfloat162>(a.local_base,
-                                                   a.contribution_offset);
+  const auto *input =
+      peer_at<const __nv_bfloat162>(a.local_base, a.contribution_offset);
   auto *output = reinterpret_cast<__nv_bfloat162 *>(a.output);
   const auto pairs = a.hidden / 2U;
   const auto top_k = a.dispatch.identity.top_k;
@@ -119,8 +127,8 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
     float2 sum = {0.0F, 0.0F};
     for (unsigned position = 0U; position < top_k; ++position) {
       const auto slot = a.dispatch.combine_order[token * top_k + position];
-      const auto value = __bfloat1622float2(
-          input[(token * top_k + slot) * pairs + column]);
+      const auto value =
+          __bfloat1622float2(input[(token * top_k + slot) * pairs + column]);
       sum.x = __fadd_rn(sum.x, value.x);
       sum.y = __fadd_rn(sum.y, value.y);
     }
@@ -133,18 +141,16 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
 
 #endif
 
-__global__ __launch_bounds__(kThreads, 1) void kernel(
+template <unsigned M>
+__global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
     const __grid_constant__ ForwardKernelArgs a,
     const __grid_constant__ CUtensorMap x_map,
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
-    const __grid_constant__ CUtensorMap w2_map,
-    const __grid_constant__ CUtensorMap output_map,
-    const __grid_constant__ CUtensorMap sparse_x_map,
-    const __grid_constant__ CUtensorMap sparse_s_map) {
+    const __grid_constant__ CUtensorMap w2_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
   extern __shared__ __align__(1024) unsigned char storage[];
-  auto &s = *reinterpret_cast<Shared *>(storage);
+  auto &s = *reinterpret_cast<Shared<M> *>(storage);
   programmatic_launch::wait();
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
@@ -163,7 +169,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   if (threadIdx.x == kMathThreads) {
     for (unsigned stage = 0U; stage < kStages; ++stage) {
       s.full[stage].init(1U);
-      s.empty[stage].init(2U * (kMathThreads / 128U));
+      s.empty[stage].init(1U);
     }
     for (auto &barrier : s.pull_full)
       barrier.init(1U);
@@ -172,18 +178,6 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     cute::prefetch_tma_descriptor(&s_map);
     cute::prefetch_tma_descriptor(&w1_map);
     cute::prefetch_tma_descriptor(&w2_map);
-    cute::prefetch_tma_descriptor(&output_map);
-    cute::prefetch_tma_descriptor(&sparse_x_map);
-    cute::prefetch_tma_descriptor(&sparse_s_map);
-  }
-  if (threadIdx.x < kMathThreads) {
-    // Sparse TMA boxes leave unused rows untouched. Initialize them once;
-    // WGMMA's real rows remain independent of these padding values.
-    auto *padding = reinterpret_cast<uint4 *>(s.a);
-    for (unsigned i = threadIdx.x; i < kStages * kM * kK / 8U;
-         i += kMathThreads)
-      padding[i] = {};
-    ::cuda::device::experimental::fence_proxy_async_shared_cta();
   }
   cute::cluster_sync();
   if (threadIdx.x < kMathThreads) {
@@ -200,24 +194,25 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   // must not enter the all-thread grid collective until that phase retires.
   __syncthreads();
   static_v4::rank_barrier<0U, kThreads>(a);
-  if (threadIdx.x >= kMathThreads && threadIdx.x < 288U)
+  if (threadIdx.x >= kMathThreads && threadIdx.x < kMathThreads + 32U)
     geometry(a, s);
   __syncthreads();
   forward_compute_detail::observe_compute_cluster(a);
   if (threadIdx.x < kMathThreads) {
-    compute(a, s, output_map);
-    static_v4::before_combine(a);
-  } else if (threadIdx.x < 288U) {
-    produce(a, s, x_map, s_map, w1_map, w2_map, sparse_x_map, sparse_s_map);
+    compute(a, s);
+    static_v4::before_combine<kMathThreads>(a);
+  } else if (threadIdx.x < kMathThreads + 32U) {
+    produce(a, s, x_map, s_map, w1_map, w2_map);
   } else {
     pull(a, s);
   }
-  static_v4::collective_scope_sync<kThreads, static_v4::kCollectiveJoinBarrier>();
+  static_v4::collective_scope_sync<kThreads,
+                                   static_v4::kCollectiveJoinBarrier>();
   if (threadIdx.x < kMathThreads) {
     if (!status->error)
       combine(a);
   } else {
-    static_v4::after_combine(a);
+    static_v4::after_combine<kMathThreads, kThreads - kMathThreads>(a);
     if (blockIdx.x == 0U && threadIdx.x == kMathThreads) {
       const auto blocks = s.blocks[a.dispatch.sizes.owned_expert_count];
       status->fc1_tasks_done = blocks * kFc1Tiles;

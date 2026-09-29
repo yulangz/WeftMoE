@@ -78,7 +78,7 @@ struct StaticV4XCheckpoint {
       if (m < valid_rows && column_base + column + 8U <= hidden &&
           (!Contiguous || destinations[index])) {
         auto *target = destinations[index] + column_base + column;
-        const auto *source = stage + m128_fragment_vector_offset(m, column);
+        const auto *source = stage + m_fragment_vector_offset(m, column);
         *reinterpret_cast<uint4 *>(target) =
             *reinterpret_cast<const uint4 *>(source);
       }

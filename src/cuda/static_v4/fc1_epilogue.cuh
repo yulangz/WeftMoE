@@ -44,16 +44,16 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     for (unsigned index = 0; index < kOutputN / 8U; ++index) {
       const auto *g = accum + index * 8U;
       const auto *u = g + 4U;
-      store_m128_fragment(
+      store_m_fragment(
           tile, index,
           __float22bfloat162_rn(static_v4_swiglu_pair(g, u, gate0)),
           __float22bfloat162_rn(static_v4_swiglu_pair(g + 2U, u + 2U, gate1)));
       if constexpr (RetainBackwardState) {
-        store_m128_fragment(
+        store_m_fragment(
             tile + kOutputElements, index,
             __float22bfloat162_rn(make_float2(g[0], g[1])),
             __float22bfloat162_rn(make_float2(g[2], g[3])));
-        store_m128_fragment(
+        store_m_fragment(
             tile + 2U * kOutputElements, index,
             __float22bfloat162_rn(make_float2(u[0], u[1])),
             __float22bfloat162_rn(make_float2(u[2], u[3])));
@@ -78,7 +78,7 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
            vector += kMathThreads) {
         const auto m = vector / (kOutputN / 8U);
         const auto n = (vector % (kOutputN / 8U)) * 8U;
-        const auto offset = m128_fragment_vector_offset(m, n);
+        const auto offset = m_fragment_vector_offset(m, n);
         if constexpr (!TmaStore)
           *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate +
                                      column_base + n) =

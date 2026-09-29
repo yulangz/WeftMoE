@@ -2,14 +2,17 @@
 
 namespace local_decode {
 
-constexpr unsigned kM = 128U, kN = 128U, kK = 64U, kStages = 5U;
-constexpr unsigned kSparseRows = 8U;
-constexpr unsigned kThreads = 384U, kMathThreads = 256U;
+// Keep the shared M128 GM directory; decode arithmetic uses M16 or M64
+// slices. Hot experts traverse every slice, including multi-block experts.
+constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U, kStages = 3U;
+constexpr unsigned kThreads = 256U, kMathThreads = 128U;
 constexpr unsigned kMaxExperts = 256U;
 constexpr unsigned kFc1Tiles = 2U * forward_tuning::kMainIntermediate / kN;
 constexpr unsigned kFc2Tiles = forward_tuning::kMainHidden / kN;
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
-using Mma = hopper::BF16Mma<kN>;
+constexpr unsigned kWarpN = kN / (kMathThreads / 32U);
+using WarpMma = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+using GroupMma = hopper::BF16Mma<kN>;
 
 // Selection uses collective capacity, never one source's actual batch size.
 // One window covers even the all-to-one-expert case. Larger pools keep V4.
@@ -17,13 +20,11 @@ inline bool eligible(const ActivationTransportPoolConfig &config,
                      const static_forward::ComputeRingLayout &ring) {
   return forward_tuning::kStaticV4PrefillEnabled &&
          forward_tuning::kClusterSize == 2U &&
-         forward_tuning::kUnifiedThreads == kThreads &&
-         forward_tuning::kTileM == kM && forward_tuning::kTileK == kK &&
+         forward_tuning::kTileM == kBlockM && forward_tuning::kTileK == kK &&
          forward_tuning::StaticV4Gemm<true>::kFc1N == kN &&
-         forward_tuning::kFc2TileN == kN &&
-         config.max_nodes == 1U && !config.enable_backward_state &&
-         config.max_tokens_per_rank <= 64U && ring.depth &&
-         ring.max_windows == 1U && config.max_world_size <= 32U &&
+         forward_tuning::kFc2TileN == kN && config.max_nodes == 1U &&
+         !config.enable_backward_state && config.max_tokens_per_rank <= 64U &&
+         ring.depth && ring.max_windows == 1U && config.max_world_size <= 32U &&
          config.max_owned_experts * config.max_world_size <= kMaxExperts;
 }
 
@@ -35,33 +36,36 @@ struct BlockState {
 };
 static_assert(sizeof(BlockState) <= sizeof(static_forward::RingBlock));
 
-struct Shared {
+template <unsigned M> struct Shared {
   // Source planning retires before geometry; reuse its scratch for local rows.
   union {
     unsigned counts[kMaxExperts];
     unsigned rows[kMaxExperts];
   };
   unsigned blocks[kMaxExperts + 1U];
-  alignas(1024) transport::BFloat16 a[kStages][kM * kK];
+  alignas(1024) transport::BFloat16 a[kStages][M * kK];
   alignas(1024) transport::BFloat16 b[kStages][kN * kK];
-  alignas(1024) transport::BFloat16 output[kM * kN];
+  alignas(1024) transport::BFloat16 output[M * kN];
   alignas(1024) unsigned char pull[3][4096];
   Barrier full[kStages], empty[kStages], pull_full[3];
 };
-static_assert(sizeof(Shared) <= 227U * 1024U);
+static_assert(sizeof(Shared<16U>) <= 76U * 1024U);
+static_assert(sizeof(Shared<64U>) <= 112U * 1024U);
 
 __device__ __forceinline__ BlockState *states(const ForwardKernelArgs &a) {
   return reinterpret_cast<BlockState *>(a.ring.blocks);
 }
 
 struct Task {
-  unsigned expert, block, column, rows;
+  unsigned expert, block, column, rows, row;
   bool fc2;
 };
 
 // Producer and math independently replay this immutable grid-stride sequence.
-// FC1 residues continue into FC2; adjacent CTAs always share M and adjacent N.
-__device__ __forceinline__ Task task(const Shared &s, unsigned owned,
+// FC1 residues continue into FC2. TMA stages and credits are CTA-local: each
+// full barrier publishes A/B; one math-group arrival releases both operands.
+template <unsigned M>
+__device__ __forceinline__ Task task(const Shared<M> &s, unsigned owned,
                                      unsigned index) {
   const auto fc1 = s.blocks[owned] * kFc1Tiles;
   const bool fc2 = index >= fc1;
@@ -71,8 +75,19 @@ __device__ __forceinline__ Task task(const Shared &s, unsigned owned,
   unsigned expert = 0U;
   while (s.blocks[expert + 1U] <= block)
     ++expert;
-  return {expert, block, linear % columns,
-          min(kM, s.rows[expert] - (block - s.blocks[expert]) * kM), fc2};
+  return {expert,
+          block,
+          linear % columns,
+          min(kBlockM, s.rows[expert] - (block - s.blocks[expert]) * kBlockM),
+          block * kBlockM,
+          fc2};
+}
+
+template <unsigned M>
+__device__ __forceinline__ Task slice(Task t, unsigned offset) {
+  t.rows = min(M, t.rows - offset);
+  t.row += offset;
+  return t;
 }
 
 } // namespace local_decode
