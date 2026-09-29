@@ -6013,3 +6013,72 @@ launcher及聚合。没有改生产测试框架；临时CUDA扫描源码构建�
 `native_stats/ep16_t{8192,20480}_eager_stats.log`。条件已足以准备一个有界协议
 候选：source元数据一致选择格式、保留双credit和静态owner、解码完成后发布
 ready；若融合资源与额外复制抹掉收益就撤回，不提前将GL标为采用。
+
+### GM：有界无损Return wire候选（不采用，2026-09-25/29）
+
+基于GA+FZ，不含GG等已拒绝消融。独立codec抽为一个模块，8块预取加单块尾部；
+运行时values为256的倍数，不再限制纯诊断的H2048。共享同一个helper的微基准
+binary SHA256 `f4b6af16f0d89509ac799ac33c29125c6bf7926f30230eb85a323c8124b304e4`，
+8K/20K全位型/复用/GEMM及1..17块尾部检查通过，各120对codec/GEMM时钟1620，
+独占第二节点单GPU、无并行构建。tail成功行误打印字面量反斜线n，两个成功标记
+仍在，原artifact/log保留；不是跳过检查。p50编码/解码/串行：8K为2298.672/
+2131.488/4429.024us，20K为5749.184/5323.616/11070.512us，约58.4/63.0GB/s。
+单独入口REG64、STACK0/LOCAL0/SHARED1024，不能代替融合资源测量。
+
+候选以冻结的SOURCE tokens>=2048、实际H%256==0选择encoded wire，收发两端
+规则一致，不依赖各GPU自身的decode/prefill入口。其它源仍使用DS直写。FC2原始
+TX不变，新增两个固定深度的encoded TX/RX平面，每slot预留原始max+128B，
+当前双机L32/D8/Q16/H2048增加33619968bytes/rank；不随T增加payload ring深度。
+可编码包压为13bits，不可编码包header0后原样传BF16，不截断route。
+
+Return warp所有lane协作codec，lane0独占GIN/序号/reservation/retirement。
+只在软件依赖就绪之后编码；acquire后广播并warp join，所有写入lane执行
+system fence/join后才能Put或发布contribution ready。双TX credit、expected
+逻辑行数、逐slot generation及GA ACK均不变。解码结束才退休RX，contribution
+另由整窗口Reduce保护。已有return_payload_bytes审计仍计逻辑BF16字节，不把
+它误称为压缩后的wire流量；尚无端到端收益结论，也无新public knob。
+
+复用既有host布局检查，增加wire off/on的1/2/3/70节点对齐、区间不重叠、
+回绕与完整extent检查，18/18通过；这不代表三机以上RDMA实测。初次native
+构建因codec include位于通信内部namespace而遮蔽外层static_v4失败，已移至
+既有primitives聚合位置；失败日志 `build_namespace_failure.log` 留存。05:10
+起重编，native数值、完整算子性能、Torch及sanitizer门禁均尚待执行。
+冻结候选与脚本位于 `build/static_v4_lossless_return_gm/`。
+
+native重编已成功，SHA256
+`ff6332ee5f2adc0dbeb82d44353160c71ea91fa96a8b129aa597592168989d80`。
+2026-09-29恢复工作后核实旧session已不存在，但三份native日志均有完整终态PASS；
+没有据观察超时重启任务。重新逐rank比较EP8/T512、EP16/T64/T2048的160个
+梯度hash均等于GA+FZ，repeat_equal均1，长档网络pool恰好多33619968bytes，
+其它pool相同。当前源码与冻结patch及codec snapshot一致。
+
+八入口完整main SASS已重新dump且非空。local四入口并非逐字节相同，不能复用
+“SASS相同”的专项门禁豁免。全部REG168/SHARED2048/LOCAL0/CONST3264；网络
+inference decode/prefill STACK592（GA+FZ392），training为600（原416/408），
+local资源配置未变。网络main中保留USETMAXREG分配216/释放到64的指令；
+编译C7507在GA+FZ中也存在，不单凭告警归因于codec。
+
+09-29 03:14检查双节点均无GPU进程，再次为全部16张卡设置1620,1620锁频，
+驱动仍570.148.08。显存时钟仅观察、不锁定。03:15起两机独占，无CPU构建或
+其它GPU任务，开始四档GA+FZ→GM的graph10/20/batch20正式对照；当前未采用，
+尚无library/Torch/fresh sanitizer。
+
+03:15–03:20正式四档八组全部exit0，128个输出hash逐rank等于GA+FZ/V3参考，
+shape/world/10/20/batch20核实；短档pool相同、长档恰好多33619968bytes/rank。
+两机独占且无CPU构建，SM锁1620MHz，graph rank-max p50/us：
+
+|T/rank|GA+FZ|GM|GM变慢|
+|---:|---:|---:|---:|
+|1|235.773|238.800|1.28%|
+|64|288.110|289.301|0.41%|
+|8192|2885.120|5075.190|75.91%|
+|20480|6872.750|12456.000|81.24%|
+
+明确不采用GM。正确性与静态owner/有界复用成立，但独立codec的58/63GB/s
+以及约18.55%理论Return字节减少没有转化为流水收益。新增扫描/编码、接收
+解码复制、失去DS直写和融合资源竞争是待分离的成本，当前没有足够的分项
+profile把81%退化归因于某一项；不把上述可能原因冒充已证实瓶颈。
+本轮退化远大于噪声，不再为GM执行反向计时、library/Torch/fresh sanitizer。
+源码、布局与host测试扩展全部撤回，生产恢复GA+FZ；完整候选patch、helper
+snapshot和微基准保留，codec构建脚本改用冻结include overlay以便独立复现。
+正式日志 `lossless_return_{gafz,gm}_ep16_t*_formal.log`。总体长文性能目标仍开放。
