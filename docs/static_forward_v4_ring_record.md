@@ -6,8 +6,8 @@
 ## 当前已采用版本（2026-09-29更新验收范围）
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
-planner、GU短文pull分工、GV metadata发布、GW destination scan及GY紧凑reverse
-规划优化。GX延后到pull的候选已撤回。下面仍是GA+FZ冻结数据，
+planner、GU短文pull分工、GV metadata发布、GW destination scan、GY紧凑reverse
+规划及GZ单机source目录精简。GX延后到pull的候选已撤回。下面仍是GA+FZ冻结数据，
 不混入后续测量。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是GA+FZ完整验收后的正式graph矩阵：
 1620MHz、下述冻结夹具、B512/D8、10warmup/20samples/batch20，rank-max p50/us。
@@ -41,6 +41,9 @@ GV相邻对照再改善约1%–1.7%；同输入复测ring为92.71/114.48us，Meg
 GW再改善约1%，GY合并紧凑reverse规划再改善约4%；最新GY同输入复测ring为
 87.78/108.83us，Mega含copy为53.19/63.38us，仍慢约65%/72%。没有用非ring
 替代ring结果，未满足收尾条件。详细门禁、原始日志及失败的GX见文末。
+GZ仅省去单机inference中无读者的node目录，短档再快约8%；最新同输入复测
+ring为80.71/100.19us，Mega含copy为53.85/63.43us，仍慢约50%/58%。长文、
+双机和补测训练未见明显退化，短文目标仍开放，详见文末GZ节。
 
 ## 冻结基线
 
@@ -6696,3 +6699,90 @@ native SHA256 `95306ad0581c7b8f0091bf86eac304b30398ab091df4aca8517042c107f23c5e`
 library `36ac7963eaf5b31c53872dbfb848a66a7f8c66fdd2c39da085075703f443ea81`；
 extension仍`725bf863...825c3`。下一步继续单独核查短档planner/admission工作，
 不重开已验收的长文目标，不提前计入任何未实现方向的收益。
+
+### GZ：省去单机 inference 的 node 目录（2026-09-29，已采用）
+
+基于GY（`ffaecde`）。读者审计确认，`node_prefix`、`node_tokens`仅由network
+packet prefix/directory及transport使用；单机inference消费expert_prefix和
+route_order，不读取node目录。给共用`build_source_window`增加默认开启的
+编译期`NodeDirectory`，ring caller传入`Network || Training`。因此只有单机
+inference跳过节点去重计数、node前缀scan及node_tokens/fanout写入，网络和训练
+继续生成完整目录。expert计数、错误/mask处理、route预留和所有同步点不变。
+不改pool布局、分配、buffer、counter或运行时参数，没有新增永久测试。
+
+与GV/GY不同，这项覆盖全部单机inference窗口，包括大pool中的短调用和多窗口。
+它不减少有效route，不取消跨机节点去重，也不删除逐slot credit。GEMM、Pull、
+Return/Reduce均未改动。原GPU planner的37 source/packet+7 destination用例
+及racecheck通过，验证默认完整node目录仍正确；精简分支由下面的应用门禁覆盖。
+
+1620MHz、B512/D8、10warmup/20samples/batch20，rank-max p50/us。首轮相邻
+GY→GZ的T1/T64为85.523→78.651、107.717→98.926us；反向T64→T1、每档
+GZ→GY，按GY→GZ列出为85.619→78.498、107.741→98.848us，分别快8.32%/
+8.25%。两轮32个output hash、pool、graph结构和协议一致，前后SM均1620MHz。
+正式计时节点无CPU构建或其它GPU任务，反向时仅另一节点构建应用库。
+
+EP8完整正式graph矩阵，同口径，相邻GY→GZ：
+
+|T/rank|GY/us|GZ/us|
+|---:|---:|---:|
+|1|85.648|78.592|
+|64|107.845|98.934|
+|8192|1240.800|1242.950|
+|20480|2925.320|2919.100|
+
+32个output hash、pool、graph/协议及全部时钟检查通过。长档变化不足0.3%，
+不宣称稳定收益；没有改已验收的GA+FZ长文配置。
+
+同输入MegaMoE应用graph，首轮T64→T1，括号为独立进程T1→T64复测；四case
+在进程内交错，10/20/batch20、rank-max p50/us：
+
+|T/rank|Mega kernel-only|Mega 含3份copy|GZ ring512/D8|已有非ring|
+|---:|---:|---:|---:|---:|
+|1|49.278（49.928）|53.170（53.848）|80.425（80.714）|60.459（61.043）|
+|64|57.800（57.626）|63.548（63.428）|100.529（100.187）|76.456（76.157）|
+
+reference通过，四case各8rank输出SHA256与GY复测逐项一致；2560组前后SM
+读数全部1620MHz，显存时钟未锁。Mega所需copy与kernel在同一个graph内计时。
+两轮均无CPU构建/其它GPU任务；公平含copy口径仍慢约50%/58%，**不能收尾**。
+没有用非ring替代ring结果，也没有测MegaMoE双机。
+
+七种main资源与GY完全一致；本地training prefill的STACK从64变72，其余
+REG168/SHARED2048/LOCAL0/CONST3264不变。虽然training仍选择完整node目录，
+不能据此声称编译结果相同，因此补测了本地训练8K/20K。采用已有native eager
+训练入口，retain_state=1、10warmup/20samples、B512/D8、1620MHz；8K按GY→GZ，
+20K按GZ→GY，表中统一按GY/GZ列出rank-max p50/us：
+
+|T/rank|GY main|GZ main|GY wall|GZ wall|
+|---:|---:|---:|---:|---:|
+|8192|1327.390|1322.500|1819.350|1813.490|
+|20480|3195.580|3191.360|3781.870|3793.260|
+
+16个rank输出hash及输入/权重hash、pool和协议一致，前后全部时钟1620MHz。
+main与wall变化均不足0.4%，不报告训练收益，未见明显回退。这是eager训练
+回归，不能与前面的inference graph相混；未重开训练布局或profile扫描。
+
+其它门禁：host18/18；native EP8/T512、EP16/T64/T2048共160个梯度hash、
+repeat_equal及pool完全等于GY。Torch EP8全四档240条PASS，单容量
+T1/T64/T512+edges 200条PASS，tiny B16/D1/K8 152条PASS；覆盖空/不等长source、
+重复route、graph路由变化、workspace/权重复用、多窗口与热点无丢失。短容量
+rank0/7 memcheck各0 errors、Forward racecheck各0 hazards，各200条PASS。
+EP16全四档及edges 480条PASS。仍不声明完整Backward racecheck关闭。
+
+EP16正式回归按20K→8K→64→1、每档GZ→GY，同口径1620MHz：
+
+|T/rank|GY/us|GZ/us|
+|---:|---:|---:|
+|1|233.950|234.011|
+|64|286.142|286.616|
+|8192|2875.580|2878.480|
+|20480|6851.010|6845.120|
+
+64个output hash、pool/registered bytes及graph/协议一致，双机前后时钟全部
+1620MHz，变化不足0.2%，不报告新增多机收益。所有正式计时节点无并发构建
+或其它GPU任务；完整复核脚本为本次目录的`verify_results.py`。
+
+冻结目录`build/static_v4_local_source_gz/`保存proposal、patch、构建、全部
+samples/hash/clock、sanitizer及复现脚本；源码与冻结patch一致。
+native SHA256 `b3452bef3c57c7ff63391c49c1183af3777cea25de8e77cd088c2535f5f0fbd7`；
+library `548c4aeb895f1e2f707e388c62f2a91f04a052a19cc5d32e05c650127fa58426`；
+extension仍`725bf863...825c3`。后续可独立检查单容量窗口的准入时机，本次未改。

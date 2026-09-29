@@ -46,8 +46,9 @@ prefix_source_counts(unsigned *counts, unsigned size, std::uint64_t *prefix) {
 // The default freezes atomic reservation order. The canonical specialization
 // reuses Notify's stable expert/source ordinals: a contiguous token window
 // selects a contiguous subsequence of each expert, with no masked rows.
+// Local inference needs only the expert directory, not node packet metadata.
 template <unsigned Threads, unsigned BaseThread = 0U, unsigned Barrier = 0U,
-          bool Canonical = false>
+          bool Canonical = false, bool NodeDirectory = true>
 __device__ void build_source_window(const SourcePlanView &a,
                                     std::uint64_t local_window,
                                     unsigned *scratch,
@@ -93,32 +94,35 @@ __device__ void build_source_window(const SourcePlanView &a,
 
   // Each token is owned by one lane. Count one X record for each actually hit
   // node, while retaining all valid route slots, including duplicate experts.
-  for (auto token = tid; token < tokens; token += Threads) {
-    const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;
-    for (unsigned k = 0; k < a.shape.top_k; ++k) {
-      if (a.valid && !a.valid[first_route + k])
-        continue;
-      const auto expert = a.selected_experts[first_route + k];
-      if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
-        continue;
-      const auto node = static_cast<unsigned>(expert) / experts_per_node;
-      bool first = true;
-      for (unsigned previous = 0; previous < k; ++previous) {
-        const auto other = a.selected_experts[first_route + previous];
-        if ((!a.valid || a.valid[first_route + previous]) && other >= 0 &&
-            static_cast<unsigned>(other) < a.experts &&
-            static_cast<unsigned>(other) / experts_per_node == node)
-          first = false;
+  if constexpr (NodeDirectory) {
+    for (auto token = tid; token < tokens; token += Threads) {
+      const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;
+      for (unsigned k = 0; k < a.shape.top_k; ++k) {
+        if (a.valid && !a.valid[first_route + k])
+          continue;
+        const auto expert = a.selected_experts[first_route + k];
+        if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
+          continue;
+        const auto node = static_cast<unsigned>(expert) / experts_per_node;
+        bool first = true;
+        for (unsigned previous = 0; previous < k; ++previous) {
+          const auto other = a.selected_experts[first_route + previous];
+          if ((!a.valid || a.valid[first_route + previous]) && other >= 0 &&
+              static_cast<unsigned>(other) < a.experts &&
+              static_cast<unsigned>(other) / experts_per_node == node)
+            first = false;
+        }
+        if (first)
+          atomicAdd(scratch + a.experts + node, 1U);
       }
-      if (first)
-        atomicAdd(scratch + a.experts + node, 1U);
     }
   }
   source_plan_sync<Threads, Barrier>();
 
   if (tid < 32U) {
     prefix_source_counts(scratch, a.experts, expert_prefix);
-    prefix_source_counts(scratch + a.experts, a.nodes, node_prefix);
+    if constexpr (NodeDirectory)
+      prefix_source_counts(scratch + a.experts, a.nodes, node_prefix);
   }
   source_plan_sync<Threads, Barrier>();
 
@@ -137,29 +141,31 @@ __device__ void build_source_window(const SourcePlanView &a,
       position = atomicAdd(scratch + expert, 1U);
     route_order[position] = route;
   }
-  for (auto token = tid; token < tokens; token += Threads) {
-    const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;
-    for (unsigned k = 0; k < a.shape.top_k; ++k) {
-      if (a.valid && !a.valid[first_route + k])
-        continue;
-      const auto expert = a.selected_experts[first_route + k];
-      if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
-        continue;
-      const auto node = static_cast<unsigned>(expert) / experts_per_node;
-      bool first = true;
-      unsigned fanouts = 0U;
-      for (unsigned other_slot = 0; other_slot < a.shape.top_k; ++other_slot) {
-        const auto other = a.selected_experts[first_route + other_slot];
-        if ((!a.valid || a.valid[first_route + other_slot]) && other >= 0 &&
-            static_cast<unsigned>(other) < a.experts &&
-            static_cast<unsigned>(other) / experts_per_node == node) {
-          first &= other_slot >= k;
-          ++fanouts;
+  if constexpr (NodeDirectory) {
+    for (auto token = tid; token < tokens; token += Threads) {
+      const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;
+      for (unsigned k = 0; k < a.shape.top_k; ++k) {
+        if (a.valid && !a.valid[first_route + k])
+          continue;
+        const auto expert = a.selected_experts[first_route + k];
+        if (expert < 0 || static_cast<unsigned>(expert) >= a.experts)
+          continue;
+        const auto node = static_cast<unsigned>(expert) / experts_per_node;
+        bool first = true;
+        unsigned fanouts = 0U;
+        for (unsigned other_slot = 0; other_slot < a.shape.top_k; ++other_slot) {
+          const auto other = a.selected_experts[first_route + other_slot];
+          if ((!a.valid || a.valid[first_route + other_slot]) && other >= 0 &&
+              static_cast<unsigned>(other) < a.experts &&
+              static_cast<unsigned>(other) / experts_per_node == node) {
+            first &= other_slot >= k;
+            ++fanouts;
+          }
         }
-      }
-      if (first) {
-        const auto position = atomicAdd(scratch + a.experts + node, 1U);
-        node_tokens[position] = {begin + token, fanouts};
+        if (first) {
+          const auto position = atomicAdd(scratch + a.experts + node, 1U);
+          node_tokens[position] = {begin + token, fanouts};
+        }
       }
     }
   }

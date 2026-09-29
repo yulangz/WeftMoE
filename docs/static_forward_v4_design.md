@@ -103,6 +103,9 @@ GW复用source的uint64 warp scan计算destination Mblock前缀，消除thread0�
 GY再将少量工作、单容量窗口的reverse metadata并入CTA0几何规划，同一个
 grid join发布blocks和rows，短档正反向约再快3.8%–4.0%。pull及逐slot合同不变；
 把reverse metadata延后到pull的GX候选反而退化，已撤回，未混入当前实现。
+GZ仅对单机inference省去无读者的node目录生成，保留expert计数/route列表和
+原同步点；短档相邻正反向再快约8%。多机节点去重/fanout和training目录不变，
+当前同输入ring仍慢于MegaMoE约50%/58%，详见ring记录。
 
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
@@ -477,6 +480,14 @@ source ordinal解码，FC1/FC2/Return的读取合同不变。空/错误窗口、
 大pool中的短调用、多窗口、training和network仍使用原分布式reverse pass。
 不同destination可选择不同本地规划分支，但均在同一个source-ready rank
 barrier之后，未删除或分叉跨rank同步。
+
+GZ在`build_source_window`复用一个编译期`NodeDirectory`选择；ring caller传
+`Network || Training`。单机inference只需expert_prefix/route_order，因此
+不再生成node histogram、node_prefix和带fanout的node_tokens。已核查这些
+node字段的生产端读者仅在network packet规划和transport中。此项也适用于
+多窗口及大pool里的短调用，不受GV/GY单容量窗口条件限制；保留全部expert
+计数、masked/非法route处理、route预留及CTA/grid/rank同步。没有减少有效route，
+也没有取消跨机按节点去重；网络和训练均保留完整目录。pool布局与分配未改。
 
 GU仅在单机inference的实际全局窗口数为1、该destination有效行数不超过
 `2 * gridDim.x`时选择Batch1，判定不依赖本rank的输入T或pool最大容量。

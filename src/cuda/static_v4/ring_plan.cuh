@@ -240,7 +240,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     for (auto w = std::uint64_t(blockIdx.x); w < p.local_windows();
          w += gridDim.x)
       static_forward::build_source_window<SourceThreads, Math,
-                                          kCollectiveScopeBarrier, Canonical>(
+                                          kCollectiveScopeBarrier, Canonical,
+                                          Network || Training>(
           planner, w, counts, a.dispatch.route_dst_row);
     if (single_window && blockIdx.x == 0U)
       publish_single_window(a, threadIdx.x - Math, SourceThreads);
