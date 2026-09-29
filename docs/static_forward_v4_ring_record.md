@@ -7080,3 +7080,14 @@ reference通过，四case各8rank的SHA256完全等于HC；2560组前后SM读数
 1620MHz。最新公平含copy口径仍慢约49%/52%，短文目标未完成。完整复核脚本
 `build/static_v4_route_gate_he/verify_results.py`通过，输出存`verification.log`。
 源码与冻结patch一致，采用HE；后续单机decode是独立里程碑，不混入本次收益。
+
+### HF：单机 decode 专属工作流（采用，2026-09-29）
+
+新增独立`local_decode`模块，按MegaMoE的固定pull/TMA/math分工及三个rank边界
+重构短容量路径，不是MNK扫参。完整布局、逐位batch-invariance验证、前后收益
+和回归见[单机decode记录](static_forward_v4_decode_record.md)。
+1620MHz同输入反向复测，HF T1/T64为47.705/55.623us，Mega kernel-only为
+49.121/57.535us、含copy为53.098/63.322us；首轮同样领先，短文目标完成。
+入口限定单机inference、max_tokens<=64且一窗口可容纳最坏路由；长文和多机
+继续用本记录中的原ring协议。EP8/EP16四规模、短文248项逐位/复用检查及
+rank0/7 memcheck/racecheck通过，长文/多机性能差异均小于0.5%。

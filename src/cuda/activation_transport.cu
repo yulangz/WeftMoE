@@ -60,6 +60,8 @@ namespace {
 
 #include "cuda/forward/device_kernels.cuh"
 
+#include "cuda/local_decode/kernel.cuh"
+
 #include "cuda/backward/device_kernels.cuh"
 
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
@@ -223,7 +225,7 @@ struct ActivationMegaKernelBackendState {
   // invariant for a backend's device/context and a fixed kernel geometry.
   // Avoid repeating these driver queries after forward_start on every small
   // Forward invocation.
-  template <class Resources>
+  template <class Resources = void>
   cudaError_t prepare_unified_launch(const void *kernel,
                                      std::size_t dynamic_smem,
                                      unsigned grid_blocks,
@@ -232,9 +234,14 @@ struct ActivationMegaKernelBackendState {
                                      bool programmatic,
                                      bool cooperative_launch,
                                      int *max_active_clusters) {
-    auto error = validate_unified_register_pool<Resources>(kernel);
-    if (error != cudaSuccess)
-      return error;
+    // Only entries using setmaxnreg need a dynamic quota audit. Ordinary
+    // register allocation is checked by the occupancy query below.
+    auto error = cudaSuccess;
+    if constexpr (!std::is_void_v<Resources>) {
+      error = validate_unified_register_pool<Resources>(kernel);
+      if (error != cudaSuccess)
+        return error;
+    }
     const UnifiedLaunchKey key{kernel, dynamic_smem, grid_blocks,
                                block_threads, cluster_size, programmatic,
                                cooperative_launch};
@@ -5223,17 +5230,26 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     : unified_forward_entry<true, true, true, true, true>();
             }
           }
-          const auto smem =
-              forward_unified_detail::shared_bytes<true>(id.world_size);
+          const bool decode = args.fused_inference_routes &&
+              local_decode::eligible(state->config, layout.static_ring);
+          if (decode)
+            kStaticUnified = local_decode::kernel;
+          const auto smem = decode ? sizeof(local_decode::Shared)
+              : forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();
-          internal::throw_cuda(
-              "forward-run",
-              backend->prepare_unified_launch<
-                  forward_tuning::StaticV4Resources>(
+          const auto error = decode
+              ? backend->prepare_unified_launch<>(
                   reinterpret_cast<const void *>(kStaticUnified), smem,
                   forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
                   forward_tuning::kClusterSize, pdl, false,
-                  &max_active_clusters),
+                  &max_active_clusters)
+              : backend->prepare_unified_launch<forward_tuning::StaticV4Resources>(
+                  reinterpret_cast<const void *>(kStaticUnified), smem,
+                  forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
+                  forward_tuning::kClusterSize, pdl, false,
+                  &max_active_clusters);
+          internal::throw_cuda(
+              "forward-run", error,
               id.calling_rank, id.world_size,
               backend->session.session().identity(), id.generation,
               ExchangeKind::ExpertCounts,
@@ -5308,7 +5324,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           launch_forward = cudaLaunchKernelEx(
               &launch, kStaticUnified, args, slot.forward_x_map,
               slot.forward_s_map,
-              prefill ? weight.prefill_w1_map : weight.w1_interleaved_map,
+              (prefill || decode) ? weight.prefill_w1_map : weight.w1_interleaved_map,
               prefill ? weight.prefill_w2_map : weight.w2_map,
               ordinary_output_store_map);
         } else {

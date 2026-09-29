@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--edge-cases", action="store_true")
+    parser.add_argument("--decode", action="store_true",
+                        help="Use short capacity and check bitwise batch invariance")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=300))
@@ -74,9 +76,12 @@ def main():
     w1 = all_w1.chunk(world)[rank].contiguous()
     w2 = all_w2.chunk(world)[rank].contiguous()
     generator.manual_seed(900 + rank)
-    max_tokens = max(*args.tokens, 257 if args.edge_cases else 1)
+    if args.decode and max(args.tokens) > 64:
+        parser.error("--decode requires --tokens <=64")
+    max_tokens = max(*args.tokens, 257 if args.edge_cases and not args.decode else 1)
+    edge_tokens = min(257, max_tokens)
     max_rows = max(2 * max_tokens * args.top_k + (args.experts // world) * 128,
-                   world * 257 * args.top_k)
+                   world * (edge_tokens if args.decode else 257) * args.top_k)
     runtime = TensorRuntime(
         group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
         hidden=hidden, intermediate=intermediate, max_tokens=max_tokens,
@@ -117,11 +122,12 @@ def main():
                   "mixed-prefill-graph")
         # Different actual lengths, including a source with no routes. Pool
         # capacity stays collective and every rank still participates.
-        x, routes, gates = inputs(0 if rank == 0 else 17 + rank, skew=True)
+        x, routes, gates = inputs(0 if rank == 0 else min(17 + rank, max_tokens),
+                                 skew=True)
         actual = runtime.inference_eager(x, routes, gates, w1, w2)
         check(actual, reference(x, routes, gates, all_w1, all_w2), "unequal-empty")
 
-        x, routes, gates = inputs(257, skew=True)
+        x, routes, gates = inputs(edge_tokens, skew=True)
         first = runtime.inference(1, x, routes, gates, w1, w2)
         second = runtime.inference(2, first, routes, gates, w1, w2)
         torch.cuda.synchronize()
@@ -185,6 +191,48 @@ def main():
             actual = runtime.inference_eager(x[:3], routes[:3], gates[:3], w1, w2)
             check(actual, reference(x[:3], routes[:3], gates[:3], all_w1, all_w2),
                   "post-hotspot-reuse" if ring else "capacity-rejection-recovery")
+    if args.decode:
+        def exact(actual, expected, label):
+            assert torch.equal(actual, expected), f"not batch invariant: {label}"
+            check(actual, expected, label)
+
+        x, routes, gates = inputs(max_tokens)
+        baseline = runtime.inference_eager(x, routes, gates, w1, w2).clone()
+        for tokens in sorted({1, min(7, max_tokens), min(32, max_tokens), max_tokens}):
+            exact(runtime.inference_eager(x[:tokens], routes[:tokens], gates[:tokens],
+                                          w1, w2), baseline[:tokens],
+                  f"batch-invariant-eager-{tokens}")
+            exact(runtime.inference(5, x[:tokens], routes[:tokens], gates[:tokens],
+                                    w1, w2), baseline[:tokens],
+                  f"batch-invariant-graph-{tokens}")
+        permutation = torch.arange(max_tokens - 1, -1, -1, device="cuda")
+        exact(runtime.inference_eager(x[permutation], routes[permutation],
+                                      gates[permutation], w1, w2),
+              baseline[permutation], "batch-invariant-permutation")
+        tokens = min(1 + rank * 7, max_tokens)
+        exact(runtime.inference_eager(x[:tokens], routes[:tokens], gates[:tokens],
+                                      w1, w2), baseline[:tokens],
+              "batch-invariant-unequal-sources")
+
+        # Changing other rows' routes changes the anchor's expert M-tile and
+        # padding without changing any of its arithmetic inputs.
+        hot_routes = torch.full_like(routes, args.experts - 1)
+        hot_baseline = runtime.inference_eager(
+            x[:1], hot_routes[:1], gates[:1], w1, w2).clone()
+        exact(runtime.inference_eager(x, hot_routes, gates, w1, w2)[:1],
+              hot_baseline, "batch-invariant-hot-expert")
+
+        # A large-capacity pool selects the unchanged general V4 kernel even
+        # for these short actual inputs. The numerical contract is shared.
+        general = TensorRuntime(
+            group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
+            hidden=hidden, intermediate=intermediate, max_tokens=512,
+            max_rows=world * 512 * args.top_k + (args.experts // world) * 128,
+            training=False,
+        )
+        exact(general.inference_eager(x, routes, gates, w1, w2), baseline,
+              "decode-general-bitwise-parity")
+        general.close()
     runtime.close()
     dist.destroy_process_group()
 

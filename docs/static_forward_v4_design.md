@@ -10,6 +10,7 @@ V4 已经落地。**
 - [多机优化记录](static_forward_v4_multinode_record.md)
 - [prefill GEMM/epilogue 优化记录](static_forward_v4_prefill_record.md)
 - [ring 实施与优化记录](static_forward_v4_ring_record.md)
+- [单机 decode 专属实现与验收](static_forward_v4_decode_record.md)
 
 ## 0. 当前代码基线：已实现什么
 
@@ -18,8 +19,8 @@ opt-in ring（`WEFTMOE_STATIC_RING_TOKENS=B`）已接通单机及多机
 Dispatch→pull→X→FC1→S→FC2→C→Return→contribution→Reduce。多机按命中节点
 去重发送 X，逐 packet ready/credit 推进，可与计算重叠；第 6.6 节描述当前
 数据面。完整 EP8/EP16 数值测试已通过；2026-09-29用户已确认GA+FZ的8K/20K
-inference领先V3符合预期。当前收尾条件是单机EP8/T1/T64接近或领先MegaMoE，
-不要求MegaMoE双机对照；该短文条件尚未满足。正式矩阵和后续消融见ring记录，
+inference领先V3符合预期。单机EP8/T1/T64接近或领先MegaMoE的收尾条件已由
+HF专属decode实现满足（仅单机对照，见decode记录）。正式矩阵和后续消融见ring记录，
 下文按实施顺序保留各阶段当时的结果。纯GEMM布局/profile及入口选择已完成；训练对接
 已接通，完整门禁仍未完成，见下方M6及训练记录。FC2 直接写预留的本地 contribution 或同节点 rail 的 Return
 TX；已删除没有读者的 C payload，保留 FC2/returned 生命周期账本。远端 TX
@@ -117,6 +118,16 @@ peer gate读取；完整单/双机、训练与复用门禁通过后采用。nati
 实现单机decode的通信/计算/同步工作流，参考MegaMoE并验证batch invariance；
 先解决宏观流程，不以MNK参数扫描代替该重构，prefill和多机维持已验收路径。
 
+HF已完成这一独立里程碑：新增`local_decode::kernel`，固定三条pull warp、
+一个TMA producer及两个math WG；去掉短容量内不需要的通用窗口规划、
+admission和return-fragment目录，FC2直接写source contribution。保留
+BeforePull/BeforeCombine/AfterClean边界及SMEM full/empty流水，沿用Weft
+数值合同；batch大小、行序及专家热点变化的逐位一致性通过。单机inference
+短容量pool（max_tokens<=64、一个容量窗口）自动选择此入口；大容量pool、
+多机、训练和非ring保持原路径。1620MHz同输入两轮1/64token均比Mega kernel-only
+低约2.9%–4.0%；EP8/EP16四规模回归通过，长文及多机差异均小于0.5%。
+完整布局、同步证明、收益及使用边界见[decode记录](static_forward_v4_decode_record.md)。
+
 | 项目 | 默认 full-arena 路径（非 ring） |
 |---|---|
 | 单机 Dispatch | source staging 后，expert GPU 的固定通信 warp 通过 NVLink destination-pull |
@@ -146,7 +157,7 @@ ring 验收配置 `configs/static_inference_ring_20260924/` 沿用上述两组 G
 四个指定规模已正式计时；阈值并非任意模型或三机以上的最优值。ring仍显式
 启用，未改变默认非ring训练路径。见ring记录DC，不能将profile选择与通信改造的收益合并归因。
 
-这里的decode/prefill是`unified_forward_kernel<..., Prefill, ...>`分别编译的
+通用V4路径的decode/prefill是`unified_forward_kernel<..., Prefill, ...>`分别编译的
 CUDA入口，不是同一个kernel内运行时修改GEMM参数，也不是两份复制的实现。
 host在launch前选择入口及对应tile尺寸的TMA descriptor；两个入口共享同一份
 packed gate8/up8权重和ring协议/调度模块。窄入口FC1输出N32，采用直接写回；
@@ -154,6 +165,8 @@ packed gate8/up8权重和ring协议/调度模块。窄入口FC1输出N32，采�
 直接写。每次inference选择一个融合Forward main，不是先后启动decode和
 prefill两个kernel。`RetainBackwardState`是另一个独立编译维度；训练ring
 额外有planner/tape准备，Backward仍复用已验证的V3实现。
+HF另有真正独立的单机短容量decode kernel/工作流，已不只是上述模板profile
+的区分；它复用数值、地址和collective模块，不影响这里的通用入口。
 
 full-arena 历史基线的 graph rank-max p50（us），核心 1620 MHz：
 
