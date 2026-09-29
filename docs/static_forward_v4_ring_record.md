@@ -3,7 +3,7 @@
 日期：2026-09-23。设计依据：[有界流水设计](static_forward_v4_design.md)。
 本记录区分代码落地、独立协议验证和端到端启用，不把准备工作记为性能收益。
 
-## 当前已采用版本（2026-09-25）
+## 当前已采用版本（2026-09-29更新验收范围）
 
 生产里程碑为`33d99a5`（GA + FZ），后续候选未计入下面数据。Ring仍显式启用，
 不改变默认full-arena/V3训练回退。以下是该版本完整验收后的正式graph矩阵：
@@ -17,9 +17,11 @@ EP8是单机8卡，EP16是双机各8卡；显存时钟仅观测，没有锁定�
 |8192|1489.090|1246.600|3355.780|2893.170|
 |20480|3295.760|2937.720|7102.290|6863.170|
 
-双机20K仅比V3快3.37%，仍未关闭显著领先目标。训练长文Forward wall也仍落后
-V3：单机B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益
-代替训练达标。完整hash、容量、测试范围及原始日志见文末GA+FZ验收和
+双机20K比V3快3.37%；2026-09-29用户确认GA+FZ的8K/20K收益已符合预期，
+收尾改为核对单机EP8/T1/T64与MegaMoE是否接近或领先，不再要求MegaMoE双机
+对照。新codec/CTA候选不计入GA+FZ。训练长文Forward wall仍落后V3：单机
+B512约5.3%，双机即使B1024仍约9.6%/14.4%；不能用inference收益代替训练
+性能事实。完整hash、容量、测试范围及原始日志见文末GA+FZ验收和
 [训练记录](static_forward_v4_training_record.md)。后续各候选按时间顺序追加；
 “数值通过”“纯GEMM通过”和“已采用”是不同状态。
 
@@ -6125,3 +6127,56 @@ shape/world/采样数核实。rank-max p50/us：
 sanitizer。生产代码/profile未改变。该结果只否定本配置，未证明队首阻塞
 不存在。日志 `fixed_owners_lanes64_{gafz,gn}_ep16_t*_formal.log`，完整构建
 和native脚本在候选目录。总体长文目标仍未完成。
+
+### GO/GP：通信专用CTA下分离原始Return与codec成本（未采用，2026-09-29）
+
+GM完整算子新增延迟8K/20K为2190.07/5583.25us，与同helper独立编解码
+耗时按native实际字节减半后的2215.08/5536.40us接近。这只是重新检查
+codec与GEMM资源/依赖竞争的线索，不能据此认定已有瓶颈归因。
+
+GO先在当前GA+FZ、L32/32 owners/96 contexts上复用旧BZ的通信专用CTA
+机制作为控制组：仅network prefill的前64 CTA（完整32 clusters）不执行
+GEMM/TMA producer，余下68 CTA重新分配静态residue。通信角色、所有初始化
+和末尾collective仍覆盖全部132 CTA，无CTA提前退出、无动态任务领用。
+host任务上限按剩余cluster检查；FZ checkpoint轮转依赖mblock/Ntile，
+不依赖物理cluster数。原始BF16/DS wire与双credit均不变。
+
+旧BZ已否定其当时的纯BF16收益，因此GO不是把旧实验换名宣称新优化；它是
+为GP（GO + 原GM codec）提供当前代码下的独立控制。比较GA+FZ→GO分离
+任务重分配成本，GO→GP分离相同资源布局下的codec增量；冻结GM可对照交互。
+03:40开始GO native构建，候选目录 `build/static_v4_comm_isolation_go/`。
+没有新增永久测试或修改生产profile；正确性、资源及四档性能结果尚待验证。
+
+GO native SHA256 `3f293ad9eb3c51a4e95c2c88220b83ede48d6331d837b2c550a355b4bed64cdb`，
+八入口资源与GA+FZ一致（未做SASS字节等价审计）。EP8/T512、EP16/T64/T2048
+均通过，160个梯度hash逐rank等于GA+FZ，repeat_equal均1、pool完全相同。
+这组仅为数值回归，与后续CPU构建有重叠，不用于性能比较。
+
+03:44在GO编译完成后，叠加冻结GM patch及相同helper构建GP，保存于
+`build/static_v4_comm_codec_gp/`。复用原有host检查，含GM wire off/on布局，
+18/18通过；GP native编译、数值和完整性能待完成。无新codec算法或不同的
+wire选择阈值，仍按source metadata决定，因此不能混淆为编码率优化。
+
+GP native SHA256 `7ceef94574d074fbb37652fcb34b09387887e7637ccb61105b106e39ac29044a`。
+三组native全部通过，160个梯度hash等于GA+FZ、repeat_equal均1，只有EP16/T2048
+pool增加33619968bytes/rank，和GM相同。八入口REG168/SHARED2048/LOCAL0/
+CONST3264；network inference STACK592、training600，local资源与GA+FZ相同。
+没有SASS字节等价结论。GP host18/18，未构建library/Torch/fresh sanitizer。
+
+03:50–03:57两机独占、无CPU构建/其它GPU任务，四档相邻GA+FZ→GO→GP，
+1620MHz、B512/D8、graph10/20/batch20。192个输出hash等于GA+FZ/V3参考，
+shape/world/采样数及每rank pool核实。rank-max p50/us：
+
+|T/rank|GA+FZ|GO 原始BF16|GP codec+专用CTA|
+|---:|---:|---:|---:|
+|1|235.915|235.982|238.989|
+|64|286.853|288.070|288.750|
+|8192|2890.900|2863.520|4930.990|
+|20480|6877.050|6823.730|12071.700|
+
+GP长档仍明显退化，不能靠隔离GEMM恢复codec收益。GO长档仅约0.95%/0.78%
+改善，未做反向复测/完整门禁，不据此采用。用户在本轮末尾确认GA+FZ长文
+已达到预期，任务转向与MegaMoE短文对照，因此不再推进GO或新的编码算法。
+源码和已有host测试扩展全部撤回，生产仍为GA+FZ；候选patch/helper和二进制
+已冻结。GQ modulo-exponent只准备了build目录中的独立源码，未编译/运行，
+无性能或正确性结论。日志 `comm_codec_{gafz,go,gp}_ep16_t*_formal.log`。
