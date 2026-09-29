@@ -277,3 +277,30 @@ HH1 全部计时的 NVML 样本均为 1620 MHz，没有并行编译或其他 GPU
 上述 9 个 bucket 均通过 baseline 数值对照；另用现有 SGLang adapter 测试在
 EP4/T17 覆盖尾部补齐、masked route 与 eager 清洗一致、变更输入的图回放、
 权重更新后释放/重建，4 rank 通过。原始日志与 trace 在 `build/local_decode_hh/`。
+
+### HH2：跳过 M128 block 中为空的上半 warpgroup
+
+保持 M128 物理布局、TMA box 和所有 SMEM credit 不变，仅在 `valid_rows <= 64`
+时省略第二个 math warpgroup 的 WGMMA。它仍等待 full、归还 empty、参与 epilogue
+同步；真实行的 K16 累加顺序和 BF16 舍入不变。热点块超过 64 行时正常计算两半。
+
+在 HH1 上叠加此项，同机同配方、全部 SM 采样 1620 MHz：
+
+|全局 T|baseline|HH1|HH2|
+|---:|---:|---:|---:|
+|1|30.024|66.138|63.980|
+|16|84.870|128.158|123.373|
+|32|106.437|146.748|141.588|
+|48|130.948|170.068|161.845|
+|64|149.973|178.628|172.087|
+|96|179.378|187.100|179.694|
+|128|185.586|191.627|185.087|
+|256|197.956|196.536|190.254|
+|512|211.983|373.559|373.049|
+
+实际收益约 2–8 µs，而非按省掉一半 WGMMA 推断两倍提速。32/64 仍慢于
+baseline，需要继续处理主循环等待和固定开销。decode 为 100 registers，
+0 stack/local spill（HG 为 112）；8 个通用 V4 ring entry 的 SASS 逐指令不变。
+EP1/2/4/8 共 465 个 native rank/case 通过，含逐位 batch-invariance、热点跨块、
+通用 V4 对齐；同四种 EP 的 T17 与 `64*EP+1` 共 30 个 SGLang rank/case 通过。
+本项尚未单独通过 sanitizer，也没有重跑 RL；最终候选再统一验收。

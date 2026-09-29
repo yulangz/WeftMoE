@@ -86,26 +86,30 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                  : forward_tuning::kMainHidden;
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.full[stage].wait(phase);
-      auto da = hopper::make_gmma_desc<hopper::Major::K, kM, kK, 128U>(
-          s.a[stage], half * 64U, 0U);
-      auto db = hopper::make_gmma_desc<hopper::Major::K, kN, kK, 128U>(
-          s.b[stage], 0U, 0U);
-      const auto abase = da.reg32_[0], bbase = db.reg32_[0];
+      // Each warpgroup owns independent rows and accumulators. A sparse block
+      // can omit its empty upper half without changing any real row's K order.
+      if (half * 64U < t.rows) {
+        auto da = hopper::make_gmma_desc<hopper::Major::K, kM, kK, 128U>(
+            s.a[stage], half * 64U, 0U);
+        auto db = hopper::make_gmma_desc<hopper::Major::K, kN, kK, 128U>(
+            s.b[stage], 0U, 0U);
+        const auto abase = da.reg32_[0], bbase = db.reg32_[0];
 #pragma unroll
-      for (unsigned i = 0U; i < Mma::kNumAccum; ++i)
-        cute::warpgroup_fence_operand(accum[i]);
-      cute::warpgroup_arrive();
+        for (unsigned i = 0U; i < Mma::kNumAccum; ++i)
+          cute::warpgroup_fence_operand(accum[i]);
+        cute::warpgroup_arrive();
 #pragma unroll
-      for (unsigned atom = 0U; atom < kK / Mma::K; ++atom) {
-        da.reg32_[0] = abase + atom * Mma::K * 2U / 16U;
-        db.reg32_[0] = bbase + atom * Mma::K * 2U / 16U;
-        Mma::wgmma(da, db, accum, k != 0U || atom != 0U);
+        for (unsigned atom = 0U; atom < kK / Mma::K; ++atom) {
+          da.reg32_[0] = abase + atom * Mma::K * 2U / 16U;
+          db.reg32_[0] = bbase + atom * Mma::K * 2U / 16U;
+          Mma::wgmma(da, db, accum, k != 0U || atom != 0U);
+        }
+        cute::warpgroup_commit_batch();
+#pragma unroll
+        for (unsigned i = 0U; i < Mma::kNumAccum; ++i)
+          cute::warpgroup_fence_operand(accum[i]);
+        cute::warpgroup_wait<0>();
       }
-      cute::warpgroup_commit_batch();
-#pragma unroll
-      for (unsigned i = 0U; i < Mma::kNumAccum; ++i)
-        cute::warpgroup_fence_operand(accum[i]);
-      cute::warpgroup_wait<0>();
       if (lane < 2U)
         s.empty[stage].arrive(lane);
       stage = (stage + 1U) % kStages;
