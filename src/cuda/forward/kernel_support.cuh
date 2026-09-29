@@ -1395,6 +1395,8 @@ struct PoolSlot {
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
   CUtensorMap forward_s_map{};
+  CUtensorMap decode_x_map{};
+  CUtensorMap decode_s_map{};
   CUtensorMap forward_output_store_map{};
   CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};

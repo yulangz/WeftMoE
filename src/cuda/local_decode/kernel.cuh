@@ -139,7 +139,9 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     const __grid_constant__ CUtensorMap s_map,
     const __grid_constant__ CUtensorMap w1_map,
     const __grid_constant__ CUtensorMap w2_map,
-    const __grid_constant__ CUtensorMap output_map) {
+    const __grid_constant__ CUtensorMap output_map,
+    const __grid_constant__ CUtensorMap sparse_x_map,
+    const __grid_constant__ CUtensorMap sparse_s_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
   extern __shared__ __align__(1024) unsigned char storage[];
   auto &s = *reinterpret_cast<Shared *>(storage);
@@ -161,7 +163,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   if (threadIdx.x == kMathThreads) {
     for (unsigned stage = 0U; stage < kStages; ++stage) {
       s.full[stage].init(1U);
-      s.empty[stage].init(16U);
+      s.empty[stage].init(2U * (kMathThreads / 128U));
     }
     for (auto &barrier : s.pull_full)
       barrier.init(1U);
@@ -171,6 +173,17 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     cute::prefetch_tma_descriptor(&w1_map);
     cute::prefetch_tma_descriptor(&w2_map);
     cute::prefetch_tma_descriptor(&output_map);
+    cute::prefetch_tma_descriptor(&sparse_x_map);
+    cute::prefetch_tma_descriptor(&sparse_s_map);
+  }
+  if (threadIdx.x < kMathThreads) {
+    // Sparse TMA boxes leave unused rows untouched. Initialize them once;
+    // WGMMA's real rows remain independent of these padding values.
+    auto *padding = reinterpret_cast<uint4 *>(s.a);
+    for (unsigned i = threadIdx.x; i < kStages * kM * kK / 8U;
+         i += kMathThreads)
+      padding[i] = {};
+    ::cuda::device::experimental::fence_proxy_async_shared_cta();
   }
   cute::cluster_sync();
   if (threadIdx.x < kMathThreads) {
@@ -195,7 +208,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     compute(a, s, output_map);
     static_v4::before_combine(a);
   } else if (threadIdx.x < 288U) {
-    produce(a, s, x_map, s_map, w1_map, w2_map);
+    produce(a, s, x_map, s_map, w1_map, w2_map, sparse_x_map, sparse_s_map);
   } else {
     pull(a, s);
   }

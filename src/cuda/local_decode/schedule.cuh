@@ -3,6 +3,7 @@
 namespace local_decode {
 
 constexpr unsigned kM = 128U, kN = 128U, kK = 64U, kStages = 5U;
+constexpr unsigned kSparseRows = 8U;
 constexpr unsigned kThreads = 384U, kMathThreads = 256U;
 constexpr unsigned kMaxExperts = 256U;
 constexpr unsigned kFc1Tiles = 2U * forward_tuning::kMainIntermediate / kN;

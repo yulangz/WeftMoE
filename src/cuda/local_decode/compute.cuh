@@ -6,7 +6,8 @@ namespace local_decode {
 __device__ __forceinline__ void produce(
     const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
     const CUtensorMap &s_map, const CUtensorMap &w1_map,
-    const CUtensorMap &w2_map) {
+    const CUtensorMap &w2_map, const CUtensorMap &sparse_x_map,
+    const CUtensorMap &sparse_s_map) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto tasks = s.blocks[owned] * (kFc1Tiles + kFc2Tiles);
   unsigned stage = 0U, phase = 0U;
@@ -20,16 +21,20 @@ __device__ __forceinline__ void produce(
                                  : forward_tuning::kMainHidden;
     const auto columns = t.fc2 ? forward_tuning::kMainHidden
                                : 2U * forward_tuning::kMainIntermediate;
+    const bool sparse = t.rows <= kSparseRows;
+    const auto *input_map = t.fc2 ? (sparse ? &sparse_s_map : &s_map)
+                                 : (sparse ? &sparse_x_map : &x_map);
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
         hopper::tma_load<kK, kM, 128U>(
-            t.fc2 ? &s_map : &x_map, &s.full[stage], s.a[stage],
+            input_map, &s.full[stage], s.a[stage],
             k, t.block * kM, 2U);
         hopper::tma_load<kK, kN, 128U>(
             t.fc2 ? &w2_map : &w1_map, &s.full[stage], s.b[stage],
             k, t.expert * columns + t.column * kN);
-        s.full[stage].arrive_and_expect_tx((kM + kN) * kK * 2U);
+        s.full[stage].arrive_and_expect_tx(
+            ((sparse ? kSparseRows : kM) + kN) * kK * 2U);
       }
       stage = (stage + 1U) % kStages;
       phase ^= stage == 0U;
@@ -71,6 +76,7 @@ __device__ __forceinline__ void store_fc1(
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                         const CUtensorMap &output_map) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
+  const auto fc1_tasks = s.blocks[owned] * kFc1Tiles;
   const auto tasks = s.blocks[owned] * (kFc1Tiles + kFc2Tiles);
   const auto half = threadIdx.x / 128U;
   const auto lane = threadIdx.x % 32U;
@@ -78,12 +84,23 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
   unsigned stage = 0U, phase = 0U;
   for (unsigned index = blockIdx.x; index < tasks; index += gridDim.x) {
     const auto t = task(s, owned, index);
-    if (threadIdx.x == 0U)
+    // Phase extrema need only this CTA's first/last task, not a contended
+    // global atomic at every tile. The static sequence puts FC1 before FC2.
+    const bool first = index < (t.fc2 ? fc1_tasks : 0U) + gridDim.x;
+    const bool last = index + gridDim.x >= (t.fc2 ? tasks : fc1_tasks);
+    if (threadIdx.x == 0U && first)
       atomicMin(t.fc2 ? &status->dispatch_blocks_done : &status->fc1_start_clock,
                 device_globaltimer_ns());
     float accum[Mma::kNumAccum] = {};
     const auto reduction = t.fc2 ? forward_tuning::kMainIntermediate
                                  : forward_tuning::kMainHidden;
+    unsigned retirement = stage;
+    const auto release = [&](unsigned retired) {
+      // WGMMA wait is warpgroup-aligned. One lane per CTA destination can
+      // return this WG's credit for both multicast readers.
+      if (threadIdx.x % 128U < 2U)
+        s.empty[retired].arrive(lane);
+    };
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.full[stage].wait(phase);
       // Each warpgroup owns independent rows and accumulators. A sparse block
@@ -108,23 +125,29 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
 #pragma unroll
         for (unsigned i = 0U; i < Mma::kNumAccum; ++i)
           cute::warpgroup_fence_operand(accum[i]);
-        cute::warpgroup_wait<0>();
       }
-      if (lane < 2U)
-        s.empty[stage].arrive(lane);
+      // Keep the newest group in flight while releasing only the retired
+      // FIFO head. The producer cannot overwrite a still-referenced stage.
+      if (k != 0U) {
+        cute::warpgroup_wait<1>();
+        release(retirement);
+        retirement = (retirement + 1U) % kStages;
+      }
       stage = (stage + 1U) % kStages;
       phase ^= stage == 0U;
     }
+    cute::warpgroup_wait<0>();
+    release(retirement);
     if (t.fc2) {
-      if (threadIdx.x == 0U)
+      if (threadIdx.x == 0U && first)
         atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
       forward_compute_detail::static_v4_push_fc2_tile<Mma, false, kN, true>(
           a, s.output, accum, t.block * kM, t.rows, t.column * kN, t.block);
-      if (threadIdx.x == 0U)
+      if (threadIdx.x == 0U && last)
         atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
     } else {
       store_fc1(a, s, t, accum, output_map);
-      if (threadIdx.x == 0U)
+      if (threadIdx.x == 0U && last)
         atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
     }
   }

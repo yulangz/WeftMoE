@@ -304,3 +304,49 @@ baseline，需要继续处理主循环等待和固定开销。decode 为 100 reg
 EP1/2/4/8 共 465 个 native rank/case 通过，含逐位 batch-invariance、热点跨块、
 通用 V4 对齐；同四种 EP 的 T17 与 `64*EP+1` 共 30 个 SGLang rank/case 通过。
 本项尚未单独通过 sanitizer，也没有重跑 RL；最终候选再统一验收。
+
+### 后续消融（候选，尚未完成最终验收）
+
+- `local_decode_hh_pipe`：WGMMA 保留最新一组在飞，只在前一组退休后返还对应
+  SMEM stage；末尾 drain 后归还最后一个。empty credit 从每 warp 改为每
+  warpgroup 发布，期望计数从 16 降至 4，仍包含 cluster2 的全部读者。
+- `local_decode_hh_sparse`：在上一项上增加 8-row X/S TMA descriptor。
+  `valid_rows <= 8` 仅搬 8 行，其他块搬 128 行；物理 M128、K16 算术顺序、
+  gate/up 舍入与最终 combine 顺序都不变。SMEM A 的未搬运行在调用开始置零。
+  descriptor 随 decode pool 准备，热路径不修改 descriptor，不增加 GM payload。
+
+同机 EP4 的交替图测量，全部 NVML 时钟样本 1620 MHz，单位 µs：
+
+|全局 T|baseline（稀疏轮）|HH2|流水 + WG credit|再加稀疏 TMA|
+|---:|---:|---:|---:|---:|
+|1|30.103|63.980|63.942|63.154|
+|16|84.849|123.373|121.026|115.742|
+|32|106.629|141.588|139.844|131.951|
+|48|131.141|161.845|160.551|152.216|
+|64|150.067|172.087|169.774|161.104|
+|96|179.545|179.694|177.834|168.662|
+|128|185.381|185.087|182.490|172.935|
+|256|198.149|190.254|187.591|182.134|
+|512|211.962|373.049|373.843|373.980|
+
+流水项只省约 2 µs，稀疏搬运再省约 8–10 µs；并未完全解决 32/64 的差距。
+两轮的 9 个 bucket 均通过 baseline 数值对照，不代表完整 batch-invariance
+和 sanitizer 验收。
+
+另用 **EP1** 的 T32 做 NCU 完整 graph 诊断，见
+`build/local_decode_hh/ncu_sparse_graph_r2_details.txt`。采样报告为约 38% DRAM、
+15% compute 利用率，约 79% scheduler cycle 没有 eligible warp，barrier stall
+占约 32%。这不是 EP4 的直接归因，也不是正式性能数据：NCU 报告的有效 SM
+频率为 1.48 GHz，尽管目标及调用前后 NVML 为 1620 MHz，且多 pass 会扰动执行。
+最初按单 kernel replay 的采样停滞，主动停止后确认 GPU 清空，改完整 graph
+replay 才成功；不把这个 profiling 失败记成应用 kernel 失败。
+
+`local_decode_hh_stats` 再把每 tile 的阶段计时原子操作缩减为每 CTA 每阶段的
+首尾 extrema，统计含义不变。T1/16/32/48/64/96/128/256/512 依次为
+62.769/115.542/130.742/151.056/159.502/166.642/171.863/180.692/373.585 µs，
+9 个 bucket 的 baseline 数值对照通过，全部时钟采样 1620 MHz。此项只省约
+1–2 µs，不支持把全局计时原子竞争当作主要原因。
+
+稀疏版本已补齐 EP1/2/4/8 共 465 个 native 和 30 个 SGLang rank/case，全部
+通过；包含逐位 batch-invariance、热点跨 M-block 和通用 V4 对齐。带首尾统计
+的最终候选正在做 sanitizer；RL 尚未重跑。

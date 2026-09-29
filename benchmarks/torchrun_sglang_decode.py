@@ -34,6 +34,11 @@ def main():
         "--tokens", type=int, nargs="+", default=[1, 16, 32, 48, 64, 96, 128, 256, 512]
     )
     parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument(
+        "--profile-ncu",
+        action="store_true",
+        help="Bracket one warmed Weft graph for NCU application replay",
+    )
     parser.add_argument("--samples", type=int, default=20)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -140,6 +145,12 @@ def main():
                 ),
                 flush=True,
             )
+        if args.profile_ncu:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            graphs["weftmoe"].replay()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
         if args.trace_dir:
             if rank == 0:
                 args.trace_dir.mkdir(parents=True, exist_ok=True)

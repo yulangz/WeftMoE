@@ -2108,6 +2108,16 @@ make_activation_pool_state(const CollectiveSession &session,
             config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U",
             forward_tuning::kTileK);
+        if (local_decode::eligible(config, state->layout.static_ring)) {
+          slot.decode_x_map = make_bf16_tma_map(
+              at<void>(slot.device, state->layout.canonical_rows),
+              config.max_hidden_size, activation_rows,
+              local_decode::kSparseRows, "decode sparse X", local_decode::kK);
+          slot.decode_s_map = make_bf16_tma_map(
+              at<void>(slot.device, state->layout.forward_s),
+              config.max_intermediate_size, activation_rows,
+              local_decode::kSparseRows, "decode sparse S", local_decode::kK);
+        }
         // Ring FC2 writes contribution/Return TX directly. Reuse its unused
         // epilogue descriptor for FC1 S; arena entries still describe C.
         const bool ring = state->layout.static_ring.depth != 0U;
@@ -5232,14 +5242,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           const bool decode = args.fused_inference_routes &&
               local_decode::eligible(state->config, layout.static_ring);
-          if (decode)
-            kStaticUnified = local_decode::kernel;
           const auto smem = decode ? sizeof(local_decode::Shared)
               : forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();
           const auto error = decode
               ? backend->prepare_unified_launch<>(
-                  reinterpret_cast<const void *>(kStaticUnified), smem,
+                  reinterpret_cast<const void *>(local_decode::kernel), smem,
                   forward_main_compute_ctas, forward_tuning::kUnifiedThreads,
                   forward_tuning::kClusterSize, pdl, false,
                   &max_active_clusters)
@@ -5321,10 +5329,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             // The same-stream main consumes the completed physical plan;
             // no device result is needed to size or bind the tape on host.
           }
-          launch_forward = cudaLaunchKernelEx(
+          if (decode)
+            launch_forward = cudaLaunchKernelEx(
+                &launch, local_decode::kernel, args, slot.forward_x_map,
+                slot.forward_s_map, weight.prefill_w1_map, weight.w2_map,
+                ordinary_output_store_map, slot.decode_x_map, slot.decode_s_map);
+          else
+            launch_forward = cudaLaunchKernelEx(
               &launch, kStaticUnified, args, slot.forward_x_map,
               slot.forward_s_map,
-              (prefill || decode) ? weight.prefill_w1_map : weight.w1_interleaved_map,
+              prefill ? weight.prefill_w1_map : weight.w1_interleaved_map,
               prefill ? weight.prefill_w2_map : weight.w2_map,
               ordinary_output_store_map);
         } else {
