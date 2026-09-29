@@ -6082,3 +6082,46 @@ profile把81%退化归因于某一项；不把上述可能原因冒充已证实�
 源码、布局与host测试扩展全部撤回，生产恢复GA+FZ；完整候选patch、helper
 snapshot和微基准保留，codec构建脚本改用冻结include overlay以便独立复现。
 正式日志 `lossless_return_{gafz,gm}_ep16_t*_formal.log`。总体长文性能目标仍开放。
+
+### GN：保持32 owners，只将L32改为L64（不采用，2026-09-29）
+
+独立回到GA+FZ的原始BF16/DS数据面，不含GM。只改变编译配置
+NETWORK_LANES=64，仍32 network workers、96 contexts及原CTA角色分配，
+DispatchQ8/ReturnQ16、B512/D8不变。旧BN同时增加到64 owners/192 contexts，
+并大幅削减local Return等角色，不能从BN直接推出本次单变量结果。此前减少
+owner、分离发包角色、共享context的失败实验也不等价于此候选。
+
+B512均衡夹具每源窗口每方向64包：L32时一个channel串行两个包，L64时可让
+同一owner用固定residue检查两个独立FIFO channel。假设是减少队首未ready
+导致的其它已ready包等待；并未证明存在瓶颈或性能收益。它也增加有界网络
+容量/metadata和轮询工作，不能将可能的改善只归因于队首阻塞。短源Return
+partition按现有规则适配64 lanes，因此短档也必须回归。
+
+03:24开始独立native构建，生产源码/profile均未修改。冻结
+`build/static_v4_fixed_owners_lanes64_gn/`。先复用既有host/native数值检查，
+通过后再做同日相邻四档对照；收益稳定才进入反向及完整集成门禁。
+
+native SHA256 `74319dd588beea83e27756485617258d5a592f4ea79bbc8c35ea808504780756`。
+八入口资源与GA+FZ一致：REG168/SHARED2048/LOCAL0/CONST3264；local inference
+STACK80/64、training72，network inference392、training416/408。未做SASS
+逐字节等价审计。host首次与native并行构建时被输入变化检测中止，未运行测试；
+原始失败日志保留，具体mtime变化原因未确定。native完成后重试18/18通过。
+host布局测试使用显式L2，不将此称为直接证明L64所有节点数的布局；真实L64
+双节点由native覆盖。EP8/T512、EP16/T64/T2048的160个梯度hash逐rank等于
+GA+FZ，repeat_equal均1；pool分别389792512/436611904/901100608bytes。
+
+03:32开始四档相邻GA+FZ→GN正式计时，两机独占，无CPU构建及其它GPU任务；
+1620MHz，B512/D8，graph10/20/batch20。128个输出hash与GA+FZ/V3参考一致，
+shape/world/采样数核实。rank-max p50/us：
+
+|T/rank|GA+FZ|GN|GN变慢|pool增加 bytes/rank|
+|---:|---:|---:|---:|---:|
+|1|236.032|263.078|11.46%|33601536|
+|64|286.848|307.376|7.16%|33603072|
+|8192|2890.380|2954.680|2.22%|33632256|
+|20480|6941.320|7181.400|3.46%|33681408|
+
+四档均退化，不采用、不新增shape阈值；不再做反向/library/Torch/fresh
+sanitizer。生产代码/profile未改变。该结果只否定本配置，未证明队首阻塞
+不存在。日志 `fixed_owners_lanes64_{gafz,gn}_ep16_t*_formal.log`，完整构建
+和native脚本在候选目录。总体长文目标仍未完成。
