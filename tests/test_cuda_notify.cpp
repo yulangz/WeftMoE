@@ -4134,7 +4134,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             cudaMemcpyDeviceToDevice, execution_state->stream));
         routes = producer.publish_selected_experts(
             static_cast<const std::int32_t *>(fresh_routes.data),
-            common_routes.selected_experts.size(), max_tokens, top_k,
+            common_routes.selected_experts.size(), common_routes.num_tokens, top_k,
             fresh_routes.owner);
         gates = producer.publish_gates(
             static_cast<const float *>(fresh_gates.data), route_gates.size(),
@@ -4173,7 +4173,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             static_cast<const weftmoe::transport::BFloat16 *>(
                 allocate_tensors ? fresh_input.data
                                  : activation_storage->device_ptr),
-            activation_host.size(), max_tokens, hidden,
+            common_routes.num_tokens * hidden, common_routes.num_tokens, hidden,
             allocate_tensors ? fresh_input.owner : activation_storage);
       auto activations =
           weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(

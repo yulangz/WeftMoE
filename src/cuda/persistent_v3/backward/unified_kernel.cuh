@@ -38,7 +38,7 @@ inline constexpr std::size_t shared_bytes() {
 } // namespace backward_unified_detail
 
 template <std::uint32_t DabTileN, std::uint32_t DxTileN, std::uint32_t DwTileN,
-          bool UseGin = false>
+          bool UseGin = false, bool StaticSchedule = false>
 __global__ __launch_bounds__(
     backward_tuning::kUnifiedThreads,
     1) void unified_backward_kernel(const __grid_constant__ BackwardKernelArgs
@@ -93,16 +93,17 @@ __global__ __launch_bounds__(
     if (threadIdx.x < backward_unified_compute_detail::kComputeThreads) {
       backward_unified_compute_detail::UnifiedComputeSynchronization<false>
           sync{state};
-      backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
-                                                    UseGin ? 1U : 2U>(
-          a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
-          x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
-          geometry, storage, state, sync);
+      backward_unified_compute_detail::run_compute<
+          DabTileN, DxTileN, DwTileN, StaticSchedule || UseGin ? 1U : 2U,
+          StaticSchedule>(a, dr_map, dab_map, w2_map, w1_map, dr_mn_map,
+                          u_mn_map, dab_mn_map, x_mn_map, u_store_map,
+                          dx_store_map, dw2_store_map, dw1_store_map, geometry,
+                          storage, state, sync);
     } else if (threadIdx.x >= backward_tuning::kUnifiedCommBase &&
                threadIdx.x < backward_tuning::kUnifiedCommBase +
                                  backward_tuning::kUnifiedCommThreads) {
-      backward_unified_transport::run<UseGin, backward_tuning::kUnifiedCommBase>(
-          a, geometry, comm);
+      backward_unified_transport::run<UseGin, backward_tuning::kUnifiedCommBase,
+                                      StaticSchedule>(a, geometry, comm);
       // run() returns after this CTA has retired every notification channel
       // and GIN has drained its contexts. Other CTAs can still finish their
       // local notification rows, but no remaining message needs these warps.
@@ -139,11 +140,12 @@ __global__ __launch_bounds__(
     cutlass::arch::warpgroup_reg_alloc<backward_tuning::kUnifiedMathRegisters>();
     backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
         state};
-    backward_unified_compute_detail::run_compute<DabTileN, DxTileN, DwTileN,
-                                                      UseGin ? 1U : 2U>(
-        a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
-        x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
-        geometry, storage, state, sync);
+    backward_unified_compute_detail::run_compute<
+        DabTileN, DxTileN, DwTileN, StaticSchedule || UseGin ? 1U : 2U,
+        StaticSchedule>(a, dr_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map,
+                        dab_mn_map, x_mn_map, u_store_map, dx_store_map,
+                        dw2_store_map, dw1_store_map, geometry, storage, state,
+                        sync);
   }
   // No role exits while a peer can still access this CTA's DSM mailbox. This
   // full-cluster lifetime boundary runs only after compute and transport drain;

@@ -78,6 +78,20 @@ def main():
         max_saved=4,
     )
     retry_checks = {}
+    if os.environ.get("TEST_ROUTE_VALIDATION") == "1":
+        local_routes = route.chunk(world)[rank].contiguous()
+        for invalid_expert in (experts, int(local_routes[0, 0])):
+            invalid_routes = local_routes.clone()
+            if rank == world - 1:
+                invalid_routes[0, 1] = invalid_expert
+            try:
+                runtime.forward(x, invalid_routes, g, w1, w2)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("invalid routes did not fail collectively")
+            assert runtime.native.usage()["notify_slots_in_use"] == 0
+        print(rank, "TRAINING_ROUTE_REJECTION_PASS", flush=True)
     if os.environ.get("TEST_TENSOR_PREPARATION_FAILURE") == "1":
         import ctypes
 

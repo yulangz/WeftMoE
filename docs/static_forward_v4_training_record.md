@@ -1945,3 +1945,246 @@ T1/64 wall 为 257.792/390.887 µs（V3 为 281.948/420.911），T8192/20480
 激活梯度流水明显变慢，保留六个微小 epilogue task 和跨 cluster readiness
 造成的等待值得优先消除，不能仅因为去掉 atomic claim 就认为会更快。
 记录于 `build/pf_static_backward/ep8_t*_backward.log`；该首版不是最终性能结论。
+
+进一步拆分归因：mini Forward 接**原动态 Backward**时，8K/20K wall 已经是
+2538.760/6227.080 µs。主要遗漏之一是旧 Notify 的 local route permutation：
+按整个 expert 遍历会让大量发送 CTA 同时写同一张卡；V3 会按 32 行交错 expert。
+因此不能把首版相对冻结 V3 的全部回退归因于静态计算调度。
+
+第二版将一个 M-block 的 dU、一次完整 M128 SwiGLU epilogue 和全部 dX N tiles
+固定交给同一 cluster。其 8K/20K wall 为 2290.390/6144.980 µs，仍未达标；
+EP8 T8192 Torch 的输出及四组梯度已通过。下一步直接由 counts 构造 32 行
+交错的 Backward dispatch 索引，不恢复 route-sized radix sort。上述消融都保持
+dW 严格后置，不改变 GEMM 算术或归约顺序。
+
+### Counts 直接构造交错 dispatch
+
+先在 `packet_order` 临时区写稳定的 source/expert 列表，再按 counts 计算各
+32-row stripe 的目的位置并写 `local_route_order`；网络 packet plan 随后覆盖
+临时区。无需恢复 V3 wave 构造或全局 radix sort。对照结果：
+
+| tokens/rank | V3 BWD wall (µs) | M-block + stripe | 耗时降低 |
+|---:|---:|---:|---:|
+| 1 | 281.948 | 303.724 | -7.72% |
+| 64 | 420.911 | 445.834 | -5.92% |
+| 8192 | 2127.380 | 1762.040 | 17.17% |
+| 20480 | 5066.530 | 4692.760 | 7.38% |
+
+仍为 EP8、同一远端节点 1620 MHz 的 rank-max p50。20K 的 dY dispatch
+从 block-only 的 4006.110 µs 降到 1504.350 µs；8K 从 1165.470 降到
+628.384 µs。阶段区间存在重叠，不能相加解释 wall。此时训练 FWD wall
+四档为 327.081/376.645/1644.690/3562.870 µs；索引构造增加约 20–30 µs，
+换回的 BWD 收益明显更大。日志在 `build/pf_static_backward_stripe/`。
+
+EP8 T512 的四组梯度 hash 与原版本完全一致；T64 的 Torch parity、allocation
+retry 和三个 live tape 测试通过。修复既有 eager benchmark 在不等长 source
+下将 activation lease 的实际 token 数误填为 capacity 的问题后，EP8
+T64/32、B16/D1、E64/K4 的训练 FWD `compute-sanitizer --tool memcheck`
+完成，error-exitcode 为零。修复前两次超时不算 sanitizer 通过或 kernel 故障。
+
+小规模的回退来自 M-block 数不足以铺满 cluster；后续只在
+`mblocks < clusters` 时恢复固定 N/epilogue residue，将其与长文整块调度
+分开，不回退动态 claim。最终矩阵另列。
+
+### 激活梯度按占用率选择静态粒度
+
+`mblocks < clusters` 时恢复独立的 dU/N、epilogue-row、dX/N 静态 residue，
+其余仍由一个 cluster 完成整块链。没有 token 数或 EP 数硬编码，不改算术。
+mini Notify 也保留原有的 out-of-range/duplicate 路由拒绝合同；既有 Torch
+集成测试覆盖单 rank 非法路由后的集体报错及下一次正常调用。
+
+`build/pf_static_backward_adaptive/` 的完整 native 矩阵如下。H2048/I512、E64/K4，
+1620 MHz，PF B512/D8，30 轮、10 warmup；均为最慢 rank 的 wall p50（µs）。
+EP8 在同一远端节点测量；EP16 同形状相邻对照，20K/64 反转 V3/PF 顺序。
+
+| EP | tokens/rank | V3 FWD | PF FWD | V3 BWD | PF BWD |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 1 | 469.704 | 351.147 | 281.948 | 258.045 |
+| 8 | 64 | 553.803 | 373.505 | 420.911 | 390.108 |
+| 8 | 8192 | 1737.380 | 1646.090 | 2127.380 | 1758.660 |
+| 8 | 20480 | 3586.140 | 3566.400 | 5066.530 | 4731.360 |
+| 16 | 1 | 733.956 | 543.033 | 404.445 | 407.909 |
+| 16 | 64 | 903.119 | 617.716 | 766.490 | 756.681 |
+| 16 | 8192 | 3434.760 | 3813.370 | 2848.860 | 2961.910 |
+| 16 | 20480 | 7213.590 | 8651.610 | 6982.980 | 6768.470 |
+
+单机四档 BWD 已领先，但双机 8K BWD 仍慢 3.97%，双机 FWD 长档仍慢
+11.02%/19.93%，没有达到全面领先。静态 dW 的独立 domain/chunk 分配在每卡
+只有 4 个专家时留下明显不均衡尾部，后续改为按实际 padded K extent 加权切分
+联合 dW2/dW1 流，每个 cluster 持有不相交区间，区间内保留连续 tile chunk
+流水。空专家权重为零，热点专家不会被整个分配给一个 cluster；仍不做动态
+claim 或 split-K，也不放松 dX 全完成的门槛。
+
+此版本 native SHA256：
+`9e4f08dc7435b04947e570e8be717a23e955f2f332aae208c15e9176fc07a05f`。
+library：`f2cf1cc5693fa34c541d93f4682446a47dd26b70999fc584c330ef3c93e2e83f`。
+EP8 T64 的 Torch parity、非法路由、allocation retry、三个 live tape，以及
+T20480 的输出/四组梯度、后续 inference/Graph 生命周期检查通过。
+
+额外用 `tools/benchmark_training.py` 测量真实 eager `forward → backward` 循环，
+包含 Python 接口、tensor 分配/回收和末尾 stream synchronize，计时外做 rank
+barrier；不是两段 native p50 相加。EP8 同远端节点、10 warmup + 20 measured：
+
+| tokens/rank | V3 cycle (µs) | PF cycle (µs) | 耗时降低 |
+|---:|---:|---:|---:|
+| 1 | 3710.478 | 3189.257 | 14.05% |
+| 64 | 3523.050 | 3306.644 | 6.14% |
+| 8192 | 6971.879 | 6261.005 | 10.20% |
+| 20480 | 13510.205 | 11215.811 | 16.98% |
+
+cycle 基线使用本轮 stripe library 中保留的 V3/non-ring specialization，
+显式 `--backend v3`，不是把旧 native 可执行文件当成 TensorRuntime extension。
+日志分别为 `build/pf_static_backward_stripe/v3_ep8_training_cycle.log` 与
+`build/pf_static_backward_adaptive/pf_ep8_training_cycle.log`。两种基准的输入生成、
+分配边界不同，不能用它们相减推断 Python overhead；双机 cycle 尚待测量。
+
+### dW 加权静态区间
+
+按各专家实际 padded K 行数给联合 dW2/dW1 output-pair 流加权，每个 cluster
+拥有连续、不相交的区间。相邻区间边界使用同一向上取整规则；空专家权重为零。
+区间内沿用连续 tile chunk，不改 K 归约或 BF16 舍入，也不提前启动 dW。
+
+`build/pf_static_backward_weighted/` 的 EP8 BWD 四档 wall 为
+257.309/388.025/1819.440/4643.750 µs，均低于冻结 V3；相对上一版，8K 略退、
+20K 改善。EP16 8K 为 2928.310 µs，仍比 V3 的 2848.860 µs 慢 2.79%，
+加权分配不是剩余 activation-gradient 差距的解决方案。
+
+该轮 EP16 脚本一度将 benchmark tokens 误填入仅 validation 使用的环境变量；
+已按 JSON 的实际 shape 纠正：另外三次都是 8K 重复，不是 1/64/20K，日志改名
+`pf_ep16_t8192_repeat{1,2,3}_backward.log`。不纳入四规模矩阵。
+
+保持 B×D=4096，训练 FWD 的 B1024/D4 相比 B512/D8，EP16 8K 从
+3832.900 降到 3613.320 µs，20K 从 8663.880 降到 7906.850 µs。
+仍比冻结 V3 慢 5.20%/9.61%，因此没有将扩大窗口误记为全面领先，也不静默
+改写默认参数；完整循环另用显式 B1024/D4 测量。
+
+该轮 native/library SHA256 分别为
+`f880e6297f30c98a81816e315f06642ed16ce17caeb8901ba2550194f3277943`、
+`5ff101167e7f77785fa77e833ffe5c3c95318365994e524bc2e7615abe6faead`。
+EP8 T64/T20480 Torch reference parity 已通过。EP8 初次 cycle 的 64 token
+结果波动至 3870.830 µs，不能引用上一版更好的 cycle 作为本版最终值，待配对复测。
+
+PF profile 的 `kRdmaCtas=0` 不包含非 ring 的多机 V3 Forward 回退；尝试用
+同一 extension 测双机 V3 cycle 会在发起 Forward 时明确拒绝，不能视为性能
+结果。双机 cycle 对照需单独按 `configs/static_inference_v3_20260923/` 构建
+library/extension。冻结 native V3 的独立 FWD/BWD 结果不受此配置问题影响。
+
+### 未采用：按本节点 source 优先的 M-block 排列
+
+尝试将各专家的 M-block 交错，并从该节点的 canonical source 区间开始，
+避免固定计算 owner 先等远端数据。`pf_static_backward_locality` 的 EP16
+8K B512/D8 四组梯度 hash 与旧 Backward 相同，dU 区间缩短至 1353.340 µs，
+但 wall 为 2957.510 µs，反而差于 weighted 的 2928.310 µs。
+
+进一步让静态 Return 使用相同排列（`pf_static_backward_ordered_return`），
+EP16 8K/20K B1024/D4 wall 为 3054.770/7361.010 µs。Return 区间变短并未
+转换为端到端收益；不能只看阶段 span 就认定优化成功。两项排列及缓存 owner
+状态均从最终代码移除，保留较简洁的 canonical residue + weighted dW。
+
+额外正确性门禁：weighted EP16 T64/T20480 Torch 全部输出及四组梯度通过，
+T64 还覆盖非法 route、分配重试与三个 live tape；EP16 T64/32 不等长 source
+在 B16/D1 与 B1024/D4 下六组输入/权重/输出 hash 全部一致。
+locality 的 EP8 T64/E16/K6/B16/D1 Backward memcheck launcher 退出码为零；
+该用例只经过不受网络排列影响的本地调度。不将 memcheck 扩大解释为 racecheck
+或完整多机 sanitizer 认证。
+
+按原 V3 profile 新建的 TensorRuntime 对照库为
+`build/pf_training_v3_reference/libweftmoe.so`，SHA256
+`6d349d29f7120e00ae1225ac9ea8e0fa1423e6f18423828b3650c3b3c49812e1`。
+EP8 20 warmup + 50 measured，V3 cycle 四档为
+3398.326/3537.165/6416.721/11410.903 µs；weighted PF 复测为
+2982.490/3259.546/6150.959/10848.984 µs，耗时降低 12.24%/7.85%/4.14%/4.92%。
+长文收益小于先前同库 V3 回退对照，最终不再沿用那个较大的百分比。
+
+### 最终静态 Backward native 矩阵
+
+最终保留 weighted 版；EP8 B512/D8，EP16 B1024/D4（Forward-only 窗口消融
+选择，Backward 不改变 K 归约），其余形状/频率/轮数同上。单位 µs：
+
+| EP | tokens/rank | 冻结 V3 BWD wall | PF BWD wall | PF 耗时降低 |
+|---:|---:|---:|---:|---:|
+| 8 | 1 | 281.948 | 257.309 | 8.74% |
+| 8 | 64 | 420.911 | 388.025 | 7.81% |
+| 8 | 8192 | 2127.380 | 1819.440 | 14.47% |
+| 8 | 20480 | 5066.530 | 4643.750 | 8.35% |
+| 16 | 1 | 404.445 | 408.590 | -1.02% |
+| 16 | 64 | 766.490 | 762.142 | 0.57% |
+| 16 | 8192 | 2848.860 | 2931.490 | -2.90% |
+| 16 | 20480 | 6982.980 | 6732.710 | 3.58% |
+
+小于约 1% 的差异按接近看待，不表述成确定领先。8K 双机仍回退约 2.9%，
+因此只完成了功能门禁，没有达成“所有规模 BWD 不低于 V3”。
+
+### 双机完整循环：必须独立于 cached-state native 报告
+
+同一 weighted PF 与原 V3 profile 的新 TensorRuntime extension，EP16
+B1024/D4，20 warmup + 50 measured 的首轮真实 `forward → backward`：
+
+| tokens/rank | V3 cycle (µs) | PF cycle (µs) |
+|---:|---:|---:|
+| 1 | 7151.888 | 5551.253 |
+| 64 | 7187.492 | 4760.193 |
+| 8192 | 9088.657 | 10038.992 |
+| 20480 | 18300.539 | 23454.933 |
+
+这组 host wall 抖动明显：PF 20K 单次范围 17414–185439 µs，各连续十轮的
+中位数约 20.4/23.6/21.4/39.4/26.8 ms；不能把首轮 28.2% 的差距全归因于
+kernel。新增 benchmark 的 Forward/Backward 接口分段计时（不改算子），
+反转运行顺序，10 warmup + 20 measured 的长档复测如下。各列单独取最慢
+rank p50，不能相加重建 cycle：
+
+| tokens/rank | V3 FWD API | PF FWD API | V3 BWD API | PF BWD API | V3 cycle | PF cycle |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 4794.760 | 5141.901 | 4316.087 | 4443.026 | 9064.414 | 10004.030 |
+| 20480 | 8542.127 | 10054.226 | 8444.019 | 8221.840 | 17210.427 | 18317.683 |
+
+复测仍有约 10.4%/6.4% 的真实循环回退，稳定的主要差距在训练 Forward，
+不能用单机收益、cached-state BWD 或 Notify 加速替代这一结论。原 V3 profile
+与 PF profile 均保持各自生产 GEMM/通信参数，不把切换 profile 当成静态调度的
+单项收益。
+
+尝试仅绑定各 local rank 的调用线程到 CPU 8/10/12/14/56/58/60/62 并没有消除
+抖动（PF 8K/20K 为 14301.164/20219.641 µs，V3 为 9357.899/17710.015 µs）。
+未修改系统或 NCCL 的 CPU 亲和性，也没有改线上 Runtime；这个无收益的临时
+benchmark 选项已移除。原始样本分别保留在 weighted 目录的
+`{v3,pf}_ep16_cycle_node*.log`、`*_phase_node*.log`、`*_pinned_node*.log`。
+
+保持 B×D=4096 再测 B2048/D2，EP16 8K/20K 训练 FWD 为
+3807.160/8111.470 µs，均差于 B1024/D4 的 3613.320/7906.850 µs，未采用。
+没有通过扩大 ring 默认值掩盖未解决的双机训练 Forward 差距。
+
+复现完整循环使用 `tools/benchmark_training.py --backend pf|v3`，通过
+`WEFTMOE_TENSOR_EXTENSION` 指向各自 profile 的 extension；EP8 用单机
+`torchrun --standalone --nproc-per-node=8`，EP16 用两台机器各八进程的
+`torchrun --nnodes=2`。PF 的 `--ring-tokens 512 --ring-depth 8` 对应单机，
+`--ring-tokens 1024 --ring-depth 4` 对应上述双机对照。该工具只测 MoE 的
+TensorRuntime FWD+BWD，不是完整模型、RL step 或包含 optimizer 的训练 step。
+
+最终补充极端热点门禁：weighted EP16、T8192/E64/K4、B1024/D4，所有 source
+均路由到 rank 0 的四个专家，rank 0 实际接收 524288 行，其余 rank 零入站。
+Forward 输出和 dX/dGate/dW1/dW2 全部通过 Torch reference，随后 EP8 子组的
+inference/Graph 生命周期检查也通过。日志为
+`torch_ep16_hotspot_t8192_node{0,1}.log`；这验证了实际 tape 扩容、静态 dW
+在严重倾斜下的完整覆盖以及 no-drop，而不只是均匀 benchmark。
+
+最终又对单机完整循环做一次相邻、反转顺序（PF→V3）的 20+50 轮确认，
+仍独占远端节点且调用线程不绑核。四档 V3/PF wall 分别为
+3337.445/3158.278、3587.115/3325.652、6577.049/6212.620、
+11247.264/10866.331 µs，降低 5.37%/7.29%/5.54%/3.39%。
+两轮单机均领先，但不将不同轮次中更有利的值拼成一个表。
+日志为 `build/pf_static_backward_final/{pf,v3}_ep8_cycle.log`，实际加载的
+extension 路径已写入每个 JSON（weighted PF 和原 V3 profile）。
+
+撤掉无收益候选后重新完整构建 `build/pf_static_backward_final/`，native SHA256
+为 `6d512a8377b16c510868622910aa30a7d64fc581df22568e6d6a038d897dad2b`，
+library 为 `5e1d15a9fc7d12741966d39971d295d95b270217a50ca80a2243ee1b11f7bda2`。
+编译完成后、无编译干扰的 EP16 B1024/D4 长档 BWD 复测为
+2919.860/6667.710 µs：8K 仍比冻结 V3 慢 2.49%，20K 快 4.52%，
+与上述“8K 小幅回退、20K 领先”的结论一致。没有将构建产物哈希不同误当成
+功能变更，也不把不同复测中最有利的数字拼成新完整矩阵。
+
+最终 extension 又通过 EP16 **T20480 全热点**的完整 Torch reference：rank 0
+实际接收 1,310,720 行，其余 rank 零入站；输出和全部四组梯度正确，随后
+inference/Graph 生命周期检查通过。使用 B1024/D4，未改变 ring 容量来容纳
+整段上下文；永久 tape/Backward 实际行数工作区则按需扩容。日志为
+`build/pf_static_backward_final/torch_ep16_hotspot_t20480_node{0,1}.log`。

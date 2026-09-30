@@ -156,10 +156,12 @@ __device__ __forceinline__ void initialize_status(const BackwardKernelArgs &a) {
   status->gin_return_payload_bytes = 0ULL;
 }
 
+template <bool StaticSchedule = false>
 __device__ __forceinline__ bool try_publish_dispatch_mblock(
     const BackwardKernelArgs &a, unsigned long long *words,
     const weftmoe::cuda::persistent_v3::backward::BackwardSchedulerLayout
-        &layout, std::uint32_t mblocks, std::uint32_t mblock) {
+        &layout,
+    std::uint32_t mblocks, std::uint32_t mblock) {
   ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> phase(
       words[layout.phase + mblock]);
   if (phase.load(::cuda::memory_order_acquire) != 0ULL)
@@ -171,6 +173,11 @@ __device__ __forceinline__ bool try_publish_dispatch_mblock(
   if (arrived.load(::cuda::memory_order_acquire) !=
       descriptors[mblock].valid_rows)
     return false;
+  if constexpr (StaticSchedule) {
+    // The unified transport already assigns one publisher per M-block.
+    phase.store(1ULL, ::cuda::memory_order_release);
+    return true;
+  }
   auto expected = 0ULL;
   if (!phase.compare_exchange_strong(expected, 1ULL,
                                      ::cuda::memory_order_acq_rel,

@@ -1121,25 +1121,63 @@ expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
 
 - [x] mini Notify：只统计、交换各 source/expert 行数和分配所需 R/P；不构造
   V3 的 packet/wave 排序，不启动 activation payload。
-- [ ] 将 ring planner 合入 main，保留全 rank 分配成功之后才能推进 ring 的
+- [x] 将 ring planner 合入 main，保留全 rank 分配成功之后才能推进 ring 的
   边界；验证零行、热点、不等长、多个 live tape 与 allocation retry。
-- [ ] 静态 Backward：固定 CTA/cluster 的 dU、SwiGLU backward、dX ownership，
+- [x] 静态 Backward：固定 CTA/cluster 的 dU、SwiGLU backward、dX ownership，
   不再动态领用计算任务；复用算术和通信模块。
-- [ ] dW1/dW2 严格位于本 rank 全部 dX GEMM 完成之后，而不是低优先级抢占；
+- [x] dW1/dW2 严格位于本 rank 全部 dX GEMM 完成之后，而不是低优先级抢占；
   Return/Reduce 可以继续与 dW 重叠，权重梯度不在 combine 的依赖链上。
-- [ ] 在 SwiGLU backward 一并计算 selected-route dGate，随 dX 返回。算子不接收
+- [x] 在 SwiGLU backward 一并计算 selected-route dGate，随 dX 返回。算子不接收
   router 权重或 logits，router softmax/top-k 之外的参数反传仍由上游 autograd
   消费 dGate 完成。
-- [ ] 1620 MHz 下 EP8（单机）/EP16（双机）的正确性、Forward wall、Backward wall
+- [x] 1620 MHz 下 EP8（单机）/EP16（双机）的正确性、Forward wall、Backward wall
   与 FWD+BWD 总耗时对照冻结 V3；分别记录 1/64/8192/20480，不把 main 计时范围
   变化误记为性能收益。每个验证完的 milestone 提交。
+- [ ] 性能目标完全达成：当前单机 BWD/完整循环领先；双机 8K BWD 仍慢约
+  2.9%，双机长档 FWD/完整循环仍回退。具体原始样本及复测见训练记录，不能
+  将功能完成表述成全场景不低于 V3。
 
 以下内容保留为已验证历史基线；上述条目未勾选之前，不代表重构已完成。
 
 mini Notify 与 main 内规划已落地，EP8/EP16 native 梯度 hash 和 Torch reference
 parity、热点/零入站、多个 live tape、allocation retry 已通过；结果和计时边界见
 [训练记录](static_forward_v4_training_record.md#mini-notify--main-内规划2026-09-30)。
-完整长序列与不等长 source 门禁仍随最终静态 Backward 一起执行。
+EP8/EP16 T20480 长序列 parity、EP8 不等长 source memcheck，以及 EP16
+T64/32 在 B16/D1 与 B1024/D4 下的输入/权重/输出 hash 一致性也已通过；
+最终静态 Backward 的性能门禁独立记录，不由 Forward 正确性推定。
+
+当前 Backward 的静态合同：
+
+- 有足够 M-block 时，cluster `c` 拥有 `c + n * clusters` 的完整
+  `dU → SwiGLU backward/dGate → dX` 链。M128 epilogue 合为一个任务，dX
+  连续遍历全部 N tile。不足一个 cluster wave 时，改为固定 N/epilogue
+  residue 以利用空闲 cluster；两种情况都没有动态 claim。
+- Dispatch 的系统域 acquire 确认 dR 的有效行全部就绪后，由唯一 publisher
+  release 发布该 M-block。计算 owner 的 dX store 完成后发布块级完成标记；
+  固定的 Return CTA acquire 后发送 dX/dGate。没有计算/Return 队列领用或
+  phase CAS。跨机复用原有 source-token 去重及 GIN ring，不宣称 Backward
+  的全部中间缓存都已成为有界 ring。
+- dW1/dW2 的静态 output-tile chunk 只在 acquire 到本 rank 的
+  `completed_dx_tiles == total_dx_tiles` 后执行；不是“当前没有 ready dX”
+  就允许执行。通信 warp 可在此期间继续 Return/Reduce，无需全节点 dX barrier。
+  联合 dW2/dW1 tile-pair 流按各专家的实际 padded K extent 加权，cluster
+  获取不相交的连续区间，区间内保留 TMA chunk 流水；空专家权重为零，
+  不做 split-K，也不把一个热点专家的全部 dW 固定给单个 cluster。
+- Tape 逻辑行仍是稳定 expert/source/route 顺序；main 由 counts 直接生成
+  32-row expert 交错的 dY dispatch 索引，通信遍历顺序不改变 dW 归约顺序。
+  算术、TMA maps、BF16 checkpoint 和逐行 dGate 的 FP32 shuffle tree 复用
+  V3；非 ring 路径继续使用原动态 Backward，保留清晰的回归对照。
+
+Router 梯度放在 SwiGLU epilogue，避免另读一遍 gate/up。记保存的两个投影为
+`A/B`、选中专家的 routing weight 为 `p`、`S = SiLU(A) * B`：先做
+`dU = dY * W2`，epilogue 同时得到 `dp = sum(dU * S)`、
+`dA = p * dU * B * SiLU'(A)`、`dB = p * dU * SiLU(A)`，并重算供 dW2
+使用的 `p*S`。随后 `dX = [dA,dB] * W1`。dX 块发布后可立即 Return dX/dp；
+所有本地 dX 完成才开始 `dW2 = dYᵀ * (p*S)` 与
+`dW1 = [dA,dB]ᵀ * SavedX`。上述是数学关系；实际 BF16 中间舍入及 FP32
+逐行归约树沿用 V3，不以重新排列 GEMM 的机会改变 batch-invariance 合同。
+
+### 以下为 M6/FS2 历史执行边界
 
 prefill inference 与 training Forward 共用有界流水，但训练保存实际规模的 tape，
 不是在 ring 中留住整次调用的激活。M6d/M6e已接通单机及多机版本，非ring训练

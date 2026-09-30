@@ -4,6 +4,7 @@
 // main recover stable source ordinals without a second global histogram.
 __global__ void __launch_bounds__(256)
     training_count_notify_kernel(NOTIFY_ENTRY_ARGS) {
+  programmatic_launch::begin();
   auto grid = cooperative_groups::this_grid();
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto stride = gridDim.x * blockDim.x;
@@ -24,6 +25,12 @@ __global__ void __launch_bounds__(256)
       const auto expert = route < local.routes ? local.selected[route] : -1;
       const auto peers = __match_any_sync(0xffffffffU, expert);
       if (expert >= 0 && unsigned(expert) < local.experts) {
+        const auto token_begin = route - route % a.top_k;
+        for (auto prior = token_begin; prior < route; ++prior)
+          if (local.selected[prior] == expert)
+            atomicMin(&local.status->duplicate_packed,
+                      (static_cast<unsigned long long>(route) << 32U) |
+                          unsigned(expert));
         if (threadIdx.x % 32U == unsigned(__ffs(peers) - 1))
           atomicAdd(reinterpret_cast<unsigned long long *>(local.chunk_counts) +
                         std::uint64_t(expert) * chunks + chunk,
@@ -116,8 +123,10 @@ __global__ void __launch_bounds__(256)
   if (!tid) {
     publish_dispatch_runtime_stage(a, 0U, runtime);
     *status = *a.status;
-    __threadfence_system();
-    ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_system>(*ready)
-        .store(1U, ::cuda::memory_order_release);
+    if (ready) {
+      __threadfence_system();
+      ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_system>(*ready)
+          .store(1U, ::cuda::memory_order_release);
+    }
   }
 }

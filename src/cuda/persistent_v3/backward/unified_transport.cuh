@@ -18,6 +18,7 @@ struct alignas(128) Shared
   unsigned queue_selected;
   unsigned queue_rows;
   unsigned long long queue_base;
+  unsigned static_return_next;
 };
 
 #include "cuda/persistent_v3/backward/unified_gin.cuh"
@@ -34,6 +35,7 @@ __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
     s.gin_sender_state = forward_unified_transport::GinSenderState{};
     s.dispatch_end = backward_pipeline_detail::local_route_count(a);
     s.return_cursor = ~0ULL;
+    s.static_return_next = blockIdx.x - (UseGin ? a.gin_receiver_base : 0U);
     s.return_queue = s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     if constexpr (UseGin) {
@@ -100,7 +102,8 @@ progress_dispatch(const BackwardKernelArgs &a, unsigned long long *words,
   return true;
 }
 
-template <bool UseGin, unsigned BaseThread, class Storage, class Layout>
+template <bool UseGin, unsigned BaseThread, bool StaticSchedule, class Storage,
+          class Layout>
 __device__ __forceinline__ bool
 progress_return(const BackwardKernelArgs &a, unsigned long long *words,
                 const Layout &layout, std::uint32_t mblocks, Storage &s) {
@@ -110,20 +113,39 @@ progress_return(const BackwardKernelArgs &a, unsigned long long *words,
   const unsigned warp = tid / 32U, lane = tid % 32U;
   if (tid == 0U) {
     s.return_cursor = ~0ULL;
-    TileTask task{};
-    if (persistent_v3::backward::try_claim_domain_once(
-            make_return_domain(a, words, layout, mblocks), task)) {
-      auto expected = 3ULL;
-      if (!::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-               words[layout.phase + task.owner])
-               .compare_exchange_strong(expected, 4ULL,
-                                        ::cuda::memory_order_acq_rel,
-                                        ::cuda::memory_order_relaxed))
-        __trap(); // Each complete M-block has one immutable Return owner.
-      s.return_cursor = task.owner;
-      atomicMin(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
-                     ->reduce_blocks_done,
-                device_globaltimer_ns());
+    if constexpr (StaticSchedule) {
+      const auto owner = s.static_return_next;
+      constexpr auto tiles = backward_tuning::kMainHidden /
+                             backward_tuning::kDxTileN /
+                             backward_tuning::kActivationClusterN;
+      if (owner < mblocks &&
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+              words[layout.dx_completed + owner])
+                  .load(::cuda::memory_order_acquire) ==
+              persistent_v3::backward::backward_dx_ready_value(tiles)) {
+        s.return_cursor = owner;
+        s.static_return_next += UseGin ? a.gin_receiver_count : gridDim.x;
+        atomicMin(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                       ->reduce_blocks_done,
+                  device_globaltimer_ns());
+      }
+    } else {
+      TileTask task{};
+      if (persistent_v3::backward::try_claim_domain_once(
+              make_return_domain(a, words, layout, mblocks), task)) {
+        auto expected = 3ULL;
+        if (!::cuda::atomic_ref<unsigned long long,
+                                ::cuda::thread_scope_device>(
+                 words[layout.phase + task.owner])
+                 .compare_exchange_strong(expected, 4ULL,
+                                          ::cuda::memory_order_acq_rel,
+                                          ::cuda::memory_order_relaxed))
+          __trap(); // Each complete M-block has one immutable Return owner.
+        s.return_cursor = task.owner;
+        atomicMin(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                       ->reduce_blocks_done,
+                  device_globaltimer_ns());
+      }
     }
   }
   forward_unified_transport::copy_sync<threads>();
@@ -183,7 +205,8 @@ progress_return(const BackwardKernelArgs &a, unsigned long long *words,
   return true;
 }
 
-template <bool UseGin, unsigned BaseThread, class Storage>
+template <bool UseGin, unsigned BaseThread, bool StaticSchedule = false,
+          class Storage>
 __device__ __forceinline__ void
 run(const BackwardKernelArgs &a,
     const backward_unified_compute_detail::RowGeometry &geometry, Storage &s) {
@@ -223,7 +246,8 @@ run(const BackwardKernelArgs &a,
     // and return NIC/NVLink notification credit while all copy warps are busy.
     // Partition retained M-blocks across CTA leaders instead of making every
     // CTA contend on one global scan counter. A descriptor has one publisher;
-    // phase CAS and the original system-acquire readiness check are unchanged.
+    // both schedules share the same system-acquire readiness check. The
+    // static path then needs only a release publication, without a phase CAS.
     unsigned scan_cursor = publisher;
     unsigned pending = publisher < geometry.mblocks
                            ? 1U + (geometry.mblocks - 1U - publisher) / publishers
@@ -238,8 +262,9 @@ run(const BackwardKernelArgs &a,
         break;
       const bool progressed = local_notification_detail::progress(a);
       if (lane == 0U && pending) {
-        if (backward_pipeline_detail::try_publish_dispatch_mblock(
-                a, words, layout, geometry.mblocks, scan_cursor))
+        if (backward_pipeline_detail::try_publish_dispatch_mblock<
+                StaticSchedule>(a, words, layout, geometry.mblocks,
+                                scan_cursor))
           --pending;
         scan_cursor += publishers;
         if (scan_cursor >= geometry.mblocks)
@@ -260,7 +285,7 @@ run(const BackwardKernelArgs &a,
             gin_detail::progress_receive<BaseThread>(a, s, false) ||
             gin_progressed;
       }
-      const bool returned = progress_return<UseGin, BaseThread>(
+      const bool returned = progress_return<UseGin, BaseThread, StaticSchedule>(
           a, words, layout, geometry.mblocks, s);
       if (tid == 0U) {
         auto *counter = reinterpret_cast<persistent_v3::PaddedCounter *>(

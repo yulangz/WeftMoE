@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/weftmoe_pf/backward_schedule.cuh"
+
 // Included after backward_pipeline_detail and the SwiGLU epilogue helpers.
 // Both kernel layouts use this scheduler and the same arithmetic routines.
 namespace backward_unified_compute_detail {
@@ -115,7 +117,8 @@ __device__ __forceinline__ void initialize_compute(unsigned char *storage,
 }
 
 template <std::uint32_t DabTileN, std::uint32_t DxTileN, std::uint32_t DwTileN,
-          std::uint32_t DxClaimTiles = 1U, class Synchronization>
+          std::uint32_t DxClaimTiles = 1U, bool StaticSchedule = false,
+          class Synchronization>
 __device__ __forceinline__ void
 run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
             const CUtensorMap &dab_map, const CUtensorMap &w2_map,
@@ -161,6 +164,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
   bool activation_complete = false;
   const auto cluster = cooperative_groups::this_cluster();
   const auto cluster_rank = cluster.block_rank();
+  weftmoe_pf::backward::Schedule schedule(blockIdx.x / 2U);
 
   while (true) {
     if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
@@ -168,76 +172,90 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       TileTask task{};
       phase_shared = 0U;
       bool claimed = false;
-      if (!activation_complete) {
-        claimed = weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
-                      queues.dx, task, blockIdx.x / 2U) ||
-                  weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
-                      queues.dab, task, blockIdx.x / 2U);
-        if (!claimed) {
-          auto *dx_counter = reinterpret_cast<PaddedCounter *>(
-              words + layout.completed_dx_tiles);
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-              completed_dx(dx_counter->value);
-          activation_complete =
-              completed_dx.load(::cuda::memory_order_acquire) ==
-              static_cast<unsigned long long>(geometry.mblocks) * kDxTiles;
+      bool terminal = false;
+      if constexpr (StaticSchedule) {
+        claimed = schedule.next<kDuTiles, kDxTiles>(
+            a, words, layout, geometry.mblocks, gridDim.x / 2U, task,
+            phase_shared, terminal);
+      } else {
+        if (!activation_complete) {
+          claimed =
+              weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  queues.dx, task, blockIdx.x / 2U) ||
+              weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  queues.dab, task, blockIdx.x / 2U);
+          if (!claimed) {
+            auto *dx_counter = reinterpret_cast<PaddedCounter *>(
+                words + layout.completed_dx_tiles);
+            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+                completed_dx(dx_counter->value);
+            activation_complete =
+                completed_dx.load(::cuda::memory_order_acquire) ==
+                static_cast<unsigned long long>(geometry.mblocks) * kDxTiles;
+          }
         }
-      }
-      if (!claimed) {
-        // Do not reserve a private dW backlog while activation work can still
-        // arrive.  Once dX is globally complete, restore the tuned multi-tile
-        // claims so each CTA can keep the dW K pipeline hot.
-        auto dw2 = queues.dw2;
-        if (!activation_complete)
-          dw2.claim_granularity = 1U;
-        claimed = weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
-            dw2, task);
-      }
-      if (!claimed) {
-        auto dw1 = queues.dw1;
-        if (!activation_complete)
-          dw1.claim_granularity = 1U;
-        claimed = weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
-            dw1, task);
+        if (!claimed) {
+          // Do not reserve a private dW backlog while activation work can still
+          // arrive.  Once dX is globally complete, restore the tuned multi-tile
+          // claims so each CTA can keep the dW K pipeline hot.
+          auto dw2 = queues.dw2;
+          if (!activation_complete)
+            dw2.claim_granularity = 1U;
+          claimed =
+              weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  dw2, task);
+        }
+        if (!claimed) {
+          auto dw1 = queues.dw1;
+          if (!activation_complete)
+            dw1.claim_granularity = 1U;
+          claimed =
+              weftmoe::cuda::persistent_v3::backward::try_claim_domain_once(
+                  dw1, task);
+        }
       }
       if (claimed) {
         task_kind_shared = static_cast<std::uint32_t>(task.kind);
         task_owner_shared = task.owner;
         task_tile_shared = task.tile;
         task_count_shared = task.tile_count;
-        if (task.kind == TaskKind::Dab) {
+        if (!StaticSchedule && task.kind == TaskKind::Dab) {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
               phase(words[layout.phase + task.owner]);
           phase_shared = static_cast<std::uint32_t>(
               phase.load(::cuda::memory_order_acquire));
         }
       } else {
-        auto *dx_counter = reinterpret_cast<PaddedCounter *>(
-            words + layout.completed_dx_tiles);
-        auto *dw2_counter = reinterpret_cast<PaddedCounter *>(
-            words + layout.completed_dw2_tiles);
-        auto *dw1_counter = reinterpret_cast<PaddedCounter *>(
-            words + layout.completed_dw1_tiles);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed_dx(dx_counter->value);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed_dw2(dw2_counter->value);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed_dw1(dw1_counter->value);
-        task_kind_shared =
-            completed_dx.load(::cuda::memory_order_acquire) ==
-                        static_cast<unsigned long long>(geometry.mblocks) *
-                            kDxTiles &&
-                    completed_dw2.load(::cuda::memory_order_acquire) ==
-                        static_cast<unsigned long long>(
-                            geometry.active_experts) *
-                            kDw2TilesPerExpert &&
-                    completed_dw1.load(::cuda::memory_order_acquire) ==
-                        static_cast<unsigned long long>(
-                            geometry.active_experts) *
-                            kDw1TilesPerExpert
-                ? kTerminalTask
-                : kNoTask;
+        if constexpr (StaticSchedule) {
+          task_kind_shared = terminal ? kTerminalTask : kNoTask;
+        } else {
+          auto *dx_counter = reinterpret_cast<PaddedCounter *>(
+              words + layout.completed_dx_tiles);
+          auto *dw2_counter = reinterpret_cast<PaddedCounter *>(
+              words + layout.completed_dw2_tiles);
+          auto *dw1_counter = reinterpret_cast<PaddedCounter *>(
+              words + layout.completed_dw1_tiles);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              completed_dx(dx_counter->value);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              completed_dw2(dw2_counter->value);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              completed_dw1(dw1_counter->value);
+          task_kind_shared =
+              completed_dx.load(::cuda::memory_order_acquire) ==
+                          static_cast<unsigned long long>(geometry.mblocks) *
+                              kDxTiles &&
+                      completed_dw2.load(::cuda::memory_order_acquire) ==
+                          static_cast<unsigned long long>(
+                              geometry.active_experts) *
+                              kDw2TilesPerExpert &&
+                      completed_dw1.load(::cuda::memory_order_acquire) ==
+                          static_cast<unsigned long long>(
+                              geometry.active_experts) *
+                              kDw1TilesPerExpert
+                  ? kTerminalTask
+                  : kNoTask;
+        }
       }
     }
     // This join drains the previous task before either CTA reads the new
@@ -291,15 +309,19 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
             ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
                 phase(words[layout.phase + owner]);
             phase.store(2ULL, ::cuda::memory_order_release);
-            weftmoe::cuda::persistent_v3::backward::publish_owner_prefix(
-                queues.dab, owner, kDabEpilogueTasks);
+            if constexpr (!StaticSchedule)
+              weftmoe::cuda::persistent_v3::backward::publish_owner_prefix(
+                  queues.dab, owner, kDabEpilogueTasks);
           }
         }
       } else if (phase_shared == 2U) {
-        const auto first_row = tile * kDabRowsPerTask;
-        const auto task_rows = kDabRowsPerMblock - first_row < kDabRowsPerTask
+        const bool whole_block = StaticSchedule && task_count_shared > 1U;
+        const auto rows_per_task =
+            whole_block ? kDabRowsPerMblock : kDabRowsPerTask;
+        const auto first_row = tile * rows_per_task;
+        const auto task_rows = kDabRowsPerMblock - first_row < rows_per_task
                                    ? kDabRowsPerMblock - first_row
-                                   : kDabRowsPerTask;
+                                   : rows_per_task;
         const auto first_half = (task_rows + 1U) / 2U;
         const auto local_row = first_row + cluster_rank * first_half;
         const auto rows =
@@ -311,7 +333,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
                                     : 0U;
         if constexpr (Synchronization::kMathEnabled)
           backward_swiglu_epilogue_warp_rows<
-              backward_tuning::kEpilogueRowsPerTask,
+              StaticSchedule ? kDabRowsPerMblock / 2U
+                             : backward_tuning::kEpilogueRowsPerTask,
               Synchronization::kWorkWarps>(
               a, static_cast<std::uint64_t>(descriptor.padded_row) + local_row,
               static_cast<std::uint64_t>(descriptor.compact_row) + local_row,
@@ -322,28 +345,33 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
             cluster_rank == 0U) {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
               completed(words[layout.dab_completed + owner]);
+          const auto epilogue_count = StaticSchedule ? task_count_shared : 1U;
           const auto done =
-              completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) + 1ULL;
+              completed.fetch_add(epilogue_count, ::cuda::memory_order_acq_rel) +
+              epilogue_count;
           if (done == kDabEpilogueTasks) {
             ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
                 phase(words[layout.phase + owner]);
             phase.store(3ULL, ::cuda::memory_order_release);
-            weftmoe::cuda::persistent_v3::backward::publish_owner(queues.dx,
-                                                                  owner);
-            ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                expert_completed(
-                    words[layout.expert_mblocks_completed + descriptor.expert]);
-            const auto expert_done =
-                expert_completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) +
-                1ULL;
-            const auto *padded_rows = peer_at<const unsigned long long>(
-                a.local_base, a.padded_expert_rows_offset);
-            if (expert_done ==
-                padded_rows[descriptor.expert] / backward_tuning::kTileM) {
-              weftmoe::cuda::persistent_v3::backward::publish_owner(
-                  queues.dw2, descriptor.expert);
-              weftmoe::cuda::persistent_v3::backward::publish_owner(
-                  queues.dw1, descriptor.expert);
+            if constexpr (!StaticSchedule) {
+              weftmoe::cuda::persistent_v3::backward::publish_owner(queues.dx,
+                                                                    owner);
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_device>
+                  expert_completed(words[layout.expert_mblocks_completed +
+                                         descriptor.expert]);
+              const auto expert_done = expert_completed.fetch_add(
+                                           1ULL, ::cuda::memory_order_acq_rel) +
+                                       1ULL;
+              const auto *padded_rows = peer_at<const unsigned long long>(
+                  a.local_base, a.padded_expert_rows_offset);
+              if (expert_done ==
+                  padded_rows[descriptor.expert] / backward_tuning::kTileM) {
+                weftmoe::cuda::persistent_v3::backward::publish_owner(
+                    queues.dw2, descriptor.expert);
+                weftmoe::cuda::persistent_v3::backward::publish_owner(
+                    queues.dw1, descriptor.expert);
+              }
             }
             atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
           }
@@ -351,7 +379,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       }
     } else if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx)) {
       const auto descriptor = descriptors[owner];
-      const auto dx_count = DxClaimTiles == 1U ? 1U : task_count_shared;
+      const auto dx_count =
+          !StaticSchedule && DxClaimTiles == 1U ? 1U : task_count_shared;
       if (Synchronization::kMathEnabled && threadIdx.x == 0U)
         atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
       // All N tiles of this owner were published together. Each original
@@ -387,7 +416,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
               weftmoe::cuda::persistent_v3::backward::backward_dx_ready_value(
                   kDxTiles),
               ::cuda::memory_order_release);
-          if (!a.use_gin || Synchronization::kUnifiedReturnQueue)
+          if (!StaticSchedule &&
+              (!a.use_gin || Synchronization::kUnifiedReturnQueue))
             weftmoe::cuda::persistent_v3::backward::publish_owner(
                 make_return_domain(a, words, layout, geometry.mblocks), owner);
         }

@@ -6835,6 +6835,14 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                        "record Backward compute start");
   if constexpr (backward_tuning::kUnifiedWorkers) {
     const auto kernel = [&] {
+      if (layout.static_ring.depth)
+        return use_gin
+                   ? unified_backward_kernel<
+                         backward_tuning::kDabTileN, backward_tuning::kDxTileN,
+                         backward_tuning::kDwTileN, true, true>
+                   : unified_backward_kernel<
+                         backward_tuning::kDabTileN, backward_tuning::kDxTileN,
+                         backward_tuning::kDwTileN, false, true>;
       if constexpr (backward_tuning::kRdmaCtas == 0U)
         return unified_backward_kernel<backward_tuning::kDabTileN,
             backward_tuning::kDxTileN, backward_tuning::kDwTileN, false>;

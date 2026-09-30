@@ -88,14 +88,58 @@ __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
       const_cast<std::uint32_t *>(a.dispatch.route_dst_local_rank)[route] =
           destination % a.local_world_size;
       const_cast<std::uint64_t *>(
-          a.dispatch_waves.local_route_order)[order_base[expert] + ordinal] =
-          route;
+          a.dispatch_waves.packet_order)[order_base[expert] + ordinal] = route;
       const_cast<DeviceReverseRouteRecord *>(
           a.dispatch.reverse_routes)[route] = {
           route / a.dispatch.identity.top_k,           row,    a.rank,
           unsigned(route % a.dispatch.identity.top_k), expert, destination};
     }
     __syncthreads();
+  }
+  grid_sync<0U, Threads>(a);
+
+  // Interleave experts in 32-row stripes for Backward dY dispatch. Draining
+  // an entire expert first concentrates every sender CTA on one peer. Build
+  // the permutation directly from counts, without a route-sized radix sort.
+  // packet_order is scratch here; the network packet plan is built later.
+  if (!threadIdx.x) {
+    std::uint64_t stripes = 0U;
+    for (unsigned expert = 0; expert < experts; ++expert)
+      stripes += (counts[expert] + 31U) / 32U;
+    shared.keys[0] = stripes;
+  }
+  __syncthreads();
+  const auto lane = threadIdx.x % 32U;
+  for (auto stripe = (std::uint64_t(blockIdx.x) * Threads + threadIdx.x) / 32U;
+       stripe < shared.keys[0];
+       stripe += std::uint64_t(gridDim.x) * Threads / 32U) {
+    unsigned expert = 0U;
+    std::uint64_t ordinal = 0U, position = 0U;
+    if (!lane) {
+      auto index = stripe;
+      while (index >= (counts[expert] + 31U) / 32U)
+        index -= (counts[expert++] + 31U) / 32U;
+      ordinal = index * 32U;
+      const bool local = expert / owned / a.local_world_size == a.node;
+      for (unsigned prior = 0; prior < experts; ++prior) {
+        const bool prior_local = prior / owned / a.local_world_size == a.node;
+        const auto count = counts[prior];
+        if (prior_local && !local)
+          position += count;
+        else if (prior_local == local) {
+          position += count < ordinal ? count : ordinal;
+          if (prior < expert && count > ordinal)
+            position += count - ordinal < 32U ? count - ordinal : 32U;
+        }
+      }
+    }
+    expert = __shfl_sync(0xffffffffU, expert, 0U);
+    ordinal = __shfl_sync(0xffffffffU, ordinal, 0U);
+    position = __shfl_sync(0xffffffffU, position, 0U);
+    if (ordinal + lane < counts[expert])
+      const_cast<std::uint64_t *>(
+          a.dispatch_waves.local_route_order)[position + lane] =
+          a.dispatch_waves.packet_order[order_base[expert] + ordinal + lane];
   }
   grid_sync<0U, Threads>(a);
 }
