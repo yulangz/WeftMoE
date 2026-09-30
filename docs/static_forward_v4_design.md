@@ -6,6 +6,8 @@ V4 已经落地。**
 旧设计中的 source-push、完整 arena 作为最终容量方案、按 fragment 数维护通用
 引用计数等选择，不再作为实现要求。历史实现和性能证据保留在：
 
+- [长文和多机优化历程](static_forward_v4_prefill_optimization_history.md)：已保留改动、分步收益、失败实验与证据边界。
+- [单机 decode 优化历程和适用范围](static_forward_v4_decode_optimization_history.md)：短文分支、SGLang 接入及跨模型推广限制。
 - [单机优化记录](static_forward_v4_optimize_record.md)
 - [多机优化记录](static_forward_v4_multinode_record.md)
 - [prefill GEMM/epilogue 优化记录](static_forward_v4_prefill_record.md)

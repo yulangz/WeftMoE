@@ -1,5 +1,10 @@
 # 单机 decode 专属实现与验收记录
 
+2026-09-30 阅读入口：[decode 优化历程和适用范围](static_forward_v4_decode_optimization_history.md)
+汇总通用 ring 短文优化到 HHE、TP/DP 对照、当前实现和跨模型推广边界。
+下文保留逐次实验记录；其中 HF 的双 warpgroup/multicast/三个 rank barrier
+不代表当前 HHE。
+
 日期：2026-09-29。基线 HE 为 `bc71411`；HE 完整验证及其收益见
 [ring 记录](static_forward_v4_ring_record.md)。本记录单独跟踪 HF，不把长文
 GA+FZ 的既有收益算成 decode 优化。本轮先对齐 MegaMoE 的通信、计算和同步

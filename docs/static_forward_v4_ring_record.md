@@ -3,6 +3,11 @@
 日期：2026-09-23。设计依据：[有界流水设计](static_forward_v4_design.md)。
 本记录区分代码落地、独立协议验证和端到端启用，不把准备工作记为性能收益。
 
+2026-09-30 阅读入口：[长文和多机优化历程](static_forward_v4_prefill_optimization_history.md)
+按问题整理已保留优化、收益及踩坑；后续 GR–HE 和专属入口另见
+[decode 优化历程](static_forward_v4_decode_optimization_history.md)。本文件仍保留
+各实验发生时的状态、原始数据和被撤回候选，不用后来结论覆盖历史证据。
+
 ## 当前已采用版本（2026-09-29更新验收范围）
 
 核心计算/通信里程碑为`33d99a5`（GA + FZ），09-29追加了文末已验证的GR/GS
