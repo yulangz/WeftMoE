@@ -1,5 +1,83 @@
 # Qwen3.5 接入 AReaL
 
+## DP4+EP4 对照（2026-09-30，运行中）
+
+在 [decode 记录第 9 节](static_forward_v4_decode_record.md) 的单层 DP-local
+对照之后，将实际 RL 的两组 rollout 都改为 DP4+EP4。仍是每组独立单机
+8 GPU、两个 4 卡 SGLang 实例；不是单个 DP8/EP8，也不是双机 EP8。
+
+|项目|baseline|WeftMoE|
+|---|---|---|
+|物理节点|10.10.16.219|10.10.19.233|
+|每个实例|DP4 / EP4 / attention TP1|DP4 / EP4 / attention TP1|
+|routed MoE|SGLang 默认 Triton + gather/reduce-scatter|HHE 专属 decode + 通用 V4 prefill|
+|actor|原版 Megatron|原版 Megatron|
+|目标 SM 时钟|1620 MHz|1620 MHz|
+
+新增启动参数 `benchmarks/run_areal_sglang.py --dp-attention`，只覆盖
+`sglang.enable_dp_attention=true`、`sglang.dp_size=4`；原配方的
+`sglang.ep_size=4` 和 `rollout.backend=sglang:d2t4p1` 保持不变。
+AReaL 的外层 `d2` 表示两个实例，不是实例内的 attention DP 数。
+解析后的两组 YAML 已逐项比较：除 trial/W&B 名称和 rollout 的 WeftMoE
+环境外一致，actor 的 `AREAL_USE_WEFTMOE` 均为 0。沿用相同模型、数据、
+seed=1、全局 prompt batch 32、每题 16 samples、20K 生成上限、32K context、
+32,768-token training microbatch，训练 horizon 不变，在第 20 个 update 后停止。
+
+### 启动前的权重布局修复
+
+不能只打开 DP 开关：检查发现两处 TP 语义混淆，已作最小修复。
+
+1. AReaL `AwexColocateReader` 原来把实例总 TP=4 写入
+   `infer_conf.infer_atten_tp_size`。改用已有 model context 的实际 attention
+   TP=1，与 AWEX 原生 reader 一致；否则 writer 会错误重排 gated QKV 和
+   GDN 权重。此修复两组共用，不改变实例数、EP、训练侧分片或通信协议。
+2. Weft 的 DP-local 路径将 shared expert 建为 TP1 完整副本，但 AWEX 的
+   Qwen3.5 shared-expert 规则仍按 TP4 描述。新增 `weftmoe/awex.py`，仅在
+   AWEX 场景且实际重建 shared MLP 后安装元数据适配：SGLang + DP 使用
+   `NO_SHARDING`；Megatron、非 DP 和 baseline 保留原规则。
+
+最小 CPU 检查覆盖 shared gate/up/down、重复安装、非 DP/Megatron 不变，
+以及 reader 的 TP4→attention TP4、DP4→attention TP1 两种 context，全部通过。
+原生 CUDA library 未改，仍为 `local_decode_hh_twobarrier/libweftmoe.so`，
+SHA256 `962daf6fa6486f7afc930934ce636d2a7053e6227742e09356101ab6f3adf421`。
+这不等于完成首次训练后的 AWEX 权重更新验证，后者需观察实际 RL。
+
+AReaL 修复提交为 `28220009`（`fix/awex-dp-attention-metadata`）。为保留
+该仓库原有未提交改动，在独立 worktree 提交；运行目录已应用同一补丁，
+未切换其运行分支。全量 pre-commit 在隔离目录通过，hook 生成的 lockfile
+改动未带入运行目录或本次提交。WeftMoE 的本轮改动不包含训练/算子优化。
+
+### 实验与日志
+
+当前 trial：
+
+- baseline：`qwen35-sglang-baseline-dp4ep4-hhe-mb32-8gpu-20260930`。
+- WeftMoE：`qwen35-sglang-weftmoe-dp4ep4-hhe-mb32-8gpu-20260930-r1`。
+
+两组数据位于 `results/areal_sglang_dp4_ep4_20260930`；启动脚本、入口日志、
+5 秒 GPU 时钟/显存采样及 HTTP 指标位于 `build/rl_dp4_ep4_20260930/`。
+HTTP 采样保留全部 DP rank 的 labels，不能沿用 TP 基准只取 `tp_rank=0`
+的过滤方式。W&B 沿用 console-table 旁路同步，仅发布完整 update：
+
+- [baseline run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-sglang-dp4ep4-hhe-mb32-20260930-baseline)
+- [WeftMoE run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-sglang-dp4ep4-hhe-mb32-20260930-weftmoe)
+
+首个配置解析尝试缺少 Hydra 的 `++`，已修正，日志留在
+`config_parse_attempt/`。Weft 首次正式启动的附加 metrics 端口冲突，尚未
+生成训练数据；失败日志/时钟记录留在 `port_collision_attempt/`，原 trial
+结果目录保留。仅清理该作业残留进程，确认 8 卡显存归零、时钟 1620 后，
+于 04:36 UTC 以 `-r1` trial 原配置重启；没有重置 GPU/驱动或中断 baseline。
+W&B 的 Weft run 在失败尝试中没有 update 数据，继续用于同配置的有效重跑。
+
+04:42 UTC 启动检查：两组的四个 SGLang 实例 `/health` 均返回 200，在线
+`tp_size/dp_size/ep_size=4/4/4`、`enable_dp_attention=true`、
+`moe_a2a_backend=none`。每个实例都有 DP rank 0–3 的活跃请求，生成 token
+计数已增长；两组 MetaServer 中的 `infer_atten_tp_size=1`、
+`infer_world_size=8`、`num_infer_engines=2` 均读回核实。当前有效运行日志
+没有 traceback；baseline/Weft 的 1256/560 个 GPU 时钟样本均为 1620 MHz。
+尚无完整 update，尤其未验证首次训练后的 AWEX 更新及恢复生成，故不报告
+端到端性能优劣。后台作业、GPU/HTTP 采样和 W&B 同步继续运行。
+
 ## 当前 V4 接入检查（2026-09-29）
 
 本轮基线为 HF（`7569ae0`），后续 HG 的 EP 通用化验收见

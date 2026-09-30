@@ -432,6 +432,10 @@ def patch_dp_attention_layout():
                 tp_rank=0,
                 tp_size=1,
             )
+            if os.environ.get("AWEX_META_SERVER_ADDR"):
+                from .awex import replicate_qwen35_shared_experts
+
+                replicate_qwen35_shared_experts()
 
     Qwen2MoeSparseMoeBlock.__init__ = block_init
 

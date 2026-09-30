@@ -17,6 +17,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--areal-root", type=Path, required=True)
     parser.add_argument("--backend", choices=("baseline", "weftmoe"), required=True)
+    parser.add_argument(
+        "--dp-attention", action="store_true",
+        help="Use DP4/EP4 inside each existing four-GPU rollout instance",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args, overrides = parser.parse_known_args()
     root = Path(__file__).resolve().parents[1]
@@ -52,8 +56,11 @@ def main():
     )
     command = [
         "bash", "examples/cpu_staged_offload/run_qwen35_comparison.sh", spec,
-        "stats_logger.wandb.mode=disabled", *overrides,
+        "stats_logger.wandb.mode=disabled",
     ]
+    if args.dp_attention:
+        command.extend(("++sglang.enable_dp_attention=true", "++sglang.dp_size=4"))
+    command.extend(overrides)
     if args.dry_run:
         print(shlex.join(command))
         return
