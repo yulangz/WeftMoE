@@ -2036,7 +2036,7 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
   for (auto &slot : impl->slots) {
     slot.notify = DeviceNotifyPoolBridge::allocate(
         impl->max_plan, execution, config.max_inflight_consumers,
-        config.enable_unstable_inference_rows);
+        config.enable_unstable_inference_rows, config.enable_training_counts);
     // The pool has one execution stream. Its count exchange is serialized by
     // device barriers, independent of which metadata slot each rank retains.
     if (&slot == &impl->slots.front())
@@ -2348,7 +2348,8 @@ ValidatedCudaGeneration CudaNotifyGenerationCoordinator::run(
                                  : static_cast<const CudaGateInput *>(nullptr);
   bool fused_forward_only =
       direct_routes && direct_gates && impl_->pool &&
-      impl_->pool->config.enable_unstable_inference_rows &&
+      (impl_->pool->config.enable_unstable_inference_rows ||
+       impl_->pool->config.enable_training_counts) &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr &&
       request.config.num_experts % request.config.topology.world_size == 0U;
   const auto fused_owned =

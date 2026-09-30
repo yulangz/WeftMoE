@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cooperative_groups.h>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <nccl.h>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -4476,6 +4478,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       ActivationTransportBridge::fused_inference_routes(dispatch);
   const bool training_ring = state->layout.static_ring.depth &&
                              config.retain_backward_state;
+  const auto training_counts = ActivationTransportBridge::training_counts(dispatch);
   const bool static_v4_candidate =
       forward_tuning::kUnifiedWorkers &&
       (!use_gin || fused_inference_routes || training_ring) &&
@@ -4487,7 +4490,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   if (config.prepare_tensors && (!training_ring || config.tensors))
     throw std::invalid_argument("deferred tape allocation requires training ring without bound tensors");
   if (training_ring) {
-    if (fused_inference_routes || view.runtime)
+    if (fused_inference_routes || (view.runtime && !training_counts.runtime))
       throw std::invalid_argument(
           "training ring requires immutable materialized Notify");
     cudaStreamCaptureStatus capture;
@@ -4752,6 +4755,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         at<const std::uint32_t>(slot.device, layout.fused_route_dst_mtile);
   }
   args.dispatch = view;
+  args.checkpoint.counts = training_counts;
   if (training_ring)
     args.dispatch.runtime = at<DeviceDispatchRuntime>(slot.device,
                                                        layout.fused_dispatch_runtime);
@@ -5343,32 +5347,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               failure_guard.committed = true;
               throw;
             }
-            const auto planner = use_gin ? static_ring_plan_kernel<true>
-                                         : static_ring_plan_kernel<false>;
-            cudaLaunchAttribute cooperative{};
-            cooperative.id = cudaLaunchAttributeCooperative;
-            cooperative.val.cooperative = 1;
-            cudaLaunchConfig_t plan_launch{};
-            plan_launch.gridDim = launch.gridDim;
-            plan_launch.blockDim = launch.blockDim;
-            plan_launch.stream = exec->stream;
-            plan_launch.attrs = &cooperative;
-            plan_launch.numAttrs = 1;
-            plan_launch.dynamicSmemBytes = sizeof(unsigned) *
-                std::max({args.ring.source.scratch_words(!use_gin),
-                          view.sizes.owned_expert_count * args.ring.source.shape.sources,
-                          12U});
-            internal::throw_cuda("forward-plan",
-                internal::prepare_kernel_stack(
-                    reinterpret_cast<const void *>(planner)),
-                id.calling_rank, id.world_size, backend->session.session().identity(),
-                id.generation, ExchangeKind::ExpertCounts, "prepare ring planner stack");
-            internal::throw_cuda("forward-plan",
-                cudaLaunchKernelEx(&plan_launch, planner, args),
-                id.calling_rank, id.world_size, backend->session.session().identity(),
-                id.generation, ExchangeKind::ExpertCounts, "freeze training ring plan");
-            // The same-stream main consumes the completed physical plan;
-            // no device result is needed to size or bind the tape on host.
+            // Physical planning runs in the same main entry as inference.
           }
           if (decode)
             launch_forward = cudaLaunchKernelEx(

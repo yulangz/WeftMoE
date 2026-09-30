@@ -1363,6 +1363,7 @@ struct WorkspaceState {
   LocalNotifyArgs local_args{};
   bool single_kernel = false;
   bool unstable_inference_rows = false;
+  bool training_counts = false;
   // Host-visible Notify supplies an exact immutable snapshot. Enqueue-only
   // replay refreshes device counts without refreshing that host snapshot.
   bool replay_counts = false;
@@ -1426,6 +1427,7 @@ DeviceBufferLease make_lease(const std::shared_ptr<WorkspaceState> &state,
 struct CudaNotifyPoolAllocation {
   CudaNotifyWorkspacePlan max_plan;
   bool unstable_inference_rows = false;
+  bool training_counts = false;
   bool owns_communication = false;
   std::shared_ptr<NotifyCommunication> communication;
   std::shared_ptr<internal::CudaAllocation> route;
@@ -2502,7 +2504,7 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
     const CudaNotifyWorkspacePlan &max_plan,
     const CudaExecution &execution,
     std::uint32_t max_inflight_consumers,
-    bool unstable_inference_rows) {
+    bool unstable_inference_rows, bool training_counts) {
   if (!execution)
     invalid("phase=device-pool-allocate, field=execution, rank=n/a, "
             "expected=valid, actual=empty");
@@ -2510,6 +2512,7 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
   auto result = std::make_shared<CudaNotifyPoolAllocation>();
   result->max_plan = max_plan;
   result->unstable_inference_rows = unstable_inference_rows;
+  result->training_counts = training_counts;
   result->route = std::make_shared<CudaAllocation>();
   result->workspace = std::make_shared<CudaAllocation>();
   result->receive = std::make_shared<ReceiveMetadata>();
@@ -2802,6 +2805,7 @@ CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
   state->receive = allocation->receive;
   state->communication = allocation->communication;
   state->unstable_inference_rows = allocation->unstable_inference_rows;
+  state->training_counts = allocation->training_counts;
   state->slot_lease = std::move(slot_lease);
   auto impl = std::make_shared<CudaNotifyWorkspace::Impl>();
   impl->state = std::move(state);
@@ -3361,7 +3365,7 @@ struct DeviceDispatchConsumerLease::Impl {
     DeviceDispatchKernelView view{};
     view.identity = identity;
     view.sizes = sizes;
-    if (workspace_ref.replay_counts)
+    if (workspace_ref.replay_counts || workspace_ref.training_counts)
       view.runtime = at<const DeviceDispatchRuntime>(base, dl.runtime);
     view.expert_id = at<const std::uint32_t>(base, dl.expert_id);
     view.expert_to_rank = at<const std::uint32_t>(base, dl.expert_to_rank);
@@ -3741,7 +3745,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
                            &resident,
                            single_node_inference
                                ? single_node_inference_notify_kernel
-                               : (state->single_kernel
+                               : (state->training_counts ? training_count_notify_kernel
+                                  : state->single_kernel
                                       ? single_notify_kernel
                                       : materialize_notify_kernel),
                            256, 0),
@@ -3790,7 +3795,8 @@ DeviceDispatchHandle DeviceMetadataBridge::materialize(
       "device-materialize",
       single_node_inference
           ? enqueue(single_node_inference_notify_kernel)
-          : (state->single_kernel ? enqueue(single_notify_kernel)
+          : (state->training_counts ? enqueue(training_count_notify_kernel)
+             : state->single_kernel ? enqueue(single_notify_kernel)
                                   : enqueue(materialize_notify_kernel)),
       rank, plan.world_size, context.session().identity(),
       context.session().generation(), ExchangeKind::ExpertCounts,
@@ -4481,6 +4487,17 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
 bool ActivationTransportBridge::fused_inference_routes(
     const DeviceDispatchHandle &dispatch) {
   return dispatch.impl_ && dispatch.impl_->fused_forward_notify;
+}
+
+TrainingCountView ActivationTransportBridge::training_counts(
+    const DeviceDispatchHandle &dispatch) {
+  const auto &state = *dispatch.impl_->workspace;
+  if (!state.training_counts)
+    return {};
+  auto *base = state.allocation->device_ptr;
+  return {at<const std::uint64_t>(base, state.device_layout.chunk_counts),
+          at<const std::uint64_t>(base, state.device_layout.expert_base),
+          at<DeviceDispatchRuntime>(base, state.device_layout.runtime)};
 }
 
 std::uint64_t ActivationTransportBridge::padded_received_rows(

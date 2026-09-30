@@ -161,6 +161,14 @@ struct DeviceDispatchRuntime {
   std::uint64_t error = 0;
 };
 
+inline constexpr unsigned kTrainingCountChunkRoutes = 1536U;
+
+struct TrainingCountView {
+  const std::uint64_t *chunk_prefix = nullptr;
+  const std::uint64_t *expert_source_base = nullptr;
+  DeviceDispatchRuntime *runtime = nullptr;
+};
+
 struct DeviceDispatchKernelView {
   DeviceDispatchIdentity identity;
   DeviceDispatchSizes sizes;
@@ -321,7 +329,8 @@ public:
       const CudaNotifyWorkspacePlan &max_plan,
       const CudaExecution &execution,
       std::uint32_t max_inflight_consumers = 4,
-      bool unstable_inference_rows = false);
+      bool unstable_inference_rows = false,
+      bool training_counts = false);
   static void
   configure_communication(const std::shared_ptr<CudaNotifyPoolAllocation> &,
                           const NcclSession &, const CudaExecution &);

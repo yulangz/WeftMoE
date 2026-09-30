@@ -2,6 +2,7 @@
 // Kept in this header so the aggregation translation unit preserves device
 // inlining and code generation while the Forward boundary remains explicit.
 struct RingCheckpointView {
+  TrainingCountView counts;
   std::uint64_t *source_rows = nullptr; // Notify route_dst_row per source route.
   std::uint64_t *rows = nullptr; // Physical-plan row -> canonical tape row.
   float *gates = nullptr;

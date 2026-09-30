@@ -219,6 +219,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   } else {
     grid_sync(a);
   }
+  if constexpr (Training)
+    if (a.checkpoint.counts.runtime)
+      build_training_rows(a, scratch);
   const auto tid = threadIdx.x;
   const auto worker = std::uint64_t(blockIdx.x) * Threads + tid;
   const auto workers = std::uint64_t(gridDim.x) * Threads;
@@ -228,8 +231,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   if (threadIdx.x < Math) {
     const auto tid = std::uint64_t(blockIdx.x) * Math + threadIdx.x;
     const auto stride = std::uint64_t(gridDim.x) * Math;
-    if constexpr (!Training)
-      stage_input(a, tid, stride);
+    stage_input(a, tid, stride);
     for (auto route = tid; route < p.tokens * p.shape.top_k; route += stride) {
       r.source_gates[route] = a.gates[route];
       if constexpr (Training)
@@ -238,7 +240,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         const_cast<std::int32_t *>(p.selected_experts)[route] =
             a.selected_experts[route];
     }
-    if constexpr (!Training)
+    if (!Training || a.checkpoint.counts.runtime)
       build_combine_order(a, tid, stride);
   } else {
     if (single_window) {
@@ -256,8 +258,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             planner, w, counts, a.dispatch.route_dst_row);
     }
   }
-  // Inference overlaps input staging and counting. Training publishes only
-  // metadata here, after tape allocation. Math has no live GEMM state yet.
+  // Input staging overlaps source planning in both modes. The host has
+  // already allocated the training tape; math has no live GEMM state yet.
   collective_scope_sync<Threads, kCollectiveJoinBarrier>();
   if constexpr (Network) {
     const auto &network = a.static_network;
@@ -275,6 +277,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   }
   if constexpr (Network) {
     grid_sync<0U, Threads>(a);
+    if constexpr (Training)
+      if (a.checkpoint.counts.runtime)
+        build_training_packets(a, scratch);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
                                Kernel, 0U, 0U, 0U);
     for (auto index = worker; index < p.local_windows() * p.window_capacity();
@@ -534,20 +539,3 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
 }
 
 } // namespace weftmoe_pf::ring
-
-// Materialized Notify owns canonical row order; this second plan freezes the
-// bounded execution geometry. No X payload or checkpoint is touched here.
-template <bool Network>
-__global__ __launch_bounds__(384, 1) void static_ring_plan_kernel(
-    const __grid_constant__ ForwardKernelArgs a) {
-  extern __shared__ __align__(128) unsigned char scratch[];
-  if (blockIdx.x == 0U && threadIdx.x == 0U) {
-    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-    *status = {};
-    status->start_clock = status->route_exchange_start_clock = device_globaltimer_ns();
-  }
-  weftmoe_pf::ring::prepare<Network, true>(a, scratch);
-  if (blockIdx.x == 0U && threadIdx.x == 0U)
-    peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
-        ->route_exchange_complete_clock = device_globaltimer_ns();
-}

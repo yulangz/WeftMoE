@@ -385,6 +385,7 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/weftmoe_pf/network_route_exchange.cuh"
 #include "cuda/weftmoe_pf/single_node_route_exchange.cuh"
 #include "cuda/weftmoe_pf/single_node_finalize.cuh"
+#include "cuda/weftmoe_pf/training_plan.cuh"
 #include "cuda/weftmoe_pf/ring_plan.cuh"
 #include "cuda/weftmoe_pf/ring_admission.cuh"
 #include "cuda/forward/unified_entry.cuh"

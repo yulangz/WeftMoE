@@ -194,6 +194,9 @@ struct DeviceNotifyResourcePoolConfig {
   // M and the fixed combine order is retained, so this does not affect FWD
   // numerics. Training must leave this disabled because dW reduces over M.
   bool enable_unstable_inference_rows = false;
+  // PF training: count-only allocation boundary; the Forward main constructs
+  // stable routed rows and its physical execution plan after tape allocation.
+  bool enable_training_counts = false;
 };
 
 struct DeviceNotifyResourcePoolUsage {

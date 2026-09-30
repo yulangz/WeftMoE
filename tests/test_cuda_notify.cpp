@@ -2809,7 +2809,8 @@ void run_cached_backward_rank(
   auto context = weftmoe::make_rank_collective_context(
       generation.session(), rank, execution.token());
   auto notify_pool = weftmoe::cuda::make_device_notify_resource_pool(
-      base, execution, {config, max_tokens, 8192, 3U});
+      base, execution, {config, max_tokens, 8192, 3U, 4U, false,
+                       std::getenv("WEFTMOE_STATIC_RING_TOKENS") != nullptr});
   auto route_storage = weftmoe::cuda::upload_cuda_routes(
       routes, top_k, context, execution);
   const auto route_gates = fixed_random_selected_gates(
@@ -3723,7 +3724,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
           {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
            forward_smoke ? 3U : 2U, 4U,
            benchmark_forward &&
-               std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr});
+               std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr,
+           benchmark_forward &&
+               std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") != nullptr &&
+               std::getenv("WEFTMOE_STATIC_RING_TOKENS") != nullptr});
   };
   if (!benchmark_forward)
     prepare_notify_pool();

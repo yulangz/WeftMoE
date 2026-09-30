@@ -9,6 +9,8 @@
 #include "cuda/forward/transport_launch.hpp"
 
 #include <cooperative_groups.h>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda/atomic>

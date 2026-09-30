@@ -113,7 +113,7 @@ class Runtime {
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
         {config_, max_tokens, 8192, max_saved, 4,
-         fused_inference_});
+         fused_inference_, training_ring_});
     if (!WEFTMOE_ENABLE_GIN_RDMA && nodes != 1)
       throw std::invalid_argument(
           "this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and supports a "

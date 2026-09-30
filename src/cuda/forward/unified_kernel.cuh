@@ -93,7 +93,8 @@ __device__ __forceinline__ void run(
   __shared__ unsigned kind, return_mblock, pair_operand;
   __shared__ forward_compute_detail::ComputePairState pair;
   if constexpr (StaticSchedule) {
-    if (a.fused_inference_routes && blockIdx.x == 0U && threadIdx.x == 0U) {
+    if ((a.fused_inference_routes || (RingSchedule && RetainBackwardState)) &&
+        blockIdx.x == 0U && threadIdx.x == 0U) {
       auto *status =
           peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       *status = {};
@@ -127,14 +128,14 @@ __device__ __forceinline__ void run(
   programmatic_launch::wait();
   if constexpr (RingSchedule && RetainBackwardState) {
     if (blockIdx.x == 0U && threadIdx.x == 0U)
-      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->start_clock =
+      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->route_exchange_start_clock =
           device_globaltimer_ns();
-    // The plan and tape allocations are already frozen. Only stage X here;
-    // the node join publishes it to pull owners, without recounting routes.
-    weftmoe_pf::ring::stage_input(a,
-        std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x,
-        std::uint64_t(gridDim.x) * blockDim.x);
-    weftmoe_pf::rank_barrier<0U, 384U, true, true, true>(a);
+    // Tape allocation is complete before launch. Training and inference use
+    // the same in-kernel physical planner and bounded payload pipeline.
+    weftmoe_pf::ring::prepare<!StaticLocal, true>(a, storage);
+    if (blockIdx.x == 0U && threadIdx.x == 0U)
+      peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->route_exchange_complete_clock =
+          device_globaltimer_ns();
   }
   if constexpr (StaticSchedule) {
     if (a.fused_inference_routes) {

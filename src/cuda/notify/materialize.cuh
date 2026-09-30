@@ -188,4 +188,5 @@ __global__ void __launch_bounds__(256) single_notify_kernel(NOTIFY_ENTRY_ARGS) {
                      packed_local);
 #endif
 }
+#include "cuda/notify/training_counts.cuh"
 #undef NOTIFY_ENTRY_ARGS

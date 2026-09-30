@@ -1112,6 +1112,35 @@ autotune 配置表。模型形状需要不同 M 或配额属于配置选择，�
 
 ## 8. Prefill/training 的保存与 no-drop 合同
 
+### 2026-09-30：mini Notify 与静态 Backward 重构（实施中）
+
+本轮目标取代下文 M6/FS2 的历史执行边界：训练只在 main 前做计数 Notify
+和精确 tape 分配；训练与推理共用 main 内的物理规划、通信和计算流水。
+推理的保存指针为空，不建立 tape。计数不赋予原子行号；main 必须生成稳定的
+expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
+
+- [x] mini Notify：只统计、交换各 source/expert 行数和分配所需 R/P；不构造
+  V3 的 packet/wave 排序，不启动 activation payload。
+- [ ] 将 ring planner 合入 main，保留全 rank 分配成功之后才能推进 ring 的
+  边界；验证零行、热点、不等长、多个 live tape 与 allocation retry。
+- [ ] 静态 Backward：固定 CTA/cluster 的 dU、SwiGLU backward、dX ownership，
+  不再动态领用计算任务；复用算术和通信模块。
+- [ ] dW1/dW2 严格位于本 rank 全部 dX GEMM 完成之后，而不是低优先级抢占；
+  Return/Reduce 可以继续与 dW 重叠，权重梯度不在 combine 的依赖链上。
+- [ ] 在 SwiGLU backward 一并计算 selected-route dGate，随 dX 返回。算子不接收
+  router 权重或 logits，router softmax/top-k 之外的参数反传仍由上游 autograd
+  消费 dGate 完成。
+- [ ] 1620 MHz 下 EP8（单机）/EP16（双机）的正确性、Forward wall、Backward wall
+  与 FWD+BWD 总耗时对照冻结 V3；分别记录 1/64/8192/20480，不把 main 计时范围
+  变化误记为性能收益。每个验证完的 milestone 提交。
+
+以下内容保留为已验证历史基线；上述条目未勾选之前，不代表重构已完成。
+
+mini Notify 与 main 内规划已落地，EP8/EP16 native 梯度 hash 和 Torch reference
+parity、热点/零入站、多个 live tape、allocation retry 已通过；结果和计时边界见
+[训练记录](static_forward_v4_training_record.md#mini-notify--main-内规划2026-09-30)。
+完整长序列与不等长 source 门禁仍随最终静态 Backward 一起执行。
+
 prefill inference 与 training Forward 共用有界流水，但训练保存实际规模的 tape，
 不是在 ring 中留住整次调用的激活。M6d/M6e已接通单机及多机版本，非ring训练
 仍用V3及相应编译profile；Backward保留原GEMM/调度，多机继承8-GPU/node的

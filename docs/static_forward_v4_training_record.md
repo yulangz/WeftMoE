@@ -1889,3 +1889,59 @@ GC规划检查及racecheck通过，未构建library或执行完整Torch/主路�
 不为单个形状硬编码阈值，不采用GC/GD，也没有留下候选测试或TMA map选项。
 全部main/wall、相同pool、反向48个hash及launcher参数误用记录，见
 [ring优化记录](static_forward_v4_ring_record.md)的GC/GD小节；训练端到端目标仍开放。
+
+## Mini Notify + main 内规划（2026-09-30）
+
+训练前置阶段改为一次 counts-only cooperative kernel：统计并交换各 source/expert
+的行数，发布实际 R/P 和容量检查结果。只保留每个 1536-route chunk 的 expert
+前缀，不生成 route 行号、packet/fanout 或 V3 wave 排序。所有 rank 完成 tape
+分配之后，PF main 在自己的 shared operand arena 中恢复稳定的
+expert/source/route 行号，再构建 ring 物理计划；双机 Backward 所需的不可变
+packet/fanout 直接从 main 的 node-token 目录生成。原独立 ring planner launch
+被删除。推理仍不创建 tape，saved pointers 为空；训练/推理共用 main 实现，
+保存代码仍由编译期 specialization 裁掉，而不是给推理增加运行时分支。
+
+SavedX 为 `[R,H]`，G/U 为分离的两个 `[R,I]` 平面。逻辑行序和 route 返回映射
+归属于各自 live tape，不依赖下一次 Forward 会覆盖的 ring 计划。mini Notify
+是分配边界，不启动 activation payload；分配失败的 collective retry 合同保留。
+
+第一轮 EP8 正式对照：同一远端节点独占，8×L20X、1620 MHz，H2048/I512、
+E64/K4、BF16、30 轮（10 warmup + 20 measured），每轮取最慢 rank 后取 p50。
+PF 使用 B512/D8，Forward 保留训练状态。单位 µs，包含 Notify 的 host wall：
+
+| tokens/rank | V3 wall | mini wall | wall 降低 | V3 Notify | mini Notify |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 469.704 | 307.791 | 34.47% | 201.338 | 110.799 |
+| 64 | 553.803 | 355.534 | 35.80% | 216.157 | 116.381 |
+| 8192 | 1737.380 | 1615.320 | 7.03% | 322.900 | 122.682 |
+| 20480 | 3586.140 | 3542.170 | 1.23% | 362.455 | 130.557 |
+
+main 的计时边界现在包含 planner，不能拿它直接对照旧 main 并将边界变化算成
+收益。20K 差距较小，不能外推其他模型或节点数。日志为
+`build/pf_training_mini_notify/{v3,mini_remote}_ep8_t*_forward.log`；所有输入、
+权重和输出 hash 一致。冻结 mini native 二进制 SHA256 为
+`72a362e1b8fade9c77c6ef17b50650e87adfff0b8b9426204a59229fa993edb5`。
+V3 使用 `build/static_inference_v3_20260923/test_cuda_notify` 并显式设置
+`WEFTMOE_DISABLE_STATIC_FORWARD_V4=1`、清除 ring 环境变量；仅凭文件名不能
+确定执行的是 V3。
+
+Native 正确性：EP8 T512/E16/K6/B512/D8、EP16 T64/E32/K6/B16/D1，mini
+Forward 接原 Backward，两次重复均稳定，dX/dGate/dW1/dW2 逐 rank hash 与
+既有 FS 验证结果完全一致。日志位于该目录的 `ep{8,16}_t*_validation.log`。
+随后使用 `build/pf_static_backward/` 的 library/extension 跑既有 Torch 集成测试：
+EP8/EP16、T64/E64/K4、B16/D1，输出及四组梯度均通过 reference parity；
+单 rank 前向/反向分配失败、保留 tape 后重试、三个 live tape、热点目的地切换
+及工作区扩缩容均通过。双机测试随后在两个 EP8 group 上验证 inference。
+日志为 `torch_ep8_t64.log` 和 `torch_ep16_t64_node{0,1}.log`。该构建含下述
+首版静态 Backward；完整长序列矩阵及最终 Backward 性能另记后续结果。
+
+### 静态 Backward 首版：细粒度 task residue 未采用
+
+dU、SwiGLU epilogue、dX 分别将线性 tile 按 cluster 数取模分配，dW 必须等待
+本 rank 全部 dX 完成；Return 也改为固定 M-block owner。EP8/EP16 上述 native
+用例四组梯度 hash 均与 mini + 原 Backward 一致。但 EP8 同机同频对照，
+T1/64 wall 为 257.792/390.887 µs（V3 为 281.948/420.911），T8192/20480
+反而为 2540.650/6612.420 µs（V3 为 2127.380/5066.530），慢 19.43%/30.51%。
+激活梯度流水明显变慢，保留六个微小 epilogue task 和跨 cluster readiness
+造成的等待值得优先消除，不能仅因为去掉 atomic claim 就认为会更快。
+记录于 `build/pf_static_backward/ep8_t*_backward.log`；该首版不是最终性能结论。
