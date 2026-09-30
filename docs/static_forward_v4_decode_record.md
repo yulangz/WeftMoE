@@ -11,6 +11,7 @@ MegaMoE，单机长文和多机回归持平。
 M128/双 warpgroup 配置当作 HH 候选的当前实现。
 2026-09-30 的 E256/K8 小 batch 三方独立对照见第 8 节；该节 T 为全局
 batch，与前面的 E64/K4、每 rank T 的 MegaMoE 对照不是同一口径。
+同日补充的 DP4+EP4（每卡输入不同，无冗余外层 all-reduce）见第 9 节。
 
 ## 1. 入口和适用范围
 
@@ -745,3 +746,91 @@ DeepGEMM 包（支持 E256 的分段专家扫描），不是另取上游新版�
   `100a06dd12331d178a8c8590da4703008598dcb9625bf7769fa69863029394ed`。
 - `deep_gemm/include/deep_gemm/impls/sm90_bf16_mega_moe.cuh`：
   `fb636714d7e7703b9a480fa7a9b57dec29b79d833c9b55dd3140a7c859082a77`。
+
+## 9. DP4+EP4：按 DP-local 输入重测
+
+2026-09-30。第 8 节是 TP4/EP4 replicated 输入：baseline 不需要 dispatch，
+只有末尾 all-reduce；Weft/Mega 的兼容布局则包含自身 dispatch/return 和
+末尾 all-reduce。它不能用来判断 DP-local 工作流的优劣。本节改为同一台
+机器的 DP4+EP4，attention TP=1、expert TP=1，共 4 张 GPU，不是 16 张。
+SGLang 参数表示为 `tp_size=4, dp_size=4, ep_size=4, enable_dp_attention=True`。
+
+### 三条路径及边界
+
+|实现|计时内的数据流|输出|
+|---|---|---|
+|SGLang baseline|DP-local X → all-gather X → Triton 本地专家 → reduce-scatter|DP-local 完整结果|
+|MegaMoE|DP-local X/route staging → 融合 dispatch / GEMM / return / combine|DP-local 完整结果|
+|WeftMoE HHE|现有适配层 DP-local staging → 专属 decode kernel|DP-local 完整结果|
+
+baseline 沿用 `moe_a2a_backend=none`，不是 DeepEP。直接调用当前安装版
+SGLang 的 `dp_gather_partial` / `dp_reduce_scatter_tensor`，MAX_LEN 模式，
+与 Qwen3.5 `allow_reduce_scatter=True` 的 decode 布局一致。Weft/Mega 不再
+做全局输出 scatter，也没有外层 TP all-reduce。没有修改生产适配层。
+
+同第 8 节，router/top-k、共享专家、attention 不计时；baseline 正常是在
+gather X 之后计算全局 route，因此本基准预计算全局 top-k，不额外添加一项
+实际工作流没有的 route all-gather。Weft/Mega 只取得各自的 local route。
+权重和全局输入仍按第 8 节种子生成，随后各 rank 取不同切片：相同全局 batch
+下与 TP 控制组的数学输入相同，并非四张卡重复同一批 token。
+
+本节 **T 为每个 DP rank 的 token 数**，四卡均衡、均非空，全局 batch=4T。
+不涵盖不均衡调度/idle rank。E256/K8/H2048/I512、BF16、GPU、冻结二进制和
+1620 MHz 设置均与第 8 节相同；Weft 各点都在每 rank 容量 64 的 decode 池内。
+
+### 实测结果
+
+单位 µs，30 轮 rank-max p50，每轮 50 replay、丢弃 5 轮 warmup、轮换 backend
+顺序。相对变化为 `Weft / 对照 - 1`，负数表示 Weft 延迟更低。
+
+|每卡 T|全局 batch|baseline|MegaMoE|WeftMoE HHE|相对 baseline|相对 MegaMoE|
+|---:|---:|---:|---:|---:|---:|---:|
+|1|4|67.588|74.278|53.032|-21.5%|-28.6%|
+|2|8|73.116|77.590|58.398|-20.1%|-24.7%|
+|4|16|102.288|135.062|97.009|-5.2%|-28.2%|
+|8|32|122.100|154.525|115.328|-5.5%|-25.4%|
+|12|48|148.347|172.280|135.388|-8.7%|-21.4%|
+|16|64|166.205|179.893|140.693|-15.3%|-21.8%|
+|24|96|194.852|188.935|148.291|-23.9%|-21.5%|
+|32|128|204.268|188.752|149.610|-26.8%|-20.7%|
+|48|192|210.642|189.807|152.589|-27.6%|-19.6%|
+|64|256|218.958|192.745|158.202|-27.7%|-17.9%|
+
+按 T64→1 反序完整复测，最大绝对 p50 变化：baseline 0.45%、Weft 0.81%、
+MegaMoE 0.61%。Weft 在两轮全部点均领先 baseline 和 MegaMoE；首轮延迟
+分别降低 5.2%–27.7% 和 17.9%–28.6%。所有 rank 的测量前后 NVML 采样均为
+1620 MHz；20 个 DP/batch 测量点的三方容差检查全部通过，最大绝对误差
+`1.1444091796875e-5`，容差仍为 `rtol=0.025, atol=2e-5`。
+
+另用扩展后的同一脚本回归 TP4：全局 batch 4/32/64/128 的 baseline 为
+50.588/105.870/150.399/187.051 µs，Weft 为
+59.243/123.184/149.431/163.794 µs，MegaMoE 为
+81.023/162.492/190.047/202.763 µs，与第 8 节趋势一致。
+例如全局 batch 32 时，TP 布局下 Weft 123.184 > baseline 105.870；DP 布局
+下 Weft 115.328 < baseline 122.100。应按实际布局比较，不能将两者混为一种
+工作流，也不能把布局变化的收益称为本轮 GEMM 优化。
+
+### 路径核实与复现
+
+正式计时结束后另对每卡 T8 做 CUDA trace。每次 replay，baseline 含一项
+`ncclDevKernel_AllGather_RING` 和一项
+`ncclDevKernel_ReduceScatter_bf16_RING`；Weft/Mega 各只有 `stage_inputs`
+和自身 MoE kernel，没有外层 NCCL collective。Weft 实际选中
+`local_decode::kernel<16u>`。Profiler 仅用于核对路径，其耗时不合入正式
+数据，也不用于估算通信占比（单 rank profiling 会引入跨 rank 偏斜）。
+
+日志目录 `build/decode_dp_threeway_20260930/`：`dp4_forward.log`、
+`dp4_reverse.log`、`tp4_control.log` 为正式记录，`profile.log` 和 `traces/`
+为独立诊断，`smoke.log` 不参与统计。全部进程正常退出，GPU 显存已释放。
+完整串行命令为该目录的 `run.sh`；沿用第 8 节环境变量，单轮命令如下：
+
+```bash
+torchrun --standalone --nproc_per_node=4 benchmarks/torchrun_sglang_decode.py \
+  --dp-attention \
+  --deepgemm-package build/deepgemm_sglang_torch291/lib.linux-x86_64-cpython-312 \
+  --tokens 1 2 4 8 12 16 24 32 48 64 --samples 30
+```
+
+这仍是暖缓存、均衡 DP batch 的 routed-MoE 单层结果，不是 DP4 的完整
+SGLang/RL 结果。不能据此覆盖第 7 节和 AReaL 记录里的 TP4 RL 回退结论，
+也没有声称已比较 DeepEP low-latency baseline。
