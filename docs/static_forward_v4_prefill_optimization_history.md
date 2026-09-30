@@ -6,6 +6,8 @@ GA+FZ 的有效优化过程，解释每一步解决了什么、收益有多少�
 为当前代码。
 
 最终 inference 在主测形状下已超过冻结 V3；训练 Forward wall 尚未超过 V3。
+这里采用统一静态流水和参数化计算模板，M/N/K、stages、CTA 配额及通信容量
+应由 autotune 适配模型、负载和拓扑，不以当前手动选出的参数限定算法适用范围。
 单机短文在通用 ring 上的后续优化、专属 decode 和 SGLang 接入另见
 [decode 优化历程](static_forward_v4_decode_optimization_history.md)。
 
@@ -302,8 +304,33 @@ consumed 保护在线换代；输入及 immutable plan 仍可能随 T 增长，�
 按代累计 retire target，没有运行时动态 expected-count 领用。
 
 这些机制没有写死两节点，但端到端 GIN 数据面实测仅两节点；更多节点的
-布局/规划检查不是更多节点的性能验收。H2048/I512/E64/K4 的最佳 Q、B/D、
-GEMM tile 和 profile 阈值也不是其他模型的通用最优值。
+布局/规划检查不是更多节点的性能验收。H2048/I512/E64/K4 的 Q、B/D、
+GEMM tile 和 profile 阈值是当前验收配置，不是其他模型的通用最优值；
+应通过自动搜索生成各形状和拓扑的配置，而不是为每个模型新增实现分支。
 
 复现实验时先核对实际路径、形状、容量和 clocks，再按原记录里的 frozen
 binary/config 重放；未通过数值或生命周期门禁的快候选不进入性能比较。
+
+## 单机和多机都采用参数化 autotune
+
+M 不是固定的模型限制。单机和多机的 GEMM 都可以在合法模板中搜索算术 M、
+N/K、stages、CTA 配额和 cluster 策略；多机再联合考虑 Dispatch/Return Q、
+lane/owner 配额、source group、窗口 B 和 contribution/network 深度。候选
+可以分层预筛，但最终以完整算子的 rank-max 延迟和规定的内存预算选优，
+不能用纯 GEMM 或纯通信的最优值直接拼成融合配置。
+
+搜索键除模型形状、dtype、EP、输入布局和 batch bucket 外，还应区分节点数、
+每节点 GPU 数、GPU/互联与通信后端。均衡、偏斜、热点、不等长样本共同约束
+选择，通信和容量参数要计入内存成本；最坏合法路由仍须背压而非丢 token。
+不同节点数可以选择不同参数，但复用同一套参数化协议，不能硬编码双机算法。
+
+算术 M 与物理 ring block 的 M 要分开。优先在不改物理目录的前提下搜索
+算术 slice；当前网络路径不能仅设置单机 decode 的 M16/M64 就视为已接入。
+若改变物理块或通信几何，须成套生成 planner、slot 容量、TMA maps、ready
+目标和静态 ownership，验证进度及复用后才纳入候选。协议不兼容的配置必须
+由通信组一致选择，在 pool 准备/图捕获前固定，不能由各 rank 临时独立拼接。
+
+当前仓库已有 Forward 调优工具与手动消融证据，但上述 V4 单机/多机统一
+选型、算术 M 候选接入和配置查表尚未完成。后续复用现有调优工具扩展，不另造
+每模型一套调度器；任务及数值约束见
+[设计第 7.4 节](static_forward_v4_design.md#74-单机和多机的统一-autotune-原则)。

@@ -5,9 +5,11 @@
 对其他模型的适用边界，不把实验流水账里的旧实现当成当前实现。
 
 当前专属 kernel 为 HHE，提交 `07a586d`；后续接入和 benchmark 以
-`a54556c` 为本次文档审计基线。阶段三并非所有项目都能无条件推广：消除冗余
-staging 和重复同步的思路较通用，M16/M64、CTA 驻留和密度阈值则必须结合
-模型形状与路由负载。当前没有其他 H/I 模型的完整性能验收。
+`a54556c` 为本次文档审计基线。阶段三采用可复用的工作流和算术模板；M、
+CTA 驻留、流水级数和切换阈值应由 autotune 按模型形状与负载选择，不应成为
+每个模型新增专属分支的理由。这一原则同样适用于多机和 prefill。当前 M16/M64
+选择仍是经验规则，统一自动选型尚未接通，其他 H/I 的性能也尚未完整验收；
+这些是实现和证据的当前边界，不是参数无法自动适配。
 
 长文和多机的演进另见 [prefill 优化历程](static_forward_v4_prefill_optimization_history.md)。
 逐次参数、冻结 hash、原始日志和验收详情见
@@ -24,9 +26,9 @@ staging 和重复同步的思路较通用，M16/M64、CTA 驻留和密度阈值�
 | 融合 staging 与输出回填 | 合并小 kernel、减少冗余张量和复制，通常降低固定开销 | 当前实现针对 SGLang BF16、稳定 child-graph 地址；DP-local 不需要 TP 布局的输出 scatter。更大 H 的 bandwidth/occupancy 仍要测 |
 | padding 不激活无关专家 | 零 X/gate 的补齐行不应制造额外专家 GEMM 任务 | 仅有补齐且原 route 激活了无关专家时有收益；T≥EP 且整除时可能完全不触发 |
 | 跳过空 warpgroup 和稀疏 TMA | 少做 padding 行的算术和搬运 | 只对稀疏专家有效；这些是历史中间实现，最终由 M16/M64 slice 取代，不是永久叠加的独立分支 |
-| TMA 与 math 流水、合并 empty credit | 减少不必要等待和控制操作 | 最佳 stage 数随 H/I、tile、寄存器及 SMEM 变化；不是所有形状都应该固定三段 |
-| M16 warp MMA 与 M64 WGMMA | 稀疏时避免无效 M 行，密集时摊薄权重加载 | 依赖实际每专家行数及硬件，M16 并非越小越快；已有 E64/T64 反例 |
-| CTA 数量按专家任务量裁剪 | 避免大量空 CTA 参与 grid/rank collective | 最佳并行度受专家数、N-tile 数、SM 数和 occupancy 影响，不能复制某个固定 CTA 数 |
+| TMA 与 math 流水、合并 empty credit | 减少不必要等待和控制操作 | stage 数可与 M/N/K 联合 autotune，在生命周期和 SMEM 约束内选优，不固定推广三段 |
+| M16 warp MMA 与 M64 WGMMA | 稀疏时避免无效 M 行，密集时摊薄权重加载 | 两个已验证候选可以进入 autotune；E64/T64 的反例说明需要选型，不说明优化机制仅适用于 E256 |
+| CTA 数量按专家任务量裁剪 | 避免大量空 CTA 参与 grid/rank collective | 与算术 tile 和 stages 联合搜索，受实际 occupancy 和静态调度进度约束 |
 | 每 CTA 汇总阶段计时 | 避免逐 tile 的全局计时原子操作 | 原实现有这些统计才会省，独立收益仅约 1–2 µs，不是主因 |
 | 省去 AfterClean | 下一次入口同步可以同时承担旧 contribution 退休确认 | 仅适用于同一 pool 串行、单容量窗口、无末尾通用计数器清理；不能推广到在线多窗口或多机 ring |
 | DP-local 输入输出 | 让融合 MoE 自己完成路由和返回，取消重复外围 collective | 要与模型层布局、shared expert、权重更新协议一致；TP replicated baseline 本来不需要 dispatch |
@@ -182,8 +184,9 @@ local_tokens × world × top_k >= experts × 16  → M64
 否则                                           → M16
 ```
 
-它近似均匀路由下的每专家行数，不是逐专家实时负载判断，更不是所有模型的
-最优分界。两种形状共享 M128 物理目录和跨 rank 协议；不等长 source 可以
+它近似均匀路由下的每专家行数，不是逐专家实时负载判断，也不是 autotune
+结果；后续应由离线搜索生成的配置表替代固定经验阈值。两种形状共享 M128
+物理目录和跨 rank 协议；不等长 source 可以
 选择不同 M，但必须保持逐位数值和协议兼容，热点遍历全部 slice，不丢 token。
 
 随后 grid 依据本地专家的 tile 数限制请求驻留倍数，M16/M64 上限分别为
@@ -343,7 +346,23 @@ batch-invariance 验证，包括 batch 1/7/32/64、行置换、不等长/空 sou
 [host 选择](../src/cuda/activation_transport.cu)、
 [SGLang 适配](../weftmoe/sglang.py)、[staging](../weftmoe/_sglang_kernels.py)。
 
-## 推广到其他模型时如何验收
+## 通过 autotune 适配模型和负载
+
+目标是统一工作流、少量已验证模板和配置化选型，而非给每个模型手写 M 或
+另建调度器。离线按 GPU、H/I/E/top-k、dtype、EP、TP/DP 输入布局和 batch
+bucket 搜索，缓存结果并在 prepare/graph capture 前选定；正常执行不做试跑、
+host 读回或动态任务领取。密度估计用于缩小候选，不作为永久硬编码的最优规则。
+
+M 应与 N/K、stages、CTA 数量联合调优，纯 GEMM 可用于预筛，最终以完整
+MoE 的 rank-max 延迟选优。当前可直接作为算术候选的是已验收 M16/M64；
+M32/M128 或其他 stage/tile 组合须先实现并验证，不能只改配置就假定可用。
+物理 M128 ring block 与算术 slice M 是不同参数，优先保持目录及协议不变。
+
+多机沿用同一原则，但额外按节点数、每节点 GPU 数和互联拓扑区分配置，并把
+通信参数与内存约束纳入端到端选优。完整约束和实施待办见
+[设计第 7.4 节](static_forward_v4_design.md#74-单机和多机的统一-autotune-原则)。
+
+## autotune 候选的验收
 
 先核对 H/I/E/K、dtype/激活和 compiled profile 是否支持，确认实际进入
 `local_decode::kernel<16>` 或 `<64>`，不能仅检查 Python 层返回成功。
@@ -351,11 +370,16 @@ batch-invariance 验证，包括 batch 1/7/32/64、行置换、不等长/空 sou
 
 1. 正确性与生命周期：普通/热点、空/不等长、容量边界、图复用、权重更新，
    以及 strict batch-invariance；改变算术或同步后做相关 sanitizer。
-2. 同机同输入微基准：分别比较原形状、M16、M64、实际选择策略；覆盖每专家
+2. 同机同输入微基准：比较已有基线、合法算术/驻留组合和自动选择结果；覆盖每专家
    平均行数约 1/8/16/32/64 的区间和偏斜路由，记录 padding、SMEM、寄存器、
    真实 occupancy、容量和时钟。按实际 TP/DP 布局计入必要 staging/collective。
 3. 多层/整模型：扩大权重工作集，再用目标服务/RL 的实际 batch 分布复测。
    单层 warm-cache 的优势不能直接乘层数推算 rollout 收益。
 
-以上是推广验收建议，不是已经完成的其他模型性能实验。本次只整理证据和
-文档，没有更改 kernel、重调阈值或启动新的 GPU 测试。
+所有会随 batch bucket 切换的 inference 候选还须彼此保持严格 batch-invariance，
+不能只因各自对参考误差合格就允许互相切换；不能通过 split-K、浮点 atomic
+或移动舍入位置换取分数。代表性路由应包含多个样本、偏斜和不等长输入，
+避免仅对一个均匀随机种子选优。
+
+以上是统一 autotune 的设计和验收要求，不是已经完成的自动搜索接入或其他
+模型性能实验。本次只修订文档，没有更改 kernel、阈值或启动新的 GPU 测试。

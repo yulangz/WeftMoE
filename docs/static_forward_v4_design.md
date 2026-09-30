@@ -221,6 +221,8 @@ V3 是同日冻结对照，不是最后一轮 prefill 改动的交错重测。�
    仍需实际规模的内存；真正 OOM 明确失败，ring 不等于无限总显存。
 7. 单机/多机、decode/prefill 使用 specialization/profile，共享协议和数值模块，
    不复制四套 scheduler。gate/up 布局通过第 7 节独立 GEMM 消融决定，先不选边。
+   M/N/K、stages、CTA 配额和通信配置由统一 autotune 适配形状、负载及拓扑，
+   不为每个模型手写一套实现；当前经验配置与后续自动选型的边界见第 7.4 节。
 8. Dispatch/Return TX 复用先保留远端消费 credit 与本地 Put completion 双重检查；
    简化检查列为后续优化，不阻塞首版。
 9. 协议参数化节点数，不硬编码两节点。当前实机主矩阵只有单机 EP8（1×8）和
@@ -1035,7 +1037,8 @@ profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一�
 3. 先做受控对照：相同 M/K、精度、K 累加次序、有效 S 输出宽度、cluster 策略，
    尽可能匹配 stage/epilogue；记录布局必需的数据流、资源或指令形状差异。
    不能仅把两个实现的 N 宏设成一样就称为等粒度比较。
-4. 再分别调 N/K/stages/有效 task 粒度，报告两种布局各自的最佳可行配置；
+4. 再分别调算术 M、N/K/stages、CTA 配额及有效 task 粒度，报告两种布局各自
+   的最佳可行配置；
    “布局本身的差异”和“布局加各自调优后的差异”分开记录。
 5. 核心固定 1620 MHz，检查实际时钟；记录延迟、register/spill、SMEM/occupancy、
    TMA/WGMMA stall 和有效吞吐，不用操作数大小推测胜负。
@@ -1071,6 +1074,38 @@ profile 的逻辑 N-tile 数推导，不写死。两种布局都可用于任一�
   64KiB不能作为安全scratch起点。FJ2将scratch放在96KiB以后，允许peer在旧
   私有epilogue执行期间进入新GEMM。原FJ失败及修正验证见ring记录，最终采用
   仍以完整数值和端到端性能验收为准。
+
+### 7.4 单机和多机的统一 autotune 原则
+
+单机/多机、decode/prefill 都应使用统一工作流、已验证的参数化计算模板和
+autotune 配置表。模型形状需要不同 M 或配额属于配置选择，不是机制不通用，
+也不是新增模型专属分支的理由。当前 HHE 的 M16/M64 密度阈值和 GA+FZ 的
+网络参数仍来自经验选择与独立消融，不能写成已经完成统一自动选型。
+
+- 搜索键包含 GPU、H/I/E/top-k、dtype、EP、TP/DP 输入布局、batch bucket
+  及 inference/retain-state 模式；多机还区分节点数、每节点 GPU 数、互联和
+  通信后端。不同模式分别测量，不复用未经验证的训练或网络最优配置。
+- 算术候选联合搜索 M/N/K、stages、CTA 配额及合法 cluster 策略；通信候选
+  考虑 Dispatch/Return Q、lane/owner、source group、B 和各 ring 深度。
+  可分层预筛，最终用同输入、完整通信计算路径的 rank-max 延迟，在给定内存
+  预算下选优；保留多个路由样本、热点及不等长用例，不仅优化均匀随机种子。
+- 区分算术 slice M 与物理 ring block M。当前单机 decode 的 M16/M64 已验证，
+  通用 ring 仍使用自己的 M128 几何；网络算术变体必须先实现并验证。更改物理
+  M 或通信几何时，同步生成 plan、容量、TMA maps、ready 目标及 ownership，
+  不能只扫一个宏便假定整个协议适配。M32/M128 等新增 decode 算术候选同理。
+- 配置离线搜索并缓存，运行时在 prepare/graph capture 前选择，不增加正常
+  执行中的试跑、host 读回或动态 task claim。通信布局和容量由通信组一致
+  选择；只有已证明共享协议兼容的算术变体可按 rank 的形状独立选型。更换
+  不兼容配置须先 drain，并准备对应 pool/maps/graph，不能中途改变 slot 合同。
+- 所有候选保留 no-drop、静态 ownership、远端消费与本地 NIC 完成双 credit，
+  并满足原有生命周期证明。
+  在要求 batch-invariance 的 inference 入口，跨 bucket/算术形状也必须严格
+  逐位对齐；仅各自通过容差参考不足以允许自动切换。第 7.3 节允许归档的
+  不同归约次序诊断候选，不能据此进入该自动选择集合。
+
+已有 `tools/autotune_forward.py` 和配置生成工具应复用扩展；当前校验仍要求
+物理 `tile_m=128`，专属 decode 的算术 slice M 是另一层参数。上述完整选型
+接入是后续待办，不覆盖已有实验的测量范围，也不预先声明其他模型/节点数获益。
 
 ## 8. Prefill/training 的保存与 no-drop 合同
 
@@ -1281,6 +1316,20 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
   AF/AS为纯GEMM，DC为当前CW数据面的阈值交错实验和最终四规模回归；六个
   token桶含阈值两侧的EP8/EP16数值检查共288/576项通过。双机长序列的最终
   性能目标仍未达成，不因M5勾选而结束后续优化。
+
+### M5 后续 单机和多机统一 autotune
+
+- [ ] 在现有 Forward 调优工具中区分物理 block M 与算术 slice M，接入已验证
+      的候选；网络或新增算术模板先完成实现与数值/生命周期门禁。
+- [ ] 以第 7.4 节的形状/拓扑键联合搜索计算、通信及容量参数，记录合法性、
+      资源和内存预算；多路由样本下以完整算子 rank-max 延迟选优。
+- [ ] 生成可复用配置表并接入 prepare/graph capture；协议配置集体一致，
+      未命中项仅使用形状兼容的已验收基线，不引入运行时搜索或新调度器。
+- [ ] 验证自动选型前后的 batch-invariance、热点 no-drop、图/权重复用，
+      在单机 EP8 和双机 EP16 的 1/64/8K/20K 回归，再扩展模型形状。
+
+这些待办不改变上方 M5 已完成的历史消融状态；本次仅补充设计，尚未实现或
+测量新的自动选择策略。
 
 ### M6：训练 Forward tape 与 Backward 对接
 
