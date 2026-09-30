@@ -12,8 +12,9 @@
     "gpu": "NVIDIA L20X", "sm_clock_mhz": 1620, "interconnect": "auto",
     "memory_limit_bytes": 8589934592,
     "search_space": {
-      "network_prefill_min_tokens": [0], "window_tokens": [256, 512],
-      "packet_rows": [32, 64]
+      "network_prefill_min_tokens": [0], "window_tokens": [512, 256],
+      "network_lanes": [32], "packet_rows": [8, 16],
+      "return_packet_rows": [16], "contribution_windows": [8]
     },
     "cases": [
       {"route": "balanced", "seed": 0},

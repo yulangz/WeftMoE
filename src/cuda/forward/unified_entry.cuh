@@ -16,8 +16,9 @@ constexpr auto unified_forward_entry() {
                                                 RetainBackwardState>;
 #else
   if constexpr (StaticSchedule)
-    return weftmoe_pf::kernel<StaticLocal, RetainBackwardState, Prefill,
-                              RingSchedule>;
+    return weftmoe_pf::kernel<
+        StaticLocal, RetainBackwardState,
+        Prefill && forward_tuning::kStaticV4PrefillEnabled, RingSchedule>;
   else
     return unified_forward_kernel<StaticLocal, RetainBackwardState>;
 #endif

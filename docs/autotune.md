@@ -17,6 +17,10 @@
 
 两份配置通过 `base_config: auto` 继承对应拓扑旧配置的第一项，再显式覆盖
 V4 参数；不是展开旧版与 V4 的全部无关参数。第一组合法候选为 incumbent。
+ring 搜索的起点使用当前长文计算几何 N128/N256、K128、3/2 stages，
+B512/D8；网络为32 lanes、Dispatch Q8、Return Q16。B256 和 Dispatch Q16
+作为候选，其他 N/K/stages 继续参与搜索。这是参数对齐，不表示生成的 binary
+已与冻结 GA+FZ 二进制等价或性能相同，仍需端到端对照。
 默认配置是待测候选，不是新测得的最优表。不同 GPU 修改配置中的 GPU 名称与
 互联标识；默认频率 1620 MHz，每轮 suite 前后检查各节点 SM 时钟，工具不修改时钟。
 
@@ -94,9 +98,9 @@ native pool 准备前检查精确键、编译配置 ID 和 EP 全组一致性，
 必须具有相同 compiled ID；不同 profile 需重建/重启并重新准备 pool/graph。
 TP 输入/retain-state 搜索尚未接入此 V4 suite，不允许借用 DP inference 结果。
 
-本次新增搜索/导出/查表的 CPU 合同检查和编译验证；GPU 当时由两组 RL 作业占用，
-未运行新的完整搜索，也没有发布最优配置表或宣称新增性能收益。后续空闲后执行
-EP8/EP16 四规模搜索与独立数值、空 rank、图/权重复用回归。
+初次实现只完成搜索/导出/查表的 CPU 合同检查和代表性编译；GPU 当时由两组
+RL 作业占用。2026-09-30 GPU 空闲后开始真实搜索，后续验证记录见下节。
+未完成完整搜索和独立验收前，不将生成候选或编译通过称为最优配置及性能收益。
 
 实现验证记录：
 
@@ -110,6 +114,49 @@ EP8/EP16 四规模搜索与独立数值、空 rank、图/权重复用回归。
 - 旧 `test_forward_autotune.py` 存在6个失败和1个错误；在未修改的 HEAD 工具上
   也复现同组失败，主要是候选数、参数面和旧 SMEM 常量断言。不能将新增检查
   通过写成整个历史测试集已通过。旧 topology/relay 测试也有既存配置假设问题。
+
+### 2026-09-30：GPU 验证中发现的问题
+
+首轮 DT EP8/T64 的18组候选均编译成功，但 incumbent 的不等长输入用例
+在 control agreement 被拒绝：奇数 rank 实际 T32 被误传为准备容量，与偶数
+rank 的 T64 不一致。`DeviceNotifyGenerationRequest` 最后一个参数是全组
+统一的 `max_tokens_per_rank`，不是本 rank 的实际长度；修复该参数，实际
+长度仍由 route/activation lease 提供。保留 uneven 用例及原有检查。
+
+PF 首轮22份编译中10份 K64 失败。非模板 host 函数的 `if constexpr`
+不能阻止分支内函数模板实例化，禁用的宽 prefill companion 仍实例化其固定
+3/2-stage 组合，触发 FC2 epilogue scratch 容量断言。在共享模板入口统一
+将未启用的 `Prefill` 映射为 false；不放宽容量断言，不改有效模板的计算或同步。
+
+另修正候选合法值遗漏的32 lanes和Dispatch Q8，并使 ring 搜索的通信/容量
+起点与已验证长文配置对齐。以上只修复离线搜索和禁用模板实例化，不切换
+生产默认 profile。复用现有 GPU suite/集成检查，不新增私有符号单测。
+首轮失败原始记录保留在 `build/v4_autotune_gpu/dt_ep8_t64.json` 和
+`pf_build.json`；后续复验使用带 `_verified` 的独立文件，不覆盖失败记录。
+
+修复后的独立验收（H2048/I512、1620 MHz，未替换默认 profile）：
+
+- PF 22份不同编译配置全部通过，含之前失败的10份 K64。
+  `pf_build_verified.json` 保存各配置、资源统计和编译记录。
+- PF N128/N256、K128 3/2 stages 与 K64 3/3 stages 在单机 EP8 执行完整
+  Graph，T8192 的均衡/热点/不等长及同路由 T1 前缀全部通过；两种配置的
+  完整输出逐位相同。使用上述二进制的本地路径，不是双机 GPU 验收。
+  原始记录：`pf_local_templates/`。
+- K64 PF 的 PyTorch 四档 T1/64/8192/20480 + edge cases 共240项通过，
+  包含20K全热点 no-drop、图复用及权重刷新。B16/D1 小 ring、T1/64/512
+  的 rank0/7 专项 memcheck 各0 errors、racecheck 各0 hazards，两轮各200项
+  应用检查通过。日志：`pf_k64_ep8.log`、`pf_k64_{memcheck,racecheck}*`。
+- DT 2-stage（M仍按原密度规则选择16/64）通过 E64/K4 EP8 的248项、
+  E256/K8 EP4的124项和EP2的62项现有检查，包含严格 batch-invariance、
+  空/不等长 source、热点和权重刷新。EP8 rank0/7 专项 memcheck 各0 errors、
+  racecheck 各0 hazards，两轮各248项应用检查通过；日志为 `dt_stages2_*`。
+- 现有 autotune/build Python 检查11项通过，未新增单测。DT EP8/T64 已
+  重新开始18候选完整搜索，incumbent 的 uneven 和跨 batch 前缀门禁已通过；
+  完整确认/导出、T1搜索、双机长文搜索及 prepare 查表 GPU 验收仍待完成。
+
+全部路径相对 `build/v4_autotune_gpu/`。上面的 sanitizer 只覆盖这次候选
+对应的单机 Forward 内核，不覆盖任意节点、多机或完整训练 Backward。
+不把候选数值/资源验收写成性能收益；仍沿用已验证的生产 DT/PF 配置。
 
 ## 传统默认配置（历史说明）
 

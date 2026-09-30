@@ -1330,7 +1330,8 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
 ### M5 后续 单机和多机统一 autotune
 
 - [x] 区分物理 block M 与算术 slice M，接入现有 decode M16/M64 和 ring M128。
-      新网络算术模板、decode 新 stage 组合的 GPU 门禁仍待独立验收。
+      decode 2-stage 已补 EP8/EP4/EP2 数值、batch-invariance 和 EP8 rank0/7
+      专项 memcheck/racecheck；新网络算术模板仍待实现及独立验收。
 - [x] 接入计算、通信及容量的联合候选搜索、资源过滤、内存预算和多路由完整
       Graph rank-max 选优；包含 incumbent 对照、确认与最终验证。
 - [x] 导出精确形状/拓扑/容量表并接入 prepare；EP 组一致检查编译配置 ID
@@ -1340,8 +1341,10 @@ M4 的功能与测量门禁通过不表示性能目标已达成；AV 时 EP16 �
 - [ ] 验证自动选型前后的 batch-invariance、热点 no-drop、图/权重复用，
       在单机 EP8 和双机 EP16 的 1/64/8K/20K 回归，再扩展模型形状。
 
-这些状态不改变上方 M5 的历史消融。离线工具已实现，当前 GPU 被 RL 作业占用，
-尚未完成新搜索的 EP8/EP16 性能回归，也没有发布新的自动选优性能结论。
+这些状态不改变上方 M5 的历史消融。离线工具初次实现时 GPU 被 RL 作业占用；
+09-30 空闲后已开始真实搜索，首轮暴露了 uneven 夹具容量参数和禁用 prefill
+模板实例化问题，修复及验收见 [autotune 记录](autotune.md)。完整 EP8/EP16
+搜索、独立回归和发布门禁尚未完成，不将候选编译通过当作自动选优性能结论。
 
 ### M6：训练 Forward tape 与 Backward 对接
 

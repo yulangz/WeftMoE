@@ -3933,7 +3933,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           generation, execution, pool);
       auto notify = coordinator.run_device(
-          {common_config, routes, gates, common_routes.num_tokens});
+          {common_config, routes, gates, max_tokens});
       transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
           generation.session(), execution, transport_config,
           notify.dispatch(), transport_pool);
