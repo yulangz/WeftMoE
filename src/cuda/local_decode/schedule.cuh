@@ -4,7 +4,22 @@ namespace local_decode {
 
 // Keep the shared M128 GM directory; decode arithmetic uses M16 or M64
 // slices. Hot experts traverse every slice, including multi-block experts.
-constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U, kStages = 3U;
+#ifndef WEFTMOE_FWD_LOCAL_DECODE_M
+#define WEFTMOE_FWD_LOCAL_DECODE_M 0
+#endif
+#ifndef WEFTMOE_FWD_LOCAL_DECODE_STAGES
+#define WEFTMOE_FWD_LOCAL_DECODE_STAGES 3
+#endif
+#ifndef WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER
+#define WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER 0
+#endif
+constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U;
+constexpr unsigned kStages = WEFTMOE_FWD_LOCAL_DECODE_STAGES;
+constexpr unsigned kSelectedM = WEFTMOE_FWD_LOCAL_DECODE_M;
+constexpr unsigned kCtaMultiplier = WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER;
+static_assert(kSelectedM == 0U || kSelectedM == 16U || kSelectedM == 64U);
+static_assert(kStages == 2U || kStages == 3U);
+static_assert(kCtaMultiplier <= 3U);
 constexpr unsigned kThreads = 256U, kMathThreads = 128U;
 constexpr unsigned kMaxExperts = 256U;
 constexpr unsigned kFc1Tiles = 2U * forward_tuning::kMainIntermediate / kN;

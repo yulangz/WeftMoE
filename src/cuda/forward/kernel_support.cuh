@@ -639,6 +639,11 @@ static_ring_shape(const ActivationTransportPoolConfig &config) {
   auto sources = std::min(local_world, 16U);
   while (local_world % sources)
     --sources;
+  if constexpr (WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP != 0U) {
+    sources = WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP;
+    if (local_world % sources)
+      throw std::invalid_argument("static source group must divide the local EP team");
+  }
   return {config.max_world_size, sources,
           static_cast<unsigned>(std::min<std::uint64_t>(config.static_forward_window_tokens,
                                                        config.max_tokens_per_rank)),
@@ -727,9 +732,11 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     // write TX. This capacity depends on B/K/Q/L, not the total token count.
     const auto window_packets = static_forward::kNetworkReturnPackets.lane_packets(
         std::uint64_t(config.static_forward_window_tokens) * config.max_top_k, 0U);
-    const auto depth = static_cast<unsigned>(std::max<std::uint64_t>(8U, window_packets));
+    const auto depth = static_cast<unsigned>(std::max<std::uint64_t>(
+        WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH, window_packets));
     network.rings = {config.max_nodes, packets.lanes, depth, packet, returning};
-    network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(network.rings.channels(), 32U));
+    network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(
+        network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
     const auto contribution_rows = checked_mul(

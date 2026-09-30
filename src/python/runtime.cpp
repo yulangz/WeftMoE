@@ -74,13 +74,15 @@ class Runtime {
           unsigned device, std::uintptr_t stream, py::object stream_owner,
           unsigned experts, unsigned top_k, unsigned hidden, unsigned intermediate,
           std::uint64_t max_tokens, std::uint64_t max_rows, bool training,
-          unsigned max_saved)
+          unsigned max_saved, py::dict tuning = py::dict())
       : rank_(rank), hidden_(hidden), intermediate_(intermediate),
         max_tokens_(max_tokens), training_(training), stream_(reinterpret_cast<cudaStream_t>(stream)) {
     if (!world || !nodes || world % nodes || experts % world || !top_k || !max_saved)
       throw std::invalid_argument("invalid EP topology or saved-tensor capacity");
     const auto *ring_setting = std::getenv("WEFTMOE_STATIC_RING_TOKENS");
-    const auto ring_tokens = ring_setting ? std::stoul(ring_setting) : 0U;
+    const auto ring_tokens = tuning.contains("window_tokens")
+        ? tuning["window_tokens"].cast<unsigned>()
+        : ring_setting ? std::stoul(ring_setting) : 0U;
     training_ring_ = training && ring_tokens;
     if (training_ring_) {
       // Only canonical routing/scheduler metadata uses this worst-case
@@ -132,6 +134,9 @@ class Runtime {
     capacity.static_forward_window_tokens = ring_tokens;
     if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
       capacity.static_forward_contribution_windows = std::stoul(depth);
+    if (tuning.contains("contribution_windows"))
+      capacity.static_forward_contribution_windows =
+          tuning["contribution_windows"].cast<unsigned>();
     capacity.enable_gin_rdma =
         WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
     pool_ = prepare_activation_transport_pool(base_.session(), execution_, capacity);
@@ -538,6 +543,7 @@ class Runtime {
 }
 
 PYBIND11_MODULE(_runtime, m) {
+  m.def("forward_tuning_id", &forward_tuning_id);
   m.def("bootstrap_id", [] {
     auto id = make_nccl_bootstrap_id();
     return py::bytes(reinterpret_cast<const char *>(id.bytes().data()), id.bytes().size());
@@ -546,6 +552,8 @@ PYBIND11_MODULE(_runtime, m) {
   py::class_<Runtime, std::shared_ptr<Runtime>>(m, "Runtime")
       .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
                     unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())
+      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
+                    unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned, py::dict>())
       .def("forward", &Runtime::forward)
       .def("backward", &Runtime::backward)
       .def("graph_forward", &Runtime::graph_forward)

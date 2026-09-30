@@ -43,6 +43,8 @@ class TensorRuntime:
         training: bool,
         max_saved: int = 64,
         stream=None,
+        input_layout: str = "dp",
+        interconnect: str | None = None,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -70,11 +72,36 @@ class TensorRuntime:
                 torch.cuda.current_stream() if training else torch.cuda.Stream()
             )
         native = _extension()
+        tuning = None
+        decision = dict(profile=None, key=None, error=None)
+        if os.environ.get("WEFTMOE_AUTOTUNE_TABLE"):
+            from .tuning import select_profile
+
+            # All ranks agree before any native pool/GIN allocation. A missing
+            # entry or stale binary must not leave peers blocked in bootstrap.
+            try:
+                key = dict(gpu=torch.cuda.get_device_name(),
+                           interconnect=interconnect or ("nvlink" if self.nodes == 1 else "nvlink+gin"),
+                           dtype="bfloat16", hidden=hidden, intermediate=intermediate,
+                           experts=experts, top_k=top_k, nodes=self.nodes,
+                           gpus_per_node=self.world // self.nodes, max_tokens=max_tokens,
+                           input_layout=input_layout, training=training)
+                tuning = select_profile(os.environ["WEFTMOE_AUTOTUNE_TABLE"], key,
+                                        native.forward_tuning_id())
+                decision = dict(profile=tuning, key=key, error=None)
+            except (OSError, ValueError, KeyError, AttributeError) as error:
+                decision = dict(profile=None, key=None, error=str(error))
+        decisions = [None] * self.world
+        dist.all_gather_object(decisions, decision, group=group)
+        if any(d["error"] for d in decisions):
+            raise ValueError(f"collective autotune preparation failed: {decisions}")
+        if any(d != decision for d in decisions):
+            raise ValueError("EP ranks selected incompatible autotune profiles")
         bootstrap = [native.bootstrap_id() if self.rank == 0 else None]
         dist.broadcast_object_list(
             bootstrap, src=dist.get_global_rank(group, 0), group=group
         )
-        self.native = native.Runtime(
+        arguments = (
             bootstrap[0],
             self.rank,
             self.world,
@@ -91,6 +118,7 @@ class TensorRuntime:
             training,
             max_saved if training else 1,
         )
+        self.native = native.Runtime(*arguments, tuning) if tuning else native.Runtime(*arguments)
 
     def _check(self, x, routes, gates, w1, w2):
         if self.training and torch.cuda.current_stream() != self.stream:

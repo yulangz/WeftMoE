@@ -45,6 +45,7 @@ from autotune_common import (
     write_result as _common_write_result,
 )
 import unified_tuning
+import static_forward_tuning as v4_tuning
 from forward_jit import ForwardJitCompiler, JitError, validate_jit_config
 
 
@@ -175,6 +176,9 @@ def flatten_groups(groups: Mapping[str, Any], *, require_all: bool) -> dict[str,
 
 
 def validate_tuning(config: Mapping[str, Any]) -> None:
+    if "v4" in config:
+        v4_tuning.validate(config)
+        config = {k: v for k, v in config.items() if k != "v4"}
     _require(set(config) == set(PARAMETER_MACROS),
              "expanded tuning config must define every parameter exactly once")
     for key, value in config.items():
@@ -240,6 +244,12 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "Forward requires cluster_size=2 for TMA multicast")
     _require(config["fc2_tma_store"],
              "Forward requires the FC2 TMA-store epilogue")
+    static_a = max(config["static_v4_fc1_stages"], config["static_v4_fc2_stages"]) * config["tile_m"] * config["tile_k"]
+    unified_tuning.require_resources(
+        config["fc2_claim_tiles"] > 1 or
+        gemm_storage_bytes(config, static_v4=True) // 2 - static_a >=
+        config["tile_m"] * config["fc2_tile_n"],
+        "V4 epilogue must fit in private staging beyond every multicast A stage")
     unified_tuning.require_resources(
         dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
         "GEMM input/output staging exceeds Hopper shared memory")
@@ -411,6 +421,19 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     except (OSError, json.JSONDecodeError) as error:
         raise PlanError(f"cannot load {path}: {error}") from error
     _require(isinstance(document, dict), "top-level plan must be an object")
+    v4 = document.get("static_v4")
+    if "base_config" in document:
+        base = document["base_config"]
+        if base == "auto":
+            nodes = resolve_parallel_settings(system)["nodes"]
+            base = f"forward_h200_{'single_node' if nodes == 1 else 'multi_node'}_autotune.json"
+        space = json.loads((path.parent / base).read_text())
+        # Inherit the incumbent, not an unrelated legacy Cartesian search.
+        space = {g: {k: values[:1] for k, values in group.items()}
+                 for g, group in space.items()}
+        for group, overrides in document.get("overrides", {}).items():
+            space[group].update(overrides)
+        document = space
     if "forward" in document:
         document = document["forward"]
         _require(isinstance(document, dict), "phase search space must be an object")
@@ -423,6 +446,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
                 "explicit parallel settings conflict with frozen plan topology")
     if "schema" not in document:
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
+    if v4 is not None:
+        document["static_v4"] = v4
     _require(document.get("schema") in (2, 3), "plan schema must be 2 or 3")
     if document["schema"] == 2:
         unified_tuning.upgrade_legacy_groups(
@@ -492,8 +517,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
         _require(type(benchmark[key]) is int and benchmark[key] > 0,
                  f"benchmark.{key} must be a positive integer")
     if launcher == "local":
-        _require(benchmark["world"] in (1, 2, 8),
-                 "local benchmark.world must be 1, 2, or 8")
+        _require(benchmark["world"] in (1, 2, 4, 8),
+                 "local benchmark.world must be 1, 2, 4, or 8")
     _require(benchmark["top_k"] in (1, 4, 6, 8),
              "benchmark.top_k must be 1, 4, 6, or 8")
     _require(benchmark["tune_rounds"] > 10 and
@@ -540,12 +565,15 @@ def expand_candidates(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             "override": copy.deepcopy(candidate.get("override", {})),
             "config": values,
         })
+    if "static_v4" in plan:
+        expanded = v4_tuning.expand(expanded, plan["static_v4"], plan["benchmark"])
+        plan["selection"]["confirmation_candidates"] = min(2, len(expanded))
     return expanded
 
 
 def generated_header(_name: str, config: Mapping[str, Any]) -> str:
     validate_tuning(config)
-    digest = candidate_digest(config)
+    digest = v4_tuning.compiled_digest(config)
     lines = [
         "#pragma once",
         "",
@@ -559,6 +587,9 @@ def generated_header(_name: str, config: Mapping[str, Any]) -> str:
         elif key in ENUM_PARAMETERS:
             value = ENUM_PARAMETERS[key][value]
         lines.append(f"#define {macro} {value}")
+    lines.append(f'#define WEFTMOE_FORWARD_TUNING_ID "{digest}"')
+    if "v4" in config:
+        lines.extend(v4_tuning.header(config))
     lines.append("")
     return "\n".join(lines)
 
@@ -595,8 +626,8 @@ def gemm_storage_bytes(config: Mapping[str, Any], *, static_v4: bool) -> int:
     fc1_b_stage = config["fc1_tile_n"] * tile_k
     fc2_b_stage = config["fc2_tile_n"] * tile_k
     a_storage = max(fc1_stages, fc2_stages) * a_stage
-    b_storage = max((1 if static_v4 else 2) * fc1_stages * fc1_b_stage,
-                    fc2_stages * fc2_b_stage)
+    b_storage = (fc1_stages * fc1_b_stage if static_v4 else
+                 max(2 * fc1_stages * fc1_b_stage, fc2_stages * fc2_b_stage))
     fc2_storage = fc2_stages * (a_stage + fc2_b_stage)
     if config["fc2_claim_tiles"] > 1:
         fc2_storage += config["tile_m"] * config["fc2_tile_n"]
@@ -640,6 +671,8 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
         "local_p2p_forward_tma_store_kernel",
         "local_p2p_forward_compute_kernel",
     )
+    if "v4" in config and config["static_v4_prefill_min_tokens"]:
+        kernel_names += ("local_decode",)
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
     for index, line in enumerate(lines[:-1]):
@@ -688,9 +721,15 @@ def _sanitized_environment() -> dict[str, str]:
         "WEFTMOE_P2P_BENCH_TOKENS",
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
+        "WEFTMOE_DISABLE_STATIC_FORWARD_V4",
+        "WEFTMOE_DISABLE_SINGLE_NODE_INFERENCE",
+        "WEFTMOE_BENCH_ALLOCATE_TENSORS",
+        "WEFTMOE_BENCH_HIDDEN",
+        "WEFTMOE_BENCH_INTERMEDIATE",
+        "WEFTMOE_TEST_TOKEN_OFFSET",
     }
     for key in tuple(environment):
-        if (key.startswith("WEFTMOE_FORWARD_") or
+        if (key.startswith("WEFTMOE_FORWARD_") or key.startswith("WEFTMOE_TUNE_") or
                 key.startswith("WEFTMOE_FWD_") or key in explicit_removals):
             environment.pop(key, None)
     return environment
@@ -703,7 +742,7 @@ def compile_candidate(candidate: Mapping[str, Any],
     log_path = log_dir / f"{candidate['name']}.build.log"
     result = compiler.build(
         candidate_name=str(candidate["name"]),
-        config_digest=candidate_digest(candidate["config"]),
+        config_digest=v4_tuning.compiled_digest(candidate["config"]),
         generated_header=generated_header(
             str(candidate["name"]), candidate["config"]),
         log_path=log_path,
@@ -727,9 +766,16 @@ def compile_candidate(candidate: Mapping[str, Any],
 def compile_candidates(candidates: list[dict[str, Any]],
                        compiler: ForwardJitCompiler,
                        log_dir: Path) -> dict[str, dict[str, Any]]:
-    return compile_in_parallel(
-        candidates, compiler, log_dir, compile_candidate
-    )
+    unique = {}
+    aliases = {}
+    for candidate in candidates:
+        digest = v4_tuning.compiled_digest(candidate["config"])
+        representative = unique.setdefault(digest, candidate)
+        aliases[candidate["name"]] = representative["name"]
+    built = compile_in_parallel(list(unique.values()), compiler, log_dir, compile_candidate)
+    return {name: dict(built[representative], elapsed_seconds=0, cache_hit=True)
+            if name != representative else built[representative]
+            for name, representative in aliases.items()}
 
 
 def launcher_command(binary: Path, benchmark: Mapping[str, Any],
@@ -780,14 +826,17 @@ def launcher_command(binary: Path, benchmark: Mapping[str, Any],
 def extract_benchmark_json(output: str,
                            benchmark: Mapping[str, Any]) -> dict[str, Any]:
     local = benchmark.get("launcher", "multinode") == "local"
-    prefix = "FORWARD_BENCH_JSON " if local else "GIN_BENCH_JSON "
+    graph = benchmark.get("graph_replay", False)
+    prefix = ("FORWARD_GRAPH_BENCH_JSON " if graph else
+              "FORWARD_BENCH_JSON " if local else "GIN_BENCH_JSON ")
     payloads = [line[len(prefix):] for line in output.splitlines()
                 if line.startswith(prefix)]
     if len(payloads) != 1:
         raise RuntimeError(
             f"launcher emitted {len(payloads)} {prefix.strip()} records")
     result = json.loads(payloads[0])
-    expected = ("single-persistent-forward-main-shape" if local else
+    expected = ("forward-graph-replay" if graph else
+                "single-persistent-forward-main-shape" if local else
                 "multinode-gin-forward-main-shape")
     if result.get("benchmark") != expected:
         raise RuntimeError(f"unexpected benchmark record: {result.get('benchmark')}")
@@ -798,6 +847,29 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                         benchmark: Mapping[str, Any], log_dir: Path,
                         environment: Mapping[str, str], *, rounds: int,
                         suffix: str = "tune") -> dict[str, Any]:
+    if "v4" in benchmark:
+        spec = benchmark["v4"]
+        v4_tuning.check_clocks(benchmark)
+        runs = []
+        for index, case in enumerate(spec["cases"]):
+            workload = {k: v for k, v in benchmark.items() if k != "v4"}
+            workload.update(seed=case["seed"] + 1,
+                            tokens_per_rank=case.get("tokens", benchmark["tokens_per_rank"]))
+            env = dict(environment, **v4_tuning.environment(candidate["config"]))
+            env["WEFTMOE_TUNE_ROUTE"] = case["route"]
+            env["WEFTMOE_TUNE_SEED"] = str(case["seed"])
+            env["WEFTMOE_TUNE_GPU"] = spec["gpu"]
+            runs.append(benchmark_candidate(candidate, binary, workload, log_dir, env,
+                                           rounds=rounds, suffix=f"{suffix}.case{index}"))
+        try:
+            v4_tuning.check_clocks(benchmark)
+            record = v4_tuning.aggregate(runs, spec)
+            error = None
+        except PlanError as failure:
+            record, error = None, str(failure)
+        return dict(returncode=0 if record else 1, record=record, parse_error=error,
+                    log=[r["log"] for r in runs], cases=runs,
+                    elapsed_seconds=sum(r["elapsed_seconds"] for r in runs))
     command = launcher_command(binary, benchmark, rounds=rounds)
     run_environment = dict(environment)
     run_environment["WEFTMOE_P2P_BENCH_TOKENS"] = str(
@@ -861,6 +933,9 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
 
 
 def correctness_fingerprint(record: Mapping[str, Any]) -> str:
+    if record.get("benchmark") == "static-v4-route-suite":
+        return hashlib.sha256(json.dumps(v4_tuning.fingerprint(record),
+                                        sort_keys=True).encode()).hexdigest()
     missing = [key for key in CORRECTNESS_KEYS if key not in record]
     if missing:
         raise RuntimeError(f"benchmark JSON omits correctness keys: {missing}")
@@ -935,6 +1010,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="do not rerun the winner with final_rounds")
     parser.add_argument("--output", type=Path,
                         help="explicit result JSON path")
+    parser.add_argument("--export-table", type=Path,
+                        help="publish a confirmed V4 entry for TensorRuntime preparation")
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--cache-root")
     parser.add_argument("--nvcc")
@@ -984,6 +1061,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_execution_topology(plan["benchmark"])
     validate_jit_config(plan["jit"])
     candidates = expand_candidates(plan)
+    candidate_count = len(candidates)
+    _require(not args.export_table or ("static_v4" in plan and not args.skip_final),
+             "--export-table requires V4 and final validation")
     requested = set(args.candidate)
     if requested:
         known = {candidate["name"] for candidate in candidates}
@@ -991,8 +1071,11 @@ def main(argv: list[str] | None = None) -> int:
         _require(not unknown, f"unknown requested candidates: {sorted(unknown)}")
         candidates = [candidate for candidate in candidates
                       if candidate["name"] in requested]
+    if "static_v4" in plan and not (args.generate_only or args.build_only):
+        _require(candidates[0]["name"] == "incumbent",
+                 "V4 search must include the incumbent correctness reference")
     _require(candidates, "candidate filter selected no configurations")
-    validate_selection(plan["selection"], len(plan["candidates"]))
+    validate_selection(plan["selection"], candidate_count)
 
     jit = plan["jit"]
     benchmark = plan["benchmark"]
@@ -1124,6 +1207,9 @@ def main(argv: list[str] | None = None) -> int:
                          for candidate in candidates}
     benchmarkable = [item for item in result["candidates"]
                      if item["status"] == "built"]
+    if "static_v4" in plan:
+        _require(benchmarkable and benchmarkable[0]["name"] == "incumbent",
+                 "V4 incumbent failed to compile; no correctness reference")
     start_tune = time.monotonic()
     for ordinal, candidate_result in enumerate(benchmarkable, 1):
         candidate = candidate_by_name[candidate_result["name"]]
@@ -1138,6 +1224,8 @@ def main(argv: list[str] | None = None) -> int:
             candidate_result["status"] = "benchmark_failed"
             print(f"  benchmark failed; see {bench_result['log']}", flush=True)
             _write_result(output_path, result)
+            if "static_v4" in plan and candidate["name"] == "incumbent":
+                raise PlanError("V4 incumbent failed; inspect its fixture logs before tuning")
             continue
         fingerprint = correctness_fingerprint(bench_result["record"])
         candidate_result["correctness_fingerprint"] = fingerprint
@@ -1310,6 +1398,12 @@ def main(argv: list[str] | None = None) -> int:
     result["elapsed_seconds"] = time.monotonic() - start_total
     result["timing"] = _timing_summary(result, result["elapsed_seconds"])
     result["completed_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    selected_header = output_path.parent / (output_path.stem + "-selected") / "weftmoe_forward_tuning_generated.hpp"
+    selected_header.parent.mkdir(parents=True, exist_ok=True)
+    selected_header.write_text(generated_header(winner["name"], winner["config"]))
+    result["selected"]["header"] = str(selected_header)
+    if args.export_table:
+        v4_tuning.export_table(args.export_table.resolve(), result, selected_header.resolve())
     _write_result(output_path, result)
     print(f"selected {winner['name']} at "
           f"{winner['aggregate_metric_us']:.3f} us "

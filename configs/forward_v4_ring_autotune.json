@@ -1,0 +1,27 @@
+{
+  "base_config": "auto",
+  "overrides": {
+    "1_gemm": {
+      "fc1_tile_n": [128, 64], "fc2_tile_n": [256, 128], "tile_k": [128, 64],
+      "static_v4_fc1_stages": [3], "static_v4_fc2_stages": [2, 3],
+      "static_v4_prefill_min_tokens": [0], "fc2_claim_tiles": [1]
+    },
+    "2_transport": {"relay_ctas": [24]}
+  },
+  "static_v4": {
+    "gpu": "NVIDIA L20X", "sm_clock_mhz": 1620, "interconnect": "auto",
+    "memory_limit_bytes": 8589934592,
+    "search_space": {
+      "network_prefill_min_tokens": [0], "window_tokens": [256, 512],
+      "packet_rows": [32, 64]
+    },
+    "cases": [
+      {"route": "balanced", "seed": 0},
+      {"route": "balanced", "seed": 0, "tokens": 1, "validate_only": true},
+      {"route": "hotspot", "seed": 1},
+      {"route": "hotspot", "seed": 1, "tokens": 1, "validate_only": true},
+      {"route": "uneven", "seed": 2},
+      {"route": "uneven", "seed": 2, "tokens": 1, "validate_only": true}
+    ]
+  }
+}

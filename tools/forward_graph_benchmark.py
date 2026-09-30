@@ -38,6 +38,10 @@ def aggregate_forward_graph(records):
                  "event_record_nodes", "event_wait_nodes"):
         result["per_rank_graph_" + name] = [
             int(item["graph_" + name]) for item in records]
+    if all("input_hash" in item for item in records):
+        result["per_rank_input_hash"] = [item["input_hash"] for item in records]
+        result["per_rank_prefix_hash"] = [item["prefix_hash"] for item in records]
+        result["per_rank_tokens"] = [int(item["actual_tokens"]) for item in records]
     for name in ("device_bytes", "compute_device_bytes", "gin_registered_bytes"):
         if all(name in item for item in records):
             result["per_rank_" + name] = [int(item[name]) for item in records]

@@ -3439,6 +3439,23 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         common_routes.selected_experts.push_back(
             static_cast<std::int32_t>((base + slot * route_stride) % experts));
     }
+    if (const auto *pattern = std::getenv("WEFTMOE_TUNE_ROUTE")) {
+      require(benchmark_forward, "autotune fixtures require Forward");
+      const std::string mode(pattern);
+      require(mode == "balanced" || mode == "hotspot" || mode == "uneven",
+              "unknown autotune route pattern");
+      const auto route_seed = std::stoull(std::getenv("WEFTMOE_TUNE_SEED"));
+      if (mode == "uneven" && rank % 2U)
+        common_routes.num_tokens = std::max<std::uint64_t>(1U, max_tokens / 2U);
+      common_routes.selected_experts.resize(common_routes.num_tokens * top_k);
+      for (std::uint64_t token = 0; token < common_routes.num_tokens; ++token) {
+        const auto base = mode == "hotspot" ? route_seed % experts :
+            (token * 17U + rank * 31U + route_seed * 13U) % experts;
+        for (unsigned slot = 0; slot < top_k; ++slot)
+          common_routes.selected_experts[token * top_k + slot] =
+              static_cast<std::int32_t>((base + slot) % experts);
+      }
+    }
     // Diagnostic only: hold per-expert row counts and GEMM dimensions fixed
     // while changing where tokens originate. This changes routing semantics
     // and must not be used as an output-equivalence fixture.
@@ -3888,6 +3905,12 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     const auto rank_barrier =
         prepare_benchmark_barrier(tensor_allocator, execution_state->stream);
     if (std::getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY") != nullptr) {
+      if (const auto *expected_gpu = std::getenv("WEFTMOE_TUNE_GPU")) {
+        cudaDeviceProp properties{};
+        check_input_cuda(cudaGetDeviceProperties(&properties, local_rank));
+        require(std::string(properties.name) == expected_gpu,
+                "autotune GPU differs from configuration key");
+      }
       require(!retain_backward_state &&
                   !allocate_tensors,
               "Forward graph benchmark requires inference with reused "
@@ -3910,7 +3933,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           generation, execution, pool);
       auto notify = coordinator.run_device(
-          {common_config, routes, gates, max_tokens});
+          {common_config, routes, gates, common_routes.num_tokens});
       transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
           generation.session(), execution, transport_config,
           notify.dispatch(), transport_pool);
@@ -3925,7 +3948,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
       input_lease = producer.publish_activations(
           static_cast<const weftmoe::transport::BFloat16 *>(
               activation_storage->device_ptr),
-          activation_host.size(), max_tokens, hidden, activation_storage);
+          common_routes.num_tokens * hidden, common_routes.num_tokens, hidden,
+          activation_storage);
       auto activations =
           weftmoe::cuda::ActivationTransportBridge::reissue_for_benchmark(
               input_lease, context, execution);
@@ -3993,6 +4017,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           weftmoe::cuda::download_forward_output_for_validation(output,
                                                                  execution);
       std::uint64_t output_hash = 1469598103934665603ULL;
+      std::uint64_t prefix_hash = output_hash;
+      std::size_t output_index = 0;
       for (const auto value : graph_output) {
         output_hash =
             (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
@@ -4000,10 +4026,13 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
         output_hash =
             (output_hash ^ static_cast<std::uint8_t>(value.bits >> 8U)) *
             1099511628211ULL;
+        if (++output_index == hidden)
+          prefix_hash = output_hash;
       }
       std::cout << "FORWARD_GRAPH_BENCH rank=" << rank
                 << " backend=" << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
                 << " world=" << world << " tokens=" << max_tokens
+                << " actual_tokens=" << common_routes.num_tokens
                 << " experts=" << experts << " top_k=" << top_k
                 << " hidden=" << hidden
                 << " intermediate=" << intermediate << " batch=" << batch
@@ -4024,6 +4053,10 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
                 << " fc1_swiglu_us=" << graph_timings.fc1_swiglu_us
                 << " fc2_us=" << graph_timings.fc2_us
                 << " after_combine_us=" << graph_timings.after_combine_us
+                << " input_hash=" << activation_hash << ":" << route_hash << ":" << gate_hash
+                << ":" << actual_weight_hashes.w1.low << ":" << actual_weight_hashes.w1.high
+                << ":" << actual_weight_hashes.w2.low << ":" << actual_weight_hashes.w2.high
+                << " prefix_hash=" << prefix_hash
                 << " output_hash=" << output_hash << " samples=";
       for (std::size_t index = 0; index < samples.size(); ++index)
         std::cout << (index ? "," : "") << samples[index];

@@ -19,6 +19,10 @@ struct CUstream_st;
 
 namespace weftmoe::cuda {
 
+// Identity of the immutable generated Forward profile, checked before pool
+// preparation when applying an offline autotune table.
+const char *forward_tuning_id();
+
 template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease =
     SelectedActivationLease<transport::BFloat16>;

@@ -55,6 +55,11 @@
 #endif
 
 namespace weftmoe::cuda {
+#ifndef WEFTMOE_FORWARD_TUNING_ID
+#define WEFTMOE_FORWARD_TUNING_ID "untuned"
+#endif
+const char *forward_tuning_id() { return WEFTMOE_FORWARD_TUNING_ID; }
+
 struct ActivationMegaKernelBackendState;
 namespace {
 
@@ -1792,11 +1797,11 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         "ncclDevCommCreate(activation GIN)");
     resources.dev_comm_created = true;
     if ((static_inference_pool &&
-         resources.dev_comm.ginContextCount < int(allocated_context_count)) ||
-        resources.dev_comm.ginContextCount < 1 ||
+         resources.dev_comm.ginContextCount < allocated_context_count) ||
+        resources.dev_comm.ginContextCount < 1U ||
         (!static_inference_pool &&
          !(forward_tuning::kUnifiedWorkers && backward_tuning::kUnifiedWorkers) &&
-         resources.dev_comm.ginContextCount < int((1U + communication::kReturnPorts) * kGinContextCount)))
+         resources.dev_comm.ginContextCount < (1U + communication::kReturnPorts) * kGinContextCount))
       transport_error(NotifyErrorCode::BackendUnavailable, "gin-create",
                       "actual GIN contexts", nccl->rank, "enough contexts for static owners or legacy Return streams",
                       std::to_string(resources.dev_comm.ginContextCount));
@@ -5070,6 +5075,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 ", actual=" + std::to_string(grid_blocks));
       args.forward_compute_cta_count = forward_tuning::kUnifiedWorkers
           ? (grid_blocks & ~1U) : grid_blocks - kTransportBlocks;
+      if (static_v4_enabled && forward_tuning::kStaticV4CtaCount)
+        args.forward_compute_cta_count = forward_tuning::kStaticV4CtaCount;
       if constexpr (forward_tuning::kUnifiedWorkers)
         args.forward_relay_cta_count = args.forward_compute_cta_count -
             forward_tuning::unified_rdma_ctas(args.forward_compute_cta_count,
@@ -5247,20 +5254,23 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           // Arithmetic variants share the same physical blocks and rank
           // protocol, so unequal sources can select different M shapes.
           const bool wide_decode =
-              decode && id.num_tokens * id.world_size * id.top_k >=
-                            id.num_experts * 16ULL;
+              decode && (local_decode::kSelectedM == 64U ||
+                         (local_decode::kSelectedM == 0U &&
+                          id.num_tokens * id.world_size * id.top_k >=
+                              id.num_experts * 16ULL));
           const auto decode_kernel = wide_decode ? local_decode::kernel<64U>
                                                  : local_decode::kernel<16U>;
           const auto threads =
               decode ? local_decode::kThreads : forward_tuning::kUnifiedThreads;
-          if (decode && id.num_tokens >= 4U) {
+          if (decode && (id.num_tokens >= 4U || local_decode::kCtaMultiplier)) {
             // More residency helps many-expert decode, but a small expert
             // set should not pay the grid collective cost of mostly idle CTAs.
             const auto expert_tiles = view.sizes.owned_expert_count *
                 (local_decode::kFc1Tiles + local_decode::kFc2Tiles);
-            forward_main_compute_ctas *= std::clamp(
-                expert_tiles / forward_main_compute_ctas, 1U,
-                wide_decode ? 2U : 3U);
+            forward_main_compute_ctas *= local_decode::kCtaMultiplier
+                ? local_decode::kCtaMultiplier
+                : std::clamp(expert_tiles / forward_main_compute_ctas, 1U,
+                             wide_decode ? 2U : 3U);
             args.forward_compute_cta_count = forward_main_compute_ctas;
             args.forward_reduce_cta_count = forward_main_compute_ctas;
           }

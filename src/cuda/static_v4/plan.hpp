@@ -1,5 +1,9 @@
 #pragma once
 
+// Packet geometry is part of the wire contract, including in translation
+// units that include the planner before the Forward GEMM tuning header.
+#include "cuda/communication/tuning_config.hpp"
+
 #include <cstdint>
 
 #if defined(__CUDACC__)
@@ -144,6 +148,19 @@ struct PacketPartition {
 #ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_LANES
 #define WEFTMOE_FWD_STATIC_V4_NETWORK_LANES 2
 #endif
+#ifndef WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP
+#define WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP 0
+#endif
+#ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH
+#define WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH 8
+#endif
+#ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS
+#define WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS 32
+#endif
+static_assert(WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP <= 16);
+static_assert(WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH >= 8);
+static_assert(WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS > 0 &&
+              WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS <= 32);
 #ifndef WEFTMOE_FWD_STATIC_V4_PACKET_ROWS
 #define WEFTMOE_FWD_STATIC_V4_PACKET_ROWS 32
 #endif
