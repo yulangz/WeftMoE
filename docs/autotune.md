@@ -24,6 +24,12 @@ B512/D8；网络为32 lanes、Dispatch Q8、Return Q16。B256 和 Dispatch Q16
 默认配置是待测候选，不是新测得的最优表。不同 GPU 修改配置中的 GPU 名称与
 互联标识；默认频率 1620 MHz，每轮 suite 前后检查各节点 SM 时钟，工具不修改时钟。
 
+当前ring搜索是**PF专用profile**：两项prefill阈值均为0，直接使用候选的通用
+静态ring GEMM，关闭额外prefill模板。这也使`weftmoe_dt::eligible`返回false，
+因此它的小token用例验证的是PF兼容性，不是DT性能。不能用选中的PF库直接替换
+同时服务decode/prefill的生产库，也不能仅合并两张JSON表实现同进程跨编译
+profile切换。混合部署需另行接通兼容的编译入口并回归DT；本轮保持原生产库不变。
+
 示例（在空闲 GPU 上执行）：
 
 ```bash
