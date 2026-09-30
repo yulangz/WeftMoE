@@ -13,6 +13,7 @@
 #include <iostream>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -3337,11 +3338,21 @@ void run_communication_benchmark_rank(
 }
 #endif
 
-void run_rank(std::uint32_t rank, std::uint32_t nodes,
-              std::uint32_t gpus_per_node, std::uint32_t local_rank,
-              std::uint64_t seed, int bootstrap_input_fd,
-              int bootstrap_output_fd,
-              const std::string &scenario) {
+struct ForwardBenchmarkResources {
+  std::uint64_t max_tokens = 0;
+  weftmoe::cuda::DeviceNotifyResourcePool notify;
+  weftmoe::cuda::ActivationTransportResourcePool transport;
+  weftmoe::cuda::ForwardWeightLease weights;
+  weftmoe::cuda::ForwardWeightStorageHashes weight_hashes;
+};
+
+void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
+                       std::uint32_t gpus_per_node, std::uint32_t local_rank,
+                       std::uint64_t seed, const std::string &scenario,
+                       const weftmoe::cuda::NcclSession &base,
+                       const weftmoe::cuda::CudaExecution &execution,
+                       unsigned case_index,
+                       ForwardBenchmarkResources *resources = nullptr) {
   const auto world = nodes * gpus_per_node;
   const auto route_stride =
       std::getenv("WEFTMOE_TEST_ROUTE_STRIDE")
@@ -3548,28 +3559,6 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
             static_cast<std::int32_t>((base + slot * route_stride) % experts));
     }
   }
-  weftmoe::cuda::NcclBootstrapId bootstrap;
-  if (rank == 0) {
-    require(rank == 0, "only rank 0 may generate bootstrap ID");
-    require(bootstrap_output_fd >= 0 && bootstrap_input_fd < 0,
-            "rank 0 requires only a bootstrap output descriptor");
-    bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-    weftmoe::cuda::NcclBootstrapOutputChannel channel(bootstrap_output_fd);
-    channel.write(bootstrap);
-    require(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed,
-            "bootstrap output channel did not reach Consumed");
-  } else {
-    require(bootstrap_input_fd >= 0 && bootstrap_output_fd < 0,
-            "nonzero rank requires only a bootstrap input descriptor");
-    weftmoe::cuda::NcclBootstrapInputChannel channel(bootstrap_input_fd);
-    bootstrap = channel.read();
-    require(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed,
-            "bootstrap input channel did not reach Consumed");
-  }
-  auto execution = weftmoe::cuda::make_cuda_execution(
-      "multinode-exec-" + std::to_string(rank), local_rank);
-  auto base = weftmoe::cuda::make_nccl_session(
-      "cuda-multinode-base", world, rank, 700, local_rank, bootstrap);
   if (benchmark_communication) {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
     run_communication_benchmark_rank(rank, nodes, world, experts, top_k,
@@ -3718,14 +3707,23 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
               << " slots=" << config.max_inflight_generations << std::endl;
     return;
   }
-  weftmoe::cuda::DeviceNotifyResourcePool pool;
+  if (resources && resources->max_tokens != max_tokens) {
+    // Cases are grouped by capacity. Retire the prior shape instead of keeping
+    // multiple registered arenas resident during the memory-budget check.
+    resources->notify = {};
+    resources->transport = {};
+    resources->max_tokens = max_tokens;
+  }
+  weftmoe::cuda::DeviceNotifyResourcePool owned_notify_pool;
+  auto &pool = resources ? resources->notify : owned_notify_pool;
   const auto prepare_notify_pool = [&] {
-    pool = weftmoe::cuda::make_device_notify_resource_pool(
-        base, execution,
-        {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
-         forward_smoke ? 3U : 2U, 4U,
-         benchmark_forward &&
-             std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr});
+    if (!pool)
+      pool = weftmoe::cuda::make_device_notify_resource_pool(
+          base, execution,
+          {common_config, max_tokens, benchmark_shape ? 8192U : 4096U,
+           forward_smoke ? 3U : 2U, 4U,
+           benchmark_forward &&
+               std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") == nullptr});
   };
   if (!benchmark_forward)
     prepare_notify_pool();
@@ -3770,7 +3768,8 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
       transport_config.static_forward_contribution_windows = std::stoul(depth);
     const auto setup_start = Clock::now();
-    weftmoe::cuda::ActivationTransportResourcePool transport_pool;
+    weftmoe::cuda::ActivationTransportResourcePool owned_transport_pool;
+    auto &transport_pool = resources ? resources->transport : owned_transport_pool;
     std::vector<weftmoe::transport::BFloat16> activation_host(
         static_cast<std::size_t>(max_tokens * hidden));
     for (std::size_t index = 0; index < activation_host.size(); ++index)
@@ -3805,13 +3804,22 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     const auto gate_hash = hash_fp32(route_gates);
     const auto weight_hash = forward_weight_sample_hash(
         rank * experts_per_rank, experts_per_rank, hidden, intermediate);
-    auto weights =
-        weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
-            experts_per_rank, rank * experts_per_rank, hidden, intermediate,
-            setup_generation.session(), execution);
-    const auto actual_weight_hashes =
-        weftmoe::cuda::testing::hash_forward_weight_storage_for_validation(
-            weights, execution);
+    auto weights = resources ? resources->weights : weftmoe::cuda::ForwardWeightLease{};
+    auto actual_weight_hashes = resources ? resources->weight_hashes
+        : weftmoe::cuda::ForwardWeightStorageHashes{};
+    if (!weights) {
+      weights =
+          weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+              experts_per_rank, rank * experts_per_rank, hidden, intermediate,
+              setup_generation.session(), execution);
+      actual_weight_hashes =
+          weftmoe::cuda::testing::hash_forward_weight_storage_for_validation(
+              weights, execution);
+      if (resources) {
+        resources->weights = weights;
+        resources->weight_hashes = actual_weight_hashes;
+      }
+    }
     const auto all_distinct = [](const auto &hashes) {
       for (std::size_t left = 0; left < hashes.size(); ++left)
         for (std::size_t right = left + 1; right < hashes.size(); ++right)
@@ -3854,10 +3862,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
     require(rounds > 10, "forward benchmark requires >10 rounds");
     const auto generation_base_text =
         std::getenv("WEFTMOE_FORWARD_BENCH_GENERATION_BASE");
-    const auto generation_base =
-        generation_base_text
+    const auto generation_base = (generation_base_text
             ? static_cast<std::uint64_t>(std::stoull(generation_base_text))
-            : 1000ULL;
+            : 1000ULL) + case_index * (static_cast<std::uint64_t>(rounds) + 1U);
     require(generation_base <=
                 std::numeric_limits<std::uint64_t>::max() - rounds,
             "forward benchmark generation range overflows");
@@ -4030,6 +4037,7 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
           prefix_hash = output_hash;
       }
       std::cout << "FORWARD_GRAPH_BENCH rank=" << rank
+                << " case_index=" << case_index
                 << " backend=" << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
                 << " world=" << world << " tokens=" << max_tokens
                 << " actual_tokens=" << common_routes.num_tokens
@@ -5537,6 +5545,63 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   throw weftmoe::NotifyDispatchError(
       weftmoe::NotifyErrorCode::ControlProtocolFailure,
       "expected invalid cross-host generation");
+}
+
+void run_rank(std::uint32_t rank, std::uint32_t nodes,
+              std::uint32_t gpus_per_node, std::uint32_t local_rank,
+              std::uint64_t seed, int bootstrap_input_fd,
+              int bootstrap_output_fd, const std::string &scenario) {
+  weftmoe::cuda::NcclBootstrapId bootstrap;
+  if (rank == 0) {
+    require(bootstrap_output_fd >= 0 && bootstrap_input_fd < 0,
+            "rank 0 requires only a bootstrap output descriptor");
+    bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
+    weftmoe::cuda::NcclBootstrapOutputChannel channel(bootstrap_output_fd);
+    channel.write(bootstrap);
+    require(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed,
+            "bootstrap output channel did not reach Consumed");
+  } else {
+    require(bootstrap_input_fd >= 0 && bootstrap_output_fd < 0,
+            "nonzero rank requires only a bootstrap input descriptor");
+    weftmoe::cuda::NcclBootstrapInputChannel channel(bootstrap_input_fd);
+    bootstrap = channel.read();
+    require(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed,
+            "bootstrap input channel did not reach Consumed");
+  }
+  auto execution = weftmoe::cuda::make_cuda_execution(
+      "multinode-exec-" + std::to_string(rank), local_rank);
+  auto base = weftmoe::cuda::make_nccl_session(
+      "cuda-multinode-base", nodes * gpus_per_node, rank, 700, local_rank,
+      bootstrap);
+  const auto *suite = std::getenv("WEFTMOE_TUNE_CASES");
+  if (!suite) {
+    run_rank_workload(rank, nodes, gpus_per_node, local_rank, seed, scenario,
+                      base, execution, 0U);
+    return;
+  }
+  require((scenario == "forward_bench" || scenario == "gin_forward_bench") &&
+              std::getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"),
+          "autotune suite requires Forward graph replay");
+  // Model weights are immutable; route/shape fixtures reuse prepared resources
+  // only after the previous Graph and output have fully retired.
+  ForwardBenchmarkResources resources;
+  std::istringstream cases(suite);
+  std::string item;
+  unsigned case_index = 0U;
+  while (std::getline(cases, item, ';')) {
+    std::istringstream fields(item);
+    std::string route, route_seed, tokens;
+    require(static_cast<bool>(std::getline(fields, route, ':')) &&
+                static_cast<bool>(std::getline(fields, route_seed, ':')) &&
+                static_cast<bool>(std::getline(fields, tokens)),
+            "autotune case requires route:seed:tokens");
+    setenv("WEFTMOE_TUNE_ROUTE", route.c_str(), 1);
+    setenv("WEFTMOE_TUNE_SEED", route_seed.c_str(), 1);
+    setenv("WEFTMOE_P2P_BENCH_TOKENS", tokens.c_str(), 1);
+    run_rank_workload(rank, nodes, gpus_per_node, local_rank,
+                      std::stoull(route_seed) + 1U, scenario, base, execution,
+                      case_index++, &resources);
+  }
 }
 struct Statistics {
   double mean = 0, p50 = 0, p95 = 0, minimum = 0, maximum = 0;

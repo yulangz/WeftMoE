@@ -827,7 +827,9 @@ def extract_benchmark_json(output: str,
                            benchmark: Mapping[str, Any]) -> dict[str, Any]:
     local = benchmark.get("launcher", "multinode") == "local"
     graph = benchmark.get("graph_replay", False)
-    prefix = ("FORWARD_GRAPH_BENCH_JSON " if graph else
+    suite = benchmark.get("graph_suite", False)
+    prefix = ("FORWARD_GRAPH_SUITE_JSON " if suite else
+              "FORWARD_GRAPH_BENCH_JSON " if graph else
               "FORWARD_BENCH_JSON " if local else "GIN_BENCH_JSON ")
     payloads = [line[len(prefix):] for line in output.splitlines()
                 if line.startswith(prefix)]
@@ -835,7 +837,8 @@ def extract_benchmark_json(output: str,
         raise RuntimeError(
             f"launcher emitted {len(payloads)} {prefix.strip()} records")
     result = json.loads(payloads[0])
-    expected = ("forward-graph-replay" if graph else
+    expected = ("forward-graph-suite" if suite else
+                "forward-graph-replay" if graph else
                 "single-persistent-forward-main-shape" if local else
                 "multinode-gin-forward-main-shape")
     if result.get("benchmark") != expected:
@@ -850,26 +853,33 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
     if "v4" in benchmark:
         spec = benchmark["v4"]
         v4_tuning.check_clocks(benchmark)
-        runs = []
-        for index, case in enumerate(spec["cases"]):
-            workload = {k: v for k, v in benchmark.items() if k != "v4"}
-            workload.update(seed=case["seed"] + 1,
-                            tokens_per_rank=case.get("tokens", benchmark["tokens_per_rank"]))
-            env = dict(environment, **v4_tuning.environment(candidate["config"]))
-            env["WEFTMOE_TUNE_ROUTE"] = case["route"]
-            env["WEFTMOE_TUNE_SEED"] = str(case["seed"])
-            env["WEFTMOE_TUNE_GPU"] = spec["gpu"]
-            runs.append(benchmark_candidate(candidate, binary, workload, log_dir, env,
-                                           rounds=rounds, suffix=f"{suffix}.case{index}"))
+        workload = {k: v for k, v in benchmark.items() if k != "v4"}
+        workload["graph_suite"] = True
+        env = dict(environment, **v4_tuning.environment(candidate["config"]))
+        env["WEFTMOE_TUNE_GPU"] = spec["gpu"]
+        # Reuse one exact-capacity arena for all routes before switching shape.
+        # Restore the declared case order below so fingerprints stay compatible.
+        order = sorted(range(len(spec["cases"])), reverse=True,
+                       key=lambda i: spec["cases"][i].get("tokens", benchmark["tokens_per_rank"]))
+        env["WEFTMOE_TUNE_CASES"] = ";".join(
+            f"{c['route']}:{c['seed']}:{c.get('tokens', benchmark['tokens_per_rank'])}"
+            for c in (spec["cases"][i] for i in order))
+        suite = benchmark_candidate(candidate, binary, workload, log_dir, env,
+                                    rounds=rounds, suffix=suffix)
+        runs = [dict(returncode=suite["returncode"], record=record, log=suite["log"])
+                for record in (suite["record"] or {}).get("cases", [])]
         try:
+            _require(suite["returncode"] == 0 and len(runs) == len(spec["cases"]),
+                     f"V4 suite failed: {suite['log']}")
+            runs = [run for _, run in sorted(zip(order, runs))]
             v4_tuning.check_clocks(benchmark)
             record = v4_tuning.aggregate(runs, spec)
             error = None
         except PlanError as failure:
             record, error = None, str(failure)
         return dict(returncode=0 if record else 1, record=record, parse_error=error,
-                    log=[r["log"] for r in runs], cases=runs,
-                    elapsed_seconds=sum(r["elapsed_seconds"] for r in runs))
+                    log=suite["log"], command=suite["command"], cases=runs,
+                    elapsed_seconds=suite["elapsed_seconds"])
     command = launcher_command(binary, benchmark, rounds=rounds)
     run_environment = dict(environment)
     run_environment["WEFTMOE_P2P_BENCH_TOKENS"] = str(

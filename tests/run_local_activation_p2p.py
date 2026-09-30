@@ -671,8 +671,19 @@ def main():
         if benchmark_mode:
             if args.forward_benchmark:
                 if os.getenv("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"):
-                    from tools.forward_graph_benchmark import aggregate_forward_graph
+                    from tools.forward_graph_benchmark import (
+                        aggregate_forward_graph, aggregate_forward_graph_suite)
 
+                    if os.getenv("WEFTMOE_TUNE_CASES"):
+                        result = aggregate_forward_graph_suite(
+                            [captured_text(capture)[0] for capture in captures],
+                            len(os.environ["WEFTMOE_TUNE_CASES"].split(";")))
+                        if any(case["world"] != args.world or
+                               case["measured"] != args.rounds - 10
+                               for case in result["cases"]):
+                            raise AssertionError("incomplete Forward graph suite")
+                        print("FORWARD_GRAPH_SUITE_JSON " + json.dumps(result, sort_keys=True))
+                        return
                     result = aggregate_forward_graph(observed)
                     if result["world"] != args.world or result["measured"] != args.rounds - 10:
                         raise AssertionError("incomplete Forward graph benchmark")

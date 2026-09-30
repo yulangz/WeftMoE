@@ -352,6 +352,7 @@ def environment_overrides(args):
         "WEFTMOE_TUNE_ROUTE",
         "WEFTMOE_TUNE_SEED",
         "WEFTMOE_TUNE_GPU",
+        "WEFTMOE_TUNE_CASES",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
         "WEFTMOE_FORWARD_BENCH_RETAIN_STATE",
         "WEFTMOE_BENCH_ALLOCATE_TENSORS",
@@ -983,13 +984,23 @@ def main(argv=None):
         return
     if args.scenario == "gin_forward_bench":
         if os.environ.get("WEFTMOE_FORWARD_BENCH_GRAPH_REPLAY"):
-            from tools.forward_graph_benchmark import aggregate_forward_graph
+            from tools.forward_graph_benchmark import (
+                aggregate_forward_graph, aggregate_forward_graph_suite)
 
             if any(result.returncode for result in outputs):
                 raise RuntimeError("GIN graph benchmark failed:\n" + "\n".join(
                     f"rank={result.rank} exit={result.returncode}\n"
                     f"{result.stdout[-3000:]}\n{result.stderr[-3000:]}"
                     for result in outputs if result.returncode))
+            if os.environ.get("WEFTMOE_TUNE_CASES"):
+                result = aggregate_forward_graph_suite(
+                    [item.stdout for item in outputs],
+                    len(os.environ["WEFTMOE_TUNE_CASES"].split(";")))
+                if any(case["backend"] != "gin-rdma" or case["world"] != world
+                       for case in result["cases"]):
+                    raise RuntimeError("incomplete GIN graph suite")
+                print("FORWARD_GRAPH_SUITE_JSON " + json.dumps(result, sort_keys=True))
+                return
             records = [parse_fields(item.stdout, "FORWARD_GRAPH_BENCH ")
                        for item in outputs]
             if len(records) != world or any(item["backend"] != "gin-rdma"

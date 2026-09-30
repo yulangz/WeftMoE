@@ -73,6 +73,15 @@ python tools/autotune_forward.py \
    交错确认，默认收益至少 0.5% 才切换，最终复验成功才允许 `--export-table`。
    这些 checks 不是相对 PyTorch 的独立数值证明；新增算术模板仍需原有数值门禁。
 
+每轮 route suite 在一次 rank launcher 中顺序执行，共用 CUDA context 与 NCCL
+communicator 与不可变模型权重；不同候选仍独立启动。同容量路由连续测量并复用
+pool，切换容量时释放旧池，始终按该用例的实际容量准备，不同时缓存多个 arena。
+各用例重建输入/Graph，保留原有 warmup/sample 数，完成并释放 Graph/output 后
+才复用；原始结果恢复到配置声明的顺序，不把准备时间计入 kernel 分数。
+`WEFTMOE_TUNE_CASES` 仅是测试驱动的批量用例协议，不影响生产算子。
+所有 case 的原始逐 rank 结果保存在同一个 `.tune.log` / `.confirmN.log` 中，
+完整输出、batch-invariance、内存预算及选优规则不变；旧的逐 case 日志仍保留。
+
 `window_tokens`/`contribution_windows` 为 prepare 参数，同一编译配置只编译一次；
 改变它们仍单独测量、记录候选和内存。其他参数写入生成 header。新配置未指定时，
 decode 的 M/CTA 密度规则、3 stages 及 ring 协议默认值保持不变。shared-memory
@@ -269,6 +278,48 @@ compute/GIN/Notify分配字节及释放后占用相同，各8项`PREPARED_TABLE_
 这些是单机选中profile的数值、生命周期和查表证据；本轮未重复该库的sanitizer，
 也不把前文另一K64编译profile的专项报告当作此库或完整训练的新sanitizer结果。
 双机EP16长文搜索及独立发布门禁仍待完成。生产DT/PF默认和性能分流保持原样。
+
+### 调参驱动：摊销进程、权重与通信池准备（2026-09-30）
+
+EP16/8K原搜索在26/44个候选后中断，20K尚未开始。初筛最佳仅比incumbent
+低0.752%，未做确认，未采用。旧实现每个候选独立启动六次16-rank作业，
+实测每次约28–33秒；一次完整候选175.699秒。这主要是测试驱动的重复准备，
+不是kernel运行三分钟，也不是编译耗时（该轮全部命中缓存）。
+单次启动诊断总耗时29.933秒，其中bootstrap约0.041秒，结束清理约1.576秒；
+不将剩余worker内耗时全部误归因于SSH或NCCL初始化。
+
+只调整测试驱动，未改生产kernel、协议或默认参数：
+
+1. 六个用例放进一次rank启动，共用CUDA context/NCCL communicator。
+   EP16单候选降到118.483秒，所有完整输入/输出hash与旧流程一致。
+2. 同一候选只准备一次不可变权重及其校验；同容量的三种路由连续运行并复用
+   Notify/transport pool。切换长文/T1容量时释放旧池，各例Graph/output完全
+   退休后再复用，使用不同generation；不同时保留两套注册arena。
+   汇总恢复原case顺序，兼容原完整正确性fingerprint。
+
+H2048/I512/E64/K4、1620 MHz、8K及T1的六例，仍各30 rounds（10 warmup +
+20 samples）、Graph batch10。以下是一次候选的**benchmark墙钟**，不含编译，
+不是算子加速比；单机和双机顺序执行，无其它GPU作业或CPU构建：
+
+| 拓扑 | 六次独立启动/s | 仅会话复用/s | 加上权重与池复用/s | 调参加速 |
+|---|---:|---:|---:|---:|
+| 单机EP8 | 61.221 | 未测 | 12.756 | 4.80× |
+| 双机EP16 | 175.699 | 118.483 | 54.255 | 3.24× |
+
+两拓扑六例的完整输入/输出fingerprint均与原incumbent一致；每rank的compute、
+GIN及总pool字节数逐例相同，batch-invariance/内存预算校验全部保留。
+测量分数、交错确认和最终完整验证规则不变。EP16综合kernel均值从6727.772
+变为6750.523 μs，不能把驱动墙钟收益当成GEMM/通信kernel性能收益。
+
+复用既有5项static-autotune检查和13项launcher检查通过，未新增细粒度单测。
+传统`test_forward_autotune.py`的6项失败、1项错误在HEAD版本复现相同结果，
+不宣称整份历史套件通过。首次资源复用构建有测试结构体namespace错误，修正
+后构建通过，失败日志保留。
+证据在`build/v4_autotune_gpu/`：`startup_profile.log`、
+`suite_ep16_validation.{json,log}`、`suite_reuse_ep{8,16}_validation.{json,log}`，
+最终测试二进制为`suite_reuse/test_cuda_notify`。本次没有恢复44候选完整搜索，
+也没有把中断的双机搜索标记为完成。
+该二进制SHA256为`c4f526d44027b8ae964156eb4a9fb27befd4e8ee93988d38043eea9d17c1f740`。
 
 ## 传统默认配置（历史说明）
 

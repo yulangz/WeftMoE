@@ -3,6 +3,24 @@
 import statistics
 
 
+def aggregate_forward_graph_suite(outputs, case_count):
+    ranks = [[dict(field.split("=", 1) for field in line.split()[1:])
+              for line in output.splitlines()
+              if line.startswith("FORWARD_GRAPH_BENCH ")]
+             for output in outputs]
+    if any(len(cases) != case_count for cases in ranks):
+        raise ValueError("incomplete Forward graph suite")
+    cases = []
+    for index in range(case_count):
+        records = [rank[index] for rank in ranks]
+        if any(int(record["case_index"]) != index for record in records):
+            raise ValueError("Forward graph suite case order differs across ranks")
+        if len({record["backend"] for record in records}) != 1:
+            raise ValueError("Forward graph suite backends differ across ranks")
+        cases.append(aggregate_forward_graph(records))
+    return dict(benchmark="forward-graph-suite", cases=cases)
+
+
 def aggregate_forward_graph(records):
     samples = [[float(value) for value in item["samples"].split(",")]
                for item in records]
