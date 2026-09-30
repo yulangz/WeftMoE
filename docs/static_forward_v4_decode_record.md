@@ -9,6 +9,8 @@ MegaMoE，单机长文和多机回归持平。
 2026-09-29 后续 HG：为 SGLang/Qwen 接入补齐单机 EP1/EP2/EP4/EP8，见第 6 节。
 后续 HH 的 RL 回退定位与消融见第 7 节；第 1–5 节描述历史 HF，不能把其
 M128/双 warpgroup 配置当作 HH 候选的当前实现。
+2026-09-30 的 E256/K8 小 batch 三方独立对照见第 8 节；该节 T 为全局
+batch，与前面的 E64/K4、每 rank T 的 MegaMoE 对照不是同一口径。
 
 ## 1. 入口和适用范围
 
@@ -624,3 +626,122 @@ EP4 的 124 个 native 和 9 个 SGLang bucket 数值检查通过，全部时钟
 的 CTA 比例；没有观察到提早安排 FC2 的净收益。编译资源为 M16 80 registers /
 16-byte stack，M64 128 registers / 32-byte stack。未进一步做全 EP 或
 sanitizer，代码已恢复 HHE，不替换 RL。原始日志为 `blockorder_*`。
+
+## 8. E256/K8 小 batch：baseline / MegaMoE / WeftMoE 独立对照
+
+2026-09-30，仅扩展既有 `benchmarks/torchrun_sglang_decode.py` 的可选
+MegaMoE 对照，不修改算子、SGLang 生产适配层或 DeepGEMM。结论是：当前
+WeftMoE HHE 在此次全部 EP/batch 点均领先冻结的 BF16 MegaMoE，但很小
+batch 仍未追上 SGLang baseline，不能以领先 MegaMoE 代替 RL 收益验收。
+
+### 配置与统计口径
+
+- 单机 `10.10.16.219`，NVIDIA L20X，132 SM/GPU；分别使用 EP2/4/8，TP=EP、
+  expert TP=1，无 DP attention。SM 锁定 1620 MHz，所有测量前后、所有 rank
+  的 NVML 采样均为 1620；没有其它 GPU workload 或并行编译。
+- Qwen3.5-35B-A3B 的 routed MoE 形状：E256/K8/H2048/I512，BF16、SwiGLU。
+  **T 是此层的全局 batch**，每个 TP rank 持有同一份输入；WeftMoE/MegaMoE
+  各自处理 `ceil(T/EP)` 个 source rows，例如 EP4/T32 是每 rank 8 行。
+  baseline 的每个 rank 持有 E/EP 个完整专家，不是把 I512 切成 I128。
+- baseline 为已安装 SGLang 0.5.10.post1 的 Triton FusedMoE，使用其默认
+  配置选择；本机无此设备/形状的专用 tuning JSON，沿用 RL 的 baseline。
+  WeftMoE 为 `07a586d` 的 HHE，而不是此前 RL 使用的 HHD。
+- 同一 EP 内三者使用完全相同的随机权重、输入、top-k IDs 和 weights。
+  权重 seed 为 `37 + rank`，输入/route seed 为 `100 + T`；不同 EP 的全局
+  权重不完全相同，因此 EP2/4/8 表不当作同一权重的严格强扩展实验。
+- 测量包含完整 routed MoE 和相同的外层 TP all-reduce；WeftMoE/MegaMoE
+  还包含同一套 fused staging、输出 scatter，以及各自内部 dispatch、
+  FC1/FC2、return/combine。补齐行 X/gate 为零，复用首个真实 token 的
+  expert IDs，避免引入额外专家；MegaMoE 此处没有改用自身的 -1 padding。
+- 不含 router/top-k、共享专家、attention、权重打包、JIT、分配和 graph
+  capture。这是 warmed 单层 CUDA Graph 微基准，不是完整模型/RL，亦非
+  40 层权重冷工作集测试；不能直接据此预测 rollout 吞吐。
+- 每点先丢弃 5 轮，再测 30 轮，每轮每个 backend 连续 replay 50 次；
+  每轮轮换三者测量顺序。CUDA event 计时，先取同一轮的 rank-max，再取
+  30 轮 p50。EP4 额外按 T128→1 反序完整复测。
+- 40 个 EP/batch 测量点、三者全部数值对照通过（`rtol=0.025, atol=2e-5`），
+  相对 baseline 的最大绝对误差为 `7.62939453125e-6`。此项是容差检查，
+  不宣称三种实现彼此 bitwise 相同，也不替代既有 Weft batch-invariance 验收。
+
+### EP4 主表（与 RL 并行配置一致）
+
+单位 µs，越低越好。相对变化为 `Weft / 对照 - 1`，负数表示 Weft 延迟更低。
+
+|全局 T|baseline|MegaMoE|WeftMoE HHE|相对 baseline|相对 MegaMoE|
+|---:|---:|---:|---:|---:|---:|
+|1|29.825|63.712|47.269|+58.5%|-25.8%|
+|2|32.727|64.244|48.327|+47.7%|-24.8%|
+|4|51.094|81.329|59.738|+16.9%|-26.5%|
+|8|55.649|84.710|65.537|+17.8%|-22.6%|
+|16|83.596|143.279|104.855|+25.4%|-26.8%|
+|32|106.241|162.474|123.420|+16.2%|-24.0%|
+|48|131.983|181.508|143.462|+8.7%|-21.0%|
+|64|150.177|190.054|149.761|-0.3%|-21.2%|
+|96|179.786|200.523|159.576|-11.2%|-20.4%|
+|128|186.565|202.729|163.707|-12.3%|-19.2%|
+
+反序复测相对首轮的最大绝对 p50 变化：baseline 0.58%、Weft 1.51%、MegaMoE
+0.31%。T64 复测为 baseline 149.853、Weft 149.855、MegaMoE 190.019 µs，
+应称 Weft 与 baseline 持平，不将首轮 0.3% 差异解释为收益。
+T1–48 的 baseline 优势、T96/128 的 Weft 优势均复现。
+
+### EP2 / EP8 补充
+
+|全局 T|EP2 baseline|EP2 MegaMoE|EP2 Weft|EP8 baseline|EP8 MegaMoE|EP8 Weft|
+|---:|---:|---:|---:|---:|---:|---:|
+|1|32.547|81.753|51.778|30.866|60.562|47.004|
+|2|45.283|90.294|60.805|31.799|62.000|48.344|
+|4|59.837|117.326|83.069|46.250|66.788|52.783|
+|8|78.679|139.011|97.631|49.508|71.868|55.472|
+|16|136.016|195.188|143.450|64.879|99.876|78.516|
+|32|170.843|266.623|188.816|79.214|114.917|93.439|
+|48|205.284|290.385|226.286|104.405|123.579|103.769|
+|64|224.215|314.637|236.582|114.290|131.571|111.613|
+|96|238.184|329.994|254.100|122.084|133.554|115.203|
+|128|242.969|336.960|259.496|116.688|133.788|117.082|
+
+EP2：Weft 比 MegaMoE 低 22.1%–36.7%，但所有所测 batch 均慢于 baseline。
+EP8：Weft 比 MegaMoE 低 12.5%–22.8%；T1–32 慢于 baseline，T48/128 接近，
+T64/96 此轮分别低 2.3%/5.6%。EP2/8 未做第二轮反序，不夸大小幅差异。
+
+三者并非相同通信工作流：此处 replicated 输入已经在所有 rank 可用，
+baseline 可直接筛选本地专家，最后 all-reduce；Weft/Mega 的兼容路径先
+分 source 行，再执行自身 dispatch/return，最后还原并 all-reduce。
+因此不能将 Weft 对 baseline 的全部差距归因于 GEMM，也不能把这一口径的
+结果推广到 DP-sharded 输入。各部分占比需要另行 profile，本表没有拆分归因。
+
+### 复现与冻结产物
+
+环境：Torch 2.9.1+cu129、CUDA 12.9、NCCL 2.31.2、driver 570.148.08。
+`build/decode_threeway_20260930/run.sh` 顺序运行 EP4、EP2、EP8、EP4 反序；
+正式原始记录分别为同目录下的 `ep4.log`、`ep2.log`、`ep8.log`、
+`ep4_reverse.log`。首轮 smoke 的包导入顺序错误已修复，两个 smoke 日志均
+不参与上述统计。正式四次 torchrun 均正常退出，GPU 显存已释放。
+
+EP4 命令（EP2/8 只改进程数；反序只改 `--tokens` 顺序）：
+
+```bash
+export PATH=/opt/.venv/bin:/usr/local/cuda/bin:/usr/bin:/bin
+export LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64
+export PYTHONPATH=$PWD OMP_NUM_THREADS=1 NCCL_DEBUG=WARN
+export NCCL_CUMEM_ENABLE=1 NCCL_NVLS_ENABLE=0
+export NCCL_IB_GID_INDEX=3 NCCL_SOCKET_IFNAME=eth0
+export WEFTMOE_STATIC_RING_TOKENS=512 WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS=8
+export WEFTMOE_TENSOR_EXTENSION=$PWD/build/local_decode_hh_twobarrier/_runtime.cpython-312-x86_64-linux-gnu.so
+export DG_JIT_CACHE_DIR=$PWD/build/static_v4_megamoe_decode_20260929/jit
+nvidia-smi -lgc 1620,1620
+torchrun --standalone --nproc_per_node=4 benchmarks/torchrun_sglang_decode.py \
+  --deepgemm-package build/deepgemm_sglang_torch291/lib.linux-x86_64-cpython-312 \
+  --tokens 1 2 4 8 16 32 48 64 96 128 --samples 30
+```
+
+Weft library 路径/hash 同 HHE 节。MegaMoE 采用前轮已冻结的本地 BF16
+DeepGEMM 包（支持 E256 的分段专家扫描），不是另取上游新版；`set_num_sms(132)`，
+`fast_math=True`、无 activation clamp。请求的 source capacity 为 64/rank，
+库实际对齐为 384/rank；实际工作行数仍由 output 的 `ceil(T/EP)` 决定。
+冻结包的 SHA256：
+
+- `deep_gemm/_C.cpython-312-x86_64-linux-gnu.so`：
+  `100a06dd12331d178a8c8590da4703008598dcb9625bf7769fa69863029394ed`。
+- `deep_gemm/include/deep_gemm/impls/sm90_bf16_mega_moe.cuh`：
+  `fb636714d7e7703b9a480fa7a9b57dec29b79d833c9b55dd3140a7c859082a77`。

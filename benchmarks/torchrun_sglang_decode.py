@@ -3,6 +3,9 @@
 Run with torchrun, the desired TP/EP size, and WEFTMOE_TENSOR_EXTENSION set.
 Weights and random routes are shared between backends. The model's outer TP
 all-reduce is included, as in Qwen's routed-plus-shared-expert block.
+Pass --deepgemm-package to include MegaMoE with the same fused input staging,
+zero-weight padding, output scatter, and outer all-reduce as WeftMoE. Weight
+packing and graph/JIT preparation are excluded for all backends.
 """
 
 import argparse
@@ -11,20 +14,42 @@ import json
 import os
 from pathlib import Path
 import statistics
+import sys
 from types import SimpleNamespace
 
 import pynvml
 import torch
 import torch.distributed as dist
-from sglang.srt.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
-from sglang.srt.layers.moe.utils import initialize_moe_config
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
+import triton
 import weftmoe.sglang as adapter
+from weftmoe._sglang_kernels import scatter_output, stage_inputs
+
+
+def make_mega_forward(deep_gemm, buffer, weights, tokens, rank, world):
+    local_tokens = (tokens + world - 1) // world
+    start = rank * local_tokens
+    valid = max(0, min(local_tokens, tokens - start))
+    hidden, top_k = buffer.x.shape[1], buffer.topk_idx.shape[1]
+    output = buffer.x.new_empty((local_tokens, hidden))
+    result = buffer.x.new_empty((tokens, hidden))
+
+    def forward(x, topk):
+        stage_inputs[(local_tokens,)](
+            x, topk.topk_ids, topk.topk_weights,
+            buffer.x, buffer.topk_idx, buffer.topk_weights, *x.stride(),
+            *topk.topk_ids.stride(), *topk.topk_weights.stride(),
+            start, valid, hidden, top_k,
+            triton.next_power_of_2(hidden), triton.next_power_of_2(top_k),
+        )
+        deep_gemm.bf16_mega_moe(
+            output, *weights, buffer, activation_clamp=None, fast_math=True
+        )
+        scatter_output[(triton.cdiv(tokens * hidden, 4096),)](
+            output, result, start, valid, hidden, tokens * hidden, 4096,
+        )
+        return result
+
+    return forward
 
 
 @torch.no_grad()
@@ -40,7 +65,24 @@ def main():
         help="Bracket one warmed Weft graph for NCU application replay",
     )
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--deepgemm-package", type=Path)
     args = parser.parse_args()
+    # SGLang imports deep_gemm itself; select the frozen package first.
+    if args.deepgemm_package:
+        sys.path.insert(0, str(args.deepgemm_package.resolve()))
+        import deep_gemm
+
+    from sglang.srt.distributed import (
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from sglang.srt.layers.moe.utils import initialize_moe_config
+    from sglang.srt.server_args import (
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
+
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -77,6 +119,18 @@ def main():
     baseline = layer.forward
     adapter.install()
     group = get_tp_group()
+    mega_buffer = None
+    if args.deepgemm_package:
+        deep_gemm.set_num_sms(
+            torch.cuda.get_device_properties(local_rank).multi_processor_count
+        )
+        mega_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+            group.device_group, 256, max(64, (max(args.tokens) + world - 1) // world),
+            8, 2048, 512, mma_type="bf16xbf16",
+        )
+        mega_weights = deep_gemm.transform_weights_for_mega_moe(
+            layer.w13_weight, layer.w2_weight
+        )
     for tokens in args.tokens:
         torch.manual_seed(100 + tokens)
         x = torch.randn(tokens, 2048, device="cuda", dtype=torch.bfloat16) * 0.03
@@ -84,6 +138,10 @@ def main():
         scores, ids = logits.topk(8, dim=-1)
         topk = StandardTopKOutput(scores.softmax(-1), ids.int(), logits)
         calls = {"baseline": baseline, "weftmoe": layer.forward}
+        if mega_buffer is not None:
+            calls["megamoe"] = make_mega_forward(
+                deep_gemm, mega_buffer, mega_weights, tokens, rank, world
+            )
         graphs, outputs = {}, {}
         for name, call in calls.items():
             with model_capture_mode(), group.graph_capture() as context:
@@ -97,17 +155,25 @@ def main():
             graphs[name] = graph
             graph.replay()
             torch.cuda.synchronize()
-        torch.testing.assert_close(
-            outputs["weftmoe"], outputs["baseline"], rtol=0.025, atol=2e-5
-        )
+        max_abs = {}
+        for name, output in outputs.items():
+            torch.testing.assert_close(
+                output, outputs["baseline"], rtol=0.025, atol=2e-5
+            )
+            max_abs[name] = (
+                (output.float() - outputs["baseline"].float()).abs().max().item()
+            )
         samples = {name: [] for name in calls}
         clocks = []
         begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         for iteration in range(args.samples + 5):
-            names = list(calls) if iteration % 2 == 0 else list(reversed(calls))
+            names = list(calls)
+            offset = iteration % len(names)
+            names = names[offset:] + names[:offset]
             for name in names:
                 dist.barrier()
                 torch.cuda.synchronize()
+                before = pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
                 begin.record()
                 for _ in range(50):
                     graphs[name].replay()
@@ -115,11 +181,12 @@ def main():
                 end.synchronize()
                 if iteration >= 5:
                     samples[name].append(begin.elapsed_time(end) * 1000 / 50)
-                    clocks.append(
-                        pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
-                    )
+                    after = pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
+                    clocks.extend((before, after))
         gathered = [None] * world
         dist.all_gather_object(gathered, samples)
+        all_errors = [None] * world
+        dist.all_gather_object(all_errors, max_abs)
         all_clocks = [None] * world
         dist.all_gather_object(all_clocks, clocks)
         if rank == 0:
@@ -133,6 +200,20 @@ def main():
                     {
                         "world": world,
                         "tokens": tokens,
+                        "tokens_scope": "global_replicated",
+                        "experts": 256, "top_k": 8,
+                        "hidden": 2048, "intermediate": 512,
+                        "deepgemm_package": (
+                            deep_gemm.__file__ if mega_buffer is not None else None
+                        ),
+                        "mega_capacity": (
+                            mega_buffer.num_max_tokens_per_rank
+                            if mega_buffer is not None else None
+                        ),
+                        "warmup": 5, "measured": args.samples, "replays": 50,
+                        "rank_max_abs_vs_baseline": {
+                            name: max(row[name] for row in all_errors) for name in calls
+                        },
                         "rank_max_p50_us": {
                             name: statistics.median(values)
                             for name, values in maximum.items()
@@ -181,6 +262,8 @@ def main():
         graphs.clear()
         del graph, outputs
     adapter.suspend(SimpleNamespace(graph_runner=None))
+    if mega_buffer is not None:
+        mega_buffer.destroy()
     dist.destroy_process_group()
     pynvml.nvmlShutdown()
 
