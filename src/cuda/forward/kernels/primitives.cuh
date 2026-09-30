@@ -1,5 +1,5 @@
 #include "cuda/forward/kernel_support.cuh"
-#include "cuda/static_v4/memory_order.cuh"
+#include "cuda/weftmoe_pf/memory_order.cuh"
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
 // The paired Forward kernel gives FC1 and FC2 independent N shapes.
@@ -179,7 +179,7 @@ forward_mblock_rows_ready(const ForwardKernelArgs &a, std::uint32_t expert,
                         local_row / forward_tuning::kTileM;
       const auto *arrived = peer_at<unsigned long long>(
           a.local_base, a.x_arrived_rows_offset);
-      return static_v4::load_acquire_device(
+      return weftmoe_pf::load_acquire_device(
                  arrived + tile * a.local_world_size +
                      a.rank % a.local_world_size) >= valid_rows;
     }
@@ -370,21 +370,21 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 #include "cuda/persistent_v3/forward/dispatch_pipeline.cuh"
 #include "cuda/persistent_v3/forward/finalize_pipeline.cuh"
 
-#include "cuda/static_v4/contract.cuh"
-#include "cuda/static_v4/network_access.cuh"
-#include "cuda/static_v4/ring_access.cuh"
-#include "cuda/static_v4/return_tx.cuh"
-#include "cuda/static_v4/network_ring.cuh"
-#include "cuda/persistent_v3/forward/compute_kernel.cuh"
+#include "cuda/weftmoe_pf/contract.cuh"
+#include "cuda/weftmoe_pf/network_access.cuh"
+#include "cuda/weftmoe_pf/ring_access.cuh"
+#include "cuda/weftmoe_pf/return_tx.cuh"
+#include "cuda/weftmoe_pf/network_ring.cuh"
+#include "cuda/forward/compute_kernel.cuh"
 
 #include "cuda/forward/initialize_pipeline.cuh"
-#include "cuda/static_v4/initialize.cuh"
-#include "cuda/static_v4/collective.cuh"
-#include "cuda/static_v4/route_plan.cuh"
-#include "cuda/static_v4/network_collective.cuh"
-#include "cuda/static_v4/network_route_exchange.cuh"
-#include "cuda/static_v4/single_node_route_exchange.cuh"
-#include "cuda/static_v4/single_node_finalize.cuh"
-#include "cuda/static_v4/ring_plan.cuh"
-#include "cuda/static_v4/ring_admission.cuh"
-#include "cuda/persistent_v3/forward/unified_kernel.cuh"
+#include "cuda/weftmoe_pf/initialize.cuh"
+#include "cuda/weftmoe_pf/collective.cuh"
+#include "cuda/weftmoe_pf/route_plan.cuh"
+#include "cuda/weftmoe_pf/network_collective.cuh"
+#include "cuda/weftmoe_pf/network_route_exchange.cuh"
+#include "cuda/weftmoe_pf/single_node_route_exchange.cuh"
+#include "cuda/weftmoe_pf/single_node_finalize.cuh"
+#include "cuda/weftmoe_pf/ring_plan.cuh"
+#include "cuda/weftmoe_pf/ring_admission.cuh"
+#include "cuda/forward/unified_entry.cuh"

@@ -32,7 +32,7 @@ __device__ constexpr auto physical_barrier(unsigned id) {
 struct ForwardKernelArgs {
   unsigned hidden, intermediate;
 };
-#include "cuda/static_v4/fc1_epilogue.cuh"
+#include "cuda/weftmoe_pf/fc1_epilogue.cuh"
 #include "gemm_benchmark.cuh"
 
 struct Mblock {

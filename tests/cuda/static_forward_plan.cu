@@ -1,5 +1,5 @@
-#include "cuda/static_v4/packet_plan.cuh"
-#include "cuda/static_v4/window_geometry.cuh"
+#include "cuda/weftmoe_pf/packet_plan.cuh"
+#include "cuda/weftmoe_pf/window_geometry.cuh"
 
 #include <algorithm>
 #include <array>

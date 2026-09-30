@@ -38,9 +38,12 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     root = args.source.resolve()
     phase = "forward" if args.phase == "static-forward" else args.phase
-    source = root / ("src/cuda/persistent_v3/forward/compute_kernel.cuh"
+    source = root / ("src/cuda/forward/compute_kernel.cuh"
                      if phase == "forward" else
                      "src/cuda/persistent_v3/backward/compute_kernels.cuh")
+    if phase == "forward" and not source.is_file():
+        # --source also accepts frozen snapshots from before the module rename.
+        source = root / "src/cuda/persistent_v3/forward/compute_kernel.cuh"
     code = source.read_text()
     if args.phase == "static-forward":
         extract_static_forward(code, directory, root)
@@ -72,7 +75,10 @@ def main():
                     root / "src/cuda/primitives/hopper.cuh",
                     root / f"src/cuda/{phase}/tuning_config.hpp"]
     if args.phase == "static-forward":
-        dependencies += [root / "src/cuda/static_v4/fc1_epilogue.cuh",
+        static_module = root / "src/cuda/weftmoe_pf"
+        if not static_module.is_dir():
+            static_module = root / "src/cuda/static_v4"
+        dependencies += [static_module / "fc1_epilogue.cuh",
                          root / "src/cuda/forward/support/fallback_kernels.cuh"]
     manifest = {"source": str(root), "phase": args.phase,
                 "source_hashes": {str(p.relative_to(root)):

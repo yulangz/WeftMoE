@@ -65,7 +65,7 @@ namespace {
 
 #include "cuda/forward/device_kernels.cuh"
 
-#include "cuda/local_decode/kernel.cuh"
+#include "cuda/weftmoe_dt/kernel.cuh"
 
 #include "cuda/backward/device_kernels.cuh"
 
@@ -1825,7 +1825,7 @@ std::shared_ptr<GinBackendState> create_gin_backend(
         resources.windows.push_back(window);
         const auto stream = internal::checked_execution_state(execution)->stream;
         if (pool->gin_layout.static_forward.rings.depth) {
-          static_v4::netring::initialize<<<allocated_context_count, 1, 0, stream>>>(
+          weftmoe_pf::netring::initialize<<<allocated_context_count, 1, 0, stream>>>(
               resources.dev_comm, window, pool->gin_layout.static_forward);
         }
         if (pool->gin_layout.rings.channels()) {
@@ -2112,17 +2112,17 @@ make_activation_pool_state(const CollectiveSession &session,
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U", forward_tuning::kTileK);
-        if (local_decode::eligible(config, state->layout.static_ring)) {
+        if (weftmoe_dt::eligible(config, state->layout.static_ring)) {
           for (unsigned variant = 0U; variant < 2U; ++variant) {
-            const auto rows = variant ? 64U : local_decode::kM;
+            const auto rows = variant ? 64U : weftmoe_dt::kM;
             slot.decode_x_map[variant] = make_bf16_tma_map(
                 at<void>(slot.device, state->layout.canonical_rows),
                 config.max_hidden_size, activation_rows, rows, "decode X",
-                local_decode::kK);
+                weftmoe_dt::kK);
             slot.decode_s_map[variant] = make_bf16_tma_map(
                 at<void>(slot.device, state->layout.forward_s),
                 config.max_intermediate_size, activation_rows, rows, "decode S",
-                local_decode::kK);
+                weftmoe_dt::kK);
           }
         }
         // Ring FC2 writes contribution/Return TX directly. Reuse its unused
@@ -5250,25 +5250,25 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             }
           }
           const bool decode = args.fused_inference_routes &&
-              local_decode::eligible(state->config, layout.static_ring);
+              weftmoe_dt::eligible(state->config, layout.static_ring);
           // Arithmetic variants share the same physical blocks and rank
           // protocol, so unequal sources can select different M shapes.
           const bool wide_decode =
-              decode && (local_decode::kSelectedM == 64U ||
-                         (local_decode::kSelectedM == 0U &&
+              decode && (weftmoe_dt::kSelectedM == 64U ||
+                         (weftmoe_dt::kSelectedM == 0U &&
                           id.num_tokens * id.world_size * id.top_k >=
                               id.num_experts * 16ULL));
-          const auto decode_kernel = wide_decode ? local_decode::kernel<64U>
-                                                 : local_decode::kernel<16U>;
+          const auto decode_kernel = wide_decode ? weftmoe_dt::kernel<64U>
+                                                 : weftmoe_dt::kernel<16U>;
           const auto threads =
-              decode ? local_decode::kThreads : forward_tuning::kUnifiedThreads;
-          if (decode && (id.num_tokens >= 4U || local_decode::kCtaMultiplier)) {
+              decode ? weftmoe_dt::kThreads : forward_tuning::kUnifiedThreads;
+          if (decode && (id.num_tokens >= 4U || weftmoe_dt::kCtaMultiplier)) {
             // More residency helps many-expert decode, but a small expert
             // set should not pay the grid collective cost of mostly idle CTAs.
             const auto expert_tiles = view.sizes.owned_expert_count *
-                (local_decode::kFc1Tiles + local_decode::kFc2Tiles);
-            forward_main_compute_ctas *= local_decode::kCtaMultiplier
-                ? local_decode::kCtaMultiplier
+                (weftmoe_dt::kFc1Tiles + weftmoe_dt::kFc2Tiles);
+            forward_main_compute_ctas *= weftmoe_dt::kCtaMultiplier
+                ? weftmoe_dt::kCtaMultiplier
                 : std::clamp(expert_tiles / forward_main_compute_ctas, 1U,
                              wide_decode ? 2U : 3U);
             args.forward_compute_cta_count = forward_main_compute_ctas;
@@ -5276,8 +5276,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           const auto smem =
               decode
-                  ? (wide_decode ? sizeof(local_decode::Shared<64U>)
-                                 : sizeof(local_decode::Shared<16U>))
+                  ? (wide_decode ? sizeof(weftmoe_dt::Shared<64U>)
+                                 : sizeof(weftmoe_dt::Shared<16U>))
                   : forward_unified_detail::shared_bytes<true>(id.world_size);
           const bool pdl = programmatic_launch::enabled();
           const auto error =

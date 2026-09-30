@@ -46,7 +46,7 @@ struct ForwardKernelArgs {
 #endif
   void *gin_window_base = nullptr;
   communication::ChunkRingLayout gin_rings;
-  static_v4::NetworkLayout static_network;
+  weftmoe_pf::NetworkLayout static_network;
   std::size_t local_notification_offset = 0;
   unsigned local_notification_ctas = 0;
   void *gin_sender_done = nullptr;

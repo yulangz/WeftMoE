@@ -667,12 +667,12 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
     functions = []
     lines = completed.stdout.splitlines()
     unified = bool(config["unified_workers"])
-    kernel_names = ("unified_forward_kernel",) if unified else (
+    kernel_names = ("unified_forward_kernel", "weftmoe_pf6kernel") if unified else (
         "local_p2p_forward_tma_store_kernel",
         "local_p2p_forward_compute_kernel",
     )
     if "v4" in config and config["static_v4_prefill_min_tokens"]:
-        kernel_names += ("local_decode",)
+        kernel_names += ("weftmoe_dt6kernel",)
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
     for index, line in enumerate(lines[:-1]):

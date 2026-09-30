@@ -238,9 +238,9 @@ FWD 生成 `WEFTMOE_FWD_UNIFIED_*` 资源宏，BWD 生成 `WEFTMOE_BWD_UNIFIED_*
 
 | 文件 | 职责 |
 | --- | --- |
-| [forward/unified_kernel.cuh](../src/cuda/persistent_v3/forward/unified_kernel.cuh) | FWD role 分离、寄存器额度、SMEM 分区和终结 |
-| [forward/compute_kernel.cuh](../src/cuda/persistent_v3/forward/compute_kernel.cuh) | FC1/FC2 与固定顺序 Reduce、计算域同步 |
-| [forward/unified_transport.cuh](../src/cuda/persistent_v3/forward/unified_transport.cuh) | TMA staging、Dispatch/Return 与通知协议 |
+| [forward/unified_kernel.cuh](../src/cuda/forward/unified_kernel.cuh) | FWD role 分离、寄存器额度、SMEM 分区和终结 |
+| [forward/compute_kernel.cuh](../src/cuda/forward/compute_kernel.cuh) | FC1/FC2 与固定顺序 Reduce、计算域同步 |
+| [forward/unified_transport.cuh](../src/cuda/forward/unified_transport.cuh) | TMA staging、Dispatch/Return 与通知协议 |
 | [forward/row_prefetch_pipeline.cuh](../src/cuda/persistent_v3/forward/row_prefetch_pipeline.cuh) | 有界分段预取与槽复用 |
 | [forward/unified_gin.cuh](../src/cuda/persistent_v3/forward/unified_gin.cuh) | GIN 共享 context 的接收、packing、发送与完成 |
 | [backward/unified_kernel.cuh](../src/cuda/persistent_v3/backward/unified_kernel.cuh) | BWD role 分离和通信退役后的 dX Reduce |

@@ -36,7 +36,7 @@ __device__ __forceinline__ void reduce_one_token_impl(
     lane_row = forward_contribution_row(a, lane_route);
     if constexpr (!StaticLocal && BulkReady)
       lane_pointer = reinterpret_cast<unsigned long long>(
-          static_v4::network_contribution(a, lane_route));
+          weftmoe_pf::network_contribution(a, lane_route));
     // Queue/scan consumers have already acquired every contribution. The
     // static scheduler instead waits for each route's local arrival marker.
     if constexpr (!BulkReady) {

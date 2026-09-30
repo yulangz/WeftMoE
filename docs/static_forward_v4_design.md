@@ -1175,7 +1175,14 @@ PDL 不能替代动态地址的分配依赖，本轮不加入 pointer-mailbox �
 
 ## 9. 模块划分与复用
 
-基于现有 `src/cuda/static_v4/` 演进，不新建一份 V3 GEMM。拟划分的职责如下，
+当前代码统一使用 `weftmoe_dt` 命名单机 decode 专属路径，使用 `weftmoe_pf`
+命名通用静态流水（含长文、跨机短文和训练 Forward）。原 `local_decode/`、
+`static_v4/` 目录分别迁至同名目录；共享 GEMM/worker 实现在 `cuda/forward/`。
+此命名整理不改变入口选择、配置宏/环境变量、缓冲区布局或 V3 回退。
+性能优化重点为：`weftmoe_dt` 的单机短序列，以及 `weftmoe_pf` 的单机/多机
+长序列（8K、20K，含训练）。双机短序列保留现有功能，不作为 PF 的重点性能目标。
+
+基于现有 `src/cuda/weftmoe_pf/` 演进，不新建一份 V3 GEMM。拟划分的职责如下，
 具体文件名以实施时最小改动为准；此表不是声称这些模块均已存在：
 
 | 职责 | 复用/修改方向 |

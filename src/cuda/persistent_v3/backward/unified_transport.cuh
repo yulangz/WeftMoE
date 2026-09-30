@@ -2,7 +2,7 @@
 
 #if __has_include(<nccl_device.h>)
 
-#include "cuda/persistent_v3/forward/unified_transport.cuh"
+#include "cuda/forward/unified_transport.cuh"
 
 // EP-local Backward payloads share the bounded TMA copier and notification
 // protocol with Forward. Only queue adapters and readiness publication differ.

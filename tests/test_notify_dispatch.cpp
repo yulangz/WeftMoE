@@ -29,7 +29,7 @@
 #include "cuda/nccl_protocol_internal.hpp"
 #include "cuda/persistent_v3/backward/cluster_task.cuh"
 #include "cuda/persistent_v3/forward/pipeline_state.cuh"
-#include "cuda/static_v4/ring_layout.hpp"
+#include "cuda/weftmoe_pf/ring_layout.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #include "weftmoe/api/errors.hpp"

@@ -20,7 +20,8 @@ batch，与前面的 E64/K4、每 rank T 的 MegaMoE 对照不是同一口径。
 
 ## 1. 入口和适用范围
 
-新增 `src/cuda/local_decode/`，而不是继续给通用 ring worker 叠加短文分支：
+HF 新增独立 `local_decode/`（当前已更名为 `src/cuda/weftmoe_dt/`），
+而不是继续给通用 ring worker 叠加短文分支：
 
 - `schedule.cuh`：容量选择、共享布局、静态任务编号。
 - `compute.cuh`：固定 TMA producer、两个 math warpgroup、FC1/FC2 epilogue。

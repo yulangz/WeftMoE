@@ -8,6 +8,14 @@ inter-node NCCL GIN communication. Routed contributions are reduced in a fixed
 order. Compiled specializations are cached, and tuning results are saved for
 inspection.
 
+The static Forward implementations are named `weftmoe_dt` (single-node decode)
+and `weftmoe_pf` (general prefill/ring pipeline, including multi-node inference
+and retained-state Forward). Their CUDA modules live in `src/cuda/weftmoe_dt/`
+and `src/cuda/weftmoe_pf/`; shared GEMM/worker code lives in `src/cuda/forward/`.
+Runtime selection, tuning/environment names and the V3 fallback are unchanged.
+`weftmoe_pf` targets long sequences on both single- and multi-node systems;
+short multi-node requests retain their existing compatibility path.
+
 ## Installation
 
 Build and install from the repository:

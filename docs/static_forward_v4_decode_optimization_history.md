@@ -97,7 +97,7 @@ MegaMoE。因此下一步不再继续堆通用 ring 短文分支，而是独立�
 
 ## HF 用单窗口工作流替代通用在线生命周期
 
-HF 新增 `src/cuda/local_decode/`，复用已有数值 helper、packed 权重和 IPC
+HF 新增独立 decode 模块（当前路径 `src/cuda/weftmoe_dt/`），复用数值 helper、packed 权重和 IPC
 内存。静态 pull/TMA/math 角色直接执行单窗口任务，FC2 写 source contribution，
 不需要通用 return-fragment 目录和调用内 slot 换代。独立短容量 runtime
 保证最坏热点也装得下，不靠均匀路由假设或丢 token 换速度。
@@ -340,9 +340,9 @@ batch-invariance 验证，包括 batch 1/7/32/64、行置换、不等长/空 sou
 热点跨块、形状切换、通用 V4 对齐、graph 输入和权重更新。三方 benchmark
 使用容差检查，不声称 Weft、MegaMoE、SGLang 三者彼此逐位一致。
 
-入口和实现：[schedule.cuh](../src/cuda/local_decode/schedule.cuh)、
-[compute.cuh](../src/cuda/local_decode/compute.cuh)、
-[kernel.cuh](../src/cuda/local_decode/kernel.cuh)、
+入口和实现：[schedule.cuh](../src/cuda/weftmoe_dt/schedule.cuh)、
+[compute.cuh](../src/cuda/weftmoe_dt/compute.cuh)、
+[kernel.cuh](../src/cuda/weftmoe_dt/kernel.cuh)、
 [host 选择](../src/cuda/activation_transport.cu)、
 [SGLang 适配](../weftmoe/sglang.py)、[staging](../weftmoe/_sglang_kernels.py)。
 
@@ -385,3 +385,41 @@ M32/M128 或其他 stage/tile 组合须先实现并验证，不能只改配置�
 stages/CTA 离线搜索及 prepare 配置检查；使用方法和未覆盖的入口见
 [autotune 文档](autotune.md)。GPU 搜索和完整发布门禁尚待空闲机器，本文历史
 性能表不变，不把工具实现当成其他模型已获益。
+
+## DT/PF 命名整理（仅清理，无新功能）
+
+单机 decode 模块/内核命名为 `weftmoe_dt`，通用静态流水命名为
+`weftmoe_pf`。PF 重点是单机/多机长序列 prefill 和训练；跨机短序列保留
+现有可用入口，不作为 PF 的重点性能目标。共享 GEMM/worker 从
+`persistent_v3/forward/` 移至 `forward/`，V3 回退与 PF 共用同一份实现。
+删除未使用的旧 GEMM 常量；不改数值、布局、调度、同步、入口选择、配置或环境变量。
+未增加细粒度私有符号单测，未采用依赖函数名排序的特殊命名方案。
+
+清理前冻结 `727c91e`，H2048/I512/E64/K4、1620 MHz，10 warmup/20 samples、
+graph batch20，rank-max p50/μs。同机相邻进程对照：
+
+| 路径 | EP | T/rank | 清理前 | 清理后 | 变化 |
+|---|---:|---:|---:|---:|---:|
+| DT | 8 | 1 | 36.754 | 36.661 | −0.25% |
+| DT | 8 | 64 | 59.205 | 58.998 | −0.35% |
+| PF | 8 | 8192 | 1242.320 | 1242.470 | +0.01% |
+| PF | 8 | 20480 | 2927.410 | 2910.650 | −0.57% |
+| PF | 16 | 8192 | 2885.370 | 2885.000 | −0.01% |
+| PF | 16 | 20480 | 6855.270 | 6843.520 | −0.17% |
+
+重点场景视为持平，不计为优化收益。额外观察到双机 T64 延迟从 287.230
+变为 291.806 μs，反向顺序为 286.917/291.808 μs（约 +1.6%–1.7%）；
+记录这项小幅差异，按上述 PF 定位不为函数名排列另加特殊处理。
+全部八档输入/输出 hash、分配字节和 graph 节点相同，前后各卡均为 1620 MHz。
+
+现有集成检查通过：DT EP8 的248项、E256/K8 EP4的124项、PF EP8四档的240项，
+覆盖空 source、热点、batch-invariance、图输入及权重刷新。单机训练257 tokens
+的8 rank输出/梯度检查、24项peer payload复用与8 rank图销毁/卸载检查通过。
+Host检查18项、现有Python检查12项通过；不新增测试文件。
+19个受检入口编译资源相同，DT两个版本和V3四个回退入口的SASS指令相同；
+PF重命名后设备函数地址/排列有变化，不声称PF逐字节相同。
+
+原始记录在 `build/dt_pf_cleanup/`；最终采用的二进制与 `namespace_candidate/`
+中的首次统一命名构建相同，未采用 `abandoned_layout_build/` 的私有命名试验。
+native SHA256 `392af078ce2e31f9f414ae784bc907b287df3724c6cea165fa8cb47f72538cf7`，
+library SHA256 `ff7da6c56e9498e98cc29d25462356f798949496b165fea9ed2ff42ce0f348d4`。

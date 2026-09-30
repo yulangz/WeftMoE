@@ -1,4 +1,4 @@
-#include "cuda/static_v4/network_layout.hpp"
+#include "cuda/weftmoe_pf/network_layout.hpp"
 
 constexpr std::size_t kAlign = 256;
 
@@ -583,7 +583,7 @@ struct Layout {
 // weights, canonical rows, and local-P2P storage stay in ordinary CUDA
 // allocations so enabling the network backend does not change their allocator.
 struct GinWindowLayout {
-  static_v4::NetworkLayout static_forward;
+  weftmoe_pf::NetworkLayout static_forward;
   communication::ChunkRingLayout rings;
   std::size_t send_dispatch_directory = 0;
   std::size_t receive_dispatch_directory = 0;
@@ -770,9 +770,9 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         checked_mul(routes, config.max_hidden_size, "V4 Return elements"),
         sizeof(transport::BFloat16), "V4 Return bytes");
     network.contexts = static_cast<unsigned>(std::min<std::size_t>(
-        static_v4::kNetworkContexts,
-        (network.return_stride + static_v4::kNetworkChunkBytes - 1U) /
-            static_v4::kNetworkChunkBytes));
+        weftmoe_pf::kNetworkContexts,
+        (network.return_stride + weftmoe_pf::kNetworkChunkBytes - 1U) /
+            weftmoe_pf::kNetworkChunkBytes));
     network.return_tx = append(cursor, config.max_nodes, network.return_stride,
                                "V4 Return TX");
     network.return_rx = append(cursor, config.max_nodes, network.return_stride,
