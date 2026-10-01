@@ -2782,3 +2782,68 @@ AC 的 EP16 T8192/20480 完整 Torch 数值、route rejection、ordinal 3/5
 失败及重试、三份 live tape/peer reuse、EP8 subgroup graph/offload 均通过。
 **采用 AC 的启动准备复用**，明确不将整个相对 V3 收益归于这项 host 改动；
 双机实际循环仍待最终组合对照。没有新增测试框架或细粒度源码断言。
+
+AC 补测 EP16 T20480 全热点（所有 top-k 都在 rank 0 的四个专家，实际
+R=1,310,720；其它 rank 零入站），16 ranks parity 及 graph/offload 均通过。
+
+AD 两档 native 四组 hash 与 c6be309 一致；诊断实际报告
+`gin_contexts=133, gin_workers=132`，确认采用了独占分支。静态 GIN 资源仍
+REG168/STACK72/SHARED2048/LOCAL0，本地 STACK0。正式 BWD 为
+2824.170/6609.280 µs，相比 AC 仅小幅变化；尚未完成实际循环与生命周期门禁，
+不把 Forward AZ 的 6%–7% 历史收益套用到 Backward。
+
+AE1/AE2 在 AD 上只消融已有 GIN chunk 行数 32/128，对照 64。PF main
+使用独立 Dispatch Q8/Return Q16，保持不变；该参数调整训练 BWD 的旧式
+wire slot（以及非 PF 的 legacy 路径），不改变 M128 或 dW K 顺序。
+用来区分小包的流水延迟与大包的提交摊销，ring 深度、sender/receiver 配额
+和 credit 语义不变；相应 GIN payload 容量也会变化，必须计入内存比较。
+仅 build 内 profile，正在构建，尚未采用。
+
+AD 的 EP16 两个长档完整 Torch 回归、20K 全热点均通过，覆盖分配失败后
+重试、多个 live tapes、零入站 rank 和 inference graph/offload。8K native
+仅插桩 rank 1/9 的 WeftMoE kernels，memcheck 两份报告均 0 errors，所有
+16 ranks 的四组 hash 与 c6be309 一致；不等于全 API/全 rank racecheck clean。
+首次插桩 rank 0/8 未进入算子：sanitizer 子进程保留 bootstrap pipe 写端，
+多机 launcher 等待 EOF 超时。改用 1/9 规避 launcher 限制，没有修改协议。
+
+AD 的 EP16 实际循环（50/200，B768/D6）为 9667.800/19257.550 µs，
+相邻 V3 为 9215.203/17214.686。**两档都未达标**，不能用 native 小幅
+收益替代端到端验收。AC/AD 尚未做稳定的完整循环直接配对，不能据此将
+20K 的波动全部归因于 GIN sharing 模式。
+
+AE1/AE2 的四组梯度 hash 均与 c6be309 一致。EP16 native BWD 分别为
+2837.990/6921.580、3093.880/6729.060 µs，均未优于 64 行；**不采用**。
+生产 profile 保留 chunk 64，未将额外通信缓冲容量引入正式实现。
+
+AF（`pf_backward_packed_storage`，基于 AD）：eager 训练每次发布权重时，
+原来均原生 cudaMalloc/cudaFree 一份 interleaved W1；native 算子基准在
+计时前准备权重，因此不会反映这一开销。新增调用方提供 packed-W1 scratch
+的 overload，复用现有 CudaTensorBuffer 校验/所有权机制；Torch 入口使用
+自身缓存分配器。**每次仍重新 interleave 当前 W1**，不是按地址缓存权重值。
+原 overload/ABI 和 native 分配路径保留。lease 保持 scratch 存活；准备失败
+时先等 packing ready 再释放，避免缓存分配器提前回收。仍在同一 collective
+allocation agreement 内准备，不增加 collective。候选正在构建，收益待测。
+
+AF 已构建；EP16 实际循环（50/200，B768/D6，1620 MHz）为
+6498.2745/14112.6975 µs，相邻冻结 V3 为 9119.4395/17659.7615，
+耗时降低 28.74%/20.09%。对照前一轮 AD 的 9667.800/19257.550，AF
+主要消除了训练入口的原生分配/释放停顿，并非 GEMM 加速；native 基准在
+计时外绑定权重，不能拿该结果推断 native GPU 阶段同幅改善。每次 publication
+仍重排完整 W1，CPU/GPU 工作没有被移出实际循环计时。已有 34 项 CPU 检查
+通过；完整 Torch 回归和最终同候选十二项配对仍在进行。
+
+补记 AE 的内存代价：相同 B1024/D4、8K 夹具中，各 rank 的 pool_bytes
+为 chunk32 966206048、chunk64 1138827872、chunk128 1484071520；
+workspace_bytes 均为 419800280、tensor_bytes 均为 293863424。20K 的 pool
+分别 1485969504/1658591328/2003834976；每档差值只来自 chunk 配额，不能
+把更大 payload 预算当成免费调整。三种配置最终仍选择原 chunk64。
+
+AD 在单机 EP8 的 200 measured native BWD 为 1771.860/4634.810 µs，
+相邻 V3 为 2128.690/5055.480；本地 kernel 没有 GIN mode 分支变化。
+
+AF 的 EP16 两个长档完整 Torch 回归均通过：每档 16 个 parity、16 个原地
+权重刷新、32 个 allocation failure、16 个 retry、48 个 peer reuse，以及
+16 个 multilayer graph / offload marker。静态 BWD 编译资源与 AD 一致：
+REG168/SHARED2048/LOCAL0，GIN STACK72、本地 STACK0。
+**采用 AD 的条件独占提交及 AF 的应用侧 packing scratch**；最终同候选的
+EP8/EP16 各档 FWD/BWD/cycle 性能门禁仍待下面统一汇总，不提前标记完成。

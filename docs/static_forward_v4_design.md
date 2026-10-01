@@ -1162,6 +1162,12 @@ backend 不再对它们重复确认分配。未绑定 tensors 的原生入口仍
 单 rank 分配失败时全体报错、释放部分分配并重试的合同，不能省略这唯一
 准备边界，也不在 payload 启动后补分配。
 
+eager 权重发布的 interleaved W1 scratch 同样由应用缓存分配器提供，lease
+持有到消费完成；准备失败则等 packing ready 再回收。每次仍重排当前权重，
+不按地址缓存内容，因此训练原地更新不需要失效接口。原 native 分配 overload
+保留；inference graph 的一次性权重准备及不可变合同不变。该优化消除每步
+原生 cudaMalloc/cudaFree，属于完整训练循环开销，不计作 GEMM 加速。
+
 当前 Backward 的静态合同：
 
 - 有足够 M-block 时，cluster `c` 拥有 `c + n * clusters` 的完整
@@ -1201,6 +1207,11 @@ Backward 与 Forward 共用 backend 的 launch 准备缓存，按 entry、资源
 与启动几何复用已通过的寄存器、shared-memory/stack 和 occupancy 检查。
 首次检查仍完整执行，统一 BWD 不设置不会启动的 split kernel 属性；不缓存
 路由或 tensor 地址，不改变跨调用数据/通信完成边界。
+
+统一 BWD 的 GIN context 0 留给 metadata；仅当实际 context 数大于 worker
+CTA 数时，data context `1+cta` 才采用 THREAD 独占模式（每 CTA 单一提交者）。
+实际资源不足时仍用 GPU sharing，跨调用由 GinExecution 完成事件串行化。
+remote credit、本地 NIC counter、ACK flush 与 payload 可见性合同均不变。
 
 Router 梯度放在 SwiGLU epilogue，避免另读一遍 gate/up。记保存的两个投影为
 `A/B`、选中专家的 routing weight 为 `p`、`S = SiLU(A) * B`：先做

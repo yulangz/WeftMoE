@@ -260,11 +260,13 @@ class Runtime {
       input = producer.publish_activations(
           static_cast<const transport::BFloat16 *>(pointer(x)),
           elements(x), tokens, hidden_, owner(x));
+      auto packed_w1 = empty({elements(w1)}, "bfloat16");
       weights = producer.publish_weights(
           static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
           static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
           config_.num_experts / config_.topology.world_size,
-          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
+          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_,
+          binding(packed_w1));
       // Mini Notify already supplies the exact tape size. Prepare inputs and
       // saved tensors under one allocation agreement before entering main.
       tape->output = empty({tokens, hidden_}, "bfloat16");

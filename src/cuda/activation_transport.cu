@@ -554,10 +554,15 @@ struct ForwardAllocation {
   bool owns_w2 = true;
   std::shared_ptr<const void> w1_owner;
   std::shared_ptr<const void> w2_owner;
+  std::shared_ptr<tensor_storage_detail::Allocation> packed_w1_storage;
   std::shared_ptr<const internal::ExternalCudaProducerState> external_producer;
   ~ForwardAllocation() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
     if (ready) {
+      // A failed preparation may release the lease before packing completes.
+      // Native cudaFree used to drain this work before recycling its storage.
+      if (packed_w1_storage)
+        (void)cudaEventSynchronize(ready);
       internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       (void)cudaEventDestroy(ready);
     }
@@ -565,7 +570,7 @@ struct ForwardAllocation {
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       (void)cudaFree(w2);
     }
-    if (w1_interleaved) {
+    if (w1_interleaved && !packed_w1_storage) {
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       (void)cudaFree(w1_interleaved);
     }
@@ -989,6 +994,19 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
     std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
     std::uint32_t global_expert_begin, std::uint64_t hidden_size,
     std::uint64_t intermediate_size) const {
+  return publish_weights(w1, w1_capacity_elements, std::move(w1_owner),
+                         w2, w2_capacity_elements, std::move(w2_owner),
+                         owned_experts, global_expert_begin, hidden_size,
+                         intermediate_size, {});
+}
+
+ForwardWeightLease ExternalCudaProducer::publish_weights(
+    const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
+    std::shared_ptr<const void> w1_owner,
+    const transport::BFloat16 *w2, std::uint64_t w2_capacity_elements,
+    std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
+    std::uint32_t global_expert_begin, std::uint64_t hidden_size,
+    std::uint64_t intermediate_size, const CudaTensorBuffer &packed_w1) const {
   if (!state_ || !w1_owner || !w2_owner || owned_experts == 0 ||
       hidden_size == 0 || intermediate_size == 0)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
@@ -1019,15 +1037,26 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   const auto w1_bytes = checked_size(
       checked_mul(w1_elements, sizeof(transport::BFloat16), "W1 bytes"),
       "W1 bytes");
-  internal::throw_cuda(
-      "external-weight-publish",
-      cudaMalloc(&allocation->w1_interleaved, w1_bytes),
-      state_->backend->context.calling_rank(),
-      state_->backend->context.session().world_size(),
-      state_->backend->context.session().identity(),
-      state_->backend->context.session().generation(),
-      ExchangeKind::ExpertCounts, "cudaMalloc(interleaved W1)");
-  internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+  if (packed_w1.data || packed_w1.bytes || packed_w1.owner) {
+    allocation->packed_w1_storage = tensor_storage_detail::allocate(
+        w1_bytes, allocation->device, packed_w1);
+    tensor_storage_detail::validate_input_disjoint(
+        {allocation->packed_w1_storage}, w1, w1_bytes);
+    tensor_storage_detail::validate_input_disjoint(
+        {allocation->packed_w1_storage}, w2,
+        w2_elements * sizeof(transport::BFloat16));
+    allocation->w1_interleaved = allocation->packed_w1_storage->data;
+  } else {
+    internal::throw_cuda(
+        "external-weight-publish",
+        cudaMalloc(&allocation->w1_interleaved, w1_bytes),
+        state_->backend->context.calling_rank(),
+        state_->backend->context.session().world_size(),
+        state_->backend->context.session().identity(),
+        state_->backend->context.session().generation(),
+        ExchangeKind::ExpertCounts, "cudaMalloc(interleaved W1)");
+    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
+  }
   allocation->bytes = checked_add(
       checked_mul(2ULL, w1_bytes, "W1 plus interleaved W1 bytes"),
       checked_mul(w2_elements, sizeof(transport::BFloat16), "W2 bytes"),

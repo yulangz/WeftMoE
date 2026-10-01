@@ -209,6 +209,22 @@ def main():
                 assert usage["compute_bytes"] == first_compute_bytes
             print(rank, "PEER_PAYLOAD_REUSE_PASS", index, usage, flush=True)
         del tapes, tape
+        # Reusing packing storage must not cache values across optimizer steps.
+        # Keep the weight addresses fixed and change both gate/up projections.
+        with torch.no_grad():
+            w1.neg_()
+            all_w1.neg_()
+        expected = reference_moe(all_x, route, gate, all_w1, all_w2)
+        gradients = torch.autograd.grad(
+            expected, (all_x, gate, all_w1, all_w2), dy)
+        tape = runtime.forward(x, route.chunk(world)[rank].contiguous(), g, w1, w2)
+        actual = (tape.output, *runtime.backward(
+            tape, dy.chunk(world)[rank].contiguous()))
+        for value, target in zip(actual, (expected, *gradients)):
+            torch.testing.assert_close(value.float(), target.chunk(world)[rank].float(),
+                                       rtol=0.02, atol=0.00002)
+        del tape
+        print(rank, "TRAINING_WEIGHT_REFRESH_PASS", flush=True)
     runtime.close()
     del output, runtime
     # AReaL trains across EP16 but serves with independent node-local EP4
