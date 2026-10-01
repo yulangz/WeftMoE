@@ -50,12 +50,15 @@ __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
           route < routes ? unsigned(a.selected_experts[route]) : experts;
       keys[item] = (std::uint64_t(expert) << KeyBits) | within;
     }
-    Sort(shared.sort).Sort(keys, 0, expert_bits + KeyBits);
+    // Input ordinals already increase in blocked order. Stable expert sorting
+    // preserves that order without radix passes over the ordinal bits.
+    Sort(shared.sort).Sort(keys, KeyBits, expert_bits + KeyBits);
     __syncthreads();
 #pragma unroll
     for (unsigned item = 0; item < Items; ++item)
       shared.keys[threadIdx.x * Items + item] = keys[item];
     __syncthreads();
+    std::uint64_t ordinals[Items]{};
 #pragma unroll
     for (unsigned item = 0; item < Items; ++item) {
       const auto position = threadIdx.x * Items + item;
@@ -70,12 +73,26 @@ __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
         else
           end = middle;
       }
-      const auto route = chunk * kTrainingCountChunkRoutes +
-                         (keys[item] & ((1U << KeyBits) - 1U));
-      const auto ordinal =
+      ordinals[item] =
           a.checkpoint.counts
               .chunk_prefix[std::uint64_t(expert) * chunks + chunk] +
           position - first;
+    }
+    // Sorting is only needed for stable ordinals. Restore source-route order
+    // in shared memory so the route-indexed tape tables get coalesced stores.
+    __syncthreads();
+#pragma unroll
+    for (unsigned item = 0; item < Items; ++item)
+      shared.keys[keys[item] & ((1U << KeyBits) - 1U)] = ordinals[item];
+    __syncthreads();
+#pragma unroll
+    for (unsigned item = 0; item < Items; ++item) {
+      const auto within = threadIdx.x + item * Threads;
+      const auto route = chunk * kTrainingCountChunkRoutes + within;
+      if (route >= routes)
+        continue;
+      const auto expert = unsigned(a.selected_experts[route]);
+      const auto ordinal = shared.keys[within];
       const auto row = a.checkpoint.counts.expert_source_base[expert] + ordinal;
       const auto destination = expert / owned;
       const_cast<std::uint32_t *>(a.dispatch.expert_id)[route] = expert;

@@ -4,7 +4,7 @@
 
 // Pull has one issuer and two private staging slots. A batch stays within
 // one Mblock and completes before publishing its aggregate X credit.
-template <bool Network, bool Training, unsigned Batch = Network ? 2U : 8U,
+template <bool Network, unsigned Batch = Network ? 2U : 8U,
           class Storage>
 __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
                                        unsigned worker, unsigned workers) {
@@ -72,8 +72,6 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
           }
           const auto target_row = ring::row(a, block) + m;
           gates[target_row] = identity.gate;
-          if constexpr (Training)
-            ring::save_identity(a, index);
           const auto *source =
               peer_at<const transport::BFloat16>(a.peer_bases[identity.source],
                                                  a.source_input_offset) +
@@ -105,7 +103,7 @@ __device__ __noinline__ void ring_pull(const ForwardKernelArgs &a, Storage &s,
       }
     if constexpr (Network) {
       __syncwarp();
-      network_ring_transport::pull_window<Training>(
+      network_ring_transport::pull_window(
           a, s, worker, workers, window, peer_rows);
     }
   }
@@ -290,7 +288,7 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
       if (blockIdx.x < network_workers)
         network_ring_transport::transmit<false>(a, s, blockIdx.x);
       else
-        ring_pull<true, Training>(a, s, blockIdx.x - network_workers,
+        ring_pull<true>(a, s, blockIdx.x - network_workers,
                         gridDim.x - network_workers);
     } else if (warp == 1U) {
       if (blockIdx.x < network_workers)
@@ -318,11 +316,11 @@ __device__ __forceinline__ void ring_run(const ForwardKernelArgs &a,
     if constexpr (!Training) {
       if (a.ring.state->windows == 1U &&
           a.ring.state->rows <= 2U * gridDim.x) {
-        ring_pull<false, false, 1U>(a, s, blockIdx.x, gridDim.x);
+        ring_pull<false, 1U>(a, s, blockIdx.x, gridDim.x);
         return;
       }
     }
-    ring_pull<false, Training>(a, s, blockIdx.x, gridDim.x);
+    ring_pull<false>(a, s, blockIdx.x, gridDim.x);
   } else if (warp == 1U)
     ring_return<false>(a, blockIdx.x, gridDim.x);
   else if (blockIdx.x == 0U)

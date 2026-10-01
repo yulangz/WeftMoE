@@ -2287,3 +2287,102 @@ SM 时钟为 1620MHz。使用上述 schema 13 诊断版，EP16/B1024/D4，保留
 首次具体消融选择缩小训练行号 radix sort 的 bit 范围：输入按 route ordinal
 递增，已安装 CUB 的 BlockRadixSort 保证稳定性，只排 expert 位即可保持完整
 行序；随后再独立测训练 packet 与目录 Put 的重叠，不混淆两个改动的收益。
+
+### planner 分项消融（2026-10-01，继续优化中）
+
+恢复环境后重新测生产二进制，H2048/I512/E64/K4、EP16/B1024/D4、
+1620MHz，30 轮中前 10 轮预热。下表均为每轮 rank-max 后的 p50，单位 µs。
+`base reverse` 是最后一个 overlap 候选之后反转顺序复测的 c6be309；
+相邻轮次的 Notify/计算区间仍有波动，不能把 wall 的全部变化归因于 planner。
+
+| 累计候选 | 8K wall | 20K wall | 8K main 规划 | 20K main 规划 |
+|---|---:|---:|---:|---:|
+| 原 V3 profile | 3433.490 | 7161.700 | 0（规划在 Notify） | 0 |
+| c6be309，初次恢复 | 3558.880 | 7912.890 | 392.512 | 555.008 |
+| A：只对 expert 位做稳定 radix sort | 3575.720 | 7954.880 | 390.688 | 553.024 |
+| B：训练 packet 与目录 Put 重叠 | 3565.720 | 7898.460 | 363.712 | 520.928 |
+| c6be309，base reverse | 3596.000 | 7949.260 | 393.504 | 555.776 |
+| C：全网格静态分摊 RX 描述符 | 3566.460 | 7893.650 | 341.920 | 503.872 |
+| D：训练表按 source-route 顺序合并写入 | 3533.150 | 7833.880 | 336.128 | 499.552 |
+
+A 利用 CUB BlockRadixSort 的稳定性，输入 ordinal 原本已经递增，因此无需
+再排序低位 ordinal。规划只改善约 2 µs，没有独立的端到端收益证据。
+B 的 packet/fanout 重建不属于发布给 Forward 的源目录，移到目录 Put 提交后、
+context fence 之前，保持原有 fence 和 collective 顺序；另外单机训练跳过
+Backward 不使用的 node-token 目录。C 把每窗口一个 CTA 内的描述符循环改成
+整个 grid 的固定 residue，没有领取队列或新增同步。D 将稳定排序所得 ordinal
+暂存回原始 route 下标，再由相邻 lane 写相邻 route 的元数据；复用原 shared
+scratch，新增两次 CTA barrier，无新增分配。D 仍是候选，尚未完成所有门禁。
+
+A/B/C/D 的两个长档均与原版保持 16 ranks 的输入、route、gate、实际权重及
+输出 hash 一致。B 另通过 EP8 两个长档的重复 Backward 验证：所有 rank 的
+dX/dGate/dW1/dW2 hash 与 c6be309 逐项一致。不能据 Forward benchmark 的输出
+hash 推断 C/D 的梯度已经验证。日志统一保存在 `build/pf_training_timeline/`，
+前缀分别为 `v3_restored`、`base_restored`、`stable_sort`、`overlap`、
+`base_reverse`、`parallel_pull`、`coalesced_rows`。
+
+本轮单机独占远端节点的恢复基线，EP8/B512/D8，FWD V3/PF 分别为
+1724.780/1640.600（8K）、3573.070/3556.640（20K）；BWD 为
+2132.490/1818.290、5067.280/4721.710。20 warmup + 50 measured 的实际 cycle
+V3/PF 为 6521.193/6294.860、10977.895/10866.903。20K FWD/cycle 优势很小，
+仍须最终配对复测，不能沿用历史轮次更大的收益。
+
+D 补充 EP8 重复 Backward 验证已通过，两个长档四组梯度 hash 均逐 rank
+等于 c6be309。独占远端节点的反向顺序 FWD 复测，原版→D 的 wall 为
+1640.210→1629.740、3588.240→3554.950 µs，规划为
+173.568→163.424、291.264→284.032 µs；日志 `base_confirm_ep8_*` 与
+`coalesced_confirm_ep8_*`。这支持小幅收益，不表述成 GEMM 提速。
+
+未采用 E（`pf_plan_node_reservations`）：source node 计数/预约以
+`match_any` 合并同 warp 的原子操作；不改变每 token 每命中节点一个记录的
+语义，但 EP16 规划为 347.520/500.864 µs、wall 3537.020/7908.970 µs，
+未优于 D，源码已撤回。不存在“减少原子数必然更快”的采用结论。
+
+同日重新测 EP16 cached-state BWD，V3/PF c6be309 的 wall 分别为
+2851.220/2917.230（8K）、6996.810/6696.970（20K）。8K 仍回退 2.32%，
+20K 降低 4.29%；不能用其它旧轮次掩盖 8K 未达标。日志前缀
+`v3_bwd_restored`、`base_bwd_restored`。现有 Forward timeline 的一个 rank
+还显示 20K 每 CTA 平均约 5.21ms 落在 select/wait 区间，FC1/FC2 tile
+区间合计约 1.31ms；事件插桩会扰动绝对耗时，这只说明不宜将整个差距
+归为纯 GEMM 算力不足，后续仍须用生产 wall 验证候选。
+
+### F：在规划中写完永久 tape 的 route header/gate
+
+之前每条训练 route 的 72-byte `LocalP2pRouteHeader` 与 gate，都在 X Pull 的
+issuer lane 写入。它们只依赖源 rank、route、expert、canonical 行号和本次
+epoch，不依赖 X 到达，也不属于可复用的 payload slot。因此把写入移到已有
+destination 行映射构建循环，复用该处已经解出的值；原有规划 join 发布它们。
+Pull 保留物理 ring gate/X 的写入和完整 completion/credit，不能把物理 slot
+的 gate 也提前写入，否则会覆盖前代。FC1 的 SavedX/GU 保存方式没有改变。
+
+这不是减少永久 tape 的字节数，而是将不可变元数据从单 lane 的串行数据面
+移到并行控制面。删除原 `save_identity` helper 和网络 Pull 中为它广播的
+block/index；Pull 不再因训练而生成另一份函数实例。无新增 kernel、分配、
+全局同步或任务队列，inference 的空缓存合同不变。
+
+EP16/B1024/D4、1620MHz、10 warmup + 20 measured；先 F 后 D 的反向对照，
+单位 µs，rank-max p50：
+
+| T/rank | D wall | F wall | 耗时降低 | D main 规划 | F main 规划 |
+|---:|---:|---:|---:|---:|---:|
+| 8192 | 3530.850 | 3312.190 | 6.19% | 337.920 | 337.888 |
+| 20480 | 7870.230 | 7108.690 | 9.68% | 500.032 | 504.544 |
+
+F 的 device kernel 为 3035.710/6816.900 µs。相比同日恢复后的 V3 wall
+3433.490/7161.700 µs，降低 3.53%/0.74%；20K 领先仍小，必须最终配对复测，
+此处不宣布十二项全面验收。两版全部输入/route/gate/实际权重/输出 hash 一致。
+F 和 c6be309 又各自完成 EP16 T8192/20480 重复 Backward 验证，全部 16 ranks
+的 dX/dGate/dW1/dW2 hash 逐项一致，repeat_equal 均为 1。该数值检查与本地
+编译并行，**不引用其 wall 作性能证据**。完整 Torch/实际 cycle 尚待新库验证。
+
+冻结 native `build/pf_plan_checkpoint_headers/test_cuda_notify`，SHA256
+`3fded55c7ee9857c2166a172adb7a950239ff966b9ce31042e03f17b721eadf4`。
+性能日志前缀 `checkpoint_headers`、`coalesced_reverse`；梯度日志
+`{pf_plan_checkpoint_headers,pf_static_backward_final}_ep16_t*_validation.log`。
+
+F 的单机补充：独占远端节点、B512/D8 的 FWD wall 为 1543.200/3334.340 µs，
+明显优于刚才 D 的 1629.740/3554.950 µs（降低 5.31%/6.21%）。规划为
+164.544/288.224 µs，未减少规划工作；SavedX/GU 算法仍不变。两个长档的
+EP8 重复 Backward 也全部通过，与 c6be309 的四组梯度 hash 逐 rank 相同。
+本轮采用 A–D 与 F 作为 planner/immutable-header 里程碑，E 已撤回；新的
+Backward ready-residue 实验单独记录，不包含在此项收益内。

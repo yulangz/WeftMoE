@@ -295,7 +295,7 @@ __device__ __noinline__ void receive_return(const ForwardKernelArgs &a,
 
 // Plan entries are source-interleaved packet ordinals. Each worker touches
 // only its immutable residue; non-consumers never inspect reusable RX storage.
-template <bool Training, class Storage>
+template <class Storage>
 __device__ __noinline__ void
 pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
             unsigned workers, std::uint64_t window, unsigned &peer_rows) {
@@ -344,16 +344,8 @@ pull_window(const ForwardKernelArgs &a, Storage &storage, unsigned worker,
         const auto row = __shfl_sync(0xffffffffU, location.row, selected);
         const auto packet_row = __shfl_sync(0xffffffffU, token, selected);
         const auto weight = __shfl_sync(0xffffffffU, gate, selected);
-        std::uint64_t index = 0U;
-        if constexpr (Training) {
-          const auto block = __shfl_sync(
-              0xffffffffU, static_cast<unsigned long long>(location.block), selected);
-          index = block * forward_tuning::kTileM + row % forward_tuning::kTileM;
-        }
         if (lane == 0U) {
           gates[row] = weight;
-          if constexpr (Training)
-            ring::save_identity(a, index);
           asm volatile("fence.proxy.async.global;" ::: "memory");
           prefetch.copy(payload + std::uint64_t(packet_row) * a.hidden,
                         output + std::uint64_t(row) * a.hidden,

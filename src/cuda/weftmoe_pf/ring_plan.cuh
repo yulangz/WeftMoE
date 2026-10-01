@@ -29,73 +29,69 @@ __device__ __forceinline__ void finish_network(const ForwardKernelArgs &a) {
 
 // Freeze RX addressing and source directory pointers once. Runtime workers
 // visit only their packet residue, not every source/channel prefix per window.
-__device__ __forceinline__ void build_pull_packets(const ForwardKernelArgs &a,
-                                                   std::uint64_t window,
-                                                   unsigned tid,
-                                                   unsigned threads) {
+__device__ __forceinline__ void build_pull_packet(const ForwardKernelArgs &a,
+                                                  std::uint64_t window,
+                                                  std::uint64_t index) {
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto &network = a.static_network;
   const auto stride = p.shape.sources * p.packets.packets(p.shape.tokens);
   const auto local_window = window / p.shape.groups();
   const auto rail = a.rank % a.local_world_size;
-  for (auto index = std::uint64_t(tid); index < stride; index += threads) {
-    auto &out = r.pull_packets[window * stride + index];
-    out.rows = 0U;
-    const auto source = p.shape.source_begin(window) + index % p.shape.sources;
-    if (source >= p.shape.source_end(window) ||
-        source / a.local_world_size == a.node)
-      continue;
-    const auto source_windows = static_forward::ceil_div(
-        r.source_epochs[source].tokens, p.shape.tokens);
-    if (local_window >= source_windows)
-      continue;
-    const auto ordinal = index / p.shape.sources;
-    const auto lane = ordinal % p.packets.lanes;
-    const auto directory = a.node * p.packets.lanes + lane;
-    const auto *offsets =
-        source_metadata(a, source, r.dispatch.channel_offsets);
-    const auto *prefix = source_metadata(a, source, p.packet_prefix) +
-                         directory * (source_windows + 1U);
-    const auto packet =
-        offsets[directory] + prefix[local_window] + ordinal / p.packets.lanes;
-    if (packet >= offsets[directory] + prefix[local_window + 1U])
-      continue;
-    const auto count = source_metadata(
-        a, source,
-        r.dispatch.consumer_rows)[packet * a.local_world_size + rail];
-    if (!count)
-      continue;
-    const auto channel =
-        network.rings.channel(a.node, source / a.local_world_size, lane);
-    const auto *state =
-        static_cast<const static_forward::NetworkChannel *>(ncclGetLsaPointer(
-            a.gin_window,
-            network.ring_region + network.rings.state(false, channel),
-            source % a.local_world_size));
-    const auto sequence = state->rx_base + packet - offsets[directory];
-    auto *control = static_cast<static_forward::NetworkSlot *>(
-        ncclGetLsaPointer(a.gin_window,
-                          network.ring_region +
-                              network.rings.control(false, channel, sequence),
-                          source % a.local_world_size));
-    const auto desc = source_metadata(a, source, r.dispatch.packets)[packet];
-    out = {source_metadata(a, source, p.node_tokens) + desc.token_begin,
-           source_metadata(a, source, p.selected_experts),
-           source_metadata(a, source, r.source_gates),
-           source_metadata(a, source, r.locations),
-           ncclGetLsaPointer(
-               a.gin_window,
-               network.ring_region +
-                   network.rings.dispatch_payload(true, channel, sequence),
-               source % a.local_world_size),
-           &control->visible_generation,
-           &control->consumed_total,
-           sequence / network.rings.depth + 1U,
-           desc.tokens,
-           count,
-           source % a.local_world_size != rail ? count : 0U};
-  }
+  auto &out = r.pull_packets[window * stride + index];
+  out.rows = 0U;
+  const auto source = p.shape.source_begin(window) + index % p.shape.sources;
+  if (source >= p.shape.source_end(window) ||
+      source / a.local_world_size == a.node)
+    return;
+  const auto source_windows = static_forward::ceil_div(
+      r.source_epochs[source].tokens, p.shape.tokens);
+  if (local_window >= source_windows)
+    return;
+  const auto ordinal = index / p.shape.sources;
+  const auto lane = ordinal % p.packets.lanes;
+  const auto directory = a.node * p.packets.lanes + lane;
+  const auto *offsets = source_metadata(a, source, r.dispatch.channel_offsets);
+  const auto *prefix = source_metadata(a, source, p.packet_prefix) +
+                       directory * (source_windows + 1U);
+  const auto packet =
+      offsets[directory] + prefix[local_window] + ordinal / p.packets.lanes;
+  if (packet >= offsets[directory] + prefix[local_window + 1U])
+    return;
+  const auto count = source_metadata(
+      a, source,
+      r.dispatch.consumer_rows)[packet * a.local_world_size + rail];
+  if (!count)
+    return;
+  const auto channel =
+      network.rings.channel(a.node, source / a.local_world_size, lane);
+  const auto *state =
+      static_cast<const static_forward::NetworkChannel *>(ncclGetLsaPointer(
+          a.gin_window,
+          network.ring_region + network.rings.state(false, channel),
+          source % a.local_world_size));
+  const auto sequence = state->rx_base + packet - offsets[directory];
+  auto *control = static_cast<static_forward::NetworkSlot *>(
+      ncclGetLsaPointer(a.gin_window,
+                        network.ring_region +
+                            network.rings.control(false, channel, sequence),
+                        source % a.local_world_size));
+  const auto desc = source_metadata(a, source, r.dispatch.packets)[packet];
+  out = {source_metadata(a, source, p.node_tokens) + desc.token_begin,
+         source_metadata(a, source, p.selected_experts),
+         source_metadata(a, source, r.source_gates),
+         source_metadata(a, source, r.locations),
+         ncclGetLsaPointer(
+             a.gin_window,
+             network.ring_region +
+                 network.rings.dispatch_payload(true, channel, sequence),
+             source % a.local_world_size),
+         &control->visible_generation,
+         &control->consumed_total,
+         sequence / network.rings.depth + 1U,
+         desc.tokens,
+         count,
+         source % a.local_world_size != rail ? count : 0U};
 }
 
 __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
@@ -259,7 +255,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
            w += gridDim.x)
         static_forward::build_source_window<SourceThreads, Math,
                                             kCollectiveScopeBarrier, Canonical,
-                                            Network || Training>(
+                                            Network>(
             planner, w, counts, a.dispatch.route_dst_row);
     }
   }
@@ -284,14 +280,6 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
                                Kernel, 0U, 0U, 0U);
-    if constexpr (Training)
-      if (a.checkpoint.counts.runtime) {
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsBegin,
-                                   Kernel, 0U, 0U, 0U);
-        build_training_packets(a, scratch);
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsEnd,
-                                   Kernel, 0U, 0U, 0U);
-      }
     for (auto index = worker; index < p.local_windows() * p.window_capacity();
          index += workers) {
       const auto window = index / p.window_capacity();
@@ -322,6 +310,16 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         if (node != a.node)
           network_put(a, node, base, base, a.static_network.source_bytes);
     }
+    // Backward's immutable packet/fanout tape is not part of the published
+    // Forward directory. Build it while those independent puts are in flight.
+    if constexpr (Training)
+      if (a.checkpoint.counts.runtime) {
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsBegin,
+                                   Kernel, 0U, 0U, 0U);
+        build_training_packets(a, scratch);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsEnd,
+                                   Kernel, 0U, 0U, 0U);
+      }
     // network_put assigns contiguous chunks to contexts from zero. Fence
     // every owner with a Put, but do not signal on the unused contexts.
     const auto chunks = static_forward::ceil_div(a.static_network.source_bytes,
@@ -370,6 +368,13 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     grid_sync<0U, Threads>(a);
   }
 
+  if constexpr (Network) {
+    // Packet descriptors are independent across windows. A window per CTA
+    // leaves most of the resident grid idle while decoding these addresses.
+    const auto packets = p.shape.sources * p.packets.packets(p.shape.tokens);
+    for (auto index = worker; index < r.state->windows * packets; index += workers)
+      build_pull_packet(a, index / packets, index % packets);
+  }
   for (auto w = std::uint64_t(blockIdx.x);
        (!single_window || blockIdx.x == 0U) && w < r.state->windows;
        w += gridDim.x) {
@@ -382,8 +387,6 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           seq, seq / r.contribution_depth + 1U,
           std::uint64_t(slot) * r.contribution_stride, slot};
     }
-    if constexpr (Network)
-      build_pull_packets(a, w, tid, Threads);
     for (unsigned index = tid; index < owned * p.shape.sources;
          index += Threads) {
       const auto expert = index / p.shape.sources;
@@ -525,9 +528,20 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
             static_cast<unsigned>(route), source, gate,
             static_cast<unsigned>(route / p.shape.top_k), output};
-        if constexpr (Training)
-          a.checkpoint.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] =
+        if constexpr (Training) {
+          const auto tape_row =
               source_metadata(a, source, a.checkpoint.source_rows)[route];
+          a.checkpoint.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] =
+              tape_row;
+          // These are immutable route metadata, independent of X arrival.
+          // Publish them with the plan, leaving payload issuers only the copy.
+          a.checkpoint.gates[tape_row] = gate;
+          a.checkpoint.headers[tape_row] = {
+              transport::kActivationTransportSchemaVersion, source, a.rank, 0U,
+              a.dispatch.identity.generation, execution_epoch(a), route, route,
+              route / p.shape.top_k, tape_row, a.rank * owned + expert,
+              unsigned(route % p.shape.top_k)};
+        }
         if constexpr (Network) {
           const auto block = r.window_prefix[w] + prefix[expert] +
                              row / forward_tuning::kTileM;
