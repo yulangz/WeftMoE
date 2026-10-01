@@ -125,7 +125,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         atom = (ROOT / "src/cuda/primitives/hopper.cuh").read_text()
         ring = (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
         common_macros = set(re.findall(
-            r"^#ifndef (WEFTMOE_UNIFIED_GIN_(?:CONTEXT_PROBES|PACK_SLOTS)|WEFTMOE_WGMMA_N256_ATOM_N|WEFTMOE_GIN_RING_DEPTH)$",
+            r"^#ifndef (WEFTMOE_UNIFIED_GIN_(?:CONTEXT_PROBES|PACK_SLOTS)|WEFTMOE_WGMMA_N256_ATOM_N|WEFTMOE_GIN_[A-Z0-9_]+)$",
             shared + "\n" + atom + "\n" + ring, flags=re.MULTILINE))
         cpp_macros = set(re.findall(
             r"^#ifndef (WEFTMOE_BWD_[A-Z0-9_]+)$", header + shared,
@@ -140,7 +140,7 @@ class BackwardAutotuneTest(unittest.TestCase):
         header += (ROOT / "src/cuda/unified_worker_tuning.hpp").read_text()
         header += (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
         defaults = dict(re.findall(
-            r"^#define (WEFTMOE_(?:BWD_[A-Z0-9_]+|UNIFIED_[A-Z0-9_]+|WGMMA_N256_ATOM_N|GIN_RING_DEPTH)) ([A-Za-z0-9_]+)$", header,
+            r"^#define (WEFTMOE_(?:BWD_[A-Z0-9_]+|UNIFIED_[A-Z0-9_]+|WGMMA_N256_ATOM_N|GIN_[A-Z0-9_]+)) ([A-Za-z0-9_]+)$", header,
             flags=re.MULTILINE))
         # Search order may change without changing the untuned C++ fallback.
         config = {}

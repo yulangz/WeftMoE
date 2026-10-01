@@ -7045,9 +7045,23 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 << " epoch=" << backward_epoch << " pending=" << pending
                 << " return_puts=" << s.gin_return_put_count
                 << " return_bytes=" << s.gin_return_payload_bytes
+                << " start=" << s.start_clock
+                << " du_start=" << s.fc1_start_clock
+                << " du_complete=" << s.fc1_complete_clock
+                << " dx_start=" << s.relay_blocks_done
                 << " dispatch_complete=" << s.dispatch_complete_clock
                 << " dx_complete=" << s.fc2_complete_clock
                 << " return_complete=" << s.return_complete_clock
+                << " dw2_start=" << s.backward_dw2_start_clock
+                << " dw2_complete=" << s.backward_dw2_complete_clock
+                << " dw1_start=" << s.backward_dw1_start_clock
+                << " dw1_complete=" << s.backward_dw1_complete_clock
+                << " reduce_start=" << s.backward_reduce_start_clock
+                << " reduce_complete=" << s.backward_reduce_complete_clock
+                << " sender_complete=" << s.backward_sender_complete_clock
+                << " transport_complete=" << s.backward_transport_complete_clock
+                << " return_send_complete=" << s.backward_return_send_complete_clock
+                << " return_receive_complete=" << s.backward_return_receive_complete_clock
                 << std::endl;
     };
     if (diagnostic_progress) {

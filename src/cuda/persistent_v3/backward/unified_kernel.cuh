@@ -123,6 +123,9 @@ __global__ __launch_bounds__(
       auto **source_rows = reinterpret_cast<const transport::BFloat16 **>(
                               comm.staging) + reduce_warp * kMaxTopK;
       auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      if (reduce_tid == 0U)
+        atomicMax(&status->backward_transport_complete_clock,
+                  device_globaltimer_ns());
       if (first_token < a.dispatch.identity.num_tokens && lane == 0U)
         atomicMin(&status->backward_reduce_start_clock, device_globaltimer_ns());
       for (; token < a.dispatch.identity.num_tokens;

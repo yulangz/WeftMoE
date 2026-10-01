@@ -256,8 +256,15 @@ run(const BackwardKernelArgs &a,
               atomicAdd(&status->gin_return_put_count, 1ULL);
               atomicAdd(&status->gin_return_payload_bytes,
                         task.rows * (a.hidden * 2ULL + sizeof(float)));
+              if (task.terminal)
+                atomicMax(&status->backward_return_send_complete_clock,
+                          device_globaltimer_ns());
             }
           }, [](unsigned, forward_unified_transport::GinSenderState &) {});
+      if (tid == 0U)
+        atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                       ->backward_sender_complete_clock,
+                  device_globaltimer_ns());
       return;
     }
   }

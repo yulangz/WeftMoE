@@ -152,6 +152,10 @@ __device__ __forceinline__ void initialize_status(const BackwardKernelArgs &a) {
   status->backward_dw1_complete_clock = 0ULL;
   status->backward_reduce_start_clock = ~0ULL;
   status->backward_reduce_complete_clock = 0ULL;
+  status->backward_sender_complete_clock = 0ULL;
+  status->backward_transport_complete_clock = 0ULL;
+  status->backward_return_send_complete_clock = 0ULL;
+  status->backward_return_receive_complete_clock = 0ULL;
   status->gin_return_put_count = 0ULL;
   status->gin_return_payload_bytes = 0ULL;
 }

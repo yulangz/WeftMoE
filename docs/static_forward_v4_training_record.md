@@ -1,15 +1,15 @@
 # V4 ring 训练对接记录
 
-对应设计文档 M6。默认训练仍执行 V3；M6d 接通 opt-in 单机 ring Forward，
-Backward 仍复用既有调度/GEMM；M6e进一步接通多机checkpoint和有界Backward
-GIN adapter，M6f已完成精确P_actual分配。完整训练sanitizer/性能门禁尚未完成，不能将
-inference或新Forward的门禁视为整个训练工程完成。
+对应设计文档 M6，按时间保留改造、失败候选和验证记录。
+2026-10-01 当前 PF 训练已使用 count-only mini Notify、main 内 planner、
+按实际 R/P 分配的独立 tape，以及静态 Backward；非 ring 路径保留 V3 对照。
+当前已采用到 `cf909bf`（Backward peer mapping 复用），新消融见本文末尾。
 
-当前已采用里程碑为`33d99a5`（GA + FZ），最新完整矩阵见本文末尾同名章节。
-长文Forward wall尚未超过V3：EP8约慢5.3%，EP16的B1024/D4仍慢9.6%/14.4%。
-完整数值/生命周期检查和Forward专项sanitizer已通过；旧Backward racecheck的
-libcu++共享atomic报告及工具版本限制仍保留，不能称完整训练sanitizer clean。
-后续GC/GD未采用，其它通信/纯GEMM候选见ring记录，不混入已采用版本性能。
+1620 MHz、仅验收 EP8 单机/EP16 双机的 8K/20K：FWD 已领先，BWD 的双机
+8K 仍慢约 1%；实际 50 warmup + 200 measured 循环也尚未全部领先。
+不把更早 GA+FZ 的性能或单个 GPU kernel 收益当作当前完整训练已达标。
+完整数值/生命周期检查和已有专项 memcheck 已通过；旧 Backward racecheck
+的未决报告及工具版本限制仍保留，不能称完整训练 sanitizer clean。
 
 ## M6a：按实际接收量分配 rank-private Backward 中间区
 
@@ -2546,3 +2546,145 @@ reuse 检查均通过。热点切换包含本 rank 尺寸不变、其它 rank �
 证明不能省略的全局 changed 确认没有被本地缓存命中替代。保留 M 作为已验证
 的控制面复用里程碑；200 样本的最终性能验收仍在进行，不能从集体操作数的
 减少推断所有规模已达标。
+
+N/O 的 EP16 8K/20K 四组梯度 hash 均与 c6be309 一致，repeat_equal=1，
+但相邻 BWD wall 消融（µs）为 M 2866.660/6679.420、N 2873.980/6715.170、
+O 2868.700/6713.820；V3 为 2838.730/7006.340。Reduce 尾部缩短未转化成
+总时间收益，两个候选均不保留，临时 owner-wait 开关已删除。
+
+M 的 50 warmup + 200 measured 实际循环确认（不裁剪慢样本）：
+
+| 拓扑 | tokens/rank | M wall µs | 相邻 V3 wall µs |
+|---|---:|---:|---:|
+| EP8 单机 | 8192 | 5914.704 | 6458.674 |
+| EP8 单机 | 20480 | 10614.076 | 10986.694 |
+| EP16 双机 | 8192 | 9630.475 | 9243.788 |
+| EP16 双机 | 20480 | 16630.619 | 17310.825 |
+
+单机两个长档与双机 20K 均领先，但双机 8K 尚未通过。双机 8K 的 PF/V3
+FWD API p50 为 4613.630/4795.851，BWD API 为 4288.800/4327.790；各自
+分位数不能相加代替 total 的分位数。完整循环中仍有主机尾部抖动，不用较快的
+单项或旧轮次掩盖这次 total 退步。日志 `peer_reuse_ep8_cycle_200.log`、
+`v3_peer_pair_ep8_cycle_200.log`、`peer_reuse_200_ep16_cycle_node*.log`、
+`v3_peer_pair_200_ep16_cycle_node*.log`。
+
+P（`pf_backward_activation_k128`）：激活梯度 dU/dX 改用 K128、两级 TMA，
+dW 保持 K64/三级。拆开两阶段的共享内存 stride，复用同一 arena，不把 dW
+也扩大成 K128；激活的 A 按两个 K64 swizzle slab 寻址，B 的 MN-major TMA
+box 扩成 K128。每个输出仍按原 K16 WGMMA 顺序累加，BF16 checkpoint 不变。
+该候选仅开始构建，须验证全部梯度 hash、资源用量及两种拓扑两个长档性能，
+不能仅凭 WGMMA wait 次数减半判断有收益。
+
+P 的 EP16 两个长档四组梯度 hash 与 c6be309 完全相同，repeat_equal=1；
+静态 unified kernel 仍 REG168/SHARED2048/LOCAL0，GIN STACK208。
+但 BWD wall 为 2869.920/6681.320 µs，基本等于 M 的 2866.660/6679.420；
+EP8 为 1793.470/4637.070，也未稳定超过 J/M 的算术实现。EP8 实际循环
+200 样本为 5852.751/10505.897 µs，不能将这一小幅主机差异归因于 GEMM。
+**不采用 P**，描述符、共享内存拆分、调参项均撤回；完整 Torch/sanitizer
+门禁未继续。检查既有 autotune 单测时发现两个默认宏检查漏列已有 GIN 参数，
+与 K128 项无关，单独记录，不能声明该轮单测全通过。
+
+Q（`pf_backward_dispatch_m128`，回到 M 后独立消融）：训练 main 生成的
+Backward 本地 dY 发送置换从 expert 间 32-row stripe 改为 128-row stripe，
+与激活计算消费块对齐。保持 expert 间交错，不一次排空某个 expert；只改变
+传输遍历顺序，不改变 canonical 行号、tape、K 累加或静态 compute ownership。
+候选开始构建，待验证和测量；不同时保留 P 的任何变更。
+
+Q 的 EP16 两个长档四组梯度 hash 与 c6be309 一致、repeat_equal=1。
+BWD wall 为 2860.570/6740.220 µs；8K 仅略好于 M，20K 退步，**不保留**。
+生成的本地 dY 置换恢复 32-row stripe，没有将这次尝试变成新配置项。
+上述 autotune 测试漏列已有 GIN 参数的两处正则已修正，既有 14 项全部通过，
+未新增测试用例。
+
+R（`pf_backward_owned_completion`，独立基于 M）：整块激活链只有一个
+cluster owner，省去 dU/dAB 的中间全局完成计数及 phase2/3 发布；dX 由该
+owner 直接 release 块级 ready，不再先 fetch_add。欠填充的分裂任务仍保留
+原计数和 phase 协议，TMA store、阶段间 cluster join、全本地 dX 完成门槛
+以及 Return ready 均不变。静态 dW 用自身区间终止，不再为已无消费者的
+全局 dW completed counter 做原子操作；每 CTA 缓存 dW 首尾时间戳，退出前
+汇总，保留整体计时但避免逐任务争用。候选开始构建，尚未验证或采用。
+
+R 的 EP16 8K/20K 四组梯度 hash 与 c6be309 一致，repeat_equal=1，资源无新增
+spill。BWD 为 2867.270/6678.090 µs，与 M 持平；实际 200 样本循环为
+8677.758/16346.678 µs，优于相邻更早 V3 的 9243.788/17310.825，但 native
+未改善、Forward 也未改，不能将全部循环差异归因于同步删除。**不保留 R**，
+避免为没有实测 device 收益的计时汇总引入额外共享状态和控制分支。
+
+S（`pf_backward_row_prefetch`，重新基于 M）：Backward 六处 payload 搬运
+（本地 Dispatch/Return、GIN Dispatch/Return pack、两种 Receive）复用
+Forward 的 RowPrefetchPipeline/FanoutRowPrefetchPipeline，使用两个 4KB
+staging slot。仍在 payload 全部 global-complete 后发布 ready/释放 RX credit，
+TX 的本地完成及远端 credit 均保留。Reduce 改为 warp shuffle 广播每 lane
+持有的 canonical source pointer，省去 768B shared pointer table；既有 H
+必须为 256 的倍数，保证每个 vector round 的 full-mask shuffle 都有完整
+warp。释放的 shared memory 让双槽搬运仍有机会装入原单 CTA 资源上限。
+正在构建；需要严格检查资源、数值/生命周期和性能，尚未采用。扩充既有
+BACKWARD_PROGRESS 日志的设备首尾时间戳，只在诊断开关开启时输出，不增
+device 插桩或正常路径通信。
+
+S 的 EP16 两个长档四组梯度 hash 与 c6be309 一致、repeat_equal=1，但 BWD
+wall 为 2974.690/7078.530 µs，EP8 为 1872.880/4958.270 µs，均退步。
+EP16 8K 的 Dispatch/dU/dX 虽加快，绝对时间戳显示 dW 约 1.98 ms 已结束，
+最终 Reduce 却到约 2.8 ms 才结束；单机也回退，不能直接归因于网络排空。
+**不采用 S**，双槽复制与 shuffle Reduce 均撤回，没有改变默认参数。
+下一步在 M 上增加 sender/transport retirement 时间点，区分通信收尾与
+最终归约尾部；诊断 wall 含进度轮询，不当作性能结果。
+
+M 的 retirement 诊断（`retirement_ep16_t8192_profile.log`）显示：dX 完成于
+1.70–1.81 ms，dW 于 2.05–2.17 ms，GIN sender retirement 于 2.46–2.59 ms，
+通信域退出于 2.64–2.67 ms，最终 Reduce 于 2.68–2.73 ms。各 rank 使用
+自己的 start 作原点；不能把跨 rank 时间戳相减。主要尾部在 GIN，其后的
+机内 End/credit 排空也有约 0.1 ms 串行成本，剩余 Reduce 算术并非主要原因。
+
+T（`pf_backward_early_close`）：静态 Return owner 的最后一个 M-block
+发布完成后，立即向本 CTA 的各本地 peer 发送 End，publisher warp 继续接收
+通知；GIN/Dispatch 仍可运行。通信主循环退出后再 join 所有 incoming End、
+consumed、outgoing credit，并执行原 GIN flush。把共享通知 helper 分为
+close/wait，Forward 和旧动态路径仍通过原 drain wrapper 顺序执行两步。
+无新参数、无新增 payload buffer，不改变 dW 门槛、梯度运算或 credit 语义。
+正在构建，尚未采用；必须覆盖热点/零入站及连续复用，不能只测均匀路由。
+
+T 的 EP16 两个长档四组梯度 hash 均与 c6be309 一致，repeat_equal=1，
+但 BWD wall 为 2872.930/6694.030 µs，未超过 M。**不采用 T**，close/wait
+拆分与提前 End 分支全部撤回，没有继续其完整 Torch 门禁。约 0.1 ms 的
+transport retirement 区间不能全部归因于 End 通知；改变发 End 时机没有
+带来总耗时收益。
+
+U（`pf_backward_local_vector`，重新基于 M）：只改变同一 GPU 内的 GIN TX
+Dispatch/Return 打包及 Return RX→contribution 放置。由整个 copy warp
+执行 16B 向量 load/store，复用一个 row helper，不再为这些本地搬运逐行
+等待单 lane TMA staging。跨 GPU 的 dY fanout、本地 Dispatch/Return 仍走
+原 TMA；所有线程完成 system fence 和 copy-domain join 后才发布 packed/
+ready、释放 RX credit。共享内存容量、通信包和计算顺序均不变。补充最后一个
+Return terminal Put/Receive 的时刻，区分 payload 尾部和纯协议 retirement。
+候选正在构建，尚未验证或采用。
+
+U 的 EP16 两个长档四组梯度 hash 完全一致，但 BWD wall 为
+4451.110/10616.500 µs，显著退步；资源仍为 REG168/SHARED2048/LOCAL0，
+GIN STACK208，不能只凭寄存器报告判断搬运效率。**不采用 U**，三个本地
+SIMT copy 改动撤回，保留用于定位的 terminal Put/Receive 时间戳。
+
+V（`pf_backward_receive_priority`）：仅静态网络 BWD 在本轮已接收到 GIN
+payload 时暂缓本地 Return，先持续释放 RX credit；没有收到包的下一轮再
+处理原固定 owner 的 Return。传输仍有限、静态 ownership 不变，计算和
+单机路径不变。用来验证 M128 本地 Return 是否让共享 copy warp 停收太久。
+
+W（`pf_backward_return_ports4`）：在 V 上只将现有 GIN Return ports 从 2
+调到 4；sender 配额仍 16。增加独立 Return receive owner/credit 流，不改变
+每 slot 容量、K 归约或消息含义。使用 build 内临时生成配置，尚未修改生产
+profile；V/W 都在构建，须分别验证和比较，不预记收益。
+
+V/W 的 EP16 两个长档均通过 native 重复验证；V 四组 hash 已核对与 c6be309
+完全一致。V 的 wall 为 2859.240/6663.720 µs，相比 M 仅小幅变化，8K 仍未
+达标；20K 本地 Return 区间扩至 1057.280 µs。W 为 3116.870/7247.540 µs，
+两个长档都退步。**V/W 均不采用**；恢复原先每轮推进接收和 Return 的次序，
+生产 ports 仍为 2。扩大独立通道而不增加 sender，并不保证吞吐更高。
+
+W 的两档四组 hash 随后也核对为与 c6be309 完全一致。上述失败候选没有残留
+在生产数据路径；本轮只保留诊断时间点，并提交已有调参检查的宏清单修正。
+现有调参/资源/launcher 检查共 34 项通过，没有新增细粒度测试。
+
+X1/X2 使用原 M 调度，分别测试 `(Return ports, sender CTAs)=(4,32)` 与
+`(2,32)`，对照 M 的 `(2,16)`。两个值均为既有调参项，使用 build 内临时
+profile，不新增源码分支。与 W 的比较包含撤回 V，不能单独归因为 sender
+数量变化；与 M 的比较才是这轮配置消融。尚未构建验证或采用。

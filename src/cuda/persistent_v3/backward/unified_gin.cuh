@@ -179,8 +179,13 @@ __device__ __forceinline__ void receive_return(const BackwardKernelArgs &a,
         a, reinterpret_cast<const ring::ReturnRow *>(record)->route);
   }
   copy_sync<Storage::kCopyThreads>();
-  if (tid == 0U)
+  if (tid == 0U) {
+    if (task.terminal)
+      atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                     ->backward_return_receive_complete_clock,
+                device_globaltimer_ns());
     wire::finish_receive(a, task);
+  }
   copy_sync<Storage::kCopyThreads>();
 }
 

@@ -1134,10 +1134,10 @@ expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
   与 FWD+BWD 总耗时对照冻结 V3；分别记录 1/64/8192/20480，不把 main 计时范围
   变化误记为性能收益。每个验证完的 milestone 提交。
 - [ ] 性能目标完全达成：后续按最新要求只验收 8K/20K，不再测 1/64。
-  2026-10-01 的 planner/header 优化已让 EP8/EP16 两个长档 FWD 初测领先；
-  双机 20K FWD 仅领先约 0.7%，还需最终配对复测。静态 BWD 基线的双机 8K
-  仍慢约 2.3%，新库的实际 FWD+BWD cycle 待测。不能将功能完成表述成
-  十二个长文比较项全部通过，具体样本见训练记录。
+  2026-10-01 的 planner/header 和分配确认优化已让 EP8/EP16 两个长档 FWD
+  领先；静态 BWD 的双机 8K 仍差约 1%，继续消融。单机实际循环的 50 warmup
+  + 200 measured 对照已经领先，双机循环还需同口径确认，不能选择不同候选
+  各自最快的一个规模拼出十二项全通过。具体样本见训练记录。
 
 以下内容保留为已验证历史基线；上述条目未勾选之前，不代表重构已完成。
 
@@ -1155,11 +1155,19 @@ payload 的生命周期不可混同。训练 packet/fanout 不属于发布给 Fo
 源目录，可与源目录 Put 重叠构建，但仍在原 context fence/collective 边界前
 完成。推理不建立这些训练数据；两者复用相同 main 流水及物理 planner。
 
+mini Notify 返回后实际 R/P 已知。应用入口把输入/权重准备和 tape 分配放在
+同一次 CollectiveTensorPreparation 中，然后把已绑定 tensors 交给 main；
+backend 不再对它们重复确认分配。未绑定 tensors 的原生入口仍由 backend
+分配并一致确认。旧独立 planner 时期的延迟分配 callback 已删除。保留
+单 rank 分配失败时全体报错、释放部分分配并重试的合同，不能省略这唯一
+准备边界，也不在 payload 启动后补分配。
+
 当前 Backward 的静态合同：
 
 - 有足够 M-block 时，cluster `c` 拥有 `c + n * clusters` 的完整
   `dU → SwiGLU backward/dGate → dX` 链。M128 epilogue 合为一个任务，dX
-  连续遍历全部 N tile。不足一个 cluster wave 时，改为固定 N/epilogue
+  连续遍历全部 N tile；整条链只交换一次任务描述符，保留阶段间数据完成同步。
+  不足一个 cluster wave 时，改为固定 N/epilogue
   residue 以利用空闲 cluster；两种情况都没有动态 claim。
 - Dispatch 的系统域 acquire 确认 dR 的有效行全部就绪后，由唯一 publisher
   release 发布该 M-block。计算 owner 的 dX store 完成后发布块级完成标记；
@@ -1176,6 +1184,18 @@ payload 的生命周期不可混同。训练 packet/fanout 不属于发布给 Fo
   32-row expert 交错的 dY dispatch 索引，通信遍历顺序不改变 dW 归约顺序。
   算术、TMA maps、BF16 checkpoint 和逐行 dGate 的 FP32 shuffle tree 复用
   V3；非 ring 路径继续使用原动态 Backward，保留清晰的回归对照。
+- 通信 warp 暂时无 Dispatch/Receive/Return 工作时，可以非阻塞尝试本 warp
+  固定 token residue 的 Reduce；全部 top-k ready 才归约，否则立即继续通信。
+  独立 pointer table 不覆盖活跃 TMA staging。传输退休后从原 cursor 继续，
+  不重复归约、不等待缺失的 contribution 来阻塞通信。
+
+Backward peer workspace 属于执行 slot，不是 live tape。跨调用实际 rows/routes
+不变时可以复用其地址与 IPC 映射，但必须是**全 rank 一致**的复用决策。
+既有分配确认的 uint64 状态字编码为
+`(failure_rank_or_world << 1) | !changed`，一次 MIN 同时保留最低失败 rank
+和无失败时的 any-changed。只有无人变化才跳过地址 AllGather/import 确认；
+任一 rank 扩缩容仍执行原完整协议，旧 imports 全部关闭后才释放旧 export。
+不因此扩大实际缓存、保留历史热点 payload，或跳过 device readiness/credit。
 
 Router 梯度放在 SwiGLU epilogue，避免另读一遍 gate/up。记保存的两个投影为
 `A/B`、选中专家的 routing weight 为 `p`、`S = SiLU(A) * B`：先做

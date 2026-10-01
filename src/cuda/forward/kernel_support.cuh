@@ -263,6 +263,10 @@ struct TransportDeviceStatus {
   unsigned long long backward_dw1_complete_clock;
   unsigned long long backward_reduce_start_clock;
   unsigned long long backward_reduce_complete_clock;
+  unsigned long long backward_sender_complete_clock;
+  unsigned long long backward_transport_complete_clock;
+  unsigned long long backward_return_send_complete_clock;
+  unsigned long long backward_return_receive_complete_clock;
   unsigned long long wgmma_instructions;
   unsigned long long tma_loads;
   unsigned long long tma_multicast_loads;
