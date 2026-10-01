@@ -220,8 +220,13 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     grid_sync(a);
   }
   if constexpr (Training)
-    if (a.checkpoint.counts.runtime)
+    if (a.checkpoint.counts.runtime) {
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, blockIdx.x == 0U && threadIdx.x == 0U,
+                                 TrainingRowsBegin, Kernel, 0U, 0U, 0U);
       build_training_rows(a, scratch);
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, blockIdx.x == 0U && threadIdx.x == 0U,
+                                 TrainingRowsEnd, Kernel, 0U, 0U, 0U);
+    }
   const auto tid = threadIdx.x;
   const auto worker = std::uint64_t(blockIdx.x) * Threads + tid;
   const auto workers = std::uint64_t(gridDim.x) * Threads;
@@ -277,11 +282,16 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   }
   if constexpr (Network) {
     grid_sync<0U, Threads>(a);
-    if constexpr (Training)
-      if (a.checkpoint.counts.runtime)
-        build_training_packets(a, scratch);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanSourceReady,
                                Kernel, 0U, 0U, 0U);
+    if constexpr (Training)
+      if (a.checkpoint.counts.runtime) {
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsBegin,
+                                   Kernel, 0U, 0U, 0U);
+        build_training_packets(a, scratch);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsEnd,
+                                   Kernel, 0U, 0U, 0U);
+      }
     for (auto index = worker; index < p.local_windows() * p.window_capacity();
          index += workers) {
       const auto window = index / p.window_capacity();

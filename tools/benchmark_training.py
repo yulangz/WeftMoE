@@ -19,7 +19,7 @@ from weftmoe.runtime import TensorRuntime
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("pf", "v3"), required=True)
-    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 64, 8192, 20480])
+    parser.add_argument("--tokens", type=int, nargs="+", default=[8192, 20480])
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--hidden", type=int, default=2048)

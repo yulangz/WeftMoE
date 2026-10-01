@@ -2188,3 +2188,102 @@ library 为 `5e1d15a9fc7d12741966d39971d295d95b270217a50ca80a2243ee1b11f7bda2`�
 inference/Graph 生命周期检查通过。使用 B1024/D4，未改变 ring 容量来容纳
 整段上下文；永久 tape/Backward 实际行数工作区则按需扩容。日志为
 `build/pf_static_backward_final/torch_ep16_hotspot_t20480_node{0,1}.log`。
+
+## 长文差距复核与下一轮测量边界（2026-10-01）
+
+后续只验收 T8192/20480：单机 EP8、双机 EP16 的训练 Forward、Backward 和
+实际 FWD+BWD cycle 都要优于 V3，共十二个比较项。已有单机收益不能替代
+双机验收；`tools/benchmark_training.py` 默认也改为这两个长档。
+
+### 原始日志暴露出的规划成本
+
+重新解析上述 adaptive 目录的 `v3_ep16_t*_forward.log` 与 weighted 目录的
+`pf_ep16_t*_b1024_forward.log`，没有运行新的 GPU 实验。双机汇总脚本原先
+遗漏了 native 已输出的 `device_kernel`、`route_exchange`、`before_combine`、
+`after_combine`；现在保留这些字段，旧二进制没有对应字段时仍可汇总。
+
+单位 µs，仍是每轮最慢 rank 再取 p50；各列独立统计，不能直接相加减：
+
+| T/rank | 版本 | Notify | device kernel | main 内规划/交换 | 去除规划后的 device 时间 | main 末尾 rendezvous 区间 |
+|---:|---|---:|---:|---:|---:|---:|
+| 8192 | V3 | 468.316 | 2852.860 | 0 | 2852.860 | 未单独计时 |
+| 8192 | PF | 184.574 | 3334.660 | 397.856 | 2944.064 | 313.088 |
+| 20480 | V3 | 508.014 | 6570.500 | 0 | 6570.500 | 未单独计时 |
+| 20480 | PF | 187.504 | 7621.410 | 555.648 | 7072.834 | 338.048 |
+
+“去除规划”先在**同一 rank、同一次调用**内计算
+`device_kernel - route_exchange`，然后取该轮 rank-max 和跨轮 p50，不是
+两列 p50 相减。V3 的路由规划在 Notify，不是没有规划成本。
+另一个口径差异是旧表的 `forward`：V3 使用 CUDA event 的总时间，PF 使用
+device status 的 kernel 时间。比较 kernel 本身应使用这里共同的
+`device_kernel`，端到端验收继续用原来的 wall/cycle。
+
+由此可以定位、但还不能完全归因：8K 的 device 差距主要集中在 main 内规划；
+20K 去除规划后仍有约 502 µs 差距，不能只优化 planner 就宣布目标达成。
+PF Dispatch/FC1/FC2/Return 的整段跨度包含等待且互相重叠，不代表实际 GEMM
+用时翻倍。末尾 `after_combine` 从 CTA 0 的通信角色到达开始计时，还包括
+等待其它 CTA 和其它 rank 的尾部，不能把 313/338 µs 全算成网络 barrier 的
+纯指令开销，更不能直接删除保护下次调用元数据复用的 rendezvous。
+
+### 源码证据与诊断补齐
+
+V3 训练也会保存 X 和 G/U，不能将差距归因为 PF 独有的整份 checkpoint
+流量。实际差异是写回几何和指令路径：V3 完整 M 块的 SavedX 连续 TMA
+写回；双机 PF 的 ring 物理行与 canonical tape 行不同，SavedX 使用 math
+线程的 uint4 scatter，G/U 同样按 canonical 行映射写回。它们与 WGMMA
+共享 stage 的读生命周期，必须全部读完才能归还 empty。单机的连续行 TMA
+路径不能无条件搬到双机。
+
+现有 timeline 的 `RingPlanBegin` 在 `build_training_rows` 之后，无法直接
+看见训练行号重建；`RingPlanSourceReady` 又落在训练 packet 重建之后。
+schema 13 增加 `TrainingRowsBegin/End`、`TrainingPacketsBegin/End`，并将
+SourceReady 放回 source 目录就绪的边界。分析工具分别报告 `training_rows`
+和 `training_packets`；后者包含在新的 `ring_plan_packets` 区间中，不能重复
+累计。旧 schema 的 source/packets 分段边界不同，不能直接作为单项对照。
+所有事件均受 `WEFTMOE_DEVICE_TIMELINE` 编译宏控制，不增加生产同步或任务。
+
+下一轮先拆清 canonical 行重建、训练 packet 重建、ring 目录交换、destination
+几何这四项，再决定 planner 改动；随后比较 retained/non-retained 的 math 与
+epilogue，并检查 Return credit 引起的计算等待。历史 GC/GD 的 source 分组/
+M16 TMA、AJ 的 wait1、GK 的两 K-stage group 合并都没有稳定收益，不能把
+这些旧实验重新包装成已证实的优化。Backward 8K 还需独立处理，保持全部
+本地 dX 完成后才进入 dW 的约束。
+
+本轮环境没有暴露 `/dev/nvidiactl`、`/dev/nvidia0`，`nvidia-smi` 无法访问
+驱动；SSH 创建 socket 被拒绝，`.git` 为只读。上述结论来自已保存日志和
+源码，不是新的性能结果；未修改生产计算/通信算法，也未提交新的性能收益。
+
+离线验证：PF profile 的 timeline native 完整编译通过，产物为
+`build/pf_training_timeline/test_cuda_notify`，SHA256
+`adce0eb6a77047bf6b50ab260d274e3bcb94e9176d451814db3beccbd4cf3f28`。
+四份 EP16 长文原始日志重新汇总后，全部旧 JSON 指标逐项不变；缺少新增字段
+的旧格式兼容检查、新事件区间解析及 Python 语法检查通过。未新增细碎单测，
+未运行 GPU 性能或数值验证；诊断版不能代替生产二进制做最终性能验收。
+
+继续核查 planner 的数据依赖：`build_training_packets` 只读取本地 source
+目录、selected experts 和 canonical route 行号，写入 Notify lease 的
+Backward packet/fanout、packet order 及 runtime counts。Forward 的
+`build_dispatch_packets`/`build_return_packets` 使用独立的 ring 目录；训练
+packet 重建的输出不在 `make_source_metadata_layout` 的 published 区间中。因此下一项
+可测候选是将训练 packet 重建移到 metadata Put 提交后、对应 context 的 Put
+fence 之前，尝试隐藏这段重建时间。仍需保持全体 CTA 的一致 collective
+顺序和 scratch 生命周期，不删除 fence，也不延迟到 main 返回之后。
+这是源码依赖分析，尚未改动调用顺序或验证收益；GPU/SSH 访问仍受限。
+
+### 环境恢复后的 planner timeline
+
+2026-10-01 恢复 GPU、SSH 和 Git 写权限，两节点各八张 L20X 均空闲且
+SM 时钟为 1620MHz。使用上述 schema 13 诊断版，EP16/B1024/D4，保留
+训练状态，12 轮（10 warmup），两个长档全部完成。各 rank 最后一次调用
+的区间时长取跨 rank 中位数，单位 µs；只用于定位，不作为生产性能：
+
+| T/rank | 训练行号 | 训练 packet | source 规划 | packet 规划总段 | 目录交换 | destination 几何 | 行映射绑定 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 60.896 | 27.616 | 86.384 | 69.856 | 59.328 | 64.512 | 42.592 |
+| 20480 | 75.824 | 31.600 | 115.360 | 78.944 | 103.648 | 87.488 | 84.976 |
+
+训练 packet 包含在 packet 总段内，不能重复相加。32 份 trace 均无 overflow；
+文件为 `build/pf_training_timeline/ep16_t{8192,20480}.rank*.forward.json`。
+首次具体消融选择缩小训练行号 radix sort 的 bit 范围：输入按 route ordinal
+递增，已安装 CUB 的 BlockRadixSort 保证稳定性，只排 expert 位即可保持完整
+行序；随后再独立测训练 packet 与目录 Put 的重叠，不混淆两个改动的收益。

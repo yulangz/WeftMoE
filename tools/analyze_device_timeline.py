@@ -87,9 +87,15 @@ EVENTS = {
     101: "ring_plan_ready",
     102: "return_packet_ready",
     103: "return_put_start",
+    104: "training_rows_begin",
+    105: "training_rows_end",
+    106: "training_packets_begin",
+    107: "training_packets_end",
 }
 
 PAIRS = {
+    "training_rows": (104, 105),
+    "training_packets": (106, 107),
     "ring_plan_source": (96, 97),
     "ring_plan_packets": (97, 98),
     "ring_plan_exchange": (98, 99),

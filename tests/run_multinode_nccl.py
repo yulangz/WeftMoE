@@ -75,8 +75,10 @@ def aggregate_gin_benchmark(outputs):
         "wall", "notify", "forward", "dispatch", "fc1", "fc2", "return",
         "reduce", "fc1_fc2_overlap", "fc2_return_overlap",
         "return_reduce_overlap", "terminal_status_agreement")
-    if all("buffer_prepare" in item for item in records):
-        stage_keys += ("buffer_prepare",)
+    stage_keys += tuple(
+        key for key in ("buffer_prepare", "device_kernel", "route_exchange",
+                        "before_combine", "after_combine")
+        if all(key in item for item in records))
     measured = None
     for rank, record in enumerate(records):
         if record.get("backend") != "gin-rdma":
