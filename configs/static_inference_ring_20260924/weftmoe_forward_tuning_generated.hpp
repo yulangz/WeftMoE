@@ -12,3 +12,7 @@
 #define WEFTMOE_BWD_UNIFIED_WORKERS 1
 #define WEFTMOE_BWD_RELAY_CTAS 16
 #define WEFTMOE_BWD_UNIFIED_RDMA_CTAS 16
+// Long-sequence static Backward: keep the 64512-register CTA budget while
+// reducing the GIN control path's stack footprint. Forward quotas stay intact.
+#define WEFTMOE_BWD_UNIFIED_MATH_REGISTERS 208
+#define WEFTMOE_BWD_UNIFIED_CONTROL_REGISTERS 88

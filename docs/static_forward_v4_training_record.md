@@ -3,10 +3,11 @@
 对应设计文档 M6，按时间保留改造、失败候选和验证记录。
 2026-10-01 当前 PF 训练已使用 count-only mini Notify、main 内 planner、
 按实际 R/P 分配的独立 tape，以及静态 Backward；非 ring 路径保留 V3 对照。
-当前已采用到 `cf909bf`（Backward peer mapping 复用），新消融见本文末尾。
+当前已采用 `cf909bf`（Backward peer mapping 复用）及本文末尾 Y2 的
+208/88 Backward 寄存器配额，Forward 配额不变。
 
 1620 MHz、仅验收 EP8 单机/EP16 双机的 8K/20K：FWD 已领先，BWD 的双机
-8K 仍慢约 1%；实际 50 warmup + 200 measured 循环也尚未全部领先。
+8K 已接近 V3；实际 50 warmup + 200 measured 循环尚未全部领先。
 不把更早 GA+FZ 的性能或单个 GPU kernel 收益当作当前完整训练已达标。
 完整数值/生命周期检查和已有专项 memcheck 已通过；旧 Backward racecheck
 的未决报告及工具版本限制仍保留，不能称完整训练 sanitizer clean。
@@ -2688,3 +2689,67 @@ X1/X2 使用原 M 调度，分别测试 `(Return ports, sender CTAs)=(4,32)` 与
 `(2,32)`，对照 M 的 `(2,16)`。两个值均为既有调参项，使用 build 内临时
 profile，不新增源码分支。与 W 的比较包含撤回 V，不能单独归因为 sender
 数量变化；与 M 的比较才是这轮配置消融。尚未构建验证或采用。
+
+X1/X2 均通过 EP16 两个长档 native 重复验证，BWD wall 分别为
+3302.000/7997.390 和 3032.180/7416.470 µs，均退步。**不采用 X1/X2**，
+生产仍使用 2 ports/16 senders。更多 sender 减少 receiver 数，并改变同
+CTA 中通信/计算的资源竞争，不能把增加并行度直接等同于更高吞吐。
+
+Y1/Y2 重新使用原 2 ports/16 senders，分别消融 math/control 寄存器配额
+`216/72`、`208/88`，对照原 `216/64`。384-thread CTA 初始寄存器预算为
+`168*384=64512`；原配置用 `216*256+64*128=63488`，Y1 只使用剩余的 1024
+个寄存器，不降低 math 配额；Y2 则显式测试向通信/producer 再倾斜的取舍。
+两者均使用既有参数和 build 内配置，不改 GEMM 的 MNK、归约顺序或协议。
+尚未构建、验证或采用。
+
+Y1/Y2 的 EP16 两个长档 native 重复验证通过。BWD wall 分别为
+2846.080/6636.550、2840.620/6615.600 µs；原 M 为 2866.660/6679.420。
+静态 GIN 栈由 208B 降为 152B/72B，静态单机仍 0B；不能将 LOCAL0 当成
+没有任何栈访问的证明。Y2 的 8K device kernel 为 2713.950 µs，相邻更早 V3
+为 2717.220，但 wall 为 2840.620 vs 2838.730，仍应称接近，不能宣告全面
+领先。下一步核对 Y2 的单机性能，生产寄存器配置尚未修改。
+
+Z（`pf_backward_early_rx_flush`，基于 Y2）：静态网络 BWD 的 receiver
+在自己负责的 Dispatch/Return RX channels 全部收到 terminal 后，即执行
+原有 ACK flush，不再统一拖到本 rank 的所有 sender 退出、机内通知排空
+之后。该 CTA 不再有后续 ACK，仍可继续自己的本地 Return；其它 CTA 的
+payload、计算和 Return 可并行推进。每个 receiver 仍只 flush 一次，末尾
+保留尚未执行时的原 drain；动态路径、每槽 credit/TX local counter 均不变。
+不删除任何完成检查，也不增加 packet buffer。候选待构建验证。
+
+Y1/Y2 的 EP16 两档、Y2 的 EP8 两档，所有 rank 的四组梯度 hash 均已
+核对为与 c6be309 完全一致，repeat_equal=1。Y2 的 EP8 BWD 为
+1774.260/4592.870 µs，相邻 V3 为 2127.020/5050.010 µs，耗时降低
+16.59%/9.05%；没有单机回退。
+
+Z 的 EP16 两档 native 重复验证通过，BWD 为 2838.350/6662.720 µs。
+8K 相比 Y2 持平，20K 退步约 0.7%，没有消除关键路径。**不采用 Z**，
+提前 flush 分支和状态均撤回，仍在原 drain 点执行完整 ACK flush。
+
+AA1/AA2 以 Y2 为基础，将已有 Backward sender CTA 配额由 16 分别改为
+8/12，其余参数和代码保持不变。目的是检查较少 sender 能否改善它们与
+计算、receiver 的竞争；不是继续增加通道。仅 build 内配置消融，尚未采用。
+
+AB 将 Y2 的 math/control 配额进一步改为 200/104，CTA 总预算仍 64512，
+sender 仍 16。用于寻找 Y2 收益的边界，不能由栈大小直接推断速度。
+
+Y2 的 EP16 T8192/20480 完整 Torch 回归均通过：每档 16 ranks 的 output、
+dX/dGate/dW1/dW2 parity，非法/重复 route 拒绝，分配失败 ordinal 3/5
+一致失败后重试，三份 live tape 热点/扩缩容，以及 EP8 subgroup inference
+graph/offload。每档 48 个 peer-reuse marker；已有 CPU 检查 34 项通过，
+未新增细粒度测试。Z 的四组 hash 也已确认与 c6be309 完全一致。
+
+AC（`pf_backward_launch_cache`，基于 Y2）复用已有 backend 的
+`prepare_unified_launch`：同一 kernel、资源配额、启动几何只检查一次寄存器
+预算、设置 shared-memory/stack 并查询 cluster occupancy。统一 Backward
+不再为不会启动的 split kernels 设置属性；首次检查和驻留门槛仍保留。
+不增加新缓存类型，不改设备工作/通信或数学顺序。该消融属于 host 提交开销，
+CUDA event 区间也可能包含 host 未提交后续 kernel 的空隙，不能称纯 GEMM
+加速。正在构建和验收，尚不预记收益。
+
+Y2 经上述长文回归后采用到 checked-in H2048/I512 profile；不是修改所有
+模型的通用默认值。其 EP8 实际训练循环（50 warmup + 200 measured）为
+5947.5945/10442.4655 µs，较此前相邻 V3 的 6458.6735/10986.6935 更快。
+仍需对最终组合进行完整配对，不能拼接不同候选的最优单项宣告目标完成。
+AA1/AA2/AB 均已通过 EP16 两档 native 重复验证，全部 hash 与 c6be309
+一致；两机 16 卡于 08:08 UTC 复查均为 1620 MHz，开始独占性能比较。

@@ -12,7 +12,7 @@ python3 build_native.py lib --jobs 8 --output build/static_v4_profiles_20260924/
 ```
 
 ring 仍显式启用。该配置已接通 inference 及训练 ring Forward；训练保存
-canonical checkpoints，衔接既有 Backward。不启用 ring 时保持原路径：
+canonical checkpoints，衔接静态 Backward。不启用 ring 时保持原路径：
 
 ```sh
 export WEFTMOE_STATIC_RING_TOKENS=512
@@ -34,5 +34,14 @@ FO将其不变目的地址移出K循环；均不改变inference计算代码。�
 FT将完整M128的FC1 S改为TMA写回，沿用B scratch与完成链；单机20K约快
 0.3%–0.5%，双机及训练持平，没有改窗口、packet或GEMM超参。
 仍未达到全面领先V3的性能目标。
+
+2026-10-01 的训练路径使用 count-only mini Notify、按实际 R/P 分配 tape，
+planner 进入共享 PF main。静态 BWD 在全部本地 dX 完成后才允许 dW；
+Return/Reduce 独立推进。当前 H2048/I512 profile 的 BWD math/control
+寄存器配额为 208/88，sender CTA 仍 16；Forward 的配额不变。这是长文
+实测配置，不作为其它模型的通用最优值。对应训练记录末尾 Y2：EP8/EP16
+两档梯度 hash、长文完整 Torch/多 tape/失败重试通过，双机 8K BWD 与 V3
+接近，完整训练性能门禁仍在继续。
+
 权重原地更新前须调用 `invalidate_inference_layer` 并重建相应 graphs；
 完整合同见[设计第 10 节](../../docs/static_forward_v4_design.md)。
