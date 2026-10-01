@@ -83,8 +83,8 @@ class Runtime {
     const auto ring_tokens = tuning.contains("window_tokens")
         ? tuning["window_tokens"].cast<unsigned>()
         : ring_setting ? std::stoul(ring_setting) : 0U;
-    training_ring_ = training && ring_tokens;
-    if (training_ring_) {
+    const bool training_ring = training && ring_tokens;
+    if (training_ring) {
       // Only canonical routing/scheduler metadata uses this worst-case
       // capacity. X/S stay bounded; saved tensors and Backward payload use R.
       if (max_tokens > UINT32_MAX / top_k / world)
@@ -113,7 +113,7 @@ class Runtime {
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
         {config_, max_tokens, 8192, max_saved, 4,
-         fused_inference_, training_ring_});
+         fused_inference_, training_ring});
     if (!WEFTMOE_ENABLE_GIN_RDMA && nodes != 1)
       throw std::invalid_argument(
           "this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and supports a "
@@ -256,12 +256,6 @@ class Runtime {
     BFloat16ActivationLease input;
     ForwardWeightLease weights;
     ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
-    const auto allocate_outputs = [&] {
-      tape->output = empty({tokens, hidden_}, "bfloat16");
-      ForwardTensorBuffers buffers;
-      buffers.output = binding(tape->output);
-      return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers, allocator());
-    };
     prepare_tensors([&] {
       input = producer.publish_activations(
           static_cast<const transport::BFloat16 *>(pointer(x)),
@@ -271,11 +265,14 @@ class Runtime {
           static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
           config_.num_experts / config_.topology.world_size,
           rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
-      if (!training_ring_)
-        fc.tensors = allocate_outputs();
+      // Mini Notify already supplies the exact tape size. Prepare inputs and
+      // saved tensors under one allocation agreement before entering main.
+      tape->output = empty({tokens, hidden_}, "bfloat16");
+      ForwardTensorBuffers buffers;
+      buffers.output = binding(tape->output);
+      fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc,
+                                           buffers, allocator());
     });
-    if (training_ring_)
-      fc.prepare_tensors = allocate_outputs;
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
@@ -517,7 +514,7 @@ class Runtime {
   }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
-  bool training_, fused_inference_ = false, training_ring_ = false;
+  bool training_, fused_inference_ = false;
   cudaStream_t stream_;
   cudaEvent_t input_ready_ = nullptr;
   RuntimeConfig config_;

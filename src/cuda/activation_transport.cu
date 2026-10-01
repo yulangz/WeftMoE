@@ -4487,8 +4487,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   if (state->layout.static_ring.depth &&
       (!static_v4_candidate || (!fused_inference_routes && !training_ring)))
     throw std::invalid_argument("ring workspace requires static Forward");
-  if (config.prepare_tensors && (!training_ring || config.tensors))
-    throw std::invalid_argument("deferred tape allocation requires training ring without bound tensors");
   if (training_ring) {
     if (fused_inference_routes || (view.runtime && !training_counts.runtime))
       throw std::invalid_argument(
@@ -4526,11 +4524,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     std::to_string(view.sizes.owned_expert_count),
                     std::to_string(weight.owned_experts));
   ForwardTensorStorage tensors;
+  const bool allocate_training_tape = training_ring && !config.tensors;
   const auto prepare_storage = [&] {
     if (config.tensors)
       tensors = config.tensors;
-    else if (config.prepare_tensors)
-      tensors = config.prepare_tensors();
     else
       tensors = prepare_forward_tensors(dispatch, backend->execution, config);
     if (!tensors)
@@ -4552,7 +4549,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     tensor_storage_detail::validate_input_disjoint(writes, weight.w1, 2 * w2_bytes);
     tensor_storage_detail::validate_input_disjoint(writes, weight.w2, w2_bytes);
   };
-  if (!training_ring)
+  if (!allocate_training_tape)
     prepare_storage();
 
   auto flight = std::make_shared<OperatorFlight>(lease, false);
@@ -4949,7 +4946,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.checkpoint.headers = static_cast<LocalP2pRouteHeader *>(data.headers->data);
     args.saved_rows = data.rows;
   };
-  if (!training_ring)
+  if (!allocate_training_tape)
     bind_storage();
   args.retain_backward_state = config.retain_backward_state;
   args.forward_task_claim_offset = layout.forward_task_claim;
@@ -5332,12 +5329,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 "V4 unified resident grid", id.calling_rank,
                 std::to_string(forward_main_compute_ctas) + " resident CTAs",
                 std::to_string(max_active_clusters) + " resident clusters");
-          if (training_ring) {
+          if (allocate_training_tape) {
             try {
               state->forward_tensor_preparation->run([&] {
-                // Materialized Notify already supplies exact canonical R/P.
-                // No physical ring plan or payload starts before all ranks
-                // have prepared their independent tape.
+                // Only backend-owned allocation needs an agreement here.
+                // Bound tensors were prepared collectively by the caller.
                 prepare_storage();
                 bind_storage();
               });

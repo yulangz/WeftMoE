@@ -170,6 +170,9 @@ struct ForwardMegaKernelConfig {
   // consumed by Forward's SwiGLU. The pool must have been constructed with
   // enable_backward_state=true.
   bool retain_backward_state = false;
+  // Caller-owned storage is prepared before entering Forward. Distributed
+  // callers must agree allocation failures before any rank starts execution.
+  // With no binding, the training-ring backend allocates/agrees the tape.
   ForwardTensorStorage tensors{};
   // The replay stream itself orders output consumers and serialized workspace
   // reuse, so observable events can be recorded once during graph release.
@@ -180,10 +183,6 @@ struct ForwardMegaKernelConfig {
   // must be provided together; training and the legacy split paths reject them.
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
-  // Training ring: allocate from materialized Notify's actual rows, before
-  // physical ring planning or activation traffic. The callback is rank-local;
-  // allocation failure is agreed collectively. Mutually exclusive with tensors.
-  std::function<ForwardTensorStorage()> prepare_tensors;
 };
 
 class ForwardWeightLease {

@@ -2504,3 +2504,16 @@ M（`pf_backward_peer_reuse`，基于 K，仍用 dispatch batch 64）：Backward
 不能凭本 rank 未变就自行跳过 collective。exact-shape 策略不变，不保留历史
 热点的大 payload。稳态新调用的这部分主机 collective 从三次减到一次；
 不是删除 main 的通信完成同步。尚未验证或测得收益。
+
+K 的 EP16 T20480 完整 Torch 检查也通过；两个长档每项有 16 个 rank 的
+parity/retry/rejection/graph 完成标记，以及 48 个 live-tape reuse 标记。
+EP8 T8192 的 FWD+重复 BWD 通过 compute-sanitizer memcheck，梯度 hash 与
+原版一致。首次启用 API 错误报告时，NCCL 初始化的 `cudaFuncGetAttributes`
+和 `cudaGetLastError` 返回 `cudaErrorNoKernelImageForDevice` 被记为 41 次 API
+错误；保留该失败日志。重跑仅关闭 API 错误报告（`--report-api-errors no`），
+内存访问检查保留且退出码为 0；不宣称首次检查通过或所有 CUDA API 无错误。
+
+K 独占远端节点的 native FWD 为 1499.550/3254.340 µs，前一版本 F 为
+1543.200/3334.340；device GEMM 不变，收益来自避免已绑定 tensors 的重复确认。
+实际 EP8 cycle 为 5942.059/12007.974 µs，20K 主机波动明显、没有全面领先，
+继续保留全部样本并测 M，不根据单次快的循环作最终验收。
