@@ -1135,7 +1135,7 @@ expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
   变化误记为性能收益。每个验证完的 milestone 提交。
 - [ ] 性能目标完全达成：后续按最新要求只验收 8K/20K，不再测 1/64。
   2026-10-01 的 planner/header 和分配确认优化已让 EP8/EP16 两个长档 FWD
-  领先；静态 BWD 的双机 8K 仍差约 1%，继续消融。单机实际循环的 50 warmup
+  领先；208/88 寄存器配额使静态 BWD 的双机 8K 接近 V3，继续消融。单机实际循环的 50 warmup
   + 200 measured 对照已经领先，双机循环还需同口径确认，不能选择不同候选
   各自最快的一个规模拼出十二项全通过。具体样本见训练记录。
 
@@ -1196,6 +1196,11 @@ Backward peer workspace 属于执行 slot，不是 live tape。跨调用实际 r
 和无失败时的 any-changed。只有无人变化才跳过地址 AllGather/import 确认；
 任一 rank 扩缩容仍执行原完整协议，旧 imports 全部关闭后才释放旧 export。
 不因此扩大实际缓存、保留历史热点 payload，或跳过 device readiness/credit。
+
+Backward 与 Forward 共用 backend 的 launch 准备缓存，按 entry、资源配额
+与启动几何复用已通过的寄存器、shared-memory/stack 和 occupancy 检查。
+首次检查仍完整执行，统一 BWD 不设置不会启动的 split kernel 属性；不缓存
+路由或 tensor 地址，不改变跨调用数据/通信完成边界。
 
 Router 梯度放在 SwiGLU epilogue，避免另读一遍 gate/up。记保存的两个投影为
 `A/B`、选中专家的 routing weight 为 `p`、`S = SiLU(A) * B`：先做

@@ -230,8 +230,7 @@ struct ActivationMegaKernelBackendState {
 
   // Function attributes, stack limits and cooperative-cluster occupancy are
   // invariant for a backend's device/context and a fixed kernel geometry.
-  // Avoid repeating these driver queries after forward_start on every small
-  // Forward invocation.
+  // Avoid repeating these driver queries on every Forward/Backward invocation.
   template <class Resources = void>
   cudaError_t prepare_unified_launch(const void *kernel,
                                      std::size_t dynamic_smem,
@@ -6661,26 +6660,28 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
           : backward_tuning::kDwTileN;
   constexpr auto kPersistentSmem =
       backward_compute_detail::dynamic_shared_bytes<kStorageTileN>();
-  internal::throw_cuda(
-      "backward-run",
-      cudaFuncSetAttribute(
-          backward_local_transport_kernel,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(kPersistentSmem)),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts,
-      "reserve one SM per Backward Relay CTA");
-  internal::throw_cuda(
-      "backward-run",
-      cudaFuncSetAttribute(
-          backward_local_compute_kernel<backward_tuning::kDabTileN,
-                                        backward_tuning::kDxTileN,
-                                        backward_tuning::kDwTileN>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(kPersistentSmem)),
-      identity.rank, identity.world, "backward", identity.generation,
-      ExchangeKind::ExpertCounts,
-      "set persistent Backward compute shared memory");
+  if constexpr (!backward_tuning::kUnifiedWorkers) {
+    internal::throw_cuda(
+        "backward-run",
+        cudaFuncSetAttribute(
+            backward_local_transport_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kPersistentSmem)),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts,
+        "reserve one SM per Backward Relay CTA");
+    internal::throw_cuda(
+        "backward-run",
+        cudaFuncSetAttribute(
+            backward_local_compute_kernel<backward_tuning::kDabTileN,
+                                          backward_tuning::kDxTileN,
+                                          backward_tuning::kDwTileN>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kPersistentSmem)),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts,
+        "set persistent Backward compute shared memory");
+  }
   const auto x_map = make_bf16_tma_map_mn(
       saved.rows ? saved.x->data : at<void>(slot.device, layout.canonical_rows),
       config.hidden_size, std::max<std::uint64_t>(saved.rows, 1),
@@ -6850,16 +6851,13 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 backward_tuning::kDxTileN, backward_tuning::kDwTileN, false>;
     }();
     const auto smem = backward_unified_detail::shared_bytes();
+    int clusters = 0;
     internal::throw_cuda("backward-run",
-        retained.backend->validate_unified_register_pool<backward_tuning::UnifiedResources>(
-            reinterpret_cast<const void *>(kernel)),
+        retained.backend->prepare_unified_launch<backward_tuning::UnifiedResources>(
+            reinterpret_cast<const void *>(kernel), smem, compute_ctas,
+            backward_tuning::kUnifiedThreads, 2U, false, false, &clusters),
         identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "validate unified Backward register pool");
-    internal::throw_cuda("backward-run",
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(smem)),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "set unified Backward shared memory");
+        ExchangeKind::ExpertCounts, "prepare unified Backward launch");
     cudaLaunchAttribute cluster{};
     cluster.id = cudaLaunchAttributeClusterDimension;
     cluster.val.clusterDim = {2U, 1U, 1U};
@@ -6870,11 +6868,6 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     launch.stream = transport_stream;
     launch.attrs = &cluster;
     launch.numAttrs = 1U;
-    int clusters = 0;
-    internal::throw_cuda("backward-run",
-        cudaOccupancyMaxActiveClusters(&clusters, kernel, &launch),
-        identity.rank, identity.world, "backward", identity.generation,
-        ExchangeKind::ExpertCounts, "query unified Backward residency");
     if (2U * static_cast<unsigned>(clusters) < compute_ctas)
       transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                       "unified Backward residency", identity.rank,
@@ -7062,6 +7055,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 << " transport_complete=" << s.backward_transport_complete_clock
                 << " return_send_complete=" << s.backward_return_send_complete_clock
                 << " return_receive_complete=" << s.backward_return_receive_complete_clock
+#if __has_include(<nccl_device.h>)
+                << " gin_contexts=" << (use_gin ? args.gin_dev_comm.ginContextCount : 0)
+#endif
+                << " gin_workers=" << args.gin_total_ctas
                 << std::endl;
     };
     if (diagnostic_progress) {

@@ -2753,3 +2753,32 @@ Y2 经上述长文回归后采用到 checked-in H2048/I512 profile；不是修�
 仍需对最终组合进行完整配对，不能拼接不同候选的最优单项宣告目标完成。
 AA1/AA2/AB 均已通过 EP16 两档 native 重复验证，全部 hash 与 c6be309
 一致；两机 16 卡于 08:08 UTC 复查均为 1620 MHz，开始独占性能比较。
+
+AA1/AA2 的 EP16 BWD 分别为 3941.040/9467.750 和
+3458.970/8144.130 µs，均显著回退。**不采用 8/12 sender 配额**，保留 16；
+较少 sender 会让每个 owner 承担更多 channel，不能只看增加 receiver 数量。
+
+AB 的 EP16 BWD 为 2835.600/6615.320 µs，未证明比 Y2 更快；静态 GIN
+栈仍 72B，本地仍 0B。**不采用 200/104**，保留已完整验证的 208/88。
+AC 为 2832.940/6616.670 µs，相邻 V3 为 2839.110/7011.880；8K 差别仅
+0.22%，仍不能宣称已经形成稳定优势。AC 的两档四组 hash 已核对一致。
+
+AD（`pf_backward_private_gin`，基于 AC）只调整统一 BWD 的 GIN 提交资源
+模式：实际 context 数大于全部 worker CTA 数时，`1+cta` 无别名，每 CTA
+只有一个线程调用 Put 或 ACK/flush，因此使用 THREAD 独占模式。context 0
+仍给 metadata；`GinExecution` 的 last-use event 串行化共享该 pool 的调用。
+实际 context 不足或非 unified 路径仍保留 GPU sharing，不以请求数量冒充
+实际分配。逐 slot ready、remote credit、本地 NIC counter、ACK flush 和
+数据内存序完全不变；不是删除本地 credit 检查。Forward 未改。
+代价是 Backward 提交路径多一个运行时模式分支，须测编译资源和端到端效果。
+沿用已有 BACKWARD_PROGRESS 输出实际 contexts/workers，不新增设备状态。
+尚未构建验证或采用。
+
+AC 的 EP8 两档四组 hash 亦与 c6be309 完全一致。EP8 BWD 为
+1769.390/4663.810 µs，20K 的约 1.5% 波动没有设备算法变化支撑，不能归为
+launch cache 的计算回退或收益。相邻实际循环（50/200）PF 为
+5889.5745/10398.4815 µs，V3 为 6354.0935/11048.4865 µs。
+AC 的 EP16 T8192/20480 完整 Torch 数值、route rejection、ordinal 3/5
+失败及重试、三份 live tape/peer reuse、EP8 subgroup graph/offload 均通过。
+**采用 AC 的启动准备复用**，明确不将整个相对 V3 收益归于这项 host 改动；
+双机实际循环仍待最终组合对照。没有新增测试框架或细粒度源码断言。
