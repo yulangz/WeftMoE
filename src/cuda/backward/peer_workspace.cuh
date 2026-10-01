@@ -106,10 +106,17 @@ struct BackwardPeerWorkspace {
     if (buffer && generation == next_generation)
       return;
     std::shared_ptr<Buffer> next;
-    preparation.run([&] {
-      next = buffer && buffer->rows == rows && buffer->routes == routes
-          ? buffer : allocate(rows, routes, hidden);
-    });
+    const bool changed =
+        !buffer || buffer->rows != rows || buffer->routes != routes;
+    const bool any_changed = preparation.run(
+        [&] { next = changed ? allocate(rows, routes, hidden) : buffer; },
+        changed);
+    if (!any_changed) {
+      // This is a collective reuse decision: a different rank may need to
+      // resize even when this rank's own rows/routes are unchanged.
+      generation = next_generation;
+      return;
+    }
     generation = 0;
     exports[nccl->rank] = next->descriptor;
     auto *device = static_cast<Export *>(exchange->data);

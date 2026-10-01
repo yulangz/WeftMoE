@@ -7,7 +7,7 @@ struct CollectiveTensorPreparation::Impl {
   CudaExecution execution;
   cudaStream_t stream;
   std::shared_ptr<tensor_storage_detail::Allocation> status;
-  std::uint32_t *host = nullptr;
+  std::uint64_t *host = nullptr;
 
   static void check(cudaError_t error) {
     if (error != cudaSuccess)
@@ -21,10 +21,10 @@ struct CollectiveTensorPreparation::Impl {
     if (nccl->device != exec.device_ordinal())
       throw std::invalid_argument("tensor preparation requires the NCCL device");
     check(cudaSetDevice(static_cast<int>(exec.device_ordinal())));
-    status = tensor_storage_detail::allocate(2U * sizeof(std::uint32_t),
+    status = tensor_storage_detail::allocate(2U * sizeof(std::uint64_t),
                                                exec.device_ordinal());
     check(cudaHostAlloc(reinterpret_cast<void **>(&host),
-                         2U * sizeof(std::uint32_t), cudaHostAllocPortable));
+                         2U * sizeof(std::uint64_t), cudaHostAllocPortable));
   }
 
   ~Impl() noexcept {
@@ -33,12 +33,15 @@ struct CollectiveTensorPreparation::Impl {
     (void)cudaFreeHost(host);
   }
 
-  std::uint32_t agree(bool failed) const {
-    auto *device = static_cast<std::uint32_t *>(status->data);
-    host[0] = failed ? nccl->rank : nccl->world;
+  std::uint64_t agree(bool failed, bool changed) const {
+    auto *device = static_cast<std::uint64_t *>(status->data);
+    // Failure rank takes precedence. With no failure, all ranks have the
+    // same high bits, so MIN also reports whether any rank changed storage.
+    const std::uint64_t origin = failed ? nccl->rank : nccl->world;
+    host[0] = (origin << 1U) | !changed;
     check(cudaMemcpyAsync(device, host, sizeof(*host), cudaMemcpyHostToDevice,
                            stream));
-    const auto error = ncclAllReduce(device, device + 1U, 1U, ncclUint32,
+    const auto error = ncclAllReduce(device, device + 1U, 1U, ncclUint64,
                                      ncclMin, nccl->comm, stream);
     if (error != ncclSuccess)
       throw std::runtime_error(std::string("tensor preparation agreement: ") +
@@ -58,8 +61,8 @@ CollectiveTensorPreparation::CollectiveTensorPreparation(
   run([] {});
 }
 
-void CollectiveTensorPreparation::run(
-    const std::function<void()> &prepare) const {
+bool CollectiveTensorPreparation::run(
+    const std::function<void()> &prepare, bool changed) const {
   auto &state = *impl_;
   Impl::check(cudaSetDevice(static_cast<int>(state.execution.device_ordinal())));
   cudaStreamCaptureStatus capture;
@@ -72,9 +75,10 @@ void CollectiveTensorPreparation::run(
   } catch (...) {
     failure = std::current_exception();
   }
-  const auto origin = state.agree(static_cast<bool>(failure));
+  const auto agreement = state.agree(static_cast<bool>(failure), changed);
+  const auto origin = agreement >> 1U;
   if (origin == state.nccl->world)
-    return;
+    return (agreement & 1U) == 0U;
   const auto error = TensorPreparationFailure(
       "tensor preparation failed on rank " + std::to_string(origin) +
       " before execution");

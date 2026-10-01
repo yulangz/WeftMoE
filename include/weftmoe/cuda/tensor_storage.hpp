@@ -56,7 +56,9 @@ public:
 class CollectiveTensorPreparation {
 public:
   CollectiveTensorPreparation(const NcclSession &, const CudaExecution &);
-  void run(const std::function<void()> &prepare) const;
+  // Also report whether any rank changed its prepared storage, using the same
+  // agreement. Stable peer mappings then need no address/import exchange.
+  bool run(const std::function<void()> &prepare, bool changed = false) const;
 
 private:
   struct Impl;
