@@ -1,5 +1,95 @@
 # V4 ring 训练对接记录
 
+## 优化总览（2026-10-01）
+
+这里汇总本文件中的 PF 训练优化：做了什么、测到了什么收益、最终是否保留。
+下文仍按时间保存完整实验，历史段落中的“待验证”以最后的验收结论为准。
+更早的推理优化见[单机记录](static_forward_v4_optimize_record.md)、
+[ring 记录](static_forward_v4_ring_record.md)；decode 独立见
+[DT 记录](static_forward_v4_decode_record.md)，不混入本表的训练收益。
+
+### 最终结果：相对冻结 V3
+
+最终代码 `eb371c2`，L20X、1620 MHz、H2048/I512/E64/top-k4、BF16；
+8K/20K 均为每 rank tokens。EP8 是单机，EP16 是双机。
+下表百分比都是耗时降低 `(V3 - PF) / V3`，不是吞吐增幅。
+
+| 拓扑 | tokens/rank | FWD 耗时降低 | BWD 耗时降低 | 实际训练循环：V3 → PF（ms） | 循环耗时降低 |
+|---|---:|---:|---:|---:|---:|
+| EP8 单机 | 8192 | 13.14% | 17.01% | 6.401 → 3.925 | 38.68% |
+| EP8 单机 | 20480 | 10.09% | 8.70% | 10.949 → 8.673 | 20.78% |
+| EP16 双机 | 8192 | 7.76% | 0.41% | 9.119 → 6.498 | 28.74% |
+| EP16 双机 | 20480 | 3.38% | 5.46% | 17.660 → 14.113 | 20.09% |
+
+FWD 包含 mini Notify 和 main；native 计时外准备权重，BWD 使用已保存的 X/GU。
+实际循环另行实测，包含每步权重重排、分配/回收及同步，不是两个 native p50 相加。
+EP16/8K BWD 应视为接近持平、本轮小幅领先。循环的大幅改善包含通用的
+host 分配优化，不能全部归因于静态调度；这些 host 优化移植到 V3 也可能获益。
+采样、基线及正确性边界见文末“最终统一验收”。
+
+### 逐项优化与收益
+
+除特别注明外，`a% / b%` 按 8K / 20K 排列；收益来自各自当时的相邻版本
+消融，不能相加，也不代表其它模型的固定增幅。`main` 仅指 GPU 主 kernel，
+FWD/BWD wall 与实际训练循环是不同口径；未独立量化的项目明确保留这一限制。
+
+先解决训练缓存和 checkpoint 的额外开销：
+
+| 优化 | 简单描述 | 实测收益 / 取舍 |
+|---|---|---|
+| M6a–f：实际容量与独立 tape | SavedX/GU 按实际 R 保存；BWD 私有 workspace 按精确 padded P 分配，解耦通信池与多份 live tape。 | 消除按最坏容量预留的浪费；T64 示例精确 P 比旧 padding 上界再省 903,672 bytes/rank。迁出通信池本身不等于等量净省显存。 |
+| M6g：BWD 独立 sender 配额 | 修正 BWD 错用 FWD 配额，恢复 unified BWD 和 16 个 sender。 | 20K BWD 相对错误的 split 配置，EP8/EP16 降低约 13.8%/52.8%；这是恢复到 V3 附近，不是新算法领先 V3。 |
+| M6h：G/U 合并写回 | 复用 FC1 epilogue 的 shared staging，以 16B vector 保存 G/U，替代分散的小 store。 | EP8 main 降低约 0.4%–1.2% / 1.5%–1.6%；EP16 约 0.8% / 0.7%。无新增 pool。 |
+| ES/ET/FJ2：共享推理改造 | ES 合并本地 NIC 完成 prefix；ET 将 Return Q32 改为 Q16；FJ2 使用三级 FC1，并补齐跨 GEMM 的 shared-memory 退休同步。 | ES/ET 训练持平，收益在协议简化、缓冲减少及推理；FJ2 修复内存复用安全性，但 EP16 20K main 回退约 0.3%–0.7%，不计为训练提速。 |
+| FM：计算侧保存 X | SavedX 从已 ready 的 FC1 A stage 写出，移除 Pull 中的第二次写回。 | EP8 20K FWD wall 约降低 2.7%，8K 持平；EP16 降低 1.98% / 3.31%。总复制字节数不变。 |
+| FO：SavedX 地址计算外提 | 每个 task 只算一次目的地址，不在每次 K 迭代重复加载 row 和算地址。 | 首轮 EP8 main 降低 4.49% / 2.82%；EP16 1.51% / 1.40%。双机 20K 反向复测仅 main 0.47%、wall 持平，收益不固定。 |
+| FR3：单机连续 X 的 TMA 保存 | 单机使用稳定物理行序和 M32 TMA；多机保留 vector scatter，避免强行统一布局。 | EP8 FWD wall 降低 3.61% / 5.19%；多机持平，撤掉通用 FR 在多机上的退化。 |
+| FS2：去掉 planner 后的 host 回传 | 分配在 planner 前完成，planner → main 在同一 stream 连续执行。 | EP8 长文 FWD wall 正反向约降低 1.0%–1.1% / 1.5%–1.8%。历史独立 planner 后来由 mini Notify + main 内规划替代。 |
+| FT/FZ/GA：写回与 credit | FT 用 TMA 写完整 S tile；FZ 将 SavedX 轮转分给 FC1 pair、两 CTA 各存半块；GA 合并连续 consumed-prefix ACK，保留远端 credit 和本地 NIC 完成检查。 | FT 对训练持平；GA+FZ 相对 FT，EP8 FWD wall 降低 0.74% / 0.94%，EP16 同容量长档降低 0.20%–0.86%。GA 仅加 4096 bytes/rank 元数据；当时仍未整体超过 V3。 |
+
+再改前置规划、静态 BWD 和每次调用的准备开销：
+
+| 优化 | 简单描述 | 实测收益 / 取舍 |
+|---|---|---|
+| Mini Notify + main 内 planner | 前置 kernel 只交换计数/分配信息；物理 ring、route 和 packet 计划在 main 内生成，训练/推理共用 main 实现。 | 当轮 EP8 Notify 从约 323/362 µs 降到 123/131 µs；累计 FWD wall 比同期 V3 低 7.03% / 1.23%，不是单项独立收益。 |
+| 静态 BWD + counts 构造交错 dispatch | 长文由一个 cluster 完成整块 dU→SwiGLU/dGate→dX；欠填充时采用静态细粒度分配。按 32 行交错专家，避免发送集中打同一卡。 | 加入 stripe 后 EP8 BWD 从整块但不交错的 2290/6145 µs 降到 1762/4693 µs；相对当轮 V3 低 17.17% / 7.38%。消除了首版静态调度的长文回退。 |
+| dW 加权静态区间 | 按实际 padded K 加权切分联合 dW2/dW1 流；本地全部 dX 完成后才启动 dW，并与 Return/Reduce 重叠。 | 改善专家/尾部负载不均；EP16 8K BWD 2962 → 2928 µs，EP8 20K 4731 → 4644 µs，但 EP8 8K 略退。无 split-K，不改归约顺序。 |
+| A–D：planner 并行化与访存 | 少排冗余 ordinal 位；packet 构建与目录 Put 重叠；全网格分摊 RX 描述符；按 source-route 合并元数据写入。 | EP16 main 规划 394/556 → 336/500 µs，FWD wall 约降低 1.75% / 1.45%。A 单独只省约 2 µs，无独立 wall 收益。 |
+| F：永久 header/gate 提前写入 | 与 payload 无关的 tape 元数据交给并行 planner，移出串行 Pull issuer。 | FWD wall：EP8 降低 5.31% / 6.21%，EP16 降低 6.19% / 9.68%。不提前发布未 ready 的 X。 |
+| B/D 窗口消融 | EP8 保留 B512/D8；EP16 从早期 B512/D8 经 B1024/D4，最终选择 B768/D6。 | 最后一步相对 1024/4，EP16 FWD 降低 1.98% / 1.37%；pool 少约 74.8/74.7 MB/rank，但注册部分多约 8.5 MB，不包含独立 tape。 |
+| I/J：流式 Reduce + 整链描述符 | 通信空闲时非阻塞归约已齐的 token；整块计算链只传递一次静态描述符，少两次 DSM mailbox 往返。 | 组合后 EP8 BWD 降低 2.51% / 1.27%。I 单独在 EP8 20K 退化，不能把组合收益拆成两项通用加速。 |
+| K：合并分配确认 | 输入/权重/tape 在同一次 collective preparation 中准备，已绑定 tensors 不再重复确认。 | FWD wall：EP8 降低 2.83% / 2.40%，EP16 降低 2.39% / 1.42%；device GEMM 不变。 |
+| M：复用 BWD peer mapping | 所有 rank 的实际 shape 均不变时复用地址及 IPC 映射；变化/失败信息并入原确认状态字。 | 稳态这部分 host collective 从 3 次减到 1 次；有 rank 变化仍完整交换。没有可单独归因的稳定耗时百分比。 |
+| Y2：BWD 寄存器配额 | 本模型 math/control 从 216/64 调到 208/88，给通信/producer 更多寄存器；FWD 不变。 | GIN 栈从 208B 降到 72B，EP16 BWD 降低 0.91% / 0.96%，单机无回退；不是所有模型的通用默认值。 |
+| AC：复用启动准备 | 缓存同一启动配置的属性/occupancy 检查，不再为未使用的 split kernel 设置属性。 | EP16 BWD 2840.62/6615.60 → 2832.94/6616.67 µs，8K 小幅改善、20K 持平；属于 host 提交优化。 |
+| AD：条件独占 GIN 提交 | 实际 context 足够且 CTA 无别名时使用 THREAD 模式，否则保留 GPU sharing。 | EP16 BWD 2832.94/6616.67 → 2824.17/6609.28 µs，仅约 0.31% / 0.11%；不删除任何 credit/完成检查。 |
+| AF：复用权重重排 scratch | packed W1 改由应用缓存分配器提供，避免每步原生 cudaMalloc/cudaFree；每步仍重排当前权重。 | EP16 实际循环从上一轮 AD 的 9.668/19.258 ms 降到 6.498/14.113 ms（32.78% / 26.72%）。主要是分配/释放收益，不是 GEMM 加速；完整最终 V3 配对见首表。 |
+
+### 未采用的消融，以及权重重排的成本
+
+以下候选未证明稳定的整体收益，已撤回或未选用；详细数值见时间记录：
+
+- 训练保存：Pull 双 lane 写 X、G/U TMA、通用网络连续行/TMA、仅轮转不分半、
+  streaming store 等；单个规模获益不足以支持通用采用。首次 main 融合 FS
+  退化，先选 FS2，后来才以 mini Notify 的新边界完成 main 内规划。
+- 规划/调度：节点原子合并、按 source 局部性重排、就绪探测重排、receiver-only
+  Reduce、owner 原地等待，以及 K128、M128 dispatch stripe、额外预取等，
+  均未稳定缩短总耗时；某个阶段变短不等于端到端更快。
+- 通信/资源：提前关闭/flush、SIMT 替代本地 TMA、接收优先、增加 Return ports、
+  增减 sender、200/104 配额、chunk32/128 等未优于最终组合；保留 2 ports、
+  16 senders、BWD chunk64、208/88。诊断插桩本身不计性能收益。
+
+补充 2026-10-01 的独立权重布局诊断：当前 W1 由分离的 gate/up 改排为每 8 行
+gate、8 行 up 交错，使 FC1 可用同一 packed GEMM 计算二者。1620 MHz 下，
+每卡 8/4 个专家的 32/16 MiB W1，生产重排 kernel 冷缓存 p50 为
+96.224/52.192 µs（不含分配）。单 GPU 回放 EP8/EP16 的均衡每卡工作量，
+不重排的 separated FC1 比 packed FC1 慢约 22%–25%；但 EP8/8K 将每步
+重排也计入后，粗算未必划算。该实验不含通信/checkpoint，独立 p50 相加
+不是完整 PF 耗时；尚未实测完整“不重排 PF”，也未实现跨训练调用的权重值缓存。
+原始数据：`build/pf_weight_layout_20261001/measurement_summary.json`。
+
+## 记录说明与当前状态
+
 对应设计文档 M6，按时间保留改造、失败候选和验证记录。
 2026-10-01 当前 PF 训练已使用 count-only mini Notify、main 内 planner、
 按实际 R/P 分配的独立 tape，以及静态 Backward；非 ring 路径保留 V3 对照。
