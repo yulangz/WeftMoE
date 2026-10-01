@@ -1133,9 +1133,11 @@ expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
 - [x] 1620 MHz 下 EP8（单机）/EP16（双机）的正确性、Forward wall、Backward wall
   与 FWD+BWD 总耗时对照冻结 V3；分别记录 1/64/8192/20480，不把 main 计时范围
   变化误记为性能收益。每个验证完的 milestone 提交。
-- [ ] 性能目标完全达成：当前单机 BWD/完整循环领先；双机 8K BWD 仍慢约
-  2.9%，双机长档 FWD/完整循环仍回退。具体原始样本及复测见训练记录，不能
-  将功能完成表述成全场景不低于 V3。
+- [ ] 性能目标完全达成：后续按最新要求只验收 8K/20K，不再测 1/64。
+  2026-10-01 的 planner/header 优化已让 EP8/EP16 两个长档 FWD 初测领先；
+  双机 20K FWD 仅领先约 0.7%，还需最终配对复测。静态 BWD 基线的双机 8K
+  仍慢约 2.3%，新库的实际 FWD+BWD cycle 待测。不能将功能完成表述成
+  十二个长文比较项全部通过，具体样本见训练记录。
 
 以下内容保留为已验证历史基线；上述条目未勾选之前，不代表重构已完成。
 
@@ -1145,6 +1147,13 @@ parity、热点/零入站、多个 live tape、allocation retry 已通过；结�
 EP8/EP16 T20480 长序列 parity、EP8 不等长 source memcheck，以及 EP16
 T64/32 在 B16/D1 与 B1024/D4 下的输入/权重/输出 hash 一致性也已通过；
 最终静态 Backward 的性能门禁独立记录，不由 Forward 正确性推定。
+
+main 的规划阶段同时生成永久 tape 的 route header/gate；它们不依赖 X 到达，
+不能留给 Pull issuer 逐行串行生成。Pull 仍在 slot admission 之后写入物理
+ring 的 gate/X，并按原 completion/credit 发布 ready；永久元数据与可复用
+payload 的生命周期不可混同。训练 packet/fanout 不属于发布给 Forward 的
+源目录，可与源目录 Put 重叠构建，但仍在原 context fence/collective 边界前
+完成。推理不建立这些训练数据；两者复用相同 main 流水及物理 planner。
 
 当前 Backward 的静态合同：
 

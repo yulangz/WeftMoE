@@ -2386,3 +2386,121 @@ F 的单机补充：独占远端节点、B512/D8 的 FWD wall 为 1543.200/3334.
 EP8 重复 Backward 也全部通过，与 c6be309 的四组梯度 hash 逐 rank 相同。
 本轮采用 A–D 与 F 作为 planner/immutable-header 里程碑，E 已撤回；新的
 Backward ready-residue 实验单独记录，不包含在此项收益内。
+
+### F 后的窗口消融与静态 Backward 就绪探测（待最终验收）
+
+移除 Pull 的串行 header 工作后，重测生产二进制的窗口参数；仍 EP16、
+1620MHz、30 轮/10 warmup，单位 µs。这里 B 是每源 token 窗口，D 是
+source contribution 深度，不是 GEMM M 或网络 packet ring depth。
+
+| B/D | 8K wall | 20K wall | 8K main 规划 | 20K main 规划 |
+|---|---:|---:|---:|---:|
+| 1024/4 | 3312.190 | 7108.690 | 337.888 | 504.544 |
+| 512/8 | 3311.680 | 7374.730 | 309.408 | 525.312 |
+| 768/6 | 3246.660 | 7011.360 | 325.408 | 500.288 |
+
+三个配置的六组输入/权重/输出 hash 均一致。768/6 的两个长档 device pool 为
+795434176/912494784 bytes/rank，1024/4 为 870260928/987174592；总 pool
+少约 74.8/74.7 MB。其 registered 部分反而多约 8.45/8.47 MB，因为 source
+contribution 容量稍大；compute ring 的较小最坏窗口节省了更多空间。
+永久 tape 与调用级 Backward tensors 不包含在这个 pool 数字中。没有新增
+运行时 shape 阈值或模型专用分支；最终还需反向计时和同参数实际 cycle。
+
+G（`pf_backward_ready_residues`）只改变 activation 链的访问顺序：cluster
+仍独占 `c + n*clusters`，但原下一个 block 未 ready 时，会在**自己的**
+residue 中探测 phase=1 的 block；不领取其它 cluster 的任务。dW 仍严格等待
+全部本地 dX，canonical tape/dW K 顺序不变。EP16 两个长档的重复梯度 hash
+均与 c6be309 完全相同。
+
+| T/rank | 原静态 BWD wall | G wall | 原 dU/epilogue 区间 | G dU/epilogue 区间 | 原 combine 区间 | G combine 区间 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 2917.230 | 2898.330 | 1700.580 | 1380.740 | 187.552 | 414.560 |
+| 20480 | 6696.970 | 6878.380 | 4284.800 | 3863.010 | 216.288 | 940.224 |
+
+各区间独立统计且互相重叠，不能相加恢复 wall。G 单独没有全面收益，不采用
+为最终版本：计算就绪更早，并不等于固定顺序 Return 能及时消费它。
+下一候选 H 同时让每个 Return owner 在自己的固定 residue 内探测完成块，
+用既有 phase=4 表示本 owner 已访问，不增加 CAS/领取队列；实际 returned
+计数仍在 copy/publish 后推进。此时 H 尚未完成构建、数值或性能验证。
+
+768/6 补充的 EP16 T8192/20480 重复 Backward 已通过，全部四组梯度 hash 与
+c6be309 的 B1024/D4 逐 rank 相同；日志 `headers_b768d6_ep16_t*_validation.log`。
+
+H 已构建 native/library/extension，EP8 两个长档四组梯度 hash 与 c6be309 一致。
+EP16/B1024/D4 的 wall 为 2899.490/6878.910 µs，combine 区间降到
+123.136/118.624 µs，但总耗时基本等于 G，仍不如原静态调度的长档组合。
+**G/H 均已撤回**，没有只因为阶段 span 变短就采用，也未为 H 执行完整 Torch
+或实际 cycle。资源用量核对中，原版/G/H 的静态 unified BWD 均 REG168、
+SHARED2048、LOCAL0，网络 STACK208/本地 STACK0；没有发现新增 spill 的证据。
+
+H native 的 Forward 代码仍是 F。它与原 V3 的相邻长档对照，PF 用 768/6，
+V3 保持原 profile：8K wall 3243.280 vs 3437.380，20K 为
+7089.200 vs 7180.770 µs，降低 5.65%/1.28%。这是 Forward 的再次确认，
+不能作为 H Backward 的采用依据。日志 `pf_final_t*_forward.log`、
+`v3_final_t*_forward.log`；此处的 `final` 是当轮文件标签，不代表目标完成。
+
+下一候选 I 基于 F 的原静态计算/Return 次序，尝试在通信暂时无可做工作时
+非阻塞 Reduce：每个 warp 保持原 token residue，只在全部 top-k ready 后
+执行原 FP32 累加及 BF16 输出，不等待缺失 contribution，不领取其它 warp
+的 token。单独的 shared pointer table 避免覆盖仍在使用的 TMA staging；
+通信结束后从各自 cursor 继续处理剩余 token。尚无收益结论。
+
+I 的 EP16 两个长档已通过重复反向验证，16 ranks 的四组梯度 hash 均与
+c6be309 相同。B1024/D4 的首轮 wall 为 2862.840/6676.730 µs，相比同日原静态
+版本 2917.230/6696.970 降低 1.86%/0.30%；8K 仍略高于 V3 的 2851.220。
+静态 unified kernel 的 REG168、SHARED2048、LOCAL0 和 STACK 用量未变化，
+额外 pointer table 属于 dynamic shared memory。`reduce` 时间戳现在包含与
+通信重叠的就绪等待区间，不能拿其变长推断归约算术变慢，也不能与其它阶段
+相加。日志 `stream_reduce_*`；单机与反向顺序复测尚未结束，不作正式采用结论。
+
+J（`pf_backward_activation_chain`，在 I 上消融）：当 M-block 数足够时，
+静态 cluster 已独占整块 dU→SwiGLU/dGate→dX，三段不必重新交换任务描述符。
+调度器一次返回整块任务，沿用原 GEMM、epilogue 和逐阶段数据完成同步，
+只省去中间两次调度回环/DSM mailbox 往返。欠填充的 N/epilogue residue
+路径不变；dW 仍严格等待所有本地 dX。此时仅开始构建，尚未验证或采用。
+
+I 补充 EP8 两个长档的全部梯度 hash 与 c6be309 相同。独占远端节点 I→原版
+的相邻 BWD 消融为 1789.120→1821.890（8K）、4733.480→4670.430（20K）；
+I 并非单独全面有收益。J 在相同节点为 1776.220/4611.050。J 的 EP16
+两个长档全部梯度 hash 也与原版一致，资源用量仍无新增 spill；其 B1024/D4
+wall 为 2869.660/6654.510，相邻 V3 为 2839.690/6990.520。8K 仍差 1.06%，
+不能用更早稍慢的 V3 轮次宣布达标。
+
+J library 的首次 EP16 实际 cycle（PF B768/D6，20 warmup + 50 measured）为
+14642.389/20479.200 µs，随后 V3 为 10288.255/19187.677 µs；FWD API 各为
+5791.449/9046.129 vs 4808.787/8891.286，BWD API 为
+7223.399/9150.568 vs 5067.943/9399.583。主机延迟抖动明显，保留完整样本，
+不裁掉大值，也不把 native cached-state 的小幅收益当成真实循环已通过。
+日志 `activation_chain_*`、`v3_chain_pair_*`。
+
+K（`pf_training_single_agreement`）：mini Notify 已提供准确 R/P，Runtime 可
+在现有输入/权重准备的同一次 CollectiveTensorPreparation 内分配 saved tensors。
+删除旧独立 planner 时代留下的延迟分配 callback；传入已绑定 tensors 时，
+backend 不重复进行分配确认。未绑定 tensors 的原生入口仍在 backend 内分配
+并集体确认，任何路径都没有在 main 中分配。应用自己准备 buffers 时本来就
+必须在进入 Forward 前一致处理分配失败，否则旧的第二次确认同样救不了
+没有进入 Forward 的失败 rank。该候选需要重新验证分配失败、重试与 live tape。
+不改变 device planner、GEMM、ring 及输入验证；尚无性能结论。
+
+L（`pf_backward_dispatch32`）在 K 上单独将既有 Backward dispatch batch 参数
+从 64 调成 32，让通信 warp 更频繁返回 GIN/Return 进展循环；所有权仍为静态
+residue，没有新增动态调度。只改构建参数，不增加规模阈值；尚未验证或采用。
+
+J 的 EP8 两个长档也完成四组梯度 hash 对照，全部等于 c6be309。其真实单机
+cycle 为 6071.962/10648.123 µs，相邻 V3 为 6592.669/11656.652，降低
+7.90%/8.65%。该收益属于 F+I+J 的累计结果，不全部归因于 J 的 mailbox 简化。
+I+J 作为小的静态 Backward 里程碑保留；双机 8K 与真实 cycle 仍未达标。
+
+K 的 EP16 T8192 已通过既有 Torch 集成测试：输出及四组梯度、非法路由拒绝、
+单 rank 前后向分配失败与重试、三个 live tape/热点切换、后续 EP8 inference
+graph/offload。T20480 正在验证。L 的 EP16 两个长档四组梯度 hash 已全部
+等于原版；这里的正确性任务可与 CPU 构建重叠，其 wall 不作为性能数据。
+
+M（`pf_backward_peer_reuse`，基于 K，仍用 dispatch batch 64）：Backward
+通信 workspace 在所有 rank 的实际 rows/routes 均不变时，复用原地址和映射。
+用分配确认的同一个 MIN 状态字编码 failure-rank 优先级与 changed 位；一旦
+有 rank 分配失败，全体仍抛错，只有全体成功且无人变化才跳过地址 AllGather
+及第二次 import 确认。任一 rank 改变尺寸仍走完整交换和旧映射退休协议，
+不能凭本 rank 未变就自行跳过 collective。exact-shape 策略不变，不保留历史
+热点的大 payload。稳态新调用的这部分主机 collective 从三次减到一次；
+不是删除 main 的通信完成同步。尚未验证或测得收益。

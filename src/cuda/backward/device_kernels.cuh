@@ -277,7 +277,8 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
 // Shared by the standalone reducer and the retired communication warps.
 // Caller supplies one disjoint source-pointer table per warp. Arithmetic,
 // canonical route order, readiness acquire and output packing are identical.
-__device__ __forceinline__ void backward_reduce_dx_token(
+template <bool Wait = true>
+__device__ __forceinline__ bool backward_reduce_dx_token(
     const BackwardKernelArgs &a, std::uint64_t token,
     const transport::BFloat16 **source_rows) {
   constexpr std::uint32_t kTrainingTopK = 6U;
@@ -285,12 +286,13 @@ __device__ __forceinline__ void backward_reduce_dx_token(
   // index the six-entry storage used by the unrolled training fast path.
   const auto lane = threadIdx.x & 31U;
   if (token >= a.dispatch.identity.num_tokens)
-    return;
+    return false;
   const auto *contribution = a.peer_payloads[a.rank].contribution;
   auto *combined = a.dx;
   auto *ready = peer_at<unsigned long long>(a.local_base,
                                              a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
+  bool available = true;
   if (lane < a.dispatch.identity.top_k) {
     const auto position = lane;
     const auto slot = a.dispatch.combine_order[route_base + position];
@@ -299,9 +301,16 @@ __device__ __forceinline__ void backward_reduce_dx_token(
     source_rows[position] = source;
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);
-    while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
-      __nanosleep(backward_tuning::kReduceIdleNanosleep);
+    if constexpr (Wait) {
+      while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
+        __nanosleep(backward_tuning::kReduceIdleNanosleep);
+    } else {
+      available = marker.load(::cuda::memory_order_acquire) == execution_epoch(a);
+    }
   }
+  if constexpr (!Wait)
+    if (!__all_sync(0xffffffffU, available))
+      return false;
   __syncwarp();
 
   auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
@@ -357,6 +366,7 @@ __device__ __forceinline__ void backward_reduce_dx_token(
            << 16U);
     output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
   }
+  return true;
 }
 
 __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {

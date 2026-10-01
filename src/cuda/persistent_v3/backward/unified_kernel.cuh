@@ -102,29 +102,30 @@ __global__ __launch_bounds__(
     } else if (threadIdx.x >= backward_tuning::kUnifiedCommBase &&
                threadIdx.x < backward_tuning::kUnifiedCommBase +
                                  backward_tuning::kUnifiedCommThreads) {
-      backward_unified_transport::run<UseGin, backward_tuning::kUnifiedCommBase,
-                                      StaticSchedule>(a, geometry, comm);
-      // run() returns after this CTA has retired every notification channel
-      // and GIN has drained its contexts. Other CTAs can still finish their
-      // local notification rows, but no remaining message needs these warps.
-      // Static token ownership therefore needs no shared queue or head wait.
       constexpr unsigned kReduceWarps = backward_tuning::kUnifiedCommThreads / 32U;
-      constexpr unsigned kMaxTopK = 32U;
-      static_assert(!backward_tuning::kUnifiedWorkers ||
-                    kReduceWarps * kMaxTopK * sizeof(const transport::BFloat16 *) <=
-                    sizeof(comm.staging),
-                    "Retired communication staging must hold the pointer tables");
       const unsigned reduce_tid = threadIdx.x - backward_tuning::kUnifiedCommBase;
       const unsigned reduce_warp = reduce_tid / 32U;
       const unsigned lane = reduce_tid % 32U;
       const std::uint64_t first_token =
           std::uint64_t(blockIdx.x) * kReduceWarps + reduce_warp;
+      auto token = first_token;
+      backward_unified_transport::run<UseGin, backward_tuning::kUnifiedCommBase,
+                                      StaticSchedule>(a, geometry, comm, token);
+      // run() returns after this CTA has retired every notification channel
+      // and GIN has drained its contexts. Other CTAs can still finish their
+      // local notification rows, but no remaining message needs these warps.
+      // Static token ownership therefore needs no shared queue or head wait.
+      constexpr unsigned kMaxTopK = 32U;
+      static_assert(!backward_tuning::kUnifiedWorkers ||
+                    kReduceWarps * kMaxTopK * sizeof(const transport::BFloat16 *) <=
+                    sizeof(comm.staging),
+                    "Retired communication staging must hold the pointer tables");
       auto **source_rows = reinterpret_cast<const transport::BFloat16 **>(
                               comm.staging) + reduce_warp * kMaxTopK;
       auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       if (first_token < a.dispatch.identity.num_tokens && lane == 0U)
         atomicMin(&status->backward_reduce_start_clock, device_globaltimer_ns());
-      for (auto token = first_token; token < a.dispatch.identity.num_tokens;
+      for (; token < a.dispatch.identity.num_tokens;
            token += std::uint64_t(gridDim.x) * kReduceWarps) {
         backward_reduce_dx_token(a, token, source_rows);
         // A lane with fewer output vectors must not replace next-token

@@ -5,7 +5,7 @@ namespace weftmoe_pf::backward {
 // Keep an M-block's activation-gradient chain on one cluster. This preserves
 // locality and avoids dependencies between independently striped N/row tasks.
 struct Schedule {
-  unsigned block, epilogue, dx, step = 0U;
+  unsigned block, epilogue, dx;
   unsigned weight = 0U, weight_end = 0U;
   bool weights_initialized = false;
 
@@ -48,23 +48,15 @@ struct Schedule {
         return true;
       }
     } else if (block < mblocks) {
-      if (step < DuTiles) {
-        if (!step && !::cuda::atomic_ref<unsigned long long,
-                                         ::cuda::thread_scope_device>(
-                          words[layout.phase + block])
-                          .load(::cuda::memory_order_acquire))
-          return false;
-        task = {block, step++, TaskKind::Dab, 1U};
-        phase = 1U;
-      } else if (step == DuTiles) {
-        task = {block, 0U, TaskKind::Dab, kDabEpilogueTasks};
-        phase = 2U;
-        ++step;
-      } else {
-        task = {block, 0U, TaskKind::Dx, DxTiles};
-        block += clusters;
-        step = 0U;
-      }
+      if (!::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
+               words[layout.phase + block])
+               .load(::cuda::memory_order_acquire))
+        return false;
+      // One immutable descriptor covers the complete activation chain. The
+      // owning cluster needs no task-mailbox exchange between its three steps.
+      task = {block, 0U, TaskKind::Dab, 1U};
+      phase = 1U;
+      block += clusters;
       return true;
     }
     const auto completed =

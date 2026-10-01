@@ -19,6 +19,8 @@ struct alignas(128) Shared
   unsigned queue_rows;
   unsigned long long queue_base;
   unsigned static_return_next;
+  // Streaming Reduce must not alias live TMA copy staging.
+  const transport::BFloat16 *reduce_sources[Threads / 32U][32U];
 };
 
 #include "cuda/persistent_v3/backward/unified_gin.cuh"
@@ -205,11 +207,31 @@ progress_return(const BackwardKernelArgs &a, unsigned long long *words,
   return true;
 }
 
+template <unsigned BaseThread, class Storage>
+__device__ __forceinline__ bool progress_reduce(
+    const BackwardKernelArgs &a, Storage &s, std::uint64_t &token) {
+  const auto warp = (threadIdx.x - BaseThread) / 32U;
+  const auto lane = threadIdx.x % 32U;
+  constexpr auto warps = Storage::kThreads / 32U;
+  const auto first = std::uint64_t(blockIdx.x) * warps + warp;
+  const auto start = lane == 0U && token == first ? device_globaltimer_ns() : 0ULL;
+  if (!backward_reduce_dx_token<false>(a, token, s.reduce_sources[warp]))
+    return false;
+  __syncwarp();
+  if (start)
+    atomicMin(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                   ->backward_reduce_start_clock,
+              start);
+  token += std::uint64_t(gridDim.x) * warps;
+  return true;
+}
+
 template <bool UseGin, unsigned BaseThread, bool StaticSchedule = false,
           class Storage>
 __device__ __forceinline__ void
 run(const BackwardKernelArgs &a,
-    const backward_unified_compute_detail::RowGeometry &geometry, Storage &s) {
+    const backward_unified_compute_detail::RowGeometry &geometry, Storage &s,
+    std::uint64_t &reduce_token) {
   const unsigned tid = threadIdx.x - BaseThread;
   const unsigned warp = tid / 32U, lane = tid % 32U;
   auto *words = backward_pipeline_detail::scheduler_words(a);
@@ -271,6 +293,12 @@ run(const BackwardKernelArgs &a,
           scan_cursor = publisher;
       }
       __syncwarp();
+      if constexpr (StaticSchedule) {
+        const bool idle = !__any_sync(0xffffffffU, progressed);
+        const bool published = __shfl_sync(0xffffffffU, pending, 0U) == 0U;
+        if (idle && published)
+          progress_reduce<BaseThread>(a, s, reduce_token);
+      }
       if (!progressed)
         __nanosleep(backward_tuning::kQueueIdleNanosleep);
     }
@@ -287,6 +315,9 @@ run(const BackwardKernelArgs &a,
       }
       const bool returned = progress_return<UseGin, BaseThread, StaticSchedule>(
           a, words, layout, geometry.mblocks, s);
+      if constexpr (StaticSchedule)
+        if (!__any_sync(0xffffffffU, dispatched || returned || gin_progressed))
+          progress_reduce<BaseThread>(a, s, reduce_token);
       if (tid == 0U) {
         auto *counter = reinterpret_cast<persistent_v3::PaddedCounter *>(
             words + layout.returned_mblocks);
