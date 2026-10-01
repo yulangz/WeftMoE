@@ -1112,7 +1112,7 @@ autotune 配置表。模型形状需要不同 M 或配额属于配置选择，�
 
 ## 8. Prefill/training 的保存与 no-drop 合同
 
-### 2026-09-30：mini Notify 与静态 Backward 重构（实施中）
+### mini Notify 与静态 Backward 重构（2026-10-01 已验收）
 
 本轮目标取代下文 M6/FS2 的历史执行边界：训练只在 main 前做计数 Notify
 和精确 tape 分配；训练与推理共用 main 内的物理规划、通信和计算流水。
@@ -1133,13 +1133,14 @@ expert/source/route 逻辑顺序，保持 checkpoint 和 dW 的数值合同。
 - [x] 1620 MHz 下 EP8（单机）/EP16（双机）的正确性、Forward wall、Backward wall
   与 FWD+BWD 总耗时对照冻结 V3；分别记录 1/64/8192/20480，不把 main 计时范围
   变化误记为性能收益。每个验证完的 milestone 提交。
-- [ ] 性能目标完全达成：后续按最新要求只验收 8K/20K，不再测 1/64。
-  2026-10-01 的 planner/header 和分配确认优化已让 EP8/EP16 两个长档 FWD
-  领先；208/88 寄存器配额使静态 BWD 的双机 8K 接近 V3，继续消融。单机实际循环的 50 warmup
-  + 200 measured 对照已经领先，双机循环还需同口径确认，不能选择不同候选
-  各自最快的一个规模拼出十二项全通过。具体样本见训练记录。
+- [x] 按最新要求完成 8K/20K 性能门禁，不再测 1/64。最终同一候选
+  `eb371c2` 的 EP8/EP16 × 两个长档 × FWD/BWD/实际循环共十二项，
+  200 measured rank-max wall p50 均低于冻结 V3。双机 8K BWD 仅小幅
+  领先 0.41%，不称显著提升；实际循环耗时降低 20.09%–38.68%，其中
+  packing scratch 分配器复用贡献的是 host 开销优化，不是 GEMM 加速。
+  具体口径、完整数值及限制见[最终统一验收](static_forward_v4_training_record.md#最终统一验收2026-10-01eb371c2)。
 
-以下内容保留为已验证历史基线；上述条目未勾选之前，不代表重构已完成。
+以下记录已落地实现及历史基线；性能以此次最终统一验收为准。
 
 mini Notify 与 main 内规划已落地，EP8/EP16 native 梯度 hash 和 Torch reference
 parity、热点/零入站、多个 live tape、allocation retry 已通过；结果和计时边界见

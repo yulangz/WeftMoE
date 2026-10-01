@@ -3,12 +3,14 @@
 对应设计文档 M6，按时间保留改造、失败候选和验证记录。
 2026-10-01 当前 PF 训练已使用 count-only mini Notify、main 内 planner、
 按实际 R/P 分配的独立 tape，以及静态 Backward；非 ring 路径保留 V3 对照。
-当前已采用 `cf909bf`（Backward peer mapping 复用）及本文末尾 Y2 的
-208/88 Backward 寄存器配额，Forward 配额不变。
+最终实现为 `eb371c2`：包含静态调度、peer mapping/launch 准备复用、Y2 的
+208/88 Backward 寄存器配额、AD 条件独占 GIN，以及 AF 的应用侧权重 packing
+scratch。Forward 寄存器配额不变。
 
-1620 MHz、仅验收 EP8 单机/EP16 双机的 8K/20K：FWD 已领先，BWD 的双机
-8K 已接近 V3；实际 50 warmup + 200 measured 循环尚未全部领先。
-不把更早 GA+FZ 的性能或单个 GPU kernel 收益当作当前完整训练已达标。
+1620 MHz、EP8 单机/EP16 双机、8K/20K 的 FWD、BWD、实际训练循环共十二项
+最终配对均低于冻结 V3，完整数据见文末「最终统一验收」。双机 8K BWD 仅
+小幅领先 0.41%，不能称显著加速，也不保证换机器/模型后仍有同样优势。
+验收依据是此次完整训练循环，不借用更早 GA+FZ 或单个 GPU kernel 的收益。
 完整数值/生命周期检查和已有专项 memcheck 已通过；旧 Backward racecheck
 的未决报告及工具版本限制仍保留，不能称完整训练 sanitizer clean。
 
@@ -2847,3 +2849,96 @@ AF 的 EP16 两个长档完整 Torch 回归均通过：每档 16 个 parity、16
 REG168/SHARED2048/LOCAL0，GIN STACK72、本地 STACK0。
 **采用 AD 的条件独占提交及 AF 的应用侧 packing scratch**；最终同候选的
 EP8/EP16 各档 FWD/BWD/cycle 性能门禁仍待下面统一汇总，不提前标记完成。
+
+## 最终统一验收：2026-10-01，eb371c2
+
+最终候选统一为 `build/pf_backward_packed_storage/`，不是拼接不同候选的
+最佳单项。两节点均为 8×L20X、132 SM/GPU，实际 graphics clock 为
+1620 MHz；结束时再次确认 16 卡时钟与无残留 GPU 作业。H2048/I512、
+E64/top-k4、BF16，tokens 均为 **每 rank** 的数量。
+EP8 是单机八卡，B512/D8；EP16 是两机十六卡，B768/D6。
+本次不重新测试 1/64 的短序列性能。
+
+计时口径：
+
+- Native FWD/BWD：10 warmup + 200 measured，取每轮 rank-max wall 的 p50。
+  FWD 包括 Notify 和 main，开启 retain-state；固定形状的 tensors 在 warmup
+  后复用，权重在计时外发布。BWD 复用已保存 X/GU，前置 FWD 不计入 BWD。
+- 实际循环：50 warmup + 200 measured，直接计时应用入口的
+  `forward → backward → 释放 tape/gradients → synchronize`，包括每步权重
+  repack、精确 tensor 分配和 collective 准备边界。不是两个独立 p50 相加。
+- 冻结 V3 native 为 `build/static_inference_v3_20260923/test_cuda_notify`，
+  应用扩展为 `build/pf_training_v3_reference/`；V3 使用其原 profile 和动态路径。
+  AF 的缓存分配器优化是通用的 host 优化，V3 若另行移植也可能受益；不能将
+  下表实际循环的全部差距归于静态任务划分或 GEMM。
+- 构建结束后才测性能。EP16 独占两节点；最终 EP8 native 在第一台机器、
+  EP8 cycle 在第二台同时运行，各自与同机 V3 配对，没有共享 GPU。
+
+### 训练 Forward
+
+单位 µs，越小越好。
+
+| 拓扑 | tokens/rank | PF | V3 | 耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 单机 | 8192 | 1497.320 | 1723.900 | 13.14% |
+| EP8 单机 | 20480 | 3209.960 | 3570.160 | 10.09% |
+| EP16 双机 | 8192 | 3167.910 | 3434.550 | 7.76% |
+| EP16 双机 | 20480 | 6994.140 | 7238.990 | 3.38% |
+
+### 缓存 X/GU 的 Backward
+
+| 拓扑 | tokens/rank | PF | V3 | 耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 单机 | 8192 | 1765.540 | 2127.500 | 17.01% |
+| EP8 单机 | 20480 | 4606.750 | 5045.690 | 8.70% |
+| EP16 双机 | 8192 | 2840.510 | 2852.200 | 0.41% |
+| EP16 双机 | 20480 | 6620.240 | 7002.220 | 5.46% |
+
+EP16 8K 的 p95 为 PF 2858.51、V3 2893.38 µs，但优势仍小，应理解为
+接近持平、此轮小幅领先。200 样本内的 iid bootstrap 中位数差 95% 区间为
+7.58–16.09 µs（2000 次重采样，seed917）；它只描述本轮样本，不覆盖不同
+运行之间、设备之间的系统性波动，不据此声称普遍显著提升。
+
+### 实际 FWD+BWD 循环
+
+| 拓扑 | tokens/rank | PF | V3 | 耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 单机 | 8192 | 3925.061 | 6400.766 | 38.68% |
+| EP8 单机 | 20480 | 8673.361 | 10948.840 | 20.78% |
+| EP16 双机 | 8192 | 6498.275 | 9119.440 | 28.74% |
+| EP16 双机 | 20480 | 14112.698 | 17659.762 | 20.09% |
+
+### 正确性、生命周期与复现
+
+最终候选 EP8/EP16 × 8192/20480 的 native 两次运行，全部 rank 的
+dX/dGate/dW1/dW2 hash 与 c6be309 一致，repeat_equal=1。
+同四个形状的完整 Torch 回归均通过：output 和四组梯度 reference parity、
+非法/重复 route 拒绝、单 rank 分配失败后的全体一致失败及重试、三份 live
+tape 的热点/扩缩容/零入站迁移、原地 W1 更新后的完整 FWD/BWD，以及
+EP8 inference graph/offload。每个 EP8 case 有 8 个 weight-refresh marker，
+每个 EP16 case 有 16 个；没有缓存旧权重值。34 项既有 CPU 检查通过。
+
+AD/AC 的额外 20K 全热点与部分 rank memcheck 证据见前文；AF 没有改变
+payload 协议。这里不把旧 racecheck 的未决项改写成 sanitizer 全通过。
+Backward 的部分通信 payload 仍按实际 R 分配，并非全部改成有界 ring。
+没有恢复动态 GEMM 领用，也没有放宽「全部本地 dX 完成后才执行 dW」的边界。
+
+日志均在 `build/pf_training_timeline/`：
+
+- EP8 native：`{packed_storage_final,v3_packed_final}_ep8_t{8192,20480}_{forward,backward}.log`。
+- EP16 native：`{packed_storage_final,v3_packed_final}_t{8192,20480}_{forward,backward}.log`。
+- 实际循环：`{packed_storage_final,v3_packed_final}_ep8_cycle.log`；
+  `{packed_storage_200,v3_packed_pair_200}_ep16_cycle_node{0,1}.log`。
+- Native 数值：`packed_storage_final_ep{8,16}_t{8192,20480}_validation.log`。
+- Torch：`packed_storage_final_torch_ep8_t{8192,20480}.log`；
+  `packed_storage_torch_ep16_t{8192,20480}_node{0,1}.log`。
+
+最终候选 SHA256：
+
+```text
+native    61385a316d22af0553de1ece81e48488b7a77614318f27391c04fa1327e39091
+library   02aad150be56b69fbefe77531e21047f4064af875bec7eb55a56f770e90902f5
+extension 50cca0cc124fb884ceb3c2cdea3b27e0ce76588bdda3b024e6ea6263278d7320
+V3 native cc0471af98d0fcbcfa52b9c9669ae2e20fb9b8077aa36e483a11a4be6331a699
+V3 ext    39ab0b7f16fe69bbaaa4b0887da0e54258874ac1ea9bb55a97e0dab86b7c55ba
+```
