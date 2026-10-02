@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Eager Forward+Backward wall time with application-owned tensors (torchrun)."""
+"""Eager FWD+BWD with varying per-rank tokens and synthetic routes (torchrun).
+
+Input preparation is untimed. This exercises changing communication sizes, not
+a full training step: expert weights are fixed and there is no optimizer.
+"""
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import random
 import statistics
 import sys
 import time
@@ -14,6 +21,30 @@ import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from weftmoe.runtime import TensorRuntime
+
+
+def make_workload(args, nominal_tokens, rank, device):
+    """Freeze a reproducible CPU route trace, without keeping activations live."""
+    seed = args.seed + nominal_tokens * 1000003
+    lengths = random.Random(seed + rank)
+    routes_rng = torch.Generator(device=device).manual_seed(seed + rank)
+    # A common per-step bias creates expert hotspots shared across source ranks.
+    # A separate stream keeps it identical despite unequal token counts.
+    bias_rng = torch.Generator(device=device).manual_seed(seed + 1000000007)
+    sigma = nominal_tokens * args.token_std_fraction
+    low = max(1, math.ceil(nominal_tokens - 3 * sigma))
+    high = math.floor(nominal_tokens + 3 * sigma)
+    batches = []
+    for _ in range(args.warmups + args.samples):
+        tokens = round(lengths.gauss(nominal_tokens, sigma))
+        while not low <= tokens <= high:
+            tokens = round(lengths.gauss(nominal_tokens, sigma))
+        logits = torch.randn(tokens, args.experts, device=device, generator=routes_rng)
+        logits.add_(torch.randn(args.experts, device=device, generator=bias_rng),
+                    alpha=args.route_bias_std)
+        scores, routes = logits.topk(args.top_k, dim=-1)
+        batches.append((routes.int().cpu(), scores.softmax(dim=-1).cpu()))
+    return batches
 
 
 def main():
@@ -28,7 +59,19 @@ def main():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--token-std-fraction", type=float, default=0.1,
+                        help="Per-rank normal token std / nominal tokens; truncate at +/-3 std")
+    parser.add_argument("--route-bias-std", type=float, default=0.5,
+                        help="Std of per-step shared expert-logit bias; 0 gives uniform routing in expectation")
     args = parser.parse_args()
+    if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
+        parser.error("tokens and samples must be positive; warmups must be nonnegative")
+    if not 1 <= args.top_k <= args.experts:
+        parser.error("top-k must be between 1 and experts")
+    if any(not math.isfinite(value) or value < 0
+           for value in (args.token_std_fraction, args.route_bias_std)):
+        parser.error("distribution standard deviations must be finite and nonnegative")
     if args.backend == "v3":
         os.environ["WEFTMOE_DISABLE_STATIC_FORWARD_V4"] = "1"
         os.environ.pop("WEFTMOE_STATIC_RING_TOKENS", None)
@@ -41,7 +84,9 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
-    generator = torch.Generator(device="cuda").manual_seed(123 + rank)
+    if args.experts % world:
+        parser.error("experts must be divisible by the EP world size")
+    generator = torch.Generator(device="cuda").manual_seed(args.seed + rank)
 
     def rand(*shape):
         return torch.randn(*shape, device="cuda", dtype=torch.bfloat16,
@@ -51,18 +96,35 @@ def main():
     w1 = rand(owned, 2 * args.intermediate, args.hidden)
     w2 = rand(owned, args.hidden, args.intermediate)
     for tokens in args.tokens:
-        x, dy = rand(tokens, args.hidden), rand(tokens, args.hidden)
-        routes = ((torch.arange(tokens, device="cuda")[:, None] * 17 + rank * 31
-                   + torch.arange(args.top_k, device="cuda")[None, :] * 53)
-                  % args.experts).int()
-        gates = torch.rand(tokens, args.top_k, device="cuda", generator=generator)
+        batches = make_workload(args, tokens, rank, "cuda")
+        digest = hashlib.sha256()
+        for routes, gates in batches:
+            digest.update(routes.shape[0].to_bytes(8, "little"))
+            digest.update(routes.numpy().tobytes())
+            digest.update(gates.numpy().tobytes())
+        workload = dict(tokens=[routes.shape[0] for routes, _ in batches],
+                        sha256=digest.hexdigest())
+        workloads = [None] * world
+        dist.all_gather_object(workloads, workload)
+        # Size both backends for the exact same trace, including skewed routes.
+        # Do not assume received rows <= 2 * nominal tokens * top-k.
+        incoming = torch.stack([
+            torch.bincount(routes.flatten().long(), minlength=args.experts)
+            for routes, _ in batches
+        ]).reshape(len(batches), world, owned).sum(dim=-1).cuda()
+        dist.all_reduce(incoming, op=dist.ReduceOp.SUM)
+        incoming = incoming.cpu()
+        max_tokens = max(max(workload["tokens"]) for workload in workloads)
+        max_rows = int(incoming.max()) + owned * 128
         runtime = TensorRuntime(
             group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
-            hidden=args.hidden, intermediate=args.intermediate, max_tokens=tokens,
-            max_rows=2 * tokens * args.top_k + owned * 128, training=True, max_saved=2)
+            hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
+            max_rows=max_rows, training=True, max_saved=2)
         samples = []
         forward_samples = []
-        for iteration in range(args.warmups + args.samples):
+        for iteration, (cpu_routes, cpu_gates) in enumerate(batches):
+            routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
+            x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
             dist.barrier()
             torch.cuda.synchronize()
             start = time.perf_counter_ns()
@@ -75,14 +137,30 @@ def main():
             if iteration >= args.warmups:
                 samples.append(elapsed)
                 forward_samples.append((forward_end - start) / 1000)
+            del x, dy, routes, gates
         per_rank = [None] * world
         dist.all_gather_object(per_rank, samples)
         forward_per_rank = [None] * world
         dist.all_gather_object(forward_per_rank, forward_samples)
         if rank == 0:
             slowest = [max(row[i] for row in per_rank) for i in range(args.samples)]
+            measured_tokens = [workload["tokens"][args.warmups:] for workload in workloads]
+            flat_tokens = [count for counts in measured_tokens for count in counts]
             print("TRAINING_CYCLE_JSON " + json.dumps(dict(
-                backend=args.backend, world=world, tokens_per_rank=tokens,
+                schema_version=2, workload="variable_tokens_random_routes",
+                backend=args.backend, world=world, nominal_tokens_per_rank=tokens,
+                seed=args.seed, token_std_fraction=args.token_std_fraction,
+                token_truncation_std=3, route_bias_std=args.route_bias_std,
+                workload_sha256_per_rank=[workload["sha256"] for workload in workloads],
+                per_rank_tokens=measured_tokens,
+                per_rank_warmup_tokens=[workload["tokens"][:args.warmups]
+                                       for workload in workloads],
+                per_rank_received_rows=incoming[args.warmups:].T.tolist(),
+                actual_tokens_min=min(flat_tokens), actual_tokens_max=max(flat_tokens),
+                actual_tokens_mean=statistics.mean(flat_tokens),
+                actual_tokens_std=statistics.pstdev(flat_tokens),
+                max_tokens_capacity=max_tokens, max_rows_capacity=max_rows,
+                input_tokens_per_second=sum(flat_tokens) * 1e6 / sum(slowest),
                 experts=args.experts, top_k=args.top_k, hidden=args.hidden,
                 intermediate=args.intermediate, warmups=args.warmups,
                 samples=args.samples, wall_slowest_rank_p50_us=statistics.median(slowest),
