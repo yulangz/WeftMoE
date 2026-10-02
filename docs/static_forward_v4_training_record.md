@@ -1,5 +1,200 @@
 # V4 ring 训练对接记录
 
+## 2026-10-02：撤回 M，改用动态 workload 基准
+
+复测结论：删除 M 的影响是固定负载下少量 host collective 开销；随机 workload
+则暴露了原本就存在的 BWD 通信缓冲重分配/IPC 重映射瓶颈。旧固定负载的收益
+可以复现，但不能据此声称动态训练循环已经稳定、显著领先 V3。详见本节配对表
+和时间线诊断，后面的旧表仅作为历史记录。
+
+M 的跨调用 peer-mapping 快路径及专用 changed-bit collective 已删除。保留 M
+之前的本地同尺寸 allocation、未变 IPC handle 和同一不可变 plan 的复用；新
+plan 均重新执行完整地址交换/确认。下面的优化表和 `eb371c2` 数据是历史记录，
+不代表撤回后的性能。
+
+旧 `benchmark_training.py` 在循环外构造固定 X、路由和 gates，循环内不更新
+权重。因此历史“实际训练循环”准确含义是带分配/释放的固定路由 FWD+BWD
+微基准，不是真实训练 step，不能直接外推到动态路由 workload。
+
+新版基准每个 rank、每步独立采样 token 数：以 `--tokens` 为均值，默认标准差
+为均值的 10%，在 ±3σ 内重采样并取正整数；每步重新生成随机 logits，加上
+所有 source 共享的随机专家 bias，再取不重复的 top-k，选中 scores 做 softmax
+得到 gates。默认 bias 标准差为 0.5，使专家/rank 负载可偏斜而非强制均匀。
+`--seed`（默认 123）、`--token-std-fraction`、`--route-bias-std` 可调；
+`--token-std-fraction 0` 仅固定 token 数，不固定路由。
+
+路由 trace 预生成并保存在 CPU；计时外上传当前 routes/gates、生成新的 X/dY。
+预先汇总整条 trace 的真实接收计数，PF/V3 使用相同的 max-token/max-row
+容量，不再假设接收行数不超过均值的两倍，也不截断/丢弃热点路由。
+FWD/BWD、权重 packing、tape/gradient 分配与释放及末尾同步仍在计时内。
+固定专家权重、随机 logits 并不等于真实模型 router；基准没有 optimizer，
+仍属于更接近动态负载的算子微基准，不称完整训练吞吐。
+
+JSON 升为 schema 2：`nominal_tokens_per_rank` 取代旧固定形状字段；记录实际
+逐 rank/逐步 token 数、接收行数、token 分布、容量、路由/gates trace SHA256
+及按实际输入 token 总量计算的吞吐。PF/V3 对照必须使用相同分布、seed、
+warmup/sample 数，并核对每 rank 的 trace SHA256；计时分布不能与旧固定
+workload 表直接混比。恢复 GPU 后的数值与性能复测见下节。
+
+使用修改后的 PF 必须重建 native 库及 TensorRuntime adapter，旧 `eb371c2`
+产物仍含 M。单机 EP8 的基准参数示例（先设置对应的
+`WEFTMOE_TENSOR_EXTENSION`，V3 使用其独立 profile 构建）：
+
+```sh
+torchrun --standalone --nproc-per-node=8 tools/benchmark_training.py \
+  --backend pf --tokens 8192 20480 --warmups 50 --samples 200 \
+  --seed 123 --token-std-fraction 0.1 --route-bias-std 0.5 \
+  --ring-tokens 512 --ring-depth 8
+```
+
+CPU 侧已检查 EP8/EP16、8K/20K 的采样可复现性、top-k 唯一性、gates
+归一化和接收行数守恒；另以模拟 runtime 检查两 backend 的 trace/容量一致
+及 JSON 主流程。这些不是 GPU 数值或性能验证，未添加新的细粒度测试文件。
+既有 16 个公共头文件独立编译和 4 项 runtime-settings 检查通过。
+初次修改时 GPU 初始化失败，只完成编译/语法检查；GPU 恢复后已完成 native
+库与 TensorRuntime adapter 的完整构建。代码提交 `3f7b59a`，与旧验收配置
+对齐的新 PF 产物为 `build/pf_variable_workload/matched_profile/`，
+`libweftmoe.so` SHA256 为
+`3c9277873503e5f65e49fd9c878ed27956e0ea8858cf4367fb36577ed3e2917b`。
+
+首次重建漏了旧验收的 network lanes/Q 参数，误用默认 2/Q32/Q32，导致双机
+固定 8K/20K 循环达到 21.076/50.778 ms；这些 `new_pf_*_ep16_node*.log`
+不是同配置对照，**排除出正式表**，中断了该候选的动态测试。随后核对旧构建
+cache 中的完整命令，恢复 32/Q8/Q16 并重建、重测；不把此修正算作代码优化。
+复现必须保留以下 NVCCFLAGS（仓库根目录执行；库与 adapter 均需重建）：
+
+```sh
+export NVCCFLAGS="-lineinfo -I$PWD/configs/static_inference_ring_20260924 \
+  -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 \
+  -DWEFTMOE_FWD_STATIC_V4_NETWORK_LANES=32 \
+  -DWEFTMOE_FWD_STATIC_V4_PACKET_ROWS=8 \
+  -DWEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS=16"
+python build_native.py lib --output build/pf_variable_workload/matched_profile/libweftmoe.so --jobs 4
+python tools/build_tensor_runtime.py --library build/pf_variable_workload/matched_profile/libweftmoe.so
+```
+
+### GPU 恢复后的正确性复测
+
+L20X、1620 MHz，单机 EP8 / 双机 EP16；H2048/I512/E64/top-k4、BF16。
+以同一随机路由生成器检查每 rank 不等长的 nominal T256/8192/20480，各两步，
+输出、dX、dGate、dW1、dW2 全部通过 Torch reference（rtol 0.02、atol 0.00002）。
+EP8 共 48、EP16 共 96 个 rank-step 检查通过；使用临时验证脚本，未新增
+细粒度单测。既有 TensorRuntime 生命周期回归也在 EP8/EP16 通过，包含
+非法路由、分配失败后重试、多份 live tape、热点迁移/零入站、payload 扩缩容、
+权重原地更新及单机 EP8 子组的 inference/Graph。
+
+日志位于 `build/pf_variable_workload/`，同配置复测为
+`validation_matched_ep8.log`、`validation_matched_ep16_node{0,1}.log`、
+`lifecycle_matched_ep8.log`、`lifecycle_matched_ep16_node{0,1}.log`。
+此前不带 `matched` 的首轮数值检查也通过，正式性能仍须使用匹配配置。
+双机 launcher 显式设置两端
+`NCCL_IB_DISABLE=0`、`NCCL_SOCKET_IFNAME=eth0`、`NCCL_IB_GID_INDEX=3`；
+首次启动因继承的 IB 开关不一致而在 NCCL 初始化失败，保留于
+`validation_ep16_node{0,1}_env_mismatch.log`，不计作算法或性能结果。
+
+### 同配置的历史 / 固定 / 动态 workload 对照
+
+所有正式循环测量均为 50 warmup + 200 measured，单位 ms，取逐步
+**全 rank 最大 wall 的 p50**，包含 FWD/BWD、权重重排、准备/分配/释放和
+末尾同步；路由生成与当前 X/dY 准备在计时外。EP8 在第二台单机测试，
+EP16 独占两节点；PF 使用 B512/D8、B768/D6。新 PF 四档统一使用上述
+`matched_profile` 库，不拼接未匹配构建的结果。
+
+旧 PF 使用 `build/pf_backward_packed_storage/`（`eb371c2`），冻结 V3 使用
+`build/pf_training_v3_reference/`，库 SHA256 分别为
+`02aad150be56b69fbefe77531e21047f4064af875bec7eb55a56f770e90902f5`、
+`6d349d29f7120e00ae1225ac9ea8e0fa1423e6f18423828b3650c3b3c49812e1`。
+固定 workload 脚本取自 `git show eb371c2:tools/benchmark_training.py`，
+保存在 build 目录的 `benchmark_fixed.py`；动态 workload 使用当前脚本。
+
+先保持旧固定 workload 不变，只比较产物和删除 M 的影响：
+
+| 拓扑 | T/rank | 历史旧 PF | 本轮旧 PF | 删 M 后 PF | 本轮冻结 V3 | 删 M 相对本轮旧 PF |
+|---|---:|---:|---:|---:|---:|---:|
+| EP8 | 8192 | 3.925 | 3.911 | 3.986 | 6.423 | +1.94% |
+| EP8 | 20480 | 8.673 | 8.652 | 8.748 | 10.979 | +1.11% |
+| EP16 | 8192 | 6.498 | 6.503 | 6.622 | 10.082 | +1.83% |
+| EP16 | 20480 | 14.113 | 14.180 | 14.297 | 17.581 | +0.83% |
+
+相同旧 PF 产物与历史记录相差均不足 0.5%。删除 M 后多出约 76/96 µs
+（EP8）和 119/118 µs（EP16），没有出现 kernel 性能的数量级回退。
+V3 wall 的波动更大：EP16 8K 本轮 p10/p50/p90 为
+8.946/10.082/22.910 ms，不能把与历史 V3 的差值算成新 PF 的额外优化收益。
+
+再换成默认动态 workload（token σ=10%、共享专家 bias σ=0.5）：
+
+| 拓扑 | nominal T/rank | 旧 PF（含 M） | 删 M 后 PF | 冻结 V3 | 新 PF 相对 V3 耗时降低 |
+|---|---:|---:|---:|---:|---:|
+| EP8 | 8192 | 79.223 | 77.651 | 88.654 | 12.41% |
+| EP8 | 20480 | 189.886 | 189.377 | 190.990 | 0.84% |
+| EP16 | 8192 | 117.364 | 115.100 | 114.700 | -0.35% |
+| EP16 | 20480 | 251.682 | 257.742 | 260.921 | 1.22% |
+
+三份产物使用逐 rank SHA256 完全相同的 routes/gates trace，逐步 token 数、
+接收行数、warmup 长度和容量也逐项一致。旧 PF 同样出现数量级变慢，故不能
+归咎于删除 M。动态结果有显著长尾：新 PF 的 p10/p90 分别为
+67.349/121.006、155.983/240.632、85.443/196.795、204.809/389.401 ms
+（按表顺序）。本轮单机 8K 的 p50 有优势，其余三档接近持平；小百分比差值
+不作为稳定收益，旧固定负载的约 20%–39% 领先不能直接外推到动态训练。
+
+新 PF 的 FWD API / BWD remainder p50 分别为 2.512/75.234、5.305/183.938、
+4.764/109.992、10.512/245.822 ms。增长主要在 BWD 准备阶段；这里的 FWD
+是 host API 边界，BWD remainder 还含释放和末尾同步，不是纯 GPU kernel
+时长，也不是两个独立 p50 相加得到 cycle。
+
+正式日志：EP8 新 PF 为 `matched_new_pf_{fixed,dynamic}_ep8.log`，
+旧 PF/V3 为 `{old_pf,v3}_{fixed,dynamic}_ep8.log`；EP16 三份产物均为
+`matched_{new_pf,old_pf,v3}_{fixed,dynamic}_ep16_node{0,1}.log`。
+首轮不带 `matched` 的新 PF 性能日志保留审计，不用于本节的最终表。
+全部测试结束后，两节点 16 卡均为 1620 MHz、无残留 GPU 作业。
+
+动态 trace 的分布如下；均值/范围和 skew 仅统计 200 measured，容量覆盖
+warmup + measured。`skew` 是每步最大接收行数 / 全 rank 平均接收行数。
+
+| 拓扑 | nominal T | 实际 T 均值 / 范围 | skew p50 / max | max_tokens / max_rows 容量 |
+|---|---:|---:|---:|---:|
+| EP8 | 8192 | 8171.85 / 5781–10578 | 1.523 / 2.645 | 10578 / 91874 |
+| EP8 | 20480 | 20532.98 / 14370–26289 | 1.532 / 2.275 | 26289 / 190159 |
+| EP16 | 8192 | 8179.44 / 5781–10578 | 2.001 / 3.595 | 10578 / 121167 |
+| EP16 | 20480 | 20533.04 / 14370–26353 | 1.966 / 3.348 | 26353 / 278127 |
+
+每档 199 对相邻 measured 调用中，全 rank 的实际 rows/routes 同时不变的
+次数均为 **0**。旧 M 的跨调用跳过交换条件在这些相邻调用上没有命中。
+这也说明仅固定 nominal T 不能代表实际专家接收形状稳定。
+
+### 动态负载暴露的主要瓶颈：BWD IPC 映射生命周期
+
+对旧 PF（含 M、与旧验收完全相同的产物）另做单机 EP8、nominal 8K 的
+Nsight Systems 诊断：5 warmup + 10 measured，默认随机分布，NVTX 标记
+FWD/BWD API，仅采集测量段。下表是 8 ranks × 10 步的**每 rank-step 平均值**，
+不是正式 200 步的 rank-max p50；插桩结果不与正式性能表混用。
+
+| BWD 内部开销 | 每 rank-step 平均（ms） |
+|---|---:|
+| BWD API 整段 | 81.435 |
+| `cudaIpcOpenMemHandle`：7 次 | 56.687 |
+| `cudaIpcCloseMemHandle`：7 次 | 13.141 |
+| `cudaMalloc` | 2.093 |
+| `cudaFree` | 1.003 |
+| unified BWD 主 kernel（device 时间） | 2.454 |
+
+IPC open/close 共 560/560 次，占 BWD API 整段约 85.7%。其余还有集体确认、
+stream/event 等待和调用准备；GPU 时间与同步 API 耗时可能重叠，不将表中
+项目简单相加作为独立分解。
+
+原因：`BackwardPeerWorkspace` 只按**精确 rows/routes 相等**复用 allocation。
+随机 tokens/路由使实际接收行数变化，每个新 plan 重新 cudaMalloc、交换
+export，并在本机打开 7 份新 peer 映射、关闭旧映射，然后释放旧 payload。
+固定 workload 即使删除 M，仍可复用原 allocation/handle，不会支付这笔
+映射开销；M 只是少做地址交换/确认，删除它并没有引入该分配策略。
+因此动态循环的数量级变慢不能解释为 GEMM 本身退化，也不能用恢复 M 解决。
+
+证据保存在 `dynamic_ipc_profile.nsys-rep`、`dynamic_ipc_profile.sqlite` 和
+`profile_dynamic.log`（同上 build 目录）。下一步应优先设计可支持逻辑 shape
+变化的有界通信存储/映射复用，明确扩缩容与旧映射退休；不是重新引入全 rank
+shape 相等快路径，也不直接预留所有 rank 的最大热点容量。本轮仅验证与定位，
+未把这项新的存储优化混入删除 M 的对照。
+
 ## 优化总览（2026-10-01）
 
 这里汇总本文件中的 PF 训练优化：做了什么、测到了什么收益、最终是否保留。
@@ -8,7 +203,7 @@
 [ring 记录](static_forward_v4_ring_record.md)；decode 独立见
 [DT 记录](static_forward_v4_decode_record.md)，不混入本表的训练收益。
 
-### 最终结果：相对冻结 V3
+### 历史固定 workload 结果：相对冻结 V3
 
 最终代码 `eb371c2`，L20X、1620 MHz、H2048/I512/E64/top-k4、BF16；
 8K/20K 均为每 rank tokens。EP8 是单机，EP16 是双机。
@@ -59,7 +254,7 @@ FWD/BWD wall 与实际训练循环是不同口径；未独立量化的项目明�
 | B/D 窗口消融 | EP8 保留 B512/D8；EP16 从早期 B512/D8 经 B1024/D4，最终选择 B768/D6。 | 最后一步相对 1024/4，EP16 FWD 降低 1.98% / 1.37%；pool 少约 74.8/74.7 MB/rank，但注册部分多约 8.5 MB，不包含独立 tape。 |
 | I/J：流式 Reduce + 整链描述符 | 通信空闲时非阻塞归约已齐的 token；整块计算链只传递一次静态描述符，少两次 DSM mailbox 往返。 | 组合后 EP8 BWD 降低 2.51% / 1.27%。I 单独在 EP8 20K 退化，不能把组合收益拆成两项通用加速。 |
 | K：合并分配确认 | 输入/权重/tape 在同一次 collective preparation 中准备，已绑定 tensors 不再重复确认。 | FWD wall：EP8 降低 2.83% / 2.40%，EP16 降低 2.39% / 1.42%；device GEMM 不变。 |
-| M：复用 BWD peer mapping | 所有 rank 的实际 shape 均不变时复用地址及 IPC 映射；变化/失败信息并入原确认状态字。 | 稳态这部分 host collective 从 3 次减到 1 次；有 rank 变化仍完整交换。没有可单独归因的稳定耗时百分比。 |
+| M：复用 BWD peer mapping（已撤回） | 所有 rank 的实际 shape 均不变时跳过地址/映射交换确认。2026-10-02 删除该快路径及 changed-bit 协议。 | 历史固定 workload 下这部分 host collective 从 3 次减到 1 次；缺少真实动态路由命中率与稳定独立耗时收益，不再采用。 |
 | Y2：BWD 寄存器配额 | 本模型 math/control 从 216/64 调到 208/88，给通信/producer 更多寄存器；FWD 不变。 | GIN 栈从 208B 降到 72B，EP16 BWD 降低 0.91% / 0.96%，单机无回退；不是所有模型的通用默认值。 |
 | AC：复用启动准备 | 缓存同一启动配置的属性/occupancy 检查，不再为未使用的 split kernel 设置属性。 | EP16 BWD 2840.62/6615.60 → 2832.94/6616.67 µs，8K 小幅改善、20K 持平；属于 host 提交优化。 |
 | AD：条件独占 GIN 提交 | 实际 context 足够且 CTA 无别名时使用 THREAD 模式，否则保留 GPU sharing。 | EP16 BWD 2832.94/6616.67 → 2824.17/6609.28 µs，仅约 0.31% / 0.11%；不删除任何 credit/完成检查。 |
@@ -91,11 +286,11 @@ gate、8 行 up 交错，使 FC1 可用同一 packed GEMM 计算二者。1620 MH
 ## 记录说明与当前状态
 
 对应设计文档 M6，按时间保留改造、失败候选和验证记录。
-2026-10-01 当前 PF 训练已使用 count-only mini Notify、main 内 planner、
+截至 2026-10-01，PF 训练已使用 count-only mini Notify、main 内 planner、
 按实际 R/P 分配的独立 tape，以及静态 Backward；非 ring 路径保留 V3 对照。
-最终实现为 `eb371c2`：包含静态调度、peer mapping/launch 准备复用、Y2 的
+当日验收实现为 `eb371c2`：包含静态调度、peer mapping/launch 准备复用、Y2 的
 208/88 Backward 寄存器配额、AD 条件独占 GIN，以及 AF 的应用侧权重 packing
-scratch。Forward 寄存器配额不变。
+scratch。Forward 寄存器配额不变。M 后续撤回及基准口径修订见本文开头。
 
 1620 MHz、EP8 单机/EP16 双机、8K/20K 的 FWD、BWD、实际训练循环共十二项
 最终配对均低于冻结 V3，完整数据见文末「最终统一验收」。双机 8K BWD 仅
@@ -2941,6 +3136,9 @@ REG168/SHARED2048/LOCAL0，GIN STACK72、本地 STACK0。
 EP8/EP16 各档 FWD/BWD/cycle 性能门禁仍待下面统一汇总，不提前标记完成。
 
 ## 最终统一验收：2026-10-01，eb371c2
+
+这是当日固定路由/固定 tokens 的历史验收；2026-10-02 已撤回 M 并修改基准，
+本节不作为新实现或动态 workload 已通过性能门禁的证据。
 
 最终候选统一为 `build/pf_backward_packed_storage/`，不是拼接不同候选的
 最佳单项。两节点均为 8×L20X、132 SM/GPU，实际 graphics clock 为

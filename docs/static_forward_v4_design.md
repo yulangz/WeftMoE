@@ -1197,12 +1197,13 @@ eager 权重发布的 interleaved W1 scratch 同样由应用缓存分配器提�
   不重复归约、不等待缺失的 contribution 来阻塞通信。
 
 Backward peer workspace 属于执行 slot，不是 live tape。跨调用实际 rows/routes
-不变时可以复用其地址与 IPC 映射，但必须是**全 rank 一致**的复用决策。
-既有分配确认的 uint64 状态字编码为
-`(failure_rank_or_world << 1) | !changed`，一次 MIN 同时保留最低失败 rank
-和无失败时的 any-changed。只有无人变化才跳过地址 AllGather/import 确认；
-任一 rank 扩缩容仍执行原完整协议，旧 imports 全部关闭后才释放旧 export。
-不因此扩大实际缓存、保留历史热点 payload，或跳过 device readiness/credit。
+不变时仍可沿用本地 allocation，handle 未变时不重复打开 IPC 映射，但每份新的
+Notify plan 都执行分配确认、地址 AllGather 和 import 确认。旧 imports 全部
+关闭并完成集体确认后，才释放被替换的旧 export。相同不可变 plan 的重复
+Backward 保留原有 generation 快路径。
+2026-10-02 撤回 M 的跨调用 any-changed 快路径：真实动态路由难以使所有 rank
+的实际接收行数同时保持相等，不再为该情形保留 changed-bit 协议。分配确认
+恢复 uint32 的最低失败 rank；不扩大缓存、不跳过 device readiness/credit。
 
 Backward 与 Forward 共用 backend 的 launch 准备缓存，按 entry、资源配额
 与启动几何复用已通过的寄存器、shared-memory/stack 和 occupancy 检查。
