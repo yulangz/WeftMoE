@@ -1,12 +1,19 @@
 # V4 ring 训练对接记录
 
-## M7 开发中：私有 dR 与有界 Return（尚未验收）
+## M7：私有 dR 与有界 Return（功能完成，性能未验收）
+
+保留提交为 `f17a39f`（私有实际 R dR）和 `69647e8`（有界 Return）。
+20K 的每卡 native 常驻区 + Torch 活跃峰值，EP8 减少约 840 MiB，
+EP16 减少约 1092 MiB；随机数值、极端路由、内存检查、真实 Megatron
+DDP/卸载恢复通过。推理四档规模相差均不到 0.4%。但训练 FWD+BWD 相对
+改造前已验收 resident 仍慢 24%–30%，**本轮不是性能已验收版本**；
+正式相邻对照及测量口径见本节后半部分，不以早期动态 IPC 开销作性能基线。
 
 目标：dR 随实际 R 进入调用者 allocator 的私有 workspace；固定通信入口不变，
 不再为 dR 长期预留容量或导出 IPC。Return 进一步按 source window 循环复用
 dX/contribution，保留完整 U/dAB 与全部本地 dX 之后的完整 dW。
 
-当前 dR 原型已通过 EP8 随机 8K/20K、EP16 随机 8K/20K，以及 B16/D1 的
+早期 dR 原型通过 EP8 随机 8K/20K、EP16 随机 8K/20K，以及 B16/D1 的
 热点迁移、空接收 rank、live tapes、inference graph/offload 验证。
 这只是正确性阶段，**还不能替代已验收 resident 版本**：匹配编译配置的
 20 warmup/60 sample 双机 cycle 从 9.34/21.69 ms 回退至 13.86/30.46 ms；
@@ -21,7 +28,7 @@ M7a 提交是可验证的私有 dR 正确性里程碑，性能门禁仍留在 M7
 
 最早一次构建遗漏了三项网络 profile 宏（32 lanes/Q8/return Q16），导致
 FWD 也变慢；该组性能已排除。后续对照显式传入相同宏，不能将编译配置差异
-归因于 dR 改造。最终保留实现、显存收益和性能验收结果待补。
+归因于 dR 改造。最终保留实现、显存收益和性能结果见下文。
 
 ### M7b Return ring 开发消融（未关闭性能门禁）
 
@@ -54,7 +61,7 @@ B512/D8 为 7.235/16.405 ms，B512/D32 为 6.867/14.265 ms，B1024/D8 为
 
 `direct_return` 已通过 EP8/EP16 随机 8K/20K 全部五项数值，EP16 B16/D1
 小 ring，以及 20K 极端热点、空接收 rank、三份 live tape、OOM 重试、权重刷新
-和图/卸载测试。最新 head 缓存候选及 sanitizer 尚在验证，不沿用旧版本结论。
+和图/卸载测试。这是该候选当时的结果，最终代码的独立验证见下文。
 产物/逐步日志均位于 `build/pf_private_dr/<candidate>/`。
 
 未保留的实验：
@@ -78,8 +85,80 @@ inference 组的图/卸载检查通过。补充 EP4 B16/D1 和 EP8 非 ring 回�
 最终版本 EP8 rank0/7、EP16 rank0/15 的 memcheck 全部为 0 errors。
 既有 native CUDA 测试源完成编译，未增加细粒度内部实现测试。
 
-这个提交完成私有实际尺寸 dR、有界 Return 的功能合同，**不代表性能验收**。
-此前 resident 产物保持不动；相邻性能、显存及真实 Megatron 路径的完整结果另补。
+这个提交（`69647e8`）完成私有实际尺寸 dR、有界 Return 的功能合同，
+**不代表性能验收**。此前 resident 产物保持不动。
+
+#### 相邻完整复测
+
+相同编译 profile、1620 MHz、20 warmup/60 sample；每步随机 token 数及
+路由，逐 rank trace SHA256/容量/接收行数匹配。整轮为逐步最慢 rank 的
+FWD+BWD wall p50，单位 ms：
+
+| 规模 | resident | M7b | 耗时变化 |
+|---|---:|---:|---:|
+| 单机 EP8，8K | 5.363 | 6.981 | +30.2% |
+| 单机 EP8，20K | 11.686 | 14.790 | +26.6% |
+| 双机 EP16，8K | 9.301 | 11.564 | +24.3% |
+| 双机 EP16，20K | 21.424 | 26.529 | +23.8% |
+
+FWD 持平，回退集中在 BWD。因此尚不能将有界化视作性能优化，也不以早期
+包含逐调用 IPC 开关开销的旧产物充当 V3 对照，掩盖当前 resident 回退。
+后续继续检查 canonical dU 跨 source 边界与窗口 Return 的依赖。
+
+同一两样本随机 workload 的每卡最大观测空间（MiB）：
+
+| 规模 | 常驻 compute：resident → M7b | 常驻区 + Torch 活跃峰值：resident → M7b |
+|---|---:|---:|
+| 单机 EP8，8K | 747.8 → 435.7 | 1785.5 → 1471.3 |
+| 单机 EP8，20K | 1521.3 → 683.3 | 3645.9 → 2805.8 |
+| 双机 EP16，8K | 997.9 → 591.0 | 2725.0 → 2316.9 |
+| 双机 EP16，20K | 2137.2 → 1046.8 | 5510.2 → 4417.9 |
+
+第二列只计 native compute；第三列计 native compute/GIN/notify 与 Torch
+活跃分配的同时峰值，不含 CUDA context、allocator 空闲缓存，不是驱动整进程
+峰值。dR 转为私有分配后的空间已包含，未只展示移出常驻区的表面收益。
+
+推理采用 50 warmup/200 sample、graph 内 10 次重复，1/64/8K/20K 全部
+EP8/EP16 相对 resident 的耗时差均小于 0.4%；未改推理 main kernel。
+真实 Megatron TP4+EP8 与 TP4+EP16 的 DDP、两次 optimizer update、
+suspend/resume 均通过，不只是 mock adapter。证据位于
+`build/pf_private_dr/final/{performance,inference,memory,framework}*.log`。
+
+#### M7b 后续调度消融：未保留
+
+继续检查是否能通过提前计算、改变窗口内顺序消除回退。相同 10 warmup/
+30 sample 随机 trace，下面仍为整轮最慢 rank p50，单位 ms；不能与上面
+20/60 的正式表直接相减。EP8 为单机 B512/D8，EP16 为双机 B768/D6。
+
+| 候选 | EP8 8K / 20K | EP16 8K / 20K |
+|---|---:|---:|
+| 已保留 dx_pairs | 7.020 / 15.488 | 11.937 / 27.007 |
+| planned_output_checked：预计算每行 dX 写回指针 | 未测性能 | 12.239 / 28.596 |
+| window_aligned：窗口内串联 dU→SwiGLU→dX，pull 同序 | 7.336 / 16.456 | 11.731 / 26.019 |
+| window_ahead：窗口 dU 提前执行，dX 独立 N-pair 调度 | 7.206 / 15.802 | 12.424 / 24.982 |
+
+- canonical dU 的 M128 可以跨 source 边界，早期窗口因而可能依赖上一个
+  source 的尾部 dispatch。尝试将整个 activation chain 改为 window-major，
+  dU/SwiGLU 后另存 canonical U/dAB 给完整 dW；同时按相同目录的 batch
+  residue 做节点内 dR pull。双机略有收益，但单机回退约 4.5%/6.3%。
+- 串联又使 dU 受到 source contribution credit 限制，故进一步让窗口 dU
+  不受该 credit 限制，dX 独立等待 canonical dAB 后 gather。双机 20K 相对
+  dx_pairs 改善约 7.5%，但双机 8K 回退约 4.1%，单机两档回退约 2.6%/2.0%。
+  没有形成跨规模收益，撤回整组改动，未给生产路径增加按规模分支。
+- 首次串联原型错误地用各自紧密行距重解释共享 staging，H 与 2I 不同时
+  不同 cluster 的区域互相覆盖，数值测试失败。修正版统一物理行距为
+  `max(H,2I)`，不是额外保留整批 dR/dAB 副本。失败原型没有性能结论。
+
+`window_aligned` 通过 EP8/EP16 随机数值、双机极端热点/空接收/live tapes/
+OOM 重试/权重刷新/卸载，以及四份 memcheck（0 errors）。`window_ahead`
+通过相同数值和生命周期测试，但未做独立 memcheck，不借用前一候选结论。
+全部调度实验和预计算写回指针均未保留；代码恢复到 `69647e8`。日志与产物
+位于对应 `build/pf_private_dr/<candidate>/`，最后一个候选的补丁另存为
+`window_ahead/source.patch`，不增加内部实现细节单测。
+
+目前证据说明单纯调整 activation 任务顺序不足以同时恢复四档训练性能。
+私有 dR 的 RX fanout/pull 和有界 Return 的 credit 等待仍需单独优化；
+保持 M7c 性能门禁开放，不把显存收益或某一规模的改善等同于整体验收。
 
 ## 2026-10-02：通信 workspace 按容量常驻，阶段切换显式退休 IPC
 

@@ -15,6 +15,10 @@ Backward 保留完整 U/dAB，以及所有本地 dX 完成后才开始的完整 
 - [ ] M7c：EP8 单机/EP16 双机、1620 MHz；随机不等长 8K/20K 正确性与相邻性能
   对照，补充空接收 rank、热点迁移、小 ring、live tapes/OOM 重试和 suspend 释放。
   分别记录实际峰值显存、常驻通信容量、初始化与稳态耗时；每个完成里程碑提交。
+  功能、memcheck、真实 Megatron DDP/卸载恢复及完整相邻复测已完成；
+  训练整轮相对 resident 仍回退 24%–30%，因此性能门禁未关闭。后续窗口串联/
+  提前计算实验没有形成跨规模收益，已撤回，当前实现仍为 `69647e8`。
+  数据及显存口径见 [训练记录 M7](static_forward_v4_training_record.md)。
 
 M7b 当前实现采用以下布局（数值及 memcheck 已通过，尚不作为性能已验收 profile）：
 
