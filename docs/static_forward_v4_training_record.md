@@ -1,8 +1,141 @@
 # V4 ring 训练对接记录
 
+## 2026-10-02：通信 workspace 按容量常驻，阶段切换显式退休 IPC
+
+本轮解决下节动态 workload 暴露的重分配瓶颈：BWD peer payload 从“实际
+rows/routes 一变就重新分配”改为按容量 lazy 分配、驻留期复用；不修改 GEMM、
+ring 调度或数值流程，也没有恢复已删除的 M。代码提交 `ceec6a0`。
+随机 workload 的 8K/20K FWD+BWD，EP8 从 79.43/196.18 ms 降至
+5.30/11.77 ms，EP16 从 111.15/253.51 ms 降至 9.40/21.21 ms；
+同一测量段反复 IPC open/close 消失，共卡 suspend 仍能实际释放显存。
+
+### 改动与边界
+
+- BWD dR 初始容量使用调用者的 `max_rows` hint；source contribution/dGate
+  按 `max_tokens * top_k` 预留。它们属于执行 slot，串行层/microbatch 共享，
+  不是每层、每份 saved tape 各保留一份通信缓存。首次 Backward lazy init，
+  后续实际 token/专家接收行数变化只更新逻辑尺寸与 TMA 描述符，不更换地址。
+- dR 还要留到 dW2 使用，因此当前不是可立即覆盖的 ring slot；它与完整
+  source contribution 是整次调用的 payload。TMA 仍按实际行数限定有效范围，
+  不把预留容量误当成有效数据。超过 hint 的极端热点按几何增长安全扩容，
+  不丢 token、不随短 batch 收缩。有限 heuristic 不保证任意热点绝不扩容。
+- FWD 的 X/S/contribution ring、跨机 GIN 注册窗口本来已按 runtime 容量
+  常驻，本轮不改成重复分配。训练保存的 X/GU、输出和梯度仍按各 tape/调用
+  分配；不能因缓存通信 workspace 而延长 autograd tensor 生命周期。
+- 新 plan 仍有分配确认、地址 AllGather 和 import 确认；只在 handle 真正
+  改变时重建 IPC 映射。这不是依赖路由不变的跨调用快路径。
+- 共卡 offload 改为两阶段退出：同步/检查无 live tape → EP barrier →
+  清理内部推理图并关闭所有 FWD/BWD IPC imports → EP barrier → 销毁
+  export、GIN/NCCL 与 runtime。外层图先由 SGLang 清理；Megatron suspend
+  也清除 packed weights。恢复时新建驻留期，没有进程级永久 CUDA 缓存。
+
+空间代价是缓存已预留/增长到的容量，而不是每步缩回实际尺寸。dR 和 source
+contribution 的主要字节数为 `2 * H * (row_capacity + max_tokens * top_k)`，
+另有 dGate、地址表等；不是把 `world * max_tokens * top_k` 的全局最坏
+路由元数据上限直接当作每卡 dR 初始容量。Megatron 继续使用
+`2 * max_tokens * top_k + local_experts * 128` 的 hint；基准则使用其整条
+trace 的最大接收行数，二者都走相同容量复用机制。
+
+### 复测条件与时间线
+
+L20X，全部 1620 MHz，H2048/I512/E64/top-k4，BF16；50 warmup + 200
+measured，默认 token σ=10%、共享专家 bias σ=0.5、seed=123。EP8 是第二台
+单机，EP16 是双机，分别使用 B512/D8、B768/D6。时长口径仍为逐步全 rank
+最大 FWD+BWD wall 的 p50；不含初始化、路由生成与 X/dY 准备，不含 optimizer。
+下节固定 workload 数字不与本节混比。
+
+产物为 `build/pf_resident_workspace/`，库 SHA256：
+`65746dbf0be207da2405c753bbdbdc188d94fdd264753fee29848990774fd24b`。
+编译参数与下节 matched_profile 完全一致，包含 32 network lanes、Q8/Q16
+及 generated tuning；没有更改 GEMM profile。对照“此前 PF”为删 M 后的
+`3f7b59a` matched_profile，V3 仍使用冻结 reference。旧 adapter 不含新的
+retire API，基准临时入口仅恢复旧版 close 流程，未改其计时路径。
+
+三份产物的逐 rank routes/gates trace SHA256、每步 token 数、接收行数、
+warmup/sample 数和容量逐项完全一致。本轮配对结果（ms）：
+
+| 拓扑 | nominal T/rank | 此前 PF | 常驻容量 PF | 冻结 V3 | 相对此前 PF 耗时降低 |
+|---|---:|---:|---:|---:|---:|
+| 单机 EP8 | 8192 | 79.433 | 5.299 | 83.975 | 93.33% |
+| 单机 EP8 | 20480 | 196.177 | 11.772 | 190.076 | 94.00% |
+| 双机 EP16 | 8192 | 111.153 | 9.396 | 120.045 | 91.55% |
+| 双机 EP16 | 20480 | 253.508 | 21.213 | 282.990 | 91.63% |
+
+相对本轮冻结 V3，耗时分别降低 93.69%、93.81%、92.17%、92.50%；V3
+仍包含同类反复重分配成本，不将此表解读为纯 kernel 或调度效率对比。
+新 PF 的 FWD API p50 为 2.447/5.250 ms（EP8）、4.648/10.368 ms（EP16），
+此前 PF 对应 2.525/5.353、4.762/10.465 ms，未出现 FWD 回退。新 BWD
+remainder p50 为 2.859/6.551、4.757/10.814 ms；它还含释放/末尾同步，
+不是纯 kernel 时间，也不能将两个阶段的独立 p50 直接相加当 cycle。
+
+正式日志：`{resident_pf,previous_pf,v3}_ep8.log` 和
+`{resident_pf,previous_pf,v3}_ep16_node{0,1}.log`；复现入口为当前
+`tools/benchmark_training.py`（旧产物用 build 下的 `benchmark_frozen.py`），
+参数与下节相同。逐项 trace 对齐检查已通过。
+
+Nsight 同样测单机 EP8、nominal 8K、5 warmup + 10 measured，合计 80 个
+rank-step：此前 `cudaIpcOpenMemHandle` / `cudaIpcCloseMemHandle` 各 560 次，
+本轮二者以及 `cudaIpcGetMemHandle` 均为 **0 次**。BWD API 平均由
+81.435 ms 降为 3.233 ms。测量段仍有 9 次其它 `cudaMalloc`，不能把
+“通信 payload 无反复重分配/映射”说成整个训练循环零分配。
+
+这个数量级的收益主要来自消除 host CUDA IPC 生命周期开销，**不是 GEMM
+快了十几倍，也不是静态任务划分独有的收益**；V3 若同样改成容量复用，也能
+消除这类开销。FWD/inference 的计算 kernel 本轮没有改动。
+
+### Inference 前后对照
+
+同一库/profile、1620 MHz；固定 T bucket，逐次测量前更新随机 routes/gates，
+50 warmup + 200 measured。外层 CUDA Graph 串行包含 10 次算子，CUDA event
+测量后除以 10，取全 rank 最大值的 p50；不含输入准备/捕获/退出开销，不能
+与上面的动态训练 wall 或完整服务请求延迟混比。单机 T1/64 使用 DT 小容量池，
+较长输入和全部双机输入走 PF。
+
+| T/rank | EP8 此前 → 本轮（µs） | 变化 | EP16 此前 → 本轮（µs） | 变化 |
+|---|---:|---:|---:|---:|
+| 1 | 35.328 → 35.285 | -0.12% | 235.219 → 235.936 | +0.30% |
+| 64 | 57.646 → 57.672 | +0.04% | 291.562 → 290.771 | -0.27% |
+| 8192 | 1531.283 → 1531.485 | +0.01% | 3066.459 → 3057.989 | -0.28% |
+| 20480 | 3623.270 → 3621.966 | -0.04% | 7031.128 → 7021.375 | -0.14% |
+
+变化均不超过 0.31%，视为持平；各档 `compute_bytes/gin_bytes/notify_bytes`
+也与此前完全一致，inference 不会分配新增的 BWD 常驻 payload。两阶段退休
+只发生在关闭 runtime 时，没有给 graph replay 添加 collective。
+脚本与日志：build 下的 `inference_benchmark.py`、`run_inference.py`、
+`inference_perf_{resident_pf,previous_pf}_{ep8,ep16_node0,ep16_node1}.log`。
+
+### 生命周期与框架兼容
+
+EP8/EP16 已通过随机不等长 nominal T256/8192/20480 的 FWD、dX、dGate、dW1、
+dW2 Torch reference，分别 48/96 个 rank-step；既有生命周期测试增加小容量
+hint、热点迁移及短 batch，
+验证溢出增长、增长后不缩容、多份 live tape、分配失败重试、原地更新权重。
+释放测试在记录起点前先 `empty_cache()`，关闭后检查驱动可用显存实际增加
+至少 pool 报告的 native 字节数，不只检查 Python 对象置空。
+
+真实 Megatron TP4+EP8、TP4+EP16、DDP 梯度累积、两次 optimizer 更新与两轮
+suspend/resume 通过，分别 16/32 个 rank-step。EP16 训练关闭后切换为四个
+节点内 EP4 inference 组，也通过多层图回放及卸载。PF 的 EP8/EP16
+inference 在 T1/64/8192/20480 通过 eager/graph、混合长短输入、空 source、
+极端热点、动态路由与权重刷新，分别 240/480 项检查。
+
+完整 Qwen3.5-35B-A3B 的 SGLang DP4+EP4 服务通过
+三轮 KV/graph 释放、恢复和 greedy 32-token 输出一致性检查；模型权重在该
+检查中保持驻留，因此这不是完整 RL step 或 AWEX 权重更新吞吐验收。
+
+详细日志、配对运行脚本和 Nsight 产物保存在 `build/pf_resident_workspace/`。
+分别为 `validation_ep8.log` / `validation_ep16_node{0,1}.log`、
+`lifecycle_release_ep8.log` / `lifecycle_ep16_node{0,1}.log`、
+`megatron_release_ep8.log` / `megatron_ep16_node{0,1}.log`、
+`inference_ep8.log` / `inference_ep16_node{0,1}.log`、`dynamic_ipc_profile.*`，
+整模型服务为 `sglang_server.log` / `sglang_offload.log`。
+只扩充既有集成测试，没有新增检查符号名或私有布局的细碎单测。
+
 ## 2026-10-02：撤回 M，改用动态 workload 基准
 
-复测结论：删除 M 的影响是固定负载下少量 host collective 开销；随机 workload
+以下是容量复用修复前的历史诊断；最新结果以上一节为准。
+
+当时的复测结论：删除 M 的影响是固定负载下少量 host collective 开销；随机 workload
 则暴露了原本就存在的 BWD 通信缓冲重分配/IPC 重映射瓶颈。旧固定负载的收益
 可以复现，但不能据此声称动态训练循环已经稳定、显著领先 V3。详见本节配对表
 和时间线诊断，后面的旧表仅作为历史记录。

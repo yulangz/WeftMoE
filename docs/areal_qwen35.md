@@ -1,5 +1,45 @@
 # Qwen3.5 接入 AReaL
 
+## 常驻通信缓存与共卡释放复测（2026-10-02）
+
+`ceec6a0` 将 PF Backward 的 peer payload 改为容量复用：一个 runtime
+驻留期内按 `max_tokens` 与接收行数 hint 首次 lazy 分配，串行层和变长
+microbatch 共用；实际行数变化不再反复分配/IPC open/close。超出 hint 的
+热点仍会安全增长，不丢 token。FWD ring、GIN 注册窗口原本已常驻；训练
+saved X/GU 仍跟随各 autograd tape，不放进长期通信缓存。
+
+兼容现有 AReaL 生命周期，不新增进程级 cache：
+
+- Megatron 的 weight-residency offload 先调用 adapter `suspend()`；无 live
+  tape 后关闭 runtime，并清 packed weights、清理 Torch cache。恢复训练时
+  `prepare()` 重建 runtime，Backward peer payload 在首次需要时创建。
+- SGLang/AWEX release hook 先销毁外层 CUDA Graph，再关闭 DT/PF runtime
+  及 staging。恢复全部 offload tags 后重新准备和捕获图。
+- `TensorRuntime.close()` 现在是明确的两阶段 IPC 退休：同步并在 EP 组
+  barrier；清内部图、关闭所有本地 IPC imports；第二次 EP barrier 后才释放
+  exporters/GIN/NCCL。第二个 barrier 只在退出驻留期时发生，不进入每步算子。
+  native 库与 Python adapter 需要同时重建。
+
+本轮真实框架检查：Megatron TP4+EP8、TP4+EP16 均通过两层 MoE、DDP
+microbatch 梯度累积、两次 optimizer 更新及两轮 suspend/resume；驱动显存
+检查在测量前先清除旧 Torch cache，要求关闭后实际释放至少 native pool
+报告的字节数。另有 EP16 训练 runtime 释放后切换为四个节点内 EP4 inference
+组的 graph/offload 回归通过。
+
+完整 Qwen3.5-35B-A3B-Base 的 SGLang DP4+EP4 单机服务，context 32768、
+mem-fraction-static 0.4、cuda-graph-max-bs 512、1620 MHz，完成三轮
+`release_memory_occupation` / `resume_memory_occupation`，每轮重新生成的
+greedy 32-token IDs 与卸载前完全一致。仅 release KV/graph，权重保持驻留；
+卸载后各 rank 的驱动可用显存约 86.9–87.9 GB，恢复后约 63.5–64.2 GB，
+包含 native workspace、图及框架资源，不能把全部差额算作 BWD payload。
+这不是新一轮完整 RL 性能对照，也不代替 AWEX 权重更新验收。
+
+产物与日志：`build/pf_resident_workspace/` 的
+`megatron_release_ep8.log`、`megatron_ep16_node{0,1}.log`、
+`lifecycle_ep16_node{0,1}.log`、`sglang_server.log`、`sglang_offload.log`。
+动态算子性能、内存取舍及配对条件见
+[训练记录开头](static_forward_v4_training_record.md)。下面保留历史 RL 对照记录。
+
 ## DP4+EP4 对照（2026-09-30，运行中）
 
 在 [decode 记录第 9 节](static_forward_v4_decode_record.md) 的单层 DP-local
