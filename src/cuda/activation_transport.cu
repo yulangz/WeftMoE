@@ -2394,6 +2394,18 @@ make_activation_transport_pool(const CollectiveSession &session,
   return ActivationTransportResourcePool(std::move(impl));
 }
 
+void ActivationTransportResourcePool::retire_peer_mappings() {
+  if (!impl_)
+    return;
+  auto &state = *impl_->state;
+  for (auto &slot : state.slots) {
+    if (slot.backward_peer_workspace)
+      slot.backward_peer_workspace->close_mappings();
+  }
+  if (state.peer_mappings)
+    state.peer_mappings->close();
+}
+
 ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
   if (!impl_ || !impl_->state)
     transport_error(NotifyErrorCode::InvalidHandle, "transport-pool-usage",
@@ -2951,7 +2963,7 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
     for (auto &slot : pool.impl_->state->slots)
       if (!slot.backward_peer_workspace)
         slot.backward_peer_workspace = std::make_shared<BackwardPeerWorkspace>(
-            session, execution, local_world);
+            session, execution, local_world, capacity);
 }
 
 GinRdmaForwardMegaKernel::GinRdmaForwardMegaKernel(

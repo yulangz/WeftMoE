@@ -152,10 +152,14 @@ def main():
             for p in model.parameters():
                 p.grad = p.main_grad.to(p.dtype)
         optimizer.step()
+        usage = adapter.runtime.native.usage()
+        resident_bytes = sum(usage[key] for key in ("compute_bytes", "gin_bytes", "notify_bytes"))
+        torch.cuda.empty_cache()
         before = torch.cuda.mem_get_info()[0]
         adapter.suspend()
         after = torch.cuda.mem_get_info()[0]
         assert adapter.runtime is None and not adapter.packed
+        assert after - before >= resident_bytes, (after - before, resident_bytes)
         print(
             dist.get_rank(),
             "MEGATRON_PARITY_AND_OFFLOAD_PASS",

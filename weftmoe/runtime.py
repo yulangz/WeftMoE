@@ -202,6 +202,10 @@ class TensorRuntime:
         if self.training and self.native.usage()["notify_slots_in_use"]:
             raise RuntimeError("Live backward tapes prevent closing the runtime")
         dist.barrier(group=self.group)
+        self.native.retire_peer_mappings()
+        # No exporter may free its storage while another rank still has an
+        # IPC import. This boundary also covers inference graph workspaces.
+        dist.barrier(group=self.group)
         self.native = None
 
 

@@ -1,8 +1,9 @@
 #pragma once
 
 // Host ownership for rank-local Backward communication payloads. A workspace
-// belongs to one execution slot, not to any retained Forward tape. Exact-shape
-// reuse avoids reallocating warm calls without retaining historical hotspots.
+// belongs to one execution slot, not to any retained Forward tape. Logical
+// rows are independent of storage capacity: one residency keeps its payloads
+// and IPC mappings across variable microbatches and expert routes.
 struct BackwardPeerWorkspace {
   struct Export {
     cudaIpcMemHandle_t handle{};
@@ -11,7 +12,7 @@ struct BackwardPeerWorkspace {
   struct Buffer {
     std::shared_ptr<tensor_storage_detail::Allocation> allocation;
     Export descriptor;
-    std::uint64_t rows = 0, routes = 0;
+    std::uint64_t row_capacity = 0, route_capacity = 0, hidden = 0;
     std::size_t table = 0;
     CUtensorMap dr_map{}, dr_mn_map{};
   };
@@ -21,6 +22,7 @@ struct BackwardPeerWorkspace {
   CudaExecution execution;
   cudaStream_t stream;
   unsigned local_world;
+  std::uint64_t initial_rows, max_rows, max_routes;
   std::shared_ptr<tensor_storage_detail::Allocation> exchange;
   std::shared_ptr<Buffer> buffer;
   PeerMappings mappings;
@@ -35,11 +37,18 @@ struct BackwardPeerWorkspace {
   }
 
   BackwardPeerWorkspace(const NcclSession &session, const CudaExecution &exec,
-                         unsigned local_size)
+                         unsigned local_size, const ActivationTransportPoolConfig &config)
       : preparation(session, exec),
         nccl(internal::NcclSessionAccess::checked(session)), execution(exec),
         stream(internal::checked_execution_state(exec)->stream),
-        local_world(local_size) {
+        local_world(local_size),
+        initial_rows(config.backward_peer_capacity_rows),
+        max_rows(config.max_destination_rows_per_rank),
+        max_routes(checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                               "Backward route capacity")) {
+    if (!initial_rows)
+      initial_rows = checked_mul(max_routes, 2ULL, "Backward initial row capacity");
+    initial_rows = std::min(initial_rows, max_rows);
     preparation.run([&] {
       exchange = tensor_storage_detail::allocate(
           nccl->world * sizeof(Export), exec.device_ordinal());
@@ -54,12 +63,7 @@ struct BackwardPeerWorkspace {
   }
 
   void close_mappings() noexcept {
-    for (unsigned rank = 0; rank < nccl->world; ++rank) {
-      if (mappings.owned[rank])
-        (void)cudaIpcCloseMemHandle(mappings.bases[rank]);
-      mappings.bases[rank] = nullptr;
-      mappings.owned[rank] = 0;
-    }
+    mappings.close();
   }
 
   ~BackwardPeerWorkspace() noexcept {
@@ -71,8 +75,9 @@ struct BackwardPeerWorkspace {
   std::shared_ptr<Buffer> allocate(std::uint64_t rows, std::uint64_t routes,
                                   std::uint64_t hidden) {
     auto result = std::make_shared<Buffer>();
-    result->rows = rows;
-    result->routes = routes;
+    result->row_capacity = rows;
+    result->route_capacity = routes;
+    result->hidden = hidden;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
     append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
@@ -90,12 +95,6 @@ struct BackwardPeerWorkspace {
         tensor_storage_detail::allocate(cursor, execution.device_ordinal());
     auto *base = result->allocation->data;
     check(cudaIpcGetMemHandle(&result->descriptor.handle, base));
-    result->dr_map = make_bf16_tma_map(
-        base, hidden, std::max(rows, std::uint64_t{1}),
-        backward_tuning::kActivationTileM, "actual Backward dR",
-        backward_tuning::kTileK);
-    result->dr_mn_map = make_bf16_tma_map_mn(
-        base, hidden, std::max(rows, std::uint64_t{1}), "actual Backward dR MN");
     return result;
   }
 
@@ -105,12 +104,31 @@ struct BackwardPeerWorkspace {
     // allocation, address exchange or host collective.
     if (buffer && generation == next_generation)
       return;
+    generation = 0;
     std::shared_ptr<Buffer> next;
     preparation.run([&] {
-      next = buffer && buffer->rows == rows && buffer->routes == routes
-          ? buffer : allocate(rows, routes, hidden);
+      if (buffer && buffer->hidden == hidden && rows <= buffer->row_capacity &&
+          routes <= buffer->route_capacity) {
+        next = buffer;
+      } else {
+        // A rare hotspot may exceed the initial heuristic, but must not drop
+        // routes. Grow geometrically; ordinary shape changes keep the handle.
+        const auto reserved = buffer
+            ? std::min(max_rows, checked_mul(buffer->row_capacity, 2ULL,
+                                             "Backward grown row capacity"))
+            : initial_rows;
+        next = allocate(std::max(rows, reserved), std::max(routes, max_routes), hidden);
+      }
+      // Preserve the logical TMA bounds, including zero fill of tail tiles.
+      // The descriptor may change without replacing or remapping the storage.
+      next->dr_map = make_bf16_tma_map(
+          next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
+          backward_tuning::kActivationTileM, "actual Backward dR",
+          backward_tuning::kTileK);
+      next->dr_mn_map = make_bf16_tma_map_mn(
+          next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
+          "actual Backward dR MN");
     });
-    generation = 0;
     exports[nccl->rank] = next->descriptor;
     auto *device = static_cast<Export *>(exchange->data);
     check(cudaMemcpyAsync(device + nccl->rank, &exports[nccl->rank],

@@ -174,9 +174,9 @@ def main():
     if os.environ.get("TEST_PEER_PAYLOAD_REUSE") == "1":
         # Retain three independent tapes while the execution-slot payload grows,
         # shrinks and changes owner. The middle invocation also has fewer source
-        # rows; empty destinations must not retain a previous hotspot's capacity.
+        # rows. Both hotspot capacities stay resident until runtime.close().
         tapes = []
-        cases = ((tokens, 0), (max(1, tokens // 4), experts - top_k), (tokens, 0))
+        cases = ((tokens, 0), (tokens, experts - top_k), (max(1, tokens // 4), 0))
         for count, first_expert in cases:
             case_x = all_x[:world * count]
             case_g = gate[:world * count]
@@ -203,10 +203,10 @@ def main():
                                            rtol=0.02, atol=0.00002)
             usage = runtime.native.usage()
             assert usage["notify_slots_in_use"] == len(cases) - index - 1
-            if index == 0:
-                first_compute_bytes = usage["compute_bytes"]
+            if index == 1:
+                warmed_compute_bytes = usage["compute_bytes"]
             elif index == 2:
-                assert usage["compute_bytes"] == first_compute_bytes
+                assert usage["compute_bytes"] == warmed_compute_bytes
             print(rank, "PEER_PAYLOAD_REUSE_PASS", index, usage, flush=True)
         del tapes, tape
         # Reusing packing storage must not cache values across optimizer steps.
@@ -225,7 +225,15 @@ def main():
                                        rtol=0.02, atol=0.00002)
         del tape
         print(rank, "TRAINING_WEIGHT_REFRESH_PASS", flush=True)
+    usage = runtime.native.usage()
+    resident_bytes = sum(usage[key] for key in ("compute_bytes", "gin_bytes", "notify_bytes"))
+    torch.cuda.empty_cache()
+    free_before = torch.cuda.mem_get_info()[0]
     runtime.close()
+    torch.cuda.empty_cache()
+    freed = torch.cuda.mem_get_info()[0] - free_before
+    assert freed >= resident_bytes, (freed, resident_bytes)
+    print(rank, "TRAINING_WORKSPACE_RELEASE_PASS", freed, resident_bytes, flush=True)
     del output, runtime
     # AReaL trains across EP16 but serves with independent node-local EP4
     # engines. Allow the test to exercise those distinct process groups.
@@ -317,9 +325,15 @@ def main():
                 )
         print(rank, "MULTILAYER_GRAPH_PASS", inference.native.usage(), flush=True)
         del graph
+    usage = inference.native.usage()
+    resident_bytes = sum(usage[key] for key in ("compute_bytes", "gin_bytes", "notify_bytes"))
+    torch.cuda.empty_cache()
+    free_before = torch.cuda.mem_get_info()[0]
     inference.close()
     del inference, graph_first, graph_second, capture
     torch.cuda.empty_cache()
+    freed = torch.cuda.mem_get_info()[0] - free_before
+    assert freed >= resident_bytes, (freed, resident_bytes)
     print(rank, "GRAPH_DESTROY_AND_OFFLOAD_PASS", flush=True)
     dist.destroy_process_group()
 

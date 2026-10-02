@@ -84,9 +84,11 @@ class Runtime {
         ? tuning["window_tokens"].cast<unsigned>()
         : ring_setting ? std::stoul(ring_setting) : 0U;
     const bool training_ring = training && ring_tokens;
+    const auto peer_capacity_rows = max_rows;
     if (training_ring) {
       // Only canonical routing/scheduler metadata uses this worst-case
-      // capacity. X/S stay bounded; saved tensors and Backward payload use R.
+      // capacity. X/S stay bounded and saved tensors use R; Backward peer
+      // storage starts with the caller's capacity hint, not the global maximum.
       if (max_tokens > UINT32_MAX / top_k / world)
         throw std::invalid_argument("training ring metadata exceeds uint32 row indices");
       max_rows = std::max(max_rows, max_tokens * top_k * world);
@@ -127,6 +129,7 @@ class Runtime {
     capacity.max_nodes = nodes;
     capacity.max_owned_experts = experts / world;
     capacity.max_destination_rows_per_rank = max_rows;
+    capacity.backward_peer_capacity_rows = peer_capacity_rows;
     capacity.max_inflight_generations = 1;
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
@@ -324,6 +327,16 @@ class Runtime {
     result["notify_bytes"] = n.device_bytes;
     result["notify_slots_in_use"] = n.slots_in_use;
     return result;
+  }
+
+  void retire_peer_mappings() {
+    // TensorRuntime.close() has synchronized all ranks; outer application
+    // graphs must already be discarded. Drop internal plans before unmapping
+    // any of their addresses, but keep exports alive until the next barrier.
+    plans_.clear();
+    buckets_.clear();
+    inference_weights_.clear();
+    pool_.retire_peer_mappings();
   }
 
   py::object graph_forward(unsigned layer, py::object x, py::object routes,
@@ -561,5 +574,6 @@ PYBIND11_MODULE(_runtime, m) {
       .def("eager_inference_async", &Runtime::eager_inference_async)
       .def("profile_inference", &Runtime::profile_inference)
       .def("drain_eager_inference", &Runtime::drain_eager_inference)
+      .def("retire_peer_mappings", &Runtime::retire_peer_mappings)
       .def("usage", &Runtime::usage);
 }

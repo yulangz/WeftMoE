@@ -1420,12 +1420,16 @@ struct PeerMappings {
   std::shared_ptr<internal::NcclSessionState> nccl;
   std::vector<void *> bases;
   std::vector<std::uint8_t> owned;
-  ~PeerMappings() noexcept {
+  void close() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
-    for (std::size_t i = 0; i < bases.size(); ++i)
+    for (std::size_t i = 0; i < bases.size(); ++i) {
       if (owned[i] && bases[i])
         (void)cudaIpcCloseMemHandle(bases[i]);
+      owned[i] = 0;
+      bases[i] = nullptr;
+    }
   }
+  ~PeerMappings() noexcept { close(); }
 };
 
 // Communication storage outlives any one compute arena. A larger Notify

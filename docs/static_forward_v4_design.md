@@ -1196,14 +1196,33 @@ eager 权重发布的 interleaved W1 scratch 同样由应用缓存分配器提�
   独立 pointer table 不覆盖活跃 TMA staging。传输退休后从原 cursor 继续，
   不重复归约、不等待缺失的 contribution 来阻塞通信。
 
-Backward peer workspace 属于执行 slot，不是 live tape。跨调用实际 rows/routes
-不变时仍可沿用本地 allocation，handle 未变时不重复打开 IPC 映射，但每份新的
-Notify plan 都执行分配确认、地址 AllGather 和 import 确认。旧 imports 全部
-关闭并完成集体确认后，才释放被替换的旧 export。相同不可变 plan 的重复
-Backward 保留原有 generation 快路径。
-2026-10-02 撤回 M 的跨调用 any-changed 快路径：真实动态路由难以使所有 rank
-的实际接收行数同时保持相等，不再为该情形保留 changed-bit 协议。分配确认
-恢复 uint32 的最低失败 rank；不扩大缓存、不跳过 device readiness/credit。
+Backward peer workspace 属于执行 slot，不是 live tape。2026-10-02 改为
+**容量复用**：首次 Backward lazy 分配，实际 rows/routes 变化不再更换 allocation。
+`backward_peer_capacity_rows` 是 dR 初始容量 hint；TensorRuntime 使用调用者的
+`max_rows`，不会误用训练路由元数据的全局最坏行数。native hint 为 0 时取
+两倍 `max_tokens_per_rank * max_top_k`，受 metadata 行数上限约束；source-side
+contribution/dGate 按 `max_tokens_per_rank * max_top_k` 预留。
+
+这部分不是网络 ring：dR 按整次调用的 compact row 索引，且在 dX 之后还用于
+dW2。物理 buffer 的容量、各区偏移在驻留期内保持稳定；TMA 描述符仍使用
+**实际 rows**，保留尾块越界补零语义。实际负载超过 hint 时按至少两倍旧容量
+扩容（不超过 metadata 上限，且覆盖本次实际需要），之后不因缩短输入而收缩。
+因此预留容量内无重分配/重映射，极端热点仍可安全扩容而非丢 token；没有声称
+有限 heuristic 能覆盖任意大接收量。驻留结束统一释放，不做进程级永久缓存。
+
+每份新的 Notify plan 仍执行分配确认、地址 AllGather 和 import 确认，未恢复
+M 的 any-changed 协议。只有 peer 的 allocation/handle 真正变化才重建对应映射；
+旧 imports 全部关闭并完成集体确认后才释放被替换的旧 export。相同不可变
+plan 的重复 Backward 保留 generation 快路径，分配确认仍用 uint32 最低失败 rank。
+
+共卡切换的 `TensorRuntime.close()` 要求无 live training tape，外层 CUDA Graph
+先由应用销毁。所有 rank quiesce 后先 barrier，native 清理内部推理图并调用
+`ActivationTransportResourcePool::retire_peer_mappings()`，统一关闭 FWD/BWD imports；
+第二次 barrier 确认全部 imports 已退休，再销毁 runtime/export/GIN 资源。
+`retire_peer_mappings()` 是终止边界，之后不能再次执行该 pool。
+Megatron `suspend()` 同时清除共享 packed weights；SGLang 先清外层图，再关闭
+PF/DT runtime，resume 在新驻留期重建。SavedX/GU 和梯度仍由各 tape/调用方
+独立持有，不被通信 workspace 的容量缓存延长生命周期。
 
 Backward 与 Forward 共用 backend 的 launch 准备缓存，按 entry、资源配额
 与启动几何复用已通过的寄存器、shared-memory/stack 和 occupancy 检查。

@@ -79,7 +79,7 @@ struct ActivationTransportPoolConfig {
   // backend. Their windows survive compatible compute-arena growth. This flag
   // never selects the backend by itself.
   bool enable_gin_rdma = false;
-  // Enable reusable Backward metadata and actual-sized peer workspaces.
+  // Enable reusable Backward metadata and capacity-sized peer workspaces.
   // Long-lived X/A/B checkpoints and final outputs belong to
   // ForwardTensorStorage, independently of these execution slots.
   bool enable_backward_state = false;
@@ -89,6 +89,10 @@ struct ActivationTransportPoolConfig {
   std::uint32_t static_forward_window_tokens = 0;
   // Source-side Return/Reduce capacity, independent of destination X/S/C.
   std::uint32_t static_forward_contribution_windows = 2;
+  // Initial dR capacity, independent of worst-case routing metadata. Zero
+  // reserves twice the source-route capacity. Payloads grow only on overflow;
+  // changing the actual row count never shrinks their allocation or IPC maps.
+  std::uint64_t backward_peer_capacity_rows = 0;
 };
 
 struct ActivationTransportPoolUsage {
@@ -107,6 +111,10 @@ class ActivationTransportResourcePool {
 public:
   ActivationTransportResourcePool() = default;
   ActivationTransportPoolUsage usage() const;
+  // Terminal phase boundary: first quiesce all users and discard captured
+  // graphs on every rank, then retire imports, then collectively agree before
+  // destroying any exporting pool. No further execution may use this pool.
+  void retire_peer_mappings();
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 
 private:
