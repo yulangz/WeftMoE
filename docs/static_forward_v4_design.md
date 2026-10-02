@@ -1,5 +1,21 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-02：Backward 私有 dR 与 Return ring 实施约定
+
+本轮保持训练/推理的 Forward 主 kernel 和元数据容量布局不变，不做元数据瘦身。
+Backward 保留完整 U/dAB，以及所有本地 dX 完成后才开始的完整 dW 归约。
+
+- [ ] M7a：通信入口保持稳定地址，目标 GPU 自行将 dY 收入按实际 R 申请的私有
+  dR；dR 与 U/dAB 同属本次 Backward workspace，不导出 IPC、不跨调用保留。
+  节点内复用已导出的输入平面；跨机 RX 在所有实际 fanout 消费完后归还 credit。
+- [ ] M7b：Return 改为与 Forward 相同的 source-window 准入、逐 slot generation
+  与消费 credit；仅通信环常驻，移除全量 dX_rows/source contribution 临时量。
+  dGate 随 route 发布并写回最终输出，不引入 dW split-reduce 或梯度原子加。
+  窗口推进必须保证当前窗口的所有专家路由可完成，不能在未来窗口等待时饿死当前窗口。
+- [ ] M7c：EP8 单机/EP16 双机、1620 MHz；随机不等长 8K/20K 正确性与相邻性能
+  对照，补充空接收 rank、热点迁移、小 ring、live tapes/OOM 重试和 suspend 释放。
+  分别记录实际峰值显存、常驻通信容量、初始化与稳态耗时；每个完成里程碑提交。
+
 更新：2026-09-29。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
 第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training
 V4 已经落地。**

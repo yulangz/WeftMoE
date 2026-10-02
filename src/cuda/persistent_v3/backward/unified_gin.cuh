@@ -8,9 +8,10 @@ namespace wire = activation_ring_detail;
 namespace ring = communication;
 namespace shared_gin = forward_unified_transport::gin_detail;
 using forward_unified_transport::copy_row;
-using forward_unified_transport::copy_row_fanout;
 using forward_unified_transport::copy_sync;
 using forward_unified_transport::finish_copies;
+
+#include "cuda/weftmoe_pf/backward_dispatch.cuh"
 
 __device__ __forceinline__ bool terminal(const BackwardKernelArgs &a) {
   for (unsigned context = 0U; context < a.gin_sender_count; ++context)
@@ -103,55 +104,6 @@ __device__ __forceinline__ void pack_return(const BackwardKernelArgs &a,
 }
 
 template <unsigned BaseThread, class Storage>
-__device__ __forceinline__ void receive_dispatch(const BackwardKernelArgs &a,
-                                                 Storage &s,
-                                                 const wire::Transfer &task) {
-  const unsigned tid = threadIdx.x - BaseThread;
-  const unsigned warp = tid / 32U, lane = tid % 32U;
-  const auto *chunk = static_cast<const char *>(a.gin_window_base) +
-                      a.gin_rings.payload(task.channel, task.sequence, true) +
-                      sizeof(ring::ChunkHeader);
-  const unsigned items = task.rows * a.dispatch.identity.top_k;
-  if (lane == 0U) {
-    for (unsigned row = warp; row < task.rows; row += Storage::kCopyWarps) {
-      const auto *record = chunk + row * a.gin_rings.dispatch_row_bytes;
-      const auto header = *reinterpret_cast<const ring::DispatchRow *>(record);
-      const unsigned fanouts =
-          min(header.fanouts, unsigned(a.dispatch.identity.top_k));
-      copy_row_fanout(
-          s, warp, record + a.gin_rings.dispatch_row_bytes - a.hidden * 2ULL,
-          unsigned(a.hidden * 2ULL), fanouts,
-          [&, record](unsigned index) -> void * {
-            const auto target =
-                reinterpret_cast<const ForwardDispatchFanoutRecord *>(
-                    record + sizeof(ring::DispatchRow))[index];
-            const auto destination = a.node * a.local_world_size +
-                                     target.destination_local_rank;
-            return a.peer_payloads[destination].dr +
-                   target.dst_row * a.hidden;
-          });
-    }
-    finish_copies();
-  }
-  copy_sync<Storage::kCopyThreads>();
-  for (unsigned item = tid; item < items; item += Storage::kCopyThreads) {
-    const auto *record = chunk + (item / a.dispatch.identity.top_k) *
-                                     a.gin_rings.dispatch_row_bytes;
-    const unsigned index = item % a.dispatch.identity.top_k;
-    if (index >= reinterpret_cast<const ring::DispatchRow *>(record)->fanouts)
-      continue;
-    const auto target = reinterpret_cast<const ForwardDispatchFanoutRecord *>(
-        record + sizeof(ring::DispatchRow))[index];
-    local_notification_detail::Receiver<BackwardKernelArgs>::publish_dispatch(
-        a, target.dst_row, target.destination_local_rank);
-  }
-  copy_sync<Storage::kCopyThreads>();
-  if (tid == 0U)
-    wire::finish_receive(a, task);
-  copy_sync<Storage::kCopyThreads>();
-}
-
-template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ void receive_return(const BackwardKernelArgs &a,
                                                Storage &s,
                                                const wire::Transfer &task) {
@@ -193,18 +145,16 @@ template <unsigned BaseThread, class Storage>
 __device__ __forceinline__ bool progress_receive(const BackwardKernelArgs &a,
                                                  Storage &s, bool dispatch) {
   const unsigned tid = threadIdx.x - BaseThread;
+  if (dispatch)
+    return publish_dispatch<BaseThread>(a, s);
   if (tid == 0U)
-    wire::claim_receive(a, dispatch ? s.gin_rx_dispatch : s.gin_rx_return,
-                        s.gin_task, dispatch);
+    wire::claim_receive(a, s.gin_rx_return, s.gin_task, false);
   copy_sync<Storage::kCopyThreads>();
   const bool received = s.gin_task.channel != wire::kNoChannel;
   copy_sync<Storage::kCopyThreads>();
   if (!received)
     return false;
-  if (dispatch)
-    receive_dispatch<BaseThread>(a, s, s.gin_task);
-  else
-    receive_return<BaseThread>(a, s, s.gin_task);
+  receive_return<BaseThread>(a, s, s.gin_task);
   return true;
 }
 

@@ -7,7 +7,7 @@
 struct BackwardPeerWorkspace {
   struct Export {
     cudaIpcMemHandle_t handle{};
-    std::size_t contribution = 0, dgate = 0;
+    std::size_t contribution = 0, dgate = 0, dispatch_slots = 0;
   };
   struct Buffer {
     std::shared_ptr<tensor_storage_detail::Allocation> allocation;
@@ -22,6 +22,7 @@ struct BackwardPeerWorkspace {
   CudaExecution execution;
   cudaStream_t stream;
   unsigned local_world;
+  unsigned dispatch_ctas = 0;
   std::uint64_t initial_rows, max_rows, max_routes;
   std::shared_ptr<tensor_storage_detail::Allocation> exchange;
   std::shared_ptr<Buffer> buffer;
@@ -49,6 +50,10 @@ struct BackwardPeerWorkspace {
     if (!initial_rows)
       initial_rows = checked_mul(max_routes, 2ULL, "Backward initial row capacity");
     initial_rows = std::min(initial_rows, max_rows);
+    int sms = 0;
+    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                                 exec.device_ordinal()));
+    dispatch_ctas = static_cast<unsigned>(sms) & ~1U;
     preparation.run([&] {
       exchange = tensor_storage_detail::allocate(
           nccl->world * sizeof(Export), exec.device_ordinal());
@@ -80,26 +85,37 @@ struct BackwardPeerWorkspace {
     result->hidden = hidden;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
-    append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
-                                "Backward dR elements"),
-            sizeof(transport::BFloat16), "Backward compact dR");
+    if constexpr (!backward_tuning::kUnifiedWorkers)
+      append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
+                                  "Backward dR elements"),
+              sizeof(transport::BFloat16), "Backward compact dR");
     result->descriptor.contribution = append(
         cursor, checked_mul(routes, hidden, "Backward contribution elements"),
         sizeof(transport::BFloat16), "Backward source contributions");
     result->descriptor.dgate =
         append(cursor, routes, sizeof(float), "Backward source dGate");
+    result->descriptor.dispatch_slots = append(
+        cursor, dispatch_ctas * communication::kRingDepth,
+        sizeof(backward_detail::DispatchSlot),
+        "Backward RX fanout credits");
     result->table = append(cursor, nccl->world,
                             sizeof(backward_detail::PeerPayload),
                             "Backward peer payload addresses");
     result->allocation =
         tensor_storage_detail::allocate(cursor, execution.device_ordinal());
     auto *base = result->allocation->data;
+    check(cudaMemsetAsync(at<void>(base, result->descriptor.dispatch_slots), 0,
+                          dispatch_ctas * communication::kRingDepth *
+                              sizeof(backward_detail::DispatchSlot),
+                          stream));
     check(cudaIpcGetMemHandle(&result->descriptor.handle, base));
     return result;
   }
 
   void prepare(std::uint64_t next_generation, std::uint64_t rows,
                 std::uint64_t routes, std::uint64_t hidden) {
+    if constexpr (backward_tuning::kUnifiedWorkers)
+      rows = 0U;
     // A retained Notify plan is immutable. Repeating that Backward needs no
     // allocation, address exchange or host collective.
     if (buffer && generation == next_generation)
@@ -117,17 +133,20 @@ struct BackwardPeerWorkspace {
             ? std::min(max_rows, checked_mul(buffer->row_capacity, 2ULL,
                                              "Backward grown row capacity"))
             : initial_rows;
-        next = allocate(std::max(rows, reserved), std::max(routes, max_routes), hidden);
+        next = allocate(backward_tuning::kUnifiedWorkers ? 0U : std::max(rows, reserved),
+                        std::max(routes, max_routes), hidden);
       }
       // Preserve the logical TMA bounds, including zero fill of tail tiles.
       // The descriptor may change without replacing or remapping the storage.
-      next->dr_map = make_bf16_tma_map(
+      if constexpr (!backward_tuning::kUnifiedWorkers) {
+        next->dr_map = make_bf16_tma_map(
           next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
           backward_tuning::kActivationTileM, "actual Backward dR",
           backward_tuning::kTileK);
-      next->dr_mn_map = make_bf16_tma_map_mn(
+        next->dr_mn_map = make_bf16_tma_map_mn(
           next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
           "actual Backward dR MN");
+      }
     });
     exports[nccl->rank] = next->descriptor;
     auto *device = static_cast<Export *>(exchange->data);
@@ -163,7 +182,8 @@ struct BackwardPeerWorkspace {
           payloads[rank] = {
               static_cast<transport::BFloat16 *>(base),
               at<transport::BFloat16>(base, exports[rank].contribution),
-              at<float>(base, exports[rank].dgate)};
+              at<float>(base, exports[rank].dgate),
+              at<backward_detail::DispatchSlot>(base, exports[rank].dispatch_slots)};
         }
       });
     } catch (...) {

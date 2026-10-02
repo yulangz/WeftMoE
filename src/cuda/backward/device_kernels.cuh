@@ -275,15 +275,14 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
 }
 
 // Shared by the standalone reducer and the retired communication warps.
-// Caller supplies one disjoint source-pointer table per warp. Arithmetic,
-// canonical route order, readiness acquire and output packing are identical.
+// One pointer per lane replaces the shared table. Canonical route order,
+// readiness acquire and output packing are identical.
 template <bool Wait = true>
 __device__ __forceinline__ bool backward_reduce_dx_token(
-    const BackwardKernelArgs &a, std::uint64_t token,
-    const transport::BFloat16 **source_rows) {
+    const BackwardKernelArgs &a, std::uint64_t token) {
   constexpr std::uint32_t kTrainingTopK = 6U;
-  // One lane publishes each route pointer. The dynamic top-k path must not
-  // index the six-entry storage used by the unrolled training fast path.
+  // Keep one route pointer per lane. Warp broadcasts preserve canonical
+  // top-k order without a separate shared-memory pointer table.
   const auto lane = threadIdx.x & 31U;
   if (token >= a.dispatch.identity.num_tokens)
     return false;
@@ -293,12 +292,13 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
                                              a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
   bool available = true;
+  unsigned long long source_address = 0ULL;
   if (lane < a.dispatch.identity.top_k) {
     const auto position = lane;
     const auto slot = a.dispatch.combine_order[route_base + position];
     const auto route = route_base + slot;
     auto *source = contribution + route * a.hidden;
-    source_rows[position] = source;
+    source_address = reinterpret_cast<unsigned long long>(source);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);
     if constexpr (Wait) {
@@ -323,7 +323,7 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
       for (std::uint32_t position = 0U; position < kTrainingTopK;
            ++position) {
         const auto packed = reinterpret_cast<const uint4 *>(
-            source_rows[position])[vector];
+            __shfl_sync(0xffffffffU, source_address, position))[vector];
         const unsigned int words[4] = {packed.x, packed.y, packed.z,
                                        packed.w};
 #pragma unroll
@@ -341,7 +341,7 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
       for (std::uint32_t position = 0U;
            position < a.dispatch.identity.top_k; ++position) {
         const auto packed = reinterpret_cast<const uint4 *>(
-            source_rows[position])[vector];
+            __shfl_sync(0xffffffffU, source_address, position))[vector];
         const unsigned int words[4] = {packed.x, packed.y, packed.z,
                                        packed.w};
 #pragma unroll
@@ -370,13 +370,11 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
 }
 
 __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
-  constexpr std::uint32_t kMaxTopK = 32U;
   constexpr std::uint32_t kWarpsPerCta =
       backward_tuning::kReduceThreads / 32U;
   const auto warp = threadIdx.x / 32U;
   const auto token = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerCta + warp;
-  __shared__ const transport::BFloat16 *source_rows[kWarpsPerCta][kMaxTopK];
-  backward_reduce_dx_token(a, token, source_rows[warp]);
+  backward_reduce_dx_token(a, token);
 }
 
 #include "cuda/persistent_v3/backward/pipeline_kernels.cuh"

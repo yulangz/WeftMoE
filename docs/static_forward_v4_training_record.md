@@ -1,5 +1,28 @@
 # V4 ring 训练对接记录
 
+## M7 开发中：私有 dR 与有界 Return（尚未验收）
+
+目标：dR 随实际 R 进入调用者 allocator 的私有 workspace；固定通信入口不变，
+不再为 dR 长期预留容量或导出 IPC。Return 进一步按 source window 循环复用
+dX/contribution，保留完整 U/dAB 与全部本地 dX 之后的完整 dW。
+
+当前 dR 原型已通过 EP8 随机 8K/20K、EP16 随机 8K/20K，以及 B16/D1 的
+热点迁移、空接收 rank、live tapes、inference graph/offload 验证。
+这只是正确性阶段，**还不能替代已验收 resident 版本**：匹配编译配置的
+20 warmup/60 sample 双机 cycle 从 9.34/21.69 ms 回退至 13.86/30.46 ms；
+FWD 持平，回退来自 BWD。RX 多 slot、连续行静态划分和双缓冲预取的独立
+实验暂未消除回退，不把它们记录为性能收益。完整证据在 `build/pf_private_dr/`。
+
+随后将跨 GPU fanout 元数据筛选改为 warp 并行：10 warmup/30 sample 同一
+trace 的 EP16 cycle 从 cooperative 原型的 14.03/31.90 ms 降到
+11.18/24.64 ms（8K/20K，约改善 20.3%/22.8%），EP8 随机数值和 EP16
+小 ring 生命周期测试通过；相邻 resident 对照为 9.75/21.67 ms，仍有回退。
+M7a 提交是可验证的私有 dR 正确性里程碑，性能门禁仍留在 M7c，不视为最终验收。
+
+最早一次构建遗漏了三项网络 profile 宏（32 lanes/Q8/return Q16），导致
+FWD 也变慢；该组性能已排除。后续对照显式传入相同宏，不能将编译配置差异
+归因于 dR 改造。最终保留实现、显存收益和性能验收结果待补。
+
 ## 2026-10-02：通信 workspace 按容量常驻，阶段切换显式退休 IPC
 
 本轮解决下节动态 workload 暴露的重分配瓶颈：BWD peer payload 从“实际

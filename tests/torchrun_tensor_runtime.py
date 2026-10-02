@@ -172,9 +172,9 @@ def main():
         )
     print(rank, "TENSOR_PARITY_PASS", runtime.native.usage(), flush=True)
     if os.environ.get("TEST_PEER_PAYLOAD_REUSE") == "1":
-        # Retain three independent tapes while the execution-slot payload grows,
-        # shrinks and changes owner. The middle invocation also has fewer source
-        # rows. Both hotspot capacities stay resident until runtime.close().
+        # Retain three independent tapes with moving hotspots and shorter source
+        # batches. Private dR follows each tape; peer communication storage does
+        # not grow with the destination's received-row count.
         tapes = []
         cases = ((tokens, 0), (tokens, experts - top_k), (max(1, tokens // 4), 0))
         for count, first_expert in cases:

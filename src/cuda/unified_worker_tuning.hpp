@@ -24,8 +24,8 @@
 #define WEFTMOE_UNIFIED_SEGMENT_BYTES 4096
 #endif
 #ifndef WEFTMOE_UNIFIED_COPY_BUFFERS
-// Absent an explicit shared override, Forward prefetches two slots while
-// Backward uses one. The phase-specific definitions below still take priority.
+// Absent an explicit shared override, prefetch uses two slots. The
+// phase-specific definitions below still take priority.
 #ifndef WEFTMOE_FWD_UNIFIED_COPY_BUFFERS
 #define WEFTMOE_FWD_UNIFIED_COPY_BUFFERS 2
 #endif
@@ -112,7 +112,8 @@
 #define WEFTMOE_BWD_UNIFIED_SEGMENT_BYTES WEFTMOE_UNIFIED_SEGMENT_BYTES
 #endif
 #ifndef WEFTMOE_BWD_UNIFIED_COPY_BUFFERS
-#define WEFTMOE_BWD_UNIFIED_COPY_BUFFERS WEFTMOE_UNIFIED_COPY_BUFFERS
+// Destination-pull keeps two independent TMA loads in flight across rows.
+#define WEFTMOE_BWD_UNIFIED_COPY_BUFFERS 2
 #endif
 #ifndef WEFTMOE_BWD_UNIFIED_ROW_PREFETCH
 #define WEFTMOE_BWD_UNIFIED_ROW_PREFETCH WEFTMOE_UNIFIED_ROW_PREFETCH

@@ -19,8 +19,11 @@ struct alignas(128) Shared
   unsigned queue_rows;
   unsigned long long queue_base;
   unsigned static_return_next;
-  // Streaming Reduce must not alias live TMA copy staging.
-  const transport::BFloat16 *reduce_sources[Threads / 32U][32U];
+  activation_ring_detail::Transfer dispatch_hold[communication::kRingDepth];
+  unsigned dispatch_head, dispatch_tail;
+  unsigned pull_cursor[communication::kLocalPeers];
+  unsigned pull_peer;
+  unsigned long long pull_sequence;
 };
 
 #include "cuda/persistent_v3/backward/unified_gin.cuh"
@@ -29,18 +32,30 @@ template <bool UseGin, unsigned BaseThread, class Storage>
 __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
   const unsigned tid = threadIdx.x - BaseThread;
   const unsigned warp = tid / 32U, lane = tid % 32U;
-  if (warp < Storage::kCopyWarps && lane == 0U)
+  if (warp < Storage::kCopyWarps && lane == 0U) {
     init(&s.full[warp], 1U);
+    for (unsigned slot = 0U; slot < Storage::kStorageSlots; ++slot)
+      init(&s.row_prefetch_full[warp * Storage::kStorageSlots + slot], 1U);
+  }
   if (tid == 0U) {
-    s.dispatch_cursor = 1ULL * (blockIdx.x - (UseGin ? a.gin_receiver_base : 0U)) * backward_tuning::kDispatchBatchRows;
+    const auto worker = blockIdx.x - (UseGin ? a.gin_receiver_base : 0U);
+    const auto workers = UseGin ? a.gin_receiver_count : gridDim.x;
+    const auto rows = dispatch_sizes(a.dispatch).incoming_row_count;
+    const auto batch = backward_tuning::kDispatchBatchRows;
+    const auto span = (rows + workers * batch - 1ULL) / (workers * batch) * batch;
+    s.dispatch_cursor = worker * span;
     s.pack_mailbox = s.pack_observed = 0U;
     s.gin_sender_state = forward_unified_transport::GinSenderState{};
-    s.dispatch_end = backward_pipeline_detail::local_route_count(a);
+    s.dispatch_end = min(1ULL * rows, s.dispatch_cursor + span);
     s.return_cursor = ~0ULL;
     s.static_return_next = blockIdx.x - (UseGin ? a.gin_receiver_base : 0U);
     s.return_queue = s.return_rows = 0U;
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     if constexpr (UseGin) {
+      s.dispatch_head = s.dispatch_tail = 0U;
+      for (unsigned peer = 0; peer < a.local_world_size; ++peer)
+        s.pull_cursor[peer] = 0U;
+      s.pull_peer = 0U;
       s.gin_rx_dispatch = blockIdx.x % a.gin_rings.dispatch_channels;
       s.gin_rx_return = blockIdx.x % a.gin_rings.return_channels;
       s.gin_task.channel = activation_ring_detail::kNoChannel;
@@ -63,27 +78,32 @@ progress_dispatch(const BackwardKernelArgs &a, unsigned long long *words,
   const auto begin = s.dispatch_cursor;
   if (begin >= s.dispatch_end)
     return false;
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const unsigned batch = static_cast<unsigned>(
       min(1ULL * backward_tuning::kDispatchBatchRows, s.dispatch_end - begin));
   if (lane == 0U) {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    forward_unified_transport::RowPrefetchPipeline<Storage> prefetch(s, warp);
     for (unsigned item = warp; item < batch; item += Storage::kCopyWarps) {
-      const auto route = a.dispatch_waves.local_route_order[begin + item];
-      const auto destination = a.dispatch.route_dst_rank[route];
-      const auto token = route / a.dispatch.identity.top_k;
-      auto *target = a.peer_payloads[destination].dr;
-      forward_unified_transport::copy_row(
-          s, warp, a.dy + token * a.hidden,
-          target + a.dispatch.route_dst_row[route] * a.hidden,
+      const auto header = headers[begin + item];
+      if (header.source_rank / a.local_world_size != a.node)
+        continue;
+      const auto token = header.route_index / a.dispatch.identity.top_k;
+      const auto *source = peer_at<const transport::BFloat16>(
+          a.peer_bases[header.source_rank], a.input_offset);
+      prefetch.copy(source + token * a.hidden,
+          a.dr + (begin + item) * a.hidden,
           unsigned(a.hidden * sizeof(transport::BFloat16)));
     }
+    prefetch.drain();
     forward_unified_transport::finish_copies();
   }
   forward_unified_transport::copy_sync<threads>();
   for (unsigned item = tid; item < batch; item += threads) {
-    const auto route = a.dispatch_waves.local_route_order[begin + item];
-    local_notification_detail::Receiver<BackwardKernelArgs>::publish_dispatch(
-        a, a.dispatch.route_dst_row[route],
-        a.dispatch.route_dst_rank[route] % a.local_world_size);
+    if (headers[begin + item].source_rank / a.local_world_size == a.node)
+      local_notification_detail::Receiver<BackwardKernelArgs>::publish_dispatch(
+          a, begin + item, a.rank % a.local_world_size);
   }
   forward_unified_transport::copy_sync<threads>();
   if (tid == 0U) {
@@ -94,11 +114,11 @@ progress_dispatch(const BackwardKernelArgs &a, unsigned long long *words,
             counter->value)
             .fetch_add(batch, ::cuda::memory_order_acq_rel) +
         batch;
-    if (done == s.dispatch_end)
+    if (done == dispatch_sizes(a.dispatch).incoming_row_count)
       atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                      ->dispatch_complete_clock,
                 device_globaltimer_ns());
-    s.dispatch_cursor += 1ULL * (a.use_gin ? a.gin_receiver_count : gridDim.x) * backward_tuning::kDispatchBatchRows;
+    s.dispatch_cursor += backward_tuning::kDispatchBatchRows;
   }
   forward_unified_transport::copy_sync<threads>();
   return true;
@@ -215,7 +235,7 @@ __device__ __forceinline__ bool progress_reduce(
   constexpr auto warps = Storage::kThreads / 32U;
   const auto first = std::uint64_t(blockIdx.x) * warps + warp;
   const auto start = lane == 0U && token == first ? device_globaltimer_ns() : 0ULL;
-  if (!backward_reduce_dx_token<false>(a, token, s.reduce_sources[warp]))
+  if (!backward_reduce_dx_token<false>(a, token))
     return false;
   __syncwarp();
   if (start)
@@ -316,6 +336,7 @@ run(const BackwardKernelArgs &a,
       bool gin_progressed = false;
       if constexpr (UseGin) {
         gin_progressed = gin_detail::progress_receive<BaseThread>(a, s, true);
+        gin_progressed = gin_detail::pull_dispatch<BaseThread>(a, s) || gin_progressed;
         gin_progressed =
             gin_detail::progress_receive<BaseThread>(a, s, false) ||
             gin_progressed;
@@ -334,7 +355,8 @@ run(const BackwardKernelArgs &a,
                 counter->value)
                     .load(::cuda::memory_order_acquire) == geometry.mblocks;
         if constexpr (UseGin)
-          if (s.stop && !gin_detail::terminal(a))
+          if (s.stop && (!gin_detail::terminal(a) ||
+                        !gin_detail::pull_terminal(a)))
             s.stop = 0U;
       }
       forward_unified_transport::copy_sync<Storage::kCopyThreads>();

@@ -154,8 +154,9 @@ struct BackwardTensorStorage::Impl {
       workspace;
   tensor_storage_detail::Completion completion;
   std::uint64_t tokens, hidden, intermediate, rows, padded_rows;
-  std::size_t u_offset, dab_offset, dx_rows_offset, dgate_rows_offset;
-  CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{}, u_store_map{}, dx_store_map{};
+  std::size_t dr_offset, u_offset, dab_offset, dx_rows_offset, dgate_rows_offset;
+  CUtensorMap dr_map{}, dr_mn_map{}, dab_map{}, u_mn_map{}, dab_mn_map{},
+      u_store_map{}, dx_store_map{};
   std::uint32_t top_k, experts;
   explicit Impl(const CudaExecution &execution) : completion(execution) {}
 };
@@ -261,10 +262,15 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
       bindings.dgate);
   state->dw1 = make(checked_mul(weight, 4ULL, "dW1 bytes"), bindings.dw1);
   state->dw2 = make(checked_mul(weight, 2ULL, "dW2 bytes"), bindings.dw2);
-  // Only compact dR and transport directories are peer-visible. Notify's
-  // existing status download also carries this private workspace's exact P;
-  // allocation needs no extra count transfer or second route plan.
+  // Notify already carries exact R/P. Unified workers pull from stable peer
+  // storage into private dR; no pointer in this workspace is exported via IPC.
   std::size_t cursor = 0;
+  state->dr_offset = cursor;
+  if constexpr (backward_tuning::kUnifiedWorkers)
+    state->dr_offset = append(
+        cursor, checked_mul(std::max<std::uint64_t>(state->rows, 1U),
+                            state->hidden, "Backward dR elements"),
+        2U, "Backward private dR");
   const auto intermediate_elements = checked_mul(
       state->padded_rows, state->intermediate, "Backward workspace elements");
   state->u_offset = append(cursor, intermediate_elements, 2U, "Backward U");
@@ -277,6 +283,16 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
   state->workspace = make(cursor);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
   auto *base = state->workspace->data;
+  if constexpr (backward_tuning::kUnifiedWorkers) {
+    state->dr_map = make_bf16_tma_map(
+        at<void>(base, state->dr_offset), state->hidden,
+        std::max<std::uint64_t>(state->rows, 1U),
+        backward_tuning::kActivationTileM, "Backward private dR",
+        backward_tuning::kTileK);
+    state->dr_mn_map = make_bf16_tma_map_mn(
+        at<void>(base, state->dr_offset), state->hidden,
+        std::max<std::uint64_t>(state->rows, 1U), "Backward private dR MN");
+  }
   state->dab_map = make_bf16_tma_map(
       at<void>(base, state->dab_offset), 2ULL * state->intermediate,
       state->padded_rows, backward_tuning::kActivationTileM,

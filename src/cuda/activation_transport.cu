@@ -6630,6 +6630,9 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.saved_ab = static_cast<const transport::BFloat16 *>(saved.ab->data);
   args.saved_rows = saved.rows;
   args.peer_payloads = peer_workspace.device_payloads();
+  if constexpr (backward_tuning::kUnifiedWorkers)
+    args.dr = at<transport::BFloat16>(data.workspace->data, data.dr_offset);
+  args.input_offset = layout.input;
   args.recomputed_u =
       at<transport::BFloat16>(data.workspace->data, data.u_offset);
   args.dab = at<transport::BFloat16>(data.workspace->data, data.dab_offset);
@@ -6790,6 +6793,22 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
             ExchangeKind::ExpertCounts, detail);
       };
   saved.completion.wait_on(exec->stream);
+  if constexpr (backward_tuning::kUnifiedWorkers)
+    if (data.tokens) {
+      internal::throw_cuda(
+          "backward-stage-dy",
+          internal::wait_input_ready(exec->stream, gradient.allocation->ready,
+                                     gradient.allocation->ready_capture_id),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "wait dY before staging");
+      internal::throw_cuda(
+          "backward-stage-dy",
+          cudaMemcpyAsync(at<void>(slot.device, layout.input), gradient.pointer,
+                          data.tokens * config.hidden_size * sizeof(transport::BFloat16),
+                          cudaMemcpyDeviceToDevice, exec->stream),
+          identity.rank, identity.world, "backward", identity.generation,
+          ExchangeKind::ExpertCounts, "stage dY for node-local destination pull");
+    }
   if (retained.dispatch.received_row_capacity())
     internal::throw_cuda(
         "backward-restore-routing",
@@ -6915,9 +6934,9 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                       "all worker CTAs resident", std::to_string(clusters));
     internal::throw_cuda("backward-run",
         cudaLaunchKernelEx(&launch, kernel, args,
-            peer_workspace.buffer->dr_map, data.dab_map,
+            data.dr_map, data.dab_map,
             retained.weights.impl_->backward_w2_map,
-            retained.weights.impl_->backward_w1_map, peer_workspace.buffer->dr_mn_map,
+            retained.weights.impl_->backward_w1_map, data.dr_mn_map,
             data.u_mn_map, data.dab_mn_map, x_map,
             data.u_store_map, data.dx_store_map, dw2_map, dw1_map),
         identity.rank, identity.world, "backward", identity.generation,
