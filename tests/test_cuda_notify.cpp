@@ -2674,8 +2674,8 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
     forward_hashes[distribution] = hash_bf16_indexed(
         download_forward_output_for_validation(forward, execution));
     BackwardMegaKernelConfig backward_config{hidden, intermediate};
-    backward_config.tensors = prepare_backward_tensors(
-        notify.dispatch(), execution, backward_config, {}, allocate);
+    backward_config.tensors = backward_kernel.prepare_tensors(
+        forward, backward_config, {}, allocate);
     auto backward =
         backward_kernel.enqueue(forward, gradients, backward_config);
     auto result = BackwardValidationBridge::download(backward, execution);
@@ -2948,8 +2948,7 @@ void run_cached_backward_rank(
                        cudaMemcpyHostToDevice) == cudaSuccess,
             "upload Backward allocation fixture");
   } else {
-    backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
-        notify.dispatch(), execution, backward_config);
+    backward_config.tensors = backward.prepare_tensors(forward, backward_config);
   }
   std::uint64_t warm_misses = 0;
   const auto rank_barrier =
@@ -2981,8 +2980,8 @@ void run_cached_backward_rank(
       output_gradients = producer.publish_output_gradients(
           static_cast<const weftmoe::transport::BFloat16 *>(input.data),
           dy_host.size(), max_tokens, hidden, input.owner);
-      backward_config.tensors = weftmoe::cuda::prepare_backward_tensors(
-          notify.dispatch(), execution, backward_config, {}, allocate);
+      backward_config.tensors = backward.prepare_tensors(
+          forward, backward_config, {}, allocate);
     }
     auto output =
         backward.enqueue(forward, output_gradients, backward_config, {});

@@ -54,6 +54,8 @@ struct BackwardKernelArgs {
   transport::BFloat16 *dab = nullptr;
   transport::BFloat16 *dx_rows = nullptr;
   float *dgate_rows = nullptr;
+  float *dgate = nullptr;
+  backward_detail::ReturnRingView return_ring;
   transport::BFloat16 *dw1 = nullptr;
   transport::BFloat16 *dw2 = nullptr;
   transport::BFloat16 *dx = nullptr;

@@ -207,13 +207,10 @@ __device__ __forceinline__ bool choose_unpacked(const Args &a, unsigned sender,
       auto &queue = return_queue_detail::queues(a)[1U + wire::peer(a, channel)];
       const auto position = wire_state.tx_cursor +
           (sequence - wire_state.sent) * (1ULL * ring::kReturnPorts * ring::kChunkRows);
-      const auto rows = position < queue.capacity
-          ? unsigned(min(queue.capacity - position, 1ULL * ring::kChunkRows)) : 0U;
-      if (!return_queue_detail::ready_block(a, queue, position, rows))
+      task = wire::Hooks<Args>::returning(a, channel, sequence, position);
+      if (!return_queue_detail::ready_block(a, queue, task.first - queue.begin,
+                                            task.rows))
         continue;
-      task = wire::Transfer{channel, rows,
-          position + 1ULL * ring::kReturnPorts * ring::kChunkRows >= queue.capacity,
-          sequence, queue.begin + position};
     }
     return true;
   }

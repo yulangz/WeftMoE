@@ -107,7 +107,7 @@ __global__ __launch_bounds__(
       const unsigned reduce_warp = reduce_tid / 32U;
       const unsigned lane = reduce_tid % 32U;
       const std::uint64_t first_token =
-          std::uint64_t(blockIdx.x) * kReduceWarps + reduce_warp;
+          weftmoe_pf::backward_return::reduce_first(a, kReduceWarps, reduce_warp);
       auto token = first_token;
       backward_unified_transport::run<UseGin, backward_tuning::kUnifiedCommBase,
                                       StaticSchedule>(a, geometry, comm, token);
@@ -122,7 +122,8 @@ __global__ __launch_bounds__(
       if (first_token < a.dispatch.identity.num_tokens && lane == 0U)
         atomicMin(&status->backward_reduce_start_clock, device_globaltimer_ns());
       for (; token < a.dispatch.identity.num_tokens;
-           token += std::uint64_t(gridDim.x) * kReduceWarps) {
+           token += std::uint64_t(weftmoe_pf::backward_return::reduce_workers(a)) *
+                    kReduceWarps) {
         backward_reduce_dx_token(a, token);
         __syncwarp();
       }

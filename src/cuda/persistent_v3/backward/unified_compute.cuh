@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda/weftmoe_pf/backward_schedule.cuh"
+#include "cuda/weftmoe_pf/backward_return_epilogue.cuh"
 
 // Included after backward_pipeline_detail and the SwiGLU epilogue helpers.
 // Both kernel layouts use this scheduler and the same arithmetic routines.
@@ -350,6 +351,10 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
               valid_rows, rows);
         __threadfence();
         synchronization.cluster_sync();
+        if constexpr (Synchronization::kMathEnabled)
+          if (a.return_ring.depth)
+            weftmoe_pf::backward_return::publish_input(
+                a, descriptor.compact_row + local_row, valid_rows);
         if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
             cluster_rank == 0U) {
           ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
@@ -390,8 +395,18 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       }
     }
     if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx) ||
-        activation_chain) {
-      const auto descriptor = descriptors[owner];
+        (activation_chain && !a.return_ring.depth)) {
+      BackwardMblockDescriptor descriptor{};
+      unsigned input_row;
+      if (a.return_ring.depth) {
+        descriptor.expert = a.return_ring.blocks[owner].expert;
+        descriptor.padded_row = (owner % a.return_ring.depth) * backward_tuning::kTileM;
+        input_row = weftmoe_pf::backward_return::gather_row();
+        weftmoe_pf::backward_return::gather(a, owner, cluster_rank, synchronization);
+      } else {
+        descriptor = descriptors[owner];
+        input_row = descriptor.padded_row;
+      }
       const auto dx_count = activation_chain ? kDxTiles
                             : !StaticSchedule && DxClaimTiles == 1U
                                 ? 1U
@@ -407,35 +422,40 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
           synchronization.cluster_sync();
         backward_compute_detail::run_k_mn_tile_tma_store<DxTileN, kStorageTileN,
                                                          Synchronization>(
-            dab_map, w1_map, dx_store_map, descriptor.padded_row,
+            dab_map, w1_map, dx_store_map, input_row,
             descriptor.expert *
                 static_cast<std::uint32_t>(2ULL * a.intermediate),
             static_cast<std::uint32_t>(2ULL * a.intermediate),
             descriptor.padded_row,
             (tile + offset) * backward_tuning::kActivationClusterN * DxTileN,
-            storage, activation_pipeline);
+            storage, activation_pipeline,
+            weftmoe_pf::backward_return::Output{a, owner});
       }
-      if (a.use_gin)
+      if (a.use_gin || a.return_ring.depth)
         __threadfence_system();
       else
         __threadfence();
       synchronization.cluster_sync();
       if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
           cluster_rank == 0U) {
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            owner_completed(words[layout.dx_completed + owner]);
-        const auto owner_done =
-            owner_completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) +
-            dx_count;
-        if (owner_done == kDxTiles) {
-          owner_completed.store(
-              weftmoe::cuda::persistent_v3::backward::backward_dx_ready_value(
-                  kDxTiles),
-              ::cuda::memory_order_release);
-          if (!StaticSchedule &&
-              (!a.use_gin || Synchronization::kUnifiedReturnQueue))
-            weftmoe::cuda::persistent_v3::backward::publish_owner(
-                make_return_domain(a, words, layout, geometry.mblocks), owner);
+        if (a.return_ring.depth) {
+          weftmoe_pf::ring::arrive(a.return_ring.blocks[owner].ready, dx_count);
+        } else {
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              owner_completed(words[layout.dx_completed + owner]);
+          const auto owner_done =
+              owner_completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) +
+              dx_count;
+          if (owner_done == kDxTiles) {
+            owner_completed.store(
+                weftmoe::cuda::persistent_v3::backward::backward_dx_ready_value(
+                    kDxTiles),
+                ::cuda::memory_order_release);
+            if (!StaticSchedule &&
+                (!a.use_gin || Synchronization::kUnifiedReturnQueue))
+              weftmoe::cuda::persistent_v3::backward::publish_owner(
+                  make_return_domain(a, words, layout, geometry.mblocks), owner);
+          }
         }
         auto *counter = reinterpret_cast<PaddedCounter *>(
             words + layout.completed_dx_tiles);
@@ -443,8 +463,9 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
             completed(counter->value);
         const auto done =
             completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) + dx_count;
-        if (done ==
-            static_cast<unsigned long long>(geometry.mblocks) * kDxTiles)
+        const auto blocks = a.return_ring.depth
+            ? a.return_ring.state->blocks : geometry.mblocks;
+        if (done == blocks * kDxTiles)
           atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
       }
     } else if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dw2)) {

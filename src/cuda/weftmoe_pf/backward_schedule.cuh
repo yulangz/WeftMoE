@@ -2,8 +2,8 @@
 
 namespace weftmoe_pf::backward {
 
-// Keep an M-block's activation-gradient chain on one cluster. This preserves
-// locality and avoids dependencies between independently striped N/row tasks.
+// Canonical dU/SwiGLU stays on one cluster. Ring dX uses window-major N pairs;
+// both domains have immutable static ownership, without a shared claim queue.
 struct Schedule {
   unsigned block, epilogue, dx;
   unsigned weight = 0U, weight_end = 0U;
@@ -19,6 +19,20 @@ struct Schedule {
        persistent_v3::backward::TileTask &task, unsigned &phase,
        bool &terminal) {
     using namespace backward_pipeline_detail;
+    const auto dx_blocks = a.return_ring.depth ? a.return_ring.state->blocks : mblocks;
+    const auto du_owner = [&](unsigned index) {
+      return a.return_ring.depth ? a.return_ring.du_order[index] : index;
+    };
+    // A bounded window can underfill the M grid even for a long invocation.
+    // Stripe N pairs as well; Return waits for every N tile of the M-block.
+    constexpr auto dx_pairs = (DxTiles + 1U) / 2U;
+    if (a.return_ring.depth && dx < dx_blocks * dx_pairs &&
+        weftmoe_pf::backward_return::input_ready(a, dx / dx_pairs)) {
+      const auto tile = (dx % dx_pairs) * 2U;
+      task = {dx / dx_pairs, tile, TaskKind::Dx, min(2U, DxTiles - tile)};
+      dx += clusters;
+      return true;
+    }
     if (mblocks < clusters) {
       // An underfilled M-block grid needs N/epilogue residues to occupy the
       // remaining clusters. Ownership remains static in each dependency domain.
@@ -28,33 +42,34 @@ struct Schedule {
                    words[layout.phase + owner])
                    .load(::cuda::memory_order_acquire) >= required;
       };
-      if (dx < mblocks * DxTiles && ready(dx / DxTiles, 3U)) {
+      if (!a.return_ring.depth && dx < mblocks * DxTiles && ready(dx / DxTiles, 3U)) {
         task = {dx / DxTiles, dx % DxTiles, TaskKind::Dx, 1U};
         dx += clusters;
         return true;
       }
       if (epilogue < mblocks * kDabEpilogueTasks &&
-          ready(epilogue / kDabEpilogueTasks, 2U)) {
-        task = {epilogue / kDabEpilogueTasks, epilogue % kDabEpilogueTasks,
+          ready(du_owner(epilogue / kDabEpilogueTasks), 2U)) {
+        task = {du_owner(epilogue / kDabEpilogueTasks), epilogue % kDabEpilogueTasks,
                 TaskKind::Dab, 1U};
         phase = 2U;
         epilogue += clusters;
         return true;
       }
-      if (block < mblocks * DuTiles && ready(block / DuTiles, 1U)) {
-        task = {block / DuTiles, block % DuTiles, TaskKind::Dab, 1U};
+      if (block < mblocks * DuTiles && ready(du_owner(block / DuTiles), 1U)) {
+        task = {du_owner(block / DuTiles), block % DuTiles, TaskKind::Dab, 1U};
         phase = 1U;
         block += clusters;
         return true;
       }
     } else if (block < mblocks) {
+      const auto owner = du_owner(block);
       if (!::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
-               words[layout.phase + block])
+               words[layout.phase + owner])
                .load(::cuda::memory_order_acquire))
         return false;
-      // One immutable descriptor covers the complete activation chain. The
-      // owning cluster needs no task-mailbox exchange between its three steps.
-      task = {block, 0U, TaskKind::Dab, 1U};
+      // Keep dU/SwiGLU together; the dense fallback also includes dX. No
+      // task-mailbox exchange is needed between these dependent stages.
+      task = {owner, 0U, TaskKind::Dab, 1U};
       phase = 1U;
       block += clusters;
       return true;
@@ -67,7 +82,7 @@ struct Schedule {
     // An idle activation residue is NOT permission to start a long dW tile.
     // All local dX stores must be complete; Return/Reduce keep progressing in
     // independent communication warps while the clusters execute dW.
-    if (completed != std::uint64_t(mblocks) * DxTiles)
+    if (completed != std::uint64_t(dx_blocks) * DxTiles)
       return false;
     const auto *rows = words + layout.dw_reduction_rows;
     const auto experts = a.dispatch.sizes.owned_expert_count;

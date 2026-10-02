@@ -155,10 +155,19 @@ struct BackwardTensorStorage::Impl {
   tensor_storage_detail::Completion completion;
   std::uint64_t tokens, hidden, intermediate, rows, padded_rows;
   std::size_t dr_offset, u_offset, dab_offset, dx_rows_offset, dgate_rows_offset;
+  std::size_t gathered_dab_offset = 0;
+  unsigned return_depth = 0;
+  std::uint64_t gather_rows = 0;
+  bool private_gather = false;
   CUtensorMap dr_map{}, dr_mn_map{}, dab_map{}, u_mn_map{}, dab_mn_map{},
       u_store_map{}, dx_store_map{};
   std::uint32_t top_k, experts;
   explicit Impl(const CudaExecution &execution) : completion(execution) {}
+  static std::shared_ptr<Impl> make(
+      const DeviceDispatchHandle &, const CudaExecution &,
+      const BackwardMegaKernelConfig &, const BackwardTensorBuffers &,
+      const CudaTensorAllocator &, unsigned return_depth = 0,
+      unsigned clusters = 0);
 };
 
 ForwardTensorStorage prepare_forward_tensors(
@@ -214,19 +223,20 @@ ForwardTensorStorage prepare_forward_tensors(
   return result;
 }
 
-BackwardTensorStorage
-prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
+std::shared_ptr<BackwardTensorStorage::Impl>
+BackwardTensorStorage::Impl::make(const DeviceDispatchHandle &dispatch,
                          const CudaExecution &execution,
                          const BackwardMegaKernelConfig &config,
                          const BackwardTensorBuffers &bindings,
-                         const CudaTensorAllocator &allocator) {
+                         const CudaTensorAllocator &allocator,
+                         unsigned return_depth, unsigned clusters) {
   using namespace tensor_storage_detail;
   if (!dispatch || !execution || !config.hidden_size ||
       !config.intermediate_size)
     throw std::runtime_error(
         "prepare Backward tensors requires Notify and a model shape");
-  BackwardTensorStorage result;
   auto state = std::make_shared<BackwardTensorStorage::Impl>(execution);
+  state->return_depth = return_depth;
   state->tokens = dispatch.identity().num_tokens;
   state->top_k = dispatch.identity().top_k;
   state->experts = dispatch.sizes().owned_expert_count;
@@ -275,9 +285,20 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
       state->padded_rows, state->intermediate, "Backward workspace elements");
   state->u_offset = append(cursor, intermediate_elements, 2U, "Backward U");
   state->dab_offset = append(cursor, intermediate_elements, 4U, "Backward dAB");
-  state->dx_rows_offset = append(
-      cursor, checked_mul(state->padded_rows, state->hidden, "Backward dX rows"),
-      2U, "Backward dX");
+  state->dx_rows_offset = 0;
+  if (!return_depth)
+    state->dx_rows_offset = append(
+        cursor, checked_mul(state->padded_rows, state->hidden, "Backward dX rows"),
+        2U, "Backward dX");
+  state->gather_rows = std::uint64_t(clusters) *
+                       backward_tuning::kTileM;
+  // Forward's retired X ring holds dX. Its S ring holds the bounded gather
+  // when it fits; a deliberately tiny ring needs only this small private plane.
+  state->private_gather = return_depth && return_depth < 2U * clusters;
+  if (state->private_gather)
+    state->gathered_dab_offset = append(
+        cursor, checked_mul(state->gather_rows, state->intermediate, "Backward gathered dAB"),
+        4U, "Backward dX input staging");
   state->dgate_rows_offset =
       append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
   state->workspace = make(cursor);
@@ -293,10 +314,11 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
         at<void>(base, state->dr_offset), state->hidden,
         std::max<std::uint64_t>(state->rows, 1U), "Backward private dR MN");
   }
-  state->dab_map = make_bf16_tma_map(
-      at<void>(base, state->dab_offset), 2ULL * state->intermediate,
-      state->padded_rows, backward_tuning::kActivationTileM,
-      "Backward padded dAB", backward_tuning::kTileK);
+  if (!return_depth)
+    state->dab_map = make_bf16_tma_map(
+        at<void>(base, state->dab_offset), 2ULL * state->intermediate,
+        state->padded_rows, backward_tuning::kActivationTileM,
+        "Backward padded dAB", backward_tuning::kTileK);
   state->u_mn_map = make_bf16_tma_map_mn(
       at<void>(base, state->u_offset), state->intermediate, state->padded_rows,
       "Backward dW2 U MN-major");
@@ -306,13 +328,23 @@ prepare_backward_tensors(const DeviceDispatchHandle &dispatch,
   state->u_store_map = make_bf16_tma_store_map(
       at<void>(base, state->u_offset), state->intermediate, state->padded_rows,
       "Backward dU output", 0ULL, backward_tuning::kActivationTileM);
-  state->dx_store_map = make_bf16_tma_store_map(
-      at<void>(base, state->dx_rows_offset), state->hidden, state->padded_rows,
-      "Backward dX output", 0ULL, backward_tuning::kActivationTileM);
+  if (!return_depth)
+    state->dx_store_map = make_bf16_tma_store_map(
+        at<void>(base, state->dx_rows_offset), state->hidden, state->padded_rows,
+        "Backward dX output", 0ULL, backward_tuning::kActivationTileM);
 #endif
   validate_disjoint(
       {state->dx, state->dgate, state->dw1, state->dw2, state->workspace});
-  result.impl_ = std::move(state);
+  return state;
+}
+
+BackwardTensorStorage prepare_backward_tensors(
+    const DeviceDispatchHandle &dispatch, const CudaExecution &execution,
+    const BackwardMegaKernelConfig &config, const BackwardTensorBuffers &bindings,
+    const CudaTensorAllocator &allocator) {
+  BackwardTensorStorage result;
+  result.impl_ = BackwardTensorStorage::Impl::make(dispatch, execution, config,
+                                                 bindings, allocator);
   return result;
 }
 

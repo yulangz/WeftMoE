@@ -87,20 +87,32 @@ __device__ __forceinline__ void pack_return(const BackwardKernelArgs &a,
   const auto *dx = a.dx_rows;
   const auto *dgate = a.dgate_rows;
   if (lane == 0U) {
+    forward_unified_transport::RowPrefetchPipeline<Storage> prefetch(s, warp);
     for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
-      const auto compact_row = entries[task.first + item];
+      const auto entry = entries[task.first + item];
+      const auto compact_row = a.return_ring.depth
+          ? a.return_ring.rows[entry].compact : entry;
       const auto padded_row = mapping[compact_row];
+      const auto payload_row = a.return_ring.depth
+          ? weftmoe_pf::backward_return::payload_row(a, entry) : padded_row;
       auto *record = chunk + sizeof(ring::ChunkHeader) +
                      item * a.gin_rings.return_row_bytes;
       *reinterpret_cast<ring::ReturnRow *>(record) = ring::ReturnRow{
           headers[compact_row].route_index, dgate[padded_row], 0};
-      copy_row(s, warp, dx + 1ULL * padded_row * a.hidden,
-               record + sizeof(ring::ReturnRow), unsigned(a.hidden * 2ULL));
+      prefetch.copy(dx + 1ULL * payload_row * a.hidden,
+                    record + sizeof(ring::ReturnRow), unsigned(a.hidden * 2ULL));
     }
+    prefetch.drain();
     finish_copies();
   }
   __threadfence_system();
   copy_sync<Storage::kCopyThreads>();
+  if (a.return_ring.depth) {
+    for (unsigned item = tid; item < task.rows; item += Storage::kCopyThreads)
+      weftmoe_pf::backward_return::retire_rows(
+          a, entries[task.first + item] / backward_tuning::kTileM, 1U);
+    copy_sync<Storage::kCopyThreads>();
+  }
 }
 
 template <unsigned BaseThread, class Storage>
@@ -115,13 +127,17 @@ __device__ __forceinline__ void receive_return(const BackwardKernelArgs &a,
   auto *output = a.peer_payloads[a.rank].contribution;
   auto *dgate = a.peer_payloads[a.rank].dgate;
   if (lane == 0U) {
+    forward_unified_transport::RowPrefetchPipeline<Storage> prefetch(s, warp);
     for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
       const auto *record = chunk + item * a.gin_rings.return_row_bytes;
       const auto meta = *reinterpret_cast<const ring::ReturnRow *>(record);
-      copy_row(s, warp, record + sizeof(ring::ReturnRow),
-               output + meta.route * a.hidden, unsigned(a.hidden * 2ULL));
-      dgate[meta.route] = meta.dgate;
+      const auto row = a.return_ring.depth
+          ? weftmoe_pf::backward_return::contribution_row(a, meta.route) : meta.route;
+      prefetch.copy(record + sizeof(ring::ReturnRow),
+                    output + row * a.hidden, unsigned(a.hidden * 2ULL));
+      dgate[row] = meta.dgate;
     }
+    prefetch.drain();
     finish_copies();
   }
   copy_sync<Storage::kCopyThreads>();

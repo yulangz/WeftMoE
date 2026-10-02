@@ -23,6 +23,64 @@ M7a 提交是可验证的私有 dR 正确性里程碑，性能门禁仍留在 M7
 FWD 也变慢；该组性能已排除。后续对照显式传入相同宏，不能将编译配置差异
 归因于 dR 改造。最终保留实现、显存收益和性能验收结果待补。
 
+### M7b Return ring 开发消融（未关闭性能门禁）
+
+相同 H2048/I512/E64/K4、1620 MHz、随机 workload、10 warmup/30 sample；
+EP16 使用 B768/D6。下表为逐步最慢 rank cycle p50，单位 ms，不是纯 GEMM。
+
+| 候选 | 改动 | 8K | 20K |
+|---|---|---:|---:|
+| resident 对照 | 改造前常驻 dR/完整 Return | 9.750 | 21.670 |
+| M7a warp_fanout | 私有实际 R dR、warp 并行筛选 RX fanout | 11.182 | 24.643 |
+| return_ring | window-major dX、source credit、窗口边界 packet | 16.104 | 29.800 |
+| fair_reduce | 通信繁忙时也推进 Reduce，避免窗口 credit 饥饿 | 14.041 | 29.397 |
+| input_credit | epilogue 发布行计数，代替逐行扫描 dAB ready | 13.962 | 28.783 |
+| reuse_forward | 复用已退休 FWD X/S、gather 向量宽度编译期化 | 13.042 | 28.385 |
+| window_order | dU 静态序列按最早消费窗口排序 | 12.638 | 27.395 |
+| direct_return | 节点内 dX epilogue 直接写已准入的 source window | 12.369 | 27.222 |
+| prefetch_return | Return TX/RX 搬运使用双缓冲预取 | 12.079 | 27.121 |
+| dx_pairs | 有界窗口内静态拆分 dX 的 N pairs | 11.937 | 27.007 |
+
+直接写回保留原 WGMMA 与 BF16 转换，只替换 epilogue 目的地址；本地不用先
+写 dX ring 再搬运。远端行仍经 dX ring → TX → RX → source contribution，
+所有权由原逐 slot credit 保护。节点内发布在整个 N 维和 cluster store 完成后，
+dGate 与 ready 一同由 Return owner 处理。
+
+单机也存在回退，不能只归因于 NIC。固定 window_order 候选，EP8 的
+B512/D8 为 7.235/16.405 ms，B512/D32 为 6.867/14.265 ms，B1024/D8 为
+6.849/14.776 ms；相邻 resident B512/D8 为 5.416/12.015 ms。增大窗口只缓解
+部分等待并增加空间，暂不因此修改默认 B/D。不同 B/D 同时影响 FWD，不能
+把整轮变化都算作 BWD 优化。
+
+`direct_return` 已通过 EP8/EP16 随机 8K/20K 全部五项数值，EP16 B16/D1
+小 ring，以及 20K 极端热点、空接收 rank、三份 live tape、OOM 重试、权重刷新
+和图/卸载测试。最新 head 缓存候选及 sanitizer 尚在验证，不沿用旧版本结论。
+产物/逐步日志均位于 `build/pf_private_dr/<candidate>/`。
+
+未保留的实验：
+
+- 用 coordinator 并行导入其它 GPU 的 source head，替代计算侧逐个 peer
+  读取。EP16 BWD 为 7.688/17.112 ms，对照直接写回的 7.691/17.069 ms，
+  没有稳定收益；EP8 也没有稳定改善，删除该缓存与额外状态。
+- 每个 source window 内再按 expert 分组 Return packet：12.205/29.190 ms，
+  20K 相对 dx_pairs 回退约 8.1%，撤回额外 prefix/cursor 元数据与计数逻辑。
+
+各保留候选的逐 rank trace SHA256、token/接收行数、容量、warmup/sample
+已逐项对齐。`prefetch_return` 通过 EP8 rank0/7 与 EP16 rank0/15 的 memcheck，
+四份报告均为 0 errors；不把它冒充后续 N-pair 版本的 sanitizer 结果。
+
+### M7b 功能里程碑
+
+最终代码（`build/pf_private_dr/final/`）已独立通过 EP8/EP16 随机不等长
+256/8K/20K 的 FWD、dX、dGate、dW1、dW2；EP16 20K 全局热点迁移、空接收
+rank、三份 live tape、OOM 重试、权重原地刷新，以及训练释放后切换四个 EP4
+inference 组的图/卸载检查通过。补充 EP4 B16/D1 和 EP8 非 ring 回退通过。
+最终版本 EP8 rank0/7、EP16 rank0/15 的 memcheck 全部为 0 errors。
+既有 native CUDA 测试源完成编译，未增加细粒度内部实现测试。
+
+这个提交完成私有实际尺寸 dR、有界 Return 的功能合同，**不代表性能验收**。
+此前 resident 产物保持不动；相邻性能、显存及真实 Megatron 路径的完整结果另补。
+
 ## 2026-10-02：通信 workspace 按容量常驻，阶段切换显式退休 IPC
 
 本轮解决下节动态 workload 暴露的重分配瓶颈：BWD peer payload 从“实际

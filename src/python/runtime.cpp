@@ -309,7 +309,7 @@ class Runtime {
       dg = empty({tokens, config_.top_k}, "float32");
       dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
       dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
-      bc.tensors = prepare_backward_tensors(tape->dispatch, execution_, bc,
+      bc.tensors = BackwardMegaKernel().prepare_tensors(tape->forward, bc,
           {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
     });
     BackwardMegaKernel().run(tape->forward, input, bc);

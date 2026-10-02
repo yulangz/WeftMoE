@@ -94,6 +94,13 @@ private:
 // session or route generation.
 class BackwardMegaKernel {
 public:
+  // Uses the retained Forward's bounded communication geometry; the private
+  // dR/U/dAB workspace and caller-visible gradients follow actual tape sizes.
+  BackwardTensorStorage prepare_tensors(
+      const DeviceForwardHandle &forward, const BackwardMegaKernelConfig &config,
+      const BackwardTensorBuffers &bindings = {},
+      const CudaTensorAllocator &allocator = {}) const;
+
   DeviceBackwardHandle enqueue(
       const DeviceForwardHandle &forward,
       const BFloat16OutputGradientLease &output_gradients,

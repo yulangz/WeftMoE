@@ -111,14 +111,23 @@ initialize_k_mn_pipeline(unsigned char *storage) {
     cutlass::arch::warpgroup_reg_dealloc<backward_tuning::kProducerRegisters>();
 }
 
+struct TmaOutput {
+  template <unsigned TileM, unsigned TileN>
+  __device__ __forceinline__ bool store(transport::BFloat16 *, unsigned,
+                                       unsigned) const {
+    return false;
+  }
+};
+
 template <std::uint32_t TileM, std::uint32_t TileN,
           std::uint32_t OutputOffsetElements,
-          class Synchronization = FullCtaComputeSynchronization>
+          class Synchronization = FullCtaComputeSynchronization,
+          class Output = TmaOutput>
 __device__ __forceinline__ void
 store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
                       std::uint32_t output_row, std::uint32_t output_column,
                       unsigned char *storage, bool wait_previous,
-                      bool wait_current) {
+                      bool wait_current, const Output &output = {}) {
   using TileMma =
       typename hopper::BF16MMASelector<TileN, cute::SM90::GMMA::Major::MN,
                                        cute::SM90::GMMA::Major::MN, kStageK,
@@ -167,6 +176,8 @@ store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
   }
   cute::tma_store_fence();
   Synchronization::math_sync(kStoreThreads, kStoreDoneBarrier);
+  if (output.template store<TileM, TileN>(output_tile, output_row, output_column))
+    return;
   if (threadIdx.x < kNAtoms * kStoreTilesM) {
     const auto atom = threadIdx.x % kNAtoms;
     const auto m_half = threadIdx.x / kNAtoms;
@@ -185,13 +196,14 @@ store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
 }
 
 template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN,
-          class Synchronization = FullCtaComputeSynchronization>
+          class Synchronization = FullCtaComputeSynchronization,
+          class Output = TmaOutput>
 __device__ __forceinline__ void run_k_mn_tile_tma_store(
     const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
     const CUtensorMap &output_store_map, std::uint32_t activation_row,
     std::uint32_t weight_reduction_start, std::uint32_t reduction,
     std::uint32_t output_row, std::uint32_t output_column,
-    unsigned char *storage, std::uint32_t &pipeline) {
+    unsigned char *storage, std::uint32_t &pipeline, const Output &output = {}) {
   constexpr auto TileM = backward_tuning::kActivationTileM;
   constexpr bool kPairN = backward_tuning::kActivationClusterN == 2U;
   constexpr auto MajorA = cute::SM90::GMMA::Major::K;
@@ -315,7 +327,7 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
       static_assert(TileM * TileN <= shared_arena_elements<StorageTileN>());
       store_tma_accumulator<TileM, TileN, 0U, Synchronization>(
           accum, output_store_map, output_row, output_column, storage, false,
-          true);
+          true, output);
     }
   }
   // The compute roles rejoin before the next task reuses the pipeline. In a

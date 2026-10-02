@@ -5,16 +5,39 @@
 本轮保持训练/推理的 Forward 主 kernel 和元数据容量布局不变，不做元数据瘦身。
 Backward 保留完整 U/dAB，以及所有本地 dX 完成后才开始的完整 dW 归约。
 
-- [ ] M7a：通信入口保持稳定地址，目标 GPU 自行将 dY 收入按实际 R 申请的私有
+- [x] M7a（`f17a39f`，性能门禁仍开放）：通信入口保持稳定地址，目标 GPU 自行将 dY 收入按实际 R 申请的私有
   dR；dR 与 U/dAB 同属本次 Backward workspace，不导出 IPC、不跨调用保留。
   节点内复用已导出的输入平面；跨机 RX 在所有实际 fanout 消费完后归还 credit。
-- [ ] M7b：Return 改为与 Forward 相同的 source-window 准入、逐 slot generation
+- [x] M7b（功能完成，性能门禁仍开放）：Return 改为与 Forward 相同的 source-window 准入、逐 slot generation
   与消费 credit；仅通信环常驻，移除全量 dX_rows/source contribution 临时量。
   dGate 随 route 发布并写回最终输出，不引入 dW split-reduce 或梯度原子加。
   窗口推进必须保证当前窗口的所有专家路由可完成，不能在未来窗口等待时饿死当前窗口。
 - [ ] M7c：EP8 单机/EP16 双机、1620 MHz；随机不等长 8K/20K 正确性与相邻性能
   对照，补充空接收 rank、热点迁移、小 ring、live tapes/OOM 重试和 suspend 释放。
   分别记录实际峰值显存、常驻通信容量、初始化与稳态耗时；每个完成里程碑提交。
+
+M7b 当前实现采用以下布局（数值及 memcheck 已通过，尚不作为性能已验收 profile）：
+
+- dR `[R,H]`、U `[P,I]`、dAB `[P,2I]` 和 dGate_rows `[P]` 为本次 BWD
+  的私有实际尺寸 workspace；Notify/saved tape 已给出 R/P，不新增 host 计数查询。
+- canonical dU/SwiGLU 为 dW 保留完整 expert-major 中间值。dX 按
+  `(source window, expert, M-block)` 静态划分，gather 只占每个常驻 cluster
+  一个 M128 tile；FWD 已退休的 S 平面足够大时直接复用，否则只申请这个有界小平面。
+- dX 临时输出复用 FWD 已退休的 X ring，**不是** saved X checkpoint。
+  source contribution/dGate 为 `[D,B,K,H]`/`[D,B,K]`；source 完成一个
+  token 的有序 top-k reduce 后归还一个 credit，窗口所有 B 个 token 消费后方可复用。
+  本地 dX epilogue 直接写已准入的 source window；只有远端行使用 dX ring。
+  N 维按 pair 静态分给 cluster，全部 N tile store 完成后才发布该 M-block。
+- dX slot 每代固定 128 个 row credit（包括 padding）。本地 Return 发布后及
+  远端 TX 拷贝完成后分别归还相应行 credit；TX 仍同时检查本地 NIC completion
+  和远端 RX credit。远端 RX 不领取尚未准入的 source window，继续探测其它 channel。
+- 所有 Return packet 的窗口边界、短尾 packet 和行位置均预计算。每个有效
+  canonical dAB 行只给所属 dX block 增加一次 input credit；expected 为该 block
+  的实际行数。不扫描所有行等待，也不依赖动态任务领用。
+- Return 复用 FWD 的闲置 plan 元数据，**不覆盖其跨调用 payload generation
+  与消费计数器**。多份 live tape 各自保存 checkpoint，执行 slot 的通信缓冲串行复用。
+- Reduce 分配给 receiver 的独立 warp，并在通信持续繁忙时仍获执行机会；不能
+  让等待未来窗口 TX credit 的 sender 同时承担推进当前 source window 的 Reduce。
 
 更新：2026-09-29。本版整理已确认的设计，作为后续实现依据；**第 0 节描述主路径，
 第 11 节跟踪实施进度，其余章节是目标合同，不表示 ring、通信/计算流水或 training

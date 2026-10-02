@@ -291,6 +291,8 @@ __global__ void backward_setup_pipeline_kernel(BackwardKernelArgs a) {
 
   if (a.use_gin)
     return_queue_detail::initialize(a);
+  if (a.return_ring.depth)
+    weftmoe_pf::backward_return::initialize(a);
   __syncthreads();
   auto *descriptors =
       reinterpret_cast<BackwardMblockDescriptor *>(words + layout.descriptors);

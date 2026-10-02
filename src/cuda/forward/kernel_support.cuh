@@ -1159,7 +1159,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
 #else
       // FC2 becomes ready only after all FC1 N tiles of this M block retire.
       // X is already saved to caller-owned storage, so training can reuse the
-      // same canonical plane as inference. Backward later reuses it for dR.
+      // same canonical plane as inference. Static Backward reuses this X ring
+      // for bounded dX output, while saved X and private dR remain separate.
       layout.forward_training_output = layout.canonical_rows;
 #endif
       layout.backward_padded_capacity_rows = checked_add(

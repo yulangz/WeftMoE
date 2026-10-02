@@ -152,6 +152,24 @@ struct Transfer {
   unsigned long long first = 0;
 };
 
+struct DefaultHooks {
+  template <class Args>
+  __device__ __forceinline__ static Transfer returning(
+      const Args &a, unsigned channel, unsigned long long sequence,
+      unsigned long long position) {
+    const auto &queue = return_queue_detail::queues(a)[1U + peer(a, channel)];
+    const auto rows = position < queue.capacity
+        ? unsigned(min(queue.capacity - position, 1ULL * ring::kChunkRows)) : 0U;
+    return {channel, rows,
+        position + 1ULL * ring::kReturnPorts * ring::kChunkRows >= queue.capacity,
+        sequence, queue.begin + position};
+  }
+  template <class Args>
+  __device__ __forceinline__ static bool receive(
+      const Args &, unsigned, const ring::ChunkHeader *) { return true; }
+};
+template <class Args> struct Hooks : DefaultHooks {};
+
 template <class Args>
 __device__ __forceinline__ bool acknowledge(const Args &a, unsigned context) {
   const ncclGin gin(a.gin_dev_comm, context);
@@ -222,14 +240,17 @@ __device__ __forceinline__ bool claim_receive(const Args &a, unsigned &cursor,
       if (!ring::reached(gin.readSignal(a.gin_window,
               a.gin_rings.slot_control(channel, slot) + offsetof(ring::ChunkSlot, ready_signal)),
               sequence / ring::kRingDepth + 1ULL, 64U)) continue;
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(state.claimed)
-          .store(sequence + 1ULL, ::cuda::memory_order_relaxed);
     } else if (!ring::claim(gin, a.gin_window, a.gin_window_base, a.gin_rings, channel,
                            sequence)) continue;
     asm volatile("fence.proxy.async.global;" ::: "memory");
     const auto *header = reinterpret_cast<const ring::ChunkHeader *>(
         static_cast<const char *>(a.gin_window_base) +
         a.gin_rings.payload(channel, sequence, true));
+    if (!Hooks<Args>::receive(a, channel, header))
+      continue;
+    if (a.gin_receiver_count)
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(state.claimed)
+          .store(sequence + 1ULL, ::cuda::memory_order_relaxed);
     task = Transfer{channel, header->rows, header->terminal, sequence, 0};
     return true;
   }

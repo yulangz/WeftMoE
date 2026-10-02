@@ -1,4 +1,7 @@
 #include "cuda/backward/kernel_contract.cuh"
+#include "cuda/weftmoe_pf/backward_return_plan.cuh"
+#include "cuda/weftmoe_pf/backward_return_access.cuh"
+#include "cuda/weftmoe_pf/backward_return_hooks.cuh"
 #include "cuda/persistent_v3/backward/compute_kernels.cuh"
 
 // Rebuilt for each invocation: routing counts may change even at fixed shape.
@@ -297,7 +300,9 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
     const auto position = lane;
     const auto slot = a.dispatch.combine_order[route_base + position];
     const auto route = route_base + slot;
-    auto *source = contribution + route * a.hidden;
+    const auto row = a.return_ring.depth
+        ? weftmoe_pf::backward_return::contribution_row(a, route) : route;
+    auto *source = contribution + row * a.hidden;
     source_address = reinterpret_cast<unsigned long long>(source);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         marker(ready[route_base + position]);
@@ -365,6 +370,19 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
                float_to_bf16_bits(sums[word * 2U + 1U]))
            << 16U);
     output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
+  }
+  if (a.return_ring.depth) {
+    if (lane < a.dispatch.identity.top_k) {
+      const auto route = route_base + lane;
+      a.dgate[route] = a.peer_payloads[a.rank].dgate[
+          weftmoe_pf::backward_return::contribution_row(a, route)];
+    }
+    __syncwarp();
+    if (lane == 0U) {
+      const auto window = token / a.return_ring.shape.tokens;
+      weftmoe_pf::ring::arrive(a.peer_payloads[a.rank].consumed[
+          window % a.return_ring.contribution_depth], 1U);
+    }
   }
   return true;
 }

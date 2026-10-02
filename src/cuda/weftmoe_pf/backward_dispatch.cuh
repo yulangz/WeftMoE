@@ -74,7 +74,9 @@ __device__ __forceinline__ bool pull_dispatch(const BackwardKernelArgs &a,
       generation = ::cuda::atomic_ref<unsigned long long,
                                       ::cuda::thread_scope_system>(slot.ready)
                        .load(::cuda::memory_order_acquire);
-      if (generation == slot.consumed[local])
+      if (generation == ::cuda::atomic_ref<unsigned long long,
+                                           ::cuda::thread_scope_system>(slot.consumed[local])
+                            .load(::cuda::memory_order_relaxed))
         generation = 0ULL;
     }
     const auto mask = __ballot_sync(0xffffffffU, generation != 0ULL);

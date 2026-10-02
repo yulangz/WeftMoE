@@ -6438,6 +6438,24 @@ double backward_elapsed_us(cudaEvent_t begin, cudaEvent_t end,
 
 } // namespace
 
+BackwardTensorStorage BackwardMegaKernel::prepare_tensors(
+    const DeviceForwardHandle &forward, const BackwardMegaKernelConfig &config,
+    const BackwardTensorBuffers &bindings, const CudaTensorAllocator &allocator) const {
+  if (!forward.impl_ || !forward.impl_->retained_backward_state)
+    throw std::invalid_argument("Backward tensors require a retained Forward tape");
+  const auto &retained = *forward.impl_;
+  const auto &pool = *retained.pool;
+  const auto depth = backward_tuning::kUnifiedWorkers ? pool.layout.static_ring.depth : 0U;
+  const auto clusters = depth
+      ? pool.slots[retained.workspace_index].backward_peer_workspace->dispatch_ctas / 2U
+      : 0U;
+  BackwardTensorStorage result;
+  result.impl_ = BackwardTensorStorage::Impl::make(
+      retained.dispatch, retained.backend->execution, config, bindings, allocator,
+      depth, clusters);
+  return result;
+}
+
 DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const DeviceForwardHandle &forward,
     const BFloat16OutputGradientLease &output_gradients,
@@ -6529,8 +6547,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   auto tensors =
       config.tensors
           ? config.tensors
-          : prepare_backward_tensors(retained.dispatch,
-                                     retained.backend->execution, config);
+          : prepare_tensors(forward, config);
   const auto &data = *tensors.impl_;
   const auto &saved = *retained.tensors.impl_;
   if (data.tokens != identity.tokens || data.hidden != config.hidden_size ||
@@ -6539,6 +6556,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.experts != view.sizes.owned_expert_count ||
       data.rows < view.sizes.incoming_row_count ||
       data.padded_rows < ActivationTransportBridge::padded_received_rows(retained.dispatch) ||
+      (data.return_depth && data.return_depth != layout.static_ring.depth) ||
       data.completion.device != pool->device)
     throw std::runtime_error(
         "Backward tensor storage does not match this invocation");
@@ -6560,7 +6578,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   auto &peer_workspace = *slot.backward_peer_workspace;
   peer_workspace.prepare(identity.generation, view.sizes.incoming_row_count,
       checked_mul(identity.tokens, dispatch_id.top_k, "Backward source routes"),
-      config.hidden_size);
+      config.hidden_size, data.return_depth ? &layout.static_ring : nullptr);
   SlotFailureGuard failure_guard{lease, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /
@@ -6639,6 +6657,41 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.dx_rows =
       at<transport::BFloat16>(data.workspace->data, data.dx_rows_offset);
   args.dgate_rows = at<float>(data.workspace->data, data.dgate_rows_offset);
+  args.dgate = static_cast<float *>(data.dgate->data);
+  auto dab_map = data.dab_map;
+  auto dx_store_map = data.dx_store_map;
+  if (data.return_depth) {
+    const auto &r = layout.static_ring;
+    auto &v = args.return_ring;
+    v.shape = r.shape;
+    v.depth = data.return_depth;
+    v.contribution_depth = r.contribution_depth;
+    v.windows = r.max_windows;
+    v.state = at<static_forward::RingState>(slot.device, r.state);
+    v.window_prefix = at<std::uint64_t>(slot.device, r.window_prefix);
+    v.expert_rows = at<std::uint64_t>(slot.device, r.expert_rows);
+    v.expert_blocks = at<std::uint64_t>(slot.device, r.expert_blocks);
+    v.blocks = at<backward_detail::ReturnBlock>(slot.device, r.blocks);
+    v.rows = at<backward_detail::ReturnRow>(slot.device, r.rows);
+    v.row_blocks = at<unsigned>(slot.device, r.tape_rows);
+    const auto mblocks = ActivationTransportBridge::padded_received_rows(
+                             retained.dispatch) / backward_tuning::kTileM;
+    v.du_window = v.row_blocks + view.sizes.incoming_row_count;
+    v.du_order = v.du_window + mblocks;
+    v.du_offsets = v.du_order + mblocks;
+    v.buckets = at<backward_detail::ReturnBucket>(slot.device, r.window_sources);
+    v.slots = peer_workspace.payloads[identity.rank].return_slots;
+    args.dx_rows = at<transport::BFloat16>(slot.device, layout.canonical_rows);
+    v.gathered_dab = data.private_gather
+        ? at<transport::BFloat16>(data.workspace->data, data.gathered_dab_offset)
+        : at<transport::BFloat16>(slot.device, layout.forward_s);
+    dab_map = make_bf16_tma_map(v.gathered_dab, 2ULL * config.intermediate_size,
+        data.gather_rows, backward_tuning::kActivationTileM,
+        "Backward bounded dX input", backward_tuning::kTileK);
+    dx_store_map = make_bf16_tma_store_map(args.dx_rows, config.hidden_size,
+        std::uint64_t(v.depth) * backward_tuning::kTileM,
+        "Backward dX ring", 0ULL, backward_tuning::kActivationTileM);
+  }
   args.dw1 = static_cast<transport::BFloat16 *>(data.dw1->data);
   args.dw2 = static_cast<transport::BFloat16 *>(data.dw2->data);
   args.dx = static_cast<transport::BFloat16 *>(data.dx->data);
@@ -6865,6 +6918,16 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       "backward-run", cudaGetLastError(), identity.rank, identity.world,
       "backward", identity.generation, ExchangeKind::ExpertCounts,
       "initialize fixed Backward pipeline state");
+  if (args.return_ring.depth) {
+    const auto blocks = std::max(1U, std::min(512U,
+        unsigned((view.sizes.incoming_row_count + 255U) / 256U)));
+    weftmoe_pf::backward_return::count<<<blocks, 256, 0, transport_stream>>>(args);
+    weftmoe_pf::backward_return::geometry<<<1, 256, 0, transport_stream>>>(args);
+    weftmoe_pf::backward_return::rows<<<blocks, 256, 0, transport_stream>>>(args);
+    internal::throw_cuda("backward-plan", cudaGetLastError(), identity.rank,
+        identity.world, "backward", identity.generation, ExchangeKind::ExpertCounts,
+        "build bounded Backward Return windows");
+  }
   internal::throw_cuda(
       "backward-run",
       internal::record_observable_event(slot.backward_start, transport_stream,
@@ -6934,11 +6997,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                       "all worker CTAs resident", std::to_string(clusters));
     internal::throw_cuda("backward-run",
         cudaLaunchKernelEx(&launch, kernel, args,
-            data.dr_map, data.dab_map,
+            data.dr_map, dab_map,
             retained.weights.impl_->backward_w2_map,
             retained.weights.impl_->backward_w1_map, data.dr_mn_map,
             data.u_mn_map, data.dab_mn_map, x_map,
-            data.u_store_map, data.dx_store_map, dw2_map, dw1_map),
+            data.u_store_map, dx_store_map, dw2_map, dw1_map),
         identity.rank, identity.world, "backward", identity.generation,
         ExchangeKind::ExpertCounts, "launch unified Backward workers");
     for (auto event : {slot.backward_transport_done, slot.backward_compute_done,
@@ -7034,7 +7097,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts,
       "join late Backward compute workers and reduction");
-  if (data.dgate->bytes)
+  if (data.dgate->bytes && !args.return_ring.depth)
     internal::throw_cuda(
         "backward-output",
         cudaMemcpyAsync(data.dgate->data,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "weftmoe/transport/activation_protocol.hpp"
+#include "cuda/weftmoe_pf/backward_return.hpp"
 
 namespace weftmoe::cuda::backward_detail {
 
@@ -22,6 +23,9 @@ struct PeerPayload {
   transport::BFloat16 *contribution;
   float *dgate;
   DispatchSlot *dispatch_slots = nullptr;
+  ReturnSlot *return_slots = nullptr;
+  SourceReturnState *return_state = nullptr;
+  std::uint64_t *consumed = nullptr;
 };
 
 } // namespace weftmoe::cuda::backward_detail

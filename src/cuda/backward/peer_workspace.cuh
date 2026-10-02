@@ -8,6 +8,7 @@ struct BackwardPeerWorkspace {
   struct Export {
     cudaIpcMemHandle_t handle{};
     std::size_t contribution = 0, dgate = 0, dispatch_slots = 0;
+    std::size_t return_slots = 0, return_state = 0, consumed = 0;
   };
   struct Buffer {
     std::shared_ptr<tensor_storage_detail::Allocation> allocation;
@@ -15,6 +16,7 @@ struct BackwardPeerWorkspace {
     std::uint64_t row_capacity = 0, route_capacity = 0, hidden = 0;
     std::size_t table = 0;
     CUtensorMap dr_map{}, dr_mn_map{};
+    unsigned return_depth = 0;
   };
 
   CollectiveTensorPreparation preparation;
@@ -78,11 +80,13 @@ struct BackwardPeerWorkspace {
   }
 
   std::shared_ptr<Buffer> allocate(std::uint64_t rows, std::uint64_t routes,
-                                  std::uint64_t hidden) {
+                                  std::uint64_t hidden,
+                                  const static_forward::ComputeRingLayout *ring) {
     auto result = std::make_shared<Buffer>();
     result->row_capacity = rows;
     result->route_capacity = routes;
     result->hidden = hidden;
+    result->return_depth = ring ? ring->depth : 0U;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
     if constexpr (!backward_tuning::kUnifiedWorkers)
@@ -98,6 +102,14 @@ struct BackwardPeerWorkspace {
         cursor, dispatch_ctas * communication::kRingDepth,
         sizeof(backward_detail::DispatchSlot),
         "Backward RX fanout credits");
+    if (ring) {
+      result->descriptor.return_slots = append(cursor, ring->depth,
+          sizeof(backward_detail::ReturnSlot), "Backward dX slot credits");
+      result->descriptor.return_state = append(cursor, 1U,
+          sizeof(backward_detail::SourceReturnState), "Backward source window head");
+      result->descriptor.consumed = append(cursor, ring->contribution_depth,
+          sizeof(std::uint64_t), "Backward source window credits");
+    }
     result->table = append(cursor, nccl->world,
                             sizeof(backward_detail::PeerPayload),
                             "Backward peer payload addresses");
@@ -113,17 +125,23 @@ struct BackwardPeerWorkspace {
   }
 
   void prepare(std::uint64_t next_generation, std::uint64_t rows,
-                std::uint64_t routes, std::uint64_t hidden) {
+                std::uint64_t routes, std::uint64_t hidden,
+                const static_forward::ComputeRingLayout *ring = nullptr) {
     if constexpr (backward_tuning::kUnifiedWorkers)
       rows = 0U;
     // A retained Notify plan is immutable. Repeating that Backward needs no
     // allocation, address exchange or host collective.
-    if (buffer && generation == next_generation)
+    const auto depth = ring ? ring->depth : 0U;
+    if (ring)
+      routes = std::uint64_t(ring->shape.tokens) * ring->contribution_depth *
+               ring->shape.top_k;
+    if (buffer && generation == next_generation && buffer->return_depth == depth)
       return;
     generation = 0;
     std::shared_ptr<Buffer> next;
     preparation.run([&] {
-      if (buffer && buffer->hidden == hidden && rows <= buffer->row_capacity &&
+      if (buffer && buffer->hidden == hidden && buffer->return_depth == depth &&
+          rows <= buffer->row_capacity &&
           routes <= buffer->route_capacity) {
         next = buffer;
       } else {
@@ -134,7 +152,7 @@ struct BackwardPeerWorkspace {
                                              "Backward grown row capacity"))
             : initial_rows;
         next = allocate(backward_tuning::kUnifiedWorkers ? 0U : std::max(rows, reserved),
-                        std::max(routes, max_routes), hidden);
+                        ring ? routes : std::max(routes, max_routes), hidden, ring);
       }
       // Preserve the logical TMA bounds, including zero fill of tail tiles.
       // The descriptor may change without replacing or remapping the storage.
@@ -183,7 +201,10 @@ struct BackwardPeerWorkspace {
               static_cast<transport::BFloat16 *>(base),
               at<transport::BFloat16>(base, exports[rank].contribution),
               at<float>(base, exports[rank].dgate),
-              at<backward_detail::DispatchSlot>(base, exports[rank].dispatch_slots)};
+              at<backward_detail::DispatchSlot>(base, exports[rank].dispatch_slots),
+              ring ? at<backward_detail::ReturnSlot>(base, exports[rank].return_slots) : nullptr,
+              ring ? at<backward_detail::SourceReturnState>(base, exports[rank].return_state) : nullptr,
+              ring ? at<std::uint64_t>(base, exports[rank].consumed) : nullptr};
         }
       });
     } catch (...) {
