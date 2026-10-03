@@ -26,6 +26,12 @@
 Megatron 基线使用 selective `moe_act`，同样保留 routed X 与 FC1 G/U，
 在 BWD 重算 gated SwiGLU；统一随机输入与计时边界。
 
+验收：EP8/EP16 的随机四档、扩容/live tapes/OOM 重试、小 ring bounded 路径、
+EP4/non-ring 和 Megatron DDP 卸载恢复通过；推理最大耗时增加约 0.21%。
+稳态随机整轮比本轮较快的 Megatron 基线低 19%–28%（8K/20K），但固定缓存的
+双机 BWD 仍比原版 V3 慢 7.72%/2.32%，该性能门禁保持开放。完整口径及证据见
+[训练记录 M7e](static_forward_v4_training_record.md#m7e-地址复用与公平训练对照2026-10-03)。
+
 ## 2026-10-03：Backward 容量优先恢复性能（M7d，已落地，仍有剩余回退）
 
 以下约定取代 M7a 的私有 dR 目标，历史实验和回退保留在下一节。用户允许

@@ -1,5 +1,206 @@
 # V4 ring 训练对接记录
 
+## M7e 地址复用与公平训练对照：2026-10-03
+
+简述：Backward peer bindings 不再随 FWD generation 重建；将“本 rank 是否换了
+allocation”并入已有分配一致性检查，容量满足时复用地址和 IPC 映射。本轮相邻
+消融中，1/64 token 整轮耗时降低 8.5%–9.6%，8K 降低 1.2%–2.5%；单机 20K
+持平、双机 20K 降低约 1.4%。这是减少固定 host 准备开销，不是 GEMM 吞吐提升。
+实现提交 `6626864`；随机 workload 的 Megatron `moe_act` 基线接入提交 `16b1e7e`。
+
+### 改动与调用计数
+
+`generation` 标识本次 retained FWD/对应 BWD 的数据，不是地址版本。实际 R 变化
+仍更新本地 TMA 边界，但只在初次分配、扩容或布局变化时交换 peer exports。
+任意 rank 更换 buffer，全体都进入慢路径；不能让本地容量足够的 rank 独自返回。
+旧 imports 全部关闭并达成 collective agreement 后才释放旧 exports；OOM/retry、
+close/suspend 的顺序不变。没有缓存 route 或计算结果，也不更改 GEMM、持久容量、
+ring slot credit、NIC completion、dX→dW 先后约束和推理 kernel。
+
+以五次不同 tokens/routes 的调用核对 CUDA/NCCL API 次数；EP8、EP16 的每个
+rank 在第 2–5 次调用结果一致。以下是**整个 BWD API**的稳态计数：
+
+| 版本 | AllGather | AllReduce | 显式 stream synchronize | IPC open/close |
+|---|---:|---:|---:|---:|
+| M7d | 1 | 3 | 4 | 0 / 0 |
+| M7e | 0 | 2 | 2 | 0 / 0 |
+
+两次剩余 AllReduce 分别是本次私有 tensor 准备、peer workspace 容量/分配检查。
+若仅看 peer prepare，已从 2 AllReduce + 1 AllGather + 3 次同步降为
+1 AllReduce + 1 次同步。初次调用仍导入本节点七个 peer。计数探针不用于测性能；
+正式测量未加载探针。证据：`build/pf_peer_bindings/audit_fixed_*`。
+
+### 相邻 M7d/M7e 消融
+
+两机均为 8×L20X，1620 MHz；EP8 是**单机八卡**，EP16 为两机十六卡。
+H2048/I512、E64/top-k4、BF16 activation/weight/gradient，gate FP32。
+每 rank 的 token 数服从 nominal 附近 σ=10% 的截断正态，专家共享 bias σ=0.5；
+所有版本逐 rank trace SHA、T/R 与容量完全匹配。20 warmup + 60 measured，
+单位 ms，取每步全 rank 最大 `FWD+BWD+释放+device synchronize` wall 的 p50。
+固定 runtime 初始化不计时，权重重排和每次私有 tensor 准备仍计时。
+
+| 拓扑 | nominal T/rank | M7d | M7e | 耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 | 1 | 1.0962 | 1.0032 | 8.49% |
+| EP8 | 64 | 1.4540 | 1.3235 | 8.98% |
+| EP8 | 8192 | 5.7525 | 5.6089 | 2.50% |
+| EP8 | 20480 | 11.9251 | 11.9474 | -0.19%，持平 |
+| EP16 | 1 | 1.4970 | 1.3655 | 8.78% |
+| EP16 | 64 | 2.0452 | 1.8482 | 9.63% |
+| EP16 | 8192 | 9.6068 | 9.4949 | 1.16% |
+| EP16 | 20480 | 22.8469 | 22.5344 | 1.37% |
+
+M7d 对照来自 `build/pf_private_dr/network_dx/`；新库来自
+`build/pf_peer_bindings/`，库 SHA256 为
+`6579bd40dd8b230d23aaa1e7c08dbc886c5bb2fb823790486b62a38c7ce15285`。
+正式原始消融为 `performance_{old,new}_ep*`。长文收益小，不据此宣称已经消除
+M7d 相对更早 resident 的所有回退。
+
+### 基线公平性约定
+
+- Megatron 使用真实 TEGroupedMLP、selective `moe_act`：保存 routed X、FC1
+  gate/up，在 BWD 重算 gated SwiGLU，不拿“不缓存 FC1、重算整个 MoE”的模式对比。
+  输出及 dX/dGate/dW1/dW2 都包括；三者都从 selected routes/probabilities 开始，
+  不计 router projection/top-k、optimizer 或整模型 DDP 通信。
+- Megatron 开启 fused permutation、fused weighted SwiGLU，分别测试
+  NCCL all-to-all 和 DeepEP Flex（上游默认 20 SM），不强制较慢的非融合/确定性模式。
+  Megatron-Core 0.17.0、TE 2.14.1+27de67e1；两机 NCCL 日志确认 IB/GDRDMA。
+- 普通 20 warmup 在小 batch 下仍可能漏掉 Megatron 的 0/1-row 编译分支：
+  EP16 的 1-token 正式采样曾有部分 rank 新编译 3 个 graph；长文该计数为零。
+  新增 `--prime-trace`：先完整运行同一 trace 一次，再进行原来的 20/60。
+  恢复显式 input RNG 状态，保证正式 X/dY 与未 prime 的试验相同；记录正式
+  采样期间的 compile graph 增量。它只预热编译/分配器，不复用 FWD/BWD 结果。
+- 冻结 V3 使用 `build/pf_training_v3_reference/`，SHA256
+  `6d349d29f7120e00ae1225ac9ea8e0fa1423e6f18423828b3650c3b3c49812e1`。
+  不把当前 PF 的 non-ring 分支重命名为“原版 V3”。旧库只用原 teardown 合同的
+  benchmark wrapper，算子和 profile 未修改。其动态 R 下的分配/IPC 成本必须
+  如实计入应用调用，但不能把数量级 wall 差距解释为计算调度收益。
+- 因而另测冻结原版 native V3 与新 PF：固定相同输入/路由/权重、预备通信地址、
+  已缓存 X/GU 的 BWD；临时输出/scratch 用 warmed caching allocator，分配仍计时。
+  Megatron cached-state 对照同样把前置 FWD 放在 BWD 计时外。独立阶段 p50
+  不相加冒充 FWD+BWD 整轮耗时；异步 FWD 的 host API 边界也不冒充 GPU 阶段耗时。
+
+### 完整 trace 预热后的实际 FWD+BWD 调用（合成随机 workload）
+
+下表所有版本统一先 prime 80 步，再 20 warmup + 60 measured；输入及路由
+trace 与上节完全一致。全部 Megatron 正式采样的新增 compile graph 数均为零。
+单位 ms，仍是整轮 rank-max p50，不是独立 FWD/BWD p50 之和。
+
+| 拓扑 | nominal T/rank | 新 PF | 冻结 V3 原样调用 | Megatron NCCL | Megatron DeepEP | PF 对较快 Megatron 耗时降低 |
+|---|---:|---:|---:|---:|---:|---:|
+| EP8 | 1 | 0.9931 | 11.7874 | 4.9589 | 5.4790 | 79.97% |
+| EP8 | 64 | 1.3190 | 14.0204 | 5.6575 | 6.5020 | 76.69% |
+| EP8 | 8192 | 5.6208 | 84.3958 | 6.9672 | 9.5305 | 19.33% |
+| EP8 | 20480 | 11.7321 | 194.7498 | 15.3929 | 18.5574 | 23.78% |
+| EP16 | 1 | 1.3556 | 11.8460 | 4.7571 | 5.7642 | 71.50% |
+| EP16 | 64 | 1.8627 | 19.8008 | 5.7190 | 5.5488 | 66.43% |
+| EP16 | 8192 | 9.3066 | 98.4278 | 18.5958 | 12.8639 | 27.65% |
+| EP16 | 20480 | 22.5249 | 275.1253 | 44.7328 | 28.4435 | 20.81% |
+
+不只采用更慢的通信后端作为基线：本轮单机 NCCL 更快，双机长文 DeepEP 更快。
+完整预热明显影响基线：例如 EP8 8K NCCL 的首轮 17.859 ms 降至 6.967 ms；
+不能继续用首轮数据宣称约三倍优势，也不将所有差额都归因于 JIT。
+新 PF 同点为 5.609→5.621 ms。上表只说明这个模型形状、分布和 eager MoE
+算子边界的收益，不是整个 Megatron/AReaL 训练 step 的加速比。
+
+Torch 为 2.9.1+cu129，DeepEP 为 1.2.1+567632d。Torch 的 NCCL 编译版本接口
+返回 2.27.5，但实际已加载库的 `ncclGetVersion` 和 NCCL 日志均为 **2.31.2**；
+不能把编译版本当成运行库版本。benchmark 现分别记录这两个值及实际库路径。
+原始日志：`steady_{new,v3,megatron_alltoall,megatron_flex}_ep*`；
+`summarize.py` 检查逐 rank SHA、tokens、received rows、容量及 API 计数。
+
+### 固定缓存的阶段对照：不能宣称全面超过 V3
+
+相同 H/I/E/K、1620 MHz、固定 balanced routes/输入/权重，10 warmup + 100
+measured。V3 native 为 `build/static_inference_v3_20260923/test_cuda_notify`，
+SHA256 `cc0471af98d0fcbcfa52b9c9669ae2e20fb9b8077aa36e483a11a4be6331a699`。
+PF/V3 开启 `WEFTMOE_BENCH_ALLOCATE_TENSORS=1`、`WEFTMOE_BENCH_SYNC_RANKS=1`；
+Megatron 开启 `--allocate-tensors`。均使用 warmed allocator，每轮 dY clone、
+输出/中间 tensor 分配计入 BWD；前置 FWD、通信缓冲初始化和上一轮梯度释放
+在 BWD 计时外。固定输入消除了 V3 动态 R 下的 IPC 重建成本。
+这是 PF/V3 native 与 Megatron framework 的阶段 wall，不冒充裸 GEMM 时间。
+
+缓存 X/GU 的 BWD，单位 ms，rank-max p50：
+
+| 拓扑 | T/rank | 原版 V3 | 新 PF | Megatron NCCL | Megatron DeepEP | PF 对 V3 耗时变化 |
+|---|---:|---:|---:|---:|---:|---:|
+| EP8 | 8192 | 2.1414 | 2.0335 | 3.7926 | 3.4347 | -5.04% |
+| EP8 | 20480 | 5.0703 | 4.8108 | 4.7352 | 6.1891 | -5.12% |
+| EP16 | 8192 | 2.8710 | 3.0928 | 5.6714 | 4.7674 | **+7.72%** |
+| EP16 | 20480 | 7.0381 | 7.2016 | 12.9485 | 9.8988 | **+2.32%** |
+
+单机 20K 的 BWD 也不是稳定领先 Megatron：本轮 PF 比 NCCL 基线慢约 1.6%，
+按接近看待。双机 BWD 与原版 V3 的差距仍明确保留为待优化项。
+缓存就绪的 native BWD 本来就绕过重新绑定；本次地址复用优化主要作用于
+不同 generation 的实际训练调用，不能用应用层的大幅领先替代这项计算路径验收。
+
+同一 native 产物的训练 FWD（含 input clone、tensor allocation、Notify、
+retained-state main），单位 ms：
+
+| 拓扑 | T/rank | 原版 V3 | 新 PF | 耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 | 8192 | 1.7261 | 1.5171 | 12.10% |
+| EP8 | 20480 | 3.5878 | 3.3021 | 7.96% |
+| EP16 | 8192 | 3.4485 | 3.2009 | 7.18% |
+| EP16 | 20480 | 7.2243 | 7.0203 | 2.82% |
+
+不把 FWD 的优势抵消后就宣布“BWD 已不低于 V3”。原始结果为
+`native_{v3,new}_ep*_t{8192,20480}_{forward,backward}.{json,measure.log}`、
+`cached_{alltoall,flex}_t*_ep*.log`。全部八组 Megatron cached-state 验证中，
+`moe_act` 与不重算版本的四组梯度，以及重复 BWD 的四组梯度，均逐字节相同。
+
+### 推理回归与验收
+
+M7d→M7e 的 inference-only CUDA Graph，对每档先 50 warmup，再 200 samples，
+每 sample 重放 10 次，每轮更换有效 routes/gates；初始化、capture 与输入准备
+均不计时。单位 µs，rank-max p50：
+
+| 拓扑 | T/rank | M7d | M7e |
+|---|---:|---:|---:|
+| EP8 | 1 | 35.301 | 35.267 |
+| EP8 | 64 | 59.293 | 57.579 |
+| EP8 | 8192 | 1528.099 | 1528.126 |
+| EP8 | 20480 | 3611.398 | 3613.594 |
+| EP16 | 1 | 234.878 | 234.786 |
+| EP16 | 64 | 290.667 | 289.958 |
+| EP16 | 8192 | 3055.397 | 3060.789 |
+| EP16 | 20480 | 7016.504 | 7031.014 |
+
+最大正向耗时变化为约 0.21%，未观察到实质推理回退。单机 64 的变化不归因于
+本次 host 改动：被移除的 peer prepare 不在 inference graph 路径内。
+
+本轮复用现有分布式集成测试，不增加内部函数名或指令布局的细粒度单测：
+
+- EP8/EP16，1/64/8K/20K 随机不等长输入：output、dX、dGate、dW1、dW2
+  对 Torch reference，全体通过；两种 Megatron dispatcher 同矩阵也通过。
+- 初始 hint 仅 64 rows，热点迁移、零接收、三份 live tape、扩缩 actual R、
+  单 rank tensor 分配失败后全体退出/重试、非法 route、权重原地刷新、释放/恢复。
+- 真实 Megatron TP4+EP8/EP16 DDP，两次优化器更新及 suspend/resume；通信
+  buffer 在共卡切换时可释放，恢复时重建映射。
+- 另以 `max_tokens=40000`、B16/D1、T256 强制 bounded source-window 路径，
+  EP8/EP16 检查小 ring 多次复用；补充 EP4 和 non-ring 回退。
+
+证据均在 `build/pf_peer_bindings/`：`random_*`、`lifecycle_*`、
+`megatron_adapter_*`、`parity_*`、`bounded_reuse_*`、`small_team_*`、
+`dense_fallback_*`、`inference_{old,new}_*`。数据汇总及 launcher 也保留在该目录。
+
+复现实际调用比较时，使用同一个 `tools/benchmark_training.py`：
+
+```bash
+torchrun --standalone --nproc-per-node=8 tools/benchmark_training.py \
+  --backend pf --tokens 1 64 8192 20480 --warmups 20 --samples 60 \
+  --prime-trace --ring-tokens 512 --ring-depth 8
+```
+
+PF 通过 `WEFTMOE_TENSOR_EXTENSION` 指定对应库目录下的 `_runtime*.so`；
+Megatron 改为 `--backend megatron --dispatcher alltoall` 或 `flex`，不需要
+WeftMoE extension。EP16 两端启动相同参数，将 ring 改为 B768/D6，并显式
+统一 NCCL IB 开关/GID/interface。冻结 V3 使用原 teardown wrapper 加
+`--backend v3`，不替换其 kernel/profile。
+
+结论：地址生命周期修复和稳态应用性能验证完成，随机整轮领先 Megatron；
+但**双机 cached-state BWD 仍未达到不低于 V3 的目标**，不能关闭这项性能门禁。
+
 ## M7d 容量优先：2026-10-03（已落地，仍有剩余回退）
 
 简述：扩大 Backward source 容量，恢复可复用 dR 和跨机 RX 直接 fanout；

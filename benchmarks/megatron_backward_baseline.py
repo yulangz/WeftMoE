@@ -208,13 +208,13 @@ def main():
         params_dtype=torch.bfloat16,
         moe_router_dtype="fp32",
         moe_router_pre_softmax=args.top_k == 1,
-        moe_permute_fusion=False,
-        deterministic_mode=True,
+        moe_permute_fusion=True,
+        deterministic_mode=False,
         add_bias_linear=False,
         gated_linear_unit=True,
         activation_func=F.silu,
         moe_grouped_gemm=True,
-        use_te_activation_func=True,
+        bias_activation_fusion=True,
         recompute_granularity="selective",
         recompute_modules=["moe_act"],
     )
@@ -228,7 +228,6 @@ def main():
     layer_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=args.experts,
         moe_grouped_gemm=True,
-        use_te_activation_func=True,
     )
     experts_builder = layer_spec.submodules.mlp.submodules.experts
     experts_module = experts_builder(
@@ -405,6 +404,9 @@ def main():
             "runs": args.runs,
         },
         "dtype": "BF16 activation/weights/grads; FP32 gate",
+        "moe_permute_fusion": config.moe_permute_fusion,
+        "bias_activation_fusion": config.bias_activation_fusion,
+        "deterministic_mode": config.deterministic_mode,
         "checkpoint_contract": {
             "retained": ["canonical routed X", "BF16 FC1 A/B"],
             "released": ["gated BF16 SwiGLU output U"],

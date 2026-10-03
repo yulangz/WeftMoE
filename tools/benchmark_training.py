@@ -60,6 +60,8 @@ def main():
     parser.add_argument("--intermediate", type=int, default=512)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--prime-trace", action="store_true",
+                        help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -129,7 +131,14 @@ def main():
                 max_rows=max_rows, training=True, max_saved=2)
         samples = []
         forward_samples = []
-        for iteration, (cpu_routes, cpu_gates) in enumerate(batches):
+        priming_steps = len(batches) if args.prime_trace else 0
+        input_rng_state = generator.get_state()
+        compile_graphs_before = 0
+        for iteration, (cpu_routes, cpu_gates) in enumerate(batches * (2 if args.prime_trace else 1)):
+            if args.prime_trace and iteration == priming_steps:
+                generator.set_state(input_rng_state)
+            if args.backend == "megatron" and iteration == priming_steps + args.warmups:
+                compile_graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
             dist.barrier()
@@ -141,7 +150,7 @@ def main():
             del tape, gradients
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - start) / 1000
-            if iteration >= args.warmups:
+            if iteration >= priming_steps + args.warmups:
                 samples.append(elapsed)
                 forward_samples.append((forward_end - start) / 1000)
             del x, dy, routes, gates
@@ -149,6 +158,11 @@ def main():
         dist.all_gather_object(per_rank, samples)
         forward_per_rank = [None] * world
         dist.all_gather_object(forward_per_rank, forward_samples)
+        compile_graphs = None
+        if args.backend == "megatron":
+            compile_graphs = [None] * world
+            dist.all_gather_object(compile_graphs,
+                torch._dynamo.utils.counters["stats"]["unique_graphs"] - compile_graphs_before)
         if rank == 0:
             slowest = [max(row[i] for row in per_rank) for i in range(args.samples)]
             measured_tokens = [workload["tokens"][args.warmups:] for workload in workloads]
@@ -170,6 +184,7 @@ def main():
                 input_tokens_per_second=sum(flat_tokens) * 1e6 / sum(slowest),
                 experts=args.experts, top_k=args.top_k, hidden=args.hidden,
                 intermediate=args.intermediate, warmups=args.warmups,
+                priming_steps=priming_steps, compiled_graphs_during_measurement=compile_graphs,
                 samples=args.samples, wall_slowest_rank_p50_us=statistics.median(slowest),
                 forward_slowest_rank_p50_us=statistics.median(
                     max(row[i] for row in forward_per_rank) for i in range(args.samples)),

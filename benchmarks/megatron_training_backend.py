@@ -21,6 +21,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from benchmarks.megatron_dispatch_baseline import loaded_nccl_libraries, nccl_runtime_version
+
 
 class MegatronTrainingBackend:
     def __init__(self, args, w1, w2):
@@ -61,7 +63,8 @@ class MegatronTrainingBackend:
             moe_permute_fusion=True, bias_activation_fusion=True,
             recompute_granularity="selective", recompute_modules=["moe_act"],
             megatron_core=version("megatron-core"), transformer_engine=version("transformer-engine"),
-            torch=torch.__version__, nccl=torch.cuda.nccl.version(),
+            torch=torch.__version__, torch_nccl_compile_version=torch.cuda.nccl.version(),
+            nccl_runtime_version=nccl_runtime_version(), loaded_nccl_libraries=loaded_nccl_libraries(),
             deep_ep=version("deep-ep") if args.dispatcher == "flex" else None)
 
     def forward(self, x, routes, gates, w1, w2):
