@@ -6445,7 +6445,11 @@ BackwardTensorStorage BackwardMegaKernel::prepare_tensors(
     throw std::invalid_argument("Backward tensors require a retained Forward tape");
   const auto &retained = *forward.impl_;
   const auto &pool = *retained.pool;
-  const auto depth = backward_tuning::kUnifiedWorkers ? pool.layout.static_ring.depth : 0U;
+  auto depth = backward_tuning::kUnifiedWorkers ? pool.layout.static_ring.depth : 0U;
+  if (depth && pool.slots[retained.workspace_index].backward_peer_workspace->full_dx_fits(
+                   pool.layout.static_ring, config.hidden_size,
+                   ActivationTransportBridge::padded_received_rows(retained.dispatch)))
+    depth = 0U;
   const auto clusters = depth
       ? pool.slots[retained.workspace_index].backward_peer_workspace->dispatch_ctas / 2U
       : 0U;
@@ -6576,12 +6580,14 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   GinExecution communication(pool->gin_resources, exec->stream);
   auto flight = std::make_shared<OperatorFlight>(lease, true);
   auto &peer_workspace = *slot.backward_peer_workspace;
-  const auto return_layout = data.return_depth
+  // Keep communication capacity and IPC handles independent of the local
+  // choice between private full dX staging and reusable dX slots.
+  const auto return_layout = layout.static_ring.depth
       ? peer_workspace.return_layout(layout.static_ring, config.hidden_size)
       : static_forward::ComputeRingLayout{};
   peer_workspace.prepare(identity.generation, view.sizes.incoming_row_count,
       checked_mul(identity.tokens, dispatch_id.top_k, "Backward source routes"),
-      config.hidden_size, data.return_depth ? &return_layout : nullptr);
+      config.hidden_size, layout.static_ring.depth ? &return_layout : nullptr);
   SlotFailureGuard failure_guard{lease, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /

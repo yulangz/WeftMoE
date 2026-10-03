@@ -79,19 +79,38 @@ struct BackwardPeerWorkspace {
     mappings.close();
   }
 
+  static std::uint64_t return_budget(
+      const static_forward::ComputeRingLayout &forward, std::uint64_t hidden) {
+    constexpr std::uint64_t kExtraBytes = 448ULL << 20U;
+    const auto routes = std::uint64_t(forward.shape.tokens) *
+                        forward.contribution_depth * forward.shape.top_k;
+    return checked_mul(routes, hidden * 2ULL + sizeof(float),
+                       "Backward source capacity") + kExtraBytes;
+  }
+
+  bool full_dx_fits(const static_forward::ComputeRingLayout &forward,
+                    std::uint64_t hidden, std::uint64_t padded_rows) const {
+    // Local dX already writes directly to its source; staging would add a copy.
+    if (!network)
+      return false;
+    const auto budget = return_budget(forward, hidden);
+    const auto source = checked_mul(max_routes, hidden * 2ULL + sizeof(float),
+                                    "Backward full source capacity");
+    const auto dx = checked_mul(padded_rows, hidden * 2ULL, "Backward full dX capacity");
+    return source <= budget && dx <= budget - source;
+  }
+
   // Spend a bounded increment on source contributions, not worst-case expert
   // payloads. A complete source range preserves canonical GEMM tiles; larger
   // contexts retain window credits with up to four times the Forward depth.
   static_forward::ComputeRingLayout return_layout(
       const static_forward::ComputeRingLayout &forward, std::uint64_t hidden) {
     auto result = forward;
-    constexpr std::uint64_t kExtraSourceBytes = 448ULL << 20U;
     const auto row_bytes = checked_mul(hidden, 2ULL, "Backward contribution row") + sizeof(float);
     const auto window_bytes = checked_mul(
         std::uint64_t(forward.shape.tokens) * forward.shape.top_k,
         row_bytes, "Backward contribution window");
-    const auto budget = checked_mul(window_bytes, forward.contribution_depth,
-                                   "Backward source capacity") + kExtraSourceBytes;
+    const auto budget = return_budget(forward, hidden);
     const auto full_bytes = checked_mul(max_routes, row_bytes, "Backward full source capacity");
     const bool canonical = full_bytes <= budget;
     if (canonical) {

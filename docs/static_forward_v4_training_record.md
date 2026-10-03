@@ -1,12 +1,14 @@
 # V4 ring 训练对接记录
 
-## M7d 容量优先：2026-10-03（阶段一完成，性能部分恢复）
+## M7d 容量优先：2026-10-03（已落地，仍有剩余回退）
 
 简述：扩大 Backward source 容量，恢复可复用 dR 和跨机 RX 直接 fanout；
 利用 canonical 行顺序恢复静态 dU→SwiGLU→dX 链，取消重复 gather 和逐行
-位置预约。相对 M7b，EP8/EP16 的 8K/20K 整轮耗时下降 13.9%–20.2%；
-20K 同时峰值增加约 343/334 MiB。相对 M7 前 resident 尚差 1.6%–8.3%，
-没有宣称性能全部恢复。分步消融与正式相邻数据如下。
+位置预约；跨机在剩余预算内复用完整 dX，单机保留直接写回。最终相对 M7b，
+EP8/EP16 的 8K/20K 整轮耗时下降 12.6%–18.3%，实测峰值增量为 84–428 MB。
+相对 M7 前 resident，单机 20K 基本持平、双机 8K 差约 0.9%，但单机 8K/
+双机 20K 仍差约 7%/5%，不按“全部恢复”关闭性能门禁。推理四档差异均小于
+0.4%。阶段一提交 `f69fffb`；分步消融与最终完整矩阵如下。
 
 性能优先于进一步压缩 workspace；用户允许先使用每卡约 500 MB 的增量。
 本轮只改变 Backward 容量，Forward 的 B512/D8（EP8）和 B768/D6（EP16）、
@@ -177,6 +179,108 @@ suspend/resume 与缓冲释放。原失败日志保留，后续日志使用 `*_s
 证据：`build/pf_private_dr/full_source_credit/` 下的 `paired_*`、
 `performance_*`、`memory_*` 与 `source.patch`。首轮 inference 阶段中途
 与另一个候选的 CPU 编译重叠，功能检查保留，但不把该次时间作为性能结论。
+
+### 第四步：剩余预算内选择实际 P 的完整 dX（收敛为仅跨机）
+
+`adaptive_dx` 只增加 host 侧容量选择，不增加设备 kernel：完整 source
+contribution 加实际 `[P,H]` BF16 dX 能放进同一个“原容量 + 448 MiB”预算
+时，复用现有静态主 kernel 的完整 dX/Return 分支，省掉三个 Return planner
+launch 和输出 slot 复用。否则继续使用上一阶段的 canonical dX ring；source
+范围本身也放不下时仍走 bounded source-window 路径。
+
+P 直接来自 retained FWD metadata，不新增计数 kernel/同步；不是按平均路由
+分配，也不申请最坏 P。完整 dX 属于本次私有 workspace，生命周期与 U/dAB
+一致。持久通信布局只取决于池的 shape/capacity，**不随各 rank 的 dX 选择改变**，
+所以混合模式或下一次路由变化不触发 IPC 重建。两种模式的 Return wire/route
+标记相同，仍等所有本地 dX 完成后才开始 dW。
+
+20/60 相邻对照，逐 rank trace/T/R/capacity 一致，ms：
+
+| 配置 | EP8 8K / 20K | EP16 8K / 20K |
+|---|---:|---:|
+| full_source_credit | 5.705 / 12.054 | 10.317 / 22.844 |
+| adaptive_dx | 5.754 / 11.967 | 9.599 / 22.720 |
+
+单机和双机 20K 差异不到 1%，不宣称显著收益；双机 8K 改善约 7.0%，但
+本轮对照值也比前几轮偏慢，继续用 resident/M7b 相邻对照核实最终效果。
+已通过 EP8/EP16 随机 1/64/8K/20K、20K 热点迁移/空 rank、三份 live tape、
+OOM 重试、权重刷新、EP4/非 ring 回退；actual T256/capacity 40K 的 bounded
+路径通过。另用 T256/capacity 27K/B16/D1：热点 P 超过剩余 dX 预算而空 rank
+仍选完整 dX，后续短 tape 又切回完整 dX，覆盖 rank 间混合及跨调用切换。
+EP8 rank0/7、EP16 rank0/15 的 memcheck 全部 0 errors。固定 CPU/CUDA
+种子的真实 Megatron TP4+EP8/EP16 DDP 两次更新及 suspend/resume 也通过。
+进一步与 resident 相邻复测，8K/20K：单机 5.364/11.744→5.756/12.017 ms，
+双机 9.426/21.319→9.778/23.173 ms。跨机 8K 的剩余差距收窄至约 3.7%，
+但单机没有改善。单机 epilogue 已直接写 source，完整 dX 会额外落地和搬运，
+因此最终 `network_dx` 仅在跨机考虑完整 dX，单机保持阶段一的直接写回。
+这是 host 容量策略的收紧，不增加或修改设备 kernel。中止 prototype 后续
+内存/推理流程，保留已完成的功能、framework、performance 原始记录；最终
+版本重新构建并进行对应验收，不能将 prototype 的整套流程标记为通过。
+
+### 最终选择版本：network_dx
+
+相对阶段一只改变 host 的容量选择：仅跨机且完整 dX 放得下时使用这条路径。
+最终产物再次通过单机/双机 1/64/8K/20K 数值检查，以及 capacity 27K 的
+热点/空 rank/live tapes/模式切换和四个被检查 rank 的 0-error memcheck。
+超预算 bounded、20K 极端热点和真实 Megatron 的完整验收使用上述
+`full_source_credit`/`adaptive_dx`，最终没有修改这些设备计算/通信流程。
+
+1620 MHz、同一随机 trace、20/60，与 resident 相邻对照，单位 ms：
+
+| 规模 | resident 整轮 | 最终版整轮 | 耗时变化 | 最终版 FWD / BWD |
+|---|---:|---:|---:|---:|
+| 单机 EP8 8K | 5.393 | 5.768 | +7.0% | 2.474 / 3.267 |
+| 单机 EP8 20K | 11.905 | 11.882 | -0.2% | 5.255 / 6.708 |
+| 双机 EP16 8K | 9.460 | 9.549 | +0.9% | 4.628 / 5.041 |
+| 双机 EP16 20K | 21.604 | 22.689 | +5.0% | 10.381 / 12.363 |
+
+单机 20K 已基本持平，双机 8K 的差距明显收窄；单机 8K 和双机 20K 仍有
+回退，不按“全部夺回”验收。源码快照基于 `f69fffb`，最终证据位于
+`build/pf_private_dr/network_dx/`；前面的候选数据仅用于逐步解释，不拼接为
+最终性能矩阵。
+
+随后对冻结 M7b 做独立相邻复测，仍为同一 trace、1620 MHz、20/60，ms：
+
+| 规模 | M7b 整轮 | 最终版整轮 | 耗时下降 |
+|---|---:|---:|---:|
+| 单机 EP8 8K | 6.806 | 5.948 | 12.6% |
+| 单机 EP8 20K | 14.852 | 12.141 | 18.3% |
+| 双机 EP16 8K | 11.572 | 9.731 | 15.9% |
+| 双机 EP16 20K | 26.465 | 22.822 | 13.8% |
+
+这一轮最终版比上一轮高约 0.6%–3.1%，两轮数据都保留，不挑选最低值。
+`performance_*` 与 `paired_*` 的逐 rank trace SHA、T/R/capacity 已逐项核对。
+这里的 resident/M7b 都是 PF 历史版本，本轮不是新的 V3 性能对照。
+
+最终显存复测，逐 rank 实际 T/R 与 M7b 完全一致，仍使用同一“native 常驻区 +
+Torch 活跃同时峰值”口径：
+
+| 规模 | 最终峰值 MiB | 相对 M7b 增量 MiB | 增量 MB（十进制） |
+|---|---:|---:|---:|
+| 单机 EP8 8K | 1551.59 | 80.27 | 84.17 |
+| 单机 EP8 20K | 3149.11 | 343.30 | 359.98 |
+| 双机 EP16 8K | 2725.06 | 408.17 | 427.99 |
+| 双机 EP16 20K | 4752.26 | 334.39 | 350.64 |
+
+四个测量点均低于 500 MB 增量。双机 8K 的完整 dX 将峰值恢复到 resident
+的水平；20K 的热点 rank 仍保留 ring，单机/双机 20K 仍比 resident 少约
+497/758 MiB。这不是任意 shape/热点历史下的整进程占用上限；dR 缓存 slack
+和 Torch allocator reserved 仍需单独考虑。
+
+无编译干扰的 inference 相邻复测，50 warmup/200 sample，每次 graph 含 10 次
+调用，每个 sample 改变路由；T 为固定 graph bucket，时间为最慢 rank p50，μs：
+
+| T | 单机 EP8 resident → 最终版 | 双机 EP16 resident → 最终版 |
+|---|---:|---:|
+| 1 | 35.371 → 35.254 | 235.344 → 235.272 |
+| 64 | 57.694 → 57.563 | 290.386 → 289.811 |
+| 8192 | 1528.120 → 1527.634 | 3054.256 → 3049.850 |
+| 20480 | 3611.304 → 3611.435 | 7041.037 → 7019.237 |
+
+全部差异小于 0.4%，未见推理回退。训练 FWD 在上面的正式 resident 对照中
+也基本一致；不将这些微小差异当作本轮 Backward 改造带来的 Forward 收益。
+最终脚本 `build/pf_private_dr/network_dx_acceptance.log` 为 `FINAL_ALL_PASS`；
+它表示所列验证执行通过，不表示“训练性能全部恢复”的目标已完成。
 
 ## M7c 回退定位：2026-10-03
 

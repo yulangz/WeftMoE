@@ -1,6 +1,6 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
-## 2026-10-03：Backward 容量优先恢复性能（M7d，阶段一完成）
+## 2026-10-03：Backward 容量优先恢复性能（M7d，已落地，仍有剩余回退）
 
 以下约定取代 M7a 的私有 dR 目标，历史实验和回退保留在下一节。用户允许
 约 500 MB 以下的增量优先用于恢复性能；Forward/推理主 kernel 不变。
@@ -13,28 +13,40 @@
   若 `[max_tokens,K,H]`/`[max_tokens,K]` 能放入，使用一个完整 source 范围；
   否则保留原 B，将 contribution 深度最多增加到原 D 的四倍，且不超过该预算。
   选择只取决于池的 shape/容量，不缓存实际 route，不截断热点 token。
+- 跨机且剩余预算足以放入实际 `[P,H]` BF16 dX 时，复用已有静态主 kernel 的完整
+  dX/Return 分支；P 来自 retained FWD metadata，不新增计数或同步。这部分
+  dX 为本次私有 workspace，不预留最坏 P，也不占长期 IPC 缓冲。通信布局仍
+  使用上述固定 source 容量，不随各 rank 选择完整 dX 或 ring 改变。
+  单机维持 dX epilogue 直接写 source，避免完整 dX 多一次落地和拷贝。
 - 完整 source 范围保留 canonical expert/source/route 顺序。dU/SwiGLU/dX
   复用同一 M-block 与静态 owner，dX 直接 TMA 读取 dAB，省掉重排和重复 gather。
   小 M-grid 仍静态拆分 N/epilogue；所有本地 dX 完成后才开始完整 dW。
-- 跨机 dX 继续复用原 FWD X ring，不申请最坏接收行数的全量 dX。进入计算链前
+- 实际完整 dX 放不下时，跨机 dX 继续复用原 FWD X ring。进入计算链前
   检查该输出 slot 的 consumed generation；Return packet 同时在 source/expert
   与 M-block 边界截断，保证旧 slot 的释放不依赖一个尚未计算的未来 M-block。
   NIC TX 本地 completion 与远端 RX credit 的双重条件不变。
 - 大容量池的有界 source-window 路径仍使用独立静态 dX N pairs 和 bounded gather。
   planner 根据稳定排序的连续区间直接计算 row/packet 位置，取消逐行 scatter 预约。
   expected rows 来自这些实际区间长度，不使用平均/最大专家 token 数推测。
-- 两种路径共用 Return 发布、source Reduce 与生命周期；U/dAB 保留实际 P 的
+- 完整 dX、canonical ring 和 bounded source-window 共用 Return wire/route
+  标记与生命周期，支持 rank 间混合模式；U/dAB 保留实际 P 的
   私有 workspace，checkpoint/live tape 不放入通信 ring。额外小区间目录与
   peer workspace 同生命周期；packet 目录复用闲置的 FWD row 元数据尾部。
 
-448 MiB 是新增 **source arena** 上限，不是所有形状下的整进程峰值承诺。
+448 MiB 是新增 **source arena + 可选完整 dX** 的预算，不是所有形状下的整进程峰值承诺。
 dR 缓存 slack、实际 tape/workspace 和 allocator reserved 必须分别测量。
+本轮四个测量点的同时峰值增量为 84–428 MB，均低于 500 MB。
+逐步消融、最终性能与验收范围见训练记录 M7d。
 
 - [x] EP8 单机 / EP16 双机，1620 MHz，随机 8K/20K 相邻性能对照。
-  相对 M7b 降低 13.9%–20.2%；相对 resident 仍差 1.6%–8.3%，不关闭性能门禁。
+  最终相对 M7b 降低 12.6%–18.3%；resident 对照中单机 20K 基本持平，
+  双机 8K 差约 0.9%，但单机 8K/双机 20K 仍差约 7%/5%，不关闭性能门禁。
 - [x] 1/64、空接收/热点迁移、超预算 bounded 路径、memcheck、OOM 重试/live tapes。
 - [x] 真实 Megatron DDP 与 suspend/resume，共卡切换时持久缓冲可释放。
-- [ ] 推理四档规模、FWD 不回退；记录峰值与容量，清理实验分支并提交。
+- [x] 推理四档规模差异均小于 0.4%，训练 FWD 对照基本一致；
+  记录峰值与容量，清理实验分支。阶段一提交 `f69fffb`。
+- [ ] 继续定位单机 8K 与双机 20K 剩余回退；不得把增加容量后的阶段收益
+  解释为所有形状均已追平 resident，或解释为本轮重新验证了 V3。
 
 ## 2026-10-02：Backward 私有 dR 与 Return ring 实施约定
 
