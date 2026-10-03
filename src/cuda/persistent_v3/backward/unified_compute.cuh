@@ -352,7 +352,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
         __threadfence();
         synchronization.cluster_sync();
         if constexpr (Synchronization::kMathEnabled)
-          if (a.return_ring.depth)
+          if (a.return_ring.depth && !a.return_ring.canonical)
             weftmoe_pf::backward_return::publish_input(
                 a, descriptor.compact_row + local_row, valid_rows);
         if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
@@ -395,14 +395,16 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       }
     }
     if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx) ||
-        (activation_chain && !a.return_ring.depth)) {
+        (activation_chain && (!a.return_ring.depth || a.return_ring.canonical))) {
       BackwardMblockDescriptor descriptor{};
       unsigned input_row;
       if (a.return_ring.depth) {
         descriptor.expert = a.return_ring.blocks[owner].expert;
         descriptor.padded_row = (owner % a.return_ring.depth) * backward_tuning::kTileM;
-        input_row = weftmoe_pf::backward_return::gather_row();
-        weftmoe_pf::backward_return::gather(a, owner, cluster_rank, synchronization);
+        input_row = a.return_ring.canonical ? descriptors[owner].padded_row
+                    : weftmoe_pf::backward_return::gather_row();
+        if (!a.return_ring.canonical)
+          weftmoe_pf::backward_return::gather(a, owner, cluster_rank, synchronization);
       } else {
         descriptor = descriptors[owner];
         input_row = descriptor.padded_row;

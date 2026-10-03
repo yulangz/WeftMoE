@@ -1,5 +1,183 @@
 # V4 ring 训练对接记录
 
+## M7d 容量优先：2026-10-03（阶段一完成，性能部分恢复）
+
+简述：扩大 Backward source 容量，恢复可复用 dR 和跨机 RX 直接 fanout；
+利用 canonical 行顺序恢复静态 dU→SwiGLU→dX 链，取消重复 gather 和逐行
+位置预约。相对 M7b，EP8/EP16 的 8K/20K 整轮耗时下降 13.9%–20.2%；
+20K 同时峰值增加约 343/334 MiB。相对 M7 前 resident 尚差 1.6%–8.3%，
+没有宣称性能全部恢复。分步消融与正式相邻数据如下。
+
+性能优先于进一步压缩 workspace；用户允许先使用每卡约 500 MB 的增量。
+本轮只改变 Backward 容量，Forward 的 B512/D8（EP8）和 B768/D6（EP16）、
+推理 kernel、GEMM tile 和实际复用 slot 的 credit 释放条件不变；完整 source
+范围不发生调用内复用，因此移除这一路径上多余的窗口 credit 操作。
+
+先将 source contribution 窗口数加深，再单独尝试加宽窗口。加宽时必须同步
+扩充 dX slot，保留一整个最坏窗口可以推进的容量；不能只扩 contribution，
+让 Return packet 等待的后续行被旧 dX slot 卡住。实验复用原 FWD X payload，
+只为额外 dX slot 分配补充区，未重新分配一整套 dX ring。
+
+10 warmup/30 sample，同一随机 trace 的初筛（FWD+BWD 最慢 rank p50，ms）：
+
+| source 窗口宽度 / 深度倍率 | EP8 8K / 20K | EP16 8K / 20K | 每卡新增主要 payload，EP8 / EP16 |
+|---|---:|---:|---:|
+| 1 / 1 | 6.923 / 14.998 | 11.868 / 27.091 | 0 / 0 MiB |
+| 1 / 4 | 6.482 / 13.859 | 12.130 / 25.739 | 192 / 216 MiB |
+| 2 / 1 | 6.441 / 13.877 | 12.251 / 25.631 | 192 / 264 MiB |
+| 2 / 2 | 6.317 / 13.790 | 11.958 / 25.548 | 320 / 408 MiB |
+
+上表产物为 `build/pf_private_dr/return_capacity_dx/`，所有配置的逐 rank
+trace SHA、token/接收行数与容量匹配。另一个不含分段 dX 寻址的独立容量
+候选 `return_capacity`，1/1→1/4 的单机 8K/20K 为 6.987/15.348→
+6.434/13.691 ms；1/6 为 6.451/13.904 ms，没有进一步改善。
+双机为 12.034/26.858→11.824/26.377 ms，1/6 为 11.787/25.908 ms。
+这些是筛选数据，部分与 CPU 编译重叠，不替代无编译干扰的正式相邻对照。
+
+当前判断：加深窗口能收回单机的一部分回退，双机改善有限；加宽窗口尚未
+显示值得保留额外寻址逻辑的稳定优势。后续正式验证优先选择更简单的 1/4，
+并独立消融 SwiGLU epilogue 额外写 window-major dAB，避免 dX N-pair 重复 gather。
+此处尚不宣布已恢复 resident 性能。
+
+### 第二步：dR 容量缓存与 RX 直接 fanout
+
+在 source D×4 上恢复可 IPC 访问的 dR 容量缓存，替代而非叠加私有 dR。
+NIC RX 接收者一次读取 payload，直接分发给节点内目标 dR，完成存储与通知
+后释放 RX，不再由八张 GPU 分别轮询、pull、ACK。节点内 dY→dR 的 destination
+pull 不变，Return 仍为有界 ring，所有本地 dX 之后才开始 dW 的约束不变。
+
+`resident_dr_ring` 的 10/30 随机短测：EP8 为 6.304/14.044 ms，EP16 为
+10.981/23.025 ms（8K/20K）。双机改善明显，但还未恢复改造前性能。
+随机、热点/空接收/live tapes、OOM 重试、权重刷新、卸载切换和 EP4/非 ring
+回退通过；EP8 rank0/7 与 EP16 rank0/15 的 memcheck 均为 0 errors。
+
+相同两样本实际 T/R 的每卡最大 native 常驻区 + Torch 活跃同时峰值（MiB）：
+
+| 配置 | EP8 8K / 20K | EP16 8K / 20K |
+|---|---:|---:|
+| M7b | 1471.33 / 2805.81 | 2316.89 / 4417.86 |
+| 仅 source D×4 | 1663.51 / 2997.99 | 2533.10 / 4634.07 |
+| D×4 + resident dR | 1667.26 / 3001.28 | 2536.03 / 4636.83 |
+
+常驻 compute 区确实变大，但私有 dR 同时退出 Torch workspace，不能将
+前者的增长误报成整轮峰值增长。相对 M7b 的 20K 同时峰值增加约
+195.5/219.0 MiB（EP8/EP16）；并非驱动整进程峰值。实际容量仍由已有 hint
+和按需增长决定，不能将这一随机样本的差值承诺为所有热点形状的固定上限。
+
+未保留的额外 dAB 副本：SwiGLU epilogue 同时写 canonical 与 window-major
+dAB，让 dX 直接 TMA 读取后者，planner 仅清零其 M 尾行。EP8 为 6.334/13.486 ms，
+EP16 为 11.777/26.349 ms，没有形成足够稳定的收益；删除该副本和实验分支。
+这也说明探针内的 gather span 不能直接等同于可从整轮减去的关键路径耗时。
+
+### 第三步：恢复行的局部性，避免重复窗口聚行
+
+在 resident dR 上，独立测试完整 M-block 的 dX N tiles、静态 owner 内
+lookahead=4，均未形成稳定收益，双机 lookahead 还可能变慢；不作为最终优化。
+warp 聚合行位置预约只能把单机 20K 的 13.848 ms 降至 13.526 ms，双机
+23.065→23.122 ms，收益不足。
+
+训练 tape 的 canonical rows 已按 expert/source/route 稳定排序。因此一个
+(window, expert, source) 是连续区间，可以由首末行及前缀直接计算 dX 行位置
+和 Return queue 位置，取消每行的 scatter 预约，而不是只合并 atomic。
+在 `ordered_plan` 的同一 binary 内关闭/开启该 planner：B×1/D×4 的
+EP8 为 6.455/13.727→6.186/13.672 ms，EP16 为
+10.718/23.438→10.247/23.562 ms。加宽到 B×8/D×1 的 EP8 为
+6.049/13.051 ms；B×4/D×1 的 EP16 为 10.449/23.081 ms。
+这些仍为 10/30 初筛，不替代最终相邻对照。
+
+下一步候选是在容量许可时让 contribution 覆盖 source 的完整 token 范围，
+使 dX 与 canonical dU/dAB 使用完全相同的 M-block，恢复静态
+dU→SwiGLU→dX 计算链并直接 TMA 读取 dAB，不再重复 gather。跨机 dX
+payload 仍保持有界；Return packet 在 M-block 边界截断，避免旧 slot
+等待一个包含未来 M-block 的 packet 而产生循环依赖。预算之外仍保留
+source-window 有界路径，不以截断路由或预留最坏 dX payload 解决热点。
+
+`canonical_network` 已通过 EP8/EP16 的随机 1/64/8K/20K 数值校验；10/30
+初筛为 EP8 5.739/12.305 ms、EP16 10.273/22.849 ms。清理实验开关并
+接入容量自动选择的 `capacity_final` 为 5.795/12.115、10.322/23.035 ms。
+这是组合变化的收益，不将容量、链式调度、padding 和 gather 的收益简单相加。
+
+重新消融 canonical dX 本地 TMA 落地再由通信 warp 转发：单机为
+6.028/12.411 ms，未优于直接写回。后续还将完整 source 范围中已不发生
+的窗口复用单独简化：route 直接寻址，不再取模；setup 已准入全部 source，
+不再逐块轮询准入或逐 token 原子归还同一窗口 credit。跨调用的 join、
+dX slot credit、NIC 双 credit 与 bounded source 路径保持不变。
+
+### 20/60 无编译干扰的三候选相邻筛选
+
+GPU 均为 1620 MHz，逐 rank trace SHA、T/R 和容量一致。单位 ms：
+
+| 候选 | EP8 8K / 20K | EP16 8K / 20K |
+|---|---:|---:|
+| capacity_final：容量 + canonical 计算链 | 5.717 / 11.956 | 10.004 / 22.726 |
+| full_source_credit：完整范围简化寻址/credit | 5.759 / 12.051 | 9.917 / 22.607 |
+| batched_credit：再聚合 Return ready/retire 原子计数 | 5.738 / 11.827 | 9.969 / 22.890 |
+
+前两者差异很小，不能把去除 source credit 单独算成显著收益；初筛中
+24.384 ms 的双机 20K 回退也未在正式对照复现。批量原子计数没有稳定
+优势，撤回该实验，暂以 `full_source_credit` 做完整验收。TMA 写回短测
+双机为 10.272/23.430 ms，同样未形成稳定改善，已删除其额外本地搬运。
+
+另一个独立容量实验 `dx_capacity` 将剩余预算中最多 64 MiB 补给跨机 dX
+slot；source 与补充 dX 的合计增量仍不超过 448 MiB。它复用 FWD X 作为
+第一段，只为尾段申请显存。EP16 随机 64/8K/20K 校验通过；20/60 为
+EP8 5.753/11.937 ms、EP16 9.947/22.411 ms。双机 20K 仅改善约 0.9%，
+8K 无改善，不保留额外分段寻址代码和 64 MiB 尾段。
+
+### 完整验收进度
+
+`full_source_credit` 的 EP8/EP16 随机 256/8K/20K、EP16 20K 热点/空接收/
+迁移、多个 live tape、OOM 重试、权重刷新、EP4、非 ring 回退均通过。
+另外用实际 T256、容量上限 40K、B16/D1 强制走超预算 bounded 路径，
+单机/双机都通过。EP8 rank0/7、EP16 rank0/15 memcheck 均为 0 errors。
+
+Megatron 集成测试暴露了测试初始化问题：原脚本仅设置 CUDA model-parallel
+RNG，但 Router 在 CPU 初始化权重，导致每次运行及 replica 间的 router
+初始参数不一致。旧脚本的一次 EP16 运行在 router/FC1 梯度阈值处失败，
+不能计为通过。补上 CPU `torch.manual_seed(123)`，没有放宽误差阈值；
+冻结 resident 和新版本在同一初始化下均通过真实 TP4+EP16 DDP 两次更新、
+suspend/resume 与缓冲释放。原失败日志保留，后续日志使用 `*_seeded` 标签。
+
+### 容量优先候选的正式结果
+
+`full_source_credit`，1620 MHz，H2048/I512/E64/K4 BF16；20 warmup、60 个
+每步变化的随机 token/route 样本。以下均为每步最慢 rank 的 FWD+BWD p50，
+不是固定路由 CUDA Graph，也不把不同阶段的 p50 相加。每组相邻对照的
+逐 rank trace SHA、T/R、max_tokens/max_rows capacity 全部一致。
+
+| 规模 | M7b 回退版 | 容量优先版 | 耗时下降 |
+|---|---:|---:|---:|
+| 单机 EP8 8K | 6.858 ms | 5.785 ms | 15.6% |
+| 单机 EP8 20K | 14.954 ms | 11.929 ms | 20.2% |
+| 双机 EP16 8K | 11.706 ms | 9.912 ms | 15.3% |
+| 双机 EP16 20K | 26.390 ms | 22.716 ms | 13.9% |
+
+独立相邻 resident 对照如下。resident 是 M7a/M7b 前的 PF，不是 V3；本轮
+不能将这个对照误称为 V3。仍有剩余回退，性能门禁不能按“全部恢复”关闭。
+
+| 规模 | resident 整轮 | 容量优先版整轮 | 剩余差距 | resident / 新版 BWD |
+|---|---:|---:|---:|---:|
+| 单机 EP8 8K | 5.431 ms | 5.734 ms | +5.6% | 2.942 / 3.235 ms |
+| 单机 EP8 20K | 11.758 ms | 11.942 ms | +1.6% | 6.586 / 6.706 ms |
+| 双机 EP16 8K | 9.275 ms | 10.043 ms | +8.3% | 4.785 / 5.342 ms |
+| 双机 EP16 20K | 21.488 ms | 22.778 ms | +6.0% | 11.140 / 12.384 ms |
+
+相同两样本 T/R 的每卡最大 native 常驻区 + Torch 活跃同时峰值，MiB：
+
+| 配置 | EP8 8K / 20K | EP16 8K / 20K |
+|---|---:|---:|
+| resident | 1785.45 / 3645.85 | 2725.03 / 5510.23 |
+| M7b | 1471.33 / 2805.81 | 2316.89 / 4417.86 |
+| 容量优先版 | 1551.59 / 3149.11 | 2396.99 / 4752.26 |
+
+20K 相比 M7b 增加 343.30/334.40 MiB（均小于 500 MB），相比 resident
+仍少 496.74/757.97 MiB。此口径不是驱动整进程峰值；allocator reserved
+与 BWD 之后的驱动占用快照另列于原始 MEMORY_JSON，不能混用。
+
+证据：`build/pf_private_dr/full_source_credit/` 下的 `paired_*`、
+`performance_*`、`memory_*` 与 `source.patch`。首轮 inference 阶段中途
+与另一个候选的 CPU 编译重叠，功能检查保留，但不把该次时间作为性能结论。
+
 ## M7c 回退定位：2026-10-03
 
 本轮先固定 1620 MHz、编译 profile、随机 token/route trace 和 B/D，区分

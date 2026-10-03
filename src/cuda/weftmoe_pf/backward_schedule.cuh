@@ -2,8 +2,9 @@
 
 namespace weftmoe_pf::backward {
 
-// Canonical dU/SwiGLU stays on one cluster. Ring dX uses window-major N pairs;
-// both domains have immutable static ownership, without a shared claim queue.
+// Canonical dU/SwiGLU/dX stays on one cluster when the source range fits.
+// Bounded source windows use a separate, window-major dX N-pair domain.
+// Both have immutable static ownership, without a shared claim queue.
 struct Schedule {
   unsigned block, epilogue, dx;
   unsigned weight = 0U, weight_end = 0U;
@@ -21,17 +22,20 @@ struct Schedule {
     using namespace backward_pipeline_detail;
     const auto dx_blocks = a.return_ring.depth ? a.return_ring.state->blocks : mblocks;
     const auto du_owner = [&](unsigned index) {
-      return a.return_ring.depth ? a.return_ring.du_order[index] : index;
+      return a.return_ring.depth && !a.return_ring.canonical
+          ? a.return_ring.du_order[index] : index;
     };
     // A bounded window can underfill the M grid even for a long invocation.
     // Stripe N pairs as well; Return waits for every N tile of the M-block.
     constexpr auto dx_pairs = (DxTiles + 1U) / 2U;
-    if (a.return_ring.depth && dx < dx_blocks * dx_pairs &&
-        weftmoe_pf::backward_return::input_ready(a, dx / dx_pairs)) {
-      const auto tile = (dx % dx_pairs) * 2U;
-      task = {dx / dx_pairs, tile, TaskKind::Dx, min(2U, DxTiles - tile)};
-      dx += clusters;
-      return true;
+    if (a.return_ring.depth && !a.return_ring.canonical) {
+      if (dx < dx_blocks * dx_pairs &&
+          weftmoe_pf::backward_return::input_ready(a, dx / dx_pairs)) {
+        const auto tile = (dx % dx_pairs) * 2U;
+        task = {dx / dx_pairs, tile, TaskKind::Dx, min(2U, DxTiles - tile)};
+        dx += clusters;
+        return true;
+      }
     }
     if (mblocks < clusters) {
       // An underfilled M-block grid needs N/epilogue residues to occupy the
@@ -42,7 +46,10 @@ struct Schedule {
                    words[layout.phase + owner])
                    .load(::cuda::memory_order_acquire) >= required;
       };
-      if (!a.return_ring.depth && dx < mblocks * DxTiles && ready(dx / DxTiles, 3U)) {
+      if ((!a.return_ring.depth || a.return_ring.canonical) &&
+          dx < mblocks * DxTiles && ready(dx / DxTiles, 3U) &&
+          (!a.return_ring.canonical ||
+           weftmoe_pf::backward_return::slot_free(a, dx / DxTiles))) {
         task = {dx / DxTiles, dx % DxTiles, TaskKind::Dx, 1U};
         dx += clusters;
         return true;
@@ -63,11 +70,14 @@ struct Schedule {
       }
     } else if (block < mblocks) {
       const auto owner = du_owner(block);
+      if (a.return_ring.canonical &&
+          !weftmoe_pf::backward_return::slot_free(a, owner))
+        return false;
       if (!::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>(
                words[layout.phase + owner])
                .load(::cuda::memory_order_acquire))
         return false;
-      // Keep dU/SwiGLU together; the dense fallback also includes dX. No
+      // Canonical Return and the dense fallback also include dX. No
       // task-mailbox exchange is needed between these dependent stages.
       task = {owner, 0U, TaskKind::Dab, 1U};
       phase = 1U;

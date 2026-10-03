@@ -378,7 +378,8 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
           weftmoe_pf::backward_return::contribution_row(a, route)];
     }
     __syncwarp();
-    if (lane == 0U) {
+    // Full source ranges retire at the invocation join, not once per token.
+    if (lane == 0U && !a.return_ring.canonical) {
       const auto window = token / a.return_ring.shape.tokens;
       weftmoe_pf::ring::arrive(a.peer_payloads[a.rank].consumed[
           window % a.return_ring.contribution_depth], 1U);

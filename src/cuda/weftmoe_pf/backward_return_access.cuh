@@ -17,6 +17,8 @@ __device__ __forceinline__ std::uint64_t reduce_first(
 // first D windows are free; subsequent reuse needs every token's Reduce credit.
 __device__ __forceinline__ void advance_source(const BackwardKernelArgs &a) {
   const auto &r = a.return_ring;
+  if (r.canonical)
+    return;
   auto &peer = a.peer_payloads[a.rank];
   const auto windows = static_forward::ceil_div(a.dispatch.identity.num_tokens,
                                                 r.shape.tokens);
@@ -32,6 +34,8 @@ __device__ __forceinline__ void advance_source(const BackwardKernelArgs &a) {
 __device__ __forceinline__ bool local_reserved(const BackwardKernelArgs &a,
                                                unsigned block) {
   const auto &r = a.return_ring;
+  if (r.canonical)
+    return true;
   auto sources = r.blocks[block].local_sources;
   const auto window = r.blocks[block].window / r.shape.groups();
   while (sources) {
@@ -95,13 +99,19 @@ __device__ __forceinline__ void gather(const BackwardKernelArgs &a,
                          std::uint64_t(block) * backward_tuning::kTileM;
       auto *output = reinterpret_cast<uint4 *>(a.return_ring.gathered_dab) +
           std::uint64_t(gather_row()) * vectors;
-      for (auto i = std::uint64_t(cluster_rank) * threads + threadIdx.x;
-           i < backward_tuning::kTileM * vectors; i += 2U * threads) {
-        const auto row = i / vectors;
-        output[i] = row < a.return_ring.blocks[block].rows
-            ? reinterpret_cast<const uint4 *>(a.dab)[
-                  std::uint64_t(mapping[rows[row].compact]) * vectors + i % vectors]
-            : uint4{0U, 0U, 0U, 0U};
+      constexpr auto warps = threads / 32U;
+      const auto lane = threadIdx.x % 32U;
+      for (unsigned row = cluster_rank * warps + threadIdx.x / 32U;
+           row < backward_tuning::kTileM; row += 2U * warps) {
+        const bool valid = row < a.return_ring.blocks[block].rows;
+        unsigned source = 0U;
+        if (lane == 0U && valid)
+          source = mapping[rows[row].compact];
+        source = __shfl_sync(0xffffffffU, source, 0U);
+        for (unsigned column = lane; column < vectors; column += 32U)
+          output[row * vectors + column] = valid
+              ? reinterpret_cast<const uint4 *>(a.dab)[std::uint64_t(source) * vectors + column]
+              : uint4{0U, 0U, 0U, 0U};
       }
       __threadfence();
     }
@@ -121,6 +131,11 @@ __device__ __forceinline__ activation_ring_detail::Transfer packet(
   if (index >= q.reserved)
     return {channel, 0U, 1U, sequence, q.begin + q.capacity};
   const auto &r = a.return_ring;
+  if (r.canonical) {
+    const auto p = r.packets[q.begin + index];
+    return {channel, p.rows, index + communication::kReturnPorts >= q.reserved,
+            sequence, p.first};
+  }
   std::uint64_t first = 0U, end = r.windows / r.shape.groups();
   while (first + 1U < end) {
     const auto middle = (first + end) / 2U;
@@ -140,7 +155,8 @@ __device__ __forceinline__ activation_ring_detail::Transfer packet(
 
 __device__ __forceinline__ bool receive_reserved(const BackwardKernelArgs &a,
     unsigned channel, const communication::ChunkHeader *chunk) {
-  if (!a.return_ring.depth || channel < a.gin_rings.dispatch_channels || !chunk->rows)
+  if (!a.return_ring.depth || a.return_ring.canonical ||
+      channel < a.gin_rings.dispatch_channels || !chunk->rows)
     return true;
   const auto route = reinterpret_cast<const communication::ReturnRow *>(chunk + 1)->route;
   const auto window = route / a.dispatch.identity.top_k / a.return_ring.shape.tokens;

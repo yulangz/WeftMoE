@@ -72,7 +72,7 @@ def main():
         top_k=top_k,
         hidden=hidden,
         intermediate=intermediate,
-        max_tokens=tokens,
+        max_tokens=int(os.environ.get("TEST_TOKEN_CAPACITY", tokens)),
         max_rows=max_rows,
         training=True,
         max_saved=4,
@@ -173,8 +173,8 @@ def main():
     print(rank, "TENSOR_PARITY_PASS", runtime.native.usage(), flush=True)
     if os.environ.get("TEST_PEER_PAYLOAD_REUSE") == "1":
         # Retain three independent tapes with moving hotspots and shorter source
-        # batches. Private dR follows each tape; peer communication storage does
-        # not grow with the destination's received-row count.
+        # batches. Checkpoints remain independent; once both destination
+        # hotspots are warmed, the shorter call must reuse communication capacity.
         tapes = []
         cases = ((tokens, 0), (tokens, experts - top_k), (max(1, tokens // 4), 0))
         for count, first_expert in cases:

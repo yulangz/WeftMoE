@@ -7,14 +7,14 @@
 struct BackwardPeerWorkspace {
   struct Export {
     cudaIpcMemHandle_t handle{};
-    std::size_t contribution = 0, dgate = 0, dispatch_slots = 0;
+    std::size_t contribution = 0, dgate = 0;
     std::size_t return_slots = 0, return_state = 0, consumed = 0;
   };
   struct Buffer {
     std::shared_ptr<tensor_storage_detail::Allocation> allocation;
     Export descriptor;
     std::uint64_t row_capacity = 0, route_capacity = 0, hidden = 0;
-    std::size_t table = 0;
+    std::size_t table = 0, partitions = 0;
     CUtensorMap dr_map{}, dr_mn_map{};
     unsigned return_depth = 0;
   };
@@ -25,6 +25,9 @@ struct BackwardPeerWorkspace {
   cudaStream_t stream;
   unsigned local_world;
   unsigned dispatch_ctas = 0;
+  unsigned owned_experts;
+  std::uint64_t max_tokens;
+  bool network;
   std::uint64_t initial_rows, max_rows, max_routes;
   std::shared_ptr<tensor_storage_detail::Allocation> exchange;
   std::shared_ptr<Buffer> buffer;
@@ -45,6 +48,9 @@ struct BackwardPeerWorkspace {
         nccl(internal::NcclSessionAccess::checked(session)), execution(exec),
         stream(internal::checked_execution_state(exec)->stream),
         local_world(local_size),
+        owned_experts(config.max_owned_experts),
+        max_tokens(config.max_tokens_per_rank),
+        network(config.max_nodes > 1U),
         initial_rows(config.backward_peer_capacity_rows),
         max_rows(config.max_destination_rows_per_rank),
         max_routes(checked_mul(config.max_tokens_per_rank, config.max_top_k,
@@ -73,6 +79,41 @@ struct BackwardPeerWorkspace {
     mappings.close();
   }
 
+  // Spend a bounded increment on source contributions, not worst-case expert
+  // payloads. A complete source range preserves canonical GEMM tiles; larger
+  // contexts retain window credits with up to four times the Forward depth.
+  static_forward::ComputeRingLayout return_layout(
+      const static_forward::ComputeRingLayout &forward, std::uint64_t hidden) {
+    auto result = forward;
+    constexpr std::uint64_t kExtraSourceBytes = 448ULL << 20U;
+    const auto row_bytes = checked_mul(hidden, 2ULL, "Backward contribution row") + sizeof(float);
+    const auto window_bytes = checked_mul(
+        std::uint64_t(forward.shape.tokens) * forward.shape.top_k,
+        row_bytes, "Backward contribution window");
+    const auto budget = checked_mul(window_bytes, forward.contribution_depth,
+                                   "Backward source capacity") + kExtraSourceBytes;
+    const auto full_bytes = checked_mul(max_routes, row_bytes, "Backward full source capacity");
+    const bool canonical = full_bytes <= budget;
+    if (canonical) {
+      result.shape.tokens = static_cast<unsigned>(max_tokens);
+      result.shape.sources = result.shape.world;
+      result.contribution_depth = 1U;
+    } else {
+      result.contribution_depth = static_cast<unsigned>(std::min(
+          std::uint64_t(forward.contribution_depth) * 4U, budget / window_bytes));
+    }
+    // Remote packets stop at an M-block boundary; their payload ring stays
+    // bounded. Local dX is written directly, so only its counters grow.
+    const auto depth = canonical && !network
+        ? std::max(std::uint64_t(forward.depth), result.shape.max_mblocks(owned_experts))
+        : std::uint64_t(forward.depth);
+    if (depth > UINT32_MAX / backward_tuning::kTileM)
+      throw std::invalid_argument("Backward payload rows exceed uint32");
+    result.depth = static_cast<unsigned>(depth);
+    result.max_windows = result.shape.windows(max_tokens);
+    return result;
+  }
+
   ~BackwardPeerWorkspace() noexcept {
     (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
     (void)cudaStreamSynchronize(stream);
@@ -89,20 +130,18 @@ struct BackwardPeerWorkspace {
     result->return_depth = ring ? ring->depth : 0U;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
-    if constexpr (!backward_tuning::kUnifiedWorkers)
-      append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
-                                  "Backward dR elements"),
-              sizeof(transport::BFloat16), "Backward compact dR");
+    append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
+                                "Backward dR elements"),
+            sizeof(transport::BFloat16), "Backward compact dR");
     result->descriptor.contribution = append(
         cursor, checked_mul(routes, hidden, "Backward contribution elements"),
         sizeof(transport::BFloat16), "Backward source contributions");
     result->descriptor.dgate =
         append(cursor, routes, sizeof(float), "Backward source dGate");
-    result->descriptor.dispatch_slots = append(
-        cursor, dispatch_ctas * communication::kRingDepth,
-        sizeof(backward_detail::DispatchSlot),
-        "Backward RX fanout credits");
     if (ring) {
+      result->partitions = append(cursor,
+          ring->max_windows * owned_experts * ring->shape.sources,
+          sizeof(backward_detail::ReturnPartition), "Backward Return intervals");
       result->descriptor.return_slots = append(cursor, ring->depth,
           sizeof(backward_detail::ReturnSlot), "Backward dX slot credits");
       result->descriptor.return_state = append(cursor, 1U,
@@ -116,10 +155,6 @@ struct BackwardPeerWorkspace {
     result->allocation =
         tensor_storage_detail::allocate(cursor, execution.device_ordinal());
     auto *base = result->allocation->data;
-    check(cudaMemsetAsync(at<void>(base, result->descriptor.dispatch_slots), 0,
-                          dispatch_ctas * communication::kRingDepth *
-                              sizeof(backward_detail::DispatchSlot),
-                          stream));
     check(cudaIpcGetMemHandle(&result->descriptor.handle, base));
     return result;
   }
@@ -127,8 +162,6 @@ struct BackwardPeerWorkspace {
   void prepare(std::uint64_t next_generation, std::uint64_t rows,
                 std::uint64_t routes, std::uint64_t hidden,
                 const static_forward::ComputeRingLayout *ring = nullptr) {
-    if constexpr (backward_tuning::kUnifiedWorkers)
-      rows = 0U;
     // A retained Notify plan is immutable. Repeating that Backward needs no
     // allocation, address exchange or host collective.
     const auto depth = ring ? ring->depth : 0U;
@@ -151,20 +184,18 @@ struct BackwardPeerWorkspace {
             ? std::min(max_rows, checked_mul(buffer->row_capacity, 2ULL,
                                              "Backward grown row capacity"))
             : initial_rows;
-        next = allocate(backward_tuning::kUnifiedWorkers ? 0U : std::max(rows, reserved),
+        next = allocate(std::max(rows, reserved),
                         ring ? routes : std::max(routes, max_routes), hidden, ring);
       }
       // Preserve the logical TMA bounds, including zero fill of tail tiles.
       // The descriptor may change without replacing or remapping the storage.
-      if constexpr (!backward_tuning::kUnifiedWorkers) {
-        next->dr_map = make_bf16_tma_map(
+      next->dr_map = make_bf16_tma_map(
           next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
           backward_tuning::kActivationTileM, "actual Backward dR",
           backward_tuning::kTileK);
-        next->dr_mn_map = make_bf16_tma_map_mn(
+      next->dr_mn_map = make_bf16_tma_map_mn(
           next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
           "actual Backward dR MN");
-      }
     });
     exports[nccl->rank] = next->descriptor;
     auto *device = static_cast<Export *>(exchange->data);
@@ -201,7 +232,6 @@ struct BackwardPeerWorkspace {
               static_cast<transport::BFloat16 *>(base),
               at<transport::BFloat16>(base, exports[rank].contribution),
               at<float>(base, exports[rank].dgate),
-              at<backward_detail::DispatchSlot>(base, exports[rank].dispatch_slots),
               ring ? at<backward_detail::ReturnSlot>(base, exports[rank].return_slots) : nullptr,
               ring ? at<backward_detail::SourceReturnState>(base, exports[rank].return_state) : nullptr,
               ring ? at<std::uint64_t>(base, exports[rank].consumed) : nullptr};

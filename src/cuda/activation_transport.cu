@@ -6576,9 +6576,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   GinExecution communication(pool->gin_resources, exec->stream);
   auto flight = std::make_shared<OperatorFlight>(lease, true);
   auto &peer_workspace = *slot.backward_peer_workspace;
+  const auto return_layout = data.return_depth
+      ? peer_workspace.return_layout(layout.static_ring, config.hidden_size)
+      : static_forward::ComputeRingLayout{};
   peer_workspace.prepare(identity.generation, view.sizes.incoming_row_count,
       checked_mul(identity.tokens, dispatch_id.top_k, "Backward source routes"),
-      config.hidden_size, data.return_depth ? &layout.static_ring : nullptr);
+      config.hidden_size, data.return_depth ? &return_layout : nullptr);
   SlotFailureGuard failure_guard{lease, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /
@@ -6649,7 +6652,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.saved_rows = saved.rows;
   args.peer_payloads = peer_workspace.device_payloads();
   if constexpr (backward_tuning::kUnifiedWorkers)
-    args.dr = at<transport::BFloat16>(data.workspace->data, data.dr_offset);
+    args.dr = peer_workspace.payloads[identity.rank].dr;
   args.input_offset = layout.input;
   args.recomputed_u =
       at<transport::BFloat16>(data.workspace->data, data.u_offset);
@@ -6661,18 +6664,25 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   auto dab_map = data.dab_map;
   auto dx_store_map = data.dx_store_map;
   if (data.return_depth) {
-    const auto &r = layout.static_ring;
+    const auto &r = return_layout;
     auto &v = args.return_ring;
     v.shape = r.shape;
-    v.depth = data.return_depth;
+    v.depth = r.depth;
     v.contribution_depth = r.contribution_depth;
     v.windows = r.max_windows;
+    v.canonical = v.windows == 1U;
     v.state = at<static_forward::RingState>(slot.device, r.state);
     v.window_prefix = at<std::uint64_t>(slot.device, r.window_prefix);
     v.expert_rows = at<std::uint64_t>(slot.device, r.expert_rows);
     v.expert_blocks = at<std::uint64_t>(slot.device, r.expert_blocks);
     v.blocks = at<backward_detail::ReturnBlock>(slot.device, r.blocks);
     v.rows = at<backward_detail::ReturnRow>(slot.device, r.rows);
+    v.partitions = at<backward_detail::ReturnPartition>(
+        peer_workspace.buffer->allocation->data, peer_workspace.buffer->partitions);
+    // At most one packet per real row fits in the unused Forward row tail.
+    v.packets = at<backward_detail::ReturnPacket>(slot.device,
+        r.rows + r.max_blocks * backward_tuning::kTileM *
+                     sizeof(backward_detail::ReturnRow));
     v.row_blocks = at<unsigned>(slot.device, r.tape_rows);
     const auto mblocks = ActivationTransportBridge::padded_received_rows(
                              retained.dispatch) / backward_tuning::kTileM;
@@ -6685,11 +6695,16 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     v.gathered_dab = data.private_gather
         ? at<transport::BFloat16>(data.workspace->data, data.gathered_dab_offset)
         : at<transport::BFloat16>(slot.device, layout.forward_s);
-    dab_map = make_bf16_tma_map(v.gathered_dab, 2ULL * config.intermediate_size,
-        data.gather_rows, backward_tuning::kActivationTileM,
-        "Backward bounded dX input", backward_tuning::kTileK);
+    if (v.canonical)
+      dab_map = make_bf16_tma_map(args.dab, 2ULL * config.intermediate_size,
+          data.padded_rows, backward_tuning::kActivationTileM,
+          "Backward canonical dAB", backward_tuning::kTileK);
+    else
+      dab_map = make_bf16_tma_map(v.gathered_dab, 2ULL * config.intermediate_size,
+          data.gather_rows, backward_tuning::kActivationTileM,
+          "Backward bounded dX input", backward_tuning::kTileK);
     dx_store_map = make_bf16_tma_store_map(args.dx_rows, config.hidden_size,
-        std::uint64_t(v.depth) * backward_tuning::kTileM,
+        std::uint64_t(layout.static_ring.depth) * backward_tuning::kTileM,
         "Backward dX ring", 0ULL, backward_tuning::kActivationTileM);
   }
   args.dw1 = static_cast<transport::BFloat16 *>(data.dw1->data);
@@ -6997,9 +7012,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                       "all worker CTAs resident", std::to_string(clusters));
     internal::throw_cuda("backward-run",
         cudaLaunchKernelEx(&launch, kernel, args,
-            data.dr_map, dab_map,
+            peer_workspace.buffer->dr_map, dab_map,
             retained.weights.impl_->backward_w2_map,
-            retained.weights.impl_->backward_w1_map, data.dr_mn_map,
+            retained.weights.impl_->backward_w1_map,
+            peer_workspace.buffer->dr_mn_map,
             data.u_mn_map, data.dab_mn_map, x_map,
             data.u_store_map, dx_store_map, dw2_map, dw1_map),
         identity.rank, identity.world, "backward", identity.generation,

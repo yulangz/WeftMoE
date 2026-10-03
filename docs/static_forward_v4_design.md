@@ -1,5 +1,41 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-03：Backward 容量优先恢复性能（M7d，阶段一完成）
+
+以下约定取代 M7a 的私有 dR 目标，历史实验和回退保留在下一节。用户允许
+约 500 MB 以下的增量优先用于恢复性能；Forward/推理主 kernel 不变。
+
+- dR 恢复 execution slot 的可 IPC 容量缓存，替代私有 dR，而不是重复保留。
+  初始 hint、按需几何增长、实际 R 的 TMA 边界、close/suspend 释放保持原合同。
+  跨机 RX owner 直接 fanout 到各目标 dR，存储/通知完成后归还 RX credit；
+  不再让每张本地 GPU 分别扫描 RX、pull、ACK。本节点 dY dispatch 仍为 pull。
+- Return 的 source contribution/dGate 预算为原 FWD 对应容量加 448 MiB。
+  若 `[max_tokens,K,H]`/`[max_tokens,K]` 能放入，使用一个完整 source 范围；
+  否则保留原 B，将 contribution 深度最多增加到原 D 的四倍，且不超过该预算。
+  选择只取决于池的 shape/容量，不缓存实际 route，不截断热点 token。
+- 完整 source 范围保留 canonical expert/source/route 顺序。dU/SwiGLU/dX
+  复用同一 M-block 与静态 owner，dX 直接 TMA 读取 dAB，省掉重排和重复 gather。
+  小 M-grid 仍静态拆分 N/epilogue；所有本地 dX 完成后才开始完整 dW。
+- 跨机 dX 继续复用原 FWD X ring，不申请最坏接收行数的全量 dX。进入计算链前
+  检查该输出 slot 的 consumed generation；Return packet 同时在 source/expert
+  与 M-block 边界截断，保证旧 slot 的释放不依赖一个尚未计算的未来 M-block。
+  NIC TX 本地 completion 与远端 RX credit 的双重条件不变。
+- 大容量池的有界 source-window 路径仍使用独立静态 dX N pairs 和 bounded gather。
+  planner 根据稳定排序的连续区间直接计算 row/packet 位置，取消逐行 scatter 预约。
+  expected rows 来自这些实际区间长度，不使用平均/最大专家 token 数推测。
+- 两种路径共用 Return 发布、source Reduce 与生命周期；U/dAB 保留实际 P 的
+  私有 workspace，checkpoint/live tape 不放入通信 ring。额外小区间目录与
+  peer workspace 同生命周期；packet 目录复用闲置的 FWD row 元数据尾部。
+
+448 MiB 是新增 **source arena** 上限，不是所有形状下的整进程峰值承诺。
+dR 缓存 slack、实际 tape/workspace 和 allocator reserved 必须分别测量。
+
+- [x] EP8 单机 / EP16 双机，1620 MHz，随机 8K/20K 相邻性能对照。
+  相对 M7b 降低 13.9%–20.2%；相对 resident 仍差 1.6%–8.3%，不关闭性能门禁。
+- [x] 1/64、空接收/热点迁移、超预算 bounded 路径、memcheck、OOM 重试/live tapes。
+- [x] 真实 Megatron DDP 与 suspend/resume，共卡切换时持久缓冲可释放。
+- [ ] 推理四档规模、FWD 不回退；记录峰值与容量，清理实验分支并提交。
+
 ## 2026-10-02：Backward 私有 dR 与 Return ring 实施约定
 
 本轮保持训练/推理的 Forward 主 kernel 和元数据容量布局不变，不做元数据瘦身。

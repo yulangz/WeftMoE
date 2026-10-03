@@ -32,6 +32,9 @@ def main():
         expert_tensor_parallel_size=1,
         create_gloo_process_groups=False,
     )
+    # Router weights are initialized on CPU; CUDA's model-parallel RNG alone
+    # neither reproduces them nor gives replicas the same initial parameters.
+    torch.manual_seed(123)
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
         num_layers=2,

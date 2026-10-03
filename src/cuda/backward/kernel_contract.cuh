@@ -46,8 +46,8 @@ struct BackwardKernelArgs {
   const transport::BFloat16 *saved_ab = nullptr;
   std::uint64_t saved_rows = 0;
   const backward_detail::PeerPayload *peer_payloads = nullptr;
-  // Private per-invocation dR. A null pointer selects the retained split-worker
-  // implementation; unified workers import stable communication storage.
+  // Stable, IPC-visible dR owned by the execution slot. Logical TMA bounds
+  // follow the actual route count independently of its cached capacity.
   transport::BFloat16 *dr = nullptr;
   std::size_t input_offset = 0;
   transport::BFloat16 *recomputed_u = nullptr;

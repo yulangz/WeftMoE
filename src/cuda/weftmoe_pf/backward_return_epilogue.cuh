@@ -26,7 +26,7 @@ struct Output {
       auto *destination = identity.source / a.local_world_size == a.node
           ? a.peer_payloads[identity.source].contribution +
                 contribution_row(a, identity.route) * a.hidden
-          : a.dx_rows + (output_row + row) * a.hidden;
+          : a.dx_rows + (std::uint64_t(output_row) + row) * a.hidden;
       for (unsigned column = (threadIdx.x % row_lanes) * 8U;
            column < TileN; column += row_lanes * 8U) {
         const auto offset = column / 64U * TileM * 64U + row * 64U +

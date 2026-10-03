@@ -20,11 +20,6 @@ struct alignas(128) Shared
   unsigned long long queue_base;
   unsigned static_return_next;
   unsigned reduced_warps;
-  activation_ring_detail::Transfer dispatch_hold[communication::kRingDepth];
-  unsigned dispatch_head, dispatch_tail;
-  unsigned pull_cursor[communication::kLocalPeers];
-  unsigned pull_peer;
-  unsigned long long pull_sequence;
 };
 
 #include "cuda/persistent_v3/backward/unified_gin.cuh"
@@ -55,10 +50,6 @@ __device__ __forceinline__ void init(const BackwardKernelArgs &a, Storage &s) {
     s.dispatch_complete = s.stop = s.copies_done = 0U;
     s.reduced_warps = 0U;
     if constexpr (UseGin) {
-      s.dispatch_head = s.dispatch_tail = 0U;
-      for (unsigned peer = 0; peer < a.local_world_size; ++peer)
-        s.pull_cursor[peer] = 0U;
-      s.pull_peer = 0U;
       s.gin_rx_dispatch = blockIdx.x % a.gin_rings.dispatch_channels;
       s.gin_rx_return = blockIdx.x % a.gin_rings.return_channels;
       s.gin_task.channel = activation_ring_detail::kNoChannel;
@@ -349,7 +340,6 @@ run(const BackwardKernelArgs &a,
       bool gin_progressed = false;
       if constexpr (UseGin) {
         gin_progressed = gin_detail::progress_receive<BaseThread>(a, s, true);
-        gin_progressed = gin_detail::pull_dispatch<BaseThread>(a, s) || gin_progressed;
         gin_progressed =
             gin_detail::progress_receive<BaseThread>(a, s, false) ||
             gin_progressed;
@@ -369,7 +359,7 @@ run(const BackwardKernelArgs &a,
                 counter->value)
                     .load(::cuda::memory_order_acquire) ==
                 (a.return_ring.depth ? a.return_ring.state->blocks : geometry.mblocks);
-        if (a.return_ring.depth && publisher == 0U &&
+        if (a.return_ring.depth && !a.return_ring.canonical && publisher == 0U &&
             weftmoe_pf::ring::acquire(a.peer_payloads[a.rank].return_state->reserved) <
                 static_forward::ceil_div(a.dispatch.identity.num_tokens,
                                           a.return_ring.shape.tokens))
@@ -383,7 +373,7 @@ run(const BackwardKernelArgs &a,
           s.stop = 0U;
         if constexpr (UseGin)
           if (s.stop && (!gin_detail::terminal(a) ||
-                        !gin_detail::pull_terminal(a) ||
+                        !activation_ring_detail::receive_complete(a, true) ||
                         (a.return_ring.depth &&
                          !activation_ring_detail::receive_complete(a, false))))
             s.stop = 0U;
