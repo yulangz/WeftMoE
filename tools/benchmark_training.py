@@ -49,7 +49,10 @@ def make_workload(args, nominal_tokens, rank, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "v3"), required=True)
+    parser.add_argument("--backend", choices=("pf", "v3", "megatron"), required=True)
+    parser.add_argument("--dispatcher", choices=("alltoall", "flex"), default="flex",
+                        help="Megatron communication backend: NCCL all-to-all or DeepEP")
+    parser.add_argument("--deepep-num-sms", type=int, default=20)
     parser.add_argument("--tokens", type=int, nargs="+", default=[8192, 20480])
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=4)
@@ -116,10 +119,14 @@ def main():
         incoming = incoming.cpu()
         max_tokens = max(max(workload["tokens"]) for workload in workloads)
         max_rows = int(incoming.max()) + owned * 128
-        runtime = TensorRuntime(
-            group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
-            hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
-            max_rows=max_rows, training=True, max_saved=2)
+        if args.backend == "megatron":
+            from benchmarks.megatron_training_backend import MegatronTrainingBackend
+            runtime = MegatronTrainingBackend(args, w1, w2)
+        else:
+            runtime = TensorRuntime(
+                group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
+                hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
+                max_rows=max_rows, training=True, max_saved=2)
         samples = []
         forward_samples = []
         for iteration, (cpu_routes, cpu_gates) in enumerate(batches):
@@ -170,7 +177,12 @@ def main():
                     max(per_rank[r][i] - forward_per_rank[r][i] for r in range(world))
                     for i in range(args.samples)),
                 wall_slowest_rank_samples_us=slowest, per_rank_wall_us=per_rank,
-                extension=os.environ["WEFTMOE_TENSOR_EXTENSION"])), flush=True)
+                measurement_scope="eager forward+backward+release+device synchronize; input preparation excluded",
+                forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
+                checkpoint="routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+                implementation=getattr(runtime, "metadata", {}),
+                extension=os.environ.get("WEFTMOE_TENSOR_EXTENSION")
+                          if args.backend != "megatron" else None)), flush=True)
         runtime.close()
     dist.destroy_process_group()
 
