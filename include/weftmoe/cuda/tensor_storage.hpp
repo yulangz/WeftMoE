@@ -57,6 +57,9 @@ class CollectiveTensorPreparation {
 public:
   CollectiveTensorPreparation(const NcclSession &, const CudaExecution &);
   void run(const std::function<void()> &prepare) const;
+  // Carry a binding-change flag in the allocation agreement. Returns true on
+  // every rank if any callback reports a change; failures still throw first.
+  bool run_with_change(const std::function<bool()> &prepare) const;
 
 private:
   struct Impl;

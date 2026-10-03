@@ -191,7 +191,7 @@ struct BackwardPeerWorkspace {
       return;
     generation = 0;
     std::shared_ptr<Buffer> next;
-    preparation.run([&] {
+    const bool bindings_changed = preparation.run_with_change([&] {
       if (buffer && buffer->hidden == hidden && buffer->return_depth == depth &&
           rows <= buffer->row_capacity &&
           routes <= buffer->route_capacity) {
@@ -215,7 +215,15 @@ struct BackwardPeerWorkspace {
       next->dr_mn_map = make_bf16_tma_map_mn(
           next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
           "actual Backward dR MN");
+      return next != buffer;
     });
+    // Logical rows and call generations do not change peer addresses. The
+    // existing allocation agreement also tells unchanged ranks when a peer
+    // grew, so all ranks enter the remapping path together only when needed.
+    if (!bindings_changed) {
+      generation = next_generation;
+      return;
+    }
     exports[nccl->rank] = next->descriptor;
     auto *device = static_cast<Export *>(exchange->data);
     check(cudaMemcpyAsync(device + nccl->rank, &exports[nccl->rank],

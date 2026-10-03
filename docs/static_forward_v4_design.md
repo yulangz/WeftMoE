@@ -1,5 +1,31 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-03：Backward peer 地址按容量复用（M7e）
+
+调用 generation 标识一次 FWD/对应 BWD 的执行，不是通信内存的地址版本。
+每个 execution slot 的 peer workspace 应在容量满足时跨 generation 复用。
+
+- 每轮按实际 R 更新本地 dR TMA descriptor；R、路由与 generation 改变不触发
+  IPC handle 交换。训练 tape 仍各自拥有 X/GU，不缓存旧路由或中间计算结果。
+- 将 `binding_changed` 和失败 rank 一起放入原有的 allocation agreement：
+  对 `(失败 rank 或 world, 地址不变标记)` 做一次二元素 MIN AllReduce。
+  任意 rank 分配失败则全体退出；任意 rank 更换地址则全体进入慢路径。
+  不能仅按本 rank 的容量判断是否跳过 collective。
+- 全体地址不变时，直接复用 IPC imports 和 device peer table，省去地址
+  AllGather、D2H/host 等待、第二次 import agreement 和 peer table H2D。
+  初次分配、扩容或布局改变仍走原有交换/导入协议；全部旧 imports 关闭并
+  完成 collective 确认后才释放旧 allocation。失败时清空映射，支持重试。
+- 不移除主 kernel 的跨调用 join、slot generation/credit 或 NIC completion；
+  close/suspend 仍统一 drain、关闭 imports、barrier、释放 exports。
+  稳态 peer prepare 从两次 AllReduce + 一次 AllGather、三次显式 stream
+  synchronize，降为一次已有 AllReduce 和一次 synchronize；不是零 host 同步。
+
+此变更不修改 GEMM、通信 payload 布局、持久容量或 inference kernel。
+性能记录须分别给出相邻 M7d 消融、冻结 V3 的真实调用开销，以及预准备 native
+计算路径，不能把 V3 的历史动态分配/IPC 开销当作静态调度的计算收益。
+Megatron 基线使用 selective `moe_act`，同样保留 routed X 与 FC1 G/U，
+在 BWD 重算 gated SwiGLU；统一随机输入与计时边界。
+
 ## 2026-10-03：Backward 容量优先恢复性能（M7d，已落地，仍有剩余回退）
 
 以下约定取代 M7a 的私有 dR 目标，历史实验和回退保留在下一节。用户允许

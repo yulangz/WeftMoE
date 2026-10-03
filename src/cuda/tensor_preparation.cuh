@@ -21,10 +21,10 @@ struct CollectiveTensorPreparation::Impl {
     if (nccl->device != exec.device_ordinal())
       throw std::invalid_argument("tensor preparation requires the NCCL device");
     check(cudaSetDevice(static_cast<int>(exec.device_ordinal())));
-    status = tensor_storage_detail::allocate(2U * sizeof(std::uint32_t),
+    status = tensor_storage_detail::allocate(4U * sizeof(std::uint32_t),
                                                exec.device_ordinal());
     check(cudaHostAlloc(reinterpret_cast<void **>(&host),
-                         2U * sizeof(std::uint32_t), cudaHostAllocPortable));
+                         4U * sizeof(std::uint32_t), cudaHostAllocPortable));
   }
 
   ~Impl() noexcept {
@@ -33,20 +33,21 @@ struct CollectiveTensorPreparation::Impl {
     (void)cudaFreeHost(host);
   }
 
-  std::uint32_t agree(bool failed) const {
+  std::uint32_t agree(bool failed, bool changed) const {
     auto *device = static_cast<std::uint32_t *>(status->data);
     host[0] = failed ? nccl->rank : nccl->world;
-    check(cudaMemcpyAsync(device, host, sizeof(*host), cudaMemcpyHostToDevice,
+    host[1] = changed ? 0U : 1U;
+    check(cudaMemcpyAsync(device, host, 2U * sizeof(*host), cudaMemcpyHostToDevice,
                            stream));
-    const auto error = ncclAllReduce(device, device + 1U, 1U, ncclUint32,
+    const auto error = ncclAllReduce(device, device + 2U, 2U, ncclUint32,
                                      ncclMin, nccl->comm, stream);
     if (error != ncclSuccess)
       throw std::runtime_error(std::string("tensor preparation agreement: ") +
                                ncclGetErrorString(error));
-    check(cudaMemcpyAsync(host + 1U, device + 1U, sizeof(*host),
+    check(cudaMemcpyAsync(host + 2U, device + 2U, 2U * sizeof(*host),
                            cudaMemcpyDeviceToHost, stream));
     check(cudaStreamSynchronize(stream));
-    return host[1];
+    return host[2];
   }
 };
 
@@ -60,6 +61,14 @@ CollectiveTensorPreparation::CollectiveTensorPreparation(
 
 void CollectiveTensorPreparation::run(
     const std::function<void()> &prepare) const {
+  run_with_change([&] {
+    prepare();
+    return false;
+  });
+}
+
+bool CollectiveTensorPreparation::run_with_change(
+    const std::function<bool()> &prepare) const {
   auto &state = *impl_;
   Impl::check(cudaSetDevice(static_cast<int>(state.execution.device_ordinal())));
   cudaStreamCaptureStatus capture;
@@ -67,14 +76,15 @@ void CollectiveTensorPreparation::run(
   if (capture != cudaStreamCaptureStatusNone)
     throw std::runtime_error("collective tensor preparation requires eager execution");
   std::exception_ptr failure;
+  bool changed = false;
   try {
-    prepare();
+    changed = prepare();
   } catch (...) {
     failure = std::current_exception();
   }
-  const auto origin = state.agree(static_cast<bool>(failure));
+  const auto origin = state.agree(static_cast<bool>(failure), changed);
   if (origin == state.nccl->world)
-    return;
+    return state.host[3] == 0U;
   const auto error = TensorPreparationFailure(
       "tensor preparation failed on rank " + std::to_string(origin) +
       " before execution");
