@@ -18,7 +18,6 @@
     "network": [
       {"window_tokens": 768, "contribution_windows": 6},
       {"window_tokens": 1536, "contribution_windows": 3},
-      {"window_tokens": 2304, "contribution_windows": 2},
       {"window_tokens": 4608, "contribution_windows": 1},
       {"window_tokens": 3072, "contribution_windows": 3}
     ]

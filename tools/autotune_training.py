@@ -307,9 +307,17 @@ def main():
         finalists = confirmation_finalists(valid, incumbent["name"], spec["confirmation_candidates"])
         for repeat in range(spec["confirmation_repeats"]):
             for candidate in (finalists if repeat % 2 == 0 else reversed(finalists)):
+                if "error" in candidate:
+                    continue
                 label = f"s{stage_index}_confirm{repeat}_{candidate['name']}"
-                candidate.setdefault("confirmations", []).append(benchmark.run(candidate, label))
+                try:
+                    candidate.setdefault("confirmations", []).append(benchmark.run(candidate, label))
+                except PlanError as error:
+                    candidate["error"] = str(error)
+                write_result(output / "result.json", result)
         for candidate in finalists:
+            if "error" in candidate:
+                continue
             candidate["aggregate_metric_us"] = statistics.mean(r["metric_us"] for r in candidate["confirmations"])
             try:
                 candidate["parity"] = benchmark.run(candidate, f"s{stage_index}_parity_{candidate['name']}", verify=True)

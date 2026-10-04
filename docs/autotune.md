@@ -62,6 +62,11 @@ Torch reference 每次只保留一个本地专家的计算图，跨 rank FP32 �
 `workspace_limit_bytes` 只约束 native 持久池（compute+GIN+notify），不含
 权重、按实际路由保存的训练激活或 Torch allocator reserved。
 
+确认阶段任何一次失败都会取消该候选的资格，不把已经完成的单轮成绩当成
+完整确认结果。Flash EP16 的 B2304/D2 曾在重复确认中出现 GPU 持续等待，
+终止后两节点正常释放；根因尚未定位，默认搜索空间暂不包含这一组合。
+此前成功的初筛/首轮确认不能替代稳定性验证，失败日志也保留在实验记录中。
+
 ## V4 inference 离线搜索（2026-09-30）
 
 `tools/autotune_forward.py` 复用原有内容寻址 JIT、资源过滤、正反顺序复测和

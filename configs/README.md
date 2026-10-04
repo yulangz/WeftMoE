@@ -12,7 +12,7 @@ model dimensions and local/multi-node topologies through
 `tools/autotune_training.py`; see [training autotune](../docs/autotune.md).
 Its search candidates are not a claim of measured optimal parameters.
 
-Each parameter contains a nonempty array of candidate values. The first values
+In the independent phase grids, each parameter contains a nonempty array of candidate values. The first values
 form the incumbent configuration and the defaults used when autotuning is
 disabled; the Cartesian product defines the search space. A single value fixes a parameter for that search. Supported values and
 parameter combinations are checked by the autotuner before benchmarking.
