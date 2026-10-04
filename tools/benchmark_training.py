@@ -23,7 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from weftmoe.runtime import TensorRuntime
 
 
-def make_workload(args, nominal_tokens, rank, device):
+def balanced_routes(tokens, experts, top_k, device, generator):
+    """Randomize complete balanced periods; only the final period is partial."""
+    period = experts // math.gcd(experts, top_k)
+    blocks = math.ceil(tokens / period)
+    permutations = torch.rand(blocks, experts, device=device, generator=generator).argsort(dim=-1)
+    slots = torch.arange(period * top_k, device=device) % experts
+    routes = permutations[:, slots].reshape(-1, top_k)[:tokens]
+    return routes[torch.randperm(tokens, device=device, generator=generator)]
+
+
+def make_workload(args, nominal_tokens, rank, device, route_distribution="random"):
     """Freeze a reproducible CPU route trace, without keeping activations live."""
     seed = args.seed + nominal_tokens * 1000003
     lengths = random.Random(seed + rank)
@@ -31,6 +41,7 @@ def make_workload(args, nominal_tokens, rank, device):
     # A common per-step bias creates expert hotspots shared across source ranks.
     # A separate stream keeps it identical despite unequal token counts.
     bias_rng = torch.Generator(device=device).manual_seed(seed + 1000000007)
+    balanced_rng = torch.Generator(device=device).manual_seed(seed + rank + 1000000009)
     sigma = nominal_tokens * args.token_std_fraction
     low = max(1, math.ceil(nominal_tokens - 3 * sigma))
     high = math.floor(nominal_tokens + 3 * sigma)
@@ -43,6 +54,9 @@ def make_workload(args, nominal_tokens, rank, device):
         logits.add_(torch.randn(args.experts, device=device, generator=bias_rng),
                     alpha=args.route_bias_std)
         scores, routes = logits.topk(args.top_k, dim=-1)
+        if route_distribution == "balanced":
+            # Keep lengths, selected gate scores and the input RNG unchanged.
+            routes = balanced_routes(tokens, args.experts, args.top_k, device, balanced_rng)
         batches.append((routes.int().cpu(), scores.softmax(dim=-1).cpu()))
     return batches
 
@@ -69,6 +83,8 @@ def main():
                         help="Per-rank normal token std / nominal tokens; truncate at +/-3 std")
     parser.add_argument("--route-bias-std", type=float, default=0.5,
                         help="Std of per-step shared expert-logit bias; 0 gives uniform routing in expectation")
+    parser.add_argument("--route-distribution", choices=("random", "balanced"), default="random",
+                        help="Balance expert counts in complete periods, keeping token lengths and gate scores")
     args = parser.parse_args()
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
@@ -101,7 +117,7 @@ def main():
     w1 = rand(owned, 2 * args.intermediate, args.hidden)
     w2 = rand(owned, args.hidden, args.intermediate)
     for tokens in args.tokens:
-        batches = make_workload(args, tokens, rank, "cuda")
+        batches = make_workload(args, tokens, rank, "cuda", args.route_distribution)
         digest = hashlib.sha256()
         for routes, gates in batches:
             digest.update(routes.shape[0].to_bytes(8, "little"))
@@ -116,9 +132,10 @@ def main():
         incoming = torch.stack([
             torch.bincount(routes.flatten().long(), minlength=args.experts)
             for routes, _ in batches
-        ]).reshape(len(batches), world, owned).sum(dim=-1).cuda()
+        ]).cuda()
         dist.all_reduce(incoming, op=dist.ReduceOp.SUM)
-        incoming = incoming.cpu()
+        expert_rows = incoming.cpu()
+        incoming = expert_rows.reshape(len(batches), world, owned).sum(dim=-1)
         max_tokens = max(max(workload["tokens"]) for workload in workloads)
         max_rows = int(incoming.max()) + owned * 128
         if args.backend == "megatron":
@@ -168,15 +185,18 @@ def main():
             measured_tokens = [workload["tokens"][args.warmups:] for workload in workloads]
             flat_tokens = [count for counts in measured_tokens for count in counts]
             print("TRAINING_CYCLE_JSON " + json.dumps(dict(
-                schema_version=2, workload="variable_tokens_random_routes",
+                schema_version=2, workload=f"variable_tokens_{args.route_distribution}_routes",
                 backend=args.backend, world=world, nominal_tokens_per_rank=tokens,
                 seed=args.seed, token_std_fraction=args.token_std_fraction,
                 token_truncation_std=3, route_bias_std=args.route_bias_std,
+                route_distribution=args.route_distribution,
                 workload_sha256_per_rank=[workload["sha256"] for workload in workloads],
                 per_rank_tokens=measured_tokens,
                 per_rank_warmup_tokens=[workload["tokens"][:args.warmups]
                                        for workload in workloads],
                 per_rank_received_rows=incoming[args.warmups:].T.tolist(),
+                expert_rows_min_per_step=expert_rows[args.warmups:].min(dim=-1).values.tolist(),
+                expert_rows_max_per_step=expert_rows[args.warmups:].max(dim=-1).values.tolist(),
                 actual_tokens_min=min(flat_tokens), actual_tokens_max=max(flat_tokens),
                 actual_tokens_mean=statistics.mean(flat_tokens),
                 actual_tokens_std=statistics.pstdev(flat_tokens),

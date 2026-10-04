@@ -1,5 +1,125 @@
 # V4 ring 训练对接记录
 
+## 2026-10-04：均衡路由 + 动态 tokens 对照
+
+本轮只增加 benchmark 的 `--route-distribution balanced`，生产算子仍使用
+M7e 的冻结产物 `build/pf_peer_bindings/`，未重新编译或修改 GEMM/通信。
+相同长度序列下，均衡路由相对热点路由使 PF 整轮耗时降低 16%–24%；
+这是 workload 的变化，不记作新的代码优化收益。
+
+### 数据与计时口径
+
+- 两节点 16 张 L20X 均锁定并采样确认 1620 MHz；EP8 是单机，EP16 是双机。
+  H2048/I512/E64/top-k4、BF16；8K/20K 是每 rank 的 nominal 8192/20480。
+- 每 rank 的 tokens 保留原来的 σ=10%、±3σ 截断正态，seed=123；不同 rank
+  独立采样，因此全局总 tokens 的实测标准差只有均值的约 1.9%–3.7%。
+  均衡和热点对照的每步长度、输入 RNG、权重、gate scores 一致。
+- 均衡路由在每个 source 的完整 16-token 分组内，将 64 个专家随机排列后
+  分给 16 个 top-k4 token；再打乱 token 顺序。每步重新生成排列，每个 token
+  无重复专家，每个完整分组的专家计数完全相等。最后一个不完整分组使每个
+  source 的专家计数最多差 1，全局最多差 EP；不靠容量截断或丢 token 做均衡。
+  通用分组长度为 `E / gcd(E, top_k)`，不要求 top-k 整除 E。
+- `route_bias_std=0.5` 仍用于生成相同的 gate scores；balanced 模式单独替换
+  expert indices，因此不再有该 bias 导致的专家负载热点。默认 random 模式不变。
+- 先完整 prime 80 步，再 20 warmup + 60 measured；每步取全 rank 最大
+  `forward → backward → 释放 tape/gradients → synchronize` wall，报告 p50。
+  固定通信缓冲、IPC、分配器/编译预热在计时外；本批 X/GU 缓存由计时内 FWD
+  生成，BWD 使用它们，不重算 FC1。Notify、权重 repack、私有 tensor 准备仍计时。
+- 各 workload 的 row-capacity 按自身 trace 最大接收量计算；均衡后容量自然
+  更小。因此结果也包含生产容量 heuristic 对路由分布的响应，不称为固定布局
+  下仅改变 GEMM 负载的微基准。所有均衡后端使用相同 trace 和相同容量参数。
+
+均衡数据的实测分布（60 measured）：
+
+| 拓扑 / nominal T | 全局 tokens 均值 | 全局 tokens 标准差 / 均值 | 最大 rank 接收量 / 平均值，p50 | 专家计数最大差值 |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 65104.9 | 3.65% | 1.0001 | 7 |
+| EP8 / 20480 | 164954.8 | 3.27% | 1.0001 | 6 |
+| EP16 / 8192 | 130402.6 | 2.41% | 1.0002 | 11 |
+| EP16 / 20480 | 329728.6 | 1.94% | 1.0001 | 10 |
+
+四档的 rank 接收量最大不均衡均低于 0.04%。这只保证 destination 专家/owner
+接收量均衡；source 的输入长度仍然随机，并未把所有 rank 的输入强制设为等长。
+
+### PF 相邻 workload 对照
+
+热点列为本轮重新测试，不拼接昨日较快结果；逐 rank SHA 与 M7e 原热点 trace
+一致。表内 ms 是整轮 wall p50，TFLOPS 是每卡有效 GEMM 吞吐的逐步 p50。
+
+| 拓扑 / nominal T | 热点 ms | 均衡 ms | 耗时降低 | 热点 TFLOPS/卡 | 均衡 TFLOPS/卡 |
+|---|---:|---:|---:|---:|---:|
+| EP8 / 8192 | 5.6221 | 4.7059 | 16.30% | 109.8 | 131.1 |
+| EP8 / 20480 | 11.8036 | 9.7845 | 17.11% | 129.0 | 159.3 |
+| EP16 / 8192 | 9.3997 | 7.5534 | 19.64% | 65.1 | 81.4 |
+| EP16 / 20480 | 22.4231 | 17.0022 | 24.18% | 69.0 | 91.6 |
+
+每步有效 FWD+BWD FLOPs 为 `18 * sum(tokens_per_rank) * top_k * H * I`，
+一次 FMA 计 2 FLOPs；除以该步 rank-max 秒数、EP 和 1e12，再取 p50。
+不计 padding、SwiGLU/dGate 标量操作的 FLOPs，但它们及通信/host 准备耗时
+均保留。不是 GPU GEMM 峰值，也不额外乘专家总数。
+若改为整个采样段的总 FLOPs / 总 wall，均衡 PF 四档为
+130.1 / 158.7 / 81.2 / 91.2 TFLOPS/卡；不能混用这两种统计口径。
+
+10 月 1 日相同 H/I/E/K 的固定均衡输入整轮为
+3.925 / 8.673 / 6.498 / 14.113 ms；本轮均衡后仍未恢复这些数值。
+旧输入/路由每轮不变，本轮长度、路由排列、输入每轮改变，且算子版本不同；
+不能把剩余差值全部归因于某一种开销，也不能声称均衡已解决 Return 重构的
+全部回退。固定缓存 BWD 相对 V3 的门禁仍以 M7e 阶段对照为准。
+
+### 均衡 workload 的 Megatron 对照
+
+真实 Megatron `moe_act`，融合 permutation/weighted SwiGLU 开启，DeepEP
+使用上游默认 20 SM；配置、软件版本和算子边界与 M7e 完全一致。
+所有正式采样的新增 compile graph 数均为零。每格为 ms / TFLOPS每卡：
+
+| 拓扑 / nominal T | PF | Megatron NCCL | Megatron DeepEP | PF 对较快基线耗时降低 |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 4.7059 / 131.1 | 5.3665 / 113.8 | 6.9056 / 89.2 | 12.31% |
+| EP8 / 20480 | 9.7845 / 159.3 | 9.4153 / 165.5 | 12.8345 / 122.0 | **-3.92%** |
+| EP16 / 8192 | 7.5534 / 81.4 | 11.9960 / 51.3 | 10.2397 / 59.8 | 26.23% |
+| EP16 / 20480 | 17.0022 / 91.6 | 27.5443 / 56.6 | 20.6659 / 75.9 | 17.73% |
+
+单机 20K 本轮 PF 比 NCCL 慢约 3.9%，不能宣称所有均衡训练点均领先。
+热点 workload 下的 19%–28% 优势也不能直接推广到均衡 workload。
+这仍是单个 MoE 算子的训练循环，不是完整模型/AReaL step。
+
+冻结原版 V3 也完成相同均衡动态 trace，仍采用原 teardown wrapper；库与 M7e
+记录的 SHA256 一致。原样应用调用的 ms / TFLOPS每卡依次为：
+
+| 拓扑 / nominal T | 冻结 V3 原样动态调用 |
+|---|---:|
+| EP8 / 8192 | 81.0759 / 7.7 |
+| EP8 / 20480 | 189.2607 / 8.3 |
+| EP16 / 8192 | 109.0479 / 5.6 |
+| EP16 / 20480 | 279.9448 / 5.6 |
+
+该口径包含旧 V3 的动态 R 缓冲重分配/IPC 生命周期成本，均衡并不意味着
+接收行数跨调用不变。这些数值不用于宣称 PF 的 GEMM/调度快了几十倍；
+也不替代 M7e 的缓存就绪 native V3/PF 阶段对照。
+
+### 验证与复现
+
+复用现有 Torch reference，EP8/EP16 的 8K/20K 均衡变长数据各验证一步，
+共 48 个 rank-case 的 output、dX、dGate、dW1、dW2 通过。CPU 检查分组
+均衡、top-k 唯一性及 gate/长度不变；未新增细粒度单测或修改生产 kernel。
+JSON 增加 route distribution 和逐步专家最小/最大计数，保留所有实际 T/R。
+
+```bash
+torchrun --standalone --nproc-per-node=8 tools/benchmark_training.py \
+  --backend pf --tokens 8192 20480 --warmups 20 --samples 60 \
+  --prime-trace --route-distribution balanced --token-std-fraction 0.1 \
+  --ring-tokens 512 --ring-depth 8
+```
+
+通过 `WEFTMOE_TENSOR_EXTENSION` 指定 M7e 的 `_runtime*.so`；EP16 两端
+启动，ring 改为 B768/D6，NCCL IB/interface/GID 参数与 M7e 一致。
+证据在 `build/pf_balanced_workload/`：`balanced_parity_*`、`random_pf_*`、
+`balanced_pf_*`、`balanced_megatron_{alltoall,flex}_*`，以及 `run.py`、
+`summarize.py` 和含原始记录的 `summary.json`。
+冻结 V3 为 `balanced_v3_*`。全部 20 组计时记录审计通过：均衡模式各后端
+trace/容量一致，热点与均衡的长度序列一致，热点路由 hash 复现 M7e。
+测量完成后确认两节点 GPU 均已释放，无残留作业。
+
 ## M7e 地址复用与公平训练对照：2026-10-03
 
 简述：Backward peer bindings 不再随 FWD generation 重建；将“本 rank 是否换了
